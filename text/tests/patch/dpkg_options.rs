@@ -142,6 +142,43 @@ fn test_patch_fuzz_option_one() {
     cleanup_test_dir(&dir);
 }
 
+// The 1.0 (.diff.gz) invocation: -z names the backup suffix. dpkg-source
+// unlinks FILE.dpkg-orig for every file the diff touches, so a file the diff
+// creates needs one too.
+#[test]
+fn test_patch_dpkg_v1_suffix_backups() {
+    let dir = setup_test_dir("dpkg_v1");
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    fs::write(dir.join("sub/m.txt"), "a\nb\nc\n").unwrap();
+    let patch = format!(
+        "{}{}",
+        MODIFY_PATCH, "--- a/debian/rules\n+++ b/debian/rules\n@@ -0,0 +1 @@\n+r\n"
+    );
+    let (code, err) = run_in(
+        &dir,
+        &[
+            "-t",
+            "-F",
+            "0",
+            "-N",
+            "-p1",
+            "-u",
+            "-V",
+            "never",
+            "-b",
+            "-z",
+            ".dpkg-orig",
+        ],
+        &patch,
+    );
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert_eq!(read(&dir, "sub/m.txt"), "a\nB\nc\n");
+    assert_eq!(read(&dir, "sub/m.txt.dpkg-orig"), "a\nb\nc\n");
+    assert_eq!(read(&dir, "debian/rules"), "r\n");
+    assert_eq!(read(&dir, "debian/rules.dpkg-orig"), "");
+    cleanup_test_dir(&dir);
+}
+
 // -E removes a file the patch leaves empty, even without /dev/null.
 #[test]
 fn test_patch_remove_empty_files() {

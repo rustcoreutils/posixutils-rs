@@ -266,7 +266,7 @@ fn run(args: Args) -> Result<bool, PatchError> {
         // wrong rather than that this one file is special.
         let (lines, orig_trailing_newline) = if target.exists() {
             read_file_lines(&target)?
-        } else if file_patch.is_new_file {
+        } else if file_patch.creates_file() {
             (Vec::new(), true)
         } else {
             eprintln!(

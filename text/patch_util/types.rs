@@ -280,6 +280,18 @@ impl FilePatch {
         }
     }
 
+    /// Whether this patch creates its file when the file does not exist.
+    ///
+    /// The old side is /dev/null, or -- as GNU patch also reads it -- the
+    /// patch is a single hunk inserting into an empty old file
+    /// ("@@ -0,0 +1,N @@"), which is how `diff -N` spells a new file. A 1.0
+    /// Debian source package's .diff.gz creates its whole debian/ directory
+    /// that way.
+    pub fn creates_file(&self) -> bool {
+        self.is_new_file
+            || matches!(self.hunks.as_slice(), [h] if h.old_count == 0 && h.old_start == 1)
+    }
+
     /// Reverse this patch (swap old/new, reverse all hunks).
     pub fn reverse(&mut self) {
         std::mem::swap(&mut self.old_path, &mut self.new_path);

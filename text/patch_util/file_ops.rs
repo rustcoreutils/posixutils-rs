@@ -62,7 +62,7 @@ pub fn determine_target_file(
     // returns a name without first checking that it exists, so it is also the
     // one that would happily create a file -- and, via write_output's
     // create_dir_all, a whole directory tree -- wherever the patch says.
-    if patch.is_new_file {
+    if patch.creates_file() {
         if let Some(ref new_path) = patch.new_path {
             if new_path != "/dev/null" {
                 let stripped = strip_path(new_path, strip);

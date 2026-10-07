@@ -354,8 +354,11 @@ POSIX specifies only `-k`.  Every other option is an addition:
    the archive's magic number and decompressed transparently, with or without
    the option.  Incompatible with `-a`.
  * `-M` / `--multi-volume`, `--tape-length`, `--new-volume-script` — GNU
-   tar-style multivolume archives, using the GNU `'M'` continuation header.
-   ustar format only, and incompatible with `-z`.
+   tar-style multivolume archives (`archive`, `archive.2`, ...): only the last
+   volume has the end-of-archive indicator, and a volume that is missing is
+   asked for (script or `/dev/tty`) rather than taken for the end.  Reads GNU
+   volume labels and `'M'` continuation headers; writes whole members per
+   volume.  Written in ustar format only, and incompatible with `-z`.
  * `-x bcpio`, `-x sv4cpio`, `-x sv4crc` — the historic pax names for the old
    binary cpio header and the SVR4 "newc" headers without and with a data
    checksum.  POSIX names only `cpio` (odc), `pax` and `ustar`.  All three are

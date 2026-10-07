@@ -17,17 +17,18 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, open_dir_at, set_attrs_fd, set_link_attrs_at, stat_at, AttrPolicy, Attrs,
-    DirTree, MemberPath,
+    chmod_at, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
+    open_dir_at, restore_atime, restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at,
+    AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
 };
-use crate::pattern::{matches_any, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::modes::followed_link;
+use crate::modes::write::FileNames;
+use crate::subst::{substitute_name, Substitution};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -36,10 +37,6 @@ use std::path::{Path, PathBuf};
 /// Options for copy mode
 #[derive(Default)]
 pub struct CopyOptions {
-    /// Patterns to match (empty means match all)
-    pub patterns: Vec<Pattern>,
-    /// Match all except patterns
-    pub exclude: bool,
     /// Don't overwrite existing files
     pub no_clobber: bool,
     /// Verbose output
@@ -66,6 +63,8 @@ pub struct CopyOptions {
     pub interactive: bool,
     /// Update mode - only copy if source is newer than destination
     pub update: bool,
+    /// Put back the access time of each source file and directory read (-t)
+    pub reset_atime: bool,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
     /// Process file-creation mask, applied to the mode of copied files when the
@@ -74,7 +73,11 @@ pub struct CopyOptions {
 }
 
 /// Copy files to a destination directory
-pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> PaxResult<()> {
+pub fn copy_files(
+    files: &mut FileNames<'_>,
+    dest_dir: &Path,
+    options: &CopyOptions,
+) -> PaxResult<()> {
     // Verify destination is a directory
     if !dest_dir.exists() {
         return Err(PaxError::Io(std::io::Error::new(
@@ -109,45 +112,59 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
         } else {
             None
         }),
-        dest_stack: RefCell::new(Vec::new()),
+        pending_dirs: RefCell::new(PendingDirs::default()),
         member_stack: RefCell::new(Vec::new()),
         dev_stack: RefCell::new(Vec::new()),
         fatal: RefCell::new(None),
     };
     if let Some(st) = stat_at(tree.root(), c".") {
-        // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
-        #[allow(clippy::unnecessary_cast)]
-        walk.dest_ids
-            .borrow_mut()
-            .insert((st.st_dev as u64, st.st_ino as u64));
+        walk.dest_ids.borrow_mut().insert(file_id(&st));
     }
 
-    for path in files {
+    // Directories take their attributes once everything has been copied --
+    // and still do when a fatal error ends the copy early.
+    let result = walk.copy_operands(files);
+    walk.pending_dirs
+        .borrow_mut()
+        .apply(&tree, &policy_of(options));
+    result
+}
+
+impl CopyWalk<'_> {
+    /// Walk each operand in turn, stopping at the first fatal error.
+    fn copy_operands(&self, files: &mut FileNames<'_>) -> PaxResult<()> {
+        for path in files {
+            self.copy_operand(&path)?;
+        }
+        Ok(())
+    }
+
+    fn copy_operand(&self, path: &Path) -> PaxResult<()> {
+        let options = self.options;
         let _ = ftw::traverse_directory(
             path,
-            |entry| walk.visit(entry),
-            |_, _| walk.leave_directory(),
+            |entry| self.visit(entry),
+            |entry, exit| self.leave_directory(&entry, exit),
             |entry, err| crate::error::report_error(entry.path().as_inner(), err.inner()),
             ftw::TraverseDirectoryOpts {
                 follow_symlinks_on_args: options.cli_dereference,
                 follow_symlinks: options.dereference,
-                // One destination-directory descriptor is held per source
-                // level, so that postprocess_dir can stamp it.
+                // The destination tree keeps a descriptor open per level it
+                // has walked (see `DirTree`), which the walk has to leave
+                // room for.
                 caller_fds_per_level: 1,
                 ..Default::default()
             },
         );
 
-        if let Some(e) = walk.fatal.borrow_mut().take() {
+        if let Some(e) = self.fatal.borrow_mut().take() {
             return Err(e);
         }
         // Each operand starts its own member naming.
-        walk.member_stack.borrow_mut().clear();
-        walk.dest_stack.borrow_mut().clear();
-        walk.dev_stack.borrow_mut().clear();
+        self.member_stack.borrow_mut().clear();
+        self.dev_stack.borrow_mut().clear();
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// State the three traversal callbacks share.
@@ -155,8 +172,9 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
 /// The destination side is untouched by this: every leaf is still resolved
 /// with `MemberPath::parse` and `DirTree::parent_of` from the anchor, because
 /// `-s` can rewrite a member to a path that is not under the current
-/// destination directory at all. `dest_stack` exists only to hold each created
-/// directory's descriptor so its attributes can be applied on the way out.
+/// destination directory at all. `DirTree` keeps the directories it last
+/// walked through open, so following the depth-first walk costs a directory
+/// per member rather than a walk from the anchor.
 struct CopyWalk<'a> {
     tree: &'a DirTree,
     options: &'a CopyOptions,
@@ -165,15 +183,20 @@ struct CopyWalk<'a> {
     /// or entered. A source directory found in here is one being copied *into*.
     dest_ids: RefCell<HashSet<(u64, u64)>>,
     prompter: RefCell<Option<InteractivePrompter>>,
-    /// Per descended directory: its destination descriptor and the source
-    /// attributes to stamp on it, or `None` for the `.` operand, whose
-    /// children go straight into the destination root.
-    dest_stack: RefCell<Vec<Option<(OwnedFd, Attrs)>>>,
+    /// Destination directories still to take their source attributes, which
+    /// wait until everything -- not only the walk below them, but any later
+    /// operand naming a file inside -- has been copied: a read-only mode
+    /// applied any sooner refuses the rest of its contents.
+    pending_dirs: RefCell<PendingDirs>,
     /// Member names, built by joining as the walk descends rather than derived
-    /// from the filesystem path, so selection and substitution see the name an
-    /// archive would record.
+    /// from the filesystem path, so substitution sees the name an archive
+    /// would record. These are the names *before* -s and -i: a copy is an
+    /// archive round trip, so each name is substituted once, by itself --
+    /// building a child's name from its parent's substituted one applied the
+    /// substitution again at every level.
     member_stack: RefCell<Vec<PathBuf>>,
-    /// `st_dev` of each directory descended into, for `-X`.
+    /// `st_dev` of each directory descended into; the first is the operand's,
+    /// which `-X` compares against.
     dev_stack: RefCell<Vec<u64>>,
     fatal: RefCell<Option<PaxError>>,
 }
@@ -212,27 +235,14 @@ impl CopyWalk<'_> {
         }
     }
 
-    /// Apply a descended directory's source attributes, now that its contents
-    /// exist.
-    ///
-    /// Runs for `DirExit::NotDescended` as well: if reading the source
-    /// directory failed, the destination directory still exists and still
-    /// wants its mode. The old code returned early on that path and left it
-    /// with the creation mode.
-    fn leave_directory(&self) -> Result<(), ()> {
-        // Taken before the pop: a failure here has to name the directory it
-        // was about, and this is the only place that still knows.
-        let member = self.member_stack.borrow().last().cloned();
+    /// Leave a descended source directory. It has been read by now, so this
+    /// is where -t puts back its access time.
+    fn leave_directory(&self, entry: &ftw::Entry<'_>, exit: ftw::DirExit) -> Result<(), ()> {
+        if self.options.reset_atime && exit == ftw::DirExit::Descended {
+            restore_dir_atime(entry);
+        }
         self.member_stack.borrow_mut().pop();
         self.dev_stack.borrow_mut().pop();
-        if let Some(Some((dir, attrs))) = self.dest_stack.borrow_mut().pop() {
-            if let Err(e) = set_attrs_fd(dir.as_fd(), &attrs, &policy_of(self.options)) {
-                match member {
-                    Some(ref m) => crate::error::report_error(m, e),
-                    None => crate::error::report_error("destination directory", e),
-                }
-            }
-        }
         Ok(())
     }
 
@@ -251,49 +261,6 @@ impl CopyWalk<'_> {
             crate::error::report_error(src, std::io::Error::from_raw_os_error(libc::ENOENT));
             return Ok(false);
         }
-
-        // Selection and substitution both act on the member name, so they
-        // reach every file in the subtree rather than only the operands.
-        if !self.options.patterns.is_empty() {
-            let name = crate::rawpath::MatchName::of(&member);
-            let matches = matches_any(&self.options.patterns, name.as_str());
-            if self.options.exclude == matches {
-                return Ok(false);
-            }
-        }
-
-        if self.options.one_file_system {
-            if let Some(&parent_dev) = self.dev_stack.borrow().last() {
-                if metadata.dev() != parent_dev {
-                    return Ok(false);
-                }
-            }
-        }
-
-        // -s applies before -i (POSIX: the order of -o, -p and -s is
-        // significant).
-        let member = if self.options.substitutions.is_empty() {
-            member
-        } else {
-            match apply_substitutions(&self.options.substitutions, &member) {
-                SubstResult::Unchanged => member,
-                SubstResult::Changed(new_name) => crate::rawpath::from_substituted(&new_name),
-                SubstResult::Empty => return Ok(false), // a null name means skip
-            }
-        };
-
-        let member = {
-            let mut prompter = self.prompter.borrow_mut();
-            if let Some(ref mut p) = *prompter {
-                match p.prompt(&member)? {
-                    RenameResult::Skip => return Ok(false),
-                    RenameResult::UseOriginal => member,
-                    RenameResult::Rename(new_name) => new_name,
-                }
-            } else {
-                member
-            }
-        };
 
         // A source directory that *is* one of this copy's destinations is one
         // being copied into. Following it walks the copy's own output back
@@ -315,11 +282,41 @@ impl CopyWalk<'_> {
             ));
         }
 
+        // -s applies before -i (POSIX: the order of -o, -p and -s is
+        // significant). A name that becomes empty is ignored -- that name
+        // only: a directory's descendants are still copied, each under its
+        // own substitution, as they would be through an archive.
+        let Some(dest) = substitute_name(&self.options.substitutions, &member) else {
+            return if metadata.is_dir() {
+                self.descend(member, metadata)
+            } else {
+                Ok(false)
+            };
+        };
+
+        let dest = {
+            let mut prompter = self.prompter.borrow_mut();
+            if let Some(ref mut p) = *prompter {
+                match p.prompt(&dest)? {
+                    // POSIX: "the file ... shall be skipped" -- that name
+                    // alone, as with an empty -s replacement.
+                    RenameResult::Skip if metadata.is_dir() => {
+                        return self.descend(member, metadata)
+                    }
+                    RenameResult::Skip => return Ok(false),
+                    RenameResult::UseOriginal => dest,
+                    RenameResult::Rename(new_name) => new_name,
+                }
+            } else {
+                dest
+            }
+        };
+
         if metadata.is_dir() {
-            return self.enter_directory(src, member, metadata);
+            return self.enter_directory(entry, member, &dest, metadata);
         }
 
-        let Some(mp) = MemberPath::parse(&member)? else {
+        let Some(mp) = MemberPath::parse(&dest)? else {
             return Ok(false);
         };
 
@@ -334,20 +331,16 @@ impl CopyWalk<'_> {
         if self.options.no_clobber && existing.is_some() {
             return Ok(false);
         }
-        if self.options.update && !is_source_newer(metadata, existing.as_ref()) {
+        if self.options.update && !self.is_source_newer(metadata, existing.as_ref()) {
             return Ok(false);
         }
-
-        if self.options.verbose {
-            let mut line = Vec::new();
-            crate::escape::push_escaped(
-                &mut line,
-                crate::rawpath::as_bytes(src),
-                crate::escape::stderr_style(),
-            );
-            line.push(b'\n');
-            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
+        // The destination name already *is* the source (`pax -rw tree .`):
+        // replacing it would rewrite the file from itself and split its links.
+        if existing.is_some_and(|st| is_source(&st, entry, metadata)) && !self.options.link {
+            return overwrites_itself(src);
         }
+
+        self.print_verbose(src);
 
         if metadata.is_symlink() {
             // ftw has already done the readlinkat from the descriptor of the
@@ -383,64 +376,125 @@ impl CopyWalk<'_> {
     /// Not here: a source mode without write or search permission (0555, say)
     /// would stop us creating the very files that belong inside it, and any
     /// mode, owner or time set now would be invalidated by populating it
-    /// anyway. `leave_directory` does it on the way out.
+    /// anyway. `pending_dirs` applies them once the copy is done.
+    ///
+    /// -k and -u treat a directory as they do any file: one already there --
+    /// unless this copy made it only to hold earlier names -- keeps its own
+    /// attributes, under -u if it is not older than the source. Its contents
+    /// are still copied, each subject to the same test.
     fn enter_directory(
+        &self,
+        entry: &ftw::Entry<'_>,
+        member: PathBuf,
+        dest: &Path,
+        metadata: &ftw::Metadata,
+    ) -> PaxResult<bool> {
+        let src_path = entry.path();
+        let src = src_path.as_inner();
+        // `.` as an operand, or a -s result naming it (or nothing below the
+        // destination at all), has no directory of its own to stamp. Its
+        // children are still copied, each under its own name, as they would
+        // be extracted from an archive.
+        let Some(mp) = MemberPath::parse(dest)? else {
+            self.print_verbose(src);
+            return self.descend(member, metadata);
+        };
+        let parent = self.tree.parent_of(&mp, true)?;
+        let existing = stat_at(parent.as_fd(), &mp.leaf);
+        if existing.is_some_and(|st| is_source(&st, entry, metadata)) {
+            return self.dir_onto_itself(src, member, metadata);
+        }
+        let keep = existing.is_some_and(|st| self.keeps_existing_dir(metadata, &st));
+        // Created no more open than its source, and reopened with
+        // O_DIRECTORY|O_NOFOLLOW, so a symbolic link left in the destination
+        // is refused rather than descended through.
+        if !keep {
+            make_dir_at(self.tree, parent.as_fd(), &mp.leaf, metadata.mode(), false)?;
+        }
+        let dir = open_dir_at(parent.as_fd(), &mp.leaf, false)?;
+        let stamp = (!keep).then_some(mp);
+
+        // Remember what this destination directory *is*, so the walk can
+        // recognise it if the source tree leads back here.
+        let dest_st = stat_at(dir.as_fd(), c".");
+        if let Some(st) = &dest_st {
+            self.dest_ids.borrow_mut().insert(file_id(st));
+        }
+
+        self.print_verbose(src);
+
+        if let (Some(mp), Some(st)) = (stamp, dest_st) {
+            self.pending_dirs
+                .borrow_mut()
+                .push(&mp, &st, attrs_of(metadata));
+        }
+        self.descend(member, metadata)
+    }
+
+    /// A directory whose destination is the directory itself (`pax -rw tree
+    /// .`) is neither created nor stamped. Without -s or -i everything below
+    /// it maps onto itself too, and one diagnostic covers the lot. With them
+    /// its contents may be renamed elsewhere, and are each copied under their
+    /// own name, as they would be extracted from an archive; any that still
+    /// map onto themselves are diagnosed one by one.
+    fn dir_onto_itself(
         &self,
         src: &Path,
         member: PathBuf,
         metadata: &ftw::Metadata,
     ) -> PaxResult<bool> {
-        // `open_dir_at` creates it when missing and otherwise opens what is
-        // there with O_DIRECTORY|O_NOFOLLOW, so a symbolic link left in the
-        // destination is refused rather than descended through.
-        let dir = if member.as_os_str().is_empty() {
-            self.tree.root().try_clone_to_owned()?
-        } else {
-            let Some(mp) = MemberPath::parse(&member)? else {
-                return Ok(false);
-            };
-            let parent = self.tree.parent_of(&mp, true)?;
-            open_dir_at(parent.as_fd(), &mp.leaf, true)?
-        };
-
-        // Remember what this destination directory *is*, so the walk can
-        // recognise it if the source tree leads back here.
-        if let Some(st) = stat_at(dir.as_fd(), c".") {
-            // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
-            #[allow(clippy::unnecessary_cast)]
-            self.dest_ids
-                .borrow_mut()
-                .insert((st.st_dev as u64, st.st_ino as u64));
+        if self.options.substitutions.is_empty() && !self.options.interactive {
+            return overwrites_itself(src);
         }
+        self.print_verbose(src);
+        self.descend(member, metadata)
+    }
 
-        if self.options.verbose {
-            let mut line = Vec::new();
-            crate::escape::push_escaped(
-                &mut line,
-                crate::rawpath::as_bytes(src),
-                crate::escape::stderr_style(),
-            );
-            line.push(b'\n');
-            let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
+    /// Whether -k or -u leaves the directory already at a destination name
+    /// with its own attributes.
+    fn keeps_existing_dir(&self, metadata: &ftw::Metadata, st: &libc::stat) -> bool {
+        if self.tree.claim_implicit(st) {
+            return false;
         }
+        self.options.no_clobber
+            || (self.options.update && !self.is_source_newer(metadata, Some(st)))
+    }
 
-        // `.` as an operand has no directory of its own to stamp: its children
-        // are copied straight into the destination root.
-        let pending = if member.as_os_str().is_empty() {
-            None
-        } else {
-            Some((dir, attrs_of(metadata)))
-        };
+    /// Whether the source is newer than the destination already there (`-u`)
+    /// -- as it was before this run, which a `find -depth` list has already
+    /// written into by the time it names the directory. Times compare to the
+    /// nanosecond.
+    fn is_source_newer(&self, src_metadata: &ftw::Metadata, dest: Option<&libc::stat>) -> bool {
+        let src = (src_metadata.mtime(), src_metadata.mtime_nsec());
+        dest.is_none_or(|st| src > self.tree.mtime_before_run(st))
+    }
 
-        if self.options.no_recurse {
-            // No postprocess_dir will fire, so stamp it now.
-            if let Some((dir, attrs)) = pending {
-                set_attrs_fd(dir.as_fd(), &attrs, &policy_of(self.options))?;
-            }
+    /// -v: name the source file on standard error.
+    fn print_verbose(&self, src: &Path) {
+        if !self.options.verbose {
+            return;
+        }
+        let mut line = Vec::new();
+        crate::escape::push_escaped(
+            &mut line,
+            crate::rawpath::as_bytes(src),
+            crate::escape::stderr_style(),
+        );
+        line.push(b'\n');
+        let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
+    }
+
+    /// Walk into the source directory `member`, unless -d says not to or it
+    /// is a mount point -X stops at.
+    fn descend(&self, member: PathBuf, metadata: &ftw::Metadata) -> PaxResult<bool> {
+        // -X copies a directory on another device but nothing below it.
+        let operand_dev = self.dev_stack.borrow().first().copied();
+        if self.options.no_recurse
+            || !crate::modes::may_descend(self.options.one_file_system, operand_dev, metadata.dev())
+        {
             return Ok(false);
         }
 
-        self.dest_stack.borrow_mut().push(pending);
         self.member_stack.borrow_mut().push(member);
         self.dev_stack.borrow_mut().push(metadata.dev());
         Ok(true)
@@ -471,13 +525,26 @@ fn member_name(src: &Path) -> PathBuf {
     out
 }
 
-/// Check if source is newer than the destination that is already there (`-u`).
-fn is_source_newer(src_metadata: &ftw::Metadata, dest: Option<&libc::stat>) -> bool {
-    // If destination doesn't exist, always copy
-    let Some(dest) = dest else {
+/// Whether the destination `st` is the very file being copied -- or, when
+/// -H or -L followed a symbolic link to reach it, that link: it is just as
+/// much the source, and replacing it destroys it (`pax -rw -H link .`).
+fn is_source(st: &libc::stat, entry: &ftw::Entry<'_>, metadata: &ftw::Metadata) -> bool {
+    let id = file_id(st);
+    if id == (metadata.dev(), metadata.ino()) {
         return true;
-    };
-    src_metadata.mtime() > dest.st_mtime
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK || !followed_link(entry, metadata) {
+        return false;
+    }
+    // SAFETY: the walk keeps the entry's directory open while it is visited.
+    let dir = unsafe { BorrowedFd::borrow_raw(entry.dir_fd()) };
+    stat_at(dir, entry.file_name()).is_some_and(|link| file_id(&link) == id)
+}
+
+/// Diagnose copying a file to its own name, as BSD pax words it, and skip it.
+fn overwrites_itself(src: &Path) -> PaxResult<bool> {
+    crate::error::report_error(src, "file would overwrite itself; not copied");
+    Ok(false)
 }
 
 /// Recreate a special file (FIFO or device node) below `dirfd`.
@@ -567,7 +634,8 @@ fn copy_symlink(
 
     // A symlink's own mode is meaningless and there is no portable way to chmod
     // one, so only owner and times are restored.
-    set_link_attrs_at(dirfd, name, &attrs_of(metadata), &policy_of(options))
+    set_link_attrs_at(dirfd, name, &attrs_of(metadata), &policy_of(options))?;
+    Ok(())
 }
 
 /// Copy a regular file
@@ -587,30 +655,32 @@ fn copy_file(
 
     // -l: link to the source rather than copying it.
     if options.link {
-        let linked = create_replacing(dirfd, name, options.no_clobber, || {
-            // From the descriptor of the directory the walk found it in, not
-            // by re-resolving the whole source path. flags 0: link the source
-            // itself, never what it points at.
-            let r = unsafe {
-                libc::linkat(
-                    entry.dir_fd(),
-                    entry.file_name().as_ptr(),
-                    dirfd.as_raw_fd(),
-                    name.as_ptr(),
-                    0,
-                )
-            };
-            if r != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        // From the descriptor of the directory the walk found it in, not by
+        // re-resolving the whole source path. Never by unlinking the source:
+        // `pax -rwl tree .` names every file as its own destination. Under
+        // -H/-L the walk followed a symbolic link here, and the link made is
+        // to the file it refers to, as POSIX requires of -l.
+        let linked = link_replacing_with(
+            entry.dir_fd(),
+            entry.file_name(),
+            followed_link(entry, metadata),
+            dirfd,
+            name,
+            options.no_clobber,
+        );
         match linked {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                // Hard link failed (maybe cross-device), fall back to copy
-                crate::error::report_error(src, format!("hard link failed, copying: {e}"));
+            // The name is resolved again by linkat, so what it linked is
+            // checked to be the file the walk saw; if the name changed in
+            // between, the copy below replaces the link with that file.
+            Ok(false) if is_file_at(dirfd, name, metadata) => return Ok(()),
+            Ok(true) => {
+                crate::error::report_error(src, "Unable to link file to itself");
+                return Ok(());
             }
+            // POSIX: links are made "whenever possible". One that cannot be
+            // made -- across devices, most often -- means the file is copied
+            // instead, which is the expected outcome and not an error.
+            Ok(false) | Err(_) => {}
         }
     }
 
@@ -621,38 +691,35 @@ fn copy_file(
     // raw name instead let a `-s` rename to an absolute path be handed to
     // `linkat`, which resolves an absolute path from the root of the filesystem
     // and ignores the anchor descriptor entirely.
-    if let Some(link_target) = link_tracker.check_ids(
-        metadata.dev(),
-        metadata.ino(),
-        metadata.nlink() as u32,
-        member,
-    ) {
+    let (dev, ino, nlink) = (metadata.dev(), metadata.ino(), metadata.nlink() as u32);
+    if let Some(link_target) = link_tracker.lookup(dev, ino, nlink) {
         let Some(target) = MemberPath::parse(&link_target)? else {
             return do_copy_file(entry, dirfd, name, metadata, options);
         };
         let target_dir = tree.parent_of(&target, false)?;
-        create_replacing(dirfd, name, options.no_clobber, || {
-            // Resolved one component at a time from the destination anchor, the
-            // same way the file itself was created. flags 0: link that file
-            // itself, never anything it might point at.
-            let r = unsafe {
-                libc::linkat(
-                    target_dir.as_raw_fd(),
-                    target.leaf.as_ptr(),
-                    dirfd.as_raw_fd(),
-                    name.as_ptr(),
-                    0,
-                )
-            };
-            if r != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        })?;
+        // Resolved one component at a time from the destination anchor, the
+        // same way the file itself was created. A name that already is that
+        // copy -- this very name visited again, from the list and from the
+        // walk -- is left alone rather than unlinked out from under itself.
+        link_replacing(
+            target_dir.as_raw_fd(),
+            &target.leaf,
+            dirfd,
+            name,
+            options.no_clobber,
+        )?;
         return Ok(());
     }
 
-    do_copy_file(entry, dirfd, name, metadata, options)
+    do_copy_file(entry, dirfd, name, metadata, options)?;
+    // Only a copy that exists can be linked to by the file's later names.
+    link_tracker.record(dev, ino, nlink, member);
+    Ok(())
+}
+
+/// Whether `name` in `dirfd` is the file `metadata` describes.
+fn is_file_at(dirfd: BorrowedFd<'_>, name: &CStr, metadata: &ftw::Metadata) -> bool {
+    stat_at(dirfd, name).is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino()))
 }
 
 /// Actually copy file contents
@@ -667,11 +734,10 @@ fn do_copy_file(
     // against the (dev, ino) the walk saw, rather than re-resolving the whole
     // source path. Whether the walk dereferenced this entry is observable from
     // the entry itself, so -H/-L stays decided in the traversal options.
-    let followed = entry.is_symlink() == Some(true) && !metadata.is_symlink();
     let mut src_file = crate::modes::anchored::open_source_file(
         entry.dir_fd(),
         entry.file_name(),
-        followed,
+        followed_link(entry, metadata),
         (metadata.dev(), metadata.ino()),
     )?;
 
@@ -703,16 +769,110 @@ fn do_copy_file(
         return Ok(());
     };
 
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = src_file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        dest_file.write_all(&buf[..n])?;
+    copy_contents(&mut src_file, &mut dest_file, metadata.size())?;
+    if options.reset_atime {
+        restore_atime(src_file.as_fd(), entry.path().as_inner(), metadata);
     }
 
-    set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))
+    set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))?;
+    // A filesystem that defers writes reports their failure on close.
+    crate::blocked_io::close_file(dest_file)?;
+    Ok(())
+}
+
+/// The largest buffer `copy_contents` reads through.
+const COPY_BUFFER: u64 = 128 * 1024;
+
+/// Copy everything left to read in `src` to `dest`.
+///
+/// On Linux the kernel moves the data (`copy_file_range`), which spares the
+/// round trip through user space and lets a filesystem that can share or
+/// clone extents do so. Where it cannot -- across filesystems on an older
+/// kernel, or a filesystem that does not support it -- what is left goes
+/// through a buffer instead, as it does everywhere else. `size` is only the
+/// size the walk saw, for sizing that buffer: the copy runs to end of file.
+fn copy_contents(src: &mut File, dest: &mut File, size: u64) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if kernel_copy(src, dest)? {
+        return Ok(());
+    }
+
+    // No larger than the file needs, so copying many small files does not
+    // allocate a large buffer for each; one more byte than its size reads
+    // end of file in the same pass.
+    let mut buf = vec![0u8; size.saturating_add(1).clamp(512, COPY_BUFFER) as usize];
+    loop {
+        let n = match src.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        dest.write_all(&buf[..n])?;
+    }
+}
+
+/// `copy_file_range` from `src` to `dest` until end of file: `Ok(false)` when
+/// the kernel cannot copy between these two files, with whatever it did copy
+/// already reflected in both file offsets, so the caller carries on from there.
+#[cfg(target_os = "linux")]
+fn kernel_copy(src: &File, dest: &File) -> std::io::Result<bool> {
+    let mut copied_any = false;
+    loop {
+        let n = unsafe {
+            libc::copy_file_range(
+                src.as_raw_fd(),
+                std::ptr::null_mut(),
+                dest.as_raw_fd(),
+                std::ptr::null_mut(),
+                1 << 30,
+                0,
+            )
+        };
+        let errno = (n < 0).then(std::io::Error::last_os_error);
+        match kernel_copy_step(n, errno.as_ref().and_then(|e| e.raw_os_error()), copied_any) {
+            KernelCopyStep::Again => copied_any |= n > 0,
+            KernelCopyStep::Done => return Ok(true),
+            KernelCopyStep::Fallback => return Ok(false),
+            KernelCopyStep::Fail => return Err(errno.expect("only a failed call fails")),
+        }
+    }
+}
+
+/// What one `copy_file_range` result means for `kernel_copy`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq)]
+enum KernelCopyStep {
+    /// Call again.
+    Again,
+    /// End of file.
+    Done,
+    /// The kernel cannot copy these; read and write what is left instead.
+    Fallback,
+    /// A real error.
+    Fail,
+}
+
+/// Classify the result `n` (and its errno) of one `copy_file_range` call.
+///
+/// 0 is end of file -- except from the very first call: Linux 5.3 to 5.18
+/// return 0 for pseudo-files whose size reads as 0 (procfs, sysfs, tracefs),
+/// and overlayfs has done the same, so a /proc file came out empty with a
+/// zero exit status. As Rust's std does, nothing copied yet means "try the
+/// ordinary way", which then finds the real end of file for a file that is
+/// truly empty.
+#[cfg(target_os = "linux")]
+fn kernel_copy_step(n: isize, errno: Option<i32>, copied_any: bool) -> KernelCopyStep {
+    match (n, errno) {
+        (0, _) if copied_any => KernelCopyStep::Done,
+        (0, _) => KernelCopyStep::Fallback,
+        (n, _) if n > 0 => KernelCopyStep::Again,
+        (_, Some(libc::EINTR)) => KernelCopyStep::Again,
+        (_, Some(libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM)) => {
+            KernelCopyStep::Fallback
+        }
+        _ => KernelCopyStep::Fail,
+    }
 }
 
 /// A source file's attributes, in the shape the anchored helpers take.
@@ -751,30 +911,10 @@ fn set_node_attrs_at(
     let attrs = attrs_of(metadata);
     let policy = policy_of(options);
 
-    // Owner and times take AT_SYMLINK_NOFOLLOW; the mode check is in
-    // set_permissions_at, which refuses a name that is a symbolic link.
-    set_link_attrs_at(dirfd, name, &attrs, &policy)?;
-
-    let Some(st) = stat_at(dirfd, name) else {
-        return Err(std::io::Error::last_os_error().into());
-    };
-    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-        return Err(PaxError::InvalidHeader(
-            "refusing to set permissions through a symbolic link".to_string(),
-        ));
-    }
-    let r = unsafe {
-        libc::fchmodat(
-            dirfd.as_raw_fd(),
-            name.as_ptr(),
-            policy.mode(&attrs) as libc::mode_t,
-            0,
-        )
-    };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
+    // Owner and times take AT_SYMLINK_NOFOLLOW, and chmod_at never follows
+    // a symbolic link either.
+    let owner_set = set_link_attrs_at(dirfd, name, &attrs, &policy)?;
+    chmod_at(dirfd, name, policy.mode(&attrs, owner_set))
 }
 
 #[cfg(test)]
@@ -798,7 +938,12 @@ mod tests {
             ..Default::default()
         };
 
-        copy_files(std::slice::from_ref(&src_file), dest_dir.path(), &options).unwrap();
+        copy_files(
+            &mut std::iter::once(src_file.clone()),
+            dest_dir.path(),
+            &options,
+        )
+        .unwrap();
 
         // An absolute operand is stored under its path with the leading slash
         // removed, exactly as an archive would record it, so that is where it
@@ -821,7 +966,12 @@ mod tests {
 
         let options = CopyOptions::default();
 
-        copy_files(std::slice::from_ref(&subdir), dest_dir.path(), &options).unwrap();
+        copy_files(
+            &mut std::iter::once(subdir.clone()),
+            dest_dir.path(),
+            &options,
+        )
+        .unwrap();
 
         let copied_subdir = dest_dir.path().join(member_name(&subdir));
         assert!(copied_subdir.is_dir());
@@ -854,7 +1004,7 @@ mod tests {
             ..Default::default()
         };
 
-        copy_files(&[src_file], dest_dir.path(), &options).unwrap();
+        copy_files(&mut std::iter::once(src_file), dest_dir.path(), &options).unwrap();
 
         // Destination should still have original content
         assert_eq!(fs::read_to_string(&dest_file).unwrap(), "existing content");
@@ -875,13 +1025,40 @@ mod tests {
 
         let options = CopyOptions::default();
 
-        copy_files(std::slice::from_ref(&src_link), dest_dir.path(), &options).unwrap();
+        copy_files(
+            &mut std::iter::once(src_link.clone()),
+            dest_dir.path(),
+            &options,
+        )
+        .unwrap();
 
         let dest_link = dest_dir.path().join(member_name(&src_link));
         assert!(dest_link.symlink_metadata().unwrap().is_symlink());
         assert_eq!(
             fs::read_link(&dest_link).unwrap().to_str().unwrap(),
             "target.txt"
+        );
+    }
+
+    /// A first `copy_file_range` that returns 0 is not trusted as end of
+    /// file: /proc and sysfs files report size 0 to it on some kernels.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_kernel_copy_first_zero_falls_back() {
+        assert_eq!(kernel_copy_step(0, None, false), KernelCopyStep::Fallback);
+        assert_eq!(kernel_copy_step(0, None, true), KernelCopyStep::Done);
+        assert_eq!(kernel_copy_step(4096, None, false), KernelCopyStep::Again);
+        assert_eq!(
+            kernel_copy_step(-1, Some(libc::EINTR), true),
+            KernelCopyStep::Again
+        );
+        assert_eq!(
+            kernel_copy_step(-1, Some(libc::EXDEV), false),
+            KernelCopyStep::Fallback
+        );
+        assert_eq!(
+            kernel_copy_step(-1, Some(libc::EIO), true),
+            KernelCopyStep::Fail
         );
     }
 }

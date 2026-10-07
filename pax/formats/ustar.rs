@@ -34,6 +34,7 @@
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, SourceHeader};
 use crate::error::{PaxError, PaxResult};
+use crate::formats::ArchiveStream;
 use std::io::{Read, Write};
 
 pub(crate) const BLOCK_SIZE: usize = 512;
@@ -80,14 +81,14 @@ pub(crate) const DEVMINOR_OFF: usize = 337;
 
 /// ustar archive reader
 pub struct UstarReader<R: Read> {
-    reader: R,
+    reader: ArchiveStream<R>,
     current_size: u64,
     bytes_read: u64,
 }
 
 impl<R: Read> UstarReader<R> {
-    /// Create a new ustar reader
-    pub fn new(reader: R) -> Self {
+    /// A ustar reader over an archive stream
+    pub fn from_stream(reader: ArchiveStream<R>) -> Self {
         UstarReader {
             reader,
             current_size: 0,
@@ -102,7 +103,7 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
         self.skip_data()?;
 
         loop {
-            let Some(header) = next_header_block(&mut self.reader)? else {
+            let Some(header) = next_header_block(&mut self.reader, LoneZeroBlock::Stop)? else {
                 return Ok(None);
             };
 
@@ -115,11 +116,22 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
             // own name field is truncated. The records and the member are
             // dropped together -- there can be more than one record.
             if long_name_record(header[TYPEFLAG_OFF]).is_some() {
-                skip_long_name_records(&mut self.reader, header)?;
+                let Some(size) = consume_long_name_group(
+                    &mut self.reader,
+                    header,
+                    SizeRule::Ustar,
+                    LoneZeroBlock::Stop,
+                )?
+                else {
+                    return Ok(None);
+                };
+                self.current_size = size;
+                self.bytes_read = 0;
+                self.skip_data()?;
                 continue;
             }
 
-            let entry = parse_header(&header, SizeRule::Ustar)?;
+            let entry = parse_header(&header, SizeRule::Ustar, |_| {})?;
             self.current_size = entry.size;
             self.bytes_read = 0;
 
@@ -145,12 +157,16 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
         let to_skip = total_bytes.saturating_sub(self.bytes_read);
 
         if to_skip > 0 {
-            skip_bytes(&mut self.reader, to_skip)?;
+            self.reader.skip(to_skip)?;
         }
 
         // Reset state - we've finished with this entry's data
         self.bytes_read = total_bytes;
         Ok(())
+    }
+
+    fn finish(&mut self, reached_end: bool) -> PaxResult<()> {
+        self.reader.finish(reached_end)
     }
 }
 
@@ -181,8 +197,7 @@ impl<W: Write> ArchiveWriter for UstarWriter<W> {
         self.writer.write_all(&header)?;
         self.bytes_written = 0;
         self.current_size = entry.size;
-        // Per POSIX, symlinks and hardlinks have no data blocks in ustar format
-        self.skip_data = matches!(entry.entry_type, EntryType::Symlink | EntryType::Hardlink);
+        self.skip_data = !stores_data(entry.entry_type);
         Ok(())
     }
 
@@ -224,7 +239,6 @@ pub(crate) fn is_zero_block(block: &[u8]) -> bool {
     block.iter().all(|&b| b == 0)
 }
 
-/// Parse a header block into an ArchiveEntry
 /// Which format's rules govern a header's size field.
 ///
 /// POSIX (pax, "No data logical records are stored for types 1, 2, or 5") makes
@@ -246,7 +260,11 @@ pub(crate) enum SizeRule {
 
 impl SizeRule {
     /// The number of data bytes that actually follow this header.
-    fn data_size(self, entry_type: EntryType, declared: u64) -> u64 {
+    ///
+    /// `declared` is the size the archive records for the member -- the ustar
+    /// field, or a pax `size=` record that overrides it. Either way the type
+    /// decides whether any data follows.
+    pub(crate) fn data_size(self, entry_type: EntryType, declared: u64) -> u64 {
         match entry_type {
             // A directory's size field is a directory size limit, not a
             // length: POSIX says a system that does not implement such
@@ -255,6 +273,12 @@ impl SizeRule {
             EntryType::Directory => 0,
             EntryType::Symlink => 0,
             EntryType::Hardlink if self == SizeRule::Ustar => 0,
+            // Types 3, 4 and 6: "no data logical records shall be stored on
+            // the medium. Additionally, for type 6, the size field shall be
+            // ignored when reading." A device's size field has no meaning
+            // either, and libarchive ignores it for all three, so none of them
+            // is diagnosed.
+            EntryType::CharDevice | EntryType::BlockDevice | EntryType::Fifo => 0,
             _ => declared,
         }
     }
@@ -270,22 +294,38 @@ impl SizeRule {
     }
 }
 
-pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResult<ArchiveEntry> {
+/// Parse a header block into an ArchiveEntry.
+///
+/// `overrides` applies what the archive says about the member outside its
+/// header block -- a pax archive's extended-header records -- before the
+/// member's type and data length are settled, since both depend on its final
+/// name and size. A plain ustar reader passes a closure that does nothing.
+pub(crate) fn parse_header(
+    header: &[u8; BLOCK_SIZE],
+    rule: SizeRule,
+    overrides: impl FnOnce(&mut ArchiveEntry),
+) -> PaxResult<ArchiveEntry> {
     let name = path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
-    let prefix = path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
+    // An old GNU header has no prefix field: GNU tar keeps the access and
+    // change times in those bytes, and joining them onto the name turned
+    // `dir/file` into `14524770401/dir/file`.
+    let prefix = if is_old_gnu(header) {
+        b"".as_slice()
+    } else {
+        path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN])
+    };
 
     let path = crate::rawpath::join(prefix, name);
 
-    let mode = parse_octal(&header[MODE_OFF..MODE_OFF + 8])? as u32;
-    let uid = parse_octal(&header[UID_OFF..UID_OFF + 8])? as u32;
-    let gid = parse_octal(&header[GID_OFF..GID_OFF + 8])? as u32;
-    let declared_size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
-    let mtime = parse_octal(&header[MTIME_OFF..MTIME_OFF + 12])?;
+    let mode = parse_u32_field(&header[MODE_OFF..MODE_OFF + 8], "mode")?;
+    let uid = parse_u32_field(&header[UID_OFF..UID_OFF + 8], "uid")?;
+    let gid = parse_u32_field(&header[GID_OFF..GID_OFF + 8], "gid")?;
+    let declared_size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    let mtime = parse_signed_numeric(&header[MTIME_OFF..MTIME_OFF + 12])?;
 
     let typeflag = header[TYPEFLAG_OFF];
     let flag = parse_typeflag(typeflag);
     let entry_type = flag.entry_type();
-    let size = rule.data_size(entry_type, declared_size);
 
     let linkname = path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
     let link_target = if linkname.is_empty() {
@@ -326,15 +366,15 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     let gname = name_field(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
 
     // Parse device major/minor for block/char devices
-    let devmajor = parse_octal(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8])? as u32;
-    let devminor = parse_octal(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8])? as u32;
+    let devmajor = parse_u32_field(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8], "devmajor")?;
+    let devminor = parse_u32_field(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8], "devminor")?;
 
-    Ok(ArchiveEntry {
+    let mut entry = ArchiveEntry {
         path,
         mode,
         uid,
         gid,
-        size,
+        size: declared_size,
         mtime,
         entry_type,
         link_target,
@@ -370,7 +410,54 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
             typeflag,
         }),
         ..Default::default()
-    })
+    };
+    overrides(&mut entry);
+    settle_type_and_size(&mut entry, typeflag, rule);
+    Ok(entry)
+}
+
+/// Decide a member's type and data length from its final name and size.
+///
+/// The old-style directory rule runs here, after any `path` and `size`
+/// records, not on the header block's own fields: the 100-byte name field of
+/// a long name can end in a slash where the name does not, and a `size`
+/// record can give data to a header whose size field is empty. Either way the
+/// member is a file, and deciding on the raw fields made it a directory --
+/// whose data, unread, then parsed as further members.
+fn settle_type_and_size(entry: &mut ArchiveEntry, typeflag: u8, rule: SizeRule) {
+    let name = crate::rawpath::as_bytes(&entry.path);
+    if is_old_style_directory(typeflag, name, entry.size) {
+        entry.entry_type = EntryType::Directory;
+    }
+    // A `size` record replaces the size field, not the rule for which types
+    // carry data: a directory or FIFO has none whichever of the two records
+    // its size.
+    entry.size = rule.data_size(entry.entry_type, entry.size);
+}
+
+/// Whether this is an old GNU header: magic "ustar " and version " \0", as
+/// GNU tar wrote before POSIX ustar, with no prefix field.
+fn is_old_gnu(header: &[u8; BLOCK_SIZE]) -> bool {
+    &header[MAGIC_OFF..VERSION_OFF + VERSION_LEN] == b"ustar  \0"
+}
+
+/// Whether a header is a directory by the convention that predates typeflag
+/// 5: a regular-file header whose name ends in a slash. GNU and BSD tar both
+/// still read it so. Only an empty one: a header that records data is a
+/// regular file whatever it is called, and its data has to be stepped over
+/// as such.
+fn is_old_style_directory(typeflag: u8, name: &[u8], declared_size: u64) -> bool {
+    matches!(typeflag, REGTYPE | AREGTYPE) && name.ends_with(b"/") && declared_size == 0
+}
+
+/// A numeric field that holds a 32-bit value: a mode, an id, a device number.
+///
+/// The base-256 form can hold far more. Truncating it is not a value the
+/// archive gave: a uid of 2^32 became 0 -- root, on a setuid file.
+fn parse_u32_field(bytes: &[u8], what: &str) -> PaxResult<u32> {
+    let value = parse_numeric(bytes)?;
+    u32::try_from(value)
+        .map_err(|_| PaxError::InvalidHeader(format!("{what} field out of range: {value}")))
 }
 
 /// Parse a NUL-terminated or space-padded string field.
@@ -415,6 +502,9 @@ pub(crate) fn name_field(bytes: &[u8]) -> &[u8] {
 /// Parse an octal number from bytes
 pub(crate) fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
     let s = parse_string(bytes);
+    // Historical writers pad on the left with spaces ("%6o "), as format
+    // detection has always accepted.
+    let s = s.trim_start_matches(' ');
     if s.is_empty() {
         return Ok(0);
     }
@@ -422,7 +512,7 @@ pub(crate) fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
     if s.starts_with('+') || s.starts_with('-') {
         return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
     }
-    u64::from_str_radix(&s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
+    u64::from_str_radix(s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
 }
 
 /// What a header's typeflag means, and why.
@@ -510,14 +600,38 @@ pub(crate) fn parse_typeflag(flag: u8) -> TypeFlag {
     }
 }
 
-/// Read one 512-byte block, or `None` at end of file.
+/// Read one 512-byte block, or `None` at end of file. A partial block is an
+/// archive truncated inside a header, and an error.
 fn read_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
     let mut block = [0u8; BLOCK_SIZE];
-    match reader.read_exact(&mut block) {
-        Ok(()) => Ok(Some(block)),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e.into()),
+    Ok(crate::formats::read_header(reader, &mut block)?.then_some(block))
+}
+
+/// The block after a zero block, or `None` when the archive ends inside it.
+///
+/// An archive cut off inside the second block of its end-of-archive
+/// indicator is complete: the first zero block already ended it, and bsdtar
+/// reads it as such. Only a cut inside something that is not zeros is a
+/// truncated header.
+fn read_block_after_zero(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
+    let mut block = [0u8; BLOCK_SIZE];
+    match crate::formats::read_up_to(reader, &mut block)? {
+        BLOCK_SIZE => Ok(Some(block)),
+        _ if is_zero_block(&block) => Ok(None),
+        _ => Err(crate::formats::truncated_header()),
     }
+}
+
+/// What [`next_header_block`] makes of a single zero block followed by a
+/// header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoneZeroBlock {
+    /// End the archive there, and say so: reading and listing.
+    Stop,
+    /// Read on from the header after it, silently. Append mode writes where
+    /// the archive ends, and stopping at a lone zero block put that in front
+    /// of members it then destroyed.
+    StepOver,
 }
 
 /// The next header block, or `None` at the end of the archive.
@@ -534,7 +648,10 @@ fn read_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
 /// place in the file. Counting correctly means threading a byte position
 /// through every read and skip in both readers, which is more machinery than
 /// a diagnostic detail is worth.
-pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
+pub(crate) fn next_header_block(
+    reader: &mut impl Read,
+    lone_zero: LoneZeroBlock,
+) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
     let Some(block) = read_block(reader)? else {
         return Ok(None);
     };
@@ -542,10 +659,11 @@ pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8;
         return Ok(Some(block));
     }
 
-    match read_block(reader)? {
+    match read_block_after_zero(reader)? {
         // Two zero blocks, or one followed by end of file: a proper end.
         None => Ok(None),
         Some(next) if is_zero_block(&next) => Ok(None),
+        Some(next) if lone_zero == LoneZeroBlock::StepOver => Ok(Some(next)),
         Some(_) => {
             crate::error::report_error(
                 "archive",
@@ -557,6 +675,54 @@ pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8;
     }
 }
 
+/// Parse an unsigned numeric header field: octal digits, or the base-256 form
+/// GNU tar writes for a value too large for them.
+pub(crate) fn parse_numeric(bytes: &[u8]) -> PaxResult<u64> {
+    match parse_base256(bytes)? {
+        None => parse_octal(bytes),
+        Some(v) => u64::try_from(v)
+            .map_err(|_| PaxError::InvalidHeader(format!("negative numeric field: {v}"))),
+    }
+}
+
+/// Parse a signed numeric header field (mtime): octal digits, or base-256,
+/// where a negative value is a time before the epoch.
+pub(crate) fn parse_signed_numeric(bytes: &[u8]) -> PaxResult<i64> {
+    match parse_base256(bytes)? {
+        Some(v) => Ok(v),
+        None => {
+            let v = parse_octal(bytes)?;
+            i64::try_from(v)
+                .map_err(|_| PaxError::InvalidHeader(format!("numeric field out of range: {v}")))
+        }
+    }
+}
+
+/// A GNU base-256 field, `None` when the field is not one.
+///
+/// The high bit of the first byte marks the form, and the field is then a
+/// big-endian two's complement number in the remaining bits: GNU tar writes a
+/// non-negative N as 256^len/2 + N (first byte 0x80) and a negative one as
+/// 256^len - N (first byte 0xff), so bit 6 of the first byte is the sign.
+fn parse_base256(bytes: &[u8]) -> PaxResult<Option<i64>> {
+    let Some((&first, rest)) = bytes.split_first() else {
+        return Ok(None);
+    };
+    if first & 0x80 == 0 {
+        return Ok(None);
+    }
+    let out_of_range =
+        || PaxError::InvalidHeader("base-256 numeric field out of range".to_string());
+    let mut value = i64::from(first & 0x3f) - i64::from(first & 0x40);
+    for &b in rest {
+        value = value
+            .checked_mul(256)
+            .and_then(|v| v.checked_add(i64::from(b)))
+            .ok_or_else(out_of_range)?;
+    }
+    Ok(Some(value))
+}
+
 /// Read and discard a GNU `L`/`K` long-name record, returning its recorded
 /// value.
 ///
@@ -566,14 +732,14 @@ pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8;
 /// a long link target and a long name, so a reader that assumes exactly one
 /// record mistakes the second record's *header* for the member, and then reads
 /// the real member header as an ordinary one -- restoring it under the
-/// truncated name it was trying to avoid. `skip_long_name_records` consumes the
-/// whole run.
-pub(crate) fn consume_long_name_record(
+/// truncated name it was trying to avoid. [`LongNameGroup`] gathers the whole
+/// run.
+fn consume_long_name_record(
     reader: &mut impl Read,
     header: &[u8; BLOCK_SIZE],
     what: &str,
 ) -> PaxResult<Vec<u8>> {
-    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
     let data = crate::formats::read_declared(reader, size, crate::formats::MAX_NAME, what)?;
     let padding = (BLOCK_SIZE - (size as usize % BLOCK_SIZE)) % BLOCK_SIZE;
     if padding > 0 {
@@ -585,36 +751,106 @@ pub(crate) fn consume_long_name_record(
     Ok(data[..end].to_vec())
 }
 
-/// Consume every long-name record preceding a member, then the member itself,
-/// and report the whole group as unsupported.
-///
-/// `header` is the first record's header. Returns once the member has been
-/// stepped over, so the caller's next read is the following member.
+/// The GNU long-name records read so far ahead of a member, which describe
+/// that member rather than files of their own.
 ///
 /// Implementing the extension is separate work. What this avoids is the
 /// alternative: extracting `././@LongLink` as a file of its own and the member
 /// under a name truncated to 100 bytes -- two wrong files, and the name that
-/// got path-checked is not the name the archive meant.
-pub(crate) fn skip_long_name_records(
-    reader: &mut impl Read,
-    mut header: [u8; BLOCK_SIZE],
-) -> PaxResult<()> {
-    let mut long_name: Option<Vec<u8>> = None;
-    let mut kinds: Vec<&'static str> = Vec::new();
+/// got path-checked is not the name the archive meant. So the member they
+/// describe is skipped, unless something else names it in full (see
+/// [`superseded`](Self::superseded)).
+#[derive(Default)]
+pub(crate) struct LongNameGroup {
+    /// The `L` record's value: the member's name.
+    name: Option<Vec<u8>>,
+    /// Whether there was a `K` record, the member's link target.
+    link: bool,
+    /// What each record was, for the diagnostic.
+    kinds: Vec<&'static str>,
+    /// The last record's own name field, which is all there is to name the
+    /// group by when no `L` record or member follows.
+    record_name: Vec<u8>,
+}
 
-    while let Some(what) = long_name_record(header[TYPEFLAG_OFF]) {
-        let value = consume_long_name_record(reader, &header, what)?;
+impl LongNameGroup {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
+    /// Read the record whose header is `header`, of the kind `what`.
+    pub(crate) fn consume(
+        &mut self,
+        reader: &mut impl Read,
+        header: &[u8; BLOCK_SIZE],
+        what: &'static str,
+    ) -> PaxResult<()> {
+        let value = consume_long_name_record(reader, header, what)?;
         // The `L` record holds the name; `K` holds the link target, which is
         // not what the member is called.
         if header[TYPEFLAG_OFF] == b'L' {
-            long_name = Some(value);
+            self.name = Some(value);
+        } else {
+            self.link = true;
         }
-        kinds.push(what);
+        self.kinds.push(what);
+        self.record_name = path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]).to_vec();
+        Ok(())
+    }
 
-        let Some(next) = next_header_block(reader)? else {
+    /// Whether the member's pax records name everything these records do --
+    /// a `path` for an `L`, a `linkpath` for a `K` -- so that they are moot:
+    /// a pax record overrides the header it describes, however that header's
+    /// own fields were spelt.
+    pub(crate) fn superseded(&self, path: bool, linkpath: bool) -> bool {
+        (self.name.is_none() || path) && (!self.link || linkpath)
+    }
+
+    /// Name the member that is being skipped, and the extensions that
+    /// describe it. `member` is its header, or `None` when the archive ended
+    /// before one.
+    pub(crate) fn report(&self, member: Option<&[u8; BLOCK_SIZE]>) {
+        // The long name if the archive gave one, otherwise the truncated name
+        // in the member's own header -- which is all there is to go on for a
+        // lone `K`.
+        let name = match (&self.name, member) {
+            (Some(n), _) => n.as_slice(),
+            (None, Some(member)) => path_field(&member[NAME_OFF..NAME_OFF + NAME_LEN]),
+            (None, None) => &self.record_name,
+        };
+        crate::error::report_error(
+            &crate::rawpath::from_bytes(name),
+            format!(
+                "uses {}, which is not supported; skipping the member",
+                self.kinds.join(" and ")
+            ),
+        );
+    }
+}
+
+/// Consume every long-name record preceding a member, and the member's header,
+/// and report the whole group as unsupported.
+///
+/// `header` is the first record's header. Returns the length of the member's
+/// data, which the caller steps over -- by seeking, where it can -- so that its
+/// next read is the following member; or `None` when the archive ends after
+/// the records, with no member for them to describe. That is the end of the
+/// archive, and the caller must not read on past the indicator just consumed.
+fn consume_long_name_group(
+    reader: &mut impl Read,
+    mut header: [u8; BLOCK_SIZE],
+    rule: SizeRule,
+    lone_zero: LoneZeroBlock,
+) -> PaxResult<Option<u64>> {
+    let mut group = LongNameGroup::default();
+
+    while let Some(what) = long_name_record(header[TYPEFLAG_OFF]) {
+        group.consume(reader, &header, what)?;
+
+        let Some(next) = next_header_block(reader, lone_zero)? else {
             // The archive ends after the record, with no member to skip.
-            report_long_name_group(&long_name, &header, &kinds);
-            return Ok(());
+            group.report(None);
+            return Ok(None);
         };
         if !verify_checksum(&next) {
             return Err(PaxError::InvalidHeader("checksum mismatch".to_string()));
@@ -623,46 +859,54 @@ pub(crate) fn skip_long_name_records(
     }
 
     // `header` is now the member the records described.
-    report_long_name_group(&long_name, &header, &kinds);
-    skip_member_data(reader, &header)
+    group.report(Some(&header));
+    member_data_size(&header, rule, None).map(Some)
 }
 
-/// Name the member that is being skipped, and the extensions that describe it.
-fn report_long_name_group(
-    long_name: &Option<Vec<u8>>,
-    member: &[u8; BLOCK_SIZE],
-    kinds: &[&'static str],
-) {
-    // The long name if the archive gave one, otherwise the truncated name in
-    // the member's own header -- which is all there is to go on for a lone `K`.
-    let name = match long_name {
-        Some(n) => crate::rawpath::from_bytes(n),
-        None => crate::rawpath::from_bytes(path_field(&member[NAME_OFF..NAME_OFF + NAME_LEN])),
+/// The length of the data that follows a member header, by the same rule
+/// `parse_header` applies, without interpreting the rest of the header.
+/// `size_record` is a pax `size` record for the member, which replaces the
+/// size field.
+pub(crate) fn member_data_size(
+    header: &[u8; BLOCK_SIZE],
+    rule: SizeRule,
+    size_record: Option<u64>,
+) -> PaxResult<u64> {
+    let declared = match size_record {
+        Some(size) => size,
+        None => parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?,
     };
-    crate::error::report_error(
-        &name,
-        format!(
-            "uses {}, which is not supported; skipping the member",
-            kinds.join(" and ")
-        ),
-    );
+    let entry_type = parse_typeflag(header[TYPEFLAG_OFF]).entry_type();
+    Ok(rule.data_size(entry_type, declared))
 }
 
-/// Step over a member's data blocks without interpreting them.
-pub(crate) fn skip_member_data(reader: &mut impl Read, header: &[u8; BLOCK_SIZE]) -> PaxResult<()> {
-    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
-    skip_bytes(reader, round_up_block(size))
-}
-
-/// Verify header checksum
+/// Verify header checksum.
+///
+/// POSIX sums the bytes as unsigned, but historical implementations summed
+/// them as signed chars, and the two differ for a header with any byte above
+/// 127. Either is accepted, as GNU and BSD tar accept them.
 pub(crate) fn verify_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
-    let stored = match parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]) {
-        Ok(v) => v as u32,
-        Err(_) => return false,
+    let Ok(stored) = parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]) else {
+        return false;
     };
+    stored == u64::from(calculate_checksum(header))
+        || i64::try_from(stored).is_ok_and(|s| s == signed_checksum(header))
+}
 
-    let calculated = calculate_checksum(header);
-    stored == calculated
+/// The checksum as a historical implementation computed it: the header bytes
+/// summed as signed chars, the checksum field as spaces.
+fn signed_checksum(header: &[u8; BLOCK_SIZE]) -> i64 {
+    header
+        .iter()
+        .enumerate()
+        .map(|(i, &byte)| {
+            if (CHKSUM_OFF..CHKSUM_OFF + 8).contains(&i) {
+                i64::from(b' ')
+            } else {
+                i64::from(byte as i8)
+            }
+        })
+        .sum()
 }
 
 /// Calculate header checksum
@@ -682,8 +926,16 @@ pub(crate) fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
 // Header building functions
 // ============================================================================
 
+/// Whether a member of this type is followed by data blocks. Per POSIX,
+/// symlinks and hardlinks have none in ustar format, whatever size the entry
+/// carries -- write mode sets a symlink's to its target length for cpio, where
+/// the target *is* the data.
+pub(crate) fn stores_data(entry_type: EntryType) -> bool {
+    !matches!(entry_type, EntryType::Symlink | EntryType::Hardlink)
+}
+
 /// Build a header block from an ArchiveEntry
-fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
+pub(crate) fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     let mut header = [0u8; BLOCK_SIZE];
 
     // Split path into name and prefix if needed
@@ -694,16 +946,16 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     write_octal(&mut header[MODE_OFF..], entry.mode as u64, 8)?;
     write_octal(&mut header[UID_OFF..], entry.uid as u64, 8)?;
     write_octal(&mut header[GID_OFF..], entry.gid as u64, 8)?;
-    // Per POSIX, symlinks and hardlinks must have size=0 (no data blocks)
-    let header_size = match entry.entry_type {
-        EntryType::Symlink | EntryType::Hardlink => 0,
-        _ => entry.size,
+    let header_size = if stores_data(entry.entry_type) {
+        entry.size
+    } else {
+        0
     };
     write_octal(&mut header[SIZE_OFF..], header_size, 12)?;
-    write_octal(&mut header[MTIME_OFF..], entry.mtime, 12)?;
+    write_octal(&mut header[MTIME_OFF..], entry.unsigned_mtime()?, 12)?;
 
     // Typeflag
-    header[TYPEFLAG_OFF] = entry_type_to_flag(&entry.entry_type);
+    header[TYPEFLAG_OFF] = entry_type_to_flag(entry.entry_type)?;
 
     // Linkname
     if let Some(ref target) = entry.link_target {
@@ -779,8 +1031,11 @@ pub(crate) fn split_name_prefix(path: &[u8]) -> Option<(&[u8], &[u8])> {
         return Some((path, b""));
     }
 
-    // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
-    for i in (1..=PREFIX_LEN.min(path.len().saturating_sub(1))).rev() {
+    // Split at the highest '/' that leaves a name of at most NAME_LEN bytes,
+    // and of at least one byte before any trailing '/': a directory's own
+    // trailing slash is no place to split, and left the name field empty --
+    // which an old reader takes for the end of the archive.
+    for i in (1..=PREFIX_LEN.min(path.len().saturating_sub(2))).rev() {
         if path[i] == b'/' && path.len() - (i + 1) <= NAME_LEN {
             return Some((&path[i + 1..], &path[..i]));
         }
@@ -789,9 +1044,14 @@ pub(crate) fn split_name_prefix(path: &[u8]) -> Option<(&[u8], &[u8])> {
     None
 }
 
-/// Convert EntryType to typeflag
-fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
-    match entry_type {
+/// The typeflag of a member of this type, for every writer of a tar header.
+///
+/// A socket has none. Writing it as a regular file, as this used to, put an
+/// empty file in the archive where there had been a socket; write mode
+/// diagnoses one before it gets here (`ArchiveWriter::supports_sockets`), and
+/// this refuses one that does.
+pub(crate) fn entry_type_to_flag(entry_type: EntryType) -> PaxResult<u8> {
+    Ok(match entry_type {
         EntryType::Regular => REGTYPE,
         EntryType::Directory => DIRTYPE,
         EntryType::Symlink => SYMTYPE,
@@ -799,8 +1059,12 @@ fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
         EntryType::CharDevice => CHRTYPE,
         EntryType::BlockDevice => BLKTYPE,
         EntryType::Fifo => FIFOTYPE,
-        EntryType::Socket => REGTYPE, // Sockets typically not stored; fallback to regular
-    }
+        EntryType::Socket => {
+            return Err(PaxError::InvalidFormat(
+                "a socket cannot be stored in a tar archive".to_string(),
+            ))
+        }
+    })
 }
 
 /// Write a string to a field, NUL-terminated if space permits
@@ -852,18 +1116,6 @@ fn padding_needed(bytes_written: u64) -> usize {
     }
 }
 
-/// Skip bytes in a reader
-fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
-    let mut remaining = count;
-    let mut buf = [0u8; 4096];
-    while remaining > 0 {
-        let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
-        reader.read_exact(&mut buf[..to_read])?;
-        remaining -= to_read as u64;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,6 +1135,30 @@ mod tests {
         assert_eq!(name_field(b"\0root"), b"");
         // Not UTF-8, and preserved rather than replaced.
         assert_eq!(name_field(b"gr\xffup\0"), b"gr\xffup");
+    }
+
+    #[test]
+    fn test_parse_base256() {
+        // GNU tar's encoding: 0x80 then the value, big-endian.
+        let mut field = [0u8; 8];
+        field[0] = 0x80;
+        field[5..].copy_from_slice(&[0x2d, 0xc6, 0xc0]);
+        assert_eq!(parse_numeric(&field).unwrap(), 3_000_000);
+
+        let mut size = [0u8; 12];
+        size[0] = 0x80;
+        size[4..].copy_from_slice(&(1u64 << 36).to_be_bytes());
+        assert_eq!(parse_numeric(&size).unwrap(), 1 << 36);
+
+        // A negative mtime is two's complement, first byte 0xff.
+        let mut mtime = [0xffu8; 12];
+        mtime[11] = 0xfe;
+        assert_eq!(parse_signed_numeric(&mtime).unwrap(), -2);
+        assert!(parse_numeric(&mtime).is_err());
+
+        // Octal is unchanged.
+        assert_eq!(parse_numeric(b"0000755\0").unwrap(), 0o755);
+        assert_eq!(parse_signed_numeric(b"00000000017\0").unwrap(), 0o17);
     }
 
     #[test]
@@ -932,6 +1208,23 @@ mod tests {
         header[NAME_OFF..NAME_OFF + 4].copy_from_slice(b"test");
         let checksum = calculate_checksum(&header);
         assert!(checksum > 0);
+    }
+
+    /// POSIX: no data records follow types 3, 4 and 6, whatever their size
+    /// field says, under either rule.
+    #[test]
+    fn test_special_files_carry_no_data() {
+        for rule in [SizeRule::Ustar, SizeRule::Pax] {
+            for t in [
+                EntryType::CharDevice,
+                EntryType::BlockDevice,
+                EntryType::Fifo,
+            ] {
+                assert_eq!(rule.data_size(t, 1024), 0);
+                assert!(!rule.size_must_be_zero(t));
+            }
+            assert_eq!(rule.data_size(EntryType::Regular, 1024), 1024);
+        }
     }
 
     #[test]

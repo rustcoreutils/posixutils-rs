@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::error::PaxResult;
+use crate::error::{PaxError, PaxResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Type of archive entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -85,18 +86,19 @@ pub struct ArchiveEntry {
     pub gid: u32,
     /// File size in bytes
     pub size: u64,
-    /// Modification time (seconds since epoch)
-    pub mtime: u64,
+    /// Modification time (seconds since epoch). Signed, like `time_t`: a
+    /// file can predate 1970, and a pax `mtime` record can say so.
+    pub mtime: i64,
     /// Modification time nanoseconds (for pax format)
     pub mtime_nsec: u32,
     /// Access time (seconds since epoch, for pax format)
-    pub atime: Option<u64>,
+    pub atime: Option<i64>,
     /// Access time nanoseconds (for pax format)
     pub atime_nsec: u32,
     /// Inode change time (seconds since epoch). Not a POSIX pax keyword -- see
     /// `ExtendedHeader::ctime` -- but carried so archives that do record one can
     /// be listed, and so `-o times` can write one.
-    pub ctime: Option<u64>,
+    pub ctime: Option<i64>,
     /// Change time nanoseconds (for pax format)
     pub ctime_nsec: u32,
     /// Type of entry
@@ -135,11 +137,8 @@ pub struct ArchiveEntry {
     /// implementation extensions the archive used.
     ///
     /// POSIX listopt rule 7 admits all of them as a `%(keyword)`, which is the
-    /// only thing that reads them -- none has any effect on extraction. A
-    /// `Vec` rather than a map because it is empty for almost every member and
-    /// one to three entries long otherwise, and because the order records
-    /// arrive in is the order that decides precedence.
-    pub ext_records: Vec<(String, String)>,
+    /// only thing that reads them -- none has any effect on extraction.
+    pub ext_records: ExtRecords,
     /// The header this member was read from, when it was read from one.
     ///
     /// `None` for an entry built from a file on disk, which has no header yet.
@@ -172,17 +171,32 @@ impl ArchiveEntry {
             devmajor: 0,
             devminor: 0,
             data_checksum: None,
-            ext_records: Vec::new(),
+            ext_records: ExtRecords::default(),
             source_header: None,
         }
     }
 
+    /// The modification time as the unsigned seconds a ustar or cpio header
+    /// field holds.
+    ///
+    /// POSIX: "Portable file timestamps cannot be negative. If pax encounters
+    /// a file with a negative timestamp in copy or write mode, it can reject
+    /// the file". Those formats have no way to say "before 1970", and storing
+    /// the two's-complement bits instead dated such a file centuries ahead,
+    /// silently, so the member is refused with a diagnostic. (The pax format
+    /// writes an `mtime` record instead.)
+    pub fn unsigned_mtime(&self) -> PaxResult<u64> {
+        u64::try_from(self.mtime).map_err(|_| {
+            PaxError::InvalidHeader(format!(
+                "modification time {} is before 1970, which this format cannot record",
+                self.mtime
+            ))
+        })
+    }
+
     /// The value of an extended-header record this member carried.
     pub fn ext_record(&self, keyword: &str) -> Option<&str> {
-        self.ext_records
-            .iter()
-            .find(|(k, _)| k == keyword)
-            .map(|(_, v)| v.as_str())
+        self.ext_records.get(keyword)
     }
 
     /// Record an extended-header value, replacing any already held under the
@@ -192,12 +206,9 @@ impl ArchiveEntry {
     /// is applied before the per-file `x` header, and `-o keyword:=value`
     /// after both, so the last writer of a keyword wins.
     pub fn set_ext_record(&mut self, keyword: &str, value: &str) {
-        match self.ext_records.iter_mut().find(|(k, _)| k == keyword) {
-            Some(slot) => slot.1 = value.to_string(),
-            None => self
-                .ext_records
-                .push((keyword.to_string(), value.to_string())),
-        }
+        self.ext_records
+            .own
+            .insert(keyword.to_string(), Some(value.to_string()));
     }
 
     /// Check if this entry is a special device file
@@ -214,6 +225,43 @@ impl ArchiveEntry {
     }
 }
 
+/// The extended-header records a member carried that no typed field of
+/// `ArchiveEntry` holds, as a map from keyword to value.
+///
+/// Two layers, because a pax archive's global `g` records apply to every
+/// member after them: copying them into each member cost time and memory
+/// proportional to the global records times the members, so they are held
+/// once and shared. A member's own records lie over them.
+#[derive(Debug, Clone, Default)]
+pub struct ExtRecords {
+    /// The global records in force for this member, shared with every other
+    /// member they apply to.
+    shared: Arc<HashMap<String, String>>,
+    /// The member's own records. `None` is a keyword its own header deleted,
+    /// which hides the shared value.
+    own: HashMap<String, Option<String>>,
+}
+
+impl ExtRecords {
+    /// The value in force for `keyword`.
+    pub fn get(&self, keyword: &str) -> Option<&str> {
+        match self.own.get(keyword) {
+            Some(value) => value.as_deref(),
+            None => self.shared.get(keyword).map(String::as_str),
+        }
+    }
+
+    /// Lay this member's records over `shared`.
+    pub fn share(&mut self, shared: &Arc<HashMap<String, String>>) {
+        self.shared = Arc::clone(shared);
+    }
+
+    /// Hide the shared value of `keyword`, unless this member set its own.
+    pub fn hide(&mut self, keyword: &str) {
+        self.own.entry(keyword.to_string()).or_insert(None);
+    }
+}
+
 /// Trait for reading archives
 pub trait ArchiveReader {
     /// Read the next entry from the archive
@@ -225,6 +273,44 @@ pub trait ArchiveReader {
 
     /// Skip the data for the current entry
     fn skip_data(&mut self) -> PaxResult<()>;
+
+    /// Whether the reader applies the `-o keyword=value` and
+    /// `-o keyword:=value` records itself. The pax reader has to, because they
+    /// rank among the archive's own extended headers; any other reader leaves
+    /// them to the caller (see `OptionRecords::apply`).
+    fn applies_option_records(&self) -> bool {
+        false
+    }
+
+    /// Done reading: the archive was read to its end when `reached_end`,
+    /// and otherwise stopped part way. See `ArchiveStream::finish`.
+    fn finish(&mut self, _reached_end: bool) -> PaxResult<()> {
+        Ok(())
+    }
+}
+
+/// A boxed reader, as `formats::open_reader` returns for a format detected at
+/// run time.
+impl<T: ArchiveReader + ?Sized> ArchiveReader for Box<T> {
+    fn read_entry(&mut self) -> PaxResult<Option<ArchiveEntry>> {
+        (**self).read_entry()
+    }
+
+    fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
+        (**self).read_data(buf)
+    }
+
+    fn skip_data(&mut self) -> PaxResult<()> {
+        (**self).skip_data()
+    }
+
+    fn applies_option_records(&self) -> bool {
+        (**self).applies_option_records()
+    }
+
+    fn finish(&mut self, reached_end: bool) -> PaxResult<()> {
+        (**self).finish(reached_end)
+    }
 }
 
 /// Trait for writing archives
@@ -252,6 +338,25 @@ pub trait ArchiveWriter {
         true
     }
 
+    /// Whether a hard-link member may also carry the file's data, which is
+    /// what `-o linkdata` asks for.
+    ///
+    /// Only the pax format allows it ("data blocks for files of typeflag 1
+    /// ... may be included"); a ustar typeflag 1 header records no data, so
+    /// there the option has nothing to act on.
+    fn hardlinks_may_carry_data(&self) -> bool {
+        false
+    }
+
+    /// Whether this format has a file type for a socket.
+    ///
+    /// cpio does (`C_ISSOCK`). The tar formats do not, and POSIX requires an
+    /// attempt to archive one in ustar to be diagnosed; a writer that returns
+    /// `false` is never handed one.
+    fn supports_sockets(&self) -> bool {
+        false
+    }
+
     /// Whether `write_entry` needs `ArchiveEntry::data_checksum` filled in.
     ///
     /// True only for the cpio "crc" format, whose c_check field sits in the
@@ -262,81 +367,136 @@ pub trait ArchiveWriter {
     }
 }
 
-/// Tracks hard links during archive creation
+/// Tracks hard links during archive creation and copying.
+///
+/// A file is remembered for the whole run, not only until `nlink` of its
+/// names have gone by: a name list can reach the same name twice (`find tree |
+/// pax -w` lists it and walks it), and a file forgotten before the repeat would
+/// be stored again in full -- splitting a hard-linked pair on extraction,
+/// depending on the order.
 #[derive(Debug, Default)]
 pub struct HardLinkTracker {
-    /// Maps (dev, ino) to the first path seen
-    seen: HashMap<(u64, u64), PathBuf>,
+    /// The first path each file was stored under, by (dev, ino)
+    stored: HashMap<(u64, u64), PathBuf>,
 }
 
 impl HardLinkTracker {
     /// Create a new tracker
     pub fn new() -> Self {
-        HardLinkTracker {
-            seen: HashMap::new(),
-        }
+        Self::default()
     }
 
-    /// Check if we've seen this file before (by dev/ino)
-    /// Returns the original path if this is a hard link
-    pub fn check(&mut self, entry: &ArchiveEntry) -> Option<PathBuf> {
-        self.check_ids(entry.dev, entry.ino, entry.nlink, &entry.path)
-    }
-
-    /// The same, for a caller that holds the ids directly rather than an entry.
-    ///
-    /// `record` is what a later link to the same file will be pointed at: the
-    /// archive member path when writing, the destination path when copying.
-    /// That difference is the only reason copy mode used to carry its own copy
-    /// of this type -- one which re-stat'd every file the caller had already
-    /// stat'd.
-    pub fn check_ids(&mut self, dev: u64, ino: u64, nlink: u32, record: &Path) -> Option<PathBuf> {
+    /// The name a multiply-linked file was first stored under, if one of its
+    /// names already has been.
+    pub fn lookup(&self, dev: u64, ino: u64, nlink: u32) -> Option<PathBuf> {
         if nlink <= 1 {
             return None;
         }
+        self.stored.get(&(dev, ino)).cloned()
+    }
 
-        let key = (dev, ino);
-        if let Some(original) = self.seen.get(&key) {
-            Some(original.clone())
-        } else {
-            self.seen.insert(key, record.to_path_buf());
-            None
+    /// Note that a file's first name has been stored, as `stored`: the archive
+    /// member path when writing, the destination path when copying.
+    ///
+    /// Separate from `lookup` because it must only happen once that name
+    /// really is in the archive or the destination. Recording a file before
+    /// its data was read made every later name of an unreadable file a link
+    /// to a member that was never written.
+    pub fn record(&mut self, dev: u64, ino: u64, nlink: u32, stored: &Path) {
+        if nlink > 1 {
+            self.stored
+                .entry((dev, ino))
+                .or_insert_with(|| stored.to_path_buf());
         }
     }
 }
 
-/// Tracks extracted files for hard link creation during extraction
-#[derive(Debug, Default)]
-pub struct ExtractedLinks {
-    /// Maps (dev, ino) to the extracted path
-    extracted: HashMap<(u64, u64), PathBuf>,
+/// The link sets of a cpio archive: members that are names of one file.
+///
+/// cpio has no link typeflag. Each name of a multiply-linked file is a member
+/// of its own, and what ties them together is a shared (c_dev, c_ino) with a
+/// c_nlink above one -- POSIX says such files "shall be" linked again when they
+/// are restored. Directories are left out: their link count only counts their
+/// subdirectories. Only cpio records a link count, so for every other format
+/// this finds nothing.
+///
+/// A set is remembered for the whole archive, as GNU cpio does, not only until
+/// c_nlink of its names have gone by: a name list may name a file more often
+/// than it has links, and the repeat would otherwise be extracted as a file of
+/// its own, splitting the set.
+///
+/// The key alone is not trusted. Writers that truncate inode numbers to the
+/// field -- GNU cpio, and this pax before archive-local numbering -- give
+/// unrelated files the same one. A member bringing data that differs in size,
+/// mode or modification time from the data the set already has is therefore
+/// no name of it.
+///
+/// `T` is what the caller remembers about a set: the names extraction created
+/// for it, the first name a listing showed.
+#[derive(Debug)]
+pub struct LinkSets<T> {
+    sets: HashMap<(u64, u64), LinkSet<T>>,
 }
 
-impl ExtractedLinks {
-    /// Create a new tracker
-    pub fn new() -> Self {
-        ExtractedLinks {
-            extracted: HashMap::new(),
+/// One set of [`LinkSets`].
+#[derive(Debug)]
+struct LinkSet<T> {
+    /// What the caller remembered
+    value: T,
+    /// The (size, mode, mtime) of the first of its names to carry data. newc
+    /// stores the data with the last name only, the earlier ones empty.
+    data: Option<(u64, u32, i64)>,
+}
+
+/// The (size, mode, mtime) a member carrying data brings, if it brings any.
+fn data_shape(entry: &ArchiveEntry) -> Option<(u64, u32, i64)> {
+    (entry.size > 0).then_some((entry.size, entry.mode, entry.mtime))
+}
+
+impl<T> Default for LinkSets<T> {
+    fn default() -> Self {
+        LinkSets {
+            sets: HashMap::new(),
         }
     }
+}
 
-    /// Record that we extracted a file
-    pub fn record(&mut self, entry: &ArchiveEntry, path: &Path) {
-        if entry.nlink > 1 {
-            let key = (entry.dev, entry.ino);
-            self.extracted
-                .entry(key)
-                .or_insert_with(|| path.to_path_buf());
-        }
+impl<T> LinkSets<T> {
+    /// The key of the set `entry` would be a name of, or `None` for a member
+    /// that is not one of several names of a file.
+    fn key(entry: &ArchiveEntry) -> Option<(u64, u64)> {
+        (entry.entry_type == EntryType::Regular && entry.nlink > 1)
+            .then_some((entry.dev, entry.ino))
     }
 
-    /// Get the path to link to, if this is a hard link
-    pub fn get_link_target(&self, entry: &ArchiveEntry) -> Option<&PathBuf> {
-        if entry.nlink <= 1 {
-            return None;
+    /// What was remembered about the set an earlier name started, when
+    /// `entry` is a later name of it. A member whose data differs from the
+    /// set's is not, and gets `None` like a member of no set.
+    pub fn find_mut(&mut self, entry: &ArchiveEntry) -> Option<&mut T> {
+        let set = self.sets.get_mut(&Self::key(entry)?)?;
+        match (set.data, data_shape(entry)) {
+            (Some(have), Some(this)) if have != this => return None,
+            (None, this) => set.data = this,
+            _ => {}
         }
-        let key = (entry.dev, entry.ino);
-        self.extracted.get(&key)
+        Some(&mut set.value)
+    }
+
+    /// What was remembered about every set started so far.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.sets.values().map(|set| &set.value)
+    }
+
+    /// Start a set at `entry`, its first name. Nothing happens for a member
+    /// that is not one of several names of a file, or whose set has already
+    /// started -- which `find_mut` turned away for its differing data.
+    pub fn insert(&mut self, entry: &ArchiveEntry, value: impl FnOnce() -> T) {
+        if let Some(key) = Self::key(entry) {
+            self.sets.entry(key).or_insert_with(|| LinkSet {
+                value: value(),
+                data: data_shape(entry),
+            });
+        }
     }
 }
 
@@ -357,6 +517,79 @@ impl std::fmt::Display for ArchiveFormat {
             ArchiveFormat::Ustar => write!(f, "ustar"),
             ArchiveFormat::Cpio => write!(f, "cpio"),
             ArchiveFormat::Pax => write!(f, "pax"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(entry_type: EntryType, ino: u64, nlink: u32) -> ArchiveEntry {
+        ArchiveEntry {
+            entry_type,
+            ino,
+            nlink,
+            ..Default::default()
+        }
+    }
+
+    fn named(ino: u64, nlink: u32, size: u64) -> ArchiveEntry {
+        ArchiveEntry {
+            size,
+            ..member(EntryType::Regular, ino, nlink)
+        }
+    }
+
+    #[test]
+    fn test_link_sets_group_names_for_the_whole_archive() {
+        let mut sets: LinkSets<&str> = LinkSets::default();
+        // Only a regular file with more than one name belongs to a set.
+        sets.insert(&member(EntryType::Regular, 4, 1), || "solo");
+        assert_eq!(sets.find_mut(&member(EntryType::Regular, 4, 1)), None);
+        sets.insert(&member(EntryType::Directory, 5, 3), || "dir");
+        assert_eq!(sets.find_mut(&member(EntryType::Directory, 5, 3)), None);
+
+        sets.insert(&named(6, 2, 0), || "a");
+        // More names than the link count still join the set.
+        for _ in 0..3 {
+            assert_eq!(sets.find_mut(&named(6, 2, 0)).copied(), Some("a"));
+        }
+    }
+
+    /// Members sharing a key whose data differs are unrelated files; the
+    /// newc set whose data arrives with its last name is still one file.
+    #[test]
+    fn test_link_sets_turn_away_differing_data() {
+        let mut sets: LinkSets<&str> = LinkSets::default();
+        sets.insert(&named(7, 2, 5), || "a");
+        assert_eq!(sets.find_mut(&named(7, 2, 9)), None);
+        // Turned away, it does not replace the set either.
+        sets.insert(&named(7, 2, 9), || "b");
+        assert_eq!(sets.find_mut(&named(7, 2, 5)).copied(), Some("a"));
+        // A name with no data of its own joins whatever the set has.
+        assert_eq!(sets.find_mut(&named(7, 2, 0)).copied(), Some("a"));
+
+        sets.insert(&named(8, 3, 0), || "c");
+        assert_eq!(sets.find_mut(&named(8, 3, 0)).copied(), Some("c"));
+        assert_eq!(sets.find_mut(&named(8, 3, 6)).copied(), Some("c"));
+        // From then on the set has data, and differing data is turned away.
+        assert_eq!(sets.find_mut(&named(8, 3, 4)), None);
+    }
+
+    #[test]
+    fn test_hard_link_tracker_keeps_the_first_name() {
+        let mut links = HardLinkTracker::new();
+        // A file with one name is never remembered.
+        links.record(1, 7, 1, Path::new("solo"));
+        assert_eq!(links.lookup(1, 7, 1), None);
+
+        links.record(1, 9, 2, Path::new("a"));
+        // Recording a second time keeps the first name, and the file stays
+        // remembered however many of its names go by.
+        links.record(1, 9, 2, Path::new("b"));
+        for _ in 0..3 {
+            assert_eq!(links.lookup(1, 9, 2).as_deref(), Some(Path::new("a")));
         }
     }
 }

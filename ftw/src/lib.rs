@@ -616,6 +616,34 @@ where
     }
 }
 
+/// Report a `path` that holds a NUL byte, which no file can be named by.
+///
+/// Passed to the kernel, the C string would end at the NUL and name some other file -- the prefix
+/// before it -- so such a path is refused outright, as an `Open` error with `InvalidInput`. Each
+/// NUL is shown as `\0` in the reported name, so the diagnostic names the path that was given
+/// rather than that prefix.
+fn report_nul_in_path<H>(path: &Path, err_reporter: &mut H)
+where
+    H: FnMut(Entry<'_>, Error),
+{
+    let mut shown = Vec::new();
+    for &b in path.as_os_str().as_bytes() {
+        match b {
+            0 => shown.extend_from_slice(b"\\0"),
+            _ => shown.push(b),
+        }
+    }
+    let shown = CString::new(shown).expect("every NUL was escaped");
+    let cwd = FileDescriptor::cwd();
+    err_reporter(
+        Entry::new(&cwd, &[], cstring_to_rc(&shown), None),
+        Error::new(
+            io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"),
+            ErrorKind::Open,
+        ),
+    );
+}
+
 fn open_long_filename<'a, H>(
     mut starting_dir: FileDescriptor,
     path: &'a Path,
@@ -769,6 +797,11 @@ where
 
     // Used in `ls`
     let mut subdirs: Vec<TreeNode> = Vec::new();
+
+    if path.as_ref().as_os_str().as_bytes().contains(&0) {
+        report_nul_in_path(path.as_ref(), &mut err_reporter);
+        return false;
+    }
 
     let (starting_dir, path_components) = match open_long_filename(
         FileDescriptor::cwd(),

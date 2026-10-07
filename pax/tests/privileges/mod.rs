@@ -15,6 +15,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -485,4 +486,51 @@ fn test_priv_owner_name_overrides_the_numeric_id() {
         (euid, egid),
         "uname and gname must override the numeric uid and gid fields"
     );
+}
+
+/// POSIX -p: when "the user ID and group ID are not preserved for any reason,
+/// pax shall not set the S_ISUID and S_ISGID bits". A non-root -pe of a
+/// root-owned 06755 member cannot chown, so it must not leave a set-id file
+/// owned by whoever ran pax.
+#[test]
+fn test_extract_pe_clears_setid_when_chown_fails() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root can chown; nothing to test
+    }
+    let temp = TempDir::new().unwrap();
+    let archive = Ustar {
+        name: b"su",
+        mode: 0o6755,
+        uid: 0,
+        gid: 0,
+        uname: b"root",
+        gname: b"wheel",
+        body: b"#!/bin/sh\n",
+        ..Default::default()
+    }
+    .archive();
+
+    run_pax_with_stdin_bytes_in_dir(&["-r", "-pe"], &archive, temp.path());
+
+    let mode = fs::metadata(temp.path().join("su")).unwrap().mode();
+    assert_eq!(mode & 0o6000, 0, "set-id bits kept: {mode:o}");
+}
+
+/// The copy-mode form of the same rule.
+#[test]
+fn test_copy_pe_clears_setid_when_chown_fails() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let src = Path::new("/usr/bin/su");
+    let Ok(meta) = fs::metadata(src) else { return };
+    if meta.mode() & 0o4000 == 0 || meta.uid() == unsafe { libc::geteuid() } {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+
+    run_pax_in_dir(&["-rw", "-pe", "/usr/bin/su", "."], temp.path());
+
+    let mode = fs::metadata(temp.path().join("usr/bin/su")).unwrap().mode();
+    assert_eq!(mode & 0o6000, 0, "set-id bits kept: {mode:o}");
 }

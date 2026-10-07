@@ -9,14 +9,14 @@
 
 use clap::Parser;
 use gettextrs::gettext;
-use plib::regex::{Regex as PlibRegex, RegexFlags};
+use plib::locale::next_char_offset;
+use plib::regex::{Match, Regex as PlibRegex, RegexFlags};
 use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Debug},
     fs::File,
     io::{BufRead, BufReader, Error, ErrorKind, Write},
-    ops::Range,
     path::PathBuf,
 };
 
@@ -448,9 +448,7 @@ impl Command {
             for (i, token) in range.limits.iter().enumerate() {
                 reached_now.push(match token {
                     AddressToken::Number(position) => *position == line_number + 1,
-                    AddressToken::Pattern(re, pattern) => {
-                        !(match_pattern(re, pattern, line, line_number + 1)?.is_empty())
-                    }
+                    AddressToken::Pattern(re, _) => re.is_match(line),
                     AddressToken::Last => match i {
                         0 => last_line,
                         1 => false,
@@ -485,182 +483,98 @@ impl Command {
     }
 }
 
-/// The regex can return from 1 to 9 range that can be nested.
-/// [`delete_nested_ranges`] function deletes ranges that contain another ranges.
-fn delete_nested_ranges(mut ranges: Vec<(usize, Range<usize>)>) -> Vec<(usize, Range<usize>)> {
-    let mut result: Vec<(usize, Range<usize>)> = Vec::new();
-
-    ranges.sort_by_key(|(_, a)| a.end - a.start);
-    for (i, Range { start, end }) in ranges.into_iter() {
-        if result.iter().any(|(_, r)| r.start >= start && end >= r.end) {
-            continue;
-        }
-        result.push((i, start..end));
-    }
-
-    result
-}
-
-/// The regex can return from 1 to 9 range. Some
-/// of them can be invalid for usage. So this function filters
-/// invalid ranges.
-fn filter_groups(groups: &mut Vec<(usize, Range<usize>)>, pattern: &str, haystack: &str) {
-    groups.retain(|(_, m)| {
-        if m.start != m.end {
-            true
-        } else {
-            m.start == 0 || m.start == haystack.len()
-        }
-    });
-    if pattern != "^" && pattern != "^$" {
-        groups.retain(|(_, r)| *r != (0..0));
-    }
-    let end_range = haystack.len()..haystack.len();
-    if pattern != "$" && pattern != "^$" {
-        groups.retain(|(_, r)| *r != end_range);
-    }
-    if (pattern == "^$" && !haystack.is_empty()) || !["^$", "^", "$"].contains(&pattern) {
-        groups.retain(|(_, r)| *r != (0..0) && *r != end_range);
-    }
-}
-
-/// Filter groups of [`Range<usize>`] for replace in
-/// pattern space when patterns like "^\{1,13\}$" appears
-fn filter_groups_when_line_size_check_in_pattern(
-    match_subranges: &mut [Vec<(usize, Range<usize>)>],
-    pattern: &str,
-) {
-    if ["^", "$", r#"\{"#, r#"\{"#]
-        .iter()
-        .all(|pat| pattern.contains(pat))
-    {
-        let mut lengths = vec![];
-        let mut i = 0;
-        while let Some(slice) = pattern.get(i..) {
-            let Some(mut a) = slice.find(r#"\{"#) else {
-                break;
-            };
-            let Some(mut b) = slice.find(r#"\}"#) else {
-                break;
-            };
-            a += i;
-            b += i;
-            let max_len = if let Some(comma_pos) = pattern.get(a..).unwrap().find(",") {
-                if let Some(s) = pattern.get((comma_pos + a + 1)..b) {
-                    s.parse::<usize>().ok()
-                } else {
-                    Some(pattern.len())
-                }
-            } else {
-                let s = pattern.get((a + 2)..b).unwrap();
-                s.parse::<usize>().ok()
-            };
-            if let Some(max_len) = max_len {
-                lengths.push(max_len);
-            }
-
-            i = b + 2;
-        }
-
-        for length in &lengths {
-            match_subranges.iter_mut().for_each(|groups| {
-                groups.retain(|(_, r)| r.end <= *length);
-            });
-        }
-    }
-}
-
-fn delete_groups_duplicates(
-    match_subranges: Vec<Vec<(usize, Range<usize>)>>,
-) -> Vec<HashMap<usize, Range<usize>>> {
-    let match_subranges = match_subranges.into_iter().collect::<HashSet<_>>();
-    match_subranges
-        .into_iter()
-        .map(delete_nested_ranges)
-        .map(|m| m.into_iter().enumerate().map(|(i, (_, r))| (i + 1, r)))
-        .map(|m| m.into_iter().collect::<HashMap<_, _>>())
-        .filter(|m| !m.is_empty())
-        .collect::<Vec<_>>()
-}
-
-fn sort_groups(match_subranges: &mut [HashMap<usize, Range<usize>>]) {
-    match_subranges.sort_by(|a, b| {
-        a.iter()
-            .next()
-            .unwrap()
-            .1
-            .start
-            .cmp(&b.iter().next().unwrap().1.start)
-    });
-}
-
-/// Get [`Vec<Range<usize>>`] from finding match in haystack with RE
+/// Replace the selected matches of `re` in `text`, as `s` does: the `nth`
+/// match (counting from 1), or with `global` that one and every later one.
+/// Returns the new text, or `None` when no match was replaced.
 ///
-/// Arguments:
-/// [`haystack`] - &[`str`] for searching pattern matches
-/// [`re`] - pattern for search in haystack
-/// [`line_number`] - current line number in input file, used in error message
-fn match_pattern(
+/// An empty match is a match at every position except just after an earlier
+/// match (`s/b*/-/g` makes "abc" "-a-c-"). Stepping over one moves a whole
+/// character under `LC_CTYPE`: one byte forward can land inside a multibyte
+/// character, where the regex matches nothing and every later match was lost.
+fn substitute(
     re: &PlibRegex,
-    pattern: &str,
-    haystack: &str,
-    _line_number: usize,
-) -> Result<Vec<HashMap<usize, std::ops::Range<usize>>>, SedError> {
-    let mut match_subranges = vec![];
-    let mut offset = 0;
+    text: &str,
+    replacement: &str,
+    nth: usize,
+    global: bool,
+) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let (mut copied, mut pos, mut count) = (0, 0, 0);
+    let mut prev_end = None;
 
-    while offset <= haystack.len() {
-        let Some(matches) = re.captures_at(haystack, offset) else {
-            break;
-        };
-
-        // The whole match is always in matches[0]
-        let whole_match = &matches[0];
-
-        // Convert plib::regex matches to (group_number, Range) format
-        // In sed, group numbers are 1-9 (not 0-indexed)
-        // A capture group is "used" if it's not at position 0,0 OR if it matches the whole match position
-        let mut groups: Vec<(usize, Range<usize>)> = matches
-            .iter()
-            .enumerate()
-            .skip(1) // Skip group 0 (whole match)
-            .filter(|(_, m)| {
-                // Filter out unused capture groups
-                // An unused group in plib::regex is Match::default() = {0, 0}
-                // A used group will either:
-                // - Have non-zero start/end, OR
-                // - Be at the same position as the whole match (for zero-length matches)
-                (m.start != 0 || m.end != 0)
-                    || (m.start == whole_match.start && m.end == whole_match.end)
-            })
-            .map(|(j, m)| (j, m.start..m.end))
-            .collect();
-
-        // For simple patterns without capture groups, use the whole match as group 1
-        // This handles patterns like "foo", "^", "$", ".*", etc.
-        if groups.is_empty() {
-            groups.push((1, whole_match.start..whole_match.end));
+    // Offsets are into `text`, which is never rewritten, so `captures_at`
+    // knows that only offset 0 is the start of the line.
+    while let Some(caps) = re.captures_at(text, pos) {
+        let m = caps[0];
+        if m.start < m.end || prev_end != Some(m.start) {
+            count += 1;
+            if count == nth || (global && count > nth) {
+                out.extend_from_slice(&bytes[copied..m.start]);
+                append_replacement(&mut out, replacement, bytes, &caps);
+                copied = m.end;
+                if !global {
+                    break;
+                }
+            }
+            prev_end = Some(m.end);
+            if m.start < m.end {
+                pos = m.end;
+                continue;
+            }
         }
-
-        filter_groups(&mut groups, pattern, haystack);
-
-        // Advance past this match
-        // Use the whole match end position, ensuring we always move forward
-        let next_offset = if whole_match.end > offset {
-            whole_match.end
-        } else {
-            offset + 1
-        };
-
-        offset = next_offset;
-        match_subranges.push(groups);
+        match next_char_offset(bytes, m.end) {
+            Some(next) => pos = next,
+            None => break,
+        }
     }
 
-    filter_groups_when_line_size_check_in_pattern(&mut match_subranges, pattern);
-    let mut match_subranges = delete_groups_duplicates(match_subranges);
-    sort_groups(&mut match_subranges);
+    if count < nth {
+        return None;
+    }
+    out.extend_from_slice(&bytes[copied..]);
+    // A match ends inside a character only in a locale whose characters are
+    // not UTF-8's, and the pattern space is text.
+    Some(match String::from_utf8(out) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
 
-    Ok(match_subranges)
+/// Append the replacement for one match to `out`: `&` is the match, `\1` to
+/// `\9` its groups (an unmatched group is empty), `\n`, `\t`, `\r`, `\a`,
+/// `\f` and `\v` the C escapes, and any other `\X` the literal `X` (so `\&`
+/// and `\\`). The inserted text is not itself scanned for escapes.
+fn append_replacement(out: &mut Vec<u8>, replacement: &str, text: &[u8], caps: &[Match]) {
+    let mut chars = replacement.chars();
+    let mut buf = [0u8; 4];
+    while let Some(c) = chars.next() {
+        let literal = match c {
+            '&' => {
+                out.extend_from_slice(caps[0].as_bytes(text));
+                continue;
+            }
+            '\\' => match chars.next() {
+                Some(d @ '0'..='9') => {
+                    let group = d as usize - '0' as usize;
+                    if let Some(m) = caps.get(group) {
+                        out.extend_from_slice(m.as_bytes(text));
+                    }
+                    continue;
+                }
+                Some('n') => '\n',
+                Some('t') => '\t',
+                Some('r') => '\r',
+                Some('a') => '\x07',
+                Some('f') => '\x0C',
+                Some('v') => '\x0B',
+                Some(other) => other,
+                None => continue,
+            },
+            _ => c,
+        };
+        out.extend_from_slice(literal.encode_utf8(&mut buf).as_bytes());
+    }
 }
 
 /// Parse sequence of digits as [`usize`]
@@ -1718,161 +1632,26 @@ fn flatten_commands(mut commands: Vec<Command>) -> Vec<Command> {
     commands
 }
 
-/// Returns all positions of '&' in [Vec<char>]
-fn get_ampersand_positions(chars: Vec<char>) -> Vec<usize> {
-    let pairs = chars.windows(2).enumerate();
-    let mut ampersand_positions = pairs
-        .filter_map(|(i, chars)| {
-            if chars[0] != '\\' && chars[1] == '&' {
-                return Some(i + 1);
-            }
-            None
-        })
-        .rev()
-        .collect::<Vec<_>>();
-
-    if let Some(ch) = chars.first() {
-        if *ch == '&' {
-            ampersand_positions.push(0);
-        }
-    }
-    ampersand_positions
-}
-
-/// Returns all groups positions (like "\1") in [Vec<char>]
-fn get_group_positions(chars: Vec<char>) -> Vec<(usize, usize)> {
-    let pairs = chars.windows(2).enumerate();
-    let mut group_positions = pairs
-        .filter_map(|(i, chars)| {
-            if chars[0] == '\\' && chars[1].is_ascii_digit() {
-                return Some((i, chars[1].to_digit(10).unwrap() as usize));
-            }
-            None
-        })
-        .rev()
-        .collect::<Vec<_>>();
-
-    if let Some(ch) = chars.first() {
-        if ch.is_ascii_digit() {
-            group_positions.push((0, ch.to_digit(10).unwrap() as usize));
-        }
-    }
-    group_positions
-}
-
-/// Process backslash escapes in an `s///` replacement string after backrefs
-/// (`\1`..`\9`) and `&` have already been substituted in.
-///
-/// POSIX/GNU: `\n`->newline, `\t`->tab, `\r`->CR, `\a`/`\f`/`\v` controls,
-/// `\\`->`\`, `\&`->literal `&`. Any other `\X` yields the literal `X`
-/// (the backslash is dropped), matching GNU's treatment of unknown escapes.
-fn process_replacement_escapes(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some('a') => out.push('\x07'),
-                Some('f') => out.push('\x0C'),
-                Some('v') => out.push('\x0B'),
-                Some('\\') => out.push('\\'),
-                Some('&') => out.push('&'),
-                Some(other) => out.push(other),
-                None => {}
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Construct replace string and replace
-/// ranges with new content in pattern space
-fn update_pattern_space(
-    pattern_space: &mut String,
-    replacement: &str,
-    ranges: &HashMap<usize, Range<usize>>,
-) -> bool {
-    let pairs = replacement.chars().collect::<Vec<_>>();
-    let ampersand_positions = get_ampersand_positions(pairs.clone());
-    let group_positions = get_group_positions(pairs);
-    let mut local_replacement = replacement.to_string();
-    if let Some((_, range)) = ranges.iter().next() {
-        let value = (*pattern_space).get(range.clone());
-        for position in ampersand_positions.clone() {
-            local_replacement.replace_range(position..(position + 1), value.unwrap());
-        }
-    }
-
-    if ranges.is_empty() {
-        return false;
-    }
-
-    let main_range = ranges.values().map(|r| r.start).min().unwrap()
-        ..ranges.values().map(|r| r.end).max().unwrap();
-
-    if !group_positions.is_empty() {
-        for (position, group) in group_positions {
-            let replace_str = if let Some(range) = ranges.get(&group) {
-                pattern_space.get(range.clone()).unwrap()
-            } else {
-                &"".to_string()
-            };
-            local_replacement.replace_range(position..(position + 2), replace_str);
-        }
-        local_replacement = process_replacement_escapes(&local_replacement);
-        pattern_space.replace_range(main_range.clone(), &local_replacement);
-    } else if !ranges.is_empty() {
-        local_replacement = process_replacement_escapes(&local_replacement);
-        pattern_space.replace_range(main_range.clone(), &local_replacement);
-        return true;
-    }
-    false
-}
-
 /// Execute [`Command::Replace`] for current [`Sed`] line
-fn execute_replace(
-    pattern_space: &mut String,
-    command: Command,
-    line_number: usize,
-) -> Result<bool, SedError> {
-    let mut replace = false;
-    let Command::Replace(_, re, pattern, replacement, flags) = command else {
+fn execute_replace(pattern_space: &mut String, command: Command) -> bool {
+    let Command::Replace(_, re, _, replacement, flags) = command else {
         unreachable!();
     };
-    let match_subranges = match_pattern(&re.0, &pattern, pattern_space, line_number)?;
-    let is_replace_n = |f: &ReplaceFlag| {
-        let ReplaceFlag::ReplaceNth(_) = f.clone() else {
-            return false;
-        };
-        true
-    };
-    if !match_subranges.is_empty()
-        && !flags.iter().any(is_replace_n)
-        && !flags.contains(&ReplaceFlag::ReplaceAll)
-    {
-        replace = update_pattern_space(pattern_space, &replacement, &match_subranges[0]);
-    } else if let Some(ReplaceFlag::ReplaceNth(n)) =
-        flags.iter().find(|f: &&ReplaceFlag| is_replace_n(f))
-    {
-        if let Some(ranges) = match_subranges.get(*n - 1) {
-            replace = update_pattern_space(pattern_space, &replacement, ranges);
-        }
-    } else if flags.contains(&ReplaceFlag::ReplaceAll) {
-        for ranges in match_subranges.iter().rev() {
-            let r = update_pattern_space(pattern_space, &replacement, ranges);
-            if !replace {
-                replace = r;
-            }
-        }
+    let nth = flags
+        .iter()
+        .find_map(|f| match f {
+            ReplaceFlag::ReplaceNth(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(1);
+    let global = flags.contains(&ReplaceFlag::ReplaceAll);
+    let replaced = substitute(&re.0, pattern_space, &replacement, nth, global);
+    let replace = replaced.is_some();
+    if let Some(new) = replaced {
+        *pattern_space = new;
     }
 
-    if flags.contains(&ReplaceFlag::PrintPatternIfReplace) && !match_subranges.is_empty() && replace
-    {
+    if flags.contains(&ReplaceFlag::PrintPatternIfReplace) && replace {
         println!("{}", *pattern_space);
     }
 
@@ -1896,7 +1675,7 @@ fn execute_replace(
         }
     }
 
-    Ok(replace)
+    replace
 }
 
 /// Set of states that are returned from [`Sed::execute`]
@@ -2300,8 +2079,7 @@ impl Sed {
         self.has_replacements_since_t = execute_replace(
             &mut self.pattern_space,
             Command::Replace(address, regex.clone(), pattern, replacement, flags),
-            self.current_line,
-        )?;
+        );
         self.last_regex = Some(regex.clone());
         Ok(())
     }

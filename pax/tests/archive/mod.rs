@@ -14,6 +14,8 @@ use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -219,23 +221,15 @@ fn test_cross_tool_tar_read() {
     writeln!(f, "Hello from tar").unwrap();
 
     // Create archive using system tar
-    let output = Command::new("tar")
-        .args(["-cf"])
-        .arg(&archive)
-        .arg(".")
-        .current_dir(&src_dir)
-        .output();
-
-    // Skip test if tar is not available
-    if output.is_err() {
-        eprintln!("Skipping cross-tool test: tar not available");
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!("Skipping cross-tool test: tar failed");
-        return;
-    }
+    };
+    run_system_ok(
+        &tar,
+        &["-cf", archive.to_str().unwrap(), "."],
+        &src_dir,
+        None,
+    );
 
     // Extract with our pax
     fs::create_dir(&dst_dir).unwrap();
@@ -268,27 +262,11 @@ fn test_cross_tool_tar_write() {
     assert_success(&output, "pax write");
 
     // Extract with system tar
+    let Some(tar) = system_tool("tar") else {
+        return;
+    };
     fs::create_dir(&dst_dir).unwrap();
-    let output = Command::new("tar")
-        .args(["-xf"])
-        .arg(&archive)
-        .current_dir(&dst_dir)
-        .output();
-
-    // Skip test if tar is not available
-    if output.is_err() {
-        eprintln!("Skipping cross-tool test: tar not available");
-        return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!(
-            "tar extract failed: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        // This is okay if tar isn't available or compatible
-        return;
-    }
+    run_system_ok(&tar, &["-xf", archive.to_str().unwrap()], &dst_dir, None);
 
     // Verify content
     let content = fs::read_to_string(dst_dir.join("hello.txt")).unwrap();
@@ -527,31 +505,16 @@ fn test_pax_cross_tool_read() {
         .write_all(b"test content")
         .unwrap();
 
-    // Try to create archive with system tar using posix format
-    let output = Command::new("tar")
-        .args(["--format=posix", "-cf"])
-        .arg(&archive)
-        .arg(".")
-        .current_dir(&src_dir)
-        .output();
-
-    if output.is_err() {
-        eprintln!("Skipping: tar not available");
+    // Create the archive with system tar in pax format. GNU tar and bsdtar
+    // both spell it --format=posix; a tar that knows neither still has to
+    // write some archive this pax reads.
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        // Try without --format flag (macOS tar)
-        let output = Command::new("tar")
-            .args(["-cf"])
-            .arg(&archive)
-            .arg(".")
-            .current_dir(&src_dir)
-            .output();
-        if output.is_err() || !output.unwrap().status.success() {
-            eprintln!("Skipping: could not create tar archive");
-            return;
-        }
+    };
+    let path = archive.to_str().unwrap();
+    let made = run_program(&tar, &["--format=posix", "-cf", path, "."], &src_dir, None);
+    if !made.status.success() {
+        run_system_ok(&tar, &["-cf", path, "."], &src_dir, None);
     }
 
     // Extract with our pax
@@ -583,23 +546,12 @@ fn test_pax_cross_tool_write() {
     );
     assert_success(&output, "pax write");
 
-    // Extract with system tar
+    // Extract with system tar: every tar in use today reads pax archives.
+    let Some(tar) = system_tool("tar") else {
+        return;
+    };
     fs::create_dir(&dst_dir).unwrap();
-    let output = Command::new("tar")
-        .args(["-xf"])
-        .arg(&archive)
-        .current_dir(&dst_dir)
-        .output();
-
-    if output.is_err() {
-        eprintln!("Skipping: tar not available");
-        return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!("System tar could not read pax archive (this may be expected)");
-        return;
-    }
+    run_system_ok(&tar, &["-xf", archive.to_str().unwrap()], &dst_dir, None);
 
     let content = fs::read_to_string(dst_dir.join("test.txt")).unwrap();
     assert!(content.contains("pax content"));
@@ -618,22 +570,11 @@ fn test_cross_tool_cpio_read() {
     let mut f = File::create(src_dir.join("hello.txt")).unwrap();
     writeln!(f, "Hello from cpio").unwrap();
 
-    // Create archive using system cpio (via find | cpio -o)
-    let output = Command::new("sh")
-        .args(["-c", "find . | cpio -o"])
-        .current_dir(&src_dir)
-        .stdout(std::process::Stdio::piped())
-        .output();
-
-    if output.is_err() {
-        eprintln!("Skipping cross-tool test: cpio not available");
+    // Create archive using system cpio, from the names `find .` would give
+    let Some(cpio) = system_tool("cpio") else {
         return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!("Skipping cross-tool test: cpio failed");
-        return;
-    }
+    };
+    let output = run_system_ok(&cpio, &["-o"], &src_dir, Some(b".\n./hello.txt\n"));
 
     // Write the cpio archive
     fs::write(&archive, &output.stdout).unwrap();
@@ -669,24 +610,16 @@ fn test_cross_tool_cpio_write() {
     assert_success(&output, "pax write cpio");
 
     // Extract with system cpio
+    let Some(cpio) = system_tool("cpio") else {
+        return;
+    };
     fs::create_dir(&dst_dir).unwrap();
-    let output = Command::new("sh")
-        .args(["-c", &format!("cpio -id < {}", archive.to_str().unwrap())])
-        .current_dir(&dst_dir)
-        .output();
-
-    if output.is_err() {
-        eprintln!("Skipping cross-tool test: cpio not available");
-        return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!(
-            "cpio extract failed: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    run_system_ok(
+        &cpio,
+        &["-id"],
+        &dst_dir,
+        Some(&fs::read(&archive).unwrap()),
+    );
 
     // Verify content
     let content = fs::read_to_string(dst_dir.join("hello.txt")).unwrap();
@@ -810,13 +743,10 @@ fn test_symlink_tar_no_damaged_warning() {
     assert_success(&output, "pax write");
 
     // List with system tar and check for "Damaged" warning
-    let output = Command::new("tar").args(["-tvf"]).arg(&archive).output();
-
-    if output.is_err() {
-        eprintln!("Skipping: tar not available");
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
-    let output = output.unwrap();
+    };
+    let output = run_system_ok(&tar, &["-tvf", archive.to_str().unwrap()], &src_dir, None);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // The key assertion: no "Damaged" warning
@@ -828,13 +758,7 @@ fn test_symlink_tar_no_damaged_warning() {
 
     // Verify it can extract correctly
     fs::create_dir(&dst_dir).unwrap();
-    let output = Command::new("tar")
-        .args(["-xf"])
-        .arg(&archive)
-        .current_dir(&dst_dir)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "tar extraction failed");
+    run_system_ok(&tar, &["-xf", archive.to_str().unwrap()], &dst_dir, None);
 
     // Verify symlink was extracted correctly
     let link_path = dst_dir.join("link.txt");
@@ -1176,4 +1100,1116 @@ fn test_reset_atime_stamps_the_file_that_was_read() {
         WHEN,
         "-L -t left the target's access time disturbed"
     );
+}
+
+/// The same multiply-linked file named twice must not be archived as a hard
+/// link to itself: extracting "f == f" unlinks f and then fails to link it.
+#[test]
+fn test_hardlink_operand_repeated_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("f"), "DATA\n").unwrap();
+    fs::hard_link(src.join("f"), src.join("g")).unwrap();
+    let archive = temp.path().join("a.tar");
+
+    let output = run_pax_in_dir(&["-w", "-f", archive.to_str().unwrap(), "f", "f"], &src);
+    assert_success(&output, "pax -w f f");
+
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst);
+    assert_success(&output, "pax -r of an archive naming f twice");
+    assert_eq!(fs::read_to_string(dst.join("f")).unwrap(), "DATA\n");
+}
+
+/// The same file named twice under different spellings of one name -- `./h/a`
+/// and `h/a` -- is one name, and must not be archived as a link to itself
+/// either: bsdtar extracts "h/a == ./h/a" by unlinking h/a, losing it.
+#[test]
+fn test_hardlink_to_itself_under_another_spelling_is_left_out() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("h")).unwrap();
+    fs::write(src.join("h/a"), "DATA\n").unwrap();
+    fs::hard_link(src.join("h/a"), src.join("h/b")).unwrap();
+
+    let output = run_pax_in_dir(
+        &["-w", "-f", "../a.tar", "./h/a", "h/a", ".//h/./a", "h/b"],
+        &src,
+    );
+    assert_success(&output, "pax -w ./h/a h/a .//h/./a h/b");
+    let listing = run_pax_in_dir(&["-v", "-f", "a.tar"], temp.path());
+    let listing = stdout_str(&listing);
+    let links: Vec<&str> = listing.lines().filter(|l| l.contains(" == ")).collect();
+    assert_eq!(links.len(), 1, "{listing}");
+    assert!(links[0].ends_with("h/b == ./h/a"), "{listing}");
+
+    let Some(tar) = system_tool("tar") else {
+        return;
+    };
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    run_system_ok(&tar, &["-xf", "../a.tar"], &dst, None);
+    assert_eq!(fs::read_to_string(dst.join("h/a")).unwrap(), "DATA\n");
+    assert_eq!(fs::read_to_string(dst.join("h/b")).unwrap(), "DATA\n");
+}
+
+/// GNU cpio and bsdcpio write a newc hard-link set with the data on the last
+/// link only; the earlier names carry c_filesize 0. Extraction has to re-create
+/// one inode holding the data, not an empty file beside a full one.
+#[test]
+fn test_cpio_newc_hardlink_data_on_last_link() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = CpioNewc {
+        name: b"a",
+        ino: 7,
+        nlink: 2,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"b",
+            body: b"DATA\n",
+            ino: 7,
+            nlink: 2,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&output, "pax -r of a newc hard-link set");
+
+    let a = fs::metadata(temp.path().join("a")).unwrap();
+    let b = fs::metadata(temp.path().join("b")).unwrap();
+    assert_eq!(a.ino(), b.ino(), "a and b should be one inode");
+    assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "DATA\n");
+}
+
+/// odc stores the data with every link. POSIX: "it shall be an error if these
+/// files cannot be linked" -- so they must come back linked, not as copies.
+#[test]
+fn test_cpio_odc_hardlinks_are_relinked() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("a"), "DATA\n").unwrap();
+    fs::hard_link(src.join("a"), src.join("b")).unwrap();
+    let archive = temp.path().join("a.cpio");
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "cpio",
+            "-f",
+            archive.to_str().unwrap(),
+            "a",
+            "b",
+        ],
+        &src,
+    );
+    assert_success(&output, "pax -w -x cpio");
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst);
+    assert_success(&output, "pax -r of a cpio hard-link set");
+
+    let a = fs::metadata(dst.join("a")).unwrap();
+    let b = fs::metadata(dst.join("b")).unwrap();
+    assert_eq!(a.ino(), b.ino(), "a and b should be one inode");
+    assert_eq!(fs::read_to_string(dst.join("b")).unwrap(), "DATA\n");
+}
+
+/// A newc set of three names, renamed by -s on the way out: the two empty
+/// earlier names must end up sharing the inode the last one brings the data in.
+#[test]
+fn test_cpio_newc_hardlink_set_renamed() {
+    let temp = TempDir::new().unwrap();
+    let link = |name, body| CpioNewc {
+        name,
+        body,
+        ino: 9,
+        nlink: 3,
+        ..Default::default()
+    };
+    let mut archive = link(b"a", b"").member();
+    archive.extend_from_slice(&link(b"b", b"").member());
+    archive.extend_from_slice(&link(b"c", b"DATA\n").archive());
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-s", ",^,new_,"], &archive, temp.path());
+    assert_success(&output, "pax -r -s of a newc hard-link set");
+
+    let ino = |n: &str| fs::metadata(temp.path().join(n)).unwrap().ino();
+    assert_eq!(ino("new_a"), ino("new_c"));
+    assert_eq!(ino("new_b"), ino("new_c"));
+    assert_eq!(fs::metadata(temp.path().join("new_c")).unwrap().nlink(), 3);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("new_a")).unwrap(),
+        "DATA\n"
+    );
+}
+
+/// The -v listing shows a later name of a cpio set as linked to the first,
+/// which is what extraction makes of it.
+#[test]
+fn test_cpio_hardlink_set_listed_as_link() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = CpioNewc {
+        name: b"a",
+        ino: 7,
+        nlink: 2,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"b",
+            body: b"DATA\n",
+            ino: 7,
+            nlink: 2,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-v"], &archive, temp.path());
+    assert_success(&output, "pax -v of a newc hard-link set");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = listing.lines().collect();
+    assert!(lines[0].ends_with(" a"), "first name: {}", lines[0]);
+    assert!(lines[1].ends_with(" b == a"), "later name: {}", lines[1]);
+}
+
+/// A datagram socket behaves like a tape: each read returns one record, and
+/// the part of a record a short read did not take is lost.
+/// The buffers are raised so a 10240-byte record fits in one datagram;
+/// macOS defaults to 2048.
+fn datagram_pair() -> (
+    std::os::unix::net::UnixDatagram,
+    std::os::unix::net::UnixDatagram,
+) {
+    use std::os::fd::AsRawFd;
+    let (a, b) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    for sock in [&a, &b] {
+        for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            let size: libc::c_int = 256 * 1024;
+            let r = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    &size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            };
+            assert_eq!(r, 0, "setsockopt: {}", std::io::Error::last_os_error());
+        }
+    }
+    (a, b)
+}
+
+/// Two files whose archive spans more than one 10240-byte record.
+fn blocking_fixture(src: &Path) -> Vec<u8> {
+    fs::create_dir(src).unwrap();
+    fs::write(src.join("f1"), vec![b'1'; 8000]).unwrap();
+    fs::write(src.join("f2"), vec![b'2'; 2000]).unwrap();
+    let output = run_pax_in_dir(&["-w", "-x", "ustar", "f1", "f2"], src);
+    assert_success(&output, "pax -w");
+    assert_eq!(output.stdout.len() % 10240, 0);
+    assert!(output.stdout.len() > 10240);
+    output.stdout
+}
+
+/// "Blocking shall be automatically determined on input": an archive read
+/// one record per read must be read whole-record at a time, not in smaller
+/// reads that drop the rest of each record.
+#[test]
+fn test_read_determines_blocking_from_input() {
+    use std::os::fd::OwnedFd;
+    let temp = TempDir::new().unwrap();
+    let archive = blocking_fixture(&temp.path().join("src"));
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let (tx, rx) = datagram_pair();
+    let child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg("-r")
+        .current_dir(&dst)
+        .stdin(std::process::Stdio::from(OwnedFd::from(rx)))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for record in archive.chunks(10240) {
+        tx.send(record).unwrap();
+    }
+    drop(tx);
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output, "pax -r from one-record reads");
+
+    assert_eq!(fs::read(dst.join("f1")).unwrap(), vec![b'1'; 8000]);
+    assert_eq!(fs::read(dst.join("f2")).unwrap(), vec![b'2'; 2000]);
+}
+
+/// -b sets the bytes per write: every write to standard output is one whole
+/// record, however the archive's data happens to fall.
+#[test]
+fn test_write_issues_whole_records() {
+    use std::os::fd::OwnedFd;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    blocking_fixture(&src);
+    // Data with newlines, which a line-buffered stdout splits writes at.
+    fs::write(src.join("lines"), "a\nb\nc\n".repeat(3000)).unwrap();
+
+    let (tx, rx) = datagram_pair();
+    let status = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-b", "10240", "-x", "ustar", "f1", "lines", "f2"])
+        .current_dir(&src)
+        .stdout(std::process::Stdio::from(OwnedFd::from(tx)))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // pax has exited, so every record it wrote is already queued.
+    rx.set_nonblocking(true).unwrap();
+    let mut buf = vec![0u8; 65536];
+    let mut sizes = Vec::new();
+    while let Ok(n) = rx.recv(&mut buf) {
+        sizes.push(n);
+    }
+    assert!(!sizes.is_empty());
+    assert!(sizes.iter().all(|&n| n == 10240), "write sizes: {sizes:?}");
+}
+
+/// `-o linkdata`: a pax-format hard link "may include" the file's data, and
+/// this option asks for it -- every hard-link member then carries the bytes.
+#[test]
+fn test_linkdata_writes_hardlink_data() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "DATA\n").unwrap();
+    fs::hard_link(temp.path().join("a"), temp.path().join("b")).unwrap();
+
+    let output = run_pax_in_dir(
+        &["-w", "-x", "pax", "-o", "linkdata", "a", "b"],
+        temp.path(),
+    );
+    assert_success(&output, "pax -w -o linkdata");
+    let listing =
+        run_pax_with_stdin_bytes(&["-o", "listopt=%(typeflag)s %(size)d %F"], &output.stdout);
+    assert_eq!(stdout_str(&listing), "0 5 a\n1 5 b\n");
+    // The sizes alone do not show the data is there: a header claiming five
+    // bytes with none behind it reads the trailer as the body. Each member's
+    // body block must begin with the bytes.
+    let bodies = output
+        .stdout
+        .chunks(BLOCK)
+        .filter(|b| b.starts_with(b"DATA\n"))
+        .count();
+    assert_eq!(bodies, 2, "hard link b carries no data block");
+}
+
+/// `-o delete=` removes the records pax would otherwise write, but not the
+/// ones that frame a member. A hard link's data is read only from a pax
+/// archive -- one with an extended header -- so dropping `size` with the rest
+/// left the reader stepping over no data, and the bytes of `b` were read as
+/// the next header.
+#[test]
+fn test_delete_keeps_the_records_that_frame_a_member() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "DATA\n").unwrap();
+    fs::hard_link(temp.path().join("a"), temp.path().join("b")).unwrap();
+    fs::write(temp.path().join("c"), "see\n").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w", "-x", "pax", "-o", "linkdata", "-o", "delete=*", "a", "b", "c",
+        ],
+        temp.path(),
+    );
+    assert_success(&output, "pax -w -o linkdata -o delete=*");
+    let listing =
+        run_pax_with_stdin_bytes(&["-o", "listopt=%(typeflag)s %(size)d %F"], &output.stdout);
+    assert_success(&listing, "list the archive");
+    assert_eq!(stdout_str(&listing), "0 5 a\n1 5 b\n0 4 c\n");
+
+    // A name the header fields cannot hold keeps its `path` record too:
+    // without it the member is named by the first 100 bytes.
+    let long = format!("{}/{}", "d".repeat(99), "e".repeat(200));
+    fs::create_dir(temp.path().join("d".repeat(99))).unwrap();
+    fs::write(temp.path().join(&long), "").unwrap();
+    let output = run_pax_in_dir(
+        &["-w", "-x", "pax", "-o", "delete=path", &long],
+        temp.path(),
+    );
+    assert_success(&output, "pax -w -o delete=path");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), format!("{long}\n"));
+}
+
+/// The size of a member's data is not the operator's to set when writing:
+/// `-o size:=3` on a five-byte file wrote a record claiming three, and every
+/// member after it was read from the wrong place.
+#[test]
+fn test_size_option_does_not_reframe_written_members() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "DATA\n").unwrap();
+    fs::write(temp.path().join("c"), "see\n").unwrap();
+
+    for opt in ["size:=3", "size=3"] {
+        let output = run_pax_in_dir(&["-w", "-x", "pax", "-o", opt, "a", "c"], temp.path());
+        assert_success(&output, &format!("pax -w -o {opt}"));
+        let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(size)d %F"], &output.stdout);
+        assert_success(&listing, "list the archive");
+        assert_eq!(stdout_str(&listing), "5 a\n4 c\n", "-o {opt}");
+    }
+}
+
+/// ustar has no socket type. POSIX: a file that cannot be archived in the
+/// format is diagnosed. It must not turn into an empty regular file.
+#[test]
+fn test_socket_is_diagnosed_not_archived_as_regular() {
+    let temp = TempDir::new().unwrap();
+    let _sock = std::os::unix::net::UnixListener::bind(temp.path().join("s")).unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+
+    for format in ["ustar", "pax"] {
+        let output = run_pax_in_dir(&["-w", "-x", format, "s", "f"], temp.path());
+        assert_exit_code(&output, 1, format);
+        let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+        assert_eq!(stdout_str(&listing), "f\n", "{format}");
+    }
+}
+
+/// A hard link is recorded only once its first name was actually archived.
+/// If a cannot be read, b must not become "b == a" pointing at nothing.
+#[test]
+fn test_hardlink_to_unarchived_file_is_not_a_link() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root reads mode 000 files
+    }
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "DATA\n").unwrap();
+    fs::hard_link(temp.path().join("a"), temp.path().join("b")).unwrap();
+    fs::set_permissions(temp.path().join("a"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "ustar", "a", "b"], temp.path());
+    fs::set_permissions(temp.path().join("a"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_exit_code(&output, 1, "pax -w of an unreadable linked file");
+    let listing = run_pax_with_stdin_bytes(&["-v"], &output.stdout);
+    assert!(
+        !stdout_str(&listing).contains("=="),
+        "{}",
+        stdout_str(&listing)
+    );
+}
+
+/// A directory name of 100-155 bytes is split into prefix and name like any
+/// other; the name field must not come out empty.
+#[test]
+fn test_ustar_long_directory_name_roundtrips() {
+    let temp = TempDir::new().unwrap();
+    let dir = format!("{}/{}", "p".repeat(60), "d".repeat(60));
+    fs::create_dir_all(temp.path().join(&dir)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-d", "-x", "ustar", &dir], temp.path());
+    assert_success(&output, "pax -w");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), format!("{dir}/\n"));
+}
+
+/// A time before 1970 cannot go in a ustar octal field. In pax format it is
+/// written as an mtime record; it must not wrap to a date centuries away.
+#[test]
+fn test_pre_epoch_mtime_roundtrips_in_pax() {
+    let temp = TempDir::new().unwrap();
+    let f = temp.path().join("old");
+    fs::write(&f, "O\n").unwrap();
+    filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(-86400, 0)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "old"], temp.path());
+    assert_success(&output, "pax -w");
+    let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(mtime)d"], &output.stdout);
+    assert_eq!(stdout_str(&listing), "-86400\n");
+}
+
+/// The default name of an extended header is built from "%d/PaxHeaders.%p/%f",
+/// where %d is what dirname(1) gives: "." for a top-level member, so the
+/// name is relative -- never an absolute path a naive reader would write to.
+#[test]
+fn test_default_exthdr_name_is_relative() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("top"), "T\n").unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "-o", "uname:=zz", "top"], temp.path());
+    assert_success(&output, "pax -w");
+    // The first header block is the extended header's.
+    let name = String::from_utf8_lossy(&output.stdout[..100]);
+    let name = name.trim_end_matches('\0');
+    assert!(name.starts_with("./PaxHeaders"), "{name}");
+}
+
+/// pax writes an empty archive (two zero blocks) when given nothing to
+/// archive; it must be able to read that archive back and append to it.
+#[test]
+fn test_empty_archive_reads_and_appends() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("e.tar");
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+
+    let output = run_pax_in_dir_with_stdin(&["-w", "-f", "e.tar"], temp.path(), "");
+    assert_success(&output, "pax -w of nothing");
+    let output = run_pax_in_dir(&["-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&output, "list of an empty archive");
+    assert_eq!(stdout_str(&output), "");
+
+    let output = run_pax_in_dir(&["-w", "-a", "-f", "e.tar", "f"], temp.path());
+    assert_success(&output, "append to an empty archive");
+    let output = run_pax_in_dir(&["-f", archive.to_str().unwrap()], temp.path());
+    assert_eq!(stdout_str(&output), "f\n");
+}
+
+/// pax-format header fields are meant for the portable character set; a name
+/// outside it goes in a UTF-8 `path` record so that every reader recovers it.
+#[test]
+fn test_pax_non_ascii_name_gets_path_record() {
+    let temp = TempDir::new().unwrap();
+    let f = temp.path().join("café");
+    fs::write(&f, "C\n").unwrap();
+    // Whole seconds, so no mtime record makes an `x` header on its own.
+    filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "café"], temp.path());
+    assert_success(&output, "pax -w");
+    assert_eq!(
+        output.stdout[156], b'x',
+        "an `x` header precedes the member"
+    );
+    assert_eq!(count_pax_records(&output.stdout, "path"), 1);
+    assert!(
+        output
+            .stdout
+            .windows(" path=café\n".len())
+            .any(|w| w == " path=café\n".as_bytes()),
+        "the record carries the name in UTF-8"
+    );
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), "café\n");
+}
+
+/// -t restores the access time of each file read -- in copy mode too, and for
+/// directories as well as regular files.
+#[test]
+fn test_t_restores_atime_in_copy_and_for_directories() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/f"), "F\n").unwrap();
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for p in [src.join("d/f"), src.join("d")] {
+        filetime::set_file_atime(&p, old).unwrap();
+    }
+    fs::create_dir(temp.path().join("out")).unwrap();
+
+    let output = run_pax_in_dir(&["-rw", "-t", "d", "../out"], &src);
+    assert_success(&output, "pax -rw -t");
+    for p in [src.join("d/f"), src.join("d")] {
+        let atime = fs::metadata(&p).unwrap().atime();
+        assert_eq!(atime, 1_000_000_000, "{}", p.display());
+    }
+
+    for p in [src.join("d/f"), src.join("d")] {
+        filetime::set_file_atime(&p, old).unwrap();
+    }
+    let output = run_pax_in_dir(&["-w", "-t", "-f", "../a.tar", "d"], &src);
+    assert_success(&output, "pax -w -t");
+    for p in [src.join("d/f"), src.join("d")] {
+        let atime = fs::metadata(&p).unwrap().atime();
+        assert_eq!(atime, 1_000_000_000, "{}", p.display());
+    }
+}
+
+/// -X: "when a directory with a different device ID is encountered, pax shall
+/// process (archive or copy) the directory itself but shall not process any
+/// files below the directory."
+#[test]
+fn test_one_file_system_archives_the_mount_point() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    fs::create_dir_all(tree.join("mnt")).unwrap();
+    fs::write(tree.join("f"), "F\n").unwrap();
+    let Some(_mount) = ScratchMount::mount(temp.path(), &tree.join("mnt")) else {
+        return; // no unprivileged way to mount here; the rule is unit-tested
+    };
+    fs::write(tree.join("mnt/inside"), "I\n").unwrap();
+
+    let output = run_pax_in_dir(&["-wX", "tree"], temp.path());
+    assert_success(&output, "pax -wX");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    let mut names: Vec<_> = stdout_str(&listing).lines().map(String::from).collect();
+    names.sort();
+    assert_eq!(names, ["tree/", "tree/f", "tree/mnt/"]);
+}
+
+/// Listing an archive in a regular file seeks over member data instead of
+/// reading it. The member here is 32 GiB of hole, which reading takes many
+/// seconds to get through and seeking skips at once; pax is killed if it is
+/// still at it after the deadline.
+#[test]
+fn test_list_seeks_over_member_data() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("big.tar");
+    const SIZE: u64 = 32 << 30;
+
+    let mut head = Ustar {
+        name: b"PaxHeaders/big",
+        typeflag: b'x',
+        body: &pax_record("size", SIZE.to_string().as_bytes()),
+        ..Default::default()
+    }
+    .member();
+    head.extend_from_slice(
+        &Ustar {
+            name: b"big",
+            ..Default::default()
+        }
+        .header(),
+    );
+    let tail = Ustar {
+        name: b"after",
+        body: b"A\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let mut f = File::create(&path).unwrap();
+    f.write_all(&head).unwrap();
+    // A hole: no disk space, and no real data to read.
+    f.set_len(head.len() as u64 + SIZE).unwrap();
+    use std::io::Seek;
+    f.seek(std::io::SeekFrom::End(0)).unwrap();
+    f.write_all(&tail).unwrap();
+    drop(f);
+
+    let output = run_pax_with_deadline(
+        &["-f", "big.tar"],
+        temp.path(),
+        std::time::Duration::from_secs(3),
+    )
+    .expect("pax read through the member data instead of seeking over it");
+    assert_success(&output, "pax -f big.tar");
+    assert_eq!(stdout_str(&output), "big\nafter\n");
+}
+
+/// The system's pax reads what ours writes, in the formats every pax shares.
+#[test]
+fn test_cross_tool_system_pax_reads_ours() {
+    let Some(pax) = system_tool("pax") else {
+        return;
+    };
+    for format in ["ustar", "cpio"] {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub/f.txt"), "from ours\n").unwrap();
+        std::os::unix::fs::symlink("sub/f.txt", src.join("l")).unwrap();
+
+        let out = run_pax_in_dir(&["-w", "-x", format, "-f", "../a", "sub", "l"], &src);
+        assert_success(&out, &format!("pax -w -x {format}"));
+        let dst = temp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        run_system_ok(&pax, &["-r", "-f", "../a"], &dst, None);
+        assert_eq!(
+            fs::read_to_string(dst.join("sub/f.txt")).unwrap(),
+            "from ours\n"
+        );
+        assert_eq!(
+            fs::read_link(dst.join("l")).unwrap(),
+            Path::new("sub/f.txt")
+        );
+    }
+}
+
+/// And ours reads what the system's pax writes.
+#[test]
+fn test_cross_tool_we_read_system_pax() {
+    let Some(pax) = system_tool("pax") else {
+        return;
+    };
+    for format in ["ustar", "cpio"] {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub/f.txt"), "from system\n").unwrap();
+        std::os::unix::fs::symlink("sub/f.txt", src.join("l")).unwrap();
+
+        run_system_ok(
+            &pax,
+            &["-w", "-x", format, "-f", "../a", "sub", "l"],
+            &src,
+            None,
+        );
+        let dst = temp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        let out = run_pax_in_dir(&["-r", "-f", "../a"], &dst);
+        assert_success(&out, &format!("pax -r of system pax -x {format}"));
+        assert_eq!(
+            fs::read_to_string(dst.join("sub/f.txt")).unwrap(),
+            "from system\n"
+        );
+        assert_eq!(
+            fs::read_link(dst.join("l")).unwrap(),
+            Path::new("sub/f.txt")
+        );
+    }
+}
+
+/// Names read from standard input are archived as they arrive. Buffering the
+/// whole list first costs memory linear in the list and means nothing is
+/// written until the producer exits, so `find / | pax -w | ssh ...` cannot
+/// stream. Here the first file fills a record, which must come out while the
+/// list is still open.
+#[test]
+fn test_write_streams_names_from_stdin() {
+    use std::io::Read;
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("big"), vec![b'B'; 64 * 1024]).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-x", "ustar"])
+        .current_dir(temp.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"big\n").unwrap();
+    stdin.flush().unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut record = vec![0u8; 10240];
+        let _ = tx.send(stdout.read_exact(&mut record).is_ok());
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(got, Ok(true), "no record written while the list was open");
+}
+
+/// Extended-header processing is linear in the number of records: a header
+/// of 40000 unknown keywords used to take seconds (a linear search per
+/// keyword) and should list instantly.
+#[test]
+fn test_many_extended_records_are_linear() {
+    let temp = TempDir::new().unwrap();
+    let mut records = Vec::new();
+    for i in 0..40_000 {
+        records.extend_from_slice(&pax_record(&format!("VENDOR.k{i}"), b"v"));
+    }
+    fs::write(
+        temp.path().join("a.pax"),
+        archive_with_ext_records(&records),
+    )
+    .unwrap();
+
+    let output = run_pax_with_deadline(
+        &["-f", "a.pax"],
+        temp.path(),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("listing 40000 extended records took over 2 s");
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "f\n");
+}
+
+/// A `g` header followed by `members` plain members, `f0` to `f<members-1>`.
+fn archive_with_global_records(records: &[u8], members: usize) -> Vec<u8> {
+    let mut a = Ustar {
+        name: b"GlobalHead",
+        typeflag: b'g',
+        body: records,
+        ..Default::default()
+    }
+    .member();
+    for i in 0..members {
+        let name = format!("f{i}");
+        a.extend_from_slice(
+            &Ustar {
+                name: name.as_bytes(),
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    a.extend_from_slice(&ustar_trailer());
+    a
+}
+
+/// A global header's records apply to every member after it, but are held
+/// once: copying them into each member made listing cost the number of
+/// global records times the number of members (and squared again by the
+/// per-keyword search), so this listing took minutes.
+#[test]
+fn test_global_records_are_not_copied_per_member() {
+    let temp = TempDir::new().unwrap();
+    let mut records = Vec::new();
+    for i in 0..5_000 {
+        records.extend_from_slice(&pax_record(&format!("VENDOR.k{i}"), b"v"));
+    }
+    fs::write(
+        temp.path().join("g.pax"),
+        archive_with_global_records(&records, 2_000),
+    )
+    .unwrap();
+
+    let output = run_pax_with_deadline(
+        &["-f", "g.pax", "-o", "listopt=%(VENDOR.k4999)s"],
+        temp.path(),
+        std::time::Duration::from_secs(3),
+    )
+    .expect("listing 2000 members under 5000 global records took over 3 s");
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "v\n".repeat(2_000));
+}
+
+/// The shared global records still layer the way POSIX says: a member's own
+/// `x` record overrides one, a zero-length `x` record deletes it for that
+/// member only, and `-o delete=` removes it everywhere.
+#[test]
+fn test_global_records_layer_under_member_records() {
+    let temp = TempDir::new().unwrap();
+    let global = [
+        pax_record("VENDOR.a", b"g"),
+        pax_record("VENDOR.b", b"g"),
+        pax_record("VENDOR.c", b"g"),
+    ]
+    .concat();
+    let own = [pax_record("VENDOR.a", b"x"), pax_record("VENDOR.b", b"")].concat();
+    let mut a = Ustar {
+        name: b"GlobalHead",
+        typeflag: b'g',
+        body: &global,
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"PaxHeaders/f0",
+            typeflag: b'x',
+            body: &own,
+            ..Default::default()
+        }
+        .member(),
+    );
+    for name in [&b"f0"[..], b"f1"] {
+        a.extend_from_slice(
+            &Ustar {
+                name,
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    a.extend_from_slice(&ustar_trailer());
+    fs::write(temp.path().join("g.pax"), a).unwrap();
+
+    let list = |extra: &[&str]| {
+        let mut args = vec![
+            "-f",
+            "g.pax",
+            "-o",
+            "listopt=%f:%(VENDOR.a)s|%(VENDOR.b)s|%(VENDOR.c)s",
+        ];
+        args.extend_from_slice(extra);
+        let output = run_pax_in_dir(&args, temp.path());
+        assert_success(&output, "list");
+        stdout_str(&output)
+    };
+    // An absent extension keyword is echoed, as for any name the listing
+    // has no value for.
+    assert_eq!(list(&[]), "f0:x|%(VENDOR.b)s|g\nf1:g|g|g\n");
+    assert_eq!(
+        list(&["-o", "delete=VENDOR.c"]),
+        "f0:x|%(VENDOR.b)s|%(VENDOR.c)s\nf1:g|g|%(VENDOR.c)s\n"
+    );
+    assert_eq!(list(&["-o", "VENDOR.b:=o"]), "f0:x|o|g\nf1:g|o|g\n");
+}
+
+/// A `path` or `linkpath` record is held to the limit every other header's
+/// pathname is (64 KiB). Without it a record could run to the whole 64 MiB
+/// extended header: a 4 KB compressed archive whose name had two million
+/// components drove extraction to 156 MiB.
+#[test]
+fn test_overlong_path_records_are_rejected() {
+    let temp = TempDir::new().unwrap();
+    let limit = 64 * 1024;
+    // Exactly at the limit is a name like any other.
+    let at_limit = format!("{}ff", "a/".repeat((limit - 2) / 2));
+    assert_eq!(at_limit.len(), limit);
+    fs::write(
+        temp.path().join("ok.pax"),
+        archive_with_ext_records(&pax_record("path", at_limit.as_bytes())),
+    )
+    .unwrap();
+    let output = run_pax_in_dir(&["-f", "ok.pax"], temp.path());
+    assert_success(&output, "list a name at the limit");
+    assert_eq!(stdout_str(&output), format!("{at_limit}\n"));
+
+    for keyword in ["path", "linkpath"] {
+        // One byte over.
+        let long = format!("{at_limit}f");
+        let name = format!("{keyword}.pax");
+        fs::write(
+            temp.path().join(&name),
+            archive_with_ext_records(&pax_record(keyword, long.as_bytes())),
+        )
+        .unwrap();
+        // A file where the name's first directory would go keeps a reader
+        // that accepts the record from creating thousands of directories.
+        let dest = temp.path().join(format!("{keyword}-dest"));
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("a"), b"").unwrap();
+        let output = run_pax_in_dir(&["-r", "-f", &format!("../{name}")], &dest);
+        assert_failure(&output, keyword);
+        let stderr = stderr_str(&output);
+        assert!(
+            stderr.contains(&format!("{keyword} record of")),
+            "{keyword}: {}",
+            &stderr[..stderr.len().min(200)]
+        );
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 1, "{keyword}");
+    }
+}
+
+/// A name list can reach a file more than once -- `find tree | pax -w` names
+/// every file twice, once listed and once in the walk of `tree`. A file the
+/// writer forgot after all its names went by is stored again in full, and
+/// depending on the order that splits a hard-linked pair on extraction.
+#[test]
+fn test_find_style_list_keeps_hard_links() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(src.join("tree")).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("tree/f"), "DATA\n").unwrap();
+    fs::hard_link(src.join("tree/f"), src.join("tree/g")).unwrap();
+
+    let output =
+        run_pax_in_dir_with_stdin(&["-w", "-f", "../a.tar"], &src, "tree/f\ntree/g\ntree/f\n");
+    assert_success(&output, "pax -w of a find-style list");
+    let output = run_pax_in_dir(&["-r", "-f", "../a.tar"], &dst);
+    assert_success(&output, "pax -r");
+
+    let f = fs::metadata(dst.join("tree/f")).unwrap();
+    let g = fs::metadata(dst.join("tree/g")).unwrap();
+    assert_eq!(f.ino(), g.ino(), "tree/f and tree/g should be one inode");
+}
+
+/// A name list that cannot be read at all fails before the archive is
+/// created. Its first read used to be diagnosed as the end of the list after
+/// `-f` had already truncated the existing archive.
+#[test]
+fn test_write_unreadable_name_list_keeps_existing_archive() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f1"), "1\n").unwrap();
+    let archive = temp.path().join("keep.tar");
+    assert_success(
+        &run_pax_in_dir(&["-w", "-f", "keep.tar", "f1"], temp.path()),
+        "create",
+    );
+    let before = fs::read(&archive).unwrap();
+    fs::create_dir(temp.path().join("somedir")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-f", "keep.tar"])
+        .current_dir(temp.path())
+        .stdin(File::open(temp.path().join("somedir")).unwrap())
+        .output()
+        .unwrap();
+    assert_failure(&out, "pax -w with a directory for a name list");
+    assert_eq!(fs::read(&archive).unwrap(), before, "archive was truncated");
+}
+
+/// A streamed name list can name the archive being written -- `find . |
+/// pax -w -f out.tar` lists out.tar once pax has created it. Archiving it
+/// copies the archive into itself; like GNU tar, pax leaves it out.
+#[test]
+fn test_write_does_not_archive_the_archive_itself() {
+    use std::process::Stdio;
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f1"), "1\n").unwrap();
+    fs::create_dir(temp.path().join("zzz")).unwrap();
+    let archive = temp.path().join("zzz/out.tar");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-wd", "-f", "zzz/out.tar"])
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"f1\n").unwrap();
+    stdin.flush().unwrap();
+    // The archive exists once the first name has been read.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !archive.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    stdin.write_all(b"zzz/out.tar\n").unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert_success(&out, "pax -w naming its own archive");
+    assert!(
+        stderr_str(&out).contains("zzz/out.tar"),
+        "the skip is not reported: {}",
+        stderr_str(&out)
+    );
+
+    let listing = stdout_str(&run_pax_in_dir(&["-f", "zzz/out.tar"], temp.path()));
+    assert_eq!(listing, "f1\n");
+}
+
+/// -t with -L restores the access time of a directory reached through a
+/// symbolic link: the walk read the directory the link refers to, and that is
+/// the one whose access time it disturbed.
+#[test]
+fn test_t_restores_atime_of_directory_reached_through_link() {
+    let temp = TempDir::new().unwrap();
+    let real = temp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("f"), "F\n").unwrap();
+    std::os::unix::fs::symlink("real", temp.path().join("lnk")).unwrap();
+    fs::create_dir(temp.path().join("out")).unwrap();
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+
+    for args in [
+        &["-w", "-L", "-t", "-f", "a.tar", "lnk"][..],
+        &["-rw", "-L", "-t", "lnk", "out"][..],
+    ] {
+        filetime::set_file_atime(&real, old).unwrap();
+        let output = run_pax_in_dir(args, temp.path());
+        assert_success(&output, &format!("pax {args:?}"));
+        assert_eq!(
+            fs::metadata(&real).unwrap().atime(),
+            1_000_000_000,
+            "{args:?}: directory access time not restored"
+        );
+    }
+}
+
+/// Read mode stops at a failure that every later member would hit too. With
+/// -O, standard output that cannot be written fails every member after the
+/// first the same way; one diagnostic says so, rather than one per member
+/// blaming each in turn. The file-size limit stands in for a full disk.
+#[test]
+fn test_extract_to_stdout_write_error_fails_once() {
+    let body = vec![b'x'; 4096];
+    let mut archive = Vec::new();
+    for name in [&b"m1"[..], b"m2", b"m3", b"m4"] {
+        archive.extend_from_slice(
+            &Ustar {
+                name,
+                body: &body,
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    archive.extend_from_slice(&ustar_trailer());
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a.tar"), &archive).unwrap();
+
+    // SIGXFSZ ignored so the over-limit write fails with EFBIG instead of
+    // killing the process.
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("trap '' XFSZ; ulimit -f 1; exec \"$0\" -xOf a.tar > out")
+        .arg(front_end("tar"))
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert_exit_code(&output, 1, "tar -xO past the file-size limit");
+    let err = stderr_str(&output);
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "one diagnostic, not one per member: {err}"
+    );
+}
+
+/// A directory whose header the format refuses -- here a time before 1970,
+/// which ustar cannot record -- is diagnosed, and its contents are still
+/// archived. The whole subtree used to go with it.
+#[test]
+fn test_refused_directory_header_keeps_its_contents() {
+    let temp = TempDir::new().unwrap();
+    let d = temp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    fs::write(d.join("f"), "F\n").unwrap();
+    filetime::set_file_mtime(&d, filetime::FileTime::from_unix_time(-86400, 0)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "ustar", "-f", "a.tar", "d"], temp.path());
+    assert_exit_code(&output, 1, "pax -w of a pre-1970 directory");
+    assert!(
+        stderr_str(&output).contains("1970"),
+        "{}",
+        stderr_str(&output)
+    );
+    let listing = run_pax_in_dir(&["-f", "a.tar"], temp.path());
+    assert_eq!(stdout_str(&listing), "d/f\n");
+}
+
+/// The reader refuses a `path` record, or a cpio name, longer than its name
+/// limit, so the writer must not produce one: pax could not read back its
+/// own archive. A name that long is refused when it is written, and the
+/// rest still are.
+#[test]
+fn test_pax_refuses_a_name_its_reader_would_reject() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    fs::write(temp.path().join("g"), "G\n").unwrap();
+    let long = "n".repeat(70_000);
+    let subst = format!(",^f$,{long},");
+
+    for format in ["pax", "cpio", "sv4cpio"] {
+        let output = run_pax_in_dir(&["-w", "-x", format, "-s", &subst, "f", "g"], temp.path());
+        assert_exit_code(&output, 1, format);
+        let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+        assert_success(&listing, format);
+        assert_eq!(stdout_str(&listing), "g\n", "{format}");
+    }
+}
+
+/// A directory whose name is 101 to 156 bytes long has a '/' only at its end.
+/// Splitting there left the name field empty -- which old readers take for
+/// the end of the archive -- and the whole name in the prefix.
+#[test]
+fn test_directory_name_is_not_split_at_its_trailing_slash() {
+    let temp = TempDir::new().unwrap();
+    let dir = "a".repeat(120);
+    fs::create_dir(temp.path().join(&dir)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", &dir], temp.path());
+    assert_success(&output, "pax -w -x pax of a 120-byte directory name");
+    // An `x` header first, then the directory's own header.
+    let header = &output.stdout[2 * BLOCK..3 * BLOCK];
+    assert_eq!(header[156], b'5');
+    assert_ne!(header[0], 0, "the name field must not be empty");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), format!("{dir}/\n"));
+
+    // ustar has nowhere to put such a name.
+    let output = run_pax_in_dir(&["-w", "-x", "ustar", &dir], temp.path());
+    assert_exit_code(&output, 1, "pax -w -x ustar of a 120-byte directory name");
 }

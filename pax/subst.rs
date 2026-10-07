@@ -22,20 +22,48 @@
 //! This implementation uses plib::regex for POSIX BRE support.
 
 use crate::error::{PaxError, PaxResult};
-use plib::regex::{Match, Regex, RegexFlags, MAX_CAPTURES};
-use std::path::Path;
+use plib::locale::next_char_offset;
+use plib::regex::{Match, Regex, RegexFlags};
+use std::path::{Path, PathBuf};
 
 /// A compiled substitution expression from -s option
 #[derive(Debug)]
 pub struct Substitution {
     /// Compiled POSIX regex
     regex: Regex,
-    /// Replacement template string (with & and \n references)
-    replacement: String,
+    /// The replacement, already split into literal text and references
+    replacement: Vec<ReplPart>,
     /// Replace all occurrences (g flag)
     global: bool,
     /// Print successful substitutions to stderr (p flag)
     print: bool,
+}
+
+/// One piece of a parsed replacement string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplPart {
+    /// Text copied as it is
+    Literal(Vec<u8>),
+    /// The text matched by subexpression `n`; 0 is the whole match (`&`)
+    Group(usize),
+}
+
+/// One character of a delimited part of the expression, by its bytes, and
+/// whether a backslash escaped it. What an escape means differs between the
+/// pattern and the replacement, so it is decided only once the part is known.
+#[derive(Clone, Copy)]
+enum Piece<'a> {
+    Plain(&'a [u8]),
+    Escaped(&'a [u8]),
+}
+
+/// Characters a BRE gives a meaning of their own, and which therefore keep
+/// their backslash when an escaped delimiter is one of them.
+const BRE_SPECIAL: &[u8] = b".[\\*^$";
+
+/// Whether the character `c` is the single byte `b`.
+fn is_byte(c: &[u8], b: u8) -> bool {
+    c == [b]
 }
 
 /// Result of applying substitutions to a path
@@ -44,7 +72,7 @@ pub enum SubstResult {
     /// No pattern matched, path unchanged
     Unchanged,
     /// Path was transformed to the new value
-    Changed(String),
+    Changed(Vec<u8>),
     /// Path became empty (file should be skipped)
     Empty,
 }
@@ -65,36 +93,37 @@ impl Substitution {
     ///
     /// The first character is the delimiter. The expression is parsed as:
     /// `<delim><old><delim><new><delim>[flags]`
-    pub fn parse(expr: &str) -> PaxResult<Self> {
-        if expr.is_empty() {
+    ///
+    /// The expression is bytes, like the names it rewrites, split into
+    /// characters under the current `LC_CTYPE`: it need not be UTF-8.
+    pub fn parse(expr: impl AsRef<[u8]>) -> PaxResult<Self> {
+        let chars = plib::locale::mb_char_slices(expr.as_ref());
+        let Some((&delimiter, rest)) = chars.split_first() else {
             return Err(PaxError::PatternError(
                 "empty substitution expression".to_string(),
             ));
-        }
+        };
 
-        let mut chars = expr.chars();
-        let delimiter = chars.next().unwrap();
-
-        if delimiter == '\0' {
+        if is_byte(delimiter, 0) {
             return Err(PaxError::PatternError(
                 "null character not allowed as delimiter".to_string(),
             ));
         }
 
-        let rest: String = chars.collect();
-
-        // Parse the old pattern (up to next unescaped delimiter)
-        let (old_pattern, after_old) = parse_delimited(&rest, delimiter)?;
-
-        // Parse the new pattern (up to next unescaped delimiter)
-        let (new_pattern, after_new) = parse_delimited(&after_old, delimiter)?;
+        // Each part runs to the next unescaped delimiter.
+        let (old_pieces, after_old) = parse_delimited(rest, delimiter)?;
+        let (new_pieces, after_new) = parse_delimited(after_old, delimiter)?;
+        let old_pattern = bre_from(&old_pieces, delimiter);
 
         // Parse flags (remainder)
-        let flags = after_new;
         let mut global = false;
         let mut print = false;
 
-        for c in flags.chars() {
+        for &flag in after_new {
+            let c = match flag {
+                [b] => char::from(*b),
+                _ => char::REPLACEMENT_CHARACTER,
+            };
             match c {
                 'g' => global = true,
                 'p' => print = true,
@@ -115,58 +144,83 @@ impl Substitution {
                 _ => {
                     return Err(PaxError::PatternError(format!(
                         "unknown substitution flag: {}",
-                        c
+                        String::from_utf8_lossy(flag)
                     )))
                 }
             }
         }
 
         // Compile the POSIX BRE regex
-        let regex = Regex::new(&old_pattern, RegexFlags::bre())
+        let regex = Regex::new_bytes(&old_pattern, RegexFlags::bre())
             .map_err(|e| PaxError::PatternError(e.to_string()))?;
 
         Ok(Substitution {
             regex,
-            replacement: new_pattern,
+            replacement: replacement_from(&new_pieces, delimiter),
             global,
             print,
         })
     }
 
-    /// Apply this substitution to a path
-    pub fn apply(&self, path: &str) -> SubstResult {
-        let mut result = path.to_string();
+    /// Apply this substitution to a path.
+    ///
+    /// A pathname is bytes, and so is everything here: the regex reports
+    /// byte offsets, which need not fall on a character boundary when the
+    /// name is not valid text in the current locale (a non-ASCII name under
+    /// `LC_ALL=C`), and a name that is not UTF-8 keeps its bytes.
+    ///
+    /// Under `g` an empty match is replaced as sed and ed replace it: at every
+    /// position, the end of the name included, except just after an earlier
+    /// match (`s/b*/-/g` makes "abc" "-a-c-").
+    pub fn apply(&self, path: &[u8]) -> SubstResult {
+        let mut result = path.to_vec();
         let mut pos = 0;
         let mut any_match = false;
+        // Where the previous replacement ended, in `result`.
+        let mut prev_end = None;
 
-        while let Some(matches) = self.regex.captures_at(&result, pos) {
-            any_match = true;
-
-            // Build the replacement string
-            let replacement = build_replacement(&self.replacement, &result, &matches);
-
-            // Get the absolute positions in result
+        // `result` is rewritten as the scan goes, so once a match has been
+        // replaced its offset 0 is no longer the start of the name: `^` must
+        // not match there again (`s,^a,,g` makes "aa" "a").
+        while let Some(matches) =
+            self.regex
+                .captures_at_bytes_notbol(&result, pos, pos > 0 || any_match)
+        {
             let match_start = matches[0].start;
             let match_end = matches[0].end;
 
-            // Replace the matched portion efficiently using with_capacity and push_str
-            let new_len = result.len() - (match_end - match_start) + replacement.len();
-            let mut new_result = String::with_capacity(new_len);
-            new_result.push_str(&result[..match_start]);
-            new_result.push_str(&replacement);
-            new_result.push_str(&result[match_end..]);
+            if match_start == match_end && prev_end == Some(match_start) {
+                // An empty match adjoining the previous one is no match.
+                match next_char_offset(&result, match_start) {
+                    Some(next) => {
+                        pos = next;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            any_match = true;
 
-            result = new_result;
+            let replacement = build_replacement(&self.replacement, &result, &matches);
+            result.splice(match_start..match_end, replacement.iter().copied());
 
             // If not global, stop after first replacement
             if !self.global {
                 break;
             }
 
-            match next_scan_pos(&result, match_start, match_end, replacement.len()) {
-                Some(next) if next < result.len() => pos = next,
-                _ => break,
-            }
+            let end = match_start + replacement.len();
+            prev_end = Some(end);
+            pos = if match_end > match_start {
+                end
+            } else {
+                // An empty match consumed nothing: step over a character of
+                // the name, or the same position matches forever.
+                match next_char_offset(&result, end) {
+                    Some(next) => next,
+                    None => break,
+                }
+            };
         }
 
         if !any_match {
@@ -181,146 +235,145 @@ impl Substitution {
     }
 }
 
-/// Where a global substitution resumes scanning, as a byte offset into the
-/// rewritten string. `None` once the scan has reached the end.
-///
-/// Whether to step over a character depends on what the *match* consumed, not
-/// on how long the replacement is:
-///
-/// - a non-empty match was consumed, so scanning continues just past the
-///   replacement. Keying this off `replacement.len()` instead meant a deletion
-///   (`-s ',a,,g'`) also skipped the character after each match, leaving about
-///   half the occurrences in place.
-/// - an empty match consumed nothing, so one character of the subject must be
-///   stepped over as well. Otherwise the same position matches forever and the
-///   string grows without bound -- `-s ',x*,-,g'` never terminated.
-///
-/// Stepping by a whole character, rather than one byte, keeps the offset on a
-/// UTF-8 boundary for the next match.
-fn next_scan_pos(
-    result: &str,
-    match_start: usize,
-    match_end: usize,
-    replacement_len: usize,
-) -> Option<usize> {
-    let resume = match_start + replacement_len;
-    if match_end > match_start {
-        return Some(resume);
-    }
-    let next_char = result[resume..].chars().next()?;
-    Some(resume + next_char.len_utf8())
-}
-
-/// Build the replacement string from template and match groups
-fn build_replacement(template: &str, input: &str, matches: &[Match]) -> String {
-    // Pre-allocate with a reasonable estimate (template length + some extra for expansions)
-    let mut result = String::with_capacity(template.len() + 32);
-    let mut chars = template.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '&' {
-            // & is replaced by entire match
-            if !matches.is_empty() && matches[0].end > matches[0].start {
-                result.push_str(&input[matches[0].start..matches[0].end]);
-            }
-        } else if c == '\\' {
-            if let Some(&next) = chars.peek() {
-                if next.is_ascii_digit() && next != '0' {
-                    // \1 through \9 - backreference
-                    let idx = (next as usize) - ('0' as usize);
-                    if idx < matches.len()
-                        && idx < MAX_CAPTURES
-                        && matches[idx].end > matches[idx].start
-                    {
-                        result.push_str(&input[matches[idx].start..matches[idx].end]);
-                    }
-                    chars.next();
-                } else if next == '\\' {
-                    // \\ -> literal backslash
-                    result.push('\\');
-                    chars.next();
-                } else if next == '&' {
-                    // \& -> literal &
-                    result.push('&');
-                    chars.next();
-                } else {
-                    // Keep other backslash sequences as-is
-                    result.push(c);
+/// Build the replacement text for one match.
+fn build_replacement(parts: &[ReplPart], input: &[u8], matches: &[Match]) -> Vec<u8> {
+    let mut result = Vec::new();
+    for part in parts {
+        match part {
+            ReplPart::Literal(text) => result.extend_from_slice(text),
+            ReplPart::Group(idx) => {
+                if let Some(m) = matches.get(*idx).filter(|m| m.end > m.start) {
+                    result.extend_from_slice(&input[m.start..m.end]);
                 }
-            } else {
-                result.push(c);
             }
-        } else {
-            result.push(c);
         }
     }
-
     result
 }
 
-/// Parse a delimited string, handling escaped delimiters
+/// Split off one delimited part of the expression: everything up to the next
+/// delimiter not preceded by a backslash, and what follows that delimiter.
 ///
-/// Returns (parsed_string, remaining_after_delimiter)
-fn parse_delimited(s: &str, delimiter: char) -> PaxResult<(String, String)> {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    let mut found_delimiter = false;
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            // Check if next char is the delimiter (escaped)
-            if let Some(&next) = chars.peek() {
-                if next == delimiter {
-                    // Escaped delimiter - include literal delimiter
-                    result.push(delimiter);
-                    chars.next();
-                    continue;
-                }
+/// A backslash always takes the character after it with it, so `\\` is one
+/// escaped backslash and cannot escape a delimiter that follows it.
+fn parse_delimited<'a, 'c>(
+    chars: &'c [&'a [u8]],
+    delimiter: &[u8],
+) -> PaxResult<(Vec<Piece<'a>>, &'c [&'a [u8]])> {
+    let mut pieces = Vec::new();
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        i += 1;
+        if is_byte(c, b'\\') {
+            if let Some(&next) = chars.get(i) {
+                i += 1;
+                pieces.push(Piece::Escaped(next));
+                continue;
             }
-            // Not an escaped delimiter - keep the backslash
-            result.push(c);
         } else if c == delimiter {
-            found_delimiter = true;
-            break;
-        } else {
-            result.push(c);
+            return Ok((pieces, &chars[i..]));
         }
+        pieces.push(Piece::Plain(c));
     }
-
-    if !found_delimiter {
-        return Err(PaxError::PatternError(format!(
-            "missing delimiter '{}' in substitution",
-            delimiter
-        )));
-    }
-
-    let remaining: String = chars.collect();
-    Ok((result, remaining))
+    Err(PaxError::PatternError(format!(
+        "missing delimiter '{}' in substitution",
+        String::from_utf8_lossy(delimiter)
+    )))
 }
 
-/// Apply a list of substitutions to a path
-///
-/// Substitutions are applied in order. The first one that matches
-/// (produces a change) wins, and no further substitutions are tried.
+/// The BRE for the `old` part. An escaped delimiter is "that literal
+/// character", as in ed and sed, so where the BRE would give it a meaning of
+/// its own it keeps a backslash; every other escape is the BRE's.
+fn bre_from(pieces: &[Piece], delimiter: &[u8]) -> Vec<u8> {
+    let mut bre = Vec::new();
+    for piece in pieces {
+        match *piece {
+            Piece::Plain(c) => bre.extend_from_slice(c),
+            Piece::Escaped(c) if c == delimiter && !is_bre_special(c) => bre.extend_from_slice(c),
+            Piece::Escaped(c) => {
+                bre.push(b'\\');
+                bre.extend_from_slice(c);
+            }
+        }
+    }
+    bre
+}
+
+/// Whether the character `c` means something of its own in a BRE.
+fn is_bre_special(c: &[u8]) -> bool {
+    matches!(c, [b] if BRE_SPECIAL.contains(b))
+}
+
+/// The parsed `new` part, with ed's meanings: `&` and `\0` are the whole
+/// match, `\1`-`\9` a subexpression, and an escaped delimiter, `\\` or `\&`
+/// the character itself. ed leaves a backslash before any other character
+/// unspecified; it is dropped, as BSD pax and sed do.
+fn replacement_from(pieces: &[Piece], delimiter: &[u8]) -> Vec<ReplPart> {
+    let mut parts = Vec::new();
+    let mut literal = Vec::new();
+    for piece in pieces {
+        let group = match *piece {
+            Piece::Plain(c) if is_byte(c, b'&') => Some(0),
+            Piece::Escaped(&[d]) if [d] != delimiter && d.is_ascii_digit() => {
+                Some(usize::from(d - b'0'))
+            }
+            _ => None,
+        };
+        match (group, *piece) {
+            (Some(n), _) => {
+                if !literal.is_empty() {
+                    parts.push(ReplPart::Literal(std::mem::take(&mut literal)));
+                }
+                parts.push(ReplPart::Group(n));
+            }
+            (None, Piece::Plain(c) | Piece::Escaped(c)) => literal.extend_from_slice(c),
+        }
+    }
+    if !literal.is_empty() {
+        parts.push(ReplPart::Literal(literal));
+    }
+    parts
+}
+
+/// The name a member takes under the `-s` expressions, or `None` when it
+/// becomes the empty string and so is to be ignored. A `p` expression reports
+/// the rewrite on standard error.
+pub fn substitute_name(substitutions: &[Substitution], path: &Path) -> Option<PathBuf> {
+    substituted(substitutions, path, true)
+}
+
+/// The `-s` rewrite of a hard link's target, which is the name of another
+/// member and so has to follow wherever `-s` moved that member. Not reported
+/// under `p`: the rename is the target member's, and was reported for it.
+pub fn substitute_link_target(substitutions: &[Substitution], path: &Path) -> Option<PathBuf> {
+    substituted(substitutions, path, false)
+}
+
+fn substituted(substitutions: &[Substitution], path: &Path, report: bool) -> Option<PathBuf> {
+    match apply_substitutions(substitutions, path, report) {
+        SubstResult::Unchanged => Some(path.to_path_buf()),
+        SubstResult::Changed(new) => Some(crate::rawpath::from_bytes(&new)),
+        SubstResult::Empty => None,
+    }
+}
+
 /// Apply the `-s` expressions to a member name, in order, stopping at the
 /// first that changes it.
 ///
-/// Takes the pathname rather than its lossy rendering so that the `p` flag can
-/// report the name as it really is. The matching itself is still done on the
-/// lossy form -- see `crate::rawpath::MatchName` -- which is why the left-hand
-/// side of the report comes from `path` and not from what the regex saw.
-pub fn apply_substitutions(substitutions: &[Substitution], path: &Path) -> SubstResult {
-    let name = crate::rawpath::MatchName::of(path);
+/// The regex sees the name's own bytes, so a name that is not UTF-8 is
+/// matched, rewritten and reported exactly as it is.
+fn apply_substitutions(substitutions: &[Substitution], path: &Path, report: bool) -> SubstResult {
+    let name = crate::rawpath::as_bytes(path);
     for subst in substitutions {
-        match subst.apply(name.as_str()) {
+        match subst.apply(name) {
             SubstResult::Unchanged => continue,
             result => {
-                if subst.print {
+                if report && subst.print {
                     let mut line = Vec::new();
                     line.extend_from_slice(crate::rawpath::as_bytes(path));
                     line.extend_from_slice(b" >> ");
                     match &result {
-                        SubstResult::Changed(new) => line.extend_from_slice(new.as_bytes()),
+                        SubstResult::Changed(new) => line.extend_from_slice(new),
                         SubstResult::Empty | SubstResult::Unchanged => {}
                     }
                     crate::escape::write_stderr_line(&line);
@@ -428,23 +481,23 @@ mod tests {
     fn test_apply_basic() {
         let s = Substitution::parse("/foo/bar/").unwrap();
         assert_eq!(
-            s.apply("hello_foo_world"),
-            SubstResult::Changed("hello_bar_world".to_string())
+            s.apply("hello_foo_world".as_bytes()),
+            SubstResult::Changed("hello_bar_world".as_bytes().to_vec())
         );
     }
 
     #[test]
     fn test_apply_no_match() {
         let s = Substitution::parse("/foo/bar/").unwrap();
-        assert_eq!(s.apply("hello_world"), SubstResult::Unchanged);
+        assert_eq!(s.apply("hello_world".as_bytes()), SubstResult::Unchanged);
     }
 
     #[test]
     fn test_apply_global() {
         let s = Substitution::parse("/foo/bar/g").unwrap();
         assert_eq!(
-            s.apply("foo_foo_foo"),
-            SubstResult::Changed("bar_bar_bar".to_string())
+            s.apply("foo_foo_foo".as_bytes()),
+            SubstResult::Changed("bar_bar_bar".as_bytes().to_vec())
         );
     }
 
@@ -455,19 +508,31 @@ mod tests {
     #[test]
     fn test_apply_global_deletion() {
         let s = Substitution::parse("/a//g").unwrap();
-        assert_eq!(s.apply("aab"), SubstResult::Changed("b".to_string()));
-        assert_eq!(s.apply("banana"), SubstResult::Changed("bnn".to_string()));
+        assert_eq!(
+            s.apply("aab".as_bytes()),
+            SubstResult::Changed("b".as_bytes().to_vec())
+        );
+        assert_eq!(
+            s.apply("banana".as_bytes()),
+            SubstResult::Changed("bnn".as_bytes().to_vec())
+        );
 
         // Deleting a multi-character match, adjacent occurrences.
         let s = Substitution::parse("/ab//g").unwrap();
-        assert_eq!(s.apply("xababy"), SubstResult::Changed("xy".to_string()));
+        assert_eq!(
+            s.apply("xababy".as_bytes()),
+            SubstResult::Changed("xy".as_bytes().to_vec())
+        );
     }
 
     /// Shortening (but non-empty) replacements hit the same advance logic.
     #[test]
     fn test_apply_global_shortening() {
         let s = Substitution::parse("/aa/a/g").unwrap();
-        assert_eq!(s.apply("aaaa"), SubstResult::Changed("aa".to_string()));
+        assert_eq!(
+            s.apply("aaaa".as_bytes()),
+            SubstResult::Changed("aa".as_bytes().to_vec())
+        );
     }
 
     /// The one-character bump that guards against an empty match must land on a
@@ -476,36 +541,39 @@ mod tests {
     fn test_apply_global_empty_match_non_ascii() {
         // `x*` matches empty at every position.
         let s = Substitution::parse("/x*/-/g").unwrap();
-        match s.apply("éöü") {
+        match s.apply("éöü".as_bytes()) {
             SubstResult::Changed(_) => {}
             other => panic!("expected a substitution, got {:?}", other),
         }
 
         let s = Substitution::parse("/é//g").unwrap();
-        assert_eq!(s.apply("éaéb"), SubstResult::Changed("ab".to_string()));
+        assert_eq!(
+            s.apply("éaéb".as_bytes()),
+            SubstResult::Changed("ab".as_bytes().to_vec())
+        );
     }
 
     #[test]
     fn test_apply_non_global() {
         let s = Substitution::parse("/foo/bar/").unwrap();
         assert_eq!(
-            s.apply("foo_foo_foo"),
-            SubstResult::Changed("bar_foo_foo".to_string())
+            s.apply("foo_foo_foo".as_bytes()),
+            SubstResult::Changed("bar_foo_foo".as_bytes().to_vec())
         );
     }
 
     #[test]
     fn test_apply_empty_result() {
         let s = Substitution::parse("/.*//").unwrap();
-        assert_eq!(s.apply("hello"), SubstResult::Empty);
+        assert_eq!(s.apply("hello".as_bytes()), SubstResult::Empty);
     }
 
     #[test]
     fn test_apply_ampersand_replacement() {
         let s = Substitution::parse("/foo/[&]/").unwrap();
         assert_eq!(
-            s.apply("hello_foo_world"),
-            SubstResult::Changed("hello_[foo]_world".to_string())
+            s.apply("hello_foo_world".as_bytes()),
+            SubstResult::Changed("hello_[foo]_world".as_bytes().to_vec())
         );
     }
 
@@ -515,8 +583,8 @@ mod tests {
         // Pattern: \(.*\)_\(.*\)$ matches "hello_world" with groups
         let s = Substitution::parse("/\\(.*\\)_\\(.*\\)$/\\2_\\1/").unwrap();
         assert_eq!(
-            s.apply("hello_world"),
-            SubstResult::Changed("world_hello".to_string())
+            s.apply("hello_world".as_bytes()),
+            SubstResult::Changed("world_hello".as_bytes().to_vec())
         );
     }
 
@@ -525,8 +593,8 @@ mod tests {
         // Add prefix using ^ anchor
         let s = Substitution::parse("/^/prefix\\//").unwrap();
         assert_eq!(
-            s.apply("foo/bar"),
-            SubstResult::Changed("prefix/foo/bar".to_string())
+            s.apply("foo/bar".as_bytes()),
+            SubstResult::Changed("prefix/foo/bar".as_bytes().to_vec())
         );
     }
 
@@ -536,8 +604,8 @@ mod tests {
         // In BRE, \. matches literal dot
         let s = Substitution::parse("/\\.txt$//").unwrap();
         assert_eq!(
-            s.apply("file.txt"),
-            SubstResult::Changed("file".to_string())
+            s.apply("file.txt".as_bytes()),
+            SubstResult::Changed("file".as_bytes().to_vec())
         );
     }
 
@@ -548,8 +616,8 @@ mod tests {
             Substitution::parse("/foo/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, Path::new("foo")),
-            SubstResult::Changed("first".to_string())
+            apply_substitutions(&subs, Path::new("foo"), false),
+            SubstResult::Changed("first".as_bytes().to_vec())
         );
     }
 
@@ -560,8 +628,8 @@ mod tests {
             Substitution::parse("/foo/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, Path::new("foo")),
-            SubstResult::Changed("second".to_string())
+            apply_substitutions(&subs, Path::new("foo"), false),
+            SubstResult::Changed("second".as_bytes().to_vec())
         );
     }
 
@@ -572,7 +640,7 @@ mod tests {
             Substitution::parse("/yyy/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, Path::new("foo")),
+            apply_substitutions(&subs, Path::new("foo"), false),
             SubstResult::Unchanged
         );
     }
@@ -580,6 +648,51 @@ mod tests {
     #[test]
     fn test_escaped_ampersand() {
         let s = Substitution::parse("/foo/\\&/").unwrap();
-        assert_eq!(s.apply("foo"), SubstResult::Changed("&".to_string()));
+        assert_eq!(
+            s.apply("foo".as_bytes()),
+            SubstResult::Changed("&".as_bytes().to_vec())
+        );
+    }
+
+    fn changed(expr: &str, name: &str) -> SubstResult {
+        Substitution::parse(expr).unwrap().apply(name.as_bytes())
+    }
+
+    fn to(name: &str) -> SubstResult {
+        SubstResult::Changed(name.as_bytes().to_vec())
+    }
+
+    /// `\\` is one escaped backslash, so the delimiter after it is not
+    /// escaped: `/a\\/X/` replaces `a\`. The pair was taken apart and the
+    /// second backslash escaped the delimiter, so the expression was refused.
+    #[test]
+    fn test_escaped_backslash_before_delimiter() {
+        assert_eq!(changed(r"/a\\/X/", r"a\"), to("X"));
+    }
+
+    /// An escaped delimiter is "that literal character" (as in ed and sed),
+    /// even where the character is special in a BRE: `.a\.b.X.` matches a
+    /// dot, not any character.
+    #[test]
+    fn test_escaped_delimiter_is_literal_in_the_pattern() {
+        assert_eq!(changed(r".a\.b.X.", "a.b"), to("X"));
+        assert_eq!(changed(r".a\.b.X.", "axb"), SubstResult::Unchanged);
+    }
+
+    /// The same in the replacement: with `&` as the delimiter, `\&` is a
+    /// literal ampersand, not the matched text.
+    #[test]
+    fn test_escaped_delimiter_is_literal_in_the_replacement() {
+        assert_eq!(changed(r"&a&\&&", "ab"), to("&b"));
+        // A digit delimiter escaped is the digit, not a back-reference.
+        assert_eq!(changed(r"1a\(b\)1\11", "ab"), to("1"));
+    }
+
+    /// Before any other character a backslash in the replacement is dropped,
+    /// as ed, sed and BSD pax do, and `\0` is the whole match like `&`.
+    #[test]
+    fn test_replacement_backslash_before_ordinary_character() {
+        assert_eq!(changed(r"/a/\x/", "ab"), to("xb"));
+        assert_eq!(changed(r"/a/<\0>/", "ab"), to("<a>b"));
     }
 }

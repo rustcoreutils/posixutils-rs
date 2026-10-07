@@ -26,19 +26,22 @@
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
-    calculate_checksum, parse_header as parse_ustar_header, parse_octal, try_split_path,
-    ustar_path_bytes, verify_checksum, write_field, SizeRule, BLKTYPE, BLOCK_SIZE, CHKSUM_OFF,
-    CHRTYPE, DEVMAJOR_OFF, DEVMINOR_OFF, DIRTYPE, FIFOTYPE, GID_OFF, GNAME_LEN, GNAME_OFF,
-    LINKNAME_LEN, LINKNAME_OFF, LNKTYPE, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF,
-    PREFIX_LEN, PREFIX_OFF, REGTYPE, SIZE_OFF, SYMTYPE, TYPEFLAG_OFF, UID_OFF, UNAME_LEN,
-    UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
+    calculate_checksum, entry_type_to_flag, long_name_record, member_data_size,
+    parse_header as parse_ustar_header, parse_numeric, try_split_path, ustar_path_bytes,
+    verify_checksum, write_field, LoneZeroBlock, LongNameGroup, SizeRule, BLOCK_SIZE, CHKSUM_OFF,
+    DEVMAJOR_OFF, DEVMINOR_OFF, GID_OFF, GNAME_LEN, GNAME_OFF, LINKNAME_LEN, LINKNAME_OFF,
+    MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF, PREFIX_LEN, PREFIX_OFF, SIZE_OFF,
+    TYPEFLAG_OFF, UID_OFF, UNAME_LEN, UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
 };
+use crate::formats::{ArchiveStream, MAX_EXTENDED_HEADER, MAX_NAME};
 use crate::options::FormatOptions;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
+use std::ops::Range;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // The header block layout, the typeflags and the zero block all come from
 // `formats::ustar`: a pax archive *is* a ustar archive with extra headers, and
@@ -104,6 +107,14 @@ pub struct ExtendedHeader {
     pub hdrcharset: Option<String>,
     /// Additional custom keywords
     pub extra: HashMap<String, String>,
+    /// Keywords a zero-length record (`keyword=`) deleted.
+    ///
+    /// POSIX: such a record "shall delete any header block field, previously
+    /// entered extended header value, or global extended header value of the
+    /// same name". The field above is cleared too; this remembers the deletion
+    /// so that it reaches the global values and header block underneath when
+    /// the headers are merged and applied.
+    pub deleted: HashSet<String>,
 }
 
 /// The extended-header keywords `ExtendedHeader` holds in a typed field, as
@@ -111,8 +122,8 @@ pub struct ExtendedHeader {
 ///
 /// One list: `serialize` needs it twice and `set_keyword` has an arm per name,
 /// and the three had been written out separately, so adding a keyword to one
-/// and not the others was a silent mistake. `test_standard_keywords_are_typed`
-/// pins them together.
+/// and not the others was a silent mistake. `holds`, `clear` and `merge` also
+/// name every field; `test_standard_keywords_are_typed` pins them together.
 const STANDARD_KEYWORDS: &[&str] = &[
     "hdrcharset",
     "atime",
@@ -152,6 +163,137 @@ impl ExtendedHeader {
         }
     }
 
+    /// Drop this header's value for `keyword`, typed or not.
+    fn clear(&mut self, keyword: &str) {
+        match keyword {
+            "hdrcharset" => self.hdrcharset = None,
+            "atime" => self.atime = None,
+            "mtime" => self.mtime = None,
+            "ctime" => self.ctime = None,
+            "path" => self.path = None,
+            "linkpath" => self.linkpath = None,
+            "size" => self.size = None,
+            "uid" => self.uid = None,
+            "gid" => self.gid = None,
+            "uname" => self.uname = None,
+            "gname" => self.gname = None,
+            _ => {
+                self.extra.remove(keyword);
+            }
+        }
+    }
+
+    /// Record a zero-length `keyword=` record: the value is gone, and so is
+    /// any value it would have overridden. See `deleted`.
+    fn delete(&mut self, keyword: &str) {
+        self.clear(keyword);
+        self.deleted.insert(keyword.to_string());
+    }
+
+    /// Layer `later` over this header, keyword by keyword: what `later` sets
+    /// replaces this header's value, what it deletes is deleted here, and
+    /// everything it does not name is left alone.
+    ///
+    /// This is both how a `g` header joins the global values already in force
+    /// ("the last one given ... shall take precedence", and only for the
+    /// keywords it gives) and how an `x` header overrides them.
+    fn merge(&mut self, later: &ExtendedHeader) {
+        for keyword in &later.deleted {
+            self.delete(keyword);
+        }
+        macro_rules! take {
+            ($($field:ident),*) => {$(
+                if later.$field.is_some() {
+                    self.$field.clone_from(&later.$field);
+                    self.deleted.remove(stringify!($field));
+                }
+            )*};
+        }
+        take!(hdrcharset, atime, mtime, ctime, path, linkpath, size, uid, gid, uname, gname);
+        for (keyword, value) in &later.extra {
+            self.extra.insert(keyword.clone(), value.clone());
+            self.deleted.remove(keyword);
+        }
+    }
+
+    /// Forget every value, and every deletion, whose keyword `keep` rejects,
+    /// as though the archive had never carried the record.
+    fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        for &keyword in STANDARD_KEYWORDS {
+            if !keep(keyword) {
+                self.clear(keyword);
+            }
+        }
+        self.extra.retain(|keyword, _| keep(keyword));
+        self.deleted.retain(|keyword| keep(keyword));
+    }
+
+    /// This header without its extension records (`extra`): the typed fields,
+    /// and which of them were deleted.
+    ///
+    /// What a member's records start from in place of a full copy of the
+    /// global ones: the extensions are shared instead (see `ExtRecords`), and
+    /// a deletion of one matters only when this header is merged into
+    /// another, which a member's records never are.
+    fn typed_only(&self) -> ExtendedHeader {
+        ExtendedHeader {
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: self.ctime,
+            path: self.path.clone(),
+            linkpath: self.linkpath.clone(),
+            size: self.size,
+            uid: self.uid,
+            gid: self.gid,
+            uname: self.uname.clone(),
+            gname: self.gname.clone(),
+            hdrcharset: self.hdrcharset.clone(),
+            extra: HashMap::new(),
+            deleted: STANDARD_KEYWORDS
+                .iter()
+                .filter(|keyword| self.deleted.contains(**keyword))
+                .map(|keyword| keyword.to_string())
+                .collect(),
+        }
+    }
+
+    /// The records a set of `-o` operands stands for, in a stable order so
+    /// that a bad value is always the same one reported. `assign` is the
+    /// operator they were given with (`=` or `:=`), for the diagnostic.
+    fn from_options(options: &HashMap<String, Vec<u8>>, assign: &str) -> PaxResult<Self> {
+        let mut sorted: Vec<_> = options.iter().collect();
+        sorted.sort();
+        let mut header = ExtendedHeader::new();
+        for (keyword, value) in sorted {
+            header
+                .apply_record(&[keyword.as_bytes(), b"=", value].concat())
+                .map_err(|e| {
+                    let reason = match e {
+                        PaxError::InvalidHeader(reason) => reason,
+                        other => other.to_string(),
+                    };
+                    let value = String::from_utf8_lossy(value);
+                    PaxError::InvalidFormat(format!("-o {keyword}{assign}{value}: {reason}"))
+                })?;
+        }
+        Ok(header)
+    }
+
+    /// Refuse a `path` or `linkpath` record longer than a reader accepts --
+    /// this one included, so writing it made an archive pax could not read
+    /// back.
+    fn check_name_limit(&self) -> PaxResult<()> {
+        for name in [&self.path, &self.linkpath].into_iter().flatten() {
+            if name.len() as u64 > MAX_NAME {
+                return Err(PaxError::PathTooLong(format!(
+                    "{} bytes, over the {MAX_NAME} byte limit",
+                    name.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Parse extended header records from data
     pub fn parse(data: &[u8]) -> PaxResult<Self> {
         let mut header = ExtendedHeader::new();
@@ -186,8 +328,27 @@ impl ExtendedHeader {
         // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
         // For binary-capable keywords, skip if not valid UTF-8
         let value_bytes = &record[eq_pos + 1..];
+        // A zero-length value is a deletion, not a value: an empty time or id
+        // is not something to parse, and a pax writer emits one on purpose
+        // (`-o mtime:=`).
+        if value_bytes.is_empty() {
+            self.delete(keyword);
+            return Ok(());
+        }
+        self.deleted.remove(keyword);
         // A pathname keyword keeps its bytes whatever they are; under
         // hdrcharset=BINARY they are deliberately not UTF-8.
+        //
+        // Its length is held to the limit every other header's pathname is
+        // (a GNU long name, a cpio name): a record may otherwise run to the
+        // whole extended header, and a short compressed archive could then
+        // hand extraction a name of millions of components to walk.
+        if matches!(keyword, "path" | "linkpath") && value_bytes.len() as u64 > MAX_NAME {
+            return Err(PaxError::InvalidHeader(format!(
+                "{keyword} record of {} bytes exceeds the {MAX_NAME} byte limit",
+                value_bytes.len()
+            )));
+        }
         match keyword {
             "path" => {
                 self.path = Some(value_bytes.to_vec());
@@ -242,24 +403,13 @@ impl ExtendedHeader {
                 self.linkpath = Some(value.as_bytes().to_vec());
             }
             "size" => {
-                self.size =
-                    Some(value.parse().map_err(|_| {
-                        PaxError::InvalidHeader(format!("invalid size: {}", value))
-                    })?);
+                self.size = Some(parse_decimal(keyword, value)?);
             }
             "uid" => {
-                self.uid = Some(
-                    value
-                        .parse()
-                        .map_err(|_| PaxError::InvalidHeader(format!("invalid uid: {}", value)))?,
-                );
+                self.uid = Some(parse_decimal(keyword, value)?);
             }
             "gid" => {
-                self.gid = Some(
-                    value
-                        .parse()
-                        .map_err(|_| PaxError::InvalidHeader(format!("invalid gid: {}", value)))?,
-                );
+                self.gid = Some(parse_decimal(keyword, value)?);
             }
             "uname" => {
                 self.uname = Some(value.as_bytes().to_vec());
@@ -288,19 +438,22 @@ impl ExtendedHeader {
 
         // Write a record unless the keyword is deleted, honoring any per-file
         // `keyword:=value` override. Plain functions rather than closures so the
-        // text and raw-bytes forms can both append to `data`.
+        // text and raw-bytes forms can both append to `data`. A record that
+        // names the member where its header fields cannot (`required`) is
+        // written whatever `-o delete=` matches.
         fn write_if_allowed_bytes(
             data: &mut Vec<u8>,
             options: &FormatOptions,
-            per_file: &HashMap<String, String>,
+            per_file: &HashMap<String, Vec<u8>>,
             keyword: &str,
             default_value: &[u8],
+            required: bool,
         ) {
-            if options.should_delete_keyword(keyword) {
+            if !required && options.should_delete_keyword(keyword) {
                 return;
             }
             match per_file.get(keyword) {
-                Some(v) => write_pax_record_bytes(data, keyword, v.as_bytes()),
+                Some(v) => write_pax_record_bytes(data, keyword, v),
                 None => write_pax_record_bytes(data, keyword, default_value),
             }
         }
@@ -308,11 +461,18 @@ impl ExtendedHeader {
         fn write_if_allowed(
             data: &mut Vec<u8>,
             options: &FormatOptions,
-            per_file: &HashMap<String, String>,
+            per_file: &HashMap<String, Vec<u8>>,
             keyword: &str,
             default_value: &str,
         ) {
-            write_if_allowed_bytes(data, options, per_file, keyword, default_value.as_bytes());
+            write_if_allowed_bytes(
+                data,
+                options,
+                per_file,
+                keyword,
+                default_value.as_bytes(),
+                false,
+            );
         }
 
         macro_rules! rec {
@@ -321,8 +481,8 @@ impl ExtendedHeader {
             };
         }
         macro_rules! rec_bytes {
-            ($kw:expr, $val:expr) => {
-                write_if_allowed_bytes(&mut data, options, per_file, $kw, $val)
+            ($kw:expr, $val:expr, $required:expr) => {
+                write_if_allowed_bytes(&mut data, options, per_file, $kw, $val, $required)
             };
         }
 
@@ -340,13 +500,18 @@ impl ExtendedHeader {
             rec!("ctime", &format_pax_time(ctime));
         }
         if let Some(ref path) = self.path {
-            rec_bytes!("path", path);
+            rec_bytes!("path", path, try_split_path(path).is_none());
         }
         if let Some(ref linkpath) = self.linkpath {
-            rec_bytes!("linkpath", linkpath);
+            rec_bytes!("linkpath", linkpath, linkpath.len() > LINKNAME_LEN);
         }
+        // `size` frames the member: `from_entry` writes it only where a reader
+        // needs it to find the data's end -- a size the field cannot hold, or a
+        // hard link's data, which only an extended header makes a reader look
+        // for. Deleting it, or replacing its value, makes the data read as
+        // headers, so neither `-o delete=` nor `-o size:=` touches it.
         if let Some(size) = self.size {
-            rec!("size", &size.to_string());
+            write_pax_record_bytes(&mut data, "size", size.to_string().as_bytes());
         }
         if let Some(uid) = self.uid {
             rec!("uid", &uid.to_string());
@@ -355,10 +520,10 @@ impl ExtendedHeader {
             rec!("gid", &gid.to_string());
         }
         if let Some(ref uname) = self.uname {
-            rec_bytes!("uname", uname);
+            rec_bytes!("uname", uname, false);
         }
         if let Some(ref gname) = self.gname {
-            rec_bytes!("gname", gname);
+            rec_bytes!("gname", gname, false);
         }
         // Sorted: iterating a HashMap made the record order differ between runs
         // of the same command, so two invocations produced different bytes for
@@ -373,13 +538,13 @@ impl ExtendedHeader {
         // value is absent from this entry: write_if_allowed above already merges
         // an override when the entry carried the field, but a forced value such
         // as `-o gname:=other` / `-o uid:=N` on an entry with no gname/uid must
-        // still produce a record.
+        // still produce a record. Never `size`, for the reason above.
         for &keyword in STANDARD_KEYWORDS {
-            if self.holds(keyword) || options.should_delete_keyword(keyword) {
+            if self.holds(keyword) || options.should_delete_keyword(keyword) || keyword == "size" {
                 continue;
             }
             if let Some(value) = per_file.get(keyword) {
-                write_pax_record(&mut data, keyword, value);
+                write_pax_record_bytes(&mut data, keyword, value);
             }
         }
 
@@ -393,86 +558,79 @@ impl ExtendedHeader {
             }
             // Skip standard keywords that were already handled above
             if !STANDARD_KEYWORDS.contains(&key.as_str()) && !self.extra.contains_key(key) {
-                write_pax_record(&mut data, key, value);
+                write_pax_record_bytes(&mut data, key, value);
             }
         }
 
         data
     }
 
-    /// Apply extended-header overrides on extract, skipping any keyword removed
-    /// by the caller's `-o delete=` patterns so the underlying ustar header
-    /// value remains in force (POSIX Keyword Precedence).
-    pub fn apply_to_filtered(&self, entry: &mut ArchiveEntry, opts: &FormatOptions) {
-        let keep = |kw: &str| !opts.should_delete_keyword(kw);
-        if keep("path") {
-            if let Some(ref path) = self.path {
-                entry.path = PathBuf::from(OsString::from_vec(path.clone()));
-            }
+    /// Apply these records over the header block fields already in `entry`.
+    ///
+    /// A keyword with no value here leaves the header block field in force.
+    /// That includes a deleted one, with two exceptions: `uname` and `gname`,
+    /// whose header block fields can be deleted too -- the owner is then named
+    /// by its numeric id, which is what an archive without the name means.
+    /// The other fields have no "absent": deleting `size` would desync the
+    /// archive, `path` would leave the member nameless, and a time or an id
+    /// of zero would be an invented value rather than a missing one, so their
+    /// header block value stands.
+    fn apply_to(&self, entry: &mut ArchiveEntry) {
+        if let Some(ref path) = self.path {
+            entry.path = PathBuf::from(OsString::from_vec(path.clone()));
         }
-        if keep("linkpath") {
-            if let Some(ref linkpath) = self.linkpath {
-                entry.link_target = Some(PathBuf::from(OsString::from_vec(linkpath.clone())));
-            }
+        if let Some(ref linkpath) = self.linkpath {
+            entry.link_target = Some(PathBuf::from(OsString::from_vec(linkpath.clone())));
         }
-        if keep("size") {
-            if let Some(size) = self.size {
-                entry.size = size;
-            }
+        if let Some(size) = self.size {
+            entry.size = size;
         }
-        if keep("uid") {
-            if let Some(uid) = self.uid {
-                entry.uid = uid;
-            }
+        if let Some(uid) = self.uid {
+            entry.uid = uid;
         }
-        if keep("gid") {
-            if let Some(gid) = self.gid {
-                entry.gid = gid;
-            }
+        if let Some(gid) = self.gid {
+            entry.gid = gid;
         }
-        if keep("uname") {
-            if let Some(ref uname) = self.uname {
-                entry.uname = Some(uname.clone());
-            }
+        if let Some(ref uname) = self.uname {
+            entry.uname = Some(uname.clone());
         }
-        if keep("gname") {
-            if let Some(ref gname) = self.gname {
-                entry.gname = Some(gname.clone());
-            }
+        if let Some(ref gname) = self.gname {
+            entry.gname = Some(gname.clone());
         }
-        if keep("mtime") {
-            if let Some(mtime) = self.mtime {
-                entry.mtime = mtime.sec as u64;
-                entry.mtime_nsec = mtime.nsec;
-            }
+        if let Some(mtime) = self.mtime {
+            entry.mtime = mtime.sec;
+            entry.mtime_nsec = mtime.nsec;
         }
-        if keep("atime") {
-            if let Some(atime) = self.atime {
-                entry.atime = Some(atime.sec as u64);
-                entry.atime_nsec = atime.nsec;
-            }
+        if let Some(atime) = self.atime {
+            entry.atime = Some(atime.sec);
+            entry.atime_nsec = atime.nsec;
         }
         // Carried onto the entry so `-o listopt=%(ctime)T` can report it. The
         // extractor never applies it to the filesystem.
-        if keep("ctime") {
-            if let Some(ctime) = self.ctime {
-                entry.ctime = Some(ctime.sec as u64);
-                entry.ctime_nsec = ctime.nsec;
-            }
+        if let Some(ctime) = self.ctime {
+            entry.ctime = Some(ctime.sec);
+            entry.ctime_nsec = ctime.nsec;
         }
         // The records nothing above holds: `charset`, `comment`, `hdrcharset`
         // and any implementation extension. None affects extraction; POSIX
         // listopt rule 7 admits every one of them as a `%(keyword)`, and
         // without this the listing had no way to report what the archive said.
-        if keep("hdrcharset") {
-            if let Some(ref hdrcharset) = self.hdrcharset {
-                entry.set_ext_record("hdrcharset", hdrcharset);
-            }
+        if let Some(ref hdrcharset) = self.hdrcharset {
+            entry.set_ext_record("hdrcharset", hdrcharset);
         }
         for (keyword, value) in &self.extra {
-            if keep(keyword) {
-                entry.set_ext_record(keyword, value);
-            }
+            entry.set_ext_record(keyword, value);
+        }
+        // A deleted record also deletes the global value beneath it, which
+        // the entry holds shared rather than here.
+        for keyword in &self.deleted {
+            entry.ext_records.hide(keyword);
+        }
+        if self.deleted.contains("uname") {
+            entry.uname = None;
+        }
+        if self.deleted.contains("gname") {
+            entry.gname = None;
         }
     }
 
@@ -486,30 +644,23 @@ impl ExtendedHeader {
     ///
     /// `options` supplies the two things the operator can change. `-o times`
     /// forces atime and mtime records for every member rather than only where
-    /// one is needed, and `-o hdrcharset=` both widens the rule for which
-    /// names need a record and decides whether this member declares a charset
-    /// of its own.
+    /// one is needed, and `-o hdrcharset=` decides whether this member
+    /// declares a charset of its own.
     pub fn from_entry(entry: &ArchiveEntry, options: &FormatOptions) -> Self {
         let mut header = ExtendedHeader::new();
         let include_times = options.include_times;
 
-        // `-o hdrcharset=BINARY` is the operator saying the names in this
-        // archive are the underlying system's bytes rather than UTF-8, and
-        // under it the `path` record is what carries those bytes. POSIX's
-        // RATIONALE is explicit about the consequence: "an extended header
-        // path record is always required to be generated if the prefix or
-        // name fields contain non-ASCII characters even when
-        // hdrcharset=binary is also in effect for that file." So the trigger
-        // widens from "has no faithful UTF-8 reading" to "is not ASCII": a
-        // UTF-8 name that would fit the ustar fields still needs the record.
+        // Every character of a ustar header is ISO/IEC 646, so a pathname
+        // with any other byte has no faithful ustar spelling and goes in a
+        // `path` (or `linkpath`) record -- as GNU tar and bsdtar write it.
+        // POSIX's RATIONALE: "an extended header path record is always
+        // required to be generated if the prefix or name fields contain
+        // non-ASCII characters even when hdrcharset=binary is also in effect
+        // for that file." Under `-o hdrcharset=BINARY` the record carries the
+        // system's bytes; otherwise UTF-8, which a name that is not valid
+        // UTF-8 cannot be -- that one is declared BINARY below.
         let binary = options.hdrcharset() == Some(crate::options::BINARY_CHARSET);
-        let needs_record = |bytes: &[u8]| {
-            if binary {
-                !bytes.is_ascii()
-            } else {
-                std::str::from_utf8(bytes).is_err()
-            }
-        };
+        let not_utf8 = |bytes: &[u8]| std::str::from_utf8(bytes).is_err();
 
         // Path needs an extended header whenever it cannot be represented
         // exactly by the ustar name/prefix pair. Length alone is not the test:
@@ -519,19 +670,20 @@ impl ExtendedHeader {
         // ustar fallback in split_path() silently truncates the name.
         let path_bytes = crate::rawpath::as_bytes(&entry.path);
         let ustar_spelling = ustar_path_bytes(entry);
-        let path_is_binary = needs_record(path_bytes);
-        if try_split_path(&ustar_spelling).is_none() || path_is_binary {
-            // A non-UTF-8 name has no faithful ustar spelling, so it always
-            // needs the record regardless of length.
-            header.path = Some(path_bytes.to_vec());
+        if try_split_path(&ustar_spelling).is_none() || !path_bytes.is_ascii() {
+            // A non-ASCII name has no faithful ustar spelling, so it always
+            // needs the record regardless of length. A directory's carries
+            // the trailing slash its header fields would, as bsdtar's does,
+            // so it lists the same whichever of the two names it.
+            header.path = Some(ustar_spelling);
         }
 
-        // Link path needs extended header if too long
+        // Link path needs extended header if too long or not ASCII
         let mut link_is_binary = false;
         if let Some(ref link) = entry.link_target {
             let link_bytes = link.as_os_str().as_bytes();
-            link_is_binary = needs_record(link_bytes);
-            if link_bytes.len() > LINKNAME_LEN || link_is_binary {
+            link_is_binary = not_utf8(link_bytes);
+            if link_bytes.len() > LINKNAME_LEN || !link_bytes.is_ascii() {
                 header.linkpath = Some(link_bytes.to_vec());
             }
         }
@@ -553,15 +705,18 @@ impl ExtendedHeader {
         // so any of the four forces the declaration, not just the two
         // pathnames. A user or group name is bytes from the local database and
         // need not be UTF-8 either.
-        let not_utf8 = |bytes: &[u8]| std::str::from_utf8(bytes).is_err();
+        let path_is_binary = not_utf8(path_bytes);
         let name_is_binary = entry.uname.as_deref().is_some_and(not_utf8)
             || entry.gname.as_deref().is_some_and(not_utf8);
         if !binary && (path_is_binary || link_is_binary || name_is_binary) {
             header.hdrcharset = Some(crate::options::BINARY_CHARSET.to_string());
         }
 
-        // Size > 8GB needs extended header
-        if entry.size > 0o77777777777 {
+        // Size > 8GB needs extended header. So does a hard link's data
+        // (`-o linkdata`): a reader takes typeflag 1 to have any only in a
+        // pax archive, which only an extended header makes one.
+        if entry.size > 0o77777777777 || (entry.entry_type == EntryType::Hardlink && entry.size > 0)
+        {
             header.size = Some(entry.size);
         }
 
@@ -573,10 +728,13 @@ impl ExtendedHeader {
             header.gid = Some(entry.gid);
         }
 
-        // Include mtime: always if include_times, or if subsecond precision needed
-        if include_times || entry.mtime_nsec > 0 {
+        // POSIX: an mtime record "for each file ... if the file's
+        // modification time cannot be represented exactly in the ustar header
+        // logical record" -- a fraction of a second, or a time outside the
+        // octal field's range, before 1970 included. Also under `-o times`.
+        if include_times || entry.mtime_nsec > 0 || !(0..=USTAR_TIME_MAX).contains(&entry.mtime) {
             header.mtime = Some(PaxTime {
-                sec: entry.mtime as i64,
+                sec: entry.mtime,
                 nsec: entry.mtime_nsec,
             });
         }
@@ -585,8 +743,8 @@ impl ExtendedHeader {
         // extended-record set, so an ordinary file produces no `x` header.
         if include_times {
             let (sec, nsec) = match entry.atime {
-                Some(atime) => (atime as i64, entry.atime_nsec),
-                None => (entry.mtime as i64, entry.mtime_nsec),
+                Some(atime) => (atime, entry.atime_nsec),
+                None => (entry.mtime, entry.mtime_nsec),
             };
             header.atime = Some(PaxTime { sec, nsec });
 
@@ -595,7 +753,7 @@ impl ExtendedHeader {
             // and an archive without it cannot answer `%(ctime)T`.
             if let Some(ctime) = entry.ctime {
                 header.ctime = Some(PaxTime {
-                    sec: ctime as i64,
+                    sec: ctime,
                     nsec: entry.ctime_nsec,
                 });
             }
@@ -644,8 +802,16 @@ fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
         .position(|&b| b == b' ')
         .ok_or_else(|| PaxError::InvalidHeader("invalid extended header format".to_string()))?;
 
-    let len_str = std::str::from_utf8(&data[pos..pos + space_pos]).map_err(|_| bad_len())?;
-    let record_len: usize = len_str.parse().map_err(|_| bad_len())?;
+    // POSIX: "%d", a decimal number -- digits only. `parse` would also take
+    // a leading '+'.
+    let len_field = &data[pos..pos + space_pos];
+    if len_field.is_empty() || !len_field.iter().all(u8::is_ascii_digit) {
+        return Err(bad_len());
+    }
+    let record_len: usize = std::str::from_utf8(len_field)
+        .ok()
+        .and_then(|digits| digits.parse().ok())
+        .ok_or_else(bad_len)?;
 
     // The record must extend past its own length field, its <space>, and the
     // trailing <newline>; otherwise there is no value and the end underflows.
@@ -666,6 +832,13 @@ fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
     if value_end < value_start {
         return Err(bad_len());
     }
+    // The length has to land just past the record's <newline>. Taking
+    // whatever byte is there for it dropped the last byte of the value.
+    if data[value_end] != b'\n' {
+        return Err(PaxError::InvalidHeader(
+            "extended header record does not end in a newline".to_string(),
+        ));
+    }
 
     Ok(RecordSpan {
         value: value_start..value_end,
@@ -673,37 +846,96 @@ fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
     })
 }
 
-/// Parse pax time format (decimal seconds with optional fractional part)
+/// Parse a pax time: decimal seconds since the Epoch with an optional
+/// fraction, and an optional leading '-' for a time before it.
+///
+/// The value is the signed decimal number, so "-1.5" is a second and a half
+/// before the Epoch. `PaxTime` holds it the way `timespec` does, as whole
+/// seconds rounded down plus a non-negative fraction: -2 s + 0.5 s. Taking
+/// the fraction as an addition to the truncated "-1" made it -0.5, and "-0.5"
+/// itself came out as +0.5, since "-0" parses as zero.
 fn parse_pax_time(s: &str) -> PaxResult<PaxTime> {
     let invalid = || PaxError::InvalidHeader(format!("invalid pax time: {}", s));
     let (sec_str, frac_str) = s.split_once('.').unwrap_or((s, ""));
-    let sec: i64 = sec_str.parse().map_err(|_| invalid())?;
+    if !is_decimal(sec_str.strip_prefix('-').unwrap_or(sec_str)) {
+        return Err(invalid());
+    }
+    let mut sec: i64 = sec_str.parse().map_err(|_| invalid())?;
 
     // Take up to 9 fractional digits, zero-padded to nanoseconds.
     let mut frac = String::with_capacity(9);
+    let mut dropped = false;
     for c in frac_str.chars() {
         if !c.is_ascii_digit() {
             return Err(invalid());
         }
         if frac.len() < 9 {
             frac.push(c);
+        } else {
+            dropped |= c != '0';
         }
     }
     while frac.len() < 9 {
         frac.push('0');
     }
-    let nsec: u32 = frac.parse().map_err(|_| invalid())?;
-    Ok(PaxTime { sec, nsec })
+    let mut nsec: u32 = frac.parse().map_err(|_| invalid())?;
+
+    if !sec_str.starts_with('-') {
+        // Dropping digits rounded down, as `timespec` does.
+        return Ok(PaxTime { sec, nsec });
+    }
+    // Before the Epoch, dropping digits rounded the magnitude down and so the
+    // time up; one more nanosecond of magnitude rounds it down instead.
+    if dropped {
+        nsec += 1;
+        if nsec == NSEC_PER_SEC {
+            sec = sec.checked_sub(1).ok_or_else(invalid)?;
+            nsec = 0;
+        }
+    }
+    if nsec == 0 {
+        return Ok(PaxTime { sec, nsec });
+    }
+    Ok(PaxTime {
+        sec: sec.checked_sub(1).ok_or_else(invalid)?,
+        nsec: NSEC_PER_SEC - nsec,
+    })
 }
 
-/// Format time for pax extended header, preserving exact nanoseconds.
+const NSEC_PER_SEC: u32 = 1_000_000_000;
+
+/// Whether `s` is a decimal number: one or more digits and nothing else.
+///
+/// Rust's `parse` also takes a leading '+', which bsdtar and GNU tar do not;
+/// a `size=+5` that frames a member for one tool and not the other is how a
+/// member gets seen by one and not the other.
+fn is_decimal(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The value of an unsigned numeric record: `size`, `uid` or `gid`.
+fn parse_decimal<T: std::str::FromStr>(keyword: &str, value: &str) -> PaxResult<T> {
+    is_decimal(value)
+        .then(|| value.parse().ok())
+        .flatten()
+        .ok_or_else(|| PaxError::InvalidHeader(format!("invalid {keyword}: {value}")))
+}
+
+/// Format time for pax extended header, preserving exact nanoseconds: the
+/// signed decimal value, so a time before the Epoch has a leading '-' on the
+/// whole number (see `parse_pax_time`).
 fn format_pax_time(time: PaxTime) -> String {
     if time.nsec == 0 {
-        format!("{}", time.sec)
-    } else {
-        let frac = format!("{:09}", time.nsec);
-        format!("{}.{}", time.sec, frac.trim_end_matches('0'))
+        return format!("{}", time.sec);
     }
+    let (sign, whole, nsec) = if time.sec < 0 {
+        // -2 s + 0.5 s is -1.5: one second fewer, and the fraction's complement.
+        ("-", (time.sec + 1).unsigned_abs(), NSEC_PER_SEC - time.nsec)
+    } else {
+        ("", time.sec as u64, time.nsec)
+    };
+    let frac = format!("{:09}", nsec);
+    format!("{sign}{whole}.{}", frac.trim_end_matches('0'))
 }
 
 /// Write a pax extended header record whose value is raw bytes.
@@ -732,58 +964,190 @@ fn write_pax_record_bytes(data: &mut Vec<u8>, keyword: &str, value: &[u8]) {
     data.extend_from_slice(&content);
 }
 
-/// Write a pax extended header record
-fn write_pax_record(data: &mut Vec<u8>, keyword: &str, value: &str) {
-    // Record format: "%d %s=%s\n"
-    // Length includes itself, so we need to calculate iteratively
-    let content = format!(" {}={}\n", keyword, value);
+/// The `-o keyword=value` and `-o keyword:=value` operands of read and list
+/// mode, as the extended-header records POSIX says they act as.
+///
+/// `keyword=value` acts "as if they had been at the beginning of the archive
+/// as typeflag g global extended header records", and `keyword:=value` "as if
+/// they were included as records at the end of each extended header", so the
+/// first is overridden by the archive's own records and the second overrides
+/// them.
+#[derive(Debug, Clone, Default)]
+pub struct OptionRecords {
+    global: ExtendedHeader,
+    per_file: ExtendedHeader,
+}
 
-    // Start with an estimate
-    let mut len = content.len() + 1; // +1 for at least one digit
-    loop {
-        let len_str = len.to_string();
-        let total = len_str.len() + content.len();
-        if total == len {
-            break;
-        }
-        len = total;
+impl OptionRecords {
+    /// Parse the operands' values as the records they stand for, so that a
+    /// value no archive record could carry is refused up front.
+    pub fn new(options: &FormatOptions) -> PaxResult<Self> {
+        Ok(OptionRecords {
+            global: ExtendedHeader::from_options(options.global_options(), "=")?,
+            per_file: ExtendedHeader::from_options(options.per_file_options(), ":=")?,
+        })
     }
 
-    data.extend_from_slice(len.to_string().as_bytes());
-    data.extend_from_slice(content.as_bytes());
+    /// Apply the records to a member of a format with no extended headers
+    /// (cpio, pre-POSIX tar), where the global records and then the per-file
+    /// ones simply override the header fields.
+    pub fn apply(&self, entry: &mut ArchiveEntry) {
+        let mut records = self.global.clone();
+        records.merge(&self.per_file);
+        records.apply_to(entry);
+    }
 }
 
 /// pax archive reader
 pub struct PaxReader<R: Read> {
-    reader: R,
+    reader: ArchiveStream<R>,
     current_size: u64,
     bytes_read: u64,
+    /// The global values in force: `-o keyword=value` first, then every `g`
+    /// header read so far, each layered over the last. Its extension records
+    /// are kept in `global_extra` instead.
     global_header: ExtendedHeader,
-    /// `-o` options consulted on read (currently `delete=` keyword removal).
+    /// The extension records of `global_header`, less any `-o delete=`
+    /// removes: held once and shared by every member they apply to, since
+    /// cloning them into each one made a large `g` header cost its size
+    /// times the number of members.
+    global_extra: Arc<HashMap<String, String>>,
+    /// The bytes of keyword and value in `global_extra`, held to
+    /// `MAX_EXTENDED_HEADER` as a whole: each `g` header is capped, but they
+    /// accumulate.
+    global_extra_bytes: usize,
+    /// `-o keyword:=value`, appended to every member's extended header.
+    per_file_options: ExtendedHeader,
+    /// `-o` options consulted on read (`delete=` keyword removal).
     options: FormatOptions,
+    /// Where the member being read begins, counting any extended header that
+    /// describes it. Once `read_entry` has returned `None` this is where the
+    /// end-of-archive indicator begins.
+    member_offset: u64,
+    /// The `g` headers read since `member_offset` while an `x` header was
+    /// pending, as byte ranges of the archive. See
+    /// [`trailing_global_headers`](Self::trailing_global_headers).
+    pending_globals: Vec<Range<u64>>,
+    /// Whether any `x` or `g` header has been read.
+    saw_extended_header: bool,
+    /// What a single zero block between members means.
+    lone_zero: LoneZeroBlock,
 }
 
 impl<R: Read> PaxReader<R> {
-    /// Create a new pax reader
-    pub fn new(reader: R) -> Self {
+    /// A pax reader over an archive stream
+    pub fn from_stream(reader: ArchiveStream<R>) -> Self {
         PaxReader {
             reader,
             current_size: 0,
             bytes_read: 0,
             global_header: ExtendedHeader::new(),
+            global_extra: Arc::default(),
+            global_extra_bytes: 0,
+            per_file_options: ExtendedHeader::new(),
             options: FormatOptions::default(),
+            member_offset: 0,
+            pending_globals: Vec::new(),
+            saw_extended_header: false,
+            lone_zero: LoneZeroBlock::Stop,
         }
     }
 
-    /// Attach `-o` format options (e.g. `delete=`) consulted while extracting.
-    pub fn with_options(mut self, options: FormatOptions) -> Self {
-        self.options = options;
+    /// Read on past a single zero block, as append mode must, rather than
+    /// taking it for the end of the archive. See [`LoneZeroBlock`].
+    pub fn stepping_over_lone_zero_blocks(mut self) -> Self {
+        self.lone_zero = LoneZeroBlock::StepOver;
         self
+    }
+
+    /// The offset at which the end-of-archive indicator begins, once
+    /// `read_entry` has returned `None`.
+    ///
+    /// An `x` header with no member after it is left out, so that whatever is
+    /// written there next is not described by it. A trailing `g` header is
+    /// not: it applies to every member that follows, appended ones included.
+    pub fn end_of_archive(&self) -> u64 {
+        self.member_offset
+    }
+
+    /// The `g` headers that lie past [`end_of_archive`](Self::end_of_archive),
+    /// once `read_entry` has returned `None`, as byte ranges of the archive.
+    ///
+    /// They come after a dangling `x` header, which is why the end of the
+    /// archive is before them. They still apply to whatever is appended, so
+    /// append writes them again at the new end, without the `x`.
+    pub fn trailing_global_headers(&self) -> &[Range<u64>] {
+        &self.pending_globals
+    }
+
+    /// Whether the archive has used any pax extended header so far.
+    pub fn saw_extended_header(&self) -> bool {
+        self.saw_extended_header
+    }
+
+    /// Attach the `-o` format options of read and list mode: `delete=`, and
+    /// the keyword records described at [`OptionRecords`].
+    pub fn with_options(mut self, options: FormatOptions) -> PaxResult<Self> {
+        let records = OptionRecords::new(&options)?;
+        self.options = options;
+        self.global_header = ExtendedHeader::new();
+        self.global_extra = Arc::default();
+        self.global_extra_bytes = 0;
+        self.merge_global(records.global)?;
+        self.per_file_options = records.per_file;
+        Ok(self)
+    }
+
+    /// Layer a `g` header -- or the `-o keyword=value` records that act as
+    /// one -- over the global values in force.
+    ///
+    /// Its extension records go straight into the shared map, which no member
+    /// still holds by the time the next header is read, so this costs the
+    /// size of `later` rather than of everything global so far.
+    ///
+    /// Distinct keywords accumulate there, one `g` header after another, so
+    /// the whole is held to the limit a single header is.
+    fn merge_global(&mut self, mut later: ExtendedHeader) -> PaxResult<()> {
+        let extra = std::mem::take(&mut later.extra);
+        let shared = Arc::make_mut(&mut self.global_extra);
+        let mut bytes = self.global_extra_bytes;
+        for keyword in &later.deleted {
+            if let Some(value) = shared.remove(keyword) {
+                bytes -= keyword.len() + value.len();
+            }
+        }
+        for (keyword, value) in extra {
+            if self.options.should_delete_keyword(&keyword) {
+                continue;
+            }
+            let keyword_len = keyword.len();
+            bytes += keyword_len + value.len();
+            if let Some(old) = shared.insert(keyword, value) {
+                // Already counted, with the value just replaced.
+                bytes -= keyword_len + old.len();
+            }
+        }
+        self.global_extra_bytes = bytes;
+        if bytes as u64 > MAX_EXTENDED_HEADER {
+            return Err(PaxError::InvalidHeader(format!(
+                "global extended header records exceed the {MAX_EXTENDED_HEADER} byte limit"
+            )));
+        }
+        // Only a typed keyword's deletion has anything left to act on: an
+        // extension's was carried out on the shared map above, and keeping
+        // it would be one more thing that accumulates.
+        later
+            .deleted
+            .retain(|keyword| STANDARD_KEYWORDS.contains(&keyword.as_str()));
+        self.global_header.merge(&later);
+        Ok(())
     }
 
     /// Read a raw header block
     fn read_header_block(&mut self) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
-        let Some(header) = crate::formats::ustar::next_header_block(&mut self.reader)? else {
+        let Some(header) =
+            crate::formats::ustar::next_header_block(&mut self.reader, self.lone_zero)?
+        else {
             return Ok(None);
         };
 
@@ -793,6 +1157,39 @@ impl<R: Read> PaxReader<R> {
         }
 
         Ok(Some(header))
+    }
+
+    /// The records that describe the next member, in POSIX's order of
+    /// precedence: the global values, then its own `x` header, then the
+    /// `-o keyword:=value` records appended to the end of it.
+    ///
+    /// `-o delete=` removes the archive's records, so a removed keyword falls
+    /// back to the header block value; the operator's own `:=` records are
+    /// applied whatever it matches.
+    ///
+    /// The global extension records are not among them: they are shared
+    /// through `global_extra` rather than copied into every member.
+    fn member_records(&self, extended_header: Option<&ExtendedHeader>) -> ExtendedHeader {
+        let mut records = self.global_header.typed_only();
+        if let Some(ext) = extended_header {
+            records.merge(ext);
+        }
+        records.retain(|keyword| !self.options.should_delete_keyword(keyword));
+        records.merge(&self.per_file_options);
+        records
+    }
+
+    /// The rule for which members carry data. A hard link may only in a pax
+    /// archive, and an archive is one only once it has used an extended
+    /// header: the ustar magic alone is no sign, and in a ustar archive a
+    /// link's size field -- which the pre-POSIX convention filled with the
+    /// linked file's size -- is followed by the next member's header.
+    fn size_rule(&self) -> SizeRule {
+        if self.saw_extended_header {
+            SizeRule::Pax
+        } else {
+            SizeRule::Ustar
+        }
     }
 
     /// Read extended header data
@@ -815,53 +1212,88 @@ impl<R: Read> PaxReader<R> {
     }
 }
 
+impl<R: Read + Seek> PaxReader<R> {
+    /// A reader over a seekable file, positioned at the start of the archive,
+    /// that seeks over member data instead of reading it.
+    pub fn seekable(reader: R) -> Self {
+        Self::from_stream(ArchiveStream::seekable(reader))
+    }
+}
+
 impl<R: Read> ArchiveReader for PaxReader<R> {
     fn read_entry(&mut self) -> PaxResult<Option<ArchiveEntry>> {
         // Skip any remaining data from previous entry
         self.skip_data()?;
 
+        // What describes the next member: its `x` header, and the GNU
+        // long-name records ahead of it. Either can come first, and both
+        // describe the member that follows them, not each other.
         let mut extended_header: Option<ExtendedHeader> = None;
+        let mut long_names = LongNameGroup::default();
 
         loop {
-            let header = match self.read_header_block()? {
-                Some(h) => h,
-                None => return Ok(None),
+            if extended_header.is_none() && long_names.is_empty() {
+                self.member_offset = self.reader.offset();
+                self.pending_globals.clear();
+            }
+            let Some(header) = self.read_header_block()? else {
+                // With no member after them, the records end the archive,
+                // which begins where they do.
+                if !long_names.is_empty() {
+                    long_names.report(None);
+                }
+                return Ok(None);
             };
 
             let typeflag = header[TYPEFLAG_OFF];
+            let describes_pending = extended_header.is_some() || !long_names.is_empty();
+
+            // A GNU long-name record describes the member that follows, whose
+            // own name field is truncated to 100 bytes. There can be more
+            // than one.
+            if let Some(what) = long_name_record(typeflag) {
+                long_names.consume(&mut self.reader, &header, what)?;
+                continue;
+            }
 
             match typeflag {
                 PAX_GHDR => {
-                    // Global extended header - affects all subsequent files
-                    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
-                    self.global_header = self.read_extended_header(size)?;
+                    // Global extended header - affects all subsequent files,
+                    // for the keywords it names; the rest stay in force.
+                    let start = self.reader.offset() - BLOCK_SIZE as u64;
+                    let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
+                    let global = self.read_extended_header(size)?;
+                    self.merge_global(global)?;
+                    self.saw_extended_header = true;
+                    if describes_pending {
+                        self.pending_globals.push(start..self.reader.offset());
+                    }
                 }
                 PAX_XHDR => {
                     // Per-file extended header
-                    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+                    let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     extended_header = Some(self.read_extended_header(size)?);
-                }
-                _ if crate::formats::ustar::long_name_record(typeflag).is_some() => {
-                    // A GNU long-name record describes the member that
-                    // follows, whose own name field is truncated to 100 bytes.
-                    // The records and the member are dropped together, and
-                    // there can be more than one record -- see
-                    // skip_long_name_records.
-                    crate::formats::ustar::skip_long_name_records(&mut self.reader, header)?;
+                    self.saw_extended_header = true;
                 }
                 _ => {
-                    // Regular file entry - parse and apply extended headers
-                    let mut entry = parse_ustar_header(&header, SizeRule::Pax)?;
-
-                    // Apply global header first, honoring `-o delete=` so removed
-                    // keywords fall back to the ustar header value.
-                    self.global_header
-                        .apply_to_filtered(&mut entry, &self.options);
-
-                    // Apply per-file extended header (overrides global)
-                    if let Some(ref ext) = extended_header {
-                        ext.apply_to_filtered(&mut entry, &self.options);
+                    let records = self.member_records(extended_header.as_ref());
+                    let rule = self.size_rule();
+                    if !long_names.superseded(records.path.is_some(), records.linkpath.is_some()) {
+                        // The records and the member are dropped together,
+                        // the member by the size its own records give it.
+                        long_names.report(Some(&header));
+                        self.current_size = member_data_size(&header, rule, records.size)?;
+                        self.bytes_read = 0;
+                        self.skip_data()?;
+                        extended_header = None;
+                        long_names = LongNameGroup::default();
+                        continue;
                     }
+
+                    // Regular file entry - parse and apply extended headers
+                    let mut entry =
+                        parse_ustar_header(&header, rule, |entry| records.apply_to(entry))?;
+                    entry.ext_records.share(&self.global_extra);
 
                     self.current_size = entry.size;
                     self.bytes_read = 0;
@@ -889,11 +1321,19 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
         let to_skip = total_bytes.saturating_sub(self.bytes_read);
 
         if to_skip > 0 {
-            skip_bytes(&mut self.reader, to_skip)?;
+            self.reader.skip(to_skip)?;
         }
 
         self.bytes_read = total_bytes;
         Ok(())
+    }
+
+    fn applies_option_records(&self) -> bool {
+        true
+    }
+
+    fn finish(&mut self, reached_end: bool) -> PaxResult<()> {
+        self.reader.finish(reached_end)
     }
 }
 
@@ -905,7 +1345,7 @@ pub struct PaxWriter<W: Write> {
     sequence: u64,          // For generating unique names for extended header files
     options: FormatOptions, // Format-specific options
     global_header_written: bool, // Track if global header has been written
-    /// Skip data writes for symlinks/hardlinks (they have no data in pax/ustar format)
+    /// Skip data writes for a symlink, which has no data blocks
     skip_data: bool,
 }
 
@@ -951,11 +1391,12 @@ impl<W: Write> PaxWriter<W> {
             if special_keywords.contains(&key.as_str()) {
                 continue;
             }
-            // Skip if this keyword should be deleted
-            if self.options.should_delete_keyword(key) {
+            // Skip if this keyword should be deleted. A global `size` would
+            // give every member that length, whatever data follows it.
+            if self.options.should_delete_keyword(key) || key == "size" {
                 continue;
             }
-            write_pax_record(&mut data, key, value);
+            write_pax_record_bytes(&mut data, key, value);
         }
 
         // If no actual header data to write, skip
@@ -966,16 +1407,16 @@ impl<W: Write> PaxWriter<W> {
         // Create a header for the global extended header block
         let mut header = [0u8; BLOCK_SIZE];
 
-        // Generate name for global header using template
+        // Named by the globexthdr.name template. Its default is under
+        // $TMPDIR, which can be too long for the header; the same name without
+        // the directory is used then.
         self.sequence += 1;
         let glob_name = self.options.expand_globexthdr_name(self.sequence);
-        // Truncate to fit in NAME_LEN if too long
-        let glob_name = if glob_name.len() > NAME_LEN {
-            format!("GlobalHead.{}", self.sequence)
-        } else {
-            glob_name
-        };
-        write_field(&mut header[NAME_OFF..], glob_name.as_bytes(), NAME_LEN);
+        let glob_path = crate::rawpath::from_bytes(&glob_name);
+        let file_name = glob_path.file_name();
+        write_header_name(&mut header, &glob_name, || {
+            file_name.unwrap_or_default().as_bytes().to_vec()
+        });
 
         // Mode, uid, gid (use reasonable defaults)
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
@@ -1033,16 +1474,16 @@ impl<W: Write> PaxWriter<W> {
         // Create a header for the extended header block
         let mut header = [0u8; BLOCK_SIZE];
 
-        // Generate a unique name for the extended header using template
+        // Named by the exthdr.name template, from the member's pathname. A
+        // name too long for the header is formed by the same template from
+        // the file's name alone, as though it were at the top level.
         self.sequence += 1;
         let ext_name = self.options.expand_exthdr_name(&entry.path, self.sequence);
-        // Truncate to fit in NAME_LEN if too long, or use fallback
-        let ext_name = if ext_name.len() > NAME_LEN {
-            format!("PaxHeader/{}", self.sequence)
-        } else {
-            ext_name
-        };
-        write_field(&mut header[NAME_OFF..], ext_name.as_bytes(), NAME_LEN);
+        write_header_name(&mut header, &ext_name, || {
+            let file_name = entry.path.file_name().unwrap_or(entry.path.as_os_str());
+            self.options
+                .expand_exthdr_name(std::path::Path::new(file_name), self.sequence)
+        });
 
         // Mode, uid, gid (use reasonable defaults)
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
@@ -1053,7 +1494,7 @@ impl<W: Write> PaxWriter<W> {
         write_octal(&mut header[SIZE_OFF..], data.len() as u64, 12);
 
         // Mtime (use entry's mtime)
-        write_octal(&mut header[MTIME_OFF..], entry.mtime, 12);
+        write_octal(&mut header[MTIME_OFF..], ustar_time(entry.mtime), 12);
 
         // Typeflag 'x' for per-file extended header
         header[TYPEFLAG_OFF] = PAX_XHDR;
@@ -1092,21 +1533,28 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         // with no extended records is a valid ustar archive and reads back
         // identically, so there is no need to force an mtime record.
         let ext_header = ExtendedHeader::from_entry(entry, &self.options);
+        ext_header.check_name_limit()?;
 
-        self.write_extended_header(&ext_header, entry)?;
-
-        // Write the regular ustar header
+        // Built before anything is written, so that a member this format
+        // cannot hold is refused without leaving its `x` header behind to
+        // describe whatever member comes next.
         let header = build_ustar_header(entry)?;
+        self.write_extended_header(&ext_header, entry)?;
         self.writer.write_all(&header)?;
         self.bytes_written = 0;
         self.current_size = entry.size;
-        // Per POSIX, symlinks and hardlinks have no data blocks in pax/ustar format
-        self.skip_data = matches!(entry.entry_type, EntryType::Symlink | EntryType::Hardlink);
+        // A symlink has no data blocks. A hard link has them exactly when the
+        // caller gave it a size, which is `-o linkdata`.
+        self.skip_data = entry.entry_type == EntryType::Symlink;
         Ok(())
     }
 
+    fn hardlinks_may_carry_data(&self) -> bool {
+        true
+    }
+
     fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
-        // Symlinks/hardlinks have no data blocks in pax/ustar format
+        // Symlinks have no data blocks
         if self.skip_data {
             return Ok(());
         }
@@ -1158,16 +1606,19 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
         std::cmp::min(entry.gid as u64, 0o7777777),
         8,
     );
-    // Per POSIX, symlinks and hardlinks must have size=0 (no data blocks)
+    // A symlink records size 0 (no data blocks). A hard link records the
+    // size of the data it carries: none, unless `-o linkdata` -- pax, unlike
+    // ustar, "may" include data blocks for typeflag 1.
     let header_size = match entry.entry_type {
-        EntryType::Symlink | EntryType::Hardlink => 0,
+        EntryType::Symlink => 0,
         _ => std::cmp::min(entry.size, 0o77777777777),
     };
     write_octal(&mut header[SIZE_OFF..], header_size, 12);
-    write_octal(&mut header[MTIME_OFF..], entry.mtime, 12);
+    // Outside the field's range the `mtime` record holds the real value.
+    write_octal(&mut header[MTIME_OFF..], ustar_time(entry.mtime), 12);
 
     // Typeflag
-    header[TYPEFLAG_OFF] = entry_type_to_flag(&entry.entry_type);
+    header[TYPEFLAG_OFF] = entry_type_to_flag(entry.entry_type)?;
 
     // Linkname
     if let Some(ref target) = entry.link_target {
@@ -1213,6 +1664,10 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 /// `ExtendedHeader::from_entry`, so these fields are only a fallback for a
 /// reader that ignores extended headers. Truncate on a UTF-8 character
 /// boundary so a multi-byte character straddling NAME_LEN does not panic.
+///
+/// Nor may the cut leave a slash at the end of a non-directory's name: an
+/// empty regular file named so is a directory by the old-style rule, to a
+/// reader that ignores the `path` record.
 fn split_path(entry: &ArchiveEntry) -> PaxResult<(Vec<u8>, Vec<u8>)> {
     let path = ustar_path_bytes(entry);
 
@@ -1220,10 +1675,38 @@ fn split_path(entry: &ArchiveEntry) -> PaxResult<(Vec<u8>, Vec<u8>)> {
         return Ok(split);
     }
 
-    Ok((
-        path[..floor_char_boundary(&path, NAME_LEN)].to_vec(),
-        Vec::new(),
-    ))
+    let mut name = &path[..floor_char_boundary(&path, NAME_LEN)];
+    if entry.entry_type != EntryType::Directory {
+        while let Some(rest) = name.strip_suffix(b"/") {
+            name = rest;
+        }
+    }
+    Ok((name.to_vec(), Vec::new()))
+}
+
+/// Put an extended header's name in the name and prefix fields, split as a
+/// member's pathname would be.
+///
+/// When it does not fit, `shorter` supplies the name to use instead, and that
+/// is cut to the name field if it does not fit either. Nothing reads these
+/// names back -- a reader that knows the format consumes the header, and one
+/// that does not extracts it as a file -- so what matters is only that the
+/// fallback keeps the template's shape, and with it a relative name for a
+/// relative member.
+fn write_header_name(
+    header: &mut [u8; BLOCK_SIZE],
+    name: &[u8],
+    shorter: impl FnOnce() -> Vec<u8>,
+) {
+    let (name, prefix) = try_split_path(name).unwrap_or_else(|| {
+        let short = shorter();
+        try_split_path(&short).unwrap_or_else(|| {
+            let end = floor_char_boundary(&short, NAME_LEN);
+            (short[..end].to_vec(), Vec::new())
+        })
+    });
+    write_field(&mut header[NAME_OFF..], &name, NAME_LEN);
+    write_field(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
 }
 
 /// Largest index `<= max` that does not cut a UTF-8 character of `bytes` in
@@ -1248,26 +1731,25 @@ fn floor_char_boundary(bytes: &[u8], max: usize) -> usize {
     end
 }
 
-/// Convert EntryType to typeflag
-fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
-    match entry_type {
-        EntryType::Regular => REGTYPE,
-        EntryType::Directory => DIRTYPE,
-        EntryType::Symlink => SYMTYPE,
-        EntryType::Hardlink => LNKTYPE,
-        EntryType::CharDevice => CHRTYPE,
-        EntryType::BlockDevice => BLKTYPE,
-        EntryType::Fifo => FIFOTYPE,
-        EntryType::Socket => REGTYPE, // Sockets not supported in tar, fall back to regular
-    }
-}
-
 /// Write an octal number to a field
 fn write_octal(buf: &mut [u8], val: u64, width: usize) {
     let s = format!("{:0width$o} ", val, width = width - 2);
     let bytes = s.as_bytes();
     let len = std::cmp::min(bytes.len(), width);
     buf[..len].copy_from_slice(&bytes[..len]);
+}
+
+/// The largest time the ustar header's 12-byte octal `mtime` field holds.
+const USTAR_TIME_MAX: i64 = 0o77777777777;
+
+/// A time as the ustar `mtime` field can hold it: clamped into its range.
+///
+/// Only a fallback for a reader that ignores extended headers -- a time
+/// outside the range also gets an `mtime` record. Writing the value as it was
+/// did not fail but wrapped: the two's-complement bits of a time before 1970
+/// truncated to eleven octal digits read back as a date in the 2500s.
+fn ustar_time(time: i64) -> u64 {
+    time.clamp(0, USTAR_TIME_MAX) as u64
 }
 
 /// Round up to next block boundary
@@ -1287,18 +1769,6 @@ fn padding_needed(bytes: u64) -> usize {
     } else {
         BLOCK_SIZE - remainder
     }
-}
-
-/// Skip bytes in a reader
-fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
-    let mut remaining = count;
-    let mut buf = [0u8; 4096];
-    while remaining > 0 {
-        let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
-        reader.read_exact(&mut buf[..to_read])?;
-        remaining -= to_read as u64;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1371,6 +1841,18 @@ mod tests {
                 header.holds(keyword),
                 "{keyword} is in STANDARD_KEYWORDS but `holds` does not see it"
             );
+
+            let mut merged = ExtendedHeader::new();
+            merged.merge(&header);
+            assert!(
+                merged.holds(keyword),
+                "{keyword} is in STANDARD_KEYWORDS but `merge` does not carry it"
+            );
+            merged.clear(keyword);
+            assert!(
+                !merged.holds(keyword),
+                "{keyword} is in STANDARD_KEYWORDS but `clear` does not drop it"
+            );
         }
 
         // And the converse: a keyword outside the list does land in `extra`,
@@ -1384,7 +1866,7 @@ mod tests {
     #[test]
     fn test_write_pax_record() {
         let mut data = Vec::new();
-        write_pax_record(&mut data, "path", "/some/path");
+        write_pax_record_bytes(&mut data, "path", b"/some/path");
         let s = String::from_utf8(data).unwrap();
         // Record format: "len path=/some/path\n"
         // len includes itself + " " + "path=/some/path\n" = 2 + 1 + 16 = 19 chars
@@ -1416,6 +1898,80 @@ mod tests {
                 nsec: 500000000
             }
         );
+    }
+
+    /// A time before the Epoch is the signed decimal value: "-1.5" is a
+    /// second and a half before it, held as -2 s + 0.5 s.
+    #[test]
+    fn test_negative_pax_times_roundtrip() {
+        for (text, sec, nsec) in [
+            ("-86400", -86400, 0),
+            ("-1.5", -2, 500_000_000),
+            ("-0.5", -1, 500_000_000),
+            ("-0.000000001", -1, 999_999_999),
+            ("-10.25", -11, 750_000_000),
+        ] {
+            let time = PaxTime { sec, nsec };
+            assert_eq!(parse_pax_time(text).unwrap(), time, "parse {text}");
+            assert_eq!(format_pax_time(time), text, "format {text}");
+        }
+        assert!(parse_pax_time(&format!("{}.5", i64::MIN)).is_err());
+    }
+
+    /// Digits past the ninth are dropped, which rounds toward zero. For a
+    /// time before the Epoch that is upward, so the time held is the one
+    /// rounded down -- the same direction as for a time after it.
+    #[test]
+    fn test_negative_pax_time_beyond_nanoseconds_rounds_down() {
+        for (text, sec, nsec) in [
+            ("-1.0000000001", -2, 999_999_999),
+            ("-0.9999999999", -1, 0),
+            ("-1.0000000000", -1, 0),
+            ("1.0000000009", 1, 0),
+        ] {
+            assert_eq!(
+                parse_pax_time(text).unwrap(),
+                PaxTime { sec, nsec },
+                "parse {text}"
+            );
+        }
+    }
+
+    /// The reader's limit on a `path` record is the writer's too: a name it
+    /// would refuse to read back is refused when written.
+    #[test]
+    fn test_path_record_beyond_the_name_limit_is_refused_on_write() {
+        let long = "n".repeat(MAX_NAME as usize + 1);
+        let entry = ArchiveEntry::new(PathBuf::from(&long), EntryType::Regular);
+        let mut out = Vec::new();
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        assert!(writer.write_entry(&entry).is_err());
+        assert!(out.is_empty(), "no header may be left behind");
+    }
+
+    /// A time the ustar field cannot hold gets an `mtime` record, and the
+    /// field itself is clamped rather than wrapped.
+    #[test]
+    fn test_out_of_range_mtime_gets_a_record() {
+        let opts = FormatOptions::default();
+        for mtime in [-86400, USTAR_TIME_MAX + 1] {
+            let mut entry = ArchiveEntry::new(PathBuf::from("f"), EntryType::Regular);
+            entry.mtime = mtime;
+            let header = ExtendedHeader::from_entry(&entry, &opts);
+            assert_eq!(
+                header.mtime,
+                Some(PaxTime {
+                    sec: mtime,
+                    nsec: 0
+                })
+            );
+        }
+        assert_eq!(ustar_time(-86400), 0);
+        assert_eq!(ustar_time(i64::MAX), USTAR_TIME_MAX as u64);
+
+        let mut entry = ArchiveEntry::new(PathBuf::from("f"), EntryType::Regular);
+        entry.mtime = 1_000_000_000;
+        assert_eq!(ExtendedHeader::from_entry(&entry, &opts).mtime, None);
     }
 
     #[test]
@@ -1472,5 +2028,65 @@ mod tests {
         let ext = ExtendedHeader::from_entry(&entry, &FormatOptions::default());
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
+    }
+
+    /// A pax archive of one empty member whose name needs a `path=` record.
+    fn archive_with_extended_header() -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        let name = "n".repeat(NAME_LEN + 1);
+        let entry = ArchiveEntry::new(PathBuf::from(name), EntryType::Regular);
+        writer.write_entry(&entry).unwrap();
+        writer.finish_entry().unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    /// An extended header whose templated name is too long for the header is
+    /// named by the same template from the file's name alone -- still
+    /// relative, never an unrelated fixed name.
+    #[test]
+    fn test_long_extended_header_name_keeps_the_template() {
+        let mut out = Vec::new();
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        let path = format!("{}/{}", "x".repeat(200), "y".repeat(90));
+        let entry = ArchiveEntry::new(PathBuf::from(path), EntryType::Regular);
+        writer.write_entry(&entry).unwrap();
+        assert_eq!(out[TYPEFLAG_OFF], PAX_XHDR);
+        let name = crate::formats::ustar::path_field(&out[NAME_OFF..NAME_OFF + NAME_LEN]);
+        let prefix = crate::formats::ustar::path_field(&out[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
+        assert_eq!(name, "y".repeat(90).as_bytes());
+        assert_eq!(
+            prefix,
+            format!("./PaxHeaders.{}", std::process::id()).as_bytes()
+        );
+    }
+
+    fn end_of(archive: &[u8]) -> (u64, bool) {
+        let mut reader = PaxReader::seekable(std::io::Cursor::new(archive));
+        while reader.read_entry().unwrap().is_some() {}
+        (reader.end_of_archive(), reader.saw_extended_header())
+    }
+
+    /// -a writes where `end_of_archive` says, so it has to be the first block
+    /// of the end-of-archive indicator.
+    #[test]
+    fn test_end_of_archive_is_the_indicator() {
+        let archive = archive_with_extended_header();
+        let indicator = archive.len() as u64 - 2 * BLOCK_SIZE as u64;
+        assert_eq!(end_of(&archive), (indicator, true));
+    }
+
+    /// An `x` header with no member after it would describe whatever is
+    /// appended next, so the end is placed before it.
+    #[test]
+    fn test_end_of_archive_drops_a_dangling_extended_header() {
+        let archive = archive_with_extended_header();
+        // The extended header is everything before the member's own header
+        // block and the two-block indicator.
+        let dangling = archive.len() - 3 * BLOCK_SIZE;
+        let mut truncated = archive[..dangling].to_vec();
+        truncated.extend_from_slice(&[0u8; 2 * BLOCK_SIZE]);
+        assert_eq!(end_of(&truncated), (0, true));
     }
 }

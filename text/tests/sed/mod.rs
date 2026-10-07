@@ -2328,7 +2328,8 @@ mod tests {
             (
                 r#"s/h\.0\.\(.*\)/ \U\1/"#,
                 "h.0.someText\nh.0=data\nh.0.anotherExample",
-                "h.0. UsomeText\nh.0=data\nh.0. UanotherExample",
+                // The whole match is replaced, not just the group.
+                " UsomeText\nh.0=data\n UanotherExample",
                 "",
             ),
             (
@@ -2524,5 +2525,86 @@ mod tests {
     #[test]
     fn test_duplicate_labels_ok() {
         sed_test(&["-e", ":x", "-e", ":x"], "a\n", "a\n", "", 0);
+    }
+
+    /// Run sed with `LC_ALL` set to `locale`, returning stdout.
+    fn sed_in_locale(locale: &str, args: &[&str], input: &str) -> String {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let out = plib::testing::run_test_base_with_env(
+            "sed",
+            &args,
+            input.as_bytes(),
+            &[("LC_ALL", locale)],
+        );
+        assert!(out.status.success(), "sed {args:?} failed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// `g` replaces an empty match at every position except just after an
+    /// earlier match, the end of the line included (POSIX, GNU and BSD sed).
+    #[test]
+    fn test_s_global_empty_matches() {
+        sed_test(&["-e", "s/b*/-/g"], "abc\n", "-a-c-\n", "", 0);
+        sed_test(&["-e", "s/x*/-/g"], "abc\n", "-a-b-c-\n", "", 0);
+        sed_test(
+            &["-e", "s/[0-9]*/N/g"],
+            "cafe 123\n",
+            "NcNaNfNeN N\n",
+            "",
+            0,
+        );
+        sed_test(&["-e", "s/ */_/g"], "a b\n", "_a_b_\n", "", 0);
+        // Without `g` only the first match, which may be the empty one at 0.
+        sed_test(&["-e", "s/x*/-/"], "abc\n", "-abc\n", "", 0);
+        // The Nth match counts empty matches too.
+        sed_test(&["-e", "s/x*/-/2"], "abc\n", "a-bc\n", "", 0);
+        // An address that matches empty still selects the line.
+        sed_test(&["-n", "-e", "\\,x*,p"], "abc\n", "abc\n", "", 0);
+    }
+
+    /// In a UTF-8 locale an empty match steps over a whole character: one
+    /// byte forward lands inside "é", where the regex matches nothing, and
+    /// every later match was lost.
+    #[test]
+    fn test_s_global_empty_matches_multibyte() {
+        let Some(loc) = plib::testing::utf8_locale() else {
+            return;
+        };
+        assert_eq!(
+            sed_in_locale(&loc, &["s/[0-9]*/N/g"], "café 123\n"),
+            "NcNaNfNéN N\n"
+        );
+        assert_eq!(
+            sed_in_locale(&loc, &["s/ */_/g"], "café au lait\n"),
+            "_c_a_f_é_a_u_l_a_i_t_\n"
+        );
+        assert_eq!(sed_in_locale(&loc, &["-n", "\\,x*,p"], "éx\n"), "éx\n");
+        assert_eq!(sed_in_locale(&loc, &["s/é*/-/g"], "aéb\n"), "-a-b-\n");
+    }
+
+    /// `^` matches only at the start of the line, not again after a
+    /// replacement there.
+    #[test]
+    fn test_s_global_caret_anchors_once() {
+        sed_test(&["-e", "s/^a//g"], "aa\n", "a\n", "", 0);
+        sed_test(&["-e", "s/^/> /g"], "abc\n", "> abc\n", "", 0);
+        sed_test(&["-e", "s/$/</g"], "abc\n", "abc<\n", "", 0);
+    }
+
+    /// Replacement text: `&` and `\N` insert the match and its groups, an
+    /// unmatched group inserts nothing, and the inserted text is not itself
+    /// scanned for escapes.
+    #[test]
+    fn test_s_replacement_groups() {
+        sed_test(&["-e", "s/b/[&&]/g"], "abcb\n", "a[bb]c[bb]\n", "", 0);
+        sed_test(
+            &["-e", "s/\\(a\\)\\(x\\)*/<\\2\\1>/g"],
+            "aba\n",
+            "<a>b<a>\n",
+            "",
+            0,
+        );
+        sed_test(&["-e", "s/x/\\n&/"], "a\\x\n", "a\\\nx\n", "", 0);
+        sed_test(&["-e", "s/.*/[&]/"], "a\\tb\n", "[a\\tb]\n", "", 0);
     }
 }

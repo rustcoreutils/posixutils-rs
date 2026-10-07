@@ -14,6 +14,7 @@ use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 
 #[test]
 fn test_option_listopt_filename() {
@@ -1968,7 +1969,7 @@ fn test_option_hdrcharset_is_checked_and_still_recorded() {
 }
 
 /// Under `-o hdrcharset=BINARY` the `path` record is what carries a name's
-/// bytes, so POSIX requires one for any non-ASCII name even when the ustar
+/// bytes, and POSIX requires one for any non-ASCII name even when the ustar
 /// fields could hold it: RATIONALE, "an extended header path record is always
 /// required to be generated if the prefix or name fields contain non-ASCII
 /// characters even when hdrcharset=binary is also in effect for that file."
@@ -1981,8 +1982,8 @@ fn test_option_hdrcharset_binary_forces_a_path_record() {
     let temp = TempDir::new().unwrap();
     let src_dir = temp.path().join("source");
     fs::create_dir(&src_dir).unwrap();
-    // Short, and valid UTF-8: the ustar name field could hold it, so nothing
-    // but the operator's request makes a record necessary.
+    // Short, and valid UTF-8: the ustar name field could hold its bytes, but
+    // a ustar header is ISO/IEC 646, so it needs a record all the same.
     fs::write(src_dir.join("élan.txt"), b"x").unwrap();
     fs::write(src_dir.join("plain.txt"), b"y").unwrap();
 
@@ -1996,15 +1997,15 @@ fn test_option_hdrcharset_binary_forces_a_path_record() {
 
     let path_records = |bytes: &[u8]| bytes.windows(5).filter(|w| *w == b"path=").count();
 
-    // Without the option, a short UTF-8 name needs no record.
+    // Without the option, the non-ASCII name gets one in UTF-8 ...
     let plain = write(&temp.path().join("plain.pax"), &[]);
     assert_eq!(
         path_records(&plain),
-        0,
-        "a representable name must not get a path record on its own"
+        1,
+        "a non-ASCII name needs a path record whatever the charset"
     );
 
-    // With it, the non-ASCII name gets one -- and only that one.
+    // ... and with it, too -- and only that one.
     let binary = write(
         &temp.path().join("binary.pax"),
         &["-o", "hdrcharset=BINARY"],
@@ -2167,4 +2168,719 @@ fn test_option_listopt_posix_rule7_keywords_all_resolve() {
     let out = run_pax_with_stdin_bytes(&["-o", "listopt=%(bogus)s"], &ustar);
     assert_success(&out, "listopt=%(bogus)s");
     assert_eq!(stdout_str(&out).trim_end(), "%(bogus)s");
+}
+
+/// A `g` header with `records` as its data, as a member to concatenate.
+fn global_header(records: &[u8]) -> Vec<u8> {
+    Ustar {
+        name: b"GlobalHead",
+        typeflag: b'g',
+        body: records,
+        ..Default::default()
+    }
+    .member()
+}
+
+/// A plain member named `name`.
+fn plain_member(name: &[u8]) -> Vec<u8> {
+    Ustar {
+        name,
+        uname: b"hdruser",
+        body: b"X\n",
+        ..Default::default()
+    }
+    .member()
+}
+
+/// A global header sets only the keywords it names: a later `g` adding a
+/// comment must leave the earlier one's uname and mtime in force.
+#[test]
+fn test_global_headers_accumulate() {
+    let mut a = global_header(
+        &[
+            pax_record("uname", b"globaluser"),
+            pax_record("mtime", b"1000000000"),
+        ]
+        .concat(),
+    );
+    a.extend_from_slice(&plain_member(b"one.txt"));
+    a.extend_from_slice(&global_header(&pax_record("comment", b"hi")));
+    a.extend_from_slice(&plain_member(b"two.txt"));
+    a.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(uname)s %(mtime)d %F"], &a);
+    assert_success(&output, "list");
+    assert_eq!(
+        stdout_str(&output),
+        "globaluser 1000000000 one.txt\nglobaluser 1000000000 two.txt\n"
+    );
+}
+
+/// A record with an empty value deletes the keyword: "the
+/// corresponding ... field shall be ... as if the record were not
+/// present". The header's own field applies again -- it is not a parse error.
+#[test]
+fn test_empty_extended_record_value_deletes_the_keyword() {
+    for keyword in ["mtime", "atime", "uid", "gid", "size", "uname"] {
+        let mut a = Ustar {
+            name: b"PaxHeaders/f",
+            typeflag: b'x',
+            body: &pax_record(keyword, b""),
+            ..Default::default()
+        }
+        .member();
+        a.extend_from_slice(&plain_member(b"f"));
+        a.extend_from_slice(&plain_member(b"after"));
+        a.extend_from_slice(&ustar_trailer());
+
+        let output = run_pax_with_stdin_bytes(&[], &a);
+        assert_success(&output, keyword);
+        assert_eq!(stdout_str(&output), "f\nafter\n", "{keyword}");
+    }
+}
+
+/// pax writes `mtime=` for `-o mtime:=`; it has to be able to read it back.
+#[test]
+fn test_reads_its_own_deleted_mtime() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    let archive = temp.path().join("e.pax");
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "mtime:=",
+            "-f",
+            archive.to_str().unwrap(),
+            "f",
+        ],
+        temp.path(),
+    );
+    assert_success(&output, "write");
+
+    let output = run_pax_in_dir(&["-v", "-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&output, "list -v");
+}
+
+/// In read and list mode, `-o keyword=value` acts as a global extended header
+/// record, and `keyword:=value` as a per-file one; both override the archive.
+#[test]
+fn test_o_keyword_value_applies_on_list() {
+    let mut a = plain_member(b"f");
+    a.extend_from_slice(&ustar_trailer());
+
+    for opt in ["uname=forced", "uname:=forced"] {
+        let output = run_pax_with_stdin_bytes(&["-o", opt, "-o", "listopt=%(uname)s"], &a);
+        assert_success(&output, opt);
+        assert_eq!(stdout_str(&output), "forced\n", "{opt}");
+    }
+}
+
+/// A `g` record with an empty value deletes the global value: later members
+/// fall back to their own header field.
+#[test]
+fn test_deleted_global_value_stops_applying() {
+    let mut a = global_header(&pax_record("mtime", b"1000000000"));
+    a.extend_from_slice(&plain_member(b"one.txt"));
+    a.extend_from_slice(&global_header(&pax_record("mtime", b"")));
+    a.extend_from_slice(&plain_member(b"two.txt"));
+    a.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(mtime)d %F"], &a);
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "1000000000 one.txt\n0 two.txt\n");
+}
+
+/// `-o keyword=value` ranks as a global record at the start of the archive,
+/// so a member's own `x` record outranks it; `keyword:=value` is appended to
+/// every extended header, so it outranks the `x` record.
+#[test]
+fn test_o_keyword_records_rank_around_the_archive_records() {
+    let mut a = Ustar {
+        name: b"PaxHeaders/f",
+        typeflag: b'x',
+        body: &pax_record("uname", b"xuser"),
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(&plain_member(b"f"));
+    a.extend_from_slice(&plain_member(b"g"));
+    a.extend_from_slice(&ustar_trailer());
+
+    for (opt, expected) in [
+        ("uname=opt", "xuser f\nopt g\n"),
+        ("uname:=opt", "opt f\nopt g\n"),
+        // A `:=` deletion drops the x record and the header field alike.
+        ("uname:=", " f\n g\n"),
+    ] {
+        let output = run_pax_with_stdin_bytes(&["-o", opt, "-o", "listopt=%(uname)s %F"], &a);
+        assert_success(&output, opt);
+        assert_eq!(stdout_str(&output), expected, "{opt}");
+    }
+}
+
+/// An `x` header ahead of a GNU long-name group describes the member that
+/// group describes; it must not rename the member after it. Its `path`
+/// record names that member in full, so the `L` record is moot and the
+/// member is read under the `x` header's name, as bsdtar reads it.
+#[test]
+fn test_extended_header_does_not_outlive_a_skipped_long_name_group() {
+    let mut a = Ustar {
+        name: b"PaxHeaders/skipped",
+        typeflag: b'x',
+        body: &pax_record("path", b"renamed"),
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"././@LongLink",
+            typeflag: b'L',
+            body: b"long/name\0",
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(&plain_member(b"long/na"));
+    a.extend_from_slice(&plain_member(b"next"));
+    a.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&[], &a);
+    assert_eq!(stdout_str(&output), "renamed\nnext\n");
+}
+
+/// A value no archive record could carry is refused, not silently ignored.
+#[test]
+fn test_o_keyword_with_invalid_value_is_refused_on_list() {
+    let mut a = plain_member(b"f");
+    a.extend_from_slice(&ustar_trailer());
+
+    for opt in ["mtime=abc", "uid:=-1"] {
+        let output = run_pax_with_stdin_bytes(&["-o", opt], &a);
+        assert_failure(&output, opt);
+        assert!(
+            stderr_str(&output).contains(opt),
+            "{opt}: {}",
+            stderr_str(&output)
+        );
+    }
+}
+
+/// The synopsis is `[-p string]...`: -p may be repeated, and the strings
+/// combine as if concatenated.
+#[test]
+fn test_p_option_may_repeat() {
+    use std::os::unix::fs::MetadataExt;
+
+    let archive = Ustar {
+        name: b"f",
+        mode: 0o666,
+        body: b"F\n",
+        mtime: 1_000_000_000,
+        ..Default::default()
+    }
+    .archive();
+    // Under umask 077 a mode of 0666 survives only if `p` took effect.
+    let extract = |privs: &[&str]| {
+        let temp = TempDir::new().unwrap();
+        let pax = env!("CARGO_BIN_EXE_pax");
+        let mut args = vec!["-c", "umask 077; exec \"$0\" \"$@\"", pax, "-r"];
+        args.extend_from_slice(privs);
+        let output = run_program(
+            std::path::Path::new("sh"),
+            &args,
+            temp.path(),
+            Some(&archive),
+        );
+        assert_success(&output, &format!("pax -r {privs:?}"));
+        let md = fs::metadata(temp.path().join("f")).unwrap();
+        (md.mode() & 0o7777, md.mtime())
+    };
+
+    // Each string alone does only its own part ...
+    assert_eq!(extract(&["-p", "p"]), (0o666, 1_000_000_000));
+    assert_eq!(extract(&["-p", "m"]).0, 0o600);
+    // ... and repeated, both apply.
+    for privs in [["-p", "p", "-p", "m"], ["-p", "m", "-p", "p"]] {
+        let (mode, mtime) = extract(&privs);
+        assert_eq!(mode, 0o666, "{privs:?}: the mode was not preserved");
+        assert_ne!(mtime, 1_000_000_000, "{privs:?}: the mtime was preserved");
+    }
+}
+
+/// -H and -L conflict, and POSIX says the last one given wins. With -L last
+/// a symlink met in the walk is followed; with -H last only operands are.
+#[test]
+fn test_h_and_l_last_one_wins() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("d")).unwrap();
+    fs::write(temp.path().join("target"), "T\n").unwrap();
+    std::os::unix::fs::symlink("../target", temp.path().join("d/link")).unwrap();
+
+    for (flags, want) in [(["-H", "-L"], "-"), (["-L", "-H"], "l")] {
+        let output = run_pax_in_dir(&["-w", flags[0], flags[1], "-x", "ustar", "d"], temp.path());
+        assert_success(&output, "pax -w");
+        let listing = run_pax_with_stdin_bytes(&["-v"], &output.stdout);
+        let line = stdout_str(&listing)
+            .lines()
+            .find(|l| l.ends_with("d/link") || l.contains("d/link "))
+            .unwrap_or_default()
+            .to_string();
+        assert!(line.starts_with(want), "{flags:?}: {line}");
+    }
+}
+
+/// An -s expression may use any delimiter, `-` included, even though the
+/// operand then looks like an option.
+#[test]
+fn test_s_expression_with_dash_delimiter() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("abc"), "A\n").unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-s", "-abc-xyz-", "abc"], temp.path());
+    assert_success(&output, "pax -w -s -abc-xyz-");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), "xyz\n");
+}
+
+/// Pathnames are byte strings. An argument that is not UTF-8 must not panic
+/// the tar front-end or be refused by pax as a usage error.
+#[test]
+fn test_non_utf8_argument_is_a_pathname() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let temp = TempDir::new().unwrap();
+    let name = OsStr::from_bytes(b"caf\xe9");
+
+    for program in ["pax", "tar"] {
+        let mut cmd = Command::new(front_end(program));
+        if program == "pax" {
+            cmd.args(["-w", "-f", "x.tar"]);
+        } else {
+            cmd.args(["-cf", "x.tar"]);
+        }
+        let output = cmd.arg(name).current_dir(temp.path()).output().unwrap();
+        // The file does not exist: a diagnostic and exit 1, not a panic (101)
+        // or a usage error (2).
+        assert_exit_code(&output, 1, program);
+    }
+}
+
+/// POSIX: "If any specified pattern or file operands are not matched by at
+/// least one file or archive member, pax shall write a diagnostic message to
+/// standard error for each one that did not match and exit with a non-zero
+/// exit status." That holds under -c too, as BSD pax does it.
+#[test]
+fn test_c_reports_an_unmatched_pattern() {
+    let a = Ustar {
+        name: b"a",
+        body: b"A\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = run_pax_with_stdin_bytes(&["-c", "nosuch"], &a);
+    assert_eq!(stdout_str(&output), "a\n");
+    assert!(
+        stderr_str(&output).contains("nosuch"),
+        "{}",
+        stderr_str(&output)
+    );
+    assert!(!output.status.success());
+
+    // A pattern that did exclude something matched it.
+    let output = run_pax_with_stdin_bytes(&["-c", "a"], &a);
+    assert_success(&output, "pax -c a");
+    assert_eq!(stdout_str(&output), "");
+}
+
+/// -n: once every pattern has selected its member, nothing later in the
+/// archive can be selected, so pax stops reading -- as BSD pax does. What
+/// follows is never looked at, damaged or not.
+#[test]
+fn test_n_stops_once_every_pattern_is_matched() {
+    let mut a = Ustar {
+        name: b"a",
+        body: b"A\n",
+        ..Default::default()
+    }
+    .member();
+    // A block that is not a header: reading on would fail the checksum.
+    a.extend_from_slice(&[b'x'; 512]);
+
+    let output = run_pax_with_stdin_bytes(&["-n", "a"], &a);
+    assert_success(&output, "pax -n a");
+    assert_eq!(stdout_str(&output), "a\n");
+
+    // Without -n the damage is reached and reported.
+    let output = run_pax_with_stdin_bytes(&["a"], &a);
+    assert!(!output.status.success());
+}
+
+/// POSIX -i: "If EOF is encountered when reading a response ... pax shall
+/// immediately exit with a non-zero exit status." Three ^D are typed, one per
+/// operand: a pax that treats EOF as a per-file error prompts for every one.
+fn assert_tty_eof_exits(args: &[&str], dir: &std::path::Path) {
+    let Some((out, tty)) = run_pax_on_tty(
+        args,
+        dir,
+        b"\x04\x04\x04",
+        std::time::Duration::from_secs(20),
+    ) else {
+        panic!("pax {:?} did not exit on EOF from /dev/tty", args);
+    };
+    assert!(!out.status.success(), "EOF on /dev/tty must fail");
+    let prompts = tty.windows(4).filter(|w| w == b" => ").count();
+    assert_eq!(
+        prompts,
+        1,
+        "pax {:?} kept prompting after EOF: {:?} / {}",
+        args,
+        String::from_utf8_lossy(&tty),
+        stderr_str(&out)
+    );
+}
+
+fn three_files(dir: &std::path::Path) {
+    for name in ["a", "b", "c"] {
+        fs::write(dir.join(name), name).unwrap();
+    }
+}
+
+#[test]
+fn test_interactive_eof_exits_write_mode() {
+    let temp = TempDir::new().unwrap();
+    three_files(temp.path());
+    assert_tty_eof_exits(&["-w", "-i", "-f", "out.tar", "a", "b", "c"], temp.path());
+}
+
+#[test]
+fn test_interactive_eof_exits_read_mode() {
+    let temp = TempDir::new().unwrap();
+    three_files(temp.path());
+    let out = run_pax_in_dir(&["-w", "-f", "in.tar", "a", "b", "c"], temp.path());
+    assert_success(&out, "pax -w");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    assert_tty_eof_exits(&["-r", "-i", "-f", "../in.tar"], &dst);
+}
+
+#[test]
+fn test_interactive_eof_exits_copy_mode() {
+    let temp = TempDir::new().unwrap();
+    three_files(temp.path());
+    fs::create_dir(temp.path().join("dst")).unwrap();
+    assert_tty_eof_exits(&["-rw", "-i", "a", "b", "c", "dst"], temp.path());
+}
+
+/// -i: a blank answer skips "the file" -- for a directory, that one name, as
+/// an empty -s replacement does. Its contents are still offered, one prompt
+/// each, rather than dropped with it unasked.
+#[test]
+fn test_interactive_skip_directory_keeps_its_contents() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("d")).unwrap();
+    fs::write(temp.path().join("d/f"), "F\n").unwrap();
+    fs::create_dir(temp.path().join("dst")).unwrap();
+
+    let runs: [&[&str]; 2] = [
+        &["-rw", "-i", "d", "dst"],
+        &["-w", "-i", "-f", "out.tar", "d"],
+    ];
+    for args in runs {
+        let Some((out, tty)) = run_pax_on_tty(
+            args,
+            temp.path(),
+            b"\n.\n",
+            std::time::Duration::from_secs(20),
+        ) else {
+            panic!("pax {args:?} did not finish");
+        };
+        assert_success(&out, &format!("pax {args:?}"));
+        let prompts = tty.windows(4).filter(|w| w == b" => ").count();
+        assert_eq!(prompts, 2, "{args:?}: {:?}", String::from_utf8_lossy(&tty));
+    }
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dst/d/f")).unwrap(),
+        "F\n"
+    );
+    let listing = run_pax_in_dir(&["-f", "out.tar"], temp.path());
+    assert_eq!(stdout_str(&listing), "d/f\n");
+}
+
+/// A `-o keyword=value` or `keyword:=value` operand of write mode becomes a
+/// record in the archive. One whose value no reader can accept -- a uid that
+/// is not a number, a time that is not one -- wrote an archive that pax
+/// itself then refused to read. It is refused before anything is written.
+#[test]
+fn test_write_refuses_option_values_no_reader_accepts() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+
+    for opt in ["uid=abc", "mtime:=garbage", "size=-1"] {
+        let output = run_pax_in_dir(&["-w", "-x", "pax", "-o", opt, "f"], temp.path());
+        assert_failure(&output, opt);
+        assert!(
+            output.stdout.is_empty(),
+            "-o {opt}: nothing should be written"
+        );
+        assert!(
+            stderr_str(&output).contains(opt),
+            "-o {opt} must be named: {}",
+            stderr_str(&output)
+        );
+    }
+
+    // A valid one is still written, and read back.
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "-o", "uid:=4242", "f"], temp.path());
+    assert_success(&output, "-o uid:=4242");
+    let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(uid)d %F"], &output.stdout);
+    assert_eq!(stdout_str(&listing), "4242 f\n");
+}
+
+/// Reading an archive from a standard input that is a file leaves the file
+/// just past the archive (POSIX, "INPUT FILES": a utility that stops before
+/// end-of-file on a seekable input positions it past the last byte it
+/// processed), the record padding after the end-of-archive indicator
+/// included. pax read ahead and left the file wherever its reads had got to.
+#[test]
+fn test_read_leaves_standard_input_after_the_archive() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "x").unwrap();
+    let out = run_pax_in_dir(&["-w", "-f", "a.tar", "f"], temp.path());
+    assert_success(&out, "pax -w");
+    let mut data = fs::read(temp.path().join("a.tar")).unwrap();
+    assert_eq!(data.len(), 10240, "padded to a whole record");
+    data.extend_from_slice(b"TRAILING");
+    fs::write(temp.path().join("in"), &data).unwrap();
+
+    for pax in [&["-v"][..], &["-r", "-k"][..]] {
+        let out = Command::new("sh")
+            .args(["-c", "\"$0\" \"$@\" >/dev/null && cat"])
+            .arg(env!("CARGO_BIN_EXE_pax"))
+            .args(pax)
+            .current_dir(temp.path())
+            .stdin(File::open(temp.path().join("in")).unwrap())
+            .output()
+            .unwrap();
+        assert_success(&out, &format!("pax {pax:?}; cat"));
+        assert_eq!(stdout_str(&out), "TRAILING", "pax {pax:?}");
+    }
+}
+
+/// -b sets the size of each write; on input the blocking is found from the
+/// archive. A -b given anyway is a record size the reads must hold, and it
+/// was refused if it exceeded what pax may *write*.
+#[test]
+fn test_read_accepts_a_record_size_over_the_write_limit() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "x").unwrap();
+    let out = run_pax_in_dir(&["-w", "-f", "a.tar", "f"], temp.path());
+    assert_success(&out, "pax -w");
+    let mut data = fs::read(temp.path().join("a.tar")).unwrap();
+    data.resize(128 * 1024, 0);
+    fs::write(temp.path().join("big.tar"), &data).unwrap();
+
+    let out = run_pax_in_dir(&["-b", "131072", "-f", "big.tar"], temp.path());
+    assert_success(&out, "pax -b 131072 on read");
+    assert_eq!(stdout_str(&out), "f\n");
+
+    // Still a number of bytes that is a multiple of 512.
+    let out = run_pax_in_dir(&["-b", "1000", "-f", "big.tar"], temp.path());
+    assert!(!out.status.success());
+    // And still limited on write.
+    let out = run_pax_in_dir(&["-w", "-b", "131072", "-f", "c.tar", "f"], temp.path());
+    assert!(!out.status.success());
+}
+
+/// EOF on /dev/tty ends a -w -i run, but the archive written so far is
+/// still finished: without its trailer a cpio archive cannot be read at all.
+#[test]
+fn test_interactive_eof_finishes_the_archive() {
+    let temp = TempDir::new().unwrap();
+    three_files(temp.path());
+    for (format, archive) in [("cpio", "out.cpio"), ("ustar", "out.tar")] {
+        let args = ["-w", "-i", "-x", format, "-f", archive, "a", "b", "c"];
+        let Some((out, _)) = run_pax_on_tty(
+            &args,
+            temp.path(),
+            b".\n\x04",
+            std::time::Duration::from_secs(20),
+        ) else {
+            panic!("pax {args:?} did not exit on EOF from /dev/tty");
+        };
+        assert!(!out.status.success(), "EOF on /dev/tty must fail");
+        let out = run_pax_in_dir(&["-f", archive], temp.path());
+        assert_success(&out, &format!("reading {archive}"));
+        assert_eq!(stdout_str(&out), "a\n");
+        assert_eq!(stderr_str(&out), "");
+    }
+}
+
+/// POSIX -o: `keyword[[:]=value]`. The keyword ends at the first `=`; a `:=`
+/// later in the value is part of the value. Searching for `:=` first split
+/// `comment=a:=b` into the per-file keyword `comment=a` with value `b`.
+#[test]
+fn test_option_value_may_contain_colon_equals() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), b"x").unwrap();
+    for opt in ["comment=a:=b", "comment:=a:=b"] {
+        let out = run_pax_in_dir(
+            &["-w", "-x", "pax", "-o", opt, "-f", "o.pax", "f"],
+            temp.path(),
+        );
+        assert_success(&out, opt);
+        assert_eq!(
+            listopt(&temp.path().join("o.pax"), "%(comment)s"),
+            "a:=b",
+            "-o {opt}"
+        );
+    }
+}
+
+/// The listopt format follows printf's escapes, `\ddd` octal included (one to
+/// three digits). It was left as a backslash-less `ddd`.
+#[test]
+fn test_option_listopt_octal_escapes() {
+    let archive = Ustar {
+        name: b"f",
+        ..Default::default()
+    }
+    .archive();
+    let out = run_pax_with_stdin_bytes(&["-o", r"listopt=<\101\60\0101\377>%F"], &archive);
+    assert_success(&out, "listopt octal escapes");
+    assert_eq!(out.stdout, b"<A0\x081\xff>f\n");
+}
+
+/// POSIX: "The pax utility shall append a <newline> to the listopt output for
+/// each selected file" -- unconditionally, even when the format ends in one.
+#[test]
+fn test_option_listopt_newline_always_appended() {
+    let archive = [
+        Ustar {
+            name: b"a",
+            ..Default::default()
+        }
+        .member(),
+        Ustar {
+            name: b"b",
+            ..Default::default()
+        }
+        .member(),
+        ustar_trailer().to_vec(),
+    ]
+    .concat();
+    let out = run_pax_with_stdin_bytes(&["-o", "listopt=%F%n"], &archive);
+    assert_success(&out, "listopt ending in %n");
+    assert_eq!(out.stdout, b"a\n\nb\n\n");
+    let out = run_pax_with_stdin_bytes(&["-o", r"listopt=%F\n"], &archive);
+    assert_eq!(out.stdout, b"a\n\nb\n\n");
+}
+
+/// `-o` values are bytes: a `path:=` pathname, or a listopt literal, that is
+/// not UTF-8 was refused by the argument parser before pax saw it.
+#[test]
+fn test_option_values_may_be_non_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let archive = Ustar {
+        name: b"f",
+        ..Default::default()
+    }
+    .archive();
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a.tar"), &archive).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-f", "a.tar", "-o"])
+        .arg(std::ffi::OsStr::from_bytes(b"path:=n\xff"))
+        .arg("-o")
+        .arg(std::ffi::OsStr::from_bytes(b"listopt=\xfe%F"))
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_success(&out, "-o with non-UTF-8 values");
+    assert_eq!(out.stdout, b"\xfen\xff\n");
+}
+
+/// POSIX -i: the response is the new name. Only its <newline> ends it, so a
+/// name with leading or trailing blanks can be given; the reply used to be
+/// trimmed.
+#[test]
+fn test_interactive_reply_keeps_blanks() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), b"x").unwrap();
+    let Some((out, _)) = run_pax_on_tty(
+        &["-w", "-i", "-x", "ustar", "-f", "o.tar", "a"],
+        temp.path(),
+        b"  sp ace  \n",
+        std::time::Duration::from_secs(20),
+    ) else {
+        panic!("pax -w -i did not finish");
+    };
+    assert_success(&out, "pax -w -i");
+    let out = run_pax_in_dir(&["-f", "o.tar"], temp.path());
+    assert_eq!(stdout_str(&out), "  sp ace  \n");
+}
+
+/// A reply is a pathname, and a pathname is bytes: one that is not UTF-8
+/// aborted the run with "stream did not contain valid UTF-8".
+#[test]
+fn test_interactive_reply_may_be_non_utf8() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), b"x").unwrap();
+    let Some((out, _)) = run_pax_on_tty(
+        &["-w", "-i", "-x", "ustar", "-f", "o.tar", "a"],
+        temp.path(),
+        b"n\xff\n",
+        std::time::Duration::from_secs(20),
+    ) else {
+        panic!("pax -w -i did not finish");
+    };
+    assert_success(&out, "pax -w -i with a non-UTF-8 reply");
+    let out = run_pax_in_dir(&["-f", "o.tar"], temp.path());
+    assert_eq!(out.stdout, b"n\xff\n");
+}
+
+/// With no terminal for `-i` to prompt on -- cron, CI -- the run fails before
+/// the archive is touched. The archive file was created first, so an existing
+/// one was truncated to nothing and only then did opening /dev/tty fail.
+/// `-M` lost its first volume the same way, and `-a` must not change the
+/// archive either.
+#[test]
+fn test_interactive_without_tty_keeps_existing_archive() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    // A real archive, so that -a gets as far as wanting the terminal.
+    let out = run_pax_in_dir(&["-w", "-f", "keep.tar", "f"], temp.path());
+    assert_success(&out, "pax -w");
+    let before = fs::read(temp.path().join("keep.tar")).unwrap();
+    let runs: [&[&str]; 3] = [
+        &["-w", "-i", "-f", "keep.tar", "f"],
+        &[
+            "-w",
+            "-i",
+            "-M",
+            "--tape-length",
+            "10240",
+            "-f",
+            "keep.tar",
+            "f",
+        ],
+        &["-w", "-a", "-i", "-f", "keep.tar", "f"],
+    ];
+    for args in runs {
+        fs::write(temp.path().join("keep.tar"), &before).unwrap();
+        let out = run_pax_without_tty(args, temp.path());
+        assert_failure(&out, &format!("pax {args:?} with no terminal"));
+        assert!(
+            stderr_str(&out).contains("/dev/tty"),
+            "{args:?}: {}",
+            stderr_str(&out)
+        );
+        assert!(
+            fs::read(temp.path().join("keep.tar")).unwrap() == before,
+            "pax {args:?} changed the archive"
+        );
+    }
 }

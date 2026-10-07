@@ -23,26 +23,29 @@ mod rawpath;
 mod subst;
 mod userdb;
 
-use archive::{ArchiveFormat, ArchiveWriter};
+use archive::{ArchiveFormat, ArchiveReader};
 use blocked_io::{
-    default_record_size, parse_blocksize, BlockedReader, BlockedWriter, ByteCounter,
-    DEFAULT_RECORD_SIZE, TAR_BLOCK_SIZE,
+    default_record_size, parse_blocksize, parse_read_blocksize, BlockedReader, BlockedWriter,
+    ByteCounter, DEFAULT_RECORD_SIZE, TAR_BLOCK_SIZE,
 };
 use clap::{Parser, ValueEnum};
 use cli::ProgramMode;
-use compression::{is_gzip, GzipReader, GzipWriter};
+use compression::{is_gzip, GzipReader, GzipWriter, GZIP_MAGIC};
 use error::{PaxError, PaxResult};
-use formats::CpioFormat;
+use formats::{ArchiveStream, CpioFormat};
 use gettextrs::gettext;
+use interactive::InteractivePrompter;
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
 use modes::read::ReadOptions;
-use modes::write::WriteOptions;
-use multivolume::{MultiVolumeOptions, MultiVolumeReader};
+use modes::write::{FileNames, NameList, WriteOptions};
+use multivolume::{MultiVolumeOptions, VolumeChain};
 use options::FormatOptions;
 use pattern::Pattern;
+use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use subst::Substitution;
@@ -102,7 +105,7 @@ struct Args {
     #[arg(short = 'a', long, help = gettext("Append files to the end of an existing archive"))]
     append: bool,
 
-    #[arg(short, long, help = gettext("Block the output at a positive decimal integer number of bytes per write"))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("Block the output at a positive decimal integer number of bytes per write"))]
     blocksize: Option<u32>,
 
     #[arg(short = 'c', long, help = gettext("Match all file or archive members except those specified by the pattern or file operands"))]
@@ -111,10 +114,12 @@ struct Args {
     #[arg(short, long, help = gettext("Cause files of type directory to match only the file or archive member itself"))]
     dir_no_follow: bool,
 
-    #[arg(short = 'f', long, help = gettext("Specify the pathname of the input or output archive"))]
+    #[arg(short = 'f', long, allow_hyphen_values = true, help = gettext("Specify the pathname of the input or output archive"))]
     archive: Option<PathBuf>,
 
-    #[arg(short = 'H', help = gettext("Follow symlinks on the command line, rather than archiving the symlink itself"))]
+    // -H and -L are mutually exclusive, and POSIX makes the last one given
+    // win rather than calling the pair an error.
+    #[arg(short = 'H', overrides_with = "dereference", help = gettext("Follow symlinks on the command line, rather than archiving the symlink itself"))]
     cli_dereference: bool,
 
     #[arg(short = 'i', long, help = gettext("Interactively rename files or archive members"))]
@@ -126,7 +131,7 @@ struct Args {
     #[arg(short, long, help = gettext("In copy mode, hard links shall be made between the source and destination"))]
     link: bool,
 
-    #[arg(short = 'L', long, help = gettext("Follow symlinks"))]
+    #[arg(short = 'L', long, overrides_with = "cli_dereference", help = gettext("Follow symlinks"))]
     dereference: bool,
 
     #[arg(short = 'n', long, help = gettext("Select only the first archive member that matches each pattern operand"))]
@@ -135,11 +140,15 @@ struct Args {
     #[arg(short = 'z', long = "gzip", help = gettext("Compress/decompress archive using gzip"))]
     gzip: bool,
 
-    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append, help = gettext("Format-specific options"))]
-    format_options: Vec<String>,
+    // Bytes, like -s: a value can be a pathname or a listopt literal.
+    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append, allow_hyphen_values = true, help = gettext("Format-specific options"))]
+    format_options: Vec<OsString>,
 
-    #[arg(short = 's', action = clap::ArgAction::Append, help = gettext("Modify file/archive member names using substitution expression"))]
-    substitutions: Vec<String>,
+    // An option-argument is taken verbatim (XBD 12.2, guideline 7), so an
+    // expression delimited by '-' (`-s -a-b-`) is a value, not an option. It
+    // rewrites names, which are bytes, so it is bytes too.
+    #[arg(short = 's', action = clap::ArgAction::Append, allow_hyphen_values = true, help = gettext("Modify file/archive member names using substitution expression"))]
+    substitutions: Vec<OsString>,
 
     #[arg(short = 't', long, help = gettext("Reset access times of files after reading them"))]
     reset_atime: bool,
@@ -147,8 +156,9 @@ struct Args {
     #[arg(short = 'u', long, help = gettext("Ignore files older than existing files/archive members with same name"))]
     update: bool,
 
-    #[arg(short, long, help = gettext("Specify one or more file characteristic options (privileges)"))]
-    privs: Option<String>,
+    // The synopsis is `[-p string]...`: the strings combine in order.
+    #[arg(short, long, action = clap::ArgAction::Append, allow_hyphen_values = true, help = gettext("Specify one or more file characteristic options (privileges)"))]
+    privs: Vec<String>,
 
     #[arg(short, long, help = gettext("In list mode, produce a verbose table of contents"))]
     verbose: bool,
@@ -156,7 +166,7 @@ struct Args {
     // Left as an Option (rather than a defaulted value) so append mode can tell
     // an explicit `-x` from the ustar default and reject a format that conflicts
     // with the existing archive.
-    #[arg(short = 'x', long, value_enum, help = gettext("Specify the output archive format"))]
+    #[arg(short = 'x', long, value_enum, allow_hyphen_values = true, help = gettext("Specify the output archive format"))]
     format: Option<Format>,
 
     #[arg(short = 'X', long, help = gettext("Do not cross filesystem boundaries"))]
@@ -171,8 +181,16 @@ struct Args {
     #[arg(long, help = gettext("Run this script at end of each volume (for -M mode)"))]
     new_volume_script: Option<String>,
 
+    // Pathnames are byte strings, so operands are not required to be UTF-8.
     #[arg(help = gettext("Pathnames, patterns and file operands to be processed"))]
-    files_and_patterns: Vec<String>,
+    files_and_patterns: Vec<OsString>,
+
+    /// Lists of pathnames to process ahead of the operands, read as they are
+    /// needed: tar's `-T`, and cpio's NUL-separated standard input. A list
+    /// given explicitly is never replaced by standard input, so an empty `-T`
+    /// list archives nothing.
+    #[arg(skip)]
+    name_lists: Vec<NameList>,
 
     /// tar `-C`: change to this directory before operating. Applied after the
     /// `-f` pathname has been resolved, since that one is relative to the
@@ -182,7 +200,7 @@ struct Args {
 
     /// tar `--exclude` / `-X`: names never archived, listed or extracted
     #[arg(skip)]
-    exclude_patterns: Vec<String>,
+    exclude_patterns: Vec<OsString>,
 
     /// tar `--strip-components`: leading pathname components to drop
     #[arg(skip)]
@@ -192,9 +210,19 @@ struct Args {
     #[arg(skip)]
     to_stdout: bool,
 
+    /// tar: a socket, which the format cannot hold, is skipped with a
+    /// warning rather than diagnosed as an error
+    #[arg(skip)]
+    ignore_sockets: bool,
+
     /// cpio: report the archive size as a count of 512-byte blocks on stderr
     #[arg(skip)]
     report_blocks: bool,
+
+    /// cpio: `update` keeps a newer file at the name a member is extracted
+    /// under, after `-r`, rather than selecting by the archived name
+    #[arg(skip)]
+    update_final_name: bool,
 }
 
 /// Operation mode
@@ -229,8 +257,8 @@ fn main() -> ExitCode {
     error::set_program_name(program.name());
     let args = match program {
         ProgramMode::Pax => Ok(Args::parse()),
-        ProgramMode::Tar => cli::tar::parse(std::env::args().collect()),
-        ProgramMode::Cpio => cli::cpio::parse(std::env::args().collect()),
+        ProgramMode::Tar => cli::tar::parse(std::env::args_os().collect()),
+        ProgramMode::Cpio => cli::cpio::parse(std::env::args_os().collect()),
     };
 
     let result = args.and_then(run);
@@ -248,7 +276,15 @@ fn main() -> ExitCode {
         }
         Err(PaxError::EarlyExit) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{}: {}", program.name(), e);
+            // Escaped like every other diagnostic: the message can quote a
+            // name or a header value straight out of the archive. The usage
+            // hint is pax's own line, so it is not.
+            let hint = match e {
+                PaxError::Usage(_, Some(prog)) => format!("Try '{} --help'.\n", prog),
+                _ => String::new(),
+            };
+            let line = format!("{}: {}", program.name(), e);
+            crate::escape::write_stderr_line_then(line.as_bytes(), &hint);
             ExitCode::FAILURE
         }
     }
@@ -261,10 +297,26 @@ fn run(mut args: Args) -> PaxResult<()> {
             "gzip compression (-z) is incompatible with append mode (-a)".to_string(),
         ));
     }
+    // Volumes are written uncompressed; -z was silently ignored.
+    if args.gzip && args.multi_volume {
+        return Err(PaxError::InvalidFormat(
+            "gzip compression (-z) is incompatible with multi-volume mode (-M)".to_string(),
+        ));
+    }
 
     apply_chdir(&mut args)?;
 
     let mode = determine_mode(&args);
+    let name_lists = std::mem::take(&mut args.name_lists);
+    let name_lists = if matches!(mode, PaxMode::List | PaxMode::Read) {
+        // An empty list adds no patterns, so with no operands either every
+        // member is selected, as bsdtar and GNU tar do -- and the archive is
+        // read all the same, so a missing or corrupt one is still an error.
+        names_as_patterns(name_lists, &mut args.files_and_patterns)?;
+        Vec::new()
+    } else {
+        name_lists
+    };
 
     // Counts the archive bytes read or written, for the block total cpio
     // reports when it is done.
@@ -273,9 +325,9 @@ fn run(mut args: Args) -> PaxResult<()> {
     let result = match mode {
         PaxMode::List => run_list(&args, &archive_bytes),
         PaxMode::Read => run_read(&args, &archive_bytes),
-        PaxMode::Write => run_write(&args, &archive_bytes),
-        PaxMode::Append => run_append(&args, &archive_bytes),
-        PaxMode::Copy => run_copy(&args),
+        PaxMode::Write => run_write(&args, name_lists, &archive_bytes),
+        PaxMode::Append => run_append(&args, name_lists, &archive_bytes),
+        PaxMode::Copy => run_copy(&args, name_lists),
     };
 
     // cpio reports the size of the archive it just handled. Copy mode moves no
@@ -334,24 +386,38 @@ fn determine_mode(args: &Args) -> PaxMode {
 
 /// Parse all -o format options from arguments
 fn parse_format_options(args: &Args) -> PaxResult<FormatOptions> {
+    use std::os::unix::ffi::OsStrExt;
     let mut opts = FormatOptions::new();
     for opt_str in &args.format_options {
-        opts.parse_into(opt_str)?;
+        opts.parse_into(opt_str.as_bytes())?;
     }
+    Ok(opts)
+}
+
+/// The `-o` options of write and append mode, whose `keyword=value` and
+/// `keyword:=value` operands become records in the archive.
+///
+/// Each value is checked as a reader will parse it, before anything is
+/// written: a uid that is not a number made an archive that pax itself then
+/// refused to read.
+fn parse_write_format_options(args: &Args) -> PaxResult<FormatOptions> {
+    let opts = parse_format_options(args)?;
+    formats::OptionRecords::new(&opts)?;
     Ok(opts)
 }
 
 /// Parse all -s substitution expressions from arguments
 fn parse_substitutions(args: &Args) -> PaxResult<Vec<Substitution>> {
+    use std::os::unix::ffi::OsStrExt;
     args.substitutions
         .iter()
-        .map(|s| Substitution::parse(s))
+        .map(|s| Substitution::parse(s.as_bytes()))
         .collect()
 }
 
 /// Run list mode
 fn run_list(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
-    let patterns = compile_patterns(&args.files_and_patterns)?;
+    let patterns = compile_patterns(&args.files_and_patterns);
     let format_options = parse_format_options(args)?;
     let substitutions = parse_substitutions(args)?;
 
@@ -363,48 +429,36 @@ fn run_list(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         substitutions,
         first_match: args.first_match,
         dir_only: args.dir_no_follow,
-        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        exclude_patterns: compile_patterns(&args.exclude_patterns),
         strip_components: args.strip_components,
     };
 
-    // Check for multi-volume mode
-    if args.multi_volume {
-        return run_list_multi_volume(args, &options);
-    }
+    let mut archive = open_archive_for_read(args, archive_bytes, &options.format_options)?;
+    let mut stdout = listing_stdout();
 
-    let (reader, format) = open_archive_for_read(args, archive_bytes)?;
-    // StdoutLock is a LineWriter, so an unbuffered listing costs one write(2)
-    // per member (two under -o listopt). Buffer it.
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
-
-    modes::list_archive(reader, &mut stdout, format, &options)?;
-    stdout.flush()?;
-    Ok(())
+    modes::list_archive(&mut archive, &mut stdout, &options)?;
+    stdout.flush().map_err(modes::list::listing_error)
 }
 
-/// Run list mode with multi-volume support
-fn run_list_multi_volume(args: &Args, options: &ListOptions) -> PaxResult<()> {
-    let archive_path = args.archive.as_ref().ok_or_else(|| {
-        PaxError::InvalidFormat("multi-volume mode requires -f archive".to_string())
-    })?;
-
-    let mv_options = MultiVolumeOptions {
-        volume_size: None, // Not needed for reading
-        volume_script: args.new_volume_script.clone(),
-        archive_path: archive_path.clone(),
-        verbose: args.verbose,
+/// Standard output for a listing.
+///
+/// StdoutLock is a LineWriter, so an unbuffered listing costs one write(2)
+/// per member (two under -o listopt), and to a pipe or a file it is buffered.
+/// On a terminal it is not: someone is watching, and each member should
+/// appear as it is read -- the LineWriter's line at a time.
+fn listing_stdout() -> io::BufWriter<io::StdoutLock<'static>> {
+    use std::io::IsTerminal;
+    let capacity = if io::stdout().is_terminal() {
+        0
+    } else {
+        8 * 1024
     };
-
-    let mut reader = MultiVolumeReader::new(mv_options)?;
-    let mut stdout = io::stdout().lock();
-
-    // Multi-volume is always ustar format
-    modes::list::list_archive_from_reader(&mut reader, &mut stdout, options)
+    io::BufWriter::with_capacity(capacity, io::stdout().lock())
 }
 
 /// Run read/extract mode
 fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
-    let patterns = compile_patterns(&args.files_and_patterns)?;
+    let patterns = compile_patterns(&args.files_and_patterns);
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
 
@@ -419,42 +473,35 @@ fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         preserve_owner: should_preserve_owner(&args.privs),
         interactive: args.interactive,
         update: args.update,
+        update_final_name: args.update_final_name,
         substitutions,
         first_match: args.first_match,
         umask: current_umask(),
         format_options,
         dir_only: args.dir_no_follow,
-        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        exclude_patterns: compile_patterns(&args.exclude_patterns),
         strip_components: args.strip_components,
         to_stdout: args.to_stdout,
     };
 
-    // Check for multi-volume mode
-    if args.multi_volume {
-        return run_read_multi_volume(args, &options);
-    }
-
-    let (reader, format) = open_archive_for_read(args, archive_bytes)?;
-    modes::extract_archive(reader, format, &options)
+    let mut archive = open_archive_for_read(args, archive_bytes, &options.format_options)?;
+    modes::extract_archive(&mut archive, &options)
 }
 
-/// Run read/extract mode with multi-volume support
-fn run_read_multi_volume(args: &Args, options: &ReadOptions) -> PaxResult<()> {
+/// The volume options of -M: the volumes are named after `-f`, which is
+/// required. `stdin_in_use` is whether pax reads its names from standard
+/// input, which the volume script then must not.
+fn multi_volume_options(args: &Args, stdin_in_use: bool) -> PaxResult<MultiVolumeOptions> {
     let archive_path = args.archive.as_ref().ok_or_else(|| {
         PaxError::InvalidFormat("multi-volume mode requires -f archive".to_string())
     })?;
-
-    let mv_options = MultiVolumeOptions {
-        volume_size: None, // Not needed for reading
+    Ok(MultiVolumeOptions {
+        volume_size: args.tape_length,
         volume_script: args.new_volume_script.clone(),
         archive_path: archive_path.clone(),
         verbose: args.verbose,
-    };
-
-    let mut reader = MultiVolumeReader::new(mv_options)?;
-
-    // Multi-volume is always ustar format
-    modes::read::extract_archive_from_reader(&mut reader, options)
+        stdin_in_use,
+    })
 }
 
 /// Run write/create mode
@@ -474,79 +521,101 @@ fn reject_dash_c(args: &Args, mode: &str) -> PaxResult<()> {
     Ok(())
 }
 
-fn run_write(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
+/// The terminal `-i` prompts on, when it is given.
+///
+/// Write and append mode open it before the archive file: with no terminal
+/// -- under cron, say -- the run then fails leaving an existing archive as it
+/// was, where creating the archive first had already truncated it.
+fn interactive_prompter(args: &Args) -> PaxResult<Option<InteractivePrompter>> {
+    args.interactive.then(InteractivePrompter::new).transpose()
+}
+
+fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter) -> PaxResult<()> {
     reject_dash_c(args, "write")?;
-    let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
-    let format_options = parse_format_options(args)?;
+    let format_options = parse_write_format_options(args)?;
 
     let selected = args.format.unwrap_or(Format::Ustar);
-    let options = WriteOptions {
+    let mut options = WriteOptions {
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,
         no_recurse: args.dir_no_follow,
         verbose: args.verbose,
         one_file_system: args.one_file_system,
-        interactive: args.interactive,
+        prompter: interactive_prompter(args)?,
+        ignore_sockets: args.ignore_sockets,
         reset_atime: args.reset_atime,
         substitutions,
         format_options,
         cpio_format: CpioFormat::from(selected),
-        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        exclude_patterns: compile_patterns(&args.exclude_patterns),
         // -u selects among existing members, which write mode has none of.
         update_times: None,
+        archive_files: Default::default(),
     };
 
     let format = ArchiveFormat::from(selected);
+    let name_lists = name_lists_or_stdin(name_lists, &args.files_and_patterns);
+    let names_on_stdin = name_lists.iter().any(NameList::is_stdin);
+    let mut files = source_names(name_lists, &args.files_and_patterns)?;
 
     // Check for multi-volume mode
     if args.multi_volume {
-        return run_write_multi_volume(args, &files, format, &options);
+        let mv_options = multi_volume_options(args, names_on_stdin)?;
+        return run_write_multi_volume(args, mv_options, &mut files, format, &mut options);
     }
 
     // Determine record size for blocked I/O. With no explicit -b, the default
     // depends on the output format (cpio/pax: 5120, ustar: 10240).
-    let record_size = match args.blocksize {
-        Some(b) => parse_blocksize(b)?,
-        None => default_record_size(format),
-    };
+    let record_size = write_record_size(args, default_record_size(format))?;
 
-    let counter = || ByteCounter::clone(archive_bytes);
-    if let Some(ref path) = args.archive {
-        let file = File::create(path)?;
-        if args.gzip {
-            let gzip_writer = GzipWriter::new(file)?;
-            let blocked_writer = BlockedWriter::with_counter(gzip_writer, record_size, counter());
-            modes::create_archive(blocked_writer, &files, format, &options)
-        } else {
-            let blocked_writer = BlockedWriter::with_counter(file, record_size, counter());
-            modes::create_archive(blocked_writer, &files, format, &options)
+    let raw = match args.archive {
+        Some(ref path) => File::create(path)?,
+        None => stdio_file(io::stdout())?,
+    };
+    let metadata = raw.metadata()?;
+    options.archive_files.add(&metadata);
+    // -b is the size of every write to the archive file, and with -z the
+    // archive file holds the compressed stream: that is what gets blocked.
+    let mut blocked =
+        BlockedWriter::with_counter(raw, record_size, ByteCounter::clone(archive_bytes));
+    let written = if args.gzip {
+        // Only a device needs its last record whole. Anywhere else the
+        // padding is zeros after the gzip trailer, which gzip(1) reports as
+        // trailing garbage -- as bsdtar and GNU tar leave none.
+        if !is_device(&metadata) {
+            blocked = blocked.unpadded_last_record();
         }
+        modes::create_archive(
+            GzipWriter::new(&mut blocked)?,
+            &mut files,
+            format,
+            &mut options,
+        )
     } else {
-        let stdout = io::stdout().lock();
-        if args.gzip {
-            let gzip_writer = GzipWriter::new(stdout)?;
-            let blocked_writer = BlockedWriter::with_counter(gzip_writer, record_size, counter());
-            modes::create_archive(blocked_writer, &files, format, &options)
-        } else {
-            let blocked_writer = BlockedWriter::with_counter(stdout, record_size, counter());
-            modes::create_archive(blocked_writer, &files, format, &options)
-        }
-    }
+        modes::create_archive(&mut blocked, &mut files, format, &mut options)
+    };
+    // Closed even after a failure, which takes precedence in the report.
+    let closed = blocked.close().map_err(PaxError::ArchiveWrite);
+    written.and(closed)
+}
+
+/// Whether the archive file is a device -- a tape -- rather than a file,
+/// pipe or socket.
+fn is_device(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = metadata.file_type();
+    file_type.is_char_device() || file_type.is_block_device()
 }
 
 /// Run write mode with multi-volume support
 fn run_write_multi_volume(
     args: &Args,
-    files: &[PathBuf],
+    mv_options: MultiVolumeOptions,
+    files: &mut FileNames<'_>,
     format: ArchiveFormat,
-    options: &WriteOptions,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
-    // Multi-volume requires an archive file (not stdout)
-    let archive_path = args.archive.as_ref().ok_or_else(|| {
-        PaxError::InvalidFormat("multi-volume mode requires -f archive".to_string())
-    })?;
-
     // The multi-volume writer emits ustar headers unconditionally, so any other
     // interchange format has to be refused rather than silently downgraded.
     if format != ArchiveFormat::Ustar {
@@ -558,29 +627,48 @@ fn run_write_multi_volume(
     }
 
     // Tape length is required for multi-volume
-    let volume_size = args.tape_length.ok_or_else(|| {
+    let volume_size = mv_options.volume_size.ok_or_else(|| {
         PaxError::InvalidFormat(
             "multi-volume mode requires --tape-length to specify volume size".to_string(),
         )
     })?;
 
-    let mv_options = MultiVolumeOptions {
-        volume_size: Some(volume_size),
-        volume_script: args.new_volume_script.clone(),
-        archive_path: archive_path.clone(),
-        verbose: args.verbose,
-    };
+    // A volume holds whole records. Without -b, a tape length shorter than
+    // the format's default record makes the record no larger than the volume.
+    let fit = (volume_size / TAR_BLOCK_SIZE as u64).max(1) * TAR_BLOCK_SIZE as u64;
+    let default = (default_record_size(format) as u64).min(fit) as usize;
+    let record_size = write_record_size(args, default)?;
+    if record_size as u64 > volume_size {
+        return Err(PaxError::InvalidFormat(format!(
+            "a {}-byte volume cannot hold a {}-byte record",
+            volume_size, record_size
+        )));
+    }
+    // Each volume is added to the files the walk leaves out as it is created.
+    let mut writer = multivolume::MultiVolumeWriter::new(
+        mv_options,
+        record_size,
+        options.archive_files.clone(),
+    )?;
 
-    let mut writer = multivolume::MultiVolumeWriter::new(mv_options)?;
-
-    // Write each file to the multi-volume archive
-    modes::write::write_files_to_archive(&mut writer, files, format, options)?;
-
-    writer.finish()
+    // Write each file to the multi-volume archive, then its trailer
+    modes::write::write_files_to_archive(&mut writer, files, options)
 }
 
 /// Run append mode (-w -a)
-fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
+fn run_append(
+    args: &Args,
+    name_lists: Vec<NameList>,
+    archive_bytes: &ByteCounter,
+) -> PaxResult<()> {
+    // Appending finds the end of one file and writes there; there is no
+    // reading a volume set to its last volume to carry on from.
+    if args.multi_volume {
+        return Err(PaxError::InvalidFormat(
+            "-M is not supported with -a".to_string(),
+        ));
+    }
+
     // Append mode requires an archive file (not stdin/stdout)
     let archive_path = args
         .archive
@@ -590,12 +678,11 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     // Check if archive exists - if not, create it instead of appending
     if !archive_path.exists() {
         // Fall back to create mode
-        return run_write(args, archive_bytes);
+        return run_write(args, name_lists, archive_bytes);
     }
 
-    let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
-    let format_options = parse_format_options(args)?;
+    let format_options = parse_write_format_options(args)?;
 
     let mut options = WriteOptions {
         cli_dereference: args.cli_dereference,
@@ -603,26 +690,26 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         no_recurse: args.dir_no_follow,
         verbose: args.verbose,
         one_file_system: args.one_file_system,
-        interactive: args.interactive,
+        prompter: interactive_prompter(args)?,
+        ignore_sockets: args.ignore_sockets,
         reset_atime: args.reset_atime,
         substitutions,
         format_options,
         cpio_format: args.format.map(CpioFormat::from).unwrap_or_default(),
-        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        exclude_patterns: compile_patterns(&args.exclude_patterns),
         // Filled in by append_to_archive once it knows the archive's format.
         update_times: None,
+        archive_files: Default::default(),
     };
 
     let requested_format = args.format.map(ArchiveFormat::from);
     // Appended members are blocked like any other write; append used to bypass
     // the blocked writer entirely and so ignored -b.
-    let record_size = match args.blocksize {
-        Some(bs) => parse_blocksize(bs)?,
-        None => DEFAULT_RECORD_SIZE,
-    };
+    let record_size = write_record_size(args, DEFAULT_RECORD_SIZE)?;
+    let mut files = source_names(name_lists, &args.files_and_patterns)?;
     modes::append_to_archive(
         archive_path,
-        &files,
+        &mut files,
         &mut options,
         requested_format,
         record_size,
@@ -631,39 +718,23 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
 }
 
 /// Run copy mode (-r -w)
-fn run_copy(args: &Args) -> PaxResult<()> {
+fn run_copy(args: &Args, name_lists: Vec<NameList>) -> PaxResult<()> {
     reject_dash_c(args, "copy")?;
 
-    // In copy mode, the last argument is the destination directory
-    // All other arguments are files/directories to copy
-    if args.files_and_patterns.is_empty() {
+    // In copy mode, the last argument is the destination directory; all the
+    // others are files/directories to copy, and with none the names are read
+    // from standard input.
+    let Some((dest, sources)) = args.files_and_patterns.split_last() else {
         return Err(PaxError::InvalidFormat(
             "copy mode requires a destination directory".to_string(),
         ));
-    }
-
-    let (files, dest_dir) = if args.files_and_patterns.len() == 1 {
-        // Only destination provided, read file list from stdin
-        let files = modes::write::read_file_list(io::stdin())?;
-        let dest = PathBuf::from(&args.files_and_patterns[0]);
-        (files, dest)
-    } else {
-        // Last arg is destination, rest are files
-        let dest = PathBuf::from(args.files_and_patterns.last().unwrap());
-        let files: Vec<PathBuf> = args.files_and_patterns[..args.files_and_patterns.len() - 1]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        (files, dest)
     };
+    let dest_dir = PathBuf::from(dest);
 
     // Copy mode has no pattern operands: every operand is a source pathname.
-    let patterns = compile_patterns(&[])?;
     let substitutions = parse_substitutions(args)?;
 
     let options = CopyOptions {
-        patterns,
-        exclude: false,
         no_clobber: args.no_clobber,
         verbose: args.verbose,
         preserve_perms: should_preserve_perms(&args.privs),
@@ -677,55 +748,130 @@ fn run_copy(args: &Args) -> PaxResult<()> {
         one_file_system: args.one_file_system,
         interactive: args.interactive,
         update: args.update,
+        reset_atime: args.reset_atime,
         substitutions,
         umask: current_umask(),
     };
 
-    modes::copy_files(&files, &dest_dir, &options)
+    modes::copy_files(&mut source_names(name_lists, sources)?, &dest_dir, &options)
 }
 
-/// Open archive for reading with format detection
+/// Open the archive for reading, detecting its format.
+///
+/// A regular file -- named by -f, or on standard input -- is read through a
+/// stream that seeks over the member data list and read mode skip, rather than
+/// reading it. A compressed archive, a pipe or a device is read throughout.
+/// Under -M the archive is its volumes, one after the other.
 fn open_archive_for_read(
     args: &Args,
     archive_bytes: &ByteCounter,
-) -> PaxResult<(Box<dyn Read>, ArchiveFormat)> {
-    // Determine record size for blocked I/O. On read the format is auto-detected
-    // after this point, so an unspecified -b just sets the read granularity.
-    let record_size = match args.blocksize {
-        Some(b) => parse_blocksize(b)?,
-        None => DEFAULT_RECORD_SIZE,
-    };
+    format_options: &FormatOptions,
+) -> PaxResult<Box<dyn ArchiveReader>> {
+    // -b sets the size of writes; on input the blocking is whatever the reads
+    // return (see BlockedReader), and a -b given says how large a record
+    // they must hold.
+    let record = args
+        .blocksize
+        .map(parse_read_blocksize)
+        .transpose()?
+        .unwrap_or(0);
 
-    // Create the underlying reader
-    let raw_reader: Box<dyn Read> = if let Some(ref path) = args.archive {
-        Box::new(File::open(path)?)
+    if args.multi_volume {
+        let chain = VolumeChain::open(multi_volume_options(args, false)?, record)?;
+        let blocked = BlockedReader::with_counter(chain, ByteCounter::clone(archive_bytes))
+            .with_record_size(record);
+        let stream = |b| ArchiveStream::new(b).with_finisher(warn_of_next_volume);
+        return open_detected(blocked, stream, format_options);
+    }
+
+    let raw = match args.archive {
+        Some(ref path) => File::open(path)?,
+        None => stdio_file(io::stdin())?,
+    };
+    let seekable = raw.metadata().is_ok_and(|m| m.is_file());
+
+    // Everything that looks at the raw archive, gzip detection included, goes
+    // through the one blocked reader: a smaller read of its own would cut the
+    // first record short.
+    let mut blocked = BlockedReader::with_counter(raw, ByteCounter::clone(archive_bytes))
+        .with_record_size(record);
+    let is_gzip_archive = is_gzip(blocked.peek(GZIP_MAGIC.len())?);
+    if is_gzip_archive || args.gzip {
+        // For format detection, peek at the decompressed archive.
+        let mut reader = PeekReader::new(Box::new(GzipReader::new(blocked)?), 512);
+        let format = detect_format_from_bytes(reader.peek()?)?;
+        let stream = ArchiveStream::new(reader).with_finisher(read_compressed_trailer);
+        return formats::open_reader(stream, format, format_options);
+    }
+
+    if seekable {
+        let stream = |b| ArchiveStream::seekable(b).with_finisher(leave_after_archive);
+        open_detected(blocked, stream, format_options)
     } else {
-        Box::new(io::stdin())
-    };
+        open_detected(blocked, ArchiveStream::new, format_options)
+    }
+}
 
-    // First, peek to detect if this is a gzip archive
-    let mut peek_reader = PeekReader::new(raw_reader, 512);
-    let peek_buf = peek_reader.peek()?;
-    let is_gzip_archive = is_gzip(peek_buf);
+/// The reader for the archive `blocked` holds, in whatever format its first
+/// block shows, over the stream `stream` makes of it.
+fn open_detected<R: Read + 'static>(
+    mut blocked: BlockedReader<R>,
+    stream: impl FnOnce(BlockedReader<R>) -> ArchiveStream<BlockedReader<R>>,
+    format_options: &FormatOptions,
+) -> PaxResult<Box<dyn ArchiveReader>> {
+    let peeked = blocked.peek(512)?;
+    let format = detect_format_from_bytes(&peeked[..peeked.len().min(512)])?;
+    formats::open_reader(stream(blocked), format, format_options)
+}
 
-    // If gzip detected or -z flag set, wrap in gzip decompressor
-    let reader: Box<dyn Read> = if is_gzip_archive || args.gzip {
-        Box::new(GzipReader::new(peek_reader)?)
-    } else {
-        Box::new(peek_reader)
-    };
+/// The end of a compressed archive is not the end of the compressed stream:
+/// its trailer, with the CRC and length of everything before it, comes after
+/// the end-of-archive indicator. Reading on to it is what checks them.
+fn read_compressed_trailer<R: Read>(reader: &mut R, reached_end: bool) -> io::Result<()> {
+    if reached_end {
+        io::copy(reader, &mut io::sink())?;
+    }
+    Ok(())
+}
 
-    // Wrap in blocked reader for proper tape drive support
-    let blocked_reader =
-        BlockedReader::with_counter(reader, record_size, ByteCounter::clone(archive_bytes));
+/// At the end of a multi-volume archive, a volume after the last one is
+/// reported rather than silently ignored.
+fn warn_of_next_volume(
+    blocked: &mut BlockedReader<VolumeChain>,
+    reached_end: bool,
+) -> io::Result<()> {
+    if reached_end {
+        blocked.get_ref().warn_of_next_volume();
+    }
+    Ok(())
+}
 
-    // For format detection, we need to peek at the (decompressed) archive
-    let mut buf_reader = PeekReader::new(Box::new(blocked_reader), 512);
-    let peek_buf = buf_reader.peek()?;
+/// Leave a seekable input just past the archive -- its record padding
+/// included, when it was read to the end -- and not wherever reading ahead
+/// got to. Standard input is shared with whatever reads it next.
+fn leave_after_archive<R: Read + Seek>(
+    blocked: &mut BlockedReader<R>,
+    reached_end: bool,
+) -> io::Result<()> {
+    if reached_end {
+        blocked.skip_trailing_zeros()?;
+    }
+    blocked.unread_buffered()
+}
 
-    let format = detect_format_from_bytes(peek_buf)?;
+/// The bytes per write to the archive: -b, or `default` without it.
+fn write_record_size(args: &Args, default: usize) -> PaxResult<usize> {
+    args.blocksize.map_or(Ok(default), parse_blocksize)
+}
 
-    Ok((Box::new(buf_reader), format))
+/// Standard input or output as a `File`, for archive I/O by raw read(2) and
+/// write(2) on the descriptor.
+///
+/// std's `Stdin` reads through an 8 KiB buffer, and `Stdout` is a `LineWriter`
+/// that splits each write at its last newline. Either way a record would not
+/// be moved in one system call, which a tape drive requires.
+fn stdio_file(stream: impl AsFd) -> io::Result<File> {
+    Ok(File::from(stream.as_fd().try_clone_to_owned()?))
 }
 
 /// Detect format from peek buffer
@@ -770,6 +916,14 @@ fn detect_format_from_bytes(buf: &[u8]) -> PaxResult<ArchiveFormat> {
         }
     }
 
+    // An all-zero first block is where a tar archive with no members starts:
+    // the end-of-archive indicator, which is all that `pax -w` writes when it
+    // is given nothing to archive. Its own output has to read back -- as an
+    // empty archive, and as one -a can append to.
+    if buf.len() >= 512 && crate::formats::ustar::is_zero_block(&buf[..512]) {
+        return Ok(ArchiveFormat::Ustar);
+    }
+
     // Check for old-style tar by validating checksum
     if buf.len() >= 512 && is_valid_tar_checksum(buf) {
         // Also check for pax extended headers in old-style tar
@@ -785,61 +939,103 @@ fn detect_format_from_bytes(buf: &[u8]) -> PaxResult<ArchiveFormat> {
     ))
 }
 
-/// Verify tar checksum
+/// Whether `buf` begins with a tar header whose checksum is right, by the
+/// same test the header parser applies -- so a header detected here is one
+/// the reader then accepts.
 fn is_valid_tar_checksum(buf: &[u8]) -> bool {
-    if buf.len() < 512 {
-        return false;
-    }
+    buf.get(..512)
+        .and_then(|block| block.try_into().ok())
+        .is_some_and(crate::formats::ustar::verify_checksum)
+}
 
-    // Parse checksum field at offset 148
-    let chksum_str = std::str::from_utf8(&buf[148..156]).unwrap_or("");
-    let chksum_str = chksum_str.trim_matches(|c| c == ' ' || c == '\0');
-    if chksum_str.is_empty() {
-        return false;
-    }
+/// Compile pattern operands into Pattern objects.
+///
+/// Patterns and member names are both bytes, so an operand that is not UTF-8
+/// -- `caf\351` -- selects the member stored under exactly those bytes.
+fn compile_patterns(patterns: &[OsString]) -> Vec<Pattern> {
+    use std::os::unix::ffi::OsStrExt;
+    patterns
+        .iter()
+        .map(|s| Pattern::new(s.as_bytes()))
+        .collect()
+}
 
-    // Reject if checksum contains a sign
-    if chksum_str.starts_with('+') || chksum_str.starts_with('-') {
-        return false;
-    }
-
-    let stored = match u32::from_str_radix(chksum_str, 8) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    // Calculate checksum
-    let mut sum: u32 = 0;
-    for (i, &byte) in buf[0..512].iter().enumerate() {
-        if (148..156).contains(&i) {
-            sum += b' ' as u32;
-        } else {
-            sum += byte as u32;
+/// The pathnames write, append and copy mode act on: the names in any lists
+/// (tar `-T`, cpio `-0`), then `operands`, and with neither the names on
+/// standard input, one per line.
+///
+/// A list is read as the walk asks for each name. One that cannot be read is
+/// diagnosed and ends there; what was archived before it stays archived, and
+/// the archive is still finished properly.
+///
+/// The first name is read here, though, before the caller creates or opens
+/// the archive: a list that cannot be read at all is an error before an
+/// existing archive has been truncated, not a diagnostic after.
+fn source_names(
+    lists: Vec<NameList>,
+    operands: &[OsString],
+) -> PaxResult<impl Iterator<Item = PathBuf> + '_> {
+    let lists = name_lists_or_stdin(lists, operands);
+    let mut names = lists.into_iter().flat_map(NameList::names).peekable();
+    if let Some(Err(_)) = names.peek() {
+        if let Some(Err(e)) = names.next() {
+            return Err(list_error(e));
         }
     }
-
-    sum == stored
+    Ok(names
+        .map_while(report_list_error)
+        .chain(operands.iter().map(PathBuf::from)))
 }
 
-/// Compile pattern strings into Pattern objects
-fn compile_patterns(patterns: &[String]) -> PaxResult<Vec<Pattern>> {
-    patterns.iter().map(|s| Pattern::new(s)).collect()
-}
-
-/// Get files to archive (from args or stdin)
-fn get_files_to_archive(args: &Args) -> PaxResult<Vec<PathBuf>> {
-    if args.files_and_patterns.is_empty() {
-        // Read from stdin
-        modes::write::read_file_list(io::stdin())
+/// The name lists of write, append and copy mode: those given, or with
+/// neither lists nor operands, standard input, one name per line.
+fn name_lists_or_stdin(lists: Vec<NameList>, operands: &[OsString]) -> Vec<NameList> {
+    if lists.is_empty() && operands.is_empty() {
+        vec![NameList::stdin(b'\n')]
     } else {
-        Ok(args.files_and_patterns.iter().map(PathBuf::from).collect())
+        lists
     }
 }
 
-/// Parse -p privilege string and return preservation flags
-/// Per POSIX: when conflicting characters appear, the last one wins.
+/// tar's `-T` in list and read mode: each name selects members as a pattern
+/// operand does, ahead of the operands themselves. The lists are read in
+/// full, since selection starts with the first member.
+fn names_as_patterns(lists: Vec<NameList>, operands: &mut Vec<OsString>) -> PaxResult<()> {
+    let mut patterns = Vec::new();
+    for list in lists {
+        for name in list.names() {
+            patterns.push(name.map_err(list_error)?.into_os_string());
+        }
+    }
+    patterns.append(operands);
+    *operands = patterns;
+    Ok(())
+}
+
+/// A failure to read a name list, saying that is what failed.
+fn list_error(e: PaxError) -> PaxError {
+    match e {
+        PaxError::Io(e) => PaxError::Io(io::Error::new(
+            e.kind(),
+            format!("{}: {}", gettext("pathname list"), e),
+        )),
+        e => e,
+    }
+}
+
+/// A name from a list, or `None` -- ending the list -- after diagnosing a
+/// failure to read it.
+fn report_list_error(name: PaxResult<PathBuf>) -> Option<PathBuf> {
+    name.map_err(|e| error::report_error(gettext("pathname list"), e))
+        .ok()
+}
+
+/// Parse the -p privilege strings and return preservation flags.
+/// Per POSIX: the strings of repeated -p options combine, and when
+/// characters conflict -- within one string or across several -- the one
+/// given last wins.
 /// Defaults: preserve atime, mtime, perms; do NOT preserve owner
-fn parse_privs(privs: &Option<String>) -> (bool, bool, bool, bool) {
+fn parse_privs(privs: &[String]) -> (bool, bool, bool, bool) {
     // Defaults per POSIX:
     // - atime: preserved (so 'a' disables it)
     // - mtime: preserved (so 'm' disables it)
@@ -851,23 +1047,21 @@ fn parse_privs(privs: &Option<String>) -> (bool, bool, bool, bool) {
     let mut preserve_perms = false;
     let mut preserve_owner = false;
 
-    if let Some(s) = privs {
-        // Process each character in order, last one wins for conflicts
-        for c in s.chars() {
-            match c {
-                'a' => preserve_atime = false,
-                'm' => preserve_mtime = false,
-                'o' => preserve_owner = true,
-                'p' => preserve_perms = true,
-                'e' => {
-                    // 'e' means preserve everything
-                    preserve_atime = true;
-                    preserve_mtime = true;
-                    preserve_perms = true;
-                    preserve_owner = true;
-                }
-                _ => {} // Ignore unknown characters per POSIX
+    // Process each character in order, last one wins for conflicts
+    for c in privs.iter().flat_map(|s| s.chars()) {
+        match c {
+            'a' => preserve_atime = false,
+            'm' => preserve_mtime = false,
+            'o' => preserve_owner = true,
+            'p' => preserve_perms = true,
+            'e' => {
+                // 'e' means preserve everything
+                preserve_atime = true;
+                preserve_mtime = true;
+                preserve_perms = true;
+                preserve_owner = true;
             }
+            _ => {} // Ignore unknown characters per POSIX
         }
     }
 
@@ -898,22 +1092,22 @@ fn current_umask() -> u32 {
 }
 
 /// Check if permissions should be preserved
-fn should_preserve_perms(privs: &Option<String>) -> bool {
+fn should_preserve_perms(privs: &[String]) -> bool {
     parse_privs(privs).2
 }
 
 /// Check if modification time should be preserved
-fn should_preserve_mtime(privs: &Option<String>) -> bool {
+fn should_preserve_mtime(privs: &[String]) -> bool {
     parse_privs(privs).1
 }
 
 /// Check if access time should be preserved
-fn should_preserve_atime(privs: &Option<String>) -> bool {
+fn should_preserve_atime(privs: &[String]) -> bool {
     parse_privs(privs).0
 }
 
 /// Check if owner should be preserved
-fn should_preserve_owner(privs: &Option<String>) -> bool {
+fn should_preserve_owner(privs: &[String]) -> bool {
     parse_privs(privs).3
 }
 
@@ -1037,40 +1231,89 @@ mod tests {
         assert!(matches!(determine_mode(&args), PaxMode::List));
     }
 
+    /// The privilege strings of one `-p` per element.
+    fn p(strings: &[&str]) -> Vec<String> {
+        strings.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn test_preserve_flags() {
         // Default (no -p): preserve atime, mtime; do NOT preserve perms (the mode
         // is set as part of normal file creation, i.e. archived mode & ~umask) or
         // owner.
-        assert!(should_preserve_atime(&None));
-        assert!(should_preserve_mtime(&None));
-        assert!(!should_preserve_perms(&None));
-        assert!(!should_preserve_owner(&None));
+        assert!(should_preserve_atime(&[]));
+        assert!(should_preserve_mtime(&[]));
+        assert!(!should_preserve_perms(&[]));
+        assert!(!should_preserve_owner(&[]));
 
         // Individual flags
-        assert!(!should_preserve_atime(&Some("a".to_string())));
-        assert!(!should_preserve_mtime(&Some("m".to_string())));
-        assert!(should_preserve_perms(&Some("p".to_string())));
-        assert!(should_preserve_owner(&Some("o".to_string())));
+        assert!(!should_preserve_atime(&p(&["a"])));
+        assert!(!should_preserve_mtime(&p(&["m"])));
+        assert!(should_preserve_perms(&p(&["p"])));
+        assert!(should_preserve_owner(&p(&["o"])));
 
         // 'e' preserves everything
-        assert!(should_preserve_atime(&Some("e".to_string())));
-        assert!(should_preserve_mtime(&Some("e".to_string())));
-        assert!(should_preserve_perms(&Some("e".to_string())));
-        assert!(should_preserve_owner(&Some("e".to_string())));
+        assert!(should_preserve_atime(&p(&["e"])));
+        assert!(should_preserve_mtime(&p(&["e"])));
+        assert!(should_preserve_perms(&p(&["e"])));
+        assert!(should_preserve_owner(&p(&["e"])));
 
         // Combined flags
-        assert!(!should_preserve_atime(&Some("am".to_string())));
-        assert!(!should_preserve_mtime(&Some("am".to_string())));
-        assert!(!should_preserve_perms(&Some("am".to_string()))); // no p/e → not preserved
+        assert!(!should_preserve_atime(&p(&["am"])));
+        assert!(!should_preserve_mtime(&p(&["am"])));
+        assert!(!should_preserve_perms(&p(&["am"]))); // no p/e → not preserved
 
         // Precedence: last wins
         // 'e' enables everything, then 'a' disables atime
-        assert!(!should_preserve_atime(&Some("ea".to_string())));
-        assert!(should_preserve_mtime(&Some("ea".to_string())));
-        assert!(should_preserve_owner(&Some("ea".to_string())));
+        assert!(!should_preserve_atime(&p(&["ea"])));
+        assert!(should_preserve_mtime(&p(&["ea"])));
+        assert!(should_preserve_owner(&p(&["ea"])));
 
         // 'm' disables mtime, then 'e' enables everything
-        assert!(should_preserve_mtime(&Some("me".to_string())));
+        assert!(should_preserve_mtime(&p(&["me"])));
+
+        // Repeated -p strings combine in order, so the same holds across them.
+        assert!(!should_preserve_atime(&p(&["e", "a"])));
+        assert!(should_preserve_mtime(&p(&["m", "e"])));
+        assert!(!should_preserve_mtime(&p(&["e", "m"])));
+    }
+
+    #[test]
+    fn test_p_may_repeat_and_h_l_last_wins() {
+        let args = Args::parse_from(["pax", "-r", "-p", "e", "-p", "m"]);
+        assert_eq!(args.privs, p(&["e", "m"]));
+
+        let args = Args::parse_from(["pax", "-w", "-H", "-L"]);
+        assert!(args.dereference && !args.cli_dereference);
+        let args = Args::parse_from(["pax", "-w", "-L", "-H"]);
+        assert!(args.cli_dereference && !args.dereference);
+    }
+
+    #[test]
+    fn test_option_arguments_may_begin_with_a_dash() {
+        let args = Args::parse_from(["pax", "-w", "-s", "-a-b-", "-v", "f"]);
+        assert_eq!(args.substitutions, vec![OsString::from("-a-b-")]);
+        assert!(args.verbose, "-v after the -s argument is still an option");
+        let args = Args::parse_from(["pax", "-r", "-f", "-v"]);
+        assert_eq!(args.archive.as_deref(), Some(std::path::Path::new("-v")));
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn test_operands_keep_their_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let name = OsString::from_vec(b"caf\xe9".to_vec());
+        let args = Args::try_parse_from([OsString::from("pax"), "-w".into(), name.clone()])
+            .expect("a non-UTF-8 operand is a pathname, not a usage error");
+        let files: Vec<PathBuf> = source_names(Vec::new(), &args.files_and_patterns)
+            .unwrap()
+            .collect();
+        assert_eq!(files[0].as_os_str().as_bytes(), b"caf\xe9");
+
+        // As a pattern it selects the member of that name.
+        let pat = &compile_patterns(&[name]).remove(0);
+        assert!(pat.matches(b"caf\xe9"));
+        assert!(!pat.matches(b"caf"));
+        assert!(!pat.matches("caf\u{fffd}".as_bytes()));
     }
 }

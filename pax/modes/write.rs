@@ -15,14 +15,16 @@ use crate::formats::{checksum_bytes, CpioFormat, CpioWriter, PaxWriter, UstarWri
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::options::FormatOptions;
 use crate::pattern::{matches_excluded, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::subst::{substitute_name, Substitution};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{BufRead, Read, Seek, Write};
+use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Options for write/create mode
 #[derive(Default)]
@@ -37,8 +39,12 @@ pub struct WriteOptions {
     pub verbose: bool,
     /// Stay on one filesystem
     pub one_file_system: bool,
-    /// Interactive rename mode
-    pub interactive: bool,
+    /// The terminal `-i` prompts on. Opened by the caller before the archive
+    /// file is created or touched: where there is no terminal, the run fails
+    /// with the archive as it was, rather than after truncating it.
+    pub prompter: Option<InteractivePrompter>,
+    /// tar: skip a socket the format cannot hold with a warning, not an error
+    pub ignore_sockets: bool,
     /// Reset access time after reading files
     pub reset_atime: bool,
     /// Path substitutions (-s option)
@@ -55,8 +61,44 @@ pub struct WriteOptions {
     /// The key is the *member* name -- what the file is stored as, after `-s`
     /// and any rename -- because that is what a later extraction resolves, and
     /// it is not the pathname the file was named by on the command line.
-    pub update_times: Option<HashMap<PathBuf, u64>>,
+    pub update_times: Option<HashMap<PathBuf, MemberTime>>,
+    /// The files the archive is being written to, which are left out rather
+    /// than copied into themselves.
+    pub archive_files: ArchiveFiles,
 }
+
+/// `(st_dev, st_ino)`, which identifies a file however it is named.
+pub fn file_id(metadata: &std::fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+/// The `(st_dev, st_ino)` of each regular file the archive is written to.
+///
+/// A name list read as the walk goes can name the archive once it exists --
+/// `find . | pax -w -f out.tar` -- and so can a walk of the directory holding
+/// it. Under -M that is every volume, each created part way through the walk,
+/// so the volume writer adds each one as it creates it: a set shared with the
+/// writer rather than one id fixed before the walk begins.
+#[derive(Clone, Default)]
+pub struct ArchiveFiles(Rc<RefCell<HashSet<(u64, u64)>>>);
+
+impl ArchiveFiles {
+    /// Record a file the archive is written to. Only a regular file counts:
+    /// a device such as `/dev/null` or a tape is not one the walk could be
+    /// copying into itself.
+    pub fn add(&self, metadata: &std::fs::Metadata) {
+        if metadata.is_file() {
+            self.0.borrow_mut().insert(file_id(metadata));
+        }
+    }
+
+    fn contains(&self, metadata: &ftw::Metadata) -> bool {
+        self.0.borrow().contains(&(metadata.dev(), metadata.ino()))
+    }
+}
+
+/// A member's modification time as `(seconds, nanoseconds)`.
+pub type MemberTime = (i64, u32);
 
 impl WriteOptions {
     /// Whether `-u` should leave this member out because the archive already
@@ -68,59 +110,140 @@ impl WriteOptions {
         let Some(times) = &self.update_times else {
             return false;
         };
-        // Directory members are stored with a trailing slash; archived_mtimes
-        // strips it so both sides of this lookup spell the name the same way.
-        let name = crate::rawpath::MatchName::of(archive_path);
-        let name = name.as_str();
-        let name = Path::new(name.trim_end_matches('/'));
+        let name = crate::rawpath::trim_trailing_slashes(archive_path);
         let Some(&member_mtime) = times.get(name) else {
             return false;
         };
-        file_mtime_secs(metadata) <= member_mtime
+        not_newer(file_mtime(metadata), member_mtime)
     }
 }
 
-/// A file's modification time in whole seconds, the resolution every header
-/// format records.
-fn file_mtime_secs(metadata: &ftw::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        metadata.mtime().max(0) as u64
-    }
-    #[cfg(not(unix))]
-    {
-        metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+/// Whether a file last modified at `file` is no newer than a member recording
+/// `member`.
+///
+/// A member with a fraction of a second -- a pax `mtime` record -- is compared
+/// to the nanosecond, so a file changed again within the same second is newer.
+/// One without has its time to the second only: every ustar header, where
+/// what was archived from a file modified at 100.5 says 100. Comparing the
+/// file's 100.5 to that would append an unchanged file on every run, so
+/// against it only the file's seconds count.
+fn not_newer(file: MemberTime, member: MemberTime) -> bool {
+    if member.1 == 0 {
+        file.0 <= member.0
+    } else {
+        file <= member
     }
 }
+
+/// A file's modification time as `(seconds, nanoseconds)`.
+fn file_mtime(metadata: &ftw::Metadata) -> MemberTime {
+    (metadata.mtime(), metadata.mtime_nsec() as u32)
+}
+
+/// The pathnames write, append and copy mode act on, in order.
+///
+/// An iterator rather than a slice so a list read from standard input or a
+/// `-T` file is consumed as the walk asks for it: collecting it first cost
+/// memory linear in the list and wrote nothing until its producer had exited,
+/// which is what stops `find / | pax -w | ssh ...` from streaming.
+pub type FileNames<'a> = dyn Iterator<Item = PathBuf> + 'a;
 
 /// Create an archive from files
 pub fn create_archive<W: Write>(
     writer: W,
-    files: &[PathBuf],
+    files: &mut FileNames<'_>,
     format: ArchiveFormat,
-    options: &WriteOptions,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
     match format {
-        ArchiveFormat::Ustar => {
-            let mut archive = UstarWriter::new(writer);
-            write_files(&mut archive, files, options)?;
-            archive.finish()
+        ArchiveFormat::Ustar => write_archive(&mut UstarWriter::new(writer), files, options),
+        ArchiveFormat::Cpio => write_archive(
+            &mut CpioWriter::with_format(writer, options.cpio_format),
+            files,
+            options,
+        ),
+        ArchiveFormat::Pax => write_archive(
+            &mut PaxWriter::with_options(writer, options.format_options.clone()),
+            files,
+            options,
+        ),
+    }
+}
+
+/// Archive `files` and write the trailer, with every I/O failure of `archive`
+/// itself marked as the archive's (see `ArchiveSink`).
+///
+/// End of file on `/dev/tty` under -i ends the run, but what has been
+/// archived by then is still finished with a trailer: without one a cpio
+/// archive cannot be read at all.
+fn write_archive<A: ArchiveWriter>(
+    archive: &mut A,
+    files: &mut FileNames<'_>,
+    options: &mut WriteOptions,
+) -> PaxResult<()> {
+    let mut sink = ArchiveSink(archive);
+    match write_files(&mut sink, files, options) {
+        Err(PaxError::TtyEof) => {
+            sink.finish()?;
+            Err(PaxError::TtyEof)
         }
-        ArchiveFormat::Cpio => {
-            let mut archive = CpioWriter::with_format(writer, options.cpio_format);
-            write_files(&mut archive, files, options)?;
-            archive.finish()
+        written => {
+            written?;
+            sink.finish()
         }
-        ArchiveFormat::Pax => {
-            let mut archive = PaxWriter::with_options(writer, options.format_options.clone());
-            write_files(&mut archive, files, options)?;
-            archive.finish()
-        }
+    }
+}
+
+/// An archive writer whose I/O errors are known to be the archive's.
+///
+/// While a file is archived, its own reads and the archive's writes happen side
+/// by side, and both fail with an `io::Error`. Telling them apart by errno does
+/// not work -- EIO, EFBIG or EAGAIN can come from either -- and getting it wrong
+/// either blames every remaining source file for the archive's failure or stops
+/// the run over one unreadable file. A writer's only I/O is its sink, so this
+/// wrapper re-labels each such error `ArchiveWrite`, which ends the run.
+struct ArchiveSink<'a, A: ArchiveWriter>(&'a mut A);
+
+impl<A: ArchiveWriter> ArchiveSink<'_, A> {
+    fn sink<T>(result: PaxResult<T>) -> PaxResult<T> {
+        result.map_err(|e| match e {
+            PaxError::Io(e) => PaxError::ArchiveWrite(e),
+            e => e,
+        })
+    }
+}
+
+impl<A: ArchiveWriter> ArchiveWriter for ArchiveSink<'_, A> {
+    fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
+        Self::sink(self.0.write_entry(entry))
+    }
+
+    fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
+        Self::sink(self.0.write_data(data))
+    }
+
+    fn finish_entry(&mut self) -> PaxResult<()> {
+        Self::sink(self.0.finish_entry())
+    }
+
+    fn finish(&mut self) -> PaxResult<()> {
+        Self::sink(self.0.finish())
+    }
+
+    fn supports_hardlinks(&self) -> bool {
+        self.0.supports_hardlinks()
+    }
+
+    fn needs_data_checksum(&self) -> bool {
+        self.0.needs_data_checksum()
+    }
+
+    fn hardlinks_may_carry_data(&self) -> bool {
+        self.0.hardlinks_may_carry_data()
+    }
+
+    fn supports_sockets(&self) -> bool {
+        self.0.supports_sockets()
     }
 }
 
@@ -137,14 +260,11 @@ pub fn create_archive<W: Write>(
 /// it has to be. Everything under it is not.
 fn write_files<W: ArchiveWriter>(
     archive: &mut W,
-    files: &[PathBuf],
-    options: &WriteOptions,
+    files: &mut FileNames<'_>,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
-    let prompter = if options.interactive {
-        Some(InteractivePrompter::new()?)
-    } else {
-        None
-    };
+    let prompter = options.prompter.take();
+    let options = &*options;
 
     let walk = WriteWalk {
         archive: RefCell::new(archive),
@@ -157,12 +277,9 @@ fn write_files<W: ArchiveWriter>(
 
     for path in files {
         let _ = ftw::traverse_directory(
-            path,
+            &path,
             |entry| walk.visit(entry),
-            |_, _| {
-                walk.dev_stack.borrow_mut().pop();
-                Ok(())
-            },
+            |entry, exit| walk.leave_directory(&entry, exit),
             |entry, err| crate::error::report_error(entry.path().as_inner(), err.inner()),
             ftw::TraverseDirectoryOpts {
                 follow_symlinks_on_args: options.cli_dereference,
@@ -196,9 +313,9 @@ struct WriteWalk<'a, W: ArchiveWriter> {
     archive: RefCell<&'a mut W>,
     link_tracker: RefCell<HardLinkTracker>,
     prompter: RefCell<Option<InteractivePrompter>>,
-    /// `st_dev` of each directory descended into, for `-X`. Per parent rather
-    /// than per operand: `-X` stops pax crossing *a* mount point, not just the
-    /// one the operand sits on.
+    /// `st_dev` of each directory descended into. The first is the operand's,
+    /// which is what `-X` compares against; an empty stack means the walk is
+    /// at an operand.
     dev_stack: RefCell<Vec<u64>>,
     /// Set by a failure that must stop the walk rather than skip a file.
     fatal: RefCell<Option<PaxError>>,
@@ -219,7 +336,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
         // and before any stat. Declining to descend takes the whole subtree.
         if matches_excluded(
             &self.options.exclude_patterns,
-            crate::rawpath::MatchName::of(path).as_str(),
+            crate::rawpath::as_bytes(path),
         ) {
             return Ok(false);
         }
@@ -230,6 +347,14 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             // stat, which it does not do inside the handler.
             return Ok(false);
         };
+
+        if self.options.archive_files.contains(metadata) {
+            crate::error::report_warning(
+                path,
+                gettextrs::gettext("file is the archive; not dumped"),
+            );
+            return Ok(false);
+        }
 
         // -L, and -H on an operand, ask for the *target*, not the link. ftw
         // falls back to the link's own metadata when the target cannot be
@@ -247,16 +372,6 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             return Ok(false);
         }
 
-        // -X: a directory on a different filesystem from its parent is not
-        // descended and not archived.
-        if self.options.one_file_system {
-            if let Some(&parent_dev) = self.dev_stack.borrow().last() {
-                if metadata.dev() != parent_dev {
-                    return Ok(false);
-                }
-            }
-        }
-
         match self.archive_entry(&entry, path, metadata) {
             Ok(descend) => Ok(descend),
             Err(e) if crate::modes::is_fatal(&e) => {
@@ -272,21 +387,42 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
         }
     }
 
+    /// Undo what `descend` did, once the walk is done with a directory, and
+    /// for -t put back the access time reading it disturbed.
+    fn leave_directory(&self, entry: &ftw::Entry<'_>, exit: ftw::DirExit) -> Result<(), ()> {
+        self.dev_stack.borrow_mut().pop();
+        if self.options.reset_atime && exit == ftw::DirExit::Descended {
+            crate::modes::anchored::restore_dir_atime(entry);
+        }
+        Ok(())
+    }
+
+    /// Whether to walk into a directory, recording its device for `-X` when so.
+    ///
+    /// `-X` is decided here and nowhere else: a directory on another device
+    /// is archived like any other and only its contents are left out.
+    fn descend(&self, metadata: &ftw::Metadata) -> bool {
+        let operand_dev = self.dev_stack.borrow().first().copied();
+        if self.options.no_recurse
+            || !crate::modes::may_descend(self.options.one_file_system, operand_dev, metadata.dev())
+        {
+            return false;
+        }
+        self.dev_stack.borrow_mut().push(metadata.dev());
+        true
+    }
+
     fn archive_entry(
         &self,
         entry: &ftw::Entry<'_>,
         path: &Path,
         metadata: &ftw::Metadata,
     ) -> PaxResult<bool> {
-        // Apply substitutions first (per POSIX: -s applies before -i)
-        let archive_path = if !self.options.substitutions.is_empty() {
-            match apply_substitutions(&self.options.substitutions, path) {
-                SubstResult::Unchanged => path.to_path_buf(),
-                SubstResult::Changed(new_path) => crate::rawpath::from_substituted(&new_path),
-                SubstResult::Empty => return Ok(false), // Skip this file
-            }
-        } else {
-            path.to_path_buf()
+        // Apply substitutions first (per POSIX: -s applies before -i). A name
+        // that becomes empty is ignored -- that name only: a directory's
+        // descendants are still archived, each under its own substitution.
+        let Some(archive_path) = substitute_name(&self.options.substitutions, path) else {
+            return Ok(metadata.is_dir() && self.descend(metadata));
         };
 
         // Handle interactive rename
@@ -294,7 +430,9 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             let mut prompter = self.prompter.borrow_mut();
             if let Some(ref mut p) = *prompter {
                 match p.prompt(&archive_path)? {
-                    RenameResult::Skip => return Ok(false),
+                    // POSIX: "the file ... shall be skipped" -- that name
+                    // alone, as with an empty -s replacement.
+                    RenameResult::Skip => return Ok(metadata.is_dir() && self.descend(metadata)),
                     RenameResult::UseOriginal => archive_path,
                     RenameResult::Rename(new_path) => new_path,
                 }
@@ -329,15 +467,14 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
 
         if metadata.is_dir() {
             if !up_to_date {
-                let dir_entry = build_entry(&archive_path, metadata, EntryType::Directory)?;
-                archive.write_entry(&dir_entry)?;
-                archive.finish_entry()?;
+                // A header the format refuses (a time before 1970 in ustar,
+                // say) loses this entry, not everything below it.
+                match write_dir_entry(archive, &archive_path, metadata) {
+                    Err(e) if !crate::modes::is_fatal(&e) => crate::error::report_error(path, e),
+                    r => r?,
+                }
             }
-            if self.options.no_recurse {
-                return Ok(false);
-            }
-            self.dev_stack.borrow_mut().push(metadata.dev());
-            return Ok(true);
+            return Ok(self.descend(metadata));
         }
 
         if metadata.is_symlink() {
@@ -363,11 +500,22 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             // Block and character devices, FIFOs and sockets are archived from
             // their metadata; none of them is ever opened, so a FIFO with no
             // writer cannot block the walk.
-            write_special(archive, &archive_path, metadata)?;
+            write_special(archive, &archive_path, metadata, self.options)?;
         }
 
         Ok(false)
     }
+}
+
+/// Write a directory's header.
+fn write_dir_entry<W: ArchiveWriter>(
+    archive: &mut W,
+    archive_path: &Path,
+    metadata: &ftw::Metadata,
+) -> PaxResult<()> {
+    let dir_entry = build_entry(archive_path, metadata, EntryType::Directory)?;
+    archive.write_entry(&dir_entry)?;
+    archive.finish_entry()
 }
 
 /// Write a symlink
@@ -406,6 +554,7 @@ fn write_special<W: ArchiveWriter>(
     archive: &mut W,
     path: &Path,
     metadata: &ftw::Metadata,
+    options: &WriteOptions,
 ) -> PaxResult<()> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -417,6 +566,23 @@ fn write_special<W: ArchiveWriter>(
     } else if file_type.is_fifo() {
         EntryType::Fifo
     } else if file_type.is_socket() {
+        // POSIX: "Attempts to archive a socket shall produce a diagnostic
+        // message when ustar interchange format is used". The pax format has
+        // no socket type either; recording one as an empty regular file
+        // would extract something the file never was.
+        if !archive.supports_sockets() {
+            // tar's front-end follows GNU tar and bsdtar: a warning, and the
+            // run still succeeds.
+            if options.ignore_sockets {
+                crate::error::report_warning(path, gettextrs::gettext("socket ignored"));
+            } else {
+                crate::error::report_error(
+                    path,
+                    gettextrs::gettext("socket not archived: the format has no socket type"),
+                );
+            }
+            return Ok(());
+        }
         EntryType::Socket
     } else {
         crate::error::report_error(path, gettextrs::gettext("unsupported file type"));
@@ -435,6 +601,7 @@ fn write_special<W: ArchiveWriter>(
     _archive: &mut W,
     path: &Path,
     _metadata: &ftw::Metadata,
+    _options: &WriteOptions,
 ) -> PaxResult<()> {
     eprintln!(
         "pax: {}: special files not supported on this platform",
@@ -454,14 +621,6 @@ fn write_file<W: ArchiveWriter>(
 ) -> PaxResult<()> {
     let src_path = entry_ref.path();
     let src_path = src_path.as_inner();
-    // Save access time if we need to reset it after reading
-    #[cfg(unix)]
-    let original_atime = if options.reset_atime {
-        Some((metadata.atime(), metadata.atime_nsec()))
-    } else {
-        None
-    };
-
     let mut entry = build_entry(archive_path, metadata, EntryType::Regular)?;
     // But use src_path for hard link tracking (dev/ino)
     entry.dev = {
@@ -496,7 +655,20 @@ fn write_file<W: ArchiveWriter>(
     };
 
     // Check for hard link
-    if let Some(original_path) = link_tracker.check(&entry) {
+    let original = link_tracker.lookup(entry.dev, entry.ino, entry.nlink);
+    let later_name = original.is_some();
+    if let Some(original_path) = original {
+        // The same file met again under the very name it was first archived
+        // as (`pax -w f f`, or `find tree | pax -w` reaching it from both the
+        // list and the walk), however spelled: `./h/a` and `h/a` are one name.
+        // "f == f" extracts by unlinking f and then failing to link it, and
+        // archiving the data again would split f from any other name linked
+        // to it in between. The earlier member already says everything this
+        // one could.
+        if crate::rawpath::same_name(&original_path, &entry.path) {
+            return Ok(());
+        }
+
         // Only claim the link in formats that can express one. cpio cannot, so
         // recording the type there would degrade the member to a regular file
         // -- and combined with the size=0 below, to an empty one.
@@ -506,11 +678,12 @@ fn write_file<W: ArchiveWriter>(
             entry.link_target = Some(original_path);
         }
 
-        // Per POSIX: -o linkdata means write file contents for each hard link.
         // By default a hard link has size=0 and no data -- but only where the
         // format records the linkage, otherwise the contents are the only copy
-        // of the data this member will ever have.
-        if linkable && !options.format_options.link_data {
+        // of the data this member will ever have. `-o linkdata` asks for the
+        // contents with every link, which only the pax format can carry.
+        let with_data = options.format_options.link_data && archive.hardlinks_may_carry_data();
+        if linkable && !with_data {
             entry.size = 0;
             archive.write_entry(&entry)?;
             archive.finish_entry()?;
@@ -523,15 +696,10 @@ fn write_file<W: ArchiveWriter>(
     // and re-checked against the (dev, ino) the walk saw. What this replaced
     // resolved the whole pathname again -- twice over, for the cpio "crc"
     // format, which needs the contents summed before the header goes out.
-    //
-    // Whether the walk dereferenced this entry is directly observable: the
-    // name is a symbolic link but the metadata is not, so -H/-L policy stays
-    // in the traversal options and is not decided a second time here.
-    let followed = entry_ref.is_symlink() == Some(true) && !metadata.is_symlink();
     let mut file = crate::modes::anchored::open_source_file(
         entry_ref.dir_fd(),
         entry_ref.file_name(),
-        followed,
+        crate::modes::followed_link(entry_ref, metadata),
         (metadata.dev(), metadata.ino()),
     )?;
 
@@ -551,11 +719,13 @@ fn write_file<W: ArchiveWriter>(
     // Held open past the copy so -t can stamp the descriptor below.
 
     archive.finish_entry()?;
+    // Only now is there a member for a later name of this file to link to.
+    if !later_name {
+        link_tracker.record(entry.dev, entry.ino, entry.nlink, &entry.path);
+    }
 
-    // Reset access time if requested
-    #[cfg(unix)]
-    if let Some((atime_sec, atime_nsec)) = original_atime {
-        reset_atime(&file, src_path, atime_sec, atime_nsec);
+    if options.reset_atime {
+        crate::modes::anchored::restore_atime(file.as_fd(), src_path, metadata);
     }
 
     Ok(())
@@ -587,12 +757,18 @@ fn file_checksum(file: &mut File) -> PaxResult<u32> {
 ///
 /// So the read is truncated if the file grew and zero-padded if it shrank, which
 /// is what GNU tar does ("File shrank by N bytes; padding with zeros"), and the
-/// exit status records that the archive does not match what was on disk. The
-/// bound also has to come from `size` rather than from end-of-file: waiting for a
-/// shrinking file to deliver bytes it no longer has is how CVE-2018-20482 turned
-/// into an infinite loop.
-fn copy_file_data<W: ArchiveWriter>(
-    file: &mut File,
+/// exit status records that the archive does not match what was on disk. A read
+/// error part-way through is the same case: it is the file's failure, reported
+/// against the file, and the member is still padded out to its declared size --
+/// stopping short would leave the next header inside this member's data area,
+/// where no reader would find it or anything after it. The bound also has to
+/// come from `size` rather than from end-of-file: waiting for a shrinking file
+/// to deliver bytes it no longer has is how CVE-2018-20482 turned into an
+/// infinite loop.
+///
+/// Only an error from `archive` is returned; one from `file` is reported here.
+fn copy_file_data<R: Read, W: ArchiveWriter>(
+    file: &mut R,
     archive: &mut W,
     size: u64,
     path: &Path,
@@ -602,34 +778,53 @@ fn copy_file_data<W: ArchiveWriter>(
 
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
-        let n = file.read(&mut buf[..want])?;
-        if n == 0 {
-            break;
-        }
+        let n = match read_retrying(file, &mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                crate::error::report_error(
+                    path,
+                    format!("{e}; padding {remaining} bytes with zeros"),
+                );
+                return pad_with_zeros(archive, remaining);
+            }
+        };
         archive.write_data(&buf[..n])?;
         remaining -= n as u64;
     }
 
     if remaining > 0 {
-        eprintln!(
-            "pax: {}: File shrank by {} bytes; padding with zeros",
-            path.display(),
-            remaining
+        crate::error::report_error(
+            path,
+            format!("File shrank by {remaining} bytes; padding with zeros"),
         );
-        crate::error::note_error();
-
-        let zeros = [0u8; 8192];
-        while remaining > 0 {
-            let n = remaining.min(zeros.len() as u64) as usize;
-            archive.write_data(&zeros[..n])?;
-            remaining -= n as u64;
-        }
-    } else if file.read(&mut buf[..1])? != 0 {
+        pad_with_zeros(archive, remaining)?;
+    } else if matches!(read_retrying(file, &mut buf[..1]), Ok(n) if n != 0) {
         // Still more to read than the header promised.
         crate::error::report_error(path, "file changed as we read it");
-        crate::error::note_error();
     }
 
+    Ok(())
+}
+
+/// `read`, retried for as long as it is interrupted by a signal.
+fn read_retrying<R: Read>(file: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match file.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+/// Write `count` zero bytes of member data.
+fn pad_with_zeros<W: ArchiveWriter>(archive: &mut W, mut count: u64) -> PaxResult<()> {
+    let zeros = [0u8; 8192];
+    while count > 0 {
+        let n = count.min(zeros.len() as u64) as usize;
+        archive.write_data(&zeros[..n])?;
+        count -= n as u64;
+    }
     Ok(())
 }
 
@@ -646,13 +841,13 @@ fn build_entry(
         entry.mode = metadata.mode() & 0o7777;
         entry.uid = metadata.uid();
         entry.gid = metadata.gid();
-        entry.mtime = metadata.mtime() as u64;
+        entry.mtime = metadata.mtime();
         // Capture sub-second times so the pax interchange format can record a
         // fractional `mtime`/`atime` (other formats ignore the nsec fields).
         entry.mtime_nsec = metadata.mtime_nsec() as u32;
-        entry.atime = Some(metadata.atime() as u64);
+        entry.atime = Some(metadata.atime());
         entry.atime_nsec = metadata.atime_nsec() as u32;
-        entry.ctime = Some(metadata.ctime() as u64);
+        entry.ctime = Some(metadata.ctime());
         entry.ctime_nsec = metadata.ctime_nsec() as u32;
         entry.dev = metadata.dev();
         entry.ino = metadata.ino();
@@ -677,7 +872,7 @@ fn build_entry(
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+            .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
     }
 
@@ -695,46 +890,132 @@ fn build_entry(
     Ok(entry)
 }
 
-/// Write files to a pre-existing archive writer (for multi-volume support)
+/// Archive files into a pre-existing archive writer and write its trailer (for
+/// multi-volume support)
 pub fn write_files_to_archive<W: ArchiveWriter>(
     archive: &mut W,
-    files: &[PathBuf],
-    _format: ArchiveFormat,
-    options: &WriteOptions,
+    files: &mut FileNames<'_>,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
-    write_files(archive, files, options)
+    write_archive(archive, files, options)
 }
 
-/// Read file list from stdin (one path per line)
-pub fn read_file_list<R: Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
-    read_file_list_sep(reader, b'\n')
-}
-
-/// Read a list of pathnames separated by `sep`.
+/// A list of pathnames for write, append or copy mode: standard input, or a
+/// file named by tar's `-T`, separated by `sep`.
 ///
 /// `sep` is `b'\n'` for the usual `find | pax` pipeline and `b'\0'` for the
 /// `find -print0` pipeline that tar's `--null` and cpio's `-0` select, which is
 /// the only way a pathname containing a newline survives the trip.
-pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>> {
-    use std::io::BufRead;
+///
+/// Nothing is read until [`names`](Self::names) is iterated. A `-T` file is
+/// opened when the command line is parsed, though, so its name is resolved
+/// from the directory the command was invoked in rather than from tar's `-C`.
+#[derive(Debug)]
+pub struct NameList {
+    source: NameSource,
+    sep: u8,
+}
 
-    let mut reader = std::io::BufReader::new(reader);
-    let mut files = Vec::new();
-    let mut buf = Vec::new();
+#[derive(Debug)]
+enum NameSource {
+    Stdin,
+    File(File),
+    Empty,
+}
 
-    loop {
-        buf.clear();
-        if reader.read_until(sep, &mut buf)? == 0 {
-            return Ok(files);
+impl NameList {
+    /// The names on standard input.
+    pub fn stdin(sep: u8) -> Self {
+        NameList {
+            source: NameSource::Stdin,
+            sep,
         }
-        if buf.last() == Some(&sep) {
-            buf.pop();
+    }
+
+    /// The names in an open file.
+    pub fn file(file: File, sep: u8) -> Self {
+        NameList {
+            source: NameSource::File(file),
+            sep,
         }
-        // Keep the name verbatim so pathnames with leading or trailing spaces
-        // survive; skip only a wholly empty entry (e.g. a trailing separator).
-        if !buf.is_empty() {
-            files.push(path_from_bytes(&buf));
+    }
+
+    /// No names at all: what stands in for standard input when a front-end
+    /// is given nothing to archive and must not read it.
+    pub fn empty() -> Self {
+        NameList {
+            source: NameSource::Empty,
+            sep: b'\n',
         }
+    }
+
+    /// Whether the names are read from standard input.
+    pub fn is_stdin(&self) -> bool {
+        matches!(self.source, NameSource::Stdin)
+    }
+
+    /// The names, read one at a time as they are asked for.
+    pub fn names(self) -> NameReader<Box<dyn BufRead>> {
+        let reader: Box<dyn BufRead> = match self.source {
+            NameSource::Stdin => Box::new(std::io::stdin().lock()),
+            NameSource::File(file) => Box::new(std::io::BufReader::new(file)),
+            NameSource::Empty => Box::new(std::io::empty()),
+        };
+        NameReader {
+            reader,
+            sep: self.sep,
+            done: false,
+        }
+    }
+}
+
+/// The pathnames of a [`NameList`], one per `next`.
+///
+/// A name holding a NUL byte -- `find -print0` piped to a list read by lines --
+/// can name no file, since the system interfaces end a pathname at the first
+/// NUL. It is diagnosed here and left out, so the exit status records it and
+/// the rest of the list is still processed, rather than handed on to a walk
+/// that would otherwise act on the prefix before the NUL instead.
+///
+/// A read error ends the list: it is returned once, and nothing follows it.
+pub struct NameReader<R> {
+    reader: R,
+    sep: u8,
+    done: bool,
+}
+
+impl<R: BufRead> Iterator for NameReader<R> {
+    type Item = PaxResult<PathBuf>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = Vec::new();
+        while !self.done {
+            buf.clear();
+            match self.reader.read_until(self.sep, &mut buf) {
+                Ok(0) => self.done = true,
+                Ok(_) => {
+                    if buf.last() == Some(&self.sep) {
+                        buf.pop();
+                    }
+                    // Keep the name verbatim so pathnames with leading or
+                    // trailing spaces survive; skip only a wholly empty entry
+                    // (e.g. a trailing separator).
+                    if buf.contains(&0) {
+                        crate::error::report_error(
+                            &path_from_bytes(std::mem::take(&mut buf)),
+                            gettextrs::gettext("pathname contains a NUL byte"),
+                        );
+                    } else if !buf.is_empty() {
+                        return Some(Ok(path_from_bytes(buf)));
+                    }
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e.into()));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -743,46 +1024,99 @@ pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>
 /// A pathname is bytes, not text, so on unix the bytes are kept exactly --
 /// which is the point of reading the list this way rather than by lines.
 #[cfg(unix)]
-fn path_from_bytes(bytes: &[u8]) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(std::ffi::OsStr::from_bytes(bytes).to_owned())
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
 }
 
 #[cfg(not(unix))]
-fn path_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Restore the access time `-t` recorded, on the file that was actually read.
-///
-/// Stamping goes through the descriptor the data came from rather than by name.
-/// Resolving the name a second time was wrong both ways round: without
-/// `AT_SYMLINK_NOFOLLOW` a name replaced by a symbolic link in between would
-/// redirect the timestamp onto the link's target, and with it, `-L`/`-H` stamped
-/// the link rather than the file whose access time the read had actually
-/// disturbed. A descriptor has neither problem, and `UTIME_OMIT` leaves the
-/// modification time alone instead of reading it back to write it again.
-#[cfg(unix)]
-fn reset_atime(file: &File, path: &Path, atime_sec: i64, atime_nsec: i64) {
-    use std::os::fd::AsRawFd;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let times = [
-        libc::timespec {
-            tv_sec: atime_sec as libc::time_t,
-            tv_nsec: atime_nsec as libc::c_long,
-        },
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-    ];
+    /// Collects member data; fails every call with `fail` once that is set.
+    #[derive(Default)]
+    struct DataSink {
+        data: Vec<u8>,
+        fail: Option<std::io::ErrorKind>,
+    }
 
-    let result = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
-    if result != 0 {
-        eprintln!(
-            "pax: warning: cannot reset atime on {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
+    impl ArchiveWriter for DataSink {
+        fn write_entry(&mut self, _entry: &ArchiveEntry) -> PaxResult<()> {
+            Ok(())
+        }
+
+        fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
+            if let Some(kind) = self.fail {
+                return Err(PaxError::Io(kind.into()));
+            }
+            self.data.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish_entry(&mut self) -> PaxResult<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PaxResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Yields `data`, then fails with EIO.
+    struct FailingReader<'a> {
+        data: &'a [u8],
+    }
+
+    impl Read for FailingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.data.is_empty() {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            let n = buf.len().min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_error_pads_member_to_declared_size() {
+        let mut file = FailingReader {
+            data: &[b'x'; 1000],
+        };
+        let mut sink = DataSink::default();
+        copy_file_data(&mut file, &mut sink, 4000, Path::new("f")).unwrap();
+        assert_eq!(sink.data.len(), 4000);
+        assert!(sink.data[..1000].iter().all(|&b| b == b'x'));
+        assert!(sink.data[1000..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn grown_file_is_cut_to_declared_size() {
+        let mut file: &[u8] = &[b'y'; 5000];
+        let mut sink = DataSink::default();
+        copy_file_data(&mut file, &mut sink, 3000, Path::new("f")).unwrap();
+        assert_eq!(sink.data, vec![b'y'; 3000]);
+    }
+
+    #[test]
+    fn archive_errors_are_archive_write_errors() {
+        // Any I/O error from the archive is fatal, whatever its kind; an error
+        // reading a source file (the test above) is not -- the errno does not
+        // decide, the origin does.
+        let mut inner = DataSink {
+            fail: Some(std::io::ErrorKind::Other),
+            ..Default::default()
+        };
+        let mut sink = ArchiveSink(&mut inner);
+        let mut file: &[u8] = b"abc";
+        let err = copy_file_data(&mut file, &mut sink, 3, Path::new("f")).unwrap_err();
+        assert!(matches!(err, PaxError::ArchiveWrite(_)));
+        assert!(crate::modes::is_fatal(&err));
     }
 }

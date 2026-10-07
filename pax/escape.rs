@@ -125,9 +125,17 @@ pub fn write_bytes<W: Write>(w: &mut W, bytes: &[u8], style: Style) -> io::Resul
 /// This does not touch the exit status. `report_error` flags the run; `-s ...p`
 /// reports a successful substitution and must not.
 pub fn write_stderr_line(line: &[u8]) {
-    let mut out = Vec::with_capacity(line.len() + 1);
+    write_stderr_line_then(line, "");
+}
+
+/// [`write_stderr_line`], followed in the same write by `trusted`: pax's own
+/// text, complete lines, which goes out unescaped so its line breaks stay
+/// line breaks.
+pub fn write_stderr_line_then(line: &[u8], trusted: &str) {
+    let mut out = Vec::with_capacity(line.len() + 1 + trusted.len());
     push_escaped(&mut out, line, stderr_style());
     out.push(b'\n');
+    out.extend_from_slice(trusted.as_bytes());
     let stderr = io::stderr();
     let mut lock = stderr.lock();
     let _ = lock.write_all(&out);

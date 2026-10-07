@@ -18,6 +18,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 pub enum PaxError {
     /// I/O error
     Io(io::Error),
+    /// Writing the archive itself failed. Unlike an `Io` error on a file being
+    /// archived, this is not about any one member and will recur for every one
+    /// after it, so it ends the run.
+    ArchiveWrite(io::Error),
+    /// Writing member contents to standard output (`-O`) failed. The stream is
+    /// shared by every member, so this too ends the run.
+    StdoutWrite(io::Error),
     /// Invalid archive format
     InvalidFormat(String),
     /// Invalid header field
@@ -26,8 +33,14 @@ pub enum PaxError {
     PathTooLong(String),
     /// Pattern matching error
     PatternError(String),
-    /// Malformed command line: the message is already a complete diagnostic
-    Usage(String),
+    /// Malformed command line: the message is already a complete diagnostic.
+    /// With a program name, `main` follows it with a line pointing at that
+    /// program's `--help`.
+    Usage(String, Option<&'static str>),
+    /// End of file on `/dev/tty` while `-i` was waiting for a response.
+    /// POSIX: pax "shall immediately exit with a non-zero exit status", so it
+    /// ends the run wherever it arises.
+    TtyEof,
     /// Nothing left to do and nothing went wrong -- `--help` and `--version`
     /// have already written their output and want a success exit.
     EarlyExit,
@@ -41,13 +54,18 @@ impl fmt::Display for PaxError {
         use gettextrs::gettext;
         match self {
             PaxError::Io(e) => write!(f, "{}: {}", gettext("I/O error"), e),
+            PaxError::ArchiveWrite(e) => write!(f, "{}: {}", gettext("error writing archive"), e),
+            PaxError::StdoutWrite(e) => {
+                write!(f, "{}: {}", gettext("error writing standard output"), e)
+            }
             PaxError::InvalidFormat(msg) => {
                 write!(f, "{}: {}", gettext("Invalid archive format"), msg)
             }
             PaxError::InvalidHeader(msg) => write!(f, "{}: {}", gettext("Invalid header"), msg),
             PaxError::PathTooLong(path) => write!(f, "{}: {}", gettext("Path too long"), path),
             PaxError::PatternError(msg) => write!(f, "{}: {}", gettext("Pattern error"), msg),
-            PaxError::Usage(msg) => write!(f, "{}", msg),
+            PaxError::Usage(msg, _) => write!(f, "{}", msg),
+            PaxError::TtyEof => write!(f, "{}", gettext("EOF on /dev/tty")),
             PaxError::EarlyExit => Ok(()),
         }
     }
@@ -56,7 +74,7 @@ impl fmt::Display for PaxError {
 impl std::error::Error for PaxError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            PaxError::Io(e) => Some(e),
+            PaxError::Io(e) | PaxError::ArchiveWrite(e) | PaxError::StdoutWrite(e) => Some(e),
             _ => None,
         }
     }
@@ -70,17 +88,6 @@ impl From<io::Error> for PaxError {
 
 /// Result type for pax operations
 pub type PaxResult<T> = Result<T, PaxError>;
-
-/// Check if a PaxError represents end-of-file
-///
-/// This is preferred over string matching on error messages,
-/// which is fragile across different platforms and Rust versions.
-pub fn is_eof_error(error: &PaxError) -> bool {
-    match error {
-        PaxError::Io(e) => e.kind() == io::ErrorKind::UnexpectedEof,
-        _ => false,
-    }
-}
 
 /// Process-wide "an error occurred" flag. Per POSIX CONSEQUENCES OF ERRORS, a
 /// per-file failure (or an unmatched pattern/operand) shall be diagnosed and a
@@ -193,10 +200,41 @@ impl<'a> From<&'a String> for Subject<'a> {
 /// carries a pathname, so one rule with no exceptions is the only one that
 /// cannot be got wrong later.
 pub fn report_error<'a>(context: impl Into<Subject<'a>>, err: impl fmt::Display) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
+    write_diagnostic(context.into(), err);
+    note_error();
+}
+
+/// Write a diagnostic in the same form as [`report_error`], for something
+/// worth saying that is not a failure: the exit status is left alone.
+pub fn report_warning<'a>(context: impl Into<Subject<'a>>, err: impl fmt::Display) {
+    write_diagnostic(context.into(), err);
+}
+
+/// Set while [`quietly`] runs.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Run `f` with [`report_error`] silenced, neither writing nor failing the run.
+///
+/// For reading an archive only to learn something about it -- where append
+/// mode is to write -- with the reader `pax -r` uses. What that reader says
+/// about a member it could not extract is about extraction, and append
+/// extracts nothing. pax is single-threaded, so the flag is not shared with
+/// work that wants its diagnostics.
+pub fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    QUIET.store(true, Ordering::Relaxed);
+    let result = f();
+    QUIET.store(false, Ordering::Relaxed);
+    result
+}
+
+fn write_diagnostic(context: Subject<'_>, err: impl fmt::Display) {
     let mut line = Vec::new();
     line.extend_from_slice(program_name().as_bytes());
     line.extend_from_slice(b": ");
-    match context.into() {
+    match context {
         Subject::Path(p) => line.extend_from_slice(crate::rawpath::as_bytes(p)),
         Subject::Text(t) => line.extend_from_slice(t.as_bytes()),
         Subject::Owned(t) => line.extend_from_slice(t.as_bytes()),
@@ -205,5 +243,4 @@ pub fn report_error<'a>(context: impl Into<Subject<'a>>, err: impl fmt::Display)
     let _ = write!(line, "{}", err);
 
     crate::escape::write_stderr_line(&line);
-    note_error();
 }

@@ -35,8 +35,7 @@
 //! ```
 
 use ffi::{
-    regcomp, regerror, regexec, regfree, RegMatchT, RegexT, REG_EXTENDED, REG_ICASE, REG_NOMATCH,
-    REG_NOTBOL,
+    regcomp, regerror, regexec, regfree, RegMatchT, RegexT, REG_EXTENDED, REG_ICASE, REG_NOTBOL,
 };
 use std::ffi::{c_char, c_int, CString};
 use std::io::{Error, ErrorKind};
@@ -47,7 +46,7 @@ use std::ptr;
 mod ffi {
     pub use libc::{
         regcomp, regerror, regex_t as RegexT, regexec, regfree, regmatch_t as RegMatchT,
-        REG_EXTENDED, REG_ICASE, REG_NOMATCH, REG_NOTBOL,
+        REG_EXTENDED, REG_ICASE, REG_NOTBOL,
     };
 }
 
@@ -79,7 +78,6 @@ mod ffi {
     pub const REG_EXTENDED: c_int = 1;
     pub const REG_ICASE: c_int = 2;
     pub const REG_NOTBOL: c_int = 1;
-    pub const REG_NOMATCH: c_int = 1;
 
     extern "C" {
         #[link_name = "plib_regcomp"]
@@ -102,6 +100,14 @@ mod ffi {
             errbuf_size: usize,
         ) -> usize;
     }
+}
+
+/// Whether `regexec` returned a match. Anything but 0 is none: `REG_NOMATCH`,
+/// or an error -- macOS's `REG_ILLSEQ` for text that is not valid in the
+/// locale's encoding -- which leaves the match offsets unset. Taking an error
+/// for a match made it an empty one at the start of the text.
+fn matched(result: c_int) -> bool {
+    result == 0
 }
 
 /// Maximum number of capture groups supported
@@ -341,7 +347,7 @@ impl Regex {
 
         let result = unsafe { regexec(&self.raw, c_text.as_ptr(), 0, ptr::null_mut(), 0) };
 
-        result != REG_NOMATCH
+        matched(result)
     }
 
     /// Find the first match in the input string.
@@ -379,7 +385,7 @@ impl Regex {
             )
         };
 
-        if result == REG_NOMATCH || pmatch.rm_so < 0 {
+        if !matched(result) || pmatch.rm_so < 0 {
             return None;
         }
 
@@ -417,7 +423,7 @@ impl Regex {
             )
         };
 
-        if result == REG_NOMATCH || pmatch.rm_so < 0 {
+        if !matched(result) || pmatch.rm_so < 0 {
             return None;
         }
 
@@ -466,7 +472,7 @@ impl Regex {
             )
         };
 
-        if result == REG_NOMATCH {
+        if !matched(result) {
             return None;
         }
 
@@ -506,6 +512,22 @@ impl Regex {
 
     /// As [`Regex::captures_at`], over bytes.
     pub fn captures_at_bytes(&self, text: &[u8], offset: usize) -> Option<Vec<Match>> {
+        self.captures_at_bytes_notbol(text, offset, offset > 0)
+    }
+
+    /// As [`Regex::captures_at_bytes`], with the caller saying whether
+    /// `offset` is not the beginning of a line (`not_bol`), so `^` must not
+    /// match there.
+    ///
+    /// A caller that rewrites `text` as it goes needs this: once a
+    /// replacement at the start has been made, offset 0 of the new text is no
+    /// longer the beginning of the original line.
+    pub fn captures_at_bytes_notbol(
+        &self,
+        text: &[u8],
+        offset: usize,
+        not_bol: bool,
+    ) -> Option<Vec<Match>> {
         if offset > text.len() {
             return None;
         }
@@ -518,11 +540,9 @@ impl Regex {
 
         let mut pmatch: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
 
-        // Past the start of `text`, the substring's first byte is not the
-        // beginning of a line, so `^` must not match there.  Without
-        // REG_NOTBOL a global substitute re-anchors `^` at every restart:
-        // `s/^/> /g` on "abc" produced "> a> b> c> ".
-        let flags = if offset == 0 { 0 } else { REG_NOTBOL };
+        // Without REG_NOTBOL a global substitute re-anchors `^` at every
+        // restart: `s/^/> /g` on "abc" produced "> a> b> c> ".
+        let flags = if not_bol { REG_NOTBOL } else { 0 };
 
         let result = unsafe {
             regexec(
@@ -534,7 +554,7 @@ impl Regex {
             )
         };
 
-        if result == REG_NOMATCH {
+        if !matched(result) {
             return None;
         }
 
@@ -925,6 +945,17 @@ mod tests {
     }
 
     /// `$` is unaffected: the substring really does end where the text ends.
+    #[test]
+    fn test_captures_at_bytes_notbol_follows_the_caller() {
+        // Text rewritten in place: offset 0 is no longer the start of a line
+        // once a replacement has been made there.
+        let re = Regex::new("^a", RegexFlags::bre()).unwrap();
+        assert!(re.captures_at_bytes_notbol(b"ab", 0, false).is_some());
+        assert!(re.captures_at_bytes_notbol(b"ab", 0, true).is_none());
+        let caret = Regex::new("^", RegexFlags::bre()).unwrap();
+        assert!(caret.captures_at_bytes_notbol(b"ab", 1, false).is_some());
+    }
+
     #[test]
     fn test_captures_at_still_matches_eol() {
         let re = Regex::new("$", RegexFlags::bre()).unwrap();

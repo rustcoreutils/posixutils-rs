@@ -13,7 +13,7 @@
 
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
@@ -273,5 +273,100 @@ fn find_printf_flushed_before_exec() {
         ],
     );
     assert_eq!((out, code), (b"XY sub/b\n".to_vec(), 0));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A package-like staging tree for the GNU tests and operators debhelper
+/// passes (dh_fixperms, dh_compress, dh_md5sums, dh_shlibdeps, dh_install):
+///
+/// ```text
+/// exe (0755, 10 B)  ux (0100, 1 B)  plain (0644, empty)
+/// four (4096 B)  fourplus (4097 B)  big (5000 B)
+/// emptydir/  DEBIAN/control
+/// doc/pkg/README  doc/pkg/Notes.HTML  doc/pkg/examples/ex.txt
+/// link -> exe   dangling -> nowhere
+/// ```
+fn make_pkg_tree(tag: &str) -> PathBuf {
+    let dir = scratch_dir(tag);
+    let file = |name: &str, len: usize, mode: u32| {
+        let p = dir.join(name);
+        fs::write(&p, vec![b'x'; len]).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    fs::create_dir_all(dir.join("emptydir")).unwrap();
+    fs::create_dir_all(dir.join("DEBIAN")).unwrap();
+    fs::create_dir_all(dir.join("doc/pkg/examples")).unwrap();
+    file("exe", 10, 0o755);
+    file("ux", 1, 0o100);
+    file("plain", 0, 0o644);
+    file("four", 4096, 0o644);
+    file("fourplus", 4097, 0o644);
+    file("big", 5000, 0o644);
+    file("DEBIAN/control", 1, 0o644);
+    file("doc/pkg/README", 1, 0o644);
+    file("doc/pkg/Notes.HTML", 1, 0o644);
+    file("doc/pkg/examples/ex.txt", 1, 0o644);
+    symlink("exe", dir.join("link")).unwrap();
+    symlink("nowhere", dir.join("dangling")).unwrap();
+    dir
+}
+
+/// Run find in `dir` and expect the sorted output lines, no diagnostics and a
+/// zero exit status.
+fn expect_lines(dir: &Path, args: &[&str], expected: &[&str]) {
+    let (out, err, code) = find_in(dir, args);
+    let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(
+        (sorted_lines(&out), err.as_str(), code),
+        (want, "", 0),
+        "find {args:?}"
+    );
+}
+
+/// `-true` and `-false`. dh_fixperms passes `-a -true` around every chmod
+/// walk (with find's stderr sent to /dev/null, so a rejection silently left
+/// permissions unfixed); dh_compress prunes with `-prune -false`.
+#[test]
+fn find_true_false() {
+    let dir = make_pkg_tree("true_false");
+    expect_lines(&dir, &["-name", "plain", "-true"], &["./plain"]);
+    expect_lines(&dir, &["-false"], &[]);
+    expect_lines(
+        &dir,
+        &["-name", "plain", "-false", "-o", "-name", "exe"],
+        &["./exe"],
+    );
+    // dh_fixperms: `find DIR EXPR -a -true -a -true -print0`
+    let (out, err, code) = find_in(
+        &dir,
+        &[".", "-name", "exe", "-a", "-true", "-a", "-true", "-print0"],
+    );
+    assert_eq!((out, err.as_str(), code), (b"./exe\0".to_vec(), "", 0));
+    // dh_compress: the pruned examples directory yields nothing.
+    expect_lines(
+        &dir,
+        &[
+            "doc",
+            "(",
+            "-type",
+            "d",
+            "(",
+            "-name",
+            "_sources",
+            "-o",
+            "-path",
+            "doc/pkg/examples",
+            ")",
+            "-prune",
+            "-false",
+            ")",
+            "-o",
+            "-type",
+            "f",
+            "-print",
+        ],
+        &["doc/pkg/README", "doc/pkg/Notes.HTML"],
+    );
     fs::remove_dir_all(&dir).unwrap();
 }

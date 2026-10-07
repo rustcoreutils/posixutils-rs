@@ -188,6 +188,9 @@ enum Primary {
     Newer(SystemTime),
     NoUser,
     NoGroup,
+    /// `-true` / `-false`: GNU extensions, forced by debhelper (dh_fixperms,
+    /// dh_compress)
+    Const(bool),
 
     // Actions
     Print,
@@ -541,6 +544,8 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
             Ok(Expr::Primary(Primary::Newer(mtime)))
         }
         "-nouser" => Ok(Expr::Primary(Primary::NoUser)),
+        "-true" => Ok(Expr::Primary(Primary::Const(true))),
+        "-false" => Ok(Expr::Primary(Primary::Const(false))),
         "-nogroup" => Ok(Expr::Primary(Primary::NoGroup)),
         "-print" => Ok(Expr::Primary(Primary::Print)),
         "-print0" => Ok(Expr::Primary(Primary::Print0)),
@@ -994,6 +999,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                 EvalResult::new(false)
             }
         }
+        Primary::Const(value) => EvalResult::new(*value),
         Primary::NoUser => {
             let uid = ctx.metadata.uid();
             EvalResult::new(plib::user::get_by_uid(uid).is_none())

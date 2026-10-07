@@ -252,6 +252,9 @@ but no daemon to run them.  Behavior follows Vixie cron:
    and `%%` and the escapes `\n`, `\\` and `\NNN` (octal, so `\0` is NUL).
    Any other directive or escape is an error.  Forced by debhelper
    (`dh_autoreconf`, `dh_installdeb`, `dh_md5sums`, `dh_installgsettings`).
+ * `-true` / `-false` — primaries that are always true / always false.
+   Forced by debhelper (`dh_fixperms` joins every walk with `-a -true`,
+   `dh_compress` prunes with `-prune -false`).
 
 ### gettext / ngettext
 

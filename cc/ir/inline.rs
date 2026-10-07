@@ -60,7 +60,6 @@ const HARD_CALLER_SIZE_CAP: usize = 5000;
 /// LLVM uses 1024 bytes. We match that value.
 const RECURSIVE_CALLER_MAX_STACK: usize = 1024;
 
-const DEFAULT_CANDIDATE_CAPACITY: usize = 16;
 const DEFAULT_REMAP_CAPACITY: usize = 64;
 const DEFAULT_ORDER_CAPACITY: usize = 16;
 
@@ -1724,97 +1723,9 @@ fn remove_tables_of_dead_labels(module: &mut Module, mut dead: HashSet<String>) 
 }
 
 /// Every function name something in the module still refers to.
-///
-/// Missing a kind of reference here deletes a live function, so this errs
-/// toward keeping: an identifier that merely *looks* like a function name in
-/// an assembly template counts.
 fn collect_referenced_functions(module: &Module) -> HashSet<String> {
     let func_names: HashSet<String> = module.functions.iter().map(|f| f.name.clone()).collect();
-    let mut referenced: HashSet<String> = HashSet::with_capacity(DEFAULT_CANDIDATE_CAPACITY);
-
-    for func in &module.functions {
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                match insn.op {
-                    // A direct call. An indirect one is named `<indirect>`,
-                    // so it cannot collide with a real function.
-                    Opcode::Call => {
-                        if let Some(name) = &insn.extra().func_name {
-                            if func_names.contains(name) {
-                                referenced.insert(name.clone());
-                            }
-                        }
-                    }
-                    // The funnel for every way an address is taken: `&f`,
-                    // `f` as an argument, `f == f`, a function-pointer
-                    // assignment -- and an `"i"`/`"s"` asm operand until
-                    // `asm_operand::resolve_immediates` names the function's
-                    // `Sym` directly, which the asm arm below counts.
-                    Opcode::SymAddr => {
-                        if let Some(src) = insn.src.first() {
-                            if let Some(name) = func.global_sym_name(*src) {
-                                if func_names.contains(name) {
-                                    referenced.insert(name.to_string());
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                // A name written into the assembly text itself -- `asm("call
-                // foo")` -- reaches the assembler with no IR reference at all.
-                if let Some(ref asm) = insn.extra().asm_data {
-                    collect_names_in_asm(&asm.template, &func_names, &mut referenced);
-                    for operand in &asm.inputs {
-                        if let Some(name) = func.global_sym_name(operand.pseudo) {
-                            if func_names.contains(name) {
-                                referenced.insert(name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // A function pointer in a global's initializer, e.g.
-    // `static const struct { fn_t f; } table[] = { { my_func }, ... }`.
-    for global in &module.globals {
-        collect_func_refs_from_initializer(&global.init, &func_names, &mut referenced);
-    }
-
-    // `__attribute__((alias))`: the `.set` the backend writes names the
-    // target, and a static function reached only through its alias -- the
-    // usual way to export an internal implementation under a public name --
-    // has no other reference at all.
-    for alias in &module.aliases {
-        if func_names.contains(&alias.target) {
-            referenced.insert(alias.target.clone());
-        }
-    }
-
-    referenced
-}
-
-/// Identifier-shaped words in an assembly template that name a function.
-fn collect_names_in_asm(
-    template: &str,
-    func_names: &HashSet<String>,
-    referenced: &mut HashSet<String>,
-) {
-    let mut word = String::new();
-    for ch in template.chars().chain(std::iter::once(' ')) {
-        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
-            word.push(ch);
-            continue;
-        }
-        if !word.is_empty() {
-            if func_names.contains(&word) {
-                referenced.insert(word.clone());
-            }
-            word.clear();
-        }
-    }
+    module.referenced_symbols(&func_names)
 }
 
 #[cfg(test)]

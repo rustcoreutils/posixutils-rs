@@ -423,9 +423,18 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// no definition to hang them on, so they are emitted standalone. Without
     /// this, `extern int f(void) __attribute__((weak));` produced a strong
     /// reference and an absent `f` was a link error rather than a null pointer.
+    ///
+    /// Only for a symbol the unit refers to, as gcc does. A directive on a
+    /// name nothing uses still enters it in the symbol table as undefined,
+    /// and an undefined *hidden* symbol is a hard link error even unused:
+    /// perl declares `Perl_do_exec` hidden everywhere and defines it nowhere.
     pub fn emit_declared_symbol_attrs(&mut self, module: &Module) {
+        let declared: std::collections::HashSet<String> =
+            module.declared_symbol_attrs.keys().cloned().collect();
+        let referenced = module.referenced_symbols(&declared);
         for (name, attrs) in &module.declared_symbol_attrs {
-            if module.functions.iter().any(|f| f.name == *name)
+            if !referenced.contains(name)
+                || module.functions.iter().any(|f| f.name == *name)
                 || module.globals.iter().any(|g| g.name == *name)
             {
                 continue;

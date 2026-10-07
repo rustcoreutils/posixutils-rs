@@ -683,6 +683,34 @@ int main(void) {
     );
 }
 
+/// A program declaring a hidden function and object it never uses, and never
+/// defines, links and runs -- perl's `Perl_do_exec` shape. A hidden one it does
+/// use, defined in the other unit, still resolves.
+#[test]
+fn codegen_unreferenced_hidden_declaration_links() {
+    let unit_a = r#"
+extern int never_defined(void) __attribute__((visibility("hidden")));
+extern int never_defined_var __attribute__((visibility("hidden")));
+extern int helper(void) __attribute__((visibility("hidden")));
+int main(void) { return helper() - 7; }
+"#;
+    let unit_b = r#"
+__attribute__((visibility("hidden"))) int helper(void) { return 7; }
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run_two_units(
+                "codegen_unref_hidden_decl",
+                unit_a,
+                unit_b,
+                &[opt.to_string()]
+            ),
+            0,
+            "{opt}"
+        );
+    }
+}
+
 /// The same declaration shape has to keep working as a program, not just as
 /// assembly -- including the attributes that carry no symbol directive.
 #[test]

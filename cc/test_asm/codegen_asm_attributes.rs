@@ -199,6 +199,42 @@ int main(void) {
     }
 }
 
+/// A declaration's `weak` and visibility reach the assembly only for a symbol
+/// the code refers to. `.hidden f` on a name nothing uses still puts an
+/// undefined hidden `f` in the symbol table, and the linker rejects that
+/// outright: perl's `proto.h` declares `Perl_do_exec` hidden in every unit
+/// and defines it nowhere, so miniperl failed to link with "hidden symbol
+/// `Perl_do_exec' isn't defined".
+#[test]
+fn codegen_unreferenced_declaration_emits_no_symbol_directives() {
+    let src = r#"
+extern int unused_fn(void) __attribute__((visibility("hidden")));
+extern int unused_var __attribute__((visibility("hidden")));
+extern int unused_weak(void) __attribute__((weak));
+extern int used_fn(void) __attribute__((visibility("hidden")));
+extern int used_var __attribute__((visibility("hidden")));
+extern int used_weak(void) __attribute__((weak));
+int f(void) { return used_fn() + used_var + (used_weak ? 1 : 0); }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        for opt in ["-O0", "-O2"] {
+            let asm = asm_for_with("unref_decl_attrs", triple, src, &[opt]);
+            for sym in ["unused_fn", "unused_var", "unused_weak"] {
+                assert!(
+                    !asm.contains(sym),
+                    "{triple} {opt}: unreferenced {sym} reached the assembly:\n{asm}"
+                );
+            }
+            for directive in [".hidden used_fn", ".hidden used_var", ".weak used_weak"] {
+                assert!(
+                    asm.contains(directive),
+                    "{triple} {opt}: missing `{directive}`:\n{asm}"
+                );
+            }
+        }
+    }
+}
+
 /// A zero-initialized definition took the `.comm`/`.bss` fast path, which
 /// returns before the `.weak` and visibility directives are emitted. A common
 /// symbol carries neither, so both were silently lost -- a hidden variable

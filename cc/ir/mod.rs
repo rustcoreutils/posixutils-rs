@@ -4294,6 +4294,85 @@ impl Module {
     }
 }
 
+impl Module {
+    /// The names among `candidates` that something in the module still
+    /// refers to: a direct call, any instruction operand naming the symbol
+    /// (its address taken, a load or store through it), an inline asm
+    /// operand or a name written into an asm template, a global's
+    /// initializer, or the target of an alias.
+    ///
+    /// Missing a kind of reference here deletes a live function, so this
+    /// errs toward keeping: an identifier that merely *looks* like a
+    /// candidate in an assembly template counts.
+    pub fn referenced_symbols(&self, candidates: &HashSet<String>) -> HashSet<String> {
+        let mut referenced = HashSet::new();
+        let mut note = |name: &str| {
+            if candidates.contains(name) {
+                referenced.insert(name.to_string());
+            }
+        };
+        for func in &self.functions {
+            for insn in func.blocks.iter().flat_map(|bb| &bb.insns) {
+                // A direct call. An indirect one is named `<indirect>`, so it
+                // cannot collide with a real symbol.
+                if insn.op == Opcode::Call {
+                    if let Some(name) = &insn.extra().func_name {
+                        note(name);
+                    }
+                }
+                let operands = insn
+                    .src
+                    .iter()
+                    .chain(insn.target.iter())
+                    .chain(insn.phi_list.iter().map(|(_, p)| p));
+                for &p in operands {
+                    if let Some(name) = func.global_sym_name(p) {
+                        note(name);
+                    }
+                }
+                // A name written into the assembly text itself -- `asm("call
+                // foo")` -- reaches the assembler with no IR reference at all.
+                if let Some(ref asm) = insn.extra().asm_data {
+                    for_each_word(&asm.template, &mut note);
+                    for operand in asm.inputs.iter().chain(&asm.outputs) {
+                        if let Some(name) = func.global_sym_name(operand.pseudo) {
+                            note(name);
+                        }
+                    }
+                }
+            }
+        }
+        // A pointer in a global's initializer, e.g.
+        // `static const struct { fn_t f; } table[] = { { my_func }, ... }`.
+        for global in &self.globals {
+            global.init.for_each_symbol(&mut note);
+        }
+        // `__attribute__((alias))`: the `.set` the backend writes names the
+        // target, and a static function reached only through its alias -- the
+        // usual way to export an internal implementation under a public name
+        // -- has no other reference at all.
+        for alias in &self.aliases {
+            note(&alias.target);
+        }
+        referenced
+    }
+}
+
+/// Every identifier-shaped word in an assembly template.
+fn for_each_word(template: &str, f: &mut impl FnMut(&str)) {
+    let mut word = String::new();
+    for ch in template.chars().chain(std::iter::once(' ')) {
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            word.push(ch);
+            continue;
+        }
+        if !word.is_empty() {
+            f(&word);
+            word.clear();
+        }
+    }
+}
+
 /// A `Module` paired with the type table.
 pub struct ModuleDisplay<'a> {
     module: &'a Module,
@@ -4868,6 +4947,74 @@ mod tests {
 
         assert_eq!(module.globals.len(), 1);
         assert_eq!(module.functions.len(), 1);
+    }
+
+    /// Each kind of reference counts; a candidate nothing names does not, and
+    /// a local spelled like a candidate is not a reference to it.
+    #[test]
+    fn test_module_referenced_symbols() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let mut func = Function::new("f", types.int_id);
+        func.add_pseudo(Pseudo::sym(PseudoId(1), "loaded".to_string()));
+        func.add_pseudo(Pseudo::sym(PseudoId(2), "shadowed".to_string()));
+        func.add_local("shadowed", PseudoId(2), types.int_id, None, None);
+        func.next_pseudo = 5;
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(Instruction::call(
+            None,
+            "called",
+            vec![],
+            vec![],
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::load(
+            PseudoId(3),
+            PseudoId(1),
+            0,
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::load(
+            PseudoId(4),
+            PseudoId(2),
+            0,
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::asm(AsmData {
+            template: "call in_template".to_string(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        bb.add_insn(Instruction::ret(None));
+        func.add_block(bb);
+        module.add_function(func);
+        module.add_global(
+            "table",
+            types.int_id,
+            Initializer::SymAddr("from_init".to_string()),
+        );
+
+        let candidates: HashSet<String> = [
+            "called",
+            "loaded",
+            "shadowed",
+            "in_template",
+            "from_init",
+            "unused",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = module.referenced_symbols(&candidates);
+        let mut got: Vec<&str> = got.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["called", "from_init", "in_template", "loaded"]);
     }
 
     #[test]

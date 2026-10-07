@@ -70,8 +70,8 @@ Test (one module): `cargo test --release -p posixutils-SOMECRATE`
    Small, lightweight utility with command line processing,
    core algorithm, and zero external crate dependencies.
 3. "only std"  When an external crate is required, avoid mega-crates.  Prefer
-   std-only, or, tiny crates such as `tempfile` that perform a single,
-   lightweight function.
+   std-only, or tiny crates that perform a single, lightweight function.
+   The workspace's standard set is `clap`, `libc`, `regex` and `chrono`.
 4. Correctness, readability, performance, in that order.
    Code should be readable by unfamiliar developers.  Avoid dense,
    uncommented code.
@@ -110,9 +110,12 @@ Test (one module): `cargo test --release -p posixutils-SOMECRATE`
 	   static input data, and compares output with
 	   static output data (OS reference data).
 * Use plib's TestPlan framework for integration tests.
-* Integration test harness should ONLY contain `mod` statements.
-  Test logic is in $module/tests/$category/mod.rs files.
+* Put test logic in `$crate/tests/$category/mod.rs`, with the
+  integration test harness holding only `mod` statements.  Some crates
+  (`sh`, `make`, `awk`, `m4`, `ftw`, ...) predate this and keep tests in
+  the harness; follow the layout the crate already uses.
 * Only "quick" tests should be run automatically in `cargo test`
-* Longer tests, or tests requiring root access, should be triggered
-  via special environment variables.
+* Longer tests, or tests requiring root access, go behind the
+  `posixutils_test_all` and `requires_root` feature flags (see README
+  "Testing").
 

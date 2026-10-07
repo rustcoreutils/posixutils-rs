@@ -172,7 +172,7 @@ host driver's crt and runtime-library decisions rather than making its own.
 Please run `cargo fmt` before committing code, and `cargo clippy` regularly while working. Code should build without warnings.
 
 ```bash
-cargo fmt && cargo clippy -p posixutils-cc
+cargo fmt && cargo clippy -p posixutils-cc --all-targets
 ```
 
 DO NOT `allow(dead_code)` to fix warnings. Instead, remove dead code; do

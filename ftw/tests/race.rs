@@ -414,6 +414,100 @@ fn deferred_reopen_refuses_dir_swapped_for_other_dir() {
     assert!(*errors.borrow() > 0, "the refused reopen must be reported");
 }
 
+/// A deferred directory whose path from its anchor is longer than `PATH_MAX` is reopened one
+/// component at a time. A FIFO swapped in for one of those components must be refused, not
+/// opened: an `O_RDONLY` open of a FIFO blocks until a writer appears, which hung every walk.
+#[test]
+fn deferred_long_path_reopen_refuses_fifo_component() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let tmp = plib::tmp::Builder::new()
+        .prefix("ftw_race_long_fifo")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let base = tmp.path().to_path_buf();
+    let root = base.join("root");
+    fs::create_dir(&root).unwrap();
+
+    // Twenty 250-byte components: far past PATH_MAX from `root`, so made through descriptors.
+    const DEPTH: usize = 20;
+    let names: Vec<String> = (0..DEPTH)
+        .map(|i| format!("{i:02}{}", "d".repeat(248)))
+        .collect();
+    let mut dir = fs::File::open(&root).unwrap();
+    for name in &names {
+        let c = std::ffi::CString::new(name.as_str()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) },
+            0
+        );
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )
+        };
+        assert!(fd >= 0);
+        dir = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    drop(dir);
+
+    // The second component, which the reopen of the deepest directory walks through.
+    let swapped_component = root.join(&names[0]).join(&names[1]);
+    let last_name = names[DEPTH - 1].clone();
+    let (tx, rx) = mpsc::channel();
+    let walker = {
+        let swapped_component = swapped_component.clone();
+        let base = base.clone();
+        std::thread::spawn(move || {
+            let mut swapped = false;
+            let mut errors = 0usize;
+            traverse_directory(
+                &root,
+                |entry| {
+                    if !swapped && entry.file_name().to_bytes() == last_name.as_bytes() {
+                        fs::rename(&swapped_component, base.join("moved")).unwrap();
+                        let c = std::ffi::CString::new(swapped_component.as_os_str().as_bytes())
+                            .unwrap();
+                        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+                        swapped = true;
+                    }
+                    Ok(true)
+                },
+                |_entry, _exit| Ok(()),
+                |_entry, _err| errors += 1,
+                TraverseDirectoryOpts {
+                    // Conserve descriptors from the first level on.
+                    caller_fds_per_level: 4096,
+                    ..Default::default()
+                },
+            );
+            tx.send((swapped, errors)).unwrap();
+        })
+    };
+
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok((swapped, errors)) => {
+            walker.join().unwrap();
+            assert!(swapped, "the swap must have run");
+            assert!(errors > 0, "the refused reopen must be reported");
+        }
+        Err(_) => {
+            // Release the walker blocked in the FIFO's open before failing.
+            let c = std::ffi::CString::new(swapped_component.as_os_str().as_bytes()).unwrap();
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+            panic!("the walk hung opening a FIFO swapped in for a long-path component");
+        }
+    }
+}
+
 /// Walk `root` after the handler for the starting point itself has replaced it using `swap`.
 /// Returns the names visited and the number of errors reported.
 fn walk_after_root_swap(tag: &str, swap: impl Fn(&Path, &Path)) -> (HashSet<String>, usize) {

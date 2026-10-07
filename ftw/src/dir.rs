@@ -158,6 +158,18 @@ pub struct DeferredDir {
     /// `(st_dev, st_ino)` the walk recorded when it stat'ed this directory. Every reopen is
     /// checked against it, as a first descent is.
     identity: (libc::dev_t, libc::ino_t),
+    /// The recorded identities of the directories between the anchor (`parent`) and this one,
+    /// nearest last; `None` when this directory is a child of the anchor. A reopen that has to
+    /// walk the path one component at a time checks each component against these.
+    ancestors: Option<Rc<Lineage>>,
+}
+
+/// One link of a deferred directory's chain of ancestor identities. Shared rather than copied,
+/// so a deep conserving walk holds one link per level, not one chain per level.
+#[derive(Debug)]
+pub struct Lineage {
+    identity: (libc::dev_t, libc::ino_t),
+    up: Option<Rc<Lineage>>,
 }
 
 impl DeferredDir {
@@ -166,6 +178,7 @@ impl DeferredDir {
         path: PathBuf,
         descent_flags: libc::c_int,
         identity: (libc::dev_t, libc::ino_t),
+        ancestors: Option<Rc<Lineage>>,
     ) -> Self {
         Self {
             parent,
@@ -173,7 +186,29 @@ impl DeferredDir {
             visited: RefCell::new(HashSet::new()),
             descent_flags,
             identity,
+            ancestors,
         }
+    }
+
+    /// The ancestor chain for a deferred child of this directory.
+    pub fn lineage(&self) -> Rc<Lineage> {
+        Rc::new(Lineage {
+            identity: self.identity,
+            up: self.ancestors.clone(),
+        })
+    }
+
+    /// The identities of every directory from the anchor down to and including this one, in
+    /// path order: one per component of this directory's path from the anchor.
+    fn component_identities(&self) -> Vec<(libc::dev_t, libc::ino_t)> {
+        let mut ids = vec![self.identity];
+        let mut link = self.ancestors.as_deref();
+        while let Some(l) = link {
+            ids.push(l.identity);
+            link = l.up.as_deref();
+        }
+        ids.reverse();
+        ids
     }
 
     /// Reopen this directory for one visit.
@@ -209,9 +244,18 @@ impl DeferredDir {
         // remainder - bar/baz
         let remainder = self.path.strip_prefix(&self.parent.1).unwrap();
 
-        // `remainder` is not guaranteed to be shorter than `libc::PATH_MAX`
-        let (starting_dir, components) =
-            open_long_filename(self.parent.0.try_clone()?, remainder, None, &mut |_, _| {})?;
+        // `remainder` is not guaranteed to be shorter than `libc::PATH_MAX`. When it is not, the
+        // prefix is opened one component at a time, each with this walk's descent flags and
+        // checked against the identity the walk recorded for it.
+        let identities = self.component_identities();
+        let (starting_dir, components) = open_long_filename(
+            self.parent.0.try_clone()?,
+            remainder,
+            None,
+            self.descent_flags,
+            Some(&identities),
+            &mut |_, _| {},
+        )?;
 
         let filename_cstr = CString::new(components.as_path().as_os_str().as_bytes())
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;

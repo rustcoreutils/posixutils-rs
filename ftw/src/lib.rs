@@ -700,16 +700,27 @@ where
     );
 }
 
+/// Open as much of `path`'s prefix as is needed for the rest to fit in `PATH_MAX`, returning the
+/// last directory opened and the components left.
+///
+/// Every prefix component is opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC` plus `open_flags` (a
+/// walk's descent flags, so `O_NOFOLLOW` when it does not follow links). `O_DIRECTORY` refuses a
+/// FIFO or device swapped in for a component before the open can block on it or open the
+/// device. With `identities` (one recorded `(dev, ino)` per component of `path`), each opened
+/// component must also be the very directory the walk recorded there.
 fn open_long_filename<'a, H>(
     mut starting_dir: FileDescriptor,
     path: &'a Path,
     mut path_stack: Option<&mut Vec<Rc<[libc::c_char]>>>,
+    open_flags: libc::c_int,
+    identities: Option<&[(libc::dev_t, libc::ino_t)]>,
     err_reporter: &mut H,
 ) -> io::Result<(FileDescriptor, std::path::Components<'a>)>
 where
     H: FnMut(Entry<'_>, Error),
 {
     let mut path_components = path.components();
+    let mut opened = 0usize;
 
     // If `path` is too long, start at a prefix of `path`
     loop {
@@ -752,11 +763,21 @@ where
         let filename_cstr = CString::new(component.as_os_str().as_bytes()).unwrap();
         let filename = cstring_to_rc(&filename_cstr);
 
-        starting_dir = match FileDescriptor::open_at(
+        let opened_component = FileDescriptor::open_at(
             &starting_dir,
             unsafe { CStr::from_ptr(filename.as_ptr()) },
-            libc::O_RDONLY,
-        ) {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | open_flags,
+        )
+        .and_then(|fd| match identities {
+            // Fail closed: a component with no recorded identity, or the wrong one, is refused.
+            Some(ids) => match ids.get(opened) {
+                Some(&(dev, ino)) if fd_matches(&fd, dev, ino) => Ok(fd),
+                _ => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+            },
+            None => Ok(fd),
+        });
+        opened += 1;
+        starting_dir = match opened_component {
             Ok(fd) => fd,
             Err(e) => {
                 let errno = e.raw_os_error().unwrap_or(libc::EIO);
@@ -865,10 +886,13 @@ where
         return false;
     }
 
+    // The operand's own components are resolved as the user wrote them, symbolic links included.
     let (starting_dir, path_components) = match open_long_filename(
         FileDescriptor::cwd(),
         path.as_ref(),
         Some(&mut path_stack),
+        0,
+        None,
         &mut err_reporter,
     ) {
         Ok(pair) => pair,
@@ -1174,6 +1198,7 @@ where
                                             path,
                                             descent_flags,
                                             (want_dev, want_ino),
+                                            None,
                                         );
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),
@@ -1189,6 +1214,7 @@ where
                                             build_path(&path_stack, &entry_filename),
                                             descent_flags,
                                             (want_dev, want_ino),
+                                            Some(current_dir.lineage()),
                                         );
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),

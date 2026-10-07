@@ -1676,3 +1676,80 @@ int main(void) {
 "#;
     compile_and_run_everywhere("va_through_ptr", src);
 }
+
+/// `va_copy` from a `va_list` parameter, in a loop, beside live values --
+/// the shape of gmp's `__gmp_doprnt`, whose `gmp_sprintf` returned a garbage
+/// length. The x86-64 copy used %rax/%rcx/%rdx, which the allocator hands
+/// out, so a running sum in %eax came back as a `gp_offset`; and at -O0 it
+/// read a spilled `va_list` parameter's slot as the object rather than the
+/// pointer it holds.
+#[test]
+fn va_copy_from_a_parameter_in_a_loop() {
+    let src = r#"
+#include <stdarg.h>
+__attribute__((noinline)) static int get(va_list ap) { return va_arg(ap, int); }
+__attribute__((noinline)) static int walk(int n, va_list orig_ap) {
+    va_list ap, last, this_ap;
+    va_copy(ap, orig_ap);
+    va_copy(last, ap);
+    int r = 0;
+    for (int i = 0; i < n; i++) {
+        va_copy(this_ap, ap);
+        r = r * 10 + va_arg(ap, int);
+        va_copy(last, ap);
+        va_end(this_ap);
+    }
+    r = r * 10 + get(last);
+    va_end(ap);
+    va_end(last);
+    return r;
+}
+__attribute__((noinline)) static int top(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int r = walk(n, ap);
+    va_end(ap);
+    return r;
+}
+__attribute__((noinline)) int piece(void *d, const char *f, va_list ap) {
+    (void)d;
+    (void)f;
+    return va_arg(ap, int);
+}
+__attribute__((noinline)) int doit(const char *f, va_list orig_ap) {
+    va_list ap, this_ap, last_ap;
+    int retval = 0;
+    va_copy(ap, orig_ap);
+    va_copy(last_ap, ap);
+    for (; *f; f++) {
+        va_copy(this_ap, ap);
+        if (*f == 'Z') {
+            int ret = va_arg(ap, int);
+            retval += ret;
+            va_copy(last_ap, ap);
+        } else {
+            retval += piece(0, f, last_ap) * 100;
+            (void)va_arg(ap, int);
+            va_copy(last_ap, ap);
+        }
+        va_end(this_ap);
+    }
+    va_end(ap);
+    va_end(last_ap);
+    return retval;
+}
+__attribute__((noinline)) int fmt(const char *f, ...) {
+    va_list ap;
+    va_start(ap, f);
+    int r = doit(f, ap);
+    va_end(ap);
+    return r;
+}
+int main(void) {
+    if (top(3, 1, 2, 3, 4) != 1234) return 1;
+    if (fmt("ZdZ", 1, 2, 3) != 204) return 2;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("va_copy_param_loop", src);
+}

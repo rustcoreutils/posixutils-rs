@@ -49,11 +49,23 @@ There are several ways to contribute to posixutils-rs:
 
 ### Quick start
 
-Build: `cargo build --release`
+Requires Rust 1.88.0 or later.  Targets Linux and macOS; a subset of crates
+also builds on Windows (see [WINDOWS.md](WINDOWS.md)).
 
-Test all (long, more than 15 minutes on some hosts) `cargo test --release`
+```bash
+cargo build --release              # always the full workspace, no -p
+cargo test --release               # all tests; more than 15 minutes on some hosts
+cargo test --release -p posixutils-SOMECRATE   # one crate
+cargo clippy --all-targets         # must be warning-free, as in CI
+cargo fmt --all -- --check         # must pass, as in CI
+```
 
-Test (one module): `cargo test --release -p posixutils-SOMECRATE`
+### Source layout
+
+Workspace crates by category: `text/`, `fs/`, `process/`, `awk/`, `sh/`,
+`make/`, `editors/`, and others; `Cargo.toml` `members` is the full list.
+Shared code is in `plib/`, race-free file tree walking in `ftw/`, and the C
+compiler in `cc/` (see [cc/README.md](cc/README.md)).
 
 ### For Maintainers: Commit Standards
 

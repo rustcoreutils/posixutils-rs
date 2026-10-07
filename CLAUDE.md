@@ -1,57 +1,19 @@
 # CLAUDE.md
 
-## CRITICAL: Git Restrictions
-
-**NEVER `git commit` or `git add`** without asking.
-
-## Project Overview
-
-posixutils-rs: Rust-native POSIX utilities (cp, mv, awk, sh, cc, make, vi, etc.) targeting POSIX.2024. Goal: clean, race-free, POSIX-compliant utilities.
-
-**Rust**: 1.88.0+ | **License**: MIT | **Platforms**: Linux, macOS; Windows for the crates in `WINDOWS_CRATES` (README "Windows")
-
-## Commands
-
-```bash
-cargo build --release           # Build (ALWAYS full workspace, no -p)
-cargo test --release            # Test all (15+ min)
-cargo test --release -p posixutils-text  # Test single crate
-cargo clippy                    # Lint (required)
-cargo fmt --all -- --check      # Format check (required)
-```
+Read CONTRIBUTING.md before building, testing or changing code: it holds the
+build and test commands, source layout, code style, dependency policy and
+test conventions, shared with human contributors.  README.md has the goals
+and platforms.  This file holds only rules for the agent.
 
 ## Git
 
-NEVER amend git commits.
+Ask before any `git add` or `git commit`. Never amend a commit; make a new one.
 
-Pre-commit checks,
-- First re-review `git diff HEAD` in totality
-- Passes `cargo clippy --all-targets` with zero warnings (pre-existing warnings MUST be fixed)
+Before committing, re-read `git diff HEAD` in full, and get
+`cargo clippy --all-targets` to zero warnings, fixing pre-existing ones too.
 
-## Architecture
+## Debugging
 
-Workspace by category: `text/`, `fs/`, `process/`, `awk/`, `sh/`, `make/`, `editors/`, `plib/` (shared lib), `ftw/` (race-free file walking).
-
-Other: `calc/`, `cc/`, `cron/`, `datetime/`, `dev/`, `display/`, `file/`, `m4/`, `mailx/`, `pax/`, `sccs/`, `screen/`, `sys/`, `tree/`, `users/`, `uucp/`, `xform/`, `i18n/`.
-
-## Code Style
-
-1. **Zero warnings** - clippy and compiler
-2. **No `#[allow(dead_code)]`** - delete unused code
-3. **Minimal deps** - prefer std; use clap, libc, regex, chrono
-4. **Small functions** - refactor large functions into helpers
-
-## Testing
-
-Debug protocol:
-Update EXISTING wrapper script in `/tmp/*.sh`, run via Bash tool.
-DO NOT (1) create file with cat, (2) run `bash` from Bash tool
-
-Integration tests use `plib::testing::TestPlan`. Test logic in `$crate/tests/$category/mod.rs`.
-
-## Core Principles
-
-1. **POSIX.2024 first** - spec before GNU/BSD extensions
-2. **Minimalism** - only widely-used extensions
-3. **Race-free** - especially file ops (see `ftw/`)
-4. **Correctness > Readability > Performance**
+Keep one wrapper script at `/tmp/<name>.sh`. Change it with the Write/Edit
+tools, not `cat` heredocs, and run it as `/tmp/<name>.sh`, not
+`bash /tmp/<name>.sh`, so that each run does not need a new permission prompt.

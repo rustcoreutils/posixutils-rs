@@ -21,7 +21,9 @@ References:
 
 Build: `cargo build && cargo build --release`
 
-Testing (compiler subset): `cargo test --release -p posixutils-cc`
+Testing (compiler subset): `cargo test --release -p posixutils-cc`.  Run it
+alone: CI uses `--test-threads=1`, and two full runs at once starve the heavy
+tests into failures that are not real.
 
 Debugging, via stdio:
 ```
@@ -166,6 +168,12 @@ This is a deliberate choice and it satisfies the implicit `-l c` and the
 executable-permission mandates transitively, since every conforming host `cc`
 does those things. The consequence worth knowing is that `c17` inherits the
 host driver's crt and runtime-library decisions rather than making its own.
+
+## Testing Requirements
+
+1. Every fix and feature comes with tests that guard against regressions.
+2. Changes to `cc/ir/`, `cc/token/` and `cc/parse/` include unit tests.
+3. Every change also gets an end-to-end integration test in `cc/tests/`.
 
 ## Code Quality
 

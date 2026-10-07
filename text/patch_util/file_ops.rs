@@ -9,7 +9,7 @@
 
 //! File operations for the patch utility.
 
-use super::types::{FilePatch, Hunk, LineOp, PatchConfig, PatchError};
+use super::types::{BackupName, FilePatch, Hunk, LineOp, PatchConfig, PatchError, RejectFile};
 use gettextrs::gettext;
 use plib::io::{open_terminal_input, open_terminal_output};
 use std::{
@@ -76,10 +76,10 @@ pub fn determine_target_file(
     }
 
     // Filename Determination step 5: prompt the user on the controlling
-    // terminal for a filename. -f means "do not ask any questions", and if no
-    // terminal is available or the response is empty, give up and skip the
-    // patch.
-    if !config.force {
+    // terminal for a filename. -f and -t mean "do not ask any questions", and
+    // if no terminal is available or the response is empty, give up and skip
+    // the patch.
+    if !config.force && !config.batch {
         if let Some(name) = prompt_for_filename() {
             let trimmed = name.trim();
             if !trimmed.is_empty() {
@@ -223,19 +223,38 @@ pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
     Ok((lines, trailing_newline))
 }
 
-/// Back up a file with the .orig suffix, but only the first time it is seen in
-/// this run (tracked via `backed_up`). This preserves the true original across
-/// a multi-patch run rather than overwriting it with an intermediate version.
-fn backup_once(path: &Path, backed_up: &mut HashSet<PathBuf>) -> io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
+/// Back up a file under the name `naming` gives it, but only the first time it
+/// is seen in this run (tracked via `backed_up`). This preserves the true
+/// original across a multi-patch run rather than overwriting it with an
+/// intermediate version.
+///
+/// A file the patch is about to create has no original, so its backup is an
+/// empty file, as GNU patch makes one. That placeholder is what dpkg-source
+/// (and quilt) read as "this file did not exist": restoring a patch deletes
+/// any file whose backup is empty, and a 1.0 source package's unpack removes
+/// FILE.dpkg-orig for every file its diff touches, failing if one is missing.
+/// The backup name may lead into directories that do not exist yet (-B
+/// .pc/NAME/); they are created.
+fn backup_once(
+    path: &Path,
+    naming: &BackupName,
+    backed_up: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
     let key = path.to_path_buf();
     if backed_up.contains(&key) {
         return Ok(());
     }
-    let backup_path = format!("{}.orig", path.display());
-    fs::copy(path, &backup_path)?;
+    let backup_path = naming.for_file(path);
+    if let Some(parent) = backup_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    if path.exists() {
+        fs::copy(path, &backup_path)?;
+    } else {
+        File::create(&backup_path)?;
+    }
     backed_up.insert(key);
     Ok(())
 }
@@ -247,8 +266,8 @@ pub fn delete_target(
     config: &PatchConfig,
     backed_up: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
-    if config.backup {
-        backup_once(target, backed_up)?;
+    if let Some(naming) = &config.backup {
+        backup_once(target, naming, backed_up)?;
     }
     if target.exists() {
         fs::remove_file(target)?;
@@ -276,12 +295,8 @@ pub fn write_output(
     let output_path = config.output_file.as_deref().unwrap_or(target);
 
     // Handle backup (-b option) once per file.
-    if config.backup {
-        if config.output_file.is_some() {
-            backup_once(output_path, backed_up)?;
-        } else {
-            backup_once(target, backed_up)?;
-        }
+    if let Some(naming) = &config.backup {
+        backup_once(output_path, naming, backed_up)?;
     }
 
     // Create parent directories if needed
@@ -329,10 +344,11 @@ pub fn write_rejects(
     }
 
     // Determine reject file path
-    let reject_path = config
-        .reject_file
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{}.rej", target.display())));
+    let reject_path = match &config.reject_file {
+        Some(RejectFile::Discard) => return Ok(()),
+        Some(RejectFile::Path(path)) => path.clone(),
+        None => PathBuf::from(format!("{}.rej", target.display())),
+    };
 
     // POSIX: rejected hunks are *appended* to the reject file. With -r, or with
     // two patch sections naming the same file, truncating per section would

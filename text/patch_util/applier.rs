@@ -21,11 +21,12 @@ use gettextrs::gettext;
 /// so this many lines always satisfies it.
 const MAX_SCAN_LINES: usize = 1000;
 
-/// How many lines of context a fuzzy match may ignore at each end.
+/// How many lines of context a fuzzy match may ignore at each end, unless -F
+/// says otherwise.
 ///
 /// POSIX describes exactly two rescans: one ignoring the first and last line of
 /// context, then one ignoring the first two and last two.
-const MAX_FUZZ: usize = 2;
+const DEFAULT_MAX_FUZZ: usize = 2;
 
 /// What to do with a patch that looks reversed or already applied.
 enum ReversalChoice {
@@ -221,6 +222,15 @@ impl<'a> PatchApplier<'a> {
         if self.config.force {
             return ReversalChoice::ApplyForward;
         }
+        // -t asks nothing either, but its assumed answer is GNU's: a patch
+        // that looks reversed is reversed.
+        if self.config.batch {
+            eprintln!(
+                "patch: {}",
+                gettext("Reversed (or previously applied) patch detected!  Assuming -R.")
+            );
+            return ReversalChoice::ApplyReversed;
+        }
         match super::file_ops::prompt_yes_no(
             "Reversed (or previously applied) patch detected!  Assume -R? [y] ",
         ) {
@@ -288,7 +298,8 @@ impl<'a> PatchApplier<'a> {
     fn apply_matched_hunk(&mut self, hunk: &Hunk) -> HunkResult {
         let expected = (hunk.old_start as i64 - 1 + self.offset).max(0) as usize;
 
-        for fuzz in 0..=MAX_FUZZ {
+        let max_fuzz = self.config.max_fuzz.unwrap_or(DEFAULT_MAX_FUZZ);
+        for fuzz in 0..=max_fuzz {
             let window = if fuzz == 0 {
                 Some(hunk.full_window())
             } else {

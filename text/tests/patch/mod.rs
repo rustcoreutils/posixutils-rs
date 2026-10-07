@@ -12,6 +12,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod dpkg_options;
+
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn setup_test_dir(name: &str) -> PathBuf {

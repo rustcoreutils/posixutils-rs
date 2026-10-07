@@ -1051,6 +1051,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                         })
                         .collect();
 
+                    flush_stdout();
                     match Command::new(utility).args(&expanded_args).status() {
                         Ok(status) => EvalResult::new(status.success()),
                         Err(e) => {
@@ -1095,6 +1096,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                 })
                 .collect();
 
+            flush_stdout();
             match Command::new(utility).args(&expanded_args).status() {
                 Ok(status) => EvalResult::new(status.success()),
                 Err(e) => {
@@ -1323,9 +1325,16 @@ fn process_children(
     }
 }
 
+/// Flush what find has written so far, so that it reaches standard output
+/// before anything a child utility writes there.
+fn flush_stdout() {
+    let _ = io::stdout().flush();
+}
+
 /// Run one `-exec ... {} +` invocation over a chunk of files. Returns whether
 /// it exited successfully.
 fn run_exec_command(utility: &str, args_before: &[String], files: &[PathBuf]) -> bool {
+    flush_stdout();
     let mut cmd = Command::new(utility);
     cmd.args(args_before);
     cmd.args(files);

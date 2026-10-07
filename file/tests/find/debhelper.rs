@@ -244,3 +244,34 @@ fn find_printf_unsupported_is_an_error() {
         1,
     );
 }
+
+/// Output written before an `-exec` runs reaches stdout before the child's.
+#[test]
+fn find_printf_flushed_before_exec() {
+    let dir = make_tree("printf_exec");
+    let (out, _, code) = find_in(
+        &dir,
+        &[
+            ".",
+            "-maxdepth",
+            "1",
+            "-name",
+            "a.txt",
+            "-printf",
+            "X",
+            "-exec",
+            "echo",
+            "Y",
+            ";",
+        ],
+    );
+    assert_eq!((out, code), (b"XY\n".to_vec(), 0));
+    let (out, _, code) = find_in(
+        &dir,
+        &[
+            "sub", "-name", "b", "-printf", "X", "-exec", "echo", "Y", "{}", "+",
+        ],
+    );
+    assert_eq!((out, code), (b"XY sub/b\n".to_vec(), 0));
+    fs::remove_dir_all(&dir).unwrap();
+}

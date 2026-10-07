@@ -449,6 +449,35 @@ fn test_ls_symlink_operand_not_followed_under_d_f_l() {
     ls_test(&["-FL", lnks], "f1\nf2\nf2same\nsub/\n", "", 0);
 }
 
+/// POSIX: under -l or -s each list of files within a directory is preceded by
+/// its total, and an empty list is still a list: `total 0`.
+#[test]
+fn test_ls_empty_directory_has_a_total_line() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let top = dir.path().join("top");
+    fs::create_dir_all(top.join("empty")).unwrap();
+    let tops = top.to_str().unwrap();
+    let empty = top.join("empty");
+    let emptys = empty.to_str().unwrap();
+
+    ls_test(&["-l", emptys], "total 0\n", "", 0);
+    ls_test(&["-s", emptys], "total 0\n", "", 0);
+    ls_test(&[emptys], "", "", 0);
+    // A directory's own block count depends on the file system.
+    ls_test_with_checker(&["-sR", tops], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(&format!("{tops}:\ntotal ")),
+            "{stdout:?}"
+        );
+        assert!(
+            stdout.ends_with(&format!(" empty\n\n{emptys}:\ntotal 0\n")),
+            "{stdout:?}"
+        );
+        assert_eq!(output.status.code(), Some(0));
+    });
+}
+
 /// A `-R` cycle refuses only the entry that closes it; the rest of the tree is
 /// still listed, as GNU does.
 #[test]

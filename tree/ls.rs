@@ -685,26 +685,25 @@ fn sort_by_entry<T>(items: &mut [T], entry: impl Fn(&T) -> &Entry, config: &Conf
     });
 }
 
-fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str>) {
+/// Under -l or -s, the status line that precedes each list of files within a directory, empty
+/// lists included.
+fn print_total_line(entries: &[Entry], config: &Config) {
+    if !(config.display_size || matches!(config.output_format, OutputFormat::Long(_))) {
+        return;
+    }
+    let total_block_size: u64 = entries.iter().map(|e| BLOCK_SIZE * e.blocks()).sum();
+
+    // The block size for -s and the total is implementation-defined without -k; we default to
+    // 1024-byte units (matching coreutils) so -k is the same as the default (#LS13).
+    println!(
+        "{} {}",
+        gettext("total"),
+        total_block_size / BLOCK_SIZE_KIBIBYTES
+    );
+}
+
+fn display_entries(entries: &mut [Entry], config: &Config) {
     sort_by_entry(entries, |e| e, config);
-
-    let mut display_total_size = config.display_size;
-    if let OutputFormat::Long(_) = &config.output_format {
-        display_total_size = true;
-    }
-
-    // `dir_path.is_some()` to only display the total on directories.
-    if display_total_size && dir_path.is_some() {
-        let mut total_block_size = 0;
-        for entry in entries.iter() {
-            total_block_size += BLOCK_SIZE * entry.blocks();
-        }
-
-        // The block size for -s and the total is implementation-defined without -k; we default to
-        // 1024-byte units (matching coreutils) so -k is the same as the default (#LS13).
-        total_block_size /= BLOCK_SIZE_KIBIBYTES;
-        println!("{} {}", gettext("total"), total_block_size);
-    }
 
     match &config.output_format {
         OutputFormat::Long(_) => {
@@ -1012,7 +1011,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
         file_entries.push(entry);
     }
     if !file_entries.is_empty() {
-        display_entries(&mut file_entries, config, None);
+        display_entries(&mut file_entries, config);
     }
 
     let mut is_first_dir_arg = true;
@@ -1043,6 +1042,9 @@ fn process_single_dir(
     let mut errors: Vec<io::Error> = Vec::new();
 
     let mut current_dir: Option<PathBuf> = None;
+    // Whether `current_dir` has delivered any entry. The operand is `current_dir` before it is
+    // opened, and an unreadable one gets no total line.
+    let mut current_dir_read = false;
 
     // Always true. According to the reference:
     // "For each operand that names a file of a type other than directory
@@ -1083,20 +1085,18 @@ fn process_single_dir(
 
     fn print_contents(
         config: &Config,
-        dir: &Path,
         entries: &mut Vec<Entry>,
         errors: &mut Vec<io::Error>,
         exit_code: &AtomicU8,
     ) {
-        let dir_path = ls_from_utf8_lossy(dir.as_os_str().as_bytes());
-
         for e in errors.drain(..) {
             eprintln!("ls: {e}");
             exit_code.fetch_max(1, Ordering::SeqCst);
         }
 
+        print_total_line(entries, config);
         if !entries.is_empty() {
-            display_entries(entries, config, Some(&dir_path));
+            display_entries(entries, config);
 
             // Already displayed so clear the entries
             entries.clear();
@@ -1219,13 +1219,8 @@ fn process_single_dir(
 
             // If moving to a new subdirectory
             if dir_parent != current_dir_ref.as_path() {
-                print_contents(
-                    config,
-                    current_dir_ref,
-                    &mut entries,
-                    &mut errors,
-                    &exit_code,
-                );
+                // Reaching another directory's entries means the one being left was read.
+                print_contents(config, &mut entries, &mut errors, &exit_code);
 
                 current_dir = Some(dir_parent.to_path_buf());
                 print_header(
@@ -1236,6 +1231,8 @@ fn process_single_dir(
                     current_dir.as_ref().unwrap(),
                 );
             }
+            // An entry inside `current_dir` (`.` and `..` included) proves it was read.
+            current_dir_read = true;
 
             match process_dir_entry(&mut entries) {
                 Ok(b) => Ok(b),
@@ -1275,11 +1272,10 @@ fn process_single_dir(
         },
     );
 
-    // If there are remaining unprinted entries
-    if !entries.is_empty() {
-        if let Some(dir) = &current_dir {
-            print_contents(config, dir, &mut entries, &mut errors, &exit_code);
-        }
+    // The last directory listed, or the operand itself if it was read at all: an empty
+    // directory still gets its total line, an unreadable one does not.
+    if current_dir_read {
+        print_contents(config, &mut entries, &mut errors, &exit_code);
     }
 
     Ok(exit_code.load(Ordering::SeqCst))

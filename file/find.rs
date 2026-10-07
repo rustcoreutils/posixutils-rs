@@ -201,6 +201,8 @@ enum Primary {
     /// `-empty`: GNU extension, forced by debhelper (dh_install,
     /// dh_installdocs)
     Empty,
+    /// `-executable`: GNU extension, forced by debhelper (dh_movelibkdeinit)
+    Executable,
 
     // Actions
     Print,
@@ -572,6 +574,7 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         "-true" => Ok(Expr::Primary(Primary::Const(true))),
         "-false" => Ok(Expr::Primary(Primary::Const(false))),
         "-empty" => Ok(Expr::Primary(Primary::Empty)),
+        "-executable" => Ok(Expr::Primary(Primary::Executable)),
         "-regex" => {
             let pattern = get_arg(tokens, idx, "-regex")?;
             let ere = emacs_regex_to_ere(pattern)?;
@@ -1112,6 +1115,12 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
         }
         Primary::Const(value) => EvalResult::new(*value),
         Primary::Empty => EvalResult::new(is_empty(ctx, state)),
+        Primary::Executable => {
+            // access(2) answers for the real user, following symlinks.
+            let path = std::ffi::CString::new(ctx.path.as_os_str().as_bytes());
+            let ok = path.is_ok_and(|p| unsafe { libc::access(p.as_ptr(), libc::X_OK) } == 0);
+            EvalResult::new(ok)
+        }
         Primary::Delete => EvalResult::new(delete_entry(ctx, state)),
         Primary::Regex(re) => EvalResult::new(re.is_match_bytes(ctx.path.as_os_str().as_bytes())),
         Primary::NoUser => {

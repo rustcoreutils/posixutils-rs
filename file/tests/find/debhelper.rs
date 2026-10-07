@@ -673,3 +673,16 @@ fn find_delete() {
     );
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `-executable` (dh_movelibkdeinit `-type f -executable`): the invoking
+/// user may execute the file (`access(X_OK)`), or search the directory.
+#[test]
+fn find_executable() {
+    let dir = make_pkg_tree("executable");
+    expect_words(&dir, "-type f -executable", &["./exe", "./ux"]);
+    expect_words(&dir, "-type d -name emptydir -executable", &["./emptydir"]);
+    // A symlink is tested through to its target; a dangling one is not.
+    expect_words(&dir, "-name link -executable", &["./link"]);
+    expect_words(&dir, "-name dangling -executable", &[]);
+    fs::remove_dir_all(&dir).unwrap();
+}

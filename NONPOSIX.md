@@ -266,6 +266,8 @@ but no daemon to run them.  Behavior follows Vixie cron:
    (`dh_doxygen`, `dh_autotools-dev_restoreconfig`).
  * `-empty` — true for an empty regular file or a directory with no
    entries.  Forced by debhelper (`dh_install`, `dh_installdocs`).
+ * `-executable` — true if `access(2)` grants the user execute (search, for
+   a directory) permission.  Forced by debhelper (`dh_movelibkdeinit`).
  * `-perm /mode` — true if any of the bits in `mode` is set (or `mode` has
    none).  Forced by debhelper (`dh_shlibdeps` `-perm /111`).
  * `-regex pattern` — true if the pattern matches the whole pathname, in

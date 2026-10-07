@@ -1548,23 +1548,10 @@ impl<'a> Preprocessor<'a> {
                 }
 
                 TokenType::Special => {
-                    if let TokenValue::Special(code) = &token.value {
-                        // Check for # at start of line (preprocessor directive).
-                        //
-                        // Only from the file. C17 6.10.3p11 makes a directive
-                        // produced by a macro expansion undefined, and taking
-                        // one would be worse than undefined here: `skip_to_eol`
-                        // and `collect_to_eol` stop at the next token that
-                        // begins a line, so a stray `#` out of an expansion
-                        // would swallow the rest of the file rather than the
-                        // rest of a replacement list.
-                        if *code == b'#' as u32
-                            && token.pos.newline
-                            && cursor.provenance() == Provenance::Main
-                        {
-                            self.handle_directive(&mut cursor, &token, &mut output, idents);
-                            continue;
-                        }
+                    // `#` at start of line, from the file: a directive.
+                    if self.is_file_directive(&token, &cursor) {
+                        self.handle_directive(&mut cursor, &token, &mut output, idents);
+                        continue;
                     }
                     if !self.is_skipping() {
                         if self.in_if_condition {

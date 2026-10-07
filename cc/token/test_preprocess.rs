@@ -2341,6 +2341,36 @@ fn test_line_directive_maps_token_positions() {
     assert_eq!(crate::diag::stream_name(b.pos.stream), "renamed.c");
 }
 
+/// Conditional directives inside a function-like macro's arguments are
+/// obeyed, as gcc does (C17 6.10.3p11 leaves it undefined): binutils'
+/// elfnn-aarch64.c picks a `HOWTO` argument with `#if ARCH_SIZE == 64`. What
+/// a skipped group holds -- commas, parentheses -- is not part of the call.
+#[test]
+fn test_conditionals_inside_macro_arguments() {
+    let (tokens, idents) = preprocess_str(
+        "#define H(a, b, c) [a b c]\n\
+         #define BIG 1\n\
+         H(1,\n\
+         #if BIG\n\
+         2,\n\
+         #else\n\
+         3, ) (,\n\
+         #endif\n\
+         4)\n\
+         H(5,\n\
+         #ifdef NOPE\n\
+         6,\n\
+         #elif 1\n\
+         7,\n\
+         #endif\n\
+         8)\n",
+    );
+    assert_eq!(
+        get_token_strings(&tokens, &idents),
+        ["[", "1", "2", "4", "]", "[", "5", "7", "8", "]"]
+    );
+}
+
 /// `#pragma weak NAME` names a weak symbol, in either spelling; the alias
 /// form and anything malformed name none.
 #[test]

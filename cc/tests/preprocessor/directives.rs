@@ -824,3 +824,43 @@ fn preprocessor_nostdinc_keeps_the_caller_s_system_paths() {
         r.stdout
     );
 }
+
+/// Conditional directives among a function-like macro's arguments are
+/// obeyed, as gcc does (C17 6.10.3p11 leaves it undefined). binutils'
+/// bfd/elfnn-aarch64.c writes its `HOWTO` table that way:
+/// `#if ARCH_SIZE == 64` picks the name argument.
+#[test]
+fn preprocessor_conditionals_inside_macro_arguments() {
+    let code = r#"
+#define HOWTO(type, size, name, mask) { type, size, name, mask }
+#define ARCH_SIZE 64
+struct howto { int type, size; const char *name; long mask; };
+static const struct howto table[] = {
+  HOWTO (1, 4,
+#if ARCH_SIZE == 64
+         "R_AARCH64_TLS_DTPMOD64",
+#else
+         "R_AARCH64_TLS_DTPMOD",
+#endif
+         -1L),
+  HOWTO (2,
+#ifdef UNDEFINED_THING
+         (8, 9),
+#elif ARCH_SIZE == 32
+         16,
+#else
+         8,
+#endif
+         "two", 0),
+};
+
+int main(void)
+{
+    if (sizeof table / sizeof table[0] != 2) return 1;
+    if (table[0].name[20] != '6' || table[0].mask != -1L) return 2;
+    if (table[1].size != 8 || table[1].name[0] != 't') return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("pp_conditionals_in_args", code, &[]), 0);
+}

@@ -264,7 +264,10 @@ fn preserve_node_attributes(
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     let pinned = fs::File::from(fd);
     let pinned_md = pinned.metadata()?;
-    if pinned_md.dev() != made.dev() || pinned_md.ino() != made.ino() {
+    if pinned_md.dev() != made.dev()
+        || pinned_md.ino() != made.ino()
+        || !same_file_type(pinned_md.file_type(), made_type)
+    {
         return Err(io::Error::other(gettext!(
             "'{}' was replaced during the copy",
             target.display()
@@ -307,7 +310,7 @@ fn preserve_node_attributes(
 ) -> io::Result<()> {
     let still_made = || -> io::Result<()> {
         let md = ftw::Metadata::new(dirfd, name, false)?;
-        if md.dev() != made.dev() || md.ino() != made.ino() {
+        if md.dev() != made.dev() || md.ino() != made.ino() || md.file_type() != made_type {
             return Err(io::Error::other(gettext!(
                 "'{}' was replaced during the copy",
                 target.display()
@@ -847,25 +850,42 @@ where
                     target_symlink_md.as_ref(),
                 )
             };
-            let target_fd = unsafe { libc::openat(target_dirfd, target_filename, open_flags) };
+            // A regular file is opened `O_NONBLOCK`, so a FIFO swapped in for it fails the open
+            // (ENXIO, no reader) instead of waiting for a reader; the flag is cleared once the
+            // descriptor is known to be the checked file. A destination that was checked as a
+            // FIFO or device (`cp x /dev/null`) is opened as before, blocking.
+            let expect_regular =
+                expected_md.is_some_and(|md| md.file_type() == ftw::FileType::RegularFile);
+            let nonblock = if expect_regular { libc::O_NONBLOCK } else { 0 };
+            let target_fd =
+                unsafe { libc::openat(target_dirfd, target_filename, open_flags | nonblock) };
             if target_fd != -1 {
                 let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
                 let opened_md = target_file.metadata()?;
-                let is_checked_file = expected_md
-                    .is_some_and(|md| md.dev() == opened_md.dev() && md.ino() == opened_md.ino());
+                // The type too: a file unlinked and replaced can hand its inode number on.
+                let is_checked_file = expected_md.is_some_and(|md| {
+                    md.dev() == opened_md.dev()
+                        && md.ino() == opened_md.ino()
+                        && same_file_type(opened_md.file_type(), md.file_type())
+                });
                 if !is_checked_file {
                     return Err(io::Error::other(gettext!(
                         "will not write to '{}': it changed after it was checked",
                         target.display()
                     )));
                 }
-                target_file.set_len(0).map_err(|e| {
-                    io::Error::other(gettext!(
-                        "cannot truncate '{}': {}",
-                        target.display(),
-                        error_string(&e)
-                    ))
-                })?;
+                if expect_regular {
+                    clear_nonblock(target_fd)?;
+                    // Truncated only now, and only a regular file: `O_TRUNC` is ignored for a
+                    // FIFO or terminal, and ftruncate would refuse one.
+                    target_file.set_len(0).map_err(|e| {
+                        io::Error::other(gettext!(
+                            "cannot truncate '{}': {}",
+                            target.display(),
+                            error_string(&e)
+                        ))
+                    })?;
+                }
 
                 io::copy(&mut source_file, &mut target_file)?;
                 (source_file, target_file)
@@ -986,14 +1006,19 @@ fn open_source(
         )));
     }
     if regular {
-        let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if status == -1
-            || unsafe { libc::fcntl(fd, libc::F_SETFL, status & !libc::O_NONBLOCK) } == -1
-        {
-            return Err(cannot_open(&io::Error::last_os_error()));
-        }
+        clear_nonblock(fd).map_err(|e| cannot_open(&e))?;
     }
     Ok(file)
+}
+
+/// Clear `O_NONBLOCK` on a descriptor opened with it only to keep a swapped-in FIFO from
+/// blocking the open.
+fn clear_nonblock(fd: libc::c_int) -> io::Result<()> {
+    let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if status == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, status & !libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// -p for a symbolic link or special file this copy just made (no descriptor to act through).

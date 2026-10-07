@@ -295,6 +295,74 @@ fn cp_refuses_a_source_swapped_after_the_walk_saw_it() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// An existing destination that is a device is written to, not truncated: `cp f /dev/null`.
+#[test]
+fn cp_writes_to_an_existing_character_device() {
+    let base = scratch("to_dev_null");
+    fs::write(base.join("source"), b"source").unwrap();
+    let out = Command::new(get_binary_path("cp"))
+        .args(["source", "/dev/null"])
+        .current_dir(&base)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute cp");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// cp decided to overwrite a regular file; a FIFO swapped in for it must be refused, not opened:
+/// an `O_WRONLY` open of a FIFO waits for a reader forever.
+#[test]
+fn cp_refuses_a_fifo_swapped_in_for_the_destination() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+    let base = scratch("swap_dest_fifo");
+    fs::write(base.join("source"), b"source").unwrap();
+    fs::write(base.join("target"), b"old").unwrap();
+    let fifo = base.join("target");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let base_for_cp = base.clone();
+    let fifo_for_cp = fifo.clone();
+    std::thread::spawn(move || {
+        let stderr = cp_i_swapping_at_prompt(&base_for_cp, || {
+            fs::remove_file(&fifo_for_cp).unwrap();
+            let c = std::ffi::CString::new(fifo_for_cp.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        });
+        let _ = tx.send(stderr);
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(stderr) => {
+            assert!(
+                fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+                "stderr: {stderr}"
+            );
+            // Refused at the open (no reader), or by the identity check.
+            assert!(
+                stderr.contains("No such device or address") || stderr.contains("changed"),
+                "stderr: {stderr}"
+            );
+        }
+        Err(_) => {
+            // Release cp, blocked in the FIFO's open, before failing.
+            let _ = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+            panic!("cp opened a FIFO swapped in for its destination and hung");
+        }
+    }
+
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// The same for another regular file renamed over the destination: the file opened must be the
 /// one cp checked, or nothing is written -- not even a truncation.
 #[test]

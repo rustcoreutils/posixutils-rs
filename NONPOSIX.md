@@ -260,6 +260,10 @@ but no daemon to run them.  Behavior follows Vixie cron:
    `dh_compress` prunes with `-prune -false`).
  * `-size nk` — the size in KiB, rounded up.  No other GNU unit is
    accepted.  Forced by debhelper (`dh_compress` `-size +4k`).
+ * `-delete` — an action removing the entry (`rmdir` for a directory); it
+   implies `-depth`, never removes a starting point such as `.`, and is an
+   error next to `-prune` unless `-depth` is given.  Forced by debhelper
+   (`dh_doxygen`, `dh_autotools-dev_restoreconfig`).
  * `-empty` — true for an empty regular file or a directory with no
    entries.  Forced by debhelper (`dh_install`, `dh_installdocs`).
  * `-perm /mode` — true if any of the bits in `mode` is set (or `mode` has

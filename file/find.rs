@@ -207,6 +207,9 @@ enum Primary {
     Print0,
     Printf(Vec<PrintfItem>),
     Prune,
+    /// `-delete`: GNU extension, forced by debhelper (dh_doxygen,
+    /// dh_autotools-dev_restoreconfig)
+    Delete,
     Exec(ExecMode),
     Ok {
         utility: String,
@@ -594,6 +597,7 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
             }))
         }
         "-prune" => Ok(Expr::Primary(Primary::Prune)),
+        "-delete" => Ok(Expr::Primary(Primary::Delete)),
         "-depth" => Ok(Expr::Primary(Primary::Depth)),
         "-xdev" => Ok(Expr::Primary(Primary::XDev)),
         "-mount" => Ok(Expr::Primary(Primary::Mount)),
@@ -934,18 +938,17 @@ fn parse_ok(tokens: &[&str], idx: &mut usize) -> Result<(String, Vec<String>), S
 
 /// Check if expression contains any action
 fn has_action(expr: &Expr) -> bool {
-    match expr {
-        Expr::Primary(p) => matches!(
+    has_primary(expr, |p| {
+        matches!(
             p,
             Primary::Print
                 | Primary::Print0
                 | Primary::Printf(_)
                 | Primary::Exec(_)
                 | Primary::Ok { .. }
-        ),
-        Expr::Not(e) => has_action(e),
-        Expr::And(l, r) | Expr::Or(l, r) => has_action(l) || has_action(r),
-    }
+                | Primary::Delete
+        )
+    })
 }
 
 /// Give every `-exec ... {} +` primary its own aggregation set, stamping each
@@ -980,13 +983,12 @@ fn register_exec_batches(expr: &mut Expr, batches: &mut Vec<ExecBatch>) {
     }
 }
 
-/// Check if expression contains -depth
-fn has_depth(expr: &Expr) -> bool {
+/// Does the expression contain a primary for which `pred` holds?
+fn has_primary(expr: &Expr, pred: fn(&Primary) -> bool) -> bool {
     match expr {
-        Expr::Primary(Primary::Depth) => true,
-        Expr::Not(e) => has_depth(e),
-        Expr::And(l, r) | Expr::Or(l, r) => has_depth(l) || has_depth(r),
-        _ => false,
+        Expr::Primary(p) => pred(p),
+        Expr::Not(e) => has_primary(e, pred),
+        Expr::And(l, r) | Expr::Or(l, r) => has_primary(l, pred) || has_primary(r, pred),
     }
 }
 
@@ -1002,26 +1004,6 @@ fn set_depth_limits(expr: &Expr, state: &mut FindState) {
             set_depth_limits(r, state);
         }
         _ => {}
-    }
-}
-
-/// Check if expression contains -xdev
-fn has_xdev(expr: &Expr) -> bool {
-    match expr {
-        Expr::Primary(Primary::XDev) => true,
-        Expr::Not(e) => has_xdev(e),
-        Expr::And(l, r) | Expr::Or(l, r) => has_xdev(l) || has_xdev(r),
-        _ => false,
-    }
-}
-
-/// Check if expression contains -mount
-fn has_mount(expr: &Expr) -> bool {
-    match expr {
-        Expr::Primary(Primary::Mount) => true,
-        Expr::Not(e) => has_mount(e),
-        Expr::And(l, r) | Expr::Or(l, r) => has_mount(l) || has_mount(r),
-        _ => false,
     }
 }
 
@@ -1130,6 +1112,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
         }
         Primary::Const(value) => EvalResult::new(*value),
         Primary::Empty => EvalResult::new(is_empty(ctx, state)),
+        Primary::Delete => EvalResult::new(delete_entry(ctx, state)),
         Primary::Regex(re) => EvalResult::new(re.is_match_bytes(ctx.path.as_os_str().as_bytes())),
         Primary::NoUser => {
             let uid = ctx.metadata.uid();
@@ -1261,6 +1244,34 @@ fn is_empty(ctx: &EvalContext, state: &mut FindState) -> bool {
         Err(e) => {
             eprintln!(
                 "find: '{}': {}",
+                ctx.path.display(),
+                plib::diag::io_error_text(&e)
+            );
+            state.had_error = true;
+            false
+        }
+    }
+}
+
+/// `-delete`: remove the entry itself (a symlink, never its target), a
+/// directory with `rmdir`. As in GNU find, a starting point with no final
+/// name component such as `.` is left alone. A failure is reported and
+/// makes the primary false.
+fn delete_entry(ctx: &EvalContext, state: &mut FindState) -> bool {
+    if ctx.path.file_name().is_none() {
+        return true;
+    }
+    let own = ctx.link_metadata.unwrap_or(ctx.metadata);
+    let removed = if own.is_dir() {
+        fs::remove_dir(ctx.path)
+    } else {
+        fs::remove_file(ctx.path)
+    };
+    match removed {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "find: cannot delete '{}': {}",
                 ctx.path.display(),
                 plib::diag::io_error_text(&e)
             );
@@ -1568,9 +1579,18 @@ fn find(args: Vec<String>) -> Result<i32, String> {
 
     // Set up state
     let mut state = FindState::new();
-    state.depth_first = has_depth(&expr);
-    state.xdev = has_xdev(&expr);
-    state.mount = has_mount(&expr);
+    let depth = has_primary(&expr, |p| matches!(p, Primary::Depth));
+    // GNU: -delete implies -depth, so a -prune next to it would do nothing.
+    let delete = has_primary(&expr, |p| matches!(p, Primary::Delete));
+    if delete && !depth && has_primary(&expr, |p| matches!(p, Primary::Prune)) {
+        return Err(
+            "-delete implies -depth, which makes -prune do nothing; give -depth explicitly to go ahead"
+                .to_string(),
+        );
+    }
+    state.depth_first = depth || delete;
+    state.xdev = has_primary(&expr, |p| matches!(p, Primary::XDev));
+    state.mount = has_primary(&expr, |p| matches!(p, Primary::Mount));
     state.symlink_mode = symlink_mode;
     set_depth_limits(&expr, &mut state);
 

@@ -585,3 +585,91 @@ fn find_empty() {
     );
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Every entry under `dir`, relative to it, sorted.
+fn tree_listing(dir: &Path) -> Vec<String> {
+    fn walk(base: &Path, d: &Path, out: &mut Vec<String>) {
+        for e in fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            out.push(p.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+            if fs::symlink_metadata(&p).unwrap().is_dir() {
+                walk(base, &p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// `-delete`: dh_autotools-dev_restoreconfig and dh_doxygen remove files
+/// with it. It is an action, implies `-depth` so a whole tree goes, never
+/// removes the starting point `.`, and reports what it cannot remove.
+#[test]
+fn find_delete() {
+    let dir = scratch_dir("delete");
+    for d in ["a/b", "keep", "rmme/x/y", "full"] {
+        fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    for f in [
+        "config.sub.dh-orig",
+        "a/b/config.guess.dh-orig",
+        "a/b/config.guess",
+        "rmme/x/y/z",
+        "full/f",
+        "keep/k.md5",
+        "keep/k.map",
+        "keep/k.html",
+    ] {
+        fs::write(dir.join(f), "").unwrap();
+    }
+    // dh_autotools-dev_restoreconfig
+    expect_words(
+        &dir,
+        ". -type f ( -name config.guess.dh-orig -o -name config.sub.dh-orig ) -delete",
+        &[],
+    );
+    // dh_doxygen
+    expect_words(
+        &dir,
+        "keep -type f -a ( -name *.md5 -o -name *.map ) -delete",
+        &[],
+    );
+    // A whole tree, children first.
+    expect_words(&dir, "rmme -delete", &[]);
+    assert_eq!(
+        tree_listing(&dir),
+        [
+            "a",
+            "a/b",
+            "a/b/config.guess",
+            "full",
+            "full/f",
+            "keep",
+            "keep/k.html"
+        ]
+    );
+
+    let (out, err, code) = find_in(&dir, &["-name", "full", "-delete"]);
+    assert_eq!(
+        (out, err.as_str(), code),
+        (
+            vec![],
+            "find: cannot delete './full': Directory not empty\n",
+            1
+        )
+    );
+
+    expect_words(&dir, "-delete", &[]);
+    assert!(dir.is_dir());
+    assert_eq!(tree_listing(&dir), Vec::<String>::new());
+
+    run_test_find(
+        &[".", "-prune", "-delete"],
+        "",
+        "find: -delete implies -depth, which makes -prune do nothing; give -depth explicitly to go ahead\n",
+        1,
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}

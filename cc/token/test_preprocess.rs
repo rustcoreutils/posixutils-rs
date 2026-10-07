@@ -2640,3 +2640,43 @@ fn test_cmdline_define_of_an_undefined_name_is_not_applied() {
         ["X", "2", "F", "(", "2", ")"]
     );
 }
+
+/// Run `input` through the preprocessor with these `-U` options, returning
+/// the output and how many errors and warnings it raised.
+fn preprocess_with_undefines(input: &str, undefines: &[&str]) -> (Vec<String>, u32, u32) {
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let defines = ["X=1".to_string()];
+    let undefines: Vec<String> = undefines.iter().map(|u| u.to_string()).collect();
+    let config = PreprocessConfig {
+        defines: &defines,
+        undefines: &undefines,
+        ..Default::default()
+    };
+    let (errors, warnings) = (crate::diag::error_count(), crate::diag::warning_count());
+    let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+    (
+        get_token_strings(&out, &idents),
+        crate::diag::error_count() - errors,
+        crate::diag::warning_count() - warnings,
+    )
+}
+
+/// A `-U` operand is the operand of an `#undef`, checked as `-D`'s is: a
+/// name that is not an identifier is an error, trailing tokens a warning,
+/// as in gcc. `-U 1x` was silently ignored.
+#[test]
+fn test_cmdline_undefine_name_must_be_an_identifier() {
+    for bad in ["1x", "-UX", "", "defined"] {
+        let (out, errors, _) = preprocess_with_undefines("X\n", &[bad]);
+        assert_eq!(errors, 1, "-U {bad:?}");
+        assert_eq!(out, ["1"], "-U {bad:?} undefines nothing");
+    }
+    // `-U a-b` is `#undef a-b`: `a` is undefined, and `-b` is extra.
+    let (out, errors, warnings) = preprocess_with_undefines("X\n", &["X-b"]);
+    assert_eq!((errors, warnings), (0, 1));
+    assert_eq!(out, ["X"]);
+    let (out, errors, warnings) = preprocess_with_undefines("X\n", &["X"]);
+    assert_eq!((errors, warnings), (0, 0));
+    assert_eq!(out, ["X"]);
+}

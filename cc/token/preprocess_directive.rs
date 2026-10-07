@@ -616,7 +616,12 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(mac);
     }
 
-    fn handle_undef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
+    pub(super) fn handle_undef(
+        &mut self,
+        iter: &mut TokenCursor,
+        idents: &IdentTable,
+        pos: Position,
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;

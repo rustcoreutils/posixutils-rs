@@ -1428,7 +1428,24 @@ impl<'a> Preprocessor<'a> {
             Some(eq) => format!("{} {}\n", &spec[..eq], &spec[eq + 1..]),
             None => format!("{} 1\n", spec),
         };
+        let (mut cursor, pos) = Self::cmdline_directive(&text, idents);
+        self.handle_define(&mut cursor, idents, pos);
+    }
 
+    /// Apply one command-line `-U` operand, as the `#undef` it stands for.
+    ///
+    /// Through the ordinary directive path, as `-D` is, so its name is
+    /// checked by the same rule: `-U 1x` is "macro names must be
+    /// identifiers", and `-U a-b` undefines `a` with a warning about `-b`,
+    /// as in gcc.
+    fn undef_from_cmdline(&mut self, name: &str, idents: &mut IdentTable) {
+        let (mut cursor, pos) = Self::cmdline_directive(&format!("{name}\n"), idents);
+        self.handle_undef(&mut cursor, idents, pos);
+    }
+
+    /// The operand tokens of a directive given on the command line, and the
+    /// position a malformed one is reported at.
+    fn cmdline_directive(text: &str, idents: &mut IdentTable) -> (TokenCursor, Position) {
         let stream_id = diag::init_stream("<command-line>");
         let tokens = {
             let mut tokenizer = Tokenizer::new(text.as_bytes(), stream_id, idents);
@@ -1442,7 +1459,7 @@ impl<'a> Preprocessor<'a> {
         // buffer and so is flagged as beginning a line -- which the operand's
         // same-line check then reads as `#define` with nothing after it.
         // `-DGITVERSION="..."`, which CPython's build passes, was rejected.
-        let mut cursor = TokenCursor::new(
+        let cursor = TokenCursor::new(
             tokens
                 .into_iter()
                 .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
@@ -1452,10 +1469,13 @@ impl<'a> Preprocessor<'a> {
                 })
                 .collect(),
         );
-        // A `-D` has no `#` to blame, so a malformed one is reported at the
-        // start of the synthesized directive.
-        let pos = cursor.peek().map(|t| t.pos).unwrap_or_default();
-        self.handle_define(&mut cursor, idents, pos);
+        // A command-line directive has no `#` to blame, so a malformed one is
+        // reported at the start of the synthesized directive.
+        let pos = cursor
+            .peek()
+            .map(|t| t.pos)
+            .unwrap_or_else(|| Position::new(stream_id, 1, 1));
+        (cursor, pos)
     }
 
     pub fn undef_macro(&mut self, name: &str) {
@@ -1484,7 +1504,7 @@ impl<'a> Preprocessor<'a> {
             }
         }
         for undef in undefines {
-            self.undef_macro(undef);
+            self.undef_from_cmdline(undef, idents);
         }
     }
 

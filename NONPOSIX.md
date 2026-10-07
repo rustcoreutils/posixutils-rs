@@ -421,6 +421,13 @@ POSIX specifies only `-k`.  Every other option is an addition:
 
  * A `g` suffix on the `-b` argument.  POSIX defines `k` and `m`.
 
+### tail
+
+ * The historical forms withdrawn from POSIX in Issue 6, as the first
+   argument only: `-number` and `+number` mean `-n -number` and
+   `-n +number`; `-numberc` and `+numberc` mean `-c -number` and
+   `-c +number`.  The historical `b`, `l` and `f` suffixes are not accepted.
+
 ### talk
 
  * `--local` — use the local Unix-domain `talkd` socket instead of the network

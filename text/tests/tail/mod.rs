@@ -355,3 +355,92 @@ fn test_tail_error_names_the_file() {
     );
     assert_ne!(out.status.code(), Some(0));
 }
+
+// ---------------------------------------------------------------------------
+// Historical `-number` / `+number` forms (withdrawn from POSIX in Issue 6)
+// ---------------------------------------------------------------------------
+
+fn tail_run(args: &[&str]) -> (String, String, i32) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tail"))
+        .args(args)
+        .output()
+        .expect("run tail");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+fn tail_tmp(name: &str, content: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("posixutils-tail-{}-{}", std::process::id(), name));
+    std::fs::write(&p, content).expect("write temp file");
+    p
+}
+
+#[test]
+fn test_tail_historical_minus_number_stdin() {
+    tail_test(&["-1"], "a\nb\nc\n", "c\n");
+    tail_test(&["-0"], "a\nb\nc\n", "");
+}
+
+#[test]
+fn test_tail_historical_plus_number_stdin() {
+    tail_test(&["+2"], "a\nb\nc\n", "b\nc\n");
+}
+
+#[test]
+fn test_tail_historical_bytes_stdin() {
+    tail_test(&["-1c"], "abc\n", "\n");
+    tail_test(&["-3c"], "abc\ndef\n", "ef\n");
+    tail_test(&["+3c"], "abc\ndef\n", "c\ndef\n");
+}
+
+#[test]
+fn test_tail_historical_forms_with_file() {
+    let f = tail_tmp("hist", "1\n2\n3\n4\n5\n");
+    let p = f.to_str().unwrap();
+    let (stdout, stderr, code) = tail_run(&["-3", p]);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("3\n4\n5\n", "", 0)
+    );
+    let (stdout, _, code) = tail_run(&["+2", p]);
+    assert_eq!((stdout.as_str(), code), ("2\n3\n4\n5\n", 0));
+    let (stdout, _, code) = tail_run(&["-4c", p]);
+    assert_eq!((stdout.as_str(), code), ("4\n5\n", 0));
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn test_tail_historical_form_is_only_the_first_argument() {
+    // As in GNU: once another option or `--` precedes it, the word is an
+    // ordinary option or operand again.
+    let (_, stderr, code) = tail_run(&["-n", "2", "-3"]);
+    assert!(!stderr.is_empty());
+    assert_ne!(code, 0);
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("posixutils-tail-{}-dashdir", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("-1"), "x\ny\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tail"))
+        .args(["--", "-1"])
+        .current_dir(&dir)
+        .output()
+        .expect("run tail");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x\ny\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_tail_historical_number_invalid_is_an_error() {
+    for bad in ["-3x", "-99999999999999999999999", "+3cf"] {
+        let (stdout, stderr, code) = tail_run(&[bad]);
+        assert_eq!(stdout, "", "{bad}");
+        assert!(!stderr.is_empty(), "{bad}: no diagnostic");
+        assert_ne!(code, 0, "{bad}: must fail");
+    }
+}

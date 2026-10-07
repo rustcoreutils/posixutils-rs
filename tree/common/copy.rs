@@ -123,13 +123,15 @@ pub fn verify_made_dir(parent_fd: libc::c_int, dir_fd: libc::c_int, dir: &Path) 
     if !others_can_rename {
         return Ok(());
     }
+    // Every fact about the made directory comes from the descriptor cp goes on to use.
     let opened = fd_metadata(dir_fd)?;
     let made = MadeObject {
         uid: opened.uid(),
         nlink: opened.nlink(),
         is_dir: true,
+        on_owner_mapping_fs: fs_maps_owners(dir_fd),
     };
-    if !made_by_us(made, parent.uid(), euid) || !ftw::is_empty_dir_fd(dir_fd)? {
+    if !made_by_us(made, Some(parent.uid()), euid) || !ftw::is_empty_dir_fd(dir_fd)? {
         return Err(io::Error::other(gettext!(
             "'{}' was replaced after it was made",
             dir.display()
@@ -138,32 +140,78 @@ pub fn verify_made_dir(parent_fd: libc::c_int, dir_fd: libc::c_int, dir: &Path) 
     Ok(())
 }
 
-/// Owner and link count, as `fstat` reports them, of an object cp has just made.
+/// What `fstat` (on a descriptor cp holds for it) reports about an object cp has just made.
 #[derive(Clone, Copy)]
 struct MadeObject {
     uid: u32,
     nlink: u64,
     is_dir: bool,
+    /// The object's filesystem reports owners it maps rather than stores (`fs_maps_owners`).
+    on_owner_mapping_fs: bool,
 }
 
-/// Whether `made`, found where cp has just made an object in a directory owned by
-/// `parent_uid`, can be the object cp made rather than one swapped in by someone else.
+/// Whether the filesystem holding `fd` reports file owners from a mount-wide or remote mapping
+/// rather than from what each creator was: vfat/msdos, exfat, ntfs (in-kernel ntfs and ntfs3),
+/// cifs/smb, NFS and FUSE (ntfs-3g, sshfs, ...). On these an object cp makes can be reported as
+/// owned by someone other than cp's effective user (`uid=` mount options, sshfs without
+/// idmap, NFS root_squash). Elsewhere (and wherever the type cannot be read) owners are taken
+/// to be stored, which is the strict answer.
+#[cfg(target_os = "linux")]
+fn fs_maps_owners(fd: libc::c_int) -> bool {
+    const OWNER_MAPPING_FS: [u64; 9] = [
+        0x4d44,      // MSDOS_SUPER_MAGIC (msdos, vfat)
+        0x2011_bab0, // EXFAT_SUPER_MAGIC
+        0x5346_544e, // NTFS_SB_MAGIC
+        0x7366_746e, // ntfs3
+        0xff53_4d42, // CIFS_SUPER_MAGIC
+        0xfe53_4d42, // SMB2_SUPER_MAGIC
+        0x517b,      // SMB_SUPER_MAGIC
+        0x6969,      // NFS_SUPER_MAGIC
+        0x6573_5546, // FUSE_SUPER_MAGIC (fuse and fuseblk)
+    ];
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(fd, st.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let st = unsafe { st.assume_init() };
+    // `f_type` is a signed word whose width varies by architecture; the magic numbers are its
+    // low 32 bits.
+    let f_type = u64::from(st.f_type as u32);
+    OWNER_MAPPING_FS.contains(&f_type)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fs_maps_owners(_fd: libc::c_int) -> bool {
+    false
+}
+
+/// Whether `made`, found where cp has just made an object in a directory owned by `parent_uid`
+/// (`None` when cp holds no descriptor for that directory), can be the object cp made rather
+/// than one swapped in by someone else.
 ///
-/// Owner: cp's effective user, or -- only in a directory owned by someone other than cp -- that
-/// directory's owner. The second case is a filesystem that maps owners (vfat/exfat/ntfs/cifs
-/// mounted with `uid=`, sshfs without idmap, NFS root_squash), where everything cp makes is
-/// owned like its parent. Neither lets an attacker in a shared directory pass: in a directory
-/// cp's user owns, the object must be cp's user's, which no one else can create (no one can
-/// give a file away, a directory cannot be hard-linked, and a hard link to one of cp's user's
-/// nodes fails the link count below); in a directory another user owns, the object must be
-/// that owner's -- someone who already controls every entry in that directory, cp's included.
-/// A third user's object fails both.
+/// Owner: cp's effective user; or, only on a filesystem that maps owners and only in a parent
+/// cp's user does not own, that parent's owner -- such a filesystem reports everything made
+/// in a directory as owned like it (vfat/exfat/ntfs/cifs `uid=`, sshfs without idmap, NFS
+/// root_squash exports owned by the anonymous user).
+///
+/// Against someone who can write the parent but does not own it: on a filesystem that stores
+/// owners, their object is theirs and never cp's user's (no one can give a file away, a
+/// directory cannot be hard-linked, and a hard link to one of cp's user's nodes fails the link
+/// count), so it is refused; the mapped arm is not open there at all. On a filesystem that
+/// maps owners, their object would be reported with the same mapped owner as cp's -- but such a
+/// filesystem records no owner to steal or confer (a `-p` chown there fails and drops
+/// set-user-ID), and the emptiness and link-count checks still apply. Against the parent's
+/// owner: they control every entry of that directory, cp's included, so accepting their object
+/// grants nothing. Under NFS root_squash, root's objects are the anonymous user's, accepted only
+/// in a parent the anonymous user owns; in a parent owned by a third user they are refused.
 ///
 /// Link count: a fresh symbolic link or special file has exactly one; a fresh directory has
 /// two (itself and its `.`), or one on filesystems that do not count directory links (btrfs,
 /// some FUSE).
-fn made_by_us(made: MadeObject, parent_uid: u32, euid: u32) -> bool {
-    let owner_ok = made.uid == euid || (parent_uid != euid && made.uid == parent_uid);
+fn made_by_us(made: MadeObject, parent_uid: Option<u32>, euid: u32) -> bool {
+    let mapped_like_parent = made.on_owner_mapping_fs
+        && parent_uid.is_some_and(|parent_uid| parent_uid != euid && made.uid == parent_uid);
+    let owner_ok = made.uid == euid || mapped_like_parent;
     let nlink_ok = if made.is_dir {
         made.nlink <= 2
     } else {
@@ -263,14 +311,18 @@ fn fresh_source_md(source: &ftw::Entry) -> io::Result<ftw::Metadata> {
 /// -p for a symbolic link or special file cp just made with `symlinkat`/`mknodat`, which return
 /// no descriptor.
 ///
-/// What the name holds must be what cp made: the same file type, owned by cp's effective user.
-/// On Linux the node is then pinned with an `O_PATH | O_NOFOLLOW` descriptor whose `(dev, ino)`
-/// must match that check, and every change goes through it: owner and times with
-/// `AT_EMPTY_PATH`, the mode of a special file through `/proc/self/fd`, which names exactly
-/// that inode. Elsewhere the changes are made by name with `AT_SYMLINK_NOFOLLOW`, each after
-/// re-checking the identity -- the residual is a replacement between that check and the call.
-/// A symbolic link's own mode is never set: Linux has none to set, and no access check reads
-/// it anywhere.
+/// What the name holds must be what cp made: the same file type, with the owner and link count
+/// `made_by_us` accepts. On Linux the node is pinned first with an `O_PATH | O_NOFOLLOW`
+/// descriptor, every check reads that descriptor's `fstat`/`fstatfs`, and every change goes
+/// through it: owner and times with `AT_EMPTY_PATH`, the mode of a special file through
+/// `/proc/self/fd`, which names exactly that inode. Elsewhere the node is checked by `lstat`
+/// and changed by name with `AT_SYMLINK_NOFOLLOW`, each change after re-checking the identity --
+/// the residual is a replacement between that check and the call. A symbolic link's own mode
+/// is never set: Linux has none to set, and no access check reads it anywhere.
+///
+/// The parent's owner is read from `dirfd` itself (`.` relative to it resolves no name). An
+/// operand resolved from the working directory has no parent descriptor, so only an object
+/// owned by cp's effective user is accepted there.
 fn preserve_made_node(
     dirfd: libc::c_int,
     name: &CStr,
@@ -278,44 +330,36 @@ fn preserve_made_node(
     source_md: &ftw::Metadata,
     target: &Path,
 ) -> io::Result<()> {
-    let md = ftw::Metadata::new(dirfd, name, false)?;
-    let parent_uid = parent_metadata(dirfd, name)?.uid();
-    let made = MadeObject {
-        uid: md.uid(),
-        nlink: md.nlink(),
-        is_dir: false,
+    let parent_uid = if dirfd == libc::AT_FDCWD {
+        None
+    } else {
+        Some(ftw::Metadata::new(dirfd, c".", false)?.uid())
     };
-    if md.file_type() != made_type || !made_by_us(made, parent_uid, unsafe { libc::geteuid() }) {
-        return Err(io::Error::other(gettext!(
-            "'{}' was replaced during the copy",
-            target.display()
-        )));
-    }
-    preserve_node_attributes(dirfd, name, &md, made_type, source_md, target)
-}
-
-/// The directory `name` is in: `dirfd` itself (`.` relative to it resolves no name), or for an
-/// operand resolved from the working directory, the operand's own parent path, resolved as the
-/// operand was.
-fn parent_metadata(dirfd: libc::c_int, name: &CStr) -> io::Result<ftw::Metadata> {
-    if dirfd != libc::AT_FDCWD {
-        return ftw::Metadata::new(dirfd, c".", false);
-    }
-    let parent = Path::new(OsStr::from_bytes(name.to_bytes()))
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let parent = CString::new(parent.as_os_str().as_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    ftw::Metadata::new(libc::AT_FDCWD, &parent, true)
+    let check = |uid: u32, nlink: u64, type_ok: bool, on_owner_mapping_fs: bool| {
+        let made = MadeObject {
+            uid,
+            nlink,
+            is_dir: false,
+            on_owner_mapping_fs,
+        };
+        if type_ok && made_by_us(made, parent_uid, unsafe { libc::geteuid() }) {
+            Ok(())
+        } else {
+            Err(io::Error::other(gettext!(
+                "'{}' was replaced during the copy",
+                target.display()
+            )))
+        }
+    };
+    preserve_node_attributes(dirfd, name, made_type, check, source_md, target)
 }
 
 #[cfg(target_os = "linux")]
 fn preserve_node_attributes(
     dirfd: libc::c_int,
     name: &CStr,
-    made: &ftw::Metadata,
     made_type: ftw::FileType,
+    check: impl Fn(u32, u64, bool, bool) -> io::Result<()>,
     source_md: &ftw::Metadata,
     target: &Path,
 ) -> io::Result<()> {
@@ -332,15 +376,12 @@ fn preserve_node_attributes(
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     let pinned = fs::File::from(fd);
     let pinned_md = pinned.metadata()?;
-    if pinned_md.dev() != made.dev()
-        || pinned_md.ino() != made.ino()
-        || !same_file_type(pinned_md.file_type(), made_type)
-    {
-        return Err(io::Error::other(gettext!(
-            "'{}' was replaced during the copy",
-            target.display()
-        )));
-    }
+    check(
+        pinned_md.uid(),
+        pinned_md.nlink(),
+        same_file_type(pinned_md.file_type(), made_type),
+        fs_maps_owners(pinned.as_raw_fd()),
+    )?;
     let fd = pinned.as_raw_fd();
     let empty = c"";
 
@@ -371,11 +412,18 @@ fn preserve_node_attributes(
 fn preserve_node_attributes(
     dirfd: libc::c_int,
     name: &CStr,
-    made: &ftw::Metadata,
     made_type: ftw::FileType,
+    check: impl Fn(u32, u64, bool, bool) -> io::Result<()>,
     source_md: &ftw::Metadata,
     target: &Path,
 ) -> io::Result<()> {
+    let made = ftw::Metadata::new(dirfd, name, false)?;
+    check(
+        made.uid(),
+        made.nlink(),
+        made.file_type() == made_type,
+        false,
+    )?;
     let still_made = || -> io::Result<()> {
         let md = ftw::Metadata::new(dirfd, name, false)?;
         if md.dev() != made.dev() || md.ino() != made.ino() || md.file_type() != made_type {
@@ -1622,6 +1670,7 @@ mod tests {
             uid,
             nlink,
             is_dir: true,
+            on_owner_mapping_fs: false,
         }
     }
 
@@ -1630,47 +1679,73 @@ mod tests {
             uid,
             nlink,
             is_dir: false,
+            on_owner_mapping_fs: false,
+        }
+    }
+
+    fn mapped(made: MadeObject) -> MadeObject {
+        MadeObject {
+            on_owner_mapping_fs: true,
+            ..made
         }
     }
 
     /// The ordinary case: cp's own object in cp's own or anyone's directory.
     #[test]
     fn accepts_what_cp_made() {
-        assert!(made_by_us(dir(CP, 2), CP, CP));
-        assert!(made_by_us(dir(CP, 2), OTHER, CP));
-        assert!(made_by_us(node(CP, 1), OTHER, CP));
+        assert!(made_by_us(dir(CP, 2), Some(CP), CP));
+        assert!(made_by_us(dir(CP, 2), Some(OTHER), CP));
+        assert!(made_by_us(node(CP, 1), Some(OTHER), CP));
+        assert!(made_by_us(node(CP, 1), None, CP));
     }
 
     /// A filesystem that maps every owner to one uid (vfat/exfat/ntfs/cifs `uid=`, sshfs
     /// without idmap, NFS root_squash): what cp makes is owned like its parent, not by cp.
     #[test]
     fn accepts_an_owner_mapped_by_the_filesystem() {
-        assert!(made_by_us(dir(4242, 2), 4242, CP));
-        assert!(made_by_us(node(4242, 1), 4242, CP));
-        assert!(made_by_us(dir(65534, 2), 65534, 0));
+        assert!(made_by_us(mapped(dir(4242, 2)), Some(4242), CP));
+        assert!(made_by_us(mapped(node(4242, 1)), Some(4242), CP));
+        assert!(made_by_us(mapped(dir(65534, 2)), Some(65534), 0));
+    }
+
+    /// Where owners are stored, an object owned by the parent's owner (who is not cp's user)
+    /// was made by that owner, not by cp.
+    #[test]
+    fn refuses_a_parent_owners_object_where_owners_are_stored() {
+        assert!(!made_by_us(dir(OTHER, 2), Some(OTHER), CP));
+        assert!(!made_by_us(node(OTHER, 1), Some(OTHER), CP));
+    }
+
+    /// The mapped arm needs the parent's owner; with no parent descriptor only cp's own user is
+    /// accepted.
+    #[test]
+    fn refuses_a_mapped_owner_without_a_parent() {
+        assert!(!made_by_us(mapped(dir(4242, 2)), None, CP));
     }
 
     /// Filesystems that report 1 for every directory's link count (btrfs, some FUSE).
     #[test]
     fn accepts_a_directory_link_count_of_one() {
-        assert!(made_by_us(dir(CP, 1), CP, CP));
+        assert!(made_by_us(dir(CP, 1), Some(CP), CP));
     }
 
     /// Someone else's object in a directory cp owns: an attacker in a shared directory.
     #[test]
     fn refuses_another_users_object() {
-        assert!(!made_by_us(dir(OTHER, 2), CP, CP));
-        assert!(!made_by_us(node(OTHER, 1), CP, CP));
+        assert!(!made_by_us(dir(OTHER, 2), Some(CP), CP));
+        assert!(!made_by_us(node(OTHER, 1), Some(CP), CP));
+        assert!(!made_by_us(mapped(dir(OTHER, 2)), Some(CP), CP));
         // In someone else's directory, an object owned by a third user.
-        assert!(!made_by_us(dir(3000, 2), OTHER, CP));
+        assert!(!made_by_us(dir(3000, 2), Some(OTHER), CP));
+        assert!(!made_by_us(mapped(dir(3000, 2)), Some(OTHER), CP));
     }
 
     /// A hard link to an existing node (cp's own, or a mapped owner's) is not a fresh one, and
     /// a directory with subdirectories is not a fresh one.
     #[test]
     fn refuses_link_counts_a_fresh_object_cannot_have() {
-        assert!(!made_by_us(node(CP, 2), CP, CP));
-        assert!(!made_by_us(node(4242, 2), 4242, CP));
-        assert!(!made_by_us(dir(CP, 3), CP, CP));
+        assert!(!made_by_us(node(CP, 2), Some(CP), CP));
+        assert!(!made_by_us(mapped(node(4242, 2)), Some(4242), CP));
+        assert!(!made_by_us(dir(CP, 3), Some(CP), CP));
     }
 }

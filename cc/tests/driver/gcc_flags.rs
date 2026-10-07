@@ -1138,3 +1138,54 @@ fn gcc_flags_header_and_library_options_take_a_hyphen_argument() {
     assert!(!stderr.contains("missing argument"), "{stderr}");
     assert!(stderr.contains("-lc17nosuch"), "{stderr}");
 }
+
+/// An option left without its argument at the end of the line is named as
+/// the user wrote it. c17 passes some to its parser under an internal
+/// spelling, and reported `-MF` as "missing argument to '--MF'".
+///
+/// Nor may the dangling option take as its argument what c17 appends to
+/// the line: `-g ... -I` compiled without a word, and `-fsignaling-nans
+/// ... -o` wrote its object to a file named `-D`.
+#[test]
+fn gcc_flags_missing_argument_names_the_option_as_written() {
+    let (dir, path) = scratch("dangle.c", MAIN);
+    let src = path.to_str().unwrap();
+    let c17 = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .expect("run c17")
+    };
+    let opts = [
+        "-MF",
+        "-MT",
+        "-include",
+        "-iquote",
+        "-isystem",
+        "-idirafter",
+        "-aux-info",
+        "--sysroot",
+        "-I",
+        "-D",
+        "-U",
+        "-o",
+        "-L",
+        "-l",
+        "-Xlinker",
+    ];
+    for opt in opts {
+        for before in [&[][..], &["-g", "-fsignaling-nans", "-fstack-protector"]] {
+            let mut args = before.to_vec();
+            args.extend(["-c", src, opt]);
+            let r = c17(&args);
+            assert_eq!(r.status.code(), Some(1), "{args:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&r.stderr),
+                format!("c17: error: missing argument to '{opt}'\n"),
+                "{args:?}"
+            );
+        }
+    }
+    assert!(!dir.path().join("-D").exists(), "-o took an appended -D");
+}

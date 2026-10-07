@@ -1269,6 +1269,11 @@ pub enum ExprKind {
     /// Used for optimization hints and silencing warnings.
     Unreachable,
 
+    /// `__builtin_unwind_init()`: every callee-saved register is saved in
+    /// the current function's frame, so a scan of the stack sees what the
+    /// callers held in them -- a conservative collector's register flush.
+    UnwindInit,
+
     /// __builtin_complex(real, imag) — construct complex value from two reals
     /// `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` and
     /// `__builtin_shufflevector(a, b, i...)`: a vector whose lane `k` is
@@ -2517,6 +2522,7 @@ impl Expr {
             | K::VaArgPack
             | K::VaArgPackLen
             | K::Unreachable
+            | K::UnwindInit
             | K::StackSave
             | K::FrameAddress { .. }
             | K::ReturnAddress { .. }

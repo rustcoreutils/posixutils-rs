@@ -8160,6 +8160,15 @@ fn test_frame_builtin_level_is_a_parsed_constant() {
     assert!(matches!(expr.kind, ExprKind::FrameAddress { level: 0 }));
 }
 
+/// `__builtin_unwind_init()` takes no arguments and has type void.
+#[test]
+fn test_unwind_init_parses() {
+    let (expr, types, ..) = parse_expr("__builtin_unwind_init()").unwrap();
+    assert!(matches!(expr.kind, ExprKind::UnwindInit));
+    assert_eq!(expr.typ, Some(types.void_id));
+    assert!(parse_expr("__builtin_unwind_init(1)").is_err());
+}
+
 /// gcc rejects a level that is not a non-negative integer constant.
 #[test]
 fn test_frame_builtin_level_must_be_constant() {

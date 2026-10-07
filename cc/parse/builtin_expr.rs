@@ -747,6 +747,15 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_UNWIND_INIT => Some((|| {
+                self.expect_special(b'(')?;
+                self.expect_special(b')')?;
+                Ok(Self::typed_expr(
+                    ExprKind::UnwindInit,
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_CONSTANT_P => Some((|| {
                 // __builtin_constant_p(expr) - returns 1 if expr is a constant, 0 otherwise
                 // This is evaluated at compile time, not runtime

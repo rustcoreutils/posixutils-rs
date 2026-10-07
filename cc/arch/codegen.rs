@@ -1106,6 +1106,19 @@ pub fn asm_dialects(arch: crate::target::Arch) -> bool {
     arch == crate::target::Arch::X86_64
 }
 
+/// The callee-saved registers of `arch`'s calling convention, as an asm
+/// clobber list names them; the frame pointer is left out, being every
+/// prologue's own. `__builtin_unwind_init` clobbers them all.
+pub fn callee_saved_register_names(arch: crate::target::Arch) -> &'static [&'static str] {
+    match arch {
+        crate::target::Arch::X86_64 => &["rbx", "r12", "r13", "r14", "r15"],
+        crate::target::Arch::Aarch64 => &[
+            "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "d8", "d9",
+            "d10", "d11", "d12", "d13", "d14", "d15",
+        ],
+    }
+}
+
 /// A basic asm's text as the extended-asm template that substitutes back to
 /// exactly it. gcc writes a basic asm as it stands -- `%eax`, `%%` and an
 /// x86 `{` all reach the assembler unchanged -- so every character

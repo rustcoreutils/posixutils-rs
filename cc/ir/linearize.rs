@@ -2977,6 +2977,9 @@ impl<'a> Linearizer<'a> {
             // __builtin_unreachable ()` -- it kills a correct program.
             ExprKind::Unreachable => !speculative,
 
+            // It writes the frame.
+            ExprKind::UnwindInit => false,
+
             // Frame/return address builtins are pure (just read registers)
             ExprKind::FrameAddress { .. } | ExprKind::ReturnAddress { .. } => true,
 
@@ -6260,6 +6263,19 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::UnwindInit => {
+                // An asm that clobbers every callee-saved register: the
+                // prologue saves each one an asm clobbers, which is all the
+                // builtin promises.
+                let clobbers: Vec<String> =
+                    crate::arch::callee_saved_register_names(self.target.arch)
+                        .iter()
+                        .map(|r| r.to_string())
+                        .collect();
+                self.linearize_asm("", &[], &[], &clobbers, &[]);
+                self.emit_const(0, self.types.int_id)
+            }
+
             ExprKind::FrameAddress { level } => {
                 let result = self.alloc_pseudo();
                 let insn = Instruction::frame_walk(
@@ -7284,6 +7300,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable
+            | ExprKind::UnwindInit
             | ExprKind::FrameAddress { .. }
             | ExprKind::ReturnAddress { .. }
             | ExprKind::Setjmp { .. }

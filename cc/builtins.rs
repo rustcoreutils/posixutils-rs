@@ -297,6 +297,8 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_types_compatible_p",
     "__builtin_classify_type",
     "__builtin_unreachable",
+    // Spill every callee-saved register to the frame
+    "__builtin_unwind_init",
     // gcc's lightweight non-local goto
     "__builtin_setjmp",
     "__builtin_longjmp",

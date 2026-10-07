@@ -59,6 +59,9 @@ pub enum ErrorKind {
     ReadDir,
     Stat,
     ReadLink,
+    /// Following a symbolic link would re-enter a directory that is an ancestor of the entry (same
+    /// `(st_dev, st_ino)`), so the traversal refused to descend. The error is `ELOOP`.
+    Cycle,
 }
 
 /// Why `traverse_directory` is leaving a directory.
@@ -1034,7 +1037,7 @@ where
                                     entry,
                                     Error::new(
                                         io::Error::from_raw_os_error(libc::ELOOP),
-                                        ErrorKind::Stat,
+                                        ErrorKind::Cycle,
                                     )
                                 );
                             }

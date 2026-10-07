@@ -730,7 +730,7 @@ fn enter_exit_balanced_on_symlink_loop() {
         },
     );
 
-    assert_eq!(errors, [ftw::ErrorKind::Stat], "expected an ELOOP report");
+    assert_eq!(errors, [ftw::ErrorKind::Cycle], "expected a cycle report");
 }
 
 /// A directory that is readable but not searchable can still be enumerated: `opendir` needs read

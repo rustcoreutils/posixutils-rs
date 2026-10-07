@@ -14,11 +14,10 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 use plib::platform::P_WINSIZE_REQUEST_CODE;
 use std::{
-    collections::HashMap,
     ffi::{CStr, CString, OsStr},
     io,
     mem::MaybeUninit,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::atomic::{AtomicU8, Ordering},
@@ -977,10 +976,6 @@ fn process_single_dir(
     // mutated
     let exit_code = AtomicU8::new(0);
 
-    // Stores visited paths to prevent infinite loops due to symbolic links
-    // Map of canonical path -> path
-    let mut visited: HashMap<(u64, u64), PathBuf> = HashMap::new();
-
     let mut entries: Vec<Entry> = Vec::new();
     let mut errors: Vec<io::Error> = Vec::new();
 
@@ -1045,34 +1040,11 @@ fn process_single_dir(
         }
     }
 
-    let mut terminate = false;
-
     let _ = ftw::traverse_directory(
         path,
         |dir_entry| {
-            if terminate {
-                return Ok(false);
-            }
-
             let metadata = dir_entry.metadata().unwrap();
             let is_dot_or_double_dot = dir_entry.is_dot_or_double_dot();
-
-            // Get the metadata of the file, equivalent to `std::fs::symlink_metadata`
-            let marker = {
-                let metadata =
-                    match ftw::Metadata::new(dir_entry.dir_fd(), dir_entry.file_name(), false) {
-                        Ok(md) => md,
-                        Err(e) => {
-                            let path_str = ls_from_utf8_lossy(
-                                dir_entry.path().as_inner().as_os_str().as_bytes(),
-                            );
-                            let err_str = gettext!("cannot access '{}': {}", path_str, e);
-                            errors.push(io::Error::other(err_str));
-                            return Ok(false);
-                        }
-                    };
-                (metadata.dev(), metadata.ino())
-            };
 
             if current_dir.is_none() {
                 // Init `dir`. `dir_entry.path()` should still be `path` here.
@@ -1085,7 +1057,6 @@ fn process_single_dir(
                     current_dir.as_ref().unwrap(),
                 );
 
-                visited.insert(marker, current_dir.as_ref().unwrap().clone());
                 return Ok(true);
             }
 
@@ -1183,36 +1154,6 @@ fn process_single_dir(
                 comps.as_path()
             };
 
-            if let Some(file_name) = visited.get(&marker) {
-                // Exclude . and .. from loop detection logic
-                if !is_dot_or_double_dot {
-                    // Process and print previous entries before showing the infinite loop error
-                    if let Err(e) = process_dir_entry(&mut entries) {
-                        errors.push(e);
-                    }
-                    print_contents(
-                        config,
-                        current_dir_ref,
-                        &mut entries,
-                        &mut errors,
-                        &exit_code,
-                    );
-
-                    eprintln!(
-                        "ls: {}: {}",
-                        ls_from_utf8_lossy(file_name.as_os_str().as_bytes()),
-                        gettext("not listing already-listed directory")
-                    );
-
-                    // This is the only error that has exit code 2 for now.
-                    exit_code.fetch_max(2, Ordering::SeqCst);
-                    terminate = true;
-                    return Ok(false);
-                }
-            } else {
-                visited.insert(marker, current_dir_ref.clone());
-            }
-
             // If moving to a new subdirectory
             if dir_parent != current_dir_ref.as_path() {
                 print_contents(
@@ -1244,6 +1185,18 @@ fn process_single_dir(
         |_, _| Ok(()),
         |entry, error| {
             let path_str = ls_from_utf8_lossy(entry.path().as_inner().as_os_str().as_bytes());
+            if error.kind() == ftw::ErrorKind::Cycle {
+                // -R descent only: ftw compares (dev, ino) against the ancestors of this entry,
+                // so an operand, a hard link, or a directory reached twice by different
+                // paths is never refused.
+                eprintln!(
+                    "ls: {}: {}",
+                    path_str,
+                    gettext("not listing already-listed directory")
+                );
+                exit_code.fetch_max(2, Ordering::SeqCst);
+                return;
+            }
             eprintln!(
                 "ls: {}",
                 gettext!("cannot access '{}': {}", path_str, error.inner())

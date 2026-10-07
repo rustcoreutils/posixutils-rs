@@ -411,7 +411,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                     )
                 );
             }
-            ftw::ErrorKind::Stat => {
+            ftw::ErrorKind::Stat | ftw::ErrorKind::Cycle => {
                 eprintln!(
                     "rm: {}",
                     gettext!(

@@ -625,17 +625,26 @@ where
         // POSIX creates the file a dangling destination link names, which GNU does only under
         // POSIXLY_CORRECT. Inside a recursive copy that link is whatever the destination tree
         // holds, and following it can write anywhere, so it is done only for the operand the
-        // user named; below it the link is refused in GNU's words. (A link to be reproduced
-        // as a link, or a special file, replaces the dangling link instead.)
-        if target_is_dangling_symlink
+        // user named; below it the link is refused in GNU's words. A link that resolves is
+        // refused below the operand for the same reason (GNU writes through it): the tree's
+        // owner chose where it points, not the user who ran cp. (A link to be reproduced as a
+        // link, or a special file, replaces the link instead.)
+        let target_is_symlink = target_symlink_md
+            .as_ref()
+            .is_some_and(|md| md.file_type() == ftw::FileType::SymbolicLink);
+        if target_is_symlink
             && !state.at_top_level
             && !act_on_link_itself
             && !(source_is_special_file && cfg.recursive)
         {
-            return Err(io::Error::other(gettext!(
-                "not writing through dangling symlink '{}'",
-                target.display()
-            )));
+            return Err(io::Error::other(if target_is_dangling_symlink {
+                gettext!(
+                    "not writing through dangling symlink '{}'",
+                    target.display()
+                )
+            } else {
+                gettext!("not writing through symlink '{}'", target.display())
+            }));
         }
 
         // 3.a
@@ -798,15 +807,42 @@ where
             }
             let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
 
-            let target_fd = unsafe {
-                libc::openat(
-                    target_dirfd,
-                    target_filename,
-                    libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+            // Open what was checked above, and nothing else. A link is followed only when the
+            // check saw one, which is now only the operand itself (POSIX writes through it);
+            // otherwise `O_NOFOLLOW` refuses a link swapped in since. Either way the descriptor
+            // must be the file the check examined -- the link's referent, or the file itself --
+            // and only then is it truncated: `O_TRUNC` at the open would have emptied a file
+            // swapped in before its identity could be checked.
+            let (open_flags, expected_md) = if target_is_symlink {
+                (
+                    libc::O_WRONLY | libc::O_CLOEXEC,
+                    target_deref_md.as_ref().ok(),
+                )
+            } else {
+                (
+                    libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    target_symlink_md.as_ref(),
                 )
             };
+            let target_fd = unsafe { libc::openat(target_dirfd, target_filename, open_flags) };
             if target_fd != -1 {
                 let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
+                let opened_md = target_file.metadata()?;
+                let is_checked_file = expected_md
+                    .is_some_and(|md| md.dev() == opened_md.dev() && md.ino() == opened_md.ino());
+                if !is_checked_file {
+                    return Err(io::Error::other(gettext!(
+                        "will not write to '{}': it changed after it was checked",
+                        target.display()
+                    )));
+                }
+                target_file.set_len(0).map_err(|e| {
+                    io::Error::other(gettext!(
+                        "cannot truncate '{}': {}",
+                        target.display(),
+                        error_string(&e)
+                    ))
+                })?;
 
                 io::copy(&mut source_file, &mut target_file)?;
                 (source_file, target_file)

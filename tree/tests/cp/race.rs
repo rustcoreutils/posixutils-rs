@@ -168,6 +168,114 @@ fn cp_r_does_not_write_through_a_dangling_link_below_the_operand() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// An existing symbolic link inside the destination tree of `cp -R` is not written through
+/// either: like a dangling one, it could name any file. (GNU follows it.)
+#[test]
+fn cp_r_does_not_write_through_a_symlink_below_the_operand() {
+    use std::os::unix::fs::symlink;
+
+    let base = scratch("symlink_below");
+    fs::create_dir_all(base.join("src")).unwrap();
+    fs::write(base.join("src/f"), b"source").unwrap();
+    fs::create_dir_all(base.join("dst/src")).unwrap();
+    fs::write(base.join("elsewhere"), b"untouched").unwrap();
+    symlink(base.join("elsewhere"), base.join("dst/src/f")).unwrap();
+
+    let out = Command::new(get_binary_path("cp"))
+        .args(["-R", "src", "dst"])
+        .current_dir(&base)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute cp");
+    assert_eq!(
+        fs::read(base.join("elsewhere")).unwrap(),
+        b"untouched",
+        "cp -R wrote through a symlink in the destination tree"
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "cp: not writing through symlink 'dst/src/f'\n"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// Run `cp -i source target` (in `base`), and when it asks to overwrite, let `swap` replace the
+/// destination before answering yes. Returns cp's stderr.
+fn cp_i_swapping_at_prompt(base: &std::path::Path, swap: impl FnOnce()) -> String {
+    use std::io::Read;
+
+    let mut child = Command::new(get_binary_path("cp"))
+        .args(["-i", "source", "target"])
+        .current_dir(base)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to execute cp");
+    let mut stderr = child.stderr.take().unwrap();
+    let mut seen = Vec::new();
+    let mut byte = [0u8; 1];
+    while !seen.ends_with(b"? ") {
+        assert_eq!(stderr.read(&mut byte).unwrap(), 1, "cp never prompted");
+        seen.push(byte[0]);
+    }
+    // cp has checked the destination and is waiting: the window is held open.
+    swap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    stderr.read_to_end(&mut seen).unwrap();
+    child.wait().unwrap();
+    String::from_utf8_lossy(&seen).into_owned()
+}
+
+/// cp decided to overwrite a regular file; a symbolic link swapped in for it before the open
+/// must not be followed.
+#[test]
+fn cp_never_writes_through_a_symlink_swapped_in_after_the_check() {
+    use std::os::unix::fs::symlink;
+
+    let base = scratch("swap_symlink");
+    fs::write(base.join("source"), b"source").unwrap();
+    fs::write(base.join("target"), b"old").unwrap();
+    fs::write(base.join("victim"), b"untouched").unwrap();
+
+    let stderr = cp_i_swapping_at_prompt(&base, || {
+        fs::remove_file(base.join("target")).unwrap();
+        symlink("victim", base.join("target")).unwrap();
+    });
+    assert_eq!(
+        fs::read(base.join("victim")).unwrap(),
+        b"untouched",
+        "cp wrote through a symlink swapped in after its check; stderr: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// The same for another regular file renamed over the destination: the file opened must be the
+/// one cp checked, or nothing is written -- not even a truncation.
+#[test]
+fn cp_never_writes_into_a_file_swapped_in_after_the_check() {
+    let base = scratch("swap_file");
+    fs::write(base.join("source"), b"source").unwrap();
+    fs::write(base.join("target"), b"old").unwrap();
+    fs::write(base.join("victim"), b"untouched").unwrap();
+
+    let stderr = cp_i_swapping_at_prompt(&base, || {
+        fs::hard_link(base.join("victim"), base.join("victim_link")).unwrap();
+        fs::rename(base.join("victim_link"), base.join("target")).unwrap();
+    });
+    assert_eq!(
+        fs::read(base.join("victim")).unwrap(),
+        b"untouched",
+        "cp wrote into a file swapped in after its check; stderr: {stderr}"
+    );
+    assert!(stderr.contains("changed"), "stderr: {stderr}");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// `cp --parents` never follows a symbolic link in the destination path
 /// below the target operand, made or found: one that "already exists" may
 /// have been planted a moment before cp's `mkdirat`, and the two cannot be

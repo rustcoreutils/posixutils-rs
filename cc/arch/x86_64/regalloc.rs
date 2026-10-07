@@ -3046,6 +3046,30 @@ mod tests {
         assert!(!ra.ld_pseudos.contains(&PseudoId(1)));
     }
 
+    /// A register output interferes with the address of a memory output of
+    /// the same statement, even when that address dies there: the template
+    /// writes through it. It may still share with a plain input that dies.
+    #[test]
+    fn asm_register_output_interferes_with_a_memory_outputs_address() {
+        use crate::arch::regalloc::build_interference_graph;
+        use crate::ir::{BasicBlock, BasicBlockId, Function};
+        let asm = make_asm_insn(
+            &[],
+            &[("=r", PseudoId(1)), ("=m", PseudoId(2)), ("r", PseudoId(3))],
+        );
+        let types = crate::types::TypeTable::new(&crate::target::Target::host());
+        let mut func = Function::new("f", types.void_id);
+        let mut block = BasicBlock::new(BasicBlockId(0));
+        block.insns = vec![asm];
+        func.blocks.push(block);
+        let candidates = [1, 2, 3].map(PseudoId).into_iter().collect();
+        let live_out = vec![HashSet::new()];
+        let graph = build_interference_graph(&candidates, &func, &live_out, false);
+        let neighbors: Vec<PseudoId> = graph.neighbors(PseudoId(1)).collect();
+        assert!(neighbors.contains(&PseudoId(2)), "{neighbors:?}");
+        assert!(!neighbors.contains(&PseudoId(3)), "{neighbors:?}");
+    }
+
     /// A `Q` operand is pinned to the first of %rax..%rdx that the statement
     /// neither pins nor clobbers, each to a different one; a tied input takes
     /// its output's register, and the allocator sees every pin.

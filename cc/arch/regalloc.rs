@@ -1501,6 +1501,7 @@ pub fn build_interference_graph(
             if insn.op == Opcode::Asm {
                 if let Some(asm) = &insn.extra().asm_data {
                     add_early_clobber_edges(&mut graph, asm, candidates);
+                    add_memory_output_edges(&mut graph, asm, candidates);
                 }
             }
             // Each def interferes with everything currently live AND
@@ -1582,6 +1583,37 @@ fn add_early_clobber_edges(
         }
         for &p in &read {
             // `add_edge` ignores a self-edge: a tied input is the output.
+            graph.add_edge(out.pseudo, p);
+        }
+    }
+}
+
+/// Edges from each register output of one asm statement to the address of
+/// each of its memory outputs.
+///
+/// A plain output may share a register with an input the template has
+/// finished reading, but the address of a memory output is read for the
+/// template's write through it, which may come after the register output is
+/// written. gprofng's `__collector_subget_32` is
+/// `movl %2, %0; negl %0; lock; xaddl %0, %1` with `"=r"(r), "=m"(*ptr)`:
+/// given one register for `r` and `ptr`, the `negl` overwrote the address and
+/// the `xaddl` wrote through the negated count.
+fn add_memory_output_edges(
+    graph: &mut InterferenceGraph,
+    asm: &crate::ir::AsmData,
+    candidates: &std::collections::BTreeSet<PseudoId>,
+) {
+    let addresses: Vec<PseudoId> = asm
+        .outputs
+        .iter()
+        .filter(|o| o.is_memory() && candidates.contains(&o.pseudo))
+        .map(|o| o.pseudo)
+        .collect();
+    for out in &asm.outputs {
+        if out.is_memory() || !candidates.contains(&out.pseudo) {
+            continue;
+        }
+        for &p in &addresses {
             graph.add_edge(out.pseudo, p);
         }
     }

@@ -51,6 +51,13 @@ pub fn is_writable_at(dirfd: libc::c_int, file_name: &CStr) -> bool {
     unsafe { faccessat(dirfd, file_name.as_ptr(), libc::W_OK, AT_EACCESS) == 0 }
 }
 
+/// Whether `file_name`, resolved relative to `dirfd`, is executable (searchable, for a
+/// directory) as `access(2)` with `X_OK` answers it: for the real user and group IDs, following
+/// a final symbolic link. Only the last component is looked up, through `dirfd`.
+pub fn is_executable_at(dirfd: libc::c_int, file_name: &CStr) -> bool {
+    unsafe { faccessat(dirfd, file_name.as_ptr(), libc::X_OK, 0) == 0 }
+}
+
 /// Type of error to be handled by the `err_reporter` of `traverse_directory`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -352,7 +359,27 @@ struct TreeNode {
     dir: HybridDir,
     filename: Rc<[libc::c_char]>,
     metadata: Metadata,
+    /// Whether the directory entry is itself a symbolic link (one the walk followed).
+    is_symlink: Option<bool>,
     path_depth: usize,
+}
+
+impl TreeNode {
+    /// The entry for this directory itself, relative to `dir_fd`, its parent's descriptor.
+    fn entry<'a>(
+        &self,
+        dir_fd: &'a FileDescriptor,
+        path_stack: &'a [Rc<[libc::c_char]>],
+    ) -> Entry<'a> {
+        let mut entry = Entry::new(
+            dir_fd,
+            path_stack,
+            self.filename.clone(),
+            Some(self.metadata.clone()),
+        );
+        entry.is_symlink = self.is_symlink;
+        entry
+    }
 }
 
 /// An entry in the directory tree.
@@ -824,6 +851,7 @@ where
                         let node = TreeNode {
                             dir: HybridDir::Owned(new_dir),
                             filename: dir_filename,
+                            is_symlink: entry.is_symlink,
                             metadata: entry.metadata.unwrap(),
                             path_depth: path_stack.len(),
                         };
@@ -983,12 +1011,7 @@ where
                                 None => &starting_dir,
                             };
                             err_reporter(
-                                Entry::new(
-                                    prev_dir,
-                                    parent_path_stack,
-                                    current.filename.clone(),
-                                    Some(current.metadata.clone()),
-                                ),
+                                current.entry(prev_dir, parent_path_stack),
                                 Error::new(e, ErrorKind::ReadDir),
                             );
 
@@ -1084,6 +1107,7 @@ where
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),
                                             filename: entry_filename,
+                                            is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1097,6 +1121,7 @@ where
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),
                                             filename: entry_filename,
+                                            is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1129,6 +1154,7 @@ where
                                         TreeNode {
                                             dir: HybridDir::Owned(new_dir),
                                             filename: entry_filename,
+                                            is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1163,12 +1189,7 @@ where
 
         if let Some(e) = enumeration_error {
             err_reporter(
-                Entry::new(
-                    &starting_dir,
-                    &path_stack[..path_depth - 1],
-                    current.filename.clone(),
-                    Some(current.metadata.clone()),
-                ),
+                current.entry(&starting_dir, &path_stack[..path_depth - 1]),
                 Error::new(e, ErrorKind::OpenDir),
             );
             success = false;
@@ -1214,29 +1235,14 @@ where
         };
         match prev_dir {
             Ok(prev_dir) => {
-                if postprocess_dir(
-                    Entry::new(
-                        prev_dir,
-                        &path_stack,
-                        current.filename.clone(),
-                        Some(current.metadata.clone()),
-                    ),
-                    dir_exit,
-                )
-                .is_err()
-                {
+                if postprocess_dir(current.entry(prev_dir, &path_stack), dir_exit).is_err() {
                     success = false;
                     // Don't `continue` here, falldown below
                 }
             }
             Err(e) => {
                 err_reporter(
-                    Entry::new(
-                        &starting_dir,
-                        &path_stack,
-                        current.filename.clone(),
-                        Some(current.metadata.clone()),
-                    ),
+                    current.entry(&starting_dir, &path_stack),
                     Error::new(e, ErrorKind::Open),
                 );
                 success = false;

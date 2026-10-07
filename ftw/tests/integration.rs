@@ -785,3 +785,74 @@ fn readable_but_not_searchable_dir_is_enumerated() {
         "expected the walk to enumerate the directory and fail on the child: {errors:?}"
     );
 }
+
+/// The entry `postprocess_dir` receives says whether the directory being left is a symbolic link
+/// the walk followed, as the `file_handler` entry for it did. A caller that acts on the directory
+/// on the way out (`find -depth -delete` removes a followed link with `unlink`, a directory with
+/// `rmdir`) cannot tell the two apart from the metadata, which describes the target.
+#[test]
+fn postprocess_entry_says_whether_it_is_a_symlink() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("postprocess_entry_is_symlink")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+    fs::create_dir(root.join("real")).unwrap();
+    unix::fs::symlink("real", root.join("link")).unwrap();
+
+    let mut exits: Vec<(String, Option<bool>)> = Vec::new();
+    ftw::traverse_directory(
+        root,
+        |_| Ok(true),
+        |entry, _| {
+            if entry.dir_fd() != libc::AT_FDCWD {
+                exits.push((
+                    entry.file_name().to_string_lossy().to_string(),
+                    entry.is_symlink(),
+                ));
+            }
+            Ok(())
+        },
+        |entry, e| panic!("unexpected error on {}: {:?}", entry.path(), e.kind()),
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks: true,
+            ..Default::default()
+        },
+    );
+
+    exits.sort();
+    assert_eq!(
+        exits,
+        [
+            ("link".to_string(), Some(true)),
+            ("real".to_string(), Some(false)),
+        ]
+    );
+}
+
+/// `is_executable_at` answers as `access(2)` with `X_OK` does, relative to a directory
+/// descriptor: for the real user, following a final symbolic link.
+#[test]
+fn is_executable_at_follows_access_semantics() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("is_executable_at")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+    fs::write(root.join("exe"), b"x").unwrap();
+    fs::set_permissions(root.join("exe"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(root.join("plain"), b"x").unwrap();
+    fs::set_permissions(root.join("plain"), fs::Permissions::from_mode(0o644)).unwrap();
+    unix::fs::symlink("exe", root.join("to_exe")).unwrap();
+    unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
+
+    let dir = fs::File::open(root).unwrap();
+    let ask = |name: &str| ftw::is_executable_at(dir.as_raw_fd(), &CString::new(name).unwrap());
+    assert!(ask("exe"));
+    assert!(ask("to_exe"), "a link to an executable is executable");
+    assert!(!ask("dangling"));
+    // No execute bit at all: not executable, even for the superuser.
+    assert!(!ask("plain"));
+}

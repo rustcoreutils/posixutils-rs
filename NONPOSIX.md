@@ -243,6 +243,15 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `-ipath pattern` — case-insensitive `-path`.  POSIX.1-2024 added `-iname`
    only.
  * With no path operand, `.` is searched.  POSIX requires at least one path.
+ * `-mindepth n` / `-maxdepth n` — global options, as in GNU find: wherever
+   they appear, entries shallower than `n` are walked but not evaluated, and
+   entries deeper than `n` are not walked.  The path operand is depth 0.
+   Forced by debhelper (`dh_update_autotools_config`, `dh_movelibkdeinit`).
+ * `-printf format` — an action writing `format` for each file, with only
+   the directives `%p`, `%P` (path without its starting point), `%s`, `%T@`
+   and `%%` and the escapes `\n`, `\\` and `\NNN` (octal, so `\0` is NUL).
+   Any other directive or escape is an error.  Forced by debhelper
+   (`dh_autoreconf`, `dh_installdeb`, `dh_md5sums`, `dh_installgsettings`).
 
 ### gettext / ngettext
 

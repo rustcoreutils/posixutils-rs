@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod debhelper;
+
 use std::fs::{remove_file, File};
 use std::io::Write;
 use std::process::{Command, Stdio};

@@ -192,6 +192,7 @@ enum Primary {
     // Actions
     Print,
     Print0,
+    Printf(Vec<PrintfItem>),
     Prune,
     Exec(ExecMode),
     Ok {
@@ -203,6 +204,24 @@ enum Primary {
     Depth,
     XDev,
     Mount,
+    MinDepth(usize),
+    MaxDepth(usize),
+}
+
+/// One piece of a `-printf` format. GNU extension, forced by debhelper; only
+/// the directives its callers use are implemented.
+#[derive(Clone, Debug)]
+enum PrintfItem {
+    /// Literal bytes, escapes already resolved
+    Literal(Vec<u8>),
+    /// `%p`: the pathname
+    Path,
+    /// `%P`: the pathname with its starting point removed
+    RelativePath,
+    /// `%s`: the size in bytes
+    Size,
+    /// `%T@`: the modification time in seconds since the Epoch
+    MTimeEpoch,
 }
 
 /// Expression AST node
@@ -218,6 +237,8 @@ enum Expr {
 struct EvalContext<'a> {
     /// Full path to the file
     path: &'a Path,
+    /// The starting point (path operand) the file was found under
+    root: &'a Path,
     /// Metadata (may be symlink or target depending on -H/-L)
     metadata: &'a Metadata,
     /// Raw symlink metadata (for -type l checks with -L)
@@ -257,6 +278,14 @@ struct FindState {
     xdev: bool,
     /// Whether -mount was specified anywhere in expression
     mount: bool,
+    /// `-mindepth`: entries shallower than this are walked but not evaluated
+    min_depth: usize,
+    /// `-maxdepth`: entries deeper than this are not walked
+    max_depth: Option<usize>,
+    /// -H / -L
+    symlink_mode: SymlinkMode,
+    /// Initialization time (for -atime, -mtime, -ctime)
+    init_time: SystemTime,
     /// (dev, ino) of the directories on the current descent path (for
     /// file-system loop detection)
     visited_inodes: HashSet<(u64, u64)>,
@@ -274,6 +303,10 @@ impl FindState {
             depth_first: false,
             xdev: false,
             mount: false,
+            min_depth: 0,
+            max_depth: None,
+            symlink_mode: SymlinkMode::Never,
+            init_time: SystemTime::now(),
             visited_inodes: HashSet::new(),
             visited_paths: std::collections::HashMap::new(),
             exec_batches: Vec::new(),
@@ -511,6 +544,21 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         "-nogroup" => Ok(Expr::Primary(Primary::NoGroup)),
         "-print" => Ok(Expr::Primary(Primary::Print)),
         "-print0" => Ok(Expr::Primary(Primary::Print0)),
+        "-printf" => {
+            let format = get_arg(tokens, idx, "-printf")?;
+            Ok(Expr::Primary(Primary::Printf(parse_printf_format(format)?)))
+        }
+        "-mindepth" | "-maxdepth" => {
+            let n = get_arg(tokens, idx, tok)?;
+            let n = n
+                .parse::<usize>()
+                .map_err(|_| format!("invalid argument to {}: {}", tok, n))?;
+            Ok(Expr::Primary(if tok == "-mindepth" {
+                Primary::MinDepth(n)
+            } else {
+                Primary::MaxDepth(n)
+            }))
+        }
         "-prune" => Ok(Expr::Primary(Primary::Prune)),
         "-depth" => Ok(Expr::Primary(Primary::Depth)),
         "-xdev" => Ok(Expr::Primary(Primary::XDev)),
@@ -525,6 +573,79 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         }
         _ => Err(format!("unknown primary: {}", tok)),
     }
+}
+
+/// Parse a `-printf` format into literal runs and directives. Unsupported
+/// directives and escapes are an error, never silently wrong output.
+fn parse_printf_format(format: &str) -> Result<Vec<PrintfItem>, String> {
+    let mut items = Vec::new();
+    let mut literal = Vec::new();
+    let bytes = format.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let directive = match &bytes[i + 1..] {
+                    [b'%', ..] => None,
+                    [b'p', ..] => Some((PrintfItem::Path, 2)),
+                    [b'P', ..] => Some((PrintfItem::RelativePath, 2)),
+                    [b's', ..] => Some((PrintfItem::Size, 2)),
+                    [b'T', b'@', ..] => Some((PrintfItem::MTimeEpoch, 3)),
+                    rest => {
+                        let shown = rest
+                            .first()
+                            .map_or(String::new(), |b| (*b as char).to_string());
+                        return Err(format!("-printf: unsupported directive %{}", shown));
+                    }
+                };
+                match directive {
+                    None => {
+                        literal.push(b'%');
+                        i += 2;
+                    }
+                    Some((item, len)) => {
+                        if !literal.is_empty() {
+                            items.push(PrintfItem::Literal(std::mem::take(&mut literal)));
+                        }
+                        items.push(item);
+                        i += len;
+                    }
+                }
+            }
+            b'\\' => {
+                i += 1;
+                match bytes.get(i) {
+                    Some(b'n') => literal.push(b'\n'),
+                    Some(b'\\') => literal.push(b'\\'),
+                    Some(b'0'..=b'7') => {
+                        // `\NNN`: up to three octal digits (`\0` is NUL).
+                        let mut value = 0u32;
+                        let start = i;
+                        while i < bytes.len() && i < start + 3 && (b'0'..=b'7').contains(&bytes[i])
+                        {
+                            value = value * 8 + u32::from(bytes[i] - b'0');
+                            i += 1;
+                        }
+                        literal.push(value as u8);
+                        continue;
+                    }
+                    other => {
+                        let shown = other.map_or(String::new(), |b| (*b as char).to_string());
+                        return Err(format!("-printf: unsupported escape \\{}", shown));
+                    }
+                }
+                i += 1;
+            }
+            b => {
+                literal.push(b);
+                i += 1;
+            }
+        }
+    }
+    if !literal.is_empty() {
+        items.push(PrintfItem::Literal(literal));
+    }
+    Ok(items)
 }
 
 /// Get the next argument or return an error
@@ -678,7 +799,11 @@ fn has_action(expr: &Expr) -> bool {
     match expr {
         Expr::Primary(p) => matches!(
             p,
-            Primary::Print | Primary::Print0 | Primary::Exec(_) | Primary::Ok { .. }
+            Primary::Print
+                | Primary::Print0
+                | Primary::Printf(_)
+                | Primary::Exec(_)
+                | Primary::Ok { .. }
         ),
         Expr::Not(e) => has_action(e),
         Expr::And(l, r) | Expr::Or(l, r) => has_action(l) || has_action(r),
@@ -724,6 +849,21 @@ fn has_depth(expr: &Expr) -> bool {
         Expr::Not(e) => has_depth(e),
         Expr::And(l, r) | Expr::Or(l, r) => has_depth(l) || has_depth(r),
         _ => false,
+    }
+}
+
+/// Apply `-mindepth` / `-maxdepth`. As in GNU find they are global options:
+/// wherever they appear they limit the whole walk, and the last one wins.
+fn set_depth_limits(expr: &Expr, state: &mut FindState) {
+    match expr {
+        Expr::Primary(Primary::MinDepth(n)) => state.min_depth = *n,
+        Expr::Primary(Primary::MaxDepth(n)) => state.max_depth = Some(*n),
+        Expr::Not(e) => set_depth_limits(e, state),
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            set_depth_limits(l, state);
+            set_depth_limits(r, state);
+        }
+        _ => {}
     }
 }
 
@@ -882,11 +1022,17 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             }
             result
         }
+        Primary::Printf(items) => {
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            let _ = handle.write_all(&format_printf(items, ctx));
+            EvalResult::new(true)
+        }
         Primary::Depth => {
             // Always true, affects traversal order (handled globally)
             EvalResult::new(true)
         }
-        Primary::XDev | Primary::Mount => {
+        Primary::XDev | Primary::Mount | Primary::MinDepth(_) | Primary::MaxDepth(_) => {
             // Always true, affects traversal (handled globally)
             EvalResult::new(true)
         }
@@ -961,6 +1107,28 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
     }
 }
 
+/// Expand a parsed `-printf` format for one file.
+fn format_printf(items: &[PrintfItem], ctx: &EvalContext) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            PrintfItem::Literal(bytes) => out.extend_from_slice(bytes),
+            PrintfItem::Path => out.extend_from_slice(ctx.path.as_os_str().as_bytes()),
+            PrintfItem::RelativePath => {
+                let rel = ctx.path.strip_prefix(ctx.root).unwrap_or(Path::new(""));
+                out.extend_from_slice(rel.as_os_str().as_bytes());
+            }
+            PrintfItem::Size => out.extend_from_slice(ctx.metadata.len().to_string().as_bytes()),
+            PrintfItem::MTimeEpoch => {
+                // GNU find 4.9 prints nanoseconds and a tenth digit.
+                let t = format!("{}.{:09}0", ctx.metadata.mtime(), ctx.metadata.mtime_nsec());
+                out.extend_from_slice(t.as_bytes());
+            }
+        }
+    }
+    out
+}
+
 /// Does `response` match the locale's affirmative pattern (`YESEXPR`)? Used by
 /// `-ok` so the accepted answers follow `LC_MESSAGES` rather than hardcoded
 /// English. Falls back to `^[yY]` if the locale pattern is unavailable.
@@ -1027,18 +1195,19 @@ fn get_metadata(
     }
 }
 
-/// Walk a directory tree and evaluate expression for each file
+/// Walk a directory tree and evaluate expression for each file. `depth` is 0
+/// for the starting point `root` (a path operand).
 fn walk_tree(
     path: &Path,
     expr: &Expr,
-    symlink_mode: SymlinkMode,
+    root: &Path,
     root_dev: u64,
-    init_time: SystemTime,
+    depth: usize,
     state: &mut FindState,
-    is_cmdline: bool,
 ) {
+    let is_cmdline = depth == 0;
     // Get metadata
-    let (metadata, link_metadata) = match get_metadata(path, symlink_mode, is_cmdline) {
+    let (metadata, link_metadata) = match get_metadata(path, state.symlink_mode, is_cmdline) {
         Ok(m) => m,
         Err(e) => {
             eprintln!(
@@ -1080,22 +1249,29 @@ fn walk_tree(
 
     let ctx = EvalContext {
         path,
+        root,
         metadata: &metadata,
         link_metadata: link_metadata.as_ref(),
-        init_time,
+        init_time: state.init_time,
     };
+    let descend =
+        metadata.is_dir() && !block_descend && state.max_depth.is_none_or(|max| depth < max);
 
     // If depth-first, process children before this entry
-    if state.depth_first && metadata.is_dir() && !block_descend {
+    if state.depth_first && descend {
         state.visited_inodes.insert(inode_key);
         state.visited_paths.insert(inode_key, path.to_path_buf());
-        process_children(path, expr, symlink_mode, root_dev, init_time, state);
+        process_children(path, expr, root, root_dev, depth + 1, state);
         state.visited_inodes.remove(&inode_key);
         state.visited_paths.remove(&inode_key);
     }
 
-    // Evaluate expression for this entry
-    let result = evaluate(expr, &ctx, state);
+    // Evaluate expression for this entry, unless it is above -mindepth
+    let result = if depth >= state.min_depth {
+        evaluate(expr, &ctx, state)
+    } else {
+        EvalResult::new(true)
+    };
 
     // Handle batched exec files. Every id was assigned by
     // register_exec_batches() over this same expression, so it indexes a
@@ -1107,10 +1283,10 @@ fn walk_tree(
     }
 
     // If not depth-first and is directory, process children
-    if !state.depth_first && metadata.is_dir() && !result.prune && !block_descend {
+    if !state.depth_first && descend && !result.prune {
         state.visited_inodes.insert(inode_key);
         state.visited_paths.insert(inode_key, path.to_path_buf());
-        process_children(path, expr, symlink_mode, root_dev, init_time, state);
+        process_children(path, expr, root, root_dev, depth + 1, state);
         state.visited_inodes.remove(&inode_key);
         state.visited_paths.remove(&inode_key);
     }
@@ -1120,9 +1296,9 @@ fn walk_tree(
 fn process_children(
     dir: &Path,
     expr: &Expr,
-    symlink_mode: SymlinkMode,
+    root: &Path,
     root_dev: u64,
-    init_time: SystemTime,
+    depth: usize,
     state: &mut FindState,
 ) {
     let entries = match fs::read_dir(dir) {
@@ -1137,15 +1313,7 @@ fn process_children(
     for entry in entries {
         match entry {
             Ok(e) => {
-                walk_tree(
-                    &e.path(),
-                    expr,
-                    symlink_mode,
-                    root_dev,
-                    init_time,
-                    state,
-                    false,
-                );
+                walk_tree(&e.path(), expr, root, root_dev, depth, state);
             }
             Err(e) => {
                 eprintln!("find: error reading directory '{}': {}", dir.display(), e);
@@ -1233,12 +1401,12 @@ fn find(args: Vec<String>) -> Result<i32, String> {
     state.depth_first = has_depth(&expr);
     state.xdev = has_xdev(&expr);
     state.mount = has_mount(&expr);
+    state.symlink_mode = symlink_mode;
+    set_depth_limits(&expr, &mut state);
 
     // Give every `-exec ... {} +` primary its own aggregation set, in source
     // order, before the walk begins.
     register_exec_batches(&mut expr, &mut state.exec_batches);
-
-    let init_time = SystemTime::now();
 
     // Process each path
     for path in paths {
@@ -1256,15 +1424,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
             }
         };
 
-        walk_tree(
-            &path,
-            &expr,
-            symlink_mode,
-            root_dev,
-            init_time,
-            &mut state,
-            true,
-        );
+        walk_tree(&path, &expr, &path, root_dev, 0, &mut state);
     }
 
     // Execute any pending batched commands

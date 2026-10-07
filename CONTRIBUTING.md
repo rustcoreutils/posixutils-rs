@@ -49,11 +49,23 @@ There are several ways to contribute to posixutils-rs:
 
 ### Quick start
 
-Build: `cargo build --release`
+Requires Rust 1.88.0 or later.  Targets Linux and macOS; a subset of crates
+also builds on Windows (see [WINDOWS.md](WINDOWS.md)).
 
-Test all (long, more than 15 minutes on some hosts) `cargo test --release`
+```bash
+cargo build --release              # always the full workspace, no -p
+cargo test --release               # all tests; more than 15 minutes on some hosts
+cargo test --release -p posixutils-SOMECRATE   # one crate
+cargo clippy --all-targets         # must be warning-free, as in CI
+cargo fmt --all -- --check         # must pass, as in CI
+```
 
-Test (one module): `cargo test --release -p posixutils-SOMECRATE`
+### Source layout
+
+Workspace crates by category: `text/`, `fs/`, `process/`, `awk/`, `sh/`,
+`make/`, `editors/`, and others; `Cargo.toml` `members` is the full list.
+Shared code is in `plib/`, race-free file tree walking in `ftw/`, and the C
+compiler in `cc/` (see [cc/README.md](cc/README.md)).
 
 ### For Maintainers: Commit Standards
 
@@ -70,8 +82,8 @@ Test (one module): `cargo test --release -p posixutils-SOMECRATE`
    Small, lightweight utility with command line processing,
    core algorithm, and zero external crate dependencies.
 3. "only std"  When an external crate is required, avoid mega-crates.  Prefer
-   std-only, or, tiny crates such as `tempfile` that perform a single,
-   lightweight function.
+   std-only, or tiny crates that perform a single, lightweight function.
+   The workspace's standard set is `clap`, `libc`, `regex` and `chrono`.
 4. Correctness, readability, performance, in that order.
    Code should be readable by unfamiliar developers.  Avoid dense,
    uncommented code.
@@ -113,6 +125,7 @@ Test (one module): `cargo test --release -p posixutils-SOMECRATE`
 * Integration test harness should ONLY contain `mod` statements.
   Test logic is in $module/tests/$category/mod.rs files.
 * Only "quick" tests should be run automatically in `cargo test`
-* Longer tests, or tests requiring root access, should be triggered
-  via special environment variables.
+* Longer tests, or tests requiring root access, go behind the
+  `posixutils_test_all` and `requires_root` feature flags (see README
+  "Testing").
 

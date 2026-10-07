@@ -13,7 +13,7 @@ minimizing bloat.
 Implementation goals include clean, safe Rust code and minimal deps beyond
 std and libc.  This project's utilities should "look like normal Rust programs."
 
-Core POSIX specification: https://pubs.opengroup.org/onlinepubs/9699919799/   (Old, free edition.  POSIX.2024 was just released.)
+Core POSIX specification: https://pubs.opengroup.org/onlinepubs/9799919799/  (POSIX.1-2024)
 
 ## Volunteers and contributors welcome!
 

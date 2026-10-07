@@ -759,7 +759,12 @@ where
 
         // When the options say not to follow this entry's links, refuse to follow one that
         // appeared between the traversal's `lstat` and this open. GNU guards the same way.
+        //
+        // Every open of a source or destination here carries `O_NOCTTY`: a terminal device
+        // copied from or to (`cp /dev/tty x`, a pty swapped in) must never become cp's
+        // controlling terminal.
         let source_open_flags = libc::O_RDONLY
+            | libc::O_NOCTTY
             | if deref_this_entry {
                 0
             } else {
@@ -779,6 +784,7 @@ where
         // and the link followed is the operand itself, resolved in the directory cp holds.
         let write_through_dangling = target_is_dangling_symlink && !cfg.no_clobber;
         let create_flags = libc::O_WRONLY
+            | libc::O_NOCTTY
             | libc::O_CREAT
             | if write_through_dangling {
                 libc::O_TRUNC
@@ -1024,12 +1030,12 @@ where
             // swapped in before its identity could be checked.
             let (open_flags, expected_md) = if target_is_symlink {
                 (
-                    libc::O_WRONLY | libc::O_CLOEXEC,
+                    libc::O_WRONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
                     target_deref_md.as_ref().ok(),
                 )
             } else {
                 (
-                    libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    libc::O_WRONLY | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                     target_symlink_md.as_ref(),
                 )
             };

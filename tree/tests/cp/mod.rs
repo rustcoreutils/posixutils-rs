@@ -1790,6 +1790,80 @@ fn test_cp_special_fifo_keeps_set_id_bits() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
+/// A terminal cp copies from must not become its controlling terminal: cp is run as a session
+/// leader with none, reading a pty's slave side, and the master is asked which session the
+/// terminal now controls.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_cp_does_not_acquire_a_controlling_terminal() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+
+    let test_dir = &format!(
+        "{}/test_cp_does_not_acquire_a_controlling_terminal",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(test_dir).unwrap();
+
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    assert!(master >= 0);
+    let master = unsafe { fs::File::from_raw_fd(master) };
+    assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
+    assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
+    let mut name = [0 as libc::c_char; 128];
+    assert_eq!(
+        unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) },
+        0
+    );
+    let slave = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let mut child = unsafe {
+        Command::new(env!("CARGO_BIN_EXE_cp"))
+            .args([slave.as_str(), &format!("{test_dir}/out")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+            .unwrap()
+    };
+
+    // Give cp time to open the terminal and start reading it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut controlling = None;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let sid = unsafe { libc::tcgetsid(master.as_raw_fd()) };
+        if sid != -1 {
+            controlling = Some(sid);
+            break;
+        }
+    }
+    // End of file on the terminal ends cp's read.
+    (&master).write_all(b"\x04").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        controlling, None,
+        "cp made the terminal it read its controlling terminal"
+    );
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
 /// `cp -p` gives the copy the source's access time as it was before cp read it, as GNU does.
 /// With an access time older than the modification time, `relatime` (and `strictatime`)
 /// update it on the read, so a time taken afterwards would be the time of the copy. Directories

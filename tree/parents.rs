@@ -15,22 +15,28 @@
 //! the directory the previous step opened, and `-p` applies attributes through those same
 //! descriptors.
 
-use crate::common::{copy_file_at, error_string, verify_made_dir, CopyConfig, InodeMap};
+use crate::common::{
+    copy_file_at, error_string, preserve_through_fd, verify_made_dir, CopyConfig, InodeMap,
+    MadeTrust,
+};
 use gettextrs::gettext;
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs::{File, FileTimes};
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{fchown, MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A destination directory `--parents` created, with the source directory it stands for.
 struct MadeDir {
     dest: File,
     source: std::fs::Metadata,
+    /// Where it is, for diagnostics only.
+    path: PathBuf,
+    /// How far `verify_made_dir` trusts it: -p gives it an owner and mode only in full.
+    trust: MadeTrust,
 }
 
 /// Open directory `name` in `dirfd`. `extra_flags` is OR'ed in (`O_NOFOLLOW`).
@@ -120,10 +126,12 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
         if created {
             // Between the `mkdirat` and the open, anyone else who can rename entries in the
             // parent could have swapped in a directory of their own.
-            verify_made_dir(dest_dir.as_raw_fd(), next_dest.as_raw_fd(), &dest_path)?;
+            let trust = verify_made_dir(dest_dir.as_raw_fd(), next_dest.as_raw_fd(), &dest_path)?;
             made.push(MadeDir {
                 dest: next_dest.try_clone()?,
                 source: src_md,
+                path: dest_path.clone(),
+                trust,
             });
         }
         src_dir = next_src;
@@ -132,33 +140,12 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
     Ok((made, dest_dir))
 }
 
-fn time_of(secs: i64, nsec: i64) -> SystemTime {
-    let d = Duration::new(secs.unsigned_abs(), nsec as u32);
-    if secs >= 0 {
-        UNIX_EPOCH + d
-    } else {
-        UNIX_EPOCH - d
-    }
-}
-
 /// `-p` for a directory `--parents` made: owner, mode and times of its source directory.
-/// As with files, set-user-ID and set-group-ID are dropped when the owner cannot be copied.
+/// The same code as every other -p through a held descriptor (`preserve_through_fd`): set-user-ID
+/// and set-group-ID are dropped when the owner cannot be copied, and a directory trusted only
+/// as owned like its parent gets times but no owner or mode.
 fn preserve_dir(dir: &MadeDir) -> io::Result<()> {
-    let src = &dir.source;
-    let chown_ok = fchown(&dir.dest, Some(src.uid()), Some(src.gid())).is_ok();
-    let mut mode = src.mode() & 0o7777;
-    if !chown_ok {
-        // Cast needed where `mode_t` is not u32 (macOS).
-        #[allow(clippy::unnecessary_cast)]
-        let id_bits = (libc::S_ISUID | libc::S_ISGID) as u32;
-        mode &= !id_bits;
-    }
-    dir.dest
-        .set_permissions(std::fs::Permissions::from_mode(mode))?;
-    let times = FileTimes::new()
-        .set_accessed(time_of(src.atime(), src.atime_nsec()))
-        .set_modified(time_of(src.mtime(), src.mtime_nsec()));
-    dir.dest.set_times(times)
+    preserve_through_fd(dir.dest.as_raw_fd(), &dir.source, &dir.path, dir.trust)
 }
 
 /// Copy each source to `target` joined with the source's own path. Returns false if anything

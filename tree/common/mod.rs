@@ -21,7 +21,8 @@ use std::{ffi::CStr, io};
 
 // cp and mv
 pub use copy::{
-    copy_file, copy_file_at, copy_files, verify_made_dir, CopyConfig, DerefMode, InodeMap,
+    copy_file, copy_file_at, copy_files, preserve_through_fd, verify_made_dir, CopyConfig,
+    DerefMode, InodeMap, MadeTrust,
 };
 
 // chgrp and chown

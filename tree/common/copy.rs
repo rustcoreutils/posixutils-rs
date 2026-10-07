@@ -109,7 +109,14 @@ fn fd_metadata(fd: libc::c_int) -> io::Result<fs::Metadata> {
 ///
 /// An operand resolved from the working directory has no parent descriptor; its parent is then
 /// read as the opened directory's own `..`, which names wherever that directory actually is.
-pub fn verify_made_dir(parent_fd: libc::c_int, dir_fd: libc::c_int, dir: &Path) -> io::Result<()> {
+///
+/// Returns how far the directory is trusted: `ParentOwnerOnly` means -p must not give it an
+/// owner or a mode (see `made_by_us`).
+pub fn verify_made_dir(
+    parent_fd: libc::c_int,
+    dir_fd: libc::c_int,
+    dir: &Path,
+) -> io::Result<MadeTrust> {
     let euid = unsafe { libc::geteuid() };
     // `.` relative to a directory descriptor is that directory: no name is resolved.
     let parent = if parent_fd == libc::AT_FDCWD {
@@ -121,7 +128,7 @@ pub fn verify_made_dir(parent_fd: libc::c_int, dir_fd: libc::c_int, dir: &Path) 
     let others_can_rename =
         parent.uid() != euid || (parent.mode() & 0o022 != 0 && parent.mode() & 0o1000 == 0);
     if !others_can_rename {
-        return Ok(());
+        return Ok(MadeTrust::Full);
     }
     // Every fact about the made directory comes from the descriptor cp goes on to use.
     let opened = fd_metadata(dir_fd)?;
@@ -129,15 +136,29 @@ pub fn verify_made_dir(parent_fd: libc::c_int, dir_fd: libc::c_int, dir: &Path) 
         uid: opened.uid(),
         nlink: opened.nlink(),
         is_dir: true,
-        on_owner_mapping_fs: fs_maps_owners(dir_fd),
+        owners: fs_owners(dir_fd),
     };
-    if !made_by_us(made, Some(parent.uid()), euid) || !ftw::is_empty_dir_fd(dir_fd)? {
-        return Err(io::Error::other(gettext!(
+    let replaced = || {
+        io::Error::other(gettext!(
             "'{}' was replaced after it was made",
             dir.display()
-        )));
+        ))
+    };
+    let trust = made_by_us(made, Some(parent.uid()), euid).ok_or_else(replaced)?;
+    if !ftw::is_empty_dir_fd(dir_fd)? {
+        return Err(replaced());
     }
-    Ok(())
+    Ok(trust)
+}
+
+/// The -p failure reported for an object `made_by_us` trusted only as `ParentOwnerOnly`: its
+/// mode cannot be duplicated (POSIX requires a diagnostic), and neither its owner nor its mode
+/// is touched.
+fn owner_unverified_error(target: &Path) -> io::Error {
+    io::Error::other(gettext!(
+        "not preserving the owner and permissions of '{}': its owner could not be verified",
+        target.display()
+    ))
 }
 
 /// What `fstat` (on a descriptor cp holds for it) reports about an object cp has just made.
@@ -146,23 +167,36 @@ struct MadeObject {
     uid: u32,
     nlink: u64,
     is_dir: bool,
-    /// The object's filesystem reports owners it maps rather than stores (`fs_maps_owners`).
-    on_owner_mapping_fs: bool,
+    /// How the object's filesystem keeps owners (`fs_owners`).
+    owners: FsOwners,
 }
 
-/// Whether the filesystem holding `fd` reports file owners from a mount-wide or remote mapping
-/// rather than from what each creator was: vfat/msdos, exfat, ntfs (in-kernel ntfs and ntfs3),
-/// cifs/smb, NFS and FUSE (ntfs-3g, sshfs, ...). On these an object cp makes can be reported as
-/// owned by someone other than cp's effective user (`uid=` mount options, sshfs without
-/// idmap, NFS root_squash). Elsewhere (and wherever the type cannot be read) owners are taken
-/// to be stored, which is the strict answer.
+/// How a filesystem keeps file owners, as far as its type says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FsOwners {
+    /// Each object's owner is stored and reported as it is (ext4, xfs, btrfs, tmpfs, ...), and
+    /// the answer wherever the type cannot be read.
+    Stored,
+    /// Owners may be mapped -- reported from a mount option, an id map or a squash rule rather
+    /// than from who made the object -- or may be stored for real, depending on the mount:
+    /// NFS (root_squash or not), FUSE (sshfs with or without idmap, mergerfs, ceph-fuse, ...),
+    /// cifs/smb (`uid=` or unix extensions).
+    MayBeMapped,
+    /// No owner is stored at all; every object reports the mount's owner: msdos/vfat, exfat,
+    /// ntfs and ntfs3.
+    None,
+}
+
+/// How the filesystem holding `fd` keeps owners, from its `fstatfs` type.
 #[cfg(target_os = "linux")]
-fn fs_maps_owners(fd: libc::c_int) -> bool {
-    const OWNER_MAPPING_FS: [u64; 9] = [
+fn fs_owners(fd: libc::c_int) -> FsOwners {
+    const OWNERLESS_FS: [u64; 4] = [
         0x4d44,      // MSDOS_SUPER_MAGIC (msdos, vfat)
         0x2011_bab0, // EXFAT_SUPER_MAGIC
         0x5346_544e, // NTFS_SB_MAGIC
         0x7366_746e, // ntfs3
+    ];
+    const MAYBE_MAPPED_FS: [u64; 5] = [
         0xff53_4d42, // CIFS_SUPER_MAGIC
         0xfe53_4d42, // SMB2_SUPER_MAGIC
         0x517b,      // SMB_SUPER_MAGIC
@@ -171,53 +205,81 @@ fn fs_maps_owners(fd: libc::c_int) -> bool {
     ];
     let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(fd, st.as_mut_ptr()) } != 0 {
-        return false;
+        return FsOwners::Stored;
     }
     let st = unsafe { st.assume_init() };
     // `f_type` is a signed word whose width varies by architecture; the magic numbers are its
     // low 32 bits.
     let f_type = u64::from(st.f_type as u32);
-    OWNER_MAPPING_FS.contains(&f_type)
+    if OWNERLESS_FS.contains(&f_type) {
+        FsOwners::None
+    } else if MAYBE_MAPPED_FS.contains(&f_type) {
+        FsOwners::MayBeMapped
+    } else {
+        FsOwners::Stored
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn fs_maps_owners(_fd: libc::c_int) -> bool {
-    false
+fn fs_owners(_fd: libc::c_int) -> FsOwners {
+    FsOwners::Stored
+}
+
+/// How far cp trusts an object `made_by_us` accepted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MadeTrust {
+    /// Owned by cp's effective user, or on a filesystem that stores no owners: -p applies in full.
+    Full,
+    /// Accepted only because it is owned like its parent, on a filesystem that may store owners
+    /// for real: cp copies into it, but -p must not chown or chmod it.
+    ParentOwnerOnly,
 }
 
 /// Whether `made`, found where cp has just made an object in a directory owned by `parent_uid`
 /// (`None` when cp holds no descriptor for that directory), can be the object cp made rather
-/// than one swapped in by someone else.
+/// than one swapped in by someone else -- and if so, how far it is trusted.
 ///
-/// Owner: cp's effective user; or, only on a filesystem that maps owners and only in a parent
-/// cp's user does not own, that parent's owner -- such a filesystem reports everything made
-/// in a directory as owned like it (vfat/exfat/ntfs/cifs `uid=`, sshfs without idmap, NFS
-/// root_squash exports owned by the anonymous user).
+/// Owned by cp's effective user: accepted, in full. Otherwise only in a parent cp's user does
+/// not own, and only when the object is owned like that parent, on a filesystem whose type says
+/// owners may not be what each creator was:
+/// - msdos/vfat, exfat, ntfs, ntfs3 store no owner at all, so every object reports the mount's
+///   owner and nothing about ownership can be learned or conferred (a -p chown there fails and
+///   drops set-user-ID): accepted in full.
+/// - NFS, FUSE and cifs/smb may map owners (root_squash, sshfs without idmap, `uid=`) -- or may
+///   store them for real (NFS without squashing, sshfs with idmap, mergerfs, ceph-fuse). In the
+///   second case someone who can write the parent but does not own it can rename in an object
+///   of the parent owner's (an empty directory, a symbolic link, a FIFO or device node with one
+///   link), which cp cannot tell from its own. Such an object is still accepted, so that copying
+///   onto these filesystems works, but only as `ParentOwnerOnly`: cp gives it no owner and no
+///   mode, so an object it did not make is never chowned or chmod'ed.
 ///
-/// Against someone who can write the parent but does not own it: on a filesystem that stores
-/// owners, their object is theirs and never cp's user's (no one can give a file away, a
-/// directory cannot be hard-linked, and a hard link to one of cp's user's nodes fails the link
-/// count), so it is refused; the mapped arm is not open there at all. On a filesystem that
-/// maps owners, their object would be reported with the same mapped owner as cp's -- but such a
-/// filesystem records no owner to steal or confer (a `-p` chown there fails and drops
-/// set-user-ID), and the emptiness and link-count checks still apply. Against the parent's
-/// owner: they control every entry of that directory, cp's included, so accepting their object
-/// grants nothing. Under NFS root_squash, root's objects are the anonymous user's, accepted only
-/// in a parent the anonymous user owns; in a parent owned by a third user they are refused.
+/// On every other filesystem only cp's effective user is accepted: no one can give a file
+/// away, a directory cannot be hard-linked, and a hard link to one of cp's user's nodes fails
+/// the link count. The parent's owner, who could plant an object of their own anywhere here,
+/// controls every entry of that directory already, cp's included.
 ///
 /// Link count: a fresh symbolic link or special file has exactly one; a fresh directory has
 /// two (itself and its `.`), or one on filesystems that do not count directory links (btrfs,
 /// some FUSE).
-fn made_by_us(made: MadeObject, parent_uid: Option<u32>, euid: u32) -> bool {
-    let mapped_like_parent = made.on_owner_mapping_fs
-        && parent_uid.is_some_and(|parent_uid| parent_uid != euid && made.uid == parent_uid);
-    let owner_ok = made.uid == euid || mapped_like_parent;
+fn made_by_us(made: MadeObject, parent_uid: Option<u32>, euid: u32) -> Option<MadeTrust> {
     let nlink_ok = if made.is_dir {
         made.nlink <= 2
     } else {
         made.nlink == 1
     };
-    owner_ok && nlink_ok
+    if !nlink_ok {
+        return None;
+    }
+    if made.uid == euid {
+        return Some(MadeTrust::Full);
+    }
+    let owned_like_parent =
+        parent_uid.is_some_and(|parent_uid| parent_uid != euid && made.uid == parent_uid);
+    match (made.owners, owned_like_parent) {
+        (FsOwners::None, true) => Some(MadeTrust::Full),
+        (FsOwners::MayBeMapped, true) => Some(MadeTrust::ParentOwnerOnly),
+        _ => None,
+    }
 }
 
 enum CopyResult {
@@ -275,14 +337,21 @@ fn preserve_mode_error(target: &Path, e: &io::Error) -> io::Error {
 /// owner, then mode. Nothing is resolved by name, so a file renamed over the destination after
 /// cp opened it is never touched. The mode (set-user-ID included) is applied last, only to a
 /// file whose owner is already final.
-fn preserve_through_fd(
+///
+/// For an object trusted only as `ParentOwnerOnly` the times are applied and the owner and
+/// mode are not: that is reported (`owner_unverified_error`).
+pub fn preserve_through_fd(
     fd: libc::c_int,
     source_md: &impl MetadataExt,
     target: &Path,
+    trust: MadeTrust,
 ) -> io::Result<()> {
     let times = source_times(source_md);
     if unsafe { libc::futimens(fd, times.as_ptr()) } != 0 {
         return Err(preserve_times_error(target, &io::Error::last_os_error()));
+    }
+    if trust == MadeTrust::ParentOwnerOnly {
+        return Err(owner_unverified_error(target));
     }
     // A failure to duplicate the owner is not itself reported (POSIX leaves it unspecified);
     // its consequence is the mode below.
@@ -337,20 +406,19 @@ fn preserve_made_node(
     } else {
         Some(ftw::Metadata::new(dirfd, c".", false)?.uid())
     };
-    let check = |uid: u32, nlink: u64, type_ok: bool, on_owner_mapping_fs: bool| {
+    let check = |uid: u32, nlink: u64, type_ok: bool, owners: FsOwners| {
         let made = MadeObject {
             uid,
             nlink,
             is_dir: false,
-            on_owner_mapping_fs,
+            owners,
         };
-        if type_ok && made_by_us(made, parent_uid, unsafe { libc::geteuid() }) {
-            Ok(())
-        } else {
-            Err(io::Error::other(gettext!(
+        match made_by_us(made, parent_uid, unsafe { libc::geteuid() }) {
+            Some(trust) if type_ok => Ok(trust),
+            _ => Err(io::Error::other(gettext!(
                 "'{}' was replaced during the copy",
                 target.display()
-            )))
+            ))),
         }
     };
     preserve_node_attributes(dirfd, name, made_type, check, source_md, target)
@@ -361,7 +429,7 @@ fn preserve_node_attributes(
     dirfd: libc::c_int,
     name: &CStr,
     made_type: ftw::FileType,
-    check: impl Fn(u32, u64, bool, bool) -> io::Result<()>,
+    check: impl Fn(u32, u64, bool, FsOwners) -> io::Result<MadeTrust>,
     source_md: &ftw::Metadata,
     target: &Path,
 ) -> io::Result<()> {
@@ -378,11 +446,11 @@ fn preserve_node_attributes(
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
     let pinned = fs::File::from(fd);
     let pinned_md = pinned.metadata()?;
-    check(
+    let trust = check(
         pinned_md.uid(),
         pinned_md.nlink(),
         same_file_type(pinned_md.file_type(), made_type),
-        fs_maps_owners(pinned.as_raw_fd()),
+        fs_owners(pinned.as_raw_fd()),
     )?;
     let fd = pinned.as_raw_fd();
     let empty = c"";
@@ -390,6 +458,9 @@ fn preserve_node_attributes(
     let times = source_times(source_md);
     if unsafe { libc::utimensat(fd, empty.as_ptr(), times.as_ptr(), libc::AT_EMPTY_PATH) } != 0 {
         return Err(preserve_times_error(target, &io::Error::last_os_error()));
+    }
+    if trust == MadeTrust::ParentOwnerOnly {
+        return Err(owner_unverified_error(target));
     }
     let chown_ok = unsafe {
         libc::fchownat(
@@ -477,17 +548,21 @@ fn preserve_node_attributes(
     dirfd: libc::c_int,
     name: &CStr,
     made_type: ftw::FileType,
-    check: impl Fn(u32, u64, bool, bool) -> io::Result<()>,
+    check: impl Fn(u32, u64, bool, FsOwners) -> io::Result<MadeTrust>,
     source_md: &ftw::Metadata,
     target: &Path,
 ) -> io::Result<()> {
     let made = ftw::Metadata::new(dirfd, name, false)?;
-    check(
+    // Without the filesystem type, owners are taken to be stored: only cp's own are trusted.
+    let trust = check(
         made.uid(),
         made.nlink(),
         made.file_type() == made_type,
-        false,
+        FsOwners::Stored,
     )?;
+    if trust == MadeTrust::ParentOwnerOnly {
+        return Err(owner_unverified_error(target));
+    }
     let still_made = || -> io::Result<()> {
         let md = ftw::Metadata::new(dirfd, name, false)?;
         if md.dev() != made.dev() || md.ino() != made.ino() || md.file_type() != made_type {
@@ -1124,7 +1199,14 @@ where
         // from the fstat of the descriptor that was then read, taken before the read moved its
         // access time (GNU keeps the original access time too).
         let preserve_error = if cfg.preserve {
-            preserve_through_fd(target_file.as_raw_fd(), &source_before_read, target).err()
+            // The file is cp's own: created with O_EXCL, or the very file the decision checked.
+            preserve_through_fd(
+                target_file.as_raw_fd(),
+                &source_before_read,
+                target,
+                MadeTrust::Full,
+            )
+            .err()
         } else {
             None
         };
@@ -1397,6 +1479,9 @@ where
     // (st_dev, st_ino) of every destination directory this copy creates or enters. A source
     // directory found in here is one we are copying *into*.
     let dest_dir_ids = RefCell::new(HashSet::<(u64, u64)>::new());
+    // (st_dev, st_ino) of the destination directories this copy made but trusts only as
+    // `MadeTrust::ParentOwnerOnly`: -p gives them no owner and no mode.
+    let parent_owner_only_dirs = RefCell::new(HashSet::<(u64, u64)>::new());
     let target_dir_path = RefCell::new(top_dir_path);
     let terminate = RefCell::new(false);
     let last_error = RefCell::new(None);
@@ -1546,11 +1631,16 @@ where
                                     }
                                     DirOrigin::Found { .. } => Ok((fd, md)),
                                     DirOrigin::Made => {
-                                        verify_made_dir(
+                                        let trust = verify_made_dir(
                                             target_dirfd.as_raw_fd(),
                                             fd.as_raw_fd(),
                                             &target,
                                         )?;
+                                        if trust == MadeTrust::ParentOwnerOnly {
+                                            parent_owner_only_dirs
+                                                .borrow_mut()
+                                                .insert((md.dev(), md.ino()));
+                                        }
                                         Ok((fd, md))
                                     }
                                 }
@@ -1634,8 +1724,20 @@ where
                 let recorded = source
                     .metadata()
                     .ok_or_else(|| io::Error::other(gettext!("cannot stat '{}'", source.path())));
+                // A directory made but trusted only as owned like its parent gets no owner and
+                // no mode; its identity comes from the descriptor held for it.
+                let trust = fd_metadata(target_dir.as_raw_fd()).map(|md| {
+                    if parent_owner_only_dirs
+                        .borrow()
+                        .contains(&(md.dev(), md.ino()))
+                    {
+                        MadeTrust::ParentOwnerOnly
+                    } else {
+                        MadeTrust::Full
+                    }
+                });
                 if let Err(e) = recorded.and_then(|source_md| {
-                    preserve_through_fd(target_dir.as_raw_fd(), source_md, &dir_path)
+                    preserve_through_fd(target_dir.as_raw_fd(), source_md, &dir_path, trust?)
                 }) {
                     // Same policy as the file case: never fatal, exit-status only for cp.
                     eprintln!("{}: {}", cfg.prog, error_string(&e));
@@ -1827,17 +1929,19 @@ fn copy_special_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{made_by_us, MadeObject};
+    use super::{made_by_us, FsOwners, MadeObject, MadeTrust};
 
     const CP: u32 = 1000;
     const OTHER: u32 = 2000;
+    const FULL: Option<MadeTrust> = Some(MadeTrust::Full);
+    const PARENT_OWNER_ONLY: Option<MadeTrust> = Some(MadeTrust::ParentOwnerOnly);
 
     fn dir(uid: u32, nlink: u64) -> MadeObject {
         MadeObject {
             uid,
             nlink,
             is_dir: true,
-            on_owner_mapping_fs: false,
+            owners: FsOwners::Stored,
         }
     }
 
@@ -1846,73 +1950,155 @@ mod tests {
             uid,
             nlink,
             is_dir: false,
-            on_owner_mapping_fs: false,
+            owners: FsOwners::Stored,
         }
     }
 
-    fn mapped(made: MadeObject) -> MadeObject {
+    /// On NFS, FUSE or cifs/smb, which may map owners or store them.
+    fn maybe_mapped(made: MadeObject) -> MadeObject {
         MadeObject {
-            on_owner_mapping_fs: true,
+            owners: FsOwners::MayBeMapped,
             ..made
         }
     }
 
-    /// The ordinary case: cp's own object in cp's own or anyone's directory.
-    #[test]
-    fn accepts_what_cp_made() {
-        assert!(made_by_us(dir(CP, 2), Some(CP), CP));
-        assert!(made_by_us(dir(CP, 2), Some(OTHER), CP));
-        assert!(made_by_us(node(CP, 1), Some(OTHER), CP));
-        assert!(made_by_us(node(CP, 1), None, CP));
+    /// On msdos/vfat, exfat or ntfs, which store no owner.
+    fn ownerless(made: MadeObject) -> MadeObject {
+        MadeObject {
+            owners: FsOwners::None,
+            ..made
+        }
     }
 
-    /// A filesystem that maps every owner to one uid (vfat/exfat/ntfs/cifs `uid=`, sshfs
-    /// without idmap, NFS root_squash): what cp makes is owned like its parent, not by cp.
+    /// The ordinary case: cp's own object in cp's own or anyone's directory, on any filesystem.
     #[test]
-    fn accepts_an_owner_mapped_by_the_filesystem() {
-        assert!(made_by_us(mapped(dir(4242, 2)), Some(4242), CP));
-        assert!(made_by_us(mapped(node(4242, 1)), Some(4242), CP));
-        assert!(made_by_us(mapped(dir(65534, 2)), Some(65534), 0));
+    fn trusts_what_cp_made() {
+        assert_eq!(made_by_us(dir(CP, 2), Some(CP), CP), FULL);
+        assert_eq!(made_by_us(dir(CP, 2), Some(OTHER), CP), FULL);
+        assert_eq!(made_by_us(node(CP, 1), Some(OTHER), CP), FULL);
+        assert_eq!(made_by_us(node(CP, 1), None, CP), FULL);
+        assert_eq!(made_by_us(maybe_mapped(dir(CP, 2)), Some(OTHER), CP), FULL);
+    }
+
+    /// A filesystem with no owners reports the mount's owner for everything: what cp makes is
+    /// owned like its parent, and there is no owner an attacker's object could carry instead.
+    #[test]
+    fn trusts_an_owner_reported_by_an_ownerless_filesystem() {
+        assert_eq!(made_by_us(ownerless(dir(4242, 2)), Some(4242), CP), FULL);
+        assert_eq!(made_by_us(ownerless(node(4242, 1)), Some(4242), CP), FULL);
+    }
+
+    /// NFS, FUSE or cifs/smb owned like the parent: accepted, so the copy works where owners are
+    /// mapped (root_squash, sshfs without idmap), but -p withholds owner and mode, because where
+    /// owners are stored (NFS without squashing, sshfs with idmap) the parent's owner's object
+    /// may have been renamed in by someone else.
+    #[test]
+    fn accepts_but_does_not_trust_an_owner_that_may_be_stored() {
+        assert_eq!(
+            made_by_us(maybe_mapped(dir(4242, 2)), Some(4242), CP),
+            PARENT_OWNER_ONLY
+        );
+        assert_eq!(
+            made_by_us(maybe_mapped(node(4242, 1)), Some(4242), CP),
+            PARENT_OWNER_ONLY
+        );
+        assert_eq!(
+            made_by_us(maybe_mapped(dir(65534, 2)), Some(65534), 0),
+            PARENT_OWNER_ONLY
+        );
     }
 
     /// Where owners are stored, an object owned by the parent's owner (who is not cp's user)
     /// was made by that owner, not by cp.
     #[test]
     fn refuses_a_parent_owners_object_where_owners_are_stored() {
-        assert!(!made_by_us(dir(OTHER, 2), Some(OTHER), CP));
-        assert!(!made_by_us(node(OTHER, 1), Some(OTHER), CP));
+        assert_eq!(made_by_us(dir(OTHER, 2), Some(OTHER), CP), None);
+        assert_eq!(made_by_us(node(OTHER, 1), Some(OTHER), CP), None);
     }
 
-    /// The mapped arm needs the parent's owner; with no parent descriptor only cp's own user is
-    /// accepted.
+    /// The parent-owner arm needs the parent's owner; with no parent descriptor only cp's own
+    /// user is accepted.
     #[test]
-    fn refuses_a_mapped_owner_without_a_parent() {
-        assert!(!made_by_us(mapped(dir(4242, 2)), None, CP));
+    fn refuses_a_foreign_owner_without_a_parent() {
+        assert_eq!(made_by_us(maybe_mapped(dir(4242, 2)), None, CP), None);
+        assert_eq!(made_by_us(ownerless(dir(4242, 2)), None, CP), None);
     }
 
     /// Filesystems that report 1 for every directory's link count (btrfs, some FUSE).
     #[test]
     fn accepts_a_directory_link_count_of_one() {
-        assert!(made_by_us(dir(CP, 1), Some(CP), CP));
+        assert_eq!(made_by_us(dir(CP, 1), Some(CP), CP), FULL);
     }
 
     /// Someone else's object in a directory cp owns: an attacker in a shared directory.
     #[test]
     fn refuses_another_users_object() {
-        assert!(!made_by_us(dir(OTHER, 2), Some(CP), CP));
-        assert!(!made_by_us(node(OTHER, 1), Some(CP), CP));
-        assert!(!made_by_us(mapped(dir(OTHER, 2)), Some(CP), CP));
+        assert_eq!(made_by_us(dir(OTHER, 2), Some(CP), CP), None);
+        assert_eq!(made_by_us(node(OTHER, 1), Some(CP), CP), None);
+        assert_eq!(made_by_us(maybe_mapped(dir(OTHER, 2)), Some(CP), CP), None);
+        assert_eq!(made_by_us(ownerless(dir(OTHER, 2)), Some(CP), CP), None);
         // In someone else's directory, an object owned by a third user.
-        assert!(!made_by_us(dir(3000, 2), Some(OTHER), CP));
-        assert!(!made_by_us(mapped(dir(3000, 2)), Some(OTHER), CP));
+        assert_eq!(made_by_us(dir(3000, 2), Some(OTHER), CP), None);
+        assert_eq!(
+            made_by_us(maybe_mapped(dir(3000, 2)), Some(OTHER), CP),
+            None
+        );
     }
 
     /// A hard link to an existing node (cp's own, or a mapped owner's) is not a fresh one, and
     /// a directory with subdirectories is not a fresh one.
     #[test]
     fn refuses_link_counts_a_fresh_object_cannot_have() {
-        assert!(!made_by_us(node(CP, 2), Some(CP), CP));
-        assert!(!made_by_us(mapped(node(4242, 2)), Some(4242), CP));
-        assert!(!made_by_us(dir(CP, 3), Some(CP), CP));
+        assert_eq!(made_by_us(node(CP, 2), Some(CP), CP), None);
+        assert_eq!(
+            made_by_us(maybe_mapped(node(4242, 2)), Some(4242), CP),
+            None
+        );
+        assert_eq!(made_by_us(dir(CP, 3), Some(CP), CP), None);
+    }
+
+    /// -p on an object trusted only as owned like its parent: the times are applied, the mode
+    /// (and owner) are not, and that is reported.
+    #[test]
+    fn withholds_owner_and_mode_from_a_parent_owner_only_object() {
+        use super::preserve_through_fd;
+        use std::fs;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!("cp_parent_owner_only_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let source = dir.join("source");
+        let target = dir.join("target");
+        fs::write(&source, b"s").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(978_307_200);
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        fs::write(&target, b"t").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let source_md = fs::metadata(&source).unwrap();
+        let target_file = fs::File::open(&target).unwrap();
+        let result = preserve_through_fd(
+            target_file.as_raw_fd(),
+            &source_md,
+            &target,
+            MadeTrust::ParentOwnerOnly,
+        );
+        let after = fs::metadata(&target).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            result.is_err(),
+            "withholding owner and mode must be reported"
+        );
+        assert_eq!(after.mode() & 0o7777, 0o600, "the mode was applied");
+        assert_eq!(after.mtime(), 978_307_200, "the times were not applied");
     }
 }

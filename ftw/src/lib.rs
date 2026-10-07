@@ -167,6 +167,15 @@ impl FileDescriptor {
     }
 }
 
+/// Take ownership of a descriptor opened elsewhere, e.g. a directory a caller reached by `openat`.
+impl From<std::os::fd::OwnedFd> for FileDescriptor {
+    fn from(fd: std::os::fd::OwnedFd) -> Self {
+        Self {
+            fd: std::os::fd::IntoRawFd::into_raw_fd(fd),
+        }
+    }
+}
+
 // Borrowing a file descriptor
 impl AsRawFd for FileDescriptor {
     fn as_raw_fd(&self) -> RawFd {

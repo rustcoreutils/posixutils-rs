@@ -101,6 +101,8 @@ struct CopyState<'a> {
     /// The operands as the user wrote them, for the diagnostics that must name them rather than
     /// the entry the failure was noticed on.
     operands: (&'a Path, &'a Path),
+    /// Whether the entry is the source operand itself, copied to the target operand.
+    at_top_level: bool,
 }
 
 /// The pathname stored in the symbolic link `source`.
@@ -157,9 +159,7 @@ where
     F: Fn(&str) -> bool,
 {
     let source_md = source.metadata().unwrap();
-    // The descriptor stack starts at `AT_FDCWD` and gains a real one per level, so the sentinel
-    // is exactly the operand named on the command line.
-    let at_top_level = target_dirfd == libc::AT_FDCWD;
+    let at_top_level = state.at_top_level;
     let deref_this_entry = cfg.deref.deref_entry(at_top_level);
     // Act on the link itself only when the options say so (POSIX 90689).
     let act_on_link_itself = source.is_symlink().unwrap_or(false) && !deref_this_entry;
@@ -314,11 +314,19 @@ where
                 libc::O_NOFOLLOW
             };
 
-        // -n creates exclusively: a destination that appears after the existence check below is
-        // left alone (EEXIST is a skip), and O_EXCL also refuses to create through a symbolic
-        // link. Returns whether the copy was made.
-        let create_flags =
-            libc::O_WRONLY | libc::O_CREAT | if cfg.no_clobber { libc::O_EXCL } else { 0 };
+        // A destination found absent (or just unlinked by -f) is created exclusively: one that
+        // appears after the check, a symbolic link included, is never written through or into.
+        // Under -n that EEXIST is the skip; otherwise it is reported. The one non-exclusive
+        // create is POSIX's write through a dangling symbolic link that is the operand itself
+        // (see below). Returns whether the copy was made.
+        let write_through_dangling = target_is_dangling_symlink && !cfg.no_clobber;
+        let create_flags = libc::O_WRONLY
+            | libc::O_CREAT
+            | if write_through_dangling {
+                0
+            } else {
+                libc::O_EXCL
+            };
         let create_target_then_copy = || -> io::Result<bool> {
             let source_fd = unsafe {
                 libc::openat(
@@ -381,6 +389,22 @@ where
             return Ok(CopyResult::Skipped);
         }
 
+        // POSIX creates the file a dangling destination link names, which GNU does only under
+        // POSIXLY_CORRECT. Inside a recursive copy that link is whatever the destination tree
+        // holds, and following it can write anywhere, so it is done only for the operand the
+        // user named; below it the link is refused in GNU's words. (A link to be reproduced
+        // as a link, or a special file, replaces the dangling link instead.)
+        if target_is_dangling_symlink
+            && !state.at_top_level
+            && !act_on_link_itself
+            && !(source_is_special_file && cfg.recursive)
+        {
+            return Err(io::Error::other(gettext!(
+                "not writing through dangling symlink '{}'",
+                target.display()
+            )));
+        }
+
         // 3.a
         if target_exists && !target_is_dangling_symlink {
             if state.created_files.contains(target) {
@@ -434,7 +458,9 @@ where
                 );
                 return Err(io::Error::other(err_str));
             }
-            copy_special_file(
+            // `mknodat` creates exclusively; under -n a destination that appeared since the
+            // check above is left alone.
+            return match copy_special_file(
                 source_md,
                 source_file_type,
                 target,
@@ -442,8 +468,13 @@ where
                 target_filename,
                 target_exists,
                 state.created_files,
-            )?;
-            return Ok(CopyResult::CopiedFile);
+            ) {
+                Ok(()) => Ok(CopyResult::CopiedFile),
+                Err(e) if cfg.no_clobber && e.kind() == io::ErrorKind::AlreadyExists => {
+                    Ok(CopyResult::Skipped)
+                }
+                Err(e) => Err(e),
+            };
         }
 
         // 4.c
@@ -575,18 +606,59 @@ pub fn copy_file<F>(
     source_arg: &Path,
     target_arg: &Path,
     created_files: &mut HashSet<PathBuf>,
+    inode_map: Option<&mut InodeMap>,
+    prompt_fn: F,
+) -> io::Result<()>
+where
+    F: Copy + Fn(&str) -> bool,
+{
+    copy_file_at(
+        cfg,
+        source_arg,
+        target_arg,
+        None,
+        created_files,
+        inode_map,
+        prompt_fn,
+    )
+}
+
+/// `copy_file`, with the destination's directory optionally given as a descriptor: with
+/// `Some(dir)`, the copy is made as `target_arg`'s last component inside `dir` and `target_arg`
+/// is only named in diagnostics, so no part of it is resolved by path.
+pub fn copy_file_at<F>(
+    cfg: &CopyConfig,
+    source_arg: &Path,
+    target_arg: &Path,
+    target_dir: Option<ftw::FileDescriptor>,
+    created_files: &mut HashSet<PathBuf>,
     mut inode_map: Option<&mut InodeMap>,
     prompt_fn: F,
 ) -> io::Result<()>
 where
     F: Copy + Fn(&str) -> bool,
 {
-    // `RefCell` to allow sharing these between closures
-    let target_dirfd_stack = RefCell::new(vec![Rc::new(ftw::FileDescriptor::cwd())]);
+    // The operand's own directory and name: the current directory and the whole operand, or the
+    // given directory and the operand's last component.
+    let (top_dir, top_name, top_dir_path) = match (target_dir, target_arg.file_name()) {
+        (Some(dir), Some(name)) => (
+            dir,
+            name,
+            target_arg.parent().unwrap_or(Path::new("")).to_path_buf(),
+        ),
+        _ => (
+            ftw::FileDescriptor::cwd(),
+            target_arg.as_os_str(),
+            PathBuf::new(),
+        ),
+    };
+    // `RefCell` to allow sharing these between closures. The bottom entry is the operand's
+    // directory, so a stack of one means the entry is the operand itself.
+    let target_dirfd_stack = RefCell::new(vec![Rc::new(top_dir)]);
     // (st_dev, st_ino) of every destination directory this copy creates or enters. A source
     // directory found in here is one we are copying *into*.
     let dest_dir_ids = RefCell::new(HashSet::<(u64, u64)>::new());
-    let target_dir_path = RefCell::new(PathBuf::new());
+    let target_dir_path = RefCell::new(top_dir_path);
     let terminate = RefCell::new(false);
     let last_error = RefCell::new(None);
     // In `continue_on_error` (cp) mode each diagnostic is emitted immediately and this flag records
@@ -604,10 +676,11 @@ where
                 return Ok(false);
             }
 
+            let at_top_level = target_dirfd_stack_borrowed.len() == 1;
             let target_dirfd = target_dirfd_stack_borrowed.last().unwrap();
 
-            let target_filename = if target_dirfd.as_raw_fd() == libc::AT_FDCWD {
-                target_arg.as_os_str()
+            let target_filename = if at_top_level {
+                top_name
             } else {
                 OsStr::from_bytes(source.file_name().to_bytes())
             };
@@ -667,6 +740,7 @@ where
                     created_files,
                     dest_dir_ids: &dest_dir_ids,
                     operands: (source_arg, target_arg),
+                    at_top_level,
                 },
                 prompt_fn,
             ) {
@@ -694,11 +768,17 @@ where
                             // not allow atomically creating a directory then opening it:
                             //
                             // https://stackoverflow.com/questions/45818628/whats-the-expected-behavior-of-openname-o-creato-directory-mode/48693137#48693137
+                            //
+                            // `copy_file_impl` accepted the destination as a directory from its
+                            // `lstat` (or made it), so it is never a symbolic link to follow:
+                            // `O_NOFOLLOW` refuses one swapped in since, which would otherwise
+                            // redirect everything copied below it. (A trailing slash on the
+                            // operand still resolves, for the open as for the `lstat`.)
                             let new_target_dirfd = match unsafe {
                                 ftw::FileDescriptor::open_at(
                                     target_dirfd,
                                     &target_filename_cstr,
-                                    libc::O_RDONLY,
+                                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
                                 )
                             } {
                                 Ok(fd) => fd,
@@ -797,8 +877,8 @@ where
             if cfg.preserve {
                 let target_dirfd = target_dirfd_stack_borrowed.last().unwrap();
 
-                let target_filename = if target_dirfd.as_raw_fd() == libc::AT_FDCWD {
-                    target_arg.as_os_str()
+                let target_filename = if target_dirfd_stack_borrowed.len() == 1 {
+                    top_name
                 } else {
                     OsStr::from_bytes(source.file_name().to_bytes())
                 };
@@ -992,7 +1072,8 @@ fn copy_special_file(
                 error_string(&e)
             )
         };
-        Err(io::Error::other(err_str))
+        // The kind is kept so that -n can tell a destination that appeared meanwhile.
+        Err(io::Error::new(e.kind(), err_str))
     }
 }
 

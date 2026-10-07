@@ -15,7 +15,7 @@
 //! the directory the previous step opened, and `-p` applies attributes through those same
 //! descriptors.
 
-use crate::common::{copy_file, error_string, CopyConfig, InodeMap};
+use crate::common::{copy_file_at, error_string, CopyConfig, InodeMap};
 use gettextrs::gettext;
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -33,12 +33,13 @@ struct MadeDir {
     source: std::fs::Metadata,
 }
 
-fn open_dir_at(dirfd: libc::c_int, name: &CString) -> io::Result<File> {
+/// Open directory `name` in `dirfd`. `extra_flags` is OR'ed in (`O_NOFOLLOW`).
+fn open_dir_at(dirfd: libc::c_int, name: &CString, extra_flags: libc::c_int) -> io::Result<File> {
     let fd = unsafe {
         libc::openat(
             dirfd,
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | extra_flags,
         )
     };
     if fd < 0 {
@@ -51,16 +52,21 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
-/// Make every directory in `source`'s parent path under `target`, returning the ones made.
-/// A directory that already exists is used as it is.
-fn make_parents(source: &Path, target: &Path) -> io::Result<Vec<MadeDir>> {
+/// Make every directory in `source`'s parent path under `target`, returning the ones made and
+/// a descriptor for the last one, where the copy itself goes.
+///
+/// A directory that already exists is used as it is, a symbolic link to one included, as GNU cp
+/// does. A directory this call made is opened with `O_NOFOLLOW`: one swapped for a symbolic link
+/// between the `mkdirat` and the `openat` is refused, so neither the copy nor `-p`'s owner, mode
+/// and times can be redirected through it.
+fn make_parents(source: &Path, target: &Path) -> io::Result<(Vec<MadeDir>, File)> {
     let mut made = Vec::new();
+    let mut dest_dir = open_dir_at(libc::AT_FDCWD, &cstring(target.as_os_str().as_bytes())?, 0)?;
     let Some(parent) = source.parent() else {
-        return Ok(made);
+        return Ok((made, dest_dir));
     };
     let start = if source.is_absolute() { "/" } else { "." };
-    let mut src_dir = open_dir_at(libc::AT_FDCWD, &cstring(start.as_bytes())?)?;
-    let mut dest_dir = open_dir_at(libc::AT_FDCWD, &cstring(target.as_os_str().as_bytes())?)?;
+    let mut src_dir = open_dir_at(libc::AT_FDCWD, &cstring(start.as_bytes())?, 0)?;
     let mut dest_path = target.to_path_buf();
 
     for comp in parent.components() {
@@ -71,7 +77,7 @@ fn make_parents(source: &Path, target: &Path) -> io::Result<Vec<MadeDir>> {
         };
         dest_path.push(comp);
 
-        let next_src = open_dir_at(src_dir.as_raw_fd(), &name).map_err(|e| {
+        let next_src = open_dir_at(src_dir.as_raw_fd(), &name, 0).map_err(|e| {
             io::Error::other(gettext!(
                 "cannot stat '{}': {}",
                 source.display(),
@@ -94,7 +100,8 @@ fn make_parents(source: &Path, target: &Path) -> io::Result<Vec<MadeDir>> {
                 )));
             }
         }
-        let next_dest = open_dir_at(dest_dir.as_raw_fd(), &name).map_err(|e| {
+        let nofollow = if created { libc::O_NOFOLLOW } else { 0 };
+        let next_dest = open_dir_at(dest_dir.as_raw_fd(), &name, nofollow).map_err(|e| {
             io::Error::other(gettext!(
                 "'{}' exists but is not a directory: {}",
                 dest_path.display(),
@@ -110,7 +117,7 @@ fn make_parents(source: &Path, target: &Path) -> io::Result<Vec<MadeDir>> {
         src_dir = next_src;
         dest_dir = next_dest;
     }
-    Ok(made)
+    Ok((made, dest_dir))
 }
 
 fn time_of(secs: i64, nsec: i64) -> SystemTime {
@@ -157,8 +164,8 @@ where
     let mut ok = true;
     let mut created_files = HashSet::new();
     for source in sources {
-        let made = match make_parents(source, target) {
-            Ok(made) => made,
+        let (made, dest_dir) = match make_parents(source, target) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("cp: {}", error_string(&e));
                 ok = false;
@@ -170,10 +177,13 @@ where
             .filter(|c| !matches!(c, Component::RootDir | Component::Prefix(_)))
             .collect();
         let dest = target.join(relative);
-        if let Err(e) = copy_file(
+        // The copy is made in the directory `make_parents` holds open, never by re-resolving
+        // `dest`, whose components could have been swapped since.
+        if let Err(e) = copy_file_at(
             cfg,
             source,
             &dest,
+            Some(OwnedFd::from(dest_dir).into()),
             &mut created_files,
             inode_map.as_deref_mut(),
             prompt_fn,

@@ -604,23 +604,7 @@ where
             };
         // Returns the source and the new destination, both still open, or `None` for a -n skip.
         let create_target_then_copy = || -> io::Result<Option<(fs::File, fs::File)>> {
-            let source_fd = unsafe {
-                libc::openat(
-                    source.dir_fd(),
-                    source.file_name().as_ptr(),
-                    source_open_flags,
-                )
-            };
-            if source_fd == -1 {
-                let e = io::Error::last_os_error();
-                let err_str = gettext!(
-                    "cannot open '{}' for reading: {}",
-                    source.path(),
-                    error_string(&e)
-                );
-                return Err(io::Error::other(err_str));
-            }
-            let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
+            let mut source_file = open_source(source, source_md, source_open_flags)?;
 
             // 3.b. POSIX 90670-90671 asks for source_file's permission bits. The set-user-ID and
             // set-group-ID bits are masked off: the copy belongs to whoever ran cp, so carrying
@@ -844,23 +828,7 @@ where
 
             // 3.a.ii. Open the source first: truncating the destination before knowing the
             // source can be read destroyed its contents and then reported a failure.
-            let source_fd = unsafe {
-                libc::openat(
-                    source.dir_fd(),
-                    source.file_name().as_ptr(),
-                    source_open_flags,
-                )
-            };
-            if source_fd == -1 {
-                let e = io::Error::last_os_error();
-                let err_str = gettext!(
-                    "cannot open '{}' for reading: {}",
-                    source.path(),
-                    error_string(&e)
-                );
-                return Err(io::Error::other(err_str));
-            }
-            let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
+            let mut source_file = open_source(source, source_md, source_open_flags)?;
 
             // Open what was checked above, and nothing else. A link is followed only when the
             // check saw one, which is now only the operand itself (POSIX writes through it);
@@ -957,6 +925,75 @@ where
         };
         Ok(CopyResult::CopiedFile(preserve_error))
     }
+}
+
+/// Whether a descriptor's file type is the one the walk recorded.
+fn same_file_type(opened: fs::FileType, walked: ftw::FileType) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    match walked {
+        ftw::FileType::RegularFile => opened.is_file(),
+        ftw::FileType::Directory => opened.is_dir(),
+        ftw::FileType::SymbolicLink => opened.is_symlink(),
+        ftw::FileType::Fifo => opened.is_fifo(),
+        ftw::FileType::CharacterDevice => opened.is_char_device(),
+        ftw::FileType::BlockDevice => opened.is_block_device(),
+        ftw::FileType::Socket => opened.is_socket(),
+        ftw::FileType::Unknown => false,
+    }
+}
+
+/// Open the source file the walk stat'ed (`walked`), for reading.
+///
+/// The walk's `lstat` (or `stat`, for a link it follows) came first, so the descriptor must be
+/// that same file, or nothing is read from it. When the walk saw a regular file the open also
+/// carries `O_NONBLOCK`, so a FIFO swapped in since cannot hold the open waiting for a writer
+/// before the identity check refuses it; the flag is then cleared for the copy. A FIFO or device
+/// the walk saw (copied as data without -R) is opened as before, blocking.
+fn open_source(
+    source: &ftw::Entry,
+    walked: &ftw::Metadata,
+    flags: libc::c_int,
+) -> io::Result<fs::File> {
+    let cannot_open = |e: &io::Error| {
+        io::Error::other(gettext!(
+            "cannot open '{}' for reading: {}",
+            source.path(),
+            error_string(e)
+        ))
+    };
+    let regular = walked.file_type() == ftw::FileType::RegularFile;
+    let nonblock = if regular { libc::O_NONBLOCK } else { 0 };
+    let fd = unsafe {
+        libc::openat(
+            source.dir_fd(),
+            source.file_name().as_ptr(),
+            flags | nonblock | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(cannot_open(&io::Error::last_os_error()));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let opened = file.metadata().map_err(|e| cannot_open(&e))?;
+    // The type too: a file unlinked and replaced can hand its inode number straight on.
+    if opened.dev() != walked.dev()
+        || opened.ino() != walked.ino()
+        || !same_file_type(opened.file_type(), walked.file_type())
+    {
+        return Err(io::Error::other(gettext!(
+            "will not read '{}': it changed after it was checked",
+            source.path()
+        )));
+    }
+    if regular {
+        let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if status == -1
+            || unsafe { libc::fcntl(fd, libc::F_SETFL, status & !libc::O_NONBLOCK) } == -1
+        {
+            return Err(cannot_open(&io::Error::last_os_error()));
+        }
+    }
+    Ok(file)
 }
 
 /// -p for a symbolic link or special file this copy just made (no descriptor to act through).

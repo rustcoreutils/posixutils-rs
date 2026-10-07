@@ -253,6 +253,48 @@ fn cp_never_writes_through_a_symlink_swapped_in_after_the_check() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// The source is opened after cp's checks (here held open by the -i prompt). A FIFO swapped in
+/// for the regular file the walk saw must be refused, not opened: an `O_RDONLY` open of a FIFO
+/// waits for a writer forever. Any other swapped-in file is refused too.
+#[test]
+fn cp_refuses_a_source_swapped_after_the_walk_saw_it() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let base = scratch("swap_source");
+    fs::write(base.join("source"), b"source").unwrap();
+    fs::write(base.join("target"), b"old").unwrap();
+    let fifo = base.join("source");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let base_for_cp = base.clone();
+    let fifo_for_cp = fifo.clone();
+    std::thread::spawn(move || {
+        let stderr = cp_i_swapping_at_prompt(&base_for_cp, || {
+            fs::remove_file(&fifo_for_cp).unwrap();
+            let c = std::ffi::CString::new(fifo_for_cp.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        });
+        let _ = tx.send(stderr);
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(stderr) => {
+            assert_eq!(fs::read(base.join("target")).unwrap(), b"old");
+            assert!(stderr.contains("changed"), "stderr: {stderr}");
+        }
+        Err(_) => {
+            // Release cp, blocked in the FIFO's open, before failing.
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+            panic!("cp opened a FIFO swapped in for its regular-file source and hung");
+        }
+    }
+
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// The same for another regular file renamed over the destination: the file opened must be the
 /// one cp checked, or nothing is written -- not even a truncation.
 #[test]

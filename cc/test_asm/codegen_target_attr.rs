@@ -78,16 +78,15 @@ fn target_attr_spellings_are_recognised() {
     assert!(!c.stderr.contains("ignored"), "{}", c.stderr);
 }
 
-/// An ISA above c17's SSE4.2 ceiling is named in a warning, and the function
-/// is compiled at the unit's ISA rather than refused.
+/// An ISA above c17's SSE4.2 ceiling is ignored without a word, and the
+/// function is compiled at the unit's ISA rather than refused.
 #[test]
-fn target_attr_beyond_the_ceiling_warns_and_compiles() {
+fn target_attr_beyond_the_ceiling_compiles_silently() {
     let src = "__attribute__((target(\"avx2\"))) int f(int x) { return x + 1; }\n";
     let c = compile("target_avx2", src, &["--target=x86_64-unknown-linux-gnu"]);
     assert!(c.success, "{}", c.stderr);
-    assert!(c.stderr.contains("avx2"), "{}", c.stderr);
     // Recognised and judged, not skipped as an unknown attribute.
-    assert!(!c.stderr.contains("directive ignored"), "{}", c.stderr);
+    assert!(c.stderr.is_empty(), "{}", c.stderr);
     assert!(c.asm.is_some());
 }
 

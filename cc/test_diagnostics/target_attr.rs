@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 // `__attribute__((target("...")))` and `target_clones(...)`: what gcc 13
-// refuses, in its words, and c17's warning for an ISA beyond its SSE4.2
-// ceiling. Every case names its target and runs the same on any host.
+// refuses, in its words, and the ISA beyond c17's SSE4.2 ceiling that is
+// ignored in silence. Every case names its target and runs the same on any
+// host.
 //
 
 use crate::test_compile::{compile, compile_accepted, compile_rejected_with};
@@ -33,33 +34,36 @@ fn expect_warning(name: &str, src: &str, expected: &str) {
     );
 }
 
-/// An ISA gcc knows and c17 does not model is named, and the function is
-/// still compiled; the modelled part of the same string applies.
+/// An ISA gcc knows and c17 does not generate is ignored without a word:
+/// `target` only permits an ISA, so plain C under it compiles the same, and
+/// a body that really used one fails on its own. libzstd's tests put
+/// `target("lzcnt,bmi,bmi2")` on plain-C functions and build with `-Werror`.
+/// The modelled part of the same string still applies.
 #[test]
-fn diagnostics_target_beyond_the_ceiling_is_named() {
-    for isa in ["avx", "avx2", "avx512f", "bmi2", "fma", "f16c"] {
-        expect_warning(
+fn diagnostics_target_beyond_the_ceiling_is_silent() {
+    for isa in [
+        "avx",
+        "avx2",
+        "avx512f",
+        "bmi2",
+        "fma",
+        "f16c",
+        "lzcnt,bmi,bmi2",
+    ] {
+        let c = compile(
             &format!("target_{isa}"),
             &format!("__attribute__((target(\"sse4.1,{isa}\"))) int f(int x) {{ return x; }}\n"),
-            &format!(
-                "ISA '{isa}' in 'target' attribute is beyond c17's SSE4.2 ceiling and is ignored"
-            ),
+            &[LINUX, "-Werror"],
         );
+        assert!(c.success && c.stderr.is_empty(), "{isa}: {}", c.stderr);
     }
-    // Turning off what c17 never generates says nothing.
+    // Turning off what c17 never generates says nothing either.
     let stderr = compile_accepted(
         "target_no_avx2",
         "__attribute__((target(\"no-avx2\"))) int f(int x) { return x; }\n",
         &[LINUX],
     );
     assert!(stderr.is_empty(), "{stderr}");
-    // `-Wno-attributes` silences it, as every attribute warning.
-    let c = compile(
-        "target_avx2_quiet",
-        "__attribute__((target(\"avx2\"))) int f(int x) { return x; }\n",
-        &[LINUX, "-Wno-attributes"],
-    );
-    assert!(c.success && c.stderr.is_empty(), "{}", c.stderr);
 }
 
 /// The strings gcc refuses, and the one it warns about.

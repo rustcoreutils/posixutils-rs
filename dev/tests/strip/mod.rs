@@ -461,6 +461,92 @@ fn test_strip_keeps_comdat_groups() {
     run_prints(&dir.path().join("main"), "14\n");
 }
 
+/// Build `main.c` and `lib.c` into the executable `name` with debug info.
+fn build_exe(dir: &Path, name: &str) -> std::path::PathBuf {
+    write_sources(dir);
+    cc(dir, &["-g", "-o", name, "main.c", "lib.c"]);
+    dir.join(name)
+}
+
+// GNU strip writes the result back into the operand's own file, so a hard
+// link survives and every name sees the stripped program.
+#[test]
+fn test_strip_keeps_hard_links() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = TempDir::new().unwrap();
+    let a = build_exe(dir.path(), "a");
+    let b = dir.path().join("b");
+    fs::hard_link(&a, &b).unwrap();
+    let before = fs::metadata(&a).unwrap();
+    strip_ok(&[], &a);
+    let after_a = fs::metadata(&a).unwrap();
+    let after_b = fs::metadata(&b).unwrap();
+    assert_eq!(after_a.ino(), before.ino());
+    assert_eq!(after_a.nlink(), 2);
+    assert_eq!(after_b.ino(), before.ino());
+    assert!(after_a.len() < before.len());
+    let names = section_names(&fs::read(&b).unwrap());
+    assert!(!names.iter().any(|n| n == ".symtab"), "{names:?}");
+    run_prints(&b, "10\n");
+}
+
+// GNU strip follows a symbolic link operand: the link stays a link and the
+// file it names is stripped in place.
+#[test]
+fn test_strip_follows_symlink_operand() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = TempDir::new().unwrap();
+    let target = build_exe(dir.path(), "target");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink("target", &link).unwrap();
+    let ino = fs::metadata(&target).unwrap().ino();
+    let size = fs::metadata(&target).unwrap().len();
+    strip_ok(&[], &link);
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_link(&link).unwrap(), Path::new("target"));
+    let after = fs::metadata(&target).unwrap();
+    assert_eq!(after.ino(), ino);
+    assert!(after.len() < size);
+    run_prints(&target, "10\n");
+}
+
+// The mode, set-user-ID bit included, is the file's own and stays.
+#[test]
+fn test_strip_keeps_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let exe = build_exe(dir.path(), "suid");
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o4751)).unwrap();
+    strip_ok(&[], &exe);
+    let mode = fs::metadata(&exe).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o4751, "mode {mode:o}");
+}
+
+// Only a regular file is rewritten.
+#[test]
+fn test_strip_rejects_directory_and_fifo() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    let out = strip(&[], &sub);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("sub"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fifo = dir.path().join("fifo");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success());
+    let out = strip(&[], &fifo);
+    assert_eq!(out.status.code(), Some(1));
+    use std::os::unix::fs::FileTypeExt;
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+}
+
 #[test]
 fn test_strip_rejects_strip_debug_with_strip_unneeded() {
     let dir = TempDir::new().unwrap();

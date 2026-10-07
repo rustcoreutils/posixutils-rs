@@ -26,8 +26,8 @@ use plib::diag;
 use std::{
     collections::HashSet,
     ffi::{OsStr, OsString},
-    io::{Read, Write},
-    path::Path,
+    fs::{File, Metadata, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
 };
 
 #[derive(Parser)]
@@ -495,20 +495,74 @@ fn is_archive(data: &[u8]) -> bool {
     data.starts_with(&archive::MAGIC)
 }
 
+/// Open the operand `file` to read it and write the stripped result back
+/// into it. Its path is resolved here, once; everything after goes through
+/// this descriptor, so a rename or symbolic link planted later cannot
+/// redirect the write. A symbolic link operand is followed, as GNU strip
+/// follows it. O_NONBLOCK keeps the open of a FIFO from waiting for a
+/// writer before [`read_operand`] rejects it, and O_NOCTTY keeps a terminal
+/// from becoming the controlling one.
+fn open_operand(file: &OsStr) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    options.open(file)
+}
+
+/// The contents and metadata of the open operand, which must be a regular
+/// file: GNU strip refuses anything else.
+fn read_operand(file: &mut File) -> std::io::Result<(Vec<u8>, Metadata)> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(gettext("not an ordinary file")));
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok((contents, metadata))
+}
+
+/// Replace the contents of the open operand with `bytes` in place. The
+/// inode stays the operand's own, so its hard links, owner and mode stay
+/// too, as with GNU strip. The kernel clears the set-user-ID and
+/// set-group-ID bits when a non-root user writes a file; they are put
+/// back as they were (`before`).
+fn write_operand(file: &mut File, before: &Metadata, bytes: &[u8]) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = before.permissions().mode() & 0o7777;
+        if file.metadata()?.permissions().mode() & 0o7777 != mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = before;
+    Ok(())
+}
+
 fn strip_file(file: &OsStr, opts: &Options) {
-    let contents = match std::fs::read(file) {
-        Ok(contents) => contents,
+    let display = file.to_string_lossy();
+    let opened = open_operand(file)
+        .and_then(|mut fd| read_operand(&mut fd).map(|(contents, meta)| (fd, contents, meta)));
+    let (mut fd, contents, metadata) = match opened {
+        Ok(opened) => opened,
         Err(err) => {
             diag::error(&format!(
                 "{}: {}: {}",
-                file.to_string_lossy(),
+                display,
                 gettext("error reading"),
                 diag::io_error_text(&err)
             ));
             return;
         }
     };
-    let display = file.to_string_lossy();
     let stripped_contents = if is_elf(&contents) {
         strip(&contents, opts, &display)
     } else if is_archive(&contents) {
@@ -531,12 +585,12 @@ fn strip_file(file: &OsStr, opts: &Options) {
     };
     match stripped_contents {
         Ok(stripped_contents) => {
-            if let Err(err) = plib::io::write_atomic(Path::new(file), &stripped_contents) {
+            if let Err(err) = write_operand(&mut fd, &metadata, &stripped_contents) {
                 diag::error(&format!(
                     "{}: {}: {}",
-                    file.to_string_lossy(),
+                    display,
                     gettext("error writing file"),
-                    err
+                    diag::io_error_text(&err)
                 ));
             }
         }

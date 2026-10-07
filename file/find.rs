@@ -658,7 +658,21 @@ fn emacs_regex_to_ere(pattern: &str) -> Result<String, String> {
                 out.push('\\');
                 out.push(c);
             }
-            '*' | '+' | '?' | '.' => out.push(c),
+            '*' | '+' | '?' => {
+                // A run of stacked operators repeats one operand: the same
+                // operator twice is itself, any other mix matches as `*`.
+                // POSIX leaves adjacent duplication operators undefined
+                // and macOS's regcomp refuses them, so emit just one.
+                let mut op = c;
+                while let Some(&next @ ('*' | '+' | '?')) = chars.get(i) {
+                    if next != op {
+                        op = '*';
+                    }
+                    i += 1;
+                }
+                out.push(op);
+            }
+            '.' => out.push(c),
             '^' if at_start => {
                 out.push('^');
                 operand_start = true;
@@ -1663,5 +1677,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("find: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::emacs_regex_to_ere;
+
+    /// Stacked postfix operators. The Emacs syntax allows them (`c++`
+    /// matches as `c+`); a POSIX ERE leaves adjacent duplication operators
+    /// undefined, and macOS's regcomp refuses them ("repetition-operator
+    /// operand invalid"). The translation collapses a run into the one
+    /// operator with the same match: the same operator twice is itself, any
+    /// other mix is `*`.
+    #[test]
+    fn stacked_operators_collapse_to_one() {
+        for (emacs, ere) in [
+            (".*/c++", "^(.*/c+)$"),
+            ("a**", "^(a*)$"),
+            ("a??", "^(a?)$"),
+            ("a+*", "^(a*)$"),
+            ("a*+", "^(a*)$"),
+            ("a?+", "^(a*)$"),
+            ("a+?", "^(a*)$"),
+            ("a+++", "^(a+)$"),
+            ("a+?+", "^(a*)$"),
+            ("\\(ab\\)+*", "^((ab)*)$"),
+            ("[xy]?*", "^([xy]*)$"),
+        ] {
+            assert_eq!(emacs_regex_to_ere(emacs).as_deref(), Ok(ere), "{emacs}");
+        }
+        // An operator with nothing before it is still a literal, and one
+        // after it is an ordinary operator on that literal.
+        assert_eq!(emacs_regex_to_ere("+a").as_deref(), Ok("^(\\+a)$"));
+        assert_eq!(emacs_regex_to_ere("*+").as_deref(), Ok("^(\\*+)$"));
     }
 }

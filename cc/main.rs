@@ -11,6 +11,7 @@
 
 #![recursion_limit = "512"]
 
+use posixutils_cc::aux_info;
 use posixutils_cc::builtins;
 use posixutils_cc::diag;
 use posixutils_cc::f_options::{self, Effect};
@@ -148,6 +149,15 @@ struct Args {
     /// build until the makefile is regenerated (`-MP`).
     #[arg(long = "MP", help = gettext("Add a phony target for each dependency"))]
     deps_phony: bool,
+
+    /// gcc's `-aux-info`: record every function declared or defined at file
+    /// scope in `<file>`. libselinux's Python binding is generated from it.
+    #[arg(
+        long = "aux-info",
+        value_name = "file",
+        help = gettext("Write the declarations of every function to <file>")
+    )]
+    aux_info: Option<String>,
 
     /// Process a file as if `#include "<file>"` were the first line
     /// (`-include`). Repeatable, applied in order.
@@ -599,11 +609,22 @@ struct DriverObserver<'a> {
 }
 
 impl pipeline::Observer for DriverObserver<'_> {
-    fn parsed(&mut self, ast: &parse::ast::TranslationUnit) -> io::Result<bool> {
+    fn parsed(
+        &mut self,
+        ast: &parse::ast::TranslationUnit,
+        strings: &StringTable,
+        types: &types::TypeTable,
+        symbols: &SymbolTable,
+    ) -> io::Result<bool> {
         if let Some(stage) = &self.args.dump_ir {
             if let Err(msg) = validate_dump_ir_stage(stage) {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
             }
+        }
+        if let Some(path) = &self.args.aux_info {
+            let text = aux_info::records(ast, strings, types, symbols);
+            std::fs::write(path, text)
+                .map_err(|e| io::Error::new(e.kind(), format!("cannot write '{path}': {e}")))?;
         }
         if self.args.dump_ast {
             println!("{:#?}", ast);
@@ -2050,7 +2071,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // clusters.
             result.push(format!("-{}", arg));
             i += 1;
-        } else if arg == "-MF" || arg == "-MT" {
+        } else if arg == "-MF" || arg == "-MT" || arg == "-aux-info" {
+            // One dash in gcc; clap would read `-aux-info` as `-a -u -x ...`.
             result.push(format!("-{}", arg));
             if let Some(v) = raw_args.get(i + 1) {
                 result.push(v.clone());

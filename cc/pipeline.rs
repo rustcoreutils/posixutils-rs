@@ -96,7 +96,13 @@ pub struct CodegenOptions<'a> {
 pub trait Observer {
     /// The translation unit parsed without error. `Ok(false)` stops here
     /// without failing; `Err` fails.
-    fn parsed(&mut self, _ast: &TranslationUnit) -> io::Result<bool> {
+    fn parsed(
+        &mut self,
+        _ast: &TranslationUnit,
+        _strings: &StringTable,
+        _types: &TypeTable,
+        _symbols: &SymbolTable,
+    ) -> io::Result<bool> {
         Ok(true)
     }
 
@@ -182,7 +188,7 @@ pub fn compile_tokens(
         return Err(failed("compilation failed"));
     }
 
-    if !observer.parsed(&ast)? {
+    if !observer.parsed(&ast, strings, &types, &symbols)? {
         return Ok(None);
     }
 

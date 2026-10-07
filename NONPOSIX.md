@@ -364,6 +364,25 @@ POSIX specifies only `-k`.  Every other option is an addition:
 
  * `-f` — force; assume answers rather than prompting.
 
+The rest are the GNU options and behaviors `dpkg-source` relies on to unpack
+Debian source packages, with GNU patch's meaning:
+
+ * `-t` — batch: ask nothing; a patch that looks reversed is applied
+   reversed, a file that cannot be named is skipped.
+ * `-F num` — at most `num` lines of fuzz (default 2, as POSIX describes).
+ * `-V never` / `-V simple` — the simple backup method, the only one there is;
+   other methods are refused.
+ * `-E` — remove a file the patch leaves empty.
+ * `-B prefix`, `-z suffix` — backup names `prefix`+FILE, FILE+`suffix`, or
+   both; either implies `-b`.  Directories in the prefix are created.
+ * `--reject-file=file` — long form of `-r`; `-r -` discards the rejects.
+ * With a backup option, a file the patch creates gets an empty backup, the
+   placeholder dpkg-source and quilt read as "did not exist".
+ * A single hunk inserting into an empty old file (`@@ -0,0 +1,n @@`) creates
+   the file when it does not exist, as `diff -N` output requires.
+ * Removing a file also removes the directories it leaves empty, up to the
+   working directory.
+
 ### pax
 
  * `-z` / `--gzip` — gzip the archive on write.  On read, gzip is detected from

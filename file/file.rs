@@ -7,13 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod elf;
 mod magic;
 
 use std::fs::{read_link, File};
 use std::io::{Read, Seek};
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::FileTypeExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -77,7 +78,43 @@ struct Args {
     )]
     test_file2: Option<PathBuf>,
 
+    #[arg(short = 'b', long, help = gettext("Do not prefix each line with the file name"))]
+    brief: bool,
+
+    #[arg(
+        short = 'e',
+        value_name = "TESTNAME",
+        action = clap::ArgAction::Append,
+        value_parser = EXCLUDABLE_TESTS,
+        help = gettext("Exclude the named default system test")
+    )]
+    exclude: Vec<String>,
+
     files: Vec<String>,
+}
+
+/// The test names `-e` accepts: exactly the ones debhelper's dh_strip and
+/// dh_shlibdeps exclude. Only `ascii` names a test this file(1) has -- the
+/// text recognition in `content_type`. The rest name GNU file built-ins
+/// absent here (OS/2 application type, character-encoding detection,
+/// Compound Document Format, the compressed-file and tar parsers), so
+/// excluding them leaves the result unchanged.
+const EXCLUDABLE_TESTS: [&str; 6] = ["apptype", "ascii", "encoding", "cdf", "compress", "tar"];
+
+impl Args {
+    /// Whether the context-sensitive text tests may run.
+    fn text_tests(&self, magic_files: &[PathBuf]) -> bool {
+        default_tests_active(magic_files) && !self.exclude.iter().any(|t| t == "ascii")
+    }
+
+    /// Write one result line, without the file name under `-b`.
+    fn report(&self, path: &str, type_str: &str) {
+        if self.brief {
+            println!("{type_str}");
+        } else {
+            println!("{path}: {type_str}");
+        }
+    }
 }
 
 fn get_magic_files(args: &Args, matches: &clap::ArgMatches) -> Vec<PathBuf> {
@@ -165,13 +202,14 @@ fn looks_like_fortran(text: &str) -> bool {
 }
 
 /// Classify regular-file content. `is_empty` short-circuits to "empty";
-/// otherwise position-sensitive magic tests run first (via `make_reader`), then
-/// — only when the default tests are active — the context-sensitive content
-/// tests on `prefix`; failing both yields "data".
+/// otherwise position-sensitive tests run first (via `make_reader`) -- each
+/// magic database in order, with the built-in ELF test leading the default
+/// one -- then, when `text_tests` allows, the context-sensitive content tests
+/// on `prefix`; failing both yields "data".
 fn classify_content<F>(
     is_empty: bool,
     prefix: &[u8],
-    default_active: bool,
+    text_tests: bool,
     magic_files: &[PathBuf],
     make_reader: F,
 ) -> String
@@ -181,10 +219,17 @@ where
     if is_empty {
         return gettext("empty");
     }
-    if let Some(f_type) = get_type_from_magic_file_dbs(make_reader, magic_files) {
-        return f_type;
+    for db in magic_files {
+        if db.as_path() == Path::new(DEFAULT_MAGIC_FILE) {
+            if let Some(f_type) = elf::describe_with(&make_reader) {
+                return f_type;
+            }
+        }
+        if let Some(f_type) = get_type_from_magic_file_dbs(&make_reader, std::slice::from_ref(db)) {
+            return f_type;
+        }
     }
-    if default_active {
+    if text_tests {
         if let Some(t) = content_type(prefix) {
             return t;
         }
@@ -231,7 +276,7 @@ fn classify(path: &str, met: &fs::Metadata, args: &Args, magic_files: &[PathBuf]
         return classify_content(
             met.len() == 0,
             &prefix,
-            default_tests_active(magic_files),
+            args.text_tests(magic_files),
             magic_files,
             move || Ok(Box::new(File::open(&owned)?) as Box<dyn ReadSeek>),
         );
@@ -251,7 +296,7 @@ fn analyze_file(path: &str, args: &Args, magic_files: &[PathBuf]) {
         Ok(met) => met,
         Err(_) => {
             // Per spec this is reported but does not affect the exit status.
-            println!("{path}: {}", gettext("cannot open"));
+            args.report(path, &gettext("cannot open"));
             return;
         }
     };
@@ -264,27 +309,24 @@ fn analyze_file(path: &str, args: &Args, magic_files: &[PathBuf]) {
         // Identify the link itself when -h is given, or by default when the
         // link is broken (POSIX: a dangling link is treated as if -h).
         if args.identify_as_symbolic_link || target_meta.is_err() {
-            match (&target, target_meta.is_ok()) {
-                (Some(t), true) => {
-                    println!("{path}: {} {}", gettext("symbolic link to"), t.display())
+            let type_str = match (&target, target_meta.is_ok()) {
+                (Some(t), true) => format!("{} {}", gettext("symbolic link to"), t.display()),
+                (Some(t), false) => {
+                    format!("{} {}", gettext("broken symbolic link to"), t.display())
                 }
-                (Some(t), false) => println!(
-                    "{path}: {} {}",
-                    gettext("broken symbolic link to"),
-                    t.display()
-                ),
-                (None, _) => println!("{path}: {}", gettext("symbolic link")),
-            }
+                (None, _) => gettext("symbolic link"),
+            };
+            args.report(path, &type_str);
             return;
         }
 
         // Default: resolve the link and classify the referenced file's type.
         let tmet = target_meta.unwrap();
-        println!("{path}: {}", classify(path, &tmet, args, magic_files));
+        args.report(path, &classify(path, &tmet, args, magic_files));
         return;
     }
 
-    println!("{path}: {}", classify(path, &lmet, args, magic_files));
+    args.report(path, &classify(path, &lmet, args, magic_files));
 }
 
 /// Obtain a seekable handle to standard input without buffering it in memory.
@@ -335,7 +377,7 @@ fn analyze_stdin(args: &Args, magic_files: &[PathBuf]) {
                 classify_content(
                     prefix.is_empty(),
                     &prefix,
-                    default_tests_active(magic_files),
+                    args.text_tests(magic_files),
                     magic_files,
                     move || {
                         let mut f = file.try_clone()?;
@@ -350,7 +392,7 @@ fn analyze_stdin(args: &Args, magic_files: &[PathBuf]) {
             }
         }
     };
-    println!("/dev/stdin: {type_str}");
+    args.report("/dev/stdin", &type_str);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

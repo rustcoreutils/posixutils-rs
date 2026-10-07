@@ -238,6 +238,22 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `#` — null command / comment.
  * `&` — repeat the last substitution.
 
+### file
+
+ * `-b` / `--brief` — print the type without the `file: ` prefix.
+ * `-e testname` — exclude a default system test.  Only the names
+   `apptype`, `ascii`, `encoding`, `cdf`, `compress` and `tar` are accepted.
+   `ascii` turns off the text recognition (`commands text`, `c program text`,
+   `fortran program text`); the others name GNU file built-ins this `file`
+   does not have, so excluding them changes nothing.
+
+Both are forced by debhelper: dh_strip and dh_shlibdeps run
+`file --brief -e apptype -e ascii -e encoding -e cdf -e compress -e tar -- FILE`.
+They read the result through `ELF.*shared`, `ELF.*(executable|shared)`,
+`not stripped` and `statically linked`, which is why the built-in ELF test
+reports the class, byte order, object type, linking and whether a symbol
+table is present.
+
 ### find
 
  * `-ipath pattern` — case-insensitive `-path`.  POSIX.1-2024 added `-iname`

@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod debhelper;
+
 use std::{env, path::PathBuf};
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};

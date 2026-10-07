@@ -14,6 +14,7 @@ use super::types::{
     Placement,
 };
 use gettextrs::gettext;
+use std::hash::{BuildHasher, RandomState};
 
 /// How many lines of context a fuzzy match may ignore at each end, unless -F
 /// says otherwise.
@@ -36,6 +37,11 @@ enum ReversalChoice {
 pub struct PatchApplier<'a> {
     config: &'a PatchConfig,
     file_lines: Vec<String>,
+    /// A hash of each line of `file_lines` (of its blank-normalized form
+    /// under -l), kept in step with it, so locating a hunk costs one pass
+    /// over the file rather than one comparison per file line per hunk line.
+    line_hashes: Vec<u64>,
+    hasher: RandomState,
     offset: i64,
     /// Whether the resulting file's last line currently has no trailing newline.
     eof_no_newline: bool,
@@ -52,9 +58,16 @@ impl<'a> PatchApplier<'a> {
         file_lines: Vec<String>,
         orig_trailing_newline: bool,
     ) -> Self {
+        let hasher = RandomState::new();
+        let line_hashes = file_lines
+            .iter()
+            .map(|l| line_hash(&hasher, config, l))
+            .collect();
         Self {
             config,
             file_lines,
+            line_hashes,
+            hasher,
             offset: 0,
             eof_no_newline: !orig_trailing_newline,
         }
@@ -144,7 +157,13 @@ impl<'a> PatchApplier<'a> {
     fn reject_at_offset(&self, hunk: &Hunk) -> Hunk {
         let mut rej = hunk.clone();
         if self.offset != 0 {
-            let adjust = |start: usize| ((start as i64 + self.offset).max(1)) as usize;
+            let adjust = |start: usize| {
+                let moved = i64::try_from(start)
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(self.offset)
+                    .max(1);
+                usize::try_from(moved).unwrap_or(usize::MAX)
+            };
             rej.old_start = adjust(rej.old_start);
             rej.new_start = adjust(rej.new_start);
         }
@@ -242,7 +261,9 @@ impl<'a> PatchApplier<'a> {
     /// the script does not record the removed text.
     fn apply_positional_hunk(&mut self, hunk: &Hunk) -> HunkResult {
         let pos = hunk.old_start.saturating_sub(1).min(self.file_lines.len());
-        let remove_end = (pos + hunk.old_count).min(self.file_lines.len());
+        let remove_end = pos
+            .saturating_add(hunk.old_count)
+            .min(self.file_lines.len());
         let adds: Vec<&str> = hunk
             .lines
             .iter()
@@ -289,10 +310,27 @@ impl<'a> PatchApplier<'a> {
     /// accumulated by previously applied hunks, scanning both ways. If that
     /// fails and the hunk carries context, rescan ignoring the first and last
     /// line of context, then the first two and last two.
+    ///
+    /// The header's line number is untrusted: the search starts from it, but
+    /// never from beyond the end of the file. More fuzz than the hunk has
+    /// lines would only retry windows already tried, so the fuzz levels are
+    /// bounded by the hunk's length as well as by -F.
     fn apply_matched_hunk(&mut self, hunk: &Hunk) -> HunkResult {
-        let expected = (hunk.old_start as i64 - 1 + self.offset).max(0) as usize;
+        let named = i64::try_from(hunk.old_start)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(1)
+            .saturating_add(self.offset)
+            .max(0);
+        let expected = usize::try_from(named)
+            .unwrap_or(usize::MAX)
+            .min(self.file_lines.len());
 
-        let max_fuzz = self.config.max_fuzz.unwrap_or(DEFAULT_MAX_FUZZ);
+        let prefix = self.prefix_hashes();
+        let max_fuzz = self
+            .config
+            .max_fuzz
+            .unwrap_or(DEFAULT_MAX_FUZZ)
+            .min(hunk.lines.len());
         for fuzz in 0..=max_fuzz {
             let window = if fuzz == 0 {
                 Some(hunk.full_window())
@@ -300,9 +338,13 @@ impl<'a> PatchApplier<'a> {
                 hunk.fuzz_window(fuzz)
             };
             let Some(window) = window else { continue };
-            if let Some(pos) = self.locate_hunk(&window, expected) {
+            if let Some(pos) = self.locate_hunk(&window, expected, &prefix) {
                 self.apply_window(hunk, &window, pos);
-                self.offset += hunk.new_count as i64 - hunk.old_count as i64;
+                // The lines the hunk really carries, not its header's counts,
+                // which nothing has checked.
+                let full = hunk.full_window();
+                let grew = full.new_lines().len() as i64 - full.old_lines().len() as i64;
+                self.offset = self.offset.saturating_add(grew);
                 return HunkResult::Applied {
                     line: pos + 1,
                     offset: pos as i64 - expected as i64,
@@ -331,30 +373,60 @@ impl<'a> PatchApplier<'a> {
     ///
     /// Returns the position of the hunk's first line, which sits `lead_skip`
     /// lines before the text that was actually verified.
-    fn locate_hunk(&self, window: &MatchWindow, expected: usize) -> Option<usize> {
+    ///
+    /// `expected` is at most the file's length, so each direction runs off
+    /// the file within that many steps. A position is compared line by line
+    /// only when the window's hash matches the file's there (`prefix`, from
+    /// [`Self::prefix_hashes`]), so the whole search is linear in the file
+    /// and the window, whatever the file repeats.
+    fn locate_hunk(&self, window: &MatchWindow, expected: usize, prefix: &[u64]) -> Option<usize> {
         let old_lines = window.old_lines();
         let skip = window.lead_skip;
+        let len = old_lines.len();
+        if len + skip > self.file_lines.len() {
+            return None;
+        }
         // Furthest hunk start at which the window still fits inside the file.
-        let last_start = self.file_lines.len().saturating_sub(old_lines.len() + skip);
+        let last_start = self.file_lines.len() - (len + skip);
 
-        for delta in 0.. {
-            if expected + delta <= last_start
-                && self.lines_match_at(&old_lines, expected + delta + skip)
-            {
+        let want = old_lines.iter().fold(0u64, |h, l| {
+            h.wrapping_mul(HASH_BASE)
+                .wrapping_add(line_hash(&self.hasher, self.config, l))
+        });
+        let base_pow = (0..len).fold(1u64, |p, _| p.wrapping_mul(HASH_BASE));
+        let matches = |start: usize| {
+            let at = start + skip;
+            let got = prefix[at + len].wrapping_sub(prefix[at].wrapping_mul(base_pow));
+            got == want && self.lines_match_at(&old_lines, at)
+        };
+
+        let reach = expected.max(last_start.saturating_sub(expected));
+        for delta in 0..=reach {
+            if expected + delta <= last_start && matches(expected + delta) {
                 return Some(expected + delta);
             }
             if delta > 0
                 && delta <= expected
-                && self.lines_match_at(&old_lines, expected - delta + skip)
+                && expected - delta <= last_start
+                && matches(expected - delta)
             {
                 return Some(expected - delta);
             }
-            // Both directions have run off the end of the file.
-            if delta > expected && expected + delta > last_start {
-                break;
-            }
         }
         None
+    }
+
+    /// Polynomial prefix hashes of the file's lines: `prefix[i]` covers lines
+    /// `0..i`, so any run of lines hashes in constant time.
+    fn prefix_hashes(&self) -> Vec<u64> {
+        let mut prefix = Vec::with_capacity(self.line_hashes.len() + 1);
+        prefix.push(0u64);
+        let mut h = 0u64;
+        for &lh in &self.line_hashes {
+            h = h.wrapping_mul(HASH_BASE).wrapping_add(lh);
+            prefix.push(h);
+        }
+        prefix
     }
 
     /// Splice the window's new-side text over the file lines it matched.
@@ -401,6 +473,11 @@ impl<'a> PatchApplier<'a> {
             return;
         }
         let write_end = at + replacement.len();
+        let hashes: Vec<u64> = replacement
+            .iter()
+            .map(|l| line_hash(&self.hasher, self.config, l))
+            .collect();
+        self.line_hashes.splice(at..remove_end, hashes);
         self.file_lines.splice(at..remove_end, replacement);
         if write_end == self.file_lines.len() {
             self.eof_no_newline = no_newline;
@@ -494,6 +571,20 @@ fn ifdef_block(define: &str, dels: &[&str], adds: &[&str]) -> Vec<String> {
     }
     out.push(String::from("#endif"));
     out
+}
+
+/// Multiplier for the polynomial hash of a run of lines (odd, so it is
+/// invertible modulo 2^64; the line hashes it combines are keyed per run).
+const HASH_BASE: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The hash of one line as `lines_match` compares it: blank runs normalized
+/// under -l, exact otherwise.
+fn line_hash(hasher: &RandomState, config: &PatchConfig, line: &str) -> u64 {
+    if config.loose_whitespace {
+        hasher.hash_one(normalize_whitespace(line))
+    } else {
+        hasher.hash_one(line)
+    }
 }
 
 /// Normalize whitespace for loose matching.

@@ -89,7 +89,9 @@ impl Hunk {
     pub fn new(old_start: usize, old_count: usize, new_start: usize, new_count: usize) -> Self {
         // Pre-allocate: typically need old_count + new_count lines
         // (context lines counted in both, plus adds and deletes)
-        let estimated_lines = old_count.saturating_add(new_count);
+        // The counts come from the header, which nothing has checked yet: a
+        // hint for the allocation, never a size to trust.
+        let estimated_lines = old_count.saturating_add(new_count).min(4096);
         Self {
             old_start,
             old_count,

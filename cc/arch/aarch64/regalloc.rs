@@ -1424,6 +1424,16 @@ impl RegAlloc {
             self.used_callee_saved_fp
                 .extend(VReg::allocatable().iter().filter(|r| r.is_callee_saved()));
         }
+        // A callee-saved register an inline asm clobbers is the function's to
+        // preserve, as any it allocates is, though no pseudo lives in it.
+        for reg in FrameBase::asm_claimed_regs(func) {
+            if reg.is_callee_saved()
+                && Reg::allocatable().contains(&reg)
+                && !self.used_callee_saved.contains(&reg)
+            {
+                self.used_callee_saved.push(reg);
+            }
+        }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // An asm operand in a `"w"` register is defined only by the asm,

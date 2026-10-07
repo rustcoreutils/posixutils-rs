@@ -469,6 +469,24 @@ pub fn asm_pinned_regs(asm: &AsmData) -> Vec<Option<Reg>> {
     pins
 }
 
+/// Every general register an inline asm of `func` may change: those it
+/// clobbers, and those its operands are pinned to -- an input in `%rbx` is
+/// loaded there by the function itself. A callee-saved one among them is the
+/// function's to preserve, as any it allocates is, though no pseudo lives
+/// in it.
+fn asm_written_regs(func: &Function) -> impl Iterator<Item = Reg> + '_ {
+    func.blocks
+        .iter()
+        .flat_map(|block| &block.insns)
+        .filter(|insn| insn.op == Opcode::Asm)
+        .filter_map(|insn| insn.extra().asm_data.as_deref())
+        .flat_map(|asm| {
+            let pinned = asm_pinned_regs(asm).into_iter().flatten();
+            let clobbered = asm.clobbers.iter().filter_map(|c| parse_gp_clobber_name(c));
+            pinned.chain(clobbered).collect::<Vec<_>>()
+        })
+}
+
 /// Map a clobber-list register name (lowercase, GCC-style) to the
 /// corresponding `Reg`. Accepts the 64-bit canonical name (`rax`,
 /// `r10`, ...), the 32/16/8-bit alias (`eax`, `ax`, `al`, `r10d`,
@@ -1190,6 +1208,12 @@ impl RegAlloc {
                 if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
                     self.used_callee_saved.push(reg);
                 }
+            }
+        }
+        // The frame pointer is the prologue's own, saved already.
+        for reg in asm_written_regs(func).filter(|r| Reg::allocatable().contains(r)) {
+            if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
+                self.used_callee_saved.push(reg);
             }
         }
         // Use shared identify_fp_pseudos with type-checker closure

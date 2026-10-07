@@ -15,6 +15,7 @@ mod aarch64_offsets;
 mod aarch64_runtime;
 mod aggregate_abi;
 mod asm_attributes;
+mod asm_callee_saved;
 mod asm_constraint_letters;
 mod asm_operand_modifiers;
 pub mod asm_probe;

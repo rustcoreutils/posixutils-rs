@@ -98,7 +98,9 @@ Supported:
 - GCC-compatible inline assembly: extended asm with constraints, clobbers,
   named operands, matching constraints, `asm goto` with labels, SSE (`x`) and
   x87 (`t`/`u`) operand classes on x86-64, and vector (`w`) operands with the
-  `b`/`h`/`s`/`d`/`q` width modifiers on AArch64
+  `b`/`h`/`s`/`d`/`q` width modifiers on AArch64; and basic asm at file scope
+  (`__asm__(".symver ...");`), written verbatim in source order among the
+  unit's definitions
 - GNU extensions real code depends on: case ranges (`case 1 ... 9:`),
   designated-initializer ranges (`[0 ... 3] = v`), computed goto (`&&label`
   and `goto *p`, with `&&a - &&b` as a constant for jump tables of offsets),

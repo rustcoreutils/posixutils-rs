@@ -260,6 +260,8 @@ but no daemon to run them.  Behavior follows Vixie cron:
    `dh_compress` prunes with `-prune -false`).
  * `-size nk` — the size in KiB, rounded up.  No other GNU unit is
    accepted.  Forced by debhelper (`dh_compress` `-size +4k`).
+ * `-perm /mode` — true if any of the bits in `mode` is set (or `mode` has
+   none).  Forced by debhelper (`dh_shlibdeps` `-perm /111`).
  * `-regex pattern` — true if the pattern matches the whole pathname, in
    the Emacs syntax that is GNU find's default: `\(`, `\)`, `\|` group and
    alternate, `+` and `?` are operators, a bare `(`, `)`, `|`, `{`, `}` is a

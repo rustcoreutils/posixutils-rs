@@ -94,6 +94,9 @@ enum PermMode {
     Exact(u32),
     /// At least all these bits are set (prefixed with -)
     AtLeast(u32),
+    /// Any of these bits is set, or no bits are given (prefixed with /): GNU
+    /// extension, forced by debhelper (dh_shlibdeps `-perm /111`)
+    Any(u32),
 }
 
 /// File types for -type primary
@@ -789,6 +792,8 @@ fn parse_perm_mode(mode_str: &str) -> Result<PermMode, String> {
     if let Some(rest) = mode_str.strip_prefix('-') {
         let mode = parse_mode_value(rest)?;
         Ok(PermMode::AtLeast(mode))
+    } else if let Some(rest) = mode_str.strip_prefix('/') {
+        Ok(PermMode::Any(parse_mode_value(rest)?))
     } else {
         let mode = parse_mode_value(mode_str)?;
         Ok(PermMode::Exact(mode))
@@ -1080,6 +1085,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             let matched = match mode {
                 PermMode::Exact(m) => file_mode == *m,
                 PermMode::AtLeast(m) => (file_mode & m) == *m,
+                PermMode::Any(m) => *m == 0 || file_mode & m != 0,
             };
             EvalResult::new(matched)
         }

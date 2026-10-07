@@ -546,3 +546,22 @@ fn find_or_and_spellings() {
     );
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `-perm /mode` (dh_shlibdeps `-perm /111`): any of the bits is set; with
+/// no bits at all it matches every file, as in GNU find.
+#[test]
+fn find_perm_any_bits() {
+    let dir = make_pkg_tree("perm_any");
+    expect_words(&dir, "-type f -perm /111", &["./exe", "./ux"]);
+    expect_words(&dir, "-type f -perm /011", &["./exe"]);
+    expect_words(&dir, "-type f -perm /u+x", &["./exe", "./ux"]);
+    expect_words(&dir, "-name plain -perm /000", &["./plain"]);
+    // dh_shlibdeps
+    expect_words(
+        &dir,
+        "-type f ( -perm /111 -or -name *.so* -or -name *.node )",
+        &["./exe", "./ux"],
+    );
+    run_test_find(&[".", "-perm", "/9"], "", "find: invalid mode: 9\n", 1);
+    fs::remove_dir_all(&dir).unwrap();
+}

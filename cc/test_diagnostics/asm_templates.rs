@@ -134,9 +134,9 @@ fn asm_template_references_that_name_nothing() {
             "undefined named asm operand 'nope'",
         ),
         (
-            "asm_tpl_eq",
-            r##""# %=" :: "r"(x)"##,
-            "invalid '%=' in asm template",
+            "asm_tpl_bang",
+            r##""# %!" :: "r"(x)"##,
+            "invalid '%!' in asm template",
         ),
         (
             "asm_tpl_label",
@@ -164,11 +164,11 @@ fn asm_template_references_that_name_nothing() {
 /// is substituted, and `%%` stays `%%`.
 #[test]
 fn asm_basic_template_is_verbatim() {
-    let src = statement(r##""# basic %eax %%ebx %0""##);
+    let src = statement(r##""# basic %eax %%ebx %0 %=""##);
     for target in [X86, A64] {
         let asm = expect_accepted("asm_basic", &src, target, "-O0");
         assert!(
-            asm.contains("# basic %eax %%ebx %0"),
+            asm.contains("# basic %eax %%ebx %0 %="),
             "{}:\n{asm}",
             target[1]
         );

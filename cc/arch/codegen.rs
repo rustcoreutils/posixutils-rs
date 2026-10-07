@@ -172,6 +172,9 @@ pub struct CodeGenBase<I: LirInst> {
     /// at which a variable's home is known -- the register allocator's decision
     /// is per-function and is not kept afterwards.
     pub fn_dies: Vec<super::dwarf::FnDie>,
+    /// Extended asm statements emitted so far in this module: the next one's
+    /// `%=` number; see [`CodeGenBase::next_asm_instance`].
+    pub asm_instances: u32,
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -196,7 +199,17 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             lir_comments: std::collections::HashMap::new(),
             value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
+            asm_instances: 0,
         }
+    }
+
+    /// The number an extended asm's `%=` prints: unique to each asm emitted
+    /// in the module, so a copy made by inlining or duplication gets its own
+    /// -- which is what makes it usable in a label.
+    pub fn next_asm_instance(&mut self) -> u32 {
+        let n = self.asm_instances;
+        self.asm_instances += 1;
+        n
     }
 
     /// Under `-fstack-clash-protection`, warn that `func` is unprobed if gcc
@@ -1135,6 +1148,7 @@ fn read_operand_ref(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<
 ///   every operand
 /// - `%cN` is a constant without its immediate prefix and `%nN` its
 ///   negation, on every target
+/// - `%=` is `instance`, a number unique to this asm in the module
 ///
 /// Anything else after a `%` is an error naming it: an unknown modifier, a
 /// modifier the operand cannot take, an operand that does not exist. Passed
@@ -1145,6 +1159,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
     template: &str,
     slots: &[AsmOperandSlot<F::Reg>],
     goto_labels: &[(String, String)],
+    instance: u32,
 ) -> Result<String, String> {
     let mut result = String::with_capacity(template.len() * 2);
     let mut chars = template.chars().peekable();
@@ -1156,6 +1171,10 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
         }
         if chars.next_if_eq(&'%').is_some() {
             result.push('%');
+            continue;
+        }
+        if chars.next_if_eq(&'=').is_some() {
+            result.push_str(&instance.to_string());
             continue;
         }
         let modifier = chars.next_if(|m| m.is_ascii_alphabetic());
@@ -1653,7 +1672,7 @@ mod tests {
             slot(V::Mem("(%rax)".into()), None),
         ];
         let labels = [(".L9".to_string(), "done".to_string())];
-        super::substitute_asm_operands(&Stub, template, &slots, &labels)
+        super::substitute_asm_operands(&Stub, template, &slots, &labels, 12)
     }
 
     /// `%c` and `%n` of a constant and `%l` of a label are the same on
@@ -1663,6 +1682,15 @@ mod tests {
         assert_eq!(
             substitute("%0 %[out] %k0 %1 %c1 %n1 %c2 %n2 %%x %l4 %l[done] %4 %c4"),
             Ok("r3 r3 r3 $-7 -7 7 g+8 -g+8 %x .L9 .L9 .L9 .L9".to_string())
+        );
+    }
+
+    /// `%=` is the asm's instance number, on every target.
+    #[test]
+    fn substitution_instance_number() {
+        assert_eq!(
+            substitute(".La%=: jmp .La%="),
+            Ok(".La12: jmp .La12".to_string())
         );
     }
 
@@ -1677,7 +1705,7 @@ mod tests {
         assert!(err("%9").contains("operand number 9 out of range"));
         assert!(err("%k4").contains("'%k' does not apply to a symbolic constant"));
         assert!(err("%[nope]").contains("undefined named asm operand 'nope'"));
-        assert!(err("%=").contains("invalid '%='"));
+        assert!(err("%!").contains("invalid '%!'"));
         assert!(err("x %").contains("at the end"));
         assert!(err("%l1").contains("asm operand 1 named by '%l' is not a label"));
         assert!(err("%l[gone]").contains("undefined asm goto label 'gone'"));

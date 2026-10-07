@@ -737,11 +737,13 @@ impl X86_64CodeGen {
             })
             .collect();
 
+        let instance = self.base.next_asm_instance();
         let asm_output = match crate::arch::substitute_asm_operands(
             self,
             &asm_data.template,
             slots,
             &goto_labels_formatted,
+            instance,
         ) {
             Ok(text) => text,
             Err(msg) => {

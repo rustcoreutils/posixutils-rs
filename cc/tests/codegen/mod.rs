@@ -56,6 +56,7 @@ mod symbols;
 mod tls_models;
 mod trapping_folds;
 mod types_exprs;
+mod unreachable_arms;
 mod unwind;
 mod varargs;
 mod vector_abi;

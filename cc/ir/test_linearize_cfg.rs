@@ -1331,6 +1331,23 @@ fn a_non_returning_terminator_ends_its_block() {
     }
 }
 
+/// A conditional with a `__builtin_unreachable ()` arm -- gnulib's
+/// `assume (R)` is `(R) ? (void) 0 : __builtin_unreachable ()` -- still
+/// branches: reaching the builtin is what the arm says never happens, so
+/// evaluating it whichever way the condition goes is a trap on every path.
+/// It was taken for a pure arm and made a select, and every function using
+/// `assume` began with `ud2`.
+#[test]
+fn an_unreachable_conditional_arm_is_not_speculated() {
+    let src = "int f(int x) { (x >= 4) ? (void) 0 : __builtin_unreachable (); return x + 3; }\n\
+               int g(int x) { return x ? x : (__builtin_unreachable (), 0); }\n\
+               int h(int x) { return x ?: (__builtin_unreachable (), 0); }\n";
+    let module = linearize_source(src, &Target::host());
+    for f in ["f", "g", "h"] {
+        assert!(still_branches(&module, f), "{f} no longer branches");
+    }
+}
+
 /// The validator's report on `func`, or `None` when it is consistent.
 ///
 /// The CFG invariants live in `validate` (I8, I9), which every compile runs;

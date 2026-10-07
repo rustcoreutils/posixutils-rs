@@ -2975,8 +2975,11 @@ impl<'a> Linearizer<'a> {
                 false
             }
 
-            // Unreachable is pure (no side effects, just UB hint)
-            ExprKind::Unreachable => true,
+            // No side effect where the program reaches it, but it lowers to
+            // a trap: evaluated on a path the program does not take -- the
+            // untaken arm of gnulib's `(R) ? (void) 0 :
+            // __builtin_unreachable ()` -- it kills a correct program.
+            ExprKind::Unreachable => !speculative,
 
             // Frame/return address builtins are pure (just read registers)
             ExprKind::FrameAddress { .. } | ExprKind::ReturnAddress { .. } => true,

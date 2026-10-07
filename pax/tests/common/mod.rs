@@ -509,7 +509,7 @@ fn numeric_field(field: &mut [u8], value: u64) {
         let n = digits.min(be.len());
         assert!(
             be[..be.len() - n].iter().all(|&b| b == 0),
-            "{value} too big"
+            "numeric field value too big"
         );
         field.fill(0);
         field[0] = 0x80;

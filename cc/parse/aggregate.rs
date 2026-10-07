@@ -47,6 +47,19 @@ pub(crate) enum VariantAllowed {
 }
 
 impl Parser<'_> {
+    /// Accept and ignore the GNU attributes an enumerator may carry before
+    /// its `=` (gcc: `deprecated`, `unavailable`, `unused`). System headers
+    /// mark old names this way (<systemd/sd-journal.h>, <lz4frame.h>). The
+    /// enumerator is no declarator, so whatever the list sets is dropped
+    /// rather than left pending for the declaration around the enum.
+    fn skip_enumerator_attributes(&mut self) {
+        if self.is_attribute_keyword() {
+            let outer = self.take_pending_decl_attrs();
+            self.parse_attributes();
+            self.restore_pending_decl_attrs(outer);
+        }
+    }
+
     /// The integer type an enumerated type is compatible with, and its size.
     ///
     /// C17 6.7.2.2p4 requires it to represent every member; the choice among
@@ -159,6 +172,7 @@ impl Parser<'_> {
             while !self.is_special(b'}') && !self.is_eof() {
                 let name_pos = self.current_pos();
                 let name = self.expect_identifier()?;
+                self.skip_enumerator_attributes();
 
                 let value = if self.is_special(b'=') {
                     self.advance();

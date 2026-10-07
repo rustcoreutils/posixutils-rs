@@ -725,3 +725,29 @@ fn test_block_scope_extern_has_the_composite_type() {
         "int (*q)[3]; void g(void) { int (*q)[]; _Static_assert(sizeof *q == 12, \"\"); }",
     );
 }
+
+/// An enumerator may carry GNU attributes between its name and any `=`, as
+/// systemd's <sd-journal.h> and <lz4frame.h> write `X __attribute__((deprecated))
+/// = Y`. They take nothing away from the enumerator or its value.
+#[test]
+fn test_enumerator_attributes() {
+    let before = crate::diag::error_count();
+    let (_, _, strings, symbols) = parse_tu(
+        "enum { A, B __attribute__((__deprecated__)) = 5, \
+         C __attribute__((deprecated)) __attribute__((unused)), \
+         D __attribute__((deprecated(\"old name\"))) = A };",
+    )
+    .unwrap();
+    assert_eq!(crate::diag::error_count(), before);
+    let value = |name: &str| {
+        let id = strings.lookup(name).expect("interned");
+        symbols
+            .lookup(id, Namespace::Ordinary)
+            .expect("declared")
+            .enum_value
+    };
+    assert_eq!(value("A"), Some(0));
+    assert_eq!(value("B"), Some(5));
+    assert_eq!(value("C"), Some(6));
+    assert_eq!(value("D"), Some(0));
+}

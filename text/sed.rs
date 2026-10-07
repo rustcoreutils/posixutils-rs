@@ -117,15 +117,15 @@ impl Args {
             quiet: self.quiet,
             script,
             input_sources: self.file,
-            pattern_space: String::new(),
-            hold_space: String::new(),
+            pattern_space: Vec::new(),
+            hold_space: Vec::new(),
             current_file: None,
             current_line: 0,
             has_replacements_since_t: false,
             last_regex: None,
             is_last_line: false,
             current_end: None,
-            next_line: String::new(),
+            next_line: Vec::new(),
             append_queue: Vec::new(),
         })
     }
@@ -270,7 +270,7 @@ impl AddressRange {
 struct LineState<'a> {
     number: usize,
     last: bool,
-    text: &'a str,
+    text: &'a [u8],
 }
 
 impl AddressToken {
@@ -286,7 +286,7 @@ impl AddressToken {
                 } else {
                     re.clone()
                 };
-                let matched = re.0.is_match(line.text);
+                let matched = re.0.is_match_bytes(line.text);
                 *last_regex = Some(re);
                 matched
             }
@@ -409,8 +409,9 @@ enum Command {
     /// Exchange the contents of the pattern and hold spaces
     ExchangeSpaces(Option<Address>), // x
     /// Replace all occurrences of characters in string1
-    /// with the corresponding characters in string2
-    ReplaceCharSet(Option<Address>, String, String), // y
+    /// with the corresponding characters in string2; each character is
+    /// its bytes in the current locale
+    ReplaceCharSet(Option<Address>, Vec<Vec<u8>>, Vec<Vec<u8>>), // y
     /// Do nothing. This command bears a label to which
     /// the b and t commands branch.
     BearBranchLabel(String), // :
@@ -502,21 +503,22 @@ impl Command {
 /// Find every match of `re` in `haystack`, left to right and
 /// non-overlapping; each entry holds the capture ranges, the whole match
 /// first. An empty match adjacent to the previous match is not a match (so
-/// `s/b*/x/g` on `abc` gives `xaxcx`).
-fn find_matches(re: &PlibRegex, haystack: &str) -> Vec<Vec<Range<usize>>> {
+/// `s/b*/x/g` on `abc` gives `xaxcx`). After an empty match the search
+/// resumes one byte on, as GNU sed does in every locale.
+fn find_matches(re: &PlibRegex, haystack: &[u8]) -> Vec<Vec<Range<usize>>> {
     let mut matches: Vec<Vec<Range<usize>>> = vec![];
     let mut offset = 0;
-    while let Some(caps) = re.captures_at(haystack, offset) {
+    while let Some(caps) = re.captures_at_bytes(haystack, offset) {
         let whole = caps[0].start..caps[0].end;
         let adjacent = whole.is_empty() && matches.last().is_some_and(|m| m[0].end == whole.start);
         if !adjacent {
             matches.push(caps.iter().map(|m| m.start..m.end).collect());
         }
         offset = if whole.is_empty() {
-            match haystack[whole.end..].chars().next() {
-                Some(ch) => whole.end + ch.len_utf8(),
-                None => break,
+            if whole.end >= haystack.len() {
+                break;
             }
+            whole.end + 1
         } else {
             whole.end
         };
@@ -954,6 +956,25 @@ fn unescape_transliteration(s: &str) -> Vec<char> {
     out
 }
 
+/// Split `chars` into the characters of the current locale, each as its
+/// bytes: in the C locale every byte of a non-ASCII character stands alone.
+fn locale_chars(chars: &[char]) -> Vec<Vec<u8>> {
+    let text: String = chars.iter().collect();
+    plib::locale::mb_char_slices(text.as_bytes())
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// Write `bytes` to standard output. sed's data is bytes in the current
+/// locale, not UTF-8; a write error ends sed with GNU's I/O status, 4.
+fn emit(bytes: &[u8]) {
+    if let Err(err) = std::io::stdout().write_all(bytes) {
+        eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
+        std::process::exit(4);
+    }
+}
+
 /// Parse [`Command::Replace`] flags
 fn parse_replace_flags(chars: &[char], i: &mut usize) -> Result<Vec<ReplaceFlag>, SedError> {
     let mut flags = vec![];
@@ -1012,7 +1033,10 @@ fn parse_replace_flags(chars: &[char], i: &mut usize) -> Result<Vec<ReplaceFlag>
     if let Some(w_start_position) = w_start_position {
         *i = w_start_position;
         let path = parse_path_attribute(chars, i)?;
-        flags.push(ReplaceFlag::AppendToIfReplace(path));
+        // The `w` flag was recorded without its file; it is last.
+        if let Some(ReplaceFlag::AppendToIfReplace(wfile)) = flags.last_mut() {
+            *wfile = path;
+        }
     }
 
     let is_replace_nth = |f| matches!(f, ReplaceFlag::ReplaceNth(_));
@@ -1063,10 +1087,10 @@ const DEFAULT_L_WIDTH: usize = 70;
 ///
 /// A `width` of 0 disables folding.  Operates on raw bytes so multibyte/high
 /// bytes are escaped octally exactly like GNU.
-fn format_l(line: &str, width: usize) -> String {
+fn format_l(line: &[u8], width: usize) -> String {
     let mut out = String::new();
     let mut col = 0usize;
-    for &b in line.as_bytes() {
+    for &b in line {
         let esc: String = match b {
             0x07 => "\\a".to_string(),
             0x08 => "\\b".to_string(),
@@ -1091,8 +1115,8 @@ fn format_l(line: &str, width: usize) -> String {
     out
 }
 
-fn print_multiline_binary(line: &str, width: Option<usize>) {
-    print!("{}", format_l(line, width.unwrap_or(DEFAULT_L_WIDTH)));
+fn print_multiline_binary(line: &[u8], width: Option<usize>) {
+    emit(format_l(line, width.unwrap_or(DEFAULT_L_WIDTH)).as_bytes());
 }
 
 /// Skip a comment: move `i` from its `#` to the <newline> that ends it (or
@@ -1291,8 +1315,8 @@ fn parse_commands(
                 let (string1, string2) = parse_replace_command(chars, &mut i, "y".to_string())?;
                 // Resolve escapes (\n, \\, \<delim>, ...) into real chars at
                 // parse time so transliteration sees actual characters.
-                let from = unescape_transliteration(&string1);
-                let to = unescape_transliteration(&string2);
+                let from = locale_chars(&unescape_transliteration(&string1));
+                let to = locale_chars(&unescape_transliteration(&string2));
                 if from.len() != to.len() {
                     let position = get_current_line_and_col(chars, i);
                     return Err(SedError::ScriptParse(
@@ -1302,11 +1326,7 @@ fn parse_commands(
                 }
                 // Leave `i` on the closing delimiter for the loop's step.
                 i -= 1;
-                commands.push(Command::ReplaceCharSet(
-                    address.clone(),
-                    from.into_iter().collect(),
-                    to.into_iter().collect(),
-                ));
+                commands.push(Command::ReplaceCharSet(address.clone(), from, to));
             }
             ':' => {
                 i += 1;
@@ -1427,32 +1447,45 @@ fn flatten_commands(commands: Vec<Command>) -> Vec<Command> {
 /// Expand an `s` replacement for one match: `&` is the whole match, `\1`..`\9`
 /// the subexpressions, `\n` a <newline>, `\&` and `\\` literal; GNU's
 /// `\t`, `\r`, `\a`, `\f` and `\v` controls are kept. Any other `\X` is `X`.
-fn expand_replacement(replacement: &str, haystack: &str, caps: &[Range<usize>]) -> String {
-    let group = |n: usize| caps.get(n).map_or("", |r| &haystack[r.clone()]);
-    let mut out = String::new();
+fn expand_replacement(replacement: &str, haystack: &[u8], caps: &[Range<usize>]) -> Vec<u8> {
+    let group = |n: usize| caps.get(n).map_or(&[][..], |r| &haystack[r.clone()]);
+    let mut out = Vec::new();
     let mut chars = replacement.chars();
+    let mut buf = [0u8; 4];
     while let Some(c) = chars.next() {
-        match c {
-            '&' => out.push_str(group(0)),
+        let literal = match c {
+            '&' => {
+                out.extend_from_slice(group(0));
+                continue;
+            }
             '\\' => match chars.next() {
-                Some(d @ '1'..='9') => out.push_str(group(d as usize - '0' as usize)),
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some('a') => out.push('\x07'),
-                Some('f') => out.push('\x0C'),
-                Some('v') => out.push('\x0B'),
-                Some(other) => out.push(other),
-                None => {}
+                Some(d @ '1'..='9') => {
+                    out.extend_from_slice(group(d as usize - '0' as usize));
+                    continue;
+                }
+                Some('n') => '\n',
+                Some('t') => '\t',
+                Some('r') => '\r',
+                Some('a') => '\x07',
+                Some('f') => '\x0C',
+                Some('v') => '\x0B',
+                Some(other) => other,
+                None => continue,
             },
-            _ => out.push(c),
-        }
+            _ => c,
+        };
+        out.extend_from_slice(literal.encode_utf8(&mut buf).as_bytes());
     }
     out
 }
 
-/// Execute [`Command::Replace`] for current [`Sed`] line
-fn execute_replace(pattern_space: &mut String, command: Command) -> Result<bool, SedError> {
+/// Execute [`Command::Replace`] for current [`Sed`] line; `end` is the line's
+/// terminator, written after the pattern space by the `w` flag
+fn execute_replace(
+    pattern_space: &mut Vec<u8>,
+    end: &[u8],
+    command: Command,
+) -> Result<bool, SedError> {
     let Command::Replace(_, re, _, replacement, flags) = command else {
         unreachable!();
     };
@@ -1471,19 +1504,20 @@ fn execute_replace(pattern_space: &mut String, command: Command) -> Result<bool,
     };
     let replace = !selected.is_empty();
     if replace {
-        let mut result = String::new();
+        let mut result = Vec::new();
         let mut copied = 0;
         for caps in selected {
-            result.push_str(&pattern_space[copied..caps[0].start]);
-            result.push_str(&expand_replacement(&replacement, pattern_space, caps));
+            result.extend_from_slice(&pattern_space[copied..caps[0].start]);
+            result.extend(expand_replacement(&replacement, pattern_space, caps));
             copied = caps[0].end;
         }
-        result.push_str(&pattern_space[copied..]);
+        result.extend_from_slice(&pattern_space[copied..]);
         *pattern_space = result;
     }
 
     if flags.contains(&ReplaceFlag::PrintPatternIfReplace) && replace {
-        println!("{}", *pattern_space);
+        emit(pattern_space);
+        emit(b"\n");
     }
 
     if let Some(wfile) = flags.iter().find_map(|flag| {
@@ -1501,7 +1535,7 @@ fn execute_replace(pattern_space: &mut String, command: Command) -> Result<bool,
                 .open(wfile)
                 .map_err(SedError::Io)
             {
-                let _ = file.write(pattern_space.as_bytes());
+                let _ = file.write_all(&[pattern_space.as_slice(), end].concat());
             }
         }
     }
@@ -1557,11 +1591,11 @@ struct Sed {
     /// Buffer with current line of processed input file,
     /// but it can be changed with [`Command`]s in cycle limits.
     /// Сleared every cycle
-    pattern_space: String,
+    pattern_space: Vec<u8>,
     /// Buffer that can be filled with certain [`Command`]s during
     /// [`Script`] processing. It's not cleared after the cycle is
     /// complete
-    hold_space: String,
+    hold_space: Vec<u8>,
     /// Current processed input file
     current_file: Option<Box<dyn BufRead>>,
     /// Current line of current processed input file
@@ -1572,7 +1606,7 @@ struct Sed {
     /// Last regex pattern in applied [`Command`]
     last_regex: Option<Regex>,
     /// Next line for processing
-    next_line: String,
+    next_line: Vec<u8>,
     /// Indicate that current processed line is last
     is_last_line: bool,
     /// Contains chars '\n\r' line end of current line for processed file
@@ -1582,6 +1616,12 @@ struct Sed {
 }
 
 impl Sed {
+    /// The current line's terminator: a <newline>, or nothing for a last
+    /// line that lacks one
+    fn end(&self) -> &[u8] {
+        self.current_end.as_deref().unwrap_or_default().as_bytes()
+    }
+
     /// Executes one command for `line` string argument
     /// and updates [`Sed`] state
     fn execute(
@@ -1626,9 +1666,9 @@ impl Sed {
                 if !self.need_execute(command_position)? {
                     return Ok(None);
                 }
-                if let Some(hold_space) = self.hold_space.strip_suffix('\n') {
+                if let Some(hold_space) = self.hold_space.strip_suffix(b"\n") {
                     self.current_end = Some("\n".to_string());
-                    self.pattern_space = hold_space.to_string();
+                    self.pattern_space = hold_space.to_vec();
                 } else {
                     self.pattern_space = self.hold_space.clone();
                 }
@@ -1645,19 +1685,19 @@ impl Sed {
                 if !self.need_execute(command_position)? {
                     return Ok(None);
                 }
-                self.hold_space = self.pattern_space.clone()
-                    + self.current_end.clone().unwrap_or_default().as_str();
+                self.hold_space = [self.pattern_space.as_slice(), self.end()].concat();
             }
             Command::AppendPatternToHold(_) => {
                 // H
                 if !self.need_execute(command_position)? {
                     return Ok(None);
                 }
-                if self.hold_space.strip_suffix("\n").is_none() {
-                    self.hold_space = self.hold_space.clone() + "\n";
+                if !self.hold_space.ends_with(b"\n") {
+                    self.hold_space.push(b'\n');
                 }
-                self.hold_space += &(self.pattern_space.clone()
-                    + self.current_end.clone().unwrap_or_default().as_str());
+                let end = self.end().to_vec();
+                self.hold_space.extend_from_slice(&self.pattern_space);
+                self.hold_space.extend(end);
             }
             Command::PrintTextBefore(_, text) => {
                 // i
@@ -1804,8 +1844,8 @@ impl Sed {
                     if line.is_empty() {
                         break;
                     }
-                    if let Some(l) = line.strip_suffix("\n") {
-                        line = l.to_string();
+                    if line.ends_with(b"\n") {
+                        line.pop();
                         self.current_end = Some("\n".to_string());
                     } else {
                         self.current_end = None;
@@ -1821,7 +1861,12 @@ impl Sed {
 
     fn execute_d(&mut self, to_first_line: bool) -> Option<ControlFlowInstruction> {
         // D
-        if let Some(newline) = self.pattern_space.find('\n').filter(|_| to_first_line) {
+        if let Some(newline) = self
+            .pattern_space
+            .iter()
+            .position(|&b| b == b'\n')
+            .filter(|_| to_first_line)
+        {
             // Delete through the first <newline>.
             self.pattern_space.drain(..=newline);
             Some(ControlFlowInstruction::NotReadNext)
@@ -1833,13 +1878,16 @@ impl Sed {
     }
 
     fn execute_upper_g(&mut self) {
-        self.pattern_space = self.pattern_space.clone()
-            + &self.current_end.clone().unwrap_or_default()
-            + &self.hold_space;
+        self.pattern_space = [
+            self.pattern_space.as_slice(),
+            self.end(),
+            self.hold_space.as_slice(),
+        ]
+        .concat();
         if self.hold_space.is_empty() {
-            self.pattern_space += "\n";
+            self.pattern_space.push(b'\n');
         }
-        if self.pattern_space.strip_suffix('\n').is_some() {
+        if self.pattern_space.ends_with(b"\n") {
             self.pattern_space.pop();
             self.current_end = Some("\n".to_string());
         } else {
@@ -1848,22 +1896,14 @@ impl Sed {
     }
 
     fn execute_p(&mut self, to_first_line: bool) {
-        if !self.pattern_space.is_empty() {
-            if to_first_line {
-                let end = self
-                    .pattern_space
-                    .chars()
-                    .enumerate()
-                    .find(|(_, ch)| *ch == '\n')
-                    .map(|pair| pair.0)
-                    .unwrap_or(self.pattern_space.len());
-                print!("{}", &self.pattern_space[0..end]);
-            } else {
-                print!("{}", self.pattern_space);
+        let newline = self.pattern_space.iter().position(|&b| b == b'\n');
+        match newline.filter(|_| to_first_line) {
+            // `P`: the first line, ended by its own <newline>.
+            Some(newline) => emit(&self.pattern_space[..=newline]),
+            None => {
+                emit(&self.pattern_space);
+                emit(self.end());
             }
-        }
-        if let Some(end) = &self.current_end {
-            print!("{end}");
         }
     }
 
@@ -1889,8 +1929,8 @@ impl Sed {
             match item {
                 AppendItem::Text(text) => println!("{text}"),
                 AppendItem::File(path) => {
-                    if let Ok(contents) = std::fs::read_to_string(&path) {
-                        print!("{contents}");
+                    if let Ok(contents) = std::fs::read(&path) {
+                        emit(&contents);
                     }
                 }
             }
@@ -1914,8 +1954,10 @@ impl Sed {
             }
         }
         // POSIX `t`: any substitution since the last input line or `t`.
+        let end = self.end().to_vec();
         self.has_replacements_since_t |= execute_replace(
             &mut self.pattern_space,
+            &end,
             Command::Replace(address, regex.clone(), pattern, replacement, flags),
         )?;
         self.last_regex = Some(regex);
@@ -1958,7 +2000,7 @@ impl Sed {
             .create(true)
             .open(wfile.clone())
         {
-            Ok(mut file) => file.write(self.pattern_space.as_bytes()),
+            Ok(mut file) => file.write_all(&[self.pattern_space.as_slice(), self.end()].concat()),
             Err(err) => {
                 return Err(SedError::Io(Error::new(
                     ErrorKind::NotFound,
@@ -1974,16 +2016,14 @@ impl Sed {
     }
 
     fn execute_x(&mut self) {
-        if let Some(hold_space) = self.hold_space.strip_suffix('\n') {
-            let tmp = hold_space.to_string();
-            self.hold_space =
-                self.pattern_space.clone() + self.current_end.clone().unwrap_or_default().as_str();
+        if let Some(hold_space) = self.hold_space.strip_suffix(b"\n") {
+            let tmp = hold_space.to_vec();
+            self.hold_space = [self.pattern_space.as_slice(), self.end()].concat();
             self.current_end = Some("\n".to_string());
             self.pattern_space = tmp;
         } else {
             let tmp = self.hold_space.clone();
-            self.hold_space =
-                self.pattern_space.clone() + self.current_end.clone().unwrap_or_default().as_str();
+            self.hold_space = [self.pattern_space.as_slice(), self.end()].concat();
             self.pattern_space = tmp.clone();
             self.current_end = if !tmp.is_empty() {
                 None
@@ -1993,38 +2033,30 @@ impl Sed {
         }
     }
 
-    fn execute_y(&mut self, string1: String, string2: String) {
-        let mut replace_positions = vec![];
-        for (a, b) in string1.chars().zip(string2.chars()) {
-            let positions = self
-                .pattern_space
-                .chars()
-                .enumerate()
-                .filter_map(|(i, ch)| if ch == a { Some(i) } else { None })
-                .collect::<Vec<_>>();
-            replace_positions.push((b.to_string(), positions));
-        }
-        for (ch, positions) in replace_positions {
-            for position in positions {
-                self.pattern_space
-                    .replace_range(position..(position + 1), &ch);
+    fn execute_y(&mut self, string1: Vec<Vec<u8>>, string2: Vec<Vec<u8>>) {
+        let mut out = Vec::with_capacity(self.pattern_space.len());
+        for ch in plib::locale::mb_char_slices(&self.pattern_space) {
+            match string1.iter().position(|from| from == ch) {
+                Some(i) => out.extend_from_slice(&string2[i]),
+                None => out.extend_from_slice(ch),
             }
         }
+        self.pattern_space = out;
         // Escapes were already resolved when the y operands were parsed; the
         // pattern space must NOT be post-processed (that corrupted literal \n).
         self.has_replacements_since_t = true;
     }
 
     /// Read next line from current file
-    fn read_line(&mut self) -> Result<String, SedError> {
+    fn read_line(&mut self) -> Result<Vec<u8>, SedError> {
         let Some(current_file) = self.current_file.as_mut() else {
             return Err(SedError::Io(std::io::Error::new(
                 ErrorKind::NotFound,
                 "current file is none",
             )));
         };
-        let mut line = String::new();
-        if let Err(err) = current_file.read_line(&mut line) {
+        let mut line = Vec::new();
+        if let Err(err) = current_file.read_until(b'\n', &mut line) {
             return Err(SedError::Io(err));
         }
         Ok(line)
@@ -2105,14 +2137,14 @@ impl Sed {
                         if line.is_empty() {
                             return Ok(None);
                         }
-                        if let Some(l) = line.strip_suffix("\n") {
+                        if line.ends_with(b"\n") {
                             self.current_end = Some("\n".to_string());
-                            line = l.to_string();
+                            line.pop();
                         } else {
                             self.current_end = None;
                         }
-                        self.pattern_space += "\n";
-                        self.pattern_space += &line;
+                        self.pattern_space.push(b'\n');
+                        self.pattern_space.extend(line);
                     }
                     ControlFlowInstruction::ReadNext => {
                         let mut line = self.next_line.clone();
@@ -2123,13 +2155,13 @@ impl Sed {
                             break;
                         }
                         if !self.quiet {
-                            print!("{}", self.pattern_space);
-                            print!("{}", self.current_end.clone().unwrap_or_default());
+                            emit(&self.pattern_space);
+                            emit(self.end());
                         }
                         // Reading a new input line flushes deferred a/r output.
                         self.flush_appends();
-                        if let Some(l) = line.strip_suffix("\n") {
-                            line = l.to_string();
+                        if line.ends_with(b"\n") {
+                            line.pop();
                         }
                         self.current_end = Some("\n".to_string());
                         self.pattern_space = line;
@@ -2141,12 +2173,8 @@ impl Sed {
         }
 
         if !self.quiet {
-            if !self.pattern_space.is_empty() {
-                print!("{}", self.pattern_space.trim_end_matches('\r'));
-            }
-            if let Some(end) = &self.current_end {
-                print!("{end}");
-            }
+            emit(&self.pattern_space);
+            emit(self.end());
         }
 
         // Flush deferred a/r output at end of cycle, before the next line read.
@@ -2172,9 +2200,9 @@ impl Sed {
             if line.is_empty() {
                 break;
             }
-            if let Some(l) = line.strip_suffix("\n") {
+            if line.ends_with(b"\n") {
                 self.current_end = Some("\n".to_string());
-                line = l.to_string();
+                line.pop();
             } else {
                 self.current_end = None;
             }

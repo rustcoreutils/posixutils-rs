@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod bytes;
+
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 /// Build an absolute path under the cargo test temp dir for a wfile, so that

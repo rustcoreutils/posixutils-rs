@@ -478,43 +478,36 @@ fn preserve_node_attributes(
     Ok(())
 }
 
-/// The `fchmodat2` system call number, where it is the generic one (Linux 6.6 and later).
-#[cfg(all(
-    target_os = "linux",
-    any(
-        target_arch = "x86_64",
-        target_arch = "x86",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64",
-        target_arch = "s390x"
-    )
-))]
-const SYS_FCHMODAT2: Option<libc::c_long> = Some(452);
-#[cfg(all(
-    target_os = "linux",
-    not(any(
-        target_arch = "x86_64",
-        target_arch = "x86",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64",
-        target_arch = "s390x"
-    ))
-))]
-const SYS_FCHMODAT2: Option<libc::c_long> = None;
+/// The `fchmodat2` system call number (Linux 6.6 and later), where it is the generic 452.
+/// `libc` 0.2.189 exports `SYS_fchmodat2` for x86_64 but not for aarch64-linux-gnu, so the
+/// number is spelled here. Not on x32, whose numbers carry `__X32_SYSCALL_BIT`, nor on the
+/// architectures with tables of their own (alpha, mips, ...): there only the procfs path is
+/// used.
+#[cfg(target_os = "linux")]
+const SYS_FCHMODAT2: Option<libc::c_long> = if cfg!(any(
+    all(target_arch = "x86_64", target_pointer_width = "64"),
+    target_arch = "x86",
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "powerpc64",
+    target_arch = "s390x"
+)) {
+    Some(452)
+} else {
+    None
+};
 
 /// Set the mode of the inode an `O_PATH` descriptor pins, which `fchmod` refuses (EBADF).
 ///
 /// First `fchmodat2(fd, "", mode, AT_EMPTY_PATH)` (Linux 6.6 and later), which acts on that
-/// inode directly. Where it does not exist (ENOSYS) or does not take `AT_EMPTY_PATH` (EINVAL),
-/// `fchmodat` on `self/fd/N` relative to a `/proc` descriptor verified to be procfs, which
-/// names the same inode. With neither, the mode is not set and the failure is reported: a
-/// by-name fallback could act on whatever the name holds by then.
+/// inode directly. Where it does not exist (ENOSYS), does not take `AT_EMPTY_PATH` (EINVAL), or
+/// is refused by a seccomp filter that does not know it (EPERM: older runc, systemd's
+/// `SystemCallFilter=`), `fchmodat` on `self/fd/N` relative to a `/proc` descriptor verified to
+/// be procfs, which names the same inode; a genuine EPERM comes back from that call too. With
+/// neither, the mode is not set and the failure is reported: a by-name fallback could act on
+/// whatever the name holds by then.
 #[cfg(target_os = "linux")]
 fn chmod_pinned(fd: libc::c_int, mode: libc::mode_t) -> io::Result<()> {
     if let Some(sys_fchmodat2) = SYS_FCHMODAT2 {
@@ -531,7 +524,10 @@ fn chmod_pinned(fd: libc::c_int, mode: libc::mode_t) -> io::Result<()> {
             return Ok(());
         }
         let e = io::Error::last_os_error();
-        if !matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) {
+        if !matches!(
+            e.raw_os_error(),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM)
+        ) {
             return Err(e);
         }
     }

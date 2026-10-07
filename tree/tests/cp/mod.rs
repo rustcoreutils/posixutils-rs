@@ -1790,6 +1790,111 @@ fn test_cp_special_fifo_keeps_set_id_bits() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
+/// Under a seccomp filter that answers `fchmodat2` with EPERM, as older runc and systemd's
+/// `SystemCallFilter=` do for system calls they do not know, `cp -p` still sets a made FIFO's
+/// mode, through the verified procfs path.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2() {
+    use std::os::unix::process::CommandExt;
+
+    #[repr(C)]
+    struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const SockFilter,
+    }
+    // BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_RET|BPF_K; SECCOMP_RET_ERRNO and
+    // SECCOMP_RET_ALLOW. Offset 0 of the seccomp data is the system call number; fchmodat2 is
+    // 452 on both architectures.
+    const LD_NR: u16 = 0x20;
+    const JEQ: u16 = 0x15;
+    const RET: u16 = 0x06;
+    const RET_ERRNO: u32 = 0x0005_0000;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+    const PR_SET_SECCOMP: libc::c_int = 22;
+    const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+
+    let test_dir = &format!(
+        "{}/test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir(test_dir).unwrap();
+    let fifo = &format!("{test_dir}/fifo");
+    let copy = &format!("{test_dir}/copy");
+    mkfifo_at(fifo, 0o640);
+    fs::set_permissions(fifo, fs::Permissions::from_mode(0o4640)).unwrap();
+
+    let out = unsafe {
+        Command::new(env!("CARGO_BIN_EXE_cp"))
+            .args(["-pR", fifo, copy])
+            .stdin(Stdio::null())
+            .pre_exec(|| {
+                let filter = [
+                    SockFilter {
+                        code: LD_NR,
+                        jt: 0,
+                        jf: 0,
+                        k: 0,
+                    },
+                    SockFilter {
+                        code: JEQ,
+                        jt: 0,
+                        jf: 1,
+                        k: 452,
+                    },
+                    SockFilter {
+                        code: RET,
+                        jt: 0,
+                        jf: 0,
+                        k: RET_ERRNO | libc::EPERM as u32,
+                    },
+                    SockFilter {
+                        code: RET,
+                        jt: 0,
+                        jf: 0,
+                        k: RET_ALLOW,
+                    },
+                ];
+                let prog = SockFprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr(),
+                };
+                if libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::symlink_metadata(copy).unwrap().permissions().mode() & 0o7777,
+        0o4640
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
 /// A terminal cp copies from must not become its controlling terminal: cp is run as a session
 /// leader with none, reading a pty's slave side, and the master is asked which session the
 /// terminal now controls.

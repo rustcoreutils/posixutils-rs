@@ -400,3 +400,118 @@ fn find_size_kilobytes() {
     run_test_find(&[".", "-size", "1M"], "", "find: invalid number: 1M\n", 1);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `-regex` as debhelper passes it: dh_md5sums, dh_fixperms, and the `-X`
+/// exclusions every dh_* tool turns into `-regex .*X.* -or ...`. The pattern
+/// matches the WHOLE pathname.
+#[test]
+fn find_regex_debhelper() {
+    let dir = make_pkg_tree("regex_dh");
+    // dh_md5sums: `find -type f ! -regex './DEBIAN/.*' -printf '%P\0'`
+    let (out, err, code) = find_in(
+        &dir,
+        &[
+            "-type",
+            "f",
+            "!",
+            "-regex",
+            "./DEBIAN/.*",
+            "-printf",
+            "%P\\0",
+        ],
+    );
+    let mut names: Vec<&[u8]> = out.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
+    names.sort();
+    let want: Vec<&[u8]> = vec![
+        b"big",
+        b"doc/pkg/Notes.HTML",
+        b"doc/pkg/README",
+        b"doc/pkg/examples/ex.txt",
+        b"exe",
+        b"four",
+        b"fourplus",
+        b"plain",
+        b"ux",
+    ];
+    assert_eq!((names, err.as_str(), code), (want, "", 0));
+    // Anchored at both ends.
+    expect_words(&dir, "-regex exe", &[]);
+    expect_words(&dir, "-regex ./ex", &[]);
+    expect_words(&dir, "-regex .*/exe", &["./exe"]);
+    // dh_fixperms, on an absolute staging path.
+    let d = dir.to_str().unwrap();
+    let doc = format!("{d}/doc");
+    let examples = format!("{d}/doc/[^/]*/examples/.*");
+    let (readme, notes) = (
+        format!("{d}/doc/pkg/README"),
+        format!("{d}/doc/pkg/Notes.HTML"),
+    );
+    expect_lines(
+        &dir,
+        &[&doc, "-type", "f", "!", "-regex", &examples],
+        &[&readme, &notes],
+    );
+    // dh_* -X.HTML -Xxampl (debhelper joins them with `-or`)
+    expect_words(
+        &dir,
+        r"( -regex .*\.HTML.* -o -regex .*xampl.* )",
+        &[
+            "./doc/pkg/Notes.HTML",
+            "./doc/pkg/examples",
+            "./doc/pkg/examples/ex.txt",
+        ],
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The Emacs syntax that is GNU find's default: `+` and `?` are operators,
+/// `\(`, `\)` and `\|` group and alternate, a bare `(`, `|` or `{` is a
+/// literal, and so is an operator with nothing to repeat.
+#[test]
+fn find_regex_emacs_syntax() {
+    let dir = scratch_dir("regex_emacs");
+    for name in ["ee", "exe", "exxe", "c++", "paren(1)", "{1}", "+", "a|b"] {
+        fs::write(dir.join(name), "").unwrap();
+    }
+    expect_words(&dir, "-regex .*/ex+e", &["./exe", "./exxe"]);
+    expect_words(&dir, "-regex .*/ex?e", &["./ee", "./exe"]);
+    expect_words(&dir, r"-regex .*/\(ee\|exe\)", &["./ee", "./exe"]);
+    expect_words(&dir, r"-regex .*c\+\+", &["./c++"]);
+    expect_words(&dir, "-regex .*/c++", &[]);
+    expect_words(&dir, "-regex .*/paren(1)", &["./paren(1)"]);
+    expect_words(&dir, "-regex .*{1}", &["./{1}"]);
+    expect_words(&dir, "-regex .*/a|b", &["./a|b"]);
+    expect_words(&dir, r"-regex .*/\(+\)", &["./+"]);
+    expect_words(&dir, r"-regex ^\./exe$", &["./exe"]);
+    expect_words(&dir, "-regex .*/[^e]*", &["./c++", "./{1}", "./+", "./a|b"]);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Emacs constructs with no POSIX counterpart are refused, not misread.
+#[test]
+fn find_regex_unsupported_is_an_error() {
+    run_test_find(
+        &[".", "-regex", r".*\w"],
+        "",
+        "find: -regex: unsupported escape \\w\n",
+        1,
+    );
+    run_test_find(
+        &[".", "-regex", "[[:alpha:]]"],
+        "",
+        "find: -regex: unsupported bracket expression in [[:alpha:]]\n",
+        1,
+    );
+    run_test_find(
+        &[".", "-regex", "a["],
+        "",
+        "find: -regex: unterminated bracket expression in a[\n",
+        1,
+    );
+    run_test_find(
+        &[".", "-regex", "a\\"],
+        "",
+        "find: -regex: trailing backslash in a\\\n",
+        1,
+    );
+}

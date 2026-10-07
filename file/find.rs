@@ -192,6 +192,9 @@ enum Primary {
     /// `-true` / `-false`: GNU extensions, forced by debhelper (dh_fixperms,
     /// dh_compress)
     Const(bool),
+    /// `-regex`: GNU extension, forced by debhelper (dh_md5sums, dh_fixperms,
+    /// `-X`). Compiled from the Emacs syntax by [`emacs_regex_to_ere`].
+    Regex(plib::regex::Regex),
 
     // Actions
     Print,
@@ -547,6 +550,12 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         "-nouser" => Ok(Expr::Primary(Primary::NoUser)),
         "-true" => Ok(Expr::Primary(Primary::Const(true))),
         "-false" => Ok(Expr::Primary(Primary::Const(false))),
+        "-regex" => {
+            let pattern = get_arg(tokens, idx, "-regex")?;
+            let ere = emacs_regex_to_ere(pattern)?;
+            let re = plib::regex::Regex::ere(&ere).map_err(|e| format!("-regex: {e}"))?;
+            Ok(Expr::Primary(Primary::Regex(re)))
+        }
         "-nogroup" => Ok(Expr::Primary(Primary::NoGroup)),
         "-print" => Ok(Expr::Primary(Primary::Print)),
         "-print0" => Ok(Expr::Primary(Primary::Print0)),
@@ -579,6 +588,104 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         }
         _ => Err(format!("unknown primary: {}", tok)),
     }
+}
+
+/// Translate a `-regex` pattern from the Emacs syntax that is GNU find's
+/// default into a POSIX ERE that must match the whole pathname.
+///
+/// In the Emacs syntax `\(`, `\)` and `\|` group and alternate while a bare
+/// `(`, `)`, `|`, `{` and `}` are literals; `*`, `+` and `?` are operators
+/// except where nothing precedes them (the start, or after `^`, `\(` or
+/// `\|`); `^` and `$` anchor only at the start and end of the pattern or of a
+/// group or alternative; and a backslash before punctuation quotes it.
+/// Emacs-only escapes (`\w`, `\b`, `\<`, backreferences, ...) and character
+/// classes such as `[[:alpha:]]`, which the Emacs syntax does not have, are
+/// an error rather than a silently different match.
+fn emacs_regex_to_ere(pattern: &str) -> Result<String, String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::from("^(");
+    // True where an operator would have nothing to repeat.
+    let mut operand_start = true;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let at_start = std::mem::replace(&mut operand_start, false);
+        i += 1;
+        match c {
+            '*' | '+' | '?' if at_start => {
+                out.push('\\');
+                out.push(c);
+            }
+            '*' | '+' | '?' | '.' => out.push(c),
+            '^' if at_start => {
+                out.push('^');
+                operand_start = true;
+            }
+            '$' if matches!(&chars[i..], [] | ['\\', ')' | '|', ..]) => out.push('$'),
+            '^' | '$' | '(' | ')' | '|' | '{' | '}' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '[' => i = copy_bracket(&chars, i, pattern, &mut out)?,
+            '\\' => match chars.get(i) {
+                None => return Err(format!("-regex: trailing backslash in {pattern}")),
+                Some(&e) => {
+                    i += 1;
+                    match e {
+                        '(' | '|' => {
+                            out.push(e);
+                            operand_start = true;
+                        }
+                        ')' => out.push(')'),
+                        e if e.is_ascii_alphanumeric() || "`'<>=_".contains(e) => {
+                            return Err(format!("-regex: unsupported escape \\{e}"))
+                        }
+                        e => {
+                            out.push('\\');
+                            out.push(e);
+                        }
+                    }
+                }
+            },
+            c => out.push(c),
+        }
+    }
+    out.push_str(")$");
+    Ok(out)
+}
+
+/// Copy the bracket expression whose `[` precedes `chars[start]` to `out`,
+/// returning the index after its closing `]`. A backslash in it is a literal
+/// in both syntaxes; `[:`, `[=` and `[.` are POSIX-only and refused.
+fn copy_bracket(
+    chars: &[char],
+    start: usize,
+    pattern: &str,
+    out: &mut String,
+) -> Result<usize, String> {
+    let mut i = start;
+    if chars.get(i) == Some(&'^') {
+        i += 1;
+    }
+    if chars.get(i) == Some(&']') {
+        i += 1;
+    }
+    while i < chars.len() && chars[i] != ']' {
+        if chars[i] == '[' && matches!(chars.get(i + 1), Some(':' | '=' | '.')) {
+            return Err(format!(
+                "-regex: unsupported bracket expression in {pattern}"
+            ));
+        }
+        i += 1;
+    }
+    if i == chars.len() {
+        return Err(format!(
+            "-regex: unterminated bracket expression in {pattern}"
+        ));
+    }
+    out.push('[');
+    out.extend(&chars[start..=i]);
+    Ok(i + 1)
 }
 
 /// Parse a `-printf` format into literal runs and directives. Unsupported
@@ -1000,6 +1107,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             }
         }
         Primary::Const(value) => EvalResult::new(*value),
+        Primary::Regex(re) => EvalResult::new(re.is_match_bytes(ctx.path.as_os_str().as_bytes())),
         Primary::NoUser => {
             let uid = ctx.metadata.uid();
             EvalResult::new(plib::user::get_by_uid(uid).is_none())

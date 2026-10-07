@@ -257,6 +257,14 @@ but no daemon to run them.  Behavior follows Vixie cron:
    `dh_compress` prunes with `-prune -false`).
  * `-size nk` — the size in KiB, rounded up.  No other GNU unit is
    accepted.  Forced by debhelper (`dh_compress` `-size +4k`).
+ * `-regex pattern` — true if the pattern matches the whole pathname, in
+   the Emacs syntax that is GNU find's default: `\(`, `\)`, `\|` group and
+   alternate, `+` and `?` are operators, a bare `(`, `)`, `|`, `{`, `}` is a
+   literal, and so is an operator with nothing before it.  Emacs-only
+   escapes (`\w`, `\b`, `\<`, backreferences, ...) and `[:class:]`-style
+   bracket terms are an error.  No `-regextype` or `-iregex`.  Forced by
+   debhelper (`dh_md5sums`, `dh_fixperms`, and the `-X` exclusions of every
+   dh_* tool).
 
 ### gettext / ngettext
 

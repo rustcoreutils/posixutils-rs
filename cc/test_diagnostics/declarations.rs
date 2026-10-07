@@ -381,6 +381,13 @@ fn tag_declared_in_a_parameter_list_warns() {
     }
     // Declared first, it is the file's tag, and there is nothing to say.
     compile_expect_ok("tag_param_visible", "struct T;\nvoid m(struct T *p);\n");
+    // So is a tag inside its own member list (C17 6.2.1p7).
+    compile_expect_no_diagnostic(
+        "tag_param_own_members",
+        "struct P { void (*fn)(struct P *); };\n\
+         union U { int (*cmp)(const union U *, const union U *); };\n",
+        "parameter list",
+    );
 }
 
 /// What these rules must keep accepting.

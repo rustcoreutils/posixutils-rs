@@ -726,6 +726,30 @@ fn test_block_scope_extern_has_the_composite_type() {
     );
 }
 
+/// C17 6.2.1p7: a tag's scope begins just after the tag in the specifier
+/// that declares it, so a parameter list inside the member list names the
+/// structure being defined -- util-linux's `void (*free_dialect)(struct
+/// path_cxt *)` inside `struct path_cxt`. It declared a new tag in the
+/// prototype's scope instead, and warned that it would not be visible.
+#[test]
+fn test_tag_is_in_scope_inside_its_own_member_list() {
+    for src in [
+        "struct S { int v; void (*fn)(struct S *); }; struct S s;",
+        "union S { int v; void (*fn)(union S *); }; union S s;",
+        "struct S; struct S { int v; void (*fn)(struct S *); }; struct S s;",
+    ] {
+        let (tu, types, _, _) = parse_tu(src).unwrap();
+        let ExternalDecl::Declaration(ref decl) = tu.items.last().unwrap() else {
+            panic!("{src}: expected a declaration");
+        };
+        let s = decl.declarators[0].typ;
+        let fn_ptr = types.composite(s).unwrap().members[1].typ;
+        let func = types.base_type(fn_ptr).unwrap();
+        let param = types.get(func).params.as_ref().unwrap()[0];
+        assert_eq!(types.base_type(param), Some(s), "{src}");
+    }
+}
+
 /// An enumerator may carry GNU attributes between its name and any `=`, as
 /// systemd's <sd-journal.h> and <lz4frame.h> write `X __attribute__((deprecated))
 /// = Y`. They take nothing away from the enumerator or its value.

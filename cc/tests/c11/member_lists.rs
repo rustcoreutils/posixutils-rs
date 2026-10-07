@@ -101,3 +101,29 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("member_lists_mega", code, &[]), 0);
 }
+
+/// C17 6.2.1p7: a tag is in scope from just after it, so a prototype inside
+/// the member list names the structure being defined (util-linux's
+/// `struct path_cxt`). c17 made the parameter a new tag of the prototype's
+/// scope, and warned it would not be visible outside.
+#[test]
+fn member_prototype_names_the_struct_being_defined() {
+    let code = r#"
+struct path_cxt {
+    int dir_fd;
+    void (*free_dialect)(struct path_cxt *);
+};
+typedef void (*freer)(struct path_cxt *);
+static void release(struct path_cxt *pc) { pc->dir_fd = 7; }
+int main(void) {
+    struct path_cxt c = { 0, release };
+    c.free_dialect(&c);
+    if (c.dir_fd != 7) return 1;
+    return _Generic(c.free_dialect, freer: 0, default: 2);
+}
+"#;
+    assert_eq!(
+        compile_and_run("member_prototype_tag", code, &["-Werror".to_string()]),
+        0
+    );
+}

@@ -373,6 +373,30 @@ impl Parser<'_> {
         }
     }
 
+    /// C17 6.2.1p7: a tag's scope begins just after the tag in the specifier
+    /// that declares it, so the member list is already inside it -- a
+    /// prototype among the members, `void (*fn)(struct S *)`, names the
+    /// structure being defined, not a new tag of its own prototype scope.
+    /// Declare the tag here, incomplete, unless this scope already has it;
+    /// the end of the list completes it in place, as it would a forward
+    /// declaration.
+    fn declare_tag_being_defined(&mut self, tag: StringId, is_union: bool) {
+        if self.symbols.lookup_tag_in_current_scope(tag).is_some() {
+            return;
+        }
+        let keyword = if is_union { "union" } else { "struct" };
+        self.warn_tag_in_parameter_list(keyword, Some(tag));
+        let incomplete = if is_union {
+            Type::incomplete_union(tag)
+        } else {
+            Type::incomplete_struct(tag)
+        };
+        let typ = self.types.intern(incomplete);
+        let _ = self
+            .symbols
+            .declare(Symbol::tag(tag, typ, self.symbols.depth()));
+    }
+
     /// Every name `members` puts in a structure's name space: its named
     /// members, and those of its anonymous structure and union members.
     fn member_names(&self, members: &[StructMember]) -> Vec<StringId> {
@@ -489,6 +513,9 @@ impl Parser<'_> {
         // Check for definition vs forward reference
         if self.is_special(b'{') {
             self.advance(); // consume '{'
+            if let Some(tag_name) = tag {
+                self.declare_tag_being_defined(tag_name, is_union);
+            }
 
             // The members are declarations of their own, parsed through the
             // same attribute slots as the declaration this specifier begins.

@@ -413,7 +413,9 @@ fn write_hunk_as_context(writer: &mut String, hunk: &Hunk) -> fmt::Result {
     // Write old section header. A zero-count side is normalized to the line
     // before which the change goes; a context diff spells it as the line after
     // which, so convert back.
-    let old_end = hunk.old_start + hunk.old_count.saturating_sub(1);
+    let old_end = hunk
+        .old_start
+        .saturating_add(hunk.old_count.saturating_sub(1));
     if hunk.old_count == 0 {
         writeln!(writer, "*** {} ****", hunk.old_start.saturating_sub(1))?;
     } else {
@@ -430,7 +432,9 @@ fn write_hunk_as_context(writer: &mut String, hunk: &Hunk) -> fmt::Result {
     }
 
     // Write new section header
-    let new_end = hunk.new_start + hunk.new_count.saturating_sub(1);
+    let new_end = hunk
+        .new_start
+        .saturating_add(hunk.new_count.saturating_sub(1));
     if hunk.new_count == 0 {
         writeln!(writer, "--- {} ----", hunk.new_start.saturating_sub(1))?;
     } else {

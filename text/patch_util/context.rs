@@ -177,7 +177,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
 /// Number of lines a `start,end` section range declares.
 fn declared_len(start: usize, end: usize) -> usize {
     if end >= start {
-        end - start + 1
+        (end - start).saturating_add(1)
     } else {
         0
     }
@@ -216,12 +216,12 @@ fn convert_context_to_hunk(
     // the line before which to insert, so add one for the empty case.
     let (old_start, old_count) = match old_end {
         Some(end) => (old_start, declared_len(old_start, end)),
-        None if old_lines.is_empty() => (old_start + 1, 0),
+        None if old_lines.is_empty() => (old_start.saturating_add(1), 0),
         None => (old_start, old_lines.len()),
     };
     let (new_start, new_count) = match new_end {
         Some(end) => (new_start, declared_len(new_start, end)),
-        None if new_lines.is_empty() => (new_start + 1, 0),
+        None if new_lines.is_empty() => (new_start.saturating_add(1), 0),
         None => (new_start, new_lines.len()),
     };
 

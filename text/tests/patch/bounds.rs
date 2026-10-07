@@ -183,3 +183,45 @@ fn test_patch_many_hunks_in_place() {
     assert!(out.starts_with("line 0\nLINE 1\nline 2\n"));
     cleanup_test_dir(&dir);
 }
+
+// Line numbers at the top of the range, in every format: the arithmetic
+// that turns a header into a hunk must not overflow (a panic in a debug
+// build, a wrapped nonsense position otherwise).
+#[test]
+fn test_patch_max_line_numbers_do_not_overflow() {
+    let dir = setup_test_dir("bounds_max_numbers");
+    let m = usize::MAX;
+    let cases = [
+        ("-u", format!("--- f.txt\n+++ f.txt\n@@ -{m},0 +{m},0 @@\n")),
+        ("-u", format!("--- f.txt\n+++ f.txt\n@@ -{m},0 +1 @@\n+x\n")),
+        ("-u", format!("--- f.txt\n+++ f.txt\n@@ -1 +{m},0 @@\n-a\n")),
+        (
+            "-u",
+            format!("--- f.txt\n+++ f.txt\n@@ -{m},3 +{m},3 @@\n x\n-y\n+Y\n z\n"),
+        ),
+        ("-n", format!("{m}a{m}\n> x\n")),
+        ("-n", format!("{m}d{m}\n< a\n")),
+        ("-e", format!("{m}a\nx\n.\n")),
+        ("-e", format!("1,{m}d\n")),
+        (
+            "-c",
+            format!("*** f.txt\n--- f.txt\n***************\n*** {m} ****\n--- 1 ----\n+ x\n"),
+        ),
+        (
+            "-c",
+            format!("*** f.txt\n--- f.txt\n***************\n*** 1 ****\n- a\n--- {m} ----\n"),
+        ),
+    ];
+    for (format, patch) in cases {
+        let (code, took) = timed(&dir, "a\nb\nc\n", &patch, &[format]);
+        assert!(
+            (0..=2).contains(&code),
+            "{} {:?}: exit {}",
+            format,
+            patch,
+            code
+        );
+        assert!(took < LIMIT, "{:?}: took {:?}", patch, took);
+    }
+    cleanup_test_dir(&dir);
+}

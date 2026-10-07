@@ -347,3 +347,22 @@ fn pp_if_signed_overflow_warns() {
     let quiet = preprocess_text("if_overflow_w", src, &["-w"]);
     assert!(quiet.success && quiet.stderr.is_empty(), "{}", quiet.stderr);
 }
+
+/// POSIX c17 makes `-U` win over `-D` regardless of order, so a `-D` of a
+/// name some `-U` names is moot: two such `-D`s with different values do
+/// not redefine anything, and nothing is reported. zstd builds its programs
+/// with `-DZSTD_LEGACY_SUPPORT=5 -UZSTD_LEGACY_SUPPORT
+/// -DZSTD_LEGACY_SUPPORT=0 -Werror`. Without the `-U`, the second `-D` is a
+/// redefinition and is reported, as gcc does.
+#[test]
+fn pp_cmdline_define_of_an_undefined_name_is_quiet() {
+    let src = "#ifdef X\nint x = X;\n#else\nint x = -1;\n#endif\n";
+    let r = preprocess_text("cmdline_du", src, &["-Werror", "-DX=5", "-UX", "-DX=0"]);
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+    assert!(r.stdout.contains("int x = -1;"), "{}", r.stdout);
+
+    let r = preprocess_text("cmdline_dd", src, &["-DX=5", "-DX=0"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.contains("'X' redefined"), "{}", r.stderr);
+    assert!(r.stdout.contains("int x = 0;"), "{}", r.stdout);
+}

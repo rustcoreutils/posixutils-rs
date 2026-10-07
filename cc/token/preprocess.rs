@@ -1437,6 +1437,32 @@ impl<'a> Preprocessor<'a> {
         self.macros.remove(name);
     }
 
+    /// Apply the command line's `-D` and then its `-U` options.
+    ///
+    /// POSIX c17: "The -D option has lower precedence than the -U option.
+    /// That is, if name is used in both a -U and a -D option, name shall be
+    /// undefined regardless of the order of the options." A `-D` of a name
+    /// some `-U` names is therefore not applied at all, so a second `-D` of
+    /// that name redefines nothing and is not reported: zstd builds its
+    /// programs with `-DZSTD_LEGACY_SUPPORT=5 -UZSTD_LEGACY_SUPPORT
+    /// -DZSTD_LEGACY_SUPPORT=0` under `-Werror`.
+    fn apply_cmdline_macros(
+        &mut self,
+        defines: &[String],
+        undefines: &[String],
+        idents: &mut IdentTable,
+    ) {
+        for def in defines {
+            let name_end = def.find(['=', '(']).unwrap_or(def.len());
+            if !undefines.iter().any(|u| *u == def[..name_end]) {
+                self.define_from_cmdline(def, idents);
+            }
+        }
+        for undef in undefines {
+            self.undef_macro(undef);
+        }
+    }
+
     /// Check if a macro is defined
     pub fn is_defined(&self, name: &str) -> bool {
         self.macros.contains_key(name)
@@ -2950,15 +2976,8 @@ pub fn preprocess_collecting(
         pp.quote_include_paths.push(path.clone());
     }
 
-    // Process -D defines
-    for def in config.defines {
-        pp.define_from_cmdline(def, idents);
-    }
-
-    // Process -U undefines
-    for undef in config.undefines {
-        pp.undef_macro(undef);
-    }
+    // -D, then -U, which wins
+    pp.apply_cmdline_macros(config.defines, config.undefines, idents);
 
     // `-dD`: what is defined now is what the source starts with; from here
     // on each directive is carried where it stands, `-include`d ones too.
@@ -3130,15 +3149,8 @@ pub fn preprocess_asm_file(
         pp.quote_include_paths.push(path.clone());
     }
 
-    // Process -D defines
-    for def in config.defines {
-        pp.define_from_cmdline(def, &mut strings);
-    }
-
-    // Process -U undefines
-    for undef in config.undefines {
-        pp.undef_macro(undef);
-    }
+    // -D, then -U, which wins
+    pp.apply_cmdline_macros(config.defines, config.undefines, &mut strings);
 
     // Preprocess
     let preprocessed = pp.preprocess(tokens, &mut strings);

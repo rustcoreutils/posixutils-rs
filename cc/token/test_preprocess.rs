@@ -2567,3 +2567,30 @@ fn test_bundled_header_marker_is_built_in() {
     );
     assert_eq!(marker_file_name("<stdin>"), "<stdin>");
 }
+
+/// POSIX c17: "-D has lower precedence than -U ... name shall be undefined
+/// regardless of the order of the options". A `-D` of a name some `-U` also
+/// names is therefore never applied -- and so never diagnosed as redefining
+/// another `-D` of it. zstd passes `-DZSTD_LEGACY_SUPPORT=5
+/// -UZSTD_LEGACY_SUPPORT -DZSTD_LEGACY_SUPPORT=0` under `-Werror`.
+#[test]
+fn test_cmdline_define_of_an_undefined_name_is_not_applied() {
+    let input = "X Y F(2)\n";
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let defines = ["X=5", "X=0", "Y=1", "Y=2", "F(a)=a+1", "F(a)=a+2"].map(String::from);
+    let undefines = ["X", "F"].map(String::from);
+    let config = PreprocessConfig {
+        defines: &defines,
+        undefines: &undefines,
+        ..Default::default()
+    };
+    let warnings = crate::diag::warning_count();
+    let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+    // Y's two definitions differ and no -U names it: that one is reported.
+    assert_eq!(crate::diag::warning_count(), warnings + 1);
+    assert_eq!(
+        get_token_strings(&out, &idents),
+        ["X", "2", "F", "(", "2", ")"]
+    );
+}

@@ -3102,6 +3102,10 @@ pub struct Function {
     /// `__attribute__((always_inline))`: inline at every call site regardless
     /// of size, and at `-O0` too. `is_noinline` wins if both are present.
     pub is_always_inline: bool,
+    /// `__attribute__((stack_protect))` or `((no_stack_protector))`. Read by
+    /// the back end, which decides about the canary once inlining is done,
+    /// so an inlined callee's attribute is gone with its body, as in gcc.
+    pub stack_protect: crate::parse::ast::StackProtectAttr,
     /// `__attribute__((constructor))`: emit a pointer to this function in
     /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
     /// without a priority; `Some(Some(p))` carries one.
@@ -3157,6 +3161,7 @@ impl Default for Function {
             isa: Default::default(),
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,
+            stack_protect: Default::default(),
             constructor: None,
             destructor: None,
             is_inline: false,

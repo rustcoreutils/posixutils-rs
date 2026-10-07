@@ -801,3 +801,40 @@ fn test_wno_implicit_accepts_its_own_construct() {
     assert_rejected(implicit_int);
     assert_rejected(implicit_call);
 }
+
+/// `stack_protect` and `no_stack_protector` reach the definition, from a
+/// prototype too, in either spelling. Given both, gcc keeps the first and
+/// warns that it ignores the second -- within one list or across
+/// declarations.
+#[test]
+fn test_stack_protect_attributes_reach_the_definition() {
+    use super::ast::StackProtectAttr;
+    let src = "__attribute__((stack_protect)) int p(void) { return 0; }\n\
+               int __attribute__((__no_stack_protector__)) n(void) { return 0; }\n\
+               int d(void) { return 0; }\n\
+               __attribute__((no_stack_protector)) int q(void);\n\
+               int q(void) { return 0; }\n\
+               __attribute__((no_stack_protector, stack_protect)) int b1(void) { return 0; }\n\
+               __attribute__((stack_protect)) int b2(void);\n\
+               __attribute__((no_stack_protector)) int b2(void) { return 0; }\n";
+    let before = crate::diag::warning_count();
+    let (tu, _, strings, _) = parse_tu(src).unwrap();
+    assert_eq!(crate::diag::warning_count() - before, 2, "one per conflict");
+    let attr = |name: &str| {
+        tu.items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == name => {
+                    Some(f.attrs.stack_protect)
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(attr("p"), StackProtectAttr::Protect);
+    assert_eq!(attr("n"), StackProtectAttr::Exempt);
+    assert_eq!(attr("d"), StackProtectAttr::Unspecified);
+    assert_eq!(attr("q"), StackProtectAttr::Exempt);
+    assert_eq!(attr("b1"), StackProtectAttr::Exempt);
+    assert_eq!(attr("b2"), StackProtectAttr::Protect);
+}

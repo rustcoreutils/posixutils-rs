@@ -1221,6 +1221,12 @@ define_keywords! {
     (CPOW,              "cpow",              0),
     (CPOWF,             "cpowf",             0),
     (CPOWL,             "cpowl",             0),
+    // `stack_protect` and `no_stack_protector`: a function's own say over
+    // `-fstack-protector`. Appended, as above.
+    (_, "stack_protect",             SUPPORTED_ATTR),
+    (_, "__stack_protect__",         SUPPORTED_ATTR),
+    (_, "no_stack_protector",        SUPPORTED_ATTR),
+    (_, "__no_stack_protector__",    SUPPORTED_ATTR),
 }
 
 // Tag query API

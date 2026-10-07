@@ -2091,6 +2091,7 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.declared_effect = func.attrs.effect;
         ir_func.is_always_inline = func.attrs.always_inline;
+        ir_func.stack_protect = func.attrs.stack_protect;
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function

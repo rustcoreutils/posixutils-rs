@@ -2001,3 +2001,27 @@ fn test_label_difference_initializers() {
         assert!(f.saves_label_in_static, "{arch}: `f` saves its labels");
     }
 }
+
+/// A function's `stack_protect` / `no_stack_protector` reaches its IR, where
+/// the back end decides about the canary after inlining.
+#[test]
+fn test_stack_protect_attribute_reaches_the_function() {
+    use crate::parse::ast::StackProtectAttr;
+    let module = linearize_source(
+        "__attribute__((stack_protect)) int p(void) { return 0; }\n\
+         __attribute__((no_stack_protector)) int n(void) { return 0; }\n\
+         int d(void) { return 0; }\n",
+        &Target::host(),
+    );
+    let attr = |name: &str| {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap()
+            .stack_protect
+    };
+    assert_eq!(attr("p"), StackProtectAttr::Protect);
+    assert_eq!(attr("n"), StackProtectAttr::Exempt);
+    assert_eq!(attr("d"), StackProtectAttr::Unspecified);
+}

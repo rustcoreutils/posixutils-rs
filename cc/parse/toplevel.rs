@@ -264,7 +264,11 @@ impl Parser<'_> {
             .max(self.pending_declarator_align.take());
         self.pending_fn_attrs.align = self.pending_fn_attrs.align.max(declared_align);
         let pending = self.pending_fn_attrs.clone();
+        let pos = self.current_pos();
         let seen = self.declared_fn_attrs.entry(name).or_default();
+        if let Err(kept) = seen.stack_protect.combine(pending.stack_protect) {
+            Self::warn_stack_protect_conflict(kept, pos);
+        }
         seen.merge(&pending);
         seen.clone()
     }

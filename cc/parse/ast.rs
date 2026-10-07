@@ -2968,6 +2968,43 @@ impl MemEffect {
     }
 }
 
+/// What a function's own attributes ask of the stack protector, whatever
+/// `-fstack-protector` level is in force.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StackProtectAttr {
+    /// Neither attribute: the level decides.
+    #[default]
+    Unspecified,
+    /// `__attribute__((stack_protect))`: protected under any level, and the
+    /// only functions `-fstack-protector-explicit` protects.
+    Protect,
+    /// `__attribute__((no_stack_protector))`: never protected.
+    Exempt,
+}
+
+impl StackProtectAttr {
+    /// The attribute's name, for diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unspecified => "",
+            Self::Protect => "stack_protect",
+            Self::Exempt => "no_stack_protector",
+        }
+    }
+
+    /// The two attributes' combination, `self` written first: gcc keeps the
+    /// first and ignores the other. `Err` holds what is kept when the two
+    /// conflict, for the warning.
+    pub fn combine(self, later: Self) -> Result<Self, Self> {
+        match (self, later) {
+            (Self::Unspecified, x) => Ok(x),
+            (x, Self::Unspecified) => Ok(x),
+            (x, y) if x == y => Ok(x),
+            (x, _) => Err(x),
+        }
+    }
+}
+
 /// Attributes that change how a function is *emitted* rather than what it
 /// computes, and so have to survive from the parser into code generation.
 #[derive(Debug, Clone, Default)]
@@ -3015,6 +3052,8 @@ pub struct FunctionAttrs {
     /// `__attribute__((noreturn))`. What a call site reads is the function
     /// *type*'s `noreturn`, which the declarator is given from this.
     pub noreturn: bool,
+    /// `__attribute__((stack_protect))` or `((no_stack_protector))`.
+    pub stack_protect: StackProtectAttr,
     /// `__attribute__((target("...")))`: the ISA this function alone is
     /// compiled for, relative to the translation unit's.
     pub target: Option<crate::target::IsaRequest>,
@@ -3064,6 +3103,11 @@ impl FunctionAttrs {
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
         self.noreturn |= other.noreturn;
+        // The first declaration's wins; see `Parser::merge_fn_attrs`.
+        self.stack_protect = self
+            .stack_protect
+            .combine(other.stack_protect)
+            .unwrap_or_else(|kept| kept);
         // A later declaration's ISA request replaces an earlier one's.
         if other.target.is_some() {
             self.target = other.target.clone();

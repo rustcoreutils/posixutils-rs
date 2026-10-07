@@ -920,13 +920,13 @@ where
             };
             // A regular file is opened `O_NONBLOCK`, so a FIFO swapped in for it fails the open
             // (ENXIO, no reader) instead of waiting for a reader; the flag is cleared once the
-            // descriptor is known to be the checked file. A destination that was checked as a
-            // FIFO or device (`cp x /dev/null`) is opened as before, blocking.
+            // descriptor is known to be the checked file (`openat_guarded`, which also waits out
+            // a lease). A destination that was checked as a FIFO or device (`cp x /dev/null`)
+            // is opened as before, blocking.
             let expect_regular =
                 expected_md.is_some_and(|md| md.file_type() == ftw::FileType::RegularFile);
-            let nonblock = if expect_regular { libc::O_NONBLOCK } else { 0 };
             let target_fd =
-                unsafe { libc::openat(target_dirfd, target_filename, open_flags | nonblock) };
+                openat_guarded(target_dirfd, target_filename, open_flags, expect_regular);
             if target_fd != -1 {
                 let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
                 let opened_md = target_file.metadata()?;
@@ -1035,7 +1035,8 @@ fn same_file_type(opened: fs::FileType, walked: ftw::FileType) -> bool {
 /// The walk's `lstat` (or `stat`, for a link it follows) came first, so the descriptor must be
 /// that same file, or nothing is read from it. When the walk saw a regular file the open also
 /// carries `O_NONBLOCK`, so a FIFO swapped in since cannot hold the open waiting for a writer
-/// before the identity check refuses it; the flag is then cleared for the copy. A FIFO or device
+/// before the identity check refuses it (`openat_guarded`, which also waits out a lease); the
+/// flag is then cleared for the copy. A FIFO or device
 /// the walk saw (copied as data without -R) is opened as before, blocking.
 fn open_source(
     source: &ftw::Entry,
@@ -1050,14 +1051,12 @@ fn open_source(
         ))
     };
     let regular = walked.file_type() == ftw::FileType::RegularFile;
-    let nonblock = if regular { libc::O_NONBLOCK } else { 0 };
-    let fd = unsafe {
-        libc::openat(
-            source.dir_fd(),
-            source.file_name().as_ptr(),
-            flags | nonblock | libc::O_CLOEXEC,
-        )
-    };
+    let fd = openat_guarded(
+        source.dir_fd(),
+        source.file_name().as_ptr(),
+        flags | libc::O_CLOEXEC,
+        regular,
+    );
     if fd == -1 {
         return Err(cannot_open(&io::Error::last_os_error()));
     }
@@ -1077,6 +1076,30 @@ fn open_source(
         clear_nonblock(fd).map_err(|e| cannot_open(&e))?;
     }
     Ok(file)
+}
+
+/// `openat(dirfd, name, flags)`, with `O_NONBLOCK` added when `guard` is set so that a FIFO
+/// swapped in for the expected regular file cannot hold the open.
+///
+/// A regular file under a lease (a Samba oplock, a knfsd delegation) fails a non-blocking open
+/// with EAGAIN/EWOULDBLOCK instead of waiting for the lease to break. That open is retried
+/// blocking, as cp opened before the guard existed: a FIFO's open never fails with EAGAIN, so
+/// the retry cannot reach one, and the caller's identity and type check follows either open.
+/// Returns -1 with `errno` set on failure.
+fn openat_guarded(
+    dirfd: libc::c_int,
+    name: *const libc::c_char,
+    flags: libc::c_int,
+    guard: bool,
+) -> libc::c_int {
+    if guard {
+        let fd = unsafe { libc::openat(dirfd, name, flags | libc::O_NONBLOCK) };
+        let errno = io::Error::last_os_error().raw_os_error();
+        if fd != -1 || !matches!(errno, Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK) {
+            return fd;
+        }
+    }
+    unsafe { libc::openat(dirfd, name, flags) }
 }
 
 /// Clear `O_NONBLOCK` on a descriptor opened with it only to keep a swapped-in FIFO from

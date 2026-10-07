@@ -295,6 +295,84 @@ fn cp_refuses_a_source_swapped_after_the_walk_saw_it() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// Run `cp source target` in `base` while this process holds a `lease` (F_RDLCK or F_WRLCK) on
+/// `leased`, opened for `writable`; the lease is released a second after cp starts, as a lease
+/// holder (Samba, knfsd) does when the kernel tells it another open is waiting. Returns cp's
+/// status and stderr.
+#[cfg(target_os = "linux")]
+fn cp_against_a_lease(
+    base: &std::path::Path,
+    leased: &std::path::Path,
+    lease: libc::c_int,
+    writable: bool,
+) -> (Option<i32>, String) {
+    use std::os::fd::AsRawFd;
+
+    // The kernel signals the lease holder (this process) with SIGIO when the lease must break;
+    // the default action would end the test run.
+    unsafe { libc::signal(libc::SIGIO, libc::SIG_IGN) };
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .write(writable)
+        .open(leased)
+        .unwrap();
+    // A write lease is refused while anything else holds the inode, which pending writeback of
+    // the file just written can do for a moment.
+    holder.sync_all().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLEASE, lease) } != 0 {
+        let e = std::io::Error::last_os_error();
+        assert!(
+            e.raw_os_error() == Some(libc::EAGAIN) && Instant::now() < deadline,
+            "cannot take a lease: {e}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let child = Command::new(get_binary_path("cp"))
+        .args(["source", "target"])
+        .current_dir(base)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to execute cp");
+    std::thread::sleep(Duration::from_secs(1));
+    unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) };
+    drop(holder);
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A destination under a read lease (a Samba oplock, a knfsd delegation) makes a non-blocking
+/// open fail with EWOULDBLOCK. cp must wait for the lease to break, as a blocking open does,
+/// not report an error (or, under -f, replace the file).
+#[cfg(target_os = "linux")]
+#[test]
+fn cp_waits_for_a_lease_on_the_destination() {
+    let base = scratch("lease_dest");
+    fs::write(base.join("source"), b"source").unwrap();
+    fs::write(base.join("target"), b"old").unwrap();
+    let (status, stderr) = cp_against_a_lease(&base, &base.join("target"), libc::F_RDLCK, false);
+    assert_eq!(status, Some(0), "stderr: {stderr}");
+    assert_eq!(fs::read(base.join("target")).unwrap(), b"source");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// The same for a source under a write lease, which a reading open must break.
+#[cfg(target_os = "linux")]
+#[test]
+fn cp_waits_for_a_lease_on_the_source() {
+    let base = scratch("lease_source");
+    fs::write(base.join("source"), b"source").unwrap();
+    let (status, stderr) = cp_against_a_lease(&base, &base.join("source"), libc::F_WRLCK, true);
+    assert_eq!(status, Some(0), "stderr: {stderr}");
+    assert_eq!(fs::read(base.join("target")).unwrap(), b"source");
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// An existing destination that is a device is written to, not truncated: `cp f /dev/null`.
 #[test]
 fn cp_writes_to_an_existing_character_device() {

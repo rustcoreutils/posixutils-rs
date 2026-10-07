@@ -11,11 +11,15 @@ use clap::Parser;
 use gettextrs::gettext;
 use object::{
     archive,
-    build::elf::{Builder, Section, SectionData},
+    build::{
+        elf::{Builder, SectionData},
+        Id,
+    },
     elf, Object, ObjectSymbol, SymbolKind,
 };
 use plib::diag;
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     io::{Read, Write},
     path::Path,
@@ -32,11 +36,73 @@ remain linkable; only debugging information is removed. Executables and shared\n
 objects additionally lose their symbol table.\n\n\
 Other formats -- Mach-O, COFF/PE, XCOFF, and BSD-variant archives -- are\n\
 rejected with a diagnostic and a non-zero exit rather than being modified or\n\
-silently passed through."))]
+silently passed through.\n\n\
+The options are GNU extensions that debhelper's dh_strip passes."))]
 struct Args {
+    /// Remove only debugging sections and symbols
+    #[arg(long)]
+    strip_debug: bool,
+
+    /// Remove every symbol that no relocation needs
+    #[arg(long, conflicts_with = "strip_debug")]
+    strip_unneeded: bool,
+
+    /// Remove the sections whose names match PATTERN (`*` and `?` wildcards)
+    #[arg(short = 'R', long = "remove-section", value_name = "PATTERN")]
+    remove_section: Vec<String>,
+
+    /// Remove the symbol SYMBOL
+    #[arg(short = 'N', value_name = "SYMBOL")]
+    strip_symbol: Vec<String>,
+
+    /// Write archive members with zero timestamps and owners and mode 0644
+    #[arg(long)]
+    enable_deterministic_archives: bool,
+
     // POSIX SYNOPSIS makes the `file...` operand required (>= 1).
     #[arg(num_args = 1.., required = true)]
     input_files: Vec<OsString>,
+}
+
+/// How much of the symbol table goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// The default: an executable or shared object loses its symbol table.
+    All,
+    /// `--strip-unneeded`: keep only the symbols a relocation needs.
+    Unneeded,
+    /// `--strip-debug`: drop only debugging symbols.
+    Debug,
+}
+
+struct Options {
+    level: Level,
+    remove_sections: Vec<String>,
+    strip_symbols: Vec<String>,
+    deterministic: bool,
+}
+
+impl Options {
+    fn removes_section(&self, name: &[u8]) -> bool {
+        self.remove_sections
+            .iter()
+            .any(|p| wildcard_match(p.as_bytes(), name))
+    }
+
+    fn strips_symbol(&self, name: &[u8]) -> bool {
+        self.strip_symbols.iter().any(|s| s.as_bytes() == name)
+    }
+}
+
+/// Match `name` against a `-R` pattern. GNU strip uses fnmatch(3); the only
+/// wildcards dh_strip passes are `*`, so `*` and `?` are all this supports.
+fn wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some((b'*', rest)) => (0..=name.len()).any(|i| wildcard_match(rest, &name[i..])),
+        Some((b'?', rest)) => !name.is_empty() && wildcard_match(rest, &name[1..]),
+        Some((c, rest)) => name.first() == Some(c) && wildcard_match(rest, &name[1..]),
+    }
 }
 
 fn is_debug_section(name: &[u8]) -> bool {
@@ -48,65 +114,123 @@ fn is_debug_section(name: &[u8]) -> bool {
         || name.starts_with(b".line")
         || name.starts_with(b".stab")
         || name.starts_with(b".gdb_index")
-        // Relocation sections that target a debug section go with it; otherwise
-        // (on a relocatable object, where we keep relocations) they would be
-        // left pointing at a deleted section.
-        || name.starts_with(b".rela.debug")
-        || name.starts_with(b".rel.debug")
-        || name.starts_with(b".rela.zdebug")
-        || name.starts_with(b".rel.zdebug")
-}
-
-fn strip_section(section: &Section, is_relocatable: bool) -> bool {
-    // Debug sections are always safe to remove.
-    if is_debug_section(section.name.as_slice()) {
-        return true;
-    }
-    // #ST4: a relocatable object (ET_REL, i.e. a `.o`) must remain linkable, so
-    // its symbol table, relocations, and group sections are preserved. Only
-    // executables / shared objects get the aggressive treatment.
-    if is_relocatable {
-        return false;
-    }
-    // Relocations against the symbol table go with it. Dynamic relocations
-    // (.rela.dyn, .rela.plt) index .dynsym, which stays: the dynamic loader
-    // applies them to every PIE and shared object.
-    matches!(section.data, SectionData::Relocation(_))
-        // after we removed all symbols, the
-        // symbol table contains only the undefined
-        // symbol entry, which can be removed
-        || section.name == ".symtab".into()
-        // this section contains the strings of the symbol
-        // table which are no longer used
-        // after we removed all the symbols
-        || matches!(section.data, SectionData::String)
 }
 
 type StripResult = Result<Vec<u8>, Box<dyn std::error::Error>>;
 
-fn strip(data: &[u8]) -> StripResult {
-    // Relocatable objects keep their symbol table and relocations (#ST4).
-    let is_relocatable = matches!(
-        object::read::File::parse(data).map(|f| f.kind()),
-        Ok(object::ObjectKind::Relocatable)
-    );
-
+/// Strip one ELF file. `display` names it in diagnostics.
+fn strip(data: &[u8], opts: &Options, display: &str) -> StripResult {
     let mut builder = Builder::read(data)?;
+    let relocatable = builder.header.e_type == elf::ET_REL;
+    // #ST4: a relocatable object (`.o`) must remain linkable, so by default
+    // it loses only what --strip-debug removes.
+    let level = match opts.level {
+        Level::All if relocatable => Level::Debug,
+        level => level,
+    };
+    // An executable or shared object needs no static symbol table: its
+    // dynamic relocations index .dynsym, which always stays.
+    let drop_symtab = !relocatable && level != Level::Debug;
 
-    if !is_relocatable {
-        for symbol in &mut builder.symbols {
-            symbol.delete = true;
-        }
-    }
     for section in &mut builder.sections {
-        if strip_section(section, is_relocatable) {
+        let name = section.name.as_slice();
+        let symtab_part = matches!(
+            section.data,
+            SectionData::Symbol
+                | SectionData::SymbolSectionIndex
+                | SectionData::String
+                | SectionData::Relocation(_)
+        );
+        if is_debug_section(name) || opts.removes_section(name) || (drop_symtab && symtab_part) {
             section.delete = true;
         }
     }
-    builder.delete_orphans();
+    delete_relocations_of_deleted_sections(&mut builder);
+
+    if drop_symtab {
+        for symbol in &mut builder.symbols {
+            symbol.delete = true;
+        }
+    } else {
+        select_symbols(&mut builder, level, relocatable, opts, display)?;
+    }
+    builder.delete_orphan_segments();
+    builder.delete_orphan_dynamics();
     let mut contents = Vec::new();
     builder.write(&mut contents)?;
     Ok(contents)
+}
+
+/// Indices of the sections that survive.
+fn kept_sections(builder: &Builder) -> HashSet<usize> {
+    builder.sections.iter().map(|s| s.id().index()).collect()
+}
+
+/// A relocation section goes with the section it applies to.
+fn delete_relocations_of_deleted_sections(builder: &mut Builder) {
+    let kept = kept_sections(builder);
+    for section in &mut builder.sections {
+        let is_reloc = matches!(
+            section.data,
+            SectionData::Relocation(_) | SectionData::DynamicRelocation(_)
+        );
+        if is_reloc
+            && section
+                .sh_info_section
+                .is_some_and(|target| !kept.contains(&target.index()))
+        {
+            section.delete = true;
+        }
+    }
+}
+
+/// Mark the symbols of a kept symbol table that `level` and `-N` remove.
+/// A symbol a kept relocation names always stays: deleting it would make
+/// the builder silently drop the relocation.
+fn select_symbols(
+    builder: &mut Builder,
+    level: Level,
+    relocatable: bool,
+    opts: &Options,
+    display: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let kept = kept_sections(builder);
+    let mut needed = HashSet::new();
+    for section in &builder.sections {
+        if let SectionData::Relocation(relocs) = &section.data {
+            needed.extend(relocs.iter().filter_map(|r| r.symbol).map(|s| s.index()));
+        }
+    }
+    for symbol in &mut builder.symbols {
+        let name = symbol.name.as_slice();
+        let in_removed_section = symbol.section.is_some_and(|s| !kept.contains(&s.index()));
+        if needed.contains(&symbol.id().index()) {
+            if in_removed_section {
+                return Err(format!(
+                    "{}: {}",
+                    String::from_utf8_lossy(name),
+                    gettext("symbol named in a relocation is in a removed section")
+                )
+                .into());
+            }
+            if opts.strips_symbol(name) {
+                diag::warning(&format!(
+                    "{}: {} `{}' {}",
+                    display,
+                    gettext("not stripping symbol"),
+                    String::from_utf8_lossy(name),
+                    gettext("because it is named in a relocation")
+                ));
+            }
+            continue;
+        }
+        // STT_FILE symbols are debugging symbols to GNU strip.
+        symbol.delete = in_removed_section
+            || opts.strips_symbol(name)
+            || symbol.st_type() == elf::STT_FILE
+            || (level == Level::Unneeded && relocatable && symbol.st_bind() == elf::STB_LOCAL);
+    }
+    Ok(())
 }
 
 /// One member of the rewritten archive: header metadata + payload.
@@ -139,7 +263,7 @@ fn extract_member_symbols(data: &[u8]) -> Vec<String> {
     }
 }
 
-fn strip_archive(data: &[u8]) -> StripResult {
+fn strip_archive(data: &[u8], opts: &Options, display: &str) -> StripResult {
     // #ST11: `!<arch>\n` is shared by the System V and BSD layouts, and the
     // variant is only known once headers have been parsed. The writer below
     // only speaks System V, so rewriting a BSD archive (the macOS default)
@@ -172,13 +296,18 @@ fn strip_archive(data: &[u8]) -> StripResult {
         // Dropping it would be silent data loss. The `ar` crate already hides
         // the archive's own "/" symbol-table and "//" name-table members.
         let (data, symbols) = if is_elf(&data) {
-            let new_data = strip(&data)?;
+            let member = format!(
+                "{}({})",
+                display,
+                String::from_utf8_lossy(header.identifier())
+            );
+            let new_data = strip(&data, opts, &member)?;
             let symbols = extract_member_symbols(&new_data);
             (new_data, symbols)
         } else {
             (data, Vec::new())
         };
-        members.push(StrippedMember {
+        let mut member = StrippedMember {
             identifier: header.identifier().to_vec(),
             mtime: header.mtime(),
             uid: header.uid(),
@@ -186,7 +315,14 @@ fn strip_archive(data: &[u8]) -> StripResult {
             mode: header.mode(),
             data,
             symbols,
-        });
+        };
+        if opts.deterministic {
+            member.mtime = 0;
+            member.uid = 0;
+            member.gid = 0;
+            member.mode = 0o644;
+        }
+        members.push(member);
     }
 
     // Emit: magic + "/" symbol-table member (regenerated per POSIX 84371-84376) +
@@ -259,7 +395,7 @@ fn is_archive(data: &[u8]) -> bool {
     data.starts_with(&archive::MAGIC)
 }
 
-fn strip_file(file: &OsStr) {
+fn strip_file(file: &OsStr, opts: &Options) {
     let contents = match std::fs::read(file) {
         Ok(contents) => contents,
         Err(err) => {
@@ -272,10 +408,11 @@ fn strip_file(file: &OsStr) {
             return;
         }
     };
+    let display = file.to_string_lossy();
     let stripped_contents = if is_elf(&contents) {
-        strip(&contents)
+        strip(&contents, opts, &display)
     } else if is_archive(&contents) {
-        strip_archive(&contents)
+        strip_archive(&contents, opts, &display)
     } else {
         // #ST3: only ELF objects/executables and ar archives are supported.
         // strip rewrites via object::build::elf::Builder, and the object crate's
@@ -317,9 +454,22 @@ fn main() {
     diag::init_locale("strip");
 
     let args = Args::parse();
+    let level = if args.strip_unneeded {
+        Level::Unneeded
+    } else if args.strip_debug {
+        Level::Debug
+    } else {
+        Level::All
+    };
+    let opts = Options {
+        level,
+        remove_sections: args.remove_section,
+        strip_symbols: args.strip_symbol,
+        deterministic: args.enable_deterministic_archives,
+    };
 
     for file in args.input_files {
-        strip_file(&file);
+        strip_file(&file, &opts);
     }
     std::process::exit(diag::exit_status());
 }

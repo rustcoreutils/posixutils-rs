@@ -7,7 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! strip on linked ELF files.
+//! strip on linked ELF files and the options debhelper's dh_strip passes.
+//!
+//! dh_strip runs, per file type:
+//!   shared libraries: `--remove-section=.comment --remove-section=.note --strip-unneeded`
+//!   executables:      `--remove-section=.comment --remove-section=.note`
+//!   static libraries: `--strip-debug --remove-section=.comment --remove-section=.note
+//!                      --enable-deterministic-archives -R .gnu.lto_* -R .gnu.debuglto_*
+//!                      -N __gnu_lto_slim -N __gnu_lto_v1`
 //!
 //! ELF-specific: cc produces Mach-O on macOS, which strip does not support.
 
@@ -15,11 +22,32 @@
 
 use crate::c_compiler;
 use object::read::elf::ElfFile64;
-use object::{Endianness, Object, ObjectSection};
+use object::{Endianness, Object, ObjectSection, ObjectSymbol, SymbolKind};
 use plib::tmp::TempDir;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
+
+const DH_SHARED: [&str; 3] = [
+    "--remove-section=.comment",
+    "--remove-section=.note",
+    "--strip-unneeded",
+];
+const DH_EXEC: [&str; 2] = ["--remove-section=.comment", "--remove-section=.note"];
+const DH_STATIC: [&str; 12] = [
+    "--strip-debug",
+    "--remove-section=.comment",
+    "--remove-section=.note",
+    "--enable-deterministic-archives",
+    "-R",
+    ".gnu.lto_*",
+    "-R",
+    ".gnu.debuglto_*",
+    "-N",
+    "__gnu_lto_slim",
+    "-N",
+    "__gnu_lto_v1",
+];
 
 const LIB_C: &str = "int lib_f(int x){return x+1;}\n\
 int lib_g(int x){return lib_f(x)*2;}\n\
@@ -81,10 +109,42 @@ fn section_names(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+fn symbol_names(bytes: &[u8]) -> Vec<String> {
+    let elf = ElfFile64::<Endianness>::parse(bytes).unwrap();
+    elf.symbols()
+        .map(|s| s.name().unwrap_or("").to_string())
+        .collect()
+}
+
+fn has_file_symbol(bytes: &[u8]) -> bool {
+    let elf = ElfFile64::<Endianness>::parse(bytes).unwrap();
+    let found = elf.symbols().any(|s| s.kind() == SymbolKind::File);
+    found
+}
+
 /// Write `lib.c` and `main.c` in `dir`.
 fn write_sources(dir: &Path) {
     fs::write(dir.join("lib.c"), LIB_C).unwrap();
     fs::write(dir.join("main.c"), MAIN_C).unwrap();
+}
+
+/// Build `lib.c` as a shared library and `main.c` linked against it.
+fn build_shared(dir: &Path) {
+    write_sources(dir);
+    cc(
+        dir,
+        &[
+            "-g",
+            "-fPIC",
+            "-shared",
+            "-Wl,-soname,libx.so.1",
+            "-o",
+            "libx.so.1",
+            "lib.c",
+        ],
+    );
+    let rpath = format!("-Wl,-rpath,{}", dir.display());
+    cc(dir, &["-g", "-o", "main", "main.c", "libx.so.1", &rpath]);
 }
 
 #[test]
@@ -107,15 +167,192 @@ fn test_strip_pie_executable_still_runs() {
 }
 
 #[test]
-fn test_strip_shared_library_still_loads() {
+fn test_strip_dh_strip_executable() {
+    let dir = TempDir::new().unwrap();
+    build_shared(dir.path());
+    let exe = dir.path().join("main");
+    strip_ok(&DH_EXEC, &exe);
+    run_prints(&exe, "10\n");
+    let names = section_names(&fs::read(&exe).unwrap());
+    for gone in [".comment", ".symtab", ".strtab", ".debug_info"] {
+        assert!(!names.iter().any(|n| n == gone), "{gone} kept: {names:?}");
+    }
+    // `.note` is an exact section name: the notes the loader and debuggers
+    // read (`.note.gnu.build-id`, the ABI tag) stay.
+    assert!(names.iter().any(|n| n == ".note.gnu.build-id"), "{names:?}");
+}
+
+#[test]
+fn test_strip_dh_strip_shared_library() {
+    let dir = TempDir::new().unwrap();
+    build_shared(dir.path());
+    let lib = dir.path().join("libx.so.1");
+    strip_ok(&DH_SHARED, &lib);
+    run_prints(&dir.path().join("main"), "10\n");
+    let bytes = fs::read(&lib).unwrap();
+    let names = section_names(&bytes);
+    for gone in [".comment", ".symtab", ".strtab", ".debug_info"] {
+        assert!(!names.iter().any(|n| n == gone), "{gone} kept: {names:?}");
+    }
+    let elf = ElfFile64::<Endianness>::parse(&*bytes).unwrap();
+    let dynsyms: Vec<_> = elf
+        .dynamic_symbols()
+        .map(|s| s.name().unwrap().to_string())
+        .collect();
+    assert!(dynsyms.iter().any(|n| n == "lib_g"), "{dynsyms:?}");
+
+    // A program linked against the stripped library still links and runs.
+    let rpath = format!("-Wl,-rpath,{}", dir.path().display());
+    cc(dir.path(), &["-o", "main2", "main.c", "libx.so.1", &rpath]);
+    run_prints(&dir.path().join("main2"), "10\n");
+}
+
+/// One System V archive member header with the given metadata.
+fn ar_member(name: &str, mtime: u64, uid: u32, mode: u32, data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    for (field, width) in [
+        (format!("{name}/"), 16),
+        (mtime.to_string(), 12),
+        (uid.to_string(), 6),
+        (uid.to_string(), 6),
+        (format!("{mode:o}"), 8),
+        (data.len().to_string(), 10),
+    ] {
+        let mut f = field.into_bytes();
+        f.resize(width, b' ');
+        v.extend(f);
+    }
+    v.extend_from_slice(b"`\n");
+    v.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        v.push(b'\n');
+    }
+    v
+}
+
+#[test]
+fn test_strip_dh_strip_static_library() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("lib.c"),
+        format!(
+            "{LIB_C}int __gnu_lto_slim = 1;\n\
+             __attribute__((section(\".gnu.lto_x\"), used)) static const char lto[] = \"lto\";\n\
+             __attribute__((section(\".note\"), used)) static const char note[] = \"note\";\n"
+        ),
+    )
+    .unwrap();
+    fs::write(dir.path().join("main.c"), MAIN_C).unwrap();
+    cc(dir.path(), &["-g", "-c", "-o", "lib.o", "lib.c"]);
+    let obj = fs::read(dir.path().join("lib.o")).unwrap();
+    for want in [".comment", ".note", ".gnu.lto_x", ".debug_info"] {
+        assert!(section_names(&obj).iter().any(|n| n == want), "no {want}");
+    }
+    assert!(has_file_symbol(&obj));
+
+    // Non-deterministic member metadata, so the test sees -D zero it.
+    let mut arc = b"!<arch>\n".to_vec();
+    arc.extend(ar_member("lib.o", 1_700_000_000, 1000, 0o100755, &obj));
+    let lib = dir.path().join("libx.a");
+    fs::write(&lib, &arc).unwrap();
+
+    strip_ok(&DH_STATIC, &lib);
+
+    let bytes = fs::read(&lib).unwrap();
+    let archive = object::read::archive::ArchiveFile::parse(&*bytes).unwrap();
+    let member = archive.members().next().unwrap().unwrap();
+    assert_eq!(member.name(), b"lib.o");
+    assert_eq!(member.date(), Some(0));
+    assert_eq!(member.uid(), Some(0));
+    assert_eq!(member.gid(), Some(0));
+    assert_eq!(member.mode(), Some(0o644));
+    let data = member.data(&*bytes).unwrap();
+    let names = section_names(data);
+    for gone in [
+        ".comment",
+        ".note",
+        ".gnu.lto_x",
+        ".debug_info",
+        ".rela.debug_info",
+    ] {
+        assert!(!names.iter().any(|n| n == gone), "{gone} kept: {names:?}");
+    }
+    assert!(names.iter().any(|n| n == ".note.GNU-stack"), "{names:?}");
+    let syms = symbol_names(data);
+    assert!(!syms.iter().any(|n| n == "__gnu_lto_slim"), "{syms:?}");
+    assert!(syms.iter().any(|n| n == "lib_h"), "{syms:?}");
+    // --strip-debug drops STT_FILE symbols, as GNU strip does.
+    assert!(!has_file_symbol(data));
+
+    cc(dir.path(), &["-o", "main", "main.c", "libx.a"]);
+    run_prints(&dir.path().join("main"), "10\n");
+}
+
+#[test]
+fn test_strip_symbol_named_in_relocation_is_kept() {
+    // `-N` must not delete a symbol a kept relocation still names: that
+    // would silently drop the relocation and corrupt the object.
     let dir = TempDir::new().unwrap();
     write_sources(dir.path());
-    cc(
-        dir.path(),
-        &["-g", "-fPIC", "-shared", "-o", "libx.so", "lib.c"],
+    cc(dir.path(), &["-c", "-fPIC", "-o", "lib.o", "lib.c"]);
+    let obj = dir.path().join("lib.o");
+    let out = strip(&["-N", "lib_f"], &obj);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("named in a relocation"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let rpath = format!("-Wl,-rpath,{}", dir.path().display());
-    cc(dir.path(), &["-o", "main", "main.c", "libx.so", &rpath]);
-    strip_ok(&[], &dir.path().join("libx.so"));
+    let syms = symbol_names(&fs::read(&obj).unwrap());
+    assert!(syms.iter().any(|n| n == "lib_f"), "{syms:?}");
+    cc(dir.path(), &["-o", "main", "main.c", "lib.o"]);
     run_prints(&dir.path().join("main"), "10\n");
+}
+
+#[test]
+fn test_strip_unneeded_relocatable_keeps_globals() {
+    let dir = TempDir::new().unwrap();
+    write_sources(dir.path());
+    // -O0 keeps `hid` a real local function symbol.
+    cc(dir.path(), &["-g", "-O0", "-c", "-o", "lib.o", "lib.c"]);
+    let obj = dir.path().join("lib.o");
+    assert!(symbol_names(&fs::read(&obj).unwrap())
+        .iter()
+        .any(|n| n == "hid"));
+    strip_ok(&["--strip-unneeded"], &obj);
+    let bytes = fs::read(&obj).unwrap();
+    let syms = symbol_names(&bytes);
+    for keep in ["lib_f", "lib_g", "lib_h"] {
+        assert!(syms.iter().any(|n| n == keep), "{keep} lost: {syms:?}");
+    }
+    assert!(!has_file_symbol(&bytes));
+    assert!(!section_names(&bytes)
+        .iter()
+        .any(|n| n.starts_with(".debug")));
+    cc(dir.path(), &["-o", "main", "main.c", "lib.o"]);
+    run_prints(&dir.path().join("main"), "10\n");
+}
+
+#[test]
+fn test_strip_debug_executable_keeps_symtab() {
+    let dir = TempDir::new().unwrap();
+    build_shared(dir.path());
+    let exe = dir.path().join("main");
+    strip_ok(&["--strip-debug"], &exe);
+    run_prints(&exe, "10\n");
+    let bytes = fs::read(&exe).unwrap();
+    assert!(!section_names(&bytes)
+        .iter()
+        .any(|n| n.starts_with(".debug")));
+    assert!(symbol_names(&bytes).iter().any(|n| n == "main"));
+    assert!(!has_file_symbol(&bytes));
+}
+
+#[test]
+fn test_strip_rejects_strip_debug_with_strip_unneeded() {
+    let dir = TempDir::new().unwrap();
+    let f = dir.path().join("x.o");
+    fs::write(&f, b"").unwrap();
+    let out = strip(&["--strip-debug", "--strip-unneeded"], &f);
+    assert!(!out.status.success());
 }

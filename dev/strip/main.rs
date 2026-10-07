@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod linked;
+
 use clap::Parser;
 use gettextrs::gettext;
 use object::{
@@ -120,42 +122,24 @@ type StripResult = Result<Vec<u8>, Box<dyn std::error::Error>>;
 
 /// Strip one ELF file. `display` names it in diagnostics.
 fn strip(data: &[u8], opts: &Options, display: &str) -> StripResult {
-    let mut builder = Builder::read(data)?;
-    let relocatable = builder.header.e_type == elf::ET_REL;
-    // #ST4: a relocatable object (`.o`) must remain linkable, so by default
-    // it loses only what --strip-debug removes.
-    let level = match opts.level {
-        Level::All if relocatable => Level::Debug,
-        level => level,
-    };
-    // An executable or shared object needs no static symbol table: its
-    // dynamic relocations index .dynsym, which always stays.
-    let drop_symtab = !relocatable && level != Level::Debug;
+    if linked::is_linked(data)? {
+        return linked::strip(data, opts);
+    }
+    strip_relocatable(data, opts, display)
+}
 
+/// Strip a relocatable object (`.o`), renumbering its sections, symbols
+/// and relocations through object's ELF builder.
+fn strip_relocatable(data: &[u8], opts: &Options, display: &str) -> StripResult {
+    let mut builder = Builder::read(data)?;
     for section in &mut builder.sections {
         let name = section.name.as_slice();
-        let symtab_part = matches!(
-            section.data,
-            SectionData::Symbol
-                | SectionData::SymbolSectionIndex
-                | SectionData::String
-                | SectionData::Relocation(_)
-        );
-        if is_debug_section(name) || opts.removes_section(name) || (drop_symtab && symtab_part) {
+        if is_debug_section(name) || opts.removes_section(name) {
             section.delete = true;
         }
     }
     delete_relocations_of_deleted_sections(&mut builder);
-
-    if drop_symtab {
-        for symbol in &mut builder.symbols {
-            symbol.delete = true;
-        }
-    } else {
-        select_symbols(&mut builder, level, relocatable, opts, display)?;
-    }
-    builder.delete_orphan_segments();
-    builder.delete_orphan_dynamics();
+    select_symbols(&mut builder, opts, display)?;
     let mut contents = Vec::new();
     builder.write(&mut contents)?;
     Ok(contents)
@@ -184,16 +168,17 @@ fn delete_relocations_of_deleted_sections(builder: &mut Builder) {
     }
 }
 
-/// Mark the symbols of a kept symbol table that `level` and `-N` remove.
-/// A symbol a kept relocation names always stays: deleting it would make
-/// the builder silently drop the relocation.
+/// Mark the symbols of a relocatable object that the options remove.
+/// #ST4: the object must remain linkable, so by default it loses only what
+/// --strip-debug removes, and --strip-unneeded removes just the local
+/// symbols no relocation names. A symbol a kept relocation names always
+/// stays: deleting it would make the builder silently drop the relocation.
 fn select_symbols(
     builder: &mut Builder,
-    level: Level,
-    relocatable: bool,
     opts: &Options,
     display: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let unneeded = opts.level == Level::Unneeded;
     let kept = kept_sections(builder);
     let mut needed = HashSet::new();
     for section in &builder.sections {
@@ -228,7 +213,7 @@ fn select_symbols(
         symbol.delete = in_removed_section
             || opts.strips_symbol(name)
             || symbol.st_type() == elf::STT_FILE
-            || (level == Level::Unneeded && relocatable && symbol.st_bind() == elf::STB_LOCAL);
+            || (unneeded && symbol.st_bind() == elf::STB_LOCAL);
     }
     Ok(())
 }

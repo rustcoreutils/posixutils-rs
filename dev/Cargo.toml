@@ -37,7 +37,7 @@ required-features = ["object/read_core", "object/archive"]
 
 [[bin]]
 name = "strip"
-path = "./strip.rs"
+path = "./strip/main.rs"
 
 [[bin]]
 name = "strings"

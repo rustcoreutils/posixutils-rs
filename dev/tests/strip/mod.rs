@@ -182,6 +182,42 @@ fn test_strip_dh_strip_executable() {
     assert!(names.iter().any(|n| n == ".note.gnu.build-id"), "{names:?}");
 }
 
+/// The file bytes of every PT_LOAD segment, what the loader maps, except
+/// the ELF header, whose section header fields strip rewrites.
+fn loadable_image(bytes: &[u8]) -> Vec<u8> {
+    use object::read::elf::{FileHeader, ProgramHeader};
+    let header = object::elf::FileHeader64::<Endianness>::parse(bytes).unwrap();
+    let endian = header.endian().unwrap();
+    let mut image = Vec::new();
+    for ph in header.program_headers(endian, bytes).unwrap() {
+        if ph.p_type(endian) == object::elf::PT_LOAD {
+            let start = image.len();
+            image.extend_from_slice(ph.data(endian, bytes).unwrap());
+            if ph.p_offset(endian) == 0 {
+                let ehsize = usize::from(header.e_ehsize(endian));
+                image[start..start + ehsize].fill(0);
+            }
+        }
+    }
+    image
+}
+
+#[test]
+fn test_strip_leaves_loadable_image_untouched() {
+    // GNU strip removes only what the loader never maps. Rewriting through
+    // object's builder regenerated .gnu.hash and shrank .dynamic.
+    let dir = TempDir::new().unwrap();
+    build_shared(dir.path());
+    for (file, args) in [("libx.so.1", &DH_SHARED[..]), ("main", &DH_EXEC[..])] {
+        let path = dir.path().join(file);
+        let before = loadable_image(&fs::read(&path).unwrap());
+        strip_ok(args, &path);
+        let after = loadable_image(&fs::read(&path).unwrap());
+        assert!(before == after, "{file}: loadable image changed");
+    }
+    run_prints(&dir.path().join("main"), "10\n");
+}
+
 #[test]
 fn test_strip_dh_strip_shared_library() {
     let dir = TempDir::new().unwrap();

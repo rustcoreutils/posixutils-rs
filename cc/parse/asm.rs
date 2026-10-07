@@ -9,7 +9,7 @@
 // GCC asm labels on declarations and extended asm statements
 //
 
-use super::ast::{AsmOperand, LabelId, Stmt};
+use super::ast::{AsmOperand, ExternalDecl, LabelId, Stmt};
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::strings::StringId;
 use crate::symbol::Namespace;
@@ -221,6 +221,70 @@ impl Parser<'_> {
             clobbers,
             goto_labels,
         })
+    }
+
+    /// Parse GNU basic asm at file scope: `asm ( string-literal ) ;`, the
+    /// `__asm` and `__asm__` spellings alike.
+    ///
+    /// Only the basic form exists here, as in gcc: no qualifier -- `volatile`,
+    /// `inline` and `goto` are errors where the `(` belongs -- and no operands,
+    /// whose first `:` gcc reads as a missing `)`. The text is the assembler's
+    /// verbatim; nothing is substituted into it, so `%` stays as written.
+    pub(super) fn parse_file_scope_asm(&mut self) -> ParseResult<ExternalDecl> {
+        let pos = self.current_pos();
+        self.advance(); // consume asm / __asm / __asm__
+        if !self.is_special(b'(') {
+            return Err(ParseError::new(
+                format!("expected '(' before {}", self.describe_current()),
+                self.current_pos(),
+            ));
+        }
+        self.advance(); // consume '('
+        match self.peek() {
+            TokenType::String => {}
+            TokenType::WideString | TokenType::Utf16String | TokenType::Utf32String => {
+                return Err(ParseError::new(
+                    "a wide string is invalid in this context",
+                    self.current_pos(),
+                ));
+            }
+            _ => {
+                return Err(ParseError::new(
+                    format!("expected string literal before {}", self.describe_current()),
+                    self.current_pos(),
+                ));
+            }
+        }
+        let text = self.parse_asm_string_literal()?;
+        if !self.is_special(b')') {
+            return Err(ParseError::new(
+                format!("expected ')' before {}", self.describe_current()),
+                self.current_pos(),
+            ));
+        }
+        self.advance(); // consume ')'
+        self.expect_special(b';')?;
+        Ok(ExternalDecl::Asm { pos, text })
+    }
+
+    /// The current token as gcc names it after "before": `'volatile'`,
+    /// `':' token`, `numeric constant`.
+    fn describe_current(&self) -> String {
+        match &self.current().value {
+            TokenValue::Ident(id) => format!("'{}'", self.idents.get_opt(*id).unwrap_or("?")),
+            TokenValue::Special(v) => {
+                format!("'{}' token", crate::token::lexer::show_special(*v))
+            }
+            _ => match self.peek() {
+                TokenType::Number => "numeric constant".to_string(),
+                TokenType::Char
+                | TokenType::WideChar
+                | TokenType::Utf16Char
+                | TokenType::Utf32Char => "character constant".to_string(),
+                TokenType::StreamEnd => "end of input".to_string(),
+                _ => "string constant".to_string(),
+            },
+        }
     }
 
     /// Parse an asm template string (handles string concatenation)

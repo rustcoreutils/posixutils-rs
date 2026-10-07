@@ -3123,6 +3123,13 @@ pub enum ExternalDecl {
     FunctionDef(FunctionDef),
     /// Variable/type declaration
     Declaration(Declaration),
+    /// GNU basic asm at file scope, `__asm__("...");`: text for the
+    /// assembler, written where it falls among the unit's definitions.
+    Asm {
+        pos: Position,
+        /// The concatenated literals, decoded from their bytes.
+        text: String,
+    },
 }
 
 /// A translation unit (entire source file)

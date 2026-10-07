@@ -1913,9 +1913,7 @@ fn parse_decl(input: &str) -> ParseResult<(Declaration, TypeTable, StringTable, 
     // translation unit ever ran through (#C133).
     match parser.parse_external_decl()? {
         ExternalDecl::Declaration(decl) => Ok((decl, types, strings, symbols)),
-        ExternalDecl::FunctionDef(_) => {
-            panic!("expected a declaration, parsed a function definition: {input}")
-        }
+        other => panic!("expected a declaration, parsed {other:?}: {input}"),
     }
 }
 
@@ -2047,9 +2045,7 @@ fn parse_func(input: &str) -> ParseResult<(FunctionDef, TypeTable, StringTable, 
     // See `parse_decl`: the production entry point.
     match parser.parse_external_decl()? {
         ExternalDecl::FunctionDef(func) => Ok((func, types, strings, symbols)),
-        ExternalDecl::Declaration(_) => {
-            panic!("expected a function definition, parsed a declaration: {input}")
-        }
+        other => panic!("expected a function definition, parsed {other:?}: {input}"),
     }
 }
 
@@ -8964,6 +8960,7 @@ fn test_every_declarator_position_binds_the_same_way() {
                     }
                 }
             }
+            ExternalDecl::Asm { .. } => {}
         }
     }
     assert_eq!(seen, ["a", "b", "c", "d", "e", "k"]);

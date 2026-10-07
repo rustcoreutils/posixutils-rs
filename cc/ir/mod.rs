@@ -3041,6 +3041,10 @@ pub struct Function {
     /// The function stays in the module because the inliner still needs its
     /// body; only the backends' emit loops skip it.
     pub emit: bool,
+    /// How many file-scope asm statements precede this definition in the
+    /// source: the backends write it after that many of
+    /// [`Module::toplevel_asm`] and before the next.
+    pub asm_before: usize,
     /// Is this function noreturn (never returns)?
     pub is_noreturn: bool,
     /// The calling convention of the function's type: how its parameters
@@ -3134,6 +3138,7 @@ impl Default for Function {
             locals: HashMap::new(),
             is_static: false,
             emit: true,
+            asm_before: 0,
             is_noreturn: false,
             conv: CallingConv::C,
             is_noinline: false,
@@ -3816,6 +3821,9 @@ pub struct GlobalDef {
     pub explicit_align: Option<u32>,
     /// `weak`, `used`, `section(...)`, `visibility(...)`.
     pub symbol_attrs: crate::parse::ast::SymbolAttrs,
+    /// How many file-scope asm statements precede this definition in the
+    /// source; see [`Function::asm_before`].
+    pub asm_before: usize,
 }
 
 impl GlobalDef {
@@ -3830,6 +3838,7 @@ impl GlobalDef {
             is_const: false,
             explicit_align: None,
             symbol_attrs: Default::default(),
+            asm_before: 0,
         }
     }
 
@@ -3925,6 +3934,11 @@ impl Module {
 pub struct Module {
     /// Functions
     pub functions: Vec<Function>,
+    /// The text of each GNU basic asm at file scope, in source order. Each
+    /// function and global records how many of them come before it
+    /// (`asm_before`), which is all the backends need to write the unit's
+    /// definitions and its asm in the order the source has them.
+    pub toplevel_asm: Vec<String>,
     /// Global variables
     pub globals: Vec<GlobalDef>,
     /// String literals (label, content)

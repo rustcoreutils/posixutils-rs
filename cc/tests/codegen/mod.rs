@@ -28,6 +28,7 @@ mod cross_abi;
 mod cross_abi_types;
 mod cross_abi_varargs;
 mod determinism;
+mod file_scope_asm;
 mod float_to_int_saturation;
 mod floating;
 mod fp_compare_traps;

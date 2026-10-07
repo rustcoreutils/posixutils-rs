@@ -314,6 +314,11 @@ impl Parser<'_> {
         if self.at_attribute_declaration() {
             return self.parse_file_attribute_declaration();
         }
+        // GNU basic asm: no declaration starts with `asm`, which is only
+        // ever an asm label after a declarator.
+        if self.is_asm_keyword() {
+            return self.parse_file_scope_asm();
+        }
         self.parse_declaration(DeclScope::File)
     }
 

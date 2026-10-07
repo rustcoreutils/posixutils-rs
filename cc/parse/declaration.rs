@@ -361,8 +361,8 @@ impl Parser<'_> {
     fn parse_block_declaration(&mut self, for_init: bool) -> ParseResult<Declaration> {
         match self.parse_declaration(DeclScope::Block { for_init })? {
             ExternalDecl::Declaration(decl) => Ok(decl),
-            ExternalDecl::FunctionDef(_) => {
-                unreachable!("a function definition is recognised only at file scope")
+            ExternalDecl::FunctionDef(_) | ExternalDecl::Asm { .. } => {
+                unreachable!("a function definition or an asm is recognised only at file scope")
             }
         }
     }

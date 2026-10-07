@@ -376,6 +376,47 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         self.last_debug_file = file;
     }
 
+    /// What the unit emits once, after the globals ahead of its first
+    /// file-scope asm and before its functions: the attributes of symbols it
+    /// only declares, its aliases, its string literals, and the DWARF
+    /// start-of-text label.
+    pub fn emit_unit_data(&mut self, module: &Module) {
+        self.emit_declared_symbol_attrs(module);
+        self.emit_symbol_aliases(module);
+        self.emit_strings(&module.strings);
+        self.emit_utf16_strings(&module.utf16_strings);
+        self.emit_utf32_strings(&module.utf32_strings);
+        // Globals may leave the assembler in a data section.
+        if module.debug && !module.functions.is_empty() {
+            self.push_directive(Directive::Text);
+            self.push_directive(Directive::local_label(".Ltext0"));
+        }
+    }
+
+    /// The text of the file-scope asm that follows run `run` of the unit's
+    /// definitions -- those whose `asm_before` is `run` -- if there is one.
+    ///
+    /// It may switch sections, and nothing here tracks which section the
+    /// assembler is in: every function and every object names its own
+    /// section, so what follows is placed whatever the asm left.
+    pub fn emit_toplevel_asm(&mut self, module: &Module, run: usize) {
+        if let Some(text) = module.toplevel_asm.get(run) {
+            self.push_directive(Directive::Verbatim(text.clone()));
+        }
+    }
+
+    /// The DWARF end-of-text label, after the last function. A file-scope
+    /// asm after that function may have switched sections, so the text
+    /// section is named again first.
+    pub fn emit_text_end(&mut self, module: &Module) {
+        if module.debug && !module.functions.is_empty() {
+            if !module.toplevel_asm.is_empty() {
+                self.push_directive(Directive::Text);
+            }
+            self.push_directive(Directive::local_label(".Ltext_end"));
+        }
+    }
+
     /// `.weak` and visibility for symbols this unit only declares.
     ///
     /// A defined symbol carries these on its own definition; a declared one has

@@ -1163,6 +1163,10 @@ impl<'a> Linearizer<'a> {
                 _ => None,
             })
             .collect();
+        // What each item adds to the module is stamped with the number of
+        // file-scope asm statements before it -- a function's statics with
+        // the function -- so the backends can write the two in source order.
+        let mut placed = (0, 0);
         for item in &tu.items {
             match item {
                 ExternalDecl::FunctionDef(func) => match &func.attrs.clones {
@@ -1172,9 +1176,14 @@ impl<'a> Linearizer<'a> {
                 ExternalDecl::Declaration(decl) => {
                     self.linearize_global_decl(decl);
                 }
+                ExternalDecl::Asm { text, .. } => {
+                    placed = self.place_after_asm(placed);
+                    self.module.toplevel_asm.push(text.clone());
+                }
             }
         }
         self.resolve_aliases();
+        self.place_after_asm(placed);
         for &name in super::FOLD_CALLEES {
             if !self.library_function_available(name) {
                 continue;
@@ -1183,6 +1192,20 @@ impl<'a> Linearizer<'a> {
             self.module.library_symbols.insert(name, symbol);
         }
         std::mem::take(&mut self.module)
+    }
+
+    /// Stamp the functions and globals added since `placed` -- the counts of
+    /// each already stamped -- as following every file-scope asm seen so
+    /// far, and return the new counts.
+    fn place_after_asm(&mut self, placed: (usize, usize)) -> (usize, usize) {
+        let asm_before = self.module.toplevel_asm.len();
+        for func in &mut self.module.functions[placed.0..] {
+            func.asm_before = asm_before;
+        }
+        for global in &mut self.module.globals[placed.1..] {
+            global.asm_before = asm_before;
+        }
+        (self.module.functions.len(), self.module.globals.len())
     }
 
     /// Allocate a new pseudo ID

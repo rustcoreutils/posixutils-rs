@@ -1070,6 +1070,10 @@ pub enum Directive {
 
     /// Raw assembly string (emitted verbatim) - used for inline asm
     Raw(String),
+
+    /// A file-scope asm's text, written exactly as the source gave it and
+    /// ended with a newline, as gcc writes it.
+    Verbatim(String),
 }
 
 /// Emit the section directive for an `.init_array` / `.fini_array` entry.
@@ -1635,6 +1639,9 @@ impl EmitAsm for Directive {
             Directive::Raw(text) => {
                 let _ = writeln!(out, "    {}", text);
             }
+            Directive::Verbatim(text) => {
+                let _ = writeln!(out, "{}", text);
+            }
         }
     }
 }
@@ -1862,6 +1869,18 @@ mod tests {
         let mut out = String::new();
         dir.emit(&target, &mut out);
         assert_eq!(out, "    .loc 1 42 5\n");
+    }
+
+    /// A file-scope asm's text goes out exactly as written, unindented, on
+    /// every target, with one newline after it.
+    #[test]
+    fn test_directive_verbatim() {
+        for os in [Os::Linux, Os::MacOS] {
+            let mut out = String::new();
+            Directive::Verbatim(".symver a,b@@V\n\t.globl c".into())
+                .emit(&Target::new(Arch::X86_64, os), &mut out);
+            assert_eq!(out, ".symver a,b@@V\n\t.globl c\n");
+        }
     }
 
     /// A `.file` path is escaped as any assembler string is: an unescaped

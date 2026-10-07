@@ -632,6 +632,8 @@ fn process_file(
                     }
                 }
             }
+            // Assembler text names no C symbol.
+            ExternalDecl::Asm { .. } => {}
         }
     }
 

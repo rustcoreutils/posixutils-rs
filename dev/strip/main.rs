@@ -8,16 +8,17 @@
 //
 
 mod linked;
+mod raw;
 
 use clap::Parser;
 use gettextrs::gettext;
 use object::{
     archive,
     build::{
-        elf::{Builder, SectionData},
+        elf::{Builder, Section, SectionData},
         Id,
     },
-    elf, Object, ObjectSymbol, SymbolKind,
+    elf, Endian, Object, ObjectSymbol, SymbolKind,
 };
 use plib::diag;
 use std::{
@@ -122,7 +123,7 @@ type StripResult = Result<Vec<u8>, Box<dyn std::error::Error>>;
 
 /// Strip one ELF file. `display` names it in diagnostics.
 fn strip(data: &[u8], opts: &Options, display: &str) -> StripResult {
-    if linked::is_linked(data)? {
+    if raw::is_linked(data)? {
         return linked::strip(data, opts);
     }
     strip_relocatable(data, opts, display)
@@ -131,7 +132,8 @@ fn strip(data: &[u8], opts: &Options, display: &str) -> StripResult {
 /// Strip a relocatable object (`.o`), renumbering its sections, symbols
 /// and relocations through object's ELF builder.
 fn strip_relocatable(data: &[u8], opts: &Options, display: &str) -> StripResult {
-    let mut builder = Builder::read(data)?;
+    let (groups, retyped) = hide_groups(data)?;
+    let mut builder = Builder::read(retyped.as_deref().unwrap_or(data))?;
     for section in &mut builder.sections {
         let name = section.name.as_slice();
         if is_debug_section(name) || opts.removes_section(name) {
@@ -139,10 +141,135 @@ fn strip_relocatable(data: &[u8], opts: &Options, display: &str) -> StripResult 
         }
     }
     delete_relocations_of_deleted_sections(&mut builder);
-    select_symbols(&mut builder, opts, display)?;
+    let signatures = prune_groups(&mut builder, &groups);
+    select_symbols(&mut builder, opts, display, &signatures)?;
+    restore_groups(&mut builder, &groups)?;
     let mut contents = Vec::new();
     builder.write(&mut contents)?;
     Ok(contents)
+}
+
+/// The section indices of the SHT_GROUP sections (COMDAT groups, in every
+/// C++ object), which object's builder refuses to read, and a copy of
+/// `data` in which they are retyped SHT_PROGBITS so it reads them as data.
+fn hide_groups(data: &[u8]) -> raw::Result<(Vec<usize>, Option<Vec<u8>>)> {
+    let Some(mut table) = raw::SectionTable::read(data)? else {
+        return Ok((Vec::new(), None));
+    };
+    let groups: Vec<usize> = (0..table.shdrs.len())
+        .filter(|&i| table.shdrs[i].sh_type == elf::SHT_GROUP)
+        .collect();
+    if groups.is_empty() {
+        return Ok((groups, None));
+    }
+    let mut copy = data.to_vec();
+    for &i in &groups {
+        table.shdrs[i].sh_type = elf::SHT_PROGBITS;
+        table.store(&mut copy, i);
+    }
+    Ok((groups, Some(copy)))
+}
+
+/// A group section's words: its flags, then its member section indices.
+fn group_words(builder: &Builder, section: &Section) -> Vec<u32> {
+    match &section.data {
+        SectionData::Data(bytes) => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| builder.endian.read_u32_bytes(*w))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether builder section `section` was section header `index`.
+fn is_header(section: &Section, index: usize) -> bool {
+    section.id().index() + 1 == index
+}
+
+/// Delete the groups whose every member was removed, and return the
+/// symbol indices of the kept groups' signatures, which must stay.
+fn prune_groups(builder: &mut Builder, groups: &[usize]) -> HashSet<usize> {
+    let kept = kept_sections(builder);
+    let mut empty = Vec::new();
+    let mut signatures = HashSet::new();
+    for section in builder.sections.iter() {
+        if !groups.iter().any(|&g| is_header(section, g)) {
+            continue;
+        }
+        let words = group_words(builder, section);
+        let mut members = words.iter().skip(1);
+        if members.any(|&m| kept.contains(&(m as usize).wrapping_sub(1))) {
+            signatures.insert((section.sh_info as usize).wrapping_sub(1));
+        } else {
+            empty.push(section.id());
+        }
+    }
+    for id in empty {
+        builder.sections.get_mut(id).delete = true;
+    }
+    signatures
+}
+
+/// Turn the kept groups back into SHT_GROUP sections, with their member
+/// and signature indices renumbered the way the builder will write them:
+/// sections in order, local symbols before the others.
+fn restore_groups(builder: &mut Builder, groups: &[usize]) -> raw::Result<()> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+    let new_section: std::collections::HashMap<usize, u32> = builder
+        .sections
+        .iter()
+        .enumerate()
+        .map(|(n, s)| (s.id().index() + 1, n as u32 + 1))
+        .collect();
+    let locals = builder
+        .symbols
+        .iter()
+        .filter(|s| s.st_bind() == elf::STB_LOCAL);
+    let others = builder
+        .symbols
+        .iter()
+        .filter(|s| s.st_bind() != elf::STB_LOCAL);
+    let new_symbol: std::collections::HashMap<usize, u32> = locals
+        .chain(others)
+        .enumerate()
+        .map(|(n, s)| (s.id().index() + 1, n as u32 + 1))
+        .collect();
+
+    let mut rebuilt = Vec::new();
+    for section in builder.sections.iter() {
+        if !groups.iter().any(|&g| is_header(section, g)) {
+            continue;
+        }
+        let words = group_words(builder, section);
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for (n, &word) in words.iter().enumerate() {
+            let word = if n == 0 {
+                word
+            } else {
+                match new_section.get(&(word as usize)) {
+                    Some(&index) => index,
+                    None => continue,
+                }
+            };
+            bytes.extend_from_slice(&builder.endian.write_u32_bytes(word));
+        }
+        let signature = new_symbol
+            .get(&(section.sh_info as usize))
+            .copied()
+            .ok_or_else(|| gettext("a COMDAT group lost its signature symbol"))?;
+        rebuilt.push((section.id(), bytes, signature));
+    }
+    for (id, bytes, signature) in rebuilt {
+        let section = builder.sections.get_mut(id);
+        section.sh_type = elf::SHT_GROUP;
+        section.sh_info = signature;
+        section.data = SectionData::Data(bytes.into());
+    }
+    Ok(())
 }
 
 /// Indices of the sections that survive.
@@ -173,14 +300,16 @@ fn delete_relocations_of_deleted_sections(builder: &mut Builder) {
 /// --strip-debug removes, and --strip-unneeded removes just the local
 /// symbols no relocation names. A symbol a kept relocation names always
 /// stays: deleting it would make the builder silently drop the relocation.
+/// So does a group signature (`signatures`).
 fn select_symbols(
     builder: &mut Builder,
     opts: &Options,
     display: &str,
+    signatures: &HashSet<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let unneeded = opts.level == Level::Unneeded;
     let kept = kept_sections(builder);
-    let mut needed = HashSet::new();
+    let mut needed = signatures.clone();
     for section in &builder.sections {
         if let SectionData::Relocation(relocs) = &section.data {
             needed.extend(relocs.iter().filter_map(|r| r.symbol).map(|s| s.index()));

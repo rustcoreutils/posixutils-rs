@@ -22,7 +22,7 @@
 
 use crate::c_compiler;
 use object::read::elf::ElfFile64;
-use object::{Endianness, Object, ObjectSection, ObjectSymbol, SymbolKind};
+use object::{Endianness, Object, ObjectComdat, ObjectSection, ObjectSymbol, SymbolKind};
 use plib::tmp::TempDir;
 use std::fs;
 use std::path::Path;
@@ -382,6 +382,49 @@ fn test_strip_debug_executable_keeps_symtab() {
         .any(|n| n.starts_with(".debug")));
     assert!(symbol_names(&bytes).iter().any(|n| n == "main"));
     assert!(!has_file_symbol(&bytes));
+}
+
+/// A translation unit with a COMDAT group defining `grp_val`, as every C++
+/// inline function or template instance gets.
+fn comdat_source(func: &str) -> String {
+    format!(
+        "extern int grp_val;\nint {func}(void){{return grp_val;}}\n\
+         __asm__(\".section .data.grp_val,\\\"awG\\\",%progbits,grp_val,comdat\\n\
+         .globl grp_val\\n.type grp_val,%object\\n.size grp_val,4\\n\
+         grp_val:\\n.long 7\\n.text\\n\");\n"
+    )
+}
+
+#[test]
+fn test_strip_keeps_comdat_groups() {
+    // object's builder rejects SHT_GROUP sections, so strip failed on
+    // every C++ object and static library. Each object here also carries
+    // -g3 macro groups, which lose every member and must go, and losing
+    // debug sections and symbols renumbers what the kept group names.
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.c"), comdat_source("fa")).unwrap();
+    fs::write(dir.path().join("b.c"), comdat_source("fb")).unwrap();
+    fs::write(
+        dir.path().join("main.c"),
+        "#include <stdio.h>\nint fa(void);int fb(void);\n\
+         int main(void){printf(\"%d\\n\", fa()+fb());return 0;}\n",
+    )
+    .unwrap();
+    for (src, obj) in [("a.c", "a.o"), ("b.c", "b.o")] {
+        cc(dir.path(), &["-g3", "-c", "-o", obj, src]);
+        strip_ok(&[], &dir.path().join(obj));
+        let bytes = fs::read(dir.path().join(obj)).unwrap();
+        let elf = ElfFile64::<Endianness>::parse(&*bytes).unwrap();
+        let groups: Vec<_> = elf
+            .comdats()
+            .map(|c| c.name().unwrap().to_string())
+            .collect();
+        assert_eq!(groups, ["grp_val"], "{obj}");
+    }
+    // Two copies of the group link as one only if each still names its
+    // signature symbol and member section.
+    cc(dir.path(), &["-o", "main", "main.c", "a.o", "b.o"]);
+    run_prints(&dir.path().join("main"), "14\n");
 }
 
 #[test]

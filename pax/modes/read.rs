@@ -532,9 +532,32 @@ struct CreatedSet {
     /// Whether that file has its contents yet. newc stores them with the last
     /// name of a set only, so the earlier names are created empty.
     has_data: bool,
+    /// The file held open until its data arrives. Its names can be replaced
+    /// by other members meanwhile, and a filesystem that reuses inode numbers
+    /// (ext4) then hands this file's number to the next file created, which
+    /// `file` would take for this one. Open, it keeps its number.
+    _pin: Option<OwnedFd>,
 }
 
 impl CreatedSet {
+    /// The set as created at `name` below `dirfd`: pinned while the data is
+    /// still to come on a later name.
+    fn new(
+        names: Vec<PathBuf>,
+        file: (u64, u64),
+        has_data: bool,
+        dirfd: BorrowedFd<'_>,
+        name: &CStr,
+    ) -> Self {
+        let _pin = (!has_data).then(|| pin_file(dirfd, name, file)).flatten();
+        CreatedSet {
+            names,
+            file,
+            has_data,
+            _pin,
+        }
+    }
+
     /// The names that still hold the set's file, each with the directory and
     /// leaf it was found at: an earlier name may since have been replaced by
     /// another member of the same name.
@@ -565,10 +588,9 @@ fn extract_regular<R: ArchiveReader>(
     }
 
     if let Some(file) = extract_file(archive, dirfd, member.leaf.as_c_str(), entry, options)? {
-        link_sets.insert(entry, || CreatedSet {
-            names: vec![member.display.clone()],
-            file,
-            has_data: entry.size > 0,
+        link_sets.insert(entry, || {
+            let names = vec![member.display.clone()];
+            CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
         });
     }
     Ok(())
@@ -625,11 +647,7 @@ fn join_link_set<R: ArchiveReader>(
     names.push(member.display.clone());
     // Created empty when no earlier name survived to link to: the data is
     // then still to come, on a later name.
-    *set = CreatedSet {
-        names,
-        file,
-        has_data: entry.size > 0,
-    };
+    *set = CreatedSet::new(names, file, entry.size > 0, dirfd, name);
     Ok(())
 }
 
@@ -665,6 +683,7 @@ fn fill_link_set<R: ArchiveReader>(
         names,
         file,
         has_data: true,
+        _pin: None,
     };
     Ok(())
 }
@@ -691,6 +710,19 @@ fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(Rc<Own
     let member = MemberPath::parse(path).ok()??;
     let dir = tree.parent_of(&member, false).ok()?;
     (id_at(dir.as_fd(), &member.leaf) == Some(file)).then_some((dir, member.leaf))
+}
+
+/// The file at `name` below `dirfd`, opened without following a symlink or
+/// blocking, when it is still the file `file`. A failure only leaves the set
+/// unpinned.
+fn pin_file(dirfd: BorrowedFd<'_>, name: &CStr, file: (u64, u64)) -> Option<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return None;
+    }
+    let file_held = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    (file_id(&file_held.metadata().ok()?) == file).then(|| file_held.into())
 }
 
 /// (st_dev, st_ino) of a name below `dirfd`, not following a symlink.

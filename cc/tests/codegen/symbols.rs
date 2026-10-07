@@ -15,7 +15,7 @@
 
 use crate::common::{
     compile_and_dlopen, compile_and_run, compile_and_run_everywhere, compile_and_run_optimized,
-    create_c_file,
+    compile_and_run_two_units, create_c_file,
 };
 use plib::testing::run_test_base;
 use std::process::Command;
@@ -1340,6 +1340,43 @@ int main(void)
     for opts in [vec![], vec!["-O2".to_string()]] {
         assert_eq!(
             compile_and_run("static_thread_local_struct_local", src, &opts),
+            0,
+            "{opts:?}"
+        );
+    }
+}
+
+/// `#pragma weak name` makes `name` a weak symbol, as the System V and
+/// gcc compilers do: a reference that no definition satisfies is a null
+/// address rather than a link error, and a definition yields to a strong one
+/// elsewhere. The pragma may come before or after the declaration.
+///
+/// binutils' libctf writes `#pragma weak ctf_open` so that its BFD-free
+/// shared library can refer to `ctf_open` without defining it; c17 ignored
+/// the pragma, so every program linked against libctf-nobfd.so (readelf
+/// first) failed with "undefined reference to `ctf_open'".
+#[test]
+fn codegen_pragma_weak() {
+    let unit_a = r#"
+#pragma weak absent_later
+int absent_before(void);
+int absent_later(void);
+#pragma weak absent_before
+#pragma weak hook
+int hook(void) { return 1; }
+
+int main(void)
+{
+    if (&absent_before != 0) return 1;
+    if (&absent_later != 0) return 2;
+    if (hook() != 2) return 3;
+    return 0;
+}
+"#;
+    let unit_b = "int hook(void) { return 2; }\n";
+    for opts in [vec![], vec!["-O2".to_string()]] {
+        assert_eq!(
+            compile_and_run_two_units("pragma_weak", unit_a, unit_b, &opts),
             0,
             "{opts:?}"
         );

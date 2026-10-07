@@ -3944,6 +3944,29 @@ impl Module {
             set(&mut alias.visibility, alias.is_static);
         }
     }
+
+    /// Make each of `names` (from `#pragma weak`) a weak symbol: a function
+    /// or object the unit defines becomes a weak definition, and any other
+    /// name a weak reference, emitted as such if the unit refers to it.
+    pub fn apply_pragma_weak(&mut self, names: &[String]) {
+        for name in names {
+            let mut defined = false;
+            for func in self.functions.iter_mut().filter(|f| f.name == *name) {
+                func.symbol_attrs.weak = true;
+                defined = true;
+            }
+            for global in self.globals.iter_mut().filter(|g| g.name == *name) {
+                global.symbol_attrs.weak = true;
+                defined = true;
+            }
+            if !defined {
+                self.declared_symbol_attrs
+                    .entry(name.clone())
+                    .or_default()
+                    .weak = true;
+            }
+        }
+    }
 }
 
 /// A module containing multiple functions

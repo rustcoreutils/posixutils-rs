@@ -2341,6 +2341,22 @@ fn test_line_directive_maps_token_positions() {
     assert_eq!(crate::diag::stream_name(b.pos.stream), "renamed.c");
 }
 
+/// `#pragma weak NAME` names a weak symbol, in either spelling; the alias
+/// form and anything malformed name none.
+#[test]
+fn test_pragma_weak_names() {
+    let (tokens, _) = preprocess_str(
+        "#pragma weak ctf_open\n\
+         int a;\n\
+         _Pragma(\"weak late_one\")\n\
+         #pragma weak alias = target\n\
+         #pragma weak\n\
+         #pragma weak 3x\n\
+         #pragma GCC weak nope\n",
+    );
+    assert_eq!(pragma_weak_names(&tokens), ["ctf_open", "late_one"]);
+}
+
 /// `#pragma scalar_storage_order` reaches the parser as a layout marker, in
 /// either spelling, and a body naming no order is dropped with a warning.
 #[test]

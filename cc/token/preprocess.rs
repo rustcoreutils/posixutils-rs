@@ -711,6 +711,31 @@ pub fn pragma_text(token: &Token) -> Option<String> {
     }
 }
 
+/// The names `#pragma weak NAME` makes weak symbols, from the pragma markers
+/// in `tokens`, in the order they stand.
+///
+/// A System V pragma that gcc implements too: `NAME` becomes a weak symbol
+/// whether its declaration or definition comes before the pragma or after
+/// it, so where the pragma stands does not matter. The `#pragma weak NAME =
+/// TARGET` form, which defines an alias, is not acted on.
+pub fn pragma_weak_names(tokens: &[Token]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|t| t.typ == TokenType::Pragma)
+        .filter_map(pragma_text)
+        .filter_map(|text| {
+            let mut words = text.strip_prefix("#pragma")?.split_whitespace();
+            if words.next()? != "weak" {
+                return None;
+            }
+            let name = words.next()?;
+            let is_ident = name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+            (words.next().is_none() && is_ident).then(|| name.to_string())
+        })
+        .collect()
+}
+
 /// A pragma that changes how the parser lays out the structures and unions
 /// defined after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

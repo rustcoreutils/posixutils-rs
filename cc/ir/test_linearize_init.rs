@@ -2443,3 +2443,34 @@ fn test_object_definition_inherits_declaration_attrs() {
     assert_eq!(attrs("c").visibility.as_deref(), Some("hidden"));
     assert!(module.declared_symbol_attrs.is_empty());
 }
+
+/// `#pragma weak` names: a defined function or object becomes a weak
+/// definition, anything else a weak reference.
+#[test]
+fn test_apply_pragma_weak() {
+    let mut module = linearize_source(
+        "int obj = 1;\nint f(void) { return obj; }\nint g(void);\n",
+        &Target::host(),
+    );
+    module.apply_pragma_weak(&["obj".into(), "f".into(), "g".into()]);
+    assert!(
+        module
+            .globals
+            .iter()
+            .find(|g| g.name == "obj")
+            .unwrap()
+            .symbol_attrs
+            .weak
+    );
+    assert!(
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .unwrap()
+            .symbol_attrs
+            .weak
+    );
+    assert!(module.declared_symbol_attrs["g"].weak);
+    assert!(!module.declared_symbol_attrs.contains_key("f"));
+}

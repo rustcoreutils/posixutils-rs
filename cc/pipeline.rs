@@ -162,6 +162,7 @@ pub fn compile_tokens(
     // point at which the order is the translation unit's own -- an include is
     // preprocessed separately and spliced in, so nothing recorded earlier
     // survives with a usable index.
+    let weak_names = token::preprocess::pragma_weak_names(&preprocessed);
     let layout_pragmas = token::preprocess::extract_pragma_directives(&mut preprocessed);
     token::lexer::report_unterminated_literals(&preprocessed);
 
@@ -207,6 +208,7 @@ pub fn compile_tokens(
     if let Some(how) = opts.default_visibility {
         module.apply_default_visibility(how);
     }
+    module.apply_pragma_weak(&weak_names);
 
     // Check for errors during linearization (e.g., unsupported global initializers)
     if diag::has_error() != 0 {

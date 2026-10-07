@@ -1558,9 +1558,10 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Anything c17 does not act on -- `#pragma GCC ...`, `#pragma weak`,
+        // Anything the preprocessor does not act on -- `#pragma GCC ...`,
         // OpenMP, a vendor pragma -- is carried through unchanged rather than
-        // discarded.
+        // discarded. `#pragma weak` travels this way too, and the compiler
+        // reads it from the carried text (`pragma_weak_names`).
         emit_verbatim(self, output);
     }
 

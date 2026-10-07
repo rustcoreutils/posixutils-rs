@@ -19,6 +19,7 @@ mod float_n;
 mod labeled_declaration;
 mod local_label;
 mod no_current_block;
+mod optimize_attr;
 mod setjmp;
 mod statement_attributes;
 mod stmt_expr;

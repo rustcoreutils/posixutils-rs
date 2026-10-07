@@ -118,9 +118,15 @@ the result of a correct program. glibc puts most of them on every declaration.
 `returns_nonnull`, `nothrow`, `access`, `returns_twice`, `externally_visible`,
 `abi_tag`, `weakref`, `simd`, `regparm`, `leaf`, `alloc_size`, `alloc_align`,
 `noclone`, `no_instrument_function`, `copy`, `designated_init`, `may_alias`,
-`artificial`, `no_sanitize_memory`, `no_sanitize_address`, `no_sanitize_thread`.
+`artificial`, `no_sanitize_memory`, `no_sanitize_address`, `no_sanitize_thread`,
+`optimize`.
 
 No diagnostic comes from `deprecated`, `warn_unused_result` or `format`.
+`optimize(...)` takes any arguments and is ignored without a word, as an ISA
+beyond the ceiling in `target` is: it only changes how gcc optimizes the one
+function (libzstd's `DONT_VECTORIZE`, `optimize("no-tree-vectorize")`, under
+`-Werror`). Its pragma form, `#pragma GCC optimize`, is ignored as every
+pragma c17 does not know.
 `artificial` is recorded in `FunctionAttrs` but no debug annotation is emitted.
 
 Also accepted:

@@ -1126,6 +1126,8 @@ define_keywords! {
     (_, "copy",                    SUPPORTED_ATTR),
     (_, "designated_init",         SUPPORTED_ATTR),
     (_, "may_alias",               SUPPORTED_ATTR),
+    // How gcc optimizes one function, which ignoring cannot make wrong.
+    (_, "optimize",                SUPPORTED_ATTR),
     // GNU forms (__foo__)
     // Note: __noreturn__ is already defined above with NORETURN_KW | SUPPORTED_ATTR
     (_, "__unused__",           SUPPORTED_ATTR),
@@ -1180,6 +1182,7 @@ define_keywords! {
     (_, "__copy__",                  SUPPORTED_ATTR),
     (_, "__designated_init__",       SUPPORTED_ATTR),
     (_, "__may_alias__",             SUPPORTED_ATTR),
+    (_, "__optimize__",              SUPPORTED_ATTR),
     // GCC's complex-part operators. Appended, because `define_ids!` numbers
     // entries by table position. Both spellings of each, as gcc accepts.
     (REAL_KW,           "__real__",          RESERVED_NAME),
@@ -1616,6 +1619,8 @@ mod tests {
             "__target__",
             "target_clones",
             "__target_clones__",
+            "optimize",
+            "__optimize__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

@@ -180,23 +180,24 @@ enum FsOwners {
     /// Owners may be mapped -- reported from a mount option, an id map or a squash rule rather
     /// than from who made the object -- or may be stored for real, depending on the mount:
     /// NFS (root_squash or not), FUSE (sshfs with or without idmap, mergerfs, ceph-fuse, ...),
-    /// cifs/smb (`uid=` or unix extensions).
+    /// cifs/smb (`uid=` or unix extensions), ntfs3 (mount options, or the per-file WSL owner
+    /// and mode it stores).
     MayBeMapped,
-    /// No owner is stored at all; every object reports the mount's owner: msdos/vfat, exfat,
-    /// ntfs and ntfs3.
+    /// No owner is stored at all; every object reports the mount's owner: msdos/vfat, exfat and
+    /// the classic ntfs driver.
     None,
 }
 
 /// How the filesystem holding `fd` keeps owners, from its `fstatfs` type.
 #[cfg(target_os = "linux")]
 fn fs_owners(fd: libc::c_int) -> FsOwners {
-    const OWNERLESS_FS: [u64; 4] = [
+    const OWNERLESS_FS: [u64; 3] = [
         0x4d44,      // MSDOS_SUPER_MAGIC (msdos, vfat)
         0x2011_bab0, // EXFAT_SUPER_MAGIC
         0x5346_544e, // NTFS_SB_MAGIC
-        0x7366_746e, // ntfs3
     ];
-    const MAYBE_MAPPED_FS: [u64; 5] = [
+    const MAYBE_MAPPED_FS: [u64; 6] = [
+        0x7366_746e, // ntfs3: stores a WSL owner and mode per file ($LXUID, $LXGID, $LXMOD)
         0xff53_4d42, // CIFS_SUPER_MAGIC
         0xfe53_4d42, // SMB2_SUPER_MAGIC
         0x517b,      // SMB_SUPER_MAGIC
@@ -242,11 +243,12 @@ pub enum MadeTrust {
 /// Owned by cp's effective user: accepted, in full. Otherwise only in a parent cp's user does
 /// not own, and only when the object is owned like that parent, on a filesystem whose type says
 /// owners may not be what each creator was:
-/// - msdos/vfat, exfat, ntfs, ntfs3 store no owner at all, so every object reports the mount's
-///   owner and nothing about ownership can be learned or conferred (a -p chown there fails and
-///   drops set-user-ID): accepted in full.
-/// - NFS, FUSE and cifs/smb may map owners (root_squash, sshfs without idmap, `uid=`) -- or may
-///   store them for real (NFS without squashing, sshfs with idmap, mergerfs, ceph-fuse). In the
+/// - msdos/vfat, exfat and the classic ntfs driver store no owner at all, so every object
+///   reports the mount's owner and nothing about ownership can be learned or conferred (a -p
+///   chown there fails and drops set-user-ID): accepted in full.
+/// - NFS, FUSE, cifs/smb and ntfs3 may map owners (root_squash, sshfs without idmap, `uid=`)
+///   -- or may store them for real (NFS without squashing, sshfs with idmap, mergerfs,
+///   ceph-fuse, ntfs3's per-file WSL owner). In the
 ///   second case someone who can write the parent but does not own it can rename in an object
 ///   of the parent owner's (an empty directory, a symbolic link, a FIFO or device node with one
 ///   link), which cp cannot tell from its own. Such an object is still accepted, so that copying

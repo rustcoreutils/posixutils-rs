@@ -1087,13 +1087,10 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             let path_str = ctx.path.to_string_lossy();
             EvalResult::new(fnmatch(pattern, &path_str, *fold))
         }
-        Primary::Type(ft) => {
-            // `-type l` asks about the entry itself, followed or not
-            if *ft == FileTypeMatch::Symlink {
-                return EvalResult::new(ctx.is_symlink);
-            }
-            EvalResult::new(ft.matches(&ctx.metadata.file_type()))
-        }
+        // POSIX -H/-L: a symbolic link that is followed has the type of the
+        // file it references, so `-type l` matches only a link that could
+        // not be followed (the walk then hands over the link's own metadata).
+        Primary::Type(ft) => EvalResult::new(ft.matches(&ctx.metadata.file_type())),
         Primary::Perm(mode) => {
             let file_mode = ctx.metadata.mode() & 0o7777;
             let matched = match mode {

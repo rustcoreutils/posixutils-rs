@@ -847,6 +847,52 @@ fn find_ok_honors_locale_yesexpr() {
     );
 }
 
+/// POSIX -H/-L: the file type evaluated for a symbolic link that is followed
+/// is that of the file it references, so `-type l` is true only for a link
+/// that cannot be followed (dangling, or a loop). It used to be true for
+/// every symbolic link, followed or not.
+#[test]
+fn find_type_l_under_follow() {
+    let dir = scratch_dir("type_l_follow");
+    std::fs::create_dir(dir.join("d")).unwrap();
+    File::create(dir.join("d/f")).unwrap();
+    std::os::unix::fs::symlink("f", dir.join("d/to_file")).unwrap();
+    std::os::unix::fs::symlink("nowhere", dir.join("d/dangling")).unwrap();
+    std::os::unix::fs::symlink("d", dir.join("to_dir")).unwrap();
+    let p = |s: &str| dir.join(s).to_string_lossy().into_owned();
+    let (d, to_dir) = (p("d"), p("to_dir"));
+
+    run_test_find_sorted(&["-L", &d, "-type", "l"], &[&p("d/dangling")], "", 0);
+    run_test_find_sorted(
+        &["-L", &d, "-type", "f"],
+        &[&p("d/f"), &p("d/to_file")],
+        "",
+        0,
+    );
+    // -H follows the operand only: it is a directory, its links are links.
+    run_test_find_sorted(
+        &["-H", &to_dir, "-type", "l"],
+        &[&p("to_dir/dangling"), &p("to_dir/to_file")],
+        "",
+        0,
+    );
+    run_test_find_sorted(
+        &["-H", &to_dir, "-maxdepth", "0", "-type", "d"],
+        &[&to_dir],
+        "",
+        0,
+    );
+    // -P: every symbolic link is one.
+    run_test_find_sorted(
+        &[&d, "-type", "l"],
+        &[&p("d/dangling"), &p("d/to_file")],
+        "",
+        0,
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_find_operator_without_operand() {
     // An operator with nothing after it is a syntax error, in GNU find's

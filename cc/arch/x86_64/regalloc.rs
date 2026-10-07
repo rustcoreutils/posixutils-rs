@@ -770,6 +770,11 @@ pub struct RegAlloc {
     /// How the target obtains a thread-local's address, which decides what a
     /// `TlsAddr` clobbers. Set with [`RegAlloc::with_tls_access`].
     tls_access: crate::target::TlsAccess,
+    /// Whether the function gets a stack-protector canary; set with
+    /// [`RegAlloc::with_stack_guard`].
+    guard_requested: bool,
+    /// The canary's slot: the frame's first, so above every other local.
+    guard_slot: Option<i32>,
     /// How many GP argument registers the **named** parameters consumed, capped
     /// at the register file size. `va_start` needs this to seed `gp_offset`.
     named_gp_regs: usize,
@@ -1133,7 +1138,21 @@ impl RegAlloc {
             max_local_align: 8,
             frame_base: FrameBase::Rbp,
             tls_access: crate::target::TlsAccess::ElfStatic,
+            guard_requested: false,
+            guard_slot: None,
         }
+    }
+
+    /// An allocator that reserves a stack-protector canary slot when
+    /// `guarded`; see `arch::stack_protect`.
+    pub fn with_stack_guard(mut self, guarded: bool) -> Self {
+        self.guard_requested = guarded;
+        self
+    }
+
+    /// The canary's slot, if [`RegAlloc::with_stack_guard`] asked for one.
+    pub fn stack_guard_slot(&self) -> Option<i32> {
+        self.guard_slot
     }
 
     /// Perform register allocation for a function
@@ -1152,6 +1171,9 @@ impl RegAlloc {
             // The prologue writes it, so the function must save it.
             self.used_callee_saved.push(base);
         }
+        // Before any other slot: the first is the highest, nearest the saved
+        // registers, which is where the canary has to be.
+        self.guard_slot = self.guard_requested.then(|| self.new_frame_slot(8, 8));
         let win64 = func.conv == crate::abi::CallingConv::Win64;
         if win64 {
             self.used_callee_saved
@@ -2061,9 +2083,11 @@ impl RegAlloc {
     /// Give every local its frame slot; see `arch::regalloc::place_locals`.
     fn place_locals(&mut self, func: &Function, types: &TypeTable, intervals: &[LiveInterval]) {
         let pos = self.func_pos;
-        let placed = crate::arch::regalloc::place_locals(func, types, pos, intervals, |b, a| {
-            self.new_frame_slot(b, a)
-        });
+        let guarded = self.guard_requested;
+        let placed =
+            crate::arch::regalloc::place_locals(func, types, pos, intervals, guarded, |b, a| {
+                self.new_frame_slot(b, a)
+            });
         for (local, offset) in placed {
             self.locations.insert(local, Loc::Stack(offset));
             if func.local_of(local).is_some_and(|l| types.is_float(l.typ)) {

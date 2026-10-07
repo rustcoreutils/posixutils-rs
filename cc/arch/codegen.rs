@@ -152,6 +152,8 @@ pub struct CodeGenBase<I: LirInst> {
     pub cf_protection: crate::target::CfProtection,
     /// `-fstack-clash-protection`; see [`CodeGenBase::check_stack_clash`].
     pub stack_clash: bool,
+    /// `-fstack-protector` and its levels; see `arch::stack_protect`.
+    pub stack_protector: crate::target::StackProtector,
     /// Trailing comments to hang off individual LIR instructions, by their
     /// index in `lir_buffer`.
     ///
@@ -190,6 +192,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             verbose_asm: false,
             cf_protection: crate::target::CfProtection::default(),
             stack_clash: false,
+            stack_protector: crate::target::StackProtector::Off,
             lir_comments: std::collections::HashMap::new(),
             value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
@@ -1270,6 +1273,9 @@ pub trait CodeGenerator {
 
     /// Set `-fstack-clash-protection`.
     fn set_stack_clash(&mut self, on: bool);
+
+    /// Set the `-fstack-protector` level.
+    fn set_stack_protector(&mut self, level: crate::target::StackProtector);
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit

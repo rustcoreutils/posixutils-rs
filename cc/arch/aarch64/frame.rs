@@ -46,9 +46,12 @@ impl Aarch64CodeGen {
         }
 
         // Register allocation
+        let guarded = crate::arch::stack_protect::protects(func, types, self.base.stack_protector);
         let mut alloc = RegAlloc::new(StackedArgs::of(&self.base.target))
-            .with_tls_access(self.base.tls_access());
+            .with_tls_access(self.base.tls_access())
+            .with_stack_guard(guarded);
         self.locations = alloc.allocate(func, types);
+        self.stack_guard = alloc.stack_guard_slot();
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
         self.sym_slots = crate::arch::codegen::sym_slots(func, types);
@@ -137,6 +140,7 @@ impl Aarch64CodeGen {
         self.base.check_stack_clash(func, total_frame as i64);
 
         self.emit_frame_base_latch();
+        self.emit_stack_guard_set();
 
         // For variadic functions on Linux/FreeBSD, save argument registers
         if is_variadic && !is_darwin {
@@ -1463,6 +1467,8 @@ impl Aarch64CodeGen {
             }
         }
 
+        self.emit_stack_guard_check();
+
         // An epilogue can sit mid-function, with more of the body after it,
         // so its rules are bracketed: the body's come back after the `ret`.
         self.push_cfi(Directive::CfiRememberState);
@@ -1577,5 +1583,78 @@ impl Aarch64CodeGen {
         }
         self.push_lir(Aarch64Inst::Ret);
         self.push_cfi(Directive::CfiRestoreState);
+    }
+
+    /// Load the stack-protector guard into `dst`: the global
+    /// `__stack_chk_guard`, through the GOT on every OS. glibc defines it
+    /// in the dynamic loader, where only the GOT reaches it, and gcc's
+    /// PIC sequence is this one.
+    fn emit_load_stack_guard(&mut self, dst: Reg) {
+        let sym = Symbol::extern_sym(crate::arch::stack_protect::GUARD_SYMBOL);
+        self.push_lir(Aarch64Inst::AdrpGotPage {
+            sym: sym.clone(),
+            dst,
+        });
+        self.push_lir(Aarch64Inst::LdrSymGotPageOff {
+            sym,
+            base: dst,
+            dst,
+        });
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: MemAddr::Base(dst),
+            dst,
+        });
+    }
+
+    /// Copy the guard into the canary slot, after the prologue, through the
+    /// scratch X16, which is cleared after.
+    fn emit_stack_guard_set(&mut self) {
+        let Some(slot) = self.stack_guard else {
+            return;
+        };
+        self.emit_load_stack_guard(Reg::X16);
+        self.push_lir(Aarch64Inst::Str {
+            size: OperandSize::B64,
+            src: Reg::X16,
+            addr: self.stack_mem(slot),
+        });
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Xzr),
+            dst: Reg::X16,
+        });
+    }
+
+    /// Compare the canary with the guard before an epilogue, and call
+    /// `__stack_chk_fail` -- which does not return -- when they differ. The
+    /// return value is already in its registers, so only the scratch X16
+    /// and X17 and the flags are written.
+    fn emit_stack_guard_check(&mut self) {
+        let Some(slot) = self.stack_guard else {
+            return;
+        };
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: self.stack_mem(slot),
+            dst: Reg::X16,
+        });
+        self.emit_load_stack_guard(Reg::X17);
+        self.push_lir(Aarch64Inst::Cmp {
+            size: OperandSize::B64,
+            src1: Reg::X16,
+            src2: GpOperand::Reg(Reg::X17),
+        });
+        let intact = self.next_unique_label("ssp_ok");
+        self.push_lir(Aarch64Inst::BCond {
+            cond: CondCode::Eq,
+            target: intact.clone(),
+        });
+        self.push_lir(Aarch64Inst::Bl {
+            target: crate::arch::lir::CallTarget::Direct(Symbol::global(
+                crate::arch::stack_protect::FAIL_SYMBOL,
+            )),
+        });
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(intact)));
     }
 }

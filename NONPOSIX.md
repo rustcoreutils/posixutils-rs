@@ -101,7 +101,7 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
    `-shared`, `-Wl,`, `-Xlinker`, `-pthread`, `-rdynamic`, `-pipe`, `-p`/`-pg`,
    and `-ffreestanding`/`-fhosted`.  The `-f*` options it knows are
    classified in `cc/f_options.rs`; one gcc would do something with that
-   c17 does not (`-fstack-protector*`, `-fsanitize=`, ...) draws the warning
+   c17 does not (`-fsanitize=`, `-ftrapv`, ...) draws the warning
    group `-Wc17-unsupported-option`, which plain `-Werror` leaves a warning,
    and an unknown one is refused as gcc refuses it.
  * A bare `-` operand is accepted as a pathname.  POSIX says standard input is

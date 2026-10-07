@@ -84,6 +84,8 @@ pub struct CodegenOptions<'a> {
     pub cf_protection: crate::target::CfProtection,
     /// `-fstack-clash-protection`.
     pub stack_clash: bool,
+    /// `-fstack-protector` and its levels.
+    pub stack_protector: crate::target::StackProtector,
     /// The name DWARF records for the primary source file.
     pub source_name: &'a str,
     /// `-fdebug-prefix-map`: rewrites every path the debug information and
@@ -293,6 +295,7 @@ pub fn compile_tokens(
         opts.cf_protection,
         opts.stack_clash,
     );
+    codegen.set_stack_protector(opts.stack_protector);
     let asm = codegen.generate(&module, &types);
 
     // Codegen can diagnose too. Inline asm is the case that reaches here: a

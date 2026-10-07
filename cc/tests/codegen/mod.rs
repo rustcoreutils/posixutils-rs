@@ -52,6 +52,7 @@ mod regalloc;
 mod scaling;
 mod sections;
 mod simd_headers;
+mod stack_protector;
 mod stacked_args;
 mod storage_order;
 mod symbols;

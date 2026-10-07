@@ -82,6 +82,8 @@ pub struct Aarch64CodeGen {
     /// Bytes the prologue allocates for locals: what a dynamically aligned
     /// frame addresses them from.
     pub(super) stack_alloc_size: i32,
+    /// The stack-protector canary's slot, when this function has one.
+    pub(super) stack_guard: Option<LocalSlot>,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     pub(super) sym_slots: HashMap<PseudoId, crate::arch::codegen::SymSlot>,
     /// Which register this function's locals are addressed through
@@ -108,6 +110,7 @@ impl Aarch64CodeGen {
             pic_mode: false,
             unique_label_counter: 0,
             stack_alloc_size: 0,
+            stack_guard: None,
             sym_slots: HashMap::new(),
             frame_base: FrameBase::Fp,
         }
@@ -1471,6 +1474,10 @@ impl CodeGenerator for Aarch64CodeGen {
 
     fn set_stack_clash(&mut self, on: bool) {
         self.base.stack_clash = on;
+    }
+
+    fn set_stack_protector(&mut self, level: crate::target::StackProtector) {
+        self.base.stack_protector = level;
     }
 }
 

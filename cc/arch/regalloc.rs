@@ -897,11 +897,17 @@ pub fn local_slot(
 /// on the near side of it. A local takes an earlier one's slot when the two
 /// agree in size and alignment and its interval -- its lifetime, see
 /// `local_lifetimes` -- overlaps none the slot has held.
+///
+/// A function with a stack-protector canary (`guarded`) lays its arrays out
+/// first, `char` arrays before the rest, as gcc does: the canary is the slot
+/// before them, so an array that overruns reaches it without passing over a
+/// scalar the function may still read before it returns.
 pub fn place_locals(
     func: &Function,
     types: &TypeTable,
     pos: crate::diag::Position,
     intervals: &[LiveInterval],
+    guarded: bool,
     mut new_slot: impl FnMut(i32, i32) -> i32,
 ) -> Vec<(PseudoId, i32)> {
     struct Shared {
@@ -919,7 +925,11 @@ pub fn place_locals(
         .values()
         .filter(|l| lifetime.contains_key(&l.sym))
         .collect();
-    locals.sort_by_key(|l| l.sym.0);
+    if guarded {
+        locals.sort_by_key(|l| (crate::arch::stack_protect::placement(l.typ, types), l.sym.0));
+    } else {
+        locals.sort_by_key(|l| l.sym.0);
+    }
     let mut slots: Vec<Shared> = Vec::new();
     let mut placed = Vec::with_capacity(locals.len());
     for local in locals {

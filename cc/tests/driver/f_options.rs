@@ -36,9 +36,6 @@ fn compile_in(dir: &Path, path: &Path, flags: &[&str]) -> crate::common::C17Run 
 
 const CLEAN: &str = "int main(void) { return 0; }\n";
 
-/// The stack protector's warning, which c17 gives once per run.
-const NO_SSP: &str = "c17: warning: '-fstack-protector-strong' is not supported; ignored\n";
-
 /// Debian trixie's `dpkg-buildflags --get CFLAGS`, and Ubuntu 24.04's.
 const DEBIAN: &[&str] = &[
     "-g",
@@ -66,12 +63,12 @@ const UBUNTU: &[&str] = &[
     "-fcf-protection",
 ];
 
-/// A distribution's default flags compile under plain `-Werror`, which they
-/// once failed: every `-f` c17 did not know was an "unrecognized option"
-/// that `-Werror` made an error. What is left is the stack protector's
-/// warning, once, which `-Werror` does not reach and `-w` silences. The
-/// stack-clash protection says nothing for a function whose stack needs no
-/// probe.
+/// A distribution's default flags compile under plain `-Werror` in silence.
+/// They once failed: every `-f` c17 did not know was an "unrecognized
+/// option" that `-Werror` made an error, and then `-fstack-protector-strong`
+/// warned on every compile, which a build comparing a recipe's stderr (GNU
+/// make's own test suite) reads as a failure. The stack-clash protection
+/// says nothing for a function whose stack needs no probe.
 #[test]
 fn distribution_flags_compile_under_werror() {
     let (dir, path) = scratch("t.c", CLEAN);
@@ -82,16 +79,55 @@ fn distribution_flags_compile_under_werror() {
         args.push("-Werror");
         let r = compile_in(dir.path(), &path, &args);
         assert!(r.success, "{flags:?}: {}", r.stderr);
-        assert_eq!(r.stderr, NO_SSP, "{flags:?}");
+        assert_eq!(r.stderr, "", "{flags:?}");
+    }
+}
 
-        args.push("-w");
-        let r = compile_in(dir.path(), &path, &args);
+/// The stack protector's levels predefine gcc's macros, the last level
+/// named winning and `-fno-stack-protector` withdrawing them all.
+#[test]
+fn stack_protector_macros() {
+    let (dir, path) = scratch("m.c", "");
+    let out = dir.path().join("m.i");
+    for (flags, want) in [
+        (&[][..], ""),
+        (&["-fstack-protector"][..], "#define __SSP__ 1\n"),
+        (
+            &["-fstack-protector-strong"][..],
+            "#define __SSP_STRONG__ 3\n",
+        ),
+        (&["-fstack-protector-all"][..], "#define __SSP_ALL__ 2\n"),
+        (
+            &["-fstack-protector-explicit"][..],
+            "#define __SSP_EXPLICIT__ 4\n",
+        ),
+        (&["-fstack-protector-all", "-fno-stack-protector"][..], ""),
+        (
+            &["-fstack-protector-all", "-fstack-protector"][..],
+            "#define __SSP__ 1\n",
+        ),
+        (
+            &["-fno-stack-protector", "-fstack-protector-strong"][..],
+            "#define __SSP_STRONG__ 3\n",
+        ),
+    ] {
+        let mut args = flags.to_vec();
+        args.extend([
+            "-dM",
+            "-E",
+            "-o",
+            out.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ]);
+        let r = run_c17(&args);
         assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
-
-        args.pop();
-        args.push("-Wno-c17-unsupported-option");
-        let r = compile_in(dir.path(), &path, &args);
-        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+        let defs = std::fs::read_to_string(&out).expect("read -dM output");
+        let ssp: String = defs
+            .lines()
+            .filter(|l| l.contains("__SSP"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(ssp, want, "{flags:?}");
     }
 }
 
@@ -170,23 +206,14 @@ fn unsupported_option_warns() {
         "c17: warning: '-fsanitize=address' is not supported; ignored\n"
     );
 
-    let r = compile_in(
-        dir.path(),
-        &path,
-        &["-fstack-protector", "-fstack-protector-strong", "-Werror"],
-    );
+    let r = compile_in(dir.path(), &path, &["-fcommon", "-fcommon", "-Werror"]);
     assert!(r.success, "{}", r.stderr);
-    assert_eq!(r.stderr, NO_SSP);
-
-    let r = compile_in(
-        dir.path(),
-        &path,
-        &[
-            "-fstack-protector-strong",
-            "-fno-stack-protector",
-            "-fcommon",
-        ],
+    assert_eq!(
+        r.stderr,
+        "c17: warning: '-fcommon' is not supported; ignored\n"
     );
+
+    let r = compile_in(dir.path(), &path, &["-ftrapv", "-fno-trapv", "-fcommon"]);
     assert!(r.success, "{}", r.stderr);
     assert_eq!(
         r.stderr,

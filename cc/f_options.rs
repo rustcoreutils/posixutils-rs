@@ -194,7 +194,9 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-signed-zeros", Accepted(Permission)),
     // Withdraws `-fstack-clash-protection`; the driver takes both.
     ("no-stack-clash-protection", Implemented),
-    ("no-stack-protector", Accepted(Default)),
+    // The stack protector's levels and their withdrawal:
+    // `target::StackProtector`.
+    ("no-stack-protector", Implemented),
     // c17 does not assume aliasing by type: a store through `float *`
     // reloads an `int` read through `int *`.
     ("no-strict-aliasing", Accepted(Default)),
@@ -261,11 +263,10 @@ const PLAIN: &[(&str, Effect)] = &[
     // gcc would probe: one whose frame reaches the guard, or that
     // allocates on the stack dynamically. Other functions need no probe.
     ("stack-clash-protection", Implemented),
-    // Hardening: no canary is placed or checked.
-    ("stack-protector", Unsupported),
-    ("stack-protector-all", Unsupported),
-    ("stack-protector-explicit", Unsupported),
-    ("stack-protector-strong", Unsupported),
+    ("stack-protector", Implemented),
+    ("stack-protector-all", Implemented),
+    ("stack-protector-explicit", Implemented),
+    ("stack-protector-strong", Implemented),
     ("strict-aliasing", Accepted(Permission)),
     ("strict-overflow", Accepted(Permission)),
     // Main driver: check, write nothing. libxcrypt's symbol-version probe.
@@ -481,15 +482,9 @@ fn check_value(stem: &str, kind: Value, value: &str, effect: Effect) -> Verdict 
 }
 
 /// The name of what an option asks for, so that a later `-fno-<family>`
-/// can withdraw it: the stack protector's levels are one request, and an
-/// option with a value is a request for that stem.
+/// can withdraw it: an option with a value is a request for that stem.
 pub fn family(name: &str) -> &str {
-    let stem = name.split_once('=').map_or(name, |(stem, _)| stem);
-    if stem.starts_with("stack-protector") {
-        "stack-protector"
-    } else {
-        stem
-    }
+    name.split_once('=').map_or(name, |(stem, _)| stem)
 }
 
 #[cfg(test)]
@@ -516,7 +511,7 @@ mod tests {
         for (name, effect) in [
             // Debian trixie and Ubuntu 24.04 `dpkg-buildflags`.
             ("file-prefix-map=/build=.", Implemented),
-            ("stack-protector-strong", Unsupported),
+            ("stack-protector-strong", Implemented),
             ("stack-clash-protection", Implemented),
             ("cf-protection", Implemented),
             ("no-omit-frame-pointer", Accepted(Default)),
@@ -610,8 +605,6 @@ mod tests {
 
     #[test]
     fn families() {
-        assert_eq!(family("stack-protector-strong"), "stack-protector");
-        assert_eq!(family("stack-protector"), "stack-protector");
         assert_eq!(family("sanitize=address"), "sanitize");
         assert_eq!(family("pack-struct=4"), "pack-struct");
         assert_eq!(family("trapv"), "trapv");

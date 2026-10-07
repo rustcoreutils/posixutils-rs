@@ -480,6 +480,16 @@ struct Args {
     /// function whose stack gcc would probe.
     #[arg(long = "c17-stack-clash", hide = true)]
     stack_clash: bool,
+
+    /// The last of `-fstack-protector`, its levels and `-fno-stack-protector`
+    /// (rewritten by `preprocess_args_from`), as its `-f` name.
+    #[arg(
+        long = "c17-stack-protector",
+        hide = true,
+        value_name = "option",
+        value_parser = parse_stack_protector
+    )]
+    stack_protector: Option<target::StackProtector>,
 }
 
 /// The `-Wno-` name for the "`-std=` was not honoured" warning.
@@ -1345,6 +1355,7 @@ fn process_file(
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
         stack_clash: args.stack_clash,
+        stack_protector: args.stack_protector.unwrap_or_default(),
         source_name: path,
         debug_prefix_map: &prefix_maps.debug,
     };
@@ -1675,6 +1686,12 @@ fn parse_cf_protection(s: &str) -> Result<target::CfProtection, String> {
     target::CfProtection::from_level(s).ok_or_else(|| format!("invalid cf-protection level '{s}'"))
 }
 
+/// The value of the internal `--c17-stack-protector` option: the `-f` name
+/// of a stack-protector level.
+fn parse_stack_protector(s: &str) -> Result<target::StackProtector, String> {
+    target::StackProtector::from_option(s).ok_or_else(|| format!("not a stack protector: '{s}'"))
+}
+
 /// The value of the internal `--c17-pic` option: a member of the `-fpic`
 /// family, in its gcc spelling.
 fn parse_pic_flag(s: &str) -> Result<target::PositionIndependence, String> {
@@ -1799,6 +1816,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut unsupported: Vec<(String, String)> = Vec::new();
     // `-fstack-clash-protection`, last one wins.
     let mut stack_clash = false;
+    // `-fstack-protector`, its levels and `-fno-stack-protector`: last wins.
+    let mut stack_protector = None;
     // The `-W<name>` and `-f<name>` options refused as gcc refuses them: by
     // its driver, and -- only if the driver let everything through -- by
     // its compiler.
@@ -2029,6 +2048,12 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-fstack-clash-protection" || arg == "-fno-stack-clash-protection" {
             stack_clash = arg == "-fstack-clash-protection";
             i += 1;
+        } else if let Some(level) = arg
+            .strip_prefix("-f")
+            .and_then(target::StackProtector::from_option)
+        {
+            stack_protector = Some(level);
+            i += 1;
         } else if arg.starts_with("-fuse-ld=")
             && f_options::classify(&arg[2..]) == f_options::Verdict::Known(Effect::Implemented)
         {
@@ -2232,6 +2257,14 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     );
     if stack_clash {
         trailer.push("--c17-stack-clash".to_string());
+    }
+    if let Some(level) = stack_protector {
+        trailer.push(format!("--c17-stack-protector={}", level.option()));
+        // gcc's `__SSP__` family, defined as gcc defines it.
+        if let Some((name, value)) = level.predefined_macro() {
+            trailer.push("-D".to_string());
+            trailer.push(format!("{name}={value}"));
+        }
     }
     if debug == Some(true) {
         trailer.push("-g".to_string());
@@ -3703,13 +3736,7 @@ mod tests {
     /// withdrawing it.
     #[test]
     fn test_preprocess_unsupported_f_flags_are_kept_for_the_warning() {
-        for flag in &[
-            "-fstack-protector",
-            "-fstack-protector-strong",
-            "-fstack-protector-all",
-            "-fsanitize=address",
-            "-fcommon",
-        ] {
+        for flag in &["-fsanitize=address", "-fcommon", "-ftrapv"] {
             let result = run_preprocess(&[flag, "foo.c"]);
             assert!(
                 result.contains(&format!("--c17-unsupported={flag}")),
@@ -3724,14 +3751,52 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            unsupported(&["-fstack-protector", "-fstack-protector-strong"]),
-            ["--c17-unsupported=-fstack-protector-strong"]
+            unsupported(&["-fsanitize=address", "-fsanitize=undefined"]),
+            ["--c17-unsupported=-fsanitize=undefined"]
         );
-        assert!(unsupported(&["-fstack-protector-all", "-fno-stack-protector"]).is_empty());
+        assert!(unsupported(&["-ftrapv", "-fno-trapv"]).is_empty());
         assert_eq!(
-            unsupported(&["-fno-stack-protector", "-fstack-protector"]),
-            ["--c17-unsupported=-fstack-protector"]
+            unsupported(&["-fno-trapv", "-ftrapv"]),
+            ["--c17-unsupported=-ftrapv"]
         );
+    }
+
+    /// The stack protector's options become one, the last named winning,
+    /// with gcc's macro for the level, and `-fno-stack-protector` leaves
+    /// neither a level nor a macro.
+    #[test]
+    fn test_preprocess_stack_protector_last_wins() {
+        let ssp = |args: &[&str]| -> Vec<String> {
+            run_preprocess(args)
+                .into_iter()
+                .filter(|a| a.starts_with("--c17-stack-protector=") || a.starts_with("__SSP"))
+                .collect()
+        };
+        assert_eq!(
+            ssp(&["-fstack-protector", "-fstack-protector-strong", "foo.c"]),
+            [
+                "--c17-stack-protector=stack-protector-strong",
+                "__SSP_STRONG__=3"
+            ]
+        );
+        assert_eq!(
+            ssp(&["-fstack-protector-all", "-fno-stack-protector", "foo.c"]),
+            ["--c17-stack-protector=no-stack-protector"]
+        );
+        assert_eq!(
+            ssp(&[
+                "-fno-stack-protector",
+                "-fstack-protector-explicit",
+                "foo.c"
+            ]),
+            [
+                "--c17-stack-protector=stack-protector-explicit",
+                "__SSP_EXPLICIT__=4"
+            ]
+        );
+        assert!(ssp(&["foo.c"]).is_empty());
+        let args = Args::parse_from(run_preprocess(&["-fstack-protector-all", "foo.c"]));
+        assert_eq!(args.stack_protector, Some(target::StackProtector::All));
     }
 
     /// What c17's output already is is taken in silence, and leaves nothing
@@ -4094,8 +4159,8 @@ mod tests {
         assert!(!result.contains(&"-fvisibility=hidden".to_string()));
         assert!(!result.contains(&"-fno-semantic-interposition".to_string()));
         assert!(!result.contains(&"-fno-plt".to_string()));
-        // The stack protector c17 does not provide is kept for its warning.
-        assert!(result.contains(&"--c17-unsupported=-fstack-protector-strong".to_string()));
+        assert!(result.contains(&"--c17-stack-protector=stack-protector-strong".to_string()));
+        assert!(!result.iter().any(|a| a.starts_with("--c17-unsupported=")));
         assert!(!result.contains(&"-pipe".to_string()));
         // Linker flags should be passed through
         assert!(result.iter().any(|a| a.starts_with("--c17-linker-flag=")));

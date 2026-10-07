@@ -47,6 +47,8 @@ pub struct X86_64CodeGen {
     /// Bytes the prologue allocates for locals: what a dynamically aligned
     /// frame addresses them from.
     pub(super) stack_alloc_size: i32,
+    /// The stack-protector canary's slot, when this function has one.
+    pub(super) stack_guard: Option<i32>,
     /// Offset from rbp to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i32,
     /// GP argument registers the named parameters consumed, for `va_start`'s
@@ -117,6 +119,7 @@ impl X86_64CodeGen {
             callee_saved_regs: Vec::new(),
             callee_saved_offset: 0,
             stack_alloc_size: 0,
+            stack_guard: None,
             reg_save_area_offset: 0,
             named_gp_regs: 0,
             named_fp_regs: 0,
@@ -1787,5 +1790,9 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_stack_clash(&mut self, on: bool) {
         self.base.stack_clash = on;
+    }
+
+    fn set_stack_protector(&mut self, level: crate::target::StackProtector) {
+        self.base.stack_protector = level;
     }
 }

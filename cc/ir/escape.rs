@@ -91,7 +91,11 @@ impl EscapeInfo {
 /// arm is the point: anything not recognized as an access or as another way
 /// of holding the address counts as an escape, so an opcode this does not
 /// model fails closed.
-fn escapes(func: &Function, sym: PseudoId) -> bool {
+///
+/// Also `-fstack-protector-strong`'s "a local whose address is taken"
+/// (`arch::stack_protect`): an address used only to reach the object's
+/// members, as `s.a = 1` does, is not taken in gcc's sense either.
+pub(crate) fn escapes(func: &Function, sym: PseudoId) -> bool {
     let mut holders: HashSet<PseudoId> = HashSet::new();
     holders.insert(sym);
     let mut work = vec![sym];

@@ -293,9 +293,11 @@ fn preserve_through_fd(
     Ok(())
 }
 
-/// The source's metadata as it is now (reading it may have moved its access time), through the
-/// directory descriptor the walk used, and required to be the very file the walk recorded: an
-/// entry swapped since must not lend its owner and mode to the copy.
+/// The source's metadata as it is now, through the directory descriptor the walk used, and
+/// required to be the very file the walk recorded: an entry swapped since must not lend its
+/// owner and mode to the copy. Used for symbolic links and special files, whose data cp does
+/// not read (a regular file's times come from its descriptor before the read, a directory's
+/// from the walk's stat before the walk read it).
 fn fresh_source_md(source: &ftw::Entry) -> io::Result<ftw::Metadata> {
     let changed = || io::Error::other(gettext!("'{}' changed during the copy", source.path()));
     let recorded = source.metadata().ok_or_else(changed)?;
@@ -721,9 +723,11 @@ where
             } else {
                 libc::O_EXCL
             };
-        // Returns the source and the new destination, both still open, or `None` for a -n skip.
-        let create_target_then_copy = || -> io::Result<Option<(fs::File, fs::File)>> {
-            let mut source_file = open_source(source, source_md, source_open_flags)?;
+        // Returns the source's metadata from before the read, and the new destination, still
+        // open; or `None` for a -n skip.
+        let create_target_then_copy = || -> io::Result<Option<(fs::Metadata, fs::File)>> {
+            let (mut source_file, source_before_read) =
+                open_source(source, source_md, source_open_flags)?;
 
             // 3.b. POSIX 90670-90671 asks for source_file's permission bits. The set-user-ID and
             // set-group-ID bits are masked off: the copy belongs to whoever ran cp, so carrying
@@ -772,7 +776,7 @@ where
             // 3.d
             io::copy(&mut source_file, &mut target_file)?;
 
-            Ok(Some((source_file, target_file)))
+            Ok(Some((source_before_read, target_file)))
         };
 
         // -n: any existing destination, a dangling link included, is left alone.
@@ -935,7 +939,7 @@ where
             )));
         }
 
-        let (source_file, target_file) = if replacing_existing {
+        let (source_before_read, target_file) = if replacing_existing {
             if target_is_dir {
                 let err_str = gettext!(
                     "cannot overwrite directory '{}' with non-directory '{}'",
@@ -947,7 +951,8 @@ where
 
             // 3.a.ii. Open the source first: truncating the destination before knowing the
             // source can be read destroyed its contents and then reported a failure.
-            let mut source_file = open_source(source, source_md, source_open_flags)?;
+            let (mut source_file, source_before_read) =
+                open_source(source, source_md, source_open_flags)?;
 
             // Open what was checked above, and nothing else. A link is followed only when the
             // check saw one, which is now only the operand itself (POSIX writes through it);
@@ -1004,7 +1009,7 @@ where
                 }
 
                 io::copy(&mut source_file, &mut target_file)?;
-                (source_file, target_file)
+                (source_before_read, target_file)
             } else {
                 // 3.a.iii
                 if cfg.force {
@@ -1048,14 +1053,10 @@ where
         state.created_files.insert(target.to_path_buf());
 
         // -p through the descriptor just written, before it is closed; the source's metadata
-        // from its own descriptor, as it is after the read.
+        // from the fstat of the descriptor that was then read, taken before the read moved its
+        // access time (GNU keeps the original access time too).
         let preserve_error = if cfg.preserve {
-            source_file
-                .metadata()
-                .and_then(|source_md| {
-                    preserve_through_fd(target_file.as_raw_fd(), &source_md, target)
-                })
-                .err()
+            preserve_through_fd(target_file.as_raw_fd(), &source_before_read, target).err()
         } else {
             None
         };
@@ -1086,11 +1087,14 @@ fn same_file_type(opened: fs::FileType, walked: ftw::FileType) -> bool {
 /// before the identity check refuses it (`openat_guarded`, which also waits out a lease); the
 /// flag is then cleared for the copy. A FIFO or device
 /// the walk saw (copied as data without -R) is opened as before, blocking.
+///
+/// Also returns that descriptor's `fstat`, taken before anything is read from it: -p copies the
+/// access time it shows, not the one the read is about to set.
 fn open_source(
     source: &ftw::Entry,
     walked: &ftw::Metadata,
     flags: libc::c_int,
-) -> io::Result<fs::File> {
+) -> io::Result<(fs::File, fs::Metadata)> {
     let cannot_open = |e: &io::Error| {
         io::Error::other(gettext!(
             "cannot open '{}' for reading: {}",
@@ -1123,7 +1127,7 @@ fn open_source(
     if regular {
         clear_nonblock(fd).map_err(|e| cannot_open(&e))?;
     }
-    Ok(file)
+    Ok((file, opened))
 }
 
 /// `openat(dirfd, name, flags)`, with `O_NONBLOCK` added when `guard` is set so that a FIFO
@@ -1553,13 +1557,17 @@ where
             target_dir_path_borrowed.pop();
             let target_dir = target_dirfd_stack_borrowed.pop();
 
-            // Preserve metadata for directories. Must do this inside this closure to ensure no
-            // further last access time changes to the source will be made. Applied through the
-            // descriptor this copy has held for the directory since it entered it, never by
-            // name.
+            // Preserve metadata for directories, after their contents so nothing written into
+            // them moves their times afterwards. Applied through the descriptor this copy has
+            // held for the directory since it entered it, never by name. The source's metadata
+            // is what the walk recorded when it stat'ed the directory, before reading it: the
+            // read moved its access time, and GNU keeps the original too.
             if let (true, Some(target_dir)) = (cfg.preserve, target_dir) {
-                if let Err(e) = fresh_source_md(&source).and_then(|source_md| {
-                    preserve_through_fd(target_dir.as_raw_fd(), &source_md, &dir_path)
+                let recorded = source
+                    .metadata()
+                    .ok_or_else(|| io::Error::other(gettext!("cannot stat '{}'", source.path())));
+                if let Err(e) = recorded.and_then(|source_md| {
+                    preserve_through_fd(target_dir.as_raw_fd(), source_md, &dir_path)
                 }) {
                     // Same policy as the file case: never fatal, exit-status only for cp.
                     eprintln!("{}: {}", cfg.prog, error_string(&e));

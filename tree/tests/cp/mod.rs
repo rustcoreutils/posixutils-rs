@@ -1789,3 +1789,46 @@ fn test_cp_special_fifo_keeps_set_id_bits() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// `cp -p` gives the copy the source's access time as it was before cp read it, as GNU does.
+/// With an access time older than the modification time, `relatime` (and `strictatime`)
+/// update it on the read, so a time taken afterwards would be the time of the copy. Directories
+/// are read by the walk before their attributes are applied, so the same holds for them.
+#[test]
+fn test_cp_p_keeps_the_access_time_from_before_the_read() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let test_dir = &format!(
+        "{}/test_cp_p_keeps_the_access_time_from_before_the_read",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(format!("{test_dir}/dir")).unwrap();
+    fs::write(format!("{test_dir}/dir/file"), b"contents").unwrap();
+    let atime = UNIX_EPOCH + Duration::from_secs(978_307_200); // 2001
+    let mtime = UNIX_EPOCH + Duration::from_secs(1_009_843_200); // 2002
+    let times = fs::FileTimes::new().set_accessed(atime).set_modified(mtime);
+    for path in [format!("{test_dir}/dir/file"), format!("{test_dir}/dir")] {
+        fs::File::open(&path).unwrap().set_times(times).unwrap();
+    }
+
+    cp_test(
+        &[
+            "-pR",
+            &format!("{test_dir}/dir"),
+            &format!("{test_dir}/copy"),
+        ],
+        "",
+        "",
+        0,
+    );
+
+    for copy in [format!("{test_dir}/copy/file"), format!("{test_dir}/copy")] {
+        let md = fs::metadata(&copy).unwrap();
+        assert_eq!(md.atime(), 978_307_200, "access time of {copy}");
+        assert_eq!(md.mtime(), 1_009_843_200, "modification time of {copy}");
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

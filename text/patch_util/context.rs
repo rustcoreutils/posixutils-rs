@@ -40,7 +40,7 @@ pub fn parse_context(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
                 break;
             }
         } else if let Some(rest) = line.strip_prefix("Index: ") {
-            patch.index_path = Some(rest.trim().to_string());
+            patch.index_path = Some(rest.trim_ascii().to_string());
         }
         pos += 1;
     }

@@ -17,6 +17,7 @@ use clap::Parser;
 use gettextrs::gettext;
 use patch_util::{
     applier::PatchApplier,
+    bytes,
     file_ops::{
         delete_target, determine_target_file, read_file_lines, write_output, write_rejects,
     },
@@ -27,7 +28,7 @@ use std::{
     collections::HashSet,
     env,
     fs::File,
-    io::{self, BufReader, Read},
+    io::{self, Read},
     path::PathBuf,
     process::ExitCode,
 };
@@ -176,7 +177,7 @@ impl Args {
             remove_empty: self.remove_empty,
             force_context: self.context,
             directory: self.directory.clone(),
-            ifdef_define: self.ifdef_define.clone(),
+            ifdef_define: self.ifdef_define.as_deref().map(bytes::from_arg),
             force_ed: self.ed,
             patchfile: self.patchfile.clone(),
             loose_whitespace: self.loose,
@@ -198,23 +199,18 @@ impl Args {
     }
 }
 
-/// Read patch content from stdin or file.
+/// Read patch content from stdin or file, as patch text (see `bytes`).
 fn read_patch_input(config: &PatchConfig) -> io::Result<String> {
+    let mut content = Vec::new();
     match &config.patchfile {
         Some(path) => {
-            let file = File::open(path)?;
-            let mut reader = BufReader::new(file);
-            let mut content = String::new();
-            reader.read_to_string(&mut content)?;
-            Ok(content)
+            File::open(path)?.read_to_end(&mut content)?;
         }
         None => {
-            let stdin = io::stdin();
-            let mut content = String::new();
-            stdin.lock().read_to_string(&mut content)?;
-            Ok(content)
+            io::stdin().lock().read_to_end(&mut content)?;
         }
     }
+    Ok(bytes::decode(&content))
 }
 
 /// Main entry point.

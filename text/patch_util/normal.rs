@@ -31,7 +31,7 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
     while pos < lines.len() {
         let line = lines[pos];
         if let Some(rest) = line.strip_prefix("Index: ") {
-            patch.index_path = Some(rest.trim().to_string());
+            patch.index_path = Some(rest.trim_ascii().to_string());
             pos += 1;
         } else if line.starts_with("diff ") {
             // Skip diff command line

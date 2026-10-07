@@ -499,7 +499,7 @@ fn ifdef_block(define: &str, dels: &[&str], adds: &[&str]) -> Vec<String> {
 
 /// Normalize whitespace for loose matching.
 fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    s.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

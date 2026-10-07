@@ -16,16 +16,18 @@ use std::sync::LazyLock;
 /// "2024-01-01 10:00:00.000000000 +0000", with the fractional seconds and the
 /// zone offset both optional.
 static ISO_STAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\s+\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}:\d{2}(?:\.\d+)?(?:\s+[-+]\d{4})?$")
-        .expect("invalid regex")
+    Regex::new(
+        r"[\t\x20]+\d{4}-\d{2}-\d{2}[\t\x20]+\d{1,2}:\d{2}:\d{2}(?:\.\d+)?(?:[\t\x20]+[-+]\d{4})?$",
+    )
+    .expect("invalid regex")
 });
 
 /// A trailing ctime-style timestamp: "Mon Jan  1 10:00:00 2024".
 static CTIME_STAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?x) \s+ (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \s+
-          (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \s+
-          \d{1,2} \s+ \d{1,2}:\d{2}:\d{2} \s+ \d{4} $",
+        r"(?x) [\t\x20]+ (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [\t\x20]+
+          (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [\t\x20]+
+          \d{1,2} [\t\x20]+ \d{1,2}:\d{2}:\d{2} [\t\x20]+ \d{4} $",
     )
     .expect("invalid regex")
 });
@@ -43,9 +45,9 @@ pub fn parse_filename(s: &str) -> String {
     let s = s.trim_end_matches(['\r', '\n']);
     // A tab is unambiguous: everything after the first one is metadata.
     if let Some(tab_pos) = s.find('\t') {
-        return s[..tab_pos].trim().to_string();
+        return s[..tab_pos].trim_ascii().to_string();
     }
-    let s = s.trim();
+    let s = s.trim_ascii();
     for re in [&*ISO_STAMP_RE, &*CTIME_STAMP_RE] {
         if let Some(m) = re.find(s) {
             return s[..m.start()].to_string();

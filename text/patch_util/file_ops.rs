@@ -9,11 +9,13 @@
 
 //! File operations for the patch utility.
 
+use super::bytes;
 use super::types::{BackupName, FilePatch, Hunk, LineOp, PatchConfig, PatchError, RejectFile};
 use gettextrs::gettext;
 use plib::io::{open_terminal_input, open_terminal_output};
 use std::{
     collections::HashSet,
+    fmt::{self, Write as _},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufWriter, Write},
     path::{Component, Path, PathBuf},
@@ -46,13 +48,9 @@ pub fn determine_target_file(
             continue;
         }
 
-        let stripped = strip_path(candidate, strip);
-        if !is_safe_patch_path(&stripped) {
-            warn_dangerous_name(&stripped);
+        let Some(path) = safe_patch_path(candidate, strip) else {
             continue;
-        }
-        let path = PathBuf::from(&stripped);
-
+        };
         if path.exists() {
             return Ok(path);
         }
@@ -65,12 +63,7 @@ pub fn determine_target_file(
     if patch.creates_file() {
         if let Some(ref new_path) = patch.new_path {
             if new_path != "/dev/null" {
-                let stripped = strip_path(new_path, strip);
-                if !is_safe_patch_path(&stripped) {
-                    warn_dangerous_name(&stripped);
-                    return Err(PatchError::NoTargetFile);
-                }
-                return Ok(PathBuf::from(stripped));
+                return safe_patch_path(new_path, strip).ok_or(PatchError::NoTargetFile);
             }
         }
     }
@@ -103,8 +96,8 @@ pub fn determine_target_file(
 /// `is_absolute`; on Windows `/etc/passwd` (rooted on the current drive) and
 /// `C:file` (relative to that drive's own current directory) are not
 /// `is_absolute`, yet reach outside the directory just the same.
-fn is_safe_patch_path(path: &str) -> bool {
-    !Path::new(path).components().any(|c| {
+fn is_safe_patch_path(path: &Path) -> bool {
+    !path.components().any(|c| {
         matches!(
             c,
             Component::Prefix(_) | Component::RootDir | Component::ParentDir
@@ -112,12 +105,24 @@ fn is_safe_patch_path(path: &str) -> bool {
     })
 }
 
+/// The path a file name from the patch names after stripping, or None (with a
+/// warning) if it may not be written.
+fn safe_patch_path(name: &str, strip: Option<usize>) -> Option<PathBuf> {
+    let path = bytes::to_path(&strip_path(name, strip));
+    if is_safe_patch_path(&path) {
+        Some(path)
+    } else {
+        warn_dangerous_name(&path);
+        None
+    }
+}
+
 /// Report a refused file name, in the same terms GNU patch uses.
-fn warn_dangerous_name(name: &str) {
+fn warn_dangerous_name(name: &Path) {
     eprintln!(
         "patch: {}: {}",
         gettext("ignoring potentially dangerous file name"),
-        name
+        name.display()
     );
 }
 
@@ -209,7 +214,7 @@ fn collapse_slashes(path: &str) -> String {
 /// trailing newline (false for an empty file). Optimized to read the entire
 /// file at once and split, avoiding per-line allocations and system calls.
 pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
-    let content = fs::read_to_string(path)?;
+    let content = bytes::decode(&fs::read(path)?);
     let trailing_newline = content.ends_with('\n');
     // Keeping any '\r' as part of the line makes the round trip through
     // write_output lossless for a CRLF file, and makes a patch written against
@@ -321,10 +326,9 @@ pub fn write_output(
     let mut writer = BufWriter::new(file);
     let last = content.len().saturating_sub(1);
     for (i, line) in content.iter().enumerate() {
-        if i == last && no_trailing_newline {
-            write!(writer, "{}", line)?;
-        } else {
-            writeln!(writer, "{}", line)?;
+        writer.write_all(&bytes::encode(line))?;
+        if i != last || !no_trailing_newline {
+            writer.write_all(b"\n")?;
         }
     }
     writer.flush()?;
@@ -347,7 +351,7 @@ pub fn write_rejects(
     let reject_path = match &config.reject_file {
         Some(RejectFile::Discard) => return Ok(()),
         Some(RejectFile::Path(path)) => path.clone(),
-        None => PathBuf::from(format!("{}.rej", target.display())),
+        None => bytes::with_suffix(target, ".rej"),
     };
 
     // POSIX: rejected hunks are *appended* to the reject file. With -r, or with
@@ -360,27 +364,27 @@ pub fn write_rejects(
     };
     written_rejects.insert(reject_path);
 
-    let mut writer = BufWriter::new(file);
-
     // Name the file each group of rejects belongs to, so an aggregated reject
     // file stays attributable. The header is context-style to match the hunks
     // below it: a unified-style "--- "/"+++ " pair would make the reject file
     // read as a unified diff that then contains no hunks at all.
-    writeln!(writer, "*** {}", target.display())?;
-    writeln!(writer, "--- {}", target.display())?;
+    let name = bytes::from_path(target);
+    let mut text = format!("*** {}\n--- {}\n", name, name);
 
     // Write rejects in context diff format per POSIX
     // (even if input was unified, rejects should be in context format)
     for (_hunk_num, hunk, _reason) in rejects {
-        write_hunk_as_context(&mut writer, hunk)?;
+        write_hunk_as_context(&mut text, hunk).map_err(io::Error::other)?;
     }
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&bytes::encode(&text))?;
     writer.flush()?;
 
     Ok(())
 }
 
-/// Write a hunk in context diff format.
-fn write_hunk_as_context<W: Write>(writer: &mut W, hunk: &Hunk) -> io::Result<()> {
+/// Write a hunk in context diff format, as patch text.
+fn write_hunk_as_context(writer: &mut String, hunk: &Hunk) -> fmt::Result {
     // Write separator
     writeln!(writer, "***************")?;
 

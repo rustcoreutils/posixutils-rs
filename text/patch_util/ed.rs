@@ -30,7 +30,7 @@ pub fn parse_ed(lines: &[&str], start: usize) -> Result<(FilePatch, usize), Patc
     while pos < lines.len() {
         let line = lines[pos];
         if let Some(rest) = line.strip_prefix("Index: ") {
-            patch.index_path = Some(rest.trim().to_string());
+            patch.index_path = Some(rest.trim_ascii().to_string());
             pos += 1;
         } else if line.starts_with("diff ") {
             pos += 1;

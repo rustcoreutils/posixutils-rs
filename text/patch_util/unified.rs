@@ -35,7 +35,7 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             pos += 1;
             break;
         } else if let Some(rest) = line.strip_prefix("Index: ") {
-            patch.index_path = Some(rest.trim().to_string());
+            patch.index_path = Some(rest.trim_ascii().to_string());
             pos += 1;
         } else {
             pos += 1;

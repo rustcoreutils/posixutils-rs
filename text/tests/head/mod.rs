@@ -383,3 +383,91 @@ fn head_mixes_dash_with_named_files() {
     );
     let _ = std::fs::remove_file(f);
 }
+
+// ---------------------------------------------------------------------------
+// Historical `-number` form (withdrawn from POSIX in Issue 6)
+// ---------------------------------------------------------------------------
+
+const TWENTY_LINES: &str =
+    "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n";
+
+#[test]
+fn head_historical_number_reads_stdin() {
+    run_test(TestPlan {
+        cmd: String::from("head"),
+        args: vec![String::from("-1")],
+        stdin_data: String::from("a\nb\nc\n"),
+        expected_out: String::from("a\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn head_historical_number_with_file() {
+    let f = head_tmp("hist5", TWENTY_LINES);
+    let p = f.to_str().unwrap();
+    let (stdout, stderr, code) = head_run(&["-5", p]);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str(), code),
+        ("1\n2\n3\n4\n5\n", "", 0)
+    );
+    // An option may follow an operand, as `-n` may.
+    let (stdout, _, code) = head_run(&[p, "-2"]);
+    assert_eq!((stdout.as_str(), code), ("1\n2\n", 0));
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn head_historical_number_last_count_wins() {
+    let f = head_tmp("histlast", TWENTY_LINES);
+    let p = f.to_str().unwrap();
+    let (stdout, _, code) = head_run(&["-n", "3", "-5", p]);
+    assert_eq!((stdout.as_str(), code), ("1\n2\n3\n4\n5\n", 0));
+    let (stdout, _, code) = head_run(&["-5", "-n", "3", p]);
+    assert_eq!((stdout.as_str(), code), ("1\n2\n3\n", 0));
+    let (stdout, _, code) = head_run(&["-4", "-2", p]);
+    assert_eq!((stdout.as_str(), code), ("1\n2\n", 0));
+    let (stdout, _, code) = head_run(&["-n", "4", "-n", "1", p]);
+    assert_eq!((stdout.as_str(), code), ("1\n", 0));
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn head_historical_zero_writes_nothing() {
+    let f = head_tmp("hist0", TWENTY_LINES);
+    let (stdout, stderr, code) = head_run(&["-0", f.to_str().unwrap()]);
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("", "", 0));
+    let _ = std::fs::remove_file(f);
+}
+
+#[test]
+fn head_historical_number_is_not_an_operand_after_double_dash() {
+    // `--` ends the options: a following "-1" is a file named "-1", and the
+    // option-argument of a separate `-n` is never rewritten.
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("posixutils-head-{}-dashdir", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("-1"), "x\ny\nz\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_head"))
+        .args(["-2", "--", "-1"])
+        .current_dir(&dir)
+        .output()
+        .expect("run head");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x\ny\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn head_historical_number_invalid_is_an_error() {
+    for bad in ["-5x", "-99999999999999999999999"] {
+        let (stdout, stderr, code) = head_run(&[bad]);
+        assert_eq!(stdout, "", "{bad}");
+        assert!(!stderr.is_empty(), "{bad}: no diagnostic");
+        assert_ne!(code, 0, "{bad}: must fail");
+    }
+    // `-c` is unaffected: it still needs its own option-argument.
+    let (_, _, code) = head_run(&["-c", "-5"]);
+    assert_ne!(code, 0, "-c -5 must not become -c with a -n 5");
+}

@@ -249,6 +249,13 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `LANGUAGE` — a colon-separated locale priority list, honored ahead of the
    `LC_*` variables.
 
+### head
+
+ * `-number` — the historical form of `-n number`, withdrawn from POSIX in
+   Issue 6.  `number` is one or more decimal digits.  It is accepted wherever
+   an option may appear (never after `--`), and the last `-n` or `-number`
+   given wins.  `-c` has no historical form.
+
 ### kill
 
  * `IOT` is accepted as a name for signal 6.  `kill -l 6` still prints `ABRT`.

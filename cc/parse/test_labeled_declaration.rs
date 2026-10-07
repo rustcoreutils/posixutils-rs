@@ -93,6 +93,34 @@ fn a_labeled_declaration_in_a_statement_expression() {
     )));
 }
 
+/// GNU label attributes: `L: __attribute__((unused)) stmt` labels the
+/// statement after the attributes (binutils' gas/read.c). Attributes followed
+/// by `;` stay an attribute statement, and ones followed by a declaration
+/// stay the declaration's.
+#[test]
+fn attributes_after_a_label_belong_to_the_label() {
+    let items = body_items(
+        "void f(int n, void (*g)(void)) { goto l; l: __attribute__((__unused__)) if (n) g(); }",
+    );
+    let [_, BlockItem::Statement(stmt)] = items.as_slice() else {
+        panic!("{items:#?}");
+    };
+    let Stmt::Labeled { labels, stmt } = &**stmt else {
+        panic!("{stmt:#?}");
+    };
+    assert!(matches!(labels.as_slice(), [Label::Named { .. }]));
+    assert!(matches!(**stmt, Stmt::If { .. }), "{stmt:#?}");
+
+    let items = body_items("int f(void) { l: __attribute__((unused)) int x = 1; return x; }");
+    assert!(
+        matches!(items.as_slice(), [_, BlockItem::Declaration(_), _]),
+        "{items:#?}"
+    );
+
+    let items = body_items("void f(void) { l: __attribute__((unused)); }");
+    assert!(matches!(items.as_slice(), [_]), "{items:#?}");
+}
+
 /// Only a block item may be a declaration: the body of an `if` or a loop is
 /// a statement, labeled or not, in C23 as in C17.
 #[test]

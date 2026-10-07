@@ -133,6 +133,11 @@ Also accepted:
   label or default label". c17 has no `-Wimplicit-fallthrough`, so it changes
   nothing else. Written on a non-null statement it is a malformed declaration,
   rejected as in gcc.
+- Label attributes: `L: __attribute__((unused)) stmt` (binutils' gas). The
+  attributes after a label's colon are parsed and discarded when a statement
+  follows them; gcc's label attributes (`unused`, `hot`, `cold`) are hints
+  c17 has no use for. Followed by `;` they are an attribute statement, and
+  followed by a declaration they are the declaration's.
 
 ## Attribute Declarations
 

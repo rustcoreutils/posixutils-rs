@@ -65,3 +65,36 @@ int main(void)
 "#,
     );
 }
+
+/// GNU label attributes: binutils' gas/read.c writes `just_record_alignment:
+/// ATTRIBUTE_UNUSED_LABEL` (`__attribute__ ((__unused__))`) straight before
+/// an `if`. The label still labels that statement.
+#[test]
+fn label_attributes_before_a_statement() {
+    compile_and_run_everywhere(
+        "label_attributes",
+        r#"
+static int f(int n)
+{
+    int r = 0;
+    if (n > 5)
+        goto done;
+    r = 1;
+done: __attribute__ ((__unused__))
+    if (n > 2)
+        r += 10;
+unused: __attribute__((unused)) __attribute__((cold))
+    r += 100;
+    return r;
+}
+
+int main(void)
+{
+    if (f(9) != 110) return 1;
+    if (f(3) != 111) return 2;
+    if (f(1) != 101) return 3;
+    return 0;
+}
+"#,
+    );
+}

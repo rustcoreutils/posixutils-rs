@@ -88,6 +88,7 @@ impl Parser<'_> {
         if self.is_special(b':') {
             self.advance();
             let label = self.resolve_label(name);
+            self.parse_label_attributes();
             return Ok(Some(Label::Named { label, pos }));
         }
         // Not a label, backtrack

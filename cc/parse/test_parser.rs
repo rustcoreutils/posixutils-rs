@@ -1810,6 +1810,14 @@ fn test_asm_basic_template_escapes_percent() {
         template("__asm__(\"mov %0, %%ebx\" :: \"r\"(1));"),
         "mov %0, %%ebx"
     );
+    // Where `{|}` are dialect alternatives (x86), a basic asm's are escaped
+    // too; elsewhere they are plain text in every template.
+    let braces = template("__asm__(\"x{a|b}\");");
+    if cfg!(target_arch = "x86_64") {
+        assert_eq!(braces, "x%{a%|b%}");
+    } else {
+        assert_eq!(braces, "x{a|b}");
+    }
 }
 
 /// A template is text decoded from the literal's bytes, so a UTF-8 `é` in

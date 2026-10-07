@@ -1634,6 +1634,10 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
             _ => return Err(AsmModifierError::Unsupported),
         })
     }
+
+    fn asm_dialects(&self) -> bool {
+        crate::arch::asm_dialects(self.base.target.arch)
+    }
 }
 
 impl X86_64CodeGen {

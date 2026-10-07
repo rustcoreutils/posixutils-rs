@@ -167,10 +167,10 @@ impl Parser<'_> {
         let mut template = self.parse_asm_string_literal()?;
 
         // Basic asm, with no colon, is emitted as written: gcc substitutes
-        // nothing into it, so `%eax` and `%%` both reach the assembler
-        // unchanged. Escaping every `%` lets it share the extended-asm path.
+        // nothing into it, so `%eax`, `%%` and an x86 `{` all reach the
+        // assembler unchanged.
         if !self.is_special(b':') {
-            template = template.replace('%', "%%");
+            template = crate::arch::basic_asm_template(&template, self.types.target().arch);
         }
 
         // Parse outputs (after first ':')

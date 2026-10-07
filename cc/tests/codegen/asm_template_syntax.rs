@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 // Extended-asm template syntax beyond operands: `%=`, the number unique to
-// each emitted asm.
+// each emitted asm, and x86's `{att|intel}` dialect alternatives.
 //
 
+use crate::codegen::asm_probe::{asm_for, AARCH64_LINUX, X86_64_LINUX};
 #[cfg(target_arch = "x86_64")]
 use crate::common::compile_and_run;
 use crate::common::compile_and_run_aarch64;
@@ -64,4 +65,46 @@ int main(void) {
             assert_eq!(rc, 0, "{opt}");
         }
     }
+}
+
+/// sljit (pcre2's JIT) reads XCR0 with `"xor{l %%ecx, %%ecx | ecx, ecx}"`:
+/// gcc's x86 templates carry an AT&T and an Intel spelling in braces, and
+/// AT&T, the default, is the first. `%{`, `%|` and `%}` are the literal
+/// characters.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn asm_template_dialect_alternatives_take_att_x86_64() {
+    let src = r#"
+int main(void) {
+    unsigned x = 7, y;
+    __asm__("mov{l %1, %0 | %0, %1}\n\txor{l %%ecx, %%ecx | ecx, ecx}"
+            : "=r"(y) : "r"(x) : "rcx");
+    return y != 7;
+}
+"#;
+    assert_eq!(compile_and_run("asm_dialect", src, &[]), 0);
+}
+
+/// The text each form becomes: dialects only on x86-64, where gcc has them,
+/// since an aarch64 template uses braces for register lists; and none of it
+/// in a basic asm, which gcc copies verbatim.
+#[test]
+fn asm_template_dialect_text() {
+    let src = r##"
+void f(int x) {
+    __asm__ volatile("# A{tt|ntel} %{k1%} p%|q%= r|s" : : "r"(x));
+    __asm__ volatile("# B{x|y} %%q");
+}
+"##;
+    let x86 = asm_for("asm_dialect_x86", X86_64_LINUX, src);
+    assert!(x86.contains("# Att {k1} p|q"), "{x86}");
+    assert!(x86.contains(" r|s"), "{x86}");
+    assert!(x86.contains("# B{x|y} %%q"), "{x86}");
+    let a64 = r##"
+void f(int x) {
+    __asm__ volatile("# A{tt|ntel} %0" : : "r"(x));
+}
+"##;
+    let a64 = asm_for("asm_dialect_a64", AARCH64_LINUX, a64);
+    assert!(a64.contains("# A{tt|ntel} w"), "{a64}");
 }

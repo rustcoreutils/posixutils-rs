@@ -1091,6 +1091,36 @@ pub trait AsmOperandFormatter {
         slot: &AsmOperandSlot<Self::Reg>,
         modifier: Option<char>,
     ) -> Result<String, AsmModifierError>;
+
+    /// Whether templates carry dialect alternatives; see [`asm_dialects`].
+    fn asm_dialects(&self) -> bool {
+        false
+    }
+}
+
+/// Whether gcc's extended-asm templates on `arch` carry assembler-dialect
+/// alternatives, `{att|intel}`: on x86 only, where gcc defines them.
+/// Elsewhere a brace is the template's own -- an aarch64 register list,
+/// `{v0.4s}`.
+pub fn asm_dialects(arch: crate::target::Arch) -> bool {
+    arch == crate::target::Arch::X86_64
+}
+
+/// A basic asm's text as the extended-asm template that substitutes back to
+/// exactly it. gcc writes a basic asm as it stands -- `%eax`, `%%` and an
+/// x86 `{` all reach the assembler unchanged -- so every character
+/// [`substitute_asm_operands`] would act on is escaped, which lets the two
+/// forms share one path.
+pub fn basic_asm_template(text: &str, arch: crate::target::Arch) -> String {
+    let dialects = asm_dialects(arch);
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '%' || (dialects && matches!(c, '{' | '|' | '}')) {
+            out.push('%');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A symbolic inline-asm constant: the already-decorated symbol `sym`
@@ -1149,6 +1179,9 @@ fn read_operand_ref(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<
 /// - `%cN` is a constant without its immediate prefix and `%nN` its
 ///   negation, on every target
 /// - `%=` is `instance`, a number unique to this asm in the module
+/// - where the target has dialects ([`AsmOperandFormatter::asm_dialects`]),
+///   `{att|intel}` is its first alternative, the AT&T one c17 writes, and
+///   `%{`, `%|` and `%}` are the literal characters
 ///
 /// Anything else after a `%` is an error naming it: an unknown modifier, a
 /// modifier the operand cannot take, an operand that does not exist. Passed
@@ -1163,8 +1196,32 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
 ) -> Result<String, String> {
     let mut result = String::with_capacity(template.len() * 2);
     let mut chars = template.chars().peekable();
+    let dialects = formatter.asm_dialects();
+    // Inside `{...}`, having written the first alternative's text so far.
+    let mut in_alternatives = false;
 
     while let Some(c) = chars.next() {
+        if dialects {
+            match c {
+                '{' if in_alternatives => {
+                    return Err("nested assembly dialect alternatives".to_string())
+                }
+                '{' => {
+                    in_alternatives = true;
+                    continue;
+                }
+                '|' if in_alternatives => {
+                    skip_other_alternatives(&mut chars)?;
+                    in_alternatives = false;
+                    continue;
+                }
+                '}' if in_alternatives => {
+                    in_alternatives = false;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         if c != '%' {
             result.push(c);
             continue;
@@ -1176,6 +1233,12 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
         if chars.next_if_eq(&'=').is_some() {
             result.push_str(&instance.to_string());
             continue;
+        }
+        if dialects {
+            if let Some(p) = chars.next_if(|p| matches!(p, '{' | '|' | '}')) {
+                result.push(p);
+                continue;
+            }
         }
         let modifier = chars.next_if(|m| m.is_ascii_alphabetic());
         let Some(operand) = read_operand_ref(&mut chars) else {
@@ -1244,7 +1307,26 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
         }
     }
 
+    if in_alternatives {
+        return Err("unterminated assembly dialect alternative".to_string());
+    }
     Ok(result)
+}
+
+/// Skip from a `|` inside dialect alternatives past the closing `}`: every
+/// alternative but the first is another dialect's. A `%` escapes the
+/// character after it, so `%}` does not close them.
+fn skip_other_alternatives(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<(), String> {
+    while let Some(c) = chars.next() {
+        match c {
+            '%' => {
+                chars.next();
+            }
+            '}' => return Ok(()),
+            _ => {}
+        }
+    }
+    Err("unterminated assembly dialect alternative".to_string())
 }
 
 /// The `asm goto` label `%l` names. gcc numbers labels after every operand,
@@ -1637,8 +1719,9 @@ mod tests {
     }
 
     /// A formatter that writes a register as `rN` and implements only `%k`,
-    /// so the shared rules are what is under test.
-    struct Stub;
+    /// so the shared rules are what is under test; the flag is whether its
+    /// target has dialect alternatives.
+    struct Stub(bool);
 
     impl super::AsmOperandFormatter for Stub {
         type Reg = u8;
@@ -1656,9 +1739,17 @@ mod tests {
                 _ => Err(super::AsmModifierError::Unsupported),
             }
         }
+
+        fn asm_dialects(&self) -> bool {
+            self.0
+        }
     }
 
     fn substitute(template: &str) -> Result<String, String> {
+        substitute_for(Stub(false), template)
+    }
+
+    fn substitute_for(stub: Stub, template: &str) -> Result<String, String> {
         use super::{AsmOperandSlot, AsmOperandValue as V};
         let slot = |value, name: Option<&str>| AsmOperandSlot {
             value,
@@ -1672,7 +1763,7 @@ mod tests {
             slot(V::Mem("(%rax)".into()), None),
         ];
         let labels = [(".L9".to_string(), "done".to_string())];
-        super::substitute_asm_operands(&Stub, template, &slots, &labels, 12)
+        super::substitute_asm_operands(&stub, template, &slots, &labels, 12)
     }
 
     /// `%c` and `%n` of a constant and `%l` of a label are the same on
@@ -1685,6 +1776,21 @@ mod tests {
         );
     }
 
+    /// A basic asm comes back from substitution as it was written, braces
+    /// included where they would be dialect alternatives.
+    #[test]
+    fn basic_asm_template_round_trips() {
+        use crate::target::Arch;
+        let text = "x{a|b}y %%q %eax %= {v0.4s}";
+        for (arch, dialects) in [(Arch::X86_64, true), (Arch::Aarch64, false)] {
+            let template = super::basic_asm_template(text, arch);
+            assert_eq!(
+                substitute_for(Stub(dialects), &template),
+                Ok(text.to_string())
+            );
+        }
+    }
+
     /// `%=` is the asm's instance number, on every target.
     #[test]
     fn substitution_instance_number() {
@@ -1692,6 +1798,25 @@ mod tests {
             substitute(".La%=: jmp .La%="),
             Ok(".La12: jmp .La12".to_string())
         );
+    }
+
+    /// x86's dialect alternatives: the first, AT&T, is written; `%{`, `%|`
+    /// and `%}` are the characters, also inside an alternative skipped; a
+    /// `|` outside braces is itself. Without dialects every brace is text.
+    #[test]
+    fn substitution_dialect_alternatives() {
+        let x86 = |t: &str| substitute_for(Stub(true), t);
+        assert_eq!(
+            x86("xor{l %0, %0 | %0, %0} a|b"),
+            Ok("xorl r3, r3  a|b".to_string())
+        );
+        assert_eq!(x86("{%{%|x|%}y}%{%}"), Ok("{|x{}".to_string()));
+        assert_eq!(x86("{a|b}{|c}{d}"), Ok("ad".to_string()));
+        assert!(x86("{a{b}}").unwrap_err().contains("nested"));
+        assert!(x86("{a").unwrap_err().contains("unterminated"));
+        assert!(x86("{a|b").unwrap_err().contains("unterminated"));
+        assert_eq!(substitute("{v0.4s}|{x}"), Ok("{v0.4s}|{x}".to_string()));
+        assert!(substitute("%{").unwrap_err().contains("invalid '%{'"));
     }
 
     /// Anything else after a `%` is an error naming what it is.

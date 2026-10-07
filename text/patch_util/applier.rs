@@ -15,12 +15,6 @@ use super::types::{
 };
 use gettextrs::gettext;
 
-/// How far to scan in each direction for a hunk's context.
-///
-/// POSIX requires scanning "at least 1 000 bytes"; a line is at least one byte,
-/// so this many lines always satisfies it.
-const MAX_SCAN_LINES: usize = 1000;
-
 /// How many lines of context a fuzzy match may ignore at each end, unless -F
 /// says otherwise.
 ///
@@ -330,6 +324,11 @@ impl<'a> PatchApplier<'a> {
     /// Scan outward from `expected` for a place where the window's old-side
     /// text matches.
     ///
+    /// The scan covers the whole file, nearest position first. POSIX asks for
+    /// "at least 1 000 bytes" either way; GNU patch looks everywhere, and
+    /// series of patches rely on it (one of Debian glibc's hunks lands over a
+    /// thousand lines from the line it names).
+    ///
     /// Returns the position of the hunk's first line, which sits `lead_skip`
     /// lines before the text that was actually verified.
     fn locate_hunk(&self, window: &MatchWindow, expected: usize) -> Option<usize> {
@@ -338,7 +337,7 @@ impl<'a> PatchApplier<'a> {
         // Furthest hunk start at which the window still fits inside the file.
         let last_start = self.file_lines.len().saturating_sub(old_lines.len() + skip);
 
-        for delta in 0..=MAX_SCAN_LINES {
+        for delta in 0.. {
             if expected + delta <= last_start
                 && self.lines_match_at(&old_lines, expected + delta + skip)
             {

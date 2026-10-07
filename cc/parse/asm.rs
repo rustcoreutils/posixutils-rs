@@ -247,7 +247,9 @@ impl Parser<'_> {
             }
         }
 
-        Ok(result)
+        // The literal's value is a payload, one `char` per byte; the
+        // assembler is handed text, decoded from those bytes.
+        Ok(payload_text(&result))
     }
 
     /// Parse asm operand list: [name] "constraint" (expr), ...

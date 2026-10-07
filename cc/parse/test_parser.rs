@@ -1812,6 +1812,20 @@ fn test_asm_basic_template_escapes_percent() {
     );
 }
 
+/// A template is text decoded from the literal's bytes, so a UTF-8 `é` in
+/// it is one character, not one per byte; and adjacent literals join.
+#[test]
+fn test_asm_template_is_decoded_text() {
+    let template = |src| match parse_stmt(src).unwrap().0 {
+        Stmt::Asm { template, .. } => template,
+        other => panic!("expected asm: {other:?}"),
+    };
+    assert_eq!(
+        template("__asm__(\"# caf\u{e9}\" \" \\x41\");"),
+        "# caf\u{e9} A"
+    );
+}
+
 #[test]
 fn test_labeled_stmt() {
     let (stmt, strings) = parse_stmt("label: x = 1;").unwrap();

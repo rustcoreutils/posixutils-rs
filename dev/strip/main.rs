@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+#[path = "../armap.rs"]
+mod armap;
 mod linked;
 mod raw;
 
@@ -18,7 +20,7 @@ use object::{
         elf::{Builder, Section, SectionData},
         Id,
     },
-    elf, Endian, Object, ObjectSymbol, SymbolKind,
+    elf, Endian,
 };
 use plib::diag;
 use std::{
@@ -361,22 +363,6 @@ struct StrippedMember {
     symbols: Vec<String>,
 }
 
-fn extract_member_symbols(data: &[u8]) -> Vec<String> {
-    match object::read::File::parse(data) {
-        Ok(file) => file
-            .symbols()
-            .filter(|s| {
-                matches!(
-                    s.kind(),
-                    SymbolKind::Text | SymbolKind::Data | SymbolKind::Tls
-                )
-            })
-            .filter_map(|s| s.name().ok().map(|n| n.to_string()))
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 fn strip_archive(data: &[u8], opts: &Options, display: &str) -> StripResult {
     // #ST11: `!<arch>\n` is shared by the System V and BSD layouts, and the
     // variant is only known once headers have been parsed. The writer below
@@ -416,7 +402,7 @@ fn strip_archive(data: &[u8], opts: &Options, display: &str) -> StripResult {
                 String::from_utf8_lossy(header.identifier())
             );
             let new_data = strip(&data, opts, &member)?;
-            let symbols = extract_member_symbols(&new_data);
+            let symbols = armap::member_symbols(&new_data);
             (new_data, symbols)
         } else {
             (data, Vec::new())

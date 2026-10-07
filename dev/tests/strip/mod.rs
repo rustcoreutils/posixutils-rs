@@ -345,6 +345,40 @@ fn test_strip_symbol_named_in_relocation_is_kept() {
     run_prints(&dir.path().join("main"), "10\n");
 }
 
+/// The names in an archive's symbol index.
+fn archive_index(bytes: &[u8]) -> Vec<String> {
+    let archive = object::read::archive::ArchiveFile::parse(bytes).unwrap();
+    archive
+        .symbols()
+        .unwrap()
+        .expect("archive must have a symbol index")
+        .map(|s| String::from_utf8_lossy(s.unwrap().name()).into_owned())
+        .collect()
+}
+
+#[test]
+fn test_strip_archive_index_lists_only_global_symbols() {
+    // The rewritten index listed static functions too, so a link could pull
+    // a member in for a name it does not export.
+    let dir = TempDir::new().unwrap();
+    write_sources(dir.path());
+    cc(dir.path(), &["-O0", "-c", "-o", "lib.o", "lib.c"]);
+    let lib = dir.path().join("libx.a");
+    let mut arc = b"!<arch>\n".to_vec();
+    arc.extend(ar_member(
+        "lib.o",
+        0,
+        0,
+        0o644,
+        &fs::read(dir.path().join("lib.o")).unwrap(),
+    ));
+    fs::write(&lib, &arc).unwrap();
+    strip_ok(&DH_STATIC, &lib);
+    let mut index = archive_index(&fs::read(&lib).unwrap());
+    index.sort();
+    assert_eq!(index, ["lib_f", "lib_g", "lib_h"]);
+}
+
 #[test]
 fn test_strip_unneeded_relocatable_keeps_globals() {
     let dir = TempDir::new().unwrap();

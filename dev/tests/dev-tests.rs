@@ -493,6 +493,41 @@ fn test_ar_list_some() {
     });
 }
 
+// ELF-specific: the static function must be a local ELF symbol.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_ar_index_lists_only_global_symbols() {
+    // The archive index listed static functions and tables too.
+    let dir = plib::tmp::TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("s.c"),
+        "static int hidden(int x){return x*3;}\nint shown(int x){return hidden(x);}\n",
+    )
+    .unwrap();
+    assert!(c_compiler()
+        .current_dir(dir.path())
+        .args(["-O0", "-c", "-o", "s.o", "s.c"])
+        .status()
+        .expect("cc")
+        .success());
+    let arc = dir.path().join("lib.a");
+    assert!(Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-r", "-c", arc.to_str().unwrap()])
+        .arg(dir.path().join("s.o"))
+        .status()
+        .expect("ar")
+        .success());
+    let bytes = fs::read(&arc).unwrap();
+    let archive = object::read::archive::ArchiveFile::parse(&*bytes).unwrap();
+    let index: Vec<String> = archive
+        .symbols()
+        .unwrap()
+        .expect("archive must have a symbol index")
+        .map(|s| String::from_utf8_lossy(s.unwrap().name()).into_owned())
+        .collect();
+    assert_eq!(index, ["shown"]);
+}
+
 #[test]
 fn test_strip_stripped_elf_is_valid_elf() {
     let stripped = strip_file(

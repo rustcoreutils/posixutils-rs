@@ -541,7 +541,7 @@ fn find_or_and_spellings() {
     run_test_find(
         &[".", "-name", "x", "-or"],
         "",
-        "find: unexpected end of expression\n",
+        "find: expected an expression after '-or'\n",
         1,
     );
     fs::remove_dir_all(&dir).unwrap();

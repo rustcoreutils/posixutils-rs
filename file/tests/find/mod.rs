@@ -845,3 +845,36 @@ fn find_ok_honors_locale_yesexpr() {
         "locale {loc}: affirmative {answer:?} should have run the utility"
     );
 }
+
+#[test]
+fn test_find_operator_without_operand() {
+    // An operator with nothing after it is a syntax error, in GNU find's
+    // words; a trailing `-a` used to be accepted silently.
+    let cases: [(&[&str], &str); 8] = [
+        (&["-name", "x", "-a"], "expected an expression after '-a'"),
+        (
+            &["-name", "x", "-and"],
+            "expected an expression after '-and'",
+        ),
+        (&["-name", "x", "-o"], "expected an expression after '-o'"),
+        (&["-name", "x", "-or"], "expected an expression after '-or'"),
+        (&["-name", "x", "!"], "expected an expression after '!'"),
+        (
+            &["(", "-name", "x", "-a", ")"],
+            "expected an expression between '-a' and ')'",
+        ),
+        (
+            &["(", "-name", "x", "!", ")"],
+            "expected an expression between '!' and ')'",
+        ),
+        (
+            &["-name", "x", "-a", "-o", "-name", "y"],
+            "invalid expression; you have used a binary operator '-o' with nothing before it.",
+        ),
+    ];
+    for (expr, message) in cases {
+        let mut args = vec!["tests/find/other"];
+        args.extend_from_slice(expr);
+        run_test_find(&args, "", &format!("find: {message}\n"), 1);
+    }
+}

@@ -400,12 +400,26 @@ fn is_and(tok: &str) -> bool {
     tok == "-a" || tok == "-and"
 }
 
+/// Fail unless an operand follows operator `op`, whose operand would start
+/// at `tokens[idx]`. The wording is GNU find's.
+fn expect_operand(tokens: &[&str], idx: usize, op: &str) -> Result<(), String> {
+    match tokens.get(idx) {
+        None => Err(format!("expected an expression after '{op}'")),
+        Some(&")") => Err(format!("expected an expression between '{op}' and ')'")),
+        Some(&next) if is_or(next) || is_and(next) => Err(format!(
+            "invalid expression; you have used a binary operator '{next}' with nothing before it."
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Parse OR expression (lowest precedence)
 fn parse_or_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
     let mut left = parse_and_expr(tokens, idx)?;
 
     while *idx < tokens.len() && is_or(tokens[*idx]) {
         *idx += 1;
+        expect_operand(tokens, *idx, tokens[*idx - 1])?;
         let right = parse_and_expr(tokens, idx)?;
         left = Expr::Or(Box::new(left), Box::new(right));
     }
@@ -424,6 +438,7 @@ fn parse_and_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         }
         if is_and(tok) {
             *idx += 1;
+            expect_operand(tokens, *idx, tok)?;
         }
         // Implicit AND by juxtaposition
         if *idx >= tokens.len() || is_or(tokens[*idx]) || tokens[*idx] == ")" {
@@ -444,6 +459,7 @@ fn parse_unary_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 
     if tokens[*idx] == "!" {
         *idx += 1;
+        expect_operand(tokens, *idx, "!")?;
         let expr = parse_unary_expr(tokens, idx)?;
         return Ok(Expr::Not(Box::new(expr)));
     }

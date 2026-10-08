@@ -132,13 +132,14 @@ impl MemberPath {
 /// search and write but not list (mode 0300) where `mkdir` or `open` by name
 /// would have succeeded. `O_PATH` (Linux) and `O_SEARCH` (macOS, the BSDs) open
 /// it for exactly that. Elsewhere `O_RDONLY` is the only option there is.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// (An `O_PATH` descriptor takes attributes only through a verified procfs,
+/// `set_attrs_search_only`, which is Linux's alone.)
+#[cfg(target_os = "linux")]
 const SEARCH_ONLY: libc::c_int = libc::O_PATH;
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
 #[cfg(not(any(
     target_os = "linux",
-    target_os = "android",
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd"
@@ -616,19 +617,25 @@ fn open_dir_for_attrs(dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<(OwnedFd,
 /// `set_attrs_fd` for a descriptor opened for search only.
 ///
 /// Linux's `O_PATH` descriptor is refused by `fchown`, `fchmod` and `futimens`
-/// alike. Its `/proc/self/fd` entry is not: it resolves to the very file the
-/// descriptor holds, whatever has happened to the name since, so the calls
-/// made through it by name cannot be redirected.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// alike. Its `self/fd/N` entry, under a `/proc` verified to be procfs
+/// (`made::procfs_dir`), is not: it resolves to the very file the descriptor
+/// holds, whatever has happened to the name since, so the calls made through
+/// it by name cannot be redirected -- not by a `/proc` that is something else
+/// either.
+#[cfg(target_os = "linux")]
 fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
-    let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-        .expect("a formatted number has no NUL");
-    set_attrs(&AttrTarget::Path(&path), attrs, policy)
+    let proc_dir = made::procfs_dir()?;
+    let name = made::proc_fd_name(fd.as_raw_fd());
+    let target = AttrTarget::Proc {
+        dir: proc_dir.as_fd(),
+        name: &name,
+    };
+    set_attrs(&target, attrs, policy)
 }
 
 /// Elsewhere a search-only descriptor (`O_SEARCH`) takes the same calls as any
 /// other.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(target_os = "linux"))]
 fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
     set_attrs_fd(fd, attrs, policy)
 }
@@ -1480,34 +1487,42 @@ pub(crate) fn set_attrs_fd(
 /// What the attribute calls of `set_attrs` act on.
 enum AttrTarget<'a> {
     Fd(BorrowedFd<'a>),
-    /// A name that cannot be redirected: see `set_attrs_search_only`.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    Path(&'a CStr),
+    /// A `self/fd/N` entry under a verified procfs `dir`, which cannot be
+    /// redirected: see `set_attrs_search_only`.
+    #[cfg(target_os = "linux")]
+    Proc {
+        dir: BorrowedFd<'a>,
+        name: &'a CStr,
+    },
 }
 
 impl AttrTarget<'_> {
     fn chown(&self, uid: libc::uid_t, gid: libc::gid_t) -> libc::c_int {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            AttrTarget::Path(p) => unsafe { libc::chown(p.as_ptr(), uid, gid) },
+            #[cfg(target_os = "linux")]
+            AttrTarget::Proc { dir, name } => unsafe {
+                libc::fchownat(dir.as_raw_fd(), name.as_ptr(), uid, gid, 0)
+            },
         }
     }
 
     fn chmod(&self, mode: libc::mode_t) -> libc::c_int {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::fchmod(fd.as_raw_fd(), mode) },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            AttrTarget::Path(p) => unsafe { libc::chmod(p.as_ptr(), mode) },
+            #[cfg(target_os = "linux")]
+            AttrTarget::Proc { dir, name } => unsafe {
+                libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, 0)
+            },
         }
     }
 
     fn utimens(&self, times: &[libc::timespec; 2]) -> libc::c_int {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            AttrTarget::Path(p) => unsafe {
-                libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), 0)
+            #[cfg(target_os = "linux")]
+            AttrTarget::Proc { dir, name } => unsafe {
+                libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times.as_ptr(), 0)
             },
         }
     }

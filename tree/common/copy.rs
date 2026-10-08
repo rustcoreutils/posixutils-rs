@@ -81,6 +81,21 @@ pub struct CopyConfig {
     /// ancestor entries (POSIX cp CONSEQUENCES OF ERRORS, 90829-90832). When `false` (mv), the
     /// first structural error stops the duplication so the source is not removed.
     pub continue_on_error: bool,
+    /// What the copy may find at the destination operand itself.
+    pub destination: Destination,
+}
+
+/// What a copy may find at its destination operand (not below it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Destination {
+    /// cp: an existing destination is examined, and then replaced, written into or (for a
+    /// directory) copied into, as POSIX cp prescribes.
+    MayExist,
+    /// mv across filesystems, after its step 5 removed the destination or found none: the copy
+    /// must create the destination itself (`O_CREAT | O_EXCL`, `mkdirat`, `symlinkat`,
+    /// `mknodat`). Whatever is at its name by then appeared during the move and is never
+    /// written into, filled or removed: the create fails with EEXIST, and that is an error.
+    MustCreate,
 }
 
 /// Where the destination directory of a `CopyingDirectory` came from, so that the descriptor
@@ -705,16 +720,22 @@ where
         }
     }
 
-    let target_symlink_md = ftw::Metadata::new(
-        target_dirfd,
-        unsafe { CStr::from_ptr(target_filename) },
-        false,
-    );
-    let target_deref_md = ftw::Metadata::new(
-        target_dirfd,
-        unsafe { CStr::from_ptr(target_filename) },
-        true,
-    );
+    // A destination the copy must create is not examined at all: it is taken to be absent, so
+    // every path below creates it exclusively, and anything at its name makes that fail.
+    let must_create = at_top_level && cfg.destination == Destination::MustCreate;
+    let examine_target = |follow: bool| {
+        if must_create {
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
+        } else {
+            ftw::Metadata::new(
+                target_dirfd,
+                unsafe { CStr::from_ptr(target_filename) },
+                follow,
+            )
+        }
+    };
+    let target_symlink_md = examine_target(false);
+    let target_deref_md = examine_target(true);
     let target_is_dangling_symlink = target_symlink_md.is_ok() && target_deref_md.is_err();
 
     let target_symlink_md = match target_symlink_md {
@@ -2215,5 +2236,95 @@ mod tests {
         );
         assert_eq!(after.mode() & 0o7777, 0o600, "the mode was applied");
         assert_eq!(after.mtime(), 978_307_200, "the times were not applied");
+    }
+
+    /// The copy `mv` makes after its step 5, which must create the destination operand.
+    fn must_create_config() -> super::CopyConfig {
+        super::CopyConfig {
+            force: true,
+            deref: super::DerefMode::Never,
+            interactive: false,
+            preserve: true,
+            recursive: true,
+            no_clobber: false,
+            prog: "mv",
+            continue_on_error: false,
+            destination: super::Destination::MustCreate,
+        }
+    }
+
+    /// A fresh directory for one test, under the system's temporary directory.
+    fn must_create_scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("copy_must_create_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    /// Copy `source` to `target` in `MustCreate` mode; the error must be the destination's
+    /// EEXIST, whatever kind of file the source is.
+    fn copy_must_create(source: &std::path::Path, target: &std::path::Path) {
+        let result = super::copy_file(
+            &must_create_config(),
+            source,
+            target,
+            &mut std::collections::HashSet::new(),
+            None,
+            |_| false,
+        );
+        let exists = super::error_string(&std::io::Error::from_raw_os_error(libc::EEXIST));
+        match result {
+            Ok(()) => panic!("copied onto a destination it did not create"),
+            Err(e) => assert!(e.to_string().ends_with(&exists), "{e}"),
+        }
+    }
+
+    /// A hard link planted at the destination's name is never written into (as root it would
+    /// also take the source's owner and mode).
+    #[test]
+    fn must_create_refuses_a_file_found_at_the_destination() {
+        use std::fs;
+
+        let dir = must_create_scratch("file");
+        fs::write(dir.join("source"), b"moved").unwrap();
+        fs::write(dir.join("victim"), b"victim").unwrap();
+        fs::hard_link(dir.join("victim"), dir.join("target")).unwrap();
+
+        copy_must_create(&dir.join("source"), &dir.join("target"));
+        let victim = fs::read(dir.join("victim")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(victim, b"victim");
+    }
+
+    /// A directory found at the destination's name is not filled.
+    #[test]
+    fn must_create_refuses_a_directory_found_at_the_destination() {
+        use std::fs;
+
+        let dir = must_create_scratch("dir");
+        fs::create_dir(dir.join("source")).unwrap();
+        fs::write(dir.join("source/f"), b"moved").unwrap();
+        fs::create_dir(dir.join("target")).unwrap();
+
+        copy_must_create(&dir.join("source"), &dir.join("target"));
+        let entries = fs::read_dir(dir.join("target")).unwrap().count();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(entries, 0);
+    }
+
+    /// Nor is anything found there unlinked to make room for a symbolic link.
+    #[test]
+    fn must_create_refuses_to_replace_a_file_with_a_symlink() {
+        use std::fs;
+
+        let dir = must_create_scratch("symlink");
+        std::os::unix::fs::symlink("anywhere", dir.join("source")).unwrap();
+        fs::write(dir.join("target"), b"kept").unwrap();
+
+        copy_must_create(&dir.join("source"), &dir.join("target"));
+        let kept = fs::read(dir.join("target")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(kept, b"kept");
     }
 }

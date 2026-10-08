@@ -281,3 +281,36 @@ fn mv_leaves_source_entries_added_or_changed_after_the_copy() {
     let _ = fs::remove_dir_all(&base);
     let _ = fs::remove_dir_all(&other);
 }
+
+/// A destination that is a dangling symbolic link is replaced, as rename(2) replaces it on one
+/// filesystem: the copy across filesystems creates the destination itself, and never writes
+/// through anything found at its name (here, creating the file the link names).
+#[test]
+fn mv_replaces_a_dangling_symlink_destination_across_filesystems() {
+    let Some(other) = other_fs("dangling_dest") else {
+        return;
+    };
+    let base = scratch("dangling_dest");
+    fs::write(base.join("f"), b"moved").unwrap();
+    let target = other.join("link");
+    symlink(other.join("elsewhere"), &target).unwrap();
+
+    let out = Command::new(get_binary_path("mv"))
+        .args([base.join("f"), target.clone()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute mv");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !other.join("elsewhere").exists(),
+        "mv wrote through a dangling destination link; stderr: {stderr}"
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(fs::symlink_metadata(&target).unwrap().is_file());
+    assert_eq!(fs::read(&target).unwrap(), b"moved");
+    assert!(!base.join("f").exists());
+
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&other);
+}

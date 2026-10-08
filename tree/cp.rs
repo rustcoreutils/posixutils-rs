@@ -10,7 +10,9 @@
 mod common;
 mod parents;
 
-use self::common::{copy_file, copy_files, error_string, CopyConfig, DerefMode, InodeMap};
+use self::common::{
+    copy_file, copy_files, error_string, CopyConfig, DerefMode, Destination, InodeMap,
+};
 use clap::Parser;
 use gettextrs::gettext;
 use std::collections::HashSet;
@@ -137,6 +139,7 @@ impl CopyConfig {
             prog: "cp",
             // POSIX cp continues with same-level/ancestor files after a per-file failure.
             continue_on_error: true,
+            destination: Destination::MayExist,
         }
     }
 }

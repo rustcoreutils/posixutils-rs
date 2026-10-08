@@ -13,7 +13,10 @@ mod remove_moved;
 
 use self::common::{copy_moved_file, error_string};
 use clap::Parser;
-use common::{CopiedSources, CopyConfig, DerefMode, InodeMap, MoveSource, PinnedDirs, PinnedEntry};
+use common::{
+    CopiedSources, CopyConfig, DerefMode, Destination, InodeMap, MoveSource, PinnedDirs,
+    PinnedEntry,
+};
 use gettextrs::gettext;
 use remove_moved::remove_moved_source;
 use std::{
@@ -118,6 +121,9 @@ fn copy_hierarchy(
         prog: "mv",
         // mv must stop the duplication on the first structural error so the source is not removed.
         continue_on_error: false,
+        // Step 5 removed the destination, or found none: anything at its name now appeared
+        // during the move, and is neither written into nor filled.
+        destination: Destination::MustCreate,
     };
 
     let mut copied = CopiedSources::default();
@@ -162,7 +168,10 @@ fn move_file(
         .map_err(|e| cannot_move(source, target, &e))?;
     let target_filename = CString::new(target.as_os_str().as_bytes()).unwrap();
 
-    let target_md = match ftw::Metadata::new(libc::AT_FDCWD, &target_filename, true) {
+    // The destination itself, not followed, as rename(2) replaces it: a symbolic link there,
+    // dangling or not, is a non-directory that the move replaces (step 5 removes it before a
+    // copy, which must then create the destination itself).
+    let target_md = match ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false) {
         Ok(md) => Some(md),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
@@ -174,16 +183,11 @@ fn move_file(
         }
     };
     let target_exists = target_md.is_some();
-    let target_is_dir = match &target_md {
-        Some(md) => md.file_type() == ftw::FileType::Directory,
-        None => false,
-    };
+    let target_is_dir = target_md.as_ref().is_some_and(|md| md.is_dir());
     // As in `rm`, a symbolic link destination is not write-protected: `mv` replaces the link
     // itself, not what it points at, so neither the link's own mode bits nor the referent's
-    // apply. `target_md` follows the link, so the type has to come from an `lstat`.
-    let target_is_symlink = ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false)
-        .map(|md| md.file_type() == ftw::FileType::SymbolicLink)
-        .unwrap_or(false);
+    // apply.
+    let target_is_symlink = target_md.as_ref().is_some_and(|md| md.is_symlink());
     let target_is_writable =
         target_is_symlink || ftw::is_writable_at(libc::AT_FDCWD, &target_filename);
 

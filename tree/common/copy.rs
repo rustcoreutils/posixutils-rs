@@ -208,6 +208,28 @@ fn fd_metadata(fd: libc::c_int) -> io::Result<fs::Metadata> {
     std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) }).metadata()
 }
 
+/// The diagnostic for `open_made_dir` failing on the directory cp made at `path`.
+///
+/// Something other than a directory swapped in for it (ELOOP, ENOTDIR) is reported as one found
+/// there would be ("exists but is not a directory"), any other system error as cp reports a
+/// directory it cannot open; a diagnostic of cp's own, which already names the path (the
+/// directory "was replaced after it was made"), is kept as it is.
+pub fn made_dir_open_error(path: &Path, e: io::Error) -> io::Error {
+    match e.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => io::Error::other(gettext!(
+            "'{}' exists but is not a directory: {}",
+            path.display(),
+            error_string(&e)
+        )),
+        Some(_) => io::Error::other(gettext!(
+            "cannot open directory '{}': {}",
+            path.display(),
+            error_string(&e)
+        )),
+        None => e,
+    }
+}
+
 /// `openat(dirfd, name, flags)`.
 fn open_fd_at(dirfd: libc::c_int, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags) };
@@ -1892,6 +1914,7 @@ where
                                 &target_filename_cstr,
                                 &target,
                             )
+                            .map_err(|e| made_dir_open_error(&target, e))
                             .and_then(|(fd, trust)| {
                                 let fd = ftw::FileDescriptor::from(fd);
                                 let md = fd_metadata(fd.as_raw_fd())?;
@@ -2191,6 +2214,36 @@ fn copy_special_file(
 mod tests {
     // made_by_us and the by-name link times are tested with them, in plib::madefs.
     use super::MadeTrust;
+
+    /// A directory cp made that cannot be opened is reported against its path: as one that is
+    /// no longer a directory when something else was swapped in for it, and otherwise as cp
+    /// reports any directory it cannot open.
+    #[test]
+    fn a_made_directory_that_cannot_be_opened_is_named() {
+        use super::made_dir_open_error;
+        use std::io;
+        use std::path::Path;
+
+        let path = Path::new("t/dir");
+        let swapped = made_dir_open_error(path, io::Error::from_raw_os_error(libc::ELOOP));
+        assert!(
+            swapped
+                .to_string()
+                .starts_with("'t/dir' exists but is not a directory: "),
+            "{swapped}"
+        );
+        let other = made_dir_open_error(path, io::Error::from_raw_os_error(libc::EACCES));
+        assert!(
+            other
+                .to_string()
+                .starts_with("cannot open directory 't/dir': "),
+            "{other}"
+        );
+        // A diagnostic that already names the path is kept as it is.
+        let named = io::Error::other("'t/dir' was replaced after it was made");
+        let kept = made_dir_open_error(path, named);
+        assert_eq!(kept.to_string(), "'t/dir' was replaced after it was made");
+    }
 
     /// -p on an object trusted only as owned like its parent: the times are applied, the mode
     /// (and owner) are not, and that is reported.

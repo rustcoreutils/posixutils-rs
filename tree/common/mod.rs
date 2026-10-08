@@ -22,8 +22,9 @@ use std::{ffi::CStr, io};
 
 // cp and mv
 pub use copy::{
-    copy_file, copy_file_at, copy_files, copy_moved_file, finish_made_dir_mode, open_made_dir,
-    preserve_through_fd, CopyConfig, DerefMode, Destination, InodeMap, MadeTrust, MoveSource,
+    copy_file, copy_file_at, copy_files, copy_moved_file, finish_made_dir_mode,
+    made_dir_open_error, open_made_dir, preserve_through_fd, CopyConfig, DerefMode, Destination,
+    InodeMap, MadeTrust, MoveSource,
 };
 
 // mv

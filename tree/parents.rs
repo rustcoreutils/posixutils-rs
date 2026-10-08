@@ -16,8 +16,8 @@
 //! descriptors.
 
 use crate::common::{
-    copy_file_at, error_string, finish_made_dir_mode, open_made_dir, preserve_through_fd,
-    CopyConfig, InodeMap, MadeTrust,
+    copy_file_at, error_string, finish_made_dir_mode, made_dir_open_error, open_made_dir,
+    preserve_through_fd, CopyConfig, InodeMap, MadeTrust,
 };
 use gettextrs::gettext;
 use std::collections::HashSet;
@@ -121,7 +121,8 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
             // parent could have swapped in a directory of their own; and the umask may have
             // withheld the owner permission the directory needs to be filled
             // (`open_made_dir`).
-            let (opened, trust) = open_made_dir(dest_dir.as_raw_fd(), &name, &dest_path)?;
+            let (opened, trust) = open_made_dir(dest_dir.as_raw_fd(), &name, &dest_path)
+                .map_err(|e| made_dir_open_error(&dest_path, e))?;
             let next_dest = File::from(opened);
             made.push(MadeDir {
                 dest: next_dest.try_clone()?,

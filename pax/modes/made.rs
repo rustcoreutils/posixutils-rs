@@ -307,6 +307,8 @@ pub(crate) fn verify_made_dir(
     Ok(Some(trust))
 }
 
+#[cfg(all(target_os = "linux", test))]
+use linux::utimens_link_by_name;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{proc_fd_name, procfs_dir, MadeNode};
 #[cfg(not(target_os = "linux"))]
@@ -320,7 +322,6 @@ mod linux {
     use super::*;
     use std::ffi::CString;
     use std::fs::File;
-    use std::marker::PhantomData;
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
     /// A FIFO, device or symbolic link pax has just made, held by descriptor.
@@ -328,7 +329,9 @@ mod linux {
         fd: OwnedFd,
         symlink: bool,
         trust: MadeTrust,
-        _dir: PhantomData<BorrowedFd<'a>>,
+        /// Where it was made, for the one by-name fallback (`utimens`).
+        dirfd: BorrowedFd<'a>,
+        name: &'a CStr,
     }
 
     impl<'a> MadeNode<'a> {
@@ -351,7 +354,8 @@ mod linux {
                 fd,
                 symlink: made_type == libc::S_IFLNK,
                 trust,
-                _dir: PhantomData,
+                dirfd,
+                name,
             })
         }
 
@@ -371,8 +375,10 @@ mod linux {
 
         /// `utimensat` with `AT_EMPTY_PATH` (Linux 5.8 and later). Before
         /// that, a FIFO or device through `/proc/self/fd`, which names exactly
-        /// the pinned inode; a symbolic link has no such route, since that
-        /// path is followed to the link and then through it.
+        /// the pinned inode. A symbolic link has no such route -- that path is
+        /// followed to the link and then through it -- so its times go by
+        /// name, only while the name still holds the pinned link
+        /// (`utimens_link_by_name`).
         pub(crate) fn utimens(&self, times: &[libc::timespec; 2]) -> io::Result<()> {
             let fd = self.fd.as_raw_fd();
             let r =
@@ -381,8 +387,11 @@ mod linux {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
             };
-            if err.raw_os_error() != Some(libc::EINVAL) || self.symlink {
+            if err.raw_os_error() != Some(libc::EINVAL) {
                 return Err(err);
+            }
+            if self.symlink {
+                return utimens_link_by_name(self.dirfd, self.name, self.fd.as_fd(), times);
             }
             let proc_dir = procfs_dir()?;
             let pinned = proc_fd_name(fd);
@@ -390,6 +399,32 @@ mod linux {
                 libc::utimensat(proc_dir.as_raw_fd(), pinned.as_ptr(), times.as_ptr(), 0)
             })
         }
+    }
+
+    /// Set the times of the symbolic link `name` below `dirfd` by name, with
+    /// `AT_SYMLINK_NOFOLLOW`, if `lstat` shows the name still holds the link
+    /// pinned on `pinned`; fail otherwise.
+    ///
+    /// For kernels before 5.8, whose `utimensat` refuses `AT_EMPTY_PATH`.
+    /// The residual is a replacement between the `lstat` and the
+    /// `utimensat`: a hard link to another file swapped in at that moment
+    /// takes the link's times -- an mtime, at worst.
+    pub(crate) fn utimens_link_by_name(
+        dirfd: BorrowedFd<'_>,
+        name: &CStr,
+        pinned: BorrowedFd<'_>,
+        times: &[libc::timespec; 2],
+    ) -> io::Result<()> {
+        let held = fstat(pinned)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let nofollow = libc::AT_SYMLINK_NOFOLLOW;
+        cvt(unsafe { libc::fstatat(dirfd.as_raw_fd(), name.as_ptr(), &mut st, nofollow) })?;
+        let id = crate::modes::anchored::file_id;
+        if id(&st) != id(&held) || st.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            return Err(replaced());
+        }
+        let (dir, path) = (dirfd.as_raw_fd(), name.as_ptr());
+        cvt(unsafe { libc::utimensat(dir, path, times.as_ptr(), nofollow) })
     }
 
     /// The `fchmodat2` system call number (Linux 6.6 and later), the generic
@@ -660,6 +695,41 @@ mod tests {
             is_dir,
             owners,
         }
+    }
+
+    /// Before Linux 5.8 a symbolic link's times go by name: only while the
+    /// name still holds the pinned link, never through a hard link to another
+    /// file swapped in for it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn link_times_by_name_reach_only_the_pinned_link() {
+        use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+        use std::os::unix::fs::MetadataExt;
+        let tmp = plib::tmp::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("anywhere", tmp.path().join("l")).unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let pin = unsafe { libc::openat(dir.as_raw_fd(), c"l".as_ptr(), flags) };
+        assert!(pin >= 0);
+        let pin = unsafe { OwnedFd::from_raw_fd(pin) };
+        let at = |sec| libc::timespec {
+            tv_sec: sec,
+            tv_nsec: 0,
+        };
+
+        let times = [at(12345), at(12345)];
+        utimens_link_by_name(dir.as_fd(), c"l", pin.as_fd(), &times).unwrap();
+        let md = std::fs::symlink_metadata(tmp.path().join("l")).unwrap();
+        assert_eq!(md.mtime(), 12345);
+
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "").unwrap();
+        std::fs::remove_file(tmp.path().join("l")).unwrap();
+        std::fs::hard_link(&victim, tmp.path().join("l")).unwrap();
+        let before = std::fs::metadata(&victim).unwrap().mtime();
+        let times = [at(1), at(1)];
+        assert!(utimens_link_by_name(dir.as_fd(), c"l", pin.as_fd(), &times).is_err());
+        assert_eq!(std::fs::metadata(&victim).unwrap().mtime(), before);
     }
 
     #[test]

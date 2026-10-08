@@ -14,11 +14,12 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
 
 use plib::testing::get_binary_path;
+use plib::tmp::TempDir;
 
 use super::{run_test_find, run_test_find_sorted, scratch_dir};
 
@@ -29,8 +30,9 @@ use super::{run_test_find, run_test_find_sorted, scratch_dir};
 /// a.txt (6 bytes, mtime 1577934245.123456789)   link -> a.txt
 /// sub/b (2 bytes)   sub/deep/   .hid/b (1 byte)
 /// ```
-fn make_tree(tag: &str) -> PathBuf {
-    let dir = scratch_dir(tag);
+fn make_tree() -> TempDir {
+    let tmp = scratch_dir();
+    let dir = tmp.path();
     let mut a = File::create(dir.join("a.txt")).unwrap();
     a.write_all(b"hello\n").unwrap();
     a.set_modified(UNIX_EPOCH + Duration::new(1_577_934_245, 123_456_789))
@@ -40,7 +42,7 @@ fn make_tree(tag: &str) -> PathBuf {
     fs::create_dir(dir.join(".hid")).unwrap();
     fs::write(dir.join(".hid/b"), "y").unwrap();
     symlink("a.txt", dir.join("link")).unwrap();
-    dir
+    tmp
 }
 
 /// Run find in `cwd` and return (stdout bytes, stderr, exit code).
@@ -69,7 +71,8 @@ fn sorted_lines(bytes: &[u8]) -> Vec<String> {
 
 #[test]
 fn find_mindepth_maxdepth() {
-    let dir = make_tree("depth");
+    let tmp = make_tree();
+    let dir = tmp.path();
     let d = dir.to_str().unwrap();
     let at = |p: &str| format!("{d}/{p}");
     let (a, link, sub, hid) = (at("a.txt"), at("link"), at("sub"), at(".hid"));
@@ -91,16 +94,16 @@ fn find_mindepth_maxdepth() {
         "",
         0,
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// dh_update_autotools_config: without `-mindepth 1` the starting point `.`
 /// would match `-name '.*'` and be pruned.
 #[test]
 fn find_mindepth_dh_update_autotools_config() {
-    let dir = make_tree("dh_autotools");
+    let tmp = make_tree();
+    let dir = tmp.path();
     let (out, err, code) = find_in(
-        &dir,
+        dir,
         &[
             "-mindepth",
             "1",
@@ -123,7 +126,6 @@ fn find_mindepth_dh_update_autotools_config() {
         (sorted_lines(&out), err.as_str(), code),
         (vec!["./sub/b".to_string()], "", 0)
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -145,9 +147,10 @@ fn find_maxdepth_bad_argument() {
 /// dh_autoreconf's `timesize` and `md5` modes.
 #[test]
 fn find_printf_dh_autoreconf() {
-    let dir = make_tree("dh_autoreconf");
+    let tmp = make_tree();
+    let dir = tmp.path();
     let (out, err, code) = find_in(
-        &dir,
+        dir,
         &[
             "!",
             "-path",
@@ -175,7 +178,6 @@ fn find_printf_dh_autoreconf() {
             0
         )
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `%T@` as GNU find 4.9 prints it: seconds, a point, and ten digits.
@@ -189,30 +191,30 @@ fn mtime_at(path: &Path) -> String {
 /// (`%P`): `%P` drops the starting point, and is empty for it.
 #[test]
 fn find_printf_relative_path_and_escapes() {
-    let dir = make_tree("printf_rel");
+    let tmp = make_tree();
+    let dir = tmp.path();
     let d = dir.to_str().unwrap();
-    let (out, _, code) = find_in(&dir, &[d, "-type", "f", "-printf", "/etc/%P\\n"]);
+    let (out, _, code) = find_in(dir, &[d, "-type", "f", "-printf", "/etc/%P\\n"]);
     assert_eq!(code, 0);
     assert_eq!(
         sorted_lines(&out),
         ["/etc/.hid/b", "/etc/a.txt", "/etc/sub/b"]
     );
 
-    let (out, _, code) = find_in(&dir, &["-name", "a.txt", "-printf", "%P\\0"]);
+    let (out, _, code) = find_in(dir, &["-name", "a.txt", "-printf", "%P\\0"]);
     assert_eq!((out, code), (b"a.txt\0".to_vec(), 0));
 
-    let (out, _, code) = find_in(&dir, &[".", "-maxdepth", "0", "-printf", "[%P]%%\\\\\\n"]);
+    let (out, _, code) = find_in(dir, &[".", "-maxdepth", "0", "-printf", "[%P]%%\\\\\\n"]);
     assert_eq!((out, code), (b"[]%\\\n".to_vec(), 0));
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `-printf` is an action: no implicit `-print` is added.
 #[test]
 fn find_printf_suppresses_default_print() {
-    let dir = make_tree("printf_action");
-    let (out, _, code) = find_in(&dir, &["-name", "a.txt", "-printf", "x"]);
+    let tmp = make_tree();
+    let dir = tmp.path();
+    let (out, _, code) = find_in(dir, &["-name", "a.txt", "-printf", "x"]);
     assert_eq!((out, code), (b"x".to_vec(), 0));
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Only the directives and escapes debhelper uses are implemented; any other
@@ -248,9 +250,10 @@ fn find_printf_unsupported_is_an_error() {
 /// Output written before an `-exec` runs reaches stdout before the child's.
 #[test]
 fn find_printf_flushed_before_exec() {
-    let dir = make_tree("printf_exec");
+    let tmp = make_tree();
+    let dir = tmp.path();
     let (out, _, code) = find_in(
-        &dir,
+        dir,
         &[
             ".",
             "-maxdepth",
@@ -267,13 +270,12 @@ fn find_printf_flushed_before_exec() {
     );
     assert_eq!((out, code), (b"XY\n".to_vec(), 0));
     let (out, _, code) = find_in(
-        &dir,
+        dir,
         &[
             "sub", "-name", "b", "-printf", "X", "-exec", "echo", "Y", "{}", "+",
         ],
     );
     assert_eq!((out, code), (b"XY sub/b\n".to_vec(), 0));
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A package-like staging tree for the GNU tests and operators debhelper
@@ -286,8 +288,9 @@ fn find_printf_flushed_before_exec() {
 /// doc/pkg/README  doc/pkg/Notes.HTML  doc/pkg/examples/ex.txt
 /// link -> exe   dangling -> nowhere
 /// ```
-fn make_pkg_tree(tag: &str) -> PathBuf {
-    let dir = scratch_dir(tag);
+fn make_pkg_tree() -> TempDir {
+    let tmp = scratch_dir();
+    let dir = tmp.path();
     let file = |name: &str, len: usize, mode: u32| {
         let p = dir.join(name);
         fs::write(&p, vec![b'x'; len]).unwrap();
@@ -308,7 +311,7 @@ fn make_pkg_tree(tag: &str) -> PathBuf {
     file("doc/pkg/examples/ex.txt", 1, 0o644);
     symlink("exe", dir.join("link")).unwrap();
     symlink("nowhere", dir.join("dangling")).unwrap();
-    dir
+    tmp
 }
 
 /// Run find in `dir` and expect the sorted output lines, no diagnostics and a
@@ -329,23 +332,24 @@ fn expect_lines(dir: &Path, args: &[&str], expected: &[&str]) {
 /// permissions unfixed); dh_compress prunes with `-prune -false`.
 #[test]
 fn find_true_false() {
-    let dir = make_pkg_tree("true_false");
-    expect_lines(&dir, &["-name", "plain", "-true"], &["./plain"]);
-    expect_lines(&dir, &["-false"], &[]);
+    let tmp = make_pkg_tree();
+    let dir = tmp.path();
+    expect_lines(dir, &["-name", "plain", "-true"], &["./plain"]);
+    expect_lines(dir, &["-false"], &[]);
     expect_lines(
-        &dir,
+        dir,
         &["-name", "plain", "-false", "-o", "-name", "exe"],
         &["./exe"],
     );
     // dh_fixperms: `find DIR EXPR -a -true -a -true -print0`
     let (out, err, code) = find_in(
-        &dir,
+        dir,
         &[".", "-name", "exe", "-a", "-true", "-a", "-true", "-print0"],
     );
     assert_eq!((out, err.as_str(), code), (b"./exe\0".to_vec(), "", 0));
     // dh_compress: the pruned examples directory yields nothing.
     expect_lines(
-        &dir,
+        dir,
         &[
             "doc",
             "(",
@@ -368,7 +372,6 @@ fn find_true_false() {
         ],
         &["doc/pkg/README", "doc/pkg/Notes.HTML"],
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// [`expect_lines`] with the arguments given as whitespace-separated words.
@@ -381,12 +384,13 @@ fn expect_words(dir: &Path, words: &str, expected: &[&str]) {
 /// POSIX 512-byte blocks. Only the `k` unit is accepted.
 #[test]
 fn find_size_kilobytes() {
-    let dir = make_pkg_tree("size_k");
-    expect_words(&dir, "-type f -size +4k", &["./fourplus", "./big"]);
-    expect_words(&dir, "-type f -size 4k", &["./four"]);
-    expect_words(&dir, "-type f -size -1k", &["./plain"]);
+    let tmp = make_pkg_tree();
+    let dir = tmp.path();
+    expect_words(dir, "-type f -size +4k", &["./fourplus", "./big"]);
+    expect_words(dir, "-type f -size 4k", &["./four"]);
+    expect_words(dir, "-type f -size -1k", &["./plain"]);
     expect_words(
-        &dir,
+        dir,
         "-type f -size 1k",
         &[
             "./exe",
@@ -398,7 +402,6 @@ fn find_size_kilobytes() {
         ],
     );
     run_test_find(&[".", "-size", "1M"], "", "find: invalid number: 1M\n", 1);
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `-regex` as debhelper passes it: dh_md5sums, dh_fixperms, and the `-X`
@@ -406,10 +409,11 @@ fn find_size_kilobytes() {
 /// matches the WHOLE pathname.
 #[test]
 fn find_regex_debhelper() {
-    let dir = make_pkg_tree("regex_dh");
+    let tmp = make_pkg_tree();
+    let dir = tmp.path();
     // dh_md5sums: `find -type f ! -regex './DEBIAN/.*' -printf '%P\0'`
     let (out, err, code) = find_in(
-        &dir,
+        dir,
         &[
             "-type",
             "f",
@@ -435,9 +439,9 @@ fn find_regex_debhelper() {
     ];
     assert_eq!((names, err.as_str(), code), (want, "", 0));
     // Anchored at both ends.
-    expect_words(&dir, "-regex exe", &[]);
-    expect_words(&dir, "-regex ./ex", &[]);
-    expect_words(&dir, "-regex .*/exe", &["./exe"]);
+    expect_words(dir, "-regex exe", &[]);
+    expect_words(dir, "-regex ./ex", &[]);
+    expect_words(dir, "-regex .*/exe", &["./exe"]);
     // dh_fixperms, on an absolute staging path.
     let d = dir.to_str().unwrap();
     let doc = format!("{d}/doc");
@@ -447,13 +451,13 @@ fn find_regex_debhelper() {
         format!("{d}/doc/pkg/Notes.HTML"),
     );
     expect_lines(
-        &dir,
+        dir,
         &[&doc, "-type", "f", "!", "-regex", &examples],
         &[&readme, &notes],
     );
     // dh_* -X.HTML -Xxampl (debhelper joins them with `-or`)
     expect_words(
-        &dir,
+        dir,
         r"( -regex .*\.HTML.* -o -regex .*xampl.* )",
         &[
             "./doc/pkg/Notes.HTML",
@@ -461,7 +465,6 @@ fn find_regex_debhelper() {
             "./doc/pkg/examples/ex.txt",
         ],
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The Emacs syntax that is GNU find's default: `+` and `?` are operators,
@@ -469,22 +472,22 @@ fn find_regex_debhelper() {
 /// literal, and so is an operator with nothing to repeat.
 #[test]
 fn find_regex_emacs_syntax() {
-    let dir = scratch_dir("regex_emacs");
+    let tmp = scratch_dir();
+    let dir = tmp.path();
     for name in ["ee", "exe", "exxe", "c++", "paren(1)", "{1}", "+", "a|b"] {
         fs::write(dir.join(name), "").unwrap();
     }
-    expect_words(&dir, "-regex .*/ex+e", &["./exe", "./exxe"]);
-    expect_words(&dir, "-regex .*/ex?e", &["./ee", "./exe"]);
-    expect_words(&dir, r"-regex .*/\(ee\|exe\)", &["./ee", "./exe"]);
-    expect_words(&dir, r"-regex .*c\+\+", &["./c++"]);
-    expect_words(&dir, "-regex .*/c++", &[]);
-    expect_words(&dir, "-regex .*/paren(1)", &["./paren(1)"]);
-    expect_words(&dir, "-regex .*{1}", &["./{1}"]);
-    expect_words(&dir, "-regex .*/a|b", &["./a|b"]);
-    expect_words(&dir, r"-regex .*/\(+\)", &["./+"]);
-    expect_words(&dir, r"-regex ^\./exe$", &["./exe"]);
-    expect_words(&dir, "-regex .*/[^e]*", &["./c++", "./{1}", "./+", "./a|b"]);
-    fs::remove_dir_all(&dir).unwrap();
+    expect_words(dir, "-regex .*/ex+e", &["./exe", "./exxe"]);
+    expect_words(dir, "-regex .*/ex?e", &["./ee", "./exe"]);
+    expect_words(dir, r"-regex .*/\(ee\|exe\)", &["./ee", "./exe"]);
+    expect_words(dir, r"-regex .*c\+\+", &["./c++"]);
+    expect_words(dir, "-regex .*/c++", &[]);
+    expect_words(dir, "-regex .*/paren(1)", &["./paren(1)"]);
+    expect_words(dir, "-regex .*{1}", &["./{1}"]);
+    expect_words(dir, "-regex .*/a|b", &["./a|b"]);
+    expect_words(dir, r"-regex .*/\(+\)", &["./+"]);
+    expect_words(dir, r"-regex ^\./exe$", &["./exe"]);
+    expect_words(dir, "-regex .*/[^e]*", &["./c++", "./{1}", "./+", "./a|b"]);
 }
 
 /// Emacs constructs with no POSIX counterpart are refused, not misread.
@@ -521,20 +524,21 @@ fn find_regex_unsupported_is_an_error() {
 /// exclusions (`-regex .*X.* -or -regex .*Y.*`).
 #[test]
 fn find_or_and_spellings() {
-    let dir = make_pkg_tree("or_and");
+    let tmp = make_pkg_tree();
+    let dir = tmp.path();
     expect_words(
-        &dir,
+        dir,
         "( -type f -or -type l ) -and -name *e*",
         &["./exe", "./doc/pkg/examples/ex.txt", "./doc/pkg/Notes.HTML"],
     );
     // `-and` binds tighter than `-or`.
     expect_words(
-        &dir,
+        dir,
         "-name e* -and -type d -or -name plain",
         &["./emptydir", "./doc/pkg/examples", "./plain"],
     );
     expect_words(
-        &dir,
+        dir,
         r"! ( -regex .*\.HTML.* -or -regex .*xampl.* ) -and -path ./doc*",
         &["./doc", "./doc/pkg", "./doc/pkg/README"],
     );
@@ -544,26 +548,25 @@ fn find_or_and_spellings() {
         "find: expected an expression after '-or'\n",
         1,
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `-perm /mode` (dh_shlibdeps `-perm /111`): any of the bits is set; with
 /// no bits at all it matches every file, as in GNU find.
 #[test]
 fn find_perm_any_bits() {
-    let dir = make_pkg_tree("perm_any");
-    expect_words(&dir, "-type f -perm /111", &["./exe", "./ux"]);
-    expect_words(&dir, "-type f -perm /011", &["./exe"]);
-    expect_words(&dir, "-type f -perm /u+x", &["./exe", "./ux"]);
-    expect_words(&dir, "-name plain -perm /000", &["./plain"]);
+    let tmp = make_pkg_tree();
+    let dir = tmp.path();
+    expect_words(dir, "-type f -perm /111", &["./exe", "./ux"]);
+    expect_words(dir, "-type f -perm /011", &["./exe"]);
+    expect_words(dir, "-type f -perm /u+x", &["./exe", "./ux"]);
+    expect_words(dir, "-name plain -perm /000", &["./plain"]);
     // dh_shlibdeps
     expect_words(
-        &dir,
+        dir,
         "-type f ( -perm /111 -or -name *.so* -or -name *.node )",
         &["./exe", "./ux"],
     );
     run_test_find(&[".", "-perm", "/9"], "", "find: invalid mode: 9\n", 1);
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `-empty`: an empty regular file or a directory with no entries; never a
@@ -571,11 +574,12 @@ fn find_perm_any_bits() {
 /// `! -empty`.
 #[test]
 fn find_empty() {
-    let dir = make_pkg_tree("empty");
-    expect_words(&dir, "-empty", &["./plain", "./emptydir"]);
-    expect_words(&dir, "( -type d -and -empty )", &["./emptydir"]);
+    let tmp = make_pkg_tree();
+    let dir = tmp.path();
+    expect_words(dir, "-empty", &["./plain", "./emptydir"]);
+    expect_words(dir, "( -type d -and -empty )", &["./emptydir"]);
     expect_words(
-        &dir,
+        dir,
         "doc ( -type f -or -type l ) -and ! -empty",
         &[
             "doc/pkg/README",
@@ -583,7 +587,6 @@ fn find_empty() {
             "doc/pkg/examples/ex.txt",
         ],
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Every entry under `dir`, relative to it, sorted.
@@ -608,7 +611,8 @@ fn tree_listing(dir: &Path) -> Vec<String> {
 /// removes the starting point `.`, and reports what it cannot remove.
 #[test]
 fn find_delete() {
-    let dir = scratch_dir("delete");
+    let tmp = scratch_dir();
+    let dir = tmp.path();
     for d in ["a/b", "keep", "rmme/x/y", "full"] {
         fs::create_dir_all(dir.join(d)).unwrap();
     }
@@ -626,20 +630,20 @@ fn find_delete() {
     }
     // dh_autotools-dev_restoreconfig
     expect_words(
-        &dir,
+        dir,
         ". -type f ( -name config.guess.dh-orig -o -name config.sub.dh-orig ) -delete",
         &[],
     );
     // dh_doxygen
     expect_words(
-        &dir,
+        dir,
         "keep -type f -a ( -name *.md5 -o -name *.map ) -delete",
         &[],
     );
     // A whole tree, children first.
-    expect_words(&dir, "rmme -delete", &[]);
+    expect_words(dir, "rmme -delete", &[]);
     assert_eq!(
-        tree_listing(&dir),
+        tree_listing(dir),
         [
             "a",
             "a/b",
@@ -651,7 +655,7 @@ fn find_delete() {
         ]
     );
 
-    let (out, err, code) = find_in(&dir, &["-name", "full", "-delete"]);
+    let (out, err, code) = find_in(dir, &["-name", "full", "-delete"]);
     assert_eq!(
         (out, err.as_str(), code),
         (
@@ -661,9 +665,9 @@ fn find_delete() {
         )
     );
 
-    expect_words(&dir, "-delete", &[]);
+    expect_words(dir, "-delete", &[]);
     assert!(dir.is_dir());
-    assert_eq!(tree_listing(&dir), Vec::<String>::new());
+    assert_eq!(tree_listing(dir), Vec::<String>::new());
 
     run_test_find(
         &[".", "-prune", "-delete"],
@@ -671,18 +675,17 @@ fn find_delete() {
         "find: -delete implies -depth, which makes -prune do nothing; give -depth explicitly to go ahead\n",
         1,
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `-executable` (dh_movelibkdeinit `-type f -executable`): the invoking
 /// user may execute the file (`access(X_OK)`), or search the directory.
 #[test]
 fn find_executable() {
-    let dir = make_pkg_tree("executable");
-    expect_words(&dir, "-type f -executable", &["./exe", "./ux"]);
-    expect_words(&dir, "-type d -name emptydir -executable", &["./emptydir"]);
+    let tmp = make_pkg_tree();
+    let dir = tmp.path();
+    expect_words(dir, "-type f -executable", &["./exe", "./ux"]);
+    expect_words(dir, "-type d -name emptydir -executable", &["./emptydir"]);
     // A symlink is tested through to its target; a dangling one is not.
-    expect_words(&dir, "-name link -executable", &["./link"]);
-    expect_words(&dir, "-name dangling -executable", &[]);
-    fs::remove_dir_all(&dir).unwrap();
+    expect_words(dir, "-name link -executable", &["./link"]);
+    expect_words(dir, "-name dangling -executable", &[]);
 }

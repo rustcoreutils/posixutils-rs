@@ -1062,14 +1062,14 @@ fn od_count_is_a_length_not_an_end_offset() {
 fn od_skip_of_exactly_the_whole_input_prints_the_offset() {
     use std::io::Write;
 
-    let path = std::env::temp_dir().join(format!("od_skip_all_{}", std::process::id()));
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = dir.path().join("skip_all");
     std::fs::File::create(&path)
         .unwrap()
         .write_all(b"12345")
         .unwrap();
 
     let (from_file, stderr, code) = od_raw(&["-j", "5", "-t", "x1", path.to_str().unwrap()], b"");
-    std::fs::remove_file(&path).ok();
     assert_eq!(
         code,
         Some(0),
@@ -1312,8 +1312,8 @@ fn od_suppression_compares_the_input_not_the_output() {
 fn od_fills_a_block_across_several_files() {
     use std::io::Write;
 
-    let dir = std::env::temp_dir().join(format!("od_multifile_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path();
     let names: Vec<std::path::PathBuf> =
         [("a1", &b"AAAAA"[..]), ("a2", b"BB"), ("a3", &[b'C'; 16])]
             .iter()
@@ -1332,7 +1332,6 @@ fn od_fills_a_block_across_several_files() {
         .chain(names.iter().map(|p| p.to_str().unwrap()))
         .collect();
     let (stdout, _, code) = od_raw(&args, b"");
-    std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(code, Some(0));
     // 23 bytes: one full 16-byte block, then a 7-byte tail. No NUL may appear

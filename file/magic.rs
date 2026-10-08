@@ -772,15 +772,13 @@ mod tests {
             message: "should not match".to_string(),
         };
 
-        // Create a temp file with some data
-        let tmp = std::env::temp_dir().join("posixutils_test_size_guard");
-        std::fs::write(&tmp, b"0123456789abcdef0123456789abcdef").unwrap();
-        let f = File::open(&tmp).unwrap();
+        // A temp file with some data; it has no name, so nothing is left behind.
+        let mut f = plib::tmp::tempfile().unwrap();
+        io::Write::write_all(&mut f, b"0123456789abcdef0123456789abcdef").unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
         let mut reader = BufReader::new(f);
 
         // Should return None (no match), not panic
         assert!(line.test(&mut reader).is_none());
-
-        std::fs::remove_file(&tmp).unwrap();
     }
 }

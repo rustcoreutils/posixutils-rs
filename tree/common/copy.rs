@@ -229,38 +229,15 @@ pub fn verify_made_dir(
     dir_fd: libc::c_int,
     dir: &Path,
 ) -> io::Result<MadeTrust> {
-    let euid = unsafe { libc::geteuid() };
-    // `.` relative to a directory descriptor is that directory: no name is resolved.
-    let parent = if parent_fd == libc::AT_FDCWD {
-        ftw::Metadata::new(dir_fd, c"..", false)?
-    } else {
-        ftw::Metadata::new(parent_fd, c".", false)?
-    };
-    // S_ISVTX is 0o1000 (fixed by POSIX).
-    let others_can_rename =
-        parent.uid() != euid || (parent.mode() & 0o022 != 0 && parent.mode() & 0o1000 == 0);
-    if !others_can_rename {
-        return Ok(MadeTrust::Full);
-    }
-    // Every fact about the made directory comes from the descriptor cp goes on to use.
-    let opened = fd_metadata(dir_fd)?;
-    let made = MadeObject {
-        uid: opened.uid(),
-        nlink: opened.nlink(),
-        is_dir: true,
-        owners: fs_owners(dir_fd),
-    };
-    let replaced = || {
+    // The rule, shared with pax: `plib::madefs::verify_made_dir`. Every fact about the made
+    // directory comes from the descriptor cp goes on to use; reading it to see that it is
+    // empty borrows its owner's read permission when a umask withheld it.
+    plib::madefs::verify_made_dir(parent_fd, dir_fd)?.ok_or_else(|| {
         io::Error::other(gettext!(
             "'{}' was replaced after it was made",
             dir.display()
         ))
-    };
-    let trust = made_by_us(made, Some(parent.uid()), euid).ok_or_else(replaced)?;
-    if !ftw::is_empty_dir_fd(dir_fd)? {
-        return Err(replaced());
-    }
-    Ok(trust)
+    })
 }
 
 /// The -p failure reported for an object `made_by_us` trusted only as `ParentOwnerOnly`: its

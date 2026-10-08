@@ -154,6 +154,164 @@ pub fn made_by_us(made: MadeObject, parent_uid: Option<u32>, euid: u32) -> Optio
     }
 }
 
+/// Whether anyone but `euid` can rename entries in the directory `parent`: its owner, when that
+/// is someone else, and anyone with group or other write permission on it when it is not
+/// sticky. (Group or other write permission granted by an ACL shows in the group bits.)
+pub fn others_can_rename(parent: &libc::stat, euid: u32) -> bool {
+    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_ISVTX is 0o1000,
+    // S_IWGRP|S_IWOTH 0o022 (fixed by POSIX).
+    #[allow(clippy::unnecessary_cast)]
+    let mode = parent.st_mode as u32;
+    parent.st_uid != euid || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+}
+
+/// Check a directory the caller has just made with `mkdirat` in `parent_fd` and then opened as
+/// `dir_fd` (`O_DIRECTORY | O_NOFOLLOW`): between the two, anyone else who can rename entries
+/// in the parent could have renamed a directory of their choosing over it, and the caller would
+/// fill it and, preserving attributes, give it an owner and mode.
+///
+/// Only the parent's owner, and anyone with group or other write permission on it when it is
+/// not sticky, can do that (`others_can_rename`); when that is nobody but the effective user,
+/// there is nothing to check. Otherwise the directory must be what a fresh `mkdirat` yields:
+/// empty, with the owner and link count `made_by_us` accepts. `None` when it is not; how far it
+/// is trusted otherwise.
+///
+/// An operand resolved from the working directory has no parent descriptor (`AT_FDCWD`); its
+/// parent is then read as the opened directory's own `..`, which names wherever that directory
+/// actually is. Every other fact comes from the descriptors, never from a name.
+pub fn verify_made_dir(parent_fd: RawFd, dir_fd: RawFd) -> io::Result<Option<MadeTrust>> {
+    let euid = unsafe { libc::geteuid() };
+    let parent = if parent_fd == libc::AT_FDCWD {
+        lstat_at(dir_fd, c"..")?
+    } else {
+        fstat(parent_fd)?
+    };
+    if !others_can_rename(&parent, euid) {
+        return Ok(Some(MadeTrust::Full));
+    }
+    let st = fstat(dir_fd)?;
+    let made = MadeObject {
+        uid: st.st_uid,
+        // Cast needed: `nlink_t` is u16 on macOS and u64 on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        nlink: st.st_nlink as u64,
+        is_dir: st.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        owners: fs_owners(dir_fd),
+    };
+    let Some(trust) = made_by_us(made, Some(parent.st_uid), euid) else {
+        return Ok(None);
+    };
+    let check = || is_empty_dir_fd(dir_fd);
+    if !made.is_dir || !empty_lending_read(dir_fd, &st, euid, check)? {
+        return Ok(None);
+    }
+    Ok(Some(trust))
+}
+
+/// Whether the directory open on `dir_fd` lists nothing but `.` and `..`.
+///
+/// It is read through a new open of `.` relative to `dir_fd` -- the same directory, which no
+/// rename can swap -- so `dir_fd` itself (which may be held for search only) is left alone.
+pub fn is_empty_dir_fd(dir_fd: RawFd) -> io::Result<bool> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir_fd, c".".as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    let empty = lists_nothing(dir);
+    unsafe { libc::closedir(dir) };
+    empty
+}
+
+/// Whether the open directory stream `dir` holds nothing but `.` and `..`.
+fn lists_nothing(dir: *mut libc::DIR) -> io::Result<bool> {
+    loop {
+        errno::set_errno(errno::Errno(0));
+        let entry = unsafe { libc::readdir(dir) };
+        if entry.is_null() {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(0) | None => Ok(true),
+                Some(_) => Err(e),
+            };
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            return Ok(false);
+        }
+    }
+}
+
+/// `check` -- whether the directory open on `dir_fd`, with `st`, is empty -- and, only if it
+/// fails with EACCES on a directory the effective user `euid` owns, again with the owner's read
+/// and search permission lent through the descriptor, the mode put back afterwards.
+///
+/// Reading a directory takes its owner's read and search permission, which a umask (0400, say)
+/// may have withheld from one just made. They are lent only then: a chmod by a user outside the
+/// directory's group clears its S_ISGID bit, and putting the mode back cannot set it again.
+/// That is the residual, for a directory made under a umask denying its owner read, in a
+/// set-group-ID parent of a group the user is not in: it loses S_ISGID.
+pub fn empty_lending_read(
+    dir_fd: RawFd,
+    st: &libc::stat,
+    euid: u32,
+    mut check: impl FnMut() -> io::Result<bool>,
+) -> io::Result<bool> {
+    let err = match check() {
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) && st.st_uid == euid => e,
+        answered => return answered,
+    };
+    let mode = st.st_mode & 0o7777;
+    if mode & 0o500 == 0o500 {
+        return Err(err);
+    }
+    chmod_fd(dir_fd, mode | 0o700)?;
+    let empty = check();
+    chmod_fd(dir_fd, mode)?;
+    empty
+}
+
+/// Set the mode of the file open on `fd`, which may be held for search only (`O_PATH` on
+/// Linux, where `fchmod` refuses it: `chmod_pinned`).
+#[cfg(target_os = "linux")]
+pub fn chmod_fd(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
+    chmod_pinned(fd, mode)
+}
+
+/// Elsewhere a search-only descriptor (`O_SEARCH`) takes `fchmod`.
+#[cfg(not(target_os = "linux"))]
+pub fn chmod_fd(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
+    if unsafe { libc::fchmod(fd, mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `fstat` of a descriptor.
+fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// `fstatat` with `AT_SYMLINK_NOFOLLOW`.
+fn lstat_at(dirfd: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let flags = libc::AT_SYMLINK_NOFOLLOW;
+    if unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
 /// The `fchmodat2` system call number (Linux 6.6 and later), where it is the generic 452.
 /// `libc` exports `SYS_fchmodat2` for x86_64 but not for aarch64-linux-gnu, so the number is
 /// spelled here. Not on x32, whose numbers carry `__X32_SYSCALL_BIT`, nor on the architectures
@@ -280,7 +438,119 @@ pub fn utimens_link_if_still(
 
 #[cfg(test)]
 mod tests {
-    use super::{made_by_us, utimens_link_if_still, FsOwners, MadeObject, MadeTrust};
+    use super::{
+        empty_lending_read, made_by_us, others_can_rename, utimens_link_if_still, verify_made_dir,
+        FsOwners, MadeObject, MadeTrust,
+    };
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// A parent directory of `uid` with permission bits `mode`.
+    fn parent(uid: u32, mode: libc::mode_t) -> libc::stat {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_uid = uid;
+        st.st_mode = libc::S_IFDIR | mode;
+        st
+    }
+
+    /// Only the parent's owner, or anyone allowed to write a parent that is not sticky, can
+    /// rename entries in it.
+    #[test]
+    fn who_can_rename_in_a_parent() {
+        assert!(!others_can_rename(&parent(US, 0o755), US));
+        assert!(!others_can_rename(&parent(US, 0o1777), US));
+        assert!(others_can_rename(&parent(US, 0o775), US));
+        assert!(others_can_rename(&parent(US, 0o777), US));
+        assert!(others_can_rename(&parent(OTHER, 0o755), US));
+    }
+
+    /// `name` below the open directory `dir`, opened for search only (it may deny reading).
+    fn open_search(dir: &std::fs::File, name: &std::ffi::CStr) -> OwnedFd {
+        #[cfg(target_os = "linux")]
+        let search = libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let search = libc::O_SEARCH;
+        let flags = search | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// In a parent others can rename entries in, a made directory must be empty -- also when a
+    /// umask left it unreadable to its owner -- and anything else is refused.
+    #[test]
+    fn a_made_directory_is_verified_empty_where_others_can_rename() {
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let parent = std::fs::File::open(tmp.path()).unwrap();
+        std::fs::create_dir(tmp.path().join("fresh")).unwrap();
+        std::fs::create_dir(tmp.path().join("full")).unwrap();
+        std::fs::write(tmp.path().join("full/f"), "").unwrap();
+        // As under umask 0400.
+        for name in ["fresh", "full"] {
+            let path = tmp.path().join(name);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
+        }
+
+        let verify = |name| {
+            let dir = open_search(&parent, name);
+            verify_made_dir(parent.as_raw_fd(), dir.as_raw_fd())
+        };
+        assert_eq!(verify(c"fresh").unwrap(), Some(MadeTrust::Full));
+        assert_eq!(verify(c"full").unwrap(), None);
+        // The lent permission was put back.
+        let mode = std::fs::metadata(tmp.path().join("fresh")).unwrap().mode();
+        assert_eq!(mode & 0o7777, 0o300);
+        for name in ["fresh", "full"] {
+            let path = tmp.path().join(name);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// Read permission is lent for the emptiness check only when the check fails for want of
+    /// it: a check that succeeds as things are (root, reading past the mode) leaves the
+    /// directory's mode alone, since a chmod by someone outside its group drops S_ISGID for
+    /// good.
+    #[test]
+    fn read_is_lent_only_when_the_check_needs_it() {
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        let path = tmp.path().join("d");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let fd = open_search(&std::fs::File::open(tmp.path()).unwrap(), c"d");
+        let st = {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) }, 0);
+            st
+        };
+        let ctime = || std::fs::metadata(&path).unwrap().ctime_nsec();
+        let before = ctime();
+        let euid = unsafe { libc::geteuid() };
+
+        // Readable as things are: no chmod.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(empty_lending_read(fd.as_raw_fd(), &st, euid, || Ok(true)).unwrap());
+        assert_eq!(
+            ctime(),
+            before,
+            "the mode was changed for a check that needed nothing"
+        );
+
+        // Refused for want of read: lent, and put back.
+        let mut calls = 0;
+        let check = || {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::Error::from_raw_os_error(libc::EACCES))
+            } else {
+                Ok(true)
+            }
+        };
+        assert!(empty_lending_read(fd.as_raw_fd(), &st, euid, check).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o300);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     const US: u32 = 1000;
     const OTHER: u32 = 2000;

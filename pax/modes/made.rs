@@ -26,7 +26,7 @@
 //! `plib::madefs`.
 
 pub(crate) use plib::madefs::MadeTrust;
-use plib::madefs::{fs_owners, made_by_us, FsOwners, MadeObject};
+use plib::madefs::{fs_owners, made_by_us, others_can_rename, FsOwners, MadeObject};
 #[cfg(target_os = "linux")]
 pub(crate) use plib::madefs::{proc_fd_name, procfs_dir};
 use std::ffi::CStr;
@@ -111,18 +111,6 @@ pub(crate) fn node_trust(
     made_by_us(made, Some(parent.st_uid), euid)
 }
 
-/// Whether anyone but `euid` can rename entries in the directory `parent`:
-/// its owner, when that is someone else, and anyone with group or other write
-/// permission on it when it is not sticky. (Group or other write permission
-/// granted by an ACL shows in the group bits.)
-pub(crate) fn others_can_rename(parent: &libc::stat, euid: u32) -> bool {
-    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_ISVTX is
-    // 0o1000, S_IWGRP|S_IWOTH 0o022 (fixed by POSIX).
-    #[allow(clippy::unnecessary_cast)]
-    let mode = parent.st_mode as u32;
-    parent.st_uid != euid || (mode & 0o022 != 0 && mode & 0o1000 == 0)
-}
-
 /// Whether a directory found already existing in the directory `parent` --
 /// not one this run made and verified -- may be given a member's owner, mode
 /// and times by pax running as `euid`.
@@ -151,19 +139,10 @@ pub(crate) fn found_dir_may_take_attrs(parent: BorrowedFd<'_>) -> io::Result<boo
 }
 
 /// Check a directory pax has just made with `mkdirat` in `parent` and then
-/// opened as `dir` (`O_DIRECTORY | O_NOFOLLOW`): between the two, anyone else
-/// who can rename entries in the parent could have renamed a directory of
-/// their choosing over it, and pax would extract into it and give it the
-/// member's owner and mode.
-///
-/// Only the parent's owner, and anyone with group or other write permission
-/// on it when it is not sticky, can do that; when that is nobody but pax's own
-/// user there is nothing to check. Otherwise the directory must be what a
-/// fresh `mkdirat` yields: empty, with the owner and link count `made_by_us`
-/// accepts. `None` when it is not.
-///
-/// Every fact comes from the two descriptors, never from a name: the caller
-/// goes on to use `dir` itself, or identifies the directory by `dir`'s fstat.
+/// opened as `dir` (`plib::madefs::verify_made_dir`, which cp uses too):
+/// `None` when it is not the directory made. Under test the trust can be
+/// forced (`race_hook::with_dir_trust`), since no filesystem whose owners
+/// may be mapped can be had there.
 pub(crate) fn verify_made_dir(
     parent: BorrowedFd<'_>,
     dir: BorrowedFd<'_>,
@@ -172,71 +151,7 @@ pub(crate) fn verify_made_dir(
     if let Some(trust) = crate::modes::race_hook::forced_dir_trust() {
         return Ok(Some(trust));
     }
-    let euid = unsafe { libc::geteuid() };
-    let parent_st = fstat(parent)?;
-    if !others_can_rename(&parent_st, euid) {
-        return Ok(Some(MadeTrust::Full));
-    }
-    let st = fstat(dir)?;
-    let made = made_object(&st, owners_of(dir));
-    let Some(trust) = made_by_us(made, Some(parent_st.st_uid), euid) else {
-        return Ok(None);
-    };
-    if !made.is_dir || !is_empty_made_dir(dir, &st, euid)? {
-        return Ok(None);
-    }
-    Ok(Some(trust))
-}
-
-/// Whether the directory open on `dir`, with `st`, lists nothing but `.` and
-/// `..`.
-///
-/// Reading it takes the owner's read and search permission, which a umask
-/// (0400, say) may have withheld from a directory pax has just made.
-fn is_empty_made_dir(dir: BorrowedFd<'_>, st: &libc::stat, euid: u32) -> io::Result<bool> {
-    empty_lending_read(dir, st, euid, || ftw::is_empty_dir_fd(dir.as_raw_fd()))
-}
-
-/// `check` -- whether the directory open on `dir`, with `st`, is empty --
-/// and, only if it fails with EACCES on a directory pax's user owns, again
-/// with the owner's read and search permission lent through the descriptor,
-/// the mode put back afterwards.
-///
-/// Only then: a chmod by a user outside the directory's group clears its
-/// S_ISGID bit, and putting the mode back cannot set it again. That is the
-/// residual, for a directory made under a umask denying its owner read in a
-/// set-group-ID parent of a group pax's user is not in: it loses S_ISGID.
-fn empty_lending_read(
-    dir: BorrowedFd<'_>,
-    st: &libc::stat,
-    euid: u32,
-    mut check: impl FnMut() -> io::Result<bool>,
-) -> io::Result<bool> {
-    let err = match check() {
-        Err(e) if e.raw_os_error() == Some(libc::EACCES) && st.st_uid == euid => e,
-        answered => return answered,
-    };
-    let mode = st.st_mode & 0o7777;
-    if mode & 0o500 == 0o500 {
-        return Err(err);
-    }
-    chmod_fd(dir, mode | 0o700)?;
-    let empty = check();
-    chmod_fd(dir, mode)?;
-    empty
-}
-
-/// Set the mode of the file open on `fd`, which may be held for search only
-/// (`O_PATH` on Linux, where `fchmod` refuses it).
-#[cfg(target_os = "linux")]
-fn chmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> io::Result<()> {
-    plib::madefs::chmod_pinned(fd.as_raw_fd(), mode)
-}
-
-/// Elsewhere a search-only descriptor (`O_SEARCH`) takes `fchmod`.
-#[cfg(not(target_os = "linux"))]
-fn chmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> io::Result<()> {
-    cvt(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
+    plib::madefs::verify_made_dir(parent.as_raw_fd(), dir.as_raw_fd())
 }
 
 #[cfg(target_os = "linux")]
@@ -542,7 +457,7 @@ mod tests {
     use super::*;
 
     // made_by_us itself, and the by-name link times, are tested in
-    // plib::madefs.
+    // plib::madefs too.
     const PAX: u32 = 1000;
     const OTHER: u32 = 2000;
 
@@ -563,72 +478,12 @@ mod tests {
         st
     }
 
-    /// Read permission is lent for the emptiness check only when the check
-    /// fails for want of it: a check that succeeds as things are (root,
-    /// reading past the mode) leaves the directory's mode alone, since a
-    /// chmod by someone outside its group drops S_ISGID for good.
-    #[test]
-    fn read_is_lent_only_when_the_check_needs_it() {
-        use std::os::fd::{AsFd, FromRawFd};
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let tmp = plib::tmp::TempDir::new().unwrap();
-        let path = tmp.path().join("d");
-        std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
-        let dir = std::fs::File::open(tmp.path()).unwrap();
-        // 0300 cannot be opened for reading: for search only.
-        #[cfg(target_os = "linux")]
-        let search = libc::O_PATH;
-        #[cfg(not(target_os = "linux"))]
-        let search = libc::O_SEARCH;
-        let flags = search | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c"d".as_ptr(), flags) };
-        assert!(fd >= 0);
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-        let st = fstat(fd.as_fd()).unwrap();
-        let ctime = || std::fs::metadata(&path).unwrap().ctime_nsec();
-        let before = ctime();
-        let euid = unsafe { libc::geteuid() };
+    // others_can_rename, verify_made_dir and the read lend are tested in
+    // plib::madefs.
 
-        // Readable as things are: no chmod.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(empty_lending_read(fd.as_fd(), &st, euid, || Ok(true)).unwrap());
-        assert_eq!(
-            ctime(),
-            before,
-            "the mode was changed for a check that needed nothing"
-        );
-
-        // Refused for want of read: lent, and put back.
-        let mut calls = 0;
-        let check = || {
-            calls += 1;
-            if calls == 1 {
-                Err(io::Error::from_raw_os_error(libc::EACCES))
-            } else {
-                Ok(true)
-            }
-        };
-        assert!(empty_lending_read(fd.as_fd(), &st, euid, check).unwrap());
-        let mode = std::fs::metadata(&path).unwrap().mode() & 0o7777;
-        assert_eq!(mode, 0o300);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    /// Only the parent's owner, or anyone allowed to write a parent that is
-    /// not sticky, can rename entries in it.
-    #[test]
-    fn who_can_rename_in_a_parent() {
-        assert!(!others_can_rename(&parent(PAX, 0o755), PAX));
-        assert!(!others_can_rename(&parent(PAX, 0o1777), PAX));
-        assert!(others_can_rename(&parent(PAX, 0o775), PAX));
-        assert!(others_can_rename(&parent(PAX, 0o777), PAX));
-        assert!(others_can_rename(&parent(OTHER, 0o755), PAX));
-    }
-
-    /// An existing directory owned by someone other than pax's user and the
-    /// parent's owner, in a parent others can rename entries in, may have
-    /// been renamed there by them: it takes no member's attributes.
+    /// A directory found existing may have been created at the member's name
+    /// by anyone who can create entries beside it: it takes no member's
+    /// attributes unless nobody but pax's user can.
     #[test]
     fn a_found_directory_takes_attributes_only_where_nobody_else_can_create() {
         // Nobody but pax's user can create entries beside it.

@@ -9,7 +9,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -469,10 +469,72 @@ pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
     );
 }
 
+/// A file a test wrote, alone in a temporary directory of its own.
+///
+/// Dropping it removes the directory and the file, and a panic drops it, so a
+/// failing assertion leaves nothing behind in the temporary directory -- the
+/// leak that a `temp_dir().join(..)` path removed by hand after the last
+/// assertion has. It dereferences to the file's [`Path`], so it stands where
+/// that path did.
+pub struct TempFile {
+    path: PathBuf,
+    _dir: crate::tmp::TempDir,
+}
+
+impl TempFile {
+    /// Write `contents` to a file called `name` in a fresh temporary
+    /// directory. `name` is a single path component.
+    pub fn new(name: &str, contents: impl AsRef<[u8]>) -> TempFile {
+        let dir = crate::tmp::tempdir().expect("create temporary directory");
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).expect("write temporary file");
+        TempFile { path, _dir: dir }
+    }
+
+    /// The file's path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for TempFile {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempFile {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::read_until_full;
+    use super::{read_until_full, TempFile};
     use std::io::Read;
+
+    /// The file holds what was written, under its own name, and dropping it
+    /// takes the directory it was made in too.
+    #[test]
+    fn temp_file_is_written_and_removed_with_its_directory() {
+        let (path, dir) = {
+            let f = TempFile::new("name.txt", b"contents");
+            assert_eq!(std::fs::read(&f).unwrap(), b"contents");
+            assert_eq!(f.file_name().unwrap(), "name.txt");
+            (f.path().to_path_buf(), f.parent().unwrap().to_path_buf())
+        };
+        assert!(!path.exists(), "the file outlived its TempFile");
+        assert!(!dir.exists(), "the directory outlived its TempFile");
+    }
 
     /// A stream that hands back exactly the chunks it was given, one per
     /// `read`, however much room the caller offers.

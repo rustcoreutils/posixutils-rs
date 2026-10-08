@@ -481,3 +481,62 @@ fn cp_pr_leaves_alone_a_named_destination_reached_through_a_link_others_could_pl
     assert_eq!(mode_of(&home), 0o700, "the private directory was opened up");
     assert_eq!(fs::read_to_string(home.join("f")).unwrap(), "data\n");
 }
+
+/// `--parents ../d/x`: the `..` climbs above the target, into a directory nothing vouched for
+/// -- whatever its own mode -- and `d/x` found there keeps everything under -p.
+#[test]
+fn cp_parents_dot_dot_above_the_target_trusts_nothing() {
+    let temp = tempdir().unwrap();
+    // Run in `c`: the source `../s/d/x` is `s/d/x`, its copy `w/t/../s/d/x`, `w/s/d/x`,
+    // where the user's own `w` already holds `s/d` and a private `x`.
+    fs::create_dir(temp.path().join("c")).unwrap();
+    source_dir(&temp.path().join("s/d/x"), 0o755);
+    fs::create_dir_all(temp.path().join("w/t")).unwrap();
+    fs::create_dir_all(temp.path().join("w/s/d")).unwrap();
+    with_private_dir(&temp.path().join("w/s/d"), 0o755, "x");
+    let out = cp(
+        &temp.path().join("c"),
+        &["-pR", "--parents", "../s/d/x", "../w/t"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let found = temp.path().join("w/s/d/x");
+    assert_eq!(mode_of(&found), 0o700, "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(DIAGNOSTIC), "{stderr}");
+    assert_eq!(fs::read_to_string(found.join("f")).unwrap(), "data\n");
+}
+
+/// `--parents a/../d/x`: the `..` returns from `a`, which the run makes, to the directory the
+/// walk was in before -- which hands what it handed then, not what a directory made below it
+/// hands. Under a target reached through a link planted in a directory others can write,
+/// `d/x` keeps everything, with the `..` as without it; under a target the user's own, it is
+/// stamped either way.
+#[test]
+fn cp_parents_dot_dot_returns_to_the_trust_it_left() {
+    for (target, code, mode) in [("../open/tl", 1, 0o700), ("../home/H", 0, 0o755)] {
+        for source in ["a/../d/x", "d/x"] {
+            let temp = tempdir().unwrap();
+            let src = temp.path().join("srcroot");
+            fs::create_dir_all(src.join("a")).unwrap();
+            source_dir(&src.join("d/x"), 0o755);
+            set_mode(&src.join("d"), 0o755);
+            let home = temp.path().join("home/H");
+            fs::create_dir_all(home.join("d")).unwrap();
+            set_mode(&home.join("d"), 0o755);
+            with_private_dir(&home.join("d"), 0o755, "x");
+            let open = temp.path().join("open");
+            fs::create_dir(&open).unwrap();
+            std::os::unix::fs::symlink("../home/H", open.join("tl")).unwrap();
+            set_mode(&open, 0o777);
+
+            let out = cp(&src, &["-pR", "--parents", source, target]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            set_mode(&open, 0o755);
+            let case = format!("{source} into {target}");
+            let x = home.join("d/x");
+            assert_eq!(mode_of(&x), mode, "{case}: {stderr}");
+            assert_eq!(out.status.code(), Some(code), "{case}: {stderr}");
+            assert_eq!(fs::read_to_string(x.join("f")).unwrap(), "data\n", "{case}");
+        }
+    }
+}

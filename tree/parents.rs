@@ -113,6 +113,9 @@ fn make_parents(
     let mut dest_path = target.to_path_buf();
     // The source's components so far, for -v.
     let mut src_path = PathBuf::from(if source.is_absolute() { "/" } else { "" });
+    // Each directory the walk is in, from the target down, with the trust it hands: a `..`
+    // goes back to the one before.
+    let mut levels = vec![(Rc::clone(&dest_dir), trust.clone())];
 
     for comp in parent.components() {
         // `..` is followed as written, as GNU cp does.
@@ -130,6 +133,22 @@ fn make_parents(
                 error_string(&e)
             ))
         })?;
+        if comp == Component::ParentDir {
+            // Back to the directory the walk was in before, with the trust it had then: never
+            // what a directory made or found below it hands. Above the target, the walk is in
+            // a directory nothing has vouched for.
+            src_dir = next_src;
+            if levels.len() > 1 {
+                levels.pop();
+                (dest_dir, trust) = levels.last().cloned().expect("levels keeps the target");
+            } else {
+                dest_dir = Rc::new(open_dir_at(dest_dir.as_raw_fd(), &name, 0)?);
+                trust = ChainTrust::unlocated();
+                levels = vec![(Rc::clone(&dest_dir), trust.clone())];
+                held.push(Rc::clone(&dest_dir));
+            }
+            continue;
+        }
         let src_md = next_src.metadata()?;
 
         // Owner search and write are needed to fill the directory; without -p the umask
@@ -199,6 +218,7 @@ fn make_parents(
             found
         };
         held.push(Rc::clone(&next_dest));
+        levels.push((Rc::clone(&next_dest), trust.clone()));
         src_dir = next_src;
         dest_dir = next_dest;
     }

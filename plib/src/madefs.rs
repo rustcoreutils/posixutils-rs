@@ -324,7 +324,7 @@ fn nobody_else_can_create_with(
 /// Whether the group `gid` is the private group of the user `euid`: nobody else is in it, so
 /// its write permission is the user's own. All of these must hold:
 /// - it is the user's primary group;
-/// - it lists no members but, perhaps, the user;
+/// - every member it lists resolves (`getpwnam`, on the name's bytes) to the user's uid;
 /// - no other user has it for a primary group.
 ///
 /// What the user and group databases say is read through NSS (`getpwuid`, `getgrgid`, and the
@@ -355,29 +355,62 @@ fn read_private_group(gid: u32, euid: u32) -> bool {
     let Some(user) = crate::user::get_by_uid(euid) else {
         return false;
     };
-    let Some(group) = crate::group::get_by_gid(gid) else {
+    let Some(members) = group_member_uids(gid) else {
         return false;
     };
     let Ok(users) = crate::user::load() else {
         return false;
     };
     let primaries = users.iter().map(|other| (other.uid, other.gid));
-    group_is_private(gid, &user, &group.members, primaries)
+    group_is_private(gid, (euid, user.gid), members, primaries)
 }
 
-/// The rule `is_private_group` follows, for the group `gid` and the user `user`, given the
-/// names the group lists as members and every user's `(uid, primary gid)`.
+/// The uid each member the group `gid` lists resolves to (`getpwnam` on the name's bytes as
+/// the database holds them), `None` for a name that resolves to nobody; `None` altogether when
+/// the group cannot be read.
+fn group_member_uids(gid: u32) -> Option<Vec<Option<u32>>> {
+    // Copied out first: `getgrgid` and `getpwnam` each return storage the next call reuses.
+    let names = unsafe {
+        let group = libc::getgrgid(gid);
+        if group.is_null() {
+            return None;
+        }
+        let mut names = Vec::new();
+        let mut member = (*group).gr_mem;
+        // read_unaligned: macOS does not align the member array.
+        while !member.is_null() {
+            let name = std::ptr::read_unaligned(member as *const *const libc::c_char);
+            if name.is_null() {
+                break;
+            }
+            names.push(CStr::from_ptr(name).to_owned());
+            member = member.add(1);
+        }
+        names
+    };
+    let uid_of = |name: &CStr| {
+        let passwd = unsafe { libc::getpwnam(name.as_ptr()) };
+        (!passwd.is_null()).then(|| unsafe { (*passwd).pw_uid })
+    };
+    Some(names.iter().map(|name| uid_of(name)).collect())
+}
+
+/// The rule `is_private_group` follows, for the group `gid` and the user `(uid, primary gid)`,
+/// given the uid each member the group lists resolves to (`None` for one that resolves to
+/// nobody) and every user's `(uid, primary gid)`. Members are compared by uid, so a second
+/// name for the user is the user.
 pub fn group_is_private(
     gid: u32,
-    user: &crate::user::User,
-    members: &[std::ffi::OsString],
+    user: (u32, u32),
+    member_uids: impl IntoIterator<Item = Option<u32>>,
     primaries: impl IntoIterator<Item = (u32, u32)>,
 ) -> bool {
-    user.gid == gid
-        && members.iter().all(|member| *member == user.name)
+    let (uid, user_gid) = user;
+    user_gid == gid
+        && member_uids.into_iter().all(|member| member == Some(uid))
         && primaries
             .into_iter()
-            .all(|(uid, primary)| primary != gid || uid == user.uid)
+            .all(|(other, primary)| primary != gid || other == uid)
 }
 
 /// Check a directory the caller has just made with `mkdirat` in `parent_fd` and then opened as
@@ -614,7 +647,7 @@ pub fn utimens_link_if_still(
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_lending_read, group_is_private, is_private_group, made_by_us,
+        empty_lending_read, group_is_private, group_member_uids, is_private_group, made_by_us,
         nobody_else_can_create_with, others_can_rename, utimens_link_if_still, verify_made_dir,
         ChainTrust, FoundDir, FsOwners, MadeObject, MadeTrust, Preserve,
     };
@@ -667,41 +700,32 @@ mod tests {
     /// nobody else, and is nobody else's primary group.
     #[test]
     fn what_makes_a_group_private() {
-        let user = crate::user::User {
-            name: "us".into(),
-            uid: US,
-            gid: 500,
-            gecos: Default::default(),
-            dir: Default::default(),
-            shell: Default::default(),
-        };
-        let names = |list: &[&str]| {
-            list.iter()
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>()
-        };
+        let user = (US, 500);
         let only_ours = [(US, 500), (OTHER, 600), (0, 0)];
-        assert!(group_is_private(500, &user, &[], only_ours));
-        assert!(group_is_private(500, &user, &names(&["us"]), only_ours));
+        // Members are given as the uid each name resolves to, `None` for one that does not.
+        assert!(group_is_private(500, user, [], only_ours));
+        assert!(group_is_private(500, user, [Some(US)], only_ours));
         // Not the user's primary group.
-        assert!(!group_is_private(600, &user, &[], only_ours));
+        assert!(!group_is_private(600, user, [], only_ours));
         // Another member listed.
         assert!(!group_is_private(
             500,
-            &user,
-            &names(&["us", "them"]),
+            user,
+            [Some(US), Some(OTHER)],
             only_ours
         ));
-        assert!(!group_is_private(500, &user, &names(&["them"]), only_ours));
+        assert!(!group_is_private(500, user, [Some(OTHER)], only_ours));
+        // A member whose name resolves to nobody cannot be shown to be the user.
+        assert!(!group_is_private(500, user, [None], only_ours));
         // Another user's primary group too.
-        assert!(!group_is_private(
+        assert!(!group_is_private(500, user, [], [(US, 500), (OTHER, 500)]));
+        // A second entry for the user's own uid is the user, under any name.
+        assert!(group_is_private(
             500,
-            &user,
-            &[],
-            [(US, 500), (OTHER, 500)]
+            user,
+            [Some(US), Some(US)],
+            [(US, 500), (US, 500)]
         ));
-        // A second entry for the user's own uid is the user.
-        assert!(group_is_private(500, &user, &[], [(US, 500), (US, 500)]));
     }
 
     /// The test user's own primary group, read from the real databases, agrees with the rule
@@ -714,13 +738,12 @@ mod tests {
         let Some(user) = crate::user::get_by_uid(euid) else {
             return;
         };
-        let (Some(group), Ok(users)) = (crate::group::get_by_gid(user.gid), crate::user::load())
-        else {
+        let (Some(members), Ok(users)) = (group_member_uids(user.gid), crate::user::load()) else {
             assert!(!is_private_group(user.gid, euid));
             return;
         };
         let primaries = users.iter().map(|u| (u.uid, u.gid));
-        let expected = group_is_private(user.gid, &user, &group.members, primaries);
+        let expected = group_is_private(user.gid, (euid, user.gid), members, primaries);
         assert_eq!(is_private_group(user.gid, euid), expected);
         // Asked again, the answer is the one read.
         assert_eq!(is_private_group(user.gid, euid), expected);

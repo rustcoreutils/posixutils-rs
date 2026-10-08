@@ -566,7 +566,7 @@ GNU tar.
    added, not GNU's free-form date parser: `[Day, ]D Mon YYYY HH:MM[:SS]`
    and a numeric `+hhmm` / `-hhmm` zone, single spaces, the English
    abbreviations spelled as `date -R` spells them, and a day name that
-   matches the date.  Zone names such as `GMT` are refused.
+   matches the date.  In this form, zone names such as `GMT` are refused.
  * `-d` also takes the POSIX date-time followed by a single space and the
    word `UTC` or `GMT`, meaning exactly what a trailing `Z` means:
    `1999-08-26 12:06:20 UTC`.  base-files' debian/timestamps sets its

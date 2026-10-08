@@ -421,7 +421,9 @@ impl GrepModel {
                     }
                     line.clear();
                 }
-                Err(err) => {
+                // `read_line` has consumed a line that is not valid UTF-8:
+                // report it and go on with the next line.
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
                     self.any_errors = true;
                     if !self.no_messages {
                         plib::diag::error(&format!(
@@ -429,6 +431,20 @@ impl GrepModel {
                             input_name, line_number, err
                         ));
                     }
+                }
+                // Any other error (EISDIR for a directory operand, EIO) does
+                // not advance the input and would recur on every retry: report
+                // it once and stop reading this input.
+                Err(err) => {
+                    self.any_errors = true;
+                    if !self.no_messages {
+                        plib::diag::error(&format!(
+                            "{}: {}",
+                            input_name,
+                            plib::diag::io_error_text(&err)
+                        ));
+                    }
+                    break;
                 }
             }
         }

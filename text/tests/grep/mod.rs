@@ -1595,3 +1595,43 @@ fn test_option_argument_begins_with_hyphen() {
 fn test_hyphen_pattern_then_option() {
     grep_test(&["-e", "-x", "-c"], "a-x\n-x\nb\n", "2\n", "", 0);
 }
+
+// A read error ends that input: grep reports it once and goes on to the next
+// operand. A directory operand used to make grep print "error reading line N"
+// for ever, hanging rpcsvc-proto's build (`grep -i GNU pkg ../*`).
+#[cfg(unix)]
+#[test]
+fn test_unreadable_operand_is_reported_once() {
+    use std::time::{Duration, Instant};
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let dir = tmp.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    let file = tmp.path().join("f");
+    std::fs::write(&file, "GNU here\nnot this\n").unwrap();
+
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("grep"))
+        .args(["GNU"])
+        .arg(&dir)
+        .arg(&file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("grep never finished reading a directory operand");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout, format!("{}:GNU here\n", file.display()));
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert!(stderr.contains(&*dir.to_string_lossy()), "{stderr:?}");
+    assert_eq!(out.status.code(), Some(2));
+}

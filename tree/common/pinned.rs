@@ -298,8 +298,10 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return; // Permissions do not bind the superuser.
         }
-        let dir = std::env::temp_dir().join(format!("pinned_by_path_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Dropping the guard removes the tree even with `closed` still mode 000, should an
+        // assertion below fire first.
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
         std::fs::create_dir_all(dir.join("closed/sub")).unwrap();
         std::fs::set_permissions(dir.join("closed"), std::fs::Permissions::from_mode(0o000))
             .unwrap();
@@ -310,7 +312,6 @@ mod tests {
 
         std::fs::set_permissions(dir.join("closed"), std::fs::Permissions::from_mode(0o700))
             .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
         for entry in [entry.unwrap(), dir_entry.unwrap()] {
             assert_eq!(entry.anchor(), Anchor::Path);
             assert_eq!(entry.dir_fd(), libc::AT_FDCWD);

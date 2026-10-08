@@ -9,9 +9,16 @@
 //
 
 use plib::testing::{run_test_with_checker, TestPlan};
+use plib::tmp::{tempdir, TempDir};
 use std::fs;
 use std::path::Path;
 use std::process::Output;
+
+/// The pathname `name` inside `dir`, a temporary directory removed with
+/// whatever mkfifo made in it when the test ends.
+fn fifo_in(dir: &TempDir, name: &str) -> String {
+    dir.path().join(name).to_str().unwrap().to_string()
+}
 
 fn run_mkfifo_test(args: Vec<&str>, expected_exit_code: i32) {
     let plan = TestPlan {
@@ -30,8 +37,9 @@ fn run_mkfifo_test(args: Vec<&str>, expected_exit_code: i32) {
 
 #[test]
 fn test_create_single_fifo() {
-    let fifo_path = "/tmp/posixutils_mkfifo_test_1";
-    let _ = fs::remove_file(fifo_path);
+    let dir = tempdir().unwrap();
+    let fifo = fifo_in(&dir, "fifo");
+    let fifo_path = fifo.as_str();
 
     run_mkfifo_test(vec![fifo_path], 0);
 
@@ -43,27 +51,25 @@ fn test_create_single_fifo() {
         let metadata = fs::metadata(fifo_path).expect("Unable to get FIFO metadata");
         assert!(metadata.file_type().is_fifo());
     }
-
-    fs::remove_file(fifo_path).expect("Unable to remove test FIFO");
 }
 
 #[test]
 fn test_fifo_already_exists() {
-    let fifo_path = "/tmp/posixutils_mkfifo_test_2";
-    let _ = fs::remove_file(fifo_path);
+    let dir = tempdir().unwrap();
+    let fifo = fifo_in(&dir, "fifo");
+    let fifo_path = fifo.as_str();
 
     run_mkfifo_test(vec![fifo_path], 0);
     assert!(Path::new(fifo_path).exists());
 
     run_mkfifo_test(vec![fifo_path], 1);
-
-    fs::remove_file(fifo_path).expect("Unable to remove test FIFO");
 }
 
 #[test]
 fn test_invalid_mode() {
-    let fifo_path = "/tmp/posixutils_mkfifo_test_3";
-    let _ = fs::remove_file(fifo_path);
+    let dir = tempdir().unwrap();
+    let fifo = fifo_in(&dir, "fifo");
+    let fifo_path = fifo.as_str();
 
     run_mkfifo_test(vec!["-m", "invalid", fifo_path], 1);
 
@@ -72,8 +78,9 @@ fn test_invalid_mode() {
 
 #[test]
 fn test_set_fifo_mode_absolute() {
-    let fifo_path = "/tmp/posixutils_mkfifo_test_4";
-    let _ = fs::remove_file(fifo_path);
+    let dir = tempdir().unwrap();
+    let fifo = fifo_in(&dir, "fifo");
+    let fifo_path = fifo.as_str();
 
     run_mkfifo_test(vec!["-m", "644", fifo_path], 0);
 
@@ -86,14 +93,13 @@ fn test_set_fifo_mode_absolute() {
         let permissions = metadata.permissions();
         assert_eq!(permissions.mode() & 0o777, 0o644);
     }
-
-    fs::remove_file(fifo_path).expect("Unable to remove test FIFO");
 }
 
 #[test]
 fn test_set_fifo_mode_symbolic_plus() {
-    let fifo_path = "/tmp/posixutils_mkfifo_test_5";
-    let _ = fs::remove_file(fifo_path);
+    let dir = tempdir().unwrap();
+    let fifo = fifo_in(&dir, "fifo");
+    let fifo_path = fifo.as_str();
 
     run_mkfifo_test(vec!["-m", "+x", fifo_path], 0);
 
@@ -108,14 +114,13 @@ fn test_set_fifo_mode_symbolic_plus() {
             "+x should produce rwxrwxrwx"
         );
     }
-
-    fs::remove_file(fifo_path).expect("Unable to remove test FIFO");
 }
 
 #[test]
 fn test_set_fifo_mode_symbolic_minus() {
-    let fifo_path = "/tmp/posixutils_mkfifo_test_6";
-    let _ = fs::remove_file(fifo_path);
+    let dir = tempdir().unwrap();
+    let fifo = fifo_in(&dir, "fifo");
+    let fifo_path = fifo.as_str();
 
     run_mkfifo_test(vec!["-m", "-w", fifo_path], 0);
 
@@ -127,14 +132,13 @@ fn test_set_fifo_mode_symbolic_minus() {
         let metadata = fs::metadata(fifo_path).expect("Unable to get FIFO metadata");
         assert!(metadata.file_type().is_fifo());
     }
-
-    fs::remove_file(fifo_path).expect("Unable to remove test FIFO");
 }
 
 #[test]
 fn test_set_fifo_mode_symbolic_who_specified() {
-    let fifo_path = "/tmp/posixutils_mkfifo_test_7";
-    let _ = fs::remove_file(fifo_path);
+    let dir = tempdir().unwrap();
+    let fifo = fifo_in(&dir, "fifo");
+    let fifo_path = fifo.as_str();
 
     run_mkfifo_test(vec!["-m", "a-w", fifo_path], 0);
 
@@ -149,24 +153,17 @@ fn test_set_fifo_mode_symbolic_who_specified() {
             "a-w should produce r--r--r--"
         );
     }
-
-    fs::remove_file(fifo_path).expect("Unable to remove test FIFO");
 }
 
 #[test]
 fn test_create_multiple_fifos() {
-    let fifo1 = "/tmp/posixutils_mkfifo_test_8a";
-    let fifo2 = "/tmp/posixutils_mkfifo_test_8b";
-    let _ = fs::remove_file(fifo1);
-    let _ = fs::remove_file(fifo2);
+    let dir = tempdir().unwrap();
+    let (fifo1, fifo2) = (fifo_in(&dir, "a"), fifo_in(&dir, "b"));
 
-    run_mkfifo_test(vec![fifo1, fifo2], 0);
+    run_mkfifo_test(vec![&fifo1, &fifo2], 0);
 
-    assert!(Path::new(fifo1).exists());
-    assert!(Path::new(fifo2).exists());
-
-    fs::remove_file(fifo1).expect("Unable to remove test FIFO");
-    fs::remove_file(fifo2).expect("Unable to remove test FIFO");
+    assert!(Path::new(&fifo1).exists());
+    assert!(Path::new(&fifo2).exists());
 }
 
 // A <newline> in the pathname is rejected.

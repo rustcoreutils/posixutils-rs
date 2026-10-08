@@ -2387,9 +2387,8 @@ mod tests {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let dir = std::env::temp_dir().join(format!("cp_parent_owner_only_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir(&dir).unwrap();
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
         let source = dir.join("source");
         let target = dir.join("target");
         fs::write(&source, b"s").unwrap();
@@ -2413,7 +2412,6 @@ mod tests {
             MadeTrust::ParentOwnerOnly,
         );
         let after = fs::metadata(&target).unwrap();
-        let _ = fs::remove_dir_all(&dir);
 
         assert!(
             result.is_err(),
@@ -2438,13 +2436,9 @@ mod tests {
         }
     }
 
-    /// A fresh directory for one test, under the system's temporary directory.
-    fn must_create_scratch(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("copy_must_create_{tag}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
-        dir
+    /// A fresh directory for one test, removed when dropped.
+    fn must_create_scratch() -> plib::tmp::TempDir {
+        plib::tmp::tempdir().unwrap()
     }
 
     /// Copy `source` to `target` in `MustCreate` mode; the error must be the destination's
@@ -2471,14 +2465,14 @@ mod tests {
     fn must_create_refuses_a_file_found_at_the_destination() {
         use std::fs;
 
-        let dir = must_create_scratch("file");
+        let tmp = must_create_scratch();
+        let dir = tmp.path();
         fs::write(dir.join("source"), b"moved").unwrap();
         fs::write(dir.join("victim"), b"victim").unwrap();
         fs::hard_link(dir.join("victim"), dir.join("target")).unwrap();
 
         copy_must_create(&dir.join("source"), &dir.join("target"));
         let victim = fs::read(dir.join("victim")).unwrap();
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(victim, b"victim");
     }
 
@@ -2487,14 +2481,14 @@ mod tests {
     fn must_create_refuses_a_directory_found_at_the_destination() {
         use std::fs;
 
-        let dir = must_create_scratch("dir");
+        let tmp = must_create_scratch();
+        let dir = tmp.path();
         fs::create_dir(dir.join("source")).unwrap();
         fs::write(dir.join("source/f"), b"moved").unwrap();
         fs::create_dir(dir.join("target")).unwrap();
 
         copy_must_create(&dir.join("source"), &dir.join("target"));
         let entries = fs::read_dir(dir.join("target")).unwrap().count();
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(entries, 0);
     }
 
@@ -2542,13 +2536,13 @@ mod tests {
     fn must_create_refuses_to_replace_a_file_with_a_symlink() {
         use std::fs;
 
-        let dir = must_create_scratch("symlink");
+        let tmp = must_create_scratch();
+        let dir = tmp.path();
         std::os::unix::fs::symlink("anywhere", dir.join("source")).unwrap();
         fs::write(dir.join("target"), b"kept").unwrap();
 
         copy_must_create(&dir.join("source"), &dir.join("target"));
         let kept = fs::read(dir.join("target")).unwrap();
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(kept, b"kept");
     }
 }

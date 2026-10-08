@@ -737,14 +737,13 @@ mod tests {
         assert!(!decide_again(&other, Replace::Never, Decision::First));
     }
 
-    /// A scratch directory holding `source` and, if `with_target`, `target`.
-    fn scratch(tag: &str, with_target: bool) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("mv_rename_{tag}_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir(&dir).unwrap();
-        fs::write(dir.join("source"), b"source").unwrap();
+    /// A scratch directory holding `source` and, if `with_target`, `target`;
+    /// removed when dropped.
+    fn scratch(with_target: bool) -> plib::tmp::TempDir {
+        let dir = plib::tmp::tempdir().unwrap();
+        fs::write(dir.path().join("source"), b"source").unwrap();
         if with_target {
-            fs::write(dir.join("target"), b"target").unwrap();
+            fs::write(dir.path().join("target"), b"target").unwrap();
         }
         dir
     }
@@ -753,14 +752,14 @@ mod tests {
     /// and the failure says so (EEXIST), for mv to decide again.
     #[test]
     fn a_rename_onto_an_absent_target_never_replaces_one_that_appeared() {
-        let dir = scratch("never", true);
+        let tmp = scratch(true);
+        let dir = tmp.path();
         let mut pinned = PinnedDirs::default();
         let source = pinned.pin(&dir.join("source")).unwrap();
         let target = pinned.pin(&dir.join("target")).unwrap();
 
         let result = rename_pinned(&source, &target, Replace::Never);
         let (kept, left) = (fs::read(dir.join("target")), dir.join("source").exists());
-        let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(
             result.map_err(|e| e.raw_os_error()),
@@ -773,22 +772,22 @@ mod tests {
     /// Without a target, and when replacing one was decided on, it is an ordinary rename.
     #[test]
     fn a_rename_replaces_only_when_that_was_decided() {
-        let dir = scratch("allowed", true);
+        let tmp = scratch(true);
+        let dir = tmp.path();
         let mut pinned = PinnedDirs::default();
         let source = pinned.pin(&dir.join("source")).unwrap();
         let target = pinned.pin(&dir.join("target")).unwrap();
         let replaced = rename_pinned(&source, &target, Replace::Allowed);
         let moved = fs::read(dir.join("target"));
-        let _ = fs::remove_dir_all(&dir);
         assert!(replaced.is_ok());
         assert_eq!(moved.unwrap(), b"source");
 
-        let dir = scratch("absent", false);
+        let tmp = scratch(false);
+        let dir = tmp.path();
         let source = pinned.pin(&dir.join("source")).unwrap();
         let target = pinned.pin(&dir.join("target")).unwrap();
         let created = rename_pinned(&source, &target, Replace::Never);
         let moved = fs::read(dir.join("target"));
-        let _ = fs::remove_dir_all(&dir);
         assert!(created.is_ok());
         assert_eq!(moved.unwrap(), b"source");
     }

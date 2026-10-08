@@ -407,6 +407,26 @@ mod tests {
         out
     }
 
+    /// A scratch directory, removed with its contents when dropped -- a failed
+    /// assertion included. This crate sits below plib, so plib::tmp is not
+    /// available to it.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> ScratchDir {
+            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir(&path).expect("create scratch directory");
+            ScratchDir(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// `gettext` resolves a real catalog through `NLSPATH`, and falls back to
     /// the untranslated message when the locale is `C` or nothing is found.
     ///
@@ -414,8 +434,8 @@ mod tests {
     /// catalog state, which cannot be done safely from concurrent tests.
     #[test]
     fn nlspath_catalog_is_found_and_used() {
-        let dir = std::env::temp_dir().join(format!("gettextrs-nlspath-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let scratch = ScratchDir::new("gettextrs-nlspath");
+        let dir = &scratch.0;
         let mo = dir.join("testdomain.de_DE.mo");
         std::fs::write(&mo, build_mo(&[("Hello", "Hallo")])).expect("write catalog");
 
@@ -442,6 +462,5 @@ mod tests {
             std::env::remove_var("NLSPATH");
             std::env::remove_var("LC_ALL");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

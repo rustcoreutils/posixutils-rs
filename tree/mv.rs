@@ -14,8 +14,8 @@ mod remove_moved;
 use self::common::{copy_moved_file, error_string};
 use clap::Parser;
 use common::{
-    CopiedSources, CopyConfig, DerefMode, Destination, InodeMap, MoveSource, PinnedDir, PinnedDirs,
-    PinnedEntry,
+    Anchor, CopiedSources, CopyConfig, DerefMode, Destination, InodeMap, MoveSource, PinnedDir,
+    PinnedDirs, PinnedEntry,
 };
 use gettextrs::gettext;
 use remove_moved::remove_moved_source;
@@ -393,6 +393,19 @@ fn move_file_deciding(
         let err_str = gettext!("inter-device move failed: {}", e);
         io::Error::other(err_str)
     };
+
+    // The copy and the removal act only through held directories: an operand reached by
+    // pathname cannot be moved across filesystems.
+    if let Some(unheld) = [&source_entry, target_entry]
+        .into_iter()
+        .find(|entry| entry.anchor() == Anchor::Path)
+    {
+        return Err(err_inter_device(err_reason(io::Error::other(gettext!(
+            "cannot open the directory holding '{}': {}",
+            unheld.path().display(),
+            error_string(&io::Error::from_raw_os_error(libc::EACCES))
+        )))));
+    }
 
     // 5. remove destination path
     if target_exists {

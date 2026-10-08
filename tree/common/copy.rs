@@ -79,15 +79,31 @@ fn link_to_first_copy(first: &FirstCopy, dirfd: libc::c_int, name: &CStr) -> io:
 }
 
 /// The identity of a symbolic link or special file this copy just made by name (`symlinkat`,
-/// `mknodat`), for hard-linking later names to it: `None` unless the name holds a file of that
-/// type with a single link, as a fresh one has.
+/// `mknodat`), for hard-linking later names to it: `None` unless the name holds what a fresh one
+/// is (`is_fresh_node`). A node that fails that is simply not linked to: each later name of the
+/// source file is copied afresh.
 fn made_node_identity(
     dirfd: libc::c_int,
     name: *const libc::c_char,
     made_type: ftw::FileType,
 ) -> Option<(u64, u64)> {
     let md = ftw::Metadata::new(dirfd, unsafe { CStr::from_ptr(name) }, false).ok()?;
-    (md.file_type() == made_type && md.nlink() == 1).then(|| (md.dev(), md.ino()))
+    let euid = unsafe { libc::geteuid() };
+    is_fresh_node(md.file_type(), md.nlink(), md.uid(), made_type, euid)
+        .then(|| (md.dev(), md.ino()))
+}
+
+/// Whether a node of type `found` with `nlink` links, owned by `uid`, can be the `made` node cp
+/// (running as `euid`) has just made: the same type, a single link, and cp's own. On filesystems
+/// that map owners, cp's own nodes may not show as its own; those are then not hard-linked to.
+fn is_fresh_node(
+    found: ftw::FileType,
+    nlink: u64,
+    uid: u32,
+    made: ftw::FileType,
+    euid: u32,
+) -> bool {
+    found == made && nlink == 1 && uid == euid
 }
 
 /// Which symbolic links are acted on by what they refer to, rather than as links
@@ -2443,6 +2459,45 @@ mod tests {
         let entries = fs::read_dir(dir.join("target")).unwrap().count();
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(entries, 0);
+    }
+
+    /// A symbolic link or special file found under the name just made is taken for the one made
+    /// only if it is of that type, has a single link, and belongs to cp's effective user: a
+    /// node someone else swapped in (their own, or a link to another) is not.
+    #[test]
+    fn a_made_node_is_of_its_type_with_one_link_and_ours() {
+        use super::is_fresh_node;
+        use ftw::FileType;
+        const ME: u32 = 1000;
+
+        assert!(is_fresh_node(
+            FileType::SymbolicLink,
+            1,
+            ME,
+            FileType::SymbolicLink,
+            ME
+        ));
+        assert!(!is_fresh_node(
+            FileType::SymbolicLink,
+            1,
+            2000,
+            FileType::SymbolicLink,
+            ME
+        ));
+        assert!(!is_fresh_node(
+            FileType::SymbolicLink,
+            2,
+            ME,
+            FileType::SymbolicLink,
+            ME
+        ));
+        assert!(!is_fresh_node(
+            FileType::RegularFile,
+            1,
+            ME,
+            FileType::Fifo,
+            ME
+        ));
     }
 
     /// Nor is anything found there unlinked to make room for a symbolic link.

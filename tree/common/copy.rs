@@ -641,9 +641,9 @@ fn preserve_node_attributes(
     let empty = c"";
 
     let times = source_times(source_md);
-    if unsafe { libc::utimensat(fd, empty.as_ptr(), times.as_ptr(), libc::AT_EMPTY_PATH) } != 0 {
-        return Err(preserve_times_error(target, &io::Error::last_os_error()));
-    }
+    let symlink = made_type == ftw::FileType::SymbolicLink;
+    utimens_pinned(dirfd, name, &pinned, symlink, &times)
+        .map_err(|e| preserve_times_error(target, &e))?;
     if trust == MadeTrust::ParentOwnerOnly {
         return Err(owner_unverified_error(target));
     }
@@ -659,6 +659,70 @@ fn preserve_node_attributes(
     if made_type != ftw::FileType::SymbolicLink {
         chmod_pinned(fd, preserved_mode(source_md, chown_ok))
             .map_err(|e| preserve_mode_error(target, &e))?;
+    }
+    Ok(())
+}
+
+/// Set the times of the node `pinned` holds -- made at `name` in `dirfd` -- through the pin.
+///
+/// `utimensat(AT_EMPTY_PATH)` (Linux 5.8 and later). Before that it fails with EINVAL, and then
+/// a special file goes through `self/fd/N` in a `/proc` verified to be procfs, which names
+/// exactly the pinned inode. A symbolic link has no such route -- that path is followed to the
+/// link and then through it -- so its times go by name with `AT_SYMLINK_NOFOLLOW`, only once a
+/// fresh `lstat` shows the name still holds the pinned link (`utimens_link_by_name`).
+#[cfg(target_os = "linux")]
+fn utimens_pinned(
+    dirfd: libc::c_int,
+    name: &CStr,
+    pinned: &fs::File,
+    symlink: bool,
+    times: &[libc::timespec; 2],
+) -> io::Result<()> {
+    let fd = pinned.as_raw_fd();
+    if unsafe { libc::utimensat(fd, c"".as_ptr(), times.as_ptr(), libc::AT_EMPTY_PATH) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() != Some(libc::EINVAL) {
+        return Err(e);
+    }
+    if symlink {
+        return utimens_link_by_name(dirfd, name, &pinned.metadata()?, times);
+    }
+    let proc_dir = procfs_dir()?;
+    let path = proc_fd_name(fd);
+    if unsafe { libc::utimensat(proc_dir.as_raw_fd(), path.as_ptr(), times.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set the times of the symbolic link `name` in `dirfd` by name, with `AT_SYMLINK_NOFOLLOW`, if
+/// `lstat` shows the name still holds the link `pinned` describes; fail otherwise.
+///
+/// Only for kernels before 5.8. The residual is a replacement between the `lstat` and the
+/// `utimensat`: a hard link to another file swapped in at that moment takes the link's times --
+/// a wrong mtime, at worst.
+#[cfg(target_os = "linux")]
+fn utimens_link_by_name(
+    dirfd: libc::c_int,
+    name: &CStr,
+    pinned: &fs::Metadata,
+    times: &[libc::timespec; 2],
+) -> io::Result<()> {
+    let now = ftw::Metadata::new(dirfd, name, false)?;
+    if now.dev() != pinned.dev()
+        || now.ino() != pinned.ino()
+        || now.file_type() != ftw::FileType::SymbolicLink
+    {
+        return Err(io::Error::other(gettext!(
+            "'{}' was replaced during the copy",
+            name.to_string_lossy()
+        )));
+    }
+    let nofollow = libc::AT_SYMLINK_NOFOLLOW;
+    if unsafe { libc::utimensat(dirfd, name.as_ptr(), times.as_ptr(), nofollow) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -2593,5 +2657,43 @@ mod tests {
         copy_must_create(&dir.join("source"), &dir.join("target"));
         let kept = fs::read(dir.join("target")).unwrap();
         assert_eq!(kept, b"kept");
+    }
+
+    /// Before Linux 5.8 a made symbolic link's times go by name: only while the name still
+    /// holds the pinned link, never through a hard link to another file swapped in for it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn link_times_by_name_reach_only_the_pinned_link() {
+        use super::utimens_link_by_name;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = std::env::temp_dir().join(format!("cp-link-times-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink("anywhere", dir.join("l")).unwrap();
+        let dirfd = std::fs::File::open(&dir).unwrap();
+        let pinned = std::fs::symlink_metadata(dir.join("l")).unwrap();
+        let at = |sec| libc::timespec {
+            tv_sec: sec,
+            tv_nsec: 0,
+        };
+
+        utimens_link_by_name(dirfd.as_raw_fd(), c"l", &pinned, &[at(12345), at(12345)]).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(dir.join("l")).unwrap().mtime(),
+            12345
+        );
+
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "").unwrap();
+        std::fs::remove_file(dir.join("l")).unwrap();
+        std::fs::hard_link(&victim, dir.join("l")).unwrap();
+        let before = std::fs::metadata(&victim).unwrap().mtime();
+        let r = utimens_link_by_name(dirfd.as_raw_fd(), c"l", &pinned, &[at(1), at(1)]);
+        assert!(r.is_err());
+        assert_eq!(std::fs::metadata(&victim).unwrap().mtime(), before);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

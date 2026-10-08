@@ -9,6 +9,11 @@
 
 mod debhelper;
 mod dirmode;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod old_kernel;
 mod race;
 
 use plib::testing::{run_test, TestPlan};

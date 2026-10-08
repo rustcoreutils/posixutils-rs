@@ -186,6 +186,11 @@ pub(crate) struct DirTree {
     /// one: renamed over it by someone else. A member naming one later does
     /// not take it for a pre-existing directory and give it attributes.
     replaced: RefCell<HashSet<(u64, u64)>>,
+    /// `(st_dev, st_ino)` of directories this run made only to hold a member
+    /// below them, whose owner could not be verified (`MadeTrust::
+    /// ParentOwnerOnly`). They are used, but a member naming one later gives
+    /// it no attributes, as it would not to one made for that member.
+    unverified: RefCell<HashSet<(u64, u64)>>,
     /// The mtime each pre-existing directory had when this run first walked
     /// into it, before any member created below it changed that. -u compares
     /// against this: a `find -depth` list names a directory after its
@@ -219,6 +224,7 @@ impl DirTree {
             last_parent: RefCell::new(None),
             implicit: RefCell::new(HashSet::new()),
             replaced: RefCell::new(HashSet::new()),
+            unverified: RefCell::new(HashSet::new()),
             pre_run_mtimes: RefCell::new(HashMap::new()),
         })
     }
@@ -277,9 +283,11 @@ impl DirTree {
             if st.is_some_and(|st| self.replaced.borrow().contains(&file_id(&st))) {
                 return Err(PaxError::Io(made::replaced()));
             }
-            if let Some(st) = fstat(next.as_fd()) {
+            if let Some(st) = st {
                 if origin == DirOrigin::Made {
                     self.implicit.borrow_mut().insert(file_id(&st));
+                } else if origin == DirOrigin::Unverified {
+                    self.unverified.borrow_mut().insert(file_id(&st));
                 } else {
                     self.pre_run_mtimes
                         .borrow_mut()
@@ -548,11 +556,13 @@ pub(crate) fn open_dir_at(
 /// Where the directory `open_or_create_dir_at` opened came from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DirOrigin {
-    /// It was already there -- or this run made it, but can trust it only so
-    /// far (`MadeTrust::ParentOwnerOnly`), and so treats it the same way.
+    /// It was already there.
     Found,
     /// This run made it, and it is checked to be the one made.
     Made,
+    /// This run made it, but can trust it only so far
+    /// (`MadeTrust::ParentOwnerOnly`): used, never given attributes.
+    Unverified,
     /// This run made one, and found another in its place: never to be used,
     /// nor given attributes later.
     Replaced,
@@ -596,24 +606,43 @@ fn open_or_create_dir_at(
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     // One this run made is checked to be that one, not a directory renamed
     // over it -- which would otherwise count as made here, and be given the
-    // attributes of the member naming it later. One trusted only so far is
-    // used but not counted as made.
+    // attributes of the member naming it later.
     if !created {
         return Ok((fd, DirOrigin::Found));
     }
     let origin = match verify_made_dir(dirfd, fd.as_fd())? {
         Some(MadeTrust::Full) => DirOrigin::Made,
-        Some(MadeTrust::ParentOwnerOnly) => DirOrigin::Found,
+        Some(MadeTrust::ParentOwnerOnly) => DirOrigin::Unverified,
         None => DirOrigin::Replaced,
     };
     Ok((fd, origin))
 }
 
+/// What `make_dir_at` decided about the attributes of the directory a member
+/// names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirAttrs {
+    /// Apply the member's attributes, once its contents exist, to the
+    /// directory with this `(st_dev, st_ino)`.
+    Apply((u64, u64)),
+    /// -k leaves what is there alone.
+    Keep,
+    /// The directory with this `(st_dev, st_ino)` is extracted into, but its
+    /// owner could not be verified (`MadeTrust::ParentOwnerOnly`): it gets no
+    /// attributes, and the caller says so (`attrs_withheld`).
+    Withheld((u64, u64)),
+}
+
+/// The diagnostic for `DirAttrs::Withheld`.
+pub(crate) fn attrs_withheld() -> PaxError {
+    PaxError::Io(std::io::Error::other(
+        "not applying owner, mode or times: its owner could not be verified",
+    ))
+}
+
 /// Create the directory a member names, replacing a non-directory in the
-/// way the way a file member replaces a file. `Some((st_dev, st_ino))` of the
-/// directory the member's attributes are to be applied to once its contents
-/// exist; `None` when -k (`no_clobber`) leaves what is there alone, or when a
-/// directory just made can be trusted only so far (`MadeTrust`).
+/// way the way a file member replaces a file, and decide what becomes of the
+/// member's attributes (`DirAttrs`).
 ///
 /// The identity of a directory made here comes from a descriptor for it,
 /// checked to be the one made (`made_dir_id`), never from its name: a
@@ -633,7 +662,7 @@ pub(crate) fn make_dir_at(
     name: &CStr,
     mode: u32,
     no_clobber: bool,
-) -> PaxResult<Option<(u64, u64)>> {
+) -> PaxResult<DirAttrs> {
     // An archived 0555 used to be set immediately and then rejected every
     // child with EACCES.
     let mode = ((mode & 0o7777) | 0o700) as libc::mode_t;
@@ -661,13 +690,16 @@ pub(crate) fn make_dir_at(
         return Err(PaxError::Io(made::replaced()));
     }
     if let Some(st) = existing_dir.filter(|st| tree.claim_implicit(st)) {
-        return Ok(Some(file_id(&st)));
+        return Ok(DirAttrs::Apply(file_id(&st)));
+    }
+    if let Some(st) = existing_dir.filter(|st| tree.unverified.borrow().contains(&file_id(st))) {
+        return Ok(DirAttrs::Withheld(file_id(&st)));
     }
     if no_clobber {
-        return Ok(None);
+        return Ok(DirAttrs::Keep);
     }
     if let Some(st) = existing_dir {
-        return Ok(Some(file_id(&st)));
+        return Ok(DirAttrs::Apply(file_id(&st)));
     }
 
     // A non-directory is in the way, and is replaced the way a file member
@@ -686,17 +718,13 @@ pub(crate) fn make_dir_at(
     }
 }
 
-/// `(st_dev, st_ino)` of the directory `make_dir_at` has just made at `name`,
-/// read from a descriptor for it once that is checked to be the directory
-/// made (`verify_made_dir`); `None` when it can be trusted only so far, and so
-/// is not to be given the member's attributes. One found in its place is
-/// remembered in `tree`, so that no later member takes it for a pre-existing
-/// directory either.
-fn made_dir_id(
-    tree: &DirTree,
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-) -> PaxResult<Option<(u64, u64)>> {
+/// The attributes decision for the directory `make_dir_at` has just made at
+/// `name`, its `(st_dev, st_ino)` read from a descriptor for it once that is
+/// checked to be the directory made (`verify_made_dir`); `Keep` when it can be
+/// trusted only so far, and so is not to be given the member's attributes. One
+/// found in its place is remembered in `tree`, so that no later member takes
+/// it for a pre-existing directory either.
+fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<DirAttrs> {
     #[cfg(test)]
     reached_made_dir(dirfd, name);
     let (dir, _) = open_dir_for_attrs(dirfd, name)?;
@@ -705,7 +733,10 @@ fn made_dir_id(
         tree.replaced.borrow_mut().insert(file_id(&st));
         return Err(PaxError::Io(made::replaced()));
     };
-    Ok((trust == MadeTrust::Full).then(|| file_id(&st)))
+    match trust {
+        MadeTrust::Full => Ok(DirAttrs::Apply(file_id(&st))),
+        MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Keep),
+    }
 }
 
 /// A directory has just been made at `name`: under test, where a writer of

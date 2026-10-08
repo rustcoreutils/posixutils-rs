@@ -237,6 +237,36 @@ fn nothing_is_extracted_into_a_directory_found_in_place_of_a_made_one() {
     );
 }
 
+/// A directory made only to hold a member below it, on a filesystem where its
+/// owner could not be verified (`MadeTrust::ParentOwnerOnly`), gets no
+/// attributes from the member naming it later, as one made for that member
+/// would not either.
+#[test]
+fn unverified_intermediate_directory_is_not_stamped() {
+    use crate::modes::made::MadeTrust;
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let entries = vec![
+        own_member("a/f", EntryType::Fifo, 0o600),
+        own_member("a", EntryType::Directory, 0o751),
+    ];
+    let mut archive = Members(entries.into_iter());
+    let options = preserve_everything();
+    race_hook::with_dir_trust(MadeTrust::ParentOwnerOnly, || {
+        extract_members(&mut archive, &options, &tree, &mut pending).unwrap();
+    });
+    pending.apply(&tree, &policy_of(&options));
+
+    let md = std::fs::metadata(tmp.path().join("a")).unwrap();
+    assert!(tmp.path().join("a/f").exists());
+    assert_ne!(
+        md.mode() & 0o7777,
+        0o751,
+        "the unverified directory was stamped"
+    );
+}
+
 /// Without a swap, both kinds of directory take the archived mode, in a
 /// shared extraction directory as anywhere else; an existing directory is
 /// merged into and takes it too.

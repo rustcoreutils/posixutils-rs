@@ -41,6 +41,27 @@ thread_local! {
     static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    static DIR_TRUST: std::cell::Cell<Option<crate::modes::made::MadeTrust>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The trust `verify_made_dir` is to report for every directory this thread
+/// makes, if one is set: a filesystem whose owners may be mapped (NFS, FUSE)
+/// cannot be had in a test.
+pub(crate) fn forced_dir_trust() -> Option<crate::modes::made::MadeTrust> {
+    DIR_TRUST.with(|t| t.get())
+}
+
+/// Run `f` with every directory made on this thread reported as trusted to
+/// `trust`.
+pub(crate) fn with_dir_trust<R>(trust: crate::modes::made::MadeTrust, f: impl FnOnce() -> R) -> R {
+    DIR_TRUST.with(|t| t.set(Some(trust)));
+    let result = f();
+    DIR_TRUST.with(|t| t.set(None));
+    result
+}
+
 /// pax has reached `point` for `name` below `dirfd`: run the hook, if any.
 pub(crate) fn reached(point: Point, dirfd: libc::c_int, name: &CStr) {
     let hook = HOOK.with(|h| h.borrow_mut().take());

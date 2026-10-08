@@ -14,8 +14,9 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, link_replacing, make_dir_at, set_attrs_fd, set_made_node_attrs, stat_at,
-    unlink_at, AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
+    attrs_withheld, create_replacing, link_replacing, make_dir_at, set_attrs_fd,
+    set_made_node_attrs, stat_at, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath,
+    PendingDirs,
 };
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
@@ -360,12 +361,15 @@ fn extract_entry<R: ArchiveReader>(
 
     match entry.entry_type {
         EntryType::Directory => {
-            if let Some(id) = extract_directory(tree, pfd, name, entry, options)? {
+            let decided = extract_directory(tree, pfd, name, entry, options)?;
+            archive.skip_data()?;
+            match decided {
                 // Its attributes are applied once the subtree exists, if it
                 // is still this directory then.
-                pending_dirs.push(&member, id, attrs_of(entry, options));
+                DirAttrs::Apply(id) => pending_dirs.push(&member, id, attrs_of(entry, options)),
+                DirAttrs::Keep => {}
+                DirAttrs::Withheld(_) => return Err(attrs_withheld()),
             }
-            archive.skip_data()?;
         }
         EntryType::Symlink => {
             extract_symlink(pfd, name, entry, options)?;
@@ -439,15 +443,14 @@ fn copy_member_to_stdout<R: ArchiveReader>(
     Ok(())
 }
 
-/// Extract a directory. Returns the `(st_dev, st_ino)` of the directory its
-/// attributes are to be applied to later, if any.
+/// Extract a directory, saying what becomes of its attributes.
 fn extract_directory(
     tree: &DirTree,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<Option<(u64, u64)>> {
+) -> PaxResult<DirAttrs> {
     make_dir_at(tree, dirfd, name, entry.mode, options.no_clobber)
 }
 

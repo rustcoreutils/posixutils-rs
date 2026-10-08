@@ -17,9 +17,9 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at, open_dir_at,
-    restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, stat_at, AttrPolicy,
-    Attrs, DirTree, MemberPath, PendingDirs,
+    attrs_withheld, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
+    open_dir_at, restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, stat_at,
+    AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::followed_link;
 use crate::modes::write::FileNames;
@@ -413,10 +413,14 @@ impl CopyWalk<'_> {
         // descriptor checked to be the one made (`make_dir_at`), one kept by
         // the `lstat` that decided to keep it. The descriptor opened here
         // must be that directory, or something was renamed over it.
-        let expected = if keep {
-            existing.map(|st| file_id(&st))
-        } else {
-            make_dir_at(self.tree, parent.as_fd(), &mp.leaf, metadata.mode(), false)?
+        let decided = match existing {
+            // -k or -u keeps it, as it is.
+            Some(_) if keep => DirAttrs::Keep,
+            _ => make_dir_at(self.tree, parent.as_fd(), &mp.leaf, metadata.mode(), false)?,
+        };
+        let expected = match decided {
+            DirAttrs::Apply(id) | DirAttrs::Withheld(id) => Some(id),
+            DirAttrs::Keep => existing.map(|st| file_id(&st)),
         };
         let dir = open_dir_at(parent.as_fd(), &mp.leaf, false)?;
         let dest_st = stat_at(dir.as_fd(), c".")
@@ -433,10 +437,15 @@ impl CopyWalk<'_> {
 
         self.print_verbose(src);
 
-        if let (false, Some(id)) = (keep, expected) {
-            self.pending_dirs
-                .borrow_mut()
-                .push(&mp, id, attrs_of(metadata));
+        match decided {
+            DirAttrs::Apply(id) => {
+                self.pending_dirs
+                    .borrow_mut()
+                    .push(&mp, id, attrs_of(metadata));
+            }
+            // Copied into all the same.
+            DirAttrs::Withheld(_) => crate::error::report_error(src, attrs_withheld()),
+            DirAttrs::Keep => {}
         }
         self.descend(member, metadata)
     }

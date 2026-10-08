@@ -268,6 +268,10 @@ pub(crate) fn verify_made_dir(
     parent: BorrowedFd<'_>,
     dir: BorrowedFd<'_>,
 ) -> io::Result<Option<MadeTrust>> {
+    #[cfg(test)]
+    if let Some(trust) = crate::modes::race_hook::forced_dir_trust() {
+        return Ok(Some(trust));
+    }
     let euid = unsafe { libc::geteuid() };
     let parent_st = fstat(parent)?;
     if !others_can_rename(&parent_st, euid) {

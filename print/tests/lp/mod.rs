@@ -952,10 +952,9 @@ fn lp_multiple_files_each_report_a_request_id() {
         return;
     };
 
-    let td = std::env::temp_dir().join(format!("posixutils_lp_multi_{}", std::process::id()));
-    std::fs::create_dir_all(&td).unwrap();
-    let a = td.join("a.txt");
-    let b = td.join("b.txt");
+    let td = TempDir::new().unwrap();
+    let a = td.path().join("a.txt");
+    let b = td.path().join("b.txt");
     std::fs::write(&a, b"alpha").unwrap();
     std::fs::write(&b, b"beta").unwrap();
 
@@ -991,7 +990,6 @@ fn lp_multiple_files_each_report_a_request_id() {
     );
 
     let _ = handle.join();
-    let _ = std::fs::remove_dir_all(&td);
 }
 
 // ============================================================================

@@ -21,6 +21,8 @@
 //! always created fresh rather than written through.
 
 use crate::error::{PaxError, PaxResult};
+use crate::modes::made::{self, cvt, verify_made_dir, MadeNode, MadeTrust};
+use plib::madefs::{ChainTrust, FoundDir, Preserve};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -121,6 +123,27 @@ impl MemberPath {
     pub(crate) fn depth(&self) -> usize {
         self.depth
     }
+
+    /// The member's own path as a registry key: its components, each ended
+    /// by a NUL, as `Chain` and `dir_key` spell them.
+    pub(crate) fn key(&self) -> Vec<u8> {
+        let mut key = self.dirs.clone();
+        key.extend_from_slice(self.leaf.to_bytes_with_nul());
+        key
+    }
+
+    /// The key (`key`) of the directory made of the member's first `n`
+    /// directory components.
+    fn dir_key(&self, n: usize) -> &[u8] {
+        let end = self
+            .dirs
+            .iter()
+            .enumerate()
+            .filter(|&(_, &b)| b == 0)
+            .nth(n - 1)
+            .map_or(0, |(i, _)| i + 1);
+        &self.dirs[..end]
+    }
 }
 
 /// Open flags for a directory that is only ever walked through or used as the
@@ -131,13 +154,14 @@ impl MemberPath {
 /// search and write but not list (mode 0300) where `mkdir` or `open` by name
 /// would have succeeded. `O_PATH` (Linux) and `O_SEARCH` (macOS, the BSDs) open
 /// it for exactly that. Elsewhere `O_RDONLY` is the only option there is.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// (An `O_PATH` descriptor takes attributes only through a verified procfs,
+/// `set_attrs_search_only`, which is Linux's alone.)
+#[cfg(target_os = "linux")]
 const SEARCH_ONLY: libc::c_int = libc::O_PATH;
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
 #[cfg(not(any(
     target_os = "linux",
-    target_os = "android",
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd"
@@ -174,13 +198,36 @@ pub(crate) struct DirTree {
     chain: RefCell<Chain>,
     /// How many levels `chain` may hold: each is an open descriptor.
     max_levels: usize,
-    /// The parent most recently walked to, so consecutive members of one
-    /// directory deeper than `max_levels` still share one walk.
-    last_parent: RefCell<Option<(Vec<u8>, Rc<OwnedFd>)>>,
+    /// The parent most recently walked to, and the trust it hands the
+    /// directories found in it, so consecutive members of one directory
+    /// deeper than `max_levels` still share one walk.
+    last_parent: RefCell<Option<LastParent>>,
+    /// The trust the anchor hands the directories found in it: the root of
+    /// the trust every walk carries down (`ChainTrust`).
+    root_trust: ChainTrust,
     /// `(st_dev, st_ino)` of the directories this run created only to hold a
-    /// member below them. Such a directory is not a pre-existing file: a member
-    /// that names it later (`find -depth` order) still gives it its attributes.
-    implicit: RefCell<HashSet<(u64, u64)>>,
+    /// member below them, each with the member path (`MemberPath::key`) it
+    /// was made at. Such a directory is not a pre-existing file: a member
+    /// that names it later (`find -depth` order) still gives it its
+    /// attributes -- a member of that name: met under any other, it was
+    /// renamed there, and is one found existing.
+    implicit: RefCell<HashMap<(u64, u64), Vec<u8>>>,
+    /// `(st_dev, st_ino)` of directories found where this run had just made
+    /// one: renamed over it by someone else. A member naming one later does
+    /// not take it for a pre-existing directory and give it attributes.
+    replaced: RefCell<HashSet<(u64, u64)>>,
+    /// `(st_dev, st_ino)` of directories this run made only to hold a member
+    /// below them, whose owner could not be verified (`MadeTrust::
+    /// ParentOwnerOnly`). They are used, but a member naming one later gives
+    /// it no attributes, as it would not to one made for that member.
+    unverified: RefCell<HashSet<(u64, u64)>>,
+    /// `(st_dev, st_ino)` of directories this run made, verified through a
+    /// descriptor to be the ones made, for a member naming them -- or made
+    /// to hold members below them and since claimed by the member naming
+    /// them -- each with the member path it was made at. Unlike a directory
+    /// found existing, these take a member's attributes wherever they are --
+    /// at that path: one renamed to another member's name is found there.
+    made: RefCell<HashMap<(u64, u64), Vec<u8>>>,
     /// The mtime each pre-existing directory had when this run first walked
     /// into it, before any member created below it changed that. -u compares
     /// against this: a `find -depth` list names a directory after its
@@ -207,12 +254,17 @@ impl DirTree {
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let root = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(DirTree {
-            root: unsafe { OwnedFd::from_raw_fd(fd) },
+            root_trust: ChainTrust::anchor(root.as_raw_fd())?,
+            root,
             chain: RefCell::new(Chain::default()),
             max_levels: cached_levels_budget(),
             last_parent: RefCell::new(None),
-            implicit: RefCell::new(HashSet::new()),
+            implicit: RefCell::new(HashMap::new()),
+            replaced: RefCell::new(HashSet::new()),
+            unverified: RefCell::new(HashSet::new()),
+            made: RefCell::new(HashMap::new()),
             pre_run_mtimes: RefCell::new(HashMap::new()),
         })
     }
@@ -229,9 +281,20 @@ impl DirTree {
         member: &MemberPath,
         create_missing: bool,
     ) -> PaxResult<Rc<OwnedFd>> {
-        if let Some((dirs, fd)) = &*self.last_parent.borrow() {
-            if *dirs == member.dirs {
-                return Ok(Rc::clone(fd));
+        self.parent_and_trust(member, create_missing)
+            .map(|(fd, _)| fd)
+    }
+
+    /// `parent_of`, with the trust that parent hands the directories found
+    /// in it (`ChainTrust`), carried down the walk from the anchor.
+    fn parent_and_trust(
+        &self,
+        member: &MemberPath,
+        create_missing: bool,
+    ) -> PaxResult<(Rc<OwnedFd>, ChainTrust)> {
+        if let Some(last) = &*self.last_parent.borrow() {
+            if last.dirs == member.dirs {
+                return Ok((Rc::clone(&last.fd), last.trust));
             }
         }
 
@@ -242,58 +305,207 @@ impl DirTree {
         // replace it while the chain kept its descriptor. With no last parent
         // the next member goes through the chain, and cuts it as it should.
         *self.last_parent.borrow_mut() = match &walked {
-            Ok(fd) => Some((member.dirs.clone(), Rc::clone(fd))),
+            Ok((fd, trust)) => Some(LastParent {
+                dirs: member.dirs.clone(),
+                fd: Rc::clone(fd),
+                trust: *trust,
+            }),
             Err(_) => None,
         };
         walked
     }
 
-    /// The walk `parent_of` does through the chain, reopening only the
-    /// components `member` does not share with it.
-    fn walk_chain(&self, member: &MemberPath, create_missing: bool) -> PaxResult<Rc<OwnedFd>> {
+    /// The walk `parent_and_trust` does through the chain, reopening only the
+    /// components `member` does not share with it, and carrying the trust
+    /// down from the anchor: each directory found existing hands on what it
+    /// was handed and its own (`ChainTrust::found`); one this run made, at
+    /// that path, starts afresh (`ChainTrust::made`).
+    fn walk_chain(
+        &self,
+        member: &MemberPath,
+        create_missing: bool,
+    ) -> PaxResult<(Rc<OwnedFd>, ChainTrust)> {
         let mut chain = self.chain.borrow_mut();
         let shared = chain.shared_with(member);
         chain.truncate(shared);
-        let mut cur = chain.levels.last().map(|(_, fd)| Rc::clone(fd));
+        let mut cur = chain.levels.last().map(|level| Rc::clone(&level.fd));
+        let mut trust = chain
+            .levels
+            .last()
+            .map_or(self.root_trust, |level| level.trust);
 
-        for comp in member.dirs().skip(shared) {
+        for (level, comp) in member.dirs().enumerate().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
-            let (next, created) = open_or_create_dir_at(at, comp, create_missing)?;
-            if let Some(st) = fstat(next.as_fd()) {
-                if created {
-                    self.implicit.borrow_mut().insert(file_id(&st));
-                } else {
+            let key = member.dir_key(level + 1);
+            let (next, origin) = open_or_create_dir_at(at, comp, create_missing)?;
+            let st = match self.admit(next.as_fd(), origin) {
+                Ok(st) => st,
+                Err(e) => {
+                    // `refuse_replaced` cannot reach the chain from here.
+                    chain.truncate(0);
+                    return Err(e);
+                }
+            };
+            let id = file_id(&st);
+            match origin {
+                DirOrigin::Made(fresh) => self.record_made(fresh, key, true),
+                DirOrigin::Found | DirOrigin::Replaced => {
                     self.pre_run_mtimes
                         .borrow_mut()
-                        .entry(file_id(&st))
+                        .entry(id)
                         .or_insert(mtime_of(&st));
                 }
             }
+            trust = match self.standing(id, key) {
+                Standing::Implicit | Standing::Made => ChainTrust::made(next.as_raw_fd())?,
+                _ => trust.found(next.as_raw_fd())?,
+            };
             let next = Rc::new(next);
             if chain.levels.len() < self.max_levels {
-                chain.push(comp, Rc::clone(&next));
+                chain.push(comp, Rc::clone(&next), trust);
             }
             cur = Some(next);
         }
         match cur {
-            Some(fd) => Ok(fd),
-            None => Ok(Rc::new(self.root.try_clone()?)),
+            Some(fd) => Ok((fd, trust)),
+            None => Ok((Rc::new(self.root.try_clone()?), trust)),
         }
     }
 
-    /// Whether `st` is a directory this run created only to hold members
-    /// below it, rather than one that was there before.
-    pub(crate) fn is_implicit(&self, st: &libc::stat) -> bool {
-        self.implicit.borrow().contains(&file_id(st))
+    /// What this run knows about the directory with `(st_dev, st_ino)` `id`,
+    /// met at the member path `key` (`MemberPath::key`).
+    ///
+    /// The one registry every site that enters, merges into or stamps a
+    /// directory consults: the walk and `open_dir` (through `admit`),
+    /// `make_dir_at` and `apply_dir_attrs`. A directory this run made counts
+    /// as made only at the path it was made at: one someone renamed to
+    /// another member's name is one found existing there.
+    fn standing(&self, id: (u64, u64), key: &[u8]) -> Standing {
+        let made_at = |made: &RefCell<HashMap<(u64, u64), Vec<u8>>>| {
+            made.borrow()
+                .get(&id)
+                .is_some_and(|at| at.as_slice() == key)
+        };
+        if self.is_replaced(id) {
+            Standing::Replaced
+        } else if self.unverified.borrow().contains(&id) {
+            Standing::Unverified
+        } else if made_at(&self.implicit) {
+            Standing::Implicit
+        } else if made_at(&self.made) {
+            Standing::Made
+        } else {
+            Standing::Ordinary
+        }
+    }
+
+    /// Whether the directory with `id` was found in place of one this run
+    /// made, wherever it is met.
+    fn is_replaced(&self, id: (u64, u64)) -> bool {
+        self.replaced.borrow().contains(&id)
+    }
+
+    /// Record `fresh`, a directory this run has just made at the member path
+    /// `key` and verified (`FreshDir::verify`), with the one standing its
+    /// trust gives it: made only to hold members below it (`implicit`), or
+    /// for a member naming it, or unverified.
+    /// The one place the walk and `make_dir_at` both record what they made.
+    ///
+    /// A directory just made is new, whatever its inode number stood for
+    /// before: one removed during the run can hand its number on to the next
+    /// directory made. So everything the registry held for the number is
+    /// forgotten first -- a stale `made` entry for another path would
+    /// otherwise make this one, renamed to that path, pass for that member's.
+    ///
+    /// It takes a `FreshDir` -- a directory a successful `mkdirat` made and
+    /// `verify_made_dir` accepted -- and nothing else, so the forgetting and
+    /// the one standing recorded in its place happen together, and only for
+    /// a directory proven new. Nothing else ever removes an entry from
+    /// `replaced` or `unverified`; a directory found in place of one made is
+    /// recorded by `refuse_replaced` instead, which removes nothing.
+    fn record_made(&self, fresh: FreshDir, key: &[u8], implicit: bool) {
+        let id = fresh.id;
+        self.implicit.borrow_mut().remove(&id);
+        self.made.borrow_mut().remove(&id);
+        self.unverified.borrow_mut().remove(&id);
+        self.replaced.borrow_mut().remove(&id);
+        let made = match fresh.trust {
+            MadeTrust::ParentOwnerOnly => {
+                self.unverified.borrow_mut().insert(id);
+                return;
+            }
+            MadeTrust::Full if implicit => &self.implicit,
+            MadeTrust::Full => &self.made,
+        };
+        made.borrow_mut().insert(id, key.to_vec());
+    }
+
+    /// Record the directory with `id` as found in place of one this run
+    /// made, and fail.
+    ///
+    /// It may be one the walk already holds a descriptor for -- moved away
+    /// from its name and renamed back over the new directory made there --
+    /// and the chain and `last_parent` reuse their descriptors without asking
+    /// again. So every cached descriptor is dropped here, and the next member
+    /// walks afresh, through `admit`. (Inside `walk_chain`, which holds the
+    /// chain, the walk drops it itself on the way out.)
+    fn refuse_replaced(&self, id: (u64, u64)) -> PaxError {
+        self.replaced.borrow_mut().insert(id);
+        *self.last_parent.borrow_mut() = None;
+        if let Ok(mut chain) = self.chain.try_borrow_mut() {
+            chain.truncate(0);
+        }
+        PaxError::Io(made::replaced())
+    }
+
+    /// Admit the directory just opened on `fd`, which `open_or_create_dir_at`
+    /// says came from `origin`, to be entered: never one found in place of a
+    /// directory this run made, now or earlier, whichever member reaches it.
+    fn admit(&self, fd: BorrowedFd<'_>, origin: DirOrigin) -> PaxResult<libc::stat> {
+        let st = fstat(fd).ok_or_else(std::io::Error::last_os_error)?;
+        if origin == DirOrigin::Replaced {
+            return Err(self.refuse_replaced(file_id(&st)));
+        }
+        if self.is_replaced(file_id(&st)) {
+            return Err(PaxError::Io(made::replaced()));
+        }
+        Ok(st)
+    }
+
+    /// Open one directory component below `dirfd` without following a
+    /// symlink, admitted as the walk admits one (`admit`).
+    pub(crate) fn open_dir(
+        &self,
+        dirfd: BorrowedFd<'_>,
+        name: &CStr,
+        create_missing: bool,
+    ) -> PaxResult<OwnedFd> {
+        let (fd, origin) = open_or_create_dir_at(dirfd, name, create_missing)?;
+        self.admit(fd.as_fd(), origin)?;
+        Ok(fd)
+    }
+
+    /// Whether `st`, met at `member`, is a directory this run created there
+    /// only to hold members below it, rather than one that was there before.
+    pub(crate) fn is_implicit(&self, st: &libc::stat, member: &MemberPath) -> bool {
+        self.standing(file_id(st), &member.key()) == Standing::Implicit
     }
 
     /// `is_implicit`, for the member that names the directory and so gives it
-    /// its attributes. That member makes it an ordinary existing directory:
-    /// a later member of the same name meets it the way it would meet any
-    /// other -- left alone under -k -- rather than as one still waiting for
-    /// its attributes.
-    pub(crate) fn claim_implicit(&self, st: &libc::stat) -> bool {
-        self.implicit.borrow_mut().remove(&file_id(st))
+    /// its attributes. That member makes it a directory this run made for a
+    /// member (`Standing::Made`): a later member of the same name meets it as
+    /// an existing directory -- left alone under -k -- rather than as one
+    /// still waiting for its attributes, and it still takes attributes
+    /// wherever it is, being verified as made.
+    pub(crate) fn claim_implicit(&self, st: &libc::stat, member: &MemberPath) -> bool {
+        let id = file_id(st);
+        let key = member.key();
+        if self.standing(id, &key) != Standing::Implicit {
+            return false;
+        }
+        self.implicit.borrow_mut().remove(&id);
+        self.made.borrow_mut().insert(id, key);
+        true
     }
 
     /// The mtime `st` had before this run put anything below it, for -u, as
@@ -319,8 +531,25 @@ fn mtime_of(st: &libc::stat) -> (i64, i64) {
 struct Chain {
     /// The components, each ended by a NUL, as in `MemberPath::dirs`.
     names: Vec<u8>,
-    /// For each level, where its name ends in `names` and its descriptor.
-    levels: Vec<(usize, Rc<OwnedFd>)>,
+    levels: Vec<Level>,
+}
+
+/// The parent `DirTree` walked to last (`DirTree::last_parent`).
+struct LastParent {
+    /// The member's directory components, as in `MemberPath::dirs`.
+    dirs: Vec<u8>,
+    fd: Rc<OwnedFd>,
+    /// The trust it hands the directories found in it (`ChainTrust`).
+    trust: ChainTrust,
+}
+
+/// One directory of `Chain`.
+struct Level {
+    /// Where its name ends in `Chain::names`.
+    end: usize,
+    fd: Rc<OwnedFd>,
+    /// The trust it hands the directories found in it (`ChainTrust`).
+    trust: ChainTrust,
 }
 
 impl Chain {
@@ -336,13 +565,14 @@ impl Chain {
     /// Forget every level below the first `depth`.
     fn truncate(&mut self, depth: usize) {
         self.levels.truncate(depth);
-        let end = self.levels.last().map_or(0, |(end, _)| *end);
+        let end = self.levels.last().map_or(0, |level| level.end);
         self.names.truncate(end);
     }
 
-    fn push(&mut self, name: &CStr, fd: Rc<OwnedFd>) {
+    fn push(&mut self, name: &CStr, fd: Rc<OwnedFd>, trust: ChainTrust) {
         self.names.extend_from_slice(name.to_bytes_with_nul());
-        self.levels.push((self.names.len(), fd));
+        let end = self.names.len();
+        self.levels.push(Level { end, fd, trust });
     }
 }
 
@@ -397,13 +627,13 @@ struct PendingDir {
 }
 
 impl PendingDirs {
-    /// Defer `attrs` for the directory `member` names, `st` being what that
-    /// directory is.
-    pub(crate) fn push(&mut self, member: &MemberPath, st: &libc::stat, attrs: Attrs) {
+    /// Defer `attrs` for the directory `member` names, `id` being the
+    /// `(st_dev, st_ino)` of that directory.
+    pub(crate) fn push(&mut self, member: &MemberPath, id: (u64, u64), attrs: Attrs) {
         self.0.push(PendingDir {
             path: member.display.clone(),
             depth: member.depth(),
-            id: file_id(st),
+            id,
             attrs,
         });
     }
@@ -433,14 +663,24 @@ impl PendingDirs {
 /// is not a directory, and the identity check a directory that is not this
 /// one. Each means the directory these attributes were for is gone, which is
 /// not an error: whatever replaced it brought its own.
+///
+/// A directory this run made and verified takes its attributes. One that was
+/// already there takes, as libarchive's does, its times by default, its mode
+/// only under `-p p` and its owner only under `-p o` -- and those only where
+/// nobody but pax's user could have created its name, in its parent or any
+/// directory above it up to the anchor (`ChainTrust`, carried down the
+/// walk); elsewhere it keeps all its own, and that is diagnosed
+/// (`found_dir_with_mode`).
 fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> PaxResult<()> {
     let Some(member) = MemberPath::parse(&dir.path)? else {
         return Ok(());
     };
     let opened = tree
-        .parent_of(&member, false)
-        .and_then(|parent| open_dir_for_attrs(parent.as_fd(), &member.leaf));
-    let (fd, search_only) = match opened {
+        .parent_and_trust(&member, false)
+        .and_then(|(parent, trust)| {
+            open_dir_for_attrs(parent.as_fd(), &member.leaf).map(|opened| (trust, opened))
+        });
+    let (trust, (fd, search_only)) = match opened {
         Ok(opened) => opened,
         Err(PaxError::Io(e)) if is_superseded(&e) => return Ok(()),
         Err(e) => return Err(e),
@@ -448,10 +688,36 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
     if fstat(fd.as_fd()).is_none_or(|st| file_id(&st) != dir.id) {
         return Ok(());
     }
+    let with_mode = match tree.standing(dir.id, &member.key()) {
+        Standing::Replaced => return Err(PaxError::Io(made::replaced())),
+        Standing::Unverified => return Err(attrs_withheld()),
+        Standing::Implicit | Standing::Made => true,
+        Standing::Ordinary => found_dir_with_mode(trust, policy)?,
+    };
     if search_only {
-        return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy);
+        return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy, with_mode);
     }
-    set_attrs_fd(fd.as_fd(), &dir.attrs, policy)
+    set_attrs_with(&AttrTarget::Fd(fd.as_fd()), &dir.attrs, policy, with_mode)
+}
+
+/// For a directory found existing at a member's name, in a parent handing it
+/// `trust`: whether it takes the member's mode, or an error when it is to
+/// take nothing at all (`ChainTrust::found_dir`). Its owner it takes only
+/// under `-p o`, which `set_attrs_with` already follows; its times, as by
+/// default, whenever it takes anything.
+fn found_dir_with_mode(trust: ChainTrust, policy: &AttrPolicy) -> PaxResult<bool> {
+    let requested = Preserve {
+        mode: policy.preserve_perms,
+        owner: policy.preserve_owner,
+    };
+    match trust.found_dir(requested) {
+        FoundDir::TimesOnly => Ok(false),
+        FoundDir::AsRequested => Ok(policy.preserve_perms),
+        FoundDir::LeaveAlone => Err(PaxError::Io(std::io::Error::other(
+            "not applying owner, mode or times: the directory was already there, \
+             and others can create entries beside it",
+        ))),
+    }
 }
 
 /// Whether failing to reach a pending directory means it was replaced.
@@ -488,41 +754,112 @@ fn open_dir_for_attrs(dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<(OwnedFd,
 /// `set_attrs_fd` for a descriptor opened for search only.
 ///
 /// Linux's `O_PATH` descriptor is refused by `fchown`, `fchmod` and `futimens`
-/// alike. Its `/proc/self/fd` entry is not: it resolves to the very file the
-/// descriptor holds, whatever has happened to the name since, so the calls
-/// made through it by name cannot be redirected.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
-    let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-        .expect("a formatted number has no NUL");
-    set_attrs(&AttrTarget::Path(&path), attrs, policy)
+/// alike. Its `self/fd/N` entry, under a `/proc` verified to be procfs
+/// (`made::procfs_dir`), is not: it resolves to the very file the descriptor
+/// holds, whatever has happened to the name since, so the calls made through
+/// it by name cannot be redirected -- not by a `/proc` that is something else
+/// either.
+#[cfg(target_os = "linux")]
+fn set_attrs_search_only(
+    fd: BorrowedFd<'_>,
+    attrs: &Attrs,
+    policy: &AttrPolicy,
+    with_mode: bool,
+) -> PaxResult<()> {
+    let proc_dir = made::procfs_dir()?;
+    let name = made::proc_fd_name(fd.as_raw_fd());
+    let target = AttrTarget::Proc {
+        dir: proc_dir.as_fd(),
+        name: &name,
+    };
+    set_attrs_with(&target, attrs, policy, with_mode)
 }
 
 /// Elsewhere a search-only descriptor (`O_SEARCH`) takes the same calls as any
 /// other.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
-    set_attrs_fd(fd, attrs, policy)
+#[cfg(not(target_os = "linux"))]
+fn set_attrs_search_only(
+    fd: BorrowedFd<'_>,
+    attrs: &Attrs,
+    policy: &AttrPolicy,
+    with_mode: bool,
+) -> PaxResult<()> {
+    set_attrs_with(&AttrTarget::Fd(fd), attrs, policy, with_mode)
 }
 
-/// Open one directory component below `dirfd` without following a symlink.
-pub(crate) fn open_dir_at(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    create_missing: bool,
-) -> PaxResult<OwnedFd> {
-    open_or_create_dir_at(dirfd, name, create_missing).map(|(fd, _)| fd)
+/// What this run knows about a directory (`DirTree::standing`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// Found in place of one this run made: never entered nor stamped.
+    Replaced,
+    /// Made by this run where its owner could not be verified: entered,
+    /// never stamped.
+    Unverified,
+    /// Made by this run only to hold members below it, awaiting the member
+    /// that names it.
+    Implicit,
+    /// Made and verified by this run for a member naming it, or implicit and
+    /// since claimed: takes attributes wherever it is.
+    Made,
+    /// Found existing: takes its times, and its mode and owner only when
+    /// asked for -- and then only where nobody else could have created its
+    /// name, here or above it (`plib::madefs::ChainTrust::found_dir`).
+    Ordinary,
 }
 
-/// `open_dir_at`, also saying whether the directory had to be created.
+/// Where the directory `open_or_create_dir_at` opened came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirOrigin {
+    /// It was already there.
+    Found,
+    /// This run made it, and it is checked to be the one made, trusted as
+    /// far as the `FreshDir` says (`MadeTrust::ParentOwnerOnly`: used, never
+    /// given attributes).
+    Made(FreshDir),
+    /// This run made one, and found another in its place: never to be used,
+    /// nor given attributes later.
+    Replaced,
+}
+
+/// A directory this run has just made with `mkdirat`, accepted by
+/// `verify_made_dir` from the descriptor it was opened on: its identity and
+/// how far it is trusted. Only `FreshDir::verify` makes one, and only
+/// `DirTree::record_made` takes one -- the one place the registry forgets
+/// what an inode number stood for, which only a directory proven new may
+/// make it do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FreshDir {
+    id: (u64, u64),
+    trust: MadeTrust,
+}
+
+impl FreshDir {
+    /// The directory a successful `mkdirat` in `parent` has just made, opened
+    /// on `dir`, if `verify_made_dir` accepts it; `None` when what is there
+    /// is not the directory made.
+    fn verify(parent: BorrowedFd<'_>, dir: BorrowedFd<'_>) -> PaxResult<Option<Self>> {
+        let Some(trust) = verify_made_dir(parent, dir)? else {
+            return Ok(None);
+        };
+        let st = fstat(dir).ok_or_else(std::io::Error::last_os_error)?;
+        Ok(Some(FreshDir {
+            id: file_id(&st),
+            trust,
+        }))
+    }
+}
+
+/// Open one directory component below `dirfd` without following a symlink,
+/// creating it if asked to, and say where it came from. Callers go through
+/// `DirTree::admit` before using it.
 fn open_or_create_dir_at(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     create_missing: bool,
-) -> PaxResult<(OwnedFd, bool)> {
+) -> PaxResult<(OwnedFd, DirOrigin)> {
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), WALK_FLAGS) };
     if fd >= 0 {
-        return Ok((unsafe { OwnedFd::from_raw_fd(fd) }, false));
+        return Ok((unsafe { OwnedFd::from_raw_fd(fd) }, DirOrigin::Found));
     }
 
     let err = std::io::Error::last_os_error();
@@ -540,18 +877,61 @@ fn open_or_create_dir_at(
             return Err(e.into());
         }
     }
+    #[cfg(test)]
+    if created {
+        reached_made_dir(dirfd, name);
+    }
 
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), WALK_FLAGS) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok((unsafe { OwnedFd::from_raw_fd(fd) }, created))
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // One this run made is checked to be that one, not a directory renamed
+    // over it -- which would otherwise count as made here, and be given the
+    // attributes of the member naming it later.
+    if !created {
+        return Ok((fd, DirOrigin::Found));
+    }
+    let origin = match FreshDir::verify(dirfd, fd.as_fd())? {
+        Some(fresh) => DirOrigin::Made(fresh),
+        None => DirOrigin::Replaced,
+    };
+    Ok((fd, origin))
+}
+
+/// What `make_dir_at` decided about the attributes of the directory a member
+/// names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirAttrs {
+    /// Apply the member's attributes, once its contents exist, to the
+    /// directory with this `(st_dev, st_ino)`.
+    Apply((u64, u64)),
+    /// -k leaves what is there alone.
+    Keep,
+    /// The directory with this `(st_dev, st_ino)` is extracted into, but its
+    /// owner could not be verified (`MadeTrust::ParentOwnerOnly`): it gets no
+    /// attributes, and the caller says so (`attrs_withheld`).
+    Withheld((u64, u64)),
+}
+
+/// The diagnostic for `DirAttrs::Withheld`.
+pub(crate) fn attrs_withheld() -> PaxError {
+    PaxError::Io(std::io::Error::other(
+        "not applying owner, mode or times: its owner could not be verified",
+    ))
 }
 
 /// Create the directory a member names, replacing a non-directory in the
-/// way the way a file member replaces a file. `true` when the member's
-/// attributes are to be applied to it once its contents exist; `false` when
-/// -k (`no_clobber`) leaves what is there alone.
+/// way the way a file member replaces a file, and decide what becomes of the
+/// member's attributes (`DirAttrs`).
+///
+/// The identity of a directory made here comes from a descriptor for it,
+/// checked to be the one made (`made_dir_id`), never from its name: a
+/// directory renamed over it in between would otherwise take the member's
+/// attributes. One that was already there (POSIX lets read mode merge into
+/// it) is identified by the `lstat` that found it, and a caller that opens it
+/// checks the descriptor against that.
 ///
 /// It is created with `mode` (the umask applies) plus owner read, write and
 /// search: enough to populate it, and never more than the final mode lets
@@ -561,10 +941,11 @@ fn open_or_create_dir_at(
 pub(crate) fn make_dir_at(
     tree: &DirTree,
     dirfd: BorrowedFd<'_>,
-    name: &CStr,
+    member: &MemberPath,
     mode: u32,
     no_clobber: bool,
-) -> PaxResult<bool> {
+) -> PaxResult<DirAttrs> {
+    let name = member.leaf.as_c_str();
     // An archived 0555 used to be set immediately and then rejected every
     // child with EACCES.
     let mode = ((mode & 0o7777) | 0o700) as libc::mode_t;
@@ -578,7 +959,7 @@ pub(crate) fn make_dir_at(
     let exists = |e: &std::io::Error| e.raw_os_error() == Some(libc::EEXIST);
 
     match mkdir() {
-        Ok(()) => return Ok(true),
+        Ok(()) => return made_dir_id(tree, dirfd, member),
         Err(e) if !exists(&e) => return Err(e.into()),
         Err(_) => {}
     }
@@ -588,27 +969,73 @@ pub(crate) fn make_dir_at(
     // Otherwise extracting onto an existing directory is not an error
     // (POSIX), and it is kept.
     let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
-    if existing_dir.is_some_and(|st| tree.claim_implicit(&st)) {
-        return Ok(true);
+    if let Some(st) = existing_dir {
+        let id = file_id(&st);
+        return match tree.standing(id, &member.key()) {
+            Standing::Replaced => Err(PaxError::Io(made::replaced())),
+            Standing::Implicit => {
+                tree.claim_implicit(&st, member);
+                Ok(DirAttrs::Apply(id))
+            }
+            Standing::Unverified => Ok(DirAttrs::Withheld(id)),
+            Standing::Made | Standing::Ordinary if no_clobber => Ok(DirAttrs::Keep),
+            // Whether one found existing may take them is decided when they
+            // are applied, from its parent (`apply_dir_attrs`).
+            Standing::Made | Standing::Ordinary => Ok(DirAttrs::Apply(id)),
+        };
     }
     if no_clobber {
-        return Ok(false);
-    }
-    if existing_dir.is_some() {
-        return Ok(true);
+        return Ok(DirAttrs::Keep);
     }
 
     // A non-directory is in the way, and is replaced the way a file member
     // replaces a file. unlinkat with no flags removes the name itself -- never
-    // what a symlink points at -- and refuses a directory, so one that
-    // appeared meanwhile survives and is used.
+    // what a symlink points at -- and refuses a directory. A directory that
+    // appears in between was put there by someone else, while this run was
+    // replacing the name: it is not given the member's attributes.
     let unlinked = unsafe { libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), 0) } == 0;
     let unlink_err = (!unlinked).then(std::io::Error::last_os_error);
     match mkdir() {
-        Ok(()) => Ok(true),
-        Err(e) if exists(&e) && is_directory_at(dirfd, name) => Ok(true),
+        Ok(()) => made_dir_id(tree, dirfd, member),
+        Err(e) if exists(&e) && is_directory_at(dirfd, name) => Err(PaxError::Io(
+            std::io::Error::other("a directory appeared in its place while it was replaced"),
+        )),
         Err(e) => Err(unlink_err.unwrap_or(e).into()),
     }
+}
+
+/// The attributes decision for the directory `make_dir_at` has just made at
+/// `name`, its `(st_dev, st_ino)` read from a descriptor for it once that is
+/// checked to be the directory made (`verify_made_dir`); `Withheld` when it
+/// can be trusted only so far, and so is not to be given the member's
+/// attributes. One
+/// found in its place is remembered in `tree`, so that no later member takes
+/// it for a pre-existing directory either.
+fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, member: &MemberPath) -> PaxResult<DirAttrs> {
+    let name = member.leaf.as_c_str();
+    #[cfg(test)]
+    reached_made_dir(dirfd, name);
+    let (dir, _) = open_dir_for_attrs(dirfd, name)?;
+    let Some(fresh) = FreshDir::verify(dirfd, dir.as_fd())? else {
+        let st = fstat(dir.as_fd()).ok_or_else(std::io::Error::last_os_error)?;
+        return Err(tree.refuse_replaced(file_id(&st)));
+    };
+    let id = fresh.id;
+    // Recorded either way, as the walk records what it makes: a later member
+    // of the same name meets it with this standing.
+    tree.record_made(fresh, &member.key(), false);
+    match fresh.trust {
+        MadeTrust::Full => Ok(DirAttrs::Apply(id)),
+        MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Withheld(id)),
+    }
+}
+
+/// A directory has just been made at `name`: under test, where a writer of
+/// the parent gets to replace it.
+#[cfg(test)]
+fn reached_made_dir(dirfd: BorrowedFd<'_>, name: &CStr) {
+    use crate::modes::race_hook::{reached, Point};
+    reached(Point::MadeDir, dirfd.as_raw_fd(), name);
 }
 
 /// Whether `name` below `dirfd` is a directory, not following a symlink.
@@ -655,7 +1082,7 @@ where
     F: FnMut() -> std::io::Result<()>,
 {
     match create() {
-        Ok(()) => return Ok(true),
+        Ok(()) => return Ok(created(dirfd, name)),
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
         Err(e) => return Err(e.into()),
     }
@@ -666,9 +1093,22 @@ where
 
     unlink_at(dirfd, name)?;
     match create() {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(created(dirfd, name)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// `create_replacing` has made `name`: always `true`. Under test this is where
+/// a writer of the destination directory gets to replace it.
+fn created(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
+    #[cfg(test)]
+    crate::modes::race_hook::reached(
+        crate::modes::race_hook::Point::Made,
+        dirfd.as_raw_fd(),
+        name,
+    );
+    let _ = (dirfd, name);
+    true
 }
 
 /// Hard-link `from_name` (in `from_dir`) to `name` (in `dirfd`), replacing
@@ -690,40 +1130,36 @@ pub(crate) fn link_replacing(
     name: &CStr,
     no_clobber: bool,
 ) -> PaxResult<bool> {
-    link_replacing_with(from_dir, from_name, false, dirfd, name, no_clobber)
+    link_replacing_with(from_dir, from_name, false, None, dirfd, name, no_clobber)
 }
 
 /// `link_replacing`, linking the file a symbolic link `from_name` refers to
 /// when `follow` is set -- copy mode's `-l` under `-H`/`-L`, where POSIX says
 /// "the hard link created ... shall be to the file referenced by the symbolic
 /// link". Without it, `from_name` itself is linked, whatever it is.
+///
+/// `linkat` by name resolves `from_name` again -- and with `follow`, the
+/// link's target too -- so it can link a file other than the one the caller
+/// examined, whose `(st_dev, st_ino)` is `expected`. Given `expected`, the
+/// source is pinned first (`LinkSource`) and checked to be that file, and the
+/// link is made to the pinned inode itself, so no other file is ever linked.
+/// Where it cannot be pinned, a link made by name to anything else is removed
+/// again and the call fails (`linked_expected`), rather than leave the
+/// destination a second name for a file nobody asked to copy.
 pub(crate) fn link_replacing_with(
     from_dir: libc::c_int,
     from_name: &CStr,
     follow: bool,
+    expected: Option<(u64, u64)>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     no_clobber: bool,
 ) -> PaxResult<bool> {
-    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
-    let link = || {
-        let r = unsafe {
-            libc::linkat(
-                from_dir,
-                from_name.as_ptr(),
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                flags,
-            )
-        };
-        if r != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    };
+    let source = LinkSource::new(from_dir, from_name, follow, expected)?;
+    let link = || source.link_to(dirfd, name);
 
     match link() {
-        Ok(()) => return Ok(false),
+        Ok(()) => return source.check_linked(dirfd, name).map(|()| false),
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
         Err(e) => return Err(e.into()),
     }
@@ -748,7 +1184,140 @@ pub(crate) fn link_replacing_with(
 
     unlink_at(dirfd, name)?;
     link()?;
+    source.check_linked(dirfd, name)?;
     Ok(false)
+}
+
+/// What `link_replacing_with` links.
+enum LinkSource<'a> {
+    /// The inode the caller examined, pinned by an `O_PATH` descriptor and
+    /// linked through its `self/fd/N` entry in a procfs-verified `/proc`
+    /// (Linux).
+    #[cfg(target_os = "linux")]
+    Pinned { proc_dir: File, pin: OwnedFd },
+    /// A name, resolved again by `linkat`: `flags` is `AT_SYMLINK_FOLLOW` or
+    /// 0, and `expected` what the link made is checked against afterwards.
+    Name {
+        from_dir: libc::c_int,
+        from_name: &'a CStr,
+        flags: libc::c_int,
+        expected: Option<(u64, u64)>,
+    },
+}
+
+impl<'a> LinkSource<'a> {
+    /// `from_name` in `from_dir`, followed if `follow`: pinned and checked to
+    /// be `expected` where that is given and the platform allows.
+    fn new(
+        from_dir: libc::c_int,
+        from_name: &'a CStr,
+        follow: bool,
+        expected: Option<(u64, u64)>,
+    ) -> PaxResult<Self> {
+        #[cfg(target_os = "linux")]
+        if let Some(expected) = expected {
+            if let Some(pinned) = Self::pin(from_dir, from_name, follow, expected)? {
+                return Ok(pinned);
+            }
+        }
+        let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+        Ok(LinkSource::Name {
+            from_dir,
+            from_name,
+            flags,
+            expected,
+        })
+    }
+
+    /// Pin the source with `O_PATH` -- following a symbolic link exactly
+    /// when `linkat` would -- and require it to be the file `expected`.
+    /// `None` without a verified procfs, where the pin could not be linked.
+    #[cfg(target_os = "linux")]
+    fn pin(
+        from_dir: libc::c_int,
+        from_name: &CStr,
+        follow: bool,
+        expected: (u64, u64),
+    ) -> PaxResult<Option<Self>> {
+        let Ok(proc_dir) = made::procfs_dir() else {
+            return Ok(None);
+        };
+        let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+        let flags = libc::O_PATH | libc::O_CLOEXEC | nofollow;
+        let fd = unsafe { libc::openat(from_dir, from_name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let pin = unsafe { OwnedFd::from_raw_fd(fd) };
+        if !fstat(pin.as_fd()).is_some_and(|st| file_id(&st) == expected) {
+            return Err(source_changed());
+        }
+        Ok(Some(LinkSource::Pinned { proc_dir, pin }))
+    }
+
+    /// Make `name` in `dirfd` a hard link to the source.
+    fn link_to(&self, dirfd: BorrowedFd<'_>, name: &CStr) -> std::io::Result<()> {
+        let to = dirfd.as_raw_fd();
+        let r = match self {
+            #[cfg(target_os = "linux")]
+            LinkSource::Pinned { proc_dir, pin } => {
+                // The magic link is followed to the pinned inode itself.
+                let pinned = made::proc_fd_name(pin.as_raw_fd());
+                let (from, follow) = (proc_dir.as_raw_fd(), libc::AT_SYMLINK_FOLLOW);
+                unsafe { libc::linkat(from, pinned.as_ptr(), to, name.as_ptr(), follow) }
+            }
+            LinkSource::Name {
+                from_dir,
+                from_name,
+                flags,
+                ..
+            } => unsafe { libc::linkat(*from_dir, from_name.as_ptr(), to, name.as_ptr(), *flags) },
+        };
+        made::cvt(r)
+    }
+
+    /// After `link_to` made `name`: a pinned source can only have linked the
+    /// file it pins. A name, resolved again, may have linked another file:
+    /// unless the link is the file expected (when given), remove it again
+    /// and fail. The residual: a writer of the destination who renames the
+    /// link away before this check keeps it.
+    fn check_linked(&self, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            LinkSource::Pinned { .. } => Ok(()),
+            LinkSource::Name { expected, .. } => linked_expected(dirfd, name, *expected),
+        }
+    }
+}
+
+/// The failure for a source that is no longer the file the walk examined.
+fn source_changed() -> PaxError {
+    PaxError::Io(std::io::Error::other(
+        "source file changed before it could be linked",
+    ))
+}
+
+/// After `link_replacing_with` made `name` by name: unless it is the file
+/// `expected` (when given), remove it again and fail.
+fn linked_expected(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    expected: Option<(u64, u64)>,
+) -> PaxResult<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    #[cfg(test)]
+    crate::modes::race_hook::reached(
+        crate::modes::race_hook::Point::Linked,
+        dirfd.as_raw_fd(),
+        name,
+    );
+    if stat_at(dirfd, name).is_some_and(|st| file_id(&st) == expected) {
+        return Ok(());
+    }
+    unlink_at(dirfd, name)?;
+    Err(source_changed())
 }
 
 /// Open a source file from the descriptor of the directory it was found in.
@@ -771,16 +1340,13 @@ pub(crate) fn open_source_file(
     follow: bool,
     expected: (u64, u64),
 ) -> std::io::Result<File> {
-    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // O_NOCTTY: a terminal swapped in for the file is refused below, but a
+    // pax with no controlling terminal would adopt it in the open itself.
+    let mut flags = libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC;
     if !follow {
         flags |= libc::O_NOFOLLOW;
     }
-
-    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file = open_regular_guarded(dir_fd, name, flags)?;
 
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
@@ -807,6 +1373,112 @@ pub(crate) fn open_source_file(
     }
 
     Ok(file)
+}
+
+/// `openat(dir_fd, name, flags)` for a file expected to be regular, with
+/// `O_NONBLOCK` added so that a FIFO swapped in for it cannot hold the open.
+///
+/// A regular file under a lease (a Samba oplock, a knfsd delegation) fails a
+/// non-blocking open with EAGAIN/EWOULDBLOCK instead of waiting for the lease
+/// to break, so that open is retried blocking (`reopen_regular_blocking`) --
+/// without letting the retry reach a FIFO swapped in after the first attempt.
+/// The caller's identity and type check follows either open.
+fn open_regular_guarded(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+) -> std::io::Result<File> {
+    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags | libc::O_NONBLOCK) };
+    if fd >= 0 {
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    let err = std::io::Error::last_os_error();
+    let leased =
+        matches!(err.raw_os_error(), Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK);
+    if !leased {
+        return Err(err);
+    }
+    reopen_regular_blocking(dir_fd, name, flags)
+}
+
+/// The blocking retry of `open_regular_guarded`, which may wait for a lease to
+/// break and so must only ever open a regular file.
+///
+/// On Linux the name is pinned with `O_PATH` (plus the caller's `O_NOFOLLOW`),
+/// the pinned inode must be a regular file, and the blocking open is of that
+/// inode itself, through `self/fd/N` in a `/proc` verified to be procfs: no
+/// name is resolved again, so nothing swapped in after the pin is reached.
+#[cfg(target_os = "linux")]
+fn reopen_regular_blocking(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+) -> std::io::Result<File> {
+    let Ok(proc_dir) = made::procfs_dir() else {
+        return reopen_regular_by_name(dir_fd, name, flags);
+    };
+    let pin_flags = libc::O_PATH | libc::O_CLOEXEC | (flags & libc::O_NOFOLLOW);
+    let pin = unsafe { libc::openat(dir_fd, name.as_ptr(), pin_flags) };
+    if pin < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pin = unsafe { OwnedFd::from_raw_fd(pin) };
+    if !fstat(pin.as_fd()).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG) {
+        return Err(std::io::Error::from_raw_os_error(libc::ENXIO));
+    }
+    // The magic link is followed to the pinned inode: `O_NOFOLLOW` would
+    // refuse it.
+    let pinned = made::proc_fd_name(pin.as_raw_fd());
+    let fd = unsafe {
+        libc::openat(
+            proc_dir.as_raw_fd(),
+            pinned.as_ptr(),
+            flags & !libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Elsewhere, and without procfs, there is no pinning an inode without
+/// opening it, so the name is `fstatat`'ed -- following a symbolic link
+/// exactly when the caller's flags do -- and must be a regular file just
+/// before the blocking open. The residual is a FIFO swapped in between those
+/// two calls, which can hold the open until a writer comes; it cannot make
+/// pax read anything else, since the caller's identity check still refuses
+/// the descriptor.
+#[cfg(not(target_os = "linux"))]
+fn reopen_regular_blocking(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+) -> std::io::Result<File> {
+    reopen_regular_by_name(dir_fd, name, flags)
+}
+
+/// The by-name half of `reopen_regular_blocking`; see the residual there.
+fn reopen_regular_by_name(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+) -> std::io::Result<File> {
+    let stat_flags = if flags & libc::O_NOFOLLOW != 0 {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    match fstatat(dir_fd, name, stat_flags) {
+        Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFREG => {}
+        Some(_) => return Err(std::io::Error::from_raw_os_error(libc::ENXIO)),
+        None => return Err(std::io::Error::last_os_error()),
+    }
+    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// `-t`: put back the access time that reading a file disturbed.
@@ -991,34 +1663,42 @@ pub(crate) fn set_attrs_fd(
 /// What the attribute calls of `set_attrs` act on.
 enum AttrTarget<'a> {
     Fd(BorrowedFd<'a>),
-    /// A name that cannot be redirected: see `set_attrs_search_only`.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    Path(&'a CStr),
+    /// A `self/fd/N` entry under a verified procfs `dir`, which cannot be
+    /// redirected: see `set_attrs_search_only`.
+    #[cfg(target_os = "linux")]
+    Proc {
+        dir: BorrowedFd<'a>,
+        name: &'a CStr,
+    },
 }
 
 impl AttrTarget<'_> {
     fn chown(&self, uid: libc::uid_t, gid: libc::gid_t) -> libc::c_int {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            AttrTarget::Path(p) => unsafe { libc::chown(p.as_ptr(), uid, gid) },
+            #[cfg(target_os = "linux")]
+            AttrTarget::Proc { dir, name } => unsafe {
+                libc::fchownat(dir.as_raw_fd(), name.as_ptr(), uid, gid, 0)
+            },
         }
     }
 
     fn chmod(&self, mode: libc::mode_t) -> libc::c_int {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::fchmod(fd.as_raw_fd(), mode) },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            AttrTarget::Path(p) => unsafe { libc::chmod(p.as_ptr(), mode) },
+            #[cfg(target_os = "linux")]
+            AttrTarget::Proc { dir, name } => unsafe {
+                libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, 0)
+            },
         }
     }
 
     fn utimens(&self, times: &[libc::timespec; 2]) -> libc::c_int {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) },
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            AttrTarget::Path(p) => unsafe {
-                libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), 0)
+            #[cfg(target_os = "linux")]
+            AttrTarget::Proc { dir, name } => unsafe {
+                libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times.as_ptr(), 0)
             },
         }
     }
@@ -1026,12 +1706,23 @@ impl AttrTarget<'_> {
 
 /// `set_attrs_fd`, for any `AttrTarget`.
 fn set_attrs(target: &AttrTarget<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
+    set_attrs_with(target, attrs, policy, true)
+}
+
+/// `set_attrs`, setting the mode only `with_mode`: a directory found
+/// existing takes a member's mode only under `-p p` (`DirStamp::Found`).
+fn set_attrs_with(
+    target: &AttrTarget<'_>,
+    attrs: &Attrs,
+    policy: &AttrPolicy,
+    with_mode: bool,
+) -> PaxResult<()> {
     // Owner first: a successful chown may clear the set-id bits, and whether it
     // succeeded decides whether they may be set at all.
     let owner_set = policy.preserve_owner
-        && set_owner(attrs.uid, attrs.gid, |uid, gid| target.chown(uid, gid))?;
+        && set_owner(attrs.uid, attrs.gid, |uid, gid| cvt(target.chown(uid, gid)))?;
 
-    if target.chmod(policy.mode(attrs, owner_set) as libc::mode_t) != 0 {
+    if with_mode && target.chmod(policy.mode(attrs, owner_set) as libc::mode_t) != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
 
@@ -1058,7 +1749,7 @@ fn set_attrs(target: &AttrTarget<'_>, attrs: &Attrs, policy: &AttrPolicy) -> Pax
 /// whoever ran pax.
 pub(crate) fn set_owner<F>(uid: u32, gid: u32, chown: F) -> PaxResult<bool>
 where
-    F: FnOnce(libc::uid_t, libc::gid_t) -> libc::c_int,
+    F: FnOnce(libc::uid_t, libc::gid_t) -> std::io::Result<()>,
 {
     if uid == u32::MAX || gid == u32::MAX {
         eprintln!("pax: cannot change owner: invalid user or group ID");
@@ -1068,16 +1759,16 @@ where
     chown_result(chown(uid, gid))
 }
 
-/// Whether a `chown` call, given its return value, set the owner.
+/// Whether a chown call, given its result, set the owner.
 ///
 /// EPERM -- usually not being root -- is diagnosed and otherwise tolerated: the
 /// file keeps whoever ran pax as its owner, and the caller must then withhold
 /// the set-id bits (see [`AttrPolicy::mode`]). Any other failure is an error.
-fn chown_result(r: libc::c_int) -> PaxResult<bool> {
-    if r == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
+fn chown_result(r: std::io::Result<()>) -> PaxResult<bool> {
+    let err = match r {
+        Ok(()) => return Ok(true),
+        Err(e) => e,
+    };
     if err.raw_os_error() == Some(libc::EPERM) {
         eprintln!("pax: cannot change owner: Operation not permitted");
         crate::error::note_error();
@@ -1086,106 +1777,60 @@ fn chown_result(r: libc::c_int) -> PaxResult<bool> {
     Err(err.into())
 }
 
-/// Apply owner and times to a name that cannot be opened for the purpose -- a
-/// symbolic link, whose own mode bits carry no meaning and which must never be
-/// followed to reach them.
+/// Owner, mode and times for a FIFO, device or symbolic link this run has just
+/// made at `name` below `dirfd`, as a node of type `made_type` (`S_IFIFO`,
+/// `S_IFCHR`, `S_IFBLK` or `S_IFLNK`).
 ///
-/// Returns whether the owner was set, for a caller that goes on to apply a mode.
-pub(crate) fn set_link_attrs_at(
+/// None of them can be opened for the purpose -- a FIFO's open blocks, a
+/// device's acts on the device -- and applying the attributes by name reaches
+/// whatever the name holds by then: a writer of the directory who swaps in a
+/// hard link to another file hands that file the member's owner, mode and
+/// times. So the node is pinned and checked to be the one just made
+/// (`MadeNode`), and everything goes through the pin, in this order: owner,
+/// then mode, with the set-id bits only if the owner took, then times. A
+/// symbolic link's own mode means nothing and is left alone.
+pub(crate) fn set_made_node_attrs(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
+    made_type: libc::mode_t,
     attrs: &Attrs,
     policy: &AttrPolicy,
-) -> PaxResult<bool> {
-    let owner_set = policy.preserve_owner
-        && set_owner(attrs.uid, attrs.gid, |uid, gid| unsafe {
-            libc::fchownat(
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                uid,
-                gid,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })?;
-
-    if let Some(times) = policy.times(attrs) {
-        let r = unsafe {
-            libc::utimensat(
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                times.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if r != 0 {
-            eprintln!(
-                "pax: warning: cannot set times: {}",
-                std::io::Error::last_os_error()
-            );
-            crate::error::note_error();
-        }
+) -> PaxResult<()> {
+    let node = MadeNode::pin(dirfd, name, made_type)?;
+    if node.trust() == MadeTrust::ParentOwnerOnly {
+        set_node_times(&node, attrs, policy);
+        return owner_unverified(policy);
     }
 
-    Ok(owner_set)
-}
-
-/// Set the mode of a name below `dirfd` that cannot be opened for the purpose
-/// -- a FIFO, whose open blocks, or a device, whose open can act on the device
-/// -- never following a symbolic link: one found there is refused, and one
-/// swapped in after that check is not followed either.
-pub(crate) fn chmod_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> PaxResult<()> {
-    match stat_at(dirfd, name) {
-        None => return Err(std::io::Error::last_os_error().into()),
-        Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
-            return Err(PaxError::InvalidHeader(
-                "refusing to set permissions through a symbolic link".to_string(),
-            ))
-        }
-        Some(_) => {}
+    let owner_set =
+        policy.preserve_owner && set_owner(attrs.uid, attrs.gid, |uid, gid| node.chown(uid, gid))?;
+    if made_type != libc::S_IFLNK {
+        node.chmod(policy.mode(attrs, owner_set) as libc::mode_t)?;
     }
-    chmod_nofollow(dirfd, name, mode as libc::mode_t).map_err(Into::into)
-}
-
-/// The race-free half of `chmod_at`: at worst, a symbolic link put at `name`
-/// since it was checked is refused or has its own mode set.
-///
-/// Linux's `fchmodat` refuses `AT_SYMLINK_NOFOLLOW` (until `fchmodat2`), and
-/// `fchmod` refuses an `O_PATH` descriptor. So the name is opened `O_PATH`,
-/// which opens nothing on the device or FIFO itself, without following a
-/// link; the descriptor is checked to be no link, and its `/proc/self/fd`
-/// entry, which resolves to the very file it holds, takes the chmod -- as in
-/// `set_attrs_search_only`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn chmod_nofollow(dirfd: BorrowedFd<'_>, name: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
-    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    match fstat(fd.as_fd()) {
-        None => return Err(std::io::Error::last_os_error()),
-        Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
-            return Err(std::io::Error::from_raw_os_error(libc::ELOOP))
-        }
-        Some(_) => {}
-    }
-    let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-        .expect("a formatted number has no NUL");
-    if AttrTarget::Path(&path).chmod(mode) != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    set_node_times(&node, attrs, policy);
     Ok(())
 }
 
-/// Elsewhere `fchmodat` takes `AT_SYMLINK_NOFOLLOW`.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn chmod_nofollow(dirfd: BorrowedFd<'_>, name: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
-    let flags = libc::AT_SYMLINK_NOFOLLOW;
-    if unsafe { libc::fchmodat(dirfd.as_raw_fd(), name.as_ptr(), mode, flags) } != 0 {
-        return Err(std::io::Error::last_os_error());
+/// The times `policy` asks for, through `node`; a failure is a warning.
+fn set_node_times(node: &MadeNode<'_>, attrs: &Attrs, policy: &AttrPolicy) {
+    let Some(times) = policy.times(attrs) else {
+        return;
+    };
+    if let Err(e) = node.utimens(&times) {
+        eprintln!("pax: warning: cannot set times: {}", e);
+        crate::error::note_error();
     }
-    Ok(())
+}
+
+/// A node trusted only as `ParentOwnerOnly` gets no owner and no mode; that is
+/// worth saying when either was asked for.
+fn owner_unverified(policy: &AttrPolicy) -> PaxResult<()> {
+    if !policy.preserve_owner && !policy.preserve_perms {
+        return Ok(());
+    }
+    Err(PaxError::Io(std::io::Error::other(
+        "not preserving owner and permissions: its owner could not be verified",
+    )))
 }
 
 /// `fstatat` with `AT_SYMLINK_NOFOLLOW`, for asking what a name *is* without
@@ -1226,10 +1871,32 @@ mod tests {
         std::fs::symlink_metadata(path).unwrap().ino()
     }
 
-    /// A symbolic link swapped in for a FIFO or device between the check and
-    /// the chmod must not carry the mode to the file it points at.
+    /// A terminal swapped in for a source file is refused -- and must not
+    /// become the controlling terminal of a pax that has none (cron, CI, a
+    /// daemon) in the open before the refusal.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn test_chmod_nofollow_never_reaches_through_a_symlink() {
+    fn test_open_source_file_never_adopts_a_terminal() {
+        use crate::modes::race_hook;
+        if !race_hook::in_new_session() {
+            race_hook::rerun_in_new_session(
+                "modes::anchored::tests::test_open_source_file_never_adopts_a_terminal",
+            );
+            return;
+        }
+        let (_master, pts, slave) = race_hook::open_pty();
+        assert!(!race_hook::has_controlling_tty());
+        assert!(open_source_file(pts.as_raw_fd(), &slave, false, (0, 0)).is_err());
+        assert!(
+            !race_hook::has_controlling_tty(),
+            "opening the source made it the controlling terminal"
+        );
+    }
+
+    /// A symbolic link, or a FIFO made by someone else, found where a FIFO was
+    /// just made is not taken for it: nothing is applied through it.
+    #[test]
+    fn test_made_node_attrs_refuse_what_was_not_made() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = plib::tmp::TempDir::new().unwrap();
         let target = tmp.path().join("target");
@@ -1237,9 +1904,10 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink(&target, tmp.path().join("link")).unwrap();
         let dir = File::open(tmp.path()).unwrap();
+        let p = policy(false, true);
 
-        // Refused (Linux) or applied to the link itself (macOS, the BSDs).
-        let _ = chmod_nofollow(dir.as_fd(), c"link", 0o600);
+        let r = set_made_node_attrs(dir.as_fd(), c"link", libc::S_IFIFO, &attrs(0o4777), &p);
+        assert!(r.is_err());
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o644);
 
@@ -1247,9 +1915,16 @@ mod tests {
         let fifo = tmp.path().join("fifo");
         let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o644) }, 0);
-        chmod_nofollow(dir.as_fd(), c"fifo", 0o604).unwrap();
-        let mode = std::fs::metadata(&fifo).unwrap().permissions().mode();
+        set_made_node_attrs(dir.as_fd(), c"fifo", libc::S_IFIFO, &attrs(0o604), &p).unwrap();
+        let mode = std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o7777, 0o604);
+
+        // Asked for as a device, the FIFO is not one.
+        let r = set_made_node_attrs(dir.as_fd(), c"fifo", libc::S_IFCHR, &attrs(0o600), &p);
+        assert!(r.is_err());
     }
 
     #[test]
@@ -1304,6 +1979,145 @@ mod tests {
 
         assert!(tree.parent_of(&member("a/b/z"), true).is_err());
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    /// An inode number the registry holds can come back: the directory made
+    /// for `p/` removed while still empty, and the next mkdir -- at `q` --
+    /// given its number. Recording the new directory forgets everything the
+    /// number stood for, so `q` renamed to `p` is not taken for the directory
+    /// made for `p/`.
+    #[test]
+    fn test_a_reused_inode_number_forgets_what_it_stood_for() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let id = (1, 4242);
+        let (p, q) = (member("p").key(), member("q").key());
+        let fresh = |trust| FreshDir { id, trust };
+
+        tree.record_made(fresh(MadeTrust::Full), &p, false);
+        assert!(tree.standing(id, &p) == Standing::Made);
+        tree.record_made(fresh(MadeTrust::Full), &q, true);
+        assert!(tree.standing(id, &q) == Standing::Implicit);
+        assert!(
+            tree.standing(id, &p) == Standing::Ordinary,
+            "the number still stood for the directory made for p/"
+        );
+
+        // Nor does an earlier refusal or doubt about the number survive a
+        // directory proven new.
+        tree.replaced.borrow_mut().insert(id);
+        tree.record_made(fresh(MadeTrust::Full), &p, false);
+        assert!(tree.standing(id, &p) == Standing::Made);
+        tree.record_made(fresh(MadeTrust::ParentOwnerOnly), &q, true);
+        assert!(tree.standing(id, &q) == Standing::Unverified);
+        tree.record_made(fresh(MadeTrust::Full), &p, false);
+        assert!(tree.standing(id, &p) == Standing::Made);
+    }
+
+    /// A directory recorded as found in place of one made, or as made with
+    /// an owner that could not be verified, keeps that standing whatever
+    /// reaches it -- the walk, copy mode's entry, a member naming it -- and
+    /// only a verified fresh mkdir (`record_made`) can change it.
+    #[test]
+    fn test_a_refused_or_unverified_directory_is_never_downgraded() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        for name in ["r", "u"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let id = |name: &CStr| file_id(&stat_at(tree.root(), name).unwrap());
+        let (r, u) = (id(c"r"), id(c"u"));
+        let (r_key, u_key) = (member("r").key(), member("u").key());
+        assert!(matches!(tree.refuse_replaced(r), PaxError::Io(_)));
+        tree.unverified.borrow_mut().insert(u);
+
+        // Everything that can reach them, in turn.
+        assert!(tree.open_dir(tree.root(), c"r", false).is_err());
+        assert!(tree.parent_of(&member("r/x"), true).is_err());
+        assert!(make_dir_at(&tree, tree.root(), &member("r"), 0o755, false).is_err());
+        assert!(tree.open_dir(tree.root(), c"u", false).is_ok());
+        assert!(tree.parent_of(&member("u/x"), true).is_ok());
+        let decided = make_dir_at(&tree, tree.root(), &member("u"), 0o755, false).unwrap();
+        assert_eq!(decided, DirAttrs::Withheld(u));
+        assert!(!tree.claim_implicit(&stat_at(tree.root(), c"u").unwrap(), &member("u")));
+
+        assert!(tree.standing(r, &r_key) == Standing::Replaced);
+        assert!(tree.standing(u, &u_key) == Standing::Unverified);
+    }
+
+    /// Every site that enters, merges into or stamps a directory consults the
+    /// same registry: one recorded as found in place of a directory this run
+    /// made is refused by `open_dir` (copy mode's entry) as by the walk, and
+    /// neither it nor one whose owner could not be verified is stamped.
+    #[test]
+    fn test_every_directory_site_consults_the_standing() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        for name in ["r", "u"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let id = |name: &CStr| file_id(&stat_at(tree.root(), name).unwrap());
+        tree.replaced.borrow_mut().insert(id(c"r"));
+        tree.unverified.borrow_mut().insert(id(c"u"));
+
+        assert!(tree.open_dir(tree.root(), c"r", false).is_err());
+        assert!(tree.parent_of(&member("r/x"), false).is_err());
+        assert!(tree.open_dir(tree.root(), c"u", false).is_ok());
+
+        let mut pending = PendingDirs::default();
+        let mut stamp = |name: &str, id| {
+            let mut attrs = attrs(0o751);
+            attrs.mtime = 12345;
+            pending.push(&member(name), id, attrs);
+        };
+        stamp("r", id(c"r"));
+        stamp("u", id(c"u"));
+        let mut p = policy(false, true);
+        p.preserve_mtime = true;
+        pending.apply(&tree, &p);
+        for name in ["r", "u"] {
+            let md = std::fs::metadata(dir.path().join(name)).unwrap();
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(md.mtime(), 12345, "{name} was stamped");
+        }
+    }
+
+    /// A directory the walk holds a descriptor for can later be found renamed
+    /// over one this run made: moved away, and back over the new directory
+    /// of its old name. Once refused, the walk's cached descriptor for it
+    /// must not take a member there either.
+    #[test]
+    fn test_a_cached_directory_found_replaced_is_not_reused() {
+        use crate::modes::race_hook::{self, Point};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = plib::tmp::TempDir::new().unwrap();
+        // Others may rename entries in it, so a made directory is verified.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+
+        // The walk makes `a` and keeps a descriptor for it.
+        tree.parent_of(&member("a/x"), true).unwrap();
+        std::fs::write(dir.path().join("a/x"), "").unwrap();
+        // It is moved away; a member naming `a` makes a new one, and the old
+        // one is renamed back over it.
+        let away = dir.path().join("away");
+        std::fs::rename(dir.path().join("a"), &away).unwrap();
+        let away_c = CString::new(away.as_os_str().as_bytes()).unwrap();
+        let hook = move |point, dirfd, name: &CStr| {
+            if point == Point::MadeDir && name == c"a" {
+                race_hook::swap_for_directory(dirfd, name, &away_c);
+            }
+        };
+        let made = race_hook::with_hook(hook, || {
+            make_dir_at(&tree, tree.root(), &member("a"), 0o755, false)
+        });
+        assert!(made.is_err(), "the directory renamed over it was taken");
+
+        assert!(
+            tree.parent_of(&member("a/y"), true).is_err(),
+            "a cached descriptor reached the refused directory"
+        );
+        assert!(!dir.path().join("a/y").exists());
     }
 
     /// Past the descriptor budget the chain stops growing, and a walk still

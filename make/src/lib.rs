@@ -1207,14 +1207,11 @@ mod tests {
         ar.extend_from_slice(header.as_bytes());
         ar.extend_from_slice(b"data");
 
-        let path = std::env::temp_dir().join("posixutils_make_ar_member_test.a");
-        fs::write(&path, &ar).unwrap();
+        let path = plib::testing::TempFile::new("member_test.a", &ar);
         let path_str = path.to_str().unwrap();
 
         let expected = SystemTime::UNIX_EPOCH + Duration::from_secs(1234567890);
         assert_eq!(archive_member_mtime(path_str, "m.o"), Some(expected));
         assert_eq!(archive_member_mtime(path_str, "absent.o"), None);
-
-        let _ = fs::remove_file(&path);
     }
 }

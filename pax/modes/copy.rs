@@ -17,9 +17,9 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    chmod_at, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
-    open_dir_at, restore_atime, restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at,
-    AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
+    attrs_withheld, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
+    restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, stat_at, AttrPolicy,
+    Attrs, DirAttrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::followed_link;
 use crate::modes::write::FileNames;
@@ -404,29 +404,48 @@ impl CopyWalk<'_> {
         if existing.is_some_and(|st| is_source(&st, entry, metadata)) {
             return self.dir_onto_itself(src, member, metadata);
         }
-        let keep = existing.is_some_and(|st| self.keeps_existing_dir(metadata, &st));
+        let keep = existing.is_some_and(|st| self.keeps_existing_dir(metadata, &st, &mp));
         // Created no more open than its source, and reopened with
         // O_DIRECTORY|O_NOFOLLOW, so a symbolic link left in the destination
         // is refused rather than descended through.
-        if !keep {
-            make_dir_at(self.tree, parent.as_fd(), &mp.leaf, metadata.mode(), false)?;
+        //
+        // The directory it is to be: one just made is identified from a
+        // descriptor checked to be the one made (`make_dir_at`), one kept by
+        // the `lstat` that decided to keep it. The descriptor opened here
+        // must be that directory, or something was renamed over it.
+        let decided = match existing {
+            // -k or -u keeps it, as it is.
+            Some(_) if keep => DirAttrs::Keep,
+            _ => make_dir_at(self.tree, parent.as_fd(), &mp, metadata.mode(), false)?,
+        };
+        let expected = match decided {
+            DirAttrs::Apply(id) | DirAttrs::Withheld(id) => Some(id),
+            DirAttrs::Keep => existing.map(|st| file_id(&st)),
+        };
+        let dir = self.tree.open_dir(parent.as_fd(), &mp.leaf, false)?;
+        let dest_st = stat_at(dir.as_fd(), c".")
+            .ok_or_else(|| PaxError::Io(std::io::Error::last_os_error()))?;
+        if expected.is_some_and(|id| id != file_id(&dest_st)) {
+            return Err(PaxError::Io(std::io::Error::other(
+                "directory was replaced after it was checked",
+            )));
         }
-        let dir = open_dir_at(parent.as_fd(), &mp.leaf, false)?;
-        let stamp = (!keep).then_some(mp);
 
         // Remember what this destination directory *is*, so the walk can
         // recognise it if the source tree leads back here.
-        let dest_st = stat_at(dir.as_fd(), c".");
-        if let Some(st) = &dest_st {
-            self.dest_ids.borrow_mut().insert(file_id(st));
-        }
+        self.dest_ids.borrow_mut().insert(file_id(&dest_st));
 
         self.print_verbose(src);
 
-        if let (Some(mp), Some(st)) = (stamp, dest_st) {
-            self.pending_dirs
-                .borrow_mut()
-                .push(&mp, &st, attrs_of(metadata));
+        match decided {
+            DirAttrs::Apply(id) => {
+                self.pending_dirs
+                    .borrow_mut()
+                    .push(&mp, id, attrs_of(metadata));
+            }
+            // Copied into all the same.
+            DirAttrs::Withheld(_) => crate::error::report_error(src, attrs_withheld()),
+            DirAttrs::Keep => {}
         }
         self.descend(member, metadata)
     }
@@ -452,8 +471,13 @@ impl CopyWalk<'_> {
 
     /// Whether -k or -u leaves the directory already at a destination name
     /// with its own attributes.
-    fn keeps_existing_dir(&self, metadata: &ftw::Metadata, st: &libc::stat) -> bool {
-        if self.tree.claim_implicit(st) {
+    fn keeps_existing_dir(
+        &self,
+        metadata: &ftw::Metadata,
+        st: &libc::stat,
+        mp: &MemberPath,
+    ) -> bool {
+        if self.tree.claim_implicit(st, mp) {
             return false;
         }
         self.options.no_clobber
@@ -563,6 +587,7 @@ fn copy_special_file(
 
     let ft = metadata.file_type();
     let perm = (metadata.mode() & 0o7777) as libc::mode_t;
+    let made_type = metadata.mode() as libc::mode_t & libc::S_IFMT;
 
     let created = if ft.is_fifo() {
         create_replacing(dirfd, name, options.no_clobber, || {
@@ -604,10 +629,15 @@ fn copy_special_file(
 
     // mkfifoat and mknodat both apply the process umask, so the mode they were
     // given is not necessarily the mode on disk; and neither carries ownership
-    // or times. Extraction restores all three here, so a copy must too. A FIFO
-    // cannot be opened for the purpose without blocking on a writer, so this is
-    // the one place a name is used -- and set_permissions_at refuses a link.
-    set_node_attrs_at(dirfd, name, metadata, options)
+    // or times. Extraction restores all three here, so a copy must too --
+    // through the node just made, never by name.
+    set_made_node_attrs(
+        dirfd,
+        name,
+        made_type,
+        &attrs_of(metadata),
+        &policy_of(options),
+    )
 }
 
 /// Copy a symlink
@@ -632,10 +662,10 @@ fn copy_symlink(
         return Ok(());
     }
 
-    // A symlink's own mode is meaningless and there is no portable way to chmod
-    // one, so only owner and times are restored.
-    set_link_attrs_at(dirfd, name, &attrs_of(metadata), &policy_of(options))?;
-    Ok(())
+    // A symlink's own mode is meaningless, so only owner and times are
+    // restored.
+    let (attrs, policy) = (attrs_of(metadata), policy_of(options));
+    set_made_node_attrs(dirfd, name, libc::S_IFLNK, &attrs, &policy)
 }
 
 /// Copy a regular file
@@ -660,18 +690,25 @@ fn copy_file(
         // `pax -rwl tree .` names every file as its own destination. Under
         // -H/-L the walk followed a symbolic link here, and the link made is
         // to the file it refers to, as POSIX requires of -l.
+        #[cfg(test)]
+        crate::modes::race_hook::reached(
+            crate::modes::race_hook::Point::Linking,
+            entry.dir_fd(),
+            entry.file_name(),
+        );
         let linked = link_replacing_with(
             entry.dir_fd(),
             entry.file_name(),
             followed_link(entry, metadata),
+            Some((metadata.dev(), metadata.ino())),
             dirfd,
             name,
             options.no_clobber,
         );
         match linked {
-            // The name is resolved again by linkat, so what it linked is
-            // checked to be the file the walk saw; if the name changed in
-            // between, the copy below replaces the link with that file.
+            // The name is resolved again by linkat, so a link to anything but
+            // the file the walk saw is removed again (an error here); the
+            // copy below then copies that file, if the name still holds it.
             Ok(false) if is_file_at(dirfd, name, metadata) => return Ok(()),
             Ok(true) => {
                 crate::error::report_error(src, "Unable to link file to itself");
@@ -901,22 +938,6 @@ fn policy_of(options: &CopyOptions) -> AttrPolicy {
     }
 }
 
-/// Owner, mode and times for a node that cannot be opened for the purpose.
-fn set_node_attrs_at(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    metadata: &ftw::Metadata,
-    options: &CopyOptions,
-) -> PaxResult<()> {
-    let attrs = attrs_of(metadata);
-    let policy = policy_of(options);
-
-    // Owner and times take AT_SYMLINK_NOFOLLOW, and chmod_at never follows
-    // a symbolic link either.
-    let owner_set = set_link_attrs_at(dirfd, name, &attrs, &policy)?;
-    chmod_at(dirfd, name, policy.mode(&attrs, owner_set))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,3 +1083,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod race_tests;

@@ -10,6 +10,7 @@
 use std::fs;
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::tmp::tempdir;
 
 fn cat_test(args: &[&str], stdin: &str, expected_out: &str) {
     let str_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -47,24 +48,25 @@ fn cat_multiple_dash_reads_stdin_once() {
 
 #[test]
 fn cat_file_operand() {
-    let f = std::env::temp_dir().join("posixutils_cat_file");
+    let dir = tempdir().unwrap();
+    let f = dir.path().join("file");
     fs::write(&f, "file contents\n").unwrap();
     cat_test(&[f.to_str().unwrap()], "", "file contents\n");
-    let _ = fs::remove_file(&f);
 }
 
 #[test]
 fn cat_dash_among_files() {
-    let f = std::env::temp_dir().join("posixutils_cat_among");
+    let dir = tempdir().unwrap();
+    let f = dir.path().join("among");
     fs::write(&f, "A\n").unwrap();
     // file, then stdin (-), in order.
     cat_test(&[f.to_str().unwrap(), "-"], "B\n", "A\nB\n");
-    let _ = fs::remove_file(&f);
 }
 
 #[test]
 fn cat_missing_file_sets_exit_and_continues() {
-    let good = std::env::temp_dir().join("posixutils_cat_good");
+    let dir = tempdir().unwrap();
+    let good = dir.path().join("good");
     fs::write(&good, "ok\n").unwrap();
     run_test_with_checker(
         TestPlan {
@@ -85,14 +87,13 @@ fn cat_missing_file_sets_exit_and_continues() {
             assert!(String::from_utf8_lossy(&output.stderr).contains("/no/such/file/xyz"));
         },
     );
-    let _ = fs::remove_file(&good);
 }
 
 /// `cat` of a large file into a closed pipe must die by SIGPIPE.
 /// See `plib::testing::assert_dies_by_sigpipe`.
 #[test]
 fn test_cat_dies_by_sigpipe_on_a_closed_pipe() {
-    let dir = plib::tmp::tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let big = dir.path().join("big");
     let body: String = (0..200_000).map(|n| format!("line {n}\n")).collect();
     std::fs::write(&big, body).unwrap();

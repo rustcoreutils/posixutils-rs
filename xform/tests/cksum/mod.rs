@@ -26,11 +26,13 @@ fn cksum_basic() {
 }
 
 use plib::testing::{run_test_u8, run_test_with_checker, TestPlanU8};
+use plib::tmp::{tempdir, TempDir};
 use std::fs;
 use std::path::PathBuf;
 
-fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("posixutils_cksum_{}", name))
+/// `name` inside `dir`, a temporary directory removed when the test ends.
+fn temp_path(dir: &TempDir, name: &str) -> PathBuf {
+    dir.path().join(name)
 }
 
 #[test]
@@ -55,7 +57,8 @@ fn cksum_binary_stdin_non_utf8() {
 #[test]
 fn cksum_named_file_operand() {
     // A named operand prints the pathname after the checksum and size.
-    let path = temp_path("named.txt");
+    let dir = tempdir().unwrap();
+    let path = temp_path(&dir, "named.txt");
     fs::write(&path, b"foo\n").unwrap();
 
     let arg = path.to_str().unwrap().to_string();
@@ -73,15 +76,14 @@ fn cksum_named_file_operand() {
             assert_eq!(stdout, format!("3915528286 4 {}\n", arg));
         },
     );
-
-    let _ = fs::remove_file(&path);
 }
 
 #[test]
 fn cksum_multiple_file_operands() {
     // Multiple operands are processed in order, each on its own line.
-    let a = temp_path("multi_a.txt");
-    let b = temp_path("multi_b.txt");
+    let dir = tempdir().unwrap();
+    let a = temp_path(&dir, "multi_a.txt");
+    let b = temp_path(&dir, "multi_b.txt");
     fs::write(&a, b"foo\n").unwrap();
     fs::write(&b, b"hello\n").unwrap();
 
@@ -104,9 +106,6 @@ fn cksum_multiple_file_operands() {
             );
         },
     );
-
-    let _ = fs::remove_file(&a);
-    let _ = fs::remove_file(&b);
 }
 
 #[test]

@@ -8,16 +8,15 @@
 //
 
 use std::fs;
-use std::path::PathBuf;
 
 use plib::testing::{run_test_with_checker, TestPlan};
+use plib::tmp::{tempdir, TempDir};
 
-/// Fresh temp directory for a test's output files; returns (dir, prefix-string).
-fn tmp_prefix(tag: &str) -> (PathBuf, String) {
-    let dir = std::env::temp_dir().join(format!("posixutils_split_{tag}"));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let prefix = dir.join("seg_").to_str().unwrap().to_string();
+/// Fresh temp directory for a test's output files, removed when dropped;
+/// returns (dir, prefix-string).
+fn tmp_prefix() -> (TempDir, String) {
+    let dir = tempdir().unwrap();
+    let prefix = dir.path().join("seg_").to_str().unwrap().to_string();
     (dir, prefix)
 }
 
@@ -38,41 +37,41 @@ fn run_split(args: &[&str], stdin: &str, expected_exit: i32) {
 
 #[test]
 fn split_lines_from_stdin_dash() {
-    let (dir, prefix) = tmp_prefix("lines_dash");
+    let (tmp, prefix) = tmp_prefix();
+    let dir = tmp.path();
     run_split(&["-l", "1", "-", &prefix], "l1\nl2\nl3\n", 0);
     assert_eq!(fs::read_to_string(dir.join("seg_aa")).unwrap(), "l1\n");
     assert_eq!(fs::read_to_string(dir.join("seg_ab")).unwrap(), "l2\n");
     assert_eq!(fs::read_to_string(dir.join("seg_ac")).unwrap(), "l3\n");
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn split_by_bytes() {
-    let (dir, prefix) = tmp_prefix("bytes");
+    let (tmp, prefix) = tmp_prefix();
+    let dir = tmp.path();
     run_split(&["-b", "2", "-", &prefix], "abcde", 0);
     assert_eq!(fs::read_to_string(dir.join("seg_aa")).unwrap(), "ab");
     assert_eq!(fs::read_to_string(dir.join("seg_ab")).unwrap(), "cd");
     assert_eq!(fs::read_to_string(dir.join("seg_ac")).unwrap(), "e");
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn split_partial_last_line() {
     // A trailing partial line (no newline) goes into the last file.
-    let (dir, prefix) = tmp_prefix("partial");
+    let (tmp, prefix) = tmp_prefix();
+    let dir = tmp.path();
     run_split(&["-l", "2", "-", &prefix], "a\nb\nc", 0);
     assert_eq!(fs::read_to_string(dir.join("seg_aa")).unwrap(), "a\nb\n");
     assert_eq!(fs::read_to_string(dir.join("seg_ab")).unwrap(), "c");
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn split_empty_input_no_files() {
-    let (dir, prefix) = tmp_prefix("empty");
+    let (tmp, prefix) = tmp_prefix();
+    let dir = tmp.path();
     run_split(&["-l", "1", "-", &prefix], "", 0);
-    let count = fs::read_dir(&dir).unwrap().count();
+    let count = fs::read_dir(dir).unwrap().count();
     assert_eq!(count, 0, "empty input must not create output files");
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Runs split and hands the raw stderr to `check`.
@@ -111,12 +110,11 @@ fn assert_one_diagnostic(stderr: &str, needle: &str) {
 
 #[test]
 fn split_exhaustion_diagnostic_is_one_named_line() {
-    let (dir, prefix) = tmp_prefix("exhausted_msg");
+    let (_dir, prefix) = tmp_prefix();
     let input: String = (0..27).map(|i| format!("line{i}\n")).collect();
     run_split_stderr(&["-l", "1", "-a", "1", "-", &prefix], &input, 1, |stderr| {
         assert_one_diagnostic(stderr, "suffixes exhausted")
     });
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -125,34 +123,35 @@ fn split_zero_byte_count_is_rejected() {
     // opened a fresh output file per pass and never consumed the input: 676
     // empty files and then "output suffixes exhausted". `-l 0` is already
     // refused by clap's `1..` range; `-b` parses its own operand and was not.
-    let (dir, prefix) = tmp_prefix("zero_bytes");
+    let (tmp, prefix) = tmp_prefix();
+    let dir = tmp.path();
     run_split_stderr(&["-b", "0", "-", &prefix], "a\nb\n", 1, |stderr| {
         assert_one_diagnostic(stderr, "byte count")
     });
     assert_eq!(
-        fs::read_dir(&dir).unwrap().count(),
+        fs::read_dir(dir).unwrap().count(),
         0,
         "a rejected byte count must create no files"
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn split_zero_byte_count_with_suffix_is_rejected() {
     // The multiplier is applied after the parse, so `0k` is zero too.
-    let (dir, prefix) = tmp_prefix("zero_bytes_k");
+    let (tmp, prefix) = tmp_prefix();
+    let dir = tmp.path();
     run_split_stderr(&["-b", "0k", "-", &prefix], "a\nb\n", 1, |stderr| {
         assert_one_diagnostic(stderr, "byte count")
     });
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-    fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
 }
 
 #[test]
 fn split_name_too_long_diagnostic_is_one_named_line() {
     // This path printed the message itself *and* returned an Err that was
     // printed again, so it emitted two lines.
-    let (dir, _) = tmp_prefix("namemax_msg");
+    let (tmp, _) = tmp_prefix();
+    let dir = tmp.path();
     let long_prefix = dir.join("p".repeat(260));
     run_split_stderr(
         &["-l", "1", "-", long_prefix.to_str().unwrap()],
@@ -160,16 +159,14 @@ fn split_name_too_long_diagnostic_is_one_named_line() {
         1,
         |stderr| assert_one_diagnostic(stderr, "too long"),
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn split_invalid_byte_count_diagnostic_is_one_named_line() {
-    let (dir, prefix) = tmp_prefix("badbytes_msg");
+    let (_dir, prefix) = tmp_prefix();
     run_split_stderr(&["-b", "12x", "-", &prefix], "data\n", 1, |stderr| {
         assert_one_diagnostic(stderr, "byte count")
     });
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -177,7 +174,8 @@ fn split_uses_every_suffix_before_exhausting() {
     // The suffix odometer carried left through every 'z' and returned None
     // without ever yielding the all-'z' value, so `-a 1` stopped at `y` and
     // produced 25 files where 26 are available.
-    let (dir, prefix) = tmp_prefix("suffix_last");
+    let (tmp, prefix) = tmp_prefix();
+    let dir = tmp.path();
     let input: String = (0..26).map(|i| format!("line{i}\n")).collect();
     run_split(&["-l", "1", "-a", "1", "-", &prefix], &input, 0);
 
@@ -190,7 +188,6 @@ fn split_uses_every_suffix_before_exhausting() {
             path.display()
         );
     }
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -198,7 +195,8 @@ fn split_suffixes_exhausted_errors() {
     // One line past the last suffix: the 26 files still get written, and the
     // 27th is the error. The iterator must stay exhausted rather than wrapping
     // back to the first suffix and overwriting `seg_a`.
-    let (dir, prefix) = tmp_prefix("suffix_exhausted");
+    let (tmp, prefix) = tmp_prefix();
+    let dir = tmp.path();
     let input: String = (0..27).map(|i| format!("line{i}\n")).collect();
     run_split(&["-l", "1", "-a", "1", "-", &prefix], &input, 1);
 
@@ -209,16 +207,16 @@ fn split_suffixes_exhausted_errors() {
     );
     assert_eq!(fs::read_to_string(dir.join("seg_z")).unwrap(), "line25\n");
     assert_eq!(
-        fs::read_dir(&dir).unwrap().count(),
+        fs::read_dir(dir).unwrap().count(),
         26,
         "exactly the 26 available suffixes are used"
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn split_name_too_long_errors() {
-    let (dir, _) = tmp_prefix("namemax");
+    let (tmp, _) = tmp_prefix();
+    let dir = tmp.path();
     let long_prefix = dir.join("p".repeat(260));
     run_split(
         &["-l", "1", "-", long_prefix.to_str().unwrap()],
@@ -226,9 +224,8 @@ fn split_name_too_long_errors() {
         1,
     );
     // No files created.
-    let count = fs::read_dir(&dir).unwrap().count();
+    let count = fs::read_dir(dir).unwrap().count();
     assert_eq!(count, 0);
-    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `split` must name the *input* file it could not open.

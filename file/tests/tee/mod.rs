@@ -11,9 +11,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use plib::testing::{run_test_with_checker, TestPlan};
+use plib::tmp::{tempdir, TempDir};
 
-fn tmp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("posixutils_tee_{name}"))
+/// `name` inside `dir`, a temporary directory removed when the test ends.
+fn tmp_path(dir: &TempDir, name: &str) -> PathBuf {
+    dir.path().join(name)
 }
 
 /// Run `tee` with the given args and stdin, assert stdout/exit, then return so
@@ -38,8 +40,8 @@ fn run_tee(args: &[&str], stdin: &str, expected_stdout: &str, expected_exit: i32
 
 #[test]
 fn tee_copies_stdin_to_stdout_and_file() {
-    let f = tmp_path("basic");
-    let _ = fs::remove_file(&f);
+    let dir = tempdir().unwrap();
+    let f = tmp_path(&dir, "basic");
     run_tee(
         &[f.to_str().unwrap()],
         "hello\nworld\n",
@@ -47,7 +49,6 @@ fn tee_copies_stdin_to_stdout_and_file() {
         0,
     );
     assert_eq!(fs::read_to_string(&f).unwrap(), "hello\nworld\n");
-    let _ = fs::remove_file(&f);
 }
 
 #[test]
@@ -57,10 +58,9 @@ fn tee_no_files_passthrough_to_stdout() {
 
 #[test]
 fn tee_positional_multiple_files() {
-    let f1 = tmp_path("multi1");
-    let f2 = tmp_path("multi2");
-    let _ = fs::remove_file(&f1);
-    let _ = fs::remove_file(&f2);
+    let dir = tempdir().unwrap();
+    let f1 = tmp_path(&dir, "multi1");
+    let f2 = tmp_path(&dir, "multi2");
     run_tee(
         &[f1.to_str().unwrap(), f2.to_str().unwrap()],
         "data\n",
@@ -69,35 +69,33 @@ fn tee_positional_multiple_files() {
     );
     assert_eq!(fs::read_to_string(&f1).unwrap(), "data\n");
     assert_eq!(fs::read_to_string(&f2).unwrap(), "data\n");
-    let _ = fs::remove_file(&f1);
-    let _ = fs::remove_file(&f2);
 }
 
 #[test]
 fn tee_append() {
-    let f = tmp_path("append");
+    let dir = tempdir().unwrap();
+    let f = tmp_path(&dir, "append");
     fs::write(&f, "first\n").unwrap();
     run_tee(&["-a", f.to_str().unwrap()], "second\n", "second\n", 0);
     assert_eq!(fs::read_to_string(&f).unwrap(), "first\nsecond\n");
-    let _ = fs::remove_file(&f);
 }
 
 #[test]
 fn tee_truncates_without_append() {
-    let f = tmp_path("trunc");
+    let dir = tempdir().unwrap();
+    let f = tmp_path(&dir, "trunc");
     fs::write(&f, "old content here\n").unwrap();
     run_tee(&[f.to_str().unwrap()], "new\n", "new\n", 0);
     assert_eq!(fs::read_to_string(&f).unwrap(), "new\n");
-    let _ = fs::remove_file(&f);
 }
 
 #[test]
 fn tee_continues_after_unopenable_file() {
     // One operand is in a non-existent directory and cannot be opened; tee must
     // still write to the good file and to stdout, and exit non-zero.
-    let good = tmp_path("good_after_bad");
-    let bad = std::env::temp_dir().join("posixutils_tee_nodir_xyz/cannot");
-    let _ = fs::remove_file(&good);
+    let dir = tempdir().unwrap();
+    let good = tmp_path(&dir, "good_after_bad");
+    let bad = tmp_path(&dir, "nodir/cannot");
     run_tee(
         &[bad.to_str().unwrap(), good.to_str().unwrap()],
         "payload\n",
@@ -105,5 +103,4 @@ fn tee_continues_after_unopenable_file() {
         1,
     );
     assert_eq!(fs::read_to_string(&good).unwrap(), "payload\n");
-    let _ = fs::remove_file(&good);
 }

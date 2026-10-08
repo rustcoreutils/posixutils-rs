@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod fake_ssh;
 mod uucp;
 mod uustat;
 mod uux;

@@ -206,13 +206,8 @@ fn comm_missing_file_error() {
 
 #[test]
 fn comm_double_dash_allows_dash_prefixed_operands() {
-    let dir = std::env::temp_dir();
-    let mut a = dir.clone();
-    a.push(format!("-posixutils-comm-a-{}", std::process::id()));
-    let mut b = dir.clone();
-    b.push(format!("-posixutils-comm-b-{}", std::process::id()));
-    std::fs::write(&a, "x\n").expect("write a");
-    std::fs::write(&b, "x\n").expect("write b");
+    let a = comm_tmp("-posixutils-comm-a", "x\n");
+    let b = comm_tmp("-posixutils-comm-b", "x\n");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_comm"))
         .args(["--", a.to_str().unwrap(), b.to_str().unwrap()])
@@ -226,8 +221,6 @@ fn comm_double_dash_allows_dash_prefixed_operands() {
     );
     // A line in both files lands in column 3.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "\t\tx\n");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -248,11 +241,8 @@ fn comm_run(args: &[&str], env: &[(&str, &str)]) -> (String, String, i32) {
     )
 }
 
-fn comm_tmp(tag: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-comm-{}-{}", std::process::id(), tag));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+fn comm_tmp(tag: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(tag, content)
 }
 
 #[test]
@@ -271,8 +261,6 @@ fn comm_compares_lines_bytewise_regardless_of_collation() {
     );
     assert_eq!(code, 0);
     assert_eq!(stdout, "a\n\ta \n", "got {stdout:?}");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -285,8 +273,6 @@ fn comm_unsorted_input_behavior() {
     let (stdout, _, code) = comm_run(&[a.to_str().unwrap(), b.to_str().unwrap()], &[]);
     assert_eq!(code, 0, "unsorted input is not diagnosed");
     assert_eq!(stdout, "\t\tb\na\n", "got {stdout:?}");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -294,8 +280,8 @@ fn comm_diagnostics_are_translatable() {
     // The diagnostic goes through gettext, so a catalog reached via NLSPATH
     // replaces it. Without a catalog it stays English, which is what every
     // other test here observes.
-    let dir = std::env::temp_dir().join(format!("posixutils-comm-nls-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path();
     let mo = dir.join("posixutils-rs.de_DE.mo");
     std::fs::write(
         &mo,
@@ -315,7 +301,6 @@ fn comm_diagnostics_are_translatable() {
         stderr.starts_with("comm:"),
         "the diagnostic must name the utility, got {stderr:?}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Build a minimal little-endian GNU `.mo` image.

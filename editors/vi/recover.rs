@@ -189,8 +189,17 @@ fn read_header(path: &Path) -> io::Result<RecoverInfo> {
 }
 
 /// List recoverable buffers under `base`, newest first.
+///
+/// Listing never creates the recovery directory: every editor start lists
+/// (to prune stale files), and one that preserves nothing must leave nothing
+/// behind under `base`.
 pub fn list(base: &str) -> Vec<RecoverInfo> {
     let mut out = Vec::new();
+    let uid = unsafe { libc::getuid() };
+    let candidate = Path::new(base).join(format!("vi.recover.{}", uid));
+    if fs::symlink_metadata(&candidate).is_err() {
+        return out;
+    }
     let Ok(dir) = recover_dir(base) else {
         return out;
     };
@@ -318,6 +327,20 @@ mod tests {
 
         remove(&rec);
         assert!(!rec.exists());
+    }
+
+    #[test]
+    fn test_list_does_not_create_the_recovery_directory() {
+        let td = plib::tmp::tempdir().unwrap();
+        let base = td.path().to_str().unwrap();
+
+        assert!(list(base).is_empty());
+        cleanup_stale(base, 0);
+        assert_eq!(
+            fs::read_dir(td.path()).unwrap().count(),
+            0,
+            "listing must leave nothing behind under the base directory"
+        );
     }
 
     #[test]

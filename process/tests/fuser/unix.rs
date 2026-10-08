@@ -66,7 +66,10 @@ fn wait_for_unix_socket(socket_path: &str) {
 fn test_fuser_unixsocket() {
     // Unique per run: a fixed path is shared with any other copy of this suite
     // running at the same time, which deletes and rebinds it underneath us.
-    let socket_file = std::env::temp_dir().join(format!("fuser_unix_{}.sock", std::process::id()));
+    // The directory is directly under the temp root, so the path stays well
+    // inside sun_path's limit.
+    let dir = plib::tmp::tempdir().unwrap();
+    let socket_file = dir.path().join("fuser_unix.sock");
     let socket_path = socket_file.to_str().unwrap();
     let _unix_socket = match start_unix_socket(socket_path) {
         Ok(socket) => socket,
@@ -95,5 +98,4 @@ fn test_fuser_unixsocket() {
     });
 
     handle.join().expect("Thread panicked");
-    let _ = fs::remove_file(socket_path);
 }

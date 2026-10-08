@@ -9,14 +9,18 @@
 //
 
 mod common;
+mod remove_moved;
 
-use self::common::{copy_file, error_string};
+use self::common::{copy_moved_file, error_string};
 use clap::Parser;
-use common::{CopyConfig, DerefMode, InodeMap};
+use common::{
+    Anchor, CopiedSources, CopyConfig, DerefMode, Destination, InodeMap, MoveSource, PinnedDir,
+    PinnedDirs, PinnedEntry,
+};
 use gettextrs::gettext;
+use remove_moved::remove_moved_source;
 use std::{
     collections::{HashMap, HashSet},
-    ffi::CString,
     fs,
     io::{self, IsTerminal},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -67,13 +71,38 @@ fn prompt_user(prompt: &str) -> bool {
     plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
 }
 
-// Copy the file or directory hierarchy from `src` to `dst`.
+/// A source operand that was copied across filesystems and is still to be removed (POSIX mv
+/// step 7).
+struct CopiedOperand {
+    source: PinnedEntry,
+    copied: CopiedSources,
+}
+
+impl CopiedOperand {
+    /// Remove the source hierarchy the copy duplicated, and with it the pin on its directory.
+    /// Returns whether all of it was removed; what was not has been reported.
+    fn remove(self, inode_map: &mut InodeMap) -> bool {
+        remove_moved_source(&self.source, &self.copied, inode_map)
+    }
+}
+
+/// What became of one source operand.
+enum Moved {
+    /// Renamed into place, or left alone at the user's request: nothing remains to be done.
+    Done,
+    /// Copied across filesystems; the source remains to be removed.
+    Copied(CopiedOperand),
+}
+
+/// Copy the file or directory hierarchy `source`, which must still be the file `identity`
+/// names, to `dst`.
 fn copy_hierarchy(
-    src: &Path,
-    dst: &Path,
+    source: PinnedEntry,
+    identity: (u64, u64),
+    dst: &PinnedEntry,
     inode_map: &mut InodeMap,
     created_files: &mut HashSet<PathBuf>,
-) -> io::Result<()> {
+) -> io::Result<CopiedOperand> {
     let copy_cfg = CopyConfig {
         // `mv` already asked its own POSIX step-1 question (108060-108064) and step 5 removed the
         // destination, so the copy engine must not ask again for the same file. `force` here
@@ -91,32 +120,96 @@ fn copy_hierarchy(
         prog: "mv",
         // mv must stop the duplication on the first structural error so the source is not removed.
         continue_on_error: false,
+        // Step 5 removed the destination, or found none: anything at its name now appeared
+        // during the move, and is neither written into nor filled.
+        destination: Destination::MustCreate,
     };
 
-    copy_file(
+    let mut copied = CopiedSources::default();
+    copy_moved_file(
         &copy_cfg,
-        src,
+        MoveSource {
+            entry: &source,
+            identity,
+            copied: &mut copied,
+        },
         dst,
         created_files,
-        Some(inode_map),
-        prompt_user,
-    )
+        inode_map,
+    )?;
+    Ok(CopiedOperand { source, copied })
+}
+
+/// The diagnostic for a move that failed before anything was done.
+fn cannot_move(source: &Path, target: &Path, e: &io::Error) -> io::Error {
+    io::Error::other(gettext!(
+        "cannot move '{}' to '{}': {}",
+        source.display(),
+        target.display(),
+        error_string(e)
+    ))
 }
 
 /// Handles moving the file.
 ///
-/// Returns `Ok(true)` if the source was deleted and `Ok(false)` if it's not.
+/// Source and destination are pinned (`PinnedDirs`, `PinnedDir`) before anything else: from the
+/// checks to the removal of a copied source, every operation on either is relative to the
+/// directory it was found in then.
 fn move_file(
     cfg: &MvConfig,
+    pinned_dirs: &mut PinnedDirs,
     source: &Path,
-    target: &Path,
+    target_entry: &PinnedEntry,
     inode_map: &mut InodeMap,
     created_files: Option<&mut HashSet<PathBuf>>,
-) -> io::Result<bool> {
-    let source_filename = CString::new(source.as_os_str().as_bytes()).unwrap();
-    let target_filename = CString::new(target.as_os_str().as_bytes()).unwrap();
+) -> io::Result<Moved> {
+    let source_entry = pinned_dirs
+        .pin(source)
+        .map_err(|e| cannot_move(source, target_entry.path(), &e))?;
+    move_file_deciding(
+        cfg,
+        source_entry,
+        target_entry,
+        inode_map,
+        created_files,
+        Decision::First,
+    )
+}
 
-    let target_md = match ftw::Metadata::new(libc::AT_FDCWD, &target_filename, true) {
+/// Which time `move_file_deciding` examines the operands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Decision {
+    First,
+    /// Again, because a destination found absent the first time appeared before the rename.
+    Again,
+}
+
+/// Whether a failed rename calls for deciding again: a destination found absent appeared before
+/// the rename (EEXIST from the rename that must not replace), the first time only.
+fn decide_again(e: &io::Error, replace: Replace, decision: Decision) -> bool {
+    e.raw_os_error() == Some(libc::EEXIST)
+        && replace == Replace::Never
+        && decision == Decision::First
+}
+
+/// `move_file` from the pinned source on: the checks, the rename and, across filesystems, the
+/// copy. A second decision (`Decision::Again`) examines the same pinned source again.
+fn move_file_deciding(
+    cfg: &MvConfig,
+    source_entry: PinnedEntry,
+    target_entry: &PinnedEntry,
+    inode_map: &mut InodeMap,
+    created_files: Option<&mut HashSet<PathBuf>>,
+    decision: Decision,
+) -> io::Result<Moved> {
+    let target = target_entry.path();
+    let source_path = source_entry.path().to_path_buf();
+    let source = source_path.as_path();
+
+    // The destination itself, not followed, as rename(2) replaces it: a symbolic link there,
+    // dangling or not, is a non-directory that the move replaces (step 5 removes it before a
+    // copy, which must then create the destination itself).
+    let target_md = match target_entry.metadata(false) {
         Ok(md) => Some(md),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
@@ -128,20 +221,17 @@ fn move_file(
         }
     };
     let target_exists = target_md.is_some();
-    let target_is_dir = match &target_md {
-        Some(md) => md.file_type() == ftw::FileType::Directory,
-        None => false,
-    };
+    let target_is_dir = target_md.as_ref().is_some_and(|md| md.is_dir());
     // As in `rm`, a symbolic link destination is not write-protected: `mv` replaces the link
     // itself, not what it points at, so neither the link's own mode bits nor the referent's
-    // apply. `target_md` follows the link, so the type has to come from an `lstat`.
-    let target_is_symlink = ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false)
-        .map(|md| md.file_type() == ftw::FileType::SymbolicLink)
-        .unwrap_or(false);
+    // apply.
+    let target_is_symlink = target_md.as_ref().is_some_and(|md| md.is_symlink());
     let target_is_writable =
-        target_is_symlink || ftw::is_writable_at(libc::AT_FDCWD, &target_filename);
+        target_is_symlink || ftw::is_writable_at(target_entry.dir_fd(), target_entry.name());
 
-    let source_md = match ftw::Metadata::new(libc::AT_FDCWD, &source_filename, true) {
+    // The operand itself, not followed: what a rename, or the copy and removal, act on.
+    let source_lstat = source_entry.metadata(false);
+    let source_md = match source_entry.metadata(true) {
         Ok(md) => Some(md),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
@@ -163,16 +253,12 @@ fn move_file(
     {
         let is_affirm = prompt_user(&gettext!("overwrite '{}'?", target.display()));
         if !is_affirm {
-            return Ok(true);
+            return Ok(Moved::Done);
         }
     }
 
     // 2. source and target are same dirent
-    if let (Ok(smd), Ok(tmd), Some(deref_smd)) = (
-        ftw::Metadata::new(libc::AT_FDCWD, &source_filename, false),
-        ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false),
-        &source_md,
-    ) {
+    if let (Ok(smd), Some(tmd), Some(deref_smd)) = (&source_lstat, &target_md, &source_md) {
         // `true` for hard links to the same file and when `source == target`
         let same_file = smd.dev() == tmd.dev() && smd.ino() == tmd.ino();
 
@@ -244,8 +330,26 @@ fn move_file(
     }
 
     // 3. call rename(2) to move source to target
-    match fs::rename(source, target) {
-        Ok(_) => return Ok(true),
+    // A destination found absent is not replaced if it appears before the rename.
+    let replace = if target_exists {
+        Replace::Allowed
+    } else {
+        Replace::Never
+    };
+    match rename_pinned(&source_entry, target_entry, replace) {
+        Ok(_) => return Ok(Moved::Done),
+        Err(e) if decide_again(&e, replace, decision) => {
+            // It appeared: decide again, now about the file that is there -- the prompt, -f
+            // and the type checks all apply to it as to any existing destination.
+            return move_file_deciding(
+                cfg,
+                source_entry,
+                target_entry,
+                inode_map,
+                created_files,
+                Decision::Again,
+            );
+        }
         Err(e) => {
             // use ErrorKind::CrossesDevices in the future, when it is stable.
             // Use the captured error's errno rather than re-reading the global errno.
@@ -278,6 +382,12 @@ fn move_file(
 
     // Fall through: source and target are on different filesystems; must copy.
 
+    // The copy must start from the file examined above, and is what step 7 removes.
+    let identity = match &source_lstat {
+        Ok(md) => (md.dev(), md.ino()),
+        Err(e) => return Err(cannot_move(source, target, e)),
+    };
+
     let err_reason = |e: io::Error| -> io::Error {
         let from_to = gettext!("'{}' to '{}'", source.display(), target.display(),);
         let err_str = format!("{}: {}", from_to, error_string(&e));
@@ -289,14 +399,22 @@ fn move_file(
         io::Error::other(err_str)
     };
 
+    // The copy and the removal act only through held directories: an operand reached by
+    // pathname cannot be moved across filesystems.
+    if let Some(unheld) = [&source_entry, target_entry]
+        .into_iter()
+        .find(|entry| entry.anchor() == Anchor::Path)
+    {
+        return Err(err_inter_device(err_reason(io::Error::other(gettext!(
+            "cannot open the directory holding '{}': {}",
+            unheld.path().display(),
+            error_string(&io::Error::from_raw_os_error(libc::EACCES))
+        )))));
+    }
+
     // 5. remove destination path
     if target_exists {
-        let remove_result = if target_is_dir {
-            fs::remove_dir(target)
-        } else {
-            fs::remove_file(target)
-        };
-        remove_result
+        remove_target(target_entry, target_is_dir)
             .map_err(|e| {
                 let err_str = gettext!("unable to remove target: {}", error_string(&e));
                 io::Error::other(err_str)
@@ -309,22 +427,134 @@ fn move_file(
         Some(set) => set,
         None => &mut HashSet::new(),
     };
-    copy_hierarchy(source, target, inode_map, created_files).map_err(err_inter_device)?;
+    let copied = copy_hierarchy(
+        source_entry,
+        identity,
+        target_entry,
+        inode_map,
+        created_files,
+    )
+    .map_err(err_inter_device)?;
 
-    Ok(false)
+    Ok(Moved::Copied(copied))
+}
+
+/// Whether a rename may replace a file at the target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Replace {
+    /// The target existed when mv decided to replace it.
+    Allowed,
+    /// The target was absent when checked.
+    Never,
+}
+
+/// rename(2) of the pinned source to the pinned target. Under `Replace::Never` a file that
+/// appeared at the target since it was checked is not replaced: the rename fails with EEXIST --
+/// wherever the system and filesystem offer such a rename (`rename_exclusive`); elsewhere it is
+/// the plain rename.
+fn rename_pinned(source: &PinnedEntry, target: &PinnedEntry, replace: Replace) -> io::Result<()> {
+    if replace == Replace::Never {
+        if let Some(result) = rename_exclusive(source, target) {
+            return result;
+        }
+    }
+    let ret = unsafe {
+        libc::renameat(
+            source.dir_fd(),
+            source.name().as_ptr(),
+            target.dir_fd(),
+            target.name().as_ptr(),
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// A rename that fails with EEXIST rather than replace anything: `renameat2(RENAME_NOREPLACE)`.
+/// `None` when the kernel lacks it (ENOSYS), the filesystem does not support it (EINVAL), or a
+/// seccomp filter that does not know it refuses it (EPERM); the plain rename that follows then
+/// reports any genuine EINVAL or EPERM again.
+#[cfg(target_os = "linux")]
+fn rename_exclusive(source: &PinnedEntry, target: &PinnedEntry) -> Option<io::Result<()>> {
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            source.dir_fd(),
+            source.name().as_ptr(),
+            target.dir_fd(),
+            target.name().as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if ret == 0 {
+        return Some(Ok(()));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM) => None,
+        _ => Some(Err(e)),
+    }
+}
+
+/// `renameatx_np(RENAME_EXCL)`; `None` where the filesystem does not support it.
+#[cfg(target_vendor = "apple")]
+fn rename_exclusive(source: &PinnedEntry, target: &PinnedEntry) -> Option<io::Result<()>> {
+    let ret = unsafe {
+        libc::renameatx_np(
+            source.dir_fd(),
+            source.name().as_ptr(),
+            target.dir_fd(),
+            target.name().as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if ret == 0 {
+        return Some(Ok(()));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOTSUP) | Some(libc::EINVAL) | Some(libc::ENOSYS) => None,
+        _ => Some(Err(e)),
+    }
+}
+
+/// No exclusive rename on this system.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn rename_exclusive(_source: &PinnedEntry, _target: &PinnedEntry) -> Option<io::Result<()>> {
+    None
+}
+
+/// Step 5: remove the destination, in the directory it was pinned in. A directory is removed
+/// only if it is empty.
+fn remove_target(target: &PinnedEntry, is_dir: bool) -> io::Result<()> {
+    let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+    if unsafe { libc::unlinkat(target.dir_fd(), target.name().as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> {
     let mut result = Some(());
 
     let mut created_files = HashSet::new();
+    let mut pinned_dirs = PinnedDirs::default();
+
+    // The target directory is resolved once, here: every operand goes into this directory.
+    let target_dir = match PinnedDir::open(target) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("mv: {}: {}", target.display(), error_string(&e));
+            return None;
+        }
+    };
 
     // inode of source -> target path
     let mut inode_map = HashMap::with_capacity(sources.len());
-
-    // Postpone deletion when moving across filesystems because it would
-    // otherwise error when copying dangling hard links
-    let mut sources_to_delete = Vec::new();
 
     // loop through sources, moving each to target
     for source in sources {
@@ -333,22 +563,37 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
                 // Concatenation of the target directory, a single <slash>
                 // character if the target did not end in a <slash>, and the
                 // last pathname component of the source_file.
-                let new_target = target.join(file_name);
+                let new_target = match target_dir.entry(file_name) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        eprintln!("mv: {}: {}", source.display(), error_string(&e));
+                        result = None;
+                        continue;
+                    }
+                };
 
                 // Don't immediately bubble up the error with `?` to allow the
                 // remaining files to be processed.
                 match move_file(
                     cfg,
+                    &mut pinned_dirs,
                     source,
                     &new_target,
                     &mut inode_map,
                     Some(&mut created_files),
                 ) {
-                    Ok(is_source_deleted) => {
-                        created_files.insert(new_target);
+                    Ok(moved) => {
+                        created_files.insert(new_target.path().to_path_buf());
 
-                        if !is_source_deleted {
-                            sources_to_delete.push(source);
+                        // 7. Remove the source file hierarchy now, as GNU does, which also
+                        // releases the directory it was pinned in: a move of many operands holds
+                        // descriptors for one at a time. Hard links between operands are still
+                        // preserved -- later names link to the destination's copy, not to the
+                        // source.
+                        if let Moved::Copied(copied) = moved {
+                            if !copied.remove(&mut inode_map) {
+                                result = None;
+                            }
                         }
                     }
                     Err(e) => {
@@ -364,28 +609,6 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
                 eprintln!("mv: {}", err_str);
                 result = None;
             }
-        }
-    }
-
-    // 7. Remove source file hierarchy
-    for source in sources_to_delete {
-        // Classify without following symlinks: a symlink source must be removed as a link, not
-        // have its target's contents recursively deleted.
-        let is_real_dir = fs::symlink_metadata(source)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        let remove_result = if is_real_dir {
-            fs::remove_dir_all(source)
-        } else {
-            fs::remove_file(source)
-        };
-        if let Err(e) = remove_result {
-            eprintln!(
-                "mv: {}: {}",
-                gettext!("cannot remove '{}'", source.display()),
-                error_string(&e)
-            );
-            result = None;
         }
     }
 
@@ -464,19 +687,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let mut dummy = HashMap::new();
-        match move_file(&cfg, source, target, &mut dummy, None) {
-            Ok(is_source_deleted) => {
-                // 7. Remove source file hierarchy
-                if !is_source_deleted {
-                    // Classify without following symlinks (see move_files).
-                    let is_real_dir = fs::symlink_metadata(source)
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false);
-                    if is_real_dir {
-                        fs::remove_dir_all(source)?;
-                    } else {
-                        fs::remove_file(source)?;
-                    }
+        let mut pinned_dirs = PinnedDirs::default();
+        let target_entry = match pinned_dirs.pin(target) {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!("mv: {}", cannot_move(source, target, &e));
+                std::process::exit(1);
+            }
+        };
+        match move_file(
+            &cfg,
+            &mut pinned_dirs,
+            source,
+            &target_entry,
+            &mut dummy,
+            None,
+        ) {
+            Ok(Moved::Done) => Ok(()),
+            // 7. Remove source file hierarchy
+            Ok(Moved::Copied(copied)) => {
+                if !copied.remove(&mut dummy) {
+                    std::process::exit(1);
                 }
                 Ok(())
             }
@@ -485,5 +716,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_again, rename_pinned, Decision, PinnedDirs, Replace};
+    use std::{fs, io};
+
+    /// A destination found absent that appears before the rename gets one more decision, made
+    /// about the file now there; a second appearance, any other error, or EEXIST from a rename
+    /// that was allowed to replace, does not.
+    #[test]
+    fn only_a_destination_appearing_once_is_decided_again() {
+        let exists = io::Error::from_raw_os_error(libc::EEXIST);
+        let other = io::Error::from_raw_os_error(libc::EXDEV);
+        assert!(decide_again(&exists, Replace::Never, Decision::First));
+        assert!(!decide_again(&exists, Replace::Never, Decision::Again));
+        assert!(!decide_again(&exists, Replace::Allowed, Decision::First));
+        assert!(!decide_again(&other, Replace::Never, Decision::First));
+    }
+
+    /// A scratch directory holding `source` and, if `with_target`, `target`;
+    /// removed when dropped.
+    fn scratch(with_target: bool) -> plib::tmp::TempDir {
+        let dir = plib::tmp::tempdir().unwrap();
+        fs::write(dir.path().join("source"), b"source").unwrap();
+        if with_target {
+            fs::write(dir.path().join("target"), b"target").unwrap();
+        }
+        dir
+    }
+
+    /// The rename for a target found absent: a target that appeared since is never replaced,
+    /// and the failure says so (EEXIST), for mv to decide again.
+    #[test]
+    fn a_rename_onto_an_absent_target_never_replaces_one_that_appeared() {
+        let tmp = scratch(true);
+        let dir = tmp.path();
+        let mut pinned = PinnedDirs::default();
+        let source = pinned.pin(&dir.join("source")).unwrap();
+        let target = pinned.pin(&dir.join("target")).unwrap();
+
+        let result = rename_pinned(&source, &target, Replace::Never);
+        let (kept, left) = (fs::read(dir.join("target")), dir.join("source").exists());
+
+        assert_eq!(
+            result.map_err(|e| e.raw_os_error()),
+            Err(Some(libc::EEXIST))
+        );
+        assert_eq!(kept.unwrap(), b"target");
+        assert!(left);
+    }
+
+    /// Without a target, and when replacing one was decided on, it is an ordinary rename.
+    #[test]
+    fn a_rename_replaces_only_when_that_was_decided() {
+        let tmp = scratch(true);
+        let dir = tmp.path();
+        let mut pinned = PinnedDirs::default();
+        let source = pinned.pin(&dir.join("source")).unwrap();
+        let target = pinned.pin(&dir.join("target")).unwrap();
+        let replaced = rename_pinned(&source, &target, Replace::Allowed);
+        let moved = fs::read(dir.join("target"));
+        assert!(replaced.is_ok());
+        assert_eq!(moved.unwrap(), b"source");
+
+        let tmp = scratch(false);
+        let dir = tmp.path();
+        let source = pinned.pin(&dir.join("source")).unwrap();
+        let target = pinned.pin(&dir.join("target")).unwrap();
+        let created = rename_pinned(&source, &target, Replace::Never);
+        let moved = fs::read(dir.join("target"));
+        assert!(created.is_ok());
+        assert_eq!(moved.unwrap(), b"source");
     }
 }

@@ -1019,8 +1019,14 @@ fn test_copy_private_directory_is_not_exposed_during_the_copy() {
 /// A `find -depth` list names a directory after its contents. A directory
 /// already at the destination has been written to by then -- by this run --
 /// so -u must compare the source with what the destination was *before* the
-/// run, or the source directory's mode and time are never applied. cpio -p
-/// implies -u, which made `find . -depth | cpio -pdm` leave them behind.
+/// run, or the source directory's time (and under -p p its mode) is never
+/// applied. cpio -p implies -u, which made `find . -depth | cpio -pdm` leave
+/// them behind.
+///
+/// An existing directory takes the source's mode only when it was asked for
+/// (-p e here; cpio maps nothing onto it), and only where nobody else can
+/// create entries beside it -- so the destination is 0755, not what a umask
+/// of 002 would make it.
 #[test]
 fn test_copy_update_depth_first_uses_pre_run_directory_time() {
     use std::os::unix::fs::PermissionsExt;
@@ -1033,15 +1039,16 @@ fn test_copy_update_depth_first_uses_pre_run_directory_time() {
     filetime::set_file_mtime(src.join("a"), src_time).unwrap();
 
     let list = b"./a/f\n./a\n.\n";
-    let runs: [(&str, &[&str]); 2] = [
-        ("cpio", &["-pdm", "../dst"]),
-        ("pax", &["-rw", "-d", "-u", "-pe", "../dst"]),
+    let runs: [(&str, &[&str], u32); 2] = [
+        ("cpio", &["-pdm", "../dst"], 0o755),
+        ("pax", &["-rw", "-d", "-u", "-pe", "../dst"], 0o700),
     ];
-    for (tool, args) in runs {
+    for (tool, args, mode) in runs {
         let dst = temp.path().join("dst");
         let _ = fs::remove_dir_all(&dst);
         fs::create_dir_all(dst.join("a")).unwrap();
         fs::set_permissions(dst.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
         let dst_time = filetime::FileTime::from_unix_time(1_546_300_800, 0); // 2019
         filetime::set_file_mtime(dst.join("a"), dst_time).unwrap();
 
@@ -1058,7 +1065,7 @@ fn test_copy_update_depth_first_uses_pre_run_directory_time() {
         assert_success(&out, tool);
         assert_eq!(fs::read_to_string(dst.join("a/f")).unwrap(), "F\n");
         let meta = fs::metadata(dst.join("a")).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{tool}: mode");
+        assert_eq!(meta.permissions().mode() & 0o777, mode, "{tool}: mode");
         assert_eq!(meta.mtime(), 1_577_836_800, "{tool}: mtime");
     }
 }

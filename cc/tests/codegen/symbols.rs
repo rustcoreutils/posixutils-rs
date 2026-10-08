@@ -39,7 +39,8 @@ int main() {
 "#,
     );
     let c_path = c_file.path().to_path_buf();
-    let obj_path = std::env::temp_dir().join("c17_debug_mega_test.o");
+    let work = crate::common::work_dir("debug_mega");
+    let obj_path = work.path().join("debug_mega_test.o");
 
     // Compile with -g -c to produce object file
     let output = run_test_base(
@@ -88,8 +89,6 @@ int main() {
             "No debug sections found in object file"
         );
     }
-
-    let _ = std::fs::remove_file(&obj_path);
 }
 
 /// A c17 unit linked after another compiler's keeps its own abbreviation

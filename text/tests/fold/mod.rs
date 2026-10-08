@@ -184,11 +184,8 @@ fn fold_run(args: &[&str], stdin: &str) -> (String, String, i32) {
     )
 }
 
-fn fold_tmp(name: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-fold-{}-{}", std::process::id(), name));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+fn fold_tmp(name: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(name, content)
 }
 
 #[test]
@@ -218,8 +215,6 @@ fn fold_multiple_file_operands_are_concatenated() {
         .expect("run fold");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "aa\naa\nbb\nbb\n");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]

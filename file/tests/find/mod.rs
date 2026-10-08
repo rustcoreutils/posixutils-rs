@@ -15,6 +15,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
+use plib::tmp::{tempdir, TempDir};
 
 fn run_test_find(
     args: &[&str],
@@ -146,7 +147,8 @@ fn find_type_test() {
 // happens to be. Stamp our own instead.
 #[test]
 fn find_mtime_exact_newer_and_older() {
-    let dir = scratch_dir("mtime");
+    let tmp = scratch_dir();
+    let dir = tmp.path();
 
     // An extra hour past each day boundary, so the spawn latency between
     // SystemTime::now() here and find's own initialization time cannot drift a
@@ -159,7 +161,6 @@ fn find_mtime_exact_newer_and_older() {
         let age = std::time::Duration::from_secs(days * 86400 + 3600);
         if !filetime_set(&f, now - age) {
             eprintln!("skipping: could not set an mtime on this host");
-            std::fs::remove_dir_all(&dir).unwrap();
             return;
         }
         paths.push(f.to_string_lossy().into_owned());
@@ -185,8 +186,6 @@ fn find_mtime_exact_newer_and_older() {
     // boundary and the local timezone play no part, only the 24-hour count.
     run_test_find_sorted(&[ds, "-type", "f", "-mtime", "+0"], &[d1, d3, d10], "", 0);
     run_test_find_sorted(&[ds, "-type", "f", "-mtime", "-1"], &[d0], "", 0);
-
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -400,41 +399,23 @@ fn find_print0_with_name_filter() {
     run_test_find_print0_sorted(&args, &[&file1, &file2, &file3], 0)
 }
 
-/// An empty scratch directory of our own, named for `tag` and this process.
+/// An empty scratch directory of our own, removed with its contents when the
+/// returned guard drops -- on a panic too.
 ///
 /// Tests that need one assert over the whole directory, so anything else
-/// writing into it breaks them. The tag separates tests within a run -- they
-/// execute on parallel threads of one process -- and the pid separates
-/// concurrent runs, which would otherwise meet on a single path inside a
-/// directory every user on the host can write to.
-///
-/// The pid is deliberately the only varying part. Something more unique per
-/// call would leave a fresh directory behind every time a test panicked before
-/// its cleanup; with the pid, a later run reuses the name and the
-/// `remove_dir_all` below clears whatever the last one left.
-fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("posixutils_find_{tag}_{}", std::process::id()));
-    // Anything but "it was not there" has to be reported here. `create_dir_all`
-    // is happy with a directory that already exists, so a removal that failed --
-    // a leftover owned by another user on a shared temp dir, or a symlink
-    // planted in it -- would otherwise leave stale entries in place and surface
-    // as an assertion about `-mtime` or `-name` further down.
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("could not clear scratch dir {}: {e}", dir.display()),
-    }
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// writing into it breaks them. `mkdtemp` makes a new directory for every
+/// call, so neither parallel tests nor concurrent runs can meet in it.
+fn scratch_dir() -> TempDir {
+    tempdir().expect("create scratch dir")
 }
 
 // --- fnmatch / -iname (find-A) ---
 
-/// Create a fresh temp dir with the given files; returns its path.
-fn make_fnmatch_dir(tag: &str, files: &[&str]) -> std::path::PathBuf {
-    let dir = scratch_dir(tag);
+/// Create a fresh temp dir with the given files.
+fn make_fnmatch_dir(files: &[&str]) -> TempDir {
+    let dir = scratch_dir();
     for f in files {
-        File::create(dir.join(f)).unwrap();
+        File::create(dir.path().join(f)).unwrap();
     }
     dir
 }
@@ -444,7 +425,8 @@ fn find_name_bracket_range() {
     // POSIX bracket expression [a-z] must match a single lowercase letter. The
     // range is LC_COLLATE-sensitive, so pin the C locale for portable ASCII
     // semantics (see run_test_find_sorted_env).
-    let dir = make_fnmatch_dir("bracket", &["m", "Q", "9", "abc"]);
+    let tmp = make_fnmatch_dir(&["m", "Q", "9", "abc"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     let expect = format!("{ds}/m");
     run_test_find_sorted_env(
@@ -454,12 +436,12 @@ fn find_name_bracket_range() {
         "",
         0,
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn find_name_bracket_negation() {
-    let dir = make_fnmatch_dir("negation", &["m", "Q", "9"]);
+    let tmp = make_fnmatch_dir(&["m", "Q", "9"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     let e1 = format!("{ds}/Q");
     let e2 = format!("{ds}/9");
@@ -471,25 +453,24 @@ fn find_name_bracket_negation() {
         "",
         0,
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn find_iname_case_insensitive() {
-    let dir = make_fnmatch_dir("iname", &["README.md", "other.txt"]);
+    let tmp = make_fnmatch_dir(&["README.md", "other.txt"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     let expect = format!("{ds}/README.md");
     run_test_find_sorted(&[ds, "-iname", "readme.md"], &[&expect], "", 0);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn find_name_question_mark() {
-    let dir = make_fnmatch_dir("qmark", &["ab", "abc", "a"]);
+    let tmp = make_fnmatch_dir(&["ab", "abc", "a"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     let expect = format!("{ds}/ab");
     run_test_find_sorted(&[ds, "-name", "a?"], &[&expect], "", 0);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 // FIND-5: -ok prompts and only runs the utility on an affirmative answer.
@@ -539,7 +520,8 @@ fn find_ok_declined() {
 fn find_exec_plus_primaries_do_not_collide() {
     // Two independent `-exec ... {} +` primaries must each receive only the
     // pathnames their own branch matched.
-    let dir = make_fnmatch_dir("execplus", &["aaa", "bbb"]);
+    let tmp = make_fnmatch_dir(&["aaa", "bbb"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     let a = format!("A {ds}/aaa");
     let b = format!("B {ds}/bbb");
@@ -552,7 +534,6 @@ fn find_exec_plus_primaries_do_not_collide() {
         "",
         0,
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -560,7 +541,8 @@ fn find_exec_plus_identical_utilities_stay_separate() {
     // Two *textually identical* primaries are still two primaries: two sets,
     // two invocations. Keying batches by (utility, args_before) would merge
     // them and fail this test.
-    let dir = make_fnmatch_dir("execplus_same", &["aaa", "bbb"]);
+    let tmp = make_fnmatch_dir(&["aaa", "bbb"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     let a = format!("{ds}/aaa");
     let b = format!("{ds}/bbb");
@@ -573,7 +555,6 @@ fn find_exec_plus_identical_utilities_stay_separate() {
         "",
         0,
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -581,7 +562,8 @@ fn find_exec_plus_single_primary_aggregates() {
     // One primary still gathers every match into a single invocation. Counts
     // arguments rather than printing them, so it is independent of readdir
     // order.
-    let dir = make_fnmatch_dir("execplus_one", &["f1", "f2", "f3"]);
+    let tmp = make_fnmatch_dir(&["f1", "f2", "f3"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     run_test_find(
         &[
@@ -591,13 +573,13 @@ fn find_exec_plus_single_primary_aggregates() {
         "",
         0,
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn find_exec_plus_empty_batch_not_invoked() {
     // A primary that never matches must not be invoked with an empty set.
-    let dir = make_fnmatch_dir("execplus_empty", &["aaa"]);
+    let tmp = make_fnmatch_dir(&["aaa"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     run_test_find(
         &[ds, "-name", "no_such_name", "-exec", "echo", "X", "{}", "+"],
@@ -605,14 +587,14 @@ fn find_exec_plus_empty_batch_not_invoked() {
         "",
         0,
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn find_exec_plus_exit_status() {
     // POSIX (l. 98402): a non-zero exit from a `+`-punctuated -exec makes find
     // exit non-zero.
-    let dir = make_fnmatch_dir("execplus_fail", &["aaa"]);
+    let tmp = make_fnmatch_dir(&["aaa"]);
+    let dir = tmp.path();
     let ds = dir.to_str().unwrap();
     run_test_find(
         &[ds, "-name", "aaa", "-exec", "false", "{}", "+"],
@@ -620,7 +602,6 @@ fn find_exec_plus_exit_status() {
         "",
         1,
     );
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 // --- coverage gaps closed in the file-crate audit sweep ---
@@ -671,7 +652,8 @@ fn find_mount_excludes_crossing_directory() {
 // nothing was lost or duplicated.
 #[test]
 fn find_exec_plus_splits_over_arg_max() {
-    let dir = scratch_dir("argmax");
+    let tmp = scratch_dir();
+    let dir = tmp.path();
 
     // The file count has to be derived from the host's ARG_MAX, not fixed: a
     // count tuned to one machine's margin silently stops splitting on a host
@@ -687,7 +669,6 @@ fn find_exec_plus_splits_over_arg_max() {
     };
     if arg_max > 64 << 20 {
         eprintln!("skipping: ARG_MAX of {arg_max} would need an unreasonable number of files");
-        std::fs::remove_dir_all(&dir).unwrap();
         return;
     }
 
@@ -730,8 +711,6 @@ fn find_exec_plus_splits_over_arg_max() {
         "every pathname must be passed exactly once across all invocations"
     );
     assert_eq!(output.status.code(), Some(0));
-
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 // FIND-7: -mtime rounds toward zero on a 24-hour granularity, so a file with a
@@ -739,7 +718,8 @@ fn find_exec_plus_splits_over_arg_max() {
 // (nor `-mtime N` for any non-negative N).
 #[test]
 fn find_mtime_future_dated_file() {
-    let dir = scratch_dir("future");
+    let tmp = scratch_dir();
+    let dir = tmp.path();
     let f = dir.join("future");
     File::create(&f).unwrap();
 
@@ -749,7 +729,6 @@ fn find_mtime_future_dated_file() {
     let ft = filetime_set(&f, future);
     if !ft {
         eprintln!("skipping: could not set a future mtime on this host");
-        std::fs::remove_dir_all(&dir).unwrap();
         return;
     }
 
@@ -768,8 +747,6 @@ fn find_mtime_future_dated_file() {
         "",
         0,
     );
-
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Set both atime and mtime of `path` via `utimensat`. Returns false on failure.
@@ -853,7 +830,8 @@ fn find_ok_honors_locale_yesexpr() {
 /// every symbolic link, followed or not.
 #[test]
 fn find_type_l_under_follow() {
-    let dir = scratch_dir("type_l_follow");
+    let tmp = scratch_dir();
+    let dir = tmp.path();
     std::fs::create_dir(dir.join("d")).unwrap();
     File::create(dir.join("d/f")).unwrap();
     std::os::unix::fs::symlink("f", dir.join("d/to_file")).unwrap();
@@ -889,8 +867,6 @@ fn find_type_l_under_follow() {
         "",
         0,
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

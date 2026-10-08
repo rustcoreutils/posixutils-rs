@@ -16,6 +16,8 @@ mod bounds;
 mod bytes;
 mod dpkg_options;
 mod search;
+#[cfg(unix)]
+mod symlinks;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 

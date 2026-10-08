@@ -12,9 +12,10 @@
 
 use clap::Parser;
 use gettextrs::gettext;
+use plib::tmp::TempDir;
 use posixutils_uucp::common::{
     current_login, expand_remote_path, generate_job_id, is_local_system, parse_path_spec,
-    send_mail, shell_escape, ssh_exec, ssh_fetch_file, ssh_send_file,
+    path_text, private_temp_dir, send_mail, shell_escape, ssh_exec, ssh_fetch_file, ssh_send_file,
 };
 use std::io::{self, Read};
 use std::process::ExitCode;
@@ -123,7 +124,7 @@ fn main() -> ExitCode {
     }
 
     // Execute the command
-    let result = execute_uux(&parsed, stdin_data.as_deref(), &job_id);
+    let result = execute_uux(&parsed, stdin_data.as_deref());
 
     match result {
         Ok(_) => ExitCode::SUCCESS,
@@ -257,84 +258,195 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
     })
 }
 
-/// Execute the uux command
-fn execute_uux(
-    parsed: &ParsedCommand,
-    stdin_data: Option<&[u8]>,
-    job_id: &str,
-) -> Result<(), String> {
-    let exec_local = is_local_system(&parsed.exec_host);
+/// The directory a `uux` command runs in on its execution host.
+///
+/// Every directory is made fresh under a name no one could predict, and
+/// readable only by this user: locally by `mkdtemp`, which also serves to
+/// stage files on their way to a remote execution host; on a remote host by
+/// `mkdir -m 700` of a name of its own from the system's random source, which
+/// fails rather than reuse anything already there. Both are removed when
+/// this is dropped.
+struct WorkDir {
+    remote: Option<RemoteDir>,
+    /// Held for its removal on drop; its path is `local_path`.
+    _local: TempDir,
+    local_path: String,
+}
 
-    // Create working directory
-    let work_dir = format!("/tmp/uux_{}", job_id);
+impl WorkDir {
+    fn create(exec_host: &str, exec_local: bool) -> Result<WorkDir, String> {
+        let fail = |e: io::Error| format!("failed to create work dir: {}", e);
+        let local = private_temp_dir("uux.").map_err(fail)?;
+        let local_path = path_text(local.path()).map_err(fail)?;
+        let remote = if exec_local {
+            None
+        } else {
+            let name = random_dir_name().map_err(fail)?;
+            Some(RemoteDir::create(exec_host, &name)?)
+        };
+        Ok(WorkDir {
+            remote,
+            _local: local,
+            local_path,
+        })
+    }
 
-    // Resolve the output redirect (if any) up front: where the command should
-    // write on the exec host, and whether the produced file must afterwards be
-    // delivered to another system. An unsupported third-system target fails here
-    // before any work is done.
-    let (redirect_target, delivery) = resolve_output(
-        &parsed.output_file,
-        &parsed.exec_host,
-        exec_local,
-        &work_dir,
-    )?;
-
-    if exec_local {
-        // Create local working directory
-        std::fs::create_dir_all(&work_dir)
-            .map_err(|e| format!("failed to create work dir: {}", e))?;
-    } else {
-        // Create remote working directory
-        let work_dir_escaped = shell_escape(&work_dir);
-        let (code, _, stderr) = ssh_exec(
-            &parsed.exec_host,
-            &format!("mkdir -p {}", work_dir_escaped),
-            None,
-        )
-        .map_err(|e| format!("ssh failed: {}", e))?;
-        if code != 0 {
-            return Err(format!(
-                "failed to create remote work dir: {}",
-                String::from_utf8_lossy(&stderr)
-            ));
+    /// The work directory's path on the execution host.
+    fn exec_path(&self) -> &str {
+        match &self.remote {
+            Some(remote) => &remote.path,
+            None => &self.local_path,
         }
     }
 
-    // Fetch input files to execution host
+    /// A path for `name` in the local directory.
+    fn local_file(&self, name: &str) -> String {
+        format!("{}/{}", self.local_path, name)
+    }
+
+    /// A path for `name` in the work directory on the execution host.
+    fn exec_file(&self, name: &str) -> String {
+        format!("{}/{}", self.exec_path(), name)
+    }
+}
+
+/// A private directory made on a remote execution host, removed on drop.
+struct RemoteDir {
+    host: String,
+    path: String,
+}
+
+impl RemoteDir {
+    /// Make `$TMPDIR/name` (or `/tmp/name`) on `host`, mode 0700. `mkdir`
+    /// without `-p` fails if anything at all already has that name, and the
+    /// path the remote shell chose is read back from its output: from after
+    /// a sentinel line, since the shell's start-up files may print first.
+    fn create(host: &str, name: &str) -> Result<RemoteDir, String> {
+        let dir = remote_tmp_path(name);
+        let script = format!(
+            "d={dir} && mkdir -m 700 \"$d\" && printf '\\n%s\\n%s' {REMOTE_DIR_SENTINEL} \"$d\""
+        );
+        let (code, stdout, stderr) =
+            ssh_exec(host, &script, None).map_err(|e| format!("ssh failed: {}", e))?;
+        let fail = || {
+            format!(
+                "failed to create remote work dir: {}",
+                String::from_utf8_lossy(&stderr)
+            )
+        };
+        if code != 0 {
+            return Err(fail());
+        }
+        match path_after_sentinel(&stdout, name) {
+            Some(path) => Ok(RemoteDir {
+                host: host.to_string(),
+                path,
+            }),
+            None => {
+                // The directory was made, but the path read back is missing
+                // or not the one made: remove it by the same name.
+                let _ = ssh_exec(host, &format!("rm -rf {dir}"), None);
+                Err(fail())
+            }
+        }
+    }
+}
+
+/// A name for a remote work directory: `uux.` and 128 bits from the
+/// system's random source, as hex, so nothing seen locally predicts it.
+fn random_dir_name() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("uux.{hex}"))
+}
+
+/// The line the remote shell prints just before the work directory's path.
+const REMOTE_DIR_SENTINEL: &str = "posixutils-uux-work-dir:";
+
+/// A shell word for `name` in the remote `$TMPDIR`, or `/tmp`.
+fn remote_tmp_path(name: &str) -> String {
+    format!("\"${{TMPDIR:-/tmp}}\"/{}", shell_escape(name))
+}
+
+/// The path printed after the last sentinel line in `stdout`, if it is the
+/// directory made as `name`: one absolute line ending in `/name`.
+/// The output before the sentinel is skipped as bytes, so start-up output
+/// in any encoding is no obstacle; only the path is decoded.
+fn path_after_sentinel(stdout: &[u8], name: &str) -> Option<String> {
+    let marker = format!("\n{REMOTE_DIR_SENTINEL}\n");
+    let marker = marker.as_bytes();
+    let start = stdout.windows(marker.len()).rposition(|w| w == marker)? + marker.len();
+    let path = std::str::from_utf8(&stdout[start..]).ok()?;
+    let is_ours =
+        path.starts_with('/') && !path.contains('\n') && path.ends_with(&format!("/{name}"));
+    is_ours.then(|| path.to_string())
+}
+
+impl Drop for RemoteDir {
+    fn drop(&mut self) {
+        let _ = ssh_exec(
+            &self.host,
+            &format!("rm -rf {}", shell_escape(&self.path)),
+            None,
+        );
+    }
+}
+
+/// Bring each input file from another system into the work directory.
+fn fetch_inputs(parsed: &ParsedCommand, work: &WorkDir, exec_local: bool) -> Result<(), String> {
     for file in &parsed.input_files {
         let basename = std::path::Path::new(&file.path)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or(file.path.clone());
+        let fetch_err = |e: io::Error| format!("failed to fetch {}: {}", file.path, e);
 
         if exec_local {
             // Fetch from remote to local work dir
-            let local_path = format!("{}/{}", work_dir, basename);
-            ssh_fetch_file(&file.system, &file.path, &local_path, true)
-                .map_err(|e| format!("failed to fetch {}: {}", file.path, e))?;
+            ssh_fetch_file(&file.system, &file.path, &work.exec_file(&basename), false)
+                .map_err(fetch_err)?;
         } else {
-            // Fetch from source remote to local temp, then send to exec host
-            let temp_path = format!("/tmp/uux_tmp_{}_{}", job_id, basename);
-            ssh_fetch_file(&file.system, &file.path, &temp_path, true)
-                .map_err(|e| format!("failed to fetch {}: {}", file.path, e))?;
-
-            let remote_path = format!("{}/{}", work_dir, basename);
-            ssh_send_file(&parsed.exec_host, &temp_path, &remote_path, true)
-                .map_err(|e| format!("failed to send to exec host: {}", e))?;
-
+            // Fetch from source remote to the local staging dir, then send to
+            // the exec host.
+            let temp_path = work.local_file(&basename);
+            ssh_fetch_file(&file.system, &file.path, &temp_path, false).map_err(fetch_err)?;
+            ssh_send_file(
+                &parsed.exec_host,
+                &temp_path,
+                &work.exec_file(&basename),
+                false,
+            )
+            .map_err(|e| format!("failed to send to exec host: {}", e))?;
             let _ = std::fs::remove_file(&temp_path);
         }
     }
+    Ok(())
+}
+
+/// Execute the uux command
+fn execute_uux(parsed: &ParsedCommand, stdin_data: Option<&[u8]>) -> Result<(), String> {
+    let exec_local = is_local_system(&parsed.exec_host);
+
+    // Resolve the output redirect (if any) up front: where the command should
+    // write on the exec host, and whether the produced file must afterwards be
+    // delivered to another system. An unsupported third-system target fails here
+    // before any work is done.
+    let (redirect_target, delivery) =
+        resolve_output(&parsed.output_file, &parsed.exec_host, exec_local)?;
+
+    // Dropping `work` at return removes the work directories.
+    let work = WorkDir::create(&parsed.exec_host, exec_local)?;
+    fetch_inputs(parsed, &work, exec_local)?;
 
     // Execute the command, appending the resolved output redirect (if any). The
-    // redirect target is shell-quoted; for cross-system output it points at a
-    // temp under the work dir, never at the target path on the exec host.
-    let work_dir_escaped = shell_escape(&work_dir);
+    // redirect target is shell-quoted; for cross-system output it is a temp in
+    // the work dir, never the target path on the exec host.
     let mut command = parsed.command.clone();
     if let Some(ref target) = redirect_target {
         command.push_str(&format!(" > {}", shell_escape(target)));
     }
-    let full_cmd = format!("cd {} && {}", work_dir_escaped, command);
+    let full_cmd = format!("cd {} && {}", shell_escape(work.exec_path()), command);
 
     let (code, stdout, stderr) = if exec_local {
         // Local execution
@@ -381,34 +493,16 @@ fn execute_uux(
         eprint!("{}", String::from_utf8_lossy(&stderr));
     }
 
-    // On success, deliver the produced output file to its target system (for a
-    // cross-system redirect it was written to a temp under the exec host's work
-    // dir). Done before cleanup removes the work dir.
-    let delivery_result = if code == 0 {
-        match delivery {
-            Some(ref d) => deliver(d, &parsed.exec_host),
-            None => Ok(()),
-        }
-    } else {
-        Ok(())
-    };
-
-    // Clean up the work directory.
-    if exec_local {
-        let _ = std::fs::remove_dir_all(&work_dir);
-    } else {
-        let work_dir_escaped = shell_escape(&work_dir);
-        let _ = ssh_exec(
-            &parsed.exec_host,
-            &format!("rm -rf {}", work_dir_escaped),
-            None,
-        );
-    }
-
     if code != 0 {
         return Err(format!("command exited with status {}", code));
     }
-    delivery_result?;
+
+    // Deliver the produced output file to its target system (for a
+    // cross-system redirect it was written to a temp in the exec host's work
+    // dir), before dropping `work` removes it.
+    if let Some(ref d) = delivery {
+        deliver(d, &parsed.exec_host, &work.exec_file(OUTPUT_TEMP))?;
+    }
 
     // The command's standard output is discarded per POSIX unless redirected.
     let _ = stdout;
@@ -423,8 +517,6 @@ struct Delivery {
     /// True to fetch the temp from a remote exec host down to the local target;
     /// false to send a locally-produced temp up to the remote target system.
     fetch: bool,
-    /// Path of the produced file on the exec host (a temp under the work dir).
-    tmp: String,
     /// Target system name (empty for local).
     system: String,
     /// Target path on the target system.
@@ -437,15 +529,15 @@ struct Delivery {
 /// - no output redirect → `(None, None)`;
 /// - output on the same host as execution → write directly to the requested
 ///   path there, no delivery;
-/// - cross-system (local↔remote) → write to a temp under the exec host's work
-///   dir, then deliver it to the target (so the target path is interpreted only
-///   on the target system, and nothing is left on the exec host);
+/// - cross-system (local↔remote) → write to [`OUTPUT_TEMP`] in the exec host's
+///   work dir, where the command runs, then deliver it to the target (so the
+///   target path is interpreted only on the target system, and nothing is left
+///   on the exec host);
 /// - output on a third remote system (neither local nor the exec host) → error.
 fn resolve_output(
     output_file: &Option<FileRef>,
     exec_host: &str,
     exec_local: bool,
-    work_dir: &str,
 ) -> Result<(Option<String>, Option<Delivery>), String> {
     let out = match output_file {
         Some(o) => o,
@@ -467,7 +559,6 @@ fn resolve_output(
         ))
     } else {
         // Cross-system: redirect to a temp in the work dir, deliver afterwards.
-        let tmp = format!("{}/uux_output_file", work_dir);
         let path = if out_local && !out.path.starts_with('/') {
             // Local target with a relative path: resolve against the cwd.
             match std::env::current_dir() {
@@ -478,10 +569,9 @@ fn resolve_output(
             out.path.clone()
         };
         Ok((
-            Some(tmp.clone()),
+            Some(OUTPUT_TEMP.to_string()),
             Some(Delivery {
                 fetch: out_local,
-                tmp,
                 system: out.system.clone(),
                 path,
             }),
@@ -489,12 +579,15 @@ fn resolve_output(
     }
 }
 
-/// Carry out a pending [`Delivery`] (the produced file is in `d.tmp` on the
-/// exec host).
-fn deliver(d: &Delivery, exec_host: &str) -> Result<(), String> {
+/// The file a cross-system `>` target is written to, in the work dir.
+const OUTPUT_TEMP: &str = "uux_output_file";
+
+/// Carry out a pending [`Delivery`] of the file produced at `tmp` on the
+/// exec host.
+fn deliver(d: &Delivery, exec_host: &str, tmp: &str) -> Result<(), String> {
     if d.fetch {
         // Remote exec host → local target.
-        ssh_fetch_file(exec_host, &d.tmp, &d.path, true).map_err(|e| {
+        ssh_fetch_file(exec_host, tmp, &d.path, true).map_err(|e| {
             format!(
                 "{}: {}",
                 gettext("failed to fetch output file from exec host"),
@@ -503,7 +596,7 @@ fn deliver(d: &Delivery, exec_host: &str) -> Result<(), String> {
         })
     } else {
         // Local exec → remote target system.
-        ssh_send_file(&d.system, &d.tmp, &d.path, true)
+        ssh_send_file(&d.system, tmp, &d.path, true)
             .map_err(|e| format!("{}: {}", gettext("failed to send output file to remote"), e))
     }
 }
@@ -591,7 +684,7 @@ mod tests {
             system: "exechost".to_string(),
             path: "/p/out".to_string(),
         });
-        let (redirect, delivery) = resolve_output(&out, "exechost", false, "/tmp/wd").unwrap();
+        let (redirect, delivery) = resolve_output(&out, "exechost", false).unwrap();
         assert_eq!(redirect.as_deref(), Some("/p/out"));
         assert!(delivery.is_none());
     }
@@ -604,12 +697,38 @@ mod tests {
             system: String::new(), // local
             path: "/p/out".to_string(),
         });
-        let (redirect, delivery) = resolve_output(&out, "exechost", false, "/tmp/wd").unwrap();
-        assert_eq!(redirect.as_deref(), Some("/tmp/wd/uux_output_file"));
+        let (redirect, delivery) = resolve_output(&out, "exechost", false).unwrap();
+        assert_eq!(redirect.as_deref(), Some(OUTPUT_TEMP));
         let d = delivery.expect("delivery scheduled");
         assert!(d.fetch, "exec-remote/output-local fetches");
-        assert_eq!(d.tmp, "/tmp/wd/uux_output_file");
         assert_eq!(d.path, "/p/out");
+    }
+
+    #[test]
+    fn test_path_after_sentinel() {
+        let parse = |out: String| path_after_sentinel(out.as_bytes(), "uux.ab");
+        let s = REMOTE_DIR_SENTINEL;
+        assert_eq!(
+            parse(format!("banner\n/x\n\n{s}\n/tmp/a b/uux.ab")).as_deref(),
+            Some("/tmp/a b/uux.ab")
+        );
+        assert_eq!(parse("/tmp/uux.ab".to_string()), None);
+        assert_eq!(parse(format!("\n{s}\ntmp/uux.ab")), None);
+        // The path must end in the generated name, and be one line.
+        assert_eq!(parse(format!("\n{s}\n/tmp/other")), None);
+        assert_eq!(parse(format!("\n{s}\n/tmp/xuux.ab")), None);
+        assert_eq!(parse(format!("\n{s}\n/tmp/uux.ab\n/etc")), None);
+        assert_eq!(parse(format!("\n{s}\n/etc\n/tmp/uux.ab")), None);
+    }
+
+    #[test]
+    fn test_path_after_sentinel_ignores_non_utf8_before_it() {
+        let mut out = b"caf\xe9 \xff motd\n".to_vec();
+        out.extend_from_slice(format!("\n{REMOTE_DIR_SENTINEL}\n/tmp/uux.ab").as_bytes());
+        assert_eq!(
+            path_after_sentinel(&out, "uux.ab").as_deref(),
+            Some("/tmp/uux.ab")
+        );
     }
 
     #[test]
@@ -620,7 +739,7 @@ mod tests {
             system: "thirdsys".to_string(),
             path: "/p/out".to_string(),
         });
-        let err = resolve_output(&out, "exechost", false, "/tmp/wd").unwrap_err();
+        let err = resolve_output(&out, "exechost", false).unwrap_err();
         assert!(
             err.contains("third system"),
             "expected third-system error, got: {err}"

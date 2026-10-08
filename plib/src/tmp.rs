@@ -474,7 +474,49 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         // Nothing useful to report from a destructor, and a directory that is
         // already gone is the outcome we wanted anyway.
-        let _ = fs::remove_dir_all(&self.path);
+        let removed = fs::remove_dir_all(&self.path);
+        // A directory in the tree that its owner may not read, search or
+        // write stops the removal: a test that takes the permissions away to
+        // provoke an error and fails before giving them back would leak the
+        // whole tree. Give them back to every directory and try once more.
+        #[cfg(unix)]
+        if removed.is_err() {
+            grant_owner_dir_access(&self.path);
+            let _ = fs::remove_dir_all(&self.path);
+        }
+        #[cfg(not(unix))]
+        let _ = removed;
+    }
+}
+
+/// Add owner read, write and search permission to `dir` and to every
+/// directory below it, so that the tree can be removed.
+///
+/// Only real directories are changed: an entry is examined with
+/// `symlink_metadata` and a directory entry's own type, so a symbolic link is
+/// never followed out of the tree. The tree is inside a `mkdtemp` directory
+/// only its owner can write, so nobody else can swap an entry underneath.
+#[cfg(unix)]
+fn grant_owner_dir_access(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700));
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            grant_owner_dir_access(&entry.path());
+        }
     }
 }
 
@@ -702,6 +744,24 @@ mod tests {
             fs::write(dir.path().join("nested"), b"x").unwrap();
             fs::create_dir(dir.path().join("sub")).unwrap();
             fs::write(dir.path().join("sub/deep"), b"y").unwrap();
+            dir.path().to_path_buf()
+        };
+        assert!(!path.exists(), "TempDir::drop must remove the tree");
+    }
+
+    /// A directory inside that its owner may not read, search or write -- a
+    /// test that made one and failed before restoring it -- does not keep the
+    /// tree from being removed.
+    #[cfg(unix)]
+    #[test]
+    fn tempdir_is_removed_past_a_directory_without_permissions() {
+        let path = {
+            let dir = tempdir().unwrap();
+            let locked = dir.path().join("locked");
+            fs::create_dir_all(locked.join("sub")).unwrap();
+            fs::write(locked.join("sub/f"), b"x").unwrap();
+            fs::set_permissions(locked.join("sub"), fs::Permissions::from_mode(0o500)).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
             dir.path().to_path_buf()
         };
         assert!(!path.exists(), "TempDir::drop must remove the tree");

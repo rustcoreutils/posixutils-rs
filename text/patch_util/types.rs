@@ -379,6 +379,17 @@ impl BackupName {
         name.push(suffix);
         PathBuf::from(name)
     }
+
+    /// The directory part of an absolute prefix (up to its last separator):
+    /// the user's own choice of where backups go.
+    pub fn absolute_prefix_dir(&self) -> Option<PathBuf> {
+        let prefix = self.prefix.as_deref()?;
+        if !Path::new(prefix).is_absolute() {
+            return None;
+        }
+        let end = prefix.rfind(std::path::is_separator)?;
+        Some(PathBuf::from(&prefix[..=end]))
+    }
 }
 
 /// Where rejected hunks go.

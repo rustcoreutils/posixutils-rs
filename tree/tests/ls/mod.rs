@@ -896,12 +896,10 @@ fn test_ls_l_symlink_no_panic() {
 // A socket gets type char `s` (long format) and indicator `=` (-F).
 #[test]
 fn test_ls_socket_classification() {
-    let test_dir = &format!(
-        "{}/test_ls_socket_classification",
-        env!("CARGO_TARGET_TMPDIR")
-    );
-    fs::create_dir(test_dir).unwrap();
-    let sock = &format!("{test_dir}/sock");
+    // A socket path must fit in sun_path (104 bytes on macOS, 108 on Linux), which a target
+    // directory deep in a checkout can exceed; the system temporary directory is short.
+    let test_dir = plib::tmp::tempdir().unwrap();
+    let sock = &test_dir.path().join("sock").to_str().unwrap().to_string();
     let _listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
 
     ls_test_with_checker(&["-F", sock], |_, output| {
@@ -917,8 +915,6 @@ fn test_ls_socket_classification() {
             "mode line should start with 's': {stdout}"
         );
     });
-
-    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // The long-format day is blank-padded (`%e`), not zero-padded (`Jun  5`, not `Jun 05`).

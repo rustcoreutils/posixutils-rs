@@ -14,7 +14,8 @@ use clap::Parser;
 use gettextrs::gettext;
 use posixutils_uucp::common::{
     current_login, expand_local_path, expand_remote_path, generate_job_id, is_local_system,
-    parse_path_spec, send_mail, send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
+    parse_path_spec, private_temp_dir, send_mail, send_remote_mail, ssh_fetch_file, ssh_send_file,
+    staging_path, Job,
 };
 use std::fs;
 use std::path::Path;
@@ -273,19 +274,12 @@ fn copy_remote_to_remote(
     dest_path: &str,
     create_dirs: bool,
 ) -> std::io::Result<()> {
-    // Create temp file
-    let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join(format!("uucp_{}", std::process::id()));
-    let temp_path = temp_file.to_string_lossy().to_string();
+    // The file is staged in a directory of its own, made by mkdtemp (mode
+    // 0700, under $TMPDIR), so no other user can have planted its name.
+    // Dropping `staging` removes it.
+    let staging = private_temp_dir("uucp.")?;
+    let temp_path = staging_path(&staging, "data")?;
 
-    // Fetch from source
-    ssh_fetch_file(src_host, src_path, &temp_path, true)?;
-
-    // Send to destination
-    let result = ssh_send_file(dest_host, &temp_path, dest_path, create_dirs);
-
-    // Clean up temp file
-    let _ = fs::remove_file(&temp_file);
-
-    result
+    ssh_fetch_file(src_host, src_path, &temp_path, false)?;
+    ssh_send_file(dest_host, &temp_path, dest_path, create_dirs)
 }

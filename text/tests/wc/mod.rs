@@ -54,19 +54,12 @@ fn wc_dash_operand_reads_stdin() {
 #[test]
 fn wc_single_file_shows_name() {
     // A single named file operand prints the filename (POSIX), not just counts.
-    use std::io::Write;
-    let dir = std::env::temp_dir();
-    let path = dir.join("wc_single_file_shows_name.txt");
-    std::fs::File::create(&path)
-        .unwrap()
-        .write_all(b"hello world\nfoo\n")
-        .unwrap();
+    let path = wc_tmp("wc_single_file_shows_name.txt", "hello world\nfoo\n");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_wc"))
         .arg("-c")
         .arg(&path)
         .output()
         .unwrap();
-    let _ = std::fs::remove_file(&path);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!("16 {}\n", path.display())
@@ -124,11 +117,8 @@ fn wc_run(args: &[&str]) -> (String, String, i32) {
     )
 }
 
-fn wc_tmp(name: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-wc-{}-{}", std::process::id(), name));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+fn wc_tmp(name: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(name, content)
 }
 
 #[test]
@@ -139,7 +129,6 @@ fn wc_default_output_is_lines_words_bytes() {
     let (stdout, _, code) = wc_run(&[f.to_str().unwrap()]);
     assert_eq!(code, 0);
     assert_eq!(stdout, format!("2 3 6 {}\n", f.display()), "got {stdout:?}");
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -153,8 +142,6 @@ fn wc_multiple_files_report_each_and_a_total() {
         format!("1 {}\n2 {}\n3 total\n", a.display(), b.display()),
         "got {stdout:?}"
     );
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -169,7 +156,6 @@ fn wc_combined_flags_keep_column_order() {
     assert_eq!(wl, lw, "option order must not change the column order");
     let (lc, _, _) = wc_run(&["-l", "-c", p]);
     assert_eq!(lc, format!("2 6 {}\n", f.display()), "got {lc:?}");
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -188,7 +174,6 @@ fn wc_double_dash_ends_options() {
     let (stdout, _, code) = wc_run(&["-l", "--", f.to_str().unwrap()]);
     assert_eq!(code, 0);
     assert_eq!(stdout, format!("1 {}\n", f.display()), "got {stdout:?}");
-    let _ = std::fs::remove_file(f);
 }
 
 /// `wc -l` over many operands into a closed pipe must die by SIGPIPE.

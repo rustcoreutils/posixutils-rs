@@ -335,11 +335,8 @@ fn paste_custom_delimiters_serial() {
 // Operands, delimiters and error paths
 // ---------------------------------------------------------------------------
 
-fn paste_tmp(tag: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-paste-{}-{}", std::process::id(), tag));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+fn paste_tmp(tag: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(tag, content)
 }
 
 #[test]
@@ -354,8 +351,6 @@ fn paste_parallel_unequal_file_lengths() {
         .expect("run paste");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\ta\n2\t\n3\t\n");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -368,8 +363,6 @@ fn paste_newline_delimiter() {
         .expect("run paste");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\na\n2\nb\n");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -384,8 +377,6 @@ fn paste_null_then_ordinary_delimiter() {
         .expect("run paste");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1a\n2b\n3c\n");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -400,7 +391,6 @@ fn paste_serial_mode_with_an_unopenable_file() {
     assert!(stderr.contains("no-such-file-xyz"), "got {stderr:?}");
     // The readable operand is still processed.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\t2\n");
-    let _ = std::fs::remove_file(good);
 }
 
 #[test]
@@ -413,8 +403,6 @@ fn paste_empty_file_operand_in_serial_mode() {
         .expect("run paste");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "\na\n");
-    let _ = std::fs::remove_file(empty);
-    let _ = std::fs::remove_file(full);
 }
 
 #[test]
@@ -430,7 +418,6 @@ fn paste_mixes_stdin_with_a_named_file() {
     child.stdin.as_mut().unwrap().write_all(b"S\n").unwrap();
     let out = child.wait_with_output().expect("wait paste");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "S\ta\n");
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -469,6 +456,4 @@ fn paste_multibyte_delimiter_under_lc_ctype() {
         .expect("run paste");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, "1\u{e9}a\n2\u{e9}b\n".as_bytes());
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }

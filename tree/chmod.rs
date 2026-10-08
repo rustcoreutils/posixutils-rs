@@ -84,12 +84,20 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
                 }
             }
 
+            // A symlink the walk followed (an operand: the walk follows no others) is changed
+            // through the link, as POSIX requires; anything else is changed itself.
+            let followed = entry.is_symlink() == Some(true) && !md.is_symlink();
+            let flags = if followed {
+                0
+            } else {
+                libc::AT_SYMLINK_NOFOLLOW
+            };
             let ret = unsafe {
                 libc::fchmodat(
                     entry.dir_fd(),
                     entry.file_name().as_ptr(),
                     new_mode as libc::mode_t, // Cast for macOS
-                    libc::AT_SYMLINK_NOFOLLOW,
+                    flags,
                 )
             };
 

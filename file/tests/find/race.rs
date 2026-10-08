@@ -58,7 +58,8 @@ fn swap_while(tree: &Path, victim: &Path, mut running: impl FnMut() -> bool) {
 
 #[test]
 fn find_delete_never_leaves_the_operand_under_a_symlink_swap() {
-    let base = scratch_dir("race_delete");
+    let tmp = scratch_dir();
+    let base = tmp.path();
     let victim = base.join("victim");
     populate(&victim, "v");
     let tree = base.join("tree");
@@ -86,6 +87,4 @@ fn find_delete_never_leaves_the_operand_under_a_symlink_swap() {
         );
     }
     assert!(rounds > 0);
-
-    let _ = fs::remove_dir_all(&base);
 }

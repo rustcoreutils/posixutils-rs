@@ -396,9 +396,7 @@ fn tsort_run(args: &[&str], stdin: &str) -> (String, String, i32) {
 
 #[test]
 fn tsort_double_dash_allows_a_dash_prefixed_file() {
-    let mut p = std::env::temp_dir();
-    p.push(format!("-posixutils-tsort-{}", std::process::id()));
-    std::fs::write(&p, "a b\n").expect("write temp file");
+    let p = plib::testing::TempFile::new("-posixutils-tsort", "a b\n");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_tsort"))
         .args(["--", p.to_str().unwrap()])
         .output()
@@ -410,7 +408,6 @@ fn tsort_double_dash_allows_a_dash_prefixed_file() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");
-    let _ = std::fs::remove_file(p);
 }
 
 #[test]

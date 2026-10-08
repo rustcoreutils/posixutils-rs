@@ -169,10 +169,8 @@ fn test_logger_reads_stdin_when_no_operands() {
 // #LG2: -f names a file to read messages from.
 #[test]
 fn test_logger_reads_message_file() {
-    let path = std::env::temp_dir().join("posixutils_logger_msgs");
-    std::fs::write(&path, "alpha\n\nbravo\n").unwrap();
+    let path = plib::testing::TempFile::new("msgs", "alpha\n\nbravo\n");
     assert_eq!(logger_run(&["-f", path.to_str().unwrap()], ""), 0);
-    std::fs::remove_file(&path).unwrap();
 }
 
 // -f - is standard input, per the usual convention.

@@ -10,7 +10,7 @@
 use super::error_string;
 use clap::Parser;
 use gettextrs::gettext;
-use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
+use std::{cell::RefCell, io};
 
 #[derive(Parser)]
 #[command(version, about, disable_help_flag = true)]
@@ -52,9 +52,6 @@ where
     G: Fn(io::Error, ftw::DisplayablePath), // separately to use two different closures
 {
     let recurse = args.recurse;
-    let no_dereference = args.no_dereference;
-    let follow_none = args.follow_none;
-    let follow_symlinks = args.follow_symlinks;
 
     // A per-file error is reported and the walk continues; this records whether any error
     // occurred (for the exit status), instead of aborting the rest of the `-R` subtree.
@@ -63,13 +60,12 @@ where
     ftw::traverse_directory(
         filename,
         |entry| {
-            let md = entry.metadata().unwrap();
-
-            // Use the UID from the args if present. If not given, according to the chgrp spec:
-            // "The user ID of the file shall be used as the owner argument."
-            let uid = uid.unwrap_or(md.uid());
-
-            // Don't change the group ID if the group argument is empty
+            // An owner or group not given is passed as -1, which leaves it as it is. The chgrp
+            // spec says "The user ID of the file shall be used as the owner argument": the
+            // file's own user ID at the moment of the change. The owner the walk saw is not
+            // that: a symlink's when chown follows it to its target, or a file's that was
+            // replaced since, and as root passing it would give the file to that owner.
+            let uid = uid.unwrap_or(libc::uid_t::MAX);
             let gid = gid.unwrap_or(libc::gid_t::MAX);
 
             let ret = unsafe {
@@ -78,13 +74,7 @@ where
                     entry.file_name().as_ptr(),
                     uid,
                     gid,
-                    // Default is to change the file that the symbolic link points to unless the
-                    // -h flag or -P flag is specified.
-                    if no_dereference || follow_none {
-                        libc::AT_SYMLINK_NOFOLLOW
-                    } else {
-                        0
-                    },
+                    chown_flags(&entry, args),
                 )
             };
 
@@ -110,4 +100,26 @@ where
 
     let had_error = *had_error.borrow();
     !had_error
+}
+
+/// The `fchownat` flag for `entry`: whether a symlink is followed to its target or changed
+/// itself.
+///
+/// -h and -P change every symlink itself. Under -R without -L (that is, with -H), POSIX leaves
+/// symlinks met during the traversal unspecified, and following one would change a file
+/// anywhere (a planted link to /etc/shadow, run as root), so only a symlink the walk followed,
+/// which is an operand, is followed. -L follows everywhere, as POSIX requires, and without -R an
+/// operand is followed by default.
+fn chown_flags(entry: &ftw::Entry<'_>, args: &ChangeOwnershipArgs) -> libc::c_int {
+    if args.no_dereference || args.follow_none {
+        return libc::AT_SYMLINK_NOFOLLOW;
+    }
+    if args.recurse && !args.follow_symlinks {
+        let walk_followed =
+            entry.is_symlink() == Some(true) && entry.metadata().is_some_and(|md| !md.is_symlink());
+        if !walk_followed {
+            return libc::AT_SYMLINK_NOFOLLOW;
+        }
+    }
+    0
 }

@@ -557,6 +557,23 @@ GNU tar.
  * The `-a` and `-o` operators and `(` / `)` grouping, which POSIX.1-2024
    removed.
 
+### touch
+
+ * `-d` also takes the RFC 5322 date `date -R` prints, such as
+   `Fri, 17 Jul 2026 19:05:00 +0200`.  Debian's base-files sets its files'
+   times by passing `touch -d` the date `dpkg-parsechangelog -SDate` prints,
+   which is this form, so a Debian build cannot do without it.  Only that one form is
+   added, not GNU's free-form date parser: `[Day, ]D Mon YYYY HH:MM[:SS]`
+   and a numeric `+hhmm` / `-hhmm` zone, single spaces, the English
+   abbreviations spelled as `date -R` spells them, and a day name that
+   matches the date.  In this form, zone names such as `GMT` are refused.
+ * `-d` also takes the POSIX date-time followed by a single space and the
+   word `UTC` or `GMT`, meaning exactly what a trailing `Z` means:
+   `1999-08-26 12:06:20 UTC`.  base-files' debian/timestamps sets its
+   license files' times in this form.  Only those two words, in upper
+   case, after one space; other zone words, `UTC` combined with `Z`, and
+   any other spacing are refused.
+
 ### tr
 
  * **Characters are UTF-8, in every locale.**  A multi-byte character can be a

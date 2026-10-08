@@ -397,15 +397,10 @@ fn test_cut_b_raw_bytes_non_utf8() {
 
 #[test]
 fn test_cut_continue_after_missing_file() {
-    use std::io::Write;
-    let dir = std::env::temp_dir();
-    let good = dir.join("cut_continue_after_missing_file.txt");
-    std::fs::File::create(&good)
-        .unwrap()
-        .write_all(b"x\n")
-        .unwrap();
-    let missing = dir.join("cut_continue_after_missing_file_nope.txt");
-    let _ = std::fs::remove_file(&missing);
+    let dir = plib::tmp::tempdir().unwrap();
+    let good = dir.path().join("good.txt");
+    std::fs::write(&good, b"x\n").unwrap();
+    let missing = dir.path().join("nope.txt");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_cut"))
         .arg("-c")
@@ -415,7 +410,6 @@ fn test_cut_continue_after_missing_file() {
         .arg(&good)
         .output()
         .unwrap();
-    let _ = std::fs::remove_file(&good);
 
     // The two readable files still produce output; the run exits non-zero.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "x\nx\n");

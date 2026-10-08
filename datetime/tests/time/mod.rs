@@ -179,13 +179,10 @@ fn reports_127_when_the_utility_is_not_found() {
 #[test]
 fn reports_126_when_the_utility_cannot_be_invoked() {
     // A regular, non-executable file: found, but not invocable.
-    let path = std::env::temp_dir().join(format!("posixutils_time_noexec_{}", std::process::id()));
-    std::fs::write(&path, b"").unwrap();
+    let path = plib::testing::TempFile::new("noexec", b"");
 
     let output = run_test_base("time", &[path.to_string_lossy().into_owned()], b"");
     assert_eq!(output.status.code(), Some(126));
-
-    let _ = std::fs::remove_file(&path);
 }
 
 // The timed utility may take its own options. Until 2026-08-06 `time` declared

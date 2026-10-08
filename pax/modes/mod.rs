@@ -13,6 +13,9 @@ pub(crate) mod anchored;
 pub mod append;
 pub mod copy;
 pub mod list;
+pub(crate) mod made;
+#[cfg(test)]
+pub(crate) mod race_hook;
 pub mod read;
 pub(crate) mod select;
 pub mod write;

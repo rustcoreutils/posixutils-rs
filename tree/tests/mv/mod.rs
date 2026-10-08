@@ -19,6 +19,8 @@ use std::os::unix::{
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+mod race;
+
 fn mv_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
@@ -1586,5 +1588,34 @@ fn test_mv_xdev_symlink_operand() {
     assert!(Path::new(real).exists(), "the referent was moved too");
 
     fs::remove_dir_all(other_dir).unwrap();
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// rename(2) needs write and search permission on the directories involved, not read
+// permission: a move within one filesystem out of, and into, directories of mode 0300 works,
+// in both synopsis forms, wherever mv cannot hold such a directory open.
+#[test]
+fn test_mv_within_unreadable_directories() {
+    let test_dir = &format!("{}/test_mv_unreadable_dirs", env!("CARGO_TARGET_TMPDIR"));
+    let _ = fs::remove_dir_all(test_dir);
+    let from = &format!("{test_dir}/from");
+    let to = &format!("{test_dir}/to");
+    fs::create_dir_all(from).unwrap();
+    fs::create_dir(to).unwrap();
+    fs::write(format!("{from}/a"), b"a").unwrap();
+    fs::write(format!("{from}/b"), b"b").unwrap();
+    for dir in [from, to] {
+        fs::set_permissions(dir, Permissions::from_mode(0o300)).unwrap();
+    }
+
+    mv_test(&[&format!("{from}/a"), &format!("{to}/a")], "", "", 0);
+    mv_test(&[&format!("{from}/b"), to], "", "", 0);
+
+    for dir in [from, to] {
+        fs::set_permissions(dir, Permissions::from_mode(0o700)).unwrap();
+    }
+    assert_eq!(fs::read(format!("{to}/a")).unwrap(), b"a");
+    assert_eq!(fs::read(format!("{to}/b")).unwrap(), b"b");
+    assert!(!Path::new(&format!("{from}/a")).exists());
     fs::remove_dir_all(test_dir).unwrap();
 }

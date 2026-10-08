@@ -464,11 +464,14 @@ fn test_chgrp_posix_h() {
 
     chgrp_test(&["-H", "-R", g2, dir1s, dir2], "", "", 0);
 
-    for file in [dir1, dir1_1f, dir2, dir2_2f, dir3] {
+    // Unlike GNU, the symlink 2/2s met inside the tree is changed itself, not
+    // the directory 3 it points to: POSIX leaves it unspecified under -H, and
+    // following it would change a file anywhere.
+    for file in [dir1, dir1_1f, dir2, dir2_2f, dir2_2s] {
         assert_eq!(file_gid(file).unwrap(), gid2);
     }
 
-    for file in [dir1s, dir2_2s, dir3_3f] {
+    for file in [dir1s, dir3, dir3_3f] {
         assert_eq!(file_gid(file).unwrap(), gid1);
     }
 
@@ -517,4 +520,65 @@ fn test_chgrp_recurse() {
     assert_eq!(file_gid(d_dd).unwrap(), gid1);
 
     fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// With -R -H only the operands are followed: a symlink met inside the tree
+/// is changed itself, never the file it points to (which may be anywhere,
+/// /etc/shadow included).
+#[test]
+fn test_chgrp_rh_does_not_follow_symlinks_inside_the_tree() {
+    let test_dir = &format!("{}/test_chgrp_rh_inner_link", env!("CARGO_TARGET_TMPDIR"));
+    let (d, outside, link) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/outside"),
+        &format!("{test_dir}/d/link"),
+    );
+    let (_, (g2, gid2)) = get_groups();
+
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::File::create(outside).unwrap();
+    unix::fs::symlink(outside, link).unwrap();
+    let outside_gid = file_gid(outside).unwrap();
+    assert_ne!(outside_gid, gid2);
+
+    chgrp_test(&["-R", "-H", &g2, d], "", "", 0);
+    let (outside_after, link_after) = (file_gid(outside).unwrap(), file_gid(link).unwrap());
+    fs::remove_dir_all(test_dir).unwrap();
+
+    assert_eq!(outside_after, outside_gid, "the link's target was changed");
+    assert_eq!(link_after, gid2, "the link itself was not changed");
+}
+
+/// chgrp changes only the group: it must pass no owner to chown, not the
+/// owner of whatever the walk saw. Through a symlink, the walk sees the
+/// link and chown acts on its target, and as root a stale owner hands the
+/// file to someone else. Linux's `/dev/stdin` is a root-owned symlink to
+/// this process's file descriptor 0, here a file this user owns: chgrp must
+/// change its group, not try to give it to root.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_chgrp_through_a_symlink_owned_by_another_user() {
+    let test_dir = &format!(
+        "{}/test_chgrp_symlink_other_owner",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let f = &format!("{test_dir}/f");
+    let (_, (g2, gid2)) = get_groups();
+
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+    assert_ne!(file_gid(f).unwrap(), gid2);
+
+    let output = std::process::Command::new(plib::testing::get_binary_path("chgrp"))
+        .args([g2.as_str(), "/dev/stdin"])
+        .stdin(fs::File::open(f).unwrap())
+        .output()
+        .unwrap();
+
+    let gid = file_gid(f).unwrap();
+    fs::remove_dir_all(test_dir).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(gid, gid2);
 }

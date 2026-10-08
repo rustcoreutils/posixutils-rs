@@ -333,11 +333,8 @@ fn pr_form_feed_multi_column_page_accounting() {
 // Option coverage and diagnostics
 // ---------------------------------------------------------------------------
 
-fn pr_tmp(tag: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-pr-{}-{}", std::process::id(), tag));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+fn pr_tmp(tag: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(tag, content)
 }
 
 #[test]
@@ -350,7 +347,6 @@ fn pr_double_space_output() {
         .expect("run pr");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "l1\n\nl2\n\n");
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -389,8 +385,6 @@ fn pr_merge_of_empty_files() {
         .expect("run pr");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -442,8 +436,6 @@ fn pr_form_feed_and_pause_without_a_terminal() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -471,7 +463,6 @@ fn pr_header_date_follows_lc_time() {
         header.contains(f.file_name().unwrap().to_str().unwrap()),
         "the header names the file, got {header:?}"
     );
-    let _ = std::fs::remove_file(f);
 }
 
 /// `pr` must name the file it could not open.
@@ -522,8 +513,7 @@ fn test_pr_r_still_suppresses_the_named_warning() {
 /// nothing to name; the failing path is the loop variable inside it.
 #[test]
 fn test_pr_merge_error_names_the_file() {
-    let good = std::env::temp_dir().join(format!("posixutils-pr-merge-{}", std::process::id()));
-    std::fs::write(&good, "one\ntwo\n").unwrap();
+    let good = pr_tmp("merge", "one\ntwo\n");
 
     let out = std::process::Command::new(plib::testing::get_binary_path("pr"))
         .arg("-m")
@@ -546,5 +536,4 @@ fn test_pr_merge_error_names_the_file() {
         "the readable operand must not be blamed: {stderr:?}"
     );
     assert_ne!(out.status.code(), Some(0));
-    let _ = std::fs::remove_file(good);
 }

@@ -253,16 +253,13 @@ fn uniq_count_with_multi_digit_counts() {
 
 #[test]
 fn uniq_reads_a_named_input_file() {
-    let mut f = std::env::temp_dir();
-    f.push(format!("posixutils-uniq-{}", std::process::id()));
-    std::fs::write(&f, "a\na\nb\n").expect("write temp file");
+    let f = plib::testing::TempFile::new("in", "a\na\nb\n");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_uniq"))
         .arg(f.to_str().unwrap())
         .output()
         .expect("run uniq");
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n");
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -307,8 +304,7 @@ fn test_uniq_error_names_utility_and_input_file() {
 /// input one -- the whole point of naming the file.
 #[test]
 fn test_uniq_error_distinguishes_output_file_from_input() {
-    let input = std::env::temp_dir().join(format!("posixutils-uniq-in-{}", std::process::id()));
-    std::fs::write(&input, "a\na\nb\n").unwrap();
+    let input = plib::testing::TempFile::new("in", "a\na\nb\n");
 
     let out = std::process::Command::new(plib::testing::get_binary_path("uniq"))
         .arg(&input)
@@ -326,5 +322,4 @@ fn test_uniq_error_distinguishes_output_file_from_input() {
         "the readable input must not be blamed: {stderr:?}"
     );
     assert_ne!(out.status.code(), Some(0));
-    let _ = std::fs::remove_file(input);
 }

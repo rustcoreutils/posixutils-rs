@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::fake_ssh::{read, FakeSsh};
 use plib::testing::{get_binary_path, run_test, run_test_with_checker, TestPlan};
 use std::fs;
 use std::io::Write;
@@ -396,4 +397,38 @@ fn test_uucp_combined_options() {
 
     // Cleanup
     fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// A remote-to-remote copy passes through a local temporary file. It must be
+/// made where no other user can have planted a name first: here a symlink to
+/// a victim file is planted at `$TMPDIR/uucp_<pid>`, the name uucp once
+/// wrote through, before uucp fetches the source.
+#[test]
+fn test_uucp_remote_to_remote_ignores_a_planted_temp_name() {
+    let fake = FakeSsh::new("uucp_r2r");
+    let (src, dst, victim) = (fake.join("src"), fake.join("dst"), fake.join("victim"));
+    fs::write(&src, "payload").unwrap();
+    fs::write(&victim, "victim").unwrap();
+    let plant = format!(
+        "[ -L \"$TMPDIR/uucp_$PPID\" ] || ln -s '{}' \"$TMPDIR/uucp_$PPID\"",
+        victim.display()
+    );
+    let src_spec = format!("hosta!{}", src.display());
+    let dst_spec = format!("hostb!{}", dst.display());
+
+    let output = fake.run("uucp", &[&src_spec, &dst_spec], &plant);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(read(&dst), "payload");
+    assert_eq!(
+        read(&victim),
+        "victim",
+        "uucp wrote through the planted link"
+    );
+    let left: Vec<String> = fake
+        .tmp_entries()
+        .into_iter()
+        .filter(|name| !name.starts_with("uucp_"))
+        .collect();
+    assert!(left.is_empty(), "temporaries left behind: {left:?}");
 }

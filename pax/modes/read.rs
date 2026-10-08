@@ -14,8 +14,9 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    chmod_at, create_replacing, link_replacing, make_dir_at, set_attrs_fd, set_owner, stat_at,
-    unlink_at, AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
+    attrs_withheld, create_replacing, link_replacing, make_dir_at, set_attrs_fd,
+    set_made_node_attrs, stat_at, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath,
+    PendingDirs,
 };
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
@@ -360,14 +361,15 @@ fn extract_entry<R: ArchiveReader>(
 
     match entry.entry_type {
         EntryType::Directory => {
-            if extract_directory(tree, pfd, name, entry, options)? {
+            let decided = extract_directory(tree, pfd, &member, entry, options)?;
+            archive.skip_data()?;
+            match decided {
                 // Its attributes are applied once the subtree exists, if it
                 // is still this directory then.
-                if let Some(st) = stat_at(pfd, name) {
-                    pending_dirs.push(&member, &st, attrs_of(entry, options));
-                }
+                DirAttrs::Apply(id) => pending_dirs.push(&member, id, attrs_of(entry, options)),
+                DirAttrs::Keep => {}
+                DirAttrs::Withheld(_) => return Err(attrs_withheld()),
             }
-            archive.skip_data()?;
         }
         EntryType::Symlink => {
             extract_symlink(pfd, name, entry, options)?;
@@ -441,15 +443,15 @@ fn copy_member_to_stdout<R: ArchiveReader>(
     Ok(())
 }
 
-/// Extract a directory. Returns whether its attributes should be applied later.
+/// Extract a directory, saying what becomes of its attributes.
 fn extract_directory(
     tree: &DirTree,
     dirfd: BorrowedFd<'_>,
-    name: &CStr,
+    member: &MemberPath,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<bool> {
-    make_dir_at(tree, dirfd, name, entry.mode, options.no_clobber)
+) -> PaxResult<DirAttrs> {
+    make_dir_at(tree, dirfd, member, entry.mode, options.no_clobber)
 }
 
 /// Extract a symlink
@@ -475,10 +477,7 @@ fn extract_symlink(
     })?;
 
     if created {
-        // No chmod: a symlink's own mode is meaningless, and
-        // fchmodat(AT_SYMLINK_NOFOLLOW) is not portable.
-        set_owner_at(dirfd, name, entry, options)?;
-        set_times_at(dirfd, name, entry, options)?;
+        set_made_attrs(dirfd, name, libc::S_IFLNK, entry, options)?;
     }
     Ok(())
 }
@@ -712,11 +711,12 @@ fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(Rc<Own
     (id_at(dir.as_fd(), &member.leaf) == Some(file)).then_some((dir, member.leaf))
 }
 
-/// The file at `name` below `dirfd`, opened without following a symlink or
-/// blocking, when it is still the file `file`. A failure only leaves the set
-/// unpinned.
+/// The file at `name` below `dirfd`, opened without following a symlink,
+/// blocking, or adopting a terminal as the controlling one, when it is still
+/// the file `file`. A failure only leaves the set unpinned.
 fn pin_file(dirfd: BorrowedFd<'_>, name: &CStr, file: (u64, u64)) -> Option<OwnedFd> {
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let flags =
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 {
         return None;
@@ -755,7 +755,7 @@ fn extract_device(
         EntryType::CharDevice => libc::S_IFCHR,
         _ => 0,
     };
-    // Created without the set-id bits; set_permissions_at applies the archived
+    // Created without the set-id bits; set_made_attrs applies the archived
     // mode below, once the node exists.
     let mode: libc::mode_t =
         (policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::mode_t) | type_bits;
@@ -779,9 +779,7 @@ fn extract_device(
         Err(e) => return Err(e),
     }
 
-    let owner_set = set_owner_at(dirfd, name, entry, options)?;
-    set_permissions_at(dirfd, name, entry, options, owner_set)?;
-    set_times_at(dirfd, name, entry, options)
+    set_made_attrs(dirfd, name, type_bits, entry, options)
 }
 
 /// Extract a FIFO
@@ -816,9 +814,7 @@ fn extract_fifo(
         Err(e) => return Err(e),
     }
 
-    let owner_set = set_owner_at(dirfd, name, entry, options)?;
-    set_permissions_at(dirfd, name, entry, options, owner_set)?;
-    set_times_at(dirfd, name, entry, options)
+    set_made_attrs(dirfd, name, libc::S_IFIFO, entry, options)
 }
 
 /// Extract a regular file, returning the (st_dev, st_ino) of the file created,
@@ -941,7 +937,7 @@ fn is_archive_newer(tree: &DirTree, entry: &ArchiveEntry) -> bool {
     };
     // A directory created here only to hold earlier members is not one.
     stat_at(parent.as_fd(), &member.leaf).is_none_or(|st| {
-        tree.is_implicit(&st)
+        tree.is_implicit(&st, &member)
             || (entry.mtime, i64::from(entry.mtime_nsec)) > tree.mtime_before_run(&st)
     })
 }
@@ -1011,83 +1007,23 @@ fn policy_of(options: &ReadOptions) -> AttrPolicy {
     }
 }
 
-/// Set file permissions on a name below `dirfd`, never through a symbolic
-/// link (`chmod_at`). Callers that hold a descriptor for the file should use
-/// `set_attrs_fd` instead, which cannot be redirected at all.
-fn set_permissions_at(
+/// The member's owner, mode and times, for the FIFO, device or symbolic link
+/// (`made_type`) just made for it at `name`: through the node itself, never
+/// by name (`set_made_node_attrs`).
+fn set_made_attrs(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
-    entry: &ArchiveEntry,
-    options: &ReadOptions,
-    owner_set: bool,
-) -> PaxResult<()> {
-    let mode = policy_of(options).mode(&attrs_of(entry, options), owner_set);
-    chmod_at(dirfd, name, mode)
-}
-
-/// Set file owner (uid/gid) - requires privileges. Returns whether it was set,
-/// which decides whether `set_permissions_at` may apply set-id bits.
-fn set_owner_at(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    entry: &ArchiveEntry,
-    options: &ReadOptions,
-) -> PaxResult<bool> {
-    if !options.preserve_owner {
-        return Ok(false);
-    }
-
-    let (uid, gid) = owner_ids(entry);
-    set_owner(uid, gid, |uid, gid| unsafe {
-        libc::fchownat(
-            dirfd.as_raw_fd(),
-            name.as_ptr(),
-            uid,
-            gid,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    })
-}
-
-/// Set file access and modification times
-fn set_times_at(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
+    made_type: libc::mode_t,
     entry: &ArchiveEntry,
     options: &ReadOptions,
 ) -> PaxResult<()> {
-    let Some(times) = policy_of(options).times(&attrs_of(entry, options)) else {
-        return Ok(());
-    };
-
-    let result = unsafe {
-        libc::utimensat(
-            dirfd.as_raw_fd(),
-            name.as_ptr(),
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        // EPERM means we don't have permission - warn but continue
-        if err.raw_os_error() == Some(libc::EPERM) {
-            eprintln!("pax: warning: cannot set times: Operation not permitted");
-        } else {
-            eprintln!("pax: warning: cannot set times: {}", err);
-        }
-        crate::error::note_error();
-    }
-
-    Ok(())
+    let attrs = attrs_of(entry, options);
+    set_made_node_attrs(dirfd, name, made_type, &attrs, &policy_of(options))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use plib::tmp::TempDir;
-    use std::os::unix::fs::PermissionsExt;
 
     /// POSIX, ustar Interchange Format: "When the file is restored by a
     /// privileged, protection-preserving version of the utility, the user and
@@ -1198,6 +1134,57 @@ mod tests {
         assert!(!rename_member(&mut linked(EntryType::Hardlink), &drop_b, 0));
     }
 
+    /// Without explicit `-p p`/`-p e` the mode a made node ends up with is
+    /// the archived mode masked by the umask (normal file-creation action);
+    /// with preservation the exact archived mode is restored.
+    #[test]
+    fn test_set_permissions_umask_vs_preserve() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = plib::tmp::TempDir::new().unwrap();
+        let path = tmp.path().join("member");
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+
+        // Attributes are applied relative to an open parent directory.
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        let name = CString::new("member").unwrap();
+        let entry = ArchiveEntry {
+            path: path.clone(),
+            mode: 0o777,
+            entry_type: EntryType::Fifo,
+            ..Default::default()
+        };
+        let mode = || {
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        // Not preserved: 0o777 & ~0o022 == 0o755.
+        let opts = ReadOptions {
+            preserve_perms: false,
+            preserve_mtime: false,
+            preserve_atime: false,
+            umask: 0o022,
+            ..Default::default()
+        };
+        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts).unwrap();
+        assert_eq!(mode(), 0o755);
+
+        // Preserved: exact 0o777 regardless of umask.
+        let opts = ReadOptions {
+            preserve_perms: true,
+            preserve_mtime: false,
+            preserve_atime: false,
+            umask: 0o022,
+            ..Default::default()
+        };
+        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts).unwrap();
+        assert_eq!(mode(), 0o777);
+    }
+
     #[test]
     fn test_strip_leading_components() {
         // The function takes and returns pathnames, which are bytes; the
@@ -1229,49 +1216,7 @@ mod tests {
             strip_leading_components(&crate::rawpath::from_bytes(b"a/n\xffm/c"), 1).unwrap();
         assert_eq!(crate::rawpath::as_bytes(&stripped), b"n\xffm/c");
     }
-
-    /// Without explicit `-p p`/`-p e` the extracted mode is the archived mode
-    /// masked by the umask (normal file-creation action); with preservation the
-    /// exact archived mode is restored.
-    #[test]
-    fn test_set_permissions_umask_vs_preserve() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("member");
-        std::fs::File::create(&path).unwrap();
-
-        // Attributes are applied relative to an open parent directory now.
-        let dir = std::fs::File::open(tmp.path()).unwrap();
-        let name = CString::new("member").unwrap();
-
-        let entry = ArchiveEntry {
-            path: path.clone(),
-            mode: 0o777,
-            entry_type: EntryType::Regular,
-            ..Default::default()
-        };
-
-        // Not preserved: 0o777 & ~0o022 == 0o755.
-        let opts = ReadOptions {
-            preserve_perms: false,
-            umask: 0o022,
-            ..Default::default()
-        };
-        set_permissions_at(dir.as_fd(), &name, &entry, &opts, false).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-
-        // Preserved: exact 0o777 regardless of umask.
-        let opts = ReadOptions {
-            preserve_perms: true,
-            umask: 0o022,
-            ..Default::default()
-        };
-        set_permissions_at(dir.as_fd(), &name, &entry, &opts, false).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o777
-        );
-    }
 }
+
+#[cfg(test)]
+mod race_tests;

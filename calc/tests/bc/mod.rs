@@ -276,32 +276,10 @@ fn test_bc_sparse_array() {
     test_bc("a[16777215]=7\na[16777215]\na[5]\nquit\n", "7\n0\n");
 }
 
-/// A fresh directory for one test's files, removed when dropped.
-struct TestDir(std::path::PathBuf);
-
-impl TestDir {
-    fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("posixutils-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        TestDir(path)
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// A file that exists but is not text is not an access failure.
 #[test]
 fn test_bc_non_text_file() {
-    let dir = TestDir::new("bc-nontext");
+    let dir = plib::tmp::tempdir().unwrap();
     let path = dir.path().join("binary.bc");
     std::fs::write(&path, b"1+1\n\xff\xfe\n").unwrap();
     let output = plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
@@ -339,7 +317,7 @@ fn test_bc_incomplete_input_at_eof() {
 /// operand or on standard input.
 #[test]
 fn test_bc_exit_status_is_consistent() {
-    let dir = TestDir::new("bc-status");
+    let dir = plib::tmp::tempdir().unwrap();
     for program in ["1/0\n", "1+\n"] {
         let path = dir.path().join("program.bc");
         std::fs::write(&path, program).unwrap();
@@ -363,7 +341,7 @@ fn test_bc_write_error_is_reported() {
         Ok(file) => file,
         Err(_) => return, // no /dev/full on this host
     };
-    let dir = TestDir::new("bc-write");
+    let dir = plib::tmp::tempdir().unwrap();
     let path = dir.path().join("program.bc");
     // Enough output to leave the buffer and reach the device.
     std::fs::write(&path, "for(i=0;i<5000;++i) i\n").unwrap();

@@ -17,13 +17,15 @@
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::common::{acquire_lock, find_binary, start_talkd, stop_talkd, test_socket_path};
+use crate::common::{
+    acquire_lock, find_binary, start_talkd, stop_talkd, test_socket_path, TestSocket,
+};
 
 // ============================================================================
 // Tests
@@ -356,7 +358,7 @@ impl Drop for TalkPeer {
 /// invitation on `callee == local_name && caller == remote_name`, so a
 /// self-directed call is the only pairing one test process can make.
 #[allow(clippy::type_complexity)]
-fn connected_peers() -> Option<(Child, PathBuf, TalkPeer, TalkPeer)> {
+fn connected_peers() -> Option<(Child, TestSocket, TalkPeer, TalkPeer)> {
     let talk = find_binary("talk")?;
     let socket = test_socket_path();
     let daemon = start_talkd(&socket)?;

@@ -15,9 +15,12 @@ use gettextrs::gettext;
 use plib::diag;
 use plib::io::input_stream;
 use plib::lzw::{UnixLZWReader, UnixLZWWriter};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+
+use fsat::{Dir, Entry, FileId, Kind};
 
 /// Conventional fallback when {NAME_MAX} cannot be queried.
 const NAME_MAX_FALLBACK: usize = 255;
@@ -155,7 +158,7 @@ fn merge_exit(current: i32, new: i32) -> i32 {
     }
 }
 
-/// Decide whether an existing output file may be overwritten.
+/// Decide whether an output file that already exists may be replaced.
 ///
 /// Returns `true` to proceed with the write, `false` to skip it (the caller
 /// then returns a non-zero exit code). Per POSIX (90427-90432), the overwrite
@@ -164,7 +167,7 @@ fn merge_exit(current: i32, new: i32) -> i32 {
 /// is not overwritten, with no prompt (so a pipeline's input stream is never
 /// consumed by `read_line`).
 fn may_overwrite(output_path: &Path, force: bool) -> bool {
-    if force || !output_path.exists() {
+    if force {
         return true;
     }
     if io::stdin().is_terminal() {
@@ -190,6 +193,314 @@ fn may_overwrite(output_path: &Path, force: bool) -> bool {
     }
 }
 
+/// Directory-relative file operations.
+///
+/// Every name compress reads, creates or removes for an operand is resolved
+/// in one directory opened once for that operand, so the input, the output
+/// and the removal all act in the same directory even if a component of its
+/// path is renamed meanwhile. Identities are compared by device and inode,
+/// so a name that comes to hold a different file is noticed instead of
+/// acted on.
+#[cfg(unix)]
+mod fsat {
+    use gettextrs::gettext;
+    use std::ffi::{CString, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    /// The identity of a file: its device and inode numbers, kept in the
+    /// C library's own types so `fstat` and `fstatat` results compare
+    /// without a conversion.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct FileId {
+        dev: libc::dev_t,
+        ino: libc::ino_t,
+    }
+
+    impl FileId {
+        /// The identity of an open file, from its `fstat`.
+        pub fn of(file: &File) -> io::Result<Self> {
+            let mut st = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: a valid descriptor and a buffer the call fills when
+            // it succeeds.
+            if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstat succeeded, so it filled `st`.
+            Ok(Self::from_stat(unsafe { st.assume_init_ref() }))
+        }
+
+        fn from_stat(st: &libc::stat) -> Self {
+            FileId {
+                dev: st.st_dev,
+                ino: st.st_ino,
+            }
+        }
+    }
+
+    /// The type of a directory entry itself, not of what a link names.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        Regular,
+        Symlink,
+        Directory,
+        Other,
+    }
+
+    /// What `lstat` reports about a directory entry.
+    pub struct Entry {
+        pub id: FileId,
+        pub kind: Kind,
+        pub links: libc::nlink_t,
+    }
+
+    impl Entry {
+        fn from_stat(st: &libc::stat) -> Self {
+            let kind = match st.st_mode & libc::S_IFMT {
+                libc::S_IFREG => Kind::Regular,
+                libc::S_IFLNK => Kind::Symlink,
+                libc::S_IFDIR => Kind::Directory,
+                _ => Kind::Other,
+            };
+            Entry {
+                id: FileId::from_stat(st),
+                kind,
+                links: st.st_nlink,
+            }
+        }
+    }
+
+    /// An open directory that names are resolved in.
+    pub struct Dir {
+        fd: OwnedFd,
+    }
+
+    impl Dir {
+        /// Open `path`, the directory holding an operand; "" is ".".
+        pub fn open(path: &Path) -> io::Result<Dir> {
+            let path = if path.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                path
+            };
+            let c = CString::new(path.as_os_str().as_bytes())?;
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+            // SAFETY: `c` is a valid NUL-terminated path for the call.
+            let fd = unsafe { libc::open(c.as_ptr(), flags) };
+            Ok(Dir { fd: owned(fd)? })
+        }
+
+        /// `lstat` of `name`: a symbolic link is reported as itself.
+        pub fn lstat(&self, name: &OsStr) -> io::Result<Entry> {
+            let c = CString::new(name.as_bytes())?;
+            let mut st = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: a valid directory descriptor, a valid NUL-terminated
+            // name, and a buffer the call fills when it succeeds.
+            let rc = unsafe {
+                libc::fstatat(
+                    self.fd.as_raw_fd(),
+                    c.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstatat succeeded, so it filled `st`.
+            Ok(Entry::from_stat(unsafe { st.assume_init_ref() }))
+        }
+
+        /// Open `name` for reading. `O_NONBLOCK` keeps the open of a FIFO
+        /// from waiting for a writer and `O_NOCTTY` keeps a terminal from
+        /// becoming the controlling one; the caller refuses anything but a
+        /// regular file before reading. Unless `follow`, a symbolic link is
+        /// refused (`ELOOP`) instead of followed.
+        pub fn open_read(&self, name: &OsStr, follow: bool) -> io::Result<File> {
+            let mut flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+            if !follow {
+                flags |= libc::O_NOFOLLOW;
+            }
+            self.openat(name, flags)
+        }
+
+        /// Create `name` for writing. `O_EXCL` with `O_NOFOLLOW` fails if
+        /// anything holds the name, a symbolic link (dangling or not)
+        /// included, so nothing is ever written through one. The mode is
+        /// 0600 until the caller sets the final one, so nobody else can
+        /// open the file while it is being filled.
+        pub fn create(&self, name: &OsStr) -> io::Result<File> {
+            let flags = libc::O_WRONLY
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_NOCTTY
+                | libc::O_CLOEXEC;
+            self.openat(name, flags)
+        }
+
+        fn openat(&self, name: &OsStr, flags: libc::c_int) -> io::Result<File> {
+            let c = CString::new(name.as_bytes())?;
+            // The mode is a variadic argument, so it is passed as an
+            // unsigned int, the type `mode_t` promotes to everywhere
+            // (`mode_t` is 16 bits on macOS).
+            let mode: libc::c_uint = 0o600;
+            // SAFETY: a valid directory descriptor and NUL-terminated name;
+            // the mode is read only under O_CREAT.
+            let fd = unsafe { libc::openat(self.fd.as_raw_fd(), c.as_ptr(), flags, mode) };
+            Ok(File::from(owned(fd)?))
+        }
+
+        /// Remove `name`, which is not a directory.
+        pub fn unlink(&self, name: &OsStr) -> io::Result<()> {
+            let c = CString::new(name.as_bytes())?;
+            // SAFETY: a valid directory descriptor and NUL-terminated name.
+            if unsafe { libc::unlinkat(self.fd.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        /// Remove `name` only if it still holds the file `id`. POSIX has no
+        /// unlink by descriptor, so a swap between this check and the
+        /// unlink is the one window left; it needs write access to this
+        /// directory and removes only the swapped-in entry.
+        pub fn unlink_if(&self, name: &OsStr, id: FileId) -> io::Result<()> {
+            if self.lstat(name)?.id != id {
+                return Err(io::Error::other(gettext(
+                    "replaced by another file while being processed",
+                )));
+            }
+            self.unlink(name)
+        }
+    }
+
+    /// Take ownership of a descriptor an open call returned, or of its error.
+    fn owned(fd: libc::c_int) -> io::Result<OwnedFd> {
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by a successful open, and nothing
+        // else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+/// Path-based stand-ins for the directory-relative operations on Windows,
+/// which has no `openat`. Stable Rust exposes no file identity there, so
+/// every identity compares equal and a removal rests on the name alone.
+#[cfg(windows)]
+mod fsat {
+    use std::ffi::OsStr;
+    use std::fs::{self, File};
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// A file identity that Windows cannot supply: all compare equal.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct FileId;
+
+    impl FileId {
+        pub fn of(_file: &File) -> io::Result<Self> {
+            Ok(FileId)
+        }
+    }
+
+    /// The type of a directory entry itself, not of what a link names.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Kind {
+        Regular,
+        Symlink,
+        Directory,
+        Other,
+    }
+
+    /// What `symlink_metadata` reports about a directory entry. Stable Rust
+    /// exposes no link count on Windows, so a file counts as its only link.
+    pub struct Entry {
+        pub id: FileId,
+        pub kind: Kind,
+        pub links: u64,
+    }
+
+    /// The directory that names are resolved in, by path.
+    pub struct Dir {
+        path: PathBuf,
+    }
+
+    impl Dir {
+        pub fn open(path: &Path) -> io::Result<Dir> {
+            Ok(Dir {
+                path: path.to_path_buf(),
+            })
+        }
+
+        pub fn lstat(&self, name: &OsStr) -> io::Result<Entry> {
+            let file_type = fs::symlink_metadata(self.path.join(name))?.file_type();
+            let kind = if file_type.is_symlink() {
+                Kind::Symlink
+            } else if file_type.is_dir() {
+                Kind::Directory
+            } else if file_type.is_file() {
+                Kind::Regular
+            } else {
+                Kind::Other
+            };
+            Ok(Entry {
+                id: FileId,
+                kind,
+                links: 1,
+            })
+        }
+
+        pub fn open_read(&self, name: &OsStr, _follow: bool) -> io::Result<File> {
+            File::open(self.path.join(name))
+        }
+
+        /// Create `name`; `create_new` (CREATE_NEW) fails if anything,
+        /// a symbolic link included, already holds the name.
+        pub fn create(&self, name: &OsStr) -> io::Result<File> {
+            File::options()
+                .write(true)
+                .create_new(true)
+                .open(self.path.join(name))
+        }
+
+        /// Remove `name`, clearing its read-only attribute first. Windows
+        /// will not delete a read-only file wherever
+        /// FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE is not honoured (Wine,
+        /// older Windows), and compress copies that attribute onto its
+        /// output, so both the input removal and the back-out of the output
+        /// depend on this. A file that still cannot be removed gets its
+        /// attribute back, so a failure leaves it as it was.
+        pub fn unlink(&self, name: &OsStr) -> io::Result<()> {
+            let path = self.path.join(name);
+            let mut perms = fs::symlink_metadata(&path)?.permissions();
+            if !perms.readonly() {
+                return fs::remove_file(&path);
+            }
+            let original = perms.clone();
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows only: clears the read-only attribute, no Unix mode bits"
+            )]
+            perms.set_readonly(false);
+            fs::set_permissions(&path, perms)?;
+            fs::remove_file(&path).inspect_err(|_| {
+                let _ = fs::set_permissions(&path, original);
+            })
+        }
+
+        pub fn unlink_if(&self, name: &OsStr, _id: FileId) -> io::Result<()> {
+            self.unlink(name)
+        }
+    }
+}
+
 /// Saved file metadata for preservation
 struct FileMetadata {
     /// The mode on Unix; the read-only attribute on Windows.
@@ -200,8 +511,8 @@ struct FileMetadata {
 }
 
 impl FileMetadata {
-    fn from_path(path: &Path) -> io::Result<Self> {
-        let meta = fs::metadata(path)?;
+    /// The attributes of the input, from the `fstat` of its descriptor.
+    fn of(meta: &fs::Metadata) -> io::Result<Self> {
         Ok(Self {
             permissions: meta.permissions(),
             #[cfg(unix)]
@@ -215,43 +526,202 @@ impl FileMetadata {
         })
     }
 
-    /// Apply the saved metadata to the output at `path`, whose write handle
-    /// `file` is still open.
-    fn apply_to(&self, file: &File, path: &Path) -> io::Result<()> {
-        // Restore ownership before the mode bits: chown() clears the
-        // set-user-ID / set-group-ID bits, so it must run first. Best effort —
-        // only a sufficiently privileged process succeeds, so the result is
-        // intentionally ignored (spec 90389-90392).
-        #[cfg(unix)]
-        {
-            use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
+    /// Give the output, through its still-open descriptor, the saved owner,
+    /// then mode, then times. Each is best effort: the spec (90389-90392)
+    /// asks for them only when the process has sufficient privilege, and
+    /// the output is already complete and correct, so a failure must not
+    /// turn into a non-zero exit. A step that fails leaves the output no
+    /// more open than the 0600 it was created with.
+    ///
+    /// The times go through the descriptor too, so neither the umask (which
+    /// may have created the file without owner write) nor the mode set just
+    /// before can keep them from being set; set_times keeps nanoseconds
+    /// (futimens on Unix), so a preserved time compares equal to the one it
+    /// came from.
+    fn apply_to(&self, out: &File) {
+        let permissions = self.restore_owner(out);
+        let _ = out.set_permissions(permissions);
+        let _ = out.set_times(self.times);
+    }
 
-            let path_cstr = CString::new(path.as_os_str().as_bytes())?;
-            unsafe {
-                libc::chown(path_cstr.as_ptr(), self.owner.0, self.owner.1);
+    /// Give `out` the saved owner and return the mode to set afterwards.
+    /// The owner goes first because chown clears the set-user-ID and
+    /// set-group-ID bits; and each of those bits is kept only if the output
+    /// really ended up with the input's user or group, so a chown refused
+    /// for lack of privilege never yields a set-ID file owned by the user
+    /// who ran compress.
+    #[cfg(unix)]
+    fn restore_owner(&self, out: &File) -> fs::Permissions {
+        use std::os::unix::fs::{fchown, MetadataExt, PermissionsExt};
+
+        const SET_UID: u32 = 0o4000;
+        const SET_GID: u32 = 0o2000;
+
+        let (uid, gid) = self.owner;
+        let _ = fchown(out, Some(uid), Some(gid));
+        let mut mode = self.permissions.mode() & 0o7777;
+        match out.metadata() {
+            Ok(now) => {
+                if now.uid() != uid {
+                    mode &= !SET_UID;
+                }
+                if now.gid() != gid {
+                    mode &= !SET_GID;
+                }
             }
+            Err(_) => mode &= !(SET_UID | SET_GID),
         }
+        fs::Permissions::from_mode(mode)
+    }
 
-        // The times go through the write handle the caller already holds, so
-        // neither the umask (which may have created the file without owner
-        // write) nor the mode restored below can keep them from being set; a
-        // reopen by path would be refused in either case. set_times keeps
-        // nanoseconds (futimens on Unix), so a preserved time compares equal
-        // to the one it came from. Best effort, like the chown: timestamp
-        // preservation is a courtesy on top of an output file that is already
-        // complete and correct, so a failure here must not turn into a
-        // non-zero exit. Both call sites discard this function's result for
-        // that reason.
-        let _ = file.set_times(self.times);
-
-        fs::set_permissions(path, self.permissions.clone())
+    /// Windows has no ownership to restore; the read-only attribute is all
+    /// the "mode" there is.
+    #[cfg(windows)]
+    fn restore_owner(&self, _out: &File) -> fs::Permissions {
+        self.permissions.clone()
     }
 }
 
-/// Check for multiple hard links
-fn check_hard_links(path: &Path, force: bool) -> io::Result<bool> {
-    let links = link_count(path)?;
+/// The last component of `path`, or an error for a path without one.
+fn file_name(path: &Path) -> io::Result<&OsStr> {
+    path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            gettext("input path has no filename"),
+        )
+    })
+}
+
+/// An operand that is replaced by its compressed or decompressed form. It is
+/// opened once, read and given its attributes through that descriptor, and
+/// removed only while its name still holds what was opened.
+struct Input {
+    path: PathBuf,
+    dir: Dir,
+    name: OsString,
+    entry: Entry,
+    file: File,
+    metadata: FileMetadata,
+}
+
+impl Input {
+    /// Open `path`, which must be a regular file or a symbolic link to one.
+    /// A link is followed (the operand names the file the user means) and
+    /// it is the link that is removed afterwards. Any other type is refused
+    /// before it is read, so a FIFO cannot hang the run.
+    fn open(path: &Path) -> io::Result<Input> {
+        let name = file_name(path)?.to_os_string();
+        let dir = Dir::open(path.parent().unwrap_or(Path::new("")))?;
+        let entry = dir.lstat(&name)?;
+        let file = match entry.kind {
+            // Not following here means a link swapped in after the lstat
+            // is refused rather than read.
+            Kind::Regular => dir.open_read(&name, false)?,
+            Kind::Symlink => dir.open_read(&name, true)?,
+            Kind::Directory | Kind::Other => return Err(not_regular()),
+        };
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(not_regular());
+        }
+        if entry.kind == Kind::Regular && FileId::of(&file)? != entry.id {
+            return Err(io::Error::other(gettext(
+                "replaced by another file while being opened",
+            )));
+        }
+        Ok(Input {
+            path: path.to_path_buf(),
+            dir,
+            name,
+            entry,
+            metadata: FileMetadata::of(&meta)?,
+            file,
+        })
+    }
+
+    fn read_all(&mut self) -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        self.file.read_to_end(&mut data)?;
+        Ok(data)
+    }
+
+    /// Write `data` to the new file `output` beside the input, give it the
+    /// input's attributes, and remove the input. Returns the exit status
+    /// for the operand; a refusal has already been reported.
+    fn replace_with(&self, output: &Path, data: &[u8], force: bool) -> io::Result<i32> {
+        let out_name = file_name(output)?;
+        let Some(mut out) = create_output(&self.dir, out_name, output, force)? else {
+            return Ok(1);
+        };
+        let out_id = FileId::of(&out)?;
+        if let Err(e) = out.write_all(data) {
+            let _ = self.dir.unlink_if(out_name, out_id);
+            return Err(e);
+        }
+        self.metadata.apply_to(&out);
+        drop(out);
+
+        // If the input cannot be removed, back out the output so we do not
+        // leave both files behind, and report a non-zero status
+        // (spec 90393-90400).
+        if let Err(e) = self.dir.unlink_if(&self.name, self.entry.id) {
+            let _ = self.dir.unlink_if(out_name, out_id);
+            diag::error(&format!(
+                "{}: {}: {}",
+                self.path.display(),
+                gettext("cannot remove input"),
+                diag::io_error_text(&e)
+            ));
+            return Ok(1);
+        }
+        Ok(0)
+    }
+}
+
+fn not_regular() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, gettext("not a regular file"))
+}
+
+/// Create the output file `name` in `dir`, shown to the user as `path`.
+///
+/// Whatever already holds the name is judged by `lstat`, so a symbolic
+/// link, dangling or not, counts as an existing file: it is replaced only
+/// with `-f` or a yes at the prompt, and then by unlinking it and creating
+/// the output afresh, never by writing through it. A directory is never
+/// replaced. If another entry appears between the unlink and the create,
+/// the exclusive create fails and that is reported, not retried.
+fn create_output(dir: &Dir, name: &OsStr, path: &Path, force: bool) -> io::Result<Option<File>> {
+    match dir.lstat(name) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(entry) if entry.kind == Kind::Directory => {
+            diag::error(&format!(
+                "{}: {}",
+                path.display(),
+                gettext("is a directory; not overwritten")
+            ));
+            return Ok(None);
+        }
+        Ok(_) => {
+            if !may_overwrite(path, force) {
+                return Ok(None);
+            }
+            match dir.unlink(name) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+    }
+    dir.create(name).map(Some)
+}
+
+/// Warn about, but do not refuse, a multiply-linked input that is to be
+/// removed (spec 90403-90406), unless `-f` was given. Returns whether to
+/// go ahead.
+/// `links` is the platform's own link-count type (`nlink_t` is 16 to 64
+/// bits wide depending on the target).
+fn check_hard_links(path: &Path, links: impl Into<u64>, force: bool) -> bool {
+    let links: u64 = links.into();
     if links > 1 {
         diag::warning(&format!(
             "{}: {}",
@@ -259,57 +729,10 @@ fn check_hard_links(path: &Path, force: bool) -> io::Result<bool> {
             gettext!("has {} hard links", links)
         ));
         if !force {
-            return Ok(false);
+            return false;
         }
     }
-    Ok(true)
-}
-
-/// The number of hard links to `path`.
-#[cfg(unix)]
-fn link_count(path: &Path) -> io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(fs::metadata(path)?.nlink())
-}
-
-/// The number of hard links to `path`. Stable Rust exposes no link count on
-/// Windows, so a file there counts as its only link; a stat failure is still
-/// reported.
-#[cfg(windows)]
-fn link_count(path: &Path) -> io::Result<u64> {
-    fs::metadata(path)?;
-    Ok(1)
-}
-
-/// Remove `path`. On Unix, removal is governed by the directory's
-/// permissions, not the file's, so a read-only file is removed as is.
-#[cfg(unix)]
-fn remove_file(path: &Path) -> io::Result<()> {
-    fs::remove_file(path)
-}
-
-/// Remove `path`, clearing its read-only attribute first. Windows will not
-/// delete a read-only file wherever FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
-/// is not honoured (Wine, older Windows), and compress copies that attribute
-/// onto its output, so both the input removal and the back-out of the output
-/// depend on this. A file that still cannot be removed gets its attribute
-/// back, so a failure leaves it as it was.
-#[cfg(windows)]
-fn remove_file(path: &Path) -> io::Result<()> {
-    let mut perms = fs::symlink_metadata(path)?.permissions();
-    if !perms.readonly() {
-        return fs::remove_file(path);
-    }
-    let original = perms.clone();
-    #[expect(
-        clippy::permissions_set_readonly_false,
-        reason = "Windows only: clears the read-only attribute, no Unix mode bits"
-    )]
-    perms.set_readonly(false);
-    fs::set_permissions(path, perms)?;
-    fs::remove_file(path).inspect_err(|_| {
-        let _ = fs::set_permissions(path, original);
-    })
+    true
 }
 
 /// Check if output path would exceed PATH_MAX
@@ -430,12 +853,7 @@ fn get_compress_algorithm(args: &Args) -> io::Result<Algorithm> {
 
 /// Build output path for compression
 fn compress_output_path(input: &Path, algo: Algorithm) -> io::Result<PathBuf> {
-    let file_name = input.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            gettext("input path has no filename"),
-        )
-    })?;
+    let file_name = file_name(input)?;
     let fname = format!("{}{}", file_name.to_string_lossy(), algo.suffix());
 
     let parent = input.parent();
@@ -504,10 +922,29 @@ fn find_decompress_input(pathname: &Path) -> PathBuf {
     with_z
 }
 
+/// Validate `-b` and compress `data` with `algo`.
+fn compress_data(args: &Args, algo: Algorithm, data: &[u8]) -> io::Result<Vec<u8>> {
+    if let Some(bits) = args.bits {
+        validate_bits(algo, bits)?;
+    }
+    match algo {
+        Algorithm::Lzw => compress_lzw(data, args.bits),
+        Algorithm::Deflate => compress_gzip(data, args.bits),
+    }
+}
+
+/// The space saved, as a percentage of the input size.
+fn compression_ratio(inp_size: usize, out_size: usize) -> f64 {
+    if inp_size > 0 {
+        100.0 - (out_size as f64 / inp_size as f64) * 100.0
+    } else {
+        0.0
+    }
+}
+
 /// Process a single file for compression
 fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i32> {
     let reading_stdin = is_stdin(pathname);
-    let writing_to_stdout = args.stdout || reading_stdin;
 
     // Warn if input already has compression suffix
     if !reading_stdin {
@@ -522,156 +959,101 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
         }
     }
 
-    // Check hard links only when the input will actually be unlinked. Under
-    // -c (or stdin) the input is never removed, so the multi-link guard
-    // (spec 90403-90406, about files "to be removed after processing") does
-    // not apply.
-    if !writing_to_stdout && !check_hard_links(pathname, args.force)? {
+    if args.stdout || reading_stdin {
+        compress_to_stdout(args, pathname, algo)
+    } else {
+        compress_in_place(args, pathname, algo)
+    }
+}
+
+/// Compress `pathname` (or standard input) to standard output. No file is
+/// changed, so the operand may be of any type that can be read.
+fn compress_to_stdout(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i32> {
+    let mut inp_buf = Vec::new();
+    input_stream(pathname, true)?.read_to_end(&mut inp_buf)?;
+    let out_buf = compress_data(args, algo, &inp_buf)?;
+    io::stdout().write_all(&out_buf)?;
+    if args.verbose && !is_stdin(pathname) {
+        let ratio = compression_ratio(inp_buf.len(), out_buf.len());
+        eprintln!(
+            "{}",
+            gettext!("{}: Compression: {:.1}%", pathname.display(), ratio)
+        );
+    }
+    Ok(0)
+}
+
+/// Replace the file `pathname` with its compressed form.
+fn compress_in_place(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i32> {
+    let mut input = Input::open(pathname)?;
+    if !check_hard_links(pathname, input.entry.links, args.force) {
         return Ok(1);
     }
-
-    // Read input
-    let mut file = input_stream(pathname, true)?;
-    let orig_metadata = if !reading_stdin {
-        Some(FileMetadata::from_path(pathname)?)
-    } else {
-        None
-    };
-
-    let mut inp_buf = Vec::new();
-    file.read_to_end(&mut inp_buf)?;
-    let inp_buf_size = inp_buf.len();
-
-    // Validate bits if specified
-    if let Some(bits) = args.bits {
-        validate_bits(algo, bits)?;
-    }
-
-    // Compress
-    let out_buf = match algo {
-        Algorithm::Lzw => compress_lzw(&inp_buf, args.bits)?,
-        Algorithm::Deflate => compress_gzip(&inp_buf, args.bits)?,
-    };
-    let out_buf_size = out_buf.len();
-
-    if writing_to_stdout {
-        io::stdout().write_all(&out_buf)?;
-        if args.verbose && !reading_stdin {
-            let ratio = if inp_buf_size > 0 {
-                100.0 - (out_buf_size as f64 / inp_buf_size as f64) * 100.0
-            } else {
-                0.0
-            };
-            eprintln!(
-                "{}",
-                gettext!("{}: Compression: {:.1}%", pathname.display(), ratio)
-            );
-        }
-        return Ok(0);
-    }
-
-    // File replacement mode
-    if out_buf_size >= inp_buf_size && !args.force {
+    let inp_buf = input.read_all()?;
+    let out_buf = compress_data(args, algo, &inp_buf)?;
+    if out_buf.len() >= inp_buf.len() && !args.force {
         return Ok(2);
     }
 
     let output_path = compress_output_path(pathname, algo)?;
-
-    // Check for existing file (terminal-gated prompt per #C1)
-    if !may_overwrite(&output_path, args.force) {
-        return Ok(1);
-    }
-
-    // Write compressed file, then apply metadata while the handle is open
-    let mut f = File::create(&output_path)?;
-    f.write_all(&out_buf)?;
-    if let Some(ref meta) = orig_metadata {
-        let _ = meta.apply_to(&f, &output_path);
-    }
-    drop(f);
-
-    // Remove original. If it cannot be removed, back out the output so we do
-    // not leave both files behind, and report a non-zero status
-    // (spec 90393-90400).
-    if let Err(e) = remove_file(pathname) {
-        let _ = remove_file(&output_path);
-        diag::error(&format!(
-            "{}: {}: {}",
-            pathname.display(),
-            gettext("cannot remove input"),
-            e
-        ));
-        return Ok(1);
-    }
-
-    if args.verbose {
-        let ratio = if inp_buf_size > 0 {
-            100.0 - (out_buf_size as f64 / inp_buf_size as f64) * 100.0
-        } else {
-            0.0
-        };
+    let status = input.replace_with(&output_path, &out_buf, args.force)?;
+    if status == 0 && args.verbose {
         eprintln!(
             "{}",
             gettext!(
                 "{}: -- replaced with {} Compression: {:.1}%",
                 pathname.display(),
                 output_path.display(),
-                ratio
+                compression_ratio(inp_buf.len(), out_buf.len())
             )
         );
     }
-
-    Ok(0)
+    Ok(status)
 }
 
 /// Process a single file for decompression
 fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
-    let reading_stdin = is_stdin(pathname);
-    let writing_to_stdout = args.stdout || reading_stdin;
+    if args.stdout || is_stdin(pathname) {
+        decompress_to_stdout(args, pathname)
+    } else {
+        decompress_in_place(args, pathname)
+    }
+}
 
-    // Find actual input file
+/// Decompress `pathname` (or standard input) to standard output. No file
+/// is changed, so the operand may be of any type that can be read.
+fn decompress_to_stdout(args: &Args, pathname: &Path) -> io::Result<i32> {
+    let reading_stdin = is_stdin(pathname);
     let input_path = if reading_stdin {
         pathname.to_path_buf()
     } else {
         find_decompress_input(pathname)
     };
 
-    // Check hard links only when the input will actually be unlinked
-    // (not under -c / stdin); see #C2.
-    if !writing_to_stdout && !check_hard_links(&input_path, args.force)? {
+    let mut compressed_data = Vec::new();
+    input_stream(&input_path, true)?.read_to_end(&mut compressed_data)?;
+    let decompressed = decompress_auto(&compressed_data)?;
+    io::stdout().write_all(&decompressed)?;
+    if args.verbose && !reading_stdin {
+        eprintln!("{}", gettext!("{}: -- decompressed", input_path.display()));
+    }
+    Ok(0)
+}
+
+/// Replace the compressed file named by `pathname` with its decompressed
+/// form.
+fn decompress_in_place(args: &Args, pathname: &Path) -> io::Result<i32> {
+    let input_path = find_decompress_input(pathname);
+    let mut input = Input::open(&input_path)?;
+    if !check_hard_links(&input_path, input.entry.links, args.force) {
         return Ok(1);
     }
-
-    // Save metadata
-    let orig_metadata = if !reading_stdin {
-        Some(FileMetadata::from_path(&input_path)?)
-    } else {
-        None
-    };
-
-    // Read compressed data
-    let mut file = input_stream(&input_path, true)?;
-    let mut compressed_data = Vec::new();
-    file.read_to_end(&mut compressed_data)?;
-
-    // Decompress with auto-detection
-    let decompressed = decompress_auto(&compressed_data)?;
-    let decompressed_size = decompressed.len();
-
-    if writing_to_stdout {
-        io::stdout().write_all(&decompressed)?;
-        if args.verbose && !reading_stdin {
-            eprintln!("{}", gettext!("{}: -- decompressed", input_path.display()));
-        }
-        return Ok(0);
-    }
-
-    // File output mode
-    let output_path = decompress_output_path(&input_path);
+    let decompressed = decompress_auto(&input.read_all()?)?;
 
     // Refuse when the input has no known suffix to strip, so the output path
     // equals the input path: writing the decompressed bytes and then removing
     // the input would destroy the result (#C3, data loss).
+    let output_path = decompress_output_path(&input_path);
     if output_path == input_path {
         diag::error(&format!(
             "{}: {}",
@@ -681,46 +1063,19 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
         return Ok(1);
     }
 
-    // Check for existing output (terminal-gated prompt per #C1)
-    if !may_overwrite(&output_path, args.force) {
-        return Ok(1);
-    }
-
-    // Write decompressed file, then apply metadata while the handle is open
-    let mut f = File::create(&output_path)?;
-    f.write_all(&decompressed)?;
-    if let Some(ref meta) = orig_metadata {
-        let _ = meta.apply_to(&f, &output_path);
-    }
-    drop(f);
-
-    // Remove compressed file. If it cannot be removed, back out the output so
-    // we do not leave both files behind, and report a non-zero status
-    // (spec 90393-90400).
-    if let Err(e) = remove_file(&input_path) {
-        let _ = remove_file(&output_path);
-        diag::error(&format!(
-            "{}: {}: {}",
-            input_path.display(),
-            gettext("cannot remove input"),
-            e
-        ));
-        return Ok(1);
-    }
-
-    if args.verbose {
+    let status = input.replace_with(&output_path, &decompressed, args.force)?;
+    if status == 0 && args.verbose {
         eprintln!(
             "{}",
             gettext!(
                 "{}: -- replaced with {} ({} bytes)",
                 input_path.display(),
                 output_path.display(),
-                decompressed_size
+                decompressed.len()
             )
         );
     }
-
-    Ok(0)
+    Ok(status)
 }
 
 fn main() {

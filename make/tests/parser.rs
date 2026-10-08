@@ -242,8 +242,8 @@ all:
     // to be handed an empty table, so this was always UndefinedMacro.
     #[test]
     fn test_include_path_may_use_a_macro() {
-        let dir = std::env::temp_dir().join("make_preproc_include_macro");
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
         let inc = dir.join("inc.mk");
         std::fs::write(&inc, "included:\n\t@echo from-include\n").unwrap();
 
@@ -252,8 +252,6 @@ all:
             .expect("include with a macro in its path")
             .text;
         assert!(text.contains("from-include"), "got: {text:?}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -544,13 +542,11 @@ mod conditionals {
     // Audit #32: a self-including file used to loop forever.
     #[test]
     fn include_recursion_is_capped() {
-        let dir = std::env::temp_dir().join("make_include_cycle_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("self.mk");
+        let dir = plib::tmp::tempdir().unwrap();
+        let f = dir.path().join("self.mk");
         std::fs::write(&f, format!("include {}\n", f.display())).unwrap();
         let src = format!("include {}\nall:\n\techo hi\n", f.display());
         assert!(preprocess(&src).is_err(), "self-include must not loop");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Audit #32: `A = $(A)x` used to grow the text forever.
@@ -707,8 +703,8 @@ mod functions {
 
     #[test]
     fn wildcard_lists_matching_files() {
-        let dir = std::env::temp_dir().join("make_wildcard_probe");
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
         std::fs::write(dir.join("one.c"), "").unwrap();
         std::fs::write(dir.join("two.c"), "").unwrap();
         std::fs::write(dir.join("skip.h"), "").unwrap();
@@ -717,7 +713,6 @@ mod functions {
         assert!(out.contains("one.c"), "got: {out:?}");
         assert!(out.contains("two.c"), "got: {out:?}");
         assert!(!out.contains("skip.h"), "got: {out:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

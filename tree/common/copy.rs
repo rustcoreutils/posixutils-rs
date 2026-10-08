@@ -575,8 +575,16 @@ fn preserve_node_attributes(
 
     let times = source_times(source_md);
     let symlink = made_type == ftw::FileType::SymbolicLink;
-    utimens_pinned(dirfd, name, &pinned, symlink, &times)
-        .map_err(|e| preserve_times_error(target, &e))?;
+    match utimens_pinned(dirfd, name, &pinned, symlink, &times) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(io::Error::other(gettext!(
+                "'{}' was replaced during the copy",
+                target.display()
+            )))
+        }
+        Err(e) => return Err(preserve_times_error(target, &e)),
+    }
     if trust == MadeTrust::ParentOwnerOnly {
         return Err(owner_unverified_error(target));
     }
@@ -603,7 +611,8 @@ fn preserve_node_attributes(
 /// exactly the pinned inode. A symbolic link has no such route -- that path is followed to the
 /// link and then through it -- so its times go by name with `AT_SYMLINK_NOFOLLOW`, only once a
 /// fresh `lstat` shows the name still holds the pinned link (`utimens_link_if_still`, whose
-/// residual -- a wrong mtime, at worst -- is documented there).
+/// residual -- a wrong mtime, at worst -- is documented there). `false` when the name no longer
+/// does, for the caller to report against the full target path.
 #[cfg(target_os = "linux")]
 fn utimens_pinned(
     dirfd: libc::c_int,
@@ -611,10 +620,10 @@ fn utimens_pinned(
     pinned: &fs::File,
     symlink: bool,
     times: &[libc::timespec; 2],
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let fd = pinned.as_raw_fd();
     if unsafe { libc::utimensat(fd, c"".as_ptr(), times.as_ptr(), libc::AT_EMPTY_PATH) } == 0 {
-        return Ok(());
+        return Ok(true);
     }
     let e = io::Error::last_os_error();
     if e.raw_os_error() != Some(libc::EINVAL) {
@@ -622,20 +631,14 @@ fn utimens_pinned(
     }
     if symlink {
         let md = pinned.metadata()?;
-        if utimens_link_if_still(dirfd, name, (md.dev(), md.ino()), times)? {
-            return Ok(());
-        }
-        return Err(io::Error::other(gettext!(
-            "'{}' was replaced during the copy",
-            name.to_string_lossy()
-        )));
+        return utimens_link_if_still(dirfd, name, (md.dev(), md.ino()), times);
     }
     let proc_dir = procfs_dir()?;
     let path = proc_fd_name(fd);
     if unsafe { libc::utimensat(proc_dir.as_raw_fd(), path.as_ptr(), times.as_ptr(), 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(not(target_os = "linux"))]

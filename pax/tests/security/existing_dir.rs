@@ -179,6 +179,38 @@ fn test_pe_stamps_an_existing_directory_in_a_destination_of_the_users_private_gr
     }
 }
 
+/// An ACL entry naming another user widens the group bits of the mode to the
+/// ACL's mask: a destination of the user's private group, 0755 but for an
+/// ACL granting someone else write, shows 0775 -- and others can create
+/// entries in it. Under -p e the existing directory keeps its mode, in both
+/// modes.
+#[test]
+fn test_pe_leaves_an_existing_directory_alone_where_an_acl_lets_others_write() {
+    if plib::testing::user_private_group().is_none() {
+        eprintln!("note: this host gives the user no private group; test skipped");
+        return;
+    }
+    for copy in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let archive = archive_with_open_directory(&temp);
+        let src = temp.path().join("src");
+        let dest = dest_with_private_d(&temp, 0o755);
+        if !plib::testing::grant_named_acl(&dest) {
+            return;
+        }
+        assert_eq!(mode_of(&dest), 0o775, "the mask shows in the group bits");
+        let out = if copy {
+            pax(&src, &["-rw", "-p", "e", "d", dest.to_str().unwrap()])
+        } else {
+            pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()])
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(mode_of(&dest.join("d")), 0o700, "copy={copy}: opened up");
+        assert_eq!(out.status.code(), Some(1), "copy={copy}: stderr: {stderr}");
+        assert!(stderr.contains(DIAGNOSTIC), "copy={copy}: stderr: {stderr}");
+    }
+}
+
 /// In a destination only the user can create entries in, -p e gives an
 /// existing directory the member's mode, as POSIX describes.
 #[test]

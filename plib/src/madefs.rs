@@ -240,7 +240,7 @@ impl ChainTrust {
     /// entries.
     pub fn anchor(anchor_fd: RawFd) -> io::Result<Self> {
         Ok(ChainTrust {
-            entries_safe: nobody_else_can_create_in(anchor_fd)?,
+            entries_safe: nobody_else_can_create(anchor_fd)?,
         })
     }
 
@@ -256,7 +256,7 @@ impl ChainTrust {
     /// `self`, hands its own entries.
     pub fn found(self, dir_fd: RawFd) -> io::Result<Self> {
         Ok(ChainTrust {
-            entries_safe: self.entries_safe && nobody_else_can_create_in(dir_fd)?,
+            entries_safe: self.entries_safe && nobody_else_can_create(dir_fd)?,
         })
     }
 
@@ -264,7 +264,7 @@ impl ChainTrust {
     /// `dir_fd`, hands its entries, wherever it is.
     pub fn made(dir_fd: RawFd) -> io::Result<Self> {
         Ok(ChainTrust {
-            entries_safe: nobody_else_can_create_in(dir_fd)?,
+            entries_safe: nobody_else_can_create(dir_fd)?,
         })
     }
 
@@ -281,28 +281,93 @@ impl ChainTrust {
     }
 }
 
-/// `nobody_else_can_create` for the directory open on `fd`.
-fn nobody_else_can_create_in(fd: RawFd) -> io::Result<bool> {
+/// Whether nobody but the effective user can create entries in the directory open on `fd`: it
+/// is owned by that user and grants no other write permission, and no group write permission
+/// either unless its group is the user's private group (`is_private_group`) and no ACL names
+/// anyone else (`acl_may_name_others`) -- the user's alone, so the directories a umask of 002
+/// leaves group-writable, as Debian-style user private groups intend, count as the user's. A
+/// sticky directory others may write counts as one they can create entries in.
+///
+/// Only what `st_mode` shows is seen otherwise. Write permission a POSIX ACL grants to named
+/// users or groups shows there (in the group bits, the ACL mask), and so counts as others'
+/// unless the ACL is read and names nobody; write permission a macOS or NFSv4 ACL grants does
+/// not show, and is not taken into account. That is a residual: below a directory such an ACL
+/// lets others write, a directory found existing -- possibly one of theirs renamed there -- is
+/// given the mode or owner asked for.
+pub fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
     let euid = unsafe { libc::geteuid() };
-    Ok(nobody_else_can_create(&fstat(fd)?, euid))
+    let private = |gid, euid| is_private_group(gid, euid) && !acl_may_name_others(fd);
+    Ok(nobody_else_can_create_with(&fstat(fd)?, euid, private))
 }
 
-/// Whether nobody but `euid` can create entries in the directory `parent`: it is owned by
-/// `euid` and grants no other write permission, and no group write permission either unless
-/// its group is the user's private group (`is_private_group`) -- the user's alone, so the
-/// directories a umask of 002 leaves group-writable, as Debian-style user private groups
-/// intend, count as the user's. A sticky directory others may write counts as one they can
-/// create entries in.
+/// Whether the access ACL of the directory open on `fd` may grant anyone but its owner and its
+/// owning group: it has a named user or named group entry, or it cannot be read for certain.
+/// No ACL, or a filesystem without ACLs, grants nobody else.
 ///
-/// Only what `st_mode` shows is seen. Write permission a POSIX ACL grants to named users or
-/// groups shows there (in the group bits, the ACL mask); write permission a macOS or NFSv4 ACL
-/// grants does not, and is not taken into account. That is a residual: below a directory such
-/// an ACL lets others write, a directory found existing -- possibly one of theirs renamed
-/// there -- is given the mode or owner asked for. (A POSIX ACL's named entries widen the mask,
-/// and so the group bits, and the group then still has to be private: only its owning group's
-/// members are counted, not the ACL's named users. That is a residual too.)
-pub fn nobody_else_can_create(parent: &libc::stat, euid: u32) -> bool {
-    nobody_else_can_create_with(parent, euid, is_private_group)
+/// Read as the `system.posix_acl_access` attribute. An `O_PATH` descriptor takes no `fgetxattr`
+/// (EBADF); the directory is then reopened for reading through `self/fd/N` under a `/proc`
+/// verified to be procfs (`procfs_dir`), which names the same inode -- and one the user may
+/// not read counts as one that may.
+#[cfg(target_os = "linux")]
+fn acl_may_name_others(fd: RawFd) -> bool {
+    const ACCESS_ACL: &CStr = c"system.posix_acl_access";
+    let read = |fd: RawFd, buf: &mut [u8]| {
+        let n =
+            unsafe { libc::fgetxattr(fd, ACCESS_ACL.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        usize::try_from(n).map_err(|_| io::Error::last_os_error())
+    };
+    let mut buf = [0u8; 1024];
+    let mut result = read(fd, &mut buf);
+    if result
+        .as_ref()
+        .is_err_and(|e| e.raw_os_error() == Some(libc::EBADF))
+    {
+        let reopened = procfs_dir().and_then(|proc_dir| {
+            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+            let name = proc_fd_name(fd);
+            let fd = unsafe { libc::openat(proc_dir.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { File::from_raw_fd(fd) })
+        });
+        result = reopened.and_then(|dir| read(dir.as_raw_fd(), &mut buf));
+    }
+    match result {
+        Ok(len) => acl_names_others(&buf[..len]),
+        Err(e) => !matches!(
+            e.raw_os_error(),
+            Some(libc::ENODATA) | Some(libc::EOPNOTSUPP)
+        ),
+    }
+}
+
+/// No ACL can be read here: assume one may (the private-group rule does not apply here anyway).
+#[cfg(not(target_os = "linux"))]
+fn acl_may_name_others(_fd: RawFd) -> bool {
+    true
+}
+
+/// Whether the `system.posix_acl_access` attribute `xattr` has an entry beyond the owner, the
+/// owning group, the mask and others -- or is not one this reads for certain. Its format is
+/// the kernel's: a little-endian 32-bit version (2), then 8-byte entries of a 16-bit tag, a
+/// 16-bit permission set and a 32-bit id.
+#[cfg(any(target_os = "linux", test))]
+fn acl_names_others(xattr: &[u8]) -> bool {
+    const USER_OBJ: u16 = 0x01;
+    const GROUP_OBJ: u16 = 0x04;
+    const MASK: u16 = 0x10;
+    const OTHER: u16 = 0x20;
+    let Some((version, entries)) = xattr.split_first_chunk::<4>() else {
+        return true;
+    };
+    if u32::from_le_bytes(*version) != 2 || entries.len() % 8 != 0 {
+        return true;
+    }
+    entries.as_chunks::<8>().0.iter().any(|entry| {
+        let tag = u16::from_le_bytes([entry[0], entry[1]]);
+        !matches!(tag, USER_OBJ | GROUP_OBJ | MASK | OTHER)
+    })
 }
 
 /// `nobody_else_can_create`, asking `private(gid, euid)` whether a group is the user's alone.
@@ -724,10 +789,10 @@ pub fn utimens_link_if_still(
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_lending_read, group_is_private, group_member_uids, is_private_group, made_by_us,
-        nobody_else_can_create_with, nss_config_is_local, nss_is_local, others_can_rename,
-        utimens_link_if_still, verify_made_dir, ChainTrust, FoundDir, FsOwners, MadeObject,
-        MadeTrust, Preserve,
+        acl_names_others, empty_lending_read, group_is_private, group_member_uids,
+        is_private_group, made_by_us, nobody_else_can_create_with, nss_config_is_local,
+        nss_is_local, others_can_rename, utimens_link_if_still, verify_made_dir, ChainTrust,
+        FoundDir, FsOwners, MadeObject, MadeTrust, Preserve,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -854,6 +919,36 @@ mod tests {
             plain
         ));
         assert!(!nss_is_local("passwd files\ngroup: files\n", plain));
+    }
+
+    /// An access ACL names someone else when it has any entry but the owner's, the owning
+    /// group's, the mask and others'; one that cannot be read for certain counts as naming.
+    #[test]
+    fn which_access_acls_name_others() {
+        let acl = |tags: &[u16]| {
+            let mut xattr = 2u32.to_le_bytes().to_vec();
+            for &tag in tags {
+                xattr.extend(tag.to_le_bytes());
+                xattr.extend(7u16.to_le_bytes());
+                xattr.extend(u32::MAX.to_le_bytes());
+            }
+            xattr
+        };
+        // Owner, owning group, others; with a mask.
+        assert!(!acl_names_others(&acl(&[0x01, 0x04, 0x20])));
+        assert!(!acl_names_others(&acl(&[0x01, 0x04, 0x10, 0x20])));
+        // A named user, a named group, a tag not known.
+        assert!(acl_names_others(&acl(&[0x01, 0x02, 0x04, 0x10, 0x20])));
+        assert!(acl_names_others(&acl(&[0x01, 0x04, 0x08, 0x10, 0x20])));
+        assert!(acl_names_others(&acl(&[0x01, 0x04, 0x40, 0x20])));
+        // Not the format read here.
+        let mut other_version = acl(&[0x01, 0x04, 0x20]);
+        other_version[0] = 3;
+        assert!(acl_names_others(&other_version));
+        let mut torn = acl(&[0x01, 0x04, 0x20]);
+        torn.pop();
+        assert!(acl_names_others(&torn));
+        assert!(acl_names_others(&[2, 0]));
     }
 
     /// Where the private-group rule cannot be backed by an ACL check and an NSS configuration

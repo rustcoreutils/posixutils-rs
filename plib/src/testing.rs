@@ -768,6 +768,23 @@ pub fn shared_group() -> Option<u32> {
         .find(|&gid| !crate::madefs::is_private_group(gid, euid))
 }
 
+/// Give `path` a POSIX ACL entry granting uid 65534 (nobody) rwx, with `setfacl`; the group
+/// bits of its mode then show the ACL mask. `false`, with a note, when `setfacl` is missing or
+/// the filesystem takes no ACLs.
+#[cfg(unix)]
+pub fn grant_named_acl(path: &Path) -> bool {
+    let granted = Command::new("setfacl")
+        .args(["-m", "u:65534:rwx"])
+        .arg(path)
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !granted {
+        eprintln!("note: setfacl is missing or this filesystem takes no ACLs; case skipped");
+    }
+    granted
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_until_full, TempFile};

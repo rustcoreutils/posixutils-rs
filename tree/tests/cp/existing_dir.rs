@@ -160,6 +160,32 @@ fn cp_pr_stamps_a_found_directory_in_a_destination_of_the_users_private_group() 
     assert_eq!(mtime_of(&d), OLD_MTIME);
 }
 
+/// An ACL entry naming another user widens the group bits of the mode to the ACL's mask: a
+/// destination of the user's private group, 0755 but for an ACL granting someone else write,
+/// shows 0775 -- and others can create entries in it. The found directory is left alone.
+#[test]
+fn cp_pr_leaves_a_found_directory_alone_where_an_acl_lets_others_write() {
+    if plib::testing::user_private_group().is_none() {
+        eprintln!("note: this host gives the user no private group; test skipped");
+        return;
+    }
+    let temp = secrets_scenario(0o755);
+    let dest = temp.path().join("dest");
+    if !plib::testing::grant_named_acl(&dest) {
+        return;
+    }
+    assert_eq!(mode_of(&dest), 0o775, "the mask shows in the group bits");
+    let out = cp(temp.path(), &["-pR", "src/d", "dest"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        mode_of(&dest.join("d")),
+        0o700,
+        "the private directory was opened up"
+    );
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains(DIAGNOSTIC), "stderr: {stderr}");
+}
+
 /// Without -p nothing is asked for: the found directory keeps its mode, as always, and nothing
 /// is said.
 #[test]

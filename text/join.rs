@@ -22,31 +22,31 @@ use std::process::ExitCode;
 #[command(version, about = gettext("join - relational database operator"))]
 struct Args {
     /// Print unpairable lines from file FILENUM (1 or 2), in addition to joined output.
-    #[arg(short = 'a', value_name = "FILENUM", action = clap::ArgAction::Append)]
+    #[arg(short = 'a', allow_hyphen_values = true, value_name = "FILENUM", action = clap::ArgAction::Append)]
     additional: Vec<String>,
 
     /// Replace empty output fields with the given string.
-    #[arg(short = 'e', value_name = "STRING", action = clap::ArgAction::Append)]
+    #[arg(short = 'e', allow_hyphen_values = true, value_name = "STRING", action = clap::ArgAction::Append)]
     empty: Vec<String>,
 
     /// Output fields according to the given list of field specifiers.
-    #[arg(short = 'o', value_name = "LIST", action = clap::ArgAction::Append)]
+    #[arg(short = 'o', allow_hyphen_values = true, value_name = "LIST", action = clap::ArgAction::Append)]
     order: Vec<String>,
 
     /// Use CHAR as the input and output field separator.
-    #[arg(short = 't', value_name = "CHAR")]
+    #[arg(short = 't', allow_hyphen_values = true, value_name = "CHAR")]
     separator: Option<String>,
 
     /// Print only unpairable lines from file FILENUM (1 or 2).
-    #[arg(short = 'v', value_name = "FILENUM", action = clap::ArgAction::Append)]
+    #[arg(short = 'v', allow_hyphen_values = true, value_name = "FILENUM", action = clap::ArgAction::Append)]
     unpairable: Vec<String>,
 
     /// Join on the given field of file 1 (1-based).
-    #[arg(short = '1', value_name = "FIELD")]
+    #[arg(short = '1', allow_hyphen_values = true, value_name = "FIELD")]
     field1: Option<String>,
 
     /// Join on the given field of file 2 (1-based).
-    #[arg(short = '2', value_name = "FIELD")]
+    #[arg(short = '2', allow_hyphen_values = true, value_name = "FIELD")]
     field2: Option<String>,
 
     /// File 1 (use '-' for standard input).

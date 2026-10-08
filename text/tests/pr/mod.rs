@@ -537,3 +537,33 @@ fn test_pr_merge_error_names_the_file() {
     );
     assert_ne!(out.status.code(), Some(0));
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["--pages", "--columns", "-h", "-l", "-N", "-o", "-w"] {
+        plib::testing::assert_hyphen_option_argument("pr", &[opt, "-zq", "--help"]);
+    }
+}
+
+// The word after `-h` is the header even when it looks like `-COLUMN`: the
+// argv rewrite used to turn `-h -3` into a header of `--columns=3`.
+#[test]
+fn header_begins_with_hyphen_digit() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("pr"),
+            args: vec![String::from("-h"), String::from("-3")],
+            stdin_data: String::from("a\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains(" -3 Page 1"), "got {stdout:?}");
+            assert_eq!(output.status.code(), Some(0));
+        },
+    );
+}

@@ -2722,3 +2722,12 @@ mod tests {
         sed_test(&["-e", "s/.*/[&]/"], "a\\tb\n", "[a\\tb]\n", "", 0);
     }
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-e", "-f"] {
+        plib::testing::assert_hyphen_option_argument("sed", &[opt, "-zq", "--help"]);
+    }
+}

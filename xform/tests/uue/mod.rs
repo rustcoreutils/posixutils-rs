@@ -545,3 +545,10 @@ fn uuencode_decode_pathname_dash_roundtrip() {
 fn uuencode_decode_pathname_dev_stdout_roundtrip() {
     decode_pathname_to_stdout_roundtrip("/dev/stdout");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    plib::testing::assert_hyphen_option_argument("uudecode", &["-o", "-zq", "--help"]);
+}

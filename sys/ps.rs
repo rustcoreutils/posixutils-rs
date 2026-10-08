@@ -119,31 +119,31 @@ struct Args {
     long_format: bool,
 
     /// Write information for processes whose session leaders are in grouplist
-    #[arg(short = 'g', value_name = "grouplist", help = gettext("Write information for processes whose session leaders are in grouplist"))]
+    #[arg(short = 'g', allow_hyphen_values = true, value_name = "grouplist", help = gettext("Write information for processes whose session leaders are in grouplist"))]
     session_leaders: Option<String>,
 
     /// Write information for processes whose real group ID is in grouplist
-    #[arg(short = 'G', value_name = "grouplist", help = gettext("Write information for processes whose real group ID is in grouplist"))]
+    #[arg(short = 'G', allow_hyphen_values = true, value_name = "grouplist", help = gettext("Write information for processes whose real group ID is in grouplist"))]
     real_group: Option<String>,
 
     /// Write information for processes whose process ID is in proclist
-    #[arg(short = 'p', value_name = "proclist", help = gettext("Write information for processes in proclist"))]
+    #[arg(short = 'p', allow_hyphen_values = true, value_name = "proclist", help = gettext("Write information for processes in proclist"))]
     pid_list: Option<String>,
 
     /// Write information for processes associated with terminals in termlist
-    #[arg(short = 't', value_name = "termlist", help = gettext("Write information for processes on terminals in termlist"))]
+    #[arg(short = 't', allow_hyphen_values = true, value_name = "termlist", help = gettext("Write information for processes on terminals in termlist"))]
     term_list: Option<String>,
 
     /// Write information for processes whose effective user ID is in userlist
-    #[arg(short = 'u', value_name = "userlist", help = gettext("Write information for processes whose user ID is in userlist"))]
+    #[arg(short = 'u', allow_hyphen_values = true, value_name = "userlist", help = gettext("Write information for processes whose user ID is in userlist"))]
     user_list: Option<String>,
 
     /// Write information for processes whose real user ID is in userlist
-    #[arg(short = 'U', value_name = "userlist", help = gettext("Write information for processes whose real user ID is in userlist"))]
+    #[arg(short = 'U', allow_hyphen_values = true, value_name = "userlist", help = gettext("Write information for processes whose real user ID is in userlist"))]
     real_user: Option<String>,
 
     /// Custom output format
-    #[arg(short = 'o', value_name = "format", action = clap::ArgAction::Append, help = gettext("Specify output format"))]
+    #[arg(short = 'o', allow_hyphen_values = true, value_name = "format", action = clap::ArgAction::Append, help = gettext("Specify output format"))]
     output_format: Vec<String>,
 
     /// Wide output: behave as if COLUMNS >= 132; repeat to remove the limit
@@ -152,7 +152,7 @@ struct Args {
 
     /// Alternative system namelist file (XSI). The format is unspecified by
     /// POSIX; accepted for conformance and otherwise ignored.
-    #[arg(short = 'n', value_name = "namelist", help = gettext("Specify an alternative namelist file (accepted; ignored)"))]
+    #[arg(short = 'n', allow_hyphen_values = true, value_name = "namelist", help = gettext("Specify an alternative namelist file (accepted; ignored)"))]
     namelist: Option<String>,
 }
 

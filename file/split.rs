@@ -26,6 +26,7 @@ struct Args {
     #[arg(
         short = 'a',
         long,
+        allow_hyphen_values = true,
         default_value_t = 2,
         value_parser = clap::value_parser!(u32).range(1..),
         help = gettext(
@@ -37,6 +38,7 @@ struct Args {
     #[arg(
         short,
         long,
+        allow_hyphen_values = true,
         group = "mode",
         value_parser = clap::value_parser!(u64).range(1..),
         help = gettext(
@@ -48,6 +50,7 @@ struct Args {
     #[arg(
         short,
         long,
+        allow_hyphen_values = true,
         group = "mode",
         help = gettext("Split a file into pieces n bytes in size")
     )]

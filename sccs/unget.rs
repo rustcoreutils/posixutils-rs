@@ -23,7 +23,7 @@ use posixutils_sccs::{diag, operands, pfile, zlock};
 #[derive(Parser)]
 #[command(version, about = gettext("unget - undo a previous get of an SCCS file"))]
 struct Args {
-    #[arg(short = 'r', value_name = "SID", help = gettext("Specify the SID to unget (when user has multiple pending edits)"))]
+    #[arg(short = 'r', allow_hyphen_values = true, value_name = "SID", help = gettext("Specify the SID to unget (when user has multiple pending edits)"))]
     sid: Option<String>,
 
     #[arg(short = 's', help = gettext("Silent mode (suppress output)"))]

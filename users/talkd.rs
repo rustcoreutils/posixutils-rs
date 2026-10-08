@@ -94,7 +94,7 @@ const CTL_RES_LEN: usize = 24;
 #[command(version, about = gettext("talkd - local talk daemon"))]
 struct Args {
     /// Socket path to listen on
-    #[arg(short, long, default_value = DEFAULT_SOCKET_PATH)]
+    #[arg(short, long, allow_hyphen_values = true, default_value = DEFAULT_SOCKET_PATH)]
     socket: PathBuf,
 
     /// Run in foreground (don't daemonize)
@@ -102,7 +102,7 @@ struct Args {
     foreground: bool,
 
     /// Seconds an unanswered invitation is retained
-    #[arg(long, default_value_t = INVITATION_TIMEOUT_SECS)]
+    #[arg(long, allow_hyphen_values = true, default_value_t = INVITATION_TIMEOUT_SECS)]
     invite_timeout: u64,
 
     /// Seconds between idle expiry sweeps (testing aid)

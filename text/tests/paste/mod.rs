@@ -457,3 +457,10 @@ fn paste_multibyte_delimiter_under_lc_ctype() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, "1\u{e9}a\n2\u{e9}b\n".as_bytes());
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    plib::testing::assert_hyphen_option_argument("paste", &["-d", "-zq", "--help"]);
+}

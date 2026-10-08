@@ -37,7 +37,7 @@ struct Args {
     append: bool,
 
     /// Write tags to specified file (default: tags)
-    #[arg(short = 'f', long = "file", default_value = "tags", conflicts_with = "index",
+    #[arg(short = 'f', long = "file", allow_hyphen_values = true, default_value = "tags", conflicts_with = "index",
           help = gettext("Write tags to specified file"))]
     tags_file: String,
 

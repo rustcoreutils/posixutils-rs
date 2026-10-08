@@ -37,11 +37,11 @@ fn short_optional_value(c: char) -> bool {
 #[derive(Parser)]
 #[command(version, about = gettext("pr - print files"), disable_help_flag = true)]
 pub struct Args {
-    #[arg(long, value_parser = parse_pages, value_name = "FIRST_PAGE[:LAST_PAGE]",
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_pages, value_name = "FIRST_PAGE[:LAST_PAGE]",
           help = gettext("Begin output at page number FIRST_PAGE, stop at LAST_PAGE if present"))]
     pages: Option<(usize, Option<usize>)>,
 
-    #[arg(long, group = "multi_column", conflicts_with = "merge",
+    #[arg(long, allow_hyphen_values = true, group = "multi_column", conflicts_with = "merge",
           help = gettext("Produce multi-column output arranged in COLUMN columns"))]
     columns: Option<usize>,
 
@@ -62,7 +62,7 @@ pub struct Args {
     #[arg(short = 'F', long, help = gettext("Use form-feed for new pages"))]
     form_feed: bool,
 
-    #[arg(short = 'h', long, value_name = "HEADER",
+    #[arg(short = 'h', long, allow_hyphen_values = true, value_name = "HEADER",
           help = gettext("Use string HEADER to replace the file name in page header"))]
     header: Option<String>,
 
@@ -70,7 +70,7 @@ pub struct Args {
           help = gettext("Replace spaces with tabs in output"))]
     output_tabs: Option<OutputTabsArg>,
 
-    #[arg(short = 'l', long, value_name = "PAGE_LENGTH",
+    #[arg(short = 'l', long, allow_hyphen_values = true, value_name = "PAGE_LENGTH",
           help = gettext("Override the 66-line default page length"))]
     length: Option<usize>,
 
@@ -82,11 +82,11 @@ pub struct Args {
           help = gettext("Provide line numbering with specified width and separator"))]
     number_lines: Option<NumberLinesArg>,
 
-    #[arg(short = 'N', long, default_value_t = 1, value_name = "NUMBER",
+    #[arg(short = 'N', long, allow_hyphen_values = true, default_value_t = 1, value_name = "NUMBER",
           help = gettext("Start line counting with NUMBER at first line of first page"))]
     first_line_number: usize,
 
-    #[arg(short = 'o', long, default_value_t = 0, value_name = "MARGIN",
+    #[arg(short = 'o', long, allow_hyphen_values = true, default_value_t = 0, value_name = "MARGIN",
           help = gettext("Precede each line with MARGIN space characters"))]
     indent: usize,
 
@@ -105,7 +105,7 @@ pub struct Args {
     #[arg(short = 't', long, help = gettext("Omit header and trailer, quit after last line"))]
     omit_header: bool,
 
-    #[arg(short = 'w', long, value_name = "PAGE_WIDTH", requires = "multi_column",
+    #[arg(short = 'w', long, allow_hyphen_values = true, value_name = "PAGE_WIDTH", requires = "multi_column",
           help = gettext("Set line width to PAGE_WIDTH for multi-column output"))]
     width: Option<usize>,
 
@@ -139,8 +139,24 @@ impl Args {
         if let Some(prog) = iter.next() {
             out.push(prog);
         }
+        let mut verbatim = false;
+        let mut end_of_options = false;
         for arg in iter {
+            if verbatim || end_of_options {
+                // An option-argument, or an operand after `--`, is passed as
+                // given even when it begins with '-' or '+' (XBD 12.2,
+                // Guideline 7): `-h -3` is the header "-3", not three columns.
+                out.push(arg);
+                verbatim = false;
+                continue;
+            }
+            if arg == "--" {
+                end_of_options = true;
+                out.push(arg);
+                continue;
+            }
             preprocess_arg(&arg, &mut out);
+            verbatim = out.last().is_some_and(|last| awaits_value(last));
         }
 
         let mut args = Args::parse_from(out);
@@ -148,6 +164,29 @@ impl Args {
 
         args
     }
+}
+
+/// Whether a rewritten word is an option whose value is the next argv
+/// element: a short cluster that ends in a required-value letter, or a
+/// value-taking long option written without `=`.
+fn awaits_value(word: &str) -> bool {
+    if let Some(long) = word.strip_prefix("--") {
+        return matches!(
+            long,
+            "pages" | "columns" | "header" | "length" | "first-line-number" | "indent" | "width"
+        );
+    }
+    let Some(cluster) = word.strip_prefix('-') else {
+        return false;
+    };
+    let chars: Vec<char> = cluster.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if short_no_value(c) {
+            continue;
+        }
+        return short_required_value(c) && i == chars.len() - 1;
+    }
+    false
 }
 
 /// Preprocess a single argv element and push 0+ rewritten elements into `out`.

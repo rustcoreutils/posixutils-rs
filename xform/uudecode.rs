@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 #[derive(Parser)]
 #[command(version, about = gettext("uudecode - decode a binary file"))]
 struct Args {
-    #[arg(short, long, help = gettext("A pathname of a file that shall be used instead of any pathname contained in the input data"))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("A pathname of a file that shall be used instead of any pathname contained in the input data"))]
     outfile: Option<PathBuf>,
 
     #[arg(help = gettext("The pathname of a file containing uuencoded data"))]

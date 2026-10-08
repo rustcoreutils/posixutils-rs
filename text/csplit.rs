@@ -141,7 +141,7 @@ mod cleanup {
 #[derive(Parser)]
 #[command(version, about = gettext("csplit - split files based on context"))]
 struct Args {
-    #[arg(short = 'f', long, default_value = "xx",
+    #[arg(short = 'f', long, allow_hyphen_values = true, default_value = "xx",
           help = gettext("Name the created files prefix 00, prefix 01, ..., prefixn"))]
     prefix: String,
 
@@ -149,7 +149,7 @@ struct Args {
           help = gettext("Leave previously created files intact. By default, csplit shall remove created files if an error occurs"))]
     keep: bool,
 
-    #[arg(short, long, default_value_t = 2,
+    #[arg(short, long, allow_hyphen_values = true, default_value_t = 2,
           help = gettext("Use number decimal digits to form filenames for the file pieces"))]
     num: u8,
 

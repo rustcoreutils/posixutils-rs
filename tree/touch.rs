@@ -29,13 +29,13 @@ struct Args {
     #[arg(short, long, help = gettext("Change the modification time of file"))]
     mtime: bool,
 
-    #[arg(short, long, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format (a trailing ' UTC' or ' GMT' means 'Z'), or an RFC 5322 date as printed by 'date -R', instead of the current time"))]
+    #[arg(short, long, allow_hyphen_values = true, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format (a trailing ' UTC' or ' GMT' means 'Z'), or an RFC 5322 date as printed by 'date -R', instead of the current time"))]
     datetime: Option<String>,
 
-    #[arg(short, long, group = "timefmt", help = gettext("Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current time"))]
+    #[arg(short, long, allow_hyphen_values = true, group = "timefmt", help = gettext("Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current time"))]
     time: Option<String>,
 
-    #[arg(short, long, group = "timefmt", help = gettext("Use the corresponding time of the file named by the pathname ref_file instead of the current time"))]
+    #[arg(short, long, allow_hyphen_values = true, group = "timefmt", help = gettext("Use the corresponding time of the file named by the pathname ref_file instead of the current time"))]
     ref_file: Option<String>,
 
     #[arg(help = gettext("A pathname of a file whose times shall be modified"))]

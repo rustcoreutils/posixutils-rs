@@ -47,7 +47,7 @@ struct Args {
     #[arg(short = 'm', help = gettext("Send mail to requester when copy completes"))]
     mail_requester: bool,
 
-    #[arg(short = 'n', value_name = "USER", help = gettext("Notify user on remote system when copy completes"))]
+    #[arg(short = 'n', allow_hyphen_values = true, value_name = "USER", help = gettext("Notify user on remote system when copy completes"))]
     notify_user: Option<String>,
 
     #[arg(short = 'r', help = gettext("Queue job only, do not start transfer"))]

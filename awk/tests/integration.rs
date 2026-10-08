@@ -924,3 +924,28 @@ fn test_awk_bugfix_redirect_truncate() {
         "file should be truncated on > redirect"
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn awk_option_argument_may_begin_with_hyphen() {
+    for opt in ["-F", "-f", "-v"] {
+        plib::testing::assert_hyphen_option_argument("awk", &[opt, "-zq", "--help"]);
+    }
+}
+
+#[test]
+fn awk_field_separator_begins_with_hyphen() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            String::from("-F"),
+            String::from("-:"),
+            String::from("{ print $2 }"),
+        ],
+        stdin_data: String::from("a-:b\n"),
+        expected_out: String::from("b\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}

@@ -553,3 +553,12 @@ fn test_localedef_u_without_a_charmap_says_so() {
     // Not an error: POSIX does not require -u to be given with -f.
     assert_ne!(out.status.code(), Some(2));
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-f", "-i", "-u"] {
+        plib::testing::assert_hyphen_option_argument("localedef", &[opt, "-zq", "--help"]);
+    }
+}

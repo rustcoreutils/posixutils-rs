@@ -1650,3 +1650,12 @@ fn test_compress_read_only_input() {
     assert!(!source_left, "the read-only input must be removed");
     assert!(compressed_made, "the output must be left in place");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-b", "-m"] {
+        plib::testing::assert_hyphen_option_argument("compress", &[opt, "-zq", "--help"]);
+    }
+}

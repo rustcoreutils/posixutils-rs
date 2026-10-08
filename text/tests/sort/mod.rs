@@ -704,3 +704,12 @@ fn test_dash_non_sole_operand() {
     // non-sole "-" was opened as a file named "-" and failed.
     sort_test(&["-", "-"], "b\na\n", "a\nb\n", 0, "");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-o", "-t", "-k"] {
+        plib::testing::assert_hyphen_option_argument("sort", &[opt, "-zq", "--help"]);
+    }
+}

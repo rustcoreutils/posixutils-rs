@@ -28,7 +28,7 @@ pub static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 #[derive(Parser, Debug)]
 #[command(version, about = gettext("ed - edit text"))]
 struct Args {
-    #[arg(short, long, default_value = "", help = gettext("Use string as the prompt when in command mode"))]
+    #[arg(short, long, allow_hyphen_values = true, default_value = "", help = gettext("Use string as the prompt when in command mode"))]
     prompt: String,
 
     #[arg(short, long, help = gettext("Suppress the writing of byte counts by e, E, r, and w commands and the '!' prompt after !command"))]

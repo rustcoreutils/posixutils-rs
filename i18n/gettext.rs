@@ -26,7 +26,7 @@ use std::process::exit;
     disable_version_flag = true
 )]
 struct Args {
-    #[arg(short = 'd', long = "domain", help = gettext("Use TEXTDOMAIN as the text domain for translating MSGID"))]
+    #[arg(short = 'd', long = "domain", allow_hyphen_values = true, help = gettext("Use TEXTDOMAIN as the text domain for translating MSGID"))]
     domain: Option<String>,
 
     #[arg(short = 'e', help = gettext("Process C-language escape sequences in MSGID"))]

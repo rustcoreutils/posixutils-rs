@@ -561,3 +561,12 @@ fn gnu_m4_differential() {
         differing.join("\n")
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn m4_option_argument_may_begin_with_hyphen() {
+    for opt in ["-D", "-U"] {
+        plib::testing::assert_hyphen_option_argument("m4", &[opt, "-zq", "--help"]);
+    }
+}

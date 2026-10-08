@@ -460,3 +460,12 @@ fn test_talkd_unprivileged_start_is_not_an_error() {
         assert_eq!(res.answer, A_NOT_HERE);
     });
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-s", "--invite-timeout"] {
+        plib::testing::assert_hyphen_option_argument("talkd", &[opt, "-zq", "--help"]);
+    }
+}

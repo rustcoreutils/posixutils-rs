@@ -613,3 +613,12 @@ fn xargs_insert_mode_without_matching_eof_string_processes_all_lines() {
         vec!["-E", "HALT", "-I", "{}", "echo", "[{}]"],
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-L", "-n", "-s", "-E", "-I"] {
+        plib::testing::assert_hyphen_option_argument("xargs", &[opt, "-zq", "--help"]);
+    }
+}

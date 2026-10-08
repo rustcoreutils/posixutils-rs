@@ -68,12 +68,14 @@ struct Args {
 
     #[arg(
         short = 'm',
+        allow_hyphen_values = true,
         help = gettext("File containing position-sensitive tests")
     )]
     test_file1: Option<PathBuf>,
 
     #[arg(
         short = 'M',
+        allow_hyphen_values = true,
         help = gettext("File containing additional position-sensitive tests")
     )]
     test_file2: Option<PathBuf>,
@@ -83,6 +85,7 @@ struct Args {
 
     #[arg(
         short = 'e',
+        allow_hyphen_values = true,
         value_name = "TESTNAME",
         action = clap::ArgAction::Append,
         value_parser = EXCLUDABLE_TESTS,

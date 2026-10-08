@@ -2958,3 +2958,12 @@ mod projectdir {
         let _ = fs::remove_dir_all(dir);
     }
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn make_option_argument_may_begin_with_hyphen() {
+    for opt in ["-C", "-f", "-j"] {
+        plib::testing::assert_hyphen_option_argument("make", &[opt, "-zq", "--help"]);
+    }
+}

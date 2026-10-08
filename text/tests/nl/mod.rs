@@ -233,3 +233,17 @@ fn test_nl_line_number_overflow_is_diagnosed() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("overflow"), "got {stderr:?}");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-b", "-d", "-f", "-h", "-i", "-l", "-n", "-s", "-v", "-w"] {
+        plib::testing::assert_hyphen_option_argument("nl", &[opt, "-zq", "--help"]);
+    }
+}
+
+#[test]
+fn test_nl_separator_begins_with_hyphen() {
+    nl_test(&["-s", "->"], "a\n", "     1->a\n");
+}

@@ -99,6 +99,7 @@ impl Args {
                         "Define the symbol name to have some value (or NULL)",
                     ))
                     .num_args(1)
+                    .allow_hyphen_values(true)
                     .action(clap::ArgAction::Append),
             )
             .arg(
@@ -107,6 +108,7 @@ impl Args {
                     .value_name(crate::lexer::UNDEFINE_VALUE_NAME)
                     .help(gettext("Undefine the symbol name"))
                     .num_args(1)
+                    .allow_hyphen_values(true)
                     .action(clap::ArgAction::Append),
             )
             .arg(clap::Arg::new("file").action(clap::ArgAction::Append))

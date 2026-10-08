@@ -65,6 +65,7 @@ struct Args {
     #[arg(
         short = 'p',
         long = "execute",
+        allow_hyphen_values = true,
         help = gettext("Execute the more command(s) in the command arguments in the order specified")
     )]
     commands: Option<String>,
@@ -81,6 +82,7 @@ struct Args {
     #[arg(
         short = 't',
         long = "tag",
+        allow_hyphen_values = true,
         help = gettext("Write the screenful of the file containing the tag named by the tagstring argument")
     )]
     tag: Option<String>,
@@ -97,6 +99,7 @@ struct Args {
     #[arg(
         short = 'n',
         long = "lines",
+        allow_hyphen_values = true,
         help = gettext("The number of lines per screenful")
     )]
     lines: Option<u16>,

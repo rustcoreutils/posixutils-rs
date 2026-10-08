@@ -497,3 +497,12 @@ fn file_context_prose_is_not_fortran() {
     );
     std::fs::remove_file(&f).unwrap();
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-m", "-M", "-e"] {
+        plib::testing::assert_hyphen_option_argument("file", &[opt, "-zq", "--help"]);
+    }
+}

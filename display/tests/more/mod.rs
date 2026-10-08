@@ -1807,3 +1807,12 @@ fn test_pty_equals_reports_source_line() {
 
     assert_eq!(session.quit(), Some(0));
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-p", "-t", "-n"] {
+        plib::testing::assert_hyphen_option_argument("more", &[opt, "-zq", "--help"]);
+    }
+}

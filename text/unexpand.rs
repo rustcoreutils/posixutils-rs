@@ -23,7 +23,7 @@ struct Args {
 
     // Specifying -t also enables -a (POSIX): conversion is not limited to
     // leading blanks.
-    #[arg(short = 't', help = gettext("Specify tab stops, comma- or blank-separated (implies -a)"))]
+    #[arg(short = 't', allow_hyphen_values = true, help = gettext("Specify tab stops, comma- or blank-separated (implies -a)"))]
     tablist: Option<String>,
 
     #[arg(help = gettext("Input files"))]

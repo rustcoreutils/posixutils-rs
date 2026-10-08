@@ -2442,3 +2442,19 @@ fn test_ar_x_refuses_a_member_name_that_leaves_the_directory() {
         assert!(!xdir.join("evil.o").exists(), "{shown} was written");
     }
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn nm_option_argument_may_begin_with_hyphen() {
+    plib::testing::assert_hyphen_option_argument("nm", &["-t", "-zq", "--help"]);
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn strings_option_argument_may_begin_with_hyphen() {
+    for opt in ["-t", "-n"] {
+        plib::testing::assert_hyphen_option_argument("strings", &[opt, "-zq", "--help"]);
+    }
+}

@@ -62,13 +62,13 @@ struct Args {
     #[arg(short = 'c', help = gettext("Create permanent output even if warnings occur"))]
     force: bool,
 
-    #[arg(short = 'f', help = gettext("Path of charmap file"))]
+    #[arg(short = 'f', allow_hyphen_values = true, help = gettext("Path of charmap file"))]
     charmap: Option<PathBuf>,
 
-    #[arg(short = 'i', help = gettext("Path of source definitions"))]
+    #[arg(short = 'i', allow_hyphen_values = true, help = gettext("Path of source definitions"))]
     input: Option<PathBuf>,
 
-    #[arg(short = 'u', help = gettext("Target codeset for conversion"))]
+    #[arg(short = 'u', allow_hyphen_values = true, help = gettext("Target codeset for conversion"))]
     code_set: Option<String>,
 
     #[arg(short = 'v', help = gettext("Verbose output"))]

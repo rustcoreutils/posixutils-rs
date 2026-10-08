@@ -39,13 +39,13 @@ struct Args {
     #[arg(short = 's', help=gettext("Suppress messages about invalid characters"))]
     suppress_messages: bool,
 
-    #[arg(short = 'f', help=gettext("Identify the codeset of the input file"))]
+    #[arg(short = 'f', allow_hyphen_values = true, help=gettext("Identify the codeset of the input file"))]
     from_codeset: Option<String>,
 
     #[arg(short = 'l', help=gettext("List all supported codeset values"))]
     list_codesets: bool,
 
-    #[arg(short = 't', help=gettext("Identify the codeset of the output file"))]
+    #[arg(short = 't', allow_hyphen_values = true, help=gettext("Identify the codeset of the output file"))]
     to_codeset: Option<String>,
 
     #[arg(help=gettext("Input files (reads from stdin if empty)"))]

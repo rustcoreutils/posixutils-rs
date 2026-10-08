@@ -47,7 +47,7 @@ fn preprocess_args() -> Vec<String> {
 #[derive(Parser)]
 #[command(version, about = gettext("tabs - set terminal tabs"))]
 struct Args {
-    #[arg(short = 'T', long, help = gettext("Indicate the type of terminal"))]
+    #[arg(short = 'T', long, allow_hyphen_values = true, help = gettext("Indicate the type of terminal"))]
     term: Option<String>,
 
     // Repetitive tab stops -0 through -9

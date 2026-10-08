@@ -23,7 +23,7 @@ struct Args {
     #[arg(short, long, help = gettext("Create any missing intermediate pathname components"))]
     parents: bool,
 
-    #[arg(short, long, help = gettext("Set the file permission bits of the newly-created directory to the specified mode value"))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("Set the file permission bits of the newly-created directory to the specified mode value"))]
     mode: Option<String>,
 
     #[arg(help = gettext("A pathname of a directory to be created"))]

@@ -25,10 +25,10 @@ struct Args {
     #[arg(short = 'a', help = gettext("Include removed deltas"))]
     all_deltas: bool,
 
-    #[arg(short = 'c', value_name = "CUTOFF", help = gettext("Cutoff date/time (YY[MM[DD[HH[MM[SS]]]]])"))]
+    #[arg(short = 'c', allow_hyphen_values = true, value_name = "CUTOFF", help = gettext("Cutoff date/time (YY[MM[DD[HH[MM[SS]]]]])"))]
     cutoff: Option<String>,
 
-    #[arg(short = 'd', value_name = "DATASPEC", help = gettext("Data format specification"))]
+    #[arg(short = 'd', allow_hyphen_values = true, value_name = "DATASPEC", help = gettext("Data format specification"))]
     dataspec: Option<String>,
 
     #[arg(short = 'e', help = gettext("Select deltas earlier than or equal to -c or -r"))]

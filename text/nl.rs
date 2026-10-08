@@ -23,31 +23,31 @@ struct Args {
     #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
 
-    #[arg(short = 'b', long, default_value_t = LineNumberingStyle::NonEmpty,
+    #[arg(short = 'b', long, allow_hyphen_values = true, default_value_t = LineNumberingStyle::NonEmpty,
           help = gettext("Specify which logical page body lines shall be numbered (a=all, t=non-empty, n=none, pREGEX=matching)"))]
     body_numbering: LineNumberingStyle,
 
-    #[arg(short = 'd', long, default_value_t = String::from("\\:"),
+    #[arg(short = 'd', long, allow_hyphen_values = true, default_value_t = String::from("\\:"),
           help = gettext("Specify the delimiter characters that indicate the start of a logical page section"))]
     section_delimiter: String,
 
-    #[arg(short = 'f', long, default_value_t = LineNumberingStyle::None,
+    #[arg(short = 'f', long, allow_hyphen_values = true, default_value_t = LineNumberingStyle::None,
           help = gettext("Specify the same as -b type except for footer"))]
     footer_numbering: LineNumberingStyle,
 
-    #[arg(short = 'h', long, default_value_t = LineNumberingStyle::None,
+    #[arg(short = 'h', long, allow_hyphen_values = true, default_value_t = LineNumberingStyle::None,
           help = gettext("Specify the same as -b type except for header"))]
     header_numbering: LineNumberingStyle,
 
-    #[arg(short = 'i', long, default_value_t = 1,
+    #[arg(short = 'i', long, allow_hyphen_values = true, default_value_t = 1,
           help = gettext("Specify the increment value used to number logical page lines"))]
     line_increment: i64,
 
-    #[arg(short = 'l', long, default_value_t = 1, value_parser = clap::value_parser!(i64).range(1..),
+    #[arg(short = 'l', long, allow_hyphen_values = true, default_value_t = 1, value_parser = clap::value_parser!(i64).range(1..),
           help = gettext("Specify the number of blank lines to be considered as one"))]
     join_blank_lines: i64,
 
-    #[arg(short = 'n', long, default_value_t = NumberFormat::Rn,
+    #[arg(short = 'n', long, allow_hyphen_values = true, default_value_t = NumberFormat::Rn,
           help = gettext("Specify the line numbering format (ln=left, rn=right, rz=right with zeros)"))]
     number_format: NumberFormat,
 
@@ -55,15 +55,15 @@ struct Args {
           help = gettext("Specify that numbering should not be restarted at logical page delimiters"))]
     no_renumber: bool,
 
-    #[arg(short = 's', long, default_value_t = String::from("\t"),
+    #[arg(short = 's', long, allow_hyphen_values = true, default_value_t = String::from("\t"),
           help = gettext("Specify the characters used in separating the line number and the corresponding text line"))]
     number_separator: String,
 
-    #[arg(short = 'v', long, default_value_t = 1,
+    #[arg(short = 'v', long, allow_hyphen_values = true, default_value_t = 1,
           help = gettext("Specify the initial value used to number logical page lines"))]
     starting_line_number: i64,
 
-    #[arg(short = 'w', long, default_value_t = 6, value_parser = clap::value_parser!(i64).range(1..),
+    #[arg(short = 'w', long, allow_hyphen_values = true, default_value_t = 6, value_parser = clap::value_parser!(i64).range(1..),
           help = gettext("Specify the number of characters to be used for the line number"))]
     number_width: i64,
 

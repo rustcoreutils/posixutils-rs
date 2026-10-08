@@ -671,3 +671,12 @@ fn test_at_list_mixes_a_present_and_an_absent_job_id() {
         "at must not exit 0 after diagnosing an absent job id"
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-f", "-q", "-t"] {
+        plib::testing::assert_hyphen_option_argument("at", &[opt, "-zq", "--help"]);
+    }
+}

@@ -457,3 +457,12 @@ fn head_historical_number_invalid_is_an_error() {
     let (_, _, code) = head_run(&["-c", "-5"]);
     assert_ne!(code, 0, "-c -5 must not become -c with a -n 5");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-n", "-c"] {
+        plib::testing::assert_hyphen_option_argument("head", &[opt, "-zq", "--help"]);
+    }
+}

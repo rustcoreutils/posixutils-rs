@@ -35,7 +35,7 @@ struct Args {
     #[arg(short = 'm', help = gettext("Merge only; the input files shall be assumed to be already sorted"))]
     merge_only: bool,
 
-    #[arg(short = 'o', help = gettext("Specify the name of an output file to be used instead of the standard output"))]
+    #[arg(short = 'o', allow_hyphen_values = true, help = gettext("Specify the name of an output file to be used instead of the standard output"))]
     output_file: Option<PathBuf>,
 
     #[arg(short = 'u', help = gettext("Unique: suppress all but one in each set of lines having equal keys"))]
@@ -59,10 +59,10 @@ struct Args {
     #[arg(short = 'b', help = gettext("Ignore leading blank characters in sort keys"))]
     ignore_leading_blanks: bool,
 
-    #[arg(short = 't', help = gettext("Specify the field separator character"))]
+    #[arg(short = 't', allow_hyphen_values = true, help = gettext("Specify the field separator character"))]
     field_separator: Option<char>,
 
-    #[arg(short = 'k', help = gettext("Specify the key definition for sorting"))]
+    #[arg(short = 'k', allow_hyphen_values = true, help = gettext("Specify the key definition for sorting"))]
     key_definition: Vec<String>,
 
     #[arg(help = gettext("Input files"))]

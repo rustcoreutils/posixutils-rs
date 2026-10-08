@@ -106,7 +106,7 @@ impl ProgramMode {
 #[derive(Parser)]
 #[command(version, about = gettext("compress - compress and decompress data"))]
 struct Args {
-    #[arg(short = 'b', help = gettext("For LZW: max bits (9-16). For DEFLATE: compression level (1-9)"))]
+    #[arg(short = 'b', allow_hyphen_values = true, help = gettext("For LZW: max bits (9-16). For DEFLATE: compression level (1-9)"))]
     bits: Option<u32>,
 
     #[arg(short = 'c', long, help = gettext("Write to standard output; no files are changed"))]
@@ -121,7 +121,7 @@ struct Args {
     #[arg(short = 'g', help = gettext("Equivalent to -m gzip"))]
     gzip: bool,
 
-    #[arg(short = 'm', help = gettext("Use algorithm: lzw, deflate, or gzip"))]
+    #[arg(short = 'm', allow_hyphen_values = true, help = gettext("Use algorithm: lzw, deflate, or gzip"))]
     algo: Option<String>,
 
     #[arg(short = 'v', long, help = gettext("Write messages to standard error"))]

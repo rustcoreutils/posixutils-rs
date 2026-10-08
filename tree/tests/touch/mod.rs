@@ -514,3 +514,12 @@ fn test_touch_d_posix_forms_unchanged() {
     let ((_, _), mtime) = touch_d("2007-11-12T10:15:30.25Z").unwrap();
     assert_eq!(mtime, (utc, 250_000_000));
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-d", "-t", "-r"] {
+        plib::testing::assert_hyphen_option_argument("touch", &[opt, "-zq", "--help"]);
+    }
+}

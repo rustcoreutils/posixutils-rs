@@ -27,7 +27,7 @@ struct Args {
     #[arg(short, long, help = gettext("Break on spaces."))]
     spaces: bool,
 
-    #[arg(short, long, default_value_t = 80, value_parser = clap::value_parser!(u64).range(1..),
+    #[arg(short, long, allow_hyphen_values = true, default_value_t = 80, value_parser = clap::value_parser!(u64).range(1..),
           help = gettext("Specify the maximum line length, in column positions (or bytes if -b is specified)."))]
     width: u64,
 

@@ -46,6 +46,7 @@ struct Args {
     #[arg(
         short = 'L',
         long,
+        allow_hyphen_values = true,
         conflicts_with_all = ["maxnum", "replstr"],
         help = gettext(
             "The utility shall be executed for each non-empty number lines of arguments from standard input"
@@ -56,6 +57,7 @@ struct Args {
     #[arg(
         short = 'n',
         long,
+        allow_hyphen_values = true,
         conflicts_with_all = ["lines", "replstr"],
         help = gettext(
             "Invoke utility using as many standard input arguments as possible, up to number"
@@ -66,6 +68,7 @@ struct Args {
     #[arg(
         short = 's',
         long,
+        allow_hyphen_values = true,
         help = gettext(
             "Invoke utility using as many standard input arguments as possible yielding a command line length less than size"
         )
@@ -75,6 +78,7 @@ struct Args {
     #[arg(
         short = 'E',
         long,
+        allow_hyphen_values = true,
         default_value = "",
         help = gettext("Use eofstr as the logical end-of-file string")
     )]
@@ -83,6 +87,7 @@ struct Args {
     #[arg(
         short = 'I',
         long,
+        allow_hyphen_values = true,
         conflicts_with_all = ["lines", "maxnum"],
         help = gettext("Insert mode: execute utility for each line, replacing replstr with input")
     )]

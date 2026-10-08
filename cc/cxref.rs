@@ -42,20 +42,20 @@ struct Args {
     silent: bool,
 
     /// Direct output to named file
-    #[arg(short = 'o', long, help = gettext("Write output to file"))]
+    #[arg(short = 'o', long, allow_hyphen_values = true, help = gettext("Write output to file"))]
     output: Option<String>,
 
     /// Format output no wider than num columns
-    #[arg(short = 'w', long, default_value = "80", help = gettext("Maximum output width"))]
+    #[arg(short = 'w', long, allow_hyphen_values = true, default_value = "80", help = gettext("Maximum output width"))]
     width: usize,
 
-    #[arg(short = 'D', action = clap::ArgAction::Append, help = gettext("Preprocessor defines"))]
+    #[arg(short = 'D', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Preprocessor defines"))]
     defines: Vec<String>,
 
-    #[arg(short = 'I', action = clap::ArgAction::Append, help = gettext("Include paths"))]
+    #[arg(short = 'I', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Include paths"))]
     include_paths: Vec<String>,
 
-    #[arg(short = 'U', action = clap::ArgAction::Append, help = gettext("Undefine macros"))]
+    #[arg(short = 'U', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Undefine macros"))]
     undefines: Vec<String>,
 
     #[arg(required = true, help = gettext("Input files"))]

@@ -24,11 +24,12 @@ mod regex;
 #[derive(Parser)]
 #[command(version, about = gettext("awk - pattern scanning and processing language"))]
 struct Args {
-    #[arg(short = 'F', help = gettext("Define the input field separator"))]
+    #[arg(short = 'F', allow_hyphen_values = true, help = gettext("Define the input field separator"))]
     separator_string: Option<String>,
 
     #[arg(
         short = 'f',
+        allow_hyphen_values = true,
         action = clap::ArgAction::Append,
         help = gettext("Specify the program files")
     )]
@@ -36,6 +37,7 @@ struct Args {
 
     #[arg(
         short = 'v',
+        allow_hyphen_values = true,
         action = clap::ArgAction::Append,
         help = gettext("Globals assignments, executed before the start of the program")
     )]

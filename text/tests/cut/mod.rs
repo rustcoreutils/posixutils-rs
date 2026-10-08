@@ -462,3 +462,18 @@ fn test_cut_backslash_delimiter() {
     cut_test(&["-d", "\\", "-f", "1"], "a\\b\\c\n", "a\n");
     cut_test(&["-d", "\\", "-f", "2"], "a\\b\\c\n", "b\n");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-b", "-c", "-f", "-d"] {
+        plib::testing::assert_hyphen_option_argument("cut", &[opt, "-zq", "--help"]);
+    }
+}
+
+// `-c -3` is the list "-3", characters 1 through 3, not an option `-3`.
+#[test]
+fn test_cut_list_begins_with_hyphen() {
+    cut_test(&["-c", "-3"], "abcdef\n", "abc\n");
+}

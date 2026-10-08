@@ -397,6 +397,28 @@ fn read_until_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> usize {
     n
 }
 
+/// Run `cmd` with `args` and assert that the argument parser took every word
+/// after an option that requires a value as that value, even where the word
+/// begins with '-' (XBD 12.2, Guideline 7). The utility may still refuse the
+/// value itself, as a number out of range or a file that is not there; only
+/// the parser reading the word as an option, or calling the value missing,
+/// fails the assertion. Returns the output for further checks.
+///
+/// A probe that would otherwise act (queue a job, write a log record) ends
+/// with `--help`, which is reached only once the words before it parsed.
+pub fn assert_hyphen_option_argument(cmd: &str, args: &[&str]) -> Output {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let output = run_test_base(cmd, &args, b"");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for refusal in ["unexpected argument", "a value is required", "tip: to pass"] {
+        assert!(
+            !stderr.contains(refusal),
+            "{cmd} {args:?}: an option-argument beginning with '-' was refused: {stderr}"
+        );
+    }
+    output
+}
+
 #[cfg(unix)]
 pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
     use std::os::unix::process::ExitStatusExt as _;

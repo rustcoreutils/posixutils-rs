@@ -33,10 +33,10 @@ struct Args {
     #[arg(short = 'n', help=gettext("Suppress the default output. Only lines explicitly selected for output are written."))]
     quiet: bool,
 
-    #[arg(short = 'e', help=gettext("Add the editing commands specified by the script option-argument to the end of the script of editing commands."))]
+    #[arg(short = 'e', allow_hyphen_values = true, help=gettext("Add the editing commands specified by the script option-argument to the end of the script of editing commands."))]
     script: Vec<String>,
 
-    #[arg(short = 'f', name = "SCRIPT_FILE", help=gettext("Add the editing commands in the file script_file to the end of the script of editing commands."))]
+    #[arg(short = 'f', allow_hyphen_values = true, name = "SCRIPT_FILE", help=gettext("Add the editing commands in the file script_file to the end of the script of editing commands."))]
     script_file: Vec<PathBuf>,
 
     #[arg(help=gettext("A pathname of a file whose contents are read and edited."))]

@@ -30,6 +30,7 @@ struct Args {
     #[arg(
         short = 'v',
         long,
+        allow_hyphen_values = true,
         help = gettext("Specification for the variable (optional)")
     )]
     specification: Option<String>,

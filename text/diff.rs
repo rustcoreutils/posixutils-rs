@@ -31,7 +31,7 @@ struct Args {
     #[arg(short, help = gettext("Output 3 lines of copied context"))]
     context3: bool,
 
-    #[arg(short='C', value_parser = clap::value_parser!(u32), help = gettext("Output <N> lines of copied context"))]
+    #[arg(allow_hyphen_values = true, short='C', value_parser = clap::value_parser!(u32), help = gettext("Output <N> lines of copied context"))]
     context: Option<u32>,
 
     #[arg(short, long, help = gettext("Produce output in a form suitable as input for the ed utility"))]
@@ -46,16 +46,16 @@ struct Args {
     #[arg(short, help = gettext("Output 3 lines of unified context"))]
     unified3: bool,
 
-    #[arg(short='U', value_parser = clap::value_parser!(u32).range(0..), help = gettext("Output <N> lines of unified context"))]
+    #[arg(allow_hyphen_values = true, short='U', value_parser = clap::value_parser!(u32).range(0..), help = gettext("Output <N> lines of unified context"))]
     unified: Option<u32>,
 
     #[arg(help = gettext("First comparison file (or directory, if -r is specified)"))]
     file1: String,
 
-    #[arg(short = 'L', long = "label", action = clap::ArgAction::Append, help = gettext("Use <LABEL> instead of the file name in the header; may be given twice"))]
+    #[arg(short = 'L', long = "label", allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Use <LABEL> instead of the file name in the header; may be given twice"))]
     label: Vec<String>,
 
-    #[arg(long, value_parser= clap::value_parser!(String), help = gettext("Label for second file"))]
+    #[arg(long, allow_hyphen_values = true, value_parser= clap::value_parser!(String), help = gettext("Label for second file"))]
     label2: Option<String>,
 
     #[arg(help = gettext("Second comparison file (or directory, if -r is specified)"))]

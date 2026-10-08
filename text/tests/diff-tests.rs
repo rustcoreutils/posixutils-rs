@@ -2012,3 +2012,12 @@ fn test_diff_io_error_names_the_failing_path() {
     assert_eq!(code, Some(EXIT_STATUS_TROUBLE));
     assert!(stderr.contains(broken.to_str().unwrap()), "got {stderr:?}");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn diff_option_argument_may_begin_with_hyphen() {
+    for opt in ["-C", "-U", "-L", "--label2"] {
+        plib::testing::assert_hyphen_option_argument("diff", &[opt, "-zq", "--help"]);
+    }
+}

@@ -52,7 +52,7 @@ struct Args {
     #[arg(short = 'P', help = gettext("Write information in a portable output format"))]
     portable: bool,
 
-    #[arg(short = 't', value_enum, help = gettext("Write each numeric value in the specified format (d, o, or x)"))]
+    #[arg(short = 't', allow_hyphen_values = true, value_enum, help = gettext("Write each numeric value in the specified format (d, o, or x)"))]
     out_type: Option<OutputType>,
 
     #[arg(short = 'u', help = gettext("Write only undefined symbols"))]

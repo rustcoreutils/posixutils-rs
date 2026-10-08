@@ -50,16 +50,16 @@ struct Args {
     depth: Option<i64>,
 
     /// Include additional symbols (x=data symbols, _=underscore names)
-    #[arg(short = 'i', action = clap::ArgAction::Append, help = gettext("Include additional symbols: x=data, _=underscore names"))]
+    #[arg(short = 'i', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Include additional symbols: x=data, _=underscore names"))]
     include: Vec<String>,
 
-    #[arg(short = 'D', action = clap::ArgAction::Append, help = gettext("Preprocessor defines"))]
+    #[arg(short = 'D', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Preprocessor defines"))]
     defines: Vec<String>,
 
-    #[arg(short = 'I', action = clap::ArgAction::Append, help = gettext("Include paths"))]
+    #[arg(short = 'I', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Include paths"))]
     include_paths: Vec<String>,
 
-    #[arg(short = 'U', action = clap::ArgAction::Append, help = gettext("Undefine macros"))]
+    #[arg(short = 'U', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Undefine macros"))]
     undefines: Vec<String>,
 
     #[arg(required = true, help = gettext("Input files"))]

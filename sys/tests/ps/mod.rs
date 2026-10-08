@@ -494,3 +494,12 @@ fn ps_wide_options_accepted() {
 fn ps_namelist_accepted() {
     run_ps_test(vec!["-n", "/dev/null", "-A"], 0, check_exit_success);
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-g", "-G", "-p", "-t", "-u", "-U", "-o", "-n"] {
+        plib::testing::assert_hyphen_option_argument("ps", &[opt, "-zq", "--help"]);
+    }
+}

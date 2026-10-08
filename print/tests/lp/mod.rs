@@ -1183,3 +1183,12 @@ fn lp_w_writes_to_the_terminal_when_the_job_completes() {
         "the terminal message must name the request ID, saw {text:?}"
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-d", "-n", "-o", "-t"] {
+        plib::testing::assert_hyphen_option_argument("lp", &[opt, "-zq", "--help"]);
+    }
+}

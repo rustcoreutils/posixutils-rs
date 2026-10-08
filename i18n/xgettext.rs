@@ -47,6 +47,7 @@ struct Args {
 
     #[arg(
         short,
+        allow_hyphen_values = true,
         help = gettext("Name the default output file DEFAULT_DOMAIN.po instead of messages.po"),
         default_value = "messages"
     )]
@@ -66,6 +67,7 @@ struct Args {
 
     #[arg(
         short = 'K',
+        allow_hyphen_values = true,
         help = gettext("\
             Specify an additional keyword to be looked for:\n\
             * If KEYWORD_SPEC is an empty string, this shall disable the use of default keywords for the gettext family of functions.\n\
@@ -85,12 +87,14 @@ struct Args {
 
     #[arg(
         short,
+        allow_hyphen_values = true,
         help = gettext("Create output files in the directory specified by pathname instead of in the current working directory")
     )]
     pathname: Option<PathBuf>,
 
     #[arg(
         short = 'x',
+        allow_hyphen_values = true,
         help = gettext("\
             Specify a file containing strings that shall not be extracted from the input files. \
             The format of EXCLUDE_FILE is identical to that of a dot-po file. However, \

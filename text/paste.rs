@@ -25,7 +25,7 @@ struct Args {
     serial: bool,
 
     // Other implementations use "delimiters" as the long form, so mirror that
-    #[arg(short, long, help = gettext("Delimiter list"))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("Delimiter list"))]
     delimiters: Option<String>,
 
     #[arg(help = gettext("One or more input files"))]

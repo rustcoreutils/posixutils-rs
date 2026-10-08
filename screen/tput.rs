@@ -26,7 +26,7 @@ const EXIT_OTHER_ERROR: u8 = 5;
 #[derive(Parser)]
 #[command(version, about = gettext("tput - change terminal characteristics"))]
 struct Args {
-    #[arg(short = 'T', long, help = gettext("Indicate the type of terminal"))]
+    #[arg(short = 'T', long, allow_hyphen_values = true, help = gettext("Indicate the type of terminal"))]
     term: Option<String>,
 
     #[arg(required = true, help = gettext("Terminal operand(s) to execute"))]

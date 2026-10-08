@@ -164,7 +164,8 @@ const WALK_FLAGS: libc::c_int =
 /// filesystem namespace, where `create_dir_all` on `sub/file` was happy to
 /// follow `sub -> /elsewhere`.
 pub(crate) struct DirTree {
-    root: OwnedFd,
+    /// The anchor, shared with the trust that holds it weakly (`root_trust`).
+    root: Rc<OwnedFd>,
     /// The directories most recently walked through, one descriptor per
     /// level from the anchor down, so the next member reopens only the
     /// components its path does not share with the last one's. Consecutive
@@ -236,9 +237,9 @@ impl DirTree {
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        let root = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
         Ok(DirTree {
-            root_trust: ChainTrust::anchor(root.as_raw_fd())?,
+            root_trust: ChainTrust::anchor(&root)?,
             root,
             chain: RefCell::new(Chain::default()),
             max_levels: cached_levels_budget(),
@@ -276,7 +277,7 @@ impl DirTree {
     ) -> PaxResult<(Rc<OwnedFd>, ChainTrust)> {
         if let Some(last) = &*self.last_parent.borrow() {
             if last.dirs == member.dirs {
-                return Ok((Rc::clone(&last.fd), last.trust));
+                return Ok((Rc::clone(&last.fd), last.trust.clone()));
             }
         }
 
@@ -290,7 +291,7 @@ impl DirTree {
             Ok((fd, trust)) => Some(LastParent {
                 dirs: member.dirs.clone(),
                 fd: Rc::clone(fd),
-                trust: *trust,
+                trust: trust.clone(),
             }),
             Err(_) => None,
         };
@@ -314,7 +315,8 @@ impl DirTree {
         let mut trust = chain
             .levels
             .last()
-            .map_or(self.root_trust, |level| level.trust);
+            .map_or(&self.root_trust, |level| &level.trust)
+            .clone();
 
         for (level, comp) in member.dirs().enumerate().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
@@ -338,19 +340,19 @@ impl DirTree {
                         .or_insert(mtime_of(&st));
                 }
             }
-            trust = match self.standing(id, key) {
-                Standing::Implicit | Standing::Made => ChainTrust::made(next.as_raw_fd())?,
-                _ => trust.found(next.as_raw_fd())?,
-            };
             let next = Rc::new(next);
+            trust = match self.standing(id, key) {
+                Standing::Implicit | Standing::Made => ChainTrust::made(&next)?,
+                _ => trust.found(&next)?,
+            };
             if chain.levels.len() < self.max_levels {
-                chain.push(comp, Rc::clone(&next), trust);
+                chain.push(comp, Rc::clone(&next), trust.clone());
             }
             cur = Some(next);
         }
         match cur {
             Some(fd) => Ok((fd, trust)),
-            None => Ok((Rc::new(self.root.try_clone()?), trust)),
+            None => Ok((Rc::clone(&self.root), trust)),
         }
     }
 
@@ -2142,6 +2144,41 @@ mod tests {
             atime: None,
             atime_nsec: 0,
         }
+    }
+
+    /// Whether a group is private is looked up only when the answer is used: when -p asks for
+    /// mode or owner of a directory that was already there. Without it, a group-writable
+    /// destination with such a directory in it is walked and stamped without a lookup; with
+    /// `-p p` one is made.
+    #[test]
+    fn test_private_groups_are_looked_up_only_under_p() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = plib::tmp::TempDir::new().unwrap();
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(dest.join("d/x")).unwrap();
+        std::fs::set_permissions(dest.join("d"), std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let x = std::fs::metadata(dest.join("d/x")).unwrap();
+        let apply = |policy: &AttrPolicy| {
+            let tree = DirTree::open_path(&dest).unwrap();
+            let mut pending = PendingDirs::default();
+            pending.push(&member("d/x"), (x.dev(), x.ino()), attrs(0o755));
+            pending.apply(&tree, policy);
+        };
+
+        let before = plib::madefs::private_group_queries();
+        apply(&policy(false, false));
+        assert_eq!(
+            plib::madefs::private_group_queries(),
+            before,
+            "looked up without -p"
+        );
+        apply(&policy(false, true));
+        assert!(
+            plib::madefs::private_group_queries() > before,
+            "-p p did not"
+        );
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn policy(preserve_owner: bool, preserve_perms: bool) -> AttrPolicy {

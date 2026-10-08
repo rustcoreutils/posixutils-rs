@@ -28,10 +28,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 /// A destination directory `--parents` created, with the source directory it stands for.
 struct MadeDir {
-    dest: File,
+    dest: Rc<File>,
     source: std::fs::Metadata,
     /// Where it is, for diagnostics only.
     path: PathBuf,
@@ -72,7 +73,9 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
 /// The target is the anchor, and the trust it hands is carried down the walk with the
 /// descriptors (`ChainTrust`): a directory found hands on what it was handed and its own, one
 /// this run made and verified in full -- now, or earlier at the same path (`MadeDirs`) --
-/// starts afresh. The last one's is returned, for the directories the copy finds in it.
+/// starts afresh. The last one's is returned, for the directories the copy finds in it, with
+/// every directory on the way held open (`Walked::held`): the trust is worked out only when
+/// the copy asks for it, through those descriptors.
 fn make_parents(
     source: &Path,
     target: &Path,
@@ -82,13 +85,15 @@ fn make_parents(
 ) -> io::Result<Walked> {
     let mut made = Vec::new();
     let mut own = Vec::new();
-    let mut dest_dir = open_dir_at(libc::AT_FDCWD, &cstring(target.as_os_str().as_bytes())?, 0)?;
-    let mut trust = ChainTrust::anchor(dest_dir.as_raw_fd())?;
+    let target_c = cstring(target.as_os_str().as_bytes())?;
+    let mut dest_dir = Rc::new(open_dir_at(libc::AT_FDCWD, &target_c, 0)?);
+    let mut trust = ChainTrust::anchor(&dest_dir)?;
+    let mut held = vec![Rc::clone(&dest_dir)];
     let Some(parent) = source.parent() else {
         return Ok(Walked {
             made,
             own,
-            dest: dest_dir,
+            held,
             trust,
         });
     };
@@ -144,18 +149,18 @@ fn make_parents(
             // (`open_made_dir`).
             let (opened, made_trust) = open_made_dir(dest_dir.as_raw_fd(), &name, &dest_path)
                 .map_err(|e| made_dir_open_error(&dest_path, e))?;
-            let next_dest = File::from(opened);
+            let next_dest = Rc::new(File::from(opened));
             trust = if made_trust == MadeTrust::Full {
                 made_dirs.record(&next_dest.metadata()?, &dest_path);
-                own.push((next_dest.try_clone()?, dest_path.clone()));
-                ChainTrust::made(next_dest.as_raw_fd())?
+                own.push((Rc::clone(&next_dest), dest_path.clone()));
+                ChainTrust::made(&next_dest)?
             } else {
                 // Owned like its parent only, it may be someone else's: it hands on what a
                 // directory found would.
-                trust.found(next_dest.as_raw_fd())?
+                trust.found(&next_dest)?
             };
             made.push(MadeDir {
-                dest: next_dest.try_clone()?,
+                dest: Rc::clone(&next_dest),
                 source: src_md,
                 path: dest_path.clone(),
                 trust: made_trust,
@@ -173,21 +178,23 @@ fn make_parents(
                         error_string(&e)
                     ))
                 })?;
+            let found = Rc::new(found);
             trust = if made_dirs.made_at(&found.metadata()?, &dest_path) {
-                own.push((found.try_clone()?, dest_path.clone()));
-                ChainTrust::made(found.as_raw_fd())?
+                own.push((Rc::clone(&found), dest_path.clone()));
+                ChainTrust::made(&found)?
             } else {
-                trust.found(found.as_raw_fd())?
+                trust.found(&found)?
             };
             found
         };
+        held.push(Rc::clone(&next_dest));
         src_dir = next_src;
         dest_dir = next_dest;
     }
     Ok(Walked {
         made,
         own,
-        dest: dest_dir,
+        held,
         trust,
     })
 }
@@ -198,10 +205,11 @@ struct Walked {
     made: Vec<MadeDir>,
     /// The directories on the way this run made, now or earlier (`MadeDirs`), and where: the
     /// copy below them changes them, and that is noted once it is done (`MadeDirs::refresh`).
-    own: Vec<(File, PathBuf)>,
-    /// The last directory, where the copy itself goes.
-    dest: File,
-    /// The trust that directory hands the directories the copy finds in it.
+    own: Vec<(Rc<File>, PathBuf)>,
+    /// Every directory on the way, the target first and last the one the copy itself goes in,
+    /// held while the copy may ask for `trust`.
+    held: Vec<Rc<File>>,
+    /// The trust the last directory hands the directories the copy finds in it.
     trust: ChainTrust,
 }
 
@@ -302,7 +310,7 @@ where
         let Walked {
             made,
             own,
-            dest: dest_dir,
+            held,
             trust,
         } = match walked {
             Ok(walked) => walked,
@@ -311,6 +319,17 @@ where
                 ok = false;
                 continue;
             }
+        };
+        // The copy takes a descriptor of its own for the last directory; `held` stays open
+        // under the trust until the operand is done.
+        let dest_dir = match held.last().map(|dir| dir.try_clone()) {
+            Some(Ok(dir)) => dir,
+            Some(Err(e)) => {
+                eprintln!("cp: {}", error_string(&e));
+                ok = false;
+                continue;
+            }
+            None => unreachable!("make_parents holds the target at least"),
         };
         let relative: PathBuf = source
             .components()

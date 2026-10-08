@@ -19,14 +19,16 @@
 
 #[cfg(target_os = "linux")]
 use gettextrs::gettext;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io;
-use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::rc::{Rc, Weak};
 use std::sync::Mutex;
 
 /// Open flags for a directory that is only ever walked through, used as the `dirfd` of an `*at`
@@ -227,54 +229,182 @@ pub enum FoundDir {
 /// directory found existing hands it on when it was handed it and nobody else can create
 /// entries in it either (`found`); a directory the caller made and verified is safe itself, and
 /// hands it on when nobody else can create entries in it (`made`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ChainTrust {
-    /// Whether directories found existing in this one may take what was asked for.
-    entries_safe: bool,
+///
+/// It is worked out only when asked for: when a directory found existing is to be given a mode
+/// or owner (`found_dir`), and then only as far up the chain as it has not been yet, from the
+/// top down, stopping at the first directory others can create entries in. Each link is made
+/// with the `fstat` of the directory's held descriptor, taken then -- what the eager check
+/// took, at the moment the caller relies on the directory -- and the costly part, whether a
+/// group-writable directory's group is the user's private one (`is_private_group`, and its ACL),
+/// waits for the question. That part reads the ACL through the same held descriptor when it is
+/// asked; only the directory's owner (the user, or it would not have got that far) or root can
+/// change it in between, so reading it later is reading it then. A link holds the descriptor
+/// weakly: one its holder has closed by then counts as one others may write -- which, in pax,
+/// is a group-writable directory deeper than the levels it keeps open.
+#[derive(Clone)]
+pub struct ChainTrust(Rc<Link>);
+
+/// One directory of a `ChainTrust`.
+struct Link {
+    /// What the directory this one is in hands it; `None` where a chain starts (`anchor`,
+    /// `made`, `unlocated`).
+    above: Option<ChainTrust>,
+    /// Who else can create entries in it, from its `fstat`.
+    writers: DirWriters,
+    /// The directory, for its ACL; `None` for `unlocated`.
+    dir: Option<Weak<dyn AsRawFd>>,
+    /// Whether directories found existing in this one may take what was asked for, once
+    /// worked out.
+    entries_safe: OnceCell<bool>,
+}
+
+impl Drop for Link {
+    /// Unlinks the chain above one link at a time, so that dropping a deep one does not recurse
+    /// as deep.
+    fn drop(&mut self) {
+        let mut above = self.above.take();
+        while let Some(ChainTrust(link)) = above {
+            above = match Rc::try_unwrap(link) {
+                Ok(mut link) => link.above.take(),
+                Err(_) => None,
+            };
+        }
+    }
+}
+
+impl std::fmt::Debug for ChainTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainTrust")
+            .field("writers", &self.0.writers)
+            .field("entries_safe", &self.0.entries_safe.get())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChainTrust {
-    /// The trust the anchor -- the directory the user named, open on `anchor_fd` -- hands its
+    /// The link for the directory held as `dir`, below `above`.
+    fn link<T: AsRawFd + 'static>(above: Option<ChainTrust>, dir: &Rc<T>) -> io::Result<Self> {
+        let euid = unsafe { libc::geteuid() };
+        let writers = dir_writers(&fstat(dir.as_raw_fd())?, euid);
+        let dir: Weak<T> = Rc::downgrade(dir);
+        let dir: Weak<dyn AsRawFd> = dir;
+        Ok(ChainTrust(Rc::new(Link {
+            above,
+            writers,
+            dir: Some(dir),
+            entries_safe: OnceCell::new(),
+        })))
+    }
+
+    /// The trust the anchor -- the directory the user named, held as `dir` -- hands its
     /// entries.
-    pub fn anchor(anchor_fd: RawFd) -> io::Result<Self> {
-        Ok(ChainTrust {
-            entries_safe: nobody_else_can_create(anchor_fd)?,
-        })
+    pub fn anchor<T: AsRawFd + 'static>(dir: &Rc<T>) -> io::Result<Self> {
+        Self::link(None, dir)
     }
 
     /// The trust handed where the caller cannot tell which directory a directory found is in --
     /// reached through a symbolic link, say, and so in none it can judge: none.
     pub fn unlocated() -> Self {
-        ChainTrust {
-            entries_safe: false,
-        }
+        ChainTrust(Rc::new(Link {
+            above: None,
+            writers: DirWriters::Others,
+            dir: None,
+            entries_safe: OnceCell::from(false),
+        }))
     }
 
-    /// The trust a directory found existing, open on `dir_fd`, in a directory that handed it
+    /// The trust a directory found existing, held as `dir`, in a directory that handed it
     /// `self`, hands its own entries.
-    pub fn found(self, dir_fd: RawFd) -> io::Result<Self> {
-        Ok(ChainTrust {
-            entries_safe: self.entries_safe && nobody_else_can_create(dir_fd)?,
-        })
+    pub fn found<T: AsRawFd + 'static>(&self, dir: &Rc<T>) -> io::Result<Self> {
+        Self::link(Some(self.clone()), dir)
     }
 
-    /// The trust a directory the caller made and verified (`verify_made_dir`), open on
-    /// `dir_fd`, hands its entries, wherever it is.
-    pub fn made(dir_fd: RawFd) -> io::Result<Self> {
-        Ok(ChainTrust {
-            entries_safe: nobody_else_can_create(dir_fd)?,
-        })
+    /// The trust a directory the caller made and verified (`verify_made_dir`), held as `dir`,
+    /// hands its entries, wherever it is.
+    pub fn made<T: AsRawFd + 'static>(dir: &Rc<T>) -> io::Result<Self> {
+        Self::link(None, dir)
     }
 
     /// What a directory found existing in a directory of this trust may be given, `requested`
-    /// being which of mode and owner the user asked to preserve.
-    pub fn found_dir(self, requested: Preserve) -> FoundDir {
+    /// being which of mode and owner the user asked to preserve. Only when one of them was
+    /// asked for is the trust worked out.
+    pub fn found_dir(&self, requested: Preserve) -> FoundDir {
         if !requested.mode && !requested.owner {
             FoundDir::TimesOnly
-        } else if self.entries_safe {
+        } else if self.entries_safe() {
             FoundDir::AsRequested
         } else {
             FoundDir::LeaveAlone
+        }
+    }
+
+    /// Whether directories found existing in this one may take what was asked for: the links
+    /// not yet worked out, from the top down, each safe only below a safe one.
+    fn entries_safe(&self) -> bool {
+        let mut unknown = Vec::new();
+        let mut known = true;
+        let mut link = Some(self);
+        while let Some(ChainTrust(this)) = link {
+            if let Some(&safe) = this.entries_safe.get() {
+                known = safe;
+                break;
+            }
+            unknown.push(this);
+            link = this.above.as_ref();
+        }
+        for this in unknown.into_iter().rev() {
+            known = known && this.own_entries_safe();
+            let _ = this.entries_safe.set(known);
+        }
+        known
+    }
+}
+
+impl Link {
+    /// Whether nobody but the user can create entries in this directory itself.
+    fn own_entries_safe(&self) -> bool {
+        match self.writers {
+            DirWriters::User => true,
+            DirWriters::Others => false,
+            DirWriters::UserAndGroup { gid, euid } => {
+                is_private_group(gid, euid)
+                    && self
+                        .dir
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|dir| !acl_may_name_others(dir.as_raw_fd()))
+            }
+        }
+    }
+}
+
+/// Who can create entries in a directory, as far as its `fstat` shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DirWriters {
+    /// The effective user alone: it is theirs and grants no group or other write permission.
+    User,
+    /// Someone else too: it is someone else's, or grants other write permission.
+    Others,
+    /// The user, and members of its group `gid`: it is the user's (`euid`), grants group write
+    /// permission and no other. Nobody else when that group is the user's private one and no
+    /// ACL names anyone else (`nobody_else_can_create`).
+    UserAndGroup { gid: u32, euid: u32 },
+}
+
+/// `DirWriters` for the directory `st`, the effective user being `euid`.
+fn dir_writers(st: &libc::stat, euid: u32) -> DirWriters {
+    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP is 0o020 and S_IWOTH
+    // 0o002 (fixed by POSIX).
+    #[allow(clippy::unnecessary_cast)]
+    let mode = st.st_mode as u32;
+    if st.st_uid != euid || mode & 0o002 != 0 {
+        DirWriters::Others
+    } else if mode & 0o020 == 0 {
+        DirWriters::User
+    } else {
+        DirWriters::UserAndGroup {
+            gid: st.st_gid,
+            euid,
         }
     }
 }
@@ -294,8 +424,13 @@ impl ChainTrust {
 /// given the mode or owner asked for.
 pub fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
     let euid = unsafe { libc::geteuid() };
-    let private = |gid, euid| is_private_group(gid, euid) && !acl_may_name_others(fd);
-    Ok(nobody_else_can_create_with(&fstat(fd)?, euid, private))
+    Ok(match dir_writers(&fstat(fd)?, euid) {
+        DirWriters::User => true,
+        DirWriters::Others => false,
+        DirWriters::UserAndGroup { gid, euid } => {
+            is_private_group(gid, euid) && !acl_may_name_others(fd)
+        }
+    })
 }
 
 /// Whether the access ACL of the directory open on `fd` may grant anyone but its owner and its
@@ -368,22 +503,6 @@ fn acl_names_others(xattr: &[u8]) -> bool {
     })
 }
 
-/// `nobody_else_can_create`, asking `private(gid, euid)` whether a group is the user's alone.
-fn nobody_else_can_create_with(
-    parent: &libc::stat,
-    euid: u32,
-    private: impl FnOnce(u32, u32) -> bool,
-) -> bool {
-    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP is 0o020 and S_IWOTH
-    // 0o002 (fixed by POSIX).
-    #[allow(clippy::unnecessary_cast)]
-    let mode = parent.st_mode as u32;
-    if parent.st_uid != euid || mode & 0o002 != 0 {
-        return false;
-    }
-    mode & 0o020 == 0 || private(parent.st_gid, euid)
-}
-
 /// Whether the group `gid` is the private group of the user `euid`, by the user-private-group
 /// convention (`useradd`, `adduser`): nobody else is in it, so its write permission is the
 /// user's own. All of these must hold (`group_is_private`):
@@ -408,6 +527,7 @@ fn nobody_else_can_create_with(
 /// - A group password lets anyone who knows it `newgrp` into the group; with shadow groups it
 ///   is out of the user's reach to read, and is not considered.
 pub fn is_private_group(gid: u32, euid: u32) -> bool {
+    PRIVATE_GROUP_QUERIES.with(|queries| queries.set(queries.get() + 1));
     if !cfg!(target_os = "linux") {
         return false;
     }
@@ -417,6 +537,18 @@ pub fn is_private_group(gid: u32, euid: u32) -> bool {
     *answers
         .entry((gid, euid))
         .or_insert_with(|| read_private_group(gid, euid))
+}
+
+thread_local! {
+    /// How many times this thread has asked `is_private_group`, cached or not.
+    static PRIVATE_GROUP_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has asked whether a group is private (`is_private_group`): for
+/// tests that a run which asks nothing that needs it -- no mode or owner to preserve -- looks
+/// nothing up.
+pub fn private_group_queries() -> usize {
+    PRIVATE_GROUP_QUERIES.with(|queries| queries.get())
 }
 
 /// `is_private_group`, read from the databases (under its lock: the lookups return storage the
@@ -738,13 +870,14 @@ pub fn utimens_link_if_still(
 #[cfg(test)]
 mod tests {
     use super::{
-        acl_names_others, empty_lending_read, group_entry, group_is_private, is_private_group,
-        made_by_us, nobody_else_can_create_with, others_can_rename, user_entry,
-        utimens_link_if_still, verify_made_dir, ChainTrust, FoundDir, FsOwners, MadeObject,
-        MadeTrust, Preserve, UserEntry,
+        acl_names_others, dir_writers, empty_lending_read, group_entry, group_is_private,
+        is_private_group, made_by_us, others_can_rename, user_entry, utimens_link_if_still,
+        verify_made_dir, ChainTrust, DirWriters, FoundDir, FsOwners, MadeObject, MadeTrust,
+        Preserve, UserEntry,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::rc::Rc;
 
     /// A parent directory of `uid` with permission bits `mode`.
     fn parent(uid: u32, mode: libc::mode_t) -> libc::stat {
@@ -758,34 +891,27 @@ mod tests {
     /// entries beside it.
     #[test]
     fn who_can_create_in_a_parent() {
-        let shared = |st: &libc::stat, euid| nobody_else_can_create_with(st, euid, |_, _| false);
-        let private = |st: &libc::stat, euid| nobody_else_can_create_with(st, euid, |_, _| true);
+        use DirWriters::{Others, User, UserAndGroup};
+        let group = |gid, euid| UserAndGroup { gid, euid };
         // Nobody but the user can.
-        assert!(shared(&parent(US, 0o755), US));
-        assert!(shared(&parent(0, 0o755), 0));
+        assert_eq!(dir_writers(&parent(US, 0o755), US), User);
+        assert_eq!(dir_writers(&parent(0, 0o755), 0), User);
         // A sticky directory others may write -- /tmp, root extracting into it too.
-        assert!(!shared(&parent(US, 0o1777), US));
-        assert!(!shared(&parent(0, 0o1777), 0));
-        assert!(!private(&parent(US, 0o1777), US));
-        // Group or other write permission.
-        assert!(!shared(&parent(US, 0o775), US));
-        assert!(!shared(&parent(US, 0o757), US));
-        // Group write permission for the user's private group is the user's own; other
-        // write permission never is.
-        assert!(private(&parent(US, 0o775), US));
-        assert!(private(&parent(US, 0o2775), US));
-        assert!(!private(&parent(US, 0o777), US));
-        assert!(!private(&parent(US, 0o757), US));
-        // Someone else's directory: its owner can.
-        assert!(!shared(&parent(OTHER, 0o755), US));
-        assert!(!private(&parent(OTHER, 0o775), US));
-        // The group asked about is the directory's.
+        assert_eq!(dir_writers(&parent(US, 0o1777), US), Others);
+        assert_eq!(dir_writers(&parent(0, 0o1777), 0), Others);
+        // Other write permission, whatever the group's.
+        assert_eq!(dir_writers(&parent(US, 0o757), US), Others);
+        assert_eq!(dir_writers(&parent(US, 0o777), US), Others);
+        // Group write permission alone: the group's members, unless it is the user's private
+        // group -- asked only later, of the directory's own group.
         let mut st = parent(US, 0o775);
         st.st_gid = 4242;
-        assert!(nobody_else_can_create_with(&st, US, |gid, euid| gid
-            == 4242
-            && euid == US));
-        assert!(!nobody_else_can_create_with(&st, US, |gid, _| gid != 4242));
+        assert_eq!(dir_writers(&st, US), group(4242, US));
+        st.st_mode = libc::S_IFDIR | 0o2775;
+        assert_eq!(dir_writers(&st, US), group(4242, US));
+        // Someone else's directory: its owner can.
+        assert_eq!(dir_writers(&parent(OTHER, 0o755), US), Others);
+        assert_eq!(dir_writers(&parent(OTHER, 0o775), US), Others);
     }
 
     /// A group is the user's private one, by the user-private-group convention, only when it
@@ -903,10 +1029,15 @@ mod tests {
             mode: false,
             owner: true,
         };
-        let fd = |path: &str| std::fs::File::open(root.join(path)).unwrap();
-        let anchor = ChainTrust::anchor(fd("").as_raw_fd()).unwrap();
-        let g = anchor.found(fd("g").as_raw_fd()).unwrap();
-        let x = g.found(fd("g/x").as_raw_fd()).unwrap();
+        let fd = |path: &str| Rc::new(std::fs::File::open(root.join(path)).unwrap());
+        let (root_fd, g_fd, x_fd) = (fd(""), fd("g"), fd("g/x"));
+        let anchor = ChainTrust::anchor(&root_fd).unwrap();
+        let g = anchor.found(&g_fd).unwrap();
+        let x = g.found(&x_fd).unwrap();
+
+        // Nothing is worked out until a mode or owner is asked for.
+        assert_eq!(x.found_dir(none), FoundDir::TimesOnly);
+        assert!(x.0.entries_safe.get().is_none() && anchor.0.entries_safe.get().is_none());
 
         // `g` itself: found in the anchor, which only the user can write.
         assert_eq!(anchor.found_dir(mode), FoundDir::AsRequested);
@@ -918,7 +1049,7 @@ mod tests {
         assert_eq!(x.found_dir(owner), FoundDir::LeaveAlone);
         assert_eq!(x.found_dir(none), FoundDir::TimesOnly);
         // Had the caller made and verified `x`, what it finds in it is safe.
-        let made_x = ChainTrust::made(fd("g/x").as_raw_fd()).unwrap();
+        let made_x = ChainTrust::made(&x_fd).unwrap();
         assert_eq!(made_x.found_dir(mode), FoundDir::AsRequested);
         assert_eq!(made_x.found_dir(owner), FoundDir::AsRequested);
         // A directory found in no directory the caller can locate takes nothing asked for, and
@@ -926,8 +1057,46 @@ mod tests {
         let unlocated = ChainTrust::unlocated();
         assert_eq!(unlocated.found_dir(mode), FoundDir::LeaveAlone);
         assert_eq!(unlocated.found_dir(none), FoundDir::TimesOnly);
-        let below = unlocated.found(fd("").as_raw_fd()).unwrap();
+        let below = unlocated.found(&root_fd).unwrap();
         assert_eq!(below.found_dir(mode), FoundDir::LeaveAlone);
+    }
+
+    /// A link holds its directory's descriptor weakly. A group-writable one, whose group needs
+    /// asking about, counts as one others may write once its holder has closed it; one the
+    /// mode alone settles does not need it.
+    #[test]
+    fn a_closed_group_writable_directory_is_not_trusted() {
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        let mode = Preserve {
+            mode: true,
+            owner: true,
+        };
+        for (perm, open, closed) in [(0o755, true, true), (0o775, private_here(), false)] {
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(perm)).unwrap();
+            let held = Rc::new(std::fs::File::open(tmp.path()).unwrap());
+            let trust = ChainTrust::anchor(&held).unwrap();
+            let again = ChainTrust::anchor(&held).unwrap();
+            assert_eq!(
+                trust.found_dir(mode) == FoundDir::AsRequested,
+                open,
+                "{perm:o}"
+            );
+            drop(held);
+            assert_eq!(
+                again.found_dir(mode) == FoundDir::AsRequested,
+                closed,
+                "{perm:o}"
+            );
+        }
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Whether a directory this test makes is of the user's private group, with no ACL.
+    fn private_here() -> bool {
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        super::nobody_else_can_create(dir.as_raw_fd()).unwrap()
     }
 
     /// Only the parent's owner, or anyone allowed to write a parent that is not sticky, can

@@ -226,7 +226,7 @@ enum DirOrigin {
 /// found existing there: whether, as a directory, it may take the source's mode and owner under
 /// -p (`ChainTrust`). The anchor the trust is carried down from is the destination directory
 /// the user named.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum OperandTrust {
     /// The operand is that directory itself, copied into (`cp -R src/. dest`): the anchor,
     /// which takes what -p asks wherever it is, as GNU cp gives it.
@@ -355,46 +355,55 @@ fn as_asked(requested: Preserve) -> FoundDir {
 /// the link's owner chose, and judging it by the directory the link is in, or by its own `..`,
 /// would hand it trust that directory never gave. Anything not located hands none
 /// (`ChainTrust::unlocated`).
+///
+/// The directory opened here comes back with the trust, for the caller to hold while it asks
+/// for that trust: the trust holds it weakly.
 fn parent_anchor(
-    parent: &ftw::FileDescriptor,
+    parent: &Rc<ftw::FileDescriptor>,
     id: (u64, u64),
     target: &Path,
-) -> io::Result<ChainTrust> {
+) -> io::Result<(ChainTrust, Option<Rc<OwnedFd>>)> {
+    let unlocated = || Ok((ChainTrust::unlocated(), None));
     let Some(name) = target.file_name() else {
-        return Ok(ChainTrust::unlocated());
+        return unlocated();
     };
     let Ok(name) = CString::new(name.as_bytes()) else {
-        return Ok(ChainTrust::unlocated());
+        return unlocated();
     };
-    let opened;
-    let dir = if parent.as_raw_fd() == libc::AT_FDCWD {
+    let opened = if parent.as_raw_fd() == libc::AT_FDCWD {
         let path = match target.parent() {
             Some(path) if !path.as_os_str().is_empty() => path,
             _ => Path::new("."),
         };
         let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-            return Ok(ChainTrust::unlocated());
+            return unlocated();
         };
         let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
         match open_fd_at(libc::AT_FDCWD, &path, flags) {
-            Ok(fd) => opened = fd,
-            Err(_) => return Ok(ChainTrust::unlocated()),
+            Ok(fd) => Some(Rc::new(fd)),
+            Err(_) => return unlocated(),
         }
-        opened.as_raw_fd()
     } else {
-        parent.as_raw_fd()
+        None
     };
+    let dir = opened
+        .as_ref()
+        .map_or(parent.as_raw_fd(), |fd| fd.as_raw_fd());
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let flags = libc::AT_SYMLINK_NOFOLLOW;
     if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, flags) } != 0 {
-        return Ok(ChainTrust::unlocated());
+        return unlocated();
     }
     // Cast needed: `dev_t` is i32 on macOS and u64 on Linux.
     #[allow(clippy::unnecessary_cast)]
     if (st.st_dev as u64, st.st_ino as u64) != id {
-        return Ok(ChainTrust::unlocated());
+        return unlocated();
     }
-    ChainTrust::anchor(dir)
+    let anchor = match &opened {
+        Some(opened) => ChainTrust::anchor(opened)?,
+        None => ChainTrust::anchor(parent)?,
+    };
+    Ok((anchor, opened))
 }
 
 /// For a directory found existing at the destination path `target`, open on `fd` with identity
@@ -406,34 +415,35 @@ fn parent_anchor(
 /// that is reported (`ChainTrust::found_dir`, which pax follows too). (One this run made at that
 /// path is its own, and not judged at all: `own_dir_trust`.)
 fn found_dir_trust(
-    hands: OperandTrust,
-    parent: &ftw::FileDescriptor,
-    fd: &ftw::FileDescriptor,
+    hands: &OperandTrust,
+    parent: &Rc<ftw::FileDescriptor>,
+    fd: &Rc<ftw::FileDescriptor>,
     id: (u64, u64),
     target: &Path,
     requested: Preserve,
 ) -> io::Result<(DirFinish, ChainTrust)> {
-    let chain = match hands {
+    let (chain, _held) = match hands {
         OperandTrust::Named => {
             let finish = DirFinish::Found(as_asked(requested));
-            return Ok((finish, ChainTrust::anchor(fd.as_raw_fd())?));
+            return Ok((finish, ChainTrust::anchor(fd)?));
         }
         OperandTrust::Parent => parent_anchor(parent, id, target)?,
-        OperandTrust::Chain(chain) => chain,
+        OperandTrust::Chain(chain) => (chain.clone(), None),
     };
+    // Asked while the anchor `parent_anchor` opened is still held.
     let finish = DirFinish::Found(chain.found_dir(requested));
-    Ok((finish, chain.found(fd.as_raw_fd())?))
+    Ok((finish, chain.found(fd)?))
 }
 
 /// For a directory found existing, open on `fd`, that this run made at the same path
 /// (`MadeDirs::made_at`): what it is given once its contents are copied -- what -p asks, as
 /// for any directory the run made -- and the trust it hands, afresh.
 fn own_dir_trust(
-    fd: &ftw::FileDescriptor,
+    fd: &Rc<ftw::FileDescriptor>,
     requested: Preserve,
 ) -> io::Result<(DirFinish, ChainTrust)> {
     let finish = DirFinish::Found(as_asked(requested));
-    Ok((finish, ChainTrust::made(fd.as_raw_fd())?))
+    Ok((finish, ChainTrust::made(fd)?))
 }
 
 /// The -p failure reported for a directory found existing where others could have created its
@@ -2184,7 +2194,7 @@ where
         let at_top_level = target_dirfd_stack_borrowed.len() == 1;
         let target_level = target_dirfd_stack_borrowed.last().unwrap();
         let target_dirfd = &target_level.fd;
-        let hands = target_level.hands;
+        let hands = &target_level.hands;
 
         let target_filename = if at_top_level {
             top_name
@@ -2339,6 +2349,7 @@ where
                             )
                             .map_err(cannot_open)
                             .and_then(|fd| {
+                                let fd = Rc::new(fd);
                                 let md = fd_metadata(fd.as_raw_fd())?;
                                 if dev != md.dev() || ino != md.ino() {
                                     return Err(io::Error::other(gettext!(
@@ -2368,12 +2379,12 @@ where
                             )
                             .map_err(|e| made_dir_open_error(&target, e))
                             .and_then(|(fd, made)| {
-                                let fd = ftw::FileDescriptor::from(fd);
+                                let fd = Rc::new(ftw::FileDescriptor::from(fd));
                                 let md = fd_metadata(fd.as_raw_fd())?;
                                 let own = made == MadeTrust::Full;
                                 let trust = if own {
                                     made_by_run.borrow_mut().record(&md, &target);
-                                    ChainTrust::made(fd.as_raw_fd())?
+                                    ChainTrust::made(&fd)?
                                 } else {
                                     // Owned like its parent only, it may be someone else's: it
                                     // hands on what a directory found would.
@@ -2416,7 +2427,7 @@ where
                         }
 
                         target_dirfd_stack_borrowed.push(DestDir {
-                            fd: Rc::new(new_target_dirfd),
+                            fd: new_target_dirfd,
                             hands: OperandTrust::Chain(trust),
                             finish: Some(finish),
                             own,
@@ -2865,6 +2876,66 @@ mod tests {
             destination: super::Destination::MayExist,
             verbose: None,
         }
+    }
+
+    /// Whether a group is private is looked up only when the answer is used: when -p asks for
+    /// mode and owner and a directory found existing is met. A plain `cp -R` into a
+    /// group-writable destination, onto a directory already there, looks nothing up; `cp -pR`
+    /// does.
+    #[test]
+    fn private_groups_are_looked_up_only_under_p() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
+        let source = dir.join("src");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("f"), b"f").unwrap();
+        // Every directory group-writable, as under a umask of 002, and found again below.
+        let dest = dir.join("dest");
+        fs::create_dir_all(dest.join("src/sub")).unwrap();
+        for found in ["src/sub", "src", ""] {
+            fs::set_permissions(dest.join(found), fs::Permissions::from_mode(0o775)).unwrap();
+        }
+        let copy = |cfg: &super::CopyConfig, name: &str| {
+            let _ = super::copy_file(
+                cfg,
+                &source,
+                &dest.join(name),
+                super::OperandTrust::Parent,
+                &mut super::CopyRun::default(),
+                None,
+                |_| false,
+            );
+        };
+
+        let before = plib::madefs::private_group_queries();
+        let plain = super::CopyConfig {
+            preserve: false,
+            ..cp_pr_config()
+        };
+        copy(&plain, "src");
+        assert_eq!(
+            plib::madefs::private_group_queries(),
+            before,
+            "cp -R looked up"
+        );
+        assert_eq!(fs::read(dest.join("src/f")).unwrap(), b"f");
+        // Under -p, but meeting no directory that was already there.
+        copy(&cp_pr_config(), "new");
+        assert_eq!(
+            plib::madefs::private_group_queries(),
+            before,
+            "nothing found, yet looked up"
+        );
+        assert_eq!(fs::read(dest.join("new/f")).unwrap(), b"f");
+        copy(&cp_pr_config(), "src");
+        assert!(
+            plib::madefs::private_group_queries() > before,
+            "cp -pR did not"
+        );
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// `cp -pR src open/new/` where, after cp found no `open/new`, someone who can write `open`

@@ -24,6 +24,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// A user account from the system user database.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +68,36 @@ impl User {
             }
         }
     }
+}
+
+/// Every user in the password database, through `setpwent`/`getpwent`/`endpwent`.
+///
+/// An error while reading is an error, never a shorter list: `getpwent` returns NULL both at
+/// the end and on a failure, which only `errno` tells apart (ENOENT, which glibc's NSS leaves
+/// at the end, counts as the end). The enumeration is the process's one, so callers here take
+/// turns.
+pub fn load() -> io::Result<Vec<User>> {
+    static ENUMERATING: Mutex<()> = Mutex::new(());
+    let _turn = ENUMERATING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut users = Vec::new();
+    let mut result = Ok(());
+    unsafe {
+        libc::setpwent();
+        loop {
+            errno::set_errno(errno::Errno(0));
+            let passwd = libc::getpwent();
+            if passwd.is_null() {
+                let e = errno::errno().0;
+                if e != 0 && e != libc::ENOENT {
+                    result = Err(io::Error::from_raw_os_error(e));
+                }
+                break;
+            }
+            users.push(User::from_passwd(&*passwd));
+        }
+        libc::endpwent();
+    }
+    result.map(|()| users)
 }
 
 /// Look up a user by name.

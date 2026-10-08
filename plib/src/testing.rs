@@ -741,6 +741,33 @@ impl AsRef<std::ffi::OsStr> for TempFile {
     }
 }
 
+/// The effective user's private group (`plib::madefs::is_private_group`), when its primary
+/// group is one and is also the process's effective group, so that the directories a test
+/// makes belong to it. `None` on a host without user private groups.
+#[cfg(unix)]
+pub fn user_private_group() -> Option<u32> {
+    let euid = unsafe { libc::geteuid() };
+    let gid = crate::user::get_by_uid(euid)?.gid;
+    let ours = gid == unsafe { libc::getegid() };
+    (ours && crate::madefs::is_private_group(gid, euid)).then_some(gid)
+}
+
+/// A group the effective user belongs to that is not the user's private group, which a test can
+/// give a directory (`chown`) to make its group write permission someone else's too. `None`
+/// when the user belongs to no such group.
+#[cfg(unix)]
+pub fn shared_group() -> Option<u32> {
+    let euid = unsafe { libc::geteuid() };
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0 as libc::gid_t; usize::try_from(count).ok()?];
+    let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    groups.truncate(usize::try_from(count).ok()?);
+    groups.push(unsafe { libc::getegid() });
+    groups
+        .into_iter()
+        .find(|&gid| !crate::madefs::is_private_group(gid, euid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_until_full, TempFile};

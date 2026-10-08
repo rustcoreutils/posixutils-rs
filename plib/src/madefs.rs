@@ -19,6 +19,7 @@
 
 #[cfg(target_os = "linux")]
 use gettextrs::gettext;
+use std::collections::HashMap;
 use std::ffi::CStr;
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -28,6 +29,7 @@ use std::io;
 use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::sync::Mutex;
 
 /// Open flags for a directory that is only ever walked through, used as the `dirfd` of an `*at`
 /// call, or `fstat`ed (`ChainTrust`).
@@ -286,20 +288,96 @@ fn nobody_else_can_create_in(fd: RawFd) -> io::Result<bool> {
 }
 
 /// Whether nobody but `euid` can create entries in the directory `parent`: it is owned by
-/// `euid` and grants no group or other write permission. A sticky directory others may write
-/// counts as one they can create entries in.
+/// `euid` and grants no other write permission, and no group write permission either unless
+/// its group is the user's private group (`is_private_group`) -- the user's alone, so the
+/// directories a umask of 002 leaves group-writable, as Debian-style user private groups
+/// intend, count as the user's. A sticky directory others may write counts as one they can
+/// create entries in.
 ///
 /// Only what `st_mode` shows is seen. Write permission a POSIX ACL grants to named users or
 /// groups shows there (in the group bits, the ACL mask); write permission a macOS or NFSv4 ACL
 /// grants does not, and is not taken into account. That is a residual: below a directory such
 /// an ACL lets others write, a directory found existing -- possibly one of theirs renamed
-/// there -- is given the mode or owner asked for.
+/// there -- is given the mode or owner asked for. (A POSIX ACL's named entries widen the mask,
+/// and so the group bits, and the group then still has to be private: only its owning group's
+/// members are counted, not the ACL's named users. That is a residual too.)
 pub fn nobody_else_can_create(parent: &libc::stat, euid: u32) -> bool {
-    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP|S_IWOTH is 0o022 (fixed
-    // by POSIX).
+    nobody_else_can_create_with(parent, euid, is_private_group)
+}
+
+/// `nobody_else_can_create`, asking `private(gid, euid)` whether a group is the user's alone.
+fn nobody_else_can_create_with(
+    parent: &libc::stat,
+    euid: u32,
+    private: impl FnOnce(u32, u32) -> bool,
+) -> bool {
+    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP is 0o020 and S_IWOTH
+    // 0o002 (fixed by POSIX).
     #[allow(clippy::unnecessary_cast)]
     let mode = parent.st_mode as u32;
-    parent.st_uid == euid && mode & 0o022 == 0
+    if parent.st_uid != euid || mode & 0o002 != 0 {
+        return false;
+    }
+    mode & 0o020 == 0 || private(parent.st_gid, euid)
+}
+
+/// Whether the group `gid` is the private group of the user `euid`: nobody else is in it, so
+/// its write permission is the user's own. All of these must hold:
+/// - it is the user's primary group;
+/// - it lists no members but, perhaps, the user;
+/// - no other user has it for a primary group.
+///
+/// What the user and group databases say is read through NSS (`getpwuid`, `getgrgid`, and the
+/// whole passwd database through `getpwent`), once per group in a process. Anything that cannot
+/// be read -- the user, the group, an error while enumerating -- counts as not private.
+///
+/// Residuals:
+/// - An NSS source that does not enumerate (sssd or LDAP with enumeration off, as is usual)
+///   hands `getpwent` only the users it does list, without an error: a user it holds who has
+///   the group for a primary group goes unseen. Nothing distinguishes that from a source with
+///   no such user, so it cannot fail closed.
+/// - Members known only to `getgrouplist` (an NSS source that adds supplementary groups it
+///   does not list in `gr_mem`) are not seen either.
+/// - A group password lets anyone who knows it `newgrp` into the group; with shadow groups
+///   it is out of the user's reach to read, and is not considered.
+/// - Users and members added after the answer is read, for the rest of the process.
+pub fn is_private_group(gid: u32, euid: u32) -> bool {
+    static ANSWERS: Mutex<Option<HashMap<(u32, u32), bool>>> = Mutex::new(None);
+    let mut answers = ANSWERS.lock().unwrap_or_else(|e| e.into_inner());
+    let answers = answers.get_or_insert_with(HashMap::new);
+    *answers
+        .entry((gid, euid))
+        .or_insert_with(|| read_private_group(gid, euid))
+}
+
+/// `is_private_group`, read from the databases.
+fn read_private_group(gid: u32, euid: u32) -> bool {
+    let Some(user) = crate::user::get_by_uid(euid) else {
+        return false;
+    };
+    let Some(group) = crate::group::get_by_gid(gid) else {
+        return false;
+    };
+    let Ok(users) = crate::user::load() else {
+        return false;
+    };
+    let primaries = users.iter().map(|other| (other.uid, other.gid));
+    group_is_private(gid, &user, &group.members, primaries)
+}
+
+/// The rule `is_private_group` follows, for the group `gid` and the user `user`, given the
+/// names the group lists as members and every user's `(uid, primary gid)`.
+pub fn group_is_private(
+    gid: u32,
+    user: &crate::user::User,
+    members: &[std::ffi::OsString],
+    primaries: impl IntoIterator<Item = (u32, u32)>,
+) -> bool {
+    user.gid == gid
+        && members.iter().all(|member| *member == user.name)
+        && primaries
+            .into_iter()
+            .all(|(uid, primary)| primary != gid || uid == user.uid)
 }
 
 /// Check a directory the caller has just made with `mkdirat` in `parent_fd` and then opened as
@@ -536,9 +614,9 @@ pub fn utimens_link_if_still(
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_lending_read, made_by_us, nobody_else_can_create, others_can_rename,
-        utimens_link_if_still, verify_made_dir, ChainTrust, FoundDir, FsOwners, MadeObject,
-        MadeTrust, Preserve,
+        empty_lending_read, group_is_private, is_private_group, made_by_us,
+        nobody_else_can_create_with, others_can_rename, utimens_link_if_still, verify_made_dir,
+        ChainTrust, FoundDir, FsOwners, MadeObject, MadeTrust, Preserve,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -555,17 +633,97 @@ mod tests {
     /// entries beside it.
     #[test]
     fn who_can_create_in_a_parent() {
+        let shared = |st: &libc::stat, euid| nobody_else_can_create_with(st, euid, |_, _| false);
+        let private = |st: &libc::stat, euid| nobody_else_can_create_with(st, euid, |_, _| true);
         // Nobody but the user can.
-        assert!(nobody_else_can_create(&parent(US, 0o755), US));
-        assert!(nobody_else_can_create(&parent(0, 0o755), 0));
+        assert!(shared(&parent(US, 0o755), US));
+        assert!(shared(&parent(0, 0o755), 0));
         // A sticky directory others may write -- /tmp, root extracting into it too.
-        assert!(!nobody_else_can_create(&parent(US, 0o1777), US));
-        assert!(!nobody_else_can_create(&parent(0, 0o1777), 0));
+        assert!(!shared(&parent(US, 0o1777), US));
+        assert!(!shared(&parent(0, 0o1777), 0));
+        assert!(!private(&parent(US, 0o1777), US));
         // Group or other write permission.
-        assert!(!nobody_else_can_create(&parent(US, 0o775), US));
-        assert!(!nobody_else_can_create(&parent(US, 0o757), US));
+        assert!(!shared(&parent(US, 0o775), US));
+        assert!(!shared(&parent(US, 0o757), US));
+        // Group write permission for the user's private group is the user's own; other
+        // write permission never is.
+        assert!(private(&parent(US, 0o775), US));
+        assert!(private(&parent(US, 0o2775), US));
+        assert!(!private(&parent(US, 0o777), US));
+        assert!(!private(&parent(US, 0o757), US));
         // Someone else's directory: its owner can.
-        assert!(!nobody_else_can_create(&parent(OTHER, 0o755), US));
+        assert!(!shared(&parent(OTHER, 0o755), US));
+        assert!(!private(&parent(OTHER, 0o775), US));
+        // The group asked about is the directory's.
+        let mut st = parent(US, 0o775);
+        st.st_gid = 4242;
+        assert!(nobody_else_can_create_with(&st, US, |gid, euid| gid
+            == 4242
+            && euid == US));
+        assert!(!nobody_else_can_create_with(&st, US, |gid, _| gid != 4242));
+    }
+
+    /// A group is the user's private one only when it is the user's primary group, lists
+    /// nobody else, and is nobody else's primary group.
+    #[test]
+    fn what_makes_a_group_private() {
+        let user = crate::user::User {
+            name: "us".into(),
+            uid: US,
+            gid: 500,
+            gecos: Default::default(),
+            dir: Default::default(),
+            shell: Default::default(),
+        };
+        let names = |list: &[&str]| {
+            list.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        let only_ours = [(US, 500), (OTHER, 600), (0, 0)];
+        assert!(group_is_private(500, &user, &[], only_ours));
+        assert!(group_is_private(500, &user, &names(&["us"]), only_ours));
+        // Not the user's primary group.
+        assert!(!group_is_private(600, &user, &[], only_ours));
+        // Another member listed.
+        assert!(!group_is_private(
+            500,
+            &user,
+            &names(&["us", "them"]),
+            only_ours
+        ));
+        assert!(!group_is_private(500, &user, &names(&["them"]), only_ours));
+        // Another user's primary group too.
+        assert!(!group_is_private(
+            500,
+            &user,
+            &[],
+            [(US, 500), (OTHER, 500)]
+        ));
+        // A second entry for the user's own uid is the user.
+        assert!(group_is_private(500, &user, &[], [(US, 500), (US, 500)]));
+    }
+
+    /// The test user's own primary group, read from the real databases, agrees with the rule
+    /// applied to what those databases list -- and an unknown user or group is never private.
+    #[test]
+    fn private_group_lookup_follows_the_databases() {
+        let euid = unsafe { libc::geteuid() };
+        assert!(!is_private_group(u32::MAX - 1, euid));
+        assert!(!is_private_group(0, u32::MAX - 1));
+        let Some(user) = crate::user::get_by_uid(euid) else {
+            return;
+        };
+        let (Some(group), Ok(users)) = (crate::group::get_by_gid(user.gid), crate::user::load())
+        else {
+            assert!(!is_private_group(user.gid, euid));
+            return;
+        };
+        let primaries = users.iter().map(|u| (u.uid, u.gid));
+        let expected = group_is_private(user.gid, &user, &group.members, primaries);
+        assert_eq!(is_private_group(user.gid, euid), expected);
+        // Asked again, the answer is the one read.
+        assert_eq!(is_private_group(user.gid, euid), expected);
     }
 
     /// A found directory gets its times only unless mode or owner was asked for; then what was
@@ -576,9 +734,9 @@ mod tests {
     fn a_found_directory_gets_what_was_asked_only_down_a_trusted_chain() {
         let tmp = crate::tmp::TempDir::new().unwrap();
         let root = tmp.path();
-        // anchor 0755 / g 0775 (someone else can create here) / x 0755 / d
+        // anchor 0755 / g 0777 (someone else can create here, whatever its group) / x 0755 / d
         std::fs::create_dir_all(root.join("g/x/d")).unwrap();
-        for (dir, mode) in [("", 0o755), ("g", 0o775), ("g/x", 0o755)] {
+        for (dir, mode) in [("", 0o755), ("g", 0o777), ("g/x", 0o755)] {
             let path = root.join(dir);
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
         }

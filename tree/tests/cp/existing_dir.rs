@@ -88,14 +88,28 @@ fn secrets_scenario(dest_mode: u32) -> TempDir {
     temp
 }
 
+/// Give `dir` a group the user shares with others (`plib::testing::shared_group`), so that
+/// its group write permission is theirs too; `false`, with a note, when the user has none.
+fn share_group(dir: &Path) -> bool {
+    let Some(gid) = plib::testing::shared_group() else {
+        eprintln!("note: the user belongs to no group shared with others; case skipped");
+        return false;
+    };
+    std::os::unix::fs::chown(dir, None, Some(gid)).unwrap();
+    true
+}
+
 /// The private directory renamed to the source's name keeps its mode and its own times under
-/// -p wherever others can create entries in the destination: group or other writable, or
-/// sticky and world writable. That is diagnosed, naming it, and the exit status is 1; its
-/// contents are still copied.
+/// -p wherever others can create entries in the destination: group (a group others are in) or
+/// other writable, or sticky and world writable. That is diagnosed, naming it, and the exit
+/// status is 1; its contents are still copied.
 #[test]
 fn cp_pr_leaves_a_found_directory_alone_below_an_open_destination() {
     for dest_mode in [0o777, 0o1777, 0o775] {
         let temp = secrets_scenario(dest_mode);
+        if dest_mode == 0o775 && !share_group(&temp.path().join("dest")) {
+            continue;
+        }
         let out = cp(temp.path(), &["-pR", "src/d", "dest"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let d = temp.path().join("dest/d");
@@ -126,6 +140,24 @@ fn cp_pr_leaves_a_found_directory_alone_below_an_open_destination() {
         assert_eq!(fs::read_to_string(d.join("key")).unwrap(), "secret\n");
         set_mode(&temp.path().join("dest"), 0o755);
     }
+}
+
+/// Under a umask of 002 the destination is group-writable; when its group is the user's
+/// private group -- nobody else in it, nobody else's primary group -- that write permission is
+/// the user's own, and -p stamps the found directory as in a destination of mode 0755.
+#[test]
+fn cp_pr_stamps_a_found_directory_in_a_destination_of_the_users_private_group() {
+    if plib::testing::user_private_group().is_none() {
+        eprintln!("note: this host gives the user no private group; test skipped");
+        return;
+    }
+    let temp = secrets_scenario(0o775);
+    let out = cp(temp.path(), &["-pR", "src/d", "dest"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let d = temp.path().join("dest/d");
+    assert_eq!(mode_of(&d), 0o755);
+    assert_eq!(mtime_of(&d), OLD_MTIME);
 }
 
 /// Without -p nothing is asked for: the found directory keeps its mode, as always, and nothing
@@ -219,7 +251,7 @@ fn cp_pr_trusts_a_directory_it_made_when_found_again() {
 #[test]
 fn cp_pr_trust_holds_along_the_chain() {
     // (destination mode, `p`'s mode): `p` is found in the destination, `p/secret` in `p`.
-    for (dest_mode, p_mode) in [(0o755, 0o777), (0o775, 0o755)] {
+    for (dest_mode, p_mode) in [(0o755, 0o777), (0o777, 0o755)] {
         let temp = tempdir().unwrap();
         source_dir(&temp.path().join("src/p/secret"), 0o755);
         set_mode(&temp.path().join("src/p"), 0o755);
@@ -258,7 +290,7 @@ fn cp_parents_pr_trust_holds_along_the_chain() {
     let dest = temp.path().join("dest");
     fs::create_dir(&dest).unwrap();
     with_private_dir(&dest.join("p"), 0o755, "secret");
-    set_mode(&dest, 0o775);
+    set_mode(&dest, 0o777);
 
     let out = cp(temp.path(), &["-pR", "--parents", "p/secret", "dest"]);
     let stderr = String::from_utf8_lossy(&out.stderr);

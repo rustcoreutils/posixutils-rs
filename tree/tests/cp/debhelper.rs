@@ -101,9 +101,6 @@ fn cp_n_recursive_merges_without_overwriting() {
     fs::write(d.join("src/b"), "new b\n").unwrap();
     fs::create_dir_all(d.join("dst/src")).unwrap();
     fs::write(d.join("dst/src/a"), "old a\n").unwrap();
-    // Only the user can create entries in `dst`, whatever the umask, so the `dst/src` found
-    // there takes the source's attributes (tests/cp/existing_dir.rs has the other case).
-    fs::set_permissions(d.join("dst"), fs::Permissions::from_mode(0o755)).unwrap();
     let (err, code) = cp_in(&d, &["-an", "src", "dst/"]);
     assert_eq!((err.as_str(), code), ("", 0));
     assert_eq!(fs::read_to_string(d.join("dst/src/a")).unwrap(), "old a\n");

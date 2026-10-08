@@ -133,18 +133,50 @@ fn test_reextract_into_a_group_writable_destination_without_p() {
     assert_eq!(mode_of(&dest.join("d")), 0o700);
 }
 
-/// The same with -p e: group members could have created the name first.
+/// The same with -p e, the group being one others are in: they could have created the name
+/// first.
 #[test]
 fn test_reextract_into_a_group_writable_destination_with_pe() {
+    let Some(shared) = plib::testing::shared_group() else {
+        eprintln!("note: the user belongs to no group shared with others; test skipped");
+        return;
+    };
     let temp = TempDir::new().unwrap();
     let archive = archive_with_open_directory(&temp);
     let dest = dest_with_private_d(&temp, 0o775);
+    std::os::unix::fs::chown(&dest, None, Some(shared)).unwrap();
 
     let out = pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(stderr.contains(DIAGNOSTIC), "stderr: {stderr}");
     assert_eq!(mode_of(&dest.join("d")), 0o700);
+}
+
+/// Under a umask of 002 the destination is group-writable; when its group is
+/// the user's private group -- nobody else in it, nobody else's primary
+/// group -- that write permission is the user's own, and -p e gives the
+/// existing directory the member's mode, in both modes.
+#[test]
+fn test_pe_stamps_an_existing_directory_in_a_destination_of_the_users_private_group() {
+    if plib::testing::user_private_group().is_none() {
+        eprintln!("note: this host gives the user no private group; test skipped");
+        return;
+    }
+    for copy in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let archive = archive_with_open_directory(&temp);
+        let src = temp.path().join("src");
+        let dest = dest_with_private_d(&temp, 0o775);
+        let out = if copy {
+            pax(&src, &["-rw", "-p", "e", "d", dest.to_str().unwrap()])
+        } else {
+            pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()])
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "copy={copy}: stderr: {stderr}");
+        assert_eq!(mode_of(&dest.join("d")), 0o755, "copy={copy}");
+    }
 }
 
 /// In a destination only the user can create entries in, -p e gives an
@@ -248,7 +280,8 @@ fn test_extract_trust_holds_along_the_chain() {
     for (privs, code) in [(Some("e"), 1), (None, 0)] {
         let temp = TempDir::new().unwrap();
         let (_, archive) = deep_source(&temp);
-        let dest = dest_with_renamed_chain(&temp, 0o775);
+        // World-writable: others can write it whatever its group.
+        let dest = dest_with_renamed_chain(&temp, 0o777);
         let mut args = vec!["-r"];
         if let Some(p) = privs {
             args.extend(["-p", p]);
@@ -273,7 +306,8 @@ fn test_copy_trust_holds_along_the_chain() {
     for (privs, code) in [(Some("e"), 1), (None, 0)] {
         let temp = TempDir::new().unwrap();
         let (src, _) = deep_source(&temp);
-        let dest = dest_with_renamed_chain(&temp, 0o775);
+        // World-writable: others can write it whatever its group.
+        let dest = dest_with_renamed_chain(&temp, 0o777);
         let mut args = vec!["-rw"];
         if let Some(p) = privs {
             args.extend(["-p", p]);

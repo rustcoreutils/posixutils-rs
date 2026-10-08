@@ -11,12 +11,11 @@ mod common;
 mod parents;
 
 use self::common::{
-    copy_file, copy_files, error_string, exit_after_verbose, CopyConfig, DerefMode, Destination,
-    InodeMap, Verbose,
+    copy_file, copy_files, error_string, exit_after_verbose, CopyConfig, CopyRun, DerefMode,
+    Destination, InodeMap, OperandTrust, Verbose,
 };
 use clap::Parser;
 use gettextrs::gettext;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::{fs, io};
 
@@ -223,13 +222,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if dir_exists {
         copy_files(&cfg, sources, target, inode_map, prompt_user).is_some()
     } else {
-        let mut created_files = HashSet::new();
-
+        // The target names no directory yet: the one it is made in is the anchor.
         match copy_file(
             &cfg,
             &sources[0],
             target,
-            &mut created_files,
+            OperandTrust::Parent,
+            &mut CopyRun::default(),
             inode_map,
             prompt_user,
         ) {

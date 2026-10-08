@@ -17,10 +17,10 @@
 
 use crate::common::{
     copy_file_at, error_string, finish_made_dir_mode, made_dir_open_error, open_made_dir,
-    preserve_through_fd, report_verbose_bytes, CopyConfig, InodeMap, MadeTrust,
+    preserve_through_fd, report_verbose_bytes, ChainTrust, CopyConfig, CopyRun, InodeMap, MadeDirs,
+    MadeTrust,
 };
 use gettextrs::gettext;
-use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
@@ -54,6 +54,12 @@ fn open_dir_at(dirfd: libc::c_int, name: &CString, extra_flags: libc::c_int) -> 
     Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
+/// `(st_dev, st_ino)` of the directory open as `dir`.
+fn dir_id(dir: &File) -> io::Result<(u64, u64)> {
+    let md = dir.metadata()?;
+    Ok((md.dev(), md.ino()))
+}
+
 fn cstring(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
@@ -68,16 +74,23 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
 /// GNU cp follows a symbolic link it finds, but a link planted between a failed lookup and the
 /// `mkdirat` is indistinguishable from one that was there before, so none is followed. Nothing
 /// is stat'ed before its open; the identity used afterwards is the opened descriptor's own.
+///
+/// The target is the anchor, and the trust it hands is carried down the walk with the
+/// descriptors (`ChainTrust`): a directory found hands on what it was handed and its own, one
+/// this run made and verified in full -- now, or earlier at the same path (`MadeDirs`) --
+/// starts afresh. The last one's is returned, for the directories the copy finds in it.
 fn make_parents(
     source: &Path,
     target: &Path,
     preserve: bool,
     verbose: bool,
-) -> io::Result<(Vec<MadeDir>, File)> {
+    made_dirs: &mut MadeDirs,
+) -> io::Result<(Vec<MadeDir>, File, ChainTrust)> {
     let mut made = Vec::new();
     let mut dest_dir = open_dir_at(libc::AT_FDCWD, &cstring(target.as_os_str().as_bytes())?, 0)?;
+    let mut trust = ChainTrust::anchor(dest_dir.as_raw_fd())?;
     let Some(parent) = source.parent() else {
-        return Ok((made, dest_dir));
+        return Ok((made, dest_dir, trust));
     };
     let start = if source.is_absolute() { "/" } else { "." };
     let mut src_dir = open_dir_at(libc::AT_FDCWD, &cstring(start.as_bytes())?, 0)?;
@@ -129,32 +142,47 @@ fn make_parents(
             // parent could have swapped in a directory of their own; and the umask may have
             // withheld the owner permission the directory needs to be filled
             // (`open_made_dir`).
-            let (opened, trust) = open_made_dir(dest_dir.as_raw_fd(), &name, &dest_path)
+            let (opened, made_trust) = open_made_dir(dest_dir.as_raw_fd(), &name, &dest_path)
                 .map_err(|e| made_dir_open_error(&dest_path, e))?;
             let next_dest = File::from(opened);
+            trust = if made_trust == MadeTrust::Full {
+                made_dirs.record(dir_id(&next_dest)?, &dest_path);
+                ChainTrust::made(next_dest.as_raw_fd())?
+            } else {
+                // Owned like its parent only, it may be someone else's: it hands on what a
+                // directory found would.
+                trust.found(next_dest.as_raw_fd())?
+            };
             made.push(MadeDir {
                 dest: next_dest.try_clone()?,
                 source: src_md,
                 path: dest_path.clone(),
-                trust,
+                trust: made_trust,
             });
             if verbose {
                 report_made_dir(&src_path, &dest_path);
             }
             next_dest
         } else {
-            open_dir_at(dest_dir.as_raw_fd(), &name, libc::O_NOFOLLOW).map_err(|e| {
-                io::Error::other(gettext!(
-                    "'{}' exists but is not a directory: {}",
-                    dest_path.display(),
-                    error_string(&e)
-                ))
-            })?
+            let found =
+                open_dir_at(dest_dir.as_raw_fd(), &name, libc::O_NOFOLLOW).map_err(|e| {
+                    io::Error::other(gettext!(
+                        "'{}' exists but is not a directory: {}",
+                        dest_path.display(),
+                        error_string(&e)
+                    ))
+                })?;
+            trust = if made_dirs.made_at(dir_id(&found)?, &dest_path) {
+                ChainTrust::made(found.as_raw_fd())?
+            } else {
+                trust.found(found.as_raw_fd())?
+            };
+            found
         };
         src_dir = next_src;
         dest_dir = next_dest;
     }
-    Ok((made, dest_dir))
+    Ok((made, dest_dir, trust))
 }
 
 /// GNU `cp -v --parents` for a directory made on the way: `source -> dest`, unquoted, unlike
@@ -198,19 +226,25 @@ where
     F: Copy + Fn(&str) -> bool,
 {
     let mut ok = true;
-    let mut created_files = HashSet::new();
+    let mut run = CopyRun::default();
     // Read once: each read is a pair of umask(2) calls.
     let umask = plib::modestr::umask();
     for source in sources {
-        let (made, dest_dir) =
-            match make_parents(source, target, cfg.preserve, cfg.verbose.is_some()) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("cp: {}", error_string(&e));
-                    ok = false;
-                    continue;
-                }
-            };
+        let walked = make_parents(
+            source,
+            target,
+            cfg.preserve,
+            cfg.verbose.is_some(),
+            &mut run.made_dirs,
+        );
+        let (made, dest_dir, trust) = match walked {
+            Ok(walked) => walked,
+            Err(e) => {
+                eprintln!("cp: {}", error_string(&e));
+                ok = false;
+                continue;
+            }
+        };
         let relative: PathBuf = source
             .components()
             .filter(|c| !matches!(c, Component::RootDir | Component::Prefix(_)))
@@ -222,8 +256,8 @@ where
             cfg,
             source,
             &dest,
-            Some(OwnedFd::from(dest_dir).into()),
-            &mut created_files,
+            (OwnedFd::from(dest_dir).into(), trust),
+            &mut run,
             inode_map.as_deref_mut(),
             prompt_fn,
         ) {

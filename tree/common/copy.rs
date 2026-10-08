@@ -322,6 +322,14 @@ impl MadeDirs {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Called with the descriptor of each directory of the run's own (`MadeDirs`) just before
+    /// cp finishes it: lets a test change it the way a slow copy would.
+    static BEFORE_FINISHING_OWN: std::cell::Cell<Option<fn(libc::c_int)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// What a cp run carries from one operand to the next.
 #[derive(Default)]
 pub struct CopyRun {
@@ -2525,6 +2533,10 @@ where
             ..
         }) = target_dir
         {
+            #[cfg(test)]
+            if own {
+                BEFORE_FINISHING_OWN.with(|hook| hook.get().map(|hook| hook(fd.as_raw_fd())));
+            }
             let finished = finish_dir(
                 fd.as_raw_fd(),
                 &source,
@@ -2826,6 +2838,102 @@ mod tests {
         );
         assert_eq!(after.mode() & 0o7777, 0o600, "the mode was applied");
         assert_eq!(after.mtime(), 978_307_200, "the times were not applied");
+    }
+
+    /// Move the status-change time of the directory open on `fd` into a later clock tick, as
+    /// a copy taking longer than a tick does: `fchmod` to the mode it has, until the time moves.
+    fn tick_ctime(fd: libc::c_int) {
+        let ctime = |fd| {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0);
+            (st.st_ctime, st.st_ctime_nsec, st.st_mode)
+        };
+        let (sec, nsec, mode) = ctime(fd);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert_eq!(unsafe { libc::fchmod(fd, mode & 0o7777) }, 0);
+            let (now_sec, now_nsec, _) = ctime(fd);
+            if (now_sec, now_nsec) != (sec, nsec) {
+                return;
+            }
+        }
+    }
+
+    /// Two operands merging into one directory of a destination others can write: the first
+    /// makes it, the second finds it the run's own and stamps it. Between the two, cp itself
+    /// changed it -- filled and finished it -- past a tick of the clock that stamps its ctime;
+    /// cp notes what it changed (`MadeDirs::refresh`), or the second operand would take it for
+    /// someone else's.
+    #[test]
+    fn a_made_directory_changed_by_cp_itself_is_still_the_runs_own() {
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
+        for (source, mode, file) in [("s1/x", 0o700, "f"), ("s2/x", 0o750, "g")] {
+            fs::create_dir_all(dir.join(source)).unwrap();
+            fs::write(dir.join(source).join(file), b"data").unwrap();
+            fs::set_permissions(dir.join(source), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let dest = dir.join("dest");
+        fs::create_dir(&dest).unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o777)).unwrap();
+
+        super::BEFORE_FINISHING_OWN.with(|hook| hook.set(Some(tick_ctime)));
+        let mut run = super::CopyRun::default();
+        for source in ["s1/x", "s2/x"] {
+            let copied = super::copy_file(
+                &cp_pr_config(),
+                &dir.join(source),
+                &dest.join("x"),
+                super::OperandTrust::Parent,
+                &mut run,
+                None,
+                |_| false,
+            );
+            assert!(copied.is_ok(), "{source}: {copied:?}");
+        }
+        super::BEFORE_FINISHING_OWN.with(|hook| hook.set(None));
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+        let x = fs::metadata(dest.join("x")).unwrap();
+        assert_eq!(x.mode() & 0o7777, 0o750);
+        assert!(dest.join("x/f").exists() && dest.join("x/g").exists());
+    }
+
+    /// The anchor of a found operand is the directory its name is in only while that name is
+    /// the very directory found: another directory under the name -- the found one renamed
+    /// away and another put there -- leaves the operand in no directory it can judge.
+    #[test]
+    fn parent_anchor_requires_the_name_to_be_the_directory_found() {
+        use std::fs;
+        use std::os::unix::fs::MetadataExt;
+        use std::rc::Rc;
+
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir(dir.join("x")).unwrap();
+        let parent_c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+        let parent = Rc::new(
+            ftw::FileDescriptor::open_at(
+                &ftw::FileDescriptor::cwd(),
+                &parent_c,
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )
+            .unwrap(),
+        );
+        let target = std::path::Path::new("x");
+        let mode = plib::madefs::Preserve {
+            mode: true,
+            owner: true,
+        };
+        let x = fs::metadata(dir.join("x")).unwrap();
+        let (trust, _) = super::parent_anchor(&parent, (x.dev(), x.ino()), target).unwrap();
+        assert_eq!(trust.found_dir(mode), super::FoundDir::AsRequested);
+
+        let other = fs::metadata(dir).unwrap();
+        let (trust, _) = super::parent_anchor(&parent, (other.dev(), other.ino()), target).unwrap();
+        assert_eq!(trust.found_dir(mode), super::FoundDir::LeaveAlone);
     }
 
     /// What `fstat` might report of a directory: only what `MadeDirs` reads is set.

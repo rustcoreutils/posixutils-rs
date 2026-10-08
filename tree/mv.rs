@@ -163,10 +163,12 @@ fn move_file(
     inode_map: &mut InodeMap,
     created_files: Option<&mut HashSet<PathBuf>>,
 ) -> io::Result<Moved> {
+    let source_entry = pinned_dirs
+        .pin(source)
+        .map_err(|e| cannot_move(source, target_entry.path(), &e))?;
     move_file_deciding(
         cfg,
-        pinned_dirs,
-        source,
+        source_entry,
         target_entry,
         inode_map,
         created_files,
@@ -182,19 +184,27 @@ enum Decision {
     Again,
 }
 
+/// Whether a failed rename calls for deciding again: a destination found absent appeared before
+/// the rename (EEXIST from the rename that must not replace), the first time only.
+fn decide_again(e: &io::Error, replace: Replace, decision: Decision) -> bool {
+    e.raw_os_error() == Some(libc::EEXIST)
+        && replace == Replace::Never
+        && decision == Decision::First
+}
+
+/// `move_file` from the pinned source on: the checks, the rename and, across filesystems, the
+/// copy. A second decision (`Decision::Again`) examines the same pinned source again.
 fn move_file_deciding(
     cfg: &MvConfig,
-    pinned_dirs: &mut PinnedDirs,
-    source: &Path,
+    source_entry: PinnedEntry,
     target_entry: &PinnedEntry,
     inode_map: &mut InodeMap,
     created_files: Option<&mut HashSet<PathBuf>>,
     decision: Decision,
 ) -> io::Result<Moved> {
     let target = target_entry.path();
-    let source_entry = pinned_dirs
-        .pin(source)
-        .map_err(|e| cannot_move(source, target, &e))?;
+    let source_path = source_entry.path().to_path_buf();
+    let source = source_path.as_path();
 
     // The destination itself, not followed, as rename(2) replaces it: a symbolic link there,
     // dangling or not, is a non-directory that the move replaces (step 5 removes it before a
@@ -328,17 +338,12 @@ fn move_file_deciding(
     };
     match rename_pinned(&source_entry, target_entry, replace) {
         Ok(_) => return Ok(Moved::Done),
-        Err(e)
-            if e.raw_os_error() == Some(libc::EEXIST)
-                && replace == Replace::Never
-                && decision == Decision::First =>
-        {
+        Err(e) if decide_again(&e, replace, decision) => {
             // It appeared: decide again, now about the file that is there -- the prompt, -f
             // and the type checks all apply to it as to any existing destination.
             return move_file_deciding(
                 cfg,
-                pinned_dirs,
-                source,
+                source_entry,
                 target_entry,
                 inode_map,
                 created_files,
@@ -716,8 +721,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rename_pinned, PinnedDirs, Replace};
-    use std::fs;
+    use super::{decide_again, rename_pinned, Decision, PinnedDirs, Replace};
+    use std::{fs, io};
+
+    /// A destination found absent that appears before the rename gets one more decision, made
+    /// about the file now there; a second appearance, any other error, or EEXIST from a rename
+    /// that was allowed to replace, does not.
+    #[test]
+    fn only_a_destination_appearing_once_is_decided_again() {
+        let exists = io::Error::from_raw_os_error(libc::EEXIST);
+        let other = io::Error::from_raw_os_error(libc::EXDEV);
+        assert!(decide_again(&exists, Replace::Never, Decision::First));
+        assert!(!decide_again(&exists, Replace::Never, Decision::Again));
+        assert!(!decide_again(&exists, Replace::Allowed, Decision::First));
+        assert!(!decide_again(&other, Replace::Never, Decision::First));
+    }
 
     /// A scratch directory holding `source` and, if `with_target`, `target`.
     fn scratch(tag: &str, with_target: bool) -> std::path::PathBuf {

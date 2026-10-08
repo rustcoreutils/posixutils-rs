@@ -348,10 +348,7 @@ impl DirTree {
             };
             let id = file_id(&st);
             match origin {
-                DirOrigin::Made => self.record_made(id, key, MadeTrust::Full, true),
-                DirOrigin::Unverified => {
-                    self.record_made(id, key, MadeTrust::ParentOwnerOnly, true)
-                }
+                DirOrigin::Made(fresh) => self.record_made(fresh, key, true),
                 DirOrigin::Found | DirOrigin::Replaced => {
                     self.pre_run_mtimes
                         .borrow_mut()
@@ -408,9 +405,10 @@ impl DirTree {
         self.replaced.borrow().contains(&id)
     }
 
-    /// Record the directory with `id` as one this run has just made at the
-    /// member path `key` and verified (`verify_made_dir`) to `trust`: made
-    /// only to hold members below it (`implicit`), or for a member naming it.
+    /// Record `fresh`, a directory this run has just made at the member path
+    /// `key` and verified (`FreshDir::verify`), with the one standing its
+    /// trust gives it: made only to hold members below it (`implicit`), or
+    /// for a member naming it, or unverified.
     /// The one place the walk and `make_dir_at` both record what they made.
     ///
     /// A directory just made is new, whatever its inode number stood for
@@ -418,12 +416,20 @@ impl DirTree {
     /// directory made. So everything the registry held for the number is
     /// forgotten first -- a stale `made` entry for another path would
     /// otherwise make this one, renamed to that path, pass for that member's.
-    fn record_made(&self, id: (u64, u64), key: &[u8], trust: MadeTrust, implicit: bool) {
+    ///
+    /// It takes a `FreshDir` -- a directory a successful `mkdirat` made and
+    /// `verify_made_dir` accepted -- and nothing else, so the forgetting and
+    /// the one standing recorded in its place happen together, and only for
+    /// a directory proven new. Nothing else ever removes an entry from
+    /// `replaced` or `unverified`; a directory found in place of one made is
+    /// recorded by `refuse_replaced` instead, which removes nothing.
+    fn record_made(&self, fresh: FreshDir, key: &[u8], implicit: bool) {
+        let id = fresh.id;
         self.implicit.borrow_mut().remove(&id);
         self.made.borrow_mut().remove(&id);
         self.unverified.borrow_mut().remove(&id);
         self.replaced.borrow_mut().remove(&id);
-        let made = match trust {
+        let made = match fresh.trust {
             MadeTrust::ParentOwnerOnly => {
                 self.unverified.borrow_mut().insert(id);
                 return;
@@ -806,14 +812,41 @@ enum Standing {
 enum DirOrigin {
     /// It was already there.
     Found,
-    /// This run made it, and it is checked to be the one made.
-    Made,
-    /// This run made it, but can trust it only so far
-    /// (`MadeTrust::ParentOwnerOnly`): used, never given attributes.
-    Unverified,
+    /// This run made it, and it is checked to be the one made, trusted as
+    /// far as the `FreshDir` says (`MadeTrust::ParentOwnerOnly`: used, never
+    /// given attributes).
+    Made(FreshDir),
     /// This run made one, and found another in its place: never to be used,
     /// nor given attributes later.
     Replaced,
+}
+
+/// A directory this run has just made with `mkdirat`, accepted by
+/// `verify_made_dir` from the descriptor it was opened on: its identity and
+/// how far it is trusted. Only `FreshDir::verify` makes one, and only
+/// `DirTree::record_made` takes one -- the one place the registry forgets
+/// what an inode number stood for, which only a directory proven new may
+/// make it do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FreshDir {
+    id: (u64, u64),
+    trust: MadeTrust,
+}
+
+impl FreshDir {
+    /// The directory a successful `mkdirat` in `parent` has just made, opened
+    /// on `dir`, if `verify_made_dir` accepts it; `None` when what is there
+    /// is not the directory made.
+    fn verify(parent: BorrowedFd<'_>, dir: BorrowedFd<'_>) -> PaxResult<Option<Self>> {
+        let Some(trust) = verify_made_dir(parent, dir)? else {
+            return Ok(None);
+        };
+        let st = fstat(dir).ok_or_else(std::io::Error::last_os_error)?;
+        Ok(Some(FreshDir {
+            id: file_id(&st),
+            trust,
+        }))
+    }
 }
 
 /// Open one directory component below `dirfd` without following a symlink,
@@ -860,9 +893,8 @@ fn open_or_create_dir_at(
     if !created {
         return Ok((fd, DirOrigin::Found));
     }
-    let origin = match verify_made_dir(dirfd, fd.as_fd())? {
-        Some(MadeTrust::Full) => DirOrigin::Made,
-        Some(MadeTrust::ParentOwnerOnly) => DirOrigin::Unverified,
+    let origin = match FreshDir::verify(dirfd, fd.as_fd())? {
+        Some(fresh) => DirOrigin::Made(fresh),
         None => DirOrigin::Replaced,
     };
     Ok((fd, origin))
@@ -984,15 +1016,15 @@ fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, member: &MemberPath) -> Pa
     #[cfg(test)]
     reached_made_dir(dirfd, name);
     let (dir, _) = open_dir_for_attrs(dirfd, name)?;
-    let st = fstat(dir.as_fd()).ok_or_else(std::io::Error::last_os_error)?;
-    let Some(trust) = verify_made_dir(dirfd, dir.as_fd())? else {
+    let Some(fresh) = FreshDir::verify(dirfd, dir.as_fd())? else {
+        let st = fstat(dir.as_fd()).ok_or_else(std::io::Error::last_os_error)?;
         return Err(tree.refuse_replaced(file_id(&st)));
     };
-    let id = file_id(&st);
+    let id = fresh.id;
     // Recorded either way, as the walk records what it makes: a later member
     // of the same name meets it with this standing.
-    tree.record_made(id, &member.key(), trust, false);
-    match trust {
+    tree.record_made(fresh, &member.key(), false);
+    match fresh.trust {
         MadeTrust::Full => Ok(DirAttrs::Apply(id)),
         MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Withheld(id)),
     }
@@ -1960,23 +1992,57 @@ mod tests {
         let tree = DirTree::open_path(dir.path()).unwrap();
         let id = (1, 4242);
         let (p, q) = (member("p").key(), member("q").key());
+        let fresh = |trust| FreshDir { id, trust };
 
-        tree.record_made(id, &p, MadeTrust::Full, false);
+        tree.record_made(fresh(MadeTrust::Full), &p, false);
         assert!(tree.standing(id, &p) == Standing::Made);
-        tree.record_made(id, &q, MadeTrust::Full, true);
+        tree.record_made(fresh(MadeTrust::Full), &q, true);
         assert!(tree.standing(id, &q) == Standing::Implicit);
         assert!(
             tree.standing(id, &p) == Standing::Ordinary,
             "the number still stood for the directory made for p/"
         );
 
-        // Nor does an earlier refusal or doubt about the number survive.
+        // Nor does an earlier refusal or doubt about the number survive a
+        // directory proven new.
         tree.replaced.borrow_mut().insert(id);
-        tree.record_made(id, &p, MadeTrust::Full, false);
+        tree.record_made(fresh(MadeTrust::Full), &p, false);
         assert!(tree.standing(id, &p) == Standing::Made);
-        tree.record_made(id, &q, MadeTrust::ParentOwnerOnly, true);
-        tree.record_made(id, &p, MadeTrust::Full, false);
+        tree.record_made(fresh(MadeTrust::ParentOwnerOnly), &q, true);
+        assert!(tree.standing(id, &q) == Standing::Unverified);
+        tree.record_made(fresh(MadeTrust::Full), &p, false);
         assert!(tree.standing(id, &p) == Standing::Made);
+    }
+
+    /// A directory recorded as found in place of one made, or as made with
+    /// an owner that could not be verified, keeps that standing whatever
+    /// reaches it -- the walk, copy mode's entry, a member naming it -- and
+    /// only a verified fresh mkdir (`record_made`) can change it.
+    #[test]
+    fn test_a_refused_or_unverified_directory_is_never_downgraded() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        for name in ["r", "u"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let id = |name: &CStr| file_id(&stat_at(tree.root(), name).unwrap());
+        let (r, u) = (id(c"r"), id(c"u"));
+        let (r_key, u_key) = (member("r").key(), member("u").key());
+        assert!(matches!(tree.refuse_replaced(r), PaxError::Io(_)));
+        tree.unverified.borrow_mut().insert(u);
+
+        // Everything that can reach them, in turn.
+        assert!(tree.open_dir(tree.root(), c"r", false).is_err());
+        assert!(tree.parent_of(&member("r/x"), true).is_err());
+        assert!(make_dir_at(&tree, tree.root(), &member("r"), 0o755, false).is_err());
+        assert!(tree.open_dir(tree.root(), c"u", false).is_ok());
+        assert!(tree.parent_of(&member("u/x"), true).is_ok());
+        let decided = make_dir_at(&tree, tree.root(), &member("u"), 0o755, false).unwrap();
+        assert_eq!(decided, DirAttrs::Withheld(u));
+        assert!(!tree.claim_implicit(&stat_at(tree.root(), c"u").unwrap(), &member("u")));
+
+        assert!(tree.standing(r, &r_key) == Standing::Replaced);
+        assert!(tree.standing(u, &u_key) == Standing::Unverified);
     }
 
     /// Every site that enters, merges into or stamps a directory consults the

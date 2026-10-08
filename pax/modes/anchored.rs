@@ -796,8 +796,8 @@ enum Standing {
     /// since claimed: takes attributes wherever it is.
     Made,
     /// Found existing: takes its times, and its mode and owner only when
-    /// asked for -- and then only where nobody else can create entries
-    /// beside it (`plib::madefs::found_dir_attrs`).
+    /// asked for -- and then only where nobody else could have created its
+    /// name, here or above it (`plib::madefs::ChainTrust::found_dir`).
     Ordinary,
 }
 

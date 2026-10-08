@@ -451,7 +451,7 @@ mod tests {
     }
 
     // others_can_rename, verify_made_dir, the read lend and what a directory
-    // found existing may be given (found_dir_attrs) are tested in
+    // found existing may be given (ChainTrust::found_dir) are tested in
     // plib::madefs.
 
     /// Where nobody but pax's user can rename entries in the parent, what is

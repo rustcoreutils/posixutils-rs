@@ -16,8 +16,8 @@
 //! descriptors.
 
 use crate::common::{
-    copy_file_at, error_string, preserve_through_fd, verify_made_dir, CopyConfig, InodeMap,
-    MadeTrust,
+    copy_file_at, error_string, finish_made_dir_mode, preserve_through_fd, verify_made_dir,
+    CopyConfig, InodeMap, MadeTrust,
 };
 use gettextrs::gettext;
 use std::collections::HashSet;
@@ -96,7 +96,8 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
         let src_md = next_src.metadata()?;
 
         // Owner search and write are needed to fill the directory; without -p the umask
-        // applies as it does to cp -R. Under -p it is made owner-only, and `preserve_dir` sets
+        // applies as it does to cp -R, and `finish_dir` takes back the owner bits the source
+        // lacks. Under -p it is made owner-only, and `finish_dir` sets
         // the exact mode through its descriptor once the owner is duplicated: until then it
         // belongs to whoever ran cp, and must not let others plant entries in it.
         let mode = if preserve {
@@ -140,12 +141,23 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
     Ok((made, dest_dir))
 }
 
-/// `-p` for a directory `--parents` made: owner, mode and times of its source directory.
+/// The final attributes of a directory `--parents` made, set once the copy below it is done.
+///
+/// Under -p: owner, mode and times of its source directory.
 /// The same code as every other -p through a held descriptor (`preserve_through_fd`): set-user-ID
 /// and set-group-ID are dropped when the owner cannot be copied, and a directory trusted only
 /// as owned like its parent gets times but no owner or mode.
-fn preserve_dir(dir: &MadeDir) -> io::Result<()> {
-    preserve_through_fd(dir.dest.as_raw_fd(), &dir.source, &dir.path, dir.trust)
+///
+/// Without -p it gets its source's permission bits less the umask (`finish_made_dir_mode`),
+/// taking back the S_IRWXU `make_parents` added. POSIX has no --parents; this is the mode GNU
+/// cp gives these directories, and the one POSIX cp 2.g gives a directory `cp -R` makes.
+fn finish_dir(dir: &MadeDir, preserve: bool, umask: u32) -> io::Result<()> {
+    let fd = dir.dest.as_raw_fd();
+    if preserve {
+        preserve_through_fd(fd, &dir.source, &dir.path, dir.trust)
+    } else {
+        finish_made_dir_mode(fd, &dir.source, umask, &dir.path)
+    }
 }
 
 /// Copy each source to `target` joined with the source's own path. Returns false if anything
@@ -162,6 +174,8 @@ where
 {
     let mut ok = true;
     let mut created_files = HashSet::new();
+    // Read once: each read is a pair of umask(2) calls.
+    let umask = plib::modestr::umask();
     for source in sources {
         let (made, dest_dir) = match make_parents(source, target, cfg.preserve) {
             Ok(pair) => pair,
@@ -193,12 +207,10 @@ where
             }
             ok = false;
         }
-        if cfg.preserve {
-            for dir in &made {
-                if let Err(e) = preserve_dir(dir) {
-                    eprintln!("cp: {}", error_string(&e));
-                    ok = false;
-                }
+        for dir in &made {
+            if let Err(e) = finish_dir(dir, cfg.preserve, umask) {
+                eprintln!("cp: {}", error_string(&e));
+                ok = false;
             }
         }
     }

@@ -483,6 +483,70 @@ pub fn preserve_through_fd(
     Ok(())
 }
 
+/// The mode a directory cp made without -p ends with (POSIX cp 2.g): the source's nine file
+/// permission bits less the umask, in place of the S_IRWXU-widened ones 2.e created it with.
+/// Every bit above those nine stays as `made` has it -- the sticky bit `mkdirat` applied, a
+/// set-group-ID bit inherited from its parent -- as GNU cp leaves them.
+fn made_dir_mode(made: u32, source: u32, umask: u32) -> u32 {
+    (made & 0o7000) | (source & 0o777 & !umask)
+}
+
+/// POSIX cp 2.g without -p, for a directory cp made, once its contents are copied: set its
+/// mode (`made_dir_mode`) through the descriptor cp holds for it, never by name. Nothing is
+/// changed when the mode is already right.
+pub fn finish_made_dir_mode(
+    fd: libc::c_int,
+    source_md: &impl MetadataExt,
+    umask: u32,
+    target: &Path,
+) -> io::Result<()> {
+    let set_mode_error = |e: &io::Error| {
+        io::Error::other(gettext!(
+            "cannot set permissions for '{}': {}",
+            target.display(),
+            error_string(e)
+        ))
+    };
+    let made = fd_metadata(fd).map_err(|e| set_mode_error(&e))?.mode() & 0o7777;
+    let wanted = made_dir_mode(made, source_md.mode(), umask);
+    if wanted != made && unsafe { libc::fchmod(fd, wanted as libc::mode_t) } != 0 {
+        return Err(set_mode_error(&io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// A destination directory's attributes, once its contents are copied so nothing written into
+/// it moves its times afterwards: under -p the source's owner, mode and times, on every
+/// directory; without -p the final mode of one this copy made (`finish_made_dir_mode`), and
+/// nothing on one it found. Applied through `fd`, the descriptor the copy has held for the
+/// directory since it entered it, never by name; whether it was made is read from that
+/// descriptor's identity. The source's metadata is what the walk recorded when it stat'ed the
+/// directory, before reading it: the read moved its access time, and GNU keeps the original.
+fn finish_dir(
+    fd: libc::c_int,
+    source: &ftw::Entry<'_>,
+    made_dirs: &HashMap<(u64, u64), MadeTrust>,
+    preserve: bool,
+    umask: u32,
+    target: &Path,
+) -> io::Result<()> {
+    let dest_md = fd_metadata(fd)?;
+    let made = made_dirs.get(&(dest_md.dev(), dest_md.ino())).copied();
+    if !preserve && made.is_none() {
+        return Ok(());
+    }
+    let source_md = source
+        .metadata()
+        .ok_or_else(|| io::Error::other(gettext!("cannot stat '{}'", source.path())))?;
+    if preserve {
+        // A directory made but trusted only as owned like its parent gets no owner and no
+        // mode.
+        preserve_through_fd(fd, source_md, target, made.unwrap_or(MadeTrust::Full))
+    } else {
+        finish_made_dir_mode(fd, source_md, umask, target)
+    }
+}
+
 /// The source's metadata as it is now, through the directory descriptor the walk used, and
 /// required to be the very file the walk recorded: an entry swapped since must not lend its
 /// owner and mode to the copy. Used for symbolic links and special files, whose data cp does
@@ -920,11 +984,11 @@ where
         if !target_exists {
             unsafe {
                 // Creates the target directory with the same file permission bits as the source,
-                // modified by the umask of the process. Copying the permission bits without the
-                // umask is postponed to the `postprocess_dir` closure on the call to
-                // `traverse_directory` inside `copy_file`. Under -p it is made owner-only: until
-                // that closure duplicates the owner, the directory belongs to whoever ran cp, and
-                // group or other write permission would let others plant entries in it.
+                // modified by the umask of the process and OR'ed with S_IRWXU. Its final mode
+                // (2.g; under -p, the source's without the umask) is set by `finish_dir` once
+                // its contents are copied. Under -p it is made owner-only: until `finish_dir`
+                // duplicates the owner, the directory belongs to whoever ran cp, and group or
+                // other write permission would let others plant entries in it.
                 let mode = if cfg.preserve {
                     libc::S_IRWXU
                 } else {
@@ -1764,9 +1828,12 @@ where
     // (st_dev, st_ino) of every destination directory this copy creates or enters. A source
     // directory found in here is one we are copying *into*.
     let dest_dir_ids = RefCell::new(HashSet::<(u64, u64)>::new());
-    // (st_dev, st_ino) of the destination directories this copy made but trusts only as
-    // `MadeTrust::ParentOwnerOnly`: -p gives them no owner and no mode.
-    let parent_owner_only_dirs = RefCell::new(HashSet::<(u64, u64)>::new());
+    // (st_dev, st_ino) of every destination directory this copy made, with how far
+    // `verify_made_dir` trusts it. Without -p each one gets its final mode once filled; under
+    // -p one trusted only as `MadeTrust::ParentOwnerOnly` gets no owner and no mode.
+    let made_dirs = RefCell::new(HashMap::<(u64, u64), MadeTrust>::new());
+    // Read once: each read is a pair of umask(2) calls.
+    let umask = plib::modestr::umask();
     let target_dir_path = RefCell::new(top_dir_path);
     let terminate = RefCell::new(false);
     let last_error = RefCell::new(None);
@@ -1937,11 +2004,7 @@ where
                                         fd.as_raw_fd(),
                                         &target,
                                     )?;
-                                    if trust == MadeTrust::ParentOwnerOnly {
-                                        parent_owner_only_dirs
-                                            .borrow_mut()
-                                            .insert((md.dev(), md.ino()));
-                                    }
+                                    made_dirs.borrow_mut().insert((md.dev(), md.ino()), trust);
                                     Ok((fd, md))
                                 }
                             }
@@ -2010,7 +2073,7 @@ where
     // Pops unconditionally. `ftw` calls this for every directory whose handler returned
     // `true`, including ones it then could not descend into; leaving the push in place there
     // would silently redirect every later file into the wrong destination directory.
-    // The target directory exists either way, so `-p` still applies to it.
+    // The target directory exists either way, so `finish_dir` still applies to it.
     let postprocess_dir = |source: ftw::Entry<'_>, _exit| -> Result<(), ()> {
         let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
         let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
@@ -2019,30 +2082,16 @@ where
         target_dir_path_borrowed.pop();
         let target_dir = target_dirfd_stack_borrowed.pop();
 
-        // Preserve metadata for directories, after their contents so nothing written into
-        // them moves their times afterwards. Applied through the descriptor this copy has
-        // held for the directory since it entered it, never by name. The source's metadata
-        // is what the walk recorded when it stat'ed the directory, before reading it: the
-        // read moved its access time, and GNU keeps the original too.
-        if let (true, Some(target_dir)) = (cfg.preserve, target_dir) {
-            let recorded = source
-                .metadata()
-                .ok_or_else(|| io::Error::other(gettext!("cannot stat '{}'", source.path())));
-            // A directory made but trusted only as owned like its parent gets no owner and
-            // no mode; its identity comes from the descriptor held for it.
-            let trust = fd_metadata(target_dir.as_raw_fd()).map(|md| {
-                if parent_owner_only_dirs
-                    .borrow()
-                    .contains(&(md.dev(), md.ino()))
-                {
-                    MadeTrust::ParentOwnerOnly
-                } else {
-                    MadeTrust::Full
-                }
-            });
-            if let Err(e) = recorded.and_then(|source_md| {
-                preserve_through_fd(target_dir.as_raw_fd(), source_md, &dir_path, trust?)
-            }) {
+        if let Some(target_dir) = target_dir {
+            let finished = finish_dir(
+                target_dir.as_raw_fd(),
+                &source,
+                &made_dirs.borrow(),
+                cfg.preserve,
+                umask,
+                &dir_path,
+            );
+            if let Err(e) = finished {
                 // Same policy as the file case: never fatal, exit-status only for cp.
                 eprintln!("{}: {}", cfg.prog, error_string(&e));
                 if cfg.continue_on_error {

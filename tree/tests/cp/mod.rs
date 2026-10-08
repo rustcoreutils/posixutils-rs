@@ -8,6 +8,7 @@
 //
 
 mod debhelper;
+mod dirmode;
 mod race;
 
 use plib::testing::{run_test, TestPlan};
@@ -1191,6 +1192,10 @@ fn test_cp_unreadable_subdir_does_not_misplace_siblings() {
     );
 
     fs::set_permissions(locked, fs::Permissions::from_mode(0o755)).unwrap();
+    // The copy cp made of it ends with the source's mode (POSIX cp 2.g), as GNU cp leaves it.
+    let locked_copy = &format!("{dst}/aaa_locked");
+    assert_eq!(fs::metadata(locked_copy).unwrap().mode() & 0o7777, 0o000);
+    fs::set_permissions(locked_copy, fs::Permissions::from_mode(0o755)).unwrap();
 
     for name in ["zzz_b", "zzz_c", "zzz_d"] {
         assert!(

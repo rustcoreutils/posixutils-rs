@@ -205,7 +205,10 @@ fn link_through_a_retargeted_symlink_leaves_no_link_to_the_new_target() {
 /// The same retargeting, and the link `linkat` makes renamed away by a writer
 /// of the destination before pax can check and remove it: no second name for
 /// the private file may exist anywhere when pax is done -- the link must
-/// never be made at all.
+/// never be made at all. Linux only: elsewhere the link is made by name and
+/// removed after a check, and a writer who renames it away first keeps it --
+/// an accepted residual (`LinkSource::check_linked`).
+#[cfg(target_os = "linux")]
 #[test]
 fn retargeted_link_is_never_made_even_briefly() {
     use std::os::unix::fs::MetadataExt;

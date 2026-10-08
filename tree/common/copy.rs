@@ -252,54 +252,72 @@ pub enum OperandTrust {
 /// the name of a source directory it does not stand for, and it would take that one's mode.
 ///
 /// Nor is it the run's own once anything but cp has changed it since cp last did: its
-/// status-change time must be the one cp noted then. An inode number is reused -- ext4 hands a
-/// freed one straight back -- so whoever could remove the directory (an empty one, from a
-/// parent they can write that is not sticky) could make one of their own at its path under its
-/// number; that one's status-change time is its making, after cp's last change. cp notes its
-/// own changes from the descriptor it has held throughout -- a directory held open keeps its
-/// number from being reused -- once it has filled and finished one (`refresh`), so an honest
-/// later operand still finds it unchanged. Residual: a status-change time has the grain of the
-/// clock tick the kernel stamps it with (a few milliseconds on Linux without fine-grained
-/// timestamps), and a directory removed and remade within the tick of cp's last change, under
-/// the same number, passes for the one made. The birth time (statx, `st_birthtime`) would not
-/// narrow that: it is stamped from the same clock. Recording a directory replaces whatever its
-/// number stood for.
+/// status-change time, owner, group and mode must be the ones cp left it with. An inode number
+/// is reused -- ext4 hands a freed one straight back -- so whoever could remove the directory
+/// (an empty one, from a parent they can write that is not sticky) could make one of their own
+/// at its path under its number. That one's status-change time is its making, after cp's last
+/// change; but the time has the grain of the clock tick the kernel stamps it with (a whole
+/// second on ext4 with 128-byte inodes, HFS+ and NFSv3), so within that tick it is the owner
+/// that tells them apart: someone else's `mkdir` gives the directory their own uid, which cp
+/// did not leave there -- unless cp gave the one it made that very owner (-p, as root, from a
+/// source of theirs), and then the directory was theirs already, and passing one of theirs for
+/// it hands them nothing they did not have. That is the residual, with root, who can make a
+/// directory with any owner. cp notes its own changes from the descriptor it has held
+/// throughout -- a directory held open keeps its number from being reused -- once it has filled
+/// and finished one (`refresh`), so an honest later operand still finds it unchanged.
+/// Recording a directory replaces whatever its number stood for.
 #[derive(Default)]
 pub struct MadeDirs(HashMap<(u64, u64), MadeAt>);
 
-/// Where a directory this run made is, and its status-change time when cp last changed it.
+/// Where a directory this run made is, and its status as cp last left it.
 struct MadeAt {
     path: PathBuf,
-    ctime: (i64, i64),
+    left: LeftAs,
 }
 
-/// `(st_dev, st_ino)` and `st_ctim` of `md`.
-fn id_and_ctime(md: &impl MetadataExt) -> ((u64, u64), (i64, i64)) {
-    ((md.dev(), md.ino()), (md.ctime(), md.ctime_nsec()))
+/// What of a directory's status cp checks it left unchanged: its status-change time, owner,
+/// group and mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LeftAs {
+    ctime: (i64, i64),
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+/// `(st_dev, st_ino)` of `md`, and what `LeftAs` keeps of it.
+fn id_and_status(md: &impl MetadataExt) -> ((u64, u64), LeftAs) {
+    let left = LeftAs {
+        ctime: (md.ctime(), md.ctime_nsec()),
+        uid: md.uid(),
+        gid: md.gid(),
+        mode: md.mode(),
+    };
+    ((md.dev(), md.ino()), left)
 }
 
 impl MadeDirs {
     /// Record the directory `md` describes, just made at `path` and verified in full.
     pub fn record(&mut self, md: &impl MetadataExt, path: &Path) {
-        let (id, ctime) = id_and_ctime(md);
+        let (id, left) = id_and_status(md);
         let path = path.to_path_buf();
-        self.0.insert(id, MadeAt { path, ctime });
+        self.0.insert(id, MadeAt { path, left });
     }
 
     /// Whether the directory `md` describes, found at `path`, is one this run made there.
     pub fn made_at(&self, md: &impl MetadataExt, path: &Path) -> bool {
-        let (id, ctime) = id_and_ctime(md);
+        let (id, left) = id_and_status(md);
         self.0
             .get(&id)
-            .is_some_and(|at| at.path == path && at.ctime == ctime)
+            .is_some_and(|at| at.path == path && at.left == left)
     }
 
     /// Note what cp has just changed on the directory `md` describes, which this run made at
     /// `path` and has held since it found it to be so (`made_at`).
     pub fn refresh(&mut self, md: &impl MetadataExt, path: &Path) {
-        let (id, ctime) = id_and_ctime(md);
+        let (id, left) = id_and_status(md);
         if let Some(at) = self.0.get_mut(&id).filter(|at| at.path == path) {
-            at.ctime = ctime;
+            at.left = left;
         }
     }
 }
@@ -2808,6 +2826,104 @@ mod tests {
         );
         assert_eq!(after.mode() & 0o7777, 0o600, "the mode was applied");
         assert_eq!(after.mtime(), 978_307_200, "the times were not applied");
+    }
+
+    /// What `fstat` might report of a directory: only what `MadeDirs` reads is set.
+    #[derive(Clone, Copy)]
+    struct Status {
+        ino: u64,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        ctime: i64,
+    }
+
+    impl std::os::unix::fs::MetadataExt for Status {
+        fn dev(&self) -> u64 {
+            1
+        }
+        fn ino(&self) -> u64 {
+            self.ino
+        }
+        fn mode(&self) -> u32 {
+            self.mode
+        }
+        fn nlink(&self) -> u64 {
+            2
+        }
+        fn uid(&self) -> u32 {
+            self.uid
+        }
+        fn gid(&self) -> u32 {
+            self.gid
+        }
+        fn rdev(&self) -> u64 {
+            0
+        }
+        fn size(&self) -> u64 {
+            0
+        }
+        fn atime(&self) -> i64 {
+            0
+        }
+        fn atime_nsec(&self) -> i64 {
+            0
+        }
+        fn mtime(&self) -> i64 {
+            0
+        }
+        fn mtime_nsec(&self) -> i64 {
+            0
+        }
+        fn ctime(&self) -> i64 {
+            self.ctime
+        }
+        fn ctime_nsec(&self) -> i64 {
+            0
+        }
+        fn blksize(&self) -> u64 {
+            4096
+        }
+        fn blocks(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Within one tick of the clock that stamps ctime, a directory removed and made again at
+    /// its path under the same inode number has the made one's ctime. It still does not pass
+    /// for the made one unless it also has the owner, group and mode cp left that one with --
+    /// and someone else's `mkdir` gives it their own uid.
+    #[test]
+    fn a_made_directory_is_known_by_its_owner_group_and_mode_too() {
+        use super::MadeDirs;
+        // S_IFDIR, whose type is u16 on macOS and u32 on Linux.
+        const DIR: u32 = 0o040000;
+        let path = std::path::Path::new("dest/x");
+        let made = Status {
+            ino: 7,
+            uid: 1000,
+            gid: 1000,
+            mode: DIR | 0o755,
+            ctime: 1_000_000_000,
+        };
+        let mut dirs = MadeDirs::default();
+        dirs.record(&made, path);
+        assert!(dirs.made_at(&made, path));
+        for other in [
+            Status { uid: 1001, ..made },
+            Status { gid: 1001, ..made },
+            Status {
+                mode: DIR | 0o777,
+                ..made
+            },
+        ] {
+            assert!(!dirs.made_at(&other, path), "passed for the made one");
+        }
+        // What cp itself changes, it notes.
+        let chowned = Status { uid: 0, ..made };
+        dirs.refresh(&chowned, path);
+        assert!(dirs.made_at(&chowned, path));
+        assert!(!dirs.made_at(&made, path));
     }
 
     /// A directory this run made stops counting as made once anything but cp changes it --

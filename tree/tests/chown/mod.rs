@@ -686,3 +686,33 @@ fn test_chown_owner_colon_login_group() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// With -R -H only the operands are followed: a symlink met inside the tree
+/// is changed itself, never the file it points to. A group change shows it
+/// without root.
+#[test]
+fn test_chown_rh_does_not_follow_symlinks_inside_the_tree() {
+    let test_dir = &format!("{}/test_chown_rh_inner_link", env!("CARGO_TARGET_TMPDIR"));
+    let (d, outside, link) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/outside"),
+        &format!("{test_dir}/d/link"),
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::File::create(outside).unwrap();
+    unix::fs::symlink(outside, link).unwrap();
+    let outside_gid = fs::metadata(outside).unwrap().gid();
+    let Some(&other) = current_user_group_ids().iter().find(|&&g| g != outside_gid) else {
+        fs::remove_dir_all(test_dir).unwrap();
+        return; // a single group: nothing to change to
+    };
+
+    chown_test(&["-R", "-H", &format!(":{other}"), d], "", "", 0);
+    let outside_after = fs::metadata(outside).unwrap().gid();
+    let link_after = fs::symlink_metadata(link).unwrap().gid();
+    fs::remove_dir_all(test_dir).unwrap();
+
+    assert_eq!(outside_after, outside_gid, "the link's target was changed");
+    assert_eq!(link_after, other, "the link itself was not changed");
+}

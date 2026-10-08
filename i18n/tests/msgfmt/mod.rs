@@ -387,3 +387,83 @@ fn test_msgfmt_high_escapes_are_single_bytes() {
         r"\xe9 and \351 must each expand to the single byte 0xE9"
     );
 }
+
+/// Run msgfmt with `args` in `dir`; return (stderr, exit code).
+fn msgfmt_status(dir: &std::path::Path, args: &[&str]) -> (String, i32) {
+    let out = std::process::Command::new(plib::testing::get_binary_path("msgfmt"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("msgfmt");
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// po4a checks every PO file with
+/// `msgfmt --check-format --check-domain -o /dev/null FILE`.
+#[test]
+fn test_msgfmt_po4a_check_accepts_a_good_file() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#, c-format
+msgid "Hello %s, %d files"
+msgstr "Hola %s, %i archivos"
+
+msgid "No format %d here"
+msgstr "Sin formato"
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    let args = ["--check-format", "--check-domain", "-o", "/dev/null", po];
+    assert_eq!(msgfmt_status(dir.path(), &args), (String::new(), 0));
+}
+
+/// --check-format alone, without -c -v, checks c-format directives.
+#[test]
+fn test_msgfmt_check_format_rejects_a_mismatch() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#, c-format
+msgid "Hello %s"
+msgstr "Hola %d"
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    let (err, code) = msgfmt_status(dir.path(), &["--check-format", "-o", "/dev/null", po]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("format specifications"), "{err:?}");
+}
+
+/// --check-domain: a `domain` directive conflicts with -o, which ignores it.
+/// Without -o the directive names the output file, and nothing conflicts.
+#[test]
+fn test_msgfmt_check_domain_rejects_a_directive_under_o() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+domain "other"
+
+msgid "Hello"
+msgstr "Hola"
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    let (err, code) = msgfmt_status(dir.path(), &["--check-domain", "-o", "/dev/null", po]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("'domain other' directive ignored"), "{err:?}");
+
+    assert_eq!(
+        msgfmt_status(dir.path(), &["--check-domain", po]),
+        (String::new(), 0)
+    );
+    assert!(dir.path().join("other").exists());
+}

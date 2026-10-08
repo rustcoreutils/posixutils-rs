@@ -34,6 +34,12 @@ struct Args {
     #[arg(short = 'c', help = gettext("Check the PO file for validity"))]
     check: bool,
 
+    #[arg(long, help = gettext("Check that c-format translations use the same conversions as the original"))]
+    check_format: bool,
+
+    #[arg(long, help = gettext("Reject domain directives when an output file is named"))]
+    check_domain: bool,
+
     #[arg(short = 'f', help = gettext("Include fuzzy entries in the output"))]
     include_fuzzy: bool,
 
@@ -138,6 +144,8 @@ fn main() {
             }
         };
 
+        // Domains of this file already reported under --check-domain.
+        let mut ignored_domains = std::collections::HashSet::new();
         // Process entries (headers are tagged per domain and flow through here
         // as the empty-msgid entry).
         for entry in po.all_entries() {
@@ -170,9 +178,22 @@ fn main() {
                 continue;
             }
 
-            // Abnormality checks (only when both -c and -v are given).
-            if run_checks {
-                validate_entry(&path, entry, &mut diagnostics);
+            // Abnormality checks (all of them when both -c and -v are given).
+            if run_checks || args.check_format {
+                validate_entry(&path, entry, run_checks, &mut diagnostics);
+            }
+
+            // --check-domain: -o ignores every `domain` directive, so one is a
+            // conflict (reported once per domain and file).
+            if let (true, Some(_), Some(name)) = (args.check_domain, &args.output, &entry.domain) {
+                if ignored_domains.insert(name.clone()) {
+                    diagnostics.push(Diagnostic {
+                        file: path.display().to_string(),
+                        line: None,
+                        message: format!("'domain {}' directive ignored", name),
+                        is_error: true,
+                    });
+                }
             }
 
             let domain = entry.domain.clone().unwrap_or_else(default_domain);
@@ -317,11 +338,12 @@ fn boundary_newline_mismatch(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Validate a PO entry, recording genuine abnormalities as errors (affecting the
-/// exit status) and softer findings as warnings. Only called when both -c and
-/// -v are given.
+/// exit status) and softer findings as warnings. With `all` (-c -v) every check
+/// runs; without it (`--check-format`) only the c-format comparison.
 fn validate_entry(
     path: &std::path::Path,
     entry: &posixutils_i18n::gettext_lib::po_file::PoEntry,
+    all: bool,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let file = path.display().to_string();
@@ -350,7 +372,7 @@ fn validate_entry(
         };
 
         // Abnormality: boundary <newline> mismatch.
-        if boundary_newline_mismatch(source, msgstr) {
+        if all && boundary_newline_mismatch(source, msgstr) {
             diagnostics.push(Diagnostic {
                 file: file.clone(),
                 line: None,
@@ -383,7 +405,7 @@ fn validate_entry(
     }
 
     // Softer finding: empty translation of a non-empty source (informational).
-    if !entry.msgid.is_empty() && entry.msgstr.iter().all(|s| s.is_empty()) {
+    if all && !entry.msgid.is_empty() && entry.msgstr.iter().all(|s| s.is_empty()) {
         diagnostics.push(Diagnostic {
             file,
             line: None,

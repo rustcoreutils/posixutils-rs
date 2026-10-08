@@ -412,6 +412,17 @@ POSIX specifies only `-k`.  Every other option is an addition:
  * Input is decoded as UTF-8 regardless of `LC_CTYPE`, so text stays readable
    under `LC_ALL=C`.
 
+### msgfmt
+
+The two GNU checks po4a runs on every PO file
+(`msgfmt --check-format --check-domain -o /dev/null FILE`):
+
+ * `--check-format` — each `c-format` translation must use the same
+   conversions as its original, the check `-c -v` makes among others; a
+   mismatch is an error.
+ * `--check-domain` — with `-o`, which ignores `domain` directives, each
+   domain a file names is reported as an error.
+
 ### newgrp
 
  * `SHELL` is consulted for the shell to exec.  POSIX derives it from the user

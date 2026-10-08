@@ -263,11 +263,10 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
 /// Every directory is made fresh under a name no one could predict, and
 /// readable only by this user: locally by `mkdtemp`, which also serves to
 /// stage files on their way to a remote execution host; on a remote host by
-/// `mkdir -m 700` of a name derived from the local one, which fails rather
-/// than reuse anything already there. Both are removed when this is dropped.
+/// `mkdir -m 700` of a name of its own from the system's random source, which
+/// fails rather than reuse anything already there. Both are removed when
+/// this is dropped.
 struct WorkDir {
-    /// Declared first so that it drops first: the remote directory goes
-    /// before the local name it was derived from is released.
     remote: Option<RemoteDir>,
     /// Held for its removal on drop; its path is `local_path`.
     _local: TempDir,
@@ -282,7 +281,7 @@ impl WorkDir {
         let remote = if exec_local {
             None
         } else {
-            let name = format!("{}.exec", local_path.rsplit('/').next().unwrap_or("uux"));
+            let name = random_dir_name().map_err(fail)?;
             Some(RemoteDir::create(exec_host, &name)?)
         };
         Ok(WorkDir {
@@ -351,6 +350,15 @@ impl RemoteDir {
             }
         }
     }
+}
+
+/// A name for a remote work directory: `uux.` and 128 bits from the
+/// system's random source, as hex, so nothing seen locally predicts it.
+fn random_dir_name() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("uux.{hex}"))
 }
 
 /// The line the remote shell prints just before the work directory's path.

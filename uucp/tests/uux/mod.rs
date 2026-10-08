@@ -274,6 +274,34 @@ fn test_uux_remote_work_dir_survives_startup_output() {
     assert_private_work_dir(&fake, &read(&out));
 }
 
+/// The remote work directory's name is random in its own right: one that
+/// could be read off a listing of the local temporary directory would let
+/// anyone there make it first on the execution host.
+#[test]
+fn test_uux_remote_work_dir_name_is_not_the_local_one() {
+    let fake = FakeSsh::new("uux_remote_name");
+    let (out, log) = (fake.join("out"), fake.join("log"));
+    let cmd = format!("hosta!ls -ld \"$PWD\" > !{}", out.display());
+    let hook = format!(
+        "case \"$5\" in *mkdir*) ls \"$TMPDIR\" > '{}';; esac",
+        log.display()
+    );
+
+    let output = fake.run("uux", &[&cmd], &hook);
+
+    assert!(output.status.success(), "{output:?}");
+    let listing = read(&out);
+    let remote = listing.trim_end().rsplit('/').next().unwrap().to_string();
+    let local = read(&log);
+    let local = local.trim();
+    let suffix = local.rsplit('.').next().unwrap();
+    assert!(local.starts_with("uux."), "local dir: {local:?}");
+    assert!(
+        !remote.contains(suffix),
+        "remote {remote:?} derived from local {local:?}"
+    );
+}
+
 /// If the remote work directory is made but its path cannot be read back
 /// (here the stand-in ssh discards the command's output), uux fails and
 /// still removes the directory.

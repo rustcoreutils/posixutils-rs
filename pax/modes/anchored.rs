@@ -278,7 +278,14 @@ impl DirTree {
         for comp in member.dirs().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
             let (next, origin) = open_or_create_dir_at(at, comp, create_missing)?;
-            let st = self.admit(next.as_fd(), origin)?;
+            let st = match self.admit(next.as_fd(), origin) {
+                Ok(st) => st,
+                Err(e) => {
+                    // `refuse_replaced` cannot reach the chain from here.
+                    chain.truncate(0);
+                    return Err(e);
+                }
+            };
             let id = file_id(&st);
             match origin {
                 DirOrigin::Made => self.record_made(id, MadeTrust::Full, true),
@@ -337,12 +344,18 @@ impl DirTree {
     /// Record the directory with `id` as found in place of one this run
     /// made, and fail.
     ///
-    /// Only a directory met at that very moment is recorded -- one never
-    /// admitted before -- so a descriptor `admit` has passed can never become
-    /// a refused one later: the chain and `last_parent` reuse admitted
-    /// descriptors without asking again.
+    /// It may be one the walk already holds a descriptor for -- moved away
+    /// from its name and renamed back over the new directory made there --
+    /// and the chain and `last_parent` reuse their descriptors without asking
+    /// again. So every cached descriptor is dropped here, and the next member
+    /// walks afresh, through `admit`. (Inside `walk_chain`, which holds the
+    /// chain, the walk drops it itself on the way out.)
     fn refuse_replaced(&self, id: (u64, u64)) -> PaxError {
         self.replaced.borrow_mut().insert(id);
+        *self.last_parent.borrow_mut() = None;
+        if let Ok(mut chain) = self.chain.try_borrow_mut() {
+            chain.truncate(0);
+        }
         PaxError::Io(made::replaced())
     }
 
@@ -1801,6 +1814,43 @@ mod tests {
             use std::os::unix::fs::MetadataExt;
             assert_ne!(md.mtime(), 12345, "{name} was stamped");
         }
+    }
+
+    /// A directory the walk holds a descriptor for can later be found renamed
+    /// over one this run made: moved away, and back over the new directory
+    /// of its old name. Once refused, the walk's cached descriptor for it
+    /// must not take a member there either.
+    #[test]
+    fn test_a_cached_directory_found_replaced_is_not_reused() {
+        use crate::modes::race_hook::{self, Point};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = plib::tmp::TempDir::new().unwrap();
+        // Others may rename entries in it, so a made directory is verified.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+
+        // The walk makes `a` and keeps a descriptor for it.
+        tree.parent_of(&member("a/x"), true).unwrap();
+        std::fs::write(dir.path().join("a/x"), "").unwrap();
+        // It is moved away; a member naming `a` makes a new one, and the old
+        // one is renamed back over it.
+        let away = dir.path().join("away");
+        std::fs::rename(dir.path().join("a"), &away).unwrap();
+        let away_c = CString::new(away.as_os_str().as_bytes()).unwrap();
+        let hook = move |point, dirfd, name: &CStr| {
+            if point == Point::MadeDir && name == c"a" {
+                race_hook::swap_for_directory(dirfd, name, &away_c);
+            }
+        };
+        let made =
+            race_hook::with_hook(hook, || make_dir_at(&tree, tree.root(), c"a", 0o755, false));
+        assert!(made.is_err(), "the directory renamed over it was taken");
+
+        assert!(
+            tree.parent_of(&member("a/y"), true).is_err(),
+            "a cached descriptor reached the refused directory"
+        );
+        assert!(!dir.path().join("a/y").exists());
     }
 
     /// Past the descriptor budget the chain stops growing, and a walk still

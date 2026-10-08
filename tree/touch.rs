@@ -13,6 +13,7 @@ use gettextrs::gettext;
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// touch - change file access and modification times
@@ -218,6 +219,11 @@ fn not_found(
     not_found: io::Error,
 ) -> io::Result<()> {
     match open_err.raw_os_error() {
+        // A dangling symlink: the file does not exist, and POSIX creates it with creat(),
+        // which follows the link and creates its target.
+        Some(libc::EEXIST) if is_symlink(path) => {
+            set_times_fd(&create_through_symlink(path)?, times)
+        }
         // The name existed when the create was tried and is gone now: POSIX would have created
         // the file, so try once more.
         Some(libc::EEXIST) => match create_new(path) {
@@ -244,6 +250,25 @@ fn create_new(path: &CStr) -> io::Result<OwnedFd> {
         | libc::O_NONBLOCK
         | libc::O_NOCTTY
         | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(path.as_ptr(), flags, 0o666 as libc::c_int) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Whether `path` names a symlink itself.
+fn is_symlink(path: &CStr) -> bool {
+    let path = std::ffi::OsStr::from_bytes(path.to_bytes());
+    std::fs::symlink_metadata(path).is_ok_and(|md| md.file_type().is_symlink())
+}
+
+/// Create the file a dangling symlink `path` names, as creat() does, following the link.
+/// Without `O_TRUNC` a file that has appeared there since is not emptied; `O_NONBLOCK` and
+/// `O_NOCTTY` keep the open from waiting on a FIFO or acquiring a terminal.
+fn create_through_symlink(path: &CStr) -> io::Result<OwnedFd> {
+    let flags =
+        libc::O_CREAT | libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
     let fd = unsafe { libc::open(path.as_ptr(), flags, 0o666 as libc::c_int) };
     if fd < 0 {
         return Err(io::Error::last_os_error());

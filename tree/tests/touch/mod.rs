@@ -260,3 +260,27 @@ fn test_touch_dangling_symlink_trailing_slash() {
     );
     assert!(!created);
 }
+
+/// POSIX touch creates a file that does not exist as creat() would, and
+/// creat() follows a symlink: the dangling symlink's target is created, and
+/// given the requested times.
+#[test]
+fn test_touch_dangling_symlink_creates_target() {
+    let d = dir("test_touch_dangling_symlink_creates_target");
+    let (link, target) = (format!("{d}/link"), format!("{d}/target"));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let out = touch(Some("UTC"), &["-t", "200001010000", &link]);
+    let target_md = fs::symlink_metadata(&target);
+    let link_is_symlink = fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink();
+    let m = target_md.as_ref().ok().map(|_| mtime_secs(&target));
+    fs::remove_dir_all(&d).unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(target_md.unwrap().is_file());
+    assert!(link_is_symlink);
+    assert_eq!(m, Some(946_684_800));
+}

@@ -8,6 +8,8 @@
 //
 
 mod bytes;
+#[cfg(unix)]
+mod wfile;
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 

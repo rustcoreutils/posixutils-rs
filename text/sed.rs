@@ -19,7 +19,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Error, ErrorKind, Write},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 static ERE: Mutex<bool> = Mutex::new(false);
@@ -128,6 +128,7 @@ impl Args {
             current_end: None,
             next_line: Vec::new(),
             append_queue: Vec::new(),
+            wfiles: WFiles::default(),
         })
     }
 }
@@ -1483,11 +1484,13 @@ fn expand_replacement(replacement: &str, haystack: &[u8], caps: &[Range<usize>])
 }
 
 /// Execute [`Command::Replace`] for current [`Sed`] line; `end` is the line's
-/// terminator, written after the pattern space by the `w` flag
+/// terminator, written after the pattern space by the `w` flag to its file
+/// in `wfiles`
 fn execute_replace(
     pattern_space: &mut Vec<u8>,
     end: &[u8],
     command: Command,
+    wfiles: &mut WFiles,
 ) -> Result<bool, SedError> {
     let Command::Replace(_, re, _, replacement, flags) = command else {
         unreachable!();
@@ -1532,14 +1535,9 @@ fn execute_replace(
         Some(wfile)
     }) {
         if replace && wfile.components().next().is_some() {
-            // Relative wfile paths are resolved against the current working
-            // directory (the wfile was pre-created/truncated at startup).
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(wfile)
-                .map_err(SedError::Io)
-            {
+            // The wfile was created at startup; a file that could not be is
+            // skipped here, as it always was.
+            if let Ok(file) = wfiles.get(wfile) {
                 let _ = file.write_all(&[pattern_space.as_slice(), end].concat());
             }
         }
@@ -1618,6 +1616,53 @@ struct Sed {
     current_end: Option<String>,
     /// Output deferred by `a`/`r`, flushed just before the next input line.
     append_queue: Vec<AppendItem>,
+    /// The wfiles of `w` commands and `s///w` flags
+    wfiles: WFiles,
+}
+
+/// The wfiles of a script, each opened once and kept open.
+///
+/// POSIX: "each wfile shall be created before processing begins". Every
+/// write then goes to the file created then, through its descriptor, not to
+/// whatever has the name later. A name used more than once is one file.
+#[derive(Default)]
+struct WFiles(HashMap<PathBuf, Result<File, String>>);
+
+impl WFiles {
+    /// Create (truncate) `path`, unless it is already open. The outcome, an
+    /// open file or the error text, is kept for each write to report.
+    fn create(&mut self, path: &Path) {
+        let _ = self.get(path);
+    }
+
+    /// The open file for `path`, created now if it was not before, or the
+    /// text of the error that kept it from being created.
+    fn get(&mut self, path: &Path) -> Result<&mut File, &str> {
+        match self
+            .0
+            .entry(path.to_path_buf())
+            .or_insert_with(|| open_wfile(path))
+        {
+            Ok(file) => Ok(file),
+            Err(text) => Err(text),
+        }
+    }
+}
+
+/// Create (truncate) the wfile `path` for writing. Each write appends, as
+/// when the file was reopened for every write, so a wfile that is also this
+/// process's standard output, such as `/dev/stdout`, interleaves the same.
+fn open_wfile(path: &Path) -> Result<File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_APPEND);
+    }
+    options
+        .open(path)
+        .map_err(|e| plib::diag::io_error_text(&e))
 }
 
 impl Sed {
@@ -1964,6 +2009,7 @@ impl Sed {
             &mut self.pattern_space,
             &end,
             Command::Replace(address, regex.clone(), pattern, replacement, flags),
+            &mut self.wfiles,
         )?;
         self.last_regex = Some(regex);
         Ok(())
@@ -1993,31 +2039,24 @@ impl Sed {
             }
         }
         for path in paths {
-            // Best-effort: errors (e.g. missing parent dir) are surfaced later
-            // at write time, preserving existing runtime diagnostics.
-            let _ = File::create(&path);
+            // An error (e.g. a missing parent dir) is kept and reported by
+            // the first write to the file.
+            self.wfiles.create(&path);
         }
     }
 
     fn execute_w(&mut self, wfile: PathBuf) -> Result<(), SedError> {
-        let _ = match std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(wfile.clone())
-        {
-            Ok(mut file) => file.write_all(&[self.pattern_space.as_slice(), self.end()].concat()),
-            Err(err) => {
-                return Err(SedError::Io(Error::new(
-                    ErrorKind::NotFound,
-                    format!(
-                        "can't find '{}': {}",
-                        wfile.display(),
-                        plib::diag::io_error_text(&err).to_lowercase()
-                    ),
-                )));
+        let line = [self.pattern_space.as_slice(), self.end()].concat();
+        match self.wfiles.get(&wfile) {
+            Ok(file) => {
+                let _ = file.write_all(&line);
+                Ok(())
             }
-        };
-        Ok(())
+            Err(text) => Err(SedError::Io(Error::new(
+                ErrorKind::NotFound,
+                format!("can't find '{}': {}", wfile.display(), text.to_lowercase()),
+            ))),
+        }
     }
 
     fn execute_x(&mut self) {

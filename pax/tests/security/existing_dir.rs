@@ -7,24 +7,33 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! A directory member whose name someone else created first. POSIX lets pax
-//! extract into an existing directory, but in a parent others can create
-//! entries in, the directory found there may be anyone's renamed to the
-//! member's name -- a private one of the user's own, say -- and giving it the
+//! A directory member whose name is already a directory. POSIX lets pax
+//! extract into it. Like libarchive, pax changes such a directory's mode only
+//! under `-p p` (or `-p e`), and its owner only under `-p o`; and then only
+//! where nobody else could have created the name first -- in a parent others
+//! can create entries in, the directory there may be anyone's renamed to the
+//! member's name, a private one of the user's own included, and giving it the
 //! archive's mode would open it up.
 
 use plib::tmp::TempDir;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
-/// An archive holding a directory `d`, mode 0755, with a file in it.
-fn archive_with_open_directory(temp: &TempDir) -> std::path::PathBuf {
+/// A source tree with a directory `d`, mode 0755, holding a file.
+fn source_tree(temp: &TempDir) -> PathBuf {
     let src = temp.path().join("src");
     fs::create_dir_all(src.join("d")).unwrap();
     fs::write(src.join("d/f"), "data\n").unwrap();
     fs::set_permissions(src.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+    src
+}
+
+/// An archive of `source_tree`'s `d` and `d/f`.
+fn archive_with_open_directory(temp: &TempDir) -> PathBuf {
+    let src = source_tree(temp);
     let mut write = Command::new(env!("CARGO_BIN_EXE_pax"))
         .args(["-w", "-f", "../a.tar"])
         .current_dir(&src)
@@ -42,63 +51,151 @@ fn archive_with_open_directory(temp: &TempDir) -> std::path::PathBuf {
     temp.path().join("a.tar")
 }
 
-#[test]
-fn test_extract_leaves_a_renamed_in_private_directory_closed() {
-    let temp = TempDir::new().unwrap();
-    let archive = archive_with_open_directory(&temp);
-
-    // A destination anyone may create entries in, holding a private
-    // directory of the user's own, renamed to the member's name before pax
-    // runs.
+/// A destination of mode `mode` holding an existing directory `d` of mode
+/// 0700 with a file in it -- in the attack, the user's own private
+/// `secrets`, renamed to the member's name before pax runs.
+fn dest_with_private_d(temp: &TempDir, mode: u32) -> PathBuf {
     let dest = temp.path().join("dest");
     fs::create_dir(&dest).unwrap();
-    fs::set_permissions(&dest, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).unwrap();
     fs::create_dir(dest.join("secrets")).unwrap();
     fs::write(dest.join("secrets/key"), "secret\n").unwrap();
     fs::set_permissions(dest.join("secrets"), fs::Permissions::from_mode(0o700)).unwrap();
     fs::rename(dest.join("secrets"), dest.join("d")).unwrap();
+    dest
+}
 
-    let out = Command::new(env!("CARGO_BIN_EXE_pax"))
-        .args(["-r", "-p", "e", "-f"])
-        .arg(&archive)
-        .current_dir(&dest)
+/// Run pax with `args` in `dir`.
+fn pax(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(args)
+        .current_dir(dir)
         .stdin(Stdio::null())
         .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+        .unwrap()
+}
 
-    let mode = fs::metadata(dest.join("d")).unwrap().permissions().mode() & 0o7777;
-    assert_eq!(mode, 0o700, "the private directory was opened up");
+fn mode_of(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+const DIAGNOSTIC: &str = "not applying owner, mode or times";
+
+/// Without -p p, an existing directory keeps its mode: nothing is wrong, and
+/// nothing is said.
+#[test]
+fn test_extract_without_p_leaves_an_existing_directory_mode_alone() {
+    let temp = TempDir::new().unwrap();
+    let archive = archive_with_open_directory(&temp);
+    let dest = dest_with_private_d(&temp, 0o777);
+
+    let out = pax(&dest, &["-r", "-f", archive.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains(DIAGNOSTIC), "stderr: {stderr}");
+    assert_eq!(mode_of(&dest.join("d")), 0o700);
+    assert!(dest.join("d/f").exists());
+}
+
+/// With -p e, in a destination others can create entries in, the directory
+/// found there may be anyone's renamed to the member's name: it keeps its
+/// own attributes, and that is diagnosed.
+#[test]
+fn test_extract_pe_leaves_a_renamed_in_private_directory_closed() {
+    let temp = TempDir::new().unwrap();
+    let archive = archive_with_open_directory(&temp);
+    let dest = dest_with_private_d(&temp, 0o777);
+
+    let out = pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        mode_of(&dest.join("d")),
+        0o700,
+        "the private directory was opened up"
+    );
     // Extracted into, as POSIX allows.
     assert!(dest.join("d/f").exists());
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
-    assert!(
-        stderr.contains("not applying owner, mode or times"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains(DIAGNOSTIC), "stderr: {stderr}");
 }
 
-/// In a destination only the user can create entries in, an existing
-/// directory still takes the member's attributes, as POSIX describes.
+/// Re-extracting into a group-writable destination (a umask of 002): without
+/// -p the directories found there are left as they are, with no error.
 #[test]
-fn test_extract_stamps_an_existing_directory_in_a_private_destination() {
+fn test_reextract_into_a_group_writable_destination_without_p() {
     let temp = TempDir::new().unwrap();
     let archive = archive_with_open_directory(&temp);
-    let dest = temp.path().join("dest");
-    fs::create_dir_all(dest.join("d")).unwrap();
-    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
-    fs::set_permissions(dest.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+    let dest = dest_with_private_d(&temp, 0o775);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_pax"))
-        .args(["-r", "-p", "e", "-f"])
-        .arg(&archive)
-        .current_dir(&dest)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let out = pax(&dest, &["-r", "-f", archive.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(mode_of(&dest.join("d")), 0o700);
+}
 
+/// The same with -p e: group members could have created the name first.
+#[test]
+fn test_reextract_into_a_group_writable_destination_with_pe() {
+    let temp = TempDir::new().unwrap();
+    let archive = archive_with_open_directory(&temp);
+    let dest = dest_with_private_d(&temp, 0o775);
+
+    let out = pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains(DIAGNOSTIC), "stderr: {stderr}");
+    assert_eq!(mode_of(&dest.join("d")), 0o700);
+}
+
+/// In a destination only the user can create entries in, -p e gives an
+/// existing directory the member's mode, as POSIX describes.
+#[test]
+fn test_extract_pe_stamps_an_existing_directory_in_a_private_destination() {
+    let temp = TempDir::new().unwrap();
+    let archive = archive_with_open_directory(&temp);
+    let dest = dest_with_private_d(&temp, 0o755);
+
+    let out = pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
-    let mode = fs::metadata(dest.join("d")).unwrap().permissions().mode() & 0o7777;
-    assert_eq!(mode, 0o755);
+    assert_eq!(mode_of(&dest.join("d")), 0o755);
+}
+
+/// And without -p p, even there, it keeps its own.
+#[test]
+fn test_extract_without_p_keeps_an_existing_directory_mode_in_a_private_destination() {
+    let temp = TempDir::new().unwrap();
+    let archive = archive_with_open_directory(&temp);
+    let dest = dest_with_private_d(&temp, 0o755);
+
+    let out = pax(&dest, &["-r", "-f", archive.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert_eq!(mode_of(&dest.join("d")), 0o700);
+}
+
+/// Copy mode treats an existing destination directory the same way: left
+/// alone without -p, and under -p e only where nobody else can create
+/// entries beside it.
+#[test]
+fn test_copy_onto_an_existing_directory_follows_p() {
+    for (privs, parent, code, mode) in [
+        (None, 0o777, 0, 0o700),
+        (Some("e"), 0o777, 1, 0o700),
+        (Some("e"), 0o755, 0, 0o755),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let src = source_tree(&temp);
+        let dest = dest_with_private_d(&temp, parent);
+        let mut args = vec!["-rw"];
+        if let Some(p) = privs {
+            args.extend(["-p", p]);
+        }
+        args.extend(["d", dest.to_str().unwrap()]);
+        let out = pax(&src, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{args:?}: stderr: {stderr}");
+        assert_eq!(mode_of(&dest.join("d")), mode, "{args:?}");
+        assert!(dest.join("d/f").exists(), "{args:?}");
+    }
 }

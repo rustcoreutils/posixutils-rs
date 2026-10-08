@@ -165,6 +165,72 @@ pub fn others_can_rename(parent: &libc::stat, euid: u32) -> bool {
     parent.st_uid != euid || (mode & 0o022 != 0 && mode & 0o1000 == 0)
 }
 
+/// Which of a source's attributes the user asked to have preserved on a directory: its mode
+/// (pax `-p p`, tar `-p`, cp `-p`) and its owner (pax `-p o`, tar `--same-owner`, cp `-p`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Preserve {
+    pub mode: bool,
+    pub owner: bool,
+}
+
+/// What a directory found already existing -- not one the caller made and verified -- is to
+/// be given (`found_dir_attrs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FoundDir {
+    /// Neither mode nor owner was asked for: its times, as by default, and nothing else.
+    TimesOnly,
+    /// What was asked for -- mode, owner, or both -- and its times.
+    AsRequested,
+    /// Nothing at all: someone else could have created its name, and the caller reports that.
+    LeaveAlone,
+}
+
+/// What the directory open on `dir_fd`, found existing in `parent_fd`, may be given, `requested`
+/// being which of mode and owner the user asked to preserve.
+///
+/// An existing directory takes a source's mode or owner only when that was asked for, as
+/// libarchive does ("we don't change perms on existing dirs unless _EXTRACT_PERM is
+/// specified"); otherwise only its times. And even then only where nobody but the effective
+/// user can create entries in its parent (`nobody_else_can_create`): anyone who can create
+/// entries there can create the name before the caller does -- renaming to it a directory of
+/// their choosing, the user's own private one included -- and the sticky bit does not stop
+/// that. Who owns the directory found proves nothing. Giving such a directory a mode would open
+/// it up; giving it an owner would give it away.
+///
+/// An operand resolved from the working directory has no parent descriptor (`AT_FDCWD`); its
+/// parent is then read as `dir_fd`'s own `..`.
+pub fn found_dir_attrs(
+    parent_fd: RawFd,
+    dir_fd: RawFd,
+    requested: Preserve,
+) -> io::Result<FoundDir> {
+    if !requested.mode && !requested.owner {
+        return Ok(FoundDir::TimesOnly);
+    }
+    let parent = if parent_fd == libc::AT_FDCWD {
+        lstat_at(dir_fd, c"..")?
+    } else {
+        fstat(parent_fd)?
+    };
+    let euid = unsafe { libc::geteuid() };
+    if nobody_else_can_create(&parent, euid) {
+        Ok(FoundDir::AsRequested)
+    } else {
+        Ok(FoundDir::LeaveAlone)
+    }
+}
+
+/// Whether nobody but `euid` can create entries in the directory `parent`: it is owned by
+/// `euid` and grants no group or other write permission (an ACL granting it shows in the group
+/// bits). A sticky directory others may write counts as one they can create entries in.
+pub fn nobody_else_can_create(parent: &libc::stat, euid: u32) -> bool {
+    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP|S_IWOTH is 0o022 (fixed
+    // by POSIX).
+    #[allow(clippy::unnecessary_cast)]
+    let mode = parent.st_mode as u32;
+    parent.st_uid == euid && mode & 0o022 == 0
+}
+
 /// Check a directory the caller has just made with `mkdirat` in `parent_fd` and then opened as
 /// `dir_fd` (`O_DIRECTORY | O_NOFOLLOW`): between the two, anyone else who can rename entries
 /// in the parent could have renamed a directory of their choosing over it, and the caller would
@@ -439,8 +505,9 @@ pub fn utimens_link_if_still(
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_lending_read, made_by_us, others_can_rename, utimens_link_if_still, verify_made_dir,
-        FsOwners, MadeObject, MadeTrust,
+        empty_lending_read, found_dir_attrs, made_by_us, nobody_else_can_create, others_can_rename,
+        utimens_link_if_still, verify_made_dir, FoundDir, FsOwners, MadeObject, MadeTrust,
+        Preserve,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -451,6 +518,59 @@ mod tests {
         st.st_uid = uid;
         st.st_mode = libc::S_IFDIR | mode;
         st
+    }
+
+    /// A directory found existing may have been created at its name by anyone who can create
+    /// entries beside it.
+    #[test]
+    fn who_can_create_in_a_parent() {
+        // Nobody but the user can.
+        assert!(nobody_else_can_create(&parent(US, 0o755), US));
+        assert!(nobody_else_can_create(&parent(0, 0o755), 0));
+        // A sticky directory others may write -- /tmp, root extracting into it too.
+        assert!(!nobody_else_can_create(&parent(US, 0o1777), US));
+        assert!(!nobody_else_can_create(&parent(0, 0o1777), 0));
+        // Group or other write permission.
+        assert!(!nobody_else_can_create(&parent(US, 0o775), US));
+        assert!(!nobody_else_can_create(&parent(US, 0o757), US));
+        // Someone else's directory: its owner can.
+        assert!(!nobody_else_can_create(&parent(OTHER, 0o755), US));
+    }
+
+    /// A found directory gets its times only unless mode or owner was asked for; then what was
+    /// asked for where nobody else can create entries beside it, and nothing elsewhere.
+    #[test]
+    fn a_found_directory_gets_what_was_asked_only_where_nobody_else_can_create() {
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        let shared = tmp.path().join("shared");
+        let private = tmp.path().join("private");
+        for (dir, mode) in [(&shared, 0o777), (&private, 0o755)] {
+            std::fs::create_dir_all(dir.join("d")).unwrap();
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let none = Preserve {
+            mode: false,
+            owner: false,
+        };
+        let mode = Preserve {
+            mode: true,
+            owner: false,
+        };
+        let owner = Preserve {
+            mode: false,
+            owner: true,
+        };
+        let attrs = |parent: &std::path::Path, requested| {
+            let parent = std::fs::File::open(parent).unwrap();
+            let dir = open_search(&parent, c"d");
+            found_dir_attrs(parent.as_raw_fd(), dir.as_raw_fd(), requested).unwrap()
+        };
+        assert_eq!(attrs(&shared, none), FoundDir::TimesOnly);
+        assert_eq!(attrs(&shared, mode), FoundDir::LeaveAlone);
+        assert_eq!(attrs(&shared, owner), FoundDir::LeaveAlone);
+        assert_eq!(attrs(&private, none), FoundDir::TimesOnly);
+        assert_eq!(attrs(&private, mode), FoundDir::AsRequested);
+        assert_eq!(attrs(&private, owner), FoundDir::AsRequested);
     }
 
     /// Only the parent's owner, or anyone allowed to write a parent that is not sticky, can

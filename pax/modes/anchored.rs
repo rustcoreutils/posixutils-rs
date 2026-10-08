@@ -22,6 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use crate::modes::made::{self, cvt, verify_made_dir, MadeNode, MadeTrust};
+use plib::madefs::{found_dir_attrs, FoundDir, Preserve};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -547,9 +548,10 @@ impl PendingDirs {
 /// not an error: whatever replaced it brought its own.
 ///
 /// A directory this run made and verified takes its attributes. One that was
-/// already there takes them only where nobody but pax's user can create
-/// entries beside it (`made::may_take_attrs`); elsewhere it keeps its own,
-/// and that is diagnosed.
+/// already there takes, as libarchive's does, its times by default, its mode
+/// only under `-p p` and its owner only under `-p o` -- and those only where
+/// nobody but pax's user can create entries beside it; elsewhere it keeps
+/// all its own, and that is diagnosed (`found_dir_with_mode`).
 fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> PaxResult<()> {
     let Some(member) = MemberPath::parse(&dir.path)? else {
         return Ok(());
@@ -565,22 +567,40 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
     if fstat(fd.as_fd()).is_none_or(|st| file_id(&st) != dir.id) {
         return Ok(());
     }
-    match tree.standing(dir.id) {
+    let with_mode = match tree.standing(dir.id) {
         Standing::Replaced => return Err(PaxError::Io(made::replaced())),
         Standing::Unverified => return Err(attrs_withheld()),
-        Standing::Implicit | Standing::Made => {}
-        Standing::Ordinary if made::found_dir_may_take_attrs(parent.as_fd())? => {}
-        Standing::Ordinary => {
-            return Err(PaxError::Io(std::io::Error::other(
-                "not applying owner, mode or times: the directory was already there, \
-                 and others can create entries beside it",
-            )))
-        }
-    }
+        Standing::Implicit | Standing::Made => true,
+        Standing::Ordinary => found_dir_with_mode(parent.as_fd(), fd.as_fd(), policy)?,
+    };
     if search_only {
-        return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy);
+        return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy, with_mode);
     }
-    set_attrs_fd(fd.as_fd(), &dir.attrs, policy)
+    set_attrs_with(&AttrTarget::Fd(fd.as_fd()), &dir.attrs, policy, with_mode)
+}
+
+/// For a directory found existing at a member's name (open on `dir`, in
+/// `parent`): whether it takes the member's mode, or an error when it is to
+/// take nothing at all (`plib::madefs::found_dir_attrs`). Its owner it takes
+/// only under `-p o`, which `set_attrs_with` already follows; its times, as
+/// by default, whenever it takes anything.
+fn found_dir_with_mode(
+    parent: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+    policy: &AttrPolicy,
+) -> PaxResult<bool> {
+    let requested = Preserve {
+        mode: policy.preserve_perms,
+        owner: policy.preserve_owner,
+    };
+    match found_dir_attrs(parent.as_raw_fd(), dir.as_raw_fd(), requested)? {
+        FoundDir::TimesOnly => Ok(false),
+        FoundDir::AsRequested => Ok(policy.preserve_perms),
+        FoundDir::LeaveAlone => Err(PaxError::Io(std::io::Error::other(
+            "not applying owner, mode or times: the directory was already there, \
+             and others can create entries beside it",
+        ))),
+    }
 }
 
 /// Whether failing to reach a pending directory means it was replaced.
@@ -623,21 +643,31 @@ fn open_dir_for_attrs(dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<(OwnedFd,
 /// it by name cannot be redirected -- not by a `/proc` that is something else
 /// either.
 #[cfg(target_os = "linux")]
-fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
+fn set_attrs_search_only(
+    fd: BorrowedFd<'_>,
+    attrs: &Attrs,
+    policy: &AttrPolicy,
+    with_mode: bool,
+) -> PaxResult<()> {
     let proc_dir = made::procfs_dir()?;
     let name = made::proc_fd_name(fd.as_raw_fd());
     let target = AttrTarget::Proc {
         dir: proc_dir.as_fd(),
         name: &name,
     };
-    set_attrs(&target, attrs, policy)
+    set_attrs_with(&target, attrs, policy, with_mode)
 }
 
 /// Elsewhere a search-only descriptor (`O_SEARCH`) takes the same calls as any
 /// other.
 #[cfg(not(target_os = "linux"))]
-fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
-    set_attrs_fd(fd, attrs, policy)
+fn set_attrs_search_only(
+    fd: BorrowedFd<'_>,
+    attrs: &Attrs,
+    policy: &AttrPolicy,
+    with_mode: bool,
+) -> PaxResult<()> {
+    set_attrs_with(&AttrTarget::Fd(fd), attrs, policy, with_mode)
 }
 
 /// What this run knows about a directory (`DirTree::standing`).
@@ -654,8 +684,9 @@ enum Standing {
     /// Made and verified by this run for a member naming it, or implicit and
     /// since claimed: takes attributes wherever it is.
     Made,
-    /// Found existing: takes attributes only where nobody else can create
-    /// entries beside it (`made::may_take_attrs`).
+    /// Found existing: takes its times, and its mode and owner only when
+    /// asked for -- and then only where nobody else can create entries
+    /// beside it (`plib::madefs::found_dir_attrs`).
     Ordinary,
 }
 
@@ -1530,12 +1561,23 @@ impl AttrTarget<'_> {
 
 /// `set_attrs_fd`, for any `AttrTarget`.
 fn set_attrs(target: &AttrTarget<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
+    set_attrs_with(target, attrs, policy, true)
+}
+
+/// `set_attrs`, setting the mode only `with_mode`: a directory found
+/// existing takes a member's mode only under `-p p` (`DirStamp::Found`).
+fn set_attrs_with(
+    target: &AttrTarget<'_>,
+    attrs: &Attrs,
+    policy: &AttrPolicy,
+    with_mode: bool,
+) -> PaxResult<()> {
     // Owner first: a successful chown may clear the set-id bits, and whether it
     // succeeded decides whether they may be set at all.
     let owner_set = policy.preserve_owner
         && set_owner(attrs.uid, attrs.gid, |uid, gid| cvt(target.chown(uid, gid)))?;
 
-    if target.chmod(policy.mode(attrs, owner_set) as libc::mode_t) != 0 {
+    if with_mode && target.chmod(policy.mode(attrs, owner_set) as libc::mode_t) != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
 

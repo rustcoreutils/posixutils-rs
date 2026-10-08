@@ -111,33 +111,6 @@ pub(crate) fn node_trust(
     made_by_us(made, Some(parent.st_uid), euid)
 }
 
-/// Whether a directory found already existing in the directory `parent` --
-/// not one this run made and verified -- may be given a member's owner, mode
-/// and times by pax running as `euid`.
-///
-/// Only where nobody but `euid` can create entries in `parent`: it is owned
-/// by `euid` and grants no group or other write permission (an ACL granting
-/// it shows in the group bits). Anyone who can create entries there can
-/// create the member's name before pax does -- renaming to it a directory of
-/// their choosing, the user's own private one included -- and the sticky bit
-/// does not stop that. Who owns the directory found proves nothing. Where
-/// others can, it is extracted into (POSIX: an existing directory is not an
-/// error) but keeps its own attributes.
-pub(crate) fn may_take_attrs(parent: &libc::stat, euid: u32) -> bool {
-    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP|S_IWOTH
-    // is 0o022 (fixed by POSIX).
-    #[allow(clippy::unnecessary_cast)]
-    let mode = parent.st_mode as u32;
-    parent.st_uid == euid && mode & 0o022 == 0
-}
-
-/// `may_take_attrs` for a directory found in `parent`, as its descriptor
-/// shows it.
-pub(crate) fn found_dir_may_take_attrs(parent: BorrowedFd<'_>) -> io::Result<bool> {
-    let euid = unsafe { libc::geteuid() };
-    Ok(may_take_attrs(&fstat(parent)?, euid))
-}
-
 /// Check a directory pax has just made with `mkdirat` in `parent` and then
 /// opened as `dir` (`plib::madefs::verify_made_dir`, which cp uses too):
 /// `None` when it is not the directory made. Under test the trust can be
@@ -459,7 +432,6 @@ mod tests {
     // made_by_us itself, and the by-name link times, are tested in
     // plib::madefs too.
     const PAX: u32 = 1000;
-    const OTHER: u32 = 2000;
 
     fn made(uid: u32, nlink: u64, is_dir: bool, owners: FsOwners) -> MadeObject {
         MadeObject {
@@ -478,27 +450,9 @@ mod tests {
         st
     }
 
-    // others_can_rename, verify_made_dir and the read lend are tested in
+    // others_can_rename, verify_made_dir, the read lend and what a directory
+    // found existing may be given (found_dir_attrs) are tested in
     // plib::madefs.
-
-    /// A directory found existing may have been created at the member's name
-    /// by anyone who can create entries beside it: it takes no member's
-    /// attributes unless nobody but pax's user can.
-    #[test]
-    fn a_found_directory_takes_attributes_only_where_nobody_else_can_create() {
-        // Nobody but pax's user can create entries beside it.
-        assert!(may_take_attrs(&parent(PAX, 0o755), PAX));
-        assert!(may_take_attrs(&parent(0, 0o755), 0));
-        // A sticky directory others may write: anyone can create the
-        // member's name there first (/tmp, and root extracting into it).
-        assert!(!may_take_attrs(&parent(PAX, 0o1777), PAX));
-        assert!(!may_take_attrs(&parent(0, 0o1777), 0));
-        // Group or other write permission.
-        assert!(!may_take_attrs(&parent(PAX, 0o775), PAX));
-        assert!(!may_take_attrs(&parent(PAX, 0o757), PAX));
-        // Someone else's directory: its owner can.
-        assert!(!may_take_attrs(&parent(OTHER, 0o755), PAX));
-    }
 
     /// Where nobody but pax's user can rename entries in the parent, what is
     /// at the name is what pax made, whoever the filesystem says owns it --

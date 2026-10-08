@@ -313,11 +313,6 @@ fn test_cpio_unconditional_overwrite() {
     let archive = copy_out(&src, Some("newc"));
     let dest = temp.path().join("dest");
     fs::create_dir(&dest).unwrap();
-    // The second extraction finds the first one's directories: they take the
-    // archive's attributes only where nobody else can create entries beside
-    // them, which a umask of 002 would allow.
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
 
     // A newer file on disk survives by default...
     fs::write(dest.join("a.txt"), "newer\n").unwrap();

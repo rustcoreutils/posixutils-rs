@@ -37,6 +37,19 @@ pub const COMPILE_MATRIX: &[(&str, &[&str])] = &[("debug_opt", &["-g", "-O"])];
 // File Path Utilities
 // ============================================================================
 
+/// A private directory for one build's outputs, removed with them when
+/// dropped -- a panic included.
+///
+/// An executable goes here rather than into a `NamedTempFile`: the handle a
+/// temp file keeps open makes the linked binary "Text file busy" when it is
+/// executed. A directory holds no handle.
+pub fn work_dir(name: &str) -> plib::tmp::TempDir {
+    plib::tmp::Builder::new()
+        .prefix(&format!("c17_{}_", name))
+        .tempdir()
+        .expect("failed to create work dir")
+}
+
 /// Create a temporary C file with the given content
 /// Returns NamedTempFile which auto-deletes on drop
 pub fn create_c_file(name: &str, content: &str) -> NamedTempFile {
@@ -64,14 +77,8 @@ fn compile_and_run_single(
     let c_file = create_c_file(name, content);
     let c_path = c_file.path().to_path_buf();
 
-    // Use thread ID and config name to make exe path unique for parallel test execution
-    let thread_id = format!("{:?}", std::thread::current().id());
-    let exe_path = std::env::temp_dir().join(format!(
-        "c17_exe_{}_{}_{}",
-        name,
-        config_name,
-        thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
-    ));
+    let work = work_dir(name);
+    let exe_path = work.path().join("exe");
 
     // The source operand goes before `extra_opts`, because those may contain
     // `-l` and a library is searched where its name is encountered — naming it
@@ -107,7 +114,7 @@ fn compile_and_run_single(
 
     // On failure, dump generated assembly for diagnosis
     if exit_code != 0 {
-        let asm_path = std::env::temp_dir().join(format!("c17_asm_{}_{}.s", name, config_name));
+        let asm_path = work.path().join(format!("{}_{}.s", name, config_name));
         let mut asm_args = vec![
             "-S".to_string(),
             "-o".to_string(),
@@ -126,12 +133,9 @@ fn compile_and_run_single(
                 eprintln!("=== End assembly ===");
             }
         }
-        let _ = std::fs::remove_file(&asm_path);
     }
 
-    // Cleanup exe (c_file auto-cleaned by NamedTempFile drop)
-    let _ = std::fs::remove_file(&exe_path);
-
+    // `work` and `c_file` remove the executable, assembly and source on drop.
     exit_code
 }
 
@@ -154,12 +158,8 @@ pub fn compile_and_run_two_units(
     let a = create_c_file(&format!("{}_a", name), unit_a);
     let b = create_c_file(&format!("{}_b", name), unit_b);
 
-    let thread_id = format!("{:?}", std::thread::current().id());
-    let exe_path = std::env::temp_dir().join(format!(
-        "c17_exe2_{}_{}",
-        name,
-        thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
-    ));
+    let work = work_dir(name);
+    let exe_path = work.path().join("exe");
 
     let mut args = vec!["-o".to_string(), exe_path.to_string_lossy().to_string()];
     args.push(a.path().to_string_lossy().to_string());
@@ -181,7 +181,6 @@ pub fn compile_and_run_two_units(
         .expect("failed to run executable");
     let exit_code = run_output.status.code().unwrap_or(-1);
     report_abnormal_exit(name, "single", &run_output);
-    let _ = std::fs::remove_file(&exe_path);
     exit_code
 }
 
@@ -412,17 +411,9 @@ pub fn compile_with_host_cc(name: &str, c17_unit: &str, host_unit: &str) -> Opti
         .tempfile()
         .expect("failed to create temp file");
     let asm_path = asm.path().to_string_lossy().to_string();
-    // A plain path, not a `NamedTempFile`: the handle a temp file keeps open
-    // makes the linked binary "Text file busy" when it is executed. This is
-    // the same reason `compile_and_run_two_units` builds its path by hand.
-    let thread_id = format!("{:?}", std::thread::current().id());
-    let exe_path = std::env::temp_dir()
-        .join(format!(
-            "c17_hostcc_{name}_{}",
-            thread_id.replace(|c: char| !c.is_alphanumeric(), "_")
-        ))
-        .to_string_lossy()
-        .to_string();
+    // In a work directory, not a `NamedTempFile`: see `work_dir`.
+    let work = work_dir(&format!("hostcc_{name}"));
+    let exe_path = work.path().join("exe").to_string_lossy().to_string();
 
     let run = run_c17(&[
         "-O0",
@@ -457,7 +448,6 @@ pub fn compile_with_host_cc(name: &str, c17_unit: &str, host_unit: &str) -> Opti
         .status
         .code()
         .unwrap_or(-1);
-    let _ = std::fs::remove_file(&exe_path);
     Some(status)
 }
 

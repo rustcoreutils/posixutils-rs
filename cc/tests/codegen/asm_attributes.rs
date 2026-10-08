@@ -102,10 +102,11 @@ int main(void) {
     let asm_s_file = create_asm_file("asm_s_test", asm_s_content, ".S");
     let c_file = crate::common::create_c_file("asm_main", c_content);
 
-    let obj_s = std::env::temp_dir().join(format!("c17_asm_{}.o", std::process::id()));
-    let obj_s_upper = std::env::temp_dir().join(format!("c17_asm_s_{}.o", std::process::id()));
-    let obj_c = std::env::temp_dir().join(format!("c17_asm_c_{}.o", std::process::id()));
-    let exe_path = std::env::temp_dir().join(format!("c17_asm_test_{}", std::process::id()));
+    let work = crate::common::work_dir("asm_test");
+    let obj_s = work.path().join("asm.o");
+    let obj_s_upper = work.path().join("asm_s.o");
+    let obj_c = work.path().join("asm_c.o");
+    let exe_path = work.path().join("asm_test");
 
     // Step 1: Compile .s to .o
     let output = plib::testing::run_test_base(
@@ -183,12 +184,6 @@ int main(void) {
 
     let exit_code = run_output.status.code().unwrap_or(-1);
 
-    // Cleanup
-    let _ = std::fs::remove_file(&obj_s);
-    let _ = std::fs::remove_file(&obj_s_upper);
-    let _ = std::fs::remove_file(&obj_c);
-    let _ = std::fs::remove_file(&exe_path);
-
     assert_eq!(
         exit_code, 0,
         "Assembly file test failed with exit code {}",
@@ -247,9 +242,10 @@ int main(void) {
     let asm_s_file = create_asm_file("asm_assembler_test", asm_s_content, ".S");
     let c_file = crate::common::create_c_file("asm_assembler_main", c_content);
 
-    let obj_asm = std::env::temp_dir().join(format!("c17_asm_macro_{}.o", std::process::id()));
-    let obj_c = std::env::temp_dir().join(format!("c17_asm_macro_c_{}.o", std::process::id()));
-    let exe_path = std::env::temp_dir().join(format!("c17_asm_macro_test_{}", std::process::id()));
+    let work = crate::common::work_dir("asm_macro");
+    let obj_asm = work.path().join("asm_macro.o");
+    let obj_c = work.path().join("asm_macro_c.o");
+    let exe_path = work.path().join("asm_macro_test");
 
     // Step 1: Compile .S to .o (with preprocessing, should have __ASSEMBLER__ defined)
     let output = plib::testing::run_test_base(
@@ -308,11 +304,6 @@ int main(void) {
         .expect("failed to run executable");
 
     let exit_code = run_output.status.code().unwrap_or(-1);
-
-    // Cleanup
-    let _ = std::fs::remove_file(&obj_asm);
-    let _ = std::fs::remove_file(&obj_c);
-    let _ = std::fs::remove_file(&exe_path);
 
     assert_eq!(
         exit_code, 0,

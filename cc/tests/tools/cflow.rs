@@ -157,9 +157,11 @@ fn tools_cflow_mega() {
 fn tools_cflow_prints_the_declared_char_spelling() {
     use std::io::Write;
 
-    let dir = std::env::temp_dir().join(format!("c17_cflow_char_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let src = dir.join("chars.c");
+    let dir = plib::tmp::Builder::new()
+        .prefix("cflow_char_")
+        .tempdir()
+        .expect("mkdir");
+    let src = dir.path().join("chars.c");
     let mut f = std::fs::File::create(&src).expect("create");
     f.write_all(
         b"char retc(void) { return 0; }\n\
@@ -171,7 +173,6 @@ fn tools_cflow_prints_the_declared_char_spelling() {
     drop(f);
 
     let (stdout, stderr, success) = run_cflow(&[src.to_str().unwrap()]);
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(success, "cflow failed: {stderr}");
 
     // The row that would flip on an aarch64 host: a plain `char` return type

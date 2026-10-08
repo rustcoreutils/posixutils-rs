@@ -325,19 +325,25 @@ fn nobody_else_can_create_with(
 /// its write permission is the user's own. All of these must hold:
 /// - it is the user's primary group;
 /// - every member it lists resolves (`getpwnam`, on the name's bytes) to the user's uid;
-/// - no other user has it for a primary group.
+/// - no other user has it for a primary group;
+/// - the passwd and group databases come from local files alone (`nss_is_local`), and the
+///   enumeration of passwd lists the user too: a directory service that does not enumerate
+///   (sssd or LDAP with enumeration off, as is usual) hands `getpwent` only some of its users,
+///   and lists a domain group's members nowhere, so the rule cannot be checked against it.
 ///
-/// What the user and group databases say is read through NSS (`getpwuid`, `getgrgid`, and the
+/// It applies only on Linux with glibc, whose `/etc/nsswitch.conf` is read here. Elsewhere --
+/// macOS, the BSDs, musl -- no group is private.
+///
+/// What the databases say is read through NSS (`getpwuid`, `getgrgid`, `getpwnam`, and the
 /// whole passwd database through `getpwent`), once per group in a process. Anything that cannot
-/// be read -- the user, the group, an error while enumerating -- counts as not private.
+/// be read -- the user, the group, `/etc/nsswitch.conf`, an error while enumerating -- counts as
+/// not private.
 ///
 /// Residuals:
-/// - An NSS source that does not enumerate (sssd or LDAP with enumeration off, as is usual)
-///   hands `getpwent` only the users it does list, without an error: a user it holds who has
-///   the group for a primary group goes unseen. Nothing distinguishes that from a source with
-///   no such user, so it cannot fail closed.
-/// - Members known only to `getgrouplist` (an NSS source that adds supplementary groups it
-///   does not list in `gr_mem`) are not seen either.
+/// - Groups granted outside every database: `pam_group` (`/etc/security/group.conf`) and
+///   systemd's `SupplementaryGroups=` hand processes a gid no database records as theirs.
+/// - Processes of someone who was a member, or had the group as primary, before it was
+///   changed keep the gid for as long as they run.
 /// - A group password lets anyone who knows it `newgrp` into the group; with shadow groups
 ///   it is out of the user's reach to read, and is not considered.
 /// - Users and members added after the answer is read, for the rest of the process.
@@ -352,6 +358,9 @@ pub fn is_private_group(gid: u32, euid: u32) -> bool {
 
 /// `is_private_group`, read from the databases.
 fn read_private_group(gid: u32, euid: u32) -> bool {
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) || !nss_config_is_local() {
+        return false;
+    }
     let Some(user) = crate::user::get_by_uid(euid) else {
         return false;
     };
@@ -406,11 +415,79 @@ pub fn group_is_private(
     primaries: impl IntoIterator<Item = (u32, u32)>,
 ) -> bool {
     let (uid, user_gid) = user;
+    let mut listed = false;
+    let no_other = primaries.into_iter().all(|(other, primary)| {
+        listed |= (other, primary) == user;
+        primary != gid || other == uid
+    });
     user_gid == gid
         && member_uids.into_iter().all(|member| member == Some(uid))
-        && primaries
+        && no_other
+        && listed
+}
+
+/// Whether the passwd and group databases come from local files alone, and so are enumerated
+/// whole by `getpwent` (`is_private_group`), going by the text of `/etc/nsswitch.conf`: each is
+/// served by the `files` and `systemd` sources only, or `compat` where `compat_plain(db)` says
+/// the database's file holds no `+`/`-` lines (which pull in NIS). A database the file does not
+/// mention takes glibc's default: `files`, or `compat [NOTFOUND=return] files` where glibc is
+/// built with the obsolete NSL, so compat's condition applies. A line that cannot be read for
+/// certain -- no source, a second line for the database, an unclosed `[action]`, no colon --
+/// means not.
+fn nss_is_local(conf: &str, compat_plain: impl Fn(&str) -> bool) -> bool {
+    let mut sources: HashMap<&str, Vec<&str>> = HashMap::new();
+    for line in conf.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let (name, rest) = line.split_once(':').unwrap_or((line, ""));
+        let Some(db) = ["passwd", "group"]
             .into_iter()
-            .all(|(other, primary)| primary != gid || other == uid)
+            .find(|db| name.split_whitespace().next() == Some(db))
+        else {
+            continue;
+        };
+        if name.trim() != db || !line.contains(':') {
+            return false;
+        }
+        let mut listed = Vec::new();
+        let mut in_action = false;
+        for word in rest.split_whitespace() {
+            if in_action || word.starts_with('[') {
+                in_action = !word.ends_with(']');
+                continue;
+            }
+            listed.push(word);
+        }
+        if in_action || listed.is_empty() || sources.insert(db, listed).is_some() {
+            return false;
+        }
+    }
+    ["passwd", "group"].into_iter().all(|db| {
+        let compat = || compat_plain(db);
+        match sources.get(db) {
+            None => compat(),
+            Some(listed) => listed.iter().all(|source| match *source {
+                "files" | "systemd" => true,
+                "compat" => compat(),
+                _ => false,
+            }),
+        }
+    })
+}
+
+/// `nss_is_local` for this system's `/etc/nsswitch.conf` (none at all: every database takes
+/// the default).
+fn nss_config_is_local() -> bool {
+    let conf = match std::fs::read_to_string("/etc/nsswitch.conf") {
+        Ok(conf) => conf,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(_) => return false,
+    };
+    nss_is_local(&conf, |db| {
+        std::fs::read(format!("/etc/{db}")).is_ok_and(|text| {
+            text.split(|&b| b == b'\n')
+                .all(|line| !line.starts_with(b"+") && !line.starts_with(b"-"))
+        })
+    })
 }
 
 /// Check a directory the caller has just made with `mkdirat` in `parent_fd` and then opened as
@@ -648,8 +725,9 @@ pub fn utimens_link_if_still(
 mod tests {
     use super::{
         empty_lending_read, group_is_private, group_member_uids, is_private_group, made_by_us,
-        nobody_else_can_create_with, others_can_rename, utimens_link_if_still, verify_made_dir,
-        ChainTrust, FoundDir, FsOwners, MadeObject, MadeTrust, Preserve,
+        nobody_else_can_create_with, nss_config_is_local, nss_is_local, others_can_rename,
+        utimens_link_if_still, verify_made_dir, ChainTrust, FoundDir, FsOwners, MadeObject,
+        MadeTrust, Preserve,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -726,6 +804,66 @@ mod tests {
             [Some(US), Some(US)],
             [(US, 500), (US, 500)]
         ));
+        // An enumeration that does not list the user is not the whole database: it may be
+        // missing others with the group as theirs too.
+        assert!(!group_is_private(500, user, [], [(OTHER, 600), (0, 0)]));
+        assert!(!group_is_private(500, user, [], [(US, 501)]));
+    }
+
+    /// The passwd and group databases are trusted to be enumerable only from local files: the
+    /// `files` and `systemd` sources, and `compat` while the files hold no `+`/`-` lines. A
+    /// database the file does not mention takes glibc's default, which is `files`, or
+    /// `compat [NOTFOUND=return] files` where glibc is built with the obsolete NSL.
+    #[test]
+    fn only_local_nss_sources_enumerate_everyone() {
+        let plain = |_: &str| true;
+        let plus = |_: &str| false;
+        let debian = "# comment\npasswd:         files systemd\ngroup:          files systemd\n\
+                      shadow: files\nhosts: files dns\nnetgroup: nis\n";
+        assert!(nss_is_local(debian, plain));
+        assert!(nss_is_local("passwd: files\ngroup: files\n", plus));
+        assert!(nss_is_local(
+            "passwd: files [SUCCESS=merge] systemd\ngroup: files [ !UNAVAIL=return ] systemd\n",
+            plain
+        ));
+        assert!(nss_is_local("passwd: compat\ngroup: compat\n", plain));
+        assert!(!nss_is_local("passwd: compat\ngroup: compat\n", plus));
+        // Directory services.
+        assert!(!nss_is_local(
+            "passwd: files sss\ngroup: files sss\n",
+            plain
+        ));
+        assert!(!nss_is_local("passwd: files\ngroup: files ldap\n", plain));
+        assert!(!nss_is_local(
+            "passwd: files winbind\ngroup: files\n",
+            plain
+        ));
+        assert!(!nss_is_local("passwd: files nis\ngroup: files\n", plain));
+        // Not mentioned: glibc's default, compat at worst.
+        assert!(nss_is_local("hosts: files\n", plain));
+        assert!(!nss_is_local("hosts: files\n", plus));
+        assert!(nss_is_local("", plain));
+        // Unclear: no source, a second line, an unclosed action, no colon.
+        assert!(!nss_is_local("passwd:\ngroup: files\n", plain));
+        assert!(!nss_is_local(
+            "passwd: files\npasswd: sss\ngroup: files\n",
+            plain
+        ));
+        assert!(!nss_is_local(
+            "passwd: files [NOTFOUND=return\ngroup: files\n",
+            plain
+        ));
+        assert!(!nss_is_local("passwd files\ngroup: files\n", plain));
+    }
+
+    /// Where the private-group rule cannot be backed by an ACL check and an NSS configuration
+    /// check, it never applies.
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[test]
+    fn no_group_is_private_without_the_checks() {
+        let euid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        assert!(!is_private_group(gid, euid));
     }
 
     /// The test user's own primary group, read from the real databases, agrees with the rule
@@ -743,7 +881,9 @@ mod tests {
             return;
         };
         let primaries = users.iter().map(|u| (u.uid, u.gid));
-        let expected = group_is_private(user.gid, (euid, user.gid), members, primaries);
+        let expected = cfg!(all(target_os = "linux", target_env = "gnu"))
+            && nss_config_is_local()
+            && group_is_private(user.gid, (euid, user.gid), members, primaries);
         assert_eq!(is_private_group(user.gid, euid), expected);
         // Asked again, the answer is the one read.
         assert_eq!(is_private_group(user.gid, euid), expected);

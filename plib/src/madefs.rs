@@ -36,18 +36,14 @@ use std::sync::Mutex;
 ///
 /// Reaching a name below a directory takes search permission only, so opening it for reading
 /// refuses a directory the user may search and write but not list (mode 0300) where `mkdir` or
-/// `open` by name would have succeeded. `O_PATH` (Linux) and `O_SEARCH` (macOS, the BSDs) open
-/// it for exactly that. Elsewhere `O_RDONLY` is the only option there is.
+/// `open` by name would have succeeded. `O_PATH` (Linux) and `O_SEARCH` (macOS, FreeBSD) open
+/// it for exactly that. Elsewhere `O_RDONLY` is the only option there is -- on NetBSD too,
+/// whose `O_SEARCH` is defined but not known here to open a directory for search alone.
 #[cfg(target_os = "linux")]
 pub const SEARCH_ONLY: libc::c_int = libc::O_PATH;
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd"
-)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
 
 /// How a filesystem keeps file owners, as far as its type says.

@@ -18,8 +18,8 @@ use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
-    open_dir_at, restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, stat_at,
-    AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath, PendingDirs,
+    restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, stat_at, AttrPolicy,
+    Attrs, DirAttrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::followed_link;
 use crate::modes::write::FileNames;
@@ -422,7 +422,7 @@ impl CopyWalk<'_> {
             DirAttrs::Apply(id) | DirAttrs::Withheld(id) => Some(id),
             DirAttrs::Keep => existing.map(|st| file_id(&st)),
         };
-        let dir = open_dir_at(parent.as_fd(), &mp.leaf, false)?;
+        let dir = self.tree.open_dir(parent.as_fd(), &mp.leaf, false)?;
         let dest_st = stat_at(dir.as_fd(), c".")
             .ok_or_else(|| PaxError::Io(std::io::Error::last_os_error()))?;
         if expected.is_some_and(|id| id != file_id(&dest_st)) {

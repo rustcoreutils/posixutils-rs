@@ -271,27 +271,19 @@ impl DirTree {
         for comp in member.dirs().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
             let (next, origin) = open_or_create_dir_at(at, comp, create_missing)?;
-            let st = fstat(next.as_fd());
-            if origin == DirOrigin::Replaced {
-                if let Some(st) = &st {
-                    self.replaced.borrow_mut().insert(file_id(st));
+            let st = self.admit(next.as_fd(), origin)?;
+            let id = file_id(&st);
+            match origin {
+                DirOrigin::Made => {
+                    self.implicit.borrow_mut().insert(id);
                 }
-                return Err(PaxError::Io(made::replaced()));
-            }
-            // One found earlier in place of a directory this run made is
-            // never extracted into, whichever member reaches it.
-            if st.is_some_and(|st| self.replaced.borrow().contains(&file_id(&st))) {
-                return Err(PaxError::Io(made::replaced()));
-            }
-            if let Some(st) = st {
-                if origin == DirOrigin::Made {
-                    self.implicit.borrow_mut().insert(file_id(&st));
-                } else if origin == DirOrigin::Unverified {
-                    self.unverified.borrow_mut().insert(file_id(&st));
-                } else {
+                DirOrigin::Unverified => {
+                    self.unverified.borrow_mut().insert(id);
+                }
+                DirOrigin::Found | DirOrigin::Replaced => {
                     self.pre_run_mtimes
                         .borrow_mut()
-                        .entry(file_id(&st))
+                        .entry(id)
                         .or_insert(mtime_of(&st));
                 }
             }
@@ -307,10 +299,66 @@ impl DirTree {
         }
     }
 
+    /// What this run knows about the directory with `(st_dev, st_ino)` `id`.
+    ///
+    /// The one registry every site that enters, merges into or stamps a
+    /// directory consults: the walk and `open_dir` (through `admit`),
+    /// `make_dir_at` and `apply_dir_attrs`.
+    fn standing(&self, id: (u64, u64)) -> Standing {
+        if self.replaced.borrow().contains(&id) {
+            Standing::Replaced
+        } else if self.unverified.borrow().contains(&id) {
+            Standing::Unverified
+        } else if self.implicit.borrow().contains(&id) {
+            Standing::Implicit
+        } else {
+            Standing::Ordinary
+        }
+    }
+
+    /// Record the directory with `id` as found in place of one this run
+    /// made, and fail.
+    ///
+    /// Only a directory met at that very moment is recorded -- one never
+    /// admitted before -- so a descriptor `admit` has passed can never become
+    /// a refused one later: the chain and `last_parent` reuse admitted
+    /// descriptors without asking again.
+    fn refuse_replaced(&self, id: (u64, u64)) -> PaxError {
+        self.replaced.borrow_mut().insert(id);
+        PaxError::Io(made::replaced())
+    }
+
+    /// Admit the directory just opened on `fd`, which `open_or_create_dir_at`
+    /// says came from `origin`, to be entered: never one found in place of a
+    /// directory this run made, now or earlier, whichever member reaches it.
+    fn admit(&self, fd: BorrowedFd<'_>, origin: DirOrigin) -> PaxResult<libc::stat> {
+        let st = fstat(fd).ok_or_else(std::io::Error::last_os_error)?;
+        if origin == DirOrigin::Replaced {
+            return Err(self.refuse_replaced(file_id(&st)));
+        }
+        if self.standing(file_id(&st)) == Standing::Replaced {
+            return Err(PaxError::Io(made::replaced()));
+        }
+        Ok(st)
+    }
+
+    /// Open one directory component below `dirfd` without following a
+    /// symlink, admitted as the walk admits one (`admit`).
+    pub(crate) fn open_dir(
+        &self,
+        dirfd: BorrowedFd<'_>,
+        name: &CStr,
+        create_missing: bool,
+    ) -> PaxResult<OwnedFd> {
+        let (fd, origin) = open_or_create_dir_at(dirfd, name, create_missing)?;
+        self.admit(fd.as_fd(), origin)?;
+        Ok(fd)
+    }
+
     /// Whether `st` is a directory this run created only to hold members
     /// below it, rather than one that was there before.
     pub(crate) fn is_implicit(&self, st: &libc::stat) -> bool {
-        self.implicit.borrow().contains(&file_id(st))
+        self.standing(file_id(st)) == Standing::Implicit
     }
 
     /// `is_implicit`, for the member that names the directory and so gives it
@@ -478,6 +526,11 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
     if fstat(fd.as_fd()).is_none_or(|st| file_id(&st) != dir.id) {
         return Ok(());
     }
+    match tree.standing(dir.id) {
+        Standing::Replaced => return Err(PaxError::Io(made::replaced())),
+        Standing::Unverified => return Err(attrs_withheld()),
+        Standing::Implicit | Standing::Ordinary => {}
+    }
     if !made::dir_may_take_attrs(parent.as_fd(), fd.as_fd())? {
         return Err(PaxError::Io(std::io::Error::other(
             "not applying owner, mode or times: the directory belongs to another user \
@@ -541,16 +594,20 @@ fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy)
     set_attrs_fd(fd, attrs, policy)
 }
 
-/// Open one directory component below `dirfd` without following a symlink.
-pub(crate) fn open_dir_at(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    create_missing: bool,
-) -> PaxResult<OwnedFd> {
-    match open_or_create_dir_at(dirfd, name, create_missing)? {
-        (_, DirOrigin::Replaced) => Err(PaxError::Io(made::replaced())),
-        (fd, _) => Ok(fd),
-    }
+/// What this run knows about a directory (`DirTree::standing`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// Found in place of one this run made: never entered nor stamped.
+    Replaced,
+    /// Made by this run where its owner could not be verified: entered,
+    /// never stamped.
+    Unverified,
+    /// Made by this run only to hold members below it, awaiting the member
+    /// that names it.
+    Implicit,
+    /// Anything else: one that was already there, or one a member has
+    /// claimed.
+    Ordinary,
 }
 
 /// Where the directory `open_or_create_dir_at` opened came from.
@@ -568,7 +625,9 @@ enum DirOrigin {
     Replaced,
 }
 
-/// `open_dir_at`, also saying whether the directory had to be created.
+/// Open one directory component below `dirfd` without following a symlink,
+/// creating it if asked to, and say where it came from. Callers go through
+/// `DirTree::admit` before using it.
 fn open_or_create_dir_at(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
@@ -686,20 +745,21 @@ pub(crate) fn make_dir_at(
     // Otherwise extracting onto an existing directory is not an error
     // (POSIX), and it is kept.
     let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
-    if existing_dir.is_some_and(|st| tree.replaced.borrow().contains(&file_id(&st))) {
-        return Err(PaxError::Io(made::replaced()));
-    }
-    if let Some(st) = existing_dir.filter(|st| tree.claim_implicit(st)) {
-        return Ok(DirAttrs::Apply(file_id(&st)));
-    }
-    if let Some(st) = existing_dir.filter(|st| tree.unverified.borrow().contains(&file_id(st))) {
-        return Ok(DirAttrs::Withheld(file_id(&st)));
+    if let Some(st) = existing_dir {
+        let id = file_id(&st);
+        return match tree.standing(id) {
+            Standing::Replaced => Err(PaxError::Io(made::replaced())),
+            Standing::Implicit => {
+                tree.claim_implicit(&st);
+                Ok(DirAttrs::Apply(id))
+            }
+            Standing::Unverified => Ok(DirAttrs::Withheld(id)),
+            Standing::Ordinary if no_clobber => Ok(DirAttrs::Keep),
+            Standing::Ordinary => Ok(DirAttrs::Apply(id)),
+        };
     }
     if no_clobber {
         return Ok(DirAttrs::Keep);
-    }
-    if let Some(st) = existing_dir {
-        return Ok(DirAttrs::Apply(file_id(&st)));
     }
 
     // A non-directory is in the way, and is replaced the way a file member
@@ -731,8 +791,7 @@ fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<
     let (dir, _) = open_dir_for_attrs(dirfd, name)?;
     let st = fstat(dir.as_fd()).ok_or_else(std::io::Error::last_os_error)?;
     let Some(trust) = verify_made_dir(dirfd, dir.as_fd())? else {
-        tree.replaced.borrow_mut().insert(file_id(&st));
-        return Err(PaxError::Io(made::replaced()));
+        return Err(tree.refuse_replaced(file_id(&st)));
     };
     match trust {
         MadeTrust::Full => Ok(DirAttrs::Apply(file_id(&st))),
@@ -1568,6 +1627,43 @@ mod tests {
 
         assert!(tree.parent_of(&member("a/b/z"), true).is_err());
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    /// Every site that enters, merges into or stamps a directory consults the
+    /// same registry: one recorded as found in place of a directory this run
+    /// made is refused by `open_dir` (copy mode's entry) as by the walk, and
+    /// neither it nor one whose owner could not be verified is stamped.
+    #[test]
+    fn test_every_directory_site_consults_the_standing() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        for name in ["r", "u"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let id = |name: &CStr| file_id(&stat_at(tree.root(), name).unwrap());
+        tree.replaced.borrow_mut().insert(id(c"r"));
+        tree.unverified.borrow_mut().insert(id(c"u"));
+
+        assert!(tree.open_dir(tree.root(), c"r", false).is_err());
+        assert!(tree.parent_of(&member("r/x"), false).is_err());
+        assert!(tree.open_dir(tree.root(), c"u", false).is_ok());
+
+        let mut pending = PendingDirs::default();
+        let mut stamp = |name: &str, id| {
+            let mut attrs = attrs(0o751);
+            attrs.mtime = 12345;
+            pending.push(&member(name), id, attrs);
+        };
+        stamp("r", id(c"r"));
+        stamp("u", id(c"u"));
+        let mut p = policy(false, true);
+        p.preserve_mtime = true;
+        pending.apply(&tree, &p);
+        for name in ["r", "u"] {
+            let md = std::fs::metadata(dir.path().join(name)).unwrap();
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(md.mtime(), 12345, "{name} was stamped");
+        }
     }
 
     /// Past the descriptor budget the chain stops growing, and a walk still

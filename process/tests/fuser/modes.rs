@@ -133,10 +133,8 @@ fn test_fuser_operands_do_not_leak_into_each_other() {
         return;
     };
 
-    let quiet = std::env::temp_dir().join(format!("fuser_quiet_{}", std::process::id()));
-    std::fs::write(&quiet, b"x").expect("write temp file");
-    let quiet_path = quiet.clone();
-    let quiet = quiet.to_string_lossy().into_owned();
+    let quiet_file = plib::testing::TempFile::new("fuser_quiet", b"x");
+    let quiet = quiet_file.to_string_lossy().into_owned();
 
     let quiet_for_check = quiet.clone();
     let dev_for_check = dev.clone();
@@ -171,8 +169,6 @@ fn test_fuser_operands_do_not_leak_into_each_other() {
             "nothing holds {quiet_for_check:?} open, but it was reported with              use characters {after_header:?}: the block device's match leaked              into the following operand. Full stderr: {stderr:?}"
         );
     });
-
-    let _ = std::fs::remove_file(&quiet_path);
 }
 
 /// The use character for a process whose *root directory* is on the named file

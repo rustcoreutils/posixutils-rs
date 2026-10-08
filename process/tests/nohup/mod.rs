@@ -36,10 +36,8 @@ fn nohup_not_found() {
 // Utility found but not executable -> 126.
 #[test]
 fn nohup_not_executable() {
-    let path = std::env::temp_dir().join(format!(
-        "posixutils_nohup_test_noexec_{}",
-        std::process::id()
-    ));
+    let dir = plib::tmp::tempdir().unwrap();
+    let path = dir.path().join("noexec");
     {
         let _f = std::fs::OpenOptions::new()
             .create(true)
@@ -50,7 +48,6 @@ fn nohup_not_executable() {
             .unwrap();
     }
     nohup_exit(vec![path.to_str().unwrap()], 126);
-    let _ = std::fs::remove_file(&path);
 }
 
 // Utility exit status is propagated.
@@ -84,9 +81,8 @@ fn nohup_out_created_mode_0600() {
     use std::os::unix::io::FromRawFd;
     use std::process::{Command, Stdio};
 
-    let tmp = std::env::temp_dir().join(format!("posixutils_nohup_pty_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp_dir = plib::tmp::tempdir().unwrap();
+    let tmp = tmp_dir.path();
 
     // Allocate a pseudo-terminal; the slave side becomes the child's stdout.
     let mut master: libc::c_int = 0;
@@ -108,7 +104,7 @@ fn nohup_out_created_mode_0600() {
     let bin = get_binary_path("nohup");
     let status = unsafe {
         Command::new(bin)
-            .current_dir(&tmp)
+            .current_dir(tmp)
             .args(["sh", "-c", "echo hi"])
             .stdin(Stdio::null())
             .stdout(Stdio::from_raw_fd(slave)) // a terminal -> triggers redirect
@@ -124,8 +120,6 @@ fn nohup_out_created_mode_0600() {
     let meta = std::fs::metadata(tmp.join("nohup.out")).expect("nohup.out should exist");
     let mode = meta.permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "nohup.out must be created with mode 0600");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// Allocate a pseudo-terminal, returning (master, slave) fds.
@@ -159,8 +153,8 @@ fn nohup_out_falls_back_to_home_when_cwd_is_unwritable() {
         return;
     }
 
-    let base = std::env::temp_dir().join(format!("posixutils_nohup_home_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base_dir = plib::tmp::tempdir().unwrap();
+    let base = base_dir.path();
     let unwritable = base.join("cwd");
     let home = base.join("home");
     std::fs::create_dir_all(&unwritable).unwrap();
@@ -203,9 +197,6 @@ fn nohup_out_falls_back_to_home_when_cwd_is_unwritable() {
         0o600,
         "the fallback file must also be created 0600"
     );
-
-    std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 // #NH3: "If standard error is a terminal, it shall be redirected to the same
@@ -217,15 +208,14 @@ fn nohup_stderr_follows_stdout_when_stdout_is_not_a_terminal() {
     use std::os::unix::io::FromRawFd;
     use std::process::{Command, Stdio};
 
-    let tmp = std::env::temp_dir().join(format!("posixutils_nohup_err_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp_dir = plib::tmp::tempdir().unwrap();
+    let tmp = tmp_dir.path();
 
     let (master, slave) = open_pty();
     let bin = get_binary_path("nohup");
     let output = unsafe {
         Command::new(bin)
-            .current_dir(&tmp)
+            .current_dir(tmp)
             .args(["sh", "-c", "echo to-stderr >&2"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped()) // a pipe: no redirection happens
@@ -247,6 +237,4 @@ fn nohup_stderr_follows_stdout_when_stdout_is_not_a_terminal() {
         !tmp.join("nohup.out").exists(),
         "no nohup.out should be created when stdout is not a terminal"
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }

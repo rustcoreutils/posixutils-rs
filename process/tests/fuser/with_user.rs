@@ -81,29 +81,22 @@ fn get_username_by_uid(uid: uid_t) -> io::Result<String> {
 /// - Verifies that the owner printed in stderr.
 #[test]
 fn test_fuser_with_user() {
-    let temp_file_path =
-        std::env::temp_dir().join(format!("fuser_with_user_{}", std::process::id()));
-    let temp_file_path_clone = temp_file_path.clone();
-
-    File::create(&temp_file_path_clone).expect("Failed to create temporary file");
+    let temp_file = plib::testing::TempFile::new("fuser_with_user", "");
 
     let mut process = Command::new("tail")
         .arg("-f")
-        .arg(&temp_file_path_clone)
+        .arg(&temp_file)
         .spawn()
         .expect("Failed to start process");
 
     let pid = process.id();
     // fuser only reports `tail` (and so its owner) once `tail` has the file
     // open, which a loaded machine can delay past fuser's scan of /proc.
-    wait_for_open_fd(pid, temp_file_path_clone.to_str().unwrap());
+    wait_for_open_fd(pid, temp_file.to_str().unwrap());
     let owner = get_process_user(pid).expect("Failed to get owner of process");
 
     fuser_test(
-        vec![
-            temp_file_path_clone.to_str().unwrap().to_string(),
-            "-u".to_string(),
-        ],
+        vec![temp_file.to_str().unwrap().to_string(), "-u".to_string()],
         "",
         0,
         |_, output| {
@@ -119,5 +112,4 @@ fn test_fuser_with_user() {
 
     process.kill().expect("Failed to kill the process");
     process.wait().expect("Failed to wait for process");
-    std::fs::remove_file(temp_file_path).expect("Failed to remove temporary file");
 }

@@ -8,7 +8,8 @@
 //
 
 use super::{fuser_test, wait_for_open_fd};
-use std::{fs::File, path::PathBuf, process::Command, str};
+use plib::testing::TempFile;
+use std::{process::Command, str};
 
 /// Tests the basic functionality of `fuser` by ensuring it can find the PID of a process.
 ///
@@ -19,17 +20,11 @@ use std::{fs::File, path::PathBuf, process::Command, str};
 /// - Verifies that the PID of the process is included in the output of `fuser`.
 #[test]
 fn test_fuser_basic() {
-    // Unique per run: the path used to be a fixed `$TMPDIR/test_file`, shared
+    // Unique per test: the path used to be a fixed `$TMPDIR/test_file`, shared
     // with the sibling tests that cargo runs in parallel, so one test could
     // delete the file another was still using.
-    fn get_temp_file_path() -> PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("fuser_basic_test_{}", std::process::id()));
-        path
-    }
-    let binding = get_temp_file_path();
+    let binding = TempFile::new("fuser_basic_test", "");
     let temp_file_path = binding.to_str().unwrap();
-    File::create(temp_file_path).expect("Failed to create temporary file");
 
     let mut process = Command::new("tail")
         .arg("-f")
@@ -57,20 +52,14 @@ fn test_fuser_basic() {
 
     process.kill().expect("Failed to kill the process");
     process.wait().expect("Failed to wait for process");
-    std::fs::remove_file(temp_file_path).expect("Failed to remove temporary file");
 }
 
 /// #F1: the stdout PID list must use the POSIX `" %1d"` format — exactly one
 /// leading space per PID (the old code emitted two spaces for <=4-digit PIDs).
 #[test]
 fn test_fuser_pid_format_single_space() {
-    let temp_file_path = {
-        let mut path = std::env::temp_dir();
-        path.push(format!("fuser_fmt_test_{}", std::process::id()));
-        path
-    };
-    let temp_file_path = temp_file_path.to_str().unwrap();
-    File::create(temp_file_path).expect("Failed to create temporary file");
+    let temp_file = TempFile::new("fuser_fmt_test", "");
+    let temp_file_path = temp_file.to_str().unwrap();
 
     let mut process = Command::new("tail")
         .arg("-f")
@@ -109,5 +98,4 @@ fn test_fuser_pid_format_single_space() {
 
     process.kill().expect("Failed to kill the process");
     process.wait().expect("Failed to wait for process");
-    std::fs::remove_file(temp_file_path).expect("Failed to remove temporary file");
 }

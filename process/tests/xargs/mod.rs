@@ -556,9 +556,8 @@ fn xargs_insert_mode_preserves_internal_spaces() {
 #[test]
 fn xargs_exit_code_126_cannot_invoke() {
     // Create a file that exists but is not executable
-    let test_dir = std::env::temp_dir().join(format!("xargs_test_126_{}", std::process::id()));
-    let _ = fs::create_dir_all(&test_dir);
-    let non_exec_file = test_dir.join("not_executable");
+    let test_dir = plib::tmp::tempdir().unwrap();
+    let non_exec_file = test_dir.path().join("not_executable");
 
     // Create the file
     File::create(&non_exec_file).expect("Failed to create test file");
@@ -589,10 +588,6 @@ fn xargs_exit_code_126_cannot_invoke() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.is_empty(), "Expected error message on stderr");
     });
-
-    // Cleanup
-    let _ = fs::remove_file(&non_exec_file);
-    let _ = fs::remove_dir(&test_dir);
 }
 
 // #X4: `-E` and `-I` together. The suite covers each flag alone

@@ -181,18 +181,35 @@ pub fn create_temp(dir: &Dir, private: bool) -> io::Result<(File, std::ffi::OsSt
     }
 }
 
-/// Give `file` the owner (when running as root) and then the mode of `meta`;
-/// the owner first, because changing it clears the set-ID bits.
+/// Give `file` the owner (when running as root) or else the group (when the
+/// caller belongs to it) of `meta`, and then its mode; the owner first,
+/// because changing it clears the set-ID bits. A set-user-ID or
+/// set-group-ID bit is kept only where the new file really has the
+/// original's owner or group, so patching another user's set-ID file never
+/// yields a set-ID file of the caller's.
 pub fn set_owner_and_mode(file: &File, meta: &Metadata) -> io::Result<()> {
     let fd = file.as_raw_fd();
     // SAFETY: geteuid cannot fail.
     if unsafe { libc::geteuid() } == 0 {
         // SAFETY: the descriptor is open.
         check(unsafe { libc::fchown(fd, meta.uid(), meta.gid()) })?;
+    } else {
+        // Best effort, as in GNU patch: it succeeds only for a group the
+        // caller belongs to. An owner of -1 leaves the owner as it is.
+        // SAFETY: the descriptor is open.
+        let _ = unsafe { libc::fchown(fd, libc::uid_t::MAX, meta.gid()) };
+    }
+    let now = file.metadata()?;
+    let mut bits = meta.mode() & 0o7777;
+    if now.uid() != meta.uid() {
+        bits &= !0o4000;
+    }
+    if now.gid() != meta.gid() {
+        bits &= !0o2000;
     }
     // mode_t is u16 on macOS, u32 on Linux; the permission bits fit both.
     #[allow(clippy::unnecessary_cast)]
-    let mode = (meta.mode() & 0o7777) as libc::mode_t;
+    let mode = bits as libc::mode_t;
     // SAFETY: the descriptor is open.
     check(unsafe { libc::fchmod(fd, mode) })
 }

@@ -358,6 +358,41 @@ fn test_patch_replaces_file() {
     assert_eq!(read(&fx.in_tree("other")), "target\n");
 }
 
+/// A group of the caller's other than its effective one, if it has any.
+fn other_group() -> Option<libc::gid_t> {
+    // SAFETY: a zero-length query only returns the count.
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0 as libc::gid_t; usize::try_from(n).ok()?];
+    // SAFETY: `groups` has room for `n` entries.
+    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    groups.truncate(usize::try_from(n).ok()?);
+    // SAFETY: getegid cannot fail.
+    let egid = unsafe { libc::getegid() };
+    groups.into_iter().find(|&g| g != egid)
+}
+
+// A patched file keeps its group, and with it its set-group-ID bit, when the
+// caller belongs to that group, as GNU patch does for a non-root caller.
+#[test]
+fn test_patch_preserves_group() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(gid) = other_group() else {
+        eprintln!("the caller belongs to only one group; nothing to carry over");
+        return;
+    };
+    let fx = Fixture::new("keeps_group");
+    let f = fx.in_tree("f");
+    fs::write(&f, "target\n").unwrap();
+    std::os::unix::fs::chown(&f, None, Some(gid)).unwrap();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o2751)).unwrap();
+    let (code, err) = fx.run(&["-p1", "-t"], MODIFY_F);
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert_eq!(read(&f), "pwned\n");
+    let meta = fs::metadata(&f).unwrap();
+    assert_eq!(meta.gid(), gid);
+    assert_eq!(meta.mode() & 0o7777, 0o2751);
+}
+
 // -o names the user's own output file; a link there is followed, as GNU does.
 #[test]
 fn test_patch_output_file_follows_link() {

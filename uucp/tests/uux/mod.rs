@@ -302,6 +302,21 @@ fn test_uux_remote_work_dir_name_is_not_the_local_one() {
     );
 }
 
+/// Start-up output that is not UTF-8 (a Latin-1 MOTD) does not break it
+/// either.
+#[test]
+fn test_uux_remote_work_dir_survives_non_utf8_startup_output() {
+    let fake = FakeSsh::new("uux_remote_latin1");
+    let out = fake.join("out");
+    let cmd = format!("hosta!ls -ld \"$PWD\" > !{}", out.display());
+    let noise = "case \"$5\" in *mkdir*) printf 'Bienvenue \\351 hosta\\n';; esac";
+
+    let output = fake.run("uux", &[&cmd], noise);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_private_work_dir(&fake, &read(&out));
+}
+
 /// If the remote work directory is made but its path cannot be read back
 /// (here the stand-in ssh discards the command's output), uux fails and
 /// still removes the directory.

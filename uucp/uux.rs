@@ -371,10 +371,13 @@ fn remote_tmp_path(name: &str) -> String {
 
 /// The path printed after the last sentinel line in `stdout`, if it is the
 /// directory made as `name`: one absolute line ending in `/name`.
+/// The output before the sentinel is skipped as bytes, so start-up output
+/// in any encoding is no obstacle; only the path is decoded.
 fn path_after_sentinel(stdout: &[u8], name: &str) -> Option<String> {
-    let text = std::str::from_utf8(stdout).ok()?;
     let marker = format!("\n{REMOTE_DIR_SENTINEL}\n");
-    let (_, path) = text.rsplit_once(&marker)?;
+    let marker = marker.as_bytes();
+    let start = stdout.windows(marker.len()).rposition(|w| w == marker)? + marker.len();
+    let path = std::str::from_utf8(&stdout[start..]).ok()?;
     let is_ours =
         path.starts_with('/') && !path.contains('\n') && path.ends_with(&format!("/{name}"));
     is_ours.then(|| path.to_string())
@@ -716,6 +719,16 @@ mod tests {
         assert_eq!(parse(format!("\n{s}\n/tmp/xuux.ab")), None);
         assert_eq!(parse(format!("\n{s}\n/tmp/uux.ab\n/etc")), None);
         assert_eq!(parse(format!("\n{s}\n/etc\n/tmp/uux.ab")), None);
+    }
+
+    #[test]
+    fn test_path_after_sentinel_ignores_non_utf8_before_it() {
+        let mut out = b"caf\xe9 \xff motd\n".to_vec();
+        out.extend_from_slice(format!("\n{REMOTE_DIR_SENTINEL}\n/tmp/uux.ab").as_bytes());
+        assert_eq!(
+            path_after_sentinel(&out, "uux.ab").as_deref(),
+            Some("/tmp/uux.ab")
+        );
     }
 
     #[test]

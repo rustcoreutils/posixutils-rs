@@ -673,11 +673,9 @@ mod tests {
     // Robustness — malformed pages must not crash (audit Phase 1)
     // -------------------------------------------------------------------------
 
-    /// Write `content` to a uniquely named temp file and return its path.
-    fn write_temp_page(tag: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("man_audit_{}_{}.1", tag, std::process::id()));
-        std::fs::write(&path, content).expect("write temp page");
-        path
+    /// Write `content` to a temp page `<tag>.1`, removed when dropped.
+    fn write_temp_page(tag: &str, content: impl AsRef<[u8]>) -> plib::testing::TempFile {
+        plib::testing::TempFile::new(&format!("{tag}.1"), content)
     }
 
     // Audit #1: `.Xr name` with a missing section number must not panic; it
@@ -691,7 +689,6 @@ mod tests {
             .args(["-C", "man.test.conf"])
             .output()
             .expect("Failed to run man -c -l");
-        let _ = std::fs::remove_file(&page);
 
         assert_eq!(
             output.status.code(),
@@ -717,7 +714,6 @@ mod tests {
             .output()
             .expect("Failed to run man -c -l");
         let elapsed = start.elapsed();
-        let _ = std::fs::remove_file(&page);
         (
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -827,7 +823,6 @@ mod tests {
 
         let wide = longest_line(&format_local(&[("COLUMNS", "120")], &page).stdout);
         let narrow = longest_line(&format_local(&[("COLUMNS", "40")], &page).stdout);
-        let _ = std::fs::remove_file(&page);
 
         assert!(wide > 90, "COLUMNS=120 should widen lines, got {wide}");
         assert!(narrow <= 39, "COLUMNS=40 should narrow lines, got {narrow}");
@@ -838,7 +833,6 @@ mod tests {
     fn columns_zero_does_not_underflow() {
         let page = write_temp_page("colz", ".Dd x\n.Dt T 1\n.Os\n.Sh D\nhello\n");
         let output = format_local(&[("COLUMNS", "0")], &page);
-        let _ = std::fs::remove_file(&page);
         assert_eq!(output.status.code(), Some(0));
         assert!(longest_line(&output.stdout) <= 200, "width must stay sane");
     }
@@ -852,7 +846,6 @@ mod tests {
         );
         // Wide page so 30 fits.
         let output = format_local(&[("COLUMNS", "100")], &page);
-        let _ = std::fs::remove_file(&page);
         let stdout = String::from_utf8_lossy(&output.stdout);
         // The tag and body share a line: `<indent>tag<pad>body`. The column
         // where `body` begins reflects the tag-column width; with -width 30 it
@@ -873,8 +866,8 @@ mod tests {
     #[test]
     fn pager_not_invoked_when_piped() {
         // A PAGER marker script; if invoked it prepends a sentinel line.
-        let pager = std::env::temp_dir().join(format!("man_audit_pager_{}.sh", std::process::id()));
-        std::fs::write(&pager, "#!/bin/sh\necho __PAGER_RAN__\ncat\n").unwrap();
+        let pager =
+            plib::testing::TempFile::new("pager.sh", "#!/bin/sh\necho __PAGER_RAN__\ncat\n");
         let mut perms = std::fs::metadata(&pager).unwrap().permissions();
         use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o755);
@@ -888,8 +881,6 @@ mod tests {
             .env("PAGER", &pager)
             .output()
             .expect("Failed to run man -l");
-        let _ = std::fs::remove_file(&page);
-        let _ = std::fs::remove_file(&pager);
 
         assert!(
             !String::from_utf8_lossy(&output.stdout).contains("__PAGER_RAN__"),
@@ -906,11 +897,9 @@ mod tests {
     fn non_utf8_page_renders() {
         let mut bytes = b".Dd x\n.Dt T 1\n.Os\n.Sh D\n".to_vec();
         bytes.extend_from_slice(b"caf\xe9\n"); // Latin-1 'é'
-        let path = std::env::temp_dir().join(format!("man_audit_latin1_{}.1", std::process::id()));
-        std::fs::write(&path, &bytes).unwrap();
+        let path = write_temp_page("latin1", &bytes);
 
         let output = format_local(&[], &path);
-        let _ = std::fs::remove_file(&path);
         assert_eq!(output.status.code(), Some(0), "should not error on Latin-1");
         assert!(String::from_utf8_lossy(&output.stdout).contains("caf"));
     }
@@ -920,7 +909,6 @@ mod tests {
     fn stray_it_renders() {
         let page = write_temp_page("it", ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.It orphanitem\n");
         let output = format_local(&[], &page);
-        let _ = std::fs::remove_file(&page);
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("orphanitem"),
             "stray .It text should render"
@@ -933,7 +921,6 @@ mod tests {
     fn tg_line_is_harmless() {
         let page = write_temp_page("tg", ".Dd x\n.Dt T 1\n.Os\n.Sh D\n.Tg sometag\nbody text\n");
         let output = format_local(&[], &page);
-        let _ = std::fs::remove_file(&page);
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("body text") && !stdout.contains("sometag"));
@@ -977,7 +964,6 @@ mod tests {
              Success.\n",
         );
         let output = format_local(&[], &page);
-        let _ = std::fs::remove_file(&page);
         assert_eq!(output.status.code(), Some(0), "man(7) page should render");
         let stdout = String::from_utf8_lossy(&output.stdout);
         for needle in [
@@ -998,7 +984,6 @@ mod tests {
     fn man7_empty_page_errors() {
         let page = write_temp_page("man7e", ".TH TEST 1\n");
         let output = format_local(&[], &page);
-        let _ = std::fs::remove_file(&page);
         assert_eq!(
             output.status.code(),
             Some(1),

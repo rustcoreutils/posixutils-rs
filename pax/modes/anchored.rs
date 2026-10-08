@@ -22,7 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use crate::modes::made::{self, cvt, verify_made_dir, MadeNode, MadeTrust};
-use plib::madefs::{found_dir_attrs, FoundDir, Preserve};
+use plib::madefs::{ChainTrust, FoundDir, Preserve};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -198,9 +198,13 @@ pub(crate) struct DirTree {
     chain: RefCell<Chain>,
     /// How many levels `chain` may hold: each is an open descriptor.
     max_levels: usize,
-    /// The parent most recently walked to, so consecutive members of one
-    /// directory deeper than `max_levels` still share one walk.
-    last_parent: RefCell<Option<(Vec<u8>, Rc<OwnedFd>)>>,
+    /// The parent most recently walked to, and the trust it hands the
+    /// directories found in it, so consecutive members of one directory
+    /// deeper than `max_levels` still share one walk.
+    last_parent: RefCell<Option<LastParent>>,
+    /// The trust the anchor hands the directories found in it: the root of
+    /// the trust every walk carries down (`ChainTrust`).
+    root_trust: ChainTrust,
     /// `(st_dev, st_ino)` of the directories this run created only to hold a
     /// member below them, each with the member path (`MemberPath::key`) it
     /// was made at. Such a directory is not a pre-existing file: a member
@@ -250,8 +254,10 @@ impl DirTree {
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let root = unsafe { OwnedFd::from_raw_fd(fd) };
         Ok(DirTree {
-            root: unsafe { OwnedFd::from_raw_fd(fd) },
+            root_trust: ChainTrust::anchor(root.as_raw_fd())?,
+            root,
             chain: RefCell::new(Chain::default()),
             max_levels: cached_levels_budget(),
             last_parent: RefCell::new(None),
@@ -275,9 +281,20 @@ impl DirTree {
         member: &MemberPath,
         create_missing: bool,
     ) -> PaxResult<Rc<OwnedFd>> {
-        if let Some((dirs, fd)) = &*self.last_parent.borrow() {
-            if *dirs == member.dirs {
-                return Ok(Rc::clone(fd));
+        self.parent_and_trust(member, create_missing)
+            .map(|(fd, _)| fd)
+    }
+
+    /// `parent_of`, with the trust that parent hands the directories found
+    /// in it (`ChainTrust`), carried down the walk from the anchor.
+    fn parent_and_trust(
+        &self,
+        member: &MemberPath,
+        create_missing: bool,
+    ) -> PaxResult<(Rc<OwnedFd>, ChainTrust)> {
+        if let Some(last) = &*self.last_parent.borrow() {
+            if last.dirs == member.dirs {
+                return Ok((Rc::clone(&last.fd), last.trust));
             }
         }
 
@@ -288,19 +305,34 @@ impl DirTree {
         // replace it while the chain kept its descriptor. With no last parent
         // the next member goes through the chain, and cuts it as it should.
         *self.last_parent.borrow_mut() = match &walked {
-            Ok(fd) => Some((member.dirs.clone(), Rc::clone(fd))),
+            Ok((fd, trust)) => Some(LastParent {
+                dirs: member.dirs.clone(),
+                fd: Rc::clone(fd),
+                trust: *trust,
+            }),
             Err(_) => None,
         };
         walked
     }
 
-    /// The walk `parent_of` does through the chain, reopening only the
-    /// components `member` does not share with it.
-    fn walk_chain(&self, member: &MemberPath, create_missing: bool) -> PaxResult<Rc<OwnedFd>> {
+    /// The walk `parent_and_trust` does through the chain, reopening only the
+    /// components `member` does not share with it, and carrying the trust
+    /// down from the anchor: each directory found existing hands on what it
+    /// was handed and its own (`ChainTrust::found`); one this run made, at
+    /// that path, starts afresh (`ChainTrust::made`).
+    fn walk_chain(
+        &self,
+        member: &MemberPath,
+        create_missing: bool,
+    ) -> PaxResult<(Rc<OwnedFd>, ChainTrust)> {
         let mut chain = self.chain.borrow_mut();
         let shared = chain.shared_with(member);
         chain.truncate(shared);
-        let mut cur = chain.levels.last().map(|(_, fd)| Rc::clone(fd));
+        let mut cur = chain.levels.last().map(|level| Rc::clone(&level.fd));
+        let mut trust = chain
+            .levels
+            .last()
+            .map_or(self.root_trust, |level| level.trust);
 
         for (level, comp) in member.dirs().enumerate().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
@@ -327,15 +359,19 @@ impl DirTree {
                         .or_insert(mtime_of(&st));
                 }
             }
+            trust = match self.standing(id, key) {
+                Standing::Implicit | Standing::Made => ChainTrust::made(next.as_raw_fd())?,
+                _ => trust.found(next.as_raw_fd())?,
+            };
             let next = Rc::new(next);
             if chain.levels.len() < self.max_levels {
-                chain.push(comp, Rc::clone(&next));
+                chain.push(comp, Rc::clone(&next), trust);
             }
             cur = Some(next);
         }
         match cur {
-            Some(fd) => Ok(fd),
-            None => Ok(Rc::new(self.root.try_clone()?)),
+            Some(fd) => Ok((fd, trust)),
+            None => Ok((Rc::new(self.root.try_clone()?), trust)),
         }
     }
 
@@ -479,8 +515,25 @@ fn mtime_of(st: &libc::stat) -> (i64, i64) {
 struct Chain {
     /// The components, each ended by a NUL, as in `MemberPath::dirs`.
     names: Vec<u8>,
-    /// For each level, where its name ends in `names` and its descriptor.
-    levels: Vec<(usize, Rc<OwnedFd>)>,
+    levels: Vec<Level>,
+}
+
+/// The parent `DirTree` walked to last (`DirTree::last_parent`).
+struct LastParent {
+    /// The member's directory components, as in `MemberPath::dirs`.
+    dirs: Vec<u8>,
+    fd: Rc<OwnedFd>,
+    /// The trust it hands the directories found in it (`ChainTrust`).
+    trust: ChainTrust,
+}
+
+/// One directory of `Chain`.
+struct Level {
+    /// Where its name ends in `Chain::names`.
+    end: usize,
+    fd: Rc<OwnedFd>,
+    /// The trust it hands the directories found in it (`ChainTrust`).
+    trust: ChainTrust,
 }
 
 impl Chain {
@@ -496,13 +549,14 @@ impl Chain {
     /// Forget every level below the first `depth`.
     fn truncate(&mut self, depth: usize) {
         self.levels.truncate(depth);
-        let end = self.levels.last().map_or(0, |(end, _)| *end);
+        let end = self.levels.last().map_or(0, |level| level.end);
         self.names.truncate(end);
     }
 
-    fn push(&mut self, name: &CStr, fd: Rc<OwnedFd>) {
+    fn push(&mut self, name: &CStr, fd: Rc<OwnedFd>, trust: ChainTrust) {
         self.names.extend_from_slice(name.to_bytes_with_nul());
-        self.levels.push((self.names.len(), fd));
+        let end = self.names.len();
+        self.levels.push(Level { end, fd, trust });
     }
 }
 
@@ -597,16 +651,20 @@ impl PendingDirs {
 /// A directory this run made and verified takes its attributes. One that was
 /// already there takes, as libarchive's does, its times by default, its mode
 /// only under `-p p` and its owner only under `-p o` -- and those only where
-/// nobody but pax's user can create entries beside it; elsewhere it keeps
-/// all its own, and that is diagnosed (`found_dir_with_mode`).
+/// nobody but pax's user could have created its name, in its parent or any
+/// directory above it up to the anchor (`ChainTrust`, carried down the
+/// walk); elsewhere it keeps all its own, and that is diagnosed
+/// (`found_dir_with_mode`).
 fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> PaxResult<()> {
     let Some(member) = MemberPath::parse(&dir.path)? else {
         return Ok(());
     };
-    let opened = tree.parent_of(&member, false).and_then(|parent| {
-        open_dir_for_attrs(parent.as_fd(), &member.leaf).map(|opened| (parent, opened))
-    });
-    let (parent, (fd, search_only)) = match opened {
+    let opened = tree
+        .parent_and_trust(&member, false)
+        .and_then(|(parent, trust)| {
+            open_dir_for_attrs(parent.as_fd(), &member.leaf).map(|opened| (trust, opened))
+        });
+    let (trust, (fd, search_only)) = match opened {
         Ok(opened) => opened,
         Err(PaxError::Io(e)) if is_superseded(&e) => return Ok(()),
         Err(e) => return Err(e),
@@ -618,7 +676,7 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
         Standing::Replaced => return Err(PaxError::Io(made::replaced())),
         Standing::Unverified => return Err(attrs_withheld()),
         Standing::Implicit | Standing::Made => true,
-        Standing::Ordinary => found_dir_with_mode(parent.as_fd(), fd.as_fd(), policy)?,
+        Standing::Ordinary => found_dir_with_mode(trust, policy)?,
     };
     if search_only {
         return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy, with_mode);
@@ -626,21 +684,17 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
     set_attrs_with(&AttrTarget::Fd(fd.as_fd()), &dir.attrs, policy, with_mode)
 }
 
-/// For a directory found existing at a member's name (open on `dir`, in
-/// `parent`): whether it takes the member's mode, or an error when it is to
-/// take nothing at all (`plib::madefs::found_dir_attrs`). Its owner it takes
-/// only under `-p o`, which `set_attrs_with` already follows; its times, as
-/// by default, whenever it takes anything.
-fn found_dir_with_mode(
-    parent: BorrowedFd<'_>,
-    dir: BorrowedFd<'_>,
-    policy: &AttrPolicy,
-) -> PaxResult<bool> {
+/// For a directory found existing at a member's name, in a parent handing it
+/// `trust`: whether it takes the member's mode, or an error when it is to
+/// take nothing at all (`ChainTrust::found_dir`). Its owner it takes only
+/// under `-p o`, which `set_attrs_with` already follows; its times, as by
+/// default, whenever it takes anything.
+fn found_dir_with_mode(trust: ChainTrust, policy: &AttrPolicy) -> PaxResult<bool> {
     let requested = Preserve {
         mode: policy.preserve_perms,
         owner: policy.preserve_owner,
     };
-    match found_dir_attrs(parent.as_raw_fd(), dir.as_raw_fd(), requested)? {
+    match trust.found_dir(requested) {
         FoundDir::TimesOnly => Ok(false),
         FoundDir::AsRequested => Ok(policy.preserve_perms),
         FoundDir::LeaveAlone => Err(PaxError::Io(std::io::Error::other(

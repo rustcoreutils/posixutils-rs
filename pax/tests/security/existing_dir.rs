@@ -199,3 +199,116 @@ fn test_copy_onto_an_existing_directory_follows_p() {
         assert!(dest.join("d/f").exists(), "{args:?}");
     }
 }
+
+/// A source tree `p/secret/f`, with `p/secret` mode 0777, and an archive of
+/// `p/secret` and its file alone: `p` is made, or walked through, only to
+/// reach it.
+fn deep_source(temp: &TempDir) -> (PathBuf, PathBuf) {
+    let src = temp.path().join("deep-src");
+    fs::create_dir_all(src.join("p/secret")).unwrap();
+    fs::write(src.join("p/secret/f"), "data\n").unwrap();
+    fs::set_permissions(src.join("p/secret"), fs::Permissions::from_mode(0o777)).unwrap();
+    let mut write = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-f", "../deep.tar"])
+        .current_dir(&src)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let list = b"p/secret\np/secret/f\n";
+    write.stdin.as_mut().unwrap().write_all(list).unwrap();
+    drop(write.stdin.take());
+    assert!(write.wait().unwrap().success());
+    (src, temp.path().join("deep.tar"))
+}
+
+/// A destination `G` of mode `mode` holding the user's own `X` (0755) with a
+/// private `secret` (0700) in it -- and, as someone who can write `G` would
+/// arrange, `X` renamed to `p`, so that the member `p/secret` names the
+/// private directory. `p` itself is the user's, and nobody else can create
+/// entries in it: the one level that is not safe is the one above.
+fn dest_with_renamed_chain(temp: &TempDir, mode: u32) -> PathBuf {
+    let dest = temp.path().join("G");
+    fs::create_dir(&dest).unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).unwrap();
+    fs::create_dir_all(dest.join("X/secret")).unwrap();
+    fs::write(dest.join("X/secret/key"), "secret\n").unwrap();
+    fs::set_permissions(dest.join("X"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(dest.join("X/secret"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(dest.join("X"), dest.join("p")).unwrap();
+    dest
+}
+
+/// Trust holds along the whole chain: a directory found below one that
+/// someone else could have put there -- `p`, renamed in -- is no safer for
+/// sitting in a parent only the user can write. Under -p e it keeps its own
+/// mode, and that is diagnosed; without -p it takes its times and nothing
+/// else, with no error.
+#[test]
+fn test_extract_trust_holds_along_the_chain() {
+    for (privs, code) in [(Some("e"), 1), (None, 0)] {
+        let temp = TempDir::new().unwrap();
+        let (_, archive) = deep_source(&temp);
+        let dest = dest_with_renamed_chain(&temp, 0o775);
+        let mut args = vec!["-r"];
+        if let Some(p) = privs {
+            args.extend(["-p", p]);
+        }
+        args.extend(["-f", archive.to_str().unwrap()]);
+        let out = pax(&dest, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            mode_of(&dest.join("p/secret")),
+            0o700,
+            "{args:?}: the private directory was opened up"
+        );
+        assert_eq!(out.status.code(), Some(code), "{args:?}: stderr: {stderr}");
+        assert_eq!(stderr.contains(DIAGNOSTIC), code == 1, "{args:?}: {stderr}");
+        assert!(dest.join("p/secret/f").exists(), "{args:?}");
+    }
+}
+
+/// The same in copy mode.
+#[test]
+fn test_copy_trust_holds_along_the_chain() {
+    for (privs, code) in [(Some("e"), 1), (None, 0)] {
+        let temp = TempDir::new().unwrap();
+        let (src, _) = deep_source(&temp);
+        let dest = dest_with_renamed_chain(&temp, 0o775);
+        let mut args = vec!["-rw"];
+        if let Some(p) = privs {
+            args.extend(["-p", p]);
+        }
+        args.extend(["p/secret", dest.to_str().unwrap()]);
+        let out = pax(&src, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            mode_of(&dest.join("p/secret")),
+            0o700,
+            "{args:?}: the private directory was opened up"
+        );
+        assert_eq!(out.status.code(), Some(code), "{args:?}: stderr: {stderr}");
+        assert!(dest.join("p/secret/f").exists(), "{args:?}");
+    }
+}
+
+/// Where every level of the chain is the user's alone, a directory found deep
+/// in it still takes the member's mode under -p e, in both modes.
+#[test]
+fn test_a_private_chain_still_stamps_under_pe() {
+    for copy in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let (src, archive) = deep_source(&temp);
+        let dest = dest_with_renamed_chain(&temp, 0o755);
+        let out = if copy {
+            pax(
+                &src,
+                &["-rw", "-p", "e", "p/secret", dest.to_str().unwrap()],
+            )
+        } else {
+            pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()])
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "copy={copy}: stderr: {stderr}");
+        assert_eq!(mode_of(&dest.join("p/secret")), 0o777, "copy={copy}");
+    }
+}

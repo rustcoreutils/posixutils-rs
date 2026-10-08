@@ -174,7 +174,7 @@ pub struct Preserve {
 }
 
 /// What a directory found already existing -- not one the caller made and verified -- is to
-/// be given (`found_dir_attrs`).
+/// be given (`ChainTrust::found_dir`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FoundDir {
     /// Neither mode nor owner was asked for: its times, as by default, and nothing else.
@@ -185,39 +185,72 @@ pub enum FoundDir {
     LeaveAlone,
 }
 
-/// What the directory open on `dir_fd`, found existing in `parent_fd`, may be given, `requested`
-/// being which of mode and owner the user asked to preserve.
+/// The trust a chain of directories, walked down from the anchor the user named, hands to the
+/// directories found existing in its last one: whether they may take a source's mode or owner.
 ///
 /// An existing directory takes a source's mode or owner only when that was asked for, as
 /// libarchive does ("we don't change perms on existing dirs unless _EXTRACT_PERM is
-/// specified"); otherwise only its times. And even then only where nobody but the effective
-/// user can create entries in its parent (`nobody_else_can_create`): anyone who can create
-/// entries there can create the name before the caller does -- renaming to it a directory of
-/// their choosing, the user's own private one included -- and the sticky bit does not stop
-/// that. Who owns the directory found proves nothing. Giving such a directory a mode would open
-/// it up; giving it an owner would give it away.
+/// specified"); otherwise only its times (`found_dir`). And even then only where nobody but the
+/// effective user could have created its name -- in its parent, and in every directory above
+/// it, up to the anchor: anyone who can create entries anywhere on the way can create a name
+/// there before the caller does -- renaming to it a directory of their choosing, the user's own
+/// private one included, or a directory holding one -- and the sticky bit does not stop that.
+/// Who owns the directory found proves nothing. Giving such a directory a mode would open it
+/// up; giving it an owner would give it away.
 ///
-/// An operand resolved from the working directory has no parent descriptor (`AT_FDCWD`); its
-/// parent is then read as `dir_fd`'s own `..`.
-pub fn found_dir_attrs(
-    parent_fd: RawFd,
-    dir_fd: RawFd,
-    requested: Preserve,
-) -> io::Result<FoundDir> {
-    if !requested.mode && !requested.owner {
-        return Ok(FoundDir::TimesOnly);
+/// So the trust is carried down the chain, one directory at a time, from descriptors: the
+/// anchor hands it to its entries when nobody else can create entries in it (`anchor`); a
+/// directory found existing hands it on when it was handed it and nobody else can create
+/// entries in it either (`found`); a directory the caller made and verified is safe itself, and
+/// hands it on when nobody else can create entries in it (`made`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChainTrust {
+    /// Whether directories found existing in this one may take what was asked for.
+    entries_safe: bool,
+}
+
+impl ChainTrust {
+    /// The trust the anchor -- the directory the user named, open on `anchor_fd` -- hands its
+    /// entries.
+    pub fn anchor(anchor_fd: RawFd) -> io::Result<Self> {
+        Ok(ChainTrust {
+            entries_safe: nobody_else_can_create_in(anchor_fd)?,
+        })
     }
-    let parent = if parent_fd == libc::AT_FDCWD {
-        lstat_at(dir_fd, c"..")?
-    } else {
-        fstat(parent_fd)?
-    };
+
+    /// The trust a directory found existing, open on `dir_fd`, in a directory that handed it
+    /// `self`, hands its own entries.
+    pub fn found(self, dir_fd: RawFd) -> io::Result<Self> {
+        Ok(ChainTrust {
+            entries_safe: self.entries_safe && nobody_else_can_create_in(dir_fd)?,
+        })
+    }
+
+    /// The trust a directory the caller made and verified (`verify_made_dir`), open on
+    /// `dir_fd`, hands its entries, wherever it is.
+    pub fn made(dir_fd: RawFd) -> io::Result<Self> {
+        Ok(ChainTrust {
+            entries_safe: nobody_else_can_create_in(dir_fd)?,
+        })
+    }
+
+    /// What a directory found existing in a directory of this trust may be given, `requested`
+    /// being which of mode and owner the user asked to preserve.
+    pub fn found_dir(self, requested: Preserve) -> FoundDir {
+        if !requested.mode && !requested.owner {
+            FoundDir::TimesOnly
+        } else if self.entries_safe {
+            FoundDir::AsRequested
+        } else {
+            FoundDir::LeaveAlone
+        }
+    }
+}
+
+/// `nobody_else_can_create` for the directory open on `fd`.
+fn nobody_else_can_create_in(fd: RawFd) -> io::Result<bool> {
     let euid = unsafe { libc::geteuid() };
-    if nobody_else_can_create(&parent, euid) {
-        Ok(FoundDir::AsRequested)
-    } else {
-        Ok(FoundDir::LeaveAlone)
-    }
+    Ok(nobody_else_can_create(&fstat(fd)?, euid))
 }
 
 /// Whether nobody but `euid` can create entries in the directory `parent`: it is owned by
@@ -505,9 +538,9 @@ pub fn utimens_link_if_still(
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_lending_read, found_dir_attrs, made_by_us, nobody_else_can_create, others_can_rename,
-        utimens_link_if_still, verify_made_dir, FoundDir, FsOwners, MadeObject, MadeTrust,
-        Preserve,
+        empty_lending_read, made_by_us, nobody_else_can_create, others_can_rename,
+        utimens_link_if_still, verify_made_dir, ChainTrust, FoundDir, FsOwners, MadeObject,
+        MadeTrust, Preserve,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -538,15 +571,18 @@ mod tests {
     }
 
     /// A found directory gets its times only unless mode or owner was asked for; then what was
-    /// asked for where nobody else can create entries beside it, and nothing elsewhere.
+    /// asked for only where nobody else could have created its name -- in its parent, and in
+    /// every directory above it up to the anchor. A directory the caller made restarts the
+    /// trust below it.
     #[test]
-    fn a_found_directory_gets_what_was_asked_only_where_nobody_else_can_create() {
+    fn a_found_directory_gets_what_was_asked_only_down_a_trusted_chain() {
         let tmp = crate::tmp::TempDir::new().unwrap();
-        let shared = tmp.path().join("shared");
-        let private = tmp.path().join("private");
-        for (dir, mode) in [(&shared, 0o777), (&private, 0o755)] {
-            std::fs::create_dir_all(dir.join("d")).unwrap();
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        let root = tmp.path();
+        // anchor 0755 / g 0775 (someone else can create here) / x 0755 / d
+        std::fs::create_dir_all(root.join("g/x/d")).unwrap();
+        for (dir, mode) in [("", 0o755), ("g", 0o775), ("g/x", 0o755)] {
+            let path = root.join(dir);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
         }
         let none = Preserve {
             mode: false,
@@ -560,17 +596,24 @@ mod tests {
             mode: false,
             owner: true,
         };
-        let attrs = |parent: &std::path::Path, requested| {
-            let parent = std::fs::File::open(parent).unwrap();
-            let dir = open_search(&parent, c"d");
-            found_dir_attrs(parent.as_raw_fd(), dir.as_raw_fd(), requested).unwrap()
-        };
-        assert_eq!(attrs(&shared, none), FoundDir::TimesOnly);
-        assert_eq!(attrs(&shared, mode), FoundDir::LeaveAlone);
-        assert_eq!(attrs(&shared, owner), FoundDir::LeaveAlone);
-        assert_eq!(attrs(&private, none), FoundDir::TimesOnly);
-        assert_eq!(attrs(&private, mode), FoundDir::AsRequested);
-        assert_eq!(attrs(&private, owner), FoundDir::AsRequested);
+        let fd = |path: &str| std::fs::File::open(root.join(path)).unwrap();
+        let anchor = ChainTrust::anchor(fd("").as_raw_fd()).unwrap();
+        let g = anchor.found(fd("g").as_raw_fd()).unwrap();
+        let x = g.found(fd("g/x").as_raw_fd()).unwrap();
+
+        // `g` itself: found in the anchor, which only the user can write.
+        assert_eq!(anchor.found_dir(mode), FoundDir::AsRequested);
+        // `x`: found in `g`, which others can write.
+        assert_eq!(g.found_dir(mode), FoundDir::LeaveAlone);
+        // `d`: its parent `x` is the user's alone, but `x` may be anyone's
+        // directory renamed into `g`.
+        assert_eq!(x.found_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(x.found_dir(owner), FoundDir::LeaveAlone);
+        assert_eq!(x.found_dir(none), FoundDir::TimesOnly);
+        // Had the caller made and verified `x`, what it finds in it is safe.
+        let made_x = ChainTrust::made(fd("g/x").as_raw_fd()).unwrap();
+        assert_eq!(made_x.found_dir(mode), FoundDir::AsRequested);
+        assert_eq!(made_x.found_dir(owner), FoundDir::AsRequested);
     }
 
     /// Only the parent's owner, or anyone allowed to write a parent that is not sticky, can

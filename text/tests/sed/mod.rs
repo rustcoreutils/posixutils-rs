@@ -8,6 +8,7 @@
 //
 
 mod bytes;
+mod options;
 #[cfg(unix)]
 mod wfile;
 

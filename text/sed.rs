@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 use plib::locale::next_char_offset;
 use plib::regex::{Regex as PlibRegex, RegexFlags};
@@ -41,42 +41,70 @@ struct Args {
 
     #[arg(help=gettext("A pathname of a file whose contents are read and edited."))]
     file: Vec<String>,
+
+    /// The `-e` scripts and `-f` script files, in command-line order.
+    #[arg(skip)]
+    sources: Vec<ScriptSource>,
+}
+
+/// One piece of the script: the text of a `-e`, or the file of a `-f`.
+#[derive(Debug, Clone)]
+enum ScriptSource {
+    Text(String),
+    File(PathBuf),
 }
 
 impl Args {
-    // Get ordered script sources from [-e script] and [-f script_file] manually.
-    fn get_raw_script() -> Result<String, SedError> {
+    /// Parse the command line, recording the `-e` and `-f` option-arguments
+    /// in the order they were given, which is the order of the script.
+    ///
+    /// The order comes from clap's own indices, so every spelling clap
+    /// accepts counts: `-ne p`, `-es/a/b/`, `-fFILE`; and a word "-e" after
+    /// `--` is the file operand it is.
+    fn parse_ordered() -> Args {
+        let matches = Args::command().get_matches();
+        let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+
+        let mut sources: Vec<(usize, ScriptSource)> = Vec::new();
+        if let (Some(texts), Some(indices)) = (
+            matches.get_many::<String>("script"),
+            matches.indices_of("script"),
+        ) {
+            sources.extend(indices.zip(texts.map(|t| ScriptSource::Text(t.clone()))));
+        }
+        if let (Some(files), Some(indices)) = (
+            matches.get_many::<PathBuf>("SCRIPT_FILE"),
+            matches.indices_of("SCRIPT_FILE"),
+        ) {
+            sources.extend(indices.zip(files.map(|f| ScriptSource::File(f.clone()))));
+        }
+        sources.sort_by_key(|(index, _)| *index);
+        args.sources = sources.into_iter().map(|(_, source)| source).collect();
+        args
+    }
+
+    /// The text of every `-e` script and `-f` script file, in order.
+    fn get_raw_script(sources: &[ScriptSource]) -> Result<String, SedError> {
         let mut raw_scripts: Vec<String> = vec![];
 
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let mut args_iter = args.iter();
-
-        while let Some(arg) = args_iter.next() {
-            match arg.as_str() {
-                "-e" => {
-                    // Can unwrap because `-e` is already validated by `clap`.
-                    let e_script = args_iter.next().unwrap();
+        for source in sources {
+            match source {
+                ScriptSource::Text(e_script) => {
                     for raw_script_line in e_script.split('\n') {
                         raw_scripts.push(raw_script_line.to_string());
                     }
-                    if let Some(script) = raw_scripts.last_mut() {
-                        *script += "\n;";
-                    }
                 }
-                "-f" => {
-                    // Can unwrap because `-f` is already validated by `clap`.
-                    let script_file =
-                        File::open(args_iter.next().unwrap()).map_err(SedError::Io)?;
+                ScriptSource::File(path) => {
+                    let script_file = File::open(path).map_err(SedError::Io)?;
                     let reader = BufReader::new(script_file);
                     for line in reader.lines() {
                         let raw_script = line.map_err(SedError::Io)?;
                         raw_scripts.push(raw_script);
                     }
-                    if let Some(script) = raw_scripts.last_mut() {
-                        *script += "\n;";
-                    }
                 }
-                _ => continue,
+            }
+            if let Some(script) = raw_scripts.last_mut() {
+                *script += "\n;";
             }
         }
 
@@ -86,7 +114,7 @@ impl Args {
     /// Creates [`Sed`] from [`Args`], if [`Script`]
     /// parsing is failed, then returns error
     fn try_to_sed(mut self: Args) -> Result<Sed, SedError> {
-        let mut raw_script = Self::get_raw_script()?;
+        let mut raw_script = Self::get_raw_script(&self.sources)?;
 
         if raw_script.is_empty() {
             if self.file.is_empty() {
@@ -2304,7 +2332,7 @@ impl Sed {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("sed");
 
-    let args = Args::parse();
+    let args = Args::parse_ordered();
 
     let exit_code = Args::try_to_sed(args)
         .and_then(|mut sed| sed.sed())

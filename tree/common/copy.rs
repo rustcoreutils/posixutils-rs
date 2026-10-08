@@ -248,20 +248,57 @@ pub enum OperandTrust {
 /// of a directory made (`ChainTrust::made`), wherever it is. Found at any other path it is one
 /// found existing there, as pax counts it: whoever renamed it there could have renamed it to
 /// the name of a source directory it does not stand for, and it would take that one's mode.
-/// Recording a directory replaces whatever its number stood for: a directory made can reuse
-/// the number of one removed during the run.
+///
+/// Nor is it the run's own once anything but cp has changed it since cp last did: its
+/// status-change time must be the one cp noted then. An inode number is reused -- ext4 hands a
+/// freed one straight back -- so whoever could remove the directory (an empty one, from a
+/// parent they can write that is not sticky) could make one of their own at its path under its
+/// number; that one's status-change time is its making, after cp's last change. cp notes its
+/// own changes from the descriptor it has held throughout -- a directory held open keeps its
+/// number from being reused -- once it has filled and finished one (`refresh`), so an honest
+/// later operand still finds it unchanged. Residual: a status-change time has the grain of the
+/// clock tick the kernel stamps it with (a few milliseconds on Linux without fine-grained
+/// timestamps), and a directory removed and remade within the tick of cp's last change, under
+/// the same number, passes for the one made. The birth time (statx, `st_birthtime`) would not
+/// narrow that: it is stamped from the same clock. Recording a directory replaces whatever its
+/// number stood for.
 #[derive(Default)]
-pub struct MadeDirs(HashMap<(u64, u64), PathBuf>);
+pub struct MadeDirs(HashMap<(u64, u64), MadeAt>);
+
+/// Where a directory this run made is, and its status-change time when cp last changed it.
+struct MadeAt {
+    path: PathBuf,
+    ctime: (i64, i64),
+}
+
+/// `(st_dev, st_ino)` and `st_ctim` of `md`.
+fn id_and_ctime(md: &impl MetadataExt) -> ((u64, u64), (i64, i64)) {
+    ((md.dev(), md.ino()), (md.ctime(), md.ctime_nsec()))
+}
 
 impl MadeDirs {
-    /// Record the directory with `id`, just made at `path` and verified in full.
-    pub fn record(&mut self, id: (u64, u64), path: &Path) {
-        self.0.insert(id, path.to_path_buf());
+    /// Record the directory `md` describes, just made at `path` and verified in full.
+    pub fn record(&mut self, md: &impl MetadataExt, path: &Path) {
+        let (id, ctime) = id_and_ctime(md);
+        let path = path.to_path_buf();
+        self.0.insert(id, MadeAt { path, ctime });
     }
 
-    /// Whether the directory with `id`, found at `path`, is one this run made there.
-    pub fn made_at(&self, id: (u64, u64), path: &Path) -> bool {
-        self.0.get(&id).is_some_and(|at| at == path)
+    /// Whether the directory `md` describes, found at `path`, is one this run made there.
+    pub fn made_at(&self, md: &impl MetadataExt, path: &Path) -> bool {
+        let (id, ctime) = id_and_ctime(md);
+        self.0
+            .get(&id)
+            .is_some_and(|at| at.path == path && at.ctime == ctime)
+    }
+
+    /// Note what cp has just changed on the directory `md` describes, which this run made at
+    /// `path` and has held since it found it to be so (`made_at`).
+    pub fn refresh(&mut self, md: &impl MetadataExt, path: &Path) {
+        let (id, ctime) = id_and_ctime(md);
+        if let Some(at) = self.0.get_mut(&id).filter(|at| at.path == path) {
+            at.ctime = ctime;
+        }
     }
 }
 
@@ -292,6 +329,8 @@ struct DestDir {
     /// What it is given once its contents are copied; `None` for the operand's own directory,
     /// which the copy only makes the operand in.
     finish: Option<DirFinish>,
+    /// Whether this run made it, here (`MadeDirs`): what cp changes on it is then noted.
+    own: bool,
 }
 
 /// What a directory that may take what -p asks of it is given: `ChainTrust::found_dir` where
@@ -362,23 +401,18 @@ fn parent_anchor(
 /// `id`, in the directory `parent` handing it `hands`: what it is given once its contents are
 /// copied, and what it hands the directories found in it.
 ///
-/// One this run made at that path is its own (`MadeDirs`). Any other takes what -p asks only
-/// where nobody else could have created its name, in its parent or any directory above it up
-/// to the anchor; elsewhere it is left as it is, times included, and that is reported
-/// (`ChainTrust::found_dir`, which pax follows too).
+/// It takes what -p asks only where nobody else could have created its name, in its parent or
+/// any directory above it up to the anchor; elsewhere it is left as it is, times included, and
+/// that is reported (`ChainTrust::found_dir`, which pax follows too). (One this run made at that
+/// path is its own, and not judged at all: `own_dir_trust`.)
 fn found_dir_trust(
     hands: OperandTrust,
     parent: &ftw::FileDescriptor,
     fd: &ftw::FileDescriptor,
     id: (u64, u64),
     target: &Path,
-    made_dirs: &MadeDirs,
     requested: Preserve,
 ) -> io::Result<(DirFinish, ChainTrust)> {
-    if made_dirs.made_at(id, target) {
-        let finish = DirFinish::Found(as_asked(requested));
-        return Ok((finish, ChainTrust::made(fd.as_raw_fd())?));
-    }
     let chain = match hands {
         OperandTrust::Named => {
             let finish = DirFinish::Found(as_asked(requested));
@@ -389,6 +423,17 @@ fn found_dir_trust(
     };
     let finish = DirFinish::Found(chain.found_dir(requested));
     Ok((finish, chain.found(fd.as_raw_fd())?))
+}
+
+/// For a directory found existing, open on `fd`, that this run made at the same path
+/// (`MadeDirs::made_at`): what it is given once its contents are copied -- what -p asks, as
+/// for any directory the run made -- and the trust it hands, afresh.
+fn own_dir_trust(
+    fd: &ftw::FileDescriptor,
+    requested: Preserve,
+) -> io::Result<(DirFinish, ChainTrust)> {
+    let finish = DirFinish::Found(as_asked(requested));
+    Ok((finish, ChainTrust::made(fd.as_raw_fd())?))
 }
 
 /// The -p failure reported for a directory found existing where others could have created its
@@ -2112,6 +2157,7 @@ where
         fd: top_dir,
         hands: top_trust,
         finish: None,
+        own: false,
     }]);
     // (st_dev, st_ino) of every destination directory this copy creates or enters. A source
     // directory found in here is one we are copying *into*.
@@ -2300,16 +2346,20 @@ where
                                         target.display()
                                     )));
                                 }
-                                let (finish, trust) = found_dir_trust(
-                                    hands,
-                                    target_dirfd,
-                                    &fd,
-                                    (dev, ino),
-                                    &target,
-                                    &made_by_run.borrow(),
-                                    requested,
-                                )?;
-                                Ok((fd, md, finish, trust))
+                                let own = made_by_run.borrow().made_at(&md, &target);
+                                let (finish, trust) = if own {
+                                    own_dir_trust(&fd, requested)?
+                                } else {
+                                    found_dir_trust(
+                                        hands,
+                                        target_dirfd,
+                                        &fd,
+                                        (dev, ino),
+                                        &target,
+                                        requested,
+                                    )?
+                                };
+                                Ok((fd, md, finish, trust, own))
                             }),
                             DirOrigin::Made => open_made_dir(
                                 target_dirfd.as_raw_fd(),
@@ -2320,30 +2370,28 @@ where
                             .and_then(|(fd, made)| {
                                 let fd = ftw::FileDescriptor::from(fd);
                                 let md = fd_metadata(fd.as_raw_fd())?;
-                                let id = (md.dev(), md.ino());
-                                let trust = if made == MadeTrust::Full {
-                                    made_by_run.borrow_mut().record(id, &target);
+                                let own = made == MadeTrust::Full;
+                                let trust = if own {
+                                    made_by_run.borrow_mut().record(&md, &target);
                                     ChainTrust::made(fd.as_raw_fd())?
                                 } else {
                                     // Owned like its parent only, it may be someone else's: it
                                     // hands on what a directory found would.
-                                    let made_dirs = made_by_run.borrow();
                                     let (_, trust) = found_dir_trust(
                                         hands,
                                         target_dirfd,
                                         &fd,
-                                        id,
+                                        (md.dev(), md.ino()),
                                         &target,
-                                        &made_dirs,
                                         requested,
                                     )?;
                                     trust
                                 };
                                 report_copied(cfg, source.path().as_inner(), &target, true);
-                                Ok((fd, md, DirFinish::Made(made), trust))
+                                Ok((fd, md, DirFinish::Made(made), trust, own))
                             }),
                         };
-                        let (new_target_dirfd, new_target_md, finish, trust) = match opened {
+                        let (new_target_dirfd, new_target_md, finish, trust, own) = match opened {
                             Ok(pair) => pair,
                             Err(e) => {
                                 if cfg.continue_on_error {
@@ -2371,6 +2419,7 @@ where
                             fd: Rc::new(new_target_dirfd),
                             hands: OperandTrust::Chain(trust),
                             finish: Some(finish),
+                            own,
                         });
                         target_dir_path_borrowed.push(target_filename);
 
@@ -2423,6 +2472,7 @@ where
         if let Some(DestDir {
             fd,
             finish: Some(finish),
+            own,
             ..
         }) = target_dir
         {
@@ -2439,6 +2489,14 @@ where
                 eprintln!("{}: {}", cfg.prog, error_string(&e));
                 if cfg.continue_on_error {
                     *had_error.borrow_mut() = true;
+                }
+            }
+            // Filled and finished through the descriptor held since it was found to be the
+            // run's own, it still is: what that changed is noted, so a later operand finding
+            // it unchanged since knows it again.
+            if own {
+                if let Ok(md) = fd_metadata(fd.as_raw_fd()) {
+                    made_by_run.borrow_mut().refresh(&md, &dir_path);
                 }
             }
         }
@@ -2719,6 +2777,77 @@ mod tests {
         );
         assert_eq!(after.mode() & 0o7777, 0o600, "the mode was applied");
         assert_eq!(after.mtime(), 978_307_200, "the times were not applied");
+    }
+
+    /// A directory this run made stops counting as made once anything but cp changes it --
+    /// above all once it is removed and another made at its path, which may take its inode
+    /// number. What cp changes itself, it notes (`MadeDirs::refresh`).
+    #[test]
+    fn a_made_directory_changed_since_is_no_longer_made() {
+        use super::MadeDirs;
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = plib::tmp::tempdir().unwrap();
+        let path = tmp.path().join("x");
+        let ctime_moves = |path: &std::path::Path, before: &fs::Metadata| {
+            // ctime has the clock's tick for its grain; wait the change into a later one.
+            loop {
+                let mode = fs::metadata(path).unwrap().mode() ^ 0o001;
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+                let after = fs::metadata(path).unwrap();
+                if (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec()) {
+                    return after;
+                }
+            }
+        };
+
+        fs::create_dir(&path).unwrap();
+        let mut made = MadeDirs::default();
+        let md = fs::metadata(&path).unwrap();
+        made.record(&md, &path);
+        assert!(made.made_at(&md, &path));
+        assert!(
+            !made.made_at(&md, &tmp.path().join("y")),
+            "found at another path"
+        );
+
+        // Changed by someone else.
+        let changed = ctime_moves(&path, &md);
+        assert!(!made.made_at(&changed, &path), "changed since it was made");
+        // Changed by cp, which notes it.
+        made.refresh(&changed, &path);
+        assert!(made.made_at(&changed, &path));
+
+        // Removed, and another made at its path: when it takes the same inode number (ext4
+        // often hands it straight back), it still is not the one made.
+        let mut reused = false;
+        for _ in 0..64 {
+            let before = fs::metadata(&path).unwrap();
+            made.record(&before, &path);
+            fs::remove_dir(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let other = fs::metadata(&path).unwrap();
+            if other.ino() == before.ino() {
+                reused = true;
+                let other = if (other.ctime(), other.ctime_nsec())
+                    == (before.ctime(), before.ctime_nsec())
+                {
+                    // Same tick: the residual `MadeDirs` documents. Move it on.
+                    ctime_moves(&path, &before)
+                } else {
+                    other
+                };
+                assert!(
+                    !made.made_at(&other, &path),
+                    "a new directory passed for the made one"
+                );
+                break;
+            }
+        }
+        if !reused {
+            eprintln!("note: this filesystem did not reuse an inode number; reuse not exercised");
+        }
     }
 
     /// `cp -pR`'s configuration.

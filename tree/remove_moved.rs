@@ -1,0 +1,131 @@
+//
+// Copyright (c) 2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+//! POSIX mv step 7 after a move across filesystems: remove the source file hierarchy.
+//!
+//! What is removed is exactly what the copy duplicated, unchanged since (`CopiedSources`),
+//! reached from the directory the operand was pinned in and from there only through directory
+//! descriptors the walk opened and checked (`ftw::traverse_directory_at`). The operand's
+//! pathname is never resolved again: a directory on the way to it that was renamed or replaced
+//! by a symbolic link after the move began leads nowhere new. Anything the copy did not
+//! duplicate -- an entry added since, a file written to or replaced since -- is left where it
+//! is and reported, and so is every directory still holding one.
+
+use crate::common::{error_string, CopiedSources, PinnedEntry};
+use gettextrs::gettext;
+use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
+
+/// Bookkeeping for one removal walk.
+#[derive(Default)]
+struct Removal {
+    /// Entries left in place so far, each already reported.
+    left: usize,
+    /// `left` when each directory being walked was entered.
+    left_on_entry: Vec<usize>,
+}
+
+impl Removal {
+    fn leave(&mut self, message: String) {
+        eprintln!("mv: {message}");
+        self.left += 1;
+    }
+}
+
+/// Remove what the copy of `source` duplicated. Returns whether all of it was removed; every
+/// entry that was not has been reported.
+pub fn remove_moved_source(source: &PinnedEntry, copied: &CopiedSources) -> bool {
+    let removal = RefCell::new(Removal::default());
+
+    let file_handler = |entry: ftw::Entry<'_>| -> Result<bool, ()> {
+        let mut removal = removal.borrow_mut();
+        let unchanged = entry.metadata().is_some_and(|md| copied.unchanged(md));
+        if !unchanged {
+            removal.leave(gettext!(
+                "not removing '{}': it changed during the move",
+                entry.path()
+            ));
+            return Ok(false);
+        }
+        if entry.metadata().is_some_and(|md| md.is_dir()) {
+            // Emptied first; removed on the way out (`remove_emptied_dir`).
+            let left = removal.left;
+            removal.left_on_entry.push(left);
+            return Ok(true);
+        }
+        if unsafe { libc::unlinkat(entry.dir_fd(), entry.file_name().as_ptr(), 0) } != 0 {
+            removal.leave(cannot_remove(&entry, &io::Error::last_os_error()));
+        }
+        Ok(false)
+    };
+    let postprocess_dir = |entry: ftw::Entry<'_>, exit: ftw::DirExit| -> Result<(), ()> {
+        let mut removal = removal.borrow_mut();
+        let left_on_entry = removal.left_on_entry.pop().unwrap_or(0);
+        // A directory that could not be read was reported by `err_reporter`.
+        if exit == ftw::DirExit::Descended {
+            let holds_reported = removal.left > left_on_entry;
+            remove_emptied_dir(&entry, holds_reported, &mut removal);
+        }
+        Ok(())
+    };
+    let err_reporter = |entry: ftw::Entry<'_>, error: ftw::Error| {
+        let message = cannot_remove(&entry, &error.inner());
+        removal.borrow_mut().leave(message);
+    };
+
+    // The return value only says whether the operand was a directory walked without error; what
+    // matters is what was left.
+    let _ = ftw::traverse_directory_at(
+        source.dir(),
+        source.name(),
+        source.display_parent(),
+        file_handler,
+        postprocess_dir,
+        err_reporter,
+        ftw::TraverseDirectoryOpts::default(),
+    );
+    removal.into_inner().left == 0
+}
+
+/// Remove a directory whose entries the walk has just removed, or left (`holds_reported`: those
+/// were reported, and the directory has to stay for them).
+///
+/// The name must still be the directory the walk entered; `AT_REMOVEDIR` then removes it only if
+/// it is empty -- nothing was added since the walk read it.
+fn remove_emptied_dir(entry: &ftw::Entry<'_>, holds_reported: bool, removal: &mut Removal) {
+    let entered = entry.metadata().map(|md| (md.dev(), md.ino()));
+    let current = ftw::Metadata::new(entry.dir_fd(), entry.file_name(), false)
+        .ok()
+        .map(|md| (md.dev(), md.ino()));
+    if current.is_none() || current != entered {
+        removal.leave(gettext!(
+            "not removing '{}': it changed during the move",
+            entry.path()
+        ));
+        return;
+    }
+    let ret = unsafe {
+        libc::unlinkat(
+            entry.dir_fd(),
+            entry.file_name().as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    };
+    if ret == 0 {
+        return;
+    }
+    let e = io::Error::last_os_error();
+    let not_empty = matches!(e.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST));
+    if !(not_empty && holds_reported) {
+        removal.leave(cannot_remove(entry, &e));
+    }
+}
+
+fn cannot_remove(entry: &ftw::Entry<'_>, e: &io::Error) -> String {
+    gettext!("cannot remove '{}': {}", entry.path(), error_string(e))
+}

@@ -831,8 +831,8 @@ pub struct TraverseDirectoryOpts {
 /// a bool indicating no errors occurred (`true`) or there is at least one error (`false`).
 pub fn traverse_directory<P, F, G, H>(
     path: P,
-    mut file_handler: F,
-    mut postprocess_dir: G,
+    file_handler: F,
+    postprocess_dir: G,
     mut err_reporter: H,
     opts: TraverseDirectoryOpts,
 ) -> bool
@@ -842,21 +842,8 @@ where
     G: FnMut(Entry<'_>, DirExit) -> Result<(), ()>,
     H: FnMut(Entry<'_>, Error),
 {
-    let TraverseDirectoryOpts {
-        follow_symlinks_on_args,
-        follow_symlinks,
-        include_dot_and_double_dot,
-        list_contents_first,
-        caller_fds_per_level,
-    } = opts;
-
-    // Stack of the directories to process
-    let mut stack: Vec<TreeNode> = Vec::new();
-    // Stack of the filename (relative to CWD). Updated in sync with `stack` above
+    // Stack of the filename (relative to CWD).
     let mut path_stack: Vec<Rc<[libc::c_char]>> = Vec::new();
-
-    // Used in `ls`
-    let mut subdirs: Vec<TreeNode> = Vec::new();
 
     if path.as_ref().as_os_str().as_bytes().contains(&0) {
         report_nul_in_path(path.as_ref(), &mut err_reporter);
@@ -877,11 +864,106 @@ where
         Err(_) => return false,
     };
 
-    {
-        let dir_filename_cstr =
-            CString::new(path_components.as_path().as_os_str().as_bytes()).unwrap();
-        let dir_filename = cstring_to_rc(&dir_filename_cstr);
+    let dir_filename_cstr = CString::new(path_components.as_path().as_os_str().as_bytes()).unwrap();
+    walk_from(
+        starting_dir,
+        path_stack,
+        cstring_to_rc(&dir_filename_cstr),
+        file_handler,
+        postprocess_dir,
+        err_reporter,
+        opts,
+    )
+}
 
+/// Walk through the directory tree rooted at `name` in the directory open on `dir`.
+///
+/// This is `traverse_directory` for a starting point already pinned by a descriptor: no part of
+/// the path to it is resolved again, so renaming or replacing one of its ancestors after `dir`
+/// was opened cannot redirect the walk. `name` is a single component (it may carry trailing
+/// slashes), looked up in `dir` exactly as `traverse_directory` looks up an operand's last
+/// component; and `postprocess_dir` for the starting point itself receives `dir` as the
+/// containing directory.
+///
+/// `display_parent` is only shown: each entry's `path()` is `display_parent` joined with the
+/// entry's path from `name`. It is never resolved.
+///
+/// `dir` is duplicated for the walk and stays open, and owned, by the caller.
+pub fn traverse_directory_at<F, G, H>(
+    dir: &FileDescriptor,
+    name: &CStr,
+    display_parent: &Path,
+    file_handler: F,
+    postprocess_dir: G,
+    mut err_reporter: H,
+    opts: TraverseDirectoryOpts,
+) -> bool
+where
+    F: FnMut(Entry<'_>) -> Result<bool, ()>,
+    G: FnMut(Entry<'_>, DirExit) -> Result<(), ()>,
+    H: FnMut(Entry<'_>, Error),
+{
+    let display_bytes = display_parent.as_os_str().as_bytes();
+    let path_stack: Vec<Rc<[libc::c_char]>> = match CString::new(display_bytes) {
+        Ok(_) if display_bytes.is_empty() => Vec::new(),
+        Ok(shown) => vec![cstring_to_rc(&shown)],
+        Err(_) => {
+            report_nul_in_path(display_parent, &mut err_reporter);
+            return false;
+        }
+    };
+    let starting_dir = match dir.try_clone() {
+        Ok(fd) => fd,
+        Err(e) => {
+            err_reporter(
+                Entry::new(dir, &path_stack, cstring_to_rc(name), None),
+                Error::new(e, ErrorKind::Open),
+            );
+            return false;
+        }
+    };
+    walk_from(
+        starting_dir,
+        path_stack,
+        cstring_to_rc(name),
+        file_handler,
+        postprocess_dir,
+        err_reporter,
+        opts,
+    )
+}
+
+/// The walk shared by `traverse_directory` and `traverse_directory_at`: `dir_filename` in
+/// `starting_dir`, whose displayed path is `path_stack`.
+fn walk_from<F, G, H>(
+    starting_dir: FileDescriptor,
+    mut path_stack: Vec<Rc<[libc::c_char]>>,
+    dir_filename: Rc<[libc::c_char]>,
+    mut file_handler: F,
+    mut postprocess_dir: G,
+    mut err_reporter: H,
+    opts: TraverseDirectoryOpts,
+) -> bool
+where
+    F: FnMut(Entry<'_>) -> Result<bool, ()>,
+    G: FnMut(Entry<'_>, DirExit) -> Result<(), ()>,
+    H: FnMut(Entry<'_>, Error),
+{
+    let TraverseDirectoryOpts {
+        follow_symlinks_on_args,
+        follow_symlinks,
+        include_dot_and_double_dot,
+        list_contents_first,
+        caller_fds_per_level,
+    } = opts;
+
+    // Stack of the directories to process. `path_stack` is updated in sync with it.
+    let mut stack: Vec<TreeNode> = Vec::new();
+
+    // Used in `ls`
+    let mut subdirs: Vec<TreeNode> = Vec::new();
+
+    {
         match process_file(
             &path_stack,
             &starting_dir,

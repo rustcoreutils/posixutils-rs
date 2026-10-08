@@ -19,6 +19,8 @@ use std::os::unix::{
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+mod race;
+
 fn mv_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 

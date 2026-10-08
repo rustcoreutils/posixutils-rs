@@ -15,15 +15,19 @@
 
 mod change_ownership;
 mod copy;
+mod pinned;
 
 use gettextrs::gettext;
 use std::{ffi::CStr, io};
 
 // cp and mv
 pub use copy::{
-    copy_file, copy_file_at, copy_files, preserve_through_fd, verify_made_dir, CopyConfig,
-    DerefMode, InodeMap, MadeTrust,
+    copy_file, copy_file_at, copy_files, copy_moved_file, preserve_through_fd, verify_made_dir,
+    CopyConfig, DerefMode, InodeMap, MadeTrust, MoveSource,
 };
+
+// mv
+pub use pinned::{CopiedSources, PinnedDirs, PinnedEntry};
 
 // chgrp and chown
 pub use change_ownership::{chown_traverse, ChangeOwnershipArgs};

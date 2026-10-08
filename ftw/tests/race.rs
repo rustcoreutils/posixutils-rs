@@ -565,3 +565,68 @@ fn root_open_refuses_dir_swapped_for_other_dir() {
     assert!(!visited.contains("SECRET.txt"), "entered: {visited:?}");
     assert!(errors > 0);
 }
+
+/// `traverse_directory_at` walks from the directory it was handed, not from a path: with the
+/// starting point's parent renamed away and replaced by a symbolic link to another directory
+/// holding an entry of the same name, the walk still visits the original tree, shows paths under
+/// the given display name, and passes the held directory to `postprocess_dir` for the root.
+#[test]
+fn walk_from_a_held_directory_ignores_a_swapped_parent_path() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = plib::tmp::Builder::new()
+        .prefix("ftw_race_at")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let base = tmp.path();
+    fs::create_dir_all(base.join("parent/root/sub")).unwrap();
+    fs::write(base.join("parent/root/sub/mine.txt"), b"mine").unwrap();
+    fs::create_dir_all(base.join("other/root")).unwrap();
+    fs::write(base.join("other/root/SECRET.txt"), b"never visited").unwrap();
+
+    let parent_path = CString::new(base.join("parent").as_os_str().as_bytes()).unwrap();
+    let held = ftw::FileDescriptor::open_at(
+        &ftw::FileDescriptor::cwd(),
+        &parent_path,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    )
+    .unwrap();
+    let held_ino = fs::metadata(base.join("parent")).unwrap();
+    fs::rename(base.join("parent"), base.join("parent.real")).unwrap();
+    unix::fs::symlink("other", base.join("parent")).unwrap();
+
+    let mut visited = Vec::new();
+    let mut root_parent_ino = None;
+    let ok = ftw::traverse_directory_at(
+        &held,
+        c"root",
+        Path::new("shown"),
+        |entry| {
+            visited.push(entry.path().as_inner().to_path_buf());
+            Ok(true)
+        },
+        |entry, _| {
+            if entry.file_name() == c"root" {
+                let md = ftw::Metadata::new(entry.dir_fd(), c".", false).unwrap();
+                root_parent_ino = Some(std::os::unix::fs::MetadataExt::ino(&md));
+            }
+            Ok(())
+        },
+        |_, e| panic!("unexpected error: {:?}", e.inner()),
+        TraverseDirectoryOpts::default(),
+    );
+
+    assert!(ok);
+    visited.sort();
+    assert_eq!(
+        visited,
+        ["shown/root", "shown/root/sub", "shown/root/sub/mine.txt"]
+            .map(std::path::PathBuf::from)
+            .to_vec()
+    );
+    assert_eq!(
+        root_parent_ino,
+        Some(std::os::unix::fs::MetadataExt::ino(&held_ino))
+    );
+}

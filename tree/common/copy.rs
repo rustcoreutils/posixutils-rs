@@ -8,6 +8,7 @@
 //
 
 use super::error_string;
+use super::pinned::{CopiedSources, PinnedEntry};
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
 use std::{
@@ -1459,12 +1460,91 @@ pub fn copy_file_at<F>(
     target_arg: &Path,
     target_dir: Option<ftw::FileDescriptor>,
     created_files: &mut HashSet<PathBuf>,
+    inode_map: Option<&mut InodeMap>,
+    prompt_fn: F,
+) -> io::Result<()>
+where
+    F: Copy + Fn(&str) -> bool,
+{
+    copy_tree(
+        cfg,
+        SourceRoot::Path(source_arg),
+        target_arg,
+        target_dir,
+        created_files,
+        inode_map,
+        prompt_fn,
+    )
+}
+
+/// The source of a `mv` across filesystems: the operand, pinned, and the file it must be.
+pub struct MoveSource<'a> {
+    pub entry: &'a PinnedEntry,
+    /// `(st_dev, st_ino)` of the operand itself (not followed) when the move examined it: the
+    /// copy refuses to start from any other file.
+    pub identity: (u64, u64),
+    /// Filled in with every source file the copy duplicated, which is what the move then
+    /// removes.
+    pub copied: &'a mut CopiedSources,
+}
+
+/// The duplication step of `mv` across filesystems (POSIX mv step 6): `copy_file_at`, walking
+/// the source from the directory it was pinned in, and recording what it copied.
+pub fn copy_moved_file(
+    cfg: &CopyConfig,
+    source: MoveSource<'_>,
+    target_arg: &Path,
+    created_files: &mut HashSet<PathBuf>,
+    inode_map: &mut InodeMap,
+) -> io::Result<()> {
+    copy_tree(
+        cfg,
+        SourceRoot::Pinned(source),
+        target_arg,
+        None,
+        created_files,
+        Some(inode_map),
+        // mv never asks: it already asked its own question.
+        |_| false,
+    )
+}
+
+/// Where a copy's walk starts.
+enum SourceRoot<'a> {
+    /// cp: the operand, resolved as written.
+    Path(&'a Path),
+    /// mv: see `MoveSource`.
+    Pinned(MoveSource<'a>),
+}
+
+/// The error for a moved operand that is no longer the file the move examined.
+fn changed_before_copy(source: &ftw::Entry) -> io::Error {
+    io::Error::other(gettext!(
+        "'{}' changed before it could be copied",
+        source.path()
+    ))
+}
+
+fn copy_tree<F>(
+    cfg: &CopyConfig,
+    source_root: SourceRoot<'_>,
+    target_arg: &Path,
+    target_dir: Option<ftw::FileDescriptor>,
+    created_files: &mut HashSet<PathBuf>,
     mut inode_map: Option<&mut InodeMap>,
     prompt_fn: F,
 ) -> io::Result<()>
 where
     F: Copy + Fn(&str) -> bool,
 {
+    let (source_arg, pinned_source, expected_root, mut copied) = match source_root {
+        SourceRoot::Path(path) => (path, None, None, None),
+        SourceRoot::Pinned(MoveSource {
+            entry,
+            identity,
+            copied,
+        }) => (entry.path(), Some(entry), Some(identity), Some(copied)),
+    };
     // The operand's own directory and name: the current directory and the whole operand, or the
     // given directory and the operand's last component.
     let (top_dir, top_name, top_dir_path) = match (target_dir, target_arg.file_name()) {
@@ -1495,207 +1575,68 @@ where
     // that the final exit status must be non-zero (without a returned message to re-print).
     let had_error = RefCell::new(false);
 
-    let _ = traverse_directory(
-        source_arg,
-        |source| {
-            let mut terminate_borrowed = terminate.borrow_mut();
-            let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
-            let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
+    let file_handler = |source: ftw::Entry<'_>| -> Result<bool, ()> {
+        let mut terminate_borrowed = terminate.borrow_mut();
+        let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
+        let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
 
-            if *terminate_borrowed {
-                return Ok(false);
-            }
+        if *terminate_borrowed {
+            return Ok(false);
+        }
 
-            let at_top_level = target_dirfd_stack_borrowed.len() == 1;
-            let target_dirfd = target_dirfd_stack_borrowed.last().unwrap();
+        let at_top_level = target_dirfd_stack_borrowed.len() == 1;
+        let target_dirfd = target_dirfd_stack_borrowed.last().unwrap();
 
-            let target_filename = if at_top_level {
-                top_name
-            } else {
-                OsStr::from_bytes(source.file_name().to_bytes())
-            };
+        let target_filename = if at_top_level {
+            top_name
+        } else {
+            OsStr::from_bytes(source.file_name().to_bytes())
+        };
 
-            let target = target_dir_path_borrowed.join(target_filename);
-            let target_filename_cstr = CString::new(target_filename.as_bytes()).unwrap();
+        let target = target_dir_path_borrowed.join(target_filename);
+        let target_filename_cstr = CString::new(target_filename.as_bytes()).unwrap();
 
-            let source_md = source.metadata().unwrap();
-            let identifier = (source_md.dev(), source_md.ino());
+        let source_md = source.metadata().unwrap();
+        let identifier = (source_md.dev(), source_md.ino());
 
-            // Hard-link preserving behavior of `mv`. `cp` does not maintain the hard-link structure
-            // of the hierarchy according to the standard
-            if let Some(inode_map) = inode_map.as_deref_mut() {
-                // Preserve hard links like coreutils mv. Creating a copy is also
-                // allowed by the standard.
-                if let Some((prev_dirfd, prev_filename)) = inode_map.get(&identifier) {
-                    let ret = unsafe {
-                        libc::linkat(
-                            prev_dirfd.as_raw_fd(),
-                            prev_filename.as_ptr(),
-                            target_dirfd.as_raw_fd(),
-                            target_filename_cstr.as_ptr(),
-                            0, // Don't dereference prev if it's a symlink
-                        )
-                    };
-                    // If success
-                    if ret == 0 {
-                        // Skip since this file/directory is handled by hard-linking
+        // A moved operand must be the file the move examined; nothing else is copied (and
+        // so nothing else will be removed).
+        if at_top_level && expected_root.is_some_and(|expected| expected != identifier) {
+            *last_error.borrow_mut() = Some(changed_before_copy(&source));
+            *terminate_borrowed = true;
+            return Ok(false);
+        }
+
+        // Hard-link preserving behavior of `mv`. `cp` does not maintain the hard-link structure
+        // of the hierarchy according to the standard
+        if let Some(inode_map) = inode_map.as_deref_mut() {
+            // Preserve hard links like coreutils mv. Creating a copy is also
+            // allowed by the standard.
+            if let Some((prev_dirfd, prev_filename)) = inode_map.get(&identifier) {
+                let ret = unsafe {
+                    libc::linkat(
+                        prev_dirfd.as_raw_fd(),
+                        prev_filename.as_ptr(),
+                        target_dirfd.as_raw_fd(),
+                        target_filename_cstr.as_ptr(),
+                        0, // Don't dereference prev if it's a symlink
+                    )
+                };
+                // If success
+                if ret == 0 {
+                    // Skip since this file/directory is handled by hard-linking
+                    if let Some(copied) = copied.as_deref_mut() {
+                        copied.record(source_md);
+                    }
+                    return Ok(false);
+                }
+                // else failed
+                else {
+                    let e = io::Error::last_os_error();
+                    // Under -n an existing destination is kept, linked or not.
+                    if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
                         return Ok(false);
                     }
-                    // else failed
-                    else {
-                        let e = io::Error::last_os_error();
-                        // Under -n an existing destination is kept, linked or not.
-                        if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
-                            return Ok(false);
-                        }
-                        if cfg.continue_on_error {
-                            eprintln!("{}: {}", cfg.prog, error_string(&e));
-                            *had_error.borrow_mut() = true;
-                        } else {
-                            *last_error.borrow_mut() = Some(e);
-                            *terminate_borrowed = true;
-                        }
-                        return Ok(false);
-                    }
-                }
-            }
-
-            let continue_processing = match copy_file_impl(
-                cfg,
-                &source,
-                &target,
-                target_dirfd.as_raw_fd(),
-                target_filename_cstr.as_ptr(),
-                &mut CopyState {
-                    created_files,
-                    dest_dir_ids: &dest_dir_ids,
-                    operands: (source_arg, target_arg),
-                    at_top_level,
-                },
-                prompt_fn,
-            ) {
-                Ok(copy_result) => {
-                    // Record where this inode landed only if a file was actually created there.
-                    // Recording a skipped copy pointed a later hard link at a target that does
-                    // not exist, and every directory reports nlink > 1, so directories were
-                    // recorded too.
-                    if matches!(copy_result, CopyResult::CopiedFile(_)) {
-                        if let Some(inode_map) = inode_map.as_deref_mut() {
-                            // Only files that have hard links are worth tracking.
-                            if source_md.nlink() > 1 {
-                                inode_map.insert(
-                                    identifier,
-                                    (Rc::clone(target_dirfd), target_filename_cstr.clone()),
-                                );
-                            }
-                        }
-                    }
-
-                    match copy_result {
-                        CopyResult::CopyingDirectory(origin) => {
-                            // mkdir/mkdirat doesn't return a file descriptor so a new one must be
-                            // opened here. Using O_CREAT | O_DIRECTORY in a call to open/openat would
-                            // not allow atomically creating a directory then opening it:
-                            //
-                            // https://stackoverflow.com/questions/45818628/whats-the-expected-behavior-of-openname-o-creato-directory-mode/48693137#48693137
-                            //
-                            // `copy_file_impl` accepted the destination as a directory from its
-                            // `lstat` (or made it), so it is never a symbolic link to follow:
-                            // `O_NOFOLLOW` refuses one swapped in since, which would otherwise
-                            // redirect everything copied below it. (A trailing slash on the
-                            // operand still resolves, for the open as for the `lstat`.)
-                            //
-                            // The descriptor must then be the directory decided on: the one the
-                            // `lstat` saw, or for one this copy made, what a fresh `mkdirat`
-                            // yields (`verify_made_dir`). Its identity is read from the
-                            // descriptor, never by name.
-                            let opened = ftw::FileDescriptor::open_at(
-                                target_dirfd,
-                                &target_filename_cstr,
-                                libc::O_RDONLY
-                                    | libc::O_DIRECTORY
-                                    | libc::O_NOFOLLOW
-                                    | libc::O_CLOEXEC,
-                            )
-                            .map_err(|e| {
-                                io::Error::other(gettext!(
-                                    "cannot open directory '{}': {}",
-                                    target.display(),
-                                    error_string(&e)
-                                ))
-                            })
-                            .and_then(|fd| {
-                                let md = fd_metadata(fd.as_raw_fd())?;
-                                match origin {
-                                    DirOrigin::Found { dev, ino }
-                                        if dev != md.dev() || ino != md.ino() =>
-                                    {
-                                        Err(io::Error::other(gettext!(
-                                            "'{}' was replaced after it was checked",
-                                            target.display()
-                                        )))
-                                    }
-                                    DirOrigin::Found { .. } => Ok((fd, md)),
-                                    DirOrigin::Made => {
-                                        let trust = verify_made_dir(
-                                            target_dirfd.as_raw_fd(),
-                                            fd.as_raw_fd(),
-                                            &target,
-                                        )?;
-                                        if trust == MadeTrust::ParentOwnerOnly {
-                                            parent_owner_only_dirs
-                                                .borrow_mut()
-                                                .insert((md.dev(), md.ino()));
-                                        }
-                                        Ok((fd, md))
-                                    }
-                                }
-                            });
-                            let (new_target_dirfd, new_target_md) = match opened {
-                                Ok(pair) => pair,
-                                Err(e) => {
-                                    if cfg.continue_on_error {
-                                        eprintln!("{}: {}", cfg.prog, error_string(&e));
-                                        *had_error.borrow_mut() = true;
-                                    } else {
-                                        *last_error.borrow_mut() = Some(e);
-                                        *terminate_borrowed = true;
-                                    }
-                                    return Ok(false);
-                                }
-                            };
-
-                            // Record what this destination directory *is*, from the descriptor
-                            // already in hand rather than by name. Recording on entry, not on
-                            // creation, so a destination that existed beforehand counts too.
-                            dest_dir_ids
-                                .borrow_mut()
-                                .insert((new_target_md.dev(), new_target_md.ino()));
-
-                            target_dirfd_stack_borrowed.push(Rc::new(new_target_dirfd));
-                            target_dir_path_borrowed.push(target_filename);
-
-                            true
-                        }
-                        CopyResult::CopiedFile(preserve_error) => {
-                            // `copy_file_impl` already applied -p to the file; directories are
-                            // handled in the `postprocess_dir` closure below.
-                            if let Some(e) = preserve_error {
-                                // A characteristics-duplication failure is never fatal: cp
-                                // reports it and sets a non-zero exit status; mv reports it but
-                                // must NOT modify its exit status (108114-108115) and still
-                                // completes the move.
-                                eprintln!("{}: {}", cfg.prog, error_string(&e));
-                                if cfg.continue_on_error {
-                                    *had_error.borrow_mut() = true;
-                                }
-                            }
-                            true
-                        }
-                        CopyResult::Skipped => false,
-                    }
-                }
-                Err(e) => {
                     if cfg.continue_on_error {
                         eprintln!("{}: {}", cfg.prog, error_string(&e));
                         *had_error.borrow_mut() = true;
@@ -1703,82 +1644,250 @@ where
                         *last_error.borrow_mut() = Some(e);
                         *terminate_borrowed = true;
                     }
-                    false
+                    return Ok(false);
                 }
-            };
+            }
+        }
 
-            Ok(continue_processing)
-        },
-        // Pops unconditionally. `ftw` calls this for every directory whose handler returned
-        // `true`, including ones it then could not descend into; leaving the push in place there
-        // would silently redirect every later file into the wrong destination directory.
-        // The target directory exists either way, so `-p` still applies to it.
-        |source, _exit| {
-            let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
-            let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
-
-            let dir_path = target_dir_path_borrowed.clone();
-            target_dir_path_borrowed.pop();
-            let target_dir = target_dirfd_stack_borrowed.pop();
-
-            // Preserve metadata for directories, after their contents so nothing written into
-            // them moves their times afterwards. Applied through the descriptor this copy has
-            // held for the directory since it entered it, never by name. The source's metadata
-            // is what the walk recorded when it stat'ed the directory, before reading it: the
-            // read moved its access time, and GNU keeps the original too.
-            if let (true, Some(target_dir)) = (cfg.preserve, target_dir) {
-                let recorded = source
-                    .metadata()
-                    .ok_or_else(|| io::Error::other(gettext!("cannot stat '{}'", source.path())));
-                // A directory made but trusted only as owned like its parent gets no owner and
-                // no mode; its identity comes from the descriptor held for it.
-                let trust = fd_metadata(target_dir.as_raw_fd()).map(|md| {
-                    if parent_owner_only_dirs
-                        .borrow()
-                        .contains(&(md.dev(), md.ino()))
-                    {
-                        MadeTrust::ParentOwnerOnly
-                    } else {
-                        MadeTrust::Full
+        let continue_processing = match copy_file_impl(
+            cfg,
+            &source,
+            &target,
+            target_dirfd.as_raw_fd(),
+            target_filename_cstr.as_ptr(),
+            &mut CopyState {
+                created_files,
+                dest_dir_ids: &dest_dir_ids,
+                operands: (source_arg, target_arg),
+                at_top_level,
+            },
+            prompt_fn,
+        ) {
+            Ok(copy_result) => {
+                // Record where this inode landed only if a file was actually created there.
+                // Recording a skipped copy pointed a later hard link at a target that does
+                // not exist, and every directory reports nlink > 1, so directories were
+                // recorded too.
+                if matches!(copy_result, CopyResult::CopiedFile(_)) {
+                    if let Some(copied) = copied.as_deref_mut() {
+                        copied.record(source_md);
                     }
-                });
-                if let Err(e) = recorded.and_then(|source_md| {
-                    preserve_through_fd(target_dir.as_raw_fd(), source_md, &dir_path, trust?)
-                }) {
-                    // Same policy as the file case: never fatal, exit-status only for cp.
+                    if let Some(inode_map) = inode_map.as_deref_mut() {
+                        // Only files that have hard links are worth tracking.
+                        if source_md.nlink() > 1 {
+                            inode_map.insert(
+                                identifier,
+                                (Rc::clone(target_dirfd), target_filename_cstr.clone()),
+                            );
+                        }
+                    }
+                }
+
+                match copy_result {
+                    CopyResult::CopyingDirectory(origin) => {
+                        // mkdir/mkdirat doesn't return a file descriptor so a new one must be
+                        // opened here. Using O_CREAT | O_DIRECTORY in a call to open/openat would
+                        // not allow atomically creating a directory then opening it:
+                        //
+                        // https://stackoverflow.com/questions/45818628/whats-the-expected-behavior-of-openname-o-creato-directory-mode/48693137#48693137
+                        //
+                        // `copy_file_impl` accepted the destination as a directory from its
+                        // `lstat` (or made it), so it is never a symbolic link to follow:
+                        // `O_NOFOLLOW` refuses one swapped in since, which would otherwise
+                        // redirect everything copied below it. (A trailing slash on the
+                        // operand still resolves, for the open as for the `lstat`.)
+                        //
+                        // The descriptor must then be the directory decided on: the one the
+                        // `lstat` saw, or for one this copy made, what a fresh `mkdirat`
+                        // yields (`verify_made_dir`). Its identity is read from the
+                        // descriptor, never by name.
+                        let opened = ftw::FileDescriptor::open_at(
+                            target_dirfd,
+                            &target_filename_cstr,
+                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                        .map_err(|e| {
+                            io::Error::other(gettext!(
+                                "cannot open directory '{}': {}",
+                                target.display(),
+                                error_string(&e)
+                            ))
+                        })
+                        .and_then(|fd| {
+                            let md = fd_metadata(fd.as_raw_fd())?;
+                            match origin {
+                                DirOrigin::Found { dev, ino }
+                                    if dev != md.dev() || ino != md.ino() =>
+                                {
+                                    Err(io::Error::other(gettext!(
+                                        "'{}' was replaced after it was checked",
+                                        target.display()
+                                    )))
+                                }
+                                DirOrigin::Found { .. } => Ok((fd, md)),
+                                DirOrigin::Made => {
+                                    let trust = verify_made_dir(
+                                        target_dirfd.as_raw_fd(),
+                                        fd.as_raw_fd(),
+                                        &target,
+                                    )?;
+                                    if trust == MadeTrust::ParentOwnerOnly {
+                                        parent_owner_only_dirs
+                                            .borrow_mut()
+                                            .insert((md.dev(), md.ino()));
+                                    }
+                                    Ok((fd, md))
+                                }
+                            }
+                        });
+                        let (new_target_dirfd, new_target_md) = match opened {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                if cfg.continue_on_error {
+                                    eprintln!("{}: {}", cfg.prog, error_string(&e));
+                                    *had_error.borrow_mut() = true;
+                                } else {
+                                    *last_error.borrow_mut() = Some(e);
+                                    *terminate_borrowed = true;
+                                }
+                                return Ok(false);
+                            }
+                        };
+
+                        // Record what this destination directory *is*, from the descriptor
+                        // already in hand rather than by name. Recording on entry, not on
+                        // creation, so a destination that existed beforehand counts too.
+                        dest_dir_ids
+                            .borrow_mut()
+                            .insert((new_target_md.dev(), new_target_md.ino()));
+                        if let Some(copied) = copied.as_deref_mut() {
+                            copied.record(source_md);
+                        }
+
+                        target_dirfd_stack_borrowed.push(Rc::new(new_target_dirfd));
+                        target_dir_path_borrowed.push(target_filename);
+
+                        true
+                    }
+                    CopyResult::CopiedFile(preserve_error) => {
+                        // `copy_file_impl` already applied -p to the file; directories are
+                        // handled in the `postprocess_dir` closure below.
+                        if let Some(e) = preserve_error {
+                            // A characteristics-duplication failure is never fatal: cp
+                            // reports it and sets a non-zero exit status; mv reports it but
+                            // must NOT modify its exit status (108114-108115) and still
+                            // completes the move.
+                            eprintln!("{}: {}", cfg.prog, error_string(&e));
+                            if cfg.continue_on_error {
+                                *had_error.borrow_mut() = true;
+                            }
+                        }
+                        true
+                    }
+                    CopyResult::Skipped => false,
+                }
+            }
+            Err(e) => {
+                if cfg.continue_on_error {
                     eprintln!("{}: {}", cfg.prog, error_string(&e));
-                    if cfg.continue_on_error {
-                        *had_error.borrow_mut() = true;
-                    }
+                    *had_error.borrow_mut() = true;
+                } else {
+                    *last_error.borrow_mut() = Some(e);
+                    *terminate_borrowed = true;
+                }
+                false
+            }
+        };
+
+        Ok(continue_processing)
+    };
+    // Pops unconditionally. `ftw` calls this for every directory whose handler returned
+    // `true`, including ones it then could not descend into; leaving the push in place there
+    // would silently redirect every later file into the wrong destination directory.
+    // The target directory exists either way, so `-p` still applies to it.
+    let postprocess_dir = |source: ftw::Entry<'_>, _exit| -> Result<(), ()> {
+        let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
+        let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
+
+        let dir_path = target_dir_path_borrowed.clone();
+        target_dir_path_borrowed.pop();
+        let target_dir = target_dirfd_stack_borrowed.pop();
+
+        // Preserve metadata for directories, after their contents so nothing written into
+        // them moves their times afterwards. Applied through the descriptor this copy has
+        // held for the directory since it entered it, never by name. The source's metadata
+        // is what the walk recorded when it stat'ed the directory, before reading it: the
+        // read moved its access time, and GNU keeps the original too.
+        if let (true, Some(target_dir)) = (cfg.preserve, target_dir) {
+            let recorded = source
+                .metadata()
+                .ok_or_else(|| io::Error::other(gettext!("cannot stat '{}'", source.path())));
+            // A directory made but trusted only as owned like its parent gets no owner and
+            // no mode; its identity comes from the descriptor held for it.
+            let trust = fd_metadata(target_dir.as_raw_fd()).map(|md| {
+                if parent_owner_only_dirs
+                    .borrow()
+                    .contains(&(md.dev(), md.ino()))
+                {
+                    MadeTrust::ParentOwnerOnly
+                } else {
+                    MadeTrust::Full
+                }
+            });
+            if let Err(e) = recorded.and_then(|source_md| {
+                preserve_through_fd(target_dir.as_raw_fd(), source_md, &dir_path, trust?)
+            }) {
+                // Same policy as the file case: never fatal, exit-status only for cp.
+                eprintln!("{}: {}", cfg.prog, error_string(&e));
+                if cfg.continue_on_error {
+                    *had_error.borrow_mut() = true;
                 }
             }
+        }
 
-            Ok(())
-        },
-        |entry, error| {
-            // `ftw::Error` carries no filename; the entry it failed on does.
-            let err_str = gettext!(
-                "cannot access '{}': {}",
-                entry.path(),
-                error_string(&error.inner())
-            );
-            if cfg.continue_on_error {
-                eprintln!("{}: {}", cfg.prog, err_str);
-                *had_error.borrow_mut() = true;
-            } else {
-                *last_error.borrow_mut() = Some(io::Error::other(err_str));
-                *terminate.borrow_mut() = true;
-            }
-        },
-        ftw::TraverseDirectoryOpts {
-            follow_symlinks_on_args: cfg.deref.follow_symlinks_on_args(),
-            follow_symlinks: cfg.deref.follow_symlinks(),
-            // One target-directory descriptor is held per level in `target_dirfd_stack`, so the
-            // traversal must count those too when deciding to conserve descriptors.
-            caller_fds_per_level: 1,
-            ..Default::default()
-        },
-    );
+        Ok(())
+    };
+    let err_reporter = |entry: ftw::Entry<'_>, error: ftw::Error| {
+        // `ftw::Error` carries no filename; the entry it failed on does.
+        let err_str = gettext!(
+            "cannot access '{}': {}",
+            entry.path(),
+            error_string(&error.inner())
+        );
+        if cfg.continue_on_error {
+            eprintln!("{}: {}", cfg.prog, err_str);
+            *had_error.borrow_mut() = true;
+        } else {
+            *last_error.borrow_mut() = Some(io::Error::other(err_str));
+            *terminate.borrow_mut() = true;
+        }
+    };
+    let opts = ftw::TraverseDirectoryOpts {
+        follow_symlinks_on_args: cfg.deref.follow_symlinks_on_args(),
+        follow_symlinks: cfg.deref.follow_symlinks(),
+        // One target-directory descriptor is held per level in `target_dirfd_stack`, so the
+        // traversal must count those too when deciding to conserve descriptors.
+        caller_fds_per_level: 1,
+        ..Default::default()
+    };
+    let _ = match pinned_source {
+        Some(entry) => ftw::traverse_directory_at(
+            entry.dir(),
+            entry.name(),
+            entry.display_parent(),
+            file_handler,
+            postprocess_dir,
+            err_reporter,
+            opts,
+        ),
+        None => traverse_directory(
+            source_arg,
+            file_handler,
+            postprocess_dir,
+            err_reporter,
+            opts,
+        ),
+    };
 
     match last_error.into_inner() {
         Some(e) => Err(e),

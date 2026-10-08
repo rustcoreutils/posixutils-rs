@@ -412,7 +412,17 @@ impl DirTree {
     /// member path `key` and verified (`verify_made_dir`) to `trust`: made
     /// only to hold members below it (`implicit`), or for a member naming it.
     /// The one place the walk and `make_dir_at` both record what they made.
+    ///
+    /// A directory just made is new, whatever its inode number stood for
+    /// before: one removed during the run can hand its number on to the next
+    /// directory made. So everything the registry held for the number is
+    /// forgotten first -- a stale `made` entry for another path would
+    /// otherwise make this one, renamed to that path, pass for that member's.
     fn record_made(&self, id: (u64, u64), key: &[u8], trust: MadeTrust, implicit: bool) {
+        self.implicit.borrow_mut().remove(&id);
+        self.made.borrow_mut().remove(&id);
+        self.unverified.borrow_mut().remove(&id);
+        self.replaced.borrow_mut().remove(&id);
         let made = match trust {
             MadeTrust::ParentOwnerOnly => {
                 self.unverified.borrow_mut().insert(id);
@@ -1937,6 +1947,36 @@ mod tests {
 
         assert!(tree.parent_of(&member("a/b/z"), true).is_err());
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    /// An inode number the registry holds can come back: the directory made
+    /// for `p/` removed while still empty, and the next mkdir -- at `q` --
+    /// given its number. Recording the new directory forgets everything the
+    /// number stood for, so `q` renamed to `p` is not taken for the directory
+    /// made for `p/`.
+    #[test]
+    fn test_a_reused_inode_number_forgets_what_it_stood_for() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let id = (1, 4242);
+        let (p, q) = (member("p").key(), member("q").key());
+
+        tree.record_made(id, &p, MadeTrust::Full, false);
+        assert!(tree.standing(id, &p) == Standing::Made);
+        tree.record_made(id, &q, MadeTrust::Full, true);
+        assert!(tree.standing(id, &q) == Standing::Implicit);
+        assert!(
+            tree.standing(id, &p) == Standing::Ordinary,
+            "the number still stood for the directory made for p/"
+        );
+
+        // Nor does an earlier refusal or doubt about the number survive.
+        tree.replaced.borrow_mut().insert(id);
+        tree.record_made(id, &p, MadeTrust::Full, false);
+        assert!(tree.standing(id, &p) == Standing::Made);
+        tree.record_made(id, &q, MadeTrust::ParentOwnerOnly, true);
+        tree.record_made(id, &p, MadeTrust::Full, false);
+        assert!(tree.standing(id, &p) == Standing::Made);
     }
 
     /// Every site that enters, merges into or stamps a directory consults the

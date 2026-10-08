@@ -282,6 +282,86 @@ fn mv_leaves_source_entries_added_or_changed_after_the_copy() {
     let _ = fs::remove_dir_all(&other);
 }
 
+/// `f` and `g`, hard links to one file, with `y` between them; mv pauses while copying `y`.
+fn hard_links_around_y(base: &Path) {
+    fs::write(base.join("f"), b"moved").unwrap();
+    fs::hard_link(base.join("f"), base.join("g")).unwrap();
+    fs::create_dir(base.join("y")).unwrap();
+    fs::write(base.join("y/z"), b"y").unwrap();
+}
+
+/// Moving two hard links of one file, mv makes the second a hard link to the copy of the
+/// first. Someone who can write the destination directory renames a file of their own over the
+/// first copy meanwhile: the second name must not become a link to their file (the source is
+/// then removed, so its data would be lost).
+#[test]
+fn mv_never_links_a_later_name_to_a_file_renamed_over_the_first_copy() {
+    let Some(other) = other_fs("link_renamed_over") else {
+        return;
+    };
+    let base = scratch("link_renamed_over");
+    hard_links_around_y(&base);
+
+    let (status, stderr) = mv_paused_on(
+        &base,
+        &[Path::new("f"), Path::new("y"), Path::new("g"), &other],
+        &base.join("y/z"),
+        || {
+            fs::write(other.join("planted"), b"attacker").unwrap();
+            fs::rename(other.join("planted"), other.join("f")).unwrap();
+        },
+    );
+
+    assert_eq!(
+        fs::read(other.join("g")).unwrap(),
+        b"moved",
+        "the second name was linked to a file renamed over the first copy; stderr: {stderr}"
+    );
+    assert_eq!(status, Some(0), "stderr: {stderr}");
+    assert!(!base.join("g").exists());
+
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&other);
+}
+
+/// The target directory operand is resolved once: replaced by a symbolic link to another
+/// directory in the middle of the move, it still receives every operand, hard links included.
+#[test]
+fn mv_moves_every_operand_into_the_target_directory_it_opened() {
+    let Some(other) = other_fs("target_dir_swap") else {
+        return;
+    };
+    let base = scratch("target_dir_swap");
+    hard_links_around_y(&base);
+    let dest = other.join("d");
+    fs::create_dir(&dest).unwrap();
+    fs::create_dir(other.join("victim")).unwrap();
+    fs::write(other.join("victim/f"), b"attacker").unwrap();
+
+    let (status, stderr) = mv_paused_on(
+        &base,
+        &[Path::new("f"), Path::new("y"), Path::new("g"), &dest],
+        &base.join("y/z"),
+        || {
+            fs::rename(&dest, other.join("d.real")).unwrap();
+            symlink("victim", &dest).unwrap();
+        },
+    );
+
+    assert!(
+        !other.join("victim/g").exists(),
+        "an operand was moved into a directory swapped in for the target; stderr: {stderr}"
+    );
+    assert_eq!(status, Some(0), "stderr: {stderr}");
+    for name in ["f", "g", "y/z"] {
+        assert!(other.join("d.real").join(name).exists(), "{name} not moved");
+    }
+    assert_eq!(fs::read(other.join("d.real/g")).unwrap(), b"moved");
+
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&other);
+}
+
 /// A destination that is a dangling symbolic link is replaced, as rename(2) replaces it on one
 /// filesystem: the copy across filesystems creates the destination itself, and never writes
 /// through anything found at its name (here, creating the file the link names).

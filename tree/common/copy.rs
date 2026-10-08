@@ -30,7 +30,65 @@ use std::{
 /// The descriptor is shared rather than duplicated: `dup`ing one per hard-linked inode grew the
 /// process's descriptor use without bound over a large move, and made the walk's own descriptor
 /// budget meaningless.
-pub type InodeMap = HashMap<(u64, u64), (Rc<ftw::FileDescriptor>, CString)>;
+pub type InodeMap = HashMap<(u64, u64), FirstCopy>;
+
+/// Where the first copy of a hard-linked source file was made, and what was made.
+pub struct FirstCopy {
+    /// The directory it was made in, held open since.
+    dir: Rc<ftw::FileDescriptor>,
+    name: CString,
+    /// `(st_dev, st_ino)` of the copy, from the descriptor it was written through (or, for a
+    /// symbolic link or special file, from the `lstat` that followed its creation).
+    made: (u64, u64),
+}
+
+/// Whether `link_to_first_copy` made the new name a link to the first copy.
+enum Linked {
+    ToFirstCopy,
+    /// The first copy's name now holds another file, and the link to it was undone.
+    NotTheFirstCopy,
+}
+
+/// Make `name` in `dirfd` a hard link to `first`.
+///
+/// The link is made by name, and anyone who can write the directory the first copy was made in
+/// can have renamed a file of their own over that name since. So the new link must turn out to
+/// be the very file the first copy made; a link to anything else is unlinked again
+/// (`NotTheFirstCopy`), and the caller copies the file afresh.
+fn link_to_first_copy(first: &FirstCopy, dirfd: libc::c_int, name: &CStr) -> io::Result<Linked> {
+    let ret = unsafe {
+        libc::linkat(
+            first.dir.as_raw_fd(),
+            first.name.as_ptr(),
+            dirfd,
+            name.as_ptr(),
+            0, // Don't dereference the first copy if it is a symlink
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let linked = ftw::Metadata::new(dirfd, name, false)?;
+    if (linked.dev(), linked.ino()) == first.made {
+        return Ok(Linked::ToFirstCopy);
+    }
+    if unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Linked::NotTheFirstCopy)
+}
+
+/// The identity of a symbolic link or special file this copy just made by name (`symlinkat`,
+/// `mknodat`), for hard-linking later names to it: `None` unless the name holds a file of that
+/// type with a single link, as a fresh one has.
+fn made_node_identity(
+    dirfd: libc::c_int,
+    name: *const libc::c_char,
+    made_type: ftw::FileType,
+) -> Option<(u64, u64)> {
+    let md = ftw::Metadata::new(dirfd, unsafe { CStr::from_ptr(name) }, false).ok()?;
+    (md.file_type() == made_type && md.nlink() == 1).then(|| (md.dev(), md.ino()))
+}
 
 /// Which symbolic links are acted on by what they refer to, rather than as links
 /// (POSIX cp 90609-90623).
@@ -302,10 +360,18 @@ fn made_by_us(made: MadeObject, parent_uid: Option<u32>, euid: u32) -> Option<Ma
 
 enum CopyResult {
     CopyingDirectory(DirOrigin),
-    /// A non-directory was copied. Carries any failure to duplicate its characteristics (-p),
-    /// which is reported but never undoes the copy.
-    CopiedFile(Option<io::Error>),
+    /// A non-directory was copied.
+    CopiedFile(CopiedFile),
     Skipped,
+}
+
+/// A non-directory this copy made.
+struct CopiedFile {
+    /// `(st_dev, st_ino)` of what was made, when known for certain (`FirstCopy::made`).
+    made: Option<(u64, u64)>,
+    /// Any failure to duplicate its characteristics (-p), which is reported but never undoes
+    /// the copy.
+    preserve_error: Option<io::Error>,
 }
 
 /// S_ISUID | S_ISGID, whose values POSIX fixes.
@@ -1036,14 +1102,14 @@ where
                 target_exists,
                 state.created_files,
             ) {
-                Ok(()) => Ok(CopyResult::CopiedFile(preserve_made(
+                Ok(()) => Ok(copied_node(
                     cfg,
                     source,
                     target_dirfd,
                     target_filename,
                     source_file_type,
                     target,
-                ))),
+                )),
                 Err(e) if cfg.no_clobber && e.kind() == io::ErrorKind::AlreadyExists => {
                     Ok(CopyResult::Skipped)
                 }
@@ -1092,14 +1158,14 @@ where
                 )));
             }
             state.created_files.insert(target.to_path_buf());
-            return Ok(CopyResult::CopiedFile(preserve_made(
+            return Ok(copied_node(
                 cfg,
                 source,
                 target_dirfd,
                 target_filename,
                 ftw::FileType::SymbolicLink,
                 target,
-            )));
+            ));
         }
 
         let (source_before_read, target_file) = if replacing_existing {
@@ -1230,8 +1296,38 @@ where
         } else {
             None
         };
-        Ok(CopyResult::CopiedFile(preserve_error))
+        // What was made is the file open on the descriptor written through.
+        let made = target_file.metadata().ok().map(|md| (md.dev(), md.ino()));
+        Ok(CopyResult::CopiedFile(CopiedFile {
+            made,
+            preserve_error,
+        }))
     }
+}
+
+/// The result for a symbolic link or special file just made by name: its identity, read before
+/// anything else is done to it, and -p.
+fn copied_node(
+    cfg: &CopyConfig,
+    source: &ftw::Entry,
+    target_dirfd: libc::c_int,
+    target_filename: *const libc::c_char,
+    made_type: ftw::FileType,
+    target: &Path,
+) -> CopyResult {
+    let made = made_node_identity(target_dirfd, target_filename, made_type);
+    let preserve_error = preserve_made(
+        cfg,
+        source,
+        target_dirfd,
+        target_filename,
+        made_type,
+        target,
+    );
+    CopyResult::CopiedFile(CopiedFile {
+        made,
+        preserve_error,
+    })
 }
 
 /// Whether a descriptor's file type is the one the walk recorded.
@@ -1490,12 +1586,58 @@ where
     copy_tree(
         cfg,
         SourceRoot::Path(source_arg),
-        target_arg,
-        target_dir,
+        TargetRoot::of_path(target_arg, target_dir),
         created_files,
         inode_map,
         prompt_fn,
     )
+}
+
+/// Where a copy's destination operand is made.
+struct TargetRoot<'a> {
+    /// The directory it is made in.
+    dir: Rc<ftw::FileDescriptor>,
+    /// Its name in `dir`.
+    name: &'a OsStr,
+    /// What precedes `name` in the operand, for diagnostics.
+    display_parent: PathBuf,
+    /// The operand as given, for the diagnostics that name the operands.
+    operand: &'a Path,
+}
+
+impl<'a> TargetRoot<'a> {
+    /// cp: the operand resolved from the working directory, or with `Some(dir)` its last
+    /// component in `dir`.
+    fn of_path(operand: &'a Path, dir: Option<ftw::FileDescriptor>) -> Self {
+        let (dir, name, display_parent) = match (dir, operand.file_name()) {
+            (Some(dir), Some(name)) => (
+                dir,
+                name,
+                operand.parent().unwrap_or(Path::new("")).to_path_buf(),
+            ),
+            _ => (
+                ftw::FileDescriptor::cwd(),
+                operand.as_os_str(),
+                PathBuf::new(),
+            ),
+        };
+        TargetRoot {
+            dir: Rc::new(dir),
+            name,
+            display_parent,
+            operand,
+        }
+    }
+
+    /// mv: the destination operand pinned in the directory it was found in.
+    fn pinned(entry: &'a PinnedEntry) -> Self {
+        TargetRoot {
+            dir: entry.dir_rc(),
+            name: OsStr::from_bytes(entry.name().to_bytes()),
+            display_parent: entry.display_parent().to_path_buf(),
+            operand: entry.path(),
+        }
+    }
 }
 
 /// The source of a `mv` across filesystems: the operand, pinned, and the file it must be.
@@ -1510,19 +1652,19 @@ pub struct MoveSource<'a> {
 }
 
 /// The duplication step of `mv` across filesystems (POSIX mv step 6): `copy_file_at`, walking
-/// the source from the directory it was pinned in, and recording what it copied.
+/// the source from the directory it was pinned in, recording what it copied, and making the
+/// destination in the directory it was pinned in.
 pub fn copy_moved_file(
     cfg: &CopyConfig,
     source: MoveSource<'_>,
-    target_arg: &Path,
+    target: &PinnedEntry,
     created_files: &mut HashSet<PathBuf>,
     inode_map: &mut InodeMap,
 ) -> io::Result<()> {
     copy_tree(
         cfg,
         SourceRoot::Pinned(source),
-        target_arg,
-        None,
+        TargetRoot::pinned(target),
         created_files,
         Some(inode_map),
         // mv never asks: it already asked its own question.
@@ -1549,8 +1691,7 @@ fn changed_before_copy(source: &ftw::Entry) -> io::Error {
 fn copy_tree<F>(
     cfg: &CopyConfig,
     source_root: SourceRoot<'_>,
-    target_arg: &Path,
-    target_dir: Option<ftw::FileDescriptor>,
+    target_root: TargetRoot<'_>,
     created_files: &mut HashSet<PathBuf>,
     mut inode_map: Option<&mut InodeMap>,
     prompt_fn: F,
@@ -1566,23 +1707,16 @@ where
             copied,
         }) => (entry.path(), Some(entry), Some(identity), Some(copied)),
     };
-    // The operand's own directory and name: the current directory and the whole operand, or the
-    // given directory and the operand's last component.
-    let (top_dir, top_name, top_dir_path) = match (target_dir, target_arg.file_name()) {
-        (Some(dir), Some(name)) => (
-            dir,
-            name,
-            target_arg.parent().unwrap_or(Path::new("")).to_path_buf(),
-        ),
-        _ => (
-            ftw::FileDescriptor::cwd(),
-            target_arg.as_os_str(),
-            PathBuf::new(),
-        ),
-    };
+    // The operand's own directory and name.
+    let TargetRoot {
+        dir: top_dir,
+        name: top_name,
+        display_parent: top_dir_path,
+        operand: target_arg,
+    } = target_root;
     // `RefCell` to allow sharing these between closures. The bottom entry is the operand's
     // directory, so a stack of one means the entry is the operand itself.
-    let target_dirfd_stack = RefCell::new(vec![Rc::new(top_dir)]);
+    let target_dirfd_stack = RefCell::new(vec![top_dir]);
     // (st_dev, st_ino) of every destination directory this copy creates or enters. A source
     // directory found in here is one we are copying *into*.
     let dest_dir_ids = RefCell::new(HashSet::<(u64, u64)>::new());
@@ -1633,39 +1767,32 @@ where
         if let Some(inode_map) = inode_map.as_deref_mut() {
             // Preserve hard links like coreutils mv. Creating a copy is also
             // allowed by the standard.
-            if let Some((prev_dirfd, prev_filename)) = inode_map.get(&identifier) {
-                let ret = unsafe {
-                    libc::linkat(
-                        prev_dirfd.as_raw_fd(),
-                        prev_filename.as_ptr(),
-                        target_dirfd.as_raw_fd(),
-                        target_filename_cstr.as_ptr(),
-                        0, // Don't dereference prev if it's a symlink
-                    )
-                };
-                // If success
-                if ret == 0 {
-                    // Skip since this file/directory is handled by hard-linking
-                    if let Some(copied) = copied.as_deref_mut() {
-                        copied.record(source_md);
-                    }
-                    return Ok(false);
-                }
-                // else failed
-                else {
-                    let e = io::Error::last_os_error();
-                    // Under -n an existing destination is kept, linked or not.
-                    if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
+            if let Some(first) = inode_map.get(&identifier) {
+                match link_to_first_copy(first, target_dirfd.as_raw_fd(), &target_filename_cstr) {
+                    Ok(Linked::ToFirstCopy) => {
+                        // Skip since this file/directory is handled by hard-linking
+                        if let Some(copied) = copied.as_deref_mut() {
+                            copied.record(source_md);
+                        }
                         return Ok(false);
                     }
-                    if cfg.continue_on_error {
-                        eprintln!("{}: {}", cfg.prog, error_string(&e));
-                        *had_error.borrow_mut() = true;
-                    } else {
-                        *last_error.borrow_mut() = Some(e);
-                        *terminate_borrowed = true;
+                    // Copied afresh below, which also makes that copy the one later names of
+                    // this file are linked to.
+                    Ok(Linked::NotTheFirstCopy) => {}
+                    Err(e) => {
+                        // Under -n an existing destination is kept, linked or not.
+                        if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
+                            return Ok(false);
+                        }
+                        if cfg.continue_on_error {
+                            eprintln!("{}: {}", cfg.prog, error_string(&e));
+                            *had_error.borrow_mut() = true;
+                        } else {
+                            *last_error.borrow_mut() = Some(e);
+                            *terminate_borrowed = true;
+                        }
+                        return Ok(false);
                     }
-                    return Ok(false);
                 }
             }
         }
@@ -1689,18 +1816,23 @@ where
                 // Recording a skipped copy pointed a later hard link at a target that does
                 // not exist, and every directory reports nlink > 1, so directories were
                 // recorded too.
-                if matches!(copy_result, CopyResult::CopiedFile(_)) {
+                if let CopyResult::CopiedFile(CopiedFile { made, .. }) = &copy_result {
                     if let Some(copied) = copied.as_deref_mut() {
                         copied.record(source_md);
                     }
-                    if let Some(inode_map) = inode_map.as_deref_mut() {
-                        // Only files that have hard links are worth tracking.
-                        if source_md.nlink() > 1 {
-                            inode_map.insert(
-                                identifier,
-                                (Rc::clone(target_dirfd), target_filename_cstr.clone()),
-                            );
-                        }
+                    // Only files that have hard links are worth tracking, and only a copy whose
+                    // identity is known: a later link is checked against it.
+                    if let (Some(inode_map), Some(made), true) =
+                        (inode_map.as_deref_mut(), made, source_md.nlink() > 1)
+                    {
+                        inode_map.insert(
+                            identifier,
+                            FirstCopy {
+                                dir: Rc::clone(target_dirfd),
+                                name: target_filename_cstr.clone(),
+                                made: *made,
+                            },
+                        );
                     }
                 }
 
@@ -1790,7 +1922,7 @@ where
 
                         true
                     }
-                    CopyResult::CopiedFile(preserve_error) => {
+                    CopyResult::CopiedFile(CopiedFile { preserve_error, .. }) => {
                         // `copy_file_impl` already applied -p to the file; directories are
                         // handled in the `postprocess_dir` closure below.
                         if let Some(e) = preserve_error {

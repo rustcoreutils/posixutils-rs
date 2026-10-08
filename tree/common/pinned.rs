@@ -39,6 +39,11 @@ impl PinnedEntry {
         &self.dir
     }
 
+    /// The directory, shared.
+    pub fn dir_rc(&self) -> Rc<ftw::FileDescriptor> {
+        Rc::clone(&self.dir)
+    }
+
     pub fn dir_fd(&self) -> libc::c_int {
         std::os::fd::AsRawFd::as_raw_fd(&*self.dir)
     }
@@ -92,6 +97,40 @@ impl PinnedDirs {
             name: CString::new(name).map_err(invalid)?,
             display_parent: PathBuf::from(std::ffi::OsStr::from_bytes(parent.unwrap_or(b""))),
             path: path.to_path_buf(),
+        })
+    }
+}
+
+/// A directory operand, opened once, that entries are pinned in by name: `mv a b dir` resolves
+/// `dir` once, so replacing it partway through the move changes nothing about where the later
+/// operands go.
+pub struct PinnedDir {
+    dir: Rc<ftw::FileDescriptor>,
+    path: PathBuf,
+}
+
+impl PinnedDir {
+    /// Open the directory `path` names, as the user wrote it (symbolic links included).
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let path_cstr = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        Ok(PinnedDir {
+            dir: Rc::new(open_lookup_dir(&path_cstr)?),
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// The entry `name` (a single component) in this directory.
+    pub fn entry(&self, name: &std::ffi::OsStr) -> io::Result<PinnedEntry> {
+        if name.as_bytes().contains(&b'/') {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(PinnedEntry {
+            dir: Rc::clone(&self.dir),
+            name: CString::new(name.as_bytes())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
+            display_parent: self.path.clone(),
+            path: self.path.join(name),
         })
     }
 }

@@ -14,14 +14,13 @@ mod remove_moved;
 use self::common::{copy_moved_file, error_string};
 use clap::Parser;
 use common::{
-    CopiedSources, CopyConfig, DerefMode, Destination, InodeMap, MoveSource, PinnedDirs,
+    CopiedSources, CopyConfig, DerefMode, Destination, InodeMap, MoveSource, PinnedDir, PinnedDirs,
     PinnedEntry,
 };
 use gettextrs::gettext;
 use remove_moved::remove_moved_source;
 use std::{
     collections::{HashMap, HashSet},
-    ffi::CString,
     fs,
     io::{self, IsTerminal},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -100,7 +99,7 @@ enum Moved {
 fn copy_hierarchy(
     source: PinnedEntry,
     identity: (u64, u64),
-    dst: &Path,
+    dst: &PinnedEntry,
     inode_map: &mut InodeMap,
     created_files: &mut HashSet<PathBuf>,
 ) -> io::Result<CopiedOperand> {
@@ -153,25 +152,26 @@ fn cannot_move(source: &Path, target: &Path, e: &io::Error) -> io::Error {
 
 /// Handles moving the file.
 ///
-/// The source is pinned first (`PinnedDirs`): from the checks to the removal of a copied source,
-/// every operation on it is relative to the directory it was found in then.
+/// Source and destination are pinned (`PinnedDirs`, `PinnedDir`) before anything else: from the
+/// checks to the removal of a copied source, every operation on either is relative to the
+/// directory it was found in then.
 fn move_file(
     cfg: &MvConfig,
     pinned_dirs: &mut PinnedDirs,
     source: &Path,
-    target: &Path,
+    target_entry: &PinnedEntry,
     inode_map: &mut InodeMap,
     created_files: Option<&mut HashSet<PathBuf>>,
 ) -> io::Result<Moved> {
+    let target = target_entry.path();
     let source_entry = pinned_dirs
         .pin(source)
         .map_err(|e| cannot_move(source, target, &e))?;
-    let target_filename = CString::new(target.as_os_str().as_bytes()).unwrap();
 
     // The destination itself, not followed, as rename(2) replaces it: a symbolic link there,
     // dangling or not, is a non-directory that the move replaces (step 5 removes it before a
     // copy, which must then create the destination itself).
-    let target_md = match ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false) {
+    let target_md = match target_entry.metadata(false) {
         Ok(md) => Some(md),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
@@ -189,7 +189,7 @@ fn move_file(
     // apply.
     let target_is_symlink = target_md.as_ref().is_some_and(|md| md.is_symlink());
     let target_is_writable =
-        target_is_symlink || ftw::is_writable_at(libc::AT_FDCWD, &target_filename);
+        target_is_symlink || ftw::is_writable_at(target_entry.dir_fd(), target_entry.name());
 
     // The operand itself, not followed: what a rename, or the copy and removal, act on.
     let source_lstat = source_entry.metadata(false);
@@ -220,11 +220,7 @@ fn move_file(
     }
 
     // 2. source and target are same dirent
-    if let (Ok(smd), Ok(tmd), Some(deref_smd)) = (
-        &source_lstat,
-        ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false),
-        &source_md,
-    ) {
+    if let (Ok(smd), Some(tmd), Some(deref_smd)) = (&source_lstat, &target_md, &source_md) {
         // `true` for hard links to the same file and when `source == target`
         let same_file = smd.dev() == tmd.dev() && smd.ino() == tmd.ino();
 
@@ -296,7 +292,7 @@ fn move_file(
     }
 
     // 3. call rename(2) to move source to target
-    match rename_pinned(&source_entry, &target_filename) {
+    match rename_pinned(&source_entry, target_entry) {
         Ok(_) => return Ok(Moved::Done),
         Err(e) => {
             // use ErrorKind::CrossesDevices in the future, when it is stable.
@@ -349,12 +345,7 @@ fn move_file(
 
     // 5. remove destination path
     if target_exists {
-        let remove_result = if target_is_dir {
-            fs::remove_dir(target)
-        } else {
-            fs::remove_file(target)
-        };
-        remove_result
+        remove_target(target_entry, target_is_dir)
             .map_err(|e| {
                 let err_str = gettext!("unable to remove target: {}", error_string(&e));
                 io::Error::other(err_str)
@@ -367,23 +358,40 @@ fn move_file(
         Some(set) => set,
         None => &mut HashSet::new(),
     };
-    let copied = copy_hierarchy(source_entry, identity, target, inode_map, created_files)
-        .map_err(err_inter_device)?;
+    let copied = copy_hierarchy(
+        source_entry,
+        identity,
+        target_entry,
+        inode_map,
+        created_files,
+    )
+    .map_err(err_inter_device)?;
 
     Ok(Moved::Copied(copied))
 }
 
-/// rename(2) of the pinned source to `target`.
-fn rename_pinned(source: &PinnedEntry, target: &CString) -> io::Result<()> {
+/// rename(2) of the pinned source to the pinned target.
+fn rename_pinned(source: &PinnedEntry, target: &PinnedEntry) -> io::Result<()> {
     let ret = unsafe {
         libc::renameat(
             source.dir_fd(),
             source.name().as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
+            target.dir_fd(),
+            target.name().as_ptr(),
         )
     };
     if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Step 5: remove the destination, in the directory it was pinned in. A directory is removed
+/// only if it is empty.
+fn remove_target(target: &PinnedEntry, is_dir: bool) -> io::Result<()> {
+    let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+    if unsafe { libc::unlinkat(target.dir_fd(), target.name().as_ptr(), flags) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -395,6 +403,15 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
 
     let mut created_files = HashSet::new();
     let mut pinned_dirs = PinnedDirs::default();
+
+    // The target directory is resolved once, here: every operand goes into this directory.
+    let target_dir = match PinnedDir::open(target) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("mv: {}: {}", target.display(), error_string(&e));
+            return None;
+        }
+    };
 
     // inode of source -> target path
     let mut inode_map = HashMap::with_capacity(sources.len());
@@ -410,7 +427,14 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
                 // Concatenation of the target directory, a single <slash>
                 // character if the target did not end in a <slash>, and the
                 // last pathname component of the source_file.
-                let new_target = target.join(file_name);
+                let new_target = match target_dir.entry(file_name) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        eprintln!("mv: {}: {}", source.display(), error_string(&e));
+                        result = None;
+                        continue;
+                    }
+                };
 
                 // Don't immediately bubble up the error with `?` to allow the
                 // remaining files to be processed.
@@ -423,7 +447,7 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
                     Some(&mut created_files),
                 ) {
                     Ok(moved) => {
-                        created_files.insert(new_target);
+                        created_files.insert(new_target.path().to_path_buf());
 
                         if let Moved::Copied(copied) = moved {
                             sources_to_delete.push(copied);
@@ -528,7 +552,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut dummy = HashMap::new();
         let mut pinned_dirs = PinnedDirs::default();
-        match move_file(&cfg, &mut pinned_dirs, source, target, &mut dummy, None) {
+        let target_entry = match pinned_dirs.pin(target) {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!("mv: {}", cannot_move(source, target, &e));
+                std::process::exit(1);
+            }
+        };
+        match move_file(
+            &cfg,
+            &mut pinned_dirs,
+            source,
+            &target_entry,
+            &mut dummy,
+            None,
+        ) {
             Ok(Moved::Done) => Ok(()),
             // 7. Remove source file hierarchy
             Ok(Moved::Copied(copied)) => {

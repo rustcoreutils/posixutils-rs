@@ -371,31 +371,3 @@ fn fifo_and_symlink_take_their_attributes() {
     assert!(md.file_type().is_symlink());
     assert_eq!(md.mtime(), 23456);
 }
-
-/// Without `-p p` the FIFO's mode is the archived one less the umask; with
-/// it, the archived one exactly.
-#[test]
-fn fifo_mode_follows_the_umask_unless_preserved() {
-    let tmp = TempDir::new().unwrap();
-    let tree = DirTree::open_path(tmp.path()).unwrap();
-    let mut pending = PendingDirs::default();
-    let options = ReadOptions {
-        preserve_perms: false,
-        umask: 0o022,
-        ..Default::default()
-    };
-    let mut archive = Members(vec![own_member("f", EntryType::Fifo, 0o777)].into_iter());
-    extract_members(&mut archive, &options, &tree, &mut pending).unwrap();
-    let md = std::fs::symlink_metadata(tmp.path().join("f")).unwrap();
-    assert_eq!(md.mode() & 0o7777, 0o755);
-
-    let options = ReadOptions {
-        preserve_perms: true,
-        umask: 0o077,
-        ..Default::default()
-    };
-    let mut archive = Members(vec![own_member("g", EntryType::Fifo, 0o777)].into_iter());
-    extract_members(&mut archive, &options, &tree, &mut pending).unwrap();
-    let md = std::fs::symlink_metadata(tmp.path().join("g")).unwrap();
-    assert_eq!(md.mode() & 0o7777, 0o777);
-}

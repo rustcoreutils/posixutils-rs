@@ -1134,6 +1134,57 @@ mod tests {
         assert!(!rename_member(&mut linked(EntryType::Hardlink), &drop_b, 0));
     }
 
+    /// Without explicit `-p p`/`-p e` the mode a made node ends up with is
+    /// the archived mode masked by the umask (normal file-creation action);
+    /// with preservation the exact archived mode is restored.
+    #[test]
+    fn test_set_permissions_umask_vs_preserve() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = plib::tmp::TempDir::new().unwrap();
+        let path = tmp.path().join("member");
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+
+        // Attributes are applied relative to an open parent directory.
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        let name = CString::new("member").unwrap();
+        let entry = ArchiveEntry {
+            path: path.clone(),
+            mode: 0o777,
+            entry_type: EntryType::Fifo,
+            ..Default::default()
+        };
+        let mode = || {
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        // Not preserved: 0o777 & ~0o022 == 0o755.
+        let opts = ReadOptions {
+            preserve_perms: false,
+            preserve_mtime: false,
+            preserve_atime: false,
+            umask: 0o022,
+            ..Default::default()
+        };
+        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts).unwrap();
+        assert_eq!(mode(), 0o755);
+
+        // Preserved: exact 0o777 regardless of umask.
+        let opts = ReadOptions {
+            preserve_perms: true,
+            preserve_mtime: false,
+            preserve_atime: false,
+            umask: 0o022,
+            ..Default::default()
+        };
+        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts).unwrap();
+        assert_eq!(mode(), 0o777);
+    }
+
     #[test]
     fn test_strip_leading_components() {
         // The function takes and returns pathnames, which are bytes; the

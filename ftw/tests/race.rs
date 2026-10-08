@@ -630,3 +630,95 @@ fn walk_from_a_held_directory_ignores_a_swapped_parent_path() {
         Some(std::os::unix::fs::MetadataExt::ino(&held_ino))
     );
 }
+
+/// `traverse_directory_at` from an `O_PATH` descriptor (as `mv` pins a directory it may not
+/// read), in descriptor-conserving mode from the first level, so every directory below the
+/// root is reopened by path from an ancestor's descriptor: the whole tree is visited, and a
+/// removal through each entry's directory descriptor -- the root's being the held `O_PATH` one
+/// -- removes all of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn conserving_walk_from_an_o_path_directory_removes_the_tree() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = plib::tmp::Builder::new()
+        .prefix("ftw_at_conserving")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let base = tmp.path();
+    fs::create_dir_all(base.join("parent/root/a/b/c")).unwrap();
+    fs::write(base.join("parent/root/a/b/c/deep"), b"d").unwrap();
+    fs::write(base.join("parent/root/a/mid"), b"m").unwrap();
+    fs::create_dir(base.join("parent/root/x")).unwrap();
+    fs::write(base.join("parent/root/top"), b"t").unwrap();
+
+    let parent = CString::new(base.join("parent").as_os_str().as_bytes()).unwrap();
+    let held = ftw::FileDescriptor::open_at(
+        &ftw::FileDescriptor::cwd(),
+        &parent,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    )
+    .unwrap();
+
+    let visited = RefCell::new(Vec::new());
+    let ok = ftw::traverse_directory_at(
+        &held,
+        c"root",
+        Path::new("shown"),
+        |entry| {
+            visited
+                .borrow_mut()
+                .push(entry.path().as_inner().to_path_buf());
+            if entry.metadata().unwrap().is_dir() {
+                return Ok(true);
+            }
+            assert_eq!(
+                unsafe { libc::unlinkat(entry.dir_fd(), entry.file_name().as_ptr(), 0) },
+                0,
+                "{}: {}",
+                entry.path(),
+                io::Error::last_os_error()
+            );
+            Ok(false)
+        },
+        |entry, exit| {
+            assert_eq!(exit, ftw::DirExit::Descended);
+            let ret = unsafe {
+                libc::unlinkat(
+                    entry.dir_fd(),
+                    entry.file_name().as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            };
+            assert_eq!(ret, 0, "{}: {}", entry.path(), io::Error::last_os_error());
+            Ok(())
+        },
+        |entry, e| panic!("unexpected error on {}: {:?}", entry.path(), e.inner()),
+        TraverseDirectoryOpts {
+            caller_fds_per_level: 4096,
+            ..Default::default()
+        },
+    );
+
+    assert!(ok);
+    let mut visited = visited.into_inner();
+    visited.sort();
+    let expected: Vec<std::path::PathBuf> = [
+        "shown/root",
+        "shown/root/a",
+        "shown/root/a/b",
+        "shown/root/a/b/c",
+        "shown/root/a/b/c/deep",
+        "shown/root/a/mid",
+        "shown/root/top",
+        "shown/root/x",
+    ]
+    .map(std::path::PathBuf::from)
+    .to_vec();
+    assert_eq!(visited, expected);
+    assert!(
+        !base.join("parent/root").exists(),
+        "the tree was not removed"
+    );
+}

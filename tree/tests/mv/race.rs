@@ -100,7 +100,22 @@ fn mv_paused_on(
     leased: &Path,
     meanwhile: impl FnOnce(),
 ) -> (Option<i32>, String) {
-    let lease = Lease::take(leased);
+    mv_paused_on_last(base, args, &[leased.to_path_buf()], |_| meanwhile())
+}
+
+/// `mv_paused_on` with every file in `leased` under a lease: each one mv waits for is released
+/// in turn, except the last, the file mv opens after all the others -- which by then it has
+/// read. `meanwhile` is told which file that is.
+fn mv_paused_on_last(
+    base: &Path,
+    args: &[&Path],
+    leased: &[PathBuf],
+    meanwhile: impl FnOnce(&Path),
+) -> (Option<i32>, String) {
+    let mut leases: Vec<(PathBuf, Lease)> = leased
+        .iter()
+        .map(|path| (path.clone(), Lease::take(path)))
+        .collect();
     let mut child = Command::new(get_binary_path("mv"))
         .args(args)
         .current_dir(base)
@@ -110,7 +125,17 @@ fn mv_paused_on(
         .spawn()
         .expect("failed to execute mv");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !lease.is_broken() {
+    loop {
+        if let Some(i) = leases.iter().position(|(_, lease)| lease.is_broken()) {
+            let (path, lease) = leases.swap_remove(i);
+            if leases.is_empty() {
+                meanwhile(&path);
+                lease.release();
+                break;
+            }
+            lease.release();
+            continue;
+        }
         if let Some(status) = child.try_wait().unwrap() {
             let mut stderr = String::new();
             child
@@ -119,13 +144,14 @@ fn mv_paused_on(
                 .unwrap()
                 .read_to_string(&mut stderr)
                 .unwrap();
-            panic!("mv finished ({status}) without opening the leased file: {stderr}");
+            panic!("mv finished ({status}) without opening every leased file: {stderr}");
         }
-        assert!(Instant::now() < deadline, "mv never opened the leased file");
+        assert!(
+            Instant::now() < deadline,
+            "mv never opened the leased files"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
-    meanwhile();
-    lease.release();
     let out = child.wait_with_output().unwrap();
     (
         out.status.code(),
@@ -181,7 +207,7 @@ fn mv_removes_the_copied_source_not_what_its_path_names_now() {
     let _ = fs::remove_dir_all(&other);
 }
 
-/// The same with several operands, where every removal waits until all of them are copied.
+/// The same with several operands, each moved into the target directory.
 #[test]
 fn mv_removes_each_copied_operand_through_the_directory_it_held() {
     let Some(other) = other_fs("parent_swap_multi") else {
@@ -195,7 +221,7 @@ fn mv_removes_each_copied_operand_through_the_directory_it_held() {
     let (status, stderr) = mv_paused_on(
         &base,
         &[Path::new("att/x"), Path::new("y"), &other],
-        &base.join("y/f"),
+        &base.join("att/x/f"),
         || swap_att_for_victim(&base),
     );
 
@@ -216,56 +242,62 @@ fn mv_removes_each_copied_operand_through_the_directory_it_held() {
 /// Only what the copy duplicated is removed from the source: an entry added after the copy, one
 /// written to since, and one replaced by another file are all left where they are, reported,
 /// and the exit status says the move was not completed. The directories holding them stay.
+///
+/// Every file is leased, so the changes are made while mv waits for the last file it opens: by
+/// then it has copied all the others, whatever order the directories list them in.
 #[test]
 fn mv_leaves_source_entries_added_or_changed_after_the_copy() {
     let Some(other) = other_fs("changed_source") else {
         return;
     };
     let base = scratch("changed_source");
-    fs::create_dir_all(base.join("x/sub")).unwrap();
-    for name in ["copied", "appended", "replaced", "sub/copied"] {
+    fs::create_dir_all(base.join("x/s1")).unwrap();
+    fs::create_dir_all(base.join("x/s2")).unwrap();
+    let files = ["r1", "r2", "r3", "s1/f", "s2/f"];
+    for name in files {
         fs::write(base.join("x").join(name), name).unwrap();
     }
-    fs::create_dir(base.join("y")).unwrap();
-    fs::write(base.join("y/f"), b"y").unwrap();
+    let leased: Vec<PathBuf> = files.iter().map(|name| base.join("x").join(name)).collect();
 
-    let (status, stderr) = mv_paused_on(
-        &base,
-        &[Path::new("x"), Path::new("y"), &other],
-        &base.join("y/f"),
-        || {
-            fs::write(base.join("x/sub/added"), b"added").unwrap();
-            let mut appended = fs::OpenOptions::new()
-                .append(true)
-                .open(base.join("x/appended"))
-                .unwrap();
-            std::io::Write::write_all(&mut appended, b" and more").unwrap();
-            fs::remove_file(base.join("x/replaced")).unwrap();
-            fs::write(base.join("x/replaced"), b"new file").unwrap();
-        },
-    );
+    // Chosen once the last file is known: two root files already copied, to write to and to
+    // replace, and a subdirectory already walked, to add to.
+    let mut changed = (String::new(), String::new(), String::new());
+    let (status, stderr) = mv_paused_on_last(&base, &[Path::new("x"), &other], &leased, |last| {
+        let last = last.strip_prefix(base.join("x")).unwrap();
+        let mut roots = ["r1", "r2", "r3"]
+            .into_iter()
+            .filter(|name| Path::new(name) != last);
+        let (appended, replaced) = (roots.next().unwrap(), roots.next().unwrap());
+        let walked = if last.starts_with("s1") { "s2" } else { "s1" };
+        let added = format!("{walked}/added");
+
+        fs::write(base.join("x").join(&added), b"added").unwrap();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(base.join("x").join(appended))
+            .unwrap();
+        std::io::Write::write_all(&mut file, b" and more").unwrap();
+        fs::remove_file(base.join("x").join(replaced)).unwrap();
+        fs::write(base.join("x").join(replaced), b"new file").unwrap();
+        changed = (added, appended.to_string(), replaced.to_string());
+    });
+    let (added, appended, replaced) = changed;
 
     assert_eq!(status, Some(1), "stderr: {stderr}");
+    let read = |name: &str| fs::read(base.join("x").join(name)).unwrap();
     assert_eq!(
-        fs::read(base.join("x/sub/added")).unwrap(),
+        read(&added),
         b"added",
         "an entry added after the copy was removed"
     );
-    assert_eq!(
-        fs::read(base.join("x/appended")).unwrap(),
-        b"appended and more"
-    );
-    assert_eq!(fs::read(base.join("x/replaced")).unwrap(), b"new file");
-    assert!(!base.join("x/copied").exists(), "a copied entry was left");
-    assert!(
-        !base.join("x/sub/copied").exists(),
-        "a copied entry was left"
-    );
-    assert!(
-        !base.join("y").exists(),
-        "the other operand was not removed"
-    );
-    for name in ["x/sub/added", "x/appended", "x/replaced"] {
+    assert_eq!(read(&appended), format!("{appended} and more").as_bytes());
+    assert_eq!(read(&replaced), b"new file");
+    for name in files {
+        if name != appended && name != replaced {
+            assert!(!base.join("x").join(name).exists(), "{name} was left");
+        }
+    }
+    for name in [&added, &appended, &replaced].map(|name| format!("x/{name}")) {
         assert!(
             stderr.contains(&format!(
                 "mv: not removing '{name}': it changed during the move\n"
@@ -357,6 +389,60 @@ fn mv_moves_every_operand_into_the_target_directory_it_opened() {
         assert!(other.join("d.real").join(name).exists(), "{name} not moved");
     }
     assert_eq!(fs::read(other.join("d.real/g")).unwrap(), b"moved");
+
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&other);
+}
+
+/// Moving many operands from as many directories across filesystems holds descriptors for a
+/// bounded number of them, not one per operand: with `RLIMIT_NOFILE` at 64, a hundred operands
+/// from a hundred directories are all moved.
+#[test]
+fn mv_moves_more_operands_from_distinct_directories_than_it_may_open() {
+    use std::os::unix::process::CommandExt;
+
+    const OPERANDS: usize = 100;
+    let Some(other) = other_fs("many_parents") else {
+        return;
+    };
+    let base = scratch("many_parents");
+    let mut args = Vec::new();
+    for i in 0..OPERANDS {
+        let dir = base.join(format!("d{i}"));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join(format!("f{i}")), format!("{i}")).unwrap();
+        args.push(dir.join(format!("f{i}")));
+    }
+    args.push(other.clone());
+
+    let mut command = Command::new(get_binary_path("mv"));
+    command.args(&args).stdin(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64,
+                rlim_max: 64,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command.output().expect("failed to execute mv");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    for i in 0..OPERANDS {
+        assert_eq!(
+            fs::read(other.join(format!("f{i}"))).unwrap(),
+            format!("{i}").as_bytes()
+        );
+        assert!(
+            !base.join(format!("d{i}/f{i}")).exists(),
+            "f{i} left behind"
+        );
+    }
 
     let _ = fs::remove_dir_all(&base);
     let _ = fs::remove_dir_all(&other);

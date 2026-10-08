@@ -17,7 +17,7 @@
 //! duplicate -- an entry added since, a file written to or replaced since -- is left where it
 //! is and reported, and so is every directory still holding one.
 
-use crate::common::{error_string, CopiedSources, PinnedEntry};
+use crate::common::{error_string, CopiedSources, InodeMap, PinnedEntry};
 use gettextrs::gettext;
 use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
 
@@ -39,20 +39,27 @@ impl Removal {
 
 /// Remove what the copy of `source` duplicated. Returns whether all of it was removed; every
 /// entry that was not has been reported.
-pub fn remove_moved_source(source: &PinnedEntry, copied: &CopiedSources) -> bool {
+///
+/// `inode_map` is the move's record of hard-linked files already copied. A file whose last link
+/// this removes is forgotten there: its inode number is free for the system to give a new
+/// file, which a later operand must not then take for this one and link to its copy.
+pub fn remove_moved_source(
+    source: &PinnedEntry,
+    copied: &CopiedSources,
+    inode_map: &mut InodeMap,
+) -> bool {
     let removal = RefCell::new(Removal::default());
 
     let file_handler = |entry: ftw::Entry<'_>| -> Result<bool, ()> {
         let mut removal = removal.borrow_mut();
-        let unchanged = entry.metadata().is_some_and(|md| copied.unchanged(md));
-        if !unchanged {
+        let Some(md) = entry.metadata().filter(|md| copied.unchanged(md)) else {
             removal.leave(gettext!(
                 "not removing '{}': it changed during the move",
                 entry.path()
             ));
             return Ok(false);
-        }
-        if entry.metadata().is_some_and(|md| md.is_dir()) {
+        };
+        if md.is_dir() {
             // Emptied first; removed on the way out (`remove_emptied_dir`).
             let left = removal.left;
             removal.left_on_entry.push(left);
@@ -60,6 +67,8 @@ pub fn remove_moved_source(source: &PinnedEntry, copied: &CopiedSources) -> bool
         }
         if unsafe { libc::unlinkat(entry.dir_fd(), entry.file_name().as_ptr(), 0) } != 0 {
             removal.leave(cannot_remove(&entry, &io::Error::last_os_error()));
+        } else if md.nlink() <= 1 {
+            inode_map.remove(&(md.dev(), md.ino()));
         }
         Ok(false)
     };

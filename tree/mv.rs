@@ -79,10 +79,10 @@ struct CopiedOperand {
 }
 
 impl CopiedOperand {
-    /// Remove the source hierarchy the copy duplicated. Returns whether all of it was removed;
-    /// what was not has been reported.
-    fn remove(&self) -> bool {
-        remove_moved_source(&self.source, &self.copied)
+    /// Remove the source hierarchy the copy duplicated, and with it the pin on its directory.
+    /// Returns whether all of it was removed; what was not has been reported.
+    fn remove(self, inode_map: &mut InodeMap) -> bool {
+        remove_moved_source(&self.source, &self.copied, inode_map)
     }
 }
 
@@ -538,10 +538,6 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
     // inode of source -> target path
     let mut inode_map = HashMap::with_capacity(sources.len());
 
-    // Postpone deletion when moving across filesystems because it would
-    // otherwise error when copying dangling hard links
-    let mut sources_to_delete = Vec::new();
-
     // loop through sources, moving each to target
     for source in sources {
         match source.file_name() {
@@ -571,8 +567,15 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
                     Ok(moved) => {
                         created_files.insert(new_target.path().to_path_buf());
 
+                        // 7. Remove the source file hierarchy now, as GNU does, which also
+                        // releases the directory it was pinned in: a move of many operands holds
+                        // descriptors for one at a time. Hard links between operands are still
+                        // preserved -- later names link to the destination's copy, not to the
+                        // source.
                         if let Moved::Copied(copied) = moved {
-                            sources_to_delete.push(copied);
+                            if !copied.remove(&mut inode_map) {
+                                result = None;
+                            }
                         }
                     }
                     Err(e) => {
@@ -588,13 +591,6 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
                 eprintln!("mv: {}", err_str);
                 result = None;
             }
-        }
-    }
-
-    // 7. Remove source file hierarchy
-    for copied in sources_to_delete {
-        if !copied.remove() {
-            result = None;
         }
     }
 
@@ -692,7 +688,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(Moved::Done) => Ok(()),
             // 7. Remove source file hierarchy
             Ok(Moved::Copied(copied)) => {
-                if !copied.remove() {
+                if !copied.remove(&mut dummy) {
                     std::process::exit(1);
                 }
                 Ok(())

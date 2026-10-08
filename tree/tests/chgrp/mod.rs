@@ -518,3 +518,36 @@ fn test_chgrp_recurse() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// chgrp changes only the group: it must pass no owner to chown, not the
+/// owner of whatever the walk saw. Through a symlink, the walk sees the
+/// link and chown acts on its target, and as root a stale owner hands the
+/// file to someone else. Linux's `/dev/stdin` is a root-owned symlink to
+/// this process's file descriptor 0, here a file this user owns: chgrp must
+/// change its group, not try to give it to root.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_chgrp_through_a_symlink_owned_by_another_user() {
+    let test_dir = &format!(
+        "{}/test_chgrp_symlink_other_owner",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let f = &format!("{test_dir}/f");
+    let (_, (g2, gid2)) = get_groups();
+
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+    assert_ne!(file_gid(f).unwrap(), gid2);
+
+    let output = std::process::Command::new(plib::testing::get_binary_path("chgrp"))
+        .args([g2.as_str(), "/dev/stdin"])
+        .stdin(fs::File::open(f).unwrap())
+        .output()
+        .unwrap();
+
+    let gid = file_gid(f).unwrap();
+    fs::remove_dir_all(test_dir).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(gid, gid2);
+}

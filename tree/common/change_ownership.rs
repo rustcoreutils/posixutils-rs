@@ -10,7 +10,7 @@
 use super::error_string;
 use clap::Parser;
 use gettextrs::gettext;
-use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
+use std::{cell::RefCell, io};
 
 #[derive(Parser)]
 #[command(version, about, disable_help_flag = true)]
@@ -63,13 +63,12 @@ where
     ftw::traverse_directory(
         filename,
         |entry| {
-            let md = entry.metadata().unwrap();
-
-            // Use the UID from the args if present. If not given, according to the chgrp spec:
-            // "The user ID of the file shall be used as the owner argument."
-            let uid = uid.unwrap_or(md.uid());
-
-            // Don't change the group ID if the group argument is empty
+            // An owner or group not given is passed as -1, which leaves it as it is. The chgrp
+            // spec says "The user ID of the file shall be used as the owner argument": the
+            // file's own user ID at the moment of the change. The owner the walk saw is not
+            // that: a symlink's when chown follows it to its target, or a file's that was
+            // replaced since, and as root passing it would give the file to that owner.
+            let uid = uid.unwrap_or(libc::uid_t::MAX);
             let gid = gid.unwrap_or(libc::gid_t::MAX);
 
             let ret = unsafe {

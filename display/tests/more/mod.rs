@@ -1490,13 +1490,10 @@ fn test_pty_editor_line_is_the_top_line_of_the_screen() {
 #[cfg(unix)]
 use crate::common::MoreSession;
 
-/// Write `content` to a fresh file under a per-test temporary directory.
-fn render_fixture(name: &str, content: &[u8]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("posixutils_more_render");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
-    std::fs::write(&path, content).unwrap();
-    path
+/// Write `content` to a fresh file under a per-test temporary directory,
+/// removed with it when dropped.
+fn render_fixture(name: &str, content: &[u8]) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(name, content)
 }
 
 #[cfg(unix)]

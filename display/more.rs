@@ -4321,21 +4321,19 @@ mod tests {
 
     #[test]
     fn find_tags_files_walks_subdirectories() {
-        let dir = std::env::temp_dir().join("posixutils_more_tags_walk");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
         std::fs::write(dir.join("tags"), "").unwrap();
         std::fs::write(dir.join("a/b/tags"), "").unwrap();
         std::fs::write(dir.join("a/not_tags"), "").unwrap();
 
-        let mut found = find_tags_files(&dir);
+        let mut found = find_tags_files(dir);
         found.sort();
         assert_eq!(found.len(), 2, "found {found:?}");
         assert!(found.iter().all(|p| p.file_name() == Some("tags".as_ref())));
 
         assert!(find_tags_files(Path::new(&dir.join("missing"))).is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     use super::{decimate_anchors, Anchor, SeekPositions, Source, MAX_ANCHORS, TRAIL_CAP};

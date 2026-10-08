@@ -342,10 +342,9 @@ fn uudecode_bad_mode_no_panic() {
 // Base64 of b"hi\n" (0x68,0x69,0x0a) is "aGkK".
 // =============================================================================
 
-fn unique_tmp(name: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("xform_uue_{}_{}", std::process::id(), name));
-    p
+/// `name` inside `dir`, a temporary directory removed when the test ends.
+fn unique_tmp(dir: &plib::tmp::TempDir, name: &str) -> PathBuf {
+    dir.path().join(name)
 }
 
 /// Whether write permission checks are bypassed, as they are for root.
@@ -393,8 +392,8 @@ fn uudecode_dash_cookie_to_stdout() {
 #[test]
 fn uudecode_o_dash_overrides_to_stdout() {
     // -o - means stdout and must not create the header's named file (#UD2).
-    let bogus = unique_tmp("should_not_be_created");
-    let _ = std::fs::remove_file(&bogus);
+    let dir = plib::tmp::tempdir().unwrap();
+    let bogus = unique_tmp(&dir, "should_not_be_created");
     let input = format!("begin-base64 644 {}\naGkK\n====\n", bogus.display());
     run_test(TestPlan {
         cmd: String::from("uudecode"),
@@ -436,7 +435,8 @@ fn uudecode_base64_tolerates_crlf_and_whitespace() {
 #[test]
 fn uudecode_overwrites_existing_writable_file() {
     // Existing writable target is overwritten in place (#UD5).
-    let target = unique_tmp("existing_writable.txt");
+    let dir = plib::tmp::tempdir().unwrap();
+    let target = unique_tmp(&dir, "existing_writable.txt");
     std::fs::write(&target, b"OLD CONTENT").unwrap();
     let output = run_test_base(
         &String::from("uudecode"),
@@ -445,7 +445,6 @@ fn uudecode_overwrites_existing_writable_file() {
     );
     let code = output.status.code();
     let got = std::fs::read(&target).unwrap();
-    let _ = std::fs::remove_file(&target);
     assert_eq!(
         code,
         Some(0),
@@ -461,7 +460,8 @@ fn uudecode_readonly_target_errors() {
     if running_as_root() {
         return; // root bypasses W_OK
     }
-    let target = unique_tmp("readonly.txt");
+    let dir = plib::tmp::tempdir().unwrap();
+    let target = unique_tmp(&dir, "readonly.txt");
     std::fs::write(&target, b"KEEP").unwrap();
     set_read_only(&target, true);
 
@@ -471,10 +471,9 @@ fn uudecode_readonly_target_errors() {
         b"begin-base64 644 ignored\naGkK\n====\n",
     );
 
-    // Restore perms so cleanup can remove it.
+    // Restore perms so the directory's cleanup can remove it.
     set_read_only(&target, false);
     let content = std::fs::read(&target).unwrap();
-    let _ = std::fs::remove_file(&target);
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(content, b"KEEP", "read-only target must be left unchanged");

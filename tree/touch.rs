@@ -198,6 +198,14 @@ fn touch_file(
         };
     }
 
+    // A pathname ending in a slash names a directory (POSIX pathname resolution), so no file is
+    // ever created for it: it is an existing directory, given its times by name, or an error.
+    // Deciding this here rather than through the create keeps it the same on every system --
+    // macOS resolves a dangling symlink followed by a slash differently from Linux.
+    if filename.ends_with('/') {
+        return set_times_path(&c_path, &times);
+    }
+
     let open_err = match create_new(&c_path) {
         Ok(fd) => return set_times_fd(&fd, &times),
         Err(e) => e,

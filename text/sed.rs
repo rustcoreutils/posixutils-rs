@@ -14,7 +14,7 @@ use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
     fs::File,
     io::{BufRead, BufReader, Error, ErrorKind, Write},
@@ -145,7 +145,10 @@ impl Args {
         Ok(Sed {
             quiet: self.quiet,
             script,
-            input_sources: self.file,
+            input_sources: self.file.into(),
+            current_input: String::new(),
+            pending_line: None,
+            exit_status: 0,
             pattern_space: Vec::new(),
             hold_space: Vec::new(),
             current_file: None,
@@ -1617,8 +1620,14 @@ struct Sed {
     quiet: bool,
     /// [`Script`] that applied for every line of every input file
     script: Script,
-    /// List of input files that need process with [`Script`]
-    input_sources: Vec<String>,
+    /// The input files not yet opened, read in turn as one stream
+    input_sources: VecDeque<String>,
+    /// The operand the current file was opened as, for diagnostics
+    current_input: String,
+    /// A line read ahead to learn whether an unterminated line was the last
+    pending_line: Option<Vec<u8>>,
+    /// 0, or 2 once an input file could not be read
+    exit_status: i32,
     /// Buffer with current line of processed input file,
     /// but it can be changed with [`Command`]s in cycle limits.
     /// Сleared every cycle
@@ -2119,19 +2128,79 @@ impl Sed {
         self.has_replacements_since_t = true;
     }
 
-    /// Read next line from current file
+    /// Read the next line of the input stream, which runs on from the end of
+    /// one file into the next; empty at the end of the last.
+    ///
+    /// A file's last line without a <newline> gets one when another line
+    /// follows it, so that the next file's first line is a line of its own,
+    /// as in GNU sed. Finding out takes reading that next line ahead.
     fn read_line(&mut self) -> Result<Vec<u8>, SedError> {
-        let Some(current_file) = self.current_file.as_mut() else {
-            return Err(SedError::Io(std::io::Error::new(
-                ErrorKind::NotFound,
-                "current file is none",
-            )));
-        };
-        let mut line = Vec::new();
-        if let Err(err) = current_file.read_until(b'\n', &mut line) {
-            return Err(SedError::Io(err));
+        if let Some(line) = self.pending_line.take() {
+            return Ok(line);
+        }
+        let mut line = self.read_stream_line();
+        if !line.is_empty() && !line.ends_with(b"\n") {
+            let next = self.read_stream_line();
+            if !next.is_empty() {
+                line.push(b'\n');
+                self.pending_line = Some(next);
+            }
         }
         Ok(line)
+    }
+
+    /// The next line of the current file, opening the next file when this
+    /// one is exhausted; empty when no file has another line.
+    fn read_stream_line(&mut self) -> Vec<u8> {
+        loop {
+            if let Some(current_file) = self.current_file.as_mut() {
+                let mut line = Vec::new();
+                match current_file.read_until(b'\n', &mut line) {
+                    Ok(_) if !line.is_empty() => return line,
+                    Ok(_) => {}
+                    Err(err) => {
+                        // GNU: report it, go on with the next file, exit 2.
+                        eprintln!(
+                            "sed: read error on {}: {}",
+                            self.current_input,
+                            plib::diag::io_error_text(&err)
+                        );
+                        self.exit_status = 2;
+                    }
+                }
+                self.current_file = None;
+            }
+            if !self.open_next_input() {
+                return Vec::new();
+            }
+        }
+    }
+
+    /// Open the next input file that can be opened, reporting each one
+    /// that cannot; false when none is left.
+    fn open_next_input(&mut self) -> bool {
+        while let Some(input) = self.input_sources.pop_front() {
+            if input == "-" {
+                self.current_file = Some(Box::new(BufReader::new(std::io::stdin())));
+                self.current_input = String::from("stdin");
+                return true;
+            }
+            match File::open(&input) {
+                Ok(file) => {
+                    self.current_file = Some(Box::new(BufReader::new(file)));
+                    self.current_input = input;
+                    return true;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "sed: can't read {input}: {}",
+                        plib::diag::io_error_text(&err)
+                    );
+                    self.exit_status = 2;
+                }
+            }
+        }
+        false
     }
 
     fn need_execute(&mut self, command_position: usize) -> Result<bool, SedError> {
@@ -2256,10 +2325,9 @@ impl Sed {
     }
 
     /// Executes all commands of [`Sed`]'s [`Script`]
-    /// for all content of `reader` file argument
+    /// for every line of the input stream
     fn process_input(&mut self) -> Result<(), SedError> {
         self.pattern_space.clear();
-        self.hold_space.clear();
         self.current_line = 0;
         self.is_last_line = false;
         let mut line;
@@ -2296,33 +2364,10 @@ impl Sed {
         // at parse time). Pre-create/truncate every wfile named in the script,
         // as required by POSIX (each wfile is created before processing begins).
         self.create_wfiles();
-        for mut input in std::mem::take(&mut self.input_sources) {
-            self.current_file = Some(if input == "-" {
-                Box::new(BufReader::new(std::io::stdin()))
-            } else {
-                match File::open(&input) {
-                    Ok(file) => Box::new(BufReader::new(file)),
-                    Err(err) => {
-                        if input == "-" {
-                            input = "stdin".to_string();
-                        }
-                        eprintln!("sed: read {input}: {err}");
-                        continue;
-                    }
-                }
-            });
-            match self.process_input() {
-                Ok(_) => {}
-                Err(err) => {
-                    if input == "-" {
-                        input = "stdin".to_string();
-                    }
-                    return Err(SedError::Runtime(input, format!("{}", err)));
-                }
-            };
-        }
-
-        Ok(())
+        // POSIX: the input files are one stream, so line numbers, `$`, the
+        // hold space and open ranges all run on from one file into the next.
+        self.process_input()
+            .map_err(|err| SedError::Runtime(self.current_input.clone(), err.to_string()))
     }
 }
 
@@ -2335,8 +2380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse_ordered();
 
     let exit_code = Args::try_to_sed(args)
-        .and_then(|mut sed| sed.sed())
-        .map(|_| 0)
+        .and_then(|mut sed| sed.sed().map(|_| sed.exit_status))
         .unwrap_or_else(|err| {
             eprintln!("sed: {err}");
             1

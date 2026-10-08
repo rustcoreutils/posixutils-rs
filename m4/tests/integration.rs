@@ -163,13 +163,30 @@ macro_rules! m4_test_expect_error {
     };
 }
 
-// Macro for stdout_regex tests
+/// Remove the file a `maketemp`/`mkstemp` fixture made: its output is the
+/// file's name. Only a name under the fixtures' own `/tmp/m4-` template is
+/// touched.
+fn remove_made_temp(stdout: &[u8]) {
+    let stdout = String::from_utf8_lossy(stdout);
+    let name = stdout.trim_end();
+    if name.starts_with("/tmp/m4-") && !name.contains("..") {
+        let _ = fs::remove_file(name);
+    }
+}
+
+// Macro for stdout_regex tests. Their fixtures (maketemp, mkstemp) print the
+// name of a file m4 just created; it is removed before the output is judged,
+// so a failure leaves nothing behind in /tmp either.
 macro_rules! m4_test_regex {
     ($name:ident, $regex:expr) => {
         #[test]
         fn $name() {
             let plan = load_fixture(stringify!($name));
-            run_test_with_checker(plan, stdout_regex_checker($regex));
+            let check = stdout_regex_checker($regex);
+            run_test_with_checker(plan, |plan, output| {
+                remove_made_temp(&output.stdout);
+                check(plan, output);
+            });
         }
     };
 }

@@ -17,9 +17,9 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    chmod_at, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
-    open_dir_at, restore_atime, restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at,
-    AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
+    create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at, open_dir_at,
+    restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, stat_at, AttrPolicy,
+    Attrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::followed_link;
 use crate::modes::write::FileNames;
@@ -563,6 +563,7 @@ fn copy_special_file(
 
     let ft = metadata.file_type();
     let perm = (metadata.mode() & 0o7777) as libc::mode_t;
+    let made_type = metadata.mode() as libc::mode_t & libc::S_IFMT;
 
     let created = if ft.is_fifo() {
         create_replacing(dirfd, name, options.no_clobber, || {
@@ -604,10 +605,15 @@ fn copy_special_file(
 
     // mkfifoat and mknodat both apply the process umask, so the mode they were
     // given is not necessarily the mode on disk; and neither carries ownership
-    // or times. Extraction restores all three here, so a copy must too. A FIFO
-    // cannot be opened for the purpose without blocking on a writer, so this is
-    // the one place a name is used -- and set_permissions_at refuses a link.
-    set_node_attrs_at(dirfd, name, metadata, options)
+    // or times. Extraction restores all three here, so a copy must too --
+    // through the node just made, never by name.
+    set_made_node_attrs(
+        dirfd,
+        name,
+        made_type,
+        &attrs_of(metadata),
+        &policy_of(options),
+    )
 }
 
 /// Copy a symlink
@@ -632,10 +638,10 @@ fn copy_symlink(
         return Ok(());
     }
 
-    // A symlink's own mode is meaningless and there is no portable way to chmod
-    // one, so only owner and times are restored.
-    set_link_attrs_at(dirfd, name, &attrs_of(metadata), &policy_of(options))?;
-    Ok(())
+    // A symlink's own mode is meaningless, so only owner and times are
+    // restored.
+    let (attrs, policy) = (attrs_of(metadata), policy_of(options));
+    set_made_node_attrs(dirfd, name, libc::S_IFLNK, &attrs, &policy)
 }
 
 /// Copy a regular file
@@ -901,22 +907,6 @@ fn policy_of(options: &CopyOptions) -> AttrPolicy {
     }
 }
 
-/// Owner, mode and times for a node that cannot be opened for the purpose.
-fn set_node_attrs_at(
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    metadata: &ftw::Metadata,
-    options: &CopyOptions,
-) -> PaxResult<()> {
-    let attrs = attrs_of(metadata);
-    let policy = policy_of(options);
-
-    // Owner and times take AT_SYMLINK_NOFOLLOW, and chmod_at never follows
-    // a symbolic link either.
-    let owner_set = set_link_attrs_at(dirfd, name, &attrs, &policy)?;
-    chmod_at(dirfd, name, policy.mode(&attrs, owner_set))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,3 +1052,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod race_tests;

@@ -21,6 +21,7 @@
 //! always created fresh rather than written through.
 
 use crate::error::{PaxError, PaxResult};
+use crate::modes::made::{cvt, MadeNode, MadeTrust};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -655,7 +656,7 @@ where
     F: FnMut() -> std::io::Result<()>,
 {
     match create() {
-        Ok(()) => return Ok(true),
+        Ok(()) => return Ok(created(dirfd, name)),
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
         Err(e) => return Err(e.into()),
     }
@@ -666,9 +667,22 @@ where
 
     unlink_at(dirfd, name)?;
     match create() {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(created(dirfd, name)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// `create_replacing` has made `name`: always `true`. Under test this is where
+/// a writer of the destination directory gets to replace it.
+fn created(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
+    #[cfg(test)]
+    crate::modes::race_hook::reached(
+        crate::modes::race_hook::Point::Made,
+        dirfd.as_raw_fd(),
+        name,
+    );
+    let _ = (dirfd, name);
+    true
 }
 
 /// Hard-link `from_name` (in `from_dir`) to `name` (in `dirfd`), replacing
@@ -1029,7 +1043,7 @@ fn set_attrs(target: &AttrTarget<'_>, attrs: &Attrs, policy: &AttrPolicy) -> Pax
     // Owner first: a successful chown may clear the set-id bits, and whether it
     // succeeded decides whether they may be set at all.
     let owner_set = policy.preserve_owner
-        && set_owner(attrs.uid, attrs.gid, |uid, gid| target.chown(uid, gid))?;
+        && set_owner(attrs.uid, attrs.gid, |uid, gid| cvt(target.chown(uid, gid)))?;
 
     if target.chmod(policy.mode(attrs, owner_set) as libc::mode_t) != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -1058,7 +1072,7 @@ fn set_attrs(target: &AttrTarget<'_>, attrs: &Attrs, policy: &AttrPolicy) -> Pax
 /// whoever ran pax.
 pub(crate) fn set_owner<F>(uid: u32, gid: u32, chown: F) -> PaxResult<bool>
 where
-    F: FnOnce(libc::uid_t, libc::gid_t) -> libc::c_int,
+    F: FnOnce(libc::uid_t, libc::gid_t) -> std::io::Result<()>,
 {
     if uid == u32::MAX || gid == u32::MAX {
         eprintln!("pax: cannot change owner: invalid user or group ID");
@@ -1068,16 +1082,16 @@ where
     chown_result(chown(uid, gid))
 }
 
-/// Whether a `chown` call, given its return value, set the owner.
+/// Whether a chown call, given its result, set the owner.
 ///
 /// EPERM -- usually not being root -- is diagnosed and otherwise tolerated: the
 /// file keeps whoever ran pax as its owner, and the caller must then withhold
 /// the set-id bits (see [`AttrPolicy::mode`]). Any other failure is an error.
-fn chown_result(r: libc::c_int) -> PaxResult<bool> {
-    if r == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
+fn chown_result(r: std::io::Result<()>) -> PaxResult<bool> {
+    let err = match r {
+        Ok(()) => return Ok(true),
+        Err(e) => e,
+    };
     if err.raw_os_error() == Some(libc::EPERM) {
         eprintln!("pax: cannot change owner: Operation not permitted");
         crate::error::note_error();
@@ -1086,106 +1100,60 @@ fn chown_result(r: libc::c_int) -> PaxResult<bool> {
     Err(err.into())
 }
 
-/// Apply owner and times to a name that cannot be opened for the purpose -- a
-/// symbolic link, whose own mode bits carry no meaning and which must never be
-/// followed to reach them.
+/// Owner, mode and times for a FIFO, device or symbolic link this run has just
+/// made at `name` below `dirfd`, as a node of type `made_type` (`S_IFIFO`,
+/// `S_IFCHR`, `S_IFBLK` or `S_IFLNK`).
 ///
-/// Returns whether the owner was set, for a caller that goes on to apply a mode.
-pub(crate) fn set_link_attrs_at(
+/// None of them can be opened for the purpose -- a FIFO's open blocks, a
+/// device's acts on the device -- and applying the attributes by name reaches
+/// whatever the name holds by then: a writer of the directory who swaps in a
+/// hard link to another file hands that file the member's owner, mode and
+/// times. So the node is pinned and checked to be the one just made
+/// (`MadeNode`), and everything goes through the pin, in this order: owner,
+/// then mode, with the set-id bits only if the owner took, then times. A
+/// symbolic link's own mode means nothing and is left alone.
+pub(crate) fn set_made_node_attrs(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
+    made_type: libc::mode_t,
     attrs: &Attrs,
     policy: &AttrPolicy,
-) -> PaxResult<bool> {
-    let owner_set = policy.preserve_owner
-        && set_owner(attrs.uid, attrs.gid, |uid, gid| unsafe {
-            libc::fchownat(
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                uid,
-                gid,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        })?;
-
-    if let Some(times) = policy.times(attrs) {
-        let r = unsafe {
-            libc::utimensat(
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                times.as_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if r != 0 {
-            eprintln!(
-                "pax: warning: cannot set times: {}",
-                std::io::Error::last_os_error()
-            );
-            crate::error::note_error();
-        }
+) -> PaxResult<()> {
+    let node = MadeNode::pin(dirfd, name, made_type)?;
+    if node.trust() == MadeTrust::ParentOwnerOnly {
+        set_node_times(&node, attrs, policy);
+        return owner_unverified(policy);
     }
 
-    Ok(owner_set)
-}
-
-/// Set the mode of a name below `dirfd` that cannot be opened for the purpose
-/// -- a FIFO, whose open blocks, or a device, whose open can act on the device
-/// -- never following a symbolic link: one found there is refused, and one
-/// swapped in after that check is not followed either.
-pub(crate) fn chmod_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> PaxResult<()> {
-    match stat_at(dirfd, name) {
-        None => return Err(std::io::Error::last_os_error().into()),
-        Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
-            return Err(PaxError::InvalidHeader(
-                "refusing to set permissions through a symbolic link".to_string(),
-            ))
-        }
-        Some(_) => {}
+    let owner_set =
+        policy.preserve_owner && set_owner(attrs.uid, attrs.gid, |uid, gid| node.chown(uid, gid))?;
+    if made_type != libc::S_IFLNK {
+        node.chmod(policy.mode(attrs, owner_set) as libc::mode_t)?;
     }
-    chmod_nofollow(dirfd, name, mode as libc::mode_t).map_err(Into::into)
-}
-
-/// The race-free half of `chmod_at`: at worst, a symbolic link put at `name`
-/// since it was checked is refused or has its own mode set.
-///
-/// Linux's `fchmodat` refuses `AT_SYMLINK_NOFOLLOW` (until `fchmodat2`), and
-/// `fchmod` refuses an `O_PATH` descriptor. So the name is opened `O_PATH`,
-/// which opens nothing on the device or FIFO itself, without following a
-/// link; the descriptor is checked to be no link, and its `/proc/self/fd`
-/// entry, which resolves to the very file it holds, takes the chmod -- as in
-/// `set_attrs_search_only`.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn chmod_nofollow(dirfd: BorrowedFd<'_>, name: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
-    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    match fstat(fd.as_fd()) {
-        None => return Err(std::io::Error::last_os_error()),
-        Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
-            return Err(std::io::Error::from_raw_os_error(libc::ELOOP))
-        }
-        Some(_) => {}
-    }
-    let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-        .expect("a formatted number has no NUL");
-    if AttrTarget::Path(&path).chmod(mode) != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    set_node_times(&node, attrs, policy);
     Ok(())
 }
 
-/// Elsewhere `fchmodat` takes `AT_SYMLINK_NOFOLLOW`.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn chmod_nofollow(dirfd: BorrowedFd<'_>, name: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
-    let flags = libc::AT_SYMLINK_NOFOLLOW;
-    if unsafe { libc::fchmodat(dirfd.as_raw_fd(), name.as_ptr(), mode, flags) } != 0 {
-        return Err(std::io::Error::last_os_error());
+/// The times `policy` asks for, through `node`; a failure is a warning.
+fn set_node_times(node: &MadeNode<'_>, attrs: &Attrs, policy: &AttrPolicy) {
+    let Some(times) = policy.times(attrs) else {
+        return;
+    };
+    if let Err(e) = node.utimens(&times) {
+        eprintln!("pax: warning: cannot set times: {}", e);
+        crate::error::note_error();
     }
-    Ok(())
+}
+
+/// A node trusted only as `ParentOwnerOnly` gets no owner and no mode; that is
+/// worth saying when either was asked for.
+fn owner_unverified(policy: &AttrPolicy) -> PaxResult<()> {
+    if !policy.preserve_owner && !policy.preserve_perms {
+        return Ok(());
+    }
+    Err(PaxError::Io(std::io::Error::other(
+        "not preserving owner and permissions: its owner could not be verified",
+    )))
 }
 
 /// `fstatat` with `AT_SYMLINK_NOFOLLOW`, for asking what a name *is* without
@@ -1226,10 +1194,10 @@ mod tests {
         std::fs::symlink_metadata(path).unwrap().ino()
     }
 
-    /// A symbolic link swapped in for a FIFO or device between the check and
-    /// the chmod must not carry the mode to the file it points at.
+    /// A symbolic link, or a FIFO made by someone else, found where a FIFO was
+    /// just made is not taken for it: nothing is applied through it.
     #[test]
-    fn test_chmod_nofollow_never_reaches_through_a_symlink() {
+    fn test_made_node_attrs_refuse_what_was_not_made() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = plib::tmp::TempDir::new().unwrap();
         let target = tmp.path().join("target");
@@ -1237,9 +1205,10 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink(&target, tmp.path().join("link")).unwrap();
         let dir = File::open(tmp.path()).unwrap();
+        let p = policy(false, true);
 
-        // Refused (Linux) or applied to the link itself (macOS, the BSDs).
-        let _ = chmod_nofollow(dir.as_fd(), c"link", 0o600);
+        let r = set_made_node_attrs(dir.as_fd(), c"link", libc::S_IFIFO, &attrs(0o4777), &p);
+        assert!(r.is_err());
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o644);
 
@@ -1247,9 +1216,16 @@ mod tests {
         let fifo = tmp.path().join("fifo");
         let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o644) }, 0);
-        chmod_nofollow(dir.as_fd(), c"fifo", 0o604).unwrap();
-        let mode = std::fs::metadata(&fifo).unwrap().permissions().mode();
+        set_made_node_attrs(dir.as_fd(), c"fifo", libc::S_IFIFO, &attrs(0o604), &p).unwrap();
+        let mode = std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o7777, 0o604);
+
+        // Asked for as a device, the FIFO is not one.
+        let r = set_made_node_attrs(dir.as_fd(), c"fifo", libc::S_IFCHR, &attrs(0o600), &p);
+        assert!(r.is_err());
     }
 
     #[test]

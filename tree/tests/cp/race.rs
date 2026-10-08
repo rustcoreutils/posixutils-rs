@@ -472,9 +472,12 @@ fn cp_refuses_a_fifo_swapped_in_for_the_destination() {
                 fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
                 "stderr: {stderr}"
             );
-            // Refused at the open (no reader), or by the identity check.
+            // Refused at the open (no reader: ENXIO, whose text is the C library's), or by the
+            // identity check.
+            let enxio = std::io::Error::from_raw_os_error(libc::ENXIO).to_string();
+            let enxio = enxio.split(" (os error").next().unwrap();
             assert!(
-                stderr.contains("No such device or address") || stderr.contains("changed"),
+                stderr.contains(enxio) || stderr.contains("changed"),
                 "stderr: {stderr}"
             );
         }

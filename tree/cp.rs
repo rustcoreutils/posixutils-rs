@@ -86,6 +86,9 @@ struct Args {
     #[arg(short = 'n', long, help = gettext("Do not overwrite an existing file"))]
     no_clobber: bool,
 
+    #[arg(short = 'l', help = gettext("Hard-link files instead of copying them"))]
+    link: bool,
+
     // Only `auto` is accepted: it asks for a copy-on-write clone where the filesystem offers
     // one and an ordinary copy otherwise, and an ordinary copy is always a correct result.
     #[arg(
@@ -136,6 +139,7 @@ impl CopyConfig {
             preserve: args.preserve || args.archive,
             recursive: args.recursive || args.archive,
             no_clobber: args.no_clobber,
+            link: args.link,
             prog: "cp",
             // POSIX cp continues with same-level/ancestor files after a per-file failure.
             continue_on_error: true,

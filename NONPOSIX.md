@@ -205,6 +205,14 @@ dh_installexamples), with GNU cp's meaning:
    followed by the source's path, and missing directories on that path are
    made from the source's (with `-p`, their owner, mode and times too).  The
    target must be an existing directory.
+ * `-l` — each non-directory is hard-linked to its source instead of copied;
+   with `-R`, directories are made and the files in them linked.  An existing
+   destination is replaced only under `-f` (or `-i` answered yes); one that is
+   already the source is left as it is.  gcc-defaults' rules run
+   `cp -l debian/substvars.native debian/$p.substvars`.  Unlike GNU, which
+   with `-l` follows every symbolic link unless `-P` is given, `-R -l` follows
+   only what `-H` or `-L` asks for, as `-R` does without `-l`: a link found
+   in the walk is itself given the new name.
 
 ### cpio
 

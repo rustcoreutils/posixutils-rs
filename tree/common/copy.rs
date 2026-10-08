@@ -171,6 +171,8 @@ pub struct CopyConfig {
     pub recursive: bool,
     /// GNU `-n`: a non-directory whose destination already exists is skipped silently.
     pub no_clobber: bool,
+    /// GNU `-l`: each non-directory is hard-linked to the source instead of copied.
+    pub link: bool,
     /// Diagnostic prefix (`"cp"` or `"mv"`) for messages emitted directly by the copy engine.
     pub prog: &'static str,
     /// When `true` (cp), a per-file failure is reported and the walk continues with same-level and
@@ -865,8 +867,23 @@ where
 
     let target_exists = target_symlink_md.is_some();
 
+    // -l: a destination that already is the link asked for -- the very file `link_source` would
+    // link, a symbolic link itself unless it is followed -- is left as it is (GNU succeeds too).
+    // Any other destination is for the -l branch below to refuse or replace.
+    if cfg.link {
+        let linked = if deref_this_entry {
+            source_deref_md.as_ref().ok()
+        } else {
+            Some(source_md)
+        };
+        if let (Some(smd), Some(tmd)) = (linked, &target_symlink_md) {
+            if smd.dev() == tmd.dev() && smd.ino() == tmd.ino() {
+                return Ok(CopyResult::Skipped);
+            }
+        }
+    }
     // 1. If source_file references the same file as dest_file
-    if let (Ok(smd), Ok(tmd)) = (&source_deref_md, &target_deref_md) {
+    else if let (Ok(smd), Ok(tmd)) = (&source_deref_md, &target_deref_md) {
         if smd.dev() == tmd.dev() && smd.ino() == tmd.ino() {
             let err_str = gettext!(
                 "'{}' and '{}' are the same file",
@@ -1121,6 +1138,33 @@ where
         // just-created set and prompted for. Everything below replaces it.
         let replacing_existing = target_exists && !target_is_dangling_symlink;
 
+        if cfg.link {
+            // GNU replaces an existing destination under -f, or once -i was answered yes.
+            if target_is_dir {
+                return Err(io::Error::other(gettext!(
+                    "cannot overwrite directory '{}' with non-directory '{}'",
+                    target.display(),
+                    source.path()
+                )));
+            }
+            let replace = target_exists && (cfg.force || (cfg.interactive && replacing_existing));
+            if target_exists && !replace {
+                let e = io::Error::from_raw_os_error(libc::EEXIST);
+                return Err(hard_link_error(target, source, &e));
+            }
+            let linked = link_source(
+                source,
+                source_md,
+                deref_this_entry,
+                target,
+                target_dirfd,
+                target_filename,
+                replace,
+            )?;
+            state.created_files.insert(target.to_path_buf());
+            return Ok(linked);
+        }
+
         // 4. -R is required for a FIFO, device or socket; without it the contents are read like
         // any other file, which is what makes `cp /dev/null x` work.
         if source_is_special_file && cfg.recursive {
@@ -1347,6 +1391,107 @@ where
             preserve_error,
         }))
     }
+}
+
+fn hard_link_error(target: &Path, source: &ftw::Entry, e: &io::Error) -> io::Error {
+    io::Error::other(gettext!(
+        "cannot create hard link '{}' to '{}': {}",
+        target.display(),
+        source.path(),
+        error_string(e)
+    ))
+}
+
+/// GNU `-l`: make `target` another name for the source, through the directories the walk and
+/// the copy hold open, never by path. `follow` says whether the source entry is acted on through
+/// its symbolic link (`DerefMode::deref_entry`); otherwise a link is itself given the new name.
+///
+/// `linkat` resolves the source by name, so the new name must turn out to be the very file the
+/// walk examined (`source_md`, which is the referent's metadata when `follow`); anything else,
+/// swapped in since, is unlinked again and reported. Nothing is done to the file's attributes:
+/// it is the source itself, so -p has nothing to duplicate.
+fn link_source(
+    source: &ftw::Entry,
+    source_md: &ftw::Metadata,
+    follow: bool,
+    target: &Path,
+    target_dirfd: libc::c_int,
+    target_filename: *const libc::c_char,
+    replace: bool,
+) -> io::Result<CopyResult> {
+    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+    let link_as = |name: &CStr| {
+        let ret = unsafe {
+            libc::linkat(
+                source.dir_fd(),
+                source.file_name().as_ptr(),
+                target_dirfd,
+                name.as_ptr(),
+                flags,
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    let expected = (source_md.dev(), source_md.ino());
+    let is_source = |name: &CStr| {
+        ftw::Metadata::new(target_dirfd, name, false)
+            .is_ok_and(|md| (md.dev(), md.ino()) == expected)
+    };
+    let check = |name: &CStr| {
+        if is_source(name) {
+            return Ok(());
+        }
+        unsafe { libc::unlinkat(target_dirfd, name.as_ptr(), 0) };
+        Err(io::Error::other(gettext!(
+            "'{}' changed before it could be linked",
+            source.path()
+        )))
+    };
+    let target_name = unsafe { CStr::from_ptr(target_filename) };
+    if !replace {
+        link_as(target_name).map_err(|e| hard_link_error(target, source, &e))?;
+        check(target_name)?;
+    } else {
+        // An existing destination is replaced as GNU replaces it: the link is made under a fresh
+        // name beside it and renamed over it. A link that cannot be made at all (another
+        // filesystem, a source the kernel will not link) leaves the destination as it was, and
+        // there is no moment without one.
+        let temp = link_beside(&link_as).map_err(|e| hard_link_error(target, source, &e))?;
+        check(&temp)?;
+        let ret =
+            unsafe { libc::renameat(target_dirfd, temp.as_ptr(), target_dirfd, target_filename) };
+        // A rename onto another name of the same file does nothing, leaving the fresh name.
+        if ret != 0 || is_source(&temp) {
+            let e = io::Error::last_os_error();
+            unsafe { libc::unlinkat(target_dirfd, temp.as_ptr(), 0) };
+            if ret != 0 {
+                return Err(hard_link_error(target, source, &e));
+            }
+        }
+    }
+    Ok(CopyResult::CopiedFile(CopiedFile {
+        made: Some(expected),
+        source: SourceState::of(source_md),
+        preserve_error: None,
+    }))
+}
+
+/// Make a link with `link_as` under a name not yet taken in the destination directory, and
+/// return that name.
+fn link_beside(link_as: &impl Fn(&CStr) -> io::Result<()>) -> io::Result<CString> {
+    for n in 0..1000 {
+        let name = CString::new(format!(".cp-link.{}.{n}", std::process::id())).unwrap();
+        match link_as(&name) {
+            Ok(()) => return Ok(name),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::EEXIST))
 }
 
 /// The result for a symbolic link or special file just made by name: its identity, read before
@@ -2297,6 +2442,7 @@ mod tests {
             preserve: true,
             recursive: true,
             no_clobber: false,
+            link: false,
             prog: "mv",
             continue_on_error: false,
             destination: super::Destination::MustCreate,

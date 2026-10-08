@@ -210,12 +210,32 @@ fn check_node(
     dirfd: BorrowedFd<'_>,
     owners: FsOwners,
 ) -> io::Result<MadeTrust> {
-    if st.st_mode & libc::S_IFMT != made_type {
-        return Err(replaced());
-    }
-    let parent_uid = fstat(dirfd)?.st_uid;
+    let type_ok = st.st_mode & libc::S_IFMT == made_type;
+    let parent = fstat(dirfd)?;
     let euid = unsafe { libc::geteuid() };
-    made_by_us(MadeObject::of(st, owners), parent_uid, euid).ok_or_else(replaced)
+    node_trust(MadeObject::of(st, owners), type_ok, &parent, euid).ok_or_else(replaced)
+}
+
+/// How far `made`, found of the type made (`type_ok`) where pax running as
+/// `euid` has just made a node in `parent`, is trusted to be that node.
+///
+/// Where nobody but pax's user can rename entries in the parent, nobody else
+/// can have put anything at the name: what is there is pax's, whoever the
+/// filesystem says owns it (`nobody`, on an export that squashes root).
+/// Otherwise `made_by_us` decides.
+pub(crate) fn node_trust(
+    made: MadeObject,
+    type_ok: bool,
+    parent: &libc::stat,
+    euid: u32,
+) -> Option<MadeTrust> {
+    if !type_ok {
+        return None;
+    }
+    if !others_can_rename(parent, euid) {
+        return Some(MadeTrust::Full);
+    }
+    made_by_us(made, parent.st_uid, euid)
 }
 
 /// Whether anyone but `euid` can rename entries in the directory `parent`:
@@ -732,6 +752,21 @@ mod tests {
         assert!(!may_take_attrs(THIRD, &parent(OTHER, 0o755), PAX));
         // root extracting into another user's sticky /tmp-like directory.
         assert!(!may_take_attrs(THIRD, &parent(PAX, 0o1777), 0));
+    }
+
+    /// Where nobody but pax's user can rename entries in the parent, what is
+    /// at the name is what pax made, whoever the filesystem says owns it --
+    /// `nobody`, on an NFS export that squashes root.
+    #[test]
+    fn trusts_any_owner_where_nobody_else_can_rename() {
+        const NOBODY: u32 = 65534;
+        let squashed = made(NOBODY, 1, false, FsOwners::MayBeMapped);
+        let full = Some(MadeTrust::Full);
+        assert_eq!(node_trust(squashed, true, &parent(PAX, 0o755), PAX), full);
+        assert_eq!(node_trust(squashed, true, &parent(PAX, 0o777), PAX), None);
+        assert_eq!(node_trust(squashed, false, &parent(PAX, 0o755), PAX), None);
+        let ours = made(PAX, 1, false, FsOwners::Stored);
+        assert_eq!(node_trust(ours, true, &parent(PAX, 0o777), PAX), full);
     }
 
     #[test]

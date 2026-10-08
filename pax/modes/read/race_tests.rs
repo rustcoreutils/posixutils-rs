@@ -267,6 +267,39 @@ fn unverified_intermediate_directory_is_not_stamped() {
     );
 }
 
+/// A directory member made where its owner could not be verified gets no
+/// attributes -- and says so, rather than dropping them in silence.
+#[test]
+fn unverified_directory_member_is_diagnosed() {
+    use crate::archive::LinkSets;
+    use crate::modes::made::MadeTrust;
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut link_sets = LinkSets::default();
+    let entry = own_member("d", EntryType::Directory, 0o751);
+    let mut archive = Members(Vec::new().into_iter());
+    let options = preserve_everything();
+    let r = race_hook::with_dir_trust(MadeTrust::ParentOwnerOnly, || {
+        let pending = &mut pending;
+        extract_entry(
+            &mut archive,
+            &entry,
+            &options,
+            &mut link_sets,
+            &tree,
+            pending,
+        )
+    });
+
+    assert!(r.is_err(), "withholding the attributes went unreported");
+    assert!(tmp.path().join("d").is_dir());
+    pending.apply(&tree, &policy_of(&options));
+    // The member's mtime is 0: stamped, the directory would carry it.
+    let md = std::fs::metadata(tmp.path().join("d")).unwrap();
+    assert_ne!(md.mtime(), 0, "the unverified directory was stamped");
+}
+
 /// Without a swap, both kinds of directory take the archived mode, in a
 /// shared extraction directory as anywhere else; an existing directory is
 /// merged into and takes it too.

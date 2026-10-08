@@ -720,8 +720,9 @@ pub(crate) fn make_dir_at(
 
 /// The attributes decision for the directory `make_dir_at` has just made at
 /// `name`, its `(st_dev, st_ino)` read from a descriptor for it once that is
-/// checked to be the directory made (`verify_made_dir`); `Keep` when it can be
-/// trusted only so far, and so is not to be given the member's attributes. One
+/// checked to be the directory made (`verify_made_dir`); `Withheld` when it
+/// can be trusted only so far, and so is not to be given the member's
+/// attributes. One
 /// found in its place is remembered in `tree`, so that no later member takes
 /// it for a pre-existing directory either.
 fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<DirAttrs> {
@@ -735,7 +736,7 @@ fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<
     };
     match trust {
         MadeTrust::Full => Ok(DirAttrs::Apply(file_id(&st))),
-        MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Keep),
+        MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Withheld(file_id(&st))),
     }
 }
 

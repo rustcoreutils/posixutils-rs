@@ -51,6 +51,15 @@ utility below:
 
 ## Extensions by utility
 
+### ar
+
+ * The key may be written without its leading `-`, in the traditional form
+   Makefiles, libtool and automake's archiver probe use: `ar cr lib.a x.o`
+   means `ar -cr lib.a x.o`.
+ * `-s` is accepted with `-r` and `-q` (`ar rcs`), where POSIX allows it only
+   with `-p`, `-t` and `-x`.  It changes nothing: `ar` writes the symbol table
+   whenever it writes the archive.
+
 ### at
 
  * `AT_ALLOW`, `AT_DENY` — override the `at.allow` / `at.deny` pathnames.

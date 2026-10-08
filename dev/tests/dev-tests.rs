@@ -528,6 +528,38 @@ fn test_ar_index_lists_only_global_symbols() {
     assert_eq!(index, ["shown"]);
 }
 
+/// Run ar with `args`, asserting success and returning its stdout.
+fn ar_ok(args: &[&std::ffi::OsStr]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(args)
+        .output()
+        .expect("ar");
+    assert!(
+        out.status.success(),
+        "ar {:?}: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+// The traditional key form without a leading '-', as Makefiles, libtool and
+// automake's archiver-interface probe write it: `ar cr`, `ar cq`, `ar rcs`,
+// `ar cru`, `ar t`.
+#[test]
+fn test_ar_dashless_key() {
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let lib1 = std::path::Path::new("tests/ar/lib1.o").as_os_str();
+    let lib4 = std::path::Path::new("tests/ar/lib4.o").as_os_str();
+    for key in ["cr", "cq", "rcs", "cru"] {
+        let arc = dir.path().join(format!("{key}.a"));
+        let arc = arc.as_os_str();
+        ar_ok(&[key.as_ref(), arc, lib1, lib4]);
+        assert_eq!(ar_ok(&["t".as_ref(), arc]), "lib1.o\nlib4.o\n", "{key}");
+        assert_eq!(ar_ok(&["-t".as_ref(), arc]), "lib1.o\nlib4.o\n", "{key}");
+    }
+}
+
 #[test]
 fn test_strip_stripped_elf_is_valid_elf() {
     let stripped = strip_file(

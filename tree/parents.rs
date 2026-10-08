@@ -88,8 +88,16 @@ fn make_parents(
     let mut own = Vec::new();
     let target_c = cstring(target.as_os_str().as_bytes())?;
     let mut dest_dir = Rc::new(open_dir_at(libc::AT_FDCWD, &target_c, 0)?);
-    let anchor = ChainTrust::named(target, &dest_dir)?;
-    let mut trust = anchor.hands.clone();
+    // How the target was reached matters only to a mode or owner preserved (-p).
+    let anchor = if preserve {
+        Some(ChainTrust::named(target, &dest_dir)?)
+    } else {
+        None
+    };
+    let mut trust = match &anchor {
+        Some(anchor) => anchor.hands.clone(),
+        None => ChainTrust::anchor(&dest_dir)?,
+    };
     let mut held = vec![Rc::clone(&dest_dir)];
     let Some(parent) = source.parent() else {
         return Ok(Walked {
@@ -213,8 +221,8 @@ struct Walked {
     /// Every directory on the way, the target first and last the one the copy itself goes in,
     /// held while the copy may ask for `trust`.
     held: Vec<Rc<File>>,
-    /// The target as the user named it (`ChainTrust::named`), held likewise.
-    anchor: NamedAnchor,
+    /// The target as the user named it (`ChainTrust::named`), held likewise; under -p only.
+    anchor: Option<NamedAnchor>,
     /// The trust the last directory hands the directories the copy finds in it.
     trust: ChainTrust,
 }

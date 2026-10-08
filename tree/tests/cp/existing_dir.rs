@@ -447,6 +447,26 @@ fn cp_pr_trusts_no_directory_reached_through_a_link_others_could_plant() {
     }
 }
 
+/// The link need not be the last component: one in the middle of the destination's path, or
+/// one a `..` climbs back out of, leads just as far from where the user pointed.
+#[test]
+fn cp_pr_trusts_no_directory_reached_through_a_link_anywhere_in_the_destination() {
+    let temp = link_scenario(0o777, 0o755);
+    let home = temp.path().join("home");
+    with_private_dir(&home.join("sub"), 0o755, "src");
+    std::os::unix::fs::symlink("../home/sub", temp.path().join("open/e")).unwrap();
+    for (destination, found) in [("open/d/sub", "home/sub/src"), ("open/e/..", "home/src")] {
+        let out = cp(temp.path(), &["-pR", "src", destination]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let found = temp.path().join(found);
+        assert_eq!(out.status.code(), Some(1), "{destination}: {stderr}");
+        assert!(stderr.contains(DIAGNOSTIC), "{destination}: {stderr}");
+        assert_eq!(mode_of(&found), 0o700, "{destination}: opened up");
+        assert_eq!(fs::read_to_string(found.join("f")).unwrap(), "data\n");
+    }
+    set_mode(&temp.path().join("open"), 0o755);
+}
+
 /// The same for the destination itself, copied into (`src/.`): named through a link in a
 /// directory others can write, it is the directory found, and keeps everything under -p.
 #[test]

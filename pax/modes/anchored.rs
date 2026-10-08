@@ -188,8 +188,8 @@ pub(crate) struct DirTree {
     /// The trust the anchor hands the directories found in it: the root of
     /// the trust every walk carries down (`ChainTrust`).
     root_trust: ChainTrust,
-    /// The anchor as the caller named it, held while `root_trust` may be asked.
-    _named: NamedAnchor,
+    /// The anchor as the user named it, held while `root_trust` may be asked (`open_dest`).
+    _named: Option<NamedAnchor>,
     /// `(st_dev, st_ino)` of the directories this run created only to hold a
     /// member below them, each with the member path (`MemberPath::key`) it
     /// was made at. Such a directory is not a pre-existing file: a member
@@ -225,8 +225,16 @@ impl DirTree {
         Self::open_path(Path::new("."))
     }
 
-    /// Anchor at a directory named by the caller, for copy mode's destination.
+    /// Anchor at a directory named by the caller, trusted as named.
     pub(crate) fn open_path(path: &Path) -> PaxResult<Self> {
+        Self::open_dest(path, false)
+    }
+
+    /// Anchor at copy mode's destination directory, named by the user as `path`. When a mode
+    /// or owner is to be preserved (`preserving`), how `path` reaches it matters: through a
+    /// symbolic link in a directory others can write, it is wherever the link's owner chose,
+    /// and trusts nothing (`ChainTrust::named`).
+    pub(crate) fn open_dest(path: &Path, preserving: bool) -> PaxResult<Self> {
         let c = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
         let fd = unsafe {
@@ -240,11 +248,16 @@ impl DirTree {
             return Err(std::io::Error::last_os_error().into());
         }
         let root = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
-        // Named through a symbolic link in a directory others can write, the anchor is
-        // wherever the link's owner chose, and trusts nothing (`ChainTrust::named`).
-        let named = ChainTrust::named(path, &root)?;
+        let named = if preserving {
+            Some(ChainTrust::named(path, &root)?)
+        } else {
+            None
+        };
         Ok(DirTree {
-            root_trust: named.hands.clone(),
+            root_trust: match &named {
+                Some(named) => named.hands.clone(),
+                None => ChainTrust::anchor(&root)?,
+            },
             _named: named,
             root,
             chain: RefCell::new(Chain::default()),

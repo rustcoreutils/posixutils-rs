@@ -21,7 +21,7 @@
 use gettextrs::gettext;
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io;
@@ -252,8 +252,93 @@ pub struct NamedAnchor {
     /// the link, which the named directory is found in; `None` where the user named the
     /// directory itself.
     through_link: Option<ChainTrust>,
-    /// The directory holding the link, held while either trust may be asked.
-    _holder: Option<Rc<OwnedFd>>,
+    /// The directories holding the links followed, held while either trust may be asked.
+    _holders: Vec<Rc<OwnedFd>>,
+}
+
+/// The most symbolic links one named path may follow: Linux's own limit before ELOOP.
+const MAX_LINKS: usize = 40;
+
+/// One step of resolving a path (`link_holders`).
+enum Step {
+    /// Back to `/` (an absolute path, or link target).
+    Root,
+    /// `..`: back to the directory the walk came from.
+    Up,
+    /// An entry of the directory the walk is in.
+    Name(CString),
+}
+
+/// The steps of `path`, last first, to be popped.
+fn steps_of(path: &Path) -> Option<Vec<Step>> {
+    let mut steps = Vec::new();
+    for component in path.components() {
+        steps.push(match component {
+            Component::RootDir => Step::Root,
+            Component::ParentDir => Step::Up,
+            Component::Normal(name) => Step::Name(CString::new(name.as_bytes()).ok()?),
+            Component::CurDir | Component::Prefix(_) => continue,
+        });
+    }
+    steps.reverse();
+    Some(steps)
+}
+
+/// Resolve `path` as the kernel would, but one component at a time from held descriptors --
+/// each directory opened `O_NOFOLLOW` in the one before it, so the walk holds every directory
+/// it passes through and `..` goes back to the one it came from -- and say which directories
+/// held the symbolic links it followed, in order: a link's target is resolved the same way,
+/// from the directory holding it. `None` when `path` cannot be resolved so (a missing
+/// component, more than `MAX_LINKS` links, an unreadable link), or does not reach the directory
+/// open on `dir`.
+fn link_holders(path: &Path, dir: RawFd) -> Option<Vec<Rc<OwnedFd>>> {
+    let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let open = |at: RawFd, name: &CStr, extra: libc::c_int| {
+        let fd = unsafe { libc::openat(at, name.as_ptr(), flags | extra) };
+        (fd >= 0).then(|| Rc::new(unsafe { OwnedFd::from_raw_fd(fd) }))
+    };
+    let mut steps = steps_of(path)?;
+    let mut walked = vec![open(libc::AT_FDCWD, c".", 0)?];
+    let mut holders = Vec::new();
+    while let Some(step) = steps.pop() {
+        let here = walked.last()?.as_raw_fd();
+        match step {
+            Step::Root => walked = vec![open(libc::AT_FDCWD, c"/", 0)?],
+            Step::Up if walked.len() > 1 => {
+                walked.pop();
+            }
+            Step::Up => walked = vec![open(here, c"..", 0)?],
+            Step::Name(name) => {
+                let st = lstat_at(here, &name).ok()?;
+                if st.st_mode & libc::S_IFMT != libc::S_IFLNK {
+                    walked.push(open(here, &name, libc::O_NOFOLLOW)?);
+                    continue;
+                }
+                if holders.len() == MAX_LINKS {
+                    return None;
+                }
+                holders.push(Rc::clone(walked.last()?));
+                let target = read_link_at(here, &name)?;
+                // Popped first: the target's steps, then the rest of the path.
+                steps.extend(steps_of(Path::new(OsStr::from_bytes(&target)))?);
+            }
+        }
+    }
+    let reached = fstat(walked.last()?.as_raw_fd()).ok()?;
+    let opened = fstat(dir).ok()?;
+    ((reached.st_dev, reached.st_ino) == (opened.st_dev, opened.st_ino)).then_some(holders)
+}
+
+/// The target of the symbolic link `name` in `dirfd`; `None` when it cannot be read whole.
+fn read_link_at(dirfd: RawFd, name: &CStr) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let n = unsafe { libc::readlinkat(dirfd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    let n = usize::try_from(n).ok()?;
+    if n >= buf.len() {
+        return None;
+    }
+    buf.truncate(n);
+    Some(buf)
 }
 
 impl NamedAnchor {
@@ -353,63 +438,39 @@ impl ChainTrust {
     /// The anchor for a directory the user named as `path`, opened (following links, as named)
     /// and held as `dir`.
     ///
-    /// The user named the directory, and it is trusted as `anchor` -- unless the last component
-    /// of `path` is a symbolic link. Then the directory is wherever the link's owner chose, and
-    /// it is as if found in the directory holding the link: it may itself be given what a
-    /// directory found there may (`NamedAnchor::named_dir`), and hands its entries only what it
-    /// was handed and its own (`found`). A link planted in a directory others can write leads
-    /// nowhere the user vouched for. Its last component is read in its parent (opened for
-    /// search only, as named) without following it; where it is no link, it must be the very
-    /// directory opened. Anything that cannot be read so, or is not, trusts nothing.
+    /// The user named the directory, and where `path` reaches it through no symbolic link it is
+    /// trusted as `anchor`. A link, anywhere on the way, leads wherever its owner chose: the
+    /// directory is then as if found in the directories holding the links followed, and may
+    /// itself be given only what a directory found in all of them may
+    /// (`NamedAnchor::named_dir`), handing its entries no more than that and its own (`found`).
+    /// A link planted in a directory others can write leads nowhere the user vouched for.
+    ///
+    /// `path` is resolved here one component at a time from held descriptors
+    /// (`link_holders`), and must reach the very directory opened; anything that cannot be
+    /// resolved so, or is not, trusts nothing.
     pub fn named<T: AsRawFd + 'static>(path: &Path, dir: &Rc<T>) -> io::Result<NamedAnchor> {
-        let unlocated = || NamedAnchor {
-            hands: Self::unlocated(),
-            through_link: Some(Self::unlocated()),
-            _holder: None,
+        let Some(holders) = link_holders(path, dir.as_raw_fd()) else {
+            return Ok(NamedAnchor {
+                hands: Self::unlocated(),
+                through_link: Some(Self::unlocated()),
+                _holders: Vec::new(),
+            });
         };
-        let Some(Component::Normal(name)) = path.components().next_back() else {
-            // `/`, `.` or `..`: none can be a link.
+        let Some((first, rest)) = holders.split_first() else {
             return Ok(NamedAnchor {
                 hands: Self::anchor(dir)?,
                 through_link: None,
-                _holder: None,
+                _holders: holders,
             });
         };
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let (Ok(name), Ok(parent)) = (
-            CString::new(name.as_bytes()),
-            CString::new(parent.as_os_str().as_bytes()),
-        ) else {
-            return Ok(unlocated());
-        };
-        let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-        let holder = unsafe { libc::openat(libc::AT_FDCWD, parent.as_ptr(), flags) };
-        if holder < 0 {
-            return Ok(unlocated());
-        }
-        let holder = Rc::new(unsafe { OwnedFd::from_raw_fd(holder) });
-        let Ok(st) = lstat_at(holder.as_raw_fd(), &name) else {
-            return Ok(unlocated());
-        };
-        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            let in_holder = Self::anchor(&holder)?;
-            return Ok(NamedAnchor {
-                hands: in_holder.found(dir)?,
-                through_link: Some(in_holder),
-                _holder: Some(holder),
-            });
-        }
-        let opened = fstat(dir.as_raw_fd())?;
-        if (st.st_dev, st.st_ino) != (opened.st_dev, opened.st_ino) {
-            return Ok(unlocated());
+        let mut in_holders = Self::anchor(first)?;
+        for holder in rest {
+            in_holders = in_holders.found(holder)?;
         }
         Ok(NamedAnchor {
-            hands: Self::anchor(dir)?,
-            through_link: None,
-            _holder: None,
+            hands: in_holders.found(dir)?,
+            through_link: Some(in_holders),
+            _holders: holders,
         })
     }
 
@@ -965,6 +1026,7 @@ mod tests {
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Path;
     use std::rc::Rc;
 
     /// A parent directory of `uid` with permission bits `mode`.
@@ -1191,6 +1253,87 @@ mod tests {
         let named = ChainTrust::named(&home, &held).unwrap();
         assert_eq!(named.named_dir(mode), FoundDir::LeaveAlone);
         assert_eq!(named.hands.found_dir(mode), FoundDir::LeaveAlone);
+    }
+
+    /// A link anywhere in a named path -- in its last component, in one before it, met again
+    /// inside another link's target, or left by a `..` -- leads wherever its owner chose: the
+    /// directory reached is trusted only where every directory holding a link the path follows
+    /// is the user's alone. A path through no link is trusted as named.
+    #[test]
+    fn a_named_path_is_trusted_only_through_links_the_user_vouches_for() {
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        let root = tmp.path();
+        // home (0755) / sub, x; open (0777) / d -> ../home/sub, m -> ../home;
+        // safe (0755) / l -> ../home, e -> ../open/m; loop (0755) / a -> b, b -> a.
+        for dir in ["home/sub", "home/x", "open", "safe", "loop"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let link = |target: &str, at: &str| std::os::unix::fs::symlink(target, root.join(at));
+        link("../home/sub", "open/d").unwrap();
+        link("../home", "open/m").unwrap();
+        link("../home", "safe/l").unwrap();
+        link("../open/m", "safe/e").unwrap();
+        link("b", "loop/a").unwrap();
+        link("a", "loop/b").unwrap();
+        for (dir, mode) in [
+            ("home", 0o755),
+            ("open", 0o777),
+            ("safe", 0o755),
+            ("loop", 0o755),
+        ] {
+            std::fs::set_permissions(root.join(dir), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        let mode = Preserve {
+            mode: true,
+            owner: false,
+        };
+        let held = |path: &Path| Rc::new(std::fs::File::open(path).unwrap());
+        let judge = |named: &Path, opened: &Path| {
+            let dir = held(opened);
+            let named = ChainTrust::named(named, &dir).unwrap();
+            (named.named_dir(mode), named.hands.found_dir(mode))
+        };
+        let trusted = (FoundDir::AsRequested, FoundDir::AsRequested);
+        let untrusted = (FoundDir::LeaveAlone, FoundDir::LeaveAlone);
+        let home = root.join("home");
+        let cases = [
+            // No link: as named.
+            (root.join("home"), home.clone(), trusted),
+            (root.join("home/sub/.."), home.clone(), trusted),
+            (root.join("home/./x"), home.join("x"), trusted),
+            // A link planted in the last component, a middle one, or left by `..`.
+            (root.join("open/m"), home.clone(), untrusted),
+            (root.join("open/m/"), home.clone(), untrusted),
+            (root.join("open/m/x"), home.join("x"), untrusted),
+            (root.join("open/d/.."), home.clone(), untrusted),
+            // A link the user's own directory holds, alone or leading to one planted.
+            (root.join("safe/l"), home.clone(), trusted),
+            (root.join("safe/l/x"), home.join("x"), trusted),
+            (root.join("safe/e"), home.clone(), untrusted),
+            (root.join("safe/e/x"), home.join("x"), untrusted),
+            // A loop of links, and a path that is not the directory opened.
+            (root.join("loop/a"), home.clone(), untrusted),
+            (root.join("home/x"), home.clone(), untrusted),
+        ];
+        for (named, opened, expected) in cases {
+            assert_eq!(judge(&named, &opened), expected, "{named:?}");
+        }
+        // `/`, `.` and a relative name with no slash (this crate's `src`): no link, as named.
+        assert_eq!(
+            judge(Path::new("/"), Path::new("/")).0,
+            FoundDir::AsRequested
+        );
+        assert_eq!(
+            judge(Path::new("."), Path::new(".")).0,
+            FoundDir::AsRequested
+        );
+        assert_eq!(
+            judge(Path::new("src"), Path::new("src")).0,
+            FoundDir::AsRequested
+        );
+        std::fs::set_permissions(root.join("open"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 
     /// A link holds its directory's descriptor weakly. A group-writable one, whose group needs

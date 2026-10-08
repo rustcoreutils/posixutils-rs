@@ -386,23 +386,24 @@ fn test_a_private_chain_still_stamps_under_pe() {
 /// the link is the user's own, and the directory is stamped.
 #[test]
 fn test_copy_trusts_no_destination_reached_through_a_link_others_could_plant() {
-    for (open_mode, code, mode) in [(0o777, 1, 0o700), (0o755, 0, 0o755)] {
-        let temp = TempDir::new().unwrap();
-        let src = source_tree(&temp);
-        let home = dest_with_private_d(&temp, 0o755);
-        let open = temp.path().join("open");
-        fs::create_dir(&open).unwrap();
-        std::os::unix::fs::symlink(&home, open.join("l")).unwrap();
-        fs::set_permissions(&open, fs::Permissions::from_mode(open_mode)).unwrap();
-        let out = pax(&src, &["-rw", "-p", "e", "d", "../open/l/"]);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(code),
-            "open {open_mode:o}: {stderr}"
-        );
-        assert_eq!(mode_of(&home.join("d")), mode, "open {open_mode:o}");
-        assert!(home.join("d/f").exists(), "open {open_mode:o}");
+    // The link as the last component, or in the middle (`m -> ..`, then `dest`).
+    for dest in ["../open/l/", "../open/m/dest"] {
+        for (open_mode, code, mode) in [(0o777, 1, 0o700), (0o755, 0, 0o755)] {
+            let temp = TempDir::new().unwrap();
+            let src = source_tree(&temp);
+            let home = dest_with_private_d(&temp, 0o755);
+            let open = temp.path().join("open");
+            fs::create_dir(&open).unwrap();
+            std::os::unix::fs::symlink(&home, open.join("l")).unwrap();
+            std::os::unix::fs::symlink("..", open.join("m")).unwrap();
+            fs::set_permissions(&open, fs::Permissions::from_mode(open_mode)).unwrap();
+            let out = pax(&src, &["-rw", "-p", "e", "d", dest]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+            let case = format!("{dest} in {open_mode:o}");
+            assert_eq!(out.status.code(), Some(code), "{case}: {stderr}");
+            assert_eq!(mode_of(&home.join("d")), mode, "{case}");
+            assert!(home.join("d/f").exists(), "{case}");
+        }
     }
 }

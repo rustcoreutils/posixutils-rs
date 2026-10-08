@@ -100,7 +100,8 @@ pub fn copy_files(
     // copy as an archive round-trip, so the destination gets the same treatment
     // extraction gives it: each component of a member name is opened with
     // O_NOFOLLOW, and the leaf is created fresh rather than written through.
-    let tree = DirTree::open_path(dest_dir)?;
+    let preserving = options.preserve_perms || options.preserve_owner;
+    let tree = DirTree::open_dest(dest_dir, preserving)?;
 
     let walk = CopyWalk {
         tree: &tree,

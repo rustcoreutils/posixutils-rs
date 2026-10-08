@@ -73,9 +73,9 @@ impl User {
 /// Every user in the password database, through `setpwent`/`getpwent`/`endpwent`.
 ///
 /// An error while reading is an error, never a shorter list: `getpwent` returns NULL both at
-/// the end and on a failure, which only `errno` tells apart -- glibc leaves it 0 at the end,
-/// and any value at all, ENOENT included, is taken for a failure. The enumeration is the
-/// process's one, so callers here take turns.
+/// the end and on a failure, which only `errno` tells apart (ENOENT, which glibc's NSS leaves
+/// at the end, counts as the end). The enumeration is the process's one, so callers here take
+/// turns.
 pub fn load() -> io::Result<Vec<User>> {
     static ENUMERATING: Mutex<()> = Mutex::new(());
     let _turn = ENUMERATING.lock().unwrap_or_else(|e| e.into_inner());
@@ -88,7 +88,7 @@ pub fn load() -> io::Result<Vec<User>> {
             let passwd = libc::getpwent();
             if passwd.is_null() {
                 let e = errno::errno().0;
-                if e != 0 {
+                if e != 0 && e != libc::ENOENT {
                     result = Err(io::Error::from_raw_os_error(e));
                 }
                 break;

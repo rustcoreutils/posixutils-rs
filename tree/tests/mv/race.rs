@@ -314,6 +314,60 @@ fn mv_leaves_source_entries_added_or_changed_after_the_copy() {
     let _ = fs::remove_dir_all(&other);
 }
 
+/// A FIFO is copied as a new FIFO, not by its data, so I/O through the source FIFO after the
+/// copy (which moves its modification time) changes nothing that was copied: it is removed with
+/// the rest, and the move succeeds.
+#[test]
+fn mv_removes_a_fifo_used_after_it_was_copied() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Some(other) = other_fs("fifo_used") else {
+        return;
+    };
+    let base = scratch("fifo_used");
+    for sub in ["s1", "s2"] {
+        fs::create_dir_all(base.join("x").join(sub)).unwrap();
+        fs::write(base.join("x").join(sub).join("f"), sub).unwrap();
+        let fifo =
+            std::ffi::CString::new(base.join("x").join(sub).join("p").as_os_str().as_bytes())
+                .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    }
+    let leased = [base.join("x/s1/f"), base.join("x/s2/f")];
+
+    let (status, stderr) = mv_paused_on_last(&base, &[Path::new("x"), &other], &leased, |last| {
+        // The other subdirectory has been walked, its FIFO copied.
+        let walked = if last.starts_with(base.join("x/s1")) {
+            "s2"
+        } else {
+            "s1"
+        };
+        let mut fifo = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(base.join("x").join(walked).join("p"))
+            .unwrap();
+        // Coarse timestamps: make sure the write lands in a later tick than the copy's stat.
+        std::thread::sleep(Duration::from_millis(20));
+        fifo.write_all(b"!").unwrap();
+        let mut byte = [0u8; 1];
+        fifo.read_exact(&mut byte).unwrap();
+    });
+
+    assert_eq!(status, Some(0), "stderr: {stderr}");
+    assert!(!base.join("x").exists(), "the source was left");
+    for sub in ["s1", "s2"] {
+        let md = fs::symlink_metadata(other.join("x").join(sub).join("p")).unwrap();
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&md.file_type()));
+    }
+
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&other);
+}
+
 /// `f` and `g`, hard links to one file, with `y` between them; mv pauses while copying `y`.
 fn hard_links_around_y(base: &Path) {
     fs::write(base.join("f"), b"moved").unwrap();

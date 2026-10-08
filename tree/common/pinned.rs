@@ -230,17 +230,19 @@ fn open_lookup_dir(path: &CStr) -> io::Result<ftw::FileDescriptor> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct CopiedState {
     file_type: FileType,
-    /// Size and modification time, for a non-directory: a write after the copy read it changes
-    /// them. (A directory's change as entries are removed from it, and its entries are judged
-    /// one by one.)
+    /// Size and modification time, for a regular file or symbolic link, whose contents the copy
+    /// duplicated: a write after the copy read it changes them. Not for a directory (they
+    /// change as entries are removed from it, and its entries are judged one by one), nor for a
+    /// FIFO, socket or device, which is recreated rather than read, and whose modification time
+    /// any I/O through it moves.
     contents: Option<(u64, i64, i64)>,
 }
 
 impl CopiedState {
     fn of(md: &ftw::Metadata) -> Self {
         let file_type = md.file_type();
-        let contents =
-            (file_type != FileType::Directory).then(|| (md.size(), md.mtime(), md.mtime_nsec()));
+        let has_contents = matches!(file_type, FileType::RegularFile | FileType::SymbolicLink);
+        let contents = has_contents.then(|| (md.size(), md.mtime(), md.mtime_nsec()));
         CopiedState {
             file_type,
             contents,

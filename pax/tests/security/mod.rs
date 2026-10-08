@@ -17,6 +17,7 @@
 
 #[cfg(target_os = "linux")]
 mod lease;
+mod umask;
 
 use crate::common::*;
 use plib::tmp::TempDir;

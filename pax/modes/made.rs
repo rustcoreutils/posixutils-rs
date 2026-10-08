@@ -297,14 +297,48 @@ pub(crate) fn verify_made_dir(
     if !others_can_rename(&parent_st, euid) {
         return Ok(Some(MadeTrust::Full));
     }
-    let made = MadeObject::of(&fstat(dir)?, fs_owners(dir));
+    let st = fstat(dir)?;
+    let made = MadeObject::of(&st, fs_owners(dir));
     let Some(trust) = made_by_us(made, parent_st.st_uid, euid) else {
         return Ok(None);
     };
-    if !made.is_dir || !ftw::is_empty_dir_fd(dir.as_raw_fd())? {
+    if !made.is_dir || !is_empty_made_dir(dir, &st, euid)? {
         return Ok(None);
     }
     Ok(Some(trust))
+}
+
+/// Whether the directory open on `dir`, with `st`, lists nothing but `.` and
+/// `..`.
+///
+/// Reading it takes the owner's read and search permission, which a umask
+/// (0400, say) may have withheld from a directory pax has just made. When pax
+/// owns it they are lent for the check, through the descriptor, and the mode
+/// is put back.
+fn is_empty_made_dir(dir: BorrowedFd<'_>, st: &libc::stat, euid: u32) -> io::Result<bool> {
+    let mode = st.st_mode & 0o7777;
+    let lend = st.st_uid == euid && mode & 0o500 != 0o500;
+    if lend {
+        chmod_fd(dir, mode | 0o700)?;
+    }
+    let empty = ftw::is_empty_dir_fd(dir.as_raw_fd());
+    if lend {
+        chmod_fd(dir, mode)?;
+    }
+    empty
+}
+
+/// Set the mode of the file open on `fd`, which may be held for search only
+/// (`O_PATH` on Linux, where `fchmod` refuses it).
+#[cfg(target_os = "linux")]
+fn chmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> io::Result<()> {
+    linux::chmod_pinned(fd, mode)
+}
+
+/// Elsewhere a search-only descriptor (`O_SEARCH`) takes `fchmod`.
+#[cfg(not(target_os = "linux"))]
+fn chmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> io::Result<()> {
+    cvt(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
 }
 
 #[cfg(all(target_os = "linux", test))]

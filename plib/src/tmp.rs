@@ -474,18 +474,18 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         // Nothing useful to report from a destructor, and a directory that is
         // already gone is the outcome we wanted anyway.
-        if fs::remove_dir_all(&self.path).is_ok() {
-            return;
-        }
+        let removed = fs::remove_dir_all(&self.path);
         // A directory in the tree that its owner may not read, search or
         // write stops the removal: a test that takes the permissions away to
         // provoke an error and fails before giving them back would leak the
         // whole tree. Give them back to every directory and try once more.
         #[cfg(unix)]
-        {
+        if removed.is_err() {
             grant_owner_dir_access(&self.path);
             let _ = fs::remove_dir_all(&self.path);
         }
+        #[cfg(not(unix))]
+        let _ = removed;
     }
 }
 

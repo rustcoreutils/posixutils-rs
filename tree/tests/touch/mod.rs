@@ -284,3 +284,29 @@ fn test_touch_dangling_symlink_creates_target() {
     assert!(link_is_symlink);
     assert_eq!(m, Some(946_684_800));
 }
+
+/// A link whose target was made just before touch runs (a FIFO with no
+/// reader, a regular file with contents) names an existing file: touch gives
+/// it its times without waiting on the FIFO or emptying the file.
+#[test]
+fn test_touch_symlink_to_a_target_made_just_before() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = dir("test_touch_symlink_target_made_before");
+    let (fifo_link, fifo) = (format!("{d}/fifo_link"), format!("{d}/fifo"));
+    let (file_link, file) = (format!("{d}/file_link"), format!("{d}/file"));
+    std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+    std::os::unix::fs::symlink(&file, &file_link).unwrap();
+    let c = std::ffi::CString::new(Path::new(&fifo).as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    fs::write(&file, b"contents").unwrap();
+
+    let out = touch_bounded(&["-t", "200001010000", &fifo_link, &file_link]);
+    let (fifo_m, file_m) = (mtime_secs(&fifo), mtime_secs(&file));
+    let contents = fs::read(&file).unwrap();
+    fs::remove_dir_all(&d).unwrap();
+
+    let out = out.expect("touch hung on a FIFO");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!((fifo_m, file_m), (946_684_800, 946_684_800));
+    assert_eq!(contents, b"contents");
+}

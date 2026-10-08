@@ -221,9 +221,17 @@ fn not_found(
     match open_err.raw_os_error() {
         // A dangling symlink: the file does not exist, and POSIX creates it with creat(),
         // which follows the link and creates its target.
-        Some(libc::EEXIST) if is_symlink(path) => {
-            set_times_fd(&create_through_symlink(path)?, times)
-        }
+        Some(libc::EEXIST) if is_symlink(path) => match create_link_target(path)? {
+            LinkTarget::Created(fd) => set_times_fd(&fd, times),
+            // The target has appeared since: an existing file, given its times by name.
+            LinkTarget::Exists => set_times_path(path, times).map_err(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    not_found
+                } else {
+                    e
+                }
+            }),
+        },
         // The name existed when the create was tried and is gone now: POSIX would have created
         // the file, so try once more.
         Some(libc::EEXIST) => match create_new(path) {
@@ -263,17 +271,90 @@ fn is_symlink(path: &CStr) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|md| md.file_type().is_symlink())
 }
 
-/// Create the file a dangling symlink `path` names, as creat() does, following the link.
-/// Without `O_TRUNC` a file that has appeared there since is not emptied; `O_NONBLOCK` and
-/// `O_NOCTTY` keep the open from waiting on a FIFO or acquiring a terminal.
-fn create_through_symlink(path: &CStr) -> io::Result<OwnedFd> {
-    let flags =
-        libc::O_CREAT | libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-    let fd = unsafe { libc::open(path.as_ptr(), flags, 0o666 as libc::c_int) };
+/// What creating a dangling symlink's target came to.
+#[derive(Debug)]
+enum LinkTarget {
+    /// The target was created by this run, and is open on this descriptor.
+    Created(OwnedFd),
+    /// Something has the target's name now (or its last component is itself a symlink): it is
+    /// an existing file, never opened here.
+    Exists,
+}
+
+/// Create the file the symlink `link` names, as creat() does through a dangling link.
+///
+/// The link is read once, with `readlinkat` in its directory, and the target is created
+/// relative to that directory with `O_EXCL|O_NOFOLLOW`: if the link has been repointed since it
+/// was found dangling, or its target made, at a file or a device, nothing is opened, so no
+/// existing file is emptied and no device sees an open. Components of the target before the last
+/// are resolved as usual.
+fn create_link_target(link: &CStr) -> io::Result<LinkTarget> {
+    let (dir_path, name) = split_parent(link.to_bytes())?;
+    let dir = open_dir(&dir_path)?;
+    let target = read_link_at(&dir, &name)?;
+    let flags = libc::O_CREAT
+        | libc::O_EXCL
+        | libc::O_NOFOLLOW
+        | libc::O_WRONLY
+        | libc::O_NONBLOCK
+        | libc::O_NOCTTY
+        | libc::O_CLOEXEC;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            target.as_ptr(),
+            flags,
+            0o666 as libc::c_int,
+        )
+    };
+    if fd >= 0 {
+        return Ok(LinkTarget::Created(unsafe { OwnedFd::from_raw_fd(fd) }));
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EEXIST) | Some(libc::ELOOP) => Ok(LinkTarget::Exists),
+        _ => Err(err),
+    }
+}
+
+/// The directory part and the last component of `path`, which does not end in a slash.
+fn split_parent(path: &[u8]) -> io::Result<(CString, CString)> {
+    let (dir, name): (&[u8], &[u8]) = match path.iter().rposition(|&b| b == b'/') {
+        Some(0) => (b"/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (b".", path),
+    };
+    let to_c =
+        |b: &[u8]| CString::new(b).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e));
+    Ok((to_c(dir)?, to_c(name)?))
+}
+
+/// Open the directory `path` to work relative to it.
+fn open_dir(path: &CStr) -> io::Result<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The target of the symlink `name` in `dir`.
+fn read_link_at(dir: &OwnedFd, name: &CStr) -> io::Result<CString> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    let len = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if len < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(len as usize);
+    CString::new(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Set the times of the file open on `fd`, the one this run created.
@@ -320,4 +401,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::FileTypeExt;
+    use std::path::Path;
+
+    fn c(path: &Path) -> CString {
+        CString::new(path.as_os_str().as_bytes()).unwrap()
+    }
+
+    /// A dangling link's target is created, relative to the link's own directory.
+    #[test]
+    fn create_link_target_creates_a_relative_target() {
+        let dir = plib::tmp::tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink("target", &link).unwrap();
+
+        let made = create_link_target(&c(&link)).unwrap();
+
+        assert!(matches!(made, LinkTarget::Created(_)), "{made:?}");
+        assert!(fs::symlink_metadata(dir.path().join("target"))
+            .unwrap()
+            .is_file());
+    }
+
+    /// A target made since the link was found dangling is not opened: a
+    /// regular file keeps its contents.
+    #[test]
+    fn create_link_target_leaves_an_existing_file() {
+        let dir = plib::tmp::tempdir().unwrap();
+        let (link, target) = (dir.path().join("link"), dir.path().join("target"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        fs::write(&target, b"contents").unwrap();
+
+        let made = create_link_target(&c(&link)).unwrap();
+
+        assert!(matches!(made, LinkTarget::Exists), "{made:?}");
+        assert_eq!(fs::read(&target).unwrap(), b"contents");
+    }
+
+    /// A FIFO target with no reader is not opened, so it neither waits nor
+    /// fails with ENXIO.
+    #[test]
+    fn create_link_target_leaves_a_fifo() {
+        let dir = plib::tmp::tempdir().unwrap();
+        let (link, target) = (dir.path().join("link"), dir.path().join("fifo"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c(&target).as_ptr(), 0o600) }, 0);
+
+        let made = create_link_target(&c(&link)).unwrap();
+
+        assert!(matches!(made, LinkTarget::Exists), "{made:?}");
+        assert!(fs::symlink_metadata(&target).unwrap().file_type().is_fifo());
+    }
+
+    /// A target whose last component is itself a symlink is not followed.
+    #[test]
+    fn create_link_target_does_not_follow_a_second_link() {
+        let dir = plib::tmp::tempdir().unwrap();
+        let (link, middle, file) = (
+            dir.path().join("link"),
+            dir.path().join("middle"),
+            dir.path().join("file"),
+        );
+        std::os::unix::fs::symlink(&middle, &link).unwrap();
+        std::os::unix::fs::symlink(&file, &middle).unwrap();
+        fs::write(&file, b"contents").unwrap();
+
+        let made = create_link_target(&c(&link)).unwrap();
+
+        assert!(matches!(made, LinkTarget::Exists), "{made:?}");
+        assert_eq!(fs::read(&file).unwrap(), b"contents");
+    }
+
+    #[test]
+    fn split_parent_cases() {
+        let split = |p: &[u8]| {
+            let (d, n) = split_parent(p).unwrap();
+            (d.into_bytes(), n.into_bytes())
+        };
+        assert_eq!(split(b"a"), (b".".to_vec(), b"a".to_vec()));
+        assert_eq!(split(b"/a"), (b"/".to_vec(), b"a".to_vec()));
+        assert_eq!(split(b"x/y/a"), (b"x/y".to_vec(), b"a".to_vec()));
+    }
 }

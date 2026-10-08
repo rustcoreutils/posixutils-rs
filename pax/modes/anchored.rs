@@ -873,16 +873,11 @@ pub(crate) fn open_source_file(
     follow: bool,
     expected: (u64, u64),
 ) -> std::io::Result<File> {
-    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
     if !follow {
         flags |= libc::O_NOFOLLOW;
     }
-
-    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file = open_regular_guarded(dir_fd, name, flags)?;
 
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(file.as_raw_fd(), &mut st) } != 0 {
@@ -909,6 +904,112 @@ pub(crate) fn open_source_file(
     }
 
     Ok(file)
+}
+
+/// `openat(dir_fd, name, flags)` for a file expected to be regular, with
+/// `O_NONBLOCK` added so that a FIFO swapped in for it cannot hold the open.
+///
+/// A regular file under a lease (a Samba oplock, a knfsd delegation) fails a
+/// non-blocking open with EAGAIN/EWOULDBLOCK instead of waiting for the lease
+/// to break, so that open is retried blocking (`reopen_regular_blocking`) --
+/// without letting the retry reach a FIFO swapped in after the first attempt.
+/// The caller's identity and type check follows either open.
+fn open_regular_guarded(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+) -> std::io::Result<File> {
+    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags | libc::O_NONBLOCK) };
+    if fd >= 0 {
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    let err = std::io::Error::last_os_error();
+    let leased =
+        matches!(err.raw_os_error(), Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK);
+    if !leased {
+        return Err(err);
+    }
+    reopen_regular_blocking(dir_fd, name, flags)
+}
+
+/// The blocking retry of `open_regular_guarded`, which may wait for a lease to
+/// break and so must only ever open a regular file.
+///
+/// On Linux the name is pinned with `O_PATH` (plus the caller's `O_NOFOLLOW`),
+/// the pinned inode must be a regular file, and the blocking open is of that
+/// inode itself, through `self/fd/N` in a `/proc` verified to be procfs: no
+/// name is resolved again, so nothing swapped in after the pin is reached.
+#[cfg(target_os = "linux")]
+fn reopen_regular_blocking(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+) -> std::io::Result<File> {
+    let Ok(proc_dir) = made::procfs_dir() else {
+        return reopen_regular_by_name(dir_fd, name, flags);
+    };
+    let pin_flags = libc::O_PATH | libc::O_CLOEXEC | (flags & libc::O_NOFOLLOW);
+    let pin = unsafe { libc::openat(dir_fd, name.as_ptr(), pin_flags) };
+    if pin < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pin = unsafe { OwnedFd::from_raw_fd(pin) };
+    if !fstat(pin.as_fd()).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG) {
+        return Err(std::io::Error::from_raw_os_error(libc::ENXIO));
+    }
+    // The magic link is followed to the pinned inode: `O_NOFOLLOW` would
+    // refuse it.
+    let pinned = made::proc_fd_name(pin.as_raw_fd());
+    let fd = unsafe {
+        libc::openat(
+            proc_dir.as_raw_fd(),
+            pinned.as_ptr(),
+            flags & !libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Elsewhere, and without procfs, there is no pinning an inode without
+/// opening it, so the name is `fstatat`'ed -- following a symbolic link
+/// exactly when the caller's flags do -- and must be a regular file just
+/// before the blocking open. The residual is a FIFO swapped in between those
+/// two calls, which can hold the open until a writer comes; it cannot make
+/// pax read anything else, since the caller's identity check still refuses
+/// the descriptor.
+#[cfg(not(target_os = "linux"))]
+fn reopen_regular_blocking(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+) -> std::io::Result<File> {
+    reopen_regular_by_name(dir_fd, name, flags)
+}
+
+/// The by-name half of `reopen_regular_blocking`; see the residual there.
+fn reopen_regular_by_name(
+    dir_fd: libc::c_int,
+    name: &CStr,
+    flags: libc::c_int,
+) -> std::io::Result<File> {
+    let stat_flags = if flags & libc::O_NOFOLLOW != 0 {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    match fstatat(dir_fd, name, stat_flags) {
+        Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFREG => {}
+        Some(_) => return Err(std::io::Error::from_raw_os_error(libc::ENXIO)),
+        None => return Err(std::io::Error::last_os_error()),
+    }
+    let fd = unsafe { libc::openat(dir_fd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 /// `-t`: put back the access time that reading a file disturbed.

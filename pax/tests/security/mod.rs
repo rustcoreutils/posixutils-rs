@@ -15,6 +15,9 @@
 //! that makes the window unwinnable (O_EXCL, O_NOFOLLOW, linkat flags=0) is
 //! reviewed, not tested.
 
+#[cfg(target_os = "linux")]
+mod lease;
+
 use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs;

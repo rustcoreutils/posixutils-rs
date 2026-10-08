@@ -257,7 +257,7 @@ pub(crate) fn verify_made_dir(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::MadeNode;
+pub(crate) use linux::{proc_fd_name, procfs_dir, MadeNode};
 #[cfg(not(target_os = "linux"))]
 pub(crate) use other::MadeNode;
 

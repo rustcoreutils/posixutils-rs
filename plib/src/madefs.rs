@@ -242,6 +242,14 @@ impl ChainTrust {
         })
     }
 
+    /// The trust handed where the caller cannot tell which directory a directory found is in --
+    /// reached through a symbolic link, say, and so in none it can judge: none.
+    pub fn unlocated() -> Self {
+        ChainTrust {
+            entries_safe: false,
+        }
+    }
+
     /// The trust a directory found existing, open on `dir_fd`, in a directory that handed it
     /// `self`, hands its own entries.
     pub fn found(self, dir_fd: RawFd) -> io::Result<Self> {
@@ -604,6 +612,13 @@ mod tests {
         let made_x = ChainTrust::made(fd("g/x").as_raw_fd()).unwrap();
         assert_eq!(made_x.found_dir(mode), FoundDir::AsRequested);
         assert_eq!(made_x.found_dir(owner), FoundDir::AsRequested);
+        // A directory found in no directory the caller can locate takes nothing asked for, and
+        // hands that on.
+        let unlocated = ChainTrust::unlocated();
+        assert_eq!(unlocated.found_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(unlocated.found_dir(none), FoundDir::TimesOnly);
+        let below = unlocated.found(fd("").as_raw_fd()).unwrap();
+        assert_eq!(below.found_dir(mode), FoundDir::LeaveAlone);
     }
 
     /// Only the parent's owner, or anyone allowed to write a parent that is not sticky, can

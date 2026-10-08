@@ -233,8 +233,7 @@ pub enum OperandTrust {
     Named,
     /// The directory the operand is made in is the anchor: `dir` for `cp -R src dir` finding
     /// `dir/src`, and the directory `new` was to be made in for `cp -R src new` finding `new`
-    /// there after all. It is read, only once the operand is found, from the found directory's
-    /// own `..`, which names wherever that directory actually is.
+    /// there after all. It is located only once the operand is found (`parent_anchor`).
     Parent,
     /// Handed down the directories walked from the anchor to the one the operand is made in
     /// (`cp --parents`).
@@ -305,22 +304,63 @@ fn as_asked(requested: Preserve) -> FoundDir {
     }
 }
 
-/// The directory that the directory open on `fd` is in, through its own `..`: wherever it
-/// actually is, never by name. Opened for search only, as copying into `fd` needs no more.
-fn open_parent_dir(fd: &ftw::FileDescriptor, target: &Path) -> io::Result<ftw::FileDescriptor> {
-    let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    ftw::FileDescriptor::open_at(fd, c"..", flags).map_err(|e| {
-        io::Error::other(gettext!(
-            "cannot open the directory holding '{}': {}",
-            target.display(),
-            error_string(&e)
-        ))
-    })
+/// The trust the anchor of `OperandTrust::Parent` hands the operand `target`, found existing as
+/// the directory with identity `id`: the directory `target` names it in, when it is there under
+/// its own name.
+///
+/// That directory is `parent`, held, or, when `parent` is the working directory the operand is
+/// resolved from, `target` less its last component, opened for search only. The operand's own
+/// name must then be the very directory found -- read with `AT_SYMLINK_NOFOLLOW`, and a
+/// directory has no other name. It is not when the operand ends in a slash and its name is a
+/// symbolic link: the copy follows it, as GNU cp's does, but the directory reached is anywhere
+/// the link's owner chose, and judging it by the directory the link is in, or by its own `..`,
+/// would hand it trust that directory never gave. Anything not located hands none
+/// (`ChainTrust::unlocated`).
+fn parent_anchor(
+    parent: &ftw::FileDescriptor,
+    id: (u64, u64),
+    target: &Path,
+) -> io::Result<ChainTrust> {
+    let Some(name) = target.file_name() else {
+        return Ok(ChainTrust::unlocated());
+    };
+    let Ok(name) = CString::new(name.as_bytes()) else {
+        return Ok(ChainTrust::unlocated());
+    };
+    let opened;
+    let dir = if parent.as_raw_fd() == libc::AT_FDCWD {
+        let path = match target.parent() {
+            Some(path) if !path.as_os_str().is_empty() => path,
+            _ => Path::new("."),
+        };
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            return Ok(ChainTrust::unlocated());
+        };
+        let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        match open_fd_at(libc::AT_FDCWD, &path, flags) {
+            Ok(fd) => opened = fd,
+            Err(_) => return Ok(ChainTrust::unlocated()),
+        }
+        opened.as_raw_fd()
+    } else {
+        parent.as_raw_fd()
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let flags = libc::AT_SYMLINK_NOFOLLOW;
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, flags) } != 0 {
+        return Ok(ChainTrust::unlocated());
+    }
+    // Cast needed: `dev_t` is i32 on macOS and u64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    if (st.st_dev as u64, st.st_ino as u64) != id {
+        return Ok(ChainTrust::unlocated());
+    }
+    ChainTrust::anchor(dir)
 }
 
 /// For a directory found existing at the destination path `target`, open on `fd` with identity
-/// `id`, in a directory handing it `hands`: what it is given once its contents are copied, and
-/// what it hands the directories found in it.
+/// `id`, in the directory `parent` handing it `hands`: what it is given once its contents are
+/// copied, and what it hands the directories found in it.
 ///
 /// One this run made at that path is its own (`MadeDirs`). Any other takes what -p asks only
 /// where nobody else could have created its name, in its parent or any directory above it up
@@ -328,6 +368,7 @@ fn open_parent_dir(fd: &ftw::FileDescriptor, target: &Path) -> io::Result<ftw::F
 /// (`ChainTrust::found_dir`, which pax follows too).
 fn found_dir_trust(
     hands: OperandTrust,
+    parent: &ftw::FileDescriptor,
     fd: &ftw::FileDescriptor,
     id: (u64, u64),
     target: &Path,
@@ -343,7 +384,7 @@ fn found_dir_trust(
             let finish = DirFinish::Found(as_asked(requested));
             return Ok((finish, ChainTrust::anchor(fd.as_raw_fd())?));
         }
-        OperandTrust::Parent => ChainTrust::anchor(open_parent_dir(fd, target)?.as_raw_fd())?,
+        OperandTrust::Parent => parent_anchor(parent, id, target)?,
         OperandTrust::Chain(chain) => chain,
     };
     let finish = DirFinish::Found(chain.found_dir(requested));
@@ -2264,6 +2305,7 @@ where
                                 }
                                 let (finish, trust) = found_dir_trust(
                                     hands,
+                                    target_dirfd,
                                     &fd,
                                     (dev, ino),
                                     &target,
@@ -2289,8 +2331,16 @@ where
                                     // Owned like its parent only, it may be someone else's: it
                                     // hands on what a directory found would.
                                     let made_dirs = made_by_run.borrow();
-                                    found_dir_trust(hands, &fd, id, &target, &made_dirs, requested)?
-                                        .1
+                                    let (_, trust) = found_dir_trust(
+                                        hands,
+                                        target_dirfd,
+                                        &fd,
+                                        id,
+                                        &target,
+                                        &made_dirs,
+                                        requested,
+                                    )?;
+                                    trust
                                 };
                                 report_copied(cfg, source.path().as_inner(), &target, true);
                                 Ok((fd, md, DirFinish::Made(made), trust))
@@ -2672,6 +2722,70 @@ mod tests {
         );
         assert_eq!(after.mode() & 0o7777, 0o600, "the mode was applied");
         assert_eq!(after.mtime(), 978_307_200, "the times were not applied");
+    }
+
+    /// `cp -pR`'s configuration.
+    fn cp_pr_config() -> super::CopyConfig {
+        super::CopyConfig {
+            force: false,
+            deref: super::DerefMode::Never,
+            interactive: false,
+            preserve: true,
+            recursive: true,
+            no_clobber: false,
+            link: false,
+            prog: "cp",
+            continue_on_error: true,
+            destination: super::Destination::MayExist,
+            verbose: None,
+        }
+    }
+
+    /// `cp -pR src open/new/` where, after cp found no `open/new`, someone who can write `open`
+    /// planted `new` as a symbolic link to the user's private directory in a parent only the
+    /// user can write. The trailing slash follows the link, as GNU cp's copy does; but the
+    /// directory found is not `open/new`, so it is judged as one found in `open` -- or rather
+    /// not judged at all, being somewhere else: it keeps its mode, and that is reported.
+    #[test]
+    fn a_directory_reached_through_a_trailing_slash_link_is_left_alone() {
+        use std::fs;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
+        let source = dir.join("src");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("f"), b"f").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let home = dir.join("home");
+        let private = home.join("private");
+        fs::create_dir_all(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        let open = dir.join("open");
+        fs::create_dir(&open).unwrap();
+        symlink(&private, open.join("new")).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let mut target = open.join("new").into_os_string();
+        target.push("/");
+        let result = super::copy_file(
+            &cp_pr_config(),
+            &source,
+            std::path::Path::new(&target),
+            super::OperandTrust::Parent,
+            &mut super::CopyRun::default(),
+            None,
+            |_| false,
+        );
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = fs::metadata(&private).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o700, "the private directory was opened up");
+        assert!(result.is_err(), "leaving it alone must be reported");
+        assert!(
+            private.join("f").exists(),
+            "the copy follows the link, as GNU's does"
+        );
     }
 
     /// The copy `mv` makes after its step 5, which must create the destination operand.

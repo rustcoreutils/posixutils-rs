@@ -29,6 +29,11 @@ ftw = { path = "../ftw" }
 [build-dependencies]
 cc = "1"
 
+[features]
+# Instrumentation only tests read, across crates: enabled by the [dev-dependencies] of the
+# crates whose tests use it, so release builds never carry it.
+test-hooks = []
+
 [lints]
 workspace = true
 

@@ -361,16 +361,6 @@ struct DestDir {
     own: bool,
 }
 
-/// What a directory that may take what -p asks of it is given: `ChainTrust::found_dir` where
-/// the chain is trusted.
-fn as_asked(requested: Preserve) -> FoundDir {
-    if requested.mode || requested.owner {
-        FoundDir::AsRequested
-    } else {
-        FoundDir::TimesOnly
-    }
-}
-
 /// The trust the anchor of `OperandTrust::Parent` hands the operand `target`, found existing as
 /// the directory with identity `id`: the directory `target` names it in, when it is there under
 /// its own name.
@@ -488,7 +478,7 @@ fn own_dir_trust(
     fd: &Rc<ftw::FileDescriptor>,
     requested: Preserve,
 ) -> io::Result<(DirFinish, ChainTrust)> {
-    let finish = DirFinish::Found(as_asked(requested));
+    let finish = DirFinish::Found(requested.where_trusted());
     Ok((finish, ChainTrust::made(fd)?))
 }
 

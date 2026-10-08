@@ -173,7 +173,8 @@ pub fn made_by_us(made: MadeObject, parent_uid: Option<u32>, euid: u32) -> Optio
 
 /// Whether anyone but `euid` can rename entries in the directory `parent`: its owner, when that
 /// is someone else, and anyone with group or other write permission on it when it is not
-/// sticky.
+/// sticky. (Who could have created a name the caller finds is another question, with another
+/// answer: `dir_writers`.)
 ///
 /// Only what `st_mode` shows is seen. Write permission a POSIX ACL grants to named users or
 /// groups shows there (in the group bits, the ACL mask); write permission a macOS or NFSv4 ACL
@@ -193,6 +194,18 @@ pub fn others_can_rename(parent: &libc::stat, euid: u32) -> bool {
 pub struct Preserve {
     pub mode: bool,
     pub owner: bool,
+}
+
+impl Preserve {
+    /// What a directory found existing is given where nobody else could have created its name:
+    /// what was asked for, or its times alone when neither mode nor owner was.
+    pub fn where_trusted(self) -> FoundDir {
+        if self.mode || self.owner {
+            FoundDir::AsRequested
+        } else {
+            FoundDir::TimesOnly
+        }
+    }
 }
 
 /// What a directory found already existing -- not one the caller made and verified -- is to
@@ -344,8 +357,7 @@ impl NamedAnchor {
     pub fn named_dir(&self, requested: Preserve) -> FoundDir {
         match &self.through_link {
             Some(trust) => trust.found_dir(requested),
-            None if requested.mode || requested.owner => FoundDir::AsRequested,
-            None => FoundDir::TimesOnly,
+            None => requested.where_trusted(),
         }
     }
 }
@@ -474,12 +486,9 @@ impl ChainTrust {
     /// being which of mode and owner the user asked to preserve. Only when one of them was
     /// asked for is the trust worked out.
     pub fn found_dir(&self, requested: Preserve) -> FoundDir {
-        if !requested.mode && !requested.owner {
-            FoundDir::TimesOnly
-        } else if self.entries_safe() {
-            FoundDir::AsRequested
-        } else {
-            FoundDir::LeaveAlone
+        match requested.where_trusted() {
+            FoundDir::AsRequested if !self.entries_safe() => FoundDir::LeaveAlone,
+            given => given,
         }
     }
 
@@ -527,6 +536,14 @@ enum DirWriters {
 }
 
 /// `DirWriters` for the directory `st`, the effective user being `euid`.
+///
+/// Not the rule `others_can_rename` follows, on purpose. That one asks whether someone could
+/// have renamed something over a directory the caller has just made, and the sticky bit stops
+/// others renaming the caller's entries. This one asks whether someone could have created a
+/// name the caller finds -- renaming in a directory of their choosing -- and the sticky bit
+/// stops nobody creating a new name. Nor does `others_can_rename` make an exception for the
+/// user's private group: where it says yes, the directory just made is verified anyway
+/// (`verify_made_dir`), with no lookup.
 fn dir_writers(st: &libc::stat, euid: u32) -> DirWriters {
     // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP is 0o020 and S_IWOTH
     // 0o002 (fixed by POSIX).
@@ -544,18 +561,9 @@ fn dir_writers(st: &libc::stat, euid: u32) -> DirWriters {
     }
 }
 
-/// Whether nobody but the effective user can create entries in the directory open on `fd`: it
-/// is owned by that user and grants no other write permission, and no group write permission
-/// either unless its group is the user's private group (`is_private_group`) -- the user's
-/// alone, so the directories a umask of 002 leaves group-writable, as Debian-style user private
-/// groups intend, count as the user's; and no ACL it carries may let others write
-/// (`acls_let_others_write`: POSIX, NFSv4 and CIFS ACLs on Linux). A sticky directory others
-/// may write counts as one they can create entries in.
-///
-/// A macOS ACL grants write permission the mode does not show, and is not read: a residual --
-/// below a directory such an ACL lets others write, a directory found existing, possibly one
-/// of theirs renamed there, is given the mode or owner asked for.
-pub fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
+/// `only_the_user_writes` for the directory open on `fd`, worked out at once: for tests.
+#[cfg(test)]
+fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
     let euid = unsafe { libc::geteuid() };
     Ok(only_the_user_writes(
         dir_writers(&fstat(fd)?, euid),
@@ -563,13 +571,21 @@ pub fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
     ))
 }
 
-/// Whether nobody but the user can create entries in a directory whose mode shows `writers`,
-/// held as `dir` (`None` once its holder has closed it, which settles nothing and so counts as
-/// others'): the rule `nobody_else_can_create` and `ChainTrust` both follow.
+/// Whether nobody but the effective user can create entries in a directory whose mode shows
+/// `writers`, held as `dir` (`None` once its holder has closed it, which settles nothing and so
+/// counts as others'): the rule `ChainTrust` follows.
 ///
-/// Beyond the mode: a directory group-writable for the user's private group (`is_private_group`)
-/// counts as the user's alone; and either way, an ACL read from the directory may let others
-/// write (`acls_let_others_write`). The ACL is read last, only when the rest says the user's.
+/// The directory must be the user's and grant no other write permission, and no group write
+/// permission either unless its group is the user's private group (`is_private_group`) -- the
+/// user's alone, so the directories a umask of 002 leaves group-writable, as Debian-style user
+/// private groups intend, count as the user's; and no ACL it carries may let others write
+/// (`acls_let_others_write`: POSIX, NFSv4 and CIFS ACLs on Linux), read last, only when the
+/// rest says the user's. A sticky directory others may write counts as one they can create
+/// entries in.
+///
+/// A macOS ACL grants write permission the mode does not show, and is not read: a residual --
+/// below a directory such an ACL lets others write, a directory found existing, possibly one
+/// of theirs renamed there, is given the mode or owner asked for.
 fn only_the_user_writes(writers: DirWriters, dir: Option<RawFd>) -> bool {
     let acls_allow = |group_writable| {
         dir.is_some_and(|fd| !acls_let_others_write(|name| read_xattr(fd, name), group_writable))
@@ -703,6 +719,7 @@ fn acl_names_others(xattr: &[u8]) -> bool {
 /// - A group password lets anyone who knows it `newgrp` into the group; with shadow groups it
 ///   is out of the user's reach to read, and is not considered.
 pub fn is_private_group(gid: u32, euid: u32) -> bool {
+    #[cfg(feature = "test-hooks")]
     PRIVATE_GROUP_QUERIES.with(|queries| queries.set(queries.get() + 1));
     if !cfg!(target_os = "linux") {
         return false;
@@ -715,6 +732,7 @@ pub fn is_private_group(gid: u32, euid: u32) -> bool {
         .or_insert_with(|| read_private_group(gid, euid))
 }
 
+#[cfg(feature = "test-hooks")]
 thread_local! {
     /// How many times this thread has asked `is_private_group`, cached or not.
     static PRIVATE_GROUP_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -722,7 +740,10 @@ thread_local! {
 
 /// How many times this thread has asked whether a group is private (`is_private_group`): for
 /// tests that a run which asks nothing that needs it -- no mode or owner to preserve -- looks
-/// nothing up.
+/// nothing up. The tests are cp's and pax's, in other crates, which `cfg(test)` here would not
+/// reach; so it is the `test-hooks` feature, which only their `[dev-dependencies]` enable: a
+/// `cargo build` of the utilities never carries it, only the builds `cargo test` makes.
+#[cfg(feature = "test-hooks")]
 pub fn private_group_queries() -> usize {
     PRIVATE_GROUP_QUERIES.with(|queries| queries.get())
 }

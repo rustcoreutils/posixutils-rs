@@ -291,8 +291,9 @@ fn reopen_through_procfs(_pin: &OwnedFd) -> Option<io::Result<OwnedFd>> {
 /// Only the parent's owner, and anyone with group or other write permission on it when it is
 /// not sticky, can do that; when that is nobody but cp's own user, there is nothing to check.
 /// Otherwise the directory must be what a fresh `mkdirat` yields: empty, with the owner and
-/// link count `made_by_us` accepts. (Group or other write permission granted by an ACL shows in
-/// the group bits.)
+/// link count `made_by_us` accepts. (Write permission a POSIX ACL grants shows in the group
+/// bits; one a macOS or NFSv4 ACL grants is not seen -- the residual documented at
+/// `plib::madefs::others_can_rename`.)
 ///
 /// An operand resolved from the working directory has no parent descriptor; its parent is then
 /// read as the opened directory's own `..`, which names wherever that directory actually is.

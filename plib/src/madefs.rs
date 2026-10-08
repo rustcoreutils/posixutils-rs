@@ -156,7 +156,12 @@ pub fn made_by_us(made: MadeObject, parent_uid: Option<u32>, euid: u32) -> Optio
 
 /// Whether anyone but `euid` can rename entries in the directory `parent`: its owner, when that
 /// is someone else, and anyone with group or other write permission on it when it is not
-/// sticky. (Group or other write permission granted by an ACL shows in the group bits.)
+/// sticky.
+///
+/// Only what `st_mode` shows is seen. Write permission a POSIX ACL grants to named users or
+/// groups shows there (in the group bits, the ACL mask); write permission a macOS or NFSv4 ACL
+/// grants does not, and is not taken into account. That is a residual: in a directory such an
+/// ACL lets others write, a directory just made is not checked for having been renamed over.
 pub fn others_can_rename(parent: &libc::stat, euid: u32) -> bool {
     // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_ISVTX is 0o1000,
     // S_IWGRP|S_IWOTH 0o022 (fixed by POSIX).
@@ -254,8 +259,14 @@ fn nobody_else_can_create_in(fd: RawFd) -> io::Result<bool> {
 }
 
 /// Whether nobody but `euid` can create entries in the directory `parent`: it is owned by
-/// `euid` and grants no group or other write permission (an ACL granting it shows in the group
-/// bits). A sticky directory others may write counts as one they can create entries in.
+/// `euid` and grants no group or other write permission. A sticky directory others may write
+/// counts as one they can create entries in.
+///
+/// Only what `st_mode` shows is seen. Write permission a POSIX ACL grants to named users or
+/// groups shows there (in the group bits, the ACL mask); write permission a macOS or NFSv4 ACL
+/// grants does not, and is not taken into account. That is a residual: below a directory such
+/// an ACL lets others write, a directory found existing -- possibly one of theirs renamed
+/// there -- is given the mode or owner asked for.
 pub fn nobody_else_can_create(parent: &libc::stat, euid: u32) -> bool {
     // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP|S_IWOTH is 0o022 (fixed
     // by POSIX).

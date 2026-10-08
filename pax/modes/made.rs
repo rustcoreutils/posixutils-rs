@@ -218,6 +218,38 @@ fn check_node(
     made_by_us(MadeObject::of(st, owners), parent_uid, euid).ok_or_else(replaced)
 }
 
+/// Whether anyone but `euid` can rename entries in the directory `parent`:
+/// its owner, when that is someone else, and anyone with group or other write
+/// permission on it when it is not sticky. (Group or other write permission
+/// granted by an ACL shows in the group bits.)
+pub(crate) fn others_can_rename(parent: &libc::stat, euid: u32) -> bool {
+    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_ISVTX is
+    // 0o1000, S_IWGRP|S_IWOTH 0o022 (fixed by POSIX).
+    #[allow(clippy::unnecessary_cast)]
+    let mode = parent.st_mode as u32;
+    parent.st_uid != euid || (mode & 0o022 != 0 && mode & 0o1000 == 0)
+}
+
+/// Whether a directory owned by `dir_uid`, in the directory `parent`, may be
+/// given a member's owner, mode and times by pax running as `euid`.
+///
+/// One pax's user owns, or the parent's owner does -- who controls that entry
+/// already -- may. So may any, where nobody else can rename entries in the
+/// parent. Otherwise the directory may be one someone renamed there from
+/// elsewhere -- a private one of a third user's -- and stamping it with the
+/// archive's mode would open it up: it is extracted into (POSIX: an existing
+/// directory is not an error) but keeps its own attributes.
+pub(crate) fn may_take_attrs(dir_uid: u32, parent: &libc::stat, euid: u32) -> bool {
+    dir_uid == euid || dir_uid == parent.st_uid || !others_can_rename(parent, euid)
+}
+
+/// `may_take_attrs` for the directory open on `dir`, found in `parent`, as
+/// both descriptors show them.
+pub(crate) fn dir_may_take_attrs(parent: BorrowedFd<'_>, dir: BorrowedFd<'_>) -> io::Result<bool> {
+    let euid = unsafe { libc::geteuid() };
+    Ok(may_take_attrs(fstat(dir)?.st_uid, &fstat(parent)?, euid))
+}
+
 /// Check a directory pax has just made with `mkdirat` in `parent` and then
 /// opened as `dir` (`O_DIRECTORY | O_NOFOLLOW`): between the two, anyone else
 /// who can rename entries in the parent could have renamed a directory of
@@ -238,12 +270,7 @@ pub(crate) fn verify_made_dir(
 ) -> io::Result<Option<MadeTrust>> {
     let euid = unsafe { libc::geteuid() };
     let parent_st = fstat(parent)?;
-    // Casts needed: `mode_t` is u16 on macOS and u32 on Linux. S_ISVTX is
-    // 0o1000, S_IWGRP|S_IWOTH 0o022 (fixed by POSIX).
-    #[allow(clippy::unnecessary_cast)]
-    let mode = parent_st.st_mode as u32;
-    let others_can_rename = parent_st.st_uid != euid || (mode & 0o022 != 0 && mode & 0o1000 == 0);
-    if !others_can_rename {
+    if !others_can_rename(&parent_st, euid) {
         return Ok(Some(MadeTrust::Full));
     }
     let made = MadeObject::of(&fstat(dir)?, fs_owners(dir));
@@ -664,6 +691,43 @@ mod tests {
             made_by_us(made(OTHER, 1, false, FsOwners::Stored), OTHER, PAX),
             None
         );
+    }
+
+    /// A parent directory of `uid` with permission bits `mode`.
+    fn parent(uid: u32, mode: libc::mode_t) -> libc::stat {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_uid = uid;
+        st.st_mode = libc::S_IFDIR | mode;
+        st
+    }
+
+    /// Only the parent's owner, or anyone allowed to write a parent that is
+    /// not sticky, can rename entries in it.
+    #[test]
+    fn who_can_rename_in_a_parent() {
+        assert!(!others_can_rename(&parent(PAX, 0o755), PAX));
+        assert!(!others_can_rename(&parent(PAX, 0o1777), PAX));
+        assert!(others_can_rename(&parent(PAX, 0o775), PAX));
+        assert!(others_can_rename(&parent(PAX, 0o777), PAX));
+        assert!(others_can_rename(&parent(OTHER, 0o755), PAX));
+    }
+
+    /// An existing directory owned by someone other than pax's user and the
+    /// parent's owner, in a parent others can rename entries in, may have
+    /// been renamed there by them: it takes no member's attributes.
+    #[test]
+    fn a_found_directory_takes_attributes_only_from_its_owners() {
+        const THIRD: u32 = 3000;
+        // pax's own, or the parent owner's, who controls that entry anyway.
+        assert!(may_take_attrs(PAX, &parent(PAX, 0o777), PAX));
+        assert!(may_take_attrs(OTHER, &parent(OTHER, 0o777), PAX));
+        // Nobody else can have put it there.
+        assert!(may_take_attrs(THIRD, &parent(PAX, 0o755), PAX));
+        // Someone else could have.
+        assert!(!may_take_attrs(THIRD, &parent(PAX, 0o777), PAX));
+        assert!(!may_take_attrs(THIRD, &parent(OTHER, 0o755), PAX));
+        // root extracting into another user's sticky /tmp-like directory.
+        assert!(!may_take_attrs(THIRD, &parent(PAX, 0o1777), 0));
     }
 
     #[test]

@@ -445,20 +445,30 @@ impl PendingDirs {
 /// is not a directory, and the identity check a directory that is not this
 /// one. Each means the directory these attributes were for is gone, which is
 /// not an error: whatever replaced it brought its own.
+///
+/// A directory that was already there, owned by a third user, in a parent
+/// others can rename entries in, keeps its own attributes
+/// (`made::may_take_attrs`), and that is diagnosed.
 fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> PaxResult<()> {
     let Some(member) = MemberPath::parse(&dir.path)? else {
         return Ok(());
     };
-    let opened = tree
-        .parent_of(&member, false)
-        .and_then(|parent| open_dir_for_attrs(parent.as_fd(), &member.leaf));
-    let (fd, search_only) = match opened {
+    let opened = tree.parent_of(&member, false).and_then(|parent| {
+        open_dir_for_attrs(parent.as_fd(), &member.leaf).map(|opened| (parent, opened))
+    });
+    let (parent, (fd, search_only)) = match opened {
         Ok(opened) => opened,
         Err(PaxError::Io(e)) if is_superseded(&e) => return Ok(()),
         Err(e) => return Err(e),
     };
     if fstat(fd.as_fd()).is_none_or(|st| file_id(&st) != dir.id) {
         return Ok(());
+    }
+    if !made::dir_may_take_attrs(parent.as_fd(), fd.as_fd())? {
+        return Err(PaxError::Io(std::io::Error::other(
+            "not applying owner, mode or times: the directory belongs to another user \
+             and others can rename entries beside it",
+        )));
     }
     if search_only {
         return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy);

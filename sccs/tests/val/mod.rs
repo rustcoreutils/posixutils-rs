@@ -453,3 +453,37 @@ fn admin_h_and_val_agree_on_a_corrupt_header_only_file() {
         "a corrupt checksum must be diagnosed, not passed"
     );
 }
+
+// A read error on standard input ends `val -`: it is reported once, not
+// retried. A directory as standard input (EISDIR) used to spin for ever.
+#[cfg(unix)]
+#[test]
+fn val_stdin_read_error_ends_input() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().unwrap();
+    let dir = std::fs::File::open(tmp.path()).unwrap();
+    let mut child = Command::new(plib::testing::get_binary_path("val"))
+        .arg("-")
+        .stdin(Stdio::from(dir))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn val");
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("val - never finished reading a directory as standard input");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert!(stderr.starts_with("val: "), "{stderr:?}");
+    assert!(out.stdout.is_empty());
+    assert_ne!(out.status.code(), Some(0));
+}

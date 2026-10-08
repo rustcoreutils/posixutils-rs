@@ -194,7 +194,15 @@ fn main() -> ExitCode {
         for line in stdin.lock().lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(_) => continue,
+                // A line that is not valid UTF-8 has been consumed; skip it.
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
+                // Any other error (EISDIR, EIO) would recur on every retry:
+                // report it once and stop reading.
+                Err(e) => {
+                    eprintln!("val: -: {}", plib::diag::io_error_text(&e));
+                    exit_code |= ERR_CANNOT_OPEN;
+                    break;
+                }
             };
 
             if line.trim().is_empty() {

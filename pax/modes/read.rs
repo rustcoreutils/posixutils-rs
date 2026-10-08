@@ -708,11 +708,12 @@ fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(Rc<Own
     (id_at(dir.as_fd(), &member.leaf) == Some(file)).then_some((dir, member.leaf))
 }
 
-/// The file at `name` below `dirfd`, opened without following a symlink or
-/// blocking, when it is still the file `file`. A failure only leaves the set
-/// unpinned.
+/// The file at `name` below `dirfd`, opened without following a symlink,
+/// blocking, or adopting a terminal as the controlling one, when it is still
+/// the file `file`. A failure only leaves the set unpinned.
 fn pin_file(dirfd: BorrowedFd<'_>, name: &CStr, file: (u64, u64)) -> Option<OwnedFd> {
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let flags =
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 {
         return None;

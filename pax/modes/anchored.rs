@@ -873,7 +873,9 @@ pub(crate) fn open_source_file(
     follow: bool,
     expected: (u64, u64),
 ) -> std::io::Result<File> {
-    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC;
+    // O_NOCTTY: a terminal swapped in for the file is refused below, but a
+    // pax with no controlling terminal would adopt it in the open itself.
+    let mut flags = libc::O_RDONLY | libc::O_NOCTTY | libc::O_CLOEXEC;
     if !follow {
         flags |= libc::O_NOFOLLOW;
     }
@@ -1381,6 +1383,28 @@ mod tests {
     fn ino_at(path: &Path) -> u64 {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// A terminal swapped in for a source file is refused -- and must not
+    /// become the controlling terminal of a pax that has none (cron, CI, a
+    /// daemon) in the open before the refusal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_open_source_file_never_adopts_a_terminal() {
+        use crate::modes::race_hook;
+        if !race_hook::in_new_session() {
+            race_hook::rerun_in_new_session(
+                "modes::anchored::tests::test_open_source_file_never_adopts_a_terminal",
+            );
+            return;
+        }
+        let (_master, pts, slave) = race_hook::open_pty();
+        assert!(!race_hook::has_controlling_tty());
+        assert!(open_source_file(pts.as_raw_fd(), &slave, false, (0, 0)).is_err());
+        assert!(
+            !race_hook::has_controlling_tty(),
+            "opening the source made it the controlling terminal"
+        );
     }
 
     /// A symbolic link, or a FIFO made by someone else, found where a FIFO was

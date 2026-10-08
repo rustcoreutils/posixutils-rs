@@ -245,6 +245,27 @@ fn made_and_existing_directories_take_their_mode() {
     assert!(dest.join("e/kept").exists());
 }
 
+/// A terminal found where a link set's first name was made is not pinned --
+/// and must not become the controlling terminal of a pax that has none in
+/// the open before the identity check refuses it.
+#[cfg(target_os = "linux")]
+#[test]
+fn pin_file_never_adopts_a_terminal() {
+    if !race_hook::in_new_session() {
+        race_hook::rerun_in_new_session(
+            "modes::read::race_tests::pin_file_never_adopts_a_terminal",
+        );
+        return;
+    }
+    let (_master, pts, slave) = race_hook::open_pty();
+    assert!(!race_hook::has_controlling_tty());
+    assert!(pin_file(pts.as_fd(), &slave, (0, 0)).is_none());
+    assert!(
+        !race_hook::has_controlling_tty(),
+        "pinning the file made it the controlling terminal"
+    );
+}
+
 /// Without any swap the FIFO and the link still get everything asked for.
 #[test]
 fn fifo_and_symlink_take_their_attributes() {

@@ -320,26 +320,53 @@ struct RemoteDir {
 impl RemoteDir {
     /// Make `$TMPDIR/name` (or `/tmp/name`) on `host`, mode 0700. `mkdir`
     /// without `-p` fails if anything at all already has that name, and the
-    /// path the remote shell chose is read back from its output.
+    /// path the remote shell chose is read back from its output: from after
+    /// a sentinel line, since the shell's start-up files may print first.
     fn create(host: &str, name: &str) -> Result<RemoteDir, String> {
+        let dir = remote_tmp_path(name);
         let script = format!(
-            "d=\"${{TMPDIR:-/tmp}}\"/{} && mkdir -m 700 \"$d\" && printf '%s' \"$d\"",
-            shell_escape(name)
+            "d={dir} && mkdir -m 700 \"$d\" && printf '\\n%s\\n%s' {REMOTE_DIR_SENTINEL} \"$d\""
         );
         let (code, stdout, stderr) =
             ssh_exec(host, &script, None).map_err(|e| format!("ssh failed: {}", e))?;
-        let path = String::from_utf8(stdout).unwrap_or_default();
-        if code != 0 || !path.starts_with('/') {
-            return Err(format!(
+        let fail = || {
+            format!(
                 "failed to create remote work dir: {}",
                 String::from_utf8_lossy(&stderr)
-            ));
+            )
+        };
+        if code != 0 {
+            return Err(fail());
         }
-        Ok(RemoteDir {
-            host: host.to_string(),
-            path,
-        })
+        match path_after_sentinel(&stdout) {
+            Some(path) => Ok(RemoteDir {
+                host: host.to_string(),
+                path,
+            }),
+            None => {
+                // The directory was made, but where is unknown: remove it by
+                // the same name.
+                let _ = ssh_exec(host, &format!("rm -rf {dir}"), None);
+                Err(fail())
+            }
+        }
     }
+}
+
+/// The line the remote shell prints just before the work directory's path.
+const REMOTE_DIR_SENTINEL: &str = "posixutils-uux-work-dir:";
+
+/// A shell word for `name` in the remote `$TMPDIR`, or `/tmp`.
+fn remote_tmp_path(name: &str) -> String {
+    format!("\"${{TMPDIR:-/tmp}}\"/{}", shell_escape(name))
+}
+
+/// The absolute path printed after the last sentinel line in `stdout`.
+fn path_after_sentinel(stdout: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    let marker = format!("\n{REMOTE_DIR_SENTINEL}\n");
+    let (_, path) = text.rsplit_once(&marker)?;
+    path.starts_with('/').then(|| path.to_string())
 }
 
 impl Drop for RemoteDir {
@@ -661,6 +688,18 @@ mod tests {
         let d = delivery.expect("delivery scheduled");
         assert!(d.fetch, "exec-remote/output-local fetches");
         assert_eq!(d.path, "/p/out");
+    }
+
+    #[test]
+    fn test_path_after_sentinel() {
+        let out = format!("banner\n/x\n\n{REMOTE_DIR_SENTINEL}\n/tmp/a b");
+        assert_eq!(
+            path_after_sentinel(out.as_bytes()).as_deref(),
+            Some("/tmp/a b")
+        );
+        assert_eq!(path_after_sentinel(b"/tmp/a"), None);
+        let relative = format!("\n{REMOTE_DIR_SENTINEL}\ntmp/a");
+        assert_eq!(path_after_sentinel(relative.as_bytes()), None);
     }
 
     #[test]

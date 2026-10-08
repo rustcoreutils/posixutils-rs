@@ -258,6 +258,42 @@ fn test_uux_remote_work_dir_is_private() {
     assert_private_work_dir(&fake, &read(&out));
 }
 
+/// A remote shell whose start-up files print something (a banner, a
+/// fortune) on standard output must not break the creation of the remote
+/// work directory, which reports its path there.
+#[test]
+fn test_uux_remote_work_dir_survives_startup_output() {
+    let fake = FakeSsh::new("uux_remote_noisy");
+    let out = fake.join("out");
+    let cmd = format!("hosta!ls -ld \"$PWD\" > !{}", out.display());
+    let noise = "case \"$5\" in *mkdir*) printf 'Welcome to hosta\\n/not/a/dir\\n';; esac";
+
+    let output = fake.run("uux", &[&cmd], noise);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_private_work_dir(&fake, &read(&out));
+}
+
+/// If the remote work directory is made but its path cannot be read back
+/// (here the stand-in ssh discards the command's output), uux fails and
+/// still removes the directory.
+#[test]
+fn test_uux_remote_work_dir_removed_when_path_is_lost() {
+    let fake = FakeSsh::new("uux_remote_lost");
+    let cmd = "hosta!true";
+    let discard =
+        "case \"$5\" in *mkdir*) set -- \"$1\" \"$2\" \"$3\" \"$4\" \"$5 >/dev/null\";; esac";
+
+    let output = fake.run("uux", &["-n", cmd], discard);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        fake.tmp_entries().is_empty(),
+        "left behind: {:?}",
+        fake.tmp_entries()
+    );
+}
+
 /// An input file from a third system is staged locally on its way to the
 /// execution host: in a private directory under `$TMPDIR`, which is gone
 /// afterwards. The hook lists `$TMPDIR` at each ssh call, so the listing

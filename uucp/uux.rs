@@ -337,14 +337,14 @@ impl RemoteDir {
         if code != 0 {
             return Err(fail());
         }
-        match path_after_sentinel(&stdout) {
+        match path_after_sentinel(&stdout, name) {
             Some(path) => Ok(RemoteDir {
                 host: host.to_string(),
                 path,
             }),
             None => {
-                // The directory was made, but where is unknown: remove it by
-                // the same name.
+                // The directory was made, but the path read back is missing
+                // or not the one made: remove it by the same name.
                 let _ = ssh_exec(host, &format!("rm -rf {dir}"), None);
                 Err(fail())
             }
@@ -369,12 +369,15 @@ fn remote_tmp_path(name: &str) -> String {
     format!("\"${{TMPDIR:-/tmp}}\"/{}", shell_escape(name))
 }
 
-/// The absolute path printed after the last sentinel line in `stdout`.
-fn path_after_sentinel(stdout: &[u8]) -> Option<String> {
+/// The path printed after the last sentinel line in `stdout`, if it is the
+/// directory made as `name`: one absolute line ending in `/name`.
+fn path_after_sentinel(stdout: &[u8], name: &str) -> Option<String> {
     let text = std::str::from_utf8(stdout).ok()?;
     let marker = format!("\n{REMOTE_DIR_SENTINEL}\n");
     let (_, path) = text.rsplit_once(&marker)?;
-    path.starts_with('/').then(|| path.to_string())
+    let is_ours =
+        path.starts_with('/') && !path.contains('\n') && path.ends_with(&format!("/{name}"));
+    is_ours.then(|| path.to_string())
 }
 
 impl Drop for RemoteDir {
@@ -700,14 +703,19 @@ mod tests {
 
     #[test]
     fn test_path_after_sentinel() {
-        let out = format!("banner\n/x\n\n{REMOTE_DIR_SENTINEL}\n/tmp/a b");
+        let parse = |out: String| path_after_sentinel(out.as_bytes(), "uux.ab");
+        let s = REMOTE_DIR_SENTINEL;
         assert_eq!(
-            path_after_sentinel(out.as_bytes()).as_deref(),
-            Some("/tmp/a b")
+            parse(format!("banner\n/x\n\n{s}\n/tmp/a b/uux.ab")).as_deref(),
+            Some("/tmp/a b/uux.ab")
         );
-        assert_eq!(path_after_sentinel(b"/tmp/a"), None);
-        let relative = format!("\n{REMOTE_DIR_SENTINEL}\ntmp/a");
-        assert_eq!(path_after_sentinel(relative.as_bytes()), None);
+        assert_eq!(parse("/tmp/uux.ab".to_string()), None);
+        assert_eq!(parse(format!("\n{s}\ntmp/uux.ab")), None);
+        // The path must end in the generated name, and be one line.
+        assert_eq!(parse(format!("\n{s}\n/tmp/other")), None);
+        assert_eq!(parse(format!("\n{s}\n/tmp/xuux.ab")), None);
+        assert_eq!(parse(format!("\n{s}\n/tmp/uux.ab\n/etc")), None);
+        assert_eq!(parse(format!("\n{s}\n/etc\n/tmp/uux.ab")), None);
     }
 
     #[test]

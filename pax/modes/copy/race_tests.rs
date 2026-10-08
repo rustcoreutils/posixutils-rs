@@ -202,6 +202,51 @@ fn link_through_a_retargeted_symlink_leaves_no_link_to_the_new_target() {
     }
 }
 
+/// The same retargeting, and the link `linkat` makes renamed away by a writer
+/// of the destination before pax can check and remove it: no second name for
+/// the private file may exist anywhere when pax is done -- the link must
+/// never be made at all.
+#[test]
+fn retargeted_link_is_never_made_even_briefly() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(src.join("a"), "A").unwrap();
+    let secret = src.join("secret");
+    std::fs::write(&secret, "S").unwrap();
+    let link = src.join("s");
+    std::os::unix::fs::symlink("a", &link).unwrap();
+    let secret_c = CString::new(secret.as_os_str().as_bytes()).unwrap();
+
+    let hook = move |point, dirfd, name: &CStr| {
+        let last = name.to_bytes().rsplit(|&b| b == b'/').next();
+        if point == Point::Linking && last == Some(b"s".as_slice()) {
+            assert_eq!(unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) }, 0);
+            let r = unsafe { libc::symlinkat(secret_c.as_ptr(), dirfd, name.as_ptr()) };
+            assert_eq!(r, 0);
+        }
+        if point == Point::Linked {
+            let r = unsafe { libc::renameat(dirfd, name.as_ptr(), dirfd, c"kept".as_ptr()) };
+            assert_eq!(r, 0);
+        }
+    };
+    let options = CopyOptions {
+        link: true,
+        cli_dereference: true,
+        ..Default::default()
+    };
+    race_hook::with_hook(hook, || {
+        let operand = link.clone();
+        copy_files(&mut std::iter::once(operand), &dest, &options).unwrap();
+    });
+
+    let nlink = std::fs::metadata(&secret).unwrap().nlink();
+    assert_eq!(nlink, 1, "a hard link to the private file was made");
+}
+
 /// Without any swap the FIFO keeps its mode, set-user-ID included, and its
 /// times.
 #[test]

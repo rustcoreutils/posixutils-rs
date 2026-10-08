@@ -33,6 +33,8 @@ pub(crate) enum Point {
     /// Copy mode's `-l` is about to link the source `name`, which the walk
     /// has already examined.
     Linking,
+    /// `-l` has just made the link `name` in the destination.
+    Linked,
 }
 
 type Hook = Box<dyn FnMut(Point, libc::c_int, &CStr)>;

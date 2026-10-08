@@ -907,10 +907,13 @@ pub(crate) fn link_replacing(
 /// "the hard link created ... shall be to the file referenced by the symbolic
 /// link". Without it, `from_name` itself is linked, whatever it is.
 ///
-/// `linkat` resolves `from_name` again -- and with `follow`, the link's
-/// target too -- so it can link a file other than the one the caller
-/// examined, whose `(st_dev, st_ino)` is `expected`. A link made to anything
-/// else is removed again and the call fails, rather than leave the
+/// `linkat` by name resolves `from_name` again -- and with `follow`, the
+/// link's target too -- so it can link a file other than the one the caller
+/// examined, whose `(st_dev, st_ino)` is `expected`. Given `expected`, the
+/// source is pinned first (`LinkSource`) and checked to be that file, and the
+/// link is made to the pinned inode itself, so no other file is ever linked.
+/// Where it cannot be pinned, a link made by name to anything else is removed
+/// again and the call fails (`linked_expected`), rather than leave the
 /// destination a second name for a file nobody asked to copy.
 pub(crate) fn link_replacing_with(
     from_dir: libc::c_int,
@@ -921,25 +924,11 @@ pub(crate) fn link_replacing_with(
     name: &CStr,
     no_clobber: bool,
 ) -> PaxResult<bool> {
-    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
-    let link = || {
-        let r = unsafe {
-            libc::linkat(
-                from_dir,
-                from_name.as_ptr(),
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                flags,
-            )
-        };
-        if r != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    };
+    let source = LinkSource::new(from_dir, from_name, follow, expected)?;
+    let link = || source.link_to(dirfd, name);
 
     match link() {
-        Ok(()) => return linked_expected(dirfd, name, expected).map(|()| false),
+        Ok(()) => return source.check_linked(dirfd, name).map(|()| false),
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
         Err(e) => return Err(e.into()),
     }
@@ -964,12 +953,121 @@ pub(crate) fn link_replacing_with(
 
     unlink_at(dirfd, name)?;
     link()?;
-    linked_expected(dirfd, name, expected)?;
+    source.check_linked(dirfd, name)?;
     Ok(false)
 }
 
-/// After `link_replacing_with` made `name`: unless it is the file `expected`
-/// (when given), remove it again and fail.
+/// What `link_replacing_with` links.
+enum LinkSource<'a> {
+    /// The inode the caller examined, pinned by an `O_PATH` descriptor and
+    /// linked through its `self/fd/N` entry in a procfs-verified `/proc`
+    /// (Linux).
+    #[cfg(target_os = "linux")]
+    Pinned { proc_dir: File, pin: OwnedFd },
+    /// A name, resolved again by `linkat`: `flags` is `AT_SYMLINK_FOLLOW` or
+    /// 0, and `expected` what the link made is checked against afterwards.
+    Name {
+        from_dir: libc::c_int,
+        from_name: &'a CStr,
+        flags: libc::c_int,
+        expected: Option<(u64, u64)>,
+    },
+}
+
+impl<'a> LinkSource<'a> {
+    /// `from_name` in `from_dir`, followed if `follow`: pinned and checked to
+    /// be `expected` where that is given and the platform allows.
+    fn new(
+        from_dir: libc::c_int,
+        from_name: &'a CStr,
+        follow: bool,
+        expected: Option<(u64, u64)>,
+    ) -> PaxResult<Self> {
+        #[cfg(target_os = "linux")]
+        if let Some(expected) = expected {
+            if let Some(pinned) = Self::pin(from_dir, from_name, follow, expected)? {
+                return Ok(pinned);
+            }
+        }
+        let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+        Ok(LinkSource::Name {
+            from_dir,
+            from_name,
+            flags,
+            expected,
+        })
+    }
+
+    /// Pin the source with `O_PATH` -- following a symbolic link exactly
+    /// when `linkat` would -- and require it to be the file `expected`.
+    /// `None` without a verified procfs, where the pin could not be linked.
+    #[cfg(target_os = "linux")]
+    fn pin(
+        from_dir: libc::c_int,
+        from_name: &CStr,
+        follow: bool,
+        expected: (u64, u64),
+    ) -> PaxResult<Option<Self>> {
+        let Ok(proc_dir) = made::procfs_dir() else {
+            return Ok(None);
+        };
+        let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+        let flags = libc::O_PATH | libc::O_CLOEXEC | nofollow;
+        let fd = unsafe { libc::openat(from_dir, from_name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let pin = unsafe { OwnedFd::from_raw_fd(fd) };
+        if !fstat(pin.as_fd()).is_some_and(|st| file_id(&st) == expected) {
+            return Err(source_changed());
+        }
+        Ok(Some(LinkSource::Pinned { proc_dir, pin }))
+    }
+
+    /// Make `name` in `dirfd` a hard link to the source.
+    fn link_to(&self, dirfd: BorrowedFd<'_>, name: &CStr) -> std::io::Result<()> {
+        let to = dirfd.as_raw_fd();
+        let r = match self {
+            #[cfg(target_os = "linux")]
+            LinkSource::Pinned { proc_dir, pin } => {
+                // The magic link is followed to the pinned inode itself.
+                let pinned = made::proc_fd_name(pin.as_raw_fd());
+                let (from, follow) = (proc_dir.as_raw_fd(), libc::AT_SYMLINK_FOLLOW);
+                unsafe { libc::linkat(from, pinned.as_ptr(), to, name.as_ptr(), follow) }
+            }
+            LinkSource::Name {
+                from_dir,
+                from_name,
+                flags,
+                ..
+            } => unsafe { libc::linkat(*from_dir, from_name.as_ptr(), to, name.as_ptr(), *flags) },
+        };
+        made::cvt(r)
+    }
+
+    /// After `link_to` made `name`: a pinned source can only have linked the
+    /// file it pins. A name, resolved again, may have linked another file:
+    /// unless the link is the file expected (when given), remove it again
+    /// and fail. The residual: a writer of the destination who renames the
+    /// link away before this check keeps it.
+    fn check_linked(&self, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            LinkSource::Pinned { .. } => Ok(()),
+            LinkSource::Name { expected, .. } => linked_expected(dirfd, name, *expected),
+        }
+    }
+}
+
+/// The failure for a source that is no longer the file the walk examined.
+fn source_changed() -> PaxError {
+    PaxError::Io(std::io::Error::other(
+        "source file changed before it could be linked",
+    ))
+}
+
+/// After `link_replacing_with` made `name` by name: unless it is the file
+/// `expected` (when given), remove it again and fail.
 fn linked_expected(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
@@ -978,13 +1076,17 @@ fn linked_expected(
     let Some(expected) = expected else {
         return Ok(());
     };
+    #[cfg(test)]
+    crate::modes::race_hook::reached(
+        crate::modes::race_hook::Point::Linked,
+        dirfd.as_raw_fd(),
+        name,
+    );
     if stat_at(dirfd, name).is_some_and(|st| file_id(&st) == expected) {
         return Ok(());
     }
     unlink_at(dirfd, name)?;
-    Err(PaxError::Io(std::io::Error::other(
-        "source file changed before it could be linked",
-    )))
+    Err(source_changed())
 }
 
 /// Open a source file from the descriptor of the directory it was found in.

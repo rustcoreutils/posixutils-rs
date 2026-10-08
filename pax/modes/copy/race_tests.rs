@@ -105,6 +105,51 @@ fn symlink_swapped_for_a_hard_link_lends_nothing_to_its_target() {
     );
 }
 
+/// A source directory of mode 0777 whose new copy is replaced, right after
+/// the mkdir, by a private directory (0700, with a file in it) renamed over
+/// it: the private one must not be opened up.
+#[test]
+fn directory_swapped_after_mkdir_is_not_stamped() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    let dir = src.join("d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let private = tmp.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(private.join("secret"), "secret").unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let private_c = CString::new(private.as_os_str().as_bytes()).unwrap();
+
+    // The directory the copy is made in already exists, and anyone may
+    // write it, so someone other than pax could rename entries in it.
+    let dest = tmp.path().join("dest");
+    let parent = dest.join(member_name(&src));
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let mut done = false;
+    let hook = move |point, dirfd, name: &CStr| {
+        if point == Point::MadeDir && name == c"d" && !done {
+            done = true;
+            race_hook::swap_for_directory(dirfd, name, &private_c);
+        }
+    };
+    race_hook::with_hook(hook, || {
+        let operand = dir.clone();
+        copy_files(&mut std::iter::once(operand), &dest, &preserve_everything()).unwrap();
+    });
+
+    let copied = parent.join("d");
+    assert!(copied.join("secret").exists(), "the swap did not happen");
+    let md = std::fs::metadata(&copied).unwrap();
+    assert_eq!(
+        md.mode() & 0o7777,
+        0o700,
+        "the private directory was opened up"
+    );
+}
+
 /// Without any swap the FIFO keeps its mode, set-user-ID included, and its
 /// times.
 #[test]

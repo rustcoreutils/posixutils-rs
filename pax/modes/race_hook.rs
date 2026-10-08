@@ -24,6 +24,8 @@ use std::ffi::CStr;
 pub(crate) enum Point {
     /// A FIFO, device or symbolic link member has just been created at `name`.
     Made,
+    /// A directory has just been made at `name` with `mkdirat`.
+    MadeDir,
 }
 
 type Hook = Box<dyn FnMut(Point, libc::c_int, &CStr)>;
@@ -50,6 +52,13 @@ pub(crate) fn with_hook<R>(
     let result = f();
     HOOK.with(|h| *h.borrow_mut() = None);
     result
+}
+
+/// A hook action: rename the directory `victim` over the empty directory
+/// `name` below `dirfd`, as a writer of both directories would.
+pub(crate) fn swap_for_directory(dirfd: libc::c_int, name: &CStr, victim: &CStr) {
+    let r = unsafe { libc::renameat(libc::AT_FDCWD, victim.as_ptr(), dirfd, name.as_ptr()) };
+    assert_eq!(r, 0, "renameat: {}", std::io::Error::last_os_error());
 }
 
 /// A hook action: replace `name` below `dirfd` with a hard link to `victim`,

@@ -408,25 +408,35 @@ impl CopyWalk<'_> {
         // Created no more open than its source, and reopened with
         // O_DIRECTORY|O_NOFOLLOW, so a symbolic link left in the destination
         // is refused rather than descended through.
-        if !keep {
-            make_dir_at(self.tree, parent.as_fd(), &mp.leaf, metadata.mode(), false)?;
-        }
+        //
+        // The directory it is to be: one just made is identified from a
+        // descriptor checked to be the one made (`make_dir_at`), one kept by
+        // the `lstat` that decided to keep it. The descriptor opened here
+        // must be that directory, or something was renamed over it.
+        let expected = if keep {
+            existing.map(|st| file_id(&st))
+        } else {
+            make_dir_at(self.tree, parent.as_fd(), &mp.leaf, metadata.mode(), false)?
+        };
         let dir = open_dir_at(parent.as_fd(), &mp.leaf, false)?;
-        let stamp = (!keep).then_some(mp);
+        let dest_st = stat_at(dir.as_fd(), c".")
+            .ok_or_else(|| PaxError::Io(std::io::Error::last_os_error()))?;
+        if expected.is_some_and(|id| id != file_id(&dest_st)) {
+            return Err(PaxError::Io(std::io::Error::other(
+                "directory was replaced after it was checked",
+            )));
+        }
 
         // Remember what this destination directory *is*, so the walk can
         // recognise it if the source tree leads back here.
-        let dest_st = stat_at(dir.as_fd(), c".");
-        if let Some(st) = &dest_st {
-            self.dest_ids.borrow_mut().insert(file_id(st));
-        }
+        self.dest_ids.borrow_mut().insert(file_id(&dest_st));
 
         self.print_verbose(src);
 
-        if let (Some(mp), Some(st)) = (stamp, dest_st) {
+        if let (false, Some(id)) = (keep, expected) {
             self.pending_dirs
                 .borrow_mut()
-                .push(&mp, &st, attrs_of(metadata));
+                .push(&mp, id, attrs_of(metadata));
         }
         self.descend(member, metadata)
     }

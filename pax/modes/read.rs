@@ -360,12 +360,10 @@ fn extract_entry<R: ArchiveReader>(
 
     match entry.entry_type {
         EntryType::Directory => {
-            if extract_directory(tree, pfd, name, entry, options)? {
+            if let Some(id) = extract_directory(tree, pfd, name, entry, options)? {
                 // Its attributes are applied once the subtree exists, if it
                 // is still this directory then.
-                if let Some(st) = stat_at(pfd, name) {
-                    pending_dirs.push(&member, &st, attrs_of(entry, options));
-                }
+                pending_dirs.push(&member, id, attrs_of(entry, options));
             }
             archive.skip_data()?;
         }
@@ -441,14 +439,15 @@ fn copy_member_to_stdout<R: ArchiveReader>(
     Ok(())
 }
 
-/// Extract a directory. Returns whether its attributes should be applied later.
+/// Extract a directory. Returns the `(st_dev, st_ino)` of the directory its
+/// attributes are to be applied to later, if any.
 fn extract_directory(
     tree: &DirTree,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<bool> {
+) -> PaxResult<Option<(u64, u64)>> {
     make_dir_at(tree, dirfd, name, entry.mode, options.no_clobber)
 }
 

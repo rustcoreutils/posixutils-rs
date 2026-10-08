@@ -132,6 +132,119 @@ fn symlink_swapped_for_a_hard_link_lends_nothing_to_its_target() {
     assert_eq!(md.mode() & 0o7777, 0o600);
 }
 
+/// A private directory (0700, with a file in it) outside the extraction
+/// directory: what a writer renames over the directory pax has just made.
+fn private_dir(tmp: &TempDir) -> (PathBuf, CString) {
+    let path = tmp.path().join("private");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("secret"), "secret").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+    (path, c)
+}
+
+/// An extraction directory anyone may write, so that someone other than pax
+/// could rename entries in it.
+fn shared_dest(tmp: &TempDir) -> PathBuf {
+    let dest = tmp.path().join("dest");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o777)).unwrap();
+    dest
+}
+
+/// Extract `entries` below `dest` while a writer renames `victim` over the
+/// directory pax makes at `swapped`, once.
+fn extract_with_dir_swap(dest: &Path, entries: Vec<ArchiveEntry>, swapped: &CStr, victim: CString) {
+    let tree = DirTree::open_path(dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut archive = Members(entries.into_iter());
+    let swapped = swapped.to_owned();
+    let mut done = false;
+    let hook = move |point, dirfd, name: &CStr| {
+        if point == Point::MadeDir && name == swapped.as_c_str() && !done {
+            done = true;
+            race_hook::swap_for_directory(dirfd, name, &victim);
+        }
+    };
+    let options = preserve_everything();
+    let _ = race_hook::with_hook(hook, || {
+        extract_members(&mut archive, &options, &tree, &mut pending)
+    });
+    pending.apply(&tree, &policy_of(&options));
+}
+
+/// A directory member archived 0777, its new directory replaced by a private
+/// one right after the mkdir: the private one must not be opened up.
+#[test]
+fn directory_swapped_after_mkdir_is_not_stamped() {
+    let tmp = TempDir::new().unwrap();
+    let dest = shared_dest(&tmp);
+    let (_, victim_c) = private_dir(&tmp);
+
+    let entry = own_member("d", EntryType::Directory, 0o777);
+    extract_with_dir_swap(&dest, vec![entry], c"d", victim_c);
+
+    let md = std::fs::metadata(dest.join("d")).unwrap();
+    assert!(dest.join("d/secret").exists(), "the swap did not happen");
+    assert_eq!(
+        md.mode() & 0o7777,
+        0o700,
+        "the private directory was opened up"
+    );
+}
+
+/// The same for a directory made only to hold a member below it, and named by
+/// a later member (`find -depth` order).
+#[test]
+fn intermediate_directory_swapped_after_mkdir_is_not_stamped() {
+    let tmp = TempDir::new().unwrap();
+    let dest = shared_dest(&tmp);
+    let (_, victim_c) = private_dir(&tmp);
+
+    let entries = vec![
+        own_member("a/f", EntryType::Fifo, 0o600),
+        own_member("a", EntryType::Directory, 0o777),
+    ];
+    extract_with_dir_swap(&dest, entries, c"a", victim_c);
+
+    let md = std::fs::metadata(dest.join("a")).unwrap();
+    assert!(dest.join("a/secret").exists(), "the swap did not happen");
+    assert_eq!(
+        md.mode() & 0o7777,
+        0o700,
+        "the private directory was opened up"
+    );
+}
+
+/// Without a swap, both kinds of directory take the archived mode, in a
+/// shared extraction directory as anywhere else; an existing directory is
+/// merged into and takes it too.
+#[test]
+fn made_and_existing_directories_take_their_mode() {
+    let tmp = TempDir::new().unwrap();
+    let dest = shared_dest(&tmp);
+    std::fs::create_dir(dest.join("e")).unwrap();
+    std::fs::write(dest.join("e/kept"), "").unwrap();
+    let tree = DirTree::open_path(&dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let entries = vec![
+        own_member("d", EntryType::Directory, 0o751),
+        own_member("a/f", EntryType::Fifo, 0o600),
+        own_member("a", EntryType::Directory, 0o753),
+        own_member("e", EntryType::Directory, 0o705),
+    ];
+    let mut archive = Members(entries.into_iter());
+    let options = preserve_everything();
+    extract_members(&mut archive, &options, &tree, &mut pending).unwrap();
+    pending.apply(&tree, &policy_of(&options));
+
+    let mode = |p: &str| std::fs::metadata(dest.join(p)).unwrap().mode() & 0o7777;
+    assert_eq!(mode("d"), 0o751);
+    assert_eq!(mode("a"), 0o753);
+    assert_eq!(mode("e"), 0o705);
+    assert!(dest.join("e/kept").exists());
+}
+
 /// Without any swap the FIFO and the link still get everything asked for.
 #[test]
 fn fifo_and_symlink_take_their_attributes() {

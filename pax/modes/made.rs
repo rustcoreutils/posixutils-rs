@@ -218,6 +218,44 @@ fn check_node(
     made_by_us(MadeObject::of(st, owners), parent_uid, euid).ok_or_else(replaced)
 }
 
+/// Check a directory pax has just made with `mkdirat` in `parent` and then
+/// opened as `dir` (`O_DIRECTORY | O_NOFOLLOW`): between the two, anyone else
+/// who can rename entries in the parent could have renamed a directory of
+/// their choosing over it, and pax would extract into it and give it the
+/// member's owner and mode.
+///
+/// Only the parent's owner, and anyone with group or other write permission
+/// on it when it is not sticky, can do that; when that is nobody but pax's own
+/// user there is nothing to check. Otherwise the directory must be what a
+/// fresh `mkdirat` yields: empty, with the owner and link count `made_by_us`
+/// accepts. `None` when it is not.
+///
+/// Every fact comes from the two descriptors, never from a name: the caller
+/// goes on to use `dir` itself, or identifies the directory by `dir`'s fstat.
+pub(crate) fn verify_made_dir(
+    parent: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+) -> io::Result<Option<MadeTrust>> {
+    let euid = unsafe { libc::geteuid() };
+    let parent_st = fstat(parent)?;
+    // Casts needed: `mode_t` is u16 on macOS and u32 on Linux. S_ISVTX is
+    // 0o1000, S_IWGRP|S_IWOTH 0o022 (fixed by POSIX).
+    #[allow(clippy::unnecessary_cast)]
+    let mode = parent_st.st_mode as u32;
+    let others_can_rename = parent_st.st_uid != euid || (mode & 0o022 != 0 && mode & 0o1000 == 0);
+    if !others_can_rename {
+        return Ok(Some(MadeTrust::Full));
+    }
+    let made = MadeObject::of(&fstat(dir)?, fs_owners(dir));
+    let Some(trust) = made_by_us(made, parent_st.st_uid, euid) else {
+        return Ok(None);
+    };
+    if !made.is_dir || !ftw::is_empty_dir_fd(dir.as_raw_fd())? {
+        return Ok(None);
+    }
+    Ok(Some(trust))
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) use linux::MadeNode;
 #[cfg(not(target_os = "linux"))]

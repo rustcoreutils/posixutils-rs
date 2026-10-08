@@ -389,6 +389,31 @@ fn pin_file_never_adopts_a_terminal() {
     );
 }
 
+/// A directory this run made for one member, renamed by someone else to the
+/// name of a later member, is not that member's directory: it is met as one
+/// found existing, and in a shared destination keeps its own attributes
+/// rather than taking the later member's.
+#[test]
+fn a_made_directory_renamed_to_a_later_members_name_is_found() {
+    let tmp = TempDir::new().unwrap();
+    let dest = shared_dest(&tmp);
+    let tree = DirTree::open_path(&dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let options = preserve_everything();
+
+    let mut extract = |member| {
+        let mut archive = Members(vec![member].into_iter());
+        extract_members(&mut archive, &options, &tree, &mut pending).unwrap();
+    };
+    extract(own_member("a", EntryType::Directory, 0o700));
+    std::fs::rename(dest.join("a"), dest.join("b")).unwrap();
+    extract(own_member("b", EntryType::Directory, 0o777));
+    pending.apply(&tree, &policy_of(&options));
+
+    let mode = std::fs::metadata(dest.join("b")).unwrap().mode() & 0o7777;
+    assert_eq!(mode, 0o700, "it took the later member's mode");
+}
+
 /// Without any swap the FIFO and the link still get everything asked for.
 #[test]
 fn fifo_and_symlink_take_their_attributes() {

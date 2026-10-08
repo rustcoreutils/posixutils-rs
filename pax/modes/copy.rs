@@ -404,7 +404,7 @@ impl CopyWalk<'_> {
         if existing.is_some_and(|st| is_source(&st, entry, metadata)) {
             return self.dir_onto_itself(src, member, metadata);
         }
-        let keep = existing.is_some_and(|st| self.keeps_existing_dir(metadata, &st));
+        let keep = existing.is_some_and(|st| self.keeps_existing_dir(metadata, &st, &mp));
         // Created no more open than its source, and reopened with
         // O_DIRECTORY|O_NOFOLLOW, so a symbolic link left in the destination
         // is refused rather than descended through.
@@ -416,7 +416,7 @@ impl CopyWalk<'_> {
         let decided = match existing {
             // -k or -u keeps it, as it is.
             Some(_) if keep => DirAttrs::Keep,
-            _ => make_dir_at(self.tree, parent.as_fd(), &mp.leaf, metadata.mode(), false)?,
+            _ => make_dir_at(self.tree, parent.as_fd(), &mp, metadata.mode(), false)?,
         };
         let expected = match decided {
             DirAttrs::Apply(id) | DirAttrs::Withheld(id) => Some(id),
@@ -471,8 +471,13 @@ impl CopyWalk<'_> {
 
     /// Whether -k or -u leaves the directory already at a destination name
     /// with its own attributes.
-    fn keeps_existing_dir(&self, metadata: &ftw::Metadata, st: &libc::stat) -> bool {
-        if self.tree.claim_implicit(st) {
+    fn keeps_existing_dir(
+        &self,
+        metadata: &ftw::Metadata,
+        st: &libc::stat,
+        mp: &MemberPath,
+    ) -> bool {
+        if self.tree.claim_implicit(st, mp) {
             return false;
         }
         self.options.no_clobber

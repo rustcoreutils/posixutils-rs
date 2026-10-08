@@ -123,6 +123,27 @@ impl MemberPath {
     pub(crate) fn depth(&self) -> usize {
         self.depth
     }
+
+    /// The member's own path as a registry key: its components, each ended
+    /// by a NUL, as `Chain` and `dir_key` spell them.
+    pub(crate) fn key(&self) -> Vec<u8> {
+        let mut key = self.dirs.clone();
+        key.extend_from_slice(self.leaf.to_bytes_with_nul());
+        key
+    }
+
+    /// The key (`key`) of the directory made of the member's first `n`
+    /// directory components.
+    fn dir_key(&self, n: usize) -> &[u8] {
+        let end = self
+            .dirs
+            .iter()
+            .enumerate()
+            .filter(|&(_, &b)| b == 0)
+            .nth(n - 1)
+            .map_or(0, |(i, _)| i + 1);
+        &self.dirs[..end]
+    }
 }
 
 /// Open flags for a directory that is only ever walked through or used as the
@@ -181,9 +202,12 @@ pub(crate) struct DirTree {
     /// directory deeper than `max_levels` still share one walk.
     last_parent: RefCell<Option<(Vec<u8>, Rc<OwnedFd>)>>,
     /// `(st_dev, st_ino)` of the directories this run created only to hold a
-    /// member below them. Such a directory is not a pre-existing file: a member
-    /// that names it later (`find -depth` order) still gives it its attributes.
-    implicit: RefCell<HashSet<(u64, u64)>>,
+    /// member below them, each with the member path (`MemberPath::key`) it
+    /// was made at. Such a directory is not a pre-existing file: a member
+    /// that names it later (`find -depth` order) still gives it its
+    /// attributes -- a member of that name: met under any other, it was
+    /// renamed there, and is one found existing.
+    implicit: RefCell<HashMap<(u64, u64), Vec<u8>>>,
     /// `(st_dev, st_ino)` of directories found where this run had just made
     /// one: renamed over it by someone else. A member naming one later does
     /// not take it for a pre-existing directory and give it attributes.
@@ -196,9 +220,10 @@ pub(crate) struct DirTree {
     /// `(st_dev, st_ino)` of directories this run made, verified through a
     /// descriptor to be the ones made, for a member naming them -- or made
     /// to hold members below them and since claimed by the member naming
-    /// them. Unlike a directory found existing, these take a member's
-    /// attributes wherever they are.
-    made: RefCell<HashSet<(u64, u64)>>,
+    /// them -- each with the member path it was made at. Unlike a directory
+    /// found existing, these take a member's attributes wherever they are --
+    /// at that path: one renamed to another member's name is found there.
+    made: RefCell<HashMap<(u64, u64), Vec<u8>>>,
     /// The mtime each pre-existing directory had when this run first walked
     /// into it, before any member created below it changed that. -u compares
     /// against this: a `find -depth` list names a directory after its
@@ -230,10 +255,10 @@ impl DirTree {
             chain: RefCell::new(Chain::default()),
             max_levels: cached_levels_budget(),
             last_parent: RefCell::new(None),
-            implicit: RefCell::new(HashSet::new()),
+            implicit: RefCell::new(HashMap::new()),
             replaced: RefCell::new(HashSet::new()),
             unverified: RefCell::new(HashSet::new()),
-            made: RefCell::new(HashSet::new()),
+            made: RefCell::new(HashMap::new()),
             pre_run_mtimes: RefCell::new(HashMap::new()),
         })
     }
@@ -277,8 +302,9 @@ impl DirTree {
         chain.truncate(shared);
         let mut cur = chain.levels.last().map(|(_, fd)| Rc::clone(fd));
 
-        for comp in member.dirs().skip(shared) {
+        for (level, comp) in member.dirs().enumerate().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
+            let key = member.dir_key(level + 1);
             let (next, origin) = open_or_create_dir_at(at, comp, create_missing)?;
             let st = match self.admit(next.as_fd(), origin) {
                 Ok(st) => st,
@@ -290,8 +316,10 @@ impl DirTree {
             };
             let id = file_id(&st);
             match origin {
-                DirOrigin::Made => self.record_made(id, MadeTrust::Full, true),
-                DirOrigin::Unverified => self.record_made(id, MadeTrust::ParentOwnerOnly, true),
+                DirOrigin::Made => self.record_made(id, key, MadeTrust::Full, true),
+                DirOrigin::Unverified => {
+                    self.record_made(id, key, MadeTrust::ParentOwnerOnly, true)
+                }
                 DirOrigin::Found | DirOrigin::Replaced => {
                     self.pre_run_mtimes
                         .borrow_mut()
@@ -311,36 +339,53 @@ impl DirTree {
         }
     }
 
-    /// What this run knows about the directory with `(st_dev, st_ino)` `id`.
+    /// What this run knows about the directory with `(st_dev, st_ino)` `id`,
+    /// met at the member path `key` (`MemberPath::key`).
     ///
     /// The one registry every site that enters, merges into or stamps a
     /// directory consults: the walk and `open_dir` (through `admit`),
-    /// `make_dir_at` and `apply_dir_attrs`.
-    fn standing(&self, id: (u64, u64)) -> Standing {
-        if self.replaced.borrow().contains(&id) {
+    /// `make_dir_at` and `apply_dir_attrs`. A directory this run made counts
+    /// as made only at the path it was made at: one someone renamed to
+    /// another member's name is one found existing there.
+    fn standing(&self, id: (u64, u64), key: &[u8]) -> Standing {
+        let made_at = |made: &RefCell<HashMap<(u64, u64), Vec<u8>>>| {
+            made.borrow()
+                .get(&id)
+                .is_some_and(|at| at.as_slice() == key)
+        };
+        if self.is_replaced(id) {
             Standing::Replaced
         } else if self.unverified.borrow().contains(&id) {
             Standing::Unverified
-        } else if self.implicit.borrow().contains(&id) {
+        } else if made_at(&self.implicit) {
             Standing::Implicit
-        } else if self.made.borrow().contains(&id) {
+        } else if made_at(&self.made) {
             Standing::Made
         } else {
             Standing::Ordinary
         }
     }
 
-    /// Record the directory with `id` as one this run has just made and
-    /// verified (`verify_made_dir`) to `trust`: made only to hold members
-    /// below it (`implicit`), or for a member naming it. The one place the
-    /// walk and `make_dir_at` both record what they made.
-    fn record_made(&self, id: (u64, u64), trust: MadeTrust, implicit: bool) {
-        let set = match trust {
-            MadeTrust::ParentOwnerOnly => &self.unverified,
+    /// Whether the directory with `id` was found in place of one this run
+    /// made, wherever it is met.
+    fn is_replaced(&self, id: (u64, u64)) -> bool {
+        self.replaced.borrow().contains(&id)
+    }
+
+    /// Record the directory with `id` as one this run has just made at the
+    /// member path `key` and verified (`verify_made_dir`) to `trust`: made
+    /// only to hold members below it (`implicit`), or for a member naming it.
+    /// The one place the walk and `make_dir_at` both record what they made.
+    fn record_made(&self, id: (u64, u64), key: &[u8], trust: MadeTrust, implicit: bool) {
+        let made = match trust {
+            MadeTrust::ParentOwnerOnly => {
+                self.unverified.borrow_mut().insert(id);
+                return;
+            }
             MadeTrust::Full if implicit => &self.implicit,
             MadeTrust::Full => &self.made,
         };
-        set.borrow_mut().insert(id);
+        made.borrow_mut().insert(id, key.to_vec());
     }
 
     /// Record the directory with `id` as found in place of one this run
@@ -369,7 +414,7 @@ impl DirTree {
         if origin == DirOrigin::Replaced {
             return Err(self.refuse_replaced(file_id(&st)));
         }
-        if self.standing(file_id(&st)) == Standing::Replaced {
+        if self.is_replaced(file_id(&st)) {
             return Err(PaxError::Io(made::replaced()));
         }
         Ok(st)
@@ -388,10 +433,10 @@ impl DirTree {
         Ok(fd)
     }
 
-    /// Whether `st` is a directory this run created only to hold members
-    /// below it, rather than one that was there before.
-    pub(crate) fn is_implicit(&self, st: &libc::stat) -> bool {
-        self.standing(file_id(st)) == Standing::Implicit
+    /// Whether `st`, met at `member`, is a directory this run created there
+    /// only to hold members below it, rather than one that was there before.
+    pub(crate) fn is_implicit(&self, st: &libc::stat, member: &MemberPath) -> bool {
+        self.standing(file_id(st), &member.key()) == Standing::Implicit
     }
 
     /// `is_implicit`, for the member that names the directory and so gives it
@@ -400,13 +445,15 @@ impl DirTree {
     /// an existing directory -- left alone under -k -- rather than as one
     /// still waiting for its attributes, and it still takes attributes
     /// wherever it is, being verified as made.
-    pub(crate) fn claim_implicit(&self, st: &libc::stat) -> bool {
+    pub(crate) fn claim_implicit(&self, st: &libc::stat, member: &MemberPath) -> bool {
         let id = file_id(st);
-        let claimed = self.implicit.borrow_mut().remove(&id);
-        if claimed {
-            self.made.borrow_mut().insert(id);
+        let key = member.key();
+        if self.standing(id, &key) != Standing::Implicit {
+            return false;
         }
-        claimed
+        self.implicit.borrow_mut().remove(&id);
+        self.made.borrow_mut().insert(id, key);
+        true
     }
 
     /// The mtime `st` had before this run put anything below it, for -u, as
@@ -567,7 +614,7 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
     if fstat(fd.as_fd()).is_none_or(|st| file_id(&st) != dir.id) {
         return Ok(());
     }
-    let with_mode = match tree.standing(dir.id) {
+    let with_mode = match tree.standing(dir.id, &member.key()) {
         Standing::Replaced => return Err(PaxError::Io(made::replaced())),
         Standing::Unverified => return Err(attrs_withheld()),
         Standing::Implicit | Standing::Made => true,
@@ -798,10 +845,11 @@ pub(crate) fn attrs_withheld() -> PaxError {
 pub(crate) fn make_dir_at(
     tree: &DirTree,
     dirfd: BorrowedFd<'_>,
-    name: &CStr,
+    member: &MemberPath,
     mode: u32,
     no_clobber: bool,
 ) -> PaxResult<DirAttrs> {
+    let name = member.leaf.as_c_str();
     // An archived 0555 used to be set immediately and then rejected every
     // child with EACCES.
     let mode = ((mode & 0o7777) | 0o700) as libc::mode_t;
@@ -815,7 +863,7 @@ pub(crate) fn make_dir_at(
     let exists = |e: &std::io::Error| e.raw_os_error() == Some(libc::EEXIST);
 
     match mkdir() {
-        Ok(()) => return made_dir_id(tree, dirfd, name),
+        Ok(()) => return made_dir_id(tree, dirfd, member),
         Err(e) if !exists(&e) => return Err(e.into()),
         Err(_) => {}
     }
@@ -827,10 +875,10 @@ pub(crate) fn make_dir_at(
     let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
     if let Some(st) = existing_dir {
         let id = file_id(&st);
-        return match tree.standing(id) {
+        return match tree.standing(id, &member.key()) {
             Standing::Replaced => Err(PaxError::Io(made::replaced())),
             Standing::Implicit => {
-                tree.claim_implicit(&st);
+                tree.claim_implicit(&st, member);
                 Ok(DirAttrs::Apply(id))
             }
             Standing::Unverified => Ok(DirAttrs::Withheld(id)),
@@ -852,7 +900,7 @@ pub(crate) fn make_dir_at(
     let unlinked = unsafe { libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), 0) } == 0;
     let unlink_err = (!unlinked).then(std::io::Error::last_os_error);
     match mkdir() {
-        Ok(()) => made_dir_id(tree, dirfd, name),
+        Ok(()) => made_dir_id(tree, dirfd, member),
         Err(e) if exists(&e) && is_directory_at(dirfd, name) => Err(PaxError::Io(
             std::io::Error::other("a directory appeared in its place while it was replaced"),
         )),
@@ -867,7 +915,8 @@ pub(crate) fn make_dir_at(
 /// attributes. One
 /// found in its place is remembered in `tree`, so that no later member takes
 /// it for a pre-existing directory either.
-fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<DirAttrs> {
+fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, member: &MemberPath) -> PaxResult<DirAttrs> {
+    let name = member.leaf.as_c_str();
     #[cfg(test)]
     reached_made_dir(dirfd, name);
     let (dir, _) = open_dir_for_attrs(dirfd, name)?;
@@ -878,7 +927,7 @@ fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<
     let id = file_id(&st);
     // Recorded either way, as the walk records what it makes: a later member
     // of the same name meets it with this standing.
-    tree.record_made(id, trust, false);
+    tree.record_made(id, &member.key(), trust, false);
     match trust {
         MadeTrust::Full => Ok(DirAttrs::Apply(id)),
         MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Withheld(id)),
@@ -1899,8 +1948,9 @@ mod tests {
                 race_hook::swap_for_directory(dirfd, name, &away_c);
             }
         };
-        let made =
-            race_hook::with_hook(hook, || make_dir_at(&tree, tree.root(), c"a", 0o755, false));
+        let made = race_hook::with_hook(hook, || {
+            make_dir_at(&tree, tree.root(), &member("a"), 0o755, false)
+        });
         assert!(made.is_err(), "the directory renamed over it was taken");
 
         assert!(

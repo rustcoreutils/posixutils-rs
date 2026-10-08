@@ -361,7 +361,7 @@ fn extract_entry<R: ArchiveReader>(
 
     match entry.entry_type {
         EntryType::Directory => {
-            let decided = extract_directory(tree, pfd, name, entry, options)?;
+            let decided = extract_directory(tree, pfd, &member, entry, options)?;
             archive.skip_data()?;
             match decided {
                 // Its attributes are applied once the subtree exists, if it
@@ -447,11 +447,11 @@ fn copy_member_to_stdout<R: ArchiveReader>(
 fn extract_directory(
     tree: &DirTree,
     dirfd: BorrowedFd<'_>,
-    name: &CStr,
+    member: &MemberPath,
     entry: &ArchiveEntry,
     options: &ReadOptions,
 ) -> PaxResult<DirAttrs> {
-    make_dir_at(tree, dirfd, name, entry.mode, options.no_clobber)
+    make_dir_at(tree, dirfd, member, entry.mode, options.no_clobber)
 }
 
 /// Extract a symlink
@@ -937,7 +937,7 @@ fn is_archive_newer(tree: &DirTree, entry: &ArchiveEntry) -> bool {
     };
     // A directory created here only to hold earlier members is not one.
     stat_at(parent.as_fd(), &member.leaf).is_none_or(|st| {
-        tree.is_implicit(&st)
+        tree.is_implicit(&st, &member)
             || (entry.mtime, i64::from(entry.mtime_nsec)) > tree.mtime_before_run(&st)
     })
 }

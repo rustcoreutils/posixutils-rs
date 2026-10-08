@@ -508,18 +508,8 @@ impl ChainTrust {
 impl Link {
     /// Whether nobody but the user can create entries in this directory itself.
     fn own_entries_safe(&self) -> bool {
-        match self.writers {
-            DirWriters::User => true,
-            DirWriters::Others => false,
-            DirWriters::UserAndGroup { gid, euid } => {
-                is_private_group(gid, euid)
-                    && self
-                        .dir
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                        .is_some_and(|dir| !acl_may_name_others(dir.as_raw_fd()))
-            }
-        }
+        let dir = self.dir.as_ref().and_then(Weak::upgrade);
+        only_the_user_writes(self.writers, dir.as_ref().map(|dir| dir.as_raw_fd()))
     }
 }
 
@@ -556,81 +546,122 @@ fn dir_writers(st: &libc::stat, euid: u32) -> DirWriters {
 
 /// Whether nobody but the effective user can create entries in the directory open on `fd`: it
 /// is owned by that user and grants no other write permission, and no group write permission
-/// either unless its group is the user's private group (`is_private_group`) and no ACL names
-/// anyone else (`acl_may_name_others`) -- the user's alone, so the directories a umask of 002
-/// leaves group-writable, as Debian-style user private groups intend, count as the user's. A
-/// sticky directory others may write counts as one they can create entries in.
+/// either unless its group is the user's private group (`is_private_group`) -- the user's
+/// alone, so the directories a umask of 002 leaves group-writable, as Debian-style user private
+/// groups intend, count as the user's; and no ACL it carries may let others write
+/// (`acls_let_others_write`: POSIX, NFSv4 and CIFS ACLs on Linux). A sticky directory others
+/// may write counts as one they can create entries in.
 ///
-/// Only what `st_mode` shows is seen otherwise. Write permission a POSIX ACL grants to named
-/// users or groups shows there (in the group bits, the ACL mask), and so counts as others'
-/// unless the ACL is read and names nobody; write permission a macOS or NFSv4 ACL grants does
-/// not show, and is not taken into account. That is a residual: below a directory such an ACL
-/// lets others write, a directory found existing -- possibly one of theirs renamed there -- is
-/// given the mode or owner asked for.
+/// A macOS ACL grants write permission the mode does not show, and is not read: a residual --
+/// below a directory such an ACL lets others write, a directory found existing, possibly one
+/// of theirs renamed there, is given the mode or owner asked for.
 pub fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
     let euid = unsafe { libc::geteuid() };
-    Ok(match dir_writers(&fstat(fd)?, euid) {
-        DirWriters::User => true,
-        DirWriters::Others => false,
-        DirWriters::UserAndGroup { gid, euid } => {
-            is_private_group(gid, euid) && !acl_may_name_others(fd)
-        }
-    })
+    Ok(only_the_user_writes(
+        dir_writers(&fstat(fd)?, euid),
+        Some(fd),
+    ))
 }
 
-/// Whether the access ACL of the directory open on `fd` may grant anyone but its owner and its
-/// owning group: it has a named user or named group entry, or it cannot be read for certain.
-/// No ACL, or a filesystem without ACLs, grants nobody else.
+/// Whether nobody but the user can create entries in a directory whose mode shows `writers`,
+/// held as `dir` (`None` once its holder has closed it, which settles nothing and so counts as
+/// others'): the rule `nobody_else_can_create` and `ChainTrust` both follow.
 ///
-/// Read as the `system.posix_acl_access` attribute. An `O_PATH` descriptor takes no `fgetxattr`
-/// (EBADF); the directory is then reopened for reading through `self/fd/N` under a `/proc`
-/// verified to be procfs (`procfs_dir`), which names the same inode -- and one the user may
-/// not read counts as one that may.
-#[cfg(target_os = "linux")]
-fn acl_may_name_others(fd: RawFd) -> bool {
-    const ACCESS_ACL: &CStr = c"system.posix_acl_access";
-    let read = |fd: RawFd, buf: &mut [u8]| {
-        let n =
-            unsafe { libc::fgetxattr(fd, ACCESS_ACL.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-        usize::try_from(n).map_err(|_| io::Error::last_os_error())
+/// Beyond the mode: a directory group-writable for the user's private group (`is_private_group`)
+/// counts as the user's alone; and either way, an ACL read from the directory may let others
+/// write (`acls_let_others_write`). The ACL is read last, only when the rest says the user's.
+fn only_the_user_writes(writers: DirWriters, dir: Option<RawFd>) -> bool {
+    let acls_allow = |group_writable| {
+        dir.is_some_and(|fd| !acls_let_others_write(|name| read_xattr(fd, name), group_writable))
     };
-    let mut buf = [0u8; 1024];
-    let mut result = read(fd, &mut buf);
-    if result
-        .as_ref()
-        .is_err_and(|e| e.raw_os_error() == Some(libc::EBADF))
-    {
-        let reopened = procfs_dir().and_then(|proc_dir| {
-            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-            let name = proc_fd_name(fd);
-            let fd = unsafe { libc::openat(proc_dir.as_raw_fd(), name.as_ptr(), flags) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(unsafe { File::from_raw_fd(fd) })
-        });
-        result = reopened.and_then(|dir| read(dir.as_raw_fd(), &mut buf));
-    }
-    match result {
-        Ok(len) => acl_names_others(&buf[..len]),
-        Err(e) => !matches!(
-            e.raw_os_error(),
-            Some(libc::ENODATA) | Some(libc::EOPNOTSUPP)
-        ),
+    match writers {
+        DirWriters::Others => false,
+        DirWriters::User => acls_allow(false),
+        DirWriters::UserAndGroup { gid, euid } => is_private_group(gid, euid) && acls_allow(true),
     }
 }
 
-/// No ACL can be read here: assume one may (the private-group rule does not apply here anyway).
+/// Whether an ACL of a directory may let others write it, `read` reading one of its extended
+/// attributes, failing with ENODATA or EOPNOTSUPP where it has none or they are not supported:
+/// - an NFSv4 or CIFS ACL (`system.nfs4_acl`, `system.nfs4_acl_xdr`, `system.cifs_acl`): its
+///   attribute being there at all, its entries unread -- one may grant anyone write whatever
+///   the mode shows;
+/// - where the directory is group-writable, a POSIX access ACL (`system.posix_acl_access`)
+///   with a named user or group entry (`acl_names_others`), which shows in the mode as group
+///   write permission (the ACL mask) and nowhere else.
+///
+/// Any other failure to read one counts as one that does. Residual: an ACL a server applies
+/// that the client does not show as an attribute at all, which nothing here can see.
+fn acls_let_others_write(
+    read: impl Fn(&CStr) -> io::Result<Vec<u8>>,
+    group_writable: bool,
+) -> bool {
+    const NFS4_OR_CIFS: [&CStr; 3] = [
+        c"system.nfs4_acl",
+        c"system.nfs4_acl_xdr",
+        c"system.cifs_acl",
+    ];
+    let absent = |e: &io::Error| {
+        e.raw_os_error()
+            .is_some_and(|code| [libc::ENODATA, libc::EOPNOTSUPP, libc::ENOTSUP].contains(&code))
+    };
+    for name in NFS4_OR_CIFS {
+        match read(name) {
+            Err(e) if absent(&e) => {}
+            _ => return true,
+        }
+    }
+    if !group_writable {
+        return false;
+    }
+    match read(c"system.posix_acl_access") {
+        Ok(xattr) => acl_names_others(&xattr),
+        Err(e) => !absent(&e),
+    }
+}
+
+/// The extended attribute `name` of the directory open on `fd`.
+///
+/// An `O_PATH` descriptor takes no `fgetxattr` (EBADF); the attribute is then read through
+/// `/proc/self/fd/N`, once `/proc` is verified to be procfs (`procfs_dir`), which names the
+/// same inode and needs no permission on it to read a `system.` attribute. (The path is
+/// resolved again after the check: only root can mount something else over `/proc`.)
+#[cfg(target_os = "linux")]
+fn read_xattr(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; 4096];
+    let read = |n: isize, mut buf: Vec<u8>| {
+        let len = usize::try_from(n).map_err(|_| io::Error::last_os_error())?;
+        buf.truncate(len);
+        Ok(buf)
+    };
+    let n = unsafe { libc::fgetxattr(fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
+        return read(n, buf);
+    }
+    procfs_dir()?;
+    let path = CString::new(format!("/proc/{}", proc_fd_name(fd).to_string_lossy()))
+        .expect("a formatted number has no NUL");
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    read(n, buf)
+}
+
+/// No extended attribute is read here: none is supported (EOPNOTSUPP), and only the mode tells.
 #[cfg(not(target_os = "linux"))]
-fn acl_may_name_others(_fd: RawFd) -> bool {
-    true
+fn read_xattr(_fd: RawFd, _name: &CStr) -> io::Result<Vec<u8>> {
+    Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
 }
 
 /// Whether the `system.posix_acl_access` attribute `xattr` has an entry beyond the owner, the
 /// owning group, the mask and others -- or is not one this reads for certain. Its format is
 /// the kernel's: a little-endian 32-bit version (2), then 8-byte entries of a 16-bit tag, a
 /// 16-bit permission set and a 32-bit id.
-#[cfg(any(target_os = "linux", test))]
 fn acl_names_others(xattr: &[u8]) -> bool {
     const USER_OBJ: u16 = 0x01;
     const GROUP_OBJ: u16 = 0x04;
@@ -1015,10 +1046,10 @@ pub fn utimens_link_if_still(
 #[cfg(test)]
 mod tests {
     use super::{
-        acl_names_others, dir_writers, empty_lending_read, group_entry, group_is_private,
-        is_private_group, made_by_us, others_can_rename, user_entry, utimens_link_if_still,
-        verify_made_dir, ChainTrust, DirWriters, FoundDir, FsOwners, MadeObject, MadeTrust,
-        Preserve, UserEntry,
+        acl_names_others, acls_let_others_write, dir_writers, empty_lending_read, group_entry,
+        group_is_private, is_private_group, made_by_us, others_can_rename, user_entry,
+        utimens_link_if_still, verify_made_dir, ChainTrust, DirWriters, FoundDir, FsOwners,
+        MadeObject, MadeTrust, Preserve, UserEntry,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1091,6 +1122,61 @@ mod tests {
         assert!(!group_is_private(500, &us, b"us", [Some(OTHER)]));
         // A member whose name resolves to nobody cannot be shown to be the user.
         assert!(!group_is_private(500, &us, b"us", [None]));
+    }
+
+    /// An NFSv4 or CIFS ACL may let anyone write, whatever the mode shows: its attribute being
+    /// there at all, or not readable for certain, makes a directory others may write -- with
+    /// group write permission or without. A POSIX ACL widens only group write permission, and
+    /// counts only then.
+    #[test]
+    fn which_acl_attributes_let_others_write() {
+        use std::ffi::CStr;
+        let absent = || Err(std::io::Error::from_raw_os_error(libc::ENODATA));
+        let unsupported = || Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        let named_user = {
+            let mut xattr = 2u32.to_le_bytes().to_vec();
+            for tag in [0x01u16, 0x02, 0x04, 0x10, 0x20] {
+                xattr.extend(tag.to_le_bytes());
+                xattr.extend(7u16.to_le_bytes());
+                xattr.extend(0u32.to_le_bytes());
+            }
+            xattr
+        };
+        // Each case: the one attribute present (or failing), and whether that lets others
+        // write without group write permission and with it.
+        let cases: [(&CStr, std::io::Result<Vec<u8>>, bool, bool); 6] = [
+            (c"system.nfs4_acl", Ok(vec![0; 8]), true, true),
+            (c"system.nfs4_acl_xdr", Ok(Vec::new()), true, true),
+            (c"system.cifs_acl", Ok(vec![1]), true, true),
+            (
+                c"system.cifs_acl",
+                Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                true,
+                true,
+            ),
+            (c"system.posix_acl_access", Ok(named_user), false, true),
+            (c"system.posix_acl_access", unsupported(), false, false),
+        ];
+        for (name, value, without_group, with_group) in cases {
+            let read = |asked: &CStr| -> std::io::Result<Vec<u8>> {
+                if asked != name {
+                    return absent();
+                }
+                match &value {
+                    Ok(value) => Ok(value.clone()),
+                    Err(e) => Err(std::io::Error::from_raw_os_error(e.raw_os_error().unwrap())),
+                }
+            };
+            assert_eq!(
+                acls_let_others_write(read, false),
+                without_group,
+                "{name:?}"
+            );
+            assert_eq!(acls_let_others_write(read, true), with_group, "{name:?}");
+        }
+        // No attribute at all, or none supported: the mode tells.
+        assert!(!acls_let_others_write(|_| absent(), true));
+        assert!(!acls_let_others_write(|_| unsupported(), true));
     }
 
     /// An access ACL names someone else when it has any entry but the owner's, the owning
@@ -1332,17 +1418,16 @@ mod tests {
             .unwrap();
     }
 
-    /// A link holds its directory's descriptor weakly. A group-writable one, whose group needs
-    /// asking about, counts as one others may write once its holder has closed it; one the
-    /// mode alone settles does not need it.
+    /// A link holds its directory's descriptor weakly: its ACLs, read only when asked, cannot
+    /// be read once its holder has closed it, and it then counts as one others may write.
     #[test]
-    fn a_closed_group_writable_directory_is_not_trusted() {
+    fn a_closed_directory_is_not_trusted() {
         let tmp = crate::tmp::TempDir::new().unwrap();
         let mode = Preserve {
             mode: true,
             owner: true,
         };
-        for (perm, open, closed) in [(0o755, true, true), (0o775, private_here(), false)] {
+        for (perm, open, closed) in [(0o755, true, false), (0o775, private_here(), false)] {
             std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(perm)).unwrap();
             let held = Rc::new(std::fs::File::open(tmp.path()).unwrap());
             let trust = ChainTrust::anchor(&held).unwrap();

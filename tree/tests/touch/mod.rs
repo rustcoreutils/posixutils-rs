@@ -432,6 +432,74 @@ fn test_touch_d_rfc5322_rejections() {
     }
 }
 
+/// Every date base-files' debian/timestamps gives its license files, the
+/// POSIX form followed by ` UTC`. Each value is GNU touch 9.4's stat `%Y`.
+#[test]
+fn test_touch_d_utc_word_base_files() {
+    for (date, secs) in [
+        ("1999-08-26 12:06:20 UTC", 935_669_180),
+        ("2004-12-19 20:30:25 UTC", 1_103_488_225),
+        ("2017-04-03 11:00:00 UTC", 1_491_217_200),
+        ("2017-04-03 20:00:00 UTC", 1_491_249_600),
+        ("2017-04-25 22:26:15 UTC", 1_493_159_175),
+        ("2017-09-30 07:14:21 UTC", 1_506_755_661),
+        ("2019-02-18 09:59:20 UTC", 1_550_483_960),
+        ("2022-02-10 06:14:38 UTC", 1_644_473_678),
+        ("2023-09-11 21:49:40 UTC", 1_694_468_980),
+        ("2023-09-11 21:49:41 UTC", 1_694_468_981),
+        ("2024-09-18 13:56:22 UTC", 1_726_667_782),
+        ("2024-09-18 14:33:26 UTC", 1_726_670_006),
+        ("2024-09-18 14:33:27 UTC", 1_726_670_007),
+        ("2024-09-18 14:33:28 UTC", 1_726_670_008),
+        ("2024-09-18 14:33:29 UTC", 1_726_670_009),
+        ("2026-01-12 21:19:44 UTC", 1_768_252_784),
+        ("2026-05-29 10:00:00 UTC", 1_780_048_800),
+    ] {
+        assert_eq!(d_mtime(date), secs, "{date:?}");
+    }
+}
+
+/// ` UTC` and ` GMT` mean what `Z` means, after either separator and with a
+/// fraction, as GNU touch 9.4 gives them.
+#[test]
+fn test_touch_d_utc_word_forms() {
+    let secs = 935_669_180; // 1999-08-26 12:06:20 UTC
+    assert_eq!(d_mtime("1999-08-26T12:06:20Z"), secs);
+    assert_eq!(d_mtime("1999-08-26T12:06:20 UTC"), secs);
+    assert_eq!(d_mtime("1999-08-26 12:06:20 GMT"), secs);
+    assert_eq!(d_mtime("1999-08-26T12:06:20 GMT"), secs);
+    for date in ["1999-08-26 12:06:20.25 UTC", "1999-08-26T12:06:20,25 GMT"] {
+        let ((_, _), mtime) = touch_d(date).unwrap();
+        assert_eq!(mtime, (secs, 250_000_000), "{date:?}");
+    }
+}
+
+/// Only a single space and then exactly `UTC` or `GMT` is the zone word.
+#[test]
+fn test_touch_d_utc_word_rejections() {
+    for date in [
+        "1999-08-26 12:06:20 utc",        // GNU accepts
+        "1999-08-26 12:06:20 Utc",        // GNU accepts
+        "1999-08-26 12:06:20 EST",        // GNU rejects
+        "1999-08-26 12:06:20 UT",         // GNU accepts
+        "1999-08-26 12:06:20 CET",        // GNU accepts, as UTC+1
+        "1999-08-26 12:06:20Z UTC",       // GNU rejects
+        "1999-08-26 12:06:20 +00:00 UTC", // a word after an offset
+        "1999-08-26 12:06:20  UTC",       // GNU accepts
+        "1999-08-26 12:06:20\tUTC",       // GNU accepts
+        "1999-08-26 12:06:20UTC",         // GNU accepts
+        "1999-08-26 12:06:20 UTC x",      // GNU rejects
+        "1999-08-26 12:06:20 UTC ",       // GNU accepts
+        "1999-08-26 12:06 UTC",           // no seconds, as with Z; GNU accepts
+        "1999-08-26 UTC",                 // no time
+        "UTC",
+    ] {
+        let out = touch_d(date).expect_err(date);
+        assert_eq!(out.status.code(), Some(1), "{date:?}: {out:?}");
+        assert!(!out.stderr.is_empty(), "{date:?}");
+    }
+}
+
 /// The POSIX `-d` forms give the same instants as before, in `TZ` when they
 /// have no zone.
 #[test]

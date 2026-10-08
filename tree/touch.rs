@@ -29,7 +29,7 @@ struct Args {
     #[arg(short, long, help = gettext("Change the modification time of file"))]
     mtime: bool,
 
-    #[arg(short, long, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format, or an RFC 5322 date as printed by 'date -R', instead of the current time"))]
+    #[arg(short, long, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format (a trailing ' UTC' or ' GMT' means 'Z'), or an RFC 5322 date as printed by 'date -R', instead of the current time"))]
     datetime: Option<String>,
 
     #[arg(short, long, group = "timefmt", help = gettext("Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current time"))]
@@ -74,13 +74,29 @@ fn systemtime_to_ts(t: SystemTime) -> libc::timespec {
     }
 }
 
-/// Parse the `-d` operand: the POSIX extended ISO-8601 form, or the RFC 5322 date that
-/// `date -R` prints (see [`parse_rfc5322`]).
+/// Parse the `-d` operand: the POSIX extended ISO-8601 form, that form followed by ` UTC` or
+/// ` GMT` (see [`strip_utc_word`]), or the RFC 5322 date that `date -R` prints (see
+/// [`parse_rfc5322`]).
 fn parse_datetime(input: &str) -> Result<libc::timespec, String> {
     if let Some(secs) = parse_rfc5322(input) {
         return Ok(mk_ts(secs, 0));
     }
+    if let Some(datetime) = strip_utc_word(input) {
+        return parse_iso8601(&format!("{datetime}Z"))
+            .map_err(|_| gettext!("invalid date format: '{}'", input));
+    }
     parse_iso8601(input)
+}
+
+/// The POSIX date-time before a trailing ` UTC` or ` GMT`, a word that means exactly what a
+/// trailing `Z` means. This is not POSIX: Debian's base-files passes
+/// `touch -d "1999-08-26 12:06:20 UTC"`. One space and the upper-case word only; any other
+/// zone word, spelling or spacing is left to fail as before.
+fn strip_utc_word(input: &str) -> Option<&str> {
+    let datetime = input
+        .strip_suffix(" UTC")
+        .or_else(|| input.strip_suffix(" GMT"))?;
+    (!datetime.ends_with(char::is_whitespace)).then_some(datetime)
 }
 
 /// The English day and month abbreviations of RFC 5322, as `date -R` spells them.

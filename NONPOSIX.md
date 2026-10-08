@@ -567,6 +567,12 @@ GNU tar.
    and a numeric `+hhmm` / `-hhmm` zone, single spaces, the English
    abbreviations spelled as `date -R` spells them, and a day name that
    matches the date.  Zone names such as `GMT` are refused.
+ * `-d` also takes the POSIX date-time followed by a single space and the
+   word `UTC` or `GMT`, meaning exactly what a trailing `Z` means:
+   `1999-08-26 12:06:20 UTC`.  base-files' debian/timestamps sets its
+   license files' times in this form.  Only those two words, in upper
+   case, after one space; other zone words, `UTC` combined with `Z`, and
+   any other spacing are refused.
 
 ### tr
 

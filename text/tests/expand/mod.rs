@@ -156,9 +156,7 @@ fn expand_backspace_decrements_the_column() {
 
 #[test]
 fn expand_multiple_files_and_a_missing_one() {
-    let mut good = std::env::temp_dir();
-    good.push(format!("posixutils-expand-{}", std::process::id()));
-    std::fs::write(&good, "a\tb\n").expect("write temp file");
+    let good = plib::testing::TempFile::new("good", "a\tb\n");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_expand"))
         .args([good.to_str().unwrap(), good.to_str().unwrap()])
@@ -175,5 +173,4 @@ fn expand_multiple_files_and_a_missing_one() {
         .output()
         .expect("run expand");
     assert_eq!(out.status.code(), Some(1), "a missing operand must exit 1");
-    let _ = std::fs::remove_file(good);
 }

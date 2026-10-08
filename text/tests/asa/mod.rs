@@ -348,12 +348,8 @@ fn asa_run(args: &[&str]) -> (String, String, i32) {
     )
 }
 
-fn tmp_file(name: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-asa-{}-{}", std::process::id(), name));
-    let mut f = std::fs::File::create(&p).expect("create temp file");
-    f.write_all(content.as_bytes()).expect("write temp file");
-    p
+fn tmp_file(name: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(name, content)
 }
 
 #[test]
@@ -377,7 +373,6 @@ fn asa_continues_past_a_missing_file() {
         stdout.contains("kept"),
         "later operands must still be processed, got {stdout:?}"
     );
-    let _ = std::fs::remove_file(good);
 }
 
 #[test]
@@ -400,8 +395,6 @@ fn asa_dash_interleaved_with_files() {
     let out = child.wait_with_output().expect("wait asa");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout, "first\nsecond\nthird\n", "got {stdout:?}");
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -411,5 +404,4 @@ fn asa_double_dash_ends_options() {
     let (stdout, _, code) = asa_run(&["--", f.to_str().unwrap()]);
     assert_eq!(code, 0);
     assert_eq!(stdout, "body\n");
-    let _ = std::fs::remove_file(f);
 }

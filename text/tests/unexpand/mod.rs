@@ -232,9 +232,7 @@ fn test_unexpand_error_names_the_file() {
 /// whole point of carrying the name from the origin.
 #[test]
 fn test_unexpand_names_the_failing_operand_among_several() {
-    let good =
-        std::env::temp_dir().join(format!("posixutils-unexpand-good-{}", std::process::id()));
-    std::fs::write(&good, "a\tb\n").unwrap();
+    let good = plib::testing::TempFile::new("good", "a\tb\n");
 
     let out = std::process::Command::new(plib::testing::get_binary_path("unexpand"))
         .arg(&good)
@@ -251,5 +249,4 @@ fn test_unexpand_names_the_failing_operand_among_several() {
         !stderr.contains(good.to_str().unwrap()),
         "the readable operand must not be blamed: {stderr:?}"
     );
-    let _ = std::fs::remove_file(good);
 }

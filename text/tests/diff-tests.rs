@@ -13,16 +13,52 @@ use plib::testing::{run_test, run_test_u8, run_test_with_checker, TestPlan, Test
 const EXIT_STATUS_NO_DIFFERENCE: i32 = 0;
 const EXIT_STATUS_DIFFERENCE: i32 = 1;
 const EXIT_STATUS_TROUBLE: i32 = 2;
+use plib::testing::TempFile;
+use plib::tmp::TempDir;
 use std::io::Write as _;
 use std::{path::PathBuf, process::Stdio};
 
-/// Write `content` to a uniquely named temp file and return its path. The
-/// `tag` must be unique per test to avoid collisions under parallel runs.
-fn write_tmp(tag: &str, content: &[u8]) -> String {
-    let path = std::env::temp_dir().join(format!("pu_difftest_{}_{}", std::process::id(), tag));
-    let mut f = std::fs::File::create(&path).expect("create temp file");
-    f.write_all(content).expect("write temp file");
-    path.to_str().unwrap().to_string()
+/// A temp file's path, as the `&str` an argument list wants. The file sits in
+/// a directory of its own, and both are removed when this drops -- a failed
+/// assertion included.
+struct TmpPath {
+    path: String,
+    _file: TempFile,
+}
+
+impl std::ops::Deref for TmpPath {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TmpPath {
+    fn as_ref(&self) -> &std::path::Path {
+        self.path.as_ref()
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TmpPath {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_ref()
+    }
+}
+
+impl std::fmt::Display for TmpPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.path)
+    }
+}
+
+/// Write `content` to a temp file named `tag` and return its path.
+fn write_tmp(tag: &str, content: &[u8]) -> TmpPath {
+    let file = TempFile::new(tag, content);
+    TmpPath {
+        path: file.to_str().unwrap().to_string(),
+        _file: file,
+    }
 }
 
 /// Run `diff` with `args`, asserting stdout, stderr, and exit code.
@@ -842,7 +878,7 @@ fn test_diff_unified_header_timestamp_format() {
     run_test_with_checker(
         TestPlan {
             cmd: String::from("diff"),
-            args: vec![String::from("-u"), f1.clone(), f2.clone()],
+            args: vec![String::from("-u"), f1.to_string(), f2.to_string()],
             stdin_data: String::new(),
             expected_out: String::new(),
             expected_err: String::new(),
@@ -877,12 +913,9 @@ fn test_diff_unified_header_timestamp_format() {
 // Operands, exit status and boundary hunk ranges
 // ---------------------------------------------------------------------------
 
-/// Write `content` to a uniquely named temporary file and return its path.
-fn diff_tmp(tag: &str, content: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-diff-{}-{}", std::process::id(), tag));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+/// Write `content` to a temporary file named `tag`, removed when dropped.
+fn diff_tmp(tag: &str, content: &str) -> TempFile {
+    TempFile::new(tag, content)
 }
 
 #[test]
@@ -890,8 +923,6 @@ fn test_diff_identical_files_are_silent_and_exit_zero() {
     let a = diff_tmp("same-a", "x\ny\n");
     let b = diff_tmp("same-b", "x\ny\n");
     diff_test(&[a.to_str().unwrap(), b.to_str().unwrap()], "", 0);
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -914,8 +945,6 @@ fn test_diff_exit_status_is_zero_one_two() {
         Some(2),
         "an inaccessible operand is an error, not a difference"
     );
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -943,7 +972,6 @@ fn test_diff_stdin_operand() {
         stdout.contains("< b") && stdout.contains("> X"),
         "got {stdout:?}"
     );
-    let _ = std::fs::remove_file(a);
 }
 
 #[test]
@@ -971,8 +999,6 @@ fn test_diff_context_empty_range_header() {
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--- 0 ----"), "got {stdout:?}");
-    let _ = std::fs::remove_file(empty);
-    let _ = std::fs::remove_file(one);
 }
 
 #[test]
@@ -992,8 +1018,6 @@ fn test_diff_no_trailing_newline_in_context_and_unified() {
             "{mode} must mark both sides, got {stdout:?}"
         );
     }
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -1024,18 +1048,13 @@ fn test_diff_edit_script_escapes_a_lone_period() {
         lines.iter().any(|l| l.contains("s/^\\.\\.$/./")),
         "the escape must be repaired, got {stdout:?}"
     );
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
 fn test_diff_directory_with_a_fifo() {
     // A non-regular file in a recursive comparison must not make diff block on
     // opening it, nor abort the walk over the regular files beside it.
-    let base = std::env::temp_dir().join(format!("posixutils-diff-fifo-{}", std::process::id()));
-    let (a, b) = (base.join("a"), base.join("b"));
-    std::fs::create_dir_all(&a).expect("mkdir a");
-    std::fs::create_dir_all(&b).expect("mkdir b");
+    let (_base, a, b) = dir_pair();
     std::fs::write(a.join("f"), "x\n").expect("write a/f");
     std::fs::write(b.join("f"), "y\n").expect("write b/f");
     let made_fifo = std::process::Command::new("mkfifo")
@@ -1061,7 +1080,6 @@ fn test_diff_directory_with_a_fifo() {
         stdout.contains("< x") && stdout.contains("> y"),
         "got {stdout:?}"
     );
-    let _ = std::fs::remove_dir_all(&base);
 }
 /// `diff -r` must terminate on a symlink cycle rather than recursing forever.
 ///
@@ -1073,7 +1091,7 @@ fn test_diff_directory_with_a_fifo() {
 #[cfg(unix)]
 #[test]
 fn test_diff_recursive_symlink_cycle_terminates() {
-    let (a, b) = dir_pair("cycle");
+    let (_base, a, b) = dir_pair();
     for dir in [&a, &b] {
         std::fs::write(dir.join("f"), "x\n").expect("write f");
         // The cycle is the whole point of the test: without it `diff -r` has
@@ -1095,7 +1113,6 @@ fn test_diff_recursive_symlink_cycle_terminates() {
         "got {:?}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
 
 /// Lines inserted before the first line the two files have in common are a
@@ -1376,7 +1393,6 @@ fn test_diff_context_and_unified_round_trip_through_patch() {
                 b.as_bytes(),
                 "{flag} {width}: patched file does not match the second file"
             );
-            let _ = std::fs::remove_file(&work);
         }
     }
 }
@@ -1602,7 +1618,6 @@ fn test_diff_patch_round_trip_preserves_bytes() {
             after,
             "{tag}: patched file does not match the second file byte for byte"
         );
-        let _ = std::fs::remove_file(&work);
     }
 }
 
@@ -1771,16 +1786,14 @@ fn test_diff_dies_by_sigpipe_on_a_closed_pipe() {
     plib::testing::assert_dies_by_sigpipe("diff", &[&f1, &f2]);
 }
 
-/// Build two directory trees under a unique base and hand back their paths.
-/// The base is removed first: a crashed earlier run can leave one behind and
-/// PIDs are recycled.
-fn dir_pair(tag: &str) -> (PathBuf, PathBuf) {
-    let base = std::env::temp_dir().join(format!("posixutils-diff-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    let (a, b) = (base.join("a"), base.join("b"));
-    std::fs::create_dir_all(&a).expect("mkdir a");
-    std::fs::create_dir_all(&b).expect("mkdir b");
-    (a, b)
+/// Build two directory trees, `a` and `b`, under a fresh temporary base and
+/// hand back the base and their paths. Dropping the base removes both trees.
+fn dir_pair() -> (TempDir, PathBuf, PathBuf) {
+    let base = plib::tmp::tempdir().expect("create temp dir");
+    let (a, b) = (base.path().join("a"), base.path().join("b"));
+    std::fs::create_dir(&a).expect("mkdir a");
+    std::fs::create_dir(&b).expect("mkdir b");
+    (base, a, b)
 }
 
 fn run_diff(args: &[&str]) -> (String, String, Option<i32>) {
@@ -1800,7 +1813,7 @@ fn run_diff(args: &[&str]) -> (String, String, Option<i32>) {
 /// leaving the status at 0, so `if diff -r a b; then` never saw a difference.
 #[test]
 fn test_diff_directory_only_in_sets_exit_status() {
-    let (a, b) = dir_pair("onlyin");
+    let (_base, a, b) = dir_pair();
     std::fs::write(a.join("same"), "hi\n").unwrap();
     std::fs::write(b.join("same"), "hi\n").unwrap();
     std::fs::write(b.join("extra"), "x\n").unwrap();
@@ -1808,7 +1821,6 @@ fn test_diff_directory_only_in_sets_exit_status() {
     let (stdout, _, code) = run_diff(&[a.to_str().unwrap(), b.to_str().unwrap()]);
     assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
     assert!(stdout.contains("Only in"), "got {stdout:?}");
-    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
 
 /// Entries are classified by following symlinks. `DirEntry::file_type` does
@@ -1819,7 +1831,7 @@ fn test_diff_directory_only_in_sets_exit_status() {
 #[cfg(unix)]
 #[test]
 fn test_diff_symlink_to_file_is_compared_as_a_file() {
-    let (a, b) = dir_pair("symlink");
+    let (_base, a, b) = dir_pair();
     for dir in [&a, &b] {
         std::fs::write(dir.join("target"), "t\n").unwrap();
         std::os::unix::fs::symlink("target", dir.join("link")).expect("symlink");
@@ -1841,14 +1853,13 @@ fn test_diff_symlink_to_file_is_compared_as_a_file() {
     std::fs::write(b.join("target"), "u\n").unwrap();
     let (_, _, code) = run_diff(&["-r", a.to_str().unwrap(), b.to_str().unwrap()]);
     assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
-    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
 
 /// A directory in one tree where the other has a file is a difference, and
 /// the message names what each side actually is.
 #[test]
 fn test_diff_directory_versus_file_mismatch() {
-    let (a, b) = dir_pair("dirfile");
+    let (_base, a, b) = dir_pair();
     std::fs::create_dir_all(a.join("x")).unwrap();
     std::fs::write(a.join("x").join("inner"), "i\n").unwrap();
     std::fs::write(b.join("x"), "hi\n").unwrap();
@@ -1859,7 +1870,6 @@ fn test_diff_directory_versus_file_mismatch() {
         stdout.contains("is a directory while file") && stdout.contains("is a regular file"),
         "got {stdout:?}"
     );
-    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
 
 /// One unreadable entry used to end the walk, so every later entry went
@@ -1871,7 +1881,7 @@ fn test_diff_directory_versus_file_mismatch() {
 fn test_diff_directory_walk_continues_past_an_unreadable_entry() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let (a, b) = dir_pair("noread");
+    let (_base, a, b) = dir_pair();
     for (name, left, right) in [("aaa", "x\n", "y\n"), ("zzz", "m\n", "n\n")] {
         std::fs::write(a.join(name), left).unwrap();
         std::fs::write(b.join(name), right).unwrap();
@@ -1891,7 +1901,6 @@ fn test_diff_directory_walk_continues_past_an_unreadable_entry() {
         stderr.contains("mmm"),
         "the diagnostic must name the file it is about: {stderr:?}"
     );
-    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
 
 /// POSIX: on entering a previously visited directory, diff "shall write a
@@ -1901,7 +1910,7 @@ fn test_diff_directory_walk_continues_past_an_unreadable_entry() {
 #[cfg(unix)]
 #[test]
 fn test_diff_recursive_directory_loop_is_diagnosed() {
-    let (a, b) = dir_pair("rloop");
+    let (_base, a, b) = dir_pair();
     for dir in [&a, &b] {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::os::unix::fs::symlink("../..", dir.join("sub").join("up")).expect("symlink");
@@ -1913,7 +1922,6 @@ fn test_diff_recursive_directory_loop_is_diagnosed() {
         "got {stderr:?}"
     );
     assert_eq!(code, Some(EXIT_STATUS_TROUBLE));
-    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
 
 /// The per-file header echoes the options as given, not a canonical rendering
@@ -1921,7 +1929,7 @@ fn test_diff_recursive_directory_loop_is_diagnosed() {
 /// --label value took the pathname operand's place.
 #[test]
 fn test_diff_recursive_per_file_header_echoes_the_command_line() {
-    let (a, b) = dir_pair("header");
+    let (_base, a, b) = dir_pair();
     std::fs::write(a.join("f"), "one\n").unwrap();
     std::fs::write(b.join("f"), "two\n").unwrap();
     let (as_, bs) = (a.to_str().unwrap(), b.to_str().unwrap());
@@ -1945,7 +1953,6 @@ fn test_diff_recursive_per_file_header_echoes_the_command_line() {
             "header for {args:?}"
         );
     }
-    let _ = std::fs::remove_dir_all(a.parent().unwrap());
 }
 
 /// An I/O error names the file it actually happened on.
@@ -1963,7 +1970,7 @@ fn test_diff_io_error_names_the_failing_path() {
     let unreadable = std::fs::Permissions::from_mode(0o000);
     let readable = std::fs::Permissions::from_mode(0o644);
 
-    let (a, b) = dir_pair("whichpath");
+    let (_base, a, b) = dir_pair();
     std::fs::write(a.join("f"), "x\n").unwrap();
     std::fs::write(b.join("f"), "y\n").unwrap();
     let (as_, bs) = (
@@ -1993,7 +2000,7 @@ fn test_diff_io_error_names_the_failing_path() {
     assert!(stderr.contains(f.to_str().unwrap()), "got {stderr:?}");
 
     // A subdirectory that cannot be read names itself, not its counterpart.
-    let (c, d) = dir_pair("whichdir");
+    let (_base2, c, d) = dir_pair();
     for dir in [&c, &d] {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub").join("g"), "1\n").unwrap();
@@ -2004,7 +2011,4 @@ fn test_diff_io_error_names_the_failing_path() {
     std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(code, Some(EXIT_STATUS_TROUBLE));
     assert!(stderr.contains(broken.to_str().unwrap()), "got {stderr:?}");
-
-    let _ = std::fs::remove_dir_all(a.parent().unwrap());
-    let _ = std::fs::remove_dir_all(c.parent().unwrap());
 }

@@ -1421,11 +1421,8 @@ fn test_duplicate_patterns_are_all_used() {
 // Pattern-file and input edge cases
 // ---------------------------------------------------------------------------
 
-fn grep_tmp(tag: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-grep-{}-{}", std::process::id(), tag));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+fn grep_tmp(tag: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(tag, content)
 }
 
 fn grep_stdin(args: &[&str], stdin: &[u8]) -> (Vec<u8>, i32) {
@@ -1459,8 +1456,6 @@ fn grep_pattern_file_with_a_trailing_empty_line() {
         "foo\nbar\n",
         "an empty last pattern matches every line"
     );
-    let _ = std::fs::remove_file(one);
-    let _ = std::fs::remove_file(blank);
 }
 
 #[test]

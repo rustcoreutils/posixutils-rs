@@ -297,11 +297,8 @@ fn head_run(args: &[&str]) -> (String, String, i32) {
     )
 }
 
-fn head_tmp(name: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-head-{}-{}", std::process::id(), name));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+fn head_tmp(name: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(name, content)
 }
 
 #[test]
@@ -321,8 +318,6 @@ fn head_multiple_files_get_name_headers() {
         ),
         "got {stdout:?}"
     );
-    let _ = std::fs::remove_file(a);
-    let _ = std::fs::remove_file(b);
 }
 
 #[test]
@@ -334,7 +329,6 @@ fn head_single_file_has_no_header() {
         stdout, "x\n",
         "a lone operand gets no header, got {stdout:?}"
     );
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -347,7 +341,6 @@ fn head_zero_count_writes_nothing_and_succeeds() {
     let (stdout, _, code) = head_run(&["-c", "0", p]);
     assert_eq!(stdout, "");
     assert_eq!(code, 0, "-c 0 is not an error");
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -381,7 +374,6 @@ fn head_mixes_dash_with_named_files() {
         stdout.contains("==>"),
         "multiple operands get headers: {stdout:?}"
     );
-    let _ = std::fs::remove_file(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +407,6 @@ fn head_historical_number_with_file() {
     // An option may follow an operand, as `-n` may.
     let (stdout, _, code) = head_run(&[p, "-2"]);
     assert_eq!((stdout.as_str(), code), ("1\n2\n", 0));
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -430,7 +421,6 @@ fn head_historical_number_last_count_wins() {
     assert_eq!((stdout.as_str(), code), ("1\n2\n", 0));
     let (stdout, _, code) = head_run(&["-n", "4", "-n", "1", p]);
     assert_eq!((stdout.as_str(), code), ("1\n", 0));
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -438,25 +428,21 @@ fn head_historical_zero_writes_nothing() {
     let f = head_tmp("hist0", TWENTY_LINES);
     let (stdout, stderr, code) = head_run(&["-0", f.to_str().unwrap()]);
     assert_eq!((stdout.as_str(), stderr.as_str(), code), ("", "", 0));
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
 fn head_historical_number_is_not_an_operand_after_double_dash() {
     // `--` ends the options: a following "-1" is a file named "-1", and the
     // option-argument of a separate `-n` is never rewritten.
-    let mut dir = std::env::temp_dir();
-    dir.push(format!("posixutils-head-{}-dashdir", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("-1"), "x\ny\nz\n").unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
+    std::fs::write(dir.path().join("-1"), "x\ny\nz\n").unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_head"))
         .args(["-2", "--", "-1"])
-        .current_dir(&dir)
+        .current_dir(dir.path())
         .output()
         .expect("run head");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "x\ny\n");
     assert_eq!(out.status.code(), Some(0));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

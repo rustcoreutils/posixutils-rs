@@ -372,11 +372,8 @@ fn tail_run(args: &[&str]) -> (String, String, i32) {
     )
 }
 
-fn tail_tmp(name: &str, content: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("posixutils-tail-{}-{}", std::process::id(), name));
-    std::fs::write(&p, content).expect("write temp file");
-    p
+fn tail_tmp(name: &str, content: &str) -> plib::testing::TempFile {
+    plib::testing::TempFile::new(name, content)
 }
 
 #[test]
@@ -410,7 +407,6 @@ fn test_tail_historical_forms_with_file() {
     assert_eq!((stdout.as_str(), code), ("2\n3\n4\n5\n", 0));
     let (stdout, _, code) = tail_run(&["-4c", p]);
     assert_eq!((stdout.as_str(), code), ("4\n5\n", 0));
-    let _ = std::fs::remove_file(f);
 }
 
 #[test]
@@ -421,18 +417,15 @@ fn test_tail_historical_form_is_only_the_first_argument() {
     assert!(!stderr.is_empty());
     assert_ne!(code, 0);
 
-    let mut dir = std::env::temp_dir();
-    dir.push(format!("posixutils-tail-{}-dashdir", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("-1"), "x\ny\n").unwrap();
+    let dir = plib::tmp::tempdir().unwrap();
+    std::fs::write(dir.path().join("-1"), "x\ny\n").unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_tail"))
         .args(["--", "-1"])
-        .current_dir(&dir)
+        .current_dir(dir.path())
         .output()
         .expect("run tail");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "x\ny\n");
     assert_eq!(out.status.code(), Some(0));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

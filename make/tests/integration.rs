@@ -192,8 +192,7 @@ mod arguments {
             .args(["-p", "-f", "/dev/null"])
             .output()
             .expect("failed to run make");
-        let path = std::env::temp_dir().join("make_p_roundtrip.mk");
-        std::fs::write(&path, &dump.stdout).unwrap();
+        let path = plib::testing::TempFile::new("roundtrip.mk", &dump.stdout);
         let reparsed = Command::new(&bin)
             .arg("-f")
             .arg(&path)
@@ -203,7 +202,6 @@ mod arguments {
             .expect("failed to run make");
         // It parses: the failure mode we are excluding is a parse error (4).
         assert_ne!(reparsed.status.code(), Some(4), "dump did not re-parse");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

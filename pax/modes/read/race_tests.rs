@@ -216,6 +216,27 @@ fn intermediate_directory_swapped_after_mkdir_is_not_stamped() {
     );
 }
 
+/// Once a directory is found renamed over the one pax made, nothing more is
+/// extracted into it: a later member below it is refused too.
+#[test]
+fn nothing_is_extracted_into_a_directory_found_in_place_of_a_made_one() {
+    let tmp = TempDir::new().unwrap();
+    let dest = shared_dest(&tmp);
+    let (_, victim_c) = private_dir(&tmp);
+
+    let entries = vec![
+        own_member("d", EntryType::Directory, 0o777),
+        own_member("d/f", EntryType::Fifo, 0o600),
+    ];
+    extract_with_dir_swap(&dest, entries, c"d", victim_c);
+
+    assert!(dest.join("d/secret").exists(), "the swap did not happen");
+    assert!(
+        std::fs::symlink_metadata(dest.join("d/f")).is_err(),
+        "a member was extracted into the directory renamed over pax's"
+    );
+}
+
 /// Without a swap, both kinds of directory take the archived mode, in a
 /// shared extraction directory as anywhere else; an existing directory is
 /// merged into and takes it too.

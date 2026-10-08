@@ -265,10 +265,16 @@ impl DirTree {
         for comp in member.dirs().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
             let (next, origin) = open_or_create_dir_at(at, comp, create_missing)?;
+            let st = fstat(next.as_fd());
             if origin == DirOrigin::Replaced {
-                if let Some(st) = fstat(next.as_fd()) {
-                    self.replaced.borrow_mut().insert(file_id(&st));
+                if let Some(st) = &st {
+                    self.replaced.borrow_mut().insert(file_id(st));
                 }
+                return Err(PaxError::Io(made::replaced()));
+            }
+            // One found earlier in place of a directory this run made is
+            // never extracted into, whichever member reaches it.
+            if st.is_some_and(|st| self.replaced.borrow().contains(&file_id(&st))) {
                 return Err(PaxError::Io(made::replaced()));
             }
             if let Some(st) = fstat(next.as_fd()) {

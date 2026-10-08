@@ -19,9 +19,9 @@ fixes. Today no utility reads or writes ACLs.
 * pax: store ACLs in the pax format's extended headers, and restore them
   under `-p`.
 * ls: mark a file that has an ACL (POSIX's alternate access method `+`).
-* chmod: keep the ACL mask consistent when changing group permission bits.
-* One implementation in plib, beside the ACL check `plib::madefs` already
-  makes for its trust rules.
+* One small module in plib, `plib::acl`, beside the ACL check
+  `plib::madefs` already makes for its trust rules. Its API is plain
+  functions and types in the style of `std::fs`, not a framework.
 
 ## Other items
 

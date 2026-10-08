@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone};
 use clap::Parser;
 use gettextrs::gettext;
 use std::ffi::{CStr, CString};
@@ -29,7 +29,7 @@ struct Args {
     #[arg(short, long, help = gettext("Change the modification time of file"))]
     mtime: bool,
 
-    #[arg(short, long, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format, instead of the current time"))]
+    #[arg(short, long, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format, or an RFC 5322 date as printed by 'date -R', instead of the current time"))]
     datetime: Option<String>,
 
     #[arg(short, long, group = "timefmt", help = gettext("Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current time"))]
@@ -74,10 +74,101 @@ fn systemtime_to_ts(t: SystemTime) -> libc::timespec {
     }
 }
 
+/// Parse the `-d` operand: the POSIX extended ISO-8601 form, or the RFC 5322 date that
+/// `date -R` prints (see [`parse_rfc5322`]).
+fn parse_datetime(input: &str) -> Result<libc::timespec, String> {
+    if let Some(secs) = parse_rfc5322(input) {
+        return Ok(mk_ts(secs, 0));
+    }
+    parse_iso8601(input)
+}
+
+/// The English day and month abbreviations of RFC 5322, as `date -R` spells them.
+const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Parse an RFC 5322 date-time, as `date -R` and Debian changelogs write it, to seconds since
+/// the epoch: `[Day, ]D Mon YYYY HH:MM[:SS] +hhmm`, e.g. `Fri, 17 Jul 2026 19:05:00 +0200`.
+/// This is not POSIX: Debian's base-files passes `dpkg-parsechangelog -SDate` to `touch -d`.
+///
+/// Strict, unlike GNU's free-form parser: fields are separated by single spaces; names are
+/// spelled exactly as above; a day name must be the date's own; the day has one or two digits,
+/// the year four, each time field two; the zone is a numeric offset (no `GMT`, `UT` or other
+/// obsolete name, which `date -R` never prints). Every field is range-checked, and a leap second
+/// (`:60`) is refused, as GNU does. The offset alone fixes the instant; `TZ` plays no part.
+fn parse_rfc5322(input: &str) -> Option<i64> {
+    let mut fields = input.split(' ');
+    let mut field = fields.next()?;
+    let weekday = match field.strip_suffix(',') {
+        Some(name) => {
+            field = fields.next()?;
+            Some(DAY_NAMES.iter().position(|d| *d == name)?)
+        }
+        None => None,
+    };
+    let day = digits(field, 1..=2)?;
+    let month_name = fields.next()?;
+    let month = MONTH_NAMES.iter().position(|m| *m == month_name)? as u32 + 1;
+    let year = digits(fields.next()?, 4..=4)?;
+    let (hour, minute, second) = parse_rfc5322_time(fields.next()?)?;
+    let offset = parse_rfc5322_zone(fields.next()?)?;
+    if fields.next().is_some() {
+        return None;
+    }
+
+    let date = NaiveDate::from_ymd_opt(year as i32, month, day)?;
+    if weekday.is_some_and(|w| w != date.weekday().num_days_from_monday() as usize) {
+        return None;
+    }
+    // Hour 24, minute 60 and second 60 are all out of range here.
+    let naive = date.and_hms_opt(hour, minute, second)?;
+    Some(offset.from_local_datetime(&naive).single()?.timestamp())
+}
+
+/// `HH:MM` or `HH:MM:SS`, each two digits; ranges are checked by the caller.
+fn parse_rfc5322_time(field: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = field.split(':');
+    let hour = digits(parts.next()?, 2..=2)?;
+    let minute = digits(parts.next()?, 2..=2)?;
+    let second = match parts.next() {
+        Some(s) => digits(s, 2..=2)?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((hour, minute, second))
+}
+
+/// A `+hhmm` or `-hhmm` offset east of UTC, hours below 24 and minutes below 60. `-0000` is UTC.
+fn parse_rfc5322_zone(field: &str) -> Option<FixedOffset> {
+    let (sign, hhmm) = match field.split_at_checked(1)? {
+        ("+", rest) => (1, rest),
+        ("-", rest) => (-1, rest),
+        _ => return None,
+    };
+    let hhmm = digits(hhmm, 4..=4)?;
+    let (hours, minutes) = (hhmm / 100, hhmm % 100);
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60) as i32)
+}
+
+/// `field` as a number, if it is all ASCII digits and its length is in `len`.
+fn digits(field: &str, len: std::ops::RangeInclusive<usize>) -> Option<u32> {
+    if !len.contains(&field.len()) || !field.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok()
+}
+
 /// Parse the `-d` extended ISO-8601 form. Accepts `T` or a space separator, `.`/`,` fractional
 /// seconds, an optional `Z`/numeric timezone (else the value is interpreted in the local zone, so
 /// `TZ` is honored).
-fn parse_datetime(input: &str) -> Result<libc::timespec, String> {
+fn parse_iso8601(input: &str) -> Result<libc::timespec, String> {
     let norm = input.trim().replace(',', ".");
 
     // If a timezone is present (offset or `Z`), parse it as a fixed-offset instant. RFC 3339 needs

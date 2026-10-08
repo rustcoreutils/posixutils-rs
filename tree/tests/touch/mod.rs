@@ -310,3 +310,139 @@ fn test_touch_symlink_to_a_target_made_just_before() {
     assert_eq!((fifo_m, file_m), (946_684_800, 946_684_800));
     assert_eq!(contents, b"contents");
 }
+
+/// A file time as (seconds, nanoseconds) since the epoch.
+type Stamp = (i64, u32);
+
+/// Run `touch -d date` on a new file in a fresh directory, under a zone that
+/// is neither UTC nor any offset below, so a result that leaned on `TZ` shows.
+/// The file's (atime, mtime), or the failed output.
+fn touch_d(date: &str) -> Result<(Stamp, Stamp), std::process::Output> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = plib::tmp::tempdir().unwrap();
+    let f = dir.path().join("f");
+    let out = Command::new(env!("CARGO_BIN_EXE_touch"))
+        .args(["-d", date])
+        .arg(&f)
+        .env("TZ", "America/New_York")
+        .output()
+        .unwrap();
+    if !out.status.success() {
+        assert!(!f.exists(), "a rejected -d created the file: {date:?}");
+        return Err(out);
+    }
+    let md = fs::metadata(&f).unwrap();
+    Ok((
+        (md.atime(), md.atime_nsec() as u32),
+        (md.mtime(), md.mtime_nsec() as u32),
+    ))
+}
+
+/// The mtime `touch -d date` gives, both times set to the same whole second.
+fn d_mtime(date: &str) -> i64 {
+    match touch_d(date) {
+        Ok((atime, mtime)) => {
+            assert_eq!(atime, mtime, "{date:?}");
+            assert_eq!(mtime.1, 0, "{date:?}");
+            mtime.0
+        }
+        Err(out) => panic!("{date:?} rejected: {out:?}"),
+    }
+}
+
+/// The RFC 5322 date Debian's base-files passes from `dpkg-parsechangelog
+/// -SDate`. GNU touch 9.4 gives it stat `%Y` 1784307900, `%y` (in UTC)
+/// 2026-07-17 17:05:00.000000000.
+#[test]
+fn test_touch_d_rfc5322_base_files() {
+    assert_eq!(d_mtime("Fri, 17 Jul 2026 19:05:00 +0200"), 1_784_307_900);
+}
+
+/// The day name is optional, the day may be one digit, and the seconds may
+/// be left out. Each value is what GNU touch 9.4 gives the same string.
+#[test]
+fn test_touch_d_rfc5322_optional_parts() {
+    assert_eq!(d_mtime("17 Jul 2026 19:05:00 +0200"), 1_784_307_900);
+    assert_eq!(d_mtime("Tue, 7 Jul 2026 19:05:00 +0200"), 1_783_443_900);
+    assert_eq!(d_mtime("Tue, 07 Jul 2026 19:05:00 +0200"), 1_783_443_900);
+    assert_eq!(d_mtime("Fri, 17 Jul 2026 19:05 +0200"), 1_784_307_900);
+}
+
+/// The zone offset is applied whatever its sign; `+0000` and `-0000` are UTC.
+#[test]
+fn test_touch_d_rfc5322_offsets() {
+    let utc = 1_784_315_100; // 2026-07-17 19:05:00 UTC
+    assert_eq!(d_mtime("Fri, 17 Jul 2026 19:05:00 +0000"), utc);
+    assert_eq!(d_mtime("Fri, 17 Jul 2026 19:05:00 -0000"), utc);
+    assert_eq!(
+        d_mtime("Fri, 17 Jul 2026 19:05:00 +0530"),
+        utc - 5 * 3600 - 1800
+    );
+    assert_eq!(d_mtime("Fri, 17 Jul 2026 19:05:00 -0700"), utc + 7 * 3600);
+}
+
+/// An offset can carry the instant across a year boundary either way.
+#[test]
+fn test_touch_d_rfc5322_year_boundary() {
+    // 2027-01-01 00:30:00 UTC and 2026-12-31 23:30:00 UTC, as GNU touch gives.
+    assert_eq!(d_mtime("Thu, 31 Dec 2026 23:30:00 -0100"), 1_798_763_400);
+    assert_eq!(d_mtime("Fri, 1 Jan 2027 00:30:00 +0100"), 1_798_759_800);
+}
+
+/// Anything outside the strict grammar is refused, with nothing created.
+#[test]
+fn test_touch_d_rfc5322_rejections() {
+    for date in [
+        "Mon, 17 Jul 2026 19:05:00 +0200",    // 17 Jul 2026 is a Friday
+        "Fri, 30 Feb 2026 19:05:00 +0200",    // no such day
+        "Fri, 17 Jul 2026 24:00:00 +0200",    // hour 24
+        "Fri, 17 Jul 2026 23:59:60 +0000",    // leap second
+        "Fri, 17 Jul 2026 19:60:00 +0200",    // minute 60
+        "Fri, 17 jul 2026 19:05:00 +0200",    // month not as date -R spells it
+        "Fri, 17 July 2026 19:05:00 +0200",   // full month name
+        "fri, 17 Jul 2026 19:05:00 +0200",    // day not as date -R spells it
+        "Friday, 17 Jul 2026 19:05:00 +0200", // full day name
+        "Fri 17 Jul 2026 19:05:00 +0200",     // day name without comma
+        "Fri,17 Jul 2026 19:05:00 +0200",     // no space after the comma
+        "Fri, 17 Jul 2026 19:05:00",          // missing zone
+        "Fri, 17 Jul 2026 19:05:00 GMT",      // zone names
+        "Fri, 17 Jul 2026 19:05:00 UT",
+        "Fri, 17 Jul 2026 19:05:00 Z",
+        "Fri, 17 Jul 2026 19:05:00 EST",
+        "Fri, 17 Jul 2026 19:05:00 +200",    // zone not four digits
+        "Fri, 17 Jul 2026 19:05:00 +0260",   // zone minutes 60
+        "Fri, 17 Jul 2026 19:05:00 +2400",   // zone hours 24
+        "Fri, 17 Jul 2026 19:05:00 +0200 x", // trailing text
+        "Fri, 17 Jul 2026 19:05:00 +0200 ",  // trailing space
+        " Fri, 17 Jul 2026 19:05:00 +0200",  // leading space
+        "Fri,  17 Jul 2026 19:05:00 +0200",  // double space
+        "Fri, 17  Jul 2026 19:05:00 +0200",
+        "Fri,\t17 Jul 2026 19:05:00 +0200", // tab
+        "Fri, 17\tJul 2026 19:05:00 +0200",
+        "Fri, 017 Jul 2026 19:05:00 +0200",  // three-digit day
+        "Fri, 17 Jul 26 19:05:00 +0200",     // two-digit year
+        "Fri, 17 Jul 2026 9:05:00 +0200",    // one-digit hour
+        "Fri, 17 Jul 2026 19:5:00 +0200",    // one-digit minute
+        "Fri, 17 Jul 2026 19:05:00.5 +0200", // fractional seconds
+        "Fri, 17 Jul 2026 +0200",            // no time
+    ] {
+        let out = touch_d(date).expect_err(date);
+        assert_eq!(out.status.code(), Some(1), "{date:?}: {out:?}");
+        assert!(!out.stderr.is_empty(), "{date:?}");
+    }
+}
+
+/// The POSIX `-d` forms give the same instants as before, in `TZ` when they
+/// have no zone.
+#[test]
+fn test_touch_d_posix_forms_unchanged() {
+    // 2007-11-12 10:15:30 in New York (EST, UTC-5) and in UTC.
+    let local = 1_194_880_530;
+    let utc = local - 5 * 3600;
+    assert_eq!(d_mtime("2007-11-12T10:15:30"), local);
+    assert_eq!(d_mtime("2007-11-12 10:15:30"), local);
+    assert_eq!(d_mtime("2007-11-12T10:15:30Z"), utc);
+    assert_eq!(d_mtime("2007-11-12T10:15:30,000"), local);
+    let ((_, _), mtime) = touch_d("2007-11-12T10:15:30.25Z").unwrap();
+    assert_eq!(mtime, (utc, 250_000_000));
+}

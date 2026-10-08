@@ -27,7 +27,7 @@ pub use copy::{
 };
 
 // mv
-pub use pinned::{Anchor, CopiedSources, PinnedDir, PinnedDirs, PinnedEntry};
+pub use pinned::{Anchor, CopiedSources, PinnedDir, PinnedDirs, PinnedEntry, SourceState};
 
 // chgrp and chown
 pub use change_ownership::{chown_traverse, ChangeOwnershipArgs};

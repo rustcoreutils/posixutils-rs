@@ -8,7 +8,7 @@
 //
 
 use super::error_string;
-use super::pinned::{CopiedSources, PinnedEntry};
+use super::pinned::{CopiedSources, PinnedEntry, SourceState};
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
 use std::{
@@ -40,22 +40,40 @@ pub struct FirstCopy {
     /// `(st_dev, st_ino)` of the copy, from the descriptor it was written through (or, for a
     /// symbolic link or special file, from the `lstat` that followed its creation).
     made: (u64, u64),
+    /// The source file as the first copy duplicated it.
+    source: SourceState,
 }
 
 /// Whether `link_to_first_copy` made the new name a link to the first copy.
 enum Linked {
     ToFirstCopy,
+    /// The source file is no longer what the first copy duplicated (written to since, or its
+    /// inode number now another file's): nothing was linked.
+    SourceChanged,
     /// The first copy's name now holds another file, and the link to it was undone.
     NotTheFirstCopy,
 }
 
-/// Make `name` in `dirfd` a hard link to `first`.
+/// Make `name` in `dirfd` a hard link to `first`, for another name of the source file, now in
+/// state `source`.
+///
+/// Only a source file still as the first copy duplicated it is linked to that copy; one written
+/// to since (or an inode number freed and given to a new file) is not (`SourceChanged`), and the
+/// caller copies it afresh, so the destination gets what the file holds now.
 ///
 /// The link is made by name, and anyone who can write the directory the first copy was made in
 /// can have renamed a file of their own over that name since. So the new link must turn out to
 /// be the very file the first copy made; a link to anything else is unlinked again
 /// (`NotTheFirstCopy`), and the caller copies the file afresh.
-fn link_to_first_copy(first: &FirstCopy, dirfd: libc::c_int, name: &CStr) -> io::Result<Linked> {
+fn link_to_first_copy(
+    first: &FirstCopy,
+    source: &SourceState,
+    dirfd: libc::c_int,
+    name: &CStr,
+) -> io::Result<Linked> {
+    if *source != first.source {
+        return Ok(Linked::SourceChanged);
+    }
     let ret = unsafe {
         libc::linkat(
             first.dir.as_raw_fd(),
@@ -385,6 +403,9 @@ enum CopyResult {
 struct CopiedFile {
     /// `(st_dev, st_ino)` of what was made, when known for certain (`FirstCopy::made`).
     made: Option<(u64, u64)>,
+    /// The source as it was duplicated: for a regular file, from the `fstat` of the descriptor
+    /// read, taken before the read; otherwise as the walk saw it.
+    source: SourceState,
     /// Any failure to duplicate its characteristics (-p), which is reported but never undoes
     /// the copy.
     preserve_error: Option<io::Error>,
@@ -1121,6 +1142,7 @@ where
                 Ok(()) => Ok(copied_node(
                     cfg,
                     source,
+                    source_md,
                     target_dirfd,
                     target_filename,
                     source_file_type,
@@ -1177,6 +1199,7 @@ where
             return Ok(copied_node(
                 cfg,
                 source,
+                source_md,
                 target_dirfd,
                 target_filename,
                 ftw::FileType::SymbolicLink,
@@ -1316,6 +1339,7 @@ where
         let made = target_file.metadata().ok().map(|md| (md.dev(), md.ino()));
         Ok(CopyResult::CopiedFile(CopiedFile {
             made,
+            source: SourceState::of(&source_before_read),
             preserve_error,
         }))
     }
@@ -1326,6 +1350,7 @@ where
 fn copied_node(
     cfg: &CopyConfig,
     source: &ftw::Entry,
+    source_md: &ftw::Metadata,
     target_dirfd: libc::c_int,
     target_filename: *const libc::c_char,
     made_type: ftw::FileType,
@@ -1342,6 +1367,9 @@ fn copied_node(
     );
     CopyResult::CopiedFile(CopiedFile {
         made,
+        // A symbolic link's target was read, and a special file's type and device taken, from
+        // what the walk saw.
+        source: SourceState::of(source_md),
         preserve_error,
     })
 }
@@ -1784,17 +1812,25 @@ where
             // Preserve hard links like coreutils mv. Creating a copy is also
             // allowed by the standard.
             if let Some(first) = inode_map.get(&identifier) {
-                match link_to_first_copy(first, target_dirfd.as_raw_fd(), &target_filename_cstr) {
+                let source_state = SourceState::of(source_md);
+                match link_to_first_copy(
+                    first,
+                    &source_state,
+                    target_dirfd.as_raw_fd(),
+                    &target_filename_cstr,
+                ) {
                     Ok(Linked::ToFirstCopy) => {
                         // Skip since this file/directory is handled by hard-linking
                         if let Some(copied) = copied.as_deref_mut() {
-                            copied.record(source_md);
+                            copied.record(source_state);
                         }
                         return Ok(false);
                     }
-                    // Copied afresh below, which also makes that copy the one later names of
-                    // this file are linked to.
-                    Ok(Linked::NotTheFirstCopy) => {}
+                    // Copied afresh below. The first copy is no longer one to link to; the
+                    // fresh copy takes its place if the file still has other names.
+                    Ok(Linked::SourceChanged) | Ok(Linked::NotTheFirstCopy) => {
+                        inode_map.remove(&identifier);
+                    }
                     Err(e) => {
                         // Under -n an existing destination is kept, linked or not.
                         if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
@@ -1832,9 +1868,9 @@ where
                 // Recording a skipped copy pointed a later hard link at a target that does
                 // not exist, and every directory reports nlink > 1, so directories were
                 // recorded too.
-                if let CopyResult::CopiedFile(CopiedFile { made, .. }) = &copy_result {
+                if let CopyResult::CopiedFile(CopiedFile { made, source, .. }) = &copy_result {
                     if let Some(copied) = copied.as_deref_mut() {
-                        copied.record(source_md);
+                        copied.record(*source);
                     }
                     // Only files that have hard links are worth tracking, and only a copy whose
                     // identity is known: a later link is checked against it.
@@ -1847,6 +1883,7 @@ where
                                 dir: Rc::clone(target_dirfd),
                                 name: target_filename_cstr.clone(),
                                 made: *made,
+                                source: *source,
                             },
                         );
                     }
@@ -1930,7 +1967,7 @@ where
                             .borrow_mut()
                             .insert((new_target_md.dev(), new_target_md.ino()));
                         if let Some(copied) = copied.as_deref_mut() {
-                            copied.record(source_md);
+                            copied.record(SourceState::of(source_md));
                         }
 
                         target_dirfd_stack_borrowed.push(Rc::new(new_target_dirfd));

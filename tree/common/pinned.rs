@@ -11,7 +11,6 @@
 //! cross-filesystem move copied -- what `mv` needs to act on the files it checked and copied,
 //! rather than on whatever their pathnames lead to by the time it acts.
 
-use ftw::{self, FileType};
 use std::{
     collections::HashMap,
     ffi::{CStr, CString},
@@ -226,26 +225,40 @@ fn open_lookup_dir(path: &CStr) -> io::Result<ftw::FileDescriptor> {
     ftw::FileDescriptor::open_at(&ftw::FileDescriptor::cwd(), path, flags)
 }
 
-/// What a source file was when the copy duplicated it.
+/// What a source file is, as far as a copy of it can go stale: the file, its type, and what of
+/// it the copy duplicated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct CopiedState {
-    file_type: FileType,
+pub struct SourceState {
+    /// `(st_dev, st_ino)`.
+    identity: (u64, u64),
+    /// `st_mode & S_IFMT`.
+    file_type: u32,
     /// Size and modification time, for a regular file or symbolic link, whose contents the copy
     /// duplicated: a write after the copy read it changes them. Not for a directory (they
     /// change as entries are removed from it, and its entries are judged one by one), nor for a
     /// FIFO, socket or device, which is recreated rather than read, and whose modification time
     /// any I/O through it moves.
     contents: Option<(u64, i64, i64)>,
+    /// The device a block or character special file names, which its copy reproduces.
+    rdev: Option<u64>,
 }
 
-impl CopiedState {
-    fn of(md: &ftw::Metadata) -> Self {
-        let file_type = md.file_type();
-        let has_contents = matches!(file_type, FileType::RegularFile | FileType::SymbolicLink);
-        let contents = has_contents.then(|| (md.size(), md.mtime(), md.mtime_nsec()));
-        CopiedState {
+impl SourceState {
+    /// The state `md` (from `lstat`, or the `fstat` of a descriptor) describes.
+    pub fn of(md: &impl MetadataExt) -> Self {
+        // `mode_t` is `u32` on Linux and `u16` on macOS.
+        #[allow(clippy::unnecessary_cast)]
+        let file_type = md.mode() & libc::S_IFMT as u32;
+        #[allow(clippy::unnecessary_cast)]
+        let is = |t: libc::mode_t| file_type == t as u32;
+        let contents = (is(libc::S_IFREG) || is(libc::S_IFLNK))
+            .then(|| (md.size(), md.mtime(), md.mtime_nsec()));
+        let rdev = (is(libc::S_IFBLK) || is(libc::S_IFCHR)).then(|| md.rdev());
+        SourceState {
+            identity: (md.dev(), md.ino()),
             file_type,
             contents,
+            rdev,
         }
     }
 }
@@ -253,18 +266,22 @@ impl CopiedState {
 /// Every source file a cross-filesystem move duplicated, by identity: after the copy, `mv`
 /// removes these and nothing else.
 #[derive(Default)]
-pub struct CopiedSources(HashMap<(u64, u64), CopiedState>);
+pub struct CopiedSources(HashMap<(u64, u64), SourceState>);
 
 impl CopiedSources {
-    /// Record a source file, as the walk saw it, that has been duplicated.
-    pub fn record(&mut self, md: &ftw::Metadata) {
-        self.0.insert((md.dev(), md.ino()), CopiedState::of(md));
+    /// Record a source file that has been duplicated, in the state that was duplicated.
+    ///
+    /// A file met again under another name (a hard link) replaces the earlier record: it is
+    /// recorded only once it is either unchanged since (and linked to the earlier copy) or
+    /// copied afresh in its current state, so the latest record describes what the copies hold.
+    pub fn record(&mut self, state: SourceState) {
+        self.0.insert(state.identity, state);
     }
 
     /// Whether `md` is a file the copy duplicated, unchanged since: the same file, of the same
-    /// type, and for a non-directory with the same size and modification time.
+    /// type, and as `SourceState` compares it.
     pub fn unchanged(&self, md: &ftw::Metadata) -> bool {
-        self.0.get(&(md.dev(), md.ino())) == Some(&CopiedState::of(md))
+        self.0.get(&(md.dev(), md.ino())) == Some(&SourceState::of(md))
     }
 }
 

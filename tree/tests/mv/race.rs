@@ -410,6 +410,88 @@ fn mv_never_links_a_later_name_to_a_file_renamed_over_the_first_copy() {
     let _ = fs::remove_dir_all(&other);
 }
 
+/// Append `more` to `path`.
+fn append(path: &Path, more: &[u8]) {
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    std::io::Write::write_all(&mut file, more).unwrap();
+}
+
+/// Moving two hard links of one file, the second name is linked to the first one's copy only
+/// if the file is as it was copied. Written to through the second name after the first was
+/// copied (and removed), the second name is copied afresh: linking it to the old copy and
+/// removing it, the file's last link, would lose the write.
+#[test]
+fn mv_copies_afresh_a_hard_link_written_to_after_the_first_copy() {
+    let Some(other) = other_fs("link_written") else {
+        return;
+    };
+    let base = scratch("link_written");
+    hard_links_around_y(&base);
+
+    let (status, stderr) = mv_paused_on(
+        &base,
+        &[Path::new("f"), Path::new("y"), Path::new("g"), &other],
+        &base.join("y/z"),
+        || append(&base.join("g"), b" and more"),
+    );
+
+    assert_eq!(
+        fs::read(other.join("g")).unwrap(),
+        b"moved and more",
+        "the write through the second name was lost; stderr: {stderr}"
+    );
+    assert_eq!(status, Some(0), "stderr: {stderr}");
+    assert!(!base.join("g").exists());
+
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&other);
+}
+
+/// The same with both names inside one directory operand. The source is on the second
+/// filesystem (normally tmpfs, which lists a directory in creation order, or its reverse), so
+/// `l`, made between `x` and `y`, is opened after the first name and before the second.
+#[test]
+fn mv_copies_afresh_a_hard_link_in_the_same_operand_written_to_after_the_first_copy() {
+    let Some(source_fs) = other_fs("link_written_one_operand") else {
+        return;
+    };
+    let dest = scratch("link_written_one_operand");
+    let d = source_fs.join("d");
+    fs::create_dir(&d).unwrap();
+    fs::write(d.join("x"), b"moved").unwrap();
+    fs::write(d.join("l"), b"l").unwrap();
+    fs::hard_link(d.join("x"), d.join("y")).unwrap();
+
+    let mut ordered = true;
+    let (status, stderr) = mv_paused_on(&dest, &[d.as_path(), &dest], &d.join("l"), || {
+        // Exactly one name copied: the first, which is the one appended through.
+        let copied: Vec<_> = ["x", "y"]
+            .into_iter()
+            .filter(|name| dest.join("d").join(name).exists())
+            .collect();
+        ordered = copied.len() == 1;
+        if ordered {
+            append(&d.join(copied[0]), b" and more");
+        }
+    });
+    if !ordered {
+        eprintln!("skipping: the source directory is not listed in creation order");
+    } else {
+        assert_eq!(status, Some(0), "stderr: {stderr}");
+        let contents: Vec<_> = ["x", "y"]
+            .map(|name| fs::read(dest.join("d").join(name)).unwrap())
+            .to_vec();
+        assert!(
+            contents.iter().any(|c| c == b"moved and more"),
+            "the write was lost: {contents:?}; stderr: {stderr}"
+        );
+        assert!(!d.exists());
+    }
+
+    let _ = fs::remove_dir_all(&source_fs);
+    let _ = fs::remove_dir_all(&dest);
+}
+
 /// The target directory operand is resolved once: replaced by a symbolic link to another
 /// directory in the middle of the move, it still receives every operand, hard links included.
 #[test]

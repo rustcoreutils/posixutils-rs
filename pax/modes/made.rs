@@ -386,79 +386,166 @@ mod linux {
     }
 }
 
-/// Elsewhere there is no `O_PATH`, and opening a device to pin it can act on
-/// the device. The node is checked by `lstat` when it is made and changed by
-/// name with `AT_SYMLINK_NOFOLLOW`, each change only after `lstat` shows the
-/// name still holds the same node. The residual is a replacement between that
-/// check and the call it guards.
+/// Elsewhere there is no `O_PATH`, so a node is pinned by an ordinary
+/// descriptor where opening it has no effect beyond the open: a FIFO opened
+/// for reading without blocking, and on macOS a symbolic link opened as itself
+/// (`O_SYMLINK`). The `lstat` that comes first only says what to open; the
+/// checks read the descriptor, which must be the node that `lstat` saw, and
+/// every change goes through it.
+///
+/// A device -- whose open can act on the device -- a symbolic link on the
+/// other BSDs, and a FIFO whose own mode denies its owner reading, cannot be
+/// held that way. Those are checked by `lstat` and changed by name with
+/// `AT_SYMLINK_NOFOLLOW`, each change only after `lstat` shows the name still
+/// holds the same node. That residual is a replacement in the moment between
+/// such a check and the call it guards; its worst case is the one this module
+/// exists to prevent -- a hard link swapped in at that moment takes the
+/// owner, mode or times then being applied -- and it needs a writer of the
+/// directory to win that window on the call it aims at.
 #[cfg(not(target_os = "linux"))]
 mod other {
     use super::*;
+    use crate::modes::anchored::file_id;
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
-    /// A FIFO, device or symbolic link pax has just made, held by name and
-    /// identity.
+    /// How a made node is held.
+    enum Held<'a> {
+        /// By a descriptor for the node itself.
+        Fd(OwnedFd),
+        /// By name and identity, re-checked before each change.
+        Name {
+            dirfd: BorrowedFd<'a>,
+            name: &'a CStr,
+            made_type: libc::mode_t,
+            id: (u64, u64),
+        },
+    }
+
+    /// A FIFO, device or symbolic link pax has just made.
     pub(crate) struct MadeNode<'a> {
-        dirfd: BorrowedFd<'a>,
-        name: &'a CStr,
-        made_type: libc::mode_t,
-        id: (u64, u64),
+        held: Held<'a>,
         trust: MadeTrust,
     }
 
     impl<'a> MadeNode<'a> {
         /// Check that `name` below `dirfd` is the node of type `made_type`
-        /// just made there, and remember which node that is.
+        /// just made there, and hold on to it.
         pub(crate) fn pin(
             dirfd: BorrowedFd<'a>,
             name: &'a CStr,
             made_type: libc::mode_t,
         ) -> io::Result<Self> {
             let st = lstat_at(dirfd, name)?;
+            if st.st_mode & libc::S_IFMT != made_type {
+                return Err(replaced());
+            }
+            if let Some(fd) = open_node(dirfd, name, made_type)? {
+                let held = fstat(fd.as_fd())?;
+                if file_id(&held) != file_id(&st) {
+                    return Err(replaced());
+                }
+                let trust = check_node(&held, made_type, dirfd, fs_owners(fd.as_fd()))?;
+                let held = Held::Fd(fd);
+                return Ok(MadeNode { held, trust });
+            }
             let trust = check_node(&st, made_type, dirfd, fs_owners(dirfd))?;
-            Ok(MadeNode {
+            let id = file_id(&st);
+            let held = Held::Name {
                 dirfd,
                 name,
                 made_type,
-                id: crate::modes::anchored::file_id(&st),
-                trust,
-            })
+                id,
+            };
+            Ok(MadeNode { held, trust })
         }
 
         pub(crate) fn trust(&self) -> MadeTrust {
             self.trust
         }
 
-        /// Whether the name still holds the node that was checked.
+        pub(crate) fn chown(&self, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
+            let flags = libc::AT_SYMLINK_NOFOLLOW;
+            match self.held {
+                Held::Fd(ref fd) => cvt(unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) }),
+                Held::Name { dirfd, name, .. } => {
+                    self.still_made()?;
+                    let (dirfd, name) = (dirfd.as_raw_fd(), name.as_ptr());
+                    cvt(unsafe { libc::fchownat(dirfd, name, uid, gid, flags) })
+                }
+            }
+        }
+
+        pub(crate) fn chmod(&self, mode: libc::mode_t) -> io::Result<()> {
+            let flags = libc::AT_SYMLINK_NOFOLLOW;
+            match self.held {
+                Held::Fd(ref fd) => cvt(unsafe { libc::fchmod(fd.as_raw_fd(), mode) }),
+                Held::Name { dirfd, name, .. } => {
+                    self.still_made()?;
+                    let (dirfd, name) = (dirfd.as_raw_fd(), name.as_ptr());
+                    cvt(unsafe { libc::fchmodat(dirfd, name, mode, flags) })
+                }
+            }
+        }
+
+        pub(crate) fn utimens(&self, times: &[libc::timespec; 2]) -> io::Result<()> {
+            let flags = libc::AT_SYMLINK_NOFOLLOW;
+            match self.held {
+                Held::Fd(ref fd) => cvt(unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) }),
+                Held::Name { dirfd, name, .. } => {
+                    self.still_made()?;
+                    let (dirfd, name) = (dirfd.as_raw_fd(), name.as_ptr());
+                    cvt(unsafe { libc::utimensat(dirfd, name, times.as_ptr(), flags) })
+                }
+            }
+        }
+
+        /// For a node held by name: whether the name still holds it.
         fn still_made(&self) -> io::Result<()> {
-            let st = lstat_at(self.dirfd, self.name)?;
-            let same = crate::modes::anchored::file_id(&st) == self.id
-                && st.st_mode & libc::S_IFMT == self.made_type;
-            if !same {
+            let Held::Name {
+                dirfd,
+                name,
+                made_type,
+                id,
+            } = self.held
+            else {
+                return Ok(());
+            };
+            let st = lstat_at(dirfd, name)?;
+            if file_id(&st) != id || st.st_mode & libc::S_IFMT != made_type {
                 return Err(replaced());
             }
             Ok(())
         }
+    }
 
-        pub(crate) fn chown(&self, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
-            self.still_made()?;
-            let flags = libc::AT_SYMLINK_NOFOLLOW;
-            let (dirfd, name) = (self.dirfd.as_raw_fd(), self.name.as_ptr());
-            cvt(unsafe { libc::fchownat(dirfd, name, uid, gid, flags) })
+    /// A descriptor for the node of type `made_type` at `name`, where one can
+    /// be had without acting on anything; `None` where it cannot.
+    ///
+    /// `O_NONBLOCK` and `O_NOCTTY` whatever is asked for: what is opened may
+    /// by now be something else, and the caller's identity check refuses it,
+    /// but the open itself must not wait on a FIFO or adopt a terminal.
+    fn open_node(
+        dirfd: BorrowedFd<'_>,
+        name: &CStr,
+        made_type: libc::mode_t,
+    ) -> io::Result<Option<OwnedFd>> {
+        let base = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+        let flags = match made_type {
+            libc::S_IFIFO => base | libc::O_NOFOLLOW,
+            #[cfg(target_os = "macos")]
+            libc::S_IFLNK => base | libc::O_SYMLINK,
+            _ => return Ok(None),
+        };
+        let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+        if fd >= 0 {
+            return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
         }
-
-        pub(crate) fn chmod(&self, mode: libc::mode_t) -> io::Result<()> {
-            self.still_made()?;
-            let flags = libc::AT_SYMLINK_NOFOLLOW;
-            let (dirfd, name) = (self.dirfd.as_raw_fd(), self.name.as_ptr());
-            cvt(unsafe { libc::fchmodat(dirfd, name, mode, flags) })
+        let err = io::Error::last_os_error();
+        // A mode denying the owner reading: held by name instead.
+        if err.raw_os_error() == Some(libc::EACCES) {
+            return Ok(None);
         }
-
-        pub(crate) fn utimens(&self, times: &[libc::timespec; 2]) -> io::Result<()> {
-            self.still_made()?;
-            let flags = libc::AT_SYMLINK_NOFOLLOW;
-            let (dirfd, name) = (self.dirfd.as_raw_fd(), self.name.as_ptr());
-            cvt(unsafe { libc::utimensat(dirfd, name, times.as_ptr(), flags) })
-        }
+        Err(err)
     }
 
     /// `fstatat` with `AT_SYMLINK_NOFOLLOW`.

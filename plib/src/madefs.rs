@@ -456,6 +456,10 @@ impl ChainTrust {
     /// `path` is resolved here one component at a time from held descriptors
     /// (`link_holders`), and must reach the very directory opened; anything that cannot be
     /// resolved so, or is not, trusts nothing.
+    ///
+    /// Residual: a relative path starts from the working directory, which is trusted as the user
+    /// named it -- by running there -- and so are the directories of an absolute path above its
+    /// first link: only the directories holding links are judged.
     pub fn named<T: AsRawFd + 'static>(path: &Path, dir: &Rc<T>) -> io::Result<NamedAnchor> {
         let Some(holders) = link_holders(path, dir.as_raw_fd()) else {
             return Ok(NamedAnchor {
@@ -641,7 +645,8 @@ fn acls_let_others_write(
 /// An `O_PATH` descriptor takes no `fgetxattr` (EBADF); the attribute is then read through
 /// `/proc/self/fd/N`, once `/proc` is verified to be procfs (`procfs_dir`), which names the
 /// same inode and needs no permission on it to read a `system.` attribute. (The path is
-/// resolved again after the check: only root can mount something else over `/proc`.)
+/// resolved again after the check: only root can mount something else over `/proc`.) Without
+/// a procfs to read through, the read fails, and the directory counts as one others may write.
 #[cfg(target_os = "linux")]
 fn read_xattr(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; 4096];
@@ -718,6 +723,9 @@ fn acl_names_others(xattr: &[u8]) -> bool {
 ///   long as they run.
 /// - A group password lets anyone who knows it `newgrp` into the group; with shadow groups it
 ///   is out of the user's reach to read, and is not considered.
+/// - `getgrgid` returns the entry of the first NSS source that has the gid: a group of the same
+///   gid in a later source, listing others -- an administrator's misconfiguration -- is not
+///   seen.
 pub fn is_private_group(gid: u32, euid: u32) -> bool {
     #[cfg(feature = "test-hooks")]
     PRIVATE_GROUP_QUERIES.with(|queries| queries.set(queries.get() + 1));

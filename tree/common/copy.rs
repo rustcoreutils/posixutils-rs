@@ -264,8 +264,11 @@ pub enum OperandTrust {
 /// it hands them nothing they did not have. That is the residual, with root, who can make a
 /// directory with any owner. cp notes its own changes from the descriptor it has held
 /// throughout -- a directory held open keeps its number from being reused -- once it has filled
-/// and finished one (`refresh`), so an honest later operand still finds it unchanged.
-/// Recording a directory replaces whatever its number stood for.
+/// and finished one (`refresh`), so an honest later operand still finds it unchanged. Residual
+/// of that: once -p as root has given a made directory away, its new owner can change it while
+/// cp still fills it, and the refresh records their change as cp's -- passing for the run's own
+/// a directory that is theirs anyway. Recording a directory replaces whatever its number stood
+/// for.
 #[derive(Default)]
 pub struct MadeDirs(HashMap<(u64, u64), MadeAt>);
 

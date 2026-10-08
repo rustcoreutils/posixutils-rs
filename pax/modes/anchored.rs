@@ -179,7 +179,10 @@ pub(crate) struct DirTree {
     /// shares less of the chain than that, and cuts the chain off there before
     /// anything below it can be reused.
     chain: RefCell<Chain>,
-    /// How many levels `chain` may hold: each is an open descriptor.
+    /// How many levels `chain` may hold: each is an open descriptor. A directory deeper than
+    /// that is closed once walked through, and its trust (`ChainTrust`), worked out only when a
+    /// directory found below it is to be given a mode or owner, then counts as one others may
+    /// write: an existing directory that deep keeps its attributes under -p, failing closed.
     max_levels: usize,
     /// The parent most recently walked to, and the trust it hands the
     /// directories found in it, so consecutive members of one directory

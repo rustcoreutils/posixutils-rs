@@ -11,6 +11,10 @@ use super::error_string;
 use super::pinned::{CopiedSources, PinnedEntry, SourceState};
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
+pub use plib::madefs::MadeTrust;
+#[cfg(target_os = "linux")]
+use plib::madefs::{chmod_pinned, proc_fd_name, procfs_dir, utimens_link_if_still};
+use plib::madefs::{fs_owners, made_by_us, FsOwners, MadeObject};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -267,129 +271,6 @@ fn owner_unverified_error(target: &Path) -> io::Error {
         "not preserving the owner and permissions of '{}': its owner could not be verified",
         target.display()
     ))
-}
-
-/// What `fstat` (on a descriptor cp holds for it) reports about an object cp has just made.
-#[derive(Clone, Copy)]
-struct MadeObject {
-    uid: u32,
-    nlink: u64,
-    is_dir: bool,
-    /// How the object's filesystem keeps owners (`fs_owners`).
-    owners: FsOwners,
-}
-
-/// How a filesystem keeps file owners, as far as its type says.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FsOwners {
-    /// Each object's owner is stored and reported as it is (ext4, xfs, btrfs, tmpfs, ...), and
-    /// the answer wherever the type cannot be read.
-    Stored,
-    /// Owners may be mapped -- reported from a mount option, an id map or a squash rule rather
-    /// than from who made the object -- or may be stored for real, depending on the mount:
-    /// NFS (root_squash or not), FUSE (sshfs with or without idmap, mergerfs, ceph-fuse, ...),
-    /// cifs/smb (`uid=` or unix extensions), ntfs3 (mount options, or the per-file WSL owner
-    /// and mode it stores).
-    MayBeMapped,
-    /// No owner is stored at all; every object reports the mount's owner: msdos/vfat, exfat and
-    /// the classic ntfs driver.
-    None,
-}
-
-/// How the filesystem holding `fd` keeps owners, from its `fstatfs` type.
-#[cfg(target_os = "linux")]
-fn fs_owners(fd: libc::c_int) -> FsOwners {
-    const OWNERLESS_FS: [u64; 3] = [
-        0x4d44,      // MSDOS_SUPER_MAGIC (msdos, vfat)
-        0x2011_bab0, // EXFAT_SUPER_MAGIC
-        0x5346_544e, // NTFS_SB_MAGIC
-    ];
-    const MAYBE_MAPPED_FS: [u64; 6] = [
-        0x7366_746e, // ntfs3: stores a WSL owner and mode per file ($LXUID, $LXGID, $LXMOD)
-        0xff53_4d42, // CIFS_SUPER_MAGIC
-        0xfe53_4d42, // SMB2_SUPER_MAGIC
-        0x517b,      // SMB_SUPER_MAGIC
-        0x6969,      // NFS_SUPER_MAGIC
-        0x6573_5546, // FUSE_SUPER_MAGIC (fuse and fuseblk)
-    ];
-    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(fd, st.as_mut_ptr()) } != 0 {
-        return FsOwners::Stored;
-    }
-    let st = unsafe { st.assume_init() };
-    // `f_type` is a signed word whose width varies by architecture; the magic numbers are its
-    // low 32 bits.
-    let f_type = u64::from(st.f_type as u32);
-    if OWNERLESS_FS.contains(&f_type) {
-        FsOwners::None
-    } else if MAYBE_MAPPED_FS.contains(&f_type) {
-        FsOwners::MayBeMapped
-    } else {
-        FsOwners::Stored
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fs_owners(_fd: libc::c_int) -> FsOwners {
-    FsOwners::Stored
-}
-
-/// How far cp trusts an object `made_by_us` accepted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MadeTrust {
-    /// Owned by cp's effective user, or on a filesystem that stores no owners: -p applies in full.
-    Full,
-    /// Accepted only because it is owned like its parent, on a filesystem that may store owners
-    /// for real: cp copies into it, but -p must not chown or chmod it.
-    ParentOwnerOnly,
-}
-
-/// Whether `made`, found where cp has just made an object in a directory owned by `parent_uid`
-/// (`None` when cp holds no descriptor for that directory), can be the object cp made rather
-/// than one swapped in by someone else -- and if so, how far it is trusted.
-///
-/// Owned by cp's effective user: accepted, in full. Otherwise only in a parent cp's user does
-/// not own, and only when the object is owned like that parent, on a filesystem whose type says
-/// owners may not be what each creator was:
-/// - msdos/vfat, exfat and the classic ntfs driver store no owner at all, so every object
-///   reports the mount's owner and nothing about ownership can be learned or conferred (a -p
-///   chown there fails and drops set-user-ID): accepted in full.
-/// - NFS, FUSE, cifs/smb and ntfs3 may map owners (root_squash, sshfs without idmap, `uid=`)
-///   -- or may store them for real (NFS without squashing, sshfs with idmap, mergerfs,
-///   ceph-fuse, ntfs3's per-file WSL owner). In the
-///   second case someone who can write the parent but does not own it can rename in an object
-///   of the parent owner's (an empty directory, a symbolic link, a FIFO or device node with one
-///   link), which cp cannot tell from its own. Such an object is still accepted, so that copying
-///   onto these filesystems works, but only as `ParentOwnerOnly`: cp gives it no owner and no
-///   mode, so an object it did not make is never chowned or chmod'ed.
-///
-/// On every other filesystem only cp's effective user is accepted: no one can give a file
-/// away, a directory cannot be hard-linked, and a hard link to one of cp's user's nodes fails
-/// the link count. The parent's owner, who could plant an object of their own anywhere here,
-/// controls every entry of that directory already, cp's included.
-///
-/// Link count: a fresh symbolic link or special file has exactly one; a fresh directory has
-/// two (itself and its `.`), or one on filesystems that do not count directory links (btrfs,
-/// some FUSE).
-fn made_by_us(made: MadeObject, parent_uid: Option<u32>, euid: u32) -> Option<MadeTrust> {
-    let nlink_ok = if made.is_dir {
-        made.nlink <= 2
-    } else {
-        made.nlink == 1
-    };
-    if !nlink_ok {
-        return None;
-    }
-    if made.uid == euid {
-        return Some(MadeTrust::Full);
-    }
-    let owned_like_parent =
-        parent_uid.is_some_and(|parent_uid| parent_uid != euid && made.uid == parent_uid);
-    match (made.owners, owned_like_parent) {
-        (FsOwners::None, true) => Some(MadeTrust::Full),
-        (FsOwners::MayBeMapped, true) => Some(MadeTrust::ParentOwnerOnly),
-        _ => None,
-    }
 }
 
 enum CopyResult {
@@ -669,7 +550,8 @@ fn preserve_node_attributes(
 /// a special file goes through `self/fd/N` in a `/proc` verified to be procfs, which names
 /// exactly the pinned inode. A symbolic link has no such route -- that path is followed to the
 /// link and then through it -- so its times go by name with `AT_SYMLINK_NOFOLLOW`, only once a
-/// fresh `lstat` shows the name still holds the pinned link (`utimens_link_by_name`).
+/// fresh `lstat` shows the name still holds the pinned link (`utimens_link_if_still`, whose
+/// residual -- a wrong mtime, at worst -- is documented there).
 #[cfg(target_os = "linux")]
 fn utimens_pinned(
     dirfd: libc::c_int,
@@ -687,102 +569,18 @@ fn utimens_pinned(
         return Err(e);
     }
     if symlink {
-        return utimens_link_by_name(dirfd, name, &pinned.metadata()?, times);
-    }
-    let proc_dir = procfs_dir()?;
-    let path = proc_fd_name(fd);
-    if unsafe { libc::utimensat(proc_dir.as_raw_fd(), path.as_ptr(), times.as_ptr(), 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Set the times of the symbolic link `name` in `dirfd` by name, with `AT_SYMLINK_NOFOLLOW`, if
-/// `lstat` shows the name still holds the link `pinned` describes; fail otherwise.
-///
-/// Only for kernels before 5.8. The residual is a replacement between the `lstat` and the
-/// `utimensat`: a hard link to another file swapped in at that moment takes the link's times --
-/// a wrong mtime, at worst.
-#[cfg(target_os = "linux")]
-fn utimens_link_by_name(
-    dirfd: libc::c_int,
-    name: &CStr,
-    pinned: &fs::Metadata,
-    times: &[libc::timespec; 2],
-) -> io::Result<()> {
-    let now = ftw::Metadata::new(dirfd, name, false)?;
-    if now.dev() != pinned.dev()
-        || now.ino() != pinned.ino()
-        || now.file_type() != ftw::FileType::SymbolicLink
-    {
+        let md = pinned.metadata()?;
+        if utimens_link_if_still(dirfd, name, (md.dev(), md.ino()), times)? {
+            return Ok(());
+        }
         return Err(io::Error::other(gettext!(
             "'{}' was replaced during the copy",
             name.to_string_lossy()
         )));
     }
-    let nofollow = libc::AT_SYMLINK_NOFOLLOW;
-    if unsafe { libc::utimensat(dirfd, name.as_ptr(), times.as_ptr(), nofollow) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// The `fchmodat2` system call number (Linux 6.6 and later), where it is the generic 452.
-/// `libc` 0.2.189 exports `SYS_fchmodat2` for x86_64 but not for aarch64-linux-gnu, so the
-/// number is spelled here. Not on x32, whose numbers carry `__X32_SYSCALL_BIT`, nor on the
-/// architectures with tables of their own (alpha, mips, ...): there only the procfs path is
-/// used.
-#[cfg(target_os = "linux")]
-const SYS_FCHMODAT2: Option<libc::c_long> = if cfg!(any(
-    all(target_arch = "x86_64", target_pointer_width = "64"),
-    target_arch = "x86",
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "riscv64",
-    target_arch = "loongarch64",
-    target_arch = "powerpc64",
-    target_arch = "s390x"
-)) {
-    Some(452)
-} else {
-    None
-};
-
-/// Set the mode of the inode an `O_PATH` descriptor pins, which `fchmod` refuses (EBADF).
-///
-/// First `fchmodat2(fd, "", mode, AT_EMPTY_PATH)` (Linux 6.6 and later), which acts on that
-/// inode directly. Where it does not exist (ENOSYS), does not take `AT_EMPTY_PATH` (EINVAL), or
-/// is refused by a seccomp filter that does not know it (EPERM: older runc, systemd's
-/// `SystemCallFilter=`), `fchmodat` on `self/fd/N` relative to a `/proc` descriptor verified to
-/// be procfs, which names the same inode; a genuine EPERM comes back from that call too. With
-/// neither, the mode is not set and the failure is reported: a by-name fallback could act on
-/// whatever the name holds by then.
-#[cfg(target_os = "linux")]
-fn chmod_pinned(fd: libc::c_int, mode: libc::mode_t) -> io::Result<()> {
-    if let Some(sys_fchmodat2) = SYS_FCHMODAT2 {
-        let ret = unsafe {
-            libc::syscall(
-                sys_fchmodat2,
-                fd,
-                c"".as_ptr(),
-                libc::c_uint::from(mode),
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if ret == 0 {
-            return Ok(());
-        }
-        let e = io::Error::last_os_error();
-        if !matches!(
-            e.raw_os_error(),
-            Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM)
-        ) {
-            return Err(e);
-        }
-    }
     let proc_dir = procfs_dir()?;
-    let pinned = proc_fd_name(fd);
-    if unsafe { libc::fchmodat(proc_dir.as_raw_fd(), pinned.as_ptr(), mode, 0) } != 0 {
+    let path = proc_fd_name(fd);
+    if unsafe { libc::utimensat(proc_dir.as_raw_fd(), path.as_ptr(), times.as_ptr(), 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -1658,38 +1456,6 @@ fn reopen_regular_blocking(
     unsafe { libc::openat(dirfd, name, flags) }
 }
 
-/// `/proc`, opened and verified to be procfs (`PROC_SUPER_MAGIC`), so that `self/fd/N` names
-/// exactly the inode open on descriptor N rather than whatever else is mounted or planted there.
-#[cfg(target_os = "linux")]
-fn procfs_dir() -> io::Result<fs::File> {
-    const PROC_SUPER_MAGIC: u32 = 0x9fa0;
-    let fd = unsafe {
-        libc::open(
-            c"/proc".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let dir = unsafe { fs::File::from_raw_fd(fd) };
-    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(dir.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // `f_type` is a signed word whose width varies by architecture; the magic is its low bits.
-    if unsafe { st.assume_init() }.f_type as u32 != PROC_SUPER_MAGIC {
-        return Err(io::Error::other(gettext("/proc is not a procfs mount")));
-    }
-    Ok(dir)
-}
-
-/// `self/fd/N`, relative to `procfs_dir`.
-#[cfg(target_os = "linux")]
-fn proc_fd_name(fd: libc::c_int) -> CString {
-    CString::new(format!("self/fd/{fd}")).unwrap()
-}
-
 /// Clear `O_NONBLOCK` on a descriptor opened with it only to keep a swapped-in FIFO from
 /// blocking the open.
 fn clear_nonblock(fd: libc::c_int) -> io::Result<()> {
@@ -2363,133 +2129,8 @@ fn copy_special_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{made_by_us, FsOwners, MadeObject, MadeTrust};
-
-    const CP: u32 = 1000;
-    const OTHER: u32 = 2000;
-    const FULL: Option<MadeTrust> = Some(MadeTrust::Full);
-    const PARENT_OWNER_ONLY: Option<MadeTrust> = Some(MadeTrust::ParentOwnerOnly);
-
-    fn dir(uid: u32, nlink: u64) -> MadeObject {
-        MadeObject {
-            uid,
-            nlink,
-            is_dir: true,
-            owners: FsOwners::Stored,
-        }
-    }
-
-    fn node(uid: u32, nlink: u64) -> MadeObject {
-        MadeObject {
-            uid,
-            nlink,
-            is_dir: false,
-            owners: FsOwners::Stored,
-        }
-    }
-
-    /// On NFS, FUSE or cifs/smb, which may map owners or store them.
-    fn maybe_mapped(made: MadeObject) -> MadeObject {
-        MadeObject {
-            owners: FsOwners::MayBeMapped,
-            ..made
-        }
-    }
-
-    /// On msdos/vfat, exfat or ntfs, which store no owner.
-    fn ownerless(made: MadeObject) -> MadeObject {
-        MadeObject {
-            owners: FsOwners::None,
-            ..made
-        }
-    }
-
-    /// The ordinary case: cp's own object in cp's own or anyone's directory, on any filesystem.
-    #[test]
-    fn trusts_what_cp_made() {
-        assert_eq!(made_by_us(dir(CP, 2), Some(CP), CP), FULL);
-        assert_eq!(made_by_us(dir(CP, 2), Some(OTHER), CP), FULL);
-        assert_eq!(made_by_us(node(CP, 1), Some(OTHER), CP), FULL);
-        assert_eq!(made_by_us(node(CP, 1), None, CP), FULL);
-        assert_eq!(made_by_us(maybe_mapped(dir(CP, 2)), Some(OTHER), CP), FULL);
-    }
-
-    /// A filesystem with no owners reports the mount's owner for everything: what cp makes is
-    /// owned like its parent, and there is no owner an attacker's object could carry instead.
-    #[test]
-    fn trusts_an_owner_reported_by_an_ownerless_filesystem() {
-        assert_eq!(made_by_us(ownerless(dir(4242, 2)), Some(4242), CP), FULL);
-        assert_eq!(made_by_us(ownerless(node(4242, 1)), Some(4242), CP), FULL);
-    }
-
-    /// NFS, FUSE or cifs/smb owned like the parent: accepted, so the copy works where owners are
-    /// mapped (root_squash, sshfs without idmap), but -p withholds owner and mode, because where
-    /// owners are stored (NFS without squashing, sshfs with idmap) the parent's owner's object
-    /// may have been renamed in by someone else.
-    #[test]
-    fn accepts_but_does_not_trust_an_owner_that_may_be_stored() {
-        assert_eq!(
-            made_by_us(maybe_mapped(dir(4242, 2)), Some(4242), CP),
-            PARENT_OWNER_ONLY
-        );
-        assert_eq!(
-            made_by_us(maybe_mapped(node(4242, 1)), Some(4242), CP),
-            PARENT_OWNER_ONLY
-        );
-        assert_eq!(
-            made_by_us(maybe_mapped(dir(65534, 2)), Some(65534), 0),
-            PARENT_OWNER_ONLY
-        );
-    }
-
-    /// Where owners are stored, an object owned by the parent's owner (who is not cp's user)
-    /// was made by that owner, not by cp.
-    #[test]
-    fn refuses_a_parent_owners_object_where_owners_are_stored() {
-        assert_eq!(made_by_us(dir(OTHER, 2), Some(OTHER), CP), None);
-        assert_eq!(made_by_us(node(OTHER, 1), Some(OTHER), CP), None);
-    }
-
-    /// The parent-owner arm needs the parent's owner; with no parent descriptor only cp's own
-    /// user is accepted.
-    #[test]
-    fn refuses_a_foreign_owner_without_a_parent() {
-        assert_eq!(made_by_us(maybe_mapped(dir(4242, 2)), None, CP), None);
-        assert_eq!(made_by_us(ownerless(dir(4242, 2)), None, CP), None);
-    }
-
-    /// Filesystems that report 1 for every directory's link count (btrfs, some FUSE).
-    #[test]
-    fn accepts_a_directory_link_count_of_one() {
-        assert_eq!(made_by_us(dir(CP, 1), Some(CP), CP), FULL);
-    }
-
-    /// Someone else's object in a directory cp owns: an attacker in a shared directory.
-    #[test]
-    fn refuses_another_users_object() {
-        assert_eq!(made_by_us(dir(OTHER, 2), Some(CP), CP), None);
-        assert_eq!(made_by_us(node(OTHER, 1), Some(CP), CP), None);
-        assert_eq!(made_by_us(maybe_mapped(dir(OTHER, 2)), Some(CP), CP), None);
-        assert_eq!(made_by_us(ownerless(dir(OTHER, 2)), Some(CP), CP), None);
-        // In someone else's directory, an object owned by a third user.
-        assert_eq!(made_by_us(dir(3000, 2), Some(OTHER), CP), None);
-        assert_eq!(
-            made_by_us(maybe_mapped(dir(3000, 2)), Some(OTHER), CP),
-            None
-        );
-    }
-
-    /// A hard link to an existing node (cp's own, or a mapped owner's) is not a fresh one, and
-    /// a directory with subdirectories is not a fresh one.
-    #[test]
-    fn refuses_link_counts_a_fresh_object_cannot_have() {
-        assert_eq!(made_by_us(node(CP, 2), Some(CP), CP), None);
-        assert_eq!(
-            made_by_us(maybe_mapped(node(4242, 2)), Some(4242), CP),
-            None
-        );
-        assert_eq!(made_by_us(dir(CP, 3), Some(CP), CP), None);
-    }
+    // made_by_us and the by-name link times are tested with them, in plib::madefs.
+    use super::MadeTrust;
 
     /// -p on an object trusted only as owned like its parent: the times are applied, the mode
     /// (and owner) are not, and that is reported.
@@ -2657,43 +2298,5 @@ mod tests {
         copy_must_create(&dir.join("source"), &dir.join("target"));
         let kept = fs::read(dir.join("target")).unwrap();
         assert_eq!(kept, b"kept");
-    }
-
-    /// Before Linux 5.8 a made symbolic link's times go by name: only while the name still
-    /// holds the pinned link, never through a hard link to another file swapped in for it.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn link_times_by_name_reach_only_the_pinned_link() {
-        use super::utimens_link_by_name;
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
-
-        let dir = std::env::temp_dir().join(format!("cp-link-times-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
-        std::os::unix::fs::symlink("anywhere", dir.join("l")).unwrap();
-        let dirfd = std::fs::File::open(&dir).unwrap();
-        let pinned = std::fs::symlink_metadata(dir.join("l")).unwrap();
-        let at = |sec| libc::timespec {
-            tv_sec: sec,
-            tv_nsec: 0,
-        };
-
-        utimens_link_by_name(dirfd.as_raw_fd(), c"l", &pinned, &[at(12345), at(12345)]).unwrap();
-        assert_eq!(
-            std::fs::symlink_metadata(dir.join("l")).unwrap().mtime(),
-            12345
-        );
-
-        let victim = dir.join("victim");
-        std::fs::write(&victim, "").unwrap();
-        std::fs::remove_file(dir.join("l")).unwrap();
-        std::fs::hard_link(&victim, dir.join("l")).unwrap();
-        let before = std::fs::metadata(&victim).unwrap().mtime();
-        let r = utimens_link_by_name(dirfd.as_raw_fd(), c"l", &pinned, &[at(1), at(1)]);
-        assert!(r.is_err());
-        assert_eq!(std::fs::metadata(&victim).unwrap().mtime(), before);
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -22,161 +22,34 @@
 //! count and emptiness, tell a directory pax has just made from one renamed
 //! over it.
 //!
-//! The trust rules mirror cp's (`tree/common/copy.rs`, `made_by_us`).
+//! The trust rules and the pinned-inode primitives are cp's, shared through
+//! `plib::madefs`.
 
+pub(crate) use plib::madefs::MadeTrust;
+use plib::madefs::{fs_owners, made_by_us, FsOwners, MadeObject};
+#[cfg(target_os = "linux")]
+pub(crate) use plib::madefs::{proc_fd_name, procfs_dir};
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
 
-/// How a filesystem keeps file owners, as far as its type says.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum FsOwners {
-    /// Each object's owner is stored and reported as it is (ext4, xfs, btrfs,
-    /// tmpfs, ...), and the answer wherever the type cannot be read.
-    Stored,
-    /// Owners may be mapped -- reported from a mount option, an id map or a
-    /// squash rule rather than from who made the object -- or may be stored
-    /// for real, depending on the mount: NFS, FUSE, cifs/smb, ntfs3.
-    MayBeMapped,
-    /// No owner is stored at all; every object reports the mount's owner:
-    /// msdos/vfat, exfat and the classic ntfs driver.
-    None,
-}
-
-/// How the filesystem holding `fd` keeps owners, from its `fstatfs` type.
-#[cfg(target_os = "linux")]
-pub(crate) fn fs_owners(fd: BorrowedFd<'_>) -> FsOwners {
-    const OWNERLESS_FS: [u64; 3] = [
-        0x4d44,      // MSDOS_SUPER_MAGIC (msdos, vfat)
-        0x2011_bab0, // EXFAT_SUPER_MAGIC
-        0x5346_544e, // NTFS_SB_MAGIC
-    ];
-    const MAYBE_MAPPED_FS: [u64; 6] = [
-        0x7366_746e, // ntfs3
-        0xff53_4d42, // CIFS_SUPER_MAGIC
-        0xfe53_4d42, // SMB2_SUPER_MAGIC
-        0x517b,      // SMB_SUPER_MAGIC
-        0x6969,      // NFS_SUPER_MAGIC
-        0x6573_5546, // FUSE_SUPER_MAGIC (fuse and fuseblk)
-    ];
-    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-        return FsOwners::Stored;
-    }
-    let st = unsafe { st.assume_init() };
-    // `f_type` is a signed word whose width varies by architecture; the magic
-    // numbers are its low 32 bits.
-    let f_type = u64::from(st.f_type as u32);
-    if OWNERLESS_FS.contains(&f_type) {
-        FsOwners::None
-    } else if MAYBE_MAPPED_FS.contains(&f_type) {
-        FsOwners::MayBeMapped
-    } else {
-        FsOwners::Stored
+/// What `st` says about an object pax has just made, on a filesystem keeping
+/// owners as `owners`.
+fn made_object(st: &libc::stat, owners: FsOwners) -> MadeObject {
+    // Cast needed: `nlink_t` is u16 on macOS and u64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let nlink = st.st_nlink as u64;
+    MadeObject {
+        uid: st.st_uid,
+        nlink,
+        is_dir: st.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        owners,
     }
 }
 
-/// How the filesystem holding `fd` keeps owners, from its `fstatfs` type
-/// name.
-#[cfg(target_os = "macos")]
-pub(crate) fn fs_owners(fd: BorrowedFd<'_>) -> FsOwners {
-    const OWNERLESS_FS: [&[u8]; 3] = [b"msdos", b"exfat", b"ntfs"];
-    const MAYBE_MAPPED_FS: [&[u8]; 6] = [
-        b"nfs", b"smbfs", b"afpfs", b"webdav", b"macfuse", b"osxfuse",
-    ];
-    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
-        return FsOwners::Stored;
-    }
-    let st = unsafe { st.assume_init() };
-    let name = unsafe { CStr::from_ptr(st.f_fstypename.as_ptr()) }.to_bytes();
-    if OWNERLESS_FS.contains(&name) {
-        FsOwners::None
-    } else if MAYBE_MAPPED_FS.contains(&name) {
-        FsOwners::MayBeMapped
-    } else {
-        FsOwners::Stored
-    }
-}
-
-/// Without the filesystem type, owners are taken to be stored: only pax's
-/// own are trusted.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn fs_owners(_fd: BorrowedFd<'_>) -> FsOwners {
-    FsOwners::Stored
-}
-
-/// How far pax trusts an object `made_by_us` accepted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum MadeTrust {
-    /// Owned by pax's effective user, or on a filesystem that stores no
-    /// owners: every attribute applies.
-    Full,
-    /// Accepted only because it is owned like its parent, on a filesystem
-    /// that may store owners for real: pax uses it, but gives it no owner and
-    /// no mode.
-    ParentOwnerOnly,
-}
-
-/// What `fstat` (on a descriptor pax holds for it) reports about an object
-/// pax has just made.
-#[derive(Clone, Copy)]
-pub(crate) struct MadeObject {
-    pub uid: u32,
-    pub nlink: u64,
-    pub is_dir: bool,
-    pub owners: FsOwners,
-}
-
-impl MadeObject {
-    /// `st` of an object on a filesystem keeping owners as `owners`.
-    fn of(st: &libc::stat, owners: FsOwners) -> Self {
-        // Cast needed: `nlink_t` is u16 on macOS and u64 on Linux.
-        #[allow(clippy::unnecessary_cast)]
-        let nlink = st.st_nlink as u64;
-        MadeObject {
-            uid: st.st_uid,
-            nlink,
-            is_dir: st.st_mode & libc::S_IFMT == libc::S_IFDIR,
-            owners,
-        }
-    }
-}
-
-/// Whether `made`, found where pax has just made an object in a directory
-/// owned by `parent_uid`, can be the object pax made rather than one swapped
-/// in by someone else -- and if so, how far it is trusted.
-///
-/// Owned by pax's effective user: accepted, in full. Otherwise only in a
-/// parent pax's user does not own, and only when the object is owned like
-/// that parent, on a filesystem whose type says owners may not be what each
-/// creator was: in full where no owner is stored at all, and as
-/// `ParentOwnerOnly` where owners may be mapped or may be real. On every other
-/// filesystem only pax's effective user is accepted: no one can give a file
-/// away, a directory cannot be hard-linked, and a hard link to one of pax's
-/// user's nodes fails the link count.
-///
-/// Link count: a fresh symbolic link or special file has exactly one; a fresh
-/// directory has two (itself and its `.`), or one on filesystems that do not
-/// count directory links (btrfs, some FUSE).
-pub(crate) fn made_by_us(made: MadeObject, parent_uid: u32, euid: u32) -> Option<MadeTrust> {
-    let nlink_ok = if made.is_dir {
-        made.nlink <= 2
-    } else {
-        made.nlink == 1
-    };
-    if !nlink_ok {
-        return None;
-    }
-    if made.uid == euid {
-        return Some(MadeTrust::Full);
-    }
-    let owned_like_parent = parent_uid != euid && made.uid == parent_uid;
-    match (made.owners, owned_like_parent) {
-        (FsOwners::None, true) => Some(MadeTrust::Full),
-        (FsOwners::MayBeMapped, true) => Some(MadeTrust::ParentOwnerOnly),
-        _ => None,
-    }
+/// How the filesystem holding `fd` keeps owners.
+fn owners_of(fd: BorrowedFd<'_>) -> FsOwners {
+    fs_owners(fd.as_raw_fd())
 }
 
 /// The error for a name that no longer holds what pax made there.
@@ -213,7 +86,7 @@ fn check_node(
     let type_ok = st.st_mode & libc::S_IFMT == made_type;
     let parent = fstat(dirfd)?;
     let euid = unsafe { libc::geteuid() };
-    node_trust(MadeObject::of(st, owners), type_ok, &parent, euid).ok_or_else(replaced)
+    node_trust(made_object(st, owners), type_ok, &parent, euid).ok_or_else(replaced)
 }
 
 /// How far `made`, found of the type made (`type_ok`) where pax running as
@@ -235,7 +108,7 @@ pub(crate) fn node_trust(
     if !others_can_rename(parent, euid) {
         return Some(MadeTrust::Full);
     }
-    made_by_us(made, parent.st_uid, euid)
+    made_by_us(made, Some(parent.st_uid), euid)
 }
 
 /// Whether anyone but `euid` can rename entries in the directory `parent`:
@@ -298,8 +171,8 @@ pub(crate) fn verify_made_dir(
         return Ok(Some(MadeTrust::Full));
     }
     let st = fstat(dir)?;
-    let made = MadeObject::of(&st, fs_owners(dir));
-    let Some(trust) = made_by_us(made, parent_st.st_uid, euid) else {
+    let made = made_object(&st, owners_of(dir));
+    let Some(trust) = made_by_us(made, Some(parent_st.st_uid), euid) else {
         return Ok(None);
     };
     if !made.is_dir || !is_empty_made_dir(dir, &st, euid)? {
@@ -332,7 +205,7 @@ fn is_empty_made_dir(dir: BorrowedFd<'_>, st: &libc::stat, euid: u32) -> io::Res
 /// (`O_PATH` on Linux, where `fchmod` refuses it).
 #[cfg(target_os = "linux")]
 fn chmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> io::Result<()> {
-    linux::chmod_pinned(fd, mode)
+    plib::madefs::chmod_pinned(fd.as_raw_fd(), mode)
 }
 
 /// Elsewhere a search-only descriptor (`O_SEARCH`) takes `fchmod`.
@@ -341,10 +214,8 @@ fn chmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> io::Result<()> {
     cvt(unsafe { libc::fchmod(fd.as_raw_fd(), mode) })
 }
 
-#[cfg(all(target_os = "linux", test))]
-use linux::utimens_link_by_name;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{proc_fd_name, procfs_dir, MadeNode};
+pub(crate) use linux::MadeNode;
 #[cfg(not(target_os = "linux"))]
 pub(crate) use other::MadeNode;
 
@@ -354,8 +225,8 @@ pub(crate) use other::MadeNode;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::ffi::CString;
-    use std::fs::File;
+    use crate::modes::anchored::file_id;
+    use plib::madefs::{chmod_pinned, utimens_link_if_still};
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
     /// A FIFO, device or symbolic link pax has just made, held by descriptor.
@@ -383,7 +254,7 @@ mod linux {
             }
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             let st = fstat(fd.as_fd())?;
-            let trust = check_node(&st, made_type, dirfd, fs_owners(fd.as_fd()))?;
+            let trust = check_node(&st, made_type, dirfd, owners_of(fd.as_fd()))?;
             Ok(MadeNode {
                 fd,
                 symlink: made_type == libc::S_IFLNK,
@@ -404,15 +275,18 @@ mod linux {
 
         /// The mode of a FIFO or device; never called for a symbolic link.
         pub(crate) fn chmod(&self, mode: libc::mode_t) -> io::Result<()> {
-            chmod_pinned(self.fd.as_fd(), mode)
+            chmod_pinned(self.fd.as_raw_fd(), mode)
         }
 
         /// `utimensat` with `AT_EMPTY_PATH` (Linux 5.8 and later). Before
-        /// that, a FIFO or device through `/proc/self/fd`, which names exactly
-        /// the pinned inode. A symbolic link has no such route -- that path is
-        /// followed to the link and then through it -- so its times go by
-        /// name, only while the name still holds the pinned link
-        /// (`utimens_link_by_name`).
+        /// that -- on EINVAL from that call, and only then -- a FIFO or device
+        /// through `/proc/self/fd`, which names exactly the pinned inode. A
+        /// symbolic link has no such route -- that path is followed to the
+        /// link and then through it -- so its times go by name, only once a
+        /// fresh `lstat` shows the name still holds the pinned link
+        /// (`utimens_link_if_still`). The residual window is between that
+        /// `lstat` and the `utimensat`: a hard link to another file swapped in
+        /// then takes the link's times -- a wrong mtime, at worst.
         pub(crate) fn utimens(&self, times: &[libc::timespec; 2]) -> io::Result<()> {
             let fd = self.fd.as_raw_fd();
             let r =
@@ -425,7 +299,12 @@ mod linux {
                 return Err(err);
             }
             if self.symlink {
-                return utimens_link_by_name(self.dirfd, self.name, self.fd.as_fd(), times);
+                let pinned = file_id(&fstat(self.fd.as_fd())?);
+                let dirfd = self.dirfd.as_raw_fd();
+                return match utimens_link_if_still(dirfd, self.name, pinned, times)? {
+                    true => Ok(()),
+                    false => Err(replaced()),
+                };
             }
             let proc_dir = procfs_dir()?;
             let pinned = proc_fd_name(fd);
@@ -433,114 +312,6 @@ mod linux {
                 libc::utimensat(proc_dir.as_raw_fd(), pinned.as_ptr(), times.as_ptr(), 0)
             })
         }
-    }
-
-    /// Set the times of the symbolic link `name` below `dirfd` by name, with
-    /// `AT_SYMLINK_NOFOLLOW`, if `lstat` shows the name still holds the link
-    /// pinned on `pinned`; fail otherwise.
-    ///
-    /// For kernels before 5.8, whose `utimensat` refuses `AT_EMPTY_PATH`.
-    /// The residual is a replacement between the `lstat` and the
-    /// `utimensat`: a hard link to another file swapped in at that moment
-    /// takes the link's times -- an mtime, at worst.
-    pub(crate) fn utimens_link_by_name(
-        dirfd: BorrowedFd<'_>,
-        name: &CStr,
-        pinned: BorrowedFd<'_>,
-        times: &[libc::timespec; 2],
-    ) -> io::Result<()> {
-        let held = fstat(pinned)?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let nofollow = libc::AT_SYMLINK_NOFOLLOW;
-        cvt(unsafe { libc::fstatat(dirfd.as_raw_fd(), name.as_ptr(), &mut st, nofollow) })?;
-        let id = crate::modes::anchored::file_id;
-        if id(&st) != id(&held) || st.st_mode & libc::S_IFMT != libc::S_IFLNK {
-            return Err(replaced());
-        }
-        let (dir, path) = (dirfd.as_raw_fd(), name.as_ptr());
-        cvt(unsafe { libc::utimensat(dir, path, times.as_ptr(), nofollow) })
-    }
-
-    /// The `fchmodat2` system call number (Linux 6.6 and later), the generic
-    /// 452, spelled here because `libc` does not export it for every target.
-    /// Not on x32, nor on the architectures with tables of their own: there
-    /// only the procfs path is used.
-    const SYS_FCHMODAT2: Option<libc::c_long> = if cfg!(any(
-        all(target_arch = "x86_64", target_pointer_width = "64"),
-        target_arch = "x86",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "powerpc64",
-        target_arch = "s390x"
-    )) {
-        Some(452)
-    } else {
-        None
-    };
-
-    /// Set the mode of the inode an `O_PATH` descriptor pins, which `fchmod`
-    /// refuses.
-    ///
-    /// First `fchmodat2(fd, "", mode, AT_EMPTY_PATH)`. Where it does not
-    /// exist (ENOSYS), does not take `AT_EMPTY_PATH` (EINVAL), or is refused
-    /// by a seccomp filter that does not know it (EPERM), `fchmodat` on
-    /// `self/fd/N` relative to a `/proc` verified to be procfs, which names
-    /// the same inode; a genuine EPERM comes back from that call too. With
-    /// neither, the mode is not set and the failure is reported: a by-name
-    /// fallback could act on whatever the name holds by then.
-    pub(super) fn chmod_pinned(fd: BorrowedFd<'_>, mode: libc::mode_t) -> io::Result<()> {
-        if let Some(sys_fchmodat2) = SYS_FCHMODAT2 {
-            let r = unsafe {
-                libc::syscall(
-                    sys_fchmodat2,
-                    fd.as_raw_fd(),
-                    c"".as_ptr(),
-                    libc::c_uint::from(mode),
-                    libc::AT_EMPTY_PATH,
-                )
-            };
-            if r == 0 {
-                return Ok(());
-            }
-            let e = io::Error::last_os_error();
-            if !matches!(
-                e.raw_os_error(),
-                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM)
-            ) {
-                return Err(e);
-            }
-        }
-        let proc_dir = procfs_dir()?;
-        let pinned = proc_fd_name(fd.as_raw_fd());
-        cvt(unsafe { libc::fchmodat(proc_dir.as_raw_fd(), pinned.as_ptr(), mode, 0) })
-    }
-
-    /// `/proc`, opened and verified to be procfs (`PROC_SUPER_MAGIC`), so
-    /// that `self/fd/N` names exactly the inode open on descriptor N rather
-    /// than whatever else is mounted or planted there.
-    pub(crate) fn procfs_dir() -> io::Result<File> {
-        const PROC_SUPER_MAGIC: u32 = 0x9fa0;
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = unsafe { libc::open(c"/proc".as_ptr(), flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let dir = unsafe { File::from_raw_fd(fd) };
-        let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        cvt(unsafe { libc::fstatfs(dir.as_raw_fd(), st.as_mut_ptr()) })?;
-        // `f_type` is a signed word whose width varies by architecture; the
-        // magic is its low bits.
-        if unsafe { st.assume_init() }.f_type as u32 != PROC_SUPER_MAGIC {
-            return Err(io::Error::other("/proc is not a procfs mount"));
-        }
-        Ok(dir)
-    }
-
-    /// `self/fd/N`, relative to `procfs_dir`.
-    pub(crate) fn proc_fd_name(fd: libc::c_int) -> CString {
-        CString::new(format!("self/fd/{fd}")).expect("a formatted number has no NUL")
     }
 }
 
@@ -602,11 +373,11 @@ mod other {
                 if file_id(&held) != file_id(&st) {
                     return Err(replaced());
                 }
-                let trust = check_node(&held, made_type, dirfd, fs_owners(fd.as_fd()))?;
+                let trust = check_node(&held, made_type, dirfd, owners_of(fd.as_fd()))?;
                 let held = Held::Fd(fd);
                 return Ok(MadeNode { held, trust });
             }
-            let trust = check_node(&st, made_type, dirfd, fs_owners(dirfd))?;
+            let trust = check_node(&st, made_type, dirfd, owners_of(dirfd))?;
             let id = file_id(&st);
             let held = Held::Name {
                 dirfd,
@@ -745,6 +516,8 @@ mod other {
 mod tests {
     use super::*;
 
+    // made_by_us itself, and the by-name link times, are tested in
+    // plib::madefs.
     const PAX: u32 = 1000;
     const OTHER: u32 = 2000;
 
@@ -755,96 +528,6 @@ mod tests {
             is_dir,
             owners,
         }
-    }
-
-    /// Before Linux 5.8 a symbolic link's times go by name: only while the
-    /// name still holds the pinned link, never through a hard link to another
-    /// file swapped in for it.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn link_times_by_name_reach_only_the_pinned_link() {
-        use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-        use std::os::unix::fs::MetadataExt;
-        let tmp = plib::tmp::TempDir::new().unwrap();
-        std::os::unix::fs::symlink("anywhere", tmp.path().join("l")).unwrap();
-        let dir = std::fs::File::open(tmp.path()).unwrap();
-        let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let pin = unsafe { libc::openat(dir.as_raw_fd(), c"l".as_ptr(), flags) };
-        assert!(pin >= 0);
-        let pin = unsafe { OwnedFd::from_raw_fd(pin) };
-        let at = |sec| libc::timespec {
-            tv_sec: sec,
-            tv_nsec: 0,
-        };
-
-        let times = [at(12345), at(12345)];
-        utimens_link_by_name(dir.as_fd(), c"l", pin.as_fd(), &times).unwrap();
-        let md = std::fs::symlink_metadata(tmp.path().join("l")).unwrap();
-        assert_eq!(md.mtime(), 12345);
-
-        let victim = tmp.path().join("victim");
-        std::fs::write(&victim, "").unwrap();
-        std::fs::remove_file(tmp.path().join("l")).unwrap();
-        std::fs::hard_link(&victim, tmp.path().join("l")).unwrap();
-        let before = std::fs::metadata(&victim).unwrap().mtime();
-        let times = [at(1), at(1)];
-        assert!(utimens_link_by_name(dir.as_fd(), c"l", pin.as_fd(), &times).is_err());
-        assert_eq!(std::fs::metadata(&victim).unwrap().mtime(), before);
-    }
-
-    #[test]
-    fn trusts_what_pax_made() {
-        let full = Some(MadeTrust::Full);
-        assert_eq!(
-            made_by_us(made(PAX, 1, false, FsOwners::Stored), PAX, PAX),
-            full
-        );
-        assert_eq!(
-            made_by_us(made(PAX, 2, true, FsOwners::Stored), OTHER, PAX),
-            full
-        );
-        assert_eq!(
-            made_by_us(made(PAX, 1, true, FsOwners::Stored), PAX, PAX),
-            full
-        );
-    }
-
-    /// A hard link to a file -- anyone's -- has two links.
-    #[test]
-    fn refuses_a_hard_link() {
-        assert_eq!(
-            made_by_us(made(PAX, 2, false, FsOwners::Stored), PAX, PAX),
-            None
-        );
-        assert_eq!(
-            made_by_us(made(OTHER, 2, false, FsOwners::None), OTHER, PAX),
-            None
-        );
-    }
-
-    /// A directory with a subdirectory in it is not one just made.
-    #[test]
-    fn refuses_a_populated_directory() {
-        assert_eq!(
-            made_by_us(made(PAX, 3, true, FsOwners::Stored), PAX, PAX),
-            None
-        );
-    }
-
-    #[test]
-    fn refuses_another_users_object() {
-        assert_eq!(
-            made_by_us(made(OTHER, 1, false, FsOwners::Stored), PAX, PAX),
-            None
-        );
-        // Owned like a parent pax does own: someone else's, wherever.
-        let mapped = FsOwners::MayBeMapped;
-        assert_eq!(made_by_us(made(OTHER, 1, false, mapped), PAX, PAX), None);
-        // Owned like the parent, where owners are stored for real.
-        assert_eq!(
-            made_by_us(made(OTHER, 1, false, FsOwners::Stored), OTHER, PAX),
-            None
-        );
     }
 
     /// A parent directory of `uid` with permission bits `mode`.
@@ -897,16 +580,8 @@ mod tests {
         assert_eq!(node_trust(squashed, false, &parent(PAX, 0o755), PAX), None);
         let ours = made(PAX, 1, false, FsOwners::Stored);
         assert_eq!(node_trust(ours, true, &parent(PAX, 0o777), PAX), full);
-    }
-
-    #[test]
-    fn trusts_the_parents_owner_only_where_owners_may_not_be_real() {
-        let mapped = made(OTHER, 1, false, FsOwners::MayBeMapped);
-        assert_eq!(
-            made_by_us(mapped, OTHER, PAX),
-            Some(MadeTrust::ParentOwnerOnly)
-        );
-        let ownerless = made(OTHER, 1, false, FsOwners::None);
-        assert_eq!(made_by_us(ownerless, OTHER, PAX), Some(MadeTrust::Full));
+        // A hard link to anyone's file, where others can rename: refused.
+        let linked = made(PAX, 2, false, FsOwners::Stored);
+        assert_eq!(node_trust(linked, true, &parent(PAX, 0o777), PAX), None);
     }
 }

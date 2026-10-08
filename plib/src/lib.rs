@@ -21,6 +21,8 @@ pub mod linediff;
 pub mod locale;
 pub mod lzw;
 #[cfg(unix)]
+pub mod madefs;
+#[cfg(unix)]
 pub mod modestr;
 pub mod perm;
 #[cfg(unix)]

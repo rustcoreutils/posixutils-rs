@@ -10,8 +10,9 @@
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use clap::Parser;
 use gettextrs::gettext;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// touch - change file access and modification times
@@ -182,34 +183,59 @@ fn touch_file(
     let c_path =
         CString::new(filename).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    let exists = std::fs::symlink_metadata(filename).is_ok();
-    if !exists {
-        if args.no_create {
-            // POSIX -c: do not create, and write no diagnostic; exit success.
-            return Ok(());
-        }
-        // Create an empty file (without truncating — it does not exist yet).
-        let fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_CREAT | libc::O_WRONLY,
-                0o666 as libc::c_int,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        unsafe { libc::close(fd) };
-    }
-
     // Set only the requested field(s); leave the other unchanged (UTIME_OMIT). On a just-created
     // file the omitted field keeps its creation-time value.
     let atime = if args.access { source.0 } else { omit() };
     let mtime = if args.mtime { source.1 } else { omit() };
     let times = [atime, mtime];
 
-    let ret = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
-    if ret != 0 {
+    if !args.no_create {
+        if let Some(fd) = create_new(&c_path)? {
+            return set_times_fd(&fd, &times);
+        }
+    }
+    match set_times_path(&c_path, &times) {
+        // POSIX -c: do not create, and write no diagnostic; exit success.
+        Err(e) if args.no_create && e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+/// Create `path` as a new empty file, or return `None` if something already has that name.
+///
+/// `O_EXCL` makes the existence check and the creation one step, so a file planted between a
+/// check and the open is never opened, and a symlink is not followed. `O_NONBLOCK` and
+/// `O_NOCTTY` keep the open from waiting on a FIFO or acquiring a terminal all the same.
+fn create_new(path: &CStr) -> io::Result<Option<OwnedFd>> {
+    let flags = libc::O_CREAT
+        | libc::O_EXCL
+        | libc::O_WRONLY
+        | libc::O_NONBLOCK
+        | libc::O_NOCTTY
+        | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(path.as_ptr(), flags, 0o666 as libc::c_int) };
+    if fd >= 0 {
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        Ok(None)
+    } else {
+        Err(err)
+    }
+}
+
+/// Set the times of the file open on `fd`, the one this run created.
+fn set_times_fd(fd: &OwnedFd, times: &[libc::timespec; 2]) -> io::Result<()> {
+    if unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set the times of the existing file `path` names, following a symlink.
+fn set_times_path(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
+    if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

@@ -158,3 +158,65 @@ fn test_touch_a_newfile_leaves_mtime_now() {
     );
     fs::remove_dir_all(&d).unwrap();
 }
+
+/// Run touch with `args`, killing it if it has not finished in ten seconds.
+/// `None` means it hung.
+fn touch_bounded(args: &[&str]) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_touch"))
+        .args(args)
+        .env("TZ", "UTC")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(child.wait_with_output().unwrap())
+}
+
+/// A FIFO with no reader is given its times without being opened, so touch
+/// cannot wait on it, and is left a FIFO.
+#[test]
+fn test_touch_fifo_without_reader() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+    let d = dir("test_touch_fifo_without_reader");
+    let f = format!("{d}/fifo");
+    let c = std::ffi::CString::new(Path::new(&f).as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+    let out = touch_bounded(&["-t", "200001010000", &f]);
+    let is_fifo = fs::symlink_metadata(&f).unwrap().file_type().is_fifo();
+    let m = mtime_secs(&f);
+    fs::remove_dir_all(&d).unwrap();
+
+    let out = out.expect("touch hung on a FIFO with no reader");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(is_fifo);
+    assert_eq!(m, 946_684_800);
+}
+
+/// `-c` writes no diagnostic for a file that does not exist, and a dangling
+/// symlink names no existing file.
+#[test]
+fn test_touch_c_dangling_symlink_silent() {
+    let d = dir("test_touch_c_dangling_symlink");
+    let link = format!("{d}/link");
+    std::os::unix::fs::symlink(format!("{d}/target"), &link).unwrap();
+
+    let out = touch(None, &["-c", &link]);
+    fs::remove_dir_all(&d).unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+}

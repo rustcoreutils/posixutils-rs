@@ -525,6 +525,18 @@ Debian source packages, with GNU patch's meaning:
 ### sed
 
  * The `I` command — a non-POSIX variant of `l`.
+ * `-r` / `--regexp-extended` — GNU synonyms for `-E`.
+ * `-i[SUFFIX]` / `--in-place[=SUFFIX]` — edit each file in place, as GNU
+   sed.  The suffix is only ever attached (`-i.bak`; `-ie` is a suffix of
+   `e`), and with one the original is kept under its name plus the suffix,
+   or under the suffix with each `*` replaced by the name.  Each file is a
+   stream of its own: line numbers restart and `$` is its last line; the hold
+   space carries over.  All output, `=` and `i` included, goes into the file;
+   `q` ends the run once its file is written.  The new version is created
+   exclusively beside the original, given its owner (when root) or group, and
+   mode, and renamed over the name, so a symbolic link operand is replaced by
+   a regular file, not written through.  Unlike GNU sed, a FIFO is refused
+   rather than read, and a suffix that names another directory is refused.
  * `PROJECT_NAME` — selects the gettext text domain.
 
 ### sh

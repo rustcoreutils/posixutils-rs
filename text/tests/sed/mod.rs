@@ -9,6 +9,7 @@
 
 mod bytes;
 mod files;
+mod inplace;
 mod options;
 #[cfg(unix)]
 mod wfile;

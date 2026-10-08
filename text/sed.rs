@@ -15,9 +15,10 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    ffi::OsString,
     fmt::{self, Debug},
-    fs::File,
-    io::{BufRead, BufReader, Error, ErrorKind, Write},
+    fs::{File, Metadata, OpenOptions},
+    io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Write},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -27,8 +28,13 @@ static ERE: Mutex<bool> = Mutex::new(false);
 #[derive(Parser, Debug, Clone)]
 #[command(version, about = gettext("sed - stream editor"))]
 struct Args {
-    #[arg(short = 'E', help=gettext("Match using extended regular expressions."))]
+    #[arg(short = 'E', short_alias = 'r', long = "regexp-extended", help=gettext("Match using extended regular expressions (-r and --regexp-extended are GNU synonyms)."))]
     ere: bool,
+
+    // GNU extension. The short form's suffix is only ever attached (`-i.bak`),
+    // and `rewrite_in_place` turns it into the long form before clap sees it.
+    #[arg(short = 'i', long = "in-place", value_name = "SUFFIX", num_args = 0..=1, require_equals = true, default_missing_value = "", help=gettext("Edit each file in place, keeping the original under its name plus SUFFIX if one is given (GNU extension)."))]
+    in_place: Option<String>,
 
     #[arg(short = 'n', help=gettext("Suppress the default output. Only lines explicitly selected for output are written."))]
     quiet: bool,
@@ -47,6 +53,70 @@ struct Args {
     sources: Vec<ScriptSource>,
 }
 
+/// Spell GNU's `-i[SUFFIX]` as `--in-place[=SUFFIX]`, which clap can parse.
+///
+/// The suffix of `-i` is the rest of its word, never the next word: `-i`
+/// alone keeps no backup, `-i.bak` keeps one, and `-ni~` is `-n` and a
+/// suffix of `~`. An `i` inside the script of `-e` or the name of `-f`
+/// (attached, or the next word) is left alone, as is everything after `--`.
+fn rewrite_in_place(argv: Vec<OsString>) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut words = argv.into_iter();
+    out.extend(words.next());
+    let mut option_argument_next = false;
+    let mut operands_only = false;
+    for word in words {
+        if option_argument_next || operands_only {
+            option_argument_next = false;
+            out.push(word);
+            continue;
+        }
+        let Some(text) = word.to_str() else {
+            out.push(word);
+            continue;
+        };
+        if text == "--" {
+            operands_only = true;
+        }
+        let Some(cluster) = text.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            out.push(word);
+            continue;
+        };
+        if cluster.starts_with('-') {
+            out.push(word);
+            continue;
+        }
+        let mut rewritten = false;
+        for (pos, letter) in cluster.char_indices() {
+            match letter {
+                'e' | 'f' => {
+                    option_argument_next = pos + 1 == cluster.len();
+                    break;
+                }
+                'i' => {
+                    let (flags, suffix) = (&cluster[..pos], &cluster[pos + 1..]);
+                    if !flags.is_empty() {
+                        out.push(OsString::from(format!("-{flags}")));
+                    }
+                    out.push(OsString::from(if suffix.is_empty() {
+                        String::from("--in-place")
+                    } else {
+                        format!("--in-place={suffix}")
+                    }));
+                    rewritten = true;
+                    break;
+                }
+                // A flag, or a letter clap will refuse.
+                _ => {}
+            }
+        }
+        if !rewritten {
+            out.push(word);
+        }
+    }
+    out
+}
+
 /// One piece of the script: the text of a `-e`, or the file of a `-f`.
 #[derive(Debug, Clone)]
 enum ScriptSource {
@@ -62,7 +132,8 @@ impl Args {
     /// accepts counts: `-ne p`, `-es/a/b/`, `-fFILE`; and a word "-e" after
     /// `--` is the file operand it is.
     fn parse_ordered() -> Args {
-        let matches = Args::command().get_matches();
+        let argv = rewrite_in_place(std::env::args_os().collect());
+        let matches = Args::command().get_matches_from(argv);
         let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
         let mut sources: Vec<(usize, ScriptSource)> = Vec::new();
@@ -131,6 +202,9 @@ impl Args {
         // If no [file...] were supplied or single file is considered to to be script, then
         // sed must read input from STDIN.
         if self.file.is_empty() {
+            if self.in_place.is_some() {
+                return Err(SedError::NoInputFiles);
+            }
             self.file.push("-".to_string());
         }
 
@@ -145,6 +219,7 @@ impl Args {
         Ok(Sed {
             quiet: self.quiet,
             script,
+            in_place: self.in_place,
             input_sources: self.file.into(),
             current_input: String::new(),
             pending_line: None,
@@ -170,6 +245,12 @@ enum SedError {
     /// Sed didn't get script for processing input files
     #[error("none script was supplied")]
     NoScripts,
+    /// `-i` was given no file to edit
+    #[error("no input files")]
+    NoInputFiles,
+    /// A file could not be edited in place; the text says why
+    #[error("{0}")]
+    InPlace(String),
     /// [`Script`] doesn't contain label that used in
     /// [`Command::BranchToLabel`] or [`Command::Test`]
     #[error("script doesn't contain label '{}'", .0)]
@@ -1001,13 +1082,29 @@ fn locale_chars(chars: &[char]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Write `bytes` to standard output. sed's data is bytes in the current
+/// Where sed's output goes while a file is edited in place (`-i`): the new
+/// version of that file. `None` the rest of the time, for standard output.
+static IN_PLACE_OUTPUT: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+
+/// Write `bytes` to the output: standard output, or under `-i` the new
+/// version of the file being edited. sed's data is bytes in the current
 /// locale, not UTF-8; a write error ends sed with GNU's I/O status, 4.
 fn emit(bytes: &[u8]) {
-    if let Err(err) = std::io::stdout().write_all(bytes) {
+    let mut in_place = IN_PLACE_OUTPUT.lock().unwrap();
+    let result = match in_place.as_mut() {
+        Some(file) => file.write_all(bytes),
+        None => std::io::stdout().write_all(bytes),
+    };
+    if let Err(err) = result {
         eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
         std::process::exit(4);
     }
+}
+
+/// [`emit`] `text` and a <newline>.
+fn emit_line(text: &str) {
+    emit(text.as_bytes());
+    emit(b"\n");
 }
 
 /// Parse [`Command::Replace`] flags
@@ -1620,6 +1717,8 @@ struct Sed {
     quiet: bool,
     /// [`Script`] that applied for every line of every input file
     script: Script,
+    /// `-i`: edit each file in place, with this backup suffix (may be empty)
+    in_place: Option<String>,
     /// The input files not yet opened, read in turn as one stream
     input_sources: VecDeque<String>,
     /// The operand the current file was opened as, for diagnostics
@@ -1791,7 +1890,7 @@ impl Sed {
                 if !self.need_execute(command_position)? {
                     return Ok(None);
                 }
-                println!("{text}");
+                emit_line(&text);
             }
             Command::PrintPatternBinary(_) => {
                 // I (extension)
@@ -1887,7 +1986,7 @@ impl Sed {
                 }
                 // POSIX/GNU: `=` writes the line number unconditionally,
                 // even under -n.
-                println!("{}", self.current_line + 1);
+                emit_line(&(self.current_line + 1).to_string());
             }
             Command::IgnoreComment if !self.quiet => {
                 // #
@@ -1915,11 +2014,11 @@ impl Sed {
         if address.is_none() {
             self.pattern_space.clear();
             self.current_end = None;
-            println!("{text}");
+            emit_line(&text);
         } else {
             let mut need_execute = self.need_execute(command_position)?;
             if need_execute {
-                println!("{text}");
+                emit_line(&text);
             }
             loop {
                 need_execute = self.need_execute(command_position)?;
@@ -2010,11 +2109,11 @@ impl Sed {
             return;
         }
         if self.current_end.is_none() {
-            println!();
+            emit(b"\n");
         }
         for item in std::mem::take(&mut self.append_queue) {
             match item {
-                AppendItem::Text(text) => println!("{text}"),
+                AppendItem::Text(text) => emit_line(&text),
                 AppendItem::File(path) => {
                     if let Ok(contents) = std::fs::read(&path) {
                         emit(&contents);
@@ -2325,8 +2424,8 @@ impl Sed {
     }
 
     /// Executes all commands of [`Sed`]'s [`Script`]
-    /// for every line of the input stream
-    fn process_input(&mut self) -> Result<(), SedError> {
+    /// for every line of the input stream; true when `q` ended it
+    fn process_input(&mut self) -> Result<bool, SedError> {
         self.pattern_space.clear();
         self.current_line = 0;
         self.is_last_line = false;
@@ -2349,12 +2448,12 @@ impl Sed {
             self.has_replacements_since_t = false;
             self.pattern_space = line;
             if let Some(ControlFlowInstruction::Break) = self.process_line()? {
-                break;
+                return Ok(true);
             }
             self.current_line += 1;
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Main [`Sed`] function. Executes all commands of
@@ -2364,11 +2463,178 @@ impl Sed {
         // at parse time). Pre-create/truncate every wfile named in the script,
         // as required by POSIX (each wfile is created before processing begins).
         self.create_wfiles();
+        if let Some(suffix) = self.in_place.take() {
+            return self.edit_in_place(&suffix);
+        }
         // POSIX: the input files are one stream, so line numbers, `$`, the
         // hold space and open ranges all run on from one file into the next.
         self.process_input()
+            .map(drop)
             .map_err(|err| SedError::Runtime(self.current_input.clone(), err.to_string()))
     }
+
+    /// `-i`: edit each input file in place, as a stream of its own (its own
+    /// line numbers and `$`; the hold space carries over, as in GNU sed).
+    /// A `q` ends the run once the file it was read from is written.
+    fn edit_in_place(&mut self, suffix: &str) -> Result<(), SedError> {
+        for name in std::mem::take(&mut self.input_sources) {
+            let Some(file) = self.open_for_edit(&name) else {
+                continue;
+            };
+            if self.edit_file(&name, file, suffix)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the file `name` to be edited in place, or report why not.
+    ///
+    /// Only a regular file is edited, judged by `fstat` of what was opened,
+    /// so nothing can be swapped in between the check and the read. The open
+    /// does not block, so a FIFO is refused rather than waited on; a symbolic
+    /// link is read through (and is then replaced by a regular file, as GNU
+    /// sed does without --follow-symlinks).
+    fn open_for_edit(&mut self, name: &str) -> Option<File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+        }
+        let file = match options.open(name) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!(
+                    "sed: can't read {name}: {}",
+                    plib::diag::io_error_text(&err)
+                );
+                self.exit_status = self.exit_status.max(2);
+                return None;
+            }
+        };
+        match file.metadata() {
+            Ok(meta) if meta.is_file() => Some(file),
+            Ok(_) => {
+                eprintln!("sed: couldn't edit {name}: not a regular file");
+                self.exit_status = self.exit_status.max(4);
+                None
+            }
+            Err(err) => {
+                eprintln!(
+                    "sed: couldn't edit {name}: {}",
+                    plib::diag::io_error_text(&err)
+                );
+                self.exit_status = self.exit_status.max(4);
+                None
+            }
+        }
+    }
+
+    /// Edit the open regular file `name`: run the script over it into a new
+    /// file, created exclusively (`O_CREAT|O_EXCL`, mode 0600) in the same
+    /// directory and given the original's owner and mode, then rename the new
+    /// file over the name, after renaming the original to its backup name
+    /// when there is a suffix. The original is never written; a failure
+    /// leaves it as it was and removes the new file. True when `q` ended it.
+    fn edit_file(&mut self, name: &str, file: File, suffix: &str) -> Result<bool, SedError> {
+        let path = Path::new(name);
+        let fail = |what: &str, err: &std::io::Error| {
+            SedError::InPlace(format!(
+                "couldn't {what} {name}: {}",
+                plib::diag::io_error_text(err)
+            ))
+        };
+        let original = file.metadata().map_err(|e| fail("edit", &e))?;
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temp = plib::tmp::Builder::new()
+            .prefix("sed")
+            .tempfile_in(dir)
+            .map_err(|e| fail("open a temporary file to edit", &e))?;
+        copy_owner_and_mode(temp.as_file(), &original).map_err(|e| fail("edit", &e))?;
+        let writer = temp.as_file().try_clone().map_err(|e| fail("edit", &e))?;
+
+        *IN_PLACE_OUTPUT.lock().unwrap() = Some(BufWriter::new(writer));
+        self.current_file = Some(Box::new(BufReader::new(file)));
+        self.current_input = name.to_string();
+        let result = self.process_input();
+        self.current_file = None;
+        let output = IN_PLACE_OUTPUT.lock().unwrap().take();
+        let quit = result.map_err(|err| SedError::Runtime(name.to_string(), err.to_string()))?;
+        if let Some(mut output) = output {
+            output.flush().map_err(|e| fail("write", &e))?;
+        }
+
+        if !suffix.is_empty() {
+            let backup = backup_name(path, suffix)?;
+            std::fs::rename(path, &backup).map_err(|e| fail("keep a backup of", &e))?;
+        }
+        temp.persist(path).map_err(|e| fail("replace", &e.error))?;
+        Ok(quit)
+    }
+}
+
+/// The backup name of `path` for the `-i` suffix `suffix`: the name plus the
+/// suffix, or, when the suffix holds a `*`, the suffix with each `*` replaced
+/// by the file's name (GNU). The backup stays in the file's directory, so a
+/// suffix naming another directory is refused.
+fn backup_name(path: &Path, suffix: &str) -> Result<PathBuf, SedError> {
+    if suffix.contains('/') {
+        return Err(SedError::InPlace(format!(
+            "backup suffix {suffix:?} names another directory"
+        )));
+    }
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let backup = if suffix.contains('*') {
+        suffix.replace('*', &file_name)
+    } else {
+        format!("{file_name}{suffix}")
+    };
+    Ok(path.with_file_name(backup))
+}
+
+/// Give `new`, the new version of a file edited in place, the owner (when
+/// running as root) or else the group (when the caller belongs to it) of
+/// `original`, and then its mode; the owner first, because changing it
+/// clears the set-ID bits. A set-ID bit is kept only where the new file
+/// really has the original's owner or group.
+#[cfg(unix)]
+fn copy_owner_and_mode(new: &File, original: &Metadata) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fd = new.as_raw_fd();
+    // SAFETY: geteuid cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        // SAFETY: the descriptor is open.
+        if unsafe { libc::fchown(fd, original.uid(), original.gid()) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    } else {
+        // Best effort, as GNU sed: it succeeds only for a group the caller
+        // belongs to. An owner of -1 leaves the owner as it is.
+        // SAFETY: the descriptor is open.
+        let _ = unsafe { libc::fchown(fd, libc::uid_t::MAX, original.gid()) };
+    }
+    let now = new.metadata()?;
+    let mut bits = original.mode() & 0o7777;
+    if now.uid() != original.uid() {
+        bits &= !0o4000;
+    }
+    if now.gid() != original.gid() {
+        bits &= !0o2000;
+    }
+    new.set_permissions(std::fs::Permissions::from_mode(bits))
+}
+
+/// Give `new` the read-only attribute of `original`, Windows's whole mode.
+#[cfg(not(unix))]
+fn copy_owner_and_mode(new: &File, original: &Metadata) -> std::io::Result<()> {
+    new.set_permissions(original.permissions())
 }
 
 /// Exit code:

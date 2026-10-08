@@ -19,7 +19,9 @@
 // Cases that only inspect assembly are in `cc/test_asm/codegen_inline_asm.rs`.
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
+use crate::common::{
+    compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere, compile_and_run_optimized,
+};
 
 // ============================================================================
 // Architecture-independent programs, run at the matrix levels and at -O1
@@ -2625,4 +2627,34 @@ fn codegen_inline_asm_operand_address_used_elsewhere() {
         compile_and_run("asm_addr_shared_o2", ASM_OPERAND_ADDRESS_SHARED, &opts),
         0
     );
+}
+
+/// The bytes of an extended character in a template reach the assembler
+/// once: the string the template assembles holds the two bytes of a UTF-8
+/// `é`, not the four its payload's `char`s re-encoded to.
+///
+/// The asm label names the data the same on ELF and Mach-O, and the
+/// definition sits in a function that is never inlined, so it is emitted
+/// exactly once.
+#[test]
+fn codegen_inline_asm_template_extended_characters_assemble_as_written() {
+    let src = r#"
+extern const char fsasm_cafe[] __asm__("fsasm_cafe");
+__attribute__((noinline)) void define_it(void) {
+    __asm__(".data\nfsasm_cafe:\n.asciz \"café\"\n.text");
+}
+int main(void) {
+    define_it();
+    const char *s = fsasm_cafe;
+    int n = 0;
+    while (s[n])
+        n++;
+    if (n != 5)
+        return 1;
+    if ((unsigned char)s[3] != 0xc3 || (unsigned char)s[4] != 0xa9)
+        return 2;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("asm_template_utf8", src);
 }

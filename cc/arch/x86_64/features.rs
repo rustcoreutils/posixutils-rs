@@ -11,11 +11,11 @@
 
 use super::call::{BlockDst, UNROLL_LIMIT_BYTES};
 use super::codegen::X86_64CodeGen;
-use super::lir::{popcount_sequence, GpOperand, MemAddr, ShiftCount, X86Inst};
-use super::regalloc::{Loc, Reg};
+use super::lir::{popcount_sequence, GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
+use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::codegen::BswapSize;
-use crate::arch::lir::{CallTarget, CondCode, Directive, Label, OperandSize, Symbol};
-use crate::ir::Instruction;
+use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::ir::{Instruction, PseudoId};
 use crate::types::TypeTable;
 
 /// Where an aggregate `va_arg` result is written.
@@ -866,63 +866,16 @@ impl X86_64CodeGen {
         let arg_size = types.size_bits(arg_type).max(32);
         let arg_bytes = (arg_size / 8).max(8) as i32;
 
-        let ap_loc = self.get_location(ap_addr);
         let dst_loc = self.get_location(target);
 
         let label_suffix = self.unique_label_counter;
         self.unique_label_counter += 1;
 
-        // The va_arg helpers (`emit_va_arg_int`/`_float`) read the va_list
-        // structure from a (base register, offset) pair. There are two
-        // distinct shapes for the `ap_addr` operand:
-        //
-        // 1. `ap_addr` is a `Sym` pseudo — the address of a stack-allocated
-        //    local `va_list`. The stack slot itself *is* the va_list, so we
-        //    can address its fields with `(rbp + sym_offset)` directly.
-        //
-        // 2. `ap_addr` is any other pseudo (Arg, Reg, Copy result, …) that
-        //    *holds* a pointer to a va_list (e.g. inside
-        //    `va_arg(*p_va, …)`). The pseudo's location merely stores the
-        //    pointer value; the va_list lives at the address that pointer
-        //    refers to, so we must load the pointer first and use *that*
-        //    as the base register with offset 0.
-        //
-        // Shape (2) is detected explicitly: the pointer is materialized
-        // into R11 before delegating to the helpers -- wherever it was,
-        // registers included. The helpers use RAX, RCX and R10 as scratch, so
-        // a pointer left in one of those was overwritten under them; and none
-        // of them may use R11, which is the one register reserved for it.
-        let is_sym = self.pseudos.is_sym(ap_addr);
-
-        let (base_reg, base_offset) = match &ap_loc {
-            // The slot *is* the va_list, so its own address is the base.
-            // Asking `stack_mem` rather than composing the displacement by hand
-            // is what keeps this right when locals are addressed off `%rsp`
-            // instead of `%rbp`, under dynamic stack alignment.
-            Loc::Stack(ap_offset) if is_sym => match self.stack_mem(*ap_offset) {
-                MemAddr::BaseOffset { base, offset } => (base, offset),
-                other => unreachable!("stack_mem gave a non-BaseOffset address: {other:?}"),
-            },
-            Loc::Stack(ap_offset) => {
-                // Stack slot holds a pointer; load it into R11 first.
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(self.stack_field(*ap_offset, 0)),
-                    dst: GpOperand::Reg(Reg::R11),
-                });
-                (Reg::R11, 0)
-            }
-            Loc::Reg(ap_reg) => {
-                if *ap_reg != Reg::R11 {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(*ap_reg),
-                        dst: GpOperand::Reg(Reg::R11),
-                    });
-                }
-                (Reg::R11, 0)
-            }
-            _ => return,
+        // The va_arg helpers (`emit_va_arg_int`/`_float`) use RAX, RCX and
+        // R10 as scratch, so a pointer left in one of those was overwritten
+        // under them; none of them uses R11, which is reserved for it.
+        let Some((base_reg, base_offset)) = self.va_list_base(ap_addr, Reg::R11) else {
+            return;
         };
 
         // A complex value is read exactly as the equivalent struct is: its
@@ -971,330 +924,104 @@ impl X86_64CodeGen {
     }
 
     /// Emit va_copy: Copy a va_list (24 bytes)
-    pub(super) fn emit_va_copy(&mut self, insn: &Instruction) {
-        let dest_addr = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let src_addr = match insn.src.get(1) {
-            Some(&s) => s,
-            None => return,
-        };
-
-        let dest_loc = self.get_location(dest_addr);
-        let src_loc = self.get_location(src_addr);
-
-        // Copy 24 bytes from src to dest
-        // Both src_loc and dest_loc contain addresses of va_list structs
-        match (&src_loc, &dest_loc) {
-            (Loc::Stack(src_off), Loc::Stack(dst_off)) => {
-                // Copy gp_offset (4 bytes)
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(self.stack_field(*src_off, 0)),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(self.stack_field(*dst_off, 0)),
-                });
-                // Copy fp_offset (4 bytes)
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(self.stack_field(*src_off, 4)),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(self.stack_field(*dst_off, 4)),
-                });
-                // Copy overflow_arg_area (8 bytes)
+    /// Where the `va_list` an operand of `va_arg`/`va_copy` names lives, as
+    /// a base register and displacement, materialising a pointer into
+    /// `scratch` when that is what the operand holds.
+    ///
+    /// There are two shapes. A `Sym` pseudo in a stack slot is a local
+    /// `va_list`: the slot *is* the object, addressed through `stack_mem`,
+    /// which keeps it right when locals are addressed off `%rsp` or an
+    /// over-aligned base. Any other pseudo -- an argument, a register, a copy
+    /// -- *holds* a pointer to the object (a `va_list` parameter, which
+    /// decays, or `*p_va`), wherever the allocator put it, so the pointer is
+    /// loaded and the object is at offset 0 from it.
+    fn va_list_base(&mut self, ap: PseudoId, scratch: Reg) -> Option<(Reg, i32)> {
+        match self.get_location(ap) {
+            Loc::Stack(offset) if self.pseudos.is_sym(ap) => match self.stack_mem(offset) {
+                MemAddr::BaseOffset { base, offset } => Some((base, offset)),
+                other => unreachable!("stack_mem gave a non-BaseOffset address: {other:?}"),
+            },
+            Loc::Stack(offset) => {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
-                    src: GpOperand::Mem(self.stack_field(*src_off, 8)),
-                    dst: GpOperand::Reg(Reg::Rax),
+                    src: GpOperand::Mem(self.stack_field(offset, 0)),
+                    dst: GpOperand::Reg(scratch),
                 });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(self.stack_field(*dst_off, 8)),
-                });
-                // Copy reg_save_area (8 bytes)
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(self.stack_field(*src_off, 16)),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(self.stack_field(*dst_off, 16)),
-                });
+                Some((scratch, 0))
             }
-            (Loc::Reg(src_reg), Loc::Reg(dst_reg)) => {
-                // Both src and dest are in registers (containing addresses)
-                // Choose a temp register that doesn't conflict with src or dst
-                let temp = if *src_reg != Reg::Rax && *dst_reg != Reg::Rax {
-                    Reg::Rax
-                } else if *src_reg != Reg::Rdx && *dst_reg != Reg::Rdx {
-                    Reg::Rdx
-                } else {
-                    Reg::Rcx
-                };
-                // Copy gp_offset (4 bytes)
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *src_reg,
-                        offset: 0,
-                    }),
-                    dst: GpOperand::Reg(temp),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(temp),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *dst_reg,
-                        offset: 0,
-                    }),
-                });
-                // Copy fp_offset (4 bytes)
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *src_reg,
-                        offset: 4,
-                    }),
-                    dst: GpOperand::Reg(temp),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(temp),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *dst_reg,
-                        offset: 4,
-                    }),
-                });
-                // Copy overflow_arg_area (8 bytes)
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *src_reg,
-                        offset: 8,
-                    }),
-                    dst: GpOperand::Reg(temp),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(temp),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *dst_reg,
-                        offset: 8,
-                    }),
-                });
-                // Copy reg_save_area (8 bytes)
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *src_reg,
-                        offset: 16,
-                    }),
-                    dst: GpOperand::Reg(temp),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(temp),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *dst_reg,
-                        offset: 16,
-                    }),
-                });
+            Loc::Reg(reg) => {
+                if reg != scratch {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(reg),
+                        dst: GpOperand::Reg(scratch),
+                    });
+                }
+                Some((scratch, 0))
             }
-            (Loc::Reg(src_reg), Loc::Stack(dst_off)) => {
-                // Src in register, dest on stack
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *src_reg,
-                        offset: 0,
-                    }),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(self.stack_field(*dst_off, 0)),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *src_reg,
-                        offset: 4,
-                    }),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(self.stack_field(*dst_off, 4)),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *src_reg,
-                        offset: 8,
-                    }),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(self.stack_field(*dst_off, 8)),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *src_reg,
-                        offset: 16,
-                    }),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(self.stack_field(*dst_off, 16)),
-                });
-            }
-            (Loc::Stack(src_off), Loc::Reg(dst_reg)) => {
-                // Src on stack, dest in register
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(self.stack_field(*src_off, 0)),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *dst_reg,
-                        offset: 0,
-                    }),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Mem(self.stack_field(*src_off, 4)),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *dst_reg,
-                        offset: 4,
-                    }),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(self.stack_field(*src_off, 8)),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *dst_reg,
-                        offset: 8,
-                    }),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(self.stack_field(*src_off, 16)),
-                    dst: GpOperand::Reg(Reg::Rax),
-                });
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::Rax),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: *dst_reg,
-                        offset: 16,
-                    }),
-                });
-            }
-            _ => {}
+            _ => None,
         }
     }
 
-    // Byte-swapping builtins
+    /// `va_copy(dest, src)`: the 24-byte System V `va_list`, copied an
+    /// eightbyte at a time.
+    ///
+    /// Only codegen scratch is used -- R10 and R11 for the two bases, the
+    /// reserved %xmm15 for the data. RAX, RCX and RDX, used here before, are
+    /// allocatable: a sum the allocator left in %eax across a `va_copy` in a
+    /// loop came back as a `gp_offset`. And each operand is read through
+    /// [`Self::va_list_base`], as `va_arg` reads it: a `va_list` parameter
+    /// spilled to the stack at -O0 holds a pointer, and was copied as if its
+    /// slot were the object.
+    pub(super) fn emit_va_copy(&mut self, insn: &Instruction) {
+        let (Some(&dest), Some(&src)) = (insn.src.first(), insn.src.get(1)) else {
+            return;
+        };
+        let Some((src_base, src_off)) = self.va_list_base(src, Reg::R10) else {
+            return;
+        };
+        let Some((dst_base, dst_off)) = self.va_list_base(dest, Reg::R11) else {
+            return;
+        };
+        for field in [0, 8, 16] {
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double,
+                src: XmmOperand::Mem(MemAddr::BaseOffset {
+                    base: src_base,
+                    offset: src_off + field,
+                }),
+                dst: XmmOperand::Reg(XmmReg::Xmm15),
+            });
+            self.push_lir(X86Inst::MovFp {
+                size: FpSize::Double,
+                src: XmmOperand::Reg(XmmReg::Xmm15),
+                dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                    base: dst_base,
+                    offset: dst_off + field,
+                }),
+            });
+        }
+    }
+
+    // Byte-swapping and bit-scanning builtins
+    //
+    // Each loads its operand into R10 with `emit_move` and stores the result
+    // with `emit_move_to_loc`, which know every location an operand can have.
+    // Matching the locations here instead left one out -- an argument the
+    // caller passed on the stack, read in place -- and for it emitted no
+    // instruction at all.
 
     /// Emit byte-swap instruction for 16/32/64-bit values
     pub(super) fn emit_bswap(&mut self, insn: &Instruction, swap_size: BswapSize) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
+        let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
+            return;
         };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
         let op_size = match swap_size {
             BswapSize::B16 => OperandSize::B16,
             BswapSize::B32 => OperandSize::B32,
             BswapSize::B64 => OperandSize::B64,
         };
-
-        // Load source into R10 (scratch register)
-        match (&src_loc, &swap_size) {
-            // 16-bit: use zero-extending moves
-            (Loc::Reg(r), BswapSize::B16) if *r != Reg::R10 => {
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B16,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Reg(*r),
-                    dst: Reg::R10,
-                });
-            }
-            (Loc::Stack(off), BswapSize::B16) => {
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B16,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Mem(self.stack_field(*off, 0)),
-                    dst: Reg::R10,
-                });
-            }
-            // 32/64-bit: use regular moves
-            (Loc::Reg(r), _) if *r != Reg::R10 => {
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(*r),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-            }
-            (Loc::Stack(off), _) => {
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Mem(self.stack_field(*off, 0)),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-            }
-            (Loc::Imm(v), _) => {
-                self.push_lir(X86Inst::Mov {
-                    size: if matches!(swap_size, BswapSize::B16) {
-                        OperandSize::B32
-                    } else {
-                        op_size
-                    },
-                    src: GpOperand::Imm(*v as i64),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-            }
-            (Loc::Reg(_), _) => {} // Already in R10
-            _ => return,
-        }
+        self.emit_move(src, Reg::R10, op_size.bits());
 
         // Perform byte-swap: 16-bit uses ROR, 32/64-bit uses BSWAP
         match swap_size {
@@ -1302,6 +1029,14 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Ror {
                     size: OperandSize::B16,
                     count: ShiftCount::Imm(8),
+                    dst: Reg::R10,
+                });
+                // The result is the low half; a register destination gets
+                // it zero-extended.
+                self.push_lir(X86Inst::Movzx {
+                    src_size: OperandSize::B16,
+                    dst_size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::R10),
                     dst: Reg::R10,
                 });
             }
@@ -1313,191 +1048,46 @@ impl X86_64CodeGen {
             }
         }
 
-        // Store result
-        match (&dst_loc, &swap_size) {
-            // 16-bit: use zero-extending move for register destination
-            (Loc::Reg(r), BswapSize::B16) if *r != Reg::R10 => {
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B16,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: *r,
-                });
-            }
-            (Loc::Stack(off), BswapSize::B16) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B16,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(*off, 0)),
-                });
-            }
-            // 32/64-bit: use regular moves
-            (Loc::Reg(r), _) if *r != Reg::R10 => {
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Reg(*r),
-                });
-            }
-            (Loc::Stack(off), _) => {
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(*off, 0)),
-                });
-            }
-            _ => {}
-        }
+        let dst_loc = self.get_location(dst);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, op_size.bits());
     }
 
-    /// Emit count trailing zeros
+    /// Emit count trailing zeros: BSF gives the index of the least
+    /// significant set bit, which is the count. The result is an `int`.
     pub(super) fn emit_ctz(&mut self, insn: &Instruction, src_size: OperandSize) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
+        let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
+            return;
         };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-
-        // BSF (bit scan forward) finds index of least significant set bit
-        // which is equivalent to count of trailing zeros
-        // Use R10 as scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Bsf {
-                    size: src_size,
-                    src: GpOperand::Reg(r),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Bsf {
-                    size: src_size,
-                    src: GpOperand::Mem(self.stack_field(off, 0)),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Imm(v) => {
-                // Load immediate first, then BSF
-                self.push_lir(X86Inst::Mov {
-                    size: src_size,
-                    src: GpOperand::Imm(v as i64),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-                self.push_lir(X86Inst::Bsf {
-                    size: src_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: Reg::R10,
-                });
-            }
-            _ => return,
-        }
-
-        // Store result (return type is int, always 32-bit)
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::R10 {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Reg(r),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(off, 0)),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Emit count leading zeros: CLZ(x) = operand_bits - 1 - BSR(x)
-    pub(super) fn emit_clz(&mut self, insn: &Instruction, src_size: OperandSize) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-
-        // BSR (bit scan reverse) finds index of most significant set bit
-        // CLZ = (operand_size - 1) - BSR_result
-        // Use R10 as scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Bsr {
-                    size: src_size,
-                    src: GpOperand::Reg(r),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Bsr {
-                    size: src_size,
-                    src: GpOperand::Mem(self.stack_field(off, 0)),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Imm(v) => {
-                // Load immediate first, then BSR
-                self.push_lir(X86Inst::Mov {
-                    size: src_size,
-                    src: GpOperand::Imm(v as i64),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-                self.push_lir(X86Inst::Bsr {
-                    size: src_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: Reg::R10,
-                });
-            }
-            _ => return,
-        }
-
-        // XOR R10 with (size - 1) to convert BSR result to CLZ
-        // Since BSR gives index from LSB, we need (size_bits - 1) - result
-        // XOR with (size_bits - 1) achieves this for valid inputs (non-zero)
-        let xor_value = (src_size.bits() - 1) as i64;
-        self.push_lir(X86Inst::Xor {
-            size: OperandSize::B32, // Result is always 32-bit int
-            src: GpOperand::Imm(xor_value),
+        self.emit_move(src, Reg::R10, src_size.bits());
+        self.push_lir(X86Inst::Bsf {
+            size: src_size,
+            src: GpOperand::Reg(Reg::R10),
             dst: Reg::R10,
         });
+        let dst_loc = self.get_location(dst);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+    }
 
-        // Store result (return type is int, always 32-bit)
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::R10 {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Reg(r),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(off, 0)),
-                });
-            }
-            _ => {}
-        }
+    /// Emit count leading zeros: CLZ(x) = operand_bits - 1 - BSR(x), which
+    /// for a non-zero operand is BSR(x) XOR (operand_bits - 1). The result
+    /// is an `int`.
+    pub(super) fn emit_clz(&mut self, insn: &Instruction, src_size: OperandSize) {
+        let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        self.emit_move(src, Reg::R10, src_size.bits());
+        self.push_lir(X86Inst::Bsr {
+            size: src_size,
+            src: GpOperand::Reg(Reg::R10),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Xor {
+            size: OperandSize::B32,
+            src: GpOperand::Imm((src_size.bits() - 1) as i64),
+            dst: Reg::R10,
+        });
+        let dst_loc = self.get_location(dst);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
     }
 
     /// Emit population count with the baseline sequence of

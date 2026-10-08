@@ -786,9 +786,7 @@ impl Type {
     /// What a declaration records as its storage class, and what a declarator
     /// carries from its specifiers onto the type it derives. `inline` is a
     /// function specifier rather than a storage class, but it travels with
-    /// them: without it `FunctionDef::is_inline` was false for every ordinary
-    /// definition, and a pointer-returning `inline` function -- `memcpy` is
-    /// exactly that shape in glibc -- lost the bit.
+    /// them, into `FunctionDef::storage_class` among the rest.
     pub const STORAGE_CLASS: TypeModifiers = TypeModifiers::STATIC
         .union(TypeModifiers::EXTERN)
         .union(TypeModifiers::REGISTER)
@@ -1214,6 +1212,17 @@ pub struct TypeTable {
 /// Parenthesize a declarator that has reached a `*` before an array or
 /// function suffix is appended, because a pointer binds looser than either.
 /// `int (*)[8]` is a pointer to an array; `int *[8]` is an array of pointers.
+/// Whose conventions [`TypeTable::format_declarator`] spells a type by.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// c17's diagnostics: the spelling a declaration would most likely use.
+    Diagnostic,
+    /// gcc's `-aux-info`: integer types by gcc's full name (`long int`), a
+    /// space before each parameter list, and `/* ??? */` for parameters a
+    /// declaration does not give.
+    Gcc,
+}
+
 fn parenthesize_if_pointer(decl: String) -> String {
     if decl.contains('*') {
         format!("({})", decl)
@@ -1805,7 +1814,20 @@ impl TypeTable {
     /// Used by diagnostics that have to name the types they are complaining
     /// about -- an assignment constraint violation is unreadable without them.
     pub fn format_type(&self, id: TypeId, idents: Option<&IdentTable>) -> String {
-        self.format_declarator(id, String::new(), idents)
+        self.format_declarator(id, String::new(), idents, Spelling::Diagnostic)
+    }
+
+    /// A declaration of `name` with type `id` as gcc's `-aux-info` writes
+    /// one: `char *subst (const char *)`, integer types by gcc's full
+    /// spelling (`long int`), a space before every parameter list. An empty
+    /// `name` spells the type alone, as a parameter's is.
+    pub fn format_gcc_declaration(
+        &self,
+        id: TypeId,
+        name: &str,
+        idents: Option<&IdentTable>,
+    ) -> String {
+        self.format_declarator(id, name.to_string(), idents, Spelling::Gcc)
     }
 
     /// `id` as gcc's conversion warnings name it: an integer type by gcc's
@@ -1813,6 +1835,15 @@ impl TypeTable {
     /// -- where [`Self::format_type`] gives the spelling a declaration would
     /// most likely use. Any other type is [`Self::format_type`]'s.
     pub fn gcc_type_name(&self, id: TypeId, idents: Option<&IdentTable>) -> String {
+        match self.gcc_integer_name(id) {
+            Some(name) => name.to_string(),
+            None => self.format_type(id, idents),
+        }
+    }
+
+    /// gcc's full spelling of `id` when it is a (non-complex) integer type
+    /// other than `_Bool` or an enum, qualifiers aside.
+    fn gcc_integer_name(&self, id: TypeId) -> Option<&'static str> {
         let typ = self.get(id);
         let unsigned = self.spelled_unsigned(id);
         let pick = |s: IntType| if unsigned { s.to_unsigned() } else { s };
@@ -1820,19 +1851,16 @@ impl TypeTable {
             _ if typ.modifiers.contains(TypeModifiers::COMPLEX) => None,
             TypeKind::Char if unsigned => Some(IntType::UChar),
             TypeKind::Char if typ.modifiers.contains(TypeModifiers::SIGNED) => Some(IntType::SChar),
-            TypeKind::Char => return "char".to_string(),
+            TypeKind::Char => return Some("char"),
             TypeKind::Short => Some(pick(IntType::Short)),
             TypeKind::Int => Some(pick(IntType::Int)),
             TypeKind::Long => Some(pick(IntType::Long)),
             TypeKind::LongLong => Some(pick(IntType::LongLong)),
-            TypeKind::Int128 if unsigned => return "__int128 unsigned".to_string(),
-            TypeKind::Int128 => return "__int128".to_string(),
+            TypeKind::Int128 if unsigned => return Some("__int128 unsigned"),
+            TypeKind::Int128 => return Some("__int128"),
             _ => None,
         };
-        match int {
-            Some(t) => t.spelling().to_string(),
-            None => self.format_type(id, idents),
-        }
+        int.map(IntType::spelling)
     }
 
     /// The type gcc names a bit-field of `bits` bits by in a diagnostic:
@@ -1855,7 +1883,7 @@ impl TypeTable {
     /// Format a pointer to `id` for display, whether or not the table holds
     /// that pointer type: `int (*)(int)` for a function `int (int)`.
     pub fn format_pointer_to(&self, id: TypeId) -> String {
-        self.format_declarator(id, String::from("*"), None)
+        self.format_declarator(id, String::from("*"), None, Spelling::Diagnostic)
     }
 
     /// Spell `id` in declarator form, wrapping `decl` -- the declarator built
@@ -1866,7 +1894,16 @@ impl TypeTable {
     /// before a suffix is appended to it. gcc spells a pointer to `int[8]` as
     /// `int (*)[8]`; built left to right it would come out `int[8] *`, which
     /// reads as "array of pointers" -- the other type entirely.
-    fn format_declarator(&self, id: TypeId, decl: String, idents: Option<&IdentTable>) -> String {
+    ///
+    /// `decl` may begin with the declared name, which the type specifier is
+    /// then written apart from: `int f(void)`.
+    fn format_declarator(
+        &self,
+        id: TypeId,
+        decl: String,
+        idents: Option<&IdentTable>,
+        style: Spelling,
+    ) -> String {
         let typ = self.get(id);
 
         match typ.kind {
@@ -1897,7 +1934,7 @@ impl TypeTable {
                     inner.push_str(&decl);
                 }
                 match typ.base {
-                    Some(base) => self.format_declarator(base, inner, idents),
+                    Some(base) => self.format_declarator(base, inner, idents, style),
                     None => inner,
                 }
             }
@@ -1912,7 +1949,9 @@ impl TypeTable {
                 if typ.modifiers.contains(TypeModifiers::VOLATILE) {
                     name.push_str("volatile ");
                 }
-                let elem = typ.base.map(|b| self.format_type(b, idents));
+                let elem = typ
+                    .base
+                    .map(|b| self.format_declarator(b, String::new(), idents, style));
                 name.push_str(&format!(
                     "__vector({}) {}",
                     typ.extent.known().unwrap_or(0),
@@ -1947,7 +1986,7 @@ impl TypeTable {
                     }
                 };
                 match element {
-                    Some(element) => self.format_declarator(element, extents, idents),
+                    Some(element) => self.format_declarator(element, extents, idents, style),
                     None => extents,
                 }
             }
@@ -1961,6 +2000,9 @@ impl TypeTable {
                     CallingConv::Win64 => format!("__attribute__((ms_abi)) {decl}"),
                 };
                 let mut sig = parenthesize_if_pointer(decl);
+                if style == Spelling::Gcc && !sig.is_empty() {
+                    sig.push(' ');
+                }
                 sig.push('(');
                 match &typ.params {
                     // 6.7.6.3p14 puts the line at "prototype or not", not at
@@ -1975,7 +2017,12 @@ impl TypeTable {
                             if i > 0 {
                                 sig.push_str(", ");
                             }
-                            sig.push_str(&self.format_type(param, idents));
+                            sig.push_str(&self.format_declarator(
+                                param,
+                                String::new(),
+                                idents,
+                                style,
+                            ));
                         }
                         if typ.variadic {
                             if !params.is_empty() {
@@ -1984,11 +2031,13 @@ impl TypeTable {
                             sig.push_str("...");
                         }
                     }
+                    // gcc's -aux-info marks the parameters it was not told.
+                    None if style == Spelling::Gcc => sig.push_str("/* ??? */"),
                     None => {}
                 }
                 sig.push(')');
                 match typ.base {
-                    Some(ret) => self.format_declarator(ret, sig, idents),
+                    Some(ret) => self.format_declarator(ret, sig, idents, style),
                     None => sig,
                 }
             }
@@ -2001,10 +2050,16 @@ impl TypeTable {
                 if typ.modifiers.contains(TypeModifiers::VOLATILE) {
                     result.push_str("volatile ");
                 }
-                // Spelling, not signedness: a diagnostic must name the type the
-                // source wrote. Plain `char` is an unsigned type on aarch64
-                // Linux and is still `char` here.
-                if self.spelled_unsigned(id) {
+                let gcc_int = match style {
+                    Spelling::Gcc => self.gcc_integer_name(id),
+                    Spelling::Diagnostic => None,
+                };
+                if let Some(name) = gcc_int {
+                    result.push_str(name);
+                } else if self.spelled_unsigned(id) {
+                    // Spelling, not signedness: a diagnostic must name the type
+                    // the source wrote. Plain `char` is an unsigned type on
+                    // aarch64 Linux and is still `char` here.
                     result.push_str("unsigned ");
                 } else if typ.modifiers.contains(TypeModifiers::SIGNED)
                     && typ.kind == TypeKind::Char
@@ -2013,6 +2068,7 @@ impl TypeTable {
                 }
 
                 match typ.kind {
+                    _ if gcc_int.is_some() => {}
                     TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
                         result.push_str(&typ.kind.to_string());
                         // The tag is what tells one struct from another, and an
@@ -2044,8 +2100,10 @@ impl TypeTable {
                     // A space only where a pointer is involved: gcc writes
                     // `int *`, `int (*)[8]` and `int (*)(void)` with one, and
                     // `int[4][8]` and `int()` without. The latter is also what
-                    // cflow's worked EXAMPLE in POSIX prints.
-                    if decl.contains('*') {
+                    // cflow's worked EXAMPLE in POSIX prints. A declarator
+                    // that starts with its name is always set apart.
+                    let named = decl.starts_with(|c: char| c.is_alphabetic() || c == '_');
+                    if named || decl.contains('*') {
                         result.push(' ');
                     }
                     result.push_str(&decl);

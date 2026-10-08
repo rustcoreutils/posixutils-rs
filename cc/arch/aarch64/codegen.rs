@@ -47,13 +47,10 @@ pub struct Aarch64CodeGen {
     pub(super) pseudos: crate::arch::codegen::PseudoTable,
     /// Total frame size for current function
     pub(super) frame_size: i32,
-    /// Size of callee-saved register area (for computing local variable offsets)
-    pub(super) callee_saved_size: i32,
+    /// Where the current function's frame areas lie.
+    pub(super) layout: crate::arch::aarch64::frame::FrameLayout,
     /// Offset from FP to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i32,
-    /// Size of register save area (for variadic functions)
-    /// Used to compute correct FP-relative offsets for local variables
-    pub(super) reg_save_area_size: i32,
     /// Number of fixed GP parameters (for variadic functions)
     pub(super) num_fixed_gp_params: usize,
     /// Number of fixed FP/SIMD parameters (for variadic functions)
@@ -82,6 +79,8 @@ pub struct Aarch64CodeGen {
     /// Bytes the prologue allocates for locals: what a dynamically aligned
     /// frame addresses them from.
     pub(super) stack_alloc_size: i32,
+    /// The stack-protector canary's slot, when this function has one.
+    pub(super) stack_guard: Option<LocalSlot>,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     pub(super) sym_slots: HashMap<PseudoId, crate::arch::codegen::SymSlot>,
     /// Which register this function's locals are addressed through
@@ -95,9 +94,8 @@ impl Aarch64CodeGen {
             locations: crate::arch::regalloc::LocationMap::new(),
             pseudos: Default::default(),
             frame_size: 0,
-            callee_saved_size: 0,
+            layout: Default::default(),
             reg_save_area_offset: 0,
-            reg_save_area_size: 0,
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,
             named_stack_param_bytes: 0,
@@ -108,6 +106,7 @@ impl Aarch64CodeGen {
             pic_mode: false,
             unique_label_counter: 0,
             stack_alloc_size: 0,
+            stack_guard: None,
             sym_slots: HashMap::new(),
             frame_base: FrameBase::Fp,
         }
@@ -141,10 +140,9 @@ impl Aarch64CodeGen {
                 let base_rounded = self.stack_alloc_size - (align - 1);
                 base_rounded + offset
             } else {
-                // Local variable: use frame size minus reg_save_area
-                // Layout: [fp/lr][callee-saved][locals][reg_save_area]
-                // Locals are at offsets from (frame_size - reg_save_area_size)
-                (self.frame_size - self.reg_save_area_size) + offset
+                // Measured down from the top of the locals; see
+                // `FrameLayout`.
+                self.layout.locals_top + offset
             }
         } else {
             // Positive offset = stack args (passed by caller)
@@ -1382,49 +1380,28 @@ impl CodeGenerator for Aarch64CodeGen {
                 .push_directive(Directive::file((i + 1) as u32, file_path));
         }
 
-        // Emit globals
-        for global in &module.globals {
-            self.emit_global(global, types);
-        }
-
-        self.base.emit_declared_symbol_attrs(module);
-        self.base.emit_symbol_aliases(module);
-
-        // Emit string literals
-        if !module.strings.is_empty() {
-            self.base.emit_strings(&module.strings);
-        }
-
-        // Emit char16_t, char32_t and wchar_t string literals
-        if !module.utf16_strings.is_empty() {
-            self.base.emit_utf16_strings(&module.utf16_strings);
-        }
-        if !module.utf32_strings.is_empty() {
-            self.base.emit_utf32_strings(&module.utf32_strings);
-        }
-
-        // Emit text start label for DWARF debug info (before first function)
-        // Must be in .text section — emit .text first since globals may leave us in .data
-        if module.debug && !module.functions.is_empty() {
-            self.push_lir(Aarch64Inst::Directive(Directive::Text));
-            self.base.push_directive(Directive::local_label(".Ltext0"));
-        }
-
-        // Emit functions
-        for func in &module.functions {
+        // The definitions, in runs between the file-scope asm statements:
+        // each run's globals, then its functions, then the asm after it.
+        for run in 0..=module.toplevel_asm.len() {
+            for global in module.globals.iter().filter(|g| g.asm_before == run) {
+                self.emit_global(global, types);
+            }
+            if run == 0 {
+                self.base.emit_unit_data(module);
+            }
             // An inline definition is kept in the module so the inliner can
             // use it, but provides no external definition -- see `Function::emit`.
-            if !func.emit {
-                continue;
+            for func in module
+                .functions
+                .iter()
+                .filter(|f| f.emit && f.asm_before == run)
+            {
+                self.emit_function(func, types);
             }
-            self.emit_function(func, types);
+            self.base.emit_toplevel_asm(module, run);
         }
 
-        // Emit text end label for DWARF debug info (after last function)
-        if module.debug && !module.functions.is_empty() {
-            self.base
-                .push_directive(Directive::local_label(".Ltext_end"));
-        }
+        self.base.emit_text_end(module);
 
         // Emit the constructor / destructor pointer arrays
         self.base.emit_init_arrays(&module.functions);
@@ -1455,14 +1432,7 @@ impl CodeGenerator for Aarch64CodeGen {
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
 
-        // Emit .note.GNU-stack section to mark stack as non-executable (ELF only)
-        // This prevents the "missing .note.GNU-stack section" linker warning
-        // Used on Linux, FreeBSD, and other ELF platforms (not macOS which uses Mach-O)
-        if !matches!(self.base.target.os, Os::MacOS) {
-            self.base.push_directive(Directive::Raw(
-                ".section .note.GNU-stack,\"\",@progbits".into(),
-            ));
-        }
+        self.base.push_directive(Directive::UnitEnd);
 
         // Flush all buffered LIR instructions to output
         self.base.emit_all();
@@ -1492,6 +1462,10 @@ impl CodeGenerator for Aarch64CodeGen {
 
     fn set_stack_clash(&mut self, on: bool) {
         self.base.stack_clash = on;
+    }
+
+    fn set_stack_protector(&mut self, level: crate::target::StackProtector) {
+        self.base.stack_protector = level;
     }
 }
 

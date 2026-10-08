@@ -65,7 +65,7 @@ fn test_compound_assignment_deref() {
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -146,7 +146,7 @@ fn test_compound_assignment_index() {
         body: Stmt::Expr(assign_expr),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -220,7 +220,7 @@ fn compound_module(op: AssignOp, atomic: bool) -> (TestContext, Module) {
         body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -441,7 +441,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -529,7 +529,7 @@ fn atomic_typed_module(
         body: Stmt::Block(vec![BlockItem::Statement(Box::new(Stmt::Expr(assign)))]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };

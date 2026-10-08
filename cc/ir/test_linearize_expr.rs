@@ -54,7 +54,7 @@ fn test_unary_logical_not() {
         body: Stmt::Return(Some(not_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -103,7 +103,7 @@ fn test_unary_bitwise_not() {
         body: Stmt::Return(Some(not_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -152,7 +152,7 @@ fn test_unary_negate() {
         body: Stmt::Return(Some(neg_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -201,7 +201,7 @@ fn test_pre_increment() {
         body: Stmt::Return(Some(inc_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -261,7 +261,7 @@ fn test_pointer_add_int() {
         body: Stmt::Return(Some(add_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -330,7 +330,7 @@ fn test_pointer_difference() {
         body: Stmt::Return(Some(diff_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -431,7 +431,7 @@ fn test_float_add() {
         body: Stmt::Return(Some(add_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -489,7 +489,7 @@ fn test_float_comparison() {
         body: Stmt::Return(Some(cmp_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -544,7 +544,7 @@ fn test_float_to_int_cast() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -594,7 +594,7 @@ fn test_int_to_float_cast() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -671,7 +671,7 @@ fn test_struct_deref_returns_address() {
         body: Stmt::Return(Some(deref_p)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -727,7 +727,7 @@ fn test_int_to_float_cast_has_src_typ() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -780,7 +780,7 @@ fn test_float_to_int_cast_has_src_typ() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -833,7 +833,7 @@ fn test_integer_extension_has_src_typ() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -885,7 +885,7 @@ fn test_float16_to_float_conversion() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -941,7 +941,7 @@ fn test_float_to_float16_conversion() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -997,7 +997,7 @@ fn test_float16_to_int_conversion() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1053,7 +1053,7 @@ fn test_int_to_float16_conversion() {
         body: Stmt::Return(Some(cast_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1099,7 +1099,7 @@ fn test_alignof_type_emits_setval() {
         body: Stmt::Return(Some(alignof_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1144,7 +1144,7 @@ fn test_alignof_expr_emits_setval() {
         body: Stmt::Return(Some(alignof_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1445,7 +1445,7 @@ fn test_float_condition_compares_against_zero() {
         body,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1530,7 +1530,7 @@ fn test_complex_equality_compares_both_halves() {
         body: Stmt::Return(Some(cmp)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };

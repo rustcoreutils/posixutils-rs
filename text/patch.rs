@@ -17,17 +17,18 @@ use clap::Parser;
 use gettextrs::gettext;
 use patch_util::{
     applier::PatchApplier,
+    bytes,
     file_ops::{
         delete_target, determine_target_file, read_file_lines, write_output, write_rejects,
     },
     parser::parse_patch,
-    types::{PatchConfig, PatchError},
+    types::{BackupName, PatchConfig, PatchError, RejectFile},
 };
 use std::{
     collections::HashSet,
     env,
     fs::File,
-    io::{self, BufReader, Read},
+    io::{self, Read},
     path::PathBuf,
     process::ExitCode,
 };
@@ -36,6 +37,7 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(
     version,
+    disable_version_flag = true,
     about = gettext("patch - apply changes to files"),
     after_help = gettext("The patch utility reads a source (patch) file containing difference listings and applies those differences to a file.")
 )]
@@ -43,6 +45,30 @@ struct Args {
     /// Save original file with .orig suffix
     #[arg(short = 'b', help = gettext("Save a copy of the original file with .orig suffix"))]
     backup: bool,
+
+    /// Backup file name prefix (GNU; used by dpkg-source)
+    #[arg(short = 'B', value_name = "PREFIX", help = gettext("Prefix PREFIX to a file's name to name its backup; implies -b"))]
+    backup_prefix: Option<String>,
+
+    /// Backup file name suffix (GNU; used by dpkg-source)
+    #[arg(short = 'z', value_name = "SUFFIX", help = gettext("Name backups with SUFFIX instead of .orig; implies -b"))]
+    backup_suffix: Option<String>,
+
+    /// Backup method (GNU; used by dpkg-source). Only simple backups exist.
+    #[arg(short = 'V', value_name = "METHOD", value_parser = ["never", "simple"], help = gettext("Backup method: only 'never' or 'simple' (FILE.orig) is supported"))]
+    _version_control: Option<String>,
+
+    /// Remove files left empty (GNU; used by dpkg-source)
+    #[arg(short = 'E', help = gettext("Remove output files that are empty after patching"))]
+    remove_empty: bool,
+
+    /// Maximum fuzz (GNU; used by dpkg-source)
+    #[arg(short = 'F', value_name = "NUM", help = gettext("Ignore at most NUM lines of context at each end of a hunk (default 2)"))]
+    fuzz: Option<usize>,
+
+    /// Batch mode (GNU; used by dpkg-source)
+    #[arg(short = 't', help = gettext("Ask no questions: skip patches naming no file and assume reversed patches are reversed"))]
+    batch: bool,
 
     /// Interpret patch as context diff
     #[arg(short = 'c', help = gettext("Interpret the patch file as a context difference"))]
@@ -89,7 +115,7 @@ struct Args {
     strip: Option<usize>,
 
     /// Override reject filename
-    #[arg(short = 'r', value_name = "REJECTFILE", help = gettext("Write rejects to REJECTFILE instead of .rej"))]
+    #[arg(short = 'r', long = "reject-file", value_name = "REJECTFILE", help = gettext("Write rejects to REJECTFILE instead of .rej; '-' discards them"))]
     reject: Option<PathBuf>,
 
     /// Reverse patch direction
@@ -103,6 +129,9 @@ struct Args {
     /// File to patch
     #[arg(name = "FILE", help = gettext("File to patch"))]
     file: Option<PathBuf>,
+
+    #[arg(long, help = gettext("Print version"), action = clap::ArgAction::Version)]
+    version: Option<bool>,
 }
 
 impl Args {
@@ -126,14 +155,29 @@ impl Args {
         Ok(())
     }
 
+    /// How backups are named, if they are made at all: -B and -z each ask
+    /// for one, as in GNU patch.
+    fn backup_name(&self) -> Option<BackupName> {
+        if !self.backup && self.backup_prefix.is_none() && self.backup_suffix.is_none() {
+            return None;
+        }
+        Some(BackupName {
+            prefix: self.backup_prefix.clone(),
+            suffix: self.backup_suffix.clone(),
+        })
+    }
+
     /// Convert Args to PatchConfig.
     fn to_config(&self) -> PatchConfig {
         PatchConfig {
-            backup: self.backup,
+            backup: self.backup_name(),
             force: self.force,
+            batch: self.batch,
+            max_fuzz: self.fuzz,
+            remove_empty: self.remove_empty,
             force_context: self.context,
             directory: self.directory.clone(),
-            ifdef_define: self.ifdef_define.clone(),
+            ifdef_define: self.ifdef_define.as_deref().map(bytes::from_arg),
             force_ed: self.ed,
             patchfile: self.patchfile.clone(),
             loose_whitespace: self.loose,
@@ -141,7 +185,13 @@ impl Args {
             ignore_applied: self.forward,
             output_file: self.output.clone(),
             strip_count: self.strip,
-            reject_file: self.reject.clone(),
+            reject_file: self.reject.as_ref().map(|r| {
+                if r.as_os_str() == "-" {
+                    RejectFile::Discard
+                } else {
+                    RejectFile::Path(r.clone())
+                }
+            }),
             reverse: self.reverse,
             force_unified: self.unified,
             target_file: self.file.clone(),
@@ -149,23 +199,18 @@ impl Args {
     }
 }
 
-/// Read patch content from stdin or file.
+/// Read patch content from stdin or file, as patch text (see `bytes`).
 fn read_patch_input(config: &PatchConfig) -> io::Result<String> {
+    let mut content = Vec::new();
     match &config.patchfile {
         Some(path) => {
-            let file = File::open(path)?;
-            let mut reader = BufReader::new(file);
-            let mut content = String::new();
-            reader.read_to_string(&mut content)?;
-            Ok(content)
+            File::open(path)?.read_to_end(&mut content)?;
         }
         None => {
-            let stdin = io::stdin();
-            let mut content = String::new();
-            stdin.lock().read_to_string(&mut content)?;
-            Ok(content)
+            io::stdin().lock().read_to_end(&mut content)?;
         }
     }
+    Ok(bytes::decode(&content))
 }
 
 /// Main entry point.
@@ -217,7 +262,7 @@ fn run(args: Args) -> Result<bool, PatchError> {
         // wrong rather than that this one file is special.
         let (lines, orig_trailing_newline) = if target.exists() {
             read_file_lines(&target)?
-        } else if file_patch.is_new_file {
+        } else if file_patch.creates_file() {
             (Vec::new(), true)
         } else {
             eprintln!(
@@ -234,11 +279,11 @@ fn run(args: Args) -> Result<bool, PatchError> {
         let result = applier.apply_patch(file_patch)?;
 
         // A deletion patch (new file is /dev/null) removes the target rather
-        // than leaving an empty file behind.
-        if file_patch.is_delete_file
-            && config.output_file.is_none()
-            && result.rejected_hunks.is_empty()
-        {
+        // than leaving an empty file behind, and so does -E for any file the
+        // patch leaves empty.
+        let removes = file_patch.is_delete_file
+            || (config.remove_empty && result.content.is_empty() && result.applied_any);
+        if removes && config.output_file.is_none() && result.rejected_hunks.is_empty() {
             if let Err(e) = delete_target(&target, &config, &mut backed_up) {
                 eprintln!("patch: {}: {}", target.display(), e);
                 exit_code = 2;

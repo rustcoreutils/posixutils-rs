@@ -75,6 +75,45 @@ impl Parser<'_> {
         None
     }
 
+    /// GNU label attributes, `L: __attribute__((unused)) stmt`: consume and
+    /// discard attributes after a label's colon when what follows them is a
+    /// statement. They say nothing c17 acts on -- gcc's label attributes are
+    /// `unused`, `hot` and `cold`, hints only.
+    ///
+    /// Attributes followed by `;` are an attribute statement, and attributes
+    /// followed by a declaration belong to that declaration; both are left
+    /// where they are.
+    ///
+    /// binutils needs it: gas/read.c writes `just_record_alignment:
+    /// ATTRIBUTE_UNUSED_LABEL` straight before an `if`.
+    pub(super) fn parse_label_attributes(&mut self) {
+        let mut end = self.pos;
+        while self
+            .tokens
+            .get(end)
+            .and_then(|tok| self.get_ident_id(tok))
+            .is_some_and(|id| crate::kw::has_tag(id, crate::kw::ATTR_KW))
+        {
+            match self.past_balanced_parens(end + 1) {
+                Some(next) => end = next,
+                None => return,
+            }
+        }
+        if end == self.pos {
+            return;
+        }
+        let start = self.pos;
+        self.pos = end;
+        let statement_follows =
+            !self.is_special(b';') && !self.is_special(b'}') && !self.is_declaration_start();
+        self.pos = start;
+        if statement_follows {
+            let saved = self.take_pending_decl_attrs();
+            self.parse_attributes();
+            self.restore_pending_decl_attrs(saved);
+        }
+    }
+
     /// Parse an attribute declaration through its `;`.
     ///
     /// The attributes apply to nothing, so whatever they would have left

@@ -116,6 +116,28 @@ fn codegen_x86_64_long_double_complex_uses_x87() {
     );
 }
 
+/// A select between two `long double` values -- what the optimizer makes of
+/// `if (x == -0.0) x = 0.0;` -- goes through the x87 stack too. It took the
+/// XMM select path and emitted `movt`, which no assembler accepts.
+#[test]
+fn codegen_x86_64_long_double_select_uses_x87() {
+    let src = r#"
+        long double unneg(long double x) { if (x == -0.0) x = 0.0; return x; }
+        long double pick(int c, long double a, long double b) { return c ? a : b; }
+    "#;
+    for opt in ["-O1", "-O2"] {
+        let asm = asm_for_with("x87_select", X86_64_LINUX, src, &[opt]);
+        for func in ["unneg", "pick"] {
+            let body = body_of(&asm, func);
+            assert!(
+                !body.contains("movt") && !body.contains("%xmm"),
+                "{opt} {func}: a long double select has no XMM form:\n{body}"
+            );
+            assert!(body.contains("fstpt"), "{opt} {func}:\n{body}");
+        }
+    }
+}
+
 /// aarch64/Linux `long double` is IEEE binary128 in a whole Q register (#H4).
 ///
 /// `fp_size_from_type` mapped it to `FpSize::Double`, so a 128-bit object was

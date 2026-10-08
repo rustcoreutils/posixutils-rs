@@ -13,8 +13,11 @@
 // drive the binary with a raw argument vector instead.
 //
 
+mod asm_dependencies;
+mod aux_info;
 mod f_options;
 mod gcc_flags;
+mod link_options;
 mod linker_input;
 mod prefix_map;
 mod warn_options;

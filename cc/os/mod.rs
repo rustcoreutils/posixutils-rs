@@ -34,7 +34,7 @@ pub fn get_os_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
     match target.os {
         Os::Linux => {
             macros.extend(unix);
-            macros.extend(linux::get_macros(target));
+            macros.extend(linux::get_macros());
         }
         Os::MacOS => {
             macros.extend(macos::get_macros());

@@ -213,6 +213,63 @@ impl CfProtection {
     }
 }
 
+/// `-fstack-protector` and its levels: which functions get a canary between
+/// their locals and their saved registers, checked before every return
+/// (`arch::stack_protect`). The default is none, as Debian's gcc has it;
+/// `-fno-stack-protector` returns to it, and the last of the family wins.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StackProtector {
+    #[default]
+    Off,
+    /// `-fstack-protector`: a `char` array of eight bytes or more, or
+    /// `alloca`.
+    Default,
+    /// `-fstack-protector-strong`: any array, or any local whose address
+    /// is taken.
+    Strong,
+    /// `-fstack-protector-all`: every function.
+    All,
+    /// `-fstack-protector-explicit`: only `__attribute__((stack_protect))`.
+    Explicit,
+}
+
+impl StackProtector {
+    /// The level the option `-f<name>` selects, or `None` for any other
+    /// option.
+    pub fn from_option(name: &str) -> Option<Self> {
+        Some(match name {
+            "no-stack-protector" => Self::Off,
+            "stack-protector" => Self::Default,
+            "stack-protector-strong" => Self::Strong,
+            "stack-protector-all" => Self::All,
+            "stack-protector-explicit" => Self::Explicit,
+            _ => return None,
+        })
+    }
+
+    /// The `-f` option spelling this level, as [`Self::from_option`] reads it.
+    pub fn option(self) -> &'static str {
+        match self {
+            Self::Off => "no-stack-protector",
+            Self::Default => "stack-protector",
+            Self::Strong => "stack-protector-strong",
+            Self::All => "stack-protector-all",
+            Self::Explicit => "stack-protector-explicit",
+        }
+    }
+
+    /// The macro gcc predefines for this level, with its value.
+    pub fn predefined_macro(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Off => None,
+            Self::Default => Some(("__SSP__", "1")),
+            Self::Strong => Some(("__SSP_STRONG__", "3")),
+            Self::All => Some(("__SSP_ALL__", "2")),
+            Self::Explicit => Some(("__SSP_EXPLICIT__", "4")),
+        }
+    }
+}
+
 /// The x86-64 SIMD extensions code may assume beyond the SSE2 baseline,
 /// in order: each implies the ones before it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]

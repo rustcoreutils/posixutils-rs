@@ -8,8 +8,9 @@
 //
 
 mod common;
+mod parents;
 
-use self::common::{copy_file, copy_files, error_string, CopyConfig, DerefMode};
+use self::common::{copy_file, copy_files, error_string, CopyConfig, DerefMode, InodeMap};
 use clap::Parser;
 use gettextrs::gettext;
 use std::collections::HashSet;
@@ -74,6 +75,29 @@ struct Args {
     #[arg(short = 'R', visible_short_alias = 'r', long, help = gettext("Copy file hierarchies"))]
     recursive: bool,
 
+    #[arg(short = 'a', long, help = gettext("Same as -R -P -p, also preserving hard links"))]
+    archive: bool,
+
+    #[arg(short = 'd', help = gettext("Same as -P, also preserving hard links"))]
+    no_deref_keep_links: bool,
+
+    #[arg(short = 'n', long, help = gettext("Do not overwrite an existing file"))]
+    no_clobber: bool,
+
+    // Only `auto` is accepted: it asks for a copy-on-write clone where the filesystem offers
+    // one and an ordinary copy otherwise, and an ordinary copy is always a correct result.
+    #[arg(
+        long,
+        value_name = "WHEN",
+        require_equals = true,
+        value_parser = ["auto"],
+        help = gettext("Accepted for compatibility; files are copied normally")
+    )]
+    reflink: Option<String>,
+
+    #[arg(long, help = gettext("Append each source path to the target directory, creating missing directories"))]
+    parents: bool,
+
     #[arg(help = gettext("Source(s) and target of move(s)"))]
     files: Vec<PathBuf>,
 }
@@ -86,13 +110,15 @@ struct Args {
 /// GNU and the BSDs behave as -P -- which is also the only choice that keeps a recursive copy
 /// inside the tree it was pointed at.
 fn deref_mode(args: &Args) -> DerefMode {
-    if args.no_dereference {
+    let implied_p =
+        (args.archive || args.no_deref_keep_links) && !args.dereference && !args.follow_cli;
+    if args.no_dereference || implied_p {
         DerefMode::Never
     } else if args.dereference {
         DerefMode::Always
     } else if args.follow_cli {
         DerefMode::CommandLineOnly
-    } else if args.recursive {
+    } else if args.recursive || args.archive {
         DerefMode::Never
     } else {
         DerefMode::Always
@@ -105,8 +131,9 @@ impl CopyConfig {
             force: args.force,
             deref: deref_mode(args),
             interactive: args.interactive,
-            preserve: args.preserve,
-            recursive: args.recursive,
+            preserve: args.preserve || args.archive,
+            recursive: args.recursive || args.archive,
+            no_clobber: args.no_clobber,
             prog: "cp",
             // POSIX cp continues with same-level/ancestor files after a per-file failure.
             continue_on_error: true,
@@ -166,9 +193,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    if args.parents && !dir_exists {
+        eprintln!(
+            "cp: {}",
+            gettext("with --parents, the destination must be a directory")
+        );
+        std::process::exit(1);
+    }
+
     let cfg = CopyConfig::new(&args);
-    if dir_exists {
-        match copy_files(&cfg, sources, target, None, prompt_user) {
+    // -a and -d keep hard links among the copied files as hard links.
+    let mut inode_map = InodeMap::new();
+    let inode_map = (args.archive || args.no_deref_keep_links).then_some(&mut inode_map);
+
+    if args.parents {
+        if !parents::copy_with_parents(&cfg, sources, target, inode_map, prompt_user) {
+            std::process::exit(1);
+        }
+        Ok(())
+    } else if dir_exists {
+        match copy_files(&cfg, sources, target, inode_map, prompt_user) {
             Some(_) => Ok(()),
             None => std::process::exit(1),
         }
@@ -180,7 +224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &sources[0],
             target,
             &mut created_files,
-            None,
+            inode_map,
             prompt_user,
         ) {
             Ok(_) => Ok(()),

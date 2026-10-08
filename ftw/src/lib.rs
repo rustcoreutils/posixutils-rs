@@ -51,6 +51,13 @@ pub fn is_writable_at(dirfd: libc::c_int, file_name: &CStr) -> bool {
     unsafe { faccessat(dirfd, file_name.as_ptr(), libc::W_OK, AT_EACCESS) == 0 }
 }
 
+/// Whether `file_name`, resolved relative to `dirfd`, is executable (searchable, for a
+/// directory) as `access(2)` with `X_OK` answers it: for the real user and group IDs, following
+/// a final symbolic link. Only the last component is looked up, through `dirfd`.
+pub fn is_executable_at(dirfd: libc::c_int, file_name: &CStr) -> bool {
+    unsafe { faccessat(dirfd, file_name.as_ptr(), libc::X_OK, 0) == 0 }
+}
+
 /// Type of error to be handled by the `err_reporter` of `traverse_directory`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -59,6 +66,9 @@ pub enum ErrorKind {
     ReadDir,
     Stat,
     ReadLink,
+    /// Following a symbolic link would re-enter a directory that is an ancestor of the entry (same
+    /// `(st_dev, st_ino)`), so the traversal refused to descend. The error is `ELOOP`.
+    Cycle,
 }
 
 /// Why `traverse_directory` is leaving a directory.
@@ -154,6 +164,15 @@ impl FileDescriptor {
     /// Create a `FileDescriptor` that denotes the current working directory.
     pub fn cwd() -> Self {
         Self { fd: libc::AT_FDCWD }
+    }
+}
+
+/// Take ownership of a descriptor opened elsewhere, e.g. a directory a caller reached by `openat`.
+impl From<std::os::fd::OwnedFd> for FileDescriptor {
+    fn from(fd: std::os::fd::OwnedFd) -> Self {
+        Self {
+            fd: std::os::fd::IntoRawFd::into_raw_fd(fd),
+        }
     }
 }
 
@@ -349,7 +368,27 @@ struct TreeNode {
     dir: HybridDir,
     filename: Rc<[libc::c_char]>,
     metadata: Metadata,
+    /// Whether the directory entry is itself a symbolic link (one the walk followed).
+    is_symlink: Option<bool>,
     path_depth: usize,
+}
+
+impl TreeNode {
+    /// The entry for this directory itself, relative to `dir_fd`, its parent's descriptor.
+    fn entry<'a>(
+        &self,
+        dir_fd: &'a FileDescriptor,
+        path_stack: &'a [Rc<[libc::c_char]>],
+    ) -> Entry<'a> {
+        let mut entry = Entry::new(
+            dir_fd,
+            path_stack,
+            self.filename.clone(),
+            Some(self.metadata.clone()),
+        );
+        entry.is_symlink = self.is_symlink;
+        entry
+    }
 }
 
 /// An entry in the directory tree.
@@ -424,33 +463,27 @@ impl<'a> Entry<'a> {
     }
 
     /// Check if this `Entry` is an empty directory.
+    ///
+    /// The directory is opened through the containing directory's descriptor with the same
+    /// hardening as a descent: `O_DIRECTORY`, `O_NOFOLLOW` unless this entry is a symbolic link the
+    /// walk followed, and a check that the opened directory is the one the walk stat'ed. An entry
+    /// swapped for a symbolic link or for another directory since then is an error rather than
+    /// an answer about some other directory.
     pub fn is_empty_dir(&self) -> io::Result<bool> {
-        let file_descriptor =
-            FileDescriptor::open_at(self.dir_file_descriptor, self.file_name(), libc::O_RDONLY)?;
-        match OwnedDir::new(file_descriptor) {
-            Ok(dir) => {
-                let mut num_entries = 0;
-
-                // Manually count the number of entries.
-                for entry_or_err in dir.iter() {
-                    let entry = match entry_or_err {
-                        Ok(entry) => entry,
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    };
-
-                    if entry.is_dot_or_double_dot() {
-                        continue;
-                    }
-
-                    num_entries += 1;
-                }
-
-                Ok(num_entries == 0)
+        let followed = self.is_symlink == Some(true)
+            && self.metadata.as_ref().is_some_and(|md| !md.is_symlink());
+        let nofollow = if followed { 0 } else { libc::O_NOFOLLOW };
+        let file_descriptor = FileDescriptor::open_at(
+            self.dir_file_descriptor,
+            self.file_name(),
+            libc::O_RDONLY | libc::O_DIRECTORY | nofollow,
+        )?;
+        if let Some(md) = &self.metadata {
+            if !fd_matches(&file_descriptor, md.0.st_dev, md.0.st_ino) {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
             }
-            Err(e) => Err(e),
         }
+        lists_nothing(OwnedDir::new(file_descriptor)?)
     }
 
     /// Returns whether this entry is a `..` or a `..`.
@@ -644,16 +677,27 @@ where
     );
 }
 
+/// Open as much of `path`'s prefix as is needed for the rest to fit in `PATH_MAX`, returning the
+/// last directory opened and the components left.
+///
+/// Every prefix component is opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC` plus `open_flags` (a
+/// walk's descent flags, so `O_NOFOLLOW` when it does not follow links). `O_DIRECTORY` refuses a
+/// FIFO or device swapped in for a component before the open can block on it or open the
+/// device. With `identities` (one recorded `(dev, ino)` per component of `path`), each opened
+/// component must also be the very directory the walk recorded there.
 fn open_long_filename<'a, H>(
     mut starting_dir: FileDescriptor,
     path: &'a Path,
     mut path_stack: Option<&mut Vec<Rc<[libc::c_char]>>>,
+    open_flags: libc::c_int,
+    identities: Option<&[(libc::dev_t, libc::ino_t)]>,
     err_reporter: &mut H,
 ) -> io::Result<(FileDescriptor, std::path::Components<'a>)>
 where
     H: FnMut(Entry<'_>, Error),
 {
     let mut path_components = path.components();
+    let mut opened = 0usize;
 
     // If `path` is too long, start at a prefix of `path`
     loop {
@@ -683,6 +727,12 @@ where
             }
         }
 
+        // Only a prefix is opened here. The last component is the entry itself, which the
+        // caller stats and opens with its own follow semantics: a symbolic link loop there
+        // (ELOOP above) is an entry to report, not a directory to step into.
+        if path_components.clone().nth(1).is_none() {
+            break;
+        }
         let Some(component) = path_components.next() else {
             break;
         };
@@ -690,11 +740,21 @@ where
         let filename_cstr = CString::new(component.as_os_str().as_bytes()).unwrap();
         let filename = cstring_to_rc(&filename_cstr);
 
-        starting_dir = match FileDescriptor::open_at(
+        let opened_component = FileDescriptor::open_at(
             &starting_dir,
             unsafe { CStr::from_ptr(filename.as_ptr()) },
-            libc::O_RDONLY,
-        ) {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | open_flags,
+        )
+        .and_then(|fd| match identities {
+            // Fail closed: a component with no recorded identity, or the wrong one, is refused.
+            Some(ids) => match ids.get(opened) {
+                Some(&(dev, ino)) if fd_matches(&fd, dev, ino) => Ok(fd),
+                _ => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
+            },
+            None => Ok(fd),
+        });
+        opened += 1;
+        starting_dir = match opened_component {
             Ok(fd) => fd,
             Err(e) => {
                 let errno = e.raw_os_error().unwrap_or(libc::EIO);
@@ -803,10 +863,13 @@ where
         return false;
     }
 
+    // The operand's own components are resolved as the user wrote them, symbolic links included.
     let (starting_dir, path_components) = match open_long_filename(
         FileDescriptor::cwd(),
         path.as_ref(),
         Some(&mut path_stack),
+        0,
+        None,
         &mut err_reporter,
     ) {
         Ok(pair) => pair,
@@ -829,14 +892,37 @@ where
             &mut err_reporter,
         ) {
             ProcessFileResult::ProcessedDirectory(entry) => {
-                // `O_DIRECTORY` rejects a non-directory; `O_NOFOLLOW` is intentionally NOT used for
-                // the root operand so that a symlinked directory argument is still honored per
-                // `follow_symlinks_on_args`.
-                match OwnedDir::open_at(&starting_dir, dir_filename.as_ptr(), libc::O_DIRECTORY) {
+                // `O_DIRECTORY` rejects a non-directory. `O_NOFOLLOW` is added unless the walk
+                // follows a symlinked starting point (-H/-L), so a directory swapped for a
+                // symlink after the stat above is not followed; the (dev, ino) check then refuses
+                // a swap for a different directory, as on every descent. (A trailing slash still
+                // resolves a symlinked operand, as it did for the stat.)
+                let root_flags = if follow_symlinks_on_args || follow_symlinks {
+                    libc::O_DIRECTORY
+                } else {
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW
+                };
+                let (want_dev, want_ino) = {
+                    let md = entry.metadata.as_ref().unwrap();
+                    (md.0.st_dev, md.0.st_ino)
+                };
+                let opened = OwnedDir::open_at(&starting_dir, dir_filename.as_ptr(), root_flags)
+                    .and_then(|dir| {
+                        if fd_matches(dir.file_descriptor(), want_dev, want_ino) {
+                            Ok(dir)
+                        } else {
+                            Err(Error::new(
+                                io::Error::from_raw_os_error(libc::ENOTDIR),
+                                ErrorKind::OpenDir,
+                            ))
+                        }
+                    });
+                match opened {
                     Ok(new_dir) => {
                         let node = TreeNode {
                             dir: HybridDir::Owned(new_dir),
                             filename: dir_filename,
+                            is_symlink: entry.is_symlink,
                             metadata: entry.metadata.unwrap(),
                             path_depth: path_stack.len(),
                         };
@@ -996,12 +1082,7 @@ where
                                 None => &starting_dir,
                             };
                             err_reporter(
-                                Entry::new(
-                                    prev_dir,
-                                    parent_path_stack,
-                                    current.filename.clone(),
-                                    Some(current.metadata.clone()),
-                                ),
+                                current.entry(prev_dir, parent_path_stack),
                                 Error::new(e, ErrorKind::ReadDir),
                             );
 
@@ -1067,7 +1148,7 @@ where
                                     entry,
                                     Error::new(
                                         io::Error::from_raw_os_error(libc::ELOOP),
-                                        ErrorKind::Stat,
+                                        ErrorKind::Cycle,
                                     )
                                 );
                             }
@@ -1093,10 +1174,13 @@ where
                                             Rc::new((anchor, path.parent().unwrap().to_path_buf())),
                                             path,
                                             descent_flags,
+                                            (want_dev, want_ino),
+                                            None,
                                         );
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),
                                             filename: entry_filename,
+                                            is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1106,10 +1190,13 @@ where
                                             current_dir.parent().clone(),
                                             build_path(&path_stack, &entry_filename),
                                             descent_flags,
+                                            (want_dev, want_ino),
+                                            Some(current_dir.lineage()),
                                         );
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),
                                             filename: entry_filename,
+                                            is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1126,20 +1213,11 @@ where
                                         // very file we stat'd. A concurrent swap to a different
                                         // directory passes `O_NOFOLLOW`/`O_DIRECTORY` but changes
                                         // (dev, ino), so the walk would otherwise be redirected.
-                                        let verified = {
-                                            let mut sb = MaybeUninit::<libc::stat>::uninit();
-                                            let r = unsafe {
-                                                libc::fstat(
-                                                    new_dir.file_descriptor().as_raw_fd(),
-                                                    sb.as_mut_ptr(),
-                                                )
-                                            };
-                                            r == 0 && {
-                                                let sb = unsafe { sb.assume_init() };
-                                                sb.st_dev == want_dev && sb.st_ino == want_ino
-                                            }
-                                        };
-                                        if !verified {
+                                        if !fd_matches(
+                                            new_dir.file_descriptor(),
+                                            want_dev,
+                                            want_ino,
+                                        ) {
                                             refuse_descent!(
                                                 entry,
                                                 Error::new(
@@ -1151,6 +1229,7 @@ where
                                         TreeNode {
                                             dir: HybridDir::Owned(new_dir),
                                             filename: entry_filename,
+                                            is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1185,12 +1264,7 @@ where
 
         if let Some(e) = enumeration_error {
             err_reporter(
-                Entry::new(
-                    &starting_dir,
-                    &path_stack[..path_depth - 1],
-                    current.filename.clone(),
-                    Some(current.metadata.clone()),
-                ),
+                current.entry(&starting_dir, &path_stack[..path_depth - 1]),
                 Error::new(e, ErrorKind::OpenDir),
             );
             success = false;
@@ -1236,29 +1310,14 @@ where
         };
         match prev_dir {
             Ok(prev_dir) => {
-                if postprocess_dir(
-                    Entry::new(
-                        prev_dir,
-                        &path_stack,
-                        current.filename.clone(),
-                        Some(current.metadata.clone()),
-                    ),
-                    dir_exit,
-                )
-                .is_err()
-                {
+                if postprocess_dir(current.entry(prev_dir, &path_stack), dir_exit).is_err() {
                     success = false;
                     // Don't `continue` here, falldown below
                 }
             }
             Err(e) => {
                 err_reporter(
-                    Entry::new(
-                        &starting_dir,
-                        &path_stack,
-                        current.filename.clone(),
-                        Some(current.metadata.clone()),
-                    ),
+                    current.entry(&starting_dir, &path_stack),
                     Error::new(e, ErrorKind::Open),
                 );
                 success = false;
@@ -1270,6 +1329,46 @@ where
     }
 
     success
+}
+
+/// Whether `dir` lists nothing but `.` and `..`.
+fn lists_nothing(dir: OwnedDir) -> io::Result<bool> {
+    for entry in dir.iter() {
+        if !entry?.is_dot_or_double_dot() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the directory open on `dir_fd` is empty.
+///
+/// It is read through a new open of `.` relative to `dir_fd` -- the same directory, which no
+/// rename can swap -- so `dir_fd`'s own read position is left alone.
+pub fn is_empty_dir_fd(dir_fd: RawFd) -> io::Result<bool> {
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    lists_nothing(OwnedDir::new(FileDescriptor { fd })?)
+}
+
+/// Whether the open descriptor `fd` refers to the file identified by `(dev, ino)`, the identity a
+/// walk recorded when it stat'ed the entry. This is the post-open re-verification that turns a
+/// concurrent swap of the entry for a different file into a refusal instead of a redirection.
+fn fd_matches(fd: &FileDescriptor, dev: libc::dev_t, ino: libc::ino_t) -> bool {
+    let mut sb = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), sb.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let sb = unsafe { sb.assume_init() };
+    sb.st_dev == dev && sb.st_ino == ino
 }
 
 fn cstring_to_rc(filename: &CStr) -> Rc<[libc::c_char]> {

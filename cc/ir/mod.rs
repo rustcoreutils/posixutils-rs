@@ -1920,6 +1920,21 @@ impl Instruction {
         }
     }
 
+    /// The builtin by which this instruction names its function's caller's
+    /// variadic arguments: `__builtin_va_arg_pack_len()`, or a call ending in
+    /// `__builtin_va_arg_pack()`. `None` for every other instruction. A
+    /// function with one is a forwarder, which only a call site it is
+    /// inlined into can complete.
+    pub fn va_arg_pack_builtin(&self) -> Option<&'static str> {
+        if self.op == Opcode::VaArgPackLen {
+            Some("__builtin_va_arg_pack_len")
+        } else if self.extra().ends_with_va_arg_pack {
+            Some("__builtin_va_arg_pack")
+        } else {
+            None
+        }
+    }
+
     /// The function in this module a direct call may run, by name.
     ///
     /// `None` for anything but a direct call, and for a call to a library
@@ -3041,8 +3056,10 @@ pub struct Function {
     /// The function stays in the module because the inliner still needs its
     /// body; only the backends' emit loops skip it.
     pub emit: bool,
-    /// Is this function noreturn (never returns)?
-    pub is_noreturn: bool,
+    /// How many file-scope asm statements precede this definition in the
+    /// source: the backends write it after that many of
+    /// [`Module::toplevel_asm`] and before the next.
+    pub asm_before: usize,
     /// The calling convention of the function's type: how its parameters
     /// arrive, its value leaves, and which registers it must preserve.
     pub conv: CallingConv,
@@ -3085,6 +3102,10 @@ pub struct Function {
     /// `__attribute__((always_inline))`: inline at every call site regardless
     /// of size, and at `-O0` too. `is_noinline` wins if both are present.
     pub is_always_inline: bool,
+    /// `__attribute__((stack_protect))` or `((no_stack_protector))`. Read by
+    /// the back end, which decides about the canary once inlining is done,
+    /// so an inlined callee's attribute is gone with its body, as in gcc.
+    pub stack_protect: crate::parse::ast::StackProtectAttr,
     /// `__attribute__((constructor))`: emit a pointer to this function in
     /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
     /// without a priority; `Some(Some(p))` carries one.
@@ -3134,12 +3155,13 @@ impl Default for Function {
             locals: HashMap::new(),
             is_static: false,
             emit: true,
-            is_noreturn: false,
+            asm_before: 0,
             conv: CallingConv::C,
             is_noinline: false,
             isa: Default::default(),
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,
+            stack_protect: Default::default(),
             constructor: None,
             destructor: None,
             is_inline: false,
@@ -3816,6 +3838,9 @@ pub struct GlobalDef {
     pub explicit_align: Option<u32>,
     /// `weak`, `used`, `section(...)`, `visibility(...)`.
     pub symbol_attrs: crate::parse::ast::SymbolAttrs,
+    /// How many file-scope asm statements precede this definition in the
+    /// source; see [`Function::asm_before`].
+    pub asm_before: usize,
 }
 
 impl GlobalDef {
@@ -3830,6 +3855,7 @@ impl GlobalDef {
             is_const: false,
             explicit_align: None,
             symbol_attrs: Default::default(),
+            asm_before: 0,
         }
     }
 
@@ -3918,6 +3944,29 @@ impl Module {
             set(&mut alias.visibility, alias.is_static);
         }
     }
+
+    /// Make each of `names` (from `#pragma weak`) a weak symbol: a function
+    /// or object the unit defines becomes a weak definition, and any other
+    /// name a weak reference, emitted as such if the unit refers to it.
+    pub fn apply_pragma_weak(&mut self, names: &[String]) {
+        for name in names {
+            let mut defined = false;
+            for func in self.functions.iter_mut().filter(|f| f.name == *name) {
+                func.symbol_attrs.weak = true;
+                defined = true;
+            }
+            for global in self.globals.iter_mut().filter(|g| g.name == *name) {
+                global.symbol_attrs.weak = true;
+                defined = true;
+            }
+            if !defined {
+                self.declared_symbol_attrs
+                    .entry(name.clone())
+                    .or_default()
+                    .weak = true;
+            }
+        }
+    }
 }
 
 /// A module containing multiple functions
@@ -3925,6 +3974,11 @@ impl Module {
 pub struct Module {
     /// Functions
     pub functions: Vec<Function>,
+    /// The text of each GNU basic asm at file scope, in source order. Each
+    /// function and global records how many of them come before it
+    /// (`asm_before`), which is all the backends need to write the unit's
+    /// definitions and its asm in the order the source has them.
+    pub toplevel_asm: Vec<String>,
     /// Global variables
     pub globals: Vec<GlobalDef>,
     /// String literals (label, content)
@@ -4265,6 +4319,85 @@ impl Module {
         let label = format!(".LU32C{}", self.utf32_strings.len());
         self.utf32_strings.push((label.clone(), units));
         label
+    }
+}
+
+impl Module {
+    /// The names among `candidates` that something in the module still
+    /// refers to: a direct call, any instruction operand naming the symbol
+    /// (its address taken, a load or store through it), an inline asm
+    /// operand or a name written into an asm template, a global's
+    /// initializer, or the target of an alias.
+    ///
+    /// Missing a kind of reference here deletes a live function, so this
+    /// errs toward keeping: an identifier that merely *looks* like a
+    /// candidate in an assembly template counts.
+    pub fn referenced_symbols(&self, candidates: &HashSet<String>) -> HashSet<String> {
+        let mut referenced = HashSet::new();
+        let mut note = |name: &str| {
+            if candidates.contains(name) {
+                referenced.insert(name.to_string());
+            }
+        };
+        for func in &self.functions {
+            for insn in func.blocks.iter().flat_map(|bb| &bb.insns) {
+                // A direct call. An indirect one is named `<indirect>`, so it
+                // cannot collide with a real symbol.
+                if insn.op == Opcode::Call {
+                    if let Some(name) = &insn.extra().func_name {
+                        note(name);
+                    }
+                }
+                let operands = insn
+                    .src
+                    .iter()
+                    .chain(insn.target.iter())
+                    .chain(insn.phi_list.iter().map(|(_, p)| p));
+                for &p in operands {
+                    if let Some(name) = func.global_sym_name(p) {
+                        note(name);
+                    }
+                }
+                // A name written into the assembly text itself -- `asm("call
+                // foo")` -- reaches the assembler with no IR reference at all.
+                if let Some(ref asm) = insn.extra().asm_data {
+                    for_each_word(&asm.template, &mut note);
+                    for operand in asm.inputs.iter().chain(&asm.outputs) {
+                        if let Some(name) = func.global_sym_name(operand.pseudo) {
+                            note(name);
+                        }
+                    }
+                }
+            }
+        }
+        // A pointer in a global's initializer, e.g.
+        // `static const struct { fn_t f; } table[] = { { my_func }, ... }`.
+        for global in &self.globals {
+            global.init.for_each_symbol(&mut note);
+        }
+        // `__attribute__((alias))`: the `.set` the backend writes names the
+        // target, and a static function reached only through its alias -- the
+        // usual way to export an internal implementation under a public name
+        // -- has no other reference at all.
+        for alias in &self.aliases {
+            note(&alias.target);
+        }
+        referenced
+    }
+}
+
+/// Every identifier-shaped word in an assembly template.
+fn for_each_word(template: &str, f: &mut impl FnMut(&str)) {
+    let mut word = String::new();
+    for ch in template.chars().chain(std::iter::once(' ')) {
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            word.push(ch);
+            continue;
+        }
+        if !word.is_empty() {
+            f(&word);
+            word.clear();
+        }
     }
 }
 
@@ -4842,6 +4975,74 @@ mod tests {
 
         assert_eq!(module.globals.len(), 1);
         assert_eq!(module.functions.len(), 1);
+    }
+
+    /// Each kind of reference counts; a candidate nothing names does not, and
+    /// a local spelled like a candidate is not a reference to it.
+    #[test]
+    fn test_module_referenced_symbols() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let mut func = Function::new("f", types.int_id);
+        func.add_pseudo(Pseudo::sym(PseudoId(1), "loaded".to_string()));
+        func.add_pseudo(Pseudo::sym(PseudoId(2), "shadowed".to_string()));
+        func.add_local("shadowed", PseudoId(2), types.int_id, None, None);
+        func.next_pseudo = 5;
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(Instruction::call(
+            None,
+            "called",
+            vec![],
+            vec![],
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::load(
+            PseudoId(3),
+            PseudoId(1),
+            0,
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::load(
+            PseudoId(4),
+            PseudoId(2),
+            0,
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::asm(AsmData {
+            template: "call in_template".to_string(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        bb.add_insn(Instruction::ret(None));
+        func.add_block(bb);
+        module.add_function(func);
+        module.add_global(
+            "table",
+            types.int_id,
+            Initializer::SymAddr("from_init".to_string()),
+        );
+
+        let candidates: HashSet<String> = [
+            "called",
+            "loaded",
+            "shadowed",
+            "in_template",
+            "from_init",
+            "unused",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = module.referenced_symbols(&candidates);
+        let mut got: Vec<&str> = got.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["called", "from_init", "in_template", "loaded"]);
     }
 
     #[test]

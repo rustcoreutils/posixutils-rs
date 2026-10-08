@@ -44,7 +44,7 @@ fn test_frame_address_emits_opcode() {
         body: Stmt::Return(Some(frame_addr_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -83,7 +83,7 @@ fn test_return_address_emits_opcode() {
         body: Stmt::Return(Some(return_addr_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -136,7 +136,7 @@ fn test_valist_parameter_stored_as_pointer() {
         body: Stmt::Block(vec![]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -201,7 +201,7 @@ fn test_valist_local_not_indirect() {
         body: Stmt::Block(vec![BlockItem::Declaration(lva_decl)]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -282,7 +282,7 @@ fn test_valist_expression_decay() {
         body: Stmt::Block(vec![BlockItem::Declaration(ptr_decl)]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1176,4 +1176,21 @@ fn test_a_trapping_arm_is_still_not_speculated() {
     assert!(!insns_of(&module, "f")
         .iter()
         .any(|i| i.op == Opcode::Select));
+}
+
+/// `__builtin_unwind_init()` is an empty asm clobbering every callee-saved
+/// register of the target, which the prologue then saves.
+#[test]
+fn test_unwind_init_is_an_asm_clobbering_the_callee_saved_registers() {
+    let src = "void f(void) { __builtin_unwind_init(); }\n";
+    for arch in [Arch::X86_64, Arch::Aarch64] {
+        let module = linearize_source(src, &Target::new(arch, Os::Linux));
+        let asm = insns_of(&module, "f")
+            .into_iter()
+            .find(|i| i.op == Opcode::Asm)
+            .and_then(|i| i.extra().asm_data.as_deref())
+            .expect("an asm");
+        assert!(asm.template.is_empty() && asm.outputs.is_empty() && asm.inputs.is_empty());
+        assert_eq!(asm.clobbers, crate::arch::callee_saved_register_names(arch));
+    }
 }

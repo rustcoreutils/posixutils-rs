@@ -374,17 +374,34 @@ pub fn expire_stack_intervals(
 /// a live pseudo into a caller-saved register that the codegen helper's
 /// embedded libc call silently overwrites — see `memory/MEMORY.md`
 pub fn find_call_positions(func: &Function, is_call_like: impl Fn(Opcode) -> bool) -> Vec<usize> {
+    find_insn_positions(func, |insn| is_call_like(insn.op))
+}
+
+/// [`find_call_positions`] deciding per instruction: the positions of every
+/// instruction `clobbers` answers true for.
+pub fn find_insn_positions(func: &Function, clobbers: impl Fn(&Instruction) -> bool) -> Vec<usize> {
     let mut call_positions = Vec::with_capacity(DEFAULT_CALL_POS_CAPACITY);
     let mut pos = 0usize;
     for block in &func.blocks {
         for insn in &block.insns {
-            if is_call_like(insn.op) {
+            if clobbers(insn) {
                 call_positions.push(pos);
             }
             pos += 1;
         }
     }
     call_positions
+}
+
+/// The registers an inline asm's clobber list names that `parse` knows --
+/// one bank's worth. Nothing for any other instruction.
+pub fn asm_clobbered<R>(insn: &Instruction, parse: impl Fn(&str) -> Option<R>) -> Vec<R> {
+    match insn.extra().asm_data.as_deref() {
+        Some(asm) if insn.op == Opcode::Asm => {
+            asm.clobbers.iter().filter_map(|c| parse(c)).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The constraint point of a `__builtin_setjmp`, which clobbers every
@@ -897,11 +914,42 @@ pub fn local_slot(
 /// on the near side of it. A local takes an earlier one's slot when the two
 /// agree in size and alignment and its interval -- its lifetime, see
 /// `local_lifetimes` -- overlaps none the slot has held.
+///
+/// Which of a function's locals [`place_locals`] lays out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalSet {
+    /// Every local, in declaration order: a function without a canary.
+    All,
+    /// A protected function's arrays and aggregates holding one.
+    Arrays,
+    /// A protected function's other locals.
+    Rest,
+}
+
+impl LocalSet {
+    /// The two sets a function with a canary (`guarded`) lays out, in order,
+    /// or the one set of one without.
+    pub fn of(guarded: bool) -> (Option<Self>, Self) {
+        if guarded {
+            (Some(Self::Arrays), Self::Rest)
+        } else {
+            (None, Self::All)
+        }
+    }
+}
+
+/// `set` says which locals: a function with a stack-protector canary lays
+/// its arrays out first ([`LocalSet::Arrays`]), right after the canary and
+/// before any other slot, `char` arrays before the rest, as gcc does -- so
+/// an array that overruns reaches the canary without passing over a spilled
+/// argument or a scalar the function may still read before it returns --
+/// and the rest ([`LocalSet::Rest`]) where the others go.
 pub fn place_locals(
     func: &Function,
     types: &TypeTable,
     pos: crate::diag::Position,
     intervals: &[LiveInterval],
+    set: LocalSet,
     mut new_slot: impl FnMut(i32, i32) -> i32,
 ) -> Vec<(PseudoId, i32)> {
     struct Shared {
@@ -919,7 +967,17 @@ pub fn place_locals(
         .values()
         .filter(|l| lifetime.contains_key(&l.sym))
         .collect();
-    locals.sort_by_key(|l| l.sym.0);
+    let phase = |l: &&crate::ir::LocalVar| crate::arch::stack_protect::placement(l.typ, types);
+    match set {
+        LocalSet::All => {}
+        LocalSet::Arrays => locals.retain(|l| phase(l) < 2),
+        LocalSet::Rest => locals.retain(|l| phase(l) == 2),
+    }
+    if set == LocalSet::All {
+        locals.sort_by_key(|l| l.sym.0);
+    } else {
+        locals.sort_by_key(|l| (phase(l), l.sym.0));
+    }
     let mut slots: Vec<Shared> = Vec::new();
     let mut placed = Vec::with_capacity(locals.len());
     for local in locals {
@@ -1443,6 +1501,7 @@ pub fn build_interference_graph(
             if insn.op == Opcode::Asm {
                 if let Some(asm) = &insn.extra().asm_data {
                     add_early_clobber_edges(&mut graph, asm, candidates);
+                    add_memory_output_edges(&mut graph, asm, candidates);
                 }
             }
             // Each def interferes with everything currently live AND
@@ -1524,6 +1583,37 @@ fn add_early_clobber_edges(
         }
         for &p in &read {
             // `add_edge` ignores a self-edge: a tied input is the output.
+            graph.add_edge(out.pseudo, p);
+        }
+    }
+}
+
+/// Edges from each register output of one asm statement to the address of
+/// each of its memory outputs.
+///
+/// A plain output may share a register with an input the template has
+/// finished reading, but the address of a memory output is read for the
+/// template's write through it, which may come after the register output is
+/// written. gprofng's `__collector_subget_32` is
+/// `movl %2, %0; negl %0; lock; xaddl %0, %1` with `"=r"(r), "=m"(*ptr)`:
+/// given one register for `r` and `ptr`, the `negl` overwrote the address and
+/// the `xaddl` wrote through the negated count.
+fn add_memory_output_edges(
+    graph: &mut InterferenceGraph,
+    asm: &crate::ir::AsmData,
+    candidates: &std::collections::BTreeSet<PseudoId>,
+) {
+    let addresses: Vec<PseudoId> = asm
+        .outputs
+        .iter()
+        .filter(|o| o.is_memory() && candidates.contains(&o.pseudo))
+        .map(|o| o.pseudo)
+        .collect();
+    for out in &asm.outputs {
+        if out.is_memory() || !candidates.contains(&out.pseudo) {
+            continue;
+        }
+        for &p in &addresses {
             graph.add_edge(out.pseudo, p);
         }
     }

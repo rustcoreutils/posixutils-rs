@@ -19,10 +19,14 @@ pub mod lir;
 pub mod mapping;
 pub mod regalloc;
 pub mod simd;
+pub mod stack_protect;
 pub mod x86_64;
 
 // Re-export inline asm support traits and functions
-pub use codegen::{substitute_asm_operands, AsmOperandFormatter, AsmOperandSlot};
+pub use codegen::{
+    asm_dialects, basic_asm_template, callee_saved_register_names, substitute_asm_operands,
+    AsmOperandFormatter, AsmOperandSlot,
+};
 
 use crate::target::{Arch, CharSignedness, IntType, Os, Target};
 

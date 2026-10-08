@@ -109,7 +109,7 @@ Checked by gcc's own rules, in its words, with the shared helpers of
 - `__builtin_choose_expr` requires a constant first argument;
 - `__builtin_frame_address`/`__builtin_return_address` require a
   non-negative integer constant;
-- `offsetof` requires a constant array index;
+- `offsetof` requires an integer array index;
 - `__builtin_nans*` requires a string literal naming a payload (gcc accepts
   any string);
 - `__builtin_va_arg_pack*` require an `always_inline` variadic function.
@@ -435,7 +435,7 @@ not be in the same function as its setjmp is not diagnosed, by gcc either.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_offsetof(type, member)`, `offsetof(type, member)` | Byte offset, as `unsigned long`; `ExprKind::OffsetOf`, folded by `constexpr::eval`. The member may be a chain (`field.sub`, `arr[i].field`) whose indices must be integer constants |
+| `__builtin_offsetof(type, member)`, `offsetof(type, member)` | Byte offset, as `unsigned long`; `ExprKind::OffsetOf`, folded by `constexpr::eval`. The member may be a chain (`field.sub`, `arr[i].field`). An index that is not a constant (a GNU extension, which util-linux needs) adds `(size_t)i * sizeof element` to the offset with it taken as 0, and the result is then no constant |
 
 ## Complex Numbers
 

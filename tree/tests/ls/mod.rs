@@ -291,14 +291,211 @@ fn test_ls_infloop() {
     fs::create_dir(loop_dir).unwrap();
     canonical_symlink(loop_dir, loop_sub).unwrap();
 
+    // The diagnostic names the entry that would close the cycle, as GNU does,
+    // not the directory being listed when it was found.
     ls_test(
         &["-RL", loop_sub],
         &format!("{loop_sub}:\nsub\n"),
-        &format!("ls: {loop_sub}: not listing already-listed directory\n"),
+        &format!("ls: {loop_sub}/sub: not listing already-listed directory\n"),
         2,
     );
 
     fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// A tree like the one `cp -a` leaves: hard links (one pair inside a single
+/// directory, one pair across directories), a symlink to a directory, and empty
+/// directories.
+fn make_hard_link_tree(root: &Path) {
+    let d2 = root.join("d1/d2");
+    fs::create_dir_all(d2.join("sub")).unwrap();
+    fs::create_dir_all(root.join("d1/empty")).unwrap();
+    fs::write(d2.join("f1"), "a").unwrap();
+    fs::write(d2.join("f2"), "b").unwrap();
+    fs::hard_link(d2.join("f1"), root.join("d1/hl")).unwrap();
+    fs::hard_link(d2.join("f2"), d2.join("f2same")).unwrap();
+    std::os::unix::fs::symlink("d1/d2", root.join("lnk")).unwrap();
+}
+
+/// Two names for one file inside a directory are not a directory cycle: a
+/// directory operand is listed once, in full, with no diagnostic, whatever the
+/// output format.
+#[test]
+fn test_ls_hard_links_are_not_an_already_listed_directory() {
+    let dir = plib::tmp::tempdir().unwrap();
+    make_hard_link_tree(dir.path());
+    let d2 = dir.path().join("d1/d2");
+    let d2s = d2.to_str().unwrap();
+
+    ls_test(&[d2s], "f1\nf2\nf2same\nsub\n", "", 0);
+
+    let ino = |name: &str| fs::symlink_metadata(d2.join(name)).unwrap().ino();
+    let expected = format!(
+        "{} f1\n{} f2\n{} f2same\n{} sub\n",
+        ino("f1"),
+        ino("f2"),
+        ino("f2same"),
+        ino("sub")
+    );
+    ls_test(&["-i", "-1", d2s], &expected, "", 0);
+
+    for args in [&["-l", d2s][..], &["-li", d2s][..], &["-R", d2s][..]] {
+        ls_test_with_checker(args, |_, output| {
+            assert_eq!(String::from_utf8_lossy(&output.stderr), "", "ls {args:?}");
+            assert_eq!(output.status.code(), Some(0), "ls {args:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("f2same"), "ls {args:?}: {stdout:?}");
+        });
+    }
+}
+
+/// The same directory named twice is listed twice, and a directory reached
+/// through a symlink operand is listed even when it is also named directly.
+#[test]
+fn test_ls_directory_operand_listed_each_time_it_is_named() {
+    let dir = plib::tmp::tempdir().unwrap();
+    make_hard_link_tree(dir.path());
+    let d1 = dir.path().join("d1");
+    let d1s = d1.to_str().unwrap();
+    let lnk = dir.path().join("lnk");
+    let lnks = lnk.to_str().unwrap();
+
+    ls_test(
+        &[d1s, d1s],
+        &format!("{d1s}:\nd2\nempty\nhl\n\n{d1s}:\nd2\nempty\nhl\n"),
+        "",
+        0,
+    );
+    ls_test(&[lnks], "f1\nf2\nf2same\nsub\n", "", 0);
+    ls_test(
+        &["-R", d1s],
+        &format!(
+            "{d1s}:\nd2\nempty\nhl\n\n{d1s}/d2:\nf1\nf2\nf2same\nsub\n\n\
+             {d1s}/d2/sub:\n\n{d1s}/empty:\n"
+        ),
+        "",
+        0,
+    );
+}
+
+/// POSIX: directory operands are sorted like any other names (and by -r/-t/-S),
+/// not listed in command-line order.
+#[test]
+fn test_ls_directory_operands_are_sorted() {
+    let dir = plib::tmp::tempdir().unwrap();
+    make_hard_link_tree(dir.path());
+    let d1 = dir.path().join("d1");
+    let d1s = d1.to_str().unwrap();
+    let d2 = d1.join("d2");
+    let d2s = d2.to_str().unwrap();
+    let d1_listing = format!("{d1s}:\nd2\nempty\nhl\n");
+    let d2_listing = format!("{d2s}:\nf1\nf2\nf2same\nsub\n");
+
+    ls_test(&[d2s, d1s], &format!("{d1_listing}\n{d2_listing}"), "", 0);
+    ls_test(
+        &["-r", d1s, d2s],
+        &format!("{d2s}:\nsub\nf2same\nf2\nf1\n\n{d1s}:\nhl\nempty\nd2\n"),
+        "",
+        0,
+    );
+}
+
+/// -d lists a directory operand as itself, not its contents.
+#[test]
+fn test_ls_d_lists_directory_operands_as_files() {
+    let dir = plib::tmp::tempdir().unwrap();
+    make_hard_link_tree(dir.path());
+    let d1 = dir.path().join("d1");
+    let d1s = d1.to_str().unwrap();
+    let hl = d1.join("hl");
+    let hls = hl.to_str().unwrap();
+    let lnk = dir.path().join("lnk");
+    let lnks = lnk.to_str().unwrap();
+
+    ls_test(&["-d", hls, d1s], &format!("{d1s}\n{hls}\n"), "", 0);
+    ls_test(&["-d", lnks], &format!("{lnks}\n"), "", 0);
+    ls_test_with_checker(&["-ld", d1s], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with('d'), "{stdout:?}");
+        assert!(stdout.ends_with(&format!(" {d1s}\n")), "{stdout:?}");
+        assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+    });
+}
+
+/// POSIX: with -d, -F or -l and neither -H nor -L, a symbolic link to a
+/// directory named as an operand is written as the link itself.
+#[test]
+fn test_ls_symlink_operand_not_followed_under_d_f_l() {
+    let dir = plib::tmp::tempdir().unwrap();
+    make_hard_link_tree(dir.path());
+    let lnk = dir.path().join("lnk");
+    let lnks = lnk.to_str().unwrap();
+
+    ls_test(&["-F", lnks], &format!("{lnks}@\n"), "", 0);
+    ls_test_with_checker(&["-l", lnks], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with('l'), "{stdout:?}");
+        assert!(
+            stdout.ends_with(&format!(" {lnks} -> d1/d2\n")),
+            "{stdout:?}"
+        );
+    });
+    // -H follows it again, so -l lists the directory's contents.
+    ls_test_with_checker(&["-lH", lnks], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("total "), "{stdout:?}");
+        assert!(stdout.contains(" f2same\n"), "{stdout:?}");
+    });
+    ls_test(&["-FL", lnks], "f1\nf2\nf2same\nsub/\n", "", 0);
+}
+
+/// POSIX: under -l or -s each list of files within a directory is preceded by
+/// its total, and an empty list is still a list: `total 0`.
+#[test]
+fn test_ls_empty_directory_has_a_total_line() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let top = dir.path().join("top");
+    fs::create_dir_all(top.join("empty")).unwrap();
+    let tops = top.to_str().unwrap();
+    let empty = top.join("empty");
+    let emptys = empty.to_str().unwrap();
+
+    ls_test(&["-l", emptys], "total 0\n", "", 0);
+    ls_test(&["-s", emptys], "total 0\n", "", 0);
+    ls_test(&[emptys], "", "", 0);
+    // A directory's own block count depends on the file system.
+    ls_test_with_checker(&["-sR", tops], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(&format!("{tops}:\ntotal ")),
+            "{stdout:?}"
+        );
+        assert!(
+            stdout.ends_with(&format!(" empty\n\n{emptys}:\ntotal 0\n")),
+            "{stdout:?}"
+        );
+        assert_eq!(output.status.code(), Some(0));
+    });
+}
+
+/// A `-R` cycle refuses only the entry that closes it; the rest of the tree is
+/// still listed, as GNU does.
+#[test]
+fn test_ls_recursive_cycle_skips_only_the_looping_entry() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let d1 = dir.path().join("d1");
+    fs::create_dir_all(d1.join("a/sub")).unwrap();
+    fs::create_dir_all(d1.join("z")).unwrap();
+    fs::write(d1.join("z/last"), "").unwrap();
+    std::os::unix::fs::symlink("../..", d1.join("a/sub/up")).unwrap();
+    let d1s = d1.to_str().unwrap();
+
+    ls_test(
+        &["-RL", d1s],
+        &format!("{d1s}:\na\nz\n\n{d1s}/a:\nsub\n\n{d1s}/a/sub:\nup\n\n{d1s}/z:\nlast\n"),
+        &format!("ls: {d1s}/a/sub/up: not listing already-listed directory\n"),
+        2,
+    );
 }
 
 // Port of coreutils/tests/ls/inode.sh

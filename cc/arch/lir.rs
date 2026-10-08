@@ -1070,6 +1070,21 @@ pub enum Directive {
 
     /// Raw assembly string (emitted verbatim) - used for inline asm
     Raw(String),
+
+    /// The unit's last line. On ELF, the empty `.note.GNU-stack` section
+    /// that marks the stack non-executable (without it the linker warns and
+    /// makes the stack executable). On Mach-O, `.subsections_via_symbols`,
+    /// as clang ends every unit: it lets Apple's linker split each section
+    /// at every non-private symbol, so a weak definition can yield to a
+    /// strong one in another object (otherwise `duplicate symbol`) and
+    /// `-dead_strip` can drop one function. Sound only because nothing c17
+    /// emits falls through or reaches by fixed offset from one non-private
+    /// symbol into the next: every label it invents is `L`-private.
+    UnitEnd,
+
+    /// A file-scope asm's text, written exactly as the source gave it and
+    /// ended with a newline, as gcc writes it.
+    Verbatim(String),
 }
 
 /// Emit the section directive for an `.init_array` / `.fini_array` entry.
@@ -1635,6 +1650,17 @@ impl EmitAsm for Directive {
             Directive::Raw(text) => {
                 let _ = writeln!(out, "    {}", text);
             }
+            Directive::UnitEnd => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".subsections_via_symbols");
+                }
+                _ => {
+                    let _ = writeln!(out, "    .section .note.GNU-stack,\"\",@progbits");
+                }
+            },
+            Directive::Verbatim(text) => {
+                let _ = writeln!(out, "{}", text);
+            }
         }
     }
 }
@@ -1862,6 +1888,18 @@ mod tests {
         let mut out = String::new();
         dir.emit(&target, &mut out);
         assert_eq!(out, "    .loc 1 42 5\n");
+    }
+
+    /// A file-scope asm's text goes out exactly as written, unindented, on
+    /// every target, with one newline after it.
+    #[test]
+    fn test_directive_verbatim() {
+        for os in [Os::Linux, Os::MacOS] {
+            let mut out = String::new();
+            Directive::Verbatim(".symver a,b@@V\n\t.globl c".into())
+                .emit(&Target::new(Arch::X86_64, os), &mut out);
+            assert_eq!(out, ".symver a,b@@V\n\t.globl c\n");
+        }
     }
 
     /// A `.file` path is escaped as any assembler string is: an unescaped

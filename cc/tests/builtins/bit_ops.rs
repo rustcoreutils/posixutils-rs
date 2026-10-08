@@ -537,3 +537,40 @@ int main(void)
 "#;
     compile_and_run_everywhere("builtins_bit_ops_everywhere_mega", code);
 }
+
+/// A bit builtin whose operand is an argument the caller passed on the
+/// stack, read in place: the x86-64 lowering of `clz`, `ctz` and `bswap`
+/// knew a register, a spill slot and a constant, and emitted nothing at all
+/// for an incoming stack argument, so the result was whatever the scratch
+/// register held. perl's regex compiler (`single_1bit_pos32` inlined into
+/// `S_optimize_regclass`, whose ninth parameter is the class mask) never
+/// built a `POSIXL` node.
+#[test]
+fn builtins_bit_ops_of_a_stacked_argument() {
+    let code = r#"
+#define N __attribute__((noinline))
+#define P int a, int b, int c, int d, int e, int f, int g, int h
+N int clz32(P, unsigned x) { return __builtin_clz(x); }
+N int clz64(P, unsigned long long x) { return __builtin_clzll(x); }
+N int ctz32(P, unsigned x) { return __builtin_ctz(x); }
+N int ctz64(P, unsigned long long x) { return __builtin_ctzll(x); }
+N unsigned short bs16(P, unsigned short x) { return __builtin_bswap16(x); }
+N unsigned bs32(P, unsigned x) { return __builtin_bswap32(x); }
+N unsigned long long bs64(P, unsigned long long x) { return __builtin_bswap64(x); }
+N int pop32(P, unsigned x) { return __builtin_popcount(x); }
+
+int main(void)
+{
+    if (clz32(0, 0, 0, 0, 0, 0, 0, 0, 0x100) != 23) return 1;
+    if (clz64(0, 0, 0, 0, 0, 0, 0, 0, 0x100000000ULL) != 31) return 2;
+    if (ctz32(0, 0, 0, 0, 0, 0, 0, 0, 0x100) != 8) return 3;
+    if (ctz64(0, 0, 0, 0, 0, 0, 0, 0, 0x100000000ULL) != 32) return 4;
+    if (bs16(0, 0, 0, 0, 0, 0, 0, 0, 0x1234) != 0x3412) return 5;
+    if (bs32(0, 0, 0, 0, 0, 0, 0, 0, 0x12345678) != 0x78563412) return 6;
+    if (bs64(0, 0, 0, 0, 0, 0, 0, 0, 0x1122334455667788ULL) != 0x8877665544332211ULL) return 7;
+    if (pop32(0, 0, 0, 0, 0, 0, 0, 0, 0xf0f) != 8) return 8;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("builtins_bit_ops_of_a_stacked_argument", code);
+}

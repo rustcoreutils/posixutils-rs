@@ -9,7 +9,8 @@
 
 //! Core data types for the patch utility.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Represents a single line operation within a hunk.
@@ -88,7 +89,9 @@ impl Hunk {
     pub fn new(old_start: usize, old_count: usize, new_start: usize, new_count: usize) -> Self {
         // Pre-allocate: typically need old_count + new_count lines
         // (context lines counted in both, plus adds and deletes)
-        let estimated_lines = old_count.saturating_add(new_count);
+        // The counts come from the header, which nothing has checked yet: a
+        // hint for the allocation, never a size to trust.
+        let estimated_lines = old_count.saturating_add(new_count).min(4096);
         Self {
             old_start,
             old_count,
@@ -279,6 +282,18 @@ impl FilePatch {
         }
     }
 
+    /// Whether this patch creates its file when the file does not exist.
+    ///
+    /// The old side is /dev/null, or -- as GNU patch also reads it -- the
+    /// patch is a single hunk inserting into an empty old file
+    /// ("@@ -0,0 +1,N @@"), which is how `diff -N` spells a new file. A 1.0
+    /// Debian source package's .diff.gz creates its whole debian/ directory
+    /// that way.
+    pub fn creates_file(&self) -> bool {
+        self.is_new_file
+            || matches!(self.hunks.as_slice(), [h] if h.old_count == 0 && h.old_start == 1)
+    }
+
     /// Reverse this patch (swap old/new, reverse all hunks).
     pub fn reverse(&mut self) {
         std::mem::swap(&mut self.old_path, &mut self.new_path);
@@ -342,13 +357,53 @@ pub struct ApplyResult {
     pub applied_any: bool,
 }
 
+/// How a backup file is named: -B PREFIX goes in front of the file's name and
+/// -z SUFFIX after it. The suffix defaults to `.orig`, except that a prefix
+/// alone replaces it (GNU's `-B .pc/NAME/` names `.pc/NAME/FILE`).
+#[derive(Debug, Clone, Default)]
+pub struct BackupName {
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+}
+
+impl BackupName {
+    /// The backup file name for `path`.
+    pub fn for_file(&self, path: &Path) -> PathBuf {
+        let suffix = match (&self.suffix, &self.prefix) {
+            (Some(s), _) => s.as_str(),
+            (None, Some(_)) => "",
+            (None, None) => ".orig",
+        };
+        let mut name = OsString::from(self.prefix.as_deref().unwrap_or(""));
+        name.push(path.as_os_str());
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+}
+
+/// Where rejected hunks go.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RejectFile {
+    /// Into this file (-r FILE).
+    Path(PathBuf),
+    /// Nowhere (-r -): the hunks are still counted as failed.
+    Discard,
+}
+
 /// Configuration options for patch.
 #[derive(Debug, Clone, Default)]
 pub struct PatchConfig {
-    /// Save .orig backup (-b)
-    pub backup: bool,
+    /// Back up each file before changing it (-b, or implied by -B / -z).
+    pub backup: Option<BackupName>,
     /// Force application without prompting (-f)
     pub force: bool,
+    /// Never ask a question; take GNU's batch answers (-t)
+    pub batch: bool,
+    /// Most context lines a hunk may ignore at each end (-F); None is the
+    /// POSIX default of two.
+    pub max_fuzz: Option<usize>,
+    /// Remove a file the patch leaves empty (-E)
+    pub remove_empty: bool,
     /// Force context diff interpretation (-c)
     pub force_context: bool,
     /// Change directory before processing (-d)
@@ -370,7 +425,7 @@ pub struct PatchConfig {
     /// Strip path components (-p)
     pub strip_count: Option<usize>,
     /// Override reject filename (-r)
-    pub reject_file: Option<PathBuf>,
+    pub reject_file: Option<RejectFile>,
     /// Reverse patch direction (-R)
     pub reverse: bool,
     /// Force unified diff interpretation (-u)

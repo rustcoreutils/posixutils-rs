@@ -222,6 +222,8 @@ fn process_file(path: &str, streams: &mut StreamTable) -> io::Result<Vec<TagEntr
                     }
                 }
             }
+            // Assembler text defines no C identifier.
+            ExternalDecl::Asm { .. } => {}
         }
     }
 

@@ -25,10 +25,21 @@ impl Parser<'_> {
     /// thousands of consecutive `case` labels, and one recursion per label
     /// overflowed the compiler's stack.
     pub fn parse_statement(&mut self) -> ParseResult<Stmt> {
+        let labels = self.parse_labels()?;
+        self.parse_after_labels(labels)
+    }
+
+    /// Every label in front of a statement, in source order.
+    fn parse_labels(&mut self) -> ParseResult<Vec<Label>> {
         let mut labels = Vec::new();
         while let Some(label) = self.parse_label()? {
             labels.push(label);
         }
+        Ok(labels)
+    }
+
+    /// The statement `labels` (perhaps none) are written in front of.
+    fn parse_after_labels(&mut self, labels: Vec<Label>) -> ParseResult<Stmt> {
         if labels.is_empty() {
             return self.parse_unlabeled_statement();
         }
@@ -77,6 +88,7 @@ impl Parser<'_> {
         if self.is_special(b':') {
             self.advance();
             let label = self.resolve_label(name);
+            self.parse_label_attributes();
             return Ok(Some(Label::Named { label, pos }));
         }
         // Not a label, backtrack
@@ -463,17 +475,43 @@ impl Parser<'_> {
     fn parse_block_item_list(&mut self) -> ParseResult<Vec<BlockItem>> {
         let mut items = Vec::new();
         while !self.is_special(b'}') && !self.is_eof() {
-            // An attribute declaration starts like a declaration but is a
-            // statement: `__attribute__((fallthrough));`.
-            if self.is_declaration_start() && !self.at_attribute_declaration() {
+            if self.at_block_declaration() {
                 let decl = self.parse_declaration_and_bind()?;
                 items.push(BlockItem::Declaration(decl));
-            } else {
-                let stmt = self.parse_statement()?;
-                items.push(BlockItem::Statement(Box::new(stmt)));
+                continue;
             }
+            let labels = self.parse_labels()?;
+            // C17 6.8.1 puts a label only in front of a statement; C23 lets
+            // one stand in front of a declaration too, and gcc and clang take
+            // that in C17, saying so only under `-pedantic`. grep's dfa.c
+            // writes `stray_backslash: char const *p;`. It is `L: ; decl`:
+            // the labels on an empty statement, and the declaration as the
+            // next block item. Only here -- the body of an `if` or a loop is
+            // a statement in C23 as well.
+            let stmt = if !labels.is_empty() && self.at_block_declaration() {
+                diag::pedwarn(
+                    self.current_pos(),
+                    &gettext(
+                        "a label can only be part of a statement and a declaration is not a statement",
+                    ),
+                );
+                Stmt::Labeled {
+                    labels,
+                    stmt: Box::new(Stmt::Empty),
+                }
+            } else {
+                self.parse_after_labels(labels)?
+            };
+            items.push(BlockItem::Statement(Box::new(stmt)));
         }
         Ok(items)
+    }
+
+    /// Whether the block item starting here is a declaration. An attribute
+    /// declaration starts like one but is a statement:
+    /// `__attribute__((fallthrough));`.
+    fn at_block_declaration(&self) -> bool {
+        self.is_declaration_start() && !self.at_attribute_declaration()
     }
 
     fn parse_block_stmt(&mut self) -> ParseResult<Stmt> {

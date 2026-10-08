@@ -627,8 +627,12 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
     // DWARF version (2)
     base.push_directive(Directive::TwoBytes(2));
 
-    // Abbrev offset (offset into .debug_abbrev, always 0 for single CU)
-    base.push_directive(Directive::Long(0));
+    // Abbrev offset: this object's own table, by a relocatable reference.
+    // The linker packs every object's `.debug_abbrev` end to end, as it does
+    // `.debug_line` (see `DW_AT_stmt_list` below), so a literal 0 names the
+    // first object's table. c17's tables are all alike, which hid it until a
+    // c17 unit was linked after a g++ one (dpkg's dselect).
+    base.push_directive(Directive::LongSym(Symbol::local(".Ldebug_abbrev0")));
 
     // Address size (8 bytes for 64-bit)
     base.push_directive(Directive::Byte(8));

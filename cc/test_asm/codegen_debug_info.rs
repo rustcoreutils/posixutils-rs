@@ -104,6 +104,38 @@ fn codegen_debug_stmt_list_is_relocatable() {
     }
 }
 
+/// The compile unit header names *this* object's abbreviation table, not
+/// offset zero -- the same packing as `DW_AT_stmt_list`: the linker lays the
+/// objects' `.debug_abbrev` contributions end to end, so a literal 0 points
+/// every c17 unit at the first object's table. c17's tables are identical, so
+/// an all-c17 link survived; dpkg's dselect links g++ units ahead of
+/// libdpkg's, its c17 units decoded against g++'s table, and `dwz` stopped
+/// the package build with "Could not find DWARF abbreviation 105".
+#[test]
+fn codegen_debug_abbrev_offset_is_relocatable() {
+    let src = "int f(void) { return 1; }\n";
+    for (triple, label) in [
+        (X86_64_LINUX, ".Ldebug_abbrev0"),
+        (AARCH64_LINUX, ".Ldebug_abbrev0"),
+        (DARWIN, "Ldebug_abbrev0"),
+    ] {
+        let asm = asm_for_with("debug_abbrev_offset", triple, src, &["-g", "-O0"]);
+        let header = asm
+            .split_once(".Ldebug_info_start:")
+            .or_else(|| asm.split_once("Ldebug_info_start:"))
+            .map(|(_, rest)| rest.lines().take(4).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        assert!(
+            header.contains(&format!(".long {label}")),
+            "{triple}: the unit header must name this unit's abbreviation table:\n{header}"
+        );
+        assert!(
+            asm.contains(&format!("\n{label}:")),
+            "{triple}: the label must be defined:\n{asm}"
+        );
+    }
+}
+
 /// `-g` is what turns all of this on; without it none of it appears.
 #[test]
 fn codegen_debug_directives_need_dash_g() {

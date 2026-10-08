@@ -35,7 +35,7 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             pos += 1;
             break;
         } else if let Some(rest) = line.strip_prefix("Index: ") {
-            patch.index_path = Some(rest.trim().to_string());
+            patch.index_path = Some(rest.trim_ascii().to_string());
             pos += 1;
         } else {
             pos += 1;
@@ -76,12 +76,12 @@ pub fn parse_unified(lines: &[&str], start: usize) -> Result<(FilePatch, usize),
             // which the change happens ("@@ -5,0 +6,2 @@" inserts after line
             // 5). `Hunk` wants the line before which to insert, so add one.
             let old_start = if old_count == 0 {
-                old_start + 1
+                old_start.saturating_add(1)
             } else {
                 old_start
             };
             let new_start = if new_count == 0 {
-                new_start + 1
+                new_start.saturating_add(1)
             } else {
                 new_start
             };

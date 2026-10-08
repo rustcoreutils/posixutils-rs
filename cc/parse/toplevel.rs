@@ -25,7 +25,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Linkage, Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
-use crate::types::{ArrayExtent, Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{ArrayExtent, Type, TypeId, TypeKind};
 use gettextrs::gettext;
 use std::collections::HashMap;
 
@@ -264,7 +264,11 @@ impl Parser<'_> {
             .max(self.pending_declarator_align.take());
         self.pending_fn_attrs.align = self.pending_fn_attrs.align.max(declared_align);
         let pending = self.pending_fn_attrs.clone();
+        let pos = self.current_pos();
         let seen = self.declared_fn_attrs.entry(name).or_default();
+        if let Err(kept) = seen.stack_protect.combine(pending.stack_protect) {
+            Self::warn_stack_protect_conflict(kept, pos);
+        }
         seen.merge(&pending);
         seen.clone()
     }
@@ -313,6 +317,11 @@ impl Parser<'_> {
         }
         if self.at_attribute_declaration() {
             return self.parse_file_attribute_declaration();
+        }
+        // GNU basic asm: no declaration starts with `asm`, which is only
+        // ever an asm label after a declarator.
+        if self.is_asm_keyword() {
+            return self.parse_file_scope_asm();
         }
         self.parse_declaration(DeclScope::File)
     }
@@ -420,7 +429,7 @@ impl Parser<'_> {
             // The linkage, not the specifier: `static int f(void);` makes
             // a later `int f(void) {..}` static too (C17 6.2.2p5, p4).
             is_static: linkage == Linkage::Internal,
-            is_inline: specs.storage_class.contains(TypeModifiers::INLINE),
+            storage_class: specs.storage_class,
             calling_conv: self.types.get(typ).conv,
             attrs,
         })

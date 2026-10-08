@@ -355,7 +355,7 @@ fn test_large_struct_copy_from_array() {
         ]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -430,7 +430,7 @@ fn test_block_scope_extern_declares_no_local() {
         body,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -534,7 +534,7 @@ fn test_complex_temporaries_are_frame_slots() {
         body: Stmt::Return(Some(neg)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };

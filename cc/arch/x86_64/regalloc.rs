@@ -47,8 +47,9 @@ use super::x87::{is_x87_float_to_int, uses_x87_scratch};
 use crate::arch::asm_constraints::{AsmOperandClass, AsmRegClass, PinnedGp};
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
-    compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
-    ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
+    asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
+    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
+    LivenessResult,
 };
 use crate::float::FloatVal;
 use crate::ir::{AsmConstraint, AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -469,6 +470,35 @@ pub fn asm_pinned_regs(asm: &AsmData) -> Vec<Option<Reg>> {
     pins
 }
 
+/// Every general register an inline asm of `func` may change: those it
+/// clobbers, and those its operands are pinned to -- an input in `%rbx` is
+/// loaded there by the function itself. A callee-saved one among them is the
+/// function's to preserve, as any it allocates is, though no pseudo lives
+/// in it.
+fn asm_written_regs(func: &Function) -> impl Iterator<Item = Reg> + '_ {
+    func.blocks
+        .iter()
+        .flat_map(|block| &block.insns)
+        .filter(|insn| insn.op == Opcode::Asm)
+        .filter_map(|insn| insn.extra().asm_data.as_deref())
+        .flat_map(|asm| {
+            let pinned = asm_pinned_regs(asm).into_iter().flatten();
+            let clobbered = asm.clobbers.iter().filter_map(|c| parse_gp_clobber_name(c));
+            pinned.chain(clobbered).collect::<Vec<_>>()
+        })
+}
+
+/// The number of the vector register a clobber-list name means: `xmm3`,
+/// `ymm3` and `zmm3` all write register 3, optionally with gcc's leading
+/// `%`. `None` for any other name.
+fn parse_xmm_clobber_name(raw: &str) -> Option<u8> {
+    let s = raw.trim_start_matches('%').to_ascii_lowercase();
+    let n = ["xmm", "ymm", "zmm"]
+        .iter()
+        .find_map(|p| s.strip_prefix(p))?;
+    n.parse().ok().filter(|&n: &u8| n < 32)
+}
+
 /// Map a clobber-list register name (lowercase, GCC-style) to the
 /// corresponding `Reg`. Accepts the 64-bit canonical name (`rax`,
 /// `r10`, ...), the 32/16/8-bit alias (`eax`, `ax`, `al`, `r10d`,
@@ -770,6 +800,11 @@ pub struct RegAlloc {
     /// How the target obtains a thread-local's address, which decides what a
     /// `TlsAddr` clobbers. Set with [`RegAlloc::with_tls_access`].
     tls_access: crate::target::TlsAccess,
+    /// Whether the function gets a stack-protector canary; set with
+    /// [`RegAlloc::with_stack_guard`].
+    guard_requested: bool,
+    /// The canary's slot: the frame's first, so above every other local.
+    guard_slot: Option<i32>,
     /// How many GP argument registers the **named** parameters consumed, capped
     /// at the register file size. `va_start` needs this to seed `gp_offset`.
     named_gp_regs: usize,
@@ -1133,7 +1168,21 @@ impl RegAlloc {
             max_local_align: 8,
             frame_base: FrameBase::Rbp,
             tls_access: crate::target::TlsAccess::ElfStatic,
+            guard_requested: false,
+            guard_slot: None,
         }
+    }
+
+    /// An allocator that reserves a stack-protector canary slot when
+    /// `guarded`; see `arch::stack_protect`.
+    pub fn with_stack_guard(mut self, guarded: bool) -> Self {
+        self.guard_requested = guarded;
+        self
+    }
+
+    /// The canary's slot, if [`RegAlloc::with_stack_guard`] asked for one.
+    pub fn stack_guard_slot(&self) -> Option<i32> {
+        self.guard_slot
     }
 
     /// Perform register allocation for a function
@@ -1152,6 +1201,15 @@ impl RegAlloc {
             // The prologue writes it, so the function must save it.
             self.used_callee_saved.push(base);
         }
+        // Before any other slot: the first is the highest, nearest the saved
+        // registers, which is where the canary has to be -- and the arrays
+        // right under it.
+        self.guard_slot = self.guard_requested.then(|| self.new_frame_slot(8, 8));
+        let (arrays, rest) = crate::arch::regalloc::LocalSet::of(self.guard_requested);
+        if let Some(arrays) = arrays {
+            let early = self.compute_live_intervals(func);
+            self.place_locals(func, types, &early.intervals, arrays);
+        }
         let win64 = func.conv == crate::abi::CallingConv::Win64;
         if win64 {
             self.used_callee_saved
@@ -1162,6 +1220,12 @@ impl RegAlloc {
                 if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
                     self.used_callee_saved.push(reg);
                 }
+            }
+        }
+        // The frame pointer is the prologue's own, saved already.
+        for reg in asm_written_regs(func).filter(|r| Reg::allocatable().contains(r)) {
+            if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
+                self.used_callee_saved.push(reg);
             }
         }
         // Use shared identify_fp_pseudos with type-checker closure
@@ -1186,7 +1250,7 @@ impl RegAlloc {
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_x86_64);
-        let fp_call_positions = self.fp_call_positions(func, &call_positions);
+        let fp_call_positions = self.fp_call_positions(func);
 
         self.spill_args_across_calls(func, types, &intervals, &call_positions);
         self.spill_gp_args(&intervals, |interval, reg| {
@@ -1198,7 +1262,7 @@ impl RegAlloc {
             )
         });
         self.allocate_alloca_to_stack(func);
-        self.place_locals(func, types, &intervals);
+        self.place_locals(func, types, &intervals, rest);
         self.run_chordal_color(
             func,
             intervals,
@@ -1279,11 +1343,16 @@ impl RegAlloc {
     /// across it has to be where one is live across a call: on the stack.
     /// The ELF descriptor resolver preserves them all, so there it adds
     /// nothing.
-    fn fp_call_positions(&self, func: &Function, call_positions: &[usize]) -> Vec<usize> {
-        if self.tls_access != crate::target::TlsAccess::MachOTlv {
-            return call_positions.to_vec();
-        }
-        find_call_positions(func, |op| is_call_like_x86_64(op) || op == Opcode::TlsAddr)
+    ///
+    /// An inline asm that clobbers an XMM register is one too: the clobber
+    /// list is all the allocator knows of what the template writes.
+    fn fp_call_positions(&self, func: &Function) -> Vec<usize> {
+        let tlv = self.tls_access == crate::target::TlsAccess::MachOTlv;
+        find_insn_positions(func, |insn| {
+            is_call_like_x86_64(insn.op)
+                || (tlv && insn.op == Opcode::TlsAddr)
+                || !asm_clobbered(insn, parse_xmm_clobber_name).is_empty()
+        })
     }
 
     /// Reset allocator state for a new function
@@ -2059,11 +2128,18 @@ impl RegAlloc {
     }
 
     /// Give every local its frame slot; see `arch::regalloc::place_locals`.
-    fn place_locals(&mut self, func: &Function, types: &TypeTable, intervals: &[LiveInterval]) {
+    fn place_locals(
+        &mut self,
+        func: &Function,
+        types: &TypeTable,
+        intervals: &[LiveInterval],
+        set: crate::arch::regalloc::LocalSet,
+    ) {
         let pos = self.func_pos;
-        let placed = crate::arch::regalloc::place_locals(func, types, pos, intervals, |b, a| {
-            self.new_frame_slot(b, a)
-        });
+        let placed =
+            crate::arch::regalloc::place_locals(func, types, pos, intervals, set, |b, a| {
+                self.new_frame_slot(b, a)
+            });
         for (local, offset) in placed {
             self.locations.insert(local, Loc::Stack(offset));
             if func.local_of(local).is_some_and(|l| types.is_float(l.typ)) {
@@ -2263,6 +2339,28 @@ impl RegAlloc {
                 all_vertices.insert(pid);
             }
         }
+        // Each asm's outputs, by position: an asm writing its own pinned
+        // output -- a `"+a"` operand, live on both sides -- is the value
+        // arriving in that register, not something overwriting it.
+        // An `asm goto` output, though, has to be in its register: the jump
+        // skips any move after the template, so it is precolored as before.
+        let mut asm_outputs_at: HashMap<usize, Vec<PseudoId>> = HashMap::new();
+        let mut goto_outputs: HashSet<PseudoId> = HashSet::new();
+        for (pos, insn) in func.blocks.iter().flat_map(|b| &b.insns).enumerate() {
+            if let Some(asm) = insn.extra().asm_data.as_deref() {
+                let outputs = asm.outputs.iter().map(|o| o.pseudo);
+                if !asm.goto_labels.is_empty() {
+                    goto_outputs.extend(outputs.clone());
+                }
+                asm_outputs_at.insert(pos, outputs.collect());
+            }
+        }
+        let writes_it = |cp: &ConstraintPoint<Reg>, interval: &LiveInterval| {
+            exempt_from_clobber(cp, interval)
+                || asm_outputs_at
+                    .get(&cp.position)
+                    .is_some_and(|outs| outs.contains(&interval.pseudo))
+        };
         for (pid, reg) in collect_asm_fixed_precolors_x86_64(func) {
             // Only pre-color if the pseudo is a GP candidate. The
             // lowering already routes pinned-operand registers
@@ -2270,6 +2368,24 @@ impl RegAlloc {
             // pre-coloring is skipped here the operand remains
             // exempt via `involved_pseudos`.
             if !gp_candidates.contains(&pid) {
+                continue;
+            }
+            // Nor if something else writes that register while the pseudo
+            // is live -- the next `mulq` of three in a row, whose `"=a"` and
+            // `"=d"` outputs are pinned to the same two registers. Precolored,
+            // every product sat in %rax/%rdx and each asm overwrote the last
+            // one's; uncolored, the pseudo is placed like any other value,
+            // kept out of the register by that constraint point, and the asm
+            // codegen moves it in and out.
+            let overwritten = by_pseudo.get(&pid).is_some_and(|interval| {
+                crate::arch::regalloc::clobbered_while_live(
+                    interval,
+                    reg,
+                    constraint_points,
+                    writes_it,
+                )
+            });
+            if overwritten && !pre_colored.contains_key(&pid) && !goto_outputs.contains(&pid) {
                 continue;
             }
             // If the pseudo is already pre-colored (ABI-pinned, or an
@@ -2759,6 +2875,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_xmm_clobber_name_every_width() {
+        for name in ["xmm3", "ymm3", "zmm3", "%xmm3", "XMM3"] {
+            assert_eq!(parse_xmm_clobber_name(name), Some(3), "{name}");
+        }
+        for name in ["xmm32", "rax", "st", "mm0", "memory"] {
+            assert_eq!(parse_xmm_clobber_name(name), None, "{name}");
+        }
+    }
+
+    #[test]
     fn parse_gp_clobber_name_leading_percent() {
         // GCC-style %rax is accepted.
         assert_eq!(parse_gp_clobber_name("%rax"), Some(Reg::Rax));
@@ -2918,6 +3044,30 @@ mod tests {
         assert!(!ra.fp_pseudos.contains(&PseudoId(2)));
         assert!(ra.ld_pseudos.contains(&PseudoId(5)));
         assert!(!ra.ld_pseudos.contains(&PseudoId(1)));
+    }
+
+    /// A register output interferes with the address of a memory output of
+    /// the same statement, even when that address dies there: the template
+    /// writes through it. It may still share with a plain input that dies.
+    #[test]
+    fn asm_register_output_interferes_with_a_memory_outputs_address() {
+        use crate::arch::regalloc::build_interference_graph;
+        use crate::ir::{BasicBlock, BasicBlockId, Function};
+        let asm = make_asm_insn(
+            &[],
+            &[("=r", PseudoId(1)), ("=m", PseudoId(2)), ("r", PseudoId(3))],
+        );
+        let types = crate::types::TypeTable::new(&crate::target::Target::host());
+        let mut func = Function::new("f", types.void_id);
+        let mut block = BasicBlock::new(BasicBlockId(0));
+        block.insns = vec![asm];
+        func.blocks.push(block);
+        let candidates = [1, 2, 3].map(PseudoId).into_iter().collect();
+        let live_out = vec![HashSet::new()];
+        let graph = build_interference_graph(&candidates, &func, &live_out, false);
+        let neighbors: Vec<PseudoId> = graph.neighbors(PseudoId(1)).collect();
+        assert!(neighbors.contains(&PseudoId(2)), "{neighbors:?}");
+        assert!(!neighbors.contains(&PseudoId(3)), "{neighbors:?}");
     }
 
     /// A `Q` operand is pinned to the first of %rax..%rdx that the statement

@@ -15,7 +15,7 @@
 
 use crate::common::{
     compile_and_dlopen, compile_and_run, compile_and_run_everywhere, compile_and_run_optimized,
-    create_c_file,
+    compile_and_run_two_units, create_c_file,
 };
 use plib::testing::run_test_base;
 use std::process::Command;
@@ -90,6 +90,86 @@ int main() {
     }
 
     let _ = std::fs::remove_file(&obj_path);
+}
+
+/// A c17 unit linked after another compiler's keeps its own abbreviation
+/// table. Its compile unit header said offset 0, which in a linked binary is
+/// the first object's table: dpkg's dselect links g++ units ahead of c17
+/// ones, and `dwz` -- and readelf -- decoded the c17 units against g++'s
+/// abbreviations ("Could not find DWARF abbreviation 105").
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_debug_info_survives_a_mixed_link() {
+    let host_cc = ["cc", "gcc"].into_iter().find(|cc| {
+        Command::new(cc)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    });
+    let Some(host_cc) = host_cc else {
+        return;
+    };
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_mixed_dwarf_")
+        .tempdir()
+        .expect("tempdir");
+    let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(
+        path("first.c"),
+        "struct pair { int a; long b; };\nint first(struct pair *p) { return p->a + (int)p->b; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        path("second.c"),
+        "int first(void *);\nint main(void) { return first(0) * 0; }\nint second(int x) { return x; }\n",
+    )
+    .unwrap();
+    let host = Command::new(host_cc)
+        .args(["-g", "-O0", "-c", "-o", &path("first.o"), &path("first.c")])
+        .output()
+        .expect("host cc");
+    assert!(
+        host.status.success(),
+        "{}",
+        String::from_utf8_lossy(&host.stderr)
+    );
+    let ours = run_test_base(
+        "c17",
+        &[
+            "-g".to_string(),
+            "-c".to_string(),
+            "-o".to_string(),
+            path("second.o"),
+            path("second.c"),
+        ],
+        &[],
+    );
+    assert!(
+        ours.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ours.stderr)
+    );
+    let link = Command::new(host_cc)
+        .args(["-o", &path("mixed"), &path("first.o"), &path("second.o")])
+        .output()
+        .expect("link");
+    assert!(
+        link.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let dump = Command::new("readelf")
+        .args(["--debug-dump=info", &path("mixed")])
+        .output()
+        .expect("readelf");
+    let stdout = String::from_utf8_lossy(&dump.stdout);
+    let stderr = String::from_utf8_lossy(&dump.stderr);
+    assert!(!stderr.contains("Warning"), "{stderr}");
+    assert!(
+        stdout.contains("DW_AT_name        : second"),
+        "the c17 unit's functions must decode:\n{stdout}"
+    );
 }
 
 // ============================================================================
@@ -1260,6 +1340,51 @@ int main(void)
     for opts in [vec![], vec!["-O2".to_string()]] {
         assert_eq!(
             compile_and_run("static_thread_local_struct_local", src, &opts),
+            0,
+            "{opts:?}"
+        );
+    }
+}
+
+/// `#pragma weak name` makes `name` a weak symbol, as the System V and
+/// gcc compilers do: a reference that no definition satisfies is a null
+/// address rather than a link error, and a definition yields to a strong one
+/// elsewhere. The pragma may come before or after the declaration.
+///
+/// binutils' libctf writes `#pragma weak ctf_open` so that its BFD-free
+/// shared library can refer to `ctf_open` without defining it; c17 ignored
+/// the pragma, so every program linked against libctf-nobfd.so (readelf
+/// first) failed with "undefined reference to `ctf_open'".
+#[test]
+fn codegen_pragma_weak() {
+    // Whether a weak reference no definition satisfies *links* is the
+    // platform linker's policy: ELF resolves it to null, Apple's ld refuses
+    // it. So that half runs off Darwin only, as for `__attribute__((weak))`
+    // in codegen::asm_attributes; the yielding definition runs everywhere.
+    let unit_a = r#"
+#ifndef __APPLE__
+#pragma weak absent_later
+int absent_before(void);
+int absent_later(void);
+#pragma weak absent_before
+#endif
+#pragma weak hook
+int hook(void) { return 1; }
+
+int main(void)
+{
+#ifndef __APPLE__
+    if (&absent_before != 0) return 1;
+    if (&absent_later != 0) return 2;
+#endif
+    if (hook() != 2) return 3;
+    return 0;
+}
+"#;
+    let unit_b = "int hook(void) { return 2; }\n";
+    for opts in [vec![], vec!["-O2".to_string()]] {
+        assert_eq!(
+            compile_and_run_two_units("pragma_weak", unit_a, unit_b, &opts),
             0,
             "{opts:?}"
         );

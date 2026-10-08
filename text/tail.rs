@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{
@@ -88,7 +89,11 @@ impl FromStr for RelativeFrom {
 /// tail - copy the last part of a file
 /// If neither -n nor -c are specified, copies the last 10 lines (-n 10).
 #[derive(Parser)]
-#[command(version, about = gettext("tail - copy the last part of a file"))]
+#[command(
+    version,
+    about = gettext("tail - copy the last part of a file"),
+    after_help = gettext("Historical forms, accepted only as the first argument: -number and +number mean -n -number and -n +number; -numberc and +numberc mean -c -number and -c +number.")
+)]
 struct Args {
     #[arg(short = 'n', long = "lines", allow_hyphen_values = true,
           help = gettext("The number of lines to print from the end of the file"))]
@@ -106,6 +111,41 @@ struct Args {
 
     #[arg(help = gettext("The file to read"))]
     file: Option<PathBuf>,
+}
+
+/// The `-n`/`-c` option and its option-argument for a historical first
+/// argument of the form `[+-]number[c]`, or `None` for any other word.
+fn historical_count(arg: &str) -> Option<(&'static str, &str)> {
+    let (option, signed_number) = match arg.strip_suffix('c') {
+        Some(rest) => ("-c", rest),
+        None => ("-n", arg),
+    };
+    let digits = signed_number
+        .strip_prefix('-')
+        .or_else(|| signed_number.strip_prefix('+'))?;
+    let is_number = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    is_number.then_some((option, signed_number))
+}
+
+/// Rewrite a historical first argument `[+-]number[c]` into `-n`/`-c` form.
+///
+/// POSIX.1-2024 tail's RATIONALE: earlier versions of the standard allowed
+/// `tail -[number][b|c|l][f] [file]` and `tail +[number][b|c|l][f] [file]`;
+/// these "are no longer specified by POSIX.1-2024, but may be present in some
+/// implementations", and OPTIONS lets '+' be recognized as an option
+/// delimiter.  Like GNU tail, only the first argument is considered, and
+/// only the subset build scripts use: no `b`, `l` or `f` suffix.
+fn expand_historical_count(argv: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut out: Vec<OsString> = argv.into_iter().collect();
+    let rewrite = out
+        .get(1)
+        .and_then(|arg| arg.to_str())
+        .and_then(historical_count)
+        .map(|(option, number)| [OsString::from(option), OsString::from(number)]);
+    if let Some(words) = rewrite {
+        out.splice(1..2, words);
+    }
+    out
 }
 
 enum BytesOrLines {
@@ -594,7 +634,7 @@ fn tail(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("tail");
 
-    let args = Args::parse();
+    let args = Args::parse_from(expand_historical_count(std::env::args_os()));
 
     let bytes_or_lines = match args.get_bytes_or_lines() {
         Ok(by) => by,

@@ -539,3 +539,28 @@ int main(void) { return SSIZE_MAX - 5; }
 "#;
     assert_eq!(compile_and_run("own_ssize_max", code, &[]), 0);
 }
+
+/// `<complex.h>` belongs to the C library, which declares more than C17 lists:
+/// glibc adds `clog10` under `_GNU_SOURCE`, which c17 predefines. The bundled
+/// header used to stand in for glibc's and hid those declarations (guile's
+/// numbers.c calls `clog10`). The C17 7.3.1 macros must still hold.
+#[cfg(target_os = "linux")]
+#[test]
+fn c99_complex_h_keeps_the_c_librarys_declarations() {
+    let code = r#"
+#include <complex.h>
+int main(void) {
+    double complex z = CMPLX(10.0, 0.0);
+    double complex l = clog10(z);
+    if (creal(l) < 0.999 || creal(l) > 1.001) return 1;
+    if (sizeof(_Complex_I) != sizeof(float complex)) return 2;
+    if (cimag(I * 3.0f) != 3.0f) return 3;
+    if (cimag(CMPLXF(0.0f, 2.0f)) != 2.0f) return 4;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("complex_h_clog10", code, &["-lm".to_string()]),
+        0
+    );
+}

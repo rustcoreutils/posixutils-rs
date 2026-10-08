@@ -779,6 +779,7 @@ fn preprocess_assembler(
         position: Default::default(),
         isa: Default::default(),
         macro_prefix_map: Default::default(),
+        collect_dependencies: false,
     };
     // A #error or a missing include makes the remaining bytes not worth
     // assembling: `as` would bury the real diagnostic under syntax errors.
@@ -786,7 +787,7 @@ fn preprocess_assembler(
         .map_err(|e| io::Error::other(e.to_string()))?;
 
     let out = dir.path().join("a.s");
-    std::fs::write(&out, &preprocessed)?;
+    std::fs::write(&out, &preprocessed.text)?;
 
     let path = out.to_string_lossy().into_owned();
     Ok(Generated { _dir: dir, path })

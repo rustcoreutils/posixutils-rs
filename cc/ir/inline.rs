@@ -60,7 +60,6 @@ const HARD_CALLER_SIZE_CAP: usize = 5000;
 /// LLVM uses 1024 bytes. We match that value.
 const RECURSIVE_CALLER_MAX_STACK: usize = 1024;
 
-const DEFAULT_CANDIDATE_CAPACITY: usize = 16;
 const DEFAULT_REMAP_CAPACITY: usize = 64;
 const DEFAULT_ORDER_CAPACITY: usize = 16;
 
@@ -174,6 +173,11 @@ pub struct InlineCandidate {
     /// be copied because it receives a non-local goto"), and neither does
     /// c17: the resume point belongs to the function's own frame.
     pub receives_nonlocal_goto: bool,
+    /// Whether the function forwards its caller's variadic arguments with
+    /// `__builtin_va_arg_pack()` or `__builtin_va_arg_pack_len()`. Such a
+    /// function has no out-of-line form -- what it forwards exists only at a
+    /// call site -- so every call must be spliced, whatever c17's own caps say.
+    pub forwards_caller_arguments: bool,
     /// Number of times this function is called in the module
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
@@ -277,6 +281,9 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
     // Check for disqualifying patterns
     for bb in &func.blocks {
         for insn in &bb.insns {
+            if insn.va_arg_pack_builtin().is_some() {
+                candidate.forwards_caller_arguments = true;
+            }
             match insn.op {
                 Opcode::VaStart => {
                     candidate.defines_varargs_frame = true;
@@ -334,6 +341,16 @@ fn should_inline(
     // assumption it always inlines, it left an undefined symbol at link.
     if candidate.cannot_be_inlined() {
         return false;
+    }
+
+    // A forwarder has no out-of-line form to call instead, so none of the
+    // caps below -- all c17's own, none gcc's -- may refuse it: a recursive
+    // caller (jansson's `do_dump` calling `snprintf`) or a huge one (bzip2's
+    // `sendMTFValues` calling `fprintf`) left the call standing and the
+    // program rejected. Its body is one call, so the stack the caps guard
+    // barely grows.
+    if candidate.forwards_caller_arguments {
+        return true;
     }
 
     // Consuming a `va_list` is safe to splice, but it is only done on request.
@@ -1706,97 +1723,9 @@ fn remove_tables_of_dead_labels(module: &mut Module, mut dead: HashSet<String>) 
 }
 
 /// Every function name something in the module still refers to.
-///
-/// Missing a kind of reference here deletes a live function, so this errs
-/// toward keeping: an identifier that merely *looks* like a function name in
-/// an assembly template counts.
 fn collect_referenced_functions(module: &Module) -> HashSet<String> {
     let func_names: HashSet<String> = module.functions.iter().map(|f| f.name.clone()).collect();
-    let mut referenced: HashSet<String> = HashSet::with_capacity(DEFAULT_CANDIDATE_CAPACITY);
-
-    for func in &module.functions {
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                match insn.op {
-                    // A direct call. An indirect one is named `<indirect>`,
-                    // so it cannot collide with a real function.
-                    Opcode::Call => {
-                        if let Some(name) = &insn.extra().func_name {
-                            if func_names.contains(name) {
-                                referenced.insert(name.clone());
-                            }
-                        }
-                    }
-                    // The funnel for every way an address is taken: `&f`,
-                    // `f` as an argument, `f == f`, a function-pointer
-                    // assignment -- and an `"i"`/`"s"` asm operand until
-                    // `asm_operand::resolve_immediates` names the function's
-                    // `Sym` directly, which the asm arm below counts.
-                    Opcode::SymAddr => {
-                        if let Some(src) = insn.src.first() {
-                            if let Some(name) = func.global_sym_name(*src) {
-                                if func_names.contains(name) {
-                                    referenced.insert(name.to_string());
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                // A name written into the assembly text itself -- `asm("call
-                // foo")` -- reaches the assembler with no IR reference at all.
-                if let Some(ref asm) = insn.extra().asm_data {
-                    collect_names_in_asm(&asm.template, &func_names, &mut referenced);
-                    for operand in &asm.inputs {
-                        if let Some(name) = func.global_sym_name(operand.pseudo) {
-                            if func_names.contains(name) {
-                                referenced.insert(name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // A function pointer in a global's initializer, e.g.
-    // `static const struct { fn_t f; } table[] = { { my_func }, ... }`.
-    for global in &module.globals {
-        collect_func_refs_from_initializer(&global.init, &func_names, &mut referenced);
-    }
-
-    // `__attribute__((alias))`: the `.set` the backend writes names the
-    // target, and a static function reached only through its alias -- the
-    // usual way to export an internal implementation under a public name --
-    // has no other reference at all.
-    for alias in &module.aliases {
-        if func_names.contains(&alias.target) {
-            referenced.insert(alias.target.clone());
-        }
-    }
-
-    referenced
-}
-
-/// Identifier-shaped words in an assembly template that name a function.
-fn collect_names_in_asm(
-    template: &str,
-    func_names: &HashSet<String>,
-    referenced: &mut HashSet<String>,
-) {
-    let mut word = String::new();
-    for ch in template.chars().chain(std::iter::once(' ')) {
-        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
-            word.push(ch);
-            continue;
-        }
-        if !word.is_empty() {
-            if func_names.contains(&word) {
-                referenced.insert(word.clone());
-            }
-            word.clear();
-        }
-    }
+    module.referenced_symbols(&func_names)
 }
 
 #[cfg(test)]
@@ -1906,6 +1835,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -1940,6 +1870,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -1992,6 +1923,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -2020,6 +1952,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -2048,6 +1981,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -2076,6 +2010,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -2096,6 +2031,42 @@ mod tests {
             &candidate_no_hint,
             opt_at(1),
             CallerSize::unchanged(100),
+            false
+        ));
+    }
+
+    /// c17's caps on the caller -- its stack in a recursive function, its
+    /// size in any -- refuse a plain `always_inline` callee, which is then an
+    /// ordinary call. A `__builtin_va_arg_pack` forwarder has no ordinary call
+    /// to fall back on, so they never refuse one; what makes a splice
+    /// impossible still does.
+    #[test]
+    fn test_forwarder_ignores_the_caller_caps() {
+        let forced = InlineCandidate {
+            estimated_size: 4,
+            is_always_inline: true,
+            ..Default::default()
+        };
+        let forwarder = InlineCandidate {
+            forwards_caller_arguments: true,
+            ..forced.clone()
+        };
+        let huge = CallerSize::unchanged(HARD_CALLER_SIZE_CAP + 1);
+        let recursive_large = CallerSize::unchanged(RECURSIVE_CALLER_MAX_STACK);
+        for opt in [opt_at(0), opt_at(2)] {
+            assert!(!should_inline(&forced, opt, huge, false));
+            assert!(!should_inline(&forced, opt, recursive_large, true));
+            assert!(should_inline(&forwarder, opt, huge, false));
+            assert!(should_inline(&forwarder, opt, recursive_large, true));
+        }
+        let noinline = InlineCandidate {
+            is_noinline: true,
+            ..forwarder
+        };
+        assert!(!should_inline(
+            &noinline,
+            opt_at(2),
+            CallerSize::unchanged(10),
             false
         ));
     }

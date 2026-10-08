@@ -36,7 +36,8 @@ pub const STDATOMIC_H: &str = include_str!("include/stdatomic.h");
 /// Builtin stdnoreturn.h - C11 _Noreturn convenience macro
 pub const STDNORETURN_H: &str = include_str!("include/stdnoreturn.h");
 
-/// Builtin complex.h - C99 complex arithmetic
+/// Builtin complex.h - C99 complex arithmetic, for a C library without one
+/// c17 can use; a hosted glibc build defers to glibc's (see its preamble).
 pub const COMPLEX_H: &str = include_str!("include/complex.h");
 
 /// Builtin iso646.h - C95/C99 alternative operator spellings

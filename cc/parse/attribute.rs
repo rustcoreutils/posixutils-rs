@@ -375,7 +375,30 @@ impl AttributeList {
             effect: self.mem_effect(),
             align: self.get_alignment().filter(|n| n.is_power_of_two()),
             noreturn: self.has_noreturn(),
+            stack_protect: self.stack_protect().unwrap_or_else(|kept| kept),
         }
+    }
+
+    /// What `stack_protect` and `no_stack_protector` in this list ask, in
+    /// either spelling; `Err` with the one kept when both are written.
+    pub fn stack_protect(
+        &self,
+    ) -> Result<crate::parse::ast::StackProtectAttr, crate::parse::ast::StackProtectAttr> {
+        use crate::parse::ast::StackProtectAttr;
+        let mut out = Ok(StackProtectAttr::Unspecified);
+        for attr in &self.attrs {
+            let this = match attr.name.trim_matches('_') {
+                "stack_protect" => StackProtectAttr::Protect,
+                "no_stack_protector" => StackProtectAttr::Exempt,
+                _ => continue,
+            };
+            let so_far = out.unwrap_or_else(|kept| kept);
+            out = match so_far.combine(this) {
+                Ok(x) if out.is_ok() => Ok(x),
+                Ok(x) | Err(x) => Err(x),
+            };
+        }
+        out
     }
 
     /// The `weak`, `used`, `section(...)`, `visibility(...)`, `alias(...)` and
@@ -1024,6 +1047,43 @@ impl Parser<'_> {
         typ
     }
 
+    /// Fold the function attributes `attrs` carries into those pending for
+    /// the declaration being parsed. Of `stack_protect` and
+    /// `no_stack_protector`, the first written wins and gcc's warning names
+    /// the other -- in the same list or another.
+    fn merge_fn_attrs(&mut self, attrs: &AttributeList, pos: Position) {
+        let fn_attrs = attrs.function_attrs(&self.types.target());
+        let in_list = attrs.stack_protect().err();
+        let across = self
+            .pending_fn_attrs
+            .stack_protect
+            .combine(fn_attrs.stack_protect)
+            .err();
+        if let Some(kept) = in_list.or(across) {
+            Self::warn_stack_protect_conflict(kept, pos);
+        }
+        self.pending_fn_attrs.merge(&fn_attrs);
+    }
+
+    /// gcc's warning for a function given both `stack_protect` and
+    /// `no_stack_protector`, which keeps `kept`.
+    pub(super) fn warn_stack_protect_conflict(
+        kept: crate::parse::ast::StackProtectAttr,
+        pos: Position,
+    ) {
+        use crate::parse::ast::StackProtectAttr;
+        let ignored = match kept {
+            StackProtectAttr::Protect => StackProtectAttr::Exempt,
+            _ => StackProtectAttr::Protect,
+        };
+        diag::group_warning_args(
+            ATTRIBUTE_WARNING,
+            pos,
+            "ignoring attribute '{0}' because it conflicts with attribute '{1}'",
+            &[ignored.name(), kept.name()],
+        );
+    }
+
     /// Hold the calling convention `attrs` names for the declarator being
     /// parsed, refusing a second one that disagrees with it -- in the same
     /// list or another -- as gcc does.
@@ -1366,8 +1426,7 @@ impl Parser<'_> {
                 self.pending_packed |= attrs.has_packed();
                 self.merge_symbol_attrs(&attrs);
                 self.merge_calling_conv(&attrs, pos);
-                let fn_attrs = attrs.function_attrs(&self.types.target());
-                self.pending_fn_attrs.merge(&fn_attrs);
+                self.merge_fn_attrs(&attrs, pos);
             } else if self.is_asm_keyword() {
                 self.parse_asm_label();
             } else if self.is_nullability_qualifier() {

@@ -580,9 +580,9 @@ fn test_macro_redefinition_conflict_detection() {
 #[test]
 fn test_replacement_lists_ignore_leading_whitespace() {
     // Whitespace before the first replacement token is not a separation
-    // *within* the list. Without this, every compilation against glibc
-    // warned: we predefine __GLIBC__ with no leading space, while
-    // features.h writes `#define __GLIBC__ 2` with one.
+    // *within* the list. Without this, a predefined macro (spelled with no
+    // leading space) that a header redefines as `#define NAME 2`, with one,
+    // was reported as a conflicting redefinition.
     let a = vec![MacroToken {
         typ: TokenType::Number,
         value: MacroTokenValue::Number("2".into()),
@@ -1910,8 +1910,8 @@ fn test_pragma_operator_destringify() {
 // The search chain: `-I`, then the bundled headers, then the system
 // directories, with `#include_next` resuming just past the current file.
 
-/// A temporary tree of headers: `q` stands for a `-I` directory, `sys` for a
-/// system one, and each file is written as given.
+/// A temporary tree of headers: `iq` stands for a `-iquote` directory, `q`
+/// for a `-I` one, `sys` for a system one, and each file is written as given.
 struct SearchTree {
     dir: plib::tmp::TempDir,
 }
@@ -1922,7 +1922,7 @@ impl SearchTree {
             .prefix("c17_search_chain_")
             .tempdir()
             .unwrap();
-        for sub in ["q", "sys"] {
+        for sub in ["iq", "q", "sys"] {
             std::fs::create_dir(dir.path().join(sub)).unwrap();
         }
         for (path, text) in files {
@@ -1935,15 +1935,17 @@ impl SearchTree {
         self.dir.path().join(sub).to_string_lossy().into_owned()
     }
 
-    /// Preprocess `input` with `q` as the only `-I` directory and `sys` as the
-    /// only system directory, returning the token spellings and the headers
-    /// depended on.
+    /// Preprocess `input` with `iq` as the only `-iquote` directory, `q` as the
+    /// only `-I` directory and `sys` as the only system directory, returning
+    /// the token spellings and the headers depended on.
     fn preprocess(&self, input: &str) -> (Vec<String>, Vec<(PathBuf, bool)>) {
+        let iquote = [self.path("iq")];
         let include_paths = [self.path("q")];
         let isystem = [self.path("sys")];
         let config = PreprocessConfig {
             include_paths: &include_paths,
             search: SystemSearch {
+                iquote: &iquote,
                 isystem: &isystem,
                 no_std_inc: true,
                 ..Default::default()
@@ -1959,12 +1961,44 @@ impl SearchTree {
     }
 }
 
+/// A `.S` is preprocessed like C, so it reports the headers it read when asked
+/// (the `-M` family) and nothing when not.
+#[test]
+fn test_assembly_collects_dependencies_when_asked() {
+    let tree = SearchTree::new(&[("q/regs.h", "#define RET ret\n")]);
+    let include_paths = [tree.path("q")];
+    let run = |collect_dependencies| {
+        let config = AsmPreprocessConfig {
+            include_paths: &include_paths,
+            collect_dependencies,
+            ..Default::default()
+        };
+        preprocess_asm_file(
+            b"#include \"regs.h\"\n\tRET\n",
+            &Target::host(),
+            "t.S",
+            &config,
+        )
+        .expect("preprocesses")
+    };
+    let asked = run(true);
+    assert_eq!(asked.dependencies.len(), 1, "{:?}", asked.dependencies);
+    assert!(asked.dependencies[0].0.ends_with("regs.h"));
+    assert!(String::from_utf8_lossy(&asked.text).contains("ret"));
+    assert!(run(false).dependencies.is_empty());
+}
+
 #[test]
 fn test_search_pos_order_is_the_search_order() {
+    assert!(SearchPos::IQuote(7) < SearchPos::Quote(0));
     assert!(SearchPos::Quote(7) < SearchPos::Bundled);
     assert!(SearchPos::Bundled < SearchPos::System(0));
     assert!(SearchPos::System(0) < SearchPos::System(1));
-    assert_eq!(SearchPos::after(None), SearchPos::Quote(0));
+    assert_eq!(SearchPos::after(None), SearchPos::IQuote(0));
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::IQuote(0))),
+        SearchPos::IQuote(1)
+    );
     assert_eq!(
         SearchPos::after(Some(SearchPos::Quote(2))),
         SearchPos::Quote(3)
@@ -1977,6 +2011,65 @@ fn test_search_pos_order_is_the_search_order() {
         SearchPos::after(Some(SearchPos::System(4))),
         SearchPos::System(5)
     );
+}
+
+/// `-dD`: each `#define` and `#undef` that takes effect travels in the
+/// output as its own text, where it stood, and the definitions in force
+/// before the source come back separately.
+#[test]
+fn test_keep_definitions_carries_the_directives() {
+    let input = "#define A  1\nA\n#undef A\n#if 0\n#define B 2\n#endif\n#define F(x) ( x+1 )\n";
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let config = PreprocessConfig {
+        keep_definitions: true,
+        defines: &["CMD=7".to_string()],
+        ..Default::default()
+    };
+    let (out, outcome) =
+        preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+    let carried: Vec<String> = out.iter().filter_map(pragma_text).collect();
+    assert_eq!(carried, ["#define A 1", "#undef A", "#define F(x) ( x+1 )"]);
+    assert!(get_token_strings(&out, &idents).contains(&"1".to_string()));
+    for want in ["#define __STDC__ 1", "#define CMD 7"] {
+        assert!(
+            outcome.initial_definitions.iter().any(|d| d == want),
+            "{want}: {:?}",
+            outcome.initial_definitions
+        );
+    }
+
+    // Without the option, nothing is carried and nothing collected.
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let (out, outcome) = preprocess_collecting(
+        tokens,
+        &Target::host(),
+        &mut idents,
+        "<test>",
+        &PreprocessConfig::default(),
+    );
+    assert!(out.iter().all(|t| pragma_text(t).is_none()));
+    assert!(outcome.initial_definitions.is_empty());
+}
+
+/// `-iquote` directories are searched for the `"..."` form only, after the
+/// including file's own directory and ahead of `-I`; `#include_next` from a
+/// header found there goes on to the rest of the chain.
+#[test]
+fn test_iquote_serves_quote_includes_only() {
+    let tree = SearchTree::new(&[
+        ("iq/h.h", "#define WHERE iquote\n"),
+        ("q/h.h", "#define WHERE dash_i\n"),
+        ("iq/n.h", "#include_next \"n.h\"\nFIRST\n"),
+        ("q/n.h", "SECOND\n"),
+    ]);
+    let (strs, deps) = tree.preprocess("#include \"h.h\"\nWHERE");
+    assert_eq!(strs, ["iquote"]);
+    assert_eq!(deps, [(Path::new(&tree.path("iq")).join("h.h"), false)]);
+    let (strs, _) = tree.preprocess("#include <h.h>\nWHERE");
+    assert_eq!(strs, ["dash_i"]);
+    let (strs, _) = tree.preprocess("#include \"n.h\"\n");
+    assert_eq!(strs, ["SECOND", "FIRST"]);
 }
 
 /// The bundled <limits.h> forwards to the system's, which, like glibc's, would
@@ -2248,6 +2341,52 @@ fn test_line_directive_maps_token_positions() {
     assert_eq!(crate::diag::stream_name(b.pos.stream), "renamed.c");
 }
 
+/// Conditional directives inside a function-like macro's arguments are
+/// obeyed, as gcc does (C17 6.10.3p11 leaves it undefined): binutils'
+/// elfnn-aarch64.c picks a `HOWTO` argument with `#if ARCH_SIZE == 64`. What
+/// a skipped group holds -- commas, parentheses -- is not part of the call.
+#[test]
+fn test_conditionals_inside_macro_arguments() {
+    let (tokens, idents) = preprocess_str(
+        "#define H(a, b, c) [a b c]\n\
+         #define BIG 1\n\
+         H(1,\n\
+         #if BIG\n\
+         2,\n\
+         #else\n\
+         3, ) (,\n\
+         #endif\n\
+         4)\n\
+         H(5,\n\
+         #ifdef NOPE\n\
+         6,\n\
+         #elif 1\n\
+         7,\n\
+         #endif\n\
+         8)\n",
+    );
+    assert_eq!(
+        get_token_strings(&tokens, &idents),
+        ["[", "1", "2", "4", "]", "[", "5", "7", "8", "]"]
+    );
+}
+
+/// `#pragma weak NAME` names a weak symbol, in either spelling; the alias
+/// form and anything malformed name none.
+#[test]
+fn test_pragma_weak_names() {
+    let (tokens, _) = preprocess_str(
+        "#pragma weak ctf_open\n\
+         int a;\n\
+         _Pragma(\"weak late_one\")\n\
+         #pragma weak alias = target\n\
+         #pragma weak\n\
+         #pragma weak 3x\n\
+         #pragma GCC weak nope\n",
+    );
+    assert_eq!(pragma_weak_names(&tokens), ["ctf_open", "late_one"]);
+}
+
 /// `#pragma scalar_storage_order` reaches the parser as a layout marker, in
 /// either spelling, and a body naming no order is dropped with a warning.
 #[test]
@@ -2437,4 +2576,107 @@ fn test_if_shift_values_match_gcc() {
         let (tokens, idents) = preprocess_str(&format!("#if {cond}\nyes\n#else\nno\n#endif\n"));
         assert_eq!(get_token_strings(&tokens, &idents), ["yes"], "#if {cond}");
     }
+}
+
+/// A substituted argument is spaced as its parameter was in the body: the
+/// first token of `-1` stands where `a` stood in `x - a`, after a space.
+/// Without it, `-E` printed `x --1` and re-lexing changed the program;
+/// libffi's `.org BASE + X * 8` came out as `.org.Lstore_table`.
+#[test]
+fn test_argument_takes_its_parameters_leading_space() {
+    for (src, want) in [
+        ("#define F(a) x - a\nF(-1)\n", &[true, true, false][..]),
+        ("#define F(a) x -a\nF( -1)\n", &[true, false, false]),
+        ("#define P(a) x - a ## b\nP(y)\n", &[true, true]),
+    ] {
+        let (tokens, _) = preprocess_str(src);
+        let spacing: Vec<bool> = tokens
+            .iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .skip(1)
+            .map(|t| t.pos.whitespace)
+            .collect();
+        assert_eq!(spacing, want, "{src:?}");
+    }
+}
+
+/// A bundled header keeps its name for diagnostics, but a line marker names
+/// it as gcc names compiler-supplied text; real files pass through.
+#[test]
+fn test_bundled_header_marker_is_built_in() {
+    let stream = bundled_header_stream("stdarg.h");
+    assert_eq!(stream, "<builtin:stdarg.h>");
+    assert_eq!(marker_file_name(&stream), "<built-in>");
+    assert_eq!(
+        marker_file_name("/usr/include/stdio.h"),
+        "/usr/include/stdio.h"
+    );
+    assert_eq!(marker_file_name("<stdin>"), "<stdin>");
+}
+
+/// POSIX c17: "-D has lower precedence than -U ... name shall be undefined
+/// regardless of the order of the options". A `-D` of a name some `-U` also
+/// names is therefore never applied -- and so never diagnosed as redefining
+/// another `-D` of it. zstd passes `-DZSTD_LEGACY_SUPPORT=5
+/// -UZSTD_LEGACY_SUPPORT -DZSTD_LEGACY_SUPPORT=0` under `-Werror`.
+#[test]
+fn test_cmdline_define_of_an_undefined_name_is_not_applied() {
+    let input = "X Y F(2)\n";
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let defines = ["X=5", "X=0", "Y=1", "Y=2", "F(a)=a+1", "F(a)=a+2"].map(String::from);
+    let undefines = ["X", "F"].map(String::from);
+    let config = PreprocessConfig {
+        defines: &defines,
+        undefines: &undefines,
+        ..Default::default()
+    };
+    let warnings = crate::diag::warning_count();
+    let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+    // Y's two definitions differ and no -U names it: that one is reported.
+    assert_eq!(crate::diag::warning_count(), warnings + 1);
+    assert_eq!(
+        get_token_strings(&out, &idents),
+        ["X", "2", "F", "(", "2", ")"]
+    );
+}
+
+/// Run `input` through the preprocessor with these `-U` options, returning
+/// the output and how many errors and warnings it raised.
+fn preprocess_with_undefines(input: &str, undefines: &[&str]) -> (Vec<String>, u32, u32) {
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let defines = ["X=1".to_string()];
+    let undefines: Vec<String> = undefines.iter().map(|u| u.to_string()).collect();
+    let config = PreprocessConfig {
+        defines: &defines,
+        undefines: &undefines,
+        ..Default::default()
+    };
+    let (errors, warnings) = (crate::diag::error_count(), crate::diag::warning_count());
+    let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+    (
+        get_token_strings(&out, &idents),
+        crate::diag::error_count() - errors,
+        crate::diag::warning_count() - warnings,
+    )
+}
+
+/// A `-U` operand is the operand of an `#undef`, checked as `-D`'s is: a
+/// name that is not an identifier is an error, trailing tokens a warning,
+/// as in gcc. `-U 1x` was silently ignored.
+#[test]
+fn test_cmdline_undefine_name_must_be_an_identifier() {
+    for bad in ["1x", "-UX", "", "defined"] {
+        let (out, errors, _) = preprocess_with_undefines("X\n", &[bad]);
+        assert_eq!(errors, 1, "-U {bad:?}");
+        assert_eq!(out, ["1"], "-U {bad:?} undefines nothing");
+    }
+    // `-U a-b` is `#undef a-b`: `a` is undefined, and `-b` is extra.
+    let (out, errors, warnings) = preprocess_with_undefines("X\n", &["X-b"]);
+    assert_eq!((errors, warnings), (0, 1));
+    assert_eq!(out, ["X"]);
+    let (out, errors, warnings) = preprocess_with_undefines("X\n", &["X"]);
+    assert_eq!((errors, warnings), (0, 0));
+    assert_eq!(out, ["X"]);
 }

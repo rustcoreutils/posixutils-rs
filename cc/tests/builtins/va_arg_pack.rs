@@ -185,3 +185,140 @@ int main(void) { return wrap("%d-%d", 42, 7) == 104 ? 0 : 1; }
     assert_eq!(compile_and_run("va_pack_alloca", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("va_pack_alloca_opt", code), 0);
 }
+
+/// A forwarder whose body calls the library through a second declaration
+/// with the same assembler name: glibc's `open` in `bits/fcntl2.h` calls
+/// `__open_alias`, and `error` in `bits/error.h` calls `__error_alias`, each
+/// `__REDIRECT`ed to the very symbol the wrapper itself is labelled with.
+/// The alias is a different function -- the library's -- so the call is not
+/// recursion, and gcc inlines the wrapper.
+#[test]
+fn builtins_va_arg_pack_forwarder_calls_its_own_assembler_name() {
+    let code = r#"
+#define STR2(x) #x
+#define STR(x) STR2(x)
+#define ASMNAME(cname) __asm__(STR(__USER_LABEL_PREFIX__) cname)
+typedef __SIZE_TYPE__ size_t;
+
+extern int fmt(char *, size_t, const char *, ...) ASMNAME("snprintf");
+extern int fmt_alias(char *, size_t, const char *, ...) ASMNAME("snprintf");
+
+extern __inline __attribute__((__always_inline__, __gnu_inline__, __artificial__)) int
+fmt(char *d, size_t n, const char *f, ...)
+{
+    if (__builtin_va_arg_pack_len() > 2)
+        return -1;
+    return fmt_alias(d, n, f, __builtin_va_arg_pack());
+}
+
+int main(void)
+{
+    char b[32];
+    if (fmt(b, sizeof b, "%d-%s", 42, "x") != 4)
+        return 1;
+    if (b[0] != '4' || b[3] != 'x')
+        return 2;
+    if (fmt(b, sizeof b, "%d%d%d", 1, 2, 3) != -1)
+        return 3;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("va_pack_own_asm_name", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// The forwarding wrapper and the program around it, with `body` -- straight
+/// line code of whatever size a test needs -- in `caller`, which also calls
+/// the wrapper once. `seen` adds up the first argument each forwarded call
+/// delivers.
+fn forwarding_program(caller: &str) -> String {
+    format!(
+        r#"
+#include <stdarg.h>
+static int seen;
+static int target(const char *f, ...) {{
+    va_list ap;
+    va_start(ap, f);
+    seen += va_arg(ap, int);
+    va_end(ap);
+    return 0;
+}}
+
+__attribute__((always_inline)) static inline int wrap(const char *f, ...) {{
+    return target(f, __builtin_va_arg_pack());
+}}
+
+volatile int vals[8] = {{1, 2, 3, 4, 5, 6, 7, 8}};
+{caller}
+"#
+    )
+}
+
+/// `count` statements of straight-line code, each a few instructions.
+fn straight_line(count: usize) -> String {
+    (0..count)
+        .map(|i| format!("    acc += vals[{}] * {i};\n", i % 8))
+        .collect()
+}
+
+/// A recursive caller of any size still inlines a forwarder, which has no
+/// out-of-line form to call instead: c17's stack-depth cap on inlining into a
+/// recursive function does not apply. jansson's `do_dump` calls `snprintf`,
+/// isl's `print_help` calls `printf`, and gcc inlines both.
+#[test]
+fn builtins_va_arg_pack_forwarder_in_large_recursive_caller() {
+    let code = forwarding_program(&format!(
+        r#"
+static long walk(int n) {{
+    long acc = 0;
+{}
+    wrap("%d", n);
+    if (n > 0)
+        acc += walk(n - 1);
+    return acc;
+}}
+
+int main(void) {{
+    walk(3);
+    return seen == 6 ? 0 : 1;
+}}
+"#,
+        straight_line(64)
+    ));
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("va_pack_recursive_caller", &code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// A caller past c17's own size cap on inlining -- bzip2's `sendMTFValues`,
+/// mpfr's test `main`s -- still inlines a forwarder. gcc has no such cap.
+#[test]
+fn builtins_va_arg_pack_forwarder_in_huge_caller() {
+    let code = forwarding_program(&format!(
+        r#"
+int main(void) {{
+    long acc = 0;
+{}
+    wrap("%d", 5);
+    return seen == 5 && acc != 0 ? 0 : 1;
+}}
+"#,
+        straight_line(1600)
+    ));
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("va_pack_huge_caller", &code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

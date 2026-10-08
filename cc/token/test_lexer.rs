@@ -1625,3 +1625,66 @@ fn test_unterminated_literals_are_marked_and_spelled_as_written() {
     assert!(lines.is_empty(), "{lines:?}");
     assert!(tokens[1..4].iter().all(|t| !t.is_unterminated_literal()));
 }
+
+/// Two spellings written side by side merge exactly when the lexer would
+/// read them back as something else: the first token grows (maximal munch),
+/// or the pair opens a comment.
+#[test]
+fn test_spellings_merge_is_the_lexers_answer() {
+    for (left, right) in [
+        ("-", "-"),
+        ("-", ">"),
+        ("-", "-1"),
+        ("+", "+="),
+        ("<", "<="),
+        ("<", ":"),
+        ("%", ":"),
+        ("%:", "%:"),
+        ("&", "&"),
+        ("|", "|"),
+        ("=", "="),
+        ("!", "="),
+        (".", "."),
+        (".", "5"),
+        ("/", "/"),
+        ("/", "*"),
+        ("#", "#"),
+        ("x", "y"),
+        ("x", "1"),
+        ("x", "$"),
+        ("1", "x"),
+        ("1", "2"),
+        ("1", "."),
+        ("1e", "+"),
+        ("0x1p", "-1"),
+        (".5", "e"),
+        ("L", "\"s\""),
+        ("u8", "'c'"),
+        ("U", "\"s\""),
+    ] {
+        assert!(spellings_merge(left, right), "{left:?} {right:?}");
+    }
+    for (left, right) in [
+        ("-", "1"),
+        ("+", "-"),
+        (")", "("),
+        ("x", "("),
+        ("x", "."),
+        ("x", "\"s\""),
+        ("1", "+"),
+        ("1", ")"),
+        ("\"s\"", "x"),
+        ("'c'", "1"),
+        ("->", ">"),
+        ("...", "."),
+        (">>=", "="),
+        ("(", "%"),
+        ("%", "eax"),
+        ("*", "/"),
+        (":", ":"),
+        ("", "x"),
+        ("x", ""),
+    ] {
+        assert!(!spellings_merge(left, right), "{left:?} {right:?}");
+    }
+}

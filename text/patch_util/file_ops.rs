@@ -9,11 +9,13 @@
 
 //! File operations for the patch utility.
 
-use super::types::{FilePatch, Hunk, LineOp, PatchConfig, PatchError};
+use super::bytes;
+use super::types::{BackupName, FilePatch, Hunk, LineOp, PatchConfig, PatchError, RejectFile};
 use gettextrs::gettext;
 use plib::io::{open_terminal_input, open_terminal_output};
 use std::{
     collections::HashSet,
+    fmt::{self, Write as _},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufWriter, Write},
     path::{Component, Path, PathBuf},
@@ -46,13 +48,9 @@ pub fn determine_target_file(
             continue;
         }
 
-        let stripped = strip_path(candidate, strip);
-        if !is_safe_patch_path(&stripped) {
-            warn_dangerous_name(&stripped);
+        let Some(path) = safe_patch_path(candidate, strip) else {
             continue;
-        }
-        let path = PathBuf::from(&stripped);
-
+        };
         if path.exists() {
             return Ok(path);
         }
@@ -62,24 +60,19 @@ pub fn determine_target_file(
     // returns a name without first checking that it exists, so it is also the
     // one that would happily create a file -- and, via write_output's
     // create_dir_all, a whole directory tree -- wherever the patch says.
-    if patch.is_new_file {
+    if patch.creates_file() {
         if let Some(ref new_path) = patch.new_path {
             if new_path != "/dev/null" {
-                let stripped = strip_path(new_path, strip);
-                if !is_safe_patch_path(&stripped) {
-                    warn_dangerous_name(&stripped);
-                    return Err(PatchError::NoTargetFile);
-                }
-                return Ok(PathBuf::from(stripped));
+                return safe_patch_path(new_path, strip).ok_or(PatchError::NoTargetFile);
             }
         }
     }
 
     // Filename Determination step 5: prompt the user on the controlling
-    // terminal for a filename. -f means "do not ask any questions", and if no
-    // terminal is available or the response is empty, give up and skip the
-    // patch.
-    if !config.force {
+    // terminal for a filename. -f and -t mean "do not ask any questions", and
+    // if no terminal is available or the response is empty, give up and skip
+    // the patch.
+    if !config.force && !config.batch {
         if let Some(name) = prompt_for_filename() {
             let trimmed = name.trim();
             if !trimmed.is_empty() {
@@ -103,8 +96,8 @@ pub fn determine_target_file(
 /// `is_absolute`; on Windows `/etc/passwd` (rooted on the current drive) and
 /// `C:file` (relative to that drive's own current directory) are not
 /// `is_absolute`, yet reach outside the directory just the same.
-fn is_safe_patch_path(path: &str) -> bool {
-    !Path::new(path).components().any(|c| {
+fn is_safe_patch_path(path: &Path) -> bool {
+    !path.components().any(|c| {
         matches!(
             c,
             Component::Prefix(_) | Component::RootDir | Component::ParentDir
@@ -112,12 +105,24 @@ fn is_safe_patch_path(path: &str) -> bool {
     })
 }
 
+/// The path a file name from the patch names after stripping, or None (with a
+/// warning) if it may not be written.
+fn safe_patch_path(name: &str, strip: Option<usize>) -> Option<PathBuf> {
+    let path = bytes::to_path(&strip_path(name, strip));
+    if is_safe_patch_path(&path) {
+        Some(path)
+    } else {
+        warn_dangerous_name(&path);
+        None
+    }
+}
+
 /// Report a refused file name, in the same terms GNU patch uses.
-fn warn_dangerous_name(name: &str) {
+fn warn_dangerous_name(name: &Path) {
     eprintln!(
         "patch: {}: {}",
         gettext("ignoring potentially dangerous file name"),
-        name
+        name.display()
     );
 }
 
@@ -209,7 +214,7 @@ fn collapse_slashes(path: &str) -> String {
 /// trailing newline (false for an empty file). Optimized to read the entire
 /// file at once and split, avoiding per-line allocations and system calls.
 pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
-    let content = fs::read_to_string(path)?;
+    let content = bytes::decode(&fs::read(path)?);
     let trailing_newline = content.ends_with('\n');
     // Keeping any '\r' as part of the line makes the round trip through
     // write_output lossless for a CRLF file, and makes a patch written against
@@ -223,19 +228,38 @@ pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
     Ok((lines, trailing_newline))
 }
 
-/// Back up a file with the .orig suffix, but only the first time it is seen in
-/// this run (tracked via `backed_up`). This preserves the true original across
-/// a multi-patch run rather than overwriting it with an intermediate version.
-fn backup_once(path: &Path, backed_up: &mut HashSet<PathBuf>) -> io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
+/// Back up a file under the name `naming` gives it, but only the first time it
+/// is seen in this run (tracked via `backed_up`). This preserves the true
+/// original across a multi-patch run rather than overwriting it with an
+/// intermediate version.
+///
+/// A file the patch is about to create has no original, so its backup is an
+/// empty file, as GNU patch makes one. That placeholder is what dpkg-source
+/// (and quilt) read as "this file did not exist": restoring a patch deletes
+/// any file whose backup is empty, and a 1.0 source package's unpack removes
+/// FILE.dpkg-orig for every file its diff touches, failing if one is missing.
+/// The backup name may lead into directories that do not exist yet (-B
+/// .pc/NAME/); they are created.
+fn backup_once(
+    path: &Path,
+    naming: &BackupName,
+    backed_up: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
     let key = path.to_path_buf();
     if backed_up.contains(&key) {
         return Ok(());
     }
-    let backup_path = format!("{}.orig", path.display());
-    fs::copy(path, &backup_path)?;
+    let backup_path = naming.for_file(path);
+    if let Some(parent) = backup_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    if path.exists() {
+        fs::copy(path, &backup_path)?;
+    } else {
+        File::create(&backup_path)?;
+    }
     backed_up.insert(key);
     Ok(())
 }
@@ -247,13 +271,35 @@ pub fn delete_target(
     config: &PatchConfig,
     backed_up: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
-    if config.backup {
-        backup_once(target, backed_up)?;
+    if let Some(naming) = &config.backup {
+        backup_once(target, naming, backed_up)?;
     }
     if target.exists() {
         fs::remove_file(target)?;
+        prune_empty_parents(target);
     }
     Ok(())
+}
+
+/// Remove the directories a removed file leaves empty, innermost first, as
+/// GNU patch does; stop at the first that is not empty. Only a relative name
+/// is pruned, and only below the working directory: an absolute name is the
+/// user's own operand, and the directories above it are none of patch's
+/// business.
+fn prune_empty_parents(removed: &Path) {
+    if !removed
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return;
+    }
+    let mut dir = removed.parent();
+    while let Some(d) = dir {
+        if d.as_os_str().is_empty() || d == Path::new(".") || fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
 }
 
 /// Write content to the output file, handling backup if needed.
@@ -276,12 +322,8 @@ pub fn write_output(
     let output_path = config.output_file.as_deref().unwrap_or(target);
 
     // Handle backup (-b option) once per file.
-    if config.backup {
-        if config.output_file.is_some() {
-            backup_once(output_path, backed_up)?;
-        } else {
-            backup_once(target, backed_up)?;
-        }
+    if let Some(naming) = &config.backup {
+        backup_once(output_path, naming, backed_up)?;
     }
 
     // Create parent directories if needed
@@ -306,10 +348,9 @@ pub fn write_output(
     let mut writer = BufWriter::new(file);
     let last = content.len().saturating_sub(1);
     for (i, line) in content.iter().enumerate() {
-        if i == last && no_trailing_newline {
-            write!(writer, "{}", line)?;
-        } else {
-            writeln!(writer, "{}", line)?;
+        writer.write_all(&bytes::encode(line))?;
+        if i != last || !no_trailing_newline {
+            writer.write_all(b"\n")?;
         }
     }
     writer.flush()?;
@@ -329,10 +370,11 @@ pub fn write_rejects(
     }
 
     // Determine reject file path
-    let reject_path = config
-        .reject_file
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(format!("{}.rej", target.display())));
+    let reject_path = match &config.reject_file {
+        Some(RejectFile::Discard) => return Ok(()),
+        Some(RejectFile::Path(path)) => path.clone(),
+        None => bytes::with_suffix(target, ".rej"),
+    };
 
     // POSIX: rejected hunks are *appended* to the reject file. With -r, or with
     // two patch sections naming the same file, truncating per section would
@@ -344,34 +386,36 @@ pub fn write_rejects(
     };
     written_rejects.insert(reject_path);
 
-    let mut writer = BufWriter::new(file);
-
     // Name the file each group of rejects belongs to, so an aggregated reject
     // file stays attributable. The header is context-style to match the hunks
     // below it: a unified-style "--- "/"+++ " pair would make the reject file
     // read as a unified diff that then contains no hunks at all.
-    writeln!(writer, "*** {}", target.display())?;
-    writeln!(writer, "--- {}", target.display())?;
+    let name = bytes::from_path(target);
+    let mut text = format!("*** {}\n--- {}\n", name, name);
 
     // Write rejects in context diff format per POSIX
     // (even if input was unified, rejects should be in context format)
     for (_hunk_num, hunk, _reason) in rejects {
-        write_hunk_as_context(&mut writer, hunk)?;
+        write_hunk_as_context(&mut text, hunk).map_err(io::Error::other)?;
     }
+    let mut writer = BufWriter::new(file);
+    writer.write_all(&bytes::encode(&text))?;
     writer.flush()?;
 
     Ok(())
 }
 
-/// Write a hunk in context diff format.
-fn write_hunk_as_context<W: Write>(writer: &mut W, hunk: &Hunk) -> io::Result<()> {
+/// Write a hunk in context diff format, as patch text.
+fn write_hunk_as_context(writer: &mut String, hunk: &Hunk) -> fmt::Result {
     // Write separator
     writeln!(writer, "***************")?;
 
     // Write old section header. A zero-count side is normalized to the line
     // before which the change goes; a context diff spells it as the line after
     // which, so convert back.
-    let old_end = hunk.old_start + hunk.old_count.saturating_sub(1);
+    let old_end = hunk
+        .old_start
+        .saturating_add(hunk.old_count.saturating_sub(1));
     if hunk.old_count == 0 {
         writeln!(writer, "*** {} ****", hunk.old_start.saturating_sub(1))?;
     } else {
@@ -388,7 +432,9 @@ fn write_hunk_as_context<W: Write>(writer: &mut W, hunk: &Hunk) -> io::Result<()
     }
 
     // Write new section header
-    let new_end = hunk.new_start + hunk.new_count.saturating_sub(1);
+    let new_end = hunk
+        .new_start
+        .saturating_add(hunk.new_count.saturating_sub(1));
     if hunk.new_count == 0 {
         writeln!(writer, "--- {} ----", hunk.new_start.saturating_sub(1))?;
     } else {

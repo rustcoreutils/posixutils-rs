@@ -118,7 +118,7 @@ pub(super) fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) ->
         body,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     }
@@ -150,7 +150,7 @@ fn test_parameter_stored_to_local() {
         body: Stmt::Return(Some(Expr::var_typed(x_sym, int_type))),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -208,7 +208,7 @@ fn test_function_with_many_params() {
         ))),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -426,7 +426,7 @@ fn test_linearize_function_with_params() {
         ))),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -630,7 +630,7 @@ fn test_local_var_emits_load_store() {
         ]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -709,7 +709,7 @@ fn test_ssa_converts_local_to_phi() {
         ]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -778,7 +778,7 @@ fn test_ssa_loop_variable() {
         ]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -836,7 +836,7 @@ fn test_short_circuit_and() {
         ))),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -900,7 +900,7 @@ fn test_short_circuit_or() {
         ))),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -975,7 +975,7 @@ fn test_ternary_pure_uses_select() {
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1057,7 +1057,7 @@ fn test_ternary_impure_uses_phi() {
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1149,7 +1149,7 @@ fn test_ternary_with_assignment_uses_phi() {
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1226,7 +1226,7 @@ fn test_ternary_with_post_increment_uses_phi() {
         body: Stmt::Return(Some(ternary)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1357,7 +1357,7 @@ fn test_incomplete_struct_type_resolution() {
         })]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1695,6 +1695,40 @@ fn test_static_definition_after_gnu_inline_body() {
     }
 }
 
+/// Whether a definition is emitted, and with which linkage, follows from its
+/// own specifiers whatever it returns. The storage class was read off the
+/// return type, and a struct specifier names the tag's one shared type, which
+/// carries none: a gnu_inline `extern inline` returning a struct, a pointer
+/// to one or a typedef of one lost its `extern` and was emitted -- glibc's
+/// `__cmsg_nxthdr`, defined in every object that includes `<sys/socket.h>`.
+#[test]
+fn test_function_storage_class_is_the_definitions_own() {
+    const GNU: &str = "__attribute__((gnu_inline))";
+    // (specifiers, emitted, local)
+    let cases: [(String, bool, bool); 5] = [
+        (format!("extern inline {GNU}"), false, false),
+        (format!("inline {GNU}"), true, false),
+        ("extern inline".to_string(), true, false),
+        ("inline".to_string(), false, false),
+        ("static inline".to_string(), true, true),
+    ];
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    for ret in ["int", "int *", "struct S", "struct S *", "T", "T *"] {
+        for (specs, emitted, local) in &cases {
+            let src = format!(
+                "struct S {{ int b; }};\ntypedef struct S T;\n\
+                 {specs} {ret} f(void) {{ {ret} r = {{0}}; return r; }}\n\
+                 {ret} (*use)(void) = f;\n"
+            );
+            let module = linearize_source(&src, &target);
+            let found: Vec<&Function> = module.functions.iter().filter(|f| f.name == "f").collect();
+            assert_eq!(found.len(), 1, "{src}");
+            assert_eq!(found[0].emit, *emitted, "emitted: {src}");
+            assert_eq!(found[0].is_static, *local, "local: {src}");
+        }
+    }
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.
@@ -1966,4 +2000,28 @@ fn test_label_difference_initializers() {
         let f = module.functions.iter().find(|f| f.name == "f").unwrap();
         assert!(f.saves_label_in_static, "{arch}: `f` saves its labels");
     }
+}
+
+/// A function's `stack_protect` / `no_stack_protector` reaches its IR, where
+/// the back end decides about the canary after inlining.
+#[test]
+fn test_stack_protect_attribute_reaches_the_function() {
+    use crate::parse::ast::StackProtectAttr;
+    let module = linearize_source(
+        "__attribute__((stack_protect)) int p(void) { return 0; }\n\
+         __attribute__((no_stack_protector)) int n(void) { return 0; }\n\
+         int d(void) { return 0; }\n",
+        &Target::host(),
+    );
+    let attr = |name: &str| {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap()
+            .stack_protect
+    };
+    assert_eq!(attr("p"), StackProtectAttr::Protect);
+    assert_eq!(attr("n"), StackProtectAttr::Exempt);
+    assert_eq!(attr("d"), StackProtectAttr::Unspecified);
 }

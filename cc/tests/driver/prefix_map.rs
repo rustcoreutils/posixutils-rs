@@ -86,6 +86,48 @@ fn prefix_map_debug_maps_comp_dir_name_and_file_directives() {
     assert!(!asm.contains(d), "the build directory leaked:\n{asm}");
 }
 
+/// gcc's driver takes `--NAME=VALUE` for `-fNAME=VALUE`, and gmp passes the
+/// prefix maps that way when it assembles its `.s` files: c17 stopped with
+/// clap's `unexpected argument '--debug-prefix-map'`.
+#[test]
+fn prefix_map_two_dash_spellings() {
+    let (_g, dir) = scratch("two_dash", PLAIN);
+    let d = dir.to_str().unwrap();
+    let asm = asm_in(&dir, &["-g", &format!("--debug-prefix-map={d}=/X")]);
+    assert!(asm.contains(".file 1 \"/X/t.c\""), "{asm}");
+    assert!(!asm.contains(d), "the build directory leaked:\n{asm}");
+
+    let (_g2, dir2) = scratch("two_dash_macro", PRINT_FILE);
+    let d2 = dir2.to_str().unwrap();
+    for flag in ["--macro-prefix-map", "--file-prefix-map"] {
+        let out = run_in(&dir2, &[&format!("{flag}={d2}=/M")]);
+        assert_eq!(out, "/M/t.c\n/M/t.c\n", "{flag}");
+    }
+
+    // gmp's case: an assembler operand, built with -g.
+    std::fs::write(dir.join("a.s"), ".text\n.globl f\nf:\n\tret\n").unwrap();
+    let r = c17_in(
+        &dir,
+        &[
+            "-c",
+            "-g",
+            &format!("--debug-prefix-map={d}=."),
+            "-o",
+            "a.o",
+            "a.s",
+        ],
+    );
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+
+    // Diagnosed as the -f spelling is.
+    let r = c17_in(&dir, &["-c", "--debug-prefix-map=noeq", "t.c"]);
+    assert!(!r.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&r.stderr),
+        "c17: error: invalid argument 'noeq' to '-fdebug-prefix-map'\n"
+    );
+}
+
 #[test]
 fn prefix_map_debug_leaves_file_macro_alone() {
     let (_g, dir) = scratch("debug_macro", PRINT_FILE);

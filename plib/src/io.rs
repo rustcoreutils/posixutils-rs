@@ -80,7 +80,7 @@ pub fn input_reader(
 /// target's directory before the rename. Inheriting *that* is how a fresh
 /// `tags` file and a fresh `ar` archive came out `-rw-------`.
 ///
-/// Used by utilities like `ar` and `strip` that rewrite a binary in place
+/// Used by utilities like `ar` that rewrite a binary in place
 /// where a partial write would corrupt the artifact on disk.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mode = match fs::metadata(path) {

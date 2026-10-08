@@ -13,8 +13,8 @@
 use crate::abi::{get_abi, Abi, ArgClass, RegClass};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
-    complex_fp_info, complex_sse_regs, eightbyte_bytes, plan_pair_move, Directive, FpSize,
-    OperandSize, PairMove, Symbol,
+    complex_fp_info, complex_sse_regs, eightbyte_bytes, plan_pair_move, CallTarget, CondCode,
+    Directive, FpSize, Label, OperandSize, PairMove, Symbol,
 };
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
@@ -237,8 +237,12 @@ impl X86_64CodeGen {
         }
 
         // Register allocation
-        let mut alloc = RegAlloc::new().with_tls_access(self.base.tls_access());
+        let guarded = crate::arch::stack_protect::protects(func, types, self.base.stack_protector);
+        let mut alloc = RegAlloc::new()
+            .with_tls_access(self.base.tls_access())
+            .with_stack_guard(guarded);
         self.locations = alloc.allocate(func, types);
+        self.stack_guard = alloc.stack_guard_slot();
         self.int128_pseudos = alloc.int128_pseudos().clone();
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
@@ -299,6 +303,7 @@ impl X86_64CodeGen {
         };
         self.base
             .check_stack_clash(func, self.stack_alloc_size as i64 + realign);
+        self.emit_stack_guard_set();
 
         // Store spilled arguments before any calls can clobber them
         self.store_spilled_args(&alloc);
@@ -1459,6 +1464,7 @@ impl X86_64CodeGen {
     /// An epilogue can sit mid-function, with more of the body after it, so
     /// its rules are bracketed: the body's come back after the `ret`.
     fn emit_epilogue(&mut self) {
+        self.emit_stack_guard_check();
         self.push_cfi(Directive::CfiRememberState);
         self.emit_win64_xmm_restores();
         let bp = Reg::bp();
@@ -1491,5 +1497,81 @@ impl X86_64CodeGen {
         self.push_cfi(Directive::cfi_restore("%rbp"));
         self.push_lir(X86Inst::Ret);
         self.push_cfi(Directive::CfiRestoreState);
+    }
+
+    /// The stack-protector guard as an operand, reached through `scratch`
+    /// when it has to be: glibc keeps it in the thread control block at
+    /// `%fs:40`, as gcc reads it; elsewhere it is the global
+    /// `__stack_chk_guard`, through the GOT.
+    fn stack_guard_operand(&mut self, scratch: Reg) -> GpOperand {
+        if self.base.target.os == crate::target::Os::Linux {
+            return GpOperand::Mem(MemAddr::FsAbsolute(40));
+        }
+        let sym = Symbol::extern_sym(crate::arch::stack_protect::GUARD_SYMBOL);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(MemAddr::GotPcrel(sym)),
+            dst: GpOperand::Reg(scratch),
+        });
+        GpOperand::Mem(MemAddr::BaseOffset {
+            base: scratch,
+            offset: 0,
+        })
+    }
+
+    /// Copy the guard into the canary slot, after the prologue: R11 is the
+    /// reserved scratch, and is cleared after so the guard is not left in a
+    /// register the body might spill.
+    fn emit_stack_guard_set(&mut self) {
+        let Some(slot) = self.stack_guard else {
+            return;
+        };
+        let guard = self.stack_guard_operand(Reg::R11);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: guard,
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: GpOperand::Mem(self.stack_mem(slot)),
+        });
+        self.push_lir(X86Inst::Xor {
+            size: OperandSize::B32,
+            src: GpOperand::Reg(Reg::R11),
+            dst: Reg::R11,
+        });
+    }
+
+    /// Compare the canary with the guard before an epilogue, and call
+    /// `__stack_chk_fail` -- which does not return -- when they differ. The
+    /// return value is already in its registers, so only the scratch R10
+    /// and R11 and the flags are written.
+    fn emit_stack_guard_check(&mut self) {
+        let Some(slot) = self.stack_guard else {
+            return;
+        };
+        let guard = self.stack_guard_operand(Reg::R10);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Mem(self.stack_mem(slot)),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        self.push_lir(X86Inst::Cmp {
+            size: OperandSize::B64,
+            src: guard,
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        let intact = Label::internal("ssp_ok", self.unique_label_counter);
+        self.unique_label_counter += 1;
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Eq,
+            target: intact.clone(),
+        });
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global(crate::arch::stack_protect::FAIL_SYMBOL)),
+        });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(intact)));
     }
 }

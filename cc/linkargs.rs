@@ -50,50 +50,6 @@ pub enum LinkArg {
     Flag(String),
 }
 
-/// Options that consume the argument that follows them, in the vector as
-/// normalized by `preprocess_args()`.
-///
-/// This table must track the `Args` struct: an option added there that takes a
-/// separate value and is missing here would have its value mistaken for a
-/// pathname operand, putting a stray entry on the link line.
-///
-/// `--dump-ir` is deliberately absent. It is optional-valued, so its presence
-/// is ambiguous here — and it suppresses the link phase anyway, so a
-/// misclassification cannot reach a link line.
-const VALUE_OPTIONS: &[&str] = &[
-    "-D",
-    "-U",
-    "-I",
-    "-o",
-    "-W",
-    "-B",
-    "--target",
-    "--rtlib",
-    "--dump-ir-func",
-    "--c17-fno-builtin-func",
-    "--c17-linker-flag",
-    "--c17-mflag",
-    "--c17-x",
-    "--sysroot",
-    // Both spellings. `preprocess_args_from` rewrites the single-dash gcc
-    // forms to double-dash before clap sees them, and `scan` runs on the
-    // rewritten vector -- so the single-dash entries never matched anything,
-    // the directory after `-isystem` was read as a pathname operand, and
-    // `ordering_recovered` went false. The link line then fell back to its
-    // unordered shape, silently: `c17 -isystem inc -L A -l foo t.c` linked a
-    // program that `c17 -L A -l foo t.c` correctly refuses.
-    "-isystem",
-    "--isystem",
-    "-idirafter",
-    "--idirafter",
-    "-include",
-    "--include",
-    "-MF",
-    "--MF",
-    "-MT",
-    "--MT",
-];
-
 /// The libraries `-l` is required to find, c17.md 88057-88093.
 ///
 /// The obligation is stronger than "forward the name and hope": 88089-88093
@@ -190,8 +146,11 @@ pub const HOST_DRIVER: &str = "cc";
 /// Recover the ordered link line from a normalized argument vector.
 ///
 /// `argv` includes `argv[0]`, which is skipped. Everything after a `--`
-/// terminator is an operand.
-pub fn scan<I>(argv: I) -> Vec<LinkArg>
+/// terminator is an operand. `takes_value` says whether an option consumes
+/// the word after it; the driver answers from its argument definitions, so
+/// an option added there is never mistaken here for one whose value is a
+/// pathname operand.
+pub fn scan<I>(argv: I, takes_value: impl Fn(&str) -> bool) -> Vec<LinkArg>
 where
     I: IntoIterator<Item = String>,
 {
@@ -226,7 +185,7 @@ where
                     out.push(LinkArg::RunPath(v));
                 }
             }
-            _ if VALUE_OPTIONS.contains(&arg.as_str()) => {
+            _ if takes_value(&arg) => {
                 let _ = it.next();
             }
             _ if arg.starts_with("--c17-linker-flag=") => {
@@ -244,6 +203,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `scan` with the options these tests use that take a value.
+    fn scan(argv: Vec<String>) -> Vec<LinkArg> {
+        super::scan(argv, |a| matches!(a, "-o" | "-D" | "-I" | "-U" | "-W"))
+    }
 
     fn argv(items: &[&str]) -> Vec<String> {
         std::iter::once("c17")

@@ -578,6 +578,106 @@ fn preprocessor_include_next_walks_the_dash_i_path() {
     );
 }
 
+/// `-dD` keeps every `#define` and `#undef` in the preprocessed text, where
+/// it stood, after the macros in force before the source. dpkg runs
+/// `echo '#include "dselect-curses.h"' | gcc -E -dD - >curkeys.hpp` and
+/// reads curses' `KEY_*` definitions back out; c17 refused the option as
+/// clap's `unexpected argument '-d'`.
+#[test]
+fn preprocessor_dash_dd_keeps_the_definitions() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_dash_dd_")
+        .tempdir()
+        .unwrap();
+    std::fs::write(
+        dir.path().join("h.h"),
+        "#define CUR_KEY 0401\n#undef CUR_KEY\n#define KEY_DOWN 0402 /* down */\n",
+    )
+    .unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(
+        &src,
+        "#include \"h.h\"\n#define A 1\nint a = A;\n#undef A\n\
+         #define F(x)  (x +   1)\nint b = F(2);\n#if 0\n#define SKIPPED 1\n#endif\n",
+    )
+    .unwrap();
+    let r = run_c17(&["-E", "-dD", "-P", "-DCMD=7", &src.to_string_lossy()]);
+    assert!(r.success, "{}", r.stderr);
+    let lines: Vec<&str> = r.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let want = [
+        "#define CUR_KEY 0401",
+        "#undef CUR_KEY",
+        "#define KEY_DOWN 0402",
+        "#define A 1",
+        "int a = 1;",
+        "#undef A",
+        "#define F(x) (x + 1)",
+        "int b = (2 + 1);",
+    ];
+    assert!(lines.len() > want.len(), "{}", r.stdout);
+    let (head, tail) = lines.split_at(lines.len() - want.len());
+    assert_eq!(tail, want, "{}", r.stdout);
+    // Ahead of the source: the predefined macros and the command line's.
+    for first in ["#define __STDC_VERSION__ 201710L", "#define CMD 7"] {
+        assert!(head.contains(&first), "{first} missing:\n{}", r.stdout);
+    }
+
+    // Line markers still name the source, after the definitions ahead of it.
+    let r = run_c17(&["-E", "-dD", &src.to_string_lossy()]);
+    assert!(r.success, "{}", r.stderr);
+    let at = r.stdout.find("int a = 1;").expect("text");
+    let before = &r.stdout[..at];
+    let marker = before.rfind("\n# ").expect("a marker before the text");
+    let line: u32 = before[marker + 3..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Count lines from the marker to the text: the text is on source line 3.
+    let gap = before[marker + 1..].matches('\n').count() as u32 - 1;
+    assert_eq!(line + gap, 3, "{}", r.stdout);
+}
+
+/// `-iquote DIR` and `-iquoteDIR` add a directory searched for `"..."`
+/// includes ahead of `-I`, and not for `<...>` ones. guile builds libguile
+/// with `-iquote.` and dpkg with `-iquote .`; c17 refused both as clap's
+/// `unexpected argument '-i'`.
+#[test]
+fn preprocessor_iquote_serves_quote_includes() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_iquote_")
+        .tempdir()
+        .unwrap();
+    let (iq, i) = (dir.path().join("iq"), dir.path().join("i"));
+    for d in [&iq, &i] {
+        std::fs::create_dir(d).unwrap();
+    }
+    std::fs::write(iq.join("h.h"), "#define WHERE iquote\n").unwrap();
+    std::fs::write(i.join("h.h"), "#define WHERE dash_i\n").unwrap();
+    let src = dir.path().join("sub").join("m.c");
+    std::fs::create_dir(src.parent().unwrap()).unwrap();
+    std::fs::write(
+        &src,
+        "#include \"h.h\"\nq WHERE\n#undef WHERE\n#include <h.h>\na WHERE\n",
+    )
+    .unwrap();
+
+    let dash_i = format!("-I{}", i.display());
+    let joined = format!("-iquote{}", iq.display());
+    let iq_s = iq.to_string_lossy();
+    for spelling in [&["-iquote", iq_s.as_ref()][..], &[joined.as_str()]] {
+        let mut args = vec!["-E", "-P", dash_i.as_str()];
+        args.extend(spelling);
+        let src_s = src.to_string_lossy();
+        args.push(&src_s);
+        let r = run_c17(&args);
+        assert!(r.success, "{spelling:?}: {}", r.stderr);
+        let text: String = r.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(text, "q iquote a dash_i", "{spelling:?}");
+    }
+}
+
 /// The other half of the same chain: a file found on a *system* path still
 /// resumes after that path, not from the front of it. `-I` directories come
 /// first on the chain -- mistaking a system position for a `-I` one would
@@ -723,4 +823,44 @@ fn preprocessor_nostdinc_keeps_the_caller_s_system_paths() {
         "-nostdinc should drop the standard directories:\n{}",
         r.stdout
     );
+}
+
+/// Conditional directives among a function-like macro's arguments are
+/// obeyed, as gcc does (C17 6.10.3p11 leaves it undefined). binutils'
+/// bfd/elfnn-aarch64.c writes its `HOWTO` table that way:
+/// `#if ARCH_SIZE == 64` picks the name argument.
+#[test]
+fn preprocessor_conditionals_inside_macro_arguments() {
+    let code = r#"
+#define HOWTO(type, size, name, mask) { type, size, name, mask }
+#define ARCH_SIZE 64
+struct howto { int type, size; const char *name; long mask; };
+static const struct howto table[] = {
+  HOWTO (1, 4,
+#if ARCH_SIZE == 64
+         "R_AARCH64_TLS_DTPMOD64",
+#else
+         "R_AARCH64_TLS_DTPMOD",
+#endif
+         -1L),
+  HOWTO (2,
+#ifdef UNDEFINED_THING
+         (8, 9),
+#elif ARCH_SIZE == 32
+         16,
+#else
+         8,
+#endif
+         "two", 0),
+};
+
+int main(void)
+{
+    if (sizeof table / sizeof table[0] != 2) return 1;
+    if (table[0].name[20] != '6' || table[0].mask != -1L) return 2;
+    if (table[1].size != 8 || table[1].name[0] != 't') return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("pp_conditionals_in_args", code, &[]), 0);
 }

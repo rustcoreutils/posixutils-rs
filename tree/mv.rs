@@ -81,6 +81,7 @@ fn copy_hierarchy(
         // and retry.
         force: true,
         interactive: false,
+        no_clobber: false,
         // POSIX mv step 6 (108097-108099): links are duplicated as links, including a link
         // named as an operand -- moving one across a filesystem must not turn it into a copy of
         // whatever it points at.

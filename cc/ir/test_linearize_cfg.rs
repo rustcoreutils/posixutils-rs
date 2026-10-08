@@ -105,7 +105,7 @@ fn test_nested_if_cfg_linking() {
         body: outer_if,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -185,7 +185,7 @@ fn test_switch_basic() {
         body: switch_stmt,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -269,7 +269,7 @@ fn test_switch_with_break() {
         body: switch_stmt,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -347,7 +347,7 @@ fn test_do_while_basic() {
         body: do_while,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -437,7 +437,7 @@ fn test_do_while_with_break() {
         body: do_while,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -521,7 +521,7 @@ fn test_goto_forward() {
         body,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -608,7 +608,7 @@ fn test_goto_backward() {
         body,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -686,7 +686,7 @@ fn test_nested_loop_break() {
         body: outer_loop,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -780,7 +780,7 @@ fn test_nested_loop_continue() {
         body: outer_loop,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1025,7 +1025,7 @@ fn test_conditional_short_circuit_arrow() {
         ))))]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -1328,6 +1328,23 @@ fn a_non_returning_terminator_ends_its_block() {
     let module = linearize_source(src, &target);
     for f in &module.functions {
         assert_eq!(cfg_inconsistency(f), None, "{}", f.name);
+    }
+}
+
+/// A conditional with a `__builtin_unreachable ()` arm -- gnulib's
+/// `assume (R)` is `(R) ? (void) 0 : __builtin_unreachable ()` -- still
+/// branches: reaching the builtin is what the arm says never happens, so
+/// evaluating it whichever way the condition goes is a trap on every path.
+/// It was taken for a pure arm and made a select, and every function using
+/// `assume` began with `ud2`.
+#[test]
+fn an_unreachable_conditional_arm_is_not_speculated() {
+    let src = "int f(int x) { (x >= 4) ? (void) 0 : __builtin_unreachable (); return x + 3; }\n\
+               int g(int x) { return x ? x : (__builtin_unreachable (), 0); }\n\
+               int h(int x) { return x ?: (__builtin_unreachable (), 0); }\n";
+    let module = linearize_source(src, &Target::host());
+    for f in ["f", "g", "h"] {
+        assert!(still_branches(&module, f), "{f} no longer branches");
     }
 }
 

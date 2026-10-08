@@ -41,8 +41,9 @@
 
 use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::arch::regalloc::{
-    compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
-    ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
+    asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
+    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
+    LivenessResult,
 };
 use crate::float::FloatVal;
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -1109,6 +1110,22 @@ pub(super) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     })
 }
 
+/// The SIMD/FP register a clobber-list name means -- `v8`, `q8`, `d8`,
+/// `s8`, `h8` and `b8` all write register 8, optionally with a leading `%` --
+/// among those the allocator hands out. `None` for any other name, and for
+/// the codegen scratch registers, which hold nothing across an instruction.
+fn parse_fp_clobber_name(raw: &str) -> Option<VReg> {
+    let s = raw.trim_start_matches('%').to_ascii_lowercase();
+    let n: u8 = s
+        .strip_prefix(['v', 'q', 'd', 's', 'h', 'b'])?
+        .parse()
+        .ok()?;
+    VReg::allocatable()
+        .iter()
+        .copied()
+        .find(|v| v.name_d().strip_prefix('d') == Some(n.to_string().as_str()))
+}
+
 /// Get constraint info for an instruction (aarch64 — mirror of
 /// x86_64's `get_constraint_info`).
 ///
@@ -1308,6 +1325,11 @@ pub struct RegAlloc {
     /// How the target obtains a thread-local's address, which decides what a
     /// `TlsAddr` clobbers. Set with [`RegAlloc::with_tls_access`].
     tls_access: crate::target::TlsAccess,
+    /// Whether the function gets a stack-protector canary; set with
+    /// [`RegAlloc::with_stack_guard`].
+    guard_requested: bool,
+    /// The canary's slot: the frame's first, so above every other local.
+    guard_slot: Option<LocalSlot>,
     /// Free GP registers (used by argument pre-allocation and the
     /// spill-args helper; the chordal coloring core ignores it).
     free_regs: Vec<Reg>,
@@ -1370,7 +1392,21 @@ impl RegAlloc {
             live_out: Vec::new(),
             frame_base: FrameBase::Fp,
             tls_access: crate::target::TlsAccess::ElfStatic,
+            guard_requested: false,
+            guard_slot: None,
         }
+    }
+
+    /// An allocator that reserves a stack-protector canary slot when
+    /// `guarded`; see `arch::stack_protect`.
+    pub fn with_stack_guard(mut self, guarded: bool) -> Self {
+        self.guard_requested = guarded;
+        self
+    }
+
+    /// The canary's slot, if [`RegAlloc::with_stack_guard`] asked for one.
+    pub fn stack_guard_slot(&self) -> Option<LocalSlot> {
+        self.guard_slot
     }
 
     /// Perform register allocation for a function
@@ -1388,11 +1424,42 @@ impl RegAlloc {
         if let Some(base) = self.frame_base.reg() {
             self.free_regs.retain(|r| *r != base);
         }
+        // Before any other slot: the first is the highest, just under the
+        // variadic save area and the saved registers, which is where the
+        // canary has to be -- and the arrays right under it.
+        self.guard_slot = self
+            .guard_requested
+            .then(|| LocalSlot::from_displacement(self.new_frame_slot(8, 8)));
+        let (arrays, rest) = crate::arch::regalloc::LocalSet::of(self.guard_requested);
+        if let Some(arrays) = arrays {
+            let early = self.compute_live_intervals(func);
+            self.place_locals(func, types, &early.intervals, arrays);
+        }
         if func.receives_nonlocal_goto() {
             self.used_callee_saved
                 .extend(Reg::allocatable().iter().filter(|r| r.is_callee_saved()));
             self.used_callee_saved_fp
                 .extend(VReg::allocatable().iter().filter(|r| r.is_callee_saved()));
+        }
+        // A callee-saved register an inline asm clobbers is the function's to
+        // preserve, as any it allocates is, though no pseudo lives in it.
+        for reg in FrameBase::asm_claimed_regs(func) {
+            if reg.is_callee_saved()
+                && Reg::allocatable().contains(&reg)
+                && !self.used_callee_saved.contains(&reg)
+            {
+                self.used_callee_saved.push(reg);
+            }
+        }
+        let fp_clobbers = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insns)
+            .flat_map(|insn| asm_clobbered(insn, parse_fp_clobber_name));
+        for reg in fp_clobbers {
+            if reg.is_callee_saved() && !self.used_callee_saved_fp.contains(&reg) {
+                self.used_callee_saved_fp.push(reg);
+            }
         }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
@@ -1413,8 +1480,14 @@ impl RegAlloc {
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_aarch64);
+        // An inline asm that clobbers a SIMD/FP register ends every FP value
+        // live across it, as a call does: the clobber list is all the
+        // allocator knows of what the template writes.
+        let fp_call_positions = find_insn_positions(func, |insn| {
+            is_call_like_aarch64(insn.op) || !asm_clobbered(insn, parse_fp_clobber_name).is_empty()
+        });
 
-        self.spill_args_across_calls(func, types, &intervals, &call_positions);
+        self.spill_args_across_calls(func, types, &intervals, &call_positions, &fp_call_positions);
         self.spill_gp_args(&intervals, |interval, reg| {
             crate::arch::regalloc::clobbered_while_live(
                 interval,
@@ -1424,8 +1497,15 @@ impl RegAlloc {
             )
         });
         self.allocate_alloca_to_stack(func);
-        self.place_locals(func, types, &intervals);
-        self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
+        self.place_locals(func, types, &intervals, rest);
+        self.run_chordal_color(
+            func,
+            types,
+            intervals,
+            &call_positions,
+            &fp_call_positions,
+            &constraint_points,
+        );
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
     }
@@ -1530,6 +1610,7 @@ impl RegAlloc {
         types: &TypeTable,
         intervals: &[LiveInterval],
         call_positions: &[usize],
+        fp_call_positions: &[usize],
     ) {
         self.spill_gp_args(intervals, |interval, _| {
             interval_crosses_call(interval, call_positions)
@@ -1540,7 +1621,8 @@ impl RegAlloc {
         let lowering = crate::arch::regalloc::AbiLowering::new(func);
         for interval in intervals {
             if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
-                if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
+                if fp_arg_regs_set.contains(reg)
+                    && interval_crosses_call(interval, fp_call_positions)
                 {
                     let from_reg = *reg;
                     // Reserve what the value actually needs: a binary128
@@ -1660,11 +1742,18 @@ impl RegAlloc {
     }
 
     /// Give every local its frame slot; see `arch::regalloc::place_locals`.
-    fn place_locals(&mut self, func: &Function, types: &TypeTable, intervals: &[LiveInterval]) {
+    fn place_locals(
+        &mut self,
+        func: &Function,
+        types: &TypeTable,
+        intervals: &[LiveInterval],
+        set: crate::arch::regalloc::LocalSet,
+    ) {
         let pos = self.func_pos;
-        let placed = crate::arch::regalloc::place_locals(func, types, pos, intervals, |b, a| {
-            self.new_frame_slot(b, a)
-        });
+        let placed =
+            crate::arch::regalloc::place_locals(func, types, pos, intervals, set, |b, a| {
+                self.new_frame_slot(b, a)
+            });
         for (local, offset) in placed {
             self.locations
                 .insert(local, Loc::Stack(LocalSlot::from_displacement(offset)));
@@ -1733,6 +1822,7 @@ impl RegAlloc {
         types: &TypeTable,
         intervals: Vec<LiveInterval>,
         call_positions: &[usize],
+        fp_call_positions: &[usize],
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
         // -------- Phase 1: pre-pass --------
@@ -1836,7 +1926,7 @@ impl RegAlloc {
                 // FP cross-call/block → stack (avoids the chordal pass
                 // having to model V-bank cross-call eviction, which is
                 // not implemented yet; matches the x86_64 XMM policy).
-                let crosses_call = interval_crosses_call(interval, call_positions);
+                let crosses_call = interval_crosses_call(interval, fp_call_positions);
                 let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if crosses_call || crosses_block {
                     let bytes = fp_pseudo_bytes(func, interval.pseudo);
@@ -2392,6 +2482,18 @@ mod tests {
         assert_eq!(parse_gp_clobber_name("x18"), None); // platform reserved
         assert_eq!(parse_gp_clobber_name(""), None);
         assert_eq!(parse_gp_clobber_name("not_a_reg"), None);
+    }
+
+    #[test]
+    fn parse_fp_clobber_name_every_width() {
+        for name in ["v8", "q8", "d8", "s8", "h8", "b8", "%D8"] {
+            assert_eq!(parse_fp_clobber_name(name), Some(VReg::V8), "{name}");
+        }
+        assert_eq!(parse_fp_clobber_name("v31"), Some(VReg::V31));
+        // Codegen scratch, out of range, and not registers at all.
+        for name in ["v16", "v32", "sp", "x8", "memory", "d"] {
+            assert_eq!(parse_fp_clobber_name(name), None, "{name}");
+        }
     }
 
     #[test]

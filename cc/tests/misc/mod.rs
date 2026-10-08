@@ -14,9 +14,12 @@
 mod auto_type;
 mod cast_to_union;
 mod cleanup_attr;
+mod enumerator_attributes;
 mod float_n;
+mod labeled_declaration;
 mod local_label;
 mod no_current_block;
+mod optimize_attr;
 mod setjmp;
 mod statement_attributes;
 mod stmt_expr;

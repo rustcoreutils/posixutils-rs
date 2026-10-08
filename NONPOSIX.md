@@ -101,7 +101,7 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
    `-shared`, `-Wl,`, `-Xlinker`, `-pthread`, `-rdynamic`, `-pipe`, `-p`/`-pg`,
    and `-ffreestanding`/`-fhosted`.  The `-f*` options it knows are
    classified in `cc/f_options.rs`; one gcc would do something with that
-   c17 does not (`-fstack-protector*`, `-fsanitize=`, ...) draws the warning
+   c17 does not (`-fsanitize=`, `-ftrapv`, ...) draws the warning
    group `-Wc17-unsupported-option`, which plain `-Werror` leaves a warning,
    and an unknown one is refused as gcc refuses it.
  * A bare `-` operand is accepted as a pathname.  POSIX says standard input is
@@ -176,6 +176,27 @@ spelling is taken in silence; C90 (`-ansi` included) draws a warning that
  * A `source/.` operand copies the contents of `source` rather than the
    directory itself.
 
+The rest are the GNU options debhelper passes for nearly every Debian
+package (`cp -an --reflink=auto` in Dh_Lib's file restore, `cp -a` in
+dh_install, dh_installdocs, dh_installexamples and dh_strip,
+`cp --parents -dp` and `cp --parents -a` in dh_install, dh_installdocs and
+dh_installexamples), with GNU cp's meaning:
+
+ * `-a` / `--archive` — `-R -P -p`, and files hard-linked to each other in
+   the source are hard-linked in the copy.  Extended attributes are not
+   copied.
+ * `-d` — `-P`, with hard links kept as for `-a`.
+ * `-n` / `--no-clobber` — an existing destination (other than a directory
+   being merged into) is left alone, silently and without affecting the exit
+   status.
+ * `--reflink=auto` — accepted, and files are copied normally: `auto` asks
+   for a copy-on-write clone only where one is available, so an ordinary copy
+   is always a correct result.  Any other `--reflink` form is refused.
+ * `--parents` — the destination of each source is the target directory
+   followed by the source's path, and missing directories on that path are
+   made from the source's (with `-p`, their owner, mode and times too).  The
+   target must be an existing directory.
+
 ### cpio
 
 The whole utility is an addition: a compatibility front-end over `pax`
@@ -238,16 +259,74 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `#` — null command / comment.
  * `&` — repeat the last substitution.
 
+### file
+
+ * `-b` / `--brief` — print the type without the `file: ` prefix.
+ * `-e testname` — exclude a default system test.  Only the names
+   `apptype`, `ascii`, `encoding`, `cdf`, `compress` and `tar` are accepted.
+   `ascii` turns off the text recognition (`commands text`, `c program text`,
+   `fortran program text`); the others name GNU file built-ins this `file`
+   does not have, so excluding them changes nothing.
+
+Both are forced by debhelper: dh_strip and dh_shlibdeps run
+`file --brief -e apptype -e ascii -e encoding -e cdf -e compress -e tar -- FILE`.
+They read the result through `ELF.*shared`, `ELF.*(executable|shared)`,
+`not stripped` and `statically linked`, which is why the built-in ELF test
+reports the class, byte order, object type, linking and whether a symbol
+table is present.
+
 ### find
 
  * `-ipath pattern` — case-insensitive `-path`.  POSIX.1-2024 added `-iname`
    only.
  * With no path operand, `.` is searched.  POSIX requires at least one path.
+ * `-mindepth n` / `-maxdepth n` — global options, as in GNU find: wherever
+   they appear, entries shallower than `n` are walked but not evaluated, and
+   entries deeper than `n` are not walked.  The path operand is depth 0.
+   Forced by debhelper (`dh_update_autotools_config`, `dh_movelibkdeinit`).
+ * `-printf format` — an action writing `format` for each file, with only
+   the directives `%p`, `%P` (path without its starting point), `%s`, `%T@`
+   and `%%` and the escapes `\n`, `\\` and `\NNN` (octal, so `\0` is NUL).
+   Any other directive or escape is an error.  Forced by debhelper
+   (`dh_autoreconf`, `dh_installdeb`, `dh_md5sums`, `dh_installgsettings`).
+ * `-or` / `-and` — spellings of `-o` / `-a`.  Forced by debhelper
+   (`dh_install`, `dh_installdocs`, `dh_shlibdeps`, and the `-X` exclusions
+   of every dh_* tool).
+ * `-true` / `-false` — primaries that are always true / always false.
+   Forced by debhelper (`dh_fixperms` joins every walk with `-a -true`,
+   `dh_compress` prunes with `-prune -false`).
+ * `-size nk` — the size in KiB, rounded up.  No other GNU unit is
+   accepted.  Forced by debhelper (`dh_compress` `-size +4k`).
+ * `-delete` — an action removing the entry (`rmdir` for a directory); it
+   implies `-depth`, never removes a starting point such as `.`, and is an
+   error next to `-prune` unless `-depth` is given.  Forced by debhelper
+   (`dh_doxygen`, `dh_autotools-dev_restoreconfig`).
+ * `-empty` — true for an empty regular file or a directory with no
+   entries.  Forced by debhelper (`dh_install`, `dh_installdocs`).
+ * `-executable` — true if `access(2)` grants the user execute (search, for
+   a directory) permission.  Forced by debhelper (`dh_movelibkdeinit`).
+ * `-perm /mode` — true if any of the bits in `mode` is set (or `mode` has
+   none).  Forced by debhelper (`dh_shlibdeps` `-perm /111`).
+ * `-regex pattern` — true if the pattern matches the whole pathname, in
+   the Emacs syntax that is GNU find's default: `\(`, `\)`, `\|` group and
+   alternate, `+` and `?` are operators, a bare `(`, `)`, `|`, `{`, `}` is a
+   literal, and so is an operator with nothing before it.  Emacs-only
+   escapes (`\w`, `\b`, `\<`, backreferences, ...) and `[:class:]`-style
+   bracket terms are an error.  No `-regextype` or `-iregex`.  Forced by
+   debhelper (`dh_md5sums`, `dh_fixperms`, and the `-X` exclusions of every
+   dh_* tool).
 
 ### gettext / ngettext
 
  * `LANGUAGE` — a colon-separated locale priority list, honored ahead of the
    `LC_*` variables.
+
+### head
+
+ * `-number` — the historical form of `-n number`, withdrawn from POSIX in
+   Issue 6.  `number` is one or more decimal digits.  It is accepted wherever
+   an option may appear (never after `--`), and the last `-n` or `-number`
+   given wins.  `-c` has no historical form.
 
 ### kill
 
@@ -348,6 +427,25 @@ POSIX specifies only `-k`.  Every other option is an addition:
 
  * `-f` — force; assume answers rather than prompting.
 
+The rest are the GNU options and behaviors `dpkg-source` relies on to unpack
+Debian source packages, with GNU patch's meaning:
+
+ * `-t` — batch: ask nothing; a patch that looks reversed is applied
+   reversed, a file that cannot be named is skipped.
+ * `-F num` — at most `num` lines of fuzz (default 2, as POSIX describes).
+ * `-V never` / `-V simple` — the simple backup method, the only one there is;
+   other methods are refused.
+ * `-E` — remove a file the patch leaves empty.
+ * `-B prefix`, `-z suffix` — backup names `prefix`+FILE, FILE+`suffix`, or
+   both; either implies `-b`.  Directories in the prefix are created.
+ * `--reject-file=file` — long form of `-r`; `-r -` discards the rejects.
+ * With a backup option, a file the patch creates gets an empty backup, the
+   placeholder dpkg-source and quilt read as "did not exist".
+ * A single hunk inserting into an empty old file (`@@ -0,0 +1,n @@`) creates
+   the file when it does not exist, as `diff -N` output requires.
+ * Removing a file also removes the directories it leaves empty, up to the
+   working directory.
+
 ### pax
 
  * `-z` / `--gzip` — gzip the archive on write.  On read, gzip is detected from
@@ -416,6 +514,13 @@ POSIX specifies only `-k`.  Every other option is an addition:
 ### split
 
  * A `g` suffix on the `-b` argument.  POSIX defines `k` and `m`.
+
+### tail
+
+ * The historical forms withdrawn from POSIX in Issue 6, as the first
+   argument only: `-number` and `+number` mean `-n -number` and
+   `-n +number`; `-numberc` and `+numberc` mean `-c -number` and
+   `-c +number`.  The historical `b`, `l` and `f` suffixes are not accepted.
 
 ### talk
 

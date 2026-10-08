@@ -12,6 +12,19 @@
 
 use super::asm_probe::{asm_for, asm_for_with, AARCH64_LINUX, X86_64_LINUX};
 
+/// A template's extended characters reach the assembler as the source spelled
+/// them. The template is a literal payload, one `char` per source byte, and
+/// it was written out as if it were text, so each byte of a UTF-8 `é` came
+/// out as two: `# \u{e9}` was emitted as `# \u{c3}\u{a9}`.
+#[test]
+fn codegen_inline_asm_template_keeps_extended_characters() {
+    let code = "void f(void) { __asm__(\"# caf\u{e9} %eax\"); }\n";
+    for triple in [AARCH64_LINUX, X86_64_LINUX] {
+        let asm = asm_for("asm_template_utf8", triple, code);
+        assert!(asm.contains("# caf\u{e9} %eax\n"), "{triple}:\n{asm}");
+    }
+}
+
 /// An `asm goto` label reference is spelled the way its definition is.
 ///
 /// A function whose identifier holds an extended character needs its local

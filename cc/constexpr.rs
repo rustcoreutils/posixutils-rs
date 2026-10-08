@@ -22,7 +22,9 @@
 
 use crate::float::{Complex, FloatVal, FpFormat};
 use crate::ir::constfold::{eval_bit_op, BitOp};
-use crate::parse::ast::{BinaryOp, Expr, ExprKind, FpTest, InlineLibraryFn, OffsetOfPath, UnaryOp};
+use crate::parse::ast::{
+    BinaryOp, CheckedOp, Expr, ExprKind, FpTest, InlineLibraryFn, OffsetOfPath, UnaryOp,
+};
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::target::Target;
@@ -416,7 +418,128 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
 
         ExprKind::OffsetOf { type_id, path } => offset_of(env, *type_id, path),
 
+        ExprKind::CheckedArith {
+            op,
+            a,
+            b,
+            res,
+            store: false,
+        } => eval_overflow_p(env, scope, *op, a, b, res),
+
         _ => None,
+    }
+}
+
+/// `__builtin_add_overflow_p(a, b, res)` and its `sub`/`mul` siblings, which
+/// gcc makes an integer constant expression when `a` and `b` are: whether
+/// the exact `a op b` fits `res`'s type. gnulib's intprops.h builds
+/// `INT_ADD_OVERFLOW` on it, and test-intprops.c puts that in `verify`.
+///
+/// `res` is read for its type, but it is evaluated, so one with a side
+/// effect makes the call no constant; here it must be a constant itself,
+/// which every `(T) 0` is.
+fn eval_overflow_p(
+    env: &impl ConstEnv,
+    scope: ConstScope,
+    op: CheckedOp,
+    a: &Expr,
+    b: &Expr,
+    res: &Expr,
+) -> Option<i128> {
+    let types = env.types();
+    let dst = res.typ?;
+    if !types.is_integer(dst) || types.kind(dst) == TypeKind::Bool {
+        return None;
+    }
+    eval(env, scope, res)?;
+    let a = Exact::of(types, a.typ?, eval(env, scope, a)?);
+    let b = Exact::of(types, b.typ?, eval(env, scope, b)?);
+    let exact = match op {
+        CheckedOp::Add => a.add(b),
+        CheckedOp::Sub => a.add(b.negated()),
+        CheckedOp::Mul => a.mul(b),
+    };
+    // A magnitude past u128 fits no type.
+    let fits = exact.is_some_and(|v| v.fits(types.size_bits(dst), types.is_unsigned(dst)));
+    Some(i128::from(!fits))
+}
+
+/// An exact integer, as sign and magnitude: every value of every C integer
+/// type, `unsigned __int128`'s included, and their sums, differences and
+/// products while the magnitude stays within 128 bits.
+#[derive(Clone, Copy)]
+struct Exact {
+    negative: bool,
+    magnitude: u128,
+}
+
+impl Exact {
+    /// `value`, as [`eval`] gives it for an integer of type `typ`.
+    fn of(types: &TypeTable, typ: TypeId, value: i128) -> Exact {
+        if types.is_unsigned(typ) {
+            // An `unsigned __int128` past `i128::MAX` arrives negative.
+            Exact {
+                negative: false,
+                magnitude: value as u128,
+            }
+        } else {
+            Exact {
+                negative: value < 0,
+                magnitude: value.unsigned_abs(),
+            }
+        }
+    }
+
+    fn negated(self) -> Exact {
+        Exact {
+            negative: !self.negative,
+            ..self
+        }
+    }
+
+    /// `None` when the magnitude passes 128 bits.
+    fn add(self, other: Exact) -> Option<Exact> {
+        if self.negative == other.negative {
+            return Some(Exact {
+                negative: self.negative,
+                magnitude: self.magnitude.checked_add(other.magnitude)?,
+            });
+        }
+        let (big, small) = if self.magnitude >= other.magnitude {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        Some(Exact {
+            negative: big.negative,
+            magnitude: big.magnitude - small.magnitude,
+        })
+    }
+
+    /// `None` when the magnitude passes 128 bits.
+    fn mul(self, other: Exact) -> Option<Exact> {
+        Some(Exact {
+            negative: self.negative != other.negative,
+            magnitude: self.magnitude.checked_mul(other.magnitude)?,
+        })
+    }
+
+    /// Whether the value is one an integer type of `bits` bits holds. A zero
+    /// fits whatever its sign.
+    fn fits(self, bits: u32, unsigned: bool) -> bool {
+        if self.magnitude == 0 {
+            return true;
+        }
+        if unsigned {
+            !self.negative && (bits >= 128 || self.magnitude >> bits == 0)
+        } else {
+            let limit = 1u128 << (bits - 1);
+            if self.negative {
+                self.magnitude <= limit
+            } else {
+                self.magnitude < limit
+            }
+        }
     }
 }
 

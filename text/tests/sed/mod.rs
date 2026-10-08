@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod bytes;
+
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 /// Build an absolute path under the cargo test temp dir for a wfile, so that
@@ -497,10 +499,12 @@ mod tests {
             (";\n;\n;;", "abc\ndef\n@#$\n", "abc\ndef\n@#$\n", ""),
             // wrong
             (
+                // `\;\;;` is a context address whose RE is a literal `;`;
+                // no command follows it (GNU: "missing command").
                 ";\\;\\;;",
                 "abc\ndef\n@#$",
                 "",
-                "sed: pattern can't consist more than 1 line (line: 0, col: 2)\n",
+                "sed: address hasn't command (line: 0, col: 7)\n",
             ),
             (
                 ";\\ ;;;",
@@ -617,10 +621,11 @@ mod tests {
                 "sed: address bound can be only one pattern, number or '$' (line: 0, col: 3)\n",
             ),
             (
+                // `addr,+N` is a GNU extension.
                 "/5/,+3p",
                 "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw",
                 "",
-                "sed: unknown character '/' (line: 0, col: 1)\n",
+                "sed: address bound can be only one pattern, number or '$' (line: 0, col: 5)\n",
             ),
             (
                 "7;+ p",
@@ -805,10 +810,11 @@ mod tests {
                 "sed: unneccessary '}' (line: 0, col: 28)\n",
             ),
             (
+                // The innermost unclosed `{` is reported.
                 "{ { { { { { { { {} } } } } } }",
                 "abc\ndef\n@@##%%#^",
                 "",
-                "sed: '{' not have pair for closing block (line: 0, col: 1)\n",
+                "sed: '{' not have pair for closing block (line: 0, col: 3)\n",
             ),
         ];
 
@@ -1553,8 +1559,9 @@ mod tests {
             ("r./text/ard/assets/abc", "abc\ncdf", "abc\ncdf\n", ""),
             // wrong
             ("r", "abc\ncdf", "", "sed: missing filename in r/R/w/W commands (line: 0, col: 1)\n"),
-            ("r #@/?", "abc\ncdf", "", "sed: missing filename in r/R/w/W commands (line: 0, col: 2)\n"),
-            ("r #@/?\nl", "abc\ncdf", "", "sed: missing filename in r/R/w/W commands (line: 0, col: 2)\n")
+            // `#@/?` is the rfile name (nonexistent), not a comment, as in GNU.
+            ("r #@/?", "abc\ncdf", "abc\ncdf\n", ""),
+            ("r #@/?\nl", "abc\ncdf", "abc$\nabc\ncdf$\ncdf\n", "")
         ];
 
         for (script, input, output, err) in test_data {
@@ -2075,16 +2082,12 @@ mod tests {
             ("#n", "abc\ncdf\naaa", "", ""),
             // wrong
             (
-                // `#text` is stripped as a comment, leaving `a\` then `text`
-                // on the next line. With POSIX multi-line `a` support, that is
-                // the classic two-line form, so `text` is appended after each
-                // input line (deferred). (GNU does not strip `#text` as a
-                // comment here; that comment-stripping divergence is pre-existing
-                // and out of scope.)
+                // `#text` is the text of `a\`, not a comment; line 2 `text`
+                // is then a `t` command with undefined label `ext`, as in GNU.
                 "a\\#text\ntext",
                 "abc\ncdf\naaa\n",
-                "abc\ntext\ncdf\ntext\naaa\ntext\n",
                 "",
+                "sed: can't find label for jump to `ext'\n",
             ),
             (
                 "{ #\\ }\n{ #\n }\n#h",
@@ -2326,9 +2329,9 @@ mod tests {
                 "",
             ),
             (
+                // The whole match is replaced; `\U` is not a POSIX escape.
                 r#"s/h\.0\.\(.*\)/ \U\1/"#,
                 "h.0.someText\nh.0=data\nh.0.anotherExample",
-                // The whole match is replaced, not just the group.
                 " UsomeText\nh.0=data\n UanotherExample",
                 "",
             ),
@@ -2525,6 +2528,115 @@ mod tests {
     #[test]
     fn test_duplicate_labels_ok() {
         sed_test(&["-e", ":x", "-e", ":x"], "a\n", "a\n", "", 0);
+    }
+
+    const VERSION_INPUT: &str = "foo\n#define VERSION \"3.25\"\na/b\na%b\na\\b\nbar\n";
+
+    /// POSIX context address `/RE/`, optionally followed by <blank>s before
+    /// the command (hostname, zlib, gcc-defaults debian/rules).
+    #[test]
+    fn test_slash_context_address() {
+        let t = |args: &[&str], out: &str| sed_test(args, VERSION_INPUT, out, "", 0);
+        t(&["-n", "/VERSION/p"], "#define VERSION \"3.25\"\n");
+        t(&["-n", "/VERSION/\t p"], "#define VERSION \"3.25\"\n");
+        t(
+            &["-n", "/foo/,/VERSION/ p"],
+            "foo\n#define VERSION \"3.25\"\n",
+        );
+        t(&["-n", "/VERSION/ !p"], "foo\na/b\na%b\na\\b\nbar\n");
+        t(&["-n", "/a\\/b/p"], "a/b\n");
+        t(&["-n", "\\%a\\%b%p"], "a%b\n");
+        t(&["-n", "/\\\\/p"], "a\\b\n");
+        t(
+            &["/foo/d"],
+            "#define VERSION \"3.25\"\na/b\na%b\na\\b\nbar\n",
+        );
+        t(&["/a/,/b/ d"], "foo\n#define VERSION \"3.25\"\n");
+        t(&["-n", "2{/VERSION/p;}"], "#define VERSION \"3.25\"\n");
+        t(&["-n", "/bar/ { p }"], "bar\n");
+        t(&["-n", "/VERSION/{s/\"//g;p;}"], "#define VERSION 3.25\n");
+        t(&["-n", "$!N;/foo\\n#/p"], "foo\n#define VERSION \"3.25\"\n");
+    }
+
+    /// An empty RE reuses the last RE used, including one used as an address.
+    #[test]
+    fn test_empty_re_reuses_address_re() {
+        let t = |args: &[&str], out: &str| sed_test(args, VERSION_INPUT, out, "", 0);
+        t(&["-En", "/^#define VERSION \"(.*)\"/ s//\\1/p"], "3.25\n");
+        t(&["-n", "/^#define VERSION \"\\(.*\\)\"/s//\\1/p"], "3.25\n");
+        t(&["-n", "/o/s//0/gp"], "f00\n");
+        t(&["-n", "s/o/0/;//p"], "f0o\n");
+        t(&["-n", "/foo/{//p;}"], "foo\n");
+        sed_test(
+            &["-n", "//p"],
+            VERSION_INPUT,
+            "",
+            "sed: read stdin: no previous regular expression\n",
+            1,
+        );
+    }
+
+    /// `#` begins a comment only where a command may begin, never inside an
+    /// RE, `a` text or a block.
+    #[test]
+    fn test_hash_outside_comments() {
+        let t = |args: &[&str], out: &str| sed_test(args, VERSION_INPUT, out, "", 0);
+        t(
+            &["-n", "/#define/p # comment"],
+            "#define VERSION \"3.25\"\n",
+        );
+        t(&["-n", "s/a/b/p # comment"], "b/b\nb%b\nb\\b\nbbr\n");
+        sed_test(&["1a\\\nx#y"], "foo\n", "foo\nx#y\n", "", 0);
+    }
+
+    /// Braces inside an RE do not open or close a block.
+    #[test]
+    fn test_braces_in_re_inside_block() {
+        sed_test(
+            &["-n", "/[0-9]/{ s/[0-9]\\{1,\\}/N/g; p; }"],
+            VERSION_INPUT,
+            "#define VERSION \"N.N\"\n",
+            "",
+            0,
+        );
+        sed_test(&["-n", "/[{]/p;/b/{\np\n}"], "{\nb\n", "{\nb\n", "", 0);
+    }
+
+    /// Delimiter escapes: `\\` before the delimiter is an escaped backslash,
+    /// `\<newline>` in a replacement is a newline, and the character after a
+    /// `y` command is a separator.
+    #[test]
+    fn test_delimiter_escapes() {
+        sed_test(&["-n", "s/\\\\/X/p"], "a\\b\n", "aXb\n", "", 0);
+        sed_test(&["-n", "s|a\\|b|X|p"], "a|b\nab\n", "X\n", "", 0);
+        sed_test(&["s/o/\\\n/"], "foo\n", "f\no\n", "", 0);
+        sed_test(&["-n", "y/abc/xyz/;p"], "abc\n", "xyz\n", "", 0);
+    }
+
+    /// Execution semantics the context-address scripts above depend on.
+    #[test]
+    fn test_execution_semantics() {
+        // `s` replaces the whole match; `\1` is a subexpression of it.
+        sed_test(&["s/x\\(y\\)z/[\\1]/"], "axyzb\n", "a[y]b\n", "", 0);
+        sed_test(
+            &["-n", "s/[0-9]*\\.\\([0-9]*\\)/<&|\\1>/p"],
+            "v3.25\n",
+            "v<3.25|25>\n",
+            "",
+            0,
+        );
+        // An empty match next to the previous match is not a match.
+        sed_test(&["s/b*/x/g"], "abc\n", "xaxcx\n", "", 0);
+        // A block's address is tested once, on entry.
+        sed_test(&["-n", "/1/{s/1/N/;p;}"], "a1\nb2\n", "aN\n", "", 0);
+        // `N` honours its address; `D` restarts the script at its first command.
+        sed_test(&["$!N"], "a\nb\nc\n", "a\nb\nc\n", "", 0);
+        sed_test(&["$!N;P;D"], "1\n2\n3\n", "1\n2\n3\n", "", 0);
+        // `t` sees a substitution even when a later `s` fails.
+        sed_test(&["s/b/B/;s/z/Z/;ta;s/$/ no/;:a"], "abc\n", "aBc\n", "", 0);
+        // A range's end is not tested on its starting line.
+        sed_test(&["-n", "/a/,/a/p"], "a\nb\na\nc\n", "a\nb\na\n", "", 0);
+        sed_test(&["-n", "2,1p"], "a\nb\nc\n", "b\n", "", 0);
     }
 
     /// Run sed with `LC_ALL` set to `locale`, returning stdout.

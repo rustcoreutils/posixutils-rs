@@ -730,7 +730,7 @@ fn enter_exit_balanced_on_symlink_loop() {
         },
     );
 
-    assert_eq!(errors, [ftw::ErrorKind::Stat], "expected an ELOOP report");
+    assert_eq!(errors, [ftw::ErrorKind::Cycle], "expected a cycle report");
 }
 
 /// A directory that is readable but not searchable can still be enumerated: `opendir` needs read
@@ -784,6 +784,106 @@ fn readable_but_not_searchable_dir_is_enumerated() {
         1,
         "expected the walk to enumerate the directory and fail on the child: {errors:?}"
     );
+}
+
+/// The entry `postprocess_dir` receives says whether the directory being left is a symbolic link
+/// the walk followed, as the `file_handler` entry for it did. A caller that acts on the directory
+/// on the way out (`find -depth -delete` removes a followed link with `unlink`, a directory with
+/// `rmdir`) cannot tell the two apart from the metadata, which describes the target.
+#[test]
+fn postprocess_entry_says_whether_it_is_a_symlink() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("postprocess_entry_is_symlink")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+    fs::create_dir(root.join("real")).unwrap();
+    unix::fs::symlink("real", root.join("link")).unwrap();
+
+    let mut exits: Vec<(String, Option<bool>)> = Vec::new();
+    ftw::traverse_directory(
+        root,
+        |_| Ok(true),
+        |entry, _| {
+            if entry.dir_fd() != libc::AT_FDCWD {
+                exits.push((
+                    entry.file_name().to_string_lossy().to_string(),
+                    entry.is_symlink(),
+                ));
+            }
+            Ok(())
+        },
+        |entry, e| panic!("unexpected error on {}: {:?}", entry.path(), e.kind()),
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks: true,
+            ..Default::default()
+        },
+    );
+
+    exits.sort();
+    assert_eq!(
+        exits,
+        [
+            ("link".to_string(), Some(true)),
+            ("real".to_string(), Some(false)),
+        ]
+    );
+}
+
+/// A starting point that is a symbolic link loop is still an entry: a walk that does not follow
+/// links stats the link itself. `ELOOP` from resolving the whole path made the walk open it one
+/// component at a time, and opening the last component -- the loop -- failed.
+#[test]
+fn symlink_loop_operand_is_an_entry() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("symlink_loop_operand")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let operand = tmp_dir.path().join("self");
+    unix::fs::symlink("self", &operand).unwrap();
+
+    let mut seen = Vec::new();
+    let mut errors = Vec::new();
+    ftw::traverse_directory(
+        &operand,
+        |entry| {
+            seen.push((entry.path().to_string(), entry.is_symlink()));
+            Ok(true)
+        },
+        |_, _| Ok(()),
+        |entry, e| errors.push((entry.path().to_string(), e.kind())),
+        ftw::TraverseDirectoryOpts::default(),
+    );
+
+    assert_eq!(errors, []);
+    assert_eq!(seen, [(operand.to_string_lossy().to_string(), Some(true))]);
+}
+
+/// `is_executable_at` answers as `access(2)` with `X_OK` does, relative to a directory
+/// descriptor: for the real user, following a final symbolic link.
+#[test]
+fn is_executable_at_follows_access_semantics() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("is_executable_at")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+    fs::write(root.join("exe"), b"x").unwrap();
+    fs::set_permissions(root.join("exe"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(root.join("plain"), b"x").unwrap();
+    fs::set_permissions(root.join("plain"), fs::Permissions::from_mode(0o644)).unwrap();
+    unix::fs::symlink("exe", root.join("to_exe")).unwrap();
+    unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
+
+    let dir = fs::File::open(root).unwrap();
+    let ask = |name: &str| ftw::is_executable_at(dir.as_raw_fd(), &CString::new(name).unwrap());
+    assert!(ask("exe"));
+    assert!(ask("to_exe"), "a link to an executable is executable");
+    assert!(!ask("dangling"));
+    // No execute bit at all: not executable, even for the superuser.
+    assert!(!ask("plain"));
 }
 
 /// A path holding a NUL byte names no file. It used to reach `CString::new(..).unwrap()` and panic;

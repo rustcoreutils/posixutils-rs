@@ -66,7 +66,7 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
         body,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -149,7 +149,7 @@ fn test_asm_memory_operand_names_its_object() {
         body,
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -225,4 +225,41 @@ fn test_asm_memory_operand_keeps_an_address_something_else_reads() {
             );
         }
     }
+}
+
+/// A file-scope asm reaches the module in order, and every function and
+/// object records how many of them came before it -- including an object
+/// a function body defines, which belongs where the function is.
+#[test]
+fn test_file_scope_asm_places_definitions_between_them() {
+    let src = "
+int a = 1;
+__asm__(\".globl first\");
+int f(void) { static int s = 2; return a + s; }
+__asm__(\"second\" \"\\n\");
+__asm__(\"third\");
+int b = 3;
+";
+    let module = linearize_source(src, &Target::host());
+    assert_eq!(module.toplevel_asm, [".globl first", "second\n", "third"]);
+    let placed: Vec<(&str, usize)> = module
+        .globals
+        .iter()
+        .map(|g| (g.name.as_str(), g.asm_before))
+        .collect();
+    // `a`, then the function's static, then `b`.
+    let [("a", 0), (_, 1), ("b", 3)] = placed.as_slice() else {
+        panic!("{placed:?}");
+    };
+    let f = module.functions.iter().find(|f| f.name == "f").expect("f");
+    assert_eq!(f.asm_before, 1);
+}
+
+/// With no file-scope asm there is one run of definitions, all at 0.
+#[test]
+fn test_no_file_scope_asm_leaves_one_run() {
+    let module = linearize_source("int a = 1; int f(void) { return a; }", &Target::host());
+    assert!(module.toplevel_asm.is_empty());
+    assert!(module.globals.iter().all(|g| g.asm_before == 0));
+    assert!(module.functions.iter().all(|f| f.asm_before == 0));
 }

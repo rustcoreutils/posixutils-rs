@@ -170,6 +170,9 @@ impl<'a> Preprocessor<'a> {
         }
 
         match directive_id {
+            crate::kw::DEFINE | crate::kw::UNDEF if self.keep_definitions => {
+                self.handle_definition_kept(iter, output, idents, hash_token.pos, directive_id)
+            }
             crate::kw::DEFINE => self.handle_define(iter, idents, hash_token.pos),
             crate::kw::UNDEF => self.handle_undef(iter, idents, hash_token.pos),
             crate::kw::IFDEF => self.handle_ifdef(iter, idents, hash_token.pos),
@@ -348,12 +351,13 @@ impl<'a> Preprocessor<'a> {
         self.skip_to_eol(iter);
     }
 
-    /// A pragma's tokens, written back out as the directive they came from.
+    /// A directive's operand tokens, written back out as the directive they
+    /// came from.
     ///
     /// Spacing follows each token's own `whitespace` flag, so the line reads
     /// the way it was written rather than the way a default joiner would guess.
-    fn pragma_line_text(line: &[Token], idents: &IdentTable) -> String {
-        let mut out = String::from("#pragma");
+    fn directive_line_text(directive: &str, line: &[Token], idents: &IdentTable) -> String {
+        let mut out = format!("#{directive}");
         for (i, token) in line.iter().enumerate() {
             if i == 0 || token.pos.whitespace {
                 out.push(' ');
@@ -361,6 +365,44 @@ impl<'a> Preprocessor<'a> {
             out.push_str(&show_token(token, idents));
         }
         out
+    }
+
+    /// `#define` or `#undef` under `-dD`: handled as ever, then, if it took
+    /// effect, carried into the output as the directive it was, where it
+    /// stood. One that is skipped or refused is not carried, as gcc does not
+    /// print it.
+    fn handle_definition_kept(
+        &mut self,
+        iter: &mut TokenCursor,
+        output: &mut Vec<Token>,
+        idents: &IdentTable,
+        hash_pos: Position,
+        directive_id: crate::strings::StringId,
+    ) {
+        if self.is_skipping() {
+            self.skip_to_eol(iter);
+            return;
+        }
+        let line = self.collect_to_eol(iter);
+        let errors = diag::error_count();
+        let mut cursor = TokenCursor::new(line.clone());
+        let name = if directive_id == crate::kw::DEFINE {
+            self.handle_define(&mut cursor, idents, hash_pos);
+            "define"
+        } else {
+            self.handle_undef(&mut cursor, idents, hash_pos);
+            "undef"
+        };
+        if diag::error_count() != errors {
+            return;
+        }
+        let mut marker = Token::new(TokenType::Pragma, self.remap_pos(hash_pos));
+        marker.value = TokenValue::String(format!(
+            "{}{}",
+            PRAGMA_TEXT_PREFIX,
+            Self::directive_line_text(name, &line, idents)
+        ));
+        output.push(marker);
     }
 
     fn skip_to_eol(&self, iter: &mut TokenCursor) {
@@ -574,7 +616,12 @@ impl<'a> Preprocessor<'a> {
         self.define_macro(mac);
     }
 
-    fn handle_undef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
+    pub(super) fn handle_undef(
+        &mut self,
+        iter: &mut TokenCursor,
+        idents: &IdentTable,
+        pos: Position,
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -935,7 +982,7 @@ impl<'a> Preprocessor<'a> {
         let start = if is_include_next {
             SearchPos::after(self.current_search_pos)
         } else {
-            SearchPos::Quote(0)
+            SearchPos::IQuote(0)
         };
         let search_dirs = |dirs: &[String], at: fn(usize) -> SearchPos| {
             dirs.iter()
@@ -949,6 +996,11 @@ impl<'a> Preprocessor<'a> {
                 })
         };
 
+        if !is_system {
+            if let Some(found) = search_dirs(&self.iquote_include_paths, SearchPos::IQuote) {
+                return Some(found);
+            }
+        }
         if let Some(found) = search_dirs(&self.quote_include_paths, SearchPos::Quote) {
             return Some(found);
         }
@@ -1250,7 +1302,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Save current state
-        let saved_file = std::mem::replace(&mut self.current_file, format!("<builtin:{}>", name));
+        let saved_file = std::mem::replace(&mut self.current_file, bundled_header_stream(name));
         let saved_dir = std::mem::replace(&mut self.current_dir, ".".to_string());
         let saved_cond_stack = std::mem::take(&mut self.cond_stack);
         // A bundled header's `#include_next` continues into the system
@@ -1361,7 +1413,7 @@ impl<'a> Preprocessor<'a> {
         // and whatever they do not act on still has to be reproduced verbatim,
         // which needs the tokens as they were written.
         let line = self.collect_to_eol(iter);
-        let verbatim = Self::pragma_line_text(&line, idents);
+        let verbatim = Self::directive_line_text("pragma", &line, idents);
         let emit_verbatim = |pp: &mut Self, output: &mut Vec<Token>| {
             let mut marker = Token::new(TokenType::Pragma, pp.remap_pos(hash_pos));
             marker.value = TokenValue::String(format!("{}{}", PRAGMA_TEXT_PREFIX, verbatim));
@@ -1511,9 +1563,10 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
-        // Anything c17 does not act on -- `#pragma GCC ...`, `#pragma weak`,
+        // Anything the preprocessor does not act on -- `#pragma GCC ...`,
         // OpenMP, a vendor pragma -- is carried through unchanged rather than
-        // discarded.
+        // discarded. `#pragma weak` travels this way too, and the compiler
+        // reads it from the carried text (`pragma_weak_names`).
         emit_verbatim(self, output);
     }
 

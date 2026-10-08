@@ -7,15 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::HashSet;
+use std::cell::RefCell;
 use std::ffi::OsStr;
-use std::fs::{self, Metadata};
+use std::fs;
 use std::io::{self, BufRead, Write as IoWrite};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use plib::modestr;
 
@@ -94,6 +94,9 @@ enum PermMode {
     Exact(u32),
     /// At least all these bits are set (prefixed with -)
     AtLeast(u32),
+    /// Any of these bits is set, or no bits are given (prefixed with /): GNU
+    /// extension, forced by debhelper (dh_shlibdeps `-perm /111`)
+    Any(u32),
 }
 
 /// File types for -type primary
@@ -122,7 +125,7 @@ impl FileTypeMatch {
         }
     }
 
-    fn matches(&self, ft: &std::fs::FileType) -> bool {
+    fn matches(&self, ft: &ftw::FileType) -> bool {
         match self {
             FileTypeMatch::BlockDevice => ft.is_block_device(),
             FileTypeMatch::CharDevice => ft.is_char_device(),
@@ -178,9 +181,10 @@ enum Primary {
     // matches), preserving the "unknown user/group → no match" behavior.
     User(Option<u32>),
     Group(Option<u32>),
+    /// `-size`: the file size in `unit`-byte units, rounded up
     Size {
         cmp: NumericComparison,
-        in_bytes: bool,
+        unit: u64,
     },
     ATime(NumericComparison),
     CTime(NumericComparison),
@@ -188,11 +192,26 @@ enum Primary {
     Newer(SystemTime),
     NoUser,
     NoGroup,
+    /// `-true` / `-false`: GNU extensions, forced by debhelper (dh_fixperms,
+    /// dh_compress)
+    Const(bool),
+    /// `-regex`: GNU extension, forced by debhelper (dh_md5sums, dh_fixperms,
+    /// `-X`). Compiled from the Emacs syntax by [`emacs_regex_to_ere`].
+    Regex(plib::regex::Regex),
+    /// `-empty`: GNU extension, forced by debhelper (dh_install,
+    /// dh_installdocs)
+    Empty,
+    /// `-executable`: GNU extension, forced by debhelper (dh_movelibkdeinit)
+    Executable,
 
     // Actions
     Print,
     Print0,
+    Printf(Vec<PrintfItem>),
     Prune,
+    /// `-delete`: GNU extension, forced by debhelper (dh_doxygen,
+    /// dh_autotools-dev_restoreconfig)
+    Delete,
     Exec(ExecMode),
     Ok {
         utility: String,
@@ -203,6 +222,24 @@ enum Primary {
     Depth,
     XDev,
     Mount,
+    MinDepth(usize),
+    MaxDepth(usize),
+}
+
+/// One piece of a `-printf` format. GNU extension, forced by debhelper; only
+/// the directives its callers use are implemented.
+#[derive(Clone, Debug)]
+enum PrintfItem {
+    /// Literal bytes, escapes already resolved
+    Literal(Vec<u8>),
+    /// `%p`: the pathname
+    Path,
+    /// `%P`: the pathname with its starting point removed
+    RelativePath,
+    /// `%s`: the size in bytes
+    Size,
+    /// `%T@`: the modification time in seconds since the Epoch
+    MTimeEpoch,
 }
 
 /// Expression AST node
@@ -215,13 +252,19 @@ enum Expr {
 }
 
 /// Context for evaluating an expression against a file
-struct EvalContext<'a> {
-    /// Full path to the file
+struct EvalContext<'a, 'e> {
+    /// Full path to the file. Printed, matched and passed to `-exec`, never
+    /// resolved: every file-system operation goes through `entry`.
     path: &'a Path,
-    /// Metadata (may be symlink or target depending on -H/-L)
-    metadata: &'a Metadata,
-    /// Raw symlink metadata (for -type l checks with -L)
-    link_metadata: Option<&'a Metadata>,
+    /// The starting point (path operand) the file was found under
+    root: &'a Path,
+    /// The file as the walk found it: the descriptor of the directory that
+    /// holds it, and its name in that directory
+    entry: &'a ftw::Entry<'e>,
+    /// Metadata (the symlink's own, or its target's under -H/-L)
+    metadata: &'a ftw::Metadata,
+    /// Whether the entry itself is a symbolic link
+    is_symlink: bool,
     /// Initialization time (for -atime, -mtime, -ctime)
     init_time: SystemTime,
 }
@@ -257,11 +300,14 @@ struct FindState {
     xdev: bool,
     /// Whether -mount was specified anywhere in expression
     mount: bool,
-    /// (dev, ino) of the directories on the current descent path (for
-    /// file-system loop detection)
-    visited_inodes: HashSet<(u64, u64)>,
-    /// Path first seen at each visited inode, for the loop diagnostic
-    visited_paths: std::collections::HashMap<(u64, u64), PathBuf>,
+    /// `-mindepth`: entries shallower than this are walked but not evaluated
+    min_depth: usize,
+    /// `-maxdepth`: entries deeper than this are not walked
+    max_depth: Option<usize>,
+    /// -H / -L
+    symlink_mode: SymlinkMode,
+    /// Initialization time (for -atime, -mtime, -ctime)
+    init_time: SystemTime,
     /// One entry per `-exec ... {} +` primary, in source order; index is the
     /// primary's stamped `id`.
     exec_batches: Vec<ExecBatch>,
@@ -274,8 +320,10 @@ impl FindState {
             depth_first: false,
             xdev: false,
             mount: false,
-            visited_inodes: HashSet::new(),
-            visited_paths: std::collections::HashMap::new(),
+            min_depth: 0,
+            max_depth: None,
+            symlink_mode: SymlinkMode::Never,
+            init_time: SystemTime::now(),
             exec_batches: Vec::new(),
         }
     }
@@ -337,12 +385,38 @@ fn parse_expression(args: &[&str]) -> Result<Expr, String> {
     parse_or_expr(&tokens, &mut idx)
 }
 
+/// Is `tok` the OR operator? `-or` is GNU's spelling of `-o`, forced by
+/// debhelper (dh_install, dh_installdocs, dh_shlibdeps, `-X` exclusions).
+fn is_or(tok: &str) -> bool {
+    tok == "-o" || tok == "-or"
+}
+
+/// Is `tok` the AND operator? `-and` is GNU's spelling of `-a`, forced by
+/// debhelper (dh_install, dh_installdocs, dh_installexamples).
+fn is_and(tok: &str) -> bool {
+    tok == "-a" || tok == "-and"
+}
+
+/// Fail unless an operand follows operator `op`, whose operand would start
+/// at `tokens[idx]`. The wording is GNU find's.
+fn expect_operand(tokens: &[&str], idx: usize, op: &str) -> Result<(), String> {
+    match tokens.get(idx) {
+        None => Err(format!("expected an expression after '{op}'")),
+        Some(&")") => Err(format!("expected an expression between '{op}' and ')'")),
+        Some(&next) if is_or(next) || is_and(next) => Err(format!(
+            "invalid expression; you have used a binary operator '{next}' with nothing before it."
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Parse OR expression (lowest precedence)
 fn parse_or_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
     let mut left = parse_and_expr(tokens, idx)?;
 
-    while *idx < tokens.len() && tokens[*idx] == "-o" {
+    while *idx < tokens.len() && is_or(tokens[*idx]) {
         *idx += 1;
+        expect_operand(tokens, *idx, tokens[*idx - 1])?;
         let right = parse_and_expr(tokens, idx)?;
         left = Expr::Or(Box::new(left), Box::new(right));
     }
@@ -356,14 +430,15 @@ fn parse_and_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 
     while *idx < tokens.len() {
         let tok = tokens[*idx];
-        if tok == "-o" || tok == ")" {
+        if is_or(tok) || tok == ")" {
             break;
         }
-        if tok == "-a" {
+        if is_and(tok) {
             *idx += 1;
+            expect_operand(tokens, *idx, tok)?;
         }
         // Implicit AND by juxtaposition
-        if *idx >= tokens.len() || tokens[*idx] == "-o" || tokens[*idx] == ")" {
+        if *idx >= tokens.len() || is_or(tokens[*idx]) || tokens[*idx] == ")" {
             break;
         }
         let right = parse_unary_expr(tokens, idx)?;
@@ -381,6 +456,7 @@ fn parse_unary_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 
     if tokens[*idx] == "!" {
         *idx += 1;
+        expect_operand(tokens, *idx, "!")?;
         let expr = parse_unary_expr(tokens, idx)?;
         return Ok(Expr::Not(Box::new(expr)));
     }
@@ -466,8 +542,8 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         }
         "-size" => {
             let size_str = get_arg(tokens, idx, "-size")?;
-            let (cmp, in_bytes) = parse_size(size_str)?;
-            Ok(Expr::Primary(Primary::Size { cmp, in_bytes }))
+            let (cmp, unit) = parse_size(size_str)?;
+            Ok(Expr::Primary(Primary::Size { cmp, unit }))
         }
         "-atime" => {
             let n = get_arg(tokens, idx, "-atime")?;
@@ -508,10 +584,36 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
             Ok(Expr::Primary(Primary::Newer(mtime)))
         }
         "-nouser" => Ok(Expr::Primary(Primary::NoUser)),
+        "-true" => Ok(Expr::Primary(Primary::Const(true))),
+        "-false" => Ok(Expr::Primary(Primary::Const(false))),
+        "-empty" => Ok(Expr::Primary(Primary::Empty)),
+        "-executable" => Ok(Expr::Primary(Primary::Executable)),
+        "-regex" => {
+            let pattern = get_arg(tokens, idx, "-regex")?;
+            let ere = emacs_regex_to_ere(pattern)?;
+            let re = plib::regex::Regex::ere(&ere).map_err(|e| format!("-regex: {e}"))?;
+            Ok(Expr::Primary(Primary::Regex(re)))
+        }
         "-nogroup" => Ok(Expr::Primary(Primary::NoGroup)),
         "-print" => Ok(Expr::Primary(Primary::Print)),
         "-print0" => Ok(Expr::Primary(Primary::Print0)),
+        "-printf" => {
+            let format = get_arg(tokens, idx, "-printf")?;
+            Ok(Expr::Primary(Primary::Printf(parse_printf_format(format)?)))
+        }
+        "-mindepth" | "-maxdepth" => {
+            let n = get_arg(tokens, idx, tok)?;
+            let n = n
+                .parse::<usize>()
+                .map_err(|_| format!("invalid argument to {}: {}", tok, n))?;
+            Ok(Expr::Primary(if tok == "-mindepth" {
+                Primary::MinDepth(n)
+            } else {
+                Primary::MaxDepth(n)
+            }))
+        }
         "-prune" => Ok(Expr::Primary(Primary::Prune)),
+        "-delete" => Ok(Expr::Primary(Primary::Delete)),
         "-depth" => Ok(Expr::Primary(Primary::Depth)),
         "-xdev" => Ok(Expr::Primary(Primary::XDev)),
         "-mount" => Ok(Expr::Primary(Primary::Mount)),
@@ -525,6 +627,191 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         }
         _ => Err(format!("unknown primary: {}", tok)),
     }
+}
+
+/// Translate a `-regex` pattern from the Emacs syntax that is GNU find's
+/// default into a POSIX ERE that must match the whole pathname.
+///
+/// In the Emacs syntax `\(`, `\)` and `\|` group and alternate while a bare
+/// `(`, `)`, `|`, `{` and `}` are literals; `*`, `+` and `?` are operators
+/// except where nothing precedes them (the start, or after `^`, `\(` or
+/// `\|`); `^` and `$` anchor only at the start and end of the pattern or of a
+/// group or alternative; and a backslash before punctuation quotes it.
+/// Emacs-only escapes (`\w`, `\b`, `\<`, backreferences, ...) and character
+/// classes such as `[[:alpha:]]`, which the Emacs syntax does not have, are
+/// an error rather than a silently different match.
+fn emacs_regex_to_ere(pattern: &str) -> Result<String, String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::from("^(");
+    // True where an operator would have nothing to repeat.
+    let mut operand_start = true;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let at_start = std::mem::replace(&mut operand_start, false);
+        i += 1;
+        match c {
+            '*' | '+' | '?' if at_start => {
+                out.push('\\');
+                out.push(c);
+            }
+            '*' | '+' | '?' => {
+                // A run of stacked operators repeats one operand: the same
+                // operator twice is itself, any other mix matches as `*`.
+                // POSIX leaves adjacent duplication operators undefined
+                // and macOS's regcomp refuses them, so emit just one.
+                let mut op = c;
+                while let Some(&next @ ('*' | '+' | '?')) = chars.get(i) {
+                    if next != op {
+                        op = '*';
+                    }
+                    i += 1;
+                }
+                out.push(op);
+            }
+            '.' => out.push(c),
+            '^' if at_start => {
+                out.push('^');
+                operand_start = true;
+            }
+            '$' if matches!(&chars[i..], [] | ['\\', ')' | '|', ..]) => out.push('$'),
+            '^' | '$' | '(' | ')' | '|' | '{' | '}' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '[' => i = copy_bracket(&chars, i, pattern, &mut out)?,
+            '\\' => match chars.get(i) {
+                None => return Err(format!("-regex: trailing backslash in {pattern}")),
+                Some(&e) => {
+                    i += 1;
+                    match e {
+                        '(' | '|' => {
+                            out.push(e);
+                            operand_start = true;
+                        }
+                        ')' => out.push(')'),
+                        e if e.is_ascii_alphanumeric() || "`'<>=_".contains(e) => {
+                            return Err(format!("-regex: unsupported escape \\{e}"))
+                        }
+                        e => {
+                            out.push('\\');
+                            out.push(e);
+                        }
+                    }
+                }
+            },
+            c => out.push(c),
+        }
+    }
+    out.push_str(")$");
+    Ok(out)
+}
+
+/// Copy the bracket expression whose `[` precedes `chars[start]` to `out`,
+/// returning the index after its closing `]`. A backslash in it is a literal
+/// in both syntaxes; `[:`, `[=` and `[.` are POSIX-only and refused.
+fn copy_bracket(
+    chars: &[char],
+    start: usize,
+    pattern: &str,
+    out: &mut String,
+) -> Result<usize, String> {
+    let mut i = start;
+    if chars.get(i) == Some(&'^') {
+        i += 1;
+    }
+    if chars.get(i) == Some(&']') {
+        i += 1;
+    }
+    while i < chars.len() && chars[i] != ']' {
+        if chars[i] == '[' && matches!(chars.get(i + 1), Some(':' | '=' | '.')) {
+            return Err(format!(
+                "-regex: unsupported bracket expression in {pattern}"
+            ));
+        }
+        i += 1;
+    }
+    if i == chars.len() {
+        return Err(format!(
+            "-regex: unterminated bracket expression in {pattern}"
+        ));
+    }
+    out.push('[');
+    out.extend(&chars[start..=i]);
+    Ok(i + 1)
+}
+
+/// Parse a `-printf` format into literal runs and directives. Unsupported
+/// directives and escapes are an error, never silently wrong output.
+fn parse_printf_format(format: &str) -> Result<Vec<PrintfItem>, String> {
+    let mut items = Vec::new();
+    let mut literal = Vec::new();
+    let bytes = format.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let directive = match &bytes[i + 1..] {
+                    [b'%', ..] => None,
+                    [b'p', ..] => Some((PrintfItem::Path, 2)),
+                    [b'P', ..] => Some((PrintfItem::RelativePath, 2)),
+                    [b's', ..] => Some((PrintfItem::Size, 2)),
+                    [b'T', b'@', ..] => Some((PrintfItem::MTimeEpoch, 3)),
+                    rest => {
+                        let shown = rest
+                            .first()
+                            .map_or(String::new(), |b| (*b as char).to_string());
+                        return Err(format!("-printf: unsupported directive %{}", shown));
+                    }
+                };
+                match directive {
+                    None => {
+                        literal.push(b'%');
+                        i += 2;
+                    }
+                    Some((item, len)) => {
+                        if !literal.is_empty() {
+                            items.push(PrintfItem::Literal(std::mem::take(&mut literal)));
+                        }
+                        items.push(item);
+                        i += len;
+                    }
+                }
+            }
+            b'\\' => {
+                i += 1;
+                match bytes.get(i) {
+                    Some(b'n') => literal.push(b'\n'),
+                    Some(b'\\') => literal.push(b'\\'),
+                    Some(b'0'..=b'7') => {
+                        // `\NNN`: up to three octal digits (`\0` is NUL).
+                        let mut value = 0u32;
+                        let start = i;
+                        while i < bytes.len() && i < start + 3 && (b'0'..=b'7').contains(&bytes[i])
+                        {
+                            value = value * 8 + u32::from(bytes[i] - b'0');
+                            i += 1;
+                        }
+                        literal.push(value as u8);
+                        continue;
+                    }
+                    other => {
+                        let shown = other.map_or(String::new(), |b| (*b as char).to_string());
+                        return Err(format!("-printf: unsupported escape \\{}", shown));
+                    }
+                }
+                i += 1;
+            }
+            b => {
+                literal.push(b);
+                i += 1;
+            }
+        }
+    }
+    if !literal.is_empty() {
+        items.push(PrintfItem::Literal(literal));
+    }
+    Ok(items)
 }
 
 /// Get the next argument or return an error
@@ -543,6 +830,8 @@ fn parse_perm_mode(mode_str: &str) -> Result<PermMode, String> {
     if let Some(rest) = mode_str.strip_prefix('-') {
         let mode = parse_mode_value(rest)?;
         Ok(PermMode::AtLeast(mode))
+    } else if let Some(rest) = mode_str.strip_prefix('/') {
+        Ok(PermMode::Any(parse_mode_value(rest)?))
     } else {
         let mode = parse_mode_value(mode_str)?;
         Ok(PermMode::Exact(mode))
@@ -573,16 +862,20 @@ fn parse_mode_value(mode_str: &str) -> Result<u32, String> {
     }
 }
 
-/// Parse -size argument
-fn parse_size(s: &str) -> Result<(NumericComparison, bool), String> {
-    let (num_str, in_bytes) = if let Some(n) = s.strip_suffix('c') {
-        (n, true)
+/// Parse a `-size` argument into the comparison and its unit in bytes:
+/// 512-byte blocks by default, bytes with POSIX `c`, and KiB with GNU `k`
+/// (forced by debhelper's dh_compress `-size +4k`; no other GNU unit is).
+fn parse_size(s: &str) -> Result<(NumericComparison, u64), String> {
+    let (num_str, unit) = if let Some(n) = s.strip_suffix('c') {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('k') {
+        (n, 1024)
     } else {
-        (s, false)
+        (s, 512)
     };
 
     let cmp = NumericComparison::parse(num_str)?;
-    Ok((cmp, in_bytes))
+    Ok((cmp, unit))
 }
 
 /// Resolve username to UID
@@ -675,14 +968,17 @@ fn parse_ok(tokens: &[&str], idx: &mut usize) -> Result<(String, Vec<String>), S
 
 /// Check if expression contains any action
 fn has_action(expr: &Expr) -> bool {
-    match expr {
-        Expr::Primary(p) => matches!(
+    has_primary(expr, |p| {
+        matches!(
             p,
-            Primary::Print | Primary::Print0 | Primary::Exec(_) | Primary::Ok { .. }
-        ),
-        Expr::Not(e) => has_action(e),
-        Expr::And(l, r) | Expr::Or(l, r) => has_action(l) || has_action(r),
-    }
+            Primary::Print
+                | Primary::Print0
+                | Primary::Printf(_)
+                | Primary::Exec(_)
+                | Primary::Ok { .. }
+                | Primary::Delete
+        )
+    })
 }
 
 /// Give every `-exec ... {} +` primary its own aggregation set, stamping each
@@ -717,33 +1013,27 @@ fn register_exec_batches(expr: &mut Expr, batches: &mut Vec<ExecBatch>) {
     }
 }
 
-/// Check if expression contains -depth
-fn has_depth(expr: &Expr) -> bool {
+/// Does the expression contain a primary for which `pred` holds?
+fn has_primary(expr: &Expr, pred: fn(&Primary) -> bool) -> bool {
     match expr {
-        Expr::Primary(Primary::Depth) => true,
-        Expr::Not(e) => has_depth(e),
-        Expr::And(l, r) | Expr::Or(l, r) => has_depth(l) || has_depth(r),
-        _ => false,
+        Expr::Primary(p) => pred(p),
+        Expr::Not(e) => has_primary(e, pred),
+        Expr::And(l, r) | Expr::Or(l, r) => has_primary(l, pred) || has_primary(r, pred),
     }
 }
 
-/// Check if expression contains -xdev
-fn has_xdev(expr: &Expr) -> bool {
+/// Apply `-mindepth` / `-maxdepth`. As in GNU find they are global options:
+/// wherever they appear they limit the whole walk, and the last one wins.
+fn set_depth_limits(expr: &Expr, state: &mut FindState) {
     match expr {
-        Expr::Primary(Primary::XDev) => true,
-        Expr::Not(e) => has_xdev(e),
-        Expr::And(l, r) | Expr::Or(l, r) => has_xdev(l) || has_xdev(r),
-        _ => false,
-    }
-}
-
-/// Check if expression contains -mount
-fn has_mount(expr: &Expr) -> bool {
-    match expr {
-        Expr::Primary(Primary::Mount) => true,
-        Expr::Not(e) => has_mount(e),
-        Expr::And(l, r) | Expr::Or(l, r) => has_mount(l) || has_mount(r),
-        _ => false,
+        Expr::Primary(Primary::MinDepth(n)) => state.min_depth = *n,
+        Expr::Primary(Primary::MaxDepth(n)) => state.max_depth = Some(*n),
+        Expr::Not(e) => set_depth_limits(e, state),
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            set_depth_limits(l, state);
+            set_depth_limits(r, state);
+        }
+        _ => {}
     }
 }
 
@@ -797,20 +1087,16 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             let path_str = ctx.path.to_string_lossy();
             EvalResult::new(fnmatch(pattern, &path_str, *fold))
         }
-        Primary::Type(ft) => {
-            // When -L is used and checking for symlink, use link_metadata
-            if *ft == FileTypeMatch::Symlink {
-                if let Some(lm) = ctx.link_metadata {
-                    return EvalResult::new(lm.file_type().is_symlink());
-                }
-            }
-            EvalResult::new(ft.matches(&ctx.metadata.file_type()))
-        }
+        // POSIX -H/-L: a symbolic link that is followed has the type of the
+        // file it references, so `-type l` matches only a link that could
+        // not be followed (the walk then hands over the link's own metadata).
+        Primary::Type(ft) => EvalResult::new(ft.matches(&ctx.metadata.file_type())),
         Primary::Perm(mode) => {
-            let file_mode = ctx.metadata.permissions().mode() & 0o7777;
+            let file_mode = ctx.metadata.mode() & 0o7777;
             let matched = match mode {
                 PermMode::Exact(m) => file_mode == *m,
                 PermMode::AtLeast(m) => (file_mode & m) == *m,
+                PermMode::Any(m) => *m == 0 || file_mode & m != 0,
             };
             EvalResult::new(matched)
         }
@@ -820,13 +1106,8 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
         }
         Primary::User(uid) => EvalResult::new(*uid == Some(ctx.metadata.uid())),
         Primary::Group(gid) => EvalResult::new(*gid == Some(ctx.metadata.gid())),
-        Primary::Size { cmp, in_bytes } => {
-            let size = if *in_bytes {
-                ctx.metadata.len() as i64
-            } else {
-                // Size in 512-byte blocks, rounded up
-                ctx.metadata.len().div_ceil(512) as i64
-            };
+        Primary::Size { cmp, unit } => {
+            let size = ctx.metadata.size().div_ceil(*unit) as i64;
             EvalResult::new(cmp.matches(size))
         }
         Primary::ATime(cmp) => {
@@ -847,13 +1128,17 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             let days = time_diff_days(ctx.init_time, mtime);
             EvalResult::new(cmp.matches(days))
         }
-        Primary::Newer(ref_time) => {
-            if let Ok(mtime) = ctx.metadata.modified() {
-                EvalResult::new(mtime > *ref_time)
-            } else {
-                EvalResult::new(false)
-            }
+        Primary::Newer(ref_time) => EvalResult::new(modified(ctx.metadata) > *ref_time),
+        Primary::Const(value) => EvalResult::new(*value),
+        Primary::Empty => EvalResult::new(is_empty(ctx, state)),
+        Primary::Executable => {
+            // access(2) as GNU find asks it -- real user, final symlink
+            // followed -- but on the name in the directory the walk holds.
+            let (dir_fd, name) = (ctx.entry.dir_fd(), ctx.entry.file_name());
+            EvalResult::new(ftw::is_executable_at(dir_fd, name))
         }
+        Primary::Delete => EvalResult::new(delete_entry(ctx, state)),
+        Primary::Regex(re) => EvalResult::new(re.is_match_bytes(ctx.path.as_os_str().as_bytes())),
         Primary::NoUser => {
             let uid = ctx.metadata.uid();
             EvalResult::new(plib::user::get_by_uid(uid).is_none())
@@ -882,11 +1167,17 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             }
             result
         }
+        Primary::Printf(items) => {
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            let _ = handle.write_all(&format_printf(items, ctx));
+            EvalResult::new(true)
+        }
         Primary::Depth => {
             // Always true, affects traversal order (handled globally)
             EvalResult::new(true)
         }
-        Primary::XDev | Primary::Mount => {
+        Primary::XDev | Primary::Mount | Primary::MinDepth(_) | Primary::MaxDepth(_) => {
             // Always true, affects traversal (handled globally)
             EvalResult::new(true)
         }
@@ -905,6 +1196,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                         })
                         .collect();
 
+                    flush_stdout();
                     match Command::new(utility).args(&expanded_args).status() {
                         Ok(status) => EvalResult::new(status.success()),
                         Err(e) => {
@@ -949,6 +1241,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                 })
                 .collect();
 
+            flush_stdout();
             match Command::new(utility).args(&expanded_args).status() {
                 Ok(status) => EvalResult::new(status.success()),
                 Err(e) => {
@@ -959,6 +1252,92 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             }
         }
     }
+}
+
+/// `-empty`: a regular file of size zero, or a directory with no entries.
+/// A directory that cannot be read is reported and is not empty.
+///
+/// The directory is opened through the descriptor of the directory holding
+/// it, refusing a symbolic link the walk did not follow, and checked to be
+/// the directory the walk stat'ed (see `ftw::Entry::is_empty_dir`).
+fn is_empty(ctx: &EvalContext, state: &mut FindState) -> bool {
+    let ft = ctx.metadata.file_type();
+    if ft.is_file() {
+        return ctx.metadata.size() == 0;
+    }
+    if !ft.is_dir() {
+        return false;
+    }
+    match ctx.entry.is_empty_dir() {
+        Ok(empty) => empty,
+        Err(e) => {
+            eprintln!(
+                "find: '{}': {}",
+                ctx.path.display(),
+                plib::diag::io_error_text(&e)
+            );
+            state.had_error = true;
+            false
+        }
+    }
+}
+
+/// `-delete`: remove the entry itself (a symlink, never its target), a
+/// directory as `rmdir` does. As in GNU find, a starting point with no final
+/// name component such as `.` is left alone. A failure is reported and
+/// makes the primary false.
+///
+/// The removal is `unlinkat` of the entry's name in the directory the walk
+/// holds open, never a pathname: a directory above it swapped for a symbolic
+/// link cannot redirect it. If the name itself was replaced since the walk
+/// stat'ed it, the removal acts on the replacement, which is in the same
+/// directory and so still inside the tree; `AT_REMOVEDIR` on something that
+/// is no longer a directory fails with `ENOTDIR`.
+fn delete_entry(ctx: &EvalContext, state: &mut FindState) -> bool {
+    if ctx.path.file_name().is_none() {
+        return true;
+    }
+    let flags = if !ctx.is_symlink && ctx.metadata.is_dir() {
+        libc::AT_REMOVEDIR
+    } else {
+        0
+    };
+    let (dir_fd, name) = (ctx.entry.dir_fd(), ctx.entry.file_name());
+    match unsafe { libc::unlinkat(dir_fd, name.as_ptr(), flags) } {
+        0 => true,
+        _ => {
+            let e = io::Error::last_os_error();
+            eprintln!(
+                "find: cannot delete '{}': {}",
+                ctx.path.display(),
+                plib::diag::io_error_text(&e)
+            );
+            state.had_error = true;
+            false
+        }
+    }
+}
+
+/// Expand a parsed `-printf` format for one file.
+fn format_printf(items: &[PrintfItem], ctx: &EvalContext) -> Vec<u8> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            PrintfItem::Literal(bytes) => out.extend_from_slice(bytes),
+            PrintfItem::Path => out.extend_from_slice(ctx.path.as_os_str().as_bytes()),
+            PrintfItem::RelativePath => {
+                let rel = ctx.path.strip_prefix(ctx.root).unwrap_or(Path::new(""));
+                out.extend_from_slice(rel.as_os_str().as_bytes());
+            }
+            PrintfItem::Size => out.extend_from_slice(ctx.metadata.size().to_string().as_bytes()),
+            PrintfItem::MTimeEpoch => {
+                // GNU find 4.9 prints nanoseconds and a tenth digit.
+                let t = format!("{}.{:09}0", ctx.metadata.mtime(), ctx.metadata.mtime_nsec());
+                out.extend_from_slice(t.as_bytes());
+            }
+        }
+    }
+    out
 }
 
 /// Does `response` match the locale's affirmative pattern (`YESEXPR`)? Used by
@@ -995,169 +1374,190 @@ fn time_diff_days(init_time: SystemTime, file_time: SystemTime) -> i64 {
     secs / 86400
 }
 
-/// Get metadata for a path, following symlinks according to mode
-fn get_metadata(
-    path: &Path,
-    symlink_mode: SymlinkMode,
-    is_cmdline: bool,
-) -> io::Result<(Metadata, Option<Metadata>)> {
-    let follow = match symlink_mode {
-        SymlinkMode::Never => false,
-        SymlinkMode::CommandLineOnly => is_cmdline,
-        SymlinkMode::Always => true,
-    };
-
-    if follow {
-        // Try to get target metadata
-        match fs::metadata(path) {
-            Ok(m) => {
-                // Also get symlink metadata for -type l check
-                let link_meta = fs::symlink_metadata(path).ok();
-                Ok((m, link_meta))
-            }
-            Err(_) => {
-                // Target doesn't exist, use symlink metadata
-                let m = fs::symlink_metadata(path)?;
-                Ok((m.clone(), Some(m)))
-            }
-        }
+/// The modification time of `md`, to the nanosecond.
+fn modified(md: &ftw::Metadata) -> SystemTime {
+    let nsec = Duration::from_nanos(md.mtime_nsec() as u64);
+    let secs = Duration::from_secs(md.mtime().unsigned_abs());
+    if md.mtime() >= 0 {
+        SystemTime::UNIX_EPOCH + secs + nsec
     } else {
-        let m = fs::symlink_metadata(path)?;
-        Ok((m, None))
+        SystemTime::UNIX_EPOCH - secs + nsec
     }
 }
 
-/// Walk a directory tree and evaluate expression for each file
-fn walk_tree(
-    path: &Path,
-    expr: &Expr,
-    symlink_mode: SymlinkMode,
+/// One walk over a starting point, driven by `ftw::traverse_directory`.
+///
+/// ftw owns every file-system access of the descent: it opens each directory
+/// with `openat(parent_fd, name, O_DIRECTORY | O_NOFOLLOW)` (without
+/// `O_NOFOLLOW` only where -H/-L follow the link), checks that the directory
+/// it opened has the `(dev, ino)` it stat'ed, stats entries with `fstatat` on
+/// that descriptor, and hands each entry over as (parent descriptor, name).
+/// Nothing here resolves a pathname: the path is only printed and matched.
+struct Walk<'a> {
+    expr: &'a Expr,
+    /// The starting point, as given
+    root: &'a Path,
+    /// Components in `root`; an entry's depth is how many more its path has
+    root_components: usize,
+    /// Device of the starting point, for -xdev / -mount
     root_dev: u64,
-    init_time: SystemTime,
-    state: &mut FindState,
-    is_cmdline: bool,
-) {
-    // Get metadata
-    let (metadata, link_metadata) = match get_metadata(path, symlink_mode, is_cmdline) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!(
-                "find: '{}': {}",
-                path.display(),
-                plib::diag::io_error_text(&e)
-            );
-            state.had_error = true;
-            return;
-        }
-    };
-
-    // Check for cycles (infinite loop detection)
-    let inode_key = (metadata.dev(), metadata.ino());
-    if metadata.is_dir() && state.visited_inodes.contains(&inode_key) {
-        let ancestor = state
-            .visited_paths
-            .get(&inode_key)
-            .cloned()
-            .unwrap_or_else(|| path.to_path_buf());
-        eprintln!(
-            "find: File system loop detected; '{}' is part of the same file system loop as '{}'.",
-            path.display(),
-            ancestor.display()
-        );
-        state.had_error = true;
-        return;
-    }
-
-    // Device-crossing handling for -xdev / -mount. When a directory on a
-    // different device is encountered (not a command-line path operand):
-    //   -mount: do not act on it and do not descend (excludes the mount point).
-    //   -xdev:  act on it but do not descend (includes the mount point).
-    let on_other_dev = !is_cmdline && metadata.dev() != root_dev;
-    if on_other_dev && state.mount {
-        return;
-    }
-    let block_descend = on_other_dev && state.xdev;
-
-    let ctx = EvalContext {
-        path,
-        metadata: &metadata,
-        link_metadata: link_metadata.as_ref(),
-        init_time,
-    };
-
-    // If depth-first, process children before this entry
-    if state.depth_first && metadata.is_dir() && !block_descend {
-        state.visited_inodes.insert(inode_key);
-        state.visited_paths.insert(inode_key, path.to_path_buf());
-        process_children(path, expr, symlink_mode, root_dev, init_time, state);
-        state.visited_inodes.remove(&inode_key);
-        state.visited_paths.remove(&inode_key);
-    }
-
-    // Evaluate expression for this entry
-    let result = evaluate(expr, &ctx, state);
-
-    // Handle batched exec files. Every id was assigned by
-    // register_exec_batches() over this same expression, so it indexes a
-    // registered batch.
-    for (id, batch_path) in result.exec_batch_files {
-        if let Some(batch) = state.exec_batches.get_mut(id) {
-            batch.files.push(batch_path);
-        }
-    }
-
-    // If not depth-first and is directory, process children
-    if !state.depth_first && metadata.is_dir() && !result.prune && !block_descend {
-        state.visited_inodes.insert(inode_key);
-        state.visited_paths.insert(inode_key, path.to_path_buf());
-        process_children(path, expr, symlink_mode, root_dev, init_time, state);
-        state.visited_inodes.remove(&inode_key);
-        state.visited_paths.remove(&inode_key);
-    }
+    /// The directories being descended, outermost first: `(dev, ino)` and
+    /// path of each, for file-system loop detection. Index `i` is depth `i`.
+    ancestors: Vec<((u64, u64), PathBuf)>,
+    state: &'a mut FindState,
 }
 
-/// Process children of a directory
-fn process_children(
-    dir: &Path,
-    expr: &Expr,
-    symlink_mode: SymlinkMode,
-    root_dev: u64,
-    init_time: SystemTime,
-    state: &mut FindState,
-) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("find: '{}': {}", dir.display(), e);
-            state.had_error = true;
-            return;
-        }
-    };
+impl Walk<'_> {
+    fn depth_of(&self, path: &Path) -> usize {
+        path.components()
+            .count()
+            .saturating_sub(self.root_components)
+    }
 
-    for entry in entries {
-        match entry {
-            Ok(e) => {
-                walk_tree(
-                    &e.path(),
-                    expr,
-                    symlink_mode,
-                    root_dev,
-                    init_time,
-                    state,
-                    false,
+    /// ftw's `file_handler`: act on `entry` now unless -depth puts it after
+    /// its contents, and say whether to descend into it.
+    fn enter(&mut self, entry: &ftw::Entry) -> bool {
+        let path = entry.path().as_inner().to_path_buf();
+        let depth = self.depth_of(&path);
+        // Normally a no-op: `leave` pops each level. ftw skips `leave` for a
+        // directory whose (descriptor-conserving) parent it cannot reopen, so
+        // the depth, which never goes stale, decides.
+        self.ancestors.truncate(depth);
+        let Some(md) = entry.metadata() else {
+            return false;
+        };
+        if depth == 0 {
+            self.root_dev = md.dev();
+        }
+
+        let key = (md.dev(), md.ino());
+        if md.is_dir() {
+            if let Some((_, ancestor)) = self.ancestors.iter().find(|(k, _)| *k == key) {
+                eprintln!(
+                    "find: File system loop detected; '{}' is part of the same file system loop as '{}'.",
+                    path.display(),
+                    ancestor.display()
                 );
+                self.state.had_error = true;
+                return false;
             }
-            Err(e) => {
-                eprintln!("find: error reading directory '{}': {}", dir.display(), e);
-                state.had_error = true;
+        }
+
+        // Device-crossing handling for -xdev / -mount. When a directory on a
+        // different device is encountered (not a command-line path operand):
+        //   -mount: do not act on it and do not descend (excludes the mount point).
+        //   -xdev:  act on it but do not descend (includes the mount point).
+        let on_other_dev = depth > 0 && md.dev() != self.root_dev;
+        if on_other_dev && self.state.mount {
+            return false;
+        }
+        let descend = md.is_dir()
+            && !(on_other_dev && self.state.xdev)
+            && self.state.max_depth.is_none_or(|max| depth < max);
+
+        // With -depth a directory is acted on in `leave`, after its contents.
+        let prune = !(self.state.depth_first && descend) && self.visit(entry, &path, md, depth);
+        if descend && !prune {
+            self.ancestors.push((key, path));
+        }
+        descend && !prune
+    }
+
+    /// ftw's `postprocess_dir`: done with a directory `enter` descended into,
+    /// whether or not ftw managed to open it. `entry` is relative to the
+    /// parent's descriptor, as in `enter`.
+    fn leave(&mut self, entry: &ftw::Entry) {
+        let path = entry.path().as_inner().to_path_buf();
+        let depth = self.depth_of(&path);
+        self.ancestors.truncate(depth);
+        if self.state.depth_first {
+            if let Some(md) = entry.metadata() {
+                self.visit(entry, &path, md, depth);
             }
         }
     }
+
+    /// Evaluate the expression for one entry, unless it is above -mindepth.
+    /// Returns whether it asked to prune.
+    fn visit(&mut self, entry: &ftw::Entry, path: &Path, md: &ftw::Metadata, depth: usize) -> bool {
+        if depth < self.state.min_depth {
+            return false;
+        }
+        let ctx = EvalContext {
+            path,
+            root: self.root,
+            entry,
+            metadata: md,
+            is_symlink: entry.is_symlink().unwrap_or(false),
+            init_time: self.state.init_time,
+        };
+        let result = evaluate(self.expr, &ctx, self.state);
+
+        // Handle batched exec files. Every id was assigned by
+        // register_exec_batches() over this same expression, so it indexes a
+        // registered batch.
+        for (id, batch_path) in result.exec_batch_files {
+            if let Some(batch) = self.state.exec_batches.get_mut(id) {
+                batch.files.push(batch_path);
+            }
+        }
+        result.prune
+    }
+
+    /// ftw's `err_reporter`.
+    fn report(&mut self, entry: &ftw::Entry, error: ftw::Error) {
+        let path = entry.path();
+        let kind = error.kind();
+        let text = plib::diag::io_error_text(&error.inner());
+        if kind == ftw::ErrorKind::ReadDir {
+            eprintln!("find: error reading directory '{}': {}", path, text);
+        } else {
+            eprintln!("find: '{}': {}", path, text);
+        }
+        self.state.had_error = true;
+    }
+}
+
+/// Walk the tree under the starting point `root`, evaluating the expression
+/// for each file.
+fn walk_operand(root: &Path, expr: &Expr, state: &mut FindState) {
+    let opts = ftw::TraverseDirectoryOpts {
+        follow_symlinks_on_args: state.symlink_mode == SymlinkMode::CommandLineOnly,
+        follow_symlinks: state.symlink_mode == SymlinkMode::Always,
+        ..Default::default()
+    };
+    let walk = RefCell::new(Walk {
+        expr,
+        root,
+        root_components: root.components().count(),
+        root_dev: 0,
+        ancestors: Vec::new(),
+        state,
+    });
+    // The result only summarizes: every error has reached `report`, and a
+    // starting point that is not a directory also counts as `false`.
+    ftw::traverse_directory(
+        root,
+        |entry| Ok(walk.borrow_mut().enter(&entry)),
+        |entry, _| {
+            walk.borrow_mut().leave(&entry);
+            Ok(())
+        },
+        |entry, error| walk.borrow_mut().report(&entry, error),
+        opts,
+    );
+}
+
+/// Flush what find has written so far, so that it reaches standard output
+/// before anything a child utility writes there.
+fn flush_stdout() {
+    let _ = io::stdout().flush();
 }
 
 /// Run one `-exec ... {} +` invocation over a chunk of files. Returns whether
 /// it exited successfully.
 fn run_exec_command(utility: &str, args_before: &[String], files: &[PathBuf]) -> bool {
+    flush_stdout();
     let mut cmd = Command::new(utility);
     cmd.args(args_before);
     cmd.args(files);
@@ -1230,41 +1630,27 @@ fn find(args: Vec<String>) -> Result<i32, String> {
 
     // Set up state
     let mut state = FindState::new();
-    state.depth_first = has_depth(&expr);
-    state.xdev = has_xdev(&expr);
-    state.mount = has_mount(&expr);
+    let depth = has_primary(&expr, |p| matches!(p, Primary::Depth));
+    // GNU: -delete implies -depth, so a -prune next to it would do nothing.
+    let delete = has_primary(&expr, |p| matches!(p, Primary::Delete));
+    if delete && !depth && has_primary(&expr, |p| matches!(p, Primary::Prune)) {
+        return Err(
+            "-delete implies -depth, which makes -prune do nothing; give -depth explicitly to go ahead"
+                .to_string(),
+        );
+    }
+    state.depth_first = depth || delete;
+    state.xdev = has_primary(&expr, |p| matches!(p, Primary::XDev));
+    state.mount = has_primary(&expr, |p| matches!(p, Primary::Mount));
+    state.symlink_mode = symlink_mode;
+    set_depth_limits(&expr, &mut state);
 
     // Give every `-exec ... {} +` primary its own aggregation set, in source
     // order, before the walk begins.
     register_exec_batches(&mut expr, &mut state.exec_batches);
 
-    let init_time = SystemTime::now();
-
-    // Process each path
     for path in paths {
-        // Get root device for -xdev
-        let root_dev = match fs::metadata(&path) {
-            Ok(m) => m.dev(),
-            Err(e) => {
-                eprintln!(
-                    "find: '{}': {}",
-                    path.display(),
-                    plib::diag::io_error_text(&e)
-                );
-                state.had_error = true;
-                continue;
-            }
-        };
-
-        walk_tree(
-            &path,
-            &expr,
-            symlink_mode,
-            root_dev,
-            init_time,
-            &mut state,
-            true,
-        );
+        walk_operand(&path, &expr, &mut state);
     }
 
     // Execute any pending batched commands
@@ -1288,5 +1674,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("find: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::emacs_regex_to_ere;
+
+    /// Stacked postfix operators. The Emacs syntax allows them (`c++`
+    /// matches as `c+`); a POSIX ERE leaves adjacent duplication operators
+    /// undefined, and macOS's regcomp refuses them ("repetition-operator
+    /// operand invalid"). The translation collapses a run into the one
+    /// operator with the same match: the same operator twice is itself, any
+    /// other mix is `*`.
+    #[test]
+    fn stacked_operators_collapse_to_one() {
+        for (emacs, ere) in [
+            (".*/c++", "^(.*/c+)$"),
+            ("a**", "^(a*)$"),
+            ("a??", "^(a?)$"),
+            ("a+*", "^(a*)$"),
+            ("a*+", "^(a*)$"),
+            ("a?+", "^(a*)$"),
+            ("a+?", "^(a*)$"),
+            ("a+++", "^(a+)$"),
+            ("a+?+", "^(a*)$"),
+            ("\\(ab\\)+*", "^((ab)*)$"),
+            ("[xy]?*", "^([xy]*)$"),
+        ] {
+            assert_eq!(emacs_regex_to_ere(emacs).as_deref(), Ok(ere), "{emacs}");
+        }
+        // An operator with nothing before it is still a literal, and one
+        // after it is an ordinary operator on that literal.
+        assert_eq!(emacs_regex_to_ere("+a").as_deref(), Ok("^(\\+a)$"));
+        assert_eq!(emacs_regex_to_ere("*+").as_deref(), Ok("^(\\*+)$"));
     }
 }

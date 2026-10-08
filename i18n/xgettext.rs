@@ -697,6 +697,8 @@ impl Walker {
                         }
                     }
                 }
+                // Assembler text holds no gettext call.
+                ExternalDecl::Asm { .. } => {}
             }
         }
 

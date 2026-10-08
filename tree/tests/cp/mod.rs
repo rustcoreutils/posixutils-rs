@@ -7,6 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod debhelper;
+mod race;
+
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;
 use std::io::{Read, Write};
@@ -1783,6 +1786,240 @@ fn test_cp_special_fifo_keeps_set_id_bits() {
         setuid,
         "the set-user-ID bit was dropped from the FIFO"
     );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// Make `command`'s process answer system call `nr` with EPERM, through a seccomp filter
+/// installed just before exec -- as a container runtime or systemd's `SystemCallFilter=` does.
+/// Every other system call is allowed.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn deny_syscall_with_eperm(command: &mut Command, nr: u32) {
+    use std::os::unix::process::CommandExt;
+
+    #[repr(C)]
+    struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const SockFilter,
+    }
+    // BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_RET|BPF_K; SECCOMP_RET_ERRNO and
+    // SECCOMP_RET_ALLOW. Offset 0 of the seccomp data is the system call number.
+    const LD_NR: u16 = 0x20;
+    const JEQ: u16 = 0x15;
+    const RET: u16 = 0x06;
+    const RET_ERRNO: u32 = 0x0005_0000;
+    const RET_ALLOW: u32 = 0x7fff_0000;
+    const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+    const PR_SET_SECCOMP: libc::c_int = 22;
+    const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+    let eperm = RET_ERRNO | u32::try_from(libc::EPERM).unwrap();
+
+    unsafe {
+        command.pre_exec(move || {
+            let filter = [
+                SockFilter {
+                    code: LD_NR,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                SockFilter {
+                    code: JEQ,
+                    jt: 0,
+                    jf: 1,
+                    k: nr,
+                },
+                SockFilter {
+                    code: RET,
+                    jt: 0,
+                    jf: 0,
+                    k: eperm,
+                },
+                SockFilter {
+                    code: RET,
+                    jt: 0,
+                    jf: 0,
+                    k: RET_ALLOW,
+                },
+            ];
+            let prog = SockFprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr(),
+            };
+            if libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Under a seccomp filter that answers `fchmodat2` with EPERM, as older runc and systemd's
+/// `SystemCallFilter=` do for system calls they do not know, `cp -p` still sets a made FIFO's
+/// mode, through the verified procfs path.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2() {
+    // fchmodat2 is 452 on both architectures.
+    const SYS_FCHMODAT2: u32 = 452;
+
+    let test_dir = &format!(
+        "{}/test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir(test_dir).unwrap();
+    let fifo = &format!("{test_dir}/fifo");
+    let copy = &format!("{test_dir}/copy");
+    mkfifo_at(fifo, 0o640);
+    fs::set_permissions(fifo, fs::Permissions::from_mode(0o4640)).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cp"));
+    command.args(["-pR", fifo, copy]).stdin(Stdio::null());
+    deny_syscall_with_eperm(&mut command, SYS_FCHMODAT2);
+    let out = command.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::symlink_metadata(copy).unwrap().permissions().mode() & 0o7777,
+        0o4640
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// A terminal cp copies from must not become its controlling terminal: cp is run as a session
+/// leader with none, reading a pty's slave side, and the master is asked which session the
+/// terminal now controls.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_cp_does_not_acquire_a_controlling_terminal() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+
+    let test_dir = &format!(
+        "{}/test_cp_does_not_acquire_a_controlling_terminal",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(test_dir).unwrap();
+
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    assert!(master >= 0);
+    let master = unsafe { fs::File::from_raw_fd(master) };
+    assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
+    assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
+    let mut name = [0 as libc::c_char; 128];
+    assert_eq!(
+        unsafe { libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) },
+        0
+    );
+    let slave = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let mut child = unsafe {
+        Command::new(env!("CARGO_BIN_EXE_cp"))
+            .args([slave.as_str(), &format!("{test_dir}/out")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+            .unwrap()
+    };
+
+    // Give cp time to open the terminal and start reading it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut controlling = None;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let sid = unsafe { libc::tcgetsid(master.as_raw_fd()) };
+        if sid != -1 {
+            controlling = Some(sid);
+            break;
+        }
+    }
+    // End of file on the terminal ends cp's read.
+    (&master).write_all(b"\x04").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        controlling, None,
+        "cp made the terminal it read its controlling terminal"
+    );
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// `cp -p` gives the copy the source's access time as it was before cp read it, as GNU does.
+/// With an access time older than the modification time, `relatime` (and `strictatime`)
+/// update it on the read, so a time taken afterwards would be the time of the copy. Directories
+/// are read by the walk before their attributes are applied, so the same holds for them.
+#[test]
+fn test_cp_p_keeps_the_access_time_from_before_the_read() {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let test_dir = &format!(
+        "{}/test_cp_p_keeps_the_access_time_from_before_the_read",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(format!("{test_dir}/dir")).unwrap();
+    fs::write(format!("{test_dir}/dir/file"), b"contents").unwrap();
+    let atime = UNIX_EPOCH + Duration::from_secs(978_307_200); // 2001
+    let mtime = UNIX_EPOCH + Duration::from_secs(1_009_843_200); // 2002
+    let times = fs::FileTimes::new().set_accessed(atime).set_modified(mtime);
+    for path in [format!("{test_dir}/dir/file"), format!("{test_dir}/dir")] {
+        fs::File::open(&path).unwrap().set_times(times).unwrap();
+    }
+
+    cp_test(
+        &[
+            "-pR",
+            &format!("{test_dir}/dir"),
+            &format!("{test_dir}/copy"),
+        ],
+        "",
+        "",
+        0,
+    );
+
+    for copy in [format!("{test_dir}/copy/file"), format!("{test_dir}/copy")] {
+        let md = fs::metadata(&copy).unwrap();
+        assert_eq!(md.atime(), 978_307_200, "access time of {copy}");
+        assert_eq!(md.mtime(), 1_009_843_200, "modification time of {copy}");
+    }
 
     fs::remove_dir_all(test_dir).unwrap();
 }

@@ -568,6 +568,7 @@ define_keywords! {
     (BUILTIN_TYPES_COMPATIBLE_P, "__builtin_types_compatible_p", BUILTIN),
     (BUILTIN_CLASSIFY_TYPE, "__builtin_classify_type", BUILTIN),
     (BUILTIN_UNREACHABLE, "__builtin_unreachable", BUILTIN),
+    (BUILTIN_UNWIND_INIT, "__builtin_unwind_init", BUILTIN),
     (BUILTIN_SETJMP,    "__builtin_setjmp",   BUILTIN),
     (BUILTIN_LONGJMP,   "__builtin_longjmp",  BUILTIN),
     (BUILTIN_OFFSETOF,  "__builtin_offsetof", BUILTIN),
@@ -1125,6 +1126,8 @@ define_keywords! {
     (_, "copy",                    SUPPORTED_ATTR),
     (_, "designated_init",         SUPPORTED_ATTR),
     (_, "may_alias",               SUPPORTED_ATTR),
+    // How gcc optimizes one function, which ignoring cannot make wrong.
+    (_, "optimize",                SUPPORTED_ATTR),
     // GNU forms (__foo__)
     // Note: __noreturn__ is already defined above with NORETURN_KW | SUPPORTED_ATTR
     (_, "__unused__",           SUPPORTED_ATTR),
@@ -1179,6 +1182,7 @@ define_keywords! {
     (_, "__copy__",                  SUPPORTED_ATTR),
     (_, "__designated_init__",       SUPPORTED_ATTR),
     (_, "__may_alias__",             SUPPORTED_ATTR),
+    (_, "__optimize__",              SUPPORTED_ATTR),
     // GCC's complex-part operators. Appended, because `define_ids!` numbers
     // entries by table position. Both spellings of each, as gcc accepts.
     (REAL_KW,           "__real__",          RESERVED_NAME),
@@ -1221,6 +1225,12 @@ define_keywords! {
     (CPOW,              "cpow",              0),
     (CPOWF,             "cpowf",             0),
     (CPOWL,             "cpowl",             0),
+    // `stack_protect` and `no_stack_protector`: a function's own say over
+    // `-fstack-protector`. Appended, as above.
+    (_, "stack_protect",             SUPPORTED_ATTR),
+    (_, "__stack_protect__",         SUPPORTED_ATTR),
+    (_, "no_stack_protector",        SUPPORTED_ATTR),
+    (_, "__no_stack_protector__",    SUPPORTED_ATTR),
 }
 
 // Tag query API
@@ -1609,6 +1619,8 @@ mod tests {
             "__target__",
             "target_clones",
             "__target_clones__",
+            "optimize",
+            "__optimize__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

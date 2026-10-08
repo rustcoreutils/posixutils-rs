@@ -189,18 +189,25 @@ fn diagnostics_computed_goto_requires_a_pointer() {
     );
 }
 
-/// An index range after a field designator is refused, not silently dropped.
+/// An index range after a field designator takes a constant value.
 ///
-/// `.m[0 ... 3] = v` resolves through the designator chain, which yields one
-/// offset where a range names many, so it initialized nothing at all and said
-/// nothing about it. The nested spelling does the same job.
+/// `.m[0 ... 3] = v` stands for one designation per index (binutils'
+/// i386-dis.c writes `.op_index[0 ... MAX_OPERANDS - 1] = -1`), which is
+/// only the same thing as gcc's once-evaluated range when evaluating `v`
+/// several times cannot be told from once. A value that is not a constant
+/// is refused rather than silently evaluated again.
 #[test]
 fn diagnostics_index_range_after_field_designator() {
-    compile_expect_error(
+    compile_expect_ok(
         "range_after_field",
         "struct S { int m[4]; int t; };\nstruct S s = { .m[0 ... 3] = 7, .t = 9 };\n\
-         int main(void){ return s.m[0]; }\n",
-        "index range is not supported after a field designator",
+         int main(void){ return (s.m[0] == 7 && s.m[3] == 7 && s.t == 9) ? 0 : 1; }\n",
+    );
+    compile_expect_error(
+        "range_after_field_not_constant",
+        "struct S { int m[4]; int t; };\n\
+         int f(int *p){ struct S s = { .m[0 ... 3] = (*p)++ }; return s.m[0]; }\n",
+        "index range after a field designator needs a constant value",
     );
     // The nested form works and is what the diagnostic points at.
     compile_expect_ok(

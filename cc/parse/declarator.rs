@@ -508,22 +508,17 @@ impl Parser<'_> {
     ///
     /// Storage class is not part of a type, but the declaration binders read
     /// it off the declarator's type -- `extern int *p` needs `EXTERN` on the
-    /// pointer, `typedef int a[3]` `TYPEDEF` on the array. A function
-    /// declarator carries it on its *return* type instead: that is the type a
-    /// function definition is emitted from, and the linearizer reads `extern`
-    /// there. The function type itself stays bare.
+    /// pointer, `typedef int a[3]` `TYPEDEF` on the array. A function type
+    /// stays bare, and so does its return type: a function definition's
+    /// storage class is its `FunctionDef::storage_class`, since a struct
+    /// return type -- the tag's one shared type -- could never carry it.
     fn carry_storage_class(&mut self, base: TypeId, derived: TypeId) -> TypeId {
         let storage = self.types.modifiers(base) & Type::STORAGE_CLASS;
-        if storage.is_empty() || derived == base {
+        if storage.is_empty() || derived == base || self.types.kind(derived) == TypeKind::Function {
             return derived;
         }
         let mut typ = self.types.get(derived).clone();
-        if typ.kind == TypeKind::Function {
-            let ret = typ.base.expect("a function type has a return type");
-            typ.base = Some(self.carry_storage_class(base, ret));
-        } else {
-            typ.modifiers |= storage;
-        }
+        typ.modifiers |= storage;
         self.types.intern(typ)
     }
 

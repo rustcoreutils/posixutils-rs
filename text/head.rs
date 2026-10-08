@@ -8,6 +8,7 @@
 //
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::io::{self, Read, StdoutLock, Write};
 use std::path::{Path, PathBuf};
 
@@ -21,7 +22,12 @@ const N_C_GROUP: &str = "N_C_GROUP";
 /// head - copy the first part of files
 /// If neither -n nor -c are specified, copies the first 10 lines of each file (-n 10).
 #[derive(Parser)]
-#[command(version, about = gettext("head - copy the first part of files"))]
+#[command(
+    version,
+    args_override_self = true,
+    about = gettext("head - copy the first part of files"),
+    after_help = gettext("The historical form -number is accepted as -n number wherever an option may appear; the last -n or -number given wins.")
+)]
 struct Args {
     #[arg(long = "lines", short, value_parser = clap::value_parser!(usize), group = N_C_GROUP,
           help = gettext("The first <N> lines of each input file shall be copied to standard output (mutually exclusive with -c)"))]
@@ -35,6 +41,44 @@ struct Args {
 
     #[arg(help = gettext("Files to read as input."))]
     files: Vec<PathBuf>,
+}
+
+/// True when `arg` is the historical `-number` option: a '-' followed by one
+/// or more decimal digits.
+fn is_historical_count(arg: &str) -> bool {
+    arg.strip_prefix('-')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Rewrite every historical `-number` option into `-n number`.
+///
+/// POSIX.1-2024 head has only `-n number`; earlier versions of the standard
+/// allowed `-number`, removed in Issue 6, and "may be present in some
+/// implementations" (RATIONALE).  Scanning stops at `--`, and the
+/// option-argument of a separate `-n` or `-c` is passed through untouched, so
+/// a word is rewritten only where clap would read it as an option.
+fn expand_historical_count(argv: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut iter = argv.into_iter();
+    let mut out: Vec<OsString> = iter.next().into_iter().collect();
+    while let Some(arg) = iter.next() {
+        match arg.to_str() {
+            Some("--") => {
+                out.push(arg);
+                out.extend(iter);
+                break;
+            }
+            Some("-n" | "-c" | "--lines" | "--bytes") => {
+                out.push(arg);
+                out.extend(iter.next());
+            }
+            Some(s) if is_historical_count(s) => {
+                out.push(OsString::from("-n"));
+                out.push(OsString::from(&s[1..]));
+            }
+            _ => out.push(arg),
+        }
+    }
+    out
 }
 
 enum CountType {
@@ -148,7 +192,7 @@ fn head_file(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("head");
 
-    let mut args = Args::parse();
+    let mut args = Args::parse_from(expand_historical_count(std::env::args_os()));
 
     // POSIX makes "the number is a positive integer" a constraint on the
     // application, not a reason for head to fail: a count of zero selects

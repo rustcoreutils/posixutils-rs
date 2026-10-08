@@ -280,13 +280,29 @@ fn c17_accepts_every_documented_std_spelling() {
     }
 }
 
+/// `__GLIBC__` and `__GLIBC_MINOR__` are glibc's macros: <features.h>
+/// defines them, and neither ISO C nor gcc predefines them. c17 predefined
+/// them, which broke binutils: its config.h opens with
+/// `#if defined(__GLIBC__) && !defined(__CONFIG_H__)` / `#error config.h must
+/// be #included before system headers`, and every bfd source failed. Once a
+/// system header is in, they are the values of the features.h on the
+/// include path.
 #[test]
 #[cfg(target_os = "linux")]
-fn c17_glibc_minor_matches_the_host() {
-    // Audit #C3: this was hardcoded to 17 ("conservative baseline") while the
-    // host reported 2.39, so any code testing __GLIBC_PREREQ *before* including
-    // a system header got the wrong answer. Read the same features.h the
-    // compilation will use, rather than guessing.
+fn c17_glibc_version_comes_from_features_h() {
+    for name in ["__GLIBC__", "__GLIBC_MINOR__"] {
+        let value = expand_under("glibc_none", None, name);
+        assert!(is_undefined(&value, name), "{name} is predefined: {value}");
+    }
+
+    let guard = "#if defined(__GLIBC__) && !defined(__CONFIG_H__)\n\
+                 #error config.h must be #included before system headers\n\
+                 #endif\n\
+                 #define __CONFIG_H__ 1\n\
+                 #include <stdio.h>\n";
+    let run = preprocess_text("glibc_config_guard", guard, &[]);
+    assert!(run.success, "{}", run.stderr);
+
     let Ok(features) = std::fs::read_to_string("/usr/include/features.h") else {
         // Not a glibc host; nothing to compare against.
         return;
@@ -307,15 +323,14 @@ fn c17_glibc_minor_matches_the_host() {
         return;
     };
 
-    assert_eq!(
-        expand_under("glibc_major", None, "__GLIBC__"),
-        want_major,
-        "__GLIBC__ should match features.h"
-    );
-    assert_eq!(
-        expand_under("glibc_minor", None, "__GLIBC_MINOR__"),
-        want_minor,
-        "__GLIBC_MINOR__ should match features.h, not a hardcoded baseline"
+    let src = "#include <stdint.h>\nMARKER __GLIBC__ . __GLIBC_MINOR__ MARKER\n";
+    let run = preprocess_text("glibc_after_header", src, &[]);
+    assert!(run.success, "{}", run.stderr);
+    let want = format!("MARKER {want_major} . {want_minor} MARKER");
+    assert!(
+        run.stdout.lines().any(|l| l == want),
+        "after a header, the glibc version is features.h's:\n{}",
+        run.stdout
     );
 }
 

@@ -42,15 +42,25 @@ mod test_constant_p;
 #[cfg(test)]
 mod test_declarations;
 #[cfg(test)]
+mod test_designator_ranges;
+#[cfg(test)]
 mod test_expr_constraints;
+#[cfg(test)]
+mod test_file_scope_asm;
 #[cfg(test)]
 mod test_float_n;
 #[cfg(test)]
 mod test_incomplete;
 #[cfg(test)]
+mod test_labeled_declaration;
+#[cfg(test)]
 mod test_local_labels;
 #[cfg(test)]
 mod test_member_list;
+#[cfg(test)]
+mod test_offsetof;
+#[cfg(test)]
+mod test_overflow_p_constant;
 #[cfg(test)]
 mod test_parser;
 #[cfg(test)]

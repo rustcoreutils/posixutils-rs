@@ -54,6 +54,8 @@ struct Options {
     shared: bool,
     no_unwind_tables: bool,
     stack_clash: bool,
+    /// The last of `-fstack-protector`'s levels and `-fno-stack-protector`.
+    stack_protector: target::StackProtector,
     verbose_asm: bool,
     cf_protection: target::CfProtection,
     math_errno: bool,
@@ -127,6 +129,11 @@ fn apply_flags(flags: &[&str]) -> Options {
             _ => {
                 if let Some(position) = target::PositionIndependence::from_flag(flag) {
                     o.position = Some(position);
+                } else if let Some(level) = flag
+                    .strip_prefix("-f")
+                    .and_then(target::StackProtector::from_option)
+                {
+                    o.stack_protector = level;
                 } else if let Some(model) = flag.strip_prefix("-ftls-model=") {
                     o.tls_model = target::TlsModel::from_name(model).unwrap();
                 } else if let Some(level) = flag.strip_prefix("-O") {
@@ -205,6 +212,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             preprocessed: false,
             pre_includes: &[],
             dump_macros: false,
+            keep_definitions: false,
             collect_dependencies: false,
             optimization: o.optimization,
             position,
@@ -228,6 +236,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
         stack_clash: o.stack_clash,
+        stack_protector: o.stack_protector,
         source_name: &source_name,
         debug_prefix_map: &prefix_maps.debug,
     };

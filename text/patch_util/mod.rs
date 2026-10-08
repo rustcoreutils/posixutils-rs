@@ -10,6 +10,7 @@
 //! Helper modules for the patch utility.
 
 pub mod applier;
+pub mod bytes;
 pub mod context;
 pub mod ed;
 pub mod file_ops;

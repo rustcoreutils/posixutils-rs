@@ -16,6 +16,7 @@
 
 pub mod abi;
 pub mod arch;
+pub mod aux_info;
 pub mod builtin_headers;
 pub mod builtins;
 pub mod constexpr;

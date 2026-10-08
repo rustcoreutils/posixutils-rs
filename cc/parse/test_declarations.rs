@@ -142,6 +142,43 @@ fn test_definition_takes_prior_internal_linkage() {
     }
 }
 
+/// A function definition records its own storage-class specifiers and
+/// `inline`, whatever it returns. They were read off the return type, which
+/// for a struct specifier is the tag's one shared type: `extern` was lost
+/// there.
+#[test]
+fn test_definition_records_its_own_storage_class() {
+    use crate::types::TypeModifiers;
+    const EI: TypeModifiers = TypeModifiers::EXTERN.union(TypeModifiers::INLINE);
+    const SI: TypeModifiers = TypeModifiers::STATIC.union(TypeModifiers::INLINE);
+    for ret in ["int", "int *", "struct S", "struct S *", "T", "T *"] {
+        for (specs, want) in [
+            ("extern inline __attribute__((gnu_inline))", EI),
+            ("extern inline", EI),
+            ("static inline", SI),
+            ("inline", TypeModifiers::INLINE),
+            ("extern", TypeModifiers::EXTERN),
+            ("", TypeModifiers::empty()),
+        ] {
+            let src = format!(
+                "struct S {{ int b; }}; typedef struct S T;\n\
+                 {specs} {ret} f(void) {{ {ret} r = {{0}}; return r; }}"
+            );
+            let (tu, _, strings, _) = parse_tu(&src).unwrap();
+            let f = strings.lookup("f").expect("interned");
+            let def = tu
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    ExternalDecl::FunctionDef(def) if def.name == f => Some(def),
+                    _ => None,
+                })
+                .expect("defined");
+            assert_eq!(def.storage_class, want, "{src}");
+        }
+    }
+}
+
 #[test]
 fn test_tag_rules() {
     for src in [
@@ -687,4 +724,117 @@ fn test_block_scope_extern_has_the_composite_type() {
     assert_rejected(
         "int (*q)[3]; void g(void) { int (*q)[]; _Static_assert(sizeof *q == 12, \"\"); }",
     );
+}
+
+/// C17 6.2.1p7: a tag's scope begins just after the tag in the specifier
+/// that declares it, so a parameter list inside the member list names the
+/// structure being defined -- util-linux's `void (*free_dialect)(struct
+/// path_cxt *)` inside `struct path_cxt`. It declared a new tag in the
+/// prototype's scope instead, and warned that it would not be visible.
+#[test]
+fn test_tag_is_in_scope_inside_its_own_member_list() {
+    for src in [
+        "struct S { int v; void (*fn)(struct S *); }; struct S s;",
+        "union S { int v; void (*fn)(union S *); }; union S s;",
+        "struct S; struct S { int v; void (*fn)(struct S *); }; struct S s;",
+    ] {
+        let (tu, types, _, _) = parse_tu(src).unwrap();
+        let ExternalDecl::Declaration(ref decl) = tu.items.last().unwrap() else {
+            panic!("{src}: expected a declaration");
+        };
+        let s = decl.declarators[0].typ;
+        let fn_ptr = types.composite(s).unwrap().members[1].typ;
+        let func = types.base_type(fn_ptr).unwrap();
+        let param = types.get(func).params.as_ref().unwrap()[0];
+        assert_eq!(types.base_type(param), Some(s), "{src}");
+    }
+}
+
+/// An enumerator may carry GNU attributes between its name and any `=`, as
+/// systemd's <sd-journal.h> and <lz4frame.h> write `X __attribute__((deprecated))
+/// = Y`. They take nothing away from the enumerator or its value.
+#[test]
+fn test_enumerator_attributes() {
+    let before = crate::diag::error_count();
+    let (_, _, strings, symbols) = parse_tu(
+        "enum { A, B __attribute__((__deprecated__)) = 5, \
+         C __attribute__((deprecated)) __attribute__((unused)), \
+         D __attribute__((deprecated(\"old name\"))) = A };",
+    )
+    .unwrap();
+    assert_eq!(crate::diag::error_count(), before);
+    let value = |name: &str| {
+        let id = strings.lookup(name).expect("interned");
+        symbols
+            .lookup(id, Namespace::Ordinary)
+            .expect("declared")
+            .enum_value
+    };
+    assert_eq!(value("A"), Some(0));
+    assert_eq!(value("B"), Some(5));
+    assert_eq!(value("C"), Some(6));
+    assert_eq!(value("D"), Some(0));
+}
+
+/// `-Wno-implicit-int` and `-Wno-implicit-function-declaration` each accept
+/// their own pre-C99 construct without a word, as gcc 14 does, and nothing
+/// else.
+#[test]
+fn test_wno_implicit_accepts_its_own_construct() {
+    let implicit_int = "static counter; f(void) { return counter; }";
+    let implicit_call = "int g(void) { return h(1); }";
+    let bare_name = "int k(void) { return nowhere; }";
+
+    crate::diag::set_warning_options(&["no-implicit-int"]);
+    assert_clean(implicit_int);
+    assert_rejected(implicit_call);
+
+    crate::diag::set_warning_options(&["no-implicit-function-declaration"]);
+    assert_clean(implicit_call);
+    assert_rejected(implicit_int);
+    assert_rejected(bare_name);
+
+    crate::diag::set_warning_options(&["no-implicit-int", "implicit-int"]);
+    assert_rejected(implicit_int);
+
+    crate::diag::set_warning_options(&[]);
+    assert_rejected(implicit_int);
+    assert_rejected(implicit_call);
+}
+
+/// `stack_protect` and `no_stack_protector` reach the definition, from a
+/// prototype too, in either spelling. Given both, gcc keeps the first and
+/// warns that it ignores the second -- within one list or across
+/// declarations.
+#[test]
+fn test_stack_protect_attributes_reach_the_definition() {
+    use super::ast::StackProtectAttr;
+    let src = "__attribute__((stack_protect)) int p(void) { return 0; }\n\
+               int __attribute__((__no_stack_protector__)) n(void) { return 0; }\n\
+               int d(void) { return 0; }\n\
+               __attribute__((no_stack_protector)) int q(void);\n\
+               int q(void) { return 0; }\n\
+               __attribute__((no_stack_protector, stack_protect)) int b1(void) { return 0; }\n\
+               __attribute__((stack_protect)) int b2(void);\n\
+               __attribute__((no_stack_protector)) int b2(void) { return 0; }\n";
+    let before = crate::diag::warning_count();
+    let (tu, _, strings, _) = parse_tu(src).unwrap();
+    assert_eq!(crate::diag::warning_count() - before, 2, "one per conflict");
+    let attr = |name: &str| {
+        tu.items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == name => {
+                    Some(f.attrs.stack_protect)
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(attr("p"), StackProtectAttr::Protect);
+    assert_eq!(attr("n"), StackProtectAttr::Exempt);
+    assert_eq!(attr("d"), StackProtectAttr::Unspecified);
+    assert_eq!(attr("q"), StackProtectAttr::Exempt);
+    assert_eq!(attr("b1"), StackProtectAttr::Exempt);
+    assert_eq!(attr("b2"), StackProtectAttr::Protect);
 }

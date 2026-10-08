@@ -8,6 +8,7 @@
 //
 
 mod lex;
+mod strip;
 mod yacc;
 
 use object::{Object, ObjectSection, ObjectSymbol};
@@ -490,6 +491,41 @@ fn test_ar_list_some() {
         expected_err: "".to_string(),
         expected_exit_code: 0,
     });
+}
+
+// ELF-specific: the static function must be a local ELF symbol.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_ar_index_lists_only_global_symbols() {
+    // The archive index listed static functions and tables too.
+    let dir = plib::tmp::TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("s.c"),
+        "static int hidden(int x){return x*3;}\nint shown(int x){return hidden(x);}\n",
+    )
+    .unwrap();
+    assert!(c_compiler()
+        .current_dir(dir.path())
+        .args(["-O0", "-c", "-o", "s.o", "s.c"])
+        .status()
+        .expect("cc")
+        .success());
+    let arc = dir.path().join("lib.a");
+    assert!(Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(["-r", "-c", arc.to_str().unwrap()])
+        .arg(dir.path().join("s.o"))
+        .status()
+        .expect("ar")
+        .success());
+    let bytes = fs::read(&arc).unwrap();
+    let archive = object::read::archive::ArchiveFile::parse(&*bytes).unwrap();
+    let index: Vec<String> = archive
+        .symbols()
+        .unwrap()
+        .expect("archive must have a symbol index")
+        .map(|s| String::from_utf8_lossy(s.unwrap().name()).into_owned())
+        .collect();
+    assert_eq!(index, ["shown"]);
 }
 
 #[test]
@@ -2226,16 +2262,17 @@ fn test_strip_archive_symbol_table_still_resolves() {
     );
 }
 
-// #ST6: strip rewrites through a temp file and renames, so a failure must
-// leave the original intact rather than a truncated file. Force the failure by
-// making the containing directory unwritable, which blocks creating the temp
-// file, and assert the input is byte-identical afterwards.
-// Staged with a directory's write permission bit, which Windows lacks.
-#[cfg(unix)]
+// #ST6: strip writes the result back into the operand's own file, as GNU
+// strip does, so it needs write permission on the file and none on its
+// directory. A file it cannot open for writing is reported and left
+// byte-identical; a writable file in an unwritable directory is stripped.
+// Linux only: the host cc must produce ELF, which strip reads (macOS cc
+// writes Mach-O).
+#[cfg(target_os = "linux")]
 #[test]
 fn test_strip_leaves_input_intact_when_it_cannot_write() {
     use std::os::unix::fs::PermissionsExt;
-    // Root ignores the directory write bit, so the failure cannot be staged.
+    // Root ignores permission bits, so the failure cannot be staged.
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
@@ -2255,9 +2292,8 @@ fn test_strip_leaves_input_intact_when_it_cannot_write() {
 
     let original = fs::read(&obj).unwrap();
 
-    // Read+execute but not write: the object is still readable, but no new
-    // file can be created alongside it.
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    // Readable but not writable.
+    fs::set_permissions(&obj, fs::Permissions::from_mode(0o444)).unwrap();
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
         .arg(obj.to_str().unwrap())
@@ -2279,7 +2315,21 @@ fn test_strip_leaves_input_intact_when_it_cannot_write() {
         "a failed strip must leave the input byte-identical, not truncated"
     );
 
+    // Writable file, read+execute-only directory: no new file can be
+    // created alongside it, and none needs to be.
+    fs::set_permissions(&obj, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_strip"))
+        .args(["--strip-unneeded", obj.to_str().unwrap()])
+        .output()
+        .expect("run strip");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(fs::read(&obj).unwrap(), original);
 }
 
 /// A one-member archive in the BSD layout, whose `#1/len` header puts the

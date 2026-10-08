@@ -754,6 +754,72 @@ fn gcc_flags_bare_v_prints_a_version_banner() {
     assert!(r.success, "{}", r.stderr);
 }
 
+/// The directories between `start` and gcc's "End of search list." line of a
+/// `-v` stderr, one per line, as perl's h2ph and CMake read them.
+fn search_list<'a>(stderr: &'a str, start: &str) -> Vec<&'a str> {
+    stderr
+        .lines()
+        .skip_while(|l| *l != start)
+        .skip(1)
+        .take_while(|l| l.starts_with(' '))
+        .map(str::trim)
+        .collect()
+}
+
+/// `-v` with an operand to preprocess prints gcc's include search list on
+/// stderr. perl's h2ph runs `cc -v -E - </dev/null` and converts the headers
+/// it finds in those directories; with no list it converted only
+/// /usr/include, so Debian's perl shipped a syslog.ph requiring a stdarg.ph
+/// nothing had made. The bundled headers' slot names the directory c17
+/// answers for `-print-file-name=include`.
+#[test]
+fn gcc_flags_v_prints_the_include_search_list() {
+    let (dir, src) = scratch("empty.c", "");
+    let quote = dir.path().join("q");
+    let angle = dir.path().join("a");
+    std::fs::create_dir(&quote).unwrap();
+    std::fs::create_dir(&angle).unwrap();
+    let r = run_c17(&[
+        "-v",
+        "-E",
+        "-iquote",
+        quote.to_str().unwrap(),
+        "-I",
+        angle.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.contains("End of search list.\n"), "{}", r.stderr);
+    let quoted = search_list(&r.stderr, "#include \"...\" search starts here:");
+    assert_eq!(quoted, [quote.to_str().unwrap()], "{}", r.stderr);
+    let system = search_list(&r.stderr, "#include <...> search starts here:");
+    assert_eq!(
+        system.first(),
+        Some(&angle.to_str().unwrap()),
+        "{}",
+        r.stderr
+    );
+
+    let include = run_c17(&["-print-file-name=include"]).stdout;
+    let include = include.trim();
+    let bundled = Path::new(include).is_absolute() && Path::new(include).is_dir();
+    assert_eq!(system.contains(&include), bundled, "{}", r.stderr);
+    if cfg!(target_os = "linux") {
+        // The bundled headers come ahead of the system's, as c17 searches.
+        assert_eq!(system.last(), Some(&"/usr/include"), "{}", r.stderr);
+        if bundled {
+            assert!(system[1..].starts_with(&[include]), "{}", r.stderr);
+        }
+    }
+
+    // -nostdinc drops the bundled headers and the target's directories, and
+    // the list says so.
+    let r = run_c17(&["-v", "-E", "-nostdinc", src.to_str().unwrap()]);
+    assert!(r.success, "{}", r.stderr);
+    let system = search_list(&r.stderr, "#include <...> search starts here:");
+    assert!(system.is_empty(), "{}", r.stderr);
+}
+
 // ---------------------------------------------------------------------------
 // Response files
 // ---------------------------------------------------------------------------
@@ -955,4 +1021,171 @@ fn gcc_flags_tls_model() {
         "{}",
         r.stderr
     );
+}
+
+/// An option c17 does not know is refused as gcc refuses it, under c17's
+/// name and naming the option as it was written: configure's `-qversion`
+/// probe came back as clap's `error: unexpected argument '-q' found`, with a
+/// usage block and no `c17:` to say which program spoke.
+#[test]
+fn gcc_flags_unknown_option_is_refused_in_gccs_words() {
+    for (args, culprit) in [
+        (&["-qversion"][..], "-qversion"),
+        (&["-version"], "-version"),
+        (&["--no-such-c17-option"], "--no-such-c17-option"),
+        // The culprit is the argument that held the unknown letter, wherever
+        // it stands, not a value that happens to contain it.
+        (&["-I/q", "-c", "-no-gcc", "x.c"], "-no-gcc"),
+    ] {
+        let r = run_c17(args);
+        assert!(!r.success, "{args:?}");
+        assert_eq!(
+            r.stderr,
+            format!("c17: error: unrecognized command-line option '{culprit}'\n"),
+            "{args:?}"
+        );
+    }
+    // A missing value, in gcc's words too.
+    let r = run_c17(&["x.c", "-o"]);
+    assert!(!r.success);
+    assert_eq!(r.stderr, "c17: error: missing argument to '-o'\n");
+    // Nothing to compile.
+    let r = run_c17(&["-c"]);
+    assert!(!r.success);
+    assert_eq!(r.stderr, "c17: fatal error: no input files\n");
+    // Every other refusal from the parser still says who is speaking.
+    let r = run_c17(&["-Obogus", "x.c"]);
+    assert!(!r.success);
+    assert!(r.stderr.starts_with("c17: error: "), "{}", r.stderr);
+    assert!(!r.stderr.contains("Usage:"), "{}", r.stderr);
+}
+
+/// An option that takes an argument takes the next word as it, even one that
+/// begins with `-` (POSIX.2024 XBD 12.2, Utility Syntax Guidelines 6 and 7;
+/// gcc does the same). zstd's educational decoder passes `-I -I/common` when
+/// a Makefile variable is empty: a directory named `-I/common`, not a missing
+/// argument.
+#[test]
+fn gcc_flags_option_argument_may_begin_with_a_hyphen() {
+    // -I and -L: a directory that happens to start with '-'.
+    let c = compile_with("hy_i.c", MAIN, &["-I", "-I/common"]);
+    assert!(c.success, "{}", c.stderr);
+    let c = compile_with("hy_l.c", MAIN, &["-L", "-Lnowhere"]);
+    assert!(c.success, "{}", c.stderr);
+    // -D: the next word is the macro definition, whatever it looks like;
+    // `-DX` is not a valid macro name, so that is the complaint, as in gcc,
+    // not a missing argument.
+    let pp = preprocess_text("hy_d.c", "int v;\n", &["-D", "-DX"]);
+    assert!(!pp.stderr.contains("missing argument"), "{}", pp.stderr);
+    // -o: the output file may be named "-out".
+    let (dir, path) = scratch("hy_o.c", MAIN);
+    let out = dir.path().join("-out");
+    let r = run_c17(&["-c", "-o", out.to_str().unwrap(), path.to_str().unwrap()]);
+    assert!(r.success && out.exists(), "{}", r.stderr);
+    let r = std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
+        .current_dir(dir.path())
+        .args(["-c", "-o", "-out2", path.to_str().unwrap()])
+        .output()
+        .expect("run c17");
+    assert!(
+        r.status.success() && dir.path().join("-out2").exists(),
+        "{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+/// The header options and `-l` take a hyphen-led argument too: a directory
+/// `-inc`, a file `-pre.h`, a library `-lfoo`.
+#[test]
+fn gcc_flags_header_and_library_options_take_a_hyphen_argument() {
+    let (dir, path) = scratch(
+        "hy_h.c",
+        "#include \"h.h\"\nint main(void) { return V + W; }\n",
+    );
+    std::fs::create_dir(dir.path().join("-inc")).unwrap();
+    std::fs::write(dir.path().join("-inc/h.h"), "#define V 0\n").unwrap();
+    std::fs::write(dir.path().join("-pre.h"), "#define W 0\n").unwrap();
+    let c17 = |args: &[&str]| {
+        let r = std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .expect("run c17");
+        (
+            r.status.success(),
+            String::from_utf8_lossy(&r.stderr).into_owned(),
+        )
+    };
+    let src = path.to_str().unwrap();
+    for opt in ["-I", "-iquote", "-isystem", "-idirafter"] {
+        let (ok, stderr) = c17(&[opt, "-inc", "-include", "-pre.h", "-c", "-o", "o.o", src]);
+        assert!(ok, "{opt}: {stderr}");
+    }
+    // The library `-lc17nosuch` is looked for and not found; the complaint
+    // is the linker's, not a missing argument.
+    let (ok, stderr) = c17(&[
+        "-I",
+        "-inc",
+        "-include",
+        "-pre.h",
+        src,
+        "-o",
+        "a.out",
+        "-l",
+        "-lc17nosuch",
+    ]);
+    assert!(!ok);
+    assert!(!stderr.contains("missing argument"), "{stderr}");
+    assert!(stderr.contains("-lc17nosuch"), "{stderr}");
+}
+
+/// An option left without its argument at the end of the line is named as
+/// the user wrote it. c17 passes some to its parser under an internal
+/// spelling, and reported `-MF` as "missing argument to '--MF'".
+///
+/// Nor may the dangling option take as its argument what c17 appends to
+/// the line: `-g ... -I` compiled without a word, and `-fsignaling-nans
+/// ... -o` wrote its object to a file named `-D`.
+#[test]
+fn gcc_flags_missing_argument_names_the_option_as_written() {
+    let (dir, path) = scratch("dangle.c", MAIN);
+    let src = path.to_str().unwrap();
+    let c17 = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .expect("run c17")
+    };
+    let opts = [
+        "-MF",
+        "-MT",
+        "-include",
+        "-iquote",
+        "-isystem",
+        "-idirafter",
+        "-aux-info",
+        "--sysroot",
+        "-I",
+        "-D",
+        "-U",
+        "-o",
+        "-L",
+        "-l",
+        "-Xlinker",
+    ];
+    for opt in opts {
+        for before in [&[][..], &["-g", "-fsignaling-nans", "-fstack-protector"]] {
+            let mut args = before.to_vec();
+            args.extend(["-c", src, opt]);
+            let r = c17(&args);
+            assert_eq!(r.status.code(), Some(1), "{args:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&r.stderr),
+                format!("c17: error: missing argument to '{opt}'\n"),
+                "{args:?}"
+            );
+        }
+    }
+    assert!(!dir.path().join("-D").exists(), "-o took an appended -D");
 }

@@ -24,7 +24,7 @@ use crate::target::Target;
 use crate::token::lexer::Tokenizer;
 use crate::types::{FloatClass, TypeId, TypeKind, TypeModifiers, TypeTable};
 
-fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
+pub(super) fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
     parse_expr_with_vars(input, &[])
 }
 
@@ -1810,6 +1810,28 @@ fn test_asm_basic_template_escapes_percent() {
         template("__asm__(\"mov %0, %%ebx\" :: \"r\"(1));"),
         "mov %0, %%ebx"
     );
+    // Where `{|}` are dialect alternatives (x86), a basic asm's are escaped
+    // too; elsewhere they are plain text in every template.
+    let braces = template("__asm__(\"x{a|b}\");");
+    if cfg!(target_arch = "x86_64") {
+        assert_eq!(braces, "x%{a%|b%}");
+    } else {
+        assert_eq!(braces, "x{a|b}");
+    }
+}
+
+/// A template is text decoded from the literal's bytes, so a UTF-8 `é` in
+/// it is one character, not one per byte; and adjacent literals join.
+#[test]
+fn test_asm_template_is_decoded_text() {
+    let template = |src| match parse_stmt(src).unwrap().0 {
+        Stmt::Asm { template, .. } => template,
+        other => panic!("expected asm: {other:?}"),
+    };
+    assert_eq!(
+        template("__asm__(\"# caf\u{e9}\" \" \\x41\");"),
+        "# caf\u{e9} A"
+    );
 }
 
 #[test]
@@ -1899,9 +1921,7 @@ fn parse_decl(input: &str) -> ParseResult<(Declaration, TypeTable, StringTable, 
     // translation unit ever ran through (#C133).
     match parser.parse_external_decl()? {
         ExternalDecl::Declaration(decl) => Ok((decl, types, strings, symbols)),
-        ExternalDecl::FunctionDef(_) => {
-            panic!("expected a declaration, parsed a function definition: {input}")
-        }
+        other => panic!("expected a declaration, parsed {other:?}: {input}"),
     }
 }
 
@@ -2033,9 +2053,7 @@ fn parse_func(input: &str) -> ParseResult<(FunctionDef, TypeTable, StringTable, 
     // See `parse_decl`: the production entry point.
     match parser.parse_external_decl()? {
         ExternalDecl::FunctionDef(func) => Ok((func, types, strings, symbols)),
-        ExternalDecl::Declaration(_) => {
-            panic!("expected a function definition, parsed a declaration: {input}")
-        }
+        other => panic!("expected a function definition, parsed {other:?}: {input}"),
     }
 }
 
@@ -8142,6 +8160,15 @@ fn test_frame_builtin_level_is_a_parsed_constant() {
     assert!(matches!(expr.kind, ExprKind::FrameAddress { level: 0 }));
 }
 
+/// `__builtin_unwind_init()` takes no arguments and has type void.
+#[test]
+fn test_unwind_init_parses() {
+    let (expr, types, ..) = parse_expr("__builtin_unwind_init()").unwrap();
+    assert!(matches!(expr.kind, ExprKind::UnwindInit));
+    assert_eq!(expr.typ, Some(types.void_id));
+    assert!(parse_expr("__builtin_unwind_init(1)").is_err());
+}
+
 /// gcc rejects a level that is not a non-negative integer constant.
 #[test]
 fn test_frame_builtin_level_must_be_constant() {
@@ -8950,6 +8977,7 @@ fn test_every_declarator_position_binds_the_same_way() {
                     }
                 }
             }
+            ExternalDecl::Asm { .. } => {}
         }
     }
     assert_eq!(seen, ["a", "b", "c", "d", "e", "k"]);

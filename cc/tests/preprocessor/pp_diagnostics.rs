@@ -347,3 +347,67 @@ fn pp_if_signed_overflow_warns() {
     let quiet = preprocess_text("if_overflow_w", src, &["-w"]);
     assert!(quiet.success && quiet.stderr.is_empty(), "{}", quiet.stderr);
 }
+
+/// POSIX c17 makes `-U` win over `-D` regardless of order, so a `-D` of a
+/// name some `-U` names is moot: two such `-D`s with different values do
+/// not redefine anything, and nothing is reported. zstd builds its programs
+/// with `-DZSTD_LEGACY_SUPPORT=5 -UZSTD_LEGACY_SUPPORT
+/// -DZSTD_LEGACY_SUPPORT=0 -Werror`. Without the `-U`, the second `-D` is a
+/// redefinition and is reported, as gcc does.
+#[test]
+fn pp_cmdline_define_of_an_undefined_name_is_quiet() {
+    let src = "#ifdef X\nint x = X;\n#else\nint x = -1;\n#endif\n";
+    let r = preprocess_text("cmdline_du", src, &["-Werror", "-DX=5", "-UX", "-DX=0"]);
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+    assert!(r.stdout.contains("int x = -1;"), "{}", r.stdout);
+
+    let r = preprocess_text("cmdline_dd", src, &["-DX=5", "-DX=0"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.contains("'X' redefined"), "{}", r.stderr);
+    assert!(r.stdout.contains("int x = 0;"), "{}", r.stdout);
+}
+
+/// `-U NAME` names a macro exactly as `-D NAME` does, so a name that is not
+/// an identifier is refused in the same words, as gcc refuses both ("macro
+/// names must be identifiers", status 1). `-U 1x` was silently accepted.
+#[test]
+fn pp_cmdline_undefine_name_must_be_an_identifier() {
+    for opt in ["-U", "-D"] {
+        for name in ["1x", "-UX", "-DX"] {
+            let joined = format!("{opt}{name}");
+            for args in [vec![opt, name], vec![joined.as_str()]] {
+                let r = preprocess_text("cmdline_badname", "int v;\n", &args);
+                assert!(!r.success, "{args:?} must fail");
+                assert!(
+                    r.stderr.contains("error: macro names must be identifiers"),
+                    "{args:?}: {}",
+                    r.stderr
+                );
+            }
+        }
+    }
+    // An empty name is no name at all, in gcc's words for `#undef`.
+    let r = preprocess_text("cmdline_noname", "int v;\n", &["-U", ""]);
+    assert!(!r.success);
+    assert!(
+        r.stderr
+            .contains("error: no macro name given in #undef directive"),
+        "{}",
+        r.stderr
+    );
+    // `-U a-b` is `#undef a-b`: `a` is undefined, `-b` is extra, a warning.
+    let src = "#ifdef a\nint defined_a;\n#endif\n";
+    let r = preprocess_text("cmdline_extra", src, &["-Da", "-U", "a-b"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("warning: extra tokens at end of #undef directive"),
+        "{}",
+        r.stderr
+    );
+    assert!(!r.stdout.contains("defined_a"), "{}", r.stdout);
+    // A valid name, either spelling, is quiet.
+    let r = preprocess_text("cmdline_okname", src, &["-Da", "-U", "a", "-Ub"]);
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+    assert!(!r.stdout.contains("defined_a"), "{}", r.stdout);
+}

@@ -164,6 +164,7 @@ the project's own filter before earning a verdict:
 
 | Extension | Verdict | Why |
 |---|---|---|
+| Basic asm at file scope | **Yes** | xz-utils and libxcrypt version their shared libraries' symbols with `__asm__(".symver ...")` between definitions, as glibc does; without it liblzma lacks its `XZ_5.2` symbols and libcrypt exports none of the crypt API. The text is written verbatim, in source order among the unit's definitions, each of which names its own section after it. Only the basic form, as in gcc: no qualifiers, and operands are an error. The `symver` attribute is not provided, so `__has_attribute(symver)` is 0 and such code takes its asm path |
 | SIMD intrinsic headers | **SSE through SSE4.2, and core NEON** | Bundled and written in C over GNU vectors; see "SIMD headers" below. The AVX families are not |
 | `__auto_type` | **No** | Not in glibc's headers or CPython; `__typeof__`, which c17 has, does the same job in the macros that use it |
 | nested functions / `__label__` | **Never** | GCC-only, Clang refuses nested functions, so portable code already avoids them; they need executable-stack trampolines. See the c-torture section |

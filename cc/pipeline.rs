@@ -84,6 +84,8 @@ pub struct CodegenOptions<'a> {
     pub cf_protection: crate::target::CfProtection,
     /// `-fstack-clash-protection`.
     pub stack_clash: bool,
+    /// `-fstack-protector` and its levels.
+    pub stack_protector: crate::target::StackProtector,
     /// The name DWARF records for the primary source file.
     pub source_name: &'a str,
     /// `-fdebug-prefix-map`: rewrites every path the debug information and
@@ -96,7 +98,13 @@ pub struct CodegenOptions<'a> {
 pub trait Observer {
     /// The translation unit parsed without error. `Ok(false)` stops here
     /// without failing; `Err` fails.
-    fn parsed(&mut self, _ast: &TranslationUnit) -> io::Result<bool> {
+    fn parsed(
+        &mut self,
+        _ast: &TranslationUnit,
+        _strings: &StringTable,
+        _types: &TypeTable,
+        _symbols: &SymbolTable,
+    ) -> io::Result<bool> {
         Ok(true)
     }
 
@@ -154,6 +162,7 @@ pub fn compile_tokens(
     // point at which the order is the translation unit's own -- an include is
     // preprocessed separately and spliced in, so nothing recorded earlier
     // survives with a usable index.
+    let weak_names = token::preprocess::pragma_weak_names(&preprocessed);
     let layout_pragmas = token::preprocess::extract_pragma_directives(&mut preprocessed);
     token::lexer::report_unterminated_literals(&preprocessed);
 
@@ -169,16 +178,20 @@ pub fn compile_tokens(
         optimizing: opts.optimization.optimizes(),
         math_errno: opts.math_errno,
     });
-    let ast = parser
-        .parse_translation_unit()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse error: {}", e)))?;
+    // A syntax error is reported where it is, like every other diagnostic:
+    // its position may be in a header, and only `diag` knows which file a
+    // position belongs to and which includes reached it.
+    let ast = parser.parse_translation_unit().map_err(|e| {
+        diag::error(e.pos, &e.message);
+        failed("compilation failed")
+    })?;
 
     // Check for semantic errors (e.g., undeclared identifiers) reported during parsing
     if diag::has_error() != 0 {
         return Err(failed("compilation failed"));
     }
 
-    if !observer.parsed(&ast)? {
+    if !observer.parsed(&ast, strings, &types, &symbols)? {
         return Ok(None);
     }
 
@@ -195,6 +208,7 @@ pub fn compile_tokens(
     if let Some(how) = opts.default_visibility {
         module.apply_default_visibility(how);
     }
+    module.apply_pragma_weak(&weak_names);
 
     // Check for errors during linearization (e.g., unsupported global initializers)
     if diag::has_error() != 0 {
@@ -283,6 +297,7 @@ pub fn compile_tokens(
         opts.cf_protection,
         opts.stack_clash,
     );
+    codegen.set_stack_protector(opts.stack_protector);
     let asm = codegen.generate(&module, &types);
 
     // Codegen can diagnose too. Inline asm is the case that reaches here: a

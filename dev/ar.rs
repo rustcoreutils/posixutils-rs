@@ -7,9 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod armap;
+
+use armap::member_symbols;
 use clap::{Parser, Subcommand};
 use gettextrs::gettext;
-use object::{Object, ObjectSymbol, SymbolKind};
 use plib::diag;
 use std::ffi::{OsStr, OsString};
 use std::io::{stdout, Write};
@@ -181,7 +183,7 @@ impl ArchiveMember {
 
         let (uid, gid, mode) = owner_and_mode(&file_metadata);
         let data = std::fs::read(file_path)?;
-        let symbols = read_member_symbols(&data);
+        let symbols = member_symbols(&data);
         let symbol_bytes = symbols.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
 
         // The archive date field is the member's mtime as Unix epoch seconds
@@ -274,7 +276,7 @@ impl Archive {
 
             let data = member.data(&*file_data)?;
             let name = name_from_bytes(member.name());
-            let symbols = read_member_symbols(data);
+            let symbols = member_symbols(data);
 
             archive_symbol_count += symbols.len() as u64;
             let symbol_bytes = member_symbol_bytes(&symbols);
@@ -475,23 +477,6 @@ fn member_symbol_bytes(member_symbols: &[String]) -> u64 {
     // we add 1 for the null terminator that is required for each symbol
     // in the archives symbol table
     member_symbols.iter().map(|s| s.len() as u64 + 1).sum()
-}
-
-fn read_member_symbols(member_data: &[u8]) -> Vec<String> {
-    if let Ok(object_file) = object::read::File::parse(member_data) {
-        let symbols = object_file
-            .symbols()
-            .filter(|s| {
-                s.kind() == SymbolKind::Text
-                    || s.kind() == SymbolKind::Data
-                    || s.kind() == SymbolKind::Tls
-            })
-            .map(|s| s.name().unwrap().to_string())
-            .collect();
-        symbols
-    } else {
-        Vec::new()
-    }
 }
 
 fn delete_cmd(args: DeleteArgs) -> ArResult<()> {

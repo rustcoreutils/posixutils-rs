@@ -988,6 +988,7 @@ name = "posixutils-file"
 version = "0.9.0"
 dependencies = [
  "clap",
+ "ftw",
  "gettext-rs",
  "libc",
  "plib",

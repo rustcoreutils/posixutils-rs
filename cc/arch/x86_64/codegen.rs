@@ -47,6 +47,8 @@ pub struct X86_64CodeGen {
     /// Bytes the prologue allocates for locals: what a dynamically aligned
     /// frame addresses them from.
     pub(super) stack_alloc_size: i32,
+    /// The stack-protector canary's slot, when this function has one.
+    pub(super) stack_guard: Option<i32>,
     /// Offset from rbp to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i32,
     /// GP argument registers the named parameters consumed, for `va_start`'s
@@ -117,6 +119,7 @@ impl X86_64CodeGen {
             callee_saved_regs: Vec::new(),
             callee_saved_offset: 0,
             stack_alloc_size: 0,
+            stack_guard: None,
             reg_save_area_offset: 0,
             named_gp_regs: 0,
             named_fp_regs: 0,
@@ -1387,7 +1390,11 @@ impl X86_64CodeGen {
 
         if is_fp {
             let fmt = self.fp_format(insn.typ, size, types);
-            self.emit_select_fp(ops, fmt);
+            if fmt == FpSize::Extended {
+                self.emit_x87_select(ops);
+            } else {
+                self.emit_select_fp(ops, fmt);
+            }
         } else {
             self.emit_select_int(ops);
         }
@@ -1450,6 +1457,47 @@ impl X86_64CodeGen {
         // Done: move xmm15 → dst.
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
         self.emit_fp_move_from_xmm(XmmReg::Xmm15, &dst_loc, size);
+    }
+
+    /// Emit a `long double` select: the chosen operand is `fldt`-loaded on
+    /// either side of a branch and `fstpt`-stored once. An x87 value lives in
+    /// memory and has no XMM form, so the XMM path's `movt` was no
+    /// instruction at all: bash's `seq` builtin, `if (ret == -0.0) ret =
+    /// 0.0;` if-converted, failed to assemble. `fldt` changes no flags, so
+    /// the one test serves the branch.
+    fn emit_x87_select(&mut self, ops: SelectOperands) {
+        let SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target,
+            ..
+        } = ops;
+        let dst = self.get_x87_mem_addr(target);
+        if let Loc::Imm(v) = self.get_location(cond) {
+            let src = self.get_x87_mem_addr(if v != 0 { then_val } else { else_val });
+            self.push_lir(X86Inst::X87Load { addr: src });
+            self.push_lir(X86Inst::X87Store { addr: dst });
+            return;
+        }
+        self.emit_condition_test(cond, Reg::R11);
+        let then_label = Label::internal("sel_then", self.unique_label_counter);
+        let done_label = Label::internal("sel_done", self.unique_label_counter + 1);
+        self.unique_label_counter += 2;
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ne,
+            target: then_label.clone(),
+        });
+        let else_addr = self.get_x87_mem_addr(else_val);
+        self.push_lir(X86Inst::X87Load { addr: else_addr });
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(then_label)));
+        let then_addr = self.get_x87_mem_addr(then_val);
+        self.push_lir(X86Inst::X87Load { addr: then_addr });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+        self.push_lir(X86Inst::X87Store { addr: dst });
     }
 
     /// Emit integer select using CMOVcc
@@ -1586,6 +1634,10 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
             _ => return Err(AsmModifierError::Unsupported),
         })
     }
+
+    fn asm_dialects(&self) -> bool {
+        crate::arch::asm_dialects(self.base.target.arch)
+    }
 }
 
 impl X86_64CodeGen {
@@ -1636,49 +1688,28 @@ impl CodeGenerator for X86_64CodeGen {
                 .push_directive(Directive::file((i + 1) as u32, file_path));
         }
 
-        // Emit globals
-        for global in &module.globals {
-            self.emit_global(global, types);
-        }
-
-        self.base.emit_declared_symbol_attrs(module);
-        self.base.emit_symbol_aliases(module);
-
-        // Emit string literals
-        if !module.strings.is_empty() {
-            self.base.emit_strings(&module.strings);
-        }
-
-        // Emit char16_t, char32_t and wchar_t string literals
-        if !module.utf16_strings.is_empty() {
-            self.base.emit_utf16_strings(&module.utf16_strings);
-        }
-        if !module.utf32_strings.is_empty() {
-            self.base.emit_utf32_strings(&module.utf32_strings);
-        }
-
-        // Emit text start label for DWARF debug info (before first function)
-        // Must be in .text section — emit .text first since globals may leave us in .data
-        if module.debug && !module.functions.is_empty() {
-            self.push_lir(X86Inst::Directive(Directive::Text));
-            self.base.push_directive(Directive::local_label(".Ltext0"));
-        }
-
-        // Emit functions
-        for func in &module.functions {
+        // The definitions, in runs between the file-scope asm statements:
+        // each run's globals, then its functions, then the asm after it.
+        for run in 0..=module.toplevel_asm.len() {
+            for global in module.globals.iter().filter(|g| g.asm_before == run) {
+                self.emit_global(global, types);
+            }
+            if run == 0 {
+                self.base.emit_unit_data(module);
+            }
             // An inline definition is kept in the module so the inliner can
             // use it, but provides no external definition -- see `Function::emit`.
-            if !func.emit {
-                continue;
+            for func in module
+                .functions
+                .iter()
+                .filter(|f| f.emit && f.asm_before == run)
+            {
+                self.emit_function(func, types);
             }
-            self.emit_function(func, types);
+            self.base.emit_toplevel_asm(module, run);
         }
 
-        // Emit text end label for DWARF debug info (after last function)
-        if module.debug && !module.functions.is_empty() {
-            self.base
-                .push_directive(Directive::local_label(".Ltext_end"));
-        }
+        self.base.emit_text_end(module);
 
         // Emit the constructor / destructor pointer arrays
         self.base.emit_init_arrays(&module.functions);
@@ -1726,14 +1757,7 @@ impl CodeGenerator for X86_64CodeGen {
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
 
-        // Emit .note.GNU-stack section to mark stack as non-executable (ELF only)
-        // This prevents the "missing .note.GNU-stack section" linker warning
-        // Used on Linux, FreeBSD, and other ELF platforms (not macOS which uses Mach-O)
-        if !matches!(self.base.target.os, Os::MacOS) {
-            self.base.push_directive(Directive::Raw(
-                ".section .note.GNU-stack,\"\",@progbits".into(),
-            ));
-        }
+        self.base.push_directive(Directive::UnitEnd);
 
         // Emit all buffered LIR instructions to output string
         self.base.emit_all();
@@ -1763,5 +1787,9 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_stack_clash(&mut self, on: bool) {
         self.base.stack_clash = on;
+    }
+
+    fn set_stack_protector(&mut self, level: crate::target::StackProtector) {
+        self.base.stack_protector = level;
     }
 }

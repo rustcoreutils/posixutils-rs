@@ -789,9 +789,9 @@ impl<'a> Preprocessor<'a> {
 
     /// Collect arguments for a function-like macro call
     pub(super) fn collect_macro_args(
-        &self,
+        &mut self,
         iter: &mut TokenCursor,
-        _idents: &IdentTable,
+        idents: &mut IdentTable,
         macro_pos: &Position,
         macro_name: &str,
         open_paren: &Token,
@@ -807,7 +807,11 @@ impl<'a> Preprocessor<'a> {
         // hides only what both ends were hiding.
         let mut close_hide = None;
 
-        for token in iter.by_ref() {
+        while let Some(token) = iter.next() {
+            if self.is_file_directive(&token, iter) {
+                self.directive_in_macro_args(iter, &token, &mut current_arg, idents);
+                continue;
+            }
             match &token.value {
                 TokenValue::Special(code) => {
                     if *code == b'(' as u32 {
@@ -871,6 +875,45 @@ impl<'a> Preprocessor<'a> {
             commas,
             close_hide,
         })
+    }
+
+    /// Whether `token`, just read from `iter`, begins a directive: a `#`
+    /// first on its line, read from the file.
+    ///
+    /// Only from the file. C17 6.10.3p11 makes a directive produced by a
+    /// macro expansion undefined, and taking one would be worse than
+    /// undefined here: `skip_to_eol` and `collect_to_eol` stop at the next
+    /// token that begins a line, so a stray `#` out of an expansion would
+    /// swallow the rest of the file rather than the rest of a replacement
+    /// list.
+    pub(super) fn is_file_directive(&self, token: &Token, iter: &TokenCursor) -> bool {
+        matches!(token.value, TokenValue::Special(code) if code == b'#' as u32)
+            && token.pos.newline
+            && iter.provenance() == Provenance::Main
+    }
+
+    /// A directive among a function-like macro's arguments, which gcc obeys
+    /// and C17 6.10.3p11 leaves undefined: binutils' elfnn-aarch64.c picks
+    /// a `HOWTO` argument with `#if ARCH_SIZE == 64`. The directive is
+    /// handled as anywhere else, and a group it turns off is skipped, its
+    /// commas and parentheses included, up to the directive that ends it.
+    /// What a directive produces (a `#pragma`'s marker) joins the argument.
+    fn directive_in_macro_args(
+        &mut self,
+        iter: &mut TokenCursor,
+        hash: &Token,
+        current_arg: &mut Vec<Token>,
+        idents: &mut IdentTable,
+    ) {
+        self.handle_directive(iter, hash, current_arg, idents);
+        while self.is_skipping() {
+            let Some(token) = iter.next() else {
+                return;
+            };
+            if self.is_file_directive(&token, iter) {
+                self.handle_directive(iter, &token, current_arg, idents);
+            }
+        }
     }
 
     /// The names hidden at *both* ends of a function-like macro invocation.
@@ -1116,6 +1159,7 @@ impl<'a> Preprocessor<'a> {
                 }
                 MacroTokenValue::Param(idx) => {
                     let arg = args.get(*idx).cloned().unwrap_or_default();
+                    let arg_start = result.len();
 
                     if next_is_paste || prev_was_paste {
                         // Don't expand for token pasting
@@ -1164,6 +1208,16 @@ impl<'a> Preprocessor<'a> {
                             expanded_args[*idx] = Some(out);
                         }
                         result.extend(expanded_args[*idx].as_ref().unwrap().iter().cloned());
+                    }
+                    // The argument stands where its parameter stood, so it is
+                    // spaced as the parameter was in the body, as
+                    // `__VA_ARGS__` is below. Keeping the argument's own
+                    // spacing glued `x - a` with `-1` into `x --1` in `-E`
+                    // output, and libffi's `.org BASE` into `.org.Ltab`.
+                    if !prev_was_paste {
+                        if let Some(first) = result.get_mut(arg_start) {
+                            first.pos.whitespace = mt.whitespace;
+                        }
                     }
                 }
                 MacroTokenValue::VaArgs => {

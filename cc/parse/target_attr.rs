@@ -64,11 +64,10 @@ fn report_target_issue(pos: Position, issue: &TargetIssue) {
             "attribute value '{0}' is unknown in '{1}' attribute",
             &[item, "target"],
         ),
-        TargetIssue::BeyondCeiling(isa) => attr_warning(
-            pos,
-            "ISA '{0}' in 'target' attribute is beyond c17's SSE4.2 ceiling and is ignored",
-            &[isa],
-        ),
+        // `target` only permits an ISA: ignoring one c17 does not generate
+        // leaves plain C as it was, and a body that really used it fails on
+        // its own. libzstd's tests build such functions under -Werror.
+        TargetIssue::BeyondCeiling(_) => {}
         TargetIssue::Unsupported(item) => attr_warning(
             pos,
             "'{0}' in 'target' attribute is not supported and is ignored",

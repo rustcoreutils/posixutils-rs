@@ -10,63 +10,9 @@
 //
 
 use crate::target::{Arch, Target};
-use std::path::Path;
-
-/// glibc version to assume when `features.h` cannot be found or parsed.
-///
-/// 2.17 is the oldest release still in wide use as a compatibility baseline;
-/// guessing low is safe because `__GLIBC_PREREQ` tests then take the
-/// conservative branch.
-const FALLBACK_GLIBC: (&str, &str) = ("2", "17");
-
-/// Read the real `__GLIBC__` / `__GLIBC_MINOR__` out of the `features.h` we
-/// will actually compile against.
-///
-/// This is deliberately not a query of the *running* libc: what matters is the
-/// header set on the include path, because that is what redefines these macros
-/// mid-translation-unit, and a predefined value that disagrees with it breaks
-/// every `__GLIBC_PREREQ` test made before a system header is included.
-fn detect_glibc_version(target: &Target) -> (String, String) {
-    for dir in get_include_paths(target) {
-        let Ok(text) = std::fs::read_to_string(Path::new(dir).join("features.h")) else {
-            continue;
-        };
-
-        let mut major = None;
-        let mut minor = None;
-        for line in text.lines() {
-            // Lines look like `#define\t__GLIBC__\t2` — split on whitespace.
-            let mut fields = line.split_whitespace();
-            if fields.next() != Some("#define") {
-                continue;
-            }
-            let (Some(name), Some(value)) = (fields.next(), fields.next()) else {
-                continue;
-            };
-            // Only accept a plain integer; anything else is a macro we do not
-            // understand and must not misreport.
-            if !value.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            match name {
-                "__GLIBC__" => major = Some(value.to_string()),
-                "__GLIBC_MINOR__" => minor = Some(value.to_string()),
-                _ => {}
-            }
-        }
-
-        if let (Some(major), Some(minor)) = (major, minor) {
-            return (major, minor);
-        }
-    }
-
-    (FALLBACK_GLIBC.0.to_string(), FALLBACK_GLIBC.1.to_string())
-}
 
 /// Get Linux-specific predefined macros
-pub fn get_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
-    let (glibc_major, glibc_minor) = detect_glibc_version(target);
-
+pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
     vec![
         // Linux identification
         // ELF adds no prefix to a C identifier.
@@ -77,9 +23,10 @@ pub fn get_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
         ("__gnu_linux__", Some("1".into())),
         // ELF binary format
         ("__ELF__", Some("1".into())),
-        // GNU C library (glibc) compatibility, read from the host's features.h
-        ("__GLIBC__", Some(glibc_major)),
-        ("__GLIBC_MINOR__", Some(glibc_minor)),
+        // No `__GLIBC__` / `__GLIBC_MINOR__`: they are glibc's, defined by
+        // <features.h>, and gcc does not predefine them either. binutils'
+        // config.h refuses to be read after a system header, which it detects
+        // by `__GLIBC__` being defined.
         // Thread model
         ("_REENTRANT", Some("1".into())),
         // Feature test macros, predefined -- which gcc does not do (its C

@@ -338,6 +338,11 @@ fn gccs_pedantic_only_diagnostics_are_silent_by_default() {
             "label at end of compound statement",
         ),
         (
+            "label_before_declaration",
+            "int f(void){ goto l; l: int a = 1; return a; }\n",
+            "a label can only be part of a statement and a declaration is not a statement",
+        ),
+        (
             "enumerator_outside_int",
             "enum E { A = 0x80000000 };\n",
             "ISO C restricts enumerator values to range of 'int'",

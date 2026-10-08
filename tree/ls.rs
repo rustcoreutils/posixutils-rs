@@ -14,11 +14,10 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 use plib::platform::P_WINSIZE_REQUEST_CODE;
 use std::{
-    collections::HashMap,
     ffi::{CStr, CString, OsStr},
     io,
     mem::MaybeUninit,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::atomic::{AtomicU8, Ordering},
@@ -272,6 +271,15 @@ enum DereferenceSymbolicLink {
     None,
 }
 
+/// Whether a directory operand is listed by its contents or as itself.
+enum DirectoryOperands {
+    /// -d: every operand is written as itself.
+    AsFiles,
+    /// A directory operand's contents are written. `follow_symlinks` says whether a symbolic link
+    /// to a directory counts as one: POSIX follows it unless -F or -l is given without -H or -L.
+    Contents { follow_symlinks: bool },
+}
+
 #[allow(clippy::enum_variant_names)]
 enum FileTimeOption {
     LastModificationTime,
@@ -290,6 +298,7 @@ struct Config {
     sort_by: SortBy,
     classify_files: ClassifyFiles,
     dereference_symbolic_link: DereferenceSymbolicLink,
+    directory_operands: DirectoryOperands,
     file_time_option: FileTimeOption,
     file_inclusion: FileInclusion,
     inode: bool,
@@ -444,6 +453,17 @@ impl Config {
             _ => unreachable!(), // -H and -L are mutually exclusive
         };
 
+        let directory_operands = if args.directory {
+            DirectoryOperands::AsFiles
+        } else {
+            DirectoryOperands::Contents {
+                follow_symlinks: !matches!(
+                    dereference_symbolic_link,
+                    DereferenceSymbolicLink::None
+                ) || !(args.classify || long_format_enabled),
+            }
+        };
+
         let file_time_option = match (args.use_last_status_change_time, args.use_last_access_time) {
             (false, false) => FileTimeOption::LastModificationTime,
             (true, false) => FileTimeOption::LastStatusChangeTime,
@@ -481,6 +501,7 @@ impl Config {
             sort_by,
             classify_files,
             dereference_symbolic_link,
+            directory_operands,
             file_time_option,
             file_inclusion,
 
@@ -645,43 +666,44 @@ fn calc_optimal_padding(
     unreachable!()
 }
 
-fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str>) {
-    match &config.sort_by {
-        SortBy::DirectoryOrder => (), // Already sorted by directory order
-        other_sorting => {
-            entries.sort_by(|a, b| {
-                let sort_fn = match other_sorting {
-                    SortBy::Lexicographical => Entry::sorting_cmp_lexicographic,
-                    SortBy::FileSize => Entry::sorting_cmp_size,
-                    SortBy::Time => Entry::sorting_cmp_time,
-                    SortBy::DirectoryOrder => unreachable!(), // Already handled
-                };
-                if config.reverse_sorting {
-                    sort_fn(a, b).reverse()
-                } else {
-                    sort_fn(a, b)
-                }
-            });
+/// Sort `items` by the `Entry` each carries, in the order -S, -t, -r and -f select. -f keeps the
+/// order they arrived in.
+fn sort_by_entry<T>(items: &mut [T], entry: impl Fn(&T) -> &Entry, config: &Config) {
+    let sort_fn = match &config.sort_by {
+        SortBy::DirectoryOrder => return,
+        SortBy::Lexicographical => Entry::sorting_cmp_lexicographic,
+        SortBy::FileSize => Entry::sorting_cmp_size,
+        SortBy::Time => Entry::sorting_cmp_time,
+    };
+    items.sort_by(|a, b| {
+        let order = sort_fn(entry(a), entry(b));
+        if config.reverse_sorting {
+            order.reverse()
+        } else {
+            order
         }
-    }
+    });
+}
 
-    let mut display_total_size = config.display_size;
-    if let OutputFormat::Long(_) = &config.output_format {
-        display_total_size = true;
+/// Under -l or -s, the status line that precedes each list of files within a directory, empty
+/// lists included.
+fn print_total_line(entries: &[Entry], config: &Config) {
+    if !(config.display_size || matches!(config.output_format, OutputFormat::Long(_))) {
+        return;
     }
+    let total_block_size: u64 = entries.iter().map(|e| BLOCK_SIZE * e.blocks()).sum();
 
-    // `dir_path.is_some()` to only display the total on directories.
-    if display_total_size && dir_path.is_some() {
-        let mut total_block_size = 0;
-        for entry in entries.iter() {
-            total_block_size += BLOCK_SIZE * entry.blocks();
-        }
+    // The block size for -s and the total is implementation-defined without -k; we default to
+    // 1024-byte units (matching coreutils) so -k is the same as the default (#LS13).
+    println!(
+        "{} {}",
+        gettext("total"),
+        total_block_size / BLOCK_SIZE_KIBIBYTES
+    );
+}
 
-        // The block size for -s and the total is implementation-defined without -k; we default to
-        // 1024-byte units (matching coreutils) so -k is the same as the default (#LS13).
-        total_block_size /= BLOCK_SIZE_KIBIBYTES;
-        println!("{} {}", gettext("total"), total_block_size);
-    }
+fn display_entries(entries: &mut [Entry], config: &Config) {
+    sort_by_entry(entries, |e| e, config);
 
     match &config.output_format {
         OutputFormat::Long(_) => {
@@ -863,6 +885,32 @@ fn report_operand_error(path: &Path, e: &io::Error) {
     );
 }
 
+/// Whether operand `path` is listed by its contents rather than written as itself.
+fn lists_contents(path: &Path, config: &Config) -> bool {
+    let DirectoryOperands::Contents { follow_symlinks } = config.directory_operands else {
+        return false;
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => follow_symlinks && path.is_dir(),
+        Ok(md) => md.is_dir(),
+        // Reported when it is listed as a file
+        Err(_) => false,
+    }
+}
+
+/// The `Entry` a directory operand sorts by. A symbolic link operand that reached here is followed.
+fn directory_operand_entry(path: &Path, config: &Config) -> io::Result<Entry> {
+    let path_cstr = CString::new(path.as_os_str().as_bytes())?;
+    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, true)?;
+    Entry::new(
+        None,
+        path.as_os_str().to_os_string(),
+        &metadata,
+        config,
+        path,
+    )
+}
+
 fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     let mut exit_code = 0;
 
@@ -872,12 +920,25 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
 
     // Categorize into directories/files
     for path in paths {
-        if path.is_dir() {
+        if lists_contents(&path, config) {
             directories.push(path);
         } else {
             files.push(path);
         }
     }
+    // POSIX sorts directory operands like file operands, by the same keys.
+    let mut directories: Vec<(Entry, PathBuf)> = directories
+        .into_iter()
+        .filter_map(|path| match directory_operand_entry(&path, config) {
+            Ok(entry) => Some((entry, path)),
+            Err(e) => {
+                report_operand_error(&path, &e);
+                exit_code = exit_code.max(1);
+                None
+            }
+        })
+        .collect();
+    sort_by_entry(&mut directories, |(entry, _)| entry, config);
 
     let num_directory_args = directories.len();
     let num_file_args = files.len();
@@ -950,11 +1011,11 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
         file_entries.push(entry);
     }
     if !file_entries.is_empty() {
-        display_entries(&mut file_entries, config, None);
+        display_entries(&mut file_entries, config);
     }
 
     let mut is_first_dir_arg = true;
-    for path in directories.into_iter() {
+    for (_, path) in directories {
         exit_code = exit_code.max(process_single_dir(
             path,
             config,
@@ -977,14 +1038,13 @@ fn process_single_dir(
     // mutated
     let exit_code = AtomicU8::new(0);
 
-    // Stores visited paths to prevent infinite loops due to symbolic links
-    // Map of canonical path -> path
-    let mut visited: HashMap<(u64, u64), PathBuf> = HashMap::new();
-
     let mut entries: Vec<Entry> = Vec::new();
     let mut errors: Vec<io::Error> = Vec::new();
 
     let mut current_dir: Option<PathBuf> = None;
+    // Whether `current_dir` has delivered any entry. The operand is `current_dir` before it is
+    // opened, and an unreadable one gets no total line.
+    let mut current_dir_read = false;
 
     // Always true. According to the reference:
     // "For each operand that names a file of a type other than directory
@@ -1025,54 +1085,29 @@ fn process_single_dir(
 
     fn print_contents(
         config: &Config,
-        dir: &Path,
         entries: &mut Vec<Entry>,
         errors: &mut Vec<io::Error>,
         exit_code: &AtomicU8,
     ) {
-        let dir_path = ls_from_utf8_lossy(dir.as_os_str().as_bytes());
-
         for e in errors.drain(..) {
             eprintln!("ls: {e}");
             exit_code.fetch_max(1, Ordering::SeqCst);
         }
 
+        print_total_line(entries, config);
         if !entries.is_empty() {
-            display_entries(entries, config, Some(&dir_path));
+            display_entries(entries, config);
 
             // Already displayed so clear the entries
             entries.clear();
         }
     }
 
-    let mut terminate = false;
-
     let _ = ftw::traverse_directory(
         path,
         |dir_entry| {
-            if terminate {
-                return Ok(false);
-            }
-
             let metadata = dir_entry.metadata().unwrap();
             let is_dot_or_double_dot = dir_entry.is_dot_or_double_dot();
-
-            // Get the metadata of the file, equivalent to `std::fs::symlink_metadata`
-            let marker = {
-                let metadata =
-                    match ftw::Metadata::new(dir_entry.dir_fd(), dir_entry.file_name(), false) {
-                        Ok(md) => md,
-                        Err(e) => {
-                            let path_str = ls_from_utf8_lossy(
-                                dir_entry.path().as_inner().as_os_str().as_bytes(),
-                            );
-                            let err_str = gettext!("cannot access '{}': {}", path_str, e);
-                            errors.push(io::Error::other(err_str));
-                            return Ok(false);
-                        }
-                    };
-                (metadata.dev(), metadata.ino())
-            };
 
             if current_dir.is_none() {
                 // Init `dir`. `dir_entry.path()` should still be `path` here.
@@ -1085,7 +1120,6 @@ fn process_single_dir(
                     current_dir.as_ref().unwrap(),
                 );
 
-                visited.insert(marker, current_dir.as_ref().unwrap().clone());
                 return Ok(true);
             }
 
@@ -1183,45 +1217,10 @@ fn process_single_dir(
                 comps.as_path()
             };
 
-            if let Some(file_name) = visited.get(&marker) {
-                // Exclude . and .. from loop detection logic
-                if !is_dot_or_double_dot {
-                    // Process and print previous entries before showing the infinite loop error
-                    if let Err(e) = process_dir_entry(&mut entries) {
-                        errors.push(e);
-                    }
-                    print_contents(
-                        config,
-                        current_dir_ref,
-                        &mut entries,
-                        &mut errors,
-                        &exit_code,
-                    );
-
-                    eprintln!(
-                        "ls: {}: {}",
-                        ls_from_utf8_lossy(file_name.as_os_str().as_bytes()),
-                        gettext("not listing already-listed directory")
-                    );
-
-                    // This is the only error that has exit code 2 for now.
-                    exit_code.fetch_max(2, Ordering::SeqCst);
-                    terminate = true;
-                    return Ok(false);
-                }
-            } else {
-                visited.insert(marker, current_dir_ref.clone());
-            }
-
             // If moving to a new subdirectory
             if dir_parent != current_dir_ref.as_path() {
-                print_contents(
-                    config,
-                    current_dir_ref,
-                    &mut entries,
-                    &mut errors,
-                    &exit_code,
-                );
+                // Reaching another directory's entries means the one being left was read.
+                print_contents(config, &mut entries, &mut errors, &exit_code);
 
                 current_dir = Some(dir_parent.to_path_buf());
                 print_header(
@@ -1232,6 +1231,8 @@ fn process_single_dir(
                     current_dir.as_ref().unwrap(),
                 );
             }
+            // An entry inside `current_dir` (`.` and `..` included) proves it was read.
+            current_dir_read = true;
 
             match process_dir_entry(&mut entries) {
                 Ok(b) => Ok(b),
@@ -1244,6 +1245,18 @@ fn process_single_dir(
         |_, _| Ok(()),
         |entry, error| {
             let path_str = ls_from_utf8_lossy(entry.path().as_inner().as_os_str().as_bytes());
+            if error.kind() == ftw::ErrorKind::Cycle {
+                // -R descent only: ftw compares (dev, ino) against the ancestors of this entry,
+                // so an operand, a hard link, or a directory reached twice by different
+                // paths is never refused.
+                eprintln!(
+                    "ls: {}: {}",
+                    path_str,
+                    gettext("not listing already-listed directory")
+                );
+                exit_code.fetch_max(2, Ordering::SeqCst);
+                return;
+            }
             eprintln!(
                 "ls: {}",
                 gettext!("cannot access '{}': {}", path_str, error.inner())
@@ -1259,11 +1272,10 @@ fn process_single_dir(
         },
     );
 
-    // If there are remaining unprinted entries
-    if !entries.is_empty() {
-        if let Some(dir) = &current_dir {
-            print_contents(config, dir, &mut entries, &mut errors, &exit_code);
-        }
+    // The last directory listed, or the operand itself if it was read at all: an empty
+    // directory still gets its total line, an unreadable one does not.
+    if current_dir_read {
+        print_contents(config, &mut entries, &mut errors, &exit_code);
     }
 
     Ok(exit_code.load(Ordering::SeqCst))

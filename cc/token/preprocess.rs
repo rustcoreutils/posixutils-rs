@@ -49,14 +49,17 @@ const DEFAULT_INCLUDE_TRACK_CAPACITY: usize = 32;
 
 /// Where on the search chain a header was found.
 ///
-/// The chain is gcc's: the `-I` directories, then the directory of headers
-/// the compiler owns (here, the bundled ones), then the system directories.
+/// The chain is gcc's: the `-iquote` directories (for the `"..."` form
+/// only), the `-I` directories, then the directory of headers the compiler
+/// owns (here, the bundled ones), then the system directories.
 /// `#include_next` resumes just after the position the current file came
 /// from, so a bundled header that forwards reaches the system's, and a `-I`
 /// header that forwards reaches the bundled one first. The variant order is
 /// the search order, which is what `Ord` compares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SearchPos {
+    /// The `-iquote` directory at this index.
+    IQuote(usize),
     /// The `-I` directory at this index.
     Quote(usize),
     /// The bundled headers.
@@ -71,7 +74,8 @@ impl SearchPos {
     /// it, or the start of the chain for a file not found on it at all.
     pub(super) fn after(from: Option<SearchPos>) -> SearchPos {
         match from {
-            None => SearchPos::Quote(0),
+            None => SearchPos::IQuote(0),
+            Some(SearchPos::IQuote(i)) => SearchPos::IQuote(i + 1),
             Some(SearchPos::Quote(i)) => SearchPos::Quote(i + 1),
             Some(SearchPos::Bundled) => SearchPos::System(0),
             Some(SearchPos::System(i)) => SearchPos::System(i + 1),
@@ -510,6 +514,9 @@ pub struct Preprocessor<'a> {
     /// Include paths for angle-bracket includes
     system_include_paths: Vec<String>,
 
+    /// `-iquote`: searched for the `"..."` form only, ahead of `-I`.
+    iquote_include_paths: Vec<String>,
+
     /// Include paths for quote includes (searched first)
     quote_include_paths: Vec<String>,
 
@@ -546,6 +553,9 @@ pub struct Preprocessor<'a> {
     dependencies: Vec<(PathBuf, bool)>,
     /// Whether to collect the above.
     collect_dependencies: bool,
+    /// `-dD`: carry each `#define` and `#undef` that takes effect into the
+    /// output, as its own text; see [`PreprocessConfig::keep_definitions`].
+    keep_definitions: bool,
 
     /// Files named by a `#pragma once`.
     once_files: HashSet<PathBuf>,
@@ -650,8 +660,9 @@ struct LineMarker {
     name: Option<String>,
 }
 
-/// The payload prefix a marker uses when it carries a pragma c17 does not act
-/// on and only needs to reproduce.
+/// The payload prefix a marker uses when it carries a directive c17 does not
+/// act on and only needs to reproduce: a pragma, or under `-dD` a `#define`
+/// or `#undef` that has already taken effect.
 const PRAGMA_TEXT_PREFIX: &str = "text:";
 
 /// The gcc release c17 claims to be, as `[major, minor, patchlevel]`.
@@ -663,6 +674,26 @@ const PRAGMA_TEXT_PREFIX: &str = "text:";
 /// set out where the macros are defined.
 pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
 
+/// The stream name of a bundled header, which diagnostics show.
+pub(crate) fn bundled_header_stream(name: &str) -> String {
+    format!("<builtin:{name}>")
+}
+
+/// The file a `-E` line marker names for a stream.
+///
+/// A bundled header is compiled into c17 and has no path, so its marker
+/// names `<built-in>`, gcc's pseudo-file for text the compiler supplies.
+/// Tools read the markers as a list of files and know gcc's pseudo-names:
+/// perl's `makedepend` drops `<built-in>` and made `<builtin:stdarg.h>` a
+/// make prerequisite, which make then rejected as a target pattern.
+pub fn marker_file_name(stream_name: &str) -> &str {
+    if stream_name.starts_with("<builtin:") {
+        "<built-in>"
+    } else {
+        stream_name
+    }
+}
+
 /// The directive a marker token stands for, when it is one c17 only carries.
 ///
 /// `#pragma pack` and `#pragma scalar_storage_order` are the pragmas that
@@ -671,12 +702,38 @@ pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
 /// text: c17 does not act on `#pragma GCC diagnostic` or an OpenMP directive,
 /// but POSIX makes a `.i` a valid operand and c17 compiles one, so dropping
 /// them made preprocessing and compiling in two steps mean something different
-/// from doing it in one.
+/// from doing it in one. Under `-dD` the `#define` and `#undef` lines travel
+/// the same way, to be written where they stood.
 pub fn pragma_text(token: &Token) -> Option<String> {
     match &token.value {
         TokenValue::String(s) => s.strip_prefix(PRAGMA_TEXT_PREFIX).map(str::to_string),
         _ => None,
     }
+}
+
+/// The names `#pragma weak NAME` makes weak symbols, from the pragma markers
+/// in `tokens`, in the order they stand.
+///
+/// A System V pragma that gcc implements too: `NAME` becomes a weak symbol
+/// whether its declaration or definition comes before the pragma or after
+/// it, so where the pragma stands does not matter. The `#pragma weak NAME =
+/// TARGET` form, which defines an alias, is not acted on.
+pub fn pragma_weak_names(tokens: &[Token]) -> Vec<String> {
+    tokens
+        .iter()
+        .filter(|t| t.typ == TokenType::Pragma)
+        .filter_map(pragma_text)
+        .filter_map(|text| {
+            let mut words = text.strip_prefix("#pragma")?.split_whitespace();
+            if words.next()? != "weak" {
+                return None;
+            }
+            let name = words.next()?;
+            let is_ident = name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+            (words.next().is_none() && is_ident).then(|| name.to_string())
+        })
+        .collect()
 }
 
 /// A pragma that changes how the parser lays out the structures and unions
@@ -1060,6 +1117,7 @@ impl<'a> Preprocessor<'a> {
             pushed_macros: HashMap::new(),
             cond_stack: Vec::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             system_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
+            iquote_include_paths: search.iquote.to_vec(),
             quote_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
             current_file: filename.to_string(),
             base_file: filename.to_string(),
@@ -1070,6 +1128,7 @@ impl<'a> Preprocessor<'a> {
             max_include_depth: 200,
             dependencies: Vec::new(),
             collect_dependencies: false,
+            keep_definitions: false,
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             guarded_files: HashMap::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             compile_date,
@@ -1369,7 +1428,24 @@ impl<'a> Preprocessor<'a> {
             Some(eq) => format!("{} {}\n", &spec[..eq], &spec[eq + 1..]),
             None => format!("{} 1\n", spec),
         };
+        let (mut cursor, pos) = Self::cmdline_directive(&text, idents);
+        self.handle_define(&mut cursor, idents, pos);
+    }
 
+    /// Apply one command-line `-U` operand, as the `#undef` it stands for.
+    ///
+    /// Through the ordinary directive path, as `-D` is, so its name is
+    /// checked by the same rule: `-U 1x` is "macro names must be
+    /// identifiers", and `-U a-b` undefines `a` with a warning about `-b`,
+    /// as in gcc.
+    fn undef_from_cmdline(&mut self, name: &str, idents: &mut IdentTable) {
+        let (mut cursor, pos) = Self::cmdline_directive(&format!("{name}\n"), idents);
+        self.handle_undef(&mut cursor, idents, pos);
+    }
+
+    /// The operand tokens of a directive given on the command line, and the
+    /// position a malformed one is reported at.
+    fn cmdline_directive(text: &str, idents: &mut IdentTable) -> (TokenCursor, Position) {
         let stream_id = diag::init_stream("<command-line>");
         let tokens = {
             let mut tokenizer = Tokenizer::new(text.as_bytes(), stream_id, idents);
@@ -1383,7 +1459,7 @@ impl<'a> Preprocessor<'a> {
         // buffer and so is flagged as beginning a line -- which the operand's
         // same-line check then reads as `#define` with nothing after it.
         // `-DGITVERSION="..."`, which CPython's build passes, was rejected.
-        let mut cursor = TokenCursor::new(
+        let cursor = TokenCursor::new(
             tokens
                 .into_iter()
                 .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
@@ -1393,14 +1469,43 @@ impl<'a> Preprocessor<'a> {
                 })
                 .collect(),
         );
-        // A `-D` has no `#` to blame, so a malformed one is reported at the
-        // start of the synthesized directive.
-        let pos = cursor.peek().map(|t| t.pos).unwrap_or_default();
-        self.handle_define(&mut cursor, idents, pos);
+        // A command-line directive has no `#` to blame, so a malformed one is
+        // reported at the start of the synthesized directive.
+        let pos = cursor
+            .peek()
+            .map(|t| t.pos)
+            .unwrap_or_else(|| Position::new(stream_id, 1, 1));
+        (cursor, pos)
     }
 
     pub fn undef_macro(&mut self, name: &str) {
         self.macros.remove(name);
+    }
+
+    /// Apply the command line's `-D` and then its `-U` options.
+    ///
+    /// POSIX c17: "The -D option has lower precedence than the -U option.
+    /// That is, if name is used in both a -U and a -D option, name shall be
+    /// undefined regardless of the order of the options." A `-D` of a name
+    /// some `-U` names is therefore not applied at all, so a second `-D` of
+    /// that name redefines nothing and is not reported: zstd builds its
+    /// programs with `-DZSTD_LEGACY_SUPPORT=5 -UZSTD_LEGACY_SUPPORT
+    /// -DZSTD_LEGACY_SUPPORT=0` under `-Werror`.
+    fn apply_cmdline_macros(
+        &mut self,
+        defines: &[String],
+        undefines: &[String],
+        idents: &mut IdentTable,
+    ) {
+        for def in defines {
+            let name_end = def.find(['=', '(']).unwrap_or(def.len());
+            if !undefines.iter().any(|u| *u == def[..name_end]) {
+                self.define_from_cmdline(def, idents);
+            }
+        }
+        for undef in undefines {
+            self.undef_from_cmdline(undef, idents);
+        }
     }
 
     /// Check if a macro is defined
@@ -1463,23 +1568,10 @@ impl<'a> Preprocessor<'a> {
                 }
 
                 TokenType::Special => {
-                    if let TokenValue::Special(code) = &token.value {
-                        // Check for # at start of line (preprocessor directive).
-                        //
-                        // Only from the file. C17 6.10.3p11 makes a directive
-                        // produced by a macro expansion undefined, and taking
-                        // one would be worse than undefined here: `skip_to_eol`
-                        // and `collect_to_eol` stop at the next token that
-                        // begins a line, so a stray `#` out of an expansion
-                        // would swallow the rest of the file rather than the
-                        // rest of a replacement list.
-                        if *code == b'#' as u32
-                            && token.pos.newline
-                            && cursor.provenance() == Provenance::Main
-                        {
-                            self.handle_directive(&mut cursor, &token, &mut output, idents);
-                            continue;
-                        }
+                    // `#` at start of line, from the file: a directive.
+                    if self.is_file_directive(&token, &cursor) {
+                        self.handle_directive(&mut cursor, &token, &mut output, idents);
+                        continue;
                     }
                     if !self.is_skipping() {
                         if self.in_if_condition {
@@ -2729,6 +2821,11 @@ fn suffix_is_valid(suffix: &str) -> bool {
 /// construction, before any other option is applied.
 #[derive(Debug, Clone, Default)]
 pub struct SystemSearch<'a> {
+    /// `-iquote`: directories searched for the `"..."` form only, after the
+    /// including file's own and ahead of `-I`. Here rather than beside `-I`
+    /// in [`PreprocessConfig`] so that `.S` files, which have their own
+    /// configuration, search them too.
+    pub iquote: &'a [String],
     /// `--sysroot`: the target's directories are read from under this prefix.
     pub sysroot: Option<&'a str>,
     /// `-isystem`: system directories searched ahead of the target's own.
@@ -2769,6 +2866,9 @@ pub struct PreprocessConfig<'a> {
     pub pre_includes: &'a [String],
     /// Collect every macro definition for `-dM` instead of only the tokens.
     pub dump_macros: bool,
+    /// `-dD`: carry each `#define` and `#undef` in the output where it
+    /// stood, and collect the definitions in force before the source.
+    pub keep_definitions: bool,
     /// Collect the headers this translation unit depends on (the `-M` family).
     pub collect_dependencies: bool,
     /// The position independence code generation uses; see
@@ -2860,6 +2960,9 @@ pub struct PreprocessOutcome {
     /// Every macro in force at the end, as `#define` lines, sorted (`-dM`).
     /// Empty unless asked for: rendering them is not free.
     pub macro_definitions: Vec<String>,
+    /// Under `-dD`, the macros in force before the source -- predefined and
+    /// from the command line -- as `#define` lines, sorted. Empty otherwise.
+    pub initial_definitions: Vec<String>,
     /// Every header opened, in the order first opened, with whether it came
     /// from a system directory (the `-M` family). Empty unless asked for.
     pub dependencies: Vec<(PathBuf, bool)>,
@@ -2905,15 +3008,17 @@ pub fn preprocess_collecting(
         pp.quote_include_paths.push(path.clone());
     }
 
-    // Process -D defines
-    for def in config.defines {
-        pp.define_from_cmdline(def, idents);
-    }
+    // -D, then -U, which wins
+    pp.apply_cmdline_macros(config.defines, config.undefines, idents);
 
-    // Process -U undefines
-    for undef in config.undefines {
-        pp.undef_macro(undef);
-    }
+    // `-dD`: what is defined now is what the source starts with; from here
+    // on each directive is carried where it stands, `-include`d ones too.
+    let initial_definitions = if config.keep_definitions {
+        pp.keep_definitions = true;
+        pp.macro_definitions(idents)
+    } else {
+        Vec::new()
+    };
 
     // `-include` runs after `-D`/`-U`, because a header may well test what
     // they defined, and before the source, because that is what "as if it were
@@ -2944,6 +3049,7 @@ pub fn preprocess_collecting(
         } else {
             Vec::new()
         },
+        initial_definitions,
         dependencies: std::mem::take(&mut pp.dependencies),
     };
     (output, outcome)
@@ -2976,6 +3082,18 @@ pub struct AsmPreprocessConfig<'a> {
     /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
     /// is mapped as in C.
     pub macro_prefix_map: PrefixMap,
+    /// See [`PreprocessConfig::collect_dependencies`]: a `.S` is preprocessed,
+    /// so the `-M` family has a rule to write for it.
+    pub collect_dependencies: bool,
+}
+
+/// A preprocessed `.S`: the text for `as`, and the headers it read.
+#[derive(Debug, Default)]
+pub struct AsmPreprocessed {
+    /// The preprocessed assembly, as bytes; see [`preprocess_asm_file`].
+    pub text: Vec<u8>,
+    /// See [`PreprocessOutcome::dependencies`].
+    pub dependencies: Vec<(PathBuf, bool)>,
 }
 
 /// A `.S` operand that could not be preprocessed.
@@ -2999,7 +3117,8 @@ impl std::error::Error for AsmPreprocessFailed {}
 /// comment syntax (`;` for line comments, no `//` or `/* */`).
 ///
 /// # Returns
-/// The preprocessed assembly text, as bytes: a string literal's payload is a
+/// The preprocessed assembly text, as bytes, with the headers read when
+/// [`AsmPreprocessConfig::collect_dependencies`] asks: a string literal's payload is a
 /// byte sequence, so rendering it through a Rust `String` would re-encode
 /// every byte >= 0x80. `Err` means this call reported a diagnostic -- a
 /// `#error`, a missing include -- and the bytes are not worth assembling.
@@ -3014,7 +3133,7 @@ pub fn preprocess_asm_file(
     target: &Target,
     filename: &str,
     config: &AsmPreprocessConfig<'_>,
-) -> Result<Vec<u8>, AsmPreprocessFailed> {
+) -> Result<AsmPreprocessed, AsmPreprocessFailed> {
     let errors_on_entry = diag::error_count();
     // Create string table for tokenization
     let mut strings = IdentTable::new();
@@ -3037,6 +3156,7 @@ pub fn preprocess_asm_file(
     // Use assembly lexer mode for included files as well
     pp.lexer_mode = LexerMode::Assembly;
     pp.macro_prefix_map = config.macro_prefix_map.clone();
+    pp.collect_dependencies = config.collect_dependencies;
 
     // Undefine C-specific macros that don't apply to assembly
     pp.undef_macro("__STDC__");
@@ -3061,15 +3181,8 @@ pub fn preprocess_asm_file(
         pp.quote_include_paths.push(path.clone());
     }
 
-    // Process -D defines
-    for def in config.defines {
-        pp.define_from_cmdline(def, &mut strings);
-    }
-
-    // Process -U undefines
-    for undef in config.undefines {
-        pp.undef_macro(undef);
-    }
+    // -D, then -U, which wins
+    pp.apply_cmdline_macros(config.defines, config.undefines, &mut strings);
 
     // Preprocess
     let preprocessed = pp.preprocess(tokens, &mut strings);
@@ -3081,7 +3194,10 @@ pub fn preprocess_asm_file(
     if diag::error_count() != errors_on_entry {
         return Err(AsmPreprocessFailed);
     }
-    Ok(text)
+    Ok(AsmPreprocessed {
+        text,
+        dependencies: std::mem::take(&mut pp.dependencies),
+    })
 }
 
 #[cfg(test)]

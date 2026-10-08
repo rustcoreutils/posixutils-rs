@@ -11,12 +11,14 @@
 
 #![recursion_limit = "512"]
 
+use posixutils_cc::aux_info;
 use posixutils_cc::builtins;
 use posixutils_cc::diag;
 use posixutils_cc::f_options::{self, Effect};
 use posixutils_cc::ir;
 use posixutils_cc::linkargs;
 use posixutils_cc::opt;
+use posixutils_cc::os;
 use posixutils_cc::parse;
 use posixutils_cc::pipeline;
 use posixutils_cc::prefix_map::{MapOption, PrefixMap, PrefixMaps};
@@ -28,7 +30,7 @@ use posixutils_cc::token;
 use posixutils_cc::types;
 use posixutils_cc::warn_options::{self, Verdict};
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{gettext, gettext_args};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -109,6 +111,10 @@ struct Args {
     #[arg(long = "dM", help = gettext("Dump macro definitions instead of output"))]
     dump_macros: bool,
 
+    /// Keep every `#define` and `#undef` in the preprocessed text (`-dD`).
+    #[arg(long = "dD", help = gettext("Keep macro definitions in the output"))]
+    dump_definitions: bool,
+
     /// Write a make rule naming every header the source depends on, instead of
     /// compiling it (`-M`).
     #[arg(short = 'M', help = gettext("Write a make dependency rule instead of compiling"))]
@@ -145,6 +151,15 @@ struct Args {
     #[arg(long = "MP", help = gettext("Add a phony target for each dependency"))]
     deps_phony: bool,
 
+    /// gcc's `-aux-info`: record every function declared or defined at file
+    /// scope in `<file>`. libselinux's Python binding is generated from it.
+    #[arg(
+        long = "aux-info",
+        value_name = "file",
+        help = gettext("Write the declarations of every function to <file>")
+    )]
+    aux_info: Option<String>,
+
     /// Process a file as if `#include "<file>"` were the first line
     /// (`-include`). Repeatable, applied in order.
     #[arg(
@@ -158,6 +173,10 @@ struct Args {
     /// Dump AST (for debugging parser)
     #[arg(long = "dump-ast", help = gettext("Parse and dump AST to stdout"))]
     dump_ast: bool,
+
+    /// `-fsyntax-only`: preprocess and parse, diagnose, and write nothing.
+    #[arg(long = "fsyntax-only", help = gettext("Check the source for errors; write nothing"))]
+    syntax_only: bool,
 
     /// Dump IR at a named stage (for debugging)
     /// Stages: post-linearize, post-mapping, post-opt, post-lower, all
@@ -194,6 +213,10 @@ struct Args {
     /// header fails on the first header that header includes.
     #[arg(long = "sysroot", value_name = "dir", help = gettext("Use dir as the root of the target's system directories"))]
     sysroot: Option<String>,
+
+    /// Include directories searched for `#include "..."` only, ahead of `-I`.
+    #[arg(long = "iquote", action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add an include path for #include \"...\" only, searched before -I"))]
+    iquote_paths: Vec<String>,
 
     /// System include directories searched ahead of the target's own.
     #[arg(long = "isystem", action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add a system include path, searched before the target's own"))]
@@ -328,7 +351,7 @@ struct Args {
     prefix_maps: Vec<MapOption>,
 
     #[arg(short = 'W', action = clap::ArgAction::Append, value_name = "warning",
-          num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
+          help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
     warnings: Vec<String>,
 
     #[arg(short = 'w', help = gettext("Suppress all warnings"))]
@@ -458,6 +481,16 @@ struct Args {
     /// function whose stack gcc would probe.
     #[arg(long = "c17-stack-clash", hide = true)]
     stack_clash: bool,
+
+    /// The last of `-fstack-protector`, its levels and `-fno-stack-protector`
+    /// (rewritten by `preprocess_args_from`), as its `-f` name.
+    #[arg(
+        long = "c17-stack-protector",
+        hide = true,
+        value_name = "option",
+        value_parser = parse_stack_protector
+    )]
+    stack_protector: Option<target::StackProtector>,
 }
 
 /// The `-Wno-` name for the "`-std=` was not honoured" warning.
@@ -591,17 +624,28 @@ struct DriverObserver<'a> {
 }
 
 impl pipeline::Observer for DriverObserver<'_> {
-    fn parsed(&mut self, ast: &parse::ast::TranslationUnit) -> io::Result<bool> {
+    fn parsed(
+        &mut self,
+        ast: &parse::ast::TranslationUnit,
+        strings: &StringTable,
+        types: &types::TypeTable,
+        symbols: &SymbolTable,
+    ) -> io::Result<bool> {
         if let Some(stage) = &self.args.dump_ir {
             if let Err(msg) = validate_dump_ir_stage(stage) {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
             }
         }
+        if let Some(path) = &self.args.aux_info {
+            let text = aux_info::records(ast, strings, types, symbols);
+            std::fs::write(path, text)
+                .map_err(|e| io::Error::new(e.kind(), format!("cannot write '{path}': {e}")))?;
+        }
         if self.args.dump_ast {
             println!("{:#?}", ast);
             return Ok(false);
         }
-        Ok(true)
+        Ok(!self.args.syntax_only)
     }
 
     fn linearized(
@@ -696,6 +740,7 @@ enum Compiled {
 /// The system header search this invocation asked for.
 fn system_search(args: &Args) -> token::preprocess::SystemSearch<'_> {
     token::preprocess::SystemSearch {
+        iquote: &args.iquote_paths,
         sysroot: args.sysroot.as_deref(),
         isystem: &args.isystem_paths,
         idirafter: &args.idirafter_paths,
@@ -757,14 +802,33 @@ impl Args {
 /// The same pass `assemble_operand` runs before handing a `.S` to `as`, with
 /// the result going to the preprocessed sink instead of a scratch file. A `.s`
 /// has no directives to act on, so this is a copy for it -- which is also what
-/// gcc does rather than skipping the operand.
+/// gcc does rather than skipping the operand. Under `-M`/`-MM` the rule is the
+/// whole output, so the text is not written.
 fn preprocess_asm_operand(
     path: &str,
     args: &Args,
     target: &Target,
     out: &mut dyn Write,
 ) -> io::Result<()> {
+    let preprocessed = preprocess_asm(path, args, target)?;
+    if args.dependencies_replace_output() {
+        return Ok(());
+    }
+    out.write_all(&preprocessed)?;
+    out.flush()
+}
+
+/// Run the preprocessor over an assembler operand, the `.S` form's first
+/// step, and write its dependency rule when one was asked for.
+///
+/// A BOM is stripped for the same reason it is on every other reader:
+/// translation phase 1 has no byte for it, and `as` reads the leading 0xEF as
+/// the first character of a mnemonic.
+fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8>> {
     let content = strip_bom(&std::fs::read(path)?).to_vec();
+    // Only a `.S` is preprocessed, so only a `.S` has a rule: gcc writes none
+    // for a `.s`, under `-M` or `-MD`.
+    let collect_dependencies = args.wants_dependencies() && args.lang_of(path) == Lang::AsmCpp;
     let config = AsmPreprocessConfig {
         optimization: args.optimization(),
         position: position_independence(args, target),
@@ -775,13 +839,17 @@ fn preprocess_asm_operand(
         search: system_search(args),
         no_std_inc: args.no_std_inc,
         macro_prefix_map: args.prefix_maps().macros,
+        collect_dependencies,
     };
+    // Catches #error, a missing include, and friends.
     let preprocessed = preprocess_asm_file(&content, target, path, &config).map_err(|e| {
         diag::reset_counts();
         io::Error::new(io::ErrorKind::InvalidData, e.to_string())
     })?;
-    out.write_all(&preprocessed)?;
-    out.flush()
+    if collect_dependencies {
+        write_dependency_rule(args, path, &preprocessed.dependencies)?;
+    }
+    Ok(preprocessed.text)
 }
 
 /// Write the make rule for one translation unit.
@@ -965,6 +1033,17 @@ fn emit_preprocessed(
     // below checks this; a marker is never merely cosmetic, so each site
     // has to say what it does instead.
     let markers = !args.no_line_markers;
+    // `-dD`: the definitions the source starts with, under gcc's name for
+    // where they came from. The marker naming the source follows, so the
+    // line count is right again for what comes after.
+    if !outcome.initial_definitions.is_empty() {
+        if markers {
+            writeln!(out.preprocessed, "# 1 \"<built-in>\"")?;
+        }
+        for line in &outcome.initial_definitions {
+            writeln!(out.preprocessed, "{}", line.trim_end())?;
+        }
+    }
     if markers {
         writeln!(
             out.preprocessed,
@@ -1055,7 +1134,7 @@ fn emit_preprocessed(
                         out.preprocessed,
                         "# {} \"{}\" {}",
                         line,
-                        token::lexer::escape_c_string(&name),
+                        token::lexer::escape_c_string(token::preprocess::marker_file_name(&name)),
                         if returning { 2 } else { 1 }
                     )?;
                 }
@@ -1087,7 +1166,9 @@ fn emit_preprocessed(
                             out.preprocessed,
                             "# {} \"{}\"",
                             line,
-                            token::lexer::escape_c_string(&name)
+                            token::lexer::escape_c_string(token::preprocess::marker_file_name(
+                                &name
+                            ))
                         )?;
                     }
                     current_line = line;
@@ -1121,19 +1202,11 @@ fn emit_preprocessed(
                     current_line += 1;
                     at_line_start = true;
                 } else {
-                    // Need a space if:
-                    // 1. Original had whitespace, OR
-                    // 2. Adjacent tokens would merge (both alphanumeric/underscore)
+                    // A space where the source had one, and wherever the
+                    // two would otherwise lex back as different tokens.
                     let next_text = show_token(next, strings);
-                    let needs_space = next.pos.whitespace
-                        || (text
-                            .chars()
-                            .last()
-                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                            && next_text
-                                .chars()
-                                .next()
-                                .is_some_and(|c| c.is_alphanumeric() || c == '_'));
+                    let needs_space =
+                        next.pos.whitespace || token::spellings_merge(&text, &next_text);
                     if needs_space {
                         write!(out.preprocessed, " ")?;
                     }
@@ -1244,6 +1317,8 @@ fn process_file(
             preprocessed,
             pre_includes: &args.pre_includes,
             dump_macros: args.dump_macros,
+            // Only `-E` writes the text the directives are carried into.
+            keep_definitions: args.dump_definitions && args.preprocess_only,
             collect_dependencies: args.wants_dependencies(),
             optimization: args.optimization(),
             position: position_independence(args, target),
@@ -1304,6 +1379,7 @@ fn process_file(
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
         stack_clash: args.stack_clash,
+        stack_protector: args.stack_protector.unwrap_or_default(),
         source_name: path,
         debug_prefix_map: &prefix_maps.debug,
     };
@@ -1634,6 +1710,12 @@ fn parse_cf_protection(s: &str) -> Result<target::CfProtection, String> {
     target::CfProtection::from_level(s).ok_or_else(|| format!("invalid cf-protection level '{s}'"))
 }
 
+/// The value of the internal `--c17-stack-protector` option: the `-f` name
+/// of a stack-protector level.
+fn parse_stack_protector(s: &str) -> Result<target::StackProtector, String> {
+    target::StackProtector::from_option(s).ok_or_else(|| format!("not a stack protector: '{s}'"))
+}
+
 /// The value of the internal `--c17-pic` option: a member of the `-fpic`
 /// family, in its gcc spelling.
 fn parse_pic_flag(s: &str) -> Result<target::PositionIndependence, String> {
@@ -1717,13 +1799,64 @@ fn is_valid_opt_level(s: &str) -> bool {
 /// `@file` response files are expanded first, so the rewriting below, clap and
 /// `linkargs::scan` all read the same, complete argument vector.
 fn preprocess_args() -> Vec<String> {
-    match respfile::expand(std::env::args().collect()) {
-        Ok(argv) => preprocess_args_from(argv),
+    match respfile::expand(std::env::args().collect()).and_then(preprocess_args_from) {
+        Ok(argv) => argv,
         Err(e) => {
             eprintln!("c17: {e}");
             std::process::exit(1);
         }
     }
+}
+
+/// gcc's one-dash spellings of the options `Args` declares long, because
+/// clap would read `-include` as the short cluster `-i -n -c ...`. The
+/// pre-pass hands each to clap with a second dash; everything else that
+/// reports an option names it as written here.
+const GCC_ONE_DASH_LONG: &[&str] = &[
+    "-aux-info",
+    "-dD",
+    "-dM",
+    "-fgnu89-inline",
+    "-fmath-errno",
+    "-fno-builtin",
+    "-fno-gnu89-inline",
+    "-fno-math-errno",
+    "-fno-trapping-math",
+    "-fpermissive",
+    "-fsyntax-only",
+    "-ftrapping-math",
+    "-fverbose-asm",
+    "-idirafter",
+    "-include",
+    "-iquote",
+    "-isystem",
+    "-MD",
+    "-MF",
+    "-MM",
+    "-MMD",
+    "-MP",
+    "-MT",
+    "-nobuiltininc",
+    "-nostdinc",
+    "-shared",
+];
+
+/// `arg` as clap is given it: see [`GCC_ONE_DASH_LONG`].
+fn clap_spelling(arg: &str) -> std::borrow::Cow<'_, str> {
+    if GCC_ONE_DASH_LONG.contains(&arg) {
+        format!("-{arg}").into()
+    } else {
+        arg.into()
+    }
+}
+
+/// Whether `arg`, as the user wrote it, takes the next word as its
+/// argument: one `Args` declares, or one the pre-pass consumes itself.
+fn takes_next_word(arg: &str) -> bool {
+    // Bare `-W` is `-Wextra`, given its value by the pre-pass.
+    arg != "-W"
+        && (takes_separate_value(&clap_spelling(arg))
+            || matches!(arg, "-x" | "-Xlinker" | "--param"))
 }
 
 /// Preprocess command-line arguments for gcc compatibility.
@@ -1732,7 +1865,12 @@ fn preprocess_args() -> Vec<String> {
 ///
 /// Takes the raw argument vector rather than reading the environment so the
 /// unit tests exercise this exact function.
-fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
+///
+/// An option missing its argument at the end of the line is refused here, in
+/// gcc's words and in the user's spelling: handed on, it would name the
+/// internal spelling (`--MF`) and take as its argument whatever is appended
+/// to the line below (`-o` wrote a file named `-D`).
+fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
     let mut o_flag_idx: Option<usize> = None; // index into result of the -O flag
@@ -1758,6 +1896,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut unsupported: Vec<(String, String)> = Vec::new();
     // `-fstack-clash-protection`, last one wins.
     let mut stack_clash = false;
+    // `-fstack-protector`, its levels and `-fno-stack-protector`: last wins.
+    let mut stack_protector = None;
     // The `-W<name>` and `-f<name>` options refused as gcc refuses them: by
     // its driver, and -- only if the driver let everything through -- by
     // its compiler.
@@ -1766,8 +1906,30 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
+        let f_spelling = two_dash_prefix_map(arg);
+        let arg = f_spelling.as_ref().unwrap_or(arg);
+        let spelled = clap_spelling(arg);
 
-        if arg == "-O" {
+        if i + 1 == raw_args.len() && takes_next_word(arg) {
+            return Err(format!("{} '{arg}'", gettext("error: missing argument to")));
+        }
+        if arg == "-W" {
+            // gcc's old spelling of `-Wextra`. Given its value here, `-W`
+            // is an option like `-I` that always has one.
+            result.push("-W".to_string());
+            result.push("extra".to_string());
+            i += 1;
+        } else if takes_separate_value(&spelled) {
+            // `-I dir`, `-o file`, `-include file`, ...: the next word is the
+            // value as written, even one that looks like an option
+            // (`-I -I/common`), so none of the rewriting below may touch it.
+            result.push(spelled.into_owned());
+            result.push(raw_args[i + 1].clone());
+            i += 2;
+        } else if GCC_ONE_DASH_LONG.contains(&arg.as_str()) {
+            result.push(spelled.into_owned());
+            i += 1;
+        } else if arg == "-O" {
             // Standalone -O: check if next arg is a valid optimization level
             let new_flag = if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
                 let flag = format!("-O{}", raw_args[i + 1]);
@@ -1891,14 +2053,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if let Some(model) = arg.strip_prefix("-ftls-model=") {
             result.push(format!("--c17-tls-model={}", tls_model_name(model)));
             i += 1;
-        } else if arg == "-shared" {
-            // -shared → --shared
-            result.push("--shared".to_string());
-            i += 1;
-        } else if arg == "-fno-builtin" {
-            // -fno-builtin → --fno-builtin
-            result.push("--fno-builtin".to_string());
-            i += 1;
         } else if let Some(func) = arg.strip_prefix("-fno-builtin-") {
             // -fno-builtin-FUNC → --c17-fno-builtin-func FUNC
             result.push("--c17-fno-builtin-func".to_string());
@@ -1956,12 +2110,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             }
             result.push(format!("--c17-prefix-map={arg}"));
             i += 1;
-        } else if arg == "-fverbose-asm" {
-            result.push("--fverbose-asm".to_string());
-            i += 1;
-        } else if arg == "-fpermissive" {
-            result.push("--fpermissive".to_string());
-            i += 1;
         } else if arg == "-fsignaling-nans" || arg == "-fno-signaling-nans" {
             // Nothing c17 folds assumes a NaN is quiet, so the optimizer is
             // already what gcc's is under `-fsignaling-nans`: an identity
@@ -1971,17 +2119,14 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // glibc's <math.h> and <fenv.h> read.
             signaling_nans = arg == "-fsignaling-nans";
             i += 1;
-        } else if arg == "-fgnu89-inline"
-            || arg == "-fno-gnu89-inline"
-            || arg == "-fmath-errno"
-            || arg == "-fno-math-errno"
-            || arg == "-ftrapping-math"
-            || arg == "-fno-trapping-math"
-        {
-            result.push(format!("-{arg}"));
-            i += 1;
         } else if arg == "-fstack-clash-protection" || arg == "-fno-stack-clash-protection" {
             stack_clash = arg == "-fstack-clash-protection";
+            i += 1;
+        } else if let Some(level) = arg
+            .strip_prefix("-f")
+            .and_then(target::StackProtector::from_option)
+        {
+            stack_protector = Some(level);
             i += 1;
         } else if arg.starts_with("-fuse-ld=")
             && f_options::classify(&arg[2..]) == f_options::Verdict::Known(Effect::Implemented)
@@ -2023,52 +2168,11 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 i += 1; // the setting travels separately
             }
             i += 1;
-        } else if arg == "-nostdinc" || arg == "-nobuiltininc" {
-            // gcc spells these with one dash; clap declares them long-only.
-            result.push(format!("-{}", arg));
+        } else if let Some(dir) = arg.strip_prefix("-iquote").filter(|d| !d.is_empty()) {
+            // gcc takes the directory joined as well; guile writes `-iquote.`.
+            result.push("--iquote".to_string());
+            result.push(dir.to_string());
             i += 1;
-        } else if matches!(arg.as_str(), "-MM" | "-MD" | "-MMD" | "-MP") {
-            // gcc spells these with one dash; clap would read them as short
-            // clusters.
-            result.push(format!("-{}", arg));
-            i += 1;
-        } else if arg == "-MF" || arg == "-MT" {
-            result.push(format!("-{}", arg));
-            if let Some(v) = raw_args.get(i + 1) {
-                result.push(v.clone());
-                i += 2;
-            } else {
-                i += 1;
-            }
-        } else if arg == "-dM" {
-            // One dash in gcc; clap would read it as the short cluster `-d -M`.
-            result.push("--dM".to_string());
-            i += 1;
-        } else if arg == "-include" {
-            // gcc spells it with one dash; clap would read that as the short
-            // cluster `-i -n -c ...` and reject it.
-            result.push("--include".to_string());
-            if let Some(v) = raw_args.get(i + 1) {
-                result.push(v.clone());
-                i += 2;
-            } else {
-                i += 1;
-            }
-        } else if arg == "-isystem" || arg == "-idirafter" || arg == "--sysroot" {
-            // Value options gcc spells with one dash. `--sysroot` is already
-            // two, but takes its value as a separate word here either way.
-            let long = if arg.starts_with("--") {
-                arg.to_string()
-            } else {
-                format!("-{}", arg)
-            };
-            result.push(long);
-            if let Some(v) = raw_args.get(i + 1) {
-                result.push(v.clone());
-                i += 2;
-            } else {
-                i += 1;
-            }
         } else if let Some(dir) = arg.strip_prefix("--sysroot=") {
             result.push("--sysroot".to_string());
             result.push(dir.to_string());
@@ -2093,18 +2197,30 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             i += 1;
         } else if arg == "-Xlinker" {
             // -Xlinker <arg> -> the same pair, for the host driver
-            if i + 1 < raw_args.len() {
-                result.push("--c17-linker-flag=-Xlinker".to_string());
-                result.push(format!("--c17-linker-flag={}", raw_args[i + 1]));
-                i += 2;
-            } else {
-                i += 1;
-            }
+            result.push("--c17-linker-flag=-Xlinker".to_string());
+            result.push(format!("--c17-linker-flag={}", raw_args[i + 1]));
+            i += 2;
         } else if arg == "-pthread" {
             // -pthread -> pass to linker and define _REENTRANT
             result.push("--c17-linker-flag=-pthread".to_string());
             result.push("-D".to_string());
             result.push("_REENTRANT".to_string());
+            i += 1;
+        } else if let Some(file) = arg.strip_prefix("-specs=") {
+            // A gcc spec file, in gcc's driver language, so the host driver
+            // that links reads it. Debian's are link specs (package notes,
+            // `-no-pie`) and `-fno-PIE` self-specs, which change nothing a
+            // link with c17's position-independent objects needs. gcc reads
+            // the file whether or not it links, and a missing one is fatal.
+            if let Err(e) = File::open(file) {
+                eprintln!(
+                    "c17: {} '{file}': {}",
+                    gettext("fatal error: cannot read spec file"),
+                    plib::diag::io_error_text(&e)
+                );
+                std::process::exit(1);
+            }
+            result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
         } else if arg == "-rdynamic" {
             // -rdynamic -> pass to linker
@@ -2123,11 +2239,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // Just echo back the program name (like gcc does when it doesn't have a special path)
             println!("{}", prog);
             std::process::exit(0);
-        } else if arg == "-v" || arg == "--version" || arg == "-qversion" || arg == "-version" {
-            // Version query - handled by clap, but -v is also our verbose flag
-            // Let it pass through to clap
-            result.push(arg.clone());
-            i += 1;
         } else {
             // An operand, or an option's value -- the two cannot be told apart
             // here, and recording a language for a value is harmless, since
@@ -2169,6 +2280,14 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     if stack_clash {
         trailer.push("--c17-stack-clash".to_string());
     }
+    if let Some(level) = stack_protector {
+        trailer.push(format!("--c17-stack-protector={}", level.option()));
+        // gcc's `__SSP__` family, defined as gcc defines it.
+        if let Some((name, value)) = level.predefined_macro() {
+            trailer.push("-D".to_string());
+            trailer.push(format!("{name}={value}"));
+        }
+    }
     if debug == Some(true) {
         trailer.push("-g".to_string());
     }
@@ -2181,7 +2300,17 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         .position(|a| a == "--")
         .unwrap_or(result.len());
     result.splice(at..at, trailer);
-    result
+    Ok(result)
+}
+
+/// The `-f` spelling of a path prefix map written `--NAME=VALUE`.
+///
+/// gcc's driver takes `--NAME` for `-fNAME`, and gmp passes
+/// `--debug-prefix-map=` that way when it assembles its `.s` files. The prefix
+/// maps are the options real builds spell so, and the only ones taken.
+fn two_dash_prefix_map(arg: &str) -> Option<String> {
+    let f = format!("-f{}", arg.strip_prefix("--")?);
+    MapOption::parse(&f).is_some().then_some(f)
 }
 
 /// Answer one of gcc's driver queries, returning the exit status, or `None`
@@ -2241,6 +2370,49 @@ fn query_target(raw_args: &[String]) -> Target {
     })
 }
 
+/// gcc's `-v` report of where `#include` looks, in the order c17 looks there.
+///
+/// Programs read it to learn the compiler's header directories: perl's h2ph
+/// converts the headers it finds in them (`cc -v -E - </dev/null`), CMake
+/// records them as implicit. Only existing directories are listed, as gcc
+/// lists them. The bundled headers have no directory of their own; their
+/// slot names the one c17 answers for `-print-file-name=include` -- the host
+/// driver's, whose files those headers stand in for -- and is left out when
+/// that is not a directory or the bundled headers are off.
+fn include_search_list(args: &Args, target: &Target) -> String {
+    let search = system_search(args);
+    let mut angle: Vec<String> = args.include_paths.clone();
+    if !args.no_std_inc && !args.no_builtin_inc {
+        angle.extend(host_include_dir());
+    }
+    angle.extend(search.isystem.iter().cloned());
+    if !search.no_std_inc {
+        angle.extend(os::get_include_paths(target, search.sysroot));
+    }
+    angle.extend(search.idirafter.iter().cloned());
+
+    let exists = |dir: &&String| Path::new(dir).is_dir();
+    let entry = |dir: &String| format!(" {dir}\n");
+    let mut out = String::from("#include \"...\" search starts here:\n");
+    out.extend(search.iquote.iter().filter(exists).map(entry));
+    out.push_str("#include <...> search starts here:\n");
+    out.extend(angle.iter().filter(exists).map(entry));
+    out.push_str("End of search list.\n");
+    out
+}
+
+/// The host driver's answer to `-print-file-name=include`, when that is a
+/// directory.
+fn host_include_dir() -> Option<String> {
+    let out = linkargs::host_driver()
+        .arg("-print-file-name=include")
+        .output()
+        .ok()?;
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && Path::new(&dir).is_absolute() && Path::new(&dir).is_dir())
+        .then_some(dir)
+}
+
 /// Put `query` to the host driver and pass on its answer and exit status.
 fn forward_to_host_driver(query: &str) -> i32 {
     match linkargs::host_driver().arg(query).output() {
@@ -2254,6 +2426,140 @@ fn forward_to_host_driver(query: &str) -> i32 {
             1
         }
     }
+}
+
+/// Whether `arg` takes exactly one value, given as its own word or joined.
+///
+/// These are the options POSIX.2024 XBD 12.2 Guidelines 6 and 7 speak of:
+/// the word after one is its option-argument, whatever it looks like. An
+/// optional-valued option (`-O`, `--dump-ir`) is not one: its value is only
+/// ever joined.
+fn takes_one_value(arg: &clap::Arg) -> bool {
+    !arg.is_positional()
+        && arg.get_action().takes_values()
+        && arg
+            .get_num_args()
+            .is_none_or(|n| n.min_values() == 1 && n.max_values() == 1)
+}
+
+/// The spellings, in the rewritten vector, of every option that takes its
+/// value as the next word: `-I`, `-o`, `--isystem` and the rest, read off
+/// `Args` so that adding an option there is all it takes.
+fn separate_value_options() -> &'static [String] {
+    static SPELLINGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SPELLINGS.get_or_init(|| {
+        Args::command()
+            .get_arguments()
+            .filter(|a| takes_one_value(a))
+            .flat_map(|a| {
+                let short = a.get_short().map(|c| format!("-{c}"));
+                let long = a.get_long().map(|l| format!("--{l}"));
+                short.into_iter().chain(long)
+            })
+            .collect()
+    })
+}
+
+/// Whether the word after `arg` is its option-argument; see
+/// [`separate_value_options`].
+fn takes_separate_value(arg: &str) -> bool {
+    separate_value_options().iter().any(|s| s == arg)
+}
+
+/// Parse a rewritten command line with clap.
+///
+/// Every option that takes one value takes the next word as it even when that
+/// word begins with `-` (XBD 12.2, Guideline 7: an option-argument is not
+/// optional), as gcc does: a Makefile whose variable is empty passes
+/// `-I -I/common`, which is the directory `-I/common`. clap would otherwise
+/// read the second word as an option and call the first one's value missing.
+fn try_parse(argv: &[String]) -> Result<Args, clap::Error> {
+    let command = Args::command().mut_args(|a| {
+        if takes_one_value(&a) {
+            a.allow_hyphen_values(true)
+        } else {
+            a
+        }
+    });
+    let mut matches = command.try_get_matches_from(argv)?;
+    Args::from_arg_matches_mut(&mut matches)
+}
+
+/// Parse the rewritten command line, refusing it as gcc's driver would.
+///
+/// clap's own refusal named no program, followed it with a usage block, and
+/// named only the letter it stopped at: configure's `-qversion` probe logged
+/// `error: unexpected argument '-q' found`. Build logs are read by people
+/// looking for which program said what, so every refusal carries `c17:`, and
+/// an unknown option is refused in gcc's words. (A missing value never
+/// reaches clap: `preprocess_args_from` refuses it, in the user's spelling.)
+/// The status is gcc's 1, not clap's 2.
+fn parse_args(argv: Vec<String>) -> Args {
+    use clap::error::ErrorKind;
+    match try_parse(&argv) {
+        Ok(args) => args,
+        Err(e) => match e.kind() {
+            ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => e.exit(),
+            _ => {
+                eprintln!("c17: {}", parse_error_text(&e, &argv));
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// The text of a parse refusal, without the `c17: ` it is printed after.
+fn parse_error_text(e: &clap::Error, argv: &[String]) -> String {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let context = |kind| match e.get(kind) {
+        Some(ContextValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let invalid_arg = context(ContextKind::InvalidArg).unwrap_or_default();
+    match e.kind() {
+        ErrorKind::UnknownArgument => format!(
+            "{} '{}'",
+            gettext("error: unrecognized command-line option"),
+            unknown_option_culprit(argv, invalid_arg)
+        ),
+        // The operands are the only required argument.
+        ErrorKind::MissingRequiredArgument => gettext("fatal error: no input files"),
+        // clap's first paragraph is the message; the rest is usage and help.
+        _ => {
+            let text = e.render().to_string();
+            let message = text.split("\n\n").next().unwrap_or_default();
+            message.trim_end().to_string()
+        }
+    }
+}
+
+/// The argument that held the unknown option clap stopped at.
+///
+/// clap reads `-qversion` as the short options `-q -v -e ...` and reports the
+/// first letter it does not know, so `-q`, where gcc names the whole
+/// argument. The argument is the first one that, parsed alone, fails on that
+/// same letter: a value such as `-I/q` that merely contains it parses.
+fn unknown_option_culprit<'a>(argv: &'a [String], reported: &'a str) -> &'a str {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if reported.starts_with("--") || reported.len() != 2 {
+        return reported;
+    }
+    let fails_on_reported = |arg: &str| {
+        let Err(e) = try_parse(&[argv[0].clone(), arg.to_string()]) else {
+            return false;
+        };
+        e.kind() == ErrorKind::UnknownArgument
+            && matches!(e.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(s)) if s == reported)
+    };
+    argv.iter()
+        .skip(1)
+        .take_while(|a| *a != "--")
+        .filter(|a| a.starts_with('-') && !a.starts_with("--") && a.len() > 1)
+        .find(|a| *a == reported || fails_on_reported(a))
+        .map_or(reported, String::as_str)
 }
 
 /// gcc's `-v` banner, printed when `-v` is given with nothing to compile.
@@ -2577,30 +2883,7 @@ fn assemble_operand(
     let needs_cpp = args.lang_of(path) == Lang::AsmCpp;
     let asm_to_assemble = if needs_cpp {
         let temp_s = scratch_path(scratch, operand_id, stem, "s");
-        // A BOM is stripped here for the same reason it is on every other
-        // reader: translation phase 1 has no byte for it, and `as` reads the
-        // leading 0xEF as the first character of a mnemonic. `-E` on the same
-        // file already stripped it, so without this a BOM'd `.S` preprocessed
-        // clean and failed to assemble. Only `.S` gets this -- a `.s` is handed
-        // to `as` untouched, which is what gcc does with it too.
-        let content = strip_bom(&std::fs::read(path)?).to_vec();
-        let asm_config = AsmPreprocessConfig {
-            optimization: args.optimization(),
-            position: position_independence(args, target),
-            isa: target::X86Isa::from_flags(&args.mflags),
-            defines: &args.defines,
-            undefines: &args.undefines,
-            include_paths: &args.include_paths,
-            search: system_search(args),
-            no_std_inc: args.no_std_inc,
-            macro_prefix_map: args.prefix_maps().macros,
-        };
-        // Catches #error, a missing include, and friends.
-        let preprocessed =
-            preprocess_asm_file(&content, target, path, &asm_config).map_err(|e| {
-                diag::reset_counts();
-                io::Error::other(e.to_string())
-            })?;
+        let preprocessed = preprocess_asm(path, args, target)?;
         std::fs::write(&temp_s, &preprocessed)?;
         temp_s
     } else {
@@ -2682,9 +2965,9 @@ impl AssemblerCommand {
 /// object each operand contributes, if any. Walking `scanned` therefore places
 /// every `-L`/`-l`/`-R` exactly where it appeared relative to the operands.
 ///
-/// If the rescan disagrees with what clap collected — which would mean
-/// `VALUE_OPTIONS` in `linkargs` has drifted from `Args` — the ordering is not
-/// trustworthy, so this falls back to the unordered shape (every object, then
+/// If the rescan disagrees with what clap collected — which would mean the
+/// rescan read an option's value as an operand, or the reverse — the ordering
+/// is not trustworthy, so this falls back to the unordered shape (every object, then
 /// every `-L`, then every `-l`, then every `-R`) rather than emitting a
 /// scrambled link line.
 fn build_link_line(
@@ -2804,8 +3087,8 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // Rescan for the -L/-l/-R order relative to the operands, which clap's
     // per-flag collection cannot preserve. Done before parsing so a parse
     // failure still exits the usual way.
-    let scanned = linkargs::scan(argv.iter().cloned());
-    let args = Args::parse_from(argv);
+    let scanned = linkargs::scan(argv.iter().cloned(), takes_separate_value);
+    let args = parse_args(argv);
 
     if args.no_warnings {
         diag::suppress_warnings();
@@ -2943,6 +3226,14 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|o| o.kind == OperandKind::Source)
         .count();
 
+    if args.verbose
+        && operands
+            .iter()
+            .any(|o| matches!(o.kind, OperandKind::Source | OperandKind::Asm))
+    {
+        eprint!("{}", include_search_list(&args, &target));
+    }
+
     // A single -o names one output. With -c and several sources it would name
     // each of them in turn, so every object but the last is overwritten. The
     // spec leaves this unspecified (88338-88343); say so rather than silently
@@ -3022,6 +3313,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         && !args.dependencies_replace_output()
         && !args.dump_tokens
         && !args.dump_ast
+        && !args.syntax_only
         && args.dump_ir.is_none();
 
     for (idx, op) in operands.iter().enumerate() {
@@ -3051,7 +3343,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             // assembler operand is never handed to `as`. Not assembling is not
             // the same as producing nothing, though: preprocess it and write
             // the text, as gcc does.
-            OperandKind::Asm if args.preprocess_only => {
+            OperandKind::Asm if args.preprocess_only || args.dependencies_replace_output() => {
                 let result = preprocess_asm_operand(&op.path, &args, &target, &mut pp_out);
                 diag::finish_unit();
                 match result {
@@ -3241,7 +3533,16 @@ mod tests {
         let raw_args: Vec<String> = std::iter::once("c17".to_string())
             .chain(args.iter().map(|s| s.to_string()))
             .collect();
-        preprocess_args_from(raw_args)
+        preprocess_args_from(raw_args).expect("preprocess")
+    }
+
+    /// The pre-pass's refusal of `args`.
+    fn preprocess_err(args: &[&str]) -> String {
+        let raw_args: Vec<String> = std::iter::once("c17")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        preprocess_args_from(raw_args).expect_err("refused")
     }
 
     #[test]
@@ -3546,13 +3847,7 @@ mod tests {
     /// withdrawing it.
     #[test]
     fn test_preprocess_unsupported_f_flags_are_kept_for_the_warning() {
-        for flag in &[
-            "-fstack-protector",
-            "-fstack-protector-strong",
-            "-fstack-protector-all",
-            "-fsanitize=address",
-            "-fcommon",
-        ] {
+        for flag in &["-fsanitize=address", "-fcommon", "-ftrapv"] {
             let result = run_preprocess(&[flag, "foo.c"]);
             assert!(
                 result.contains(&format!("--c17-unsupported={flag}")),
@@ -3567,14 +3862,52 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            unsupported(&["-fstack-protector", "-fstack-protector-strong"]),
-            ["--c17-unsupported=-fstack-protector-strong"]
+            unsupported(&["-fsanitize=address", "-fsanitize=undefined"]),
+            ["--c17-unsupported=-fsanitize=undefined"]
         );
-        assert!(unsupported(&["-fstack-protector-all", "-fno-stack-protector"]).is_empty());
+        assert!(unsupported(&["-ftrapv", "-fno-trapv"]).is_empty());
         assert_eq!(
-            unsupported(&["-fno-stack-protector", "-fstack-protector"]),
-            ["--c17-unsupported=-fstack-protector"]
+            unsupported(&["-fno-trapv", "-ftrapv"]),
+            ["--c17-unsupported=-ftrapv"]
         );
+    }
+
+    /// The stack protector's options become one, the last named winning,
+    /// with gcc's macro for the level, and `-fno-stack-protector` leaves
+    /// neither a level nor a macro.
+    #[test]
+    fn test_preprocess_stack_protector_last_wins() {
+        let ssp = |args: &[&str]| -> Vec<String> {
+            run_preprocess(args)
+                .into_iter()
+                .filter(|a| a.starts_with("--c17-stack-protector=") || a.starts_with("__SSP"))
+                .collect()
+        };
+        assert_eq!(
+            ssp(&["-fstack-protector", "-fstack-protector-strong", "foo.c"]),
+            [
+                "--c17-stack-protector=stack-protector-strong",
+                "__SSP_STRONG__=3"
+            ]
+        );
+        assert_eq!(
+            ssp(&["-fstack-protector-all", "-fno-stack-protector", "foo.c"]),
+            ["--c17-stack-protector=no-stack-protector"]
+        );
+        assert_eq!(
+            ssp(&[
+                "-fno-stack-protector",
+                "-fstack-protector-explicit",
+                "foo.c"
+            ]),
+            [
+                "--c17-stack-protector=stack-protector-explicit",
+                "__SSP_EXPLICIT__=4"
+            ]
+        );
+        assert!(ssp(&["foo.c"]).is_empty());
+        let args = Args::parse_from(run_preprocess(&["-fstack-protector-all", "foo.c"]));
+        assert_eq!(args.stack_protector, Some(target::StackProtector::All));
     }
 
     /// What c17's output already is is taken in silence, and leaves nothing
@@ -3629,6 +3962,7 @@ mod tests {
             "-fno-trapping-math",
             "-fuse-ld=lld",
             "-fverbose-asm",
+            "-fsyntax-only",
             "-fvisibility=hidden",
         ] {
             assert_eq!(
@@ -3936,10 +4270,140 @@ mod tests {
         assert!(!result.contains(&"-fvisibility=hidden".to_string()));
         assert!(!result.contains(&"-fno-semantic-interposition".to_string()));
         assert!(!result.contains(&"-fno-plt".to_string()));
-        // The stack protector c17 does not provide is kept for its warning.
-        assert!(result.contains(&"--c17-unsupported=-fstack-protector-strong".to_string()));
+        assert!(result.contains(&"--c17-stack-protector=stack-protector-strong".to_string()));
+        assert!(!result.iter().any(|a| a.starts_with("--c17-unsupported=")));
         assert!(!result.contains(&"-pipe".to_string()));
         // Linker flags should be passed through
         assert!(result.iter().any(|a| a.starts_with("--c17-linker-flag=")));
+    }
+
+    /// Every option that takes a value takes the next word as it, even one
+    /// that begins with `-` (XBD 12.2, Guidelines 6 and 7), in each spelling
+    /// gcc gives it. `-Wall` would be rewritten if the rewriting reached it.
+    #[test]
+    fn option_argument_may_begin_with_a_hyphen() {
+        let v = "-Wall";
+        let parse = |opt: &str| {
+            let args = try_parse(&run_preprocess(&[opt, v, "foo.c"]))
+                .unwrap_or_else(|e| panic!("{opt} {v}: {e}"));
+            assert_eq!(args.files, ["foo.c"], "{opt}");
+            assert!(args.warnings.is_empty(), "{opt}");
+            args
+        };
+        let one = |o: Option<String>| o.into_iter().collect::<Vec<_>>();
+        type Field = fn(Args) -> Vec<String>;
+        let cases: &[(&str, Field)] = &[
+            ("-I", |a| a.include_paths),
+            ("-D", |a| a.defines),
+            ("-U", |a| a.undefines),
+            ("-L", |a| a.lib_paths),
+            ("-l", |a| a.libraries),
+            ("-R", |a| a.run_paths),
+            ("-iquote", |a| a.iquote_paths),
+            ("-isystem", |a| a.isystem_paths),
+            ("-idirafter", |a| a.idirafter_paths),
+            ("-include", |a| a.pre_includes),
+            ("-MT", |a| a.deps_target),
+            ("--dump-ir-func", |a| a.dump_ir_func.into_iter().collect()),
+        ];
+        for (opt, field) in cases {
+            assert_eq!(field(parse(opt)), [v], "{opt}");
+        }
+        assert_eq!(one(parse("-o").output), [v]);
+        assert_eq!(one(parse("-B").binding), [v]);
+        assert_eq!(one(parse("-MF").deps_file), [v]);
+        assert_eq!(one(parse("-aux-info").aux_info), [v]);
+        assert_eq!(one(parse("--sysroot").sysroot), [v]);
+        assert_eq!(one(parse("--target").target), [v]);
+        assert_eq!(one(parse("--rtlib").rtlib), [v]);
+        // Joined spellings are untouched.
+        let args = try_parse(&run_preprocess(&["-I-I/common", "-L-Lx", "foo.c"])).unwrap();
+        assert_eq!(args.include_paths, ["-I/common"]);
+        assert_eq!(args.lib_paths, ["-Lx"]);
+    }
+
+    /// An option with nothing after it is still missing its argument, in
+    /// gcc's words, naming the option as the user wrote it -- not as the
+    /// internal spelling clap is handed (`--MF`) -- and before anything the
+    /// pre-pass appends to the line could be taken as its argument.
+    #[test]
+    fn option_at_the_end_is_missing_its_argument() {
+        let opts = [
+            "-I",
+            "-D",
+            "-U",
+            "-o",
+            "-l",
+            "-L",
+            "-MF",
+            "-MT",
+            "-include",
+            "-iquote",
+            "-isystem",
+            "-idirafter",
+            "-aux-info",
+            "--sysroot",
+            "-Xlinker",
+            "-x",
+            "--param",
+        ];
+        for opt in opts {
+            for before in [&[][..], &["-g", "-fsignaling-nans"]] {
+                let mut args = before.to_vec();
+                args.extend(["foo.c", opt]);
+                assert_eq!(
+                    preprocess_err(&args),
+                    format!("error: missing argument to '{opt}'"),
+                    "{args:?}"
+                );
+            }
+        }
+        // As an argument itself, an option is not missing one.
+        let args = try_parse(&run_preprocess(&["-c", "foo.c", "-o", "-MF"])).unwrap();
+        assert_eq!(args.output.as_deref(), Some("-MF"));
+    }
+
+    /// Every one-dash gcc spelling clap is given as a long option is one
+    /// clap declares.
+    #[test]
+    fn one_dash_long_options_are_declared() {
+        let command = Args::command();
+        for opt in GCC_ONE_DASH_LONG {
+            let long = opt.strip_prefix('-').unwrap();
+            assert!(
+                command.get_arguments().any(|a| a.get_long() == Some(long)),
+                "{opt}"
+            );
+        }
+    }
+
+    /// Bare `-W` is gcc's `-Wextra`, and takes no word after it.
+    #[test]
+    fn bare_w_is_wextra_and_takes_no_argument() {
+        let args = try_parse(&run_preprocess(&["-W", "-c", "foo.c"])).unwrap();
+        assert_eq!(args.warnings, ["extra"]);
+        assert!(args.compile_only);
+        let args = try_parse(&run_preprocess(&["foo.c", "-W"])).unwrap();
+        assert_eq!(args.warnings, ["extra"]);
+    }
+
+    /// The link-order rescan knows the same options as the parser: a value is
+    /// never an operand, and one that looks like an option is still a value.
+    #[test]
+    fn link_rescan_reads_values_as_the_parser_does() {
+        use linkargs::LinkArg;
+        let scan = |argv: &[&str]| linkargs::scan(run_preprocess(argv), takes_separate_value);
+        assert_eq!(
+            scan(&["-std=c17", "-iquote", "inc", "a.c", "-l", "m"]),
+            [LinkArg::Operand("a.c".into()), LinkArg::Library("m".into())]
+        );
+        assert_eq!(
+            scan(&["-L", "-Lx", "a.c", "-l", "-lfoo", "-I", "-I/common"]),
+            [
+                LinkArg::LibPath("-Lx".into()),
+                LinkArg::Operand("a.c".into()),
+                LinkArg::Library("-lfoo".into()),
+            ]
+        );
     }
 }

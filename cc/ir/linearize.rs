@@ -1163,6 +1163,10 @@ impl<'a> Linearizer<'a> {
                 _ => None,
             })
             .collect();
+        // What each item adds to the module is stamped with the number of
+        // file-scope asm statements before it -- a function's statics with
+        // the function -- so the backends can write the two in source order.
+        let mut placed = (0, 0);
         for item in &tu.items {
             match item {
                 ExternalDecl::FunctionDef(func) => match &func.attrs.clones {
@@ -1172,9 +1176,14 @@ impl<'a> Linearizer<'a> {
                 ExternalDecl::Declaration(decl) => {
                     self.linearize_global_decl(decl);
                 }
+                ExternalDecl::Asm { text, .. } => {
+                    placed = self.place_after_asm(placed);
+                    self.module.toplevel_asm.push(text.clone());
+                }
             }
         }
         self.resolve_aliases();
+        self.place_after_asm(placed);
         for &name in super::FOLD_CALLEES {
             if !self.library_function_available(name) {
                 continue;
@@ -1183,6 +1192,20 @@ impl<'a> Linearizer<'a> {
             self.module.library_symbols.insert(name, symbol);
         }
         std::mem::take(&mut self.module)
+    }
+
+    /// Stamp the functions and globals added since `placed` -- the counts of
+    /// each already stamped -- as following every file-scope asm seen so
+    /// far, and return the new counts.
+    fn place_after_asm(&mut self, placed: (usize, usize)) -> (usize, usize) {
+        let asm_before = self.module.toplevel_asm.len();
+        for func in &mut self.module.functions[placed.0..] {
+            func.asm_before = asm_before;
+        }
+        for global in &mut self.module.globals[placed.1..] {
+            global.asm_before = asm_before;
+        }
+        (self.module.functions.len(), self.module.globals.len())
     }
 
     /// Allocate a new pseudo ID
@@ -1980,12 +2003,11 @@ impl<'a> Linearizer<'a> {
         self.written_labels = labels.written;
         self.label_cleanups = labels.cleanups;
 
-        // Create function - use storage class from FunctionDef
-        let modifiers = self.types.modifiers(func.return_type);
+        // The definition's own specifiers; the linkage, which an earlier
+        // declaration may have made internal, is `is_static`.
         let is_static = func.is_static || version.is_some();
-        let is_inline = func.is_inline;
-        let is_extern = modifiers.contains(TypeModifiers::EXTERN);
-        let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
+        let is_inline = func.storage_class.contains(TypeModifiers::INLINE);
+        let is_extern = func.storage_class.contains(TypeModifiers::EXTERN);
 
         // The definition is compiled under its own type's convention.
         self.current_calling_conv = func.calling_conv;
@@ -2024,10 +2046,7 @@ impl<'a> Linearizer<'a> {
         // `extern inline` after a `static` declaration has internal linkage
         // and is an ordinary static function, as in gcc.
         let is_inline_definition = if gnu_inline {
-            let mut storage = TypeModifiers::empty();
-            storage.set(TypeModifiers::EXTERN, is_extern);
-            storage.set(TypeModifiers::INLINE, is_inline);
-            !is_static && func.attrs.gnu_inline_only(storage)
+            !is_static && func.attrs.gnu_inline_only(func.storage_class)
         } else {
             is_inline && !is_static && !has_extern_decl && all_decls_inline
         };
@@ -2043,7 +2062,6 @@ impl<'a> Linearizer<'a> {
 
         ir_func.is_static = is_static;
         ir_func.emit = !is_inline_definition;
-        ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         // How the symbol is emitted: by the definition's own attributes, or
         // by a version's share of them.
@@ -2073,6 +2091,7 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.declared_effect = func.attrs.effect;
         ir_func.is_always_inline = func.attrs.always_inline;
+        ir_func.stack_protect = func.attrs.stack_protect;
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function
@@ -2952,8 +2971,14 @@ impl<'a> Linearizer<'a> {
                 false
             }
 
-            // Unreachable is pure (no side effects, just UB hint)
-            ExprKind::Unreachable => true,
+            // No side effect where the program reaches it, but it lowers to
+            // a trap: evaluated on a path the program does not take -- the
+            // untaken arm of gnulib's `(R) ? (void) 0 :
+            // __builtin_unreachable ()` -- it kills a correct program.
+            ExprKind::Unreachable => !speculative,
+
+            // It writes the frame.
+            ExprKind::UnwindInit => false,
 
             // Frame/return address builtins are pure (just read registers)
             ExprKind::FrameAddress { .. } | ExprKind::ReturnAddress { .. } => true,
@@ -4250,6 +4275,7 @@ impl<'a> Linearizer<'a> {
         known: Option<crate::parse::ast::LibFn>,
     ) -> PseudoId {
         let target = self.lower_callee(func_expr);
+        let binding = self.callee_binding(func_expr, binding);
 
         let sig = self.callee_signature(func_expr);
         let conv = sig.conv;
@@ -4388,6 +4414,33 @@ impl<'a> Linearizer<'a> {
             return self.vector_returned(result_sym, typ, expr_typ, conv);
         }
         result_sym
+    }
+
+    /// Which definition a direct call reaches, refining what the parser
+    /// decided.
+    ///
+    /// The IR names a callee by its assembler name, so a second declaration
+    /// labelled with the name of a function this unit defines would otherwise
+    /// call that definition. It does not: glibc's fortified `open` calls
+    /// `__open_alias`, `__REDIRECT`ed to `open` (or `open64`) -- the label of
+    /// the wrapper itself -- and means the library's function. Read as a call
+    /// to the wrapper, it made the wrapper recursive, which kept it from being
+    /// inlined anywhere. gcc binds the call to the declaration it names, so a
+    /// labelled identifier with no definition here is the external function.
+    fn callee_binding(
+        &self,
+        func_expr: &Expr,
+        binding: crate::parse::ast::CalleeBinding,
+    ) -> crate::parse::ast::CalleeBinding {
+        let ExprKind::Ident(symbol_id) = func_expr.kind else {
+            return binding;
+        };
+        let sym = self.symbols.get(symbol_id);
+        if sym.asm_label.is_some() && !self.defined_functions.contains(&sym.name) {
+            crate::parse::ast::CalleeBinding::Library
+        } else {
+            binding
+        }
     }
 
     /// What a call calls: the named function, or the function pointer the
@@ -6210,6 +6263,19 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::UnwindInit => {
+                // An asm that clobbers every callee-saved register: the
+                // prologue saves each one an asm clobbers, which is all the
+                // builtin promises.
+                let clobbers: Vec<String> =
+                    crate::arch::callee_saved_register_names(self.target.arch)
+                        .iter()
+                        .map(|r| r.to_string())
+                        .collect();
+                self.linearize_asm("", &[], &[], &clobbers, &[]);
+                self.emit_const(0, self.types.int_id)
+            }
+
             ExprKind::FrameAddress { level } => {
                 let result = self.alloc_pseudo();
                 let insn = Instruction::frame_walk(
@@ -7234,6 +7300,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable
+            | ExprKind::UnwindInit
             | ExprKind::FrameAddress { .. }
             | ExprKind::ReturnAddress { .. }
             | ExprKind::Setjmp { .. }

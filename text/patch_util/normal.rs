@@ -31,7 +31,7 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
     while pos < lines.len() {
         let line = lines[pos];
         if let Some(rest) = line.strip_prefix("Index: ") {
-            patch.index_path = Some(rest.trim().to_string());
+            patch.index_path = Some(rest.trim_ascii().to_string());
             pos += 1;
         } else if line.starts_with("diff ") {
             // Skip diff command line
@@ -76,20 +76,30 @@ pub fn parse_normal(lines: &[&str], start: usize) -> Result<(FilePatch, usize), 
                 "a" => {
                     // Add: old_start is line after which to add
                     // old_count = 0, new_count = new_end - new_start + 1
-                    Hunk::new(old_start + 1, 0, new_start, new_end - new_start + 1)
+                    Hunk::new(
+                        old_start.saturating_add(1),
+                        0,
+                        new_start,
+                        (new_end - new_start).saturating_add(1),
+                    )
                 }
                 "d" => {
                     // Delete: new_start is line before which content was deleted
                     // old_count = old_end - old_start + 1, new_count = 0
-                    Hunk::new(old_start, old_end - old_start + 1, new_start + 1, 0)
+                    Hunk::new(
+                        old_start,
+                        (old_end - old_start).saturating_add(1),
+                        new_start.saturating_add(1),
+                        0,
+                    )
                 }
                 "c" => {
                     // Change: replace old lines with new lines
                     Hunk::new(
                         old_start,
-                        old_end - old_start + 1,
+                        (old_end - old_start).saturating_add(1),
                         new_start,
-                        new_end - new_start + 1,
+                        (new_end - new_start).saturating_add(1),
                     )
                 }
                 _ => continue,

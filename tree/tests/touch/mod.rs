@@ -215,8 +215,48 @@ fn test_touch_c_dangling_symlink_silent() {
     std::os::unix::fs::symlink(format!("{d}/target"), &link).unwrap();
 
     let out = touch(None, &["-c", &link]);
+    let created = Path::new(&format!("{d}/target")).exists();
     fs::remove_dir_all(&d).unwrap();
 
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(out.stderr.is_empty(), "{out:?}");
+    assert!(!created, "-c created the symlink's target");
+}
+
+/// An existing directory named with a trailing slash gets its times. Linux's
+/// open(O_CREAT) refuses such a name with EISDIR before it looks at O_EXCL.
+#[test]
+fn test_touch_existing_dir_trailing_slash() {
+    let d = dir("test_touch_existing_dir_trailing_slash");
+    let sub = format!("{d}/sub");
+    fs::create_dir(&sub).unwrap();
+
+    let out = touch(Some("UTC"), &["-t", "200001010000", &format!("{sub}/")]);
+    let m = mtime_secs(&sub);
+    fs::remove_dir_all(&d).unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(m, 946_684_800);
+}
+
+/// A trailing slash on a dangling symlink names a directory that does not
+/// exist: the times cannot be set, and nothing is created.
+#[test]
+fn test_touch_dangling_symlink_trailing_slash() {
+    let d = dir("test_touch_dangling_symlink_trailing_slash");
+    let (link, target) = (format!("{d}/link"), format!("{d}/target"));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let out = touch(None, &[&format!("{link}/")]);
+    let created = Path::new(&target).exists();
+    fs::remove_dir_all(&d).unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let enoent = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(enoent.split(" (os error").next().unwrap()),
+        "{stderr}"
+    );
+    assert!(!created);
 }

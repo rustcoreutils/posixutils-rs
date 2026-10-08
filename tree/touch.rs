@@ -189,24 +189,55 @@ fn touch_file(
     let mtime = if args.mtime { source.1 } else { omit() };
     let times = [atime, mtime];
 
-    if !args.no_create {
-        if let Some(fd) = create_new(&c_path)? {
-            return set_times_fd(&fd, &times);
-        }
+    if args.no_create {
+        return match set_times_path(&c_path, &times) {
+            // POSIX -c: do not create, and write no diagnostic; exit success.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        };
     }
+
+    let open_err = match create_new(&c_path) {
+        Ok(fd) => return set_times_fd(&fd, &times),
+        Err(e) => e,
+    };
+    // Whatever kept the file from being created (it exists; or the name ends in a slash, which
+    // Linux refuses with EISDIR before it looks at O_EXCL), an existing file gets its times by
+    // name.
     match set_times_path(&c_path, &times) {
-        // POSIX -c: do not create, and write no diagnostic; exit success.
-        Err(e) if args.no_create && e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => not_found(&c_path, &times, open_err, e),
         result => result,
     }
 }
 
-/// Create `path` as a new empty file, or return `None` if something already has that name.
+/// The file could neither be created (`open_err`) nor found (`not_found`).
+fn not_found(
+    path: &CStr,
+    times: &[libc::timespec; 2],
+    open_err: io::Error,
+    not_found: io::Error,
+) -> io::Result<()> {
+    match open_err.raw_os_error() {
+        // The name existed when the create was tried and is gone now: POSIX would have created
+        // the file, so try once more.
+        Some(libc::EEXIST) => match create_new(path) {
+            Ok(fd) => set_times_fd(&fd, times),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Err(not_found),
+            Err(e) => Err(e),
+        },
+        // A trailing slash on a name that does not exist: it is the missing file to report.
+        Some(libc::EISDIR) => Err(not_found),
+        // Why the file could not be created, e.g. a directory without write permission.
+        _ => Err(open_err),
+    }
+}
+
+/// Create `path` as a new empty file; EEXIST if something already has that name.
 ///
 /// `O_EXCL` makes the existence check and the creation one step, so a file planted between a
 /// check and the open is never opened, and a symlink is not followed. `O_NONBLOCK` and
 /// `O_NOCTTY` keep the open from waiting on a FIFO or acquiring a terminal all the same.
-fn create_new(path: &CStr) -> io::Result<Option<OwnedFd>> {
+fn create_new(path: &CStr) -> io::Result<OwnedFd> {
     let flags = libc::O_CREAT
         | libc::O_EXCL
         | libc::O_WRONLY
@@ -214,15 +245,10 @@ fn create_new(path: &CStr) -> io::Result<Option<OwnedFd>> {
         | libc::O_NOCTTY
         | libc::O_CLOEXEC;
     let fd = unsafe { libc::open(path.as_ptr(), flags, 0o666 as libc::c_int) };
-    if fd >= 0 {
-        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
     }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EEXIST) {
-        Ok(None)
-    } else {
-        Err(err)
-    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Set the times of the file open on `fd`, the one this run created.

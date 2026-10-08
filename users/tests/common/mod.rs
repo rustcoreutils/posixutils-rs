@@ -113,8 +113,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-/// File-based lock path serializing every test that starts a talkd.
-const LOCK_FILE: &str = "/tmp/talk_test.lock";
+/// File-based lock path serializing every test that starts a talkd. It lives
+/// in the build's own scratch directory, which every test process of this
+/// build shares, rather than as a permanent file in /tmp.
+const LOCK_FILE: &str = concat!(env!("CARGO_TARGET_TMPDIR"), "/talk_test.lock");
 
 /// RAII guard for file-based locking across test processes.
 pub struct FileLockGuard {
@@ -162,14 +164,50 @@ pub fn find_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// A unique socket path for one test, in a temporary directory of its own.
+///
+/// Dropping it removes the directory and whatever was bound there, so a test
+/// that fails before `stop_talkd` leaves nothing behind. The directory sits
+/// directly under the temporary root, keeping the path far inside sun_path's
+/// limit. It dereferences to the socket's [`Path`].
+pub struct TestSocket {
+    path: PathBuf,
+    _dir: plib::tmp::TempDir,
+}
+
+impl std::ops::Deref for TestSocket {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::fmt::Debug for TestSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.path.fmt(f)
+    }
+}
+
+impl AsRef<Path> for TestSocket {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TestSocket {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_os_str()
+    }
+}
+
 /// A unique socket path for one test.
-pub fn test_socket_path() -> PathBuf {
-    let pid = std::process::id();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    PathBuf::from(format!("/tmp/talkd_test_{}_{}.sock", pid, timestamp))
+pub fn test_socket_path() -> TestSocket {
+    let dir = plib::tmp::tempdir().expect("create socket directory");
+    TestSocket {
+        path: dir.path().join("talkd.sock"),
+        _dir: dir,
+    }
 }
 
 /// Start a talkd with extra arguments, returning the child once its socket

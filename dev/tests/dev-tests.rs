@@ -2266,8 +2266,9 @@ fn test_strip_archive_symbol_table_still_resolves() {
 // strip does, so it needs write permission on the file and none on its
 // directory. A file it cannot open for writing is reported and left
 // byte-identical; a writable file in an unwritable directory is stripped.
-// Staged with permission bits, which Windows lacks.
-#[cfg(unix)]
+// Linux only: the host cc must produce ELF, which strip reads (macOS cc
+// writes Mach-O).
+#[cfg(target_os = "linux")]
 #[test]
 fn test_strip_leaves_input_intact_when_it_cannot_write() {
     use std::os::unix::fs::PermissionsExt;

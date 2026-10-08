@@ -22,7 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use crate::modes::made::{self, cvt, verify_made_dir, MadeNode, MadeTrust};
-use plib::madefs::{ChainTrust, FoundDir, Preserve, SEARCH_ONLY};
+use plib::madefs::{ChainTrust, FoundDir, NamedAnchor, Preserve, SEARCH_ONLY};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -188,6 +188,8 @@ pub(crate) struct DirTree {
     /// The trust the anchor hands the directories found in it: the root of
     /// the trust every walk carries down (`ChainTrust`).
     root_trust: ChainTrust,
+    /// The anchor as the caller named it, held while `root_trust` may be asked.
+    _named: NamedAnchor,
     /// `(st_dev, st_ino)` of the directories this run created only to hold a
     /// member below them, each with the member path (`MemberPath::key`) it
     /// was made at. Such a directory is not a pre-existing file: a member
@@ -238,8 +240,12 @@ impl DirTree {
             return Err(std::io::Error::last_os_error().into());
         }
         let root = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+        // Named through a symbolic link in a directory others can write, the anchor is
+        // wherever the link's owner chose, and trusts nothing (`ChainTrust::named`).
+        let named = ChainTrust::named(path, &root)?;
         Ok(DirTree {
-            root_trust: ChainTrust::anchor(&root)?,
+            root_trust: named.hands.clone(),
+            _named: named,
             root,
             chain: RefCell::new(Chain::default()),
             max_levels: cached_levels_budget(),

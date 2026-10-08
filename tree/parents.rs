@@ -21,6 +21,7 @@ use crate::common::{
     InodeMap, MadeDirs, MadeTrust, OperandTrust,
 };
 use gettextrs::gettext;
+use plib::madefs::NamedAnchor;
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
@@ -87,13 +88,15 @@ fn make_parents(
     let mut own = Vec::new();
     let target_c = cstring(target.as_os_str().as_bytes())?;
     let mut dest_dir = Rc::new(open_dir_at(libc::AT_FDCWD, &target_c, 0)?);
-    let mut trust = ChainTrust::anchor(&dest_dir)?;
+    let anchor = ChainTrust::named(target, &dest_dir)?;
+    let mut trust = anchor.hands.clone();
     let mut held = vec![Rc::clone(&dest_dir)];
     let Some(parent) = source.parent() else {
         return Ok(Walked {
             made,
             own,
             held,
+            anchor,
             trust,
         });
     };
@@ -195,6 +198,7 @@ fn make_parents(
         made,
         own,
         held,
+        anchor,
         trust,
     })
 }
@@ -209,6 +213,8 @@ struct Walked {
     /// Every directory on the way, the target first and last the one the copy itself goes in,
     /// held while the copy may ask for `trust`.
     held: Vec<Rc<File>>,
+    /// The target as the user named it (`ChainTrust::named`), held likewise.
+    anchor: NamedAnchor,
     /// The trust the last directory hands the directories the copy finds in it.
     trust: ChainTrust,
 }
@@ -311,6 +317,7 @@ where
             made,
             own,
             held,
+            anchor: _anchor,
             trust,
         } = match walked {
             Ok(walked) => walked,

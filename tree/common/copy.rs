@@ -15,7 +15,9 @@ pub use plib::madefs::ChainTrust;
 pub use plib::madefs::MadeTrust;
 #[cfg(target_os = "linux")]
 use plib::madefs::{chmod_pinned, proc_fd_name, procfs_dir, utimens_link_if_still};
-use plib::madefs::{fs_owners, made_by_us, FoundDir, FsOwners, MadeObject, Preserve, SEARCH_ONLY};
+use plib::madefs::{
+    fs_owners, made_by_us, FoundDir, FsOwners, MadeObject, NamedAnchor, Preserve, SEARCH_ONLY,
+};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -356,13 +358,17 @@ fn as_asked(requested: Preserve) -> FoundDir {
 /// would hand it trust that directory never gave. Anything not located hands none
 /// (`ChainTrust::unlocated`).
 ///
-/// The directory opened here comes back with the trust, for the caller to hold while it asks
-/// for that trust: the trust holds it weakly.
+/// The directory a path names is itself the directory the user named, and anchors as one
+/// (`ChainTrust::named`): reached through a symbolic link in a directory others can write, it
+/// trusts nothing.
+///
+/// The directories opened here come back with the trust, for the caller to hold while it asks
+/// for that trust: the trust holds them weakly.
 fn parent_anchor(
     parent: &Rc<ftw::FileDescriptor>,
     id: (u64, u64),
     target: &Path,
-) -> io::Result<(ChainTrust, Option<Rc<OwnedFd>>)> {
+) -> io::Result<(ChainTrust, HeldAnchor)> {
     let unlocated = || Ok((ChainTrust::unlocated(), None));
     let Some(name) = target.file_name() else {
         return unlocated();
@@ -370,11 +376,11 @@ fn parent_anchor(
     let Ok(name) = CString::new(name.as_bytes()) else {
         return unlocated();
     };
+    let path = match target.parent() {
+        Some(path) if !path.as_os_str().is_empty() => path,
+        _ => Path::new("."),
+    };
     let opened = if parent.as_raw_fd() == libc::AT_FDCWD {
-        let path = match target.parent() {
-            Some(path) if !path.as_os_str().is_empty() => path,
-            _ => Path::new("."),
-        };
         let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
             return unlocated();
         };
@@ -399,12 +405,17 @@ fn parent_anchor(
     if (st.st_dev as u64, st.st_ino as u64) != id {
         return unlocated();
     }
-    let anchor = match &opened {
-        Some(opened) => ChainTrust::anchor(opened)?,
-        None => ChainTrust::anchor(parent)?,
-    };
-    Ok((anchor, opened))
+    match opened {
+        Some(opened) => {
+            let named = ChainTrust::named(path, &opened)?;
+            Ok((named.hands.clone(), Some((opened, named))))
+        }
+        None => Ok((ChainTrust::anchor(parent)?, None)),
+    }
 }
+
+/// What `parent_anchor` opened, held while its trust may be asked.
+type HeldAnchor = Option<(Rc<OwnedFd>, NamedAnchor)>;
 
 /// For a directory found existing at the destination path `target`, open on `fd` with identity
 /// `id`, in the directory `parent` handing it `hands`: what it is given once its contents are
@@ -423,9 +434,18 @@ fn found_dir_trust(
     requested: Preserve,
 ) -> io::Result<(DirFinish, ChainTrust)> {
     let (chain, _held) = match hands {
+        // Without a mode or owner asked for, the named directory is given nothing, and its
+        // name need not be read.
+        OperandTrust::Named if !requested.mode && !requested.owner => {
+            return Ok((
+                DirFinish::Found(FoundDir::TimesOnly),
+                ChainTrust::anchor(fd)?,
+            ));
+        }
         OperandTrust::Named => {
-            let finish = DirFinish::Found(as_asked(requested));
-            return Ok((finish, ChainTrust::anchor(fd)?));
+            let named = ChainTrust::named(target, fd)?;
+            let finish = DirFinish::Found(named.named_dir(requested));
+            return Ok((finish, named.hands.clone()));
         }
         OperandTrust::Parent => parent_anchor(parent, id, target)?,
         OperandTrust::Chain(chain) => (chain.clone(), None),

@@ -404,3 +404,60 @@ fn cp_parents_refuses_a_source_ending_in_dot_dot() {
     assert_eq!(mode_of(&c.join("g")), 0o755);
     assert!(!c.join("g/f").exists());
 }
+
+/// `open` (mode `open_mode`) holding `d -> ../home`, and `home` (mode `home_mode`) holding the
+/// user's private `src` (0700); and a source `src` (0755, modified at `OLD_MTIME`).
+fn link_scenario(open_mode: u32, home_mode: u32) -> TempDir {
+    let temp = tempdir().unwrap();
+    source_dir(&temp.path().join("src"), 0o755);
+    with_private_dir(&temp.path().join("home"), home_mode, "src");
+    let open = temp.path().join("open");
+    fs::create_dir(&open).unwrap();
+    std::os::unix::fs::symlink("../home", open.join("d")).unwrap();
+    set_mode(&open, open_mode);
+    temp
+}
+
+/// A destination named through a symbolic link that sits in a directory others can write:
+/// whoever planted the link chose the directory it leads to, so nothing found there is
+/// trusted. Under -p the found directory keeps everything, and that is reported; the copy
+/// itself still follows the link, as GNU cp's does. In a directory only the user can write,
+/// the link is the user's own, and the found directory is stamped.
+#[test]
+fn cp_pr_trusts_no_directory_reached_through_a_link_others_could_plant() {
+    for (open_mode, code, mode) in [(0o777, 1, 0o700), (0o755, 0, 0o755)] {
+        let temp = link_scenario(open_mode, 0o755);
+        let out = cp(temp.path(), &["-pR", "src", "open/d/"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        set_mode(&temp.path().join("open"), 0o755);
+        let found = temp.path().join("home/src");
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "open {open_mode:o}: {stderr}"
+        );
+        assert_eq!(mode_of(&found), mode, "open {open_mode:o}");
+        assert_eq!(
+            mtime_of(&found) == OLD_MTIME,
+            code == 0,
+            "open {open_mode:o}"
+        );
+        assert_eq!(stderr.contains("'open/d/src'"), code == 1, "{stderr}");
+        assert_eq!(fs::read_to_string(found.join("f")).unwrap(), "data\n");
+    }
+}
+
+/// The same for the destination itself, copied into (`src/.`): named through a link in a
+/// directory others can write, it is the directory found, and keeps everything under -p.
+#[test]
+fn cp_pr_leaves_alone_a_named_destination_reached_through_a_link_others_could_plant() {
+    let temp = link_scenario(0o777, 0o700);
+    let out = cp(temp.path(), &["-pR", "src/.", "open/d/"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    set_mode(&temp.path().join("open"), 0o755);
+    let home = temp.path().join("home");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(DIAGNOSTIC), "{stderr}");
+    assert_eq!(mode_of(&home), 0o700, "the private directory was opened up");
+    assert_eq!(fs::read_to_string(home.join("f")).unwrap(), "data\n");
+}

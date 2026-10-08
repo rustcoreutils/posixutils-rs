@@ -25,9 +25,9 @@ use std::ffi::{CStr, CString};
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io;
-#[cfg(target_os = "linux")]
-use std::os::fd::FromRawFd;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path};
 use std::rc::{Rc, Weak};
 use std::sync::Mutex;
 
@@ -244,6 +244,31 @@ pub enum FoundDir {
 #[derive(Clone)]
 pub struct ChainTrust(Rc<Link>);
 
+/// A directory the user named by a path, as the anchor of a chain (`ChainTrust::named`).
+pub struct NamedAnchor {
+    /// The trust it hands its entries.
+    pub hands: ChainTrust,
+    /// Where its name's last component is a symbolic link, the trust of the directory holding
+    /// the link, which the named directory is found in; `None` where the user named the
+    /// directory itself.
+    through_link: Option<ChainTrust>,
+    /// The directory holding the link, held while either trust may be asked.
+    _holder: Option<Rc<OwnedFd>>,
+}
+
+impl NamedAnchor {
+    /// What the named directory itself may be given, existing, `requested` being which of
+    /// mode and owner the user asked to preserve: what was asked, as the user named it; or,
+    /// reached through a link, what a directory found in the link's directory may be.
+    pub fn named_dir(&self, requested: Preserve) -> FoundDir {
+        match &self.through_link {
+            Some(trust) => trust.found_dir(requested),
+            None if requested.mode || requested.owner => FoundDir::AsRequested,
+            None => FoundDir::TimesOnly,
+        }
+    }
+}
+
 /// One directory of a `ChainTrust`.
 struct Link {
     /// What the directory this one is in hands it; `None` where a chain starts (`anchor`,
@@ -323,6 +348,69 @@ impl ChainTrust {
     /// hands its entries, wherever it is.
     pub fn made<T: AsRawFd + 'static>(dir: &Rc<T>) -> io::Result<Self> {
         Self::link(None, dir)
+    }
+
+    /// The anchor for a directory the user named as `path`, opened (following links, as named)
+    /// and held as `dir`.
+    ///
+    /// The user named the directory, and it is trusted as `anchor` -- unless the last component
+    /// of `path` is a symbolic link. Then the directory is wherever the link's owner chose, and
+    /// it is as if found in the directory holding the link: it may itself be given what a
+    /// directory found there may (`NamedAnchor::named_dir`), and hands its entries only what it
+    /// was handed and its own (`found`). A link planted in a directory others can write leads
+    /// nowhere the user vouched for. Its last component is read in its parent (opened for
+    /// search only, as named) without following it; where it is no link, it must be the very
+    /// directory opened. Anything that cannot be read so, or is not, trusts nothing.
+    pub fn named<T: AsRawFd + 'static>(path: &Path, dir: &Rc<T>) -> io::Result<NamedAnchor> {
+        let unlocated = || NamedAnchor {
+            hands: Self::unlocated(),
+            through_link: Some(Self::unlocated()),
+            _holder: None,
+        };
+        let Some(Component::Normal(name)) = path.components().next_back() else {
+            // `/`, `.` or `..`: none can be a link.
+            return Ok(NamedAnchor {
+                hands: Self::anchor(dir)?,
+                through_link: None,
+                _holder: None,
+            });
+        };
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let (Ok(name), Ok(parent)) = (
+            CString::new(name.as_bytes()),
+            CString::new(parent.as_os_str().as_bytes()),
+        ) else {
+            return Ok(unlocated());
+        };
+        let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let holder = unsafe { libc::openat(libc::AT_FDCWD, parent.as_ptr(), flags) };
+        if holder < 0 {
+            return Ok(unlocated());
+        }
+        let holder = Rc::new(unsafe { OwnedFd::from_raw_fd(holder) });
+        let Ok(st) = lstat_at(holder.as_raw_fd(), &name) else {
+            return Ok(unlocated());
+        };
+        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            let in_holder = Self::anchor(&holder)?;
+            return Ok(NamedAnchor {
+                hands: in_holder.found(dir)?,
+                through_link: Some(in_holder),
+                _holder: Some(holder),
+            });
+        }
+        let opened = fstat(dir.as_raw_fd())?;
+        if (st.st_dev, st.st_ino) != (opened.st_dev, opened.st_ino) {
+            return Ok(unlocated());
+        }
+        Ok(NamedAnchor {
+            hands: Self::anchor(dir)?,
+            through_link: None,
+            _holder: None,
+        })
     }
 
     /// What a directory found existing in a directory of this trust may be given, `requested`
@@ -1059,6 +1147,50 @@ mod tests {
         assert_eq!(unlocated.found_dir(none), FoundDir::TimesOnly);
         let below = unlocated.found(&root_fd).unwrap();
         assert_eq!(below.found_dir(mode), FoundDir::LeaveAlone);
+    }
+
+    /// A directory the user names is trusted as named -- unless its name's last component is a
+    /// symbolic link in a directory others can write, or its name no longer holds it.
+    #[test]
+    fn a_named_directory_reached_through_a_link_is_found_in_the_links_directory() {
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let open = tmp.path().join("open");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(&open).unwrap();
+        std::os::unix::fs::symlink(&home, open.join("l")).unwrap();
+        let mode = Preserve {
+            mode: true,
+            owner: false,
+        };
+        let held = Rc::new(std::fs::File::open(&home).unwrap());
+        for (open_mode, through) in [
+            (0o777, FoundDir::LeaveAlone),
+            (0o755, FoundDir::AsRequested),
+        ] {
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(open_mode)).unwrap();
+            for path in [open.join("l"), open.join("l/"), open.join("l/.").join("")] {
+                // `l/.` too: a trailing `.` is no component of its own.
+                let named = ChainTrust::named(&path, &held).unwrap();
+                assert_eq!(named.named_dir(mode), through, "{path:?} in {open_mode:o}");
+                assert_eq!(
+                    named.hands.found_dir(mode),
+                    through,
+                    "{path:?} in {open_mode:o}"
+                );
+            }
+        }
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Named directly.
+        let named = ChainTrust::named(&home, &held).unwrap();
+        assert_eq!(named.named_dir(mode), FoundDir::AsRequested);
+        assert_eq!(named.hands.found_dir(mode), FoundDir::AsRequested);
+        // A name that holds another directory than the one opened.
+        std::fs::rename(&home, tmp.path().join("moved")).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let named = ChainTrust::named(&home, &held).unwrap();
+        assert_eq!(named.named_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(named.hands.found_dir(mode), FoundDir::LeaveAlone);
     }
 
     /// A link holds its directory's descriptor weakly. A group-writable one, whose group needs

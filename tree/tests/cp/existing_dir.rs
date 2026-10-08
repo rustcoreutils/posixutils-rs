@@ -302,3 +302,47 @@ fn cp_pr_judges_a_found_directory_in_an_unreadable_destination() {
     assert_eq!(mode_of(&r.join("s2")), 0o750);
     assert_eq!(mtime_of(&r.join("s2")), OLD_MTIME);
 }
+
+/// `--parents .` copies the working directory's contents into the target itself, as GNU cp
+/// does -- not into a directory of the target's own name inside it.
+#[test]
+fn cp_parents_dot_copies_into_the_target_itself() {
+    let temp = tempdir().unwrap();
+    let sub = temp.path().join("sub");
+    fs::create_dir_all(sub.join("d")).unwrap();
+    fs::write(sub.join("d/f"), "f\n").unwrap();
+    fs::create_dir(temp.path().join("t")).unwrap();
+
+    let out = cp(&sub, &["-R", "--parents", ".", "../t"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    let t = temp.path().join("t");
+    assert_eq!(fs::read_to_string(t.join("d/f")).unwrap(), "f\n");
+    assert!(
+        !t.join("t").exists(),
+        "copied into a directory named like the target"
+    );
+}
+
+/// A source ending in `..` has a destination ending in `..` too: not a name inside the target,
+/// where `--parents` copies, but whatever directory that `..` reaches, which no chain of trust
+/// from the target describes. It is refused, and nothing there is touched.
+#[test]
+fn cp_parents_refuses_a_source_ending_in_dot_dot() {
+    let temp = tempdir().unwrap();
+    let a = temp.path().join("a");
+    source_dir(&a.join("g"), 0o777);
+    let c = a.join("c");
+    fs::create_dir_all(c.join("g")).unwrap();
+    set_mode(&c.join("g"), 0o755);
+    fs::create_dir(c.join("t")).unwrap();
+    set_mode(&c.join("t"), 0o777);
+
+    let out = cp(&c, &["-pR", "--parents", "..", "t"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    set_mode(&c.join("t"), 0o755);
+    assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("'..'"), "stderr: {stderr}");
+    assert_eq!(mode_of(&c.join("g")), 0o755);
+    assert!(!c.join("g/f").exists());
+}

@@ -1919,7 +1919,7 @@ where
     copy_tree(
         cfg,
         SourceRoot::Path(source_arg),
-        TargetRoot::of_path(target_arg, None, trust),
+        TargetRoot::in_cwd(target_arg, trust),
         &mut run.created_files,
         &mut run.made_dirs,
         inode_map,
@@ -1947,7 +1947,7 @@ where
     copy_tree(
         cfg,
         SourceRoot::Path(source_arg),
-        TargetRoot::of_path(target_arg, Some(dir), OperandTrust::Chain(trust)),
+        TargetRoot::in_dir(target_arg, dir, trust)?,
         &mut run.created_files,
         &mut run.made_dirs,
         inode_map,
@@ -1970,37 +1970,34 @@ struct TargetRoot<'a> {
 }
 
 impl<'a> TargetRoot<'a> {
-    /// cp: the operand resolved from the working directory, or with `Some(dir)` its last
-    /// component in `dir`.
-    fn of_path(operand: &'a Path, dir: Option<ftw::FileDescriptor>, trust: OperandTrust) -> Self {
-        let (dir, trust, name, display_parent) = match (dir, operand.file_name()) {
-            (Some(dir), Some(name)) => (
-                dir,
-                trust,
-                name,
-                operand.parent().unwrap_or(Path::new("")).to_path_buf(),
-            ),
-            // Resolved from the working directory, it is in whatever directory that names.
-            (Some(_), None) => (
-                ftw::FileDescriptor::cwd(),
-                OperandTrust::Parent,
-                operand.as_os_str(),
-                PathBuf::new(),
-            ),
-            (None, _) => (
-                ftw::FileDescriptor::cwd(),
-                trust,
-                operand.as_os_str(),
-                PathBuf::new(),
-            ),
-        };
+    /// cp: the operand resolved from the working directory.
+    fn in_cwd(operand: &'a Path, trust: OperandTrust) -> Self {
         TargetRoot {
-            dir: Rc::new(dir),
+            dir: Rc::new(ftw::FileDescriptor::cwd()),
             trust,
-            name,
-            display_parent,
+            name: operand.as_os_str(),
+            display_parent: PathBuf::new(),
             operand,
         }
+    }
+
+    /// cp --parents: the operand's last component in `dir`. An operand with none (`..`, `/`)
+    /// is refused: it names no entry of `dir`, and resolving it some other way would leave
+    /// both the directory and the trust it hands behind.
+    fn in_dir(operand: &'a Path, dir: ftw::FileDescriptor, trust: ChainTrust) -> io::Result<Self> {
+        let name = operand.file_name().ok_or_else(|| {
+            io::Error::other(gettext!(
+                "'{}' names no entry of a directory",
+                operand.display()
+            ))
+        })?;
+        Ok(TargetRoot {
+            dir: Rc::new(dir),
+            trust: OperandTrust::Chain(trust),
+            name,
+            display_parent: operand.parent().unwrap_or(Path::new("")).to_path_buf(),
+            operand,
+        })
     }
 
     /// mv: the destination operand pinned in the directory it was found in.

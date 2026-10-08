@@ -16,9 +16,9 @@
 //! descriptors.
 
 use crate::common::{
-    copy_file_at, error_string, finish_made_dir_mode, made_dir_open_error, open_made_dir,
-    preserve_through_fd, report_verbose_bytes, ChainTrust, CopyConfig, CopyRun, InodeMap, MadeDirs,
-    MadeTrust,
+    copy_file, copy_file_at, error_string, finish_made_dir_mode, made_dir_open_error,
+    open_made_dir, preserve_through_fd, report_verbose_bytes, ChainTrust, CopyConfig, CopyRun,
+    InodeMap, MadeDirs, MadeTrust, OperandTrust,
 };
 use gettextrs::gettext;
 use std::ffi::CString;
@@ -230,6 +230,48 @@ where
     // Read once: each read is a pair of umask(2) calls.
     let umask = plib::modestr::umask();
     for source in sources {
+        match source.components().next_back() {
+            Some(Component::Normal(_)) => {}
+            // A source ending in `..` has a destination ending in `..`: no name inside the
+            // target, but whatever directory that reaches -- the target's parent, for `..`
+            // itself -- which no chain from the target describes. GNU cp copies onto it.
+            Some(Component::ParentDir) => {
+                eprintln!(
+                    "cp: {}",
+                    gettext!(
+                        "with --parents, '{}' would be copied to '{}', which is not a name \
+                         inside '{}'",
+                        source.display(),
+                        target.join(source).display(),
+                        target.display()
+                    )
+                );
+                ok = false;
+                continue;
+            }
+            // `.` (or `/`) is the directory every source path starts from, whose copy is the
+            // target itself: its contents are copied there, as for `cp -R src/. target`. Its
+            // last component taken for a name, `target/.` was copied into `target/target`.
+            _ => {
+                let copied = copy_file(
+                    cfg,
+                    source,
+                    target,
+                    OperandTrust::Named,
+                    &mut run,
+                    inode_map.as_deref_mut(),
+                    prompt_fn,
+                );
+                if let Err(e) = copied {
+                    let s = error_string(&e);
+                    if !s.is_empty() {
+                        eprintln!("cp: {s}");
+                    }
+                    ok = false;
+                }
+                continue;
+            }
+        }
         let walked = make_parents(
             source,
             target,

@@ -699,11 +699,19 @@ mod other {
             return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
         }
         let err = io::Error::last_os_error();
-        // A mode denying the owner reading: held by name instead.
-        if err.raw_os_error() == Some(libc::EACCES) {
+        if err.raw_os_error().is_some_and(held_by_name_after) {
             return Ok(None);
         }
         Err(err)
+    }
+
+    /// Whether `open_node` failing with `errno` means the node is to be held
+    /// by name instead -- re-checked by `lstat` before each change, as a
+    /// device is. EACCES: a mode denying the owner reading. ENOTSUP and
+    /// EOPNOTSUPP: a filesystem, network ones especially, that does not
+    /// support opening a symbolic link as itself.
+    fn held_by_name_after(errno: libc::c_int) -> bool {
+        errno == libc::EACCES || errno == libc::ENOTSUP || errno == libc::EOPNOTSUPP
     }
 
     /// `fstatat` with `AT_SYMLINK_NOFOLLOW`.
@@ -712,6 +720,24 @@ mod other {
         let flags = libc::AT_SYMLINK_NOFOLLOW;
         cvt(unsafe { libc::fstatat(dirfd.as_raw_fd(), name.as_ptr(), &mut st, flags) })?;
         Ok(st)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::held_by_name_after;
+
+        /// A node that cannot be opened to be held -- a FIFO whose mode
+        /// denies its owner reading, a symbolic link on a network filesystem
+        /// that does not support `O_SYMLINK` -- is held by name, re-checked
+        /// before each change; any other failure is one.
+        #[test]
+        fn falls_back_to_name_where_the_node_cannot_be_opened() {
+            assert!(held_by_name_after(libc::EACCES));
+            assert!(held_by_name_after(libc::ENOTSUP));
+            assert!(held_by_name_after(libc::EOPNOTSUPP));
+            assert!(!held_by_name_after(libc::ENOENT));
+            assert!(!held_by_name_after(libc::ELOOP));
+        }
     }
 }
 

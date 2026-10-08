@@ -191,6 +191,12 @@ pub(crate) struct DirTree {
     /// ParentOwnerOnly`). They are used, but a member naming one later gives
     /// it no attributes, as it would not to one made for that member.
     unverified: RefCell<HashSet<(u64, u64)>>,
+    /// `(st_dev, st_ino)` of directories this run made, verified through a
+    /// descriptor to be the ones made, for a member naming them -- or made
+    /// to hold members below them and since claimed by the member naming
+    /// them. Unlike a directory found existing, these take a member's
+    /// attributes wherever they are.
+    made: RefCell<HashSet<(u64, u64)>>,
     /// The mtime each pre-existing directory had when this run first walked
     /// into it, before any member created below it changed that. -u compares
     /// against this: a `find -depth` list names a directory after its
@@ -225,6 +231,7 @@ impl DirTree {
             implicit: RefCell::new(HashSet::new()),
             replaced: RefCell::new(HashSet::new()),
             unverified: RefCell::new(HashSet::new()),
+            made: RefCell::new(HashSet::new()),
             pre_run_mtimes: RefCell::new(HashMap::new()),
         })
     }
@@ -274,12 +281,8 @@ impl DirTree {
             let st = self.admit(next.as_fd(), origin)?;
             let id = file_id(&st);
             match origin {
-                DirOrigin::Made => {
-                    self.implicit.borrow_mut().insert(id);
-                }
-                DirOrigin::Unverified => {
-                    self.unverified.borrow_mut().insert(id);
-                }
+                DirOrigin::Made => self.record_made(id, MadeTrust::Full, true),
+                DirOrigin::Unverified => self.record_made(id, MadeTrust::ParentOwnerOnly, true),
                 DirOrigin::Found | DirOrigin::Replaced => {
                     self.pre_run_mtimes
                         .borrow_mut()
@@ -311,9 +314,24 @@ impl DirTree {
             Standing::Unverified
         } else if self.implicit.borrow().contains(&id) {
             Standing::Implicit
+        } else if self.made.borrow().contains(&id) {
+            Standing::Made
         } else {
             Standing::Ordinary
         }
+    }
+
+    /// Record the directory with `id` as one this run has just made and
+    /// verified (`verify_made_dir`) to `trust`: made only to hold members
+    /// below it (`implicit`), or for a member naming it. The one place the
+    /// walk and `make_dir_at` both record what they made.
+    fn record_made(&self, id: (u64, u64), trust: MadeTrust, implicit: bool) {
+        let set = match trust {
+            MadeTrust::ParentOwnerOnly => &self.unverified,
+            MadeTrust::Full if implicit => &self.implicit,
+            MadeTrust::Full => &self.made,
+        };
+        set.borrow_mut().insert(id);
     }
 
     /// Record the directory with `id` as found in place of one this run
@@ -362,12 +380,18 @@ impl DirTree {
     }
 
     /// `is_implicit`, for the member that names the directory and so gives it
-    /// its attributes. That member makes it an ordinary existing directory:
-    /// a later member of the same name meets it the way it would meet any
-    /// other -- left alone under -k -- rather than as one still waiting for
-    /// its attributes.
+    /// its attributes. That member makes it a directory this run made for a
+    /// member (`Standing::Made`): a later member of the same name meets it as
+    /// an existing directory -- left alone under -k -- rather than as one
+    /// still waiting for its attributes, and it still takes attributes
+    /// wherever it is, being verified as made.
     pub(crate) fn claim_implicit(&self, st: &libc::stat) -> bool {
-        self.implicit.borrow_mut().remove(&file_id(st))
+        let id = file_id(st);
+        let claimed = self.implicit.borrow_mut().remove(&id);
+        if claimed {
+            self.made.borrow_mut().insert(id);
+        }
+        claimed
     }
 
     /// The mtime `st` had before this run put anything below it, for -u, as
@@ -508,9 +532,10 @@ impl PendingDirs {
 /// one. Each means the directory these attributes were for is gone, which is
 /// not an error: whatever replaced it brought its own.
 ///
-/// A directory that was already there, owned by a third user, in a parent
-/// others can rename entries in, keeps its own attributes
-/// (`made::may_take_attrs`), and that is diagnosed.
+/// A directory this run made and verified takes its attributes. One that was
+/// already there takes them only where nobody but pax's user can create
+/// entries beside it (`made::may_take_attrs`); elsewhere it keeps its own,
+/// and that is diagnosed.
 fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> PaxResult<()> {
     let Some(member) = MemberPath::parse(&dir.path)? else {
         return Ok(());
@@ -529,13 +554,14 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
     match tree.standing(dir.id) {
         Standing::Replaced => return Err(PaxError::Io(made::replaced())),
         Standing::Unverified => return Err(attrs_withheld()),
-        Standing::Implicit | Standing::Ordinary => {}
-    }
-    if !made::dir_may_take_attrs(parent.as_fd(), fd.as_fd())? {
-        return Err(PaxError::Io(std::io::Error::other(
-            "not applying owner, mode or times: the directory belongs to another user \
-             and others can rename entries beside it",
-        )));
+        Standing::Implicit | Standing::Made => {}
+        Standing::Ordinary if made::found_dir_may_take_attrs(parent.as_fd())? => {}
+        Standing::Ordinary => {
+            return Err(PaxError::Io(std::io::Error::other(
+                "not applying owner, mode or times: the directory was already there, \
+                 and others can create entries beside it",
+            )))
+        }
     }
     if search_only {
         return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy);
@@ -605,8 +631,11 @@ enum Standing {
     /// Made by this run only to hold members below it, awaiting the member
     /// that names it.
     Implicit,
-    /// Anything else: one that was already there, or one a member has
-    /// claimed.
+    /// Made and verified by this run for a member naming it, or implicit and
+    /// since claimed: takes attributes wherever it is.
+    Made,
+    /// Found existing: takes attributes only where nobody else can create
+    /// entries beside it (`made::may_take_attrs`).
     Ordinary,
 }
 
@@ -754,8 +783,10 @@ pub(crate) fn make_dir_at(
                 Ok(DirAttrs::Apply(id))
             }
             Standing::Unverified => Ok(DirAttrs::Withheld(id)),
-            Standing::Ordinary if no_clobber => Ok(DirAttrs::Keep),
-            Standing::Ordinary => Ok(DirAttrs::Apply(id)),
+            Standing::Made | Standing::Ordinary if no_clobber => Ok(DirAttrs::Keep),
+            // Whether one found existing may take them is decided when they
+            // are applied, from its parent (`apply_dir_attrs`).
+            Standing::Made | Standing::Ordinary => Ok(DirAttrs::Apply(id)),
         };
     }
     if no_clobber {
@@ -793,9 +824,13 @@ fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<
     let Some(trust) = verify_made_dir(dirfd, dir.as_fd())? else {
         return Err(tree.refuse_replaced(file_id(&st)));
     };
+    let id = file_id(&st);
     match trust {
-        MadeTrust::Full => Ok(DirAttrs::Apply(file_id(&st))),
-        MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Withheld(file_id(&st))),
+        MadeTrust::Full => {
+            tree.record_made(id, trust, false);
+            Ok(DirAttrs::Apply(id))
+        }
+        MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Withheld(id)),
     }
 }
 

@@ -300,14 +300,17 @@ fn unverified_directory_member_is_diagnosed() {
     assert_ne!(md.mtime(), 0, "the unverified directory was stamped");
 }
 
-/// Without a swap, both kinds of directory take the archived mode, in a
-/// shared extraction directory as anywhere else; an existing directory is
-/// merged into and takes it too.
+/// In a shared extraction directory -- sticky, like /tmp -- both kinds of
+/// directory this run makes and verifies take the archived mode. One that
+/// was already there is merged into but keeps its own: anyone could have
+/// created that name first.
 #[test]
-fn made_and_existing_directories_take_their_mode() {
+fn made_directories_take_their_mode_and_an_existing_one_keeps_its_own() {
     let tmp = TempDir::new().unwrap();
     let dest = shared_dest(&tmp);
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o1777)).unwrap();
     std::fs::create_dir(dest.join("e")).unwrap();
+    std::fs::set_permissions(dest.join("e"), std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(dest.join("e/kept"), "").unwrap();
     let tree = DirTree::open_path(&dest).unwrap();
     let mut pending = PendingDirs::default();
@@ -325,7 +328,7 @@ fn made_and_existing_directories_take_their_mode() {
     let mode = |p: &str| std::fs::metadata(dest.join(p)).unwrap().mode() & 0o7777;
     assert_eq!(mode("d"), 0o751);
     assert_eq!(mode("a"), 0o753);
-    assert_eq!(mode("e"), 0o705);
+    assert_eq!(mode("e"), 0o700);
     assert!(dest.join("e/kept").exists());
 }
 

@@ -1042,6 +1042,9 @@ fn test_copy_update_depth_first_uses_pre_run_directory_time() {
         let _ = fs::remove_dir_all(&dst);
         fs::create_dir_all(dst.join("a")).unwrap();
         fs::set_permissions(dst.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+        // An existing directory takes the source's attributes only where
+        // nobody else can create entries beside it: not under a umask of 002.
+        fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
         let dst_time = filetime::FileTime::from_unix_time(1_546_300_800, 0); // 2019
         filetime::set_file_mtime(dst.join("a"), dst_time).unwrap();
 

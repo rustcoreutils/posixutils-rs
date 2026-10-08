@@ -163,6 +163,34 @@ fn move_file(
     inode_map: &mut InodeMap,
     created_files: Option<&mut HashSet<PathBuf>>,
 ) -> io::Result<Moved> {
+    move_file_deciding(
+        cfg,
+        pinned_dirs,
+        source,
+        target_entry,
+        inode_map,
+        created_files,
+        Decision::First,
+    )
+}
+
+/// Which time `move_file_deciding` examines the operands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Decision {
+    First,
+    /// Again, because a destination found absent the first time appeared before the rename.
+    Again,
+}
+
+fn move_file_deciding(
+    cfg: &MvConfig,
+    pinned_dirs: &mut PinnedDirs,
+    source: &Path,
+    target_entry: &PinnedEntry,
+    inode_map: &mut InodeMap,
+    created_files: Option<&mut HashSet<PathBuf>>,
+    decision: Decision,
+) -> io::Result<Moved> {
     let target = target_entry.path();
     let source_entry = pinned_dirs
         .pin(source)
@@ -292,8 +320,31 @@ fn move_file(
     }
 
     // 3. call rename(2) to move source to target
-    match rename_pinned(&source_entry, target_entry) {
+    // A destination found absent is not replaced if it appears before the rename.
+    let replace = if target_exists {
+        Replace::Allowed
+    } else {
+        Replace::Never
+    };
+    match rename_pinned(&source_entry, target_entry, replace) {
         Ok(_) => return Ok(Moved::Done),
+        Err(e)
+            if e.raw_os_error() == Some(libc::EEXIST)
+                && replace == Replace::Never
+                && decision == Decision::First =>
+        {
+            // It appeared: decide again, now about the file that is there -- the prompt, -f
+            // and the type checks all apply to it as to any existing destination.
+            return move_file_deciding(
+                cfg,
+                pinned_dirs,
+                source,
+                target_entry,
+                inode_map,
+                created_files,
+                Decision::Again,
+            );
+        }
         Err(e) => {
             // use ErrorKind::CrossesDevices in the future, when it is stable.
             // Use the captured error's errno rather than re-reading the global errno.
@@ -370,8 +421,25 @@ fn move_file(
     Ok(Moved::Copied(copied))
 }
 
-/// rename(2) of the pinned source to the pinned target.
-fn rename_pinned(source: &PinnedEntry, target: &PinnedEntry) -> io::Result<()> {
+/// Whether a rename may replace a file at the target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Replace {
+    /// The target existed when mv decided to replace it.
+    Allowed,
+    /// The target was absent when checked.
+    Never,
+}
+
+/// rename(2) of the pinned source to the pinned target. Under `Replace::Never` a file that
+/// appeared at the target since it was checked is not replaced: the rename fails with EEXIST --
+/// wherever the system and filesystem offer such a rename (`rename_exclusive`); elsewhere it is
+/// the plain rename.
+fn rename_pinned(source: &PinnedEntry, target: &PinnedEntry, replace: Replace) -> io::Result<()> {
+    if replace == Replace::Never {
+        if let Some(result) = rename_exclusive(source, target) {
+            return result;
+        }
+    }
     let ret = unsafe {
         libc::renameat(
             source.dir_fd(),
@@ -385,6 +453,60 @@ fn rename_pinned(source: &PinnedEntry, target: &PinnedEntry) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// A rename that fails with EEXIST rather than replace anything: `renameat2(RENAME_NOREPLACE)`.
+/// `None` when the kernel lacks it (ENOSYS), the filesystem does not support it (EINVAL), or a
+/// seccomp filter that does not know it refuses it (EPERM); the plain rename that follows then
+/// reports any genuine EINVAL or EPERM again.
+#[cfg(target_os = "linux")]
+fn rename_exclusive(source: &PinnedEntry, target: &PinnedEntry) -> Option<io::Result<()>> {
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            source.dir_fd(),
+            source.name().as_ptr(),
+            target.dir_fd(),
+            target.name().as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if ret == 0 {
+        return Some(Ok(()));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM) => None,
+        _ => Some(Err(e)),
+    }
+}
+
+/// `renameatx_np(RENAME_EXCL)`; `None` where the filesystem does not support it.
+#[cfg(target_vendor = "apple")]
+fn rename_exclusive(source: &PinnedEntry, target: &PinnedEntry) -> Option<io::Result<()>> {
+    let ret = unsafe {
+        libc::renameatx_np(
+            source.dir_fd(),
+            source.name().as_ptr(),
+            target.dir_fd(),
+            target.name().as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if ret == 0 {
+        return Some(Ok(()));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOTSUP) | Some(libc::EINVAL) | Some(libc::ENOSYS) => None,
+        _ => Some(Err(e)),
+    }
+}
+
+/// No exclusive rename on this system.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn rename_exclusive(_source: &PinnedEntry, _target: &PinnedEntry) -> Option<io::Result<()>> {
+    None
 }
 
 /// Step 5: remove the destination, in the directory it was pinned in. A directory is removed
@@ -580,5 +702,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rename_pinned, PinnedDirs, Replace};
+    use std::fs;
+
+    /// A scratch directory holding `source` and, if `with_target`, `target`.
+    fn scratch(tag: &str, with_target: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mv_rename_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("source"), b"source").unwrap();
+        if with_target {
+            fs::write(dir.join("target"), b"target").unwrap();
+        }
+        dir
+    }
+
+    /// The rename for a target found absent: a target that appeared since is never replaced,
+    /// and the failure says so (EEXIST), for mv to decide again.
+    #[test]
+    fn a_rename_onto_an_absent_target_never_replaces_one_that_appeared() {
+        let dir = scratch("never", true);
+        let mut pinned = PinnedDirs::default();
+        let source = pinned.pin(&dir.join("source")).unwrap();
+        let target = pinned.pin(&dir.join("target")).unwrap();
+
+        let result = rename_pinned(&source, &target, Replace::Never);
+        let (kept, left) = (fs::read(dir.join("target")), dir.join("source").exists());
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            result.map_err(|e| e.raw_os_error()),
+            Err(Some(libc::EEXIST))
+        );
+        assert_eq!(kept.unwrap(), b"target");
+        assert!(left);
+    }
+
+    /// Without a target, and when replacing one was decided on, it is an ordinary rename.
+    #[test]
+    fn a_rename_replaces_only_when_that_was_decided() {
+        let dir = scratch("allowed", true);
+        let mut pinned = PinnedDirs::default();
+        let source = pinned.pin(&dir.join("source")).unwrap();
+        let target = pinned.pin(&dir.join("target")).unwrap();
+        let replaced = rename_pinned(&source, &target, Replace::Allowed);
+        let moved = fs::read(dir.join("target"));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(replaced.is_ok());
+        assert_eq!(moved.unwrap(), b"source");
+
+        let dir = scratch("absent", false);
+        let source = pinned.pin(&dir.join("source")).unwrap();
+        let target = pinned.pin(&dir.join("target")).unwrap();
+        let created = rename_pinned(&source, &target, Replace::Never);
+        let moved = fs::read(dir.join("target"));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(created.is_ok());
+        assert_eq!(moved.unwrap(), b"source");
     }
 }

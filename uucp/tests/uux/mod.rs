@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::fake_ssh::{read, FakeSsh};
 use plib::testing::{run_test_with_checker, TestPlan};
 use std::fs;
 use std::process::Output;
@@ -214,6 +215,75 @@ fn test_uux_simple_redirect() {
 
     // Cleanup
     fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// Check what `ls -ld "$PWD"`, run by uux, wrote to `listing`: the command
+/// ran in a directory of its own under `$TMPDIR`, readable only by its owner.
+fn assert_private_work_dir(fake: &FakeSsh, listing: &str) {
+    assert!(listing.starts_with("drwx------"), "work dir: {listing}");
+    let tmp = fake.tmp().display().to_string();
+    assert!(listing.contains(&format!("{tmp}/")), "work dir: {listing}");
+    assert!(
+        fake.tmp_entries().is_empty(),
+        "left behind: {:?}",
+        fake.tmp_entries()
+    );
+}
+
+/// A local command runs in a fresh private directory under `$TMPDIR`, not in
+/// a predictable `/tmp` name another user could have made first, and the
+/// directory is removed afterwards.
+#[test]
+fn test_uux_local_work_dir_is_private() {
+    let fake = FakeSsh::new("uux_local");
+    let out = fake.join("out");
+    let cmd = format!("ls -ld \"$PWD\" > {}", out.display());
+
+    let output = fake.run("uux", &[&cmd], "");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_private_work_dir(&fake, &read(&out));
+}
+
+/// The same holds for the work directory made on a remote execution host.
+#[test]
+fn test_uux_remote_work_dir_is_private() {
+    let fake = FakeSsh::new("uux_remote");
+    let out = fake.join("out");
+    let cmd = format!("hosta!ls -ld \"$PWD\" > !{}", out.display());
+
+    let output = fake.run("uux", &[&cmd], "");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_private_work_dir(&fake, &read(&out));
+}
+
+/// An input file from a third system is staged locally on its way to the
+/// execution host: in a private directory under `$TMPDIR`, which is gone
+/// afterwards. The hook lists `$TMPDIR` at each ssh call, so the listing
+/// taken while the staged copy is sent shows where it was.
+#[test]
+fn test_uux_stages_a_remote_input_privately() {
+    let fake = FakeSsh::new("uux_stage");
+    let (src, out, log) = (fake.join("src"), fake.join("out"), fake.join("log"));
+    fs::write(&src, "staged input\n").unwrap();
+    let hook = format!("ls -lAR \"$TMPDIR\" >> '{}'", log.display());
+    let cmd = format!("hosta!cat hostb!{} > !{}", src.display(), out.display());
+
+    let output = fake.run("uux", &[&cmd], &hook);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(read(&out), "staged input\n");
+    let log = read(&log);
+    assert!(
+        log.lines()
+            .any(|l| l.starts_with('-') && l.ends_with(" src")),
+        "staged copy not under $TMPDIR:\n{log}"
+    );
+    for dir in log.lines().filter(|l| l.starts_with('d')) {
+        assert!(dir.starts_with("drwx------"), "listing:\n{log}");
+    }
+    assert!(fake.tmp_entries().is_empty(), "{:?}", fake.tmp_entries());
 }
 
 #[test]

@@ -9,6 +9,7 @@
 
 //! Common functionality shared between uucp, uux, and uustat utilities.
 
+use plib::tmp::TempDir;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -87,6 +88,28 @@ pub fn generate_job_id() -> String {
         .unwrap_or_default();
     let pid = std::process::id();
     format!("{}{:04x}", now.as_secs() % 100000, pid % 0x10000)
+}
+
+/// A new directory only this user can use, made by `mkdtemp` (mode 0700)
+/// under `$TMPDIR`, or `/tmp`, with a name starting with `prefix`. It is
+/// removed, with its contents, when the value is dropped.
+pub fn private_temp_dir(prefix: &str) -> io::Result<TempDir> {
+    plib::tmp::Builder::new().prefix(prefix).tempdir()
+}
+
+/// The path of `name` inside `dir`, as the text the ssh helpers take.
+pub fn staging_path(dir: &TempDir, name: &str) -> io::Result<String> {
+    path_text(&dir.path().join(name))
+}
+
+/// `path` as text, or an error if it is not valid UTF-8.
+pub fn path_text(path: &Path) -> io::Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "temporary directory name is not valid UTF-8",
+        )
+    })
 }
 
 /// Parse a UUCP path specification (system!path or just path)

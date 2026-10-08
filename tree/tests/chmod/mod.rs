@@ -230,3 +230,53 @@ fn test_chmod_continue_on_error() {
     fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).unwrap();
     fs::remove_dir_all(&test_dir).unwrap();
 }
+
+fn mode_of(path: &str) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// POSIX chmod follows a symlink named as an operand: the file it points to
+/// gets the mode. Linux has no symlink modes and refuses fchmodat with
+/// AT_SYMLINK_NOFOLLOW ("Operation not supported").
+#[test]
+fn test_chmod_follows_operand_symlink() {
+    let test_dir = &format!("{}/test_chmod_operand_symlink", env!("CARGO_TARGET_TMPDIR"));
+    let (f, l) = (&format!("{test_dir}/f"), &format!("{test_dir}/l"));
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+    fs::set_permissions(f, fs::Permissions::from_mode(0o600)).unwrap();
+    unix::fs::symlink("f", l).unwrap();
+
+    chmod_test(&["644", l], "", "", 0);
+    assert_eq!(mode_of(f), 0o644);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// With -R, a symlink to a directory named as an operand is followed too:
+/// the directory and what is in it get the mode.
+#[test]
+fn test_chmod_recursive_follows_operand_symlink() {
+    let test_dir = &format!(
+        "{}/test_chmod_r_operand_symlink",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let (d, f, l) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/d/f"),
+        &format!("{test_dir}/l"),
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::File::create(f).unwrap();
+    fs::set_permissions(f, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(d, fs::Permissions::from_mode(0o700)).unwrap();
+    unix::fs::symlink("d", l).unwrap();
+
+    chmod_test(&["-R", "go+rX", l], "", "", 0);
+    assert_eq!(mode_of(d), 0o755);
+    assert_eq!(mode_of(f), 0o644);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

@@ -192,19 +192,37 @@ pub(crate) fn verify_made_dir(
 /// `..`.
 ///
 /// Reading it takes the owner's read and search permission, which a umask
-/// (0400, say) may have withheld from a directory pax has just made. When pax
-/// owns it they are lent for the check, through the descriptor, and the mode
-/// is put back.
+/// (0400, say) may have withheld from a directory pax has just made.
 fn is_empty_made_dir(dir: BorrowedFd<'_>, st: &libc::stat, euid: u32) -> io::Result<bool> {
+    empty_lending_read(dir, st, euid, || ftw::is_empty_dir_fd(dir.as_raw_fd()))
+}
+
+/// `check` -- whether the directory open on `dir`, with `st`, is empty --
+/// and, only if it fails with EACCES on a directory pax's user owns, again
+/// with the owner's read and search permission lent through the descriptor,
+/// the mode put back afterwards.
+///
+/// Only then: a chmod by a user outside the directory's group clears its
+/// S_ISGID bit, and putting the mode back cannot set it again. That is the
+/// residual, for a directory made under a umask denying its owner read in a
+/// set-group-ID parent of a group pax's user is not in: it loses S_ISGID.
+fn empty_lending_read(
+    dir: BorrowedFd<'_>,
+    st: &libc::stat,
+    euid: u32,
+    mut check: impl FnMut() -> io::Result<bool>,
+) -> io::Result<bool> {
+    let err = match check() {
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) && st.st_uid == euid => e,
+        answered => return answered,
+    };
     let mode = st.st_mode & 0o7777;
-    let lend = st.st_uid == euid && mode & 0o500 != 0o500;
-    if lend {
-        chmod_fd(dir, mode | 0o700)?;
+    if mode & 0o500 == 0o500 {
+        return Err(err);
     }
-    let empty = ftw::is_empty_dir_fd(dir.as_raw_fd());
-    if lend {
-        chmod_fd(dir, mode)?;
-    }
+    chmod_fd(dir, mode | 0o700)?;
+    let empty = check();
+    chmod_fd(dir, mode)?;
     empty
 }
 
@@ -543,6 +561,58 @@ mod tests {
         st.st_uid = uid;
         st.st_mode = libc::S_IFDIR | mode;
         st
+    }
+
+    /// Read permission is lent for the emptiness check only when the check
+    /// fails for want of it: a check that succeeds as things are (root,
+    /// reading past the mode) leaves the directory's mode alone, since a
+    /// chmod by someone outside its group drops S_ISGID for good.
+    #[test]
+    fn read_is_lent_only_when_the_check_needs_it() {
+        use std::os::fd::{AsFd, FromRawFd};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = plib::tmp::TempDir::new().unwrap();
+        let path = tmp.path().join("d");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let dir = std::fs::File::open(tmp.path()).unwrap();
+        // 0300 cannot be opened for reading: for search only.
+        #[cfg(target_os = "linux")]
+        let search = libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let search = libc::O_SEARCH;
+        let flags = search | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c"d".as_ptr(), flags) };
+        assert!(fd >= 0);
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let st = fstat(fd.as_fd()).unwrap();
+        let ctime = || std::fs::metadata(&path).unwrap().ctime_nsec();
+        let before = ctime();
+        let euid = unsafe { libc::geteuid() };
+
+        // Readable as things are: no chmod.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(empty_lending_read(fd.as_fd(), &st, euid, || Ok(true)).unwrap());
+        assert_eq!(
+            ctime(),
+            before,
+            "the mode was changed for a check that needed nothing"
+        );
+
+        // Refused for want of read: lent, and put back.
+        let mut calls = 0;
+        let check = || {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            } else {
+                Ok(true)
+            }
+        };
+        assert!(empty_lending_read(fd.as_fd(), &st, euid, check).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o300);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     /// Only the parent's owner, or anyone allowed to write a parent that is

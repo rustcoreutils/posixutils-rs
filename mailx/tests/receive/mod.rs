@@ -3512,6 +3512,16 @@ fn author_derived_filename_rejects_path_traversal() {
     let probe = std::path::Path::new("/tmp/mailx-traversal-probe");
     let _ = std::fs::remove_file(probe);
 
+    /// Removes the probe file when dropped, so a regression that creates it
+    /// does not leave it behind after the assertion below fails.
+    struct RemoveOnDrop<'a>(&'a std::path::Path);
+    impl Drop for RemoveOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _cleanup = RemoveOnDrop(probe);
+
     run_test_with_checker(
         TestPlan {
             cmd: String::from("mailx"),
@@ -3534,7 +3544,6 @@ fn author_derived_filename_rejects_path_traversal() {
             );
         },
     );
-    let _ = std::fs::remove_file(probe);
 }
 
 // =============================================================================

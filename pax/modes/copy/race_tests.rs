@@ -150,6 +150,58 @@ fn directory_swapped_after_mkdir_is_not_stamped() {
     );
 }
 
+/// `-l -H`: a symbolic link operand retargeted, after the walk followed it,
+/// at a private file. The copy must not be left a hard link to that file.
+#[test]
+fn link_through_a_retargeted_symlink_leaves_no_link_to_the_new_target() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    let dest = tmp.path().join("dest");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(src.join("a"), "A").unwrap();
+    std::fs::write(src.join("secret"), "S").unwrap();
+    std::fs::set_permissions(src.join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = src.join("s");
+    std::os::unix::fs::symlink("a", &link).unwrap();
+    let secret_ino = std::fs::metadata(src.join("secret")).unwrap().ino();
+    let secret_path = src.join("secret");
+
+    // An operand's name is its whole path, relative to the working directory.
+    let swapped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = std::rc::Rc::clone(&swapped);
+    let hook = move |point, dirfd, name: &CStr| {
+        let last = name.to_bytes().rsplit(|&b| b == b'/').next();
+        if point == Point::Linking && last == Some(b"s".as_slice()) {
+            seen.set(true);
+            assert_eq!(unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) }, 0);
+            let secret = CString::new(secret_path.as_os_str().as_bytes()).unwrap();
+            let r = unsafe { libc::symlinkat(secret.as_ptr(), dirfd, name.as_ptr()) };
+            assert_eq!(r, 0);
+        }
+    };
+    let options = CopyOptions {
+        link: true,
+        cli_dereference: true,
+        ..Default::default()
+    };
+    race_hook::with_hook(hook, || {
+        let operand = link.clone();
+        copy_files(&mut std::iter::once(operand), &dest, &options).unwrap();
+    });
+
+    assert!(swapped.get(), "the swap did not happen");
+    let copied = dest.join(member_name(&link));
+    if let Ok(md) = std::fs::symlink_metadata(&copied) {
+        assert_ne!(
+            md.ino(),
+            secret_ino,
+            "the copy is a hard link to the new target"
+        );
+    }
+}
+
 /// Without any swap the FIFO keeps its mode, set-user-ID included, and its
 /// times.
 #[test]

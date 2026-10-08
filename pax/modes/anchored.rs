@@ -792,17 +792,24 @@ pub(crate) fn link_replacing(
     name: &CStr,
     no_clobber: bool,
 ) -> PaxResult<bool> {
-    link_replacing_with(from_dir, from_name, false, dirfd, name, no_clobber)
+    link_replacing_with(from_dir, from_name, false, None, dirfd, name, no_clobber)
 }
 
 /// `link_replacing`, linking the file a symbolic link `from_name` refers to
 /// when `follow` is set -- copy mode's `-l` under `-H`/`-L`, where POSIX says
 /// "the hard link created ... shall be to the file referenced by the symbolic
 /// link". Without it, `from_name` itself is linked, whatever it is.
+///
+/// `linkat` resolves `from_name` again -- and with `follow`, the link's
+/// target too -- so it can link a file other than the one the caller
+/// examined, whose `(st_dev, st_ino)` is `expected`. A link made to anything
+/// else is removed again and the call fails, rather than leave the
+/// destination a second name for a file nobody asked to copy.
 pub(crate) fn link_replacing_with(
     from_dir: libc::c_int,
     from_name: &CStr,
     follow: bool,
+    expected: Option<(u64, u64)>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     no_clobber: bool,
@@ -825,7 +832,7 @@ pub(crate) fn link_replacing_with(
     };
 
     match link() {
-        Ok(()) => return Ok(false),
+        Ok(()) => return linked_expected(dirfd, name, expected).map(|()| false),
         Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
         Err(e) => return Err(e.into()),
     }
@@ -850,7 +857,27 @@ pub(crate) fn link_replacing_with(
 
     unlink_at(dirfd, name)?;
     link()?;
+    linked_expected(dirfd, name, expected)?;
     Ok(false)
+}
+
+/// After `link_replacing_with` made `name`: unless it is the file `expected`
+/// (when given), remove it again and fail.
+fn linked_expected(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    expected: Option<(u64, u64)>,
+) -> PaxResult<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if stat_at(dirfd, name).is_some_and(|st| file_id(&st) == expected) {
+        return Ok(());
+    }
+    unlink_at(dirfd, name)?;
+    Err(PaxError::Io(std::io::Error::other(
+        "source file changed before it could be linked",
+    )))
 }
 
 /// Open a source file from the descriptor of the directory it was found in.

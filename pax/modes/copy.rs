@@ -676,18 +676,25 @@ fn copy_file(
         // `pax -rwl tree .` names every file as its own destination. Under
         // -H/-L the walk followed a symbolic link here, and the link made is
         // to the file it refers to, as POSIX requires of -l.
+        #[cfg(test)]
+        crate::modes::race_hook::reached(
+            crate::modes::race_hook::Point::Linking,
+            entry.dir_fd(),
+            entry.file_name(),
+        );
         let linked = link_replacing_with(
             entry.dir_fd(),
             entry.file_name(),
             followed_link(entry, metadata),
+            Some((metadata.dev(), metadata.ino())),
             dirfd,
             name,
             options.no_clobber,
         );
         match linked {
-            // The name is resolved again by linkat, so what it linked is
-            // checked to be the file the walk saw; if the name changed in
-            // between, the copy below replaces the link with that file.
+            // The name is resolved again by linkat, so a link to anything but
+            // the file the walk saw is removed again (an error here); the
+            // copy below then copies that file, if the name still holds it.
             Ok(false) if is_file_at(dirfd, name, metadata) => return Ok(()),
             Ok(true) => {
                 crate::error::report_error(src, "Unable to link file to itself");

@@ -1574,3 +1574,24 @@ fn grep_diagnostics_name_the_utility() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no-such-file-xyz"), "got {stderr:?}");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. autoconf's
+// AC_PROG_GREP runs `grep -e 'GREP$' -e '-(cannot match)-'`; clap used to
+// read the second pattern as an option and refuse it, failing configure.
+#[test]
+fn test_option_argument_begins_with_hyphen() {
+    grep_test(
+        &["-e", "GREP$", "-e", "-(cannot match)-"],
+        "GREP\nnot this\n",
+        "GREP\n",
+        "",
+        0,
+    );
+}
+
+// Only the word after an option that takes a value is its argument: the
+// options around it still parse as options.
+#[test]
+fn test_hyphen_pattern_then_option() {
+    grep_test(&["-e", "-x", "-c"], "a-x\n-x\nb\n", "2\n", "", 0);
+}

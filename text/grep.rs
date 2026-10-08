@@ -36,10 +36,10 @@ struct Args {
     #[arg(short, long, help = gettext("Write only a count of selected lines to standard output"))]
     count: bool,
 
-    #[arg(short = 'e', long, help = gettext("Specify one or more patterns to be used during the search for input"))]
+    #[arg(short = 'e', long, allow_hyphen_values = true, help = gettext("Specify one or more patterns to be used during the search for input"))]
     regexp: Vec<String>,
 
-    #[arg(short, long, help = gettext("Read one or more patterns from the file named by the pathname"))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("Read one or more patterns from the file named by the pathname"))]
     file: Vec<PathBuf>,
 
     #[arg(short, long, help = gettext("Perform pattern matching in searches without regard to case"))]

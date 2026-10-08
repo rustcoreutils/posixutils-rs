@@ -11,7 +11,7 @@ use base64::prelude::*;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::diag;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -58,24 +58,6 @@ fn strip_cr(line: &[u8]) -> &[u8] {
 fn is_stdout_cookie(path: &Path) -> bool {
     let s = path.as_os_str();
     s == "-" || s == "/dev/stdout"
-}
-
-/// Whether the caller has write permission on an existing path (access(2),
-/// W_OK). Windows has no `access`; there a file is writable unless it carries
-/// the read-only attribute.
-fn is_writable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        match std::ffi::CString::new(path.as_os_str().as_bytes()) {
-            Ok(c) => unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 },
-            Err(_) => false,
-        }
-    }
-    #[cfg(windows)]
-    {
-        std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
-    }
 }
 
 impl Header {
@@ -224,25 +206,77 @@ fn decode_file(args: &Args) -> io::Result<()> {
     if is_stdout_cookie(out_path) {
         io::stdout().write_all(&out)?;
     } else {
-        // If the target exists and the user lacks write permission, terminate with
-        // an error (spec 119716-119718). Otherwise overwrite the file in place
-        // (File::create truncates, keeping the inode) — do not unlink it.
-        if out_path.exists() && !is_writable(out_path) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                gettext("output file is not writable"),
-            ));
-        }
-
-        let mut o_file = File::create(out_path)?;
-        let mut o_file_perm = o_file.metadata()?.permissions();
-        plib::perm::set_mode(&mut o_file_perm, header.lower_perm_bits);
-
-        o_file.write_all(&out)?;
-        // If the mode bits cannot be set, this is not an error (spec 119719-119720).
-        let _ = o_file.set_permissions(o_file_perm);
+        write_output(out_path, header.lower_perm_bits, &out)?;
     }
 
+    Ok(())
+}
+
+/// Write `data` to `path`, created or overwritten in place (never unlinked),
+/// and give a regular file the access permission bits of `mode`.
+///
+/// Write permission on an existing file is checked by the open itself, so an
+/// unwritable file ends uudecode with an error (spec 119716-119718) with no
+/// window between a check and the open. Everything after the open goes
+/// through the descriptor: the file type is that of the file opened, and only
+/// a regular file is truncated and given the mode, so a device the pathname
+/// names is written but never changed.
+fn write_output(path: &Path, mode: u32, data: &[u8]) -> io::Result<()> {
+    let mut file = open_output(path)?;
+    let meta = file.metadata()?;
+    if meta.is_file() {
+        file.set_len(0)?;
+        let mut perm = meta.permissions();
+        plib::perm::set_mode(&mut perm, mode & ACCESS_PERMISSION_BITS);
+        // If the mode bits cannot be set, this is not an error (spec 119719-119720).
+        let _ = file.set_permissions(perm);
+    }
+    file.write_all(data)
+}
+
+/// The file access permission bits, the only ones the `begin` line may set:
+/// set-user-ID, set-group-ID and sticky bits in the data are ignored.
+const ACCESS_PERMISSION_BITS: u32 = 0o777;
+
+/// Open `path` for writing, creating it if absent, without truncating it.
+///
+/// A new file starts owner-only until its mode is set. `O_NONBLOCK` makes a
+/// FIFO with no reader fail with ENXIO instead of waiting forever, and is
+/// cleared once open; `O_NOCTTY` keeps a terminal from becoming the
+/// controlling one.
+#[cfg(unix)]
+fn open_output(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(path)?;
+    clear_nonblock(&file)?;
+    Ok(file)
+}
+
+/// Open `path` for writing, creating it if absent, without truncating it.
+#[cfg(windows)]
+fn open_output(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Make writes to `file` block again.
+#[cfg(unix)]
+fn clear_nonblock(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 

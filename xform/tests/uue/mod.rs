@@ -7,6 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+#[cfg(unix)]
+mod output;
+
 use plib::testing::{run_test, run_test_base, TestPlan};
 use std::{
     fs::{File, Permissions},

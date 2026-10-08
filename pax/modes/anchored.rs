@@ -825,11 +825,11 @@ fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<
         return Err(tree.refuse_replaced(file_id(&st)));
     };
     let id = file_id(&st);
+    // Recorded either way, as the walk records what it makes: a later member
+    // of the same name meets it with this standing.
+    tree.record_made(id, trust, false);
     match trust {
-        MadeTrust::Full => {
-            tree.record_made(id, trust, false);
-            Ok(DirAttrs::Apply(id))
-        }
+        MadeTrust::Full => Ok(DirAttrs::Apply(id)),
         MadeTrust::ParentOwnerOnly => Ok(DirAttrs::Withheld(id)),
     }
 }

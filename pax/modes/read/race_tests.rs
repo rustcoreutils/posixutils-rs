@@ -300,6 +300,42 @@ fn unverified_directory_member_is_diagnosed() {
     assert_ne!(md.mtime(), 0, "the unverified directory was stamped");
 }
 
+/// A directory member made where its owner could not be verified stays
+/// unverified when the same name comes again -- a duplicate member, an
+/// appended archive -- and gets no attributes then either.
+#[test]
+fn unverified_directory_named_twice_is_withheld_both_times() {
+    use crate::archive::LinkSets;
+    use crate::modes::made::MadeTrust;
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut link_sets = LinkSets::default();
+    let entry = own_member("d", EntryType::Directory, 0o751);
+    let mut archive = Members(Vec::new().into_iter());
+    let options = preserve_everything();
+    let results = race_hook::with_dir_trust(MadeTrust::ParentOwnerOnly, || {
+        let mut extract = || {
+            let pending = &mut pending;
+            extract_entry(
+                &mut archive,
+                &entry,
+                &options,
+                &mut link_sets,
+                &tree,
+                pending,
+            )
+        };
+        [extract().is_err(), extract().is_err()]
+    });
+
+    assert_eq!(results, [true, true], "withholding went unreported");
+    pending.apply(&tree, &policy_of(&options));
+    // The member's mtime is 0: stamped, the directory would carry it.
+    let md = std::fs::metadata(tmp.path().join("d")).unwrap();
+    assert_ne!(md.mtime(), 0, "the unverified directory was stamped");
+}
+
 /// In a shared extraction directory -- sticky, like /tmp -- both kinds of
 /// directory this run makes and verifies take the archived mode. One that
 /// was already there is merged into but keeps its own: anyone could have

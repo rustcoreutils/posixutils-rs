@@ -19,10 +19,12 @@ use patch_util::{
     applier::PatchApplier,
     bytes,
     file_ops::{
-        delete_target, determine_target_file, read_file_lines, write_output, write_rejects,
+        delete_target, determine_target_file, file_lines, open_target, write_output, write_rejects,
+        Target,
     },
     parser::parse_patch,
-    types::{BackupName, PatchConfig, PatchError, RejectFile},
+    safe_fs::{Name, Refusal},
+    types::{BackupName, FilePatch, PatchConfig, PatchError, RejectFile},
 };
 use std::{
     collections::HashSet,
@@ -213,6 +215,46 @@ fn read_patch_input(config: &PatchConfig) -> io::Result<String> {
     Ok(bytes::decode(&content))
 }
 
+/// Open the file a patch section applies to. None (with a message, in GNU
+/// patch's words) when the file is refused: a name leading through a link is
+/// skipped, and a file that is not a regular file is left alone with all of
+/// the section's hunks put in its reject file. An I/O error ends the run.
+fn open_section(
+    file_patch: &FilePatch,
+    name: Name,
+    config: &PatchConfig,
+    written_rejects: &mut HashSet<PathBuf>,
+) -> Result<Option<Target>, PatchError> {
+    let shown = name.path().display();
+    match open_target(&name) {
+        Ok(target) => Ok(Some(target)),
+        Err(Refusal::InvalidName) => {
+            eprintln!(
+                "patch: {}",
+                gettext!("Invalid file name {} -- skipping patch", shown)
+            );
+            Ok(None)
+        }
+        Err(Refusal::NotRegular) => {
+            eprintln!(
+                "patch: {}",
+                gettext!("File {} is not a regular file -- refusing to patch", shown)
+            );
+            let rejects: Vec<_> = file_patch
+                .hunks
+                .iter()
+                .enumerate()
+                .map(|(i, hunk)| (i + 1, hunk.clone(), String::new()))
+                .collect();
+            if let Err(e) = write_rejects(&rejects, &name, config, written_rejects) {
+                eprintln!("patch: {}: {}", shown, e);
+            }
+            Ok(None)
+        }
+        Err(Refusal::Io(e)) => Err(e.into()),
+    }
+}
+
 /// Main entry point.
 fn run(args: Args) -> Result<bool, PatchError> {
     let config = args.to_config();
@@ -259,20 +301,29 @@ fn run(args: Args) -> Result<bool, PatchError> {
 
         // Read target file content (or empty for new files). A read failure
         // ends the run, as GNU patch does: it usually means the invocation is
-        // wrong rather than that this one file is special.
-        let (lines, orig_trailing_newline) = if target.exists() {
-            read_file_lines(&target)?
-        } else if file_patch.creates_file() {
-            (Vec::new(), true)
-        } else {
-            eprintln!(
-                "patch: {}: {}",
-                target.display(),
-                gettext("No such file or directory")
-            );
-            exit_code = 2;
-            continue;
+        // wrong rather than that this one file is special. A refused file is
+        // a failed section, exit status 1, as in GNU patch.
+        let target = match open_section(file_patch, target, &config, &mut written_rejects)? {
+            Some(target) => target,
+            None => {
+                had_rejects = true;
+                continue;
+            }
         };
+        let (lines, orig_trailing_newline) = match &target.original {
+            Some(original) => file_lines(original),
+            None if file_patch.creates_file() => (Vec::new(), true),
+            None => {
+                eprintln!(
+                    "patch: {}: {}",
+                    target.name.path().display(),
+                    gettext("No such file or directory")
+                );
+                exit_code = 2;
+                continue;
+            }
+        };
+        let shown = target.name.path();
 
         // Apply patch
         let mut applier = PatchApplier::new(&config, lines, orig_trailing_newline);
@@ -285,7 +336,7 @@ fn run(args: Args) -> Result<bool, PatchError> {
             || (config.remove_empty && result.content.is_empty() && result.applied_any);
         if removes && config.output_file.is_none() && result.rejected_hunks.is_empty() {
             if let Err(e) = delete_target(&target, &config, &mut backed_up) {
-                eprintln!("patch: {}: {}", target.display(), e);
+                eprintln!("patch: {}: {}", shown.display(), e);
                 exit_code = 2;
             }
             continue;
@@ -298,11 +349,11 @@ fn run(args: Args) -> Result<bool, PatchError> {
             had_rejects = true;
             if let Err(e) = write_rejects(
                 &result.rejected_hunks,
-                &target,
+                &target.name,
                 &config,
                 &mut written_rejects,
             ) {
-                eprintln!("patch: {}: {}", target.display(), e);
+                eprintln!("patch: {}: {}", shown.display(), e);
                 exit_code = 2;
             }
             for (num, _, reason) in &result.rejected_hunks {
@@ -321,7 +372,7 @@ fn run(args: Args) -> Result<bool, PatchError> {
             &mut backed_up,
             &mut written_outputs,
         ) {
-            eprintln!("patch: {}: {}", target.display(), e);
+            eprintln!("patch: {}: {}", shown.display(), e);
             exit_code = 2;
             continue;
         }
@@ -331,11 +382,11 @@ fn run(args: Args) -> Result<bool, PatchError> {
             had_rejects = true;
             if let Err(e) = write_rejects(
                 &result.rejected_hunks,
-                &target,
+                &target.name,
                 &config,
                 &mut written_rejects,
             ) {
-                eprintln!("patch: {}: {}", target.display(), e);
+                eprintln!("patch: {}: {}", shown.display(), e);
                 exit_code = 2;
             }
             for (num, _, reason) in &result.rejected_hunks {

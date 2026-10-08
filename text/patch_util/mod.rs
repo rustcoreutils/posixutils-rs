@@ -17,5 +17,6 @@ pub mod file_ops;
 pub mod header;
 pub mod normal;
 pub mod parser;
+pub mod safe_fs;
 pub mod types;
 pub mod unified;

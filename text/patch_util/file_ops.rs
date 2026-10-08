@@ -10,25 +10,53 @@
 //! File operations for the patch utility.
 
 use super::bytes;
+use super::safe_fs::{open_user_output, prune_empty_dirs, Name, Original, Place, Refusal};
 use super::types::{BackupName, FilePatch, Hunk, LineOp, PatchConfig, PatchError, RejectFile};
 use gettextrs::gettext;
 use plib::io::{open_terminal_input, open_terminal_output};
 use std::{
     collections::HashSet,
     fmt::{self, Write as _},
-    fs::{self, File, OpenOptions},
     io::{self, BufRead, BufWriter, Write},
     path::{Component, Path, PathBuf},
 };
 
+/// The file a patch section applies to, as found before patching: the
+/// directory it is in, held open, and what it held.
+pub struct Target {
+    pub name: Name,
+    /// None when a directory on the way does not exist yet.
+    place: Option<Place>,
+    /// None when there is no file.
+    pub original: Option<Original>,
+}
+
+/// Find and read the file `name`. A file the patch names is reached without
+/// following a link; whatever is found must be a regular file.
+pub fn open_target(name: &Name) -> Result<Target, Refusal> {
+    let place = Place::locate(name, false)?;
+    let original = match &place {
+        Some(place) => place.read_regular()?,
+        None => None,
+    };
+    Ok(Target {
+        name: name.clone(),
+        place,
+        original,
+    })
+}
+
+/// Whether anything stands at `name`, reached without following a link. A
+/// name that leads through a link does not exist, as GNU patch finds it.
+fn exists(name: &Name) -> bool {
+    matches!(Place::locate(name, false), Ok(Some(place)) if place.exists())
+}
+
 /// Determine the target file for a patch.
-pub fn determine_target_file(
-    patch: &FilePatch,
-    config: &PatchConfig,
-) -> Result<PathBuf, PatchError> {
+pub fn determine_target_file(patch: &FilePatch, config: &PatchConfig) -> Result<Name, PatchError> {
     // If file operand was specified, use it
     if let Some(ref target) = config.target_file {
-        return Ok(target.clone());
+        return Ok(Name::from_user(target.clone()));
     }
 
     let strip = config.strip_count;
@@ -48,18 +76,18 @@ pub fn determine_target_file(
             continue;
         }
 
-        let Some(path) = safe_patch_path(candidate, strip) else {
+        let Some(name) = safe_patch_path(candidate, strip) else {
             continue;
         };
-        if path.exists() {
-            return Ok(path);
+        if exists(&name) {
+            return Ok(name);
         }
     }
 
     // For new files, try the new_path directly. This is the one path that
     // returns a name without first checking that it exists, so it is also the
-    // one that would happily create a file -- and, via write_output's
-    // create_dir_all, a whole directory tree -- wherever the patch says.
+    // one that would happily create a file -- and a whole directory tree --
+    // wherever the patch says.
     if patch.creates_file() {
         if let Some(ref new_path) = patch.new_path {
             if new_path != "/dev/null" {
@@ -76,7 +104,7 @@ pub fn determine_target_file(
         if let Some(name) = prompt_for_filename() {
             let trimmed = name.trim();
             if !trimmed.is_empty() {
-                return Ok(PathBuf::from(trimmed));
+                return Ok(Name::from_user(PathBuf::from(trimmed)));
             }
         }
     }
@@ -105,12 +133,12 @@ fn is_safe_patch_path(path: &Path) -> bool {
     })
 }
 
-/// The path a file name from the patch names after stripping, or None (with a
+/// The name a file name from the patch gives after stripping, or None (with a
 /// warning) if it may not be written.
-fn safe_patch_path(name: &str, strip: Option<usize>) -> Option<PathBuf> {
+fn safe_patch_path(name: &str, strip: Option<usize>) -> Option<Name> {
     let path = bytes::to_path(&strip_path(name, strip));
     if is_safe_patch_path(&path) {
-        Some(path)
+        Some(Name::from_patch(path))
     } else {
         warn_dangerous_name(&path);
         None
@@ -208,13 +236,12 @@ fn collapse_slashes(path: &str) -> String {
     out
 }
 
-/// Read a file into a vector of lines.
+/// Split a file's contents into lines.
 ///
 /// Returns the lines and a flag indicating whether the file ended with a
-/// trailing newline (false for an empty file). Optimized to read the entire
-/// file at once and split, avoiding per-line allocations and system calls.
-pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
-    let content = bytes::decode(&fs::read(path)?);
+/// trailing newline (false for an empty file).
+pub fn file_lines(original: &Original) -> (Vec<String>, bool) {
+    let content = bytes::decode(&original.bytes);
     let trailing_newline = content.ends_with('\n');
     // Keeping any '\r' as part of the line makes the round trip through
     // write_output lossless for a CRLF file, and makes a patch written against
@@ -225,7 +252,7 @@ pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
         .into_iter()
         .map(str::to_string)
         .collect();
-    Ok((lines, trailing_newline))
+    (lines, trailing_newline)
 }
 
 /// Back up a file under the name `naming` gives it, but only the first time it
@@ -239,67 +266,95 @@ pub fn read_file_lines(path: &Path) -> io::Result<(Vec<String>, bool)> {
 /// any file whose backup is empty, and a 1.0 source package's unpack removes
 /// FILE.dpkg-orig for every file its diff touches, failing if one is missing.
 /// The backup name may lead into directories that do not exist yet (-B
-/// .pc/NAME/); they are created.
+/// .pc/NAME/); they are created. The backup is a new file renamed over its
+/// name, with the original's owner and mode, so whatever stood at the name --
+/// a link to anywhere -- is replaced, not written through.
 fn backup_once(
-    path: &Path,
+    name: &Name,
+    original: Option<&Original>,
     naming: &BackupName,
     backed_up: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
-    let key = path.to_path_buf();
+    let key = name.path().to_path_buf();
     if backed_up.contains(&key) {
         return Ok(());
     }
-    let backup_path = naming.for_file(path);
-    if let Some(parent) = backup_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    if path.exists() {
-        fs::copy(path, &backup_path)?;
-    } else {
-        File::create(&backup_path)?;
-    }
+    let backup = name.backup(naming);
+    let place = locate_creating(&backup)?;
+    let bytes = original.map_or(&[][..], |o| &o.bytes);
+    place.replace(original.map(|o| &o.meta), |w| w.write_all(bytes))?;
     backed_up.insert(key);
     Ok(())
 }
 
+/// Reach the directory `name` goes in, making any that are missing.
+fn locate_creating(name: &Name) -> io::Result<Place> {
+    Place::locate(name, true)
+        .map_err(|r| r.into_io(name.path()))?
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+}
+
 /// Remove the target file for a deletion patch (new file is /dev/null),
-/// honoring -b backup first. Used instead of writing an empty file.
+/// honoring -b backup first. Used instead of writing an empty file. The file
+/// is removed from the directory it was read in, and only if it is still the
+/// file that was read; then the directories it leaves empty go too.
 pub fn delete_target(
-    target: &Path,
+    target: &Target,
     config: &PatchConfig,
     backed_up: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     if let Some(naming) = &config.backup {
-        backup_once(target, naming, backed_up)?;
+        backup_once(&target.name, target.original.as_ref(), naming, backed_up)?;
     }
-    if target.exists() {
-        fs::remove_file(target)?;
-        prune_empty_parents(target);
+    if let (Some(place), Some(original)) = (&target.place, &target.original) {
+        place.remove(original)?;
+        prune_empty_dirs(&target.name);
     }
     Ok(())
 }
 
-/// Remove the directories a removed file leaves empty, innermost first, as
-/// GNU patch does; stop at the first that is not empty. Only a relative name
-/// is pruned, and only below the working directory: an absolute name is the
-/// user's own operand, and the directories above it are none of patch's
-/// business.
-fn prune_empty_parents(removed: &Path) {
-    if !removed
-        .components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
-    {
-        return;
-    }
-    let mut dir = removed.parent();
-    while let Some(d) = dir {
-        if d.as_os_str().is_empty() || d == Path::new(".") || fs::remove_dir(d).is_err() {
-            break;
+/// Write the patched lines; `no_trailing_newline` drops the final newline.
+fn write_lines(w: &mut dyn Write, content: &[String], no_trailing_newline: bool) -> io::Result<()> {
+    let last = content.len().saturating_sub(1);
+    for (i, line) in content.iter().enumerate() {
+        w.write_all(&bytes::encode(line))?;
+        if i != last || !no_trailing_newline {
+            w.write_all(b"\n")?;
         }
-        dir = d.parent();
     }
+    Ok(())
+}
+
+/// Back up a -o output file the user named, if it exists.
+fn backup_user_file(
+    path: &Path,
+    naming: &BackupName,
+    backed_up: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
+    let name = Name::from_user(path.to_path_buf());
+    let original = match Place::locate(&name, false) {
+        Ok(Some(place)) => place.read_regular().map_err(|r| r.into_io(path))?,
+        Ok(None) => None,
+        Err(r) => return Err(r.into_io(path)),
+    };
+    backup_once(&name, original.as_ref(), naming, backed_up)
+}
+
+/// Write the patched file to the -o output file, concatenating successive
+/// patched versions of the same file: truncate on first write, append
+/// thereafter.
+fn write_user_output(
+    content: &[String],
+    path: &Path,
+    no_trailing_newline: bool,
+    written_outputs: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
+    let append = written_outputs.contains(path);
+    let file = open_user_output(path, append)?;
+    written_outputs.insert(path.to_path_buf());
+    let mut writer = BufWriter::new(file);
+    write_lines(&mut writer, content, no_trailing_newline)?;
+    writer.flush()
 }
 
 /// Write content to the output file, handling backup if needed.
@@ -309,83 +364,84 @@ fn prune_empty_parents(removed: &Path) {
 /// backed up this run (so -b preserves the true original). `written_outputs`
 /// tracks which -o output files have already been written, so successive
 /// patched versions of the same -o file are concatenated rather than truncated.
-#[allow(clippy::too_many_arguments)]
+///
+/// The patched file replaces the target: it is written to a new file in the
+/// directory the target was read from, given the original's owner and mode,
+/// and renamed over the target's name. Directories a new file needs are made
+/// on the way, never through a link.
 pub fn write_output(
     content: &[String],
-    target: &Path,
+    target: &Target,
     config: &PatchConfig,
     no_trailing_newline: bool,
     backed_up: &mut HashSet<PathBuf>,
     written_outputs: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
-    // Determine output path
-    let output_path = config.output_file.as_deref().unwrap_or(target);
+    if let Some(output) = &config.output_file {
+        if let Some(naming) = &config.backup {
+            backup_user_file(output, naming, backed_up)?;
+        }
+        return write_user_output(content, output, no_trailing_newline, written_outputs);
+    }
 
-    // Handle backup (-b option) once per file.
+    let original = target.original.as_ref();
     if let Some(naming) = &config.backup {
-        backup_once(output_path, naming, backed_up)?;
+        backup_once(&target.name, original, naming, backed_up)?;
     }
-
-    // Create parent directories if needed
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            fs::create_dir_all(parent)?;
+    let made;
+    let place = match &target.place {
+        Some(place) => place,
+        None => {
+            made = locate_creating(&target.name)?;
+            &made
         }
-    }
-
-    // For -o output, concatenate successive patched versions of the same file:
-    // truncate on first write, append thereafter.
-    let key = output_path.to_path_buf();
-    let append = config.output_file.is_some() && written_outputs.contains(&key);
-    let file = if append {
-        OpenOptions::new().append(true).open(output_path)?
-    } else {
-        File::create(output_path)?
     };
-    written_outputs.insert(key);
-
-    // Write content using BufWriter for better I/O performance
-    let mut writer = BufWriter::new(file);
-    let last = content.len().saturating_sub(1);
-    for (i, line) in content.iter().enumerate() {
-        writer.write_all(&bytes::encode(line))?;
-        if i != last || !no_trailing_newline {
-            writer.write_all(b"\n")?;
-        }
-    }
-    writer.flush()?;
-
-    Ok(())
+    place.replace(original.map(|o| &o.meta), |w| {
+        write_lines(w, content, no_trailing_newline)
+    })
 }
 
 /// Write rejected hunks to a reject file.
+///
+/// POSIX: rejected hunks are *appended* to the reject file. With -r, or with
+/// two patch sections naming the same file, truncating per section would
+/// leave only the last one's rejects. A -r file is the user's own, opened as
+/// named; the default FILE.rej is reached like FILE and, the first time, made
+/// new over whatever stood at its name.
 pub fn write_rejects(
     rejects: &[(usize, Hunk, String)],
-    target: &Path,
+    target: &Name,
     config: &PatchConfig,
     written_rejects: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     if rejects.is_empty() {
         return Ok(());
     }
+    let text = bytes::encode(&reject_text(rejects, target.path())?);
+    match &config.reject_file {
+        Some(RejectFile::Discard) => Ok(()),
+        Some(RejectFile::Path(path)) => {
+            let append = written_rejects.contains(path);
+            let mut file = open_user_output(path, append)?;
+            written_rejects.insert(path.clone());
+            file.write_all(&text)
+        }
+        None => {
+            let name = target.with_suffix(".rej");
+            let place = locate_creating(&name)?;
+            if written_rejects.contains(name.path()) {
+                place.append(&text).map_err(|r| r.into_io(name.path()))?;
+            } else {
+                place.replace(None, |w| w.write_all(&text))?;
+                written_rejects.insert(name.path().to_path_buf());
+            }
+            Ok(())
+        }
+    }
+}
 
-    // Determine reject file path
-    let reject_path = match &config.reject_file {
-        Some(RejectFile::Discard) => return Ok(()),
-        Some(RejectFile::Path(path)) => path.clone(),
-        None => bytes::with_suffix(target, ".rej"),
-    };
-
-    // POSIX: rejected hunks are *appended* to the reject file. With -r, or with
-    // two patch sections naming the same file, truncating per section would
-    // leave only the last one's rejects.
-    let file = if written_rejects.contains(&reject_path) {
-        OpenOptions::new().append(true).open(&reject_path)?
-    } else {
-        File::create(&reject_path)?
-    };
-    written_rejects.insert(reject_path);
-
+/// The reject file text for the hunks of one file.
+fn reject_text(rejects: &[(usize, Hunk, String)], target: &Path) -> io::Result<String> {
     // Name the file each group of rejects belongs to, so an aggregated reject
     // file stays attributable. The header is context-style to match the hunks
     // below it: a unified-style "--- "/"+++ " pair would make the reject file
@@ -398,11 +454,7 @@ pub fn write_rejects(
     for (_hunk_num, hunk, _reason) in rejects {
         write_hunk_as_context(&mut text, hunk).map_err(io::Error::other)?;
     }
-    let mut writer = BufWriter::new(file);
-    writer.write_all(&bytes::encode(&text))?;
-    writer.flush()?;
-
-    Ok(())
+    Ok(text)
 }
 
 /// Write a hunk in context diff format, as patch text.

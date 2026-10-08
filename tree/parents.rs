@@ -16,7 +16,7 @@
 //! descriptors.
 
 use crate::common::{
-    copy_file_at, error_string, finish_made_dir_mode, preserve_through_fd, verify_made_dir,
+    copy_file_at, error_string, finish_made_dir_mode, open_made_dir, preserve_through_fd,
     CopyConfig, InodeMap, MadeTrust,
 };
 use gettextrs::gettext;
@@ -116,25 +116,29 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
                 )));
             }
         }
-        let next_dest =
-            open_dir_at(dest_dir.as_raw_fd(), &name, libc::O_NOFOLLOW).map_err(|e| {
-                io::Error::other(gettext!(
-                    "'{}' exists but is not a directory: {}",
-                    dest_path.display(),
-                    error_string(&e)
-                ))
-            })?;
-        if created {
+        let next_dest = if created {
             // Between the `mkdirat` and the open, anyone else who can rename entries in the
-            // parent could have swapped in a directory of their own.
-            let trust = verify_made_dir(dest_dir.as_raw_fd(), next_dest.as_raw_fd(), &dest_path)?;
+            // parent could have swapped in a directory of their own; and the umask may have
+            // withheld the owner permission the directory needs to be filled
+            // (`open_made_dir`).
+            let (opened, trust) = open_made_dir(dest_dir.as_raw_fd(), &name, &dest_path)?;
+            let next_dest = File::from(opened);
             made.push(MadeDir {
                 dest: next_dest.try_clone()?,
                 source: src_md,
                 path: dest_path.clone(),
                 trust,
             });
-        }
+            next_dest
+        } else {
+            open_dir_at(dest_dir.as_raw_fd(), &name, libc::O_NOFOLLOW).map_err(|e| {
+                io::Error::other(gettext!(
+                    "'{}' exists but is not a directory: {}",
+                    dest_path.display(),
+                    error_string(&e)
+                ))
+            })?
+        };
         src_dir = next_src;
         dest_dir = next_dest;
     }

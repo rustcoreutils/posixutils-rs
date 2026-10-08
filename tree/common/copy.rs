@@ -21,7 +21,7 @@ use std::{
     ffi::{CStr, CString, OsStr},
     fs, io,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
@@ -206,6 +206,81 @@ enum DirOrigin {
 /// `fstat` of a descriptor the caller keeps open (and goes on owning).
 fn fd_metadata(fd: libc::c_int) -> io::Result<fs::Metadata> {
     std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) }).metadata()
+}
+
+/// `openat(dirfd, name, flags)`.
+fn open_fd_at(dirfd: libc::c_int, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open flags for a directory held for search only: it may deny its owner reading. `O_PATH`
+/// (Linux) and `O_SEARCH` (macOS, FreeBSD) open it for exactly that; elsewhere only `O_RDONLY`.
+#[cfg(target_os = "linux")]
+const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+
+/// Open the directory this copy has just made with `mkdirat` at `name` in `parent_fd`, for
+/// reading, checked to be the one made (`verify_made_dir`), and with its owner's read, write and
+/// search permission.
+///
+/// POSIX cp 2.e makes the directory with the source's permission bits "modified by the file
+/// creation mask of the user ... OR'ed with S_IRWXU", but `mkdirat` applies the umask to the
+/// S_IRWXU too: under a umask of 0400 the directory came out 0300, and cp could neither open it
+/// to copy into nor read it to see that it was the one made. So it is pinned search-only first,
+/// verified through the pin, given S_IRWXU through the pin when it is cp's own and lacks it, and
+/// only then opened for reading -- through the pin's `self/fd/N` under a verified procfs, or,
+/// without one, by name with its identity checked against the pin.
+pub fn open_made_dir(
+    parent_fd: libc::c_int,
+    name: &CStr,
+    target: &Path,
+) -> io::Result<(OwnedFd, MadeTrust)> {
+    let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let pin = open_fd_at(parent_fd, name, flags)?;
+    let trust = verify_made_dir(parent_fd, pin.as_raw_fd(), target)?;
+    let md = fd_metadata(pin.as_raw_fd())?;
+    // S_IRWXU is 0o700 (fixed by POSIX).
+    if md.uid() == unsafe { libc::geteuid() } && md.mode() & 0o700 != 0o700 {
+        let mode = ((md.mode() & 0o7777) | 0o700) as libc::mode_t;
+        plib::madefs::chmod_fd(pin.as_raw_fd(), mode)?;
+    }
+    if let Some(opened) = reopen_through_procfs(&pin) {
+        return Ok((opened?, trust));
+    }
+    // Without procfs, by name, refused unless it is still the pinned directory.
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let opened = open_fd_at(parent_fd, name, flags)?;
+    let now = fd_metadata(opened.as_raw_fd())?;
+    if (now.dev(), now.ino()) != (md.dev(), md.ino()) {
+        return Err(io::Error::other(gettext!(
+            "'{}' was replaced after it was made",
+            target.display()
+        )));
+    }
+    Ok((opened, trust))
+}
+
+/// The directory `pin` holds, opened again for reading through its `self/fd/N` under a
+/// verified procfs, which names exactly the pinned inode; `None` without one.
+#[cfg(target_os = "linux")]
+fn reopen_through_procfs(pin: &OwnedFd) -> Option<io::Result<OwnedFd>> {
+    let proc_dir = procfs_dir().ok()?;
+    let path = proc_fd_name(pin.as_raw_fd());
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    Some(open_fd_at(proc_dir.as_raw_fd(), &path, flags))
+}
+
+/// Elsewhere there is no procfs to reopen through.
+#[cfg(not(target_os = "linux"))]
+fn reopen_through_procfs(_pin: &OwnedFd) -> Option<io::Result<OwnedFd>> {
+    None
 }
 
 /// Check a directory cp has just made with `mkdirat` in `parent_fd` and then opened as `dir_fd`
@@ -1781,41 +1856,45 @@ where
                         // `lstat` saw, or for one this copy made, what a fresh `mkdirat`
                         // yields (`verify_made_dir`). Its identity is read from the
                         // descriptor, never by name.
-                        let opened = ftw::FileDescriptor::open_at(
-                            target_dirfd,
-                            &target_filename_cstr,
-                            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                        )
-                        .map_err(|e| {
+                        let cannot_open = |e: io::Error| {
                             io::Error::other(gettext!(
                                 "cannot open directory '{}': {}",
                                 target.display(),
                                 error_string(&e)
                             ))
-                        })
-                        .and_then(|fd| {
-                            let md = fd_metadata(fd.as_raw_fd())?;
-                            match origin {
-                                DirOrigin::Found { dev, ino }
-                                    if dev != md.dev() || ino != md.ino() =>
-                                {
-                                    Err(io::Error::other(gettext!(
+                        };
+                        let opened = match origin {
+                            DirOrigin::Found { dev, ino } => ftw::FileDescriptor::open_at(
+                                target_dirfd,
+                                &target_filename_cstr,
+                                libc::O_RDONLY
+                                    | libc::O_DIRECTORY
+                                    | libc::O_NOFOLLOW
+                                    | libc::O_CLOEXEC,
+                            )
+                            .map_err(cannot_open)
+                            .and_then(|fd| {
+                                let md = fd_metadata(fd.as_raw_fd())?;
+                                if dev != md.dev() || ino != md.ino() {
+                                    return Err(io::Error::other(gettext!(
                                         "'{}' was replaced after it was checked",
                                         target.display()
-                                    )))
+                                    )));
                                 }
-                                DirOrigin::Found { .. } => Ok((fd, md)),
-                                DirOrigin::Made => {
-                                    let trust = verify_made_dir(
-                                        target_dirfd.as_raw_fd(),
-                                        fd.as_raw_fd(),
-                                        &target,
-                                    )?;
-                                    made_dirs.borrow_mut().insert((md.dev(), md.ino()), trust);
-                                    Ok((fd, md))
-                                }
-                            }
-                        });
+                                Ok((fd, md))
+                            }),
+                            DirOrigin::Made => open_made_dir(
+                                target_dirfd.as_raw_fd(),
+                                &target_filename_cstr,
+                                &target,
+                            )
+                            .and_then(|(fd, trust)| {
+                                let fd = ftw::FileDescriptor::from(fd);
+                                let md = fd_metadata(fd.as_raw_fd())?;
+                                made_dirs.borrow_mut().insert((md.dev(), md.ino()), trust);
+                                Ok((fd, md))
+                            }),
+                        };
                         let (new_target_dirfd, new_target_md) = match opened {
                             Ok(pair) => pair,
                             Err(e) => {

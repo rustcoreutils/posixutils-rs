@@ -15,6 +15,7 @@ mod dirmode;
 ))]
 mod old_kernel;
 mod race;
+mod umask;
 
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;

@@ -29,6 +29,25 @@ use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
 
+/// Open flags for a directory that is only ever walked through, used as the `dirfd` of an `*at`
+/// call, or `fstat`ed (`ChainTrust`).
+///
+/// Reaching a name below a directory takes search permission only, so opening it for reading
+/// refuses a directory the user may search and write but not list (mode 0300) where `mkdir` or
+/// `open` by name would have succeeded. `O_PATH` (Linux) and `O_SEARCH` (macOS, the BSDs) open
+/// it for exactly that. Elsewhere `O_RDONLY` is the only option there is.
+#[cfg(target_os = "linux")]
+pub const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd"
+)))]
+pub const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+
 /// How a filesystem keeps file owners, as far as its type says.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FsOwners {

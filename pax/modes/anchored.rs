@@ -22,7 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use crate::modes::made::{self, cvt, verify_made_dir, MadeNode, MadeTrust};
-use plib::madefs::{ChainTrust, FoundDir, Preserve};
+use plib::madefs::{ChainTrust, FoundDir, Preserve, SEARCH_ONLY};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
@@ -146,27 +146,9 @@ impl MemberPath {
     }
 }
 
-/// Open flags for a directory that is only ever walked through or used as the
-/// `dirfd` of an `*at` call.
-///
-/// Reaching a name below a directory takes search permission only, so opening
-/// each component for reading refused a path through a directory the user may
-/// search and write but not list (mode 0300) where `mkdir` or `open` by name
-/// would have succeeded. `O_PATH` (Linux) and `O_SEARCH` (macOS, the BSDs) open
-/// it for exactly that. Elsewhere `O_RDONLY` is the only option there is.
-/// (An `O_PATH` descriptor takes attributes only through a verified procfs,
-/// `set_attrs_search_only`, which is Linux's alone.)
-#[cfg(target_os = "linux")]
-const SEARCH_ONLY: libc::c_int = libc::O_PATH;
-#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
-const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd"
-)))]
-const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+// Directories walked through are opened `plib::madefs::SEARCH_ONLY`. (An
+// `O_PATH` descriptor takes attributes only through a verified procfs,
+// `set_attrs_search_only`, which is Linux's alone.)
 
 /// Flags for walking one directory component: search only, and never through
 /// a symbolic link or anything that is not a directory.

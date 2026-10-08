@@ -281,3 +281,24 @@ fn cp_parents_pr_trust_holds_along_the_chain() {
     assert_eq!(mode_of(&secret), 0o755);
     assert_eq!(mtime_of(&secret), OLD_MTIME);
 }
+
+/// Judging the directory a found one is in needs only search permission on it, as copying
+/// into the found one does: under a destination the user may search and write but not read
+/// (0300), the copy is made and the found directory stamped.
+#[test]
+fn cp_pr_judges_a_found_directory_in_an_unreadable_destination() {
+    let temp = tempdir().unwrap();
+    source_dir(&temp.path().join("s2"), 0o750);
+    let r = temp.path().join("r");
+    fs::create_dir_all(r.join("s2")).unwrap();
+    set_mode(&r.join("s2"), 0o700);
+    set_mode(&r, 0o300);
+
+    let out = cp(temp.path(), &["-pR", "s2", "r"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    set_mode(&r, 0o755);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(fs::read_to_string(r.join("s2/f")).unwrap(), "data\n");
+    assert_eq!(mode_of(&r.join("s2")), 0o750);
+    assert_eq!(mtime_of(&r.join("s2")), OLD_MTIME);
+}

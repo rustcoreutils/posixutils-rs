@@ -15,7 +15,7 @@ pub use plib::madefs::ChainTrust;
 pub use plib::madefs::MadeTrust;
 #[cfg(target_os = "linux")]
 use plib::madefs::{chmod_pinned, proc_fd_name, procfs_dir, utimens_link_if_still};
-use plib::madefs::{fs_owners, made_by_us, FoundDir, FsOwners, MadeObject, Preserve};
+use plib::madefs::{fs_owners, made_by_us, FoundDir, FsOwners, MadeObject, Preserve, SEARCH_ONLY};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -306,9 +306,9 @@ fn as_asked(requested: Preserve) -> FoundDir {
 }
 
 /// The directory that the directory open on `fd` is in, through its own `..`: wherever it
-/// actually is, never by name.
+/// actually is, never by name. Opened for search only, as copying into `fd` needs no more.
 fn open_parent_dir(fd: &ftw::FileDescriptor, target: &Path) -> io::Result<ftw::FileDescriptor> {
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     ftw::FileDescriptor::open_at(fd, c"..", flags).map_err(|e| {
         io::Error::other(gettext!(
             "cannot open the directory holding '{}': {}",
@@ -395,15 +395,6 @@ fn open_fd_at(dirfd: libc::c_int, name: &CStr, flags: libc::c_int) -> io::Result
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
-
-/// Open flags for a directory held for search only: it may deny its owner reading. `O_PATH`
-/// (Linux) and `O_SEARCH` (macOS, FreeBSD) open it for exactly that; elsewhere only `O_RDONLY`.
-#[cfg(target_os = "linux")]
-const SEARCH_ONLY: libc::c_int = libc::O_PATH;
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
-const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
 
 /// Open the directory this copy has just made with `mkdirat` at `name` in `parent_fd`, for
 /// reading, checked to be the one made (`verify_made_dir`), and with its owner's read, write and

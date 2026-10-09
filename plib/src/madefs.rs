@@ -616,9 +616,9 @@ enum DirWriters {
 /// A directory may be its owner's alone only where its owner is someone the trust can rest
 /// with:
 /// - the effective user, while the chain has gone into no other user's directories;
-/// - for root, one user other than root, the one the copy or extraction is for -- root
-///   extracting into `/home/alice`, which alice owns, with the directories a umask of 002 left
-///   below it. That user is the owner of the first directory in the chain not root's own, and
+/// - for root, on Linux only (`ROOT_WORKS_FOR_USERS`), one user other than root, the one the
+///   copy or extraction is for -- root extracting into `/home/alice`, which alice owns, with
+///   the directories a umask of 002 left below it. That user is the owner of the first directory in the chain not root's own, and
 ///   must own every directory below it: root's own, or a third user's, below it is mixed in,
 ///   and others than its owner could have created its name. A directory the caller made and
 ///   verified (`ChainStart::Made`) starts no such chain: it is root's own, or the owner it was
@@ -645,11 +645,7 @@ fn dir_writers(
     #[allow(clippy::unnecessary_cast)]
     let mode = st.st_mode as u32;
     let uid = st.st_uid;
-    let trusted_owner = match above_owner {
-        Some(owner) => uid == owner,
-        None => uid == euid || (euid == 0 && uid != 0 && start == ChainStart::Anchor),
-    };
-    if !trusted_owner || mode & 0o002 != 0 {
+    if !trusted_owner(uid, euid, above_owner, start, ROOT_WORKS_FOR_USERS) || mode & 0o002 != 0 {
         DirWriters::Others
     } else if mode & 0o020 == 0 {
         DirWriters::Owner { uid }
@@ -657,6 +653,32 @@ fn dir_writers(
         DirWriters::OwnerAndGroup {
             uid,
             gid: st.st_gid,
+        }
+    }
+}
+
+/// Whether root trusts a tree one other user owns alone (`dir_writers`): on Linux only, the one
+/// system where every ACL that could let someone else write such a directory is read
+/// (`acls_let_others_write`). Elsewhere an ACL is never read -- a macOS ACL granting bob write
+/// on alice's 0755 directory would go unseen -- so root trusts only its own directories, as
+/// the private-group rule is off there too (`is_private_group`).
+const ROOT_WORKS_FOR_USERS: bool = cfg!(target_os = "linux");
+
+/// Whether a directory owned by `uid` may be the trusted owner's alone, the effective user being
+/// `euid`, in a chain that has gone into the tree of `above_owner`, where it stands as `start`;
+/// `works_for_users` being whether root may trust a tree one other user owns alone
+/// (`ROOT_WORKS_FOR_USERS`). The rule `dir_writers` states.
+fn trusted_owner(
+    uid: u32,
+    euid: u32,
+    above_owner: Option<u32>,
+    start: ChainStart,
+    works_for_users: bool,
+) -> bool {
+    match above_owner {
+        Some(owner) => uid == owner,
+        None => {
+            uid == euid || (works_for_users && euid == 0 && uid != 0 && start == ChainStart::Anchor)
         }
     }
 }
@@ -1208,8 +1230,9 @@ mod tests {
     use super::{
         acl_names_others, acls_let_others_write, dir_writers, empty_lending_read, group_entry,
         group_is_private, is_private_group, made_by_us, others_can_rename, read_private_group,
-        user_entry, utimens_link_if_still, verify_made_dir, ChainStart, ChainTrust, DirWriters,
-        FoundDir, FsOwners, MadeObject, MadeTrust, Preserve, UserEntry,
+        trusted_owner, user_entry, utimens_link_if_still, verify_made_dir, ChainStart, ChainTrust,
+        DirWriters, FoundDir, FsOwners, MadeObject, MadeTrust, Preserve, UserEntry,
+        ROOT_WORKS_FOR_USERS,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -1258,6 +1281,8 @@ mod tests {
     /// owner, not root, owning every directory below root's own, none of them writable by
     /// others. The test user stands for that user here, and root's view is taken by asking as
     /// euid 0; `/` stands for `/home`.
+    // Root works for a user on Linux only (`ROOT_WORKS_FOR_USERS`).
+    #[cfg(target_os = "linux")]
     #[test]
     fn root_trusts_a_tree_one_other_user_owns_alone() {
         let me = unsafe { libc::geteuid() };
@@ -1320,6 +1345,8 @@ mod tests {
     /// In the tree of a user root works for, the user can rename into place any directory
     /// they can reach -- one of root's, or another user's from a directory they share -- and
     /// root must give such a one nothing: only the user's own directories are found there.
+    // Root works for a user on Linux only (`ROOT_WORKS_FOR_USERS`).
+    #[cfg(target_os = "linux")]
     #[test]
     fn root_gives_nothing_to_a_directory_not_the_users_found_in_their_tree() {
         if unsafe { libc::geteuid() } == 0 {
@@ -1347,6 +1374,8 @@ mod tests {
     /// tree is trusted only where every directory above it up to one of root's own is the
     /// user's alone, and root's is no directory others can write either. This crate's own
     /// directory is the test user's, below root's `/home`; a directory in `/tmp` is not.
+    // Root works for a user on Linux only (`ROOT_WORKS_FOR_USERS`).
+    #[cfg(target_os = "linux")]
     #[test]
     fn root_trusts_a_users_tree_at_the_anchor_only_where_it_rests_on_roots_own() {
         let me = unsafe { libc::geteuid() };
@@ -1377,6 +1406,7 @@ mod tests {
         assert_eq!(anchor.found_dir(&src, mode), FoundDir::AsRequested);
     }
 
+    #[cfg(target_os = "linux")]
     /// Whether `dir` and every directory above it up to the first of root's are `uid`'s,
     /// writable by nobody else -- group write permission only for the user's private group --
     /// and that one of root's by nobody but root: as the test sees it, by name.
@@ -1404,16 +1434,25 @@ mod tests {
     /// continue the chain: another user's, or root's, are mixed in.
     #[test]
     fn root_trusts_no_mixed_owners() {
+        // Off Linux, where no ACL is read, root trusts nobody's tree but its own.
+        assert!(trusted_owner(US, 0, None, ChainStart::Anchor, true));
+        assert!(!trusted_owner(US, 0, None, ChainStart::Anchor, false));
+        assert!(trusted_owner(0, 0, None, ChainStart::Anchor, false));
+        assert!(trusted_owner(US, US, None, ChainStart::Anchor, false));
         use DirWriters::{Others, Owner, OwnerAndGroup};
         // Root's own, at the top.
         assert_eq!(
             dir_writers(&parent(0, 0o755), 0, None, ChainStart::Anchor),
             Owner { uid: 0 }
         );
-        // One user's, below root's or at the top.
+        // One user's, below root's or at the top -- on Linux only.
         assert_eq!(
             dir_writers(&parent(US, 0o755), 0, None, ChainStart::Anchor),
-            Owner { uid: US }
+            if ROOT_WORKS_FOR_USERS {
+                Owner { uid: US }
+            } else {
+                Others
+            }
         );
         assert_eq!(
             dir_writers(&parent(US, 0o755), 0, Some(US), ChainStart::Anchor),

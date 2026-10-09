@@ -1589,6 +1589,58 @@ fn test_mv_xdev_symlink_operand() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
+// `link/`, a symbolic link to a directory named with a trailing slash, is not a directory that
+// can be renamed (rename(2) fails with ENOTDIR). Across filesystems the move fell back to a copy,
+// which followed the link, and then removed what it had copied: the directory the link points
+// to was emptied and the link left. It fails as the rename does, before anything is copied.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_mv_xdev_symlink_with_trailing_slash() {
+    let other_root = Path::new(option_env!("OTHER_PARTITION_TMPDIR").unwrap_or("/dev/shm"));
+    let src_tmp = plib::tmp::tempdir().unwrap();
+    let here = fs::metadata(src_tmp.path()).unwrap().dev();
+    if fs::metadata(other_root).map_or(true, |md| md.dev() == here) {
+        eprintln!("skipping: no second filesystem at {}", other_root.display());
+        return;
+    }
+    let other_tmp = plib::tmp::Builder::new().tempdir_in(other_root).unwrap();
+
+    let src = src_tmp.path();
+    fs::create_dir(src.join("D")).unwrap();
+    fs::write(src.join("D/f"), b"f").unwrap();
+    unix::fs::symlink("D", src.join("link")).unwrap();
+    let link_slash = &format!("{}/link/", src.display());
+
+    // Within one filesystem: the rename's own error.
+    let same_fs = &format!("{}/x", src.display());
+    mv_test(
+        &[link_slash, same_fs],
+        "",
+        &format!("mv: cannot move '{link_slash}' to '{same_fs}': Not a directory\n"),
+        1,
+    );
+
+    // Across filesystems: the same error, and nothing copied or removed.
+    let other = other_tmp.path().display();
+    for (target, shown) in [
+        (format!("{other}/x"), format!("{other}/x")),
+        (format!("{other}"), format!("{other}/link")),
+    ] {
+        mv_test(
+            &[link_slash, &target],
+            "",
+            &format!("mv: cannot move '{link_slash}' to '{shown}': Not a directory\n"),
+            1,
+        );
+        assert_eq!(fs::read(src.join("D/f")).unwrap(), b"f", "D was emptied");
+        assert!(fs::symlink_metadata(src.join("link")).unwrap().is_symlink());
+        assert!(
+            fs::symlink_metadata(&shown).is_err(),
+            "{shown} was copied to"
+        );
+    }
+}
+
 // rename(2) needs write and search permission on the directories involved, not read
 // permission: a move within one filesystem out of, and into, directories of mode 0300 works,
 // in both synopsis forms, wherever mv cannot hold such a directory open.

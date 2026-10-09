@@ -23,6 +23,7 @@ use gettextrs::gettext;
 use remove_moved::remove_moved_source;
 use std::{
     collections::{HashMap, HashSet},
+    ffi::CString,
     fs,
     io::{self, IsTerminal},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -397,6 +398,17 @@ fn move_file_deciding(
 
     // Fall through: source and target are on different filesystems; must copy.
 
+    // `link/` is not a directory the rename could move (ENOTDIR), and copying it would follow
+    // the link: fail as the rename does within one filesystem, rather than copy the directory
+    // the link points to and then empty it.
+    if is_symlink_with_trailing_slash(&source_entry) {
+        return Err(cannot_move(
+            source,
+            target,
+            &io::Error::from_raw_os_error(libc::ENOTDIR),
+        ));
+    }
+
     // The copy must start from the file examined above, and is what step 7 removes.
     let identity = match &source_lstat {
         Ok(md) => (md.dev(), md.ino()),
@@ -453,6 +465,21 @@ fn move_file_deciding(
     .map_err(err_inter_device)?;
 
     Ok(Moved::Copied(copied))
+}
+
+/// Whether `entry` is named with a trailing slash and, without it, names a symbolic link.
+fn is_symlink_with_trailing_slash(entry: &PinnedEntry) -> bool {
+    let name = entry.name().to_bytes();
+    let Some(last) = name.iter().rposition(|&b| b != b'/') else {
+        return false;
+    };
+    if last + 1 == name.len() {
+        return false;
+    }
+    let Ok(link) = CString::new(&name[..=last]) else {
+        return false;
+    };
+    ftw::Metadata::new(entry.dir_fd(), &link, false).is_ok_and(|md| md.is_symlink())
 }
 
 /// Whether a rename may replace a file at the target.

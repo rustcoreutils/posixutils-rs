@@ -1072,8 +1072,9 @@ where
 /// the path to it is resolved again, so renaming or replacing one of its ancestors after `dir`
 /// was opened cannot redirect the walk. `name` is a single component (it may carry trailing
 /// slashes), looked up in `dir` exactly as `traverse_directory` looks up an operand's last
-/// component; and `postprocess_dir` for the starting point itself receives `dir` as the
-/// containing directory.
+/// component: a symbolic link named with a trailing slash is walked as `.` in the directory it
+/// names (`Entry::reached_through_symlink`). `postprocess_dir` for the starting point itself
+/// receives `dir` as the containing directory (or, for such a link, the directory it names).
 ///
 /// `display_parent` is only shown: each entry's `path()` is `display_parent` joined with the
 /// entry's path from `name`. It is never resolved.
@@ -1112,6 +1113,23 @@ where
             return false;
         }
     };
+
+    // A trailing slash after a name that may be a symbolic link: as in `traverse_directory`.
+    let name_bytes = name.to_bytes();
+    let (bare, suffix) = name_bytes.split_at(name_bytes.len() - directory_suffix_len(name_bytes));
+    if !suffix.is_empty() && !matches!(bare, b"" | b"." | b"..") {
+        let bare = CString::new(bare).expect("taken from a C string");
+        return walk_slash_operand(
+            starting_dir,
+            path_stack,
+            cstring_to_rc(&bare),
+            suffix,
+            file_handler,
+            postprocess_dir,
+            err_reporter,
+            opts,
+        );
+    }
     walk_from(
         starting_dir,
         path_stack,

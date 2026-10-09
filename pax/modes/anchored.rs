@@ -213,8 +213,13 @@ pub(crate) struct DirTree {
     /// descriptor to be the ones made, for a member naming them -- or made
     /// to hold members below them and since claimed by the member naming
     /// them -- each with the member path it was made at. Unlike a directory
-    /// found existing, these take a member's attributes wherever they are --
-    /// at that path: one renamed to another member's name is found there.
+    /// found existing, one of these takes a member's attributes without the
+    /// existing-directory rule (`Standing::Made`), but only when met at that
+    /// path and still as this run left it (`left_as`). Met at any other
+    /// path, it is one found existing there: otherwise someone who can
+    /// rename in the destination could rename a directory this run made to
+    /// another member's name, and have that member's mode or owner given to
+    /// it without the existing-directory rule.
     made: RefCell<HashMap<(u64, u64), Vec<u8>>>,
     /// What each directory in `implicit` and `made` was left as by this run
     /// (`LeftAs`): its inode number alone cannot tell it from a directory
@@ -867,7 +872,12 @@ enum Standing {
     /// that names it.
     Implicit,
     /// Made and verified by this run for a member naming it, or implicit and
-    /// since claimed: takes attributes wherever it is.
+    /// since claimed; met at the member path it was made at, and still owned,
+    /// grouped and moded as this run left it (`LeftAs`), which it no longer
+    /// is once this run has given it to someone else. Takes a member's
+    /// attributes without the existing-directory rule. A directory this run
+    /// made, met anywhere else -- renamed to another member's name -- or no
+    /// longer as it was left, is `Ordinary`.
     Made,
     /// Found existing: takes its times, and its mode and owner only when
     /// asked for -- and then only where nobody else could have created its

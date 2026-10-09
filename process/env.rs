@@ -9,6 +9,9 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
+use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
@@ -41,73 +44,70 @@ struct Args {
         allow_hyphen_values = true,
         help = gettext("NAME=VALUE pairs, the utility to invoke, and its arguments")
     )]
-    operands: Vec<String>,
+    operands: Vec<OsString>,
 }
 
 /// True if `name` is a valid environment variable name per the portable
 /// character set: a non-digit `[A-Za-z_]` followed by `[A-Za-z0-9_]*`.
-fn is_valid_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-}
-
-fn separate_ops(sv: &[String]) -> (Vec<String>, Vec<String>) {
-    // Upper bound: all operands could be envs or all could be args
-    let mut envs = Vec::with_capacity(sv.len());
-    let mut util_args = Vec::with_capacity(sv.len());
-    let mut in_envs = true;
-
-    for s in sv {
-        if in_envs {
-            // A leading `name=value` operand is an assignment only when the
-            // part before the first '=' is a valid environment-variable name.
-            if let Some((name, _)) = s.split_once('=') {
-                if is_valid_name(name) {
-                    envs.push(String::from(s));
-                    continue;
-                }
-            }
-
-            in_envs = false;
-
-            // fall through
+fn is_valid_name(name: &[u8]) -> bool {
+    match name.split_first() {
+        Some((&first, rest)) if first == b'_' || first.is_ascii_alphabetic() => {
+            rest.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric())
         }
-
-        util_args.push(String::from(s));
+        _ => false,
     }
-
-    (envs, util_args)
 }
 
-fn merge_env(new_env: &[String], clear: bool) -> BTreeMap<String, String> {
+/// Split a `name=value` operand at its first '=', if the part before it is a
+/// valid name. Bytes, not text: neither part need be valid UTF-8.
+fn split_assignment(op: &OsStr) -> Option<(&OsStr, &OsStr)> {
+    let bytes = op.as_bytes();
+    let eq = bytes.iter().position(|&b| b == b'=')?;
+    let (name, value) = (&bytes[..eq], &bytes[eq + 1..]);
+    is_valid_name(name).then(|| (OsStr::from_bytes(name), OsStr::from_bytes(value)))
+}
+
+/// Split the operands into the leading assignments and the utility with its
+/// arguments.
+fn separate_ops(sv: &[OsString]) -> (&[OsString], &[OsString]) {
+    let n_envs = sv
+        .iter()
+        .take_while(|s| split_assignment(s).is_some())
+        .count();
+    sv.split_at(n_envs)
+}
+
+fn merge_env(new_env: &[OsString], clear: bool) -> BTreeMap<OsString, OsString> {
     let mut map = BTreeMap::new();
 
     if !clear {
-        for (key, value) in env::vars() {
-            map.insert(key, value);
-        }
+        // `vars_os`, not `vars`: an inherited entry need not be valid UTF-8,
+        // and `vars` panics on one that is not.
+        map.extend(env::vars_os());
     }
 
     for env_op in new_env {
-        let (key, value) = env_op.split_once('=').unwrap();
-        map.insert(String::from(key), String::from(value));
+        let (key, value) = split_assignment(env_op).expect("separate_ops checked it");
+        map.insert(key.to_os_string(), value.to_os_string());
     }
 
     map
 }
 
-fn print_env(envs: &BTreeMap<String, String>) {
+/// Write each `name=value` as its raw bytes, one per line.
+fn print_env(envs: &BTreeMap<OsString, OsString>) -> io::Result<()> {
     // BTreeMap iterates in sorted key order, giving deterministic output.
+    let mut out = BufWriter::new(io::stdout().lock());
     for (key, value) in envs {
-        println!("{}={}", key, value);
+        out.write_all(key.as_bytes())?;
+        out.write_all(b"=")?;
+        out.write_all(value.as_bytes())?;
+        out.write_all(b"\n")?;
     }
+    out.flush()
 }
 
-fn exec_util(envs: &BTreeMap<String, String>, util_args: &[String]) -> ! {
+fn exec_util(envs: &BTreeMap<OsString, OsString>, util_args: &[OsString]) -> ! {
     let err = Command::new(&util_args[0])
         .args(&util_args[1..])
         .stdin(Stdio::inherit())
@@ -118,7 +118,7 @@ fn exec_util(envs: &BTreeMap<String, String>, util_args: &[String]) -> ! {
         .exec();
 
     // exec() only returns on failure.
-    exec_error_exit(&util_args[0], err)
+    exec_error_exit(&util_args[0].to_string_lossy(), err)
 }
 
 fn main() {
@@ -127,12 +127,15 @@ fn main() {
     let args = plib::optarg::parse::<Args>();
 
     let (envs, util_args) = separate_ops(&args.operands);
-    let new_env = merge_env(&envs, args.ignore_env);
+    let new_env = merge_env(envs, args.ignore_env);
 
     if util_args.is_empty() {
-        print_env(&new_env);
+        if let Err(e) = print_env(&new_env) {
+            diag::error(&format!("write error: {}", diag::io_error_text(&e)));
+            std::process::exit(1);
+        }
         return;
     }
 
-    exec_util(&new_env, &util_args);
+    exec_util(&new_env, util_args);
 }

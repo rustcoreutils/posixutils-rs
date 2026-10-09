@@ -228,6 +228,44 @@ dh_installexamples), with GNU cp's meaning:
    quoted as GNU coreutils quotes them.  sysvinit installs with
    `cp -afv etc/* $(DESTDIR)...`.
 
+#### Existing directories under `-p`
+
+`cp -p` (and `-a`) and `pax -p` give a directory that already existed in the
+destination what `-p` asks for -- its mode and owner from the source -- only
+where nobody but the user could have created its name: in its parent and in
+every directory above it, up to the destination the user named.  Elsewhere it
+keeps its mode, owner and times, its contents are still copied, a diagnostic
+names it, and the exit status is 1.  Without a mode or owner asked for it gets
+its times only, as by default.  GNU cp and libarchive do no such check.
+
+A directory counts as one nobody else can create entries in when it is the
+user's, grants no other write permission (sticky or not), grants group write
+permission only for the user's private group -- its primary group, named as
+the user, listing no other member -- and carries no ACL that lets others
+write.  This fails closed, with the diagnostic and exit 1, wherever it cannot
+tell:
+
+ * an NFSv4 or CIFS ACL (`system.nfs4_acl`, `system.nfs4_acl_xdr`,
+   `system.cifs_acl`), whose entries are not evaluated;
+ * group write permission for a group the user shares -- a primary group that
+   is not a user-private group, as under a umask of 002 without user private
+   groups;
+ * an ACL attribute, or the user and group databases, that cannot be read.
+
+On Linux, root working in another user's tree -- extracting into
+`/home/alice`, which alice owns -- also trusts that one user's directories, as
+the user's own: every directory below root's own must be alice's alone, and
+so must every directory above where her tree starts, up to one of root's, and
+each directory found there must itself be hers.  Elsewhere, where ACLs are
+not read, root trusts only its own directories.
+
+What is not seen: groups granted outside the user and group databases
+(`pam_group`, systemd `SupplementaryGroups=`); another account given the
+user's primary gid (accounts are not enumerated); a second entry for the same
+gid, in a later NSS source or a second `/etc/group` line; a group password;
+a macOS ACL; and, in another user's tree, a move of that user's own
+directories timed against the lazy check above it.
+
 ### cpio
 
 The whole utility is an addition: a compatibility front-end over `pax`
@@ -611,6 +649,8 @@ Debian source packages, with GNU patch's meaning:
    asked for (script or `/dev/tty`) rather than taken for the end.  Reads GNU
    volume labels and `'M'` continuation headers; writes whole members per
    volume.  Written in ustar format only, and incompatible with `-z`.
+ * `-p` on a directory that already existed follows the rule under
+   [cp, existing directories under `-p`](#existing-directories-under--p).
  * `-x bcpio`, `-x sv4cpio`, `-x sv4crc` — the historic pax names for the old
    binary cpio header and the SVR4 "newc" headers without and with a data
    checksum.  POSIX names only `cpio` (odc), `pax` and `ustar`.  All three are

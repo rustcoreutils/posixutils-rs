@@ -737,6 +737,12 @@ const MAX_CLIMB: usize = 4096;
 /// that directory is now, never a path -- and fails closed: a `..` that cannot be opened or
 /// read, the root of the file hierarchy reached without one of root's directories, or more
 /// than `MAX_CLIMB` levels, and the tree is not trusted.
+///
+/// Residual: the climb runs once, lazily, when a mode or owner is first asked of a directory
+/// found in the tree -- not when the anchor was opened. Where the named path already crosses
+/// a directory others can write, whoever can write it can move the tree between the open and
+/// the climb, and time the climb to see the tree where it rests on root's own. What they can
+/// move there is only their own directory: only directories of theirs are affected.
 fn rests_on_roots_own(fd: RawFd, owner: u32) -> bool {
     let id = |st: &libc::stat| (st.st_dev, st.st_ino);
     let Ok(st) = fstat(fd) else {
@@ -898,7 +904,8 @@ fn acl_names_others(xattr: &[u8]) -> bool {
 ///   is out of the user's reach to read, and is not considered.
 /// - A group lookup returns the entry of the first NSS source that has the gid: a group of the same
 ///   gid in a later source, listing others -- an administrator's misconfiguration -- is not
-///   seen.
+///   seen. Nor is a second line for the same gid in the same source (`/etc/group` holding
+///   two), listing others: the lookup returns the first.
 pub fn is_private_group(gid: u32, euid: u32) -> bool {
     #[cfg(feature = "test-hooks")]
     PRIVATE_GROUP_QUERIES.with(|queries| queries.set(queries.get() + 1));

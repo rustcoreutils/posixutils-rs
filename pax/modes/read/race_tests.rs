@@ -895,3 +895,22 @@ fn a_link_member_whose_name_is_taken_at_once_leaves_a_tombstone() {
     let g = MemberPath::parse(Path::new("g")).unwrap().unwrap().key();
     assert!(matches!(links.made.get(&g), Some(super::Record::Failed)));
 }
+
+/// A later member of a name -i renamed, turned away -- by a pattern, -u, or
+/// -i's skip -- is still the latest member of that name: the earlier rename
+/// no longer applies to a link member naming it. The name is taken after -s.
+#[test]
+fn a_member_turned_away_ends_an_earlier_rename() {
+    let mut links = super::Links::new();
+    links.named(Some(Path::new("f")), Path::new("renamed"));
+    links.turned_away(PathBuf::from("f"), &ReadOptions::default());
+    assert_eq!(links.link_target(PathBuf::from("f")), PathBuf::from("f"));
+
+    links.named(Some(Path::new("f")), Path::new("renamed"));
+    let options = ReadOptions {
+        substitutions: vec![crate::subst::Substitution::parse(",^x$,f,").unwrap()],
+        ..Default::default()
+    };
+    links.turned_away(PathBuf::from("x"), &options);
+    assert_eq!(links.link_target(PathBuf::from("f")), PathBuf::from("f"));
+}

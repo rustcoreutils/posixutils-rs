@@ -153,6 +153,9 @@ fn extract_members<R: ArchiveReader>(
             records.apply(&mut entry);
         }
         links.sets.count_name(&entry);
+        // Under -i, a member turned away still ends an earlier rename of its
+        // name (`Links::turned_away`).
+        let original = (!links.aliases.is_empty()).then(|| entry.path.clone());
         let mut renamed_from = None;
         let selected = select_member(
             &mut selector,
@@ -164,6 +167,8 @@ fn extract_members<R: ArchiveReader>(
         )?;
         if selected {
             links.named(renamed_from.as_deref(), &entry.path);
+        } else if let Some(original) = original {
+            links.turned_away(original, options);
         }
         if selected {
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
@@ -675,6 +680,18 @@ impl Links {
                     self.aliases.remove(&own);
                 }
             }
+        }
+    }
+
+    /// A member at `original` (its name in the archive) was turned away -- by
+    /// a pattern, -u, or -i's skip. It is still the latest member of its
+    /// name, which a link member naming it refers to, and it was not
+    /// extracted: an earlier rename of the name no longer applies. Its name
+    /// after -s (and --strip-components) is what renames are kept under.
+    fn turned_away(&mut self, original: PathBuf, options: &ReadOptions) {
+        let mut named = ArchiveEntry::new(original, EntryType::Regular);
+        if rename_member(&mut named, &options.substitutions, options.strip_components) {
+            self.named(None, &named.path);
         }
     }
 

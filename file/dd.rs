@@ -8,8 +8,10 @@
 //
 
 use gettextrs::gettext;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEF_BLOCK_SIZE: usize = 512;
@@ -123,8 +125,8 @@ impl Stats {
 }
 
 struct Config {
-    ifile: String,
-    ofile: String,
+    ifile: OsString,
+    ofile: OsString,
     ibs: usize,
     obs: usize,
     cbs: usize,
@@ -647,26 +649,28 @@ fn parse_block_size(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(result)
 }
 
-fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> {
+fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>> {
     let mut config = Config::default();
 
     for arg in args {
-        // Split arg into option and argument
-        let (op, oparg) = {
-            match arg.split_once('=') {
-                None => {
-                    let msg = format!("{}: {}", gettext("invalid option"), arg);
-                    eprintln!("{}", msg);
-                    return Err(msg.into());
-                }
-                Some((opt, optarg)) => (opt, optarg.to_string()),
-            }
+        // Split arg into option and argument.  A file name is taken as bytes;
+        // every other operand is ASCII, so one that is not valid UTF-8 comes
+        // out of the lossy conversion as an invalid operand.
+        let bytes = arg.as_bytes();
+        let Some(eq) = bytes.iter().position(|&b| b == b'=') else {
+            let msg = format!("{}: {}", gettext("invalid option"), arg.to_string_lossy());
+            eprintln!("{}", msg);
+            return Err(msg.into());
         };
+        let op = String::from_utf8_lossy(&bytes[..eq]);
+        let op = op.as_ref();
+        let raw_oparg = OsStr::from_bytes(&bytes[eq + 1..]);
+        let oparg = raw_oparg.to_string_lossy().into_owned();
 
         // per-option processing
         match op {
-            "if" => config.ifile = oparg,
-            "of" => config.ofile = oparg,
+            "if" => config.ifile = raw_oparg.to_os_string(),
+            "of" => config.ofile = raw_oparg.to_os_string(),
             "ibs" => config.ibs = parse_block_size(&oparg)?,
             "obs" => config.obs = parse_block_size(&oparg)?,
             "bs" => {
@@ -723,7 +727,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let config = parse_cmdline(&args)?;
 
     let stats = copy_convert_file(&config)?;

@@ -1026,3 +1026,62 @@ fn find_reports_write_error() {
     plib::testing::assert_write_error_on_full_device("find", &[path], b"", 1);
     plib::testing::assert_write_error_on_full_device("find", &[path, "-print0"], b"", 1);
 }
+
+// A starting point, and a file name handed to -exec, are passed through byte
+// for byte; a non-UTF-8 starting point made find panic, and {} was replaced
+// by a lossy copy of the name, which named a different file.
+#[test]
+fn find_non_utf8_path_and_exec() {
+    use plib::testing::os_bytes;
+    let dir = tempdir().unwrap();
+    let top = dir.path().join(os_bytes(b"top\xff"));
+    std::fs::create_dir(&top).unwrap();
+    File::create(top.join(os_bytes(b"f\xfe"))).unwrap();
+
+    let output = Command::new(get_binary_path("find"))
+        .arg(&top)
+        .args([
+            "-type",
+            "f",
+            "-exec",
+            "sh",
+            "-c",
+            "printf '%s\\n' \"${1##*/}\"",
+            "sh",
+            "{}",
+            ";",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"f\xfe\n");
+
+    let output = Command::new(get_binary_path("find"))
+        .arg(&top)
+        .args(["-type", "f", "-exec", "ls", "{}", "+"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let mut expected = top
+        .join(os_bytes(b"f\xfe"))
+        .into_os_string()
+        .into_encoded_bytes();
+    expected.push(b'\n');
+    assert_eq!(output.stdout, expected);
+}
+
+// An expression operand that is not valid UTF-8 is reported as an error,
+// not a panic.
+#[test]
+fn find_non_utf8_expression_operand_is_an_error() {
+    use plib::testing::os_bytes;
+    let dir = tempdir().unwrap();
+    let output = Command::new(get_binary_path("find"))
+        .arg(dir.path())
+        .arg("-name")
+        .arg(os_bytes(b"x\xff"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.starts_with(b"find: "), "{output:?}");
+}

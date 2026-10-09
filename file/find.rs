@@ -8,7 +8,7 @@
 //
 
 use std::cell::RefCell;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, Write as IoWrite};
 use std::os::unix::ffi::OsStrExt;
@@ -337,18 +337,21 @@ impl FindState {
 }
 
 /// Parse command line arguments, returning (symlink_mode, paths, expression)
-fn parse_args(args: &[String]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), String> {
+///
+/// A starting point is a pathname and is taken byte for byte.  The expression
+/// is parsed as text, so an operand in it that is not valid UTF-8 is an error.
+fn parse_args(args: &[OsString]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), String> {
     let mut symlink_mode = SymlinkMode::Never;
     let mut idx = 1; // skip program name
 
     // Parse options (-H, -L)
     while idx < args.len() {
-        match args[idx].as_str() {
-            "-H" => {
+        match args[idx].as_bytes() {
+            b"-H" => {
                 symlink_mode = SymlinkMode::CommandLineOnly;
                 idx += 1;
             }
-            "-L" => {
+            b"-L" => {
                 symlink_mode = SymlinkMode::Always;
                 idx += 1;
             }
@@ -361,7 +364,7 @@ fn parse_args(args: &[String]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), Stri
     while idx < args.len() {
         let arg = &args[idx];
         // Expression starts with -, !, or (
-        if arg.starts_with('-') || arg == "!" || arg == "(" {
+        if arg.as_bytes().starts_with(b"-") || arg == "!" || arg == "(" {
             break;
         }
         paths.push(PathBuf::from(arg));
@@ -374,7 +377,18 @@ fn parse_args(args: &[String]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), Stri
     }
 
     // Parse expression
-    let expr_args: Vec<&str> = args[idx..].iter().map(|s| s.as_str()).collect();
+    let expr_args = args[idx..]
+        .iter()
+        .map(|s| {
+            s.to_str().ok_or_else(|| {
+                format!(
+                    "{}: {}",
+                    s.to_string_lossy(),
+                    gettext("expression operand is not valid UTF-8")
+                )
+            })
+        })
+        .collect::<Result<Vec<&str>, String>>()?;
     let expr = parse_expression(&expr_args)?;
 
     Ok((symlink_mode, paths, expr))
@@ -1107,6 +1121,18 @@ fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult
     }
 }
 
+/// The arguments of `-exec` or `-ok`, with each `{}` replaced by `path` as it
+/// is, bytes and all.
+fn expand_braces<'a>(args: &'a [String], path: &'a Path) -> impl Iterator<Item = &'a OsStr> {
+    args.iter().map(move |a| {
+        if a == "{}" {
+            path.as_os_str()
+        } else {
+            OsStr::new(a.as_str())
+        }
+    })
+}
+
 /// Evaluate a single primary
 fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState) -> EvalResult {
     match primary {
@@ -1213,20 +1239,11 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
         Primary::Exec(mode) => {
             match mode {
                 ExecMode::Single { utility, args } => {
-                    // Replace {} with pathname
-                    let expanded_args: Vec<String> = args
-                        .iter()
-                        .map(|a| {
-                            if a == "{}" {
-                                ctx.path.to_string_lossy().to_string()
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect();
-
                     flush_stdout();
-                    match Command::new(utility).args(&expanded_args).status() {
+                    match Command::new(utility)
+                        .args(expand_braces(args, ctx.path))
+                        .status()
+                    {
                         Ok(status) => EvalResult::new(status.success()),
                         Err(e) => {
                             eprintln!("find: '{}': {}", utility, plib::diag::io_error_text(&e));
@@ -1258,20 +1275,11 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                 return EvalResult::new(false);
             }
 
-            // Replace {} with pathname and execute
-            let expanded_args: Vec<String> = args
-                .iter()
-                .map(|a| {
-                    if a == "{}" {
-                        ctx.path.to_string_lossy().to_string()
-                    } else {
-                        a.clone()
-                    }
-                })
-                .collect();
-
             flush_stdout();
-            match Command::new(utility).args(&expanded_args).status() {
+            match Command::new(utility)
+                .args(expand_braces(args, ctx.path))
+                .status()
+            {
                 Ok(status) => EvalResult::new(status.success()),
                 Err(e) => {
                     eprintln!("find: '{}': {}", utility, plib::diag::io_error_text(&e));
@@ -1676,7 +1684,7 @@ fn execute_batches(state: &mut FindState) {
 }
 
 /// Main find function
-fn find(args: Vec<String>) -> Result<i32, String> {
+fn find(args: Vec<OsString>) -> Result<i32, String> {
     let (symlink_mode, paths, mut expr) = parse_args(&args)?;
 
     // If no action, wrap with implicit -print per POSIX
@@ -1729,7 +1737,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("find");
 
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<OsString> = std::env::args_os().collect();
 
     match find(args) {
         Ok(code) => std::process::exit(code),

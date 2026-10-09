@@ -658,3 +658,42 @@ fn test_seek_sets_output_size_unless_notrunc() {
     want[1024..1027].copy_from_slice(b"xyz");
     assert_eq!(std::fs::read(&out).unwrap(), want);
 }
+
+// if= and of= name files byte for byte; a name that is not valid UTF-8 made
+// dd panic.
+#[test]
+fn test_dd_non_utf8_file_names() {
+    use plib::testing::{get_binary_path, os_bytes};
+    use std::ffi::OsString;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let input = dir.path().join(os_bytes(b"in\xff"));
+    let output = dir.path().join(os_bytes(b"out\xfe"));
+    std::fs::write(&input, b"hello\n").unwrap();
+
+    let mut if_arg = OsString::from("if=");
+    if_arg.push(&input);
+    let mut of_arg = OsString::from("of=");
+    of_arg.push(&output);
+    let run = std::process::Command::new(get_binary_path("dd"))
+        .args([if_arg, of_arg])
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(std::fs::read(&output).unwrap(), b"hello\n");
+}
+
+// An operand that is not valid UTF-8 outside a file name is an invalid
+// operand, reported with a failing status rather than a panic.
+#[test]
+fn test_dd_non_utf8_operand_is_an_error() {
+    use plib::testing::{get_binary_path, os_bytes};
+    for arg in [&b"bs=1\xff"[..], b"x\xff=1", b"conv=\xff"] {
+        let run = std::process::Command::new(get_binary_path("dd"))
+            .arg(os_bytes(arg))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(run.status.code(), Some(1), "{arg:?}: {run:?}");
+    }
+}

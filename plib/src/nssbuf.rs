@@ -56,10 +56,16 @@ pub(crate) fn lookup<E, T>(
         let mut result: *mut E = ptr::null_mut();
         match call(entry.as_mut_ptr(), &mut buf, &mut result) {
             0 if result.is_null() => return Ok(None),
-            // SAFETY: on success `result` points at `entry`, which the call
-            // filled in, and every pointer inside it points into `buf`; both
-            // outlive `convert`.
-            0 => return Ok(Some(convert(unsafe { &*result }))),
+            0 => {
+                // The `_r` functions report a found entry by pointing `result`
+                // at the caller's own `entry`; it is only ever compared here,
+                // never read through.
+                debug_assert_eq!(result, entry.as_mut_ptr());
+                // SAFETY: a zero return with a non-null result means the call
+                // filled in `entry`, and every pointer inside it points into
+                // `buf`; both outlive `convert`.
+                return Ok(Some(convert(unsafe { entry.assume_init_ref() })));
+            }
             libc::EINTR => continue,
             libc::ERANGE if len < MAX_LEN => len = (len * 2).min(MAX_LEN),
             errno => return Err(io::Error::from_raw_os_error(errno)),

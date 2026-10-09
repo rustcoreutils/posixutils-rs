@@ -229,7 +229,7 @@ append   = { ">>" ~ expr }
 pipe     = { "|" ~ expr }
 
 print_expr_list    = _{ print_expr ~ ("," ~ opt_newline ~ print_expr)* }
-expr_list          = _{ multiple_expr_list | expr }
+expr_list          = _{ expr ~ ("," ~ opt_newline ~ expr)* }
 multiple_expr_list = _{ expr ~ ("," ~ opt_newline ~ expr)+ }
 
 primary = _{
@@ -313,16 +313,19 @@ eq = { "==" }
 gt = { ">" }
 ge = { ">=" }
 
+// A group with a top-level comma is never a primary, so trying the simple
+// form first costs `(i, j) in a` one short failed parse, not a re-parse of
+// every parenthesised expression.
 binary_expr = {
-    multidimensional_in
-  | simple_binary_expr
+    simple_binary_expr
+  | multidimensional_in
 }
 
 multidimensional_in    = { "(" ~ multidimensional_index ~ ")" ~ "in" ~ name }
 simple_binary_expr     = { prefix_op? ~ primary ~ postfix_op? ~ (infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
 multidimensional_index = { multiple_expr_list }
 
-ternary_expr = { binary_expr ~ "?" ~ expr ~ ":" ~ expr }
+ternary_expr = { binary_expr ~ ("?" ~ expr ~ ":" ~ expr)? }
 
 assignment = { lvalue ~ assignment_op ~ expr }
 
@@ -344,12 +347,12 @@ div_assign = { "/=" }
 mod_assign = { "%=" }
 pow_assign = { "^=" }
 
-expr = {
-    input_function
-  | assignment
-  | ternary_expr
-  | binary_expr
-}
+// Alternatives that share a prefix are factored, never retried: a choice
+// that re-parses a nested `( expr )` after a later failure makes parsing
+// time exponential in the nesting depth.  So `getline_from_pipe` and
+// `ternary_expr` also stand for the plain expression without their `|
+// getline` or `? :` tail.
+expr = { input_function }
 
 lvalue = {
     array_element
@@ -360,10 +363,8 @@ lvalue = {
 field_var = { "$" ~ prefix_op* ~ primary ~ postfix_op* }
 
 input_function = {
-    getline_from_pipe
-  | getline_from_file_cmp
-  | getline_from_file
-  | simple_getline
+    getline_from_file_cmp
+  | getline_from_pipe
 }
 
 getline_from_file_cmp = { kw ~ "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr ~ comp_op ~ expr }
@@ -372,14 +373,13 @@ simple_getline    = { kw ~ "getline" ~ lvalue? }
 getline_from_file = { kw ~ "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr }
 
 simple_getline_file_expr = { prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
-getline_from_pipe = { unpiped_expr ~ (piped_getline)+ }
+getline_from_pipe = { unpiped_expr ~ piped_getline* }
 piped_getline     = { "|" ~ kw ~ "getline" ~ lvalue? }
 
 unpiped_expr           = {
     unpiped_input_function
   | assignment
   | ternary_expr
-  | binary_expr
 }
 unpiped_input_function = {
     getline_from_file
@@ -404,15 +404,14 @@ simple_binary_print_expr =  {
     prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)*
 }
 binary_print_expr        =  {
-    multidimensional_in
-  | simple_binary_print_expr
+    simple_binary_print_expr
+  | multidimensional_in
 }
 
 print_assignment   = { lvalue ~ assignment_op ~ print_expr }
-ternary_print_expr = { binary_print_expr ~ "?" ~ print_expr ~ ":" ~ print_expr }
+ternary_print_expr = { binary_print_expr ~ ("?" ~ print_expr ~ ":" ~ print_expr)? }
 
 print_expr = {
     print_assignment
   | ternary_print_expr
-  | binary_print_expr
 }

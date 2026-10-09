@@ -1126,6 +1126,10 @@ impl Compiler {
             Rule::getline_from_pipe => {
                 let mut inner = input_function.into_inner();
                 let unpiped_expr = inner.next().unwrap();
+                if inner.peek().is_none() {
+                    // no `| getline`: a plain expression
+                    return self.compile_expr(unpiped_expr, instructions, locals);
+                }
                 let mut lvalues = Vec::new();
                 for piped_getline in inner {
                     lvalues.push(piped_getline.into_inner().next());
@@ -1205,6 +1209,10 @@ impl Compiler {
                 let line_col = expr.line_col();
                 let mut inner = expr.into_inner();
                 self.compile_binary_expr(inner.next().unwrap(), instructions, locals)?;
+                if inner.peek().is_none() {
+                    // no `? :`: a plain binary expression
+                    return Ok(());
+                }
                 let mut true_expr_instructions = Instructions::default();
                 self.compile_expr(inner.next().unwrap(), &mut true_expr_instructions, locals)?;
                 instructions.push(

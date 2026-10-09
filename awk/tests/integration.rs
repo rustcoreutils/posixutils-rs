@@ -1474,3 +1474,56 @@ fn awk_numeric_string_is_the_whole_field() {
         expected_exit_code: 0,
     });
 }
+
+// Parsing must not take time exponential in how deeply expressions nest.
+// Each parenthesised level was parsed about eight times over, by the
+// alternatives that failed (`| getline`, `? :`, `(i, j) in`) before the one
+// that matched, so five levels took a second and eight never finished.
+#[test]
+fn awk_deeply_nested_expressions_parse_quickly() {
+    let depth = 40;
+    let nested =
+        |open: &str, close: &str| format!("{}1{}", open.repeat(depth), close.repeat(depth));
+    let cases = [
+        (format!("BEGIN {{ print {} }}", nested("(", ")")), "1\n"),
+        (
+            format!("BEGIN {{ x = {}; print x }}", nested("(", ")")),
+            "1\n",
+        ),
+        (
+            format!("BEGIN {{ print {} + 1 }}", nested("-(", ")")),
+            "2\n",
+        ),
+        (
+            format!("BEGIN {{ print {} }}", nested("length(", ")")),
+            "1\n",
+        ),
+        (
+            format!("BEGIN {{ print {} }}", nested("(1 ? ", " : 0)")),
+            "1\n",
+        ),
+        (
+            format!(
+                "BEGIN {{ a[1, 2]; if (({}, 2) in a) print \"in\" }}",
+                nested("(", ")")
+            ),
+            "in\n",
+        ),
+        (
+            format!(
+                "BEGIN {{ while ((\"echo x\" | getline v) > 0) print {} v }}",
+                nested("(", ")")
+            ),
+            "1x\n",
+        ),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline(&program);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}

@@ -461,11 +461,10 @@ fn handle_lookup(registry: &InvitationRegistry, msg: &CtlMsg) -> CtlRes {
 /// Returns the `Answer` to report to the caller.
 fn announce_to_tty(caller: &str, callee: &str, requested_tty: &str) -> Answer {
     // The callee must exist in the password database.
-    let c_callee = match CString::new(callee) {
-        Ok(c) => c,
-        Err(_) => return Answer::Failed,
-    };
-    if unsafe { libc::getpwnam(c_callee.as_ptr()).is_null() } {
+    if callee.contains('\0') {
+        return Answer::Failed;
+    }
+    if plib::user::get_by_name(callee).is_none() {
         return Answer::NotHere;
     }
 

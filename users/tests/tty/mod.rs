@@ -15,7 +15,8 @@
 //! - --help and --version options
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
@@ -28,46 +29,18 @@ static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 // PTY Helper Functions
 // ============================================================================
 
-/// Create a PTY pair, returns (master_fd, slave_path)
-fn create_pty() -> Result<(i32, String), String> {
-    unsafe {
-        let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-        if master_fd < 0 {
-            return Err(format!(
-                "posix_openpt failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        if libc::grantpt(master_fd) < 0 {
-            libc::close(master_fd);
-            return Err(format!(
-                "grantpt failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        if libc::unlockpt(master_fd) < 0 {
-            libc::close(master_fd);
-            return Err(format!(
-                "unlockpt failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        let slave_name = libc::ptsname(master_fd);
-        if slave_name.is_null() {
-            libc::close(master_fd);
-            return Err(format!(
-                "ptsname failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        let slave_path = CStr::from_ptr(slave_name).to_string_lossy().into_owned();
-
-        Ok((master_fd, slave_path))
-    }
+/// Create a PTY pair, returns (master_fd, slave, slave_path).
+///
+/// The slave stays open for as long as the caller holds it: on macOS a pty
+/// whose slave has been opened and closed again cannot be reopened.
+fn create_pty() -> Result<(i32, OwnedFd, String), String> {
+    let (master_fd, slave_fd, slave_path) = crate::common::open_pty_pair()?;
+    // SAFETY: open_pty_pair hands over ownership of both descriptors.
+    Ok((
+        master_fd,
+        unsafe { OwnedFd::from_raw_fd(slave_fd) },
+        slave_path,
+    ))
 }
 
 /// Set a file descriptor to non-blocking mode
@@ -115,7 +88,7 @@ struct TtyTestResult {
 /// Run the tty utility with stdin connected to a PTY slave and capture output.
 fn run_tty_with_pty(tty_path: &str) -> Result<TtyTestResult, String> {
     // Create PTY pair
-    let (master_fd, slave_path) = create_pty()?;
+    let (master_fd, _slave, slave_path) = create_pty()?;
 
     // Set master to non-blocking for reading output
     set_nonblocking(master_fd)?;
@@ -427,8 +400,8 @@ fn test_tty_pty_output_is_slave_path() {
     };
 
     // Create PTY to get the expected slave path
-    let (master_fd, slave_path) = match create_pty() {
-        Ok((m, s)) => (m, s),
+    let (master_fd, _slave, slave_path) = match create_pty() {
+        Ok(pty) => pty,
         Err(e) => {
             eprintln!("Skipping PTY test: {}", e);
             return;

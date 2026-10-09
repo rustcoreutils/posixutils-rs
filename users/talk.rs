@@ -13,8 +13,8 @@ use thiserror::Error;
 #[cfg(target_os = "linux")]
 use libc::sa_family_t;
 use libc::{
-    gethostname, getpid, getpwuid, getservbyname, getuid, ioctl, signal, winsize, AF_INET, SIGINT,
-    SIGPIPE, SIGQUIT, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
+    gethostname, getpid, getservbyname, getuid, ioctl, signal, winsize, AF_INET, SIGINT, SIGPIPE,
+    SIGQUIT, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
 };
 
 use std::{
@@ -1440,23 +1440,18 @@ fn handle_new_invitation(
 /// A `Result` containing the login name as a `String` on success,
 /// or an `io::Error` if the user cannot be found.
 fn get_current_user_name() -> Result<String, io::Error> {
-    unsafe {
-        let login_name = libc::getlogin();
-        if !login_name.is_null() {
-            Ok(CStr::from_ptr(login_name).to_string_lossy().into_owned())
-        } else {
-            let pw = getpwuid(getuid());
-            // If no user information is found, return an error.
-            if pw.is_null() {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "You don't exist. Go away.",
-                ))
-            } else {
-                // Convert the pw_name (user name) from the passwd struct to a Rust String.
-                Ok(CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned())
-            }
-        }
+    if let Some(login_name) = plib::curuser::login_name_strict() {
+        return Ok(login_name);
+    }
+    // SAFETY: getuid never fails.
+    let uid = unsafe { getuid() };
+    match plib::user::get_by_uid(uid) {
+        Some(pw) => Ok(pw.name.to_string_lossy().into_owned()),
+        // If no user information is found, return an error.
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "You don't exist. Go away.",
+        )),
     }
 }
 

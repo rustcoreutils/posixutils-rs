@@ -9,26 +9,28 @@
 
 use clap::Parser;
 use gettextrs::gettext;
-use libc::{getgid, getgroups, getlogin, getpwnam, getpwuid, getuid, gid_t, passwd};
+use libc::{getgid, getgroups, getuid, gid_t};
 
 #[cfg(target_os = "linux")]
 use libc::{ECHO, ECHONL, TCSANOW};
 #[cfg(target_os = "linux")]
 use libcrypt_rs::Crypt;
 use plib::group::Group;
+use plib::user::{self, User};
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CString, OsString};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{self, Command};
 
 #[cfg(target_os = "linux")]
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader},
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    os::unix::ffi::OsStringExt,
     os::unix::io::AsRawFd,
 };
 
@@ -94,7 +96,7 @@ fn run(args: &Args) -> ! {
 
 /// Change the process group identity per the operand, or restore the user's
 /// login groups when no operand is given.
-fn change_group(args: &Args, pwd: &passwd) -> Result<(), String> {
+fn change_group(args: &Args, pwd: &User) -> Result<(), String> {
     match args.group.as_deref() {
         None => restore_login_groups(pwd),
         Some(id) => switch_to_group(id.trim(), pwd),
@@ -103,17 +105,19 @@ fn change_group(args: &Args, pwd: &passwd) -> Result<(), String> {
 
 /// With no operand, restore the effective/real group to the user's primary
 /// group and the supplementary list to the user's group-database entries.
-fn restore_login_groups(pwd: &passwd) -> Result<(), String> {
+fn restore_login_groups(pwd: &User) -> Result<(), String> {
     // initgroups() needs to run while privileged; it sets the supplementary
     // list (including the base gid) from the group database.
-    if unsafe { libc::initgroups(pwd.pw_name, pwd.pw_gid as _) } != 0 {
+    let name = CString::new(pwd.name.as_bytes())
+        .map_err(|_| gettext("cannot restore supplementary groups"))?;
+    if unsafe { libc::initgroups(name.as_ptr(), pwd.gid as _) } != 0 {
         return Err(format!(
             "{}: {}",
             gettext("cannot restore supplementary groups"),
             io::Error::last_os_error()
         ));
     }
-    if unsafe { libc::setgid(pwd.pw_gid) } != 0 {
+    if unsafe { libc::setgid(pwd.gid) } != 0 {
         return Err(format!(
             "{}: {}",
             gettext("cannot restore group ID"),
@@ -125,7 +129,7 @@ fn restore_login_groups(pwd: &passwd) -> Result<(), String> {
 
 /// Switch to the named/numeric group: resolve it, check permission (possibly
 /// prompting for the group password), then apply the change.
-fn switch_to_group(identifier: &str, pwd: &passwd) -> Result<(), String> {
+fn switch_to_group(identifier: &str, pwd: &User) -> Result<(), String> {
     let groups = plib::group::load();
     let group = find_matching_group(identifier, &groups)
         .ok_or_else(|| format!("{}: {}", gettext("no such group"), identifier))?;
@@ -184,48 +188,38 @@ fn apply_group_change(new_gid: gid_t) -> Result<(), String> {
 /// `-name`, HOME/SHELL/USER/LOGNAME set, working directory = HOME). The default
 /// (non-login) form retains the current environment and working directory and
 /// honors $SHELL.
-fn exec_shell(login: bool, pwd: &passwd) -> ! {
-    let pw_shell = unsafe { CStr::from_ptr(pwd.pw_shell) }
-        .to_str()
-        .unwrap_or("");
+fn exec_shell(login: bool, pwd: &User) -> ! {
+    let pw_shell = pwd.shell.as_os_str();
+    let default_shell = || {
+        if pw_shell.is_empty() {
+            OsString::from("/bin/sh")
+        } else {
+            pw_shell.to_os_string()
+        }
+    };
 
     let shell = if login {
-        if pw_shell.is_empty() {
-            "/bin/sh".to_string()
-        } else {
-            pw_shell.to_string()
-        }
+        default_shell()
     } else {
-        std::env::var("SHELL")
-            .ok()
+        std::env::var_os("SHELL")
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                if pw_shell.is_empty() {
-                    "/bin/sh".to_string()
-                } else {
-                    pw_shell.to_string()
-                }
-            })
+            .unwrap_or_else(default_shell)
     };
 
     let mut cmd = Command::new(&shell);
 
     if login {
-        let base = Path::new(&shell)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(shell.as_str());
+        let base = Path::new(&shell).file_name().unwrap_or(&shell);
         // Login shells receive argv0 prefixed with '-'.
-        cmd.arg0(format!("-{}", base));
+        let mut argv0 = OsString::from("-");
+        argv0.push(base);
+        cmd.arg0(argv0);
 
-        let home = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_str().unwrap_or("");
-        let user = unsafe { CStr::from_ptr(pwd.pw_name) }
-            .to_str()
-            .unwrap_or("");
+        let home = pwd.dir.as_os_str();
         cmd.env("HOME", home)
             .env("SHELL", &shell)
-            .env("USER", user)
-            .env("LOGNAME", user);
+            .env("USER", &pwd.name)
+            .env("LOGNAME", &pwd.name);
         if !home.is_empty() {
             cmd.current_dir(home);
         }
@@ -233,7 +227,7 @@ fn exec_shell(login: bool, pwd: &passwd) -> ! {
 
     // exec() only returns on failure.
     let err = cmd.exec();
-    plib::exec::exec_error_exit(&shell, err);
+    plib::exec::exec_error_exit(&shell.to_string_lossy(), err);
 }
 
 /// Retrieves the current supplementary group IDs for the calling process.
@@ -268,33 +262,20 @@ fn set_supplementary_gids(gids: &[gid_t]) -> Result<(), io::Error> {
 
 /// Retrieves the password entry for the current user based on the login name
 /// or user ID (UID).
-fn get_password() -> Result<passwd, io::Error> {
-    unsafe {
-        let login_ptr = getlogin();
-        let ruid = getuid();
+fn get_password() -> Result<User, io::Error> {
+    // SAFETY: getuid never fails.
+    let ruid = unsafe { getuid() };
 
-        if !login_ptr.is_null() {
-            if let Ok(login_name) = CStr::from_ptr(login_ptr).to_str() {
-                if !login_name.is_empty() {
-                    if let Ok(c_login_name) = CString::new(login_name) {
-                        let pw = getpwnam(c_login_name.as_ptr());
-                        // Only trust getlogin() if its uid matches the real uid.
-                        if !pw.is_null() && (*pw).pw_uid == ruid {
-                            return Ok(*pw);
-                        }
-                    }
-                }
-            }
+    // Only trust getlogin() if its uid matches the real uid.
+    if let Some(login_name) = plib::curuser::login_name_strict().filter(|n| !n.is_empty()) {
+        if let Some(pw) = user::get_by_name(&login_name).filter(|pw| pw.uid == ruid) {
+            return Ok(pw);
         }
-
-        // Fall back to the real UID's password entry.
-        let pw_by_uid = getpwuid(ruid);
-        if !pw_by_uid.is_null() {
-            return Ok(*pw_by_uid);
-        }
-
-        Err(io::Error::new(io::ErrorKind::NotFound, "no password entry"))
     }
+
+    // Fall back to the real UID's password entry.
+    user::get_by_uid(ruid)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no password entry"))
 }
 
 /// Finds a matching group by numeric GID or by name.
@@ -320,19 +301,9 @@ fn find_matching_group(group_identifier: &str, groups: &[Group]) -> Option<Group
 /// Checks permission to change to `group`. If a password is required and the
 /// user is not a member, prompts for the group password and verifies it.
 /// Returns `Ok` if permitted, `Err(PermissionDenied)` otherwise.
-fn check_perms(group: &Group, password: &passwd) -> Result<(), io::Error> {
-    let pw_name = unsafe {
-        CStr::from_ptr(password.pw_name)
-            .to_string_lossy()
-            .into_owned()
-    };
-
+fn check_perms(group: &Group, password: &User) -> Result<(), io::Error> {
     // A member of the group (by primary gid or membership) needs no password.
-    let is_member = group.gid == password.pw_gid
-        || group
-            .members
-            .iter()
-            .any(|member| member.as_os_str() == pw_name.as_str());
+    let is_member = group.gid == password.gid || group.members.contains(&password.name);
 
     if is_member {
         return Ok(());

@@ -290,3 +290,47 @@ pub fn wait_for_line(buf: &Arc<Mutex<String>>, needle: &str, timeout: Duration) 
     }
     false
 }
+
+/// Open a pseudo-terminal pair with `openpty(3)` and name its slave with
+/// `ttyname_r` (through `plib::curuser::ttyname_of`), returning
+/// `(master_fd, slave_fd, slave_path)`. The caller closes both descriptors.
+///
+/// `ptsname` would name the slave from the master alone, but it returns a
+/// pointer into a static buffer that a concurrently running test overwrites;
+/// its reentrant form is not on every platform. Both descriptors are
+/// close-on-exec, so the children other tests spawn do not inherit them.
+pub fn open_pty_pair() -> Result<(i32, i32, String), String> {
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: the out-pointers are valid; the optional ones are null.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            // `*mut` on macOS, `*const` on Linux; a null `*mut` suits both.
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "openpty failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    for fd in [master, slave] {
+        // SAFETY: fd is open; F_SETFD takes an int.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    match plib::curuser::ttyname_of(slave) {
+        Some(path) => Ok((master, slave, path)),
+        None => {
+            // SAFETY: both descriptors are ours.
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            Err("ttyname of the pty slave failed".into())
+        }
+    }
+}

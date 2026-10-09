@@ -58,29 +58,15 @@ fn get_current_egid() -> u32 {
 }
 
 fn get_current_username() -> String {
-    let uid = get_current_uid();
-    let passwd = unsafe { libc::getpwuid(uid) };
-    if passwd.is_null() {
-        return String::new();
-    }
-    unsafe {
-        std::ffi::CStr::from_ptr((*passwd).pw_name)
-            .to_string_lossy()
-            .to_string()
-    }
+    plib::user::get_by_uid(get_current_uid())
+        .map(|u| u.name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn get_current_groupname() -> String {
-    let gid = get_current_gid();
-    let grp = unsafe { libc::getgrgid(gid) };
-    if grp.is_null() {
-        return String::new();
-    }
-    unsafe {
-        std::ffi::CStr::from_ptr((*grp).gr_name)
-            .to_string_lossy()
-            .to_string()
-    }
+    plib::group::get_by_gid(get_current_gid())
+        .map(|g| g.name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 // ============================================================================

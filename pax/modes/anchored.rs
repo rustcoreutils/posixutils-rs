@@ -216,6 +216,11 @@ pub(crate) struct DirTree {
     /// found existing, these take a member's attributes wherever they are --
     /// at that path: one renamed to another member's name is found there.
     made: RefCell<HashMap<(u64, u64), Vec<u8>>>,
+    /// What each directory in `implicit` and `made` was left as by this run
+    /// (`LeftAs`): its inode number alone cannot tell it from a directory
+    /// someone else made after removing it, which can be given the same
+    /// number (`standing`).
+    left_as: RefCell<HashMap<(u64, u64), LeftAs>>,
     /// The mtime each pre-existing directory had when this run first walked
     /// into it, before any member created below it changed that. -u compares
     /// against this: a `find -depth` list names a directory after its
@@ -270,6 +275,7 @@ impl DirTree {
             replaced: RefCell::new(HashSet::new()),
             unverified: RefCell::new(HashSet::new()),
             made: RefCell::new(HashMap::new()),
+            left_as: RefCell::new(HashMap::new()),
             pre_run_mtimes: RefCell::new(HashMap::new()),
         })
     }
@@ -363,7 +369,7 @@ impl DirTree {
                 }
             }
             let next = Rc::new(next);
-            trust = match self.standing(id, key) {
+            trust = match self.standing(&st, key) {
                 Standing::Implicit | Standing::Made => ChainTrust::made(&next)?,
                 _ => trust.found(&next)?,
             };
@@ -385,12 +391,19 @@ impl DirTree {
     /// directory consults: the walk and `open_dir` (through `admit`),
     /// `make_dir_at` and `apply_dir_attrs`. A directory this run made counts
     /// as made only at the path it was made at: one someone renamed to
-    /// another member's name is one found existing there.
-    fn standing(&self, id: (u64, u64), key: &[u8]) -> Standing {
+    /// another member's name is one found existing there. Nor where it is no
+    /// longer owned, grouped or moded as this run left it (`LeftAs`): someone
+    /// who can write its parent can remove it and make another there, which
+    /// the filesystem can give the same inode number.
+    fn standing(&self, st: &libc::stat, key: &[u8]) -> Standing {
+        let id = file_id(st);
+        // Made there, and still as this run left it: an inode number can be
+        // handed on to a directory someone else makes in its place (`LeftAs`).
         let made_at = |made: &RefCell<HashMap<(u64, u64), Vec<u8>>>| {
             made.borrow()
                 .get(&id)
                 .is_some_and(|at| at.as_slice() == key)
+                && self.left_as.borrow().get(&id) == Some(&LeftAs::of(st))
         };
         if self.is_replaced(id) {
             Standing::Replaced
@@ -435,6 +448,7 @@ impl DirTree {
         self.made.borrow_mut().remove(&id);
         self.unverified.borrow_mut().remove(&id);
         self.replaced.borrow_mut().remove(&id);
+        self.left_as.borrow_mut().remove(&id);
         let made = match fresh.trust {
             MadeTrust::ParentOwnerOnly => {
                 self.unverified.borrow_mut().insert(id);
@@ -444,6 +458,15 @@ impl DirTree {
             MadeTrust::Full => &self.made,
         };
         made.borrow_mut().insert(id, key.to_vec());
+        self.left_as.borrow_mut().insert(id, fresh.left_as);
+    }
+
+    /// Note what this run has just left the directory `st` it made as, once it has given it
+    /// attributes itself (`apply_dir_attrs`).
+    fn note_left_as(&self, st: &libc::stat) {
+        if let Some(left) = self.left_as.borrow_mut().get_mut(&file_id(st)) {
+            *left = LeftAs::of(st);
+        }
     }
 
     /// Record the directory with `id` as found in place of one this run
@@ -503,7 +526,7 @@ impl DirTree {
     /// Whether `st`, met at `member`, is a directory this run created there
     /// only to hold members below it, rather than one that was there before.
     pub(crate) fn is_implicit(&self, st: &libc::stat, member: &MemberPath) -> bool {
-        self.standing(file_id(st), &member.key()) == Standing::Implicit
+        self.standing(st, &member.key()) == Standing::Implicit
     }
 
     /// `is_implicit`, for the member that names the directory and so gives it
@@ -515,7 +538,7 @@ impl DirTree {
     pub(crate) fn claim_implicit(&self, st: &libc::stat, member: &MemberPath) -> bool {
         let id = file_id(st);
         let key = member.key();
-        if self.standing(id, &key) != Standing::Implicit {
+        if self.standing(st, &key) != Standing::Implicit {
             return false;
         }
         self.implicit.borrow_mut().remove(&id);
@@ -700,19 +723,27 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
         Err(PaxError::Io(e)) if is_superseded(&e) => return Ok(()),
         Err(e) => return Err(e),
     };
-    if fstat(fd.as_fd()).is_none_or(|st| file_id(&st) != dir.id) {
+    let Some(st) = fstat(fd.as_fd()).filter(|st| file_id(st) == dir.id) else {
         return Ok(());
-    }
-    let with_mode = match tree.standing(dir.id, &member.key()) {
+    };
+    let (with_mode, ours) = match tree.standing(&st, &member.key()) {
         Standing::Replaced => return Err(PaxError::Io(made::replaced())),
         Standing::Unverified => return Err(attrs_withheld()),
-        Standing::Implicit | Standing::Made => true,
-        Standing::Ordinary => found_dir_with_mode(trust, &fd, policy)?,
+        Standing::Implicit | Standing::Made => (true, true),
+        Standing::Ordinary => (found_dir_with_mode(trust, &fd, policy)?, false),
     };
-    if search_only {
-        return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy, with_mode);
+    let set = if search_only {
+        set_attrs_search_only(fd.as_fd(), &dir.attrs, policy, with_mode)
+    } else {
+        set_attrs_with(&AttrTarget::Fd(fd.as_fd()), &dir.attrs, policy, with_mode)
+    };
+    // What it was given is this run's doing: it is still the directory made.
+    if ours {
+        if let Some(st) = fstat(fd.as_fd()) {
+            tree.note_left_as(&st);
+        }
     }
-    set_attrs_with(&AttrTarget::Fd(fd.as_fd()), &dir.attrs, policy, with_mode)
+    set
 }
 
 /// For a directory found existing at a member's name, held as `fd`, in a
@@ -850,6 +881,35 @@ enum DirOrigin {
 struct FreshDir {
     id: (u64, u64),
     trust: MadeTrust,
+    left_as: LeftAs,
+}
+
+/// What this run left a directory it made as: owner, group and permission
+/// bits, from its `fstat`. A directory someone else made at the same name
+/// after removing this one can have the same `(st_dev, st_ino)`, but not this
+/// owner unless they are the user pax runs as -- who could have changed the
+/// directory anyway.
+///
+/// Not its ctime: every entry this run adds below the directory changes that,
+/// at too many sites to note each one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LeftAs {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+impl LeftAs {
+    fn of(st: &libc::stat) -> Self {
+        // Cast needed: `mode_t` is u16 on macOS and u32 on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let mode = st.st_mode as u32 & 0o7777;
+        LeftAs {
+            uid: st.st_uid,
+            gid: st.st_gid,
+            mode,
+        }
+    }
 }
 
 impl FreshDir {
@@ -864,6 +924,7 @@ impl FreshDir {
         Ok(Some(FreshDir {
             id: file_id(&st),
             trust,
+            left_as: LeftAs::of(&st),
         }))
     }
 }
@@ -990,7 +1051,7 @@ pub(crate) fn make_dir_at(
     let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
     if let Some(st) = existing_dir {
         let id = file_id(&st);
-        return match tree.standing(id, &member.key()) {
+        return match tree.standing(&st, &member.key()) {
             Standing::Replaced => Err(PaxError::Io(made::replaced())),
             Standing::Implicit => {
                 tree.claim_implicit(&st, member);
@@ -2011,14 +2072,19 @@ mod tests {
         let tree = DirTree::open_path(dir.path()).unwrap();
         let id = (1, 4242);
         let (p, q) = (member("p").key(), member("q").key());
-        let fresh = |trust| FreshDir { id, trust };
+        let fresh = |trust| FreshDir {
+            id,
+            trust,
+            left_as: LEFT,
+        };
+        let st = status(id, LEFT);
 
         tree.record_made(fresh(MadeTrust::Full), &p, false);
-        assert!(tree.standing(id, &p) == Standing::Made);
+        assert!(tree.standing(&st, &p) == Standing::Made);
         tree.record_made(fresh(MadeTrust::Full), &q, true);
-        assert!(tree.standing(id, &q) == Standing::Implicit);
+        assert!(tree.standing(&st, &q) == Standing::Implicit);
         assert!(
-            tree.standing(id, &p) == Standing::Ordinary,
+            tree.standing(&st, &p) == Standing::Ordinary,
             "the number still stood for the directory made for p/"
         );
 
@@ -2026,11 +2092,77 @@ mod tests {
         // directory proven new.
         tree.replaced.borrow_mut().insert(id);
         tree.record_made(fresh(MadeTrust::Full), &p, false);
-        assert!(tree.standing(id, &p) == Standing::Made);
+        assert!(tree.standing(&st, &p) == Standing::Made);
         tree.record_made(fresh(MadeTrust::ParentOwnerOnly), &q, true);
-        assert!(tree.standing(id, &q) == Standing::Unverified);
+        assert!(tree.standing(&st, &q) == Standing::Unverified);
         tree.record_made(fresh(MadeTrust::Full), &p, false);
-        assert!(tree.standing(id, &p) == Standing::Made);
+        assert!(tree.standing(&st, &p) == Standing::Made);
+    }
+
+    /// What `record_made` is told a directory was left as, in the tests.
+    const LEFT: LeftAs = LeftAs {
+        uid: 0,
+        gid: 0,
+        mode: 0o700,
+    };
+
+    /// An `fstat` answer for the directory `id`, as `left` says.
+    fn status(id: (u64, u64), left: LeftAs) -> libc::stat {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // Casts needed: the field types differ between platforms.
+        #[allow(clippy::unnecessary_cast)]
+        {
+            st.st_dev = id.0 as _;
+            st.st_ino = id.1 as _;
+            st.st_mode = (libc::S_IFDIR as u32 | left.mode) as _;
+        }
+        st.st_uid = left.uid;
+        st.st_gid = left.gid;
+        st
+    }
+
+    /// A directory this run made, removed by someone who can write its parent
+    /// and made again there by them, can be given the same inode number --
+    /// ext4 hands a freed one straight back. Met at its member's name before
+    /// its attributes are applied, it is not the directory made: it is found
+    /// existing there (`Standing::Ordinary`), and judged as one, unless it is
+    /// still owned, grouped and moded as this run left it.
+    #[test]
+    fn test_a_directory_made_again_at_a_reused_number_is_not_the_one_made() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let id = (1, 4242);
+        let (p, q) = (member("p").key(), member("q").key());
+        let fresh = FreshDir {
+            id,
+            trust: MadeTrust::Full,
+            left_as: LEFT,
+        };
+        tree.record_made(fresh, &p, false);
+        tree.record_made(
+            FreshDir {
+                id: (1, 4243),
+                ..fresh
+            },
+            &q,
+            true,
+        );
+        let bobs = LeftAs { uid: 1000, ..LEFT };
+        let regrouped = LeftAs { gid: 1000, ..LEFT };
+        let opened = LeftAs {
+            mode: 0o755,
+            ..LEFT
+        };
+        for other in [bobs, regrouped, opened] {
+            assert!(tree.standing(&status(id, other), &p) == Standing::Ordinary);
+            assert!(tree.standing(&status((1, 4243), other), &q) == Standing::Ordinary);
+        }
+        assert!(tree.standing(&status(id, LEFT), &p) == Standing::Made);
+        assert!(tree.standing(&status((1, 4243), LEFT), &q) == Standing::Implicit);
+
+        // What this run gives it itself is noted, and it stays the one made.
+        tree.note_left_as(&status(id, opened));
+        assert!(tree.standing(&status(id, opened), &p) == Standing::Made);
     }
 
     /// A directory recorded as found in place of one made, or as made with
@@ -2060,8 +2192,9 @@ mod tests {
         assert_eq!(decided, DirAttrs::Withheld(u));
         assert!(!tree.claim_implicit(&stat_at(tree.root(), c"u").unwrap(), &member("u")));
 
-        assert!(tree.standing(r, &r_key) == Standing::Replaced);
-        assert!(tree.standing(u, &u_key) == Standing::Unverified);
+        let st = |name: &CStr| stat_at(tree.root(), name).unwrap();
+        assert!(tree.standing(&st(c"r"), &r_key) == Standing::Replaced);
+        assert!(tree.standing(&st(c"u"), &u_key) == Standing::Unverified);
     }
 
     /// Every site that enters, merges into or stamps a directory consults the

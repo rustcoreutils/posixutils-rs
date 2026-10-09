@@ -35,6 +35,9 @@ pub(crate) enum Point {
     Linking,
     /// `-l` has just made the link `name` in the destination.
     Linked,
+    /// A link to the source, already pinned, found the destination `name`
+    /// taken.
+    LinkExists,
 }
 
 type Hook = Box<dyn FnMut(Point, libc::c_int, &CStr)>;

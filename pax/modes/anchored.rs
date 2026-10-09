@@ -1221,10 +1221,12 @@ fn created(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
 /// be the link source itself (`pax -rwl tree .`, or a member linked to its own
 /// name), and unlinking it destroys the only thing there was to link. Nothing
 /// is changed and `true` is returned; the caller decides whether that merits a
-/// diagnostic. Identity is (dev, ino) of both names, the source resolved the
-/// way `linkat` resolves it: the name itself, or with `follow` the file a
-/// symbolic link refers to -- which may be the very file at `name` -- and the
-/// link too, which is just as much the source (`pax -rwl -H link .`).
+/// diagnostic. Identity is (dev, ino): the source's is the pinned inode's, or
+/// the one the caller expects (`link_replacing_with`); only for a source known
+/// by neither is the name resolved again, the way `linkat` resolves it -- the
+/// name itself, or with `follow` the file a symbolic link refers to. With
+/// `follow` the link itself counts too, being just as much the source
+/// (`pax -rwl -H link .`).
 pub(crate) fn link_replacing(
     from_dir: libc::c_int,
     from_name: &CStr,
@@ -1269,16 +1271,31 @@ pub(crate) fn link_replacing_with(
     if no_clobber {
         return Ok(false);
     }
+    #[cfg(test)]
+    crate::modes::race_hook::reached(
+        crate::modes::race_hook::Point::LinkExists,
+        dirfd.as_raw_fd(),
+        name,
+    );
     if let Some(dst) = stat_at(dirfd, name) {
-        let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-        let resolved = fstatat(from_dir, from_name, src_flags);
+        // The source is the file pinned, or the one the caller examined: its
+        // name, resolved again, can be pointed at the destination's file by
+        // now, which would skip the member as linked to itself. Only a source
+        // known by neither is resolved again.
+        let resolved = source.identity().or_else(|| {
+            let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+            fstatat(from_dir, from_name, src_flags).map(|st| file_id(&st))
+        });
+        // Followed, the link itself is the source just as much
+        // (`pax -rwl -H link .`).
         let link = follow
             .then(|| fstatat(from_dir, from_name, libc::AT_SYMLINK_NOFOLLOW))
-            .flatten();
-        if [resolved, link]
-            .iter()
             .flatten()
-            .any(|src| file_id(src) == file_id(&dst))
+            .map(|st| file_id(&st));
+        if [resolved, link]
+            .into_iter()
+            .flatten()
+            .any(|src| src == file_id(&dst))
         {
             return Ok(true);
         }
@@ -1355,6 +1372,16 @@ impl<'a> LinkSource<'a> {
             return Err(source_changed());
         }
         Ok(Some(LinkSource::Pinned { proc_dir, pin }))
+    }
+
+    /// The source's `(st_dev, st_ino)`: the pinned inode's, or the one the
+    /// caller expects of a name; `None` for a name nothing is known of.
+    fn identity(&self) -> Option<(u64, u64)> {
+        match self {
+            #[cfg(target_os = "linux")]
+            LinkSource::Pinned { pin, .. } => fstat(pin.as_fd()).map(|st| file_id(&st)),
+            LinkSource::Name { expected, .. } => *expected,
+        }
     }
 
     /// Make `name` in `dirfd` a hard link to the source.
@@ -2243,6 +2270,41 @@ mod tests {
             tree.note_left_as(&status(id, stamped));
             assert!(tree.standing(&status(id, stamped), &p) == Standing::Made);
         }
+    }
+
+    /// Whether the destination already is the source decides whether a link
+    /// is made at all: that file is left in place, and the member counted as
+    /// linked to itself. It was decided by resolving the source's name again,
+    /// which someone who can rename in the source directory can point at the
+    /// destination's file once the source is pinned: the member was then
+    /// skipped, its name left holding another file. The pinned inode decides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_link_replacing_judges_itself_by_the_pinned_source() {
+        use crate::modes::race_hook::{with_hook, Point};
+        let dir = plib::tmp::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a"), "source\n").unwrap();
+        // Another name keeps the source linkable once `a` is taken from it.
+        std::fs::hard_link(dir.path().join("a"), dir.path().join("a2")).unwrap();
+        std::fs::write(dir.path().join("d"), "other\n").unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let root = tree.root().as_raw_fd();
+        let source = file_id(&stat_at(tree.root(), c"a").unwrap());
+
+        let path = dir.path().to_path_buf();
+        let swap = move |point, _: libc::c_int, _: &CStr| {
+            if point == Point::LinkExists {
+                // `a` now names the destination's file.
+                std::fs::remove_file(path.join("a")).unwrap();
+                std::fs::hard_link(path.join("d"), path.join("a")).unwrap();
+            }
+        };
+        let linked = with_hook(swap, || {
+            link_replacing_with(root, c"a", false, Some(source), tree.root(), c"d", false)
+        });
+        assert!(!linked.unwrap(), "skipped as already linked to itself");
+        let d = stat_at(tree.root(), c"d").unwrap();
+        assert_eq!(file_id(&d), source, "d does not hold the source");
     }
 
     /// -k leaves an existing directory entirely alone, and says nothing: one

@@ -647,7 +647,12 @@ fn process_file(
 /// POSIX ENVIRONMENT VARIABLES: `LC_COLLATE` determines the order in which the
 /// symbol listing is sorted, so the map's byte order is re-sorted through
 /// `strcoll` here rather than relied upon.
-fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Write) {
+fn print_xref(
+    xref: &CrossRef,
+    width: usize,
+    silent: bool,
+    output: &mut dyn Write,
+) -> io::Result<()> {
     let mut names: Vec<&String> = xref.symbols.keys().collect();
     names.sort_by(|a, b| plib::locale::strcoll(a, b));
 
@@ -715,7 +720,7 @@ fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Writ
 
                     if !first_num && current_line.len() + needed > width {
                         // Flush current line and start continuation
-                        let _ = writeln!(output, "{}", current_line);
+                        writeln!(output, "{}", current_line)?;
                         current_line = format!("{:prefix_len$}", "");
                         first_num = true;
                     }
@@ -730,13 +735,14 @@ fn print_xref(xref: &CrossRef, width: usize, silent: bool, output: &mut dyn Writ
                 }
 
                 if !first_num {
-                    let _ = writeln!(output, "{}", current_line);
+                    writeln!(output, "{}", current_line)?;
                 }
 
                 first_file = false;
             }
         }
     }
+    Ok(())
 }
 
 // Main
@@ -774,6 +780,10 @@ fn main() -> ExitCode {
         output_file = Box::new(stdout.lock());
     }
 
+    // The first failed write of the listing; once one fails, nothing more is
+    // written, and it is reported once, at the end.
+    let mut write_result: io::Result<()> = Ok(());
+
     // Build cross-reference
     let mut xref = CrossRef::default();
     let mut streams = StreamTable::new();
@@ -800,21 +810,30 @@ fn main() -> ExitCode {
         // In non-combined mode, print and reset after each file. A file that
         // could not be read contributes no portion to the listing, so it gets
         // no heading either.
-        if !args.combined && readable {
+        if !args.combined && readable && write_result.is_ok() {
             // POSIX STDOUT: "If the -c option is not specified, each portion of
             // the listing shall start with the name of the input file on a
             // separate line." -s suppresses filenames entirely.
             if !args.silent {
-                let _ = writeln!(output_file, "{}", file);
+                write_result = writeln!(output_file, "{}", file);
             }
-            print_xref(&xref, args.width, args.silent, &mut *output_file);
+            write_result = write_result
+                .and_then(|()| print_xref(&xref, args.width, args.silent, &mut *output_file));
             xref = CrossRef::default();
         }
     }
 
     // In combined mode, print all at end
-    if args.combined {
-        print_xref(&xref, args.width, args.silent, &mut *output_file);
+    if args.combined && write_result.is_ok() {
+        write_result = print_xref(&xref, args.width, args.silent, &mut *output_file);
+    }
+
+    if let Err(e) = write_result.and_then(|()| output_file.flush()) {
+        plib::diag::error(&format!(
+            "{}: {}",
+            gettext("write error"),
+            plib::diag::io_error_text(&e)
+        ));
     }
 
     posixutils_cc::tools::exit_code()

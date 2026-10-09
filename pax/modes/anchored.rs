@@ -463,10 +463,28 @@ impl DirTree {
 
     /// Note what this run has just left the directory `st` it made as, once it has given it
     /// attributes itself (`apply_dir_attrs`).
+    ///
+    /// Unless that gave it away: owned now by someone other than the user pax runs as and than
+    /// the owner it was made with (root under -p o), it is theirs, and no longer counts as made.
+    /// They can remove it and make another at its name, which the filesystem can give the same
+    /// inode number, owner and mode, so `LeftAs` cannot tell the two apart; a second pending
+    /// apply for that name (a member named twice, two sources -s maps onto one) judges what it
+    /// finds as found existing (`found_dir_with_mode`). The owner it was made with stays: on a
+    /// filesystem that stores no owners that is the mount's, and pax gives it nothing else.
     fn note_left_as(&self, st: &libc::stat) {
-        if let Some(left) = self.left_as.borrow_mut().get_mut(&file_id(st)) {
-            *left = LeftAs::of(st);
+        let id = file_id(st);
+        let euid = unsafe { libc::geteuid() };
+        let mut left_as = self.left_as.borrow_mut();
+        let Some(left) = left_as.get_mut(&id) else {
+            return;
+        };
+        if st.st_uid != euid && st.st_uid != left.uid {
+            left_as.remove(&id);
+            self.implicit.borrow_mut().remove(&id);
+            self.made.borrow_mut().remove(&id);
+            return;
         }
+        *left = LeftAs::of(st);
     }
 
     /// Record the directory with `id` as found in place of one this run
@@ -2163,6 +2181,64 @@ mod tests {
         // What this run gives it itself is noted, and it stays the one made.
         tree.note_left_as(&status(id, opened));
         assert!(tree.standing(&status(id, opened), &p) == Standing::Made);
+    }
+
+    /// A directory this run made and then, under -p o as root, gave to
+    /// someone else is theirs from then on: they can remove it and make
+    /// another at its name, which ext4 can give the same number, and set its
+    /// mode to what this run left. A second pending apply for that name -- a
+    /// member named twice, or two sources -s maps onto one name -- must then
+    /// judge it as found existing (`Standing::Ordinary`), never as the one
+    /// made, or root gives the planted directory the second member's owner
+    /// and mode without the existing-directory rule.
+    #[test]
+    fn test_a_made_directory_given_to_someone_else_is_no_longer_the_one_made() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let euid = unsafe { libc::geteuid() };
+        let ours = LeftAs { uid: euid, ..LEFT };
+        let given = LeftAs {
+            uid: euid.wrapping_add(1),
+            mode: 0o755,
+            ..LEFT
+        };
+        let (p, q) = (member("p").key(), member("q").key());
+        for (id, key, implicit) in [((1, 4242), &p, false), ((1, 4243), &q, true)] {
+            let fresh = FreshDir {
+                id,
+                trust: MadeTrust::Full,
+                left_as: ours,
+            };
+            tree.record_made(fresh, key, implicit);
+            // pax gave it the member's owner and mode, and noted that.
+            tree.note_left_as(&status(id, given));
+            assert!(
+                tree.standing(&status(id, given), key) == Standing::Ordinary,
+                "implicit={implicit}: a directory given away still counted as made"
+            );
+        }
+
+        // Left with its own owner -- the user's, or the one a filesystem that
+        // stores no owners reports for everything -- it stays the one made.
+        let mount_owner = LeftAs {
+            uid: euid.wrapping_add(2),
+            ..LEFT
+        };
+        for left in [ours, mount_owner] {
+            let id = (1, 4244);
+            let fresh = FreshDir {
+                id,
+                trust: MadeTrust::Full,
+                left_as: left,
+            };
+            tree.record_made(fresh, &p, false);
+            let stamped = LeftAs {
+                mode: 0o750,
+                ..left
+            };
+            tree.note_left_as(&status(id, stamped));
+            assert!(tree.standing(&status(id, stamped), &p) == Standing::Made);
+        }
     }
 
     /// A directory recorded as found in place of one made, or as made with

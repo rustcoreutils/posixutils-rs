@@ -18,7 +18,14 @@
 //! `plib/build.rs` under `plib_`-prefixed names. Matching is per character
 //! under the C runtime's `LC_CTYPE`, which [`crate::diag::init_locale`] makes
 //! UTF-8 on Windows; `wchar_t` is 16 bits there, so characters above U+FFFF
-//! are not supported.
+//! are not supported: like a byte that begins no character, they match
+//! nothing.
+//!
+//! Text need not be valid in the locale's encoding. A sequence that does not
+//! decode is no character: no part of a pattern matches it, and the rest of
+//! the text is searched, as glibc's `regexec` and GNU grep do. Where the C
+//! library's `regexec` gives up on such text instead (macOS, and musl's on
+//! Windows), the text is searched a piece at a time; see `Regex::exec_runs`.
 //!
 //! # Example
 //!
@@ -36,8 +43,9 @@
 
 use ffi::{
     regcomp, regerror, regexec, regfree, RegMatchT, RegexT, REG_EXTENDED, REG_ICASE, REG_NOTBOL,
+    REG_NOTEOL,
 };
-use std::ffi::{c_char, c_int, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::io::{Error, ErrorKind};
 use std::ptr;
 
@@ -46,7 +54,7 @@ use std::ptr;
 mod ffi {
     pub use libc::{
         regcomp, regerror, regex_t as RegexT, regexec, regfree, regmatch_t as RegMatchT,
-        REG_EXTENDED, REG_ICASE, REG_NOTBOL,
+        REG_EXTENDED, REG_ICASE, REG_NOTBOL, REG_NOTEOL,
     };
 }
 
@@ -78,6 +86,7 @@ mod ffi {
     pub const REG_EXTENDED: c_int = 1;
     pub const REG_ICASE: c_int = 2;
     pub const REG_NOTBOL: c_int = 1;
+    pub const REG_NOTEOL: c_int = 2;
 
     extern "C" {
         #[link_name = "plib_regcomp"]
@@ -109,6 +118,14 @@ mod ffi {
 fn matched(result: c_int) -> bool {
     result == 0
 }
+
+/// Whether the C library's `regexec` searches text holding a sequence the
+/// locale cannot decode. glibc's does, as GNU grep expects: such a byte is no
+/// character, so `.` and a bracket expression never match it, and the rest of
+/// the text is searched. Apple's (TRE) stops with `REG_ILLSEQ` and musl's
+/// (Windows, vendored) with `REG_NOMATCH`, so nothing in the text matches;
+/// [`Regex::exec`] then searches the pieces between such sequences itself.
+const REGEXEC_SEARCHES_UNDECODABLE: bool = cfg!(all(target_os = "linux", target_env = "gnu"));
 
 /// Maximum number of capture groups supported
 pub const MAX_CAPTURES: usize = 10;
@@ -323,6 +340,87 @@ impl Regex {
         String::from_utf8_lossy(&errbuf[..len]).to_string()
     }
 
+    /// Search `text` with `regexec`, filling `pmatch` (which may be empty)
+    /// with byte offsets into `text`. False when there is no match, or
+    /// `text` holds a NUL, which a C string cannot carry.
+    ///
+    /// Where the C library's `regexec` cannot search past a sequence the
+    /// locale does not decode (see [`REGEXEC_SEARCHES_UNDECODABLE`]), a text
+    /// it finds nothing in is searched again a piece at a time by
+    /// [`Regex::exec_runs`].
+    fn exec(&self, text: &[u8], pmatch: &mut [RegMatchT], eflags: c_int) -> bool {
+        let Ok(c_text) = CString::new(text) else {
+            return false;
+        };
+        if self.exec_c(&c_text, pmatch, eflags) {
+            return true;
+        }
+        if REGEXEC_SEARCHES_UNDECODABLE {
+            return false;
+        }
+        match crate::locale::wchar_runs(text) {
+            Some(runs) => self.exec_runs(text, &runs, pmatch, eflags),
+            None => false,
+        }
+    }
+
+    /// Search `text` one run at a time, `runs` being the pieces between the
+    /// sequences the locale cannot decode, as
+    /// [`crate::locale::wchar_runs`] gives them.
+    ///
+    /// Such a sequence is no character, so nothing a pattern can say matches
+    /// it, and no match can include it: every match lies within one run, and
+    /// the first run that holds a match holds the leftmost one. Only the
+    /// first run starts the text and only the last ends it, so the others are
+    /// searched with `REG_NOTBOL` or `REG_NOTEOL`: `^` and `$` match where
+    /// they would in the whole text, and nowhere else. The offsets found are
+    /// moved back to `text`'s, and the text itself is never changed.
+    ///
+    /// A word boundary is the exception: next to such a sequence the run's
+    /// own start or end counts as a non-word character, so `\<` matches
+    /// after one, where glibc's `regexec` takes the byte as part of a word.
+    fn exec_runs(
+        &self,
+        text: &[u8],
+        runs: &[std::ops::Range<usize>],
+        pmatch: &mut [RegMatchT],
+        eflags: c_int,
+    ) -> bool {
+        let last = runs.len() - 1;
+        for (i, run) in runs.iter().enumerate() {
+            let mut run_eflags = eflags;
+            if i > 0 {
+                run_eflags |= REG_NOTBOL;
+            }
+            if i < last {
+                run_eflags |= REG_NOTEOL;
+            }
+            // `text` holds no NUL: exec made a C string of it.
+            let Ok(c_run) = CString::new(&text[run.clone()]) else {
+                return false;
+            };
+            if self.exec_c(&c_run, pmatch, run_eflags) {
+                for m in pmatch.iter_mut().filter(|m| m.rm_so >= 0) {
+                    m.rm_so = (m.rm_so as usize + run.start) as _;
+                    m.rm_eo = (m.rm_eo as usize + run.start) as _;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// One `regexec` call on a C string.
+    fn exec_c(&self, text: &CStr, pmatch: &mut [RegMatchT], eflags: c_int) -> bool {
+        let pmatch_ptr = if pmatch.is_empty() {
+            ptr::null_mut()
+        } else {
+            pmatch.as_mut_ptr()
+        };
+        let result = unsafe { regexec(&self.raw, text.as_ptr(), pmatch.len(), pmatch_ptr, eflags) };
+        matched(result)
+    }
+
     /// Returns true if the pattern matches anywhere in the input string.
     ///
     /// # Arguments
@@ -341,13 +439,7 @@ impl Regex {
         if self.empty {
             return true;
         }
-        let Ok(c_text) = CString::new(text) else {
-            return false;
-        };
-
-        let result = unsafe { regexec(&self.raw, c_text.as_ptr(), 0, ptr::null_mut(), 0) };
-
-        matched(result)
+        self.exec(text, &mut [], 0)
     }
 
     /// Find the first match in the input string.
@@ -368,24 +460,12 @@ impl Regex {
         if self.empty {
             return Some(Match { start: 0, end: 0 });
         }
-        let c_text = CString::new(text).ok()?;
-
         let mut pmatch = RegMatchT {
             rm_so: -1,
             rm_eo: -1,
         };
 
-        let result = unsafe {
-            regexec(
-                &self.raw,
-                c_text.as_ptr(),
-                1,
-                &mut pmatch as *mut RegMatchT,
-                0,
-            )
-        };
-
-        if !matched(result) || pmatch.rm_so < 0 {
+        if !self.exec(text, std::slice::from_mut(&mut pmatch), 0) || pmatch.rm_so < 0 {
             return None;
         }
 
@@ -406,24 +486,12 @@ impl Regex {
         if self.empty {
             return Some(Match { start: 0, end: 0 });
         }
-        let c_text = CString::new(text).ok()?;
-
         let mut pmatch = RegMatchT {
             rm_so: -1,
             rm_eo: -1,
         };
 
-        let result = unsafe {
-            regexec(
-                &self.raw,
-                c_text.as_ptr(),
-                1,
-                &mut pmatch as *mut RegMatchT,
-                REG_NOTBOL,
-            )
-        };
-
-        if !matched(result) || pmatch.rm_so < 0 {
+        if !self.exec(text, std::slice::from_mut(&mut pmatch), REG_NOTBOL) || pmatch.rm_so < 0 {
             return None;
         }
 
@@ -458,21 +526,9 @@ impl Regex {
         if self.empty {
             return Some(Self::empty_captures(0));
         }
-        let c_text = CString::new(text).ok()?;
-
         let mut pmatch: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
 
-        let result = unsafe {
-            regexec(
-                &self.raw,
-                c_text.as_ptr(),
-                MAX_CAPTURES,
-                pmatch.as_mut_ptr(),
-                0,
-            )
-        };
-
-        if !matched(result) {
+        if !self.exec(text, &mut pmatch, 0) {
             return None;
         }
 
@@ -536,7 +592,6 @@ impl Regex {
         }
 
         let substring = &text[offset..];
-        let c_text = CString::new(substring).ok()?;
 
         let mut pmatch: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
 
@@ -544,17 +599,7 @@ impl Regex {
         // restart: `s/^/> /g` on "abc" produced "> a> b> c> ".
         let flags = if not_bol { REG_NOTBOL } else { 0 };
 
-        let result = unsafe {
-            regexec(
-                &self.raw,
-                c_text.as_ptr(),
-                MAX_CAPTURES,
-                pmatch.as_mut_ptr(),
-                flags,
-            )
-        };
-
-        if !matched(result) {
+        if !self.exec(substring, &mut pmatch, flags) {
             return None;
         }
 
@@ -1043,11 +1088,19 @@ mod tests {
 
     /// Restores `LC_CTYPE` when dropped, so a failing assertion cannot leave
     /// the process in another locale for the tests after it.
-    struct CtypeRestore(Vec<u8>);
+    /// On Windows it also restores plib's own reading of `LC_CTYPE`, which
+    /// [`crate::diag::init_locale`] sets beside the C runtime's.
+    struct CtypeRestore {
+        saved: Vec<u8>,
+        #[cfg(windows)]
+        mode: crate::locale::CtypeMode,
+    }
 
     impl Drop for CtypeRestore {
         fn drop(&mut self) {
-            gettextrs::setlocale(gettextrs::LocaleCategory::LcCType, self.0.clone());
+            gettextrs::setlocale(gettextrs::LocaleCategory::LcCType, self.saved.clone());
+            #[cfg(windows)]
+            crate::locale::set_ctype_mode(self.mode);
         }
     }
 
@@ -1069,12 +1122,20 @@ mod tests {
             assert!(!p.is_null(), "LC_CTYPE has a name");
             std::ffi::CStr::from_ptr(p).to_bytes().to_vec()
         };
-        let restore = CtypeRestore(saved);
+        let restore = CtypeRestore {
+            saved,
+            #[cfg(windows)]
+            mode: crate::locale::ctype_mode(),
+        };
         let found = NAMES
             .iter()
             .any(|name| setlocale(LocaleCategory::LcCType, *name).is_some());
         #[cfg(target_env = "msvc")]
         assert!(found, "the UCRT accepts setlocale(LC_CTYPE, \".UTF-8\")");
+        #[cfg(windows)]
+        if found {
+            crate::locale::set_ctype_mode(crate::locale::CtypeMode::Unicode);
+        }
         found.then_some(restore)
     }
 
@@ -1114,6 +1175,134 @@ mod tests {
             assert_eq!(re.find("üaa"), Some(Match { start: 2, end: 4 }));
             let re = Regex::bre(r"\(.\)\1").unwrap();
             assert_eq!(re.find("xéüü"), Some(Match { start: 3, end: 7 }));
+        }
+    }
+
+    /// Under a UTF-8 `LC_CTYPE` a byte that begins no character is no
+    /// character: nothing in a pattern matches it, `^` and `$` do not match
+    /// beside it, and the rest of the text is still searched, on every
+    /// platform, whatever the C library's `regexec` makes of such text.
+    #[test]
+    fn utf8_text_with_an_invalid_byte_is_searched() {
+        let _guard = crate::locale_test_lock();
+        let Some(_ctype) = utf8_ctype() else {
+            return;
+        };
+
+        let find = |pattern: &str, text: &[u8]| Regex::bre(pattern).unwrap().find_bytes(text);
+        let at = |start, end| Some(Match { start, end });
+        assert!(Regex::bre("foo").unwrap().is_match_bytes(b"x\xff foo"));
+        assert_eq!(find("foo", b"x\xff foo"), at(3, 6));
+        assert_eq!(find("é", b"\xff\xfe\xc3\xa9"), at(2, 4));
+        assert_eq!(find("o*$", b"foo\xff"), at(4, 4));
+        assert_eq!(find("^", b"\xffa"), at(0, 0));
+        assert_eq!(find("$", b"a\xff"), at(2, 2));
+        for (pattern, text) in [
+            ("x.", &b"x\xff"[..]),
+            ("x[^a]", b"x\xff"),
+            ("x.*foo", b"x\xff foo"),
+            ("^a", b"\xffa"),
+            ("a$", b"a\xff"),
+            ("^$", b"\xff"),
+            ("é", b"\xc3"),
+        ] {
+            assert_eq!(find(pattern, text), None, "{pattern:?} in {text:?}");
+        }
+
+        let re = Regex::bre(r"\(f\)\(o*\)").unwrap();
+        let caps = re.captures_bytes(b"\xffx\xfffoo").unwrap();
+        assert_eq!(
+            &caps[..3],
+            &[at(3, 6).unwrap(), at(3, 4).unwrap(), at(4, 6).unwrap()]
+        );
+        assert_eq!(caps[3], Match::default());
+        // A search that starts later keeps its own offsets, and its own
+        // REG_NOTBOL.
+        let re = Regex::bre("^o").unwrap();
+        assert_eq!(re.captures_at_bytes(b"f\xffoo", 1), None);
+        let re = Regex::bre("o").unwrap();
+        assert_eq!(
+            re.captures_at_bytes(b"f\xffoo", 1).unwrap()[0],
+            at(2, 3).unwrap()
+        );
+        assert_eq!(re.find_notbol_bytes(b"\xffo"), at(1, 2));
+    }
+
+    /// The search a run at a time against glibc's own, which searches such
+    /// text itself: they must agree (word boundaries aside, which glibc
+    /// takes the byte to be part of).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn search_by_runs_agrees_with_glibc() {
+        let _guard = crate::locale_test_lock();
+        let Some(_ctype) = utf8_ctype() else {
+            return;
+        };
+
+        let patterns = [
+            "foo",
+            "x.",
+            "x[^a]",
+            "x.*foo",
+            "^x",
+            "x$",
+            "^$",
+            "^",
+            "$",
+            "a$",
+            "^a",
+            "o*",
+            r"\(f\)\(o*\)",
+            "é",
+            " f",
+            ".*",
+            r"\(.\)\1",
+            "[[:alpha:]]*$",
+        ];
+        let texts: [&[u8]; 12] = [
+            b"x\xff foo",
+            b"x\xfffoo",
+            b"a\xff",
+            b"\xffa",
+            b"\xff",
+            b"\xff\xfe",
+            b"\xc3\xa9\xff \xc3\xa9",
+            b"\xc3",
+            b"x\xe2\x82 foo",
+            b"aa\xffbb\xffoo",
+            b"",
+            b"plain foo",
+        ];
+        for pattern in patterns {
+            for ere in [false, true] {
+                let flags = if ere {
+                    RegexFlags::ere()
+                } else {
+                    RegexFlags::bre()
+                };
+                let Ok(re) = Regex::new(pattern, flags) else {
+                    continue;
+                };
+                for text in texts {
+                    for eflags in [0, REG_NOTBOL] {
+                        let mut native: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
+                        let mut by_runs: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
+                        let found = re.exec(text, &mut native, eflags);
+                        let whole = 0..text.len();
+                        let runs = crate::locale::wchar_runs(text);
+                        let runs = runs.as_deref().unwrap_or(std::slice::from_ref(&whole));
+                        let found_by_runs = re.exec_runs(text, runs, &mut by_runs, eflags);
+                        let what = format!("{pattern:?} (ere {ere}) in {text:?}, eflags {eflags}");
+                        assert_eq!(found, found_by_runs, "{what}");
+                        if found {
+                            let offsets = |m: &[RegMatchT]| {
+                                m.iter().map(|m| (m.rm_so, m.rm_eo)).collect::<Vec<_>>()
+                            };
+                            assert_eq!(offsets(&native), offsets(&by_runs), "{what}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

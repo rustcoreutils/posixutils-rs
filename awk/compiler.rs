@@ -536,6 +536,8 @@ impl Instructions {
 struct LoopStubs {
     break_stubs: Vec<usize>,
     continue_stubs: Vec<usize>,
+    /// A `for (k in a)` loop, whose iterator is on the stack.
+    is_for_in: bool,
 }
 
 struct Compiler {
@@ -1420,6 +1422,15 @@ impl Compiler {
         Ok(())
     }
 
+    /// Ends the iterator of every `for (k in a)` loop the statement being
+    /// compiled is in, which it leaves (`return`, `next`, `exit`...).  At a
+    /// statement the stack holds nothing else above them.
+    fn end_for_in_loops(&self, instructions: &mut Instructions, line_col: (usize, usize)) {
+        for _ in self.loop_stack.iter().filter(|l| l.is_for_in) {
+            instructions.push(OpCode::EndIterator, line_col);
+        }
+    }
+
     fn compile_do_while(
         &mut self,
         do_while: Pair<Rule>,
@@ -1484,6 +1495,10 @@ impl Compiler {
         let iter_deref_location = instructions.len();
         instructions.push(OpCode::Invalid, array_var_line_col);
 
+        self.loop_stack.push(LoopStubs {
+            is_for_in: true,
+            ..LoopStubs::default()
+        });
         if let Some(body) = inner.next() {
             self.compile_stmt(body, instructions, locals)?;
         }
@@ -1496,6 +1511,14 @@ impl Compiler {
         instructions.opcodes[iter_deref_location] =
             OpCode::AdvanceIterOrJump(distance(iter_deref_location, instructions.len()));
 
+        // a `break` has ended the iterator already
+        let loop_stubs = self.loop_stack.pop().unwrap();
+        for stub in loop_stubs.break_stubs {
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, instructions.len()));
+        }
+        for stub in loop_stubs.continue_stubs {
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, iter_deref_location));
+        }
         Ok(())
     }
 
@@ -1659,15 +1682,20 @@ impl Compiler {
             Rule::ut_foreach => self.compile_for_each(stmt, instructions, locals),
             Rule::simple_statement => self.compile_simple_statement(stmt, instructions, locals),
             Rule::nextfile => {
+                self.end_for_in_loops(instructions, stmt.line_col());
                 instructions.push(OpCode::NextFile, stmt.line_col());
                 Ok(())
             }
             Rule::next => {
+                self.end_for_in_loops(instructions, stmt.line_col());
                 instructions.push(OpCode::Next, stmt.line_col());
                 Ok(())
             }
             Rule::break_stmt => {
                 if let Some(loop_stubs) = self.loop_stack.last_mut() {
+                    if loop_stubs.is_for_in {
+                        instructions.push(OpCode::EndIterator, stmt.line_col());
+                    }
                     loop_stubs.break_stubs.push(instructions.len());
                     instructions.push(OpCode::Invalid, stmt.line_col());
                     Ok(())
@@ -1692,6 +1720,7 @@ impl Compiler {
             }
             Rule::exit_stmt => {
                 let stmt_line_col = stmt.line_col();
+                self.end_for_in_loops(instructions, stmt_line_col);
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
                     instructions.push(OpCode::Exit, stmt_line_col);
@@ -1708,6 +1737,7 @@ impl Compiler {
                     ));
                 }
                 let stmt_line_col = stmt.line_col();
+                self.end_for_in_loops(instructions, stmt_line_col);
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
                 } else {

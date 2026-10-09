@@ -46,6 +46,8 @@ pub enum OpCode {
     CreateGlobalIterator(u32),
     CreateLocalIterator(u32),
     AdvanceIterOrJump(i32),
+    // pops the iterator on top of the stack before it reached its end
+    EndIterator,
 
     AsNumber,
     // push the value on top of the stack

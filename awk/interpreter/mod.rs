@@ -625,6 +625,11 @@ impl Interpreter {
                         ip_increment = offset as isize;
                     }
                 }
+                OpCode::EndIterator => {
+                    let iter = stack.pop().expect("empty stack").unwrap_array_iterator();
+                    // The pointer value is valid by stack invariance
+                    unsafe { &mut *iter.array }.as_array()?.end_iterator();
+                }
                 OpCode::AsNumber => {
                     let val = stack.pop_scalar_value()?;
                     stack.push_value(val.scalar_as_f64())?;

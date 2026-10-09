@@ -1907,3 +1907,43 @@ fn awk_delete_the_last_stored_element() {
         assert_eq!(status, Some(0), "{program}");
     }
 }
+
+// `break` and `continue` work in a `for (k in a)` loop, and leaving one by
+// `break`, `return` or `next` releases the array, which could then never
+// be added to again.  Reading a missing element inside such a loop creates
+// it instead of failing (gawk's test delarpm2); the loop does not visit
+// it, as in gawk and mawk.
+#[test]
+fn awk_for_in_loop_can_be_left_and_its_array_added_to() {
+    let cases = [
+        (
+            "BEGIN { a[1]; a[2]; a[3]; for (k in a) { n++; break }; for (k in a) { if (k == 2) continue; m++ }; a[4]; print n, m, length(a) }",
+            "1 2 4\n",
+        ),
+        (
+            "function f(arr, k) { for (k in arr) return k } BEGIN { a[1]; a[2]; f(a); a[3] = 1; print length(a) }",
+            "3\n",
+        ),
+        (
+            "{ for (k in seen) next } { seen[$0] } END { seen[\"z\"]; print length(seen) }",
+            "2\n",
+        ),
+        (
+            "BEGIN { a[1]; a[2]; for (k in a) if (a[k \"x\"] == \"\") n++; print n, length(a) }",
+            "2 4\n",
+        ),
+        (
+            "BEGIN { a[1]; a[2]; for (k in a) { delete a; a[\"q\"] }; print length(a) }",
+            "1\n",
+        ),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "a\nb\nc\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}

@@ -236,7 +236,10 @@ pub enum FoundDir {
 /// Root working for a user -- extracting into `/home/alice`, which alice owns -- also trusts
 /// the directories of that one user, below its own: alice can create names there, but only in
 /// her own tree, which the copy is for. One user only, owning every directory from the first
-/// one not root's down, and none others can write (`dir_writers`).
+/// one not root's down, and none others can write (`dir_writers`); where that first one starts
+/// the chain, every directory above it up to one of root's own must be hers alone too
+/// (`rests_on_roots_own`); and a directory found in her tree must itself be hers (`found_dir`),
+/// since she can rename into it any directory she can reach.
 ///
 /// So the trust is carried down the chain, one directory at a time, from descriptors: the
 /// anchor hands it to its entries when nobody else can create entries in it (`anchor`); a
@@ -361,7 +364,7 @@ impl NamedAnchor {
     /// reached through a link, what a directory found in the link's directory may be.
     pub fn named_dir(&self, requested: Preserve) -> FoundDir {
         match &self.through_link {
-            Some(trust) => trust.found_dir(requested),
+            Some(trust) => trust.found_dir_owned(|| self.hands.0.uid, requested),
             None => requested.where_trusted(),
         }
     }
@@ -382,6 +385,8 @@ struct Link {
     above: Option<ChainTrust>,
     /// Who else can create entries in it, from its `fstat`.
     writers: DirWriters,
+    /// Its owner, from the same `fstat`; `None` for `unlocated`.
+    uid: Option<u32>,
     /// The one user other than root that the chain has gone into the directories of, root
     /// being the effective user (`dir_writers`): from then on, every directory must be theirs.
     /// `None` while every directory has been the effective user's.
@@ -434,7 +439,8 @@ impl ChainTrust {
         euid: u32,
     ) -> io::Result<Self> {
         let above_owner = above.as_ref().and_then(|ChainTrust(link)| link.owner);
-        let writers = dir_writers(&fstat(dir.as_raw_fd())?, euid, above_owner, start);
+        let st = fstat(dir.as_raw_fd())?;
+        let writers = dir_writers(&st, euid, above_owner, start);
         let owner = match writers {
             DirWriters::Owner { uid } | DirWriters::OwnerAndGroup { uid, .. } if uid != euid => {
                 Some(uid)
@@ -446,6 +452,7 @@ impl ChainTrust {
         Ok(ChainTrust(Rc::new(Link {
             above,
             writers,
+            uid: Some(st.st_uid),
             owner,
             dir: Some(dir),
             entries_safe: OnceCell::new(),
@@ -464,6 +471,7 @@ impl ChainTrust {
         ChainTrust(Rc::new(Link {
             above: None,
             writers: DirWriters::Others,
+            uid: None,
             owner: None,
             dir: None,
             entries_safe: OnceCell::from(false),
@@ -525,12 +533,27 @@ impl ChainTrust {
         })
     }
 
-    /// What a directory found existing in a directory of this trust may be given, `requested`
-    /// being which of mode and owner the user asked to preserve. Only when one of them was
-    /// asked for is the trust worked out.
-    pub fn found_dir(&self, requested: Preserve) -> FoundDir {
+    /// What a directory found existing in a directory of this trust, held as `dir`, may be
+    /// given, `requested` being which of mode and owner the user asked to preserve. Only when
+    /// one of them was asked for is the trust worked out.
+    ///
+    /// In the tree of the user root works for (`dir_writers`), that user can rename into it any
+    /// directory they can reach -- one of root's, or another user's from a directory they
+    /// share -- so there the directory found must be that user's own too, by its `fstat`.
+    pub fn found_dir<D: AsRawFd + ?Sized>(&self, dir: &D, requested: Preserve) -> FoundDir {
+        self.found_dir_owned(
+            || fstat(dir.as_raw_fd()).ok().map(|st| st.st_uid),
+            requested,
+        )
+    }
+
+    /// `found_dir`, for a directory whose owner `uid` reads, `None` where it cannot be read.
+    fn found_dir_owned(&self, uid: impl FnOnce() -> Option<u32>, requested: Preserve) -> FoundDir {
         match requested.where_trusted() {
             FoundDir::AsRequested if !self.entries_safe() => FoundDir::LeaveAlone,
+            FoundDir::AsRequested if self.0.owner.is_some_and(|owner| uid() != Some(owner)) => {
+                FoundDir::LeaveAlone
+            }
             given => given,
         }
     }
@@ -558,10 +581,17 @@ impl ChainTrust {
 }
 
 impl Link {
-    /// Whether nobody but the user can create entries in this directory itself.
+    /// Whether nobody but the user can create entries in this directory itself -- and, where
+    /// it is the first of the tree of the user root works for and starts the chain, where
+    /// nobody else could have put it either (`rests_on_roots_own`).
     fn own_entries_safe(&self) -> bool {
         let dir = self.dir.as_ref().and_then(Weak::upgrade);
-        only_the_user_writes(self.writers, dir.as_ref().map(|dir| dir.as_raw_fd()))
+        let fd = dir.as_ref().map(|dir| dir.as_raw_fd());
+        let placed = || match (&self.above, self.owner, fd) {
+            (None, Some(owner), Some(fd)) => rests_on_roots_own(fd, owner),
+            _ => true,
+        };
+        only_the_user_writes(self.writers, fd) && placed()
     }
 }
 
@@ -666,6 +696,58 @@ fn only_the_user_writes(writers: DirWriters, dir: Option<RawFd>) -> bool {
         DirWriters::Owner { .. } => acls_allow(false),
         DirWriters::OwnerAndGroup { uid, gid } => is_private_group(gid, uid) && acls_allow(true),
     }
+}
+
+/// The most directories `rests_on_roots_own` climbs.
+const MAX_CLIMB: usize = 4096;
+
+/// Whether the directory open on `fd`, the first of the tree of the user `owner` that root works
+/// for (`dir_writers`) and the top of its chain, is where nobody but root or `owner` could have
+/// put it: every directory above it, up to the first of root's own, is `owner`'s, and that one
+/// root's, each writable by nobody else (`only_the_user_writes`, root's directory judged as
+/// root's).
+///
+/// Otherwise anyone who can write a directory above it could have renamed a directory of
+/// their own, or another user's they can reach, to its name -- and the chain would go on to
+/// trust that directory's owner instead.
+///
+/// The climb goes from descriptors, each `..` opened in the one below it -- naming wherever
+/// that directory is now, never a path -- and fails closed: a `..` that cannot be opened or
+/// read, the root of the file hierarchy reached without one of root's directories, or more
+/// than `MAX_CLIMB` levels, and the tree is not trusted.
+fn rests_on_roots_own(fd: RawFd, owner: u32) -> bool {
+    let id = |st: &libc::stat| (st.st_dev, st.st_ino);
+    let Ok(st) = fstat(fd) else {
+        return false;
+    };
+    let mut below = id(&st);
+    let mut held: Option<OwnedFd> = None;
+    for _ in 0..MAX_CLIMB {
+        let at = held.as_ref().map_or(fd, |held| held.as_raw_fd());
+        let flags = SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let up = unsafe { libc::openat(at, c"..".as_ptr(), flags) };
+        if up < 0 {
+            return false;
+        }
+        let up = unsafe { OwnedFd::from_raw_fd(up) };
+        let Ok(st) = fstat(up.as_raw_fd()) else {
+            return false;
+        };
+        if id(&st) == below {
+            return false;
+        }
+        if st.st_uid == 0 {
+            let writers = dir_writers(&st, 0, None, ChainStart::Anchor);
+            return only_the_user_writes(writers, Some(up.as_raw_fd()));
+        }
+        let writers = dir_writers(&st, 0, Some(owner), ChainStart::Anchor);
+        if !only_the_user_writes(writers, Some(up.as_raw_fd())) {
+            return false;
+        }
+        below = id(&st);
+        held = Some(up);
+    }
+    false
 }
 
 /// Whether an ACL of a directory may let others write it, `read` reading one of its extended
@@ -1173,9 +1255,9 @@ mod tests {
 
     /// Root copying or extracting for a user, into a tree that user owns -- `/home/alice`,
     /// with the directories a umask of 002 leaves below it -- trusts it as the user's own: one
-    /// owner, not root, owning every directory from the anchor (or below root's own) down,
-    /// none of them writable by others. The test user stands for that user here, and root's
-    /// view is taken by asking as euid 0.
+    /// owner, not root, owning every directory below root's own, none of them writable by
+    /// others. The test user stands for that user here, and root's view is taken by asking as
+    /// euid 0; `/` stands for `/home`.
     #[test]
     fn root_trusts_a_tree_one_other_user_owns_alone() {
         let me = unsafe { libc::geteuid() };
@@ -1185,7 +1267,7 @@ mod tests {
         }
         let tmp = crate::tmp::TempDir::new().unwrap();
         let root = tmp.path();
-        std::fs::create_dir_all(root.join("x/y")).unwrap();
+        std::fs::create_dir_all(root.join("x/y/z")).unwrap();
         std::fs::create_dir_all(root.join("open/z")).unwrap();
         for (dir, mode) in [("", 0o755), ("x", 0o755), ("x/y", 0o755), ("open", 0o777)] {
             let path = root.join(dir);
@@ -1197,44 +1279,125 @@ mod tests {
         };
         let fd = |path: &str| Rc::new(std::fs::File::open(root.join(path)).unwrap());
         let (root_fd, x_fd, y_fd, open_fd) = (fd(""), fd("x"), fd("x/y"), fd("open"));
+        let (z_fd, open_z_fd) = (fd("x/y/z"), fd("open/z"));
         let slash = Rc::new(std::fs::File::open("/").unwrap());
         let as_root = |above: Option<&ChainTrust>, dir: &Rc<std::fs::File>| {
             ChainTrust::link_as(above.cloned(), dir, ChainStart::Anchor, 0).unwrap()
         };
 
-        // The user's own tree, from the anchor down.
-        let anchor = as_root(None, &root_fd);
-        let x = as_root(Some(&anchor), &x_fd);
-        assert_eq!(anchor.found_dir(mode), FoundDir::AsRequested);
-        assert_eq!(x.found_dir(mode), FoundDir::AsRequested);
-        // Below root's own directory too: `/` stands for `/home`.
+        // The user's own tree, below root's own directory.
         let home = as_root(None, &slash);
-        let below_home = as_root(Some(&home), &root_fd);
-        assert_eq!(below_home.found_dir(mode), FoundDir::AsRequested);
+        let tree = as_root(Some(&home), &root_fd);
+        let x = as_root(Some(&tree), &x_fd);
+        assert_eq!(home.found_dir(&*root_fd, mode), FoundDir::AsRequested);
+        assert_eq!(tree.found_dir(&*x_fd, mode), FoundDir::AsRequested);
+        assert_eq!(x.found_dir(&*y_fd, mode), FoundDir::AsRequested);
         // A directory others can write, owned by the user or not, is refused.
-        let open = as_root(Some(&anchor), &open_fd);
-        assert_eq!(open.found_dir(mode), FoundDir::LeaveAlone);
+        let open = as_root(Some(&tree), &open_fd);
+        assert_eq!(open.found_dir(&*open_z_fd, mode), FoundDir::LeaveAlone);
         // Root's own directory below the user's is mixed in: the user can rename it there.
         let mixed = as_root(Some(&x), &slash);
-        assert_eq!(mixed.found_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(mixed.found_dir(&*z_fd, mode), FoundDir::LeaveAlone);
         // A directory the caller made and verified that has become the user's is not a point
         // to start trusting the user from.
         let made = ChainTrust::link_as(None, &y_fd, ChainStart::Made, 0).unwrap();
-        assert_eq!(made.found_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(made.found_dir(&*z_fd, mode), FoundDir::LeaveAlone);
         // Group write permission counts as the user's only for the user's own private group.
         if let Some(gid) = crate::testing::user_private_group() {
             std::fs::set_permissions(root.join("x"), std::fs::Permissions::from_mode(0o775))
                 .unwrap();
             assert_eq!(x_fd.metadata().unwrap().gid(), gid);
-            let anchor = as_root(None, &root_fd);
-            let x = as_root(Some(&anchor), &x_fd);
-            assert_eq!(x.found_dir(mode), FoundDir::AsRequested);
+            let x = as_root(Some(&tree), &x_fd);
+            assert_eq!(x.found_dir(&*y_fd, mode), FoundDir::AsRequested);
         } else {
             eprintln!("note: no user private group here; group-writable case skipped");
         }
         // Anyone but root asks for directories that are their own, as before.
         let other = ChainTrust::link_as(None, &root_fd, ChainStart::Anchor, me + 1).unwrap();
-        assert_eq!(other.found_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(other.found_dir(&*x_fd, mode), FoundDir::LeaveAlone);
+    }
+
+    /// In the tree of a user root works for, the user can rename into place any directory
+    /// they can reach -- one of root's, or another user's from a directory they share -- and
+    /// root must give such a one nothing: only the user's own directories are found there.
+    #[test]
+    fn root_gives_nothing_to_a_directory_not_the_users_found_in_their_tree() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("note: run as root, the test user cannot stand for another user; skipped");
+            return;
+        }
+        let mode = Preserve {
+            mode: true,
+            owner: false,
+        };
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tree = Rc::new(std::fs::File::open(tmp.path()).unwrap());
+        let slash = Rc::new(std::fs::File::open("/").unwrap());
+        let home = ChainTrust::link_as(None, &slash, ChainStart::Anchor, 0).unwrap();
+        let tree = ChainTrust::link_as(Some(home), &tree, ChainStart::Anchor, 0).unwrap();
+        // `/` stands for a directory of root's renamed into the user's tree.
+        assert_eq!(tree.found_dir(&*slash, mode), FoundDir::LeaveAlone);
+        // And one that cannot be read at all is nobody's for certain.
+        assert_eq!(tree.found_dir(&-1, mode), FoundDir::LeaveAlone);
+    }
+
+    /// Where the user's tree starts the chain -- the anchor root was handed, or the directory
+    /// holding a link it named -- someone else may have renamed it to that name: the user's
+    /// tree is trusted only where every directory above it up to one of root's own is the
+    /// user's alone, and root's is no directory others can write either. This crate's own
+    /// directory is the test user's, below root's `/home`; a directory in `/tmp` is not.
+    #[test]
+    fn root_trusts_a_users_tree_at_the_anchor_only_where_it_rests_on_roots_own() {
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            eprintln!("note: run as root, the test user cannot stand for another user; skipped");
+            return;
+        }
+        let mode = Preserve {
+            mode: true,
+            owner: false,
+        };
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(tmp.path().join("x")).unwrap();
+        let in_tmp = Rc::new(std::fs::File::open(tmp.path()).unwrap());
+        let x = std::fs::File::open(tmp.path().join("x")).unwrap();
+        let anchor = ChainTrust::link_as(None, &in_tmp, ChainStart::Anchor, 0).unwrap();
+        assert_eq!(anchor.found_dir(&x, mode), FoundDir::LeaveAlone);
+
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !rests_on_root(crate_dir, me) {
+            eprintln!("note: this crate is not in a tree of the test user's own; case skipped");
+            return;
+        }
+        let held = Rc::new(std::fs::File::open(crate_dir).unwrap());
+        let src = std::fs::File::open(crate_dir.join("src")).unwrap();
+        let anchor = ChainTrust::link_as(None, &held, ChainStart::Anchor, 0).unwrap();
+        assert_eq!(anchor.found_dir(&src, mode), FoundDir::AsRequested);
+    }
+
+    /// Whether `dir` and every directory above it up to the first of root's are `uid`'s,
+    /// writable by nobody else -- group write permission only for the user's private group --
+    /// and that one of root's by nobody but root: as the test sees it, by name.
+    fn rests_on_root(dir: &Path, uid: u32) -> bool {
+        let private = crate::testing::user_private_group();
+        for dir in dir.ancestors() {
+            let Ok(md) = std::fs::metadata(dir) else {
+                return false;
+            };
+            let writers = md.mode() & 0o022;
+            if md.uid() == 0 {
+                return writers == 0;
+            }
+            if md.uid() != uid || md.mode() & 0o002 != 0 {
+                return false;
+            }
+            if writers == 0o020 && private != Some(md.gid()) {
+                return false;
+            }
+        }
+        false
     }
 
     /// Below a directory owned by one user other than root, only that user's directories
@@ -1498,35 +1661,35 @@ mod tests {
             owner: true,
         };
         let fd = |path: &str| Rc::new(std::fs::File::open(root.join(path)).unwrap());
-        let (root_fd, g_fd, x_fd) = (fd(""), fd("g"), fd("g/x"));
+        let (root_fd, g_fd, x_fd, d_fd) = (fd(""), fd("g"), fd("g/x"), fd("g/x/d"));
         let anchor = ChainTrust::anchor(&root_fd).unwrap();
         let g = anchor.found(&g_fd).unwrap();
         let x = g.found(&x_fd).unwrap();
 
         // Nothing is worked out until a mode or owner is asked for.
-        assert_eq!(x.found_dir(none), FoundDir::TimesOnly);
+        assert_eq!(x.found_dir(&*d_fd, none), FoundDir::TimesOnly);
         assert!(x.0.entries_safe.get().is_none() && anchor.0.entries_safe.get().is_none());
 
         // `g` itself: found in the anchor, which only the user can write.
-        assert_eq!(anchor.found_dir(mode), FoundDir::AsRequested);
+        assert_eq!(anchor.found_dir(&*g_fd, mode), FoundDir::AsRequested);
         // `x`: found in `g`, which others can write.
-        assert_eq!(g.found_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(g.found_dir(&*x_fd, mode), FoundDir::LeaveAlone);
         // `d`: its parent `x` is the user's alone, but `x` may be anyone's
         // directory renamed into `g`.
-        assert_eq!(x.found_dir(mode), FoundDir::LeaveAlone);
-        assert_eq!(x.found_dir(owner), FoundDir::LeaveAlone);
-        assert_eq!(x.found_dir(none), FoundDir::TimesOnly);
+        assert_eq!(x.found_dir(&*d_fd, mode), FoundDir::LeaveAlone);
+        assert_eq!(x.found_dir(&*d_fd, owner), FoundDir::LeaveAlone);
+        assert_eq!(x.found_dir(&*d_fd, none), FoundDir::TimesOnly);
         // Had the caller made and verified `x`, what it finds in it is safe.
         let made_x = ChainTrust::made(&x_fd).unwrap();
-        assert_eq!(made_x.found_dir(mode), FoundDir::AsRequested);
-        assert_eq!(made_x.found_dir(owner), FoundDir::AsRequested);
+        assert_eq!(made_x.found_dir(&*d_fd, mode), FoundDir::AsRequested);
+        assert_eq!(made_x.found_dir(&*d_fd, owner), FoundDir::AsRequested);
         // A directory found in no directory the caller can locate takes nothing asked for, and
         // hands that on.
         let unlocated = ChainTrust::unlocated();
-        assert_eq!(unlocated.found_dir(mode), FoundDir::LeaveAlone);
-        assert_eq!(unlocated.found_dir(none), FoundDir::TimesOnly);
+        assert_eq!(unlocated.found_dir(&*root_fd, mode), FoundDir::LeaveAlone);
+        assert_eq!(unlocated.found_dir(&*root_fd, none), FoundDir::TimesOnly);
         let below = unlocated.found(&root_fd).unwrap();
-        assert_eq!(below.found_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(below.found_dir(&*root_fd, mode), FoundDir::LeaveAlone);
     }
 
     /// A directory the user names is trusted as named -- unless its name's last component is a
@@ -1554,7 +1717,7 @@ mod tests {
                 let named = ChainTrust::named(&path, &held).unwrap();
                 assert_eq!(named.named_dir(mode), through, "{path:?} in {open_mode:o}");
                 assert_eq!(
-                    named.hands.found_dir(mode),
+                    named.hands.found_dir(&*held, mode),
                     through,
                     "{path:?} in {open_mode:o}"
                 );
@@ -1564,13 +1727,13 @@ mod tests {
         // Named directly.
         let named = ChainTrust::named(&home, &held).unwrap();
         assert_eq!(named.named_dir(mode), FoundDir::AsRequested);
-        assert_eq!(named.hands.found_dir(mode), FoundDir::AsRequested);
+        assert_eq!(named.hands.found_dir(&*held, mode), FoundDir::AsRequested);
         // A name that holds another directory than the one opened.
         std::fs::rename(&home, tmp.path().join("moved")).unwrap();
         std::fs::create_dir(&home).unwrap();
         let named = ChainTrust::named(&home, &held).unwrap();
         assert_eq!(named.named_dir(mode), FoundDir::LeaveAlone);
-        assert_eq!(named.hands.found_dir(mode), FoundDir::LeaveAlone);
+        assert_eq!(named.hands.found_dir(&*held, mode), FoundDir::LeaveAlone);
     }
 
     /// A link anywhere in a named path -- in its last component, in one before it, met again
@@ -1610,7 +1773,7 @@ mod tests {
         let judge = |named: &Path, opened: &Path| {
             let dir = held(opened);
             let named = ChainTrust::named(named, &dir).unwrap();
-            (named.named_dir(mode), named.hands.found_dir(mode))
+            (named.named_dir(mode), named.hands.found_dir(&*dir, mode))
         };
         let trusted = (FoundDir::AsRequested, FoundDir::AsRequested);
         let untrusted = (FoundDir::LeaveAlone, FoundDir::LeaveAlone);
@@ -1666,16 +1829,17 @@ mod tests {
         for (perm, open, closed) in [(0o755, true, false), (0o775, private_here(), false)] {
             std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(perm)).unwrap();
             let held = Rc::new(std::fs::File::open(tmp.path()).unwrap());
+            let child = std::fs::File::open(tmp.path()).unwrap();
             let trust = ChainTrust::anchor(&held).unwrap();
             let again = ChainTrust::anchor(&held).unwrap();
             assert_eq!(
-                trust.found_dir(mode) == FoundDir::AsRequested,
+                trust.found_dir(&child, mode) == FoundDir::AsRequested,
                 open,
                 "{perm:o}"
             );
             drop(held);
             assert_eq!(
-                again.found_dir(mode) == FoundDir::AsRequested,
+                again.found_dir(&child, mode) == FoundDir::AsRequested,
                 closed,
                 "{perm:o}"
             );

@@ -470,7 +470,7 @@ fn found_dir_trust(
         OperandTrust::Chain(chain) => (chain.clone(), None),
     };
     // Asked while the anchor `parent_anchor` opened is still held.
-    let finish = DirFinish::Found(chain.found_dir(requested));
+    let finish = DirFinish::Found(chain.found_dir(&**fd, requested));
     Ok((finish, chain.found(fd)?))
 }
 
@@ -2922,11 +2922,14 @@ mod tests {
         };
         let x = fs::metadata(dir.join("x")).unwrap();
         let (trust, _) = super::parent_anchor(&parent, (x.dev(), x.ino()), target).unwrap();
-        assert_eq!(trust.found_dir(mode), super::FoundDir::AsRequested);
+        assert_eq!(
+            trust.found_dir(&*parent, mode),
+            super::FoundDir::AsRequested
+        );
 
         let other = fs::metadata(dir).unwrap();
         let (trust, _) = super::parent_anchor(&parent, (other.dev(), other.ino()), target).unwrap();
-        assert_eq!(trust.found_dir(mode), super::FoundDir::LeaveAlone);
+        assert_eq!(trust.found_dir(&*parent, mode), super::FoundDir::LeaveAlone);
     }
 
     /// What `fstat` might report of a directory: only what `MadeDirs` reads is set.

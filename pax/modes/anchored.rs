@@ -707,7 +707,7 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
         Standing::Replaced => return Err(PaxError::Io(made::replaced())),
         Standing::Unverified => return Err(attrs_withheld()),
         Standing::Implicit | Standing::Made => true,
-        Standing::Ordinary => found_dir_with_mode(trust, policy)?,
+        Standing::Ordinary => found_dir_with_mode(trust, &fd, policy)?,
     };
     if search_only {
         return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy, with_mode);
@@ -715,17 +715,21 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
     set_attrs_with(&AttrTarget::Fd(fd.as_fd()), &dir.attrs, policy, with_mode)
 }
 
-/// For a directory found existing at a member's name, in a parent handing it
-/// `trust`: whether it takes the member's mode, or an error when it is to
+/// For a directory found existing at a member's name, held as `fd`, in a
+/// parent handing it `trust`: whether it takes the member's mode, or an error when it is to
 /// take nothing at all (`ChainTrust::found_dir`). Its owner it takes only
 /// under `-p o`, which `set_attrs_with` already follows; its times, as by
 /// default, whenever it takes anything.
-fn found_dir_with_mode(trust: ChainTrust, policy: &AttrPolicy) -> PaxResult<bool> {
+fn found_dir_with_mode(
+    trust: ChainTrust,
+    fd: &impl AsRawFd,
+    policy: &AttrPolicy,
+) -> PaxResult<bool> {
     let requested = Preserve {
         mode: policy.preserve_perms,
         owner: policy.preserve_owner,
     };
-    match trust.found_dir(requested) {
+    match trust.found_dir(fd, requested) {
         FoundDir::TimesOnly => Ok(false),
         FoundDir::AsRequested => Ok(policy.preserve_perms),
         FoundDir::LeaveAlone => Err(PaxError::Io(std::io::Error::other(

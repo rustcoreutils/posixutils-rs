@@ -70,18 +70,10 @@ pub fn sccs_dir(resolved: &Path) -> PathBuf {
 
 /// Look up a user's home directory in the passwd database.
 fn user_home_dir(name: &str) -> Option<PathBuf> {
-    use std::ffi::{CStr, CString};
-    let cname = CString::new(name).ok()?;
-    // SAFETY: `cname` is a live NUL-terminated string; the returned `passwd`
-    // points into libc's static storage, read before any further libc call.
-    unsafe {
-        let pw = libc::getpwnam(cname.as_ptr());
-        if pw.is_null() || (*pw).pw_dir.is_null() {
-            return None;
-        }
-        let dir = CStr::from_ptr((*pw).pw_dir).to_str().ok()?;
-        Some(PathBuf::from(dir))
-    }
+    // An entry with no home must not resolve relative to the current directory.
+    crate::user::get_by_name(name)
+        .map(|u| u.dir)
+        .filter(|dir| !dir.as_os_str().is_empty())
 }
 
 #[cfg(test)]

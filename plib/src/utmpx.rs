@@ -11,6 +11,7 @@ use crate::platform::{self, endutxent, getutxent, setutxent, utmpxname};
 use std::ffi::{CStr, CString};
 use std::io;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 pub struct Utmpx {
     pub user: String,
@@ -42,7 +43,21 @@ pub fn ut_type_str(typ: libc::c_short) -> &'static str {
     }
 }
 
-// Internal function to load entries after utmpx stream is initialized
+/// Hold the process's one utmpx stream.
+///
+/// `getutxent` has no portable reentrant form: its position and the entry it
+/// returns are process-wide, so two threads reading at once would skip or tear
+/// each other's entries. Every reader takes this first and copies each entry
+/// out before the next `getutxent`.
+fn stream_lock() -> MutexGuard<'static, ()> {
+    static STREAM: Mutex<()> = Mutex::new(());
+    STREAM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+// Internal function to load entries after utmpx stream is initialized.
+// The caller holds `stream_lock`.
 fn load_entries() -> Vec<Utmpx> {
     let mut entries = Vec::new();
 
@@ -98,6 +113,7 @@ fn load_entries() -> Vec<Utmpx> {
 
 /// Load utmpx entries from the system default utmpx database.
 pub fn load() -> Vec<Utmpx> {
+    let _guard = stream_lock();
     unsafe {
         setutxent(); // Initialize the utx entry stream
     }
@@ -115,6 +131,7 @@ pub fn load_from_file(path: &Path) -> io::Result<Vec<Utmpx>> {
     let c_path =
         CString::new(path_str).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
+    let _guard = stream_lock();
     unsafe {
         // Set the utmpx database file
         // Note: Return value semantics differ between platforms (macOS returns 1 on success,

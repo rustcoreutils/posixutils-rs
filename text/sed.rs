@@ -1602,6 +1602,18 @@ fn parse_commands(
 struct Script(Vec<Command>);
 
 impl Script {
+    /// Close every two-address range, so that each must select its first
+    /// line again.
+    fn close_ranges(&mut self) {
+        for command in self.0.iter_mut() {
+            if let Some((Some(address), _)) = command.get_mut_address() {
+                for range in address.0.iter_mut() {
+                    range.active = false;
+                }
+            }
+        }
+    }
+
     /// Try parse raw script string to sequence of [`Command`]s
     /// formated as [`Script`]
     fn parse(raw_script: impl AsRef<str>) -> Result<Script, SedError> {
@@ -2513,10 +2525,14 @@ impl Sed {
         Ok(global_instruction)
     }
 
-    /// Executes all commands of [`Sed`]'s [`Script`]
-    /// for every line of the input stream; true when `q` ended it
+    /// Run the script over one stream -- all the input as one, or under `-s`
+    /// and `-i` one file -- and say whether `q` ended it. Each stream starts
+    /// as GNU sed starts each file: at line 1, with an empty hold space and
+    /// every range closed.
     fn process_input(&mut self) -> Result<bool, SedError> {
         self.pattern_space.clear();
+        self.hold_space.clear();
+        self.script.close_ranges();
         self.current_line = 0;
         self.is_last_line = false;
         let mut line;
@@ -2583,7 +2599,7 @@ impl Sed {
     }
 
     /// `-i`: edit each input file in place, as a stream of its own (its own
-    /// line numbers and `$`; the hold space carries over, as in GNU sed).
+    /// line numbers, `$`, hold space and ranges, as in GNU sed).
     /// A `q` ends the run once the file it was read from is written.
     fn edit_in_place(&mut self, suffix: &str) -> Result<(), SedError> {
         for name in std::mem::take(&mut self.input_sources) {

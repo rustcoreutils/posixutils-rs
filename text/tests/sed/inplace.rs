@@ -97,6 +97,27 @@ fn each_file_has_its_own_line_numbers_and_last_line() {
     assert_eq!(get(dir.path(), "f2"), "d!\n");
 }
 
+// Each file starts with an empty hold space and no range open, as in GNU sed.
+#[test]
+fn each_file_has_its_own_hold_space_and_ranges() {
+    let dir = TempDir::new().unwrap();
+    put(dir.path(), "f1", "a1\nb1\nc1\n");
+    put(dir.path(), "f2", "a2\nb2\nc2\n");
+    assert_ok(&sed_in(dir.path(), &["-i", "x", "f1", "f2"]));
+    assert_eq!(get(dir.path(), "f1"), "\na1\nb1\n");
+    assert_eq!(get(dir.path(), "f2"), "\na2\nb2\n");
+    put(dir.path(), "f1", "a1\nb1\nc1\n");
+    put(dir.path(), "f2", "a2\nb2\nc2\n");
+    assert_ok(&sed_in(dir.path(), &["-i", "2,5d", "f1", "f2"]));
+    assert_eq!(get(dir.path(), "f1"), "a1\n");
+    assert_eq!(get(dir.path(), "f2"), "a2\n");
+    put(dir.path(), "f1", "a1\nb1\nc1\n");
+    put(dir.path(), "f2", "a2\nb2\nc2\n");
+    assert_ok(&sed_in(dir.path(), &["-i", "/b1/,/b2/d", "f1", "f2"]));
+    assert_eq!(get(dir.path(), "f1"), "a1\n");
+    assert_eq!(get(dir.path(), "f2"), "a2\nb2\nc2\n");
+}
+
 // Everything sed writes goes into the file: `=`, `i`, `p`.
 #[test]
 fn all_output_goes_to_the_file() {

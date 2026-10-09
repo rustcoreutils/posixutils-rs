@@ -611,19 +611,19 @@ Debian source packages, with GNU patch's meaning:
    sed.  The suffix is only ever attached (`-i.bak`; `-ie` is a suffix of
    `e`), and with one the original is kept under its name plus the suffix,
    or under the suffix with each `*` replaced by the name.  Each file is a
-   stream of its own: line numbers restart and `$` is its last line; the hold
-   space carries over.  All output, `=` and `i` included, goes into the file;
-   `q` ends the run once its file is written.  The new version is created
-   exclusively beside the original, given its owner (when root) or group, and
-   mode, and renamed over the name, so a symbolic link operand is replaced by
-   a regular file, not written through.  Unlike GNU sed, a FIFO is refused
-   rather than read, and a suffix that names another directory is refused.
+   stream of its own: line numbers restart, `$` is its last line, the hold
+   space starts empty and a range left open by the file before is closed, so
+   it must select its first line again.  All output, `=` and `i` included,
+   goes into the file; `q` ends the run once its file is written.  The new
+   version is created exclusively beside the original, given its owner (when
+   root) or group, and mode, and renamed over the name, so a symbolic link
+   operand is replaced by a regular file, not written through.  Unlike GNU
+   sed, a FIFO is refused rather than read, and a suffix that names another
+   directory is refused.
  * `-s` / `--separate` — each file is a stream of its own, as under `-i`, but
    the output goes to standard output: line numbers restart, `$` is each
-   file's last line.  As under `-i`, the hold space and a range still open
-   carry over to the next file, where GNU sed 4.9 starts each file with both
-   cleared.  A file that cannot be read is reported and skipped; `q` ends the
-   run.
+   file's last line, the hold space starts empty and no range is open.  A
+   file that cannot be read is reported and skipped; `q` ends the run.
  * `PROJECT_NAME` — selects the gettext text domain.
 
 ### sh

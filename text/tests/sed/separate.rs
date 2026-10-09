@@ -8,7 +8,8 @@
 //
 
 //! The GNU extension `-s`/`--separate`: each file operand is a stream of its
-//! own, with its own line numbers and its own `$`, as under `-i`.
+//! own, with its own line numbers, its own `$`, an empty hold space and no
+//! range left open by the file before, as under `-i`.
 
 use plib::testing::{run_test, TempFile, TestPlan};
 use plib::tmp::TempDir;
@@ -65,6 +66,57 @@ fn line_numbers_restart() {
         "",
         0,
     );
+}
+
+fn three_line_files() -> (TempFile, TempFile) {
+    (
+        TempFile::new("s4", "a1\nb1\nc1\n"),
+        TempFile::new("s5", "a2\nb2\nc2\n"),
+    )
+}
+
+// Each file starts with an empty hold space, as in GNU sed.
+#[test]
+fn hold_space_starts_empty() {
+    let (f1, f2) = three_line_files();
+    let (p1, p2) = (path(&f1), path(&f2));
+    sed_separate(&["-s", "x", &p1, &p2], "", "\na1\nb1\n\na2\nb2\n", "", 0);
+    sed_separate(
+        &["-s", "H;$!d;x", &p1, &p2],
+        "",
+        "\na1\nb1\nc1\n\na2\nb2\nc2\n",
+        "",
+        0,
+    );
+    // Without -s the hold space runs on.
+    sed_separate(&["x", &p1, &p2], "", "\na1\nb1\nc1\na2\nb2\n", "", 0);
+}
+
+// A range still open at the end of a file is closed, as in GNU sed: the next
+// file's first line must match the first address again.
+#[test]
+fn open_range_ends_with_its_file() {
+    let (f1, f2) = three_line_files();
+    let (p1, p2) = (path(&f1), path(&f2));
+    sed_separate(
+        &["-s", "/b1/,/a2/d", &p1, &p2],
+        "",
+        "a1\na2\nb2\nc2\n",
+        "",
+        0,
+    );
+    sed_separate(&["-s", "2,5d", &p1, &p2], "", "a1\na2\n", "", 0);
+    sed_separate(&["-s", "/a2/,/b1/d", &p1, &p2], "", "a1\nb1\nc1\n", "", 0);
+    // A `c` range that the end of its file cuts off writes nothing.
+    sed_separate(
+        &["-s", "/b1/,/a2/c\\X", &p1, &p2],
+        "",
+        "a1\na2\nb2\nc2\n",
+        "",
+        0,
+    );
+    // Without -s the range runs on into the next file.
+    sed_separate(&["/b1/,/a2/d", &p1, &p2], "", "a1\nb2\nc2\n", "", 0);
 }
 
 // Standard input is a stream like any other, and `q` ends the whole run.

@@ -1328,3 +1328,11 @@ fn awk_unset_argument_becomes_the_callers_array() {
         });
     }
 }
+
+// An original program written in the style of texinfo's texindex.awk, which
+// hung, then failed to parse, then rejected every entry.  The expected
+// output is gawk's (mawk agrees).
+#[test]
+fn test_awk_sort_index_entries() {
+    test_awk!(sort_index_entries, "tests/awk/sort_index_entries.txt");
+}

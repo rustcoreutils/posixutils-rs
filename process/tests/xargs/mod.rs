@@ -794,3 +794,35 @@ fn argument_too_long_for_size_limit_is_an_error() {
 fn arguments_left_at_end_of_input_all_run() {
     xargs_test("aaa bbb ccc", "aaa bbb\nccc\n", vec!["-s", "13", "echo"]);
 }
+
+// By default a command line must leave room for the environment and stay well
+// under {ARG_MAX}: xargs packed 200000 short arguments into one command and
+// exec failed with E2BIG, because the default size was {ARG_MAX}-2048 with
+// neither the environment nor the argument pointers counted.
+#[test]
+fn many_arguments_fit_the_default_size() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let count = 200_000;
+    let input: String = (1..=count).map(|n| format!("{n}\n")).collect();
+    // Written in one go: the TestPlan runner feeds stdin in small paced chunks.
+    let mut child = Command::new(plib::testing::get_binary_path("xargs"))
+        .arg("echo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let output = child.wait_with_output().unwrap();
+    // A write error (xargs gone early) shows up in the assertions below.
+    let _ = writer.join().unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{:?}", output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    assert_eq!(words.len(), count);
+    assert_eq!(words.last(), Some(&"200000"));
+}

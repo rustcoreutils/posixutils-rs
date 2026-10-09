@@ -34,8 +34,30 @@ fn get_arg_max() -> usize {
     }
 }
 
+/// The default command line length when -s is not given: GNU xargs's,
+/// comfortably above the {LINE_MAX} POSIX requires as a minimum.
+const DEFAULT_SIZE: usize = 128 * 1024;
+
+/// Bytes the environment takes in exec's combined argument and environment
+/// lists: each string with its NUL, and its pointer.
+fn environment_size() -> usize {
+    std::env::vars_os()
+        .map(|(name, value)| name.len() + value.len() + 2 + mem::size_of::<*const u8>())
+        .sum()
+}
+
+/// The largest command line length allowed: POSIX bounds the combined
+/// argument and environment lists by {ARG_MAX}-2048 bytes.
 fn get_max_args_bytes() -> usize {
-    get_arg_max().saturating_sub(2048)
+    get_arg_max()
+        .saturating_sub(2048)
+        .saturating_sub(environment_size())
+}
+
+/// The command line length to build up to: -s's size, or the default, but
+/// never beyond what exec accepts.
+fn command_size_limit(maxsize: Option<usize>) -> usize {
+    maxsize.unwrap_or(DEFAULT_SIZE).min(get_max_args_bytes())
 }
 
 #[derive(Parser)]
@@ -352,7 +374,7 @@ impl ParseState {
             max_lines: args.lines,
             line_continues: false,
             line_has_content: false,
-            max_bytes: args.maxsize.unwrap_or_else(get_max_args_bytes),
+            max_bytes: command_size_limit(args.maxsize),
             max_args: args.maxnum,
             exit_on_overflow,
             args: VecDeque::new(),

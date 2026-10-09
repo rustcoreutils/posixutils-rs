@@ -1496,3 +1496,55 @@ fn test_rm_ri_declined_entries_and_their_parent() {
     );
     assert!(Path::new(s).exists());
 }
+
+/// `-v` quotes each name as GNU coreutils 9.4 does (and as cp and mv do): a newline, a quote and
+/// a byte that is not a character all come out unambiguous, from names in a directory and from
+/// operands alike.
+#[test]
+fn test_rm_v_quotes_names() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path();
+    let rm_in = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_rm"))
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+        assert_eq!(output.status.code(), Some(0));
+        let mut lines: Vec<String> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        lines.sort();
+        lines
+    };
+
+    fs::create_dir(dir.join("d")).unwrap();
+    fs::File::create(dir.join("d/a\nb")).unwrap();
+    fs::File::create(dir.join("d/it's")).unwrap();
+    let non_utf8 = plib::testing::create_non_utf8(&dir.join("d"), b"x\xffy", |p| {
+        fs::File::create(p).map(drop)
+    });
+    let mut expected = vec![
+        "removed 'd/a'$'\\n''b'",
+        "removed directory 'd'",
+        "removed \"d/it's\"",
+    ];
+    if non_utf8.is_some() {
+        expected.push("removed 'd/x'$'\\377''y'");
+    }
+    expected.sort();
+    assert_eq!(rm_in(&["-rv", "d"]), expected);
+
+    fs::File::create(dir.join("a\nb")).unwrap();
+    fs::File::create(dir.join("it's")).unwrap();
+    fs::create_dir(dir.join("e\nf")).unwrap();
+    assert_eq!(
+        rm_in(&["-v", "a\nb", "it's"]),
+        ["removed \"it's\"", "removed 'a'$'\\n''b'"]
+    );
+    assert_eq!(rm_in(&["-dv", "e\nf"]), ["removed directory 'e'$'\\n''f'"]);
+}

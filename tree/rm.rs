@@ -9,7 +9,7 @@
 
 mod common;
 
-use self::common::{error_string, exit_after_verbose, report_verbose};
+use self::common::{error_string, exit_after_verbose, quote_bytes, report_verbose};
 use clap::Parser;
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
@@ -93,13 +93,19 @@ fn ask_for_prompt(cfg: &RmConfig, writable: bool) -> bool {
 }
 
 // With `-v`, write the name of each removed entry to standard output (format unspecified by POSIX;
-// matches the `removed '…'` / `removed directory '…'` wording of common implementations).
-fn report_removed(cfg: &RmConfig, is_dir: bool, name: &str) {
+// matches the `removed '…'` / `removed directory '…'` wording of common implementations), quoted
+// as cp and mv quote names, trailing slashes reduced to one as in diagnostics.
+fn report_removed(cfg: &RmConfig, is_dir: bool, path: &Path) {
     if cfg.args.verbose {
+        let mut name = path.as_os_str().as_bytes();
+        while name.ends_with(b"//") {
+            name = &name[..name.len() - 1];
+        }
+        let name = quote_bytes(name);
         let msg = if is_dir {
-            gettext!("removed directory '{}'", name)
+            gettext!("removed directory {}", name)
         } else {
-            gettext!("removed '{}'", name)
+            gettext!("removed {}", name)
         };
         report_verbose(&msg);
     }
@@ -304,7 +310,7 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
                 };
                 Err(io::Error::other(err_str))
             } else {
-                report_removed(cfg, true, &entry.path().clean_trailing_slashes());
+                report_removed(cfg, true, entry.path().as_inner());
                 Ok(DirAction::Removed)
             }
         } else {
@@ -473,9 +479,8 @@ fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<Walked, ()> {
             }
         }
     } else {
-        if let Err(e) = remove_nondir_at(cfg, entry.dir_fd(), entry.file_name(), md, || {
-            entry.path().clean_trailing_slashes()
-        }) {
+        if let Err(e) = remove_nondir_at(cfg, entry.dir_fd(), entry.file_name(), md, &entry.path())
+        {
             eprintln!("rm: {}", error_string(&e));
             return Err(());
         }
@@ -525,7 +530,7 @@ fn remove_left_directory(
             eprintln!("rm: {}", err_str);
             return Err(());
         } else {
-            report_removed(cfg, true, &entry.path().clean_trailing_slashes());
+            report_removed(cfg, true, entry.path().as_inner());
         }
     }
 
@@ -636,26 +641,24 @@ fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
         parent_fd.as_raw_fd(),
         &basename_cstr,
         &metadata,
-        || display_cleaned(filepath),
+        filepath,
     )?;
     Ok(true)
 }
 
 /// Removes the non-directory `file_name` in the directory open on `dirfd`, which `metadata`
-/// describes, after prompting as the options require; `shown` names it in messages.
+/// describes, after prompting as the options require; `path` names it in messages.
 ///
 /// Declining the prompt is not an error. The returned error carries the full diagnostic.
-fn remove_nondir_at<F>(
+fn remove_nondir_at(
     cfg: &RmConfig,
     dirfd: libc::c_int,
     file_name: &CStr,
     metadata: &ftw::Metadata,
-    shown: F,
-) -> io::Result<()>
-where
-    F: Fn() -> String,
-{
-    if !should_remove_file(cfg, dirfd, file_name, metadata, &shown) {
+    path: &Path,
+) -> io::Result<()> {
+    let shown = || display_cleaned(path);
+    if !should_remove_file(cfg, dirfd, file_name, metadata, shown) {
         return Ok(());
     }
     let ret = unsafe { libc::unlinkat(dirfd, file_name.as_ptr(), 0) };
@@ -667,7 +670,7 @@ where
         let err_str = gettext!("cannot remove '{}': {}", shown(), error_string(&e));
         return Err(io::Error::other(err_str));
     }
-    report_removed(cfg, false, &shown());
+    report_removed(cfg, false, path);
     Ok(())
 }
 
@@ -697,7 +700,7 @@ fn rm_dir_empty(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     }
 
     match fs::remove_dir(filepath) {
-        Ok(()) => report_removed(cfg, true, &display_cleaned(filepath)),
+        Ok(()) => report_removed(cfg, true, filepath),
         Err(e) if is_already_gone(cfg, &e) => (),
         Err(e) => {
             let err_str = gettext!(
@@ -892,7 +895,7 @@ mod tests {
         let md = ftw::Metadata::new(dir_fd.as_raw_fd(), c"x.o", false).unwrap();
         fs::remove_file(tmp.path().join("x.o")).unwrap();
 
-        let shown = || String::from("x.o");
+        let shown = Path::new("x.o");
         assert!(remove_nondir_at(&config("-f"), dir_fd.as_raw_fd(), c"x.o", &md, shown).is_ok());
         let err = remove_nondir_at(&config("-v"), dir_fd.as_raw_fd(), c"x.o", &md, shown)
             .unwrap_err()

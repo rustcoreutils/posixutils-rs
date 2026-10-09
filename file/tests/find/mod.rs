@@ -870,36 +870,69 @@ fn find_type_l_under_follow() {
     );
 }
 
-/// The directories a walk holds open are close-on-exec: a command run by -exec inherits none.
+/// The descriptors `find ARGS -name f -exec` hands its child, one `NUM TARGET` line each, as the
+/// child lists them from `/proc`.  With `nofile`, find runs with that `RLIMIT_NOFILE`, which puts
+/// a deep walk in its descriptor-conserving mode: there the walk holds descriptors it opened
+/// without a directory stream, which glibc's `fdopendir` would otherwise mark close-on-exec.
 #[cfg(target_os = "linux")]
-#[test]
-fn find_exec_child_inherits_no_walk_descriptors() {
-    let tmp = scratch_dir();
-    let dir = tmp.path();
-    std::fs::create_dir_all(dir.join("a/b")).unwrap();
-    File::create(dir.join("a/b/f")).unwrap();
-
-    // The child lists its own descriptors: only the standard three, none of the directories
-    // the walk holds open around it.
-    let out = Command::new(get_binary_path("find"))
-        .arg(dir)
+fn exec_child_descriptors(nofile: Option<u32>, args: &[&std::ffi::OsStr]) -> Vec<(String, String)> {
+    let list = r#"for f in /proc/$$/fd/*; do printf '%s %s\n' "${f##*/}" "$(readlink "$f")"; done"#;
+    let limit = nofile.map_or(String::new(), |n| format!("ulimit -n {n}; "));
+    let out = Command::new("/bin/sh")
+        .args(["-c", &format!("{limit}exec \"$@\""), "sh"])
+        .arg(get_binary_path("find"))
+        .args(args)
         .args([
-            "-name",
-            "f",
-            "-exec",
-            "/bin/sh",
-            "-c",
-            "ls /proc/$$/fd",
-            "sh",
-            "{}",
-            ";",
+            "-name", "f", "-exec", "/bin/sh", "-c", list, "sh", "{}", ";",
         ])
         .stdin(Stdio::null())
         .output()
         .expect("failed to execute find");
     assert_eq!(String::from_utf8_lossy(&out.stderr), "");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n1\n2\n");
     assert_eq!(out.status.code(), Some(0));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| {
+            let (fd, target) = line.split_once(' ').unwrap_or((line, ""));
+            (fd.to_string(), target.to_string())
+        })
+        .collect()
+}
+
+/// The directories a walk holds open are close-on-exec: a command run by -exec inherits none,
+/// in a walk that holds a stream per level and in one deep enough to conserve descriptors.
+/// What the child may inherit from find's own parent (a test harness's jobserver pipes) is
+/// taken from a baseline: the same -exec on a file operand, which walks nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn find_exec_child_inherits_no_walk_descriptors() {
+    let tmp = scratch_dir();
+    let dir = tmp.path();
+    let deep = dir.join("1/2/3/4/5/6/7/8/9/10/11/12");
+    std::fs::create_dir_all(&deep).unwrap();
+    let file = deep.join("f");
+    File::create(&file).unwrap();
+    let tree = dir.to_str().unwrap();
+
+    let fds = |found: &[(String, String)]| -> Vec<String> {
+        found.iter().map(|(fd, _)| fd.clone()).collect()
+    };
+    for nofile in [None, Some(24)] {
+        let baseline = exec_child_descriptors(nofile, &[file.as_os_str()]);
+        for walk in [
+            &[dir.as_os_str()][..],
+            &[dir.as_os_str(), "-depth".as_ref()],
+        ] {
+            let walked = exec_child_descriptors(nofile, walk);
+            for (fd, target) in &walked {
+                assert!(
+                    !target.starts_with(tree),
+                    "fd {fd} -> {target}, nofile {nofile:?}, {walk:?}"
+                );
+            }
+            assert_eq!(fds(&walked), fds(&baseline), "nofile {nofile:?}, {walk:?}");
+        }
+    }
 }
 
 /// A trailing slash on a symlink operand follows the link and names a directory (POSIX pathname

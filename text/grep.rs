@@ -12,15 +12,35 @@ use gettextrs::gettext;
 use plib::regex::{Regex, RegexFlags};
 use std::{
     fs::File,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
 };
 
-/// Fold a string to lowercase under the current `LC_CTYPE` (libc `tolower`/
+/// Fold bytes to lowercase under the current `LC_CTYPE` (libc `tolower`/
 /// `towlower`), used for the `-F -i` fixed-string comparison so case-insensitive
 /// matching honors the locale rather than Rust's Unicode-only folding.
-fn locale_lower(s: &str) -> String {
-    s.chars().map(plib::locale::to_lower).collect()
+///
+/// The bytes are taken a character of the locale at a time; a byte that is no
+/// character (not valid UTF-8 in a UTF-8 locale, or above 0x7F in the C
+/// locale) is kept as it is.
+fn locale_lower(bytes: &[u8]) -> Vec<u8> {
+    let mut folded = Vec::with_capacity(bytes.len());
+    for ch in plib::locale::mb_char_slices(bytes) {
+        match std::str::from_utf8(ch) {
+            Ok(s) => {
+                for c in s.chars().map(plib::locale::to_lower) {
+                    folded.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+            }
+            Err(_) => folded.extend_from_slice(ch),
+        }
+    }
+    folded
+}
+
+/// Whether `needle` occurs in `haystack`.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// grep - search a file for a pattern
@@ -197,7 +217,7 @@ impl Args {
 
 /// Holds patterns for matching input data - either fixed strings or compiled regexes.
 enum Patterns {
-    Fixed(Vec<String>, bool, bool),
+    Fixed(Vec<Vec<u8>>, bool, bool),
     Regex(Vec<Regex>),
 }
 
@@ -230,7 +250,13 @@ impl Patterns {
             Ok(Self::Fixed(
                 patterns
                     .into_iter()
-                    .map(|p| if ignore_case { locale_lower(&p) } else { p })
+                    .map(|p| {
+                        if ignore_case {
+                            locale_lower(p.as_bytes())
+                        } else {
+                            p.into_bytes()
+                        }
+                    })
                     .collect(),
                 ignore_case,
                 line_regexp,
@@ -263,33 +289,31 @@ impl Patterns {
         }
     }
 
-    /// Checks if input string matches the present patterns.
+    /// Checks if the line `input` (its bytes, without the <newline>) matches
+    /// the present patterns.
     ///
-    /// # Arguments
-    ///
-    /// * `input` - object that implements [AsRef](AsRef) for [str](str) and describes line.
-    ///
-    /// # Returns
-    ///
-    /// Returns [bool](bool) - `true` if input matches present patterns, else `false`.
-    fn matches(&self, input: impl AsRef<str>) -> bool {
-        let input = input.as_ref();
+    /// A line need not be valid UTF-8: in the C locale every byte is a
+    /// character, and in a UTF-8 locale a byte that is no character still
+    /// leaves the rest of the line to match.
+    fn matches(&self, input: &[u8]) -> bool {
         match self {
             Patterns::Fixed(patterns, ignore_case, line_regexp) => {
+                let folded;
                 let input = if *ignore_case {
-                    locale_lower(input)
+                    folded = locale_lower(input);
+                    &folded
                 } else {
-                    input.to_string()
+                    input
                 };
                 patterns.iter().any(|p| {
                     if *line_regexp {
-                        input == *p
+                        input == p.as_slice()
                     } else {
-                        input.contains(p)
+                        contains_bytes(input, p)
                     }
                 })
             }
-            Patterns::Regex(patterns) => patterns.iter().any(|re| re.is_match(input)),
+            Patterns::Regex(patterns) => patterns.iter().any(|re| re.is_match_bytes(input)),
         }
     }
 }
@@ -367,74 +391,45 @@ impl GrepModel {
     /// * `reader` - [Box](Box) that contains object that implements [BufRead] and reads lines.
     fn process_input(&mut self, input_name: &str, mut reader: Box<dyn BufRead>) {
         let mut line_number: u64 = 0;
+        let mut line = Vec::new();
         loop {
-            let mut line = String::new();
+            line.clear();
             line_number += 1;
-            match reader.read_line(&mut line) {
-                Ok(n_read) => {
-                    if n_read == 0 {
-                        break;
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
+                    if self.patterns.matches(trimmed) == self.invert_match {
+                        continue;
                     }
-                    let trimmed = if line.ends_with('\n') {
-                        &line[..line.len() - 1]
-                    } else {
-                        &line
-                    };
-
-                    let init_matches = self.patterns.matches(trimmed);
-                    let matches = if self.invert_match {
-                        !init_matches
-                    } else {
-                        init_matches
-                    };
-                    if matches {
-                        self.any_matches = true;
-                        match &mut self.output_mode {
-                            OutputMode::Count(count) => {
-                                *count += 1;
+                    self.any_matches = true;
+                    match &mut self.output_mode {
+                        OutputMode::Count(count) => {
+                            *count += 1;
+                        }
+                        OutputMode::FilesWithMatches => {
+                            println!("{input_name}");
+                            break;
+                        }
+                        OutputMode::Quiet => {
+                            return;
+                        }
+                        OutputMode::Default => {
+                            let mut prefix = String::new();
+                            if self.multiple_inputs {
+                                prefix.push_str(input_name);
+                                prefix.push(':');
                             }
-                            OutputMode::FilesWithMatches => {
-                                println!("{input_name}");
-                                break;
+                            if self.line_number {
+                                prefix.push_str(&format!("{line_number}:"));
                             }
-                            OutputMode::Quiet => {
-                                return;
-                            }
-                            OutputMode::Default => {
-                                let result = format!(
-                                    "{}{}{}",
-                                    if self.multiple_inputs {
-                                        format!("{input_name}:")
-                                    } else {
-                                        String::new()
-                                    },
-                                    if self.line_number {
-                                        format!("{line_number}:")
-                                    } else {
-                                        String::new()
-                                    },
-                                    trimmed
-                                );
-                                println!("{result}");
-                            }
+                            write_line(prefix.as_bytes(), trimmed);
                         }
                     }
-                    line.clear();
                 }
-                // `read_line` has consumed a line that is not valid UTF-8:
-                // report it and go on with the next line.
-                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
-                    self.any_errors = true;
-                    if !self.no_messages {
-                        plib::diag::error(&format!(
-                            "{}: error reading line {} ({})",
-                            input_name, line_number, err
-                        ));
-                    }
-                }
-                // Any other error (EISDIR for a directory operand, EIO) does
-                // not advance the input and would recur on every retry: report
-                // it once and stop reading this input.
+                // A read error (EISDIR for a directory operand, EIO) does not
+                // advance the input and would recur on every retry: report it
+                // once and stop reading this input.
                 Err(err) => {
                     self.any_errors = true;
                     if !self.no_messages {
@@ -456,6 +451,25 @@ impl GrepModel {
             }
             *count = 0;
         }
+    }
+}
+
+/// Write a selected line, after `prefix`, to standard output as its bytes.
+/// grep cannot go on once its output fails, so a write error ends it with
+/// status 2.
+fn write_line(prefix: &[u8], line: &[u8]) {
+    let mut out = io::stdout().lock();
+    let written = out
+        .write_all(prefix)
+        .and_then(|()| out.write_all(line))
+        .and_then(|()| out.write_all(b"\n"));
+    if let Err(err) = written {
+        plib::diag::error(&format!(
+            "{}: {}",
+            gettext("write error"),
+            plib::diag::io_error_text(&err)
+        ));
+        std::process::exit(2);
     }
 }
 

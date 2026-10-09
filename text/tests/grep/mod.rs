@@ -156,8 +156,8 @@ fn test_basic_regexp_03() {
         &[BRE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -256,8 +256,8 @@ fn test_basic_regexp_line_number_03() {
         &["-n", BRE, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -305,13 +305,13 @@ fn test_basic_regexp_no_messages_with_error_04() {
 }
 
 #[test]
-fn test_basic_regexp_no_messages_with_error_05() {
+fn test_basic_regexp_no_messages_invalid_utf8_line_05() {
     grep_test(
         &["-s", BRE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
         "",
-        2,
+        0,
     );
 }
 
@@ -374,8 +374,8 @@ fn test_extended_regexp_03() {
         &["-E", ERE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -480,8 +480,8 @@ fn test_extended_regexp_line_number_03() {
         &["-E", "-n", ERE, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -539,13 +539,13 @@ fn test_extended_regexp_no_messages_with_error_04() {
 }
 
 #[test]
-fn test_extended_regexp_no_messages_with_error_05() {
+fn test_extended_regexp_no_messages_invalid_utf8_line_05() {
     grep_test(
         &["-E", "-s", ERE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
         "",
-        2,
+        0,
     );
 }
 
@@ -614,8 +614,8 @@ fn test_fixed_strings_03() {
         &["-F", FIXED, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -726,8 +726,8 @@ fn test_fixed_strings_line_number_03() {
         &["-F", "-n", FIXED, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -786,13 +786,13 @@ fn test_fixed_strings_no_messages_with_error_04() {
 }
 
 #[test]
-fn test_fixed_strings_no_messages_with_error_05() {
+fn test_fixed_strings_no_messages_invalid_utf8_line_05() {
     grep_test(
         &["-F", "-s", FIXED, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
         "",
-        2,
+        0,
     );
 }
 
@@ -1634,4 +1634,99 @@ fn test_unreadable_operand_is_reported_once() {
     assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
     assert!(stderr.contains(&*dir.to_string_lossy()), "{stderr:?}");
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// Run grep with `env` added to its environment; returns stdout, stderr and
+/// the exit status.
+fn grep_bytes_with_env(
+    args: &[&str],
+    stdin: &[u8],
+    env: &[(&str, &str)],
+) -> (Vec<u8>, String, i32) {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let out = plib::testing::run_test_base_with_env("grep", &args, stdin, env);
+    (
+        out.stdout,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+// A line that is not valid UTF-8 is still a line. In the C locale every byte
+// is a character, so it matches like any other; grep used to skip it with
+// "error reading line N" and exit 2, even with no locale set at all.
+#[test]
+fn test_line_not_valid_utf8_is_searched_in_the_c_locale() {
+    let c = [("LC_ALL", "C")];
+    let input: &[u8] = b"x\xff foo\nbar\n\xc3\xa9\xe9 FOO\n";
+    let cases: [(&[&str], &[u8]); 8] = [
+        (&["foo"], b"x\xff foo\n"),
+        (&["-F", "foo"], b"x\xff foo\n"),
+        (&["-i", "foo"], b"x\xff foo\n\xc3\xa9\xe9 FOO\n"),
+        (&["-F", "-i", "foo"], b"x\xff foo\n\xc3\xa9\xe9 FOO\n"),
+        (&["-v", "-n", "bar"], b"1:x\xff foo\n3:\xc3\xa9\xe9 FOO\n"),
+        (&["-c", "x. "], b"1\n"),
+        // `.` is one byte: three of them before the blank on line 3.
+        (&["^... "], b"\xc3\xa9\xe9 FOO\n"),
+        (&["-F", "-x", "\u{e9}\u{fffd}"], b""),
+    ];
+    for (args, expected) in cases {
+        let (out, err, code) = grep_bytes_with_env(args, input, &c);
+        let want_code = if expected.is_empty() { 1 } else { 0 };
+        assert_eq!(
+            (out.as_slice(), err.as_str(), code),
+            (expected, "", want_code),
+            "{args:?}"
+        );
+    }
+}
+
+// The same with no locale variable set at all (`env -i grep`).
+#[test]
+fn test_line_not_valid_utf8_is_searched_with_no_locale() {
+    let mut cmd = std::process::Command::new(plib::testing::get_binary_path("grep"));
+    cmd.env_clear()
+        .arg("foo")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"x\xff foo\n")
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.stdout, b"x\xff foo\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+// In a UTF-8 locale an invalid byte is no character at all: it is not matched
+// by `.`, but the rest of its line is searched and the line is written as is.
+#[test]
+fn test_line_not_valid_utf8_is_searched_in_a_utf8_locale() {
+    let Some(locale) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let env = [("LC_ALL", locale.as_str())];
+    let input: &[u8] = b"x\xff foo\n\xc3\xa9 FOO\n";
+    let cases: [(&[&str], &[u8]); 4] = [
+        (&["foo"], b"x\xff foo\n"),
+        (&["-F", "-i", "foo"], b"x\xff foo\n\xc3\xa9 FOO\n"),
+        (&["-c", "^. "], b"1\n"),
+        (&["-v", "foo"], b"\xc3\xa9 FOO\n"),
+    ];
+    for (args, expected) in cases {
+        let (out, err, code) = grep_bytes_with_env(args, input, &env);
+        assert_eq!(
+            (out.as_slice(), err.as_str(), code),
+            (expected, "", 0),
+            "{args:?}"
+        );
+    }
 }

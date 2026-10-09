@@ -645,10 +645,20 @@ impl GrepModel {
             pending.after_left -= 1;
             self.print_line(name, number, text, b'-', pending);
         } else if self.context.before > 0 {
-            if pending.before.len() == self.context.before {
-                pending.before.pop_front();
-            }
-            pending.before.push_back((number, text.to_vec()));
+            // Once the window is full, the line falling out of it lends its buffer to the new
+            // one, so a long run of unselected lines allocates nothing.
+            let mut buf = if pending.before.len() == self.context.before {
+                pending
+                    .before
+                    .pop_front()
+                    .map(|(_, buf)| buf)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            buf.clear();
+            buf.extend_from_slice(text);
+            pending.before.push_back((number, buf));
         }
     }
 

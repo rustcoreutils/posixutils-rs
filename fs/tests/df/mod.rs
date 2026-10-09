@@ -394,3 +394,41 @@ fn test_df_does_not_report_unrequested_mounts() {
         );
     }
 }
+
+/// -T adds the filesystem type as the second column.  guile's build reads it
+/// with `df -T "$1" | awk 'END{print $2}'`.
+#[test]
+fn test_df_type_column() {
+    for extra in [vec![], vec!["-k"], vec!["-P"], vec!["-P", "-k"]] {
+        let mut args = extra.clone();
+        args.extend(["-T", "/"]);
+        let typed = run_df_test(args);
+        let mut args = extra.clone();
+        args.push("/");
+        let plain = run_df_test(args);
+
+        let header: Vec<&str> = typed.lines().next().unwrap().split_whitespace().collect();
+        assert_eq!(&header[..2], ["Filesystem", "Type"], "{typed}");
+
+        let row: Vec<&str> = typed.lines().last().unwrap().split_whitespace().collect();
+        let plain_row: Vec<&str> = plain.lines().last().unwrap().split_whitespace().collect();
+        assert_eq!(row.len(), plain_row.len() + 1, "{typed}\n{plain}");
+        assert_eq!(row[0], plain_row[0]);
+        assert!(!row[1].is_empty() && !row[1].bytes().all(|b| b.is_ascii_digit()));
+        assert_eq!(row.last(), plain_row.last());
+
+        // The type is the one the mount table records for that mount point.
+        #[cfg(target_os = "linux")]
+        {
+            let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+            let fstype = mounts
+                .lines()
+                .map(|l| l.split(' ').collect::<Vec<_>>())
+                .filter(|f| Some(&f[1]) == row.last())
+                .map(|f| f[2].to_string())
+                .next_back()
+                .unwrap();
+            assert_eq!(row[1], fstype, "{typed}");
+        }
+    }
+}

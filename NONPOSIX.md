@@ -259,6 +259,10 @@ but no daemon to run them.  Behavior follows Vixie cron:
 
  * Failure to enumerate a mounted filesystem does not set a non-zero exit
    status.
+ * `-T` / `--print-type` — a `Type` column after `Filesystem`, with each file
+   system's type from the mount table (Linux) or `f_fstypename` (macOS), in
+   every output format including `-P`.  guile's build reads it with
+   `df -T PATH | awk 'END{print $2}'`.
 
 ### diff
 

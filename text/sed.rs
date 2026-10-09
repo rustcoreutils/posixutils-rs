@@ -1140,6 +1140,16 @@ fn emit(bytes: &[u8]) {
     }
 }
 
+/// Flush standard output before exit. Output that does not end in a
+/// <newline> is still in the line buffer then, and the flush the runtime does
+/// at exit discards its error; a write error ends sed as in [`emit`].
+fn flush_output() {
+    if let Err(err) = std::io::stdout().flush() {
+        eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
+        std::process::exit(4);
+    }
+}
+
 /// [`emit`] `text` and a <newline>.
 fn emit_line(text: &str) {
     emit(text.as_bytes());
@@ -2730,5 +2740,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             1
         });
 
+    flush_output();
     std::process::exit(exit_code);
 }

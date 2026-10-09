@@ -268,5 +268,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         plib::diag::error(&plib::diag::error_text(err.as_ref()));
     }
 
+    if !plib::diag::flush_stdout() {
+        exit_code = 1;
+    }
+
     std::process::exit(exit_code)
 }

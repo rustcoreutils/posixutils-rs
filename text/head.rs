@@ -236,5 +236,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         first = false;
     }
 
+    plib::diag::flush_stdout();
     std::process::exit(plib::diag::exit_status())
 }

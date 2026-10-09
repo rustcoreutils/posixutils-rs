@@ -491,3 +491,11 @@ fn test_tail_verbose_header_names_standard_input() {
     tail_test(&["-v", "-n1"], "a\nb\n", "==> standard input <==\nb\n");
     tail_test(&["-v", "-"], "a\n", "==> standard input <==\na\n");
 }
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in the line buffer until exit, where the error was lost.
+#[test]
+fn test_tail_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("tail", &[], b"x", 1);
+    plib::testing::assert_write_error_on_full_device("tail", &["-c", "1"], b"x\ny", 1);
+}

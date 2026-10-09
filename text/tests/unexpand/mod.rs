@@ -257,3 +257,10 @@ fn test_unexpand_names_the_failing_operand_among_several() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("unexpand", &["-t", "-zq", "--help"]);
 }
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in the line buffer until exit, where the error was lost.
+#[test]
+fn test_unexpand_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("unexpand", &[], b"x", 1);
+}

@@ -362,6 +362,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         process::exit(1_i32);
     }
 
+    if !plib::diag::flush_stdout() {
+        process::exit(1_i32);
+    }
+
     Ok(())
 }
 

@@ -178,5 +178,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         plib::diag::error(&format!("{}", e));
     }
 
+    plib::diag::flush_stdout();
     std::process::exit(plib::diag::exit_status())
 }

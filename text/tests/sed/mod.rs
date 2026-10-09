@@ -2785,3 +2785,11 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("sed", &[opt, "-zq", "--help"]);
     }
 }
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in the line buffer until exit, where the error was lost.
+#[test]
+fn test_sed_reports_write_error_on_final_partial_line() {
+    // GNU sed's status for an I/O error, as sed uses for every write error.
+    plib::testing::assert_write_error_on_full_device("sed", &["-n", "p"], b"x", 4);
+}

@@ -466,3 +466,11 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("head", &[opt, "-zq", "--help"]);
     }
 }
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in the line buffer until exit, where the error was lost.
+#[test]
+fn test_head_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("head", &[], b"x", 1);
+    plib::testing::assert_write_error_on_full_device("head", &["-c", "1"], b"xy\n", 1);
+}

@@ -2363,3 +2363,29 @@ fn lone_dash_elsewhere_is_not_s() {
     assert!(!out.stderr.is_empty());
     assert_ne!(out.status.code(), Some(0));
 }
+
+// POSIX e: "The currently remembered pathname shall be set to file", and r
+// sets it when none is remembered -- whether or not the file can be read. A
+// file operand that does not exist yet is therefore the one `w` writes.
+#[test]
+fn failed_read_still_remembers_the_pathname() {
+    let dir = plib::tmp::tempdir().unwrap();
+    fs::write(dir.path().join("e1"), "hello\n").unwrap();
+
+    let out = ed_in(dir.path(), &["-s", "newf"], "a\nnew\n.\nw\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("newf")).unwrap(),
+        "new\n"
+    );
+
+    let out = ed_in(dir.path(), &["-s", "e1"], "e nosuch\nf\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "?\nnosuch\n");
+
+    let out = ed_in(dir.path(), &["-s"], "r nosuch\nf\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "?\nnosuch\n");
+
+    // r does not replace a pathname already remembered.
+    let out = ed_in(dir.path(), &["-s", "e1"], "r nosuch\nf\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "?\ne1\n");
+}

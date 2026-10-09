@@ -369,6 +369,10 @@ impl Buffer {
 
     /// Read a file into the buffer, replacing contents.
     pub fn read_file(&mut self, pathname: &str) -> io::Result<usize> {
+        // POSIX e: the remembered pathname is set to the file whether or not
+        // it can be read, so a file that does not exist yet is the one `w`
+        // writes.
+        self.pathname = String::from(pathname);
         let file = fs::File::open(pathname)?;
         let mut reader = BufReader::new(file);
         let mut lines = Vec::new();
@@ -385,7 +389,6 @@ impl Buffer {
         }
 
         self.lines = lines;
-        self.pathname = String::from(pathname);
         self.cur_line = if self.lines.is_empty() {
             0
         } else {
@@ -433,6 +436,11 @@ impl Buffer {
 
     /// Read a file and append after a line.
     pub fn read_file_at(&mut self, pathname: &str, after_line: usize) -> io::Result<usize> {
+        // POSIX r: the file becomes the remembered pathname when none is,
+        // whether or not it can be read.
+        if self.pathname.is_empty() {
+            self.pathname = String::from(pathname);
+        }
         let file = fs::File::open(pathname)?;
         let mut reader = BufReader::new(file);
         let mut lines = Vec::new();

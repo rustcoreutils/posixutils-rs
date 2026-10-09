@@ -476,3 +476,48 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("msgfmt", &[opt, "-zq", "--help"]);
     }
 }
+
+/// gettext's configure keeps a msgfmt only if
+/// `msgfmt --statistics /dev/null` succeeds; an empty input writes no catalog.
+#[test]
+fn test_msgfmt_statistics_on_empty_input() {
+    let dir = TempDir::new().unwrap();
+    assert_eq!(
+        msgfmt_status(dir.path(), &["--statistics", "/dev/null"]),
+        ("0 translated messages.\n".to_string(), 0)
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+/// --statistics counts as GNU msgfmt does, singular for a count of one.
+#[test]
+fn test_msgfmt_statistics_counts() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "a"
+msgstr "A"
+
+#, fuzzy
+msgid "b"
+msgstr "B"
+
+msgid "c"
+msgstr ""
+
+msgid "d"
+msgstr "D"
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    assert_eq!(
+        msgfmt_status(dir.path(), &["--statistics", "-o", "/dev/null", po]),
+        (
+            "2 translated messages, 1 fuzzy translation, 1 untranslated message.\n".to_string(),
+            0
+        )
+    );
+}

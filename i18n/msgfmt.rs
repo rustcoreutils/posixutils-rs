@@ -40,6 +40,9 @@ struct Args {
     #[arg(long, help = gettext("Reject domain directives when an output file is named"))]
     check_domain: bool,
 
+    #[arg(long, help = gettext("Print translation statistics to standard error"))]
+    statistics: bool,
+
     #[arg(short = 'f', help = gettext("Include fuzzy entries in the output"))]
     include_fuzzy: bool,
 
@@ -231,8 +234,8 @@ fn main() {
         exit_code = 1;
     }
 
-    // -v: print translation statistics.
-    if args.verbose {
+    // -v or --statistics: print translation statistics.
+    if args.verbose || args.statistics {
         print_statistics(n_translated, n_fuzzy, n_untranslated);
     }
 
@@ -477,16 +480,23 @@ fn conversion_class(c: char) -> char {
     }
 }
 
-/// Print `-v` translation statistics to standard error.
+/// Print `-v` / `--statistics` translation statistics to standard error, in
+/// GNU msgfmt's wording.
 fn print_statistics(translated: usize, fuzzy: usize, untranslated: usize) {
-    let mut parts = vec![format!("{} translated messages", translated)];
+    let mut parts = vec![count_phrase(translated, "translated message")];
     if fuzzy > 0 {
-        parts.push(format!("{} fuzzy translations", fuzzy));
+        parts.push(count_phrase(fuzzy, "fuzzy translation"));
     }
     if untranslated > 0 {
-        parts.push(format!("{} untranslated messages", untranslated));
+        parts.push(count_phrase(untranslated, "untranslated message"));
     }
     eprintln!("{}.", parts.join(", "));
+}
+
+/// "1 fuzzy translation", "2 fuzzy translations".
+fn count_phrase(n: usize, noun: &str) -> String {
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{} {}{}", n, noun, plural)
 }
 
 /// Truncate a string for display, respecting character boundaries.

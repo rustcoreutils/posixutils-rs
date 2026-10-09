@@ -423,6 +423,10 @@ The two GNU checks po4a runs on every PO file
  * `--check-domain` — with `-o`, which ignores `domain` directives, each
    domain a file names is reported as an error.
 
+ * `--statistics` — print the translated / fuzzy / untranslated counts to
+   standard error, as `-v` does, in GNU's wording.  gettext's `po.m4` keeps a
+   msgfmt only if `msgfmt --statistics /dev/null` succeeds.
+
 ### newgrp
 
  * `SHELL` is consulted for the shell to exec.  POSIX derives it from the user

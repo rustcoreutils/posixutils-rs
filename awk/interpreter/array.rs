@@ -139,6 +139,12 @@ impl Array {
         }
     }
 
+    /// The value of the element with the given key, without creating it.
+    pub fn get(&self, key: &str) -> Option<&AwkValue> {
+        let index = *self.key_map.get(key)?;
+        self.pairs[index].as_ref().map(|(_, value)| value)
+    }
+
     pub fn contains(&self, key: &str) -> bool {
         self.key_map.contains_key(key)
     }

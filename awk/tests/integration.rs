@@ -1114,9 +1114,12 @@ fn awk_with_deadline_input(program: &str, input: &str) -> (String, String, Optio
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // the input is small, so writing it all before reading cannot deadlock
+    // the input is small, so writing it all before reading cannot deadlock;
+    // awk may exit without reading it
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(input.as_bytes()).unwrap();
+    if let Err(error) = stdin.write_all(input.as_bytes()) {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
     drop(stdin);
     let start = Instant::now();
     while child.try_wait().unwrap().is_none() {
@@ -1837,4 +1840,45 @@ fn awk_exit_skips_input_and_keeps_its_status() {
         );
         assert_eq!(status, Some(exit_status), "{program}");
     }
+}
+
+// Plain getline reads the main input: in BEGIN it opens the first file
+// (standard input here), and at the end of a file it goes on to the next
+// operand, performing assignments on the way; in END there is no more
+// input (gawk's tests getline2 and gsubtst3).  FILENAME is empty until a
+// file is opened.
+#[test]
+fn awk_getline_reads_the_main_input() {
+    let cases = [
+        (
+            "BEGIN { while ((getline l) > 0) n++; print n, NR }",
+            "3 3\n",
+        ),
+        (
+            "BEGIN { getline; print \"begin\", $0, NR } { print \"main\", $0, NR }",
+            "begin a 1\nmain b 2\nmain c 3\n",
+        ),
+        (
+            "BEGIN { printf \"[%s]\", FILENAME; getline; print FILENAME }",
+            "[]-\n",
+        ),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "a\nb\nc\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+    test_awk(
+        vec![
+            "{ n = 0; while ((getline l) > 0) n++; print FILENAME, FNR, NR, n, x } END { print NR, (getline l) }".to_string(),
+            "tests/awk/test_data2.txt".to_string(),
+            "x=5".to_string(),
+            "tests/awk/test_data3.txt".to_string(),
+        ],
+        "tests/awk/test_data3.txt 6 11 10 5\n11 0\n",
+    );
 }

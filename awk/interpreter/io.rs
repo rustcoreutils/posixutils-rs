@@ -298,32 +298,6 @@ impl RecordReader for StringRecordReader {
     }
 }
 
-/// A no-op record reader that immediately signals EOF.
-/// The `ere_byte_buffer` field exists solely to satisfy the `RecordReader` trait;
-/// `Vec::new()` (via `Default`) does not heap-allocate.
-#[derive(Default)]
-pub struct EmptyRecordReader {
-    ere_byte_buffer: Vec<u8>,
-}
-
-impl Iterator for EmptyRecordReader {
-    type Item = ReadResult;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
-
-impl RecordReader for EmptyRecordReader {
-    fn is_done(&self) -> bool {
-        true
-    }
-
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
-        &mut self.ere_byte_buffer
-    }
-}
-
 #[derive(Default)]
 pub struct WriteFiles {
     files: HashMap<String, File>,

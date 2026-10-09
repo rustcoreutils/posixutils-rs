@@ -82,7 +82,7 @@ impl Test {
                 &mut self.record,
                 &mut stack,
                 &mut GlobalEnv::default(),
-                &mut EmptyRecordReader::default(),
+                &mut MainInput::exhausted(),
             )
             .expect("execution generated an error");
 

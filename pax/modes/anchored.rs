@@ -1075,8 +1075,12 @@ pub(crate) fn make_dir_at(
                 tree.claim_implicit(&st, member);
                 Ok(DirAttrs::Apply(id))
             }
+            // -k leaves it alone, as it does any directory found existing;
+            // there is nothing to withhold.
+            Standing::Unverified | Standing::Made | Standing::Ordinary if no_clobber => {
+                Ok(DirAttrs::Keep)
+            }
             Standing::Unverified => Ok(DirAttrs::Withheld(id)),
-            Standing::Made | Standing::Ordinary if no_clobber => Ok(DirAttrs::Keep),
             // Whether one found existing may take them is decided when they
             // are applied, from its parent (`apply_dir_attrs`).
             Standing::Made | Standing::Ordinary => Ok(DirAttrs::Apply(id)),
@@ -2239,6 +2243,26 @@ mod tests {
             tree.note_left_as(&status(id, stamped));
             assert!(tree.standing(&status(id, stamped), &p) == Standing::Made);
         }
+    }
+
+    /// -k leaves an existing directory entirely alone, and says nothing: one
+    /// this run made with an owner it could not verify (`Standing::Unverified`,
+    /// NFS or FUSE) too. Its attributes were withheld and diagnosed even under
+    /// -k; without -k they still are.
+    #[test]
+    fn test_no_clobber_keeps_an_unverified_directory_silently() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("u")).unwrap();
+        let u = file_id(&stat_at(tree.root(), c"u").unwrap());
+        tree.unverified.borrow_mut().insert(u);
+
+        let kept = make_dir_at(&tree, tree.root(), &member("u"), 0o755, true).unwrap();
+        assert_eq!(kept, DirAttrs::Keep);
+        let decided = make_dir_at(&tree, tree.root(), &member("u"), 0o755, false).unwrap();
+        assert_eq!(decided, DirAttrs::Withheld(u));
+        let st = stat_at(tree.root(), c"u").unwrap();
+        assert!(tree.standing(&st, &member("u").key()) == Standing::Unverified);
     }
 
     /// A directory recorded as found in place of one made, or as made with

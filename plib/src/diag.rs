@@ -265,6 +265,26 @@ pub fn exit_status() -> i32 {
     }
 }
 
+/// Flush standard output at the end of a run, and report a failure.
+///
+/// Standard output is line-buffered, so output that does not end in a
+/// <newline> is still in the buffer when `main` returns or calls
+/// `std::process::exit`. The runtime flushes it then but discards the error,
+/// so a final partial line written to a full disk was lost with exit status 0
+/// (`printf x | cat >/dev/full`). Call this after the last output: a failure
+/// is reported as `UTILITY: write error: REASON`, counted like any [`error`],
+/// and `false` is returned for the caller to fold into the exit status its
+/// specification gives an error.
+pub fn flush_stdout() -> bool {
+    match io::stdout().flush() {
+        Ok(()) => true,
+        Err(e) => {
+            error(&format!("write error: {}", io_error_text(&e)));
+            false
+        }
+    }
+}
+
 /// Render an `io::Error` the way a system utility reports one.
 ///
 /// Rust's `Display` appends `" (os error 2)"` to the strerror text, so a

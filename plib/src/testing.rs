@@ -552,6 +552,47 @@ pub fn assert_epipe_when_sigpipe_ignored(cmd: &str, args: &[&str], status: i32) 
     );
 }
 
+/// Assert that a utility whose standard output is `/dev/full` reports the
+/// failed write: it exits with `status`, does not panic, and gives the
+/// system's text for `ENOSPC` on standard error.
+///
+/// Feed it input whose output does not end in a <newline>: standard output is
+/// line-buffered, and a final partial line reaches the device only when the
+/// buffer is flushed at exit, where the runtime discards the error. Hosts
+/// without `/dev/full` (macOS) skip the check.
+pub fn assert_write_error_on_full_device(cmd: &str, args: &[&str], stdin: &[u8], status: i32) {
+    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        return;
+    };
+    let enospc = {
+        let mut probe = full.try_clone().expect("dup /dev/full");
+        crate::diag::io_error_text(&probe.write_all(b"x").unwrap_err())
+    };
+    let mut child = Command::new(get_binary_path(cmd))
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {}: {}", cmd, e));
+    let mut input = child.stdin.take().expect("stdin");
+    input.write_all(stdin).expect("write stdin");
+    drop(input);
+    let out = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(status),
+        "{cmd} {args:?} >/dev/full: wrong exit status; stderr {stderr:?}"
+    );
+    assert!(
+        stderr.contains(&enospc) && !stderr.contains("panicked"),
+        "{cmd} {args:?} >/dev/full: expected a write-error diagnostic, got {stderr:?}"
+    );
+}
+
 /// A file a test wrote, alone in a temporary directory of its own.
 ///
 /// Dropping it removes the directory and the file, and a panic drops it, so a

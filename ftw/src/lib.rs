@@ -759,14 +759,15 @@ where
 /// Every prefix component is opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC` plus `open_flags` (a
 /// walk's descent flags, so `O_NOFOLLOW` when it does not follow links). `O_DIRECTORY` refuses a
 /// FIFO or device swapped in for a component before the open can block on it or open the
-/// device. With `identities` (one recorded `(dev, ino)` per component of `path`), each opened
-/// component must also be the very directory the walk recorded there.
+/// device. With `identities` (giving one recorded `(dev, ino)` per component of `path`, and
+/// called only once a component is to be opened), each opened component must also be the very
+/// directory the walk recorded there.
 fn open_long_filename<'a, H>(
     mut starting_dir: FileDescriptor,
     path: &'a Path,
     mut path_stack: Option<&mut Vec<Rc<[libc::c_char]>>>,
     open_flags: libc::c_int,
-    identities: Option<&[(libc::dev_t, libc::ino_t)]>,
+    identities: Option<&dyn Fn() -> Vec<(libc::dev_t, libc::ino_t)>>,
     err_reporter: &mut H,
 ) -> io::Result<(FileDescriptor, std::path::Components<'a>)>
 where
@@ -774,6 +775,7 @@ where
 {
     let mut path_components = path.components();
     let mut opened = 0usize;
+    let mut recorded: Option<Vec<(libc::dev_t, libc::ino_t)>> = None;
 
     // If `path` is too long, start at a prefix of `path`
     loop {
@@ -823,7 +825,7 @@ where
         )
         .and_then(|fd| match identities {
             // Fail closed: a component with no recorded identity, or the wrong one, is refused.
-            Some(ids) => match ids.get(opened) {
+            Some(gather) => match recorded.get_or_insert_with(gather).get(opened) {
                 Some(&(dev, ino)) if fd_matches(&fd, dev, ino) => Ok(fd),
                 _ => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
             },

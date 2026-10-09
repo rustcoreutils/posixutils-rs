@@ -244,10 +244,11 @@ impl DeferredDir {
         // remainder - bar/baz
         let remainder = self.path.strip_prefix(&self.parent.1).unwrap();
 
-        // `remainder` is not guaranteed to be shorter than `libc::PATH_MAX`. When it is not, the
-        // prefix is opened one component at a time, each with this walk's descent flags and
-        // checked against the identity the walk recorded for it.
-        let identities = self.component_identities();
+        // `remainder` is not guaranteed to be shorter than `libc::PATH_MAX`. When it is not (or
+        // resolving it at once meets ELOOP), the prefix is opened one component at a time, each
+        // with this walk's descent flags and checked against the identity the walk recorded for
+        // it. The identities are gathered only then: most reopens resolve in one call.
+        let identities = || self.component_identities();
         let (starting_dir, components) = open_long_filename(
             self.parent.0.try_clone()?,
             remainder,

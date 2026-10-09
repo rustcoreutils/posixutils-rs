@@ -508,6 +508,84 @@ fn deferred_long_path_reopen_refuses_fifo_component() {
     }
 }
 
+/// A deferred directory reopened one component at a time checks every component against the
+/// identity the walk recorded for it, not only the directory reached: a component replaced by
+/// another directory holding the rest of the path (the same directories below) is refused.
+#[test]
+fn deferred_long_path_reopen_refuses_a_replaced_component() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let tmp = plib::tmp::Builder::new()
+        .prefix("ftw_race_long_ident")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let base = tmp.path().to_path_buf();
+    let root = base.join("root");
+    fs::create_dir(&root).unwrap();
+
+    // Twenty 250-byte components: far past PATH_MAX from `root`, so made through descriptors.
+    const DEPTH: usize = 20;
+    let names: Vec<String> = (0..DEPTH)
+        .map(|i| format!("{i:02}{}", "d".repeat(248)))
+        .collect();
+    let mut dir = fs::File::open(&root).unwrap();
+    for name in &names {
+        let c = std::ffi::CString::new(name.as_str()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) },
+            0
+        );
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+            )
+        };
+        assert!(fd >= 0);
+        dir = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+    drop(dir);
+
+    // The second component is replaced by a new directory, and the third moved into it: the
+    // path from `root` again leads to the very same directories below.
+    let first = root.join(&names[0]);
+    let last_name = names[DEPTH - 1].clone();
+    let mut swapped = false;
+    let mut long_errors = 0usize;
+    traverse_directory(
+        &root,
+        |entry| {
+            if !swapped && entry.file_name().to_bytes() == last_name.as_bytes() {
+                let old = first.join(&names[1]);
+                fs::rename(&old, base.join("moved")).unwrap();
+                fs::create_dir(&old).unwrap();
+                fs::rename(base.join("moved").join(&names[2]), old.join(&names[2])).unwrap();
+                swapped = true;
+            }
+            Ok(true)
+        },
+        |_entry, _exit| Ok(()),
+        |entry, _err| {
+            // Only a reopen longer than `PATH_MAX` goes component by component; a shorter one
+            // is refused by the identity of the directory it reaches.
+            if entry.path().as_inner().as_os_str().len() >= libc::PATH_MAX as usize {
+                long_errors += 1;
+            }
+        },
+        TraverseDirectoryOpts {
+            // Conserve descriptors from the first level on.
+            caller_fds_per_level: 4096,
+            ..Default::default()
+        },
+    );
+    assert!(swapped, "the swap must have run");
+    assert!(
+        long_errors > 0,
+        "a long reopen through the replaced component must be refused"
+    );
+}
+
 /// Walk `root` after the handler for the starting point itself has replaced it using `swap`.
 /// Returns the names visited and the number of errors reported.
 fn walk_after_root_swap(tag: &str, swap: impl Fn(&Path, &Path)) -> (HashSet<String>, usize) {

@@ -8,10 +8,8 @@
 //
 
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::PermissionsExt;
+use std::ffi::OsString;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
@@ -333,33 +331,6 @@ fn disable_core_dumps() -> bool {
     (unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) } == 0)
 }
 
-/// Searches for the executable utility in the directories specified by the `PATH` environment variable.
-///
-/// # Arguments
-///
-/// * `utility` - name of the utility to search for.
-///
-/// # Returns
-///
-/// `Option<PathBuf>` - full path to the utility if found, or `None` if not found.
-fn search_in_path(utility: &OsStr) -> Option<PathBuf> {
-    // `var_os`: a PATH that is not valid UTF-8 is still a PATH.
-    if let Some(paths) = std::env::var_os("PATH") {
-        for path in std::env::split_paths(&paths) {
-            let full_path = path.join(utility);
-            if full_path.is_file() {
-                if let Ok(metadata) = std::fs::metadata(&full_path) {
-                    // Check if the file is executable
-                    if metadata.permissions().mode() & 0o111 != 0 {
-                        return Some(full_path);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Main timeout function that creates child and processes its return exit status.
 ///
 /// # Arguments
@@ -381,23 +352,6 @@ fn timeout(args: Args) -> i32 {
     let (utility, arguments) = command
         .split_first()
         .expect("clap requires the utility operand");
-
-    let utility_path = if Path::new(utility).is_file() {
-        PathBuf::from(utility)
-    } else {
-        match search_in_path(utility) {
-            Some(path) => path,
-            None => {
-                diag::error(&format!(
-                    "{} '{}' {}",
-                    gettext("utility"),
-                    utility.to_string_lossy(),
-                    gettext("not found")
-                ));
-                return 127;
-            }
-        }
-    };
 
     FOREGROUND.store(foreground, Ordering::SeqCst);
     FIRST_SIGNAL.store(signal_name, Ordering::SeqCst);
@@ -429,7 +383,8 @@ fn timeout(args: Args) -> i32 {
     block_handler_and_chld(signal_name, &mut original_set);
 
     let spawn_result = unsafe {
-        Command::new(&utility_path)
+        // A name without a slash is searched for through PATH by execvp.
+        Command::new(utility)
             .args(arguments)
             .pre_exec(move || {
                 libc::sigprocmask(

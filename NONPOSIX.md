@@ -308,6 +308,10 @@ but no daemon to run them.  Behavior follows Vixie cron:
    GNU diff compares it as empty too.
  * `-w` / `--ignore-all-space` — ignore all white space, wherever it is in
    the line; `-w` wins over `-b`.
+ * `-s` / `--report-identical-files` — report `Files A and B are identical`
+   for a pair with no differences under the options given, in any output
+   format, with `-q`, and for each such pair a directory comparison meets.
+   libzstd's tests run `$DIFF -s tmp1 tmp`.
 
 ### echo
 

@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+use super::diff_exit_status::DiffExitStatus;
+
 /// How white space takes part in comparing two lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WhiteSpace {
@@ -40,11 +42,21 @@ pub struct FormatOptions {
     /// `-N` (GNU): a directory entry missing on one side is compared as an
     /// empty file, or as an empty directory.
     pub new_file: bool,
+    /// `-s` (GNU): report a pair of files found identical.
+    pub report_identical: bool,
     label1: Option<String>,
     label2: Option<String>,
 }
 
 impl FormatOptions {
+    /// The result for two files found identical: under -s, say so.
+    pub fn identical(&self, name1: &str, name2: &str) -> DiffExitStatus {
+        if self.report_identical {
+            println!("Files {} and {} are identical", name1, name2);
+        }
+        DiffExitStatus::NotDifferent
+    }
+
     /// Infallible: the labels are validated where they are parsed, so a bad
     /// combination is a usage error with a diagnostic rather than something
     /// every caller has to unwrap.
@@ -59,6 +71,7 @@ impl FormatOptions {
             output_format,
             brief: false,
             new_file: false,
+            report_identical: false,
             label1,
             label2,
         }

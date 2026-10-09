@@ -2275,3 +2275,100 @@ fn test_diff_ignore_all_space() {
     diff_test(&["-w", &lf, &bare], "", EXIT_STATUS_NO_DIFFERENCE);
     diff_test(&["-q", "-w", &lf, &crlf], "", EXIT_STATUS_NO_DIFFERENCE);
 }
+
+/// GNU `-s` / `--report-identical-files`: a pair found identical, under the
+/// comparison options in force, is reported as such with status 0; a differing
+/// pair is reported as without -s. libzstd's tests run `$DIFF -s tmp1 tmp`.
+#[test]
+fn test_diff_report_identical_files() {
+    let a = write_tmp("s_a", b"a\n");
+    let a2 = write_tmp("s_a2", b"a\n");
+    let a_space = write_tmp("s_a3", b"a \n");
+    let b = write_tmp("s_b", b"b\n");
+    let bin1 = write_tmp("s_bin1", b"\0x");
+    let bin2 = write_tmp("s_bin2", b"\0x");
+    let same = |x: &str, y: &str| format!("Files {x} and {y} are identical\n");
+
+    for opt in ["-s", "--report-identical-files"] {
+        diff_test(&[opt, &a, &a2], &same(&a, &a2), EXIT_STATUS_NO_DIFFERENCE);
+    }
+    diff_test(&["-s", &a, &a], &same(&a, &a), EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-sq", &a, &a2], &same(&a, &a2), EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-su", &a, &a2], &same(&a, &a2), EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-sw", &a, &a_space], &same(&a, &a_space), 0);
+    diff_test(&["-s", &bin1, &bin2], &same(&bin1, &bin2), 0);
+    diff_test(
+        &["-s", &a, &b],
+        "1c1\n< a\n---\n> b\n",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test(
+        &["-sq", &a, &b],
+        &format!("Files {a} and {b} differ\n"),
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    run_test(TestPlan {
+        cmd: String::from("diff"),
+        args: vec!["-s".into(), "-".into(), a2.to_string()],
+        stdin_data: String::from("a\n"),
+        expected_out: same("-", &a2),
+        expected_err: String::new(),
+        expected_exit_code: EXIT_STATUS_NO_DIFFERENCE,
+    });
+}
+
+/// -s in a directory comparison: each identical pair of files is reported, in
+/// the place its diff would be, under -r in subdirectories too, and with -q.
+#[test]
+fn test_diff_report_identical_files_in_directories() {
+    let tmp = TempDir::new().unwrap();
+    let (d1, d2) = (tmp.path().join("d1"), tmp.path().join("d2"));
+    for (name, one, two) in [
+        ("diff", "y\n", "z\n"),
+        ("empty", "", ""),
+        ("same", "x\n", "x\n"),
+        ("sub/s", "q\n", "q\n"),
+    ] {
+        for (dir, content) in [(&d1, one), (&d2, two)] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+    }
+    std::fs::write(d1.join("only"), "o\n").unwrap();
+    let (d1, d2) = (d1.to_str().unwrap(), d2.to_str().unwrap());
+    let same = |name: &str| format!("Files {d1}/{name} and {d2}/{name} are identical\n");
+
+    let hunk = "1c1\n< y\n---\n> z\n";
+    diff_test(
+        &["-s", d1, d2],
+        &format!(
+            "diff -s {d1}/diff {d2}/diff\n{hunk}{}Only in {d1}: only\n{}\
+             Common subdirectories: {d1}/sub and {d2}/sub\n",
+            same("empty"),
+            same("same"),
+        ),
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test(
+        &["-sr", d1, d2],
+        &format!(
+            "diff -sr {d1}/diff {d2}/diff\n{hunk}{}Only in {d1}: only\n{}{}",
+            same("empty"),
+            same("same"),
+            same("sub/s"),
+        ),
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test(
+        &["-srq", d1, d2],
+        &format!(
+            "Files {d1}/diff and {d2}/diff differ\n{}Only in {d1}: only\n{}{}",
+            same("empty"),
+            same("same"),
+            same("sub/s"),
+        ),
+        EXIT_STATUS_DIFFERENCE,
+    );
+}

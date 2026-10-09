@@ -34,6 +34,9 @@ struct Args {
     #[arg(short = 'q', long = "brief", help = gettext("Report only whether the files differ"))]
     brief: bool,
 
+    #[arg(short = 's', long = "report-identical-files", help = gettext("Report when two files are identical"))]
+    report_identical: bool,
+
     #[arg(short = 'N', long = "new-file", help = gettext("Treat a file missing from one directory as empty"))]
     new_file: bool,
 
@@ -174,6 +177,7 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     let mut format_options = FormatOptions::new(white_space, output_format, label1, label2);
     format_options.brief = args.brief;
     format_options.new_file = args.new_file;
+    format_options.report_identical = args.report_identical;
 
     let path1 = PathBuf::from(&args.file1);
     let path2 = PathBuf::from(&args.file2);
@@ -206,7 +210,7 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     // The same file named twice has no differences; that is a normal result,
     // not an error. This reported "trouble" (exit 2) with no diagnostic at all.
     if path1 == path2 {
-        return Ok(DiffExitStatus::NotDifferent);
+        return Ok(format_options.identical(&args.file1, &args.file2));
     }
 
     // Only a directory is a directory operand. Anything else -- a regular

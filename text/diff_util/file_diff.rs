@@ -171,13 +171,7 @@ impl<'a> FileDiff<'a> {
         let (modified1, modified2) = (src1.modified, src2.modified);
 
         if is_binary(&content1) || is_binary(&content2) {
-            Self::binary_file_diff(
-                &src1.name,
-                &src2.name,
-                &content1,
-                &content2,
-                format_options.brief,
-            )
+            Self::binary_file_diff(&src1.name, &src2.name, &content1, &content2, format_options)
         } else {
             let linereader1 = LineReader::new(&content1);
             let ends_with_newline1 = linereader1.ends_with_newline();
@@ -239,8 +233,12 @@ impl<'a> FileDiff<'a> {
                     );
                     DiffExitStatus::Different
                 } else {
-                    DiffExitStatus::NotDifferent
+                    format_options.identical(diff.file1.name(), diff.file2.name())
                 });
+            }
+
+            if !diff.are_different && format_options.report_identical {
+                return Ok(format_options.identical(diff.file1.name(), diff.file2.name()));
             }
 
             if diff.are_different {
@@ -291,13 +289,13 @@ impl<'a> FileDiff<'a> {
         name2: &str,
         content1: &[u8],
         content2: &[u8],
-        brief: bool,
+        format_options: &FormatOptions,
     ) -> io::Result<DiffExitStatus> {
         if content1 == content2 {
-            return Ok(DiffExitStatus::NotDifferent);
+            return Ok(format_options.identical(name1, name2));
         }
 
-        if brief {
+        if format_options.brief {
             println!("Files {} and {} differ", name1, name2);
         } else {
             println!("Binary files {} and {} differ", name1, name2);

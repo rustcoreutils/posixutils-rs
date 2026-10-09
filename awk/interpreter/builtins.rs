@@ -303,7 +303,7 @@ pub(crate) fn builtin_split(
     let s = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
-    let array = stack.pop_ref().as_array()?;
+    let array = stack.pop_array()?;
     array.clear();
 
     if !s.is_empty() {

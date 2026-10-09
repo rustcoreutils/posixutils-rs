@@ -534,7 +534,7 @@ impl Interpreter {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    let array = stack.pop_ref().as_array()?;
+                    let array = stack.pop_array()?;
                     let result = array.contains(&key);
                     stack.push_value(bool_to_f64(result))?;
                 }
@@ -656,7 +656,7 @@ impl Interpreter {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    let array = stack.pop_ref().as_array()?;
+                    let array = stack.pop_array()?;
                     let element = array.get_value(key.into())?.clone();
                     stack.push_value(element)?
                 }
@@ -683,7 +683,7 @@ impl Interpreter {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    let array = unsafe { stack.pop().expect("empty stack").unwrap_ptr() };
+                    let array = stack.pop_array_ptr()?;
                     // safe by type invariance
                     let value_index = unsafe { &mut *array }
                         .as_array()?
@@ -727,11 +727,11 @@ impl Interpreter {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    let array = stack.pop_ref().as_array()?;
+                    let array = stack.pop_array()?;
                     array.delete(&key);
                 }
                 OpCode::ClearArray => {
-                    let array = stack.pop_ref().as_array()?;
+                    let array = stack.pop_array()?;
                     array.clear();
                 }
                 OpCode::JumpIfFalse(offset) => {

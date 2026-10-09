@@ -2081,3 +2081,28 @@ fn awk_sub_without_a_match_assigns_nothing() {
         assert_eq!(status, Some(0), "{program}");
     }
 }
+
+// Using a scalar as an array is a runtime error, where indexing it, `in`,
+// delete and split panicked (gawk's tests prmarscl and scalar).
+#[test]
+fn awk_scalar_used_as_an_array_is_an_error() {
+    let programs = [
+        "function f(a) { print a[1] } BEGIN { j = 4; f(j) }",
+        "BEGIN { x = 1; x[1] = 2 }",
+        "BEGIN { x = 1; print x[1] }",
+        "BEGIN { x = 1; print (1 in x) }",
+        "BEGIN { x = 1; delete x[1] }",
+        "BEGIN { x = 1; delete x }",
+        "BEGIN { x = 1; split(\"a b\", x) }",
+        "BEGIN { sub(/x/, \"\", a); a[1] }",
+    ];
+    for program in programs {
+        let (stdout, stderr, status) = awk_with_deadline(program);
+        assert_eq!(stdout, "", "{program}");
+        assert!(
+            stderr.starts_with("runtime error: scalar used in array context\n"),
+            "{program}: {stderr}"
+        );
+        assert_eq!(status, Some(1), "{program}");
+    }
+}

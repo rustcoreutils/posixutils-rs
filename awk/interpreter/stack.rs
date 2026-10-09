@@ -11,7 +11,7 @@ use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use super::array::{KeyIterator, ValueIndex};
+use super::array::{Array, KeyIterator, ValueIndex};
 use super::value::{AwkRefType, AwkValue, AwkValueVariant};
 use crate::program::{Action, Function, OpCode, SourceLocation};
 
@@ -269,6 +269,22 @@ impl<'i, 's> Stack<'i, 's> {
         // safe by type invariance: a reference points to a variable, a field
         // or an array element, never to the stack slots popped here
         Ok((value, unsafe { &mut *reference.unwrap_ptr() }))
+    }
+
+    /// Pops the variable on top of the stack that is used as an array: a
+    /// pointer to it, or an error if it holds a scalar's value.
+    pub(crate) fn pop_array_ptr(&mut self) -> Result<*mut AwkValue, String> {
+        match self.pop().expect("empty stack") {
+            StackValue::Value(_) => Err("scalar used in array context".to_string()),
+            // safe by type invariance
+            reference => Ok(unsafe { reference.unwrap_ptr() }),
+        }
+    }
+
+    /// Pops the array on top of the stack, see `pop_array_ptr`.
+    pub(crate) fn pop_array(&mut self) -> Result<&mut Array, String> {
+        // safe by type invariance
+        unsafe { &mut *self.pop_array_ptr()? }.as_array()
     }
 
     pub(crate) fn pop_ref(&mut self) -> &mut AwkValue {

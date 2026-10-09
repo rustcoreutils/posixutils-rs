@@ -650,6 +650,9 @@ Debian source packages, with GNU patch's meaning:
    argument only: `-number` and `+number` mean `-n -number` and
    `-n +number`; `-numberc` and `+numberc` mean `-c -number` and
    `-c +number`.  The historical `b`, `l` and `f` suffixes are not accepted.
+ * `-v` / `--verbose` — write GNU's `==> NAME <==` header (`standard input`
+   for standard input) before the output, once the file is open.  Unlike GNU
+   tail, the header is written for `-n 0` too.
 
 ### talk
 

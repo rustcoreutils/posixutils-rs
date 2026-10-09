@@ -109,6 +109,9 @@ struct Args {
     #[arg(short = 'r', help = gettext("Copy lines in reverse order"))]
     reverse: bool,
 
+    #[arg(short = 'v', long = "verbose", help = gettext("Write a header naming the file before its contents"))]
+    verbose: bool,
+
     #[arg(help = gettext("The file to read"))]
     file: Option<PathBuf>,
 }
@@ -572,6 +575,7 @@ fn tail(
     file: Option<PathBuf>,
     follow: bool,
     reverse: bool,
+    verbose: bool,
     bytes_or_lines: BytesOrLines,
 ) -> Result<(), Box<dyn Error>> {
     fn get_stdin() -> FileOrStdin {
@@ -600,6 +604,16 @@ fn tail(
     };
 
     let mut stdout_lock = io::stdout().lock();
+
+    // -v: the header GNU tail writes before each of several files, once the
+    // file is open.
+    if verbose {
+        let name = match &file_or_stdin {
+            FileOrStdin::File(path, _) => path.display().to_string(),
+            FileOrStdin::Stdin(_) => gettext("standard input"),
+        };
+        writeln!(stdout_lock, "==> {name} <==")?;
+    }
 
     {
         let mut buf_reader = file_or_stdin.get_buf_read();
@@ -645,7 +659,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if let Err(er) = tail(args.file, args.follow, args.reverse, bytes_or_lines) {
+    if let Err(er) = tail(
+        args.file,
+        args.follow,
+        args.reverse,
+        args.verbose,
+        bytes_or_lines,
+    ) {
         plib::diag::error(&plib::diag::error_text(er.as_ref()));
     }
 

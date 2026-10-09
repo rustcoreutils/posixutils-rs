@@ -674,6 +674,14 @@ being redirected through a directory operand swapped for a symbolic link.
    and bash, rather than the shell-aborting special-builtin error POSIX
    requires.
 
+### sort
+
+ * `-z` / `--zero-terminated` — lines end with NUL, not newline, in the input
+   and the output (and in a `-c` disorder diagnostic); a newline is then an
+   ordinary character, which separates fields as a blank does, as in GNU
+   sort.  binutils runs
+   `find ... -print0 | LC_ALL=C sort -z | tar --null -T -`.
+
 ### split
 
  * A `g` suffix on the `-b` argument.  POSIX defines `k` and `m`.

@@ -712,6 +712,48 @@ fn test_carriage_return_is_part_of_the_line() {
     sort_test(&[], "b\na\r\nc\r", "a\r\nb\nc\r\n", 0, "");
 }
 
+/// GNU -z / --zero-terminated: lines end with NUL on input and output, and a
+/// newline is an ordinary character -- a blank, as GNU counts it, in fields.
+/// binutils runs `find ... -print0 | LC_ALL=C sort -z | tar --null -T -`.
+#[test]
+fn test_zero_terminated() {
+    let input = "b\nx\0a\ny\0c z\0";
+    for opt in ["-z", "--zero-terminated"] {
+        sort_test(&[opt], input, "a\ny\0b\nx\0c z\0", 0, "");
+    }
+    sort_test(&["-z", "-r"], input, "c z\0b\nx\0a\ny\0", 0, "");
+    sort_test(&["-z", "-k2"], input, "b\nx\0a\ny\0c z\0", 0, "");
+    sort_test(&["-z", "-k2n"], "x\n2\0y\n1\0", "y\n1\0x\n2\0", 0, "");
+    sort_test(
+        &["-z", "-t:", "-k1,1"],
+        "b:1\0a\nb:2\0",
+        "a\nb:2\0b:1\0",
+        0,
+        "",
+    );
+    sort_test(&["-zu"], "a\0a\0b\0", "a\0b\0", 0, "");
+    // A last line without its terminator gets one, as without -z.
+    sort_test(&["-z"], "b\0a", "a\0b\0", 0, "");
+    // Newlines alone separate nothing.
+    sort_test(&["-z"], "b\na\n", "b\na\n\0", 0, "");
+}
+
+/// -z with -m, -c and -C: the disorder diagnostic ends with the line's NUL, as
+/// GNU writes it.
+#[test]
+fn test_zero_terminated_merge_and_check() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let (z2, z3) = (tmp.path().join("z2"), tmp.path().join("z3"));
+    std::fs::write(&z2, "a\0c\0e").unwrap();
+    std::fs::write(&z3, "b\0d\0").unwrap();
+    let (z2, z3) = (z2.to_str().unwrap(), z3.to_str().unwrap());
+    sort_test(&["-zm", z2, z3], "", "a\0b\0c\0d\0e\0", 0, "");
+
+    sort_test(&["-zc"], "a\0b\0", "", 0, "");
+    sort_test(&["-zc"], "b\0a\0", "", 1, "sort: -:2: disorder: a\0");
+    sort_test(&["-zC"], "b\0a\0", "", 1, "");
+}
+
 // XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
 // below used to have the word after it refused as an unknown option.
 #[test]

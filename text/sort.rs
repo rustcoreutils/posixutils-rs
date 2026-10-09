@@ -65,11 +65,23 @@ struct Args {
     #[arg(short = 'k', allow_hyphen_values = true, help = gettext("Specify the key definition for sorting"))]
     key_definition: Vec<String>,
 
+    #[arg(short = 'z', long = "zero-terminated", help = gettext("End lines with NUL, not newline, on input and output"))]
+    zero_terminated: bool,
+
     #[arg(help = gettext("Input files"))]
     filenames: Vec<PathBuf>,
 }
 
 impl Args {
+    /// The byte that ends each line, read and written.
+    fn eol(&self) -> u8 {
+        if self.zero_terminated {
+            b'\0'
+        } else {
+            b'\n'
+        }
+    }
+
     fn validate_args(&self) -> Result<(), String> {
         // POSIX: -c and -C cannot be combined; -c/-C cannot be combined with -m.
         if self.check_order && self.check_order_silent {
@@ -174,8 +186,10 @@ fn numeric_conv() -> (char, Option<char>) {
     (decimal, None)
 }
 
+/// A blank separating fields, and skipped by -b and -n. A newline counts too,
+/// as in GNU sort: under -z it is a character of the line.
 fn is_blank(c: char) -> bool {
-    locale::isblank(c)
+    c == '\n' || locale::isblank(c)
 }
 
 /// Offset (in chars) of the start of field `field` (1-based), including any
@@ -605,7 +619,7 @@ fn read_inputs(args: &Args) -> Result<Vec<(String, Vec<String>)>, String> {
         };
         let reader = input_stream_dashed(&f)
             .map_err(|e| format!("cannot read: {name}: {}", plib::diag::io_error_text(&e)))?;
-        let lines = read_lines(io::BufReader::new(reader), b'\n')
+        let lines = read_lines(io::BufReader::new(reader), args.eol())
             .map_err(|e| format!("read error: {name}: {e}"))?;
         out.push((name, lines));
     }
@@ -636,20 +650,20 @@ fn write_output(records: &[Record], args: &Args) -> Result<(), String> {
     if let Some(path) = &args.output_file {
         let file =
             File::create(path).map_err(|e| format!("open failed: {}: {e}", path.display()))?;
-        let mut w = BufWriter::new(file);
-        for r in records {
-            writeln!(w, "{}", r.line).map_err(|e| format!("write error: {e}"))?;
-        }
-        w.flush().map_err(|e| format!("write error: {e}"))?;
+        write_lines(BufWriter::new(file), records, args.eol())
     } else {
-        let stdout = io::stdout();
-        let mut w = BufWriter::new(stdout.lock());
-        for r in records {
-            writeln!(w, "{}", r.line).map_err(|e| format!("write error: {e}"))?;
-        }
-        w.flush().map_err(|e| format!("write error: {e}"))?;
+        write_lines(BufWriter::new(io::stdout().lock()), records, args.eol())
     }
-    Ok(())
+}
+
+/// Write each record's line, ended by `eol`.
+fn write_lines(mut w: impl Write, records: &[Record], eol: u8) -> Result<(), String> {
+    for r in records {
+        w.write_all(r.line.as_bytes())
+            .and_then(|()| w.write_all(&[eol]))
+            .map_err(|e| format!("write error: {e}"))?;
+    }
+    w.flush().map_err(|e| format!("write error: {e}"))
 }
 
 /// Sequentially scan the inputs for the first out-of-order pair (`-c`/`-C`).
@@ -677,7 +691,14 @@ fn check_order(
                 };
                 if bad {
                     if args.check_order {
-                        eprintln!("sort: {}:{}: disorder: {}", name, i + 1, cur.line);
+                        // The line is written with its own terminator, as GNU does.
+                        eprint!(
+                            "sort: {}:{}: disorder: {}{}",
+                            name,
+                            i + 1,
+                            cur.line,
+                            char::from(args.eol())
+                        );
                     }
                     return 1;
                 }

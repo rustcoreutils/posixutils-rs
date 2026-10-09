@@ -1189,9 +1189,11 @@ pub fn chmod_pinned(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
 /// the descriptor still reaches its own `fd/N`. It is `O_CLOEXEC`, so nothing exec'd inherits
 /// it.
 ///
-/// Only a verified answer is kept: the procfs descriptor, or a `/proc` verified to be something
-/// else. A failure that may pass -- a descriptor table full (EMFILE, ENFILE), `/proc` not
-/// mounted yet -- is returned, and the next call tries again.
+/// Only a verified answer is kept: the procfs descriptor, or a `/proc` opened and found to be
+/// something else -- an empty directory on the root filesystem of a chroot or container where
+/// procfs is not mounted (yet) included, which is then kept for the rest of the process. A
+/// failure to open or `fstatfs` it -- a descriptor table full (EMFILE, ENFILE), no `/proc` at
+/// all -- is returned, and the next call tries again.
 #[cfg(target_os = "linux")]
 pub fn procfs_dir() -> io::Result<BorrowedFd<'static>> {
     // `None`: `/proc` was opened, and is not procfs.

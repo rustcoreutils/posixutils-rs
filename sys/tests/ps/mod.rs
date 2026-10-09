@@ -511,3 +511,42 @@ fn option_argument_may_begin_with_hyphen() {
 fn ps_reports_write_error() {
     plib::testing::assert_write_error_on_full_device("ps", &["-A"], b"", 1);
 }
+
+// A reader that stops after the first line must not kill ps with SIGPIPE once
+// ps has produced its whole listing.  perl's dist/threads/t/join.t reads
+// `ps -f |` up to its own line and dies if closing the pipe reports a failed
+// ps.  procps fully buffers a pipe, so its listing is in the pipe before the
+// reader sees the first byte; ps wrote line by line and was still writing when
+// the reader closed.  The listing must fit in the pipe, as it must for procps:
+// `pid,comm` keeps it small.
+#[test]
+fn ps_survives_reader_closing_after_first_line() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    for _ in 0..20 {
+        let mut child = Command::new(plib::testing::get_binary_path("ps"))
+            .args(["-A", "-o", "pid,comm"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn ps");
+        let mut stdout = child.stdout.take().unwrap();
+        let mut byte = [0u8; 1];
+        loop {
+            match stdout.read(&mut byte) {
+                Ok(1) if byte[0] != b'\n' => continue,
+                _ => break,
+            }
+        }
+        // Give a kernel that copies a large write without holding the pipe
+        // locked (macOS) time to finish it.
+        #[cfg(not(target_os = "linux"))]
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(stdout);
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "ps failed after an early close: {status:?}"
+        );
+    }
+}

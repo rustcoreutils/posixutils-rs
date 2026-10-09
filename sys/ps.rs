@@ -17,7 +17,7 @@ mod pslinux;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _; // write! into a String (distinct from io::Write below)
-use std::io::{self, Write};
+use std::io::{self, BufWriter, IsTerminal, StdoutLock, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -553,6 +553,22 @@ fn resolve_line_limit(wide_count: u8) -> usize {
     line_max.max(columns)
 }
 
+/// Standard output for a listing: line-buffered on a terminal, fully buffered
+/// otherwise, as C's stdio buffers it.
+///
+/// A reader of `ps | ...` that stops early -- perl's threads tests read up to
+/// their own line and close -- then finds the whole listing already in the
+/// pipe, and ps exits 0 instead of dying of `SIGPIPE` halfway through.  The
+/// buffer holds as much as a pipe does, so a listing that fits in the pipe is
+/// one write.  The caller flushes it once at the end, reporting the error.
+fn listing_output() -> BufWriter<StdoutLock<'static>> {
+    let out = io::stdout().lock();
+    // A zero-capacity BufWriter passes every write straight to stdout's own
+    // line buffer.
+    let capacity = if out.is_terminal() { 0 } else { 64 * 1024 };
+    BufWriter::with_capacity(capacity, out)
+}
+
 /// Truncate `line` to at most `max_bytes`, rounding down to a UTF-8 character
 /// boundary so multi-byte characters are never split (POSIX bounds the line in
 /// bytes; for ASCII this is exact).
@@ -856,8 +872,7 @@ fn write_listing(
     line_limit: usize,
     ctx: &Context,
 ) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = listing_output();
 
     // Print header (clipped to the line limit so it stays aligned with rows).
     if print_header {

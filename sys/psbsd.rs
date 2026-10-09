@@ -239,7 +239,7 @@ fn format_line(columns: &[Column], cell: impl Fn(&Column) -> String) -> String {
 
 fn write_listing(procs: &[ProcessInfo], columns: &[Column], ctx: &Context) -> io::Result<()> {
     let limit = crate::resolve_line_limit(0);
-    let mut out = io::stdout().lock();
+    let mut out = crate::listing_output();
     let header = format_line(columns, |c| c.header.to_string());
     writeln!(out, "{}", crate::truncate_line(&header, limit))?;
     for proc in procs {

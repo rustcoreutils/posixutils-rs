@@ -195,7 +195,7 @@ pub(crate) fn builtin_match(
     stack: &mut Stack,
     global_env: &mut GlobalEnv,
 ) -> Result<(f64, f64), String> {
-    let ere = stack.pop_value().into_ere()?;
+    let ere = stack.pop_value().into_ere(&global_env.convfmt)?;
     let string = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
@@ -294,7 +294,7 @@ pub(crate) fn builtin_split(
     } else {
         let sep_val = stack.pop_value();
         if matches!(&sep_val.value, AwkValueVariant::Regex { .. }) {
-            Some(FieldSeparator::Ere(sep_val.into_ere()?))
+            Some(FieldSeparator::Ere(sep_val.into_ere(&global_env.convfmt)?))
         } else {
             let sep_str = sep_val.scalar_to_string(&global_env.convfmt)?;
             Some(FieldSeparator::try_from(sep_str)?)
@@ -326,7 +326,7 @@ pub(crate) fn builtin_gsub(
     let repl = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
-    let ere = stack.pop_value().into_ere()?;
+    let ere = stack.pop_value().into_ere(&global_env.convfmt)?;
     let in_str = stack.pop_ref();
     in_str.ensure_value_is_scalar()?;
     let (result, count) = gsub(

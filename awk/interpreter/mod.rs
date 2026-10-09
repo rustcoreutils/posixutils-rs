@@ -513,7 +513,7 @@ impl Interpreter {
                     compare_op!(stack, &global_env.convfmt, !=);
                 }
                 OpCode::Match => {
-                    let ere = stack.pop_value().into_ere()?;
+                    let ere = stack.pop_value().into_ere(&global_env.convfmt)?;
                     let string = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;

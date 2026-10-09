@@ -2106,3 +2106,17 @@ fn awk_scalar_used_as_an_array_is_an_error() {
         assert_eq!(status, Some(1), "{program}");
     }
 }
+
+// A number used as a regular expression is its string value, as POSIX says
+// for any expression on the right of `~`: `"a" ~ ("a" ~ "a")` failed with
+// "expected extended regular expression".
+#[test]
+fn awk_number_used_as_a_regular_expression() {
+    let program = "BEGIN { print (\"a\" ~ (\"a\" ~ \"a\")), (\"1\" ~ 1), (\"x10\" ~ 5*2), match(\"a.5\", 0.5), s = \"123\", sub(2, \"z\", s), s }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str()),
+        ("0 1 1 0 123 1 1z3\n", "")
+    );
+    assert_eq!(status, Some(0));
+}

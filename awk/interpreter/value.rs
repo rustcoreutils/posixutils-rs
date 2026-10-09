@@ -157,13 +157,18 @@ impl AwkValue {
         Self { ref_type, ..self }
     }
 
-    pub(crate) fn into_ere(self) -> Result<Rc<Regex>, String> {
+    /// The value as a regular expression: an ERE token's, or the string
+    /// value of anything else, a number converted with `convfmt`.
+    pub(crate) fn into_ere(self, convfmt: &str) -> Result<Rc<Regex>, String> {
         match self.value {
             AwkValueVariant::Regex { ere, .. } => Ok(ere),
             AwkValueVariant::String(s) => Ok(Rc::new(Regex::new(s.try_into()?)?)),
             AwkValueVariant::UninitializedScalar => {
                 Ok(Rc::new(Regex::new(CString::new("").unwrap())?))
             }
+            AwkValueVariant::Number(_) => Ok(Rc::new(Regex::new(
+                self.scalar_to_string(convfmt)?.try_into()?,
+            )?)),
             _ => Err("expected extended regular expression".to_string()),
         }
     }

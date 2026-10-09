@@ -392,7 +392,7 @@ impl<T> Default for HardLinkTracker<T> {
     }
 }
 
-impl<T: Clone> HardLinkTracker<T> {
+impl<T> HardLinkTracker<T> {
     /// Create a new tracker
     pub fn new() -> Self {
         Self::default()
@@ -400,11 +400,24 @@ impl<T: Clone> HardLinkTracker<T> {
 
     /// What was remembered of the name a multiply-linked file was first
     /// stored under, if one of its names already has been.
-    pub fn lookup(&self, dev: u64, ino: u64, nlink: u32) -> Option<T> {
+    pub fn lookup(&self, dev: u64, ino: u64, nlink: u32) -> Option<&T> {
         if nlink <= 1 {
             return None;
         }
-        self.stored.get(&(dev, ino)).cloned()
+        self.stored.get(&(dev, ino))
+    }
+
+    /// `lookup`, to change what was remembered.
+    pub fn lookup_mut(&mut self, dev: u64, ino: u64, nlink: u32) -> Option<&mut T> {
+        if nlink <= 1 {
+            return None;
+        }
+        self.stored.get_mut(&(dev, ino))
+    }
+
+    /// What was remembered of the file `(dev, ino)`.
+    pub fn by_key_mut(&mut self, key: (u64, u64)) -> Option<&mut T> {
+        self.stored.get_mut(&key)
     }
 
     /// Note that a file's first name has been stored, and what to remember of
@@ -688,7 +701,10 @@ mod tests {
         // remembered however many of its names go by.
         links.record(1, 9, 2, PathBuf::from("b"));
         for _ in 0..3 {
-            assert_eq!(links.lookup(1, 9, 2).as_deref(), Some(Path::new("a")));
+            assert_eq!(
+                links.lookup(1, 9, 2).map(PathBuf::as_path),
+                Some(Path::new("a"))
+            );
         }
     }
 }

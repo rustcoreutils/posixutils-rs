@@ -15,12 +15,15 @@ use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, link_replacing_with, make_dir_at, set_attrs_fd,
-    set_made_node_attrs, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath, PendingDirs,
+    set_made_node_attrs, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, Expected, MemberPath,
+    PendingDirs,
 };
+use crate::modes::pins::{MadeFile, PinBudget};
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
 use crate::subst::{substitute_link_target, substitute_name, Substitution};
 use plib::madefs::lstat_at;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::Write;
@@ -125,9 +128,7 @@ fn extract_members<R: ArchiveReader>(
     tree: &DirTree,
     pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
-    let mut link_sets: LinkSets<CreatedSet> = LinkSets::default();
-    let mut made_files = MadeFiles::new();
-    let mut pins = PinBudget::new();
+    let mut links = Links::new();
     let mut selector = Selector::new(
         &options.patterns,
         options.exclude,
@@ -151,36 +152,28 @@ fn extract_members<R: ArchiveReader>(
         if let Some(ref records) = option_records {
             records.apply(&mut entry);
         }
-        link_sets.count_name(&entry);
+        links.sets.count_name(&entry);
         if select_member(&mut selector, &mut entry, options, &mut prompter, tree)? {
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
             // set a non-zero exit, but continue with the next member. Skip any
             // unconsumed data of the failed entry to realign the reader.
             // A failure every later member would meet too -- -O's output
             // gone, end of file on the terminal -- ends the run instead.
-            let r = extract_entry(
-                archive,
-                &entry,
-                options,
-                &mut link_sets,
-                &mut made_files,
-                tree,
-                pending_dirs,
-            );
+            let r = extract_entry(archive, &entry, options, &mut links, tree, pending_dirs);
             report_unless_fatal(&entry, r)?;
-        } else if let Some(set) = link_sets.find_mut(&entry) {
+        } else if let Some(set) = links.sets.find_mut(&entry) {
             let r = fill_link_set(archive, tree, &entry, options, set);
             report_unless_fatal(&entry, r)?;
         }
         archive.skip_data()?;
         // A set no data can still come for needs its file pinned no longer.
-        if let Some(set) = link_sets.settled_mut(&entry) {
+        if let Some(set) = links.sets.settled_mut(&entry) {
             set.unpin();
         }
-        pins.account(&entry, &mut link_sets);
+        links.account_set(&entry);
         // A newc set's data comes with its last name, which -n must still
         // read even when every pattern has been used by an earlier one.
-        if selector.is_done() && link_sets.all_settled() {
+        if selector.is_done() && links.sets.all_settled() {
             reached_end = false;
             break;
         }
@@ -332,8 +325,7 @@ fn extract_entry<R: ArchiveReader>(
     archive: &mut R,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    link_sets: &mut LinkSets<CreatedSet>,
-    made_files: &mut MadeFiles,
+    links: &mut Links,
     tree: &DirTree,
     pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
@@ -378,7 +370,7 @@ fn extract_entry<R: ArchiveReader>(
 
     // Whatever this member puts at its name replaces what an earlier one made
     // there; only a regular file or a link to one records it again.
-    made_files.remove(&member.key());
+    links.forget(&member.key());
     match entry.entry_type {
         EntryType::Directory => {
             let decided = extract_directory(tree, pfd, &member, entry, options)?;
@@ -396,13 +388,14 @@ fn extract_entry<R: ArchiveReader>(
             archive.skip_data()?;
         }
         EntryType::Hardlink => {
-            extract_hardlink(tree, pfd, &member, entry, options, made_files)?;
+            extract_hardlink(tree, pfd, &member, entry, options, links)?;
             archive.skip_data()?;
         }
         EntryType::Regular => {
-            let made = extract_regular(archive, tree, pfd, &member, entry, options, link_sets)?;
-            if let Some(file) = made {
-                made_files.insert(member.key(), file);
+            let sets = &mut links.sets;
+            let made = extract_regular(archive, tree, pfd, &member, entry, options, sets)?;
+            if let Some(made) = made {
+                links.record_made(member.key(), made);
             }
             archive.skip_data()?; // Skip padding to block boundary
         }
@@ -505,10 +498,80 @@ fn extract_symlink(
     Ok(())
 }
 
-/// What this run created at each member path (`MemberPath::key`): the
-/// identity of the regular file it made there, from the descriptor that made
-/// it.
-type MadeFiles = std::collections::HashMap<Vec<u8>, (u64, u64)>;
+/// What extraction keeps about the files later members name: the cpio link
+/// sets, the file this run made at each member path, and the pins both hold,
+/// within one budget.
+struct Links {
+    sets: LinkSets<CreatedSet>,
+    /// The file this run made at each member path (`MemberPath::key`) -- a
+    /// tar link member's target -- known from the descriptor that made it.
+    made: HashMap<Vec<u8>, MadeFile>,
+    pins: PinBudget<PinKey>,
+}
+
+/// What holds a pin in `Links`.
+#[derive(PartialEq, Eq, Debug)]
+enum PinKey {
+    /// A cpio link set (`LinkSets::key`), until it is settled.
+    Set((u64, u64)),
+    /// The file made at a member path.
+    Member(Vec<u8>),
+}
+
+impl Links {
+    fn new() -> Self {
+        Links {
+            sets: LinkSets::default(),
+            made: HashMap::new(),
+            pins: PinBudget::new(),
+        }
+    }
+
+    /// Account for the pin of the set `entry` is a name of, after the member.
+    fn account_set(&mut self, entry: &ArchiveEntry) {
+        let Some(key) = LinkSets::<CreatedSet>::key(entry) else {
+            return;
+        };
+        let Some(set) = self.sets.by_key_mut(key) else {
+            return;
+        };
+        let pinned = set.pin.is_some();
+        self.note(PinKey::Set(key), pinned);
+    }
+
+    /// Record `made` as the file this run made at the member path `key`.
+    fn record_made(&mut self, key: Vec<u8>, made: MadeFile) {
+        let pinned = made.is_pinned();
+        self.made.insert(key.clone(), made);
+        self.note(PinKey::Member(key), pinned);
+    }
+
+    /// Forget what this run made at the member path `key`: something else is
+    /// being put there.
+    fn forget(&mut self, key: &[u8]) {
+        if self.made.remove(key).is_some() {
+            self.note(PinKey::Member(key.to_vec()), false);
+        }
+    }
+
+    /// `PinBudget::note`, closing the oldest pin -- a set's or a file's --
+    /// when the budget is over.
+    fn note(&mut self, key: PinKey, pinned: bool) {
+        let Links { sets, made, pins } = self;
+        pins.note(key, pinned, |oldest| match oldest {
+            PinKey::Set(key) => {
+                if let Some(set) = sets.by_key_mut(*key) {
+                    set.unpin();
+                }
+            }
+            PinKey::Member(key) => {
+                if let Some(made) = made.get_mut(key) {
+                    made.unpin();
+                }
+            }
+        });
+    }
+}
 
 /// Extract a hard link
 fn extract_hardlink(
@@ -517,7 +580,7 @@ fn extract_hardlink(
     member: &MemberPath,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    made_files: &mut MadeFiles,
+    links: &mut Links,
 ) -> PaxResult<()> {
     let name = member.leaf.as_c_str();
     let Some(target) = entry.link_target.clone() else {
@@ -545,85 +608,26 @@ fn extract_hardlink(
     // made one: someone who can write that directory can have put another
     // file at the name since. A target this run did not make is linked by
     // name.
-    let expected = made_files.get(&target_member.key()).copied();
+    let target_key = target_member.key();
     link_replacing_with(
         target_parent.as_raw_fd(),
         &target_member.leaf,
         None,
-        expected,
+        links.made.get(&target_key).map(MadeFile::expected),
         dirfd,
         name,
         options.no_clobber,
     )?;
-    // This name holds that file now, for a later member linked to it.
-    if let Some(file) = expected {
-        made_files.insert(member.key(), file);
-    }
+    // This name holds that file now, for a later member linked to it; and
+    // linking it changed the file's ctime.
+    let Some(target) = links.made.get_mut(&target_key) else {
+        return Ok(());
+    };
+    target.linked(dirfd, name);
+    let shared = target.share();
+    links.record_made(member.key(), shared);
 
     Ok(())
-}
-
-/// The link sets whose files are pinned (`CreatedSet::pin`), oldest first,
-/// and how many may be at once.
-///
-/// A newc set waits for its data until c_nlink of its names have been read,
-/// and an archive can start any number of sets that never finish: one name
-/// each, with a c_nlink of 2 or of 0xffffffff. Pinned until the end, one
-/// descriptor each, they would leave none for the members after them. Past
-/// the budget the oldest set's pin is closed, and that set falls back to the
-/// bare `(st_dev, st_ino)` check every set relies on once its data is in.
-struct PinBudget {
-    /// The keys (`LinkSets::key`) of the sets holding a pin, oldest first.
-    held: std::collections::VecDeque<(u64, u64)>,
-    /// How many may be held at once: a quarter of the descriptor limit, and
-    /// at most 256.
-    limit: usize,
-}
-
-impl PinBudget {
-    fn new() -> Self {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
-            lim.rlim_cur
-        } else {
-            0
-        };
-        PinBudget {
-            held: std::collections::VecDeque::new(),
-            limit: usize::try_from(soft / 4).map_or(256, |quarter| quarter.min(256)),
-        }
-    }
-
-    /// Account for the set `entry` is a name of, after the member: forget it
-    /// once it holds no pin, note it when it has taken one, and close the
-    /// oldest pin when that puts the budget over.
-    fn account(&mut self, entry: &ArchiveEntry, link_sets: &mut LinkSets<CreatedSet>) {
-        let Some(key) = LinkSets::<CreatedSet>::key(entry) else {
-            return;
-        };
-        let Some(set) = link_sets.by_key_mut(key) else {
-            return;
-        };
-        let held_at = self.held.iter().position(|&k| k == key);
-        match (set.pin.is_some(), held_at) {
-            (false, Some(at)) => {
-                self.held.remove(at);
-            }
-            (true, None) => self.held.push_back(key),
-            _ => {}
-        }
-        while self.held.len() > self.limit {
-            let Some(oldest) = self.held.pop_front() else {
-                break;
-            };
-            if let Some(set) = link_sets.by_key_mut(oldest) {
-                set.unpin();
-            }
-        }
-    }
 }
 
 /// What extraction remembers about a cpio link set.
@@ -637,7 +641,7 @@ struct CreatedSet {
     /// name of a set only, so the earlier names are created empty.
     has_data: bool,
     /// The file held open while data may still come for it on a later name
-    /// (`LinkSets::settled_mut`), within the budget (`PinBudget`). Its names
+    /// (`LinkSets::settled_mut`), within the budget (`Links::pins`). Its names
     /// can be replaced by other members meanwhile, and a filesystem that
     /// reuses inode numbers (ext4) then hands this file's number to the next
     /// file created, which `file` would take for this one. Open, it keeps its
@@ -693,14 +697,14 @@ fn extract_regular<R: ArchiveReader>(
     entry: &ArchiveEntry,
     options: &ReadOptions,
     link_sets: &mut LinkSets<CreatedSet>,
-) -> PaxResult<Option<(u64, u64)>> {
+) -> PaxResult<Option<MadeFile>> {
     if let Some(set) = link_sets.find_mut(entry) {
         join_link_set(archive, tree, dirfd, member, entry, options, set)?;
         return Ok(None);
     }
 
     let made = extract_file(archive, dirfd, member.leaf.as_c_str(), entry, options)?;
-    if let Some(file) = made {
+    if let Some(file) = made.as_ref().map(MadeFile::id) {
         link_sets.insert(entry, || {
             let names = vec![member.display.clone()];
             CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
@@ -741,7 +745,7 @@ fn join_link_set<R: ArchiveReader>(
                 src_dir.as_raw_fd(),
                 &src_leaf,
                 None,
-                Some(set.file),
+                Some(Expected::id(set.file)),
                 dirfd,
                 name,
                 options.no_clobber,
@@ -756,7 +760,8 @@ fn join_link_set<R: ArchiveReader>(
     }
 
     let holders = set.holders(tree);
-    let Some(file) = extract_file(archive, dirfd, name, entry, options)? else {
+    let Some(file) = extract_file(archive, dirfd, name, entry, options)?.map(|made| made.id())
+    else {
         // -k kept what was there; the data is still the earlier names'.
         return fill_link_set(archive, tree, entry, options, set);
     };
@@ -792,6 +797,7 @@ fn fill_link_set<R: ArchiveReader>(
     let dir = Rc::clone(dir);
     let (temp, file) = create_temp_file(dir.as_fd(), entry, options)?;
     let filled = write_file_data(archive, file, entry, options)
+        .map(|made| made.id())
         .and_then(|id| Ok((id, move_names_to(holders, dir.as_fd(), &temp, id)?)));
     let removed = unlink_at(dir.as_fd(), &temp);
     let (file, names) = filled?;
@@ -820,7 +826,15 @@ fn move_names_to(
         // even under -k. The link is to the file made, pinned, never to
         // whatever has been put at its name since.
         let from = dirfd.as_raw_fd();
-        link_replacing_with(from, name, None, Some(file), dir.as_fd(), &leaf, false)?;
+        link_replacing_with(
+            from,
+            name,
+            None,
+            Some(Expected::id(file)),
+            dir.as_fd(),
+            &leaf,
+            false,
+        )?;
         names.push(path);
     }
     Ok(names)
@@ -949,7 +963,7 @@ fn extract_file<R: ArchiveReader>(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<Option<(u64, u64)>> {
+) -> PaxResult<Option<MadeFile>> {
     let mut opened: Option<File> = None;
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         opened = Some(create_file(dirfd, name, entry, options)?);
@@ -1014,16 +1028,17 @@ fn write_file_data<R: ArchiveReader>(
     mut file: File,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<(u64, u64)> {
+) -> PaxResult<MadeFile> {
     copy_file_data(archive, &mut file, entry.size)?;
 
     // Through the descriptor the data was just written to, not by name.
     set_attrs_fd(file.as_fd(), &attrs_of(entry, options), &policy_of(options))?;
-    let id = file_id(&file.metadata()?);
+    // Known once its attributes are set, which change its ctime.
+    let made = MadeFile::of(file.as_fd())?;
     // A filesystem that defers writes -- NFS, a quota checked late -- reports
     // their failure here, and the member is then not extracted after all.
     crate::blocked_io::close_file(file)?;
-    Ok(id)
+    Ok(made)
 }
 
 /// Copy file data from archive to file
@@ -1152,18 +1167,6 @@ mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
 
-    /// POSIX, ustar Interchange Format: "When the file is restored by a
-    /// privileged, protection-preserving version of the utility, the user and
-    /// group databases shall be scanned for these names. If found, the user
-    /// and group IDs contained within these files shall be used rather than
-    /// the values contained within the uid and gid fields." The pax `uname`
-    /// record puts it more strongly still: it "shall override the uid and
-    /// uname fields in the following header block(s), and any uid extended
-    /// header record."
-    ///
-    /// Extraction chowned by the numeric fields alone, so an archive carried
-    /// between hosts restored each file to whichever account happened to hold
-    /// the originating host's uid -- the problem uname exists to solve.
     /// A link set's earlier names are moved over to the file just made for
     /// its data by linking that file's name again. Someone who can rename in
     /// that directory can put another file at the name first, and the set's
@@ -1205,9 +1208,11 @@ mod tests {
         let dir = plib::tmp::TempDir::new().unwrap();
         std::fs::write(dir.path().join("f"), "extracted\n").unwrap();
         let tree = DirTree::open_path(dir.path()).unwrap();
-        let mut made_files = MadeFiles::new();
+        let mut links = Links::new();
         let target = MemberPath::parse(Path::new("f")).unwrap().unwrap();
-        made_files.insert(target.key(), id_at(tree.root(), c"f").unwrap());
+        let f = std::fs::File::open(dir.path().join("f")).unwrap();
+        links.record_made(target.key(), MadeFile::of(f.as_fd()).unwrap());
+        drop(f);
 
         let path = dir.path().to_path_buf();
         let swap = move |point, _: libc::c_int, name: &CStr| {
@@ -1221,14 +1226,7 @@ mod tests {
         let member = MemberPath::parse(Path::new("g")).unwrap().unwrap();
         let options = ReadOptions::default();
         let _ = with_hook(swap, || {
-            extract_hardlink(
-                &tree,
-                tree.root(),
-                &member,
-                &entry,
-                &options,
-                &mut made_files,
-            )
+            extract_hardlink(&tree, tree.root(), &member, &entry, &options, &mut links)
         });
         let linked = std::fs::read_to_string(dir.path().join("g")).unwrap_or_default();
         assert_ne!(
@@ -1237,6 +1235,18 @@ mod tests {
         );
     }
 
+    /// POSIX, ustar Interchange Format: "When the file is restored by a
+    /// privileged, protection-preserving version of the utility, the user and
+    /// group databases shall be scanned for these names. If found, the user
+    /// and group IDs contained within these files shall be used rather than
+    /// the values contained within the uid and gid fields." The pax `uname`
+    /// record puts it more strongly still: it "shall override the uid and
+    /// uname fields in the following header block(s), and any uid extended
+    /// header record."
+    ///
+    /// Extraction chowned by the numeric fields alone, so an archive carried
+    /// between hosts restored each file to whichever account happened to hold
+    /// the originating host's uid -- the problem uname exists to solve.
     #[test]
     fn test_owner_prefers_the_recorded_name_over_the_numeric_id() {
         let euid = unsafe { libc::geteuid() };

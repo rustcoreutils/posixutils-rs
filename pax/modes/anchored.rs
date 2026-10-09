@@ -1231,6 +1231,39 @@ fn created(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
     true
 }
 
+/// What a caller knows of the file it means to link (`link_replacing_with`):
+/// its `(st_dev, st_ino)`; for a file this run made, the `ctime` it was left
+/// with, which an inode number reused for someone else's file does not have;
+/// and a descriptor pinning the file itself, where one is held.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Expected<'a> {
+    pub(crate) id: (u64, u64),
+    pub(crate) ctime: Option<(i64, i64)>,
+    pub(crate) pin: Option<BorrowedFd<'a>>,
+}
+
+impl Expected<'_> {
+    /// Whether `st` shows the file meant: its identity, and its ctime where
+    /// that is known.
+    fn matches(&self, st: &libc::stat) -> bool {
+        file_id(st) == self.id
+            && self
+                .ctime
+                .is_none_or(|ctime| ctime == crate::modes::pins::ctime_of(st))
+    }
+}
+
+impl Expected<'static> {
+    /// Only the identity the caller examined.
+    pub(crate) fn id(id: (u64, u64)) -> Self {
+        Expected {
+            id,
+            ctime: None,
+            pin: None,
+        }
+    }
+}
+
 /// Hard-link `from_name` (in `from_dir`) to `name` (in `dirfd`), replacing
 /// whatever holds `name` the way `create_replacing` does -- unless it already
 /// *is* the file being linked.
@@ -1266,7 +1299,7 @@ pub(crate) fn link_replacing_with(
     from_dir: libc::c_int,
     from_name: &CStr,
     follow: Option<(u64, u64)>,
-    expected: Option<(u64, u64)>,
+    expected: Option<Expected<'_>>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     no_clobber: bool,
@@ -1332,7 +1365,7 @@ enum LinkSource<'a> {
     #[cfg(target_os = "linux")]
     Pinned {
         proc_dir: BorrowedFd<'static>,
-        pin: OwnedFd,
+        pin: PinFd<'a>,
     },
     /// A name, resolved again by `linkat`: `flags` is `AT_SYMLINK_FOLLOW` or
     /// 0, and `expected` what the link made is checked against afterwards.
@@ -1345,13 +1378,15 @@ enum LinkSource<'a> {
 }
 
 impl<'a> LinkSource<'a> {
-    /// `from_name` in `from_dir`, followed if `follow`: pinned and checked to
-    /// be `expected` where that is given and the platform allows.
+    /// `from_name` in `from_dir`, followed if `follow`, as `expected` knows
+    /// it: the caller's own pin of it, where it holds one and the platform
+    /// can link through it; otherwise pinned here, by name, and checked to be
+    /// that file; otherwise the name, checked before and after the link.
     fn new(
         from_dir: libc::c_int,
         from_name: &'a CStr,
         follow: bool,
-        expected: Option<(u64, u64)>,
+        expected: Option<Expected<'a>>,
     ) -> PaxResult<Self> {
         #[cfg(target_os = "linux")]
         if let Some(expected) = expected {
@@ -1359,39 +1394,58 @@ impl<'a> LinkSource<'a> {
                 return Ok(pinned);
             }
         }
+        let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        if let Some(expected) = expected.filter(|e| e.ctime.is_some()) {
+            // The residual without procfs: a file removed and made again
+            // with this number and ctime between this check and the link.
+            let st = fstatat(from_dir, from_name, src_flags).map_err(|_| source_changed())?;
+            if !expected.matches(&st) {
+                return Err(source_changed());
+            }
+        }
         let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
         Ok(LinkSource::Name {
             from_dir,
             from_name,
             flags,
-            expected,
+            expected: expected.map(|e| e.id),
         })
     }
 
-    /// Pin the source with `O_PATH` -- following a symbolic link exactly
-    /// when `linkat` would -- and require it to be the file `expected`.
-    /// `None` without a verified procfs, where the pin could not be linked.
+    /// The source as a descriptor to link through: the caller's pin, or one
+    /// opened here with `O_PATH` -- following a symbolic link exactly when
+    /// `linkat` would -- and required to be the file `expected`. `None`
+    /// without a verified procfs, where no descriptor can be linked.
     #[cfg(target_os = "linux")]
     fn pin(
         from_dir: libc::c_int,
         from_name: &CStr,
         follow: bool,
-        expected: (u64, u64),
+        expected: Expected<'a>,
     ) -> PaxResult<Option<Self>> {
         let Ok(proc_dir) = made::procfs_dir() else {
             return Ok(None);
         };
-        let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
-        let flags = libc::O_PATH | libc::O_CLOEXEC | nofollow;
-        let fd = unsafe { libc::openat(from_dir, from_name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let pin = unsafe { OwnedFd::from_raw_fd(fd) };
-        if !fstat(pin.as_raw_fd())
-            .ok()
-            .is_some_and(|st| file_id(&st) == expected)
-        {
+        let pin = match expected.pin {
+            Some(pin) => PinFd::Borrowed(pin),
+            None => {
+                let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+                let flags = libc::O_PATH | libc::O_CLOEXEC | nofollow;
+                let fd = unsafe { libc::openat(from_dir, from_name.as_ptr(), flags) };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                PinFd::Owned(unsafe { OwnedFd::from_raw_fd(fd) })
+            }
+        };
+        // A pin the caller holds is the file itself; one opened by name must
+        // show the identity, and the ctime where known, of the file meant.
+        let st = fstat(pin.as_raw_fd()).map_err(|_| source_changed())?;
+        let is_expected = match pin {
+            PinFd::Borrowed(_) => file_id(&st) == expected.id,
+            PinFd::Owned(_) => expected.matches(&st),
+        };
+        if !is_expected {
             return Err(source_changed());
         }
         Ok(Some(LinkSource::Pinned { proc_dir, pin }))
@@ -1438,6 +1492,23 @@ impl<'a> LinkSource<'a> {
             #[cfg(target_os = "linux")]
             LinkSource::Pinned { .. } => Ok(()),
             LinkSource::Name { expected, .. } => linked_expected(dirfd, name, *expected),
+        }
+    }
+}
+
+/// A descriptor `LinkSource` links through: opened by it, or the caller's.
+#[cfg(target_os = "linux")]
+enum PinFd<'a> {
+    Owned(OwnedFd),
+    Borrowed(BorrowedFd<'a>),
+}
+
+#[cfg(target_os = "linux")]
+impl AsRawFd for PinFd<'_> {
+    fn as_raw_fd(&self) -> libc::c_int {
+        match self {
+            PinFd::Owned(fd) => fd.as_raw_fd(),
+            PinFd::Borrowed(fd) => fd.as_raw_fd(),
         }
     }
 }
@@ -2312,7 +2383,15 @@ mod tests {
             }
         };
         let linked = with_hook(swap, || {
-            link_replacing_with(root, c"a", None, Some(source), tree.root(), c"d", false)
+            link_replacing_with(
+                root,
+                c"a",
+                None,
+                Some(Expected::id(source)),
+                tree.root(),
+                c"d",
+                false,
+            )
         });
         assert!(!linked.unwrap(), "skipped as already linked to itself");
         let d = lstat_at(tree.root().as_raw_fd(), c"d").unwrap();
@@ -2351,7 +2430,7 @@ mod tests {
                 root,
                 c"l",
                 Some(link),
-                Some(target),
+                Some(Expected::id(target)),
                 tree.root(),
                 c"d",
                 false,

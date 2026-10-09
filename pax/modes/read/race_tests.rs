@@ -271,27 +271,17 @@ fn unverified_intermediate_directory_is_not_stamped() {
 /// attributes -- and says so, rather than dropping them in silence.
 #[test]
 fn unverified_directory_member_is_diagnosed() {
-    use crate::archive::LinkSets;
     use crate::modes::made::MadeTrust;
     let tmp = TempDir::new().unwrap();
     let tree = DirTree::open_path(tmp.path()).unwrap();
     let mut pending = PendingDirs::default();
-    let mut link_sets = LinkSets::default();
-    let mut made_files = super::MadeFiles::new();
+    let mut links = super::Links::new();
     let entry = own_member("d", EntryType::Directory, 0o751);
     let mut archive = Members(Vec::new().into_iter());
     let options = preserve_everything();
     let r = race_hook::with_dir_trust(MadeTrust::ParentOwnerOnly, || {
         let pending = &mut pending;
-        extract_entry(
-            &mut archive,
-            &entry,
-            &options,
-            &mut link_sets,
-            &mut made_files,
-            &tree,
-            pending,
-        )
+        extract_entry(&mut archive, &entry, &options, &mut links, &tree, pending)
     });
 
     assert!(r.is_err(), "withholding the attributes went unreported");
@@ -307,28 +297,18 @@ fn unverified_directory_member_is_diagnosed() {
 /// appended archive -- and gets no attributes then either.
 #[test]
 fn unverified_directory_named_twice_is_withheld_both_times() {
-    use crate::archive::LinkSets;
     use crate::modes::made::MadeTrust;
     let tmp = TempDir::new().unwrap();
     let tree = DirTree::open_path(tmp.path()).unwrap();
     let mut pending = PendingDirs::default();
-    let mut link_sets = LinkSets::default();
-    let mut made_files = super::MadeFiles::new();
+    let mut links = super::Links::new();
     let entry = own_member("d", EntryType::Directory, 0o751);
     let mut archive = Members(Vec::new().into_iter());
     let options = preserve_everything();
     let results = race_hook::with_dir_trust(MadeTrust::ParentOwnerOnly, || {
         let mut extract = || {
             let pending = &mut pending;
-            extract_entry(
-                &mut archive,
-                &entry,
-                &options,
-                &mut link_sets,
-                &mut made_files,
-                &tree,
-                pending,
-            )
+            extract_entry(&mut archive, &entry, &options, &mut links, &tree, pending)
         };
         [extract().is_err(), extract().is_err()]
     });

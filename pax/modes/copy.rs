@@ -19,12 +19,13 @@ use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, file_id, link_replacing_with, make_dir_at, restore_atime,
     restore_dir_atime, set_attrs_fd, set_made_node_attrs, AttrPolicy, Attrs, DirAttrs, DirTree,
-    MemberPath, PendingDirs,
+    Expected, MemberPath, PendingDirs,
 };
 use crate::modes::followed_link;
+use crate::modes::pins::{MadeFile, PinBudget};
 use crate::modes::write::FileNames;
 use crate::subst::{substitute_name, Substitution};
-use plib::madefs::{fstat, lstat_at};
+use plib::madefs::lstat_at;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
@@ -171,9 +172,41 @@ impl CopyWalk<'_> {
 }
 
 /// The first copy of each multiply-linked file: the member path it was made
-/// at, and the identity of the copy made there -- `None` where -k kept a file
-/// already at that name.
-type CopiedLinks = HardLinkTracker<(PathBuf, Option<(u64, u64)>)>;
+/// at, and the copy made there (`MadeFile`, pinned within the budget) --
+/// `None` where -k kept a file already at that name.
+struct CopiedLinks {
+    names: HardLinkTracker<(PathBuf, Option<MadeFile>)>,
+    pins: PinBudget<(u64, u64)>,
+}
+
+impl CopiedLinks {
+    fn new() -> Self {
+        CopiedLinks {
+            names: HardLinkTracker::new(),
+            pins: PinBudget::new(),
+        }
+    }
+
+    /// Record the first copy of the source file `(dev, ino)`, `made` at
+    /// `member`, within the budget of pins.
+    fn record(
+        &mut self,
+        (dev, ino): (u64, u64),
+        nlink: u32,
+        member: &Path,
+        made: Option<MadeFile>,
+    ) {
+        let pinned = made.as_ref().is_some_and(MadeFile::is_pinned);
+        self.names
+            .record(dev, ino, nlink, (member.to_path_buf(), made));
+        let names = &mut self.names;
+        self.pins.note((dev, ino), pinned, |key| {
+            if let Some((_, Some(made))) = names.by_key_mut(*key) {
+                made.unpin();
+            }
+        });
+    }
+}
 
 /// State the three traversal callbacks share.
 ///
@@ -768,7 +801,7 @@ fn copy_file(
             entry.dir_fd(),
             entry.file_name(),
             follow,
-            Some((metadata.dev(), metadata.ino())),
+            Some(Expected::id((metadata.dev(), metadata.ino()))),
             dirfd,
             name,
             options.no_clobber,
@@ -797,8 +830,8 @@ fn copy_file(
     // `linkat`, which resolves an absolute path from the root of the filesystem
     // and ignores the anchor descriptor entirely.
     let (dev, ino, nlink) = (metadata.dev(), metadata.ino(), metadata.nlink() as u32);
-    if let Some((link_target, copy)) = link_tracker.lookup(dev, ino, nlink) {
-        let Some(target) = MemberPath::parse(&link_target)? else {
+    if let Some((link_target, copy)) = link_tracker.names.lookup_mut(dev, ino, nlink) {
+        let Some(target) = MemberPath::parse(link_target)? else {
             return do_copy_file(entry, dirfd, name, metadata, options).map(|_| ());
         };
         let target_dir = tree.parent_of(&target, false)?;
@@ -812,17 +845,21 @@ fn copy_file(
             target_dir.as_raw_fd(),
             &target.leaf,
             None,
-            copy,
+            copy.as_ref().map(MadeFile::expected),
             dirfd,
             name,
             options.no_clobber,
         )?;
+        // Linking a name changed its ctime.
+        if let Some(copy) = copy {
+            copy.linked(dirfd, name);
+        }
         return Ok(());
     }
 
     let copy = do_copy_file(entry, dirfd, name, metadata, options)?;
     // Only a copy that exists can be linked to by the file's later names.
-    link_tracker.record(dev, ino, nlink, (member.to_path_buf(), copy));
+    link_tracker.record((dev, ino), nlink, member, copy);
     Ok(())
 }
 
@@ -833,15 +870,15 @@ fn is_file_at(dirfd: BorrowedFd<'_>, name: &CStr, metadata: &ftw::Metadata) -> b
         .is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino()))
 }
 
-/// Actually copy file contents, returning the identity of the copy made, from
-/// its descriptor; `None` where -k kept a file already at the name.
+/// Actually copy file contents, returning the copy made, known from its
+/// descriptor (`MadeFile`); `None` where -k kept a file already at the name.
 fn do_copy_file(
     entry: &ftw::Entry<'_>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     metadata: &ftw::Metadata,
     options: &CopyOptions,
-) -> PaxResult<Option<(u64, u64)>> {
+) -> PaxResult<Option<MadeFile>> {
     // From the descriptor of the directory the walk found it in, and re-checked
     // against the (dev, ino) the walk saw, rather than re-resolving the whole
     // source path. Whether the walk dereferenced this entry is observable from
@@ -880,7 +917,6 @@ fn do_copy_file(
         debug_assert!(!created);
         return Ok(None);
     };
-    let copy = file_id(&fstat(dest_file.as_raw_fd())?);
 
     copy_contents(&mut src_file, &mut dest_file, metadata.size())?;
     if options.reset_atime {
@@ -888,6 +924,8 @@ fn do_copy_file(
     }
 
     set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))?;
+    // Known once its attributes are set, which change its ctime.
+    let copy = MadeFile::of(dest_file.as_fd())?;
     // A filesystem that defers writes reports their failure on close.
     crate::blocked_io::close_file(dest_file)?;
     Ok(Some(copy))

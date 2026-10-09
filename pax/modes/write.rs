@@ -655,7 +655,9 @@ fn write_file<W: ArchiveWriter>(
     };
 
     // Check for hard link
-    let original = link_tracker.lookup(entry.dev, entry.ino, entry.nlink);
+    let original = link_tracker
+        .lookup(entry.dev, entry.ino, entry.nlink)
+        .cloned();
     let later_name = original.is_some();
     if let Some(original_path) = original {
         // The same file met again under the very name it was first archived

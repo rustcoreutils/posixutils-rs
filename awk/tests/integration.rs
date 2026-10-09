@@ -1710,3 +1710,34 @@ fn awk_runtime_error_after_a_call_reports_the_caller() {
     );
     assert_eq!(status, Some(1));
 }
+
+// `$` binds tighter than `++` and `--`, so `$NF++` increments the last
+// field and `$i++` leaves i alone; awk incremented the field's index
+// instead.  In `$$i++` the increment goes to the inner field, as in gawk
+// and mawk, so `$$a++++` is `$($a++)++` (gawk's test parse1), and so is
+// one after a unary operator: `$+i++` is `$(+(i++))` (gawk's test prec).
+#[test]
+fn awk_field_reference_binds_tighter_than_increment() {
+    let cases = [
+        ("{ $NF++; print }", "1 2\n", "1 3\n"),
+        ("{ $2--; print }", "1 2\n", "1 1\n"),
+        ("{ i = 1; print $i++; print i, $0 }", "5 6\n", "5\n1 6 6\n"),
+        ("{ i = 1; print $$i++; print }", "2 5 6\n", "5\n3 5 6\n"),
+        (
+            "BEGIN { a = 3 } { print $$a++++; print }",
+            "3 4 5 6 7 8 9\n",
+            "7\n3 4 6 6 8 8 9\n",
+        ),
+        ("{ i = 1; print $++i, $i^2, $i-1 }", "5 6\n", "6 36 5\n"),
+        ("{ i = 1; $!i++; $+i++; print i, $0 }", "5 6\n", "3 5 6\n"),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}

@@ -1042,30 +1042,36 @@ impl Compiler {
         locals: &LocalMap,
     ) -> Result<Expr, PestError> {
         let mut prefix_ops = Vec::new();
-        let mut primary_pair = None;
-        let mut postfix_ops = Vec::new();
-
+        let mut operand = None;
+        let mut postfix_op = None;
         for child in field_var.into_inner() {
             match child.as_rule() {
                 Rule::pre_inc | Rule::pre_dec | Rule::not | Rule::unary_plus | Rule::negate => {
-                    if primary_pair.is_none() {
-                        prefix_ops.push(child);
-                    }
+                    prefix_ops.push(child);
                 }
-                Rule::post_inc | Rule::post_dec => {
-                    postfix_ops.push(child);
-                }
-                _ => {
-                    primary_pair = Some(child);
-                }
+                Rule::post_inc | Rule::post_dec => postfix_op = Some(child),
+                _ => operand = Some(child),
             }
         }
 
-        let primary = primary_pair.expect("field_var missing primary");
-        let mut expr = self.map_primary(primary, locals)?;
-
-        // Apply postfix ops first (they bind tighter to the primary)
-        for op in postfix_ops {
+        let operand = operand.expect("field_var missing operand");
+        let mut expr = if operand.as_rule() == Rule::nested_field {
+            // `$$i++`: the increment applies to the inner field `$i`
+            let mut inner = operand.into_inner();
+            let field = inner.next().unwrap();
+            let line_col = field.line_col();
+            let mut instructions = self.compile_field_var_expr(field, locals)?.instructions;
+            instructions.push(OpCode::GetField, line_col);
+            let mut expr = Expr::new(ExprKind::LValue, instructions);
+            if let Some(op) = inner.next() {
+                expr = self.map_postfix(expr, op)?;
+            }
+            expr
+        } else {
+            self.map_primary(operand, locals)?
+        };
+        // `$-i++`: the increment binds tighter than the unary operator
+        if let Some(op) = postfix_op {
             expr = self.map_postfix(expr, op)?;
         }
 

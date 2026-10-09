@@ -373,7 +373,13 @@ lvalue = {
   | field_var
 }
 
-field_var = { "$" ~ prefix_op* ~ primary ~ postfix_op* }
+// `$` binds tighter than `++` and `--`: `$i++` increments the field, so
+// the operand of `$` takes no increment of its own, except a field operand
+// or one with a unary operator: `$$i++` is `$($i++)` and `$-i++` is
+// `$(-(i++))`, as in gawk and mawk.  `nested_field` always takes the inner
+// field, so the field is never parsed a second time as a primary.
+field_var    = { "$" ~ (prefix_op+ ~ primary ~ postfix_op? | nested_field | primary) }
+nested_field = { field_var ~ postfix_op? }
 
 input_function = {
     getline_from_file_cmp

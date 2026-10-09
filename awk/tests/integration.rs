@@ -2057,3 +2057,27 @@ fn awk_slash_in_bracket_expression_of_ere_token() {
     assert_eq!((stdout.as_str(), stderr.as_str()), ("m\nnum 12/3\nm\n", ""));
     assert_eq!(status, Some(0));
 }
+
+// sub and gsub leave their target alone when nothing matched: a field was
+// assigned anyway, which rebuilt $0 with OFS (gawk's test gsubtst7), and a
+// number became a string.
+#[test]
+fn awk_sub_without_a_match_assigns_nothing() {
+    let cases = [
+        (
+            "{ gsub(\"foo\", \"bar\", $1); print; sub(/x/, \"y\", $2); print; gsub(/q/, \"z\"); print }",
+            " aaa  b\n",
+            " aaa  b\n aaa  b\n aaa  b\n",
+        ),
+        ("BEGIN { x = 10; gsub(/q/, \"\", x); print (x < 9) }", "", "0\n"),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}

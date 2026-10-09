@@ -335,7 +335,13 @@ pub(crate) fn builtin_gsub(
         &in_str.clone().scalar_to_string(&global_env.convfmt)?,
         is_sub,
     )?;
-    let result = in_str.assign(result, global_env);
+    // with nothing replaced the target keeps its value and type, and a field
+    // is not assigned, which would rebuild the record
+    let result = if count == 0 {
+        Ok(FieldsState::Ok)
+    } else {
+        in_str.assign(result, global_env)
+    };
     stack.push_value(count as f64)?;
     result
 }

@@ -869,6 +869,38 @@ fn find_type_l_under_follow() {
     );
 }
 
+/// The directories a walk holds open are close-on-exec: a command run by -exec inherits none.
+#[cfg(target_os = "linux")]
+#[test]
+fn find_exec_child_inherits_no_walk_descriptors() {
+    let tmp = scratch_dir();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("a/b")).unwrap();
+    File::create(dir.join("a/b/f")).unwrap();
+
+    // The child lists its own descriptors: only the standard three, none of the directories
+    // the walk holds open around it.
+    let out = Command::new(get_binary_path("find"))
+        .arg(dir)
+        .args([
+            "-name",
+            "f",
+            "-exec",
+            "/bin/sh",
+            "-c",
+            "ls /proc/$$/fd",
+            "sh",
+            "{}",
+            ";",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute find");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n1\n2\n");
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// A trailing slash on a symlink operand follows the link and names a directory (POSIX pathname
 /// resolution), with or without -H/-L: `to_dir/` is walked, under the operand as written, and
 /// `to_file/` is "Not a directory".

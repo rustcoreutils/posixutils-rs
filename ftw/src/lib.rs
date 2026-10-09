@@ -126,7 +126,7 @@ impl Drop for FileDescriptor {
 }
 
 impl FileDescriptor {
-    /// Duplicate this descriptor with `dup(2)`.
+    /// Duplicate this descriptor, close-on-exec (`fcntl(F_DUPFD_CLOEXEC)`).
     ///
     /// Fallible on purpose: a `Clone` impl has nowhere to report `EMFILE`, and the one this
     /// replaces stored the resulting `-1` instead, so the failure resurfaced later as a
@@ -136,7 +136,7 @@ impl FileDescriptor {
         if self.fd == libc::AT_FDCWD {
             return Ok(Self { fd: libc::AT_FDCWD });
         }
-        let fd = unsafe { libc::dup(self.fd) };
+        let fd = unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 0) };
         if fd == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -146,13 +146,20 @@ impl FileDescriptor {
 
 impl FileDescriptor {
     /// Create a `FileDescriptor` with arguments similar to `libc::openat`.
+    ///
+    /// The descriptor is always close-on-exec (`O_CLOEXEC` is added to `flags`): a command a
+    /// caller runs during a walk (`find -exec`) must not inherit the directories it holds.
     pub fn open_at(
         dir_file_descriptor: &FileDescriptor,
         file_name: &CStr,
         flags: i32,
     ) -> io::Result<Self> {
         unsafe {
-            let fd = libc::openat(dir_file_descriptor.fd, file_name.as_ptr(), flags);
+            let fd = libc::openat(
+                dir_file_descriptor.fd,
+                file_name.as_ptr(),
+                flags | libc::O_CLOEXEC,
+            );
             if fd == -1 {
                 Err(io::Error::last_os_error())
             } else {

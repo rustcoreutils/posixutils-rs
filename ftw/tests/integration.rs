@@ -1015,3 +1015,58 @@ fn trailing_slash_operand_names_a_directory() {
         }
     }
 }
+
+fn is_cloexec(fd: libc::c_int) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(flags >= 0, "{}", io::Error::last_os_error());
+    flags & libc::FD_CLOEXEC != 0
+}
+
+/// Every descriptor ftw opens or duplicates is close-on-exec, so a command a caller runs during a
+/// walk (`find -exec`) inherits none of the directories it holds: those opened by
+/// `FileDescriptor::open_at` whatever flags it is given, its duplicates, and the ones each entry
+/// is reached through, in a normal and in a descriptor-conserving walk, and through a symbolic
+/// link named with a trailing slash.
+#[test]
+fn walk_descriptors_are_close_on_exec() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("walk_cloexec")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+    fs::create_dir_all(root.join("d/a/b")).unwrap();
+    fs::write(root.join("d/a/b/f"), b"x").unwrap();
+    unix::fs::symlink("d", root.join("dl")).unwrap();
+
+    let root_cstr = CString::new(root.to_str().unwrap()).unwrap();
+    let opened =
+        ftw::FileDescriptor::open_at(&ftw::FileDescriptor::cwd(), &root_cstr, libc::O_RDONLY)
+            .unwrap();
+    assert!(is_cloexec(opened.as_raw_fd()), "open_at");
+    assert!(
+        is_cloexec(opened.try_clone().unwrap().as_raw_fd()),
+        "try_clone"
+    );
+
+    for (operand, opts) in [
+        (root.join("d"), ftw::TraverseDirectoryOpts::default()),
+        (root.join("d"), conserving_fds_opts()),
+        (root.join("dl/"), ftw::TraverseDirectoryOpts::default()),
+    ] {
+        let mut checked = 0;
+        ftw::traverse_directory(
+            &operand,
+            |entry| {
+                if entry.dir_fd() != libc::AT_FDCWD {
+                    assert!(is_cloexec(entry.dir_fd()), "{}", entry.path());
+                    checked += 1;
+                }
+                Ok(true)
+            },
+            |_, _| Ok(()),
+            |entry, e| panic!("unexpected error on {}: {:?}", entry.path(), e.kind()),
+            opts,
+        );
+        assert!(checked >= 3, "{}", operand.display());
+    }
+}

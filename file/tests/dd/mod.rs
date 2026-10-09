@@ -663,13 +663,15 @@ fn test_seek_sets_output_size_unless_notrunc() {
 // dd panic.
 #[test]
 fn test_dd_non_utf8_file_names() {
-    use plib::testing::{get_binary_path, os_bytes};
+    use plib::testing::{create_non_utf8, get_binary_path, os_bytes};
     use std::ffi::OsString;
 
     let dir = plib::tmp::tempdir().unwrap();
-    let input = dir.path().join(os_bytes(b"in\xff"));
+    let Some(input) = create_non_utf8(dir.path(), b"in\xff", |p| std::fs::write(p, b"hello\n"))
+    else {
+        return;
+    };
     let output = dir.path().join(os_bytes(b"out\xfe"));
-    std::fs::write(&input, b"hello\n").unwrap();
 
     let mut if_arg = OsString::from("if=");
     if_arg.push(&input);

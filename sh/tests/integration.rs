@@ -10,7 +10,6 @@
 mod pty;
 
 use plib::testing::{run_test, run_test_u8, run_test_with_checker, TestPlan, TestPlanU8};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3531,16 +3530,13 @@ mod audit_regressions {
     /// the filesystem rather than the shell. Probed rather than assumed, so
     /// they still run wherever the names are accepted.
     fn filesystem_keeps_byte_names() -> bool {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-        std::fs::create_dir_all(&dir).expect("the target temporary directory is unusable");
-        let path = dir.join(std::ffi::OsStr::from_bytes(b"byte-name-probe\xff"));
-        let _ = std::fs::remove_file(&path);
-        let accepted = std::fs::write(&path, b"").is_ok();
-        let _ = std::fs::remove_file(&path);
-        if !accepted {
-            eprintln!("this filesystem rejects a filename that is not valid text");
-        }
-        accepted
+        let base = env!("CARGO_TARGET_TMPDIR");
+        std::fs::create_dir_all(base).expect("the target temporary directory is unusable");
+        let dir = plib::tmp::Builder::new()
+            .prefix("byte-name-probe")
+            .tempdir_in(base)
+            .expect("create probe directory");
+        plib::testing::non_utf8_names_supported(dir.path())
     }
 
     fn expect_stdout_bytes(script: &[u8], expected: &[u8]) {

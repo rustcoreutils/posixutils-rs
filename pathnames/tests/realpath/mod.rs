@@ -7,10 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
-// Only the Linux-only non-UTF-8 test below needs the byte-oriented plan.
-#[cfg(target_os = "linux")]
-use plib::testing::{os_bytes, run_test_os, TestPlanOs};
+use plib::testing::{create_non_utf8, os_bytes, run_test, run_test_os, TestPlan, TestPlanOs};
 
 fn realpath_test(args: &[&str], stdout: &str, stderr: &str, expected_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -268,22 +265,22 @@ fn realpath_newline_is_error() {
 /// A real directory entry is needed because `-e` resolution stats the path, so
 /// this creates one with a non-UTF-8 name rather than asserting on a string.
 ///
-/// Linux-only: APFS and HFS+ validate that filenames are well-formed UTF-8 and
-/// reject the `\xff\xfe` name with EILSEQ, so such a directory entry cannot be
-/// created on macOS at all. The byte-clean operand handling this covers is
-/// filesystem-independent, and `basename`/`dirname` exercise it on both
-/// platforms since they never touch the filesystem.
-#[cfg(target_os = "linux")]
+/// Skipped where the filesystem refuses the `\xff\xfe` name (macOS APFS and
+/// HFS+ answer EILSEQ), as such a directory entry cannot be created there at
+/// all. The byte-clean operand handling this covers is filesystem-independent,
+/// and `basename`/`dirname` exercise it on every platform since they never
+/// touch the filesystem.
 #[test]
 fn realpath_non_utf8_operand() {
     use std::os::unix::ffi::OsStrExt;
 
     let td = plib::tmp::tempdir().unwrap();
     // The temp dir path itself is valid UTF-8; only the entry name is not.
-    let mut name = td.path().as_os_str().as_bytes().to_vec();
-    name.extend_from_slice(b"/\xff\xfefile");
-    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&name));
-    std::fs::write(&path, b"x").unwrap();
+    let Some(path) = create_non_utf8(td.path(), b"\xff\xfefile", |p| std::fs::write(p, b"x"))
+    else {
+        return;
+    };
+    let name = path.as_os_str().as_bytes().to_vec();
 
     let mut expected = name.clone();
     expected.push(b'\n');

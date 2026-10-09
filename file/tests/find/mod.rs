@@ -1033,10 +1033,11 @@ fn find_reports_write_error() {
 // by a lossy copy of the name, which named a different file.
 #[test]
 fn find_non_utf8_path_and_exec() {
-    use plib::testing::os_bytes;
+    use plib::testing::{create_non_utf8, os_bytes};
     let dir = tempdir().unwrap();
-    let top = dir.path().join(os_bytes(b"top\xff"));
-    std::fs::create_dir(&top).unwrap();
+    let Some(top) = create_non_utf8(dir.path(), b"top\xff", |p| std::fs::create_dir(p)) else {
+        return;
+    };
     File::create(top.join(os_bytes(b"f\xfe"))).unwrap();
 
     let output = Command::new(get_binary_path("find"))

@@ -16,7 +16,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Output, Stdio};
 
-use plib::testing::get_binary_path;
+use plib::testing::{create_non_utf8, get_binary_path};
 use plib::tmp::{tempdir, TempDir};
 
 /// Run find on `dir` with `args` (byte strings) in locale `locale`.
@@ -47,13 +47,14 @@ fn printed_names(output: &Output) -> Vec<Vec<u8>> {
     names
 }
 
-/// A scratch directory holding empty files with the given names.
-fn dir_with(names: &[&[u8]]) -> TempDir {
+/// A scratch directory holding empty files with the given names, or `None`
+/// where the filesystem refuses a name that is not valid UTF-8 (macOS APFS).
+fn dir_with(names: &[&[u8]]) -> Option<TempDir> {
     let dir = tempdir().expect("create scratch dir");
     for name in names {
-        std::fs::File::create(dir.path().join(OsStr::from_bytes(name))).unwrap();
+        create_non_utf8(dir.path(), name, |p| std::fs::File::create(p).map(drop))?;
     }
-    dir
+    Some(dir)
 }
 
 /// Assert that find in `locale` with `args` prints exactly `expected` names.
@@ -74,18 +75,17 @@ fn assert_finds(dir: &TempDir, locale: &str, args: &[&[u8]], expected: &[&[u8]])
 // pattern; it was refused as "expression operand is not valid UTF-8".
 #[test]
 fn non_utf8_pattern_operand_is_accepted() {
-    let dir = dir_with(&[b"plain"]);
+    let dir = dir_with(&[b"plain"]).unwrap();
     for primary in [&b"-name"[..], b"-iname", b"-path", b"-ipath"] {
         assert_finds(&dir, "C", &[primary, b"x\xffy"], &[]);
     }
 }
 
-// Linux only from here on: APFS refuses a name that is not valid UTF-8.
-
-#[cfg(target_os = "linux")]
 #[test]
 fn name_matches_non_utf8_file_name_as_bytes() {
-    let dir = dir_with(&[b"a\xffb", b"plain"]);
+    let Some(dir) = dir_with(&[b"a\xffb", b"plain"]) else {
+        return;
+    };
     assert_finds(&dir, "C", &[b"-name", b"a?b"], &[b"a\xffb"]);
     assert_finds(&dir, "C", &[b"-name", b"a*"], &[b"a\xffb"]);
     assert_finds(&dir, "C", &[b"-name", b"a\xffb"], &[b"a\xffb"]);
@@ -95,10 +95,11 @@ fn name_matches_non_utf8_file_name_as_bytes() {
     assert_finds(&dir, "C", &[b"-iname", b"A?B"], &[b"a\xffb"]);
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn path_matches_non_utf8_path_as_bytes() {
-    let dir = dir_with(&[b"a\xffb", b"plain"]);
+    let Some(dir) = dir_with(&[b"a\xffb", b"plain"]) else {
+        return;
+    };
     assert_finds(&dir, "C", &[b"-path", b"*/a?b"], &[b"a\xffb"]);
     assert_finds(&dir, "C", &[b"-path", b"*/a\xffb"], &[b"a\xffb"]);
     assert_finds(&dir, "C", &[b"-ipath", b"*/A\xffB"], &[b"a\xffb"]);
@@ -108,7 +109,7 @@ fn path_matches_non_utf8_path_as_bytes() {
 // several bytes in the C locale, as GNU find has it.
 #[test]
 fn multibyte_name_matched_per_locale() {
-    let dir = dir_with(&["x\u{e9}y".as_bytes()]);
+    let dir = dir_with(&["x\u{e9}y".as_bytes()]).unwrap();
     let e_acute = "x\u{e9}y".as_bytes();
     assert_finds(&dir, "C", &[b"-name", b"x?y"], &[]);
     assert_finds(&dir, "C", &[b"-name", b"x??y"], &[e_acute]);

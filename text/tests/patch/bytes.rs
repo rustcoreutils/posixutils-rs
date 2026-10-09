@@ -85,9 +85,7 @@ fn test_patch_non_utf8_file_name() {
     use std::os::unix::ffi::OsStrExt;
     let dir = setup_test_dir("latin1_name");
     let name = OsStr::from_bytes(b"caf\xe9.txt");
-    // Some file systems (APFS) take only UTF-8 names.
-    if fs::write(dir.join(name), b"a\n").is_err() {
-        eprintln!("this filesystem rejects a filename that is not valid text");
+    if plib::testing::create_non_utf8(&dir, b"caf\xe9.txt", |p| fs::write(p, b"a\n")).is_none() {
         cleanup_test_dir(&dir);
         return;
     }

@@ -145,21 +145,21 @@ fn open_pty() -> (libc::c_int, libc::c_int) {
 // whenever HOME is overridden.
 #[test]
 fn nohup_out_falls_back_to_home_when_cwd_is_unwritable() {
-    check_home_fallback(std::ffi::OsStr::new("home"));
+    check_home_fallback(b"home");
 }
 
 // The fallback directory's name need not be valid UTF-8: such a HOME was
 // treated as unset, and nohup failed instead of writing there.
 #[test]
 fn nohup_out_falls_back_to_non_utf8_home() {
-    use std::os::unix::ffi::OsStrExt;
-    check_home_fallback(std::ffi::OsStr::from_bytes(b"home\xff"));
+    check_home_fallback(b"home\xff");
 }
 
 /// Run nohup on a terminal in an unwritable directory with `$HOME` set to a
 /// directory called `home_name`, and check its output went to
-/// `$HOME/nohup.out`.
-fn check_home_fallback(home_name: &std::ffi::OsStr) {
+/// `$HOME/nohup.out`. Skipped where the filesystem refuses `home_name`, a
+/// name that is not valid UTF-8 (macOS APFS).
+fn check_home_fallback(home_name: &[u8]) {
     use std::os::unix::io::FromRawFd;
     use std::process::{Command, Stdio};
 
@@ -171,9 +171,11 @@ fn check_home_fallback(home_name: &std::ffi::OsStr) {
     let base_dir = plib::tmp::tempdir().unwrap();
     let base = base_dir.path();
     let unwritable = base.join("cwd");
-    let home = base.join(home_name);
     std::fs::create_dir_all(&unwritable).unwrap();
-    std::fs::create_dir_all(&home).unwrap();
+    let Some(home) = plib::testing::create_non_utf8(base, home_name, |p| std::fs::create_dir(p))
+    else {
+        return;
+    };
 
     // Searchable but not writable, so creating ./nohup.out fails.
     std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o500)).unwrap();

@@ -398,10 +398,11 @@ fn who_dash_b_writes_a_system_boot_line() {
 // command line made who panic on one.
 #[test]
 fn who_non_utf8_file_operand() {
-    use plib::testing::{get_binary_path, os_bytes};
+    use plib::testing::{create_non_utf8, get_binary_path};
     let dir = plib::tmp::tempdir().unwrap();
-    let file = dir.path().join(os_bytes(b"utmp\xff"));
-    std::fs::write(&file, b"").unwrap();
+    let Some(file) = create_non_utf8(dir.path(), b"utmp\xff", |p| std::fs::write(p, b"")) else {
+        return;
+    };
     let output = std::process::Command::new(get_binary_path("who"))
         .arg(&file)
         .output()

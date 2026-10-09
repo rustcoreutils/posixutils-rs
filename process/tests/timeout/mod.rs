@@ -598,12 +598,13 @@ fn test_options_after_utility_belong_to_the_utility() {
 // PATH was treated as unset.
 #[test]
 fn timeout_non_utf8_arguments_and_path() {
-    use plib::testing::{get_binary_path, os_bytes};
+    use plib::testing::{create_non_utf8, get_binary_path, os_bytes};
     use std::os::unix::fs::PermissionsExt;
 
     let dir = plib::tmp::tempdir().unwrap();
-    let bin = dir.path().join(os_bytes(b"bin\xff"));
-    std::fs::create_dir(&bin).unwrap();
+    let Some(bin) = create_non_utf8(dir.path(), b"bin\xff", |p| std::fs::create_dir(p)) else {
+        return;
+    };
     let script = bin.join("posixutils-timeout-probe");
     std::fs::write(&script, "#!/bin/sh\nprintf '%s' \"$1\"\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();

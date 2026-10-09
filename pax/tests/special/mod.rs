@@ -10,6 +10,7 @@
 //! Special file tests (FIFO, block device, character device)
 
 use crate::common::*;
+use plib::testing::{create_non_utf8, non_utf8_names_supported};
 use plib::tmp::TempDir;
 use std::ffi::CString;
 use std::fs;
@@ -352,9 +353,8 @@ fn test_stdin_file_list_preserves_leading_space() {
 /// to_string_lossy first, replacing every invalid byte with U+FFFD
 /// irreversibly, which made `binary` produce byte-identical output to `write`.
 ///
-/// Linux-only: APFS and HFS+ reject a filename that is not well-formed UTF-8,
-/// so the fixture cannot exist on macOS.
-#[cfg(target_os = "linux")]
+/// Skipped where the filesystem refuses a filename that is not well-formed
+/// UTF-8 (macOS APFS and HFS+), since the fixture cannot exist there.
 #[test]
 fn test_pax_preserves_a_raw_name_without_being_asked() {
     // This used to need `-o invalid=binary`. A pathname is bytes, so keeping
@@ -369,7 +369,9 @@ fn test_pax_preserves_a_raw_name_without_being_asked() {
 
     let raw = b"na\xffme.txt";
     let name = std::ffi::OsStr::from_bytes(raw);
-    fs::write(src_dir.join(name), b"payload").unwrap();
+    if create_non_utf8(&src_dir, raw, |p| fs::write(p, b"payload")).is_none() {
+        return;
+    }
 
     let output = run_pax_in_dir(
         &["-w", "-x", "pax", "-f", archive.to_str().unwrap(), "."],
@@ -408,12 +410,11 @@ fn test_pax_preserves_a_raw_name_without_being_asked() {
 
 /// The member name a GNU-tar archive records must be the name pax creates.
 ///
-/// Linux-only: APFS and HFS+ reject a filename that is not well-formed UTF-8
-/// (`creat` returns EILSEQ), so neither the source file nor the extracted one
-/// can exist on macOS. What is under test is that pax passes the bytes
-/// through; a filesystem that refuses to hold them cannot show that either
-/// way.
-#[cfg(target_os = "linux")]
+/// Skipped where the filesystem refuses a filename that is not well-formed
+/// UTF-8 (macOS APFS and HFS+: `creat` returns EILSEQ), so neither the source
+/// file nor the extracted one can exist. What is under test is that pax
+/// passes the bytes through; a filesystem that refuses to hold them cannot
+/// show that either way.
 #[test]
 fn test_non_utf8_name_round_trips_through_every_format() {
     let raw = b"na\xffme.txt";
@@ -425,7 +426,9 @@ fn test_non_utf8_name_round_trips_through_every_format() {
         let dst = temp.path().join("dst");
         fs::create_dir(&src).unwrap();
         fs::create_dir(&dst).unwrap();
-        fs::write(src.join(name), b"payload").unwrap();
+        if create_non_utf8(&src, raw, |p| fs::write(p, b"payload")).is_none() {
+            return;
+        }
 
         let archive = temp.path().join("a.archive");
         assert_success(
@@ -452,13 +455,15 @@ fn test_non_utf8_name_round_trips_through_every_format() {
 /// members. Under a lossy conversion both became `a<U+FFFD>b` and the second
 /// clobbered the first.
 ///
-/// Linux-only: see the note above -- macOS will not hold either name.
-#[cfg(target_os = "linux")]
+/// Skipped where the filesystem will hold neither name; see the note above.
 #[test]
 fn test_names_differing_only_in_invalid_bytes_do_not_collide() {
     let temp = TempDir::new().unwrap();
     let dst = temp.path().join("dst");
     fs::create_dir(&dst).unwrap();
+    if !non_utf8_names_supported(&dst) {
+        return;
+    }
 
     let mut archive = crate::common::Ustar {
         name: b"a\xffb",
@@ -513,14 +518,16 @@ fn test_listing_reports_the_recorded_bytes() {
 /// U+FFFD where `pax -r` writes a raw byte makes the two disagree about the
 /// same archive.
 ///
-/// Linux-only: macOS will not create the file, so there is no name to compare
-/// the listing against.
-#[cfg(target_os = "linux")]
+/// Skipped where the filesystem will not create the file (macOS APFS), as
+/// there is then no name to compare the listing against.
 #[test]
 fn test_listing_reports_the_name_extraction_creates() {
     let temp = TempDir::new().unwrap();
     let dst = temp.path().join("dst");
     fs::create_dir(&dst).unwrap();
+    if !non_utf8_names_supported(&dst) {
+        return;
+    }
 
     let archive = crate::common::Ustar {
         name: b"na\xffme.txt",

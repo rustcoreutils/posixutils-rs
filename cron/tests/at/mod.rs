@@ -695,17 +695,15 @@ fn test_at_non_utf8_environment_and_directory() {
     fs::create_dir_all(&spool).unwrap();
     let allow = dir.path().join("at.allow");
     fs::write(&allow, format!("{}\n", whoami())).unwrap();
-    // macOS (APFS) refuses a name that is not UTF-8; there the directory part
-    // falls back to a plain name and only the environment is non-UTF-8.
-    let mut cwd = dir.path().join(os_bytes(b"cwd\xff"));
-    match fs::create_dir_all(&cwd) {
-        Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
-            cwd = dir.path().join("cwd");
-            fs::create_dir_all(&cwd).unwrap();
-        }
-        Err(e) => panic!("create test directory: {e}"),
-    }
+    // Where the filesystem refuses a name that is not UTF-8 (macOS APFS), the
+    // directory falls back to a plain name and only the environment is
+    // non-UTF-8.
+    let cwd = plib::testing::create_non_utf8(dir.path(), b"cwd\xff", |p| fs::create_dir(p))
+        .unwrap_or_else(|| {
+            let cwd = dir.path().join("cwd");
+            fs::create_dir(&cwd).unwrap();
+            cwd
+        });
 
     let mut child = std::process::Command::new(plib::testing::get_binary_path("at"))
         .args(["-m", "now", "+", "1", "hour"])

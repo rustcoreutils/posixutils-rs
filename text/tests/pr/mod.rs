@@ -573,10 +573,11 @@ fn header_begins_with_hyphen_digit() {
 #[cfg(unix)]
 #[test]
 fn pr_non_utf8_file_operand() {
-    use plib::testing::{get_binary_path, os_bytes};
+    use plib::testing::{create_non_utf8, get_binary_path};
     let dir = plib::tmp::tempdir().unwrap();
-    let file = dir.path().join(os_bytes(b"in\xff"));
-    fs::write(&file, b"hello\n").unwrap();
+    let Some(file) = create_non_utf8(dir.path(), b"in\xff", |p| fs::write(p, b"hello\n")) else {
+        return;
+    };
     let output = std::process::Command::new(get_binary_path("pr"))
         .arg("-t")
         .arg(&file)

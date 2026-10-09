@@ -746,8 +746,8 @@ fn size_limit_counts_bytes() {
     );
 }
 
-// Linux only: APFS refuses a name that is not valid UTF-8 (EILSEQ).
-#[cfg(target_os = "linux")]
+// Skipped where the filesystem refuses a name that is not valid UTF-8
+// (macOS APFS).
 #[test]
 fn rm_removes_exactly_the_named_non_utf8_files() {
     use std::ffi::OsStr;
@@ -757,8 +757,11 @@ fn rm_removes_exactly_the_named_non_utf8_files() {
     let names: [&[u8]; 2] = [b"a\xffb", b"c\xe9d"];
     let mut stdin = Vec::new();
     for name in names {
-        let path = dir.path().join(OsStr::from_bytes(name));
-        File::create(&path).unwrap();
+        let created =
+            plib::testing::create_non_utf8(dir.path(), name, |p| File::create(p).map(drop));
+        let Some(path) = created else {
+            return;
+        };
         stdin.extend_from_slice(path.as_os_str().as_bytes());
         stdin.push(0);
     }

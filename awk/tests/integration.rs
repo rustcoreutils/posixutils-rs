@@ -1096,3 +1096,51 @@ fn awk_gsub_skips_an_empty_match_after_a_match() {
         });
     }
 }
+
+/// Run awk on `program` with a 20 second limit, so that a hang fails the test
+/// instead of the whole run; returns stdout, stderr and the exit status.
+fn awk_with_deadline(program: &str) -> (String, String, Option<i32>) {
+    use std::time::{Duration, Instant};
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("awk"))
+        .arg(program)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("awk never finished with {program:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// After a syntax error awk looks for more errors by reparsing from each later
+// `}`, BEGIN, END or `function`.  When the reparse from a keyword failed too,
+// the next search found that same keyword again at offset 0 and awk spun for
+// ever; texinfo's texindex.awk hung bash's documentation build this way.
+#[test]
+fn awk_syntax_error_before_a_failing_function_terminates() {
+    let programs = [
+        "BEGIN { @ }\nfunction f() { @ }\n",
+        "BEGIN { @ }\nBEGIN { @ }\n",
+        "BEGIN { @ }\nEND { @ }\nEND { @ }\n",
+        "{ @ } function",
+    ];
+    for program in programs {
+        let (stdout, stderr, status) = awk_with_deadline(program);
+        assert_eq!(stdout, "", "{program:?}");
+        assert!(!stderr.is_empty(), "{program:?}");
+        assert_ne!(status, Some(0), "{program:?}");
+    }
+}

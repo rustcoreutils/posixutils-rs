@@ -1842,13 +1842,19 @@ fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestErro
     let first_error_end = location_end(&first_error.location);
 
     errors.push(improve_error(first_error, file));
-    let mut parsing_start = first_error_end;
+    let mut search_start = first_error_end;
 
-    while let Some(checkpoint_offset) = next_checkpoint(&source[parsing_start..]) {
-        parsing_start += checkpoint_offset;
+    while let Some(checkpoint_offset) = next_checkpoint(&source[search_start..]) {
+        let parsing_start = search_start + checkpoint_offset;
         match AwkParser::parse(Rule::program, &source[parsing_start..]) {
             Ok(_) => break,
             Err(err) => errors.push(improve_error(err, file)),
+        }
+        // A keyword checkpoint starts at its own offset, so the next search
+        // begins past its first character, or it would find it again.
+        match source[parsing_start..].chars().next() {
+            Some(c) => search_start = parsing_start + c.len_utf8(),
+            None => break,
         }
     }
 }

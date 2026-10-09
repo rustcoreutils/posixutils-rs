@@ -18,6 +18,8 @@ mod dpkg_options;
 mod search;
 #[cfg(unix)]
 mod symlinks;
+#[cfg(unix)]
+mod traversal;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 

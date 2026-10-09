@@ -1268,3 +1268,37 @@ fn test_copy_onto_itself_does_not_revisit_its_own_output() {
         );
     }
 }
+
+/// The deepest directory below `dir`, in components.
+fn deepest_dir(dir: &std::path::Path) -> usize {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().unwrap().is_dir())
+        .map(|e| 1 + deepest_dir(&e.path()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// -s can send a member below a directory the walk has still to read, and the
+/// directories made to hold it are the copy's own output too. Walked as a
+/// source, each was copied again under the same substitution, one level
+/// deeper, without end: here `e/q` is made while `e` is visited, before the
+/// walk reads `e`, so every level is met whatever the readdir order. Bounded
+/// by a deadline, since the regression neither ends nor fails.
+#[test]
+fn test_copy_does_not_walk_directories_it_made_to_hold_members() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("d")).unwrap();
+    fs::create_dir(temp.path().join("e")).unwrap();
+    fs::write(temp.path().join("d/f"), "F\n").unwrap();
+    let args = ["-rw", "-s", r",^[de]/\(.*\)$,e/q/\1/w,", "d", "e", "."];
+    let out = run_pax_with_deadline(&args, temp.path(), std::time::Duration::from_secs(5))
+        .expect("pax -rw -s into a directory it made did not finish");
+    assert_success(&out, "pax -rw -s into a directory it made");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("e/q/f/w")).unwrap(),
+        "F\n"
+    );
+    assert_eq!(deepest_dir(&temp.path().join("e")), 2);
+}

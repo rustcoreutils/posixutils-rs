@@ -485,6 +485,15 @@ impl DirTree {
         Ok(fd)
     }
 
+    /// Whether the directory with `id` is one this run made -- to hold
+    /// members below it, for a member naming it, or unverified -- wherever it
+    /// is met.
+    pub(crate) fn made_by_run(&self, id: (u64, u64)) -> bool {
+        self.implicit.borrow().contains_key(&id)
+            || self.made.borrow().contains_key(&id)
+            || self.unverified.borrow().contains(&id)
+    }
+
     /// Whether `st`, met at `member`, is a directory this run created there
     /// only to hold members below it, rather than one that was there before.
     pub(crate) fn is_implicit(&self, st: &libc::stat, member: &MemberPath) -> bool {

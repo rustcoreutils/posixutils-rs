@@ -106,7 +106,7 @@ pub fn copy_files(
         tree: &tree,
         options,
         link_tracker: RefCell::new(HardLinkTracker::new()),
-        dest_ids: RefCell::new(HashMap::new()),
+        dest_ids: RefCell::new(HashSet::new()),
         made_files: RefCell::new(HashMap::new()),
         prompter: RefCell::new(if options.interactive {
             Some(InteractivePrompter::new()?)
@@ -119,7 +119,7 @@ pub fn copy_files(
         fatal: RefCell::new(None),
     };
     if let Some(st) = stat_at(tree.root(), c".") {
-        walk.record_dest(file_id(&st), Dest::Entered);
+        walk.dest_ids.borrow_mut().insert(file_id(&st));
     }
 
     // Directories take their attributes once everything has been copied --
@@ -168,20 +168,6 @@ impl CopyWalk<'_> {
     }
 }
 
-/// What a destination in `CopyWalk::dest_ids` is to the walk, should the walk
-/// meet it as a source.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Dest {
-    /// A directory that was there already: the destination operand, one
-    /// entered, or one that maps onto itself. A source directory that is one
-    /// is one being copied *into*.
-    Entered,
-    /// A directory this copy made. -s and -i can put it inside a directory
-    /// the walk has still to read (as with `CopyWalk::made_files`), and it is
-    /// then the copy's own output, which is not copied again.
-    Made,
-}
-
 /// State the three traversal callbacks share.
 ///
 /// The destination side is untouched by this: every leaf is still resolved
@@ -195,8 +181,10 @@ struct CopyWalk<'a> {
     options: &'a CopyOptions,
     link_tracker: RefCell<HardLinkTracker>,
     /// `(st_dev, st_ino)` of every destination directory this copy has created
-    /// or entered, with which it is (`Dest`).
-    dest_ids: RefCell<HashMap<(u64, u64), Dest>>,
+    /// or entered, and of every directory that maps onto itself. A source
+    /// directory found in here is one being copied *into* -- unless this copy
+    /// made it (`DirTree::made_by_run`).
+    dest_ids: RefCell<HashSet<(u64, u64)>>,
     /// The names of the files this copy has made under -s or -i, by the
     /// `(st_dev, st_ino)` of the directory they were made in. -s and -i can
     /// put a file inside a directory the walk has still to read -- the very
@@ -289,29 +277,28 @@ impl CopyWalk<'_> {
         // being copied into. Following it walks the copy's own output back
         // into itself until the pathname runs out of room; identity cannot be
         // spelled two ways, where a path comparison could be defeated by any
-        // other spelling. A source this copy made is its own output, met again
-        // by a walk that is still reading the directory it was put in.
+        // other spelling.
+        //
+        // A source this copy made is its own output, met again by a walk that
+        // is still reading the directory -s or -i put it in: a file
+        // (`made_here`), or a directory, made for a member or only to hold
+        // members below it. Walked, such a directory is copied again under
+        // the same substitution, one level deeper each time, without end.
         if self.made_here(entry, metadata) {
             return Ok(false);
         }
-        let dest = self
-            .dest_ids
-            .borrow()
-            .get(&(metadata.dev(), metadata.ino()))
-            .copied();
-        match dest {
-            Some(Dest::Made) => return Ok(false),
-            Some(Dest::Entered) if metadata.is_dir() => {
-                // The path is not repeated in the message: `visit` reports
-                // this against `src`, byte-accurately, as the diagnostic's
-                // subject. Interpolating `src.display()` here both duplicated
-                // it and reintroduced the lossy rendering the rest of this
-                // branch removed.
-                return Err(PaxError::InvalidFormat(
-                    "cannot copy directory into itself".to_string(),
-                ));
-            }
-            _ => {}
+        let id = (metadata.dev(), metadata.ino());
+        if metadata.is_dir() && self.tree.made_by_run(id) {
+            return Ok(false);
+        }
+        if metadata.is_dir() && self.dest_ids.borrow().contains(&id) {
+            // The path is not repeated in the message: `visit` reports this
+            // against `src`, byte-accurately, as the diagnostic's subject.
+            // Interpolating `src.display()` here both duplicated it and
+            // reintroduced the lossy rendering the rest of this branch removed.
+            return Err(PaxError::InvalidFormat(
+                "cannot copy directory into itself".to_string(),
+            ));
         }
 
         // -s applies before -i (POSIX: the order of -o, -p and -s is
@@ -404,16 +391,11 @@ impl CopyWalk<'_> {
         Ok(false)
     }
 
-    /// Record `id` as a destination of kind `dest`, unless it already is one.
-    fn record_dest(&self, id: (u64, u64), dest: Dest) {
-        self.dest_ids.borrow_mut().entry(id).or_insert(dest);
-    }
-
     /// Under -s or -i, record `name` in `dirfd` as a file this copy made
     /// (`made_files`). Only a renamed member can land in a directory the walk
     /// has still to read; without -s or -i every member lands at its source's
     /// own name below the destination, which the walk never enters
-    /// (`Dest::Entered`).
+    /// (`dest_ids`).
     fn record_made_file(&self, dirfd: BorrowedFd<'_>, name: &CStr) {
         if self.options.substitutions.is_empty() && !self.options.interactive {
             return;
@@ -504,12 +486,7 @@ impl CopyWalk<'_> {
 
         // Remember what this destination directory *is*, so the walk can
         // recognise it if the source tree leads back here.
-        let dest = if existing.is_some() {
-            Dest::Entered
-        } else {
-            Dest::Made
-        };
-        self.record_dest(file_id(&dest_st), dest);
+        self.dest_ids.borrow_mut().insert(file_id(&dest_st));
 
         self.print_verbose(src);
 
@@ -542,7 +519,9 @@ impl CopyWalk<'_> {
             return overwrites_itself(src);
         }
         // It is a destination, and is being read while it is written to.
-        self.record_dest((metadata.dev(), metadata.ino()), Dest::Entered);
+        self.dest_ids
+            .borrow_mut()
+            .insert((metadata.dev(), metadata.ino()));
         self.print_verbose(src);
         self.descend(member, metadata)
     }

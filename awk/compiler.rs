@@ -18,7 +18,7 @@ use crate::regex::Regex;
 use pest::error::InputLocation;
 use pest::iterators::{Pair, Pairs};
 use pest::pratt_parser::{Assoc, Op, PrattParser};
-use pest::Parser;
+use pest::{Parser, Position, Span};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -1853,17 +1853,42 @@ fn improve_error(error: PestError, file: &str) -> PestError {
     }
 }
 
+/// Places `error`, found parsing `source[offset..]`, in `source` itself, so
+/// that it reports its own line and column.
+fn rebase_error(error: PestError, source: &str, offset: usize) -> PestError {
+    match error.location {
+        InputLocation::Pos(pos) => {
+            let pos = Position::new(source, offset + pos).expect("error inside the source");
+            PestError::new_from_pos(error.variant, pos)
+        }
+        InputLocation::Span((start, end)) => {
+            let span =
+                Span::new(source, offset + start, offset + end).expect("error inside the source");
+            PestError::new_from_span(error.variant, span)
+        }
+    }
+}
+
 fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestError>, file: &str) {
     let first_error_end = location_end(&first_error.location);
 
     errors.push(improve_error(first_error, file));
     let mut search_start = first_error_end;
 
+    let mut reported = vec![first_error_end];
     while let Some(checkpoint_offset) = next_checkpoint(&source[search_start..]) {
         let parsing_start = search_start + checkpoint_offset;
         match AwkParser::parse(Rule::program, &source[parsing_start..]) {
             Ok(_) => break,
-            Err(err) => errors.push(improve_error(err, file)),
+            Err(err) => {
+                // Several checkpoints can lead to the same error; report it once.
+                let err = rebase_error(err, source, parsing_start);
+                let end = location_end(&err.location);
+                if !reported.contains(&end) {
+                    reported.push(end);
+                    errors.push(improve_error(err, file));
+                }
+            }
         }
         // A keyword checkpoint starts at its own offset, so the next search
         // begins past its first character, or it would find it again.

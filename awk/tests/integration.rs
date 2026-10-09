@@ -1383,3 +1383,27 @@ fn awk_empty_separator_match_does_not_split() {
         });
     }
 }
+
+// Each syntax error is reported once, at its own line and column: errors
+// found after the first were placed relative to where the search for them
+// resumed, and found again from every later checkpoint.
+#[test]
+fn awk_later_syntax_errors_report_their_own_position() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let program = tmp.path().join("two.awk");
+    std::fs::write(&program, "BEGIN { @ }\n\nfunction f() {\n  x = 1 @\n}\n").unwrap();
+    let args = vec![String::from("-f"), program.to_string_lossy().into_owned()];
+    let output = plib::testing::run_test_base("awk", &args, b"");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let locations: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("--> "))
+        .collect();
+    let file = program.to_string_lossy();
+    assert_eq!(
+        locations,
+        [format!("{file}:1:9"), format!("{file}:4:9")],
+        "{stderr}"
+    );
+    assert_ne!(output.status.code(), Some(0));
+}

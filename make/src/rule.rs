@@ -26,7 +26,7 @@ use recipe::config::Config as RecipeConfig;
 use recipe::Recipe;
 use std::path::PathBuf;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, FileTimes},
     process::Command,
     sync::{Arc, LazyLock, Mutex},
@@ -679,7 +679,11 @@ fn exported_macros(
     if env_macros {
         return HashMap::new();
     }
-    let inherited: HashMap<String, String> = std::env::vars().collect();
+    // Only the names matter.  `vars_os`, not `vars`, which panics on an entry
+    // that is not valid UTF-8; such a name can never be a macro's.
+    let inherited: HashSet<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .collect();
     // `export` with no names means all of them (GNU), recorded as `*`.
     let export_all = exports.iter().any(|e| e == "*");
     variables
@@ -688,7 +692,7 @@ fn exported_macros(
         .filter(|(name, _)| {
             // Inherited names keep their POSIX 105869 treatment; an explicit
             // `export` adds a name make did not inherit (audit #74).
-            inherited.contains_key(name) || export_all || exports.iter().any(|e| e == name)
+            inherited.contains(name) || export_all || exports.iter().any(|e| e == name)
         })
         .cloned()
         .collect()

@@ -396,6 +396,21 @@ mod internal_macros {
         assert_eq!(stdout, "MYMACRO=[fromenv]\n", "stdout: {stdout}");
     }
 
+    // An environment entry that is not valid UTF-8 made make panic while it
+    // decided what to export.  The entry is inherited unchanged.
+    #[test]
+    fn non_utf8_environment_entry() {
+        use plib::testing::os_bytes;
+        let output = Command::new(get_binary_path("make"))
+            .args(["-f", "tests/makefiles/macros/env_export.mk"])
+            .env("POSIXUTILS_K", os_bytes(b"eh zero \xa0"))
+            .env(os_bytes(b"POSIXUTILS_\xff"), "v")
+            .output()
+            .expect("failed to run make");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"MYMACRO=[]\n");
+    }
+
     // Audit #13: the `MAKEFLAGS` environment variable seeds options; `n`
     // behaves as `-n` (print recipe, do not execute).
     #[test]

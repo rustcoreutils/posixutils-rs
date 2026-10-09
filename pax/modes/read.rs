@@ -149,6 +149,7 @@ fn extract_members<R: ArchiveReader>(
         if let Some(ref records) = option_records {
             records.apply(&mut entry);
         }
+        link_sets.count_name(&entry);
         if select_member(&mut selector, &mut entry, options, &mut prompter, tree)? {
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
             // set a non-zero exit, but continue with the next member. Skip any
@@ -162,9 +163,13 @@ fn extract_members<R: ArchiveReader>(
             report_unless_fatal(&entry, r)?;
         }
         archive.skip_data()?;
+        // A set no data can still come for needs its file pinned no longer.
+        if let Some(set) = link_sets.settled_mut(&entry) {
+            set.unpin();
+        }
         // A newc set's data comes with its last name, which -n must still
         // read even when every pattern has been used by an earlier one.
-        if selector.is_done() && link_sets.values().all(|set| set.has_data) {
+        if selector.is_done() && link_sets.all_settled() {
             reached_end = false;
             break;
         }
@@ -531,16 +536,17 @@ struct CreatedSet {
     /// Whether that file has its contents yet. newc stores them with the last
     /// name of a set only, so the earlier names are created empty.
     has_data: bool,
-    /// The file held open until its data arrives. Its names can be replaced
-    /// by other members meanwhile, and a filesystem that reuses inode numbers
-    /// (ext4) then hands this file's number to the next file created, which
-    /// `file` would take for this one. Open, it keeps its number.
-    _pin: Option<OwnedFd>,
+    /// The file held open while data may still come for it on a later name
+    /// (`LinkSets::settled_mut`). Its names can be replaced by other members
+    /// meanwhile, and a filesystem that reuses inode numbers (ext4) then hands
+    /// this file's number to the next file created, which `file` would take
+    /// for this one. Open, it keeps its number.
+    pin: Option<OwnedFd>,
 }
 
 impl CreatedSet {
-    /// The set as created at `name` below `dirfd`: pinned while the data is
-    /// still to come on a later name.
+    /// The set as created at `name` below `dirfd`: pinned when created empty,
+    /// until the extract loop finds no data can still come for it (`unpin`).
     fn new(
         names: Vec<PathBuf>,
         file: (u64, u64),
@@ -548,13 +554,18 @@ impl CreatedSet {
         dirfd: BorrowedFd<'_>,
         name: &CStr,
     ) -> Self {
-        let _pin = (!has_data).then(|| pin_file(dirfd, name, file)).flatten();
+        let pin = (!has_data).then(|| pin_file(dirfd, name, file)).flatten();
         CreatedSet {
             names,
             file,
             has_data,
-            _pin,
+            pin,
         }
+    }
+
+    /// Close the pin once no data can still come for the set.
+    fn unpin(&mut self) {
+        self.pin = None;
     }
 
     /// The names that still hold the set's file, each with the directory and
@@ -682,7 +693,7 @@ fn fill_link_set<R: ArchiveReader>(
         names,
         file,
         has_data: true,
-        _pin: None,
+        pin: None,
     };
     Ok(())
 }

@@ -801,3 +801,130 @@ fn test_cpio_newc_set_data_arrives_after_its_first_name_is_replaced() {
         file_id(&temp.path().join("c"))
     );
 }
+
+/// An odc member: six-digit octal fields, the name, the body, no padding.
+fn odc_member(name: &[u8], ino: u32, nlink: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = b"070707".to_vec();
+    for v in [0, ino, 0o100644, 0, 0, nlink, 0] {
+        out.extend_from_slice(format!("{v:06o}").as_bytes());
+    }
+    out.extend_from_slice(format!("{:011o}", 0).as_bytes()); // c_mtime
+    out.extend_from_slice(format!("{:06o}", name.len() + 1).as_bytes());
+    out.extend_from_slice(format!("{:011o}", body.len()).as_bytes());
+    out.extend_from_slice(name);
+    out.push(0);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Run pax with `args` in `dir` allowed only `limit` open descriptors.
+fn pax_with_fd_limit(args: &[&str], dir: &Path, limit: u64) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pax"));
+    command.args(args).current_dir(dir);
+    // SAFETY: setrlimit is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            let lim = libc::rlimit {
+                rlim_cur: limit as libc::rlim_t,
+                rlim_max: limit as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+/// A link set of empty files never gets data, and the descriptor pinning its
+/// file until the data came was never closed: one per set, so an archive of
+/// more sets than the descriptor limit failed every member past it. In odc
+/// every name carries the data, in newc the last one; neither has any to
+/// wait for here.
+#[test]
+fn test_cpio_empty_link_sets_do_not_hold_a_descriptor_each() {
+    const SETS: u32 = 200;
+    for format in ["odc", "newc"] {
+        let mut archive = Vec::new();
+        for i in 0..SETS {
+            for name in [format!("e{i}a"), format!("e{i}b")] {
+                let member = match format {
+                    "odc" => odc_member(name.as_bytes(), i + 1, 2, b""),
+                    _ => CpioNewc {
+                        name: name.as_bytes(),
+                        ino: i + 1,
+                        nlink: 2,
+                        ..Default::default()
+                    }
+                    .member(),
+                };
+                archive.extend_from_slice(&member);
+            }
+        }
+        archive.extend_from_slice(&odc_member(b"TRAILER!!!", 0, 1, b""));
+        if format == "newc" {
+            archive.truncate(archive.len() - odc_member(b"TRAILER!!!", 0, 1, b"").len());
+            archive.extend_from_slice(
+                &CpioNewc {
+                    name: b"TRAILER!!!",
+                    ..Default::default()
+                }
+                .member(),
+            );
+        }
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("archive.cpio");
+        fs::write(&path, &archive).unwrap();
+        let dest = temp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let out = pax_with_fd_limit(&["-r", "-f", path.to_str().unwrap()], &dest, 64);
+        assert_success(&out, &format!("pax -r of {SETS} empty {format} link sets"));
+        for i in 0..SETS {
+            let a = dest.join(format!("e{i}a"));
+            let b = dest.join(format!("e{i}b"));
+            assert_eq!(fs::read(&b).unwrap(), b"", "{format} e{i}b");
+            assert_eq!(file_id(&a), file_id(&b), "{format} set {i} is linked");
+        }
+    }
+}
+
+/// -n stops reading once every pattern is used and no link set still waits
+/// for data on a later name. An empty set waited for ever, so pax read the
+/// rest of the archive: here, a damaged header it must never reach.
+#[test]
+fn test_cpio_first_match_stops_after_an_empty_link_set() {
+    let link = |name| CpioNewc {
+        name,
+        ino: 5,
+        nlink: 2,
+        ..Default::default()
+    };
+    let mut archive = link(b"e1").member();
+    archive.extend_from_slice(&link(b"e2").member());
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"sel",
+            body: b"selected",
+            ino: 6,
+            ..Default::default()
+        }
+        .member(),
+    );
+    // Not a header: reading it is an error.
+    archive.extend_from_slice(b"070701");
+    archive.extend_from_slice(&[b'Z'; 200]);
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("archive.cpio");
+    fs::write(&path, &archive).unwrap();
+    let dest = temp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    let args = ["-r", "-n", "-f", path.to_str().unwrap(), "e1", "e2", "sel"];
+    let out = crate::common::run_pax_in_dir(&args, &dest);
+    assert_success(&out, "pax -r -n e1 e2 sel");
+    assert_eq!(fs::read(dest.join("sel")).unwrap(), b"selected");
+    assert_eq!(file_id(&dest.join("e1")), file_id(&dest.join("e2")));
+}

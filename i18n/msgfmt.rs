@@ -15,6 +15,7 @@
 use clap::Parser;
 use gettextrs::gettext;
 use posixutils_i18n::gettext_lib::mo_file::MO_MAGIC_LE;
+use posixutils_i18n::gettext_lib::plural::parse_plural_forms;
 use posixutils_i18n::gettext_lib::po_file::PoFile;
 use std::collections::HashMap;
 use std::fs::File;
@@ -147,6 +148,8 @@ fn main() {
             }
         };
 
+        // Which plural forms stand for many numbers, read from the header.
+        let often = plural_forms_used_often(&po);
         // Domains of this file already reported under --check-domain.
         let mut ignored_domains = std::collections::HashSet::new();
         // Process entries (headers are tagged per domain and flow through here
@@ -183,7 +186,7 @@ fn main() {
 
             // Abnormality checks (all of them when both -c and -v are given).
             if run_checks || args.check_format {
-                validate_entry(&path, entry, run_checks, &mut diagnostics);
+                validate_entry(&path, entry, run_checks, often.as_deref(), &mut diagnostics);
             }
 
             // --check-domain: -o ignores every `domain` directive, so one is a
@@ -340,13 +343,34 @@ fn boundary_newline_mismatch(a: &[u8], b: &[u8]) -> bool {
         || (a.last() == Some(&b'\n')) != (b.last() == Some(&b'\n'))
 }
 
+/// For each plural form of the file's `Plural-Forms` expression, whether it
+/// stands for many numbers: five or more of n = 0..=1000, as GNU msgfmt
+/// counts.  `None` when the header gives no usable expression.
+fn plural_forms_used_often(po: &PoFile) -> Option<Vec<bool>> {
+    let (nplurals, expr) = parse_plural_forms(&po.plural_forms()?)?;
+    let mut counts = vec![0usize; nplurals];
+    for n in 0..=1000 {
+        if let Some(count) = usize::try_from(expr.evaluate(n))
+            .ok()
+            .and_then(|form| counts.get_mut(form))
+        {
+            *count += 1;
+        }
+    }
+    Some(counts.into_iter().map(|c| c >= 5).collect())
+}
+
 /// Validate a PO entry, recording genuine abnormalities as errors (affecting the
 /// exit status) and softer findings as warnings. With `all` (-c -v) every check
 /// runs; without it (`--check-format`) only the c-format comparison.
+///
+/// `often` says which plural forms stand for many numbers (see
+/// [`plural_forms_used_often`]).
 fn validate_entry(
     path: &std::path::Path,
     entry: &posixutils_i18n::gettext_lib::po_file::PoEntry,
     all: bool,
+    often: Option<&[bool]>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let file = path.display().to_string();
@@ -361,14 +385,14 @@ fn validate_entry(
         if msgstr.is_empty() {
             continue;
         }
-        // The source string corresponding to this msgstr: the plural form is
-        // compared against msgid_plural, the singular against msgid.
+        // The original whose boundary newlines this msgstr must share: the
+        // plural forms share msgid_plural's, the singular msgid's.
         let source = if is_plural && i > 0 {
             entry.msgid_plural.as_deref().unwrap_or(&entry.msgid)
         } else {
             &entry.msgid
         };
-        let suffix = if entry.msgstr.len() > 1 {
+        let suffix = if is_plural {
             format!("[{}]", i)
         } else {
             String::new()
@@ -389,8 +413,19 @@ fn validate_entry(
         }
 
         // Abnormality: c-format conversion specifiers differ in number or type.
+        // As in GNU msgfmt, every plural form is checked against
+        // msgid_plural, and a form that stands for few numbers (the singular
+        // of most languages) may leave out trailing arguments: "one file"
+        // for "%d files".
         if c_format {
-            if let Some(problem) = format_mismatch(source, msgstr, &suffix) {
+            let (original, strict) = match &entry.msgid_plural {
+                Some(plural) => (
+                    ("msgid_plural", plural.as_slice()),
+                    often.is_none_or(|o| o.get(i).copied().unwrap_or(true)),
+                ),
+                None => (("msgid", entry.msgid.as_slice()), true),
+            };
+            if let Some(problem) = format_mismatch(original, msgstr, &suffix, strict) {
                 diagnostics.push(Diagnostic {
                     file: file.clone(),
                     line,
@@ -413,33 +448,39 @@ fn validate_entry(
 }
 
 /// How the conversion specifications of `msgstr` fail to match those of
-/// `source`, or `None` when they match.
+/// `original`, named and given as its text, or `None` when they match.
 ///
 /// POSIX has `msgfmt -c -v` compare only the number of conversions and the
 /// argument types of corresponding ones. The comparison is by argument, so a
 /// flag or a width does not count, and a `%n$` conversion is matched by its
-/// argument number wherever it stands. A `source` that is no valid format
+/// argument number wherever it stands. Unless `strict`, `msgstr` may consume
+/// fewer arguments than `original`. An `original` that is no valid format
 /// string has nothing to compare against. The wording is GNU msgfmt's.
-fn format_mismatch(source: &[u8], msgstr: &[u8], suffix: &str) -> Option<String> {
-    let Ok(expected) = format_arguments(source) else {
+fn format_mismatch(
+    (name, original): (&str, &[u8]),
+    msgstr: &[u8],
+    suffix: &str,
+    strict: bool,
+) -> Option<String> {
+    let Ok(expected) = format_arguments(original) else {
         return None;
     };
     let found = match format_arguments(msgstr) {
         Ok(found) => found,
         Err(reason) => {
             return Some(format!(
-                "'msgstr{suffix}' is not a valid C format string, unlike 'msgid'. Reason: {reason}"
+                "'msgstr{suffix}' is not a valid C format string, unlike '{name}'. Reason: {reason}"
             ))
         }
     };
-    if expected.len() != found.len() {
+    if found.len() > expected.len() || (strict && found.len() < expected.len()) {
         return Some(format!(
-            "number of format specifications in 'msgid' and 'msgstr{suffix}' does not match"
+            "number of format specifications in '{name}' and 'msgstr{suffix}' does not match"
         ));
     }
     let n = expected.iter().zip(&found).position(|(a, b)| a != b)?;
     Some(format!(
-        "format specifications in 'msgid' and 'msgstr{suffix}' for argument {} are not the same",
+        "format specifications in '{name}' and 'msgstr{suffix}' for argument {} are not the same",
         n + 1
     ))
 }

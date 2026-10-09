@@ -616,3 +616,130 @@ fn test_msgfmt_check_compares_arguments_not_spelling() {
         }
     }
 }
+
+/// GNU msgfmt's plural check (NONPOSIX.md): with -c -v every plural form is
+/// checked against msgid_plural, and a form that stands for fewer than five
+/// of n = 0..=1000 (the singular of most languages) may leave out trailing
+/// arguments, as "one file" for "%d files". Verdicts are GNU msgfmt's.
+#[test]
+fn test_msgfmt_check_plural_forms_as_gnu() {
+    const EN: &str = "nplurals=2; plural=(n != 1);";
+    const CS: &str = "nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=4) ? 1 : 2;";
+    const JA: &str = "nplurals=1; plural=0;";
+    const FIVE: &str = "nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=6) ? 1 : 2;";
+    const FOUR: &str = "nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=5) ? 1 : 2;";
+    let count = |form: &str| {
+        Some(format!(
+            "number of format specifications in 'msgid_plural' and 'msgstr[{form}]'"
+        ))
+    };
+    let argument_1 = |form: &str| {
+        Some(format!(
+            "in 'msgid_plural' and 'msgstr[{form}]' for argument 1 are not the same"
+        ))
+    };
+    for (forms, msgid, plural, msgstr, refusal) in [
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["%d soubor", "%d souborů"][..],
+            None,
+        ),
+        (
+            EN,
+            "one file",
+            "%d files",
+            &["jeden soubor", "%d souborů"][..],
+            None,
+        ),
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["jeden soubor", "%d souborů"][..],
+            None,
+        ),
+        (
+            EN,
+            "%d file %s",
+            "%d files %s",
+            &["%d soubor", "%d souborů %s"][..],
+            None,
+        ),
+        (
+            EN,
+            "%s: %d file",
+            "%s: %d files",
+            &["%s: jeden", "%s: %d souborů"][..],
+            None,
+        ),
+        (EN, "file", "files %d", &["soubor", "%d souborů"][..], None),
+        (EN, "%s file", "%d files", &["%d", "%d"][..], None),
+        (
+            CS,
+            "%d file",
+            "%d files",
+            &["jeden", "%d soubory", "%d souborů"][..],
+            None,
+        ),
+        (JA, "%d file", "%d files", &["%d"][..], None),
+        (FOUR, "%d file", "%d files", &["%d", "x", "%d"][..], None),
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["%d soubor", "souborů"][..],
+            count("1"),
+        ),
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["%s soubor", "%d souborů"][..],
+            argument_1("0"),
+        ),
+        (
+            EN,
+            "%d file %s",
+            "%d files %s",
+            &["soubor %s", "%d souborů %s"][..],
+            argument_1("0"),
+        ),
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["%d soubor %d", "%d souborů"][..],
+            count("0"),
+        ),
+        (JA, "%d file", "%d files", &["ファイル"][..], count("0")),
+        (
+            FIVE,
+            "%d file",
+            "%d files",
+            &["%d", "x", "%d"][..],
+            count("1"),
+        ),
+    ] {
+        let mut po = format!(
+            "msgid \"\"\nmsgstr \"\"\n\"Content-Type: text/plain; charset=UTF-8\\n\"\n\
+             \"Plural-Forms: {forms}\\n\"\n\n\
+             #, c-format\nmsgid \"{msgid}\"\nmsgid_plural \"{plural}\"\n"
+        );
+        for (i, s) in msgstr.iter().enumerate() {
+            po.push_str(&format!("msgstr[{i}] \"{s}\"\n"));
+        }
+        let (dir, po_path) = create_temp_po_file(&po);
+        let po = po_path.to_str().unwrap();
+        let (err, code) = msgfmt_status(dir.path(), &["-c", "-v", "-o", "/dev/null", po]);
+        match refusal {
+            None => assert_eq!(code, 0, "{forms} {plural:?} / {msgstr:?}: {err}"),
+            Some(reason) => {
+                assert_eq!(code, 1, "{forms} {plural:?} / {msgstr:?}: {err}");
+                assert!(err.contains(&format!("{po}:9: error: ")), "{err:?}");
+                assert!(err.contains(&reason), "{plural:?} / {msgstr:?}: {err:?}");
+            }
+        }
+    }
+}

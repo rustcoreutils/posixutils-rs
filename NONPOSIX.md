@@ -525,6 +525,16 @@ The two GNU checks po4a runs on every PO file
  * `--check-domain` — with `-o`, which ignores `domain` directives, each
    domain a file names is reported as an error.
 
+Deviation: GNU's check of plural forms.  POSIX gives `-c -v` no rule for
+a `msgid_plural` entry; as in GNU msgfmt, which PO files are written for:
+
+ * every `msgstr[N]` of a `c-format` entry is checked against
+   `msgid_plural`, not `msgid`;
+ * a plural form that the header's `Plural-Forms` expression gives to
+   fewer than five of n = 0..=1000 (the singular of most languages) may
+   leave out trailing arguments: `msgstr[0] "one file"` for
+   `msgid_plural "%d files"`.  It may not add any or change their types.
+
  * `--statistics` — print the translated / fuzzy / untranslated counts to
    standard error, as `-v` does, in GNU's wording.  gettext's `po.m4` keeps a
    msgfmt only if `msgfmt --statistics /dev/null` succeeds.

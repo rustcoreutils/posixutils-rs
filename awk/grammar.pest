@@ -327,7 +327,20 @@ multidimensional_index = { multiple_expr_list }
 
 ternary_expr = { binary_expr ~ ("?" ~ expr ~ ":" ~ expr)? }
 
-assignment = { lvalue ~ assignment_op ~ expr }
+assignment = { maybe_assignment ~ lvalue ~ assignment_op ~ expr }
+
+// An assignment's target would otherwise be parsed twice when no assignment
+// operator follows it, once here and once as an operand, and nested targets
+// (a[a[a[1]]], $($(1))) twice per level.  This lookahead skips the attempt
+// when the target's shape, scanned without parsing it, is followed by
+// something else.  Anything the scan cannot read with confidence (a `/`
+// that may begin a regular expression, a comment, `$++i`) fails the scan,
+// and then the assignment is attempted as before.
+maybe_assignment = _{ !(lvalue_shape ~ !assignment_op) }
+lvalue_shape     = _{ name ~ subscript_shape? ~ !"[" | "$" ~ field_shape }
+field_shape      = _{ "$" ~ field_shape | group_shape | name ~ subscript_shape? ~ !"[" | number }
+subscript_shape  = @{ "[" ~ (string | subscript_shape | !("[" | "]" | "\"" | "/" | "#") ~ ANY)* ~ "]" }
+group_shape      = @{ "(" ~ (string | group_shape | !("(" | ")" | "\"" | "/" | "#") ~ ANY)* ~ ")" }
 
 assignment_op = {
     assign
@@ -408,7 +421,7 @@ binary_print_expr        =  {
   | multidimensional_in
 }
 
-print_assignment   = { lvalue ~ assignment_op ~ print_expr }
+print_assignment   = { maybe_assignment ~ lvalue ~ assignment_op ~ print_expr }
 ternary_print_expr = { binary_print_expr ~ ("?" ~ print_expr ~ ":" ~ print_expr)? }
 
 print_expr = {

@@ -1100,14 +1100,24 @@ fn awk_gsub_skips_an_empty_match_after_a_match() {
 /// Run awk on `program` with a 20 second limit, so that a hang fails the test
 /// instead of the whole run; returns stdout, stderr and the exit status.
 fn awk_with_deadline(program: &str) -> (String, String, Option<i32>) {
+    awk_with_deadline_input(program, "")
+}
+
+/// `awk_with_deadline`, with `input` on standard input.
+fn awk_with_deadline_input(program: &str, input: &str) -> (String, String, Option<i32>) {
+    use std::io::Write;
     use std::time::{Duration, Instant};
     let mut child = std::process::Command::new(plib::testing::get_binary_path("awk"))
         .arg(program)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+    // the input is small, so writing it all before reading cannot deadlock
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).unwrap();
+    drop(stdin);
     let start = Instant::now();
     while child.try_wait().unwrap().is_none() {
         if start.elapsed() > Duration::from_secs(20) {
@@ -1519,6 +1529,67 @@ fn awk_deeply_nested_expressions_parse_quickly() {
     ];
     for (program, output) in cases {
         let (stdout, stderr, status) = awk_with_deadline(&program);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// Nested subscripts and field references parse in linear time too: each
+// level was parsed once as a possible assignment target and again as an
+// operand, so 20 levels of a[a[...]] never finished.  The check that skips
+// the first parse must not miss a real assignment.
+#[test]
+fn awk_nested_lvalues_parse_quickly() {
+    let depth = 40;
+    let nested = |open: &str, inner: &str, close: &str| {
+        format!("{}{inner}{}", open.repeat(depth), close.repeat(depth))
+    };
+    let cases = [
+        (
+            format!("BEGIN {{ a[1] = 1; print {} }}", nested("a[", "1", "]")),
+            "1\n",
+        ),
+        (
+            format!(
+                "BEGIN {{ a[1] = 1; {} = 7; print a[1] }}",
+                nested("a[", "1", "]")
+            ),
+            "7\n",
+        ),
+        (format!("{{ print {} }}", nested("$(", "1", ")")), "1\n"),
+        (
+            format!("{{ {} = \"z\"; print }}", nested("$(", "1", ")")),
+            "z\n",
+        ),
+        // assignments the shape check cannot read must still be assignments
+        (
+            String::from("BEGIN { a[\"]\"] = 5; a[\"[\"] += 1; print a[\"]\"], a[\"[\"] }"),
+            "5 1\n",
+        ),
+        (
+            String::from("BEGIN { i = 4; a[i/2] = 3; a[i / 2] ^= 2; print a[2] }"),
+            "9\n",
+        ),
+        (
+            String::from("{ i = 0; $++i = \"z\"; $(i + 0) = $i \"y\"; print }"),
+            "zy\n",
+        ),
+        (
+            String::from("BEGIN { a[1, 2] = 3; a [1] = 4; print a[1, 2], a[1] }"),
+            "3 4\n",
+        ),
+        (
+            String::from("BEGIN { a[1] = 1; print (a[1] == 1), a[1] = 2, a[1] }"),
+            "1 2 2\n",
+        ),
+        (String::from("{ x = $1; $1 = \"b\"; print x, $0 }"), "1 b\n"),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(&program, "1\n");
         assert_eq!(
             (stdout.as_str(), stderr.as_str()),
             (output, ""),

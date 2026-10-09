@@ -17,7 +17,11 @@ string_char     =  {
   | "\\\\" | "\\" ~ ("\"" | "/" | "a" | "b" | "f" | "n" | "r" | "t" | "v")
   | "\\" ~ ASCII_DIGIT{1, 3}
 }
-ere             = @{ "/" ~ (("\\" ~ ANY) | (!("/" | "\n") ~ ANY))* ~ "/" }
+// A `/` inside a bracket expression does not end the token, as in gawk and
+// mawk: `/[/]/`.  An unclosed `[` is an ordinary character here.
+ere             = @{ "/" ~ (("\\" ~ ANY) | ere_bracket | (!("/" | "\n") ~ ANY))* ~ "/" }
+ere_bracket     = _{ "[" ~ "^"? ~ "]"? ~ (("\\" ~ ANY) | ere_bracket_word | (!("]" | "\n") ~ ANY))* ~ "]" }
+ere_bracket_word = _{ "[" ~ PUSH(":" | "." | "=") ~ (!(PEEK ~ "]") ~ !"\n" ~ ANY)* ~ POP ~ "]" }
 number          = @{ decimal_float | integer }
 digit           =  { ('0'..'9') }
 integer         = @{ digit+ }

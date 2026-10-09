@@ -2047,3 +2047,13 @@ fn awk_ere_escape_sequences() {
     );
     assert_eq!(out, b"1\n");
 }
+
+// A `/` inside a bracket expression does not end an ERE token, as in gawk
+// and mawk (gawk's test regexpbrack).
+#[test]
+fn awk_slash_in_bracket_expression_of_ere_token() {
+    let program = "/^[]+()0-9.,$%/'\"-]*$/ { print \"num\", $0 } /[/]/ { print \"m\" } /[[:alpha:]/]x/ { print \"no\" }";
+    let (stdout, stderr, status) = awk_with_deadline_input(program, "a/b\n12/3\n");
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("m\nnum 12/3\nm\n", ""));
+    assert_eq!(status, Some(0));
+}

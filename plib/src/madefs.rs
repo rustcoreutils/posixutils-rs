@@ -21,7 +21,7 @@
 use gettextrs::gettext;
 use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io;
@@ -703,9 +703,11 @@ fn acl_names_others(xattr: &[u8]) -> bool {
 /// Whether the group `gid` is the private group of the user `euid`, by the user-private-group
 /// convention (`useradd`, `adduser`): nobody else is in it, so its write permission is the
 /// user's own. All of these must hold (`group_is_private`):
-/// - it is the user's primary group (`getpwuid`);
-/// - its name (`getgrgid`) is the user's name, byte for byte;
-/// - every member it lists resolves (`getpwnam`, on the name's bytes) to the user's uid.
+/// - it is the user's primary group (`crate::user::lookup_by_uid`);
+/// - its name (`crate::group::lookup_by_gid`) is the user's name, byte for byte;
+/// - every member it lists -- that one group's own member list; no other group, and no
+///   account, is enumerated -- resolves (`crate::user::lookup_by_name`, on the name's bytes)
+///   to the user's uid.
 ///
 /// Three lookups by key, once per group and user in a process; nothing is enumerated. Anything
 /// that cannot be read counts as not private. It applies only on Linux, the one system where
@@ -723,7 +725,7 @@ fn acl_names_others(xattr: &[u8]) -> bool {
 ///   long as they run.
 /// - A group password lets anyone who knows it `newgrp` into the group; with shadow groups it
 ///   is out of the user's reach to read, and is not considered.
-/// - `getgrgid` returns the entry of the first NSS source that has the gid: a group of the same
+/// - A group lookup returns the entry of the first NSS source that has the gid: a group of the same
 ///   gid in a later source, listing others -- an administrator's misconfiguration -- is not
 ///   seen.
 pub fn is_private_group(gid: u32, euid: u32) -> bool {
@@ -756,8 +758,9 @@ pub fn private_group_queries() -> usize {
     PRIVATE_GROUP_QUERIES.with(|queries| queries.get())
 }
 
-/// `is_private_group`, read from the databases (under its lock: the lookups return storage the
-/// next one reuses).
+/// `is_private_group`, read from the databases through the reentrant lookups
+/// (`crate::user::lookup_by_uid`, `crate::group::lookup_by_gid`), which no other thread's
+/// lookup can overwrite. A lookup that fails, or finds nothing, counts as not private.
 fn read_private_group(gid: u32, euid: u32) -> bool {
     let Some((user_name, user_gid)) = user_entry(euid) else {
         return false;
@@ -781,46 +784,25 @@ pub struct UserEntry<'a> {
     pub name: &'a [u8],
 }
 
-/// The name and primary gid of the user `uid` (`getpwuid`), the name as the database holds it.
-fn user_entry(uid: u32) -> Option<(CString, u32)> {
-    let passwd = unsafe { libc::getpwuid(uid) };
-    if passwd.is_null() {
-        return None;
-    }
-    let passwd = unsafe { &*passwd };
-    let name = unsafe { CStr::from_ptr(passwd.pw_name) }.to_owned();
-    Some((name, passwd.pw_gid))
+/// The name and primary gid of the user `uid` (`crate::user::lookup_by_uid`), the name as the
+/// database holds it; `None` when there is no such user or the lookup fails.
+fn user_entry(uid: u32) -> Option<(OsString, u32)> {
+    let user = crate::user::lookup_by_uid(uid).ok()??;
+    Some((user.name, user.gid))
 }
 
-/// The name of the group `gid` (`getgrgid`), as the database holds it, and the uid each member
-/// it lists resolves to (`getpwnam` on the name's bytes), `None` for a name that resolves to
-/// nobody; `None` altogether when the group cannot be read.
-fn group_entry(gid: u32) -> Option<(CString, Vec<Option<u32>>)> {
-    // Copied out first: `getgrgid` and `getpwnam` each return storage the next call reuses.
-    let (group_name, names) = unsafe {
-        let group = libc::getgrgid(gid);
-        if group.is_null() {
-            return None;
-        }
-        let group_name = CStr::from_ptr((*group).gr_name).to_owned();
-        let mut names = Vec::new();
-        let mut member = (*group).gr_mem;
-        // read_unaligned: macOS does not align the member array.
-        while !member.is_null() {
-            let name = std::ptr::read_unaligned(member as *const *const libc::c_char);
-            if name.is_null() {
-                break;
-            }
-            names.push(CStr::from_ptr(name).to_owned());
-            member = member.add(1);
-        }
-        (group_name, names)
-    };
-    let uid_of = |name: &CStr| {
-        let passwd = unsafe { libc::getpwnam(name.as_ptr()) };
-        (!passwd.is_null()).then(|| unsafe { (*passwd).pw_uid })
-    };
-    Some((group_name, names.iter().map(|name| uid_of(name)).collect()))
+/// The name of the group `gid` (`crate::group::lookup_by_gid`), as the database holds it, and
+/// the uid each member it lists resolves to (`crate::user::lookup_by_name` on the name's
+/// bytes), `None` for a name that resolves to nobody; `None` altogether when the group cannot
+/// be read or a member's lookup fails.
+fn group_entry(gid: u32) -> Option<(OsString, Vec<Option<u32>>)> {
+    let group = crate::group::lookup_by_gid(gid).ok()??;
+    let member_uids = group
+        .members
+        .iter()
+        .map(|name| Some(crate::user::lookup_by_name(name).ok()?.map(|user| user.uid)))
+        .collect::<Option<Vec<_>>>()?;
+    Some((group.name, member_uids))
 }
 
 /// The rule `is_private_group` follows, for the group `gid` named `group_name` and the user
@@ -1076,11 +1058,12 @@ pub fn utimens_link_if_still(
 mod tests {
     use super::{
         acl_names_others, acls_let_others_write, dir_writers, empty_lending_read, group_entry,
-        group_is_private, is_private_group, made_by_us, others_can_rename, user_entry,
-        utimens_link_if_still, verify_made_dir, ChainTrust, DirWriters, FoundDir, FsOwners,
-        MadeObject, MadeTrust, Preserve, UserEntry,
+        group_is_private, is_private_group, made_by_us, others_can_rename, read_private_group,
+        user_entry, utimens_link_if_still, verify_made_dir, ChainTrust, DirWriters, FoundDir,
+        FsOwners, MadeObject, MadeTrust, Preserve, UserEntry,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
     use std::rc::Rc;
@@ -1262,6 +1245,42 @@ mod tests {
         assert_eq!(is_private_group(user_gid, euid), expected);
         // Asked again, the answer is the one read.
         assert_eq!(is_private_group(user.gid, euid), expected);
+    }
+
+    /// Reading whether a group is private gives the same answer while another thread -- other
+    /// code in the process, a parallel test -- looks up other users and groups with the
+    /// non-reentrant `getpwuid`, `getgrgid` and `getpwnam`, whose static storage those calls
+    /// overwrite.
+    #[test]
+    fn private_group_lookup_is_unaffected_by_other_threads_lookups() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let euid = unsafe { libc::geteuid() };
+        let Ok(Some(user)) = crate::user::lookup_by_uid(euid) else {
+            return;
+        };
+        let expected = read_private_group(user.gid, euid);
+        let (started, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started.store(true, Ordering::Relaxed);
+                while !stop.load(Ordering::Relaxed) {
+                    // Other entries than the ones asked about: root's, and group 0.
+                    unsafe {
+                        libc::getpwuid(0);
+                        libc::getgrgid(0);
+                        libc::getpwnam(c"root".as_ptr());
+                    }
+                }
+            });
+            while !started.load(Ordering::Relaxed) {
+                std::hint::spin_loop();
+            }
+            let differed = (0..100_000)
+                .filter(|_| read_private_group(user.gid, euid) != expected)
+                .count();
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(differed, 0, "answers changed under other threads' lookups");
+        });
     }
 
     /// A found directory gets its times only unless mode or owner was asked for; then what was

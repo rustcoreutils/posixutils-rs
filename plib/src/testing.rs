@@ -747,7 +747,7 @@ impl AsRef<std::ffi::OsStr> for TempFile {
 #[cfg(unix)]
 pub fn user_private_group() -> Option<u32> {
     let euid = unsafe { libc::geteuid() };
-    let gid = crate::user::get_by_uid(euid)?.gid;
+    let gid = crate::user::lookup_by_uid(euid).ok()??.gid;
     let ours = gid == unsafe { libc::getegid() };
     (ours && crate::madefs::is_private_group(gid, euid)).then_some(gid)
 }

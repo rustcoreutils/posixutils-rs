@@ -260,7 +260,8 @@ impl Interpreter {
     /// Close `name` in every I/O table (a name may have been opened for both
     /// reading and writing). POSIX: close shall return 0 if the close was
     /// successful and non-zero otherwise (e.g. the name was not open). Surface
-    /// any error status, else 0, else -1 when nothing matched.
+    /// any non-zero status (a failure, or the exit status of a pipe's
+    /// command), else 0, else -1 when nothing matched.
     fn close_streams(&mut self, name: &str) -> i32 {
         let results = [
             self.write_files.close_file(name),

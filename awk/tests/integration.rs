@@ -1957,3 +1957,14 @@ fn awk_do_while_takes_break_and_continue() {
     assert_eq!((stdout.as_str(), stderr.as_str()), ("1 3 2\n", ""));
     assert_eq!(status, Some(0));
 }
+
+// close() of a pipe returns the command's exit status, or 256 plus the
+// signal that killed it, as gawk and mawk do (gawk's tests close_status
+// and status-close); it returned 0 for any command.
+#[test]
+fn awk_close_of_a_pipe_returns_the_exit_status() {
+    let program = "BEGIN { print \"x\" | \"cat >/dev/null; exit 9\"; print close(\"cat >/dev/null; exit 9\"); \"echo hi; exit 3\" | getline; print close(\"echo hi; exit 3\"); \"kill -9 $$\" | getline; print close(\"kill -9 $$\"); print close(\"echo hi; exit 3\") }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("9\n3\n265\n-1\n", ""));
+    assert_eq!(status, Some(0));
+}

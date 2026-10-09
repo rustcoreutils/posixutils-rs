@@ -2061,6 +2061,12 @@ pub(crate) fn set_made_node_attrs_recording(
     let node = MadeNode::pin(dirfd, name, made_type)?;
     let applied = apply_node_attrs(&node, made_type, attrs, policy);
     *made = node.made_file();
+    // A node made is always known; one that cannot be is a failure, never a
+    // name left as it was.
+    if made.is_none() {
+        applied?;
+        return Err(PaxError::Io(made::replaced()));
+    }
     applied
 }
 

@@ -383,12 +383,17 @@ fn extract_entry<R: ArchiveReader>(
         let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
     }
 
-    // Whatever this member puts at its name replaces what an earlier one made
-    // there; only a regular file or a link to one records it again.
-    links.forget(&member.key());
+    // Each arm settles what it left at its name (`Links::left`): a file this
+    // run made, nothing it can vouch for, or the name as it was.
     match entry.entry_type {
         EntryType::Directory => {
-            let decided = extract_directory(tree, pfd, &member, entry, options)?;
+            let decided = extract_directory(tree, pfd, &member, entry, options);
+            // A directory is nothing a link member can be linked to; -k
+            // leaves the name as it was.
+            if !matches!(decided, Ok(DirAttrs::Keep)) {
+                links.left(&member, true, None);
+            }
+            let decided = decided?;
             archive.skip_data()?;
             match decided {
                 // Its attributes are applied once the subtree exists, if it
@@ -401,12 +406,16 @@ fn extract_entry<R: ArchiveReader>(
         EntryType::Symlink => {
             let mut made = None;
             let result = extract_symlink(pfd, name, entry, options, &mut made);
-            links.record(&member, made);
+            links.left(&member, result.is_err(), made);
             result?;
             archive.skip_data()?;
         }
         EntryType::Hardlink => {
-            extract_hardlink(tree, pfd, &member, entry, options, links)?;
+            let result = extract_hardlink(tree, pfd, &member, entry, options, links);
+            if result.is_err() {
+                links.left(&member, true, None);
+            }
+            result?;
             archive.skip_data()?;
         }
         EntryType::Regular => {
@@ -416,14 +425,14 @@ fn extract_entry<R: ArchiveReader>(
         EntryType::BlockDevice | EntryType::CharDevice => {
             let mut made = None;
             let result = extract_device(pfd, name, entry, options, &mut made);
-            links.record(&member, made);
+            links.left(&member, result.is_err(), made);
             result?;
             archive.skip_data()?;
         }
         EntryType::Fifo => {
             let mut made = None;
             let result = extract_fifo(pfd, name, entry, options, &mut made);
-            links.record(&member, made);
+            links.left(&member, result.is_err(), made);
             result?;
             archive.skip_data()?;
         }
@@ -524,13 +533,23 @@ fn extract_symlink(
 /// within one budget.
 struct Links {
     sets: LinkSets<CreatedSet>,
-    /// The file this run made at each member path (`MemberPath::key`) -- a
-    /// tar link member's target -- known from the descriptor that made it.
-    made: HashMap<Vec<u8>, MadeFile>,
+    /// What this run left at each member path (`MemberPath::key`) it tried
+    /// to extract -- a tar link member's target.
+    made: HashMap<Vec<u8>, Record>,
     pins: PinBudget<PinKey>,
     /// The name -i gave each member it renamed, by the member path
     /// (`MemberPath::key`) it had before.
     aliases: HashMap<Vec<u8>, PathBuf>,
+}
+
+/// What this run left at a member path it tried to extract.
+enum Record {
+    /// The file it made there, known from the descriptor that made it.
+    File(MadeFile),
+    /// Nothing it can vouch for: the member failed before a file of this
+    /// run's was verified at its name, which may hold anything now. A link
+    /// member naming it fails rather than link whatever that is.
+    Failed,
 }
 
 /// What holds a pin in `Links`.
@@ -567,8 +586,41 @@ impl Links {
     /// Record `made` as the file this run made at the member path `key`.
     fn record_made(&mut self, key: Vec<u8>, made: MadeFile) {
         let pinned = made.is_pinned();
-        self.made.insert(key.clone(), made);
+        self.made.insert(key.clone(), Record::File(made));
         self.note(PinKey::Member(key), pinned);
+    }
+
+    /// Settle what a member at `member`, which `failed` or not, left at its
+    /// name: the file it made (`made`), even if it then failed; nothing this
+    /// run can vouch for, when it failed without one; and, when it succeeded
+    /// without making one -- -k kept the name, a socket was skipped -- the
+    /// name is as it was, and so is its record.
+    fn left(&mut self, member: &MemberPath, failed: bool, made: Option<MadeFile>) {
+        match made {
+            Some(made) => self.record_made(member.key(), made),
+            None if failed => self.tombstone(member.key()),
+            None => {}
+        }
+    }
+
+    /// Record that the member at `key` left nothing this run can vouch for.
+    fn tombstone(&mut self, key: Vec<u8>) {
+        self.made.insert(key.clone(), Record::Failed);
+        self.note(PinKey::Member(key), false);
+    }
+
+    /// What a link member is to be linked to at the member path `key`: the
+    /// file this run made there; `None` for a name this run never tried to
+    /// extract, which is linked by name; an error for one it tried and left
+    /// nothing it can vouch for at.
+    fn target(&self, key: &[u8]) -> PaxResult<Option<Expected<'_>>> {
+        match self.made.get(key) {
+            Some(Record::File(made)) => Ok(Some(made.expected())),
+            Some(Record::Failed) => Err(PaxError::Io(std::io::Error::other(
+                "link target was not extracted; not linked",
+            ))),
+            None => Ok(None),
+        }
     }
 
     /// Note that -i renamed the member named `before` (after -s) to `after`.
@@ -587,15 +639,7 @@ impl Links {
             .unwrap_or(target)
     }
 
-    /// Record what this run made for `member`, if anything.
-    fn record(&mut self, member: &MemberPath, made: Option<MadeFile>) {
-        if let Some(made) = made {
-            self.record_made(member.key(), made);
-        }
-    }
-
-    /// Forget what this run made at the member path `key`: something else is
-    /// being put there.
+    /// Forget what this run made at the member path `key`.
     fn forget(&mut self, key: &[u8]) {
         if self.made.remove(key).is_some() {
             self.note(PinKey::Member(key.to_vec()), false);
@@ -615,7 +659,7 @@ impl Links {
                 }
             }
             PinKey::Member(key) => {
-                if let Some(made) = made.get_mut(key) {
+                if let Some(Record::File(made)) = made.get_mut(key) {
                     made.unpin();
                 }
             }
@@ -665,15 +709,16 @@ fn extract_hardlink(
         target_parent.as_raw_fd(),
         &target_member.leaf,
         None,
-        links.made.get(&target_key).map(MadeFile::expected),
+        links.target(&target_key)?,
         dirfd,
         name,
         options.no_clobber,
     )?;
     // Linking it changed the file's ctime. And this name holds that file
     // now, for a later member linked to it -- unless -k left another file
-    // there.
-    let Some(target) = links.made.get_mut(&target_key) else {
+    // there. Linked by name, it holds what the name held.
+    let Some(Record::File(target)) = links.made.get_mut(&target_key) else {
+        links.forget(&member.key());
         return Ok(());
     };
     target.linked(dirfd, name);
@@ -756,7 +801,12 @@ fn extract_regular<R: ArchiveReader>(
     links: &mut Links,
 ) -> PaxResult<()> {
     if let Some(set) = links.sets.find_mut(entry) {
-        return join_link_set(archive, tree, dirfd, member, entry, options, set);
+        let result = join_link_set(archive, tree, dirfd, member, entry, options, set);
+        match result {
+            Err(_) => links.left(member, true, None),
+            Ok(()) => links.forget(&member.key()),
+        }
+        return result;
     }
 
     let mut made = None;
@@ -770,16 +820,13 @@ fn extract_regular<R: ArchiveReader>(
     );
     // A file made is recorded for a later link member to name, even when its
     // data or attributes then failed: it is at that name all the same.
-    if let Some(made) = made {
-        if result.is_ok() {
-            let file = made.id();
-            links.sets.insert(entry, || {
-                let names = vec![member.display.clone()];
-                CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
-            });
-        }
-        links.record_made(member.key(), made);
+    if let Some(file) = made.as_ref().map(MadeFile::id).filter(|_| result.is_ok()) {
+        links.sets.insert(entry, || {
+            let names = vec![member.display.clone()];
+            CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
+        });
     }
+    links.left(member, result.is_err(), made);
     result
 }
 

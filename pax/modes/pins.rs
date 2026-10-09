@@ -62,6 +62,7 @@ impl MadeFile {
     #[cfg(target_os = "linux")]
     pub(crate) fn held(pin: BorrowedFd<'_>) -> io::Result<Self> {
         let st = fstat(pin.as_raw_fd())?;
+        // Without a duplicate it is known by identity and ctime alone.
         let dup = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         Ok(MadeFile {
             id: file_id(&st),

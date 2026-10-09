@@ -606,3 +606,68 @@ fn link_member_kept_by_k_is_not_recorded_as_its_target() {
     assert_ne!(id("g"), id("f"), "-k replaced g");
     assert_eq!(id("h"), id("g"), "h is not the file g holds");
 }
+
+/// Extract `archive` below `dest` under `options`, a writer putting the
+/// file `planted` at `target` just before any link to it is made.
+#[cfg(target_os = "linux")]
+fn extract_with_plant_at_link<R: ArchiveReader>(
+    dest: &Path,
+    archive: &mut R,
+    options: &ReadOptions,
+    target: &'static str,
+) {
+    let tree = DirTree::open_path(dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let path = dest.to_path_buf();
+    let hook = move |point, _: libc::c_int, name: &CStr| {
+        if point == Point::Linking && name.to_bytes() == target.as_bytes() {
+            let at = path.join(target);
+            if at.is_dir() {
+                std::fs::remove_dir_all(&at).unwrap();
+            }
+            std::fs::write(path.join("planted"), "planted\n").unwrap();
+            std::fs::rename(path.join("planted"), &at).unwrap();
+        }
+    };
+    race_hook::with_hook(hook, || {
+        while let Some(entry) = archive.read_entry().unwrap() {
+            let _ = extract_entry(archive, &entry, options, &mut links, &tree, &mut pending);
+        }
+    });
+}
+
+/// A target member whose file could not be made -- a non-empty directory in
+/// its way -- leaves no file of this run's at its name, and a link member
+/// naming it fails: linked by name it took whatever was put there by then.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_to_a_target_that_failed_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("a")).unwrap();
+    std::fs::write(tmp.path().join("a/inside"), "x").unwrap();
+    let file = own_member("a", EntryType::Regular, 0o644);
+    let mut archive = Members(vec![file, link_member("a")].into_iter());
+    extract_with_plant_at_link(tmp.path(), &mut archive, &ReadOptions::default(), "a");
+    let g = std::fs::read_to_string(tmp.path().join("g")).unwrap_or_default();
+    assert_ne!(g, "planted\n", "g was linked to what was put at the name");
+}
+
+/// Under -k a second member of a name already extracted is skipped, and
+/// leaves the first one's file -- and its pin -- in place: a link member
+/// naming it is linked to that file.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_after_a_k_duplicate_links_the_first_file() {
+    let tmp = TempDir::new().unwrap();
+    let file = own_member("a", EntryType::Regular, 0o644);
+    let again = own_member("a", EntryType::Regular, 0o644);
+    let mut archive = Members(vec![file, again, link_member("a")].into_iter());
+    let options = ReadOptions {
+        no_clobber: true,
+        ..Default::default()
+    };
+    extract_with_plant_at_link(tmp.path(), &mut archive, &options, "a");
+    let g = std::fs::read_to_string(tmp.path().join("g")).unwrap_or_default();
+    assert_ne!(g, "planted\n", "g was linked to what was put at the name");
+}

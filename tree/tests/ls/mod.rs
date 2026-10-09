@@ -1163,3 +1163,62 @@ fn test_ls_l_mode_string_special_bits() {
         });
     }
 }
+
+/// The `+` alternate-access flag describes the file the line is about. For a
+/// symbolic link listed as itself that is the link, which carries no ACL on
+/// Linux; the probe followed the link and reported the target's ACL. When
+/// `-L` (or `-H` for an operand) makes the line describe the target, the
+/// target's `+` is the right answer. Gated like `test_ls_acl_plus_flag`.
+#[test]
+fn test_ls_acl_plus_flag_describes_the_link_itself() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    fs::File::create(&target).unwrap();
+    std::os::unix::fs::symlink("target", &link).unwrap();
+    let (target, link) = (target.to_str().unwrap(), link.to_str().unwrap());
+
+    let ok = std::process::Command::new("setfacl")
+        .args(["-m", "u:0:r", target])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("Skipping: setfacl unavailable or filesystem lacks ACL support");
+        return;
+    }
+
+    let mode_of = |output: &std::process::Output| -> String {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.split_whitespace().next().unwrap_or("").to_string()
+    };
+
+    // The link itself: operand, and an entry found inside a directory.
+    ls_test_with_checker(&["-l", link], |_, output| {
+        assert_eq!(mode_of(output), "lrwxrwxrwx");
+    });
+    ls_test_with_checker(&["-l", dir.path().to_str().unwrap()], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout.lines().find(|l| l.contains("link -> ")).unwrap();
+        assert!(line.starts_with("lrwxrwxrwx "), "got {stdout:?}");
+    });
+
+    // Followed: the line describes the target, so it carries the target's `+`.
+    for args in [["-lL", link], ["-lH", link]] {
+        ls_test_with_checker(&args, |_, output| {
+            let mode = mode_of(output);
+            assert!(
+                mode.starts_with('-') && mode.ends_with('+'),
+                "{args:?}: {mode}"
+            );
+        });
+    }
+    ls_test_with_checker(&["-lL", dir.path().to_str().unwrap()], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines().skip(1) {
+            let mode = line.split_whitespace().next().unwrap();
+            assert!(mode.starts_with('-') && mode.ends_with('+'), "{stdout:?}");
+        }
+    });
+}

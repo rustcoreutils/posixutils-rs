@@ -156,11 +156,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(output) => {
             let mut stdout_lock = stdout().lock();
 
-            write!(stdout_lock, "{output}").unwrap();
-
-            stdout_lock.flush().unwrap();
-
-            0_i32
+            match write!(stdout_lock, "{output}").and_then(|()| stdout_lock.flush()) {
+                Ok(()) => 0_i32,
+                Err(e) => {
+                    plib::diag::error(&format!(
+                        "{}: {}",
+                        gettext("write error"),
+                        plib::diag::io_error_text(&e)
+                    ));
+                    1_i32
+                }
+            }
         }
         Err(error_description) => {
             if !error_description.is_empty() {

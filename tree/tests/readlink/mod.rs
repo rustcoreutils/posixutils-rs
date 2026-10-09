@@ -116,3 +116,15 @@ fn test_readlink_not_symlink_diagnoses() {
         "expected a diagnostic: {stderr:?}"
     );
 }
+
+// A write error is reported with status 1, not a panic; with -n the output
+// has no <newline> and is still buffered at exit.
+#[test]
+fn readlink_reports_write_error() {
+    let dir = tempdir().unwrap();
+    let link = dir.path().join("link");
+    symlink("target", &link).unwrap();
+    let link = link.to_str().unwrap();
+    plib::testing::assert_write_error_on_full_device("readlink", &[link], b"", 1);
+    plib::testing::assert_write_error_on_full_device("readlink", &["-n", link], b"", 1);
+}

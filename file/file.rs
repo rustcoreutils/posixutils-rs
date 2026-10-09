@@ -13,6 +13,7 @@ mod magic;
 use std::fs::{read_link, File};
 use std::io::{Read, Seek};
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -20,7 +21,7 @@ use std::{fs, io};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 
-use crate::magic::{get_type_from_magic_file_dbs, ReadSeek, DEFAULT_MAGIC_FILE};
+use crate::magic::{get_type_from_magic_file_dbs, printable, ReadSeek, DEFAULT_MAGIC_FILE};
 
 /// Number of leading bytes inspected by the context-sensitive content tests.
 const CONTENT_PREFIX_LEN: usize = 8192;
@@ -178,11 +179,10 @@ fn content_type(prefix: &[u8]) -> Option<String> {
     if prefix.is_empty() || prefix.contains(&0) {
         return None;
     }
-    let text = String::from_utf8_lossy(prefix);
-
-    if text.starts_with("#!") {
-        return Some(gettext("commands text"));
+    if let Some(rest) = prefix.strip_prefix(b"#!") {
+        return Some(script_type(rest, prefix));
     }
+    let text = String::from_utf8_lossy(prefix);
     if text.contains("#include") || text.contains("#define ") || text.contains("int main") {
         return Some(gettext("c program text"));
     }
@@ -190,6 +190,63 @@ fn content_type(prefix: &[u8]) -> Option<String> {
         return Some(gettext("fortran program text"));
     }
     None
+}
+
+/// The type of a `#!` script, in libmagic's wording rather than POSIX's
+/// "commands text": binutils' debian/rules tells scripts from binaries by
+/// matching /script/.  `interp` is what follows the `#!`; `text` is the
+/// whole prefix, whose encoding is reported as libmagic does.
+///
+/// A few interpreters have names (`POSIX shell`, `Bourne-Again shell`,
+/// `Perl`, `Python`), found by the command's last path component, after an
+/// `env`; any other is `a <command> script`, with the command as written
+/// but escaped by [`printable`], since it comes from the file.
+fn script_type(interp: &[u8], text: &[u8]) -> String {
+    let is_blank = |b: &u8| *b == b' ' || *b == b'\t';
+    let line = interp.split(|&b| b == b'\n').next().unwrap_or_default();
+    let mut command = line.trim_ascii();
+    if program_of(command) == b"env" {
+        command = match command.iter().position(is_blank) {
+            Some(i) => command[i..].trim_ascii_start(),
+            None => b"",
+        };
+    }
+    let program = String::from_utf8_lossy(program_of(command));
+
+    let name = match program.as_ref() {
+        "sh" => gettext("POSIX shell script"),
+        "bash" => gettext("Bourne-Again shell script"),
+        "perl" => return gettext("Perl script text executable"),
+        "python" | "python2" | "python3" => gettext("Python script"),
+        p if p.starts_with("python3.") || p.starts_with("python2.") => gettext("Python script"),
+        _ => gettext!("a {} script", printable(command)),
+    };
+    match text_encoding(text) {
+        Some(encoding) => format!("{}, {} {}", name, encoding, gettext("executable")),
+        None => format!("{} {}", name, gettext("text executable")),
+    }
+}
+
+/// The last path component of a `#!` command's first word.
+fn program_of(command: &[u8]) -> &[u8] {
+    let first = command
+        .split(|&b| b == b' ' || b == b'\t')
+        .next()
+        .unwrap_or_default();
+    first.rsplit(|&b| b == b'/').next().unwrap_or_default()
+}
+
+/// libmagic's name for the encoding of `text`, if it is ASCII or UTF-8.  A
+/// UTF-8 sequence cut short at the end of the prefix still counts.
+fn text_encoding(text: &[u8]) -> Option<String> {
+    if text.is_ascii() {
+        return Some(gettext("ASCII text"));
+    }
+    match std::str::from_utf8(text) {
+        Ok(_) => Some(gettext("Unicode text, UTF-8 text")),
+        Err(e) if e.error_len().is_none() => Some(gettext("Unicode text, UTF-8 text")),
+        Err(_) => None,
+    }
 }
 
 /// Very conservative FORTRAN heuristic: a line beginning with a distinctive
@@ -313,9 +370,17 @@ fn analyze_file(path: &str, args: &Args, magic_files: &[PathBuf]) {
         // link is broken (POSIX: a dangling link is treated as if -h).
         if args.identify_as_symbolic_link || target_meta.is_err() {
             let type_str = match (&target, target_meta.is_ok()) {
-                (Some(t), true) => format!("{} {}", gettext("symbolic link to"), t.display()),
+                (Some(t), true) => format!(
+                    "{} {}",
+                    gettext("symbolic link to"),
+                    printable(t.as_os_str().as_bytes())
+                ),
                 (Some(t), false) => {
-                    format!("{} {}", gettext("broken symbolic link to"), t.display())
+                    format!(
+                        "{} {}",
+                        gettext("broken symbolic link to"),
+                        printable(t.as_os_str().as_bytes())
+                    )
                 }
                 (None, _) => gettext("symbolic link"),
             };

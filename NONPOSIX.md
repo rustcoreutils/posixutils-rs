@@ -295,9 +295,21 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `-b` / `--brief` — print the type without the `file: ` prefix.
  * `-e testname` — exclude a default system test.  Only the names
    `apptype`, `ascii`, `encoding`, `cdf`, `compress` and `tar` are accepted.
-   `ascii` turns off the text recognition (`commands text`, `c program text`,
+   `ascii` turns off the text recognition (scripts, `c program text`,
    `fortran program text`); the others name GNU file built-ins this `file`
    does not have, so excluding them changes nothing.
+ * **A `#!` script is not reported as `commands text`.**  POSIX has a file of
+   shell commands contain `commands text`; we print libmagic's wording
+   instead, `<interpreter> script, <encoding> executable`, because Debian's
+   binutils build tells scripts from binaries by matching `file` output
+   against /script/.  `sh`, `bash`, `perl` and `python` (also after
+   `env`) are named — `POSIX shell script, ASCII text executable`,
+   `Perl script text executable` — and any other interpreter is
+   `a <command> script`, its control characters and invalid UTF-8 bytes
+   shown as `\ooo`.  The encoding is `ASCII text` or
+   `Unicode text, UTF-8 text`, otherwise left out; libmagic's other
+   interpreter names, encodings and line-terminator notes are not
+   reproduced.
 
 Both are forced by debhelper: dh_strip and dh_shlibdeps run
 `file --brief -e apptype -e ascii -e encoding -e cdf -e compress -e tar -- FILE`.

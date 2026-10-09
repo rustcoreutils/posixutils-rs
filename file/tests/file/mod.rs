@@ -369,7 +369,10 @@ fn file_context_shell_script() {
     file_test_stdout(
         &[f.to_str().unwrap()],
         "",
-        &format!("{}: commands text\n", f.to_str().unwrap()),
+        &format!(
+            "{}: POSIX shell script, ASCII text executable\n",
+            f.to_str().unwrap()
+        ),
     );
     std::fs::remove_file(&f).unwrap();
 }
@@ -390,7 +393,97 @@ fn file_context_c_source() {
 // FILE-4: a '-' operand classifies standard-input content.
 #[test]
 fn file_dash_classifies_stdin() {
-    file_test_stdout(&["-"], "#!/bin/bash\n", "/dev/stdin: commands text\n");
+    file_test_stdout(
+        &["-"],
+        "#!/bin/bash\n",
+        "/dev/stdin: Bourne-Again shell script, ASCII text executable\n",
+    );
+}
+
+// A `#!` script is "<interpreter> script ... executable", in libmagic's
+// wording; binutils' debian/rules keeps the files whose `file` line does not
+// match /script/.  Each expected type is what file 5.45 prints.
+#[test]
+fn file_script_names_its_interpreter() {
+    for (first_line, body, expected) in [
+        (
+            "#!/bin/sh",
+            "echo hi\n",
+            "POSIX shell script, ASCII text executable",
+        ),
+        (
+            "#! /bin/sh",
+            "echo hi\n",
+            "POSIX shell script, ASCII text executable",
+        ),
+        (
+            "#!/bin/bash",
+            "echo hi\n",
+            "Bourne-Again shell script, ASCII text executable",
+        ),
+        (
+            "#!/usr/bin/env bash",
+            "echo hi\n",
+            "Bourne-Again shell script, ASCII text executable",
+        ),
+        (
+            "#!/usr/bin/perl",
+            "print 1;\n",
+            "Perl script text executable",
+        ),
+        (
+            "#!/usr/bin/perl -w",
+            "print 1;\n",
+            "Perl script text executable",
+        ),
+        (
+            "#!/usr/bin/env perl",
+            "print 1;\n",
+            "Perl script text executable",
+        ),
+        (
+            "#!/usr/bin/python3",
+            "pass\n",
+            "Python script, ASCII text executable",
+        ),
+        (
+            "#!/usr/bin/env python3",
+            "pass\n",
+            "Python script, ASCII text executable",
+        ),
+        (
+            "#!/usr/bin/foo",
+            "x\n",
+            "a /usr/bin/foo script, ASCII text executable",
+        ),
+        (
+            "#!/usr/bin/env foo",
+            "x\n",
+            "a foo script, ASCII text executable",
+        ),
+        (
+            "#!/usr/bin/make -f",
+            "all:\n",
+            "a /usr/bin/make -f script, ASCII text executable",
+        ),
+        (
+            "#!/bin/dash",
+            "echo hi\n",
+            "a /bin/dash script, ASCII text executable",
+        ),
+        ("#!", "x\n", "a  script, ASCII text executable"),
+        (
+            "#!/bin/sh",
+            "echo h\u{e9}\n",
+            "POSIX shell script, Unicode text, UTF-8 text executable",
+        ),
+    ] {
+        file_test_stdout(
+            &["-b", "-"],
+            &format!("{first_line}\n{body}"),
+            &format!("{expected}\n"),
+        );
+    }
 }
 
 #[test]
@@ -505,4 +598,55 @@ fn option_argument_may_begin_with_hyphen() {
     for opt in ["-m", "-M", "-e"] {
         plib::testing::assert_hyphen_option_argument("file", &[opt, "-zq", "--help"]);
     }
+}
+
+/// Run `file -b ARGS` and return its stdout, which must be one line of text
+/// with no control character (C0, DEL or C1) before the final newline.
+fn file_line_without_controls(args: &[&str]) -> String {
+    let out = std::process::Command::new(plib::testing::get_binary_path("file"))
+        .arg("-b")
+        .args(args)
+        .output()
+        .expect("run file");
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).expect("stdout is valid UTF-8");
+    let line = text.strip_suffix('\n').expect("one line");
+    assert!(!line.chars().any(char::is_control), "{line:?}");
+    line.to_string()
+}
+
+// Bytes a file holds never reach the terminal raw: a `#!` line, a symbolic
+// link's contents, and a magic `%c` / `%s` value are shown with every
+// control character and invalid UTF-8 byte escaped as \ooo, as libmagic does.
+#[test]
+fn file_escapes_content_bytes() {
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let script = dir.path().join("script");
+    std::fs::write(
+        &script,
+        b"#!/usr/bin/fo\x1b[31mo\r\x1b]0;title\x07 \xff\x9b2J\necho\n",
+    )
+    .unwrap();
+    let line = file_line_without_controls(&[script.to_str().unwrap()]);
+    assert_eq!(
+        line,
+        r"a /usr/bin/fo\033[31mo\015\033]0;title\007 \377\2332J script text executable"
+    );
+
+    let env_script = dir.path().join("env_script");
+    std::fs::write(&env_script, b"#!/usr/bin/env \x1b]0;x\x07\necho\n").unwrap();
+    let line = file_line_without_controls(&[env_script.to_str().unwrap()]);
+    assert_eq!(line, r"a \033]0;x\007 script, ASCII text executable");
+
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink("x\x1b[2J\u{e9}\u{9b}y", &link).unwrap();
+    let line = file_line_without_controls(&["-h", link.to_str().unwrap()]);
+    assert_eq!(line, "broken symbolic link to x\\033[2J\u{e9}\\302\\233y");
+
+    let magic = dir.path().join("magic");
+    std::fs::write(&magic, "0\tuC\t>0\tbyte %c\n").unwrap();
+    let data = dir.path().join("data");
+    std::fs::write(&data, b"\x1bxyz").unwrap();
+    let line = file_line_without_controls(&["-M", magic.to_str().unwrap(), data.to_str().unwrap()]);
+    assert_eq!(line, r"byte \033");
 }

@@ -119,11 +119,10 @@ impl Args {
                     }
                 }
             }
-            if let Some(script) = raw_scripts.last_mut() {
-                *script += "\n;";
-            }
         }
 
+        // POSIX: the scripts are joined by <newline>s, so a text or a
+        // continuation begun in one `-e` may run on into the next.
         Ok(raw_scripts.join("\n"))
     }
 
@@ -132,7 +131,7 @@ impl Args {
     fn try_to_sed(mut self: Args) -> Result<Sed, SedError> {
         let mut raw_script = Self::get_raw_script(&self.sources)?;
 
-        if raw_script.is_empty() {
+        if self.sources.is_empty() {
             if self.file.is_empty() {
                 return Err(SedError::NoScripts);
             } else {
@@ -143,6 +142,8 @@ impl Args {
                 raw_script = self.file.remove(0);
             }
         }
+        // The script ends with a <newline>, as a script file's last line does.
+        raw_script.push('\n');
 
         // If no [file...] were supplied or single file is considered to to be script, then
         // sed must read input from STDIN.
@@ -830,27 +831,10 @@ fn tokens_to_address(
 
 /// Get current line and column in script parse process
 fn get_current_line_and_col(chars: &[char], i: usize) -> Option<(usize, usize)> {
-    let mut j = 0;
-    let lines_positions = chars
-        .split(|c| *c == '\n')
-        .map(|line| {
-            let k = j;
-            j += line.len() + 1;
-            (line, k)
-        })
-        .collect::<Vec<_>>();
-    let (line, _) = lines_positions
-        .iter()
-        .enumerate()
-        .find(|(_, (_, line_start))| {
-            if i >= *line_start {
-                return false;
-            }
-            true
-        })?;
-    let line = line.saturating_sub(1);
-    let col = i - lines_positions[line].1 + 1;
-    Some((line, col))
+    let before = &chars[..i.min(chars.len())];
+    let line = before.iter().filter(|c| **c == '\n').count();
+    let line_start = before.iter().rposition(|c| *c == '\n').map_or(0, |p| p + 1);
+    Some((line, i - line_start + 1))
 }
 
 /// Format string for current script line and column
@@ -897,23 +881,37 @@ fn parse_address(
     Ok(())
 }
 
-/// Parse text attribute of a, c, i [`Command`]s that formated as:
+/// Parse the text of an a, c or i [`Command`], with `*i` on the command
+/// letter.  The POSIX form is
 /// a\
 /// text
+/// and, as in GNU sed, blanks after the letter are skipped and text on the
+/// letter's own line (`a text`, `a\text`) is the one-line form.
 fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>, SedError> {
     *i += 1;
+    while matches!(chars.get(*i), Some(' ' | '\t')) {
+        *i += 1;
+    }
     let Some(ch) = chars.get(*i) else {
         return Err(SedError::ScriptParse(
             "script ended unexpectedly".to_string(),
             None,
         ));
     };
-    if *ch != '\\' {
-        let position = get_current_line_and_col(chars, *i);
-        return Err(SedError::ScriptParse(
-            "text must be separated with '\\'".to_string(),
-            position,
-        ));
+    match *ch {
+        '\\' if chars.get(*i + 1) == Some(&'\n') => {}
+        '\\' => {
+            *i += 1;
+            return Ok(parse_one_line_text(chars, i));
+        }
+        '\n' => {
+            let position = get_current_line_and_col(chars, *i);
+            return Err(SedError::ScriptParse(
+                "text must be separated with '\\'".to_string(),
+                position,
+            ));
+        }
+        _ => return Ok(parse_one_line_text(chars, i)),
     }
     *i += 1;
     // POSIX multi-line form: `a\` followed by a <newline> begins the text on the
@@ -941,6 +939,9 @@ fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>,
             '\\' => {
                 *i += 1;
                 match chars.get(*i) {
+                    // A continuation at the very end of the script continues
+                    // nothing.
+                    Some('\n') if *i + 1 == chars.len() => break,
                     // `\` before a newline is a continuation: emit a real
                     // newline and keep reading the next line.
                     Some('\n') => {
@@ -965,6 +966,53 @@ fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>,
         Ok(None)
     } else {
         Ok(Some(text))
+    }
+}
+
+/// Parse the GNU one-line text of an a, c or i [`Command`] from `*i` to the
+/// end of its line, leaving `*i` on its last character.  `;`, `}` and `#` are
+/// part of the text.  A `\` before the <newline> continues the text on the
+/// next line; `\n`, `\t` and the other [`control_escape`]s are controls, and
+/// a `\` before any other character is removed.
+fn parse_one_line_text(chars: &[char], i: &mut usize) -> Option<String> {
+    let mut text = String::new();
+    while let Some(&ch) = chars.get(*i) {
+        match ch {
+            '\n' => break,
+            '\\' => match chars.get(*i + 1) {
+                // A continuation at the very end of the script continues
+                // nothing.
+                Some('\n') if *i + 2 == chars.len() => {}
+                Some(&escaped) => {
+                    text.push(control_escape(escaped).unwrap_or(escaped));
+                    *i += 1;
+                }
+                None => {}
+            },
+            _ => text.push(ch),
+        }
+        *i += 1;
+    }
+    if text.is_empty() {
+        return None;
+    }
+    // The caller steps past the last character, onto the <newline>.
+    *i -= 1;
+    Some(text)
+}
+
+/// The control character GNU sed writes for `\` followed by `ch` in an `s`
+/// replacement or a one-line text: <newline> for `n` and the C escapes `t`,
+/// `r`, `a`, `f` and `v`.
+fn control_escape(ch: char) -> Option<char> {
+    match ch {
+        'n' => Some('\n'),
+        't' => Some('\t'),
+        'r' => Some('\r'),
+        'a' => Some('\x07'),
+        'f' => Some('\x0C'),
+        'v' => Some('\x0B'),
+        _ => None,
     }
 }
 
@@ -1656,13 +1704,7 @@ fn expand_replacement(replacement: &str, haystack: &[u8], caps: &[Range<usize>])
                     out.extend_from_slice(group(d as usize - '0' as usize));
                     continue;
                 }
-                Some('n') => '\n',
-                Some('t') => '\t',
-                Some('r') => '\r',
-                Some('a') => '\x07',
-                Some('f') => '\x0C',
-                Some('v') => '\x0B',
-                Some(other) => other,
+                Some(other) => control_escape(other).unwrap_or(other),
                 None => continue,
             },
             _ => c,

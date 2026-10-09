@@ -681,6 +681,15 @@ being redirected through a directory operand swapped for a symbolic link.
    the output goes to standard output: line numbers restart, `$` is each
    file's last line, the hold space starts empty and no range is open.  A
    file that cannot be read is reported and skipped; `q` ends the run.
+ * One-line `a`, `i` and `c`, as GNU sed: blanks after the letter are
+   skipped, and text on the letter's own line (`a text`, `$i #define X 1`,
+   `a\text`) runs to the end of that line, `;`, `}` and `#` included.  In it
+   a `\` before the <newline> continues the text on the next line, `\n`,
+   `\t`, `\r`, `\a`, `\f` and `\v` are controls, and a `\` before any other
+   character is removed.  The POSIX `a\` <newline> form keeps POSIX's rule
+   (GNU applies the controls there too), and an empty text is still an
+   error where GNU appends nothing.  perl's and binutils' Debian builds use
+   it.
  * `PROJECT_NAME` — selects the gettext text domain.
 
 ### sh

@@ -11,6 +11,7 @@ mod bytes;
 mod change;
 mod files;
 mod inplace;
+mod oneline;
 mod options;
 mod separate;
 #[cfg(unix)]
@@ -862,20 +863,20 @@ mod tests {
             (
                 "a  \text",
                 "abc\ndef\n@#$",
+                "abc\next\ndef\next\n@#$\next\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 "a\text",
                 "abc\ndef\n@#$",
+                "abc\next\ndef\next\n@#$\next\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 "a\text\\in\\sed",
                 "abc\ndef\n@#$",
+                "abc\nextinsed\ndef\nextinsed\n@#$\nextinsed\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 // The <newline> ends the `a` text (POSIX/GNU: text ends at the
@@ -890,14 +891,14 @@ mod tests {
             (
                 "atext",
                 "abc\ndef\n@#$",
+                "abc\ntext\ndef\ntext\n@#$\ntext\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 "a text",
                 "abc\ndef\n@#$",
+                "abc\ntext\ndef\ntext\n@#$\ntext\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
         ];
 
@@ -930,15 +931,13 @@ mod tests {
                 "sed: can't find label for jump to `label'\n",
             ),
             (
-                // The <newline> separates commands: `b ab` (branch to label
-                // `ab`), then line 2 `cd` is a `c` command, which requires a
-                // `\` before its text. (GNU accepts the one-line `c text` form
-                // and instead reports the missing `ab` label; this impl does not
-                // implement that extension, a pre-existing limitation.)
+                // The <newline> separates commands: `b ab`, then line 2
+                // `cd; :ab` is a one-line `c` whose text is `d; :ab`, so the
+                // label `ab` is never defined.  Matches GNU sed.
                 "b ab\ncd; :ab\ncd",
                 "",
                 "",
-                "sed: text must be separated with '\\' (line: 1, col: 2)\n",
+                "sed: can't find label for jump to `ab'\n",
             ),
             (
                 "b label",
@@ -1037,23 +1036,13 @@ mod tests {
                 "",
                 "sed: missing text argument (line: 0, col: 3)\n",
             ),
-            (
-                "c  \text",
-                "abc\ndef\n@#$",
-                "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
-            ),
-            (
-                "c\text",
-                "abc\ndef\n@#$",
-                "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
-            ),
+            ("c  \text", "abc\ndef\n@#$", "ext\next\next\n", ""),
+            ("c\text", "abc\ndef\n@#$", "ext\next\next\n", ""),
             (
                 "c\text\\in\\sed",
                 "abc\ndef\n@#$",
+                "extinsed\nextinsed\nextinsed\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 // The <newline> ends the `c` text; line 2 ` text ` parses as a
@@ -1306,20 +1295,15 @@ mod tests {
             (
                 "i  \text",
                 "abc\ncdf\n\n",
+                "ext\nabc\next\ncdf\next\n\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
-            (
-                "i\text",
-                "abc\ncdf\n\n",
-                "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
-            ),
+            ("i\text", "abc\ncdf\n\n", "ext\nabc\next\ncdf\next\n\n", ""),
             (
                 "i\text\\in\\sed",
                 "abc\ncdf\n\n",
+                "extinsed\nabc\nextinsed\ncdf\nextinsed\n\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 // The <newline> ends the `i` text; line 2 ` text ` parses as a
@@ -1890,13 +1874,13 @@ mod tests {
                 "sed: label can't contain ' ' (line: 0, col: 14)\n",
             ),
             (
-                // The <newline> separates commands: `t ab`, then line 2 `cd`
-                // is a `c` command requiring a `\` before its text. (GNU's
-                // one-line `c text` extension is not implemented here.)
+                // The <newline> separates commands: `t ab`, then line 2
+                // `cd; :ab` is a one-line `c` whose text is `d; :ab`, so the
+                // label `ab` is never defined.  Matches GNU sed.
                 "t ab\ncd; :ab\ncd",
                 "aa\naaa\n\n",
                 "",
-                "sed: text must be separated with '\\' (line: 1, col: 2)\n",
+                "sed: can't find label for jump to `ab'\n",
             ),
         ];
 

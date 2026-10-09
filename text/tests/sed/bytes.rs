@@ -69,7 +69,9 @@ fn test_sed_bytes_y_multibyte_operand_is_bytes_in_c_locale() {
         args: vec![String::from("y/\u{e9}/E/")],
         stdin_data: MIXED.to_vec(),
         expected_out: Vec::new(),
-        expected_err: b"sed: number of characters in the two arrays does not match\n".to_vec(),
+        expected_err:
+            b"sed: number of characters in the two arrays does not match (line: 0, col: 7)\n"
+                .to_vec(),
         expected_exit_code: 1,
     });
     // Two bytes for two bytes is a valid byte transliteration.

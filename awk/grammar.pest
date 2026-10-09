@@ -322,7 +322,7 @@ binary_expr = {
 }
 
 multidimensional_in    = { "(" ~ multidimensional_index ~ ")" ~ "in" ~ name }
-simple_binary_expr     = { prefix_op? ~ primary ~ postfix_op? ~ (infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
+simple_binary_expr     = { prefix_op* ~ primary ~ postfix_op? ~ (infix_op ~ prefix_op* ~ primary ~ postfix_op?)* }
 multidimensional_index = { multiple_expr_list }
 
 ternary_expr = { binary_expr ~ ("?" ~ expr ~ ":" ~ expr)? }
@@ -391,7 +391,7 @@ getline_from_file_cmp = { kw ~ "getline" ~ lvalue? ~ "<" ~ simple_getline_file_e
 simple_getline    = { kw ~ "getline" ~ lvalue? }
 getline_from_file = { kw ~ "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr }
 
-simple_getline_file_expr = { prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
+simple_getline_file_expr = { prefix_op* ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op* ~ primary ~ postfix_op?)* }
 getline_from_pipe = { unpiped_expr ~ piped_getline* }
 piped_getline     = { "|" ~ kw ~ "getline" ~ lvalue? }
 
@@ -420,7 +420,7 @@ print_infix_op           = _{
   | concat
 }
 simple_binary_print_expr =  {
-    prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)*
+    prefix_op* ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op* ~ primary ~ postfix_op?)*
 }
 binary_print_expr        =  {
     simple_binary_print_expr

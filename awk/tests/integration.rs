@@ -1741,3 +1741,13 @@ fn awk_field_reference_binds_tighter_than_increment() {
         assert_eq!(status, Some(0), "{program}");
     }
 }
+
+// An operand can have more than one unary operator: `!!x` was a syntax
+// error.
+#[test]
+fn awk_operand_takes_several_unary_operators() {
+    let (stdout, stderr, status) =
+        awk_with_deadline("BEGIN { x = 2; print !!x, - -x, !-x, -!x, !!!\"\", 1 - -1 }");
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("1 2 0 0 1 2\n", ""));
+    assert_eq!(status, Some(0));
+}

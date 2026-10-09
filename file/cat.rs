@@ -127,10 +127,14 @@ fn cat_file(pathname: &Path, render: Render) -> bool {
             &rendered[..]
         };
 
-        if let Err(e) = handle.write_all(data) {
+        // One write per read, flushed at once: stdout is line-buffered, and a
+        // chunk with no <newline> left in the buffer would otherwise reach the
+        // device only at exit, where a write error is lost. It is also what
+        // -u asks for.
+        if let Err(e) = handle.write_all(data).and_then(|()| handle.flush()) {
             eprintln!(
                 "cat: {}: {}",
-                gettext("standard output"),
+                gettext("write error"),
                 plib::diag::io_error_text(&e)
             );
             return true;

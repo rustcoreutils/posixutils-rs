@@ -113,6 +113,16 @@ fn test_cat_reports_epipe_when_sigpipe_is_ignored() {
     plib::testing::assert_epipe_when_sigpipe_ignored("cat", &[f.to_str().unwrap()], 1);
 }
 
+/// A write error on the last chunk is reported even when that chunk has no
+/// <newline>: it sat in the line buffer until exit, where the error was lost
+/// and `printf x | cat >/dev/full` exited 0. -u must not buffer it at all.
+#[test]
+fn test_cat_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("cat", &[], b"x", 1);
+    plib::testing::assert_write_error_on_full_device("cat", &["-u"], b"x", 1);
+    plib::testing::assert_write_error_on_full_device("cat", &["-v"], b"a\nb", 1);
+}
+
 /// Run `cat` with `args` on `stdin`, asserting stdout byte for byte.
 fn cat_test_bytes(args: &[&str], stdin: &[u8], expected_out: &[u8]) {
     run_test_u8(TestPlanU8 {

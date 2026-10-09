@@ -1816,3 +1816,11 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("more", &[opt, "-zq", "--help"]);
     }
 }
+
+// When stdout is not a terminal more copies its input; a write error on a
+// final line without a <newline> sat in the line buffer until exit, where it
+// was lost.
+#[test]
+fn more_filter_mode_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("more", &[], b"x", 1);
+}

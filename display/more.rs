@@ -4089,6 +4089,11 @@ fn main() {
         Ok(mut ctl) => {
             if ctl.terminal.is_none() {
                 ctl.print_all_input();
+                // A last line without a <newline> is still in stdout's line
+                // buffer, and the flush at exit would discard its write error.
+                if !plib::diag::flush_stdout() {
+                    std::process::exit(1);
+                }
             } else {
                 ctl.loop_();
             }

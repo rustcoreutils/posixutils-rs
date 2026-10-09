@@ -771,3 +771,26 @@ fn rm_removes_exactly_the_named_non_utf8_files() {
     }
     assert!(decoy.exists(), "rm removed the U+FFFD decoy");
 }
+
+// An argument that cannot fit within -s even alone is an error, with or
+// without -x, as in GNU xargs.  Without -x it used to run the utility with no
+// arguments over and over, forever.
+#[test]
+fn argument_too_long_for_size_limit_is_an_error() {
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![String::from("-s"), String::from("8"), String::from("echo")],
+        stdin_data: String::from("aaaaaaaaaa bb\n"),
+        expected_out: String::new(),
+        expected_err: String::from("xargs: argument line too long\n"),
+        expected_exit_code: 1,
+    });
+}
+
+// The last argument, read at end of input, can overflow the batch built so
+// far; it then goes in a command of its own.  Only one command was run for
+// whatever remained at end of input, and the overflow was dropped.
+#[test]
+fn arguments_left_at_end_of_input_all_run() {
+    xargs_test("aaa bbb ccc", "aaa bbb\nccc\n", vec!["-s", "13", "echo"]);
+}

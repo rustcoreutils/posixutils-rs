@@ -735,7 +735,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
                 let mut util_args = args.util_args.clone();
                 let batch = state.remove_args();
                 if batch.is_empty() {
-                    break;
+                    // The first argument does not fit even alone.
+                    err_arg_too_long();
+                    return Ok(1);
                 }
                 util_args.extend(batch);
 
@@ -795,7 +797,8 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
 
                     let mut util_args = args.util_args.clone();
                     let batch = state.remove_args();
-                    if batch.is_empty() && state.exit_on_overflow {
+                    if batch.is_empty() {
+                        // The first argument does not fit even alone.
                         err_arg_too_long();
                         return Ok(1);
                     }
@@ -833,13 +836,23 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
             let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
             handle_exec_result!(result, any_failed);
         }
-    } else if !state.args.is_empty() {
-        let mut util_args = args.util_args.clone();
-        util_args.extend(state.remove_args());
+    } else {
+        // The last argument read can overflow the batch, so what remains may
+        // need more than one command.
+        while !state.args.is_empty() {
+            let batch = state.remove_args();
+            if batch.is_empty() {
+                // The first argument does not fit even alone.
+                err_arg_too_long();
+                return Ok(1);
+            }
+            let mut util_args = args.util_args.clone();
+            util_args.extend(batch);
 
-        invoked = true;
-        let result = exec_util(&args.util, util_args, trace, args.prompt)?;
-        handle_exec_result!(result, any_failed);
+            invoked = true;
+            let result = exec_util(&args.util, util_args, trace, args.prompt)?;
+            handle_exec_result!(result, any_failed);
+        }
     }
 
     // POSIX: if standard input yields no arguments, the utility shall be

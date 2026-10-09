@@ -501,6 +501,33 @@ impl Regex {
         })
     }
 
+    /// As [`Regex::find_bytes`], for `text` that is part of a line: `not_bol` says its start is
+    /// not the beginning of the line, so `^` cannot match there, and `not_eol` that its end is
+    /// not the end of the line, so `$` cannot match there.
+    pub fn find_bytes_in_line(&self, text: &[u8], not_bol: bool, not_eol: bool) -> Option<Match> {
+        if self.empty {
+            return Some(Match { start: 0, end: 0 });
+        }
+        let mut pmatch = RegMatchT {
+            rm_so: -1,
+            rm_eo: -1,
+        };
+        let mut eflags = 0;
+        if not_bol {
+            eflags |= REG_NOTBOL;
+        }
+        if not_eol {
+            eflags |= REG_NOTEOL;
+        }
+        if !self.exec(text, std::slice::from_mut(&mut pmatch), eflags) || pmatch.rm_so < 0 {
+            return None;
+        }
+        Some(Match {
+            start: pmatch.rm_so as usize,
+            end: pmatch.rm_eo as usize,
+        })
+    }
+
     /// Find all capture groups in the input string.
     ///
     /// Group 0 is always the entire match. Groups 1-9 are the parenthesized

@@ -10,6 +10,9 @@
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
+mod context;
+mod word;
+
 const LINES_INPUT: &str =
     "line_{1}\np_line_{2}_s\n  line_{3}  \nLINE_{4}\np_LINE_{5}_s\nl_{6}\nline_{70}\n";
 const EMPTY_LINES_INPUT: &str = "\n\n\n";

@@ -11,6 +11,8 @@ use clap::Parser;
 use gettextrs::gettext;
 use plib::regex::{Regex, RegexFlags};
 use std::{
+    collections::VecDeque,
+    ffi::OsString,
     fs::File,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -41,6 +43,90 @@ fn locale_lower(bytes: &[u8]) -> Vec<u8> {
 /// Whether `needle` occurs in `haystack`.
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Whether the character in `ch` (one character of the locale, or one byte that is none) is a
+/// word constituent for `-w`: a letter or digit of the locale, or `_`, as in GNU grep.
+fn is_word_char(ch: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(ch) else {
+        return false;
+    };
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => c == '_' || plib::locale::isalnum(c),
+        _ => false,
+    }
+}
+
+/// Whether `line[start..end]` stands as a word for `-w`: no word constituent just before it
+/// or just after it.
+fn is_word_at(line: &[u8], start: usize, end: usize) -> bool {
+    // No character is longer than this; a window that starts inside one still ends with the
+    // whole character before `start`.
+    const MAX_CHAR_LEN: usize = 16;
+    let before = &line[start.saturating_sub(MAX_CHAR_LEN)..start];
+    let after = &line[end..line.len().min(end + MAX_CHAR_LEN)];
+    let word_before = plib::locale::mb_char_slices(before)
+        .last()
+        .is_some_and(|ch| is_word_char(ch));
+    let word_after = plib::locale::mb_char_slices(after)
+        .first()
+        .is_some_and(|ch| is_word_char(ch));
+    !word_before && !word_after
+}
+
+/// `-w` for a regular expression: some match of `re` in `line` stands as a word. As GNU grep
+/// does, a match that does not is tried again shorter from the same start, and then the
+/// search goes on from the next character.
+fn regex_matches_word(re: &Regex, line: &[u8]) -> bool {
+    let mut from = 0;
+    while let Some(m) = re.find_bytes_in_line(&line[from..], from > 0, false) {
+        let start = from + m.start;
+        let mut end = from + m.end;
+        loop {
+            if is_word_at(line, start, end) {
+                return true;
+            }
+            if end == start {
+                break;
+            }
+            // The longest match from `start` shorter than this one, if any match starts there:
+            // the leftmost-longest match in the shortened text.
+            let shorter = &line[start..end - 1];
+            match re.find_bytes_in_line(shorter, start > 0, end - 1 < line.len()) {
+                Some(m) if m.start == 0 && m.end > 0 => end = start + m.end,
+                _ => break,
+            }
+        }
+        match plib::locale::next_char_offset(line, start) {
+            Some(next) => from = next,
+            None => break,
+        }
+    }
+    false
+}
+
+/// `-w` for a fixed string: some occurrence of `needle` in `line` stands as a word.
+fn fixed_matches_word(line: &[u8], needle: &[u8]) -> bool {
+    let mut from = 0;
+    loop {
+        let found = if needle.is_empty() {
+            Some(0)
+        } else {
+            line[from..].windows(needle.len()).position(|w| w == needle)
+        };
+        let Some(i) = found else {
+            return false;
+        };
+        let start = from + i;
+        if is_word_at(line, start, start + needle.len()) {
+            return true;
+        }
+        match plib::locale::next_char_offset(line, start) {
+            Some(next) => from = next,
+            None => return false,
+        }
+    }
 }
 
 /// grep - search a file for a pattern
@@ -88,7 +174,7 @@ struct Args {
     #[arg(short = 'n', long, help = gettext("Precede each output line by its relative line number in the file"))]
     line_number: bool,
 
-    #[arg(short, long, help = gettext("Quiet mode, only return exit status"))]
+    #[arg(short, long, visible_alias = "silent", help = gettext("Quiet mode, only return exit status"))]
     quiet: bool,
 
     #[arg(short = 's', long, help = gettext("Suppress the error messages for nonexistent or unreadable files"))]
@@ -99,6 +185,18 @@ struct Args {
 
     #[arg(short = 'x', long, help = gettext("Match entire lines only"))]
     line_regexp: bool,
+
+    #[arg(short = 'w', long, help = gettext("Match only whole words"))]
+    word_regexp: bool,
+
+    #[arg(short = 'A', long, value_name = "NUM", help = gettext("Print NUM lines of context after each selected line"))]
+    after_context: Option<usize>,
+
+    #[arg(short = 'B', long, value_name = "NUM", help = gettext("Print NUM lines of context before each selected line"))]
+    before_context: Option<usize>,
+
+    #[arg(short = 'C', long, value_name = "NUM", help = gettext("Print NUM lines of context around each selected line; -NUM is the same"))]
+    context: Option<usize>,
 
     #[arg(name = "PATTERNS", help = gettext("Pattern to search for"))]
     single_pattern: Option<String>,
@@ -215,8 +313,24 @@ impl Args {
             self.extended_regexp,
             self.fixed_strings,
             self.ignore_case,
-            self.line_regexp,
+            // -x wins over -w.
+            if self.line_regexp {
+                Whole::Line
+            } else if self.word_regexp {
+                Whole::Word
+            } else {
+                Whole::Any
+            },
         )?;
+
+        // -A and -B win over -C, whatever their order, as in GNU grep.
+        let context = Context {
+            before: self.before_context.or(self.context).unwrap_or(0),
+            after: self.after_context.or(self.context).unwrap_or(0),
+            separate: self.before_context.is_some()
+                || self.after_context.is_some()
+                || self.context.is_some(),
+        };
 
         Ok(GrepModel {
             any_matches: false,
@@ -231,15 +345,29 @@ impl Args {
                 .unwrap_or_else(|| String::from("(standard input)")),
             output_mode,
             patterns,
+            context,
+            printed_any: false,
             input_files: self.input_files,
         })
     }
 }
 
+/// What part of a line a pattern has to match.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Whole {
+    /// Any part (the default).
+    Any,
+    /// A part with no word constituent next to it (`-w`).
+    Word,
+    /// All of it (`-x`).
+    Line,
+}
+
 /// Holds patterns for matching input data - either fixed strings or compiled regexes.
 enum Patterns {
-    Fixed(Vec<Vec<u8>>, bool, bool),
-    Regex(Vec<Regex>),
+    /// The strings (folded under -i), whether -i is in effect, and what they must match.
+    Fixed(Vec<Vec<u8>>, bool, Whole),
+    Regex(Vec<Regex>, Whole),
 }
 
 impl Patterns {
@@ -251,7 +379,7 @@ impl Patterns {
     /// * `extended_regexp` - `bool` indicating whether to use extended regular expressions.
     /// * `fixed_string` - `bool` indicating whether pattern is fixed string or regex.
     /// * `ignore_case` - `bool` indicating whether to ignore case.
-    /// * `line_regexp` - `bool` indicating whether to match the entire input.
+    /// * `whole` - what part of a line a pattern has to match.
     ///
     /// # Errors
     ///
@@ -265,7 +393,7 @@ impl Patterns {
         extended_regexp: bool,
         fixed_string: bool,
         ignore_case: bool,
-        line_regexp: bool,
+        whole: Whole,
     ) -> Result<Self, String> {
         if fixed_string {
             Ok(Self::Fixed(
@@ -280,7 +408,7 @@ impl Patterns {
                     })
                     .collect(),
                 ignore_case,
-                line_regexp,
+                whole,
             ))
         } else {
             let mut ps = vec![];
@@ -297,7 +425,7 @@ impl Patterns {
 
             for pattern in patterns {
                 // For -x option, anchor the pattern to match entire line
-                let pattern = if line_regexp {
+                let pattern = if whole == Whole::Line {
                     format!("^{pattern}$")
                 } else {
                     pattern
@@ -306,7 +434,7 @@ impl Patterns {
                 let regex = Regex::new(&pattern, flags).map_err(|e| e.to_string())?;
                 ps.push(regex);
             }
-            Ok(Self::Regex(ps))
+            Ok(Self::Regex(ps, whole))
         }
     }
 
@@ -318,7 +446,7 @@ impl Patterns {
     /// leaves the rest of the line to match.
     fn matches(&self, input: &[u8]) -> bool {
         match self {
-            Patterns::Fixed(patterns, ignore_case, line_regexp) => {
+            Patterns::Fixed(patterns, ignore_case, whole) => {
                 let folded;
                 let input = if *ignore_case {
                     folded = locale_lower(input);
@@ -326,15 +454,16 @@ impl Patterns {
                 } else {
                     input
                 };
-                patterns.iter().any(|p| {
-                    if *line_regexp {
-                        input == p.as_slice()
-                    } else {
-                        contains_bytes(input, p)
-                    }
+                patterns.iter().any(|p| match whole {
+                    Whole::Any => contains_bytes(input, p),
+                    Whole::Word => fixed_matches_word(input, p),
+                    Whole::Line => input == p.as_slice(),
                 })
             }
-            Patterns::Regex(patterns) => patterns.iter().any(|re| re.is_match_bytes(input)),
+            Patterns::Regex(patterns, Whole::Word) => {
+                patterns.iter().any(|re| regex_matches_word(re, input))
+            }
+            Patterns::Regex(patterns, _) => patterns.iter().any(|re| re.is_match_bytes(input)),
         }
     }
 }
@@ -362,7 +491,33 @@ struct GrepModel {
     stdin_name: String,
     output_mode: OutputMode,
     patterns: Patterns,
+    context: Context,
+    /// Whether any line has been written, so a later group of context is separated from it.
+    printed_any: bool,
     input_files: Vec<String>,
+}
+
+/// GNU context output (`-A`, `-B`, `-C`, `-NUM`).
+struct Context {
+    /// Lines written before each selected line.
+    before: usize,
+    /// Lines written after each selected line.
+    after: usize,
+    /// Whether groups of lines that do not touch are separated by `--`: whenever a context
+    /// option was given, even a context of 0.
+    separate: bool,
+}
+
+/// The context state of one input.
+#[derive(Default)]
+struct Pending {
+    /// The latest unselected lines not written, up to `Context::before` of them, with their
+    /// line numbers.
+    before: VecDeque<(u64, Vec<u8>)>,
+    /// How many of the next unselected lines are still to be written after a selected one.
+    after_left: usize,
+    /// The number of the last line written from this input.
+    last_printed: Option<u64>,
 }
 
 impl GrepModel {
@@ -418,6 +573,7 @@ impl GrepModel {
     fn process_input(&mut self, input_name: &str, mut reader: Box<dyn BufRead>) {
         let mut line_number: u64 = 0;
         let mut line = Vec::new();
+        let mut pending = Pending::default();
         loop {
             line.clear();
             line_number += 1;
@@ -426,6 +582,9 @@ impl GrepModel {
                 Ok(_) => {
                     let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
                     if self.patterns.matches(trimmed) == self.invert_match {
+                        if self.output_mode == OutputMode::Default {
+                            self.unselected_line(input_name, line_number, trimmed, &mut pending);
+                        }
                         continue;
                     }
                     self.any_matches = true;
@@ -441,15 +600,13 @@ impl GrepModel {
                             return;
                         }
                         OutputMode::Default => {
-                            let mut prefix = String::new();
-                            if self.with_filename {
-                                prefix.push_str(input_name);
-                                prefix.push(':');
+                            let mut before = std::mem::take(&mut pending.before);
+                            for (number, text) in before.drain(..) {
+                                self.print_line(input_name, number, &text, b'-', &mut pending);
                             }
-                            if self.line_number {
-                                prefix.push_str(&format!("{line_number}:"));
-                            }
-                            write_line(prefix.as_bytes(), trimmed);
+                            pending.before = before;
+                            self.print_line(input_name, line_number, trimmed, b':', &mut pending);
+                            pending.after_left = self.context.after;
                         }
                     }
                 }
@@ -480,6 +637,42 @@ impl GrepModel {
     }
 }
 
+impl GrepModel {
+    /// An unselected line: written as context after a selected one, or kept in case one
+    /// follows.
+    fn unselected_line(&mut self, name: &str, number: u64, text: &[u8], pending: &mut Pending) {
+        if pending.after_left > 0 {
+            pending.after_left -= 1;
+            self.print_line(name, number, text, b'-', pending);
+        } else if self.context.before > 0 {
+            if pending.before.len() == self.context.before {
+                pending.before.pop_front();
+            }
+            pending.before.push_back((number, text.to_vec()));
+        }
+    }
+
+    /// Write line `number` of input `name`: `sep` is `:` for a selected line and `-` for a
+    /// context line. A line that does not follow the last one written starts a new group.
+    fn print_line(&mut self, name: &str, number: u64, text: &[u8], sep: u8, pending: &mut Pending) {
+        if self.context.separate && self.printed_any && pending.last_printed != Some(number - 1) {
+            write_line(b"", b"--");
+        }
+        let mut prefix = Vec::new();
+        if self.with_filename {
+            prefix.extend_from_slice(name.as_bytes());
+            prefix.push(sep);
+        }
+        if self.line_number {
+            prefix.extend_from_slice(number.to_string().as_bytes());
+            prefix.push(sep);
+        }
+        write_line(&prefix, text);
+        pending.last_printed = Some(number);
+        self.printed_any = true;
+    }
+}
+
 /// Write a selected line, after `prefix`, to standard output as its bytes.
 /// grep cannot go on once its output fails, so a write error ends it with
 /// status 2.
@@ -499,6 +692,59 @@ fn write_line(prefix: &[u8], line: &[u8]) {
     }
 }
 
+/// GNU's `-NUM` option, a context of NUM lines, as `-C NUM`, which clap can parse. An argument
+/// that is the value of an option before it, or follows `--`, is left as it is.
+fn expand_numeric_context(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    const SHORT_WITH_VALUE: &[char] = &['e', 'f', 'A', 'B', 'C'];
+    const LONG_WITH_VALUE: &[&str] = &[
+        "--regexp",
+        "--file",
+        "--label",
+        "--after-context",
+        "--before-context",
+        "--context",
+    ];
+    let mut args = args.into_iter();
+    let mut out: Vec<OsString> = args.next().into_iter().collect();
+    let mut value_next = false;
+    while let Some(arg) = args.next() {
+        let Some(text) = arg.to_str().filter(|_| !value_next) else {
+            value_next = false;
+            out.push(arg);
+            continue;
+        };
+        if text == "--" {
+            out.push(arg);
+            out.extend(args);
+            break;
+        }
+        if text.starts_with("--") {
+            value_next = LONG_WITH_VALUE.contains(&text);
+        } else if let Some(cluster) = text.strip_prefix('-') {
+            // The first letter that takes a value takes the rest of the cluster, or else the
+            // next argument. Digits before it are -NUM, the last run of them counting, as in
+            // GNU grep: `-n5` is `-n -C 5`.
+            let value_at = cluster.find(SHORT_WITH_VALUE).unwrap_or(cluster.len());
+            let (options, value) = cluster.split_at(value_at);
+            value_next = value.len() == 1;
+            let digits = options
+                .split(|c: char| !c.is_ascii_digit())
+                .rfind(|run| !run.is_empty());
+            if let Some(digits) = digits {
+                out.push(OsString::from("-C"));
+                out.push(OsString::from(digits));
+                let letters: String = options.chars().filter(|c| !c.is_ascii_digit()).collect();
+                if !letters.is_empty() || !value.is_empty() {
+                    out.push(OsString::from(format!("-{letters}{value}")));
+                }
+                continue;
+            }
+        }
+        out.push(arg);
+    }
+    out
+}
+
 // Exit code:
 //     0 - One or more lines were selected.
 //     1 - No lines were selected.
@@ -506,7 +752,7 @@ fn write_line(prefix: &[u8], line: &[u8]) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("grep");
 
-    let mut args = Args::parse();
+    let mut args = Args::parse_from(expand_numeric_context(std::env::args_os()));
 
     let exit_code = args
         .validate_args()

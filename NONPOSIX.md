@@ -417,6 +417,17 @@ table is present.
    therefore `--help` only.
  * `--label=LABEL` — the name standard input goes by in those prefixes and in
    `-l` and `-c` output, in place of `(standard input)`.
+ * `-w` / `--word-regexp` (BSD and GNU) — a match counts only with no word
+   character (a letter or digit of the locale, or `_`) just before or after
+   it; a match that fails is tried shorter from the same start, then later in
+   the line, as GNU does.  `-x` wins over it.  binutils runs
+   `grep --word-regexp --silent`.
+ * `-A NUM` / `--after-context`, `-B NUM` / `--before-context`,
+   `-C NUM` / `--context`, and `-NUM` — write NUM lines after, before, or
+   around each selected line, marking them with `-` where a selected line has
+   `:`, and `--` between groups that do not touch (in a later file too).
+   `-A` and `-B` win over `-C`.  Only the output of lines changes, not `-c`,
+   `-l` or `-q`.  gzip's zgrep tests run `grep -15`.
 
 ### head
 

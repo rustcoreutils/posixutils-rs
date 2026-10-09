@@ -1259,6 +1259,8 @@ pub(crate) fn link_replacing_with(
     name: &CStr,
     no_clobber: bool,
 ) -> PaxResult<bool> {
+    #[cfg(test)]
+    crate::modes::race_hook::reached(crate::modes::race_hook::Point::Linking, from_dir, from_name);
     let source = LinkSource::new(from_dir, from_name, follow, expected)?;
     let link = || source.link_to(dirfd, name);
 

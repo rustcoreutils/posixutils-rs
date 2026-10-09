@@ -748,12 +748,6 @@ fn copy_file(
         // `pax -rwl tree .` names every file as its own destination. Under
         // -H/-L the walk followed a symbolic link here, and the link made is
         // to the file it refers to, as POSIX requires of -l.
-        #[cfg(test)]
-        crate::modes::race_hook::reached(
-            crate::modes::race_hook::Point::Linking,
-            entry.dir_fd(),
-            entry.file_name(),
-        );
         let linked = link_replacing_with(
             entry.dir_fd(),
             entry.file_name(),

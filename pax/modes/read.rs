@@ -14,9 +14,9 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    attrs_withheld, create_replacing, link_replacing, make_dir_at, set_attrs_fd,
-    set_made_node_attrs, stat_at, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath,
-    PendingDirs,
+    attrs_withheld, create_replacing, link_replacing, link_replacing_with, make_dir_at,
+    set_attrs_fd, set_made_node_attrs, stat_at, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree,
+    MemberPath, PendingDirs,
 };
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
@@ -698,9 +698,13 @@ fn join_link_set<R: ArchiveReader>(
             .iter()
             .find_map(|path| holding_name(tree, path, set.file));
         if let Some((src_dir, src_leaf)) = holder {
-            link_replacing(
+            // To the set's file, pinned: the holder was found holding it, but
+            // its name can be given another file before the link is made.
+            link_replacing_with(
                 src_dir.as_raw_fd(),
                 &src_leaf,
+                false,
+                Some(set.file),
                 dirfd,
                 name,
                 options.no_clobber,
@@ -719,7 +723,7 @@ fn join_link_set<R: ArchiveReader>(
         // -k kept what was there; the data is still the earlier names'.
         return fill_link_set(archive, tree, entry, options, set);
     };
-    let mut names = move_names_to(holders, dirfd, name)?;
+    let mut names = move_names_to(holders, dirfd, name, file)?;
     names.push(member.display.clone());
     // Created empty when no earlier name survived to link to: the data is
     // then still to come, on a later name.
@@ -751,7 +755,7 @@ fn fill_link_set<R: ArchiveReader>(
     let dir = Rc::clone(dir);
     let (temp, file) = create_temp_file(dir.as_fd(), entry, options)?;
     let filled = write_file_data(archive, file, entry, options)
-        .and_then(|id| Ok((id, move_names_to(holders, dir.as_fd(), &temp)?)));
+        .and_then(|id| Ok((id, move_names_to(holders, dir.as_fd(), &temp, id)?)));
     let removed = unlink_at(dir.as_fd(), &temp);
     let (file, names) = filled?;
     removed?;
@@ -765,17 +769,21 @@ fn fill_link_set<R: ArchiveReader>(
 }
 
 /// Link each of `holders` -- names of a set, with the directory and leaf they
-/// were found at -- to `name` in `dirfd`, returning their paths.
+/// were found at -- to `name` in `dirfd`, the file `file` this extraction has
+/// just made, returning their paths.
 fn move_names_to(
     holders: Vec<((Rc<OwnedFd>, CString), PathBuf)>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
+    file: (u64, u64),
 ) -> PaxResult<Vec<PathBuf>> {
     let mut names = Vec::with_capacity(holders.len() + 1);
     for ((dir, leaf), path) in holders {
         // These names were created by this extraction, so they are replaced
-        // even under -k.
-        link_replacing(dirfd.as_raw_fd(), name, dir.as_fd(), &leaf, false)?;
+        // even under -k. The link is to the file made, pinned, never to
+        // whatever has been put at its name since.
+        let from = dirfd.as_raw_fd();
+        link_replacing_with(from, name, false, Some(file), dir.as_fd(), &leaf, false)?;
         names.push(path);
     }
     Ok(names)
@@ -1115,6 +1123,35 @@ mod tests {
     /// Extraction chowned by the numeric fields alone, so an archive carried
     /// between hosts restored each file to whichever account happened to hold
     /// the originating host's uid -- the problem uname exists to solve.
+    /// A link set's earlier names are moved over to the file just made for
+    /// its data by linking that file's name again. Someone who can rename in
+    /// that directory can put another file at the name first, and the set's
+    /// names became links to it. The link is made to the file made, or not
+    /// at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_link_set_names_move_only_to_the_file_made() {
+        use crate::modes::race_hook::{with_hook, Point};
+        let dir = plib::tmp::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("new"), "data\n").unwrap();
+        std::fs::write(dir.path().join("old"), "").unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let made = id_at(tree.root(), c"new").unwrap();
+        let root = Rc::new(tree.root().try_clone_to_owned().unwrap());
+        let holders = vec![((Rc::clone(&root), c"old".to_owned()), PathBuf::from("old"))];
+
+        let path = dir.path().to_path_buf();
+        let swap = move |point, _: libc::c_int, name: &CStr| {
+            if point == Point::Linking && name == c"new" {
+                std::fs::write(path.join("planted"), "planted\n").unwrap();
+                std::fs::rename(path.join("planted"), path.join("new")).unwrap();
+            }
+        };
+        let moved = with_hook(swap, || move_names_to(holders, root.as_fd(), c"new", made));
+        assert!(moved.is_err(), "linked to the file put in its place");
+        assert_eq!(std::fs::read(dir.path().join("old")).unwrap(), b"");
+    }
+
     #[test]
     fn test_owner_prefers_the_recorded_name_over_the_numeric_id() {
         let euid = unsafe { libc::geteuid() };

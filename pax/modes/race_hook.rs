@@ -30,8 +30,8 @@ pub(crate) enum Point {
     Made,
     /// A directory has just been made at `name` with `mkdirat`.
     MadeDir,
-    /// Copy mode's `-l` is about to link the source `name`, which the walk
-    /// has already examined.
+    /// A hard link is about to be made to the source `name`, which the
+    /// caller has already examined: copy mode's `-l`, a cpio link set's names.
     Linking,
     /// `-l` has just made the link `name` in the destination.
     Linked,

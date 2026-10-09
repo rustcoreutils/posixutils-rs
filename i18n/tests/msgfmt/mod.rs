@@ -559,3 +559,60 @@ msgstr ""
     }
     assert!(dir.path().join("xx.gmo").exists());
 }
+
+/// With -c -v, POSIX compares only the number of conversion specifications
+/// and the argument types of corresponding ones: a flag such as `'` (or
+/// GNU's `I`) changes neither, and a `%n$` conversion is matched by its
+/// argument number, not by where it stands in the text. Each failure names
+/// the file, the line of the msgstr and the msgid. Verdicts are GNU
+/// msgfmt's.
+#[test]
+fn test_msgfmt_check_compares_arguments_not_spelling() {
+    for (msgid, msgstr, refusal) in [
+        ("%d", "%'d", None),
+        ("%d %d", "%Id %d", None),
+        ("%d of %s", "%2$s ... %1$d", None),
+        ("%1$d of %2$s", "%2$s ... %1$d", None),
+        ("%*d", "%*d", None),
+        ("%5.2f%%", "%f %%", None),
+        (
+            "a %d b %s",
+            "x %s y %d",
+            Some("for argument 1 are not the same"),
+        ),
+        (
+            "%d of %s",
+            "%2$d ... %1$s",
+            Some("for argument 1 are not the same"),
+        ),
+        (
+            "%d of %s",
+            "%2$s ... %d",
+            Some("both through absolute argument numbers"),
+        ),
+        ("%d", "%d %d", Some("number of format specifications")),
+        (
+            "%d of %s",
+            "%2$s",
+            Some("refers to argument number 2 but ignores argument number 1"),
+        ),
+        ("%ld", "%d", Some("for argument 1 are not the same")),
+        ("%*d", "%d", Some("number of format specifications")),
+    ] {
+        let (dir, po_path) = create_temp_po_file(&format!(
+            "msgid \"\"\nmsgstr \"Content-Type: text/plain; charset=UTF-8\\n\"\n\n\
+             #, c-format\nmsgid \"{msgid}\"\nmsgstr \"{msgstr}\"\n"
+        ));
+        let po = po_path.to_str().unwrap();
+        let (err, code) = msgfmt_status(dir.path(), &["-c", "-v", "-o", "/dev/null", po]);
+        match refusal {
+            None => assert_eq!(code, 0, "{msgid:?} / {msgstr:?}: {err}"),
+            Some(reason) => {
+                assert_eq!(code, 1, "{msgid:?} / {msgstr:?}: {err}");
+                assert!(err.contains(&format!("{po}:6: error: ")), "{err:?}");
+                assert!(err.contains(reason), "{msgid:?} / {msgstr:?}: {err:?}");
+                assert!(err.contains(&format!("msgid \"{msgid}\"")), "{err:?}");
+            }
+        }
+    }
+}

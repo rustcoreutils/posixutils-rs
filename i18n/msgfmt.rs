@@ -373,12 +373,13 @@ fn validate_entry(
         } else {
             String::new()
         };
+        let line = Some(entry.msgstr_line).filter(|&n| n > 0);
 
         // Abnormality: boundary <newline> mismatch.
         if all && boundary_newline_mismatch(source, msgstr) {
             diagnostics.push(Diagnostic {
                 file: file.clone(),
-                line: None,
+                line,
                 message: format!(
                     "'msgid' and 'msgstr{}' do not both begin/end with '\\n'",
                     suffix
@@ -389,18 +390,11 @@ fn validate_entry(
 
         // Abnormality: c-format conversion specifiers differ in number or type.
         if c_format {
-            // Conversion specifications are ASCII, so the check reads the
-            // message as text; the bytes themselves are untouched.
-            let src_specs = format_signatures(&String::from_utf8_lossy(source));
-            let dst_specs = format_signatures(&String::from_utf8_lossy(msgstr));
-            if src_specs != dst_specs {
+            if let Some(problem) = format_mismatch(source, msgstr, &suffix) {
                 diagnostics.push(Diagnostic {
                     file: file.clone(),
-                    line: None,
-                    message: format!(
-                        "format specifications in 'msgid' and 'msgstr{}' differ",
-                        suffix
-                    ),
+                    line,
+                    message: format!("{problem}: msgid \"{}\"", truncate(&entry.msgid, 60)),
                     is_error: true,
                 });
             }
@@ -418,65 +412,154 @@ fn validate_entry(
     }
 }
 
-/// Normalized signatures of the printf-style conversion specifications in `s`,
-/// in order. Each signature is the length modifier plus an argument-type class,
-/// so the comparison catches both a differing count and differing argument
-/// types (`%d` vs `%s`), while treating equivalents like `%d`/`%i` as the same.
-fn format_signatures(s: &str) -> Vec<String> {
-    let mut sigs = Vec::new();
-    let mut chars = s.chars().peekable();
+/// How the conversion specifications of `msgstr` fail to match those of
+/// `source`, or `None` when they match.
+///
+/// POSIX has `msgfmt -c -v` compare only the number of conversions and the
+/// argument types of corresponding ones. The comparison is by argument, so a
+/// flag or a width does not count, and a `%n$` conversion is matched by its
+/// argument number wherever it stands. A `source` that is no valid format
+/// string has nothing to compare against. The wording is GNU msgfmt's.
+fn format_mismatch(source: &[u8], msgstr: &[u8], suffix: &str) -> Option<String> {
+    let Ok(expected) = format_arguments(source) else {
+        return None;
+    };
+    let found = match format_arguments(msgstr) {
+        Ok(found) => found,
+        Err(reason) => {
+            return Some(format!(
+                "'msgstr{suffix}' is not a valid C format string, unlike 'msgid'. Reason: {reason}"
+            ))
+        }
+    };
+    if expected.len() != found.len() {
+        return Some(format!(
+            "number of format specifications in 'msgid' and 'msgstr{suffix}' does not match"
+        ));
+    }
+    let n = expected.iter().zip(&found).position(|(a, b)| a != b)?;
+    Some(format!(
+        "format specifications in 'msgid' and 'msgstr{suffix}' for argument {} are not the same",
+        n + 1
+    ))
+}
 
-    while let Some(c) = chars.next() {
-        if c != '%' {
+/// The argument types the conversion specifications of `s` consume, in
+/// argument order, or why `s` is no valid C format string.
+///
+/// Each type is the length modifier plus an argument class, so `%d`/`%i`
+/// agree and `%d`/`%ld` do not. A `*` width or precision consumes an `int`.
+fn format_arguments(s: &[u8]) -> Result<Vec<String>, String> {
+    // (argument number when given as `n$`, type), in textual order.
+    let mut uses: Vec<(Option<usize>, String)> = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] != b'%' {
+            i += 1;
             continue;
         }
-        match chars.peek() {
-            Some('%') => {
-                chars.next(); // literal %%
-                continue;
-            }
-            None => break,
-            _ => {}
+        i += 1;
+        if s.get(i) == Some(&b'%') {
+            i += 1;
+            continue;
         }
-
-        // Flags, field width, precision, positional ($) — ignored for typing.
-        while let Some(&c) = chars.peek() {
-            if "-+ #0".contains(c) || c.is_ascii_digit() || c == '.' || c == '*' || c == '$' {
-                chars.next();
+        let number = argument_number(s, &mut i);
+        while i < s.len() && b"-+ #0'I".contains(&s[i]) {
+            i += 1;
+        }
+        // Field width, then precision: digits, or `*` with its own `n$`.
+        for leading in [None, Some(b'.')] {
+            if let Some(dot) = leading {
+                if s.get(i) != Some(&dot) {
+                    continue;
+                }
+                i += 1;
+            }
+            if s.get(i) == Some(&b'*') {
+                i += 1;
+                uses.push((argument_number(s, &mut i), "i".to_string()));
             } else {
-                break;
+                while i < s.len() && s[i].is_ascii_digit() {
+                    i += 1;
+                }
             }
         }
-        // Length modifiers affect the argument type, so keep them.
         let mut length = String::new();
-        while let Some(&c) = chars.peek() {
-            if "hlLjztq".contains(c) {
-                length.push(c);
-                chars.next();
-            } else {
-                break;
-            }
+        while i < s.len() && b"hlLjztq".contains(&s[i]) {
+            length.push(char::from(s[i]));
+            i += 1;
         }
-        // Conversion character.
-        if let Some(conv) = chars.next() {
-            sigs.push(format!("{}{}", length, conversion_class(conv)));
-        }
+        let Some(&conversion) = s.get(i) else {
+            return Err("The string ends in the middle of a directive.".to_string());
+        };
+        i += 1;
+        uses.push((number, format!("{length}{}", conversion_class(conversion))));
     }
 
-    sigs
+    let numbered = uses.iter().filter(|(n, _)| n.is_some()).count();
+    if numbered == 0 {
+        return Ok(uses.into_iter().map(|(_, t)| t).collect());
+    }
+    if numbered != uses.len() {
+        return Err(
+            "The string refers to arguments both through absolute argument numbers \
+                    and through unnumbered argument specifications."
+                .to_string(),
+        );
+    }
+    let max = uses.iter().filter_map(|(n, _)| *n).max().unwrap_or(0);
+    let mut types: Vec<Option<String>> = vec![None; max];
+    for (n, t) in uses {
+        let slot = &mut types[n.unwrap_or(1) - 1];
+        match slot {
+            Some(seen) if *seen != t => {
+                return Err(format!(
+                    "The string refers to argument number {} in incompatible ways.",
+                    n.unwrap_or(1)
+                ))
+            }
+            _ => *slot = Some(t),
+        }
+    }
+    types
+        .into_iter()
+        .enumerate()
+        .map(|(k, t)| {
+            t.ok_or_else(|| {
+                format!(
+                    "The string refers to argument number {max} but ignores argument number {}.",
+                    k + 1
+                )
+            })
+        })
+        .collect()
+}
+
+/// Read an `n$` argument number at `s[*i..]`, stepping past it; `None`, and
+/// `*i` left alone, when there is none. Argument numbers start at 1.
+fn argument_number(s: &[u8], i: &mut usize) -> Option<usize> {
+    let digits = s[*i..].iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || s.get(*i + digits) != Some(&b'$') {
+        return None;
+    }
+    let n: usize = std::str::from_utf8(&s[*i..*i + digits])
+        .ok()?
+        .parse()
+        .ok()?;
+    if n == 0 {
+        return None;
+    }
+    *i += digits + 1;
+    Some(n)
 }
 
 /// Map a printf conversion character to an argument-type class.
-fn conversion_class(c: char) -> char {
+fn conversion_class(c: u8) -> char {
     match c {
-        'd' | 'i' => 'i',
-        'o' | 'u' | 'x' | 'X' => 'u',
-        'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'a' | 'A' => 'f',
-        'c' => 'c',
-        's' => 's',
-        'p' => 'p',
-        'n' => 'n',
-        other => other,
+        b'd' | b'i' => 'i',
+        b'o' | b'u' | b'x' | b'X' => 'u',
+        b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A' => 'f',
+        other => char::from(other),
     }
 }
 

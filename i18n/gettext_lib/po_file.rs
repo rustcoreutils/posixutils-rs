@@ -57,6 +57,9 @@ pub struct PoEntry {
     /// For singular: single element
     /// For plural: multiple elements indexed by plural form
     pub msgstr: Vec<Vec<u8>>,
+    /// The line of the first `msgstr` keyword, where diagnostics about the
+    /// translation point; 0 when there is none.
+    pub msgstr_line: usize,
     /// Whether this entry is marked as fuzzy
     pub is_fuzzy: bool,
     /// Whether this entry is obsolete (#~ ...)
@@ -284,6 +287,7 @@ impl<R: Read> PoParser<R> {
             }
 
             let line = self.next_line()?.unwrap();
+            let line_number = self.line_number;
 
             if let Some(rest) = line.strip_prefix(b"#".as_slice()) {
                 self.parse_comment(&mut entry, rest);
@@ -309,9 +313,13 @@ impl<R: Read> PoParser<R> {
                         entry.msgstr.push(Vec::new());
                     }
                     entry.msgstr[idx] = value;
+                    if entry.msgstr_line == 0 {
+                        entry.msgstr_line = line_number;
+                    }
                 }
             } else if let Some(rest) = line.strip_prefix(b"msgstr".as_slice()) {
                 entry.msgstr = vec![self.parse_string_value(rest)?];
+                entry.msgstr_line = line_number;
             } else if line.starts_with(b"\"") {
                 // Continuation string
                 let value = self.parse_quoted_string(&line)?;

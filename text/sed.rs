@@ -602,6 +602,15 @@ impl Command {
         Ok(())
     }
 
+    /// Whether this command's two-address range has selected the current
+    /// line and has not yet selected its last.
+    fn in_open_range(&mut self) -> bool {
+        let Some((Some(address), _)) = self.get_mut_address() else {
+            return false;
+        };
+        address.0.iter().any(|range| range.active)
+    }
+
     /// Check if [`Command`] apply conditions are met for current line
     fn need_execute(
         &mut self,
@@ -1937,11 +1946,9 @@ impl Sed {
                 }
                 instruction = Some(ControlFlowInstruction::Goto(label.clone()));
             }
-            Command::DeletePatternAndPrintText(address, text) => {
+            Command::DeletePatternAndPrintText(_, text) => {
                 // c
-                if let Ok(next) = self.execute_c(command_position, address, text) {
-                    instruction = next;
-                }
+                instruction = self.execute_c(command_position, text)?;
             }
             Command::DeletePattern(_, to_first_line) => {
                 // dD
@@ -2108,47 +2115,25 @@ impl Sed {
         Ok(instruction)
     }
 
+    /// `c`: delete the pattern space and start the next cycle, first writing
+    /// the text -- except on a line inside a two-address range that is still
+    /// open, so a range writes it once, at its last line (and a range that
+    /// never ends, never).
     fn execute_c(
         &mut self,
         command_position: usize,
-        address: Option<Address>,
         text: String,
     ) -> Result<Option<ControlFlowInstruction>, SedError> {
-        if address.is_none() {
-            // Delete the pattern space and start the next cycle, so there is
-            // nothing to print at the end of this one -- not even the end of
-            // a line, which for an unterminated last line would be owed.
-            self.pattern_space.clear();
-            emit_line(&text);
-            return Ok(Some(ControlFlowInstruction::Continue));
-        } else {
-            let mut need_execute = self.need_execute(command_position)?;
-            if need_execute {
-                emit_line(&text);
-            }
-            loop {
-                need_execute = self.need_execute(command_position)?;
-                if need_execute {
-                    let mut line = self.next_line.clone();
-                    self.next_line = self.read_line()?;
-                    self.is_last_line = self.next_line.is_empty();
-                    self.current_line += 1;
-                    if line.is_empty() {
-                        break;
-                    }
-                    if line.ends_with(b"\n") {
-                        line.pop();
-                        self.current_end = Some("\n".to_string());
-                    } else {
-                        self.current_end = None;
-                    }
-                    self.pattern_space = line;
-                } else {
-                    break;
-                }
-            }
+        if !self.need_execute(command_position)? {
+            return Ok(None);
         }
-        Ok(None)
+        if !self.script.0[command_position].in_open_range() {
+            emit_line(&text);
+        }
+        // Nothing is left to print at the end of the cycle -- not even the
+        // end of a line, which for an unterminated last line would be owed.
+        self.pattern_space.clear();
+        Ok(Some(ControlFlowInstruction::Continue))
     }
 
     fn execute_d(&mut self, to_first_line: bool) -> Option<ControlFlowInstruction> {

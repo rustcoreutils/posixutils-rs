@@ -8,6 +8,7 @@
 //
 
 mod bytes;
+mod change;
 mod files;
 mod inplace;
 mod options;

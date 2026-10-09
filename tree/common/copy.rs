@@ -2006,16 +2006,10 @@ where
             prompt_fn,
         ) {
             Ok(copy_result) => {
-                match &copy_result {
-                    CopyResult::CopyingDirectory(DirOrigin::Made) => {
-                        report_copied(cfg, source.path().as_inner(), &target, true)
-                    }
-                    CopyResult::CopiedFile(_) => {
-                        report_copied(cfg, source.path().as_inner(), &target, false)
-                    }
-                    // A directory copied into was not made by this copy.
-                    CopyResult::CopyingDirectory(DirOrigin::Found { .. }) | CopyResult::Skipped => {
-                    }
+                // A directory this copy made is reported once it is opened and checked to be
+                // the one made, below; one copied into was not made by this copy.
+                if let CopyResult::CopiedFile(_) = &copy_result {
+                    report_copied(cfg, source.path().as_inner(), &target, false);
                 }
                 // Record where this inode landed only if a file was actually created there.
                 // Recording a skipped copy pointed a later hard link at a target that does
@@ -2097,6 +2091,7 @@ where
                                 let fd = ftw::FileDescriptor::from(fd);
                                 let md = fd_metadata(fd.as_raw_fd())?;
                                 made_dirs.borrow_mut().insert((md.dev(), md.ino()), trust);
+                                report_copied(cfg, source.path().as_inner(), &target, true);
                                 Ok((fd, md))
                             }),
                         };

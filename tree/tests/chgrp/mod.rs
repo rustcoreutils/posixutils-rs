@@ -54,14 +54,13 @@ static GROUPS: RwLock<Groups> = RwLock::new(Groups {
 fn get_group_id(name: &str) -> u32 {
     match plib::group::get_by_name(name) {
         Some(group) => group.gid,
-        None => panic!("Group name not found: {name}"),
+        None => panic!("Group name not found"),
     }
 }
 
 /// The name of `gid`, which the test needs as text.
 fn group_name(gid: u32) -> String {
-    let group = plib::group::get_by_gid(gid)
-        .unwrap_or_else(|| panic!("Unable to get group entry for group id {gid}"));
+    let group = plib::group::get_by_gid(gid).expect("Unable to get group entry");
     group.name.into_string().unwrap()
 }
 

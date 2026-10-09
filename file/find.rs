@@ -15,7 +15,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gettextrs::gettext;
 use plib::modestr;
@@ -590,6 +590,15 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
             })?;
             Ok(Expr::Primary(Primary::Newer(mtime)))
         }
+        "-newermt" => {
+            let date = get_arg(tokens, idx, "-newermt")?;
+            Ok(Expr::Primary(Primary::Newer(parse_newermt_date(date)?)))
+        }
+        // GNU's other -newerXY forms compare access, change or birth times, or take the time
+        // from a file; none is used by what this find has to build.
+        t if t.len() == "-newerXY".len() && t.starts_with("-newer") => Err(format!(
+            "{t}: only -newermt is supported of the -newerXY forms"
+        )),
         "-nouser" => Ok(Expr::Primary(Primary::NoUser)),
         "-true" => Ok(Expr::Primary(Primary::Const(true))),
         "-false" => Ok(Expr::Primary(Primary::Const(false))),
@@ -822,6 +831,19 @@ fn parse_printf_format(format: &str) -> Result<Vec<PrintfItem>, String> {
 }
 
 /// Get the next argument or return an error
+/// The instant `-newermt DATE` names, read as `touch -d` and `date -d` read a date (a date
+/// without a zone is local time).
+fn parse_newermt_date(date: &str) -> Result<SystemTime, String> {
+    let (secs, nanos) = plib::date_arg::parse(date, plib::date_arg::Zoneless::Local)?;
+    let since_epoch = Duration::new(secs.unsigned_abs(), nanos);
+    let instant = if secs >= 0 {
+        UNIX_EPOCH.checked_add(since_epoch)
+    } else {
+        UNIX_EPOCH.checked_sub(since_epoch)
+    };
+    instant.ok_or_else(|| format!("invalid date format: '{date}'"))
+}
+
 fn get_arg<'a>(tokens: &[&'a str], idx: &mut usize, primary: &str) -> Result<&'a str, String> {
     if *idx >= tokens.len() {
         return Err(format!("{} requires an argument", primary));

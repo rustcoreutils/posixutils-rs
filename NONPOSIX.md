@@ -361,6 +361,11 @@ table is present.
 
  * `-ipath pattern` — case-insensitive `-path`.  POSIX.1-2024 added `-iname`
    only.
+ * `-newermt date` — true if the file was modified after `date`, read as
+   `touch -d` and `date -d` read one (ISO 8601, RFC 5322 as in a Debian
+   changelog, `@SECONDS`); not GNU's free-form dates.  The other `-newerXY`
+   forms are refused.  binutils' Debian rules run
+   `find ... -depth -newermt '$(BUILD_DATE)' -print0`.
  * With no path operand, `.` is searched.  POSIX requires at least one path.
  * `-mindepth n` / `-maxdepth n` — global options, as in GNU find: wherever
    they appear, entries shallower than `n` are walked but not evaluated, and

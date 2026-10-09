@@ -8,6 +8,7 @@
 //
 
 mod debhelper;
+mod newermt;
 mod race;
 
 use std::fs::{remove_file, File};

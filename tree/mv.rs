@@ -11,7 +11,7 @@
 mod common;
 mod remove_moved;
 
-use self::common::{copy_moved_file, error_string};
+use self::common::{copy_moved_file, error_string, quote, Verbose};
 use clap::Parser;
 use common::{
     Anchor, CopiedSources, CopyConfig, DerefMode, Destination, InodeMap, MoveSource, PinnedDir,
@@ -37,6 +37,9 @@ struct Args {
     #[arg(short, long, overrides_with_all = ["force", "interactive"], help = gettext("Prompt for confirmation if the destination path exists"))]
     interactive: bool,
 
+    #[arg(short, long, help = gettext("Write the name of each file moved"))]
+    verbose: bool,
+
     // `PathBuf` instead of `String` avoids the inefficient reconverting of a
     // `String` to a `&Path` when calling the `std::fs` functions. It also
     // facilitates processing filenames that are non-UTF8 but are still valid in
@@ -49,6 +52,7 @@ struct MvConfig {
     force: bool,
     interactive: bool,
     is_terminal: bool,
+    verbose: bool,
 }
 
 impl MvConfig {
@@ -57,6 +61,7 @@ impl MvConfig {
             force: args.force,
             interactive: args.interactive,
             is_terminal: io::stdin().is_terminal(),
+            verbose: args.verbose,
         }
     }
 }
@@ -81,8 +86,8 @@ struct CopiedOperand {
 impl CopiedOperand {
     /// Remove the source hierarchy the copy duplicated, and with it the pin on its directory.
     /// Returns whether all of it was removed; what was not has been reported.
-    fn remove(self, inode_map: &mut InodeMap) -> bool {
-        remove_moved_source(&self.source, &self.copied, inode_map)
+    fn remove(self, inode_map: &mut InodeMap, verbose: bool) -> bool {
+        remove_moved_source(&self.source, &self.copied, inode_map, verbose)
     }
 }
 
@@ -102,6 +107,7 @@ fn copy_hierarchy(
     dst: &PinnedEntry,
     inode_map: &mut InodeMap,
     created_files: &mut HashSet<PathBuf>,
+    verbose: bool,
 ) -> io::Result<CopiedOperand> {
     let copy_cfg = CopyConfig {
         // `mv` already asked its own POSIX step-1 question (108060-108064) and step 5 removed the
@@ -124,6 +130,7 @@ fn copy_hierarchy(
         // Step 5 removed the destination, or found none: anything at its name now appeared
         // during the move, and is neither written into nor filled.
         destination: Destination::MustCreate,
+        verbose: verbose.then_some(Verbose::Move),
     };
 
     let mut copied = CopiedSources::default();
@@ -338,7 +345,15 @@ fn move_file_deciding(
         Replace::Never
     };
     match rename_pinned(&source_entry, target_entry, replace) {
-        Ok(_) => return Ok(Moved::Done),
+        Ok(_) => {
+            if cfg.verbose {
+                println!(
+                    "{}",
+                    gettext!("renamed {} -> {}", quote(source), quote(target))
+                );
+            }
+            return Ok(Moved::Done);
+        }
         Err(e) if decide_again(&e, replace, decision) => {
             // It appeared: decide again, now about the file that is there -- the prompt, -f
             // and the type checks all apply to it as to any existing destination.
@@ -434,6 +449,7 @@ fn move_file_deciding(
         target_entry,
         inode_map,
         created_files,
+        cfg.verbose,
     )
     .map_err(err_inter_device)?;
 
@@ -592,7 +608,7 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
                         // preserved -- later names link to the destination's copy, not to the
                         // source.
                         if let Moved::Copied(copied) = moved {
-                            if !copied.remove(&mut inode_map) {
+                            if !copied.remove(&mut inode_map, cfg.verbose) {
                                 result = None;
                             }
                         }
@@ -707,7 +723,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(Moved::Done) => Ok(()),
             // 7. Remove source file hierarchy
             Ok(Moved::Copied(copied)) => {
-                if !copied.remove(&mut dummy) {
+                if !copied.remove(&mut dummy, cfg.verbose) {
                     std::process::exit(1);
                 }
                 Ok(())

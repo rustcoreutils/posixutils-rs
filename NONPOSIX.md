@@ -222,6 +222,11 @@ dh_installexamples), with GNU cp's meaning:
    with `-l` follows every symbolic link unless `-P` is given, `-R -l` follows
    only what `-H` or `-L` asks for, as `-R` does without `-l`: a link found
    in the walk is itself given the new name.
+ * `-v` / `--verbose` — write `'source' -> 'dest'` to standard output for
+   each file copied or linked and each directory made (not one copied into),
+   and `source -> dest` unquoted for each directory `--parents` makes, names
+   quoted as GNU coreutils quotes them.  sysvinit installs with
+   `cp -afv etc/* $(DESTDIR)...`.
 
 ### cpio
 
@@ -503,6 +508,16 @@ The two GNU checks po4a runs on every PO file
  * `--statistics` — print the translated / fuzzy / untranslated counts to
    standard error, as `-v` does, in GNU's wording.  gettext's `po.m4` keeps a
    msgfmt only if `msgfmt --statistics /dev/null` succeeds.
+
+### mv
+
+ * `-v` / `--verbose` — write `renamed 'source' -> 'dest'` to standard
+   output for each operand renamed.  A move across filesystems writes, in
+   GNU's wording, `created directory 'dest'` for each directory made,
+   `copied 'source' -> 'dest'` for each file copied, then `removed 'source'`
+   and `removed directory 'source'` for each one removed.  Names are quoted
+   as GNU coreutils quotes them.  findutils' build runs
+   `mv -v bin/$i bin/$i.findutils`.
 
 ### newgrp
 

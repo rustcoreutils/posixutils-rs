@@ -11,7 +11,7 @@ mod common;
 mod parents;
 
 use self::common::{
-    copy_file, copy_files, error_string, CopyConfig, DerefMode, Destination, InodeMap,
+    copy_file, copy_files, error_string, CopyConfig, DerefMode, Destination, InodeMap, Verbose,
 };
 use clap::Parser;
 use gettextrs::gettext;
@@ -103,6 +103,9 @@ struct Args {
     #[arg(long, help = gettext("Append each source path to the target directory, creating missing directories"))]
     parents: bool,
 
+    #[arg(short, long, help = gettext("Write the name of each file copied and directory made"))]
+    verbose: bool,
+
     #[arg(help = gettext("Source(s) and target of move(s)"))]
     files: Vec<PathBuf>,
 }
@@ -144,6 +147,7 @@ impl CopyConfig {
             // POSIX cp continues with same-level/ancestor files after a per-file failure.
             continue_on_error: true,
             destination: Destination::MayExist,
+            verbose: args.verbose.then_some(Verbose::Copy),
         }
     }
 }

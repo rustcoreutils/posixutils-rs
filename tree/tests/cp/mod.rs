@@ -17,6 +17,7 @@ mod link;
 mod old_kernel;
 mod race;
 mod umask;
+mod verbose;
 
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;

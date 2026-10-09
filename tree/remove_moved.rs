@@ -17,7 +17,7 @@
 //! duplicate -- an entry added since, a file written to or replaced since -- is left where it
 //! is and reported, and so is every directory still holding one.
 
-use crate::common::{error_string, CopiedSources, InodeMap, PinnedEntry};
+use crate::common::{error_string, quote, CopiedSources, InodeMap, PinnedEntry};
 use gettextrs::gettext;
 use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
 
@@ -47,6 +47,7 @@ pub fn remove_moved_source(
     source: &PinnedEntry,
     copied: &CopiedSources,
     inode_map: &mut InodeMap,
+    verbose: bool,
 ) -> bool {
     let removal = RefCell::new(Removal::default());
 
@@ -67,8 +68,13 @@ pub fn remove_moved_source(
         }
         if unsafe { libc::unlinkat(entry.dir_fd(), entry.file_name().as_ptr(), 0) } != 0 {
             removal.leave(cannot_remove(&entry, &io::Error::last_os_error()));
-        } else if md.nlink() <= 1 {
+            return Ok(false);
+        }
+        if md.nlink() <= 1 {
             inode_map.remove(&(md.dev(), md.ino()));
+        }
+        if verbose {
+            println!("{}", gettext!("removed {}", quote(entry.path().as_inner())));
         }
         Ok(false)
     };
@@ -78,7 +84,10 @@ pub fn remove_moved_source(
         // A directory that could not be read was reported by `err_reporter`.
         if exit == ftw::DirExit::Descended {
             let holds_reported = removal.left > left_on_entry;
-            remove_emptied_dir(&entry, holds_reported, &mut removal);
+            if remove_emptied_dir(&entry, holds_reported, &mut removal) && verbose {
+                let shown = quote(entry.path().as_inner());
+                println!("{}", gettext!("removed directory {}", shown));
+            }
         }
         Ok(())
     };
@@ -105,8 +114,8 @@ pub fn remove_moved_source(
 /// were reported, and the directory has to stay for them).
 ///
 /// The name must still be the directory the walk entered; `AT_REMOVEDIR` then removes it only if
-/// it is empty -- nothing was added since the walk read it.
-fn remove_emptied_dir(entry: &ftw::Entry<'_>, holds_reported: bool, removal: &mut Removal) {
+/// it is empty -- nothing was added since the walk read it. Returns whether it was removed.
+fn remove_emptied_dir(entry: &ftw::Entry<'_>, holds_reported: bool, removal: &mut Removal) -> bool {
     let entered = entry.metadata().map(|md| (md.dev(), md.ino()));
     let current = ftw::Metadata::new(entry.dir_fd(), entry.file_name(), false)
         .ok()
@@ -116,7 +125,7 @@ fn remove_emptied_dir(entry: &ftw::Entry<'_>, holds_reported: bool, removal: &mu
             "not removing '{}': it changed during the move",
             entry.path()
         ));
-        return;
+        return false;
     }
     let ret = unsafe {
         libc::unlinkat(
@@ -126,13 +135,14 @@ fn remove_emptied_dir(entry: &ftw::Entry<'_>, holds_reported: bool, removal: &mu
         )
     };
     if ret == 0 {
-        return;
+        return true;
     }
     let e = io::Error::last_os_error();
     let not_empty = matches!(e.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST));
     if !(not_empty && holds_reported) {
         removal.leave(cannot_remove(entry, &e));
     }
+    false
 }
 
 fn cannot_remove(entry: &ftw::Entry<'_>, e: &io::Error) -> String {

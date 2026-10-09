@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use super::error_string;
 use super::pinned::{CopiedSources, PinnedEntry, SourceState};
+use super::{error_string, quote, Verbose};
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
 pub use plib::madefs::MadeTrust;
@@ -181,6 +181,22 @@ pub struct CopyConfig {
     pub continue_on_error: bool,
     /// What the copy may find at the destination operand itself.
     pub destination: Destination,
+    /// GNU `-v`: write each step done to standard output, in this wording.
+    pub verbose: Option<Verbose>,
+}
+
+/// With `-v`, write to standard output what a copy step just did: `made_dir` when it made the
+/// directory `target`, otherwise when it copied or linked the non-directory `source` there.
+fn report_copied(cfg: &CopyConfig, source: &Path, target: &Path, made_dir: bool) {
+    let line = match (cfg.verbose, made_dir) {
+        (None, _) => return,
+        (Some(Verbose::Copy), _) => gettext!("{} -> {}", quote(source), quote(target)),
+        (Some(Verbose::Move), true) => gettext!("created directory {}", quote(target)),
+        (Some(Verbose::Move), false) => {
+            gettext!("copied {} -> {}", quote(source), quote(target))
+        }
+    };
+    println!("{line}");
 }
 
 /// What a copy may find at its destination operand (not below it).
@@ -1940,6 +1956,10 @@ where
                     &target_filename_cstr,
                 ) {
                     Ok(Linked::ToFirstCopy) => {
+                        // GNU cp lists the link it makes; GNU mv does not.
+                        if cfg.verbose == Some(Verbose::Copy) {
+                            report_copied(cfg, source.path().as_inner(), &target, false);
+                        }
                         // Skip since this file/directory is handled by hard-linking
                         if let Some(copied) = copied.as_deref_mut() {
                             copied.record(source_state);
@@ -1984,6 +2004,17 @@ where
             prompt_fn,
         ) {
             Ok(copy_result) => {
+                match &copy_result {
+                    CopyResult::CopyingDirectory(DirOrigin::Made) => {
+                        report_copied(cfg, source.path().as_inner(), &target, true)
+                    }
+                    CopyResult::CopiedFile(_) => {
+                        report_copied(cfg, source.path().as_inner(), &target, false)
+                    }
+                    // A directory copied into was not made by this copy.
+                    CopyResult::CopyingDirectory(DirOrigin::Found { .. }) | CopyResult::Skipped => {
+                    }
+                }
                 // Record where this inode landed only if a file was actually created there.
                 // Recording a skipped copy pointed a later hard link at a target that does
                 // not exist, and every directory reports nlink > 1, so directories were
@@ -2446,6 +2477,7 @@ mod tests {
             prog: "mv",
             continue_on_error: false,
             destination: super::Destination::MustCreate,
+            verbose: None,
         }
     }
 

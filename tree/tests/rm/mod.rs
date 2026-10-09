@@ -1548,3 +1548,79 @@ fn test_rm_v_quotes_names() {
     );
     assert_eq!(rm_in(&["-dv", "e\nf"]), ["removed directory 'e'$'\\n''f'"]);
 }
+
+/// Operands that are not valid UTF-8 are file names like any other, and every diagnostic shows
+/// a name's bytes quoted as GNU coreutils 9.4 does, not a lossy rendering of them.
+#[test]
+fn test_rm_non_utf8_operands_and_quoted_diagnostics() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path();
+    let rm_in = |args: &[&OsStr]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_rm"))
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+            output.status.code().unwrap_or(-1),
+        )
+    };
+    let os = |s: &'static str| OsStr::new(s);
+
+    // A quote in a name is shown the way the shell would read it back.
+    assert_eq!(
+        rm_in(&[os("it's")]),
+        (
+            String::new(),
+            "rm: cannot remove \"it's\": No such file or directory\n".into(),
+            1
+        )
+    );
+
+    let Some(file) =
+        plib::testing::create_non_utf8(dir, b"x\xffy", |p| fs::File::create(p).map(drop))
+    else {
+        return;
+    };
+    let name = OsStr::from_bytes(b"x\xffy");
+    assert_eq!(
+        rm_in(&[os("-v"), name]),
+        (String::from("removed 'x'$'\\377''y'\n"), String::new(), 0)
+    );
+    assert!(!file.exists());
+    assert_eq!(
+        rm_in(&[name]),
+        (
+            String::new(),
+            "rm: cannot remove 'x'$'\\377''y': No such file or directory\n".into(),
+            1
+        )
+    );
+
+    fs::create_dir(&file).unwrap();
+    assert_eq!(
+        rm_in(&[name]),
+        (
+            String::new(),
+            "rm: cannot remove 'x'$'\\377''y': Is a directory\n".into(),
+            1
+        )
+    );
+    let dot = OsStr::from_bytes(b"x\xffy/.");
+    assert_eq!(
+        rm_in(&[os("-r"), dot]),
+        (
+            String::new(),
+            "rm: refusing to remove '.' or '..' directory: skipping 'x'$'\\377''y/.'\n".into(),
+            1
+        )
+    );
+    assert_eq!(rm_in(&[os("-d"), name]), (String::new(), String::new(), 0));
+    assert!(!file.exists());
+}

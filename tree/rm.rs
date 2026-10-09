@@ -15,14 +15,14 @@ use ftw::{self, traverse_directory};
 use gettextrs::gettext;
 use std::{
     cell::{Cell, RefCell},
-    ffi::{CStr, CString},
+    ffi::{CStr, CString, OsString},
     fs,
     io::{self, IsTerminal},
     os::{
         fd::AsRawFd,
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 /// rm - remove directory entries
@@ -44,13 +44,9 @@ struct Args {
     #[arg(short, long, help = gettext("Write the name of each removed file to standard output"))]
     verbose: bool,
 
-    #[arg(value_parser = parse_pathbuf, help = gettext("Filepaths to remove"))]
-    files: Vec<PathBuf>,
-}
-
-// Parser for `PathBuf` that allows empty strings
-fn parse_pathbuf(s: &str) -> Result<PathBuf, String> {
-    Ok(PathBuf::from(s))
+    // Any bytes but NUL, the empty string included.
+    #[arg(value_parser = clap::builder::ValueParser::os_string(), help = gettext("Filepaths to remove"))]
+    files: Vec<OsString>,
 }
 
 struct RmConfig {
@@ -71,13 +67,24 @@ fn prompt_user(prompt: &str) -> bool {
     plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
 }
 
-// Simplifies trailing slashes
-fn display_cleaned(filepath: &Path) -> String {
-    let mut s = format!("{}", filepath.display());
-    while s.ends_with("//") {
-        s.pop();
+/// `filepath`'s bytes with any run of trailing slashes reduced to one.
+fn cleaned_bytes(filepath: &Path) -> &[u8] {
+    let mut name = filepath.as_os_str().as_bytes();
+    while name.ends_with(b"//") {
+        name = &name[..name.len() - 1];
     }
-    s
+    name
+}
+
+/// `filepath` as diagnostics, prompts and `-v` show it: trailing slashes reduced to one, and
+/// quoted as cp and mv quote names, so that every byte of it comes out unambiguous.
+fn display_cleaned(filepath: &Path) -> String {
+    quote_bytes(cleaned_bytes(filepath))
+}
+
+/// The path of a walked entry, shown as `display_cleaned` shows an operand.
+fn entry_shown(entry: &ftw::Entry) -> String {
+    display_cleaned(entry.path().as_inner())
 }
 
 /// Whether `e` only says that the file is not there, which with `-f` is no error and no
@@ -94,14 +101,10 @@ fn ask_for_prompt(cfg: &RmConfig, writable: bool) -> bool {
 
 // With `-v`, write the name of each removed entry to standard output (format unspecified by POSIX;
 // matches the `removed '…'` / `removed directory '…'` wording of common implementations), quoted
-// as cp and mv quote names, trailing slashes reduced to one as in diagnostics.
+// as diagnostics show names (`display_cleaned`).
 fn report_removed(cfg: &RmConfig, is_dir: bool, path: &Path) {
     if cfg.args.verbose {
-        let mut name = path.as_os_str().as_bytes();
-        while name.ends_with(b"//") {
-            name = &name[..name.len() - 1];
-        }
-        let name = quote_bytes(name);
+        let name = display_cleaned(path);
         let msg = if is_dir {
             gettext!("removed directory {}", name)
         } else {
@@ -118,7 +121,7 @@ fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
     let dot_dotdot_pattern = regex::bytes::Regex::new(r"(?:^|/)\.{1,2}/*$").unwrap();
     if dot_dotdot_pattern.is_match(filepath.as_os_str().as_bytes()) {
         let err_str = gettext!(
-            "refusing to remove '.' or '..' directory: skipping '{}'",
+            "refusing to remove '.' or '..' directory: skipping {}",
             display_cleaned(filepath)
         );
         return Err(io::Error::other(err_str));
@@ -127,7 +130,7 @@ fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
     if let Ok(abspath) = fs::canonicalize(filepath) {
         if abspath.as_os_str() == "/" {
             return Err(io::Error::other(dangerous_root_message(
-                &filepath.display().to_string(),
+                filepath.as_os_str().as_bytes(),
             )));
         }
     }
@@ -136,13 +139,13 @@ fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
 }
 
 /// The refusal of an operand that is the root directory, named as `shown`.
-fn dangerous_root_message(shown: &str) -> String {
-    if shown == "/" {
+fn dangerous_root_message(shown: &[u8]) -> String {
+    if shown == b"/" {
         gettext("it is dangerous to operate recursively on '/'")
     } else {
         gettext!(
-            "it is dangerous to operate recursively on '{}' (same as '/')",
-            shown
+            "it is dangerous to operate recursively on {} (same as '/')",
+            quote_bytes(shown)
         )
     }
 }
@@ -171,14 +174,11 @@ fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry) -> bool {
     let writable = entry.is_writable();
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
-            gettext!(
-                "descend into directory '{}'?",
-                entry.path().clean_trailing_slashes()
-            )
+            gettext!("descend into directory {}?", entry_shown(entry))
         } else {
             gettext!(
-                "descend into write-protected directory '{}'?",
-                entry.path().clean_trailing_slashes()
+                "descend into write-protected directory {}?",
+                entry_shown(entry)
             )
         };
         if !prompt_user(&prompt) {
@@ -192,15 +192,9 @@ fn should_remove_directory(cfg: &RmConfig, entry: &ftw::Entry) -> bool {
     let writable = entry.is_writable();
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
-            gettext!(
-                "remove directory '{}'?",
-                entry.path().clean_trailing_slashes()
-            )
+            gettext!("remove directory {}?", entry_shown(entry))
         } else {
-            gettext!(
-                "remove write-protected directory '{}'?",
-                entry.path().clean_trailing_slashes(),
-            )
+            gettext!("remove write-protected directory {}?", entry_shown(entry),)
         };
         if !prompt_user(&prompt) {
             return false;
@@ -226,44 +220,44 @@ where
         let file_type = metadata.file_type();
         let prompt = match file_type {
             ftw::FileType::Socket => {
-                gettext!("remove socket '{}'?", filename_fn())
+                gettext!("remove socket {}?", filename_fn())
             }
             ftw::FileType::SymbolicLink => {
-                gettext!("remove symbolic link '{}'?", filename_fn())
+                gettext!("remove symbolic link {}?", filename_fn())
             }
             ftw::FileType::BlockDevice => {
-                gettext!("remove block special file '{}'?", filename_fn())
+                gettext!("remove block special file {}?", filename_fn())
             }
             ftw::FileType::CharacterDevice => {
-                gettext!("remove character special file '{}'?", filename_fn())
+                gettext!("remove character special file {}?", filename_fn())
             }
             ftw::FileType::Fifo => {
-                gettext!("remove fifo '{}'?", filename_fn())
+                gettext!("remove fifo {}?", filename_fn())
             }
             ftw::FileType::RegularFile => {
                 let is_empty = metadata.size() == 0;
                 if writable {
                     if is_empty {
-                        gettext!("remove regular empty file '{}'?", filename_fn())
+                        gettext!("remove regular empty file {}?", filename_fn())
                     } else {
-                        gettext!("remove regular file '{}'?", filename_fn())
+                        gettext!("remove regular file {}?", filename_fn())
                     }
                 } else if is_empty {
                     gettext!(
-                        "remove write-protected regular empty file '{}'?",
+                        "remove write-protected regular empty file {}?",
                         filename_fn()
                     )
                 } else {
-                    gettext!("remove write-protected regular file '{}'?", filename_fn())
+                    gettext!("remove write-protected regular file {}?", filename_fn())
                 }
             }
             // Directories are handled by the caller before reaching here; fall back to a generic
             // prompt rather than panicking if that ever changes.
             ftw::FileType::Directory => {
-                gettext!("remove directory '{}'?", filename_fn())
+                gettext!("remove directory {}?", filename_fn())
             }
             ftw::FileType::Unknown => {
-                gettext!("remove '{}'?", filename_fn())
+                gettext!("remove {}?", filename_fn())
             }
         };
 
@@ -297,14 +291,14 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
                 }
                 let err_str = if let Err(e1) = dir_is_empty {
                     gettext!(
-                        "cannot remove '{}': {}",
-                        entry.path().clean_trailing_slashes(),
+                        "cannot remove {}: {}",
+                        entry_shown(entry),
                         error_string(&e1)
                     )
                 } else {
                     gettext!(
-                        "cannot remove directory '{}': {}",
-                        entry.path().clean_trailing_slashes(),
+                        "cannot remove directory {}: {}",
+                        entry_shown(entry),
                         error_string(&e2)
                     )
                 };
@@ -333,7 +327,7 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
 fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     if !cfg.args.recurse {
         let err_str = gettext!(
-            "cannot remove '{}': Is a directory",
+            "cannot remove {}: Is a directory",
             display_cleaned(filepath)
         );
         return Err(io::Error::other(err_str));
@@ -346,7 +340,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     // the removal is refused rather than walked unguarded.
     if cfg.root_identity.is_none() {
         let err_str = gettext!(
-            "cannot remove '{}': the root directory could not be identified",
+            "cannot remove {}: the root directory could not be identified",
             display_cleaned(filepath)
         );
         return Err(io::Error::other(err_str));
@@ -455,16 +449,16 @@ fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<Walked, ()> {
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot remove '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot remove {}: {}",
+                    entry_shown(entry),
                     error_string(&io::Error::from_raw_os_error(libc::ENOTDIR))
                 )
             );
             return Err(());
         }
         if is_root_directory(cfg, md) {
-            let shown = entry.path().clean_trailing_slashes();
-            eprintln!("rm: {}", dangerous_root_message(&shown));
+            let path = entry.path();
+            eprintln!("rm: {}", dangerous_root_message(cleaned_bytes(&path)));
             return Err(());
         }
         match process_directory(cfg, entry) {
@@ -515,15 +509,11 @@ fn remove_left_directory(
             // one was kept at its prompt.
             let not_empty = matches!(e.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST));
             let err_str = if not_empty {
-                gettext!(
-                    "cannot remove '{}': {}",
-                    entry.path().clean_trailing_slashes(),
-                    error_string(&e)
-                )
+                gettext!("cannot remove {}: {}", entry_shown(entry), error_string(&e))
             } else {
                 gettext!(
-                    "cannot remove directory '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot remove directory {}: {}",
+                    entry_shown(entry),
                     error_string(&e)
                 )
             };
@@ -544,8 +534,8 @@ fn report_walk_error(entry: &ftw::Entry, kind: ftw::ErrorKind, error: &io::Error
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot access directory '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot access directory {}: {}",
+                    entry_shown(entry),
                     error_string(error)
                 )
             );
@@ -553,18 +543,15 @@ fn report_walk_error(entry: &ftw::Entry, kind: ftw::ErrorKind, error: &io::Error
         ftw::ErrorKind::ReadDir => {
             eprintln!(
                 "rm: {}",
-                gettext!(
-                    "error accessing directory entry: {}",
-                    entry.path().clean_trailing_slashes(),
-                )
+                gettext!("error accessing directory entry: {}", entry_shown(entry),)
             );
         }
         ftw::ErrorKind::Stat | ftw::ErrorKind::Cycle => {
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot remove '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot remove {}: {}",
+                    entry_shown(entry),
                     error_string(error)
                 )
             );
@@ -573,8 +560,8 @@ fn report_walk_error(entry: &ftw::Entry, kind: ftw::ErrorKind, error: &io::Error
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot remove '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot remove {}: {}",
+                    entry_shown(entry),
                     error_string(error)
                 )
             );
@@ -584,8 +571,8 @@ fn report_walk_error(entry: &ftw::Entry, kind: ftw::ErrorKind, error: &io::Error
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot read symbolic link '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot read symbolic link {}: {}",
+                    entry_shown(entry),
                     error_string(error)
                 )
             );
@@ -667,7 +654,7 @@ fn remove_nondir_at(
         if is_already_gone(cfg, &e) {
             return Ok(());
         }
-        let err_str = gettext!("cannot remove '{}': {}", shown(), error_string(&e));
+        let err_str = gettext!("cannot remove {}: {}", shown(), error_string(&e));
         return Err(io::Error::other(err_str));
     }
     report_removed(cfg, false, path);
@@ -687,10 +674,10 @@ fn rm_dir_empty(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     let writable = ftw::is_writable_at(libc::AT_FDCWD, &filename_cstr);
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
-            gettext!("remove directory '{}'?", display_cleaned(filepath))
+            gettext!("remove directory {}?", display_cleaned(filepath))
         } else {
             gettext!(
-                "remove write-protected directory '{}'?",
+                "remove write-protected directory {}?",
                 display_cleaned(filepath)
             )
         };
@@ -704,7 +691,7 @@ fn rm_dir_empty(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
         Err(e) if is_already_gone(cfg, &e) => (),
         Err(e) => {
             let err_str = gettext!(
-                "cannot remove '{}': {}",
+                "cannot remove {}: {}",
                 display_cleaned(filepath),
                 error_string(&e)
             );
@@ -724,7 +711,7 @@ fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                 return Ok(true);
             } else {
                 let err_str = gettext!(
-                    "cannot remove '{}': {}",
+                    "cannot remove {}: {}",
                     display_cleaned(filepath),
                     error_string(&e)
                 );
@@ -772,7 +759,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for filepath in &cfg.args.files {
-        match rm_path(&cfg, filepath) {
+        match rm_path(&cfg, Path::new(filepath)) {
             Ok(success) => {
                 if !success {
                     exit_code = 1;

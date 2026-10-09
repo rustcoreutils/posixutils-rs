@@ -407,3 +407,78 @@ fn test_copy_trusts_no_destination_reached_through_a_link_others_could_plant() {
         }
     }
 }
+
+/// Run pax with `args` in `dir` under umask 002.
+fn pax_umask_002(dir: &Path, args: &[&str]) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pax"));
+    command.args(args).current_dir(dir).stdin(Stdio::null());
+    // SAFETY: umask is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+/// The modification time of `path`, in seconds.
+fn mtime_of(path: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).unwrap().mtime()
+}
+
+/// Set the modification time of the directory or file `path`.
+fn set_mtime(path: &Path, time: std::time::SystemTime) {
+    fs::File::open(path).unwrap().set_modified(time).unwrap();
+}
+
+/// A tree made under a umask of 002 -- every directory group-writable, of the
+/// user's private group, as Debian-style user private groups intend -- and
+/// extracted again with -p e: every directory found there is the user's alone,
+/// so each takes the member's times and mode, with no diagnostic and exit 0.
+/// Any group-writable directory on the way used to leave every directory
+/// found below it untouched, with "not applying owner, mode or times" and
+/// exit 1.
+#[test]
+fn test_pe_reextracts_a_umask_002_tree_of_the_users_private_group() {
+    if plib::testing::user_private_group().is_none() {
+        eprintln!("note: this host gives the user no private group; test skipped");
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dirs = ["t", "t/a", "t/a/b"];
+    fs::create_dir_all(src.join("t/a/b")).unwrap();
+    fs::write(src.join("t/a/b/f"), "data\n").unwrap();
+    let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(978_307_200);
+    for dir in dirs.iter().rev() {
+        fs::set_permissions(src.join(dir), fs::Permissions::from_mode(0o775)).unwrap();
+        set_mtime(&src.join(dir), then);
+    }
+    let out = pax(&src, &["-w", "-f", "../a.tar", "t"]);
+    assert!(out.status.success(), "pax -w");
+    let archive = temp.path().join("a.tar");
+    let archive = archive.to_str().unwrap();
+
+    let dest = temp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o775)).unwrap();
+    let out = pax_umask_002(&dest, &["-r", "-f", archive]);
+    assert!(out.status.success(), "first extraction");
+    let now = std::time::SystemTime::now();
+    for dir in dirs {
+        assert_eq!(mode_of(&dest.join(dir)), 0o775, "{dir}");
+        set_mtime(&dest.join(dir), now);
+    }
+
+    let out = pax_umask_002(&dest, &["-r", "-p", "e", "-f", archive]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains(DIAGNOSTIC), "stderr: {stderr}");
+    for dir in dirs {
+        assert_eq!(mtime_of(&dest.join(dir)), 978_307_200, "{dir}: times");
+        assert_eq!(mode_of(&dest.join(dir)), 0o775, "{dir}: mode");
+    }
+}

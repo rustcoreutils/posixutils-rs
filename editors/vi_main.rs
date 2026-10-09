@@ -13,7 +13,6 @@
 //! The mode is determined by argv[0]: if it ends with "ex",
 //! the editor starts in ex (line) mode; otherwise in visual mode.
 
-use std::env;
 use std::process;
 use vi_rs::{run_editor, InvokedAs};
 
@@ -21,7 +20,7 @@ fn main() {
     let invoked_as = InvokedAs::detect();
     plib::diag::init_locale(invoked_as.name());
 
-    let args: Vec<String> = env::args().collect();
+    let args = plib::optarg::args_utf8(invoked_as.name());
     let exit_code = run_editor(invoked_as, &args);
     process::exit(exit_code);
 }

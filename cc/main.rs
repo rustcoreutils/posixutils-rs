@@ -1799,7 +1799,7 @@ fn is_valid_opt_level(s: &str) -> bool {
 /// `@file` response files are expanded first, so the rewriting below, clap and
 /// `linkargs::scan` all read the same, complete argument vector.
 fn preprocess_args() -> Vec<String> {
-    match respfile::expand(std::env::args().collect()).and_then(preprocess_args_from) {
+    match respfile::expand(plib::optarg::args_utf8("c17")).and_then(preprocess_args_from) {
         Ok(argv) => argv,
         Err(e) => {
             eprintln!("c17: {e}");

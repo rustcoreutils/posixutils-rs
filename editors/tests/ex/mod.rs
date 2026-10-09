@@ -1699,3 +1699,31 @@ fn test_ex_bare_bang_without_a_terminal_is_refused() {
         "expected a diagnostic rather than a hang, got {err:?}"
     );
 }
+
+// An argument that is not valid UTF-8 is reported, not a panic.
+#[test]
+fn ex_non_utf8_argument_is_reported() {
+    plib::testing::assert_non_utf8_argument_rejected("ex", &[]);
+}
+
+// An argument that is not valid UTF-8 is reported, not a panic.
+#[test]
+fn vi_non_utf8_argument_is_reported() {
+    plib::testing::assert_non_utf8_argument_rejected("vi", &[]);
+}
+
+// A program name that is not valid UTF-8 still selects ex by its ending;
+// reading it made the editor panic.
+#[test]
+fn ex_invoked_by_non_utf8_name() {
+    use plib::testing::{get_binary_path, os_bytes};
+    let dir = plib::tmp::tempdir().unwrap();
+    let link = dir.path().join(os_bytes(b"\xffex"));
+    std::os::unix::fs::symlink(get_binary_path("vi"), &link).unwrap();
+    let output = std::process::Command::new(&link)
+        .arg("-s")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}

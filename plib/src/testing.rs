@@ -421,6 +421,25 @@ pub fn assert_hyphen_option_argument(cmd: &str, args: &[&str]) -> Output {
     output
 }
 
+/// Run `cmd ARGS... x\xff` and assert that the last argument, which is not
+/// valid UTF-8, is reported by [`crate::optarg::args_utf8`] with status 1
+/// instead of making `cmd` panic.
+#[cfg(unix)]
+pub fn assert_non_utf8_argument_rejected(cmd: &str, args: &[&str]) {
+    let mut argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+    argv.push(os_bytes(b"x\xff"));
+    let output = run_test_base_os(cmd, &argv, b"", &[]);
+    let expected = format!("{cmd}: x\u{FFFD}: argument is not valid UTF-8\n");
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        (Some(1), expected.into()),
+        "{cmd} {argv:?}"
+    );
+}
+
 /// Run `cmd` with an option-argument beginning with '=' attached to the
 /// short option `opt` (`-d=`, `-d=x`) and again as the next word (`-d =`,
 /// `-d =x`), with `rest` after it and `stdin` as input, and assert that the

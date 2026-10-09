@@ -211,6 +211,42 @@ pub fn args_os<T: CommandFactory>() -> Vec<OsString> {
     keep_leading_equals::<T>(std::env::args_os())
 }
 
+/// The command line as text, for a utility that parses it by hand.
+///
+/// `std::env::args` panics on an argument that is not valid UTF-8.  Here one
+/// is reported as `UTILITY: ARG: argument is not valid UTF-8` and the process
+/// exits with status 1, as clap rejects one for the utilities it parses.  A
+/// utility whose operands are pathnames should take them as `OsString`s
+/// instead, through [`args_os`] or `std::env::args_os`.
+pub fn args_utf8(utility: &str) -> Vec<String> {
+    match utf8_words(std::env::args_os()) {
+        Ok(argv) => argv,
+        Err(word) => {
+            eprintln!(
+                "{utility}: {}: {}",
+                word.to_string_lossy(),
+                gettextrs::gettext("argument is not valid UTF-8")
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `argv` as Strings, or the first word that is not valid UTF-8.  `argv[0]`
+/// is only a name and is converted lossily.
+fn utf8_words(argv: impl IntoIterator<Item = OsString>) -> Result<Vec<String>, OsString> {
+    let mut argv = argv.into_iter();
+    let mut words: Vec<String> = argv
+        .next()
+        .map(|name| name.to_string_lossy().into_owned())
+        .into_iter()
+        .collect();
+    for word in argv {
+        words.push(word.into_string()?);
+    }
+    Ok(words)
+}
+
 /// Keep an attached option-argument that begins with '=' whole.
 ///
 /// An option-argument attached to its option letter is everything after the
@@ -410,5 +446,24 @@ mod tests {
         assert_eq!(spell(&["--expr=x", "-i"]), ["--expr=x", "--in-place"]);
         assert_eq!(spell(&["--", "-i"]), ["--", "-i"]);
         assert_eq!(spell(&["-", "-i"]), ["-", "--in-place"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn utf8_words_reports_the_first_non_utf8_word() {
+        use std::os::unix::ffi::OsStringExt;
+        let word = |b: &[u8]| OsString::from_vec(b.to_vec());
+        assert_eq!(
+            super::utf8_words([word(b"prog\xff"), word(b"-a"), word(b"b")]),
+            Ok(vec![
+                "prog\u{FFFD}".to_string(),
+                "-a".to_string(),
+                "b".to_string()
+            ])
+        );
+        assert_eq!(
+            super::utf8_words([word(b"prog"), word(b"x\xfe"), word(b"y\xff")]),
+            Err(word(b"x\xfe"))
+        );
     }
 }

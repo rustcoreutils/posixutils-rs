@@ -2318,3 +2318,9 @@ fn driver_repeated_flag_last_one_wins() {
         "-O2 after -O0 did not enable the optimizer:\n{text}"
     );
 }
+
+// An argument that is not valid UTF-8 is reported, not a panic.
+#[test]
+fn c17_non_utf8_argument_is_reported() {
+    plib::testing::assert_non_utf8_argument_rejected("c17", &[]);
+}

@@ -9,6 +9,8 @@
 
 //! Integration tests for yacc
 
+mod args;
+
 use plib::tmp::TempDir;
 use std::fs;
 use std::process::Command;

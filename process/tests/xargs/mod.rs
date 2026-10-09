@@ -746,6 +746,8 @@ fn size_limit_counts_bytes() {
     );
 }
 
+// Linux only: APFS refuses a name that is not valid UTF-8 (EILSEQ).
+#[cfg(target_os = "linux")]
 #[test]
 fn rm_removes_exactly_the_named_non_utf8_files() {
     use std::ffi::OsStr;

@@ -1179,27 +1179,46 @@ pub fn chmod_pinned(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
 /// `/proc`, opened and verified to be procfs (`PROC_SUPER_MAGIC`), so that `self/fd/N` names
 /// exactly the inode open on descriptor N rather than whatever else is mounted or planted there.
 ///
-/// Opened and verified once per process, on the first call, and held open from then on: every
-/// later call hands out the same descriptor, or the same failure. A pinned chmod, link or
-/// reopen used to open `/proc` by name and `fstatfs` it every time, a pair of system calls per
-/// file. Holding the verified descriptor is also safer than reopening by name: what is checked
-/// is what every later lookup goes through, whatever is mounted at `/proc` since. `self`
+/// Opened and verified on the first call that can, and held open from then on: every later
+/// call hands out the same descriptor. A pinned chmod, link or reopen used to open `/proc` by
+/// name and `fstatfs` it every time, a pair of system calls per file. Holding the verified
+/// descriptor is also safer than reopening by name: a lookup made relative to it goes through
+/// what was checked, whatever is mounted at `/proc` since. (`read_xattr` is the exception: no
+/// `*at` form of `getxattr` takes the descriptor, so it still names `/proc` by path.) `self`
 /// resolves to whichever process looks it up, so a child forked after the first call that uses
 /// the descriptor still reaches its own `fd/N`. It is `O_CLOEXEC`, so nothing exec'd inherits
 /// it.
+///
+/// Only a verified answer is kept: the procfs descriptor, or a `/proc` verified to be something
+/// else. A failure that may pass -- a descriptor table full (EMFILE, ENFILE), `/proc` not
+/// mounted yet -- is returned, and the next call tries again.
 #[cfg(target_os = "linux")]
 pub fn procfs_dir() -> io::Result<BorrowedFd<'static>> {
-    static PROC: OnceLock<Result<OwnedFd, (Option<i32>, String)>> = OnceLock::new();
-    match PROC.get_or_init(|| open_procfs().map_err(|e| (e.raw_os_error(), e.to_string()))) {
-        Ok(fd) => Ok(fd.as_fd()),
-        Err((Some(errno), _)) => Err(io::Error::from_raw_os_error(*errno)),
-        Err((None, message)) => Err(io::Error::other(message.clone())),
-    }
+    // `None`: `/proc` was opened, and is not procfs.
+    static PROC: OnceLock<Option<OwnedFd>> = OnceLock::new();
+    let verified = match PROC.get() {
+        Some(verified) => verified,
+        None => {
+            let opened = open_procfs()?;
+            PROC.get_or_init(|| opened)
+        }
+    };
+    verified
+        .as_ref()
+        .map(|fd| fd.as_fd())
+        .ok_or_else(not_procfs)
 }
 
-/// Open `/proc` and verify it is procfs (`procfs_dir`).
+/// The failure for a `/proc` that is not procfs.
 #[cfg(target_os = "linux")]
-fn open_procfs() -> io::Result<OwnedFd> {
+fn not_procfs() -> io::Error {
+    io::Error::other(gettext("/proc is not a procfs mount"))
+}
+
+/// Open `/proc` and verify it is procfs (`procfs_dir`): the descriptor, or `None` for a
+/// `/proc` that is something else.
+#[cfg(target_os = "linux")]
+fn open_procfs() -> io::Result<Option<OwnedFd>> {
     const PROC_SUPER_MAGIC: u32 = 0x9fa0;
     let fd = unsafe {
         libc::open(
@@ -1216,10 +1235,8 @@ fn open_procfs() -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     // `f_type` is a signed word whose width varies by architecture; the magic is its low bits.
-    if unsafe { st.assume_init() }.f_type as u32 != PROC_SUPER_MAGIC {
-        return Err(io::Error::other(gettext("/proc is not a procfs mount")));
-    }
-    Ok(dir)
+    let is_procfs = unsafe { st.assume_init() }.f_type as u32 == PROC_SUPER_MAGIC;
+    Ok(is_procfs.then_some(dir))
 }
 
 /// `self/fd/N`, relative to `procfs_dir`.
@@ -2156,8 +2173,6 @@ mod tests {
         assert_eq!(made_by_us(dir(US, 3), Some(US), US), None);
     }
 
-    /// A made symbolic link's times by name reach only the pinned link, never a hard link to
-    /// another file swapped in for it.
     /// `/proc` is opened and verified once per process: every call hands out
     /// the same descriptor, which stays open and procfs.
     #[cfg(target_os = "linux")]
@@ -2176,6 +2191,51 @@ mod tests {
         assert_eq!(unsafe { st.assume_init() }.f_type as u32, 0x9fa0);
     }
 
+    /// A failure to open `/proc` that may pass -- the descriptor table full
+    /// (EMFILE, ENFILE) -- is not kept for the rest of the process: a later
+    /// call tries again. Run in a child process of its own, so that its first
+    /// call is the process's first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_dir_retries_a_transient_failure() {
+        const CHILD: &str = "PLIB_PROCFS_RETRY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "madefs::tests::procfs_dir_retries_a_transient_failure",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "child: {stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        // Fill the descriptor table under a low limit.
+        let lim = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: 64,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) }, 0);
+        let mut filler = Vec::new();
+        while let Ok(f) = std::fs::File::open("/dev/null") {
+            filler.push(f);
+        }
+        let err = super::procfs_dir().unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+        drop(filler);
+        assert!(super::procfs_dir().is_ok(), "the first failure was kept");
+    }
+
+    /// A made symbolic link's times by name reach only the pinned link, never a hard link to
+    /// another file swapped in for it.
     #[test]
     fn link_times_by_name_reach_only_the_pinned_link() {
         use std::os::fd::AsRawFd;

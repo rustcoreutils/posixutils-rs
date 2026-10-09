@@ -1369,3 +1369,130 @@ fn test_rm_r_trailing_slash_symlink_to_directory() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// Read `stderr` until what it has written ends with `prompt`.
+fn await_prompt(stderr: &mut impl io::Read, seen: &mut Vec<u8>, prompt: &str) {
+    let mut byte = [0u8];
+    while !seen.ends_with(prompt.as_bytes()) {
+        let n = stderr.read(&mut byte).unwrap();
+        assert_eq!(n, 1, "rm exited before asking {prompt:?}: {seen:?}");
+        seen.push(byte[0]);
+    }
+}
+
+/// A directory that gains an entry while `rm -r` empties it is not removed, and rm says so:
+/// rmdir's ENOTEMPTY is no error only for a directory that holds something rm already reported
+/// or was told to keep. The entry is added while rm waits for the answer to the directory's
+/// own prompt, so the order is fixed.
+#[test]
+fn test_rm_r_dir_that_gained_an_entry_is_reported() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let d = &format!("{}/d", tmp.path().display());
+    fs::create_dir(d).unwrap();
+    fs::write(format!("{d}/f"), b"f").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rm"))
+        .args(["-ri", d])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut seen = Vec::new();
+
+    await_prompt(
+        &mut stderr,
+        &mut seen,
+        &format!("descend into directory '{d}'? "),
+    );
+    stdin.write_all(b"y\n").unwrap();
+    await_prompt(
+        &mut stderr,
+        &mut seen,
+        &format!("remove regular file '{d}/f'? "),
+    );
+    stdin.write_all(b"y\n").unwrap();
+    await_prompt(&mut stderr, &mut seen, &format!("remove directory '{d}'? "));
+    fs::write(format!("{d}/new"), b"new").unwrap();
+    stdin.write_all(b"y\n").unwrap();
+    drop(stdin);
+
+    io::Read::read_to_end(&mut stderr, &mut seen).unwrap();
+    let status = child.wait().unwrap();
+    let seen = String::from_utf8(seen).unwrap();
+    assert!(
+        seen.ends_with(&format!("? rm: cannot remove '{d}': Directory not empty\n")),
+        "{seen:?}"
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(Path::new(&format!("{d}/new")).exists());
+}
+
+/// What `-i` was told to keep, as GNU coreutils 9.4 treats it: a declined file, or a declined
+/// removal of an emptied directory, leaves its parent not empty, which is reported; a declined
+/// descent, or a declined removal of an empty directory, keeps its ancestors without asking.
+#[test]
+fn test_rm_ri_declined_entries_and_their_parent() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let d = &format!("{}/d", tmp.path().display());
+    let s = &format!("{d}/s");
+
+    // A declined file.
+    fs::create_dir(d).unwrap();
+    fs::write(format!("{d}/f"), b"f").unwrap();
+    rm_test_with_stdin(
+        &["-ri", d],
+        "y\nn\ny\n",
+        "",
+        &format!(
+            "rm: descend into directory '{d}'? rm: remove regular file '{d}/f'? \
+             rm: remove directory '{d}'? rm: cannot remove '{d}': Directory not empty\n"
+        ),
+        1,
+    );
+    assert!(Path::new(&format!("{d}/f")).exists());
+    fs::remove_dir_all(d).unwrap();
+
+    // A declined removal of a directory, once emptied.
+    fs::create_dir_all(s).unwrap();
+    fs::write(format!("{s}/f"), b"f").unwrap();
+    rm_test_with_stdin(
+        &["-ri", d],
+        "y\ny\ny\nn\ny\n",
+        "",
+        &format!(
+            "rm: descend into directory '{d}'? rm: descend into directory '{s}'? \
+             rm: remove regular file '{s}/f'? rm: remove directory '{s}'? \
+             rm: remove directory '{d}'? rm: cannot remove '{d}': Directory not empty\n"
+        ),
+        1,
+    );
+    assert!(Path::new(s).exists());
+    fs::remove_dir_all(d).unwrap();
+
+    // A declined descent.
+    fs::create_dir_all(s).unwrap();
+    fs::write(format!("{s}/f"), b"f").unwrap();
+    rm_test_with_stdin(
+        &["-ri", d],
+        "y\nn\n",
+        "",
+        &format!("rm: descend into directory '{d}'? rm: descend into directory '{s}'? "),
+        0,
+    );
+    assert!(Path::new(&format!("{s}/f")).exists());
+    fs::remove_dir_all(d).unwrap();
+
+    // A declined removal of an empty directory.
+    fs::create_dir_all(s).unwrap();
+    rm_test_with_stdin(
+        &["-ri", d],
+        "y\nn\n",
+        "",
+        &format!("rm: descend into directory '{d}'? rm: remove directory '{s}'? "),
+        0,
+    );
+    assert!(Path::new(s).exists());
+}

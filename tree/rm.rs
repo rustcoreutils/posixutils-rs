@@ -14,7 +14,7 @@ use clap::Parser;
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, CString},
     fs,
     io::{self, IsTerminal},
@@ -272,7 +272,10 @@ where
 enum DirAction {
     Removed,
     Entered,
-    Skipped,
+    /// Kept: its prompt was declined.
+    Declined,
+    /// Removed meanwhile by someone else, which with `-f` is no error.
+    Gone,
 }
 
 /// Directly remove a directory or enter it.
@@ -284,7 +287,7 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
         if should_remove_directory(cfg, entry) {
             if let Err(e2) = entry.unlink(libc::AT_REMOVEDIR) {
                 if is_already_gone(cfg, &e2) {
-                    return Ok(DirAction::Skipped);
+                    return Ok(DirAction::Gone);
                 }
                 let err_str = if let Err(e1) = dir_is_empty {
                     gettext!(
@@ -305,14 +308,14 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
                 Ok(DirAction::Removed)
             }
         } else {
-            Ok(DirAction::Skipped)
+            Ok(DirAction::Declined)
         }
 
     // Else, manually traverse the directory to remove the contents one-by-one
     } else if descend_into_directory(cfg, entry) {
         Ok(DirAction::Entered)
     } else {
-        Ok(DirAction::Skipped)
+        Ok(DirAction::Declined)
     }
 }
 
@@ -346,19 +349,33 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     // Set by every diagnostic. The walk's own result cannot stand for the exit status: it also
     // counts the errors `is_already_gone` excuses.
     let had_error = Cell::new(false);
+    let left = LeftBehind::default();
+    let failed = || {
+        had_error.set(true);
+        left.leave();
+    };
     traverse_directory(
         filepath,
-        |entry| {
-            let result = remove_walked(cfg, &entry);
-            if result.is_err() {
-                had_error.set(true);
+        |entry| match remove_walked(cfg, &entry) {
+            Ok(Walked::Entered) => {
+                left.enter();
+                Ok(true)
             }
-            result
+            Ok(Walked::Done) => Ok(false),
+            Ok(Walked::Declined) => {
+                left.leave();
+                Ok(false)
+            }
+            Err(()) => {
+                failed();
+                Err(())
+            }
         },
         |entry, exit| {
-            let result = remove_left_directory(cfg, &entry, exit);
+            let holds_left = left.exit();
+            let result = remove_left_directory(cfg, &entry, exit, holds_left);
             if result.is_err() {
-                had_error.set(true);
+                failed();
             }
             result
         },
@@ -368,7 +385,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             if is_already_gone(cfg, &error) {
                 return;
             }
-            had_error.set(true);
+            failed();
             report_walk_error(&entry, kind, &error);
         },
         ftw::TraverseDirectoryOpts::default(),
@@ -377,9 +394,50 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     Ok(!had_error.get())
 }
 
+/// What a recursive removal has left behind, which keeps the directories holding it.
+///
+/// As GNU rm does, an entry counts once it has been reported, or kept at a directory's first
+/// prompt (a declined descent, or a declined removal of an empty directory): a directory holding
+/// one is neither prompted for nor reported again. A declined file, or a declined removal of a
+/// directory already emptied, does not count: its directory is still prompted for, and rmdir's
+/// "Directory not empty" is reported.
+#[derive(Default)]
+struct LeftBehind {
+    /// Entries left behind so far.
+    count: Cell<usize>,
+    /// `count` when each directory being walked was entered.
+    on_entry: RefCell<Vec<usize>>,
+}
+
+impl LeftBehind {
+    fn leave(&self) {
+        self.count.set(self.count.get() + 1);
+    }
+
+    fn enter(&self) {
+        self.on_entry.borrow_mut().push(self.count.get());
+    }
+
+    /// Leave the directory being walked: whether anything was left behind under it.
+    fn exit(&self) -> bool {
+        let on_entry = self.on_entry.borrow_mut().pop().unwrap_or(0);
+        self.count.get() > on_entry
+    }
+}
+
+/// What `remove_walked` did with an entry.
+enum Walked {
+    /// A directory with contents, entered to remove them.
+    Entered,
+    /// Removed, kept at a file's prompt, or gone meanwhile (with `-f`).
+    Done,
+    /// A directory kept at its first prompt.
+    Declined,
+}
+
 /// The walk's `file_handler` for `rm_directory`: remove `entry`, or enter it if it is a
 /// directory with contents. `Err` means a diagnostic was written.
-fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<bool, ()> {
+fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<Walked, ()> {
     let md = entry.metadata().unwrap();
 
     if md.file_type() == ftw::FileType::Directory {
@@ -405,8 +463,9 @@ fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<bool, ()> {
         }
         match process_directory(cfg, entry) {
             Ok(dir_action) => match dir_action {
-                DirAction::Entered => Ok(true),
-                DirAction::Removed | DirAction::Skipped => Ok(false),
+                DirAction::Entered => Ok(Walked::Entered),
+                DirAction::Declined => Ok(Walked::Declined),
+                DirAction::Removed | DirAction::Gone => Ok(Walked::Done),
             },
             Err(e) => {
                 eprintln!("rm: {}", error_string(&e));
@@ -420,36 +479,51 @@ fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<bool, ()> {
             eprintln!("rm: {}", error_string(&e));
             return Err(());
         }
-        Ok(true)
+        Ok(Walked::Done)
     }
 }
 
 /// The walk's `postprocess_dir` for `rm_directory`: remove the directory `entry` once its
-/// contents are gone. `Err` means a diagnostic was written.
-fn remove_left_directory(cfg: &RmConfig, entry: &ftw::Entry, exit: ftw::DirExit) -> Result<(), ()> {
-    // A directory the traversal could not descend into still has its contents, so
-    // prompting for it and attempting the removal would only produce a second diagnostic
-    // on top of the one already reported.
-    if exit == ftw::DirExit::NotDescended {
+/// contents are gone, unless it holds something left behind (`holds_left`, see `LeftBehind`).
+/// `Err` means a diagnostic was written.
+fn remove_left_directory(
+    cfg: &RmConfig,
+    entry: &ftw::Entry,
+    exit: ftw::DirExit,
+    holds_left: bool,
+) -> Result<(), ()> {
+    // A directory the traversal could not descend into still has its contents, and one holding
+    // an entry already reported or kept stays for it: prompting for either and attempting the
+    // removal would only add a `Directory not empty` on top of what was already said.
+    if exit == ftw::DirExit::NotDescended || holds_left {
         return Ok(());
     }
 
     if should_remove_directory(cfg, entry) {
         // Remove the directory
         if let Err(e) = entry.unlink(libc::AT_REMOVEDIR) {
-            // `ENOTEMPTY` means one or more subdirectories were not
-            // removed. Do not flood the output by recursively
-            // printing `Directory not empty` errors. With -f a directory
-            // someone else removed meanwhile is no error either.
-            if e.raw_os_error() != Some(libc::ENOTEMPTY) && !is_already_gone(cfg, &e) {
-                let err_str = gettext!(
+            // With -f a directory someone else removed meanwhile is no error.
+            if is_already_gone(cfg, &e) {
+                return Ok(());
+            }
+            // Not empty: an entry the removal did not know of appeared in it meanwhile, or
+            // one was kept at its prompt.
+            let not_empty = matches!(e.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST));
+            let err_str = if not_empty {
+                gettext!(
+                    "cannot remove '{}': {}",
+                    entry.path().clean_trailing_slashes(),
+                    error_string(&e)
+                )
+            } else {
+                gettext!(
                     "cannot remove directory '{}': {}",
                     entry.path().clean_trailing_slashes(),
                     error_string(&e)
-                );
-                eprintln!("rm: {}", err_str);
-                return Err(());
-            }
+                )
+            };
+            eprintln!("rm: {}", err_str);
+            return Err(());
         } else {
             report_removed(cfg, true, &entry.path().clean_trailing_slashes());
         }

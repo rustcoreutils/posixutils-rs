@@ -170,6 +170,14 @@ impl MadeFile {
     /// A name has just been linked to it, which changed its `ctime`. Pinned,
     /// the pin shows that when it is closed; unpinned, it is read from `name`
     /// in `dirfd` if that holds the file.
+    ///
+    /// Residual: unpinned, the read is by name -- an `lstat` and a check of
+    /// the identity. In a directory others can write, a file removed and
+    /// another made at `name` with the same inode number between the link
+    /// and the `lstat` would give its ctime to the shared cell, and so to
+    /// every record of this file: a later link to it would then be refused,
+    /// or, while that other file is still at a name of this one, made to
+    /// that file instead.
     pub(crate) fn linked(&mut self, dirfd: BorrowedFd<'_>, name: &CStr) {
         if self.pin.is_some() {
             return;

@@ -511,7 +511,10 @@ impl ChainTrust {
     ///
     /// Residual: a relative path starts from the working directory, which is trusted as the user
     /// named it -- by running there -- and so are the directories of an absolute path above its
-    /// first link: only the directories holding links are judged.
+    /// first link: only the directories holding links are judged. Since root's own directories
+    /// are trusted for every user (`dir_writers`), so is a link root's directory holds: a named
+    /// path through such a link into another user's tree is judged by the link's holder alone,
+    /// not by that user's directories it leads through.
     pub fn named<T: AsRawFd + 'static>(path: &Path, dir: &Rc<T>) -> io::Result<NamedAnchor> {
         let Some(holders) = link_holders(path, dir.as_raw_fd()) else {
             return Ok(NamedAnchor {
@@ -624,7 +627,13 @@ enum DirWriters {
 /// - root, for every effective user, on the same terms: nobody but root can create entries in
 ///   a directory only root can write, and root needs no trick to change anything. Every path
 ///   starts in root's directories -- `/`, and on macOS the `/var` and `/tmp` links it holds --
-///   and a user's own tree below them is as safe as root's are;
+///   and a user's own tree below them is as safe as root's are. Residuals of trusting root's:
+///   - a `root:root` directory with group write counts as root's alone when group `root` is
+///     root's private group, and that check reads the group's member list, not every account's
+///     primary group: on RHEL and Fedora, `sync`, `shutdown`, `halt` and `operator` have
+///     primary gid 0 and can write such a directory, which is now trusted for every user;
+///   - on macOS an ACL is never read (`acls_let_others_write`), so one granting someone else
+///     write on a directory of root's goes unseen, as it does on the user's own;
 /// - for root, on Linux only (`ROOT_WORKS_FOR_USERS`), one user other than root, the one the
 ///   copy or extraction is for -- root extracting into `/home/alice`, which alice owns, with
 ///   the directories a umask of 002 left below it. That user is the owner of the first directory in the chain not root's own, and

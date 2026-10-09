@@ -15,7 +15,9 @@ use std::{
 };
 
 use crate::diff_util::{
-    constants::COULD_NOT_UNWRAP_FILENAME, diff_exit_status::DiffExitStatus, file_diff::FileDiff,
+    constants::COULD_NOT_UNWRAP_FILENAME,
+    diff_exit_status::DiffExitStatus,
+    file_diff::{FileDiff, Source},
     functions::io_error_at,
 };
 
@@ -131,8 +133,8 @@ impl<'a> DirDiff<'a> {
     ) -> DiffExitStatus {
         let mut visited = HashSet::new();
         Self::dir_diff_inner(
-            path1,
-            path2,
+            [path1, path2],
+            [false, false],
             format_options,
             recursive,
             options,
@@ -143,9 +145,12 @@ impl<'a> DirDiff<'a> {
     /// Recursive directory comparison with (dev, ino) tracking of directories
     /// already visited on the current path, so symlink cycles cannot cause
     /// infinite recursion.
+    ///
+    /// `absent` marks a side that does not exist, which `-N` compares as an
+    /// empty directory.
     fn dir_diff_inner(
-        path1: PathBuf,
-        path2: PathBuf,
+        [path1, path2]: [PathBuf; 2],
+        absent: [bool; 2],
         format_options: &FormatOptions,
         recursive: bool,
         options: &[String],
@@ -159,7 +164,14 @@ impl<'a> DirDiff<'a> {
             }
         }
 
-        let (mut dir1, mut dir2) = match (DirData::load(path1), DirData::load(path2)) {
+        let load = |path: PathBuf, absent: bool| {
+            if absent {
+                Ok(DirData::absent(path))
+            } else {
+                DirData::load(path)
+            }
+        };
+        let (mut dir1, mut dir2) = match (load(path1, absent[0]), load(path2, absent[1])) {
             (Ok(d1), Ok(d2)) => (d1, d2),
             (Err(e), _) | (_, Err(e)) => {
                 Self::report(&e);
@@ -186,9 +198,18 @@ impl<'a> DirDiff<'a> {
     /// out, so it describes the current path rather than everything ever seen
     /// -- two sibling links to one directory are now both compared instead of
     /// the second silently disappearing.
-    fn descend(&self, path1: &Path, path2: &Path, visited: &mut HashSet<DirId>) -> DiffExitStatus {
+    fn descend(
+        &self,
+        path1: &Path,
+        path2: &Path,
+        absent: [bool; 2],
+        visited: &mut HashSet<DirId>,
+    ) -> DiffExitStatus {
         let mut ids = Vec::new();
-        for path in [path1, path2] {
+        for (path, absent) in [(path1, absent[0]), (path2, absent[1])] {
+            if absent {
+                continue;
+            }
             let id = match dir_id(path) {
                 Ok(id) => id,
                 Err(e) => {
@@ -205,8 +226,8 @@ impl<'a> DirDiff<'a> {
         visited.extend(ids.iter().cloned());
 
         let result = Self::dir_diff_inner(
-            path1.to_path_buf(),
-            path2.to_path_buf(),
+            [path1.to_path_buf(), path2.to_path_buf()],
+            absent,
             self.format_options,
             self.recursive,
             self.options,
@@ -275,109 +296,115 @@ impl<'a> DirDiff<'a> {
             let in_dir1 = self.dir1.files().contains_key(file_name);
             let in_dir2 = self.dir2.files().contains_key(file_name);
 
-            match (in_dir1, in_dir2) {
-                (true, true) => {
-                    let path1 = self.dir1.path().join(file_name);
-                    let path2 = self.dir2.path().join(file_name);
-
-                    // One unreadable entry used to end the walk: the error was
-                    // propagated out of analyze, so every later entry went
-                    // uncompared. Report it against the path it happened on and
-                    // carry on, which is what GNU does.
-                    let (kind1, kind2) = match (Self::classify(&path1), Self::classify(&path2)) {
-                        (Ok(k1), Ok(k2)) => (k1, k2),
-                        (Err(e), _) | (_, Err(e)) => {
-                            Self::report(&e);
-                            exit_status = DiffExitStatus::Trouble;
-                            continue;
-                        }
-                    };
-
-                    match (kind1, kind2) {
-                        (EntryKind::File, EntryKind::File) => {
-                            let header = self.file_header(&path1, &path2);
-                            match FileDiff::file_diff(
-                                path1,
-                                path2,
-                                self.format_options,
-                                Some(header),
-                            ) {
-                                Ok(inner) => {
-                                    if exit_status.status_code() < inner.status_code() {
-                                        exit_status = inner;
-                                    }
-                                }
-                                Err(e) => {
-                                    Self::report(&e);
-                                    exit_status = DiffExitStatus::Trouble;
-                                }
-                            }
-                        }
-                        (EntryKind::Directory, EntryKind::Directory) => {
-                            if self.recursive {
-                                let inner = self.descend(&path1, &path2, visited);
-                                if exit_status.status_code() < inner.status_code() {
-                                    exit_status = inner;
-                                }
-                            } else {
-                                // Two directories left uncompared are not a
-                                // difference; GNU exits 0 for this alone.
-                                println!(
-                                    "Common subdirectories: {} and {}",
-                                    display(&path1),
-                                    display(&path2)
-                                );
-                            }
-                        }
-                        (k1, k2) => {
-                            // Anything else is a mismatch between the two
-                            // trees, and a mismatch is a difference.
-                            println!(
-                                "File {} is a {} while file {} is a {}",
-                                display(&path1),
-                                k1.describe(),
-                                display(&path2),
-                                k2.describe()
-                            );
-                            if exit_status.status_code() < DiffExitStatus::Different.status_code() {
-                                exit_status = DiffExitStatus::Different;
-                            }
-                        }
-                    }
-                }
-                // An entry present in only one tree is a difference, so it
-                // has to raise the exit status: `if diff -r a b; then` was
-                // useless while these arms only printed.
-                (true, false) => {
-                    println!(
-                        "Only in {}: {}",
-                        self.dir1.path_str(),
-                        file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                    );
-                    if exit_status.status_code() < DiffExitStatus::Different.status_code() {
-                        exit_status = DiffExitStatus::Different;
-                    }
-                }
-                (false, true) => {
-                    println!(
-                        "Only in {}: {}",
-                        self.dir2.path_str(),
-                        file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                    );
-                    if exit_status.status_code() < DiffExitStatus::Different.status_code() {
-                        exit_status = DiffExitStatus::Different;
-                    }
-                }
-                (false, false) => {
-                    eprintln!(
-                        "At least one of directories should contain file \"{}\"",
-                        file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                    );
-                    return DiffExitStatus::Trouble;
-                }
+            let inner = if in_dir1 && in_dir2 {
+                self.compare_entry(file_name, [false, false], visited)
+            } else if self.format_options.new_file {
+                self.compare_entry(file_name, [!in_dir1, !in_dir2], visited)
+            } else {
+                self.only_in(file_name, in_dir1)
+            };
+            if exit_status.status_code() < inner.status_code() {
+                exit_status = inner;
             }
         }
 
         exit_status
+    }
+
+    /// Report an entry present in only one tree. That is a difference, so it
+    /// has to raise the exit status: `if diff -r a b; then` was useless while
+    /// this only printed.
+    fn only_in(&self, file_name: &OsString, in_dir1: bool) -> DiffExitStatus {
+        let dir = if in_dir1 { &self.dir1 } else { &self.dir2 };
+        println!(
+            "Only in {}: {}",
+            dir.path_str(),
+            file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+        );
+        DiffExitStatus::Different
+    }
+
+    /// What the two entries named `file_name` are. Under `-N` the side marked
+    /// `absent` is taken to be the same kind as the side that exists.
+    fn kinds(path1: &Path, path2: &Path, absent: [bool; 2]) -> io::Result<(EntryKind, EntryKind)> {
+        match absent {
+            [true, _] => Self::classify(path2).map(|k| (k, k)),
+            [_, true] => Self::classify(path1).map(|k| (k, k)),
+            _ => Ok((Self::classify(path1)?, Self::classify(path2)?)),
+        }
+    }
+
+    /// Compare the two entries named `file_name`. `absent` marks a side that
+    /// does not exist, which only `-N` compares rather than reporting it as
+    /// "Only in".
+    fn compare_entry(
+        &self,
+        file_name: &OsString,
+        absent: [bool; 2],
+        visited: &mut HashSet<DirId>,
+    ) -> DiffExitStatus {
+        let path1 = self.dir1.path().join(file_name);
+        let path2 = self.dir2.path().join(file_name);
+
+        // One unreadable entry used to end the walk: the error was propagated
+        // out of analyze, so every later entry went uncompared. Report it
+        // against the path it happened on and carry on, which is what GNU does.
+        let (kind1, kind2) = match Self::kinds(&path1, &path2, absent) {
+            Ok(kinds) => kinds,
+            Err(e) => {
+                Self::report(&e);
+                return DiffExitStatus::Trouble;
+            }
+        };
+
+        match (kind1, kind2) {
+            (EntryKind::File, EntryKind::File) => {
+                let header = self.file_header(&path1, &path2);
+                let source = |path: PathBuf, absent: bool| {
+                    if absent {
+                        Ok(Source::absent(&path))
+                    } else {
+                        Source::from_path(path)
+                    }
+                };
+                let result = source(path1, absent[0]).and_then(|src1| {
+                    let src2 = source(path2, absent[1])?;
+                    FileDiff::diff_sources(src1, src2, self.format_options, Some(header))
+                });
+                result.unwrap_or_else(|e| {
+                    Self::report(&e);
+                    DiffExitStatus::Trouble
+                })
+            }
+            (EntryKind::Directory, EntryKind::Directory) => {
+                if self.recursive {
+                    self.descend(&path1, &path2, absent, visited)
+                } else {
+                    // Two directories left uncompared are not a difference;
+                    // GNU exits 0 for this alone, and under -N prints this for
+                    // a directory on one side only as well.
+                    println!(
+                        "Common subdirectories: {} and {}",
+                        display(&path1),
+                        display(&path2)
+                    );
+                    DiffExitStatus::NotDifferent
+                }
+            }
+            // A special file has no contents to compare with an empty file.
+            _ if absent.contains(&true) => self.only_in(file_name, !absent[0]),
+            (k1, k2) => {
+                // Anything else is a mismatch between the two trees, and a
+                // mismatch is a difference.
+                println!(
+                    "File {} is a {} while file {} is a {}",
+                    display(&path1),
+                    k1.describe(),
+                    display(&path2),
+                    k2.describe()
+                );
+                DiffExitStatus::Different
+            }
+        }
     }
 }

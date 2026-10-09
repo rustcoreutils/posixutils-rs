@@ -277,6 +277,15 @@ but no daemon to run them.  Behavior follows Vixie cron:
 ### diff
 
  * `--label` and `--label2` set the header names used in `-c` and `-u` output.
+ * `-q` / `--brief` — report only `Files A and B differ` for a differing
+   pair, text or binary, with no `diff ...` header under `-r`.  The exit
+   status is unchanged.
+ * `-N` / `--new-file` — a directory entry missing on one side is compared as
+   an empty file dated the Epoch, or as an empty directory.  It applies to
+   directory entries only: a missing file operand is still an error, where
+   GNU diff compares it as empty too.
+ * `-w` / `--ignore-all-space` — ignore all white space, wherever it is in
+   the line; `-w` wins over `-b`.
 
 ### echo
 

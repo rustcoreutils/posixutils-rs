@@ -13,7 +13,7 @@ use std::{fs, io, path::PathBuf};
 
 use clap::Parser;
 use diff_util::{
-    common::{FormatOptions, OutputFormat},
+    common::{FormatOptions, OutputFormat, WhiteSpace},
     diff_exit_status::DiffExitStatus,
     dir_diff::DirDiff,
     file_diff::{FileDiff, Source},
@@ -28,6 +28,15 @@ struct Args {
     #[arg(short = 'b', long = "ignore-space-change", help = gettext("Cause EOL whitespace to be treated as blanks"))]
     ignore_eol_space: bool,
 
+    #[arg(short = 'w', long = "ignore-all-space", help = gettext("Ignore all white space"))]
+    ignore_all_space: bool,
+
+    #[arg(short = 'q', long = "brief", help = gettext("Report only whether the files differ"))]
+    brief: bool,
+
+    #[arg(short = 'N', long = "new-file", help = gettext("Treat a file missing from one directory as empty"))]
+    new_file: bool,
+
     #[arg(short, help = gettext("Output 3 lines of copied context"))]
     context3: bool,
 
@@ -40,7 +49,7 @@ struct Args {
     #[arg(short, help = gettext("Produce output in an alternative form, similar in format to -e"))]
     fed: bool,
 
-    #[arg(short, long, help = gettext("Apply diff recursively to files and directories of the same name"))]
+    #[arg(short, long = "recursive", alias = "recurse", help = gettext("Apply diff recursively to files and directories of the same name"))]
     recurse: bool,
 
     #[arg(short, help = gettext("Output 3 lines of unified context"))]
@@ -155,7 +164,16 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         }
     };
 
-    let format_options = FormatOptions::new(args.ignore_eol_space, output_format, label1, label2);
+    let white_space = if args.ignore_all_space {
+        WhiteSpace::IgnoreAll
+    } else if args.ignore_eol_space {
+        WhiteSpace::IgnoreChanges
+    } else {
+        WhiteSpace::Significant
+    };
+    let mut format_options = FormatOptions::new(white_space, output_format, label1, label2);
+    format_options.brief = args.brief;
+    format_options.new_file = args.new_file;
 
     let path1 = PathBuf::from(&args.file1);
     let path2 = PathBuf::from(&args.file2);

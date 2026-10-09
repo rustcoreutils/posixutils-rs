@@ -38,6 +38,14 @@ impl DirData {
         Ok(Self { path, files })
     }
 
+    /// A directory missing on one side under `-N`: compared as an empty one.
+    pub fn absent(path: PathBuf) -> Self {
+        Self {
+            path,
+            files: HashMap::new(),
+        }
+    }
+
     pub fn files(&self) -> &HashMap<OsString, DirEntry> {
         &self.files
     }

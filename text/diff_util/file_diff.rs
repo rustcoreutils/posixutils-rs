@@ -26,7 +26,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{self, BufWriter, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
@@ -64,6 +64,19 @@ impl Source {
             content,
             modified,
         })
+    }
+
+    /// A directory entry missing on one side under `-N`: an empty file, named
+    /// as if it existed and dated the Epoch, as GNU diff dates it.
+    pub fn absent(path: &Path) -> Self {
+        Self {
+            name: path
+                .to_str()
+                .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+                .to_string(),
+            content: Vec::new(),
+            modified: SystemTime::UNIX_EPOCH,
+        }
     }
 
     /// Standard input, buffered in memory.
@@ -158,7 +171,13 @@ impl<'a> FileDiff<'a> {
         let (modified1, modified2) = (src1.modified, src2.modified);
 
         if is_binary(&content1) || is_binary(&content2) {
-            Self::binary_file_diff(&src1.name, &src2.name, &content1, &content2)
+            Self::binary_file_diff(
+                &src1.name,
+                &src2.name,
+                &content1,
+                &content2,
+                format_options.brief,
+            )
         } else {
             let linereader1 = LineReader::new(&content1);
             let ends_with_newline1 = linereader1.ends_with_newline();
@@ -168,23 +187,22 @@ impl<'a> FileDiff<'a> {
             let ends_with_newline2 = linereader2.ends_with_newline();
             let lines2: Vec<&[u8]> = linereader2.collect();
 
-            // Pass whitespace normalization flag to FileData
-            // When -b is set, hashes are computed using normalized whitespace for comparison
-            // but original lines are stored for output
-            let normalize_ws = format_options.ignore_trailing_white_spaces;
+            // Under -b or -w, hashes are computed over normalized white space
+            // for comparison, but the original lines are stored for output.
+            let white_space = format_options.white_space;
             let mut file1 = FileData::new(
                 src1.name,
                 lines1,
                 modified1,
                 ends_with_newline1,
-                normalize_ws,
+                white_space,
             );
             let mut file2 = FileData::new(
                 src2.name,
                 lines2,
                 modified2,
                 ends_with_newline2,
-                normalize_ws,
+                white_space,
             );
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
@@ -208,6 +226,21 @@ impl<'a> FileDiff<'a> {
 
             if diff.hunks.hunk_count() > 0 {
                 diff.are_different = true;
+            }
+
+            // -q says that the files differ and nothing else, so neither the
+            // -r header nor the hunks are written.
+            if format_options.brief {
+                return Ok(if diff.are_different {
+                    println!(
+                        "Files {} and {} differ",
+                        diff.file1.name(),
+                        diff.file2.name()
+                    );
+                    DiffExitStatus::Different
+                } else {
+                    DiffExitStatus::NotDifferent
+                });
             }
 
             if diff.are_different {
@@ -258,12 +291,17 @@ impl<'a> FileDiff<'a> {
         name2: &str,
         content1: &[u8],
         content2: &[u8],
+        brief: bool,
     ) -> io::Result<DiffExitStatus> {
         if content1 == content2 {
             return Ok(DiffExitStatus::NotDifferent);
         }
 
-        println!("Binary files {} and {} differ", name1, name2);
+        if brief {
+            println!("Files {} and {} differ", name1, name2);
+        } else {
+            println!("Binary files {} and {} differ", name1, name2);
+        }
         Ok(DiffExitStatus::Different)
     }
 

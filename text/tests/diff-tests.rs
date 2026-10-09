@@ -2076,3 +2076,193 @@ fn test_diff_non_regular_file_operand_is_compared_as_a_file() {
     assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
     assert_eq!(stdout, "1d0\n< x\n");
 }
+
+/// `-q` / `--brief` reports only whether two files differ, in GNU's words,
+/// and keeps the exit status: 1 for a difference, 0 for none.
+#[test]
+fn test_diff_brief_reports_only_whether_files_differ() {
+    let f1 = write_tmp("brief_1", b"x\n");
+    let f2 = write_tmp("brief_2", b"y\n");
+    let same = write_tmp("brief_3", b"x\n");
+
+    for opt in ["-q", "--brief"] {
+        diff_test_full(
+            &[opt, &f1, &f2],
+            &format!("Files {f1} and {f2} differ\n"),
+            "",
+            EXIT_STATUS_DIFFERENCE,
+        );
+        diff_test_full(&[opt, &f1, &same], "", "", EXIT_STATUS_NO_DIFFERENCE);
+    }
+
+    // An output style given alongside is no conflict; -q wins.
+    diff_test_full(
+        &["-q", "-u", &f1, &f2],
+        &format!("Files {f1} and {f2} differ\n"),
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    // Binary files get the same message.
+    let b1 = write_tmp("brief_bin_1", b"\0bin");
+    let b2 = write_tmp("brief_bin_2", b"\0bon");
+    diff_test_full(
+        &["-q", &b1, &b2],
+        &format!("Files {b1} and {b2} differ\n"),
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    // A missing operand is still trouble.
+    let (_base, a, _b) = dir_pair();
+    let missing = a.join("missing");
+    let missing = missing.to_str().unwrap();
+    diff_test_full(
+        &["-q", &f1, missing],
+        "",
+        &format!("diff: {missing}: No such file or directory\n"),
+        EXIT_STATUS_TROUBLE,
+    );
+}
+
+/// Run diff in `dir`, returning stdout, stderr and the exit status.
+fn run_diff_in(dir: &std::path::Path, args: &[&str]) -> (String, String, Option<i32>) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("run diff");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+/// Under `-q -r` a differing pair is one line, with no `diff ...` header.
+#[test]
+fn test_diff_brief_recursive() {
+    let (base, a, b) = dir_pair();
+    std::fs::write(a.join("f"), "x\n").unwrap();
+    std::fs::write(b.join("f"), "y\n").unwrap();
+    std::fs::write(a.join("same"), "s\n").unwrap();
+    std::fs::write(b.join("same"), "s\n").unwrap();
+    std::fs::create_dir(a.join("sub")).unwrap();
+    std::fs::create_dir(b.join("sub")).unwrap();
+    std::fs::write(a.join("sub/g"), "1\n").unwrap();
+    std::fs::write(b.join("sub/g"), "2\n").unwrap();
+    std::fs::write(b.join("new"), "n\n").unwrap();
+
+    let (out, err, code) = run_diff_in(base.path(), &["--brief", "-r", "a", "b"]);
+    assert_eq!(
+        out,
+        "Files a/f and b/f differ\nOnly in b: new\nFiles a/sub/g and b/sub/g differ\n"
+    );
+    assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
+}
+
+/// The trees libzstd's test compares with `diff --brief --recursive
+/// --new-file`, in small: a file on one side only, a directory on one side
+/// only, and an empty file whose counterpart is missing.
+fn new_file_trees() -> TempDir {
+    let (base, a, b) = dir_pair();
+    std::fs::write(a.join("f"), "x\n").unwrap();
+    std::fs::write(b.join("f"), "y\n").unwrap();
+    std::fs::write(a.join("gone"), "old\n").unwrap();
+    std::fs::write(b.join("new"), "n\n").unwrap();
+    std::fs::write(a.join("empty"), "").unwrap();
+    std::fs::create_dir(a.join("sub")).unwrap();
+    std::fs::write(a.join("sub/q"), "q\n").unwrap();
+    base
+}
+
+/// `-N` / `--new-file` compares an entry missing from one tree as an empty
+/// file, and a missing directory as an empty directory.
+#[test]
+fn test_diff_new_file_recursive() {
+    let base = new_file_trees();
+    let dir = base.path();
+
+    let (out, err, code) = run_diff_in(dir, &["-N", "-r", "a", "b"]);
+    assert_eq!(
+        out,
+        "diff -N -r a/f b/f\n1c1\n< x\n---\n> y\n\
+         diff -N -r a/gone b/gone\n1d0\n< old\n\
+         diff -N -r a/new b/new\n0a1\n> n\n\
+         diff -N -r a/sub/q b/sub/q\n1d0\n< q\n"
+    );
+    assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
+
+    let (out, err, code) = run_diff_in(dir, &["--brief", "--recursive", "--new-file", "b", "a"]);
+    assert_eq!(
+        out,
+        "Files b/f and a/f differ\nFiles b/gone and a/gone differ\n\
+         Files b/new and a/new differ\nFiles b/sub/q and a/sub/q differ\n"
+    );
+    assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
+
+    // The missing side's header carries the Epoch, as in GNU diff.
+    let (out, _, code) = run_diff_in(dir, &["-N", "-r", "-u", "a", "b"]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+    assert!(
+        out.contains("\n--- a/new\t1970-01-01 00:00:00.000000000 +0000\n"),
+        "got {out:?}"
+    );
+    assert!(
+        out.contains("diff -N -r -u a/sub/q b/sub/q\n--- a/sub/q\t"),
+        "got {out:?}"
+    );
+    assert!(
+        out.ends_with("+++ b/sub/q\t1970-01-01 00:00:00.000000000 +0000\n@@ -1 +0,0 @@\n-q\n"),
+        "got {out:?}"
+    );
+}
+
+/// An empty file whose counterpart is missing is no difference under -N;
+/// without -N it is "Only in".
+#[test]
+fn test_diff_new_file_absent_empty_file_is_equal() {
+    let base = new_file_trees();
+    let dir = base.path();
+    std::fs::write(dir.join("b/f"), "x\n").unwrap();
+    std::fs::remove_file(dir.join("a/gone")).unwrap();
+    std::fs::remove_file(dir.join("b/new")).unwrap();
+    std::fs::remove_dir_all(dir.join("a/sub")).unwrap();
+
+    let (out, err, code) = run_diff_in(dir, &["-Nr", "a", "b"]);
+    assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    assert_eq!(code, Some(EXIT_STATUS_NO_DIFFERENCE));
+
+    let (out, _, code) = run_diff_in(dir, &["-r", "a", "b"]);
+    assert_eq!(out, "Only in a: empty\n");
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+}
+
+/// `-w` ignores all white space: inside a line, at its ends, and a carriage
+/// return.  Output still shows the lines as they are.
+#[test]
+fn test_diff_ignore_all_space() {
+    let f1 = write_tmp("w_1", b"a b\nc\td\n  x  \nsame\nlast");
+    let f2 = write_tmp("w_2", b"ab\ncd\nx\nsame\n\nlast\n");
+
+    diff_test(&["-w", &f1, &f2], "4a5\n> \n", EXIT_STATUS_DIFFERENCE);
+    // -b alone still sees "a b" and "ab" as different.
+    let (out, _, _) = run_diff(&["-b", &f1, &f2]);
+    assert!(out.starts_with("1,3c1,3\n"), "got {out:?}");
+    // -w wins over -b.
+    diff_test(&["-w", "-b", &f1, &f2], "4a5\n> \n", EXIT_STATUS_DIFFERENCE);
+    diff_test(
+        &["-u", "-w", "-L", "A", "-L", "B", &f1, &f2],
+        "--- A\n+++ B\n@@ -2,4 +2,5 @@\n c\td\n   x  \n same\n+\n last\n\\ No newline at end of file\n",
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    let lf = write_tmp("w_lf", b"a\n");
+    let crlf = write_tmp("w_crlf", b"a\r\n");
+    let bare = write_tmp("w_bare", b"a");
+    diff_test(&["-w", &lf, &crlf], "", EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-w", &lf, &bare], "", EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-q", "-w", &lf, &crlf], "", EXIT_STATUS_NO_DIFFERENCE);
+}

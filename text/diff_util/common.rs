@@ -7,9 +7,39 @@
 // SPDX-License-Identifier: MIT
 //
 
+/// How white space takes part in comparing two lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhiteSpace {
+    /// Every byte counts.
+    Significant,
+    /// `-b`: a run of white space equals any other run, and trailing white
+    /// space is ignored.
+    IgnoreChanges,
+    /// `-w` (GNU): white space is ignored wherever it is.
+    IgnoreAll,
+}
+
+impl WhiteSpace {
+    /// `None` when lines are compared byte for byte; otherwise whether the
+    /// normal form drops every run of white space (`-w`) rather than folding
+    /// it to one space (`-b`).
+    pub fn drop_all(self) -> Option<bool> {
+        match self {
+            WhiteSpace::Significant => None,
+            WhiteSpace::IgnoreChanges => Some(false),
+            WhiteSpace::IgnoreAll => Some(true),
+        }
+    }
+}
+
 pub struct FormatOptions {
-    pub ignore_trailing_white_spaces: bool,
+    pub white_space: WhiteSpace,
     pub output_format: OutputFormat,
+    /// `-q` (GNU): report only whether files differ.
+    pub brief: bool,
+    /// `-N` (GNU): a directory entry missing on one side is compared as an
+    /// empty file, or as an empty directory.
+    pub new_file: bool,
     label1: Option<String>,
     label2: Option<String>,
 }
@@ -19,14 +49,16 @@ impl FormatOptions {
     /// combination is a usage error with a diagnostic rather than something
     /// every caller has to unwrap.
     pub fn new(
-        ignore_trailing_white_spaces: bool,
+        white_space: WhiteSpace,
         output_format: OutputFormat,
         label1: Option<String>,
         label2: Option<String>,
     ) -> Self {
         Self {
-            ignore_trailing_white_spaces,
+            white_space,
             output_format,
+            brief: false,
+            new_file: false,
             label1,
             label2,
         }

@@ -9,6 +9,8 @@
 
 use std::{collections::hash_map::DefaultHasher, hash::Hasher, mem::take, time::SystemTime};
 
+use super::common::WhiteSpace;
+
 /// The bytes `-b` treats as white space.
 ///
 /// POSIX describes `-b` in terms of "white space", not `<blank>`, and GNU diff
@@ -20,11 +22,13 @@ fn is_blank(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | 0x0b | 0x0c)
 }
 
-/// The `-b` normal form of a line, yielded byte by byte so nothing is
-/// allocated: every run of white space becomes a single space, and a run that
-/// reaches the end of the line is dropped instead.
+/// The `-b` or `-w` normal form of a line, yielded byte by byte so nothing is
+/// allocated. Under `-b` every run of white space becomes a single space, and
+/// a run that reaches the end of the line is dropped instead; under `-w` every
+/// run is dropped.
 struct Normalized<'a> {
     rest: &'a [u8],
+    drop_all: bool,
 }
 
 impl Iterator for Normalized<'_> {
@@ -38,14 +42,21 @@ impl Iterator for Normalized<'_> {
         }
         let run = self.rest.iter().take_while(|&&c| is_blank(c)).count();
         self.rest = &self.rest[run..];
+        if self.drop_all {
+            // The run is followed by a non-blank byte or by nothing.
+            return self.next();
+        }
         // Trailing white space is ignored outright, so the normal form ends
         // here rather than with a space.
         (!self.rest.is_empty()).then_some(b' ')
     }
 }
 
-fn normalized(line: &[u8]) -> Normalized<'_> {
-    Normalized { rest: line }
+fn normalized(line: &[u8], drop_all: bool) -> Normalized<'_> {
+    Normalized {
+        rest: line,
+        drop_all,
+    }
 }
 
 /// A file, split into lines that borrow from the buffer it was read into.
@@ -62,7 +73,7 @@ pub struct FileData<'a> {
     hashes: Vec<u64>, // Pre-computed line hashes for O(1) comparison
     modified: SystemTime,
     ends_with_newline: bool,
-    normalize_ws: bool, // Whether whitespace normalization is enabled (-b flag)
+    white_space: WhiteSpace,
 }
 
 impl<'a> FileData<'a> {
@@ -79,20 +90,20 @@ impl<'a> FileData<'a> {
         lines: Vec<&'a [u8]>,
         modified: SystemTime,
         ends_with_newline: bool,
-        normalize_ws: bool,
+        white_space: WhiteSpace,
     ) -> Self {
         let line_count = lines.len();
-        // Pre-compute hashes for O(1) line comparison. Under -b the hash is
-        // taken over the normalized line so that lines differing only in
-        // whitespace land in the same bucket; the original bytes are kept for
-        // output either way.
+        // Pre-compute hashes for O(1) line comparison. Under -b and -w the
+        // hash is taken over the normalized line so that lines differing only
+        // in whitespace land in the same bucket; the original bytes are kept
+        // for output either way.
         let hashes: Vec<u64> = lines
             .iter()
             .enumerate()
             .map(|(index, line)| {
                 let mut hasher = DefaultHasher::new();
-                if normalize_ws {
-                    for b in normalized(line) {
+                if let Some(drop_all) = white_space.drop_all() {
+                    for b in normalized(line, drop_all) {
                         hasher.write_u8(b);
                     }
                 } else {
@@ -101,7 +112,8 @@ impl<'a> FileData<'a> {
                     // is, so it has to be part of the hash: "b\n" and a final
                     // "b" with no newline are different lines. -b ignores the
                     // distinction, as GNU does, because it treats trailing
-                    // white space -- including the newline -- as insignificant.
+                    // white space -- including the newline -- as insignificant;
+                    // so does -w.
                     let terminated = ends_with_newline || index + 1 != line_count;
                     hasher.write_u8(terminated as u8);
                 }
@@ -115,7 +127,7 @@ impl<'a> FileData<'a> {
             hashes,
             modified,
             ends_with_newline,
-            normalize_ws,
+            white_space,
         }
     }
 
@@ -125,11 +137,11 @@ impl<'a> FileData<'a> {
         self.ends_with_newline || index + 1 != self.lines.len()
     }
 
-    /// Compare lines, normalizing whitespace when `-b` is in effect.
+    /// Compare lines, normalizing whitespace when `-b` or `-w` is in effect.
     pub fn lines_equal(&self, my_index: usize, other: &FileData, other_index: usize) -> bool {
         let (mine, theirs) = (self.lines[my_index], other.lines[other_index]);
-        if self.normalize_ws {
-            normalized(mine).eq(normalized(theirs))
+        if let Some(drop_all) = self.white_space.drop_all() {
+            normalized(mine, drop_all).eq(normalized(theirs, drop_all))
         } else {
             mine == theirs && self.line_terminated(my_index) == other.line_terminated(other_index)
         }

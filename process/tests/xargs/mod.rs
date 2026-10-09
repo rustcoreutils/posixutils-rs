@@ -642,3 +642,132 @@ fn double_dash_ends_options_and_later_one_is_passed_through() {
     xargs_test("x\n", "-t x\n", vec!["--", "echo", "-t"]);
     xargs_test("x\n", "-- -t x\n", vec!["echo", "--", "-t"]);
 }
+
+// Input arguments are byte strings, as pathnames are.  Bytes that are not
+// valid UTF-8 used to become U+FFFD, so `find . -print0 | xargs -0 rm` was
+// handed names of files that do not exist.  The child prints each argument
+// it received between brackets, so the expectation is the exact bytes.
+
+/// Run xargs with `xargs_args` (each a byte string) on `stdin`, expecting
+/// `expected` on stdout and success.
+fn xargs_bytes(xargs_args: &[&[u8]], stdin: &[u8], expected: &[u8]) {
+    plib::testing::run_test_os(plib::testing::TestPlanOs {
+        cmd: String::from("xargs"),
+        args: xargs_args
+            .iter()
+            .map(|a| plib::testing::os_bytes(a))
+            .collect(),
+        stdin_data: stdin.to_vec(),
+        expected_out: expected.to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn non_utf8_bytes_pass_through_null_separated_input() {
+    xargs_bytes(
+        &[b"-0", b"printf", b"[%s]\n"],
+        b"a\xffb\0c\xe9d\0",
+        b"[a\xffb]\n[c\xe9d]\n",
+    );
+}
+
+#[test]
+fn non_utf8_bytes_pass_through_blank_separated_input() {
+    xargs_bytes(
+        &[b"printf", b"[%s]\n"],
+        b"a\xffb c\xe9d\n'q\xff t'\n",
+        b"[a\xffb]\n[c\xe9d]\n[q\xff t]\n",
+    );
+}
+
+#[test]
+fn non_utf8_bytes_substituted_by_insert_mode() {
+    xargs_bytes(
+        &[b"-I", b"{}", b"printf", b"[%s]\n", b"x{}y"],
+        b"a\xffb\nc\xe9d\n",
+        b"[xa\xffby]\n[xc\xe9dy]\n",
+    );
+}
+
+#[test]
+fn non_utf8_replstr_and_utility_argument() {
+    xargs_bytes(
+        &[b"-I", b"\xfe", b"printf", b"[%s]\n", b"x\xfey"],
+        b"a\xffb\n",
+        b"[xa\xffby]\n",
+    );
+}
+
+#[test]
+fn non_utf8_bytes_one_argument_per_invocation() {
+    xargs_bytes(
+        &[
+            b"-n",
+            b"1",
+            b"sh",
+            b"-c",
+            b"printf '%s:[%s]\\n' $# \"$1\"",
+            b"sh",
+        ],
+        b"a\xffb c\xe9d\n",
+        b"1:[a\xffb]\n1:[c\xe9d]\n",
+    );
+}
+
+#[test]
+fn non_utf8_bytes_in_line_mode() {
+    xargs_bytes(
+        &[b"-L", b"1", b"printf", b"<%s>"],
+        b"a\xffb c\n\xe9d\n",
+        b"<a\xffb><c><\xe9d>",
+    );
+}
+
+#[test]
+fn non_utf8_eof_string_compared_as_bytes() {
+    // "\xff" and "\xfe" were both U+FFFD, so each matched the other.
+    xargs_bytes(
+        &[b"-E", b"\xff", b"printf", b"[%s]\n"],
+        b"a \xfe \xff b\n",
+        b"[a]\n[\xfe]\n",
+    );
+}
+
+#[test]
+fn size_limit_counts_bytes() {
+    // "\xff\xff\xff" is three bytes: with "echo" (5 bytes with its NUL) and
+    // -s 13, two such arguments (4 + 4) fit in one command but three do not.
+    xargs_bytes(
+        &[b"-s", b"13", b"echo"],
+        b"\xff\xff\xff \xff\xff\xff \xff\xff\xff\n",
+        b"\xff\xff\xff \xff\xff\xff\n\xff\xff\xff\n",
+    );
+}
+
+#[test]
+fn rm_removes_exactly_the_named_non_utf8_files() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let names: [&[u8]; 2] = [b"a\xffb", b"c\xe9d"];
+    let mut stdin = Vec::new();
+    for name in names {
+        let path = dir.path().join(OsStr::from_bytes(name));
+        File::create(&path).unwrap();
+        stdin.extend_from_slice(path.as_os_str().as_bytes());
+        stdin.push(0);
+    }
+    // A decoy that the lossy name "a\u{FFFD}b" would have named.
+    let decoy = dir.path().join("a\u{FFFD}b");
+    File::create(&decoy).unwrap();
+
+    xargs_bytes(&[b"-0", b"rm"], &stdin, b"");
+
+    for name in names {
+        assert!(!dir.path().join(OsStr::from_bytes(name)).exists());
+    }
+    assert!(decoy.exists(), "rm removed the U+FFFD decoy");
+}

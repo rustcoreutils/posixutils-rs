@@ -8,9 +8,11 @@
 //
 
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::mem;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -82,7 +84,7 @@ struct Args {
         default_value = "",
         help = gettext("Use eofstr as the logical end-of-file string")
     )]
-    eofstr: String,
+    eofstr: OsString,
 
     #[arg(
         short = 'I',
@@ -91,7 +93,7 @@ struct Args {
         conflicts_with_all = ["lines", "maxnum"],
         help = gettext("Insert mode: execute utility for each line, replacing replstr with input")
     )]
-    replstr: Option<String>,
+    replstr: Option<OsString>,
 
     #[arg(short, long, help = gettext("Prompt mode: ask before executing each command"))]
     prompt: bool,
@@ -128,13 +130,13 @@ struct Args {
         trailing_var_arg = true,
         help = gettext("Utility to invoke (default: echo) and its arguments")
     )]
-    command: Vec<String>,
+    command: Vec<OsString>,
 
     #[arg(skip)]
-    util: String,
+    util: OsString,
 
     #[arg(skip)]
-    util_args: Vec<String>,
+    util_args: Vec<OsString>,
 }
 
 impl Args {
@@ -143,7 +145,7 @@ impl Args {
     fn parse_command_line() -> Self {
         let mut args = plib::optarg::parse::<Args>();
         let mut command = std::mem::take(&mut args.command).into_iter();
-        args.util = command.next().unwrap_or_else(|| String::from("echo"));
+        args.util = command.next().unwrap_or_else(|| OsString::from("echo"));
         args.util_args = command.collect();
         args
     }
@@ -162,11 +164,28 @@ enum ExecResult {
     Skipped,
 }
 
+/// The command line `util util_args...` as the bytes that -t and -p write,
+/// the words separated by single spaces.
+fn command_line_bytes(util: &OsStr, util_args: &[OsString]) -> Vec<u8> {
+    let mut line = util.as_bytes().to_vec();
+    line.push(b' ');
+    for (i, arg) in util_args.iter().enumerate() {
+        if i > 0 {
+            line.push(b' ');
+        }
+        line.extend_from_slice(arg.as_bytes());
+    }
+    line
+}
+
 /// Prompt user for confirmation. Returns true if user confirms.
-fn prompt_confirm(util: &str, util_args: &[String]) -> io::Result<bool> {
+fn prompt_confirm(util: &OsStr, util_args: &[OsString]) -> io::Result<bool> {
     // Write command and prompt to stderr.
-    eprint!("{} {}?...", util, util_args.join(" "));
-    io::stderr().flush()?;
+    let mut stderr = io::stderr().lock();
+    stderr.write_all(&command_line_bytes(util, util_args))?;
+    stderr.write_all(b"?...")?;
+    stderr.flush()?;
+    drop(stderr);
 
     // Read response from /dev/tty (not stdin, which carries the argument list).
     let tty = File::open("/dev/tty")?;
@@ -182,8 +201,8 @@ fn prompt_confirm(util: &str, util_args: &[String]) -> io::Result<bool> {
 
 /// Execute the utility with the given arguments
 fn exec_util(
-    util: &str,
-    util_args: Vec<String>,
+    util: &OsStr,
+    util_args: Vec<OsString>,
     trace: bool,
     prompt: bool,
 ) -> io::Result<ExecResult> {
@@ -197,7 +216,9 @@ fn exec_util(
     } else if trace {
         // If tracing (and not prompting, since prompt implies trace output),
         // write command to stderr
-        eprintln!("{} {}", util, util_args.join(" "));
+        let mut line = command_line_bytes(util, &util_args);
+        line.push(b'\n');
+        io::stderr().write_all(&line)?;
     }
 
     match Command::new(util)
@@ -215,12 +236,12 @@ fn exec_util(
             if e.kind() == io::ErrorKind::NotFound {
                 diag::error(&format!(
                     "{}: {}",
-                    util,
+                    util.to_string_lossy(),
                     gettext("No such file or directory")
                 ));
                 Ok(ExecResult::NotFound)
             } else {
-                diag::error(&format!("{}: {}", util, e));
+                diag::error(&format!("{}: {}", util.to_string_lossy(), e));
                 Ok(ExecResult::CannotInvoke)
             }
         }
@@ -239,20 +260,22 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
     }
 }
 
+/// Input is parsed as bytes: an argument is a byte string, as a pathname is,
+/// and is handed to the utility exactly as read.  The delimiters (<blank>,
+/// <newline>, quotes, backslash, NUL) are all single ASCII bytes, which never
+/// occur inside a multibyte UTF-8 character.
 struct ParseState {
     // cmdline-related state
     util_size: usize,
 
     // input state
-    tmp_arg: String,
+    tmp_arg: Vec<u8>,
     in_arg: bool,
     in_quote: bool,
     in_escape: bool,
-    quote_char: char,
+    quote_char: u8,
     skip_remainder: bool,
     null_slop: Vec<u8>,
-    // Incomplete trailing UTF-8 bytes carried across read() boundaries.
-    pending: Vec<u8>,
     // Set when a <newline> appears inside a quoted string (an error per POSIX:
     // a quoted string is "non-<quote> non-<newline> characters") or a quote is
     // left unterminated at end of input.
@@ -270,7 +293,39 @@ struct ParseState {
     exit_on_overflow: bool,
 
     // parsed args, ready for exec
-    args: VecDeque<String>,
+    args: VecDeque<Vec<u8>>,
+    // Bytes of `args`, each counted with its terminating NUL.
+    args_size: usize,
+}
+
+/// True for a <blank> byte.
+fn is_blank(byte: u8) -> bool {
+    byte == b' ' || byte == b'\t'
+}
+
+/// `line` without its leading <blank> bytes.
+fn trim_leading_blanks(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|&b| !is_blank(b))
+        .unwrap_or(line.len());
+    &line[start..]
+}
+
+/// `word` with every occurrence of `from` replaced by `to`.
+fn replace_bytes(word: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    if from.is_empty() {
+        return word.to_vec();
+    }
+    let mut out = Vec::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(pos) = rest.windows(from.len()).position(|w| w == from) {
+        out.extend_from_slice(&rest[..pos]);
+        out.extend_from_slice(to);
+        rest = &rest[pos + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
 }
 
 impl ParseState {
@@ -285,14 +340,13 @@ impl ParseState {
 
         ParseState {
             util_size: total,
-            tmp_arg: String::new(),
+            tmp_arg: Vec::new(),
             in_arg: false,
             in_quote: false,
             in_escape: false,
-            quote_char: '"',
+            quote_char: b'"',
             skip_remainder: false,
             null_slop: Vec::new(),
-            pending: Vec::new(),
             unmatched_quote: false,
             line_count: 0,
             max_lines: args.lines,
@@ -302,15 +356,31 @@ impl ParseState {
             max_args: args.maxnum,
             exit_on_overflow,
             args: VecDeque::new(),
+            args_size: 0,
         }
     }
 
+    /// Queue a parsed argument for the next command.
+    fn push_arg(&mut self, arg: Vec<u8>) {
+        self.args_size += arg.len() + 1; // +1 for null terminator
+        self.args.push_back(arg);
+    }
+
+    /// Take the oldest queued argument.
+    fn pop_arg(&mut self) -> Option<Vec<u8>> {
+        let arg = self.args.pop_front()?;
+        self.args_size -= arg.len() + 1;
+        Some(arg)
+    }
+
+    /// Queue the argument being accumulated.
+    fn push_tmp_arg(&mut self) {
+        let arg = mem::take(&mut self.tmp_arg);
+        self.push_arg(arg);
+    }
+
     fn current_cmd_size(&self) -> usize {
-        let mut total = self.util_size;
-        for arg in &self.args {
-            total += arg.len() + 1; // +1 for null terminator
-        }
-        total
+        self.util_size + self.args_size
     }
 
     fn full(&self) -> bool {
@@ -335,11 +405,11 @@ impl ParseState {
     }
 
     /// Check if a single argument is too large to fit
-    fn arg_too_large(&self, arg: &str) -> bool {
+    fn arg_too_large(&self, arg: &[u8]) -> bool {
         self.util_size + arg.len() + 1 > self.max_bytes
     }
 
-    fn remove_args(&mut self) -> Vec<String> {
+    fn remove_args(&mut self) -> Vec<OsString> {
         let mut total = self.util_size;
         let mut ret = Vec::new();
 
@@ -350,9 +420,9 @@ impl ParseState {
             }
 
             // add the next arg
-            let arg = self.args.pop_front().unwrap();
+            let arg = self.pop_arg().unwrap();
             total += arg.len() + 1; // +1 for null terminator
-            ret.push(arg);
+            ret.push(OsString::from_vec(arg));
 
             // stop if we have reached the max number of args
             // POSIX: -n limits stdin arguments only, not utility command-line args
@@ -372,58 +442,6 @@ impl ParseState {
         ret
     }
 
-    /// Decode a freshly-read byte chunk into a `String`, prepending any
-    /// incomplete UTF-8 sequence carried over from the previous read and
-    /// stashing a new incomplete trailing sequence for the next read. An
-    /// invalid byte sequence in the middle is replaced with U+FFFD. This keeps
-    /// multibyte characters intact instead of mangling each byte via `as char`.
-    fn decode_chunk(&mut self, buf: &[u8]) -> String {
-        let mut bytes = mem::take(&mut self.pending);
-        bytes.extend_from_slice(buf);
-
-        let mut out = String::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            match std::str::from_utf8(&bytes[i..]) {
-                Ok(s) => {
-                    out.push_str(s);
-                    i = bytes.len();
-                }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    if valid > 0 {
-                        out.push_str(unsafe {
-                            std::str::from_utf8_unchecked(&bytes[i..i + valid])
-                        });
-                        i += valid;
-                    }
-                    match e.error_len() {
-                        Some(n) => {
-                            out.push('\u{FFFD}');
-                            i += n;
-                        }
-                        None => {
-                            // Incomplete trailing sequence: keep for next read.
-                            self.pending = bytes[i..].to_vec();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Decode any leftover pending bytes at end-of-input, lossily (there is no
-    /// more data to complete a truncated sequence).
-    fn take_pending_lossy(&mut self) -> String {
-        if self.pending.is_empty() {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&mem::take(&mut self.pending)).to_string()
-        }
-    }
-
     // args are null-separated, without any further processing.
     // if the input data crosses a null boundary, the remainder is
     // stored as state for the next call to parse_buf_null.
@@ -432,45 +450,33 @@ impl ParseState {
             return;
         }
 
-        // pull prior state into current buffer
-        let mut buf = Vec::with_capacity(self.null_slop.len() + in_buf.len());
-        buf.extend_from_slice(&self.null_slop);
-        buf.extend_from_slice(in_buf);
-        self.null_slop.clear();
-
-        // divide buffer into null-terminated strings, with remainder
-        let mut start = 0;
-        let mut end = 0;
-        while end < buf.len() {
-            if buf[end] == 0 {
-                let s = String::from_utf8_lossy(&buf[start..end]).to_string();
-                self.args.push_back(s);
-                start = end + 1;
-            }
-            end += 1;
+        let mut rest = in_buf;
+        while let Some(pos) = rest.iter().position(|&b| b == 0) {
+            let mut arg = mem::take(&mut self.null_slop);
+            arg.extend_from_slice(&rest[..pos]);
+            self.push_arg(arg);
+            rest = &rest[pos + 1..];
         }
 
         // remember remainder, if any, for next call
-        if start < buf.len() {
-            self.null_slop.extend_from_slice(&buf[start..]);
-        }
+        self.null_slop.extend_from_slice(rest);
     }
 
-    fn parse_buf(&mut self, text: &str) {
+    fn parse_buf(&mut self, text: &[u8]) {
         if self.skip_remainder {
             return;
         }
 
         let mut prev_was_blank = false;
 
-        for ch in text.chars() {
+        for &ch in text {
             if self.in_quote {
                 if ch == self.quote_char {
                     self.in_quote = false;
                     self.in_arg = false;
-                    self.args.push_back(mem::take(&mut self.tmp_arg));
+                    self.push_tmp_arg();
                     self.line_has_content = true;
-                } else if ch == '\n' {
+                } else if ch == b'\n' {
                     // A <newline> inside a quoted string is not permitted.
                     self.unmatched_quote = true;
                     return;
@@ -480,18 +486,18 @@ impl ParseState {
                 prev_was_blank = false;
             } else if self.in_escape {
                 self.in_escape = false;
-                if ch == '\n' {
+                if ch == b'\n' {
                     // Escaped newline: in -L mode, this continues the line
                     // but doesn't add anything to the argument
                 } else {
                     self.tmp_arg.push(ch);
                 }
                 prev_was_blank = false;
-            } else if ch == '\n' {
+            } else if ch == b'\n' {
                 // End of line
                 if self.in_arg {
                     self.in_arg = false;
-                    self.args.push_back(mem::take(&mut self.tmp_arg));
+                    self.push_tmp_arg();
                     self.line_has_content = true;
                 }
 
@@ -519,20 +525,20 @@ impl ParseState {
                     // Empty lines don't count
                 }
                 prev_was_blank = false;
-            } else if self.in_arg && (ch == ' ' || ch == '\t') {
+            } else if self.in_arg && is_blank(ch) {
                 self.in_arg = false;
-                self.args.push_back(mem::take(&mut self.tmp_arg));
+                self.push_tmp_arg();
                 self.line_has_content = true;
                 prev_was_blank = true;
-            } else if ch == '\'' || ch == '"' {
+            } else if ch == b'\'' || ch == b'"' {
                 self.in_arg = true;
                 self.in_quote = true;
                 self.quote_char = ch;
                 prev_was_blank = false;
-            } else if ch == '\\' {
+            } else if ch == b'\\' {
                 self.in_escape = true;
                 prev_was_blank = false;
-            } else if ch == ' ' || ch == '\t' {
+            } else if is_blank(ch) {
                 // ignore leading/inter-arg whitespace
                 prev_was_blank = true;
             } else {
@@ -543,29 +549,36 @@ impl ParseState {
         }
     }
 
+    /// Queue the line accumulated in insert mode, without its leading
+    /// <blank> characters, unless that leaves it empty.
+    fn push_insert_line(&mut self) {
+        let line = mem::take(&mut self.tmp_arg);
+        let trimmed = trim_leading_blanks(&line);
+        if !trimmed.is_empty() {
+            let arg = trimmed.to_vec();
+            self.push_arg(arg);
+        }
+    }
+
     /// Parse text for -I insert mode: lines are separated only by newlines,
     /// blanks are preserved within arguments
-    fn parse_buf_insert(&mut self, text: &str) {
+    fn parse_buf_insert(&mut self, text: &[u8]) {
         if self.skip_remainder {
             return;
         }
 
-        for ch in text.chars() {
+        for &ch in text {
             if self.in_escape {
                 self.in_escape = false;
-                if ch == '\n' {
+                if ch == b'\n' {
                     // Escaped newline: continue line, don't add newline
                 } else {
                     self.tmp_arg.push(ch);
                 }
-            } else if ch == '\n' {
+            } else if ch == b'\n' {
                 // End of line - this is our argument (trim leading blanks)
-                let trimmed = self.tmp_arg.trim_start().to_string();
-                if !trimmed.is_empty() {
-                    self.args.push_back(trimmed);
-                }
-                self.tmp_arg.clear();
-            } else if ch == '\\' {
+                self.push_insert_line();
+            } else if ch == b'\\' {
                 self.in_escape = true;
             } else {
                 self.tmp_arg.push(ch);
@@ -581,21 +594,16 @@ impl ParseState {
 
         if self.in_arg {
             self.in_arg = false;
-            self.args.push_back(mem::take(&mut self.tmp_arg));
+            self.push_tmp_arg();
             self.line_has_content = true;
         } else if !self.tmp_arg.is_empty() {
             // For insert mode: finalize any remaining content
-            let trimmed = self.tmp_arg.trim_start().to_string();
-            if !trimmed.is_empty() {
-                self.args.push_back(trimmed);
-            }
-            self.tmp_arg.clear();
+            self.push_insert_line();
         }
 
         if !self.null_slop.is_empty() {
-            let s = String::from_utf8_lossy(&self.null_slop).to_string();
-            self.args.push_back(s);
-            self.null_slop.clear();
+            let arg = mem::take(&mut self.null_slop);
+            self.push_arg(arg);
         }
 
         // Count final partial line if it had content
@@ -605,9 +613,13 @@ impl ParseState {
     }
 
     fn postprocess(&mut self, args: &Args) {
-        if !args.eofstr.is_empty() {
-            if let Some(pos) = self.args.iter().position(|s| s == &args.eofstr) {
-                self.args.truncate(pos);
+        let eofstr = args.eofstr.as_bytes();
+        if !eofstr.is_empty() {
+            if let Some(pos) = self.args.iter().position(|s| s == eofstr) {
+                while self.args.len() > pos {
+                    let arg = self.args.pop_back().unwrap();
+                    self.args_size -= arg.len() + 1;
+                }
                 self.skip_remainder = true;
             }
         }
@@ -618,16 +630,16 @@ impl ParseState {
 /// replacing replstr in utility args with the input
 fn exec_insert_mode(
     args: &Args,
-    replstr: &str,
-    input_arg: &str,
+    replstr: &OsStr,
+    input_arg: &[u8],
     trace: bool,
     prompt: bool,
 ) -> io::Result<ExecResult> {
     // Replace replstr with input_arg in each utility argument
-    let util_args: Vec<String> = args
+    let util_args: Vec<OsString> = args
         .util_args
         .iter()
-        .map(|arg| arg.replace(replstr, input_arg))
+        .map(|arg| OsString::from_vec(replace_bytes(arg.as_bytes(), replstr.as_bytes(), input_arg)))
         .collect();
 
     // POSIX: Check that constructed arguments don't exceed the limit
@@ -695,14 +707,19 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
     // For line mode, read line-by-line to properly batch
     if line_mode {
         let stdin = io::stdin();
-        let reader = BufReader::new(stdin.lock());
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = Vec::new();
 
-        for line_result in reader.lines() {
-            let line = line_result?;
-
-            // Parse the line (add newline since BufReader strips it)
-            let line_with_nl = format!("{}\n", line);
-            state.parse_buf(&line_with_nl);
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            // A last line without its <newline> still ends there.
+            if line.last() != Some(&b'\n') {
+                line.push(b'\n');
+            }
+            state.parse_buf(&line);
             if check_quote_error(&state) {
                 return Ok(1);
             }
@@ -740,12 +757,10 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
             if args.null_mode {
                 state.parse_buf_null(&buffer[..n_read]);
             } else if insert_mode {
-                let text = state.decode_chunk(&buffer[..n_read]);
-                state.parse_buf_insert(&text);
+                state.parse_buf_insert(&buffer[..n_read]);
                 state.postprocess(args);
             } else {
-                let text = state.decode_chunk(&buffer[..n_read]);
-                state.parse_buf(&text);
+                state.parse_buf(&buffer[..n_read]);
                 if check_quote_error(&state) {
                     return Ok(1);
                 }
@@ -756,7 +771,7 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
             if insert_mode {
                 let replstr = args.replstr.as_ref().unwrap();
                 while !state.args.is_empty() {
-                    let input_arg = state.args.pop_front().unwrap();
+                    let input_arg = state.pop_arg().unwrap();
 
                     if state.exit_on_overflow && state.arg_too_large(&input_arg) {
                         err_arg_too_long();
@@ -792,16 +807,6 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
                 }
             }
         }
-
-        // Flush any incomplete trailing bytes (lossily) before finalizing.
-        let leftover = state.take_pending_lossy();
-        if !leftover.is_empty() {
-            if insert_mode {
-                state.parse_buf_insert(&leftover);
-            } else {
-                state.parse_buf(&leftover);
-            }
-        }
     }
 
     // finalize parsing
@@ -817,7 +822,7 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
     if insert_mode {
         let replstr = args.replstr.as_ref().unwrap();
         while !state.args.is_empty() {
-            let input_arg = state.args.pop_front().unwrap();
+            let input_arg = state.pop_arg().unwrap();
 
             if state.exit_on_overflow && state.arg_too_large(&input_arg) {
                 err_arg_too_long();

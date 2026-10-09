@@ -658,7 +658,8 @@ fn extract_hardlink(
     // To the file this run extracted at the target's name, pinned, when it
     // made one: someone who can write that directory can have put another
     // file at the name since. A target this run did not make is linked by
-    // name.
+    // name -- under -k, that includes a file someone put at the name before
+    // the run, which is what GNU tar and cp -n link to as well.
     let target_key = target_member.key();
     link_replacing_with(
         target_parent.as_raw_fd(),
@@ -669,14 +670,19 @@ fn extract_hardlink(
         name,
         options.no_clobber,
     )?;
-    // This name holds that file now, for a later member linked to it; and
-    // linking it changed the file's ctime.
+    // Linking it changed the file's ctime. And this name holds that file
+    // now, for a later member linked to it -- unless -k left another file
+    // there.
     let Some(target) = links.made.get_mut(&target_key) else {
         return Ok(());
     };
     target.linked(dirfd, name);
-    let shared = target.share();
-    links.record_made(member.key(), shared);
+    let holds_it = lstat_at(dirfd.as_raw_fd(), name)
+        .is_ok_and(|st| crate::modes::anchored::file_id(&st) == target.id());
+    if holds_it {
+        let shared = target.share();
+        links.record_made(member.key(), shared);
+    }
 
     Ok(())
 }

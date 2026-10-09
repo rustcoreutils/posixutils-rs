@@ -570,3 +570,39 @@ fn link_member_follows_a_target_renamed_by_i() {
         Some((made.dev(), made.ino()))
     );
 }
+
+/// Under -k a link member whose name is taken leaves that file alone, and
+/// its name is not the file it names: a later link member naming it is
+/// linked to the file that was there, not to the earlier member's target.
+#[test]
+fn link_member_kept_by_k_is_not_recorded_as_its_target() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("g"), "was here\n").unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let options = ReadOptions {
+        no_clobber: true,
+        ..Default::default()
+    };
+    let file = own_member("f", EntryType::Regular, 0o644);
+    let mut h = link_member("g");
+    h.path = PathBuf::from("h");
+    let mut archive = Members(vec![file, link_member("f"), h].into_iter());
+    while let Some(entry) = archive.read_entry().unwrap() {
+        let _ = extract_entry(
+            &mut archive,
+            &entry,
+            &options,
+            &mut links,
+            &tree,
+            &mut pending,
+        );
+    }
+    let id = |name: &str| {
+        let md = std::fs::metadata(tmp.path().join(name)).unwrap();
+        (md.dev(), md.ino())
+    };
+    assert_ne!(id("g"), id("f"), "-k replaced g");
+    assert_eq!(id("h"), id("g"), "h is not the file g holds");
+}

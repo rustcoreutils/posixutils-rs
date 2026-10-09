@@ -12,6 +12,7 @@ use gettextrs::gettext;
 use plib::locale::next_char_offset;
 use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -1156,14 +1157,28 @@ fn locale_chars(chars: &[char]) -> Vec<Vec<u8>> {
 /// version of that file. `None` the rest of the time, for standard output.
 static IN_PLACE_OUTPUT: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
 
+/// Set once the output has been left without the <newline> of a last input
+/// line that lacked one. Any further output starts by writing it, as GNU
+/// sed's does, so `p` on such a line writes it twice, each on a line of its
+/// own, rather than run together; output that ends there stays without one.
+static NEWLINE_OWED: AtomicBool = AtomicBool::new(false);
+
 /// Write `bytes` to the output: standard output, or under `-i` the new
 /// version of the file being edited. sed's data is bytes in the current
 /// locale, not UTF-8; a write error ends sed with GNU's I/O status, 4.
 fn emit(bytes: &[u8]) {
+    let owed: &[u8] = if NEWLINE_OWED.swap(false, Ordering::Relaxed) {
+        b"\n"
+    } else {
+        b""
+    };
     let mut in_place = IN_PLACE_OUTPUT.lock().unwrap();
     let result = match in_place.as_mut() {
-        Some(file) => file.write_all(bytes),
-        None => std::io::stdout().write_all(bytes),
+        Some(file) => file.write_all(owed).and_then(|()| file.write_all(bytes)),
+        None => {
+            let mut out = std::io::stdout();
+            out.write_all(owed).and_then(|()| out.write_all(bytes))
+        }
     };
     if let Err(err) = result {
         eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
@@ -1878,6 +1893,16 @@ impl Sed {
         self.current_end.as_deref().unwrap_or_default().as_bytes()
     }
 
+    /// [`emit`] the end of an output line: the current line's terminator, or
+    /// for a last line that lacks one, nothing yet -- the <newline> is owed,
+    /// and written only if more output follows.
+    fn emit_end(&self) {
+        match &self.current_end {
+            Some(end) => emit(end.as_bytes()),
+            None => NEWLINE_OWED.store(true, Ordering::Relaxed),
+        }
+    }
+
     /// Executes one command for `line` string argument
     /// and updates [`Sed`] state
     fn execute(
@@ -1908,7 +1933,9 @@ impl Sed {
             }
             Command::DeletePatternAndPrintText(address, text) => {
                 // c
-                let _ = self.execute_c(command_position, address, text);
+                if let Ok(next) = self.execute_c(command_position, address, text) {
+                    instruction = next;
+                }
             }
             Command::DeletePattern(_, to_first_line) => {
                 // dD
@@ -2080,11 +2107,14 @@ impl Sed {
         command_position: usize,
         address: Option<Address>,
         text: String,
-    ) -> Result<(), SedError> {
+    ) -> Result<Option<ControlFlowInstruction>, SedError> {
         if address.is_none() {
+            // Delete the pattern space and start the next cycle, so there is
+            // nothing to print at the end of this one -- not even the end of
+            // a line, which for an unterminated last line would be owed.
             self.pattern_space.clear();
-            self.current_end = None;
             emit_line(&text);
+            return Ok(Some(ControlFlowInstruction::Continue));
         } else {
             let mut need_execute = self.need_execute(command_position)?;
             if need_execute {
@@ -2112,7 +2142,7 @@ impl Sed {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn execute_d(&mut self, to_first_line: bool) -> Option<ControlFlowInstruction> {
@@ -2158,7 +2188,7 @@ impl Sed {
             Some(newline) => emit(&self.pattern_space[..=newline]),
             None => {
                 emit(&self.pattern_space);
-                emit(self.end());
+                self.emit_end();
             }
         }
     }
@@ -2171,16 +2201,15 @@ impl Sed {
     }
 
     /// Flush the deferred `a`/`r` output queue. Called just before the next
-    /// input line is read (and at the end of each cycle). Emits a separating
-    /// newline first when the previous output line lacked a terminator, exactly
-    /// like GNU's `output_missing_newline`.
+    /// input line is read (and at the end of each cycle). A <newline> owed by
+    /// an unterminated last line is written first, even when the queue holds
+    /// only an unreadable file, as GNU's `output_missing_newline` does.
     fn flush_appends(&mut self) {
         if self.append_queue.is_empty() {
             return;
         }
-        if self.current_end.is_none() {
-            emit(b"\n");
-        }
+        // Writes nothing but an owed <newline>.
+        emit(b"");
         for item in std::mem::take(&mut self.append_queue) {
             match item {
                 AppendItem::Text(text) => emit_line(&text),
@@ -2466,7 +2495,7 @@ impl Sed {
                         }
                         if !self.quiet {
                             emit(&self.pattern_space);
-                            emit(self.end());
+                            self.emit_end();
                         }
                         // Reading a new input line flushes deferred a/r output.
                         self.flush_appends();
@@ -2484,7 +2513,7 @@ impl Sed {
 
         if !self.quiet {
             emit(&self.pattern_space);
-            emit(self.end());
+            self.emit_end();
         }
 
         // Flush deferred a/r output at end of cycle, before the next line read.
@@ -2634,6 +2663,9 @@ impl Sed {
         let result = self.process_input();
         self.current_file = None;
         let output = IN_PLACE_OUTPUT.lock().unwrap().take();
+        // Each file is an output of its own: one left unterminated owes the
+        // next nothing.
+        NEWLINE_OWED.store(false, Ordering::Relaxed);
         let quit = result.map_err(|err| SedError::Runtime(name.to_string(), err.to_string()))?;
         if let Some(mut output) = output {
             output.flush().map_err(|e| fail("write", &e))?;

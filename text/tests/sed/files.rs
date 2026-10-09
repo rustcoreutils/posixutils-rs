@@ -70,6 +70,43 @@ fn unterminated_line_before_another_file() {
     sed_files(&["p", &path(&f1), &path(&f2)], "a\na\nb\nb\n", "", 0);
 }
 
+// The last line of the input, when it has no <newline>, is written without
+// one; but any output after it starts on a line of its own, as in GNU sed.
+// `p` ran the two copies together as "aa".
+#[test]
+fn unterminated_last_line_owes_a_newline_to_more_output() {
+    let f1 = TempFile::new("f1", "a");
+    let f2 = TempFile::new("f2", "x\n");
+    let (p1, p2) = (path(&f1), path(&f2));
+    sed_files(&["p", &p1], "a\na", "", 0);
+    sed_files(&["-n", "p;p", &p1], "a\na", "", 0);
+    sed_files(&["s/a//;p", &p1], "\n", "", 0);
+    sed_files(&["", &p1], "a", "", 0);
+    // Deferred `r` output pays the debt too, even for an unreadable file,
+    // but owes nothing when no line was written.
+    sed_files(&[&format!("$r {p2}"), &p1], "a\nx\n", "", 0);
+    sed_files(&["-n", &format!("$r {p2}"), &p1], "x\n", "", 0);
+    sed_files(&["$r /nonexistent/sed-input", &p1], "a\n", "", 0);
+}
+
+// Under -i each file is an output of its own, so the newline one file owes
+// is not written into the next.
+#[test]
+fn in_place_unterminated_line_owes_nothing_to_the_next_file() {
+    let dir = plib::tmp::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("f1"), "a").unwrap();
+    std::fs::write(dir.path().join("f2"), "b\n").unwrap();
+    let out = std::process::Command::new(plib::testing::get_binary_path("sed"))
+        .args(["-i", "p", "f1", "f2"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+    assert_eq!(read("f1"), "a\na");
+    assert_eq!(read("f2"), "b\nb\n");
+}
+
 // An unreadable operand is reported, the rest are still read, and the exit
 // status says something went wrong (GNU uses 2).
 #[test]

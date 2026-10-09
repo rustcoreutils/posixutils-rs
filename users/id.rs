@@ -197,9 +197,11 @@ fn get_group_info(userinfo: &mut UserInfo, is_named_user: bool) {
             }
 
             // Check if user is a member of this group
-            if grp.members.iter().any(|m| m == &userinfo.username) {
+            if grp.members.iter().any(|m| m == userinfo.username.as_str()) {
                 user_groups.push(grp.gid);
-                userinfo.group_names.insert(grp.gid, grp.name.clone());
+                userinfo
+                    .group_names
+                    .insert(grp.gid, grp.name.to_string_lossy().into_owned());
                 seen_gids.insert(grp.gid);
             }
         }

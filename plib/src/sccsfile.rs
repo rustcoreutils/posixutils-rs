@@ -365,7 +365,7 @@ pub fn real_login_name() -> String {
     let uid = unsafe { libc::getuid() };
     if let Some(user) = crate::user::get_by_uid(uid) {
         if !user.name.is_empty() {
-            return user.name;
+            return user.name.to_string_lossy().into_owned();
         }
     }
     std::env::var("LOGNAME")

@@ -25,8 +25,10 @@ use std::process::{self, Command};
 
 #[cfg(target_os = "linux")]
 use std::{
+    ffi::{OsStr, OsString},
     fs::File,
     io::{BufRead, BufReader},
+    os::unix::ffi::{OsStrExt, OsStringExt},
     os::unix::io::AsRawFd,
 };
 
@@ -326,8 +328,11 @@ fn check_perms(group: &Group, password: &passwd) -> Result<(), io::Error> {
     };
 
     // A member of the group (by primary gid or membership) needs no password.
-    let is_member =
-        group.gid == password.pw_gid || group.members.iter().any(|member| member == &pw_name);
+    let is_member = group.gid == password.pw_gid
+        || group
+            .members
+            .iter()
+            .any(|member| member.as_os_str() == pw_name.as_str());
 
     if is_member {
         return Ok(());
@@ -360,6 +365,13 @@ fn verify_group_password(group: &Group) -> Result<(), io::Error> {
         Some(p) if !p.is_empty() => p,
         _ => group.passwd.clone(),
     };
+    // A crypt(3) hash is ASCII; anything else cannot be one, so fail closed.
+    let stored = stored.into_string().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            gettext("malformed group password"),
+        )
+    })?;
 
     let hashed_input = pw_encrypt(&password_input, &stored)?;
 
@@ -397,8 +409,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Retrieves the shadow group password for `group_name` from /etc/gshadow.
+///
+/// Matched byte for byte: a group name need not be UTF-8, and a lossy decode
+/// could match some other group's line.
 #[cfg(target_os = "linux")]
-fn get_shadow_password(group_name: &str) -> Result<Option<String>, io::Error> {
+fn get_shadow_password(group_name: &OsStr) -> Result<Option<OsString>, io::Error> {
     let file = match File::open(GROUPSHADOW_PATH) {
         Ok(f) => f,
         // No gshadow (or not readable): fall back to the group-database field.
@@ -406,12 +421,12 @@ fn get_shadow_password(group_name: &str) -> Result<Option<String>, io::Error> {
     };
     let reader = BufReader::new(file);
 
-    for line in reader.lines() {
+    for line in reader.split(b'\n') {
         let line = line?;
-        let mut fields = line.splitn(3, ':');
+        let mut fields = line.splitn(3, |&b| b == b':');
         if let (Some(name), Some(passwd)) = (fields.next(), fields.next()) {
-            if name == group_name {
-                return Ok(Some(passwd.to_string()));
+            if name == group_name.as_bytes() {
+                return Ok(Some(OsString::from_vec(passwd.to_vec())));
             }
         }
     }
@@ -510,10 +525,10 @@ mod tests {
 
     fn grp(name: &str, gid: u32, members: &[&str], passwd: &str) -> Group {
         Group {
-            name: name.to_string(),
+            name: name.into(),
             gid,
-            members: members.iter().map(|s| s.to_string()).collect(),
-            passwd: passwd.to_string(),
+            members: members.iter().map(|&s| s.into()).collect(),
+            passwd: passwd.into(),
         }
     }
 

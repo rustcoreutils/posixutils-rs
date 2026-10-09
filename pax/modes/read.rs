@@ -1024,6 +1024,7 @@ fn set_made_attrs(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
 
     /// POSIX, ustar Interchange Format: "When the file is restored by a
     /// privileged, protection-preserving version of the utility, the user and
@@ -1054,8 +1055,8 @@ mod tests {
         let named = ArchiveEntry {
             uid: 0xffff_fff0,
             gid: 0xffff_fff0,
-            uname: Some(user.name.clone().into_bytes()),
-            gname: Some(group.name.clone().into_bytes()),
+            uname: Some(user.name.clone().into_vec()),
+            gname: Some(group.name.clone().into_vec()),
             ..Default::default()
         };
         let owner = ReadOptions {

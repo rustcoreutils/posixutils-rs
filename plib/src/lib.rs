@@ -25,6 +25,8 @@ pub mod lzw;
 pub mod madefs;
 #[cfg(unix)]
 pub mod modestr;
+#[cfg(unix)]
+mod nssbuf;
 pub mod optarg;
 pub mod perm;
 #[cfg(unix)]

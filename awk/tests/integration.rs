@@ -1336,3 +1336,26 @@ fn awk_unset_argument_becomes_the_callers_array() {
 fn test_awk_sort_index_entries() {
     test_awk!(sort_index_entries, "tests/awk/sort_index_entries.txt");
 }
+
+// An empty match is one match, wherever the search finds it: gsub(/$/, "X")
+// appended "XX" to the record, because the empty match at the end was found
+// again from its own position.
+#[test]
+fn awk_empty_match_at_end_is_counted_once() {
+    let cases = [
+        ("{ n = gsub(/$/, \"X\"); print n, $0 }", "1 abcX\n"),
+        ("{ n = gsub(/b*$/, \"X\"); print n, $0 }", "1 abcX\n"),
+        ("{ n = gsub(/c*$/, \"X\"); print n, $0 }", "1 abX\n"),
+        ("{ n = gsub(/x*/, \"-\"); print n, $0 }", "4 -a-b-c-\n"),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from("abc\n"),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

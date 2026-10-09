@@ -94,12 +94,12 @@ impl Iterator for MatchIter<'_> {
             end: self.string_offset(end),
         };
 
-        // Move past this match for next iteration
-        // Ensure we make progress even on zero-width matches
-        self.next_start = if m.end > 0 {
-            end
+        // Resume after the match; after an empty match, one character past
+        // it, or the next search would find the same empty match again.
+        self.next_start = if m.start == m.end {
+            self.next_char(end)
         } else {
-            self.next_char(self.next_start)
+            end
         };
 
         Some(result)

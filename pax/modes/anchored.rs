@@ -1315,7 +1315,10 @@ enum LinkSource<'a> {
     /// linked through its `self/fd/N` entry in a procfs-verified `/proc`
     /// (Linux).
     #[cfg(target_os = "linux")]
-    Pinned { proc_dir: File, pin: OwnedFd },
+    Pinned {
+        proc_dir: BorrowedFd<'static>,
+        pin: OwnedFd,
+    },
     /// A name, resolved again by `linkat`: `flags` is `AT_SYMLINK_FOLLOW` or
     /// 0, and `expected` what the link made is checked against afterwards.
     Name {

@@ -22,14 +22,16 @@ use gettextrs::gettext;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
-#[cfg(target_os = "linux")]
-use std::fs::File;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path};
 use std::rc::{Rc, Weak};
 use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 
 /// Open flags for a directory that is only ever walked through, used as the `dirfd` of an `*at`
 /// call, or `fstat`ed (`ChainTrust`).
@@ -1170,8 +1172,28 @@ pub fn chmod_pinned(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
 
 /// `/proc`, opened and verified to be procfs (`PROC_SUPER_MAGIC`), so that `self/fd/N` names
 /// exactly the inode open on descriptor N rather than whatever else is mounted or planted there.
+///
+/// Opened and verified once per process, on the first call, and held open from then on: every
+/// later call hands out the same descriptor, or the same failure. A pinned chmod, link or
+/// reopen used to open `/proc` by name and `fstatfs` it every time, a pair of system calls per
+/// file. Holding the verified descriptor is also safer than reopening by name: what is checked
+/// is what every later lookup goes through, whatever is mounted at `/proc` since. `self`
+/// resolves to whichever process looks it up, so a child forked after the first call that uses
+/// the descriptor still reaches its own `fd/N`. It is `O_CLOEXEC`, so nothing exec'd inherits
+/// it.
 #[cfg(target_os = "linux")]
-pub fn procfs_dir() -> io::Result<File> {
+pub fn procfs_dir() -> io::Result<BorrowedFd<'static>> {
+    static PROC: OnceLock<Result<OwnedFd, (Option<i32>, String)>> = OnceLock::new();
+    match PROC.get_or_init(|| open_procfs().map_err(|e| (e.raw_os_error(), e.to_string()))) {
+        Ok(fd) => Ok(fd.as_fd()),
+        Err((Some(errno), _)) => Err(io::Error::from_raw_os_error(*errno)),
+        Err((None, message)) => Err(io::Error::other(message.clone())),
+    }
+}
+
+/// Open `/proc` and verify it is procfs (`procfs_dir`).
+#[cfg(target_os = "linux")]
+fn open_procfs() -> io::Result<OwnedFd> {
     const PROC_SUPER_MAGIC: u32 = 0x9fa0;
     let fd = unsafe {
         libc::open(
@@ -1182,7 +1204,7 @@ pub fn procfs_dir() -> io::Result<File> {
     if fd == -1 {
         return Err(io::Error::last_os_error());
     }
-    let dir = unsafe { File::from_raw_fd(fd) };
+    let dir = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(dir.as_raw_fd(), st.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
@@ -2130,6 +2152,24 @@ mod tests {
 
     /// A made symbolic link's times by name reach only the pinned link, never a hard link to
     /// another file swapped in for it.
+    /// `/proc` is opened and verified once per process: every call hands out
+    /// the same descriptor, which stays open and procfs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_dir_is_verified_once_and_held() {
+        use std::os::fd::AsRawFd;
+        // Both held at once: two opens could not share a number.
+        let first = super::procfs_dir().unwrap();
+        let second = super::procfs_dir().unwrap();
+        assert_eq!(first.as_raw_fd(), second.as_raw_fd());
+        let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        assert_eq!(
+            unsafe { libc::fstatfs(second.as_raw_fd(), st.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(unsafe { st.assume_init() }.f_type as u32, 0x9fa0);
+    }
+
     #[test]
     fn link_times_by_name_reach_only_the_pinned_link() {
         use std::os::fd::AsRawFd;

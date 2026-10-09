@@ -2726,6 +2726,32 @@ mod tests {
     }
 }
 
+// POSIX.2024 sed, "Regular Expressions in sed": the delimiter "shall not
+// terminate the RE when it appears within a bracket expression, and shall have
+// its normal meaning in the bracket expression", for `s` and for a context
+// address alike. A backslash inside a bracket expression is an ordinary
+// character, so it does not escape the delimiter there either.
+#[test]
+fn delimiter_inside_bracket_expression_does_not_end_the_re() {
+    let cases: [(&[&str], &str, &str); 11] = [
+        (&["s/[/]/X/"], "a/b\n", "aXb\n"),
+        (&["-n", "/[/][/*]/p"], "a//b\n/*x\nab\n", "a//b\n/*x\n"),
+        (&["s/\\.[^/.][^/.]*$//"], "f.tar.gz\n", "f.tar\n"),
+        (&["-n", "\\%[%]%p"], "a%b\nab\n", "a%b\n"),
+        (&["s-[0-9]--g"], "a1b2\n", "ab\n"),
+        (&["s/[\\/]/X/g"], "a\\b/\n", "aXbX\n"),
+        (&["s/[]/]/X/g"], "a]b/c\n", "aXbXc\n"),
+        (&["s/[^]/]/X/g"], "]/a\n", "]/X\n"),
+        (&["s/[[:alpha:]/]/X/g"], "a:b/c\n", "X:XXX\n"),
+        (&["-E", "s/[^/]+/X/"], "ab/\n", "X/\n"),
+        // The replacement has no bracket expressions.
+        (&["s/a/[/;s/b/]/"], "ab\n", "[]\n"),
+    ];
+    for (args, input, output) in cases {
+        sed_test(args, input, output, "", 0);
+    }
+}
+
 // XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
 // below used to have the word after it refused as an unknown option.
 #[test]

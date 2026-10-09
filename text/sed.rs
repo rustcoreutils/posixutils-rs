@@ -678,7 +678,8 @@ fn parse_number(chars: &[char], i: &mut usize) -> Result<Option<usize>, SedError
 /// delimiter, and `\n` in an RE matches a <newline>. A backslash followed by a
 /// <newline> is a literal <newline>. Every other `\x` pair is kept intact
 /// for the regex compiler or the replacement expander; in a replacement whose
-/// delimiter is `&`, `\&` stays escaped so it remains a literal `&`.
+/// delimiter is `&`, `\&` stays escaped so it remains a literal `&`. In an
+/// RE, a bracket expression is copied by [`scan_bracket_expression`].
 fn scan_delimited(chars: &[char], i: &mut usize, delim: char, is_re: bool) -> Option<String> {
     let mut text = String::new();
     loop {
@@ -700,6 +701,74 @@ fn scan_delimited(chars: &[char], i: &mut usize, delim: char, is_re: bool) -> Op
                     text.push('\\');
                     text.push(next);
                 }
+                *i += 2;
+            }
+            '[' if is_re => scan_bracket_expression(chars, i, &mut text)?,
+            _ => {
+                text.push(ch);
+                *i += 1;
+            }
+        }
+    }
+}
+
+/// Copy the bracket expression that starts at `chars[*i]` (its `[`) into
+/// `text`, leaving `*i` just past its closing `]`. Returns `None` when the
+/// script ends, or a line does, before the expression does.
+///
+/// POSIX.2024 sed: the delimiter "shall not terminate the RE when it appears
+/// within a bracket expression, and shall have its normal meaning in the
+/// bracket expression", so `s/[/]/X/` replaces a `/`. A backslash is an
+/// ordinary character there (XBD 9.3.5) and is copied as is, delimiter or
+/// not, except that `\n` is a <newline> as it is in GNU sed, whose
+/// `[^\n]` idiom scripts rely on. A `]` first in the list (after any `^`) is
+/// a member, and `[:class:]`, `[=equiv=]` and `[.coll.]` may hold a `]`.
+fn scan_bracket_expression(chars: &[char], i: &mut usize, text: &mut String) -> Option<()> {
+    text.push('[');
+    *i += 1;
+    if chars.get(*i) == Some(&'^') {
+        text.push('^');
+        *i += 1;
+    }
+    if chars.get(*i) == Some(&']') {
+        text.push(']');
+        *i += 1;
+    }
+    loop {
+        let ch = *chars.get(*i)?;
+        match ch {
+            '\n' => return None,
+            ']' => {
+                text.push(']');
+                *i += 1;
+                return Some(());
+            }
+            '[' if matches!(chars.get(*i + 1), Some(':' | '=' | '.')) => {
+                let kind = chars[*i + 1];
+                text.push('[');
+                text.push(kind);
+                *i += 2;
+                // Copy through the closing `kind]`.
+                loop {
+                    let c = *chars.get(*i)?;
+                    if c == '\n' {
+                        return None;
+                    }
+                    text.push(c);
+                    *i += 1;
+                    if c == kind && chars.get(*i) == Some(&']') {
+                        text.push(']');
+                        *i += 1;
+                        break;
+                    }
+                }
+            }
+            '\\' if chars.get(*i + 1) == Some(&'n') => {
+                text.push('\n');
+                *i += 2;
+            }
+            '\\' if chars.get(*i + 1) == Some(&'\\') => {
+                text.push_str("\\\\");
                 *i += 2;
             }
             _ => {

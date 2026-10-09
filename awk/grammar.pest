@@ -79,26 +79,32 @@ close    = { "close" ~ !(letter | "_" | digit) }
 fflush   = { "fflush" ~ !(letter | "_" | digit) }
 system   = { "system" ~ !(letter | "_" | digit) }
 
-keyword = {
-    ("foreach"
-  | "function"
+// A keyword is a whole word: `nextchar`, `printer` and `elsewhere` are names.
+// `kw` guards each keyword literal below, so that a statement or expression
+// starting with a longer name is not read as the keyword plus the rest.
+keyword = @{
+    ("function"
   | "continue"
   | "getline"
   | "printf"
   | "return"
   | "while"
   | "break"
-  | "begin"
+  | "BEGIN"
   | "else"
   | "exit"
+  | "nextfile"
   | "next"
+  | "delete"
   | "print"
   | "for"
-  | "end"
+  | "END"
   | "if"
   | "do"
   | "in") ~ !(letter | "_" | digit)
 }
+
+kw = _{ &keyword }
 
 program = { SOI ~ opt_newline ~ (item ~ terminator)* ~ item? ~ opt_newline ~ EOI }
 
@@ -149,7 +155,7 @@ terminated_statement = _{
   | terminatable_statement ~ ";" ~ opt_newline
 }
 
-t_if       =  { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ terminated_statement ~ (!"else" | "else" ~ opt_newline ~ terminated_statement) }
+t_if       =  { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ terminated_statement ~ (!(kw ~ "else") | kw ~ "else" ~ opt_newline ~ terminated_statement) }
 t_while    =  { "while" ~ "(" ~ expr ~ ")" ~ opt_newline ~ terminated_statement }
 t_for      =  { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_statement? ~ ")" ~ opt_newline ~ terminated_statement }
 t_foreach  =  { "for" ~ "(" ~ name ~ in_op ~ name ~ ")" ~ opt_newline ~ terminated_statement }
@@ -163,7 +169,7 @@ unterminated_statement = _{
   | ut_foreach
 }
 
-ut_if      = { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ (terminated_statement ~ "else" ~ opt_newline ~ unterminated_statement | unterminated_statement) }
+ut_if      = { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ (terminated_statement ~ kw ~ "else" ~ opt_newline ~ unterminated_statement | unterminated_statement) }
 ut_while   = { "while" ~ "(" ~ expr ~ ")" ~ opt_newline ~ unterminated_statement }
 ut_for     = { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_statement? ~ ")" ~ opt_newline ~ unterminated_statement }
 ut_foreach = { "for" ~ "(" ~ name ~ in_op ~ name ~ ")" ~ opt_newline ~ unterminated_statement }
@@ -179,14 +185,14 @@ terminatable_statement = _{
   | simple_statement
 }
 
-do_while      = { "do" ~ opt_newline ~ terminated_statement ~ "while" ~ "(" ~ expr ~ ")" }
-next          = { "next" }
-nextfile      = { "nextfile" }
-break_stmt    = { "break" }
-continue_stmt = { "continue" }
+do_while      = { kw ~ "do" ~ opt_newline ~ terminated_statement ~ "while" ~ "(" ~ expr ~ ")" }
+next          = { kw ~ "next" }
+nextfile      = { kw ~ "nextfile" }
+break_stmt    = { kw ~ "break" }
+continue_stmt = { kw ~ "continue" }
 
-return_stmt = { "return" ~ expr? }
-exit_stmt   = { "exit" ~ expr? }
+return_stmt = { kw ~ "return" ~ expr? }
+exit_stmt   = { kw ~ "exit" ~ expr? }
 
 simple_statement = {
     array_delete
@@ -195,17 +201,17 @@ simple_statement = {
 }
 
 array_delete = {
-    "delete" ~ name ~ ("[" ~ expr ~ "]")?
+    kw ~ "delete" ~ name ~ ("[" ~ expr ~ "]")?
 }
 
 print_stmt = {
     (printf_call | simple_printf | print_call | simple_print) ~ output_redirection?
 }
 
-simple_print       =  { "print" ~ print_expr_list? }
-print_call         =  { "print" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
-simple_printf      =  { "printf" ~ print_expr_list }
-printf_call        =  { "printf" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
+simple_print       =  { kw ~ "print" ~ print_expr_list? }
+print_call         =  { kw ~ "print" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
+simple_printf      =  { kw ~ "printf" ~ print_expr_list }
+printf_call        =  { kw ~ "printf" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
 output_redirection = _{
     truncate
   | append
@@ -354,14 +360,14 @@ input_function = {
   | simple_getline
 }
 
-getline_from_file_cmp = { "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr ~ comp_op ~ expr }
+getline_from_file_cmp = { kw ~ "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr ~ comp_op ~ expr }
 
-simple_getline    = { "getline" ~ lvalue? }
-getline_from_file = { "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr }
+simple_getline    = { kw ~ "getline" ~ lvalue? }
+getline_from_file = { kw ~ "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr }
 
 simple_getline_file_expr = { prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
 getline_from_pipe = { unpiped_expr ~ (piped_getline)+ }
-piped_getline     = { "|" ~ "getline" ~ lvalue? }
+piped_getline     = { "|" ~ kw ~ "getline" ~ lvalue? }
 
 unpiped_expr           = {
     unpiped_input_function

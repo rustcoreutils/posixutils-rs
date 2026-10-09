@@ -1144,3 +1144,55 @@ fn awk_syntax_error_before_a_failing_function_terminates() {
         assert_ne!(status, Some(0), "{program:?}");
     }
 }
+
+// A keyword is a whole word, and only BEGIN and END are reserved, in
+// capitals.  `begin`, `end` and `foreach` are ordinary names, and so is a
+// name that starts with a keyword: `nextchar` is not `next` followed by
+// `char`, `exitcode = 4` does not exit, and `elsewhere` after an `if` is not
+// its `else`.  texindex.awk has `function join(array, start, end, sep)` and
+// `nextchar = kchars[3]`.
+#[test]
+fn awk_keywords_are_whole_words() {
+    let cases = [
+        ("BEGIN { nextchar = 1; print nextchar }", "1\n"),
+        (
+            "BEGIN { breakx = 2; continued = 3; print breakx, continued }",
+            "2 3\n",
+        ),
+        ("BEGIN { exitcode = 4; print exitcode }", "4\n"),
+        (
+            "BEGIN { returned = 5; doit = 6; print returned, doit }",
+            "5 6\n",
+        ),
+        (
+            "BEGIN { printer = 7; printfx = 8; print printer, printfx }",
+            "7 8\n",
+        ),
+        (
+            "BEGIN { deleted = 9; getlines = 10; print deleted, getlines }",
+            "9 10\n",
+        ),
+        (
+            "BEGIN { if (0) x = 1\nelsewhere = 11; print elsewhere }",
+            "11\n",
+        ),
+        ("BEGIN { if (0) x = 1; else print 12 }", "12\n"),
+        (
+            "function j(a, start, end) { return start end } BEGIN { print j(0, 1, 2) }",
+            "12\n",
+        ),
+        ("BEGIN { begin = 3; end = 4; print begin + end }", "7\n"),
+        ("BEGIN { foreach = \"f\"; print foreach }", "f\n"),
+        ("BEGIN { endx = 1; Begin = 2; print endx, Begin }", "1 2\n"),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::new(),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

@@ -1222,3 +1222,15 @@ fn test_ls_acl_plus_flag_describes_the_link_itself() {
         }
     });
 }
+
+/// Started with SIGPIPE ignored, `ls` into a closed pipe reports the write
+/// error and exits nonzero, rather than dying by the ignored signal or
+/// panicking in `println!`.
+/// See `plib::testing::assert_epipe_when_sigpipe_ignored`.
+#[test]
+fn test_ls_reports_epipe_when_sigpipe_is_ignored() {
+    let dir = plib::tmp::tempdir().unwrap();
+    fs::File::create(dir.path().join("f")).unwrap();
+
+    plib::testing::assert_epipe_when_sigpipe_ignored("ls", &[dir.path().to_str().unwrap()], 1);
+}

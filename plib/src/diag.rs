@@ -100,7 +100,10 @@ pub fn init(utility: &str) {
 ///   signal every historical utility gets. A utility that writes into a pager
 ///   or filter it spawned itself needs `EPIPE` for *that* pipe, and holds a
 ///   [`crate::io::SigPipeIgnored`] across the write rather than changing the
-///   disposition for its whole run.
+///   disposition for its whole run. A `SIG_IGN` the process inherited is
+///   kept, and a write to a closed pipe is then a write error.
+/// - [`crate::io::report_stdout_write_errors`] — a failed `println!` is
+///   reported as `UTILITY: write error: REASON` with exit 1, not a panic.
 /// - `setlocale(LC_ALL, "")` — inherits the locale from the environment so that
 ///   locale-sensitive libc functions (`<ctype.h>`/`<wctype.h>`, `strcoll`,
 ///   `strftime`, `nl_langinfo`, …) observe `LC_*`. The gettextrs wrapper applies
@@ -140,6 +143,7 @@ pub fn init(utility: &str) {
 pub fn init_locale(utility: &str) {
     use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
     crate::io::restore_sigpipe();
+    crate::io::report_stdout_write_errors(utility);
     setlocale(LocaleCategory::LcAll, "");
     #[cfg(windows)]
     {

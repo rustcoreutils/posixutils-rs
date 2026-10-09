@@ -365,18 +365,6 @@ fn installed_locale(candidates: &[&str]) -> Option<String> {
         .map(|name| (*name).to_string())
 }
 
-/// Assert that a utility dies by `SIGPIPE` when the reader of its standard
-/// output goes away, writing nothing to standard error.
-///
-/// The Rust runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so without
-/// [`crate::io::restore_sigpipe`] — which [`crate::diag::init_locale`] now
-/// calls — the write fails with `EPIPE`, libstd panics with "failed printing
-/// to stdout: Broken pipe", and the process exits 101. A shell reports the
-/// correct outcome as 141.
-///
-/// `cmd` is the binary name as [`get_binary_path`] resolves it. The utility
-/// must produce enough output that it is still writing when the pipe closes;
-/// `args` should name something large.
 /// Fill `buf`, looping until it is full or the stream ends.
 ///
 /// Returns how many bytes arrived, so a caller can tell "the stream really is
@@ -419,6 +407,18 @@ pub fn assert_hyphen_option_argument(cmd: &str, args: &[&str]) -> Output {
     output
 }
 
+/// Assert that a utility dies by `SIGPIPE` when the reader of its standard
+/// output goes away, writing nothing to standard error.
+///
+/// The Rust runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so without
+/// [`crate::io::restore_sigpipe`] — which [`crate::diag::init_locale`] now
+/// calls — the write fails with `EPIPE`, libstd panics with "failed printing
+/// to stdout: Broken pipe", and the process exits 101. A shell reports the
+/// correct outcome as 141.
+///
+/// `cmd` is the binary name as [`get_binary_path`] resolves it. The utility
+/// must produce enough output that it is still writing when the pipe closes;
+/// `args` should name something large.
 #[cfg(unix)]
 pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
     use std::os::unix::process::ExitStatusExt as _;
@@ -488,6 +488,53 @@ pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
         "{}: a closed pipe is not an error to report: {:?}",
         cmd,
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Assert that a utility started with `SIGPIPE` ignored, as `trap '' PIPE`
+/// in a shell leaves it, reports a write to a closed pipe as a write error:
+/// it exits with `status`, is not killed by a signal, does not panic, and
+/// says "Broken pipe" on standard error.
+///
+/// POSIX keeps an ignored signal ignored across `exec`, and a process may
+/// rely on that to see `EPIPE` instead of dying. Resetting the disposition
+/// to the default at startup -- what [`crate::io::restore_sigpipe`] did
+/// unconditionally -- killed the utility anyway, and the shell saw 141.
+///
+/// The reader end of standard output is closed before the utility starts,
+/// so its first write fails; any output at all reaches the error.
+#[cfg(unix)]
+pub fn assert_epipe_when_sigpipe_ignored(cmd: &str, args: &[&str], status: i32) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap '' PIPE; exec \"$0\" \"$@\"")
+        .arg(get_binary_path(cmd))
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("spawn {}: {}", cmd, e));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.signal(),
+        None,
+        "{cmd}: killed by a signal although SIGPIPE was ignored; stderr {stderr:?}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(status),
+        "{cmd}: wrong exit status for a write error; stderr {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Broken pipe") && !stderr.contains("panicked"),
+        "{cmd}: expected a write-error diagnostic, got {stderr:?}"
     );
 }
 

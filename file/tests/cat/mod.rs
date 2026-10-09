@@ -100,3 +100,15 @@ fn test_cat_dies_by_sigpipe_on_a_closed_pipe() {
 
     plib::testing::assert_dies_by_sigpipe("cat", &[big.to_str().unwrap()]);
 }
+
+/// Started with SIGPIPE ignored, `cat` into a closed pipe reports the write
+/// error and exits 1 instead of dying by the signal it was told to ignore.
+/// See `plib::testing::assert_epipe_when_sigpipe_ignored`.
+#[test]
+fn test_cat_reports_epipe_when_sigpipe_is_ignored() {
+    let dir = tempdir().unwrap();
+    let f = dir.path().join("f");
+    std::fs::write(&f, "hello\n").unwrap();
+
+    plib::testing::assert_epipe_when_sigpipe_ignored("cat", &[f.to_str().unwrap()], 1);
+}

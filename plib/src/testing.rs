@@ -87,6 +87,51 @@ pub fn os_bytes(bytes: &[u8]) -> OsString {
     std::ffi::OsStr::from_bytes(bytes).to_os_string()
 }
 
+/// Make the entry `name`, raw bytes that need not be valid UTF-8, in `dir`
+/// by calling `create` with its path, and return that path; or return `None`,
+/// after saying so on stderr, when the filesystem refuses the name.
+///
+/// POSIX file names are byte strings, but some filesystems store only
+/// UTF-8: macOS APFS fails such a name with `EILSEQ`, and others answer
+/// `EINVAL`. A test whose subject is a non-UTF-8 name then skips that part
+/// rather than failing. Any other error is a broken test and panics.
+///
+/// `create` makes whatever kind of entry the test needs: a file, a directory
+/// or a symlink.
+#[cfg(unix)]
+pub fn create_non_utf8(
+    dir: &Path,
+    name: &[u8],
+    create: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Option<PathBuf> {
+    let path = dir.join(os_bytes(name));
+    match create(&path) {
+        Ok(()) => Some(path),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EILSEQ | libc::EINVAL)) => {
+            eprintln!("skipping: filesystem refuses non-UTF-8 name {path:?}: {e}");
+            None
+        }
+        Err(e) => panic!("create {path:?}: {e}"),
+    }
+}
+
+/// Whether the filesystem holding `dir` accepts a file name that is not
+/// valid UTF-8, for a test whose utility, not the test, makes such a name.
+/// Probes with [`create_non_utf8`], so a refusal is reported the same way.
+#[cfg(unix)]
+pub fn non_utf8_names_supported(dir: &Path) -> bool {
+    let probe = create_non_utf8(dir, b"non-utf8-probe\xff", |p| {
+        std::fs::File::create(p).map(drop)
+    });
+    match probe {
+        Some(path) => {
+            std::fs::remove_file(&path).expect("remove non-UTF-8 probe file");
+            true
+        }
+        None => false,
+    }
+}
+
 /// Spawn a child process, retrying transient OS-level failures.
 ///
 /// The test suite runs many tests in parallel, each forking child processes
@@ -772,5 +817,51 @@ mod tests {
 
         let mut empty = Chunks(vec![]);
         assert_eq!(read_until_full(&mut empty, &mut buf), 0);
+    }
+
+    /// A filesystem that refuses the name the way APFS does (`EILSEQ`), or
+    /// the way others do (`EINVAL`), gives `None`, so the test skips.
+    #[cfg(unix)]
+    #[test]
+    fn create_non_utf8_reports_a_refused_name_as_none() {
+        use super::create_non_utf8;
+        let dir = crate::tmp::tempdir().unwrap();
+        for errno in [libc::EILSEQ, libc::EINVAL] {
+            let got = create_non_utf8(dir.path(), b"x\xff", |_| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(got, None, "errno {errno}");
+        }
+    }
+
+    /// Any other failure is the test's own fault and panics.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "Permission denied")]
+    fn create_non_utf8_panics_on_another_error() {
+        let dir = crate::tmp::tempdir().unwrap();
+        super::create_non_utf8(dir.path(), b"x\xff", |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        });
+    }
+
+    /// An accepted name comes back as the path the creator was handed, the
+    /// raw bytes joined to the directory; on a filesystem that refuses it,
+    /// nothing is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn create_non_utf8_returns_the_created_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::tmp::tempdir().unwrap();
+        match super::create_non_utf8(dir.path(), b"d\xfe", |p| std::fs::create_dir(p)) {
+            Some(path) => {
+                assert!(path.is_dir());
+                assert_eq!(path.file_name().unwrap().as_bytes(), b"d\xfe");
+                assert!(super::non_utf8_names_supported(dir.path()));
+            }
+            None => assert!(!super::non_utf8_names_supported(dir.path())),
+        }
+        // The probe removed its file; only the directory, if made, is left.
+        assert!(std::fs::read_dir(dir.path()).unwrap().count() <= 1);
     }
 }

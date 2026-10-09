@@ -11,6 +11,7 @@ mod bytes;
 mod files;
 mod inplace;
 mod options;
+mod separate;
 #[cfg(unix)]
 mod wfile;
 

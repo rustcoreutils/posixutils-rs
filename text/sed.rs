@@ -37,6 +37,9 @@ struct Args {
     #[arg(short = 'i', long = "in-place", value_name = "SUFFIX", num_args = 0..=1, require_equals = true, default_missing_value = "", help=gettext("Edit each file in place, keeping the original under its name plus SUFFIX if one is given (GNU extension)."))]
     in_place: Option<String>,
 
+    #[arg(short = 's', long = "separate", help=gettext("Read each file as a stream of its own, with its own line numbers and last line (GNU extension)."))]
+    separate: bool,
+
     #[arg(short = 'n', help=gettext("Suppress the default output. Only lines explicitly selected for output are written."))]
     quiet: bool,
 
@@ -221,6 +224,7 @@ impl Args {
             quiet: self.quiet,
             script,
             in_place: self.in_place,
+            separate: self.separate,
             input_sources: self.file.into(),
             current_input: String::new(),
             pending_line: None,
@@ -1804,6 +1808,8 @@ struct Sed {
     script: Script,
     /// `-i`: edit each file in place, with this backup suffix (may be empty)
     in_place: Option<String>,
+    /// `-s`: each input file is a stream of its own, as under `-i`
+    separate: bool,
     /// The input files not yet opened, read in turn as one stream
     input_sources: VecDeque<String>,
     /// The operand the current file was opened as, for diagnostics
@@ -2565,11 +2571,30 @@ impl Sed {
         if let Some(suffix) = self.in_place.take() {
             return self.edit_in_place(&suffix);
         }
+        if self.separate {
+            return self.process_separately();
+        }
         // POSIX: the input files are one stream, so line numbers, `$`, the
         // hold space and open ranges all run on from one file into the next.
         self.process_input()
             .map(drop)
             .map_err(|err| SedError::Runtime(self.current_input.clone(), err.to_string()))
+    }
+
+    /// `-s`: run the script over each input file as a stream of its own, the
+    /// way `-i` does but writing to standard output. A file that cannot be
+    /// read is reported and skipped; a `q` ends the run.
+    fn process_separately(&mut self) -> Result<(), SedError> {
+        for name in std::mem::take(&mut self.input_sources) {
+            self.input_sources.push_back(name);
+            let quit = self
+                .process_input()
+                .map_err(|err| SedError::Runtime(self.current_input.clone(), err.to_string()))?;
+            if quit {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// `-i`: edit each input file in place, as a stream of its own (its own

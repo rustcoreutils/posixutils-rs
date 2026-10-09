@@ -611,6 +611,12 @@ Debian source packages, with GNU patch's meaning:
    mode, and renamed over the name, so a symbolic link operand is replaced by
    a regular file, not written through.  Unlike GNU sed, a FIFO is refused
    rather than read, and a suffix that names another directory is refused.
+ * `-s` / `--separate` — each file is a stream of its own, as under `-i`, but
+   the output goes to standard output: line numbers restart, `$` is each
+   file's last line.  As under `-i`, the hold space and a range still open
+   carry over to the next file, where GNU sed 4.9 starts each file with both
+   cleared.  A file that cannot be read is reported and skipped; `q` ends the
+   run.
  * `PROJECT_NAME` — selects the gettext text domain.
 
 ### sh

@@ -1222,3 +1222,49 @@ fn test_copy_followed_link_onto_itself_keeps_the_link() {
         assert_eq!(fs::read_to_string(temp.path().join("f")).unwrap(), "F\n");
     }
 }
+
+/// A directory that maps onto itself is walked while -s renames its entries
+/// into it. The walk's own readdir then meets the files the copy has just
+/// made there, and copied each onto itself again: "file would overwrite
+/// itself", or under -l "Unable to link file to itself". With enough entries
+/// the directory is read in several batches, and some of the new names fall
+/// in a later one. Under -l the new names are the sources themselves, linked,
+/// so a name the source already had must still be copied.
+#[test]
+fn test_copy_onto_itself_does_not_revisit_its_own_output() {
+    const FILES: usize = 2000;
+    for flags in [&["-rw"][..], &["-rw", "-l"][..]] {
+        let temp = TempDir::new().unwrap();
+        let d = temp.path().join("d");
+        fs::create_dir(&d).unwrap();
+        for i in 0..FILES {
+            fs::write(d.join(format!("f{i}")), format!("{i}\n")).unwrap();
+        }
+        fs::hard_link(d.join("f0"), d.join("fdup")).unwrap();
+        fs::create_dir(d.join("fdir")).unwrap();
+        fs::write(d.join("fdir/inner"), "inner\n").unwrap();
+
+        let mut args = flags.to_vec();
+        args.extend(["-s", ",^d/f,d/g,", "d", "."]);
+        let out = run_pax_in_dir(&args, temp.path());
+        assert_success(&out, &format!("pax {args:?}"));
+        assert!(!stderr_str(&out).contains("itself"), "{}", stderr_str(&out));
+        for i in 0..FILES {
+            let copied = fs::read_to_string(d.join(format!("g{i}"))).unwrap();
+            assert_eq!(copied, format!("{i}\n"), "{flags:?}");
+        }
+        assert_eq!(fs::read_to_string(d.join("gdup")).unwrap(), "0\n");
+        if flags.contains(&"-l") {
+            let ino = |name: &str| fs::metadata(d.join(name)).unwrap().ino();
+            assert_eq!(ino("g7"), ino("f7"));
+            assert_eq!(ino("gdup"), ino("f0"));
+        }
+        assert_eq!(fs::read_to_string(d.join("gdir/inner")).unwrap(), "inner\n");
+        // Each source once, and its copy once: nothing copied twice.
+        assert_eq!(
+            fs::read_dir(&d).unwrap().count(),
+            2 * (FILES + 2),
+            "{flags:?}"
+        );
+    }
+}

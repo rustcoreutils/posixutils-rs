@@ -10,8 +10,8 @@
 use clap::{Parser, ValueEnum};
 use gettextrs::gettext;
 use object::{
-    Object, ObjectSection, ObjectSymbol, SectionIndex, SectionKind, Symbol, SymbolKind,
-    SymbolScope, SymbolSection,
+    AddressSize, Object, ObjectSection, ObjectSymbol, SectionIndex, SectionKind, Symbol,
+    SymbolKind, SymbolScope, SymbolSection,
 };
 use plib::{diag, locale};
 use std::collections::HashMap;
@@ -257,9 +257,19 @@ fn print_symbols(symbols: &[SymInfo], args: &Args, radix: OutputType, prefix: &s
 /// Process one parsed object (a standalone file or an archive member).
 fn show_object(file: &object::File<'_>, args: &Args, radix: OutputType, prefix: &str) {
     let symbols = collect_symbols(file, args);
-    // As many digits as a hexadecimal address has, whatever the radix.
-    let width = if file.is_64() { 16 } else { 8 };
-    print_symbols(&symbols, args, radix, prefix, width);
+    print_symbols(&symbols, args, radix, prefix, value_width(file));
+}
+
+/// The default format's value width: as many digits as a hexadecimal address
+/// has, whatever the radix.  The architecture decides it, since a COFF object
+/// has no 32/64-bit class and reports itself 32-bit even on x86-64; the class
+/// still decides for an unknown architecture and keeps sub-32-bit ones at 8.
+fn value_width(file: &object::File<'_>) -> usize {
+    if file.is_64() || file.architecture().address_size() == Some(AddressSize::U64) {
+        16
+    } else {
+        8
+    }
 }
 
 fn process_input(args: &Args, path: &str, radix: OutputType, multiple: bool) -> Result<(), ()> {
@@ -367,4 +377,52 @@ fn main() {
     }
 
     std::process::exit(diag::exit_status());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_width;
+
+    /// A COFF object with no sections and no symbols for `machine`.
+    fn coff(machine: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 20];
+        b[0..2].copy_from_slice(&machine.to_le_bytes());
+        b
+    }
+
+    /// An ELF header with no sections for `class` (1 or 2) and `machine`.
+    fn elf(class: u8, machine: u16) -> Vec<u8> {
+        let size = if class == 2 { 64 } else { 52 };
+        let mut b = vec![0u8; size];
+        b[0..4].copy_from_slice(b"\x7fELF");
+        b[4] = class;
+        b[5] = 1; // little-endian
+        b[6] = 1; // EV_CURRENT
+        b[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
+        b[18..20].copy_from_slice(&machine.to_le_bytes());
+        b[20..24].copy_from_slice(&1u32.to_le_bytes());
+        let ehsize = if class == 2 { 52 } else { 40 };
+        b[ehsize..ehsize + 2].copy_from_slice(&(size as u16).to_le_bytes());
+        b
+    }
+
+    fn width(data: &[u8]) -> usize {
+        value_width(&object::File::parse(data).expect("parse"))
+    }
+
+    #[test]
+    fn coff_width_follows_the_architecture() {
+        assert_eq!(width(&coff(0x8664)), 16); // x86-64
+        assert_eq!(width(&coff(0xaa64)), 16); // aarch64
+        assert_eq!(width(&coff(0x014c)), 8); // i386
+    }
+
+    #[test]
+    fn elf_width_follows_the_class() {
+        assert_eq!(width(&elf(2, 62)), 16); // x86-64
+        assert_eq!(width(&elf(2, 183)), 16); // aarch64
+        assert_eq!(width(&elf(1, 3)), 8); // i386
+        assert_eq!(width(&elf(1, 62)), 8); // x32
+        assert_eq!(width(&elf(1, 40)), 8); // arm
+    }
 }

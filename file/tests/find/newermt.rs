@@ -100,3 +100,24 @@ fn test_find_newermt_errors() {
         );
     }
 }
+
+/// A DATE before the epoch with a fraction: `1969-12-31T23:59:59.5Z` is half a second before
+/// the epoch, so a file modified 1.2 seconds before the epoch is not newer than it, and one
+/// modified 0.3 seconds before the epoch is (as GNU find has it).
+#[test]
+fn test_find_newermt_before_epoch_fraction() {
+    let dir = TempDir::new().unwrap();
+    for (name, millis) in [("before", 1200), ("after", 300)] {
+        let file = File::create(dir.path().join(name)).unwrap();
+        file.set_modified(UNIX_EPOCH - Duration::from_millis(millis))
+            .unwrap();
+    }
+    let d = dir.path().to_str().unwrap();
+    let after = format!("{d}/after");
+    run_test_find_sorted(
+        &[d, "-type", "f", "-newermt", "1969-12-31T23:59:59.5Z"],
+        &[&after],
+        "",
+        0,
+    );
+}

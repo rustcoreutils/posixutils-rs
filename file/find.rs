@@ -830,20 +830,23 @@ fn parse_printf_format(format: &str) -> Result<Vec<PrintfItem>, String> {
     Ok(items)
 }
 
-/// Get the next argument or return an error
 /// The instant `-newermt DATE` names, read as `touch -d` and `date -d` read a date (a date
-/// without a zone is local time).
+/// without a zone is local time).  The parser gives floor seconds and non-negative nanoseconds,
+/// so the nanoseconds are added even before the epoch: -0.5 s is (-1, 500000000).
 fn parse_newermt_date(date: &str) -> Result<SystemTime, String> {
     let (secs, nanos) = plib::date_arg::parse(date, plib::date_arg::Zoneless::Local)?;
-    let since_epoch = Duration::new(secs.unsigned_abs(), nanos);
-    let instant = if secs >= 0 {
-        UNIX_EPOCH.checked_add(since_epoch)
+    let whole = Duration::from_secs(secs.unsigned_abs());
+    let whole_secs = if secs >= 0 {
+        UNIX_EPOCH.checked_add(whole)
     } else {
-        UNIX_EPOCH.checked_sub(since_epoch)
+        UNIX_EPOCH.checked_sub(whole)
     };
-    instant.ok_or_else(|| format!("invalid date format: '{date}'"))
+    whole_secs
+        .and_then(|t| t.checked_add(Duration::from_nanos(u64::from(nanos))))
+        .ok_or_else(|| format!("invalid date format: '{date}'"))
 }
 
+/// Get the next argument or return an error
 fn get_arg<'a>(tokens: &[&'a str], idx: &mut usize, primary: &str) -> Result<&'a str, String> {
     if *idx >= tokens.len() {
         return Err(format!("{} requires an argument", primary));

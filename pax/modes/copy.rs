@@ -172,10 +172,9 @@ impl CopyWalk<'_> {
 }
 
 /// The first copy of each multiply-linked file: the member path it was made
-/// at, and the copy made there (`MadeFile`, pinned within the budget) --
-/// `None` where -k kept a file already at that name.
+/// at, and the copy made there (`MadeFile`, pinned within the budget).
 struct CopiedLinks {
-    names: HardLinkTracker<(PathBuf, Option<MadeFile>)>,
+    names: HardLinkTracker<(PathBuf, MadeFile)>,
     pins: PinBudget<(u64, u64)>,
 }
 
@@ -188,7 +187,10 @@ impl CopiedLinks {
     }
 
     /// Record the first copy of the source file `(dev, ino)`, `made` at
-    /// `member`, within the budget of pins.
+    /// `member`, within the budget of pins. Nothing is recorded where -k
+    /// kept a file already at the name (`made` is `None`) -- found there
+    /// before the copy, or at the moment it was made: its later names are
+    /// then copied themselves, not linked to that file.
     fn record(
         &mut self,
         (dev, ino): (u64, u64),
@@ -197,15 +199,15 @@ impl CopiedLinks {
         made: Option<MadeFile>,
     ) {
         // A file with one name has no later name to be linked to it.
-        if nlink <= 1 {
+        let Some(made) = made.filter(|_| nlink > 1) else {
             return;
-        }
-        let pinned = made.as_ref().is_some_and(MadeFile::is_pinned);
+        };
+        let pinned = made.is_pinned();
         self.names
             .record(dev, ino, nlink, (member.to_path_buf(), made));
         let names = &mut self.names;
         self.pins.note((dev, ino), pinned, |key| {
-            if let Some((_, Some(made))) = names.by_key_mut(*key) {
+            if let Some((_, made)) = names.by_key_mut(*key) {
                 made.unpin();
             }
         });
@@ -849,15 +851,13 @@ fn copy_file(
             target_dir.as_raw_fd(),
             &target.leaf,
             None,
-            copy.as_ref().map(MadeFile::expected),
+            Some(copy.expected()),
             dirfd,
             name,
             options.no_clobber,
         )?;
         // Linking a name changed its ctime.
-        if let Some(copy) = copy {
-            copy.linked(dirfd, name);
-        }
+        copy.linked(dirfd, name);
         return Ok(());
     }
 
@@ -1113,6 +1113,17 @@ mod tests {
         let mut links = CopiedLinks::new();
         links.record((1, 2), 1, Path::new("f"), Some(made));
         assert_eq!(links.pins.held(), 0);
+        assert!(links.names.lookup(1, 2, 2).is_none());
+    }
+
+    /// Under -k a copy that finds its name taken at the moment it is made --
+    /// the check before it saw nothing there -- makes nothing, and its later
+    /// names are not linked to whatever holds that name: nothing is
+    /// remembered, as when -k finds the name taken beforehand.
+    #[test]
+    fn test_a_copy_kept_by_k_is_not_remembered() {
+        let mut links = CopiedLinks::new();
+        links.record((1, 2), 2, Path::new("f"), None);
         assert!(links.names.lookup(1, 2, 2).is_none());
     }
 

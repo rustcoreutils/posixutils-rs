@@ -539,3 +539,41 @@ fn test_subst_global_caret_anchors_once() {
     assert_eq!(list_substituted(b"aa", b",^a,,g", "C"), b"a\n");
     assert_eq!(list_substituted(b"aab", b",^a,X,g", "C"), b"Xab\n");
 }
+
+/// A `p` substitution reports each member's rename once. Under -i a member
+/// skipped at the prompt, after -s has renamed it, ends any earlier -i rename
+/// of its name -- and must not report its -s rename a second time doing so.
+#[test]
+fn test_subst_p_reports_a_member_skipped_under_i_once() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("x1"), "1\n").unwrap();
+    fs::write(src.join("x2"), "2\n").unwrap();
+    let archive = temp.path().join("a.tar");
+    let out = run_pax_in_dir(&["-w", "-f", archive.to_str().unwrap(), "x1", "x2"], &src);
+    assert!(out.status.success());
+    let dest = temp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+
+    // x1 (as y1) renamed to z at the prompt; x2 (as y2) skipped.
+    let args = ["-r", "-i", "-s", ",x,y,p", "-f", archive.to_str().unwrap()];
+    let (out, _) = run_pax_on_tty(&args, &dest, b"z\n\n", std::time::Duration::from_secs(10))
+        .expect("pax -r -i did not finish");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("x2 >> y2").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("x1 >> y1").count(), 1, "{stderr}");
+    assert!(dest.join("z").exists());
+    assert!(!dest.join("y2").exists());
+
+    // x2 turned away by a pattern, before -s ever saw it: nothing to report.
+    let dest = temp.path().join("dest2");
+    fs::create_dir(&dest).unwrap();
+    let mut args = args.to_vec();
+    args.push("x1");
+    let (out, _) = run_pax_on_tty(&args, &dest, b"z\n", std::time::Duration::from_secs(10))
+        .expect("pax -r -i x1 did not finish");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("x2 >> y2").count(), 0, "{stderr}");
+    assert!(dest.join("z").exists());
+}

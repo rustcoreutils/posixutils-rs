@@ -687,11 +687,19 @@ impl Links {
     /// a pattern, -u, or -i's skip. It is still the latest member of its
     /// name, which a link member naming it refers to, and it was not
     /// extracted: an earlier rename of the name no longer applies. Its name
-    /// after -s (and --strip-components) is what renames are kept under.
+    /// after -s (and --strip-components) is what renames are kept under,
+    /// substituted here without reporting it: a `p` substitution reports a
+    /// member's rename where -s renames the member, if it gets that far.
     fn turned_away(&mut self, original: PathBuf, options: &ReadOptions) {
-        let mut named = ArchiveEntry::new(original, EntryType::Regular);
-        if rename_member(&mut named, &options.substitutions, options.strip_components) {
-            self.named(None, &named.path);
+        let named =
+            substitute_link_target(&options.substitutions, &original).and_then(
+                |name| match options.strip_components {
+                    0 => Some(name),
+                    n => strip_leading_components(&name, n),
+                },
+            );
+        if let Some(named) = named {
+            self.named(None, &named);
         }
     }
 

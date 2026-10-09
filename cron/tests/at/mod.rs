@@ -51,7 +51,7 @@ fn run_test_at(
 
 #[test]
 fn test1() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let (_temp_dir, dir_path) = setup_test_env();
 
@@ -75,7 +75,7 @@ fn test1() {
 
 #[test]
 fn test2() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let (_temp_dir, dir_path) = setup_test_env();
 
@@ -99,7 +99,7 @@ fn test2() {
 
 #[test]
 fn test3() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -121,7 +121,7 @@ fn test3() {
 
 #[test]
 fn test4() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -143,7 +143,7 @@ fn test4() {
 
 #[test]
 fn test5() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -165,7 +165,7 @@ fn test5() {
 
 #[test]
 fn test6() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -187,7 +187,7 @@ fn test6() {
 
 #[test]
 fn test7() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -209,7 +209,7 @@ fn test7() {
 
 #[test]
 fn test8() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -231,7 +231,7 @@ fn test8() {
 
 #[test]
 fn test9() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -252,7 +252,7 @@ fn test9() {
 
 #[test]
 fn test10() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -274,7 +274,7 @@ fn test10() {
 
 #[test]
 fn test11() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -295,7 +295,7 @@ fn test11() {
 
 #[test]
 fn test12() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -318,7 +318,7 @@ fn test12() {
 // error (POSIX synopsis `at -r at_job_id...`).
 #[test]
 fn remove_requires_operand() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
     std::env::set_var("AT_JOB_DIR", &dir_path);
@@ -332,7 +332,7 @@ fn remove_requires_operand() {
 // equivalent to test1's single-operand "05:53amNOV4,2100".
 #[test]
 fn test_multi_operand_timespec() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_temp_dir, dir_path) = setup_test_env();
     fs::create_dir(&dir_path).expect("Unable to create test directory");
 
@@ -695,8 +695,17 @@ fn test_at_non_utf8_environment_and_directory() {
     fs::create_dir_all(&spool).unwrap();
     let allow = dir.path().join("at.allow");
     fs::write(&allow, format!("{}\n", whoami())).unwrap();
-    let cwd = dir.path().join(os_bytes(b"cwd\xff"));
-    fs::create_dir_all(&cwd).unwrap();
+    // macOS (APFS) refuses a name that is not UTF-8; there the directory part
+    // falls back to a plain name and only the environment is non-UTF-8.
+    let mut cwd = dir.path().join(os_bytes(b"cwd\xff"));
+    match fs::create_dir_all(&cwd) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EILSEQ) => {
+            cwd = dir.path().join("cwd");
+            fs::create_dir_all(&cwd).unwrap();
+        }
+        Err(e) => panic!("create test directory: {e}"),
+    }
 
     let mut child = std::process::Command::new(plib::testing::get_binary_path("at"))
         .args(["-m", "now", "+", "1", "hour"])

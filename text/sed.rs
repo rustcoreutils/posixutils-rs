@@ -10,13 +10,13 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 use plib::locale::next_char_offset;
+use plib::optarg::TakesArgument;
 use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    ffi::OsString,
     fmt::{self, Debug},
     fs::{File, Metadata, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Write},
@@ -33,7 +33,7 @@ struct Args {
     ere: bool,
 
     // GNU extension. The short form's suffix is only ever attached (`-i.bak`),
-    // and `rewrite_in_place` turns it into the long form before clap sees it.
+    // and `spell_optional_argument` turns it into the long form before clap sees it.
     #[arg(short = 'i', long = "in-place", value_name = "SUFFIX", num_args = 0..=1, require_equals = true, default_missing_value = "", help=gettext("Edit each file in place, keeping the original under its name plus SUFFIX if one is given (GNU extension)."))]
     in_place: Option<String>,
 
@@ -57,70 +57,6 @@ struct Args {
     sources: Vec<ScriptSource>,
 }
 
-/// Spell GNU's `-i[SUFFIX]` as `--in-place[=SUFFIX]`, which clap can parse.
-///
-/// The suffix of `-i` is the rest of its word, never the next word: `-i`
-/// alone keeps no backup, `-i.bak` keeps one, and `-ni~` is `-n` and a
-/// suffix of `~`. An `i` inside the script of `-e` or the name of `-f`
-/// (attached, or the next word) is left alone, as is everything after `--`.
-fn rewrite_in_place(argv: Vec<OsString>) -> Vec<OsString> {
-    let mut out = Vec::with_capacity(argv.len());
-    let mut words = argv.into_iter();
-    out.extend(words.next());
-    let mut option_argument_next = false;
-    let mut operands_only = false;
-    for word in words {
-        if option_argument_next || operands_only {
-            option_argument_next = false;
-            out.push(word);
-            continue;
-        }
-        let Some(text) = word.to_str() else {
-            out.push(word);
-            continue;
-        };
-        if text == "--" {
-            operands_only = true;
-        }
-        let Some(cluster) = text.strip_prefix('-').filter(|c| !c.is_empty()) else {
-            out.push(word);
-            continue;
-        };
-        if cluster.starts_with('-') {
-            out.push(word);
-            continue;
-        }
-        let mut rewritten = false;
-        for (pos, letter) in cluster.char_indices() {
-            match letter {
-                'e' | 'f' => {
-                    option_argument_next = pos + 1 == cluster.len();
-                    break;
-                }
-                'i' => {
-                    let (flags, suffix) = (&cluster[..pos], &cluster[pos + 1..]);
-                    if !flags.is_empty() {
-                        out.push(OsString::from(format!("-{flags}")));
-                    }
-                    out.push(OsString::from(if suffix.is_empty() {
-                        String::from("--in-place")
-                    } else {
-                        format!("--in-place={suffix}")
-                    }));
-                    rewritten = true;
-                    break;
-                }
-                // A flag, or a letter clap will refuse.
-                _ => {}
-            }
-        }
-        if !rewritten {
-            out.push(word);
-        }
-    }
-    out
-}
-
 /// One piece of the script: the text of a `-e`, or the file of a `-f`.
 #[derive(Debug, Clone)]
 enum ScriptSource {
@@ -136,7 +72,12 @@ impl Args {
     /// accepts counts: `-ne p`, `-es/a/b/`, `-fFILE`; and a word "-e" after
     /// `--` is the file operand it is.
     fn parse_ordered() -> Args {
-        let argv = rewrite_in_place(std::env::args_os().collect());
+        let argv = plib::optarg::spell_optional_argument(
+            std::env::args_os().collect(),
+            'i',
+            "in-place",
+            &[TakesArgument::Short('e'), TakesArgument::Short('f')],
+        );
         let matches = Args::command().get_matches_from(argv);
         let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 

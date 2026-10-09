@@ -268,6 +268,14 @@ but no daemon to run them.  Behavior follows Vixie cron:
    or UTC under `-u`.  With `-d` an operand must be a `+format`.  guile's
    build runs `date -u +FORMAT -d @SECONDS`; perl's passes `--utc -d` its
    changelog date.
+ * `-I[FMT]` / `--iso-8601[=FMT]` — write the time in GNU date's ISO 8601
+   form, to the precision `FMT` names: `date` (the default, `2026-10-09`),
+   `hours` (`2026-10-09T01+00:00`), `minutes`, `seconds`
+   (`2026-10-09T01:02:03+00:00`) or `ns` (`...T01:02:03,000000000+00:00`),
+   or any unambiguous prefix of one.  As with `-i` in sed, `FMT` is only
+   ever attached.  The offset is the local zone's, `+00:00` under `-u`.  A
+   second `-I` or a `+format` operand is an error.  binutils' debian/rules
+   runs `date -Idate -u -d` its changelog date.
 
 ### dd
 

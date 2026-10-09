@@ -355,3 +355,93 @@ fn test_date_d_rejections() {
         });
     }
 }
+
+/// -I[FMT] / --iso-8601[=FMT]: GNU's ISO 8601 output, the date by default.
+/// binutils' debian/rules runs `date -Idate -u -d "<changelog date>"`.
+#[test]
+fn test_iso_8601() {
+    let at = "@1700000000";
+    for (args, expected) in [
+        (&["-I"][..], "2023-11-14"),
+        (&["-Idate"], "2023-11-14"),
+        (&["--iso-8601"], "2023-11-14"),
+        (&["-Ihours"], "2023-11-14T22+00:00"),
+        (&["-Iminutes"], "2023-11-14T22:13+00:00"),
+        (&["-Iseconds"], "2023-11-14T22:13:20+00:00"),
+        (&["--iso-8601=seconds"], "2023-11-14T22:13:20+00:00"),
+        (&["-Ins"], "2023-11-14T22:13:20,000000000+00:00"),
+        // A value may be shortened to any unambiguous prefix.
+        (&["-Id"], "2023-11-14"),
+        (&["-Ih"], "2023-11-14T22+00:00"),
+        (&["-Im"], "2023-11-14T22:13+00:00"),
+        (&["-Is"], "2023-11-14T22:13:20+00:00"),
+        (&["--iso-8601=n"], "2023-11-14T22:13:20,000000000+00:00"),
+    ] {
+        let mut all = vec!["-u", "-d", at];
+        all.extend_from_slice(args);
+        date_d(&all, "EST5", expected);
+    }
+    date_d(
+        &["-Idate", "-u", "-d", "Mon, 03 Mar 2025 21:01:22 +0100"],
+        "EST5",
+        "2025-03-03",
+    );
+    date_d(
+        &["-Ins", "-d", "2007-11-12 10:15:30.25Z"],
+        "UTC0",
+        "2007-11-12T10:15:30,250000000+00:00",
+    );
+}
+
+/// The offset is the local zone's, with a colon, minutes included.
+#[cfg(unix)]
+#[test]
+fn test_iso_8601_offsets() {
+    let at = "@1700000000";
+    date_d(
+        &["-Idate", "-d", "Mon, 03 Mar 2025 01:01:22 +0100"],
+        "EST5",
+        "2025-03-02",
+    );
+    date_d(&["-Ihours", "-d", at], "EST5", "2023-11-14T17-05:00");
+    date_d(
+        &["-Iminutes", "-d", at],
+        "IST-5:30",
+        "2023-11-15T03:43+05:30",
+    );
+    date_d(
+        &["-Iseconds", "-d", at],
+        "NST3:30",
+        "2023-11-14T18:43:20-03:30",
+    );
+}
+
+/// Without -d, -I writes the current time.
+#[test]
+fn test_iso_8601_now() {
+    run_test_with_checker_and_env(date_plan(&["-I", "-u"]), &[], |_, output| {
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let shape: Vec<usize> = stdout.trim_end().split('-').map(str::len).collect();
+        assert_eq!(shape, [4, 2, 2], "{stdout:?}");
+    });
+}
+
+/// A FMT that names none of the formats, or a second output format, is an
+/// error, as in GNU date.
+#[test]
+fn test_iso_8601_rejections() {
+    for args in [
+        &["-Ifoo"][..],
+        &["--iso-8601="],
+        &["-I", "-I"],
+        &["-I", "+%Y"],
+        &["-Iseconds", "-d", "@0", "+%Y"],
+    ] {
+        run_test_with_checker_and_env(date_plan(args), &[("TZ", "UTC0")], |_, output| {
+            assert_eq!(output.status.code(), Some(1), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        });
+    }
+}

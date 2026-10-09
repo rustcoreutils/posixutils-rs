@@ -133,17 +133,48 @@ mod tests {
     /// every answer is the one asked for. Under the old `getpwuid`/`getpwnam`
     /// one thread's lookup overwrote the entry another was still reading, and
     /// a lookup for one user came back holding another's uid or name.
+    ///
+    /// Each answer is compared with one taken before the threads start by the
+    /// same kind of lookup. The two kinds need not agree on every field: macOS
+    /// answers a lookup by name and one by uid from different sources, and
+    /// gives root a different shell from each.
     #[test]
     fn concurrent_lookups_do_not_see_each_other() {
         const THREADS: usize = 8;
         const ROUNDS: usize = 10_000;
 
+        /// One user as each kind of lookup returns it.
+        #[derive(Clone)]
+        struct Expected {
+            uid: libc::uid_t,
+            by_uid: Option<User>,
+            by_name: Option<User>,
+        }
+
+        fn expected(uid: libc::uid_t) -> Expected {
+            let by_uid = lookup_by_uid(uid).unwrap();
+            let by_name = by_uid.as_ref().map(|u| {
+                lookup_by_name(&u.name)
+                    .unwrap()
+                    .expect("a user's name finds it")
+            });
+            if let (Some(a), Some(b)) = (&by_uid, &by_name) {
+                assert_eq!((&a.name, a.uid), (&b.name, b.uid));
+            }
+            Expected {
+                uid,
+                by_uid,
+                by_name,
+            }
+        }
+
         // SAFETY: geteuid never fails.
         let me = unsafe { libc::geteuid() };
-        let root = get_by_uid(0).expect("every system has a uid 0");
+        let root = expected(0);
+        assert!(root.by_uid.is_some(), "every system has a uid 0");
         // A uid with no database entry (a sparse container) still races
         // against root's lookups; it just has no name to look up.
-        let mine = get_by_uid(me);
+        let mine = expected(me);
 
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
@@ -153,16 +184,11 @@ mod tests {
                     for i in 0..ROUNDS {
                         // Threads start out of phase, so at any moment some
                         // are reading root's entry while others read mine.
-                        let want = if (i + t) % 2 == 0 {
-                            Some(&root)
-                        } else {
-                            mine.as_ref()
-                        };
-                        let uid = want.map_or(me, |u| u.uid);
-                        assert_eq!(lookup_by_uid(uid).unwrap().as_ref(), want, "by uid");
-                        if let Some(want) = want {
-                            let got = lookup_by_name(&want.name).unwrap();
-                            assert_eq!(got.as_ref(), Some(want), "by name");
+                        let want = if (i + t) % 2 == 0 { &root } else { &mine };
+                        assert_eq!(lookup_by_uid(want.uid).unwrap(), want.by_uid, "by uid");
+                        if let Some(by_name) = &want.by_name {
+                            let got = lookup_by_name(&by_name.name).unwrap();
+                            assert_eq!(got.as_ref(), Some(by_name), "by name");
                         }
                     }
                 })

@@ -155,16 +155,45 @@ mod tests {
 
     /// The group half of `user`'s static-buffer regression test: threads look
     /// up gid 0 and the caller's group, by gid and by name, and check every
-    /// answer is the one asked for.
+    /// answer is the one asked for. As there, each answer is compared with one
+    /// taken beforehand by the same kind of lookup, since the two kinds may
+    /// come from different sources.
     #[test]
     fn concurrent_lookups_do_not_see_each_other() {
         const THREADS: usize = 8;
         const ROUNDS: usize = 10_000;
 
+        /// One group as each kind of lookup returns it.
+        #[derive(Clone)]
+        struct Expected {
+            gid: libc::gid_t,
+            by_gid: Option<Group>,
+            by_name: Option<Group>,
+        }
+
+        fn expected(gid: libc::gid_t) -> Expected {
+            let by_gid = lookup_by_gid(gid).unwrap();
+            let by_name = by_gid.as_ref().map(|g| {
+                lookup_by_name(&g.name)
+                    .unwrap()
+                    .expect("a group's name finds it")
+            });
+            // Two groups may share a gid; the name is what a by-name lookup
+            // must give back.
+            if let (Some(a), Some(b)) = (&by_gid, &by_name) {
+                assert_eq!(a.name, b.name);
+            }
+            Expected {
+                gid,
+                by_gid,
+                by_name,
+            }
+        }
+
         // SAFETY: getegid never fails.
         let egid = unsafe { libc::getegid() };
-        let zero = get_by_gid(0);
-        let mine = get_by_gid(egid);
+        let zero = expected(0);
+        let mine = expected(egid);
 
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
@@ -172,17 +201,11 @@ mod tests {
                 let mine = mine.clone();
                 thread::spawn(move || {
                     for i in 0..ROUNDS {
-                        let (gid, want) = if (i + t) % 2 == 0 {
-                            (0, zero.as_ref())
-                        } else {
-                            (egid, mine.as_ref())
-                        };
-                        assert_eq!(lookup_by_gid(gid).unwrap().as_ref(), want, "by gid");
-                        if let Some(want) = want {
-                            let got = lookup_by_name(&want.name).unwrap();
-                            // Two groups may share a gid; the name is what a
-                            // by-name lookup must give back.
-                            assert_eq!(got.map(|g| g.name), Some(want.name.clone()), "by name");
+                        let want = if (i + t) % 2 == 0 { &zero } else { &mine };
+                        assert_eq!(lookup_by_gid(want.gid).unwrap(), want.by_gid, "by gid");
+                        if let Some(by_name) = &want.by_name {
+                            let got = lookup_by_name(&by_name.name).unwrap();
+                            assert_eq!(got.as_ref(), Some(by_name), "by name");
                         }
                     }
                 })

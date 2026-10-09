@@ -984,12 +984,8 @@ mod tests {
                 "",
                 "sed: can't find label for jump to `:label'\n",
             ),
-            (
-                "b label :label",
-                "aa\naa",
-                "",
-                "sed: label can't contain ' ' (line: 0, col: 14)\n",
-            ),
+            // A <blank> ends the label, as in GNU sed: `:label` follows.
+            ("b label :label", "aa\naa", "aa\naa", ""),
         ];
 
         for (script, input, output, err) in test_data {
@@ -1867,12 +1863,8 @@ mod tests {
                 "",
                 "sed: commands must be delimited with ';' (line: 0, col: 5)\n",
             ),
-            (
-                "t label :label",
-                "aa\naaa\n\n",
-                "",
-                "sed: label can't contain ' ' (line: 0, col: 14)\n",
-            ),
+            // A <blank> ends the label, as in GNU sed: `:label` follows.
+            ("t label :label", "aa\naaa\n\n", "aa\naaa\n\n", ""),
             (
                 // The <newline> separates commands: `t ab`, then line 2
                 // `cd; :ab` is a one-line `c` whose text is `d; :ab`, so the
@@ -2519,6 +2511,54 @@ mod tests {
     #[test]
     fn test_duplicate_labels_ok() {
         sed_test(&["-e", ":x", "-e", ":x"], "a\n", "a\n", "", 0);
+    }
+
+    /// A label of b, t or : ends at a <blank>, `;`, <newline>, `#` or `}`,
+    /// as in GNU sed, and leading <blank>s are skipped; what follows is the
+    /// next command.  POSIX leaves a label with these characters unspecified
+    /// (perl's debian/gen-patchlevel uses `:append H; d;`).  Every case was
+    /// checked against GNU sed 4.9.
+    #[test]
+    fn test_label_ends_at_blank() {
+        let t = |script: &str, input: &str, out: &str| sed_test(&["-n", script], input, out, "", 0);
+        t("b;p", "a\nb\n", "");
+        t("p;b end;p;:end", "a\nb\n", "a\nb\n");
+        t(":a;N;ba\np", "a\nb\nc\n", "");
+        t(": a;N;$!ba;p", "a\nb\nc\n", "a\nb\nc\n");
+        t("{b }\np", "a\n", "");
+        t("s/a/x/;t x ; p;:x;p", "a\n", "x\n");
+        t(":append p; p", "a\n", "a\na\n");
+        t(":x\tp", "a\n", "a\n");
+        t("bx \t;p;:x", "a\n", "");
+        t("bx\tp;:x\np", "a\n", "a\n");
+        t("b x  p;:x", "a\n", "");
+        t("b ;p", "a\n", "");
+        t("p;b # comment\np", "a\n", "a\n");
+        t("b x;p;:x#c\np", "a\n", "a\n");
+        t("b x{;p;:x{\np", "a\n", "a\n");
+        t("b a.b-c/d;p;:a.b-c/d\np", "a\n", "a\n");
+        t("1{s/a/b/;tx}\np;:x\np", "a\n", "b\n");
+        t("{:a};p", "a\n", "a\n");
+        // The address of `b` does not carry over to the command after the
+        // <blank>.
+        t("2b x p;p;:x", "a\nb\n", "a\na\n");
+        // `}` ends the label, so here it closes a block that was never opened.
+        sed_test(
+            &["-n", "bend};p;:end"],
+            "a\n",
+            "",
+            "sed: unneccessary '}' (line: 0, col: 5)\n",
+            1,
+        );
+        // Only <space> and <tab> are blanks here: a <vertical-tab> is part of
+        // the label.
+        sed_test(
+            &["-n", "bx\x0bp;:x\np"],
+            "a\n",
+            "",
+            "sed: can't find label for jump to `x\x0bp'\n",
+            1,
+        );
     }
 
     const VERSION_INPUT: &str = "foo\n#define VERSION \"3.25\"\na/b\na%b\na\\b\nbar\n";

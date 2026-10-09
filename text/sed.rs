@@ -1017,33 +1017,42 @@ fn control_escape(ch: char) -> Option<char> {
     }
 }
 
-/// Parse the label of a b, t or : [`Command`]. As in GNU sed, the label ends
-/// at a <newline>, `;`, `#` (which then begins a comment) or `}` (which
-/// closes the enclosing block).
-fn parse_word_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>, SedError> {
-    let mut label = String::new();
-    while let Some(ch) = chars.get(*i) {
-        match ch {
-            '\n' | ';' | '#' | '}' => {
-                *i -= 1;
-                break;
-            }
-            _ => label.push(*ch),
-        }
+/// The label of a b, t or : [`Command`], as [`parse_label`] reads it.
+struct Label {
+    /// The label, or `None` when it is empty.
+    name: Option<String>,
+    /// A <blank> ended the label, and with it the command: the next command
+    /// may follow without a `;`.
+    ended_by_blank: bool,
+}
+
+/// Parse the label of a b, t or : [`Command`] from `*i`, as GNU sed does:
+/// <blank>s before it are skipped, and it ends at a <blank>, `;`, <newline>,
+/// `#` (which then begins a comment) or `}` (which closes the enclosing
+/// block).  POSIX leaves a label with any of these characters unspecified.
+/// `*i` is left on the ending <blank>, or else just before the character
+/// that ended the label.
+fn parse_label(chars: &[char], i: &mut usize) -> Label {
+    while matches!(chars.get(*i), Some(' ' | '\t')) {
         *i += 1;
-        if *i > chars.len() {
+    }
+    let start = *i;
+    while let Some(ch) = chars.get(*i) {
+        if matches!(ch, ' ' | '\t' | '\n' | ';' | '#' | '}') {
             break;
         }
+        *i += 1;
     }
-    let label = label.trim().to_string();
-    if label.contains(' ') {
-        let position = get_current_line_and_col(chars, *i);
-        return Err(SedError::ScriptParse(
-            "label can't contain ' '".to_string(),
-            position,
-        ));
+    let name: String = chars[start..*i].iter().collect();
+    let ended_by_blank = matches!(chars.get(*i), Some(' ' | '\t'));
+    if !ended_by_blank {
+        // The caller steps onto the terminator, which it then parses.
+        *i -= 1;
     }
-    Ok(if label.is_empty() { None } else { Some(label) })
+    Label {
+        name: (!name.is_empty()).then_some(name),
+        ended_by_blank,
+    }
 }
 
 /// Parse rfile attribute of r [`Command`]
@@ -1374,6 +1383,7 @@ fn parse_commands(
     let mut command_added = false;
 
     while let Some(ch) = chars.get(i) {
+        let mut label_ended_by_blank = false;
         match *ch {
             ' ' | '\t' => {}
             // A comment runs to the <newline>, which still separates commands.
@@ -1443,8 +1453,9 @@ fn parse_commands(
             }
             'b' => {
                 i += 1;
-                let label = parse_word_attribute(chars, &mut i)?;
-                commands.push(Command::BranchToLabel(address.clone(), label));
+                let label = parse_label(chars, &mut i);
+                label_ended_by_blank = label.ended_by_blank;
+                commands.push(Command::BranchToLabel(address.clone(), label.name));
             }
             'c' => {
                 if let Some(text) = parse_text_attribute(chars, &mut i)? {
@@ -1528,8 +1539,9 @@ fn parse_commands(
             }
             't' => {
                 i += 1;
-                let label = parse_word_attribute(chars, &mut i)?;
-                commands.push(Command::Test(address.clone(), label));
+                let label = parse_label(chars, &mut i);
+                label_ended_by_blank = label.ended_by_blank;
+                commands.push(Command::Test(address.clone(), label.name));
             }
             'w' => {
                 match parse_path_attribute(chars, &mut i) {
@@ -1560,7 +1572,9 @@ fn parse_commands(
             }
             ':' => {
                 i += 1;
-                let Some(label) = parse_word_attribute(chars, &mut i)? else {
+                let label = parse_label(chars, &mut i);
+                label_ended_by_blank = label.ended_by_blank;
+                let Some(label) = label.name else {
                     let position = get_current_line_and_col(chars, i);
                     return Err(SedError::ScriptParse(
                         "label doesn't have name".to_string(),
@@ -1582,6 +1596,11 @@ fn parse_commands(
         if last_commands_count < commands.len() {
             last_commands_count = commands.len();
             command_added = true;
+        }
+        if label_ended_by_blank {
+            // The <blank> that ended a label separates commands, like `;`.
+            address = None;
+            command_added = false;
         }
         i += 1;
     }

@@ -697,6 +697,25 @@ impl Interpreter {
                     fields_state = lvalue.assign(value.clone(), global_env)?;
                     stack.push_value(value)?;
                 }
+                OpCode::AppendAssign => {
+                    let tail = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
+                    let lvalue = stack.pop_ref();
+                    lvalue.ensure_value_is_scalar()?;
+                    match &mut lvalue.value {
+                        // the compiler only appends to plain variables, so
+                        // there is no special variable or field to update
+                        AwkValueVariant::String(s) if lvalue.ref_type == AwkRefType::None => {
+                            s.concat(&tail)
+                        }
+                        _ => {
+                            let mut s = lvalue.clone().scalar_to_string(&global_env.convfmt)?;
+                            s.concat(&tail);
+                            fields_state = lvalue.assign(s, global_env)?;
+                        }
+                    }
+                }
                 OpCode::DeleteElement => {
                     let key = stack
                         .pop_scalar_value()?

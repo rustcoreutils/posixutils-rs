@@ -1598,3 +1598,56 @@ fn awk_nested_lvalues_parse_quickly() {
         assert_eq!(status, Some(0), "{program}");
     }
 }
+
+// `s = s t` appends to s in place, so building a string piece by piece is
+// linear: it copied the whole of s two or three times per append, and two
+// million appends never finished.  The result is the same as concatenating:
+// a number on the left is converted with CONVFMT, a numeric string from
+// input stops being numeric, and anything that may change s while the
+// right-hand side is evaluated keeps the ordinary evaluation order.
+#[test]
+fn awk_append_to_a_variable_is_linear() {
+    let cases = [
+        (
+            "BEGIN { for (i = 0; i < 2000000; i++) s = s \"x\"; print length(s) }",
+            "2000000\n",
+        ),
+        (
+            "function f(  l, i) { for (i = 0; i < 2000000; i++) l = l \"ab\"; return length(l) }
+             BEGIN { print f() }",
+            "4000000\n",
+        ),
+        (
+            "BEGIN { s = 0.1; CONVFMT = \"%.2f\"; s = s \"|\" 1 + 1 \"|\" 2; print s }",
+            "0.10|2|2\n",
+        ),
+        ("{ s = $1; s = s \"\"; print (s < 9) }", "1\n"),
+        ("BEGIN { s = \"a\"; s = s s s; print s }", "aaa\n"),
+        ("BEGIN { s = \"a\"; s = s (s = \"b\"); print s }", "ab\n"),
+        (
+            "BEGIN { s = \"a\"; s = s sub(/a/, \"c\", s) s; print s }",
+            "a1c\n",
+        ),
+        (
+            "function g() { s = \"z\"; return \"y\" } BEGIN { s = \"a\"; s = s g(); print s }",
+            "ay\n",
+        ),
+        ("BEGIN { s = \"a\"; s = s 1 < 2; print s }", "0\n"),
+        ("BEGIN { s = \"a\"; s = s \"b\" ~ /ab/; print s }", "1\n"),
+        ("BEGIN { s = 3; s = s - 1; print s }", "2\n"),
+        (
+            "BEGIN { x[1] = \"a\"; s = \"q\"; s = s x[1] substr(\"bcd\", 2) toupper(s); print s }",
+            "qacdQ\n",
+        ),
+        ("{ $0 = $0 \"y\"; print $1, NF }", "10y 1\n"),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "10\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}

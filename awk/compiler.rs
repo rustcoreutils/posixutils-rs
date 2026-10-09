@@ -328,6 +328,86 @@ fn lvalue_to_scalar_ref(instructions: &mut [OpCode]) {
     }
 }
 
+/// The only child of `pair`, if it has exactly one and it is a `kind`.
+fn only_child(pair: Pair<Rule>, kind: Rule) -> Option<Pair<Rule>> {
+    let mut inner = pair.into_inner();
+    let child = inner.next()?;
+    (inner.next().is_none() && child.as_rule() == kind).then_some(child)
+}
+
+/// The simple binary expression an `expr` consists of, if that is all it is.
+fn plain_binary_expr(expr: Pair<Rule>) -> Option<Pair<Rule>> {
+    let piped = only_child(
+        only_child(expr, Rule::input_function)?,
+        Rule::getline_from_pipe,
+    )?;
+    let ternary = only_child(only_child(piped, Rule::unpiped_expr)?, Rule::ternary_expr)?;
+    only_child(
+        only_child(ternary, Rule::binary_expr)?,
+        Rule::simple_binary_expr,
+    )
+}
+
+/// For the statement `s = s t...`, returns the lvalue s and the tokens of
+/// `t...`, if every operator in them binds at least as tightly as
+/// concatenation (so that the statement appends `t...` to s) and none of
+/// them can change a variable (so that s may be read after them).
+fn append_statement_parts(stmt: Pair<Rule>) -> Option<(Pair<Rule>, Pairs<Rule>)> {
+    let piped = only_child(
+        only_child(stmt, Rule::input_function)?,
+        Rule::getline_from_pipe,
+    )?;
+    let assignment = only_child(only_child(piped, Rule::unpiped_expr)?, Rule::assignment)?;
+    let mut parts = assignment.into_inner();
+    let (target, op, rhs) = (parts.next()?, parts.next()?, parts.next()?);
+    let name = only_child(target.clone(), Rule::name)?;
+    only_child(op, Rule::assign)?;
+
+    let mut tokens = plain_binary_expr(rhs)?.into_inner();
+    let first = only_child(tokens.next()?, Rule::name)?;
+    if first.as_str() != name.as_str() || tokens.next()?.as_rule() != Rule::concat {
+        return None;
+    }
+    tokens.peek()?;
+    let binds_looser_than_concat = |kind| {
+        matches!(
+            kind,
+            Rule::or | Rule::and | Rule::in_op | Rule::match_op | Rule::not_match | Rule::comp_op
+        )
+    };
+    if tokens
+        .clone()
+        .any(|t| binds_looser_than_concat(t.as_rule()))
+    {
+        return None;
+    }
+    let may_change_a_variable = |kind| {
+        matches!(
+            kind,
+            Rule::function_call
+                | Rule::assignment
+                | Rule::pre_inc
+                | Rule::pre_dec
+                | Rule::post_inc
+                | Rule::post_dec
+                | Rule::input_function
+                | Rule::unpiped_input_function
+                | Rule::piped_getline
+                | Rule::sub
+                | Rule::gsub
+                | Rule::split
+        )
+    };
+    if tokens
+        .clone()
+        .flatten()
+        .any(|t| may_change_a_variable(t.as_rule()))
+    {
+        return None;
+    }
+    Some((target, tokens))
+}
+
 fn normalize_builtin_function_arguments(
     function: BuiltinFunction,
     mut args: Vec<Instructions>,
@@ -1242,6 +1322,37 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compiles the statement `s = s t...`, where s is a plain variable, as
+    /// an in-place append of `t...` to s, and returns true; returns false,
+    /// compiling nothing, for any other statement.  Like gawk, it leaves alone
+    /// a right-hand side that could change s while it is evaluated (a call,
+    /// an assignment, sub, getline...), since s is read after it, not before.
+    fn compile_append(
+        &self,
+        stmt: Pair<Rule>,
+        instructions: &mut Instructions,
+        locals: &LocalMap,
+    ) -> Result<bool, PestError> {
+        let Some((target, tail)) = append_statement_parts(stmt) else {
+            return Ok(false);
+        };
+        let is_plain_variable = locals.contains_key(target.as_str())
+            || !matches!(
+                self.names.borrow().get(target.as_str()),
+                Some(GlobalName::SpecialVar(_) | GlobalName::Function { .. })
+            );
+        if !is_plain_variable {
+            return Ok(false);
+        }
+        let line_col = target.line_col();
+        self.compile_lvalue(target, instructions, locals)?;
+        lvalue_to_scalar_ref(&mut instructions.opcodes);
+        let tail = self.compile_simple_binary_expr(tail, locals)?;
+        instructions.extend(tail.instructions);
+        instructions.push(OpCode::AppendAssign, line_col);
+        Ok(true)
+    }
+
     fn compile_simple_statement(
         &mut self,
         simple_stmt: Pair<Rule>,
@@ -1266,8 +1377,10 @@ impl Compiler {
                 }
             }
             Rule::expr => {
-                self.compile_expr(stmt, instructions, locals)?;
-                instructions.push(OpCode::Pop, stmt_line_col);
+                if !self.compile_append(stmt.clone(), instructions, locals)? {
+                    self.compile_expr(stmt, instructions, locals)?;
+                    instructions.push(OpCode::Pop, stmt_line_col);
+                }
             }
             Rule::print_stmt => {
                 let mut inner = stmt.into_inner();

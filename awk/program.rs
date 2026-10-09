@@ -71,6 +71,11 @@ pub enum OpCode {
     // preceding it. Leaves the assigned value on top of the stack
     Assign,
 
+    // appends the string value on top of the stack to the variable referenced
+    // by the value preceding it, in place, popping both: `s = s t` as a
+    // statement, which would otherwise copy all of s for every append
+    AppendAssign,
+
     // deletes the key on top of the stack from the array preceding it
     DeleteElement,
     // clears the array on top of the stack

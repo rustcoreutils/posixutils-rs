@@ -901,3 +901,13 @@ fn test_find_operator_without_operand() {
         run_test_find(&args, "", &format!("find: {message}\n"), 1);
     }
 }
+
+// A failed write of a pathname is an error: find discarded it and exited 0.
+// -print0 output ends without a <newline>, so it is still buffered at exit.
+#[test]
+fn find_reports_write_error() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    plib::testing::assert_write_error_on_full_device("find", &[path], b"", 1);
+    plib::testing::assert_write_error_on_full_device("find", &[path, "-print0"], b"", 1);
+}

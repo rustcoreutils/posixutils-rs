@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+use gettextrs::gettext;
 use plib::modestr;
 
 /// Match `string` against a shell filename pattern using POSIX `fnmatch(3)`,
@@ -294,6 +295,8 @@ impl EvalResult {
 struct FindState {
     /// Whether any error occurred
     had_error: bool,
+    /// Whether a write to standard output failed (reported once)
+    stdout_failed: bool,
     /// Whether -depth was specified anywhere in expression
     depth_first: bool,
     /// Whether -xdev was specified anywhere in expression
@@ -317,6 +320,7 @@ impl FindState {
     fn new() -> Self {
         Self {
             had_error: false,
+            stdout_failed: false,
             depth_first: false,
             xdev: false,
             mount: false,
@@ -1148,16 +1152,15 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             EvalResult::new(plib::group::get_by_gid(gid).is_none())
         }
         Primary::Print => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            let _ = writeln!(handle, "{}", ctx.path.display());
+            let mut line = ctx.path.as_os_str().as_bytes().to_vec();
+            line.push(b'\n');
+            write_stdout(state, &line);
             EvalResult::new(true)
         }
         Primary::Print0 => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            let _ = handle.write_all(ctx.path.as_os_str().as_bytes());
-            let _ = handle.write_all(b"\0");
+            let mut name = ctx.path.as_os_str().as_bytes().to_vec();
+            name.push(b'\0');
+            write_stdout(state, &name);
             EvalResult::new(true)
         }
         Primary::Prune => {
@@ -1168,9 +1171,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             result
         }
         Primary::Printf(items) => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            let _ = handle.write_all(&format_printf(items, ctx));
+            write_stdout(state, &format_printf(items, ctx));
             EvalResult::new(true)
         }
         Primary::Depth => {
@@ -1549,9 +1550,26 @@ fn walk_operand(root: &Path, expr: &Expr, state: &mut FindState) {
 }
 
 /// Flush what find has written so far, so that it reaches standard output
-/// before anything a child utility writes there.
+/// before anything a child utility writes there. A failure is left in the
+/// buffer, and reported by the flush at the end of the run.
 fn flush_stdout() {
     let _ = io::stdout().flush();
+}
+
+/// Write `bytes` to standard output. A write error makes find's exit status
+/// nonzero and is reported once, not once per pathname.
+fn write_stdout(state: &mut FindState, bytes: &[u8]) {
+    if let Err(e) = io::stdout().lock().write_all(bytes) {
+        state.had_error = true;
+        if !state.stdout_failed {
+            state.stdout_failed = true;
+            plib::diag::error(&format!(
+                "{}: {}",
+                gettext("write error"),
+                plib::diag::io_error_text(&e)
+            ));
+        }
+    }
 }
 
 /// Run one `-exec ... {} +` invocation over a chunk of files. Returns whether
@@ -1655,6 +1673,12 @@ fn find(args: Vec<String>) -> Result<i32, String> {
 
     // Execute any pending batched commands
     execute_batches(&mut state);
+
+    // A final partial line (`-print0`, `-printf` without `\n`) is still in the
+    // line buffer; the runtime's flush at exit would discard its error.
+    if !state.stdout_failed && !plib::diag::flush_stdout() {
+        state.had_error = true;
+    }
 
     if state.had_error {
         Ok(1)

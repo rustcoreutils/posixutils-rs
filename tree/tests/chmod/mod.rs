@@ -323,3 +323,36 @@ fn test_chmod_trailing_slash_names_a_directory() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// chmod -R changes no symbolic link met in the walk and reports none: a dangling link is
+/// skipped silently (binutils runs `chmod -R go=rX` over a tree holding some), and a live link
+/// leaves its target alone, a file or a directory outside the tree.
+#[test]
+fn test_chmod_recursive_skips_symlinks_in_walk() {
+    let test_dir = &format!("{}/test_chmod_r_skips_links", env!("CARGO_TARGET_TMPDIR"));
+    let (d, d_f, outside, outdir) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/d/f"),
+        &format!("{test_dir}/outside"),
+        &format!("{test_dir}/outdir"),
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::create_dir_all(outdir).unwrap();
+    fs::File::create(d_f).unwrap();
+    fs::File::create(outside).unwrap();
+    for p in [d, d_f, outside, outdir] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    unix::fs::symlink("nonexistent", format!("{d}/dangle")).unwrap();
+    unix::fs::symlink("../outside", format!("{d}/flink")).unwrap();
+    unix::fs::symlink("../outdir", format!("{d}/dlink")).unwrap();
+
+    chmod_test(&["-R", "go=rX", d], "", "", 0);
+    assert_eq!(
+        [d, d_f, outside, outdir].map(|p| mode_of(p)),
+        [0o755, 0o755, 0o700, 0o700]
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

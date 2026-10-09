@@ -35,6 +35,7 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
     // Each per-file error is reported immediately and the walk continues; `had_error` drives the
     // exit status. The returned error (if any) carries no message — it has already been printed.
     let had_error = RefCell::new(false);
+    let mut at_operand = true;
 
     ftw::traverse_directory(
         filename,
@@ -62,8 +63,17 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
                 ChmodMode::Symbolic(s) => modestr::mutate(md.mode(), is_dir, s),
             };
 
+            // The first entry is the operand; every later one was met in the walk.
+            let is_operand = std::mem::replace(&mut at_operand, false);
+
             if md.is_symlink() {
-                // Uses libc::fstatat to check for the validity of the symlink
+                // A symbolic link met in the walk is not followed and not changed (POSIX chmod -R
+                // changes the files of the tree, not links found in it), live or dangling.
+                if !is_operand {
+                    return Ok(false);
+                }
+
+                // The walk follows a link named as an operand, so a symlink here dangles.
                 let is_dangling = {
                     let target_deref_md =
                         ftw::Metadata::new(entry.dir_fd(), entry.file_name(), true);

@@ -1983,3 +1983,27 @@ fn awk_printf_alternative_form_of_zero() {
     );
     assert_eq!(status, Some(0));
 }
+
+// printf `%s` counts its width and precision in characters, so a byte
+// above 127 in the C locale is one column (gawk's test rebt8b1), and a
+// precision that falls inside a UTF-8 character panicked.
+#[test]
+fn awk_printf_string_width_counts_characters() {
+    let c = [("LC_ALL", "C")];
+    let out = awk_bytes_with_env(
+        &["BEGIN { printf \"%-5s|%.1s|%3s|\\n\", \"a\\351b\", \"\\351x\", \"\\351\" }"],
+        b"",
+        &c,
+    );
+    assert_eq!(out, b"a\xe9b  |\xe9|  \xe9|\n");
+    let Some(locale) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let env = [("LC_ALL", locale.as_str())];
+    let out = awk_bytes_with_env(
+        &["BEGIN { printf \"%-5s|%.1s|%3s|\\n\", \"éa\", \"éab\", \"é\" }"],
+        b"",
+        &env,
+    );
+    assert_eq!(out, "éa   |é|  é|\n".as_bytes());
+}

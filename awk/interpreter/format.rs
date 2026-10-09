@@ -855,16 +855,29 @@ pub fn fmt_write_float_general(
     }
 }
 
+/// Writes `value` for `%s`, its width and precision counting characters,
+/// as in gawk (in a single-byte locale a character is a byte).
 pub fn fmt_write_string(target: &mut String, value: &str, args: &FormatArgs) {
-    let precision = args.precision.unwrap_or(usize::MAX);
-    let str_len = value.len().min(precision);
-    let padding = args.width.saturating_sub(str_len);
+    let (value, chars) = match args.precision {
+        // all of it, so only a width needs the character count
+        None if value.is_ascii() || args.width == 0 => (value, value.len()),
+        None => (value, value.chars().count()),
+        Some(precision) if value.is_ascii() => {
+            let end = value.len().min(precision);
+            (&value[..end], end)
+        }
+        Some(precision) => match value.char_indices().nth(precision) {
+            Some((end, _)) => (&value[..end], precision),
+            None => (value, value.chars().count()),
+        },
+    };
+    let padding = args.width.saturating_sub(chars);
     if args.left_justified {
-        target.push_str(&value[..str_len]);
+        target.push_str(value);
         pad_target(target, padding, b' ');
     } else {
         pad_target(target, padding, b' ');
-        target.push_str(&value[..str_len]);
+        target.push_str(value);
     }
 }
 

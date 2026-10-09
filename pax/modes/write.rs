@@ -721,7 +721,7 @@ fn write_file<W: ArchiveWriter>(
     archive.finish_entry()?;
     // Only now is there a member for a later name of this file to link to.
     if !later_name {
-        link_tracker.record(entry.dev, entry.ino, entry.nlink, &entry.path);
+        link_tracker.record(entry.dev, entry.ino, entry.nlink, entry.path.clone());
     }
 
     if options.reset_atime {

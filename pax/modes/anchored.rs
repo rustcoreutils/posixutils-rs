@@ -1240,25 +1240,15 @@ fn created(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
 /// name), and unlinking it destroys the only thing there was to link. Nothing
 /// is changed and `true` is returned; the caller decides whether that merits a
 /// diagnostic. Identity is (dev, ino): the source's is the pinned inode's, or
-/// the one the caller expects (`link_replacing_with`); only for a source known
-/// by neither is the name resolved again, the way `linkat` resolves it -- the
-/// name itself, or with `follow` the file a symbolic link refers to. With
-/// `follow` the link itself counts too, being just as much the source
-/// (`pax -rwl -H link .`).
-pub(crate) fn link_replacing(
-    from_dir: libc::c_int,
-    from_name: &CStr,
-    dirfd: BorrowedFd<'_>,
-    name: &CStr,
-    no_clobber: bool,
-) -> PaxResult<bool> {
-    link_replacing_with(from_dir, from_name, false, None, dirfd, name, no_clobber)
-}
-
-/// `link_replacing`, linking the file a symbolic link `from_name` refers to
-/// when `follow` is set -- copy mode's `-l` under `-H`/`-L`, where POSIX says
-/// "the hard link created ... shall be to the file referenced by the symbolic
-/// link". Without it, `from_name` itself is linked, whatever it is.
+/// `expected`; only for a source known by neither is the name resolved again,
+/// the way `linkat` resolves it -- the name itself, or with `follow` the file
+/// a symbolic link refers to. With `follow` the link itself counts too, being
+/// just as much the source (`pax -rwl -H link .`).
+///
+/// With `follow`, the file a symbolic link `from_name` refers to is linked --
+/// copy mode's `-l` under `-H`/`-L`, where POSIX says "the hard link created
+/// ... shall be to the file referenced by the symbolic link". Without it,
+/// `from_name` itself is linked, whatever it is.
 ///
 /// `linkat` by name resolves `from_name` again -- and with `follow`, the
 /// link's target too -- so it can link a file other than the one the caller
@@ -1267,7 +1257,9 @@ pub(crate) fn link_replacing(
 /// link is made to the pinned inode itself, so no other file is ever linked.
 /// Where it cannot be pinned, a link made by name to anything else is removed
 /// again and the call fails (`linked_expected`), rather than leave the
-/// destination a second name for a file nobody asked to copy.
+/// destination a second name for a file nobody asked to copy. Without
+/// `expected` -- a source this run did not make, such as a tar link member's
+/// target already there before it -- the link is made by name.
 pub(crate) fn link_replacing_with(
     from_dir: libc::c_int,
     from_name: &CStr,
@@ -2602,7 +2594,16 @@ mod tests {
         let dir = DirTree::open_path(temp.path()).unwrap();
         let f = CString::new("f").unwrap();
 
-        let same = link_replacing(dir.root().as_raw_fd(), &f, dir.root(), &f, false).unwrap();
+        let same = link_replacing_with(
+            dir.root().as_raw_fd(),
+            &f,
+            false,
+            None,
+            dir.root(),
+            &f,
+            false,
+        )
+        .unwrap();
         assert!(same, "the name was already the source");
         assert_eq!(
             std::fs::read_to_string(temp.path().join("f")).unwrap(),
@@ -2620,7 +2621,16 @@ mod tests {
         let f = CString::new("f").unwrap();
         let g = CString::new("g").unwrap();
 
-        let same = link_replacing(dir.root().as_raw_fd(), &f, dir.root(), &g, false).unwrap();
+        let same = link_replacing_with(
+            dir.root().as_raw_fd(),
+            &f,
+            false,
+            None,
+            dir.root(),
+            &g,
+            false,
+        )
+        .unwrap();
         assert!(!same);
         assert_eq!(
             std::fs::read_to_string(temp.path().join("g")).unwrap(),

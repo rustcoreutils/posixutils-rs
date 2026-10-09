@@ -14,9 +14,8 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    attrs_withheld, create_replacing, link_replacing, link_replacing_with, make_dir_at,
-    set_attrs_fd, set_made_node_attrs, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath,
-    PendingDirs,
+    attrs_withheld, create_replacing, link_replacing_with, make_dir_at, set_attrs_fd,
+    set_made_node_attrs, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
@@ -127,6 +126,7 @@ fn extract_members<R: ArchiveReader>(
     pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
     let mut link_sets: LinkSets<CreatedSet> = LinkSets::default();
+    let mut made_files = MadeFiles::new();
     let mut pins = PinBudget::new();
     let mut selector = Selector::new(
         &options.patterns,
@@ -158,7 +158,15 @@ fn extract_members<R: ArchiveReader>(
             // unconsumed data of the failed entry to realign the reader.
             // A failure every later member would meet too -- -O's output
             // gone, end of file on the terminal -- ends the run instead.
-            let r = extract_entry(archive, &entry, options, &mut link_sets, tree, pending_dirs);
+            let r = extract_entry(
+                archive,
+                &entry,
+                options,
+                &mut link_sets,
+                &mut made_files,
+                tree,
+                pending_dirs,
+            );
             report_unless_fatal(&entry, r)?;
         } else if let Some(set) = link_sets.find_mut(&entry) {
             let r = fill_link_set(archive, tree, &entry, options, set);
@@ -325,6 +333,7 @@ fn extract_entry<R: ArchiveReader>(
     entry: &ArchiveEntry,
     options: &ReadOptions,
     link_sets: &mut LinkSets<CreatedSet>,
+    made_files: &mut MadeFiles,
     tree: &DirTree,
     pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
@@ -367,6 +376,9 @@ fn extract_entry<R: ArchiveReader>(
         let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
     }
 
+    // Whatever this member puts at its name replaces what an earlier one made
+    // there; only a regular file or a link to one records it again.
+    made_files.remove(&member.key());
     match entry.entry_type {
         EntryType::Directory => {
             let decided = extract_directory(tree, pfd, &member, entry, options)?;
@@ -384,11 +396,14 @@ fn extract_entry<R: ArchiveReader>(
             archive.skip_data()?;
         }
         EntryType::Hardlink => {
-            extract_hardlink(tree, pfd, name, entry, options)?;
+            extract_hardlink(tree, pfd, &member, entry, options, made_files)?;
             archive.skip_data()?;
         }
         EntryType::Regular => {
-            extract_regular(archive, tree, pfd, &member, entry, options, link_sets)?;
+            let made = extract_regular(archive, tree, pfd, &member, entry, options, link_sets)?;
+            if let Some(file) = made {
+                made_files.insert(member.key(), file);
+            }
             archive.skip_data()?; // Skip padding to block boundary
         }
         EntryType::BlockDevice | EntryType::CharDevice => {
@@ -490,14 +505,21 @@ fn extract_symlink(
     Ok(())
 }
 
+/// What this run created at each member path (`MemberPath::key`): the
+/// identity of the regular file it made there, from the descriptor that made
+/// it.
+type MadeFiles = std::collections::HashMap<Vec<u8>, (u64, u64)>;
+
 /// Extract a hard link
 fn extract_hardlink(
     tree: &DirTree,
     dirfd: BorrowedFd<'_>,
-    name: &CStr,
+    member: &MemberPath,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made_files: &mut MadeFiles,
 ) -> PaxResult<()> {
+    let name = member.leaf.as_c_str();
     let Some(target) = entry.link_target.clone() else {
         return Err(PaxError::InvalidHeader(
             "hard link target not found".to_string(),
@@ -518,13 +540,25 @@ fn extract_hardlink(
     // earlier member of this very archive -- could link a file from outside
     // the extraction directory into it. A member linked to its own name, or
     // to a name it already shares, finds the file in place and keeps it.
-    link_replacing(
+    //
+    // To the file this run extracted at the target's name, pinned, when it
+    // made one: someone who can write that directory can have put another
+    // file at the name since. A target this run did not make is linked by
+    // name.
+    let expected = made_files.get(&target_member.key()).copied();
+    link_replacing_with(
         target_parent.as_raw_fd(),
         &target_member.leaf,
+        false,
+        expected,
         dirfd,
         name,
         options.no_clobber,
     )?;
+    // This name holds that file now, for a later member linked to it.
+    if let Some(file) = expected {
+        made_files.insert(member.key(), file);
+    }
 
     Ok(())
 }
@@ -659,18 +693,20 @@ fn extract_regular<R: ArchiveReader>(
     entry: &ArchiveEntry,
     options: &ReadOptions,
     link_sets: &mut LinkSets<CreatedSet>,
-) -> PaxResult<()> {
+) -> PaxResult<Option<(u64, u64)>> {
     if let Some(set) = link_sets.find_mut(entry) {
-        return join_link_set(archive, tree, dirfd, member, entry, options, set);
+        join_link_set(archive, tree, dirfd, member, entry, options, set)?;
+        return Ok(None);
     }
 
-    if let Some(file) = extract_file(archive, dirfd, member.leaf.as_c_str(), entry, options)? {
+    let made = extract_file(archive, dirfd, member.leaf.as_c_str(), entry, options)?;
+    if let Some(file) = made {
         link_sets.insert(entry, || {
             let names = vec![member.display.clone()];
             CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
         });
     }
-    Ok(())
+    Ok(made)
 }
 
 /// Extract a later name of a link set whose file is already on disk.
@@ -1155,6 +1191,50 @@ mod tests {
         let moved = with_hook(swap, || move_names_to(holders, root.as_fd(), c"new", made));
         assert!(moved.is_err(), "linked to the file put in its place");
         assert_eq!(std::fs::read(dir.path().join("old")).unwrap(), b"");
+    }
+
+    /// A tar link member is linked to its target member, found by the name
+    /// the target was extracted at. In a directory others can write, someone
+    /// can rename their own file over that name first, and the link member
+    /// became a link to theirs. The link is made to the file extracted, or
+    /// not at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_hardlink_member_links_only_to_the_file_extracted() {
+        use crate::modes::race_hook::{with_hook, Point};
+        let dir = plib::tmp::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f"), "extracted\n").unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let mut made_files = MadeFiles::new();
+        let target = MemberPath::parse(Path::new("f")).unwrap().unwrap();
+        made_files.insert(target.key(), id_at(tree.root(), c"f").unwrap());
+
+        let path = dir.path().to_path_buf();
+        let swap = move |point, _: libc::c_int, name: &CStr| {
+            if point == Point::Linking && name == c"f" {
+                std::fs::write(path.join("planted"), "planted\n").unwrap();
+                std::fs::rename(path.join("planted"), path.join("f")).unwrap();
+            }
+        };
+        let mut entry = ArchiveEntry::new(PathBuf::from("g"), EntryType::Hardlink);
+        entry.link_target = Some(PathBuf::from("f"));
+        let member = MemberPath::parse(Path::new("g")).unwrap().unwrap();
+        let options = ReadOptions::default();
+        let _ = with_hook(swap, || {
+            extract_hardlink(
+                &tree,
+                tree.root(),
+                &member,
+                &entry,
+                &options,
+                &mut made_files,
+            )
+        });
+        let linked = std::fs::read_to_string(dir.path().join("g")).unwrap_or_default();
+        assert_ne!(
+            linked, "planted\n",
+            "the link member was linked to the planted file"
+        );
     }
 
     #[test]

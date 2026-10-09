@@ -277,6 +277,7 @@ fn unverified_directory_member_is_diagnosed() {
     let tree = DirTree::open_path(tmp.path()).unwrap();
     let mut pending = PendingDirs::default();
     let mut link_sets = LinkSets::default();
+    let mut made_files = super::MadeFiles::new();
     let entry = own_member("d", EntryType::Directory, 0o751);
     let mut archive = Members(Vec::new().into_iter());
     let options = preserve_everything();
@@ -287,6 +288,7 @@ fn unverified_directory_member_is_diagnosed() {
             &entry,
             &options,
             &mut link_sets,
+            &mut made_files,
             &tree,
             pending,
         )
@@ -311,6 +313,7 @@ fn unverified_directory_named_twice_is_withheld_both_times() {
     let tree = DirTree::open_path(tmp.path()).unwrap();
     let mut pending = PendingDirs::default();
     let mut link_sets = LinkSets::default();
+    let mut made_files = super::MadeFiles::new();
     let entry = own_member("d", EntryType::Directory, 0o751);
     let mut archive = Members(Vec::new().into_iter());
     let options = preserve_everything();
@@ -322,6 +325,7 @@ fn unverified_directory_named_twice_is_withheld_both_times() {
                 &entry,
                 &options,
                 &mut link_sets,
+                &mut made_files,
                 &tree,
                 pending,
             )

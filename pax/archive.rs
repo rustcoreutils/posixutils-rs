@@ -9,7 +9,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Type of archive entry
@@ -374,39 +374,49 @@ pub trait ArchiveWriter {
 /// pax -w` lists it and walks it), and a file forgotten before the repeat would
 /// be stored again in full -- splitting a hard-linked pair on extraction,
 /// depending on the order.
-#[derive(Debug, Default)]
-pub struct HardLinkTracker {
-    /// The first path each file was stored under, by (dev, ino)
-    stored: HashMap<(u64, u64), PathBuf>,
+///
+/// `T` is what is remembered of the first name: the archive member path when
+/// writing; when copying, the destination path and the identity of the copy
+/// made there.
+#[derive(Debug)]
+pub struct HardLinkTracker<T = PathBuf> {
+    /// What was remembered of each file's first name, by (dev, ino)
+    stored: HashMap<(u64, u64), T>,
 }
 
-impl HardLinkTracker {
+impl<T> Default for HardLinkTracker<T> {
+    fn default() -> Self {
+        HardLinkTracker {
+            stored: HashMap::new(),
+        }
+    }
+}
+
+impl<T: Clone> HardLinkTracker<T> {
     /// Create a new tracker
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The name a multiply-linked file was first stored under, if one of its
-    /// names already has been.
-    pub fn lookup(&self, dev: u64, ino: u64, nlink: u32) -> Option<PathBuf> {
+    /// What was remembered of the name a multiply-linked file was first
+    /// stored under, if one of its names already has been.
+    pub fn lookup(&self, dev: u64, ino: u64, nlink: u32) -> Option<T> {
         if nlink <= 1 {
             return None;
         }
         self.stored.get(&(dev, ino)).cloned()
     }
 
-    /// Note that a file's first name has been stored, as `stored`: the archive
-    /// member path when writing, the destination path when copying.
+    /// Note that a file's first name has been stored, and what to remember of
+    /// it (`stored`).
     ///
     /// Separate from `lookup` because it must only happen once that name
     /// really is in the archive or the destination. Recording a file before
     /// its data was read made every later name of an unreadable file a link
     /// to a member that was never written.
-    pub fn record(&mut self, dev: u64, ino: u64, nlink: u32, stored: &Path) {
+    pub fn record(&mut self, dev: u64, ino: u64, nlink: u32, stored: T) {
         if nlink > 1 {
-            self.stored
-                .entry((dev, ino))
-                .or_insert_with(|| stored.to_path_buf());
+            self.stored.entry((dev, ino)).or_insert(stored);
         }
     }
 }
@@ -578,6 +588,7 @@ impl std::fmt::Display for ArchiveFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn member(entry_type: EntryType, ino: u64, nlink: u32) -> ArchiveEntry {
         ArchiveEntry {
@@ -669,13 +680,13 @@ mod tests {
     fn test_hard_link_tracker_keeps_the_first_name() {
         let mut links = HardLinkTracker::new();
         // A file with one name is never remembered.
-        links.record(1, 7, 1, Path::new("solo"));
+        links.record(1, 7, 1, PathBuf::from("solo"));
         assert_eq!(links.lookup(1, 7, 1), None);
 
-        links.record(1, 9, 2, Path::new("a"));
+        links.record(1, 9, 2, PathBuf::from("a"));
         // Recording a second time keeps the first name, and the file stays
         // remembered however many of its names go by.
-        links.record(1, 9, 2, Path::new("b"));
+        links.record(1, 9, 2, PathBuf::from("b"));
         for _ in 0..3 {
             assert_eq!(links.lookup(1, 9, 2).as_deref(), Some(Path::new("a")));
         }

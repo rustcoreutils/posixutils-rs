@@ -1073,3 +1073,26 @@ fn awk_printf_c_writes_utf8_in_a_utf8_locale() {
     );
     assert_eq!(out, "È|é 1\n".as_bytes());
 }
+
+// gsub replaces non-overlapping matches, and an empty match right where the
+// previous match ended is not another one: gawk, mawk and the one true awk
+// all turn "abc" into "XaXcX" for gsub(/b*/, "X").
+#[test]
+fn awk_gsub_skips_an_empty_match_after_a_match() {
+    let cases = [
+        ("{ gsub(/b*/, \"X\"); print }", "abc\n", "XaXcX\n"),
+        ("{ n = gsub(/b*/, \"X\"); print n }", "abbc\n", "3\n"),
+        ("{ gsub(/x*/, \"-\"); print }", "abc\n", "-a-b-c-\n"),
+        ("{ gsub(/a*/, \"X\"); print }", "aab\n", "XbX\n"),
+    ];
+    for (program, input, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from(input),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

@@ -253,7 +253,16 @@ pub(crate) fn gsub(
     repl_parts.push(current_repl_part);
 
     let mut num_replacements = 0;
+    // Where the last non-empty match ended: an empty match there is not
+    // another match (gsub(/b*/, "X") makes "abc" "XaXcX", not "XaXXcX").
+    let mut last_nonempty_end = None;
     for m in ere.match_locations(in_str) {
+        if m.start == m.end && last_nonempty_end == Some(m.start) {
+            continue;
+        }
+        if m.start != m.end {
+            last_nonempty_end = Some(m.end);
+        }
         result.push_str(&in_str[last_match_end..m.start]);
         let replaced_string = &in_str[m.start..m.end];
         result.push_str(&repl_parts[0]);

@@ -598,6 +598,15 @@ Debian source packages, with GNU patch's meaning:
  * More than one `file` operand.  The SYNOPSIS allows exactly one.
  * With no operand, the current working directory is printed.
 
+### rm
+
+Deviation: `rm -r link/`, where `link` is a symbolic link to a directory,
+is refused ("Not a directory") and removes nothing.  POSIX resolves `link/`
+to the directory, so `rm` would remove everything in it and then fail to
+remove the directory by that name.  Refusing keeps a recursive removal from
+being redirected through a directory operand swapped for a symbolic link.
+`find link/ -delete` is refused the same way.
+
 ### rmdir
 
  * `--ignore-fail-on-non-empty` — a directory that cannot be removed only

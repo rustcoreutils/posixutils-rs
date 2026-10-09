@@ -325,6 +325,21 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             let md = entry.metadata().unwrap();
 
             if md.file_type() == ftw::FileType::Directory {
+                // `link/` names the directory the link points to, which no removal takes away
+                // by that name. Refuse it before descending rather than empty that directory
+                // (GNU does): a directory operand swapped for a symlink would otherwise redirect
+                // the whole removal.
+                if entry.reached_through_symlink() {
+                    eprintln!(
+                        "rm: {}",
+                        gettext!(
+                            "cannot remove '{}': {}",
+                            entry.path().clean_trailing_slashes(),
+                            error_string(&io::Error::from_raw_os_error(libc::ENOTDIR))
+                        )
+                    );
+                    return Err(());
+                }
                 if is_root_directory(cfg, md) {
                     let shown = entry.path().clean_trailing_slashes();
                     eprintln!("rm: {}", dangerous_root_message(&shown));

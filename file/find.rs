@@ -299,6 +299,8 @@ struct FindState {
     stdout_failed: bool,
     /// Whether -depth was specified anywhere in expression
     depth_first: bool,
+    /// Whether -delete was specified anywhere in expression
+    deletes: bool,
     /// Whether -xdev was specified anywhere in expression
     xdev: bool,
     /// Whether -mount was specified anywhere in expression
@@ -322,6 +324,7 @@ impl FindState {
             had_error: false,
             stdout_failed: false,
             depth_first: false,
+            deletes: false,
             xdev: false,
             mount: false,
             min_depth: 0,
@@ -1428,6 +1431,18 @@ impl Walk<'_> {
         if depth == 0 {
             self.root_dev = md.dev();
         }
+        // `link/` names the directory the link points to. With -delete, refuse it before
+        // descending, as rm -r does, rather than delete through the link: a directory operand
+        // swapped for a symlink would otherwise redirect the deletion.
+        if self.state.deletes && entry.reached_through_symlink() {
+            eprintln!(
+                "find: cannot delete '{}': {}",
+                path.display(),
+                plib::diag::io_error_text(&io::Error::from_raw_os_error(libc::ENOTDIR))
+            );
+            self.state.had_error = true;
+            return false;
+        }
 
         let key = (md.dev(), md.ino());
         if md.is_dir() {
@@ -1656,6 +1671,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
         );
     }
     state.depth_first = depth || delete;
+    state.deletes = delete;
     state.xdev = has_primary(&expr, |p| matches!(p, Primary::XDev));
     state.mount = has_primary(&expr, |p| matches!(p, Primary::Mount));
     state.symlink_mode = symlink_mode;

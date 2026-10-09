@@ -486,7 +486,7 @@ impl<'a> Entry<'a> {
     /// fails with `ENOTDIR`, as Linux's `rmdir("link/")` does, without the `EINVAL` that removing
     /// `.` would give.
     pub fn unlink(&self, flags: libc::c_int) -> io::Result<()> {
-        if self.shown_name.is_some() && self.file_name() == c"." {
+        if self.reached_through_symlink() {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
         let ret = unsafe { libc::unlinkat(self.dir_fd(), self.file_name().as_ptr(), flags) };
@@ -495,6 +495,14 @@ impl<'a> Entry<'a> {
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    /// Whether this is a starting point named as a symbolic link with a trailing slash (`link/`),
+    /// which the walk followed to the directory it names, whatever its options. Such an entry is
+    /// `.` in that directory; a caller that removes what it walks refuses it rather than act on
+    /// the link's target.
+    pub fn reached_through_symlink(&self) -> bool {
+        self.shown_name.is_some() && self.file_name() == c"."
     }
 
     /// Whether the calling process can write to the file this entry refers to.

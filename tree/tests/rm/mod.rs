@@ -1297,9 +1297,11 @@ fn test_rm_f_no_operand() {
     rm_test(&["-f"], "", "", 0);
 }
 
-/// `dl/`, a symlink to a directory named with a trailing slash, is that directory (POSIX pathname
-/// resolution): `rm -r` removes what is in it, then cannot remove the directory by that name, as
-/// `rmdir("dl/")` cannot. It used to unlink the symlink and leave the directory untouched.
+/// `dl/`, a symlink to a directory named with a trailing slash, names that directory (POSIX
+/// pathname resolution), which no removal can take away by that name. rm refuses it before
+/// descending, rather than emptying the directory the link points to as GNU does: a directory
+/// operand swapped for a symlink would otherwise redirect a recursive removal anywhere. It used
+/// to unlink the symlink itself.
 #[test]
 fn test_rm_r_trailing_slash_symlink_to_directory() {
     let test_dir = &format!("{}/test_rm_r_trailing_slash", env!("CARGO_TARGET_TMPDIR"));
@@ -1310,20 +1312,27 @@ fn test_rm_r_trailing_slash_symlink_to_directory() {
     fs::File::create(format!("{d}/sub/g")).unwrap();
     unix::fs::symlink("d", dl).unwrap();
 
-    rm_test(
-        &["-r", &format!("{dl}/")],
-        "",
-        &format!("rm: cannot remove directory '{dl}/': Not a directory\n"),
-        1,
-    );
-    assert!(fs::symlink_metadata(dl).unwrap().is_symlink());
-    assert_eq!(fs::read_dir(d).unwrap().count(), 0);
+    for opts in ["-rf", "-r"] {
+        rm_test(
+            &[opts, &format!("{dl}/")],
+            "",
+            &format!("rm: cannot remove '{dl}/': Not a directory\n"),
+            1,
+        );
+        assert!(fs::symlink_metadata(dl).unwrap().is_symlink());
+        assert!(fs::symlink_metadata(format!("{d}/sub/g"))
+            .unwrap()
+            .is_file());
+        assert!(fs::symlink_metadata(format!("{d}/f")).unwrap().is_file());
+    }
 
-    // Now empty, it takes the path that removes it without descending.
+    // Empty, it is refused too, rather than taking the path that removes it without descending.
+    fs::remove_dir_all(format!("{d}/sub")).unwrap();
+    fs::remove_file(format!("{d}/f")).unwrap();
     rm_test(
         &["-r", &format!("{dl}/")],
         "",
-        &format!("rm: cannot remove directory '{dl}/': Not a directory\n"),
+        &format!("rm: cannot remove '{dl}/': Not a directory\n"),
         1,
     );
     assert!(fs::symlink_metadata(dl).unwrap().is_symlink());

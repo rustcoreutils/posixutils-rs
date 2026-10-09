@@ -891,8 +891,8 @@ fn find_trailing_slash_follows_operand_symlink() {
         &format!("find: '{}': Not a directory\n", p("to_file/")),
         1,
     );
-    // -delete empties the directory but cannot remove it by that name, as rmdir("to_dir/")
-    // cannot, and leaves the link alone.
+    // -delete refuses such a starting point before descending, as rm -r does, rather than
+    // deleting through the link: no removal can take away the directory by that name.
     run_test_find(
         &[&p("to_dir/"), "-delete"],
         "",
@@ -900,7 +900,7 @@ fn find_trailing_slash_follows_operand_symlink() {
         1,
     );
     assert!(dir.join("to_dir").is_symlink());
-    assert_eq!(std::fs::read_dir(dir.join("d")).unwrap().count(), 0);
+    assert!(dir.join("d/f").is_file());
 }
 
 #[test]

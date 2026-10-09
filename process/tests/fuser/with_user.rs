@@ -9,7 +9,7 @@
 
 use super::{fuser_test, wait_for_open_fd};
 use libc::uid_t;
-use std::{ffi::CStr, io, process::Command, str};
+use std::{io, process::Command, str};
 
 /// Retrieves the user name of the process owner by process ID on Linux.
 ///
@@ -59,18 +59,9 @@ fn get_process_user(_pid: u32) -> io::Result<String> {
 }
 
 fn get_username_by_uid(uid: uid_t) -> io::Result<String> {
-    let pwd = unsafe { libc::getpwuid(uid) };
-    if pwd.is_null() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "User not found"));
-    }
-
-    let user_name = unsafe {
-        CStr::from_ptr((*pwd).pw_name)
-            .to_string_lossy()
-            .into_owned()
-    };
-
-    Ok(user_name)
+    plib::user::get_by_uid(uid)
+        .map(|u| u.name.to_string_lossy().into_owned())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "User not found"))
 }
 /// Tests `fuser` with the `-u` flag to ensure it outputs the process owner.
 ///

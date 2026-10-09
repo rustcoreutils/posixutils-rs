@@ -143,17 +143,10 @@ fn renice_unknown_group_fails() {
 #[test]
 fn renice_user_id_type_accepts_a_name() {
     // Resolve our own login name via the same passwd database renice uses.
-    // SAFETY: getpwuid returns a pointer into a static buffer; it is read
-    // immediately and not retained.
-    let name = unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() {
-            return; // no passwd entry for this uid; nothing to test against
-        }
-        std::ffi::CStr::from_ptr((*pw).pw_name)
-            .to_string_lossy()
-            .into_owned()
+    let Some(pw) = plib::user::get_by_uid(unsafe { libc::getuid() }) else {
+        return; // no passwd entry for this uid; nothing to test against
     };
+    let name = pw.name.to_string_lossy().into_owned();
 
     // Increment 0 on our own uid: permitted, and only reachable if the name
     // resolved. Some of our processes may be unwritable, so tolerate either

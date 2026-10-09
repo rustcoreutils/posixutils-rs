@@ -530,7 +530,7 @@ fn link_member_follows_a_target_renamed_by_i() {
     let options = ReadOptions::default();
     // The member `f`, renamed to `renamed` at the prompt.
     let file = own_member("renamed", EntryType::Regular, 0o644);
-    links.alias(Path::new("f"), Path::new("renamed"));
+    links.named(Some(Path::new("f")), Path::new("renamed"));
     let mut archive = Members(vec![file, link_member("f")].into_iter());
     while let Some(entry) = archive.read_entry().unwrap() {
         let _ = extract_entry(
@@ -777,5 +777,26 @@ fn a_made_file_is_pinned_only_where_it_could_be_needed() {
     assert!(
         recorded_pinned(&private, cpio("c2", 2)),
         "cpio, other names"
+    );
+}
+
+/// A later member of the name -i renamed an earlier one away from, kept at
+/// its own name, is the one a link member naming that name refers to: the
+/// earlier rename no longer applies.
+#[test]
+fn a_later_member_of_a_renamed_name_ends_the_rename() {
+    let mut links = super::Links::new();
+    links.named(Some(Path::new("f")), Path::new("renamed"));
+    assert_eq!(
+        links.link_target(PathBuf::from("f")),
+        PathBuf::from("renamed")
+    );
+    links.named(None, Path::new("f"));
+    assert_eq!(links.link_target(PathBuf::from("f")), PathBuf::from("f"));
+    // A later rename of the name overrides an earlier one.
+    links.named(Some(Path::new("f")), Path::new("again"));
+    assert_eq!(
+        links.link_target(PathBuf::from("f")),
+        PathBuf::from("again")
     );
 }

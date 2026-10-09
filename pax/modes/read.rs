@@ -162,8 +162,8 @@ fn extract_members<R: ArchiveReader>(
             tree,
             &mut renamed_from,
         )?;
-        if let Some(before) = renamed_from.filter(|_| selected) {
-            links.alias(&before, &entry.path);
+        if selected {
+            links.named(renamed_from.as_deref(), &entry.path);
         }
         if selected {
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
@@ -657,10 +657,24 @@ impl Links {
         }
     }
 
-    /// Note that -i renamed the member named `before` (after -s) to `after`.
-    fn alias(&mut self, before: &Path, after: &Path) {
-        if let Ok(Some(before)) = MemberPath::parse(before) {
-            self.aliases.insert(before.key(), after.to_path_buf());
+    /// Note the name a selected member is extracted at, `path`: -i gave it
+    /// that name in place of `renamed_from` (its name after -s), or it keeps
+    /// its own. A link member names the latest member of a name in the
+    /// archive: renamed, that one is at `path`; not renamed, it is at its
+    /// own name, and an earlier member's rename no longer applies.
+    fn named(&mut self, renamed_from: Option<&Path>, path: &Path) {
+        let key = |p: &Path| MemberPath::parse(p).ok().flatten().map(|m| m.key());
+        match renamed_from {
+            Some(before) => {
+                if let Some(before) = key(before) {
+                    self.aliases.insert(before, path.to_path_buf());
+                }
+            }
+            None => {
+                if let Some(own) = key(path) {
+                    self.aliases.remove(&own);
+                }
+            }
         }
     }
 

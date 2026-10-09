@@ -8,13 +8,16 @@
 //
 use std::{
     collections::{hash_map::Entry, HashMap},
-    ffi::CString,
+    ffi::{CString, OsStr},
     fs::File,
     io::{BufReader, Bytes, Read, Write},
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
     rc::Rc,
 };
 
 use super::string::AwkString;
+use crate::charset;
 use crate::regex::Regex;
 
 pub enum RecordSeparator {
@@ -52,14 +55,14 @@ macro_rules! read_iter_next {
     };
 }
 
-/// Convert bytes to String, trying UTF-8 first, falling back to Latin-1.
-/// Latin-1 maps each byte 0x00-0xFF to the corresponding Unicode code point,
-/// so it preserves byte values faithfully for single-byte encodings.
+/// The awk string for the bytes of a record.
 fn bytes_to_string(buf: Vec<u8>) -> String {
-    match String::from_utf8(buf) {
-        Ok(s) => s,
-        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
-    }
+    charset::decode(buf)
+}
+
+/// The path awk opens for the file name `name`.
+fn path_of(name: &str) -> PathBuf {
+    PathBuf::from(OsStr::from_bytes(&charset::encode(name)))
 }
 
 /// Try to find a regex match in the byte buffer. Returns the record before
@@ -68,9 +71,8 @@ fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, Vec<u8>)>, St
     if buf.is_empty() {
         return Ok(None);
     }
-    let input = std::str::from_utf8(buf).map_err(|e| e.to_string())?;
-    if let Some(m) = re.find_first(input) {
-        let record = input[..m.start].to_string();
+    if let Some(m) = re.find_nonempty_bytes(buf) {
+        let record = bytes_to_string(buf[..m.start].to_vec());
         let remainder = buf[m.end..].to_vec();
         Ok(Some((record, remainder)))
     } else {
@@ -217,7 +219,7 @@ pub struct FileStream {
 
 impl FileStream {
     pub fn open(path: &str) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
+        let file = File::open(path_of(path)).map_err(|e| e.to_string())?;
         let reader = BufReader::new(file);
         Ok(Self {
             bytes: reader.bytes(),
@@ -296,32 +298,6 @@ impl RecordReader for StringRecordReader {
     }
 }
 
-/// A no-op record reader that immediately signals EOF.
-/// The `ere_byte_buffer` field exists solely to satisfy the `RecordReader` trait;
-/// `Vec::new()` (via `Default`) does not heap-allocate.
-#[derive(Default)]
-pub struct EmptyRecordReader {
-    ere_byte_buffer: Vec<u8>,
-}
-
-impl Iterator for EmptyRecordReader {
-    type Item = ReadResult;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        None
-    }
-}
-
-impl RecordReader for EmptyRecordReader {
-    fn is_done(&self) -> bool {
-        true
-    }
-
-    fn ere_byte_buffer(&mut self) -> &mut Vec<u8> {
-        &mut self.ere_byte_buffer
-    }
-}
-
 #[derive(Default)]
 pub struct WriteFiles {
     files: HashMap<String, File>,
@@ -332,7 +308,7 @@ impl WriteFiles {
         match self.files.entry(filename.to_string()) {
             Entry::Occupied(mut e) => {
                 e.get_mut()
-                    .write_all(contents.as_bytes())
+                    .write_all(&charset::encode(contents))
                     .map_err(|e| e.to_string())?;
             }
             Entry::Vacant(e) => {
@@ -341,9 +317,9 @@ impl WriteFiles {
                     .create(true)
                     .truncate(!append)
                     .append(append)
-                    .open(filename)
+                    .open(path_of(filename))
                     .map_err(|e| e.to_string())?;
-                file.write_all(contents.as_bytes())
+                file.write_all(&charset::encode(contents))
                     .map_err(|e| e.to_string())?;
                 e.insert(file);
             }
@@ -407,6 +383,21 @@ impl ReadFiles {
     }
 }
 
+/// What close() of a pipe returns for the `pclose` result `status`: the
+/// command's exit status, 256 plus the number of the signal that killed it,
+/// as in gawk and mawk, or -1 if `pclose` failed.
+fn close_status(status: libc::c_int) -> i32 {
+    if status == -1 {
+        -1
+    } else if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        256 + libc::WTERMSIG(status)
+    } else {
+        status
+    }
+}
+
 #[derive(Default)]
 pub struct WritePipes {
     pipes: HashMap<Rc<str>, *mut libc::FILE>,
@@ -454,18 +445,13 @@ impl WritePipes {
         success
     }
 
-    /// Close a previously-opened output pipe. Returns `Some(0)` on a
-    /// successful `pclose`, `Some(-1)` if `pclose` failed, or `None` if no pipe
-    /// was open under this name.
+    /// Close a previously-opened output pipe. Returns the command's
+    /// status as `close_status` gives it, or `None` if no pipe was open under
+    /// this name.
     pub fn close_pipe(&mut self, filename: &str) -> Option<i32> {
-        self.pipes.remove(filename).map(|file| {
-            let status = unsafe { libc::pclose(file) };
-            if status == -1 {
-                -1
-            } else {
-                0
-            }
-        })
+        self.pipes
+            .remove(filename)
+            .map(|file| close_status(unsafe { libc::pclose(file) }))
     }
 }
 
@@ -492,7 +478,7 @@ pub struct PipeRecordReader {
 
 impl PipeRecordReader {
     pub fn open(command: &str) -> Result<Self, String> {
-        let command = CString::new(command).map_err(|e| e.to_string())?;
+        let command = charset::to_cstring(command)?;
         let file = unsafe {
             let file = libc::popen(command.as_ptr(), c"r".as_ptr());
             if file.is_null() {
@@ -508,16 +494,11 @@ impl PipeRecordReader {
         })
     }
 
-    /// `pclose` the pipe and return the resulting status (0 on success, -1 on
-    /// failure). Marks the reader closed so `Drop` will not close it again.
+    /// `pclose` the pipe and return the command's status as `close_status`
+    /// gives it. Marks the reader closed so `Drop` will not close it again.
     fn pclose(&mut self) -> i32 {
         self.closed = true;
-        let status = unsafe { libc::pclose(self.pipe) };
-        if status == -1 {
-            -1
-        } else {
-            0
-        }
+        close_status(unsafe { libc::pclose(self.pipe) })
     }
 }
 
@@ -581,9 +562,8 @@ impl ReadPipes {
         }
     }
 
-    /// Close a previously-opened input pipe. Returns `Some(0)` on a successful
-    /// `pclose`, `Some(-1)` if `pclose` failed, or `None` if no pipe was open
-    /// under this name.
+    /// Close a previously-opened input pipe. Returns the command's status as
+    /// `close_status` gives it, or `None` if no pipe was open under this name.
     pub fn close_pipe(&mut self, command: &str) -> Option<i32> {
         self.pipes.remove(command).map(|mut reader| reader.pclose())
     }

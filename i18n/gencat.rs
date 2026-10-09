@@ -1055,7 +1055,7 @@ impl MessageCatalog {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("gencat");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut exit_code = 0;
 

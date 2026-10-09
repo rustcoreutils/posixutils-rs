@@ -168,7 +168,7 @@ fn main() -> ExitCode {
 
     // Parse the command line manually so that an unknown or duplicate
     // keyletter yields the 0x40 exit bit rather than clap's default exit(2).
-    let args = match Args::try_parse_from(std::env::args_os()) {
+    let args = match plib::optarg::try_parse::<Args>() {
         Ok(a) => a,
         Err(e) => {
             // --help / --version are not errors; let clap print and exit 0.
@@ -194,7 +194,15 @@ fn main() -> ExitCode {
         for line in stdin.lock().lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(_) => continue,
+                // A line that is not valid UTF-8 has been consumed; skip it.
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
+                // Any other error (EISDIR, EIO) would recur on every retry:
+                // report it once and stop reading.
+                Err(e) => {
+                    eprintln!("val: -: {}", plib::diag::io_error_text(&e));
+                    exit_code |= ERR_CANNOT_OPEN;
+                    break;
+                }
             };
 
             if line.trim().is_empty() {
@@ -208,7 +216,7 @@ fn main() -> ExitCode {
 
             // Re-parse args for this line. An unknown or duplicate keyletter
             // contributes the 0x40 bit to this line's aggregate code.
-            match Args::try_parse_from(&line_args) {
+            match Args::try_parse_from(plib::optarg::keep_leading_equals::<Args>(&line_args)) {
                 Ok(line_parsed) => {
                     for file in &line_parsed.files {
                         let mut diags: Vec<String> = Vec::new();

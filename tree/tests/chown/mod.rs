@@ -213,28 +213,11 @@ fn test_chown_change_to_non_member_group() {
     // Get the GID of a group that the test runner doesn't belong to
     fn get_non_member_group() -> Option<u32> {
         let user_groups: HashSet<_> = current_user_group_ids().iter().copied().collect();
-        let mut non_member_group: Option<u32> = None; // Group that the current user does not belong to
 
-        // Start reading the group database
-        unsafe { libc::setgrent() };
-
-        loop {
-            let group = unsafe { libc::getgrent() };
-            if group.is_null() {
-                break;
-            }
-            let gid = unsafe { (&*group).gr_gid };
-
-            if !user_groups.contains(&gid) {
-                non_member_group = Some(gid);
-                break;
-            }
-        }
-
-        // End reading the group database
-        unsafe { libc::endgrent() };
-
-        non_member_group
+        plib::group::load()
+            .into_iter()
+            .map(|g| g.gid)
+            .find(|gid| !user_groups.contains(gid))
     }
 
     let test_dir = &format!(
@@ -675,11 +658,9 @@ fn test_chown_owner_colon_login_group() {
 
     // Current user's own login → no privilege needed; group becomes the login group.
     let uid = unsafe { libc::getuid() };
-    let login_gid = unsafe {
-        let p = libc::getpwuid(uid);
-        assert!(!p.is_null());
-        (*p).pw_gid
-    };
+    let login_gid = plib::user::get_by_uid(uid)
+        .expect("the test user has a passwd entry")
+        .gid;
     let spec = format!("{uid}:");
     chown_test(&[&spec, f], "", "", 0);
     assert_eq!(fs::metadata(f).unwrap().gid(), login_gid);
@@ -715,4 +696,49 @@ fn test_chown_rh_does_not_follow_symlinks_inside_the_tree() {
 
     assert_eq!(outside_after, outside_gid, "the link's target was changed");
     assert_eq!(link_after, other, "the link itself was not changed");
+}
+
+/// A trailing slash on a symlink operand follows the link, -h or not, and names a directory
+/// (POSIX pathname resolution): `fl/` naming a link to a file is "Not a directory", and `dl/`
+/// naming a link to a directory changes the directory, and with -R what is in it, never the link.
+#[test]
+fn test_chown_trailing_slash_follows_symlink() {
+    let test_dir = &format!("{}/test_chown_trailing_slash", env!("CARGO_TARGET_TMPDIR"));
+    let (d, d_f, file, dl, fl) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/d/f"),
+        &format!("{test_dir}/file"),
+        &format!("{test_dir}/dl"),
+        &format!("{test_dir}/fl"),
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::File::create(d_f).unwrap();
+    fs::File::create(file).unwrap();
+    unix::fs::symlink("d", dl).unwrap();
+    unix::fs::symlink("file", fl).unwrap();
+    let gid_of = |p: &str| fs::symlink_metadata(p).unwrap().gid();
+    let gid1 = gid_of(d);
+    let gid2 = *current_user_group_ids()
+        .iter()
+        .find(|&&g| g != gid1)
+        .expect("the user must be a member of a second group");
+    let uid = unsafe { libc::geteuid() }.to_string();
+
+    chown_test(
+        &["-h", &uid, &format!("{fl}/")],
+        "",
+        &format!("chown: cannot access '{fl}/': Not a directory\n"),
+        1,
+    );
+
+    let gids = || [d, d_f, file, dl, fl].map(|p| gid_of(p));
+    assert_eq!(gids(), [gid1; 5]);
+    chown_test(&["-h", &format!(":{gid2}"), &format!("{dl}/")], "", "", 0);
+    assert_eq!(gids(), [gid2, gid1, gid1, gid1, gid1]);
+
+    chown_test(&["-hR", &format!(":{gid2}"), &format!("{dl}/")], "", "", 0);
+    assert_eq!(gids(), [gid2, gid2, gid1, gid1, gid1]);
+
+    fs::remove_dir_all(test_dir).unwrap();
 }

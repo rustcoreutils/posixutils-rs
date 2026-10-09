@@ -28,14 +28,14 @@ const RUN_LIMIT: Duration = Duration::from_secs(20);
 
 /// A tree to patch, `tree/`, next to a directory the patch must never reach,
 /// `outside/`, which holds one file, `outside/target`.
-struct Fixture {
-    root: PathBuf,
-    tree: PathBuf,
-    outside: PathBuf,
+pub(super) struct Fixture {
+    pub(super) root: PathBuf,
+    pub(super) tree: PathBuf,
+    pub(super) outside: PathBuf,
 }
 
 impl Fixture {
-    fn new(name: &str) -> Self {
+    pub(super) fn new(name: &str) -> Self {
         let root = setup_test_dir(name);
         let tree = root.join("tree");
         let outside = root.join("outside");
@@ -52,7 +52,7 @@ impl Fixture {
     /// Run patch with `-d tree`, reading `patch` from a file outside the
     /// tree; return the exit code and stderr. Fails the test if patch is
     /// still running after RUN_LIMIT.
-    fn run(&self, args: &[&str], patch: &str) -> (i32, String) {
+    pub(super) fn run(&self, args: &[&str], patch: &str) -> (i32, String) {
         let patch_file = self.root.join("p.diff");
         fs::write(&patch_file, patch).unwrap();
         let mut child = Command::new(get_binary_path("patch"))
@@ -88,11 +88,11 @@ impl Fixture {
         (status.code().unwrap_or(-1), err)
     }
 
-    fn in_tree(&self, rel: &str) -> PathBuf {
+    pub(super) fn in_tree(&self, rel: &str) -> PathBuf {
         self.tree.join(rel)
     }
 
-    fn link_to_outside(&self, rel: &str, dest: &str) {
+    pub(super) fn link_to_outside(&self, rel: &str, dest: &str) {
         symlink(dest, self.in_tree(rel)).unwrap();
     }
 
@@ -107,7 +107,7 @@ impl Fixture {
     }
 
     /// `outside/` still holds exactly the file it started with.
-    fn assert_outside_untouched(&self) {
+    pub(super) fn assert_outside_untouched(&self) {
         assert_eq!(self.outside_names(), vec![String::from("target")]);
         assert_eq!(read(&self.outside.join("target")), "target\n");
     }

@@ -48,10 +48,59 @@ fn test_pwd_default_rejects_pwd_with_dotdot() {
     pwd_plan(&[], &[("PWD", "/foo/../bar")], &physical_cwd());
 }
 
+// -L must not print a $PWD that names some other directory: POSIX pwd uses
+// $PWD only if it is "an absolute pathname of the current working directory".
+// Until this test, only the spelling was checked, so a stale $PWD inherited
+// across a chdir() (perl's `chdir "sub"; print `pwd``) was printed as is.
 #[test]
-fn test_pwd_logical_honors_valid_pwd() {
-    // -L prints a syntactically valid $PWD verbatim (it is not stat-verified).
-    pwd_plan(&["-L"], &[("PWD", "/valid/abs/path")], "/valid/abs/path\n");
+fn test_pwd_logical_rejects_pwd_naming_another_directory() {
+    pwd_plan(&["-L"], &[("PWD", "/")], &physical_cwd());
+    pwd_plan(&[], &[("PWD", "/nonexistent/abs/path")], &physical_cwd());
+}
+
+/// A temporary directory holding `real/` and `link -> real`.
+struct LinkedDir {
+    dir: plib::tmp::TempDir,
+}
+
+impl LinkedDir {
+    fn new() -> LinkedDir {
+        let dir = plib::tmp::tempdir().expect("create temporary directory");
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
+        LinkedDir { dir }
+    }
+
+    fn link(&self) -> String {
+        self.dir.path().join("link").to_string_lossy().into_owned()
+    }
+
+    fn physical(&self) -> String {
+        let real = std::fs::canonicalize(self.dir.path().join("real")).unwrap();
+        format!("{}\n", real.to_string_lossy())
+    }
+
+    /// Run pwd with `args` in `link`, with $PWD spelled through the link.
+    fn pwd(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new(plib::testing::get_binary_path("pwd"))
+            .args(args)
+            .current_dir(self.link())
+            .env("PWD", self.link())
+            .output()
+            .expect("run pwd");
+        assert_eq!(out.status.code(), Some(0));
+        String::from_utf8(out.stdout).unwrap()
+    }
+}
+
+#[test]
+fn test_pwd_logical_honors_pwd_through_a_symlink() {
+    // A $PWD that reaches the working directory through a symbolic link names
+    // it, so -L prints it rather than the physical path.
+    let dirs = LinkedDir::new();
+    assert_eq!(dirs.pwd(&["-L"]), format!("{}\n", dirs.link()));
+    assert_eq!(dirs.pwd(&[]), format!("{}\n", dirs.link()));
+    assert_eq!(dirs.pwd(&["-P"]), dirs.physical());
 }
 
 #[test]
@@ -72,12 +121,11 @@ fn test_pwd_last_option_wins_lp_is_physical() {
 
 #[test]
 fn test_pwd_last_option_wins_pl_is_logical() {
-    // `-P -L`: the last (-L) wins → logical, honoring valid $PWD.
-    pwd_plan(
-        &["-P", "-L"],
-        &[("PWD", "/valid/abs/path")],
-        "/valid/abs/path\n",
-    );
+    // `-P -L`: the last (-L) wins → logical, honoring valid $PWD; `-L -P` is
+    // physical.
+    let dirs = LinkedDir::new();
+    assert_eq!(dirs.pwd(&["-P", "-L"]), format!("{}\n", dirs.link()));
+    assert_eq!(dirs.pwd(&["-L", "-P"]), dirs.physical());
 }
 
 #[test]

@@ -27,23 +27,23 @@ struct Args {
     #[arg(short = 'q', conflicts_with_all = ["kill_job", "rejuvenate_job", "system", "user"], help = gettext("Report queue summary (jobs per system)"))]
     queue_summary: bool,
 
-    #[arg(short = 'k', value_name = "JOBID", conflicts_with_all = ["queue_summary", "rejuvenate_job", "system", "user"], help = gettext("Kill (remove) the specified job"))]
+    #[arg(short = 'k', allow_hyphen_values = true, value_name = "JOBID", conflicts_with_all = ["queue_summary", "rejuvenate_job", "system", "user"], help = gettext("Kill (remove) the specified job"))]
     kill_job: Option<String>,
 
-    #[arg(short = 'r', value_name = "JOBID", conflicts_with_all = ["queue_summary", "kill_job", "system", "user"], help = gettext("Rejuvenate (touch) the specified job"))]
+    #[arg(short = 'r', allow_hyphen_values = true, value_name = "JOBID", conflicts_with_all = ["queue_summary", "kill_job", "system", "user"], help = gettext("Rejuvenate (touch) the specified job"))]
     rejuvenate_job: Option<String>,
 
-    #[arg(short = 's', value_name = "SYSTEM", conflicts_with_all = ["queue_summary", "kill_job", "rejuvenate_job"], help = gettext("Filter jobs by system name"))]
+    #[arg(short = 's', allow_hyphen_values = true, value_name = "SYSTEM", conflicts_with_all = ["queue_summary", "kill_job", "rejuvenate_job"], help = gettext("Filter jobs by system name"))]
     system: Option<String>,
 
-    #[arg(short = 'u', value_name = "USER", conflicts_with_all = ["queue_summary", "kill_job", "rejuvenate_job"], help = gettext("Filter jobs by user name"))]
+    #[arg(short = 'u', allow_hyphen_values = true, value_name = "USER", conflicts_with_all = ["queue_summary", "kill_job", "rejuvenate_job"], help = gettext("Filter jobs by user name"))]
     user: Option<String>,
 }
 
 fn main() -> ExitCode {
     plib::diag::init_locale("uustat");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Check if spool is accessible
     let spool = spool_dir();

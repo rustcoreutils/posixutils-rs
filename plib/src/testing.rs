@@ -87,6 +87,51 @@ pub fn os_bytes(bytes: &[u8]) -> OsString {
     std::ffi::OsStr::from_bytes(bytes).to_os_string()
 }
 
+/// Make the entry `name`, raw bytes that need not be valid UTF-8, in `dir`
+/// by calling `create` with its path, and return that path; or return `None`,
+/// after saying so on stderr, when the filesystem refuses the name.
+///
+/// POSIX file names are byte strings, but some filesystems store only
+/// UTF-8: macOS APFS fails such a name with `EILSEQ`, and others answer
+/// `EINVAL`. A test whose subject is a non-UTF-8 name then skips that part
+/// rather than failing. Any other error is a broken test and panics.
+///
+/// `create` makes whatever kind of entry the test needs: a file, a directory
+/// or a symlink.
+#[cfg(unix)]
+pub fn create_non_utf8(
+    dir: &Path,
+    name: &[u8],
+    create: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Option<PathBuf> {
+    let path = dir.join(os_bytes(name));
+    match create(&path) {
+        Ok(()) => Some(path),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EILSEQ | libc::EINVAL)) => {
+            eprintln!("skipping: filesystem refuses non-UTF-8 name {path:?}: {e}");
+            None
+        }
+        Err(e) => panic!("create {path:?}: {e}"),
+    }
+}
+
+/// Whether the filesystem holding `dir` accepts a file name that is not
+/// valid UTF-8, for a test whose utility, not the test, makes such a name.
+/// Probes with [`create_non_utf8`], so a refusal is reported the same way.
+#[cfg(unix)]
+pub fn non_utf8_names_supported(dir: &Path) -> bool {
+    let probe = create_non_utf8(dir, b"non-utf8-probe\xff", |p| {
+        std::fs::File::create(p).map(drop)
+    });
+    match probe {
+        Some(path) => {
+            std::fs::remove_file(&path).expect("remove non-UTF-8 probe file");
+            true
+        }
+        None => false,
+    }
+}
+
 /// Spawn a child process, retrying transient OS-level failures.
 ///
 /// The test suite runs many tests in parallel, each forking child processes
@@ -329,6 +374,20 @@ pub fn utf8_locale() -> Option<String> {
     }
 }
 
+/// The text a utility reports when it cannot open `path`, which must not
+/// exist: the system's own words for the failed open, as
+/// [`crate::diag::io_error_text`] gives them. They differ between systems
+/// (Windows has "The system cannot find the file specified." where Unix has
+/// "No such file or directory", and another message again when a directory
+/// in the path is missing), so a test asks rather than spelling them out.
+///
+/// A relative `path` is taken from the test's own working directory.
+pub fn open_error_text(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
+    let err = std::fs::File::open(path).expect_err(&format!("{} must not exist", path.display()));
+    crate::diag::io_error_text(&err)
+}
+
 /// Name of an installed locale matching one of `candidates`, or `None`.
 ///
 /// For tests that need a *specific* locale rather than any UTF-8 one — Turkish
@@ -365,18 +424,6 @@ fn installed_locale(candidates: &[&str]) -> Option<String> {
         .map(|name| (*name).to_string())
 }
 
-/// Assert that a utility dies by `SIGPIPE` when the reader of its standard
-/// output goes away, writing nothing to standard error.
-///
-/// The Rust runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so without
-/// [`crate::io::restore_sigpipe`] — which [`crate::diag::init_locale`] now
-/// calls — the write fails with `EPIPE`, libstd panics with "failed printing
-/// to stdout: Broken pipe", and the process exits 101. A shell reports the
-/// correct outcome as 141.
-///
-/// `cmd` is the binary name as [`get_binary_path`] resolves it. The utility
-/// must produce enough output that it is still writing when the pipe closes;
-/// `args` should name something large.
 /// Fill `buf`, looping until it is full or the stream ends.
 ///
 /// Returns how many bytes arrived, so a caller can tell "the stream really is
@@ -397,6 +444,95 @@ fn read_until_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> usize {
     n
 }
 
+/// Run `cmd` with `args` and assert that the argument parser took every word
+/// after an option that requires a value as that value, even where the word
+/// begins with '-' (XBD 12.2, Guideline 7). The utility may still refuse the
+/// value itself, as a number out of range or a file that is not there; only
+/// the parser reading the word as an option, or calling the value missing,
+/// fails the assertion. Returns the output for further checks.
+///
+/// A probe that would otherwise act (queue a job, write a log record) ends
+/// with `--help`, which is reached only once the words before it parsed.
+pub fn assert_hyphen_option_argument(cmd: &str, args: &[&str]) -> Output {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let output = run_test_base(cmd, &args, b"");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for refusal in ["unexpected argument", "a value is required", "tip: to pass"] {
+        assert!(
+            !stderr.contains(refusal),
+            "{cmd} {args:?}: an option-argument beginning with '-' was refused: {stderr}"
+        );
+    }
+    output
+}
+
+/// Run `cmd ARGS... x\xff` and assert that the last argument, which is not
+/// valid UTF-8, is reported by [`crate::optarg::args_utf8`] with status 1
+/// instead of making `cmd` panic.
+#[cfg(unix)]
+pub fn assert_non_utf8_argument_rejected(cmd: &str, args: &[&str]) {
+    let mut argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+    argv.push(os_bytes(b"x\xff"));
+    let output = run_test_base_os(cmd, &argv, b"", &[]);
+    let expected = format!("{cmd}: x\u{FFFD}: argument is not valid UTF-8\n");
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        (Some(1), expected.into()),
+        "{cmd} {argv:?}"
+    );
+}
+
+/// Run `cmd` with an option-argument beginning with '=' attached to the
+/// short option `opt` (`-d=`, `-d=x`) and again as the next word (`-d =`,
+/// `-d =x`), with `rest` after it and `stdin` as input, and assert that the
+/// two runs agree in status, standard output and standard error.
+///
+/// An attached option-argument is everything after the option letter (XBD
+/// 12.1), so `-d=` is the argument "="; clap alone reads it as `-d` with the
+/// empty argument.
+pub fn assert_equals_option_argument(cmd: &str, opt: &str, rest: &[&str], stdin: &[u8]) {
+    for value in ["=", "=x"] {
+        let rest = rest.iter().map(|s| s.to_string());
+        let attached: Vec<String> = std::iter::once(format!("{opt}{value}"))
+            .chain(rest.clone())
+            .collect();
+        let separate: Vec<String> = [opt.to_string(), value.to_string()]
+            .into_iter()
+            .chain(rest)
+            .collect();
+        let a = run_test_base(cmd, &attached, stdin);
+        let s = run_test_base(cmd, &separate, stdin);
+        assert_eq!(
+            (
+                a.status.code(),
+                String::from_utf8_lossy(&a.stdout),
+                String::from_utf8_lossy(&a.stderr)
+            ),
+            (
+                s.status.code(),
+                String::from_utf8_lossy(&s.stdout),
+                String::from_utf8_lossy(&s.stderr)
+            ),
+            "{cmd} {attached:?} differs from {cmd} {separate:?}"
+        );
+    }
+}
+
+/// Assert that a utility dies by `SIGPIPE` when the reader of its standard
+/// output goes away, writing nothing to standard error.
+///
+/// The Rust runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so without
+/// [`crate::io::restore_sigpipe`] — which [`crate::diag::init_locale`] now
+/// calls — the write fails with `EPIPE`, libstd panics with "failed printing
+/// to stdout: Broken pipe", and the process exits 101. A shell reports the
+/// correct outcome as 141.
+///
+/// `cmd` is the binary name as [`get_binary_path`] resolves it. The utility
+/// must produce enough output that it is still writing when the pipe closes;
+/// `args` should name something large.
 #[cfg(unix)]
 pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
     use std::os::unix::process::ExitStatusExt as _;
@@ -466,6 +602,94 @@ pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
         "{}: a closed pipe is not an error to report: {:?}",
         cmd,
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Assert that a utility started with `SIGPIPE` ignored, as `trap '' PIPE`
+/// in a shell leaves it, reports a write to a closed pipe as a write error:
+/// it exits with `status`, is not killed by a signal, does not panic, and
+/// says "Broken pipe" on standard error.
+///
+/// POSIX keeps an ignored signal ignored across `exec`, and a process may
+/// rely on that to see `EPIPE` instead of dying. Resetting the disposition
+/// to the default at startup -- what [`crate::io::restore_sigpipe`] did
+/// unconditionally -- killed the utility anyway, and the shell saw 141.
+///
+/// The reader end of standard output is closed before the utility starts,
+/// so its first write fails; any output at all reaches the error.
+#[cfg(unix)]
+pub fn assert_epipe_when_sigpipe_ignored(cmd: &str, args: &[&str], status: i32) {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap '' PIPE; exec \"$0\" \"$@\"")
+        .arg(get_binary_path(cmd))
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| panic!("spawn {}: {}", cmd, e));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.signal(),
+        None,
+        "{cmd}: killed by a signal although SIGPIPE was ignored; stderr {stderr:?}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(status),
+        "{cmd}: wrong exit status for a write error; stderr {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Broken pipe") && !stderr.contains("panicked"),
+        "{cmd}: expected a write-error diagnostic, got {stderr:?}"
+    );
+}
+
+/// Assert that a utility whose standard output is `/dev/full` reports the
+/// failed write: it exits with `status`, does not panic, and gives the
+/// system's text for `ENOSPC` on standard error.
+///
+/// Feed it input whose output does not end in a <newline>: standard output is
+/// line-buffered, and a final partial line reaches the device only when the
+/// buffer is flushed at exit, where the runtime discards the error. Hosts
+/// without `/dev/full` (macOS) skip the check.
+pub fn assert_write_error_on_full_device(cmd: &str, args: &[&str], stdin: &[u8], status: i32) {
+    let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+        return;
+    };
+    let enospc = {
+        let mut probe = full.try_clone().expect("dup /dev/full");
+        crate::diag::io_error_text(&probe.write_all(b"x").unwrap_err())
+    };
+    let mut child = Command::new(get_binary_path(cmd))
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(full)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {}: {}", cmd, e));
+    let mut input = child.stdin.take().expect("stdin");
+    input.write_all(stdin).expect("write stdin");
+    drop(input);
+    let out = child.wait_with_output().expect("wait");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(status),
+        "{cmd} {args:?} >/dev/full: wrong exit status; stderr {stderr:?}"
+    );
+    assert!(
+        stderr.contains(&enospc) && !stderr.contains("panicked"),
+        "{cmd} {args:?} >/dev/full: expected a write-error diagnostic, got {stderr:?}"
     );
 }
 
@@ -593,5 +817,51 @@ mod tests {
 
         let mut empty = Chunks(vec![]);
         assert_eq!(read_until_full(&mut empty, &mut buf), 0);
+    }
+
+    /// A filesystem that refuses the name the way APFS does (`EILSEQ`), or
+    /// the way others do (`EINVAL`), gives `None`, so the test skips.
+    #[cfg(unix)]
+    #[test]
+    fn create_non_utf8_reports_a_refused_name_as_none() {
+        use super::create_non_utf8;
+        let dir = crate::tmp::tempdir().unwrap();
+        for errno in [libc::EILSEQ, libc::EINVAL] {
+            let got = create_non_utf8(dir.path(), b"x\xff", |_| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(got, None, "errno {errno}");
+        }
+    }
+
+    /// Any other failure is the test's own fault and panics.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "Permission denied")]
+    fn create_non_utf8_panics_on_another_error() {
+        let dir = crate::tmp::tempdir().unwrap();
+        super::create_non_utf8(dir.path(), b"x\xff", |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        });
+    }
+
+    /// An accepted name comes back as the path the creator was handed, the
+    /// raw bytes joined to the directory; on a filesystem that refuses it,
+    /// nothing is left behind.
+    #[cfg(unix)]
+    #[test]
+    fn create_non_utf8_returns_the_created_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::tmp::tempdir().unwrap();
+        match super::create_non_utf8(dir.path(), b"d\xfe", |p| std::fs::create_dir(p)) {
+            Some(path) => {
+                assert!(path.is_dir());
+                assert_eq!(path.file_name().unwrap().as_bytes(), b"d\xfe");
+                assert!(super::non_utf8_names_supported(dir.path()));
+            }
+            None => assert!(!super::non_utf8_names_supported(dir.path())),
+        }
+        // The probe removed its file; only the directory, if made, is left.
+        assert!(std::fs::read_dir(dir.path()).unwrap().count() <= 1);
     }
 }

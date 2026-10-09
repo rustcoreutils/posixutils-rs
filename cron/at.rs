@@ -42,7 +42,7 @@ struct Args {
     list: bool,
 
     /// Specifies the pathname of a file to be used as the source of the at-job, instead of standard input.
-    #[arg(short = 'f', long = "file", value_name = "FILE", help = gettext("Specifies the pathname of a file to be used as the source of the at-job, instead of standard input."))]
+    #[arg(short = 'f', long = "file", allow_hyphen_values = true, value_name = "FILE", help = gettext("Specifies the pathname of a file to be used as the source of the at-job, instead of standard input."))]
     file: Option<PathBuf>,
 
     /// Send mail to the invoking user after the at-job has run.
@@ -50,7 +50,7 @@ struct Args {
     mail: bool,
 
     /// Specify in which queue to schedule a job for submission.
-    #[arg(short = 'q', long = "queue", value_name = "QUEUENAME", help = gettext("Specify in which queue to schedule a job for submission."))]
+    #[arg(short = 'q', long = "queue", allow_hyphen_values = true, value_name = "QUEUENAME", help = gettext("Specify in which queue to schedule a job for submission."))]
     queue: Option<char>,
 
     /// Remove the jobs with the specified at_job_id operands that were previously scheduled by the at utility.
@@ -58,7 +58,7 @@ struct Args {
     remove: bool,
 
     /// Submit the job to be run at the time specified by the time option-argument.
-    #[arg(short = 't', long = "time", value_name = "TIME_ARG", help = gettext("Submit the job to be run at the time specified by the time option-argument."))]
+    #[arg(short = 't', long = "time", allow_hyphen_values = true, value_name = "TIME_ARG", help = gettext("Submit the job to be run at the time specified by the time option-argument."))]
     time: Option<String>,
 
     /// timespec words (when submitting), or at_job_id operands with -l / -r.
@@ -99,7 +99,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn at_main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::try_parse().unwrap_or_else(|err| {
+    let args = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| {
         eprintln!("{}", err);
         std::process::exit(1);
     });

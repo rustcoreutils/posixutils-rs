@@ -574,3 +574,128 @@ fn test_timeouts_own_options_still_parse_before_operands() {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "ok");
     }
 }
+
+// XBD 12.2 Guideline 9: once DURATION and UTILITY are read, every later word
+// is the utility's, including one spelled like timeout's own -s, -k, -f or
+// -p. `timeout 10 echo -s KILL x` took `-s KILL` as timeout's signal and ran
+// `echo x`.
+#[test]
+fn test_options_after_utility_belong_to_the_utility() {
+    let out = Command::new(get_binary_path("timeout"))
+        .args(["10", "echo", "-s", "KILL", "-k", "1", "-f", "-p", "x"])
+        .output()
+        .expect("failed to run timeout");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "-s KILL -k 1 -f -p x\n"
+    );
+}
+
+// The utility's arguments are passed through byte for byte, valid UTF-8 or
+// not, and a PATH directory whose name is not valid UTF-8 is searched; such a
+// PATH was treated as unset.
+#[test]
+fn timeout_non_utf8_arguments_and_path() {
+    use plib::testing::{create_non_utf8, get_binary_path, os_bytes};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let Some(bin) = create_non_utf8(dir.path(), b"bin\xff", |p| std::fs::create_dir(p)) else {
+        return;
+    };
+    let script = bin.join("posixutils-timeout-probe");
+    std::fs::write(&script, "#!/bin/sh\nprintf '%s' \"$1\"\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = std::process::Command::new(get_binary_path("timeout"))
+        .env("PATH", &bin)
+        .args(["10", "posixutils-timeout-probe"])
+        .arg(os_bytes(b"arg\xfe"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"arg\xfe");
+}
+
+/// Run `timeout 10 utility` in `cwd` with `path` as PATH (unset if None).
+fn timeout_in(cwd: &std::path::Path, path: Option<&std::ffi::OsStr>, utility: &str) -> Output {
+    let mut command = Command::new(get_binary_path("timeout"));
+    command.current_dir(cwd).args(["10", utility]);
+    match path {
+        Some(path) => command.env("PATH", path),
+        None => command.env_remove("PATH"),
+    };
+    command.output().unwrap()
+}
+
+/// Write an executable script at `path` that prints `word`.
+fn write_script(path: &std::path::Path, word: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("#!/bin/sh\necho {word}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// A utility name without a slash is looked up through PATH, as execvp does;
+// a file of that name in the current directory does not shadow it.
+#[test]
+fn timeout_bare_name_found_through_path_not_cwd() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let cwd = dir.path().join("cwd");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    write_script(&cwd.join("posixutils-probe"), "WRONG");
+    write_script(&bin.join("posixutils-probe"), "RIGHT");
+    write_script(&cwd.join("posixutils-cwd-only"), "WRONG");
+
+    let output = timeout_in(&cwd, Some(bin.as_os_str()), "posixutils-probe");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"RIGHT\n");
+
+    // Present only in the current directory, which PATH does not name.
+    let output = timeout_in(&cwd, Some(bin.as_os_str()), "posixutils-cwd-only");
+    assert_eq!(output.status.code(), Some(127), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+// A name with a slash is a pathname and is never searched for in PATH.
+// timeout looked `./posixutils-probe` up under each PATH directory when no
+// such file was in the current directory, and ran bin/./posixutils-probe.
+#[test]
+fn timeout_name_with_slash_is_not_searched_in_path() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let cwd = dir.path().join("cwd");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::create_dir(&bin).unwrap();
+    write_script(&bin.join("posixutils-probe"), "WRONG");
+
+    let output = timeout_in(&cwd, Some(bin.as_os_str()), "./posixutils-probe");
+    assert_eq!(output.status.code(), Some(127), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+// With PATH unset the utility is searched for in the system's default path,
+// as execvp does; timeout reported every utility as not found.
+#[test]
+fn timeout_unset_path_uses_default_search_path() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let output = timeout_in(dir.path(), None, "true");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+}
+
+// An empty PATH element names the current directory.
+#[test]
+fn timeout_empty_path_element_is_cwd() {
+    let dir = plib::tmp::tempdir().unwrap();
+    write_script(&dir.path().join("posixutils-probe"), "HERE");
+    let output = timeout_in(
+        dir.path(),
+        Some(std::ffi::OsStr::new(":/nonexistent")),
+        "posixutils-probe",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"HERE\n");
+}

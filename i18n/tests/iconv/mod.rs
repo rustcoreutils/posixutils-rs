@@ -1244,3 +1244,23 @@ fn iconv_missing_charmap_names_utility_and_file() {
     );
     assert_ne!(out.status.code(), Some(0));
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-f", "-t"] {
+        plib::testing::assert_hyphen_option_argument("iconv", &[opt, "-zq", "--help"]);
+    }
+}
+
+// A write error is reported with status 1, not a panic.
+#[test]
+fn iconv_reports_write_error() {
+    plib::testing::assert_write_error_on_full_device(
+        "iconv",
+        &["-f", "UTF-8", "-t", "UTF-8"],
+        b"x",
+        1,
+    );
+}

@@ -20,12 +20,17 @@ fn main() -> ExitCode {
 
     let stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
-    if let Err(error) = posixutils_m4::run(stdout, &mut stderr, args) {
-        ExitCode::from(u8::try_from(error.get_exit_code()).unwrap_or_else(|e| {
+    let status = match posixutils_m4::run(stdout, &mut stderr, args) {
+        Err(error) => u8::try_from(error.get_exit_code()).unwrap_or_else(|e| {
             eprintln!("Error casting exit code {e} into platform agnostic u8");
             1
-        }))
-    } else {
-        ExitCode::SUCCESS
+        }),
+        Ok(()) => 0,
+    };
+    // Output without a final <newline> is still in stdout's line buffer, and
+    // the flush at exit would discard its write error.
+    if !plib::diag::flush_stdout() {
+        return ExitCode::from(status.max(1));
     }
+    ExitCode::from(status)
 }

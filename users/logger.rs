@@ -21,13 +21,13 @@ struct Args {
     #[arg(short = 'i', help = gettext("Log the process ID of the logger process with each message"))]
     log_pid: bool,
 
-    #[arg(short = 'f', value_name = "file", help = gettext("Read the log message bodies from file instead of standard input"))]
+    #[arg(short = 'f', allow_hyphen_values = true, value_name = "file", help = gettext("Read the log message bodies from file instead of standard input"))]
     file: Option<String>,
 
-    #[arg(short = 'p', value_name = "priority", help = gettext("Log with the given facility.level priority (default user.notice)"))]
+    #[arg(short = 'p', allow_hyphen_values = true, value_name = "priority", help = gettext("Log with the given facility.level priority (default user.notice)"))]
     priority: Option<String>,
 
-    #[arg(short = 't', value_name = "tag", help = gettext("Use tag as the message tag (default: the login name)"))]
+    #[arg(short = 't', allow_hyphen_values = true, value_name = "tag", help = gettext("Use tag as the message tag (default: the login name)"))]
     tag: Option<String>,
 
     #[arg(help = gettext("Message text; operands are concatenated with single spaces"))]
@@ -77,7 +77,7 @@ fn collect_messages(args: &Args) -> io::Result<Vec<String>> {
 fn main() -> ExitCode {
     plib::diag::init_locale("logger");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Default priority is user.notice (POSIX 102902).
     let (facility, level) = match &args.priority {

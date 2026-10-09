@@ -163,7 +163,7 @@ fn args_mask(args: &Args) -> u32 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("comm");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mask = args_mask(&args);
 
@@ -178,5 +178,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         plib::diag::error(&format!("{}", e));
     }
 
+    plib::diag::flush_stdout();
     std::process::exit(plib::diag::exit_status())
 }

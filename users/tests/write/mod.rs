@@ -17,7 +17,7 @@
 //! fork/exec/read pattern used to capture output from the write utility.
 
 use plib::testing::{run_test_with_checker, TestPlan};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
@@ -41,57 +41,7 @@ fn lock_pty_tests() -> std::sync::MutexGuard<'static, ()> {
 /// On some systems (especially macOS CI), the slave must be opened for
 /// data written to it to be readable from the master.
 fn create_pty() -> Result<(i32, i32, String), String> {
-    unsafe {
-        let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-        if master_fd < 0 {
-            return Err(format!(
-                "posix_openpt failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        if libc::grantpt(master_fd) < 0 {
-            libc::close(master_fd);
-            return Err(format!(
-                "grantpt failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        if libc::unlockpt(master_fd) < 0 {
-            libc::close(master_fd);
-            return Err(format!(
-                "unlockpt failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        let slave_name = libc::ptsname(master_fd);
-        if slave_name.is_null() {
-            libc::close(master_fd);
-            return Err(format!(
-                "ptsname failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        let slave_path = CStr::from_ptr(slave_name).to_string_lossy().into_owned();
-
-        // Open the slave to establish the PTY connection.
-        // This is required on some systems (especially macOS) for data
-        // written to the slave to be readable from the master.
-        let slave_cstr = CString::new(slave_path.clone()).unwrap();
-        let slave_fd = libc::open(slave_cstr.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-        if slave_fd < 0 {
-            libc::close(master_fd);
-            return Err(format!(
-                "open slave failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        Ok((master_fd, slave_fd, slave_path))
-    }
+    crate::common::open_pty_pair()
 }
 
 /// Set a file descriptor to non-blocking mode

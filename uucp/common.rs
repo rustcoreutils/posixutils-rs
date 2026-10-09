@@ -68,7 +68,7 @@ pub fn current_login() -> String {
     let uid = unsafe { libc::getuid() };
     if let Some(user) = plib::user::get_by_uid(uid) {
         if !user.name.is_empty() {
-            return user.name;
+            return user.name.to_string_lossy().into_owned();
         }
     }
     env::var("LOGNAME")

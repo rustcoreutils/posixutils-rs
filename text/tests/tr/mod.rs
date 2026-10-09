@@ -1459,3 +1459,10 @@ fn tr_large_repeat_count_in_string1_terminates() {
         "a string1 repeat count must not be counted out"
     );
 }
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in the line buffer until exit, where the error was lost.
+#[test]
+fn test_tr_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("tr", &["a", "b"], b"x", 1);
+}

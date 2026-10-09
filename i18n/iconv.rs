@@ -39,13 +39,13 @@ struct Args {
     #[arg(short = 's', help=gettext("Suppress messages about invalid characters"))]
     suppress_messages: bool,
 
-    #[arg(short = 'f', help=gettext("Identify the codeset of the input file"))]
+    #[arg(short = 'f', allow_hyphen_values = true, help=gettext("Identify the codeset of the input file"))]
     from_codeset: Option<String>,
 
     #[arg(short = 'l', help=gettext("List all supported codeset values"))]
     list_codesets: bool,
 
-    #[arg(short = 't', help=gettext("Identify the codeset of the output file"))]
+    #[arg(short = 't', allow_hyphen_values = true, help=gettext("Identify the codeset of the output file"))]
     to_codeset: Option<String>,
 
     #[arg(help=gettext("Input files (reads from stdin if empty)"))]
@@ -461,7 +461,7 @@ fn encoding_conversion(
     omit_invalid: bool,
     suppress_error: bool,
     had_error: &Rc<Cell<bool>>,
-) {
+) -> io::Result<()> {
     let iter = input.into_iter();
     let ucs4 = match from {
         Encodings::UTF_8 => utf_8::to_ucs4(iter, omit_invalid, suppress_error, had_error.clone()),
@@ -560,9 +560,13 @@ fn encoding_conversion(
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     for byte in expected {
-        out.write_all(&[byte]).unwrap();
+        out.write_all(&[byte])?;
     }
-    out.flush().unwrap();
+    out.flush()?;
+    drop(out);
+    // The BufWriter's flush hands the bytes to stdout's line buffer, which
+    // holds output without a final <newline> until it is flushed itself.
+    io::stdout().flush()
 }
 
 fn charmap_conversion(
@@ -572,7 +576,7 @@ fn charmap_conversion(
     omit_invalid: bool,
     suppress_error: bool,
     had_error: &Rc<Cell<bool>>,
-) {
+) -> io::Result<()> {
     let mut buffer = Vec::new();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -587,12 +591,7 @@ fn charmap_conversion(
                     .values()
                     .find(|e| e.symbolic_name == entry.symbolic_name)
                 {
-                    if let Err(e) = stdout.write_all(&to_entry.encoding) {
-                        plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
-                    }
-                    if let Err(e) = stdout.flush() {
-                        plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
-                    }
+                    stdout.write_all(&to_entry.encoding)?;
                     buffer.clear();
                     found = true;
                     break;
@@ -607,12 +606,7 @@ fn charmap_conversion(
                 if !suppress_error {
                     plib::diag::error(&gettext("invalid or unmapped character"));
                 }
-                if let Err(e) = stdout.write_all(&[buffer[0]]) {
-                    plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
-                }
-                if let Err(e) = stdout.flush() {
-                    plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
-                }
+                stdout.write_all(&[buffer[0]])?;
                 buffer.remove(0);
             }
         }
@@ -621,17 +615,23 @@ fn charmap_conversion(
     for &byte in &buffer {
         if !omit_invalid {
             had_error.set(true);
-            if let Err(e) = stdout.write_all(&[byte]) {
-                plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
-            }
-            if let Err(e) = stdout.flush() {
-                plib::diag::error(&format!("stdout: {}", plib::diag::io_error_text(&e)));
-            }
+            stdout.write_all(&[byte])?;
             if !suppress_error {
                 plib::diag::error(&gettext("invalid or unmapped character at end of input"));
             }
         }
     }
+    stdout.flush()
+}
+
+/// A failed write to standard output, as iconv reports it.
+fn write_error(e: io::Error) -> Box<dyn std::error::Error> {
+    format!(
+        "{}: {}",
+        gettext("write error"),
+        plib::diag::io_error_text(&e)
+    )
+    .into()
 }
 
 fn main() -> std::process::ExitCode {
@@ -654,7 +654,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn iconv_main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.list_codesets {
         list_encodings();
@@ -697,7 +697,8 @@ fn iconv_main() -> Result<(), Box<dyn std::error::Error>> {
                     args.omit_invalid,
                     args.suppress_messages,
                     &had_error,
-                );
+                )
+                .map_err(write_error)?;
             }
             (CodesetType::Charmap(from), CodesetType::Charmap(to)) => {
                 charmap_conversion(
@@ -707,7 +708,8 @@ fn iconv_main() -> Result<(), Box<dyn std::error::Error>> {
                     args.omit_invalid,
                     args.suppress_messages,
                     &had_error,
-                );
+                )
+                .map_err(write_error)?;
             }
             _ => {
                 plib::diag::error(&gettext(

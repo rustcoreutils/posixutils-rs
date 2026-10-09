@@ -51,6 +51,15 @@ utility below:
 
 ## Extensions by utility
 
+### ar
+
+ * The key may be written without its leading `-`, in the traditional form
+   Makefiles, libtool and automake's archiver probe use: `ar cr lib.a x.o`
+   means `ar -cr lib.a x.o`.
+ * `-s` is accepted with `-r` and `-q` (`ar rcs`), where POSIX allows it only
+   with `-p`, `-t` and `-x`.  It changes nothing: `ar` writes the symbol table
+   whenever it writes the archive.
+
 ### at
 
  * `AT_ALLOW`, `AT_DENY` — override the `at.allow` / `at.deny` pathnames.
@@ -151,6 +160,15 @@ Deviation: `-std=` selects nothing — the language is C17 and
 spelling is taken in silence; C90 (`-ansi` included) draws a warning that
 `-Wno-c17-dialect` silences; a revision after C17 is an error.
 
+### cat
+
+ * `-v` / `--show-nonprinting` — write nonprinting bytes visibly, as GNU and
+   BSD cat do: a control character as `^X`, DEL as `^?`, and a byte above
+   127 as `M-` and the form of the byte 128 below it (`M-^I`, `M-a`).  Tab
+   and newline are written as they are.  Bytes, not characters: a UTF-8
+   sequence shows as its bytes.
+ * `-e` — `-v`, and a `$` at the end of each line.
+
 ### cflow
 
  * `.S` operands — assembler source that is preprocessed before it is
@@ -196,6 +214,19 @@ dh_installexamples), with GNU cp's meaning:
    followed by the source's path, and missing directories on that path are
    made from the source's (with `-p`, their owner, mode and times too).  The
    target must be an existing directory.
+ * `-l` — each non-directory is hard-linked to its source instead of copied;
+   with `-R`, directories are made and the files in them linked.  An existing
+   destination is replaced only under `-f` (or `-i` answered yes); one that is
+   already the source is left as it is.  gcc-defaults' rules run
+   `cp -l debian/substvars.native debian/$p.substvars`.  Unlike GNU, which
+   with `-l` follows every symbolic link unless `-P` is given, `-R -l` follows
+   only what `-H` or `-L` asks for, as `-R` does without `-l`: a link found
+   in the walk is itself given the new name.
+ * `-v` / `--verbose` — write `'source' -> 'dest'` to standard output for
+   each file copied or linked and each directory made (not one copied into),
+   and `source -> dest` unquoted for each directory `--parents` makes, names
+   quoted as GNU coreutils quotes them.  sysvinit installs with
+   `cp -afv etc/* $(DESTDIR)...`.
 
 ### cpio
 
@@ -233,6 +264,24 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `CRON_ALLOW`, `CRON_DENY` — override the `cron.allow` / `cron.deny`
    pathnames.  Honored only when the real and effective user IDs match.
 
+### date
+
+ * `-d STRING` / `--date=STRING` — write the time `STRING` names instead of
+   the current time.  `STRING` is what `touch -d` takes (see touch below):
+   the ISO 8601 date-time, the RFC 5322 date `date -R` prints, or
+   `@SECONDS`, never GNU's free-form dates.  A zone-less time is local time,
+   or UTC under `-u`.  With `-d` an operand must be a `+format`.  guile's
+   build runs `date -u +FORMAT -d @SECONDS`; perl's passes `--utc -d` its
+   changelog date.
+ * `-I[FMT]` / `--iso-8601[=FMT]` — write the time in GNU date's ISO 8601
+   form, to the precision `FMT` names: `date` (the default, `2026-10-09`),
+   `hours` (`2026-10-09T01+00:00`), `minutes`, `seconds`
+   (`2026-10-09T01:02:03+00:00`) or `ns` (`...T01:02:03,000000000+00:00`),
+   or any unambiguous prefix of one.  As with `-i` in sed, `FMT` is only
+   ever attached.  The offset is the local zone's, `+00:00` under `-u`.  A
+   second `-I` or a `+format` operand is an error.  binutils' debian/rules
+   runs `date -Idate -u -d` its changelog date.
+
 ### dd
 
  * Block-size suffixes `c`, `K`, `m`, `M`, `g` and `G`.  POSIX defines `b`
@@ -242,10 +291,27 @@ but no daemon to run them.  Behavior follows Vixie cron:
 
  * Failure to enumerate a mounted filesystem does not set a non-zero exit
    status.
+ * `-T` / `--print-type` — a `Type` column after `Filesystem`, with each file
+   system's type from the mount table (Linux) or `f_fstypename` (macOS), in
+   every output format including `-P`.  guile's build reads it with
+   `df -T PATH | awk 'END{print $2}'`.
 
 ### diff
 
  * `--label` and `--label2` set the header names used in `-c` and `-u` output.
+ * `-q` / `--brief` — report only `Files A and B differ` for a differing
+   pair, text or binary, with no `diff ...` header under `-r`.  The exit
+   status is unchanged.
+ * `-N` / `--new-file` — a directory entry missing on one side is compared as
+   an empty file dated the Epoch, or as an empty directory.  It applies to
+   directory entries only: a missing file operand is still an error, where
+   GNU diff compares it as empty too.
+ * `-w` / `--ignore-all-space` — ignore all white space, wherever it is in
+   the line; `-w` wins over `-b`.
+ * `-s` / `--report-identical-files` — report `Files A and B are identical`
+   for a pair with no differences under the options given, in any output
+   format, with `-q`, and for each such pair a directory comparison meets.
+   libzstd's tests run `$DIFF -s tmp1 tmp`.
 
 ### echo
 
@@ -254,6 +320,10 @@ but no daemon to run them.  Behavior follows Vixie cron:
 
 ### ed
 
+ * `-` — the historic spelling of `-s`, withdrawn from POSIX, as in
+   `ed - file`, which GNU patch runs to apply an ed-style diff.  It is the
+   option only before the file operand and `--`, and never as the
+   option-argument of `-p`.
  * `x` — synonym for `wq`.
  * `z` — scroll.
  * `#` — null command / comment.
@@ -264,9 +334,21 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `-b` / `--brief` — print the type without the `file: ` prefix.
  * `-e testname` — exclude a default system test.  Only the names
    `apptype`, `ascii`, `encoding`, `cdf`, `compress` and `tar` are accepted.
-   `ascii` turns off the text recognition (`commands text`, `c program text`,
+   `ascii` turns off the text recognition (scripts, `c program text`,
    `fortran program text`); the others name GNU file built-ins this `file`
    does not have, so excluding them changes nothing.
+ * **A `#!` script is not reported as `commands text`.**  POSIX has a file of
+   shell commands contain `commands text`; we print libmagic's wording
+   instead, `<interpreter> script, <encoding> executable`, because Debian's
+   binutils build tells scripts from binaries by matching `file` output
+   against /script/.  `sh`, `bash`, `perl` and `python` (also after
+   `env`) are named — `POSIX shell script, ASCII text executable`,
+   `Perl script text executable` — and any other interpreter is
+   `a <command> script`, its control characters and invalid UTF-8 bytes
+   shown as `\ooo`.  The encoding is `ASCII text` or
+   `Unicode text, UTF-8 text`, otherwise left out; libmagic's other
+   interpreter names, encodings and line-terminator notes are not
+   reproduced.
 
 Both are forced by debhelper: dh_strip and dh_shlibdeps run
 `file --brief -e apptype -e ascii -e encoding -e cdf -e compress -e tar -- FILE`.
@@ -279,6 +361,11 @@ table is present.
 
  * `-ipath pattern` — case-insensitive `-path`.  POSIX.1-2024 added `-iname`
    only.
+ * `-newermt date` — true if the file was modified after `date`, read as
+   `touch -d` and `date -d` read one (ISO 8601, RFC 5322 as in a Debian
+   changelog, `@SECONDS`); not GNU's free-form dates.  The other `-newerXY`
+   forms are refused.  binutils' Debian rules run
+   `find ... -depth -newermt '$(BUILD_DATE)' -print0`.
  * With no path operand, `.` is searched.  POSIX requires at least one path.
  * `-mindepth n` / `-maxdepth n` — global options, as in GNU find: wherever
    they appear, entries shallower than `n` are walked but not evaluated, and
@@ -321,6 +408,27 @@ table is present.
  * `LANGUAGE` — a colon-separated locale priority list, honored ahead of the
    `LC_*` variables.
 
+### grep
+
+ * `-H` / `--with-filename` — precede every output line, and each `-c`
+   count, by the file name, even for a single input.
+ * `-h` / `--no-filename` — never precede them by the file name, even for
+   several inputs.  Of `-H` and `-h`, the last one given wins.  Help is
+   therefore `--help` only.
+ * `--label=LABEL` — the name standard input goes by in those prefixes and in
+   `-l` and `-c` output, in place of `(standard input)`.
+ * `-w` / `--word-regexp` (BSD and GNU) — a match counts only with no word
+   character (a letter or digit of the locale, or `_`) just before or after
+   it; a match that fails is tried shorter from the same start, then later in
+   the line, as GNU does.  `-x` wins over it.  binutils runs
+   `grep --word-regexp --silent`.
+ * `-A NUM` / `--after-context`, `-B NUM` / `--before-context`,
+   `-C NUM` / `--context`, and `-NUM` — write NUM lines after, before, or
+   around each selected line, marking them with `-` where a selected line has
+   `:`, and `--` between groups that do not touch (in a later file too).
+   `-A` and `-B` win over `-C`.  Only the output of lines changes, not `-c`,
+   `-l` or `-q`.  gzip's zgrep tests run `grep -15`.
+
 ### head
 
  * `-number` — the historical form of `-n number`, withdrawn from POSIX in
@@ -338,6 +446,17 @@ table is present.
  * `%option noinput` and `%option nounput`.
  * `<<EOF>>` rules (without start-condition prefixes).
  * A "Output written to <file>" notice on standard error.
+
+### ln
+
+ * `-r` / `--relative` (with `-s` only) — write each link's text as the
+   source's path relative to the link's directory.  The source is taken from
+   the current directory; both paths are resolved through any symbolic links
+   that exist, and need not exist themselves (`realpath -m`).  libselinux
+   runs `ln -sf --relative`.
+ * A single operand links into the current directory under the operand's last
+   component, as `ln SOURCE .` would.  POSIX requires two.  perl's build runs
+   `ln -s regen-configure/U`.
 
 ### localedef
 
@@ -394,6 +513,41 @@ POSIX specifies only `-k`.  Every other option is an addition:
  * `-d` / `--test` — hidden test hook.
  * Input is decoded as UTF-8 regardless of `LC_CTYPE`, so text stays readable
    under `LC_ALL=C`.
+
+### msgfmt
+
+The two GNU checks po4a runs on every PO file
+(`msgfmt --check-format --check-domain -o /dev/null FILE`):
+
+ * `--check-format` — each `c-format` translation must use the same
+   conversions as its original, the check `-c -v` makes among others; a
+   mismatch is an error.
+ * `--check-domain` — with `-o`, which ignores `domain` directives, each
+   domain a file names is reported as an error.
+
+Deviation: GNU's check of plural forms.  POSIX gives `-c -v` no rule for
+a `msgid_plural` entry; as in GNU msgfmt, which PO files are written for:
+
+ * every `msgstr[N]` of a `c-format` entry is checked against
+   `msgid_plural`, not `msgid`;
+ * a plural form that the header's `Plural-Forms` expression gives to
+   fewer than five of n = 0..=1000 (the singular of most languages) may
+   leave out trailing arguments: `msgstr[0] "one file"` for
+   `msgid_plural "%d files"`.  It may not add any or change their types.
+
+ * `--statistics` — print the translated / fuzzy / untranslated counts to
+   standard error, as `-v` does, in GNU's wording.  gettext's `po.m4` keeps a
+   msgfmt only if `msgfmt --statistics /dev/null` succeeds.
+
+### mv
+
+ * `-v` / `--verbose` — write `renamed 'source' -> 'dest'` to standard
+   output for each operand renamed.  A move across filesystems writes, in
+   GNU's wording, `created directory 'dest'` for each directory made,
+   `copied 'source' -> 'dest'` for each file copied, then `removed 'source'`
+   and `removed directory 'source'` for each one removed.  Names are quoted
+   as GNU coreutils quotes them.  findutils' build runs
+   `mv -v bin/$i bin/$i.findutils`.
 
 ### newgrp
 
@@ -472,6 +626,18 @@ Debian source packages, with GNU patch's meaning:
 
  * The `%a`, `%A`, `%e`, `%E`, `%f`, `%F`, `%g` and `%G` conversions.
 
+### ps
+
+ * procps' dashless BSD options `a`, `u` and `x`, in one word or several
+   (`ps aux`, `ps ax`, `ps u`), when the first argument is such a word; it
+   cannot be mixed with dash options.  `a` lists every user's processes, not
+   only the invoker's; `x` lists processes without a controlling terminal
+   too; `u` selects procps' user format (`USER PID %CPU %MEM VSZ RSS TTY
+   STAT START TIME COMMAND`), otherwise the format is `PID TTY STAT TIME
+   COMMAND`.  Columns, `STAT` flags, `%CPU` (CPU time over lifetime) and
+   `%MEM` follow procps; a control character in the command is shown as `?`.
+   binutils' `debian/rules` runs `ps aux`.
+
 ### prs
 
  * The `:KV:` dataspec keyword, removed from POSIX by Austin Group Defect 1452.
@@ -488,6 +654,28 @@ Debian source packages, with GNU patch's meaning:
    `-e`.
  * More than one `file` operand.  The SYNOPSIS allows exactly one.
  * With no operand, the current working directory is printed.
+ * `-s` / `--no-symlinks` — make the path absolute and remove `.` and `..`
+   by name, without following symbolic links.  As in GNU, a name followed by
+   more of the path must be a directory, and with `-e` the last name must
+   exist.  Unlike GNU, a missing directory before the last name is an error,
+   as it is without `-s`.  perl's `Configure` runs `realpath --no-symlinks`.
+
+### rm
+
+Deviation: `rm -r link/`, where `link` is a symbolic link to a directory,
+is refused ("Not a directory") and removes nothing.  POSIX resolves `link/`
+to the directory, so `rm` would remove everything in it and then fail to
+remove the directory by that name.  Refusing keeps a recursive removal from
+being redirected through a directory operand swapped for a symbolic link.
+`find link/ -delete` is refused the same way.
+
+### rmdir
+
+ * `--ignore-fail-on-non-empty` — a directory that cannot be removed only
+   because it is not empty is kept silently and does not affect the exit
+   status; with `-p`, the walk up the parents stops there.  As in GNU, a
+   permission, read-only or busy error on a directory that holds an entry
+   counts as "not empty".  debhelper's `dh_strip` runs it.
 
 ### sccs
 
@@ -497,6 +685,33 @@ Debian source packages, with GNU patch's meaning:
 ### sed
 
  * The `I` command — a non-POSIX variant of `l`.
+ * `-r` / `--regexp-extended` — GNU synonyms for `-E`.
+ * `-i[SUFFIX]` / `--in-place[=SUFFIX]` — edit each file in place, as GNU
+   sed.  The suffix is only ever attached (`-i.bak`; `-ie` is a suffix of
+   `e`), and with one the original is kept under its name plus the suffix,
+   or under the suffix with each `*` replaced by the name.  Each file is a
+   stream of its own: line numbers restart, `$` is its last line, the hold
+   space starts empty and a range left open by the file before is closed, so
+   it must select its first line again.  All output, `=` and `i` included,
+   goes into the file; `q` ends the run once its file is written.  The new
+   version is created exclusively beside the original, given its owner (when
+   root) or group, and mode, and renamed over the name, so a symbolic link
+   operand is replaced by a regular file, not written through.  Unlike GNU
+   sed, a FIFO is refused rather than read, and a suffix that names another
+   directory is refused.
+ * `-s` / `--separate` — each file is a stream of its own, as under `-i`, but
+   the output goes to standard output: line numbers restart, `$` is each
+   file's last line, the hold space starts empty and no range is open.  A
+   file that cannot be read is reported and skipped; `q` ends the run.
+ * One-line `a`, `i` and `c`, as GNU sed: blanks after the letter are
+   skipped, and text on the letter's own line (`a text`, `$i #define X 1`,
+   `a\text`) runs to the end of that line, `;`, `}` and `#` included.  In it
+   a `\` before the <newline> continues the text on the next line, `\n`,
+   `\t`, `\r`, `\a`, `\f` and `\v` are controls, and a `\` before any other
+   character is removed.  The POSIX `a\` <newline> form keeps POSIX's rule
+   (GNU applies the controls there too), and an empty text is still an
+   error where GNU appends nothing.  perl's and binutils' Debian builds use
+   it.
  * `PROJECT_NAME` — selects the gettext text domain.
 
 ### sh
@@ -511,6 +726,27 @@ Debian source packages, with GNU patch's meaning:
    and bash, rather than the shell-aborting special-builtin error POSIX
    requires.
 
+### sleep
+
+ * The `time` operand may have a fraction — `0.01`, `.5`, `1.` — as GNU and
+   BSD sleep allow; POSIX requires a decimal integer.  No sign, exponent,
+   unit suffix or `inf`.
+
+### sort
+
+ * `-z` / `--zero-terminated` — lines end with NUL, not newline, in the input
+   and the output (and in a `-c` disorder diagnostic); a newline is then an
+   ordinary character, which separates fields as a blank does, as in GNU
+   sort.  binutils runs
+   `find ... -print0 | LC_ALL=C sort -z | tar --null -T -`.
+ * `-V` / `--version-sort`, and the `V` key modifier — compare keys as
+   version strings, in GNU sort's (gnulib `filevercmp`) order: runs of
+   digits by value, `~` before everything (even the end of the key),
+   letters before other bytes, trailing file suffixes such as `.tar.gz`
+   compared last, and `.`, `..` and other names beginning with `.` first.
+   Combined with `-n` it is refused.  `-V` is therefore not a spelling of
+   `--version`.  util-linux runs `sort --check --version-sort`.
+
 ### split
 
  * A `g` suffix on the `-b` argument.  POSIX defines `k` and `m`.
@@ -521,6 +757,9 @@ Debian source packages, with GNU patch's meaning:
    argument only: `-number` and `+number` mean `-n -number` and
    `-n +number`; `-numberc` and `+numberc` mean `-c -number` and
    `-c +number`.  The historical `b`, `l` and `f` suffixes are not accepted.
+ * `-v` / `--verbose` — write GNU's `==> NAME <==` header (`standard input`
+   for standard input) before the output, once the file is open.  Unlike GNU
+   tail, the header is written for `-n 0` too.
 
 ### talk
 
@@ -573,6 +812,15 @@ GNU tar.
    license files' times in this form.  Only those two words, in upper
    case, after one space; other zone words, `UTC` combined with `Z`, and
    any other spacing are refused.
+ * `-d` also takes the POSIX date-time without its seconds
+   (`1990-06-22T12:00Z`), and `@SECONDS`, a signed whole number of seconds
+   since the Epoch.  `--date` is a long form of `-d`.  perl's build runs
+   `touch --date=@SECONDS`.
+ * `-h` / `--no-dereference` — change a symbolic link's own times, never
+   those of the file it names, as GNU touch does; with `-r`, a link gives its
+   own times too.  Nothing is created: a file that does not exist is an
+   error, passed over in silence under `-c`.  `--help` has only its long
+   form.  binutils' debian/rules runs `touch --no-dereference --date=...`.
 
 ### tr
 
@@ -609,6 +857,12 @@ GNU tar.
    RATIONALE at 118258-118263 records that this was found ambiguous and settles
    on octal escapes naming single byte values.  The RATIONALE's reading is the
    one implemented, and it is what other implementations do.
+
+### uname
+
+ * `-i` / `--hardware-platform` — write the machine hardware name (`-m`'s),
+   as Debian's coreutils does, after the `-m` field.  `-a` stays POSIX's
+   `-mnrsv` and does not include it.  gprofng's testsuite runs `uname -i`.
 
 ### uucp / uux / uustat
 

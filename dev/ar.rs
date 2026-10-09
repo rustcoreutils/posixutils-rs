@@ -64,6 +64,10 @@ struct QuickAppendArgs {
     #[arg(short = 'c', help = gettext("Suppress archive creation diagnostics"))]
     no_create_message: bool,
 
+    // Accepted for `ar rcs` / `ar qs`: the symbol table is always written.
+    #[arg(short = 's', help = gettext("Write the archive's symbol table (always done)"))]
+    symbol_table: bool,
+
     #[arg(short = 'v', help = gettext("Give verbose output"))]
     verbose: bool,
 
@@ -75,6 +79,10 @@ struct QuickAppendArgs {
 struct ReplaceArgs {
     #[arg(short = 'c', help = gettext("Suppress archive creation diagnostics"))]
     no_create_message: bool,
+
+    // Accepted for `ar rcs` / `ar qs`: the symbol table is always written.
+    #[arg(short = 's', help = gettext("Write the archive's symbol table (always done)"))]
+    symbol_table: bool,
 
     #[arg(short = 'u', help = gettext("Update older files in the archive"))]
     update_if_not_newer: bool,
@@ -999,18 +1007,23 @@ const MODE_LETTERS: &[u8] = b"dmpqrtx";
 /// tokens before clap sees them (#A3). XBD 12.2 requires grouped single-char
 /// options to be equivalent to separate ones, but the mode flags are clap
 /// subcommands, so a literal `-rv` token would not match any subcommand. Only
-/// the first option-shaped argument (the ar key) is rewritten; `-a`/`-b`/`-i`
-/// posname operands remain separate tokens and are untouched.
+/// the first argument (the ar key) is rewritten; `-a`/`-b`/`-i` posname
+/// operands remain separate tokens and are untouched.
+///
+/// The key may also be given in the traditional form without the leading
+/// '-' (`ar cr lib.a x.o`, `ar rcs ...`), as Makefiles, libtool and automake's
+/// archiver probe write it; it means the same letters with a '-'.
 fn canonicalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
     if args.len() < 2 {
         return args;
     }
     let bytes = args[1].as_encoded_bytes();
-    // Need "-" + at least two letters; leave "-d", "--", "--long" to clap.
-    if bytes.len() <= 2 || bytes[0] != b'-' || bytes[1] == b'-' {
-        return args;
-    }
-    let letters = &bytes[1..];
+    let letters = match bytes.first() {
+        // Need "-" + at least two letters; leave "-d", "--", "--long" to clap.
+        Some(b'-') if bytes.len() > 2 && bytes[1] != b'-' => &bytes[1..],
+        Some(b'-') | None => return args,
+        Some(_) => bytes,
+    };
     if !letters.iter().all(u8::is_ascii_alphabetic) {
         return args;
     }
@@ -1029,7 +1042,9 @@ fn canonicalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
 
 fn main() {
     diag::init_locale("ar");
-    let args = Args::parse_from(canonicalize_args(std::env::args_os().collect()));
+    let args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+        canonicalize_args(std::env::args_os().collect()),
+    ));
     let result = match args.command {
         Commands::Delete(args) => delete_cmd(args),
         Commands::Move(args) => move_cmd(args),

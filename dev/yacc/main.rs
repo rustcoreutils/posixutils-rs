@@ -17,7 +17,6 @@ mod lr0;
 mod parser;
 mod verify;
 
-use std::env;
 use std::fs;
 use std::process;
 
@@ -62,7 +61,7 @@ impl Default for Options {
 }
 
 fn parse_args() -> Result<Options, YaccError> {
-    let args: Vec<String> = env::args().collect();
+    let args = plib::optarg::args_utf8("yacc");
     let mut opts = Options::default();
 
     let mut i = 1;

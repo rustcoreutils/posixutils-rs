@@ -238,7 +238,7 @@ fn pathname_display(path: &Option<PathBuf>) -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("tsort");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     match tsort_file(&args.file) {
         Ok(cycle_count) => {

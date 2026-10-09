@@ -202,7 +202,7 @@ fn check_path(args: &Args, pathname: &[u8]) -> Result<(), String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     diag::init_locale("pathchk");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     for pathname in &args.pathnames {
         if let Err(msg) = check_path(&args, pathname.as_bytes()) {

@@ -11,7 +11,8 @@ mod common;
 mod parents;
 
 use self::common::{
-    copy_file, copy_files, error_string, CopyConfig, DerefMode, Destination, InodeMap,
+    copy_file, copy_files, error_string, exit_after_verbose, CopyConfig, DerefMode, Destination,
+    InodeMap, Verbose,
 };
 use clap::Parser;
 use gettextrs::gettext;
@@ -86,6 +87,9 @@ struct Args {
     #[arg(short = 'n', long, help = gettext("Do not overwrite an existing file"))]
     no_clobber: bool,
 
+    #[arg(short = 'l', help = gettext("Hard-link files instead of copying them"))]
+    link: bool,
+
     // Only `auto` is accepted: it asks for a copy-on-write clone where the filesystem offers
     // one and an ordinary copy otherwise, and an ordinary copy is always a correct result.
     #[arg(
@@ -99,6 +103,9 @@ struct Args {
 
     #[arg(long, help = gettext("Append each source path to the target directory, creating missing directories"))]
     parents: bool,
+
+    #[arg(short, long, help = gettext("Write the name of each file copied and directory made"))]
+    verbose: bool,
 
     #[arg(help = gettext("Source(s) and target of move(s)"))]
     files: Vec<PathBuf>,
@@ -136,10 +143,12 @@ impl CopyConfig {
             preserve: args.preserve || args.archive,
             recursive: args.recursive || args.archive,
             no_clobber: args.no_clobber,
+            link: args.link,
             prog: "cp",
             // POSIX cp continues with same-level/ancestor files after a per-file failure.
             continue_on_error: true,
             destination: Destination::MayExist,
+            verbose: args.verbose.then_some(Verbose::Copy),
         }
     }
 }
@@ -157,7 +166,7 @@ fn prompt_user(prompt: &str) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("cp");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.files.len() < 2 {
         eprintln!("{}", gettext("Must supply a source and target for copy"));
@@ -209,16 +218,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut inode_map = InodeMap::new();
     let inode_map = (args.archive || args.no_deref_keep_links).then_some(&mut inode_map);
 
-    if args.parents {
-        if !parents::copy_with_parents(&cfg, sources, target, inode_map, prompt_user) {
-            std::process::exit(1);
-        }
-        Ok(())
+    let ok = if args.parents {
+        parents::copy_with_parents(&cfg, sources, target, inode_map, prompt_user)
     } else if dir_exists {
-        match copy_files(&cfg, sources, target, inode_map, prompt_user) {
-            Some(_) => Ok(()),
-            None => std::process::exit(1),
-        }
+        copy_files(&cfg, sources, target, inode_map, prompt_user).is_some()
     } else {
         let mut created_files = HashSet::new();
 
@@ -230,15 +233,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             inode_map,
             prompt_user,
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => true,
             Err(e) => {
                 // `copy_file` already emitted its per-file diagnostics (empty-message marker).
                 let s = error_string(&e);
                 if !s.is_empty() {
                     eprintln!("cp: {s}");
                 }
-                std::process::exit(1);
+                false
             }
         }
-    }
+    };
+    exit_after_verbose(ok)
 }

@@ -31,20 +31,17 @@ struct Args {
     )]
     posix: bool,
 
-    #[arg(help = gettext("The utility to be invoked"))]
-    utility: String,
-
-    // `allow_hyphen_values` alongside `trailing_var_arg`: without it clap tries
-    // to parse the utility's own options as time's, so `time sh -c '...'` and
-    // `time ls -l` failed with "unexpected argument found". Every token after
-    // UTILITY belongs to the utility (XBD 12.2 Guideline 9).
+    // XBD 12.2 Guideline 9: time's options all precede the utility, so the
+    // utility name and every word after it are one trailing operand list.
+    // With the utility as a positional of its own, clap went on parsing
+    // options after it: `time echo -p x` took `-p` as time's own.
     #[arg(
-        name = "ARGUMENT",
+        value_name = "UTILITY",
+        required = true,
         trailing_var_arg = true,
-        allow_hyphen_values = true,
-        help = gettext("Arguments for the utility")
+        help = gettext("The utility to be invoked and its arguments")
     )]
-    arguments: Vec<String>,
+    command: Vec<String>,
 
     #[arg(short, long, help = gettext("Print help"), action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
@@ -59,21 +56,26 @@ enum TimeError {
     CommandNotFound(String),
 }
 
-/// Run `args.utility`, write timing statistics to standard error, and return
-/// the exit code that `time` itself should exit with (the utility's exit
-/// status, per POSIX EXIT STATUS).
+/// Run the utility named by `args.command`, write timing statistics to
+/// standard error, and return the exit code that `time` itself should exit
+/// with (the utility's exit status, per POSIX EXIT STATUS).
 fn time(args: Args) -> Result<i32, TimeError> {
     let start_time = Instant::now();
     let cpu_start = CpuStart::now();
 
-    let mut child = Command::new(&args.utility)
-        .args(args.arguments)
+    let (utility, arguments) = args
+        .command
+        .split_first()
+        .expect("clap requires the utility operand");
+
+    let mut child = Command::new(utility)
+        .args(arguments)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => TimeError::CommandNotFound(args.utility),
-            _ => TimeError::ExecCommand(args.utility),
+            io::ErrorKind::NotFound => TimeError::CommandNotFound(utility.clone()),
+            _ => TimeError::ExecCommand(utility.clone()),
         })?;
 
     let status = child.wait().map_err(|_| TimeError::ExecTime)?;
@@ -238,7 +240,7 @@ impl Status {
 fn main() {
     diag::init_locale("time");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     match time(args) {
         Ok(code) => Status::Utility(code).exit(),

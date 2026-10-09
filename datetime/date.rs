@@ -8,9 +8,10 @@
 //
 
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
-use clap::Parser;
+use clap::{ArgAction, CommandFactory, Parser};
 use gettextrs::gettext;
-use plib::diag;
+use plib::optarg::OptionArguments;
+use plib::{date_arg, diag};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::io::{self, Write};
@@ -48,6 +49,32 @@ struct Args {
     utc: bool,
 
     #[arg(
+        short,
+        long,
+        allow_hyphen_values = true,
+        help = gettext(
+            "Display the given time instead of the current time: an ISO 8601 date-time, \
+             an RFC 5322 date as printed by 'date -R', or @SECONDS"
+        )
+    )]
+    date: Option<String>,
+
+    #[arg(
+        short = 'I',
+        long = "iso-8601",
+        value_name = "FMT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "date",
+        action = ArgAction::Append,
+        help = gettext(
+            "Display the time in ISO 8601 format, to the precision FMT names: \
+             date (the default), hours, minutes, seconds or ns"
+        )
+    )]
+    iso_8601: Vec<String>,
+
+    #[arg(
         help = gettext(
             "If prefixed with '+', Display the current time in the given FORMAT, \
              as in strftime(3). Otherwise, set the current time to the given string"
@@ -56,24 +83,139 @@ struct Args {
     timestr: Option<String>,
 }
 
-fn show_time(utc: bool, formatstr: &str) {
-    if formatstr.is_empty() {
-        println!();
-        return;
+/// How much of the time `-I` writes: GNU date's `--iso-8601` formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IsoFormat {
+    Date,
+    Hours,
+    Minutes,
+    Seconds,
+    Ns,
+}
+
+impl IsoFormat {
+    const NAMES: [(&'static str, IsoFormat); 5] = [
+        ("hours", IsoFormat::Hours),
+        ("minutes", IsoFormat::Minutes),
+        ("date", IsoFormat::Date),
+        ("seconds", IsoFormat::Seconds),
+        ("ns", IsoFormat::Ns),
+    ];
+
+    /// The format `name` spells out, or the only one it is a prefix of
+    /// (GNU's argmatch: `-Is` is `-Iseconds`).
+    fn parse(name: &str) -> Option<IsoFormat> {
+        let mut found = Self::NAMES
+            .iter()
+            .filter(|(full, _)| !name.is_empty() && full.starts_with(name));
+        match (found.next(), found.next()) {
+            (Some((_, format)), None) => Some(*format),
+            _ => None,
+        }
     }
 
+    /// The `strftime` format for a time `nanos` nanoseconds past its second;
+    /// every format but the date ends in `%z`, which [`show_iso_time`] gives
+    /// a colon.
+    fn strftime_format(self, nanos: u32) -> String {
+        match self {
+            IsoFormat::Date => String::from("%Y-%m-%d"),
+            IsoFormat::Hours => String::from("%Y-%m-%dT%H%z"),
+            IsoFormat::Minutes => String::from("%Y-%m-%dT%H:%M%z"),
+            IsoFormat::Seconds => String::from("%Y-%m-%dT%H:%M:%S%z"),
+            IsoFormat::Ns => format!("%Y-%m-%dT%H:%M:%S,{nanos:09}%z"),
+        }
+    }
+}
+
+/// The `-I` format the arguments ask for, if any. A second output format
+/// (another `-I`, or a `+format` operand) is an error, as in GNU date.
+fn iso_format(args: &Args) -> Option<IsoFormat> {
+    let name = match args.iso_8601.as_slice() {
+        [] => return None,
+        [name] => name,
+        _ => fail(&gettext("multiple output formats specified")),
+    };
+    if args.timestr.as_deref().is_some_and(|t| t.starts_with('+')) {
+        fail(&gettext("multiple output formats specified"));
+    }
+    match IsoFormat::parse(name) {
+        Some(format) => Some(format),
+        None => fail(&gettext!(
+            "invalid argument '{}' for '--iso-8601'; valid arguments are \
+             'hours', 'minutes', 'date', 'seconds' and 'ns'",
+            name
+        )),
+    }
+}
+
+/// Report `msg` and exit with status 1.
+fn fail(msg: &str) -> ! {
+    diag::error(msg);
+    process::exit(1);
+}
+
+/// Write `when`, `nanos` nanoseconds past its second, in the ISO 8601
+/// `format`, in UTC or local time. The zone offset is written `+hh:mm`.
+fn show_iso_time(when: libc::time_t, nanos: u32, utc: bool, format: IsoFormat) {
+    let mut text = match format_time(when, utc, &format.strftime_format(nanos)) {
+        Ok(text) => text,
+        Err(msg) => fail(&gettext(msg)),
+    };
+    if format != IsoFormat::Date && text.len() >= 5 {
+        text.insert(text.len() - 2, b':');
+    }
+    text.push(b'\n');
+    write_stdout(&text);
+}
+
+/// Write `text` to standard output, failing on a write error rather than
+/// exiting 0 with the output lost.
+fn write_stdout(text: &[u8]) {
+    let mut out = io::stdout().lock();
+    if let Err(e) = out.write_all(text).and_then(|()| out.flush()) {
+        fail(&format!(
+            "{}: {}",
+            gettext("write error"),
+            diag::io_error_text(&e)
+        ));
+    }
+}
+
+/// The current time: seconds since the Epoch, and nanoseconds past that.
+fn current_instant() -> (libc::time_t, u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| Some((libc::time_t::try_from(d.as_secs()).ok()?, d.subsec_nanos())));
+    match now {
+        Some(now) => now,
+        None => fail(&gettext("failed to get current time")),
+    }
+}
+
+/// The current time, in seconds since the Epoch.
+fn current_time() -> libc::time_t {
     let now = unsafe { libc::time(std::ptr::null_mut()) };
     if now == -1 {
         diag::error(&gettext("failed to get current time"));
         process::exit(1);
     }
+    now
+}
 
-    match format_time(now, utc, formatstr) {
-        Ok(text) => {
+/// Write `when` formatted by `formatstr`, in UTC or local time.
+fn show_time(when: libc::time_t, utc: bool, formatstr: &str) {
+    if formatstr.is_empty() {
+        write_stdout(b"\n");
+        return;
+    }
+
+    match format_time(when, utc, formatstr) {
+        Ok(mut text) => {
             // Write the raw bytes so non-UTF-8 locale output is preserved.
-            let mut out = io::stdout().lock();
-            let _ = out.write_all(&text);
-            let _ = out.write_all(b"\n");
+            text.push(b'\n');
+            write_stdout(&text);
         }
         Err(msg) => {
             diag::error(&gettext(msg));
@@ -84,19 +226,28 @@ fn show_time(utc: bool, formatstr: &str) {
 
 /// `now` formatted by `formatstr` with the C library's `strftime`, in UTC or
 /// local time.
+///
+/// POSIX has `-u` act as if `TZ` were `UTC0`, and that is what it does: a
+/// broken-down time from `gmtime_r` under another `TZ` gives `%s` (which
+/// `strftime` computes with `mktime`) off by the zone's offset, and `%Z`
+/// as `GMT`.
 #[cfg(unix)]
 fn format_time(now: libc::time_t, utc: bool, formatstr: &str) -> Result<Vec<u8>, &'static str> {
+    extern "C" {
+        fn tzset();
+    }
+
     let c_format = CString::new(formatstr).map_err(|_| "format string contains NUL byte")?;
+
+    if utc {
+        // date is single-threaded, so nothing reads the environment meanwhile.
+        std::env::set_var("TZ", "UTC0");
+        unsafe { tzset() };
+    }
 
     let mut tm = MaybeUninit::<libc::tm>::uninit();
 
-    let tm_ptr = unsafe {
-        if utc {
-            libc::gmtime_r(&now, tm.as_mut_ptr())
-        } else {
-            libc::localtime_r(&now, tm.as_mut_ptr())
-        }
-    };
+    let tm_ptr = unsafe { libc::localtime_r(&now, tm.as_mut_ptr()) };
 
     if tm_ptr.is_null() {
         return Err("failed to get current time");
@@ -275,19 +426,74 @@ fn set_clock(secs: i64) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// -d: write the time `date` names, in the `-I` format or the operand's
+/// format if there is one. The operand cannot set the clock then, so it must
+/// be a `+format`.
+fn show_given_time(args: &Args, date: &str, iso: Option<IsoFormat>) {
+    let formatstr = match args.timestr.as_deref() {
+        None => DEF_TIMESTR,
+        Some(timestr) => match timestr.strip_prefix('+') {
+            Some(formatstr) => formatstr,
+            None => fail(&gettext!(
+                "the argument '{}' lacks a leading '+'; with -d, an operand must be a format",
+                timestr
+            )),
+        },
+    };
+
+    let zoneless = if args.utc {
+        date_arg::Zoneless::Utc
+    } else {
+        date_arg::Zoneless::Local
+    };
+    let (secs, nanos) = match date_arg::parse(date, zoneless) {
+        Ok(instant) => instant,
+        Err(msg) => fail(&msg),
+    };
+    let Some(when) = libc::time_t::try_from(secs).ok() else {
+        fail(&gettext!("invalid date format: '{}'", date));
+    };
+    match iso {
+        Some(format) => show_iso_time(when, nanos, args.utc, format),
+        None => show_time(when, args.utc, formatstr),
+    }
+}
+
 fn main() {
     diag::init_locale("date");
 
-    let args = Args::parse();
+    // `-I[FMT]` takes FMT only attached, as GNU getopt gives it.
+    let argv = plib::optarg::spell_optional_argument(
+        std::env::args_os().collect(),
+        'I',
+        "iso-8601",
+        &OptionArguments::of(Args::command()),
+    );
+    let args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(argv));
+    let iso = iso_format(&args);
+
+    if let Some(date) = &args.date {
+        show_given_time(&args, date, iso);
+        return;
+    }
 
     match &args.timestr {
-        None => show_time(args.utc, DEF_TIMESTR),
+        None => match iso {
+            Some(format) => {
+                let (when, nanos) = current_instant();
+                show_iso_time(when, nanos, args.utc, format);
+            }
+            None => show_time(current_time(), args.utc, DEF_TIMESTR),
+        },
         Some(timestr) => {
             if let Some(st) = timestr.strip_prefix("+") {
-                show_time(args.utc, st);
+                show_time(current_time(), args.utc, st);
             } else if let Err(msg) = set_time(args.utc, timestr) {
-                diag::error(&gettext(msg));
-                process::exit(1);
+                fail(&gettext(msg));
+            } else if let Some(format) = iso {
+                // GNU date writes the time it set in the -I format.
+                let (when, nanos) = current_instant();
+                show_iso_time(when, nanos, args.utc, format);
             }
         }
     }

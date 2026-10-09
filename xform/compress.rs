@@ -91,7 +91,9 @@ enum ProgramMode {
 
 impl ProgramMode {
     fn detect() -> Self {
-        let prog = std::env::args().next().unwrap_or_default();
+        // `args_os`: `args` panics on a program name that is not valid UTF-8.
+        let prog = std::env::args_os().next().unwrap_or_default();
+        let prog = prog.to_string_lossy();
         if prog.ends_with("zcat") {
             ProgramMode::Zcat
         } else if prog.ends_with("uncompress") {
@@ -106,7 +108,7 @@ impl ProgramMode {
 #[derive(Parser)]
 #[command(version, about = gettext("compress - compress and decompress data"))]
 struct Args {
-    #[arg(short = 'b', help = gettext("For LZW: max bits (9-16). For DEFLATE: compression level (1-9)"))]
+    #[arg(short = 'b', allow_hyphen_values = true, help = gettext("For LZW: max bits (9-16). For DEFLATE: compression level (1-9)"))]
     bits: Option<u32>,
 
     #[arg(short = 'c', long, help = gettext("Write to standard output; no files are changed"))]
@@ -121,7 +123,7 @@ struct Args {
     #[arg(short = 'g', help = gettext("Equivalent to -m gzip"))]
     gzip: bool,
 
-    #[arg(short = 'm', help = gettext("Use algorithm: lzw, deflate, or gzip"))]
+    #[arg(short = 'm', allow_hyphen_values = true, help = gettext("Use algorithm: lzw, deflate, or gzip"))]
     algo: Option<String>,
 
     #[arg(short = 'v', long, help = gettext("Write messages to standard error"))]
@@ -966,13 +968,34 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
     }
 }
 
+/// Write `data` to standard output and flush it, reporting a failure as a
+/// write error rather than one of the input file's. Without the flush, data
+/// with no <newline> stays in stdout's line buffer until exit, where its
+/// write error is lost. Returns whether the write succeeded.
+fn write_stdout(data: &[u8]) -> bool {
+    let mut out = io::stdout().lock();
+    match out.write_all(data).and_then(|()| out.flush()) {
+        Ok(()) => true,
+        Err(e) => {
+            diag::error(&format!(
+                "{}: {}",
+                gettext("write error"),
+                diag::io_error_text(&e)
+            ));
+            false
+        }
+    }
+}
+
 /// Compress `pathname` (or standard input) to standard output. No file is
 /// changed, so the operand may be of any type that can be read.
 fn compress_to_stdout(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i32> {
     let mut inp_buf = Vec::new();
     input_stream(pathname, true)?.read_to_end(&mut inp_buf)?;
     let out_buf = compress_data(args, algo, &inp_buf)?;
-    io::stdout().write_all(&out_buf)?;
+    if !write_stdout(&out_buf) {
+        return Ok(1);
+    }
     if args.verbose && !is_stdin(pathname) {
         let ratio = compression_ratio(inp_buf.len(), out_buf.len());
         eprintln!(
@@ -1033,7 +1056,9 @@ fn decompress_to_stdout(args: &Args, pathname: &Path) -> io::Result<i32> {
     let mut compressed_data = Vec::new();
     input_stream(&input_path, true)?.read_to_end(&mut compressed_data)?;
     let decompressed = decompress_auto(&compressed_data)?;
-    io::stdout().write_all(&decompressed)?;
+    if !write_stdout(&decompressed) {
+        return Ok(1);
+    }
     if args.verbose && !reading_stdin {
         eprintln!("{}", gettext!("{}: -- decompressed", input_path.display()));
     }
@@ -1082,7 +1107,7 @@ fn main() {
     diag::init_locale("compress");
 
     let program_mode = ProgramMode::detect();
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // Apply program mode defaults
     match program_mode {

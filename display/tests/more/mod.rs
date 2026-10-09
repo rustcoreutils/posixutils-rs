@@ -1807,3 +1807,39 @@ fn test_pty_equals_reports_source_line() {
 
     assert_eq!(session.quit(), Some(0));
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-p", "-t", "-n"] {
+        plib::testing::assert_hyphen_option_argument("more", &[opt, "-zq", "--help"]);
+    }
+}
+
+// When stdout is not a terminal more copies its input; a write error on a
+// final line without a <newline> sat in the line buffer until exit, where it
+// was lost.
+#[test]
+fn more_filter_mode_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("more", &[], b"x", 1);
+}
+
+// With $MORE set, an argument that is not valid UTF-8 is refused like any
+// other, not a panic.
+#[cfg(unix)]
+#[test]
+fn more_env_with_non_utf8_argument() {
+    use plib::testing::{get_binary_path, os_bytes};
+    let output = std::process::Command::new(get_binary_path("more"))
+        .env("MORE", "-s")
+        .arg(os_bytes(b"x\xff"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid UTF-8"),
+        "{output:?}"
+    );
+}

@@ -24,7 +24,12 @@ pub struct ProcessInfo {
     pub sid: i32,            // session ID
     pub nice: i32,           // nice value
     pub vsz: u64,            // virtual memory size in KB
+    pub rss: u64,            // resident set size in KB
     pub time: u64,           // cumulative CPU time in whole seconds
+    pub cpu_ms: u64,         // cumulative CPU time in milliseconds
+    pub tpgid: i32,          // foreground process group of its terminal
+    pub threads: u32,        // number of threads
+    pub locked: bool,        // has pages locked into memory
     pub start_time: u64,     // start time in seconds since the Unix epoch
     pub state: char,         // process state (R, S, D, Z, T, etc.)
     pub priority: i32,       // priority
@@ -42,6 +47,29 @@ fn clock_ticks_per_sec() -> u64 {
     } else {
         100
     }
+}
+
+/// The page size in KB (`_SC_PAGESIZE`); /proc/[pid]/statm counts pages.
+fn page_size_kb() -> u64 {
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 {
+        size as u64 / 1024
+    } else {
+        4
+    }
+}
+
+/// Total physical memory in KB, from the `MemTotal` line of /proc/meminfo;
+/// 0 if unavailable.
+pub fn total_memory_kb() -> u64 {
+    read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|info| {
+            info.lines()
+                .find_map(|line| line.strip_prefix("MemTotal:"))
+                .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// System boot time as seconds since the Unix epoch, read from the `btime`
@@ -63,6 +91,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, Error> {
     // These are host-wide constants; read them once, not per-process.
     let clk_tck = clock_ticks_per_sec();
     let boot_epoch = boot_time_epoch();
+    let page_kb = page_size_kb();
 
     let mut processes = Vec::new();
     for entry in fs::read_dir("/proc")? {
@@ -70,7 +99,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, Error> {
         let path = entry.path();
         if let Ok(pid) = entry.file_name().to_str().unwrap_or("").parse::<i32>() {
             if pid > 0 {
-                if let Some(info) = get_process_info(pid, &path, clk_tck, boot_epoch) {
+                if let Some(info) = get_process_info(pid, &path, clk_tck, boot_epoch, page_kb) {
                     processes.push(info);
                 }
             }
@@ -84,6 +113,7 @@ fn get_process_info(
     proc_path: &Path,
     clk_tck: u64,
     boot_epoch: u64,
+    page_kb: u64,
 ) -> Option<ProcessInfo> {
     let status_path = proc_path.join("status");
     let cmdline_path = proc_path.join("cmdline");
@@ -111,17 +141,20 @@ fn get_process_info(
     let pgid: i32 = stat_fields[2].parse().unwrap_or(0);
     let sid: i32 = stat_fields[3].parse().unwrap_or(0);
     let tty_nr: i32 = stat_fields[4].parse().unwrap_or(0);
+    let tpgid: i32 = stat_fields[5].parse().unwrap_or(-1);
     let flags: u32 = stat_fields[6].parse().unwrap_or(0);
     let utime: u64 = stat_fields[11].parse().unwrap_or(0);
     let stime: u64 = stat_fields[12].parse().unwrap_or(0);
     let priority: i32 = stat_fields[15].parse().unwrap_or(0);
     let nice: i32 = stat_fields[16].parse().unwrap_or(0);
+    let threads: u32 = stat_fields[17].parse().unwrap_or(1);
     let start_ticks: u64 = stat_fields[19].parse().unwrap_or(0);
 
     // Normalize to seconds so the shared formatters are unit-agnostic.
     // Total CPU time (utime+stime) is in clock ticks; starttime (field 22) is
     // clock ticks since boot, so add the boot epoch to get an absolute time.
     let time = (utime + stime) / clk_tck;
+    let cpu_ms = (utime + stime) * 1000 / clk_tck;
     let start_time = if boot_epoch > 0 {
         boot_epoch + start_ticks / clk_tck
     } else {
@@ -133,15 +166,14 @@ fn get_process_info(
     let comm_end = stat.rfind(')')?;
     let comm = stat[comm_start..comm_end].to_string();
 
-    // Parse /proc/[pid]/statm for virtual memory size
+    // Parse /proc/[pid]/statm for the virtual and resident sizes
     // Format: size resident shared text lib data dt
-    // size is in pages, we convert to KB
-    let vsz: u64 = statm
+    // in pages, which we convert to KB
+    let mut statm_pages = statm
         .split_whitespace()
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|pages| pages * 4) // Assume 4KB pages, convert to KB
-        .unwrap_or(0);
+        .map(|s| s.parse::<u64>().unwrap_or(0) * page_kb);
+    let vsz = statm_pages.next().unwrap_or(0);
+    let rss = statm_pages.next().unwrap_or(0);
 
     // Parse TTY device number
     let tty = if tty_nr > 0 {
@@ -162,6 +194,7 @@ fn get_process_info(
     let mut gid: u32 = 0;
     let mut ruid: u32 = 0;
     let mut rgid: u32 = 0;
+    let mut locked = false;
 
     for line in status.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -177,16 +210,21 @@ fn get_process_info(
                     rgid = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
                     gid = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(rgid);
                 }
+                // Format: VmLck: <size> kB
+                "VmLck:" => locked = parts[1] != "0",
                 _ => {}
             }
         }
     }
 
-    // Build args from cmdline (null-separated arguments)
-    let args = if !cmdline.is_empty() {
-        cmdline.trim_end_matches('\0').replace('\0', " ")
-    } else {
+    // Build args from cmdline (null-separated arguments); an empty one, as
+    // a kernel thread or a process part-way through exec or exit has, shows
+    // the command name in brackets.
+    let args = cmdline.trim_end_matches('\0').replace('\0', " ");
+    let args = if args.is_empty() {
         format!("[{}]", comm)
+    } else {
+        args
     };
 
     Some(ProcessInfo {
@@ -201,7 +239,12 @@ fn get_process_info(
         sid,
         nice,
         vsz,
+        rss,
         time,
+        cpu_ms,
+        tpgid,
+        threads,
+        locked,
         start_time,
         state,
         priority,

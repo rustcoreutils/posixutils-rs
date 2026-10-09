@@ -77,3 +77,32 @@ fn nice_not_executable() {
     }
     nice_exit(vec![path.to_str().unwrap()], 126);
 }
+
+// XBD 12.2 Guideline 9: once the utility name is read, every later word is
+// the utility's. `nice echo -n 5 x` took `-n 5` as nice's own increment and
+// ran `echo x`. Both GNU and BSD echo honour -n, so the output has no newline.
+#[test]
+fn options_after_utility_belong_to_the_utility() {
+    plib::testing::run_test(TestPlan {
+        cmd: String::from("nice"),
+        args: ["echo", "-n", "5", "x"].map(String::from).to_vec(),
+        stdin_data: String::new(),
+        expected_out: String::from("5 x"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// The utility's arguments are passed through byte for byte; clap rejected
+// one that was not valid UTF-8.
+#[test]
+fn nice_passes_non_utf8_arguments() {
+    use plib::testing::{get_binary_path, os_bytes};
+    let output = std::process::Command::new(get_binary_path("nice"))
+        .args(["sh", "-c", "printf '%s' \"$1\"", "sh"])
+        .arg(os_bytes(b"arg\xfe"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"arg\xfe");
+}

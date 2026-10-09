@@ -18,6 +18,9 @@ use super::AwkValue;
 #[derive(Clone, PartialEq)]
 pub struct KeyIterator {
     index: usize,
+    /// Elements added after the iterator was created are stored at or past
+    /// `end`, so it does not visit them.
+    end: usize,
 }
 
 pub type Key = Rc<str>;
@@ -46,8 +49,9 @@ impl Array {
         if let Some(pair_index) = self.key_map.remove(key) {
             if self.iterator_count == 0 {
                 self.pairs.swap_remove(pair_index);
-                if !self.pairs.is_empty() {
-                    let (key, _) = self.pairs[pair_index].as_ref().unwrap();
+                // the element moved into the slot, unless the deleted one was
+                // the last, or what moved is a slot a loop emptied
+                if let Some(Some((key, _))) = self.pairs.get(pair_index) {
                     *self.key_map.get_mut(key).unwrap() = pair_index;
                 }
             } else {
@@ -59,44 +63,47 @@ impl Array {
 
     pub fn key_iter(&mut self) -> KeyIterator {
         self.iterator_count += 1;
-        KeyIterator { index: 0 }
+        KeyIterator {
+            index: 0,
+            end: self.pairs.len(),
+        }
     }
 
+    /// The next key of the iteration, or None at its end, which also ends
+    /// the iterator.
     pub fn key_iter_next(&mut self, iter: &mut KeyIterator) -> Option<Key> {
-        for maybe_key in &self.pairs[iter.index..] {
+        // `delete a` may have emptied the array since
+        let end = iter.end.min(self.pairs.len());
+        while iter.index < end {
             iter.index += 1;
-            if let Some((key, _)) = maybe_key {
+            if let Some((key, _)) = &self.pairs[iter.index - 1] {
                 return Some(key.clone());
             }
         }
-        iter.index = usize::MAX;
-        self.iterator_count -= 1;
+        self.end_iterator();
         None
     }
 
+    /// Ends an iterator before it reached its end (`break` or `return` out
+    /// of a `for (k in a)` loop).
+    pub fn end_iterator(&mut self) {
+        self.iterator_count -= 1;
+    }
+
     /// Get the `ValueIndex` of the key in the array. If the key does not exist, it will be inserted.
-    /// # Errors
-    /// If the array has an active iterator, an error will be returned.
     pub fn get_value_index(&mut self, key: Key) -> Result<ValueIndex, String> {
         match self.key_map.entry(key.clone()) {
             Entry::Occupied(e) => Ok(ValueIndex { index: *e.get() }),
             Entry::Vacant(e) => {
-                if self.iterator_count == 0 {
-                    let reusing_slot = self.empty_slots > 0;
-                    let pair_index = insert_pair(
-                        key,
-                        AwkValue::uninitialized_scalar(),
-                        &mut self.pairs,
-                        self.empty_slots == 0,
-                    );
-                    if reusing_slot {
-                        self.empty_slots -= 1;
-                    }
-                    e.insert(pair_index);
-                    Ok(ValueIndex { index: pair_index })
-                } else {
-                    Err("cannot insert into an array with an active iterator".to_string())
-                }
+                let pair_index = store_pair(
+                    key,
+                    AwkValue::uninitialized_scalar(),
+                    &mut self.pairs,
+                    &mut self.empty_slots,
+                    self.iterator_count,
+                );
+                e.insert(pair_index);
+                Ok(ValueIndex { index: pair_index })
             }
         }
     }
@@ -111,32 +118,33 @@ impl Array {
     }
 
     /// Set the array element at the given key to the given value
-    /// # Errors
-    /// If the array has an active iterator, an error will be returned.
     pub fn set<V: Into<AwkValue>>(&mut self, key: String, value: V) -> Result<ValueIndex, String> {
-        if self.iterator_count == 0 {
-            let key = Rc::<str>::from(key);
-            let value = value.into();
-            match self.key_map.entry(key.clone()) {
-                Entry::Occupied(e) => {
-                    let pair_index = *e.get();
-                    self.pairs[pair_index].as_mut().unwrap().1 = value;
-                    Ok(ValueIndex { index: pair_index })
-                }
-                Entry::Vacant(e) => {
-                    let reusing_slot = self.empty_slots > 0;
-                    let pair_index =
-                        insert_pair(key, value, &mut self.pairs, self.empty_slots == 0);
-                    if reusing_slot {
-                        self.empty_slots -= 1;
-                    }
-                    e.insert(pair_index);
-                    Ok(ValueIndex { index: pair_index })
-                }
+        let key = Rc::<str>::from(key);
+        let value = value.into();
+        match self.key_map.entry(key.clone()) {
+            Entry::Occupied(e) => {
+                let pair_index = *e.get();
+                self.pairs[pair_index].as_mut().unwrap().1 = value;
+                Ok(ValueIndex { index: pair_index })
             }
-        } else {
-            Err("cannot insert into an array with an active iterator".to_string())
+            Entry::Vacant(e) => {
+                let pair_index = store_pair(
+                    key,
+                    value,
+                    &mut self.pairs,
+                    &mut self.empty_slots,
+                    self.iterator_count,
+                );
+                e.insert(pair_index);
+                Ok(ValueIndex { index: pair_index })
+            }
         }
+    }
+
+    /// The value of the element with the given key, without creating it.
+    pub fn get(&self, key: &str) -> Option<&AwkValue> {
+        let index = *self.key_map.get(key)?;
+        self.pairs[index].as_ref().map(|(_, value)| value)
     }
 
     pub fn contains(&self, key: &str) -> bool {
@@ -164,6 +172,22 @@ impl<S: Into<String>, A: Into<AwkValue>> FromIterator<(S, A)> for Array {
         }
         result
     }
+}
+
+/// Stores a new element: in an empty slot if there is one, unless an
+/// iteration is going on, which must not visit it.
+fn store_pair(
+    key: Key,
+    value: AwkValue,
+    pairs: &mut Vec<Option<KeyValuePair>>,
+    empty_slots: &mut usize,
+    iterator_count: usize,
+) -> usize {
+    let reuse_a_slot = *empty_slots > 0 && iterator_count == 0;
+    if reuse_a_slot {
+        *empty_slots -= 1;
+    }
+    insert_pair(key, value, pairs, !reuse_a_slot)
 }
 
 fn insert_pair(
@@ -263,10 +287,17 @@ mod tests {
     }
 
     #[test]
-    fn insert_with_active_iterator_is_error() {
+    fn element_inserted_during_iteration_is_not_visited() {
         let mut array = Array::default();
-        let _ = array.key_iter();
-        assert!(array.set("a".to_string(), 1.0).is_err());
+        array.set("a".to_string(), 1.0).unwrap();
+        array.set("b".to_string(), 2.0).unwrap();
+        array.delete("a");
+        let mut iter = array.key_iter();
+        array.set("c".to_string(), 3.0).unwrap();
+        assert_eq!(array.key_iter_next(&mut iter), Some(Rc::from("b")));
+        array.get_value_index(Rc::from("d")).unwrap();
+        assert_eq!(array.key_iter_next(&mut iter), None);
+        assert_eq!(array.len(), 3);
     }
 
     #[test]

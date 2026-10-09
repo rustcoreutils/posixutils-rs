@@ -1650,3 +1650,50 @@ fn test_compress_read_only_input() {
     assert!(!source_left, "the read-only input must be removed");
     assert!(compressed_made, "the output must be left in place");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-b", "-m"] {
+        plib::testing::assert_hyphen_option_argument("compress", &[opt, "-zq", "--help"]);
+    }
+}
+
+// A write error on standard output is reported: the compressed data has no
+// <newline> to flush it, so it sat in the line buffer until exit, where the
+// error was lost.
+#[test]
+fn compress_reports_write_error_to_stdout() {
+    plib::testing::assert_write_error_on_full_device("compress", &["-c"], b"x", 1);
+    let input = plib::testing::TempFile::new("x", "x");
+    let compressed = std::process::Command::new(plib::testing::get_binary_path("compress"))
+        .arg("-c")
+        .arg(input.path())
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(!compressed.is_empty());
+    plib::testing::assert_write_error_on_full_device("uncompress", &["-c"], &compressed, 1);
+}
+
+// A program name that is not valid UTF-8 still selects zcat by its ending;
+// reading it made compress panic.  The name is set as argv[0] directly,
+// which is all compress reads, so no file of that name is needed.
+#[cfg(unix)]
+#[test]
+fn zcat_invoked_by_non_utf8_name() {
+    use plib::testing::{get_binary_path, os_bytes};
+    use std::os::unix::process::CommandExt;
+    let compressed = compress_stdin_test("hello\n");
+    let mut child = std::process::Command::new(get_binary_path("compress"))
+        .arg0(os_bytes(b"\xffzcat"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&compressed).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+}

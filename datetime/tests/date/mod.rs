@@ -245,3 +245,239 @@ fn test_utc_set_form_fails_cleanly_without_privilege() {
         },
     );
 }
+
+/// `date ARGS` under `TZ` and the C locale prints `expected`.
+fn date_d(args: &[&str], tz: &str, expected: &str) {
+    let mut plan = date_plan(args);
+    plan.expected_out = format!("{expected}\n");
+    run_test_with_env(plan, &[("TZ", tz), ("LC_ALL", "C")]);
+}
+
+/// -d @SECONDS, in either order with the format; guile's build runs
+/// `date -u +'%Y-%m-%d %T' -d @$SOURCE_DATE_EPOCH`.
+#[test]
+fn test_date_d_epoch() {
+    let fmt = "+%Y-%m-%d %H:%M:%S";
+    date_d(&["-u", "-d", "@0", fmt], "UTC0", "1970-01-01 00:00:00");
+    date_d(
+        &["-u", fmt, "-d", "@1700000000"],
+        "UTC0",
+        "2023-11-14 22:13:20",
+    );
+    date_d(&["--utc", "--date=@-1", fmt], "UTC0", "1969-12-31 23:59:59");
+    date_d(&["--date", "@+86400", fmt], "UTC0", "1970-01-02 00:00:00");
+}
+
+/// -d takes the ISO 8601 forms touch -d takes, with or without seconds.
+#[test]
+fn test_date_d_iso8601() {
+    let fmt = "+%Y-%m-%d %H:%M:%S";
+    for (date, utc) in [
+        ("1990-06-22T12:00Z", "1990-06-22 12:00:00"),
+        ("1990-06-22T12:00:30Z", "1990-06-22 12:00:30"),
+        ("1990-06-22T12:00+02:00", "1990-06-22 10:00:00"),
+        ("1990-06-22 12:00:30-05:30", "1990-06-22 17:30:30"),
+        ("2007-11-12 10:15:30.25Z", "2007-11-12 10:15:30"),
+        ("1999-08-26 12:06:20 UTC", "1999-08-26 12:06:20"),
+        ("1999-08-26 12:06 UTC", "1999-08-26 12:06:00"),
+    ] {
+        date_d(&["-u", "-d", date, fmt], "UTC0", utc);
+    }
+}
+
+/// perl's debian/config.debian runs
+/// `LC_ALL=C date '+%b %e %Y %T' --utc -d "<changelog Date:>"`, the RFC 5322
+/// date touch -d already takes.
+#[test]
+fn test_date_d_changelog_date() {
+    date_d(
+        &[
+            "+%b %e %Y %T",
+            "--utc",
+            "-d",
+            "Sat, 05 Jul 2025 12:34:56 +0200",
+        ],
+        "UTC0",
+        "Jul  5 2025 10:34:56",
+    );
+}
+
+/// A zone-less -d time is local time, in TZ, or in UTC under -u.
+#[cfg(unix)]
+#[test]
+fn test_date_d_local_time() {
+    date_d(
+        &["-d", "@0", "+%Y-%m-%d %H:%M:%S"],
+        "EST5",
+        "1969-12-31 19:00:00",
+    );
+    date_d(&["-d", "1990-06-22T12:00", "+%s"], "EST5", "646074000");
+    date_d(
+        &["-u", "-d", "1990-06-22T12:00", "+%Y-%m-%d %H:%M:%S"],
+        "EST5",
+        "1990-06-22 12:00:00",
+    );
+}
+
+/// A local time the fall-back hour repeats is the earlier of the two (daylight time), as GNU
+/// date reads it in New York; in Berlin GNU takes the later one, and this date keeps to the
+/// earlier.  A time the spring-forward gap skips does not exist and is rejected, as GNU
+/// rejects it.
+#[cfg(unix)]
+#[test]
+fn test_date_d_local_time_across_dst() {
+    let tz = "EST5EDT,M3.2.0,M11.1.0";
+    date_d(&["-d", "2026-11-01 01:30", "+%s"], tz, "1793511000");
+    date_d(
+        &["-d", "2026-11-01T01:30:00", "+%s %Z"],
+        tz,
+        "1793511000 EDT",
+    );
+    let berlin = "CET-1CEST,M3.5.0,M10.5.0/3";
+    date_d(
+        &["-d", "2026-10-25T02:30", "+%s %Z"],
+        berlin,
+        "1792888200 CEST",
+    );
+    let plan = date_plan(&["-d", "2026-03-08 02:30", "+%s"]);
+    run_test_with_checker_and_env(plan, &[("TZ", tz)], |_, output| {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    });
+}
+
+/// -u is TZ=UTC0 for every conversion, %s and %Z included: %s used to be
+/// computed in the TZ zone from a UTC broken-down time, off by the offset.
+#[cfg(unix)]
+#[test]
+fn test_utc_flag_is_tz_utc0() {
+    date_d(&["-u", "-d", "@0", "+%s %Z"], "EST5", "0 UTC");
+    date_d(&["-u", "-d", "@1700000000", "+%s"], "EST5", "1700000000");
+    run_test_with_checker_and_env(date_plan(&["-u", "+%s"]), &[("TZ", "EST5")], |_, out| {
+        let shown: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((now - shown).abs() < 60, "{shown} vs {now}");
+    });
+}
+
+/// No free-form dates, and with -d an operand must be a format.
+#[test]
+fn test_date_d_rejections() {
+    for args in [
+        &["-d", "junk"][..],
+        &["-d", "next tuesday"],
+        &["-d", "@"],
+        &["-d", "@12x"],
+        &["-d", "@1.5"],
+        &["-d", "1990-06-22"],
+        &["-d", "@0", "0101"],
+    ] {
+        run_test_with_checker_and_env(date_plan(args), &[("TZ", "UTC0")], |_, output| {
+            assert_eq!(output.status.code(), Some(1), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        });
+    }
+}
+
+/// -I[FMT] / --iso-8601[=FMT]: GNU's ISO 8601 output, the date by default.
+/// binutils' debian/rules runs `date -Idate -u -d "<changelog date>"`.
+#[test]
+fn test_iso_8601() {
+    let at = "@1700000000";
+    for (args, expected) in [
+        (&["-I"][..], "2023-11-14"),
+        (&["-Idate"], "2023-11-14"),
+        (&["--iso-8601"], "2023-11-14"),
+        (&["-Ihours"], "2023-11-14T22+00:00"),
+        (&["-Iminutes"], "2023-11-14T22:13+00:00"),
+        (&["-Iseconds"], "2023-11-14T22:13:20+00:00"),
+        (&["--iso-8601=seconds"], "2023-11-14T22:13:20+00:00"),
+        (&["-Ins"], "2023-11-14T22:13:20,000000000+00:00"),
+        // A value may be shortened to any unambiguous prefix.
+        (&["-Id"], "2023-11-14"),
+        (&["-Ih"], "2023-11-14T22+00:00"),
+        (&["-Im"], "2023-11-14T22:13+00:00"),
+        (&["-Is"], "2023-11-14T22:13:20+00:00"),
+        (&["--iso-8601=n"], "2023-11-14T22:13:20,000000000+00:00"),
+    ] {
+        let mut all = vec!["-u", "-d", at];
+        all.extend_from_slice(args);
+        date_d(&all, "EST5", expected);
+    }
+    date_d(
+        &["-Idate", "-u", "-d", "Mon, 03 Mar 2025 21:01:22 +0100"],
+        "EST5",
+        "2025-03-03",
+    );
+    date_d(
+        &["-Ins", "-d", "2007-11-12 10:15:30.25Z"],
+        "UTC0",
+        "2007-11-12T10:15:30,250000000+00:00",
+    );
+}
+
+/// The offset is the local zone's, with a colon, minutes included.
+#[cfg(unix)]
+#[test]
+fn test_iso_8601_offsets() {
+    let at = "@1700000000";
+    date_d(
+        &["-Idate", "-d", "Mon, 03 Mar 2025 01:01:22 +0100"],
+        "EST5",
+        "2025-03-02",
+    );
+    date_d(&["-Ihours", "-d", at], "EST5", "2023-11-14T17-05:00");
+    date_d(
+        &["-Iminutes", "-d", at],
+        "IST-5:30",
+        "2023-11-15T03:43+05:30",
+    );
+    date_d(
+        &["-Iseconds", "-d", at],
+        "NST3:30",
+        "2023-11-14T18:43:20-03:30",
+    );
+}
+
+/// Without -d, -I writes the current time.
+#[test]
+fn test_iso_8601_now() {
+    run_test_with_checker_and_env(date_plan(&["-I", "-u"]), &[], |_, output| {
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let shape: Vec<usize> = stdout.trim_end().split('-').map(str::len).collect();
+        assert_eq!(shape, [4, 2, 2], "{stdout:?}");
+    });
+}
+
+/// A FMT that names none of the formats, or a second output format, is an
+/// error, as in GNU date.
+#[test]
+fn test_iso_8601_rejections() {
+    for args in [
+        &["-Ifoo"][..],
+        &["--iso-8601="],
+        &["-I", "-I"],
+        &["-I", "+%Y"],
+        &["-Iseconds", "-d", "@0", "+%Y"],
+    ] {
+        run_test_with_checker_and_env(date_plan(args), &[("TZ", "UTC0")], |_, output| {
+            assert_eq!(output.status.code(), Some(1), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        });
+    }
+}
+
+// A failed write of the date is an error: date discarded it and exited 0.
+#[test]
+fn test_date_reports_write_error() {
+    plib::testing::assert_write_error_on_full_device("date", &["+x"], b"", 1);
+    plib::testing::assert_write_error_on_full_device("date", &["+"], b"", 1);
+    plib::testing::assert_write_error_on_full_device("date", &["-Iseconds"], b"", 1);
+}

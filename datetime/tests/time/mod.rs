@@ -235,3 +235,23 @@ fn own_p_option_still_parses_before_the_utility() {
         "-p must still select the POSIX format, got {stderr:?}"
     );
 }
+
+// XBD 12.2 Guideline 9: once the utility name is read, every later word is
+// the utility's, including one spelled like time's own -p. `time echo -p x`
+// took `-p` as time's and ran `echo x`.
+#[test]
+fn own_option_after_the_utility_belongs_to_the_utility() {
+    let output = run_test_base(
+        "time",
+        &["echo".to_string(), "-p".to_string(), "x".to_string()],
+        b"",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "-p x\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("real "),
+        "-p after the utility switched time to POSIX format: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -1,0 +1,6 @@
+\entry{zebra}{12}{\code {zebra}}
+\entry{apple}{3}{apple {pie}}
+\entry{Mango}{7}{\var {Mango}}
+\entry{banana}{5}{banana}
+\entry{}{1}{empty key}
+\entry{avocado}{9}{\code {avocado}}

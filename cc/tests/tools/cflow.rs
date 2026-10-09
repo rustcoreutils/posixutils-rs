@@ -339,3 +339,12 @@ fn cflow_does_not_expand_macros_in_a_dot_i() {
         "the macro was expanded a second time:\n{out}"
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-i", "-D", "-I", "-U"] {
+        plib::testing::assert_hyphen_option_argument("cflow", &[opt, "-zq", "--help"]);
+    }
+}

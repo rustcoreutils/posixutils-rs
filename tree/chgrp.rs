@@ -12,7 +12,7 @@ mod common;
 use self::common::{chown_traverse, error_string, ChangeOwnershipArgs};
 use clap::Parser;
 use gettextrs::gettext;
-use std::{ffi::CString, io};
+use std::io;
 
 /// chgrp - change file group ownership
 #[derive(Parser)]
@@ -40,22 +40,19 @@ fn parse_group(group: &str) -> Result<Option<u32>, String> {
         Ok(gid) => Ok(Some(gid)),
         Err(_) => {
             // lookup group by name
-            let group_cstr = CString::new(group).unwrap();
-            let group_st = unsafe { libc::getgrnam(group_cstr.as_ptr()) };
-            if group_st.is_null() {
-                let err_str = gettext!("invalid group: '{}'", group);
-                return Err(err_str);
+            match plib::group::get_by_name(group) {
+                Some(g) => Ok(Some(g.gid)),
+                None => Err(gettext!("invalid group: '{}'", group)),
             }
-
-            let gid = unsafe { (*group_st).gr_gid };
-            Ok(Some(gid))
         }
     }
 }
 
 fn err_handler(e: io::Error, path: ftw::DisplayablePath) {
     let err_str = match e.kind() {
-        io::ErrorKind::PermissionDenied => {
+        io::ErrorKind::PermissionDenied
+        | io::ErrorKind::NotFound
+        | io::ErrorKind::NotADirectory => {
             gettext!("cannot access '{}': {}", path, error_string(&e))
         }
         _ => {
@@ -79,7 +76,7 @@ fn chown_err_handler(e: io::Error, path: ftw::DisplayablePath) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // Enable `no_derereference` if `-R` is enabled without either `-H` or `-L`
     if args.delegate.recurse && !(args.delegate.follow_cli || args.delegate.follow_symlinks) {

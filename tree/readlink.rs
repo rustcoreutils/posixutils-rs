@@ -9,10 +9,9 @@
 
 use clap::Parser;
 use gettextrs::gettext;
-use std::error::Error;
 use std::fs;
 use std::io::Write;
-use std::io::{stderr, stdout, ErrorKind};
+use std::io::{stderr, stdout};
 use std::path::PathBuf;
 use std::path::{Component, Path};
 
@@ -51,17 +50,12 @@ fn do_readlink(args: Args) -> Result<String, String> {
 
     let pathname_path = pathname.as_path();
 
-    let format_error = |description: &str, error: Option<&dyn Error>| {
-        let pathname_path_display = pathname_path.display();
-
-        let description = gettext(description);
-        let st = if let Some(er) = error {
-            format!("{pathname_path_display}: {description}: {er}")
-        } else {
-            format!("{pathname_path_display}: {description}")
-        };
-
-        Result::<String, String>::Err(st)
+    let format_error = |description: &str| {
+        Result::<String, String>::Err(format!(
+            "{}: {}",
+            pathname_path.display(),
+            gettext(description)
+        ))
     };
 
     let format_returned_path = |path_to_return: &Path| {
@@ -76,13 +70,14 @@ fn do_readlink(args: Args) -> Result<String, String> {
         Result::<String, String>::Ok(st)
     };
 
+    // POSIX: readlink writes a diagnostic to stderr and exits non-zero. It is the system's own
+    // message for the error, as other utilities give it.
     let map_io_error = |error: &std::io::Error| {
-        match error.kind() {
-            // POSIX: readlink writes a diagnostic to stderr and exits non-zero (#RL1).
-            ErrorKind::NotFound => format_error("No such file or directory", None),
-            ErrorKind::PermissionDenied => format_error("Permission denied", None),
-            _ => format_error("Unknown error", Some(&error)),
-        }
+        Result::<String, String>::Err(format!(
+            "{}: {}",
+            pathname_path.display(),
+            plib::diag::io_error_text(error)
+        ))
     };
 
     if canonicalize {
@@ -106,7 +101,7 @@ fn do_readlink(args: Args) -> Result<String, String> {
                             // Before printing the hypothetical resolved path:
                             // ensure that the parent is actually a directory
                             if !parent_path_canonicalized.is_dir() {
-                                return format_error("Not a directory", None);
+                                return format_error("Not a directory");
                             }
 
                             let parent_path_canonicalized_with_last_component = {
@@ -134,7 +129,7 @@ fn do_readlink(args: Args) -> Result<String, String> {
                 if !me.is_symlink() {
                     // POSIX: "If file does not name a symbolic link, readlink shall write a
                     // diagnostic message to standard error and exit with non-zero status." (#RL1)
-                    return format_error("Not a symbolic link", None);
+                    return format_error("Not a symbolic link");
                 }
 
                 match fs::read_link(pathname_path) {
@@ -150,17 +145,23 @@ fn do_readlink(args: Args) -> Result<String, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("readlink");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let exit_code = match do_readlink(args) {
         Ok(output) => {
             let mut stdout_lock = stdout().lock();
 
-            write!(stdout_lock, "{output}").unwrap();
-
-            stdout_lock.flush().unwrap();
-
-            0_i32
+            match write!(stdout_lock, "{output}").and_then(|()| stdout_lock.flush()) {
+                Ok(()) => 0_i32,
+                Err(e) => {
+                    plib::diag::error(&format!(
+                        "{}: {}",
+                        gettext("write error"),
+                        plib::diag::io_error_text(&e)
+                    ));
+                    1_i32
+                }
+            }
         }
         Err(error_description) => {
             if !error_description.is_empty() {

@@ -40,7 +40,12 @@ fn main() {
     // message instead of terminating mailx (ASYNCHRONOUS EVENTS).
     signals::setup();
 
-    let args = match Args::parse(env::args().skip(1).collect()) {
+    let args = match Args::parse(
+        plib::optarg::args_utf8("mailx")
+            .into_iter()
+            .skip(1)
+            .collect(),
+    ) {
         Ok(args) => args,
         Err(e) => {
             eprintln!("mailx: {}", e);

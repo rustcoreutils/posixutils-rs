@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::{Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use clap::Parser;
 use gettextrs::gettext;
+use plib::date_arg;
 use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -18,8 +19,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// touch - change file access and modification times
 #[derive(Parser)]
-#[command(version, about = gettext("touch - change file access and modification times"))]
+#[command(
+    version,
+    disable_help_flag = true,
+    about = gettext("touch - change file access and modification times")
+)]
 struct Args {
+    #[arg(long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
+    help: Option<bool>,
+
     #[arg(short, long, help = gettext("Change the access time of file"))]
     access: bool,
 
@@ -29,13 +37,16 @@ struct Args {
     #[arg(short, long, help = gettext("Change the modification time of file"))]
     mtime: bool,
 
-    #[arg(short, long, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format (a trailing ' UTC' or ' GMT' means 'Z'), or an RFC 5322 date as printed by 'date -R', instead of the current time"))]
+    #[arg(short = 'h', long, help = gettext("Change the times of a symbolic link itself, not of the file it names; create no file (GNU extension)"))]
+    no_dereference: bool,
+
+    #[arg(short, long, alias = "date", allow_hyphen_values = true, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format (a trailing ' UTC' or ' GMT' means 'Z'), an RFC 5322 date as printed by 'date -R', or @SECONDS, instead of the current time"))]
     datetime: Option<String>,
 
-    #[arg(short, long, group = "timefmt", help = gettext("Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current time"))]
+    #[arg(short, long, allow_hyphen_values = true, group = "timefmt", help = gettext("Use the specified POSIX [[CC]YY]MMDDhhmm[.SS] format, instead of the current time"))]
     time: Option<String>,
 
-    #[arg(short, long, group = "timefmt", help = gettext("Use the corresponding time of the file named by the pathname ref_file instead of the current time"))]
+    #[arg(short, long, allow_hyphen_values = true, group = "timefmt", help = gettext("Use the corresponding time of the file named by the pathname ref_file instead of the current time"))]
     ref_file: Option<String>,
 
     #[arg(help = gettext("A pathname of a file whose times shall be modified"))]
@@ -72,148 +83,6 @@ fn systemtime_to_ts(t: SystemTime) -> libc::timespec {
             mk_ts(-(d.as_secs() as i64), 0)
         }
     }
-}
-
-/// Parse the `-d` operand: the POSIX extended ISO-8601 form, that form followed by ` UTC` or
-/// ` GMT` (see [`strip_utc_word`]), or the RFC 5322 date that `date -R` prints (see
-/// [`parse_rfc5322`]).
-fn parse_datetime(input: &str) -> Result<libc::timespec, String> {
-    if let Some(secs) = parse_rfc5322(input) {
-        return Ok(mk_ts(secs, 0));
-    }
-    if let Some(datetime) = strip_utc_word(input) {
-        return parse_iso8601(&format!("{datetime}Z"))
-            .map_err(|_| gettext!("invalid date format: '{}'", input));
-    }
-    parse_iso8601(input)
-}
-
-/// The POSIX date-time before a trailing ` UTC` or ` GMT`, a word that means exactly what a
-/// trailing `Z` means. This is not POSIX: Debian's base-files passes
-/// `touch -d "1999-08-26 12:06:20 UTC"`. One space and the upper-case word only; any other
-/// zone word, spelling or spacing is left to fail as before.
-fn strip_utc_word(input: &str) -> Option<&str> {
-    let datetime = input
-        .strip_suffix(" UTC")
-        .or_else(|| input.strip_suffix(" GMT"))?;
-    (!datetime.ends_with(char::is_whitespace)).then_some(datetime)
-}
-
-/// The English day and month abbreviations of RFC 5322, as `date -R` spells them.
-const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const MONTH_NAMES: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// Parse an RFC 5322 date-time, as `date -R` and Debian changelogs write it, to seconds since
-/// the epoch: `[Day, ]D Mon YYYY HH:MM[:SS] +hhmm`, e.g. `Fri, 17 Jul 2026 19:05:00 +0200`.
-/// This is not POSIX: Debian's base-files passes `dpkg-parsechangelog -SDate` to `touch -d`.
-///
-/// Strict, unlike GNU's free-form parser: fields are separated by single spaces; names are
-/// spelled exactly as above; a day name must be the date's own; the day has one or two digits,
-/// the year four, each time field two; the zone is a numeric offset (no `GMT`, `UT` or other
-/// obsolete name, which `date -R` never prints). Every field is range-checked, and a leap second
-/// (`:60`) is refused, as GNU does. The offset alone fixes the instant; `TZ` plays no part.
-fn parse_rfc5322(input: &str) -> Option<i64> {
-    let mut fields = input.split(' ');
-    let mut field = fields.next()?;
-    let weekday = match field.strip_suffix(',') {
-        Some(name) => {
-            field = fields.next()?;
-            Some(DAY_NAMES.iter().position(|d| *d == name)?)
-        }
-        None => None,
-    };
-    let day = digits(field, 1..=2)?;
-    let month_name = fields.next()?;
-    let month = MONTH_NAMES.iter().position(|m| *m == month_name)? as u32 + 1;
-    let year = digits(fields.next()?, 4..=4)?;
-    let (hour, minute, second) = parse_rfc5322_time(fields.next()?)?;
-    let offset = parse_rfc5322_zone(fields.next()?)?;
-    if fields.next().is_some() {
-        return None;
-    }
-
-    let date = NaiveDate::from_ymd_opt(year as i32, month, day)?;
-    if weekday.is_some_and(|w| w != date.weekday().num_days_from_monday() as usize) {
-        return None;
-    }
-    // Hour 24, minute 60 and second 60 are all out of range here.
-    let naive = date.and_hms_opt(hour, minute, second)?;
-    Some(offset.from_local_datetime(&naive).single()?.timestamp())
-}
-
-/// `HH:MM` or `HH:MM:SS`, each two digits; ranges are checked by the caller.
-fn parse_rfc5322_time(field: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = field.split(':');
-    let hour = digits(parts.next()?, 2..=2)?;
-    let minute = digits(parts.next()?, 2..=2)?;
-    let second = match parts.next() {
-        Some(s) => digits(s, 2..=2)?,
-        None => 0,
-    };
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((hour, minute, second))
-}
-
-/// A `+hhmm` or `-hhmm` offset east of UTC, hours below 24 and minutes below 60. `-0000` is UTC.
-fn parse_rfc5322_zone(field: &str) -> Option<FixedOffset> {
-    let (sign, hhmm) = match field.split_at_checked(1)? {
-        ("+", rest) => (1, rest),
-        ("-", rest) => (-1, rest),
-        _ => return None,
-    };
-    let hhmm = digits(hhmm, 4..=4)?;
-    let (hours, minutes) = (hhmm / 100, hhmm % 100);
-    if hours > 23 || minutes > 59 {
-        return None;
-    }
-    FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60) as i32)
-}
-
-/// `field` as a number, if it is all ASCII digits and its length is in `len`.
-fn digits(field: &str, len: std::ops::RangeInclusive<usize>) -> Option<u32> {
-    if !len.contains(&field.len()) || !field.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    field.parse().ok()
-}
-
-/// Parse the `-d` extended ISO-8601 form. Accepts `T` or a space separator, `.`/`,` fractional
-/// seconds, an optional `Z`/numeric timezone (else the value is interpreted in the local zone, so
-/// `TZ` is honored).
-fn parse_iso8601(input: &str) -> Result<libc::timespec, String> {
-    let norm = input.trim().replace(',', ".");
-
-    // If a timezone is present (offset or `Z`), parse it as a fixed-offset instant. RFC 3339 needs
-    // a `T`, so restore it for parsing.
-    let with_t = if norm.contains(' ') && !norm.contains('T') {
-        norm.replacen(' ', "T", 1)
-    } else {
-        norm.clone()
-    };
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&with_t) {
-        return Ok(mk_ts(dt.timestamp(), dt.timestamp_subsec_nanos()));
-    }
-
-    // Otherwise interpret the naive date-time in the local timezone.
-    let body = norm.replacen('T', " ", 1);
-    let body = body.trim();
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-    ] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(body, fmt) {
-            if let Some(dt) = Local.from_local_datetime(&naive).single() {
-                return Ok(mk_ts(dt.timestamp(), dt.timestamp_subsec_nanos()));
-            }
-        }
-    }
-
-    Err(gettext!("invalid date format: '{}'", input))
 }
 
 /// Parse the `-t` POSIX `[[CC]YY]MMDDhhmm[.SS]` form, interpreted in the local timezone.
@@ -261,14 +130,20 @@ fn parse_posix_time(input: &str) -> Result<libc::timespec, String> {
 /// corresponding fields; for `-d`/`-t` both are the parsed instant; otherwise both are "now".
 fn time_source(args: &Args) -> Result<(libc::timespec, libc::timespec), String> {
     if let Some(d) = &args.datetime {
-        let ts = parse_datetime(d)?;
+        let (secs, nsec) = date_arg::parse(d, date_arg::Zoneless::Local)?;
+        let ts = mk_ts(secs, nsec);
         Ok((ts, ts))
     } else if let Some(t) = &args.time {
         let ts = parse_posix_time(t)?;
         Ok((ts, ts))
     } else if let Some(rf) = &args.ref_file {
-        let md = std::fs::metadata(rf)
-            .map_err(|e| format!("{rf}: {}", plib::diag::io_error_text(&e)))?;
+        // Under -h a link gives its own times, as it receives them.
+        let md = if args.no_dereference {
+            std::fs::symlink_metadata(rf)
+        } else {
+            std::fs::metadata(rf)
+        };
+        let md = md.map_err(|e| format!("{rf}: {}", plib::diag::io_error_text(&e)))?;
         let atime = md
             .accessed()
             .map(systemtime_to_ts)
@@ -297,6 +172,27 @@ fn touch_file(
     let mtime = if args.mtime { source.1 } else { omit() };
     let times = [atime, mtime];
 
+    // A pathname ending in a slash names a directory (POSIX pathname resolution): a symlink in
+    // the last component is followed, -h or not, and anything but a directory is ENOTDIR. No
+    // file is ever created for it. This is decided here, not left to the kernel: macOS's
+    // utimensat(AT_SYMLINK_NOFOLLOW) sets the times of a link named with a trailing slash, and
+    // macOS resolves a dangling symlink followed by a slash differently from Linux.
+    if filename.ends_with('/') {
+        return match set_dir_times(&c_path, &times) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && args.no_create => Ok(()),
+            result => result,
+        };
+    }
+
+    // -h: the link itself, by name, and nothing is created; a missing file is
+    // an error unless -c says to pass it over (GNU).
+    if args.no_dereference {
+        return match set_link_times(&c_path, &times) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && args.no_create => Ok(()),
+            result => result,
+        };
+    }
+
     if args.no_create {
         return match set_times_path(&c_path, &times) {
             // POSIX -c: do not create, and write no diagnostic; exit success.
@@ -305,21 +201,11 @@ fn touch_file(
         };
     }
 
-    // A pathname ending in a slash names a directory (POSIX pathname resolution), so no file is
-    // ever created for it: it is an existing directory, given its times by name, or an error.
-    // Deciding this here rather than through the create keeps it the same on every system --
-    // macOS resolves a dangling symlink followed by a slash differently from Linux.
-    if filename.ends_with('/') {
-        return set_times_path(&c_path, &times);
-    }
-
     let open_err = match create_new(&c_path) {
         Ok(fd) => return set_times_fd(&fd, &times),
         Err(e) => e,
     };
-    // Whatever kept the file from being created (it exists; or the name ends in a slash, which
-    // Linux refuses with EISDIR before it looks at O_EXCL), an existing file gets its times by
-    // name.
+    // Whatever kept the file from being created, an existing file gets its times by name.
     match set_times_path(&c_path, &times) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => not_found(&c_path, &times, open_err, e),
         result => result,
@@ -354,8 +240,6 @@ fn not_found(
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Err(not_found),
             Err(e) => Err(e),
         },
-        // A trailing slash on a name that does not exist: it is the missing file to report.
-        Some(libc::EISDIR) => Err(not_found),
         // Why the file could not be created, e.g. a directory without write permission.
         _ => Err(open_err),
     }
@@ -472,12 +356,26 @@ fn read_link_at(dir: &OwnedFd, name: &CStr) -> io::Result<CString> {
     CString::new(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Set the times of the file open on `fd`, the one this run created.
+/// Set the times of the file open on `fd`.
 fn set_times_fd(fd: &OwnedFd, times: &[libc::timespec; 2]) -> io::Result<()> {
     if unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Set the times of the directory `path` names, following a symlink; ENOTDIR if it is not one.
+///
+/// The directory is opened with `O_DIRECTORY` and given its times through the descriptor, so the
+/// object checked is the object changed, and the check does not depend on how the kernel treats
+/// a trailing slash. A directory that cannot be opened for reading (write or search permission
+/// only) is given its times by name instead, still following links.
+fn set_dir_times(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
+    match open_dir(path) {
+        Ok(fd) => set_times_fd(&fd, times),
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) => set_times_path(path, times),
+        Err(e) => Err(e),
+    }
 }
 
 /// Set the times of the existing file `path` names, following a symlink.
@@ -488,10 +386,19 @@ fn set_times_path(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
     Ok(())
 }
 
+/// Set the times of the file `path` names, a symlink's own if it is one.
+fn set_link_times(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
+    let flags = libc::AT_SYMLINK_NOFOLLOW;
+    if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("touch");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // Default to changing both access and modification times.
     if !args.access && !args.mtime {

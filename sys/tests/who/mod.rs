@@ -393,3 +393,19 @@ fn who_dash_b_writes_a_system_boot_line() {
         "-b must render the boot record's own timestamp: {out}"
     );
 }
+
+// A FILE operand is a pathname and need not be valid UTF-8; reading the
+// command line made who panic on one.
+#[test]
+fn who_non_utf8_file_operand() {
+    use plib::testing::{create_non_utf8, get_binary_path};
+    let dir = plib::tmp::tempdir().unwrap();
+    let Some(file) = create_non_utf8(dir.path(), b"utmp\xff", |p| std::fs::write(p, b"")) else {
+        return;
+    };
+    let output = std::process::Command::new(get_binary_path("who"))
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}

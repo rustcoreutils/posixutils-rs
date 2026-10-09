@@ -15,9 +15,7 @@ use crate::mntent::MountTable;
 
 use clap::Parser;
 use gettextrs::gettext;
-#[cfg(target_os = "macos")]
-use std::ffi::CStr;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::{cmp, fmt::Display, io};
@@ -46,6 +44,13 @@ struct Args {
         help = gettext("Include total allocated-space figures in the output")
     )]
     total: bool,
+
+    #[arg(
+        short = 'T',
+        long = "print-type",
+        help = gettext("Add a column with each file system's type")
+    )]
+    print_type: bool,
 
     #[arg(
         help = gettext("A pathname of a file within the hierarchy of the desired file system")
@@ -125,8 +130,12 @@ pub struct Fields {
     pub mode: OutputMode,
     /// Whether the inode columns are shown (default & -t modes, not -k/-P).
     pub inodes: bool,
+    /// Whether the file system type column is shown (-T).
+    pub show_type: bool,
     /// file system
     pub source: Field,
+    /// file system type
+    pub fstype: Field,
     /// FS size
     pub size: Field,
     /// FS size used
@@ -148,12 +157,14 @@ pub struct Fields {
 }
 
 impl Fields {
-    pub fn new(mode: OutputMode, inodes: bool) -> Self {
+    pub fn new(mode: OutputMode, inodes: bool, show_type: bool) -> Self {
         let size_caption = format!("{}-{}", mode.get_block_size(), gettext("blocks"));
         Self {
             mode,
             inodes,
+            show_type,
             source: Field::new(gettext("Filesystem"), 14, FieldType::Str),
+            fstype: Field::new(gettext("Type"), 8, FieldType::Str),
             size: Field::new(size_caption, 10, FieldType::Num),
             used: Field::new(gettext("Used"), 10, FieldType::Num),
             avail: Field::new(gettext("Available"), 10, FieldType::Num),
@@ -170,10 +181,14 @@ impl Fields {
 /// Print header
 impl Display for Fields {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)?;
+        if self.show_type {
+            write!(f, " {}", self.fstype)?;
+        }
         write!(
             f,
-            "{} {} {} {} {}",
-            self.source, self.size, self.used, self.avail, self.pcent
+            " {} {} {} {}",
+            self.size, self.used, self.avail, self.pcent
         )?;
         if self.inodes {
             write!(
@@ -189,6 +204,7 @@ impl Display for Fields {
 pub struct FieldsData<'a> {
     pub fields: &'a Fields,
     pub source: String,
+    pub fstype: String,
     pub size: u64,
     pub used: u64,
     pub avail: u64,
@@ -209,11 +225,15 @@ impl Display for FieldsData<'_> {
     //
     // In default and -t modes the inode (file-slot) columns are inserted
     // before <file system root>; -k and -P keep the fixed six-column format.
+    // -T (an extension) inserts the file system type after its name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.fields.source.format(&self.source))?;
+        if self.fields.show_type {
+            write!(f, " {}", self.fields.fstype.format(&self.fstype))?;
+        }
         write!(
             f,
-            "{} {} {} {} {}%",
-            self.fields.source.format(&self.source),
+            " {} {} {} {}%",
             self.fields.size.format(&self.size),
             self.fields.used.format(&self.used),
             self.fields.avail.format(&self.avail),
@@ -241,7 +261,7 @@ fn to_cstr(array: &[libc::c_char]) -> &CStr {
     }
 }
 
-fn stat(filename: &CString) -> io::Result<libc::stat> {
+fn stat(filename: &CStr) -> io::Result<libc::stat> {
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
         let rc = libc::stat(filename.as_ptr(), &mut st);
@@ -286,6 +306,7 @@ fn capacity_percent(used: u64, avail: u64) -> u32 {
 struct Mount {
     devname: OsString,
     dir: OsString,
+    fstype: OsString,
     dev: i64,
     masked: bool,
     cached_statfs: libc::statfs,
@@ -314,6 +335,7 @@ impl Mount {
         FieldsData {
             fields,
             source: self.devname.to_string_lossy().into_owned(),
+            fstype: self.fstype.to_string_lossy().into_owned(),
             size: total,
             used,
             avail,
@@ -342,7 +364,7 @@ impl MountList {
         }
     }
 
-    fn push(&mut self, fsstat: &libc::statfs, devname: &CString, dirname: &CString) {
+    fn push(&mut self, fsstat: &libc::statfs, devname: &CStr, dirname: &CStr, fstype: &CStr) {
         let dev = {
             if let Ok(st) = stat(devname) {
                 st.st_rdev as i64
@@ -356,6 +378,7 @@ impl MountList {
         self.mounts.push(Mount {
             devname: OsStr::from_bytes(devname.to_bytes()).to_os_string(),
             dir: OsStr::from_bytes(dirname.to_bytes()).to_os_string(),
+            fstype: OsStr::from_bytes(fstype.to_bytes()).to_os_string(),
             dev,
             masked: false,
             cached_statfs: *fsstat,
@@ -376,9 +399,10 @@ fn read_mount_info() -> io::Result<MountList> {
 
         let mounts: &[libc::statfs] = std::slice::from_raw_parts(mounts as _, n_mnt as _);
         for mount in mounts {
-            let devname = to_cstr(&mount.f_mntfromname).into();
-            let dirname = to_cstr(&mount.f_mntonname).into();
-            info.push(mount, &devname, &dirname);
+            let devname = to_cstr(&mount.f_mntfromname);
+            let dirname = to_cstr(&mount.f_mntonname);
+            let fstype = to_cstr(&mount.f_fstypename);
+            info.push(mount, devname, dirname, fstype);
         }
     }
 
@@ -408,7 +432,7 @@ fn read_mount_info() -> io::Result<MountList> {
                 continue;
             }
 
-            info.push(&buf, &mount.fsname, &mount.dir);
+            info.push(&buf, &mount.fsname, &mount.dir, &mount.fstype);
         }
     }
 
@@ -453,7 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // diagnostics were bare `eprintln!`s and carried no `df: ` prefix.
     plib::diag::init_locale("df");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut info = read_mount_info()?;
     let mut exit_code = 0;
@@ -479,7 +503,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = args.total;
 
     let mode = OutputMode::new(args.kilo, args.portable);
-    let fields = Fields::new(mode, show_inodes);
+    let fields = Fields::new(mode, show_inodes, args.print_type);
     // Print header
     println!("{}", fields);
 

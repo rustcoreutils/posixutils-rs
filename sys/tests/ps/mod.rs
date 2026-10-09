@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod bsd;
+
 use plib::testing::{run_test_with_checker, TestPlan};
 use std::process::Output;
 
@@ -493,4 +495,113 @@ fn ps_wide_options_accepted() {
 #[test]
 fn ps_namelist_accepted() {
     run_ps_test(vec!["-n", "/dev/null", "-A"], 0, check_exit_success);
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-g", "-G", "-p", "-t", "-u", "-U", "-o", "-n"] {
+        plib::testing::assert_hyphen_option_argument("ps", &[opt, "-zq", "--help"]);
+    }
+}
+
+// ps discarded every write error and exited 0.
+#[test]
+fn ps_reports_write_error() {
+    plib::testing::assert_write_error_on_full_device("ps", &["-A"], b"", 1);
+}
+
+// A reader that stops after the first line must not kill ps with SIGPIPE once
+// ps has produced its whole listing.  perl's dist/threads/t/join.t reads
+// `ps -f |` up to its own line and dies if closing the pipe reports a failed
+// ps.  procps fully buffers a pipe, so its listing is in the pipe before the
+// reader sees the first byte; ps wrote line by line and was still writing when
+// the reader closed.  The listing must fit in the pipe, as it must for procps:
+// `pid,comm` keeps it small.
+#[test]
+fn ps_survives_reader_closing_after_first_line() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    for _ in 0..20 {
+        let mut child = Command::new(plib::testing::get_binary_path("ps"))
+            .args(["-A", "-o", "pid,comm"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn ps");
+        let mut stdout = child.stdout.take().unwrap();
+        let mut byte = [0u8; 1];
+        loop {
+            match stdout.read(&mut byte) {
+                Ok(1) if byte[0] != b'\n' => continue,
+                _ => break,
+            }
+        }
+        // Give a kernel that copies a large write without holding the pipe
+        // locked (macOS) time to finish it.
+        #[cfg(not(target_os = "linux"))]
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(stdout);
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "ps failed after an early close: {status:?}"
+        );
+    }
+}
+
+/// `ps ARGS` over this test process alone: its header and its one line.
+fn ps_self(args: &[&str]) -> Vec<String> {
+    let mut argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    argv.extend(["-p".to_string(), std::process::id().to_string()]);
+    let output = plib::testing::run_test_base("ps", &argv, b"");
+    assert!(output.status.success(), "ps {argv:?} failed: {output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<String> = stdout.lines().map(String::from).collect();
+    assert_eq!(lines.len(), 2, "expected a header and one line: {stdout:?}");
+    lines
+}
+
+// The C column of -f is the processor utilization, an integer as procps
+// prints it (CPU time over elapsed time, as a percentage capped at 99),
+// right-aligned under its header; it was always "-".
+#[test]
+fn ps_full_format_c_is_an_integer() {
+    let lines = ps_self(&["-f"]);
+    let c = lines[1].split_whitespace().nth(3).unwrap();
+    let value: u32 = c
+        .parse()
+        .unwrap_or_else(|_| panic!("C is not an integer: {:?}", lines[1]));
+    assert!(value <= 99, "C is capped at 99: {value}");
+
+    let lines = ps_self(&["-o", "c,pid"]);
+    assert_eq!(lines[0].find('C'), Some(1), "header: {:?}", lines[0]);
+    assert!(
+        lines[1].as_bytes()[1].is_ascii_digit(),
+        "C is right-aligned: {:?}",
+        lines[1]
+    );
+}
+
+// The last column is not padded: no trailing blanks after CMD, and no blanks
+// before its header beyond the one separating it, as procps prints it.
+#[test]
+fn ps_last_column_is_not_padded() {
+    for args in [&["-f"][..], &["-l"], &[], &["-o", "pid,comm"]] {
+        let lines = ps_self(args);
+        for line in &lines {
+            assert!(
+                !line.ends_with(' '),
+                "ps {args:?}: trailing blanks in {line:?}"
+            );
+        }
+        let last = lines[0].rfind(' ').unwrap();
+        assert_ne!(
+            lines[0].as_bytes()[last - 1],
+            b' ',
+            "ps {args:?}: last header is padded: {:?}",
+            lines[0]
+        );
+    }
 }

@@ -13,7 +13,7 @@ use std::{fs, io, path::PathBuf};
 
 use clap::Parser;
 use diff_util::{
-    common::{FormatOptions, OutputFormat},
+    common::{FormatOptions, OutputFormat, WhiteSpace},
     diff_exit_status::DiffExitStatus,
     dir_diff::DirDiff,
     file_diff::{FileDiff, Source},
@@ -28,10 +28,22 @@ struct Args {
     #[arg(short = 'b', long = "ignore-space-change", help = gettext("Cause EOL whitespace to be treated as blanks"))]
     ignore_eol_space: bool,
 
+    #[arg(short = 'w', long = "ignore-all-space", help = gettext("Ignore all white space"))]
+    ignore_all_space: bool,
+
+    #[arg(short = 'q', long = "brief", help = gettext("Report only whether the files differ"))]
+    brief: bool,
+
+    #[arg(short = 's', long = "report-identical-files", help = gettext("Report when two files are identical"))]
+    report_identical: bool,
+
+    #[arg(short = 'N', long = "new-file", help = gettext("Treat a file missing from one directory as empty"))]
+    new_file: bool,
+
     #[arg(short, help = gettext("Output 3 lines of copied context"))]
     context3: bool,
 
-    #[arg(short='C', value_parser = clap::value_parser!(u32), help = gettext("Output <N> lines of copied context"))]
+    #[arg(allow_hyphen_values = true, short='C', value_parser = clap::value_parser!(u32), help = gettext("Output <N> lines of copied context"))]
     context: Option<u32>,
 
     #[arg(short, long, help = gettext("Produce output in a form suitable as input for the ed utility"))]
@@ -40,22 +52,22 @@ struct Args {
     #[arg(short, help = gettext("Produce output in an alternative form, similar in format to -e"))]
     fed: bool,
 
-    #[arg(short, long, help = gettext("Apply diff recursively to files and directories of the same name"))]
+    #[arg(short, long = "recursive", alias = "recurse", help = gettext("Apply diff recursively to files and directories of the same name"))]
     recurse: bool,
 
     #[arg(short, help = gettext("Output 3 lines of unified context"))]
     unified3: bool,
 
-    #[arg(short='U', value_parser = clap::value_parser!(u32).range(0..), help = gettext("Output <N> lines of unified context"))]
+    #[arg(allow_hyphen_values = true, short='U', value_parser = clap::value_parser!(u32).range(0..), help = gettext("Output <N> lines of unified context"))]
     unified: Option<u32>,
 
     #[arg(help = gettext("First comparison file (or directory, if -r is specified)"))]
     file1: String,
 
-    #[arg(short = 'L', long = "label", action = clap::ArgAction::Append, help = gettext("Use <LABEL> instead of the file name in the header; may be given twice"))]
+    #[arg(short = 'L', long = "label", allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Use <LABEL> instead of the file name in the header; may be given twice"))]
     label: Vec<String>,
 
-    #[arg(long, value_parser= clap::value_parser!(String), help = gettext("Label for second file"))]
+    #[arg(long, allow_hyphen_values = true, value_parser= clap::value_parser!(String), help = gettext("Label for second file"))]
     label2: Option<String>,
 
     #[arg(help = gettext("Second comparison file (or directory, if -r is specified)"))]
@@ -155,7 +167,17 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         }
     };
 
-    let format_options = FormatOptions::new(args.ignore_eol_space, output_format, label1, label2);
+    let white_space = if args.ignore_all_space {
+        WhiteSpace::IgnoreAll
+    } else if args.ignore_eol_space {
+        WhiteSpace::IgnoreChanges
+    } else {
+        WhiteSpace::Significant
+    };
+    let mut format_options = FormatOptions::new(white_space, output_format, label1, label2);
+    format_options.brief = args.brief;
+    format_options.new_file = args.new_file;
+    format_options.report_identical = args.report_identical;
 
     let path1 = PathBuf::from(&args.file1);
     let path2 = PathBuf::from(&args.file2);
@@ -188,19 +210,23 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     // The same file named twice has no differences; that is a normal result,
     // not an error. This reported "trouble" (exit 2) with no diagnostic at all.
     if path1 == path2 {
-        return Ok(DiffExitStatus::NotDifferent);
+        return Ok(format_options.identical(&args.file1, &args.file2));
     }
 
-    let path1_is_file = fs::metadata(&path1)
+    // Only a directory is a directory operand. Anything else -- a regular
+    // file, a character device such as /dev/null, a FIFO -- is a file whose
+    // contents are compared; asking "is it a regular file?" instead sent
+    // /dev/null down the directory path, looking for "/dev/null/NAME".
+    let path1_is_dir = fs::metadata(&path1)
         .map_err(|e| io_error_at(&path1, e))?
-        .is_file();
-    let path2_is_file = fs::metadata(&path2)
+        .is_dir();
+    let path2_is_dir = fs::metadata(&path2)
         .map_err(|e| io_error_at(&path2, e))?
-        .is_file();
+        .is_dir();
 
-    if path1_is_file && path2_is_file {
+    if !path1_is_dir && !path2_is_dir {
         FileDiff::file_diff(path1, path2, &format_options, None)
-    } else if !path1_is_file && !path2_is_file {
+    } else if path1_is_dir && path2_is_dir {
         let options = option_arguments(&args.file1, &args.file2);
         Ok(DirDiff::dir_diff(
             path1,
@@ -217,7 +243,7 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
 fn main() -> DiffExitStatus {
     plib::diag::init_locale("diff");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let result = check_difference(args);
 

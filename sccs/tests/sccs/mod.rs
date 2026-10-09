@@ -685,3 +685,9 @@ fn sccs_delget_keeps_a_detached_option_argument_out_of_the_file_list() {
         "delget re-gets the file"
     );
 }
+
+// An argument that is not valid UTF-8 is reported, not a panic.
+#[test]
+fn sccs_non_utf8_argument_is_reported() {
+    plib::testing::assert_non_utf8_argument_rejected("sccs", &["get"]);
+}

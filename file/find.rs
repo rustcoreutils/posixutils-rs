@@ -8,15 +8,16 @@
 //
 
 use std::cell::RefCell;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, Write as IoWrite};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gettextrs::gettext;
 use plib::modestr;
 
 /// Match `string` against a shell filename pattern using POSIX `fnmatch(3)`,
@@ -26,7 +27,11 @@ use plib::modestr;
 ///
 /// Neither `-name` nor `-path` sets `FNM_PATHNAME`: POSIX `-path` explicitly
 /// does not treat a `<slash>` specially, and `-name` only ever sees a basename.
-fn fnmatch(pattern: &str, string: &str, fold: bool) -> bool {
+///
+/// Both are byte strings, as pathnames are: fnmatch(3) reads them in the
+/// current locale, so a byte that is not part of a valid character still
+/// matches itself.
+fn fnmatch(pattern: &[u8], string: &[u8], fold: bool) -> bool {
     use std::ffi::CString;
     let (Ok(p), Ok(s)) = (CString::new(pattern), CString::new(string)) else {
         return false;
@@ -167,11 +172,11 @@ struct ExecBatch {
 enum Primary {
     // Tests
     Name {
-        pattern: String,
+        pattern: Vec<u8>,
         fold: bool,
     },
     Path {
-        pattern: String,
+        pattern: Vec<u8>,
         fold: bool,
     },
     Type(FileTypeMatch),
@@ -294,8 +299,12 @@ impl EvalResult {
 struct FindState {
     /// Whether any error occurred
     had_error: bool,
+    /// Whether a write to standard output failed (reported once)
+    stdout_failed: bool,
     /// Whether -depth was specified anywhere in expression
     depth_first: bool,
+    /// Whether -delete was specified anywhere in expression
+    deletes: bool,
     /// Whether -xdev was specified anywhere in expression
     xdev: bool,
     /// Whether -mount was specified anywhere in expression
@@ -317,7 +326,9 @@ impl FindState {
     fn new() -> Self {
         Self {
             had_error: false,
+            stdout_failed: false,
             depth_first: false,
+            deletes: false,
             xdev: false,
             mount: false,
             min_depth: 0,
@@ -330,18 +341,22 @@ impl FindState {
 }
 
 /// Parse command line arguments, returning (symlink_mode, paths, expression)
-fn parse_args(args: &[String]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), String> {
+///
+/// A starting point is a pathname and is taken byte for byte, as is a
+/// -name, -iname, -path or -ipath pattern.  Any other expression operand is
+/// read as text, so one that is not valid UTF-8 is an error.
+fn parse_args(args: &[OsString]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), String> {
     let mut symlink_mode = SymlinkMode::Never;
     let mut idx = 1; // skip program name
 
     // Parse options (-H, -L)
     while idx < args.len() {
-        match args[idx].as_str() {
-            "-H" => {
+        match args[idx].as_bytes() {
+            b"-H" => {
                 symlink_mode = SymlinkMode::CommandLineOnly;
                 idx += 1;
             }
-            "-L" => {
+            b"-L" => {
                 symlink_mode = SymlinkMode::Always;
                 idx += 1;
             }
@@ -354,7 +369,7 @@ fn parse_args(args: &[String]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), Stri
     while idx < args.len() {
         let arg = &args[idx];
         // Expression starts with -, !, or (
-        if arg.starts_with('-') || arg == "!" || arg == "(" {
+        if arg.as_bytes().starts_with(b"-") || arg == "!" || arg == "(" {
             break;
         }
         paths.push(PathBuf::from(arg));
@@ -367,14 +382,14 @@ fn parse_args(args: &[String]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), Stri
     }
 
     // Parse expression
-    let expr_args: Vec<&str> = args[idx..].iter().map(|s| s.as_str()).collect();
+    let expr_args: Vec<&OsStr> = args[idx..].iter().map(|s| s.as_os_str()).collect();
     let expr = parse_expression(&expr_args)?;
 
     Ok((symlink_mode, paths, expr))
 }
 
 /// Parse an expression from arguments
-fn parse_expression(args: &[&str]) -> Result<Expr, String> {
+fn parse_expression(args: &[&OsStr]) -> Result<Expr, String> {
     if args.is_empty() {
         // Default expression is -print
         return Ok(Expr::Primary(Primary::Print));
@@ -387,31 +402,33 @@ fn parse_expression(args: &[&str]) -> Result<Expr, String> {
 
 /// Is `tok` the OR operator? `-or` is GNU's spelling of `-o`, forced by
 /// debhelper (dh_install, dh_installdocs, dh_shlibdeps, `-X` exclusions).
-fn is_or(tok: &str) -> bool {
+fn is_or(tok: &OsStr) -> bool {
     tok == "-o" || tok == "-or"
 }
 
 /// Is `tok` the AND operator? `-and` is GNU's spelling of `-a`, forced by
 /// debhelper (dh_install, dh_installdocs, dh_installexamples).
-fn is_and(tok: &str) -> bool {
+fn is_and(tok: &OsStr) -> bool {
     tok == "-a" || tok == "-and"
 }
 
 /// Fail unless an operand follows operator `op`, whose operand would start
 /// at `tokens[idx]`. The wording is GNU find's.
-fn expect_operand(tokens: &[&str], idx: usize, op: &str) -> Result<(), String> {
+fn expect_operand(tokens: &[&OsStr], idx: usize, op: &OsStr) -> Result<(), String> {
+    let op = op.display();
     match tokens.get(idx) {
         None => Err(format!("expected an expression after '{op}'")),
-        Some(&")") => Err(format!("expected an expression between '{op}' and ')'")),
+        Some(&next) if next == ")" => Err(format!("expected an expression between '{op}' and ')'")),
         Some(&next) if is_or(next) || is_and(next) => Err(format!(
-            "invalid expression; you have used a binary operator '{next}' with nothing before it."
+            "invalid expression; you have used a binary operator '{}' with nothing before it.",
+            next.display()
         )),
         Some(_) => Ok(()),
     }
 }
 
 /// Parse OR expression (lowest precedence)
-fn parse_or_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
+fn parse_or_expr(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
     let mut left = parse_and_expr(tokens, idx)?;
 
     while *idx < tokens.len() && is_or(tokens[*idx]) {
@@ -425,7 +442,7 @@ fn parse_or_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 }
 
 /// Parse AND expression
-fn parse_and_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
+fn parse_and_expr(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
     let mut left = parse_unary_expr(tokens, idx)?;
 
     while *idx < tokens.len() {
@@ -449,14 +466,14 @@ fn parse_and_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 }
 
 /// Parse unary expression (NOT or primary)
-fn parse_unary_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
+fn parse_unary_expr(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
     if *idx >= tokens.len() {
         return Err("unexpected end of expression".to_string());
     }
 
     if tokens[*idx] == "!" {
         *idx += 1;
-        expect_operand(tokens, *idx, "!")?;
+        expect_operand(tokens, *idx, OsStr::new("!"))?;
         let expr = parse_unary_expr(tokens, idx)?;
         return Ok(Expr::Not(Box::new(expr)));
     }
@@ -475,40 +492,40 @@ fn parse_unary_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 }
 
 /// Parse a primary
-fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
+fn parse_primary(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
     if *idx >= tokens.len() {
         return Err("unexpected end of expression".to_string());
     }
 
-    let tok = tokens[*idx];
+    let tok = token_str(tokens[*idx])?;
     *idx += 1;
 
     match tok {
         "-name" => {
-            let pattern = get_arg(tokens, idx, "-name")?;
+            let pattern = get_os_arg(tokens, idx, "-name")?;
             Ok(Expr::Primary(Primary::Name {
-                pattern: pattern.to_string(),
+                pattern: pattern.as_bytes().to_vec(),
                 fold: false,
             }))
         }
         "-iname" => {
-            let pattern = get_arg(tokens, idx, "-iname")?;
+            let pattern = get_os_arg(tokens, idx, "-iname")?;
             Ok(Expr::Primary(Primary::Name {
-                pattern: pattern.to_string(),
+                pattern: pattern.as_bytes().to_vec(),
                 fold: true,
             }))
         }
         "-path" => {
-            let pattern = get_arg(tokens, idx, "-path")?;
+            let pattern = get_os_arg(tokens, idx, "-path")?;
             Ok(Expr::Primary(Primary::Path {
-                pattern: pattern.to_string(),
+                pattern: pattern.as_bytes().to_vec(),
                 fold: false,
             }))
         }
         "-ipath" => {
-            let pattern = get_arg(tokens, idx, "-ipath")?;
+            let pattern = get_os_arg(tokens, idx, "-ipath")?;
             Ok(Expr::Primary(Primary::Path {
-                pattern: pattern.to_string(),
+                pattern: pattern.as_bytes().to_vec(),
                 fold: true,
             }))
         }
@@ -583,6 +600,15 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
             })?;
             Ok(Expr::Primary(Primary::Newer(mtime)))
         }
+        "-newermt" => {
+            let date = get_arg(tokens, idx, "-newermt")?;
+            Ok(Expr::Primary(Primary::Newer(parse_newermt_date(date)?)))
+        }
+        // GNU's other -newerXY forms compare access, change or birth times, or take the time
+        // from a file; none is used by what this find has to build.
+        t if t.len() == "-newerXY".len() && t.starts_with("-newer") => Err(format!(
+            "{t}: only -newermt is supported of the -newerXY forms"
+        )),
         "-nouser" => Ok(Expr::Primary(Primary::NoUser)),
         "-true" => Ok(Expr::Primary(Primary::Const(true))),
         "-false" => Ok(Expr::Primary(Primary::Const(false))),
@@ -814,14 +840,51 @@ fn parse_printf_format(format: &str) -> Result<Vec<PrintfItem>, String> {
     Ok(items)
 }
 
+/// The instant `-newermt DATE` names, read as `touch -d` and `date -d` read a date (a date
+/// without a zone is local time).  The parser gives floor seconds and non-negative nanoseconds,
+/// so the nanoseconds are added even before the epoch: -0.5 s is (-1, 500000000).
+fn parse_newermt_date(date: &str) -> Result<SystemTime, String> {
+    let (secs, nanos) = plib::date_arg::parse(date, plib::date_arg::Zoneless::Local)?;
+    let whole = Duration::from_secs(secs.unsigned_abs());
+    let whole_secs = if secs >= 0 {
+        UNIX_EPOCH.checked_add(whole)
+    } else {
+        UNIX_EPOCH.checked_sub(whole)
+    };
+    whole_secs
+        .and_then(|t| t.checked_add(Duration::from_nanos(u64::from(nanos))))
+        .ok_or_else(|| format!("invalid date format: '{date}'"))
+}
+
 /// Get the next argument or return an error
-fn get_arg<'a>(tokens: &[&'a str], idx: &mut usize, primary: &str) -> Result<&'a str, String> {
+fn get_arg<'a>(tokens: &[&'a OsStr], idx: &mut usize, primary: &str) -> Result<&'a str, String> {
+    token_str(get_os_arg(tokens, idx, primary)?)
+}
+
+/// Get the next argument as the byte string it is, or return an error
+fn get_os_arg<'a>(
+    tokens: &[&'a OsStr],
+    idx: &mut usize,
+    primary: &str,
+) -> Result<&'a OsStr, String> {
     if *idx >= tokens.len() {
         return Err(format!("{} requires an argument", primary));
     }
     let arg = tokens[*idx];
     *idx += 1;
     Ok(arg)
+}
+
+/// An expression operand that is read as text, or an error if it is not
+/// valid UTF-8.
+fn token_str(token: &OsStr) -> Result<&str, String> {
+    token.to_str().ok_or_else(|| {
+        format!(
+            "{}: {}",
+            token.to_string_lossy(),
+            gettext("expression operand is not valid UTF-8")
+        )
+    })
 }
 
 /// Parse -perm argument
@@ -901,12 +964,12 @@ fn resolve_group(name: &str) -> Result<u32, String> {
 }
 
 /// Parse -exec primary arguments
-fn parse_exec(tokens: &[&str], idx: &mut usize) -> Result<ExecMode, String> {
+fn parse_exec(tokens: &[&OsStr], idx: &mut usize) -> Result<ExecMode, String> {
     if *idx >= tokens.len() {
         return Err("-exec requires an argument".to_string());
     }
 
-    let utility = tokens[*idx].to_string();
+    let utility = token_str(tokens[*idx])?.to_string();
     *idx += 1;
 
     let mut args = Vec::new();
@@ -936,19 +999,19 @@ fn parse_exec(tokens: &[&str], idx: &mut usize) -> Result<ExecMode, String> {
         if tok == "{}" {
             has_placeholder = true;
         }
-        args.push(tok.to_string());
+        args.push(token_str(tok)?.to_string());
     }
 
     Err("-exec not terminated by ; or {} +".to_string())
 }
 
 /// Parse -ok primary arguments
-fn parse_ok(tokens: &[&str], idx: &mut usize) -> Result<(String, Vec<String>), String> {
+fn parse_ok(tokens: &[&OsStr], idx: &mut usize) -> Result<(String, Vec<String>), String> {
     if *idx >= tokens.len() {
         return Err("-ok requires an argument".to_string());
     }
 
-    let utility = tokens[*idx].to_string();
+    let utility = token_str(tokens[*idx])?.to_string();
     *idx += 1;
 
     let mut args = Vec::new();
@@ -960,7 +1023,7 @@ fn parse_ok(tokens: &[&str], idx: &mut usize) -> Result<(String, Vec<String>), S
         if tok == ";" {
             return Ok((utility, args));
         }
-        args.push(tok.to_string());
+        args.push(token_str(tok)?.to_string());
     }
 
     Err("-ok not terminated by ;".to_string())
@@ -1075,17 +1138,27 @@ fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult
     }
 }
 
+/// The arguments of `-exec` or `-ok`, with each `{}` replaced by `path` as it
+/// is, bytes and all.
+fn expand_braces<'a>(args: &'a [String], path: &'a Path) -> impl Iterator<Item = &'a OsStr> {
+    args.iter().map(move |a| {
+        if a == "{}" {
+            path.as_os_str()
+        } else {
+            OsStr::new(a.as_str())
+        }
+    })
+}
+
 /// Evaluate a single primary
 fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState) -> EvalResult {
     match primary {
         Primary::Name { pattern, fold } => {
             let name = ctx.path.file_name().unwrap_or(OsStr::new(""));
-            let name_str = name.to_string_lossy();
-            EvalResult::new(fnmatch(pattern, &name_str, *fold))
+            EvalResult::new(fnmatch(pattern, name.as_bytes(), *fold))
         }
         Primary::Path { pattern, fold } => {
-            let path_str = ctx.path.to_string_lossy();
-            EvalResult::new(fnmatch(pattern, &path_str, *fold))
+            EvalResult::new(fnmatch(pattern, ctx.path.as_os_str().as_bytes(), *fold))
         }
         // POSIX -H/-L: a symbolic link that is followed has the type of the
         // file it references, so `-type l` matches only a link that could
@@ -1148,16 +1221,15 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             EvalResult::new(plib::group::get_by_gid(gid).is_none())
         }
         Primary::Print => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            let _ = writeln!(handle, "{}", ctx.path.display());
+            let mut line = ctx.path.as_os_str().as_bytes().to_vec();
+            line.push(b'\n');
+            write_stdout(state, &line);
             EvalResult::new(true)
         }
         Primary::Print0 => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            let _ = handle.write_all(ctx.path.as_os_str().as_bytes());
-            let _ = handle.write_all(b"\0");
+            let mut name = ctx.path.as_os_str().as_bytes().to_vec();
+            name.push(b'\0');
+            write_stdout(state, &name);
             EvalResult::new(true)
         }
         Primary::Prune => {
@@ -1168,9 +1240,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             result
         }
         Primary::Printf(items) => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            let _ = handle.write_all(&format_printf(items, ctx));
+            write_stdout(state, &format_printf(items, ctx));
             EvalResult::new(true)
         }
         Primary::Depth => {
@@ -1184,20 +1254,11 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
         Primary::Exec(mode) => {
             match mode {
                 ExecMode::Single { utility, args } => {
-                    // Replace {} with pathname
-                    let expanded_args: Vec<String> = args
-                        .iter()
-                        .map(|a| {
-                            if a == "{}" {
-                                ctx.path.to_string_lossy().to_string()
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect();
-
                     flush_stdout();
-                    match Command::new(utility).args(&expanded_args).status() {
+                    match Command::new(utility)
+                        .args(expand_braces(args, ctx.path))
+                        .status()
+                    {
                         Ok(status) => EvalResult::new(status.success()),
                         Err(e) => {
                             eprintln!("find: '{}': {}", utility, plib::diag::io_error_text(&e));
@@ -1229,20 +1290,11 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                 return EvalResult::new(false);
             }
 
-            // Replace {} with pathname and execute
-            let expanded_args: Vec<String> = args
-                .iter()
-                .map(|a| {
-                    if a == "{}" {
-                        ctx.path.to_string_lossy().to_string()
-                    } else {
-                        a.clone()
-                    }
-                })
-                .collect();
-
             flush_stdout();
-            match Command::new(utility).args(&expanded_args).status() {
+            match Command::new(utility)
+                .args(expand_braces(args, ctx.path))
+                .status()
+            {
                 Ok(status) => EvalResult::new(status.success()),
                 Err(e) => {
                     eprintln!("find: '{}': {}", utility, plib::diag::io_error_text(&e));
@@ -1302,11 +1354,9 @@ fn delete_entry(ctx: &EvalContext, state: &mut FindState) -> bool {
     } else {
         0
     };
-    let (dir_fd, name) = (ctx.entry.dir_fd(), ctx.entry.file_name());
-    match unsafe { libc::unlinkat(dir_fd, name.as_ptr(), flags) } {
-        0 => true,
-        _ => {
-            let e = io::Error::last_os_error();
+    match ctx.entry.unlink(flags) {
+        Ok(()) => true,
+        Err(e) => {
             eprintln!(
                 "find: cannot delete '{}': {}",
                 ctx.path.display(),
@@ -1429,6 +1479,18 @@ impl Walk<'_> {
         if depth == 0 {
             self.root_dev = md.dev();
         }
+        // `link/` names the directory the link points to. With -delete, refuse it before
+        // descending, as rm -r does, rather than delete through the link: a directory operand
+        // swapped for a symlink would otherwise redirect the deletion.
+        if self.state.deletes && entry.reached_through_symlink() {
+            eprintln!(
+                "find: cannot delete '{}': {}",
+                path.display(),
+                plib::diag::io_error_text(&io::Error::from_raw_os_error(libc::ENOTDIR))
+            );
+            self.state.had_error = true;
+            return false;
+        }
 
         let key = (md.dev(), md.ino());
         if md.is_dir() {
@@ -1549,9 +1611,26 @@ fn walk_operand(root: &Path, expr: &Expr, state: &mut FindState) {
 }
 
 /// Flush what find has written so far, so that it reaches standard output
-/// before anything a child utility writes there.
+/// before anything a child utility writes there. A failure is left in the
+/// buffer, and reported by the flush at the end of the run.
 fn flush_stdout() {
     let _ = io::stdout().flush();
+}
+
+/// Write `bytes` to standard output. A write error makes find's exit status
+/// nonzero and is reported once, not once per pathname.
+fn write_stdout(state: &mut FindState, bytes: &[u8]) {
+    if let Err(e) = io::stdout().lock().write_all(bytes) {
+        state.had_error = true;
+        if !state.stdout_failed {
+            state.stdout_failed = true;
+            plib::diag::error(&format!(
+                "{}: {}",
+                gettext("write error"),
+                plib::diag::io_error_text(&e)
+            ));
+        }
+    }
 }
 
 /// Run one `-exec ... {} +` invocation over a chunk of files. Returns whether
@@ -1620,7 +1699,7 @@ fn execute_batches(state: &mut FindState) {
 }
 
 /// Main find function
-fn find(args: Vec<String>) -> Result<i32, String> {
+fn find(args: Vec<OsString>) -> Result<i32, String> {
     let (symlink_mode, paths, mut expr) = parse_args(&args)?;
 
     // If no action, wrap with implicit -print per POSIX
@@ -1640,6 +1719,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
         );
     }
     state.depth_first = depth || delete;
+    state.deletes = delete;
     state.xdev = has_primary(&expr, |p| matches!(p, Primary::XDev));
     state.mount = has_primary(&expr, |p| matches!(p, Primary::Mount));
     state.symlink_mode = symlink_mode;
@@ -1656,6 +1736,12 @@ fn find(args: Vec<String>) -> Result<i32, String> {
     // Execute any pending batched commands
     execute_batches(&mut state);
 
+    // A final partial line (`-print0`, `-printf` without `\n`) is still in the
+    // line buffer; the runtime's flush at exit would discard its error.
+    if !state.stdout_failed && !plib::diag::flush_stdout() {
+        state.had_error = true;
+    }
+
     if state.had_error {
         Ok(1)
     } else {
@@ -1666,7 +1752,7 @@ fn find(args: Vec<String>) -> Result<i32, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("find");
 
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<OsString> = std::env::args_os().collect();
 
     match find(args) {
         Ok(code) => std::process::exit(code),

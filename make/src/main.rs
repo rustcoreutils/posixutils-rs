@@ -52,7 +52,12 @@ const _: () = {
 #[derive(Parser, Debug)]
 #[command(version, about = gettext("make - maintain, update, and regenerate groups of programs"))]
 struct Args {
-    #[arg(short = 'C', long, help = "Change to DIRECTORY before doing anything")]
+    #[arg(
+        short = 'C',
+        long,
+        allow_hyphen_values = true,
+        help = "Change to DIRECTORY before doing anything"
+    )]
     directory: Option<PathBuf>,
 
     #[arg(
@@ -63,6 +68,7 @@ struct Args {
     terminate: bool,
 
     #[arg(
+        allow_hyphen_values = true,
         short = 'f',
         long,
         help = "Path to a makefile to parse (may be given multiple times; processed in order)"
@@ -70,6 +76,7 @@ struct Args {
     makefile: Vec<PathBuf>,
 
     #[arg(
+        allow_hyphen_values = true,
         short = 'j',
         long,
         value_name = "maxjobs",
@@ -302,7 +309,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keep_going,
         jobs,
         mut targets,
-    } = Args::parse_from(args_with_makeflags());
+    } = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+        args_with_makeflags(),
+    ));
 
     let mut status_code = 0;
 

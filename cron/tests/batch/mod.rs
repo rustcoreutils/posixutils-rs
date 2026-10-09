@@ -21,13 +21,11 @@ use std::process::{Command, Stdio};
 
 /// The identity `batch` itself resolves: `getpwuid(getuid())`.
 fn whoami() -> String {
-    unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        assert!(!pw.is_null(), "no passwd entry for the test user");
-        std::ffi::CStr::from_ptr((*pw).pw_name)
-            .to_string_lossy()
-            .to_string()
-    }
+    plib::user::get_by_uid(unsafe { libc::getuid() })
+        .expect("no passwd entry for the test user")
+        .name
+        .to_string_lossy()
+        .into_owned()
 }
 
 struct Run {

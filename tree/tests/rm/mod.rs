@@ -1087,12 +1087,9 @@ fn test_rm_fail_2eperm() {
 
     // chown $NON_ROOT_USERNAME $test_dir
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
 
         let test_dir_cstr = CString::new(test_dir.as_bytes()).unwrap();
 
@@ -1160,12 +1157,9 @@ fn test_rm_no_give_up() {
     fs::File::create(d_f).unwrap();
 
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
 
         // The two calls below to `libc::chown` is equivalent to:
         // chown -R $NON_ROOT_USERNAME d
@@ -1272,6 +1266,27 @@ fn test_rm_v_file() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
+/// A `-v` line that cannot be written does not stop the removal: the whole tree is removed, and
+/// the write error is reported at the end with status 1, as GNU rm does.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_rm_v_write_error_finishes_the_removal() {
+    let test_dir = format!("{}/test_rm_v_write_error", env!("CARGO_TARGET_TMPDIR"));
+    let _ = fs::remove_dir_all(&test_dir);
+    let tree = format!("{test_dir}/tree");
+    fs::create_dir_all(format!("{tree}/sub")).unwrap();
+    fs::write(format!("{tree}/a"), "a").unwrap();
+    fs::write(format!("{tree}/sub/b"), "b").unwrap();
+    let file = format!("{test_dir}/f");
+    fs::write(&file, "f").unwrap();
+
+    plib::testing::assert_write_error_on_full_device("rm", &["-rv", &tree, &file], b"", 1);
+    assert!(!Path::new(&tree).exists());
+    assert!(!Path::new(&file).exists());
+
+    fs::remove_dir_all(&test_dir).unwrap();
+}
+
 // `-dv` reports a removed empty directory on stdout.
 #[test]
 fn test_rm_dv_empty_dir() {
@@ -1292,7 +1307,65 @@ fn test_rm_no_operand() {
     rm_test(&[], "", "rm: missing operand\n", 1);
 }
 
+/// A directory whose name only ends in dots (`foo.`, `x..`) is an ordinary operand, not `.` or
+/// `..`: rm -r removes it.
+#[test]
+fn test_rm_r_name_ending_in_dots() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    for name in ["foo.", "x.."] {
+        let dir = tmp.path().join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::File::create(dir.join("f")).unwrap();
+        rm_test(&["-r", dir.to_str().unwrap()], "", "", 0);
+        assert!(fs::symlink_metadata(&dir).is_err(), "{name}");
+    }
+}
+
 #[test]
 fn test_rm_f_no_operand() {
     rm_test(&["-f"], "", "", 0);
+}
+
+/// `dl/`, a symlink to a directory named with a trailing slash, names that directory (POSIX
+/// pathname resolution), which no removal can take away by that name. rm refuses it before
+/// descending, rather than emptying the directory the link points to as GNU does: a directory
+/// operand swapped for a symlink would otherwise redirect a recursive removal anywhere. It used
+/// to unlink the symlink itself.
+#[test]
+fn test_rm_r_trailing_slash_symlink_to_directory() {
+    let test_dir = &format!("{}/test_rm_r_trailing_slash", env!("CARGO_TARGET_TMPDIR"));
+    let (d, dl) = (&format!("{test_dir}/d"), &format!("{test_dir}/dl"));
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(format!("{d}/sub")).unwrap();
+    fs::File::create(format!("{d}/f")).unwrap();
+    fs::File::create(format!("{d}/sub/g")).unwrap();
+    unix::fs::symlink("d", dl).unwrap();
+
+    for opts in ["-rf", "-r"] {
+        rm_test(
+            &[opts, &format!("{dl}/")],
+            "",
+            &format!("rm: cannot remove '{dl}/': Not a directory\n"),
+            1,
+        );
+        assert!(fs::symlink_metadata(dl).unwrap().is_symlink());
+        assert!(fs::symlink_metadata(format!("{d}/sub/g"))
+            .unwrap()
+            .is_file());
+        assert!(fs::symlink_metadata(format!("{d}/f")).unwrap().is_file());
+    }
+
+    // Empty, it is refused too, rather than taking the path that removes it without descending.
+    fs::remove_dir_all(format!("{d}/sub")).unwrap();
+    fs::remove_file(format!("{d}/f")).unwrap();
+    rm_test(
+        &["-r", &format!("{dl}/")],
+        "",
+        &format!("rm: cannot remove '{dl}/': Not a directory\n"),
+        1,
+    );
+    assert!(fs::symlink_metadata(dl).unwrap().is_symlink());
+    assert!(fs::symlink_metadata(d).unwrap().is_dir());
+
+    fs::remove_dir_all(test_dir).unwrap();
 }

@@ -482,3 +482,10 @@ fn getconf_output(var: &str) -> String {
     });
     captured
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    plib::testing::assert_hyphen_option_argument("getconf", &["-v", "-zq", "--help"]);
+}

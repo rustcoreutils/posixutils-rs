@@ -121,3 +121,104 @@ fn test_rmdir_p_names_failing_parent() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// Run the built `rmdir` binary on `args` inside `cwd`, returning (exit code, stderr).
+fn run_rmdir_in(cwd: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rmdir"))
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+// GNU `--ignore-fail-on-non-empty`: a non-empty directory is kept silently and does
+// not affect the exit status; an empty operand next to it is still removed.
+#[test]
+fn rmdir_ignore_fail_on_non_empty_skips_non_empty() {
+    let temp_dir = tempdir().unwrap();
+    let base = temp_dir.path();
+    fs::create_dir_all(base.join("full")).unwrap();
+    fs::File::create(base.join("full/file")).unwrap();
+    fs::create_dir(base.join("empty")).unwrap();
+
+    let (code, stderr) = run_rmdir_in(base, &["--ignore-fail-on-non-empty", "full", "empty"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    assert!(base.join("full/file").exists(), "non-empty directory kept");
+    assert!(!base.join("empty").exists(), "empty directory removed");
+}
+
+// With `-p`, the walk up the parents stops silently at the first non-empty one:
+// `a/b/c` and `a/b` are removed, `a` (holding `keep`) stays, and the exit status is 0.
+#[test]
+fn rmdir_ignore_fail_on_non_empty_with_parents() {
+    let temp_dir = tempdir().unwrap();
+    let base = temp_dir.path();
+    fs::create_dir_all(base.join("a/b/c")).unwrap();
+    fs::File::create(base.join("a/keep")).unwrap();
+
+    let (code, stderr) = run_rmdir_in(base, &["-p", "--ignore-fail-on-non-empty", "a/b/c"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    assert!(!base.join("a/b").exists(), "empty chain removed");
+    assert!(base.join("a/keep").exists(), "non-empty parent kept");
+}
+
+// Errors other than "not empty" are still reported and still fail.
+#[test]
+fn rmdir_ignore_fail_on_non_empty_reports_other_errors() {
+    let temp_dir = tempdir().unwrap();
+    let base = temp_dir.path();
+    fs::create_dir(base.join("full")).unwrap();
+    fs::File::create(base.join("full/file")).unwrap();
+
+    let (code, stderr) = run_rmdir_in(base, &["--ignore-fail-on-non-empty", "full", "nope"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("rmdir: nope: No such file or directory"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("full"),
+        "non-empty failure stays silent: {stderr}"
+    );
+
+    let (code, stderr) = run_rmdir_in(base, &["--ignore-fail-on-non-empty", "full/file"]);
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("Not a directory"), "stderr: {stderr}");
+}
+
+// Like GNU, a permission error on a directory that is in fact non-empty counts as
+// "not empty" and is ignored; on an empty directory it is reported.
+#[test]
+fn rmdir_ignore_fail_on_non_empty_permission_denied() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root ignores directory permissions
+    }
+    let temp_dir = tempdir().unwrap();
+    let base = temp_dir.path();
+    fs::create_dir_all(base.join("ro/full/x")).unwrap();
+    fs::create_dir(base.join("ro/empty")).unwrap();
+    let ro = base.join("ro");
+    let mode = |m| {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&ro, fs::Permissions::from_mode(m)).unwrap();
+    };
+    mode(0o555);
+
+    let full = run_rmdir_in(base, &["--ignore-fail-on-non-empty", "ro/full"]);
+    let empty = run_rmdir_in(base, &["--ignore-fail-on-non-empty", "ro/empty"]);
+    mode(0o755);
+
+    assert_eq!(full, (Some(0), String::new()));
+    assert_eq!(empty.0, Some(1));
+    assert!(
+        empty.1.contains("rmdir: ro/empty: Permission denied"),
+        "stderr: {}",
+        empty.1
+    );
+}

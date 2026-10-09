@@ -10,7 +10,6 @@
 use chrono::{Local, TimeZone};
 use clap::Parser;
 use gettextrs::gettext;
-use std::ffi::CStr;
 use std::io;
 
 #[cfg(target_os = "linux")]
@@ -66,32 +65,16 @@ fn enable_all_facilities(args: &mut Args) {
 
 /// Get username from UID, returning UID as string if not found
 fn get_username(uid: u32) -> String {
-    unsafe {
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
-            uid.to_string()
-        } else {
-            CStr::from_ptr((*pw).pw_name)
-                .to_str()
-                .unwrap_or(&uid.to_string())
-                .to_string()
-        }
-    }
+    plib::user::get_by_uid(uid)
+        .and_then(|u| u.name.into_string().ok())
+        .unwrap_or_else(|| uid.to_string())
 }
 
 /// Get group name from GID, returning GID as string if not found
 fn get_groupname(gid: u32) -> String {
-    unsafe {
-        let gr = libc::getgrgid(gid);
-        if gr.is_null() {
-            gid.to_string()
-        } else {
-            CStr::from_ptr((*gr).gr_name)
-                .to_str()
-                .unwrap_or(&gid.to_string())
-                .to_string()
-        }
-    }
+    plib::group::get_by_gid(gid)
+        .and_then(|g| g.name.into_string().ok())
+        .unwrap_or_else(|| gid.to_string())
 }
 
 /// Truncate a string to at most `max_chars` characters (not bytes).
@@ -817,7 +800,7 @@ fn display_ipc_status(args: &Args) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("ipcs");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // -a enables all print options
     if args.all {

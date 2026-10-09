@@ -8,8 +8,10 @@
 //
 
 use gettextrs::gettext;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEF_BLOCK_SIZE: usize = 512;
@@ -123,8 +125,8 @@ impl Stats {
 }
 
 struct Config {
-    ifile: String,
-    ofile: String,
+    ifile: OsString,
+    ofile: OsString,
     ibs: usize,
     obs: usize,
     cbs: usize,
@@ -364,6 +366,15 @@ impl Write for OutputFile {
 }
 
 impl OutputFile {
+    /// Set a regular output file's size to `len`. Anything else (standard
+    /// output, a device, a FIFO) has no size to set and is left alone.
+    fn truncate_regular(&mut self, len: u64) -> io::Result<()> {
+        match self {
+            OutputFile::File(f) if f.metadata()?.is_file() => f.set_len(len),
+            _ => Ok(()),
+        }
+    }
+
     fn try_seek(&mut self, pos: SeekFrom) -> io::Result<bool> {
         match self {
             OutputFile::Stdout(_) => Ok(false),
@@ -445,6 +456,13 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
     // Handle seek (output positioning)
     if config.seek > 0 {
         let seek_bytes = config.seek * config.obs;
+        // POSIX: without conv=notrunc, the blocks seeked over are preserved
+        // and no other part of the output file is; with empty input the size
+        // becomes the seek offset. Cutting (or extending) the file at the
+        // seek point does both, before the copy rewrites what follows it.
+        if !config.notrunc {
+            ofile.truncate_regular(seek_bytes as u64)?;
+        }
         // Try to seek first
         if !ofile.try_seek(SeekFrom::Start(seek_bytes as u64))? {
             // Non-seekable: write null bytes
@@ -631,26 +649,28 @@ fn parse_block_size(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(result)
 }
 
-fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> {
+fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>> {
     let mut config = Config::default();
 
     for arg in args {
-        // Split arg into option and argument
-        let (op, oparg) = {
-            match arg.split_once('=') {
-                None => {
-                    let msg = format!("{}: {}", gettext("invalid option"), arg);
-                    eprintln!("{}", msg);
-                    return Err(msg.into());
-                }
-                Some((opt, optarg)) => (opt, optarg.to_string()),
-            }
+        // Split arg into option and argument.  A file name is taken as bytes;
+        // every other operand is ASCII, so one that is not valid UTF-8 comes
+        // out of the lossy conversion as an invalid operand.
+        let bytes = arg.as_bytes();
+        let Some(eq) = bytes.iter().position(|&b| b == b'=') else {
+            let msg = format!("{}: {}", gettext("invalid option"), arg.to_string_lossy());
+            eprintln!("{}", msg);
+            return Err(msg.into());
         };
+        let op = String::from_utf8_lossy(&bytes[..eq]);
+        let op = op.as_ref();
+        let raw_oparg = OsStr::from_bytes(&bytes[eq + 1..]);
+        let oparg = raw_oparg.to_string_lossy().into_owned();
 
         // per-option processing
         match op {
-            "if" => config.ifile = oparg,
-            "of" => config.ofile = oparg,
+            "if" => config.ifile = raw_oparg.to_os_string(),
+            "of" => config.ofile = raw_oparg.to_os_string(),
             "ibs" => config.ibs = parse_block_size(&oparg)?,
             "obs" => config.obs = parse_block_size(&oparg)?,
             "bs" => {
@@ -707,7 +727,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let config = parse_cmdline(&args)?;
 
     let stats = copy_convert_file(&config)?;

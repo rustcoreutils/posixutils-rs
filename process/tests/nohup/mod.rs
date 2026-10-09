@@ -145,6 +145,21 @@ fn open_pty() -> (libc::c_int, libc::c_int) {
 // whenever HOME is overridden.
 #[test]
 fn nohup_out_falls_back_to_home_when_cwd_is_unwritable() {
+    check_home_fallback(b"home");
+}
+
+// The fallback directory's name need not be valid UTF-8: such a HOME was
+// treated as unset, and nohup failed instead of writing there.
+#[test]
+fn nohup_out_falls_back_to_non_utf8_home() {
+    check_home_fallback(b"home\xff");
+}
+
+/// Run nohup on a terminal in an unwritable directory with `$HOME` set to a
+/// directory called `home_name`, and check its output went to
+/// `$HOME/nohup.out`. Skipped where the filesystem refuses `home_name`, a
+/// name that is not valid UTF-8 (macOS APFS).
+fn check_home_fallback(home_name: &[u8]) {
     use std::os::unix::io::FromRawFd;
     use std::process::{Command, Stdio};
 
@@ -156,9 +171,11 @@ fn nohup_out_falls_back_to_home_when_cwd_is_unwritable() {
     let base_dir = plib::tmp::tempdir().unwrap();
     let base = base_dir.path();
     let unwritable = base.join("cwd");
-    let home = base.join("home");
     std::fs::create_dir_all(&unwritable).unwrap();
-    std::fs::create_dir_all(&home).unwrap();
+    let Some(home) = plib::testing::create_non_utf8(base, home_name, |p| std::fs::create_dir(p))
+    else {
+        return;
+    };
 
     // Searchable but not writable, so creating ./nohup.out fails.
     std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -237,4 +254,19 @@ fn nohup_stderr_follows_stdout_when_stdout_is_not_a_terminal() {
         !tmp.join("nohup.out").exists(),
         "no nohup.out should be created when stdout is not a terminal"
     );
+}
+
+// The utility and its arguments are passed through byte for byte; a
+// non-UTF-8 argument made nohup panic.
+#[test]
+fn nohup_passes_non_utf8_arguments() {
+    use plib::testing::os_bytes;
+    let output = std::process::Command::new(get_binary_path("nohup"))
+        .args(["sh", "-c", "printf '%s' \"$1\"", "sh"])
+        .arg(os_bytes(b"arg\xfe"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"arg\xfe");
 }

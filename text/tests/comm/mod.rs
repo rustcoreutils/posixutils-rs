@@ -330,3 +330,10 @@ fn mo_catalog(entries: &[(&str, &str)]) -> Vec<u8> {
     out.extend_from_slice(&blob);
     out
 }
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in the line buffer until exit, where the error was lost.
+#[test]
+fn test_comm_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("comm", &["-", "/dev/null"], b"x", 1);
+}

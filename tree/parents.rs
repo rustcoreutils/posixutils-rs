@@ -17,7 +17,7 @@
 
 use crate::common::{
     copy_file_at, error_string, finish_made_dir_mode, made_dir_open_error, open_made_dir,
-    preserve_through_fd, CopyConfig, InodeMap, MadeTrust,
+    preserve_through_fd, report_verbose_bytes, CopyConfig, InodeMap, MadeTrust,
 };
 use gettextrs::gettext;
 use std::collections::HashSet;
@@ -68,7 +68,12 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
 /// GNU cp follows a symbolic link it finds, but a link planted between a failed lookup and the
 /// `mkdirat` is indistinguishable from one that was there before, so none is followed. Nothing
 /// is stat'ed before its open; the identity used afterwards is the opened descriptor's own.
-fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec<MadeDir>, File)> {
+fn make_parents(
+    source: &Path,
+    target: &Path,
+    preserve: bool,
+    verbose: bool,
+) -> io::Result<(Vec<MadeDir>, File)> {
     let mut made = Vec::new();
     let mut dest_dir = open_dir_at(libc::AT_FDCWD, &cstring(target.as_os_str().as_bytes())?, 0)?;
     let Some(parent) = source.parent() else {
@@ -77,6 +82,8 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
     let start = if source.is_absolute() { "/" } else { "." };
     let mut src_dir = open_dir_at(libc::AT_FDCWD, &cstring(start.as_bytes())?, 0)?;
     let mut dest_path = target.to_path_buf();
+    // The source's components so far, for -v.
+    let mut src_path = PathBuf::from(if source.is_absolute() { "/" } else { "" });
 
     for comp in parent.components() {
         // `..` is followed as written, as GNU cp does.
@@ -85,6 +92,7 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
             Component::RootDir | Component::CurDir | Component::Prefix(_) => continue,
         };
         dest_path.push(comp);
+        src_path.push(comp);
 
         let next_src = open_dir_at(src_dir.as_raw_fd(), &name, 0).map_err(|e| {
             io::Error::other(gettext!(
@@ -130,6 +138,9 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
                 path: dest_path.clone(),
                 trust,
             });
+            if verbose {
+                report_made_dir(&src_path, &dest_path);
+            }
             next_dest
         } else {
             open_dir_at(dest_dir.as_raw_fd(), &name, libc::O_NOFOLLOW).map_err(|e| {
@@ -144,6 +155,15 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
         dest_dir = next_dest;
     }
     Ok((made, dest_dir))
+}
+
+/// GNU `cp -v --parents` for a directory made on the way: `source -> dest`, unquoted, unlike
+/// every other line `-v` writes.
+fn report_made_dir(source: &Path, dest: &Path) {
+    let mut line = source.as_os_str().as_bytes().to_vec();
+    line.extend_from_slice(b" -> ");
+    line.extend_from_slice(dest.as_os_str().as_bytes());
+    report_verbose_bytes(&line);
 }
 
 /// The final attributes of a directory `--parents` made, set once the copy below it is done.
@@ -182,14 +202,15 @@ where
     // Read once: each read is a pair of umask(2) calls.
     let umask = plib::modestr::umask();
     for source in sources {
-        let (made, dest_dir) = match make_parents(source, target, cfg.preserve) {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("cp: {}", error_string(&e));
-                ok = false;
-                continue;
-            }
-        };
+        let (made, dest_dir) =
+            match make_parents(source, target, cfg.preserve, cfg.verbose.is_some()) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("cp: {}", error_string(&e));
+                    ok = false;
+                    continue;
+                }
+            };
         let relative: PathBuf = source
             .components()
             .filter(|c| !matches!(c, Component::RootDir | Component::Prefix(_)))

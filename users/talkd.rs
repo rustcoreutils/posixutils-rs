@@ -94,7 +94,7 @@ const CTL_RES_LEN: usize = 24;
 #[command(version, about = gettext("talkd - local talk daemon"))]
 struct Args {
     /// Socket path to listen on
-    #[arg(short, long, default_value = DEFAULT_SOCKET_PATH)]
+    #[arg(short, long, allow_hyphen_values = true, default_value = DEFAULT_SOCKET_PATH)]
     socket: PathBuf,
 
     /// Run in foreground (don't daemonize)
@@ -102,7 +102,7 @@ struct Args {
     foreground: bool,
 
     /// Seconds an unanswered invitation is retained
-    #[arg(long, default_value_t = INVITATION_TIMEOUT_SECS)]
+    #[arg(long, allow_hyphen_values = true, default_value_t = INVITATION_TIMEOUT_SECS)]
     invite_timeout: u64,
 
     /// Seconds between idle expiry sweeps (testing aid)
@@ -461,11 +461,10 @@ fn handle_lookup(registry: &InvitationRegistry, msg: &CtlMsg) -> CtlRes {
 /// Returns the `Answer` to report to the caller.
 fn announce_to_tty(caller: &str, callee: &str, requested_tty: &str) -> Answer {
     // The callee must exist in the password database.
-    let c_callee = match CString::new(callee) {
-        Ok(c) => c,
-        Err(_) => return Answer::Failed,
-    };
-    if unsafe { libc::getpwnam(c_callee.as_ptr()).is_null() } {
+    if callee.contains('\0') {
+        return Answer::Failed;
+    }
+    if plib::user::get_by_name(callee).is_none() {
         return Answer::NotHere;
     }
 
@@ -975,7 +974,7 @@ fn daemonize() -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("talkd");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Detach unless asked to stay in the foreground (#TD9).
     if !args.foreground {

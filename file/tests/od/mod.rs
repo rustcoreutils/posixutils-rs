@@ -1405,3 +1405,12 @@ fn test_od_dies_by_sigpipe_on_a_closed_pipe() {
 
     plib::testing::assert_dies_by_sigpipe("od", &[big.to_str().unwrap()]);
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-A", "-j", "-N", "-t"] {
+        plib::testing::assert_hyphen_option_argument("od", &[opt, "-zq", "--help"]);
+    }
+}

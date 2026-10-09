@@ -9,10 +9,11 @@
 
 use clap::Parser;
 use gettextrs::gettext;
-use plib::group;
+use plib::{group, user};
 use std::collections::{HashMap, HashSet};
-use std::ffi::CStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
 /// id - return user identity
@@ -45,9 +46,10 @@ struct UserInfo {
     egid: libc::gid_t,
     groups: Vec<libc::gid_t>,
 
-    username: String,
-    eusername: String,
-    group_names: HashMap<libc::gid_t, String>,
+    // Byte-exact, as the database holds them: a name need not be UTF-8.
+    username: OsString,
+    eusername: OsString,
+    group_names: HashMap<libc::gid_t, OsString>,
 }
 
 /// Get supplementary groups for the current process using getgroups() syscall.
@@ -69,25 +71,13 @@ fn get_process_groups() -> Vec<libc::gid_t> {
 }
 
 /// Look up username for a given uid.
-fn get_username(uid: libc::uid_t) -> Option<String> {
-    let passwd = unsafe { libc::getpwuid(uid) };
-    if passwd.is_null() {
-        return None;
-    }
-    Some(unsafe {
-        CStr::from_ptr((*passwd).pw_name)
-            .to_string_lossy()
-            .to_string()
-    })
+fn get_username(uid: libc::uid_t) -> Option<OsString> {
+    user::get_by_uid(uid).map(|u| u.name)
 }
 
 /// Look up group name for a given gid.
-fn get_groupname(gid: libc::gid_t) -> Option<String> {
-    let grp = unsafe { libc::getgrgid(gid) };
-    if grp.is_null() {
-        return None;
-    }
-    Some(unsafe { CStr::from_ptr((*grp).gr_name).to_string_lossy().to_string() })
+fn get_groupname(gid: libc::gid_t) -> Option<OsString> {
+    group::get_by_gid(gid).map(|g| g.name)
 }
 
 fn userinfo_process(userinfo: &mut UserInfo) -> Result<(), String> {
@@ -119,26 +109,16 @@ fn userinfo_process(userinfo: &mut UserInfo) -> Result<(), String> {
 }
 
 fn userinfo_name(userinfo: &mut UserInfo, user: &str) -> Result<(), String> {
-    let user_str =
-        std::ffi::CString::new(user).map_err(|_| gettext("invalid username").to_string())?;
-    let passwd = unsafe { libc::getpwnam(user_str.as_ptr()) };
-    if passwd.is_null() {
-        return Err(format!("{}: {}", user, gettext("no such user")));
-    }
+    let passwd =
+        user::get_by_name(user).ok_or_else(|| format!("{}: {}", user, gettext("no such user")))?;
 
-    unsafe {
-        userinfo.uid = (*passwd).pw_uid;
-        userinfo.gid = (*passwd).pw_gid;
-    }
+    userinfo.uid = passwd.uid;
+    userinfo.gid = passwd.gid;
     // For a named user, effective IDs are same as real IDs
     userinfo.euid = userinfo.uid;
     userinfo.egid = userinfo.gid;
 
-    userinfo.username = unsafe {
-        CStr::from_ptr((*passwd).pw_name)
-            .to_string_lossy()
-            .to_string()
-    };
+    userinfo.username = passwd.name;
     userinfo.eusername = userinfo.username.clone();
 
     Ok(())
@@ -151,8 +131,8 @@ fn get_user_info(args: &Args) -> Result<UserInfo, String> {
         euid: 0,
         egid: 0,
         groups: Vec::new(),
-        username: String::new(),
-        eusername: String::new(),
+        username: OsString::new(),
+        eusername: OsString::new(),
         group_names: HashMap::new(),
     };
 
@@ -197,7 +177,7 @@ fn get_group_info(userinfo: &mut UserInfo, is_named_user: bool) {
             }
 
             // Check if user is a member of this group
-            if grp.members.iter().any(|m| m == &userinfo.username) {
+            if grp.members.contains(&userinfo.username) {
                 user_groups.push(grp.gid);
                 userinfo.group_names.insert(grp.gid, grp.name.clone());
                 seen_gids.insert(grp.gid);
@@ -234,6 +214,14 @@ fn get_group_info(userinfo: &mut UserInfo, is_named_user: bool) {
     }
 }
 
+/// Write ` (name)` as the default format shows it, with the name's bytes as
+/// they are.
+fn write_parenthesized(out: &mut impl Write, name: &OsStr) -> io::Result<()> {
+    out.write_all(b"(")?;
+    out.write_all(name.as_bytes())?;
+    out.write_all(b")")
+}
+
 fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -255,7 +243,8 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
                 // If name not found, output numeric per POSIX
                 writeln!(out, "{}", uid)?;
             } else {
-                writeln!(out, "{}", name)?;
+                out.write_all(name.as_bytes())?;
+                writeln!(out)?;
             }
         } else {
             writeln!(out, "{}", uid)?;
@@ -272,9 +261,11 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
         };
         if args.name {
             if let Some(name) = userinfo.group_names.get(&gid) {
-                writeln!(out, "{}", name)?;
+                out.write_all(name.as_bytes())?;
+                writeln!(out)?;
             } else if let Some(name) = get_groupname(gid) {
-                writeln!(out, "{}", name)?;
+                out.write_all(name.as_bytes())?;
+                writeln!(out)?;
             } else {
                 // If name not found, output numeric per POSIX
                 writeln!(out, "{}", gid)?;
@@ -296,9 +287,9 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
 
             if args.name {
                 if let Some(name) = userinfo.group_names.get(gid) {
-                    write!(out, "{}", name)?;
+                    out.write_all(name.as_bytes())?;
                 } else if let Some(name) = get_groupname(*gid) {
-                    write!(out, "{}", name)?;
+                    out.write_all(name.as_bytes())?;
                 } else {
                     // If name not found, output numeric per POSIX
                     write!(out, "{}", gid)?;
@@ -316,20 +307,20 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
     // uid=UID(username)
     write!(out, "uid={}", userinfo.uid)?;
     if !userinfo.username.is_empty() {
-        write!(out, "({})", userinfo.username)?;
+        write_parenthesized(&mut out, &userinfo.username)?;
     }
 
     // gid=GID(groupname)
     write!(out, " gid={}", userinfo.gid)?;
     if let Some(name) = userinfo.group_names.get(&userinfo.gid) {
-        write!(out, "({})", name)?;
+        write_parenthesized(&mut out, name)?;
     }
 
     // euid=EUID(eusername) - only if different from uid
     if userinfo.euid != userinfo.uid {
         write!(out, " euid={}", userinfo.euid)?;
         if !userinfo.eusername.is_empty() {
-            write!(out, "({})", userinfo.eusername)?;
+            write_parenthesized(&mut out, &userinfo.eusername)?;
         }
     }
 
@@ -337,9 +328,9 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
     if userinfo.egid != userinfo.gid {
         write!(out, " egid={}", userinfo.egid)?;
         if let Some(name) = userinfo.group_names.get(&userinfo.egid) {
-            write!(out, "({})", name)?;
+            write_parenthesized(&mut out, name)?;
         } else if let Some(name) = get_groupname(userinfo.egid) {
-            write!(out, "({})", name)?;
+            write_parenthesized(&mut out, &name)?;
         }
     }
 
@@ -355,7 +346,7 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
 
             write!(out, "{}", gid)?;
             if let Some(name) = userinfo.group_names.get(gid) {
-                write!(out, "({})", name)?;
+                write_parenthesized(&mut out, name)?;
             }
         }
     }
@@ -367,7 +358,7 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
 fn main() -> ExitCode {
     plib::diag::init_locale("id");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut userinfo = match get_user_info(&args) {
         Ok(info) => info,

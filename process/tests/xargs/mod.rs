@@ -613,3 +613,221 @@ fn xargs_insert_mode_without_matching_eof_string_processes_all_lines() {
         vec!["-E", "HALT", "-I", "{}", "echo", "[{}]"],
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-L", "-n", "-s", "-E", "-I"] {
+        plib::testing::assert_hyphen_option_argument("xargs", &[opt, "-zq", "--help"]);
+    }
+}
+
+// XBD 12.2, Guideline 9: xargs's options all come before the utility, so
+// every word after the utility name belongs to the utility. `xargs touch -t
+// STAMP` traced the command and ran `touch STAMP`, and `xargs -r0 rm -r` was
+// refused as a repeated `-r`.
+#[test]
+fn options_after_utility_belong_to_the_utility() {
+    // echo does not take -t, -r or -x as options, so it prints them.
+    xargs_test("x\n", "-t x\n", vec!["echo", "-t"]);
+    xargs_test("x\0", "-r x\n", vec!["-r0", "echo", "-r"]);
+    xargs_test("x\n", "-x -L 1 x\n", vec!["echo", "-x", "-L", "1"]);
+}
+
+// `--` still ends xargs's options, and a `--` after the utility name is one of
+// the utility's arguments.
+#[test]
+fn double_dash_ends_options_and_later_one_is_passed_through() {
+    xargs_test("x\n", "-t x\n", vec!["--", "echo", "-t"]);
+    xargs_test("x\n", "-- -t x\n", vec!["echo", "--", "-t"]);
+}
+
+// Input arguments are byte strings, as pathnames are.  Bytes that are not
+// valid UTF-8 used to become U+FFFD, so `find . -print0 | xargs -0 rm` was
+// handed names of files that do not exist.  The child prints each argument
+// it received between brackets, so the expectation is the exact bytes.
+
+/// Run xargs with `xargs_args` (each a byte string) on `stdin`, expecting
+/// `expected` on stdout and success.
+fn xargs_bytes(xargs_args: &[&[u8]], stdin: &[u8], expected: &[u8]) {
+    plib::testing::run_test_os(plib::testing::TestPlanOs {
+        cmd: String::from("xargs"),
+        args: xargs_args
+            .iter()
+            .map(|a| plib::testing::os_bytes(a))
+            .collect(),
+        stdin_data: stdin.to_vec(),
+        expected_out: expected.to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn non_utf8_bytes_pass_through_null_separated_input() {
+    xargs_bytes(
+        &[b"-0", b"printf", b"[%s]\n"],
+        b"a\xffb\0c\xe9d\0",
+        b"[a\xffb]\n[c\xe9d]\n",
+    );
+}
+
+#[test]
+fn non_utf8_bytes_pass_through_blank_separated_input() {
+    xargs_bytes(
+        &[b"printf", b"[%s]\n"],
+        b"a\xffb c\xe9d\n'q\xff t'\n",
+        b"[a\xffb]\n[c\xe9d]\n[q\xff t]\n",
+    );
+}
+
+#[test]
+fn non_utf8_bytes_substituted_by_insert_mode() {
+    xargs_bytes(
+        &[b"-I", b"{}", b"printf", b"[%s]\n", b"x{}y"],
+        b"a\xffb\nc\xe9d\n",
+        b"[xa\xffby]\n[xc\xe9dy]\n",
+    );
+}
+
+#[test]
+fn non_utf8_replstr_and_utility_argument() {
+    xargs_bytes(
+        &[b"-I", b"\xfe", b"printf", b"[%s]\n", b"x\xfey"],
+        b"a\xffb\n",
+        b"[xa\xffby]\n",
+    );
+}
+
+#[test]
+fn non_utf8_bytes_one_argument_per_invocation() {
+    xargs_bytes(
+        &[
+            b"-n",
+            b"1",
+            b"sh",
+            b"-c",
+            b"printf '%s:[%s]\\n' $# \"$1\"",
+            b"sh",
+        ],
+        b"a\xffb c\xe9d\n",
+        b"1:[a\xffb]\n1:[c\xe9d]\n",
+    );
+}
+
+#[test]
+fn non_utf8_bytes_in_line_mode() {
+    xargs_bytes(
+        &[b"-L", b"1", b"printf", b"<%s>"],
+        b"a\xffb c\n\xe9d\n",
+        b"<a\xffb><c><\xe9d>",
+    );
+}
+
+#[test]
+fn non_utf8_eof_string_compared_as_bytes() {
+    // "\xff" and "\xfe" were both U+FFFD, so each matched the other.
+    xargs_bytes(
+        &[b"-E", b"\xff", b"printf", b"[%s]\n"],
+        b"a \xfe \xff b\n",
+        b"[a]\n[\xfe]\n",
+    );
+}
+
+#[test]
+fn size_limit_counts_bytes() {
+    // "\xff\xff\xff" is three bytes: with "echo" (5 bytes with its NUL) and
+    // -s 13, two such arguments (4 + 4) fit in one command but three do not.
+    xargs_bytes(
+        &[b"-s", b"13", b"echo"],
+        b"\xff\xff\xff \xff\xff\xff \xff\xff\xff\n",
+        b"\xff\xff\xff \xff\xff\xff\n\xff\xff\xff\n",
+    );
+}
+
+// Skipped where the filesystem refuses a name that is not valid UTF-8
+// (macOS APFS).
+#[test]
+fn rm_removes_exactly_the_named_non_utf8_files() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let names: [&[u8]; 2] = [b"a\xffb", b"c\xe9d"];
+    let mut stdin = Vec::new();
+    for name in names {
+        let created =
+            plib::testing::create_non_utf8(dir.path(), name, |p| File::create(p).map(drop));
+        let Some(path) = created else {
+            return;
+        };
+        stdin.extend_from_slice(path.as_os_str().as_bytes());
+        stdin.push(0);
+    }
+    // A decoy that the lossy name "a\u{FFFD}b" would have named.
+    let decoy = dir.path().join("a\u{FFFD}b");
+    File::create(&decoy).unwrap();
+
+    xargs_bytes(&[b"-0", b"rm"], &stdin, b"");
+
+    for name in names {
+        assert!(!dir.path().join(OsStr::from_bytes(name)).exists());
+    }
+    assert!(decoy.exists(), "rm removed the U+FFFD decoy");
+}
+
+// An argument that cannot fit within -s even alone is an error, with or
+// without -x, as in GNU xargs.  Without -x it used to run the utility with no
+// arguments over and over, forever.
+#[test]
+fn argument_too_long_for_size_limit_is_an_error() {
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![String::from("-s"), String::from("8"), String::from("echo")],
+        stdin_data: String::from("aaaaaaaaaa bb\n"),
+        expected_out: String::new(),
+        expected_err: String::from("xargs: argument line too long\n"),
+        expected_exit_code: 1,
+    });
+}
+
+// The last argument, read at end of input, can overflow the batch built so
+// far; it then goes in a command of its own.  Only one command was run for
+// whatever remained at end of input, and the overflow was dropped.
+#[test]
+fn arguments_left_at_end_of_input_all_run() {
+    xargs_test("aaa bbb ccc", "aaa bbb\nccc\n", vec!["-s", "13", "echo"]);
+}
+
+// By default a command line must leave room for the environment and stay well
+// under {ARG_MAX}: xargs packed 200000 short arguments into one command and
+// exec failed with E2BIG, because the default size was {ARG_MAX}-2048 with
+// neither the environment nor the argument pointers counted.
+#[test]
+fn many_arguments_fit_the_default_size() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let count = 200_000;
+    let input: String = (1..=count).map(|n| format!("{n}\n")).collect();
+    // Written in one go: the TestPlan runner feeds stdin in small paced chunks.
+    let mut child = Command::new(plib::testing::get_binary_path("xargs"))
+        .arg("echo")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let output = child.wait_with_output().unwrap();
+    // A write error (xargs gone early) shows up in the assertions below.
+    let _ = writer.join().unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{:?}", output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    assert_eq!(words.len(), count);
+    assert_eq!(words.last(), Some(&"200000"));
+}

@@ -545,3 +545,12 @@ fn test_csplit_byte_counts_match_file_sizes() {
         std::fs::remove_file(name).unwrap();
     }
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-f", "-n"] {
+        plib::testing::assert_hyphen_option_argument("csplit", &[opt, "-zq", "--help"]);
+    }
+}

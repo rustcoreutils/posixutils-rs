@@ -15,6 +15,7 @@
 use clap::Parser;
 use gettextrs::gettext;
 use posixutils_i18n::gettext_lib::mo_file::MO_MAGIC_LE;
+use posixutils_i18n::gettext_lib::plural::parse_plural_forms;
 use posixutils_i18n::gettext_lib::po_file::PoFile;
 use std::collections::HashMap;
 use std::fs::File;
@@ -34,19 +35,28 @@ struct Args {
     #[arg(short = 'c', help = gettext("Check the PO file for validity"))]
     check: bool,
 
+    #[arg(long, help = gettext("Check that c-format translations use the same conversions as the original"))]
+    check_format: bool,
+
+    #[arg(long, help = gettext("Reject domain directives when an output file is named"))]
+    check_domain: bool,
+
+    #[arg(long, help = gettext("Print translation statistics to standard error"))]
+    statistics: bool,
+
     #[arg(short = 'f', help = gettext("Include fuzzy entries in the output"))]
     include_fuzzy: bool,
 
     #[arg(short = 'S', help = gettext("Append .mo suffix to output file names"))]
     add_suffix: bool,
 
-    #[arg(short = 'v', help = gettext("Verbose mode - print warnings"))]
+    #[arg(short = 'v', long, help = gettext("Verbose mode - print warnings"))]
     verbose: bool,
 
-    #[arg(short = 'D', action = clap::ArgAction::Append, help = gettext("Add directory to search path for input files"))]
+    #[arg(short = 'D', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Add directory to search path for input files"))]
     directories: Vec<PathBuf>,
 
-    #[arg(short = 'o', long = "output-file", help = gettext("Output file name"))]
+    #[arg(short = 'o', long = "output-file", allow_hyphen_values = true, help = gettext("Output file name"))]
     output: Option<PathBuf>,
 
     #[arg(short, long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
@@ -86,7 +96,7 @@ impl std::fmt::Display for Diagnostic {
 fn main() {
     plib::diag::init_locale("msgfmt");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // POSIX: at least one pathname operand is required, but report it as a
     // usage diagnostic rather than a clap argument error.
@@ -138,6 +148,10 @@ fn main() {
             }
         };
 
+        // Which plural forms stand for many numbers, read from the header.
+        let often = plural_forms_used_often(&po);
+        // Domains of this file already reported under --check-domain.
+        let mut ignored_domains = std::collections::HashSet::new();
         // Process entries (headers are tagged per domain and flow through here
         // as the empty-msgid entry).
         for entry in po.all_entries() {
@@ -170,9 +184,22 @@ fn main() {
                 continue;
             }
 
-            // Abnormality checks (only when both -c and -v are given).
-            if run_checks {
-                validate_entry(&path, entry, &mut diagnostics);
+            // Abnormality checks (all of them when both -c and -v are given).
+            if run_checks || args.check_format {
+                validate_entry(&path, entry, run_checks, often.as_deref(), &mut diagnostics);
+            }
+
+            // --check-domain: -o ignores every `domain` directive, so one is a
+            // conflict (reported once per domain and file).
+            if let (true, Some(_), Some(name)) = (args.check_domain, &args.output, &entry.domain) {
+                if ignored_domains.insert(name.clone()) {
+                    diagnostics.push(Diagnostic {
+                        file: path.display().to_string(),
+                        line: None,
+                        message: format!("'domain {}' directive ignored", name),
+                        is_error: true,
+                    });
+                }
             }
 
             let domain = entry.domain.clone().unwrap_or_else(default_domain);
@@ -210,8 +237,8 @@ fn main() {
         exit_code = 1;
     }
 
-    // -v: print translation statistics.
-    if args.verbose {
+    // -v or --statistics: print translation statistics.
+    if args.verbose || args.statistics {
         print_statistics(n_translated, n_fuzzy, n_untranslated);
     }
 
@@ -316,12 +343,34 @@ fn boundary_newline_mismatch(a: &[u8], b: &[u8]) -> bool {
         || (a.last() == Some(&b'\n')) != (b.last() == Some(&b'\n'))
 }
 
+/// For each plural form of the file's `Plural-Forms` expression, whether it
+/// stands for many numbers: five or more of n = 0..=1000, as GNU msgfmt
+/// counts.  `None` when the header gives no usable expression.
+fn plural_forms_used_often(po: &PoFile) -> Option<Vec<bool>> {
+    let (nplurals, expr) = parse_plural_forms(&po.plural_forms()?)?;
+    let mut counts = vec![0usize; nplurals];
+    for n in 0..=1000 {
+        if let Some(count) = usize::try_from(expr.evaluate(n))
+            .ok()
+            .and_then(|form| counts.get_mut(form))
+        {
+            *count += 1;
+        }
+    }
+    Some(counts.into_iter().map(|c| c >= 5).collect())
+}
+
 /// Validate a PO entry, recording genuine abnormalities as errors (affecting the
-/// exit status) and softer findings as warnings. Only called when both -c and
-/// -v are given.
+/// exit status) and softer findings as warnings. With `all` (-c -v) every check
+/// runs; without it (`--check-format`) only the c-format comparison.
+///
+/// `often` says which plural forms stand for many numbers (see
+/// [`plural_forms_used_often`]).
 fn validate_entry(
     path: &std::path::Path,
     entry: &posixutils_i18n::gettext_lib::po_file::PoEntry,
+    all: bool,
+    often: Option<&[bool]>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let file = path.display().to_string();
@@ -336,24 +385,25 @@ fn validate_entry(
         if msgstr.is_empty() {
             continue;
         }
-        // The source string corresponding to this msgstr: the plural form is
-        // compared against msgid_plural, the singular against msgid.
+        // The original whose boundary newlines this msgstr must share: the
+        // plural forms share msgid_plural's, the singular msgid's.
         let source = if is_plural && i > 0 {
             entry.msgid_plural.as_deref().unwrap_or(&entry.msgid)
         } else {
             &entry.msgid
         };
-        let suffix = if entry.msgstr.len() > 1 {
+        let suffix = if is_plural {
             format!("[{}]", i)
         } else {
             String::new()
         };
+        let line = Some(entry.msgstr_line).filter(|&n| n > 0);
 
         // Abnormality: boundary <newline> mismatch.
-        if boundary_newline_mismatch(source, msgstr) {
+        if all && boundary_newline_mismatch(source, msgstr) {
             diagnostics.push(Diagnostic {
                 file: file.clone(),
-                line: None,
+                line,
                 message: format!(
                     "'msgid' and 'msgstr{}' do not both begin/end with '\\n'",
                     suffix
@@ -363,19 +413,23 @@ fn validate_entry(
         }
 
         // Abnormality: c-format conversion specifiers differ in number or type.
+        // As in GNU msgfmt, every plural form is checked against
+        // msgid_plural, and a form that stands for few numbers (the singular
+        // of most languages) may leave out trailing arguments: "one file"
+        // for "%d files".
         if c_format {
-            // Conversion specifications are ASCII, so the check reads the
-            // message as text; the bytes themselves are untouched.
-            let src_specs = format_signatures(&String::from_utf8_lossy(source));
-            let dst_specs = format_signatures(&String::from_utf8_lossy(msgstr));
-            if src_specs != dst_specs {
+            let (original, strict) = match &entry.msgid_plural {
+                Some(plural) => (
+                    ("msgid_plural", plural.as_slice()),
+                    often.is_none_or(|o| o.get(i).copied().unwrap_or(true)),
+                ),
+                None => (("msgid", entry.msgid.as_slice()), true),
+            };
+            if let Some(problem) = format_mismatch(original, msgstr, &suffix, strict) {
                 diagnostics.push(Diagnostic {
                     file: file.clone(),
-                    line: None,
-                    message: format!(
-                        "format specifications in 'msgid' and 'msgstr{}' differ",
-                        suffix
-                    ),
+                    line,
+                    message: format!("{problem}: msgid \"{}\"", truncate(&entry.msgid, 60)),
                     is_error: true,
                 });
             }
@@ -383,7 +437,7 @@ fn validate_entry(
     }
 
     // Softer finding: empty translation of a non-empty source (informational).
-    if !entry.msgid.is_empty() && entry.msgstr.iter().all(|s| s.is_empty()) {
+    if all && !entry.msgid.is_empty() && entry.msgstr.iter().all(|s| s.is_empty()) {
         diagnostics.push(Diagnostic {
             file,
             line: None,
@@ -393,78 +447,180 @@ fn validate_entry(
     }
 }
 
-/// Normalized signatures of the printf-style conversion specifications in `s`,
-/// in order. Each signature is the length modifier plus an argument-type class,
-/// so the comparison catches both a differing count and differing argument
-/// types (`%d` vs `%s`), while treating equivalents like `%d`/`%i` as the same.
-fn format_signatures(s: &str) -> Vec<String> {
-    let mut sigs = Vec::new();
-    let mut chars = s.chars().peekable();
+/// How the conversion specifications of `msgstr` fail to match those of
+/// `original`, named and given as its text, or `None` when they match.
+///
+/// POSIX has `msgfmt -c -v` compare only the number of conversions and the
+/// argument types of corresponding ones. The comparison is by argument, so a
+/// flag or a width does not count, and a `%n$` conversion is matched by its
+/// argument number wherever it stands. Unless `strict`, `msgstr` may consume
+/// fewer arguments than `original`. An `original` that is no valid format
+/// string has nothing to compare against. The wording is GNU msgfmt's.
+fn format_mismatch(
+    (name, original): (&str, &[u8]),
+    msgstr: &[u8],
+    suffix: &str,
+    strict: bool,
+) -> Option<String> {
+    let Ok(expected) = format_arguments(original) else {
+        return None;
+    };
+    let found = match format_arguments(msgstr) {
+        Ok(found) => found,
+        Err(reason) => {
+            return Some(format!(
+                "'msgstr{suffix}' is not a valid C format string, unlike '{name}'. Reason: {reason}"
+            ))
+        }
+    };
+    if found.len() > expected.len() || (strict && found.len() < expected.len()) {
+        return Some(format!(
+            "number of format specifications in '{name}' and 'msgstr{suffix}' does not match"
+        ));
+    }
+    let n = expected.iter().zip(&found).position(|(a, b)| a != b)?;
+    Some(format!(
+        "format specifications in '{name}' and 'msgstr{suffix}' for argument {} are not the same",
+        n + 1
+    ))
+}
 
-    while let Some(c) = chars.next() {
-        if c != '%' {
+/// The argument types the conversion specifications of `s` consume, in
+/// argument order, or why `s` is no valid C format string.
+///
+/// Each type is the length modifier plus an argument class, so `%d`/`%i`
+/// agree and `%d`/`%ld` do not. A `*` width or precision consumes an `int`.
+fn format_arguments(s: &[u8]) -> Result<Vec<String>, String> {
+    // (argument number when given as `n$`, type), in textual order.
+    let mut uses: Vec<(Option<usize>, String)> = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] != b'%' {
+            i += 1;
             continue;
         }
-        match chars.peek() {
-            Some('%') => {
-                chars.next(); // literal %%
-                continue;
-            }
-            None => break,
-            _ => {}
+        i += 1;
+        if s.get(i) == Some(&b'%') {
+            i += 1;
+            continue;
         }
-
-        // Flags, field width, precision, positional ($) — ignored for typing.
-        while let Some(&c) = chars.peek() {
-            if "-+ #0".contains(c) || c.is_ascii_digit() || c == '.' || c == '*' || c == '$' {
-                chars.next();
+        let number = argument_number(s, &mut i);
+        while i < s.len() && b"-+ #0'I".contains(&s[i]) {
+            i += 1;
+        }
+        // Field width, then precision: digits, or `*` with its own `n$`.
+        for leading in [None, Some(b'.')] {
+            if let Some(dot) = leading {
+                if s.get(i) != Some(&dot) {
+                    continue;
+                }
+                i += 1;
+            }
+            if s.get(i) == Some(&b'*') {
+                i += 1;
+                uses.push((argument_number(s, &mut i), "i".to_string()));
             } else {
-                break;
+                while i < s.len() && s[i].is_ascii_digit() {
+                    i += 1;
+                }
             }
         }
-        // Length modifiers affect the argument type, so keep them.
         let mut length = String::new();
-        while let Some(&c) = chars.peek() {
-            if "hlLjztq".contains(c) {
-                length.push(c);
-                chars.next();
-            } else {
-                break;
-            }
+        while i < s.len() && b"hlLjztq".contains(&s[i]) {
+            length.push(char::from(s[i]));
+            i += 1;
         }
-        // Conversion character.
-        if let Some(conv) = chars.next() {
-            sigs.push(format!("{}{}", length, conversion_class(conv)));
-        }
+        let Some(&conversion) = s.get(i) else {
+            return Err("The string ends in the middle of a directive.".to_string());
+        };
+        i += 1;
+        uses.push((number, format!("{length}{}", conversion_class(conversion))));
     }
 
-    sigs
+    let numbered = uses.iter().filter(|(n, _)| n.is_some()).count();
+    if numbered == 0 {
+        return Ok(uses.into_iter().map(|(_, t)| t).collect());
+    }
+    if numbered != uses.len() {
+        return Err(
+            "The string refers to arguments both through absolute argument numbers \
+                    and through unnumbered argument specifications."
+                .to_string(),
+        );
+    }
+    let max = uses.iter().filter_map(|(n, _)| *n).max().unwrap_or(0);
+    let mut types: Vec<Option<String>> = vec![None; max];
+    for (n, t) in uses {
+        let slot = &mut types[n.unwrap_or(1) - 1];
+        match slot {
+            Some(seen) if *seen != t => {
+                return Err(format!(
+                    "The string refers to argument number {} in incompatible ways.",
+                    n.unwrap_or(1)
+                ))
+            }
+            _ => *slot = Some(t),
+        }
+    }
+    types
+        .into_iter()
+        .enumerate()
+        .map(|(k, t)| {
+            t.ok_or_else(|| {
+                format!(
+                    "The string refers to argument number {max} but ignores argument number {}.",
+                    k + 1
+                )
+            })
+        })
+        .collect()
+}
+
+/// Read an `n$` argument number at `s[*i..]`, stepping past it; `None`, and
+/// `*i` left alone, when there is none. Argument numbers start at 1.
+fn argument_number(s: &[u8], i: &mut usize) -> Option<usize> {
+    let digits = s[*i..].iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || s.get(*i + digits) != Some(&b'$') {
+        return None;
+    }
+    let n: usize = std::str::from_utf8(&s[*i..*i + digits])
+        .ok()?
+        .parse()
+        .ok()?;
+    if n == 0 {
+        return None;
+    }
+    *i += digits + 1;
+    Some(n)
 }
 
 /// Map a printf conversion character to an argument-type class.
-fn conversion_class(c: char) -> char {
+fn conversion_class(c: u8) -> char {
     match c {
-        'd' | 'i' => 'i',
-        'o' | 'u' | 'x' | 'X' => 'u',
-        'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'a' | 'A' => 'f',
-        'c' => 'c',
-        's' => 's',
-        'p' => 'p',
-        'n' => 'n',
-        other => other,
+        b'd' | b'i' => 'i',
+        b'o' | b'u' | b'x' | b'X' => 'u',
+        b'e' | b'E' | b'f' | b'F' | b'g' | b'G' | b'a' | b'A' => 'f',
+        other => char::from(other),
     }
 }
 
-/// Print `-v` translation statistics to standard error.
+/// Print `-v` / `--statistics` translation statistics to standard error, in
+/// GNU msgfmt's wording.
 fn print_statistics(translated: usize, fuzzy: usize, untranslated: usize) {
-    let mut parts = vec![format!("{} translated messages", translated)];
+    let mut parts = vec![count_phrase(translated, "translated message")];
     if fuzzy > 0 {
-        parts.push(format!("{} fuzzy translations", fuzzy));
+        parts.push(count_phrase(fuzzy, "fuzzy translation"));
     }
     if untranslated > 0 {
-        parts.push(format!("{} untranslated messages", untranslated));
+        parts.push(count_phrase(untranslated, "untranslated message"));
     }
     eprintln!("{}.", parts.join(", "));
+}
+
+/// "1 fuzzy translation", "2 fuzzy translations".
+fn count_phrase(n: usize, noun: &str) -> String {
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{} {}{}", n, noun, plural)
 }
 
 /// Truncate a string for display, respecting character boundaries.

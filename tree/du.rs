@@ -197,7 +197,7 @@ fn du_impl(args: &Args, filename: &str, seen: &RefCell<HashSet<(u64, u64)>>) -> 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("du");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // default to current directory
     if args.files.is_empty() {

@@ -14,14 +14,13 @@
 
 use chrono::{DateTime, Utc};
 use gettextrs::gettext;
-use libc::{getpwuid, getuid, passwd};
+use libc::getuid;
 
 use std::{
     collections::HashSet,
-    env,
-    ffi::CStr,
-    fs,
+    env, fs,
     io::{self, ErrorKind, Read, Seek, Write},
+    os::unix::ffi::OsStrExt,
     os::unix::fs::OpenOptionsExt,
     os::unix::io::AsRawFd,
     path::{Path, PathBuf},
@@ -117,7 +116,14 @@ pub fn at(
         return Err(format!("{}: {}", gettext("Access denied for user"), user.name).into());
     }
 
-    let job = Job::new(&user, std::env::current_dir()?, std::env::vars(), cmd, mail).into_script();
+    let job = Job::new(
+        &user,
+        std::env::current_dir()?,
+        std::env::vars_os(),
+        cmd,
+        mail,
+    )
+    .into_script();
 
     // Create the job file restricted to the owner from the start, so there is no
     // window in which it is readable by others (the script embeds the user's
@@ -146,7 +152,7 @@ pub fn at(
         }
     }
 
-    file.write_all(job.as_bytes())?;
+    file.write_all(&job)?;
 
     // POSIX: the submission notice "job %s at %s\n" is written to standard error,
     // with the date as `date +"%a %b %e %T %Y"` adjusted to the user's timezone
@@ -168,7 +174,7 @@ pub struct Job {
     user_uid: u32,
     user_gid: u32,
     user_name: String,
-    env: std::env::Vars,
+    env: std::env::VarsOs,
     call_place: PathBuf,
     cmd: String,
     mail: bool,
@@ -183,7 +189,7 @@ impl Job {
             name,
         }: &User,
         call_place: PathBuf,
-        env: std::env::Vars,
+        env: std::env::VarsOs,
         cmd: impl Into<String>,
         mail: bool,
     ) -> Self {
@@ -199,7 +205,9 @@ impl Job {
         }
     }
 
-    pub fn into_script(self) -> String {
+    /// The job script, as bytes: an environment value or the working
+    /// directory need not be valid UTF-8.
+    pub fn into_script(self) -> Vec<u8> {
         let Self {
             shell,
             user_uid,
@@ -211,35 +219,63 @@ impl Job {
             mail,
         } = self;
 
-        // Environment values and the working directory are single-quoted so
-        // spaces and shell metacharacters survive intact (audit #A8).
-        let env = env
-            .into_iter()
-            .map(|(key, value)| format!("{}={}; export {}", key, sh_single_quote(&value), key))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        format!(
-            "#!{shell}\n# atrun uid={user_uid} gid={user_gid}\n# mail {user_name} {}\numask {:03o}\n{env}\ncd {} || {{\n\techo 'Execution directory inaccessible' >&2\n\texit 1 \n}}\n{cmd}",
+        let mut script = format!(
+            "#!{shell}\n# atrun uid={user_uid} gid={user_gid}\n# mail {user_name} {}\numask {:03o}\n",
             if mail { 1 } else { 0 },
             current_umask(),
-            sh_single_quote(&call_place.to_string_lossy())
         )
+        .into_bytes();
+
+        // Environment values and the working directory are single-quoted so
+        // spaces and shell metacharacters survive intact (audit #A8).  A name
+        // the shell cannot assign is left out: written out, it would be a
+        // command instead.
+        for (key, value) in env {
+            let key = key.as_bytes();
+            if !is_shell_name(key) {
+                continue;
+            }
+            script.extend_from_slice(key);
+            script.push(b'=');
+            script.extend_from_slice(&sh_single_quote(value.as_bytes()));
+            script.extend_from_slice(b"; export ");
+            script.extend_from_slice(key);
+            script.push(b'\n');
+        }
+
+        script.extend_from_slice(b"cd ");
+        script.extend_from_slice(&sh_single_quote(call_place.as_os_str().as_bytes()));
+        script.extend_from_slice(
+            b" || {\n\techo 'Execution directory inaccessible' >&2\n\texit 1 \n}\n",
+        );
+        script.extend_from_slice(cmd.as_bytes());
+        script
     }
 }
 
-/// Single-quote a string for safe inclusion in a POSIX shell script.
-fn sh_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
+/// Whether `name` is a shell variable name: a letter or underscore, then
+/// letters, digits and underscores (XBD 3.216).
+fn is_shell_name(name: &[u8]) -> bool {
+    match name.split_first() {
+        Some((&first, rest)) if first == b'_' || first.is_ascii_alphabetic() => {
+            rest.iter().all(|&c| c == b'_' || c.is_ascii_alphanumeric())
+        }
+        _ => false,
+    }
+}
+
+/// Single-quote bytes for safe inclusion in a POSIX shell script.
+fn sh_single_quote(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() + 2);
+    out.push(b'\'');
+    for &c in s {
+        if c == b'\'' {
+            out.extend_from_slice(b"'\\''");
         } else {
             out.push(c);
         }
     }
-    out.push('\'');
+    out.push(b'\'');
     out
 }
 
@@ -465,53 +501,28 @@ impl User {
     pub fn current() -> Option<Self> {
         const DEFAULT_SHELL: &str = "/bin/sh";
 
-        // SAFETY: getpwuid() is read-only; we copy every field we keep out of
-        // the returned struct before it can be invalidated by another call.
-        unsafe {
-            let passwd {
-                pw_uid,
-                pw_gid,
-                pw_name,
-                pw_shell,
-                ..
-            } = *resolve_passwd()?;
+        // SAFETY: getuid never fails.
+        let pw = plib::user::get_by_uid(unsafe { getuid() })?;
+        let name = pw.name.into_string().ok()?;
 
-            let name = CStr::from_ptr(pw_name).to_str().ok()?.to_owned();
+        // #B6: POSIX (batch.md 86991-86994) makes `SHELL` authoritative for
+        // the command interpreter that runs an at-job, and mandates that
+        // when it is "unset or null, sh shall be used". Consulting the
+        // passwd shell first inverted that -- and left the unset case
+        // running the login shell rather than sh, which the spec does not
+        // permit. The passwd entry is no longer consulted for job
+        // execution; only `$SHELL`, then `sh`.
+        let shell = match std::env::var("SHELL") {
+            Ok(v) if !v.is_empty() => v,
+            _ => DEFAULT_SHELL.to_owned(),
+        };
 
-            // #B6: POSIX (batch.md 86991-86994) makes `SHELL` authoritative for
-            // the command interpreter that runs an at-job, and mandates that
-            // when it is "unset or null, sh shall be used". Consulting the
-            // passwd shell first inverted that -- and left the unset case
-            // running the login shell rather than sh, which the spec does not
-            // permit. The passwd entry is no longer consulted for job
-            // execution; only `$SHELL`, then `sh`.
-            let _ = pw_shell;
-            let shell = match std::env::var("SHELL") {
-                Ok(v) if !v.is_empty() => v,
-                _ => DEFAULT_SHELL.to_owned(),
-            };
-
-            Some(Self {
-                shell,
-                uid: pw_uid,
-                gid: pw_gid,
-                name,
-            })
-        }
-    }
-}
-
-/// `getpwuid(getuid())`, returning the raw passwd pointer or `None`.
-///
-/// # Safety
-/// The returned pointer aliases libc's static passwd buffer and must be copied
-/// from before the next passwd lookup.
-unsafe fn resolve_passwd() -> Option<*const passwd> {
-    let pw_ptr = getpwuid(getuid());
-    if pw_ptr.is_null() {
-        None
-    } else {
-        Some(pw_ptr)
+        Some(Self {
+            shell,
+            uid: pw.uid,
+            gid: pw.gid,
+            name,
+        })
     }
 }
 
@@ -565,20 +576,35 @@ mod tests {
 
     #[test]
     fn sh_quote_wraps_plain_and_spaces() {
-        assert_eq!(sh_single_quote("abc"), "'abc'");
-        assert_eq!(sh_single_quote("a b c"), "'a b c'");
+        assert_eq!(sh_single_quote(b"abc"), b"'abc'");
+        assert_eq!(sh_single_quote(b"a b c"), b"'a b c'");
     }
 
     #[test]
     fn sh_quote_neutralizes_metacharacters() {
         // Shell metacharacters are inert inside single quotes.
-        assert_eq!(sh_single_quote("rm -rf /; echo x"), "'rm -rf /; echo x'");
-        assert_eq!(sh_single_quote("$(id)`id`"), "'$(id)`id`'");
+        assert_eq!(sh_single_quote(b"rm -rf /; echo x"), b"'rm -rf /; echo x'");
+        assert_eq!(sh_single_quote(b"$(id)`id`"), b"'$(id)`id`'");
     }
 
     #[test]
     fn sh_quote_escapes_embedded_single_quote() {
-        assert_eq!(sh_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(sh_single_quote(b"a'b"), b"'a'\\''b'");
+    }
+
+    #[test]
+    fn sh_quote_keeps_non_utf8_bytes() {
+        assert_eq!(sh_single_quote(b"a\xa0b"), b"'a\xa0b'");
+    }
+
+    #[test]
+    fn shell_names() {
+        use super::is_shell_name;
+        assert!(is_shell_name(b"_a1"));
+        assert!(!is_shell_name(b"1a"));
+        assert!(!is_shell_name(b""));
+        assert!(!is_shell_name(b"a-b"));
+        assert!(!is_shell_name(b"a\xff"));
     }
 
     #[test]

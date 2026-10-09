@@ -108,7 +108,7 @@ fn report_parse_error(e: &ParseError) -> bool {
 fn run() {
     diag::init_locale("bc");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut interpreter = Interpreter::default();
     let mut had_error = false;

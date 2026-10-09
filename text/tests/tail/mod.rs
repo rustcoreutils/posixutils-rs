@@ -437,3 +437,65 @@ fn test_tail_historical_number_invalid_is_an_error() {
         assert_ne!(code, 0, "{bad}: must fail");
     }
 }
+
+/// Run tail in `dir` with `args` and no input, as GNU names its operand.
+fn tail_in(dir: &std::path::Path, args: &[&str]) -> (String, String, Option<i32>) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tail"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run tail");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// -v (GNU) writes the `==> NAME <==` header even for a single file.
+// debhelper runs `tail -v -n +0 config.log`.
+#[test]
+fn test_tail_verbose_header() {
+    let dir = plib::tmp::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.log"), "a\nb\n").unwrap();
+    std::fs::write(dir.path().join("partial"), "x\ny").unwrap();
+
+    let ok = |out: &str| (out.to_string(), String::new(), Some(0));
+    assert_eq!(
+        tail_in(dir.path(), &["-v", "-n", "+0", "config.log"]),
+        ok("==> config.log <==\na\nb\n")
+    );
+    assert_eq!(
+        tail_in(dir.path(), &["--verbose", "-n1", "config.log"]),
+        ok("==> config.log <==\nb\n")
+    );
+    assert_eq!(
+        tail_in(dir.path(), &["-v", "-c1", "partial"]),
+        ok("==> partial <==\ny")
+    );
+    assert_eq!(
+        tail_in(dir.path(), &["-v", "-r", "config.log"]),
+        ok("==> config.log <==\nb\na\n")
+    );
+
+    // An operand that cannot be opened gets no header.
+    let (out, err, code) = tail_in(dir.path(), &["-v", "nosuch"]);
+    assert_eq!(out, "");
+    assert!(err.starts_with("tail: nosuch: "), "got {err:?}");
+    assert_eq!(code, Some(1));
+}
+
+#[test]
+fn test_tail_verbose_header_names_standard_input() {
+    tail_test(&["-v", "-n1"], "a\nb\n", "==> standard input <==\nb\n");
+    tail_test(&["-v", "-"], "a\n", "==> standard input <==\na\n");
+}
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in the line buffer until exit, where the error was lost.
+#[test]
+fn test_tail_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("tail", &[], b"x", 1);
+    plib::testing::assert_write_error_on_full_device("tail", &["-c", "1"], b"x\ny", 1);
+}

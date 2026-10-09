@@ -346,7 +346,9 @@ fn show_utmpx_summary(file: Option<&PathBuf>) -> Result<(), Box<dyn std::error::
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("who");
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `args_os`: `args` panics on an argument that is not valid UTF-8, and
+    // the FILE operand is a pathname.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let am_i = args.len() == 2 && args[0] == "am" && (args[1] == "i" || args[1] == "I");
 
     // parse command line arguments; if "who am i", use special args
@@ -354,7 +356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if am_i {
             Args::parse_from(["who", "-m"])
         } else {
-            Args::parse()
+            plib::optarg::parse::<Args>()
         }
     };
     if args.all {

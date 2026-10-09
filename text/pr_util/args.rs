@@ -14,6 +14,7 @@ use crate::{
 use clap::Parser;
 use gettextrs::gettext;
 use regex::Regex;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -37,11 +38,11 @@ fn short_optional_value(c: char) -> bool {
 #[derive(Parser)]
 #[command(version, about = gettext("pr - print files"), disable_help_flag = true)]
 pub struct Args {
-    #[arg(long, value_parser = parse_pages, value_name = "FIRST_PAGE[:LAST_PAGE]",
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_pages, value_name = "FIRST_PAGE[:LAST_PAGE]",
           help = gettext("Begin output at page number FIRST_PAGE, stop at LAST_PAGE if present"))]
     pages: Option<(usize, Option<usize>)>,
 
-    #[arg(long, group = "multi_column", conflicts_with = "merge",
+    #[arg(long, allow_hyphen_values = true, group = "multi_column", conflicts_with = "merge",
           help = gettext("Produce multi-column output arranged in COLUMN columns"))]
     columns: Option<usize>,
 
@@ -62,7 +63,7 @@ pub struct Args {
     #[arg(short = 'F', long, help = gettext("Use form-feed for new pages"))]
     form_feed: bool,
 
-    #[arg(short = 'h', long, value_name = "HEADER",
+    #[arg(short = 'h', long, allow_hyphen_values = true, value_name = "HEADER",
           help = gettext("Use string HEADER to replace the file name in page header"))]
     header: Option<String>,
 
@@ -70,7 +71,7 @@ pub struct Args {
           help = gettext("Replace spaces with tabs in output"))]
     output_tabs: Option<OutputTabsArg>,
 
-    #[arg(short = 'l', long, value_name = "PAGE_LENGTH",
+    #[arg(short = 'l', long, allow_hyphen_values = true, value_name = "PAGE_LENGTH",
           help = gettext("Override the 66-line default page length"))]
     length: Option<usize>,
 
@@ -82,11 +83,11 @@ pub struct Args {
           help = gettext("Provide line numbering with specified width and separator"))]
     number_lines: Option<NumberLinesArg>,
 
-    #[arg(short = 'N', long, default_value_t = 1, value_name = "NUMBER",
+    #[arg(short = 'N', long, allow_hyphen_values = true, default_value_t = 1, value_name = "NUMBER",
           help = gettext("Start line counting with NUMBER at first line of first page"))]
     first_line_number: usize,
 
-    #[arg(short = 'o', long, default_value_t = 0, value_name = "MARGIN",
+    #[arg(short = 'o', long, allow_hyphen_values = true, default_value_t = 0, value_name = "MARGIN",
           help = gettext("Precede each line with MARGIN space characters"))]
     indent: usize,
 
@@ -105,7 +106,7 @@ pub struct Args {
     #[arg(short = 't', long, help = gettext("Omit header and trailer, quit after last line"))]
     omit_header: bool,
 
-    #[arg(short = 'w', long, value_name = "PAGE_WIDTH", requires = "multi_column",
+    #[arg(short = 'w', long, allow_hyphen_values = true, value_name = "PAGE_WIDTH", requires = "multi_column",
           help = gettext("Set line width to PAGE_WIDTH for multi-column output"))]
     width: Option<usize>,
 
@@ -131,23 +132,71 @@ impl Args {
     }
 
     pub fn parse_custom() -> Self {
-        let env_args: Vec<String> = std::env::args().collect();
-        let mut out: Vec<String> = Vec::with_capacity(env_args.len());
-        let mut iter = env_args.into_iter();
+        // `args_os`, not `args`, which panics on an argument that is not
+        // valid UTF-8: a file operand is a pathname.
+        let mut iter = std::env::args_os();
+        let mut out: Vec<OsString> = Vec::with_capacity(iter.len());
 
         // Preserve program name (argv[0]) untouched.
         if let Some(prog) = iter.next() {
             out.push(prog);
         }
+        let mut verbatim = false;
+        let mut end_of_options = false;
         for arg in iter {
-            preprocess_arg(&arg, &mut out);
+            // A word that is not valid UTF-8 is no option; clap takes it as
+            // an operand, or refuses it as an option-argument.
+            let text = match arg.to_str() {
+                Some(text) if !verbatim && !end_of_options => text,
+                _ => {
+                    // An option-argument, or an operand after `--`, is passed
+                    // as given even when it begins with '-' or '+' (XBD 12.2,
+                    // Guideline 7): `-h -3` is the header "-3", not three
+                    // columns.
+                    out.push(arg);
+                    verbatim = false;
+                    continue;
+                }
+            };
+            if text == "--" {
+                end_of_options = true;
+                out.push(arg);
+                continue;
+            }
+            let mut words = Vec::new();
+            preprocess_arg(text, &mut words);
+            verbatim = words.last().is_some_and(|last| awaits_value(last));
+            out.extend(words.into_iter().map(OsString::from));
         }
 
-        let mut args = Args::parse_from(out);
+        let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(out));
         args.add_stdin_if_no_files();
 
         args
     }
+}
+
+/// Whether a rewritten word is an option whose value is the next argv
+/// element: a short cluster that ends in a required-value letter, or a
+/// value-taking long option written without `=`.
+fn awaits_value(word: &str) -> bool {
+    if let Some(long) = word.strip_prefix("--") {
+        return matches!(
+            long,
+            "pages" | "columns" | "header" | "length" | "first-line-number" | "indent" | "width"
+        );
+    }
+    let Some(cluster) = word.strip_prefix('-') else {
+        return false;
+    };
+    let chars: Vec<char> = cluster.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if short_no_value(c) {
+            continue;
+        }
+        return short_required_value(c) && i == chars.len() - 1;
+    }
+    false
 }
 
 /// Preprocess a single argv element and push 0+ rewritten elements into `out`.
@@ -156,7 +205,7 @@ impl Args {
 /// * `+PAGES`           -> `--pages=PAGES`
 /// * `-COLUMN[REST]`    -> `--columns=COLUMN` [+ `-REST` cluster]
 /// * `-CLUSTER`         -> peel optional-value (e/i/n/s) at trailing position
-///   and append `=<tab>` so clap accepts it.
+///   and append a <tab> as its value so clap accepts it.
 ///
 /// Per POSIX, the value of `-e`, `-i`, `-n`, `-s` must be IMMEDIATELY attached
 /// (no whitespace). When the letter is the last char of a cluster with no value
@@ -215,7 +264,7 @@ fn preprocess_arg(arg: &str, out: &mut Vec<String>) {
 ///     its value (or pulls from the next argv element); we leave the cluster
 ///     untouched so clap handles it natively.
 ///   * The first `optional_value` char either takes the remaining chars as its
-///     value, or — if it is the final char with nothing after — gets `=\t`
+///     value, or — if it is the final char with nothing after — gets a <tab>
 ///     appended so clap accepts the option without requiring a separate arg.
 fn preprocess_short_cluster(cluster: &str, out: &mut Vec<String>) {
     let chars: Vec<char> = cluster.chars().collect();
@@ -229,7 +278,7 @@ fn preprocess_short_cluster(cluster: &str, out: &mut Vec<String>) {
         }
         if short_optional_value(c) {
             if i == chars.len() - 1 {
-                out.push(format!("-{}=\t", cluster));
+                out.push(format!("-{}\t", cluster));
             } else {
                 out.push(format!("-{}", cluster));
             }
@@ -513,21 +562,21 @@ mod tests {
 
     #[test]
     fn column_with_cluster_suffix() {
-        // -4ats -> --columns=4 + -ats=<tab>
+        // -4ats -> --columns=4 + -ats<tab>
         assert_eq!(
             run("-4ats"),
-            vec!["--columns=4".to_string(), "-ats=\t".to_string()]
+            vec!["--columns=4".to_string(), "-ats\t".to_string()]
         );
     }
 
     #[test]
     fn cluster_with_optional_arg_at_end_default_tab() {
-        // -ats -> -ats=<tab>
-        assert_eq!(run("-ats"), vec!["-ats=\t".to_string()]);
-        assert_eq!(run("-s"), vec!["-s=\t".to_string()]);
-        assert_eq!(run("-e"), vec!["-e=\t".to_string()]);
-        assert_eq!(run("-i"), vec!["-i=\t".to_string()]);
-        assert_eq!(run("-n"), vec!["-n=\t".to_string()]);
+        // -ats -> -ats<tab>
+        assert_eq!(run("-ats"), vec!["-ats\t".to_string()]);
+        assert_eq!(run("-s"), vec!["-s\t".to_string()]);
+        assert_eq!(run("-e"), vec!["-e\t".to_string()]);
+        assert_eq!(run("-i"), vec!["-i\t".to_string()]);
+        assert_eq!(run("-n"), vec!["-n\t".to_string()]);
     }
 
     #[test]
@@ -580,7 +629,7 @@ mod tests {
         // direct entry into the cluster helper (no leading '-')
         let mut out = Vec::new();
         preprocess_short_cluster("ats", &mut out);
-        assert_eq!(out, vec!["-ats=\t".to_string()]);
+        assert_eq!(out, vec!["-ats\t".to_string()]);
 
         let mut out = Vec::new();
         preprocess_short_cluster("ats,", &mut out);

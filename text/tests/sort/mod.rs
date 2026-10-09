@@ -704,3 +704,142 @@ fn test_dash_non_sole_operand() {
     // non-sole "-" was opened as a file named "-" and failed.
     sort_test(&["-", "-"], "b\na\n", "a\nb\n", 0, "");
 }
+
+/// A line ends at its newline only: a carriage return before it is part of the
+/// line, and is written back out.
+#[test]
+fn test_carriage_return_is_part_of_the_line() {
+    sort_test(&[], "b\na\r\nc\r", "a\r\nb\nc\r\n", 0, "");
+}
+
+/// GNU -z / --zero-terminated: lines end with NUL on input and output, and a
+/// newline is an ordinary character -- a blank, as GNU counts it, in fields.
+/// binutils runs `find ... -print0 | LC_ALL=C sort -z | tar --null -T -`.
+#[test]
+fn test_zero_terminated() {
+    let input = "b\nx\0a\ny\0c z\0";
+    for opt in ["-z", "--zero-terminated"] {
+        sort_test(&[opt], input, "a\ny\0b\nx\0c z\0", 0, "");
+    }
+    sort_test(&["-z", "-r"], input, "c z\0b\nx\0a\ny\0", 0, "");
+    sort_test(&["-z", "-k2"], input, "b\nx\0a\ny\0c z\0", 0, "");
+    sort_test(&["-z", "-k2n"], "x\n2\0y\n1\0", "y\n1\0x\n2\0", 0, "");
+    sort_test(
+        &["-z", "-t:", "-k1,1"],
+        "b:1\0a\nb:2\0",
+        "a\nb:2\0b:1\0",
+        0,
+        "",
+    );
+    sort_test(&["-zu"], "a\0a\0b\0", "a\0b\0", 0, "");
+    // A last line without its terminator gets one, as without -z.
+    sort_test(&["-z"], "b\0a", "a\0b\0", 0, "");
+    // Newlines alone separate nothing.
+    sort_test(&["-z"], "b\na\n", "b\na\n\0", 0, "");
+}
+
+/// -z with -m, -c and -C: the disorder diagnostic ends with the line's NUL, as
+/// GNU writes it.
+#[test]
+fn test_zero_terminated_merge_and_check() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let (z2, z3) = (tmp.path().join("z2"), tmp.path().join("z3"));
+    std::fs::write(&z2, "a\0c\0e").unwrap();
+    std::fs::write(&z3, "b\0d\0").unwrap();
+    let (z2, z3) = (z2.to_str().unwrap(), z3.to_str().unwrap());
+    sort_test(&["-zm", z2, z3], "", "a\0b\0c\0d\0e\0", 0, "");
+
+    sort_test(&["-zc"], "a\0b\0", "", 0, "");
+    sort_test(&["-zc"], "b\0a\0", "", 1, "sort: -:2: disorder: a\0");
+    sort_test(&["-zC"], "b\0a\0", "", 1, "");
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-o", "-t", "-k"] {
+        plib::testing::assert_hyphen_option_argument("sort", &[opt, "-zq", "--help"]);
+    }
+}
+
+// XBD 12.1: `-t=` is the field separator "=", not `-t` with an empty one.
+#[test]
+fn attached_option_argument_may_begin_with_equals() {
+    sort_test(&["-t=", "-k2"], "b=1\na=2\n", "b=1\na=2\n", 0, "");
+    plib::testing::assert_equals_option_argument("sort", "-t", &["-k2"], b"b=1\na=2\n");
+}
+
+/// `--check` is GNU's long spelling of POSIX -c.
+#[test]
+fn test_check_long_option() {
+    sort_test(&["--check"], "a\nb\n", "", 0, "");
+    sort_test(&["--check"], "b\na\n", "", 1, "sort: -:2: disorder: a\n");
+    sort_test(&["--check", "-r"], "b\na\n", "", 0, "");
+}
+
+/// GNU -V / --version-sort orders as coreutils' filevercmp: digit runs by
+/// value, `~` before everything (even the end), letters before other bytes,
+/// trailing file suffixes compared last, and `.`, `..` and hidden names first.
+/// The expected orders are GNU sort 9.4's.
+#[test]
+fn test_version_sort() {
+    let input = "1.2.10\n1.2.9\n1.0\n1.0~rc1\n1.2.09\n\na-1.10.tar.gz\n\
+                 a-1.2.tar.gz\n.bashrc\n..\n.\n1.0a\n1.0.a\n~\nfoo.10.c\nfoo.2.c\n";
+    let expected = "\n.\n..\n.bashrc\n~\n1.0~rc1\n1.0\n1.0.a\n1.0a\n1.2.09\n1.2.9\n\
+                    1.2.10\na-1.2.tar.gz\na-1.10.tar.gz\nfoo.2.c\nfoo.10.c\n";
+    for opt in ["-V", "--version-sort"] {
+        sort_test(&[opt], input, expected, 0, "");
+    }
+    // util-linux's tools/poman-translate.sh.
+    sort_test(&["--check", "--version-sort"], "0.72 0.73\n", "", 0, "");
+}
+
+/// -V as a key modifier and with -r, -u and -c.
+#[test]
+fn test_version_sort_keys() {
+    let input = "x 1.10\ny 1.9\nz 1.010\nw 1.9\n";
+    sort_test(&["-V"], input, "w 1.9\nx 1.10\ny 1.9\nz 1.010\n", 0, "");
+    sort_test(&["-Vr"], input, "z 1.010\ny 1.9\nx 1.10\nw 1.9\n", 0, "");
+    sort_test(&["-Vu"], input, "w 1.9\nx 1.10\ny 1.9\nz 1.010\n", 0, "");
+    sort_test(&["-k1V"], input, "w 1.9\nx 1.10\ny 1.9\nz 1.010\n", 0, "");
+    // 1.10 and 1.010 tie as versions; the whole line breaks the tie.
+    sort_test(&["-k2,2V"], input, "w 1.9\ny 1.9\nx 1.10\nz 1.010\n", 0, "");
+    sort_test(&["-k2,2V", "-u"], input, "y 1.9\nx 1.10\n", 0, "");
+
+    sort_test(&["-cV"], "1.9\n1.10\n", "", 0, "");
+    sort_test(&["-cV"], "1.10\n1.9\n", "", 1, "sort: -:2: disorder: 1.9\n");
+    sort_test(
+        &["-cuV"],
+        "1.9\n1.09\n",
+        "",
+        1,
+        "sort: -:2: disorder: 1.09\n",
+    );
+    sort_test(&["-crV"], "1.10\n1.9\n", "", 0, "");
+    sort_test(&["-CV"], "1.10\n1.9\n", "", 1, "");
+
+    sort_test(
+        &["-nV"],
+        "1\n",
+        "",
+        2,
+        "sort: options '-nV' are incompatible\n",
+    );
+    sort_test(
+        &["-k1Vn"],
+        "1\n",
+        "",
+        2,
+        "sort: options '-nV' are incompatible\n",
+    );
+}
+
+/// clap's -V version flag is gone, so -V sorts; --version still reports.
+#[test]
+fn test_version_flag_is_long_only() {
+    sort_test(&["-V"], "b\na\n", "a\nb\n", 0, "");
+    let out = plib::testing::run_test_base("sort", &["--version".to_string()], b"");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("posixutils-text "));
+}

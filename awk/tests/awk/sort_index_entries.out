@@ -1,0 +1,10 @@
+bad entry: \entry{}{1}{empty key}
+\initial {M}
+\entry{\var {Mango}}{7}
+\initial {A}
+\entry{apple {pie}}{3}
+\entry{\code {avocado}}{9}
+\initial {B}
+\entry{banana}{5}
+\initial {Z}
+\entry{\code {zebra}}{12}

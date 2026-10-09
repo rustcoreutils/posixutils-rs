@@ -26,7 +26,7 @@ use std::process::exit;
     disable_version_flag = true
 )]
 struct Args {
-    #[arg(short = 'd', long = "domain", help = gettext("Use TEXTDOMAIN as the text domain for translating MSGID"))]
+    #[arg(short = 'd', long = "domain", allow_hyphen_values = true, help = gettext("Use TEXTDOMAIN as the text domain for translating MSGID"))]
     domain: Option<String>,
 
     #[arg(short = 'e', help = gettext("Process C-language escape sequences in MSGID"))]
@@ -54,11 +54,12 @@ struct Args {
 fn main() {
     plib::diag::init_locale("gettext");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Handle shell mode (-s)
     if args.shell_mode {
         shell_mode(&args);
+        flush_stdout_or_exit();
         return;
     }
 
@@ -96,6 +97,15 @@ fn main() {
 
     // The non-`-s` form does not append a trailing newline.
     print!("{}", output);
+    flush_stdout_or_exit();
+}
+
+/// Output without a final <newline> is still in stdout's line buffer, and the
+/// flush at exit would discard its write error.
+fn flush_stdout_or_exit() {
+    if !plib::diag::flush_stdout() {
+        exit(1);
+    }
 }
 
 /// Resolve the text domain, in decreasing precedence: the operand `textdomain`,

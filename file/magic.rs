@@ -510,6 +510,30 @@ impl RawMagicFileLine {
     }
 }
 
+/// `bytes` from a file as text that is safe to write to a terminal: printable
+/// characters as they are, and each byte of a control character (C0, DEL,
+/// C1) or of an invalid UTF-8 sequence as `\ooo`, the way libmagic shows them.
+pub fn printable(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let escape = |out: &mut String, byte: u8| out.push_str(&format!("\\{byte:03o}"));
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c.is_control() {
+                let mut buf = [0u8; 4];
+                for &byte in c.encode_utf8(&mut buf).as_bytes() {
+                    escape(&mut out, byte);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        for &byte in chunk.invalid() {
+            escape(&mut out, byte);
+        }
+    }
+    out
+}
+
 /// Format a magic message that may contain a single printf conversion, using
 /// the numeric value read from the file as the argument. Only the conversions
 /// that appear in practical magic files are supported (`%d`/`%i`/`%u`,
@@ -537,7 +561,7 @@ fn format_message_num(fmt: &str, value: u64) -> String {
                     'x' => out.push_str(&format!("{value:x}")),
                     'X' => out.push_str(&format!("{value:X}")),
                     'o' => out.push_str(&format!("{value:o}")),
-                    'c' => out.push((value as u8) as char),
+                    'c' => out.push_str(&printable(&[value as u8])),
                     _ => unreachable!(),
                 }
             }
@@ -565,7 +589,7 @@ fn format_message_str(fmt: &str, value: &[u8]) -> String {
             Some('s') if !used => {
                 chars.next();
                 used = true;
-                out.push_str(&String::from_utf8_lossy(value));
+                out.push_str(&printable(value));
             }
             _ => out.push('%'),
         }

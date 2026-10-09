@@ -537,3 +537,52 @@ fn test_pr_merge_error_names_the_file() {
     );
     assert_ne!(out.status.code(), Some(0));
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["--pages", "--columns", "-h", "-l", "-N", "-o", "-w"] {
+        plib::testing::assert_hyphen_option_argument("pr", &[opt, "-zq", "--help"]);
+    }
+}
+
+// The word after `-h` is the header even when it looks like `-COLUMN`: the
+// argv rewrite used to turn `-h -3` into a header of `--columns=3`.
+#[test]
+fn header_begins_with_hyphen_digit() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("pr"),
+            args: vec![String::from("-h"), String::from("-3")],
+            stdin_data: String::from("a\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains(" -3 Page 1"), "got {stdout:?}");
+            assert_eq!(output.status.code(), Some(0));
+        },
+    );
+}
+
+// A file operand is a pathname and need not be valid UTF-8; reading the
+// command line made pr panic on one.
+#[cfg(unix)]
+#[test]
+fn pr_non_utf8_file_operand() {
+    use plib::testing::{create_non_utf8, get_binary_path};
+    let dir = plib::tmp::tempdir().unwrap();
+    let Some(file) = create_non_utf8(dir.path(), b"in\xff", |p| fs::write(p, b"hello\n")) else {
+        return;
+    };
+    let output = std::process::Command::new(get_binary_path("pr"))
+        .arg("-t")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+}

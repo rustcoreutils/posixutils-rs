@@ -8,7 +8,6 @@
 //
 
 use std::collections::BTreeMap;
-use std::ffi::CStr;
 use std::fs::{metadata, Metadata};
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
@@ -1550,18 +1549,10 @@ fn print_matches(name: &mut Names, user: bool) -> Result<(), io::Error> {
 
         eprint!("{}", access);
         if user {
-            let owner_str: String = unsafe {
-                let pw_entry = libc::getpwuid(uid);
-                if pw_entry.is_null() {
-                    // POSIX: if user name cannot be resolved, print the real user ID
-                    uid.to_string()
-                } else {
-                    CStr::from_ptr((*pw_entry).pw_name)
-                        .to_str()
-                        .unwrap_or(&uid.to_string())
-                        .to_string()
-                }
-            };
+            // POSIX: if user name cannot be resolved, print the real user ID
+            let owner_str = plib::user::get_by_uid(uid)
+                .and_then(|u| u.name.into_string().ok())
+                .unwrap_or_else(|| uid.to_string());
             eprint!("({})", owner_str);
         }
         io::stderr().flush()?;
@@ -1647,7 +1638,7 @@ fn fuser_main() -> Result<(), Box<dyn std::error::Error>> {
         named_files,
         user,
         file,
-    } = Args::try_parse().unwrap_or_else(|err| match err.kind() {
+    } = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| match err.kind() {
         // `--help` and `--version` are a successful request for information,
         // not an error: clap writes the text itself and the status is 0.
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {

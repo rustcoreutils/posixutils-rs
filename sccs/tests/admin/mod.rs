@@ -690,3 +690,9 @@ fn admin_r_keeps_an_explicit_level() {
     let out = super::common::run_in("prs", &["-d:I:", "-r", &sfile_s], tmp.path(), "");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3.4");
 }
+
+// An argument that is not valid UTF-8 is reported, not a panic.
+#[test]
+fn admin_non_utf8_argument_is_reported() {
+    plib::testing::assert_non_utf8_argument_rejected("admin", &[]);
+}

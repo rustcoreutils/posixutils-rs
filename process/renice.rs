@@ -7,12 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::ffi::CString;
 use std::process;
 
 use clap::Parser;
 use gettextrs::gettext;
-use libc::{getpwnam, passwd};
 use plib::diag;
 use plib::priority::{getpriority, setpriority};
 
@@ -69,18 +67,7 @@ struct Args {
 }
 
 fn lookup_uid(username: &str) -> Result<u32, ()> {
-    let c_username = match CString::new(username) {
-        Ok(s) => s,
-        Err(_) => return Err(()),
-    };
-    let passwd = unsafe { getpwnam(c_username.as_ptr()) };
-
-    if passwd.is_null() {
-        return Err(());
-    }
-
-    let passwd: &passwd = unsafe { &*passwd };
-    Ok(passwd.pw_uid)
+    plib::user::get_by_name(username).map(|u| u.uid).ok_or(())
 }
 
 /// Resolve an operand to a numeric id for the given priority class. For the
@@ -108,7 +95,7 @@ fn parse_id(which: u32, input: &str) -> Result<u32, ()> {
 fn main() {
     diag::init_locale("renice");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // which class of priority to modify
     // Cast to u32 for cross-platform compatibility (i32 on macOS, u32 on Linux)

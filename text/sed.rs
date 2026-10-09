@@ -7,17 +7,19 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 use plib::locale::next_char_offset;
+use plib::optarg::OptionArguments;
 use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
-    fs::File,
-    io::{BufRead, BufReader, Error, ErrorKind, Write},
+    fs::{File, Metadata, OpenOptions},
+    io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Write},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -27,68 +29,110 @@ static ERE: Mutex<bool> = Mutex::new(false);
 #[derive(Parser, Debug, Clone)]
 #[command(version, about = gettext("sed - stream editor"))]
 struct Args {
-    #[arg(short = 'E', help=gettext("Match using extended regular expressions."))]
+    #[arg(short = 'E', short_alias = 'r', long = "regexp-extended", help=gettext("Match using extended regular expressions (-r and --regexp-extended are GNU synonyms)."))]
     ere: bool,
+
+    // GNU extension. The short form's suffix is only ever attached (`-i.bak`),
+    // and `spell_optional_argument` turns it into the long form before clap sees it.
+    #[arg(short = 'i', long = "in-place", value_name = "SUFFIX", num_args = 0..=1, require_equals = true, default_missing_value = "", help=gettext("Edit each file in place, keeping the original under its name plus SUFFIX if one is given (GNU extension)."))]
+    in_place: Option<String>,
+
+    #[arg(short = 's', long = "separate", help=gettext("Read each file as a stream of its own, with its own line numbers and last line (GNU extension)."))]
+    separate: bool,
 
     #[arg(short = 'n', help=gettext("Suppress the default output. Only lines explicitly selected for output are written."))]
     quiet: bool,
 
-    #[arg(short = 'e', help=gettext("Add the editing commands specified by the script option-argument to the end of the script of editing commands."))]
+    #[arg(short = 'e', allow_hyphen_values = true, help=gettext("Add the editing commands specified by the script option-argument to the end of the script of editing commands."))]
     script: Vec<String>,
 
-    #[arg(short = 'f', name = "SCRIPT_FILE", help=gettext("Add the editing commands in the file script_file to the end of the script of editing commands."))]
+    #[arg(short = 'f', allow_hyphen_values = true, name = "SCRIPT_FILE", help=gettext("Add the editing commands in the file script_file to the end of the script of editing commands."))]
     script_file: Vec<PathBuf>,
 
     #[arg(help=gettext("A pathname of a file whose contents are read and edited."))]
     file: Vec<String>,
+
+    /// The `-e` scripts and `-f` script files, in command-line order.
+    #[arg(skip)]
+    sources: Vec<ScriptSource>,
+}
+
+/// One piece of the script: the text of a `-e`, or the file of a `-f`.
+#[derive(Debug, Clone)]
+enum ScriptSource {
+    Text(String),
+    File(PathBuf),
 }
 
 impl Args {
-    // Get ordered script sources from [-e script] and [-f script_file] manually.
-    fn get_raw_script() -> Result<String, SedError> {
+    /// Parse the command line, recording the `-e` and `-f` option-arguments
+    /// in the order they were given, which is the order of the script.
+    ///
+    /// The order comes from clap's own indices, so every spelling clap
+    /// accepts counts: `-ne p`, `-es/a/b/`, `-fFILE`; and a word "-e" after
+    /// `--` is the file operand it is.
+    fn parse_ordered() -> Args {
+        let argv = plib::optarg::spell_optional_argument(
+            std::env::args_os().collect(),
+            'i',
+            "in-place",
+            &OptionArguments::of(Args::command()),
+        );
+        let matches =
+            Args::command().get_matches_from(plib::optarg::keep_leading_equals::<Args>(argv));
+        let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+
+        let mut sources: Vec<(usize, ScriptSource)> = Vec::new();
+        if let (Some(texts), Some(indices)) = (
+            matches.get_many::<String>("script"),
+            matches.indices_of("script"),
+        ) {
+            sources.extend(indices.zip(texts.map(|t| ScriptSource::Text(t.clone()))));
+        }
+        if let (Some(files), Some(indices)) = (
+            matches.get_many::<PathBuf>("SCRIPT_FILE"),
+            matches.indices_of("SCRIPT_FILE"),
+        ) {
+            sources.extend(indices.zip(files.map(|f| ScriptSource::File(f.clone()))));
+        }
+        sources.sort_by_key(|(index, _)| *index);
+        args.sources = sources.into_iter().map(|(_, source)| source).collect();
+        args
+    }
+
+    /// The text of every `-e` script and `-f` script file, in order.
+    fn get_raw_script(sources: &[ScriptSource]) -> Result<String, SedError> {
         let mut raw_scripts: Vec<String> = vec![];
 
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let mut args_iter = args.iter();
-
-        while let Some(arg) = args_iter.next() {
-            match arg.as_str() {
-                "-e" => {
-                    // Can unwrap because `-e` is already validated by `clap`.
-                    let e_script = args_iter.next().unwrap();
+        for source in sources {
+            match source {
+                ScriptSource::Text(e_script) => {
                     for raw_script_line in e_script.split('\n') {
                         raw_scripts.push(raw_script_line.to_string());
                     }
-                    if let Some(script) = raw_scripts.last_mut() {
-                        *script += "\n;";
-                    }
                 }
-                "-f" => {
-                    // Can unwrap because `-f` is already validated by `clap`.
-                    let script_file =
-                        File::open(args_iter.next().unwrap()).map_err(SedError::Io)?;
+                ScriptSource::File(path) => {
+                    let script_file = File::open(path).map_err(SedError::Io)?;
                     let reader = BufReader::new(script_file);
                     for line in reader.lines() {
                         let raw_script = line.map_err(SedError::Io)?;
                         raw_scripts.push(raw_script);
                     }
-                    if let Some(script) = raw_scripts.last_mut() {
-                        *script += "\n;";
-                    }
                 }
-                _ => continue,
             }
         }
 
+        // POSIX: the scripts are joined by <newline>s, so a text or a
+        // continuation begun in one `-e` may run on into the next.
         Ok(raw_scripts.join("\n"))
     }
 
     /// Creates [`Sed`] from [`Args`], if [`Script`]
     /// parsing is failed, then returns error
     fn try_to_sed(mut self: Args) -> Result<Sed, SedError> {
-        let mut raw_script = Self::get_raw_script()?;
+        let mut raw_script = Self::get_raw_script(&self.sources)?;
 
-        if raw_script.is_empty() {
+        if self.sources.is_empty() {
             if self.file.is_empty() {
                 return Err(SedError::NoScripts);
             } else {
@@ -99,10 +143,15 @@ impl Args {
                 raw_script = self.file.remove(0);
             }
         }
+        // The script ends with a <newline>, as a script file's last line does.
+        raw_script.push('\n');
 
         // If no [file...] were supplied or single file is considered to to be script, then
         // sed must read input from STDIN.
         if self.file.is_empty() {
+            if self.in_place.is_some() {
+                return Err(SedError::NoInputFiles);
+            }
             self.file.push("-".to_string());
         }
 
@@ -117,7 +166,12 @@ impl Args {
         Ok(Sed {
             quiet: self.quiet,
             script,
-            input_sources: self.file,
+            in_place: self.in_place,
+            separate: self.separate,
+            input_sources: self.file.into(),
+            current_input: String::new(),
+            pending_line: None,
+            exit_status: 0,
             pattern_space: Vec::new(),
             hold_space: Vec::new(),
             current_file: None,
@@ -139,6 +193,12 @@ enum SedError {
     /// Sed didn't get script for processing input files
     #[error("none script was supplied")]
     NoScripts,
+    /// `-i` was given no file to edit
+    #[error("no input files")]
+    NoInputFiles,
+    /// A file could not be edited in place; the text says why
+    #[error("{0}")]
+    InPlace(String),
     /// [`Script`] doesn't contain label that used in
     /// [`Command::BranchToLabel`] or [`Command::Test`]
     #[error("script doesn't contain label '{}'", .0)]
@@ -485,6 +545,15 @@ impl Command {
         Ok(())
     }
 
+    /// Whether this command's two-address range has selected the current
+    /// line and has not yet selected its last.
+    fn in_open_range(&mut self) -> bool {
+        let Some((Some(address), _)) = self.get_mut_address() else {
+            return false;
+        };
+        address.0.iter().any(|range| range.active)
+    }
+
     /// Check if [`Command`] apply conditions are met for current line
     fn need_execute(
         &mut self,
@@ -566,7 +635,8 @@ fn parse_number(chars: &[char], i: &mut usize) -> Result<Option<usize>, SedError
 /// delimiter, and `\n` in an RE matches a <newline>. A backslash followed by a
 /// <newline> is a literal <newline>. Every other `\x` pair is kept intact
 /// for the regex compiler or the replacement expander; in a replacement whose
-/// delimiter is `&`, `\&` stays escaped so it remains a literal `&`.
+/// delimiter is `&`, `\&` stays escaped so it remains a literal `&`. In an
+/// RE, a bracket expression is copied by [`scan_bracket_expression`].
 fn scan_delimited(chars: &[char], i: &mut usize, delim: char, is_re: bool) -> Option<String> {
     let mut text = String::new();
     loop {
@@ -588,6 +658,74 @@ fn scan_delimited(chars: &[char], i: &mut usize, delim: char, is_re: bool) -> Op
                     text.push('\\');
                     text.push(next);
                 }
+                *i += 2;
+            }
+            '[' if is_re => scan_bracket_expression(chars, i, &mut text)?,
+            _ => {
+                text.push(ch);
+                *i += 1;
+            }
+        }
+    }
+}
+
+/// Copy the bracket expression that starts at `chars[*i]` (its `[`) into
+/// `text`, leaving `*i` just past its closing `]`. Returns `None` when the
+/// script ends, or a line does, before the expression does.
+///
+/// POSIX.2024 sed: the delimiter "shall not terminate the RE when it appears
+/// within a bracket expression, and shall have its normal meaning in the
+/// bracket expression", so `s/[/]/X/` replaces a `/`. A backslash is an
+/// ordinary character there (XBD 9.3.5) and is copied as is, delimiter or
+/// not, except that `\n` is a <newline> as it is in GNU sed, whose
+/// `[^\n]` idiom scripts rely on. A `]` first in the list (after any `^`) is
+/// a member, and `[:class:]`, `[=equiv=]` and `[.coll.]` may hold a `]`.
+fn scan_bracket_expression(chars: &[char], i: &mut usize, text: &mut String) -> Option<()> {
+    text.push('[');
+    *i += 1;
+    if chars.get(*i) == Some(&'^') {
+        text.push('^');
+        *i += 1;
+    }
+    if chars.get(*i) == Some(&']') {
+        text.push(']');
+        *i += 1;
+    }
+    loop {
+        let ch = *chars.get(*i)?;
+        match ch {
+            '\n' => return None,
+            ']' => {
+                text.push(']');
+                *i += 1;
+                return Some(());
+            }
+            '[' if matches!(chars.get(*i + 1), Some(':' | '=' | '.')) => {
+                let kind = chars[*i + 1];
+                text.push('[');
+                text.push(kind);
+                *i += 2;
+                // Copy through the closing `kind]`.
+                loop {
+                    let c = *chars.get(*i)?;
+                    if c == '\n' {
+                        return None;
+                    }
+                    text.push(c);
+                    *i += 1;
+                    if c == kind && chars.get(*i) == Some(&']') {
+                        text.push(']');
+                        *i += 1;
+                        break;
+                    }
+                }
+            }
+            '\\' if chars.get(*i + 1) == Some(&'n') => {
+                text.push('\n');
+                *i += 2;
+            }
+            '\\' if chars.get(*i + 1) == Some(&'\\') => {
+                text.push_str("\\\\");
                 *i += 2;
             }
             _ => {
@@ -694,27 +832,10 @@ fn tokens_to_address(
 
 /// Get current line and column in script parse process
 fn get_current_line_and_col(chars: &[char], i: usize) -> Option<(usize, usize)> {
-    let mut j = 0;
-    let lines_positions = chars
-        .split(|c| *c == '\n')
-        .map(|line| {
-            let k = j;
-            j += line.len() + 1;
-            (line, k)
-        })
-        .collect::<Vec<_>>();
-    let (line, _) = lines_positions
-        .iter()
-        .enumerate()
-        .find(|(_, (_, line_start))| {
-            if i >= *line_start {
-                return false;
-            }
-            true
-        })?;
-    let line = line.saturating_sub(1);
-    let col = i - lines_positions[line].1 + 1;
-    Some((line, col))
+    let before = &chars[..i.min(chars.len())];
+    let line = before.iter().filter(|c| **c == '\n').count();
+    let line_start = before.iter().rposition(|c| *c == '\n').map_or(0, |p| p + 1);
+    Some((line, i - line_start + 1))
 }
 
 /// Format string for current script line and column
@@ -761,23 +882,37 @@ fn parse_address(
     Ok(())
 }
 
-/// Parse text attribute of a, c, i [`Command`]s that formated as:
+/// Parse the text of an a, c or i [`Command`], with `*i` on the command
+/// letter.  The POSIX form is
 /// a\
 /// text
+/// and, as in GNU sed, blanks after the letter are skipped and text on the
+/// letter's own line (`a text`, `a\text`) is the one-line form.
 fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>, SedError> {
     *i += 1;
+    while matches!(chars.get(*i), Some(' ' | '\t')) {
+        *i += 1;
+    }
     let Some(ch) = chars.get(*i) else {
         return Err(SedError::ScriptParse(
             "script ended unexpectedly".to_string(),
             None,
         ));
     };
-    if *ch != '\\' {
-        let position = get_current_line_and_col(chars, *i);
-        return Err(SedError::ScriptParse(
-            "text must be separated with '\\'".to_string(),
-            position,
-        ));
+    match *ch {
+        '\\' if chars.get(*i + 1) == Some(&'\n') => {}
+        '\\' => {
+            *i += 1;
+            return Ok(parse_one_line_text(chars, i));
+        }
+        '\n' => {
+            let position = get_current_line_and_col(chars, *i);
+            return Err(SedError::ScriptParse(
+                "text must be separated with '\\'".to_string(),
+                position,
+            ));
+        }
+        _ => return Ok(parse_one_line_text(chars, i)),
     }
     *i += 1;
     // POSIX multi-line form: `a\` followed by a <newline> begins the text on the
@@ -805,6 +940,9 @@ fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>,
             '\\' => {
                 *i += 1;
                 match chars.get(*i) {
+                    // A continuation at the very end of the script continues
+                    // nothing.
+                    Some('\n') if *i + 1 == chars.len() => break,
                     // `\` before a newline is a continuation: emit a real
                     // newline and keep reading the next line.
                     Some('\n') => {
@@ -832,33 +970,89 @@ fn parse_text_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>,
     }
 }
 
-/// Parse the label of a b, t or : [`Command`]. As in GNU sed, the label ends
-/// at a <newline>, `;`, `#` (which then begins a comment) or `}` (which
-/// closes the enclosing block).
-fn parse_word_attribute(chars: &[char], i: &mut usize) -> Result<Option<String>, SedError> {
-    let mut label = String::new();
-    while let Some(ch) = chars.get(*i) {
+/// Parse the GNU one-line text of an a, c or i [`Command`] from `*i` to the
+/// end of its line, leaving `*i` on its last character.  `;`, `}` and `#` are
+/// part of the text.  A `\` before the <newline> continues the text on the
+/// next line; `\n`, `\t` and the other [`control_escape`]s are controls, and
+/// a `\` before any other character is removed.
+fn parse_one_line_text(chars: &[char], i: &mut usize) -> Option<String> {
+    let mut text = String::new();
+    while let Some(&ch) = chars.get(*i) {
         match ch {
-            '\n' | ';' | '#' | '}' => {
-                *i -= 1;
-                break;
-            }
-            _ => label.push(*ch),
+            '\n' => break,
+            '\\' => match chars.get(*i + 1) {
+                // A continuation at the very end of the script continues
+                // nothing.
+                Some('\n') if *i + 2 == chars.len() => {}
+                Some(&escaped) => {
+                    text.push(control_escape(escaped).unwrap_or(escaped));
+                    *i += 1;
+                }
+                None => {}
+            },
+            _ => text.push(ch),
         }
         *i += 1;
-        if *i > chars.len() {
+    }
+    if text.is_empty() {
+        return None;
+    }
+    // The caller steps past the last character, onto the <newline>.
+    *i -= 1;
+    Some(text)
+}
+
+/// The control character GNU sed writes for `\` followed by `ch` in an `s`
+/// replacement or a one-line text: <newline> for `n` and the C escapes `t`,
+/// `r`, `a`, `f` and `v`.
+fn control_escape(ch: char) -> Option<char> {
+    match ch {
+        'n' => Some('\n'),
+        't' => Some('\t'),
+        'r' => Some('\r'),
+        'a' => Some('\x07'),
+        'f' => Some('\x0C'),
+        'v' => Some('\x0B'),
+        _ => None,
+    }
+}
+
+/// The label of a b, t or : [`Command`], as [`parse_label`] reads it.
+struct Label {
+    /// The label, or `None` when it is empty.
+    name: Option<String>,
+    /// A <blank> ended the label, and with it the command: the next command
+    /// may follow without a `;`.
+    ended_by_blank: bool,
+}
+
+/// Parse the label of a b, t or : [`Command`] from `*i`, as GNU sed does:
+/// <blank>s before it are skipped, and it ends at a <blank>, `;`, <newline>,
+/// `#` (which then begins a comment) or `}` (which closes the enclosing
+/// block).  POSIX leaves a label with any of these characters unspecified.
+/// `*i` is left on the ending <blank>, or else just before the character
+/// that ended the label.
+fn parse_label(chars: &[char], i: &mut usize) -> Label {
+    while matches!(chars.get(*i), Some(' ' | '\t')) {
+        *i += 1;
+    }
+    let start = *i;
+    while let Some(ch) = chars.get(*i) {
+        if matches!(ch, ' ' | '\t' | '\n' | ';' | '#' | '}') {
             break;
         }
+        *i += 1;
     }
-    let label = label.trim().to_string();
-    if label.contains(' ') {
-        let position = get_current_line_and_col(chars, *i);
-        return Err(SedError::ScriptParse(
-            "label can't contain ' '".to_string(),
-            position,
-        ));
+    let name: String = chars[start..*i].iter().collect();
+    let ended_by_blank = matches!(chars.get(*i), Some(' ' | '\t'));
+    if !ended_by_blank {
+        // The caller steps onto the terminator, which it then parses.
+        *i -= 1;
     }
-    Ok(if label.is_empty() { None } else { Some(label) })
+    Label {
+        name: (!name.is_empty()).then_some(name),
+        ended_by_blank,
+    }
 }
 
 /// Parse rfile attribute of r [`Command`]
@@ -915,7 +1109,8 @@ fn parse_replace_command(
             None,
         ));
     };
-    if splitter.is_alphanumeric() || " \n;{".contains(*splitter) {
+    // POSIX: any character other than <backslash> or <newline> delimits.
+    if *splitter == '\\' || *splitter == '\n' {
         let position = get_current_line_and_col(chars, *i);
         return Err(SedError::ScriptParse(
             format!("unterminated `{}' command", command),
@@ -970,13 +1165,53 @@ fn locale_chars(chars: &[char]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Write `bytes` to standard output. sed's data is bytes in the current
+/// Where sed's output goes while a file is edited in place (`-i`): the new
+/// version of that file. `None` the rest of the time, for standard output.
+static IN_PLACE_OUTPUT: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+
+/// Set once the output has been left without the <newline> of a last input
+/// line that lacked one. Any further output starts by writing it, as GNU
+/// sed's does, so `p` on such a line writes it twice, each on a line of its
+/// own, rather than run together; output that ends there stays without one.
+static NEWLINE_OWED: AtomicBool = AtomicBool::new(false);
+
+/// Write `bytes` to the output: standard output, or under `-i` the new
+/// version of the file being edited. sed's data is bytes in the current
 /// locale, not UTF-8; a write error ends sed with GNU's I/O status, 4.
 fn emit(bytes: &[u8]) {
-    if let Err(err) = std::io::stdout().write_all(bytes) {
+    let owed: &[u8] = if NEWLINE_OWED.swap(false, Ordering::Relaxed) {
+        b"\n"
+    } else {
+        b""
+    };
+    let mut in_place = IN_PLACE_OUTPUT.lock().unwrap();
+    let result = match in_place.as_mut() {
+        Some(file) => file.write_all(owed).and_then(|()| file.write_all(bytes)),
+        None => {
+            let mut out = std::io::stdout();
+            out.write_all(owed).and_then(|()| out.write_all(bytes))
+        }
+    };
+    if let Err(err) = result {
         eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
         std::process::exit(4);
     }
+}
+
+/// Flush standard output before exit. Output that does not end in a
+/// <newline> is still in the line buffer then, and the flush the runtime does
+/// at exit discards its error; a write error ends sed as in [`emit`].
+fn flush_output() {
+    if let Err(err) = std::io::stdout().flush() {
+        eprintln!("sed: couldn't write: {}", plib::diag::io_error_text(&err));
+        std::process::exit(4);
+    }
+}
+
+/// [`emit`] `text` and a <newline>.
+fn emit_line(text: &str) {
+    emit(text.as_bytes());
+    emit(b"\n");
 }
 
 /// Parse [`Command::Replace`] flags
@@ -1148,6 +1383,7 @@ fn parse_commands(
     let mut command_added = false;
 
     while let Some(ch) = chars.get(i) {
+        let mut label_ended_by_blank = false;
         match *ch {
             ' ' | '\t' => {}
             // A comment runs to the <newline>, which still separates commands.
@@ -1217,8 +1453,9 @@ fn parse_commands(
             }
             'b' => {
                 i += 1;
-                let label = parse_word_attribute(chars, &mut i)?;
-                commands.push(Command::BranchToLabel(address.clone(), label));
+                let label = parse_label(chars, &mut i);
+                label_ended_by_blank = label.ended_by_blank;
+                commands.push(Command::BranchToLabel(address.clone(), label.name));
             }
             'c' => {
                 if let Some(text) = parse_text_attribute(chars, &mut i)? {
@@ -1302,8 +1539,9 @@ fn parse_commands(
             }
             't' => {
                 i += 1;
-                let label = parse_word_attribute(chars, &mut i)?;
-                commands.push(Command::Test(address.clone(), label));
+                let label = parse_label(chars, &mut i);
+                label_ended_by_blank = label.ended_by_blank;
+                commands.push(Command::Test(address.clone(), label.name));
             }
             'w' => {
                 match parse_path_attribute(chars, &mut i) {
@@ -1334,7 +1572,9 @@ fn parse_commands(
             }
             ':' => {
                 i += 1;
-                let Some(label) = parse_word_attribute(chars, &mut i)? else {
+                let label = parse_label(chars, &mut i);
+                label_ended_by_blank = label.ended_by_blank;
+                let Some(label) = label.name else {
                     let position = get_current_line_and_col(chars, i);
                     return Err(SedError::ScriptParse(
                         "label doesn't have name".to_string(),
@@ -1357,6 +1597,11 @@ fn parse_commands(
             last_commands_count = commands.len();
             command_added = true;
         }
+        if label_ended_by_blank {
+            // The <blank> that ended a label separates commands, like `;`.
+            address = None;
+            command_added = false;
+        }
         i += 1;
     }
 
@@ -1376,6 +1621,18 @@ fn parse_commands(
 struct Script(Vec<Command>);
 
 impl Script {
+    /// Close every two-address range, so that each must select its first
+    /// line again.
+    fn close_ranges(&mut self) {
+        for command in self.0.iter_mut() {
+            if let Some((Some(address), _)) = command.get_mut_address() {
+                for range in address.0.iter_mut() {
+                    range.active = false;
+                }
+            }
+        }
+    }
+
     /// Try parse raw script string to sequence of [`Command`]s
     /// formated as [`Script`]
     fn parse(raw_script: impl AsRef<str>) -> Result<Script, SedError> {
@@ -1467,13 +1724,7 @@ fn expand_replacement(replacement: &str, haystack: &[u8], caps: &[Range<usize>])
                     out.extend_from_slice(group(d as usize - '0' as usize));
                     continue;
                 }
-                Some('n') => '\n',
-                Some('t') => '\t',
-                Some('r') => '\r',
-                Some('a') => '\x07',
-                Some('f') => '\x0C',
-                Some('v') => '\x0B',
-                Some(other) => other,
+                Some(other) => control_escape(other).unwrap_or(other),
                 None => continue,
             },
             _ => c,
@@ -1589,8 +1840,18 @@ struct Sed {
     quiet: bool,
     /// [`Script`] that applied for every line of every input file
     script: Script,
-    /// List of input files that need process with [`Script`]
-    input_sources: Vec<String>,
+    /// `-i`: edit each file in place, with this backup suffix (may be empty)
+    in_place: Option<String>,
+    /// `-s`: each input file is a stream of its own, as under `-i`
+    separate: bool,
+    /// The input files not yet opened, read in turn as one stream
+    input_sources: VecDeque<String>,
+    /// The operand the current file was opened as, for diagnostics
+    current_input: String,
+    /// A line read ahead to learn whether an unterminated line was the last
+    pending_line: Option<Vec<u8>>,
+    /// 0, or 2 once an input file could not be read
+    exit_status: i32,
     /// Buffer with current line of processed input file,
     /// but it can be changed with [`Command`]s in cycle limits.
     /// Сleared every cycle
@@ -1672,6 +1933,16 @@ impl Sed {
         self.current_end.as_deref().unwrap_or_default().as_bytes()
     }
 
+    /// [`emit`] the end of an output line: the current line's terminator, or
+    /// for a last line that lacks one, nothing yet -- the <newline> is owed,
+    /// and written only if more output follows.
+    fn emit_end(&self) {
+        match &self.current_end {
+            Some(end) => emit(end.as_bytes()),
+            None => NEWLINE_OWED.store(true, Ordering::Relaxed),
+        }
+    }
+
     /// Executes one command for `line` string argument
     /// and updates [`Sed`] state
     fn execute(
@@ -1700,9 +1971,9 @@ impl Sed {
                 }
                 instruction = Some(ControlFlowInstruction::Goto(label.clone()));
             }
-            Command::DeletePatternAndPrintText(address, text) => {
+            Command::DeletePatternAndPrintText(_, text) => {
                 // c
-                let _ = self.execute_c(command_position, address, text);
+                instruction = self.execute_c(command_position, text)?;
             }
             Command::DeletePattern(_, to_first_line) => {
                 // dD
@@ -1754,7 +2025,7 @@ impl Sed {
                 if !self.need_execute(command_position)? {
                     return Ok(None);
                 }
-                println!("{text}");
+                emit_line(&text);
             }
             Command::PrintPatternBinary(_) => {
                 // I (extension)
@@ -1850,7 +2121,7 @@ impl Sed {
                 }
                 // POSIX/GNU: `=` writes the line number unconditionally,
                 // even under -n.
-                println!("{}", self.current_line + 1);
+                emit_line(&(self.current_line + 1).to_string());
             }
             Command::IgnoreComment if !self.quiet => {
                 // #
@@ -1869,44 +2140,25 @@ impl Sed {
         Ok(instruction)
     }
 
+    /// `c`: delete the pattern space and start the next cycle, first writing
+    /// the text -- except on a line inside a two-address range that is still
+    /// open, so a range writes it once, at its last line (and a range that
+    /// never ends, never).
     fn execute_c(
         &mut self,
         command_position: usize,
-        address: Option<Address>,
         text: String,
-    ) -> Result<(), SedError> {
-        if address.is_none() {
-            self.pattern_space.clear();
-            self.current_end = None;
-            println!("{text}");
-        } else {
-            let mut need_execute = self.need_execute(command_position)?;
-            if need_execute {
-                println!("{text}");
-            }
-            loop {
-                need_execute = self.need_execute(command_position)?;
-                if need_execute {
-                    let mut line = self.next_line.clone();
-                    self.next_line = self.read_line()?;
-                    self.is_last_line = self.next_line.is_empty();
-                    self.current_line += 1;
-                    if line.is_empty() {
-                        break;
-                    }
-                    if line.ends_with(b"\n") {
-                        line.pop();
-                        self.current_end = Some("\n".to_string());
-                    } else {
-                        self.current_end = None;
-                    }
-                    self.pattern_space = line;
-                } else {
-                    break;
-                }
-            }
+    ) -> Result<Option<ControlFlowInstruction>, SedError> {
+        if !self.need_execute(command_position)? {
+            return Ok(None);
         }
-        Ok(())
+        if !self.script.0[command_position].in_open_range() {
+            emit_line(&text);
+        }
+        // Nothing is left to print at the end of the cycle -- not even the
+        // end of a line, which for an unterminated last line would be owed.
+        self.pattern_space.clear();
+        Ok(Some(ControlFlowInstruction::Continue))
     }
 
     fn execute_d(&mut self, to_first_line: bool) -> Option<ControlFlowInstruction> {
@@ -1952,7 +2204,7 @@ impl Sed {
             Some(newline) => emit(&self.pattern_space[..=newline]),
             None => {
                 emit(&self.pattern_space);
-                emit(self.end());
+                self.emit_end();
             }
         }
     }
@@ -1965,19 +2217,18 @@ impl Sed {
     }
 
     /// Flush the deferred `a`/`r` output queue. Called just before the next
-    /// input line is read (and at the end of each cycle). Emits a separating
-    /// newline first when the previous output line lacked a terminator, exactly
-    /// like GNU's `output_missing_newline`.
+    /// input line is read (and at the end of each cycle). A <newline> owed by
+    /// an unterminated last line is written first, even when the queue holds
+    /// only an unreadable file, as GNU's `output_missing_newline` does.
     fn flush_appends(&mut self) {
         if self.append_queue.is_empty() {
             return;
         }
-        if self.current_end.is_none() {
-            println!();
-        }
+        // Writes nothing but an owed <newline>.
+        emit(b"");
         for item in std::mem::take(&mut self.append_queue) {
             match item {
-                AppendItem::Text(text) => println!("{text}"),
+                AppendItem::Text(text) => emit_line(&text),
                 AppendItem::File(path) => {
                     if let Ok(contents) = std::fs::read(&path) {
                         emit(&contents);
@@ -2091,19 +2342,79 @@ impl Sed {
         self.has_replacements_since_t = true;
     }
 
-    /// Read next line from current file
+    /// Read the next line of the input stream, which runs on from the end of
+    /// one file into the next; empty at the end of the last.
+    ///
+    /// A file's last line without a <newline> gets one when another line
+    /// follows it, so that the next file's first line is a line of its own,
+    /// as in GNU sed. Finding out takes reading that next line ahead.
     fn read_line(&mut self) -> Result<Vec<u8>, SedError> {
-        let Some(current_file) = self.current_file.as_mut() else {
-            return Err(SedError::Io(std::io::Error::new(
-                ErrorKind::NotFound,
-                "current file is none",
-            )));
-        };
-        let mut line = Vec::new();
-        if let Err(err) = current_file.read_until(b'\n', &mut line) {
-            return Err(SedError::Io(err));
+        if let Some(line) = self.pending_line.take() {
+            return Ok(line);
+        }
+        let mut line = self.read_stream_line();
+        if !line.is_empty() && !line.ends_with(b"\n") {
+            let next = self.read_stream_line();
+            if !next.is_empty() {
+                line.push(b'\n');
+                self.pending_line = Some(next);
+            }
         }
         Ok(line)
+    }
+
+    /// The next line of the current file, opening the next file when this
+    /// one is exhausted; empty when no file has another line.
+    fn read_stream_line(&mut self) -> Vec<u8> {
+        loop {
+            if let Some(current_file) = self.current_file.as_mut() {
+                let mut line = Vec::new();
+                match current_file.read_until(b'\n', &mut line) {
+                    Ok(_) if !line.is_empty() => return line,
+                    Ok(_) => {}
+                    Err(err) => {
+                        // GNU: report it, go on with the next file, exit 2.
+                        eprintln!(
+                            "sed: read error on {}: {}",
+                            self.current_input,
+                            plib::diag::io_error_text(&err)
+                        );
+                        self.exit_status = 2;
+                    }
+                }
+                self.current_file = None;
+            }
+            if !self.open_next_input() {
+                return Vec::new();
+            }
+        }
+    }
+
+    /// Open the next input file that can be opened, reporting each one
+    /// that cannot; false when none is left.
+    fn open_next_input(&mut self) -> bool {
+        while let Some(input) = self.input_sources.pop_front() {
+            if input == "-" {
+                self.current_file = Some(Box::new(BufReader::new(std::io::stdin())));
+                self.current_input = String::from("stdin");
+                return true;
+            }
+            match File::open(&input) {
+                Ok(file) => {
+                    self.current_file = Some(Box::new(BufReader::new(file)));
+                    self.current_input = input;
+                    return true;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "sed: can't read {input}: {}",
+                        plib::diag::io_error_text(&err)
+                    );
+                    self.exit_status = 2;
+                }
+            }
+        }
+        false
     }
 
     fn need_execute(&mut self, command_position: usize) -> Result<bool, SedError> {
@@ -2200,7 +2511,7 @@ impl Sed {
                         }
                         if !self.quiet {
                             emit(&self.pattern_space);
-                            emit(self.end());
+                            self.emit_end();
                         }
                         // Reading a new input line flushes deferred a/r output.
                         self.flush_appends();
@@ -2218,7 +2529,7 @@ impl Sed {
 
         if !self.quiet {
             emit(&self.pattern_space);
-            emit(self.end());
+            self.emit_end();
         }
 
         // Flush deferred a/r output at end of cycle, before the next line read.
@@ -2227,11 +2538,14 @@ impl Sed {
         Ok(global_instruction)
     }
 
-    /// Executes all commands of [`Sed`]'s [`Script`]
-    /// for all content of `reader` file argument
-    fn process_input(&mut self) -> Result<(), SedError> {
+    /// Run the script over one stream -- all the input as one, or under `-s`
+    /// and `-i` one file -- and say whether `q` ended it. Each stream starts
+    /// as GNU sed starts each file: at line 1, with an empty hold space and
+    /// every range closed.
+    fn process_input(&mut self) -> Result<bool, SedError> {
         self.pattern_space.clear();
         self.hold_space.clear();
+        self.script.close_ranges();
         self.current_line = 0;
         self.is_last_line = false;
         let mut line;
@@ -2253,12 +2567,12 @@ impl Sed {
             self.has_replacements_since_t = false;
             self.pattern_space = line;
             if let Some(ControlFlowInstruction::Break) = self.process_line()? {
-                break;
+                return Ok(true);
             }
             self.current_line += 1;
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Main [`Sed`] function. Executes all commands of
@@ -2268,34 +2582,256 @@ impl Sed {
         // at parse time). Pre-create/truncate every wfile named in the script,
         // as required by POSIX (each wfile is created before processing begins).
         self.create_wfiles();
-        for mut input in std::mem::take(&mut self.input_sources) {
-            self.current_file = Some(if input == "-" {
-                Box::new(BufReader::new(std::io::stdin()))
-            } else {
-                match File::open(&input) {
-                    Ok(file) => Box::new(BufReader::new(file)),
-                    Err(err) => {
-                        if input == "-" {
-                            input = "stdin".to_string();
-                        }
-                        eprintln!("sed: read {input}: {err}");
-                        continue;
-                    }
-                }
-            });
-            match self.process_input() {
-                Ok(_) => {}
-                Err(err) => {
-                    if input == "-" {
-                        input = "stdin".to_string();
-                    }
-                    return Err(SedError::Runtime(input, format!("{}", err)));
-                }
-            };
+        if let Some(suffix) = self.in_place.take() {
+            return self.edit_in_place(&suffix);
         }
+        if self.separate {
+            return self.process_separately();
+        }
+        // POSIX: the input files are one stream, so line numbers, `$`, the
+        // hold space and open ranges all run on from one file into the next.
+        self.process_input()
+            .map(drop)
+            .map_err(|err| SedError::Runtime(self.current_input.clone(), err.to_string()))
+    }
 
+    /// `-s`: run the script over each input file as a stream of its own, the
+    /// way `-i` does but writing to standard output. A file that cannot be
+    /// read is reported and skipped; a `q` ends the run.
+    fn process_separately(&mut self) -> Result<(), SedError> {
+        for name in std::mem::take(&mut self.input_sources) {
+            self.input_sources.push_back(name);
+            let quit = self
+                .process_input()
+                .map_err(|err| SedError::Runtime(self.current_input.clone(), err.to_string()))?;
+            if quit {
+                break;
+            }
+        }
         Ok(())
     }
+
+    /// `-i`: edit each input file in place, as a stream of its own (its own
+    /// line numbers, `$`, hold space and ranges, as in GNU sed).
+    /// A `q` ends the run once the file it was read from is written.
+    fn edit_in_place(&mut self, suffix: &str) -> Result<(), SedError> {
+        for name in std::mem::take(&mut self.input_sources) {
+            let Some(file) = self.open_for_edit(&name) else {
+                continue;
+            };
+            if self.edit_file(&name, file, suffix)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the file `name` to be edited in place, or report why not.
+    ///
+    /// Only a regular file is edited, judged by `fstat` of what was opened,
+    /// so nothing can be swapped in between the check and the read. The open
+    /// does not block, so a FIFO is refused rather than waited on; a symbolic
+    /// link is read through (and is then replaced by a regular file, as GNU
+    /// sed does without --follow-symlinks). On Windows a directory opens only
+    /// with `FILE_FLAG_BACKUP_SEMANTICS`, without which it is refused as
+    /// "Access is denied." before its type can be seen; with it, a directory
+    /// is refused here as on Unix.
+    fn open_for_edit(&mut self, name: &str) -> Option<File> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        let file = match options.open(name) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!(
+                    "sed: can't read {name}: {}",
+                    plib::diag::io_error_text(&err)
+                );
+                self.exit_status = self.exit_status.max(2);
+                return None;
+            }
+        };
+        match file.metadata() {
+            Ok(meta) if meta.is_file() => Some(file),
+            Ok(_) => {
+                eprintln!("sed: couldn't edit {name}: not a regular file");
+                self.exit_status = self.exit_status.max(4);
+                None
+            }
+            Err(err) => {
+                eprintln!(
+                    "sed: couldn't edit {name}: {}",
+                    plib::diag::io_error_text(&err)
+                );
+                self.exit_status = self.exit_status.max(4);
+                None
+            }
+        }
+    }
+
+    /// Edit the open regular file `name`: run the script over it into a new
+    /// file, created exclusively (`O_CREAT|O_EXCL`, mode 0600) in the same
+    /// directory and given the original's owner and mode, then rename the new
+    /// file over the name, after keeping the original under its backup name
+    /// when there is a suffix (see [`keep_backup`]). The original is never
+    /// written, and its name is never without a file; a failure leaves it as
+    /// it was and removes the new file. True when `q` ended it.
+    fn edit_file(&mut self, name: &str, file: File, suffix: &str) -> Result<bool, SedError> {
+        let path = Path::new(name);
+        let fail = |what: &str, err: &std::io::Error| {
+            SedError::InPlace(format!(
+                "couldn't {what} {name}: {}",
+                plib::diag::io_error_text(err)
+            ))
+        };
+        let original = file.metadata().map_err(|e| fail("edit", &e))?;
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temp = plib::tmp::Builder::new()
+            .prefix("sed")
+            .tempfile_in(dir)
+            .map_err(|e| fail("open a temporary file to edit", &e))?;
+        copy_owner_and_mode(temp.as_file(), &original).map_err(|e| fail("edit", &e))?;
+        let writer = temp.as_file().try_clone().map_err(|e| fail("edit", &e))?;
+        let mut source = file.try_clone().map_err(|e| fail("edit", &e))?;
+
+        *IN_PLACE_OUTPUT.lock().unwrap() = Some(BufWriter::new(writer));
+        self.current_file = Some(Box::new(BufReader::new(file)));
+        self.current_input = name.to_string();
+        let result = self.process_input();
+        self.current_file = None;
+        let output = IN_PLACE_OUTPUT.lock().unwrap().take();
+        // Each file is an output of its own: one left unterminated owes the
+        // next nothing.
+        NEWLINE_OWED.store(false, Ordering::Relaxed);
+        let quit = result.map_err(|err| SedError::Runtime(name.to_string(), err.to_string()))?;
+        if let Some(mut output) = output {
+            output.flush().map_err(|e| fail("write", &e))?;
+        }
+
+        if !suffix.is_empty() {
+            let backup = backup_name(path, suffix)?;
+            keep_backup(path, &backup, dir, &mut source, &original)
+                .map_err(|e| fail("keep a backup of", &e))?;
+        }
+        temp.persist(path).map_err(|e| fail("replace", &e.error))?;
+        Ok(quit)
+    }
+}
+
+/// Keep the original of a file edited in place, `path`, under the name `backup` in the same
+/// directory `dir`, while `path` still names it: a hard link made in a fresh directory of its
+/// own in `dir`, then renamed over `backup`, so an existing backup is replaced at once.  Where
+/// the link cannot be made (a file system without hard links, or Linux's protected_hardlinks
+/// for a file of another owner), a copy of `source`, the file as it was opened, with its owner,
+/// mode and times, takes the link's place.
+fn keep_backup(
+    path: &Path,
+    backup: &Path,
+    dir: &Path,
+    source: &mut File,
+    original: &Metadata,
+) -> std::io::Result<()> {
+    let staging = plib::tmp::Builder::new().prefix("sed").tempdir_in(dir)?;
+    let link = staging.path().join("backup");
+    if std::fs::hard_link(path, &link).is_ok() {
+        return std::fs::rename(&link, backup);
+    }
+    drop(staging);
+    copy_to_backup(backup, dir, source, original)
+}
+
+/// Write a copy of `source` from its start, with the owner, mode and times of `original`, to a
+/// new file in `dir`, and rename it over `backup`.
+fn copy_to_backup(
+    backup: &Path,
+    dir: &Path,
+    source: &mut File,
+    original: &Metadata,
+) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut copy = plib::tmp::Builder::new().prefix("sed").tempfile_in(dir)?;
+    copy_owner_and_mode(copy.as_file(), original)?;
+    source.seek(SeekFrom::Start(0))?;
+    std::io::copy(source, copy.as_file_mut())?;
+    let mut times = std::fs::FileTimes::new().set_modified(original.modified()?);
+    if let Ok(accessed) = original.accessed() {
+        times = times.set_accessed(accessed);
+    }
+    copy.as_file().set_times(times)?;
+    copy.persist(backup).map(drop).map_err(|e| e.error)
+}
+
+/// The backup name of `path` for the `-i` suffix `suffix`: the name plus the
+/// suffix, or, when the suffix holds a `*`, the suffix with each `*` replaced
+/// by the file's name (GNU). The backup stays in the file's directory, so a
+/// suffix naming another directory is refused.
+fn backup_name(path: &Path, suffix: &str) -> Result<PathBuf, SedError> {
+    if suffix.contains('/') {
+        return Err(SedError::InPlace(format!(
+            "backup suffix {suffix:?} names another directory"
+        )));
+    }
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let backup = if suffix.contains('*') {
+        suffix.replace('*', &file_name)
+    } else {
+        format!("{file_name}{suffix}")
+    };
+    Ok(path.with_file_name(backup))
+}
+
+/// Give `new`, the new version of a file edited in place, the owner (when
+/// running as root) or else the group (when the caller belongs to it) of
+/// `original`, and then its mode; the owner first, because changing it
+/// clears the set-ID bits. A set-ID bit is kept only where the new file
+/// really has the original's owner or group.
+#[cfg(unix)]
+fn copy_owner_and_mode(new: &File, original: &Metadata) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fd = new.as_raw_fd();
+    // SAFETY: geteuid cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        // SAFETY: the descriptor is open.
+        if unsafe { libc::fchown(fd, original.uid(), original.gid()) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    } else {
+        // Best effort, as GNU sed: it succeeds only for a group the caller
+        // belongs to. An owner of -1 leaves the owner as it is.
+        // SAFETY: the descriptor is open.
+        let _ = unsafe { libc::fchown(fd, libc::uid_t::MAX, original.gid()) };
+    }
+    let now = new.metadata()?;
+    let mut bits = original.mode() & 0o7777;
+    if now.uid() != original.uid() {
+        bits &= !0o4000;
+    }
+    if now.gid() != original.gid() {
+        bits &= !0o2000;
+    }
+    new.set_permissions(std::fs::Permissions::from_mode(bits))
+}
+
+/// Give `new` the read-only attribute of `original`, Windows's whole mode.
+#[cfg(not(unix))]
+fn copy_owner_and_mode(new: &File, original: &Metadata) -> std::io::Result<()> {
+    new.set_permissions(original.permissions())
 }
 
 /// Exit code:
@@ -2304,15 +2840,15 @@ impl Sed {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("sed");
 
-    let args = Args::parse();
+    let args = Args::parse_ordered();
 
     let exit_code = Args::try_to_sed(args)
-        .and_then(|mut sed| sed.sed())
-        .map(|_| 0)
+        .and_then(|mut sed| sed.sed().map(|_| sed.exit_status))
         .unwrap_or_else(|err| {
             eprintln!("sed: {err}");
             1
         });
 
+    flush_output();
     std::process::exit(exit_code);
 }

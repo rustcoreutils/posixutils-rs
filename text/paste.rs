@@ -25,7 +25,7 @@ struct Args {
     serial: bool,
 
     // Other implementations use "delimiters" as the long form, so mirror that
-    #[arg(short, long, help = gettext("Delimiter list"))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("Delimiter list"))]
     delimiters: Option<String>,
 
     #[arg(help = gettext("One or more input files"))]
@@ -425,7 +425,7 @@ fn paste_files(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("paste");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let Args {
         delimiters,

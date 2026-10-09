@@ -313,3 +313,12 @@ fn test_uustat_kill_foreign_job_denied() {
         "the foreign-owned job must not have been removed"
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-k", "-r", "-s", "-u"] {
+        plib::testing::assert_hyphen_option_argument("uustat", &[opt, "-zq", "--help"]);
+    }
+}

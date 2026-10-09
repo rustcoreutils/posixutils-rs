@@ -49,15 +49,15 @@ struct Args {
     backup: bool,
 
     /// Backup file name prefix (GNU; used by dpkg-source)
-    #[arg(short = 'B', value_name = "PREFIX", help = gettext("Prefix PREFIX to a file's name to name its backup; implies -b"))]
+    #[arg(short = 'B', allow_hyphen_values = true, value_name = "PREFIX", help = gettext("Prefix PREFIX to a file's name to name its backup; implies -b"))]
     backup_prefix: Option<String>,
 
     /// Backup file name suffix (GNU; used by dpkg-source)
-    #[arg(short = 'z', value_name = "SUFFIX", help = gettext("Name backups with SUFFIX instead of .orig; implies -b"))]
+    #[arg(short = 'z', allow_hyphen_values = true, value_name = "SUFFIX", help = gettext("Name backups with SUFFIX instead of .orig; implies -b"))]
     backup_suffix: Option<String>,
 
     /// Backup method (GNU; used by dpkg-source). Only simple backups exist.
-    #[arg(short = 'V', value_name = "METHOD", value_parser = ["never", "simple"], help = gettext("Backup method: only 'never' or 'simple' (FILE.orig) is supported"))]
+    #[arg(short = 'V', allow_hyphen_values = true, value_name = "METHOD", value_parser = ["never", "simple"], help = gettext("Backup method: only 'never' or 'simple' (FILE.orig) is supported"))]
     _version_control: Option<String>,
 
     /// Remove files left empty (GNU; used by dpkg-source)
@@ -65,7 +65,7 @@ struct Args {
     remove_empty: bool,
 
     /// Maximum fuzz (GNU; used by dpkg-source)
-    #[arg(short = 'F', value_name = "NUM", help = gettext("Ignore at most NUM lines of context at each end of a hunk (default 2)"))]
+    #[arg(short = 'F', allow_hyphen_values = true, value_name = "NUM", help = gettext("Ignore at most NUM lines of context at each end of a hunk (default 2)"))]
     fuzz: Option<usize>,
 
     /// Batch mode (GNU; used by dpkg-source)
@@ -81,11 +81,11 @@ struct Args {
     force: bool,
 
     /// Change to directory before processing
-    #[arg(short = 'd', value_name = "DIR", help = gettext("Change to directory before processing"))]
+    #[arg(short = 'd', allow_hyphen_values = true, value_name = "DIR", help = gettext("Change to directory before processing"))]
     directory: Option<PathBuf>,
 
     /// Mark changes with #ifdef directive
-    #[arg(short = 'D', value_name = "DEFINE", help = gettext("Mark changes with #ifdef/#endif using DEFINE"))]
+    #[arg(short = 'D', allow_hyphen_values = true, value_name = "DEFINE", help = gettext("Mark changes with #ifdef/#endif using DEFINE"))]
     ifdef_define: Option<String>,
 
     /// Interpret patch as ed script
@@ -93,7 +93,7 @@ struct Args {
     ed: bool,
 
     /// Read patch from file
-    #[arg(short = 'i', value_name = "PATCHFILE", help = gettext("Read the patch from PATCHFILE"))]
+    #[arg(short = 'i', allow_hyphen_values = true, value_name = "PATCHFILE", help = gettext("Read the patch from PATCHFILE"))]
     patchfile: Option<PathBuf>,
 
     /// Loose whitespace matching
@@ -109,15 +109,15 @@ struct Args {
     forward: bool,
 
     /// Write output to file
-    #[arg(short = 'o', value_name = "OUTFILE", help = gettext("Write output to OUTFILE instead of patching in place"))]
+    #[arg(short = 'o', allow_hyphen_values = true, value_name = "OUTFILE", help = gettext("Write output to OUTFILE instead of patching in place"))]
     output: Option<PathBuf>,
 
     /// Strip path components
-    #[arg(short = 'p', value_name = "NUM", help = gettext("Strip NUM leading path components from file names"))]
+    #[arg(short = 'p', allow_hyphen_values = true, value_name = "NUM", help = gettext("Strip NUM leading path components from file names"))]
     strip: Option<usize>,
 
     /// Override reject filename
-    #[arg(short = 'r', long = "reject-file", value_name = "REJECTFILE", help = gettext("Write rejects to REJECTFILE instead of .rej; '-' discards them"))]
+    #[arg(short = 'r', long = "reject-file", allow_hyphen_values = true, value_name = "REJECTFILE", help = gettext("Write rejects to REJECTFILE instead of .rej; '-' discards them"))]
     reject: Option<PathBuf>,
 
     /// Reverse patch direction
@@ -405,7 +405,7 @@ fn run(args: Args) -> Result<bool, PatchError> {
 fn main() -> ExitCode {
     plib::diag::init_locale("patch");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Validate arguments
     if let Err(e) = args.validate() {

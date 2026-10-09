@@ -11,6 +11,7 @@ pub mod archive;
 pub mod cscan;
 #[cfg(unix)]
 pub mod curuser;
+pub mod date_arg;
 pub mod diag;
 #[cfg(unix)]
 pub mod exec;
@@ -24,6 +25,9 @@ pub mod lzw;
 pub mod madefs;
 #[cfg(unix)]
 pub mod modestr;
+#[cfg(unix)]
+mod nssbuf;
+pub mod optarg;
 pub mod perm;
 #[cfg(unix)]
 pub mod platform;

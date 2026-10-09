@@ -80,10 +80,12 @@ Every change inside a musl file is marked with a `plib:` comment.
 Matching decodes the subject with the C runtime's `mbtowc`, so it follows
 `LC_CTYPE`; `plib::diag::init_locale` sets the UCRT's to UTF-8. `wchar_t`
 is 16 bits, so characters above U+FFFF are not supported: `mbtowc` cannot
-return one, and musl's matcher reports no match for a subject containing a
-character it cannot decode (as it does for invalid UTF-8). A back-reference
-under `REG_ICASE` compares bytes, so it matches only text in the same case
-(glibc's ignores case there too).
+return one. musl's matcher reports no match for a subject containing a
+character it cannot decode (as it does for invalid UTF-8), so `plib::regex`
+then searches the pieces of the subject between such characters, each on its
+own; a character above U+FFFF, like an invalid byte, matches nothing. A
+back-reference under `REG_ICASE` compares bytes, so it matches only text in
+the same case (glibc's ignores case there too).
 
 The `-gnu` targets link msvcrt, which has no UTF-8 locale, so under Wine
 the UTF-8 regex tests in `plib/src/regex.rs` find none and return early;

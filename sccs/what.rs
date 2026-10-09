@@ -101,7 +101,7 @@ fn process_file<R: BufRead>(mut reader: R, single: bool, out: &mut impl Write) -
 fn main() -> io::Result<()> {
     plib::diag::init_locale("what");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     let mut any_found = false;
 
     let stdout = io::stdout();

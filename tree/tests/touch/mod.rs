@@ -490,7 +490,6 @@ fn test_touch_d_utc_word_rejections() {
         "1999-08-26 12:06:20UTC",         // GNU accepts
         "1999-08-26 12:06:20 UTC x",      // GNU rejects
         "1999-08-26 12:06:20 UTC ",       // GNU accepts
-        "1999-08-26 12:06 UTC",           // no seconds, as with Z; GNU accepts
         "1999-08-26 UTC",                 // no time
         "UTC",
     ] {
@@ -513,4 +512,237 @@ fn test_touch_d_posix_forms_unchanged() {
     assert_eq!(d_mtime("2007-11-12T10:15:30,000"), local);
     let ((_, _), mtime) = touch_d("2007-11-12T10:15:30.25Z").unwrap();
     assert_eq!(mtime, (utc, 250_000_000));
+}
+
+/// The ISO 8601 forms may leave out the seconds, with a zone too; each value
+/// is GNU touch 9.4's stat `%Y`.
+#[test]
+fn test_touch_d_without_seconds() {
+    assert_eq!(d_mtime("1990-06-22T12:00Z"), 646_056_000);
+    assert_eq!(d_mtime("1990-06-22 12:00Z"), 646_056_000);
+    assert_eq!(d_mtime("1990-06-22T12:00+02:00"), 646_048_800);
+    assert_eq!(d_mtime("1999-08-26 12:06 UTC"), 935_669_160);
+    // No zone: New York time (EDT, UTC-4).
+    assert_eq!(d_mtime("1990-06-22T12:00"), 646_070_400);
+}
+
+/// -d @SECONDS, and --date as its long form; perl's debian/rules runs
+/// `touch --date="@$patchdate" patchlevel.h`.
+#[test]
+fn test_touch_d_epoch() {
+    assert_eq!(d_mtime("@1000000000"), 1_000_000_000);
+    assert_eq!(d_mtime("@0"), 0);
+    assert_eq!(d_mtime("@-86400"), -86_400);
+
+    let d = dir("test_touch_d_epoch");
+    let f = format!("{d}/f");
+    for argv in [
+        vec!["--date=@1000000000", &f],
+        vec!["--date", "@1000000000", &f],
+    ] {
+        let out = touch(None, &argv);
+        assert!(out.status.success(), "{argv:?}: {out:?}");
+        assert_eq!(mtime_secs(&f), 1_000_000_000);
+        fs::remove_file(&f).unwrap();
+    }
+    fs::remove_dir_all(&d).unwrap();
+
+    for date in ["@", "@x", "@12x", "@1.5", "@ 1", "@--1"] {
+        let out = touch_d(date).expect_err(date);
+        assert_eq!(out.status.code(), Some(1), "{date:?}: {out:?}");
+    }
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-d", "-t", "-r"] {
+        plib::testing::assert_hyphen_option_argument("touch", &[opt, "-zq", "--help"]);
+    }
+}
+
+/// The modification time of `p` itself, never of what a symlink names.
+fn link_mtime_secs(p: &str) -> u64 {
+    fs::symlink_metadata(p)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// -h / --no-dereference (GNU) sets a symlink's own times and leaves the file
+/// it names alone; binutils' debian/rules runs `touch --no-dereference
+/// --date=...`.
+#[test]
+fn test_touch_h_sets_the_link_itself() {
+    let d = dir("test_touch_h_sets_the_link_itself");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    fs::write(&target, "x").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = touch(None, &["-d", "@1000000000", &target]);
+    assert!(out.status.success(), "{out:?}");
+
+    let out = touch(None, &["-h", "-d", "@2000000000", &link]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_mtime_secs(&link), 2000000000);
+    assert_eq!(mtime_secs(&target), 1000000000);
+
+    let out = touch(
+        None,
+        &["--no-dereference", "-m", "--date=@1500000000", &link],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_mtime_secs(&link), 1500000000);
+    assert_eq!(mtime_secs(&target), 1000000000);
+
+    // A file that is not a link is touched as ever.
+    let out = touch(None, &["-h", "-d", "@1200000000", &target]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mtime_secs(&target), 1200000000);
+}
+
+/// Under -h a dangling symlink gets its own times; its target is not created.
+#[test]
+fn test_touch_h_dangling_symlink() {
+    let d = dir("test_touch_h_dangling_symlink");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = touch(None, &["-h", "-d", "@2000000000", &link]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_mtime_secs(&link), 2000000000);
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "-h created the target"
+    );
+}
+
+/// -h creates nothing: a missing file is an error, as in GNU touch, and with
+/// -c it is passed over in silence.
+#[test]
+fn test_touch_h_missing_file_is_not_created() {
+    let d = dir("test_touch_h_missing_file");
+    let missing = format!("{d}/missing");
+    let out = touch(None, &["-h", &missing]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(!out.stderr.is_empty());
+    assert!(
+        fs::symlink_metadata(&missing).is_err(),
+        "-h created the file"
+    );
+
+    let out = touch(None, &["-h", "-c", &missing]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty());
+    assert!(
+        fs::symlink_metadata(&missing).is_err(),
+        "-h -c created the file"
+    );
+}
+
+/// Under -h a reference file that is a symlink gives its own times.
+#[test]
+fn test_touch_h_reference_link() {
+    let d = dir("test_touch_h_reference_link");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    let other = format!("{d}/other");
+    fs::write(&target, "x").unwrap();
+    fs::write(&other, "y").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(touch(None, &["-d", "@1000000000", &target])
+        .status
+        .success());
+    assert!(touch(None, &["-h", "-d", "@2000000000", &link])
+        .status
+        .success());
+
+    let out = touch(None, &["-h", "-r", &link, &other]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mtime_secs(&other), 2000000000);
+    let out = touch(None, &["-r", &link, &other]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mtime_secs(&other), 1000000000);
+}
+
+/// The text of an OS error, without Rust's "(os error N)" suffix.
+fn os_error_text(errno: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(errno).to_string();
+    text.split(" (os error").next().unwrap().to_string()
+}
+
+/// A trailing slash still resolves the link: a link to a file followed by a
+/// slash is not a directory, under -h, -c and neither, and neither the link
+/// nor its target is touched.  macOS's utimensat(AT_SYMLINK_NOFOLLOW) set the
+/// link's own times instead.
+#[test]
+fn test_touch_h_link_with_trailing_slash() {
+    let d = dir("test_touch_h_link_with_trailing_slash");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    fs::write(&target, "x").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(touch(None, &["-d", "@1000000000", &target])
+        .status
+        .success());
+    assert!(touch(None, &["-h", "-d", "@1000000000", &link])
+        .status
+        .success());
+
+    let enotdir = os_error_text(libc::ENOTDIR);
+    for opts in [&["-h"][..], &["-h", "-c"], &["-c"], &[]] {
+        let slashed = format!("{link}/");
+        let mut args = opts.to_vec();
+        args.extend(["-d", "@2000000000", &slashed]);
+        let out = touch(None, &args);
+        assert_eq!(out.status.code(), Some(1), "{opts:?} {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(&enotdir), "{opts:?} {stderr}");
+        assert_eq!(link_mtime_secs(&link), 1000000000, "{opts:?}");
+        assert_eq!(mtime_secs(&target), 1000000000, "{opts:?}");
+    }
+}
+
+/// Under -h a link to a directory followed by a slash names the directory:
+/// it gets the times and the link keeps its own (GNU, Linux).
+#[test]
+fn test_touch_h_dir_link_with_trailing_slash() {
+    let d = dir("test_touch_h_dir_link_with_trailing_slash");
+    let sub = format!("{d}/sub");
+    let link = format!("{d}/link");
+    fs::create_dir(&sub).unwrap();
+    std::os::unix::fs::symlink(&sub, &link).unwrap();
+    assert!(touch(None, &["-h", "-d", "@1000000000", &link])
+        .status
+        .success());
+
+    let out = touch(None, &["-h", "-d", "@2000000000", &format!("{link}/")]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mtime_secs(&sub), 2000000000);
+    assert_eq!(link_mtime_secs(&link), 1000000000);
+}
+
+/// Under -h -c a dangling link followed by a slash is a missing file passed
+/// over in silence; under -h alone it is reported, and nothing is created.
+#[test]
+fn test_touch_h_dangling_link_with_trailing_slash() {
+    let d = dir("test_touch_h_dangling_link_with_trailing_slash");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let slashed = format!("{link}/");
+
+    let out = touch(None, &["-h", "-c", &slashed]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+
+    let out = touch(None, &["-h", &slashed]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&os_error_text(libc::ENOENT)), "{stderr}");
+    assert!(fs::symlink_metadata(&target).is_err());
 }

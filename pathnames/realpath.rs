@@ -10,7 +10,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use clap::Parser;
 use gettextrs::gettext;
@@ -28,6 +28,9 @@ struct Args {
 
     #[arg(short = 'E', overrides_with = "canonicalize_existing", help = gettext("Do not error if the path cannot be resolved (default)"))]
     _canonicalize_missing: bool,
+
+    #[arg(short = 's', long, help = gettext("Do not resolve symbolic links; remove . and .. by name"))]
+    no_symlinks: bool,
 
     #[arg(short, long, help = gettext("Don't print errors when paths cannot be resolved"))]
     quiet: bool,
@@ -96,6 +99,62 @@ fn resolve_inner(abs: &Path, depth: usize) -> io::Result<PathBuf> {
     }
 }
 
+/// Make `path` absolute and remove `.` and `..` components by name, without
+/// following any symbolic link (the `-s` behavior).  Every component that is
+/// followed by more of the path, or by a trailing <slash>, must name a
+/// directory; with `must_exist` (`-e`) the final component must exist too.
+fn resolve_no_symlinks(path: &Path, must_exist: bool) -> io::Result<PathBuf> {
+    let mut out = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        std::env::current_dir()?
+    };
+
+    let bytes = path.as_os_str().as_bytes();
+    let trailing_slash = bytes.len() > 1 && bytes.ends_with(b"/");
+    let names: Vec<Component> = path
+        .components()
+        .filter(|c| !matches!(c, Component::RootDir | Component::CurDir))
+        .collect();
+
+    for (i, component) in names.iter().enumerate() {
+        let is_last = i + 1 == names.len();
+        match component {
+            // The name being removed was already checked to be a directory.
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => {
+                out.push(name);
+                if !is_last {
+                    require_directory(&out)?;
+                } else if trailing_slash || must_exist {
+                    match fs::metadata(&out) {
+                        Ok(md) if trailing_slash && !md.is_dir() => {
+                            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound && !must_exist => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+        }
+    }
+
+    Ok(out)
+}
+
+/// Succeed only if `path` (following symbolic links) is a directory.
+fn require_directory(path: &Path) -> io::Result<()> {
+    if fs::metadata(path)?.is_dir() {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(libc::ENOTDIR))
+    }
+}
+
 fn clone_err(e: &io::Error) -> io::Error {
     match e.raw_os_error() {
         Some(code) => io::Error::from_raw_os_error(code),
@@ -127,12 +186,14 @@ fn write_path(path: &Path) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     diag::init_locale("realpath");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut had_error = false;
 
     for path in &args.paths {
-        let ret = if args.canonicalize_existing {
+        let ret = if args.no_symlinks {
+            resolve_no_symlinks(path, args.canonicalize_existing)
+        } else if args.canonicalize_existing {
             fs::canonicalize(path)
         } else {
             resolve_missing_ok(path)

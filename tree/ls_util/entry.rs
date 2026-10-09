@@ -14,7 +14,7 @@ use crate::{
 };
 use std::{
     cmp::Ordering,
-    ffi::{CStr, OsStr, OsString},
+    ffi::{OsStr, OsString},
     io,
     os::unix::{
         ffi::OsStrExt,
@@ -605,6 +605,8 @@ fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> Str
     #[allow(clippy::unnecessary_cast)]
     let s_isuid = libc::S_ISUID as u32;
     #[allow(clippy::unnecessary_cast)]
+    let s_isgid = libc::S_ISGID as u32;
+    #[allow(clippy::unnecessary_cast)]
     let s_irgrp = libc::S_IRGRP as u32;
     #[allow(clippy::unnecessary_cast)]
     let s_iwgrp = libc::S_IWGRP as u32;
@@ -636,7 +638,16 @@ fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> Str
     // Group permissions
     file_mode.push(if mode & s_irgrp != 0 { 'r' } else { '-' });
     file_mode.push(if mode & s_iwgrp != 0 { 'w' } else { '-' });
-    file_mode.push(if mode & s_ixgrp != 0 { 'x' } else { '-' });
+    file_mode.push({
+        let executable = mode & s_ixgrp != 0;
+        let set_group_id = mode & s_isgid != 0;
+        match (executable, set_group_id) {
+            (true, true) => 's',
+            (true, false) => 'x',
+            (false, true) => 'S',
+            (false, false) => '-',
+        }
+    });
 
     // Other permissions
     file_mode.push(if mode & s_iroth != 0 { 'r' } else { '-' });
@@ -659,7 +670,11 @@ fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> Str
     });
 
     // Alternate-access-method flag: '+' when the file carries a POSIX ACL.
-    if has_acl(path) {
+    // It describes the file this line is about: a symbolic link listed as
+    // itself is probed without following it, while a link that -L or -H
+    // followed (so `metadata` is the target's) is probed through the link.
+    let follow = !metadata.is_symlink();
+    if has_acl(path, follow) {
         file_mode.push('+');
     }
 
@@ -669,37 +684,25 @@ fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> Str
 fn get_owner_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String> {
     let uid = metadata.uid();
     if numeric {
-        Ok(uid.to_string())
-    } else {
-        unsafe {
-            let passwd = libc::getpwuid(uid);
-            if passwd.is_null() {
-                // POSIX: if the owner name cannot be determined, use the numeric UID.
-                return Ok(uid.to_string());
-            }
-            let passwd_ref = &*passwd;
-            let name = CStr::from_ptr(passwd_ref.pw_name);
-            Ok(ls_from_utf8_lossy(name.to_bytes()))
-        }
+        return Ok(uid.to_string());
     }
+    // POSIX: if the owner name cannot be determined, use the numeric UID.
+    Ok(match plib::user::get_by_uid(uid) {
+        Some(user) => ls_from_utf8_lossy(user.name.as_bytes()),
+        None => uid.to_string(),
+    })
 }
 
 fn get_group_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String> {
     let gid = metadata.gid();
     if numeric {
-        Ok(gid.to_string())
-    } else {
-        unsafe {
-            let group = libc::getgrgid(gid);
-            if group.is_null() {
-                // POSIX: if the group name cannot be determined, use the numeric GID.
-                return Ok(gid.to_string());
-            }
-            let group_ref = &*group;
-            let name = CStr::from_ptr(group_ref.gr_name);
-            Ok(ls_from_utf8_lossy(name.to_bytes()))
-        }
+        return Ok(gid.to_string());
     }
+    // POSIX: if the group name cannot be determined, use the numeric GID.
+    Ok(match plib::group::get_by_gid(gid) {
+        Some(group) => ls_from_utf8_lossy(group.name.as_bytes()),
+        None => gid.to_string(),
+    })
 }
 
 fn get_file_info(metadata: &ftw::Metadata) -> FileInfo {
@@ -765,36 +768,39 @@ fn display_width(s: &str) -> usize {
 }
 
 /// True if `path` carries an ACL (an "alternate access method"); used to append the `+` flag to the
-/// `-l` mode string. The probe is platform-specific: Linux exposes a POSIX access ACL through the
-/// `system.posix_acl_access` extended attribute, while macOS/BSD report an extended ACL through the
-/// `acl(3)` API (`getxattr` there has a different, 6-argument signature and does not surface ACLs by
-/// that name).
+/// `-l` mode string. When `path` is a symbolic link, `follow` picks whether the link itself or the
+/// file it names is asked. The probe is platform-specific: Linux exposes a POSIX access ACL through
+/// the `system.posix_acl_access` extended attribute, while macOS/BSD report an extended ACL through
+/// the `acl(3)` API (`getxattr` there has a different, 6-argument signature and does not surface
+/// ACLs by that name).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn has_acl(path: &std::path::Path) -> bool {
+fn has_acl(path: &std::path::Path, follow: bool) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
     const NAME: &[u8] = b"system.posix_acl_access\0";
+    let name = NAME.as_ptr() as *const libc::c_char;
     let ret = unsafe {
-        libc::getxattr(
-            cpath.as_ptr(),
-            NAME.as_ptr() as *const libc::c_char,
-            std::ptr::null_mut(),
-            0,
-        )
+        if follow {
+            libc::getxattr(cpath.as_ptr(), name, std::ptr::null_mut(), 0)
+        } else {
+            libc::lgetxattr(cpath.as_ptr(), name, std::ptr::null_mut(), 0)
+        }
     };
     ret >= 0
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn has_acl(path: &std::path::Path) -> bool {
+fn has_acl(path: &std::path::Path, follow: bool) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    // macOS/BSD: an extended ACL is present iff `acl_get_link_np(path, ACL_TYPE_EXTENDED)` returns a
-    // non-empty list (matching what BSD `ls` does for the `+` flag). These symbols live in libSystem
-    // but are not surfaced by the `libc` crate on every target, so declare them directly. `acl_t` /
+    // macOS/BSD: an extended ACL is present iff `acl_get_file` (following a symlink) or
+    // `acl_get_link_np` (not following) with `ACL_TYPE_EXTENDED` returns a non-empty list
+    // (matching what BSD `ls` does for the `+` flag). These symbols live in libSystem but are not
+    // surfaced by the `libc` crate on every target, so declare them directly. `acl_t` /
     // `acl_entry_t` are opaque pointers.
     extern "C" {
+        fn acl_get_file(path: *const libc::c_char, acl_type: libc::c_uint) -> *mut libc::c_void;
         fn acl_get_link_np(path: *const libc::c_char, acl_type: libc::c_uint) -> *mut libc::c_void;
         fn acl_get_entry(
             acl: *mut libc::c_void,
@@ -810,7 +816,11 @@ fn has_acl(path: &std::path::Path) -> bool {
         return false;
     };
     unsafe {
-        let acl = acl_get_link_np(cpath.as_ptr(), ACL_TYPE_EXTENDED);
+        let acl = if follow {
+            acl_get_file(cpath.as_ptr(), ACL_TYPE_EXTENDED)
+        } else {
+            acl_get_link_np(cpath.as_ptr(), ACL_TYPE_EXTENDED)
+        };
         if acl.is_null() {
             return false;
         }

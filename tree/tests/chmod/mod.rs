@@ -280,3 +280,79 @@ fn test_chmod_recursive_follows_operand_symlink() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// A pathname ending in a slash names a directory (POSIX pathname resolution): `file/` and `fl/`
+/// (a link to a file) are "Not a directory" and change nothing, while `dl/` (a link to a
+/// directory) changes the directory, and with -R what is in it.
+#[test]
+fn test_chmod_trailing_slash_names_a_directory() {
+    let test_dir = &format!("{}/test_chmod_trailing_slash", env!("CARGO_TARGET_TMPDIR"));
+    let (d, d_f, file, dl, fl) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/d/f"),
+        &format!("{test_dir}/file"),
+        &format!("{test_dir}/dl"),
+        &format!("{test_dir}/fl"),
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::File::create(d_f).unwrap();
+    fs::File::create(file).unwrap();
+    for p in [d, d_f, file] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    unix::fs::symlink("d", dl).unwrap();
+    unix::fs::symlink("file", fl).unwrap();
+    let modes = || [d, d_f, file].map(|p| mode_of(p));
+
+    for operand in [&format!("{fl}/"), &format!("{file}/")] {
+        chmod_test(
+            &["644", operand],
+            "",
+            &format!("chmod: cannot access '{operand}': Not a directory\n"),
+            1,
+        );
+    }
+    assert_eq!(modes(), [0o700; 3]);
+
+    chmod_test(&["755", &format!("{dl}/")], "", "", 0);
+    assert_eq!(modes(), [0o755, 0o700, 0o700]);
+
+    chmod_test(&["-R", "750", &format!("{dl}/")], "", "", 0);
+    assert_eq!(modes(), [0o750, 0o750, 0o700]);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// chmod -R changes no symbolic link met in the walk and reports none: a dangling link is
+/// skipped silently (binutils runs `chmod -R go=rX` over a tree holding some), and a live link
+/// leaves its target alone, a file or a directory outside the tree.
+#[test]
+fn test_chmod_recursive_skips_symlinks_in_walk() {
+    let test_dir = &format!("{}/test_chmod_r_skips_links", env!("CARGO_TARGET_TMPDIR"));
+    let (d, d_f, outside, outdir) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/d/f"),
+        &format!("{test_dir}/outside"),
+        &format!("{test_dir}/outdir"),
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::create_dir_all(outdir).unwrap();
+    fs::File::create(d_f).unwrap();
+    fs::File::create(outside).unwrap();
+    for p in [d, d_f, outside, outdir] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    unix::fs::symlink("nonexistent", format!("{d}/dangle")).unwrap();
+    unix::fs::symlink("../outside", format!("{d}/flink")).unwrap();
+    unix::fs::symlink("../outdir", format!("{d}/dlink")).unwrap();
+
+    chmod_test(&["-R", "go=rX", d], "", "", 0);
+    assert_eq!(
+        [d, d_f, outside, outdir].map(|p| mode_of(p)),
+        [0o755, 0o755, 0o700, 0o700]
+    );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

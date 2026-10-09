@@ -1068,3 +1068,12 @@ mod malformed {
         assert!(checked >= 23, "corpus shrank: only {checked} files");
     }
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-C", "-M", "-m", "-S", "-s"] {
+        plib::testing::assert_hyphen_option_argument("man", &[opt, "-zq", "--help"]);
+    }
+}

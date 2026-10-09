@@ -37,6 +37,10 @@ struct Args {
 
     #[arg(short = 'v', long, help = gettext("Write the current version level of this release of the operating system implementation"))]
     osversion: bool,
+
+    // GNU; as Debian's coreutils prints it, the machine hardware name.
+    #[arg(short = 'i', long, help = gettext("Write the hardware platform: the machine hardware name"))]
+    hardware_platform: bool,
 }
 
 /// The six POSIX `uname` fields obtained from `uname(2)`'s `utsname`.
@@ -72,8 +76,9 @@ fn get_uname() -> std::io::Result<UnameInfo> {
     })
 }
 
-/// Number of uname info fields: sysname, nodename, release, version, machine
-const UNAME_FIELD_COUNT: usize = 5;
+/// Number of fields written at most: sysname, nodename, release, version, machine, and GNU's
+/// hardware platform
+const UNAME_FIELD_COUNT: usize = 6;
 
 fn print_info(args: &Args, info: &UnameInfo) {
     let mut outs = Vec::with_capacity(UNAME_FIELD_COUNT);
@@ -93,6 +98,9 @@ fn print_info(args: &Args, info: &UnameInfo) {
     if args.machine {
         outs.push(info.machine.as_str());
     }
+    if args.hardware_platform {
+        outs.push(info.machine.as_str());
+    }
 
     println!("{}", outs.join(" "));
 }
@@ -100,7 +108,7 @@ fn print_info(args: &Args, info: &UnameInfo) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("uname");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     if args.all {
         args.machine = true;
@@ -108,7 +116,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.release = true;
         args.system = true;
         args.osversion = true;
-    } else if !args.machine && !args.node && !args.release && !args.system && !args.osversion {
+    } else if !args.machine
+        && !args.node
+        && !args.release
+        && !args.system
+        && !args.osversion
+        && !args.hardware_platform
+    {
         args.system = true;
     }
 

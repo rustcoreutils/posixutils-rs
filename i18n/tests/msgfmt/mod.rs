@@ -387,3 +387,359 @@ fn test_msgfmt_high_escapes_are_single_bytes() {
         r"\xe9 and \351 must each expand to the single byte 0xE9"
     );
 }
+
+/// Run msgfmt with `args` in `dir`; return (stderr, exit code).
+fn msgfmt_status(dir: &std::path::Path, args: &[&str]) -> (String, i32) {
+    let out = std::process::Command::new(plib::testing::get_binary_path("msgfmt"))
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("msgfmt");
+    (
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// po4a checks every PO file with
+/// `msgfmt --check-format --check-domain -o /dev/null FILE`.
+#[test]
+fn test_msgfmt_po4a_check_accepts_a_good_file() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#, c-format
+msgid "Hello %s, %d files"
+msgstr "Hola %s, %i archivos"
+
+msgid "No format %d here"
+msgstr "Sin formato"
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    let args = ["--check-format", "--check-domain", "-o", "/dev/null", po];
+    assert_eq!(msgfmt_status(dir.path(), &args), (String::new(), 0));
+}
+
+/// --check-format alone, without -c -v, checks c-format directives.
+#[test]
+fn test_msgfmt_check_format_rejects_a_mismatch() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+#, c-format
+msgid "Hello %s"
+msgstr "Hola %d"
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    let (err, code) = msgfmt_status(dir.path(), &["--check-format", "-o", "/dev/null", po]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("format specifications"), "{err:?}");
+}
+
+/// --check-domain: a `domain` directive conflicts with -o, which ignores it.
+/// Without -o the directive names the output file, and nothing conflicts.
+#[test]
+fn test_msgfmt_check_domain_rejects_a_directive_under_o() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+domain "other"
+
+msgid "Hello"
+msgstr "Hola"
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    let (err, code) = msgfmt_status(dir.path(), &["--check-domain", "-o", "/dev/null", po]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("'domain other' directive ignored"), "{err:?}");
+
+    assert_eq!(
+        msgfmt_status(dir.path(), &["--check-domain", po]),
+        (String::new(), 0)
+    );
+    assert!(dir.path().join("other").exists());
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-D", "-o"] {
+        plib::testing::assert_hyphen_option_argument("msgfmt", &[opt, "-zq", "--help"]);
+    }
+}
+
+/// gettext's configure keeps a msgfmt only if
+/// `msgfmt --statistics /dev/null` succeeds; an empty input writes no catalog.
+#[test]
+fn test_msgfmt_statistics_on_empty_input() {
+    let dir = TempDir::new().unwrap();
+    assert_eq!(
+        msgfmt_status(dir.path(), &["--statistics", "/dev/null"]),
+        ("0 translated messages.\n".to_string(), 0)
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+/// --statistics counts as GNU msgfmt does, singular for a count of one.
+#[test]
+fn test_msgfmt_statistics_counts() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "a"
+msgstr "A"
+
+#, fuzzy
+msgid "b"
+msgstr "B"
+
+msgid "c"
+msgstr ""
+
+msgid "d"
+msgstr "D"
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    assert_eq!(
+        msgfmt_status(dir.path(), &["--statistics", "-o", "/dev/null", po]),
+        (
+            "2 translated messages, 1 fuzzy translation, 1 untranslated message.\n".to_string(),
+            0
+        )
+    );
+}
+
+/// `--verbose` is GNU's long spelling of -v. gettext's stock po/Makefile.in.in builds each
+/// catalog with `msgfmt -c --statistics --verbose -o xx.gmo xx.po`; the counts are written once.
+#[test]
+fn test_msgfmt_long_verbose() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "a"
+msgstr "A"
+
+msgid "c"
+msgstr ""
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    let counts = "1 translated message, 1 untranslated message.\n";
+    for args in [
+        ["--verbose", "-o", "/dev/null", po, "", ""],
+        ["-c", "--statistics", "--verbose", "-o", "xx.gmo", po],
+    ] {
+        let args: Vec<&str> = args.into_iter().filter(|a| !a.is_empty()).collect();
+        let (err, status) = msgfmt_status(dir.path(), &args);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(err.matches(counts).count(), 1, "{err}");
+        assert!(err.ends_with(counts), "{err}");
+        // Everything else written is what -v writes.
+        let short: Vec<&str> = args
+            .iter()
+            .map(|a| if *a == "--verbose" { "-v" } else { a })
+            .collect();
+        assert_eq!(msgfmt_status(dir.path(), &short), (err, 0));
+    }
+    assert!(dir.path().join("xx.gmo").exists());
+}
+
+/// With -c -v, POSIX compares only the number of conversion specifications
+/// and the argument types of corresponding ones: a flag such as `'` (or
+/// GNU's `I`) changes neither, and a `%n$` conversion is matched by its
+/// argument number, not by where it stands in the text. Each failure names
+/// the file, the line of the msgstr and the msgid. Verdicts are GNU
+/// msgfmt's.
+#[test]
+fn test_msgfmt_check_compares_arguments_not_spelling() {
+    for (msgid, msgstr, refusal) in [
+        ("%d", "%'d", None),
+        ("%d %d", "%Id %d", None),
+        ("%d of %s", "%2$s ... %1$d", None),
+        ("%1$d of %2$s", "%2$s ... %1$d", None),
+        ("%*d", "%*d", None),
+        ("%5.2f%%", "%f %%", None),
+        (
+            "a %d b %s",
+            "x %s y %d",
+            Some("for argument 1 are not the same"),
+        ),
+        (
+            "%d of %s",
+            "%2$d ... %1$s",
+            Some("for argument 1 are not the same"),
+        ),
+        (
+            "%d of %s",
+            "%2$s ... %d",
+            Some("both through absolute argument numbers"),
+        ),
+        ("%d", "%d %d", Some("number of format specifications")),
+        (
+            "%d of %s",
+            "%2$s",
+            Some("refers to argument number 2 but ignores argument number 1"),
+        ),
+        ("%ld", "%d", Some("for argument 1 are not the same")),
+        ("%*d", "%d", Some("number of format specifications")),
+    ] {
+        let (dir, po_path) = create_temp_po_file(&format!(
+            "msgid \"\"\nmsgstr \"Content-Type: text/plain; charset=UTF-8\\n\"\n\n\
+             #, c-format\nmsgid \"{msgid}\"\nmsgstr \"{msgstr}\"\n"
+        ));
+        let po = po_path.to_str().unwrap();
+        let (err, code) = msgfmt_status(dir.path(), &["-c", "-v", "-o", "/dev/null", po]);
+        match refusal {
+            None => assert_eq!(code, 0, "{msgid:?} / {msgstr:?}: {err}"),
+            Some(reason) => {
+                assert_eq!(code, 1, "{msgid:?} / {msgstr:?}: {err}");
+                assert!(err.contains(&format!("{po}:6: error: ")), "{err:?}");
+                assert!(err.contains(reason), "{msgid:?} / {msgstr:?}: {err:?}");
+                assert!(err.contains(&format!("msgid \"{msgid}\"")), "{err:?}");
+            }
+        }
+    }
+}
+
+/// GNU msgfmt's plural check (NONPOSIX.md): with -c -v every plural form is
+/// checked against msgid_plural, and a form that stands for fewer than five
+/// of n = 0..=1000 (the singular of most languages) may leave out trailing
+/// arguments, as "one file" for "%d files". Verdicts are GNU msgfmt's.
+#[test]
+fn test_msgfmt_check_plural_forms_as_gnu() {
+    const EN: &str = "nplurals=2; plural=(n != 1);";
+    const CS: &str = "nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=4) ? 1 : 2;";
+    const JA: &str = "nplurals=1; plural=0;";
+    const FIVE: &str = "nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=6) ? 1 : 2;";
+    const FOUR: &str = "nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=5) ? 1 : 2;";
+    let count = |form: &str| {
+        Some(format!(
+            "number of format specifications in 'msgid_plural' and 'msgstr[{form}]'"
+        ))
+    };
+    let argument_1 = |form: &str| {
+        Some(format!(
+            "in 'msgid_plural' and 'msgstr[{form}]' for argument 1 are not the same"
+        ))
+    };
+    for (forms, msgid, plural, msgstr, refusal) in [
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["%d soubor", "%d souborů"][..],
+            None,
+        ),
+        (
+            EN,
+            "one file",
+            "%d files",
+            &["jeden soubor", "%d souborů"][..],
+            None,
+        ),
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["jeden soubor", "%d souborů"][..],
+            None,
+        ),
+        (
+            EN,
+            "%d file %s",
+            "%d files %s",
+            &["%d soubor", "%d souborů %s"][..],
+            None,
+        ),
+        (
+            EN,
+            "%s: %d file",
+            "%s: %d files",
+            &["%s: jeden", "%s: %d souborů"][..],
+            None,
+        ),
+        (EN, "file", "files %d", &["soubor", "%d souborů"][..], None),
+        (EN, "%s file", "%d files", &["%d", "%d"][..], None),
+        (
+            CS,
+            "%d file",
+            "%d files",
+            &["jeden", "%d soubory", "%d souborů"][..],
+            None,
+        ),
+        (JA, "%d file", "%d files", &["%d"][..], None),
+        (FOUR, "%d file", "%d files", &["%d", "x", "%d"][..], None),
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["%d soubor", "souborů"][..],
+            count("1"),
+        ),
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["%s soubor", "%d souborů"][..],
+            argument_1("0"),
+        ),
+        (
+            EN,
+            "%d file %s",
+            "%d files %s",
+            &["soubor %s", "%d souborů %s"][..],
+            argument_1("0"),
+        ),
+        (
+            EN,
+            "%d file",
+            "%d files",
+            &["%d soubor %d", "%d souborů"][..],
+            count("0"),
+        ),
+        (JA, "%d file", "%d files", &["ファイル"][..], count("0")),
+        (
+            FIVE,
+            "%d file",
+            "%d files",
+            &["%d", "x", "%d"][..],
+            count("1"),
+        ),
+    ] {
+        let mut po = format!(
+            "msgid \"\"\nmsgstr \"\"\n\"Content-Type: text/plain; charset=UTF-8\\n\"\n\
+             \"Plural-Forms: {forms}\\n\"\n\n\
+             #, c-format\nmsgid \"{msgid}\"\nmsgid_plural \"{plural}\"\n"
+        );
+        for (i, s) in msgstr.iter().enumerate() {
+            po.push_str(&format!("msgstr[{i}] \"{s}\"\n"));
+        }
+        let (dir, po_path) = create_temp_po_file(&po);
+        let po = po_path.to_str().unwrap();
+        let (err, code) = msgfmt_status(dir.path(), &["-c", "-v", "-o", "/dev/null", po]);
+        match refusal {
+            None => assert_eq!(code, 0, "{forms} {plural:?} / {msgstr:?}: {err}"),
+            Some(reason) => {
+                assert_eq!(code, 1, "{forms} {plural:?} / {msgstr:?}: {err}");
+                assert!(err.contains(&format!("{po}:9: error: ")), "{err:?}");
+                assert!(err.contains(&reason), "{plural:?} / {msgstr:?}: {err:?}");
+            }
+        }
+    }
+}

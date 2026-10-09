@@ -81,8 +81,8 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn parse() -> Self {
-        let matches = clap::command!()
+    fn command() -> clap::Command {
+        clap::command!()
             .arg(
                 clap::Arg::new("line_synchronization")
                     .short('s')
@@ -99,6 +99,7 @@ impl Args {
                         "Define the symbol name to have some value (or NULL)",
                     ))
                     .num_args(1)
+                    .allow_hyphen_values(true)
                     .action(clap::ArgAction::Append),
             )
             .arg(
@@ -107,10 +108,16 @@ impl Args {
                     .value_name(crate::lexer::UNDEFINE_VALUE_NAME)
                     .help(gettext("Undefine the symbol name"))
                     .num_args(1)
+                    .allow_hyphen_values(true)
                     .action(clap::ArgAction::Append),
             )
             .arg(clap::Arg::new("file").action(clap::ArgAction::Append))
-            .get_matches();
+    }
+
+    pub fn parse() -> Self {
+        let argv = std::env::args_os().collect();
+        let matches = Self::command()
+            .get_matches_from(plib::optarg::keep_leading_equals_with(argv, Self::command));
 
         let line_synchronization = matches.get_flag("line_synchronization");
 

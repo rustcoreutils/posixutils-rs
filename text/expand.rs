@@ -21,7 +21,7 @@ use plib::locale::{mb_char_slices, wcwidth_char};
 struct Args {
     // `--tablist` is a non-POSIX long-option alias kept for convenience; POSIX
     // specifies only `-t tablist`.
-    #[arg(short, long, help = gettext("Tab stops, either a single positive decimal integer or a list of tabstops separated by commas."))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("Tab stops, either a single positive decimal integer or a list of tabstops separated by commas."))]
     tablist: Option<String>,
 
     #[arg(help = gettext("Files to read as input."))]
@@ -145,7 +145,7 @@ fn expand_file(tablist: &TabList, pathname: &Path) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("expand");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     let tablist = {
         if let Some(ref tablist) = args.tablist {

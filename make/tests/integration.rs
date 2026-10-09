@@ -396,6 +396,21 @@ mod internal_macros {
         assert_eq!(stdout, "MYMACRO=[fromenv]\n", "stdout: {stdout}");
     }
 
+    // An environment entry that is not valid UTF-8 made make panic while it
+    // decided what to export.  The entry is inherited unchanged.
+    #[test]
+    fn non_utf8_environment_entry() {
+        use plib::testing::os_bytes;
+        let output = Command::new(get_binary_path("make"))
+            .args(["-f", "tests/makefiles/macros/env_export.mk"])
+            .env("POSIXUTILS_K", os_bytes(b"eh zero \xa0"))
+            .env(os_bytes(b"POSIXUTILS_\xff"), "v")
+            .output()
+            .expect("failed to run make");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, b"MYMACRO=[]\n");
+    }
+
     // Audit #13: the `MAKEFLAGS` environment variable seeds options; `n`
     // behaves as `-n` (print recipe, do not execute).
     #[test]
@@ -2956,5 +2971,14 @@ mod projectdir {
         assert!(stdout.contains("local"), "the local history wins: {stdout}");
         assert_eq!(code, Some(0));
         let _ = fs::remove_dir_all(dir);
+    }
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn make_option_argument_may_begin_with_hyphen() {
+    for opt in ["-C", "-f", "-j"] {
+        plib::testing::assert_hyphen_option_argument("make", &[opt, "-zq", "--help"]);
     }
 }

@@ -555,3 +555,12 @@ fn test_strip_rejects_strip_debug_with_strip_unneeded() {
     let out = strip(&["--strip-debug", "--strip-unneeded"], &f);
     assert!(!out.status.success());
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-R", "-N"] {
+        plib::testing::assert_hyphen_option_argument("strip", &[opt, "-zq", "--help"]);
+    }
+}

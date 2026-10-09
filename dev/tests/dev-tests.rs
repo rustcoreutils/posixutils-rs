@@ -528,6 +528,38 @@ fn test_ar_index_lists_only_global_symbols() {
     assert_eq!(index, ["shown"]);
 }
 
+/// Run ar with `args`, asserting success and returning its stdout.
+fn ar_ok(args: &[&std::ffi::OsStr]) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ar"))
+        .args(args)
+        .output()
+        .expect("ar");
+    assert!(
+        out.status.success(),
+        "ar {:?}: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+// The traditional key form without a leading '-', as Makefiles, libtool and
+// automake's archiver-interface probe write it: `ar cr`, `ar cq`, `ar rcs`,
+// `ar cru`, `ar t`.
+#[test]
+fn test_ar_dashless_key() {
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let lib1 = std::path::Path::new("tests/ar/lib1.o").as_os_str();
+    let lib4 = std::path::Path::new("tests/ar/lib4.o").as_os_str();
+    for key in ["cr", "cq", "rcs", "cru"] {
+        let arc = dir.path().join(format!("{key}.a"));
+        let arc = arc.as_os_str();
+        ar_ok(&[key.as_ref(), arc, lib1, lib4]);
+        assert_eq!(ar_ok(&["t".as_ref(), arc]), "lib1.o\nlib4.o\n", "{key}");
+        assert_eq!(ar_ok(&["-t".as_ref(), arc]), "lib1.o\nlib4.o\n", "{key}");
+    }
+}
+
 #[test]
 fn test_strip_stripped_elf_is_valid_elf() {
     let stripped = strip_file(
@@ -2408,5 +2440,75 @@ fn test_ar_x_refuses_a_member_name_that_leaves_the_directory() {
         assert!(!dir.path().join("evil.o").exists(), "{shown} escaped");
         assert!(!xdir.join("sub/evil.o").exists(), "{shown} went into sub/");
         assert!(!xdir.join("evil.o").exists(), "{shown} was written");
+    }
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn nm_option_argument_may_begin_with_hyphen() {
+    plib::testing::assert_hyphen_option_argument("nm", &["-t", "-zq", "--help"]);
+}
+
+/// The default format pads each value with zeros to the address width (16
+/// digits for a 64-bit object), and an undefined symbol's value with as many
+/// spaces, as GNU and BSD nm do, in every radix.
+#[test]
+fn test_nm_default_format_pads_values() {
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let obj = obj.to_str().unwrap();
+    for (args, digits) in [
+        (vec![], "0123456789"),
+        (vec!["-t", "d"], "0123456789"),
+        (vec!["-t", "o"], "01234567"),
+        (vec!["-t", "x"], "0123456789abcdef"),
+    ] {
+        let mut argv = args.clone();
+        argv.push(obj);
+        let out = nm_run(&argv);
+        assert!(out.status.success(), "{argv:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let (value, rest) = line.split_at(16);
+            let fields: Vec<&str> = rest.split(' ').collect();
+            assert_eq!(fields.len(), 3, "{argv:?}: {line:?}");
+            assert_eq!(fields[0], "", "{argv:?}: {line:?}");
+            if fields[1] == "U" {
+                assert_eq!(value, " ".repeat(16), "{argv:?}: {line:?}");
+            } else {
+                assert!(
+                    value.chars().all(|c| digits.contains(c)),
+                    "{argv:?}: {line:?}"
+                );
+            }
+        }
+    }
+}
+
+/// db5.3's build lists its symbols with
+/// `nm *.o | grep " [DTR] " | cut -d" " -f3`.
+#[test]
+fn test_nm_default_format_cut_field_three() {
+    let dir = plib::tmp::TempDir::new().unwrap();
+    let obj = nm_compile_obj(dir.path(), "t", NM_SRC);
+    let out = nm_run(&[obj.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let names: Vec<&str> = stdout
+        .lines()
+        .filter(|l| [" D ", " T ", " R "].iter().any(|t| l.contains(t)))
+        .map(|l| l.split(' ').nth(2).unwrap())
+        .collect();
+    for want in ["alpha_global", "zeta_global", "mid_func", "use_undef"] {
+        assert!(names.iter().any(|n| n.ends_with(want)), "{want}: {names:?}");
+    }
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn strings_option_argument_may_begin_with_hyphen() {
+    for opt in ["-t", "-n"] {
+        plib::testing::assert_hyphen_option_argument("strings", &[opt, "-zq", "--help"]);
     }
 }

@@ -44,7 +44,7 @@ struct Args {
 fn main() -> ExitCode {
     plib::diag::init_locale("uux");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Handle command arguments - check for "-" which means pipe stdin
     let mut pipe_stdin = args.pipe_stdin;

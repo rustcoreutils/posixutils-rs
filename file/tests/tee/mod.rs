@@ -104,3 +104,10 @@ fn tee_continues_after_unopenable_file() {
     );
     assert_eq!(fs::read_to_string(&good).unwrap(), "payload\n");
 }
+
+// A write error on input that does not end in a <newline> is reported: tee
+// left it in stdout's line buffer until exit, where the error was lost.
+#[test]
+fn tee_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("tee", &[], b"x", 1);
+}

@@ -15,6 +15,7 @@ mod ed;
 
 use clap::Parser;
 use gettextrs::gettext;
+use std::ffi::OsString;
 use std::io::{self, BufReader, BufWriter};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,14 +29,48 @@ pub static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 #[derive(Parser, Debug)]
 #[command(version, about = gettext("ed - edit text"))]
 struct Args {
-    #[arg(short, long, default_value = "", help = gettext("Use string as the prompt when in command mode"))]
+    #[arg(short, long, allow_hyphen_values = true, default_value = "", help = gettext("Use string as the prompt when in command mode"))]
     prompt: String,
 
-    #[arg(short, long, help = gettext("Suppress the writing of byte counts by e, E, r, and w commands and the '!' prompt after !command"))]
+    // Repeatable: `ed -s - file` is -s twice once `-` is spelled as -s.
+    #[arg(short, long, overrides_with = "silent", help = gettext("Suppress the writing of byte counts by e, E, r, and w commands and the '!' prompt after !command"))]
     silent: bool,
 
     #[arg(help = gettext("File to edit"))]
     file: Option<String>,
+}
+
+/// Spell the historic option `-` as `-s`.
+///
+/// `ed - file` is the form POSIX withdrew in favour of `-s`, and GNU patch
+/// still runs it to apply an ed-style diff. A `-` is the option only where an
+/// option may stand: before the file operand and before `--`, and never as
+/// the option-argument of `-p`, which may be a prompt of `-`.
+fn rewrite_lone_dash(argv: Vec<OsString>) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut words = argv.into_iter();
+    out.extend(words.next());
+    while let Some(word) = words.next() {
+        let text = word.to_str().unwrap_or_default();
+        if text == "-" {
+            out.push(OsString::from("-s"));
+            continue;
+        }
+        let takes_argument = text == "--prompt"
+            || (text.starts_with('-')
+                && !text.starts_with("--")
+                && text.find('p') == Some(text.len() - 1));
+        let operand = text == "--" || !text.starts_with('-');
+        out.push(word);
+        if operand {
+            break;
+        }
+        if takes_argument {
+            out.extend(words.next());
+        }
+    }
+    out.extend(words);
+    out
 }
 
 /// SIGINT signal handler - sets the SIGINT_RECEIVED flag
@@ -80,7 +115,9 @@ fn setup_signals() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("ed");
 
-    let args = Args::parse();
+    let args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+        rewrite_lone_dash(std::env::args_os().collect()),
+    ));
 
     // Set up signal handlers
     setup_signals();

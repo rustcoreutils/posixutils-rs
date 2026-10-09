@@ -351,3 +351,20 @@ fn invalid_field_spec_test() {
 
     run_test_join(&args, "", "join: invalid field specifier: '0.1'\n", 1)
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-a", "-e", "-o", "-t", "-v", "-1", "-2"] {
+        plib::testing::assert_hyphen_option_argument("join", &[opt, "-zq", "--help"]);
+    }
+}
+
+// XBD 12.1: `-t=` is the field separator "=", not `-t` with an empty one.
+#[test]
+fn attached_option_argument_may_begin_with_equals() {
+    let file2 = fixture("equals.txt");
+    run_test_join_stdin(&["-t=", "-", &file2], "a=1\nb=x\n", "a=1=2\nb=x=3\n", "", 0);
+    plib::testing::assert_equals_option_argument("join", "-t", &["-", &file2], b"a=1\n");
+}

@@ -175,10 +175,10 @@ struct Args {
     #[arg(short = 'M', long, help = gettext("Create/read multi-volume archives"))]
     multi_volume: bool,
 
-    #[arg(long, help = gettext("Specify the tape/volume length in bytes (used with -M)"))]
+    #[arg(long, allow_hyphen_values = true, help = gettext("Specify the tape/volume length in bytes (used with -M)"))]
     tape_length: Option<u64>,
 
-    #[arg(long, help = gettext("Run this script at end of each volume (for -M mode)"))]
+    #[arg(long, allow_hyphen_values = true, help = gettext("Run this script at end of each volume (for -M mode)"))]
     new_volume_script: Option<String>,
 
     // Pathnames are byte strings, so operands are not required to be UTF-8.
@@ -256,7 +256,7 @@ fn main() -> ExitCode {
     let program = ProgramMode::detect();
     error::set_program_name(program.name());
     let args = match program {
-        ProgramMode::Pax => Ok(Args::parse()),
+        ProgramMode::Pax => Ok(plib::optarg::parse::<Args>()),
         ProgramMode::Tar => cli::tar::parse(std::env::args_os().collect()),
         ProgramMode::Cpio => cli::cpio::parse(std::env::args_os().collect()),
     };

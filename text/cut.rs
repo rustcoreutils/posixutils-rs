@@ -18,16 +18,16 @@ use std::path::PathBuf;
 #[derive(Parser, Clone)]
 #[command(version, about = gettext("cut - cut out selected fields of each line of a file"))]
 struct Args {
-    #[arg(short = 'b', long, help = gettext("Cut based on a list of bytes"))]
+    #[arg(short = 'b', long, allow_hyphen_values = true, help = gettext("Cut based on a list of bytes"))]
     bytes: Option<String>,
 
-    #[arg(short = 'c', long, help = gettext("Cut based on a list of characters"))]
+    #[arg(short = 'c', long, allow_hyphen_values = true, help = gettext("Cut based on a list of characters"))]
     characters: Option<String>,
 
-    #[arg(short = 'f', long, help = gettext("Cut based on a list of fields"))]
+    #[arg(short = 'f', long, allow_hyphen_values = true, help = gettext("Cut based on a list of fields"))]
     fields: Option<String>,
 
-    #[arg(short = 'd', long, help = gettext("Set the field delimiter"))]
+    #[arg(short = 'd', long, allow_hyphen_values = true, help = gettext("Set the field delimiter"))]
     delimiter: Option<char>,
 
     #[structopt(short = 's', long, help = gettext("Suppress lines with no delimiter characters"))]
@@ -456,7 +456,7 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("cut");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if let Err(err) = cut_files(args) {
         plib::diag::error(&format!("{}", err));

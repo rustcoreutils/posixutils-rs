@@ -29,13 +29,13 @@ const N_C_GROUP: &str = "N_C_GROUP";
     after_help = gettext("The historical form -number is accepted as -n number wherever an option may appear; the last -n or -number given wins.")
 )]
 struct Args {
-    #[arg(long = "lines", short, value_parser = clap::value_parser!(usize), group = N_C_GROUP,
+    #[arg(long = "lines", short, allow_hyphen_values = true, value_parser = clap::value_parser!(usize), group = N_C_GROUP,
           help = gettext("The first <N> lines of each input file shall be copied to standard output (mutually exclusive with -c)"))]
     n: Option<usize>,
 
     // Note: -c was added to POSIX in POSIX.1-2024, but has been supported on most platforms since the late 1990s
     // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/head.html
-    #[arg(long = "bytes", short = 'c', value_parser = clap::value_parser!(usize), group = N_C_GROUP,
+    #[arg(long = "bytes", short = 'c', allow_hyphen_values = true, value_parser = clap::value_parser!(usize), group = N_C_GROUP,
           help = gettext("The first <N> bytes of each input file shall be copied to standard output (mutually exclusive with -n)"))]
     bytes_to_copy: Option<usize>,
 
@@ -192,7 +192,9 @@ fn head_file(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("head");
 
-    let mut args = Args::parse_from(expand_historical_count(std::env::args_os()));
+    let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+        expand_historical_count(std::env::args_os()),
+    ));
 
     // POSIX makes "the number is a positive integer" a constraint on the
     // application, not a reason for head to fail: a count of zero selects
@@ -236,5 +238,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         first = false;
     }
 
+    plib::diag::flush_stdout();
     std::process::exit(plib::diag::exit_status())
 }

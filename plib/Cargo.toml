@@ -12,10 +12,11 @@ cfg-if = "1.0"
 libc.workspace = true
 errno.workspace = true
 gettext-rs.workspace = true
-
-# Formats times on Windows, which has no strftime(3) of its own (timefmt.rs).
-[target.'cfg(windows)'.dependencies]
+# Parses the date-time operand of touch -d and date -d (date_arg.rs), and
+# formats times on Windows, which has no strftime(3) of its own (timefmt.rs).
 chrono.workspace = true
+# Reads which options take an argument from a command's definition (optarg.rs).
+clap.workspace = true
 
 # Compiles the vendored musl regex for a Windows target (see build.rs). Not
 # under [target.'cfg(windows)'.build-dependencies]: Cargo matches that against

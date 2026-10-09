@@ -26,12 +26,12 @@ struct Args {
     #[arg(short = 'c', help = gettext("Copy files to spool directory before printing"))]
     _copy: bool,
 
-    #[arg(short = 'd', help = gettext("Printer destination (IPP URI)"))]
+    #[arg(short = 'd', allow_hyphen_values = true, help = gettext("Printer destination (IPP URI)"))]
     dest: Option<String>,
 
     // Upper-bounded to i32::MAX: the IPP `copies` attribute is a signed 32-bit
     // integer, so a larger value would wrap negative when sent.
-    #[arg(short = 'n', default_value = "1", value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)), help = gettext("Number of copies to print"))]
+    #[arg(short = 'n', allow_hyphen_values = true, default_value = "1", value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)), help = gettext("Number of copies to print"))]
     copies: u32,
 
     #[arg(short = 'm', help = gettext("Send mail after printing"))]
@@ -43,10 +43,10 @@ struct Args {
     #[arg(short = 'w', help = gettext("Write to terminal after printing"))]
     write_terminal: bool,
 
-    #[arg(short = 'o', action = clap::ArgAction::Append, help = gettext("Printer-dependent options"))]
+    #[arg(short = 'o', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Printer-dependent options"))]
     options: Vec<String>,
 
-    #[arg(short = 't', help = gettext("Title for the banner page"))]
+    #[arg(short = 't', allow_hyphen_values = true, help = gettext("Title for the banner page"))]
     title: Option<String>,
 
     #[arg(help = gettext("Files to print (use '-' for stdin)"))]
@@ -459,7 +459,7 @@ fn do_lp(mut args: Args) -> Result<bool, String> {
 fn main() -> ExitCode {
     plib::diag::init_locale("lp");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     match do_lp(args) {
         Ok(false) => ExitCode::SUCCESS,

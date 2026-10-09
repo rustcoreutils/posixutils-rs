@@ -11,7 +11,7 @@ use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use super::array::{KeyIterator, ValueIndex};
+use super::array::{Array, KeyIterator, ValueIndex};
 use super::value::{AwkRefType, AwkValue, AwkValueVariant};
 use crate::program::{Action, Function, OpCode, SourceLocation};
 
@@ -224,12 +224,67 @@ impl<'i, 's> Stack<'i, 's> {
         }
     }
 
+    /// Returns a pointer to local `index` for assigning it as a scalar.  A
+    /// parameter that still aliases the caller's unset variable stops
+    /// aliasing it here: the caller's variable becomes a scalar, as in gawk,
+    /// but what is assigned to the parameter stays local.  If the caller's
+    /// variable has meanwhile become an array the alias is kept, and the
+    /// assignment reports an array used in scalar context.
+    pub(crate) fn local_scalar_ref_ptr(&mut self, index: usize) -> Option<*mut AwkValue> {
+        if unsafe { self.sp.offset_from(self.bp) } <= index as isize {
+            return None;
+        }
+        let slot = unsafe { &mut *self.bp.add(index) };
+        if let StackValue::UninitializedRef(caller_var) = slot {
+            // valid by stack invariance: the caller's variable outlives this frame
+            let caller_var = unsafe { &mut **caller_var };
+            match caller_var.value {
+                AwkValueVariant::Array(_) => return Some(caller_var),
+                AwkValueVariant::Uninitialized => {
+                    caller_var.value = AwkValueVariant::UninitializedScalar
+                }
+                _ => {}
+            }
+            let local = AwkValue {
+                value: caller_var.value.clone(),
+                ref_type: AwkRefType::None,
+            };
+            *slot = StackValue::Value(UnsafeCell::new(local));
+        }
+        self.get_mut_value_ptr(index)
+    }
+
     pub(crate) fn pop_value(&mut self) -> AwkValue {
         // safe by type invariance
         unsafe {
             let value = self.pop().expect("empty stack");
             value.into_owned()
         }
+    }
+
+    /// Pops the reference on top of the stack, then the scalar value under it.
+    pub(crate) fn pop_scalar_under_ref(&mut self) -> Result<(AwkValue, &mut AwkValue), String> {
+        let reference = self.pop().expect("empty stack");
+        let value = self.pop_scalar_value()?;
+        // safe by type invariance: a reference points to a variable, a field
+        // or an array element, never to the stack slots popped here
+        Ok((value, unsafe { &mut *reference.unwrap_ptr() }))
+    }
+
+    /// Pops the variable on top of the stack that is used as an array: a
+    /// pointer to it, or an error if it holds a scalar's value.
+    pub(crate) fn pop_array_ptr(&mut self) -> Result<*mut AwkValue, String> {
+        match self.pop().expect("empty stack") {
+            StackValue::Value(_) => Err("scalar used in array context".to_string()),
+            // safe by type invariance
+            reference => Ok(unsafe { reference.unwrap_ptr() }),
+        }
+    }
+
+    /// Pops the array on top of the stack, see `pop_array_ptr`.
+    pub(crate) fn pop_array(&mut self) -> Result<&mut Array, String> {
+        // safe by type invariance
+        unsafe { &mut *self.pop_array_ptr()? }.as_array()
     }
 
     pub(crate) fn pop_ref(&mut self) -> &mut AwkValue {
@@ -256,15 +311,11 @@ impl<'i, 's> Stack<'i, 's> {
 
     pub(crate) fn call_function(&mut self, function: &'i Function) {
         unsafe { assert!(self.sp.offset_from(self.bp) >= function.parameters_count as isize) };
+        // A parameter bound to the caller's unset variable stays an
+        // `UninitializedRef` to it, so that using the parameter as an array
+        // makes the caller's variable that array; `local_scalar_ref_ptr`
+        // ends the alias when the parameter is assigned as a scalar.
         let new_bp = unsafe { self.sp.sub(function.parameters_count) };
-        // Convert UninitializedRef parameters to owned values to break aliasing
-        // between function parameters and the caller's variables
-        for i in 0..function.parameters_count {
-            let param = unsafe { &mut *new_bp.add(i) };
-            if let StackValue::UninitializedRef(_) = param {
-                *param = StackValue::Value(UnsafeCell::new(AwkValue::uninitialized()));
-            }
-        }
         let caller_frame = CallFrame {
             bp: self.bp,
             sp: new_bp,
@@ -291,6 +342,9 @@ impl<'i, 's> Stack<'i, 's> {
         self.bp = caller_frame.bp;
         self.sp = caller_frame.sp;
         self.instructions = caller_frame.instructions;
+        self.source_locations = caller_frame.source_locations;
+        self.current_function_name = caller_frame.function_name;
+        self.current_function_file = caller_frame.function_file;
         self.ip = caller_frame.ip;
     }
 
@@ -318,14 +372,25 @@ pub(crate) enum ExecutionResult {
     Expression(AwkValue),
     Next,
     NextFile,
-    Exit(i32),
+    /// `exit [status]`; no status keeps that of an earlier `exit status`
+    Exit(Option<i32>),
 }
 
 impl ExecutionResult {
-    pub(crate) fn expr_to_bool(self) -> bool {
-        self.unwrap_expr().scalar_as_bool()
+    /// The truth value of a pattern's result.  A `next`, `nextfile` or
+    /// `exit` executed by a function the pattern called is put in `control`,
+    /// and the pattern does not match.
+    pub(crate) fn pattern_matched(self, control: &mut Option<ExecutionResult>) -> bool {
+        match self {
+            ExecutionResult::Expression(value) => value.scalar_as_bool(),
+            other => {
+                *control = Some(other);
+                false
+            }
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn unwrap_expr(self) -> AwkValue {
         match self {
             ExecutionResult::Expression(value) => value,

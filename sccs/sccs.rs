@@ -337,7 +337,7 @@ fn get_editing_info(
 fn main() -> ExitCode {
     plib::diag::init_locale("sccs");
 
-    let args: Vec<String> = env::args().collect();
+    let args = plib::optarg::args_utf8("sccs");
 
     if args.len() < 2 {
         usage();

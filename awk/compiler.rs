@@ -18,10 +18,9 @@ use crate::regex::Regex;
 use pest::error::InputLocation;
 use pest::iterators::{Pair, Pairs};
 use pest::pratt_parser::{Assoc, Op, PrattParser};
-use pest::Parser;
+use pest::{Parser, Position, Span};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::LazyLock;
@@ -220,7 +219,8 @@ static PRATT_PARSER: LazyLock<PrattParser<Rule>> = LazyLock::new(|| {
         .op(Op::infix(Rule::and, Assoc::Left))
         .op(Op::infix(Rule::in_op, Assoc::Left))
         .op(Op::infix(Rule::match_op, Assoc::Left) | Op::infix(Rule::not_match, Assoc::Left))
-        .op(Op::infix(Rule::comp_op, Assoc::Left))
+        .op(Op::infix(Rule::comp_op, Assoc::Left) | Op::infix(Rule::print_comp_op, Assoc::Left))
+        .op(Op::postfix(Rule::piped_getline))
         .op(Op::infix(Rule::concat, Assoc::Left))
         .op(Op::infix(Rule::add, Assoc::Left) | Op::infix(Rule::binary_sub, Assoc::Left))
         .op(Op::infix(Rule::mul, Assoc::Left)
@@ -327,6 +327,77 @@ fn lvalue_to_scalar_ref(instructions: &mut [OpCode]) {
         OpCode::IndexArrayGetValue => *last_ref = OpCode::IndexArrayGetRef,
         _ => unreachable!(),
     }
+}
+
+/// The only child of `pair`, if it has exactly one and it is a `kind`.
+fn only_child(pair: Pair<Rule>, kind: Rule) -> Option<Pair<Rule>> {
+    let mut inner = pair.into_inner();
+    let child = inner.next()?;
+    (inner.next().is_none() && child.as_rule() == kind).then_some(child)
+}
+
+/// The simple binary expression an `expr` consists of, if that is all it is.
+fn plain_binary_expr(expr: Pair<Rule>) -> Option<Pair<Rule>> {
+    let ternary = only_child(expr, Rule::ternary_expr)?;
+    only_child(
+        only_child(ternary, Rule::binary_expr)?,
+        Rule::simple_binary_expr,
+    )
+}
+
+/// For the statement `s = s t...`, returns the lvalue s and the tokens of
+/// `t...`, if every operator in them binds at least as tightly as
+/// concatenation (so that the statement appends `t...` to s) and none of
+/// them can change a variable (so that s may be read after them).
+fn append_statement_parts(stmt: Pair<Rule>) -> Option<(Pair<Rule>, Pairs<Rule>)> {
+    let assignment = only_child(stmt, Rule::assignment)?;
+    let mut parts = assignment.into_inner();
+    let (target, op, rhs) = (parts.next()?, parts.next()?, parts.next()?);
+    let name = only_child(target.clone(), Rule::name)?;
+    only_child(op, Rule::assign)?;
+
+    let mut tokens = plain_binary_expr(rhs)?.into_inner();
+    let first = only_child(tokens.next()?, Rule::name)?;
+    if first.as_str() != name.as_str() || tokens.next()?.as_rule() != Rule::concat {
+        return None;
+    }
+    tokens.peek()?;
+    let binds_looser_than_concat = |kind| {
+        matches!(
+            kind,
+            Rule::or | Rule::and | Rule::in_op | Rule::match_op | Rule::not_match | Rule::comp_op
+        )
+    };
+    if tokens
+        .clone()
+        .any(|t| binds_looser_than_concat(t.as_rule()))
+    {
+        return None;
+    }
+    let may_change_a_variable = |kind| {
+        matches!(
+            kind,
+            Rule::function_call
+                | Rule::assignment
+                | Rule::pre_inc
+                | Rule::pre_dec
+                | Rule::post_inc
+                | Rule::post_dec
+                | Rule::getline
+                | Rule::piped_getline
+                | Rule::sub
+                | Rule::gsub
+                | Rule::split
+        )
+    };
+    if tokens
+        .clone()
+        .flatten()
+        .any(|t| may_change_a_variable(t.as_rule()))
+    {
+        return None;
+    }
+    Some((target, tokens))
 }
 
 fn normalize_builtin_function_arguments(
@@ -465,6 +536,8 @@ impl Instructions {
 struct LoopStubs {
     break_stubs: Vec<usize>,
     continue_stubs: Vec<usize>,
+    /// A `for (k in a)` loop, whose iterator is on the stack.
+    is_for_in: bool,
 }
 
 struct Compiler {
@@ -614,7 +687,10 @@ impl Compiler {
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::ere => {
-                let ere_c_str = CString::new(primary.as_str().trim_matches('/')).unwrap();
+                // only the delimiters: `/\//` ends in an escaped slash
+                let text = primary.as_str();
+                let ere_c_str = crate::charset::to_cstring(&text[1..text.len() - 1])
+                    .map_err(|e| pest_error_from_span(primary.as_span(), e))?;
                 let regex = Regex::new(ere_c_str)
                     .map_err(|e| pest_error_from_span(primary.as_span(), e))?;
                 let index = self.push_constant(Constant::Regex(Rc::new(regex)));
@@ -656,6 +732,7 @@ impl Compiler {
                 self.compile_lvalue(primary, &mut instructions, locals)?;
                 Ok(Expr::new(ExprKind::LValue, instructions))
             }
+            Rule::getline => self.compile_getline(primary, locals),
             Rule::function_call => {
                 let span = primary.as_span();
                 let line_col = primary.line_col();
@@ -783,10 +860,28 @@ impl Compiler {
         }
     }
 
-    fn map_postfix(&self, lhs: Expr, op: Pair<Rule>) -> Result<Expr, PestError> {
-        assert!(op.as_rule() == Rule::post_inc || op.as_rule() == Rule::post_dec);
+    fn map_postfix(&self, lhs: Expr, op: Pair<Rule>, locals: &LocalMap) -> Result<Expr, PestError> {
         let kind = lhs.kind;
         let mut instructions = lhs.instructions;
+        if op.as_rule() == Rule::piped_getline {
+            // `cmd | getline [var]`: the command, then the target
+            let line_col = op.line_col();
+            self.compile_getline_target(
+                op.into_inner().next(),
+                line_col,
+                &mut instructions,
+                locals,
+            )?;
+            instructions.push(
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromPipe,
+                    argc: 2,
+                },
+                line_col,
+            );
+            return Ok(Expr::new(ExprKind::Number, instructions));
+        }
+        assert!(op.as_rule() == Rule::post_inc || op.as_rule() == Rule::post_dec);
         if kind != ExprKind::LValue {
             return Err(pest_error_from_span(
                 op.as_span(),
@@ -869,7 +964,7 @@ impl Compiler {
                 instructions.push(OpCode::Le, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
-            Rule::comp_op => {
+            Rule::comp_op | Rule::print_comp_op => {
                 if lhs_kind == ExprKind::Comp || rhs_kind == ExprKind::Comp {
                     return Err(pest_error_from_span(
                         op.as_span(),
@@ -916,7 +1011,7 @@ impl Compiler {
         PRATT_PARSER
             .map_primary(|primary| self.map_primary(primary, locals))
             .map_prefix(|op, rhs| self.map_prefix(op, rhs?))
-            .map_postfix(|lhs, op| self.map_postfix(lhs?, op))
+            .map_postfix(|lhs, op| self.map_postfix(lhs?, op, locals))
             .map_infix(|lhs, op, rhs| self.map_infix(lhs?, op, rhs?))
             .parse(expr)
     }
@@ -962,31 +1057,37 @@ impl Compiler {
         locals: &LocalMap,
     ) -> Result<Expr, PestError> {
         let mut prefix_ops = Vec::new();
-        let mut primary_pair = None;
-        let mut postfix_ops = Vec::new();
-
+        let mut operand = None;
+        let mut postfix_op = None;
         for child in field_var.into_inner() {
             match child.as_rule() {
                 Rule::pre_inc | Rule::pre_dec | Rule::not | Rule::unary_plus | Rule::negate => {
-                    if primary_pair.is_none() {
-                        prefix_ops.push(child);
-                    }
+                    prefix_ops.push(child);
                 }
-                Rule::post_inc | Rule::post_dec => {
-                    postfix_ops.push(child);
-                }
-                _ => {
-                    primary_pair = Some(child);
-                }
+                Rule::post_inc | Rule::post_dec => postfix_op = Some(child),
+                _ => operand = Some(child),
             }
         }
 
-        let primary = primary_pair.expect("field_var missing primary");
-        let mut expr = self.map_primary(primary, locals)?;
-
-        // Apply postfix ops first (they bind tighter to the primary)
-        for op in postfix_ops {
-            expr = self.map_postfix(expr, op)?;
+        let operand = operand.expect("field_var missing operand");
+        let mut expr = if operand.as_rule() == Rule::nested_field {
+            // `$$i++`: the increment applies to the inner field `$i`
+            let mut inner = operand.into_inner();
+            let field = inner.next().unwrap();
+            let line_col = field.line_col();
+            let mut instructions = self.compile_field_var_expr(field, locals)?.instructions;
+            instructions.push(OpCode::GetField, line_col);
+            let mut expr = Expr::new(ExprKind::LValue, instructions);
+            if let Some(op) = inner.next() {
+                expr = self.map_postfix(expr, op, locals)?;
+            }
+            expr
+        } else {
+            self.map_primary(operand, locals)?
+        };
+        // `$-i++`: the increment binds tighter than the unary operator
+        if let Some(op) = postfix_op {
+            expr = self.map_postfix(expr, op, locals)?;
         }
 
         // Apply prefix ops in reverse order (innermost first)
@@ -1057,105 +1158,54 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_input_function(
+    /// Pushes a reference to the variable `getline` reads into: `lvalue`, or
+    /// $0 if there is none.
+    fn compile_getline_target(
         &self,
-        expr: Pair<Rule>,
+        lvalue: Option<Pair<Rule>>,
+        line_col: (usize, usize),
         instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
-        let input_function = first_child(expr);
-        let line_col = input_function.line_col();
-        match input_function.as_rule() {
-            Rule::simple_getline => {
-                if let Some(lvalue) = input_function.into_inner().next() {
-                    self.compile_lvalue(lvalue, instructions, locals)?;
-                    lvalue_to_scalar_ref(&mut instructions.opcodes);
-                } else {
-                    instructions.extend(Instructions::from_instructions_and_line_col(
-                        vec![OpCode::PushZero, OpCode::FieldRef],
-                        line_col,
-                    ));
-                }
-                instructions.push(
-                    OpCode::CallBuiltin {
-                        function: BuiltinFunction::GetLine,
-                        argc: 1,
-                    },
-                    line_col,
-                );
-            }
-            Rule::getline_from_file | Rule::getline_from_file_cmp => {
-                let is_cmp = input_function.as_rule() == Rule::getline_from_file_cmp;
-                let mut inner = input_function.into_inner();
-                let lvalue = inner.next().unwrap();
-                let file = if lvalue.as_rule() == Rule::lvalue {
-                    self.compile_lvalue(lvalue, instructions, locals)?;
-                    lvalue_to_scalar_ref(&mut instructions.opcodes);
-                    inner.next().unwrap()
-                } else {
-                    instructions.extend(Instructions::from_instructions_and_line_col(
-                        vec![OpCode::PushZero, OpCode::FieldRef],
-                        line_col,
-                    ));
-                    lvalue
-                };
-                let file_expr = self.compile_simple_binary_expr(file.into_inner(), locals)?;
-                instructions.extend(file_expr.instructions);
-                instructions.push(
-                    OpCode::CallBuiltin {
-                        function: BuiltinFunction::GetLineFromFile,
-                        argc: 2,
-                    },
-                    line_col,
-                );
-                if is_cmp {
-                    let comp = first_child(inner.next().unwrap());
-                    self.compile_expr(inner.next().unwrap(), instructions, locals)?;
-                    let op = match comp.as_rule() {
-                        Rule::lt => OpCode::Lt,
-                        Rule::le => OpCode::Le,
-                        Rule::gt => OpCode::Gt,
-                        Rule::ge => OpCode::Ge,
-                        Rule::eq => OpCode::Eq,
-                        Rule::ne => OpCode::Ne,
-                        _ => unreachable!(),
-                    };
-                    instructions.push(op, comp.line_col());
-                }
-            }
-            Rule::getline_from_pipe => {
-                let mut inner = input_function.into_inner();
-                let unpiped_expr = inner.next().unwrap();
-                let mut lvalues = Vec::new();
-                for piped_getline in inner {
-                    lvalues.push(piped_getline.into_inner().next());
-                }
-                let getline_count = lvalues.len();
-                for lvalue in lvalues.into_iter().rev() {
-                    if let Some(lvalue) = lvalue {
-                        self.compile_lvalue(lvalue.clone(), instructions, locals)?;
-                        lvalue_to_scalar_ref(&mut instructions.opcodes);
-                    } else {
-                        instructions.extend(Instructions::from_instructions_and_line_col(
-                            vec![OpCode::PushZero, OpCode::FieldRef],
-                            line_col,
-                        ));
-                    }
-                }
-                self.compile_expr(unpiped_expr, instructions, locals)?;
-                for _ in 0..getline_count {
-                    instructions.push(
-                        OpCode::CallBuiltin {
-                            function: BuiltinFunction::GetLineFromPipe,
-                            argc: 2,
-                        },
-                        line_col,
-                    );
-                }
-            }
-            _ => unreachable!(),
+        if let Some(lvalue) = lvalue {
+            self.compile_lvalue(lvalue, instructions, locals)?;
+            lvalue_to_scalar_ref(&mut instructions.opcodes);
+        } else {
+            instructions.extend(Instructions::from_instructions_and_line_col(
+                vec![OpCode::PushZero, OpCode::FieldRef],
+                line_col,
+            ));
         }
         Ok(())
+    }
+
+    /// Compiles `getline [var] [< file]`.
+    fn compile_getline(&self, getline: Pair<Rule>, locals: &LocalMap) -> Result<Expr, PestError> {
+        let line_col = getline.line_col();
+        let mut instructions = Instructions::default();
+        let mut lvalue = None;
+        let mut file = None;
+        for part in getline.into_inner() {
+            match part.as_rule() {
+                Rule::lvalue => lvalue = Some(part),
+                _ => file = Some(part),
+            }
+        }
+        let function = if let Some(file) = file {
+            let file = self.compile_simple_binary_expr(file.into_inner(), locals)?;
+            instructions.extend(file.instructions);
+            BuiltinFunction::GetLineFromFile
+        } else {
+            BuiltinFunction::GetLine
+        };
+        self.compile_getline_target(lvalue, line_col, &mut instructions, locals)?;
+        let argc = if function == BuiltinFunction::GetLine {
+            1
+        } else {
+            2
+        };
+        instructions.push(OpCode::CallBuiltin { function, argc }, line_col);
+        Ok(Expr::new(ExprKind::Number, instructions))
     }
 
     fn compile_expr(
@@ -1205,6 +1255,10 @@ impl Compiler {
                 let line_col = expr.line_col();
                 let mut inner = expr.into_inner();
                 self.compile_binary_expr(inner.next().unwrap(), instructions, locals)?;
+                if inner.peek().is_none() {
+                    // no `? :`: a plain binary expression
+                    return Ok(());
+                }
                 let mut true_expr_instructions = Instructions::default();
                 self.compile_expr(inner.next().unwrap(), &mut true_expr_instructions, locals)?;
                 instructions.push(
@@ -1223,15 +1277,43 @@ impl Compiler {
             Rule::binary_expr | Rule::binary_print_expr => {
                 self.compile_binary_expr(expr, instructions, locals)?;
             }
-            Rule::input_function | Rule::unpiped_input_function => {
-                self.compile_input_function(expr, instructions, locals)?;
-            }
             _ => unreachable!(
                 "encountered {:?} while compiling expression",
                 expr.as_rule()
             ),
         }
         Ok(())
+    }
+
+    /// Compiles the statement `s = s t...`, where s is a plain variable, as
+    /// an in-place append of `t...` to s, and returns true; returns false,
+    /// compiling nothing, for any other statement.  Like gawk, it leaves alone
+    /// a right-hand side that could change s while it is evaluated (a call,
+    /// an assignment, sub, getline...), since s is read after it, not before.
+    fn compile_append(
+        &self,
+        stmt: Pair<Rule>,
+        instructions: &mut Instructions,
+        locals: &LocalMap,
+    ) -> Result<bool, PestError> {
+        let Some((target, tail)) = append_statement_parts(stmt) else {
+            return Ok(false);
+        };
+        let is_plain_variable = locals.contains_key(target.as_str())
+            || !matches!(
+                self.names.borrow().get(target.as_str()),
+                Some(GlobalName::SpecialVar(_) | GlobalName::Function { .. })
+            );
+        if !is_plain_variable {
+            return Ok(false);
+        }
+        let line_col = target.line_col();
+        self.compile_lvalue(target, instructions, locals)?;
+        lvalue_to_scalar_ref(&mut instructions.opcodes);
+        let tail = self.compile_simple_binary_expr(tail, locals)?;
+        instructions.extend(tail.instructions);
+        instructions.push(OpCode::AppendAssign, line_col);
+        Ok(true)
     }
 
     fn compile_simple_statement(
@@ -1258,8 +1340,10 @@ impl Compiler {
                 }
             }
             Rule::expr => {
-                self.compile_expr(stmt, instructions, locals)?;
-                instructions.push(OpCode::Pop, stmt_line_col);
+                if !self.compile_append(stmt.clone(), instructions, locals)? {
+                    self.compile_expr(stmt, instructions, locals)?;
+                    instructions.push(OpCode::Pop, stmt_line_col);
+                }
             }
             Rule::print_stmt => {
                 let mut inner = stmt.into_inner();
@@ -1340,6 +1424,15 @@ impl Compiler {
         Ok(())
     }
 
+    /// Ends the iterator of every `for (k in a)` loop the statement being
+    /// compiled is in, which it leaves (`return`, `next`, `exit`...).  At a
+    /// statement the stack holds nothing else above them.
+    fn end_for_in_loops(&self, instructions: &mut Instructions, line_col: (usize, usize)) {
+        for _ in self.loop_stack.iter().filter(|l| l.is_for_in) {
+            instructions.push(OpCode::EndIterator, line_col);
+        }
+    }
+
     fn compile_do_while(
         &mut self,
         do_while: Pair<Rule>,
@@ -1349,9 +1442,11 @@ impl Compiler {
         let mut inner = do_while.into_inner();
         let start_index = instructions.len();
 
+        self.loop_stack.push(LoopStubs::default());
         let body = inner.next().unwrap();
         self.compile_stmt(body, instructions, locals)?;
 
+        let condition_start = instructions.len();
         let condition = inner.next().unwrap();
         let condition_line_col = condition.line_col();
         self.compile_expr(condition, instructions, locals)?;
@@ -1360,6 +1455,13 @@ impl Compiler {
             condition_line_col,
         );
 
+        let loop_stubs = self.loop_stack.pop().unwrap();
+        for stub in loop_stubs.break_stubs {
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, instructions.len()));
+        }
+        for stub in loop_stubs.continue_stubs {
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, condition_start));
+        }
         Ok(())
     }
 
@@ -1404,6 +1506,10 @@ impl Compiler {
         let iter_deref_location = instructions.len();
         instructions.push(OpCode::Invalid, array_var_line_col);
 
+        self.loop_stack.push(LoopStubs {
+            is_for_in: true,
+            ..LoopStubs::default()
+        });
         if let Some(body) = inner.next() {
             self.compile_stmt(body, instructions, locals)?;
         }
@@ -1416,6 +1522,14 @@ impl Compiler {
         instructions.opcodes[iter_deref_location] =
             OpCode::AdvanceIterOrJump(distance(iter_deref_location, instructions.len()));
 
+        // a `break` has ended the iterator already
+        let loop_stubs = self.loop_stack.pop().unwrap();
+        for stub in loop_stubs.break_stubs {
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, instructions.len()));
+        }
+        for stub in loop_stubs.continue_stubs {
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, iter_deref_location));
+        }
         Ok(())
     }
 
@@ -1429,27 +1543,42 @@ impl Compiler {
 
         self.loop_stack.push(LoopStubs::default());
 
+        // for_init, for_cond and for_update are always there, each holding
+        // its clause or nothing; the body is absent for `for (...);`.
         let init = inner.next().unwrap();
-        self.compile_simple_statement(init, instructions, locals)?;
+        if let Some(init) = init.into_inner().next() {
+            self.compile_simple_statement(init, instructions, locals)?;
+        }
 
         let condition_start = instructions.len();
         let condition = inner.next().unwrap();
         let condition_line_col = condition.line_col();
-        self.compile_expr(condition, instructions, locals)?;
-        let for_jump_index = instructions.len();
-        instructions.push(OpCode::Invalid, condition_line_col);
+        // An empty condition is true: the loop has no exit jump.
+        let for_jump_index = match condition.into_inner().next() {
+            Some(condition) => {
+                self.compile_expr(condition, instructions, locals)?;
+                instructions.push(OpCode::Invalid, condition_line_col);
+                Some(instructions.len() - 1)
+            }
+            None => None,
+        };
 
         let update = inner.next().unwrap();
-        let body = inner.next().unwrap();
-        self.compile_stmt(body, instructions, locals)?;
+        if let Some(body) = inner.next() {
+            self.compile_stmt(body, instructions, locals)?;
+        }
         let update_start = instructions.len();
-        self.compile_simple_statement(update, instructions, locals)?;
+        if let Some(update) = update.into_inner().next() {
+            self.compile_simple_statement(update, instructions, locals)?;
+        }
         instructions.push(
             OpCode::Jump(distance(instructions.len(), condition_start)),
             condition_line_col,
         );
-        instructions.opcodes[for_jump_index] =
-            OpCode::JumpIfFalse(distance(for_jump_index, instructions.len()));
+        if let Some(for_jump_index) = for_jump_index {
+            instructions.opcodes[for_jump_index] =
+                OpCode::JumpIfFalse(distance(for_jump_index, instructions.len()));
+        }
 
         let loop_stubs = self.loop_stack.pop().unwrap();
         for stub in loop_stubs.break_stubs {
@@ -1564,15 +1693,20 @@ impl Compiler {
             Rule::ut_foreach => self.compile_for_each(stmt, instructions, locals),
             Rule::simple_statement => self.compile_simple_statement(stmt, instructions, locals),
             Rule::nextfile => {
+                self.end_for_in_loops(instructions, stmt.line_col());
                 instructions.push(OpCode::NextFile, stmt.line_col());
                 Ok(())
             }
             Rule::next => {
+                self.end_for_in_loops(instructions, stmt.line_col());
                 instructions.push(OpCode::Next, stmt.line_col());
                 Ok(())
             }
             Rule::break_stmt => {
                 if let Some(loop_stubs) = self.loop_stack.last_mut() {
+                    if loop_stubs.is_for_in {
+                        instructions.push(OpCode::EndIterator, stmt.line_col());
+                    }
                     loop_stubs.break_stubs.push(instructions.len());
                     instructions.push(OpCode::Invalid, stmt.line_col());
                     Ok(())
@@ -1597,12 +1731,13 @@ impl Compiler {
             }
             Rule::exit_stmt => {
                 let stmt_line_col = stmt.line_col();
+                self.end_for_in_loops(instructions, stmt_line_col);
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
+                    instructions.push(OpCode::Exit, stmt_line_col);
                 } else {
-                    instructions.push(OpCode::PushZero, stmt_line_col);
+                    instructions.push(OpCode::ExitKeepingStatus, stmt_line_col);
                 }
-                instructions.push(OpCode::Exit, stmt_line_col);
                 Ok(())
             }
             Rule::return_stmt => {
@@ -1613,6 +1748,7 @@ impl Compiler {
                     ));
                 }
                 let stmt_line_col = stmt.line_col();
+                self.end_for_in_loops(instructions, stmt_line_col);
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
                 } else {
@@ -1838,17 +1974,48 @@ fn improve_error(error: PestError, file: &str) -> PestError {
     }
 }
 
+/// Places `error`, found parsing `source[offset..]`, in `source` itself, so
+/// that it reports its own line and column.
+fn rebase_error(error: PestError, source: &str, offset: usize) -> PestError {
+    match error.location {
+        InputLocation::Pos(pos) => {
+            let pos = Position::new(source, offset + pos).expect("error inside the source");
+            PestError::new_from_pos(error.variant, pos)
+        }
+        InputLocation::Span((start, end)) => {
+            let span =
+                Span::new(source, offset + start, offset + end).expect("error inside the source");
+            PestError::new_from_span(error.variant, span)
+        }
+    }
+}
+
 fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestError>, file: &str) {
     let first_error_end = location_end(&first_error.location);
 
     errors.push(improve_error(first_error, file));
-    let mut parsing_start = first_error_end;
+    let mut search_start = first_error_end;
 
-    while let Some(checkpoint_offset) = next_checkpoint(&source[parsing_start..]) {
-        parsing_start += checkpoint_offset;
+    let mut reported = vec![first_error_end];
+    while let Some(checkpoint_offset) = next_checkpoint(&source[search_start..]) {
+        let parsing_start = search_start + checkpoint_offset;
         match AwkParser::parse(Rule::program, &source[parsing_start..]) {
             Ok(_) => break,
-            Err(err) => errors.push(improve_error(err, file)),
+            Err(err) => {
+                // Several checkpoints can lead to the same error; report it once.
+                let err = rebase_error(err, source, parsing_start);
+                let end = location_end(&err.location);
+                if !reported.contains(&end) {
+                    reported.push(end);
+                    errors.push(improve_error(err, file));
+                }
+            }
+        }
+        // A keyword checkpoint starts at its own offset, so the next search
+        // begins past its first character, or it would find it again.
+        match source[parsing_start..].chars().next() {
+            Some(c) => search_start = parsing_start + c.len_utf8(),
+            None => break,
         }
     }
 }
@@ -1952,11 +2119,6 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
     } else {
         Err(CompilerErrors { errors })
     }
-}
-
-/// Returns true if the given string is a valid number token.
-pub fn is_valid_number(s: &str) -> bool {
-    AwkParser::parse(Rule::number, s).is_ok()
 }
 
 #[cfg(test)]
@@ -3279,7 +3441,7 @@ mod test {
     #[test]
     fn test_compile_exit() {
         let (instructions, _) = compile_stmt("exit;");
-        assert_eq!(instructions, vec![OpCode::PushZero, OpCode::Exit]);
+        assert_eq!(instructions, vec![OpCode::ExitKeepingStatus]);
 
         let (instructions, _) = compile_stmt("exit 1;");
         assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Exit]);
@@ -4386,9 +4548,9 @@ mod test {
         assert_eq!(
             expr,
             vec![
+                OpCode::PushConstant(0),
                 OpCode::PushZero,
                 OpCode::FieldRef,
-                OpCode::PushConstant(0),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLineFromFile,
                     argc: 2
@@ -4400,8 +4562,8 @@ mod test {
         assert_eq!(
             expr,
             vec![
-                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLineFromFile,
                     argc: 2
@@ -4416,9 +4578,9 @@ mod test {
         assert_eq!(
             expr,
             vec![
+                OpCode::PushConstant(0),
                 OpCode::PushZero,
                 OpCode::FieldRef,
-                OpCode::PushConstant(0),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLineFromPipe,
                     argc: 2
@@ -4430,8 +4592,8 @@ mod test {
         assert_eq!(
             expr,
             vec![
-                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLineFromPipe,
                     argc: 2
@@ -4444,11 +4606,11 @@ mod test {
             expr,
             vec![
                 OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
-                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLine,
                     argc: 1
                 },
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLineFromPipe,
                     argc: 2
@@ -4460,18 +4622,18 @@ mod test {
         assert_eq!(
             expr,
             vec![
-                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
-                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
-                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 2),
                 OpCode::PushConstant(0),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLineFromPipe,
                     argc: 2
                 },
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLineFromPipe,
                     argc: 2
                 },
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 2),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::GetLineFromPipe,
                     argc: 2

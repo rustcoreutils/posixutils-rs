@@ -30,10 +30,10 @@ struct OutputOptions {
     #[arg(short = 'a', help = gettext("Scan the input files in their entirety"))]
     scan_all: bool,
 
-    #[arg(short = 't', help = gettext("Byte offset format"))]
+    #[arg(short = 't', allow_hyphen_values = true, help = gettext("Byte offset format"))]
     format: Option<OffsetFormat>,
 
-    #[arg(short = 'n', default_value_t = 4, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), help = gettext("Minimum string length"))]
+    #[arg(short = 'n', allow_hyphen_values = true, default_value_t = 4, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), help = gettext("Minimum string length"))]
     minimum_string_length: usize,
 }
 
@@ -192,7 +192,7 @@ fn process_files(files: &[OsString], opts: OutputOptions) {
 
 fn main() {
     diag::init_locale("strings");
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     if args.input_files.is_empty() {
         // POSIX OPERANDS 115878-115881: with no file operand, read stdin.
         let mut bytes = Vec::new();

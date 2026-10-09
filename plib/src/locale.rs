@@ -766,6 +766,88 @@ pub fn next_char_offset(bytes: &[u8], pos: usize) -> Option<usize> {
     Some(pos + mb_char_len_fn()(&rest[..rest.len().min(MAX_CHAR_LEN)]))
 }
 
+/// The byte ranges of `bytes` that lie between the sequences the C runtime
+/// cannot decode to a `wchar_t` under the current `LC_CTYPE`, in order, an
+/// empty range included wherever two such sequences (or one and an end of
+/// `bytes`) meet; or `None` when every character decodes.
+///
+/// A sequence that does not decode is an invalid byte, standing alone, or an
+/// incomplete sequence at the end, one byte at a time. On Windows `wchar_t`
+/// is 16 bits, so in the UTF-8 mode a character above U+FFFF does not decode
+/// either, and is skipped whole.
+///
+/// [`crate::regex`] uses it to search text that its matcher cannot read in
+/// one piece.
+pub(crate) fn wchar_runs(bytes: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+    // Every supported encoding reads ASCII as itself, one byte a character.
+    if bytes.is_ascii() {
+        return None;
+    }
+    let mut runs = Vec::new();
+    let mut run_start = 0;
+    let mut i = 0;
+    let mut undecodable = undecodable_len_fn();
+    while i < bytes.len() {
+        match undecodable(&bytes[i..]) {
+            Ok(n) => i += n,
+            Err(n) => {
+                runs.push(run_start..i);
+                i += n;
+                run_start = i;
+            }
+        }
+    }
+    if runs.is_empty() {
+        return None;
+    }
+    runs.push(run_start..bytes.len());
+    Some(runs)
+}
+
+/// For [`wchar_runs`]: given a non-empty slice, `Ok` with the byte length of
+/// the character that starts it, or `Err` with the length of the sequence
+/// that does not decode there.
+#[cfg(unix)]
+fn undecodable_len_fn() -> impl FnMut(&[u8]) -> Result<usize, usize> {
+    let mut state = MbStateT::zeroed();
+    move |remaining: &[u8]| {
+        // SAFETY: the pointer/length describe a valid slice, and `state` is a
+        // live mbstate_t owned by this closure; a null first argument only
+        // asks for the byte count.
+        let n = unsafe {
+            mbrtowc(
+                std::ptr::null_mut(),
+                remaining.as_ptr() as *const libc::c_char,
+                remaining.len() as libc::size_t,
+                &mut state,
+            )
+        };
+        if n == usize::MAX || n == usize::MAX - 1 {
+            // (size_t)-1, invalid, or (size_t)-2, incomplete at the end: one
+            // byte does not decode, and the state starts over after it.
+            state = MbStateT::zeroed();
+            Err(1)
+        } else {
+            // 0 is a NUL, one byte.
+            Ok(n.max(1))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn undecodable_len_fn() -> impl FnMut(&[u8]) -> Result<usize, usize> {
+    let mode = ctype_mode();
+    move |remaining: &[u8]| match mode {
+        // The C runtime's C locale takes every byte as a character.
+        CtypeMode::C => Ok(1),
+        CtypeMode::Unicode => match decode_utf8_char(remaining) {
+            Utf8Step::Char(c, n) if u32::from(c) <= 0xFFFF => Ok(n),
+            Utf8Step::Char(_, n) => Err(n),
+            Utf8Step::Invalid | Utf8Step::Incomplete => Err(1),
+        },
+    }
+}
+
 /// A function giving the byte length of the character that starts a non-empty
 /// slice, between 1 and the slice's length, for [`mb_char_slices`]. On Unix it
 /// owns the `mbrtowc` conversion state across calls.
@@ -1610,5 +1692,21 @@ mod windows_tests {
         assert_eq!(decode_utf8_char(b"\xF0\x9F\xA6x"), Utf8Step::Invalid);
         assert_eq!(decode_utf8_char(b"\xC0\x80"), Utf8Step::Invalid); // overlong
         assert_eq!(decode_utf8_char(b"\xED\xA0"), Utf8Step::Invalid); // surrogate
+    }
+
+    #[test]
+    fn wchar_runs_split_at_what_a_16_bit_wchar_t_cannot_hold() {
+        {
+            let _mode = ctype(CtypeMode::C);
+            assert_eq!(wchar_runs(b"x\xff y"), None);
+        }
+        let _mode = ctype(CtypeMode::Unicode);
+        assert_eq!(wchar_runs("é x".as_bytes()), None);
+        assert_eq!(wchar_runs(b"x\xff y"), Some(vec![0..1, 2..4]));
+        assert_eq!(wchar_runs(b"\xff\xfe"), Some(vec![0..0, 1..1, 2..2]));
+        // A character above U+FFFF is skipped whole, an unfinished one at
+        // the end a byte at a time.
+        assert_eq!(wchar_runs("a🦀b".as_bytes()), Some(vec![0..1, 5..6]));
+        assert_eq!(wchar_runs(b"a\xF0\x9F"), Some(vec![0..1, 2..2, 3..3]));
     }
 }

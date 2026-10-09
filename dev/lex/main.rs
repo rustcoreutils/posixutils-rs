@@ -324,7 +324,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // If no files, read from stdin
     if args.files.is_empty() {

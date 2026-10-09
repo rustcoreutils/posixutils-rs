@@ -8,9 +8,8 @@
 //
 
 use std::error::Error;
-use std::os::unix::fs::PermissionsExt;
+use std::ffi::OsString;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
@@ -67,25 +66,18 @@ struct Args {
     #[arg(name = "DURATION", value_parser = parse_duration, help=gettext("The maximum amount of time to allow the utility to run, specified as a decimal number with an optional decimal fraction and an optional suffix."))]
     duration: Duration,
 
-    #[arg(name = "UTILITY", help=gettext("The utility to execute."))]
-    utility: String,
-
-    // `allow_hyphen_values` is what makes `timeout 5 ls -l` work. Without it,
-    // `trailing_var_arg` alone still lets clap try to parse a leading-hyphen
-    // token as one of timeout's own options, so *any* utility invoked with an
-    // option failed with "unexpected argument found" — `timeout 5 ls -l`,
-    // `timeout 5 grep -c ...`, `timeout 5 sh -c '...'`.
-    //
-    // XBD 12.2 Guideline 9 puts all of timeout's options before its operands,
-    // so once DURATION and UTILITY have been consumed every remaining token
-    // belongs to the utility, hyphen or not.
+    // XBD 12.2 Guideline 9: timeout's options all precede the utility, so the
+    // utility name and every word after it are one trailing operand list.
+    // With the utility as a positional of its own, clap went on parsing
+    // options after it: `timeout 10 echo -s KILL x` took `-s KILL` as
+    // timeout's signal.
     #[arg(
-        name = "ARGUMENT",
+        value_name = "UTILITY",
+        required = true,
         trailing_var_arg = true,
-        allow_hyphen_values = true,
-        help = gettext("Arguments to pass to the utility.")
+        help = gettext("The utility to execute and its arguments.")
     )]
-    arguments: Vec<String>,
+    command: Vec<OsString>,
 }
 
 /// Parses string slice into [Duration].
@@ -339,32 +331,6 @@ fn disable_core_dumps() -> bool {
     (unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) } == 0)
 }
 
-/// Searches for the executable utility in the directories specified by the `PATH` environment variable.
-///
-/// # Arguments
-///
-/// * `utility` - name of the utility to search for.
-///
-/// # Returns
-///
-/// `Option<String>` - full path to the utility if found, or `None` if not found.
-fn search_in_path(utility: &str) -> Option<String> {
-    if let Ok(paths) = std::env::var("PATH") {
-        for path in paths.split(':') {
-            let full_path = std::path::Path::new(path).join(utility);
-            if full_path.is_file() {
-                if let Ok(metadata) = std::fs::metadata(&full_path) {
-                    // Check if the file is executable
-                    if metadata.permissions().mode() & 0o111 != 0 {
-                        return Some(full_path.to_string_lossy().into_owned());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Main timeout function that creates child and processes its return exit status.
 ///
 /// # Arguments
@@ -381,26 +347,11 @@ fn timeout(args: Args) -> i32 {
         kill_after,
         signal_name,
         duration,
-        utility,
-        arguments,
+        command,
     } = args;
-
-    let utility_path = if Path::new(&utility).is_file() {
-        utility.clone()
-    } else {
-        match search_in_path(&utility) {
-            Some(path) => path,
-            None => {
-                diag::error(&format!(
-                    "{} '{}' {}",
-                    gettext("utility"),
-                    utility,
-                    gettext("not found")
-                ));
-                return 127;
-            }
-        }
-    };
+    let (utility, arguments) = command
+        .split_first()
+        .expect("clap requires the utility operand");
 
     FOREGROUND.store(foreground, Ordering::SeqCst);
     FIRST_SIGNAL.store(signal_name, Ordering::SeqCst);
@@ -432,7 +383,8 @@ fn timeout(args: Args) -> i32 {
     block_handler_and_chld(signal_name, &mut original_set);
 
     let spawn_result = unsafe {
-        Command::new(&utility_path)
+        // A name without a slash is searched for through PATH by execvp.
+        Command::new(utility)
             .args(arguments)
             .pre_exec(move || {
                 libc::sigprocmask(
@@ -454,7 +406,7 @@ fn timeout(args: Args) -> i32 {
                 diag::error(&format!(
                     "{} '{}' {}",
                     gettext("utility"),
-                    utility,
+                    utility.to_string_lossy(),
                     gettext("not found")
                 ));
                 return 127;
@@ -463,7 +415,7 @@ fn timeout(args: Args) -> i32 {
                 diag::error(&format!(
                     "{} '{}'",
                     gettext("unable to run the utility"),
-                    utility
+                    utility.to_string_lossy()
                 ));
                 return 126;
             }
@@ -544,7 +496,7 @@ fn timeout(args: Args) -> i32 {
 fn main() {
     diag::init_locale("timeout");
 
-    let args = Args::try_parse().unwrap_or_else(|err| match err.kind() {
+    let args = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| match err.kind() {
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
             print!("{err}");
             std::process::exit(0);

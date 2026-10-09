@@ -19,7 +19,7 @@ use std::{
         fd::{AsRawFd, RawFd},
         unix::{self, ffi::OsStrExt},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     rc::Rc,
 };
 
@@ -126,7 +126,7 @@ impl Drop for FileDescriptor {
 }
 
 impl FileDescriptor {
-    /// Duplicate this descriptor with `dup(2)`.
+    /// Duplicate this descriptor, close-on-exec (`fcntl(F_DUPFD_CLOEXEC)`).
     ///
     /// Fallible on purpose: a `Clone` impl has nowhere to report `EMFILE`, and the one this
     /// replaces stored the resulting `-1` instead, so the failure resurfaced later as a
@@ -136,7 +136,7 @@ impl FileDescriptor {
         if self.fd == libc::AT_FDCWD {
             return Ok(Self { fd: libc::AT_FDCWD });
         }
-        let fd = unsafe { libc::dup(self.fd) };
+        let fd = unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 0) };
         if fd == -1 {
             return Err(io::Error::last_os_error());
         }
@@ -146,13 +146,20 @@ impl FileDescriptor {
 
 impl FileDescriptor {
     /// Create a `FileDescriptor` with arguments similar to `libc::openat`.
+    ///
+    /// The descriptor is always close-on-exec (`O_CLOEXEC` is added to `flags`): a command a
+    /// caller runs during a walk (`find -exec`) must not inherit the directories it holds.
     pub fn open_at(
         dir_file_descriptor: &FileDescriptor,
         file_name: &CStr,
         flags: i32,
     ) -> io::Result<Self> {
         unsafe {
-            let fd = libc::openat(dir_file_descriptor.fd, file_name.as_ptr(), flags);
+            let fd = libc::openat(
+                dir_file_descriptor.fd,
+                file_name.as_ptr(),
+                flags | libc::O_CLOEXEC,
+            );
             if fd == -1 {
                 Err(io::Error::last_os_error())
             } else {
@@ -367,6 +374,8 @@ impl unix::fs::FileTypeExt for FileType {
 struct TreeNode {
     dir: HybridDir,
     filename: Rc<[libc::c_char]>,
+    /// The name shown for this directory when it is not `filename`; see `Entry::shown_name`.
+    shown_name: Option<Rc<[libc::c_char]>>,
     metadata: Metadata,
     /// Whether the directory entry is itself a symbolic link (one the walk followed).
     is_symlink: Option<bool>,
@@ -385,9 +394,17 @@ impl TreeNode {
             path_stack,
             self.filename.clone(),
             Some(self.metadata.clone()),
-        );
+        )
+        .with_shown_name(self.shown_name.clone());
         entry.is_symlink = self.is_symlink;
         entry
+    }
+
+    /// The name this directory contributes to the paths shown for its contents.
+    fn shown_name(&self) -> Rc<[libc::c_char]> {
+        self.shown_name
+            .clone()
+            .unwrap_or_else(|| self.filename.clone())
     }
 }
 
@@ -397,6 +414,10 @@ pub struct Entry<'a> {
     dir_file_descriptor: &'a FileDescriptor,
     path_stack: &'a [Rc<[libc::c_char]>],
     filename: Rc<[libc::c_char]>,
+    /// The name `path()` shows in place of `filename`. Only a starting point named with a trailing
+    /// slash (or `/.`) has one: the operand as written, while `filename` is the name the walk
+    /// acts on (the operand without the slash, or `.` in a symbolic link's target directory).
+    shown_name: Option<Rc<[libc::c_char]>>,
     metadata: Option<Metadata>,
     is_symlink: Option<bool>,
     read_link: Option<Rc<[libc::c_char]>>,
@@ -413,10 +434,16 @@ impl<'a> Entry<'a> {
             dir_file_descriptor,
             path_stack,
             filename,
+            shown_name: None,
             metadata,
             is_symlink: None,
             read_link: None,
         }
+    }
+
+    fn with_shown_name(mut self, shown_name: Option<Rc<[libc::c_char]>>) -> Self {
+        self.shown_name = shown_name;
+        self
     }
 
     /// Returns the file descriptor of the containing directory.
@@ -454,7 +481,35 @@ impl<'a> Entry<'a> {
     ///
     /// This is either relative to the current working directory or an absolute path.
     pub fn path(&self) -> DisplayablePath {
-        DisplayablePath(build_path(self.path_stack, &self.filename))
+        let shown = self.shown_name.as_ref().unwrap_or(&self.filename);
+        DisplayablePath(build_path(self.path_stack, shown))
+    }
+
+    /// Remove this entry by its name in the directory the walk holds open: `unlinkat(dir_fd(),
+    /// file_name(), flags)`.
+    ///
+    /// A starting point named as a symbolic link with a trailing slash (`link/`) is reached as `.`
+    /// in the directory the link resolved to, and no directory is removed by that name: that
+    /// fails with `ENOTDIR`, as Linux's `rmdir("link/")` does, without the `EINVAL` that removing
+    /// `.` would give.
+    pub fn unlink(&self, flags: libc::c_int) -> io::Result<()> {
+        if self.reached_through_symlink() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        let ret = unsafe { libc::unlinkat(self.dir_fd(), self.file_name().as_ptr(), flags) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Whether this is a starting point named as a symbolic link with a trailing slash (`link/`),
+    /// which the walk followed to the directory it names, whatever its options. Such an entry is
+    /// `.` in that directory; a caller that removes what it walks refuses it rather than act on
+    /// the link's target.
+    pub fn reached_through_symlink(&self) -> bool {
+        self.shown_name.is_some() && self.file_name() == c"."
     }
 
     /// Whether the calling process can write to the file this entry refers to.
@@ -538,10 +593,17 @@ enum ProcessFileResult<'a> {
     Skipped,
 }
 
+/// Stat one entry, call `file_handler` on it and say whether to descend.
+///
+/// `shown_name` is set only for a starting point named with a trailing slash (see
+/// `Entry::shown_name`). Such a name must resolve to a directory, so anything else is reported as
+/// `ENOTDIR` before `file_handler` sees it.
+#[allow(clippy::too_many_arguments)]
 fn process_file<'a, F, H>(
     path_stack: &'a [Rc<[libc::c_char]>],
     dir_fd: &'a FileDescriptor,
     entry_filename: Rc<[libc::c_char]>,
+    shown_name: Option<&Rc<[libc::c_char]>>,
     follow_symlinks: bool,
     is_dot_or_double_dot: bool,
     file_handler: &mut F,
@@ -560,7 +622,8 @@ where
         Ok(md) => md,
         Err(e) => {
             err_reporter(
-                Entry::new(dir_fd, path_stack, entry_filename, None),
+                Entry::new(dir_fd, path_stack, entry_filename, None)
+                    .with_shown_name(shown_name.cloned()),
                 Error::new(e, ErrorKind::Stat),
             );
             return ProcessFileResult::NotProcessed;
@@ -577,7 +640,8 @@ where
             Ok(p) => Some(p),
             Err(e) => {
                 err_reporter(
-                    Entry::new(dir_fd, path_stack, entry_filename.clone(), None),
+                    Entry::new(dir_fd, path_stack, entry_filename.clone(), None)
+                        .with_shown_name(shown_name.cloned()),
                     Error::new(e, ErrorKind::ReadLink),
                 );
                 if follow_symlinks {
@@ -605,7 +669,8 @@ where
                         (read_link, entry_symlink_metadata)
                     } else {
                         err_reporter(
-                            Entry::new(dir_fd, path_stack, entry_filename, None),
+                            Entry::new(dir_fd, path_stack, entry_filename, None)
+                                .with_shown_name(shown_name.cloned()),
                             Error::new(e, ErrorKind::Stat),
                         );
                         return ProcessFileResult::NotProcessed;
@@ -617,9 +682,20 @@ where
         (None, entry_symlink_metadata)
     };
 
-    let mut entry = Entry::new(dir_fd, path_stack, entry_filename, Some(entry_metadata));
+    let must_be_dir = shown_name.is_some() && !entry_metadata.is_dir();
+    let mut entry = Entry::new(dir_fd, path_stack, entry_filename, Some(entry_metadata))
+        .with_shown_name(shown_name.cloned());
     entry.is_symlink = Some(is_symlink);
     entry.read_link = entry_readlink;
+
+    if must_be_dir {
+        entry.metadata = None;
+        err_reporter(
+            entry,
+            Error::new(io::Error::from_raw_os_error(libc::ENOTDIR), ErrorKind::Stat),
+        );
+        return ProcessFileResult::NotProcessed;
+    }
 
     let file_handler_result = file_handler(entry.clone());
 
@@ -864,16 +940,130 @@ where
         Err(_) => return false,
     };
 
+    // `Components` drops trailing slashes and `.`s, so this is the operand's remainder without
+    // them.
     let dir_filename_cstr = CString::new(path_components.as_path().as_os_str().as_bytes()).unwrap();
-    walk_from(
+    let dir_filename = cstring_to_rc(&dir_filename_cstr);
+
+    // A trailing slash, alone or as `/.`, after a final component that may be a symbolic link
+    // changes what the operand names (POSIX pathname resolution): the link is followed, whatever
+    // the walk's options, and the result must be a directory. `/`, `.` and `..` already name
+    // directories.
+    let operand = path.as_ref().as_os_str().as_bytes();
+    let suffix = &operand[operand.len() - directory_suffix_len(operand)..];
+    if suffix.is_empty()
+        || !matches!(
+            path.as_ref().components().next_back(),
+            Some(Component::Normal(_))
+        )
+    {
+        return walk_from(
+            starting_dir,
+            path_stack,
+            dir_filename,
+            None,
+            file_handler,
+            postprocess_dir,
+            err_reporter,
+            opts,
+        );
+    }
+    walk_slash_operand(
         starting_dir,
         path_stack,
-        cstring_to_rc(&dir_filename_cstr),
+        dir_filename,
+        suffix,
         file_handler,
         postprocess_dir,
         err_reporter,
         opts,
     )
+}
+
+/// The length of the run of `/` and `/.` at the end of `path`: what follows its last component and
+/// makes it name a directory.
+fn directory_suffix_len(path: &[u8]) -> usize {
+    let mut rest = path;
+    while let Some(shorter) = rest.strip_suffix(b"/").or_else(|| rest.strip_suffix(b"/.")) {
+        rest = shorter;
+    }
+    path.len() - rest.len()
+}
+
+/// `traverse_directory` for an operand whose last component is followed by `suffix`, a run of `/`
+/// and `/.`: `dir_filename` (the operand without it) in `starting_dir` must be a directory, and a
+/// symbolic link there is followed.
+///
+/// The starting point is shown as the operand was written. A name that is not a symbolic link is
+/// walked as usual, with `process_file` refusing anything but a directory. A symbolic link is
+/// resolved once, by opening it with `O_DIRECTORY` (the kernel follows it and refuses a
+/// non-directory), and the walk starts at `.` in the directory that open pinned. Every call a
+/// caller makes on the starting entry is then relative to that descriptor and acts on that
+/// directory: a caller's `AT_SYMLINK_NOFOLLOW` call cannot reach the link instead, as it would on
+/// a system that ignores a trailing slash under `AT_SYMLINK_NOFOLLOW` (macOS), and a link replaced
+/// after the open cannot redirect it.
+#[allow(clippy::too_many_arguments)]
+fn walk_slash_operand<F, G, H>(
+    starting_dir: FileDescriptor,
+    path_stack: Vec<Rc<[libc::c_char]>>,
+    dir_filename: Rc<[libc::c_char]>,
+    suffix: &[u8],
+    file_handler: F,
+    postprocess_dir: G,
+    mut err_reporter: H,
+    opts: TraverseDirectoryOpts,
+) -> bool
+where
+    F: FnMut(Entry<'_>) -> Result<bool, ()>,
+    G: FnMut(Entry<'_>, DirExit) -> Result<(), ()>,
+    H: FnMut(Entry<'_>, Error),
+{
+    let name = unsafe { CStr::from_ptr(dir_filename.as_ptr()) };
+    let mut shown = name.to_bytes().to_vec();
+    shown.extend_from_slice(suffix);
+    let shown_name = cstring_to_rc(&CString::new(shown).expect("taken from a C string"));
+
+    // Only chooses how the name is reached; it decides nothing about which object is acted on.
+    // Either way the object comes from a single later lookup that is checked to be a directory.
+    let is_symlink = Metadata::new(starting_dir.fd, name, false).is_ok_and(|md| md.is_symlink());
+    if !is_symlink {
+        return walk_from(
+            starting_dir,
+            path_stack,
+            dir_filename,
+            Some(shown_name),
+            file_handler,
+            postprocess_dir,
+            err_reporter,
+            opts,
+        );
+    }
+
+    let target = FileDescriptor::open_at(
+        &starting_dir,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    );
+    match target {
+        Ok(target) => walk_from(
+            target,
+            path_stack,
+            cstring_to_rc(c"."),
+            Some(shown_name),
+            file_handler,
+            postprocess_dir,
+            err_reporter,
+            opts,
+        ),
+        Err(e) => {
+            err_reporter(
+                Entry::new(&starting_dir, &path_stack, dir_filename.clone(), None)
+                    .with_shown_name(Some(shown_name)),
+                Error::new(e, ErrorKind::Stat),
+            );
+            false
+        }
+    }
 }
 
 /// Walk through the directory tree rooted at `name` in the directory open on `dir`.
@@ -926,6 +1116,7 @@ where
         starting_dir,
         path_stack,
         cstring_to_rc(name),
+        None,
         file_handler,
         postprocess_dir,
         err_reporter,
@@ -934,11 +1125,14 @@ where
 }
 
 /// The walk shared by `traverse_directory` and `traverse_directory_at`: `dir_filename` in
-/// `starting_dir`, whose displayed path is `path_stack`.
+/// `starting_dir`, whose displayed path is `path_stack`. With `shown_name` (a starting point named
+/// with a trailing slash), the starting point is shown by that name and must be a directory.
+#[allow(clippy::too_many_arguments)]
 fn walk_from<F, G, H>(
     starting_dir: FileDescriptor,
     mut path_stack: Vec<Rc<[libc::c_char]>>,
     dir_filename: Rc<[libc::c_char]>,
+    shown_name: Option<Rc<[libc::c_char]>>,
     mut file_handler: F,
     mut postprocess_dir: G,
     mut err_reporter: H,
@@ -968,6 +1162,7 @@ where
             &path_stack,
             &starting_dir,
             dir_filename.clone(),
+            shown_name.as_ref(),
             follow_symlinks_on_args || follow_symlinks,
             false,
             &mut file_handler,
@@ -977,8 +1172,8 @@ where
                 // `O_DIRECTORY` rejects a non-directory. `O_NOFOLLOW` is added unless the walk
                 // follows a symlinked starting point (-H/-L), so a directory swapped for a
                 // symlink after the stat above is not followed; the (dev, ino) check then refuses
-                // a swap for a different directory, as on every descent. (A trailing slash still
-                // resolves a symlinked operand, as it did for the stat.)
+                // a swap for a different directory, as on every descent. (An operand that named
+                // a symlink with a trailing slash is here as `.` in the directory it resolved to.)
                 let root_flags = if follow_symlinks_on_args || follow_symlinks {
                     libc::O_DIRECTORY
                 } else {
@@ -1004,6 +1199,7 @@ where
                         let node = TreeNode {
                             dir: HybridDir::Owned(new_dir),
                             filename: dir_filename,
+                            shown_name,
                             is_symlink: entry.is_symlink,
                             metadata: entry.metadata.unwrap(),
                             path_depth: path_stack.len(),
@@ -1097,7 +1293,7 @@ where
 
         // Push the directory's filename. The contents' filename will be concatenated to the
         // directory's filename.
-        path_stack.push(current.filename.clone());
+        path_stack.push(current.shown_name());
 
         let path_depth = path_stack.len();
 
@@ -1205,6 +1401,7 @@ where
                         &path_stack,
                         dir_fd,
                         entry_filename.clone(),
+                        None,
                         follow_symlinks,
                         is_dot_or_double_dot,
                         &mut file_handler,
@@ -1262,6 +1459,7 @@ where
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),
                                             filename: entry_filename,
+                                            shown_name: None,
                                             is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
@@ -1278,6 +1476,7 @@ where
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),
                                             filename: entry_filename,
+                                            shown_name: None,
                                             is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
@@ -1311,6 +1510,7 @@ where
                                         TreeNode {
                                             dir: HybridDir::Owned(new_dir),
                                             filename: entry_filename,
+                                            shown_name: None,
                                             is_symlink: entry.is_symlink,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,

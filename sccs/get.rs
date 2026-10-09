@@ -23,16 +23,16 @@ use posixutils_sccs::{cutoff, diag, idkw, operands, pfile, protect, sfio, zlock}
 #[derive(Parser)]
 #[command(version, about = gettext("get - get a version of an SCCS file"))]
 struct Args {
-    #[arg(short = 'r', value_name = "SID", help = gettext("SID to retrieve"))]
+    #[arg(short = 'r', allow_hyphen_values = true, value_name = "SID", help = gettext("SID to retrieve"))]
     sid: Option<String>,
 
-    #[arg(short = 'c', value_name = "CUTOFF", help = gettext("Cutoff date-time; exclude deltas created after it"))]
+    #[arg(short = 'c', allow_hyphen_values = true, value_name = "CUTOFF", help = gettext("Cutoff date-time; exclude deltas created after it"))]
     cutoff: Option<String>,
 
-    #[arg(short = 'i', value_name = "LIST", help = gettext("List of deltas (SIDs) to include"))]
+    #[arg(short = 'i', allow_hyphen_values = true, value_name = "LIST", help = gettext("List of deltas (SIDs) to include"))]
     include: Option<String>,
 
-    #[arg(short = 'x', value_name = "LIST", help = gettext("List of deltas (SIDs) to exclude"))]
+    #[arg(short = 'x', allow_hyphen_values = true, value_name = "LIST", help = gettext("List of deltas (SIDs) to exclude"))]
     exclude: Option<String>,
 
     #[arg(short = 'l', help = gettext("Write a delta summary into an l-file"))]
@@ -954,7 +954,7 @@ fn main() -> ExitCode {
     // handler installed the registry is inert and ^C strands z.<name>.
     zlock::install_cleanup();
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Expand operands: a lone "-" reads s-file pathnames from stdin, and
     // directory operands expand to their sorted s.* members.

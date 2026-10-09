@@ -149,7 +149,7 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
 fn main() -> ExitCode {
     plib::diag::init_locale("cmp");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     match cmp_main(&args) {
         Ok(x) => ExitCode::from(x),

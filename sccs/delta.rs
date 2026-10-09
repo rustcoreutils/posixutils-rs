@@ -44,7 +44,7 @@ fn read_stdin_line() -> String {
 #[derive(Parser)]
 #[command(version, about = gettext("delta - make a delta (change) to an SCCS file"))]
 struct Args {
-    #[arg(short = 'r', value_name = "SID", help = gettext("SID of delta to create (if multiple edits pending)"))]
+    #[arg(short = 'r', allow_hyphen_values = true, value_name = "SID", help = gettext("SID of delta to create (if multiple edits pending)"))]
     sid: Option<String>,
 
     #[arg(short = 'y', value_name = "COMMENT", num_args = 0..=1, default_missing_value = "", help = gettext("Comment for delta"))]
@@ -53,7 +53,7 @@ struct Args {
     #[arg(short = 'm', value_name = "MRLIST", num_args = 0..=1, default_missing_value = "", help = gettext("Modification request (MR) numbers for delta"))]
     mrlist: Option<String>,
 
-    #[arg(short = 'g', value_name = "LIST", help = gettext("List of deltas to ignore at this change level"))]
+    #[arg(short = 'g', allow_hyphen_values = true, value_name = "LIST", help = gettext("List of deltas to ignore at this change level"))]
     glist: Option<String>,
 
     #[arg(short = 'n', help = gettext("Retain g-file after delta"))]
@@ -734,7 +734,7 @@ fn main() -> ExitCode {
 
     zlock::install_cleanup();
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // When the single operand is '-', the spec requires the comment to be
     // supplied via -y (and the MR list via -m if the v flag is set), since

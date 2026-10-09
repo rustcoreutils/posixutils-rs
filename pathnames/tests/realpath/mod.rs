@@ -7,10 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
-// Only the Linux-only non-UTF-8 test below needs the byte-oriented plan.
-#[cfg(target_os = "linux")]
-use plib::testing::{os_bytes, run_test_os, TestPlanOs};
+use plib::testing::{create_non_utf8, os_bytes, run_test, run_test_os, TestPlan, TestPlanOs};
 
 fn realpath_test(args: &[&str], stdout: &str, stderr: &str, expected_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -268,22 +265,22 @@ fn realpath_newline_is_error() {
 /// A real directory entry is needed because `-e` resolution stats the path, so
 /// this creates one with a non-UTF-8 name rather than asserting on a string.
 ///
-/// Linux-only: APFS and HFS+ validate that filenames are well-formed UTF-8 and
-/// reject the `\xff\xfe` name with EILSEQ, so such a directory entry cannot be
-/// created on macOS at all. The byte-clean operand handling this covers is
-/// filesystem-independent, and `basename`/`dirname` exercise it on both
-/// platforms since they never touch the filesystem.
-#[cfg(target_os = "linux")]
+/// Skipped where the filesystem refuses the `\xff\xfe` name (macOS APFS and
+/// HFS+ answer EILSEQ), as such a directory entry cannot be created there at
+/// all. The byte-clean operand handling this covers is filesystem-independent,
+/// and `basename`/`dirname` exercise it on every platform since they never
+/// touch the filesystem.
 #[test]
 fn realpath_non_utf8_operand() {
     use std::os::unix::ffi::OsStrExt;
 
     let td = plib::tmp::tempdir().unwrap();
     // The temp dir path itself is valid UTF-8; only the entry name is not.
-    let mut name = td.path().as_os_str().as_bytes().to_vec();
-    name.extend_from_slice(b"/\xff\xfefile");
-    let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&name));
-    std::fs::write(&path, b"x").unwrap();
+    let Some(path) = create_non_utf8(td.path(), b"\xff\xfefile", |p| std::fs::write(p, b"x"))
+    else {
+        return;
+    };
+    let name = path.as_os_str().as_bytes().to_vec();
 
     let mut expected = name.clone();
     expected.push(b'\n');
@@ -296,4 +293,115 @@ fn realpath_non_utf8_operand() {
         expected_err: Vec::new(),
         expected_exit_code: 0,
     });
+}
+
+/// Directory `real/sub`, a symbolic link `link -> real/sub`, and a regular
+/// file `file`, for the `-s` tests.  Returns the temp dir and its path.
+fn nosym_fixture() -> (plib::tmp::TempDir, String) {
+    let td = plib::tmp::tempdir().unwrap();
+    let base = td.path().to_str().unwrap().to_string();
+    std::fs::create_dir_all(td.path().join("real/sub")).unwrap();
+    symlink("real/sub", td.path().join("link")).unwrap();
+    std::fs::write(td.path().join("file"), b"x").unwrap();
+    (td, base)
+}
+
+// -s / --no-symlinks: a symbolic link is printed as named, not followed.
+#[test]
+fn realpath_no_symlinks_keeps_link() {
+    let (_td, base) = nosym_fixture();
+    let out = format!("{base}/link\n");
+    realpath_test(&["-s", &format!("{base}/link")], &out, "", 0);
+    realpath_test(&["--no-symlinks", &format!("{base}/link")], &out, "", 0);
+    realpath_test(&["-s", "-e", &format!("{base}/link/")], &out, "", 0);
+}
+
+// `..` removes the previous name lexically, even when that name is a link.
+#[test]
+fn realpath_no_symlinks_dotdot_is_lexical() {
+    let (_td, base) = nosym_fixture();
+    realpath_test(
+        &["-s", &format!("{base}/link/..")],
+        &format!("{base}\n"),
+        "",
+        0,
+    );
+    realpath_test(
+        &["-s", &format!("{base}/./real/../link/x")],
+        &format!("{base}/link/x\n"),
+        "",
+        0,
+    );
+    realpath_test(&["-s", "//..//../real"], "/real\n", "", 0);
+}
+
+// A relative operand is made absolute against the working directory.
+#[test]
+fn realpath_no_symlinks_relative() {
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = cwd.to_str().unwrap();
+    realpath_test(
+        &["-s", "tests/../nosuch"],
+        &format!("{cwd}/nosuch\n"),
+        "",
+        0,
+    );
+    realpath_test(&["-s", "."], &format!("{cwd}\n"), "", 0);
+    realpath_test(&["-s"], &format!("{cwd}\n"), "", 0);
+}
+
+// Every name but the last must exist, and a name followed by more of the
+// path must be a directory; -e requires the last name to exist too.
+#[test]
+fn realpath_no_symlinks_existence() {
+    let (_td, base) = nosym_fixture();
+    let p = |s: &str| format!("{base}/{s}");
+    let err = |s: &str, msg: &str| format!("realpath: {base}/{s}: {msg}\n");
+
+    realpath_test(&["-s", &p("missing")], &format!("{base}/missing\n"), "", 0);
+    realpath_test(&["-s", &p("missing/")], &format!("{base}/missing\n"), "", 0);
+    realpath_test(
+        &["-s", "-e", &p("missing")],
+        "",
+        &err("missing", "No such file or directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", "-e", &p("link/x")],
+        "",
+        &err("link/x", "No such file or directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", &p("real/missing/../file")],
+        "",
+        &err("real/missing/../file", "No such file or directory"),
+        1,
+    );
+    // GNU prints this one; a missing directory is an error here, as in -E.
+    realpath_test(
+        &["-s", &p("missing/x")],
+        "",
+        &err("missing/x", "No such file or directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", &p("file/")],
+        "",
+        &err("file/", "Not a directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", &p("file/x")],
+        "",
+        &err("file/x", "Not a directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", &p("file/..")],
+        "",
+        &err("file/..", "Not a directory"),
+        1,
+    );
+    realpath_test(&["-s", "-q", &p("file/..")], "", "", 1);
 }

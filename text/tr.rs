@@ -348,7 +348,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn Error>> {
     plib::diag::init_locale("tr");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if let Err(error_string) = args.validate_args() {
         eprintln!("tr: {error_string}");
@@ -359,6 +359,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Err(error) = tr(&args) {
         eprintln!("tr: {error}");
 
+        process::exit(1_i32);
+    }
+
+    if !plib::diag::flush_stdout() {
         process::exit(1_i32);
     }
 

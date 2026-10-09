@@ -2012,3 +2012,365 @@ fn test_diff_io_error_names_the_failing_path() {
     assert_eq!(code, Some(EXIT_STATUS_TROUBLE));
     assert!(stderr.contains(broken.to_str().unwrap()), "got {stderr:?}");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn diff_option_argument_may_begin_with_hyphen() {
+    for opt in ["-C", "-U", "-L", "--label2"] {
+        plib::testing::assert_hyphen_option_argument("diff", &[opt, "-zq", "--help"]);
+    }
+}
+
+/// A file operand that is neither a regular file nor a directory -- here the
+/// character device /dev/null -- is a file to compare, not a directory to
+/// look inside. It was classified by "is it a regular file?", so /dev/null
+/// took the file-versus-directory path and diff looked for "/dev/null/e".
+// Unix only: /dev/null.
+#[cfg(unix)]
+#[test]
+fn test_diff_non_regular_file_operand_is_compared_as_a_file() {
+    let (_base, a, _b) = dir_pair();
+    let empty = a.join("e");
+    let full = a.join("n");
+    std::fs::write(&empty, "").unwrap();
+    std::fs::write(&full, "x\n").unwrap();
+    let (empty, full) = (empty.to_str().unwrap(), full.to_str().unwrap());
+
+    for args in [
+        vec!["-u", "/dev/null", empty],
+        vec!["-u", empty, "/dev/null"],
+        vec!["/dev/null", empty],
+    ] {
+        let (stdout, stderr, code) = run_diff(&args);
+        assert_eq!(
+            code,
+            Some(EXIT_STATUS_NO_DIFFERENCE),
+            "{args:?}: {stderr:?}"
+        );
+        assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""), "{args:?}");
+    }
+
+    let (stdout, stderr, code) = run_diff(&["-u", "/dev/null", full]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE), "{stderr:?}");
+    assert!(stdout.starts_with("--- /dev/null\t"), "got {stdout:?}");
+    assert!(
+        stdout.contains(&format!("\n+++ {full}\t")),
+        "got {stdout:?}"
+    );
+    assert!(stdout.ends_with("@@ -0,0 +1 @@\n+x\n"), "got {stdout:?}");
+
+    let (stdout, stderr, code) = run_diff(&["-c", full, "/dev/null"]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE), "{stderr:?}");
+    assert!(
+        stdout.starts_with(&format!("*** {full}\t")),
+        "got {stdout:?}"
+    );
+    assert!(stdout.contains("\n--- /dev/null\t"), "got {stdout:?}");
+    assert!(
+        stdout.ends_with("*** 1 ****\n- x\n--- 0 ----\n"),
+        "got {stdout:?}"
+    );
+
+    let (stdout, _, code) = run_diff(&[full, "/dev/null"]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+    assert_eq!(stdout, "1d0\n< x\n");
+}
+
+/// `-q` / `--brief` reports only whether two files differ, in GNU's words,
+/// and keeps the exit status: 1 for a difference, 0 for none.
+#[test]
+fn test_diff_brief_reports_only_whether_files_differ() {
+    let f1 = write_tmp("brief_1", b"x\n");
+    let f2 = write_tmp("brief_2", b"y\n");
+    let same = write_tmp("brief_3", b"x\n");
+
+    for opt in ["-q", "--brief"] {
+        diff_test_full(
+            &[opt, &f1, &f2],
+            &format!("Files {f1} and {f2} differ\n"),
+            "",
+            EXIT_STATUS_DIFFERENCE,
+        );
+        diff_test_full(&[opt, &f1, &same], "", "", EXIT_STATUS_NO_DIFFERENCE);
+    }
+
+    // An output style given alongside is no conflict; -q wins.
+    diff_test_full(
+        &["-q", "-u", &f1, &f2],
+        &format!("Files {f1} and {f2} differ\n"),
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    // Binary files get the same message.
+    let b1 = write_tmp("brief_bin_1", b"\0bin");
+    let b2 = write_tmp("brief_bin_2", b"\0bon");
+    diff_test_full(
+        &["-q", &b1, &b2],
+        &format!("Files {b1} and {b2} differ\n"),
+        "",
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    // A missing operand is still trouble.
+    let (_base, a, _b) = dir_pair();
+    let missing = a.join("missing");
+    let missing = missing.to_str().unwrap();
+    diff_test_full(
+        &["-q", &f1, missing],
+        "",
+        &format!("diff: {missing}: No such file or directory\n"),
+        EXIT_STATUS_TROUBLE,
+    );
+}
+
+/// Run diff in `dir`, returning stdout, stderr and the exit status.
+fn run_diff_in(dir: &std::path::Path, args: &[&str]) -> (String, String, Option<i32>) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_diff"))
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("run diff");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+/// `expected`, spelled with `/`, with the platform's separator, which diff
+/// uses to join a directory and an entry name: `\` on Windows.  No file
+/// name or content in these fixtures contains a `/`.
+fn sep(expected: &str) -> String {
+    expected.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// Under `-q -r` a differing pair is one line, with no `diff ...` header.
+#[test]
+fn test_diff_brief_recursive() {
+    let (base, a, b) = dir_pair();
+    std::fs::write(a.join("f"), "x\n").unwrap();
+    std::fs::write(b.join("f"), "y\n").unwrap();
+    std::fs::write(a.join("same"), "s\n").unwrap();
+    std::fs::write(b.join("same"), "s\n").unwrap();
+    std::fs::create_dir(a.join("sub")).unwrap();
+    std::fs::create_dir(b.join("sub")).unwrap();
+    std::fs::write(a.join("sub/g"), "1\n").unwrap();
+    std::fs::write(b.join("sub/g"), "2\n").unwrap();
+    std::fs::write(b.join("new"), "n\n").unwrap();
+
+    let (out, err, code) = run_diff_in(base.path(), &["--brief", "-r", "a", "b"]);
+    assert_eq!(
+        out,
+        sep("Files a/f and b/f differ\nOnly in b: new\nFiles a/sub/g and b/sub/g differ\n")
+    );
+    assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
+}
+
+/// The trees libzstd's test compares with `diff --brief --recursive
+/// --new-file`, in small: a file on one side only, a directory on one side
+/// only, and an empty file whose counterpart is missing.
+fn new_file_trees() -> TempDir {
+    let (base, a, b) = dir_pair();
+    std::fs::write(a.join("f"), "x\n").unwrap();
+    std::fs::write(b.join("f"), "y\n").unwrap();
+    std::fs::write(a.join("gone"), "old\n").unwrap();
+    std::fs::write(b.join("new"), "n\n").unwrap();
+    std::fs::write(a.join("empty"), "").unwrap();
+    std::fs::create_dir(a.join("sub")).unwrap();
+    std::fs::write(a.join("sub/q"), "q\n").unwrap();
+    base
+}
+
+/// `-N` / `--new-file` compares an entry missing from one tree as an empty
+/// file, and a missing directory as an empty directory.
+#[test]
+fn test_diff_new_file_recursive() {
+    let base = new_file_trees();
+    let dir = base.path();
+
+    let (out, err, code) = run_diff_in(dir, &["-N", "-r", "a", "b"]);
+    assert_eq!(
+        out,
+        sep("diff -N -r a/f b/f\n1c1\n< x\n---\n> y\n\
+             diff -N -r a/gone b/gone\n1d0\n< old\n\
+             diff -N -r a/new b/new\n0a1\n> n\n\
+             diff -N -r a/sub/q b/sub/q\n1d0\n< q\n")
+    );
+    assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
+
+    let (out, err, code) = run_diff_in(dir, &["--brief", "--recursive", "--new-file", "b", "a"]);
+    assert_eq!(
+        out,
+        sep("Files b/f and a/f differ\nFiles b/gone and a/gone differ\n\
+             Files b/new and a/new differ\nFiles b/sub/q and a/sub/q differ\n")
+    );
+    assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
+
+    // The missing side's header carries the Epoch, as in GNU diff.
+    let (out, _, code) = run_diff_in(dir, &["-N", "-r", "-u", "a", "b"]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+    assert!(
+        out.contains(&sep("\n--- a/new\t1970-01-01 00:00:00.000000000 +0000\n")),
+        "got {out:?}"
+    );
+    assert!(
+        out.contains(&sep("diff -N -r -u a/sub/q b/sub/q\n--- a/sub/q\t")),
+        "got {out:?}"
+    );
+    assert!(
+        out.ends_with(&sep(
+            "+++ b/sub/q\t1970-01-01 00:00:00.000000000 +0000\n@@ -1 +0,0 @@\n-q\n"
+        )),
+        "got {out:?}"
+    );
+}
+
+/// An empty file whose counterpart is missing is no difference under -N;
+/// without -N it is "Only in".
+#[test]
+fn test_diff_new_file_absent_empty_file_is_equal() {
+    let base = new_file_trees();
+    let dir = base.path();
+    std::fs::write(dir.join("b/f"), "x\n").unwrap();
+    std::fs::remove_file(dir.join("a/gone")).unwrap();
+    std::fs::remove_file(dir.join("b/new")).unwrap();
+    std::fs::remove_dir_all(dir.join("a/sub")).unwrap();
+
+    let (out, err, code) = run_diff_in(dir, &["-Nr", "a", "b"]);
+    assert_eq!((out.as_str(), err.as_str()), ("", ""));
+    assert_eq!(code, Some(EXIT_STATUS_NO_DIFFERENCE));
+
+    let (out, _, code) = run_diff_in(dir, &["-r", "a", "b"]);
+    assert_eq!(out, "Only in a: empty\n");
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+}
+
+/// `-w` ignores all white space: inside a line, at its ends, and a carriage
+/// return.  Output still shows the lines as they are.
+#[test]
+fn test_diff_ignore_all_space() {
+    let f1 = write_tmp("w_1", b"a b\nc\td\n  x  \nsame\nlast");
+    let f2 = write_tmp("w_2", b"ab\ncd\nx\nsame\n\nlast\n");
+
+    diff_test(&["-w", &f1, &f2], "4a5\n> \n", EXIT_STATUS_DIFFERENCE);
+    // -b alone still sees "a b" and "ab" as different.
+    let (out, _, _) = run_diff(&["-b", &f1, &f2]);
+    assert!(out.starts_with("1,3c1,3\n"), "got {out:?}");
+    // -w wins over -b.
+    diff_test(&["-w", "-b", &f1, &f2], "4a5\n> \n", EXIT_STATUS_DIFFERENCE);
+    diff_test(
+        &["-u", "-w", "-L", "A", "-L", "B", &f1, &f2],
+        "--- A\n+++ B\n@@ -2,4 +2,5 @@\n c\td\n   x  \n same\n+\n last\n\\ No newline at end of file\n",
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    let lf = write_tmp("w_lf", b"a\n");
+    let crlf = write_tmp("w_crlf", b"a\r\n");
+    let bare = write_tmp("w_bare", b"a");
+    diff_test(&["-w", &lf, &crlf], "", EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-w", &lf, &bare], "", EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-q", "-w", &lf, &crlf], "", EXIT_STATUS_NO_DIFFERENCE);
+}
+
+/// GNU `-s` / `--report-identical-files`: a pair found identical, under the
+/// comparison options in force, is reported as such with status 0; a differing
+/// pair is reported as without -s. libzstd's tests run `$DIFF -s tmp1 tmp`.
+#[test]
+fn test_diff_report_identical_files() {
+    let a = write_tmp("s_a", b"a\n");
+    let a2 = write_tmp("s_a2", b"a\n");
+    let a_space = write_tmp("s_a3", b"a \n");
+    let b = write_tmp("s_b", b"b\n");
+    let bin1 = write_tmp("s_bin1", b"\0x");
+    let bin2 = write_tmp("s_bin2", b"\0x");
+    let same = |x: &str, y: &str| format!("Files {x} and {y} are identical\n");
+
+    for opt in ["-s", "--report-identical-files"] {
+        diff_test(&[opt, &a, &a2], &same(&a, &a2), EXIT_STATUS_NO_DIFFERENCE);
+    }
+    diff_test(&["-s", &a, &a], &same(&a, &a), EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-sq", &a, &a2], &same(&a, &a2), EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-su", &a, &a2], &same(&a, &a2), EXIT_STATUS_NO_DIFFERENCE);
+    diff_test(&["-sw", &a, &a_space], &same(&a, &a_space), 0);
+    diff_test(&["-s", &bin1, &bin2], &same(&bin1, &bin2), 0);
+    diff_test(
+        &["-s", &a, &b],
+        "1c1\n< a\n---\n> b\n",
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test(
+        &["-sq", &a, &b],
+        &format!("Files {a} and {b} differ\n"),
+        EXIT_STATUS_DIFFERENCE,
+    );
+
+    run_test(TestPlan {
+        cmd: String::from("diff"),
+        args: vec!["-s".into(), "-".into(), a2.to_string()],
+        stdin_data: String::from("a\n"),
+        expected_out: same("-", &a2),
+        expected_err: String::new(),
+        expected_exit_code: EXIT_STATUS_NO_DIFFERENCE,
+    });
+}
+
+/// -s in a directory comparison: each identical pair of files is reported, in
+/// the place its diff would be, under -r in subdirectories too, and with -q.
+#[test]
+fn test_diff_report_identical_files_in_directories() {
+    let tmp = TempDir::new().unwrap();
+    let (d1, d2) = (tmp.path().join("d1"), tmp.path().join("d2"));
+    for (name, one, two) in [
+        ("diff", "y\n", "z\n"),
+        ("empty", "", ""),
+        ("same", "x\n", "x\n"),
+        ("sub/s", "q\n", "q\n"),
+    ] {
+        for (dir, content) in [(&d1, one), (&d2, two)] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+    }
+    std::fs::write(d1.join("only"), "o\n").unwrap();
+    let (d1, d2) = (d1.to_str().unwrap(), d2.to_str().unwrap());
+    // Expected text is spelled with `/`, which sep() makes the platform's separator; the
+    // temporary directory's own path has none to change.
+    let same = |name: &str| format!("Files {d1}/{name} and {d2}/{name} are identical\n");
+
+    let hunk = "1c1\n< y\n---\n> z\n";
+    diff_test(
+        &["-s", d1, d2],
+        &sep(&format!(
+            "diff -s {d1}/diff {d2}/diff\n{hunk}{}Only in {d1}: only\n{}\
+             Common subdirectories: {d1}/sub and {d2}/sub\n",
+            same("empty"),
+            same("same"),
+        )),
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test(
+        &["-sr", d1, d2],
+        &sep(&format!(
+            "diff -sr {d1}/diff {d2}/diff\n{hunk}{}Only in {d1}: only\n{}{}",
+            same("empty"),
+            same("same"),
+            same("sub/s"),
+        )),
+        EXIT_STATUS_DIFFERENCE,
+    );
+    diff_test(
+        &["-srq", d1, d2],
+        &sep(&format!(
+            "Files {d1}/diff and {d2}/diff differ\n{}Only in {d1}: only\n{}{}",
+            same("empty"),
+            same("same"),
+            same("sub/s"),
+        )),
+        EXIT_STATUS_DIFFERENCE,
+    );
+}

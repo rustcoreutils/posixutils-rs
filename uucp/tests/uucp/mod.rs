@@ -432,3 +432,10 @@ fn test_uucp_remote_to_remote_ignores_a_planted_temp_name() {
         .collect();
     assert!(left.is_empty(), "temporaries left behind: {left:?}");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    plib::testing::assert_hyphen_option_argument("uucp", &["-n", "-zq", "--help"]);
+}

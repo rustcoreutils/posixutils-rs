@@ -1143,8 +1143,7 @@ fn test_multi_volume_non_utf8_archive_name() {
     let temp = TempDir::new().unwrap();
     let names = many_files(temp.path(), 8, 3000);
     let name = OsStr::from_bytes(b"vol\xff");
-    // Some file systems (APFS) take only UTF-8 names.
-    if fs::write(temp.path().join(name), "").is_err() {
+    if plib::testing::create_non_utf8(temp.path(), b"vol\xff", |p| fs::write(p, "")).is_none() {
         return;
     }
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_pax"))

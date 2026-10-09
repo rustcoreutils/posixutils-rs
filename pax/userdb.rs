@@ -16,11 +16,10 @@
 //! found, the user and group IDs contained within these files shall be used
 //! rather than the values contained within the uid and gid fields."
 //!
-//! A name is bytes here, not a `String`. `plib::user` and `plib::group` offer
-//! the same lookups over `&str`, but they decode the database's `char *`
-//! lossily, and a user name that is not UTF-8 would come back with U+FFFD in
-//! it -- the very substitution `hdrcharset=BINARY` exists to avoid. On the way
-//! in, a `&str` cannot spell such a name at all.
+//! A name is bytes here, not a `String`: a user name that is not UTF-8 must
+//! not come back with U+FFFD in it -- the very substitution `hdrcharset=BINARY`
+//! exists to avoid. `plib::user` and `plib::group` do the lookups, with the
+//! reentrant `_r` functions, and hand back the database's bytes exactly.
 //!
 //! Memoized because libc caches none of these: under a `files` backend each
 //! call is an open/read/close of /etc/passwd or /etc/group, and under LDAP or
@@ -30,7 +29,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::OsStr;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 /// The name of a uid, or `None` when the database has no entry for it.
 pub(crate) fn name_for_uid(uid: u32) -> Option<Vec<u8>> {
@@ -38,9 +38,8 @@ pub(crate) fn name_for_uid(uid: u32) -> Option<Vec<u8>> {
         static CACHE: RefCell<HashMap<u32, Option<Vec<u8>>>> = RefCell::new(HashMap::new());
     }
     CACHE.with(|cache| {
-        cached(cache, uid, |&uid| unsafe {
-            let pw = libc::getpwuid(uid);
-            (!pw.is_null()).then(|| CStr::from_ptr((*pw).pw_name).to_bytes().to_vec())
+        cached(cache, uid, |&uid| {
+            plib::user::get_by_uid(uid).map(|u| u.name.into_vec())
         })
     })
 }
@@ -51,9 +50,8 @@ pub(crate) fn name_for_gid(gid: u32) -> Option<Vec<u8>> {
         static CACHE: RefCell<HashMap<u32, Option<Vec<u8>>>> = RefCell::new(HashMap::new());
     }
     CACHE.with(|cache| {
-        cached(cache, gid, |&gid| unsafe {
-            let gr = libc::getgrgid(gid);
-            (!gr.is_null()).then(|| CStr::from_ptr((*gr).gr_name).to_bytes().to_vec())
+        cached(cache, gid, |&gid| {
+            plib::group::get_by_gid(gid).map(|g| g.name.into_vec())
         })
     })
 }
@@ -66,12 +64,9 @@ pub(crate) fn uid_for_name(name: &[u8]) -> Option<u32> {
         static CACHE: RefCell<HashMap<Vec<u8>, Option<u32>>> = RefCell::new(HashMap::new());
     }
     CACHE.with(|cache| {
-        cached(cache, name.to_vec(), |name| unsafe {
-            // A name holding a NUL cannot be passed to getpwnam at all, and no
-            // database entry could match one anyway.
-            let name = CString::new(name.as_slice()).ok()?;
-            let pw = libc::getpwnam(name.as_ptr());
-            (!pw.is_null()).then(|| (*pw).pw_uid)
+        cached(cache, name.to_vec(), |name| {
+            // A name holding a NUL matches no entry.
+            plib::user::get_by_name(OsStr::from_bytes(name)).map(|u| u.uid)
         })
     })
 }
@@ -82,10 +77,8 @@ pub(crate) fn gid_for_name(name: &[u8]) -> Option<u32> {
         static CACHE: RefCell<HashMap<Vec<u8>, Option<u32>>> = RefCell::new(HashMap::new());
     }
     CACHE.with(|cache| {
-        cached(cache, name.to_vec(), |name| unsafe {
-            let name = CString::new(name.as_slice()).ok()?;
-            let gr = libc::getgrnam(name.as_ptr());
-            (!gr.is_null()).then(|| (*gr).gr_gid)
+        cached(cache, name.to_vec(), |name| {
+            plib::group::get_by_name(OsStr::from_bytes(name)).map(|g| g.gid)
         })
     })
 }

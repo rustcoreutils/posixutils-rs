@@ -23,3 +23,4 @@ mod rm;
 mod rmdir;
 mod touch;
 mod unlink;
+mod walk;

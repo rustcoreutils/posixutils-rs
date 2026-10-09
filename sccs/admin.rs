@@ -453,8 +453,8 @@ fn main() -> ExitCode {
 
     // Pre-process argv to strip the attached-only options (-i/-t/-y) before
     // clap parses; clap cannot express "attached value only".
-    let (attached, rest) = extract_attached_opts(std::env::args());
-    let args = match Args::try_parse_from(&rest) {
+    let (attached, rest) = extract_attached_opts(plib::optarg::args_utf8("admin"));
+    let args = match Args::try_parse_from(plib::optarg::keep_leading_equals::<Args>(rest)) {
         Ok(a) => a,
         Err(e) => {
             e.print().ok();

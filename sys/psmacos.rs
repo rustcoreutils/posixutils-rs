@@ -28,7 +28,12 @@ pub struct ProcessInfo {
     pub sid: pid_t,          // session ID
     pub nice: i32,           // nice value
     pub vsz: u64,            // virtual memory size in KB
+    pub rss: u64,            // resident set size in KB
     pub time: u64,           // cumulative CPU time in whole seconds
+    pub cpu_ms: u64,         // cumulative CPU time in milliseconds
+    pub tpgid: i32,          // foreground process group of its terminal
+    pub threads: u32,        // number of threads
+    pub locked: bool,        // has pages locked into memory (not reported)
     pub start_time: u64,     // start time in seconds since the Unix epoch
     pub state: char,         // process state
     pub priority: i32,       // priority
@@ -73,6 +78,26 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, Error> {
     }
 
     Ok(processes)
+}
+
+/// Total physical memory in KB (`hw.memsize`); 0 if unavailable.
+pub fn total_memory_kb() -> u64 {
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>() as libc::size_t;
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            &mut bytes as *mut u64 as *mut c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        bytes / 1024
+    } else {
+        0
+    }
 }
 
 /// Map device numbers (`rdev`) to their /dev entry names, built once per run.
@@ -199,16 +224,18 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
         )
     };
 
-    let (vsz, time) = if task_res > 0 {
+    let (vsz, rss, time, cpu_ms, threads) = if task_res > 0 {
         let task_info = unsafe { task_info.assume_init() };
         let vsz_kb = task_info.pti_virtual_size / 1024;
+        let rss_kb = task_info.pti_resident_size / 1024;
         // Total CPU time is in nanoseconds; normalize to whole seconds to match
         // the shared formatter's contract (audit #P9).
         let total_time = task_info.pti_total_user + task_info.pti_total_system;
         let time_secs = total_time / 1_000_000_000;
-        (vsz_kb, time_secs)
+        let threads = task_info.pti_threadnum.max(1) as u32;
+        (vsz_kb, rss_kb, time_secs, total_time / 1_000_000, threads)
     } else {
-        (0, 0)
+        (0, 0, 0, 0, 1)
     };
 
     // Get process path
@@ -276,7 +303,12 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
         sid,
         nice: bsd_info.pbi_nice,
         vsz,
+        rss,
         time,
+        cpu_ms,
+        tpgid: bsd_info.e_tpgid as i32,
+        threads,
+        locked: false,
         start_time: bsd_info.pbi_start_tvsec,
         state,
         priority: 0, // Not easily available on macOS, use 0

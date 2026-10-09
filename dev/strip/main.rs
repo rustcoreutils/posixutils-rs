@@ -53,11 +53,16 @@ struct Args {
     strip_unneeded: bool,
 
     /// Remove the sections whose names match PATTERN (`*` and `?` wildcards)
-    #[arg(short = 'R', long = "remove-section", value_name = "PATTERN")]
+    #[arg(
+        short = 'R',
+        long = "remove-section",
+        allow_hyphen_values = true,
+        value_name = "PATTERN"
+    )]
     remove_section: Vec<String>,
 
     /// Remove the symbol SYMBOL
-    #[arg(short = 'N', value_name = "SYMBOL")]
+    #[arg(short = 'N', allow_hyphen_values = true, value_name = "SYMBOL")]
     strip_symbol: Vec<String>,
 
     /// Write archive members with zero timestamps and owners and mode 0644
@@ -613,7 +618,7 @@ fn strip_file(file: &OsStr, opts: &Options) {
 fn main() {
     diag::init_locale("strip");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     let level = if args.strip_unneeded {
         Level::Unneeded
     } else if args.strip_debug {

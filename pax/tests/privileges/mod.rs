@@ -13,6 +13,7 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

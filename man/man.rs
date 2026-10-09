@@ -64,6 +64,7 @@ struct Args {
     #[arg(
         short = 'C',
         long,
+        allow_hyphen_values = true,
         help = gettext("Use the specified file instead of the default configuration file")
     )]
     config_file: Option<PathBuf>,
@@ -98,6 +99,7 @@ struct Args {
 
     #[arg(
         short = 'M',
+        allow_hyphen_values = true,
         value_delimiter = ':',
         help = gettext("Override the list of directories to search for manual pages")
     )]
@@ -105,6 +107,7 @@ struct Args {
 
     #[arg(
         short = 'm',
+        allow_hyphen_values = true,
         value_delimiter = ':',
         help = gettext("Augment the list of directories to search for manual pages")
     )]
@@ -112,6 +115,7 @@ struct Args {
 
     #[arg(
         short = 'S',
+        allow_hyphen_values = true,
         help = gettext("Only show pages for the specified machine(1) architecture")
     )]
     subsection: Option<String>,
@@ -122,6 +126,7 @@ struct Args {
     // below already mapped the right names and was dead code.
     #[arg(
         short = 's',
+        allow_hyphen_values = true,
         value_parser = Section::from_str,
         help = gettext("Only select manuals from the specified section")
     )]
@@ -1259,7 +1264,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("man");
 
     // parse command line arguments
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut man = match Man::new(args) {
         Ok(man) => man,

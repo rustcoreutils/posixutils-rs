@@ -151,7 +151,7 @@ fn wc_count(args: &Args, chars_mode: bool, pathname: &Path) -> io::Result<CountI
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("wc");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     let mut chars_mode = false;
 

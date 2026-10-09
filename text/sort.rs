@@ -24,9 +24,14 @@ use gettextrs::gettext;
 
 /// sort - sort, merge, or sequence check text files
 #[derive(Parser)]
-#[command(version, about = gettext("sort - sort, merge, or sequence check text files"))]
+// -V is GNU's --version-sort, so the version flag is long only.
+#[command(
+    version,
+    disable_version_flag = true,
+    about = gettext("sort - sort, merge, or sequence check text files")
+)]
 struct Args {
-    #[arg(short = 'c', help = gettext("Check that the single input file is ordered as specified"))]
+    #[arg(short = 'c', long = "check", help = gettext("Check that the single input file is ordered as specified"))]
     check_order: bool,
 
     #[arg(short = 'C', help = gettext("Same as -c, but without warning message for disorder or duplicate keys"))]
@@ -35,7 +40,7 @@ struct Args {
     #[arg(short = 'm', help = gettext("Merge only; the input files shall be assumed to be already sorted"))]
     merge_only: bool,
 
-    #[arg(short = 'o', help = gettext("Specify the name of an output file to be used instead of the standard output"))]
+    #[arg(short = 'o', allow_hyphen_values = true, help = gettext("Specify the name of an output file to be used instead of the standard output"))]
     output_file: Option<PathBuf>,
 
     #[arg(short = 'u', help = gettext("Unique: suppress all but one in each set of lines having equal keys"))]
@@ -53,23 +58,41 @@ struct Args {
     #[arg(short = 'n', help = gettext("Restrict the sort key to an initial numeric string"))]
     numeric_sort: bool,
 
+    #[arg(short = 'V', long = "version-sort", help = gettext("Compare keys as version strings"))]
+    version_sort: bool,
+
     #[arg(short = 'r', help = gettext("Reverse the sense of comparisons"))]
     reverse: bool,
 
     #[arg(short = 'b', help = gettext("Ignore leading blank characters in sort keys"))]
     ignore_leading_blanks: bool,
 
-    #[arg(short = 't', help = gettext("Specify the field separator character"))]
+    #[arg(short = 't', allow_hyphen_values = true, help = gettext("Specify the field separator character"))]
     field_separator: Option<char>,
 
-    #[arg(short = 'k', help = gettext("Specify the key definition for sorting"))]
+    #[arg(short = 'k', allow_hyphen_values = true, help = gettext("Specify the key definition for sorting"))]
     key_definition: Vec<String>,
+
+    #[arg(short = 'z', long = "zero-terminated", help = gettext("End lines with NUL, not newline, on input and output"))]
+    zero_terminated: bool,
+
+    #[arg(long, action = clap::ArgAction::Version, help = gettext("Print version"))]
+    version: Option<bool>,
 
     #[arg(help = gettext("Input files"))]
     filenames: Vec<PathBuf>,
 }
 
 impl Args {
+    /// The byte that ends each line, read and written.
+    fn eol(&self) -> u8 {
+        if self.zero_terminated {
+            b'\0'
+        } else {
+            b'\n'
+        }
+    }
+
     fn validate_args(&self) -> Result<(), String> {
         // POSIX: -c and -C cannot be combined; -c/-C cannot be combined with -m.
         if self.check_order && self.check_order_silent {
@@ -94,6 +117,8 @@ struct KeySpec {
     /// `None` means "to end of field". Only meaningful when `end_field` is set.
     end_char: Option<usize>,
     numeric: bool,
+    /// GNU `-V`: compare as version strings (see [`filevercmp`]).
+    version: bool,
     reverse: bool,
     fold_case: bool,
     dictionary: bool,
@@ -116,7 +141,9 @@ struct ParsedNum {
     is_zero: bool,
 }
 
-/// A precomputed comparison value for one key.
+/// A precomputed comparison value for one key.  A `-V` key is `Text`, and
+/// [`compare_keyval`] reads its `KeySpec` to compare it as a version: a third
+/// variant measured a few percent slower on `-n` sorts.
 #[derive(Clone)]
 enum KeyVal {
     Num(ParsedNum),
@@ -174,8 +201,10 @@ fn numeric_conv() -> (char, Option<char>) {
     (decimal, None)
 }
 
+/// A blank separating fields, and skipped by -b and -n. A newline counts too,
+/// as in GNU sort: under -z it is a character of the line.
 fn is_blank(c: char) -> bool {
-    locale::isblank(c)
+    c == '\n' || locale::isblank(c)
 }
 
 /// Offset (in chars) of the start of field `field` (1-based), including any
@@ -395,9 +424,120 @@ fn cmp_num(a: &ParsedNum, b: &ParsedNum) -> Ordering {
     }
 }
 
-fn compare_keyval(a: &KeyVal, b: &KeyVal) -> Ordering {
+/// Compare two version strings as GNU `sort -V` does (gnulib's
+/// `filevercmp`).  Byte classes are the C locale's, whatever the locale.
+///
+/// The empty string sorts first; then `.`, then `..`, then other names
+/// beginning with `.`, then the rest.  Each name's file suffix (see
+/// [`version_prefix_len`]) is set aside and the prefixes compared with
+/// [`verrevcmp`]; only when they tie, and a suffix exists, are the whole
+/// names compared.
+fn filevercmp(a: &[u8], b: &[u8]) -> Ordering {
+    if a.is_empty() || b.is_empty() {
+        return b.is_empty().cmp(&a.is_empty());
+    }
+    match (a[0] == b'.', b[0] == b'.') {
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (true, true) => {
+            for special in [&b"."[..], b".."] {
+                match (a == special, b == special) {
+                    (true, true) => return Ordering::Equal,
+                    (true, false) => return Ordering::Less,
+                    (false, true) => return Ordering::Greater,
+                    (false, false) => {}
+                }
+            }
+        }
+        (false, false) => {}
+    }
+    let (ap, bp) = (version_prefix_len(a), version_prefix_len(b));
+    let result = verrevcmp(&a[..ap], &b[..bp]);
+    if result != Ordering::Equal || (ap == a.len() && bp == b.len()) {
+        result
+    } else {
+        verrevcmp(a, b)
+    }
+}
+
+/// The length of `s` without its file suffix: the longest tail matching
+/// `(\.[A-Za-z~][A-Za-z0-9~]*)*$` that leaves the first byte in place.
+fn version_prefix_len(s: &[u8]) -> usize {
+    let n = s.len();
+    let mut prefix = 0;
+    let mut i = 0;
+    while i < n {
+        i += 1;
+        prefix = i;
+        while i + 1 < n && s[i] == b'.' && (s[i + 1].is_ascii_alphabetic() || s[i + 1] == b'~') {
+            i += 2;
+            while i < n && (s[i].is_ascii_alphanumeric() || s[i] == b'~') {
+                i += 1;
+            }
+        }
+    }
+    prefix
+}
+
+/// The weight of the non-digit at `s[pos]`: the end of the string sorts
+/// after `~` and before everything else, letters before other bytes.
+fn version_byte_order(s: &[u8], pos: usize) -> i32 {
+    match s.get(pos) {
+        None => -1,
+        Some(c) if c.is_ascii_digit() => 0,
+        Some(c) if c.is_ascii_alphabetic() => i32::from(*c),
+        Some(b'~') => -2,
+        Some(c) => i32::from(*c) + 256,
+    }
+}
+
+/// Debian's version comparison: alternate runs of non-digits, compared
+/// byte by byte with [`version_byte_order`], and runs of digits, compared by
+/// value (leading zeros ignored).
+fn verrevcmp(a: &[u8], b: &[u8]) -> Ordering {
+    let is_digit = |s: &[u8], i: usize| s.get(i).is_some_and(u8::is_ascii_digit);
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        while (i < a.len() && !is_digit(a, i)) || (j < b.len() && !is_digit(b, j)) {
+            let o = version_byte_order(a, i).cmp(&version_byte_order(b, j));
+            if o != Ordering::Equal {
+                return o;
+            }
+            i += 1;
+            j += 1;
+        }
+        while a.get(i) == Some(&b'0') {
+            i += 1;
+        }
+        while b.get(j) == Some(&b'0') {
+            j += 1;
+        }
+        let mut first_diff = Ordering::Equal;
+        while is_digit(a, i) && is_digit(b, j) {
+            if first_diff == Ordering::Equal {
+                first_diff = a[i].cmp(&b[j]);
+            }
+            i += 1;
+            j += 1;
+        }
+        if is_digit(a, i) {
+            return Ordering::Greater;
+        }
+        if is_digit(b, j) {
+            return Ordering::Less;
+        }
+        if first_diff != Ordering::Equal {
+            return first_diff;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Compare the values of `key` from two records.
+fn compare_keyval(a: &KeyVal, b: &KeyVal, key: &KeySpec) -> Ordering {
     match (a, b) {
         (KeyVal::Num(x), KeyVal::Num(y)) => cmp_num(x, y),
+        (KeyVal::Text(x), KeyVal::Text(y)) if key.version => filevercmp(x.as_bytes(), y.as_bytes()),
         (KeyVal::Text(x), KeyVal::Text(y)) => locale::strcoll(x, y),
         _ => Ordering::Equal,
     }
@@ -414,7 +554,7 @@ fn compare_records(
     last_resort: bool,
 ) -> Ordering {
     for (i, k) in keys.iter().enumerate() {
-        let mut o = compare_keyval(&a.keys[i], &b.keys[i]);
+        let mut o = compare_keyval(&a.keys[i], &b.keys[i], k);
         if k.reverse {
             o = o.reverse();
         }
@@ -453,7 +593,7 @@ fn parse_field_spec(s: &str) -> Result<(usize, Option<usize>, String), String> {
     let (numpart, mods) = s.split_at(split);
 
     for c in mods.chars() {
-        if !"bdfinr".contains(c) {
+        if !"bdfinrV".contains(c) {
             return Err(format!("invalid modifier '{c}' in key specification"));
         }
     }
@@ -510,6 +650,7 @@ fn parse_one_key(kdef: &str, args: &Args) -> Result<KeySpec, String> {
             end_field: ef,
             end_char,
             numeric: has('n'),
+            version: has('V'),
             reverse: has('r'),
             fold_case: has('f'),
             dictionary: has('d'),
@@ -524,6 +665,7 @@ fn parse_one_key(kdef: &str, args: &Args) -> Result<KeySpec, String> {
             end_field: ef,
             end_char,
             numeric: args.numeric_sort,
+            version: args.version_sort,
             reverse: args.reverse,
             fold_case: args.fold_case,
             dictionary: args.dictionary_order,
@@ -547,24 +689,38 @@ fn parse_one_key(kdef: &str, args: &Args) -> Result<KeySpec, String> {
 /// the global ordering options (including a global `-b`).
 fn build_keys(args: &Args) -> Result<Vec<KeySpec>, String> {
     if args.key_definition.is_empty() {
-        return Ok(vec![KeySpec {
+        let keys = vec![KeySpec {
             start_field: 1,
             start_char: 1,
             end_field: None,
             end_char: None,
             numeric: args.numeric_sort,
+            version: args.version_sort,
             reverse: args.reverse,
             fold_case: args.fold_case,
             dictionary: args.dictionary_order,
             ignore_nonprintable: args.ignore_nonprintable,
             start_blanks: args.ignore_leading_blanks,
             end_blanks: args.ignore_leading_blanks,
-        }]);
+        }];
+        check_key_options(&keys)?;
+        return Ok(keys);
     }
-    args.key_definition
+    let keys: Vec<KeySpec> = args
+        .key_definition
         .iter()
         .map(|k| parse_one_key(k, args))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    check_key_options(&keys)?;
+    Ok(keys)
+}
+
+/// Refuse a key that asks for two comparison methods, as GNU does.
+fn check_key_options(keys: &[KeySpec]) -> Result<(), String> {
+    if keys.iter().any(|k| k.numeric && k.version) {
+        return Err("options '-nV' are incompatible".to_string());
+    }
+    Ok(())
 }
 
 fn make_record(
@@ -605,34 +761,51 @@ fn read_inputs(args: &Args) -> Result<Vec<(String, Vec<String>)>, String> {
         };
         let reader = input_stream_dashed(&f)
             .map_err(|e| format!("cannot read: {name}: {}", plib::diag::io_error_text(&e)))?;
-        let br = io::BufReader::new(reader);
-        let mut lines = Vec::new();
-        for line in br.lines() {
-            lines.push(line.map_err(|e| format!("read error: {name}: {e}"))?);
-        }
+        let lines = read_lines(io::BufReader::new(reader), args.eol())
+            .map_err(|e| format!("read error: {name}: {e}"))?;
         out.push((name, lines));
     }
     Ok(out)
+}
+
+/// The lines of `reader`, each ended by `eol` (dropped) or by the end of the
+/// input. Nothing else is taken off: a carriage return before a newline is
+/// part of its line.
+fn read_lines(mut reader: impl BufRead, eol: u8) -> io::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(eol, &mut buf)? == 0 {
+            return Ok(lines);
+        }
+        if buf.last() == Some(&eol) {
+            buf.pop();
+        }
+        let line = String::from_utf8(std::mem::take(&mut buf))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        lines.push(line);
+    }
 }
 
 fn write_output(records: &[Record], args: &Args) -> Result<(), String> {
     if let Some(path) = &args.output_file {
         let file =
             File::create(path).map_err(|e| format!("open failed: {}: {e}", path.display()))?;
-        let mut w = BufWriter::new(file);
-        for r in records {
-            writeln!(w, "{}", r.line).map_err(|e| format!("write error: {e}"))?;
-        }
-        w.flush().map_err(|e| format!("write error: {e}"))?;
+        write_lines(BufWriter::new(file), records, args.eol())
     } else {
-        let stdout = io::stdout();
-        let mut w = BufWriter::new(stdout.lock());
-        for r in records {
-            writeln!(w, "{}", r.line).map_err(|e| format!("write error: {e}"))?;
-        }
-        w.flush().map_err(|e| format!("write error: {e}"))?;
+        write_lines(BufWriter::new(io::stdout().lock()), records, args.eol())
     }
-    Ok(())
+}
+
+/// Write each record's line, ended by `eol`.
+fn write_lines(mut w: impl Write, records: &[Record], eol: u8) -> Result<(), String> {
+    for r in records {
+        w.write_all(r.line.as_bytes())
+            .and_then(|()| w.write_all(&[eol]))
+            .map_err(|e| format!("write error: {e}"))?;
+    }
+    w.flush().map_err(|e| format!("write error: {e}"))
 }
 
 /// Sequentially scan the inputs for the first out-of-order pair (`-c`/`-C`).
@@ -660,7 +833,14 @@ fn check_order(
                 };
                 if bad {
                     if args.check_order {
-                        eprintln!("sort: {}:{}: disorder: {}", name, i + 1, cur.line);
+                        // The line is written with its own terminator, as GNU does.
+                        eprint!(
+                            "sort: {}:{}: disorder: {}{}",
+                            name,
+                            i + 1,
+                            cur.line,
+                            char::from(args.eol())
+                        );
                     }
                     return 1;
                 }
@@ -776,7 +956,7 @@ fn merge_records(
 fn main() {
     plib::diag::init_locale("sort");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let code = match run(&args) {
         Ok(c) => c,

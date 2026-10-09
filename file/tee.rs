@@ -97,8 +97,12 @@ fn tee_stdin(info: &mut TeeInfo) -> bool {
         // tee copies standard input to standard output, in addition to each
         // named file (POSIX: "The standard output shall be a copy of the
         // standard input.").
-        if let Err(e) = io::stdout().write_all(bufslice) {
-            eprintln!("tee: stdout: {}", e);
+        // Flushed at once: tee does not buffer, and a chunk with no <newline>
+        // left in stdout's line buffer would reach it only at exit, where a
+        // write error is lost.
+        let mut stdout = io::stdout().lock();
+        if let Err(e) = stdout.write_all(bufslice).and_then(|()| stdout.flush()) {
+            eprintln!("tee: stdout: {}", plib::diag::io_error_text(&e));
             had_error = true;
         }
 
@@ -124,7 +128,7 @@ fn tee_stdin(info: &mut TeeInfo) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("tee");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.ignore {
         unsafe {

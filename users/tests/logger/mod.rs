@@ -188,3 +188,12 @@ fn test_logger_missing_message_file_errors() {
         "an unreadable -f file must be a diagnostic, not a silent success"
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-f", "-p", "-t"] {
+        plib::testing::assert_hyphen_option_argument("logger", &[opt, "-zq", "--help"]);
+    }
+}

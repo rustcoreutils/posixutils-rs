@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod psbsd;
+
 #[cfg(target_os = "macos")]
 mod psmacos;
 
@@ -14,17 +16,13 @@ mod psmacos;
 mod pslinux;
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::CStr;
 use std::fmt::Write as _; // write! into a String (distinct from io::Write below)
-use std::io::{self, Write};
+use std::io::{self, BufWriter, IsTerminal, StdoutLock, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
-use libc::{
-    geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname, STDERR_FILENO, STDIN_FILENO,
-    STDOUT_FILENO,
-};
+use libc::{geteuid, isatty, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -38,56 +36,22 @@ mod platform {
 
 /// Convert UID to username
 fn uid_to_name(uid: u32) -> Option<String> {
-    unsafe {
-        let pw = getpwuid(uid);
-        if pw.is_null() {
-            return None;
-        }
-        let name = (*pw).pw_name;
-        if name.is_null() {
-            return None;
-        }
-        Some(CStr::from_ptr(name).to_string_lossy().into_owned())
-    }
+    plib::user::get_by_uid(uid).map(|u| u.name.to_string_lossy().into_owned())
 }
 
 /// Convert username to UID
 fn name_to_uid(name: &str) -> Option<u32> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    unsafe {
-        let pw = getpwnam(c_name.as_ptr());
-        if pw.is_null() {
-            return None;
-        }
-        Some((*pw).pw_uid)
-    }
+    plib::user::get_by_name(name).map(|u| u.uid)
 }
 
 /// Convert GID to group name
 fn gid_to_name(gid: u32) -> Option<String> {
-    unsafe {
-        let gr = getgrgid(gid);
-        if gr.is_null() {
-            return None;
-        }
-        let name = (*gr).gr_name;
-        if name.is_null() {
-            return None;
-        }
-        Some(CStr::from_ptr(name).to_string_lossy().into_owned())
-    }
+    plib::group::get_by_gid(gid).map(|g| g.name.to_string_lossy().into_owned())
 }
 
 /// Convert group name to GID
 fn groupname_to_gid(name: &str) -> Option<u32> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    unsafe {
-        let gr = getgrnam(c_name.as_ptr());
-        if gr.is_null() {
-            return None;
-        }
-        Some((*gr).gr_gid)
-    }
+    plib::group::get_by_name(name).map(|g| g.gid)
 }
 
 /// ps - report process status
@@ -119,31 +83,31 @@ struct Args {
     long_format: bool,
 
     /// Write information for processes whose session leaders are in grouplist
-    #[arg(short = 'g', value_name = "grouplist", help = gettext("Write information for processes whose session leaders are in grouplist"))]
+    #[arg(short = 'g', allow_hyphen_values = true, value_name = "grouplist", help = gettext("Write information for processes whose session leaders are in grouplist"))]
     session_leaders: Option<String>,
 
     /// Write information for processes whose real group ID is in grouplist
-    #[arg(short = 'G', value_name = "grouplist", help = gettext("Write information for processes whose real group ID is in grouplist"))]
+    #[arg(short = 'G', allow_hyphen_values = true, value_name = "grouplist", help = gettext("Write information for processes whose real group ID is in grouplist"))]
     real_group: Option<String>,
 
     /// Write information for processes whose process ID is in proclist
-    #[arg(short = 'p', value_name = "proclist", help = gettext("Write information for processes in proclist"))]
+    #[arg(short = 'p', allow_hyphen_values = true, value_name = "proclist", help = gettext("Write information for processes in proclist"))]
     pid_list: Option<String>,
 
     /// Write information for processes associated with terminals in termlist
-    #[arg(short = 't', value_name = "termlist", help = gettext("Write information for processes on terminals in termlist"))]
+    #[arg(short = 't', allow_hyphen_values = true, value_name = "termlist", help = gettext("Write information for processes on terminals in termlist"))]
     term_list: Option<String>,
 
     /// Write information for processes whose effective user ID is in userlist
-    #[arg(short = 'u', value_name = "userlist", help = gettext("Write information for processes whose user ID is in userlist"))]
+    #[arg(short = 'u', allow_hyphen_values = true, value_name = "userlist", help = gettext("Write information for processes whose user ID is in userlist"))]
     user_list: Option<String>,
 
     /// Write information for processes whose real user ID is in userlist
-    #[arg(short = 'U', value_name = "userlist", help = gettext("Write information for processes whose real user ID is in userlist"))]
+    #[arg(short = 'U', allow_hyphen_values = true, value_name = "userlist", help = gettext("Write information for processes whose real user ID is in userlist"))]
     real_user: Option<String>,
 
     /// Custom output format
-    #[arg(short = 'o', value_name = "format", action = clap::ArgAction::Append, help = gettext("Specify output format"))]
+    #[arg(short = 'o', allow_hyphen_values = true, value_name = "format", action = clap::ArgAction::Append, help = gettext("Specify output format"))]
     output_format: Vec<String>,
 
     /// Wide output: behave as if COLUMNS >= 132; repeat to remove the limit
@@ -152,7 +116,7 @@ struct Args {
 
     /// Alternative system namelist file (XSI). The format is unspecified by
     /// POSIX; accepted for conformance and otherwise ignored.
-    #[arg(short = 'n', value_name = "namelist", help = gettext("Specify an alternative namelist file (accepted; ignored)"))]
+    #[arg(short = 'n', allow_hyphen_values = true, value_name = "namelist", help = gettext("Specify an alternative namelist file (accepted; ignored)"))]
     namelist: Option<String>,
 }
 
@@ -589,6 +553,22 @@ fn resolve_line_limit(wide_count: u8) -> usize {
     line_max.max(columns)
 }
 
+/// Standard output for a listing: line-buffered on a terminal, fully buffered
+/// otherwise, as C's stdio buffers it.
+///
+/// A reader of `ps | ...` that stops early -- perl's threads tests read up to
+/// their own line and close -- then finds the whole listing already in the
+/// pipe, and ps exits 0 instead of dying of `SIGPIPE` halfway through.  The
+/// buffer holds as much as a pipe does, so a listing that fits in the pipe is
+/// one write.  The caller flushes it once at the end, reporting the error.
+fn listing_output() -> BufWriter<StdoutLock<'static>> {
+    let out = io::stdout().lock();
+    // A zero-capacity BufWriter passes every write straight to stdout's own
+    // line buffer.
+    let capacity = if out.is_terminal() { 0 } else { 64 * 1024 };
+    BufWriter::with_capacity(capacity, out)
+}
+
 /// Truncate `line` to at most `max_bytes`, rounding down to a UTF-8 character
 /// boundary so multi-byte characters are never split (POSIX bounds the line in
 /// bytes; for ASCII this is exact).
@@ -614,22 +594,19 @@ fn truncate_line(line: &str, max_bytes: usize) -> &str {
 /// prefix stripped, to match the names derived from each process's `tty_nr`.
 fn get_current_tty() -> Option<String> {
     for fd in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
-        unsafe {
-            if isatty(fd) == 0 {
-                continue;
-            }
-            let name = ttyname(fd);
-            if name.is_null() {
-                continue;
-            }
-            let name_str = std::ffi::CStr::from_ptr(name).to_string_lossy().to_string();
-            return Some(
-                name_str
-                    .strip_prefix("/dev/")
-                    .map(str::to_string)
-                    .unwrap_or(name_str),
-            );
+        // SAFETY: isatty has no preconditions.
+        if unsafe { isatty(fd) } == 0 {
+            continue;
         }
+        let Some(name_str) = plib::curuser::ttyname_of(fd) else {
+            continue;
+        };
+        return Some(
+            name_str
+                .strip_prefix("/dev/")
+                .map(str::to_string)
+                .unwrap_or(name_str),
+        );
     }
     None
 }
@@ -643,6 +620,17 @@ fn mark_defunct(command: &str, state: char) -> String {
     } else {
         command.to_string()
     }
+}
+
+/// Processor utilization for scheduling, the `C` field: the CPU time used
+/// as a percentage of the time since the process started, capped at 99, as
+/// procps computes it.
+fn cpu_utilization(cpu_ms: u64, start_epoch: u64, now_epoch: u64) -> u64 {
+    let elapsed = now_epoch.saturating_sub(start_epoch);
+    if elapsed == 0 {
+        return 0;
+    }
+    (cpu_ms / 10 / elapsed).min(99)
 }
 
 /// Get field value for a process, using `ctx` for time-dependent fields.
@@ -675,7 +663,7 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> 
         "sz" => (proc.vsz / 4).to_string(), // Convert KB to blocks (4KB pages)
         "state" => proc.state.to_string(),
         "f" => format!("{:x}", proc.flags & 0xf),
-        "c" => "-".to_string(),    // CPU utilization - difficult to calculate
+        "c" => cpu_utilization(proc.cpu_ms, proc.start_time, ctx.now).to_string(),
         "addr" => "-".to_string(), // Memory address - implementation specific
         "wchan" => "-".to_string(), // Wait channel - implementation specific
         "stime" => format_stime(proc.start_time, ctx.now, &chrono::Local),
@@ -687,7 +675,18 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> 
 fn main() -> ExitCode {
     plib::diag::init_locale("ps");
 
-    let args = Args::parse();
+    // procps' dashless BSD options (`ps aux`) take another path.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match psbsd::parse(&argv) {
+        Ok(Some(opts)) => return psbsd::run(&opts),
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("ps: {}", msg);
+            return ExitCode::from(1);
+        }
+    }
+
+    let args = plib::optarg::parse::<Args>();
 
     // -n namelist is accepted for XSI conformance; its format is unspecified by
     // POSIX and this implementation reads live process state (/proc on Linux,
@@ -862,8 +861,50 @@ fn main() -> ExitCode {
     // Maximum line length (-w / COLUMNS / {LINE_MAX}); lines are clipped to it.
     let line_limit = resolve_line_limit(args.wide);
 
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    match write_listing(&filtered, &output_fields, print_header, line_limit, &ctx) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "ps: {}: {}",
+                gettext("write error"),
+                plib::diag::io_error_text(&e)
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Whether a field's values are numbers, right-aligned in their column.
+fn is_numeric_field(name: &str) -> bool {
+    matches!(
+        name,
+        "pid" | "ppid" | "pgid" | "sid" | "uid" | "gid" | "nice" | "pri" | "vsz" | "sz" | "c"
+    )
+}
+
+/// Append `text` to `line` in a column `width` wide, right-aligned or
+/// left-aligned.  The last column is not padded on the right: a line does not
+/// end in blanks.
+fn push_cell(line: &mut String, text: &str, width: usize, right: bool, last: bool) {
+    let _ = if right {
+        write!(line, "{text:>width$}")
+    } else if last {
+        write!(line, "{text}")
+    } else {
+        write!(line, "{text:<width$}")
+    };
+}
+
+/// Write the header (unless every field's header is empty) and one line per
+/// process in `filtered`, each clipped to `line_limit`.
+fn write_listing(
+    filtered: &[platform::ProcessInfo],
+    output_fields: &[OutputField],
+    print_header: bool,
+    line_limit: usize,
+    ctx: &Context,
+) -> io::Result<()> {
+    let mut out = listing_output();
 
     // Print header (clipped to the line limit so it stays aligned with rows).
     if print_header {
@@ -872,9 +913,12 @@ fn main() -> ExitCode {
             if i > 0 {
                 line.push(' ');
             }
-            let _ = write!(line, "{:>width$}", field.header, width = field.width);
+            let last = i + 1 == output_fields.len();
+            // A left-aligned last column's header starts where its values do.
+            let right = !last || is_numeric_field(field.name);
+            push_cell(&mut line, &field.header, field.width, right, last);
         }
-        let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
+        writeln!(out, "{}", truncate_line(&line, line_limit))?;
     }
 
     // Print processes
@@ -884,21 +928,20 @@ fn main() -> ExitCode {
             if i > 0 {
                 line.push(' ');
             }
-            let value = get_field_value(&proc, field.name, &ctx);
-            // Right-align numeric fields, left-align text
-            if matches!(
-                field.name,
-                "pid" | "ppid" | "pgid" | "sid" | "uid" | "gid" | "nice" | "pri" | "vsz" | "sz"
-            ) {
-                let _ = write!(line, "{:>width$}", value, width = field.width);
-            } else {
-                let _ = write!(line, "{:<width$}", value, width = field.width);
-            }
+            let value = get_field_value(proc, field.name, ctx);
+            let last = i + 1 == output_fields.len();
+            push_cell(
+                &mut line,
+                &value,
+                field.width,
+                is_numeric_field(field.name),
+                last,
+            );
         }
-        let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
+        writeln!(out, "{}", truncate_line(&line, line_limit))?;
     }
 
-    ExitCode::SUCCESS
+    out.flush()
 }
 
 #[cfg(test)]
@@ -959,6 +1002,18 @@ mod tests {
         // A 2-byte 'é' at the boundary is dropped whole, never split.
         assert_eq!(truncate_line("aé", 2), "a");
         assert_eq!(truncate_line("aé", 3), "aé");
+    }
+
+    #[test]
+    fn cpu_utilization_percent() {
+        assert_eq!(cpu_utilization(0, 100, 200), 0);
+        // 5 s of CPU over 100 s elapsed.
+        assert_eq!(cpu_utilization(5_000, 100, 200), 5);
+        // Multithreaded CPU time beyond the elapsed time is capped.
+        assert_eq!(cpu_utilization(500_000, 100, 200), 99);
+        // Started this second, or a clock that went backwards.
+        assert_eq!(cpu_utilization(5_000, 200, 200), 0);
+        assert_eq!(cpu_utilization(5_000, 300, 200), 0);
     }
 
     // Zombies are tagged <defunct> in the command column (#P10).

@@ -8,7 +8,7 @@
 //
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// open file, or stdin
@@ -172,7 +172,8 @@ fn writable(mut perm: fs::Permissions) -> fs::Permissions {
     perm
 }
 
-/// Restore the default disposition for `SIGPIPE`.
+/// Restore the default disposition for `SIGPIPE`, unless the process was
+/// started with it ignored.
 ///
 /// The Rust runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so a write to a
 /// closed pipe returns `EPIPE` instead of killing the process. For a filter
@@ -180,6 +181,14 @@ fn writable(mut perm: fs::Permissions) -> fs::Permissions {
 /// error surfaces as a panic ("failed printing to stdout: Broken pipe") and
 /// exit 101, where the historical utilities die by the signal and the shell
 /// reports 141.
+///
+/// An *inherited* `SIG_IGN` is a different matter. POSIX keeps an ignored
+/// signal ignored across `exec`, and whoever started the utility that way
+/// (`trap '' PIPE` in a shell) asked to see `EPIPE` as a write error instead
+/// of dying. That disposition is left alone; a write to a closed pipe is then
+/// reported like any other write error. The runtime has already overwritten
+/// the disposition by the time `main` runs, so the inherited one is recorded
+/// by a constructor that runs before it (see [`sigpipe_inherited_ignored`]).
 ///
 /// [`crate::diag::init_locale`] calls this, so a utility gets it by starting up
 /// the usual way; call it directly only before that, or instead of it.
@@ -196,12 +205,80 @@ fn writable(mut perm: fs::Permissions) -> fs::Permissions {
 /// Windows has no `SIGPIPE`: a write to a closed pipe fails with an error,
 /// and there is nothing to restore.
 pub fn restore_sigpipe() {
-    // SAFETY: `signal` with SIG_DFL is async-signal-safe and this runs before
-    // any other thread exists.
     #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    if !sigpipe_inherited_ignored() {
+        // SAFETY: `signal` with SIG_DFL is async-signal-safe and this runs
+        // before any other thread exists.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
     }
+}
+
+/// Whether the process was started with `SIGPIPE` ignored.
+///
+/// The answer is recorded before `main`, before the Rust runtime replaces the
+/// inherited disposition with its own `SIG_IGN`.
+#[cfg(unix)]
+pub fn sigpipe_inherited_ignored() -> bool {
+    // Name the constructor's slot, so the object file holding it is linked
+    // into every binary that asks; an unreferenced archive member, and the
+    // constructor with it, would be left out and the answer always false.
+    std::hint::black_box(&RECORD_INHERITED_SIGPIPE);
+    SIGPIPE_INHERITED_IGNORED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(unix)]
+static SIGPIPE_INHERITED_IGNORED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record the `SIGPIPE` disposition the process was started with. Runs from
+/// the platform's constructor list, before the C `main` that starts the Rust
+/// runtime.
+#[cfg(unix)]
+extern "C" fn record_inherited_sigpipe() {
+    // SAFETY: a null new action makes `sigaction` only read the current one
+    // into `old`, which is a plain C struct for which all-zero is valid.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut old) == 0 {
+            let ignored = old.sa_sigaction == libc::SIG_IGN;
+            SIGPIPE_INHERITED_IGNORED.store(ignored, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[used]
+#[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
+#[cfg_attr(not(target_vendor = "apple"), link_section = ".init_array")]
+static RECORD_INHERITED_SIGPIPE: extern "C" fn() = record_inherited_sigpipe;
+
+/// Report a failed write to standard output as `UTILITY: write error: ...`
+/// and exit 1, instead of the panic and exit 101 that `print!`/`println!`
+/// turn it into.
+///
+/// With `SIGPIPE` ignored (see [`restore_sigpipe`]) a closed pipe is the
+/// common case, but a full disk or an I/O error on standard output takes the
+/// same path. Any other panic goes to the hook that was installed before.
+pub fn report_stdout_write_errors(utility: &str) {
+    let utility = utility.to_string();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        let failure = message.and_then(|m| m.strip_prefix("failed printing to stdout: "));
+        let Some(failure) = failure else {
+            return previous(info);
+        };
+        // libstd appends " (os error N)" to the system's message.
+        let reason = failure.split(" (os error ").next().unwrap_or(failure);
+        let _ = writeln!(io::stderr(), "{utility}: write error: {reason}");
+        std::process::exit(1);
+    }));
 }
 
 /// Ignores `SIGPIPE` for as long as the guard is held, then restores whatever

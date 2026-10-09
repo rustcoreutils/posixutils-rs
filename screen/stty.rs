@@ -897,7 +897,7 @@ fn run(args: &Args) -> io::Result<()> {
 fn main() -> std::process::ExitCode {
     plib::diag::init_locale("stty");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     match run(&args) {
         Ok(()) => std::process::ExitCode::SUCCESS,

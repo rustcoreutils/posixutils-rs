@@ -24,7 +24,7 @@ use posixutils_sccs::{diag, operands, pfile, sfio, zlock};
 #[derive(Parser)]
 #[command(version, about = gettext("rmdel - remove a delta from an SCCS file"))]
 struct Args {
-    #[arg(short = 'r', value_name = "SID", required = true, help = gettext("SID of delta to remove (required)"))]
+    #[arg(short = 'r', allow_hyphen_values = true, value_name = "SID", required = true, help = gettext("SID of delta to remove (required)"))]
     sid: String,
 
     #[arg(required = true, help = gettext("SCCS files to process (use - for stdin)"))]
@@ -175,7 +175,7 @@ fn main() -> ExitCode {
 
     zlock::install_cleanup();
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Parse the SID
     let sid: Sid = match args.sid.parse() {

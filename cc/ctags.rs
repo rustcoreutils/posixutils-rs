@@ -37,7 +37,7 @@ struct Args {
     append: bool,
 
     /// Write tags to specified file (default: tags)
-    #[arg(short = 'f', long = "file", default_value = "tags", conflicts_with = "index",
+    #[arg(short = 'f', long = "file", allow_hyphen_values = true, default_value = "tags", conflicts_with = "index",
           help = gettext("Write tags to specified file"))]
     tags_file: String,
 
@@ -340,7 +340,7 @@ fn extract_macro_tags(lines: &[String], path: &str, tags: &mut Vec<TagEntry>) {
 fn main() -> ExitCode {
     plib::diag::init_locale("ctags");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Collect all tags. Keyed by (name, file, line) rather than by name alone:
     // two files that each define `init` are two distinct tags, and dropping one

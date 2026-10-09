@@ -426,12 +426,20 @@ pub fn fmt_write_unsigned(
     // regarding the alternative form for octal numbers:
     // > For the o conversion specifier, it shall increase
     // > the precision to force the first digit of the result to be a zero
-    if args.alternative_form && integer_format == IntegerFormat::Octal && precision < buffer_length
+    // The digits of a number never start with a zero, and those of 0 are
+    // none at all, so only zeros of precision put one first.
+    if args.alternative_form && integer_format == IntegerFormat::Octal && precision <= buffer_length
     {
         precision = buffer_length + 1;
     }
 
-    let hex_prefix = integer_hex_prefix_str(integer_format, args);
+    // > For x or X conversion specifiers, a non-zero result shall have 0x
+    // > (or 0X) prefixed to it.
+    let hex_prefix = if value == 0 {
+        ""
+    } else {
+        integer_hex_prefix_str(integer_format, args)
+    };
 
     // left justified:
     //    hex_prefix precision buffer padding
@@ -847,16 +855,29 @@ pub fn fmt_write_float_general(
     }
 }
 
+/// Writes `value` for `%s`, its width and precision counting characters,
+/// as in gawk (in a single-byte locale a character is a byte).
 pub fn fmt_write_string(target: &mut String, value: &str, args: &FormatArgs) {
-    let precision = args.precision.unwrap_or(usize::MAX);
-    let str_len = value.len().min(precision);
-    let padding = args.width.saturating_sub(str_len);
+    let (value, chars) = match args.precision {
+        // all of it, so only a width needs the character count
+        None if value.is_ascii() || args.width == 0 => (value, value.len()),
+        None => (value, value.chars().count()),
+        Some(precision) if value.is_ascii() => {
+            let end = value.len().min(precision);
+            (&value[..end], end)
+        }
+        Some(precision) => match value.char_indices().nth(precision) {
+            Some((end, _)) => (&value[..end], precision),
+            None => (value, value.chars().count()),
+        },
+    };
+    let padding = args.width.saturating_sub(chars);
     if args.left_justified {
-        target.push_str(&value[..str_len]);
+        target.push_str(value);
         pad_target(target, padding, b' ');
     } else {
         pad_target(target, padding, b' ');
-        target.push_str(&value[..str_len]);
+        target.push_str(value);
     }
 }
 

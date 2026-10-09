@@ -33,7 +33,7 @@ fn do_unlink(pathname: &str) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("unlink");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut exit_code = 0;
 

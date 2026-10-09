@@ -27,10 +27,10 @@ struct Args {
     #[arg(short = 'u', help = gettext("Print only unique lines"))]
     unique: bool,
 
-    #[arg(short = 'f', help = gettext("Ignore the first fields fields on each input line"))]
+    #[arg(short = 'f', allow_hyphen_values = true, help = gettext("Ignore the first fields fields on each input line"))]
     fields: Option<usize>,
 
-    #[arg(short = 's', help = gettext("Ignore the first chars characters on each input line"))]
+    #[arg(short = 's', allow_hyphen_values = true, help = gettext("Ignore the first chars characters on each input line"))]
     chars: Option<usize>,
 
     #[arg(help = gettext("Input file (if not specified, use stdin)"))]
@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // one utility here whose diagnostics carried no `uniq: ` prefix at all.
     plib::diag::init_locale("uniq");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     args.validate_args()?;
 

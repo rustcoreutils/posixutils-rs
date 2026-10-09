@@ -712,3 +712,12 @@ fn prs_lk_reports_none_when_no_releases_are_locked() {
     let out = super::common::run_in("prs", &["-d:LK:", "-r", &sfile], tmp.path(), "");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "none");
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-c", "-d"] {
+        plib::testing::assert_hyphen_option_argument("prs", &[opt, "-zq", "--help"]);
+    }
+}

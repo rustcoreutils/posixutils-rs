@@ -153,3 +153,24 @@ fn tools_cxref_mega() {
         );
     }
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-o", "-w", "-D", "-I", "-U"] {
+        plib::testing::assert_hyphen_option_argument("cxref", &[opt, "-zq", "--help"]);
+    }
+}
+
+// A failed write of the listing is an error: every write discarded its error
+// and cxref exited 0.
+#[test]
+fn tools_cxref_reports_write_error() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("m.c");
+    fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+    let source = source.to_str().unwrap();
+    plib::testing::assert_write_error_on_full_device("cxref", &[source], b"", 1);
+    plib::testing::assert_write_error_on_full_device("cxref", &["-c", source], b"", 1);
+}

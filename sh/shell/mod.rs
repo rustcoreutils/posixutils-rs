@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::builtin::pwd::pwd_is_usable;
 use crate::builtin::set::SetOptions;
 use crate::builtin::trap::TrapAction;
 use crate::builtin::{
@@ -1349,15 +1350,22 @@ impl Shell {
         environment.set_global_if_unset("PS4", "+ ");
         environment.set_global_if_unset("OPTIND", "1");
         let history = initialize_history_from_system(&environment);
-        let current_directory = match env::current_dir() {
-            Ok(path) => path.into_os_string(),
-            Err(err) => {
-                eprintln!(
-                    "sh: failed to determine the current working directory ({})",
-                    err
-                );
-                std::process::exit(1);
-            }
+        // XCU sh, PWD: an inherited PWD that is an absolute pathname of the
+        // working directory with no `.` or `..` components is kept; otherwise
+        // the shell sets PWD to what `pwd -P` would print.
+        let inherited_pwd = env::var_os("PWD").filter(|pwd| pwd_is_usable(pwd));
+        let current_directory = match inherited_pwd {
+            Some(pwd) => pwd,
+            None => match env::current_dir() {
+                Ok(path) => path.into_os_string(),
+                Err(err) => {
+                    eprintln!(
+                        "sh: failed to determine the current working directory ({})",
+                        err
+                    );
+                    std::process::exit(1);
+                }
+            },
         };
         // POSIX: the shell sets and exports PWD to the current directory.
         environment

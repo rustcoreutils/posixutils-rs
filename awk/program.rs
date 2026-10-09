@@ -46,6 +46,8 @@ pub enum OpCode {
     CreateGlobalIterator(u32),
     CreateLocalIterator(u32),
     AdvanceIterOrJump(i32),
+    // pops the iterator on top of the stack before it reached its end
+    EndIterator,
 
     AsNumber,
     // push the value on top of the stack
@@ -70,6 +72,11 @@ pub enum OpCode {
     // assign the value on top of the stack to the reference
     // preceding it. Leaves the assigned value on top of the stack
     Assign,
+
+    // appends the string value on top of the stack to the variable referenced
+    // by the value preceding it, in place, popping both: `s = s t` as a
+    // statement, which would otherwise copy all of s for every append
+    AppendAssign,
 
     // deletes the key on top of the stack from the array preceding it
     DeleteElement,
@@ -101,7 +108,10 @@ pub enum OpCode {
 
     Next,
     NextFile,
+    // exit with the status on top of the stack
     Exit,
+    // exit keeping the status of an earlier exit
+    ExitKeepingStatus,
     Return,
 
     // invalid opcode. Cannot be inside a valid program

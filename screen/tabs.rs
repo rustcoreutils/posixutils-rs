@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
@@ -32,13 +33,14 @@ fn max_column() -> u16 {
 
 /// Pre-process command line arguments to handle POSIX multi-character options.
 /// Converts -a2 -> --a2, -c2 -> --c2, -c3 -> --c3, and -0 -> --rep-0
-fn preprocess_args() -> Vec<String> {
-    std::env::args()
-        .map(|arg| match arg.as_str() {
-            "-a2" => "--a2".to_string(),
-            "-c2" => "--c2".to_string(),
-            "-c3" => "--c3".to_string(),
-            "-0" => "--rep-0".to_string(),
+fn preprocess_args() -> Vec<OsString> {
+    // `args_os`: `args` panics on an argument that is not valid UTF-8.
+    std::env::args_os()
+        .map(|arg| match arg.to_str() {
+            Some("-a2") => "--a2".into(),
+            Some("-c2") => "--c2".into(),
+            Some("-c3") => "--c3".into(),
+            Some("-0") => "--rep-0".into(),
             _ => arg,
         })
         .collect()
@@ -47,7 +49,7 @@ fn preprocess_args() -> Vec<String> {
 #[derive(Parser)]
 #[command(version, about = gettext("tabs - set terminal tabs"))]
 struct Args {
-    #[arg(short = 'T', long, help = gettext("Indicate the type of terminal"))]
+    #[arg(short = 'T', long, allow_hyphen_values = true, help = gettext("Indicate the type of terminal"))]
     term: Option<String>,
 
     // Repetitive tab stops -0 through -9
@@ -321,7 +323,9 @@ fn main() -> ExitCode {
     plib::diag::init_locale("tabs");
 
     let preprocessed_args = preprocess_args();
-    let args = match Args::try_parse_from(&preprocessed_args) {
+    let args = match Args::try_parse_from(plib::optarg::keep_leading_equals::<Args>(
+        &preprocessed_args,
+    )) {
         Ok(args) => args,
         Err(e) => {
             // Handle --help and --version specially (they exit with 0)

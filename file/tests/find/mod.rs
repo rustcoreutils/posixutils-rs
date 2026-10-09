@@ -7,7 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod bytes;
 mod debhelper;
+mod newermt;
 mod race;
 
 use std::fs::{remove_file, File};
@@ -869,6 +871,120 @@ fn find_type_l_under_follow() {
     );
 }
 
+/// The descriptors `find ARGS -name f -exec` hands its child, one `NUM TARGET` line each, as the
+/// child lists them from `/proc`.  With `nofile`, find runs with that `RLIMIT_NOFILE`, which puts
+/// a deep walk in its descriptor-conserving mode: there the walk holds descriptors it opened
+/// without a directory stream, which glibc's `fdopendir` would otherwise mark close-on-exec.
+#[cfg(target_os = "linux")]
+fn exec_child_descriptors(nofile: Option<u32>, args: &[&std::ffi::OsStr]) -> Vec<(String, String)> {
+    let list = r#"for f in /proc/$$/fd/*; do printf '%s %s\n' "${f##*/}" "$(readlink "$f")"; done"#;
+    let limit = nofile.map_or(String::new(), |n| format!("ulimit -n {n}; "));
+    let out = Command::new("/bin/sh")
+        .args(["-c", &format!("{limit}exec \"$@\""), "sh"])
+        .arg(get_binary_path("find"))
+        .args(args)
+        .args([
+            "-name", "f", "-exec", "/bin/sh", "-c", list, "sh", "{}", ";",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute find");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert_eq!(out.status.code(), Some(0));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| {
+            let (fd, target) = line.split_once(' ').unwrap_or((line, ""));
+            (fd.to_string(), target.to_string())
+        })
+        .collect()
+}
+
+/// The directories a walk holds open are close-on-exec: a command run by -exec inherits none,
+/// in a walk that holds a stream per level and in one deep enough to conserve descriptors.
+/// What the child may inherit from find's own parent (a test harness's jobserver pipes) is
+/// taken from a baseline: the same -exec on a file operand, which walks nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn find_exec_child_inherits_no_walk_descriptors() {
+    let tmp = scratch_dir();
+    let dir = tmp.path();
+    let deep = dir.join("1/2/3/4/5/6/7/8/9/10/11/12");
+    std::fs::create_dir_all(&deep).unwrap();
+    let file = deep.join("f");
+    File::create(&file).unwrap();
+    let tree = dir.to_str().unwrap();
+
+    let fds = |found: &[(String, String)]| -> Vec<String> {
+        found.iter().map(|(fd, _)| fd.clone()).collect()
+    };
+    for nofile in [None, Some(24)] {
+        let baseline = exec_child_descriptors(nofile, &[file.as_os_str()]);
+        for walk in [
+            &[dir.as_os_str()][..],
+            &[dir.as_os_str(), "-depth".as_ref()],
+        ] {
+            let walked = exec_child_descriptors(nofile, walk);
+            for (fd, target) in &walked {
+                assert!(
+                    !target.starts_with(tree),
+                    "fd {fd} -> {target}, nofile {nofile:?}, {walk:?}"
+                );
+            }
+            assert_eq!(fds(&walked), fds(&baseline), "nofile {nofile:?}, {walk:?}");
+        }
+    }
+}
+
+/// A trailing slash on a symlink operand follows the link and names a directory (POSIX pathname
+/// resolution), with or without -H/-L: `to_dir/` is walked, under the operand as written, and
+/// `to_file/` is "Not a directory".
+#[test]
+fn find_trailing_slash_follows_operand_symlink() {
+    let tmp = scratch_dir();
+    let dir = tmp.path();
+    std::fs::create_dir(dir.join("d")).unwrap();
+    File::create(dir.join("d/f")).unwrap();
+    File::create(dir.join("file")).unwrap();
+    std::os::unix::fs::symlink("d", dir.join("to_dir")).unwrap();
+    std::os::unix::fs::symlink("file", dir.join("to_file")).unwrap();
+    let p = |s: &str| dir.join(s).to_string_lossy().into_owned();
+
+    run_test_find_sorted(&[&p("to_dir/")], &[&p("to_dir/"), &p("to_dir/f")], "", 0);
+    run_test_find_sorted(&[&p("to_dir/"), "-type", "d"], &[&p("to_dir/")], "", 0);
+    run_test_find(
+        &[&p("to_file/")],
+        "",
+        &format!("find: '{}': Not a directory\n", p("to_file/")),
+        1,
+    );
+    // -delete refuses such a starting point before descending, as rm -r does, rather than
+    // deleting through the link: no removal can take away the directory by that name.
+    run_test_find(
+        &[&p("to_dir/"), "-delete"],
+        "",
+        &format!("find: cannot delete '{}': Not a directory\n", p("to_dir/")),
+        1,
+    );
+    assert!(dir.join("to_dir").is_symlink());
+    assert!(dir.join("d/f").is_file());
+
+    // A dangling link names no directory: reported by name, with or without -delete.
+    std::os::unix::fs::symlink("nowhere", dir.join("dangling")).unwrap();
+    for extra in [&[][..], &["-delete"][..]] {
+        let mut args = vec![p("dangling/")];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_test_find(
+            &args,
+            "",
+            &format!("find: '{}': No such file or directory\n", p("dangling/")),
+            1,
+        );
+    }
+    assert!(dir.join("dangling").is_symlink());
+}
+
 #[test]
 fn test_find_operator_without_operand() {
     // An operator with nothing after it is a syntax error, in GNU find's
@@ -900,4 +1016,75 @@ fn test_find_operator_without_operand() {
         args.extend_from_slice(expr);
         run_test_find(&args, "", &format!("find: {message}\n"), 1);
     }
+}
+
+// A failed write of a pathname is an error: find discarded it and exited 0.
+// -print0 output ends without a <newline>, so it is still buffered at exit.
+#[test]
+fn find_reports_write_error() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    plib::testing::assert_write_error_on_full_device("find", &[path], b"", 1);
+    plib::testing::assert_write_error_on_full_device("find", &[path, "-print0"], b"", 1);
+}
+
+// A starting point, and a file name handed to -exec, are passed through byte
+// for byte; a non-UTF-8 starting point made find panic, and {} was replaced
+// by a lossy copy of the name, which named a different file.
+#[test]
+fn find_non_utf8_path_and_exec() {
+    use plib::testing::{create_non_utf8, os_bytes};
+    let dir = tempdir().unwrap();
+    let Some(top) = create_non_utf8(dir.path(), b"top\xff", |p| std::fs::create_dir(p)) else {
+        return;
+    };
+    File::create(top.join(os_bytes(b"f\xfe"))).unwrap();
+
+    let output = Command::new(get_binary_path("find"))
+        .arg(&top)
+        .args([
+            "-type",
+            "f",
+            "-exec",
+            "sh",
+            "-c",
+            "printf '%s\\n' \"${1##*/}\"",
+            "sh",
+            "{}",
+            ";",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"f\xfe\n");
+
+    let output = Command::new(get_binary_path("find"))
+        .arg(&top)
+        .args(["-type", "f", "-exec", "ls", "{}", "+"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let mut expected = top
+        .join(os_bytes(b"f\xfe"))
+        .into_os_string()
+        .into_encoded_bytes();
+    expected.push(b'\n');
+    assert_eq!(output.stdout, expected);
+}
+
+// An operand read as text (here a user name) that is not valid UTF-8 is
+// reported as an error, not a panic.  Pattern operands are byte strings and
+// are accepted (see bytes.rs).
+#[test]
+fn find_non_utf8_expression_operand_is_an_error() {
+    use plib::testing::os_bytes;
+    let dir = tempdir().unwrap();
+    let output = Command::new(get_binary_path("find"))
+        .arg(dir.path())
+        .arg("-user")
+        .arg(os_bytes(b"x\xff"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.starts_with(b"find: "), "{output:?}");
 }

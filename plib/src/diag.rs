@@ -100,7 +100,10 @@ pub fn init(utility: &str) {
 ///   signal every historical utility gets. A utility that writes into a pager
 ///   or filter it spawned itself needs `EPIPE` for *that* pipe, and holds a
 ///   [`crate::io::SigPipeIgnored`] across the write rather than changing the
-///   disposition for its whole run.
+///   disposition for its whole run. A `SIG_IGN` the process inherited is
+///   kept, and a write to a closed pipe is then a write error.
+/// - [`crate::io::report_stdout_write_errors`] — a failed `println!` is
+///   reported as `UTILITY: write error: REASON` with exit 1, not a panic.
 /// - `setlocale(LC_ALL, "")` — inherits the locale from the environment so that
 ///   locale-sensitive libc functions (`<ctype.h>`/`<wctype.h>`, `strcoll`,
 ///   `strftime`, `nl_langinfo`, …) observe `LC_*`. The gettextrs wrapper applies
@@ -140,6 +143,7 @@ pub fn init(utility: &str) {
 pub fn init_locale(utility: &str) {
     use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
     crate::io::restore_sigpipe();
+    crate::io::report_stdout_write_errors(utility);
     setlocale(LocaleCategory::LcAll, "");
     #[cfg(windows)]
     {
@@ -258,6 +262,26 @@ pub fn exit_status() -> i32 {
         1
     } else {
         0
+    }
+}
+
+/// Flush standard output at the end of a run, and report a failure.
+///
+/// Standard output is line-buffered, so output that does not end in a
+/// <newline> is still in the buffer when `main` returns or calls
+/// `std::process::exit`. The runtime flushes it then but discards the error,
+/// so a final partial line written to a full disk was lost with exit status 0
+/// (`printf x | cat >/dev/full`). Call this after the last output: a failure
+/// is reported as `UTILITY: write error: REASON`, counted like any [`error`],
+/// and `false` is returned for the caller to fold into the exit status its
+/// specification gives an error.
+pub fn flush_stdout() -> bool {
+    match io::stdout().flush() {
+        Ok(()) => true,
+        Err(e) => {
+            error(&format!("write error: {}", io_error_text(&e)));
+            false
+        }
     }
 }
 

@@ -262,7 +262,11 @@ fn file_exclude_ascii_skips_text_tests() {
     // GNU file's "ascii" test is the one that recognises text; without it a
     // script that no magic entry matches is "data".
     let path = write_fixture("script", b"#!/bin/sh\necho hi\n");
-    file_stdout(&["-b"], &path, "commands text\n");
+    file_stdout(
+        &["-b"],
+        &path,
+        "POSIX shell script, ASCII text executable\n",
+    );
     file_stdout(&DH_ARGS, &path, "data\n");
 }
 

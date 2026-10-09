@@ -571,3 +571,24 @@ fn test_negative_pid_after_positive_needs_no_dash_dash() {
     );
     assert_eq!(output.status.code(), Some(1));
 }
+
+// An argument that is not valid UTF-8 is an invalid signal or PID, reported
+// with status 1; it made kill panic.
+#[test]
+fn kill_rejects_non_utf8_arguments() {
+    use plib::testing::os_bytes;
+    for args in [
+        vec![os_bytes(b"x\xff")],
+        vec!["-s".into(), os_bytes(b"x\xff"), "1".into()],
+    ] {
+        let output = Command::new(get_binary_path("kill"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "kill {args:?}: {output:?}");
+        assert!(
+            output.stderr.starts_with(b"kill: "),
+            "kill {args:?}: {output:?}"
+        );
+    }
+}

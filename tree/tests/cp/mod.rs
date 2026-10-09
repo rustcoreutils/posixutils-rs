@@ -9,6 +9,7 @@
 
 mod debhelper;
 mod dirmode;
+mod link;
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -16,6 +17,7 @@ mod dirmode;
 mod old_kernel;
 mod race;
 mod umask;
+mod verbose;
 
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;
@@ -514,6 +516,41 @@ fn test_cp_r_vs_symlink() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
+/// A trailing slash on a symlink source follows the link, -P or not, and names a directory
+/// (POSIX pathname resolution): `cp -R dl/ x` copies the directory, and `cp -R fl/ x` (a link to
+/// a file) is "Not a directory". Both used to copy the link itself.
+#[test]
+fn test_cp_r_trailing_slash_symlink_source() {
+    let test_dir = &format!("{}/test_cp_r_trailing_slash", env!("CARGO_TARGET_TMPDIR"));
+    let (d, dl, fl, x, y) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/dl"),
+        &format!("{test_dir}/fl"),
+        &format!("{test_dir}/x"),
+        &format!("{test_dir}/y"),
+    );
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::write(format!("{d}/f"), b"abc\n").unwrap();
+    fs::write(format!("{test_dir}/file"), b"abc\n").unwrap();
+    unix::fs::symlink("d", dl).unwrap();
+    unix::fs::symlink("file", fl).unwrap();
+
+    cp_test(&["-RP", &format!("{dl}/"), x], "", "", 0);
+    assert!(fs::symlink_metadata(x).unwrap().is_dir());
+    assert_eq!(fs::read(format!("{x}/f")).unwrap(), b"abc\n");
+
+    cp_test(
+        &["-R", &format!("{fl}/"), y],
+        "",
+        &format!("cp: cannot access '{fl}/': Not a directory\n"),
+        1,
+    );
+    assert!(fs::symlink_metadata(y).is_err());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
 // Partial port of coreutils/tests/cp/same-file.sh
 // Only the -f flag is tested
 #[test]
@@ -900,12 +937,9 @@ fn test_cp_special_bits() {
     fs::set_permissions(c, fs::Permissions::from_mode(mode_c)).unwrap();
 
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
 
         // chown "$NON_ROOT_USERNAME" .
         let md = fs::metadata(test_dir).unwrap();
@@ -1016,12 +1050,9 @@ fn test_cp_preserve_clears_setuid_on_chown_fail() {
 
     // Hand the directory to the non-root user so it can create the copy there.
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
         let md = fs::metadata(test_dir).unwrap();
         let test_dir_cstr = CString::new(test_dir.as_bytes()).unwrap();
         if libc::chown(test_dir_cstr.as_ptr(), uid, md.gid()) != 0 {
@@ -1761,7 +1792,8 @@ fn test_cp_f_does_not_replace_directory() {
         cp_test(
             &args,
             "",
-            &format!("cp: cannot overwrite directory '{clash}' with non-directory '{src}/sub'\n"),
+            // The source is shown under the operand as written, `.` included, as GNU does.
+            &format!("cp: cannot overwrite directory '{clash}' with non-directory '{src_contents}/sub'\n"),
             1,
         );
         assert!(

@@ -1431,3 +1431,12 @@ fn get_replaces_a_gfile_symlink_instead_of_following_it() {
         "the symlink is replaced by the g-file"
     );
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-r", "-c", "-i", "-x"] {
+        plib::testing::assert_hyphen_option_argument("get", &[opt, "-zq", "--help"]);
+    }
+}

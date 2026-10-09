@@ -152,3 +152,97 @@ fn env_ignore_with_no_assignments_prints_nothing() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+/// Run env with byte-string arguments and extra environment entries, neither
+/// of which need be valid UTF-8.
+fn env_raw(args: &[&[u8]], env_vars: &[(&[u8], &[u8])]) -> std::process::Output {
+    use plib::testing::{get_binary_path, os_bytes};
+    let mut command = std::process::Command::new(get_binary_path("env"));
+    command.env("LC_ALL", "C");
+    for arg in args {
+        command.arg(os_bytes(arg));
+    }
+    for (key, value) in env_vars {
+        command.env(os_bytes(key), os_bytes(value));
+    }
+    command.output().expect("failed to run env")
+}
+
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "env failed: {:?}, stderr {:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// An inherited value that is not valid UTF-8 is printed as its raw bytes.
+// Found by perl's test suite, whose `$ENV{k} = "eh zero \xA0"` made env panic.
+#[test]
+fn env_dump_non_utf8_value() {
+    let output = env_raw(&[], &[(b"POSIXUTILS_K", b"eh zero \xA0")]);
+    assert_success(&output);
+    assert!(
+        output
+            .stdout
+            .split(|&b| b == b'\n')
+            .any(|l| l == b"POSIXUTILS_K=eh zero \xA0"),
+        "raw value missing from {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+// An inherited name that is not valid UTF-8 is printed as its raw bytes.
+#[test]
+fn env_dump_non_utf8_name() {
+    let output = env_raw(&[], &[(b"POSIXUTILS_\xFF", b"v")]);
+    assert_success(&output);
+    assert!(
+        output
+            .stdout
+            .split(|&b| b == b'\n')
+            .any(|l| l == b"POSIXUTILS_\xFF=v"),
+        "raw name missing from {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+// A NAME=VALUE operand whose value is not valid UTF-8 is set byte for byte.
+#[test]
+fn env_assign_non_utf8_value() {
+    let output = env_raw(&[b"-i", b"K=a\xA0b"], &[]);
+    assert_success(&output);
+    assert_eq!(output.stdout, b"K=a\xA0b\n");
+}
+
+// A NAME=VALUE operand is set byte for byte when it reaches a utility, and the
+// utility's own arguments are passed through unchanged, valid UTF-8 or not.
+#[test]
+fn env_exec_non_utf8_operands() {
+    let output = env_raw(
+        &[
+            b"-i",
+            b"K=x\xA0y",
+            b"/bin/sh",
+            b"-c",
+            b"printf '%s|%s' \"$K\" \"$1\"",
+            b"sh",
+            b"arg\xFE",
+        ],
+        &[],
+    );
+    assert_success(&output);
+    assert_eq!(output.stdout, b"x\xA0y|arg\xFE");
+}
+
+// An inherited non-UTF-8 entry reaches the utility unchanged.
+#[test]
+fn env_exec_passes_non_utf8_environment() {
+    let output = env_raw(
+        &[b"/bin/sh", b"-c", b"printf '%s' \"$POSIXUTILS_K\""],
+        &[(b"POSIXUTILS_K", b"eh zero \xA0")],
+    );
+    assert_success(&output);
+    assert_eq!(output.stdout, b"eh zero \xA0");
+}

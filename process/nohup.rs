@@ -37,7 +37,7 @@ fn get_nohup_out_file() -> io::Result<(File, NohupDir)> {
         Ok(file) => Ok((file, NohupDir::Current)),
         Err(_) => {
             // POSIX: the fallback directory is the HOME environment variable.
-            let home = env::var("HOME").map_err(|_| {
+            let home = env::var_os("HOME").ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     gettext("HOME environment variable not set"),
@@ -85,7 +85,7 @@ fn main() {
         fatal(gettext("failed to duplicate stderr"));
     }
 
-    let mut args = env::args().skip(1);
+    let mut args = env::args_os().skip(1);
     let command = match args.next() {
         Some(cmd) => cmd,
         None => fatal(gettext("usage: nohup utility [argument...]")),
@@ -163,11 +163,19 @@ fn main() {
             }
             match error.kind() {
                 io::ErrorKind::NotFound => {
-                    diag::error(&format!("{}: {}", command, gettext("command not found")));
+                    diag::error(&format!(
+                        "{}: {}",
+                        command.to_string_lossy(),
+                        gettext("command not found")
+                    ));
                     process::exit(127);
                 }
                 _ => {
-                    diag::error(&format!("{}: {}", command, gettext("cannot execute")));
+                    diag::error(&format!(
+                        "{}: {}",
+                        command.to_string_lossy(),
+                        gettext("cannot execute")
+                    ));
                     process::exit(126);
                 }
             }

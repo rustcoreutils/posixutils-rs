@@ -10,6 +10,9 @@
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
+mod context;
+mod word;
+
 const LINES_INPUT: &str =
     "line_{1}\np_line_{2}_s\n  line_{3}  \nLINE_{4}\np_LINE_{5}_s\nl_{6}\nline_{70}\n";
 const EMPTY_LINES_INPUT: &str = "\n\n\n";
@@ -24,10 +27,9 @@ const INVALID_LINE_INPUT_FILE: &str = "tests/grep/invalid_line";
 /// What grep reports for `BAD_INPUT_FILE`: the system's own text for the
 /// failed open, which differs between Unix and Windows.
 fn bad_input_file_error() -> String {
-    let err = std::fs::File::open(BAD_INPUT_FILE).expect_err("BAD_INPUT_FILE must not exist");
     format!(
         "grep: {BAD_INPUT_FILE}: {}\n",
-        plib::diag::io_error_text(&err)
+        plib::testing::open_error_text(BAD_INPUT_FILE)
     )
 }
 
@@ -156,8 +158,8 @@ fn test_basic_regexp_03() {
         &[BRE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -256,8 +258,8 @@ fn test_basic_regexp_line_number_03() {
         &["-n", BRE, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -305,13 +307,13 @@ fn test_basic_regexp_no_messages_with_error_04() {
 }
 
 #[test]
-fn test_basic_regexp_no_messages_with_error_05() {
+fn test_basic_regexp_no_messages_invalid_utf8_line_05() {
     grep_test(
         &["-s", BRE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
         "",
-        2,
+        0,
     );
 }
 
@@ -374,8 +376,8 @@ fn test_extended_regexp_03() {
         &["-E", ERE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -480,8 +482,8 @@ fn test_extended_regexp_line_number_03() {
         &["-E", "-n", ERE, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -539,13 +541,13 @@ fn test_extended_regexp_no_messages_with_error_04() {
 }
 
 #[test]
-fn test_extended_regexp_no_messages_with_error_05() {
+fn test_extended_regexp_no_messages_invalid_utf8_line_05() {
     grep_test(
         &["-E", "-s", ERE, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
         "",
-        2,
+        0,
     );
 }
 
@@ -614,8 +616,8 @@ fn test_fixed_strings_03() {
         &["-F", FIXED, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -726,8 +728,8 @@ fn test_fixed_strings_line_number_03() {
         &["-F", "-n", FIXED, INVALID_LINE_INPUT_FILE],
         "",
         "1:line_{1}\n3:p_line_{2}_s\n",
-        "grep: tests/grep/invalid_line: error reading line 2 (stream did not contain valid UTF-8)\n",
-        2,
+        "",
+        0,
     );
 }
 
@@ -786,13 +788,13 @@ fn test_fixed_strings_no_messages_with_error_04() {
 }
 
 #[test]
-fn test_fixed_strings_no_messages_with_error_05() {
+fn test_fixed_strings_no_messages_invalid_utf8_line_05() {
     grep_test(
         &["-F", "-s", FIXED, INVALID_LINE_INPUT_FILE],
         "",
         "line_{1}\np_line_{2}_s\n",
         "",
-        2,
+        0,
     );
 }
 
@@ -1573,4 +1575,315 @@ fn grep_diagnostics_name_the_utility() {
     assert_eq!(out.status.code(), Some(2), "an unreadable operand exits 2");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no-such-file-xyz"), "got {stderr:?}");
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. autoconf's
+// AC_PROG_GREP runs `grep -e 'GREP$' -e '-(cannot match)-'`; clap used to
+// read the second pattern as an option and refuse it, failing configure.
+#[test]
+fn test_option_argument_begins_with_hyphen() {
+    grep_test(
+        &["-e", "GREP$", "-e", "-(cannot match)-"],
+        "GREP\nnot this\n",
+        "GREP\n",
+        "",
+        0,
+    );
+}
+
+// Only the word after an option that takes a value is its argument: the
+// options around it still parse as options.
+#[test]
+fn test_hyphen_pattern_then_option() {
+    grep_test(&["-e", "-x", "-c"], "a-x\n-x\nb\n", "2\n", "", 0);
+}
+
+// A read error ends that input: grep reports it once and goes on to the next
+// operand. A directory operand used to make grep print "error reading line N"
+// for ever, hanging rpcsvc-proto's build (`grep -i GNU pkg ../*`).
+#[cfg(unix)]
+#[test]
+fn test_unreadable_operand_is_reported_once() {
+    use std::time::{Duration, Instant};
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let dir = tmp.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    let file = tmp.path().join("f");
+    std::fs::write(&file, "GNU here\nnot this\n").unwrap();
+
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("grep"))
+        .args(["GNU"])
+        .arg(&dir)
+        .arg(&file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("grep never finished reading a directory operand");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout, format!("{}:GNU here\n", file.display()));
+    assert_eq!(stderr.lines().count(), 1, "{stderr:?}");
+    assert!(stderr.contains(&*dir.to_string_lossy()), "{stderr:?}");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// Run grep with `env` added to its environment; returns stdout, stderr and
+/// the exit status.
+fn grep_bytes_with_env(
+    args: &[&str],
+    stdin: &[u8],
+    env: &[(&str, &str)],
+) -> (Vec<u8>, String, i32) {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let out = plib::testing::run_test_base_with_env("grep", &args, stdin, env);
+    (
+        out.stdout,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+// A line that is not valid UTF-8 is still a line. In the C locale every byte
+// is a character, so it matches like any other; grep used to skip it with
+// "error reading line N" and exit 2, even with no locale set at all.
+#[test]
+fn test_line_not_valid_utf8_is_searched_in_the_c_locale() {
+    let c = [("LC_ALL", "C")];
+    let input: &[u8] = b"x\xff foo\nbar\n\xc3\xa9\xe9 FOO\n";
+    let cases: [(&[&str], &[u8]); 8] = [
+        (&["foo"], b"x\xff foo\n"),
+        (&["-F", "foo"], b"x\xff foo\n"),
+        (&["-i", "foo"], b"x\xff foo\n\xc3\xa9\xe9 FOO\n"),
+        (&["-F", "-i", "foo"], b"x\xff foo\n\xc3\xa9\xe9 FOO\n"),
+        (&["-v", "-n", "bar"], b"1:x\xff foo\n3:\xc3\xa9\xe9 FOO\n"),
+        (&["-c", "x. "], b"1\n"),
+        // `.` is one byte: three of them before the blank on line 3.
+        (&["^... "], b"\xc3\xa9\xe9 FOO\n"),
+        (&["-F", "-x", "\u{e9}\u{fffd}"], b""),
+    ];
+    for (args, expected) in cases {
+        let (out, err, code) = grep_bytes_with_env(args, input, &c);
+        let want_code = if expected.is_empty() { 1 } else { 0 };
+        assert_eq!(
+            (out.as_slice(), err.as_str(), code),
+            (expected, "", want_code),
+            "{args:?}"
+        );
+    }
+}
+
+// The same with no locale variable set at all (`env -i grep`).
+#[test]
+fn test_line_not_valid_utf8_is_searched_with_no_locale() {
+    let mut cmd = std::process::Command::new(plib::testing::get_binary_path("grep"));
+    cmd.env_clear()
+        .arg("foo")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"x\xff foo\n")
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.stdout, b"x\xff foo\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+// In a UTF-8 locale an invalid byte is no character at all: it is not matched
+// by `.`, but the rest of its line is searched and the line is written as is.
+#[test]
+fn test_line_not_valid_utf8_is_searched_in_a_utf8_locale() {
+    let Some(locale) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let env = [("LC_ALL", locale.as_str())];
+    let input: &[u8] = b"x\xff foo\n\xc3\xa9 FOO\n";
+    let cases: [(&[&str], &[u8]); 4] = [
+        (&["foo"], b"x\xff foo\n"),
+        (&["-F", "-i", "foo"], b"x\xff foo\n\xc3\xa9 FOO\n"),
+        (&["-c", "^. "], b"1\n"),
+        (&["-v", "foo"], b"\xc3\xa9 FOO\n"),
+    ];
+    for (args, expected) in cases {
+        let (out, err, code) = grep_bytes_with_env(args, input, &env);
+        assert_eq!(
+            (out.as_slice(), err.as_str(), code),
+            (expected, "", 0),
+            "{args:?}"
+        );
+    }
+}
+
+// -H (GNU) names the file on every output line, even for a single input;
+// --with-filename is its long spelling.
+#[test]
+fn test_with_filename() {
+    let named = format!("{INPUT_FILE_1}:line_{{1}}\n{INPUT_FILE_1}:line_{{70}}\n");
+    grep_test(&["-H", "^line", INPUT_FILE_1], "", &named, "", 0);
+    grep_test(
+        &["--with-filename", "^line", INPUT_FILE_1],
+        "",
+        &named,
+        "",
+        0,
+    );
+    grep_test(
+        &["-H", "-n", "^line_{7", INPUT_FILE_1],
+        "",
+        &format!("{INPUT_FILE_1}:7:line_{{70}}\n"),
+        "",
+        0,
+    );
+    grep_test(
+        &["-H", "-c", "^line", INPUT_FILE_1],
+        "",
+        &format!("{INPUT_FILE_1}:2\n"),
+        "",
+        0,
+    );
+    grep_test(
+        &["-H", "^line_{7"],
+        LINES_INPUT,
+        "(standard input):line_{70}\n",
+        "",
+        0,
+    );
+}
+
+// -h (GNU) never names the file, even for several inputs.  -h no longer means
+// --help, and of -h and -H the last one given wins.
+#[test]
+fn test_no_filename() {
+    grep_test(
+        &["-h", "^line_{7", INPUT_FILE_1, "-"],
+        LINES_INPUT,
+        "line_{70}\nline_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["--no-filename", "-n", "^line_{7", INPUT_FILE_1, "-"],
+        LINES_INPUT,
+        "7:line_{70}\n7:line_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["-h", "-c", "^line_{7", INPUT_FILE_1, "-"],
+        LINES_INPUT,
+        "1\n1\n",
+        "",
+        0,
+    );
+    grep_test(&["-Hh", "^line_{7", INPUT_FILE_1], "", "line_{70}\n", "", 0);
+    grep_test(
+        &["-hH", "^line_{7", INPUT_FILE_1],
+        "",
+        &format!("{INPUT_FILE_1}:line_{{70}}\n"),
+        "",
+        0,
+    );
+    // -l writes names whatever -h says.
+    grep_test(
+        &["-h", "-l", "^line_{7", INPUT_FILE_1],
+        "",
+        &format!("{INPUT_FILE_1}\n"),
+        "",
+        0,
+    );
+}
+
+// Help is reachable as --help only.
+#[test]
+fn test_help_is_long_only() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("grep"),
+            args: vec![String::from("--help")],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(out.contains("--help"), "got {out:?}");
+            assert!(out.contains("-h, --no-filename"), "got {out:?}");
+            assert_eq!(output.status.code(), Some(0));
+        },
+    );
+}
+
+// --label (GNU) names standard input in prefixes and in -l and -c output.
+#[test]
+fn test_label_names_standard_input() {
+    grep_test(
+        &["--label=LBL", "-H", "^line_{7", "-"],
+        LINES_INPUT,
+        "LBL:line_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["--label", "LBL", "-H", "^line_{7"],
+        LINES_INPUT,
+        "LBL:line_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["--label=LBL", "^line_{7", "-", INPUT_FILE_1],
+        LINES_INPUT,
+        &format!("LBL:line_{{70}}\n{INPUT_FILE_1}:line_{{70}}\n"),
+        "",
+        0,
+    );
+    grep_test(
+        &["--label=LBL", "-c", "^line_{7", INPUT_FILE_1, "-"],
+        LINES_INPUT,
+        &format!("{INPUT_FILE_1}:1\nLBL:1\n"),
+        "",
+        0,
+    );
+    grep_test(
+        &["--label=LBL", "-l", "^line_{7"],
+        LINES_INPUT,
+        "LBL\n",
+        "",
+        0,
+    );
+    // A label names standard input only, and only when it is printed.
+    grep_test(
+        &["--label=LBL", "^line_{7", INPUT_FILE_1],
+        "",
+        "line_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["--label=", "-H", "^line_{7"],
+        LINES_INPUT,
+        ":line_{70}\n",
+        "",
+        0,
+    );
 }

@@ -36,7 +36,9 @@ What behaves differently on Windows:
   Unicode; any other value, or none, is the user's locale with UTF-8 input and
   Unicode characters;
 - POSIX regular expressions are musl's (vendored in `plib/vendor/musl-regex`)
-  and do not support characters above U+FFFF;
+  and do not support characters above U+FFFF: such a character matches
+  nothing, as a byte that is not UTF-8 does, and the rest of the line is
+  still searched;
 - `sort -n` always takes `.` as the decimal point, with no thousands
   separator;
 - `diff` reports anything that is neither a file nor a directory as a
@@ -124,7 +126,7 @@ before going on.
 | `/dev/tty` | the console, `CONIN$` / `CONOUT$`: `plib::io::open_terminal_input` / `open_terminal_output` |
 | `LC_ALL`, `LC_*`, `LANG` | read per category by `plib::diag::init_locale`: `C` or `POSIX` selects the C locale (the C runtime's `"C"`, and ASCII-only, byte-per-character `plib::locale`); `C.UTF-8` and other `C`/`POSIX` names with a codeset select the C runtime's `"C"` except for `LC_CTYPE`, which stays UTF-8; anything else, or unset, the user's locale in UTF-8 |
 | characters, case, multibyte | `plib::locale`: outside the C locale, Rust's Unicode rules with input decoded as UTF-8; before `init_locale`, the C locale |
-| POSIX regex | vendored musl regex (`plib::regex`); no characters above U+FFFF |
+| POSIX regex | vendored musl regex (`plib::regex`); a character above U+FFFF matches nothing |
 | `localeconv` (decimal point, grouping) | `.` and no grouping |
 | `dev`/`ino` file identity | the canonical path (stable Rust has no file ID) |
 | FIFOs, devices, sockets | none: neither a file nor a directory is "special" |

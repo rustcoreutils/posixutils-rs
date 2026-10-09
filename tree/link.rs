@@ -37,7 +37,7 @@ fn do_link(file1: &str, file2: &str) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("link");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut exit_code = 0;
 

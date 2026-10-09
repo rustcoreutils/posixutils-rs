@@ -277,3 +277,12 @@ fn test_split_error_names_the_output_file() {
     );
     assert_ne!(out.status.code(), Some(0));
 }
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-a", "-l", "-b"] {
+        plib::testing::assert_hyphen_option_argument("split", &[opt, "-zq", "--help"]);
+    }
+}

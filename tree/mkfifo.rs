@@ -67,7 +67,7 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Resul
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("mkfifo");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut exit_code = 0;
 

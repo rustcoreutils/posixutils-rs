@@ -21,19 +21,20 @@ use gettextrs::gettext;
 struct Args {
     #[arg(
         short = 'A',
+        allow_hyphen_values = true,
         help = gettext(
             "Address base (d for decimal, o for octal, x for hexadecimal, n for none)"
         )
     )]
     address_base: Option<char>,
 
-    #[arg(short = 'j', help = gettext("Skip bytes from the beginning of the input"))]
+    #[arg(short = 'j', allow_hyphen_values = true, help = gettext("Skip bytes from the beginning of the input"))]
     skip: Option<String>,
 
-    #[arg(short = 'N', help = gettext("Read only the specified number of bytes"))]
+    #[arg(short = 'N', allow_hyphen_values = true, help = gettext("Read only the specified number of bytes"))]
     count: Option<String>,
 
-    #[arg(short = 't', help = gettext("Select the output format"))]
+    #[arg(short = 't', allow_hyphen_values = true, help = gettext("Select the output format"))]
     type_strings: Vec<String>,
 
     #[arg(
@@ -1405,7 +1406,7 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("od");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     args.validate_args()?;
     let mut exit_code = 0;

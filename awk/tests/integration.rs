@@ -131,9 +131,32 @@ fn test_awk_dash_f_escape_processing() {
     );
 }
 
+/// Run the program file `tests/awk/<name>.awk` in a UTF-8 locale and compare
+/// its output with `<name>.out`. Characters are bytes in the C locale the
+/// harness defaults to, so a test of multibyte characters names its locale.
+fn test_awk_utf8(name: &str, expected_output: &str) {
+    let Some(locale) = plib::testing::utf8_locale() else {
+        return;
+    };
+    plib::testing::run_test_with_env(
+        TestPlan {
+            cmd: String::from("awk"),
+            args: vec!["-f".to_string(), format!("tests/awk/{name}.awk")],
+            stdin_data: String::new(),
+            expected_out: String::from(expected_output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LC_ALL", locale.as_str())],
+    );
+}
+
 #[test]
 fn test_awk_multibyte_char_counts() {
-    test_awk!(multibyte_char_counts);
+    test_awk_utf8(
+        "multibyte_char_counts",
+        include_str!("awk/multibyte_char_counts.out"),
+    );
 }
 
 #[test]
@@ -858,7 +881,10 @@ fn test_awk_bugfix_numstr_field_cmp() {
 // Regression: gsub with zero-width match must not panic on multi-byte UTF-8
 #[test]
 fn test_awk_bugfix_gsub_multibyte() {
-    test_awk!(bugfix_gsub_multibyte);
+    test_awk_utf8(
+        "bugfix_gsub_multibyte",
+        include_str!("awk/bugfix_gsub_multibyte.out"),
+    );
 }
 
 // Regression: default SUBSEP must be \034 (0x1c), not space
@@ -923,4 +949,1208 @@ fn test_awk_bugfix_redirect_truncate() {
         contents, "short\n",
         "file should be truncated on > redirect"
     );
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn awk_option_argument_may_begin_with_hyphen() {
+    for opt in ["-F", "-f", "-v"] {
+        plib::testing::assert_hyphen_option_argument("awk", &[opt, "-zq", "--help"]);
+    }
+}
+
+#[test]
+fn awk_field_separator_begins_with_hyphen() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            String::from("-F"),
+            String::from("-:"),
+            String::from("{ print $2 }"),
+        ],
+        stdin_data: String::from("a-:b\n"),
+        expected_out: String::from("b\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// A '#' inside a regular expression literal, or inside a string, is part of
+// that token and does not start a comment. autoconf's config.status uses
+// `/^[\t ]*#[\t ]*(define|undef)[\t ]+/` and `sub(/#.*/, "")`.
+#[test]
+fn awk_hash_inside_regex_literal_is_not_a_comment() {
+    let cases = [
+        ("/#/", "x\na#b\n", "a#b\n"),
+        ("/^#AT_START_/", "#AT_START_1\nAT_START_\n", "#AT_START_1\n"),
+        (
+            "/^[\\t ]*#[\\t ]*(define|undef)[\\t ]+/ { print $2 }",
+            "# define FOO 1\n#undef BAR\nint x;\n",
+            "define\nBAR\n",
+        ),
+        ("{ sub(/#.*/, \"\"); print }", "keep # drop\n", "keep \n"),
+        ("/[#]/ { print \"br\" }", "a#\nb\n", "br\n"),
+        ("{ print \"a#b\" } # trailing comment", "x\n", "a#b\n"),
+        ("/a b/", "ab\na b\n", "a b\n"),
+    ];
+    for (program, input, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from(input),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+/// Run awk with `env` added to its environment and return its standard output
+/// as raw bytes, asserting that it succeeded without diagnostics.
+fn awk_bytes_with_env(args: &[&str], stdin: &[u8], env: &[(&str, &str)]) -> Vec<u8> {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let output = plib::testing::run_test_base_with_env("awk", &args, stdin, env);
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{args:?}");
+    assert_eq!(output.status.code(), Some(0), "{args:?}");
+    output.stdout
+}
+
+// In a single-byte locale a character is a byte: `%c` with a numeric
+// argument writes the one byte whose value is the argument (modulo 256, as
+// gawk and mawk do), never a UTF-8 encoding of it, and input bytes reach the
+// output unchanged.
+#[test]
+fn awk_printf_c_writes_a_byte_in_the_c_locale() {
+    let c = [("LC_ALL", "C")];
+    let cases: [(&str, &[u8], &[u8]); 6] = [
+        ("BEGIN { printf(\"%c\", 200) }", b"", b"\xc8"),
+        (
+            "BEGIN { s = sprintf(\"%c%c\", 200, 256 + 65); printf \"%s|%d\", s, length(s) }",
+            b"",
+            b"\xc8A|2",
+        ),
+        // A string argument gives its first character, which is a byte here.
+        (
+            "{ printf(\"%c|%c\", $0, \"\\303\\251\") }",
+            b"\xe9x\n",
+            b"\xe9|\xc3",
+        ),
+        // Bytes in, the same bytes out; length counts bytes.
+        (
+            "{ print length($1); print }",
+            b"caf\xc3\xa9 \xff\n",
+            b"5\ncaf\xc3\xa9 \xff\n",
+        ),
+        // A regular expression sees bytes: `.` matches one byte.
+        ("{ sub(/./, \"x\"); print }", b"\xc3\xa9\n", b"x\xa9\n"),
+        (
+            "{ print index($0, \"\\251\"), substr($0, 2) }",
+            b"\xc3\xa9\n",
+            b"2 \xa9\n",
+        ),
+    ];
+    for (program, input, expected) in cases {
+        assert_eq!(
+            awk_bytes_with_env(&[program], input, &c),
+            expected,
+            "{program}"
+        );
+    }
+}
+
+// In a UTF-8 locale `%c` writes the character with that code point.
+#[test]
+fn awk_printf_c_writes_utf8_in_a_utf8_locale() {
+    let Some(locale) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let env = [("LC_ALL", locale.as_str())];
+    let out = awk_bytes_with_env(
+        &["BEGIN { printf(\"%c|%c\", 200, \"éx\"); s = \"é\"; print \"\", length(s) }"],
+        b"",
+        &env,
+    );
+    assert_eq!(out, "È|é 1\n".as_bytes());
+}
+
+// gsub replaces non-overlapping matches, and an empty match right where the
+// previous match ended is not another one: gawk, mawk and the one true awk
+// all turn "abc" into "XaXcX" for gsub(/b*/, "X").
+#[test]
+fn awk_gsub_skips_an_empty_match_after_a_match() {
+    let cases = [
+        ("{ gsub(/b*/, \"X\"); print }", "abc\n", "XaXcX\n"),
+        ("{ n = gsub(/b*/, \"X\"); print n }", "abbc\n", "3\n"),
+        ("{ gsub(/x*/, \"-\"); print }", "abc\n", "-a-b-c-\n"),
+        ("{ gsub(/a*/, \"X\"); print }", "aab\n", "XbX\n"),
+    ];
+    for (program, input, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from(input),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+/// Run awk on `program` with a 20 second limit, so that a hang fails the test
+/// instead of the whole run; returns stdout, stderr and the exit status.
+fn awk_with_deadline(program: &str) -> (String, String, Option<i32>) {
+    awk_with_deadline_input(program, "")
+}
+
+/// `awk_with_deadline`, with `input` on standard input.
+fn awk_with_deadline_input(program: &str, input: &str) -> (String, String, Option<i32>) {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("awk"))
+        .arg(program)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // the input is small, so writing it all before reading cannot deadlock;
+    // awk may exit without reading it
+    let mut stdin = child.stdin.take().unwrap();
+    if let Err(error) = stdin.write_all(input.as_bytes()) {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    drop(stdin);
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("awk never finished with {program:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+// After a syntax error awk looks for more errors by reparsing from each later
+// `}`, BEGIN, END or `function`.  When the reparse from a keyword failed too,
+// the next search found that same keyword again at offset 0 and awk spun for
+// ever; texinfo's texindex.awk hung bash's documentation build this way.
+#[test]
+fn awk_syntax_error_before_a_failing_function_terminates() {
+    let programs = [
+        "BEGIN { @ }\nfunction f() { @ }\n",
+        "BEGIN { @ }\nBEGIN { @ }\n",
+        "BEGIN { @ }\nEND { @ }\nEND { @ }\n",
+        "{ @ } function",
+    ];
+    for program in programs {
+        let (stdout, stderr, status) = awk_with_deadline(program);
+        assert_eq!(stdout, "", "{program:?}");
+        assert!(!stderr.is_empty(), "{program:?}");
+        assert_ne!(status, Some(0), "{program:?}");
+    }
+}
+
+// A keyword is a whole word, and only BEGIN and END are reserved, in
+// capitals.  `begin`, `end` and `foreach` are ordinary names, and so is a
+// name that starts with a keyword: `nextchar` is not `next` followed by
+// `char`, `exitcode = 4` does not exit, and `elsewhere` after an `if` is not
+// its `else`.  texindex.awk has `function join(array, start, end, sep)` and
+// `nextchar = kchars[3]`.
+#[test]
+fn awk_keywords_are_whole_words() {
+    let cases = [
+        ("BEGIN { nextchar = 1; print nextchar }", "1\n"),
+        (
+            "BEGIN { breakx = 2; continued = 3; print breakx, continued }",
+            "2 3\n",
+        ),
+        ("BEGIN { exitcode = 4; print exitcode }", "4\n"),
+        (
+            "BEGIN { returned = 5; doit = 6; print returned, doit }",
+            "5 6\n",
+        ),
+        (
+            "BEGIN { printer = 7; printfx = 8; print printer, printfx }",
+            "7 8\n",
+        ),
+        (
+            "BEGIN { deleted = 9; getlines = 10; print deleted, getlines }",
+            "9 10\n",
+        ),
+        (
+            "BEGIN { if (0) x = 1\nelsewhere = 11; print elsewhere }",
+            "11\n",
+        ),
+        ("BEGIN { if (0) x = 1; else print 12 }", "12\n"),
+        (
+            "function j(a, start, end) { return start end } BEGIN { print j(0, 1, 2) }",
+            "12\n",
+        ),
+        ("BEGIN { begin = 3; end = 4; print begin + end }", "7\n"),
+        ("BEGIN { foreach = \"f\"; print foreach }", "f\n"),
+        ("BEGIN { endx = 1; Begin = 2; print endx, Begin }", "1 2\n"),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::new(),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+// A newline may follow `&&`, `||` and the comma of a parameter list, with a
+// comment before it (POSIX awk, Lexical Conventions); texindex.awk relies on
+// all three.
+#[test]
+fn awk_newline_after_and_or_and_parameter_comma() {
+    let cases = [
+        ("BEGIN { if (1 &&\n 2) print \"and\" }", "and\n"),
+        ("BEGIN { if (0 ||  # why\n\n 2) print \"or\" }", "or\n"),
+        ("BEGIN { x = 1 &&\n 0; print x }", "0\n"),
+        (
+            "function q(a,\t# parameters\n\tb) { return a b }\nBEGIN { print q(1, 2) }",
+            "12\n",
+        ),
+        (
+            "function q(a,\n\n b,\n c) { return c }\nBEGIN { print q(1, 2, 3) }",
+            "3\n",
+        ),
+        ("/x/ &&\n/y/ { print }", "xy\n"),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from("xy\nx\n"),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+// Each of the three clauses of `for (init; cond; update)` may be empty, and
+// so may the body; an empty condition is true.  The compiler took the
+// children in order and panicked when one was missing (texindex.awk has
+// `for (; i <= j; i++)`).
+#[test]
+fn awk_for_clauses_may_be_empty() {
+    let cases = [
+        (
+            "BEGIN { i = 1; for (; i <= 3; i++) printf i; print \"\" }",
+            "123\n",
+        ),
+        (
+            "BEGIN { for (i = 1; ; i++) if (i > 2) break; print i }",
+            "3\n",
+        ),
+        ("BEGIN { for (i = 1; i < 3;) i++; print i }", "3\n"),
+        (
+            "BEGIN { for (;;) { n++; if (n == 4) break }; print n }",
+            "4\n",
+        ),
+        ("BEGIN { for (i = 0; i < 5; i++); print i }", "5\n"),
+        ("BEGIN { for (i = 0; i < 6; i++) {}\nprint i }", "6\n"),
+        (
+            "BEGIN { for (i = 0; i < 4; i++) { if (i % 2) continue; s = s i }; print s }",
+            "02\n",
+        ),
+        (
+            "BEGIN { i = 0; for (;; i++) if (i == 7) break; print i }",
+            "7\n",
+        ),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::new(),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+// An unset variable passed to a function becomes an array in the caller when
+// the function uses its parameter as one (filling it with split, assigning
+// an element, passing it on), as in gawk, mawk and the one true awk; a
+// scalar assigned to the parameter stays local.  texindex.awk's char_split
+// fills its caller's local with split(string, array, "").
+#[test]
+fn awk_unset_argument_becomes_the_callers_array() {
+    let cases = [
+        (
+            "function f(arr) { split(\"x y\", arr) } BEGIN { f(b); print length(b), b[2] }",
+            "2 y\n",
+        ),
+        (
+            "function f(arr) { arr[1] = \"set\" } BEGIN { f(b); print b[1] }",
+            "set\n",
+        ),
+        (
+            "function f(arr) { return split(\"p q\", arr) }
+             function g(  loc, n) { n = f(loc); return n \"-\" loc[2] }
+             BEGIN { print g() }",
+            "2-q\n",
+        ),
+        (
+            "function h(a) { split(\"m n\", a) } function f(arr) { h(arr) }
+             BEGIN { f(b); print b[2] }",
+            "n\n",
+        ),
+        (
+            "function g(b) { b[\"k\"] = \"v\" } function f(a) { g(a); return a[\"k\"] }
+             BEGIN { print f(x), x[\"k\"] }",
+            "v v\n",
+        ),
+        (
+            "function f(a) { a = 5; return a } BEGIN { print f(x); print \"[\" x \"]\" }",
+            "5\n[]\n",
+        ),
+        (
+            "function f(a) { a++; a++; return a } function g(  l) { f(l); return \"[\" l \"]\" }
+             BEGIN { print g() }",
+            "[]\n",
+        ),
+        (
+            "function f(a) { print \"r\" a } BEGIN { f(x); x = 3; print x }",
+            "r\n3\n",
+        ),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::new(),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+// An original program written in the style of texinfo's texindex.awk, which
+// hung, then failed to parse, then rejected every entry.  The expected
+// output is gawk's (mawk agrees).
+#[test]
+fn test_awk_sort_index_entries() {
+    test_awk!(sort_index_entries, "tests/awk/sort_index_entries.txt");
+}
+
+// An empty match is one match, wherever the search finds it: gsub(/$/, "X")
+// appended "XX" to the record, because the empty match at the end was found
+// again from its own position.
+#[test]
+fn awk_empty_match_at_end_is_counted_once() {
+    let cases = [
+        ("{ n = gsub(/$/, \"X\"); print n, $0 }", "1 abcX\n"),
+        ("{ n = gsub(/b*$/, \"X\"); print n, $0 }", "1 abcX\n"),
+        ("{ n = gsub(/c*$/, \"X\"); print n, $0 }", "1 abX\n"),
+        ("{ n = gsub(/x*/, \"-\"); print n, $0 }", "4 -a-b-c-\n"),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from("abc\n"),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+// An empty match of a field separator does not separate fields, in split()
+// and in FS alike, as in gawk and mawk: split("abc", a, /x*/) is one field,
+// and /b*/ splits "abc" only at the "b".
+#[test]
+fn awk_empty_separator_match_does_not_split() {
+    let cases = [
+        ("{ n = split($0, a, /x*/); print n, a[1] }", "1 abc\n"),
+        ("{ n = split($0, a, /b*/); print n, a[1], a[2] }", "2 a c\n"),
+        ("{ n = split($0, a, /$/); print n, a[1] }", "1 abc\n"),
+        ("BEGIN { FS = \"b*\" } { print NF, $1, $2 }", "2 a c\n"),
+        ("BEGIN { FS = \"x*\" } { print NF, $1 }", "1 abc\n"),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from("abc\n"),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+// Each syntax error is reported once, at its own line and column: errors
+// found after the first were placed relative to where the search for them
+// resumed, and found again from every later checkpoint.
+#[test]
+fn awk_later_syntax_errors_report_their_own_position() {
+    let tmp = plib::tmp::TempDir::new().unwrap();
+    let program = tmp.path().join("two.awk");
+    std::fs::write(&program, "BEGIN { @ }\n\nfunction f() {\n  x = 1 @\n}\n").unwrap();
+    let args = vec![String::from("-f"), program.to_string_lossy().into_owned()];
+    let output = plib::testing::run_test_base("awk", &args, b"");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let locations: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("--> "))
+        .collect();
+    let file = program.to_string_lossy();
+    assert_eq!(
+        locations,
+        [format!("{file}:1:9"), format!("{file}:4:9")],
+        "{stderr}"
+    );
+    assert_ne!(output.status.code(), Some(0));
+}
+
+// A string converts to a number as C's strtod reads it, skipping leading
+// white space: " 12" + 1 is 13, and a field " 12 " is 12.
+#[test]
+fn awk_string_to_number_skips_leading_white_space() {
+    let cases = [
+        (
+            "BEGIN { print \" 12\" + 1, \"\\t5\" * 2, \" +3\" + 0, \" -.5e1x\" + 0 }",
+            "",
+            "13 10 3 -5\n",
+        ),
+        (
+            "BEGIN { print \"\\n7\" + 0, \"\\v8\" + 0, \"\\f9\" + 0, \"\\r4\" + 0 }",
+            "",
+            "7 8 9 4\n",
+        ),
+        ("{ print $1 + 0, $1 * 2 }", " 12 |x\n", "12 24\n"),
+    ];
+    for (program, input, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from("-F|"), String::from(program)],
+            stdin_data: String::from(input),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}
+
+// A field is a numeric string only if all of it, apart from leading and
+// trailing blanks, looks like a number: "12abc", "12.5f" and "12 x" compare
+// as strings ("12abc" > 9 is false), " 12 " and "+12" as numbers.
+#[test]
+fn awk_numeric_string_is_the_whole_field() {
+    let cases = [
+        ("12", "1"),
+        ("12abc", "0"),
+        ("12.5f", "0"),
+        ("12 x", "0"),
+        ("12e", "0"),
+        ("+-12", "0"),
+        ("--12", "0"),
+        ("0x1A", "0"),
+        (".", "0"),
+        (" 12 ", "1"),
+        ("\t12\t", "1"),
+        ("+12", "1"),
+        ("12e1", "1"),
+        ("1e+1x", "0"),
+        ("12.", "1"),
+        (".12e2", "1"),
+    ];
+    let input: String = cases
+        .iter()
+        .map(|(field, _)| format!("{field}|\n"))
+        .collect();
+    let output: String = cases.iter().map(|(_, gt)| format!("{gt}\n")).collect();
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![String::from("-F|"), String::from("{ print ($1 > 9) }")],
+        stdin_data: input,
+        expected_out: output,
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+// Parsing must not take time exponential in how deeply expressions nest.
+// Each parenthesised level was parsed about eight times over, by the
+// alternatives that failed (`| getline`, `? :`, `(i, j) in`) before the one
+// that matched, so five levels took a second and eight never finished.
+#[test]
+fn awk_deeply_nested_expressions_parse_quickly() {
+    let depth = 40;
+    let nested =
+        |open: &str, close: &str| format!("{}1{}", open.repeat(depth), close.repeat(depth));
+    let cases = [
+        (format!("BEGIN {{ print {} }}", nested("(", ")")), "1\n"),
+        (
+            format!("BEGIN {{ x = {}; print x }}", nested("(", ")")),
+            "1\n",
+        ),
+        (
+            format!("BEGIN {{ print {} + 1 }}", nested("-(", ")")),
+            "2\n",
+        ),
+        (
+            format!("BEGIN {{ print {} }}", nested("length(", ")")),
+            "1\n",
+        ),
+        (
+            format!("BEGIN {{ print {} }}", nested("(1 ? ", " : 0)")),
+            "1\n",
+        ),
+        (
+            format!(
+                "BEGIN {{ a[1, 2]; if (({}, 2) in a) print \"in\" }}",
+                nested("(", ")")
+            ),
+            "in\n",
+        ),
+        (
+            format!(
+                "BEGIN {{ while ((\"echo x\" | getline v) > 0) print {} v }}",
+                nested("(", ")")
+            ),
+            "1x\n",
+        ),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline(&program);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// Nested subscripts and field references parse in linear time too: each
+// level was parsed once as a possible assignment target and again as an
+// operand, so 20 levels of a[a[...]] never finished.  The check that skips
+// the first parse must not miss a real assignment.
+#[test]
+fn awk_nested_lvalues_parse_quickly() {
+    let depth = 40;
+    let nested = |open: &str, inner: &str, close: &str| {
+        format!("{}{inner}{}", open.repeat(depth), close.repeat(depth))
+    };
+    let cases = [
+        (
+            format!("BEGIN {{ a[1] = 1; print {} }}", nested("a[", "1", "]")),
+            "1\n",
+        ),
+        (
+            format!(
+                "BEGIN {{ a[1] = 1; {} = 7; print a[1] }}",
+                nested("a[", "1", "]")
+            ),
+            "7\n",
+        ),
+        (format!("{{ print {} }}", nested("$(", "1", ")")), "1\n"),
+        (
+            format!("{{ {} = \"z\"; print }}", nested("$(", "1", ")")),
+            "z\n",
+        ),
+        // assignments the shape check cannot read must still be assignments
+        (
+            String::from("BEGIN { a[\"]\"] = 5; a[\"[\"] += 1; print a[\"]\"], a[\"[\"] }"),
+            "5 1\n",
+        ),
+        (
+            String::from("BEGIN { i = 4; a[i/2] = 3; a[i / 2] ^= 2; print a[2] }"),
+            "9\n",
+        ),
+        (
+            String::from("{ i = 0; $++i = \"z\"; $(i + 0) = $i \"y\"; print }"),
+            "zy\n",
+        ),
+        (
+            String::from("BEGIN { a[1, 2] = 3; a [1] = 4; print a[1, 2], a[1] }"),
+            "3 4\n",
+        ),
+        (
+            String::from("BEGIN { a[1] = 1; print (a[1] == 1), a[1] = 2, a[1] }"),
+            "1 2 2\n",
+        ),
+        (String::from("{ x = $1; $1 = \"b\"; print x, $0 }"), "1 b\n"),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(&program, "1\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// `s = s t` appends to s in place, so building a string piece by piece is
+// linear: it copied the whole of s two or three times per append, and two
+// million appends never finished.  The result is the same as concatenating:
+// a number on the left is converted with CONVFMT, a numeric string from
+// input stops being numeric, and anything that may change s while the
+// right-hand side is evaluated keeps the ordinary evaluation order.
+#[test]
+fn awk_append_to_a_variable_is_linear() {
+    let cases = [
+        (
+            "BEGIN { for (i = 0; i < 2000000; i++) s = s \"x\"; print length(s) }",
+            "2000000\n",
+        ),
+        (
+            "function f(  l, i) { for (i = 0; i < 2000000; i++) l = l \"ab\"; return length(l) }
+             BEGIN { print f() }",
+            "4000000\n",
+        ),
+        (
+            "BEGIN { s = 0.1; CONVFMT = \"%.2f\"; s = s \"|\" 1 + 1 \"|\" 2; print s }",
+            "0.10|2|2\n",
+        ),
+        ("{ s = $1; s = s \"\"; print (s < 9) }", "1\n"),
+        ("BEGIN { s = \"a\"; s = s s s; print s }", "aaa\n"),
+        ("BEGIN { s = \"a\"; s = s (s = \"b\"); print s }", "ab\n"),
+        (
+            "BEGIN { s = \"a\"; s = s sub(/a/, \"c\", s) s; print s }",
+            "a1c\n",
+        ),
+        (
+            "function g() { s = \"z\"; return \"y\" } BEGIN { s = \"a\"; s = s g(); print s }",
+            "ay\n",
+        ),
+        ("BEGIN { s = \"a\"; s = s 1 < 2; print s }", "0\n"),
+        ("BEGIN { s = \"a\"; s = s \"b\" ~ /ab/; print s }", "1\n"),
+        ("BEGIN { s = 3; s = s - 1; print s }", "2\n"),
+        (
+            "BEGIN { x[1] = \"a\"; s = \"q\"; s = s x[1] substr(\"bcd\", 2) toupper(s); print s }",
+            "qacdQ\n",
+        ),
+        ("{ $0 = $0 \"y\"; print $1, NF }", "10y 1\n"),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "10\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// An empty match of a regular-expression RS does not end a record, as in
+// mawk: RS = "()" or "x*" made every read return an empty record without
+// consuming input, so awk printed empty records for ever (gawk's test
+// rsnullre).  "b*" still separates at each run of b's.
+#[test]
+fn awk_empty_rs_match_does_not_end_a_record() {
+    let cases = [
+        (
+            "BEGIN { RS = \"()\" } { printf \"<%s>\", $0 }",
+            "foo\n",
+            "<foo\n>",
+        ),
+        (
+            "BEGIN { RS = \"x*\" } { printf \"<%s>\", $0 }",
+            "foo\n",
+            "<foo\n>",
+        ),
+        (
+            "BEGIN { RS = \"b*\" } { printf \"<%s>\", $0 }",
+            "abba\ncd",
+            "<a><a\ncd>",
+        ),
+        (
+            "BEGIN { RS = \"b*\" } { printf \"<%s>\", $0 }",
+            "xabbay",
+            "<xa><ay>",
+        ),
+        (
+            "BEGIN { RS = \"b*|;\" } { printf \"<%s>\", $0 }",
+            "a;b;c",
+            "<a><><><c>",
+        ),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// A runtime error after a function call reports the caller's location.
+// Returning from a call kept the callee's table of source locations, so
+// the report indexed past its end and awk panicked instead.
+#[test]
+fn awk_runtime_error_after_a_call_reports_the_caller() {
+    let program = "function f(a, b, c, d, e) { return 1 }\nBEGIN { f(); printf(\"%z\") }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "runtime error: not enough arguments for format string\ncall trace:\n=> <start> at :2:14\n\n"
+    );
+    assert_eq!(status, Some(1));
+}
+
+// `$` binds tighter than `++` and `--`, so `$NF++` increments the last
+// field and `$i++` leaves i alone; awk incremented the field's index
+// instead.  In `$$i++` the increment goes to the inner field, as in gawk
+// and mawk, so `$$a++++` is `$($a++)++` (gawk's test parse1), and so is
+// one after a unary operator: `$+i++` is `$(+(i++))` (gawk's test prec).
+#[test]
+fn awk_field_reference_binds_tighter_than_increment() {
+    let cases = [
+        ("{ $NF++; print }", "1 2\n", "1 3\n"),
+        ("{ $2--; print }", "1 2\n", "1 1\n"),
+        ("{ i = 1; print $i++; print i, $0 }", "5 6\n", "5\n1 6 6\n"),
+        ("{ i = 1; print $$i++; print }", "2 5 6\n", "5\n3 5 6\n"),
+        (
+            "BEGIN { a = 3 } { print $$a++++; print }",
+            "3 4 5 6 7 8 9\n",
+            "7\n3 4 6 6 8 8 9\n",
+        ),
+        ("{ i = 1; print $++i, $i^2, $i-1 }", "5 6\n", "6 36 5\n"),
+        ("{ i = 1; $!i++; $+i++; print i, $0 }", "5 6\n", "3 5 6\n"),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// An operand can have more than one unary operator: `!!x` was a syntax
+// error.
+#[test]
+fn awk_operand_takes_several_unary_operators() {
+    let (stdout, stderr, status) =
+        awk_with_deadline("BEGIN { x = 2; print !!x, - -x, !-x, -!x, !!!\"\", 1 - -1 }");
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("1 2 0 0 1 2\n", ""));
+    assert_eq!(status, Some(0));
+}
+
+// getline is an operand: `getline > 0` compares its result and `getline x
+// y` concatenates y to it, where both were syntax errors (gawk's tests
+// getline, getline2, getline3 and inputred).  As in gawk, `getline < f`
+// takes no concatenation into the file name, and `cmd | getline` binds
+// tighter than a comparison but looser than a concatenation.
+#[test]
+fn awk_getline_is_an_operand() {
+    let cases = [
+        ("NR == 1 { while (getline > 0) n++; print n }", "a\nb\nc\n", "2\n"),
+        ("NR == 1 { a = (getline x y); print a, x }", "l1\nl2\n", "1 l2\n"),
+        ("NR == 1 { print (getline x - 2), x }", "a\nb\n", "-1 b\n"),
+        (
+            "BEGIN { x = getline line < \"/nonexistent\" \".txt\"; print x; print getline line < \"/nonexistent\" }",
+            "",
+            "-1.txt\n-1\n",
+        ),
+        ("BEGIN { print (getline line < \"/dev/null\" > -1) }", "", "1\n"),
+        ("BEGIN { y = 7; print (\"echo 4\" | getline x y), x }", "", "17 4\n"),
+        ("BEGIN { \"echo a\" \"b\" | getline; print }", "", "ab\n"),
+        (
+            "BEGIN { while (\"echo z\" | getline line > 0) n++; print n, line }",
+            "",
+            "1 z\n",
+        ),
+        ("BEGIN { print (\"echo 5\" | getline x + 1), x }", "", "2 5\n"),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// A print list can hold `==`, `!=`, `<` and `<=` without parentheses, as
+// in gawk, mawk and busybox awk; `>` still redirects (gawk's test
+// gsubtst3).
+#[test]
+fn awk_print_list_takes_comparisons() {
+    let program = "BEGIN { x = 1; print x == 1, x != 1, x < 2, x <= 0, x == 1 ? \"y\" : \"n\"; printf \"%s %s\\n\", x == 1, x != 1 ? \"a\" : \"b\"; print x == 1 > \"/dev/stdout\" }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str()),
+        ("1 0 1 0 y\n1 b\n1\n", "")
+    );
+    assert_eq!(status, Some(0));
+}
+
+// `exit` in BEGIN skips the input but runs the END actions, `exit` with no
+// expression keeps the status of an earlier `exit expr` (gawk's test
+// exitval3), and `exit` in a function called from a pattern ends the
+// program instead of panicking.
+#[test]
+fn awk_exit_skips_input_and_keeps_its_status() {
+    let cases = [
+        (
+            "BEGIN { exit 3 } { print \"main\" } END { print \"end\" }",
+            "end\n",
+            3,
+        ),
+        ("BEGIN { exit 42 } END { exit }", "", 42),
+        ("{ exit 4 } END { exit }", "", 4),
+        (
+            "function f() { exit 3 } f() { print \"matched\" } END { print \"end\" }",
+            "end\n",
+            3,
+        ),
+        (
+            "BEGIN { exit 1 } END { print \"e1\"; exit 6; print \"no\" } END { print \"e2\" }",
+            "e1\n",
+            6,
+        ),
+    ];
+    for (program, output, exit_status) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "x\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(exit_status), "{program}");
+    }
+}
+
+// Plain getline reads the main input: in BEGIN it opens the first file
+// (standard input here), and at the end of a file it goes on to the next
+// operand, performing assignments on the way; in END there is no more
+// input (gawk's tests getline2 and gsubtst3).  FILENAME is empty until a
+// file is opened.
+#[test]
+fn awk_getline_reads_the_main_input() {
+    let cases = [
+        (
+            "BEGIN { while ((getline l) > 0) n++; print n, NR }",
+            "3 3\n",
+        ),
+        (
+            "BEGIN { getline; print \"begin\", $0, NR } { print \"main\", $0, NR }",
+            "begin a 1\nmain b 2\nmain c 3\n",
+        ),
+        (
+            "BEGIN { printf \"[%s]\", FILENAME; getline; print FILENAME }",
+            "[]-\n",
+        ),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "a\nb\nc\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+    test_awk(
+        vec![
+            "{ n = 0; while ((getline l) > 0) n++; print FILENAME, FNR, NR, n, x } END { print NR, (getline l) }".to_string(),
+            "tests/awk/test_data2.txt".to_string(),
+            "x=5".to_string(),
+            "tests/awk/test_data3.txt".to_string(),
+        ],
+        "tests/awk/test_data3.txt 6 11 10 5\n11 0\n",
+    );
+}
+
+// Deleting the element at the end of an array's storage, the last one
+// added or a slot a `for (k in a)` loop emptied, panicked.
+#[test]
+fn awk_delete_the_last_stored_element() {
+    let cases = [
+        (
+            "BEGIN { a[1]; a[2]; delete a[2]; print length(a); for (k in a) print k }",
+            "1\n1\n",
+        ),
+        (
+            "BEGIN { a[1]; a[2]; a[3]; for (k in a) if (k == 3) delete a[k]; delete a[1]; print length(a); for (k in a) print k }",
+            "1\n2\n",
+        ),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline(program);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// `break` and `continue` work in a `for (k in a)` loop, and leaving one by
+// `break`, `return` or `next` releases the array, which could then never
+// be added to again.  Reading a missing element inside such a loop creates
+// it instead of failing (gawk's test delarpm2); the loop does not visit
+// it, as in gawk and mawk.
+#[test]
+fn awk_for_in_loop_can_be_left_and_its_array_added_to() {
+    let cases = [
+        (
+            "BEGIN { a[1]; a[2]; a[3]; for (k in a) { n++; break }; for (k in a) { if (k == 2) continue; m++ }; a[4]; print n, m, length(a) }",
+            "1 2 4\n",
+        ),
+        (
+            "function f(arr, k) { for (k in arr) return k } BEGIN { a[1]; a[2]; f(a); a[3] = 1; print length(a) }",
+            "3\n",
+        ),
+        (
+            "{ for (k in seen) next } { seen[$0] } END { seen[\"z\"]; print length(seen) }",
+            "2\n",
+        ),
+        (
+            "BEGIN { a[1]; a[2]; for (k in a) if (a[k \"x\"] == \"\") n++; print n, length(a) }",
+            "2 4\n",
+        ),
+        (
+            "BEGIN { a[1]; a[2]; for (k in a) { delete a; a[\"q\"] }; print length(a) }",
+            "1\n",
+        ),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "a\nb\nc\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// `break` and `continue` work in a do-while loop, where they were
+// rejected as being outside a loop.
+#[test]
+fn awk_do_while_takes_break_and_continue() {
+    let program = "BEGIN { do { n++; break } while (1); do { m++; if (m < 3) continue; break } while (1); i = 0; while (i < 2) { i++; do { break } while (1); k++ }; print n, m, k }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("1 3 2\n", ""));
+    assert_eq!(status, Some(0));
+}
+
+// close() of a pipe returns the command's exit status, or 256 plus the
+// signal that killed it, as gawk and mawk do (gawk's tests close_status
+// and status-close); it returned 0 for any command.
+#[test]
+fn awk_close_of_a_pipe_returns_the_exit_status() {
+    let program = "BEGIN { print \"x\" | \"cat >/dev/null; exit 9\"; print close(\"cat >/dev/null; exit 9\"); \"echo hi; exit 3\" | getline; print close(\"echo hi; exit 3\"); \"kill -9 $$\" | getline; print close(\"kill -9 $$\"); print close(\"echo hi; exit 3\") }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("9\n3\n265\n-1\n", ""));
+    assert_eq!(status, Some(0));
+}
+
+// The `#` flag follows printf(3): `%#x` of 0 has no 0x prefix, and `%#o`
+// makes the first digit a zero even with a precision that leaves room for
+// none (gawk's test printf1).
+#[test]
+fn awk_printf_alternative_form_of_zero() {
+    let program =
+        "BEGIN { printf \"%#.0o|%#x|%#X|%#o|%#.2o|%#x|%#5x|\\n\", 0, 0, 0, 0, 8, 255, 0 }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str()),
+        ("0|0|0|0|010|0xff|    0|\n", "")
+    );
+    assert_eq!(status, Some(0));
+}
+
+// printf `%s` counts its width and precision in characters, so a byte
+// above 127 in the C locale is one column (gawk's test rebt8b1), and a
+// precision that falls inside a UTF-8 character panicked.
+#[test]
+fn awk_printf_string_width_counts_characters() {
+    let c = [("LC_ALL", "C")];
+    let out = awk_bytes_with_env(
+        &["BEGIN { printf \"%-5s|%.1s|%3s|\\n\", \"a\\351b\", \"\\351x\", \"\\351\" }"],
+        b"",
+        &c,
+    );
+    assert_eq!(out, b"a\xe9b  |\xe9|  \xe9|\n");
+    let Some(locale) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let env = [("LC_ALL", locale.as_str())];
+    let out = awk_bytes_with_env(
+        &["BEGIN { printf \"%-5s|%.1s|%3s|\\n\", \"éa\", \"éab\", \"é\" }"],
+        b"",
+        &env,
+    );
+    assert_eq!(out, "éa   |é|  é|\n".as_bytes());
+}
+
+// The escape sequences of awk EREs, which regcomp does not know, are
+// translated: `/\t/` never matched a tab, nor `/\141/` an "a", in an ERE
+// token or a string used as one.  Inside a bracket expression a backslash
+// escapes too, as in gawk and mawk (gawk's test regrange), and `\8` is a
+// plain 8, not a back-reference (gawk's test back89).
+#[test]
+fn awk_ere_escape_sequences() {
+    let cases = [
+        (
+            "/a\\tb/ { print \"tab\" } $0 ~ \"a\\\\tb\" { print \"dyntab\" } /[\\t]/ { print \"brtab\" } /\\141/ { print \"oct\" }",
+            "a\tb\n",
+            "tab\ndyntab\nbrtab\noct\n",
+        ),
+        ("/a\\8b/ { print \"a8b\" }", "a8b\n", "a8b\n"),
+        ("{ gsub(/\\//, \"|\"); print }", "a/b\n", "a|b\n"),
+        ("/a\\.b/ { print \"wrong\" } { print \"ok\" }", "axb\n", "ok\n"),
+        (
+            "{ print (\"\\\\\" ~ /[\\\\]/), (\"]\" ~ /[\\]]/), (\"a\" ~ /[\\]a]/), (\"-\" ~ /[a\\-z]/), (\"b\" ~ /[a\\-z]/), (\"^\" ~ /[\\^x]/) }",
+            "x\n",
+            "1 1 1 1 0 1\n",
+        ),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+    // a range is the C locale's byte order only there
+    let out = awk_bytes_with_env(
+        &["{ print ($0 ~ /[\\[-\\]]/) }"],
+        b"\\\n",
+        &[("LC_ALL", "C")],
+    );
+    assert_eq!(out, b"1\n");
+}
+
+// A `/` inside a bracket expression does not end an ERE token, as in gawk
+// and mawk (gawk's test regexpbrack).
+#[test]
+fn awk_slash_in_bracket_expression_of_ere_token() {
+    let program = "/^[]+()0-9.,$%/'\"-]*$/ { print \"num\", $0 } /[/]/ { print \"m\" } /[[:alpha:]/]x/ { print \"no\" }";
+    let (stdout, stderr, status) = awk_with_deadline_input(program, "a/b\n12/3\n");
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("m\nnum 12/3\nm\n", ""));
+    assert_eq!(status, Some(0));
+}
+
+// sub and gsub leave their target alone when nothing matched: a field was
+// assigned anyway, which rebuilt $0 with OFS (gawk's test gsubtst7), and a
+// number became a string.
+#[test]
+fn awk_sub_without_a_match_assigns_nothing() {
+    let cases = [
+        (
+            "{ gsub(\"foo\", \"bar\", $1); print; sub(/x/, \"y\", $2); print; gsub(/q/, \"z\"); print }",
+            " aaa  b\n",
+            " aaa  b\n aaa  b\n aaa  b\n",
+        ),
+        ("BEGIN { x = 10; gsub(/q/, \"\", x); print (x < 9) }", "", "0\n"),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}
+
+// Using a scalar as an array is a runtime error, where indexing it, `in`,
+// delete and split panicked (gawk's tests prmarscl and scalar).
+#[test]
+fn awk_scalar_used_as_an_array_is_an_error() {
+    let programs = [
+        "function f(a) { print a[1] } BEGIN { j = 4; f(j) }",
+        "BEGIN { x = 1; x[1] = 2 }",
+        "BEGIN { x = 1; print x[1] }",
+        "BEGIN { x = 1; print (1 in x) }",
+        "BEGIN { x = 1; delete x[1] }",
+        "BEGIN { x = 1; delete x }",
+        "BEGIN { x = 1; split(\"a b\", x) }",
+        "BEGIN { sub(/x/, \"\", a); a[1] }",
+    ];
+    for program in programs {
+        let (stdout, stderr, status) = awk_with_deadline(program);
+        assert_eq!(stdout, "", "{program}");
+        assert!(
+            stderr.starts_with("runtime error: scalar used in array context\n"),
+            "{program}: {stderr}"
+        );
+        assert_eq!(status, Some(1), "{program}");
+    }
+}
+
+// A number used as a regular expression is its string value, as POSIX says
+// for any expression on the right of `~`: `"a" ~ ("a" ~ "a")` failed with
+// "expected extended regular expression".
+#[test]
+fn awk_number_used_as_a_regular_expression() {
+    let program = "BEGIN { print (\"a\" ~ (\"a\" ~ \"a\")), (\"1\" ~ 1), (\"x10\" ~ 5*2), match(\"a.5\", 0.5), s = \"123\", sub(2, \"z\", s), s }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str()),
+        ("0 1 1 0 123 1 1z3\n", "")
+    );
+    assert_eq!(status, Some(0));
+}
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in stdout's line buffer until exit, where the error was lost.
+#[test]
+fn test_awk_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("awk", &["{ printf $0 }"], b"x", 1);
+    plib::testing::assert_write_error_on_full_device("awk", &["BEGIN { printf \"x\" }"], b"", 1);
+    plib::testing::assert_write_error_on_full_device(
+        "awk",
+        &["BEGIN { printf \"x\"; exit 3 }"],
+        b"",
+        3,
+    );
+}
+
+// XBD 12.1: `-F=` is the field separator "=", not `-F` with an empty one
+// (an empty FS split every character into its own field).
+#[test]
+fn awk_attached_field_separator_may_begin_with_equals() {
+    for (args, input, out) in [
+        (&["-F=", "{print $2}"][..], "a=b\n", "b\n"),
+        (&["-F==", "{print $2}"][..], "a==b\n", "b\n"),
+    ] {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdin_data: String::from(input),
+            expected_out: String::from(out),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+    plib::testing::assert_equals_option_argument("awk", "-F", &["{print $2}"], b"a=b\n");
 }

@@ -375,16 +375,19 @@ fn test_update_compares_subsecond_times() {
 /// same bytes. The names were compared lossily, so `n\376` matched an
 /// archived `n\377` (both `n\u{FFFD}`) and, being older, was left out.
 ///
-/// Linux-only: macOS cannot hold a filename that is not UTF-8.
-#[cfg(target_os = "linux")]
+/// Skipped where the filesystem cannot hold a filename that is not UTF-8
+/// (macOS APFS).
 #[test]
 fn test_update_append_distinguishes_non_utf8_names() {
+    use plib::testing::create_non_utf8;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let temp = TempDir::new().unwrap();
     let old = OsStr::from_bytes(b"n\xfe");
     let new = OsStr::from_bytes(b"n\xff");
-    fs::write(temp.path().join(new), b"new").unwrap();
+    if create_non_utf8(temp.path(), b"n\xff", |p| fs::write(p, b"new")).is_none() {
+        return;
+    }
     fs::write(temp.path().join(old), b"old").unwrap();
     let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
     filetime::set_file_mtime(

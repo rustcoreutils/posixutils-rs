@@ -1114,3 +1114,142 @@ fn test_ls_dies_by_sigpipe_on_a_closed_pipe() {
 
     plib::testing::assert_dies_by_sigpipe("ls", &["-1", dir.path().to_str().unwrap()]);
 }
+
+/// The `-l` mode string shows the set-user-ID, set-group-ID and restricted
+/// deletion bits in the owner, group and others execute positions (XCU ls,
+/// STDOUT: `s`/`S`, `t`/`T`). The group position only ever showed `x` or
+/// `-`, so a set-group-ID file or directory was indistinguishable from one
+/// without the bit.
+#[test]
+fn test_ls_l_mode_string_special_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let cases: &[(&str, bool, u32, &str)] = &[
+        ("sgid_x", false, 0o2754, "-rwxr-sr--"),
+        ("sgid_nox", false, 0o2744, "-rwxr-Sr--"),
+        ("suid_x", false, 0o4755, "-rwsr-xr-x"),
+        ("suid_nox", false, 0o4644, "-rwSr--r--"),
+        ("all_x", false, 0o6755, "-rwsr-sr-x"),
+        ("dir_sgid", true, 0o2775, "drwxrwsr-x"),
+        ("dir_sgid_nox", true, 0o2705, "drwx--Sr-x"),
+        ("dir_sticky", true, 0o1777, "drwxrwxrwt"),
+        ("dir_sticky_nox", true, 0o1770, "drwxrwx--T"),
+    ];
+    for &(name, is_dir, mode, _) in cases {
+        let path = dir.path().join(name);
+        if is_dir {
+            fs::create_dir(&path).unwrap();
+        } else {
+            fs::File::create(&path).unwrap();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    for &(name, _, mode, expected) in cases {
+        let path = dir.path().join(name);
+        // chmod may drop set-group-ID when the file's group is not one of
+        // ours; compare against what the file actually got.
+        let actual_mode = fs::symlink_metadata(&path).unwrap().mode() & 0o7777;
+        if actual_mode != mode {
+            eprintln!("Skipping {name}: mode {actual_mode:o}, wanted {mode:o}");
+            continue;
+        }
+        ls_test_with_checker(&["-ld", path.to_str().unwrap()], |_, output| {
+            assert_eq!(output.status.code(), Some(0));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mode = stdout.split_whitespace().next().unwrap_or("");
+            assert_eq!(mode.trim_end_matches('+'), expected, "{name}: {stdout}");
+        });
+    }
+}
+
+/// The `+` alternate-access flag describes the file the line is about. For a
+/// symbolic link listed as itself that is the link, which carries no ACL on
+/// Linux; the probe followed the link and reported the target's ACL. When
+/// `-L` (or `-H` for an operand) makes the line describe the target, the
+/// target's `+` is the right answer. Gated like `test_ls_acl_plus_flag`.
+#[test]
+fn test_ls_acl_plus_flag_describes_the_link_itself() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    fs::File::create(&target).unwrap();
+    std::os::unix::fs::symlink("target", &link).unwrap();
+    let (target, link) = (target.to_str().unwrap(), link.to_str().unwrap());
+
+    let ok = std::process::Command::new("setfacl")
+        .args(["-m", "u:0:r", target])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("Skipping: setfacl unavailable or filesystem lacks ACL support");
+        return;
+    }
+
+    let mode_of = |output: &std::process::Output| -> String {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.split_whitespace().next().unwrap_or("").to_string()
+    };
+
+    // The link itself: operand, and an entry found inside a directory.
+    ls_test_with_checker(&["-l", link], |_, output| {
+        assert_eq!(mode_of(output), "lrwxrwxrwx");
+    });
+    ls_test_with_checker(&["-l", dir.path().to_str().unwrap()], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout.lines().find(|l| l.contains("link -> ")).unwrap();
+        assert!(line.starts_with("lrwxrwxrwx "), "got {stdout:?}");
+    });
+
+    // Followed: the line describes the target, so it carries the target's `+`.
+    for args in [["-lL", link], ["-lH", link]] {
+        ls_test_with_checker(&args, |_, output| {
+            let mode = mode_of(output);
+            assert!(
+                mode.starts_with('-') && mode.ends_with('+'),
+                "{args:?}: {mode}"
+            );
+        });
+    }
+    ls_test_with_checker(&["-lL", dir.path().to_str().unwrap()], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines().skip(1) {
+            let mode = line.split_whitespace().next().unwrap();
+            assert!(mode.starts_with('-') && mode.ends_with('+'), "{stdout:?}");
+        }
+    });
+}
+
+/// Started with SIGPIPE ignored, `ls` into a closed pipe reports the write
+/// error and exits nonzero, rather than dying by the ignored signal or
+/// panicking in `println!`.
+/// See `plib::testing::assert_epipe_when_sigpipe_ignored`.
+#[test]
+fn test_ls_reports_epipe_when_sigpipe_is_ignored() {
+    let dir = plib::tmp::tempdir().unwrap();
+    fs::File::create(dir.path().join("f")).unwrap();
+
+    plib::testing::assert_epipe_when_sigpipe_ignored("ls", &[dir.path().to_str().unwrap()], 1);
+}
+
+/// `ls -R dl/`, with `dl` a symlink to a directory, lists the directory under the operand as
+/// written, slash included, as it does the subdirectories below it.
+#[test]
+fn test_ls_recursive_trailing_slash_symlink() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    fs::create_dir_all(format!("{dir}/d/sub")).unwrap();
+    fs::File::create(format!("{dir}/d/f")).unwrap();
+    fs::File::create(format!("{dir}/d/sub/g")).unwrap();
+    std::os::unix::fs::symlink("d", format!("{dir}/dl")).unwrap();
+
+    ls_test(
+        &["-R", &format!("{dir}/dl/")],
+        &format!("{dir}/dl/:\nf\nsub\n\n{dir}/dl/sub:\ng\n"),
+        "",
+        0,
+    );
+}

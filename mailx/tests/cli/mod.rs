@@ -1189,3 +1189,9 @@ fn alias_backslash_prevents_expansion() {
         },
     );
 }
+
+// An argument that is not valid UTF-8 is reported, not a panic.
+#[test]
+fn mailx_non_utf8_argument_is_reported() {
+    plib::testing::assert_non_utf8_argument_rejected("mailx", &[]);
+}

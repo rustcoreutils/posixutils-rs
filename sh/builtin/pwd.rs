@@ -12,18 +12,29 @@ use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::shstr::ShString;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
 pub struct Pwd;
 
 /// POSIX `pwd` `-L`, step 2: `$PWD` may stand in for the working directory only
-/// if it is an absolute pathname with no `.` or `..` components.
-fn pwd_is_usable(value: &str) -> bool {
-    let path = Path::new(value);
-    path.is_absolute()
+/// if it is an absolute pathname of the current working directory with no `.`
+/// or `..` components. Naming the working directory is checked by comparing
+/// the device and inode of `value` with those of `.`, so a `$PWD` that reaches
+/// it through a symbolic link is kept and one naming another directory is not.
+pub(crate) fn pwd_is_usable(value: impl AsRef<Path>) -> bool {
+    let path = value.as_ref();
+    let well_formed = path.is_absolute()
         && !path
             .components()
-            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir));
+    if !well_formed {
+        return false;
+    }
+    match (std::fs::metadata(path), std::fs::metadata(".")) {
+        (Ok(named), Ok(dot)) => named.dev() == dot.dev() && named.ino() == dot.ino(),
+        _ => false,
+    }
 }
 
 impl BuiltinUtility for Pwd {

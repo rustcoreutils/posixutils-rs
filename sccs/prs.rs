@@ -25,10 +25,10 @@ struct Args {
     #[arg(short = 'a', help = gettext("Include removed deltas"))]
     all_deltas: bool,
 
-    #[arg(short = 'c', value_name = "CUTOFF", help = gettext("Cutoff date/time (YY[MM[DD[HH[MM[SS]]]]])"))]
+    #[arg(short = 'c', allow_hyphen_values = true, value_name = "CUTOFF", help = gettext("Cutoff date/time (YY[MM[DD[HH[MM[SS]]]]])"))]
     cutoff: Option<String>,
 
-    #[arg(short = 'd', value_name = "DATASPEC", help = gettext("Data format specification"))]
+    #[arg(short = 'd', allow_hyphen_values = true, value_name = "DATASPEC", help = gettext("Data format specification"))]
     dataspec: Option<String>,
 
     #[arg(short = 'e', help = gettext("Select deltas earlier than or equal to -c or -r"))]
@@ -598,7 +598,9 @@ fn main() -> ExitCode {
     // The -r option-argument is optional and "cannot be presented as a separate
     // argument" (POSIX). Rewrite a bare "-r" to "-r=" so clap treats it as an
     // empty attached value rather than greedily consuming the following operand.
-    let argv = std::env::args().map(|a| if a == "-r" { "-r=".to_string() } else { a });
+    let argv = plib::optarg::keep_leading_equals::<Args>(std::env::args_os())
+        .into_iter()
+        .map(|a| if a == "-r" { "-r=".into() } else { a });
     let args = Args::parse_from(argv);
 
     let mut success = true;

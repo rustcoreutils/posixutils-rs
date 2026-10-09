@@ -145,7 +145,7 @@ fn deliver(file: &mut File, bytes: &[u8]) {
 fn main() {
     plib::diag::init_locale("write");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     let user_name = args.username;
 
     // Resolve the recipient terminal.

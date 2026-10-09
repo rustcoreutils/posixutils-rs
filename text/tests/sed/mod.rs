@@ -8,6 +8,12 @@
 //
 
 mod bytes;
+mod change;
+mod files;
+mod inplace;
+mod oneline;
+mod options;
+mod separate;
 #[cfg(unix)]
 mod wfile;
 
@@ -857,20 +863,20 @@ mod tests {
             (
                 "a  \text",
                 "abc\ndef\n@#$",
+                "abc\next\ndef\next\n@#$\next\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 "a\text",
                 "abc\ndef\n@#$",
+                "abc\next\ndef\next\n@#$\next\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 "a\text\\in\\sed",
                 "abc\ndef\n@#$",
+                "abc\nextinsed\ndef\nextinsed\n@#$\nextinsed\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 // The <newline> ends the `a` text (POSIX/GNU: text ends at the
@@ -885,14 +891,14 @@ mod tests {
             (
                 "atext",
                 "abc\ndef\n@#$",
+                "abc\ntext\ndef\ntext\n@#$\ntext\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 "a text",
                 "abc\ndef\n@#$",
+                "abc\ntext\ndef\ntext\n@#$\ntext\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
         ];
 
@@ -925,15 +931,13 @@ mod tests {
                 "sed: can't find label for jump to `label'\n",
             ),
             (
-                // The <newline> separates commands: `b ab` (branch to label
-                // `ab`), then line 2 `cd` is a `c` command, which requires a
-                // `\` before its text. (GNU accepts the one-line `c text` form
-                // and instead reports the missing `ab` label; this impl does not
-                // implement that extension, a pre-existing limitation.)
+                // The <newline> separates commands: `b ab`, then line 2
+                // `cd; :ab` is a one-line `c` whose text is `d; :ab`, so the
+                // label `ab` is never defined.  Matches GNU sed.
                 "b ab\ncd; :ab\ncd",
                 "",
                 "",
-                "sed: text must be separated with '\\' (line: 1, col: 2)\n",
+                "sed: can't find label for jump to `ab'\n",
             ),
             (
                 "b label",
@@ -980,12 +984,8 @@ mod tests {
                 "",
                 "sed: can't find label for jump to `:label'\n",
             ),
-            (
-                "b label :label",
-                "aa\naa",
-                "",
-                "sed: label can't contain ' ' (line: 0, col: 14)\n",
-            ),
+            // A <blank> ends the label, as in GNU sed: `:label` follows.
+            ("b label :label", "aa\naa", "aa\naa", ""),
         ];
 
         for (script, input, output, err) in test_data {
@@ -1032,23 +1032,13 @@ mod tests {
                 "",
                 "sed: missing text argument (line: 0, col: 3)\n",
             ),
-            (
-                "c  \text",
-                "abc\ndef\n@#$",
-                "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
-            ),
-            (
-                "c\text",
-                "abc\ndef\n@#$",
-                "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
-            ),
+            ("c  \text", "abc\ndef\n@#$", "ext\next\next\n", ""),
+            ("c\text", "abc\ndef\n@#$", "ext\next\next\n", ""),
             (
                 "c\text\\in\\sed",
                 "abc\ndef\n@#$",
+                "extinsed\nextinsed\nextinsed\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 // The <newline> ends the `c` text; line 2 ` text ` parses as a
@@ -1301,20 +1291,15 @@ mod tests {
             (
                 "i  \text",
                 "abc\ncdf\n\n",
+                "ext\nabc\next\ncdf\next\n\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
-            (
-                "i\text",
-                "abc\ncdf\n\n",
-                "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
-            ),
+            ("i\text", "abc\ncdf\n\n", "ext\nabc\next\ncdf\next\n\n", ""),
             (
                 "i\text\\in\\sed",
                 "abc\ncdf\n\n",
+                "extinsed\nabc\nextinsed\ncdf\nextinsed\n\n",
                 "",
-                "sed: text must be separated with '\\' (line: 0, col: 2)\n",
             ),
             (
                 // The <newline> ends the `i` text; line 2 ` text ` parses as a
@@ -1878,20 +1863,16 @@ mod tests {
                 "",
                 "sed: commands must be delimited with ';' (line: 0, col: 5)\n",
             ),
+            // A <blank> ends the label, as in GNU sed: `:label` follows.
+            ("t label :label", "aa\naaa\n\n", "aa\naaa\n\n", ""),
             (
-                "t label :label",
-                "aa\naaa\n\n",
-                "",
-                "sed: label can't contain ' ' (line: 0, col: 14)\n",
-            ),
-            (
-                // The <newline> separates commands: `t ab`, then line 2 `cd`
-                // is a `c` command requiring a `\` before its text. (GNU's
-                // one-line `c text` extension is not implemented here.)
+                // The <newline> separates commands: `t ab`, then line 2
+                // `cd; :ab` is a one-line `c` whose text is `d; :ab`, so the
+                // label `ab` is never defined.  Matches GNU sed.
                 "t ab\ncd; :ab\ncd",
                 "aa\naaa\n\n",
                 "",
-                "sed: text must be separated with '\\' (line: 1, col: 2)\n",
+                "sed: can't find label for jump to `ab'\n",
             ),
         ];
 
@@ -2532,6 +2513,54 @@ mod tests {
         sed_test(&["-e", ":x", "-e", ":x"], "a\n", "a\n", "", 0);
     }
 
+    /// A label of b, t or : ends at a <blank>, `;`, <newline>, `#` or `}`,
+    /// as in GNU sed, and leading <blank>s are skipped; what follows is the
+    /// next command.  POSIX leaves a label with these characters unspecified
+    /// (perl's debian/gen-patchlevel uses `:append H; d;`).  Every case was
+    /// checked against GNU sed 4.9.
+    #[test]
+    fn test_label_ends_at_blank() {
+        let t = |script: &str, input: &str, out: &str| sed_test(&["-n", script], input, out, "", 0);
+        t("b;p", "a\nb\n", "");
+        t("p;b end;p;:end", "a\nb\n", "a\nb\n");
+        t(":a;N;ba\np", "a\nb\nc\n", "");
+        t(": a;N;$!ba;p", "a\nb\nc\n", "a\nb\nc\n");
+        t("{b }\np", "a\n", "");
+        t("s/a/x/;t x ; p;:x;p", "a\n", "x\n");
+        t(":append p; p", "a\n", "a\na\n");
+        t(":x\tp", "a\n", "a\n");
+        t("bx \t;p;:x", "a\n", "");
+        t("bx\tp;:x\np", "a\n", "a\n");
+        t("b x  p;:x", "a\n", "");
+        t("b ;p", "a\n", "");
+        t("p;b # comment\np", "a\n", "a\n");
+        t("b x;p;:x#c\np", "a\n", "a\n");
+        t("b x{;p;:x{\np", "a\n", "a\n");
+        t("b a.b-c/d;p;:a.b-c/d\np", "a\n", "a\n");
+        t("1{s/a/b/;tx}\np;:x\np", "a\n", "b\n");
+        t("{:a};p", "a\n", "a\n");
+        // The address of `b` does not carry over to the command after the
+        // <blank>.
+        t("2b x p;p;:x", "a\nb\n", "a\na\n");
+        // `}` ends the label, so here it closes a block that was never opened.
+        sed_test(
+            &["-n", "bend};p;:end"],
+            "a\n",
+            "",
+            "sed: unneccessary '}' (line: 0, col: 5)\n",
+            1,
+        );
+        // Only <space> and <tab> are blanks here: a <vertical-tab> is part of
+        // the label.
+        sed_test(
+            &["-n", "bx\x0bp;:x\np"],
+            "a\n",
+            "",
+            "sed: can't find label for jump to `x\x0bp'\n",
+            1,
+        );
+    }
+
     const VERSION_INPUT: &str = "foo\n#define VERSION \"3.25\"\na/b\na%b\na\\b\nbar\n";
 
     /// POSIX context address `/RE/`, optionally followed by <blank>s before
@@ -2721,4 +2750,70 @@ mod tests {
         sed_test(&["-e", "s/x/\\n&/"], "a\\x\n", "a\\\nx\n", "", 0);
         sed_test(&["-e", "s/.*/[&]/"], "a\\tb\n", "[a\\tb]\n", "", 0);
     }
+}
+
+// POSIX.2024 sed, "Regular Expressions in sed": the delimiter "shall not
+// terminate the RE when it appears within a bracket expression, and shall have
+// its normal meaning in the bracket expression", for `s` and for a context
+// address alike. A backslash inside a bracket expression is an ordinary
+// character, so it does not escape the delimiter there either.
+#[test]
+fn delimiter_inside_bracket_expression_does_not_end_the_re() {
+    let cases: [(&[&str], &str, &str); 11] = [
+        (&["s/[/]/X/"], "a/b\n", "aXb\n"),
+        (&["-n", "/[/][/*]/p"], "a//b\n/*x\nab\n", "a//b\n/*x\n"),
+        (&["s/\\.[^/.][^/.]*$//"], "f.tar.gz\n", "f.tar\n"),
+        (&["-n", "\\%[%]%p"], "a%b\nab\n", "a%b\n"),
+        (&["s-[0-9]--g"], "a1b2\n", "ab\n"),
+        (&["s/[\\/]/X/g"], "a\\b/\n", "aXbX\n"),
+        (&["s/[]/]/X/g"], "a]b/c\n", "aXbXc\n"),
+        (&["s/[^]/]/X/g"], "]/a\n", "]/X\n"),
+        (&["s/[[:alpha:]/]/X/g"], "a:b/c\n", "X:XXX\n"),
+        (&["-E", "s/[^/]+/X/"], "ab/\n", "X/\n"),
+        // The replacement has no bracket expressions.
+        (&["s/a/[/;s/b/]/"], "ab\n", "[]\n"),
+    ];
+    for (args, input, output) in cases {
+        sed_test(args, input, output, "", 0);
+    }
+}
+
+// POSIX.2024 sed, `s` and `y`: "Any character other than <backslash> or
+// <newline> can be used instead of a <slash> to delimit" the strings. A `;`
+// delimiter is part of the command, not a command separator.
+#[test]
+fn any_character_but_backslash_or_newline_delimits_s_and_y() {
+    let cases: [(&[&str], &str, &str); 11] = [
+        (&["s;a;X;"], "abc\n", "Xbc\n"),
+        (&["-e", "s;[[][0-9][]]\\(.*\\);\\1;"], "[1]rest\n", "rest\n"),
+        (&["s;\\;;-;"], "a;b\n", "a-b\n"),
+        (&["s;a;X;;s;b;Y;"], "abc\n", "XYc\n"),
+        (&["-n", "s;b;Y;p;p"], "abc\n", "aYc\naYc\n"),
+        (&["sxaxXx"], "abc\n", "Xbc\n"),
+        (&["s1a1X1"], "abc\n", "Xbc\n"),
+        (&["s a X "], "abc\n", "Xbc\n"),
+        (&["s{a{X{"], "abc\n", "Xbc\n"),
+        (&["y;abc;xyz;"], "abc\n", "xyz\n"),
+        (&["y,a\\,c,x\\,z,"], "a,c\n", "x,z\n"),
+    ];
+    for (args, input, output) in cases {
+        sed_test(args, input, output, "", 0);
+    }
+}
+
+// XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
+// below used to have the word after it refused as an unknown option.
+#[test]
+fn option_argument_may_begin_with_hyphen() {
+    for opt in ["-e", "-f"] {
+        plib::testing::assert_hyphen_option_argument("sed", &[opt, "-zq", "--help"]);
+    }
+}
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in the line buffer until exit, where the error was lost.
+#[test]
+fn test_sed_reports_write_error_on_final_partial_line() {
+    // GNU sed's status for an I/O error, as sed uses for every write error.
+    plib::testing::assert_write_error_on_full_device("sed", &["-n", "p"], b"x", 4);
 }

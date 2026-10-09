@@ -44,6 +44,7 @@ fn parse_ipc_key(s: &str) -> Result<i32, String> {
 struct Args {
     #[arg(
         short = 's',
+        allow_hyphen_values = true,
         action = clap::ArgAction::Append,
         help = gettext("Remove the semaphore identifier semid from the system")
     )]
@@ -51,6 +52,7 @@ struct Args {
 
     #[arg(
         short = 'S',
+        allow_hyphen_values = true,
         action = clap::ArgAction::Append,
         value_parser = parse_ipc_key,
         help = gettext("Remove the semaphore identifier, created with key semkey, from the system")
@@ -59,6 +61,7 @@ struct Args {
 
     #[arg(
         short = 'm',
+        allow_hyphen_values = true,
         action = clap::ArgAction::Append,
         help = gettext("Remove the shared memory identifier shmid from the system")
     )]
@@ -66,6 +69,7 @@ struct Args {
 
     #[arg(
         short = 'M',
+        allow_hyphen_values = true,
         action = clap::ArgAction::Append,
         value_parser = parse_ipc_key,
         help = gettext("Remove the shared memory identifier, created with key shmkey, from the system")
@@ -74,6 +78,7 @@ struct Args {
 
     #[arg(
         short = 'q',
+        allow_hyphen_values = true,
         action = clap::ArgAction::Append,
         help = gettext("Remove the message queue identifier msgid from the system")
     )]
@@ -81,6 +86,7 @@ struct Args {
 
     #[arg(
         short = 'Q',
+        allow_hyphen_values = true,
         action = clap::ArgAction::Append,
         value_parser = parse_ipc_key,
         help = gettext("Remove the message queue identifier, created with key msgkey, from the system")
@@ -330,7 +336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse via clap (for --help/--version/validation) and keep the matches so
     // we can recover the command-line order of the repeated options.
-    let matches = Args::command().get_matches();
+    let matches = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
     let args = Args::from_arg_matches(&matches)?;
 
     let mut ops: Vec<(usize, Op)> = Vec::new();

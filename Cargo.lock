@@ -860,6 +860,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "chrono",
+ "clap",
  "errno",
  "gettext-rs",
  "libc",

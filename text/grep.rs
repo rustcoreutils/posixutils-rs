@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use gettextrs::gettext;
+use plib::optarg::OptionArguments;
 use plib::regex::{Regex, RegexFlags};
 use std::{
     collections::VecDeque,
@@ -702,57 +703,23 @@ fn write_line(prefix: &[u8], line: &[u8]) {
     }
 }
 
-/// GNU's `-NUM` option, a context of NUM lines, as `-C NUM`, which clap can parse. An argument
-/// that is the value of an option before it, or follows `--`, is left as it is.
-fn expand_numeric_context(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    const SHORT_WITH_VALUE: &[char] = &['e', 'f', 'A', 'B', 'C'];
-    const LONG_WITH_VALUE: &[&str] = &[
-        "--regexp",
-        "--file",
-        "--label",
-        "--after-context",
-        "--before-context",
-        "--context",
-    ];
-    let mut args = args.into_iter();
-    let mut out: Vec<OsString> = args.next().into_iter().collect();
-    let mut value_next = false;
-    while let Some(arg) = args.next() {
-        let Some(text) = arg.to_str().filter(|_| !value_next) else {
-            value_next = false;
-            out.push(arg);
-            continue;
-        };
-        if text == "--" {
-            out.push(arg);
-            out.extend(args);
-            break;
+/// GNU's `-NUM` option, a context of NUM lines, as `-C NUM`, which clap can parse. Digits before
+/// the first letter of a cluster that takes an argument are -NUM, the last run of them counting,
+/// as in GNU grep: `-n5` is `-n -C 5`. An option-argument, and anything after `--`, is left as
+/// it is.
+fn expand_numeric_context(argv: Vec<OsString>) -> Vec<OsString> {
+    let options = OptionArguments::of(Args::command());
+    plib::optarg::rewrite_short_clusters(argv, &options, |flags, rest| {
+        let digits = flags
+            .split(|c: char| !c.is_ascii_digit())
+            .rfind(|run| !run.is_empty())?;
+        let mut words = vec![OsString::from("-C"), OsString::from(digits)];
+        let letters: String = flags.chars().filter(|c| !c.is_ascii_digit()).collect();
+        if !letters.is_empty() || !rest.is_empty() {
+            words.push(OsString::from(format!("-{letters}{rest}")));
         }
-        if text.starts_with("--") {
-            value_next = LONG_WITH_VALUE.contains(&text);
-        } else if let Some(cluster) = text.strip_prefix('-') {
-            // The first letter that takes a value takes the rest of the cluster, or else the
-            // next argument. Digits before it are -NUM, the last run of them counting, as in
-            // GNU grep: `-n5` is `-n -C 5`.
-            let value_at = cluster.find(SHORT_WITH_VALUE).unwrap_or(cluster.len());
-            let (options, value) = cluster.split_at(value_at);
-            value_next = value.len() == 1;
-            let digits = options
-                .split(|c: char| !c.is_ascii_digit())
-                .rfind(|run| !run.is_empty());
-            if let Some(digits) = digits {
-                out.push(OsString::from("-C"));
-                out.push(OsString::from(digits));
-                let letters: String = options.chars().filter(|c| !c.is_ascii_digit()).collect();
-                if !letters.is_empty() || !value.is_empty() {
-                    out.push(OsString::from(format!("-{letters}{value}")));
-                }
-                continue;
-            }
-        }
-        out.push(arg);
-    }
-    out
+        Some(words)
+    })
 }
 
 // Exit code:
@@ -762,7 +729,7 @@ fn expand_numeric_context(args: impl IntoIterator<Item = OsString>) -> Vec<OsStr
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("grep");
 
-    let mut args = Args::parse_from(expand_numeric_context(std::env::args_os()));
+    let mut args = Args::parse_from(expand_numeric_context(std::env::args_os().collect()));
 
     let exit_code = args
         .validate_args()

@@ -10,7 +10,7 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 use plib::locale::next_char_offset;
-use plib::optarg::TakesArgument;
+use plib::optarg::OptionArguments;
 use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,7 +76,7 @@ impl Args {
             std::env::args_os().collect(),
             'i',
             "in-place",
-            &[TakesArgument::Short('e'), TakesArgument::Short('f')],
+            &OptionArguments::of(Args::command()),
         );
         let matches = Args::command().get_matches_from(argv);
         let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());

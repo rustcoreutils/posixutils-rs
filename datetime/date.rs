@@ -8,9 +8,9 @@
 //
 
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, CommandFactory, Parser};
 use gettextrs::gettext;
-use plib::optarg::TakesArgument;
+use plib::optarg::OptionArguments;
 use plib::{date_arg, diag};
 #[cfg(unix)]
 use std::ffi::CString;
@@ -467,7 +467,7 @@ fn main() {
         std::env::args_os().collect(),
         'I',
         "iso-8601",
-        &[TakesArgument::Short('d'), TakesArgument::Long("date")],
+        &OptionArguments::of(Args::command()),
     );
     let args = Args::parse_from(argv);
     let iso = iso_format(&args);

@@ -55,6 +55,8 @@ fn parse_pathbuf(s: &str) -> Result<PathBuf, String> {
 struct RmConfig {
     args: Args,
     is_tty: bool,
+    /// `(st_dev, st_ino)` of the root directory, which a recursive removal refuses to enter.
+    root_identity: Option<(u64, u64)>,
 }
 
 fn prompt_user(prompt: &str) -> bool {
@@ -107,19 +109,34 @@ fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
 
     if let Ok(abspath) = fs::canonicalize(filepath) {
         if abspath.as_os_str() == "/" {
-            let err_str = if filepath.as_os_str() == "/" {
-                gettext("it is dangerous to operate recursively on '/'")
-            } else {
-                gettext!(
-                    "it is dangerous to operate recursively on '{}' (same as '/')",
-                    filepath.display()
-                )
-            };
-            return Err(io::Error::other(err_str));
+            return Err(io::Error::other(dangerous_root_message(
+                &filepath.display().to_string(),
+            )));
         }
     }
 
     Ok(())
+}
+
+/// The refusal of an operand that is the root directory, named as `shown`.
+fn dangerous_root_message(shown: &str) -> String {
+    if shown == "/" {
+        gettext("it is dangerous to operate recursively on '/'")
+    } else {
+        gettext!(
+            "it is dangerous to operate recursively on '{}' (same as '/')",
+            shown
+        )
+    }
+}
+
+/// Whether the walk is about to enter the root directory itself. The pathname check in
+/// `refuse_dot_dotdot_root` is only a first answer: the operand is resolved again when the walk
+/// opens it (a symbolic link named with a trailing slash is followed then), so this compares the
+/// identity of the directory the walk actually stat'ed and will open -- `ftw` checks the opened
+/// descriptor against that same `(dev, ino)` -- with the root's.
+fn is_root_directory(cfg: &RmConfig, md: &ftw::Metadata) -> bool {
+    cfg.root_identity == Some((md.dev(), md.ino()))
 }
 
 /// Whether removing this file counts as unprotected, which is what decides the wording of the
@@ -308,6 +325,11 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             let md = entry.metadata().unwrap();
 
             if md.file_type() == ftw::FileType::Directory {
+                if is_root_directory(cfg, md) {
+                    let shown = entry.path().clean_trailing_slashes();
+                    eprintln!("rm: {}", dangerous_root_message(&shown));
+                    return Err(());
+                }
                 match process_directory(cfg, &entry) {
                     Ok(dir_action) => match dir_action {
                         DirAction::Entered => Ok(true),
@@ -565,7 +587,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let is_tty = io::stdin().is_terminal();
-    let cfg = RmConfig { args, is_tty };
+    let root_identity = fs::metadata("/").ok().map(|md| (md.dev(), md.ino()));
+    let cfg = RmConfig {
+        args,
+        is_tty,
+        root_identity,
+    };
 
     // POSIX rm SYNOPSIS form 1 requires at least one operand; only the `-f` form permits none, in
     // which case rm is silent and successful (113405-113407).
@@ -594,4 +621,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rm_directory, Args, RmConfig};
+    use clap::Parser;
+    use std::{fs, os::unix::fs::MetadataExt};
+
+    /// The refusal of the root directory binds to the directory the walk opens, not to the
+    /// operand's pathname: with a stand-in directory as "root", `rm -r link/` (link -> it) is
+    /// refused although the pathname check, which canonicalizes to the real root only, passes,
+    /// and nothing in it is removed.
+    #[test]
+    fn root_refusal_checks_the_walked_directory() {
+        let tmp = plib::tmp::tempdir().unwrap();
+        let fake_root = tmp.path().join("root");
+        fs::create_dir(&fake_root).unwrap();
+        fs::write(fake_root.join("f"), b"x").unwrap();
+        let link = tmp.path().join("rootlink");
+        std::os::unix::fs::symlink(&fake_root, &link).unwrap();
+        let md = fs::metadata(&fake_root).unwrap();
+
+        let operand = format!("{}/", link.display());
+        let cfg = RmConfig {
+            args: Args::parse_from(["rm", "-rf", operand.as_str()]),
+            is_tty: false,
+            root_identity: Some((md.dev(), md.ino())),
+        };
+        let walked_ok = rm_directory(&cfg, operand.as_ref()).unwrap();
+
+        assert!(!walked_ok);
+        assert!(fake_root.join("f").exists());
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    }
 }

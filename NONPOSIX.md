@@ -616,6 +616,18 @@ Debian source packages, with GNU patch's meaning:
 
  * The `%a`, `%A`, `%e`, `%E`, `%f`, `%F`, `%g` and `%G` conversions.
 
+### ps
+
+ * procps' dashless BSD options `a`, `u` and `x`, in one word or several
+   (`ps aux`, `ps ax`, `ps u`), when the first argument is such a word; it
+   cannot be mixed with dash options.  `a` lists every user's processes, not
+   only the invoker's; `x` lists processes without a controlling terminal
+   too; `u` selects procps' user format (`USER PID %CPU %MEM VSZ RSS TTY
+   STAT START TIME COMMAND`), otherwise the format is `PID TTY STAT TIME
+   COMMAND`.  Columns, `STAT` flags, `%CPU` (CPU time over lifetime) and
+   `%MEM` follow procps; a control character in the command is shown as `?`.
+   binutils' `debian/rules` runs `ps aux`.
+
 ### prs
 
  * The `:KV:` dataspec keyword, removed from POSIX by Austin Group Defect 1452.

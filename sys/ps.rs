@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod psbsd;
+
 #[cfg(target_os = "macos")]
 mod psmacos;
 
@@ -686,6 +688,17 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> 
 
 fn main() -> ExitCode {
     plib::diag::init_locale("ps");
+
+    // procps' dashless BSD options (`ps aux`) take another path.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match psbsd::parse(&argv) {
+        Ok(Some(opts)) => return psbsd::run(&opts),
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("ps: {}", msg);
+            return ExitCode::from(1);
+        }
+    }
 
     let args = Args::parse();
 

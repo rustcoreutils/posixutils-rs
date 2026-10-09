@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod bsd;
+
 use plib::testing::{run_test_with_checker, TestPlan};
 use std::process::Output;
 

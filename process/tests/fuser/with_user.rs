@@ -9,7 +9,7 @@
 
 use super::{fuser_test, wait_for_open_fd};
 use libc::uid_t;
-use std::{ffi::CStr, fs::File, io, process::Command, str};
+use std::{ffi::CStr, io, process::Command, str};
 
 /// Retrieves the user name of the process owner by process ID on Linux.
 ///
@@ -20,7 +20,7 @@ use std::{ffi::CStr, fs::File, io, process::Command, str};
 /// - A `Result` containing the user name if successful, or an `io::Error`.
 #[cfg(target_os = "linux")]
 fn get_process_user(pid: u32) -> io::Result<String> {
-    use std::io::Read;
+    use std::{fs::File, io::Read};
     let status_path = format!("/proc/{}/status", pid);
     let mut file = File::open(&status_path).map_err(|e| {
         eprintln!("Failed to open {}: {}", status_path, e);

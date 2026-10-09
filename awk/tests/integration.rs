@@ -949,3 +949,33 @@ fn awk_field_separator_begins_with_hyphen() {
         expected_exit_code: 0,
     });
 }
+
+// A '#' inside a regular expression literal, or inside a string, is part of
+// that token and does not start a comment. autoconf's config.status uses
+// `/^[\t ]*#[\t ]*(define|undef)[\t ]+/` and `sub(/#.*/, "")`.
+#[test]
+fn awk_hash_inside_regex_literal_is_not_a_comment() {
+    let cases = [
+        ("/#/", "x\na#b\n", "a#b\n"),
+        ("/^#AT_START_/", "#AT_START_1\nAT_START_\n", "#AT_START_1\n"),
+        (
+            "/^[\\t ]*#[\\t ]*(define|undef)[\\t ]+/ { print $2 }",
+            "# define FOO 1\n#undef BAR\nint x;\n",
+            "define\nBAR\n",
+        ),
+        ("{ sub(/#.*/, \"\"); print }", "keep # drop\n", "keep \n"),
+        ("/[#]/ { print \"br\" }", "a#\nb\n", "br\n"),
+        ("{ print \"a#b\" } # trailing comment", "x\n", "a#b\n"),
+        ("/a b/", "ab\na b\n", "a b\n"),
+    ];
+    for (program, input, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from(input),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

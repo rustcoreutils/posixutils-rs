@@ -17,7 +17,7 @@ string_char     =  {
   | "\\\\" | "\\" ~ ("\"" | "/" | "a" | "b" | "f" | "n" | "r" | "t" | "v")
   | "\\" ~ ASCII_DIGIT{1, 3}
 }
-ere             =  { "/" ~ (("\\" ~ ANY) | (!("/" | "\n") ~ ANY))* ~ "/" }
+ere             = @{ "/" ~ (("\\" ~ ANY) | (!("/" | "\n") ~ ANY))* ~ "/" }
 number          = @{ decimal_float | integer }
 digit           =  { ('0'..'9') }
 integer         = @{ digit+ }

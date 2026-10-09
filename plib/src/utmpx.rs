@@ -10,6 +10,7 @@
 use crate::platform::{self, endutxent, getutxent, setutxent, utmpxname};
 use std::ffi::{CStr, CString};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -125,11 +126,9 @@ pub fn load() -> Vec<Utmpx> {
 /// This sets the utmpx database file to the given path before reading entries.
 /// Returns an error if the path cannot be converted to a C string.
 pub fn load_from_file(path: &Path) -> io::Result<Vec<Utmpx>> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
-    let c_path =
-        CString::new(path_str).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // The pathname's own bytes: it need not be valid UTF-8.
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let _guard = stream_lock();
     unsafe {

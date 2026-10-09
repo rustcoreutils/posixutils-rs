@@ -1676,3 +1676,24 @@ fn compress_reports_write_error_to_stdout() {
     assert!(!compressed.is_empty());
     plib::testing::assert_write_error_on_full_device("uncompress", &["-c"], &compressed, 1);
 }
+
+// A program name that is not valid UTF-8 still selects zcat by its ending;
+// reading it made compress panic.
+#[cfg(unix)]
+#[test]
+fn zcat_invoked_by_non_utf8_name() {
+    use plib::testing::{get_binary_path, os_bytes};
+    let compressed = compress_stdin_test("hello\n");
+    let dir = plib::tmp::tempdir().unwrap();
+    let link = dir.path().join(os_bytes(b"\xffzcat"));
+    std::os::unix::fs::symlink(get_binary_path("compress"), &link).unwrap();
+    let mut child = std::process::Command::new(&link)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&compressed).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+}

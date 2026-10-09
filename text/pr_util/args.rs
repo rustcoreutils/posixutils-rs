@@ -14,6 +14,7 @@ use crate::{
 use clap::Parser;
 use gettextrs::gettext;
 use regex::Regex;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -131,9 +132,10 @@ impl Args {
     }
 
     pub fn parse_custom() -> Self {
-        let env_args: Vec<String> = std::env::args().collect();
-        let mut out: Vec<String> = Vec::with_capacity(env_args.len());
-        let mut iter = env_args.into_iter();
+        // `args_os`, not `args`, which panics on an argument that is not
+        // valid UTF-8: a file operand is a pathname.
+        let mut iter = std::env::args_os();
+        let mut out: Vec<OsString> = Vec::with_capacity(iter.len());
 
         // Preserve program name (argv[0]) untouched.
         if let Some(prog) = iter.next() {
@@ -142,21 +144,29 @@ impl Args {
         let mut verbatim = false;
         let mut end_of_options = false;
         for arg in iter {
-            if verbatim || end_of_options {
-                // An option-argument, or an operand after `--`, is passed as
-                // given even when it begins with '-' or '+' (XBD 12.2,
-                // Guideline 7): `-h -3` is the header "-3", not three columns.
-                out.push(arg);
-                verbatim = false;
-                continue;
-            }
-            if arg == "--" {
+            // A word that is not valid UTF-8 is no option; clap takes it as
+            // an operand, or refuses it as an option-argument.
+            let text = match arg.to_str() {
+                Some(text) if !verbatim && !end_of_options => text,
+                _ => {
+                    // An option-argument, or an operand after `--`, is passed
+                    // as given even when it begins with '-' or '+' (XBD 12.2,
+                    // Guideline 7): `-h -3` is the header "-3", not three
+                    // columns.
+                    out.push(arg);
+                    verbatim = false;
+                    continue;
+                }
+            };
+            if text == "--" {
                 end_of_options = true;
                 out.push(arg);
                 continue;
             }
-            preprocess_arg(&arg, &mut out);
-            verbatim = out.last().is_some_and(|last| awaits_value(last));
+            let mut words = Vec::new();
+            preprocess_arg(text, &mut words);
+            verbatim = words.last().is_some_and(|last| awaits_value(last));
+            out.extend(words.into_iter().map(OsString::from));
         }
 
         let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(out));

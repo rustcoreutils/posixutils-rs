@@ -567,3 +567,21 @@ fn header_begins_with_hyphen_digit() {
         },
     );
 }
+
+// A file operand is a pathname and need not be valid UTF-8; reading the
+// command line made pr panic on one.
+#[cfg(unix)]
+#[test]
+fn pr_non_utf8_file_operand() {
+    use plib::testing::{get_binary_path, os_bytes};
+    let dir = plib::tmp::tempdir().unwrap();
+    let file = dir.path().join(os_bytes(b"in\xff"));
+    fs::write(&file, b"hello\n").unwrap();
+    let output = std::process::Command::new(get_binary_path("pr"))
+        .arg("-t")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+}

@@ -91,7 +91,9 @@ enum ProgramMode {
 
 impl ProgramMode {
     fn detect() -> Self {
-        let prog = std::env::args().next().unwrap_or_default();
+        // `args_os`: `args` panics on a program name that is not valid UTF-8.
+        let prog = std::env::args_os().next().unwrap_or_default();
+        let prog = prog.to_string_lossy();
         if prog.ends_with("zcat") {
             ProgramMode::Zcat
         } else if prog.ends_with("uncompress") {

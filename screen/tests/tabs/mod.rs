@@ -143,3 +143,20 @@ fn test_tabs_non_terminal_stdout_errors() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("tabs", &["-T", "-zq", "--help"]);
 }
+
+// An operand that is not valid UTF-8 is refused with status 1, as any
+// other invalid operand; it made tabs panic.
+#[test]
+fn tabs_non_utf8_operand_is_refused() {
+    use plib::testing::{get_binary_path, os_bytes};
+    let output = Command::new(get_binary_path("tabs"))
+        .arg(os_bytes(b"x\xff"))
+        .env("TERM", "dumb")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid UTF-8"),
+        "{output:?}"
+    );
+}

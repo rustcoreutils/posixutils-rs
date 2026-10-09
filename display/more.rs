@@ -4063,16 +4063,18 @@ fn parse_args_with_more_env() -> Args {
     // Get the MORE environment variable
     if let Ok(more_env) = std::env::var("MORE") {
         // Parse MORE variable into args
-        let more_args: Vec<String> = more_env.split_whitespace().map(String::from).collect();
+        let more_args: Vec<std::ffi::OsString> =
+            more_env.split_whitespace().map(Into::into).collect();
 
         if !more_args.is_empty() {
-            // Get actual command line args (skip program name)
-            let cmd_args: Vec<String> = std::env::args().collect();
+            // `args_os`, not `args`, which panics on an argument that is not
+            // valid UTF-8; clap then refuses one with its own message.
+            let mut cmd_args = std::env::args_os();
 
             // Build combined args: program name, MORE args, then command line args
-            let mut combined_args = vec![cmd_args[0].clone()];
+            let mut combined_args: Vec<std::ffi::OsString> = cmd_args.next().into_iter().collect();
             combined_args.extend(more_args);
-            combined_args.extend(cmd_args.into_iter().skip(1));
+            combined_args.extend(cmd_args);
 
             return Args::parse_from(plib::optarg::keep_leading_equals::<Args>(combined_args));
         }

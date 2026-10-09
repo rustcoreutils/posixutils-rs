@@ -1824,3 +1824,22 @@ fn option_argument_may_begin_with_hyphen() {
 fn more_filter_mode_reports_write_error_on_final_partial_line() {
     plib::testing::assert_write_error_on_full_device("more", &[], b"x", 1);
 }
+
+// With $MORE set, an argument that is not valid UTF-8 is refused like any
+// other, not a panic.
+#[cfg(unix)]
+#[test]
+fn more_env_with_non_utf8_argument() {
+    use plib::testing::{get_binary_path, os_bytes};
+    let output = std::process::Command::new(get_binary_path("more"))
+        .env("MORE", "-s")
+        .arg(os_bytes(b"x\xff"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid UTF-8"),
+        "{output:?}"
+    );
+}

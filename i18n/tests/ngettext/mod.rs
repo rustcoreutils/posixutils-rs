@@ -120,3 +120,10 @@ fn test_ngettext_large_number() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("ngettext", &["-d", "-zq", "--help"]);
 }
+
+// The message has no trailing <newline>, so it sat in stdout's line buffer
+// until exit, where a write error was lost.
+#[test]
+fn ngettext_reports_write_error() {
+    plib::testing::assert_write_error_on_full_device("ngettext", &["a", "b", "1"], b"", 1);
+}

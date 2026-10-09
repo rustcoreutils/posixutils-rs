@@ -128,3 +128,11 @@ fn test_gettext_shell_mode() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("gettext", &["-d", "-zq", "--help"]);
 }
+
+// The message has no trailing <newline>, so it sat in stdout's line buffer
+// until exit, where a write error was lost.
+#[test]
+fn gettext_reports_write_error() {
+    plib::testing::assert_write_error_on_full_device("gettext", &["x"], b"", 1);
+    plib::testing::assert_write_error_on_full_device("gettext", &["-s", "x"], b"", 1);
+}

@@ -1253,3 +1253,14 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("iconv", &[opt, "-zq", "--help"]);
     }
 }
+
+// A write error is reported with status 1, not a panic.
+#[test]
+fn iconv_reports_write_error() {
+    plib::testing::assert_write_error_on_full_device(
+        "iconv",
+        &["-f", "UTF-8", "-t", "UTF-8"],
+        b"x",
+        1,
+    );
+}

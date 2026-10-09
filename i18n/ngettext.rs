@@ -109,8 +109,12 @@ fn main() {
         None => germanic(),
     };
 
-    // No trailing newline is appended.
+    // No trailing newline is appended. It is therefore still in stdout's
+    // line buffer, and the flush at exit would discard its write error.
     print!("{}", output);
+    if !plib::diag::flush_stdout() {
+        exit(1);
+    }
 }
 
 /// Resolve the text domain in decreasing precedence: operand `textdomain`, the

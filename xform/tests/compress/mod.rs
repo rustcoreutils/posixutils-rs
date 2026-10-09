@@ -1659,3 +1659,20 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("compress", &[opt, "-zq", "--help"]);
     }
 }
+
+// A write error on standard output is reported: the compressed data has no
+// <newline> to flush it, so it sat in the line buffer until exit, where the
+// error was lost.
+#[test]
+fn compress_reports_write_error_to_stdout() {
+    plib::testing::assert_write_error_on_full_device("compress", &["-c"], b"x", 1);
+    let input = plib::testing::TempFile::new("x", "x");
+    let compressed = std::process::Command::new(plib::testing::get_binary_path("compress"))
+        .arg("-c")
+        .arg(input.path())
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(!compressed.is_empty());
+    plib::testing::assert_write_error_on_full_device("uncompress", &["-c"], &compressed, 1);
+}

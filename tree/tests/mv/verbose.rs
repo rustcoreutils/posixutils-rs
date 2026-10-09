@@ -129,3 +129,36 @@ fn test_mv_verbose_across_filesystems() {
     fs::remove_dir_all(&dir).unwrap();
     fs::remove_dir_all(&other).unwrap();
 }
+
+/// A `-v` line that cannot be written does not stop the move: every operand is moved, within a
+/// filesystem and across one, and the write error is reported at the end with status 1, as GNU
+/// mv does.
+#[cfg(target_os = "linux")]
+#[test]
+fn verbose_write_error_finishes_the_move() {
+    let dir = scratch("write_error");
+    for name in ["a", "b", "c"] {
+        fs::write(dir.join(name), name).unwrap();
+    }
+    fs::create_dir(dir.join("to")).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let args = ["-v", &p("a"), &p("b"), &p("c"), &p("to")];
+    plib::testing::assert_write_error_on_full_device("mv", &args, b"", 1);
+    for name in ["a", "b", "c"] {
+        assert!(!dir.join(name).exists(), "{name} left behind");
+        assert_eq!(fs::read_to_string(dir.join("to").join(name)).unwrap(), name);
+    }
+
+    if let Some(other) = other_fs("write_error") {
+        fs::create_dir_all(dir.join("tree/sub")).unwrap();
+        fs::write(dir.join("tree/x"), "x").unwrap();
+        fs::write(dir.join("tree/sub/y"), "y").unwrap();
+        let target = other.join("tree");
+        let args = ["-v", &p("tree"), target.to_str().unwrap()];
+        plib::testing::assert_write_error_on_full_device("mv", &args, b"", 1);
+        assert!(!dir.join("tree").exists(), "source left behind");
+        assert_eq!(fs::read_to_string(target.join("sub/y")).unwrap(), "y");
+        fs::remove_dir_all(&other).unwrap();
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}

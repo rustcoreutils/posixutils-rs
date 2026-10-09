@@ -17,7 +17,7 @@
 //! duplicate -- an entry added since, a file written to or replaced since -- is left where it
 //! is and reported, and so is every directory still holding one.
 
-use crate::common::{error_string, quote, CopiedSources, InodeMap, PinnedEntry};
+use crate::common::{error_string, quote, report_verbose, CopiedSources, InodeMap, PinnedEntry};
 use gettextrs::gettext;
 use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
 
@@ -74,7 +74,7 @@ pub fn remove_moved_source(
             inode_map.remove(&(md.dev(), md.ino()));
         }
         if verbose {
-            println!("{}", gettext!("removed {}", quote(entry.path().as_inner())));
+            report_verbose(&gettext!("removed {}", quote(entry.path().as_inner())));
         }
         Ok(false)
     };
@@ -86,7 +86,7 @@ pub fn remove_moved_source(
             let holds_reported = removal.left > left_on_entry;
             if remove_emptied_dir(&entry, holds_reported, &mut removal) && verbose {
                 let shown = quote(entry.path().as_inner());
-                println!("{}", gettext!("removed directory {}", shown));
+                report_verbose(&gettext!("removed directory {}", shown));
             }
         }
         Ok(())

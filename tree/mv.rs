@@ -11,7 +11,9 @@
 mod common;
 mod remove_moved;
 
-use self::common::{copy_moved_file, error_string, quote, Verbose};
+use self::common::{
+    copy_moved_file, error_string, exit_after_verbose, quote, report_verbose, Verbose,
+};
 use clap::Parser;
 use common::{
     Anchor, CopiedSources, CopyConfig, DerefMode, Destination, InodeMap, MoveSource, PinnedDir,
@@ -347,10 +349,7 @@ fn move_file_deciding(
     match rename_pinned(&source_entry, target_entry, replace) {
         Ok(_) => {
             if cfg.verbose {
-                println!(
-                    "{}",
-                    gettext!("renamed {} -> {}", quote(source), quote(target))
-                );
+                report_verbose(&gettext!("renamed {} -> {}", quote(source), quote(target)));
             }
             return Ok(Moved::Done);
         }
@@ -674,14 +673,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let cfg = MvConfig::new(&args);
-    if dir_exists {
-        match move_files(&cfg, sources, target) {
-            Some(_) => Ok(()),
-            None => {
-                // Already eprintln'd the errors
-                std::process::exit(1);
-            }
-        }
+    let ok = if dir_exists {
+        // A failure was reported where it happened.
+        move_files(&cfg, sources, target).is_some()
     } else {
         let source = &sources[0];
 
@@ -720,20 +714,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut dummy,
             None,
         ) {
-            Ok(Moved::Done) => Ok(()),
+            Ok(Moved::Done) => true,
             // 7. Remove source file hierarchy
-            Ok(Moved::Copied(copied)) => {
-                if !copied.remove(&mut dummy, cfg.verbose) {
-                    std::process::exit(1);
-                }
-                Ok(())
-            }
+            Ok(Moved::Copied(copied)) => copied.remove(&mut dummy, cfg.verbose),
             Err(e) => {
                 eprintln!("mv: {}", e);
-                std::process::exit(1);
+                false
             }
         }
-    }
+    };
+    exit_after_verbose(ok)
 }
 
 #[cfg(test)]

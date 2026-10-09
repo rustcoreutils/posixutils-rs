@@ -11,7 +11,8 @@ mod common;
 mod parents;
 
 use self::common::{
-    copy_file, copy_files, error_string, CopyConfig, DerefMode, Destination, InodeMap, Verbose,
+    copy_file, copy_files, error_string, exit_after_verbose, CopyConfig, DerefMode, Destination,
+    InodeMap, Verbose,
 };
 use clap::Parser;
 use gettextrs::gettext;
@@ -217,16 +218,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut inode_map = InodeMap::new();
     let inode_map = (args.archive || args.no_deref_keep_links).then_some(&mut inode_map);
 
-    if args.parents {
-        if !parents::copy_with_parents(&cfg, sources, target, inode_map, prompt_user) {
-            std::process::exit(1);
-        }
-        Ok(())
+    let ok = if args.parents {
+        parents::copy_with_parents(&cfg, sources, target, inode_map, prompt_user)
     } else if dir_exists {
-        match copy_files(&cfg, sources, target, inode_map, prompt_user) {
-            Some(_) => Ok(()),
-            None => std::process::exit(1),
-        }
+        copy_files(&cfg, sources, target, inode_map, prompt_user).is_some()
     } else {
         let mut created_files = HashSet::new();
 
@@ -238,15 +233,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             inode_map,
             prompt_user,
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => true,
             Err(e) => {
                 // `copy_file` already emitted its per-file diagnostics (empty-message marker).
                 let s = error_string(&e);
                 if !s.is_empty() {
                     eprintln!("cp: {s}");
                 }
-                std::process::exit(1);
+                false
             }
         }
-    }
+    };
+    exit_after_verbose(ok)
 }

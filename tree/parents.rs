@@ -17,13 +17,13 @@
 
 use crate::common::{
     copy_file_at, error_string, finish_made_dir_mode, made_dir_open_error, open_made_dir,
-    preserve_through_fd, CopyConfig, InodeMap, MadeTrust,
+    preserve_through_fd, report_verbose_bytes, CopyConfig, InodeMap, MadeTrust,
 };
 use gettextrs::gettext;
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -163,8 +163,7 @@ fn report_made_dir(source: &Path, dest: &Path) {
     let mut line = source.as_os_str().as_bytes().to_vec();
     line.extend_from_slice(b" -> ");
     line.extend_from_slice(dest.as_os_str().as_bytes());
-    line.push(b'\n');
-    let _ = io::stdout().write_all(&line);
+    report_verbose_bytes(&line);
 }
 
 /// The final attributes of a directory `--parents` made, set once the copy below it is done.

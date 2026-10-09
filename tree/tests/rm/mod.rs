@@ -1272,6 +1272,27 @@ fn test_rm_v_file() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
+/// A `-v` line that cannot be written does not stop the removal: the whole tree is removed, and
+/// the write error is reported at the end with status 1, as GNU rm does.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_rm_v_write_error_finishes_the_removal() {
+    let test_dir = format!("{}/test_rm_v_write_error", env!("CARGO_TARGET_TMPDIR"));
+    let _ = fs::remove_dir_all(&test_dir);
+    let tree = format!("{test_dir}/tree");
+    fs::create_dir_all(format!("{tree}/sub")).unwrap();
+    fs::write(format!("{tree}/a"), "a").unwrap();
+    fs::write(format!("{tree}/sub/b"), "b").unwrap();
+    let file = format!("{test_dir}/f");
+    fs::write(&file, "f").unwrap();
+
+    plib::testing::assert_write_error_on_full_device("rm", &["-rv", &tree, &file], b"", 1);
+    assert!(!Path::new(&tree).exists());
+    assert!(!Path::new(&file).exists());
+
+    fs::remove_dir_all(&test_dir).unwrap();
+}
+
 // `-dv` reports a removed empty directory on stdout.
 #[test]
 fn test_rm_dv_empty_dir() {

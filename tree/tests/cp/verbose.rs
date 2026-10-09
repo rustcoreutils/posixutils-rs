@@ -159,3 +159,33 @@ fn test_cp_verbose_quoting() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A `-v` line that cannot be written does not stop the copy: the whole tree is copied, and the
+/// write error is reported at the end with status 1, as GNU cp does.  So with `--parents`.
+#[cfg(target_os = "linux")]
+#[test]
+fn verbose_write_error_finishes_the_copy() {
+    let dir = scratch("write_error");
+    fs::create_dir_all(dir.join("src/sub")).unwrap();
+    fs::write(dir.join("src/a"), "a\n").unwrap();
+    fs::write(dir.join("src/sub/b"), "b\n").unwrap();
+    let (src, dst) = (dir.join("src"), dir.join("dst"));
+    let (src, dst) = (src.to_str().unwrap(), dst.to_str().unwrap());
+    plib::testing::assert_write_error_on_full_device("cp", &["-rv", src, dst], b"", 1);
+    assert_eq!(fs::read_to_string(dir.join("dst/a")).unwrap(), "a\n");
+    assert_eq!(fs::read_to_string(dir.join("dst/sub/b")).unwrap(), "b\n");
+
+    let parents = dir.join("parents");
+    fs::create_dir(&parents).unwrap();
+    let b = dir.join("src/sub/b");
+    let args = [
+        "-v",
+        "--parents",
+        b.to_str().unwrap(),
+        parents.to_str().unwrap(),
+    ];
+    plib::testing::assert_write_error_on_full_device("cp", &args, b"", 1);
+    let copied = parents.join(b.strip_prefix("/").unwrap());
+    assert_eq!(fs::read_to_string(copied).unwrap(), "b\n");
+    fs::remove_dir_all(&dir).unwrap();
+}

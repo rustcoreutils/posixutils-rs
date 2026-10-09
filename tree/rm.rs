@@ -9,7 +9,7 @@
 
 mod common;
 
-use self::common::error_string;
+use self::common::{error_string, exit_after_verbose, report_verbose};
 use clap::Parser;
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
@@ -101,7 +101,7 @@ fn report_removed(cfg: &RmConfig, is_dir: bool, name: &str) {
         } else {
             gettext!("removed '{}'", name)
         };
-        println!("{msg}");
+        report_verbose(&msg);
     }
 }
 
@@ -708,7 +708,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    std::process::exit(exit_code)
+    exit_after_verbose(exit_code == 0)
 }
 
 #[cfg(test)]

@@ -196,7 +196,7 @@ fn report_copied(cfg: &CopyConfig, source: &Path, target: &Path, made_dir: bool)
             gettext!("copied {} -> {}", quote(source), quote(target))
         }
     };
-    println!("{line}");
+    super::report_verbose(&line);
 }
 
 /// What a copy may find at its destination operand (not below it).

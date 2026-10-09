@@ -16,6 +16,7 @@
 mod change_ownership;
 mod copy;
 mod pinned;
+mod verbose;
 
 use gettextrs::gettext;
 use std::{ffi::CStr, io, os::unix::ffi::OsStrExt, path::Path};
@@ -143,6 +144,9 @@ pub use copy::{
 
 // mv
 pub use pinned::{Anchor, CopiedSources, PinnedDir, PinnedDirs, PinnedEntry, SourceState};
+
+// cp, mv and rm -v
+pub use verbose::{exit_after_verbose, report_verbose, report_verbose_bytes};
 
 // chgrp and chown
 pub use change_ownership::{chown_traverse, ChangeOwnershipArgs};

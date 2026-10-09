@@ -2752,6 +2752,29 @@ fn delimiter_inside_bracket_expression_does_not_end_the_re() {
     }
 }
 
+// POSIX.2024 sed, `s` and `y`: "Any character other than <backslash> or
+// <newline> can be used instead of a <slash> to delimit" the strings. A `;`
+// delimiter is part of the command, not a command separator.
+#[test]
+fn any_character_but_backslash_or_newline_delimits_s_and_y() {
+    let cases: [(&[&str], &str, &str); 11] = [
+        (&["s;a;X;"], "abc\n", "Xbc\n"),
+        (&["-e", "s;[[][0-9][]]\\(.*\\);\\1;"], "[1]rest\n", "rest\n"),
+        (&["s;\\;;-;"], "a;b\n", "a-b\n"),
+        (&["s;a;X;;s;b;Y;"], "abc\n", "XYc\n"),
+        (&["-n", "s;b;Y;p;p"], "abc\n", "aYc\naYc\n"),
+        (&["sxaxXx"], "abc\n", "Xbc\n"),
+        (&["s1a1X1"], "abc\n", "Xbc\n"),
+        (&["s a X "], "abc\n", "Xbc\n"),
+        (&["s{a{X{"], "abc\n", "Xbc\n"),
+        (&["y;abc;xyz;"], "abc\n", "xyz\n"),
+        (&["y,a\\,c,x\\,z,"], "a,c\n", "x,z\n"),
+    ];
+    for (args, input, output) in cases {
+        sed_test(args, input, output, "", 0);
+    }
+}
+
 // XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
 // below used to have the word after it refused as an unknown option.
 #[test]

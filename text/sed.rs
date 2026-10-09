@@ -1096,7 +1096,8 @@ fn parse_replace_command(
             None,
         ));
     };
-    if splitter.is_alphanumeric() || " \n;{".contains(*splitter) {
+    // POSIX: any character other than <backslash> or <newline> delimits.
+    if *splitter == '\\' || *splitter == '\n' {
         let position = get_current_line_and_col(chars, *i);
         return Err(SedError::ScriptParse(
             format!("unterminated `{}' command", command),

@@ -311,51 +311,11 @@ pub fn verify_made_dir(parent_fd: RawFd, dir_fd: RawFd) -> io::Result<Option<Mad
     let Some(trust) = made_by_us(made, Some(parent.st_uid), euid) else {
         return Ok(None);
     };
-    let check = || is_empty_dir_fd(dir_fd);
+    let check = || ftw::is_empty_dir_fd(dir_fd);
     if !made.is_dir || !empty_lending_read(dir_fd, &st, euid, check)? {
         return Ok(None);
     }
     Ok(Some(trust))
-}
-
-/// Whether the directory open on `dir_fd` lists nothing but `.` and `..`.
-///
-/// It is read through a new open of `.` relative to `dir_fd` -- the same directory, which no
-/// rename can swap -- so `dir_fd` itself (which may be held for search only) is left alone.
-pub fn is_empty_dir_fd(dir_fd: RawFd) -> io::Result<bool> {
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dir_fd, c".".as_ptr(), flags) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let dir = unsafe { libc::fdopendir(fd) };
-    if dir.is_null() {
-        let e = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(e);
-    }
-    let empty = lists_nothing(dir);
-    unsafe { libc::closedir(dir) };
-    empty
-}
-
-/// Whether the open directory stream `dir` holds nothing but `.` and `..`.
-fn lists_nothing(dir: *mut libc::DIR) -> io::Result<bool> {
-    loop {
-        errno::set_errno(errno::Errno(0));
-        let entry = unsafe { libc::readdir(dir) };
-        if entry.is_null() {
-            let e = io::Error::last_os_error();
-            return match e.raw_os_error() {
-                Some(0) | None => Ok(true),
-                Some(_) => Err(e),
-            };
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." {
-            return Ok(false);
-        }
-    }
 }
 
 /// `check` -- whether the directory open on `dir_fd`, with `st`, is empty -- and, only if it

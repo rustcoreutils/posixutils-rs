@@ -1646,7 +1646,8 @@ fn lists_nothing(dir: OwnedDir) -> io::Result<bool> {
 /// Whether the directory open on `dir_fd` is empty.
 ///
 /// It is read through a new open of `.` relative to `dir_fd` -- the same directory, which no
-/// rename can swap -- so `dir_fd`'s own read position is left alone.
+/// rename can swap -- so `dir_fd` itself (its read position, or a descriptor held for search
+/// only) is left alone. `plib::madefs` checks a directory it made with this too.
 pub fn is_empty_dir_fd(dir_fd: RawFd) -> io::Result<bool> {
     let fd = unsafe {
         libc::openat(

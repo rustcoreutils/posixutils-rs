@@ -18,6 +18,11 @@ chrono.workspace = true
 # Reads which options take an argument from a command's definition (optarg.rs).
 clap.workspace = true
 
+# Race-free directory access shared with the tree walk: madefs's emptiness check
+# (madefs.rs). ftw is Unix-only, as madefs is.
+[target.'cfg(unix)'.dependencies]
+ftw = { path = "../ftw" }
+
 # Compiles the vendored musl regex for a Windows target (see build.rs). Not
 # under [target.'cfg(windows)'.build-dependencies]: Cargo matches that against
 # the host, so a Linux host cross-building for Windows would not get it.

@@ -319,6 +319,34 @@ fn test_date_d_local_time() {
     );
 }
 
+/// A local time the fall-back hour repeats is the earlier of the two (daylight time), as GNU
+/// date reads it in New York; in Berlin GNU takes the later one, and this date keeps to the
+/// earlier.  A time the spring-forward gap skips does not exist and is rejected, as GNU
+/// rejects it.
+#[cfg(unix)]
+#[test]
+fn test_date_d_local_time_across_dst() {
+    let tz = "EST5EDT,M3.2.0,M11.1.0";
+    date_d(&["-d", "2026-11-01 01:30", "+%s"], tz, "1793511000");
+    date_d(
+        &["-d", "2026-11-01T01:30:00", "+%s %Z"],
+        tz,
+        "1793511000 EDT",
+    );
+    let berlin = "CET-1CEST,M3.5.0,M10.5.0/3";
+    date_d(
+        &["-d", "2026-10-25T02:30", "+%s %Z"],
+        berlin,
+        "1792888200 CEST",
+    );
+    let plan = date_plan(&["-d", "2026-03-08 02:30", "+%s"]);
+    run_test_with_checker_and_env(plan, &[("TZ", tz)], |_, output| {
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    });
+}
+
 /// -u is TZ=UTC0 for every conversion, %s and %Z included: %s used to be
 /// computed in the TZ zone from a UTC broken-down time, off by the offset.
 #[cfg(unix)]

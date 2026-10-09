@@ -14,7 +14,10 @@
 //! RFC 5322 date `date -R` prints, and `@SECONDS`.  This is not GNU's
 //! free-form date parser, and is not meant to grow into one.
 
-use chrono::{Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, Local, MappedLocalTime, NaiveDate, NaiveDateTime, TimeZone,
+    Utc,
+};
 use gettextrs::gettext;
 
 /// An instant: seconds and nanoseconds since the epoch.
@@ -170,9 +173,23 @@ fn parse_iso8601(input: &str, zoneless: Zoneless) -> Option<Instant> {
     let dt = match (offset, zoneless) {
         (Some(offset), _) => offset.from_local_datetime(&naive).single()?,
         (None, Zoneless::Utc) => Utc.from_utc_datetime(&naive).fixed_offset(),
-        (None, Zoneless::Local) => Local.from_local_datetime(&naive).single()?.fixed_offset(),
+        (None, Zoneless::Local) => local_instant(&naive)?.fixed_offset(),
     };
     Some((dt.timestamp(), dt.timestamp_subsec_nanos()))
+}
+
+/// A wall-clock time in the local zone.  A time the fall-back hour repeats is the earlier of
+/// its two instants, in every zone.  (GNU, through glibc `mktime`, takes the earlier one west
+/// of UTC and the later one east of it, an artefact of its first guess.)  A time the
+/// spring-forward gap skips does not exist and is rejected, as GNU rejects it.  The pair is
+/// compared by instant, since chrono's `earliest()` returns whichever offset its zone lookup
+/// listed first.
+fn local_instant(naive: &NaiveDateTime) -> Option<DateTime<Local>> {
+    match Local.from_local_datetime(naive) {
+        MappedLocalTime::Single(dt) => Some(dt),
+        MappedLocalTime::Ambiguous(a, b) => Some(a.min(b)),
+        MappedLocalTime::None => None,
+    }
 }
 
 /// Split a trailing zone off an ISO 8601 date-time: `Z`, or `+hh:mm` / `-hh:mm` after the

@@ -632,6 +632,11 @@ Debian source packages, with GNU patch's meaning:
    `-e`.
  * More than one `file` operand.  The SYNOPSIS allows exactly one.
  * With no operand, the current working directory is printed.
+ * `-s` / `--no-symlinks` — make the path absolute and remove `.` and `..`
+   by name, without following symbolic links.  As in GNU, a name followed by
+   more of the path must be a directory, and with `-e` the last name must
+   exist.  Unlike GNU, a missing directory before the last name is an error,
+   as it is without `-s`.  perl's `Configure` runs `realpath --no-symlinks`.
 
 ### rm
 

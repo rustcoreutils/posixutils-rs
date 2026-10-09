@@ -297,3 +297,114 @@ fn realpath_non_utf8_operand() {
         expected_exit_code: 0,
     });
 }
+
+/// Directory `real/sub`, a symbolic link `link -> real/sub`, and a regular
+/// file `file`, for the `-s` tests.  Returns the temp dir and its path.
+fn nosym_fixture() -> (plib::tmp::TempDir, String) {
+    let td = plib::tmp::tempdir().unwrap();
+    let base = td.path().to_str().unwrap().to_string();
+    std::fs::create_dir_all(td.path().join("real/sub")).unwrap();
+    symlink("real/sub", td.path().join("link")).unwrap();
+    std::fs::write(td.path().join("file"), b"x").unwrap();
+    (td, base)
+}
+
+// -s / --no-symlinks: a symbolic link is printed as named, not followed.
+#[test]
+fn realpath_no_symlinks_keeps_link() {
+    let (_td, base) = nosym_fixture();
+    let out = format!("{base}/link\n");
+    realpath_test(&["-s", &format!("{base}/link")], &out, "", 0);
+    realpath_test(&["--no-symlinks", &format!("{base}/link")], &out, "", 0);
+    realpath_test(&["-s", "-e", &format!("{base}/link/")], &out, "", 0);
+}
+
+// `..` removes the previous name lexically, even when that name is a link.
+#[test]
+fn realpath_no_symlinks_dotdot_is_lexical() {
+    let (_td, base) = nosym_fixture();
+    realpath_test(
+        &["-s", &format!("{base}/link/..")],
+        &format!("{base}\n"),
+        "",
+        0,
+    );
+    realpath_test(
+        &["-s", &format!("{base}/./real/../link/x")],
+        &format!("{base}/link/x\n"),
+        "",
+        0,
+    );
+    realpath_test(&["-s", "//..//../real"], "/real\n", "", 0);
+}
+
+// A relative operand is made absolute against the working directory.
+#[test]
+fn realpath_no_symlinks_relative() {
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = cwd.to_str().unwrap();
+    realpath_test(
+        &["-s", "tests/../nosuch"],
+        &format!("{cwd}/nosuch\n"),
+        "",
+        0,
+    );
+    realpath_test(&["-s", "."], &format!("{cwd}\n"), "", 0);
+    realpath_test(&["-s"], &format!("{cwd}\n"), "", 0);
+}
+
+// Every name but the last must exist, and a name followed by more of the
+// path must be a directory; -e requires the last name to exist too.
+#[test]
+fn realpath_no_symlinks_existence() {
+    let (_td, base) = nosym_fixture();
+    let p = |s: &str| format!("{base}/{s}");
+    let err = |s: &str, msg: &str| format!("realpath: {base}/{s}: {msg}\n");
+
+    realpath_test(&["-s", &p("missing")], &format!("{base}/missing\n"), "", 0);
+    realpath_test(&["-s", &p("missing/")], &format!("{base}/missing\n"), "", 0);
+    realpath_test(
+        &["-s", "-e", &p("missing")],
+        "",
+        &err("missing", "No such file or directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", "-e", &p("link/x")],
+        "",
+        &err("link/x", "No such file or directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", &p("real/missing/../file")],
+        "",
+        &err("real/missing/../file", "No such file or directory"),
+        1,
+    );
+    // GNU prints this one; a missing directory is an error here, as in -E.
+    realpath_test(
+        &["-s", &p("missing/x")],
+        "",
+        &err("missing/x", "No such file or directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", &p("file/")],
+        "",
+        &err("file/", "Not a directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", &p("file/x")],
+        "",
+        &err("file/x", "Not a directory"),
+        1,
+    );
+    realpath_test(
+        &["-s", &p("file/..")],
+        "",
+        &err("file/..", "Not a directory"),
+        1,
+    );
+    realpath_test(&["-s", "-q", &p("file/..")], "", "", 1);
+}

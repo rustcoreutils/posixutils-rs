@@ -329,6 +329,20 @@ pub fn utf8_locale() -> Option<String> {
     }
 }
 
+/// The text a utility reports when it cannot open `path`, which must not
+/// exist: the system's own words for the failed open, as
+/// [`crate::diag::io_error_text`] gives them. They differ between systems
+/// (Windows has "The system cannot find the file specified." where Unix has
+/// "No such file or directory", and another message again when a directory
+/// in the path is missing), so a test asks rather than spelling them out.
+///
+/// A relative `path` is taken from the test's own working directory.
+pub fn open_error_text(path: impl AsRef<Path>) -> String {
+    let path = path.as_ref();
+    let err = std::fs::File::open(path).expect_err(&format!("{} must not exist", path.display()));
+    crate::diag::io_error_text(&err)
+}
+
 /// Name of an installed locale matching one of `candidates`, or `None`.
 ///
 /// For tests that need a *specific* locale rather than any UTF-8 one — Turkish

@@ -24,10 +24,9 @@ const INVALID_LINE_INPUT_FILE: &str = "tests/grep/invalid_line";
 /// What grep reports for `BAD_INPUT_FILE`: the system's own text for the
 /// failed open, which differs between Unix and Windows.
 fn bad_input_file_error() -> String {
-    let err = std::fs::File::open(BAD_INPUT_FILE).expect_err("BAD_INPUT_FILE must not exist");
     format!(
         "grep: {BAD_INPUT_FILE}: {}\n",
-        plib::diag::io_error_text(&err)
+        plib::testing::open_error_text(BAD_INPUT_FILE)
     )
 }
 

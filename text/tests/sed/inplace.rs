@@ -11,7 +11,7 @@
 //! Each file edited in place is a stream of its own: its own line numbers and
 //! its own `$`, as GNU sed does.
 
-use plib::testing::{get_binary_path, run_test, TestPlan};
+use plib::testing::{get_binary_path, open_error_text, run_test, TestPlan};
 use plib::tmp::TempDir;
 use std::fs;
 use std::path::Path;
@@ -193,7 +193,10 @@ fn missing_file_is_reported_and_the_rest_edited() {
     let out = sed_in(dir.path(), &["-i", "s/a/b/", "nope", "f"]);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "sed: can't read nope: No such file or directory\n"
+        format!(
+            "sed: can't read nope: {}\n",
+            open_error_text(dir.path().join("nope"))
+        )
     );
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(get(dir.path(), "f"), "b\n");

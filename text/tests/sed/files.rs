@@ -11,7 +11,7 @@
 //! numbers run on across files, `$` is the last line of the last file, and
 //! the hold space carries over.
 
-use plib::testing::{run_test, TempFile, TestPlan};
+use plib::testing::{open_error_text, run_test, TempFile, TestPlan};
 
 fn sed_files(args: &[&str], output: &str, err: &str, code: i32) {
     run_test(TestPlan {
@@ -112,10 +112,11 @@ fn in_place_unterminated_line_owes_nothing_to_the_next_file() {
 #[test]
 fn unreadable_file_is_reported_and_skipped() {
     let f1 = TempFile::new("f1", "a\n");
+    let missing = "/nonexistent/sed-input";
     sed_files(
-        &["p", "/nonexistent/sed-input", &path(&f1)],
+        &["p", missing, &path(&f1)],
         "a\na\n",
-        "sed: can't read /nonexistent/sed-input: No such file or directory\n",
+        &format!("sed: can't read {missing}: {}\n", open_error_text(missing)),
         2,
     );
 }
@@ -126,7 +127,7 @@ fn e_after_double_dash_is_an_operand() {
     sed_files(
         &["p", "--", "-e"],
         "",
-        "sed: can't read -e: No such file or directory\n",
+        &format!("sed: can't read -e: {}\n", open_error_text("-e")),
         2,
     );
 }

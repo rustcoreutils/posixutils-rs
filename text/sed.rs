@@ -2618,7 +2618,10 @@ impl Sed {
     /// so nothing can be swapped in between the check and the read. The open
     /// does not block, so a FIFO is refused rather than waited on; a symbolic
     /// link is read through (and is then replaced by a regular file, as GNU
-    /// sed does without --follow-symlinks).
+    /// sed does without --follow-symlinks). On Windows a directory opens only
+    /// with `FILE_FLAG_BACKUP_SEMANTICS`, without which it is refused as
+    /// "Access is denied." before its type can be seen; with it, a directory
+    /// is refused here as on Unix.
     fn open_for_edit(&mut self, name: &str) -> Option<File> {
         let mut options = OpenOptions::new();
         options.read(true);
@@ -2626,6 +2629,12 @@ impl Sed {
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
         }
         let file = match options.open(name) {
             Ok(file) => file,

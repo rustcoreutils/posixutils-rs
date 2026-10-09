@@ -317,6 +317,9 @@ impl<'i, 's> Stack<'i, 's> {
         self.bp = caller_frame.bp;
         self.sp = caller_frame.sp;
         self.instructions = caller_frame.instructions;
+        self.source_locations = caller_frame.source_locations;
+        self.current_function_name = caller_frame.function_name;
+        self.current_function_file = caller_frame.function_file;
         self.ip = caller_frame.ip;
     }
 

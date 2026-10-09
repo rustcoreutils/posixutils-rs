@@ -1695,3 +1695,18 @@ fn awk_empty_rs_match_does_not_end_a_record() {
         assert_eq!(status, Some(0), "{program}");
     }
 }
+
+// A runtime error after a function call reports the caller's location.
+// Returning from a call kept the callee's table of source locations, so
+// the report indexed past its end and awk panicked instead.
+#[test]
+fn awk_runtime_error_after_a_call_reports_the_caller() {
+    let program = "function f(a, b, c, d, e) { return 1 }\nBEGIN { f(); printf(\"%z\") }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "runtime error: not enough arguments for format string\ncall trace:\n=> <start> at :2:14\n\n"
+    );
+    assert_eq!(status, Some(1));
+}

@@ -62,7 +62,7 @@ mod getopts;
 mod hash;
 mod jobs;
 mod kill;
-mod pwd;
+pub(crate) mod pwd;
 mod read;
 mod readonly;
 pub mod set;

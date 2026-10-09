@@ -3451,6 +3451,47 @@ mod audit_regressions {
         );
     }
 
+    // POSIX pwd -L uses $PWD only if it names the current working directory.
+    // The builtin checked the spelling alone, so an assignment to PWD made
+    // `pwd` print a directory the shell is not in.
+    #[test]
+    fn pwd_ignores_a_pwd_that_names_another_directory() {
+        test_script(
+            "cd $TEST_WRITE_DIR\nPWD=/\ntest \"$(pwd)\" = \"$(pwd -P)\" && echo physical\n",
+            "physical\n",
+        );
+    }
+
+    /// Run `sh -c pwd` in `dir` with `PWD` set to `pwd_value`.
+    fn startup_pwd(dir: &Path, pwd_value: &Path) -> String {
+        let out = std::process::Command::new(plib::testing::get_binary_path("sh"))
+            .args(["-c", "pwd"])
+            .current_dir(dir)
+            .env("PWD", pwd_value)
+            .output()
+            .expect("run sh");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    // XCU sh, PWD: the shell sets PWD at startup to what `pwd -P` prints only
+    // when the inherited value is not an absolute pathname of the working
+    // directory free of `.` and `..`. A valid inherited PWD reached through a
+    // symbolic link was discarded, and a stale one must still be.
+    #[test]
+    fn startup_keeps_an_inherited_pwd_only_if_it_names_the_working_directory() {
+        let tmp = plib::tmp::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink("real", &link).unwrap();
+        let physical = format!("{}\n", std::fs::canonicalize(&real).unwrap().display());
+
+        assert_eq!(startup_pwd(&link, &link), format!("{}\n", link.display()));
+        assert_eq!(startup_pwd(&link, Path::new("/")), physical);
+        assert_eq!(startup_pwd(&link, &link.join("..").join("link")), physical);
+    }
+
     // ---- Phase 10: test and [ are builtins ---------------------------------
 
     #[test]

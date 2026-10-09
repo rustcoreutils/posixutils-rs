@@ -854,3 +854,44 @@ fn a_chain_of_link_members_is_linked() {
         assert_eq!(id(name), id("f"), "{name}");
     }
 }
+
+/// A link member whose name, once linked, no longer holds the file -- taken
+/// by someone else at once -- leaves nothing this run can vouch for at its
+/// name: not the record of an earlier member there.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_link_member_whose_name_is_taken_at_once_leaves_a_tombstone() {
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let mut archive = Members(
+        vec![
+            own_member("f", EntryType::Regular, 0o644),
+            own_member("g", EntryType::Regular, 0o644),
+            link_member("f"),
+        ]
+        .into_iter(),
+    );
+    let path = tmp.path().to_path_buf();
+    let hook = move |point, _: libc::c_int, name: &CStr| {
+        if point == Point::Linked && name == c"g" {
+            std::fs::write(path.join("planted"), "planted\n").unwrap();
+            std::fs::rename(path.join("planted"), path.join("g")).unwrap();
+        }
+    };
+    race_hook::with_hook(hook, || {
+        while let Some(entry) = archive.read_entry().unwrap() {
+            let _ = extract_entry(
+                &mut archive,
+                &entry,
+                &ReadOptions::default(),
+                &mut links,
+                &tree,
+                &mut pending,
+            );
+        }
+    });
+    let g = MemberPath::parse(Path::new("g")).unwrap().unwrap().key();
+    assert!(matches!(links.made.get(&g), Some(super::Record::Failed)));
+}

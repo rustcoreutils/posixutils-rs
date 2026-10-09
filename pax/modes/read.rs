@@ -781,6 +781,12 @@ fn extract_hardlink(
         name,
         options.no_clobber,
     )?;
+    #[cfg(test)]
+    crate::modes::race_hook::reached(
+        crate::modes::race_hook::Point::Linked,
+        dirfd.as_raw_fd(),
+        name,
+    );
     // Linking it changed the file's ctime. And this name holds that file
     // now, for a later member linked to it -- unless -k left another file
     // there. Linked by name, it holds what the name held.
@@ -794,6 +800,10 @@ fn extract_hardlink(
     if holds_it {
         let shared = target.share();
         links.record_made(member.key(), shared);
+    } else if !options.no_clobber {
+        // Linked, then taken at once: nothing this run can vouch for is
+        // there. Under -k the name was left as it was, and so is its record.
+        links.tombstone(member.key());
     }
 
     Ok(())

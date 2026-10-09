@@ -262,6 +262,15 @@ impl<'i, 's> Stack<'i, 's> {
         }
     }
 
+    /// Pops the reference on top of the stack, then the scalar value under it.
+    pub(crate) fn pop_scalar_under_ref(&mut self) -> Result<(AwkValue, &mut AwkValue), String> {
+        let reference = self.pop().expect("empty stack");
+        let value = self.pop_scalar_value()?;
+        // safe by type invariance: a reference points to a variable, a field
+        // or an array element, never to the stack slots popped here
+        Ok((value, unsafe { &mut *reference.unwrap_ptr() }))
+    }
+
     pub(crate) fn pop_ref(&mut self) -> &mut AwkValue {
         // safe by type invariance
         unsafe { &mut *self.pop().expect("empty stack").unwrap_ptr() }

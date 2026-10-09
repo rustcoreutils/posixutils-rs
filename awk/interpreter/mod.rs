@@ -389,10 +389,9 @@ impl Interpreter {
                 }
             }
             BuiltinFunction::GetLineFromFile | BuiltinFunction::GetLineFromPipe => {
-                let filename = stack
-                    .pop_scalar_value()?
-                    .scalar_to_string(&global_env.convfmt)?;
-                let var = stack.pop_ref();
+                // the file or command is under the target, which is evaluated after it
+                let (filename, var) = stack.pop_scalar_under_ref()?;
+                let filename = filename.scalar_to_string(&global_env.convfmt)?;
                 let maybe_next_record = if function == BuiltinFunction::GetLineFromFile {
                     self.read_files.read_next_record(filename, &global_env.rs)
                 } else {

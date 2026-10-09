@@ -322,7 +322,7 @@ binary_expr = {
 }
 
 multidimensional_in    = { "(" ~ multidimensional_index ~ ")" ~ "in" ~ name }
-simple_binary_expr     = { prefix_op* ~ primary ~ postfix_op? ~ (infix_op ~ prefix_op* ~ primary ~ postfix_op?)* }
+simple_binary_expr     = { operand ~ (piped_getline | infix_op ~ operand)* }
 multidimensional_index = { multiple_expr_list }
 
 ternary_expr = { binary_expr ~ ("?" ~ expr ~ ":" ~ expr)? }
@@ -362,10 +362,11 @@ pow_assign = { "^=" }
 
 // Alternatives that share a prefix are factored, never retried: a choice
 // that re-parses a nested `( expr )` after a later failure makes parsing
-// time exponential in the nesting depth.  So `getline_from_pipe` and
-// `ternary_expr` also stand for the plain expression without their `|
-// getline` or `? :` tail.
-expr = { input_function }
+// time exponential in the nesting depth.  So `ternary_expr` also stands
+// for the plain expression without its `? :` tail.
+expr = { assignment | ternary_expr }
+
+operand = _{ prefix_op* ~ (getline | primary) ~ postfix_op? }
 
 lvalue = {
     array_element
@@ -381,29 +382,16 @@ lvalue = {
 field_var    = { "$" ~ (prefix_op+ ~ primary ~ postfix_op? | nested_field | primary) }
 nested_field = { field_var ~ postfix_op? }
 
-input_function = {
-    getline_from_file_cmp
-  | getline_from_pipe
-}
-
-getline_from_file_cmp = { kw ~ "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr ~ comp_op ~ expr }
-
-simple_getline    = { kw ~ "getline" ~ lvalue? }
-getline_from_file = { kw ~ "getline" ~ lvalue? ~ "<" ~ simple_getline_file_expr }
-
-simple_getline_file_expr = { prefix_op* ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op* ~ primary ~ postfix_op?)* }
-getline_from_pipe = { unpiped_expr ~ piped_getline* }
-piped_getline     = { "|" ~ kw ~ "getline" ~ lvalue? }
-
-unpiped_expr           = {
-    unpiped_input_function
-  | assignment
-  | ternary_expr
-}
-unpiped_input_function = {
-    getline_from_file
-  | simple_getline
-}
+// `getline [var] [< file]` is an operand, so `getline > 0` compares its
+// result and `getline x y` concatenates y to it.  As in gawk, the file
+// name takes no operator that binds looser than `+` and `-`: `getline <
+// "a" ".b"` is `(getline < "a") ".b"`.  `cmd | getline [var]` is an
+// operator (`piped_getline`) that binds tighter than a comparison but
+// looser than a concatenation.
+getline         = { kw ~ "getline" ~ lvalue? ~ ("<" ~ getline_file)? }
+getline_file    = { prefix_op* ~ primary ~ postfix_op? ~ (getline_file_op ~ prefix_op* ~ primary ~ postfix_op?)* }
+getline_file_op = _{ pow | mul | div | modulus | add | binary_sub }
+piped_getline   = { "|" ~ kw ~ "getline" ~ lvalue? }
 
 print_infix_op           = _{
     pow
@@ -419,9 +407,7 @@ print_infix_op           = _{
   | or
   | concat
 }
-simple_binary_print_expr =  {
-    prefix_op* ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op* ~ primary ~ postfix_op?)*
-}
+simple_binary_print_expr =  { operand ~ (print_infix_op ~ operand)* }
 binary_print_expr        =  {
     simple_binary_print_expr
   | multidimensional_in

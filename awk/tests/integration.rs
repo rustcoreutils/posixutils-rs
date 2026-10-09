@@ -1751,3 +1751,40 @@ fn awk_operand_takes_several_unary_operators() {
     assert_eq!((stdout.as_str(), stderr.as_str()), ("1 2 0 0 1 2\n", ""));
     assert_eq!(status, Some(0));
 }
+
+// getline is an operand: `getline > 0` compares its result and `getline x
+// y` concatenates y to it, where both were syntax errors (gawk's tests
+// getline, getline2, getline3 and inputred).  As in gawk, `getline < f`
+// takes no concatenation into the file name, and `cmd | getline` binds
+// tighter than a comparison but looser than a concatenation.
+#[test]
+fn awk_getline_is_an_operand() {
+    let cases = [
+        ("NR == 1 { while (getline > 0) n++; print n }", "a\nb\nc\n", "2\n"),
+        ("NR == 1 { a = (getline x y); print a, x }", "l1\nl2\n", "1 l2\n"),
+        ("NR == 1 { print (getline x - 2), x }", "a\nb\n", "-1 b\n"),
+        (
+            "BEGIN { x = getline line < \"/nonexistent\" \".txt\"; print x; print getline line < \"/nonexistent\" }",
+            "",
+            "-1.txt\n-1\n",
+        ),
+        ("BEGIN { print (getline line < \"/dev/null\" > -1) }", "", "1\n"),
+        ("BEGIN { y = 7; print (\"echo 4\" | getline x y), x }", "", "17 4\n"),
+        ("BEGIN { \"echo a\" \"b\" | getline; print }", "", "ab\n"),
+        (
+            "BEGIN { while (\"echo z\" | getline line > 0) n++; print n, line }",
+            "",
+            "1 z\n",
+        ),
+        ("BEGIN { print (\"echo 5\" | getline x + 1), x }", "", "2 5\n"),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}

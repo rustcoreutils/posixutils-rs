@@ -45,8 +45,25 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// grep - search a file for a pattern
 #[derive(Parser)]
-#[command(version, about = gettext("grep - search a file for a pattern"))]
+#[command(
+    version,
+    about = gettext("grep - search a file for a pattern"),
+    disable_help_flag = true
+)]
 struct Args {
+    // -h is --no-filename, so help is reachable as --help only.
+    #[arg(long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
+    help: Option<bool>,
+
+    #[arg(short = 'H', long, overrides_with = "no_filename", help = gettext("Precede each output line by the file name"))]
+    with_filename: bool,
+
+    #[arg(short = 'h', long, overrides_with = "with_filename", help = gettext("Never precede output lines by the file name"))]
+    no_filename: bool,
+
+    #[arg(long, allow_hyphen_values = true, help = gettext("Name standard input <LABEL> in output"))]
+    label: Option<String>,
+
     #[arg(short = 'E', long, help = gettext("Match using extended regular expressions"))]
     extended_regexp: bool,
 
@@ -207,7 +224,11 @@ impl Args {
             line_number: self.line_number,
             no_messages: self.no_messages,
             invert_match: self.invert_match,
-            multiple_inputs: self.input_files.len() > 1,
+            // -H and -h override each other, so at most one is set.
+            with_filename: self.with_filename || (!self.no_filename && self.input_files.len() > 1),
+            stdin_name: self
+                .label
+                .unwrap_or_else(|| String::from("(standard input)")),
             output_mode,
             patterns,
             input_files: self.input_files,
@@ -334,7 +355,11 @@ struct GrepModel {
     line_number: bool,
     no_messages: bool,
     invert_match: bool,
-    multiple_inputs: bool,
+    /// Whether output lines and counts carry the input's name: by default
+    /// when there is more than one input, always under -H, never under -h.
+    with_filename: bool,
+    /// What standard input is called in output: `--label`, or GNU's name.
+    stdin_name: String,
     output_mode: OutputMode,
     patterns: Patterns,
     input_files: Vec<String>,
@@ -350,7 +375,8 @@ impl GrepModel {
         for input_name in std::mem::take(&mut self.input_files) {
             if input_name == "-" {
                 let reader = Box::new(BufReader::new(io::stdin()));
-                self.process_input("(standard input)", reader);
+                let name = self.stdin_name.clone();
+                self.process_input(&name, reader);
             } else {
                 match File::open(&input_name) {
                     Ok(file) => {
@@ -416,7 +442,7 @@ impl GrepModel {
                         }
                         OutputMode::Default => {
                             let mut prefix = String::new();
-                            if self.multiple_inputs {
+                            if self.with_filename {
                                 prefix.push_str(input_name);
                                 prefix.push(':');
                             }
@@ -444,7 +470,7 @@ impl GrepModel {
             }
         }
         if let OutputMode::Count(count) = &mut self.output_mode {
-            if self.multiple_inputs {
+            if self.with_filename {
                 println!("{input_name}:{count}");
             } else {
                 println!("{count}");

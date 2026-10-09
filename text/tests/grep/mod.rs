@@ -1730,3 +1730,158 @@ fn test_line_not_valid_utf8_is_searched_in_a_utf8_locale() {
         );
     }
 }
+
+// -H (GNU) names the file on every output line, even for a single input;
+// --with-filename is its long spelling.
+#[test]
+fn test_with_filename() {
+    let named = format!("{INPUT_FILE_1}:line_{{1}}\n{INPUT_FILE_1}:line_{{70}}\n");
+    grep_test(&["-H", "^line", INPUT_FILE_1], "", &named, "", 0);
+    grep_test(
+        &["--with-filename", "^line", INPUT_FILE_1],
+        "",
+        &named,
+        "",
+        0,
+    );
+    grep_test(
+        &["-H", "-n", "^line_{7", INPUT_FILE_1],
+        "",
+        &format!("{INPUT_FILE_1}:7:line_{{70}}\n"),
+        "",
+        0,
+    );
+    grep_test(
+        &["-H", "-c", "^line", INPUT_FILE_1],
+        "",
+        &format!("{INPUT_FILE_1}:2\n"),
+        "",
+        0,
+    );
+    grep_test(
+        &["-H", "^line_{7"],
+        LINES_INPUT,
+        "(standard input):line_{70}\n",
+        "",
+        0,
+    );
+}
+
+// -h (GNU) never names the file, even for several inputs.  -h no longer means
+// --help, and of -h and -H the last one given wins.
+#[test]
+fn test_no_filename() {
+    grep_test(
+        &["-h", "^line_{7", INPUT_FILE_1, "-"],
+        LINES_INPUT,
+        "line_{70}\nline_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["--no-filename", "-n", "^line_{7", INPUT_FILE_1, "-"],
+        LINES_INPUT,
+        "7:line_{70}\n7:line_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["-h", "-c", "^line_{7", INPUT_FILE_1, "-"],
+        LINES_INPUT,
+        "1\n1\n",
+        "",
+        0,
+    );
+    grep_test(&["-Hh", "^line_{7", INPUT_FILE_1], "", "line_{70}\n", "", 0);
+    grep_test(
+        &["-hH", "^line_{7", INPUT_FILE_1],
+        "",
+        &format!("{INPUT_FILE_1}:line_{{70}}\n"),
+        "",
+        0,
+    );
+    // -l writes names whatever -h says.
+    grep_test(
+        &["-h", "-l", "^line_{7", INPUT_FILE_1],
+        "",
+        &format!("{INPUT_FILE_1}\n"),
+        "",
+        0,
+    );
+}
+
+// Help is reachable as --help only.
+#[test]
+fn test_help_is_long_only() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("grep"),
+            args: vec![String::from("--help")],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            let out = String::from_utf8_lossy(&output.stdout);
+            assert!(out.contains("--help"), "got {out:?}");
+            assert!(out.contains("-h, --no-filename"), "got {out:?}");
+            assert_eq!(output.status.code(), Some(0));
+        },
+    );
+}
+
+// --label (GNU) names standard input in prefixes and in -l and -c output.
+#[test]
+fn test_label_names_standard_input() {
+    grep_test(
+        &["--label=LBL", "-H", "^line_{7", "-"],
+        LINES_INPUT,
+        "LBL:line_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["--label", "LBL", "-H", "^line_{7"],
+        LINES_INPUT,
+        "LBL:line_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["--label=LBL", "^line_{7", "-", INPUT_FILE_1],
+        LINES_INPUT,
+        &format!("LBL:line_{{70}}\n{INPUT_FILE_1}:line_{{70}}\n"),
+        "",
+        0,
+    );
+    grep_test(
+        &["--label=LBL", "-c", "^line_{7", INPUT_FILE_1, "-"],
+        LINES_INPUT,
+        &format!("{INPUT_FILE_1}:1\nLBL:1\n"),
+        "",
+        0,
+    );
+    grep_test(
+        &["--label=LBL", "-l", "^line_{7"],
+        LINES_INPUT,
+        "LBL\n",
+        "",
+        0,
+    );
+    // A label names standard input only, and only when it is printed.
+    grep_test(
+        &["--label=LBL", "^line_{7", INPUT_FILE_1],
+        "",
+        "line_{70}\n",
+        "",
+        0,
+    );
+    grep_test(
+        &["--label=", "-H", "^line_{7"],
+        LINES_INPUT,
+        ":line_{70}\n",
+        "",
+        0,
+    );
+}

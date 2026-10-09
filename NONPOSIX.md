@@ -373,6 +373,16 @@ table is present.
  * `LANGUAGE` — a colon-separated locale priority list, honored ahead of the
    `LC_*` variables.
 
+### grep
+
+ * `-H` / `--with-filename` — precede every output line, and each `-c`
+   count, by the file name, even for a single input.
+ * `-h` / `--no-filename` — never precede them by the file name, even for
+   several inputs.  Of `-H` and `-h`, the last one given wins.  Help is
+   therefore `--help` only.
+ * `--label=LABEL` — the name standard input goes by in those prefixes and in
+   `-l` and `-c` output, in place of `(standard input)`.
+
 ### head
 
  * `-number` — the historical form of `-n number`, withdrawn from POSIX in

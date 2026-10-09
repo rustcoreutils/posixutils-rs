@@ -160,6 +160,15 @@ Deviation: `-std=` selects nothing — the language is C17 and
 spelling is taken in silence; C90 (`-ansi` included) draws a warning that
 `-Wno-c17-dialect` silences; a revision after C17 is an error.
 
+### cat
+
+ * `-v` / `--show-nonprinting` — write nonprinting bytes visibly, as GNU and
+   BSD cat do: a control character as `^X`, DEL as `^?`, and a byte above
+   127 as `M-` and the form of the byte 128 below it (`M-^I`, `M-a`).  Tab
+   and newline are written as they are.  Bytes, not characters: a UTF-8
+   sequence shows as its bytes.
+ * `-e` — `-v`, and a `$` at the end of each line.
+
 ### cflow
 
  * `.S` operands — assembler source that is preprocessed before it is

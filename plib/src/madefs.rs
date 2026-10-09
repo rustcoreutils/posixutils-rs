@@ -233,6 +233,11 @@ pub enum FoundDir {
 /// Who owns the directory found proves nothing. Giving such a directory a mode would open it
 /// up; giving it an owner would give it away.
 ///
+/// Root working for a user -- extracting into `/home/alice`, which alice owns -- also trusts
+/// the directories of that one user, below its own: alice can create names there, but only in
+/// her own tree, which the copy is for. One user only, owning every directory from the first
+/// one not root's down, and none others can write (`dir_writers`).
+///
 /// So the trust is carried down the chain, one directory at a time, from descriptors: the
 /// anchor hands it to its entries when nobody else can create entries in it (`anchor`); a
 /// directory found existing hands it on when it was handed it and nobody else can create
@@ -362,6 +367,14 @@ impl NamedAnchor {
     }
 }
 
+/// Where the directory of a `ChainTrust` link stands: below the anchor the user named (`anchor`,
+/// `found`), or one the caller made and verified (`made`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChainStart {
+    Anchor,
+    Made,
+}
+
 /// One directory of a `ChainTrust`.
 struct Link {
     /// What the directory this one is in hands it; `None` where a chain starts (`anchor`,
@@ -369,6 +382,10 @@ struct Link {
     above: Option<ChainTrust>,
     /// Who else can create entries in it, from its `fstat`.
     writers: DirWriters,
+    /// The one user other than root that the chain has gone into the directories of, root
+    /// being the effective user (`dir_writers`): from then on, every directory must be theirs.
+    /// `None` while every directory has been the effective user's.
+    owner: Option<u32>,
     /// The directory, for its ACL; `None` for `unlocated`.
     dir: Option<Weak<dyn AsRawFd>>,
     /// Whether directories found existing in this one may take what was asked for, once
@@ -401,14 +418,35 @@ impl std::fmt::Debug for ChainTrust {
 
 impl ChainTrust {
     /// The link for the directory held as `dir`, below `above`.
-    fn link<T: AsRawFd + 'static>(above: Option<ChainTrust>, dir: &Rc<T>) -> io::Result<Self> {
-        let euid = unsafe { libc::geteuid() };
-        let writers = dir_writers(&fstat(dir.as_raw_fd())?, euid);
+    fn link<T: AsRawFd + 'static>(
+        above: Option<ChainTrust>,
+        dir: &Rc<T>,
+        start: ChainStart,
+    ) -> io::Result<Self> {
+        Self::link_as(above, dir, start, unsafe { libc::geteuid() })
+    }
+
+    /// `link`, the effective user being `euid`.
+    fn link_as<T: AsRawFd + 'static>(
+        above: Option<ChainTrust>,
+        dir: &Rc<T>,
+        start: ChainStart,
+        euid: u32,
+    ) -> io::Result<Self> {
+        let above_owner = above.as_ref().and_then(|ChainTrust(link)| link.owner);
+        let writers = dir_writers(&fstat(dir.as_raw_fd())?, euid, above_owner, start);
+        let owner = match writers {
+            DirWriters::Owner { uid } | DirWriters::OwnerAndGroup { uid, .. } if uid != euid => {
+                Some(uid)
+            }
+            _ => above_owner,
+        };
         let dir: Weak<T> = Rc::downgrade(dir);
         let dir: Weak<dyn AsRawFd> = dir;
         Ok(ChainTrust(Rc::new(Link {
             above,
             writers,
+            owner,
             dir: Some(dir),
             entries_safe: OnceCell::new(),
         })))
@@ -417,7 +455,7 @@ impl ChainTrust {
     /// The trust the anchor -- the directory the user named, held as `dir` -- hands its
     /// entries.
     pub fn anchor<T: AsRawFd + 'static>(dir: &Rc<T>) -> io::Result<Self> {
-        Self::link(None, dir)
+        Self::link(None, dir, ChainStart::Anchor)
     }
 
     /// The trust handed where the caller cannot tell which directory a directory found is in --
@@ -426,6 +464,7 @@ impl ChainTrust {
         ChainTrust(Rc::new(Link {
             above: None,
             writers: DirWriters::Others,
+            owner: None,
             dir: None,
             entries_safe: OnceCell::from(false),
         }))
@@ -434,13 +473,13 @@ impl ChainTrust {
     /// The trust a directory found existing, held as `dir`, in a directory that handed it
     /// `self`, hands its own entries.
     pub fn found<T: AsRawFd + 'static>(&self, dir: &Rc<T>) -> io::Result<Self> {
-        Self::link(Some(self.clone()), dir)
+        Self::link(Some(self.clone()), dir, ChainStart::Anchor)
     }
 
     /// The trust a directory the caller made and verified (`verify_made_dir`), held as `dir`,
     /// hands its entries, wherever it is.
     pub fn made<T: AsRawFd + 'static>(dir: &Rc<T>) -> io::Result<Self> {
-        Self::link(None, dir)
+        Self::link(None, dir, ChainStart::Made)
     }
 
     /// The anchor for a directory the user named as `path`, opened (following links, as named)
@@ -529,17 +568,34 @@ impl Link {
 /// Who can create entries in a directory, as far as its `fstat` shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DirWriters {
-    /// The effective user alone: it is theirs and grants no group or other write permission.
-    User,
+    /// Its owner `uid` alone -- the effective user, or the one user root is working in the tree
+    /// of (`dir_writers`): it grants no group or other write permission.
+    Owner { uid: u32 },
     /// Someone else too: it is someone else's, or grants other write permission.
     Others,
-    /// The user, and members of its group `gid`: it is the user's (`euid`), grants group write
-    /// permission and no other. Nobody else when that group is the user's private one and no
-    /// ACL names anyone else (`nobody_else_can_create`).
-    UserAndGroup { gid: u32, euid: u32 },
+    /// Its owner `uid`, and members of its group `gid`: it grants group write permission and no
+    /// other. Nobody else when that group is the owner's private one and no ACL names anyone
+    /// else (`only_the_user_writes`).
+    OwnerAndGroup { uid: u32, gid: u32 },
 }
 
-/// `DirWriters` for the directory `st`, the effective user being `euid`.
+/// `DirWriters` for the directory `st`, the effective user being `euid`, in a chain that has
+/// gone into the directories of the user `above_owner` (`Link::owner`), where it stands as
+/// `start`.
+///
+/// A directory may be its owner's alone only where its owner is someone the trust can rest
+/// with:
+/// - the effective user, while the chain has gone into no other user's directories;
+/// - for root, one user other than root, the one the copy or extraction is for -- root
+///   extracting into `/home/alice`, which alice owns, with the directories a umask of 002 left
+///   below it. That user is the owner of the first directory in the chain not root's own, and
+///   must own every directory below it: root's own, or a third user's, below it is mixed in,
+///   and others than its owner could have created its name. A directory the caller made and
+///   verified (`ChainStart::Made`) starts no such chain: it is root's own, or the owner it was
+///   given since, which proves nothing about who could create entries in it.
+///
+/// Anyone else, a sticky directory included, counts as others. So does a non-root effective
+/// user meeting a directory not theirs: nobody but root acts for another user.
 ///
 /// Not the rule `others_can_rename` follows, on purpose. That one asks whether someone could
 /// have renamed something over a directory the caller has just made, and the sticky bit stops
@@ -548,19 +604,29 @@ enum DirWriters {
 /// stops nobody creating a new name. Nor does `others_can_rename` make an exception for the
 /// user's private group: where it says yes, the directory just made is verified anyway
 /// (`verify_made_dir`), with no lookup.
-fn dir_writers(st: &libc::stat, euid: u32) -> DirWriters {
+fn dir_writers(
+    st: &libc::stat,
+    euid: u32,
+    above_owner: Option<u32>,
+    start: ChainStart,
+) -> DirWriters {
     // Cast needed: `mode_t` is u16 on macOS and u32 on Linux. S_IWGRP is 0o020 and S_IWOTH
     // 0o002 (fixed by POSIX).
     #[allow(clippy::unnecessary_cast)]
     let mode = st.st_mode as u32;
-    if st.st_uid != euid || mode & 0o002 != 0 {
+    let uid = st.st_uid;
+    let trusted_owner = match above_owner {
+        Some(owner) => uid == owner,
+        None => uid == euid || (euid == 0 && uid != 0 && start == ChainStart::Anchor),
+    };
+    if !trusted_owner || mode & 0o002 != 0 {
         DirWriters::Others
     } else if mode & 0o020 == 0 {
-        DirWriters::User
+        DirWriters::Owner { uid }
     } else {
-        DirWriters::UserAndGroup {
+        DirWriters::OwnerAndGroup {
+            uid,
             gid: st.st_gid,
-            euid,
         }
     }
 }
@@ -570,18 +636,19 @@ fn dir_writers(st: &libc::stat, euid: u32) -> DirWriters {
 fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
     let euid = unsafe { libc::geteuid() };
     Ok(only_the_user_writes(
-        dir_writers(&fstat(fd)?, euid),
+        dir_writers(&fstat(fd)?, euid, None, ChainStart::Anchor),
         Some(fd),
     ))
 }
 
-/// Whether nobody but the effective user can create entries in a directory whose mode shows
-/// `writers`, held as `dir` (`None` once its holder has closed it, which settles nothing and so
-/// counts as others'): the rule `ChainTrust` follows.
+/// Whether nobody but the effective user -- or, for root, the one user whose tree it is working
+/// in (`dir_writers`) -- can create entries in a directory whose mode shows `writers`, held as
+/// `dir` (`None` once its holder has closed it, which settles nothing and so counts as
+/// others'): the rule `ChainTrust` follows. "The user" below is that owner.
 ///
 /// The directory must be the user's and grant no other write permission, and no group write
-/// permission either unless its group is the user's private group (`is_private_group`) -- the
-/// user's alone, so the directories a umask of 002 leaves group-writable, as Debian-style user
+/// permission either unless its group is the user's private group (`is_private_group`, asked
+/// of the directory's owner) -- the user's alone, so the directories a umask of 002 leaves group-writable, as Debian-style user
 /// private groups intend, count as the user's; and no ACL it carries may let others write
 /// (`acls_let_others_write`: POSIX, NFSv4 and CIFS ACLs on Linux), read last, only when the
 /// rest says the user's. A sticky directory others may write counts as one they can create
@@ -596,8 +663,8 @@ fn only_the_user_writes(writers: DirWriters, dir: Option<RawFd>) -> bool {
     };
     match writers {
         DirWriters::Others => false,
-        DirWriters::User => acls_allow(false),
-        DirWriters::UserAndGroup { gid, euid } => is_private_group(gid, euid) && acls_allow(true),
+        DirWriters::Owner { .. } => acls_allow(false),
+        DirWriters::OwnerAndGroup { uid, gid } => is_private_group(gid, uid) && acls_allow(true),
     }
 }
 
@@ -1059,8 +1126,8 @@ mod tests {
     use super::{
         acl_names_others, acls_let_others_write, dir_writers, empty_lending_read, group_entry,
         group_is_private, is_private_group, made_by_us, others_can_rename, read_private_group,
-        user_entry, utimens_link_if_still, verify_made_dir, ChainTrust, DirWriters, FoundDir,
-        FsOwners, MadeObject, MadeTrust, Preserve, UserEntry,
+        user_entry, utimens_link_if_still, verify_made_dir, ChainStart, ChainTrust, DirWriters,
+        FoundDir, FsOwners, MadeObject, MadeTrust, Preserve, UserEntry,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -1080,11 +1147,12 @@ mod tests {
     /// entries beside it.
     #[test]
     fn who_can_create_in_a_parent() {
-        use DirWriters::{Others, User, UserAndGroup};
-        let group = |gid, euid| UserAndGroup { gid, euid };
+        use DirWriters::{Others, Owner, OwnerAndGroup};
+        let dir_writers = |st: &libc::stat, euid| dir_writers(st, euid, None, ChainStart::Anchor);
+        let group = |gid, uid| OwnerAndGroup { uid, gid };
         // Nobody but the user can.
-        assert_eq!(dir_writers(&parent(US, 0o755), US), User);
-        assert_eq!(dir_writers(&parent(0, 0o755), 0), User);
+        assert_eq!(dir_writers(&parent(US, 0o755), US), Owner { uid: US });
+        assert_eq!(dir_writers(&parent(0, 0o755), 0), Owner { uid: 0 });
         // A sticky directory others may write -- /tmp, root extracting into it too.
         assert_eq!(dir_writers(&parent(US, 0o1777), US), Others);
         assert_eq!(dir_writers(&parent(0, 0o1777), 0), Others);
@@ -1101,6 +1169,126 @@ mod tests {
         // Someone else's directory: its owner can.
         assert_eq!(dir_writers(&parent(OTHER, 0o755), US), Others);
         assert_eq!(dir_writers(&parent(OTHER, 0o775), US), Others);
+    }
+
+    /// Root copying or extracting for a user, into a tree that user owns -- `/home/alice`,
+    /// with the directories a umask of 002 leaves below it -- trusts it as the user's own: one
+    /// owner, not root, owning every directory from the anchor (or below root's own) down,
+    /// none of them writable by others. The test user stands for that user here, and root's
+    /// view is taken by asking as euid 0.
+    #[test]
+    fn root_trusts_a_tree_one_other_user_owns_alone() {
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            eprintln!("note: run as root, the test user cannot stand for another user; skipped");
+            return;
+        }
+        let tmp = crate::tmp::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("x/y")).unwrap();
+        std::fs::create_dir_all(root.join("open/z")).unwrap();
+        for (dir, mode) in [("", 0o755), ("x", 0o755), ("x/y", 0o755), ("open", 0o777)] {
+            let path = root.join(dir);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let mode = Preserve {
+            mode: true,
+            owner: true,
+        };
+        let fd = |path: &str| Rc::new(std::fs::File::open(root.join(path)).unwrap());
+        let (root_fd, x_fd, y_fd, open_fd) = (fd(""), fd("x"), fd("x/y"), fd("open"));
+        let slash = Rc::new(std::fs::File::open("/").unwrap());
+        let as_root = |above: Option<&ChainTrust>, dir: &Rc<std::fs::File>| {
+            ChainTrust::link_as(above.cloned(), dir, ChainStart::Anchor, 0).unwrap()
+        };
+
+        // The user's own tree, from the anchor down.
+        let anchor = as_root(None, &root_fd);
+        let x = as_root(Some(&anchor), &x_fd);
+        assert_eq!(anchor.found_dir(mode), FoundDir::AsRequested);
+        assert_eq!(x.found_dir(mode), FoundDir::AsRequested);
+        // Below root's own directory too: `/` stands for `/home`.
+        let home = as_root(None, &slash);
+        let below_home = as_root(Some(&home), &root_fd);
+        assert_eq!(below_home.found_dir(mode), FoundDir::AsRequested);
+        // A directory others can write, owned by the user or not, is refused.
+        let open = as_root(Some(&anchor), &open_fd);
+        assert_eq!(open.found_dir(mode), FoundDir::LeaveAlone);
+        // Root's own directory below the user's is mixed in: the user can rename it there.
+        let mixed = as_root(Some(&x), &slash);
+        assert_eq!(mixed.found_dir(mode), FoundDir::LeaveAlone);
+        // A directory the caller made and verified that has become the user's is not a point
+        // to start trusting the user from.
+        let made = ChainTrust::link_as(None, &y_fd, ChainStart::Made, 0).unwrap();
+        assert_eq!(made.found_dir(mode), FoundDir::LeaveAlone);
+        // Group write permission counts as the user's only for the user's own private group.
+        if let Some(gid) = crate::testing::user_private_group() {
+            std::fs::set_permissions(root.join("x"), std::fs::Permissions::from_mode(0o775))
+                .unwrap();
+            assert_eq!(x_fd.metadata().unwrap().gid(), gid);
+            let anchor = as_root(None, &root_fd);
+            let x = as_root(Some(&anchor), &x_fd);
+            assert_eq!(x.found_dir(mode), FoundDir::AsRequested);
+        } else {
+            eprintln!("note: no user private group here; group-writable case skipped");
+        }
+        // Anyone but root asks for directories that are their own, as before.
+        let other = ChainTrust::link_as(None, &root_fd, ChainStart::Anchor, me + 1).unwrap();
+        assert_eq!(other.found_dir(mode), FoundDir::LeaveAlone);
+    }
+
+    /// Below a directory owned by one user other than root, only that user's directories
+    /// continue the chain: another user's, or root's, are mixed in.
+    #[test]
+    fn root_trusts_no_mixed_owners() {
+        use DirWriters::{Others, Owner, OwnerAndGroup};
+        // Root's own, at the top.
+        assert_eq!(
+            dir_writers(&parent(0, 0o755), 0, None, ChainStart::Anchor),
+            Owner { uid: 0 }
+        );
+        // One user's, below root's or at the top.
+        assert_eq!(
+            dir_writers(&parent(US, 0o755), 0, None, ChainStart::Anchor),
+            Owner { uid: US }
+        );
+        assert_eq!(
+            dir_writers(&parent(US, 0o755), 0, Some(US), ChainStart::Anchor),
+            Owner { uid: US }
+        );
+        let mut st = parent(US, 0o775);
+        st.st_gid = 4242;
+        assert_eq!(
+            dir_writers(&st, 0, Some(US), ChainStart::Anchor),
+            OwnerAndGroup { uid: US, gid: 4242 }
+        );
+        // Another user's below the first one's, or root's below either.
+        assert_eq!(
+            dir_writers(&parent(OTHER, 0o755), 0, Some(US), ChainStart::Anchor),
+            Others
+        );
+        assert_eq!(
+            dir_writers(&parent(0, 0o755), 0, Some(US), ChainStart::Anchor),
+            Others
+        );
+        // Not where a made directory starts a chain, and never for anyone but root.
+        assert_eq!(
+            dir_writers(&parent(US, 0o755), 0, None, ChainStart::Made),
+            Others
+        );
+        assert_eq!(
+            dir_writers(&parent(US, 0o755), OTHER, None, ChainStart::Anchor),
+            Others
+        );
+        // Others' write permission, the user's tree or not.
+        assert_eq!(
+            dir_writers(&parent(US, 0o757), 0, Some(US), ChainStart::Anchor),
+            Others
+        );
+        assert_eq!(
+            dir_writers(&parent(US, 0o1777), 0, None, ChainStart::Anchor),
+            Others
+        );
     }
 
     /// A group is the user's private one, by the user-private-group convention, only when it

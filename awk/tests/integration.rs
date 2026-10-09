@@ -1359,3 +1359,27 @@ fn awk_empty_match_at_end_is_counted_once() {
         });
     }
 }
+
+// An empty match of a field separator does not separate fields, in split()
+// and in FS alike, as in gawk and mawk: split("abc", a, /x*/) is one field,
+// and /b*/ splits "abc" only at the "b".
+#[test]
+fn awk_empty_separator_match_does_not_split() {
+    let cases = [
+        ("{ n = split($0, a, /x*/); print n, a[1] }", "1 abc\n"),
+        ("{ n = split($0, a, /b*/); print n, a[1], a[2] }", "2 a c\n"),
+        ("{ n = split($0, a, /$/); print n, a[1] }", "1 abc\n"),
+        ("BEGIN { FS = \"b*\" } { print NF, $1, $2 }", "2 a c\n"),
+        ("BEGIN { FS = \"x*\" } { print NF, $1 }", "1 abc\n"),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from("abc\n"),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

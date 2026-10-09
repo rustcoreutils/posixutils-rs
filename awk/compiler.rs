@@ -21,7 +21,6 @@ use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest::Parser;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::hash::Hash;
 use std::rc::Rc;
 use std::sync::LazyLock;
@@ -614,7 +613,8 @@ impl Compiler {
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::ere => {
-                let ere_c_str = CString::new(primary.as_str().trim_matches('/')).unwrap();
+                let ere_c_str = crate::charset::to_cstring(primary.as_str().trim_matches('/'))
+                    .map_err(|e| pest_error_from_span(primary.as_span(), e))?;
                 let regex = Regex::new(ere_c_str)
                     .map_err(|e| pest_error_from_span(primary.as_span(), e))?;
                 let index = self.push_constant(Constant::Regex(Rc::new(regex)));

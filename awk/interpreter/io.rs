@@ -8,13 +8,16 @@
 //
 use std::{
     collections::{hash_map::Entry, HashMap},
-    ffi::CString,
+    ffi::{CString, OsStr},
     fs::File,
     io::{BufReader, Bytes, Read, Write},
+    os::unix::ffi::OsStrExt,
+    path::PathBuf,
     rc::Rc,
 };
 
 use super::string::AwkString;
+use crate::charset;
 use crate::regex::Regex;
 
 pub enum RecordSeparator {
@@ -52,14 +55,14 @@ macro_rules! read_iter_next {
     };
 }
 
-/// Convert bytes to String, trying UTF-8 first, falling back to Latin-1.
-/// Latin-1 maps each byte 0x00-0xFF to the corresponding Unicode code point,
-/// so it preserves byte values faithfully for single-byte encodings.
+/// The awk string for the bytes of a record.
 fn bytes_to_string(buf: Vec<u8>) -> String {
-    match String::from_utf8(buf) {
-        Ok(s) => s,
-        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
-    }
+    charset::decode(buf)
+}
+
+/// The path awk opens for the file name `name`.
+fn path_of(name: &str) -> PathBuf {
+    PathBuf::from(OsStr::from_bytes(&charset::encode(name)))
 }
 
 /// Try to find a regex match in the byte buffer. Returns the record before
@@ -68,9 +71,8 @@ fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, Vec<u8>)>, St
     if buf.is_empty() {
         return Ok(None);
     }
-    let input = std::str::from_utf8(buf).map_err(|e| e.to_string())?;
-    if let Some(m) = re.find_first(input) {
-        let record = input[..m.start].to_string();
+    if let Some(m) = re.find_bytes(buf) {
+        let record = bytes_to_string(buf[..m.start].to_vec());
         let remainder = buf[m.end..].to_vec();
         Ok(Some((record, remainder)))
     } else {
@@ -217,7 +219,7 @@ pub struct FileStream {
 
 impl FileStream {
     pub fn open(path: &str) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
+        let file = File::open(path_of(path)).map_err(|e| e.to_string())?;
         let reader = BufReader::new(file);
         Ok(Self {
             bytes: reader.bytes(),
@@ -332,7 +334,7 @@ impl WriteFiles {
         match self.files.entry(filename.to_string()) {
             Entry::Occupied(mut e) => {
                 e.get_mut()
-                    .write_all(contents.as_bytes())
+                    .write_all(&charset::encode(contents))
                     .map_err(|e| e.to_string())?;
             }
             Entry::Vacant(e) => {
@@ -341,9 +343,9 @@ impl WriteFiles {
                     .create(true)
                     .truncate(!append)
                     .append(append)
-                    .open(filename)
+                    .open(path_of(filename))
                     .map_err(|e| e.to_string())?;
-                file.write_all(contents.as_bytes())
+                file.write_all(&charset::encode(contents))
                     .map_err(|e| e.to_string())?;
                 e.insert(file);
             }
@@ -492,7 +494,7 @@ pub struct PipeRecordReader {
 
 impl PipeRecordReader {
     pub fn open(command: &str) -> Result<Self, String> {
-        let command = CString::new(command).map_err(|e| e.to_string())?;
+        let command = charset::to_cstring(command)?;
         let file = unsafe {
             let file = libc::popen(command.as_ptr(), c"r".as_ptr());
             if file.is_null() {

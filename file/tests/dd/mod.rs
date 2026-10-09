@@ -611,3 +611,50 @@ fn test_sigint_reports_stats_and_signal_death() {
         "statistics must still be written before dying, got {stderr:?}"
     );
 }
+
+/// XCU dd, of=: with seek= and without conv=notrunc, the blocks dd seeks over
+/// are preserved and nothing else is; with empty input the file's size is set
+/// to the seek offset. dd only opened without O_TRUNC and seeked, so an empty
+/// input left a new file empty and an existing one at its old size.
+#[test]
+fn test_seek_sets_output_size_unless_notrunc() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let out = dir.path().join("out");
+    let of = format!("of={}", out.to_str().unwrap());
+    let old: Vec<u8> = (0..10_000u32).map(|n| (n % 251) as u8).collect();
+    let size = || std::fs::metadata(&out).unwrap().len();
+
+    // New file, empty input: extended (sparse) to the seek offset.
+    let (_, err, code) = run_dd(&["bs=512", "seek=8", "if=/dev/null", &of], b"");
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(size(), 4096);
+    assert!(std::fs::read(&out).unwrap().iter().all(|&b| b == 0));
+
+    // Existing longer file, empty input: shortened to the seek offset, with
+    // the blocks seeked over preserved.
+    std::fs::write(&out, &old).unwrap();
+    let (_, err, code) = run_dd(&["bs=512", "seek=8", "if=/dev/null", &of], b"");
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(std::fs::read(&out).unwrap(), &old[..4096]);
+
+    // Existing longer file, short input: seek plus input, nothing after.
+    std::fs::write(&out, &old).unwrap();
+    let (_, err, code) = run_dd(&["bs=512", "seek=2", &of], b"xyz");
+    assert_eq!(code, Some(0), "{err}");
+    let mut want = old[..1024].to_vec();
+    want.extend_from_slice(b"xyz");
+    assert_eq!(std::fs::read(&out).unwrap(), want);
+
+    // conv=notrunc: neither shortened nor extended.
+    std::fs::write(&out, &old).unwrap();
+    let args = ["bs=512", "seek=40", "conv=notrunc", "if=/dev/null", &of];
+    let (_, err, code) = run_dd(&args, b"");
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(std::fs::read(&out).unwrap(), old);
+
+    let (_, err, code) = run_dd(&["bs=512", "seek=2", "conv=notrunc", &of], b"xyz");
+    assert_eq!(code, Some(0), "{err}");
+    let mut want = old.clone();
+    want[1024..1027].copy_from_slice(b"xyz");
+    assert_eq!(std::fs::read(&out).unwrap(), want);
+}

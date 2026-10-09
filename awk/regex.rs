@@ -7,11 +7,17 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::charset;
 use plib::regex::{Match, Regex as PlibRegex, RegexFlags};
+use std::borrow::Cow;
 use std::ffi::CString;
 
 /// A regex wrapper that provides CString-compatible API for AWK.
 /// Internally uses plib::regex for POSIX ERE support.
+///
+/// Patterns and subjects reach `regexec` as the bytes awk would write for
+/// them (see [`crate::charset`]), so in a single-byte locale a character is
+/// a byte to the regular expression as well.
 pub struct Regex {
     inner: PlibRegex,
     pattern_string: String,
@@ -33,45 +39,67 @@ impl From<Match> for RegexMatch {
     }
 }
 
-/// Iterator over regex matches in a string.
-/// Owns the input CString to preserve lifetimes.
+/// Iterator over regex matches in a string, giving offsets into that string.
 pub struct MatchIter<'re> {
-    // Store the string as owned String to avoid lifetime issues
-    string: String,
+    /// The subject as `regexec` sees it.
+    bytes: Vec<u8>,
+    /// For a subject whose bytes are not its own UTF-8 (a non-ASCII string in
+    /// a single-byte locale, where each character is one byte): the string
+    /// offset of each byte, and of the end.
+    string_offsets: Option<Vec<usize>>,
     next_start: usize,
     regex: &'re Regex,
+}
+
+impl MatchIter<'_> {
+    fn string_offset(&self, pos: usize) -> usize {
+        match &self.string_offsets {
+            Some(offsets) => offsets[pos],
+            None => pos,
+        }
+    }
+
+    /// The offset just past the character that starts at `pos` in `bytes`.
+    fn next_char(&self, pos: usize) -> usize {
+        let mut next = pos + 1;
+        if !charset::single_byte() {
+            // UTF-8: skip continuation bytes.
+            while next < self.bytes.len() && (self.bytes[next] & 0xc0) == 0x80 {
+                next += 1;
+            }
+        }
+        next
+    }
 }
 
 impl Iterator for MatchIter<'_> {
     type Item = RegexMatch;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_start > self.string.len() {
+        if self.next_start > self.bytes.len() {
             return None;
         }
 
         // Find match starting from current offset
-        let substring = &self.string[self.next_start..];
+        let subject = &self.bytes[self.next_start..];
         let m = if self.next_start == 0 {
-            self.regex.inner.find(substring)?
+            self.regex.inner.find_bytes(subject)?
         } else {
-            self.regex.inner.find_notbol(substring)?
+            self.regex.inner.find_notbol_bytes(subject)?
         };
 
+        let start = self.next_start + m.start;
+        let end = self.next_start + m.end;
         let result = RegexMatch {
-            start: self.next_start + m.start,
-            end: self.next_start + m.end,
+            start: self.string_offset(start),
+            end: self.string_offset(end),
         };
 
         // Move past this match for next iteration
         // Ensure we make progress even on zero-width matches
         self.next_start = if m.end > 0 {
-            self.next_start + m.end
+            end
         } else {
-            let mut next = self.next_start + 1;
-            while next < self.string.len() && !self.string.is_char_boundary(next) {
-                next += 1;
-            }
-            next
+            self.next_char(self.next_start)
         };
 
         Some(result)
@@ -79,29 +107,40 @@ impl Iterator for MatchIter<'_> {
 }
 
 impl Regex {
+    /// Compile the pattern whose bytes are `regex`.
     pub fn new(regex: CString) -> Result<Self, String> {
-        let pattern = regex.to_str().map_err(|e| e.to_string())?;
-        let inner = PlibRegex::new(pattern, RegexFlags::ere()).map_err(|e| e.to_string())?;
+        let bytes = regex.into_bytes();
+        let inner = PlibRegex::new_bytes(&bytes, RegexFlags::ere()).map_err(|e| e.to_string())?;
         Ok(Self {
             inner,
-            pattern_string: pattern.to_string(),
+            pattern_string: charset::decode(bytes),
         })
     }
 
-    /// Returns the first match location in the string, or `None`.
-    /// Delegates to `PlibRegex::find` which handles CString conversion internally.
-    pub fn find_first(&self, string: &str) -> Option<RegexMatch> {
-        self.inner.find(string).map(RegexMatch::from)
+    /// Returns the first match location in the raw input bytes `bytes`, as
+    /// byte offsets.
+    pub fn find_bytes(&self, bytes: &[u8]) -> Option<RegexMatch> {
+        self.inner.find_bytes(bytes).map(RegexMatch::from)
     }
 
-    /// Returns an iterator over all match locations in the string.
-    /// Takes ownership of the CString.
-    pub fn match_locations(&self, string: CString) -> MatchIter<'_> {
-        let s = string.into_string().unwrap_or_default();
+    /// Returns an iterator over all match locations in `string`.
+    pub fn match_locations(&self, string: &str) -> MatchIter<'_> {
+        let bytes = charset::encode(string);
+        let string_offsets = match bytes {
+            Cow::Borrowed(_) => None,
+            Cow::Owned(_) => Some(
+                string
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain([string.len()])
+                    .collect(),
+            ),
+        };
         MatchIter {
+            bytes: bytes.into_owned(),
+            string_offsets,
             next_start: 0,
             regex: self,
-            string: s,
         }
     }
 
@@ -109,9 +148,9 @@ impl Regex {
         &self.pattern_string
     }
 
+    /// Whether the regular expression matches the bytes of `string`.
     pub fn matches(&self, string: &CString) -> bool {
-        let s = string.to_str().unwrap_or("");
-        self.inner.is_match(s)
+        self.inner.is_match_bytes(string.as_bytes())
     }
 }
 
@@ -161,7 +200,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn test_regex_match_locations() {
         let ere = regex_from_str("match");
-        let mut iter = ere.match_locations(CString::new("match 12345 match2 matchmatch").unwrap());
+        let mut iter = ere.match_locations("match 12345 match2 matchmatch");
         assert_eq!(iter.next(), Some(RegexMatch { start: 0, end: 5 }));
         assert_eq!(iter.next(), Some(RegexMatch { start: 12, end: 17 }));
         assert_eq!(iter.next(), Some(RegexMatch { start: 19, end: 24 }));

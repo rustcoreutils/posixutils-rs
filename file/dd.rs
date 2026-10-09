@@ -364,6 +364,15 @@ impl Write for OutputFile {
 }
 
 impl OutputFile {
+    /// Set a regular output file's size to `len`. Anything else (standard
+    /// output, a device, a FIFO) has no size to set and is left alone.
+    fn truncate_regular(&mut self, len: u64) -> io::Result<()> {
+        match self {
+            OutputFile::File(f) if f.metadata()?.is_file() => f.set_len(len),
+            _ => Ok(()),
+        }
+    }
+
     fn try_seek(&mut self, pos: SeekFrom) -> io::Result<bool> {
         match self {
             OutputFile::Stdout(_) => Ok(false),
@@ -445,6 +454,13 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
     // Handle seek (output positioning)
     if config.seek > 0 {
         let seek_bytes = config.seek * config.obs;
+        // POSIX: without conv=notrunc, the blocks seeked over are preserved
+        // and no other part of the output file is; with empty input the size
+        // becomes the seek offset. Cutting (or extending) the file at the
+        // seek point does both, before the copy rewrites what follows it.
+        if !config.notrunc {
+            ofile.truncate_regular(seek_bytes as u64)?;
+        }
         // Try to seek first
         if !ofile.try_seek(SeekFrom::Start(seek_bytes as u64))? {
             // Non-seekable: write null bytes

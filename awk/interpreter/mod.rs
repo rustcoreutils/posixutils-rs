@@ -22,15 +22,16 @@ use stack::{
 use string::AwkString;
 use value::{AwkRefType, AwkValue, AwkValueRef, AwkValueVariant};
 
+use crate::charset;
 use crate::compiler::{escape_string_contents, is_valid_number};
 use crate::program::{
     Action, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar,
 };
 use crate::regex::Regex;
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fmt::Write;
 use std::iter;
+use std::os::unix::ffi::OsStringExt;
 use std::rc::Rc;
 use std::time::SystemTime;
 
@@ -160,13 +161,13 @@ impl GlobalEnv {
                 let escaped = ere_escape_char(*c as char);
                 let pattern = format!("\n|{}", escaped);
                 Some(FieldSeparator::Ere(Rc::new(Regex::new(
-                    CString::new(pattern).map_err(|e| e.to_string())?,
+                    charset::to_cstring(&pattern)?,
                 )?)))
             }
             FieldSeparator::Ere(re) => {
                 let pattern = format!("\n|{}", re.pattern());
                 Some(FieldSeparator::Ere(Rc::new(Regex::new(
-                    CString::new(pattern).map_err(|e| e.to_string())?,
+                    charset::to_cstring(&pattern)?,
                 )?)))
             }
         };
@@ -871,8 +872,11 @@ pub fn interpret(
         }))
         .collect();
 
-    let env = std::env::vars()
-        .map(|(k, v)| (k, maybe_numeric_string(v)))
+    let env = std::env::vars_os()
+        .map(|(k, v)| {
+            let k = charset::decode(k.into_vec());
+            (k, maybe_numeric_string(charset::decode(v.into_vec())))
+        })
         .collect();
 
     let mut stack = iter::repeat_with(|| StackValue::Invalid)

@@ -131,12 +131,8 @@ impl TryInto<CString> for AwkString {
 
     fn try_into(self) -> Result<CString, Self::Error> {
         match self.value {
-            AwkStringVariant::Owned(value) => {
-                CString::new(value).map_err(|_| "invalid string".to_string())
-            }
-            AwkStringVariant::Shared(value) => {
-                CString::new(value.as_bytes()).map_err(|_| "invalid string".to_string())
-            }
+            AwkStringVariant::Owned(value) => crate::charset::to_cstring(&value),
+            AwkStringVariant::Shared(value) => crate::charset::to_cstring(&value),
         }
     }
 }

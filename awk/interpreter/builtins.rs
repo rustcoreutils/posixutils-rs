@@ -126,16 +126,10 @@ fn format_one_conversion(
         }
         'c' => {
             let ch = match &value.value {
-                AwkValueVariant::Number(n) => char::from_u32(*n as u32).unwrap_or('\0'),
-                AwkValueVariant::String(s) if s.is_numeric => {
-                    let code = value.scalar_as_f64() as u32;
-                    char::from_u32(code).unwrap_or('\0')
+                AwkValueVariant::String(s) if !s.is_numeric && !s.is_empty() => {
+                    s.chars().next().unwrap()
                 }
-                AwkValueVariant::String(s) if !s.is_empty() => s.chars().next().unwrap(),
-                _ => {
-                    let code = value.scalar_as_f64() as u32;
-                    char::from_u32(code).unwrap_or('\0')
-                }
+                _ => char_for_code(value.scalar_as_f64()),
             };
             let ch_str = ch.to_string();
             fmt_write_string(result, &ch_str, args);
@@ -147,6 +141,17 @@ fn format_one_conversion(
         _ => return Err(format!("unsupported format specifier '{}'", specifier)),
     }
     Ok(())
+}
+
+/// The character `%c` writes for the numeric argument `code`: in a
+/// single-byte locale the byte with that value modulo 256 (as gawk and mawk
+/// do), otherwise the character with that code point.
+fn char_for_code(code: f64) -> char {
+    if crate::charset::single_byte() {
+        char::from(code as i64 as u8)
+    } else {
+        char::from_u32(code as u32).unwrap_or('\0')
+    }
 }
 
 pub(crate) fn builtin_sprintf(
@@ -195,7 +200,7 @@ pub(crate) fn builtin_match(
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
     let text = string.as_str().to_owned();
-    let mut locations = ere.match_locations(string.try_into()?);
+    let mut locations = ere.match_locations(&text);
     let start;
     let len;
     if let Some(first_match) = locations.next() {
@@ -248,7 +253,7 @@ pub(crate) fn gsub(
     repl_parts.push(current_repl_part);
 
     let mut num_replacements = 0;
-    for m in ere.match_locations(AwkString::from(in_str).try_into()?) {
+    for m in ere.match_locations(in_str) {
         result.push_str(&in_str[last_match_end..m.start]);
         let replaced_string = &in_str[m.start..m.end];
         result.push_str(&repl_parts[0]);
@@ -434,14 +439,20 @@ pub(crate) fn call_simple_builtin(
             stack.push_value(run_system(&command) as f64)?;
         }
         BuiltinFunction::Print => {
-            print!("{}", print_to_string(stack, argc, global_env)?);
+            write_stdout(&print_to_string(stack, argc, global_env)?)?;
         }
         BuiltinFunction::Printf => {
-            print!("{}", builtin_sprintf(stack, argc, global_env)?);
+            write_stdout(&builtin_sprintf(stack, argc, global_env)?)?;
         }
         _ => unreachable!("call_simple_builtin was passed an invalid builtin function kind"),
     }
     Ok(FieldsState::Ok)
+}
+
+/// Write `s` to standard output as the bytes awk writes for it.
+fn write_stdout(s: &str) -> Result<(), String> {
+    std::io::Write::write_all(&mut std::io::stdout(), &crate::charset::encode(s))
+        .map_err(|e| e.to_string())
 }
 
 /// Run `command` via `libc::system` and translate its wait-status into the value

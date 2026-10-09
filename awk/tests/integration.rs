@@ -131,9 +131,32 @@ fn test_awk_dash_f_escape_processing() {
     );
 }
 
+/// Run the program file `tests/awk/<name>.awk` in a UTF-8 locale and compare
+/// its output with `<name>.out`. Characters are bytes in the C locale the
+/// harness defaults to, so a test of multibyte characters names its locale.
+fn test_awk_utf8(name: &str, expected_output: &str) {
+    let Some(locale) = plib::testing::utf8_locale() else {
+        return;
+    };
+    plib::testing::run_test_with_env(
+        TestPlan {
+            cmd: String::from("awk"),
+            args: vec!["-f".to_string(), format!("tests/awk/{name}.awk")],
+            stdin_data: String::new(),
+            expected_out: String::from(expected_output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("LC_ALL", locale.as_str())],
+    );
+}
+
 #[test]
 fn test_awk_multibyte_char_counts() {
-    test_awk!(multibyte_char_counts);
+    test_awk_utf8(
+        "multibyte_char_counts",
+        include_str!("awk/multibyte_char_counts.out"),
+    );
 }
 
 #[test]
@@ -858,7 +881,10 @@ fn test_awk_bugfix_numstr_field_cmp() {
 // Regression: gsub with zero-width match must not panic on multi-byte UTF-8
 #[test]
 fn test_awk_bugfix_gsub_multibyte() {
-    test_awk!(bugfix_gsub_multibyte);
+    test_awk_utf8(
+        "bugfix_gsub_multibyte",
+        include_str!("awk/bugfix_gsub_multibyte.out"),
+    );
 }
 
 // Regression: default SUBSEP must be \034 (0x1c), not space
@@ -978,4 +1004,72 @@ fn awk_hash_inside_regex_literal_is_not_a_comment() {
             expected_exit_code: 0,
         });
     }
+}
+
+/// Run awk with `env` added to its environment and return its standard output
+/// as raw bytes, asserting that it succeeded without diagnostics.
+fn awk_bytes_with_env(args: &[&str], stdin: &[u8], env: &[(&str, &str)]) -> Vec<u8> {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let output = plib::testing::run_test_base_with_env("awk", &args, stdin, env);
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{args:?}");
+    assert_eq!(output.status.code(), Some(0), "{args:?}");
+    output.stdout
+}
+
+// In a single-byte locale a character is a byte: `%c` with a numeric
+// argument writes the one byte whose value is the argument (modulo 256, as
+// gawk and mawk do), never a UTF-8 encoding of it, and input bytes reach the
+// output unchanged.
+#[test]
+fn awk_printf_c_writes_a_byte_in_the_c_locale() {
+    let c = [("LC_ALL", "C")];
+    let cases: [(&str, &[u8], &[u8]); 6] = [
+        ("BEGIN { printf(\"%c\", 200) }", b"", b"\xc8"),
+        (
+            "BEGIN { s = sprintf(\"%c%c\", 200, 256 + 65); printf \"%s|%d\", s, length(s) }",
+            b"",
+            b"\xc8A|2",
+        ),
+        // A string argument gives its first character, which is a byte here.
+        (
+            "{ printf(\"%c|%c\", $0, \"\\303\\251\") }",
+            b"\xe9x\n",
+            b"\xe9|\xc3",
+        ),
+        // Bytes in, the same bytes out; length counts bytes.
+        (
+            "{ print length($1); print }",
+            b"caf\xc3\xa9 \xff\n",
+            b"5\ncaf\xc3\xa9 \xff\n",
+        ),
+        // A regular expression sees bytes: `.` matches one byte.
+        ("{ sub(/./, \"x\"); print }", b"\xc3\xa9\n", b"x\xa9\n"),
+        (
+            "{ print index($0, \"\\251\"), substr($0, 2) }",
+            b"\xc3\xa9\n",
+            b"2 \xa9\n",
+        ),
+    ];
+    for (program, input, expected) in cases {
+        assert_eq!(
+            awk_bytes_with_env(&[program], input, &c),
+            expected,
+            "{program}"
+        );
+    }
+}
+
+// In a UTF-8 locale `%c` writes the character with that code point.
+#[test]
+fn awk_printf_c_writes_utf8_in_a_utf8_locale() {
+    let Some(locale) = plib::testing::utf8_locale() else {
+        return;
+    };
+    let env = [("LC_ALL", locale.as_str())];
+    let out = awk_bytes_with_env(
+        &["BEGIN { printf(\"%c|%c\", 200, \"éx\"); s = \"é\"; print \"\", length(s) }"],
+        b"",
+        &env,
+    );
+    assert_eq!(out, "È|é 1\n".as_bytes());
 }

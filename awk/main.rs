@@ -16,6 +16,7 @@ use std::error::Error;
 use std::fmt::Display;
 use std::io::Read;
 
+mod charset;
 mod compiler;
 mod interpreter;
 mod program;
@@ -58,26 +59,37 @@ fn exit_if_error<T, U: Display>(r: Result<T, U>) -> T {
 
 fn main() -> Result<(), Box<dyn Error>> {
     plib::diag::init_locale("awk");
+    charset::init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Operands, assignments and the program text become awk strings the way
+    // input does, so that in a single-byte locale each byte is a character.
+    for arg in args
+        .arguments
+        .iter_mut()
+        .chain(args.assignments.iter_mut())
+        .chain(args.separator_string.iter_mut())
+    {
+        *arg = charset::decode_utf8(std::mem::take(arg));
+    }
 
     let return_status = if !args.program_files.is_empty() {
         let mut sources = Vec::new();
         for source_file in &args.program_files {
-            let mut contents = String::new();
+            let mut contents = Vec::new();
             if source_file == "-" {
                 // POSIX: a progfile of '-' denotes the standard input.
                 std::io::stdin()
-                    .read_to_string(&mut contents)
+                    .read_to_end(&mut contents)
                     .map_err(|_| gettext!("could not read standard input"))?;
             } else {
                 let mut file = std::fs::File::open(source_file)
                     .map_err(|_| gettext!("could not open file '{}'", source_file))?;
-                file.read_to_string(&mut contents)
+                file.read_to_end(&mut contents)
                     .map_err(|_| gettext!("could not read file '{}'", source_file))?;
             }
             sources.push(SourceFile {
-                contents,
+                contents: charset::decode(contents),
                 filename: source_file.clone(),
             });
         }

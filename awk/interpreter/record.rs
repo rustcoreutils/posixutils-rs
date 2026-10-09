@@ -66,7 +66,7 @@ pub(crate) fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
         FieldSeparator::Ere(re) => {
             let mut split_start = 0;
             let mut index = 0;
-            for separator_range in re.match_locations(record.clone().try_into()?) {
+            for separator_range in re.match_locations(&record) {
                 store_result(index, string(&record[split_start..separator_range.start]))?;
                 split_start = separator_range.end;
                 index += 1;

@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::regex::regex_from_str;
+use std::ffi::CString;
 
 const FIRST_GLOBAL_VAR: u32 = SpecialVar::Count as u32;
 

@@ -11,7 +11,7 @@ use crate::parse::command_parser::is_valid_name;
 use crate::parse::word::{Word, WordPart};
 use crate::shell::environment::Environment;
 use crate::shstr::ShString;
-use std::ffi::{c_char, CStr, CString};
+use std::os::unix::ffi::OsStrExt;
 
 fn is_portable_filename_character(c: char) -> bool {
     // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html#tag_03_282
@@ -26,15 +26,8 @@ struct DefaultUsersHomeDirs;
 
 impl UsersHomeDirs for DefaultUsersHomeDirs {
     fn get_user_home(&self, login_name: &str) -> Option<ShString> {
-        let login_name = CString::new(login_name).ok()?;
-        let passwd = unsafe { libc::getpwnam(login_name.as_ptr()) };
-        if passwd.is_null() {
-            return None;
-        }
-        // this is safe, since the pointer is not null
-        // https://pubs.opengroup.org/onlinepubs/9699919799/functions/getpwnam.html
-        let user_home_dir = unsafe { CStr::from_ptr((*passwd).pw_dir as *const c_char) };
-        Some(ShString::from(user_home_dir.to_bytes()))
+        let user = plib::user::get_by_name(login_name)?;
+        Some(ShString::from(user.dir.as_os_str().as_bytes()))
     }
 }
 

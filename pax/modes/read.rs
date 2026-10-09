@@ -9,7 +9,7 @@
 
 //! Read mode implementation - extract archive contents
 
-use crate::archive::{ArchiveEntry, ArchiveReader, EntryType, LinkSets};
+use crate::archive::{ArchiveEntry, ArchiveReader, EntryType, LinkSets, SourceHeader};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
@@ -18,7 +18,7 @@ use crate::modes::anchored::{
     set_made_node_attrs_recording, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, Expected,
     MemberPath, PendingDirs,
 };
-use crate::modes::pins::{MadeFile, PinBudget};
+use crate::modes::pins::{MadeFile, Making, PinBudget};
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
 use crate::subst::{substitute_link_target, substitute_name, Substitution};
@@ -388,6 +388,8 @@ fn extract_entry<R: ArchiveReader>(
 
     // Each arm settles what it left at its name (`Links::left`): a file this
     // run made, nothing it can vouch for, or the name as it was.
+    let pin = links.wants_pin(entry, &parent);
+    links.pin_member = pin;
     match entry.entry_type {
         EntryType::Directory => {
             let decided = extract_directory(tree, pfd, &member, entry, options);
@@ -407,9 +409,9 @@ fn extract_entry<R: ArchiveReader>(
             }
         }
         EntryType::Symlink => {
-            let mut made = None;
+            let mut made = Making::new(pin);
             let result = extract_symlink(pfd, name, entry, options, &mut made);
-            links.left(&member, result.is_err(), made);
+            links.left(&member, result.is_err(), made.file);
             result?;
             archive.skip_data()?;
         }
@@ -426,16 +428,16 @@ fn extract_entry<R: ArchiveReader>(
             archive.skip_data()?; // Skip padding to block boundary
         }
         EntryType::BlockDevice | EntryType::CharDevice => {
-            let mut made = None;
+            let mut made = Making::new(pin);
             let result = extract_device(pfd, name, entry, options, &mut made);
-            links.left(&member, result.is_err(), made);
+            links.left(&member, result.is_err(), made.file);
             result?;
             archive.skip_data()?;
         }
         EntryType::Fifo => {
-            let mut made = None;
+            let mut made = Making::new(pin);
             let result = extract_fifo(pfd, name, entry, options, &mut made);
-            links.left(&member, result.is_err(), made);
+            links.left(&member, result.is_err(), made.file);
             result?;
             archive.skip_data()?;
         }
@@ -508,7 +510,7 @@ fn extract_symlink(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    made: &mut Option<MadeFile>,
+    made: &mut Making,
 ) -> PaxResult<()> {
     let target = entry
         .link_target
@@ -543,6 +545,11 @@ struct Links {
     /// The name -i gave each member it renamed, by the member path
     /// (`MemberPath::key`) it had before.
     aliases: HashMap<Vec<u8>, PathBuf>,
+    /// Whether the member being extracted is to pin what it makes
+    /// (`wants_pin`), as decided for it.
+    pin_member: bool,
+    /// The directory last asked about in `wants_pin`, and the answer.
+    last_dir: Option<(Rc<OwnedFd>, bool)>,
 }
 
 /// What this run left at a member path it tried to extract.
@@ -571,7 +578,31 @@ impl Links {
             made: HashMap::new(),
             pins: PinBudget::new(),
             aliases: HashMap::new(),
+            pin_member: false,
+            last_dir: None,
         }
+    }
+
+    /// Whether the file a member makes is to be pinned (`MadeFile`): only where
+    /// a later member could name it while someone else could replace it at
+    /// its name. A cpio member, where its file has other names. A tar or pax
+    /// member, whose later link members cannot be known ahead in a streamed
+    /// archive, where anyone but the user pax runs as can create, rename or
+    /// remove entries in `parent`, its directory
+    /// (`plib::madefs::only_the_user_writes_in`, asked once per directory).
+    /// Every other file is known by identity and ctime alone.
+    fn wants_pin(&mut self, entry: &ArchiveEntry, parent: &Rc<OwnedFd>) -> bool {
+        if matches!(entry.source_header, Some(SourceHeader::Cpio { .. })) {
+            return entry.nlink > 1;
+        }
+        if let Some((dir, answer)) = &self.last_dir {
+            if Rc::ptr_eq(dir, parent) {
+                return *answer;
+            }
+        }
+        let answer = !plib::madefs::only_the_user_writes_in(parent.as_raw_fd());
+        self.last_dir = Some((Rc::clone(parent), answer));
+        answer
     }
 
     /// Account for the pin of the set `entry` is a name of, after the member.
@@ -823,15 +854,16 @@ fn extract_regular<R: ArchiveReader>(
         return result;
     }
 
-    let mut made = None;
+    let mut making = Making::new(links.pin_member);
     let result = extract_file(
         archive,
         dirfd,
         member.leaf.as_c_str(),
         entry,
         options,
-        &mut made,
+        &mut making,
     );
+    let made = making.file;
     // A file made is recorded for a later link member to name, even when its
     // data or attributes then failed: it is at that name all the same.
     // The first name of a cpio link set: the set holds the file's pin, and
@@ -902,9 +934,10 @@ fn join_link_set<R: ArchiveReader>(
     }
 
     let holders = set.holders(tree);
-    let mut made = None;
+    // A set's file has other names: pinned.
+    let mut made = Making::new(true);
     extract_file(archive, dirfd, name, entry, options, &mut made)?;
-    let Some(mut file) = made else {
+    let Some(mut file) = made.file else {
         // -k kept what was there; the data is still the earlier names'.
         return fill_link_set(archive, tree, entry, options, set);
     };
@@ -939,9 +972,9 @@ fn fill_link_set<R: ArchiveReader>(
     };
     let dir = Rc::clone(dir);
     let (temp, file) = create_temp_file(dir.as_fd(), entry, options)?;
-    let mut made = None;
+    let mut made = Making::new(true);
     let filled = write_file_data(archive, file, entry, options, &mut made).and_then(|()| {
-        let mut made = made.ok_or_else(crate::modes::made::replaced)?;
+        let mut made = made.file.ok_or_else(crate::modes::made::replaced)?;
         let names = move_names_to(holders, dir.as_fd(), &temp, &mut made)?;
         Ok((made, names))
     });
@@ -1002,7 +1035,7 @@ fn extract_device(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    made: &mut Option<MadeFile>,
+    made: &mut Making,
 ) -> PaxResult<()> {
     // makedev has different signatures on different platforms:
     // - Linux: makedev(major: u32, minor: u32) -> u64
@@ -1049,7 +1082,7 @@ fn extract_fifo(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    made: &mut Option<MadeFile>,
+    made: &mut Making,
 ) -> PaxResult<()> {
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         let r = unsafe {
@@ -1088,7 +1121,7 @@ fn extract_file<R: ArchiveReader>(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    made: &mut Option<MadeFile>,
+    made: &mut Making,
 ) -> PaxResult<()> {
     let mut opened: Option<File> = None;
     let created = create_replacing(dirfd, name, options.no_clobber, || {
@@ -1154,16 +1187,16 @@ fn write_file_data<R: ArchiveReader>(
     mut file: File,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    made: &mut Option<MadeFile>,
+    made: &mut Making,
 ) -> PaxResult<()> {
     // Known from the descriptor that made it, whatever happens next.
-    *made = Some(MadeFile::of(file.as_fd())?);
+    made.file = Some(MadeFile::of(file.as_fd(), made.pin)?);
     let written = copy_file_data(archive, &mut file, entry.size).and_then(|()| {
         // Through the descriptor the data was just written to, not by name.
         set_attrs_fd(file.as_fd(), &attrs_of(entry, options), &policy_of(options))
     });
     // Its data and attributes changed its ctime.
-    if let Some(made) = made.as_mut() {
+    if let Some(made) = made.file.as_mut() {
         made.refresh(file.as_fd());
     }
     written?;
@@ -1289,7 +1322,7 @@ fn set_made_attrs(
     made_type: libc::mode_t,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    made: &mut Option<MadeFile>,
+    made: &mut Making,
 ) -> PaxResult<()> {
     let attrs = attrs_of(entry, options);
     set_made_node_attrs_recording(dirfd, name, made_type, &attrs, &policy_of(options), made)
@@ -1347,7 +1380,7 @@ mod tests {
         let mut links = Links::new();
         let target = MemberPath::parse(Path::new("f")).unwrap().unwrap();
         let f = std::fs::File::open(dir.path().join("f")).unwrap();
-        links.record_made(target.key(), MadeFile::of(f.as_fd()).unwrap());
+        links.record_made(target.key(), MadeFile::of(f.as_fd(), true).unwrap());
         drop(f);
 
         let path = dir.path().to_path_buf();
@@ -1516,7 +1549,15 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts, &mut None).unwrap();
+        set_made_attrs(
+            dir.as_fd(),
+            &name,
+            libc::S_IFIFO,
+            &entry,
+            &opts,
+            &mut Making::new(false),
+        )
+        .unwrap();
         assert_eq!(mode(), 0o755);
 
         // Preserved: exact 0o777 regardless of umask.
@@ -1527,7 +1568,15 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts, &mut None).unwrap();
+        set_made_attrs(
+            dir.as_fd(),
+            &name,
+            libc::S_IFIFO,
+            &entry,
+            &opts,
+            &mut Making::new(false),
+        )
+        .unwrap();
         assert_eq!(mode(), 0o777);
     }
 

@@ -53,14 +53,15 @@ pub(crate) struct MadeFile {
 
 impl MadeFile {
     /// The file open on `fd` -- for writing, or `O_PATH` -- which this run
-    /// has just made and given its attributes: pinned by a descriptor of its
-    /// own where a verified procfs can reopen it.
-    pub(crate) fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
+    /// has just made and given its attributes; where `pin` asks for it,
+    /// pinned by a descriptor of its own where a verified procfs can reopen
+    /// it (`Making::pin`).
+    pub(crate) fn of(fd: BorrowedFd<'_>, pin: bool) -> io::Result<Self> {
         let st = fstat(fd.as_raw_fd())?;
         Ok(MadeFile {
             id: file_id(&st),
             ctime: ctime_of(&st),
-            pin: reopen_path(fd),
+            pin: if pin { reopen_path(fd) } else { None },
         })
     }
 
@@ -68,10 +69,14 @@ impl MadeFile {
     /// by the `O_PATH` descriptor `pin` (`MadeNode`): pinned by a duplicate
     /// of it.
     #[cfg(target_os = "linux")]
-    pub(crate) fn held(pin: BorrowedFd<'_>) -> io::Result<Self> {
+    pub(crate) fn held(pin: BorrowedFd<'_>, keep: bool) -> io::Result<Self> {
         let st = fstat(pin.as_raw_fd())?;
         // Without a duplicate it is known by identity and ctime alone.
-        let dup = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        let dup = if keep {
+            unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) }
+        } else {
+            -1
+        };
         Ok(MadeFile {
             id: file_id(&st),
             ctime: ctime_of(&st),
@@ -173,6 +178,21 @@ impl MadeFile {
     }
 }
 
+/// What a member makes, as it is made: whether its file is to be pinned, and
+/// the file once it is made (`MadeFile`).
+pub(crate) struct Making {
+    /// Whether a later name could be linked to it while someone else could
+    /// replace it at its name: only then is a pin worth its cost.
+    pub(crate) pin: bool,
+    pub(crate) file: Option<MadeFile>,
+}
+
+impl Making {
+    pub(crate) fn new(pin: bool) -> Self {
+        Making { pin, file: None }
+    }
+}
+
 /// A status's `ctime`, seconds and nanoseconds.
 pub(crate) fn ctime_of(st: &libc::stat) -> (i64, i64) {
     // Casts needed: the field types differ between platforms.
@@ -226,6 +246,12 @@ impl<K: PartialEq> PinBudget<K> {
             held: VecDeque::new(),
             limit: usize::try_from(soft / 4).map_or(256, |quarter| quarter.min(256)),
         }
+    }
+
+    /// How many holders hold a pin.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn held(&self) -> usize {
+        self.held.len()
     }
 
     /// Account for `key`'s holder, which `pinned` says holds a pin now or not:
@@ -285,7 +311,7 @@ mod tests {
         let (dir, tree) = made_and_planted();
         let root = tree.root();
         let f = std::fs::File::open(dir.path().join("f")).unwrap();
-        let made = MadeFile::of(f.as_fd()).unwrap();
+        let made = MadeFile::of(f.as_fd(), true).unwrap();
         assert!(made.is_pinned());
         drop(f);
 

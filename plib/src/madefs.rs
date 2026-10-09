@@ -685,6 +685,22 @@ fn trusted_owner(
     }
 }
 
+/// Whether nobody but the effective user itself can create, rename or remove entries in the
+/// directory open on `fd`: the rule `ChainTrust` follows (`only_the_user_writes`) -- write
+/// permission for the user's private group counts as the user's, an ACL letting anyone else
+/// write as theirs -- with the directory the effective user's own. Root working in another
+/// user's tree does not count it as root's here: that user can replace what is in it.
+///
+/// pax pins a file it makes for later names to be linked to only where this is false.
+pub fn only_the_user_writes_in(fd: RawFd) -> bool {
+    let euid = unsafe { libc::geteuid() };
+    let Ok(st) = fstat(fd) else {
+        return false;
+    };
+    st.st_uid == euid
+        && only_the_user_writes(dir_writers(&st, euid, None, ChainStart::Anchor), Some(fd))
+}
+
 /// `only_the_user_writes` for the directory open on `fd`, worked out at once: for tests.
 #[cfg(test)]
 fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {

@@ -711,3 +711,71 @@ fn link_set_name_is_not_linked_to_a_file_with_a_reused_number() {
         "the later name was linked to the planted file"
     );
 }
+
+/// Whether the file a member at `name` made below `dest` was recorded pinned.
+#[cfg(target_os = "linux")]
+fn recorded_pinned(dest: &Path, entry: ArchiveEntry) -> bool {
+    let tree = DirTree::open_path(dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let key = MemberPath::parse(&entry.path).unwrap().unwrap().key();
+    let mut archive = Members(vec![entry].into_iter());
+    while let Some(entry) = archive.read_entry().unwrap() {
+        extract_entry(
+            &mut archive,
+            &entry,
+            &ReadOptions::default(),
+            &mut links,
+            &tree,
+            &mut pending,
+        )
+        .unwrap();
+    }
+    let set_pinned = links
+        .sets
+        .by_key_mut((0, 0))
+        .is_some_and(|set| set.file.is_pinned());
+    match links.made.get(&key) {
+        Some(super::Record::File(made)) => made.is_pinned() || set_pinned,
+        _ => panic!("nothing recorded"),
+    }
+}
+
+/// A pin costs a reopen through procfs per file; it is held only where a
+/// later member could name the file and someone else could replace it at
+/// its name meanwhile. A tar member is pinned where others can rename in its
+/// directory, a cpio member where its file has other names; every other is
+/// known by identity and ctime alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_made_file_is_pinned_only_where_it_could_be_needed() {
+    use crate::archive::SourceHeader;
+    use crate::formats::cpio::CpioFormat;
+    let tmp = TempDir::new().unwrap();
+    let private = tmp.path().join("private");
+    let open = tmp.path().join("open");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let tar = |name| own_member(name, EntryType::Regular, 0o644);
+    assert!(
+        !recorded_pinned(&private, tar("t")),
+        "tar, private directory"
+    );
+    assert!(recorded_pinned(&open, tar("t")), "tar, others can rename");
+
+    let cpio = |name, nlink| ArchiveEntry {
+        nlink,
+        source_header: Some(SourceHeader::Cpio {
+            format: CpioFormat::Newc,
+        }),
+        ..own_member(name, EntryType::Regular, 0o644)
+    };
+    assert!(!recorded_pinned(&open, cpio("c1", 1)), "cpio, one name");
+    assert!(
+        recorded_pinned(&private, cpio("c2", 2)),
+        "cpio, other names"
+    );
+}

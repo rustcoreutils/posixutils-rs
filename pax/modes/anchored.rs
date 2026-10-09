@@ -22,7 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use crate::modes::made::{self, verify_made_dir, MadeNode, MadeTrust};
-use crate::modes::pins::MadeFile;
+use crate::modes::pins::Making;
 use plib::madefs::{cvt, fstat, fstatat, lstat_at};
 use plib::madefs::{ChainTrust, FoundDir, NamedAnchor, Preserve, SEARCH_ONLY};
 use std::cell::RefCell;
@@ -2091,7 +2091,14 @@ pub(crate) fn set_made_node_attrs(
     attrs: &Attrs,
     policy: &AttrPolicy,
 ) -> PaxResult<()> {
-    set_made_node_attrs_recording(dirfd, name, made_type, attrs, policy, &mut None)
+    set_made_node_attrs_recording(
+        dirfd,
+        name,
+        made_type,
+        attrs,
+        policy,
+        &mut Making::new(false),
+    )
 }
 
 /// `set_made_node_attrs`, leaving in `made` the node as a later name of it
@@ -2103,14 +2110,14 @@ pub(crate) fn set_made_node_attrs_recording(
     made_type: libc::mode_t,
     attrs: &Attrs,
     policy: &AttrPolicy,
-    made: &mut Option<MadeFile>,
+    made: &mut Making,
 ) -> PaxResult<()> {
     let node = MadeNode::pin(dirfd, name, made_type)?;
     let applied = apply_node_attrs(&node, made_type, attrs, policy);
-    *made = node.made_file();
+    made.file = node.made_file(made.pin);
     // A node made is always known; one that cannot be is a failure, never a
     // name left as it was.
-    if made.is_none() {
+    if made.file.is_none() {
         applied?;
         return Err(PaxError::Io(made::replaced()));
     }

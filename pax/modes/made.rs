@@ -163,8 +163,8 @@ mod linux {
 
         /// The node as a later name of it is to be linked to it: pinned by a
         /// duplicate of this pin.
-        pub(crate) fn made_file(&self) -> Option<MadeFile> {
-            MadeFile::held(self.fd.as_fd()).ok()
+        pub(crate) fn made_file(&self, pin: bool) -> Option<MadeFile> {
+            MadeFile::held(self.fd.as_fd(), pin).ok()
         }
 
         pub(crate) fn trust(&self) -> MadeTrust {
@@ -295,7 +295,7 @@ mod other {
         /// The node as a later name of it is to be linked to it, known by its
         /// identity and ctime: nothing here can be linked through a
         /// descriptor.
-        pub(crate) fn made_file(&self) -> Option<MadeFile> {
+        pub(crate) fn made_file(&self, _pin: bool) -> Option<MadeFile> {
             let st = match self.held {
                 Held::Fd(ref fd) => fstat(fd.as_raw_fd()).ok()?,
                 Held::Name {

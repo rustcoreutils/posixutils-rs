@@ -196,6 +196,10 @@ impl CopiedLinks {
         member: &Path,
         made: Option<MadeFile>,
     ) {
+        // A file with one name has no later name to be linked to it.
+        if nlink <= 1 {
+            return;
+        }
         let pinned = made.as_ref().is_some_and(MadeFile::is_pinned);
         self.names
             .record(dev, ino, nlink, (member.to_path_buf(), made));
@@ -832,7 +836,7 @@ fn copy_file(
     let (dev, ino, nlink) = (metadata.dev(), metadata.ino(), metadata.nlink() as u32);
     if let Some((link_target, copy)) = link_tracker.names.lookup_mut(dev, ino, nlink) {
         let Some(target) = MemberPath::parse(link_target)? else {
-            return do_copy_file(entry, dirfd, name, metadata, options).map(|_| ());
+            return do_copy_file(entry, dirfd, name, metadata, options, false).map(|_| ());
         };
         let target_dir = tree.parent_of(&target, false)?;
         // Resolved one component at a time from the destination anchor, the
@@ -857,7 +861,7 @@ fn copy_file(
         return Ok(());
     }
 
-    let copy = do_copy_file(entry, dirfd, name, metadata, options)?;
+    let copy = do_copy_file(entry, dirfd, name, metadata, options, nlink > 1)?;
     // Only a copy that exists can be linked to by the file's later names.
     link_tracker.record((dev, ino), nlink, member, copy);
     Ok(())
@@ -878,6 +882,7 @@ fn do_copy_file(
     name: &CStr,
     metadata: &ftw::Metadata,
     options: &CopyOptions,
+    pin: bool,
 ) -> PaxResult<Option<MadeFile>> {
     // From the descriptor of the directory the walk found it in, and re-checked
     // against the (dev, ino) the walk saw, rather than re-resolving the whole
@@ -925,7 +930,7 @@ fn do_copy_file(
 
     set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))?;
     // Known once its attributes are set, which change its ctime.
-    let copy = MadeFile::of(dest_file.as_fd())?;
+    let copy = MadeFile::of(dest_file.as_fd(), pin)?;
     // A filesystem that defers writes reports their failure on close.
     crate::blocked_io::close_file(dest_file)?;
     Ok(Some(copy))
@@ -1092,6 +1097,23 @@ mod tests {
             later, "planted\n",
             "the later name was linked to the planted file"
         );
+    }
+
+    /// A file with one name has no later name to be linked to it: its copy is
+    /// not remembered, and takes nothing from the budget of pins.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_a_copy_with_one_name_takes_no_pin() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f");
+        fs::write(&path, "x").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let made = MadeFile::of(file.as_fd(), true).unwrap();
+        assert!(made.is_pinned());
+        let mut links = CopiedLinks::new();
+        links.record((1, 2), 1, Path::new("f"), Some(made));
+        assert_eq!(links.pins.held(), 0);
+        assert!(links.names.lookup(1, 2, 2).is_none());
     }
 
     #[test]

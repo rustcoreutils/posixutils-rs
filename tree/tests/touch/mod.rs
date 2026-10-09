@@ -561,3 +561,124 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("touch", &[opt, "-zq", "--help"]);
     }
 }
+
+/// The modification time of `p` itself, never of what a symlink names.
+fn link_mtime_secs(p: &str) -> u64 {
+    fs::symlink_metadata(p)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// -h / --no-dereference (GNU) sets a symlink's own times and leaves the file
+/// it names alone; binutils' debian/rules runs `touch --no-dereference
+/// --date=...`.
+#[test]
+fn test_touch_h_sets_the_link_itself() {
+    let d = dir("test_touch_h_sets_the_link_itself");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    fs::write(&target, "x").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = touch(None, &["-d", "@1000000000", &target]);
+    assert!(out.status.success(), "{out:?}");
+
+    let out = touch(None, &["-h", "-d", "@2000000000", &link]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_mtime_secs(&link), 2000000000);
+    assert_eq!(mtime_secs(&target), 1000000000);
+
+    let out = touch(
+        None,
+        &["--no-dereference", "-m", "--date=@1500000000", &link],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_mtime_secs(&link), 1500000000);
+    assert_eq!(mtime_secs(&target), 1000000000);
+
+    // A file that is not a link is touched as ever.
+    let out = touch(None, &["-h", "-d", "@1200000000", &target]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mtime_secs(&target), 1200000000);
+}
+
+/// Under -h a dangling symlink gets its own times; its target is not created.
+#[test]
+fn test_touch_h_dangling_symlink() {
+    let d = dir("test_touch_h_dangling_symlink");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = touch(None, &["-h", "-d", "@2000000000", &link]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_mtime_secs(&link), 2000000000);
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "-h created the target"
+    );
+}
+
+/// -h creates nothing: a missing file is an error, as in GNU touch, and with
+/// -c it is passed over in silence.
+#[test]
+fn test_touch_h_missing_file_is_not_created() {
+    let d = dir("test_touch_h_missing_file");
+    let missing = format!("{d}/missing");
+    let out = touch(None, &["-h", &missing]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(!out.stderr.is_empty());
+    assert!(
+        fs::symlink_metadata(&missing).is_err(),
+        "-h created the file"
+    );
+
+    let out = touch(None, &["-h", "-c", &missing]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty());
+    assert!(
+        fs::symlink_metadata(&missing).is_err(),
+        "-h -c created the file"
+    );
+}
+
+/// Under -h a reference file that is a symlink gives its own times.
+#[test]
+fn test_touch_h_reference_link() {
+    let d = dir("test_touch_h_reference_link");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    let other = format!("{d}/other");
+    fs::write(&target, "x").unwrap();
+    fs::write(&other, "y").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(touch(None, &["-d", "@1000000000", &target])
+        .status
+        .success());
+    assert!(touch(None, &["-h", "-d", "@2000000000", &link])
+        .status
+        .success());
+
+    let out = touch(None, &["-h", "-r", &link, &other]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mtime_secs(&other), 2000000000);
+    let out = touch(None, &["-r", &link, &other]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mtime_secs(&other), 1000000000);
+}
+
+/// A trailing slash still resolves the link: a link to a file followed by a
+/// slash is not a directory.
+#[test]
+fn test_touch_h_link_with_trailing_slash() {
+    let d = dir("test_touch_h_link_with_trailing_slash");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    fs::write(&target, "x").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = touch(None, &["-h", &format!("{link}/")]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(!out.stderr.is_empty());
+}

@@ -715,6 +715,11 @@ GNU tar.
    (`1990-06-22T12:00Z`), and `@SECONDS`, a signed whole number of seconds
    since the Epoch.  `--date` is a long form of `-d`.  perl's build runs
    `touch --date=@SECONDS`.
+ * `-h` / `--no-dereference` — change a symbolic link's own times, never
+   those of the file it names, as GNU touch does; with `-r`, a link gives its
+   own times too.  Nothing is created: a file that does not exist is an
+   error, passed over in silence under `-c`.  `--help` has only its long
+   form.  binutils' debian/rules runs `touch --no-dereference --date=...`.
 
 ### tr
 

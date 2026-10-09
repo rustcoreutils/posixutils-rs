@@ -19,8 +19,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// touch - change file access and modification times
 #[derive(Parser)]
-#[command(version, about = gettext("touch - change file access and modification times"))]
+#[command(
+    version,
+    disable_help_flag = true,
+    about = gettext("touch - change file access and modification times")
+)]
 struct Args {
+    #[arg(long, action = clap::ArgAction::HelpLong, help = gettext("Print help"))]
+    help: Option<bool>,
+
     #[arg(short, long, help = gettext("Change the access time of file"))]
     access: bool,
 
@@ -29,6 +36,9 @@ struct Args {
 
     #[arg(short, long, help = gettext("Change the modification time of file"))]
     mtime: bool,
+
+    #[arg(short = 'h', long, help = gettext("Change the times of a symbolic link itself, not of the file it names; create no file (GNU extension)"))]
+    no_dereference: bool,
 
     #[arg(short, long, alias = "date", allow_hyphen_values = true, group = "timefmt", help = gettext("Use the specified ISO 8601:2000 date-time format (a trailing ' UTC' or ' GMT' means 'Z'), an RFC 5322 date as printed by 'date -R', or @SECONDS, instead of the current time"))]
     datetime: Option<String>,
@@ -127,8 +137,13 @@ fn time_source(args: &Args) -> Result<(libc::timespec, libc::timespec), String> 
         let ts = parse_posix_time(t)?;
         Ok((ts, ts))
     } else if let Some(rf) = &args.ref_file {
-        let md = std::fs::metadata(rf)
-            .map_err(|e| format!("{rf}: {}", plib::diag::io_error_text(&e)))?;
+        // Under -h a link gives its own times, as it receives them.
+        let md = if args.no_dereference {
+            std::fs::symlink_metadata(rf)
+        } else {
+            std::fs::metadata(rf)
+        };
+        let md = md.map_err(|e| format!("{rf}: {}", plib::diag::io_error_text(&e)))?;
         let atime = md
             .accessed()
             .map(systemtime_to_ts)
@@ -156,6 +171,15 @@ fn touch_file(
     let atime = if args.access { source.0 } else { omit() };
     let mtime = if args.mtime { source.1 } else { omit() };
     let times = [atime, mtime];
+
+    // -h: the link itself, by name, and nothing is created; a missing file is
+    // an error unless -c says to pass it over (GNU).
+    if args.no_dereference {
+        return match set_link_times(&c_path, &times) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && args.no_create => Ok(()),
+            result => result,
+        };
+    }
 
     if args.no_create {
         return match set_times_path(&c_path, &times) {
@@ -343,6 +367,15 @@ fn set_times_fd(fd: &OwnedFd, times: &[libc::timespec; 2]) -> io::Result<()> {
 /// Set the times of the existing file `path` names, following a symlink.
 fn set_times_path(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
     if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set the times of the file `path` names, a symlink's own if it is one.
+fn set_link_times(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
+    let flags = libc::AT_SYMLINK_NOFOLLOW;
+    if unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), flags) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

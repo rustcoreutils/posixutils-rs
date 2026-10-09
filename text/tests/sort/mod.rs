@@ -777,3 +777,69 @@ fn test_check_long_option() {
     sort_test(&["--check"], "b\na\n", "", 1, "sort: -:2: disorder: a\n");
     sort_test(&["--check", "-r"], "b\na\n", "", 0, "");
 }
+
+/// GNU -V / --version-sort orders as coreutils' filevercmp: digit runs by
+/// value, `~` before everything (even the end), letters before other bytes,
+/// trailing file suffixes compared last, and `.`, `..` and hidden names first.
+/// The expected orders are GNU sort 9.4's.
+#[test]
+fn test_version_sort() {
+    let input = "1.2.10\n1.2.9\n1.0\n1.0~rc1\n1.2.09\n\na-1.10.tar.gz\n\
+                 a-1.2.tar.gz\n.bashrc\n..\n.\n1.0a\n1.0.a\n~\nfoo.10.c\nfoo.2.c\n";
+    let expected = "\n.\n..\n.bashrc\n~\n1.0~rc1\n1.0\n1.0.a\n1.0a\n1.2.09\n1.2.9\n\
+                    1.2.10\na-1.2.tar.gz\na-1.10.tar.gz\nfoo.2.c\nfoo.10.c\n";
+    for opt in ["-V", "--version-sort"] {
+        sort_test(&[opt], input, expected, 0, "");
+    }
+    // util-linux's tools/poman-translate.sh.
+    sort_test(&["--check", "--version-sort"], "0.72 0.73\n", "", 0, "");
+}
+
+/// -V as a key modifier and with -r, -u and -c.
+#[test]
+fn test_version_sort_keys() {
+    let input = "x 1.10\ny 1.9\nz 1.010\nw 1.9\n";
+    sort_test(&["-V"], input, "w 1.9\nx 1.10\ny 1.9\nz 1.010\n", 0, "");
+    sort_test(&["-Vr"], input, "z 1.010\ny 1.9\nx 1.10\nw 1.9\n", 0, "");
+    sort_test(&["-Vu"], input, "w 1.9\nx 1.10\ny 1.9\nz 1.010\n", 0, "");
+    sort_test(&["-k1V"], input, "w 1.9\nx 1.10\ny 1.9\nz 1.010\n", 0, "");
+    // 1.10 and 1.010 tie as versions; the whole line breaks the tie.
+    sort_test(&["-k2,2V"], input, "w 1.9\ny 1.9\nx 1.10\nz 1.010\n", 0, "");
+    sort_test(&["-k2,2V", "-u"], input, "y 1.9\nx 1.10\n", 0, "");
+
+    sort_test(&["-cV"], "1.9\n1.10\n", "", 0, "");
+    sort_test(&["-cV"], "1.10\n1.9\n", "", 1, "sort: -:2: disorder: 1.9\n");
+    sort_test(
+        &["-cuV"],
+        "1.9\n1.09\n",
+        "",
+        1,
+        "sort: -:2: disorder: 1.09\n",
+    );
+    sort_test(&["-crV"], "1.10\n1.9\n", "", 0, "");
+    sort_test(&["-CV"], "1.10\n1.9\n", "", 1, "");
+
+    sort_test(
+        &["-nV"],
+        "1\n",
+        "",
+        2,
+        "sort: options '-nV' are incompatible\n",
+    );
+    sort_test(
+        &["-k1Vn"],
+        "1\n",
+        "",
+        2,
+        "sort: options '-nV' are incompatible\n",
+    );
+}
+
+/// clap's -V version flag is gone, so -V sorts; --version still reports.
+#[test]
+fn test_version_flag_is_long_only() {
+    sort_test(&["-V"], "b\na\n", "a\nb\n", 0, "");
+    let out = plib::testing::run_test_base("sort", &["--version".to_string()], b"");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("posixutils-text "));
+}

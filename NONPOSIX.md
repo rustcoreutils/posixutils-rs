@@ -739,6 +739,13 @@ being redirected through a directory operand swapped for a symbolic link.
    ordinary character, which separates fields as a blank does, as in GNU
    sort.  binutils runs
    `find ... -print0 | LC_ALL=C sort -z | tar --null -T -`.
+ * `-V` / `--version-sort`, and the `V` key modifier — compare keys as
+   version strings, in GNU sort's (gnulib `filevercmp`) order: runs of
+   digits by value, `~` before everything (even the end of the key),
+   letters before other bytes, trailing file suffixes such as `.tar.gz`
+   compared last, and `.`, `..` and other names beginning with `.` first.
+   Combined with `-n` it is refused.  `-V` is therefore not a spelling of
+   `--version`.  util-linux runs `sort --check --version-sort`.
 
 ### split
 

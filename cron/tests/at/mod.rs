@@ -678,3 +678,63 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("at", &[opt, "-zq", "--help"]);
     }
 }
+
+// The job script carries the environment and the working directory byte for
+// byte: an entry that is not valid UTF-8 made at panic, and a directory name
+// that is not valid UTF-8 was mangled so the job could not `cd` back to it.
+// An inherited name that is not a shell name cannot be assigned in the
+// script and is left out rather than written as a broken command.
+#[test]
+fn test_at_non_utf8_environment_and_directory() {
+    use plib::testing::os_bytes;
+    use std::io::Write;
+
+    let _guard = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempdir().expect("tempdir");
+    let spool = dir.path().join("spool");
+    fs::create_dir_all(&spool).unwrap();
+    let allow = dir.path().join("at.allow");
+    fs::write(&allow, format!("{}\n", whoami())).unwrap();
+    let cwd = dir.path().join(os_bytes(b"cwd\xff"));
+    fs::create_dir_all(&cwd).unwrap();
+
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("at"))
+        .args(["-m", "now", "+", "1", "hour"])
+        .current_dir(&cwd)
+        .env("AT_JOB_DIR", &spool)
+        .env("AT_ALLOW", &allow)
+        .env_remove("AT_DENY")
+        .env("POSIXUTILS_K", os_bytes(b"eh zero \xa0"))
+        .env(os_bytes(b"POSIXUTILS_\xff"), "v")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn at");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"printf '%s|' \"$POSIXUTILS_K\"; pwd\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "at failed: {out:?}");
+
+    let job = fs::read_dir(&spool)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let run = std::process::Command::new("/bin/sh")
+        .arg(&job)
+        .env_clear()
+        .current_dir("/")
+        .output()
+        .unwrap();
+    assert!(run.stderr.is_empty(), "job stderr: {run:?}");
+    let mut expected = b"eh zero \xa0|".to_vec();
+    expected.extend_from_slice(cwd.canonicalize().unwrap().as_os_str().as_encoded_bytes());
+    expected.push(b'\n');
+    assert_eq!(run.stdout, expected);
+}

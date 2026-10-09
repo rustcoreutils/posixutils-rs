@@ -912,3 +912,106 @@ fn path_with_nul_byte_is_reported_not_walked() {
     assert_eq!(visited, 0);
     assert_eq!(errors, [(PathBuf::from("a\\0b"), ftw::ErrorKind::Open)]);
 }
+
+/// What one walk of `operand` saw: each entry's displayed path with the `(st_dev, st_ino)` that a
+/// no-follow `fstatat` on its `(dir_fd, file_name)` reaches, and each error's path, kind and errno.
+type Seen = Vec<(String, (u64, u64))>;
+type Errors = Vec<(String, ftw::ErrorKind, Option<i32>)>;
+
+// `st_dev` and `st_ino` are not `u64` everywhere (macOS `dev_t` is `i32`).
+#[allow(clippy::unnecessary_cast)]
+fn walk_trailing_slash(operand: &Path, opts: ftw::TraverseDirectoryOpts) -> (Seen, Errors) {
+    let mut seen = Vec::new();
+    let mut errors = Vec::new();
+    ftw::traverse_directory(
+        operand,
+        |entry| {
+            let mut sb = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let ret = unsafe {
+                libc::fstatat(
+                    entry.dir_fd(),
+                    entry.file_name().as_ptr(),
+                    sb.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            assert_eq!(ret, 0, "{}", io::Error::last_os_error());
+            let sb = unsafe { sb.assume_init() };
+            seen.push((
+                entry.path().to_string(),
+                (sb.st_dev as u64, sb.st_ino as u64),
+            ));
+            Ok(true)
+        },
+        |_, _| Ok(()),
+        |entry, e| {
+            let kind = e.kind();
+            errors.push((entry.path().to_string(), kind, e.inner().raw_os_error()));
+        },
+        opts,
+    );
+    seen.sort();
+    (seen, errors)
+}
+
+/// A pathname that ends in a slash names a directory: a symbolic link as its last component is
+/// followed, even by a walk that follows no links, and anything but a directory is `ENOTDIR`
+/// (POSIX pathname resolution), as after `/.`. The walk used to drop the slash and act on the link
+/// itself, or on the file. The starting entry must reach the directory through its own
+/// `(dir_fd, file_name)` with a no-follow call, since that is how callers such as `chown -h` act
+/// on it, and its path is the operand as written.
+#[test]
+fn trailing_slash_operand_names_a_directory() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("trailing_slash_operand")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp_dir.path();
+    fs::create_dir(root.join("dir")).unwrap();
+    fs::write(root.join("dir/f"), b"x").unwrap();
+    fs::write(root.join("file"), b"x").unwrap();
+    unix::fs::symlink("dir", root.join("dl")).unwrap();
+    unix::fs::symlink("file", root.join("fl")).unwrap();
+    unix::fs::symlink("nowhere", root.join("dangling")).unwrap();
+    let id = |p: &str| {
+        let md = fs::symlink_metadata(root.join(p)).unwrap();
+        (md.dev(), md.ino())
+    };
+    let shown = |p: &str| root.join(p).to_string_lossy().to_string();
+
+    for follow in [false, true] {
+        let opts = || ftw::TraverseDirectoryOpts {
+            follow_symlinks_on_args: follow,
+            ..Default::default()
+        };
+
+        for operand in ["dl/", "dl//", "dl/.", "dl/./", "dir/"] {
+            let (seen, errors) = walk_trailing_slash(&root.join(operand), opts());
+            assert_eq!(errors, [], "{operand}");
+            let child = root.join(operand).join("f").to_string_lossy().to_string();
+            assert_eq!(
+                seen,
+                [(shown(operand), id("dir")), (child, id("dir/f"))],
+                "{operand}"
+            );
+        }
+
+        for (operand, errno) in [
+            ("fl/", libc::ENOTDIR),
+            ("fl/.", libc::ENOTDIR),
+            ("file/", libc::ENOTDIR),
+            ("dangling/", libc::ENOENT),
+            ("missing/", libc::ENOENT),
+        ] {
+            let (seen, errors) = walk_trailing_slash(&root.join(operand), opts());
+            assert_eq!(seen, [], "{operand}");
+            assert_eq!(
+                errors,
+                [(shown(operand), ftw::ErrorKind::Stat, Some(errno))],
+                "{operand}"
+            );
+        }
+    }
+}

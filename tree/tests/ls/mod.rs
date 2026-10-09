@@ -1234,3 +1234,22 @@ fn test_ls_reports_epipe_when_sigpipe_is_ignored() {
 
     plib::testing::assert_epipe_when_sigpipe_ignored("ls", &[dir.path().to_str().unwrap()], 1);
 }
+
+/// `ls -R dl/`, with `dl` a symlink to a directory, lists the directory under the operand as
+/// written, slash included, as it does the subdirectories below it.
+#[test]
+fn test_ls_recursive_trailing_slash_symlink() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    fs::create_dir_all(format!("{dir}/d/sub")).unwrap();
+    fs::File::create(format!("{dir}/d/f")).unwrap();
+    fs::File::create(format!("{dir}/d/sub/g")).unwrap();
+    std::os::unix::fs::symlink("d", format!("{dir}/dl")).unwrap();
+
+    ls_test(
+        &["-R", &format!("{dir}/dl/")],
+        &format!("{dir}/dl/:\nf\nsub\n\n{dir}/dl/sub:\ng\n"),
+        "",
+        0,
+    );
+}

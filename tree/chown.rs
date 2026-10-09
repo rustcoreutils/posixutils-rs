@@ -169,10 +169,9 @@ fn main() -> Result<(), io::Error> {
             &args.delegate,
             |e: io::Error, path: ftw::DisplayablePath| {
                 let err_str = match e.kind() {
-                    io::ErrorKind::PermissionDenied => {
-                        gettext!("cannot access '{}': {}", path, error_string(&e))
-                    }
-                    io::ErrorKind::NotFound => {
+                    io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::NotFound
+                    | io::ErrorKind::NotADirectory => {
                         gettext!("cannot access '{}': {}", path, error_string(&e))
                     }
                     _ => {

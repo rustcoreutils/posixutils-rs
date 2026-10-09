@@ -1303,11 +1303,9 @@ fn delete_entry(ctx: &EvalContext, state: &mut FindState) -> bool {
     } else {
         0
     };
-    let (dir_fd, name) = (ctx.entry.dir_fd(), ctx.entry.file_name());
-    match unsafe { libc::unlinkat(dir_fd, name.as_ptr(), flags) } {
-        0 => true,
-        _ => {
-            let e = io::Error::last_os_error();
+    match ctx.entry.unlink(flags) {
+        Ok(()) => true,
+        Err(e) => {
             eprintln!(
                 "find: cannot delete '{}': {}",
                 ctx.path.display(),

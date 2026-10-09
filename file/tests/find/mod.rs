@@ -869,6 +869,40 @@ fn find_type_l_under_follow() {
     );
 }
 
+/// A trailing slash on a symlink operand follows the link and names a directory (POSIX pathname
+/// resolution), with or without -H/-L: `to_dir/` is walked, under the operand as written, and
+/// `to_file/` is "Not a directory".
+#[test]
+fn find_trailing_slash_follows_operand_symlink() {
+    let tmp = scratch_dir();
+    let dir = tmp.path();
+    std::fs::create_dir(dir.join("d")).unwrap();
+    File::create(dir.join("d/f")).unwrap();
+    File::create(dir.join("file")).unwrap();
+    std::os::unix::fs::symlink("d", dir.join("to_dir")).unwrap();
+    std::os::unix::fs::symlink("file", dir.join("to_file")).unwrap();
+    let p = |s: &str| dir.join(s).to_string_lossy().into_owned();
+
+    run_test_find_sorted(&[&p("to_dir/")], &[&p("to_dir/"), &p("to_dir/f")], "", 0);
+    run_test_find_sorted(&[&p("to_dir/"), "-type", "d"], &[&p("to_dir/")], "", 0);
+    run_test_find(
+        &[&p("to_file/")],
+        "",
+        &format!("find: '{}': Not a directory\n", p("to_file/")),
+        1,
+    );
+    // -delete empties the directory but cannot remove it by that name, as rmdir("to_dir/")
+    // cannot, and leaves the link alone.
+    run_test_find(
+        &[&p("to_dir/"), "-delete"],
+        "",
+        &format!("find: cannot delete '{}': Not a directory\n", p("to_dir/")),
+        1,
+    );
+    assert!(dir.join("to_dir").is_symlink());
+    assert_eq!(std::fs::read_dir(dir.join("d")).unwrap().count(), 0);
+}
+
 #[test]
 fn test_find_operator_without_operand() {
     // An operator with nothing after it is a syntax error, in GNU find's

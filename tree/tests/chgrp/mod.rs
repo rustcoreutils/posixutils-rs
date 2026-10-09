@@ -582,3 +582,46 @@ fn test_chgrp_through_a_symlink_owned_by_another_user() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(gid, gid2);
 }
+
+/// A trailing slash on a symlink operand follows the link, -h or not, and names a directory
+/// (POSIX pathname resolution): `fl/` naming a link to a file is "Not a directory", and `dl/`
+/// naming a link to a directory changes the directory, and with -R what is in it, never the link.
+#[test]
+fn test_chgrp_trailing_slash_follows_symlink() {
+    let test_dir = &format!("{}/test_chgrp_trailing_slash", env!("CARGO_TARGET_TMPDIR"));
+    let (d, d_f, file, dl, fl) = (
+        &format!("{test_dir}/d"),
+        &format!("{test_dir}/d/f"),
+        &format!("{test_dir}/file"),
+        &format!("{test_dir}/dl"),
+        &format!("{test_dir}/fl"),
+    );
+    let ((g1, gid1), (g2, gid2)) = get_groups();
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(d).unwrap();
+    fs::File::create(d_f).unwrap();
+    fs::File::create(file).unwrap();
+    unix::fs::symlink("d", dl).unwrap();
+    unix::fs::symlink("file", fl).unwrap();
+    chgrp_test(&["-hR", &g1, d, d_f, file, dl, fl], "", "", 0);
+    let gids = || [d, d_f, file, dl, fl].map(|p| file_gid(p).unwrap());
+    assert_eq!(gids(), [gid1; 5]);
+
+    for opt in ["-h", "-R"] {
+        chgrp_test(
+            &[opt, &g2, &format!("{fl}/")],
+            "",
+            &format!("chgrp: cannot access '{fl}/': Not a directory\n"),
+            1,
+        );
+    }
+    assert_eq!(gids(), [gid1; 5]);
+
+    chgrp_test(&["-h", &g2, &format!("{dl}/")], "", "", 0);
+    assert_eq!(gids(), [gid2, gid1, gid1, gid1, gid1]);
+
+    chgrp_test(&["-hR", &g2, &format!("{dl}//")], "", "", 0);
+    assert_eq!(gids(), [gid2, gid2, gid1, gid1, gid1]);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

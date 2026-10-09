@@ -634,3 +634,40 @@ fn test_du_x_still_descends_within_one_filesystem() {
 
     let _ = fs::remove_dir_all(test_dir);
 }
+
+/// A trailing slash on a symlink operand follows the link and names a directory: `du dl/` sizes
+/// the directory, under the operand as written, and `du fl/` (a link to a file) is an error.
+#[test]
+fn test_du_trailing_slash_symlink() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    fs::create_dir_all(format!("{dir}/d/sub")).unwrap();
+    fs::write(format!("{dir}/d/sub/g"), b"x").unwrap();
+    fs::write(format!("{dir}/file"), b"x").unwrap();
+    std::os::unix::fs::symlink("d", format!("{dir}/dl")).unwrap();
+    std::os::unix::fs::symlink("file", format!("{dir}/fl")).unwrap();
+
+    du_test_with_checker(&["-a", &format!("{dir}/dl/")], |_, out| {
+        let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.split_once('\t').unwrap().1.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                format!("{dir}/dl/"),
+                format!("{dir}/dl/sub"),
+                format!("{dir}/dl/sub/g")
+            ]
+        );
+        assert_eq!(out.status.code(), Some(0));
+    });
+
+    du_test(
+        &["-s", &format!("{dir}/fl/")],
+        "",
+        &format!("du: {dir}/fl/: Not a directory\n"),
+        1,
+    );
+}

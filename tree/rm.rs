@@ -254,14 +254,7 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
     // If directory is empty or the directory is inaccessible, try to remove it directly
     if (dir_is_empty.is_ok() && dir_is_empty.as_ref().unwrap() == &true) || dir_is_empty.is_err() {
         if should_remove_directory(cfg, entry) {
-            let ret = unsafe {
-                libc::unlinkat(
-                    entry.dir_fd(),
-                    entry.file_name().as_ptr(),
-                    libc::AT_REMOVEDIR,
-                )
-            };
-            if ret != 0 {
+            if let Err(e2) = entry.unlink(libc::AT_REMOVEDIR) {
                 let err_str = if let Err(e1) = dir_is_empty {
                     gettext!(
                         "cannot remove '{}': {}",
@@ -269,7 +262,6 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
                         error_string(&e1)
                     )
                 } else {
-                    let e2 = io::Error::last_os_error();
                     gettext!(
                         "cannot remove directory '{}': {}",
                         entry.path().clean_trailing_slashes(),
@@ -361,17 +353,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 
             if should_remove_directory(cfg, &entry) {
                 // Remove the directory
-                let ret = unsafe {
-                    libc::unlinkat(
-                        entry.dir_fd(),
-                        entry.file_name().as_ptr(),
-                        libc::AT_REMOVEDIR,
-                    )
-                };
-
-                if ret != 0 {
-                    let e = io::Error::last_os_error();
-
+                if let Err(e) = entry.unlink(libc::AT_REMOVEDIR) {
                     // `ENOTEMPTY` means one or more subdirectories were not
                     // removed. Do not flood the output by recursively
                     // printing `Directory not empty` errors.

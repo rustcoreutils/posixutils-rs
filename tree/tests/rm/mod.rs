@@ -1296,3 +1296,38 @@ fn test_rm_no_operand() {
 fn test_rm_f_no_operand() {
     rm_test(&["-f"], "", "", 0);
 }
+
+/// `dl/`, a symlink to a directory named with a trailing slash, is that directory (POSIX pathname
+/// resolution): `rm -r` removes what is in it, then cannot remove the directory by that name, as
+/// `rmdir("dl/")` cannot. It used to unlink the symlink and leave the directory untouched.
+#[test]
+fn test_rm_r_trailing_slash_symlink_to_directory() {
+    let test_dir = &format!("{}/test_rm_r_trailing_slash", env!("CARGO_TARGET_TMPDIR"));
+    let (d, dl) = (&format!("{test_dir}/d"), &format!("{test_dir}/dl"));
+    let _ = fs::remove_dir_all(test_dir);
+    fs::create_dir_all(format!("{d}/sub")).unwrap();
+    fs::File::create(format!("{d}/f")).unwrap();
+    fs::File::create(format!("{d}/sub/g")).unwrap();
+    unix::fs::symlink("d", dl).unwrap();
+
+    rm_test(
+        &["-r", &format!("{dl}/")],
+        "",
+        &format!("rm: cannot remove directory '{dl}/': Not a directory\n"),
+        1,
+    );
+    assert!(fs::symlink_metadata(dl).unwrap().is_symlink());
+    assert_eq!(fs::read_dir(d).unwrap().count(), 0);
+
+    // Now empty, it takes the path that removes it without descending.
+    rm_test(
+        &["-r", &format!("{dl}/")],
+        "",
+        &format!("rm: cannot remove directory '{dl}/': Not a directory\n"),
+        1,
+    );
+    assert!(fs::symlink_metadata(dl).unwrap().is_symlink());
+    assert!(fs::symlink_metadata(d).unwrap().is_dir());
+
+    fs::remove_dir_all(test_dir).unwrap();
+}

@@ -1882,3 +1882,28 @@ fn awk_getline_reads_the_main_input() {
         "tests/awk/test_data3.txt 6 11 10 5\n11 0\n",
     );
 }
+
+// Deleting the element at the end of an array's storage, the last one
+// added or a slot a `for (k in a)` loop emptied, panicked.
+#[test]
+fn awk_delete_the_last_stored_element() {
+    let cases = [
+        (
+            "BEGIN { a[1]; a[2]; delete a[2]; print length(a); for (k in a) print k }",
+            "1\n1\n",
+        ),
+        (
+            "BEGIN { a[1]; a[2]; a[3]; for (k in a) if (k == 3) delete a[k]; delete a[1]; print length(a); for (k in a) print k }",
+            "1\n2\n",
+        ),
+    ];
+    for (program, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline(program);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}

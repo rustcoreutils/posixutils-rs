@@ -46,8 +46,9 @@ impl Array {
         if let Some(pair_index) = self.key_map.remove(key) {
             if self.iterator_count == 0 {
                 self.pairs.swap_remove(pair_index);
-                if !self.pairs.is_empty() {
-                    let (key, _) = self.pairs[pair_index].as_ref().unwrap();
+                // the element moved into the slot, unless the deleted one was
+                // the last, or what moved is a slot a loop emptied
+                if let Some(Some((key, _))) = self.pairs.get(pair_index) {
                     *self.key_map.get_mut(key).unwrap() = pair_index;
                 }
             } else {

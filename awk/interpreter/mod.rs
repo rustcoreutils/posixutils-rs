@@ -23,7 +23,7 @@ use string::AwkString;
 use value::{AwkRefType, AwkValue, AwkValueRef, AwkValueVariant};
 
 use crate::charset;
-use crate::compiler::{escape_string_contents, is_valid_number};
+use crate::compiler::escape_string_contents;
 use crate::program::{
     Action, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar,
 };
@@ -60,7 +60,7 @@ pub(crate) fn bool_to_f64(p: bool) -> f64 {
 /// Converts the longest numeric prefix of `s` as C's strtod does, after
 /// skipping leading white space; 0 if there is none.
 pub(crate) fn strtod(s: &str) -> f64 {
-    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let s = s.trim_start_matches(STRTOD_SPACE);
     lexical::parse_partial_with_options::<f64, _, { lexical::format::C_STRING }>(
         s,
         &lexical::ParseFloatOptions::default(),
@@ -79,10 +79,47 @@ pub(crate) fn swap_with_default<T: Default>(value: &mut T) -> T {
     result
 }
 
+/// The white space strtod skips, which may also surround a numeric string.
+const STRTOD_SPACE: [char; 6] = [' ', '\t', '\n', '\x0b', '\x0c', '\r'];
+
+/// Skips the decimal digits at the start of `bytes`; returns how many there were.
+fn skip_digits(bytes: &mut &[u8]) -> usize {
+    let count = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    *bytes = &bytes[count..];
+    count
+}
+
+/// Whether all of `s`, apart from surrounding white space, is a decimal
+/// number: an optional sign, digits with an optional fraction (or a fraction
+/// alone), and an optional exponent.
+fn looks_numeric(s: &str) -> bool {
+    let mut bytes = s.trim_matches(STRTOD_SPACE).as_bytes();
+    if let [b'+' | b'-', rest @ ..] = bytes {
+        bytes = rest;
+    }
+    let mut digits = skip_digits(&mut bytes);
+    if let [b'.', rest @ ..] = bytes {
+        bytes = rest;
+        digits += skip_digits(&mut bytes);
+    }
+    if digits == 0 {
+        return false;
+    }
+    if let [b'e' | b'E', rest @ ..] = bytes {
+        bytes = rest;
+        if let [b'+' | b'-', rest @ ..] = bytes {
+            bytes = rest;
+        }
+        if skip_digits(&mut bytes) == 0 {
+            return false;
+        }
+    }
+    bytes.is_empty()
+}
+
 pub(crate) fn maybe_numeric_string<S: Into<AwkString>>(str: S) -> AwkString {
     let mut str = str.into();
-    let numeric_string = is_valid_number(str.as_str().trim().trim_start_matches(['+', '-']));
-    str.is_numeric = numeric_string;
+    str.is_numeric = looks_numeric(str.as_str());
     str
 }
 

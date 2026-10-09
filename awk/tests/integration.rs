@@ -1436,3 +1436,41 @@ fn awk_string_to_number_skips_leading_white_space() {
         });
     }
 }
+
+// A field is a numeric string only if all of it, apart from leading and
+// trailing blanks, looks like a number: "12abc", "12.5f" and "12 x" compare
+// as strings ("12abc" > 9 is false), " 12 " and "+12" as numbers.
+#[test]
+fn awk_numeric_string_is_the_whole_field() {
+    let cases = [
+        ("12", "1"),
+        ("12abc", "0"),
+        ("12.5f", "0"),
+        ("12 x", "0"),
+        ("12e", "0"),
+        ("+-12", "0"),
+        ("--12", "0"),
+        ("0x1A", "0"),
+        (".", "0"),
+        (" 12 ", "1"),
+        ("\t12\t", "1"),
+        ("+12", "1"),
+        ("12e1", "1"),
+        ("1e+1x", "0"),
+        ("12.", "1"),
+        (".12e2", "1"),
+    ];
+    let input: String = cases
+        .iter()
+        .map(|(field, _)| format!("{field}|\n"))
+        .collect();
+    let output: String = cases.iter().map(|(_, gt)| format!("{gt}\n")).collect();
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![String::from("-F|"), String::from("{ print ($1 > 9) }")],
+        stdin_data: input,
+        expected_out: output,
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}

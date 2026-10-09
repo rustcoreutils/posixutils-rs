@@ -2000,11 +2000,6 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
     }
 }
 
-/// Returns true if the given string is a valid number token.
-pub fn is_valid_number(s: &str) -> bool {
-    AwkParser::parse(Rule::number, s).is_ok()
-}
-
 #[cfg(test)]
 mod test {
 

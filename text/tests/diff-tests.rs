@@ -2338,37 +2338,39 @@ fn test_diff_report_identical_files_in_directories() {
     }
     std::fs::write(d1.join("only"), "o\n").unwrap();
     let (d1, d2) = (d1.to_str().unwrap(), d2.to_str().unwrap());
+    // Expected text is spelled with `/`, which sep() makes the platform's separator; the
+    // temporary directory's own path has none to change.
     let same = |name: &str| format!("Files {d1}/{name} and {d2}/{name} are identical\n");
 
     let hunk = "1c1\n< y\n---\n> z\n";
     diff_test(
         &["-s", d1, d2],
-        &format!(
+        &sep(&format!(
             "diff -s {d1}/diff {d2}/diff\n{hunk}{}Only in {d1}: only\n{}\
              Common subdirectories: {d1}/sub and {d2}/sub\n",
             same("empty"),
             same("same"),
-        ),
+        )),
         EXIT_STATUS_DIFFERENCE,
     );
     diff_test(
         &["-sr", d1, d2],
-        &format!(
+        &sep(&format!(
             "diff -sr {d1}/diff {d2}/diff\n{hunk}{}Only in {d1}: only\n{}{}",
             same("empty"),
             same("same"),
             same("sub/s"),
-        ),
+        )),
         EXIT_STATUS_DIFFERENCE,
     );
     diff_test(
         &["-srq", d1, d2],
-        &format!(
+        &sep(&format!(
             "Files {d1}/diff and {d2}/diff differ\n{}Only in {d1}: only\n{}{}",
             same("empty"),
             same("same"),
             same("sub/s"),
-        ),
+        )),
         EXIT_STATUS_DIFFERENCE,
     );
 }

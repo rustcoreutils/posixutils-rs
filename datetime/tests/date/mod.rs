@@ -245,3 +245,96 @@ fn test_utc_set_form_fails_cleanly_without_privilege() {
         },
     );
 }
+
+/// `date ARGS` under `TZ` and the C locale prints `expected`.
+fn date_d(args: &[&str], tz: &str, expected: &str) {
+    let mut plan = date_plan(args);
+    plan.expected_out = format!("{expected}\n");
+    run_test_with_env(plan, &[("TZ", tz), ("LC_ALL", "C")]);
+}
+
+/// -d @SECONDS, in either order with the format; guile's build runs
+/// `date -u +'%Y-%m-%d %T' -d @$SOURCE_DATE_EPOCH`.
+#[test]
+fn test_date_d_epoch() {
+    let fmt = "+%Y-%m-%d %H:%M:%S";
+    date_d(&["-u", "-d", "@0", fmt], "UTC0", "1970-01-01 00:00:00");
+    date_d(
+        &["-u", fmt, "-d", "@1700000000"],
+        "UTC0",
+        "2023-11-14 22:13:20",
+    );
+    date_d(&["--utc", "--date=@-1", fmt], "UTC0", "1969-12-31 23:59:59");
+    date_d(&["--date", "@+86400", fmt], "UTC0", "1970-01-02 00:00:00");
+}
+
+/// -d takes the ISO 8601 forms touch -d takes, with or without seconds.
+#[test]
+fn test_date_d_iso8601() {
+    let fmt = "+%Y-%m-%d %H:%M:%S";
+    for (date, utc) in [
+        ("1990-06-22T12:00Z", "1990-06-22 12:00:00"),
+        ("1990-06-22T12:00:30Z", "1990-06-22 12:00:30"),
+        ("1990-06-22T12:00+02:00", "1990-06-22 10:00:00"),
+        ("1990-06-22 12:00:30-05:30", "1990-06-22 17:30:30"),
+        ("2007-11-12 10:15:30.25Z", "2007-11-12 10:15:30"),
+        ("1999-08-26 12:06:20 UTC", "1999-08-26 12:06:20"),
+        ("1999-08-26 12:06 UTC", "1999-08-26 12:06:00"),
+    ] {
+        date_d(&["-u", "-d", date, fmt], "UTC0", utc);
+    }
+}
+
+/// perl's debian/config.debian runs
+/// `LC_ALL=C date '+%b %e %Y %T' --utc -d "<changelog Date:>"`, the RFC 5322
+/// date touch -d already takes.
+#[test]
+fn test_date_d_changelog_date() {
+    date_d(
+        &[
+            "+%b %e %Y %T",
+            "--utc",
+            "-d",
+            "Sat, 05 Jul 2025 12:34:56 +0200",
+        ],
+        "UTC0",
+        "Jul  5 2025 10:34:56",
+    );
+}
+
+/// A zone-less -d time is local time, in TZ, or in UTC under -u.
+#[cfg(unix)]
+#[test]
+fn test_date_d_local_time() {
+    date_d(
+        &["-d", "@0", "+%Y-%m-%d %H:%M:%S"],
+        "EST5",
+        "1969-12-31 19:00:00",
+    );
+    date_d(&["-d", "1990-06-22T12:00", "+%s"], "EST5", "646074000");
+    date_d(
+        &["-u", "-d", "1990-06-22T12:00", "+%Y-%m-%d %H:%M:%S"],
+        "EST5",
+        "1990-06-22 12:00:00",
+    );
+}
+
+/// No free-form dates, and with -d an operand must be a format.
+#[test]
+fn test_date_d_rejections() {
+    for args in [
+        &["-d", "junk"][..],
+        &["-d", "next tuesday"],
+        &["-d", "@"],
+        &["-d", "@12x"],
+        &["-d", "@1.5"],
+        &["-d", "1990-06-22"],
+        &["-d", "@0", "0101"],
+    ] {
+        run_test_with_checker_and_env(date_plan(args), &[("TZ", "UTC0")], |_, output| {
+            assert_eq!(output.status.code(), Some(1), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            assert!(!output.stderr.is_empty(), "{args:?}");
+        });
+    }
+}

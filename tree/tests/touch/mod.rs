@@ -490,7 +490,6 @@ fn test_touch_d_utc_word_rejections() {
         "1999-08-26 12:06:20UTC",         // GNU accepts
         "1999-08-26 12:06:20 UTC x",      // GNU rejects
         "1999-08-26 12:06:20 UTC ",       // GNU accepts
-        "1999-08-26 12:06 UTC",           // no seconds, as with Z; GNU accepts
         "1999-08-26 UTC",                 // no time
         "UTC",
     ] {
@@ -513,6 +512,45 @@ fn test_touch_d_posix_forms_unchanged() {
     assert_eq!(d_mtime("2007-11-12T10:15:30,000"), local);
     let ((_, _), mtime) = touch_d("2007-11-12T10:15:30.25Z").unwrap();
     assert_eq!(mtime, (utc, 250_000_000));
+}
+
+/// The ISO 8601 forms may leave out the seconds, with a zone too; each value
+/// is GNU touch 9.4's stat `%Y`.
+#[test]
+fn test_touch_d_without_seconds() {
+    assert_eq!(d_mtime("1990-06-22T12:00Z"), 646_056_000);
+    assert_eq!(d_mtime("1990-06-22 12:00Z"), 646_056_000);
+    assert_eq!(d_mtime("1990-06-22T12:00+02:00"), 646_048_800);
+    assert_eq!(d_mtime("1999-08-26 12:06 UTC"), 935_669_160);
+    // No zone: New York time (EDT, UTC-4).
+    assert_eq!(d_mtime("1990-06-22T12:00"), 646_070_400);
+}
+
+/// -d @SECONDS, and --date as its long form; perl's debian/rules runs
+/// `touch --date="@$patchdate" patchlevel.h`.
+#[test]
+fn test_touch_d_epoch() {
+    assert_eq!(d_mtime("@1000000000"), 1_000_000_000);
+    assert_eq!(d_mtime("@0"), 0);
+    assert_eq!(d_mtime("@-86400"), -86_400);
+
+    let d = dir("test_touch_d_epoch");
+    let f = format!("{d}/f");
+    for argv in [
+        vec!["--date=@1000000000", &f],
+        vec!["--date", "@1000000000", &f],
+    ] {
+        let out = touch(None, &argv);
+        assert!(out.status.success(), "{argv:?}: {out:?}");
+        assert_eq!(mtime_secs(&f), 1_000_000_000);
+        fs::remove_file(&f).unwrap();
+    }
+    fs::remove_dir_all(&d).unwrap();
+
+    for date in ["@", "@x", "@12x", "@1.5", "@ 1", "@--1"] {
+        let out = touch_d(date).expect_err(date);
+        assert_eq!(out.status.code(), Some(1), "{date:?}: {out:?}");
+    }
 }
 
 // XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option

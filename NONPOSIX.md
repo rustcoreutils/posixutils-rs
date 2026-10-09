@@ -250,6 +250,16 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `CRON_ALLOW`, `CRON_DENY` — override the `cron.allow` / `cron.deny`
    pathnames.  Honored only when the real and effective user IDs match.
 
+### date
+
+ * `-d STRING` / `--date=STRING` — write the time `STRING` names instead of
+   the current time.  `STRING` is what `touch -d` takes (see touch below):
+   the ISO 8601 date-time, the RFC 5322 date `date -R` prints, or
+   `@SECONDS`, never GNU's free-form dates.  A zone-less time is local time,
+   or UTC under `-u`.  With `-d` an operand must be a `+format`.  guile's
+   build runs `date -u +FORMAT -d @SECONDS`; perl's passes `--utc -d` its
+   changelog date.
+
 ### dd
 
  * Block-size suffixes `c`, `K`, `m`, `M`, `g` and `G`.  POSIX defines `b`
@@ -640,6 +650,10 @@ GNU tar.
    license files' times in this form.  Only those two words, in upper
    case, after one space; other zone words, `UTC` combined with `Z`, and
    any other spacing are refused.
+ * `-d` also takes the POSIX date-time without its seconds
+   (`1990-06-22T12:00Z`), and `@SECONDS`, a signed whole number of seconds
+   since the Epoch.  `--date` is a long form of `-d`.  perl's build runs
+   `touch --date=@SECONDS`.
 
 ### tr
 

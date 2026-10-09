@@ -10,7 +10,7 @@
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
 use gettextrs::gettext;
-use plib::diag;
+use plib::{date_arg, diag};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::io::{self, Write};
@@ -48,6 +48,17 @@ struct Args {
     utc: bool,
 
     #[arg(
+        short,
+        long,
+        allow_hyphen_values = true,
+        help = gettext(
+            "Display the given time instead of the current time: an ISO 8601 date-time, \
+             an RFC 5322 date as printed by 'date -R', or @SECONDS"
+        )
+    )]
+    date: Option<String>,
+
+    #[arg(
         help = gettext(
             "If prefixed with '+', Display the current time in the given FORMAT, \
              as in strftime(3). Otherwise, set the current time to the given string"
@@ -56,19 +67,24 @@ struct Args {
     timestr: Option<String>,
 }
 
-fn show_time(utc: bool, formatstr: &str) {
-    if formatstr.is_empty() {
-        println!();
-        return;
-    }
-
+/// The current time, in seconds since the Epoch.
+fn current_time() -> libc::time_t {
     let now = unsafe { libc::time(std::ptr::null_mut()) };
     if now == -1 {
         diag::error(&gettext("failed to get current time"));
         process::exit(1);
     }
+    now
+}
 
-    match format_time(now, utc, formatstr) {
+/// Write `when` formatted by `formatstr`, in UTC or local time.
+fn show_time(when: libc::time_t, utc: bool, formatstr: &str) {
+    if formatstr.is_empty() {
+        println!();
+        return;
+    }
+
+    match format_time(when, utc, formatstr) {
         Ok(text) => {
             // Write the raw bytes so non-UTF-8 locale output is preserved.
             let mut out = io::stdout().lock();
@@ -275,16 +291,57 @@ fn set_clock(secs: i64) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// -d: write the time `date` names, in the operand's format if there is one.
+/// The operand cannot set the clock then, so it must be a `+format`.
+fn show_given_time(args: &Args, date: &str) {
+    let formatstr = match args.timestr.as_deref() {
+        None => DEF_TIMESTR,
+        Some(timestr) => match timestr.strip_prefix('+') {
+            Some(formatstr) => formatstr,
+            None => {
+                diag::error(&gettext!(
+                    "the argument '{}' lacks a leading '+'; with -d, an operand must be a format",
+                    timestr
+                ));
+                process::exit(1);
+            }
+        },
+    };
+
+    let zoneless = if args.utc {
+        date_arg::Zoneless::Utc
+    } else {
+        date_arg::Zoneless::Local
+    };
+    let when = match date_arg::parse(date, zoneless) {
+        Ok((secs, _)) => libc::time_t::try_from(secs).ok(),
+        Err(msg) => {
+            diag::error(&msg);
+            process::exit(1);
+        }
+    };
+    let Some(when) = when else {
+        diag::error(&gettext!("invalid date format: '{}'", date));
+        process::exit(1);
+    };
+    show_time(when, args.utc, formatstr);
+}
+
 fn main() {
     diag::init_locale("date");
 
     let args = Args::parse();
 
+    if let Some(date) = &args.date {
+        show_given_time(&args, date);
+        return;
+    }
+
     match &args.timestr {
-        None => show_time(args.utc, DEF_TIMESTR),
+        None => show_time(current_time(), args.utc, DEF_TIMESTR),
         Some(timestr) => {
             if let Some(st) = timestr.strip_prefix("+") {
-                show_time(args.utc, st);
+                show_time(current_time(), args.utc, st);
             } else if let Err(msg) = set_time(args.utc, timestr) {
                 diag::error(&gettext(msg));
                 process::exit(1);

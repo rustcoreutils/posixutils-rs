@@ -933,6 +933,21 @@ fn find_trailing_slash_follows_operand_symlink() {
     );
     assert!(dir.join("to_dir").is_symlink());
     assert!(dir.join("d/f").is_file());
+
+    // A dangling link names no directory: reported by name, with or without -delete.
+    std::os::unix::fs::symlink("nowhere", dir.join("dangling")).unwrap();
+    for extra in [&[][..], &["-delete"][..]] {
+        let mut args = vec![p("dangling/")];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_test_find(
+            &args,
+            "",
+            &format!("find: '{}': No such file or directory\n", p("dangling/")),
+            1,
+        );
+    }
+    assert!(dir.join("dangling").is_symlink());
 }
 
 #[test]

@@ -862,6 +862,28 @@ fn main() -> ExitCode {
     // Maximum line length (-w / COLUMNS / {LINE_MAX}); lines are clipped to it.
     let line_limit = resolve_line_limit(args.wide);
 
+    match write_listing(&filtered, &output_fields, print_header, line_limit, &ctx) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!(
+                "ps: {}: {}",
+                gettext("write error"),
+                plib::diag::io_error_text(&e)
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Write the header (unless every field's header is empty) and one line per
+/// process in `filtered`, each clipped to `line_limit`.
+fn write_listing(
+    filtered: &[platform::ProcessInfo],
+    output_fields: &[OutputField],
+    print_header: bool,
+    line_limit: usize,
+    ctx: &Context,
+) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -874,7 +896,7 @@ fn main() -> ExitCode {
             }
             let _ = write!(line, "{:>width$}", field.header, width = field.width);
         }
-        let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
+        writeln!(out, "{}", truncate_line(&line, line_limit))?;
     }
 
     // Print processes
@@ -884,7 +906,7 @@ fn main() -> ExitCode {
             if i > 0 {
                 line.push(' ');
             }
-            let value = get_field_value(&proc, field.name, &ctx);
+            let value = get_field_value(proc, field.name, ctx);
             // Right-align numeric fields, left-align text
             if matches!(
                 field.name,
@@ -895,10 +917,10 @@ fn main() -> ExitCode {
                 let _ = write!(line, "{:<width$}", value, width = field.width);
             }
         }
-        let _ = writeln!(out, "{}", truncate_line(&line, line_limit));
+        writeln!(out, "{}", truncate_line(&line, line_limit))?;
     }
 
-    ExitCode::SUCCESS
+    out.flush()
 }
 
 #[cfg(test)]

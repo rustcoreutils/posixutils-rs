@@ -503,3 +503,9 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("ps", &[opt, "-zq", "--help"]);
     }
 }
+
+// ps discarded every write error and exited 0.
+#[test]
+fn ps_reports_write_error() {
+    plib::testing::assert_write_error_on_full_device("ps", &["-A"], b"", 1);
+}

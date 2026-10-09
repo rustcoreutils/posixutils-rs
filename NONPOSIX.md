@@ -213,7 +213,11 @@ dh_installexamples), with GNU cp's meaning:
  * `--parents` — the destination of each source is the target directory
    followed by the source's path, and missing directories on that path are
    made from the source's (with `-p`, their owner, mode and times too).  The
-   target must be an existing directory.
+   target must be an existing directory.  Unlike GNU, a source ending in `..`
+   is refused with a diagnostic and exit status 1: its destination ends in
+   `..` too, which names no entry inside the target but whatever directory
+   that reaches -- for `..` itself the target's parent -- and GNU cp copies
+   onto that.  A source of `.` copies its contents into the target itself.
  * `-l` — each non-directory is hard-linked to its source instead of copied;
    with `-R`, directories are made and the files in them linked.  An existing
    destination is replaced only under `-f` (or `-i` answered yes); one that is

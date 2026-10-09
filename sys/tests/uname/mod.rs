@@ -357,6 +357,30 @@ fn uname_mixed_short_long() {
     );
 }
 
+/// GNU `-i` / `--hardware-platform`, as Debian's coreutils prints it: the machine hardware
+/// name, written after `-m`'s field whatever the order of the options. gprofng's testsuite
+/// runs `uname -i`.
+#[test]
+fn uname_hardware_platform() {
+    let machine = get_uname_output(&["-m"]);
+    let machine = machine.trim_end();
+    let system = get_uname_output(&["-s"]);
+    let system = system.trim_end();
+    assert_eq!(get_uname_output(&["-i"]), format!("{machine}\n"));
+    assert_eq!(
+        get_uname_output(&["--hardware-platform"]),
+        format!("{machine}\n")
+    );
+    assert_eq!(
+        get_uname_output(&["-i", "-m"]),
+        format!("{machine} {machine}\n")
+    );
+    assert_eq!(
+        get_uname_output(&["-i", "-s"]),
+        format!("{system} {machine}\n")
+    );
+}
+
 #[test]
 fn uname_mixed_long_short() {
     // Mix of long and short options should work

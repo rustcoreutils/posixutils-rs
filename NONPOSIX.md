@@ -809,6 +809,12 @@ GNU tar.
    on octal escapes naming single byte values.  The RATIONALE's reading is the
    one implemented, and it is what other implementations do.
 
+### uname
+
+ * `-i` / `--hardware-platform` — write the machine hardware name (`-m`'s),
+   as Debian's coreutils does, after the `-m` field.  `-a` stays POSIX's
+   `-mnrsv` and does not include it.  gprofng's testsuite runs `uname -i`.
+
 ### uucp / uux / uustat
 
  * Transport is SSH.  The legacy UUCP protocol, configuration files and

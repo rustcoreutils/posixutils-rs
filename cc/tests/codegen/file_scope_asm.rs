@@ -14,8 +14,10 @@
 // `cc/test_asm/codegen_file_scope_asm.rs`.
 //
 
+#[cfg(target_os = "linux")]
+use crate::common::run_c17;
 use crate::common::{
-    asm_for_at, compile_and_run_everywhere, compile_expect_error, preprocess_text, run_c17,
+    asm_for_at, compile_and_run_everywhere, compile_expect_error, preprocess_text,
 };
 
 /// `.symver` in file-scope asm gives a shared object versioned symbols: one

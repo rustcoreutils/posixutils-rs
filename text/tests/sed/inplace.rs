@@ -299,3 +299,53 @@ mod unix {
         assert_ne!(out.status.code(), Some(0));
     }
 }
+
+/// With a backup suffix, the file's name is never without a file: when the edited copy cannot
+/// replace it, the original is still there under its name, beside its backup.  The replacement
+/// is made to fail by removing sed's temporary file while sed reads a long input; an attempt in
+/// which sed finished before the removal is tried again.
+#[cfg(unix)]
+#[test]
+fn failed_replace_keeps_the_original_name() {
+    let original = "x\n".repeat(2_000_000);
+    for _ in 0..20 {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        put(dir, "f", &original);
+        let mut child = Command::new(get_binary_path("sed"))
+            .args(["-i.bak", "s/x/y/", "f"])
+            .current_dir(dir)
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run sed");
+        // Remove sed's temporary file as soon as it appears.
+        let removed = loop {
+            let temp = fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .find(|n| n.starts_with("sed") && dir.join(n).is_file());
+            if let Some(temp) = temp {
+                break fs::remove_file(dir.join(temp)).is_ok();
+            }
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+        };
+        let out = child.wait_with_output().unwrap();
+        if !removed || out.status.success() {
+            continue;
+        }
+        assert_eq!(get(dir, "f"), original);
+        assert!(dir.join("f.bak").exists());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("couldn't replace f"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    panic!("sed finished before its temporary file could be removed, every time");
+}

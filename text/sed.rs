@@ -2620,9 +2620,10 @@ impl Sed {
     /// Edit the open regular file `name`: run the script over it into a new
     /// file, created exclusively (`O_CREAT|O_EXCL`, mode 0600) in the same
     /// directory and given the original's owner and mode, then rename the new
-    /// file over the name, after renaming the original to its backup name
-    /// when there is a suffix. The original is never written; a failure
-    /// leaves it as it was and removes the new file. True when `q` ended it.
+    /// file over the name, after keeping the original under its backup name
+    /// when there is a suffix (see [`keep_backup`]). The original is never
+    /// written, and its name is never without a file; a failure leaves it as
+    /// it was and removes the new file. True when `q` ended it.
     fn edit_file(&mut self, name: &str, file: File, suffix: &str) -> Result<bool, SedError> {
         let path = Path::new(name);
         let fail = |what: &str, err: &std::io::Error| {
@@ -2642,6 +2643,7 @@ impl Sed {
             .map_err(|e| fail("open a temporary file to edit", &e))?;
         copy_owner_and_mode(temp.as_file(), &original).map_err(|e| fail("edit", &e))?;
         let writer = temp.as_file().try_clone().map_err(|e| fail("edit", &e))?;
+        let mut source = file.try_clone().map_err(|e| fail("edit", &e))?;
 
         *IN_PLACE_OUTPUT.lock().unwrap() = Some(BufWriter::new(writer));
         self.current_file = Some(Box::new(BufReader::new(file)));
@@ -2659,11 +2661,56 @@ impl Sed {
 
         if !suffix.is_empty() {
             let backup = backup_name(path, suffix)?;
-            std::fs::rename(path, &backup).map_err(|e| fail("keep a backup of", &e))?;
+            keep_backup(path, &backup, dir, &mut source, &original)
+                .map_err(|e| fail("keep a backup of", &e))?;
         }
         temp.persist(path).map_err(|e| fail("replace", &e.error))?;
         Ok(quit)
     }
+}
+
+/// Keep the original of a file edited in place, `path`, under the name `backup` in the same
+/// directory `dir`, while `path` still names it: a hard link made in a fresh directory of its
+/// own in `dir`, then renamed over `backup`, so an existing backup is replaced at once.  Where
+/// the link cannot be made (a file system without hard links, or Linux's protected_hardlinks
+/// for a file of another owner), a copy of `source`, the file as it was opened, with its owner,
+/// mode and times, takes the link's place.
+fn keep_backup(
+    path: &Path,
+    backup: &Path,
+    dir: &Path,
+    source: &mut File,
+    original: &Metadata,
+) -> std::io::Result<()> {
+    let staging = plib::tmp::Builder::new().prefix("sed").tempdir_in(dir)?;
+    let link = staging.path().join("backup");
+    if std::fs::hard_link(path, &link).is_ok() {
+        return std::fs::rename(&link, backup);
+    }
+    drop(staging);
+    copy_to_backup(backup, dir, source, original)
+}
+
+/// Write a copy of `source` from its start, with the owner, mode and times of `original`, to a
+/// new file in `dir`, and rename it over `backup`.
+fn copy_to_backup(
+    backup: &Path,
+    dir: &Path,
+    source: &mut File,
+    original: &Metadata,
+) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut copy = plib::tmp::Builder::new().prefix("sed").tempfile_in(dir)?;
+    copy_owner_and_mode(copy.as_file(), original)?;
+    source.seek(SeekFrom::Start(0))?;
+    std::io::copy(source, copy.as_file_mut())?;
+    let mut times = std::fs::FileTimes::new().set_modified(original.modified()?);
+    if let Ok(accessed) = original.accessed() {
+        times = times.set_accessed(accessed);
+    }
+    copy.as_file().set_times(times)?;
+    copy.persist(backup).map(drop).map_err(|e| e.error)
 }
 
 /// The backup name of `path` for the `-i` suffix `suffix`: the name plus the

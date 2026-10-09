@@ -92,3 +92,17 @@ fn options_after_utility_belong_to_the_utility() {
         expected_exit_code: 0,
     });
 }
+
+// The utility's arguments are passed through byte for byte; clap rejected
+// one that was not valid UTF-8.
+#[test]
+fn nice_passes_non_utf8_arguments() {
+    use plib::testing::{get_binary_path, os_bytes};
+    let output = std::process::Command::new(get_binary_path("nice"))
+        .args(["sh", "-c", "printf '%s' \"$1\"", "sh"])
+        .arg(os_bytes(b"arg\xfe"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"arg\xfe");
+}

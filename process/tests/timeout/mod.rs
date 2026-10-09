@@ -592,3 +592,28 @@ fn test_options_after_utility_belong_to_the_utility() {
         "-s KILL -k 1 -f -p x\n"
     );
 }
+
+// The utility's arguments are passed through byte for byte, valid UTF-8 or
+// not, and a PATH directory whose name is not valid UTF-8 is searched; such a
+// PATH was treated as unset.
+#[test]
+fn timeout_non_utf8_arguments_and_path() {
+    use plib::testing::{get_binary_path, os_bytes};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let bin = dir.path().join(os_bytes(b"bin\xff"));
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("posixutils-timeout-probe");
+    std::fs::write(&script, "#!/bin/sh\nprintf '%s' \"$1\"\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = std::process::Command::new(get_binary_path("timeout"))
+        .env("PATH", &bin)
+        .args(["10", "posixutils-timeout-probe"])
+        .arg(os_bytes(b"arg\xfe"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"arg\xfe");
+}

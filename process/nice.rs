@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -45,7 +46,7 @@ struct Args {
         trailing_var_arg = true,
         help = gettext("Utility to invoke and its arguments")
     )]
-    command: Vec<String>,
+    command: Vec<OsString>,
 }
 
 #[cfg(target_os = "linux")]
@@ -78,7 +79,7 @@ fn apply_increment(increment: i32) {
     }
 }
 
-fn exec_util(util: &str, util_args: &[String]) -> ! {
+fn exec_util(util: &OsStr, util_args: &[OsString]) -> ! {
     let err = Command::new(util)
         .args(util_args)
         .stdin(Stdio::inherit())
@@ -87,7 +88,7 @@ fn exec_util(util: &str, util_args: &[String]) -> ! {
         .exec();
 
     // exec() only returns on failure.
-    exec_error_exit(util, err)
+    exec_error_exit(&util.to_string_lossy(), err)
 }
 
 fn main() {

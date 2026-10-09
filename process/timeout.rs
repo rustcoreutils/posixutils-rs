@@ -8,9 +8,10 @@
 //
 
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
@@ -78,7 +79,7 @@ struct Args {
         trailing_var_arg = true,
         help = gettext("The utility to execute and its arguments.")
     )]
-    command: Vec<String>,
+    command: Vec<OsString>,
 }
 
 /// Parses string slice into [Duration].
@@ -340,16 +341,17 @@ fn disable_core_dumps() -> bool {
 ///
 /// # Returns
 ///
-/// `Option<String>` - full path to the utility if found, or `None` if not found.
-fn search_in_path(utility: &str) -> Option<String> {
-    if let Ok(paths) = std::env::var("PATH") {
-        for path in paths.split(':') {
-            let full_path = std::path::Path::new(path).join(utility);
+/// `Option<PathBuf>` - full path to the utility if found, or `None` if not found.
+fn search_in_path(utility: &OsStr) -> Option<PathBuf> {
+    // `var_os`: a PATH that is not valid UTF-8 is still a PATH.
+    if let Some(paths) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&paths) {
+            let full_path = path.join(utility);
             if full_path.is_file() {
                 if let Ok(metadata) = std::fs::metadata(&full_path) {
                     // Check if the file is executable
                     if metadata.permissions().mode() & 0o111 != 0 {
-                        return Some(full_path.to_string_lossy().into_owned());
+                        return Some(full_path);
                     }
                 }
             }
@@ -381,7 +383,7 @@ fn timeout(args: Args) -> i32 {
         .expect("clap requires the utility operand");
 
     let utility_path = if Path::new(utility).is_file() {
-        utility.clone()
+        PathBuf::from(utility)
     } else {
         match search_in_path(utility) {
             Some(path) => path,
@@ -389,7 +391,7 @@ fn timeout(args: Args) -> i32 {
                 diag::error(&format!(
                     "{} '{}' {}",
                     gettext("utility"),
-                    utility,
+                    utility.to_string_lossy(),
                     gettext("not found")
                 ));
                 return 127;
@@ -449,7 +451,7 @@ fn timeout(args: Args) -> i32 {
                 diag::error(&format!(
                     "{} '{}' {}",
                     gettext("utility"),
-                    utility,
+                    utility.to_string_lossy(),
                     gettext("not found")
                 ));
                 return 127;
@@ -458,7 +460,7 @@ fn timeout(args: Args) -> i32 {
                 diag::error(&format!(
                     "{} '{}'",
                     gettext("unable to run the utility"),
-                    utility
+                    utility.to_string_lossy()
                 ));
                 return 126;
             }

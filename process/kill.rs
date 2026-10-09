@@ -28,7 +28,10 @@ fn parse_cmdline() -> Result<Config, &'static str> {
     let mut in_args = true;
     let mut in_s_arg = false;
     let mut in_l_arg = false;
-    for arg in std::env::args().skip(1) {
+    // Signals and PIDs are ASCII; an argument that is not valid UTF-8 is
+    // simply not one, so a lossy conversion gives the right error.
+    for arg in std::env::args_os().skip(1) {
+        let arg = arg.to_string_lossy();
         if in_args {
             // -l takes an OPTIONAL exit_status operand; if the next token is
             // itself an option, -l had no operand (don't mis-read it as one).

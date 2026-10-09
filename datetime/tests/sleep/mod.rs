@@ -45,6 +45,39 @@ fn test_sleep_non_numeric_fails() {
     });
 }
 
+/// A fractional operand (`0.01`, `.5`, `1.`), as GNU and BSD sleep accept: the sleep lasts at
+/// least that long. Anything else that is not a decimal number is refused.
+#[test]
+fn test_sleep_fraction() {
+    for operand in ["0.01", ".05", "0.", "0.000000000001"] {
+        run_test_with_checker(sleep_plan(&[operand], 0), |_, output| {
+            assert!(output.status.success(), "`sleep {operand}` should exit 0");
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        });
+    }
+    let started = std::time::Instant::now();
+    run_test_with_checker(sleep_plan(&["0.3"], 0), |_, output| {
+        assert!(output.status.success());
+    });
+    assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+}
+
+#[test]
+fn test_sleep_rejects_malformed_numbers() {
+    for operand in [
+        ".", "", "1.2.3", "1e2", "0x10", "1s", "inf", " 1", "1,5", "+1",
+    ] {
+        run_test_with_checker(sleep_plan(&[operand], 2), |_, output| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                err.contains(&format!("invalid time interval '{operand}'")),
+                "`sleep {operand:?}`: {err}"
+            );
+            assert_eq!(output.status.code(), Some(2));
+        });
+    }
+}
+
 #[test]
 fn test_sleep_negative_fails() {
     run_test_with_checker(sleep_plan(&["-1"], 2), |_, output| {

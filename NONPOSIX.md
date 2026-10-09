@@ -690,6 +690,12 @@ being redirected through a directory operand swapped for a symbolic link.
    and bash, rather than the shell-aborting special-builtin error POSIX
    requires.
 
+### sleep
+
+ * The `time` operand may have a fraction — `0.01`, `.5`, `1.` — as GNU and
+   BSD sleep allow; POSIX requires a decimal integer.  No sign, exponent,
+   unit suffix or `inf`.
+
 ### sort
 
  * `-z` / `--zero-terminated` — lines end with NUL, not newline, in the input

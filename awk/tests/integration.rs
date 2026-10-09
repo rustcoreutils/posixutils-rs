@@ -1407,3 +1407,32 @@ fn awk_later_syntax_errors_report_their_own_position() {
     );
     assert_ne!(output.status.code(), Some(0));
 }
+
+// A string converts to a number as C's strtod reads it, skipping leading
+// white space: " 12" + 1 is 13, and a field " 12 " is 12.
+#[test]
+fn awk_string_to_number_skips_leading_white_space() {
+    let cases = [
+        (
+            "BEGIN { print \" 12\" + 1, \"\\t5\" * 2, \" +3\" + 0, \" -.5e1x\" + 0 }",
+            "",
+            "13 10 3 -5\n",
+        ),
+        (
+            "BEGIN { print \"\\n7\" + 0, \"\\v8\" + 0, \"\\f9\" + 0, \"\\r4\" + 0 }",
+            "",
+            "7 8 9 4\n",
+        ),
+        ("{ print $1 + 0, $1 * 2 }", " 12 |x\n", "12 24\n"),
+    ];
+    for (program, input, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from("-F|"), String::from(program)],
+            stdin_data: String::from(input),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

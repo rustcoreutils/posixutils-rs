@@ -57,7 +57,10 @@ pub(crate) fn bool_to_f64(p: bool) -> f64 {
     }
 }
 
+/// Converts the longest numeric prefix of `s` as C's strtod does, after
+/// skipping leading white space; 0 if there is none.
 pub(crate) fn strtod(s: &str) -> f64 {
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     lexical::parse_partial_with_options::<f64, _, { lexical::format::C_STRING }>(
         s,
         &lexical::ParseFloatOptions::default(),

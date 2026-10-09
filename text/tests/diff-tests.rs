@@ -2021,3 +2021,58 @@ fn diff_option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("diff", &[opt, "-zq", "--help"]);
     }
 }
+
+/// A file operand that is neither a regular file nor a directory -- here the
+/// character device /dev/null -- is a file to compare, not a directory to
+/// look inside. It was classified by "is it a regular file?", so /dev/null
+/// took the file-versus-directory path and diff looked for "/dev/null/e".
+// Unix only: /dev/null.
+#[cfg(unix)]
+#[test]
+fn test_diff_non_regular_file_operand_is_compared_as_a_file() {
+    let (_base, a, _b) = dir_pair();
+    let empty = a.join("e");
+    let full = a.join("n");
+    std::fs::write(&empty, "").unwrap();
+    std::fs::write(&full, "x\n").unwrap();
+    let (empty, full) = (empty.to_str().unwrap(), full.to_str().unwrap());
+
+    for args in [
+        vec!["-u", "/dev/null", empty],
+        vec!["-u", empty, "/dev/null"],
+        vec!["/dev/null", empty],
+    ] {
+        let (stdout, stderr, code) = run_diff(&args);
+        assert_eq!(
+            code,
+            Some(EXIT_STATUS_NO_DIFFERENCE),
+            "{args:?}: {stderr:?}"
+        );
+        assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""), "{args:?}");
+    }
+
+    let (stdout, stderr, code) = run_diff(&["-u", "/dev/null", full]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE), "{stderr:?}");
+    assert!(stdout.starts_with("--- /dev/null\t"), "got {stdout:?}");
+    assert!(
+        stdout.contains(&format!("\n+++ {full}\t")),
+        "got {stdout:?}"
+    );
+    assert!(stdout.ends_with("@@ -0,0 +1 @@\n+x\n"), "got {stdout:?}");
+
+    let (stdout, stderr, code) = run_diff(&["-c", full, "/dev/null"]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE), "{stderr:?}");
+    assert!(
+        stdout.starts_with(&format!("*** {full}\t")),
+        "got {stdout:?}"
+    );
+    assert!(stdout.contains("\n--- /dev/null\t"), "got {stdout:?}");
+    assert!(
+        stdout.ends_with("*** 1 ****\n- x\n--- 0 ----\n"),
+        "got {stdout:?}"
+    );
+
+    let (stdout, _, code) = run_diff(&[full, "/dev/null"]);
+    assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
+    assert_eq!(stdout, "1d0\n< x\n");
+}

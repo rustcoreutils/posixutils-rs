@@ -225,12 +225,12 @@ impl<'a> FileDiff<'a> {
         path2: PathBuf,
         format_options: &FormatOptions,
     ) -> io::Result<DiffExitStatus> {
-        let path1_file_type = path1
+        let path1_is_dir = path1
             .metadata()
             .map_err(|e| io_error_at(&path1, e))?
-            .file_type();
+            .is_dir();
 
-        if path1_file_type.is_file() {
+        if !path1_is_dir {
             let path1_file = path1.clone();
             let path1_file = path1_file.file_name().expect(COULD_NOT_UNWRAP_FILENAME);
             let path2 = path2.join(path1_file);

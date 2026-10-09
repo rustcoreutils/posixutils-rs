@@ -191,16 +191,20 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         return Ok(DiffExitStatus::NotDifferent);
     }
 
-    let path1_is_file = fs::metadata(&path1)
+    // Only a directory is a directory operand. Anything else -- a regular
+    // file, a character device such as /dev/null, a FIFO -- is a file whose
+    // contents are compared; asking "is it a regular file?" instead sent
+    // /dev/null down the directory path, looking for "/dev/null/NAME".
+    let path1_is_dir = fs::metadata(&path1)
         .map_err(|e| io_error_at(&path1, e))?
-        .is_file();
-    let path2_is_file = fs::metadata(&path2)
+        .is_dir();
+    let path2_is_dir = fs::metadata(&path2)
         .map_err(|e| io_error_at(&path2, e))?
-        .is_file();
+        .is_dir();
 
-    if path1_is_file && path2_is_file {
+    if !path1_is_dir && !path2_is_dir {
         FileDiff::file_diff(path1, path2, &format_options, None)
-    } else if !path1_is_file && !path2_is_file {
+    } else if path1_is_dir && path2_is_dir {
         let options = option_arguments(&args.file1, &args.file2);
         Ok(DirDiff::dir_diff(
             path1,

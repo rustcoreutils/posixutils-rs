@@ -622,3 +622,23 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("xargs", &[opt, "-zq", "--help"]);
     }
 }
+
+// XBD 12.2, Guideline 9: xargs's options all come before the utility, so
+// every word after the utility name belongs to the utility. `xargs touch -t
+// STAMP` traced the command and ran `touch STAMP`, and `xargs -r0 rm -r` was
+// refused as a repeated `-r`.
+#[test]
+fn options_after_utility_belong_to_the_utility() {
+    // echo does not take -t, -r or -x as options, so it prints them.
+    xargs_test("x\n", "-t x\n", vec!["echo", "-t"]);
+    xargs_test("x\0", "-r x\n", vec!["-r0", "echo", "-r"]);
+    xargs_test("x\n", "-x -L 1 x\n", vec!["echo", "-x", "-L", "1"]);
+}
+
+// `--` still ends xargs's options, and a `--` after the utility name is one of
+// the utility's arguments.
+#[test]
+fn double_dash_ends_options_and_later_one_is_passed_through() {
+    xargs_test("x\n", "-t x\n", vec!["--", "echo", "-t"]);
+    xargs_test("x\n", "-- -t x\n", vec!["echo", "--", "-t"]);
+}

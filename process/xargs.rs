@@ -118,11 +118,35 @@ struct Args {
     )]
     exit: bool,
 
-    #[arg(default_value = "echo", help = gettext("Utility to invoke (default: echo)"))]
+    // XBD 12.2 Guideline 9: xargs's options all precede the utility, so the
+    // utility name and every word after it are one trailing operand list.
+    // Two separate positionals let clap go on parsing options after the
+    // utility name: `xargs touch -t STAMP` traced the command instead of
+    // passing `-t` to touch.
+    #[arg(
+        value_name = "UTILITY",
+        trailing_var_arg = true,
+        help = gettext("Utility to invoke (default: echo) and its arguments")
+    )]
+    command: Vec<String>,
+
+    #[arg(skip)]
     util: String,
 
-    #[arg(allow_hyphen_values = true, help = gettext("Utility arguments"))]
+    #[arg(skip)]
     util_args: Vec<String>,
+}
+
+impl Args {
+    /// Parse the command line and split the operand list into the utility
+    /// and its arguments.
+    fn parse_command_line() -> Self {
+        let mut args = Args::parse();
+        let mut command = std::mem::take(&mut args.command).into_iter();
+        args.util = command.next().unwrap_or_else(|| String::from("echo"));
+        args.util_args = command.collect();
+        args
+    }
 }
 
 /// Result of executing a utility
@@ -827,7 +851,7 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
 fn main() {
     diag::init_locale("xargs");
 
-    let args = Args::parse();
+    let args = Args::parse_command_line();
 
     let exit_code = match read_and_spawn(&args) {
         Ok(code) => code,

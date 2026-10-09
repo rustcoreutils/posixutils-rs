@@ -22,6 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use crate::modes::made::{self, verify_made_dir, MadeNode, MadeTrust};
+use crate::modes::pins::MadeFile;
 use plib::madefs::{cvt, fstat, fstatat, lstat_at};
 use plib::madefs::{ChainTrust, FoundDir, NamedAnchor, Preserve, SEARCH_ONLY};
 use std::cell::RefCell;
@@ -1395,6 +1396,13 @@ impl<'a> LinkSource<'a> {
             }
         }
         let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        // A pin the caller holds, not linked through, must still be the file.
+        if let Some(pin) = expected.and_then(|e| e.pin) {
+            let st = fstat(pin.as_raw_fd()).map_err(|_| source_changed())?;
+            if expected.is_some_and(|e| file_id(&st) != e.id) {
+                return Err(source_changed());
+            }
+        }
         if let Some(expected) = expected.filter(|e| e.ctime.is_some()) {
             // The residual without procfs: a file removed and made again
             // with this number and ctime between this check and the link.
@@ -1441,6 +1449,14 @@ impl<'a> LinkSource<'a> {
         // A pin the caller holds is the file itself; one opened by name must
         // show the identity, and the ctime where known, of the file meant.
         let st = fstat(pin.as_raw_fd()).map_err(|_| source_changed())?;
+        // A symbolic link cannot be linked through its `self/fd/N` entry:
+        // `AT_SYMLINK_FOLLOW` goes on through the link to what it names. It
+        // is linked by name, checked by identity and ctime before and after;
+        // a pin the caller holds keeps its number from being reused
+        // meanwhile.
+        if st.st_mode & libc::S_IFMT == libc::S_IFLNK && !follow {
+            return Ok(None);
+        }
         let is_expected = match pin {
             PinFd::Borrowed(_) => file_id(&st) == expected.id,
             PinFd::Owned(_) => expected.matches(&st),
@@ -2028,9 +2044,35 @@ pub(crate) fn set_made_node_attrs(
     attrs: &Attrs,
     policy: &AttrPolicy,
 ) -> PaxResult<()> {
+    set_made_node_attrs_recording(dirfd, name, made_type, attrs, policy, &mut None)
+}
+
+/// `set_made_node_attrs`, leaving in `made` the node as a later name of it
+/// is to be linked to it (`MadeFile`) once it is pinned and checked to be the
+/// one made -- as it is left, whether or not its attributes all took.
+pub(crate) fn set_made_node_attrs_recording(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    made_type: libc::mode_t,
+    attrs: &Attrs,
+    policy: &AttrPolicy,
+    made: &mut Option<MadeFile>,
+) -> PaxResult<()> {
     let node = MadeNode::pin(dirfd, name, made_type)?;
+    let applied = apply_node_attrs(&node, made_type, attrs, policy);
+    *made = node.made_file();
+    applied
+}
+
+/// The attributes `set_made_node_attrs` gives a node, through its pin.
+fn apply_node_attrs(
+    node: &MadeNode<'_>,
+    made_type: libc::mode_t,
+    attrs: &Attrs,
+    policy: &AttrPolicy,
+) -> PaxResult<()> {
     if node.trust() == MadeTrust::ParentOwnerOnly {
-        set_node_times(&node, attrs, policy);
+        set_node_times(node, attrs, policy);
         return owner_unverified(policy);
     }
 
@@ -2039,7 +2081,7 @@ pub(crate) fn set_made_node_attrs(
     if made_type != libc::S_IFLNK {
         node.chmod(policy.mode(attrs, owner_set) as libc::mode_t)?;
     }
-    set_node_times(&node, attrs, policy);
+    set_node_times(node, attrs, policy);
     Ok(())
 }
 

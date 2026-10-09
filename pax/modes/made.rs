@@ -25,6 +25,7 @@
 //! The trust rules and the pinned-inode primitives are cp's, shared through
 //! `plib::madefs`.
 
+use crate::modes::pins::MadeFile;
 pub(crate) use plib::madefs::MadeTrust;
 use plib::madefs::{cvt, fs_owners, fstat, made_by_us, others_can_rename, FsOwners, MadeObject};
 #[cfg(target_os = "linux")]
@@ -160,6 +161,12 @@ mod linux {
             })
         }
 
+        /// The node as a later name of it is to be linked to it: pinned by a
+        /// duplicate of this pin.
+        pub(crate) fn made_file(&self) -> Option<MadeFile> {
+            MadeFile::held(self.fd.as_fd()).ok()
+        }
+
         pub(crate) fn trust(&self) -> MadeTrust {
             self.trust
         }
@@ -283,6 +290,21 @@ mod other {
                 id,
             };
             Ok(MadeNode { held, trust })
+        }
+
+        /// The node as a later name of it is to be linked to it, known by its
+        /// identity and ctime: nothing here can be linked through a
+        /// descriptor.
+        pub(crate) fn made_file(&self) -> Option<MadeFile> {
+            let st = match self.held {
+                Held::Fd(ref fd) => fstat(fd.as_raw_fd()).ok()?,
+                Held::Name {
+                    dirfd, name, id, ..
+                } => lstat_at(dirfd.as_raw_fd(), name)
+                    .ok()
+                    .filter(|st| file_id(st) == id)?,
+            };
+            Some(MadeFile::unpinned(&st))
         }
 
         pub(crate) fn trust(&self) -> MadeTrust {

@@ -15,8 +15,8 @@ use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, link_replacing_with, make_dir_at, set_attrs_fd,
-    set_made_node_attrs, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, Expected, MemberPath,
-    PendingDirs,
+    set_made_node_attrs_recording, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, Expected,
+    MemberPath, PendingDirs,
 };
 use crate::modes::pins::{MadeFile, PinBudget};
 use crate::modes::select::Selector;
@@ -153,7 +153,19 @@ fn extract_members<R: ArchiveReader>(
             records.apply(&mut entry);
         }
         links.sets.count_name(&entry);
-        if select_member(&mut selector, &mut entry, options, &mut prompter, tree)? {
+        let mut renamed_from = None;
+        let selected = select_member(
+            &mut selector,
+            &mut entry,
+            options,
+            &mut prompter,
+            tree,
+            &mut renamed_from,
+        )?;
+        if let Some(before) = renamed_from.filter(|_| selected) {
+            links.alias(&before, &entry.path);
+        }
+        if selected {
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
             // set a non-zero exit, but continue with the next member. Skip any
             // unconsumed data of the failed entry to realign the reader.
@@ -209,6 +221,7 @@ fn select_member(
     options: &ReadOptions,
     prompter: &mut Option<InteractivePrompter>,
     tree: &DirTree,
+    renamed_from: &mut Option<PathBuf>,
 ) -> PaxResult<bool> {
     let Some(selection) = selector.select(entry) else {
         return Ok(false);
@@ -228,7 +241,9 @@ fn select_member(
         match p.prompt(&entry.path)? {
             RenameResult::Skip => return Ok(false),
             RenameResult::UseOriginal => {}
-            RenameResult::Rename(new_path) => entry.path = new_path,
+            RenameResult::Rename(new_path) => {
+                *renamed_from = Some(std::mem::replace(&mut entry.path, new_path));
+            }
         }
     }
     Ok(!(options.update && options.update_final_name && !is_archive_newer(tree, entry)))
@@ -384,7 +399,10 @@ fn extract_entry<R: ArchiveReader>(
             }
         }
         EntryType::Symlink => {
-            extract_symlink(pfd, name, entry, options)?;
+            let mut made = None;
+            let result = extract_symlink(pfd, name, entry, options, &mut made);
+            links.record(&member, made);
+            result?;
             archive.skip_data()?;
         }
         EntryType::Hardlink => {
@@ -392,19 +410,21 @@ fn extract_entry<R: ArchiveReader>(
             archive.skip_data()?;
         }
         EntryType::Regular => {
-            let sets = &mut links.sets;
-            let made = extract_regular(archive, tree, pfd, &member, entry, options, sets)?;
-            if let Some(made) = made {
-                links.record_made(member.key(), made);
-            }
+            extract_regular(archive, tree, pfd, &member, entry, options, links)?;
             archive.skip_data()?; // Skip padding to block boundary
         }
         EntryType::BlockDevice | EntryType::CharDevice => {
-            extract_device(pfd, name, entry, options)?;
+            let mut made = None;
+            let result = extract_device(pfd, name, entry, options, &mut made);
+            links.record(&member, made);
+            result?;
             archive.skip_data()?;
         }
         EntryType::Fifo => {
-            extract_fifo(pfd, name, entry, options)?;
+            let mut made = None;
+            let result = extract_fifo(pfd, name, entry, options, &mut made);
+            links.record(&member, made);
+            result?;
             archive.skip_data()?;
         }
         EntryType::Socket => {
@@ -476,6 +496,7 @@ fn extract_symlink(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made: &mut Option<MadeFile>,
 ) -> PaxResult<()> {
     let target = entry
         .link_target
@@ -493,7 +514,7 @@ fn extract_symlink(
     })?;
 
     if created {
-        set_made_attrs(dirfd, name, libc::S_IFLNK, entry, options)?;
+        set_made_attrs(dirfd, name, libc::S_IFLNK, entry, options, made)?;
     }
     Ok(())
 }
@@ -507,6 +528,9 @@ struct Links {
     /// tar link member's target -- known from the descriptor that made it.
     made: HashMap<Vec<u8>, MadeFile>,
     pins: PinBudget<PinKey>,
+    /// The name -i gave each member it renamed, by the member path
+    /// (`MemberPath::key`) it had before.
+    aliases: HashMap<Vec<u8>, PathBuf>,
 }
 
 /// What holds a pin in `Links`.
@@ -524,6 +548,7 @@ impl Links {
             sets: LinkSets::default(),
             made: HashMap::new(),
             pins: PinBudget::new(),
+            aliases: HashMap::new(),
         }
     }
 
@@ -546,6 +571,29 @@ impl Links {
         self.note(PinKey::Member(key), pinned);
     }
 
+    /// Note that -i renamed the member named `before` (after -s) to `after`.
+    fn alias(&mut self, before: &Path, after: &Path) {
+        if let Ok(Some(before)) = MemberPath::parse(before) {
+            self.aliases.insert(before.key(), after.to_path_buf());
+        }
+    }
+
+    /// The name a link member's `target` is to be found at: the name -i gave
+    /// that member, where it gave one. A link member names its target by its
+    /// name in the archive (after -s), which -i does not rename.
+    fn link_target(&self, target: PathBuf) -> PathBuf {
+        let key = MemberPath::parse(&target).ok().flatten().map(|m| m.key());
+        key.and_then(|key| self.aliases.get(&key).cloned())
+            .unwrap_or(target)
+    }
+
+    /// Record what this run made for `member`, if anything.
+    fn record(&mut self, member: &MemberPath, made: Option<MadeFile>) {
+        if let Some(made) = made {
+            self.record_made(member.key(), made);
+        }
+    }
+
     /// Forget what this run made at the member path `key`: something else is
     /// being put there.
     fn forget(&mut self, key: &[u8]) {
@@ -557,7 +605,9 @@ impl Links {
     /// `PinBudget::note`, closing the oldest pin -- a set's or a file's --
     /// when the budget is over.
     fn note(&mut self, key: PinKey, pinned: bool) {
-        let Links { sets, made, pins } = self;
+        let Links {
+            sets, made, pins, ..
+        } = self;
         pins.note(key, pinned, |oldest| match oldest {
             PinKey::Set(key) => {
                 if let Some(set) = sets.by_key_mut(*key) {
@@ -588,6 +638,7 @@ fn extract_hardlink(
             "hard link target not found".to_string(),
         ));
     };
+    let target = links.link_target(target);
 
     let Some(target_member) = MemberPath::parse(&target)? else {
         return Err(PaxError::InvalidHeader(
@@ -696,21 +747,34 @@ fn extract_regular<R: ArchiveReader>(
     member: &MemberPath,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    link_sets: &mut LinkSets<CreatedSet>,
-) -> PaxResult<Option<MadeFile>> {
-    if let Some(set) = link_sets.find_mut(entry) {
-        join_link_set(archive, tree, dirfd, member, entry, options, set)?;
-        return Ok(None);
+    links: &mut Links,
+) -> PaxResult<()> {
+    if let Some(set) = links.sets.find_mut(entry) {
+        return join_link_set(archive, tree, dirfd, member, entry, options, set);
     }
 
-    let made = extract_file(archive, dirfd, member.leaf.as_c_str(), entry, options)?;
-    if let Some(file) = made.as_ref().map(MadeFile::id) {
-        link_sets.insert(entry, || {
-            let names = vec![member.display.clone()];
-            CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
-        });
+    let mut made = None;
+    let result = extract_file(
+        archive,
+        dirfd,
+        member.leaf.as_c_str(),
+        entry,
+        options,
+        &mut made,
+    );
+    // A file made is recorded for a later link member to name, even when its
+    // data or attributes then failed: it is at that name all the same.
+    if let Some(made) = made {
+        if result.is_ok() {
+            let file = made.id();
+            links.sets.insert(entry, || {
+                let names = vec![member.display.clone()];
+                CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
+            });
+        }
+        links.record_made(member.key(), made);
     }
-    Ok(made)
+    result
 }
 
 /// Extract a later name of a link set whose file is already on disk.
@@ -760,8 +824,9 @@ fn join_link_set<R: ArchiveReader>(
     }
 
     let holders = set.holders(tree);
-    let Some(file) = extract_file(archive, dirfd, name, entry, options)?.map(|made| made.id())
-    else {
+    let mut made = None;
+    extract_file(archive, dirfd, name, entry, options, &mut made)?;
+    let Some(file) = made.as_ref().map(MadeFile::id) else {
         // -k kept what was there; the data is still the earlier names'.
         return fill_link_set(archive, tree, entry, options, set);
     };
@@ -796,9 +861,14 @@ fn fill_link_set<R: ArchiveReader>(
     };
     let dir = Rc::clone(dir);
     let (temp, file) = create_temp_file(dir.as_fd(), entry, options)?;
-    let filled = write_file_data(archive, file, entry, options)
-        .map(|made| made.id())
-        .and_then(|id| Ok((id, move_names_to(holders, dir.as_fd(), &temp, id)?)));
+    let mut made = None;
+    let filled = write_file_data(archive, file, entry, options, &mut made).and_then(|()| {
+        let id = made
+            .as_ref()
+            .map(MadeFile::id)
+            .ok_or_else(crate::modes::made::replaced)?;
+        Ok((id, move_names_to(holders, dir.as_fd(), &temp, id)?))
+    });
     let removed = unlink_at(dir.as_fd(), &temp);
     let (file, names) = filled?;
     removed?;
@@ -880,6 +950,7 @@ fn extract_device(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made: &mut Option<MadeFile>,
 ) -> PaxResult<()> {
     // makedev has different signatures on different platforms:
     // - Linux: makedev(major: u32, minor: u32) -> u64
@@ -917,7 +988,7 @@ fn extract_device(
         Err(e) => return Err(e),
     }
 
-    set_made_attrs(dirfd, name, type_bits, entry, options)
+    set_made_attrs(dirfd, name, type_bits, entry, options, made)
 }
 
 /// Extract a FIFO
@@ -926,6 +997,7 @@ fn extract_fifo(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made: &mut Option<MadeFile>,
 ) -> PaxResult<()> {
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         let r = unsafe {
@@ -952,18 +1024,20 @@ fn extract_fifo(
         Err(e) => return Err(e),
     }
 
-    set_made_attrs(dirfd, name, libc::S_IFIFO, entry, options)
+    set_made_attrs(dirfd, name, libc::S_IFIFO, entry, options, made)
 }
 
-/// Extract a regular file, returning the (st_dev, st_ino) of the file created,
-/// or `None` when -k left an existing one in place.
+/// Extract a regular file, leaving in `made` the file created -- whether or
+/// not its data and attributes then all went in -- or `None` when -k left an
+/// existing one in place.
 fn extract_file<R: ArchiveReader>(
     archive: &mut R,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<Option<MadeFile>> {
+    made: &mut Option<MadeFile>,
+) -> PaxResult<()> {
     let mut opened: Option<File> = None;
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         opened = Some(create_file(dirfd, name, entry, options)?);
@@ -974,9 +1048,9 @@ fn extract_file<R: ArchiveReader>(
         // -k: the name already exists, so the member is skipped. Its data is
         // consumed by the caller's skip_data.
         debug_assert!(!created);
-        return Ok(None);
+        return Ok(());
     };
-    write_file_data(archive, file, entry, options).map(Some)
+    write_file_data(archive, file, entry, options, made)
 }
 
 /// Create `name` in `dirfd` exclusively, never following a symlink, with the
@@ -1028,17 +1102,23 @@ fn write_file_data<R: ArchiveReader>(
     mut file: File,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<MadeFile> {
-    copy_file_data(archive, &mut file, entry.size)?;
-
-    // Through the descriptor the data was just written to, not by name.
-    set_attrs_fd(file.as_fd(), &attrs_of(entry, options), &policy_of(options))?;
-    // Known once its attributes are set, which change its ctime.
-    let made = MadeFile::of(file.as_fd())?;
+    made: &mut Option<MadeFile>,
+) -> PaxResult<()> {
+    // Known from the descriptor that made it, whatever happens next.
+    *made = Some(MadeFile::of(file.as_fd())?);
+    let written = copy_file_data(archive, &mut file, entry.size).and_then(|()| {
+        // Through the descriptor the data was just written to, not by name.
+        set_attrs_fd(file.as_fd(), &attrs_of(entry, options), &policy_of(options))
+    });
+    // Its data and attributes changed its ctime.
+    if let Some(made) = made.as_mut() {
+        made.refresh(file.as_fd());
+    }
+    written?;
     // A filesystem that defers writes -- NFS, a quota checked late -- reports
     // their failure here, and the member is then not extracted after all.
     crate::blocked_io::close_file(file)?;
-    Ok(made)
+    Ok(())
 }
 
 /// Copy file data from archive to file
@@ -1157,9 +1237,10 @@ fn set_made_attrs(
     made_type: libc::mode_t,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made: &mut Option<MadeFile>,
 ) -> PaxResult<()> {
     let attrs = attrs_of(entry, options);
-    set_made_node_attrs(dirfd, name, made_type, &attrs, &policy_of(options))
+    set_made_node_attrs_recording(dirfd, name, made_type, &attrs, &policy_of(options), made)
 }
 
 #[cfg(all(test, unix))]
@@ -1380,7 +1461,7 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts).unwrap();
+        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts, &mut None).unwrap();
         assert_eq!(mode(), 0o755);
 
         // Preserved: exact 0o777 regardless of umask.
@@ -1391,7 +1472,7 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts).unwrap();
+        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts, &mut None).unwrap();
         assert_eq!(mode(), 0o777);
     }
 

@@ -56,16 +56,57 @@ impl MadeFile {
         })
     }
 
+    /// A node this run has just made and given its attributes, already held
+    /// by the `O_PATH` descriptor `pin` (`MadeNode`): pinned by a duplicate
+    /// of it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn held(pin: BorrowedFd<'_>) -> io::Result<Self> {
+        let st = fstat(pin.as_raw_fd())?;
+        let dup = unsafe { libc::fcntl(pin.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        Ok(MadeFile {
+            id: file_id(&st),
+            ctime: ctime_of(&st),
+            pin: (dup >= 0).then(|| unsafe { OwnedFd::from_raw_fd(dup) }),
+        })
+    }
+
+    /// A file this run has just made, known only by the status `st` -- where
+    /// nothing holds it.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn unpinned(st: &libc::stat) -> Self {
+        MadeFile {
+            id: file_id(st),
+            ctime: ctime_of(st),
+            pin: None,
+        }
+    }
+
+    /// Take the `ctime` the file open on `fd`, this one, shows now: after this
+    /// run has written it or set its attributes.
+    pub(crate) fn refresh(&mut self, fd: BorrowedFd<'_>) {
+        if let Ok(st) = fstat(fd.as_raw_fd()) {
+            if file_id(&st) == self.id {
+                self.ctime = ctime_of(&st);
+            }
+        }
+    }
+
     /// Its `(st_dev, st_ino)`.
     pub(crate) fn id(&self) -> (u64, u64) {
         self.id
     }
 
-    /// What `link_replacing_with` is to link: this file.
+    /// What `link_replacing_with` is to link: this file, with the `ctime` it
+    /// shows now where it is pinned, and as last left otherwise.
     pub(crate) fn expected(&self) -> Expected<'_> {
+        let pinned_ctime = self
+            .pin
+            .as_ref()
+            .and_then(|pin| fstat(pin.as_raw_fd()).ok())
+            .map(|st| ctime_of(&st));
         Expected {
             id: self.id,
-            ctime: Some(self.ctime),
+            ctime: Some(pinned_ctime.unwrap_or(self.ctime)),
             pin: self.pin.as_ref().map(|pin| pin.as_fd()),
         }
     }

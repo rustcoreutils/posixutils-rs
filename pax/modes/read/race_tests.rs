@@ -419,3 +419,154 @@ fn fifo_and_symlink_take_their_attributes() {
     assert!(md.file_type().is_symlink());
     assert_eq!(md.mtime(), 23456);
 }
+
+/// An archive of `members` whose data cannot be read: every regular member
+/// fails after its file is created.
+#[cfg(target_os = "linux")]
+struct DataFails(std::vec::IntoIter<ArchiveEntry>);
+
+#[cfg(target_os = "linux")]
+impl ArchiveReader for DataFails {
+    fn read_entry(&mut self) -> PaxResult<Option<ArchiveEntry>> {
+        Ok(self.0.next())
+    }
+    fn read_data(&mut self, _buf: &mut [u8]) -> PaxResult<usize> {
+        Err(PaxError::Io(std::io::Error::other("data unreadable")))
+    }
+    fn skip_data(&mut self) -> PaxResult<()> {
+        Ok(())
+    }
+}
+
+/// A tar link member `g` naming the member `target`.
+fn link_member(target: &str) -> ArchiveEntry {
+    let mut entry = own_member("g", EntryType::Hardlink, 0o644);
+    entry.link_target = Some(PathBuf::from(target));
+    entry
+}
+
+/// Extract `members` in order below `dest` with `archive`, a writer renaming
+/// the file `planted` over `target` just before the link to it is made.
+#[cfg(target_os = "linux")]
+fn extract_linked_while_planted<R: ArchiveReader>(
+    dest: &Path,
+    archive: &mut R,
+    target: &'static CStr,
+) {
+    let tree = DirTree::open_path(dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let options = ReadOptions::default();
+    let path = dest.to_path_buf();
+    let hook = move |point, _: libc::c_int, name: &CStr| {
+        if point == Point::Linking && name == target {
+            std::fs::write(path.join("planted"), "planted\n").unwrap();
+            let target = std::ffi::OsStr::from_bytes(target.to_bytes());
+            std::fs::rename(path.join("planted"), path.join(target)).unwrap();
+        }
+    };
+    race_hook::with_hook(hook, || {
+        while let Some(entry) = archive.read_entry().unwrap() {
+            let _ = extract_entry(archive, &entry, &options, &mut links, &tree, &mut pending);
+        }
+    });
+}
+
+/// A link member naming a symbolic link member is linked to that very link,
+/// the one this run made, or not at all -- never to whatever is at its name
+/// by then. Only regular files were recorded; a symbolic link was linked by
+/// name, whatever the name held. (A symbolic link cannot be linked through
+/// its pin, so with its name taken the member fails.)
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_to_a_symlink_member_links_only_the_link_made() {
+    let tmp = TempDir::new().unwrap();
+    let mut symlink = own_member("s", EntryType::Symlink, 0o777);
+    symlink.link_target = Some(PathBuf::from("made-target"));
+    let mut archive = Members(vec![symlink, link_member("s")].into_iter());
+    extract_linked_while_planted(tmp.path(), &mut archive, c"s");
+    let g = tmp.path().join("g");
+    if std::fs::symlink_metadata(&g).is_ok() {
+        assert_eq!(
+            std::fs::read_link(&g).ok(),
+            Some(PathBuf::from("made-target")),
+            "g is not the symbolic link made"
+        );
+    }
+}
+
+/// Without a writer in the way, the link member is linked to the symbolic
+/// link made: by name, checked by identity and ctime.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_to_a_symlink_member_is_linked() {
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let options = ReadOptions::default();
+    let mut symlink = own_member("s", EntryType::Symlink, 0o777);
+    symlink.link_target = Some(PathBuf::from("made-target"));
+    let mut archive = Members(vec![symlink, link_member("s")].into_iter());
+    while let Some(entry) = archive.read_entry().unwrap() {
+        extract_entry(
+            &mut archive,
+            &entry,
+            &options,
+            &mut links,
+            &tree,
+            &mut pending,
+        )
+        .unwrap();
+    }
+    let g = std::fs::symlink_metadata(tmp.path().join("g")).unwrap();
+    let s = std::fs::symlink_metadata(tmp.path().join("s")).unwrap();
+    assert_eq!((g.dev(), g.ino()), (s.dev(), s.ino()));
+}
+
+/// A regular member whose data fails after its file is made still leaves
+/// that file, and a link member naming it is linked to it -- not to what is
+/// at its name by then.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_to_a_failed_member_links_the_file_made() {
+    let tmp = TempDir::new().unwrap();
+    let mut file = own_member("f", EntryType::Regular, 0o644);
+    file.size = 10;
+    let mut archive = DataFails(vec![file, link_member("f")].into_iter());
+    extract_linked_while_planted(tmp.path(), &mut archive, c"f");
+    let g = std::fs::read_to_string(tmp.path().join("g")).unwrap_or_default();
+    assert_ne!(g, "planted\n", "g was linked to the planted file");
+}
+
+/// -i renames a member as it is extracted; a later link member still names
+/// it by its name in the archive, and is linked to it at the name it was
+/// given -- the file this run made -- not to whatever is at the old name.
+#[test]
+fn link_member_follows_a_target_renamed_by_i() {
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let options = ReadOptions::default();
+    // The member `f`, renamed to `renamed` at the prompt.
+    let file = own_member("renamed", EntryType::Regular, 0o644);
+    links.alias(Path::new("f"), Path::new("renamed"));
+    let mut archive = Members(vec![file, link_member("f")].into_iter());
+    while let Some(entry) = archive.read_entry().unwrap() {
+        let _ = extract_entry(
+            &mut archive,
+            &entry,
+            &options,
+            &mut links,
+            &tree,
+            &mut pending,
+        );
+    }
+    let g = std::fs::metadata(tmp.path().join("g")).ok();
+    let made = std::fs::metadata(tmp.path().join("renamed")).unwrap();
+    assert_eq!(
+        g.map(|g| (g.dev(), g.ino())),
+        Some((made.dev(), made.ino()))
+    );
+}

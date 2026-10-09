@@ -61,15 +61,20 @@ impl MatchIter<'_> {
 
     /// The offset just past the character that starts at `pos` in `bytes`.
     fn next_char(&self, pos: usize) -> usize {
-        let mut next = pos + 1;
-        if !charset::single_byte() {
-            // UTF-8: skip continuation bytes.
-            while next < self.bytes.len() && (self.bytes[next] & 0xc0) == 0x80 {
-                next += 1;
-            }
-        }
-        next
+        next_char(&self.bytes, pos)
     }
+}
+
+/// The offset just past the character that starts at `pos` in `bytes`.
+fn next_char(bytes: &[u8], pos: usize) -> usize {
+    let mut next = pos + 1;
+    if !charset::single_byte() {
+        // UTF-8: skip continuation bytes.
+        while next < bytes.len() && (bytes[next] & 0xc0) == 0x80 {
+            next += 1;
+        }
+    }
+    next
 }
 
 impl Iterator for MatchIter<'_> {
@@ -117,10 +122,26 @@ impl Regex {
         })
     }
 
-    /// Returns the first match location in the raw input bytes `bytes`, as
-    /// byte offsets.
-    pub fn find_bytes(&self, bytes: &[u8]) -> Option<RegexMatch> {
-        self.inner.find_bytes(bytes).map(RegexMatch::from)
+    /// Returns the first match in the raw input bytes `bytes` that is not
+    /// empty, as byte offsets: an empty match separates nothing.
+    pub fn find_nonempty_bytes(&self, bytes: &[u8]) -> Option<RegexMatch> {
+        let mut start = 0;
+        while start <= bytes.len() {
+            let subject = &bytes[start..];
+            let m = if start == 0 {
+                self.inner.find_bytes(subject)?
+            } else {
+                self.inner.find_notbol_bytes(subject)?
+            };
+            if m.start != m.end {
+                return Some(RegexMatch {
+                    start: start + m.start,
+                    end: start + m.end,
+                });
+            }
+            start = next_char(bytes, start + m.start);
+        }
+        None
     }
 
     /// Returns an iterator over all match locations in `string`.

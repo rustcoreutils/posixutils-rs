@@ -1651,3 +1651,47 @@ fn awk_append_to_a_variable_is_linear() {
         assert_eq!(status, Some(0), "{program}");
     }
 }
+
+// An empty match of a regular-expression RS does not end a record, as in
+// mawk: RS = "()" or "x*" made every read return an empty record without
+// consuming input, so awk printed empty records for ever (gawk's test
+// rsnullre).  "b*" still separates at each run of b's.
+#[test]
+fn awk_empty_rs_match_does_not_end_a_record() {
+    let cases = [
+        (
+            "BEGIN { RS = \"()\" } { printf \"<%s>\", $0 }",
+            "foo\n",
+            "<foo\n>",
+        ),
+        (
+            "BEGIN { RS = \"x*\" } { printf \"<%s>\", $0 }",
+            "foo\n",
+            "<foo\n>",
+        ),
+        (
+            "BEGIN { RS = \"b*\" } { printf \"<%s>\", $0 }",
+            "abba\ncd",
+            "<a><a\ncd>",
+        ),
+        (
+            "BEGIN { RS = \"b*\" } { printf \"<%s>\", $0 }",
+            "xabbay",
+            "<xa><ay>",
+        ),
+        (
+            "BEGIN { RS = \"b*|;\" } { printf \"<%s>\", $0 }",
+            "a;b;c",
+            "<a><><><c>",
+        ),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+}

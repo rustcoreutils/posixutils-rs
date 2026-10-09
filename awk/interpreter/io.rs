@@ -71,7 +71,7 @@ fn ere_try_match(buf: &[u8], re: &Regex) -> Result<Option<(String, Vec<u8>)>, St
     if buf.is_empty() {
         return Ok(None);
     }
-    if let Some(m) = re.find_bytes(buf) {
+    if let Some(m) = re.find_nonempty_bytes(buf) {
         let record = bytes_to_string(buf[..m.start].to_vec());
         let remainder = buf[m.end..].to_vec();
         Ok(Some((record, remainder)))

@@ -124,3 +124,17 @@ fn uudecode_writes_to_a_character_device() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(mode_of(null), before);
 }
+
+// Decoded data written to standard output has no <newline> to flush it, so it
+// stayed in stdout's line buffer until exit, where its write error was lost.
+#[test]
+fn uudecode_reports_write_error_on_standard_output() {
+    let encoded = b"begin 644 -\n!>```\n`\nend\n";
+    plib::testing::assert_write_error_on_full_device("uudecode", &[], encoded, 1);
+    plib::testing::assert_write_error_on_full_device(
+        "uudecode",
+        &["-o", "/dev/stdout"],
+        encoded,
+        1,
+    );
+}

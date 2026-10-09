@@ -204,7 +204,18 @@ fn decode_file(args: &Args) -> io::Result<()> {
     let out_path = args.outfile.as_ref().unwrap_or(&header.out);
 
     if is_stdout_cookie(out_path) {
-        io::stdout().write_all(&out)?;
+        // Flushed here: decoded data need not end in a <newline>, and what
+        // is left in stdout's line buffer reaches it only at exit, where a
+        // write error is lost.
+        // A failure is a write error, not one of the input file's.
+        let mut stdout = io::stdout().lock();
+        if let Err(e) = stdout.write_all(&out).and_then(|()| stdout.flush()) {
+            diag::error(&format!(
+                "{}: {}",
+                gettext("write error"),
+                diag::io_error_text(&e)
+            ));
+        }
     } else {
         write_output(out_path, header.lower_perm_bits, &out)?;
     }

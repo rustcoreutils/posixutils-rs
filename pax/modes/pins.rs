@@ -73,7 +73,7 @@ impl MadeFile {
 
     /// A file this run has just made, known only by the status `st` -- where
     /// nothing holds it.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(test, not(target_os = "linux")))]
     pub(crate) fn unpinned(st: &libc::stat) -> Self {
         MadeFile {
             id: file_id(st),
@@ -123,6 +123,16 @@ impl MadeFile {
             if let Ok(st) = fstat(pin.as_raw_fd()) {
                 self.ctime = ctime_of(&st);
             }
+        }
+    }
+
+    /// The same file, known by identity and ctime alone, for a record that
+    /// holds no pin of its own.
+    pub(crate) fn known(&self) -> Self {
+        MadeFile {
+            id: self.id,
+            ctime: self.ctime,
+            pin: None,
         }
     }
 

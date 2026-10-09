@@ -352,27 +352,6 @@ fn made_directories_take_their_mode_and_an_existing_one_keeps_its_own() {
     assert!(dest.join("e/kept").exists());
 }
 
-/// A terminal found where a link set's first name was made is not pinned --
-/// and must not become the controlling terminal of a pax that has none in
-/// the open before the identity check refuses it.
-#[cfg(target_os = "linux")]
-#[test]
-fn pin_file_never_adopts_a_terminal() {
-    if !race_hook::in_new_session() {
-        race_hook::rerun_in_new_session(
-            "modes::read::race_tests::pin_file_never_adopts_a_terminal",
-        );
-        return;
-    }
-    let (_master, pts, slave) = race_hook::open_pty();
-    assert!(!race_hook::has_controlling_tty());
-    assert!(pin_file(pts.as_fd(), &slave, (0, 0)).is_none());
-    assert!(
-        !race_hook::has_controlling_tty(),
-        "pinning the file made it the controlling terminal"
-    );
-}
-
 /// A directory this run made for one member, renamed by someone else to the
 /// name of a later member, is not that member's directory: it is met as one
 /// found existing, and in a shared destination keeps its own attributes
@@ -670,4 +649,65 @@ fn link_member_after_a_k_duplicate_links_the_first_file() {
     extract_with_plant_at_link(tmp.path(), &mut archive, &options, "a");
     let g = std::fs::read_to_string(tmp.path().join("g")).unwrap_or_default();
     assert_ne!(g, "planted\n", "g was linked to what was put at the name");
+}
+
+/// A later name of a cpio link set is linked to the set's file, found at an
+/// earlier name. Once the set's pin is closed, a file of someone else's at
+/// that name with the set file's inode number -- the number reused,
+/// simulated by giving the record the planted file's number -- is told
+/// apart by its ctime, and not linked.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_set_name_is_not_linked_to_a_file_with_a_reused_number() {
+    use crate::modes::pins::{ctime_of, MadeFile};
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let root = tree.root();
+    std::fs::write(tmp.path().join("a"), "set\n").unwrap();
+    let made_st = plib::madefs::lstat_at(root.as_raw_fd(), c"a").unwrap();
+    std::fs::write(tmp.path().join("planted"), "planted\n").unwrap();
+    // A later clock tick for the planted file, as a file made after the
+    // set's was removed would have.
+    let planted = tmp.path().join("planted");
+    let mut planted_st = plib::madefs::lstat_at(root.as_raw_fd(), c"planted").unwrap();
+    for _ in 0..200 {
+        if ctime_of(&planted_st) != ctime_of(&made_st) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let perms = std::fs::metadata(&planted).unwrap().permissions();
+        std::fs::set_permissions(&planted, perms).unwrap();
+        planted_st = plib::madefs::lstat_at(root.as_raw_fd(), c"planted").unwrap();
+    }
+    std::fs::rename(&planted, tmp.path().join("a")).unwrap();
+    // The record: the planted file's number, the set file's ctime.
+    let mut reused = made_st;
+    reused.st_dev = planted_st.st_dev;
+    reused.st_ino = planted_st.st_ino;
+    let mut set = CreatedSet {
+        names: vec![PathBuf::from("a")],
+        file: MadeFile::unpinned(&reused),
+        has_data: true,
+    };
+    let entry = ArchiveEntry {
+        nlink: 2,
+        ..own_member("b", EntryType::Regular, 0o644)
+    };
+    let member = MemberPath::parse(Path::new("b")).unwrap().unwrap();
+    let mut archive = Members(Vec::new().into_iter());
+    let options = ReadOptions::default();
+    let _ = join_link_set(
+        &mut archive,
+        &tree,
+        root,
+        &member,
+        &entry,
+        &options,
+        &mut set,
+    );
+    let b = std::fs::read_to_string(tmp.path().join("b")).unwrap_or_default();
+    assert_ne!(
+        b, "planted\n",
+        "the later name was linked to the planted file"
+    );
 }

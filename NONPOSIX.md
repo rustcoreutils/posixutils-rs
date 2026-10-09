@@ -505,12 +505,6 @@ The two GNU checks po4a runs on every PO file
 
  * Symbol type letters `C` (common) and `r` (read-only data), beyond the
    letters POSIX names.
- * The default (non-`-P`) format is GNU's and BSD's column layout: each value
-   zero-padded to the address width (16 digits for a 64-bit object, 8 for a
-   32-bit one) in whatever radix, an undefined symbol's value as that many
-   spaces, then single spaces: `0000000000000000 T sym`.  The radix stays
-   decimal, as XSI requires.  db5.3's build runs
-   `nm *.o | grep " [DTR] " | cut -d" " -f3`.
 
 ### od
 

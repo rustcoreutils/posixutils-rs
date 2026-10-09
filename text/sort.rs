@@ -605,14 +605,31 @@ fn read_inputs(args: &Args) -> Result<Vec<(String, Vec<String>)>, String> {
         };
         let reader = input_stream_dashed(&f)
             .map_err(|e| format!("cannot read: {name}: {}", plib::diag::io_error_text(&e)))?;
-        let br = io::BufReader::new(reader);
-        let mut lines = Vec::new();
-        for line in br.lines() {
-            lines.push(line.map_err(|e| format!("read error: {name}: {e}"))?);
-        }
+        let lines = read_lines(io::BufReader::new(reader), b'\n')
+            .map_err(|e| format!("read error: {name}: {e}"))?;
         out.push((name, lines));
     }
     Ok(out)
+}
+
+/// The lines of `reader`, each ended by `eol` (dropped) or by the end of the
+/// input. Nothing else is taken off: a carriage return before a newline is
+/// part of its line.
+fn read_lines(mut reader: impl BufRead, eol: u8) -> io::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(eol, &mut buf)? == 0 {
+            return Ok(lines);
+        }
+        if buf.last() == Some(&eol) {
+            buf.pop();
+        }
+        let line = String::from_utf8(std::mem::take(&mut buf))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        lines.push(line);
+    }
 }
 
 fn write_output(records: &[Record], args: &Args) -> Result<(), String> {

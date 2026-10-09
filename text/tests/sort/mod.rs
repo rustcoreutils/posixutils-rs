@@ -705,6 +705,13 @@ fn test_dash_non_sole_operand() {
     sort_test(&["-", "-"], "b\na\n", "a\nb\n", 0, "");
 }
 
+/// A line ends at its newline only: a carriage return before it is part of the
+/// line, and is written back out.
+#[test]
+fn test_carriage_return_is_part_of_the_line() {
+    sort_test(&[], "b\na\r\nc\r", "a\r\nb\nc\r\n", 0, "");
+}
+
 // XBD 12.2, Guideline 7: an option-argument may begin with '-'. Each option
 // below used to have the word after it refused as an unknown option.
 #[test]

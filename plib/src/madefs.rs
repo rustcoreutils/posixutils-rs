@@ -444,7 +444,10 @@ impl ChainTrust {
         let st = fstat(dir.as_raw_fd())?;
         let writers = dir_writers(&st, euid, above_owner, start);
         let owner = match writers {
-            DirWriters::Owner { uid } | DirWriters::OwnerAndGroup { uid, .. } if uid != euid => {
+            // Root's own directory, trusted for every user, is no other user's tree.
+            DirWriters::Owner { uid } | DirWriters::OwnerAndGroup { uid, .. }
+                if uid != euid && uid != 0 =>
+            {
                 Some(uid)
             }
             _ => above_owner,
@@ -618,6 +621,10 @@ enum DirWriters {
 /// A directory may be its owner's alone only where its owner is someone the trust can rest
 /// with:
 /// - the effective user, while the chain has gone into no other user's directories;
+/// - root, for every effective user, on the same terms: nobody but root can create entries in
+///   a directory only root can write, and root needs no trick to change anything. Every path
+///   starts in root's directories -- `/`, and on macOS the `/var` and `/tmp` links it holds --
+///   and a user's own tree below them is as safe as root's are;
 /// - for root, on Linux only (`ROOT_WORKS_FOR_USERS`), one user other than root, the one the
 ///   copy or extraction is for -- root extracting into `/home/alice`, which alice owns, with
 ///   the directories a umask of 002 left below it. That user is the owner of the first directory in the chain not root's own, and
@@ -627,7 +634,7 @@ enum DirWriters {
 ///   given since, which proves nothing about who could create entries in it.
 ///
 /// Anyone else, a sticky directory included, counts as others. So does a non-root effective
-/// user meeting a directory not theirs: nobody but root acts for another user.
+/// user meeting a directory neither theirs nor root's: nobody but root acts for another user.
 ///
 /// Not the rule `others_can_rename` follows, on purpose. That one asks whether someone could
 /// have renamed something over a directory the caller has just made, and the sticky bit stops
@@ -680,7 +687,7 @@ fn trusted_owner(
     match above_owner {
         Some(owner) => uid == owner,
         None => {
-            uid == euid || (works_for_users && euid == 0 && uid != 0 && start == ChainStart::Anchor)
+            uid == euid || uid == 0 || (works_for_users && euid == 0 && start == ChainStart::Anchor)
         }
     }
 }
@@ -1799,6 +1806,32 @@ mod tests {
         assert_eq!(unlocated.found_dir(&*root_fd, none), FoundDir::TimesOnly);
         let below = unlocated.found(&root_fd).unwrap();
         assert_eq!(below.found_dir(&*root_fd, mode), FoundDir::LeaveAlone);
+    }
+
+    /// A directory only root can write -- root's, granting nobody else write -- is one nobody
+    /// but root can create entries in, and root needs no trick to change anything: it is
+    /// trusted whoever the user is. It was trusted only for root, so for any other user a
+    /// directory found in `/` took nothing asked for, and so did every named path through a
+    /// link root's own directory holds -- on macOS, every one through `/var` or `/tmp`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_only_root_writes_is_trusted_for_every_user() {
+        let mode = Preserve {
+            mode: true,
+            owner: false,
+        };
+        // `/` as the anchor, for a user other than root.
+        let slash = Rc::new(std::fs::File::open("/").unwrap());
+        let st = super::fstat(slash.as_raw_fd()).unwrap();
+        assert_eq!((st.st_uid, st.st_mode & 0o022), (0, 0), "/ is root's alone");
+        let as_user = ChainTrust::link_as(None, &slash, ChainStart::Anchor, 4242).unwrap();
+        assert_eq!(as_user.found_dir(&*slash, mode), FoundDir::AsRequested);
+
+        // `/proc/self`: a link in /proc (root's, 0555) to the process's own directory.
+        let held = Rc::new(std::fs::File::open("/proc/self").unwrap());
+        let named = ChainTrust::named(Path::new("/proc/self"), &held).unwrap();
+        assert_eq!(named.named_dir(mode), FoundDir::AsRequested);
+        assert_eq!(named.hands.found_dir(&*held, mode), FoundDir::AsRequested);
     }
 
     /// A directory the user names is trusted as named -- unless its name's last component is a

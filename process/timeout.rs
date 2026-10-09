@@ -67,25 +67,18 @@ struct Args {
     #[arg(name = "DURATION", value_parser = parse_duration, help=gettext("The maximum amount of time to allow the utility to run, specified as a decimal number with an optional decimal fraction and an optional suffix."))]
     duration: Duration,
 
-    #[arg(name = "UTILITY", help=gettext("The utility to execute."))]
-    utility: String,
-
-    // `allow_hyphen_values` is what makes `timeout 5 ls -l` work. Without it,
-    // `trailing_var_arg` alone still lets clap try to parse a leading-hyphen
-    // token as one of timeout's own options, so *any* utility invoked with an
-    // option failed with "unexpected argument found" — `timeout 5 ls -l`,
-    // `timeout 5 grep -c ...`, `timeout 5 sh -c '...'`.
-    //
-    // XBD 12.2 Guideline 9 puts all of timeout's options before its operands,
-    // so once DURATION and UTILITY have been consumed every remaining token
-    // belongs to the utility, hyphen or not.
+    // XBD 12.2 Guideline 9: timeout's options all precede the utility, so the
+    // utility name and every word after it are one trailing operand list.
+    // With the utility as a positional of its own, clap went on parsing
+    // options after it: `timeout 10 echo -s KILL x` took `-s KILL` as
+    // timeout's signal.
     #[arg(
-        name = "ARGUMENT",
+        value_name = "UTILITY",
+        required = true,
         trailing_var_arg = true,
-        allow_hyphen_values = true,
-        help = gettext("Arguments to pass to the utility.")
+        help = gettext("The utility to execute and its arguments.")
     )]
-    arguments: Vec<String>,
+    command: Vec<String>,
 }
 
 /// Parses string slice into [Duration].
@@ -381,14 +374,16 @@ fn timeout(args: Args) -> i32 {
         kill_after,
         signal_name,
         duration,
-        utility,
-        arguments,
+        command,
     } = args;
+    let (utility, arguments) = command
+        .split_first()
+        .expect("clap requires the utility operand");
 
-    let utility_path = if Path::new(&utility).is_file() {
+    let utility_path = if Path::new(utility).is_file() {
         utility.clone()
     } else {
-        match search_in_path(&utility) {
+        match search_in_path(utility) {
             Some(path) => path,
             None => {
                 diag::error(&format!(

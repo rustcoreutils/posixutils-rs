@@ -574,3 +574,21 @@ fn test_timeouts_own_options_still_parse_before_operands() {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), "ok");
     }
 }
+
+// XBD 12.2 Guideline 9: once DURATION and UTILITY are read, every later word
+// is the utility's, including one spelled like timeout's own -s, -k, -f or
+// -p. `timeout 10 echo -s KILL x` took `-s KILL` as timeout's signal and ran
+// `echo x`.
+#[test]
+fn test_options_after_utility_belong_to_the_utility() {
+    let out = Command::new(get_binary_path("timeout"))
+        .args(["10", "echo", "-s", "KILL", "-k", "1", "-f", "-p", "x"])
+        .output()
+        .expect("failed to run timeout");
+
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "-s KILL -k 1 -f -p x\n"
+    );
+}

@@ -2141,6 +2141,13 @@ fn run_diff_in(dir: &std::path::Path, args: &[&str]) -> (String, String, Option<
     )
 }
 
+/// `expected`, spelled with `/`, with the platform's separator, which diff
+/// uses to join a directory and an entry name: `\` on Windows.  No file
+/// name or content in these fixtures contains a `/`.
+fn sep(expected: &str) -> String {
+    expected.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 /// Under `-q -r` a differing pair is one line, with no `diff ...` header.
 #[test]
 fn test_diff_brief_recursive() {
@@ -2158,7 +2165,7 @@ fn test_diff_brief_recursive() {
     let (out, err, code) = run_diff_in(base.path(), &["--brief", "-r", "a", "b"]);
     assert_eq!(
         out,
-        "Files a/f and b/f differ\nOnly in b: new\nFiles a/sub/g and b/sub/g differ\n"
+        sep("Files a/f and b/f differ\nOnly in b: new\nFiles a/sub/g and b/sub/g differ\n")
     );
     assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
 }
@@ -2188,18 +2195,18 @@ fn test_diff_new_file_recursive() {
     let (out, err, code) = run_diff_in(dir, &["-N", "-r", "a", "b"]);
     assert_eq!(
         out,
-        "diff -N -r a/f b/f\n1c1\n< x\n---\n> y\n\
-         diff -N -r a/gone b/gone\n1d0\n< old\n\
-         diff -N -r a/new b/new\n0a1\n> n\n\
-         diff -N -r a/sub/q b/sub/q\n1d0\n< q\n"
+        sep("diff -N -r a/f b/f\n1c1\n< x\n---\n> y\n\
+             diff -N -r a/gone b/gone\n1d0\n< old\n\
+             diff -N -r a/new b/new\n0a1\n> n\n\
+             diff -N -r a/sub/q b/sub/q\n1d0\n< q\n")
     );
     assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
 
     let (out, err, code) = run_diff_in(dir, &["--brief", "--recursive", "--new-file", "b", "a"]);
     assert_eq!(
         out,
-        "Files b/f and a/f differ\nFiles b/gone and a/gone differ\n\
-         Files b/new and a/new differ\nFiles b/sub/q and a/sub/q differ\n"
+        sep("Files b/f and a/f differ\nFiles b/gone and a/gone differ\n\
+             Files b/new and a/new differ\nFiles b/sub/q and a/sub/q differ\n")
     );
     assert_eq!((err.as_str(), code), ("", Some(EXIT_STATUS_DIFFERENCE)));
 
@@ -2207,15 +2214,17 @@ fn test_diff_new_file_recursive() {
     let (out, _, code) = run_diff_in(dir, &["-N", "-r", "-u", "a", "b"]);
     assert_eq!(code, Some(EXIT_STATUS_DIFFERENCE));
     assert!(
-        out.contains("\n--- a/new\t1970-01-01 00:00:00.000000000 +0000\n"),
+        out.contains(&sep("\n--- a/new\t1970-01-01 00:00:00.000000000 +0000\n")),
         "got {out:?}"
     );
     assert!(
-        out.contains("diff -N -r -u a/sub/q b/sub/q\n--- a/sub/q\t"),
+        out.contains(&sep("diff -N -r -u a/sub/q b/sub/q\n--- a/sub/q\t")),
         "got {out:?}"
     );
     assert!(
-        out.ends_with("+++ b/sub/q\t1970-01-01 00:00:00.000000000 +0000\n@@ -1 +0,0 @@\n-q\n"),
+        out.ends_with(&sep(
+            "+++ b/sub/q\t1970-01-01 00:00:00.000000000 +0000\n@@ -1 +0,0 @@\n-q\n"
+        )),
         "got {out:?}"
     );
 }

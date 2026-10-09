@@ -669,8 +669,16 @@ fn test_touch_h_reference_link() {
     assert_eq!(mtime_secs(&other), 1000000000);
 }
 
+/// The text of an OS error, without Rust's "(os error N)" suffix.
+fn os_error_text(errno: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(errno).to_string();
+    text.split(" (os error").next().unwrap().to_string()
+}
+
 /// A trailing slash still resolves the link: a link to a file followed by a
-/// slash is not a directory.
+/// slash is not a directory, under -h, -c and neither, and neither the link
+/// nor its target is touched.  macOS's utimensat(AT_SYMLINK_NOFOLLOW) set the
+/// link's own times instead.
 #[test]
 fn test_touch_h_link_with_trailing_slash() {
     let d = dir("test_touch_h_link_with_trailing_slash");
@@ -678,7 +686,63 @@ fn test_touch_h_link_with_trailing_slash() {
     let link = format!("{d}/link");
     fs::write(&target, "x").unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    let out = touch(None, &["-h", &format!("{link}/")]);
+    assert!(touch(None, &["-d", "@1000000000", &target])
+        .status
+        .success());
+    assert!(touch(None, &["-h", "-d", "@1000000000", &link])
+        .status
+        .success());
+
+    let enotdir = os_error_text(libc::ENOTDIR);
+    for opts in [&["-h"][..], &["-h", "-c"], &["-c"], &[]] {
+        let slashed = format!("{link}/");
+        let mut args = opts.to_vec();
+        args.extend(["-d", "@2000000000", &slashed]);
+        let out = touch(None, &args);
+        assert_eq!(out.status.code(), Some(1), "{opts:?} {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(&enotdir), "{opts:?} {stderr}");
+        assert_eq!(link_mtime_secs(&link), 1000000000, "{opts:?}");
+        assert_eq!(mtime_secs(&target), 1000000000, "{opts:?}");
+    }
+}
+
+/// Under -h a link to a directory followed by a slash names the directory:
+/// it gets the times and the link keeps its own (GNU, Linux).
+#[test]
+fn test_touch_h_dir_link_with_trailing_slash() {
+    let d = dir("test_touch_h_dir_link_with_trailing_slash");
+    let sub = format!("{d}/sub");
+    let link = format!("{d}/link");
+    fs::create_dir(&sub).unwrap();
+    std::os::unix::fs::symlink(&sub, &link).unwrap();
+    assert!(touch(None, &["-h", "-d", "@1000000000", &link])
+        .status
+        .success());
+
+    let out = touch(None, &["-h", "-d", "@2000000000", &format!("{link}/")]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mtime_secs(&sub), 2000000000);
+    assert_eq!(link_mtime_secs(&link), 1000000000);
+}
+
+/// Under -h -c a dangling link followed by a slash is a missing file passed
+/// over in silence; under -h alone it is reported, and nothing is created.
+#[test]
+fn test_touch_h_dangling_link_with_trailing_slash() {
+    let d = dir("test_touch_h_dangling_link_with_trailing_slash");
+    let target = format!("{d}/target");
+    let link = format!("{d}/link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let slashed = format!("{link}/");
+
+    let out = touch(None, &["-h", "-c", &slashed]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+
+    let out = touch(None, &["-h", &slashed]);
     assert_eq!(out.status.code(), Some(1), "{out:?}");
-    assert!(!out.stderr.is_empty());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&os_error_text(libc::ENOENT)), "{stderr}");
+    assert!(fs::symlink_metadata(&target).is_err());
 }

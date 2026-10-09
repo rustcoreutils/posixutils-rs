@@ -172,6 +172,18 @@ fn touch_file(
     let mtime = if args.mtime { source.1 } else { omit() };
     let times = [atime, mtime];
 
+    // A pathname ending in a slash names a directory (POSIX pathname resolution): a symlink in
+    // the last component is followed, -h or not, and anything but a directory is ENOTDIR. No
+    // file is ever created for it. This is decided here, not left to the kernel: macOS's
+    // utimensat(AT_SYMLINK_NOFOLLOW) sets the times of a link named with a trailing slash, and
+    // macOS resolves a dangling symlink followed by a slash differently from Linux.
+    if filename.ends_with('/') {
+        return match set_dir_times(&c_path, &times) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && args.no_create => Ok(()),
+            result => result,
+        };
+    }
+
     // -h: the link itself, by name, and nothing is created; a missing file is
     // an error unless -c says to pass it over (GNU).
     if args.no_dereference {
@@ -189,21 +201,11 @@ fn touch_file(
         };
     }
 
-    // A pathname ending in a slash names a directory (POSIX pathname resolution), so no file is
-    // ever created for it: it is an existing directory, given its times by name, or an error.
-    // Deciding this here rather than through the create keeps it the same on every system --
-    // macOS resolves a dangling symlink followed by a slash differently from Linux.
-    if filename.ends_with('/') {
-        return set_times_path(&c_path, &times);
-    }
-
     let open_err = match create_new(&c_path) {
         Ok(fd) => return set_times_fd(&fd, &times),
         Err(e) => e,
     };
-    // Whatever kept the file from being created (it exists; or the name ends in a slash, which
-    // Linux refuses with EISDIR before it looks at O_EXCL), an existing file gets its times by
-    // name.
+    // Whatever kept the file from being created, an existing file gets its times by name.
     match set_times_path(&c_path, &times) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => not_found(&c_path, &times, open_err, e),
         result => result,
@@ -238,8 +240,6 @@ fn not_found(
             Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Err(not_found),
             Err(e) => Err(e),
         },
-        // A trailing slash on a name that does not exist: it is the missing file to report.
-        Some(libc::EISDIR) => Err(not_found),
         // Why the file could not be created, e.g. a directory without write permission.
         _ => Err(open_err),
     }
@@ -356,12 +356,26 @@ fn read_link_at(dir: &OwnedFd, name: &CStr) -> io::Result<CString> {
     CString::new(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Set the times of the file open on `fd`, the one this run created.
+/// Set the times of the file open on `fd`.
 fn set_times_fd(fd: &OwnedFd, times: &[libc::timespec; 2]) -> io::Result<()> {
     if unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Set the times of the directory `path` names, following a symlink; ENOTDIR if it is not one.
+///
+/// The directory is opened with `O_DIRECTORY` and given its times through the descriptor, so the
+/// object checked is the object changed, and the check does not depend on how the kernel treats
+/// a trailing slash. A directory that cannot be opened for reading (write or search permission
+/// only) is given its times by name instead, still following links.
+fn set_dir_times(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
+    match open_dir(path) {
+        Ok(fd) => set_times_fd(&fd, times),
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) => set_times_path(path, times),
+        Err(e) => Err(e),
+    }
 }
 
 /// Set the times of the existing file `path` names, following a symlink.

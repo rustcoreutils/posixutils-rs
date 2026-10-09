@@ -1114,3 +1114,52 @@ fn test_ls_dies_by_sigpipe_on_a_closed_pipe() {
 
     plib::testing::assert_dies_by_sigpipe("ls", &["-1", dir.path().to_str().unwrap()]);
 }
+
+/// The `-l` mode string shows the set-user-ID, set-group-ID and restricted
+/// deletion bits in the owner, group and others execute positions (XCU ls,
+/// STDOUT: `s`/`S`, `t`/`T`). The group position only ever showed `x` or
+/// `-`, so a set-group-ID file or directory was indistinguishable from one
+/// without the bit.
+#[test]
+fn test_ls_l_mode_string_special_bits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let cases: &[(&str, bool, u32, &str)] = &[
+        ("sgid_x", false, 0o2754, "-rwxr-sr--"),
+        ("sgid_nox", false, 0o2744, "-rwxr-Sr--"),
+        ("suid_x", false, 0o4755, "-rwsr-xr-x"),
+        ("suid_nox", false, 0o4644, "-rwSr--r--"),
+        ("all_x", false, 0o6755, "-rwsr-sr-x"),
+        ("dir_sgid", true, 0o2775, "drwxrwsr-x"),
+        ("dir_sgid_nox", true, 0o2705, "drwx--Sr-x"),
+        ("dir_sticky", true, 0o1777, "drwxrwxrwt"),
+        ("dir_sticky_nox", true, 0o1770, "drwxrwx--T"),
+    ];
+    for &(name, is_dir, mode, _) in cases {
+        let path = dir.path().join(name);
+        if is_dir {
+            fs::create_dir(&path).unwrap();
+        } else {
+            fs::File::create(&path).unwrap();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    for &(name, _, mode, expected) in cases {
+        let path = dir.path().join(name);
+        // chmod may drop set-group-ID when the file's group is not one of
+        // ours; compare against what the file actually got.
+        let actual_mode = fs::symlink_metadata(&path).unwrap().mode() & 0o7777;
+        if actual_mode != mode {
+            eprintln!("Skipping {name}: mode {actual_mode:o}, wanted {mode:o}");
+            continue;
+        }
+        ls_test_with_checker(&["-ld", path.to_str().unwrap()], |_, output| {
+            assert_eq!(output.status.code(), Some(0));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mode = stdout.split_whitespace().next().unwrap_or("");
+            assert_eq!(mode.trim_end_matches('+'), expected, "{name}: {stdout}");
+        });
+    }
+}

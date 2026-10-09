@@ -605,6 +605,8 @@ fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> Str
     #[allow(clippy::unnecessary_cast)]
     let s_isuid = libc::S_ISUID as u32;
     #[allow(clippy::unnecessary_cast)]
+    let s_isgid = libc::S_ISGID as u32;
+    #[allow(clippy::unnecessary_cast)]
     let s_irgrp = libc::S_IRGRP as u32;
     #[allow(clippy::unnecessary_cast)]
     let s_iwgrp = libc::S_IWGRP as u32;
@@ -636,7 +638,16 @@ fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> Str
     // Group permissions
     file_mode.push(if mode & s_irgrp != 0 { 'r' } else { '-' });
     file_mode.push(if mode & s_iwgrp != 0 { 'w' } else { '-' });
-    file_mode.push(if mode & s_ixgrp != 0 { 'x' } else { '-' });
+    file_mode.push({
+        let executable = mode & s_ixgrp != 0;
+        let set_group_id = mode & s_isgid != 0;
+        match (executable, set_group_id) {
+            (true, true) => 's',
+            (true, false) => 'x',
+            (false, true) => 'S',
+            (false, false) => '-',
+        }
+    });
 
     // Other permissions
     file_mode.push(if mode & s_iroth != 0 { 'r' } else { '-' });

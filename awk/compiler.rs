@@ -219,7 +219,7 @@ static PRATT_PARSER: LazyLock<PrattParser<Rule>> = LazyLock::new(|| {
         .op(Op::infix(Rule::and, Assoc::Left))
         .op(Op::infix(Rule::in_op, Assoc::Left))
         .op(Op::infix(Rule::match_op, Assoc::Left) | Op::infix(Rule::not_match, Assoc::Left))
-        .op(Op::infix(Rule::comp_op, Assoc::Left))
+        .op(Op::infix(Rule::comp_op, Assoc::Left) | Op::infix(Rule::print_comp_op, Assoc::Left))
         .op(Op::postfix(Rule::piped_getline))
         .op(Op::infix(Rule::concat, Assoc::Left))
         .op(Op::infix(Rule::add, Assoc::Left) | Op::infix(Rule::binary_sub, Assoc::Left))
@@ -960,7 +960,7 @@ impl Compiler {
                 instructions.push(OpCode::Le, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
-            Rule::comp_op => {
+            Rule::comp_op | Rule::print_comp_op => {
                 if lhs_kind == ExprKind::Comp || rhs_kind == ExprKind::Comp {
                     return Err(pest_error_from_span(
                         op.as_span(),

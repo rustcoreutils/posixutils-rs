@@ -393,6 +393,11 @@ getline_file    = { prefix_op* ~ primary ~ postfix_op? ~ (getline_file_op ~ pref
 getline_file_op = _{ pow | mul | div | modulus | add | binary_sub }
 piped_getline   = { "|" ~ kw ~ "getline" ~ lvalue? }
 
+// In a print list `>` redirects the output, but the other comparisons are
+// operators, as in gawk, mawk and busybox awk (`>=` is left out, as mawk
+// and busybox awk do).
+print_comp_op = { le | lt | ne | eq }
+
 print_infix_op           = _{
     pow
   | mul
@@ -400,6 +405,7 @@ print_infix_op           = _{
   | modulus
   | add
   | binary_sub
+  | print_comp_op
   | match_op
   | not_match
   | in_op

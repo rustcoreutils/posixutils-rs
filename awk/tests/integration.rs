@@ -1788,3 +1788,17 @@ fn awk_getline_is_an_operand() {
         assert_eq!(status, Some(0), "{program}");
     }
 }
+
+// A print list can hold `==`, `!=`, `<` and `<=` without parentheses, as
+// in gawk, mawk and busybox awk; `>` still redirects (gawk's test
+// gsubtst3).
+#[test]
+fn awk_print_list_takes_comparisons() {
+    let program = "BEGIN { x = 1; print x == 1, x != 1, x < 2, x <= 0, x == 1 ? \"y\" : \"n\"; printf \"%s %s\\n\", x == 1, x != 1 ? \"a\" : \"b\"; print x == 1 > \"/dev/stdout\" }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str()),
+        ("1 0 1 0 y\n1 b\n1\n", "")
+    );
+    assert_eq!(status, Some(0));
+}

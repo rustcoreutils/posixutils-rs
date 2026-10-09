@@ -1412,12 +1412,9 @@ fn test_mv_sticky_to_xpart() {
     fs::create_dir(other_dir).unwrap();
 
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
 
         // chown "$NON_ROOT_USERNAME" "$other_partition_tmpdir"
         let md = fs::metadata(other_dir).unwrap();

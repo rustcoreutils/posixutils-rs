@@ -12,7 +12,6 @@
 
 use plib::testing::{run_test, TestPlan};
 use std::{
-    ffi::{CStr, CString},
     fs, io,
     os::unix::{
         self,
@@ -52,15 +51,18 @@ static GROUPS: RwLock<Groups> = RwLock::new(Groups {
     gid2: 0,
 });
 
-fn get_group_id(name: &CStr) -> u32 {
-    unsafe {
-        let grp = libc::getgrnam(name.as_ptr());
-        if grp.is_null() {
-            panic!("Group name not found: {}", name.to_string_lossy());
-        } else {
-            (&*grp).gr_gid
-        }
+fn get_group_id(name: &str) -> u32 {
+    match plib::group::get_by_name(name) {
+        Some(group) => group.gid,
+        None => panic!("Group name not found: {name}"),
     }
+}
+
+/// The name of `gid`, which the test needs as text.
+fn group_name(gid: u32) -> String {
+    let group = plib::group::get_by_gid(gid)
+        .unwrap_or_else(|| panic!("Unable to get group entry for group id {gid}"));
+    group.name.into_string().unwrap()
 }
 
 // Return two groups that the current user belongs to.
@@ -82,19 +84,10 @@ fn get_groups() -> ((String, u32), (String, u32)) {
         if cfg!(target_os = "linux") {
             unsafe {
                 let uid = libc::getuid();
-                let pw = libc::getpwuid(uid);
-                if pw.is_null() {
-                    panic!("{}", io::Error::last_os_error());
-                }
-
-                let primary_gid = (&*pw).pw_gid;
-                let gr = libc::getgrgid(primary_gid);
-                if gr.is_null() {
-                    panic!("{}", io::Error::last_os_error());
-                }
-
-                let gr_name = CStr::from_ptr((&*gr).gr_name).to_owned();
-                *primary_group = gr_name.to_str().unwrap().to_owned();
+                let primary_gid = plib::user::get_by_uid(uid)
+                    .expect("the test user has a passwd entry")
+                    .gid;
+                *primary_group = group_name(primary_gid);
 
                 let mut count = libc::getgroups(0, std::ptr::null_mut());
                 if count < 0 {
@@ -121,13 +114,7 @@ fn get_groups() -> ((String, u32), (String, u32)) {
                     if second_gid == primary_gid {
                         continue;
                     } else {
-                        let sec_grent = libc::getgrgid(second_gid);
-                        if sec_grent.is_null() {
-                            panic!("Unable to get group entry for secondary group id {second_gid}");
-                        }
-
-                        let sec_gr_name = CStr::from_ptr((&*sec_grent).gr_name).to_owned();
-                        *secondary_group = sec_gr_name.to_str().unwrap().to_owned();
+                        *secondary_group = group_name(second_gid);
                         break;
                     }
                 }
@@ -144,13 +131,8 @@ fn get_groups() -> ((String, u32), (String, u32)) {
         }
 
         // Initialize the group IDs corresponding to the group strings
-        {
-            let g1_cstr = CString::new(primary_group.as_str()).unwrap();
-            let g2_cstr = CString::new(secondary_group.as_str()).unwrap();
-
-            *gid1 = get_group_id(&g1_cstr);
-            *gid2 = get_group_id(&g2_cstr);
-        }
+        *gid1 = get_group_id(primary_group);
+        *gid2 = get_group_id(secondary_group);
     });
 
     // The reads to GROUPS should not have conflicts with the writes because:

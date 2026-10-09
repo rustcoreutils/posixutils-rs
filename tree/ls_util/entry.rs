@@ -14,7 +14,7 @@ use crate::{
 };
 use std::{
     cmp::Ordering,
-    ffi::{CStr, OsStr, OsString},
+    ffi::{OsStr, OsString},
     io,
     os::unix::{
         ffi::OsStrExt,
@@ -684,37 +684,25 @@ fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> Str
 fn get_owner_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String> {
     let uid = metadata.uid();
     if numeric {
-        Ok(uid.to_string())
-    } else {
-        unsafe {
-            let passwd = libc::getpwuid(uid);
-            if passwd.is_null() {
-                // POSIX: if the owner name cannot be determined, use the numeric UID.
-                return Ok(uid.to_string());
-            }
-            let passwd_ref = &*passwd;
-            let name = CStr::from_ptr(passwd_ref.pw_name);
-            Ok(ls_from_utf8_lossy(name.to_bytes()))
-        }
+        return Ok(uid.to_string());
     }
+    // POSIX: if the owner name cannot be determined, use the numeric UID.
+    Ok(match plib::user::get_by_uid(uid) {
+        Some(user) => ls_from_utf8_lossy(user.name.as_bytes()),
+        None => uid.to_string(),
+    })
 }
 
 fn get_group_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String> {
     let gid = metadata.gid();
     if numeric {
-        Ok(gid.to_string())
-    } else {
-        unsafe {
-            let group = libc::getgrgid(gid);
-            if group.is_null() {
-                // POSIX: if the group name cannot be determined, use the numeric GID.
-                return Ok(gid.to_string());
-            }
-            let group_ref = &*group;
-            let name = CStr::from_ptr(group_ref.gr_name);
-            Ok(ls_from_utf8_lossy(name.to_bytes()))
-        }
+        return Ok(gid.to_string());
     }
+    // POSIX: if the group name cannot be determined, use the numeric GID.
+    Ok(match plib::group::get_by_gid(gid) {
+        Some(group) => ls_from_utf8_lossy(group.name.as_bytes()),
+        None => gid.to_string(),
+    })
 }
 
 fn get_file_info(metadata: &ftw::Metadata) -> FileInfo {

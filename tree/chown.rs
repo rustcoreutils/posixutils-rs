@@ -12,7 +12,7 @@ mod common;
 use self::common::{chown_traverse, error_string, ChangeOwnershipArgs};
 use clap::Parser;
 use gettextrs::gettext;
-use std::{ffi::CString, io};
+use std::io;
 
 /// chown - change the file ownership
 #[derive(Parser)]
@@ -31,14 +31,7 @@ struct Args {
 
 // The login (primary) group ID of a user, used for the `owner:` operand form.
 fn login_gid(uid: u32) -> Option<u32> {
-    unsafe {
-        let passwd = libc::getpwuid(uid);
-        if passwd.is_null() {
-            None
-        } else {
-            Some((*passwd).pw_gid)
-        }
-    }
+    plib::user::get_by_uid(uid).map(|u| u.gid)
 }
 
 // lookup string group by name, or parse numeric group ID
@@ -47,14 +40,9 @@ fn parse_group(group: &str) -> Result<u32, String> {
         Ok(gid) => Ok(gid),
         Err(_) => {
             // lookup group by name
-            let group_cstr = CString::new(group).unwrap();
-            let group_name = unsafe { libc::getgrnam(group_cstr.as_ptr()) };
-            if group_name.is_null() {
-                return Err(gettext!("invalid group: '{}'", group));
-            }
-
-            let gid = unsafe { (*group_name).gr_gid };
-            Ok(gid)
+            plib::group::get_by_name(group)
+                .map(|g| g.gid)
+                .ok_or_else(|| gettext!("invalid group: '{}'", group))
         }
     }
 }
@@ -65,14 +53,9 @@ fn parse_user(user: &str) -> Result<u32, String> {
         Ok(uid) => Ok(uid),
         Err(_) => {
             // lookup user by name
-            let user_cstr = CString::new(user).unwrap();
-            let user_name = unsafe { libc::getpwnam(user_cstr.as_ptr()) };
-            if user_name.is_null() {
-                return Err(gettext!("invalid user: '{}'", user));
-            }
-
-            let uid = unsafe { (*user_name).pw_uid };
-            Ok(uid)
+            plib::user::get_by_name(user)
+                .map(|u| u.uid)
+                .ok_or_else(|| gettext!("invalid user: '{}'", user))
         }
     }
 }

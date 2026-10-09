@@ -213,28 +213,11 @@ fn test_chown_change_to_non_member_group() {
     // Get the GID of a group that the test runner doesn't belong to
     fn get_non_member_group() -> Option<u32> {
         let user_groups: HashSet<_> = current_user_group_ids().iter().copied().collect();
-        let mut non_member_group: Option<u32> = None; // Group that the current user does not belong to
 
-        // Start reading the group database
-        unsafe { libc::setgrent() };
-
-        loop {
-            let group = unsafe { libc::getgrent() };
-            if group.is_null() {
-                break;
-            }
-            let gid = unsafe { (&*group).gr_gid };
-
-            if !user_groups.contains(&gid) {
-                non_member_group = Some(gid);
-                break;
-            }
-        }
-
-        // End reading the group database
-        unsafe { libc::endgrent() };
-
-        non_member_group
+        plib::group::load()
+            .into_iter()
+            .map(|g| g.gid)
+            .find(|gid| !user_groups.contains(gid))
     }
 
     let test_dir = &format!(
@@ -675,11 +658,9 @@ fn test_chown_owner_colon_login_group() {
 
     // Current user's own login → no privilege needed; group becomes the login group.
     let uid = unsafe { libc::getuid() };
-    let login_gid = unsafe {
-        let p = libc::getpwuid(uid);
-        assert!(!p.is_null());
-        (*p).pw_gid
-    };
+    let login_gid = plib::user::get_by_uid(uid)
+        .expect("the test user has a passwd entry")
+        .gid;
     let spec = format!("{uid}:");
     chown_test(&[&spec, f], "", "", 0);
     assert_eq!(fs::metadata(f).unwrap().gid(), login_gid);

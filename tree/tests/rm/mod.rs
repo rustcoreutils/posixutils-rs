@@ -1087,12 +1087,9 @@ fn test_rm_fail_2eperm() {
 
     // chown $NON_ROOT_USERNAME $test_dir
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
 
         let test_dir_cstr = CString::new(test_dir.as_bytes()).unwrap();
 
@@ -1160,12 +1157,9 @@ fn test_rm_no_give_up() {
     fs::File::create(d_f).unwrap();
 
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
 
         // The two calls below to `libc::chown` is equivalent to:
         // chown -R $NON_ROOT_USERNAME d

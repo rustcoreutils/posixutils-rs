@@ -12,7 +12,7 @@ mod common;
 use self::common::{chown_traverse, error_string, ChangeOwnershipArgs};
 use clap::Parser;
 use gettextrs::gettext;
-use std::{ffi::CString, io};
+use std::io;
 
 /// chgrp - change file group ownership
 #[derive(Parser)]
@@ -40,15 +40,10 @@ fn parse_group(group: &str) -> Result<Option<u32>, String> {
         Ok(gid) => Ok(Some(gid)),
         Err(_) => {
             // lookup group by name
-            let group_cstr = CString::new(group).unwrap();
-            let group_st = unsafe { libc::getgrnam(group_cstr.as_ptr()) };
-            if group_st.is_null() {
-                let err_str = gettext!("invalid group: '{}'", group);
-                return Err(err_str);
+            match plib::group::get_by_name(group) {
+                Some(g) => Ok(Some(g.gid)),
+                None => Err(gettext!("invalid group: '{}'", group)),
             }
-
-            let gid = unsafe { (*group_st).gr_gid };
-            Ok(Some(gid))
         }
     }
 }

@@ -937,12 +937,9 @@ fn test_cp_special_bits() {
     fs::set_permissions(c, fs::Permissions::from_mode(mode_c)).unwrap();
 
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
 
         // chown "$NON_ROOT_USERNAME" .
         let md = fs::metadata(test_dir).unwrap();
@@ -1053,12 +1050,9 @@ fn test_cp_preserve_clears_setuid_on_chown_fail() {
 
     // Hand the directory to the non-root user so it can create the copy there.
     unsafe {
-        let non_root_cstr = CString::new(non_root).unwrap();
-        let passwd = libc::getpwnam(non_root_cstr.as_ptr());
-        if passwd.is_null() {
-            panic!("{}", io::Error::last_os_error());
-        }
-        let uid = (*passwd).pw_uid;
+        let uid = plib::user::get_by_name(non_root)
+            .expect("NON_ROOT_USERNAME has a passwd entry")
+            .uid;
         let md = fs::metadata(test_dir).unwrap();
         let test_dir_cstr = CString::new(test_dir.as_bytes()).unwrap();
         if libc::chown(test_dir_cstr.as_ptr(), uid, md.gid()) != 0 {

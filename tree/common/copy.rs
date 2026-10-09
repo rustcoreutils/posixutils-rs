@@ -1093,7 +1093,8 @@ where
         // user named; below it the link is refused in GNU's words. A link that resolves is
         // refused below the operand for the same reason (GNU writes through it): the tree's
         // owner chose where it points, not the user who ran cp. (A link to be reproduced as a
-        // link, or a special file, replaces the link instead.)
+        // link, a special file, or a hard link under -l, which writes nothing, replaces the link
+        // instead, or is refused like any existing destination.)
         let target_is_symlink = target_symlink_md
             .as_ref()
             .is_some_and(|md| md.file_type() == ftw::FileType::SymbolicLink);
@@ -1101,6 +1102,7 @@ where
             && !state.at_top_level
             && !act_on_link_itself
             && !(source_is_special_file && cfg.recursive)
+            && !cfg.link
         {
             return Err(io::Error::other(if target_is_dangling_symlink {
                 gettext!(

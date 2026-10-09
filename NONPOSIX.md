@@ -517,6 +517,14 @@ Debian source packages, with GNU patch's meaning:
  * More than one `file` operand.  The SYNOPSIS allows exactly one.
  * With no operand, the current working directory is printed.
 
+### rmdir
+
+ * `--ignore-fail-on-non-empty` — a directory that cannot be removed only
+   because it is not empty is kept silently and does not affect the exit
+   status; with `-p`, the walk up the parents stops there.  As in GNU, a
+   permission, read-only or busy error on a directory that holds an entry
+   counts as "not empty".  debhelper's `dh_strip` runs it.
+
 ### sccs
 
  * `-p` takes its historic BSD meaning (the SCCS subdirectory name).

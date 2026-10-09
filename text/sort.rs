@@ -26,7 +26,7 @@ use gettextrs::gettext;
 #[derive(Parser)]
 #[command(version, about = gettext("sort - sort, merge, or sequence check text files"))]
 struct Args {
-    #[arg(short = 'c', help = gettext("Check that the single input file is ordered as specified"))]
+    #[arg(short = 'c', long = "check", help = gettext("Check that the single input file is ordered as specified"))]
     check_order: bool,
 
     #[arg(short = 'C', help = gettext("Same as -c, but without warning message for disorder or duplicate keys"))]

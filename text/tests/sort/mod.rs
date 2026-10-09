@@ -769,3 +769,11 @@ fn attached_option_argument_may_begin_with_equals() {
     sort_test(&["-t=", "-k2"], "b=1\na=2\n", "b=1\na=2\n", 0, "");
     plib::testing::assert_equals_option_argument("sort", "-t", &["-k2"], b"b=1\na=2\n");
 }
+
+/// `--check` is GNU's long spelling of POSIX -c.
+#[test]
+fn test_check_long_option() {
+    sort_test(&["--check"], "a\nb\n", "", 0, "");
+    sort_test(&["--check"], "b\na\n", "", 1, "sort: -:2: disorder: a\n");
+    sort_test(&["--check", "-r"], "b\na\n", "", 0, "");
+}

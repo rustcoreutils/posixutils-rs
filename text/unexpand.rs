@@ -259,7 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // utility as every other one in the tree does.
     plib::diag::init_locale("unexpand");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut exit_code = 0;
 

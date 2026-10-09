@@ -367,7 +367,7 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) -> io::Result<()> {
 fn main() -> ExitCode {
     plib::diag::init_locale("id");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut userinfo = match get_user_info(&args) {
         Ok(info) => info,

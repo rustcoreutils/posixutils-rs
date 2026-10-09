@@ -2367,7 +2367,7 @@ fn get_terminal_size() -> (u16, u16) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("talk");
 
-    let args = Args::try_parse().unwrap_or_else(|err| {
+    let args = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| {
         if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
             // Print help or version message
             eprintln!("{}", err);

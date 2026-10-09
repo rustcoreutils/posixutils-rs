@@ -477,7 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // diagnostics were bare `eprintln!`s and carried no `df: ` prefix.
     plib::diag::init_locale("df");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut info = read_mount_info()?;
     let mut exit_code = 0;

@@ -500,7 +500,7 @@ fn read_password() -> io::Result<String> {
 
 fn main() {
     plib::diag::init_locale("newgrp");
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     run(&args);
 }
 

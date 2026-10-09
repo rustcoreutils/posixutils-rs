@@ -92,7 +92,7 @@ fn resolve_cwd(physical: bool) -> io::Result<OsString> {
 fn main() -> ExitCode {
     plib::diag::init_locale("pwd");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // `overrides_with` makes the last of -L/-P win; neither given => logical.
     let cwd = match resolve_cwd(args.process) {

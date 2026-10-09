@@ -77,7 +77,7 @@ fn collect_messages(args: &Args) -> io::Result<Vec<String>> {
 fn main() -> ExitCode {
     plib::diag::init_locale("logger");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Default priority is user.notice (POSIX 102902).
     let (facility, level) = match &args.priority {

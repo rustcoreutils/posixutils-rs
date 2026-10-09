@@ -20,7 +20,7 @@ struct Args {}
 fn main() -> ExitCode {
     plib::diag::init_locale("logname");
 
-    let _args = Args::parse();
+    let _args = plib::optarg::parse::<Args>();
 
     // POSIX: write the login name as reported by getlogin(). Under the
     // conditions where getlogin() would fail, write a diagnostic to stderr and

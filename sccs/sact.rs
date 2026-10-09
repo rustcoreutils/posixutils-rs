@@ -67,7 +67,7 @@ fn process_sfile(sfile: &Path, show_header: bool) -> io::Result<bool> {
 fn main() -> ExitCode {
     plib::diag::init_locale("sact");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     let files = operands::expand(&args.files);
 
     // Per POSIX, the "\n%s:\n" pathname header is written when there is more

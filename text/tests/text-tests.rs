@@ -17,6 +17,7 @@ mod grep;
 mod head;
 mod join;
 mod nl;
+mod optarg;
 mod paste;
 mod patch;
 mod pr;

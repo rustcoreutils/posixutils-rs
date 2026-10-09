@@ -147,7 +147,7 @@ fn cat_file(pathname: &Path, render: Render) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("cat");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // if no file args, read from stdin
     if args.files.is_empty() {

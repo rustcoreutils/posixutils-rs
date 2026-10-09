@@ -477,3 +477,13 @@ fn option_argument_may_begin_with_hyphen() {
 fn test_cut_list_begins_with_hyphen() {
     cut_test(&["-c", "-3"], "abcdef\n", "abc\n");
 }
+
+// XBD 12.1: an option-argument attached to its option letter is everything
+// after the letter, so `-d=` is the delimiter "=" (perl's Configure runs
+// `cut -f2- -d=`). clap alone read it as `-d` with an empty argument.
+#[test]
+fn attached_option_argument_may_begin_with_equals() {
+    cut_test(&["-f2-", "-d="], "a=b=c\n", "b=c\n");
+    cut_test(&["-nd=", "-f2"], "a=b\n", "b\n");
+    plib::testing::assert_equals_option_argument("cut", "-d", &["-f2"], b"a=b\n");
+}

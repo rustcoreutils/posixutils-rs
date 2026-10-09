@@ -186,7 +186,7 @@ fn write_path(path: &Path) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     diag::init_locale("realpath");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut had_error = false;
 

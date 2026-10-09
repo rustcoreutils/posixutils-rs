@@ -93,7 +93,7 @@ fn exec_util(util: &str, util_args: &[String]) -> ! {
 fn main() {
     diag::init_locale("nice");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     apply_increment(args.niceval);
 

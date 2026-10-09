@@ -192,7 +192,7 @@ fn process_files(files: &[OsString], opts: OutputOptions) {
 
 fn main() {
     diag::init_locale("strings");
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     if args.input_files.is_empty() {
         // POSIX OPERANDS 115878-115881: with no file operand, read stdin.
         let mut bytes = Vec::new();

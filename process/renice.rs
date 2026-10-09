@@ -108,7 +108,7 @@ fn parse_id(which: u32, input: &str) -> Result<u32, ()> {
 fn main() {
     diag::init_locale("renice");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // which class of priority to modify
     // Cast to u32 for cross-platform compatibility (i32 on macOS, u32 on Linux)

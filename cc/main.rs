@@ -2473,15 +2473,22 @@ fn takes_separate_value(arg: &str) -> bool {
 /// optional), as gcc does: a Makefile whose variable is empty passes
 /// `-I -I/common`, which is the directory `-I/common`. clap would otherwise
 /// read the second word as an option and call the first one's value missing.
+///
+/// An attached argument beginning with '=' is kept whole, `-I=dir` being the
+/// directory "=dir" as in gcc without a configured sysroot (XBD 12.1).
 fn try_parse(argv: &[String]) -> Result<Args, clap::Error> {
-    let command = Args::command().mut_args(|a| {
-        if takes_one_value(&a) {
-            a.allow_hyphen_values(true)
-        } else {
-            a
-        }
-    });
-    let mut matches = command.try_get_matches_from(argv)?;
+    let command = || {
+        Args::command().mut_args(|a| {
+            if takes_one_value(&a) {
+                a.allow_hyphen_values(true)
+            } else {
+                a
+            }
+        })
+    };
+    let argv = argv.iter().map(std::ffi::OsString::from).collect();
+    let argv = plib::optarg::keep_leading_equals_with(argv, command);
+    let mut matches = command().try_get_matches_from(argv)?;
     Args::from_arg_matches_mut(&mut matches)
 }
 

@@ -159,7 +159,7 @@ impl Args {
             verbatim = out.last().is_some_and(|last| awaits_value(last));
         }
 
-        let mut args = Args::parse_from(out);
+        let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(out));
         args.add_stdin_if_no_files();
 
         args
@@ -195,7 +195,7 @@ fn awaits_value(word: &str) -> bool {
 /// * `+PAGES`           -> `--pages=PAGES`
 /// * `-COLUMN[REST]`    -> `--columns=COLUMN` [+ `-REST` cluster]
 /// * `-CLUSTER`         -> peel optional-value (e/i/n/s) at trailing position
-///   and append `=<tab>` so clap accepts it.
+///   and append a <tab> as its value so clap accepts it.
 ///
 /// Per POSIX, the value of `-e`, `-i`, `-n`, `-s` must be IMMEDIATELY attached
 /// (no whitespace). When the letter is the last char of a cluster with no value
@@ -254,7 +254,7 @@ fn preprocess_arg(arg: &str, out: &mut Vec<String>) {
 ///     its value (or pulls from the next argv element); we leave the cluster
 ///     untouched so clap handles it natively.
 ///   * The first `optional_value` char either takes the remaining chars as its
-///     value, or — if it is the final char with nothing after — gets `=\t`
+///     value, or — if it is the final char with nothing after — gets a <tab>
 ///     appended so clap accepts the option without requiring a separate arg.
 fn preprocess_short_cluster(cluster: &str, out: &mut Vec<String>) {
     let chars: Vec<char> = cluster.chars().collect();
@@ -268,7 +268,7 @@ fn preprocess_short_cluster(cluster: &str, out: &mut Vec<String>) {
         }
         if short_optional_value(c) {
             if i == chars.len() - 1 {
-                out.push(format!("-{}=\t", cluster));
+                out.push(format!("-{}\t", cluster));
             } else {
                 out.push(format!("-{}", cluster));
             }
@@ -552,21 +552,21 @@ mod tests {
 
     #[test]
     fn column_with_cluster_suffix() {
-        // -4ats -> --columns=4 + -ats=<tab>
+        // -4ats -> --columns=4 + -ats<tab>
         assert_eq!(
             run("-4ats"),
-            vec!["--columns=4".to_string(), "-ats=\t".to_string()]
+            vec!["--columns=4".to_string(), "-ats\t".to_string()]
         );
     }
 
     #[test]
     fn cluster_with_optional_arg_at_end_default_tab() {
-        // -ats -> -ats=<tab>
-        assert_eq!(run("-ats"), vec!["-ats=\t".to_string()]);
-        assert_eq!(run("-s"), vec!["-s=\t".to_string()]);
-        assert_eq!(run("-e"), vec!["-e=\t".to_string()]);
-        assert_eq!(run("-i"), vec!["-i=\t".to_string()]);
-        assert_eq!(run("-n"), vec!["-n=\t".to_string()]);
+        // -ats -> -ats<tab>
+        assert_eq!(run("-ats"), vec!["-ats\t".to_string()]);
+        assert_eq!(run("-s"), vec!["-s\t".to_string()]);
+        assert_eq!(run("-e"), vec!["-e\t".to_string()]);
+        assert_eq!(run("-i"), vec!["-i\t".to_string()]);
+        assert_eq!(run("-n"), vec!["-n\t".to_string()]);
     }
 
     #[test]
@@ -619,7 +619,7 @@ mod tests {
         // direct entry into the cluster helper (no leading '-')
         let mut out = Vec::new();
         preprocess_short_cluster("ats", &mut out);
-        assert_eq!(out, vec!["-ats=\t".to_string()]);
+        assert_eq!(out, vec!["-ats\t".to_string()]);
 
         let mut out = Vec::new();
         preprocess_short_cluster("ats,", &mut out);

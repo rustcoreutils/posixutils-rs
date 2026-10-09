@@ -49,7 +49,7 @@ struct Args {
 fn main() {
     plib::diag::init_locale("ngettext");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Operands: `[textdomain] msgid msgid_plural n`.
     let (operand_domain, msgid1, msgid2, count_str): (Option<&str>, &str, &str, &str) = match args

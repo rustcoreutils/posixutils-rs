@@ -2134,3 +2134,23 @@ fn test_awk_reports_write_error_on_final_partial_line() {
         3,
     );
 }
+
+// XBD 12.1: `-F=` is the field separator "=", not `-F` with an empty one
+// (an empty FS split every character into its own field).
+#[test]
+fn awk_attached_field_separator_may_begin_with_equals() {
+    for (args, input, out) in [
+        (&["-F=", "{print $2}"][..], "a=b\n", "b\n"),
+        (&["-F==", "{print $2}"][..], "a==b\n", "b\n"),
+    ] {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdin_data: String::from(input),
+            expected_out: String::from(out),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+    plib::testing::assert_equals_option_argument("awk", "-F", &["{print $2}"], b"a=b\n");
+}

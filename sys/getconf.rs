@@ -1057,7 +1057,7 @@ fn load_pathconf_mapping() -> HashMap<&'static str, libc::c_int> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("getconf");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Handle -v specification option
     // POSIX requires this for selecting different compilation environments.

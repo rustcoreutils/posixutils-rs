@@ -4074,11 +4074,11 @@ fn parse_args_with_more_env() -> Args {
             combined_args.extend(more_args);
             combined_args.extend(cmd_args.into_iter().skip(1));
 
-            return Args::parse_from(combined_args);
+            return Args::parse_from(plib::optarg::keep_leading_equals::<Args>(combined_args));
         }
     }
 
-    Args::parse()
+    plib::optarg::parse::<Args>()
 }
 
 fn main() {

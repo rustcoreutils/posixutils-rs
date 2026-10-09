@@ -225,7 +225,7 @@ fn report(source: &Path, dest: &Path, e: &io::Error) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("ln");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.files.is_empty() {
         eprintln!("ln: {}", gettext("a source operand is required"));

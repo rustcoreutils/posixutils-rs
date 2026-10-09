@@ -321,7 +321,9 @@ fn main() -> ExitCode {
     plib::diag::init_locale("tabs");
 
     let preprocessed_args = preprocess_args();
-    let args = match Args::try_parse_from(&preprocessed_args) {
+    let args = match Args::try_parse_from(plib::optarg::keep_leading_equals::<Args>(
+        &preprocessed_args,
+    )) {
         Ok(args) => args,
         Err(e) => {
             // Handle --help and --version specially (they exit with 0)

@@ -464,3 +464,23 @@ fn paste_multibyte_delimiter_under_lc_ctype() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("paste", &["-d", "-zq", "--help"]);
 }
+
+// XBD 12.1: `-d=` is the delimiter list "=", not `-d` with an empty list.
+#[test]
+fn attached_option_argument_may_begin_with_equals() {
+    for (args, out) in [
+        (&["-d=", "-", "-"][..], "a=b\n"),
+        (&["-sd=", "-"][..], "a=b\n"),
+        (&["-d=x", "-", "-"][..], "a=b\n"),
+    ] {
+        run_test(TestPlan {
+            cmd: String::from("paste"),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdin_data: String::from("a\nb\n"),
+            expected_out: String::from(out),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+    plib::testing::assert_equals_option_argument("paste", "-d", &["-", "-"], b"a\nb\n");
+}

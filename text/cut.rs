@@ -456,7 +456,7 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("cut");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if let Err(err) = cut_files(args) {
         plib::diag::error(&format!("{}", err));

@@ -158,7 +158,7 @@ fn encode_file(base64: bool, file: Option<&Path>, decode_path: &str) -> io::Resu
 fn main() {
     diag::init_locale("uuencode");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let (file, decode_path) = match resolve_operands(&args.operands) {
         Ok(v) => v,

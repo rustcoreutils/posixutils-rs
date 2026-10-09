@@ -367,7 +367,7 @@ fn process_input(args: &Args, path: &str, radix: OutputType, multiple: bool) -> 
 fn main() {
     diag::init_locale("nm");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     let radix = resolve_radix(&args);
     let multiple = args.files.len() > 1;
 

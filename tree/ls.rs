@@ -311,7 +311,7 @@ struct Config {
 
 impl Config {
     fn new() -> (Self, Vec<PathBuf>) {
-        let m = Args::command().get_matches();
+        let m = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
 
         // Enables long format (-g, -n, -l, -o)
         const LONG_FORMAT_WITHOUT_OWNER: &str = "long_format_without_owner";

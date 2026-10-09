@@ -539,7 +539,7 @@ fn timeout(args: Args) -> i32 {
 fn main() {
     diag::init_locale("timeout");
 
-    let args = Args::try_parse().unwrap_or_else(|err| match err.kind() {
+    let args = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| match err.kind() {
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
             print!("{err}");
             std::process::exit(0);

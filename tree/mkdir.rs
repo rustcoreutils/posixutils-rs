@@ -114,7 +114,7 @@ fn do_mkdir(dirname: &str, mode: &ChmodMode, parents: bool, explicit_mode: bool)
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("mkdir");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut exit_code = 0;
 

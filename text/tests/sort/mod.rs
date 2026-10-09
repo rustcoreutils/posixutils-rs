@@ -762,3 +762,10 @@ fn option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("sort", &[opt, "-zq", "--help"]);
     }
 }
+
+// XBD 12.1: `-t=` is the field separator "=", not `-t` with an empty one.
+#[test]
+fn attached_option_argument_may_begin_with_equals() {
+    sort_test(&["-t=", "-k2"], "b=1\na=2\n", "b=1\na=2\n", 0, "");
+    plib::testing::assert_equals_option_argument("sort", "-t", &["-k2"], b"b=1\na=2\n");
+}

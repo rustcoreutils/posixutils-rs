@@ -672,7 +672,7 @@ fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("rm");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let is_tty = io::stdin().is_terminal();
     let root_identity = fs::metadata("/").ok().map(|md| (md.dev(), md.ino()));

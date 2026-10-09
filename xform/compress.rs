@@ -1105,7 +1105,7 @@ fn main() {
     diag::init_locale("compress");
 
     let program_mode = ProgramMode::detect();
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // Apply program mode defaults
     match program_mode {

@@ -304,7 +304,7 @@ fn main() -> ExitCode {
     // identifies the utility.
     plib::diag::init_locale("nl");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     match args.section_delimiter.len() {
         1 => {

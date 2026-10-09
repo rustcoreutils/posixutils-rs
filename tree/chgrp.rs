@@ -81,7 +81,7 @@ fn chown_err_handler(e: io::Error, path: ftw::DisplayablePath) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // Enable `no_derereference` if `-R` is enabled without either `-H` or `-L`
     if args.delegate.recurse && !(args.delegate.follow_cli || args.delegate.follow_symlinks) {

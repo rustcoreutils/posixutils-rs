@@ -466,7 +466,7 @@ fn analyze_stdin(args: &Args, magic_files: &[PathBuf]) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("file");
 
-    let matches = Args::command().get_matches();
+    let matches = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
     let args = Args::from_arg_matches(&matches)?;
 
     let magic_files = get_magic_files(&args, &matches);

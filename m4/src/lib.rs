@@ -81,8 +81,8 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn parse() -> Self {
-        let matches = clap::command!()
+    fn command() -> clap::Command {
+        clap::command!()
             .arg(
                 clap::Arg::new("line_synchronization")
                     .short('s')
@@ -112,7 +112,12 @@ impl Args {
                     .action(clap::ArgAction::Append),
             )
             .arg(clap::Arg::new("file").action(clap::ArgAction::Append))
-            .get_matches();
+    }
+
+    pub fn parse() -> Self {
+        let argv = std::env::args_os().collect();
+        let matches = Self::command()
+            .get_matches_from(plib::optarg::keep_leading_equals_with(argv, Self::command));
 
         let line_synchronization = matches.get_flag("line_synchronization");
 

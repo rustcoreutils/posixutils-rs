@@ -43,7 +43,7 @@ struct Args {
 fn main() -> ExitCode {
     plib::diag::init_locale("uustat");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Check if spool is accessible
     let spool = spool_dir();

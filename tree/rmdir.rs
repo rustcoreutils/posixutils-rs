@@ -83,7 +83,7 @@ fn remove_dir(operand: &str, rm_parents: bool, ignore_non_empty: bool) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("rmdir");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut exit_code = 0;
 

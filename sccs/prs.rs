@@ -598,7 +598,9 @@ fn main() -> ExitCode {
     // The -r option-argument is optional and "cannot be presented as a separate
     // argument" (POSIX). Rewrite a bare "-r" to "-r=" so clap treats it as an
     // empty attached value rather than greedily consuming the following operand.
-    let argv = std::env::args().map(|a| if a == "-r" { "-r=".to_string() } else { a });
+    let argv = plib::optarg::keep_leading_equals::<Args>(std::env::args_os())
+        .into_iter()
+        .map(|a| if a == "-r" { "-r=".into() } else { a });
     let args = Args::parse_from(argv);
 
     let mut success = true;

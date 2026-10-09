@@ -124,7 +124,7 @@ fn exec_util(envs: &BTreeMap<String, String>, util_args: &[String]) -> ! {
 fn main() {
     diag::init_locale("env");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let (envs, util_args) = separate_ops(&args.operands);
     let new_env = merge_env(&envs, args.ignore_env);

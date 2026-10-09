@@ -147,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // identifies the utility.
     plib::diag::init_locale("fold");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // if no files, read from stdin
     if args.files.is_empty() {

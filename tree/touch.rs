@@ -398,7 +398,7 @@ fn set_link_times(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("touch");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // Default to changing both access and modification times.
     if !args.access && !args.mtime {

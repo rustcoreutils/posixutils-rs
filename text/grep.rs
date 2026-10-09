@@ -729,7 +729,9 @@ fn expand_numeric_context(argv: Vec<OsString>) -> Vec<OsString> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("grep");
 
-    let mut args = Args::parse_from(expand_numeric_context(std::env::args_os().collect()));
+    let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+        expand_numeric_context(std::env::args_os().collect()),
+    ));
 
     let exit_code = args
         .validate_args()

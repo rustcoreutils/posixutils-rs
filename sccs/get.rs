@@ -954,7 +954,7 @@ fn main() -> ExitCode {
     // handler installed the registry is inert and ^C strands z.<name>.
     zlock::install_cleanup();
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Expand operands: a lone "-" reads s-file pathnames from stdin, and
     // directory operands expand to their sorted s.* members.

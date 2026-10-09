@@ -108,7 +108,7 @@ fn print_info(args: &Args, info: &UnameInfo) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("uname");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     if args.all {
         args.machine = true;

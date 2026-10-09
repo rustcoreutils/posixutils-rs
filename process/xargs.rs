@@ -141,7 +141,7 @@ impl Args {
     /// Parse the command line and split the operand list into the utility
     /// and its arguments.
     fn parse_command_line() -> Self {
-        let mut args = Args::parse();
+        let mut args = plib::optarg::parse::<Args>();
         let mut command = std::mem::take(&mut args.command).into_iter();
         args.util = command.next().unwrap_or_else(|| String::from("echo"));
         args.util_args = command.collect();

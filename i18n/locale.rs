@@ -54,7 +54,7 @@ fn main() {
     // localeconv/nl_langinfo below) to the environment locale.
     plib::diag::init_locale("locale");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Handle -a (list all locales)
     if args.all_locales {

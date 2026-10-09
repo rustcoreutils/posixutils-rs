@@ -192,7 +192,9 @@ fn head_file(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("head");
 
-    let mut args = Args::parse_from(expand_historical_count(std::env::args_os()));
+    let mut args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+        expand_historical_count(std::env::args_os()),
+    ));
 
     // POSIX makes "the number is a positive integer" a constraint on the
     // application, not a reason for head to fail: a count of zero selects

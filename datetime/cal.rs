@@ -257,7 +257,7 @@ fn print_year(year: u32) {
 fn main() {
     diag::init_locale("cal");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // If no arguments are provided, display the current month
     if args.month.is_none() && args.year.is_none() {

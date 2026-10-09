@@ -817,7 +817,7 @@ fn display_ipc_status(args: &Args) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("ipcs");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // -a enables all print options
     if args.all {

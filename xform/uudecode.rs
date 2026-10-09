@@ -301,7 +301,7 @@ fn pathname_display(path: &Option<PathBuf>) -> String {
 fn main() {
     diag::init_locale("uudecode");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if let Err(e) = decode_file(&args) {
         diag::error(&format!(

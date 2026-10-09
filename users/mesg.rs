@@ -72,7 +72,7 @@ fn exit_for(allowed: bool) -> ExitCode {
 fn main() -> ExitCode {
     plib::diag::init_locale("mesg");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let (fd, st) = match stat_tty() {
         Ok(v) => v,

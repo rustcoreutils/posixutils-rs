@@ -121,7 +121,7 @@ fn parse_owner_group(owner_group: &str) -> Result<ParseOwnerGroupResult, String>
 fn main() -> Result<(), io::Error> {
     plib::diag::init_locale("chown");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // Enable no-dereference if `-R` is given without `-H` or `-L` (parity with chgrp; #CO2).
     if args.delegate.recurse && !(args.delegate.follow_cli || args.delegate.follow_symlinks) {

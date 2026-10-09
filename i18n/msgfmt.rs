@@ -95,7 +95,7 @@ impl std::fmt::Display for Diagnostic {
 fn main() {
     plib::diag::init_locale("msgfmt");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // POSIX: at least one pathname operand is required, but report it as a
     // usage diagnostic rather than a clap argument error.

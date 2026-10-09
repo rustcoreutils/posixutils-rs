@@ -78,7 +78,8 @@ impl Args {
             "in-place",
             &OptionArguments::of(Args::command()),
         );
-        let matches = Args::command().get_matches_from(argv);
+        let matches =
+            Args::command().get_matches_from(plib::optarg::keep_leading_equals::<Args>(argv));
         let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
         let mut sources: Vec<(usize, ScriptSource)> = Vec::new();

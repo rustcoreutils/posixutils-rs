@@ -256,7 +256,7 @@ fn main() -> ExitCode {
     let program = ProgramMode::detect();
     error::set_program_name(program.name());
     let args = match program {
-        ProgramMode::Pax => Ok(Args::parse()),
+        ProgramMode::Pax => Ok(plib::optarg::parse::<Args>()),
         ProgramMode::Tar => cli::tar::parse(std::env::args_os().collect()),
         ProgramMode::Cpio => cli::cpio::parse(std::env::args_os().collect()),
     };

@@ -405,7 +405,7 @@ fn run(args: Args) -> Result<bool, PatchError> {
 fn main() -> ExitCode {
     plib::diag::init_locale("patch");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Validate arguments
     if let Err(e) = args.validate() {

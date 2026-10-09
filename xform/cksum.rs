@@ -71,7 +71,7 @@ fn cksum_file(filename: &Path) -> io::Result<()> {
 fn main() {
     diag::init_locale("cksum");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // if no file args, read from stdin
     if args.files.is_empty() {

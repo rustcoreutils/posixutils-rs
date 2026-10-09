@@ -336,7 +336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse via clap (for --help/--version/validation) and keep the matches so
     // we can recover the command-line order of the repeated options.
-    let matches = Args::command().get_matches();
+    let matches = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
     let args = Args::from_arg_matches(&matches)?;
 
     let mut ops: Vec<(usize, Op)> = Vec::new();

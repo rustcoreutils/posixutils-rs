@@ -639,7 +639,7 @@ fn display_name(p: &Path) -> String {
 fn main() -> ExitCode {
     diag::init_locale("join");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     match run(args) {
         Ok(false) => ExitCode::SUCCESS,

@@ -60,7 +60,7 @@ struct Args {
 fn main() -> ExitCode {
     plib::diag::init_locale("uucp");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // -d is the default, -f overrides it
     let create_dirs = !args.no_create_dirs;

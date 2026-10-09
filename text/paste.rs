@@ -425,7 +425,7 @@ fn paste_files(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("paste");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let Args {
         delimiters,

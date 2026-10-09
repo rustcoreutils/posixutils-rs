@@ -145,7 +145,7 @@ fn do_readlink(args: Args) -> Result<String, String> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("readlink");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let exit_code = match do_readlink(args) {
         Ok(output) => {

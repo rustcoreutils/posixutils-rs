@@ -814,7 +814,7 @@ fn merge_records(
 fn main() {
     plib::diag::init_locale("sort");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let code = match run(&args) {
         Ok(c) => c,

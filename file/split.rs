@@ -345,7 +345,7 @@ fn main() -> ExitCode {
     // user as `Error: Custom { kind: Other, error: "..." }`. Every failure has
     // to read as one `split: <message>` line, so each error site returns its
     // message and only this one prints it.
-    match split_main(Args::parse()) {
+    match split_main(plib::optarg::parse::<Args>()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("split: {}", plib::diag::error_text(e.as_ref()));

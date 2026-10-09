@@ -145,7 +145,7 @@ fn expand_file(tablist: &TabList, pathname: &Path) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("expand");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     let tablist = {
         if let Some(ref tablist) = args.tablist {

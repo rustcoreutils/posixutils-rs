@@ -129,7 +129,7 @@ fn asa_file(pathname: &Path) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("asa");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     // if no files, read from stdin (use "-" to indicate stdin)
     if args.files.is_empty() {

@@ -207,9 +207,11 @@ fn test_nl_width_and_multi_character_separator() {
 
 #[test]
 fn test_nl_negative_start_and_zero_increment() {
-    // -v takes any integer; a `-5` argument needs `=` so it is not read as an
-    // option. -i 0 leaves every line with the same number.
-    nl_test(&["-b", "a", "-v=-5"], "a\n", "    -5\ta\n");
+    // -v takes any integer, attached or the next word even when it begins
+    // with '-' (XBD 12.2, Guideline 7). -i 0 leaves every line with the same
+    // number.
+    nl_test(&["-b", "a", "-v-5"], "a\n", "    -5\ta\n");
+    nl_test(&["-b", "a", "-v", "-5"], "a\n", "    -5\ta\n");
     nl_test(&["-b", "a", "-i", "0"], "a\nb\n", "     1\ta\n     1\tb\n");
 }
 

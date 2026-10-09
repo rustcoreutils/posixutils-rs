@@ -54,7 +54,7 @@ struct Args {
 fn main() {
     plib::diag::init_locale("gettext");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Handle shell mode (-s)
     if args.shell_mode {

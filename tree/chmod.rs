@@ -147,7 +147,7 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("chmod");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut exit_code = 0;
 

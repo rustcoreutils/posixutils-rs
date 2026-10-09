@@ -1193,7 +1193,7 @@ fn named(path: impl std::fmt::Display, e: std::io::Error) -> String {
 }
 
 fn xgettext_main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.files.is_empty() {
         return Err(gettext("no input file given").into());

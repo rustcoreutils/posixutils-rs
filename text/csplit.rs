@@ -797,7 +797,7 @@ fn validate_prefix(prefix: &str, suffix_len: u8) -> io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("csplit");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Validate prefix won't exceed NAME_MAX
     validate_prefix(&args.prefix, args.num)?;

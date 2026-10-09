@@ -99,7 +99,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn at_main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::try_parse().unwrap_or_else(|err| {
+    let args = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| {
         eprintln!("{}", err);
         std::process::exit(1);
     });

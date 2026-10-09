@@ -240,7 +240,7 @@ impl Status {
 fn main() {
     diag::init_locale("time");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     match time(args) {
         Ok(code) => Status::Utility(code).exit(),

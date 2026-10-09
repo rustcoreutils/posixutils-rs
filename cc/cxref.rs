@@ -750,7 +750,7 @@ fn print_xref(
 fn main() -> ExitCode {
     plib::diag::init_locale("cxref");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // -D/-U are order-significant for this utility (unlike c17, where -U
     // always wins). clap collects each flag into its own list, losing the

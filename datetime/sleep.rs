@@ -53,7 +53,7 @@ fn parse_interval(operand: &str) -> Result<Duration, String> {
 fn main() {
     plib::diag::init_locale("sleep");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Ignore the SIGALRM signal (Windows has none).
     #[cfg(unix)]

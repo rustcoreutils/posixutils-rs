@@ -354,7 +354,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if am_i {
             Args::parse_from(["who", "-m"])
         } else {
-            Args::parse()
+            plib::optarg::parse::<Args>()
         }
     };
     if args.all {

@@ -504,7 +504,7 @@ struct Args {
 fn main() -> Result<(), Box<dyn Error>> {
     plib::diag::init_locale("crond");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Install handlers via sigaction (audit #D11) *before* forking, so the
     // daemon has them from its first instruction. Dispositions are inherited

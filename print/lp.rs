@@ -459,7 +459,7 @@ fn do_lp(mut args: Args) -> Result<bool, String> {
 fn main() -> ExitCode {
     plib::diag::init_locale("lp");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     match do_lp(args) {
         Ok(false) => ExitCode::SUCCESS,

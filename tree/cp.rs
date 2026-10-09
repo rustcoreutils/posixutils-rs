@@ -166,7 +166,7 @@ fn prompt_user(prompt: &str) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("cp");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.files.len() < 2 {
         eprintln!("{}", gettext("Must supply a source and target for copy"));

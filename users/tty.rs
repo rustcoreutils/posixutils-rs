@@ -21,7 +21,7 @@ struct Args {}
 fn main() -> ExitCode {
     plib::diag::init_locale("tty");
 
-    let _args = Args::parse();
+    let _args = plib::optarg::parse::<Args>();
 
     // POSIX: report the name of the terminal open as *standard input* only.
     if !io::stdin().is_terminal() {

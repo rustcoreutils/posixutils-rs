@@ -654,7 +654,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn iconv_main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.list_codesets {
         list_encodings();

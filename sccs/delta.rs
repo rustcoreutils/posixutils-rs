@@ -734,7 +734,7 @@ fn main() -> ExitCode {
 
     zlock::install_cleanup();
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // When the single operand is '-', the spec requires the comment to be
     // supplied via -y (and the MR list via -m if the v flag is set), since

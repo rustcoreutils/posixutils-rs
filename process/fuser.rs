@@ -1647,7 +1647,7 @@ fn fuser_main() -> Result<(), Box<dyn std::error::Error>> {
         named_files,
         user,
         file,
-    } = Args::try_parse().unwrap_or_else(|err| match err.kind() {
+    } = plib::optarg::try_parse::<Args>().unwrap_or_else(|err| match err.kind() {
         // `--help` and `--version` are a successful request for information,
         // not an error: clap writes the text itself and the status is 0.
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {

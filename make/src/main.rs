@@ -309,7 +309,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keep_going,
         jobs,
         mut targets,
-    } = Args::parse_from(args_with_makeflags());
+    } = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(
+        args_with_makeflags(),
+    ));
 
     let mut status_code = 0;
 

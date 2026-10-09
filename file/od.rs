@@ -1406,7 +1406,7 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("od");
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
 
     args.validate_args()?;
     let mut exit_code = 0;

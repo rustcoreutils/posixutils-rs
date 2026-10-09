@@ -148,7 +148,7 @@ fn process_operand(info: &Database, operand: &str) -> Result<(), u8> {
 fn main() -> ExitCode {
     plib::diag::init_locale("tput");
 
-    let args = match Args::try_parse() {
+    let args = match plib::optarg::try_parse::<Args>() {
         Ok(a) => a,
         Err(e) => {
             // Clap already prints the error message

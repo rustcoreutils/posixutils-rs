@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     plib::diag::init_locale("awk");
     charset::init();
 
-    let mut args = Args::parse();
+    let mut args = plib::optarg::parse::<Args>();
     // Operands, assignments and the program text become awk strings the way
     // input does, so that in a single-byte locale each byte is a character.
     for arg in args

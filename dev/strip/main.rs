@@ -618,7 +618,7 @@ fn strip_file(file: &OsStr, opts: &Options) {
 fn main() {
     diag::init_locale("strip");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
     let level = if args.strip_unneeded {
         Level::Unneeded
     } else if args.strip_debug {

@@ -700,7 +700,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // -n namelist is accepted for XSI conformance; its format is unspecified by
     // POSIX and this implementation reads live process state (/proc on Linux,

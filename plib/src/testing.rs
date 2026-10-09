@@ -421,6 +421,42 @@ pub fn assert_hyphen_option_argument(cmd: &str, args: &[&str]) -> Output {
     output
 }
 
+/// Run `cmd` with an option-argument beginning with '=' attached to the
+/// short option `opt` (`-d=`, `-d=x`) and again as the next word (`-d =`,
+/// `-d =x`), with `rest` after it and `stdin` as input, and assert that the
+/// two runs agree in status, standard output and standard error.
+///
+/// An attached option-argument is everything after the option letter (XBD
+/// 12.1), so `-d=` is the argument "="; clap alone reads it as `-d` with the
+/// empty argument.
+pub fn assert_equals_option_argument(cmd: &str, opt: &str, rest: &[&str], stdin: &[u8]) {
+    for value in ["=", "=x"] {
+        let rest = rest.iter().map(|s| s.to_string());
+        let attached: Vec<String> = std::iter::once(format!("{opt}{value}"))
+            .chain(rest.clone())
+            .collect();
+        let separate: Vec<String> = [opt.to_string(), value.to_string()]
+            .into_iter()
+            .chain(rest)
+            .collect();
+        let a = run_test_base(cmd, &attached, stdin);
+        let s = run_test_base(cmd, &separate, stdin);
+        assert_eq!(
+            (
+                a.status.code(),
+                String::from_utf8_lossy(&a.stdout),
+                String::from_utf8_lossy(&a.stderr)
+            ),
+            (
+                s.status.code(),
+                String::from_utf8_lossy(&s.stdout),
+                String::from_utf8_lossy(&s.stderr)
+            ),
+            "{cmd} {attached:?} differs from {cmd} {separate:?}"
+        );
+    }
+}
+
 /// Assert that a utility dies by `SIGPIPE` when the reader of its standard
 /// output goes away, writing nothing to standard error.
 ///

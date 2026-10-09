@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // one utility here whose diagnostics carried no `uniq: ` prefix at all.
     plib::diag::init_locale("uniq");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     args.validate_args()?;
 

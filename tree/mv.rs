@@ -634,7 +634,7 @@ fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("mv");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.files.len() < 2 {
         eprintln!(

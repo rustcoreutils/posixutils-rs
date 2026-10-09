@@ -239,7 +239,7 @@ fn diag_error(msg: &str) {
 fn main() {
     plib::diag::init_locale("crontab");
 
-    let args = CronArgs::parse();
+    let args = plib::optarg::parse::<CronArgs>();
 
     // Identity comes from the real uid, never the spoofable $LOGNAME (audit #X2).
     let Some(logname) = cron::spool::User::current().map(|u| u.name) else {

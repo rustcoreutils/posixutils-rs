@@ -340,7 +340,7 @@ fn extract_macro_tags(lines: &[String], path: &str, tags: &mut Vec<TagEntry>) {
 fn main() -> ExitCode {
     plib::diag::init_locale("ctags");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     // Collect all tags. Keyed by (name, file, line) rather than by name alone:
     // two files that each define `init` are two distinct tags, and dropping one

@@ -57,7 +57,7 @@ fn show_dirname(args: &Args) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     diag::init_locale("dirname");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     show_dirname(&args);
 

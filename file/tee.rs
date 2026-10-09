@@ -128,7 +128,7 @@ fn tee_stdin(info: &mut TeeInfo) -> bool {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     plib::diag::init_locale("tee");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     if args.ignore {
         unsafe {

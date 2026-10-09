@@ -469,7 +469,7 @@ fn main() {
         "iso-8601",
         &OptionArguments::of(Args::command()),
     );
-    let args = Args::parse_from(argv);
+    let args = Args::parse_from(plib::optarg::keep_leading_equals::<Args>(argv));
     let iso = iso_format(&args);
 
     if let Some(date) = &args.date {

@@ -148,7 +148,7 @@ fn main() -> ExitCode {
 
     zlock::install_cleanup();
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let mut success = true;
 

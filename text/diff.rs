@@ -243,7 +243,7 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
 fn main() -> DiffExitStatus {
     plib::diag::init_locale("diff");
 
-    let args = Args::parse();
+    let args = plib::optarg::parse::<Args>();
 
     let result = check_difference(args);
 

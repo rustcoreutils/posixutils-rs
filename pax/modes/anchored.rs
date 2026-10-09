@@ -21,7 +21,8 @@
 //! always created fresh rather than written through.
 
 use crate::error::{PaxError, PaxResult};
-use crate::modes::made::{self, cvt, verify_made_dir, MadeNode, MadeTrust};
+use crate::modes::made::{self, verify_made_dir, MadeNode, MadeTrust};
+use plib::madefs::{cvt, fstat, fstatat, lstat_at};
 use plib::madefs::{ChainTrust, FoundDir, NamedAnchor, Preserve, SEARCH_ONLY};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -514,7 +515,7 @@ impl DirTree {
     /// says came from `origin`, to be entered: never one found in place of a
     /// directory this run made, now or earlier, whichever member reaches it.
     fn admit(&self, fd: BorrowedFd<'_>, origin: DirOrigin) -> PaxResult<libc::stat> {
-        let st = fstat(fd).ok_or_else(std::io::Error::last_os_error)?;
+        let st = fstat(fd.as_raw_fd())?;
         if origin == DirOrigin::Replaced {
             return Err(self.refuse_replaced(file_id(&st)));
         }
@@ -746,7 +747,10 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
         Err(PaxError::Io(e)) if is_superseded(&e) => return Ok(()),
         Err(e) => return Err(e),
     };
-    let Some(st) = fstat(fd.as_fd()).filter(|st| file_id(st) == dir.id) else {
+    let Some(st) = fstat(fd.as_raw_fd())
+        .ok()
+        .filter(|st| file_id(st) == dir.id)
+    else {
         return Ok(());
     };
     let (with_mode, ours) = match tree.standing(&st, &member.key()) {
@@ -762,7 +766,7 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
     };
     // What it was given is this run's doing: it is still the directory made.
     if ours {
-        if let Some(st) = fstat(fd.as_fd()) {
+        if let Ok(st) = fstat(fd.as_raw_fd()) {
             tree.note_left_as(&st);
         }
     }
@@ -948,7 +952,7 @@ impl FreshDir {
         let Some(trust) = verify_made_dir(parent, dir)? else {
             return Ok(None);
         };
-        let st = fstat(dir).ok_or_else(std::io::Error::last_os_error)?;
+        let st = fstat(dir.as_raw_fd())?;
         Ok(Some(FreshDir {
             id: file_id(&st),
             trust,
@@ -1076,7 +1080,9 @@ pub(crate) fn make_dir_at(
     // its attributes. With -k anything else there is left entirely alone.
     // Otherwise extracting onto an existing directory is not an error
     // (POSIX), and it is kept.
-    let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+    let existing_dir = lstat_at(dirfd.as_raw_fd(), name)
+        .ok()
+        .filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
     if let Some(st) = existing_dir {
         let id = file_id(&st);
         return match tree.standing(&st, &member.key()) {
@@ -1129,7 +1135,7 @@ fn made_dir_id(tree: &DirTree, dirfd: BorrowedFd<'_>, member: &MemberPath) -> Pa
     reached_made_dir(dirfd, name);
     let (dir, _) = open_dir_for_attrs(dirfd, name)?;
     let Some(fresh) = FreshDir::verify(dirfd, dir.as_fd())? else {
-        let st = fstat(dir.as_fd()).ok_or_else(std::io::Error::last_os_error)?;
+        let st = fstat(dir.as_raw_fd())?;
         return Err(tree.refuse_replaced(file_id(&st)));
     };
     let id = fresh.id;
@@ -1152,7 +1158,9 @@ fn reached_made_dir(dirfd: BorrowedFd<'_>, name: &CStr) {
 
 /// Whether `name` below `dirfd` is a directory, not following a symlink.
 fn is_directory_at(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
-    stat_at(dirfd, name).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    lstat_at(dirfd.as_raw_fd(), name)
+        .ok()
+        .is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
 }
 
 /// Remove whatever currently occupies `name`, so an exclusive create can win.
@@ -1289,19 +1297,21 @@ pub(crate) fn link_replacing_with(
         dirfd.as_raw_fd(),
         name,
     );
-    if let Some(dst) = stat_at(dirfd, name) {
+    if let Ok(dst) = lstat_at(dirfd.as_raw_fd(), name) {
         // The source is the file pinned, or the one the caller examined: its
         // name, resolved again, can be pointed at the destination's file by
         // now, which would skip the member as linked to itself. Only a source
         // known by neither is resolved again.
         let resolved = source.identity().or_else(|| {
             let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-            fstatat(from_dir, from_name, src_flags).map(|st| file_id(&st))
+            fstatat(from_dir, from_name, src_flags)
+                .ok()
+                .map(|st| file_id(&st))
         });
         // Followed, the link itself is the source just as much
         // (`pax -rwl -H link .`).
         let link = follow
-            .then(|| fstatat(from_dir, from_name, libc::AT_SYMLINK_NOFOLLOW))
+            .then(|| fstatat(from_dir, from_name, libc::AT_SYMLINK_NOFOLLOW).ok())
             .flatten()
             .map(|st| file_id(&st));
         if [resolved, link]
@@ -1383,7 +1393,10 @@ impl<'a> LinkSource<'a> {
             return Err(std::io::Error::last_os_error().into());
         }
         let pin = unsafe { OwnedFd::from_raw_fd(fd) };
-        if !fstat(pin.as_fd()).is_some_and(|st| file_id(&st) == expected) {
+        if !fstat(pin.as_raw_fd())
+            .ok()
+            .is_some_and(|st| file_id(&st) == expected)
+        {
             return Err(source_changed());
         }
         Ok(Some(LinkSource::Pinned { proc_dir, pin }))
@@ -1394,7 +1407,7 @@ impl<'a> LinkSource<'a> {
     fn identity(&self) -> Option<(u64, u64)> {
         match self {
             #[cfg(target_os = "linux")]
-            LinkSource::Pinned { pin, .. } => fstat(pin.as_fd()).map(|st| file_id(&st)),
+            LinkSource::Pinned { pin, .. } => fstat(pin.as_raw_fd()).ok().map(|st| file_id(&st)),
             LinkSource::Name { expected, .. } => *expected,
         }
     }
@@ -1417,7 +1430,7 @@ impl<'a> LinkSource<'a> {
                 ..
             } => unsafe { libc::linkat(*from_dir, from_name.as_ptr(), to, name.as_ptr(), *flags) },
         };
-        made::cvt(r)
+        cvt(r)
     }
 
     /// After `link_to` made `name`: a pinned source can only have linked the
@@ -1457,7 +1470,10 @@ fn linked_expected(
         dirfd.as_raw_fd(),
         name,
     );
-    if stat_at(dirfd, name).is_some_and(|st| file_id(&st) == expected) {
+    if lstat_at(dirfd.as_raw_fd(), name)
+        .ok()
+        .is_some_and(|st| file_id(&st) == expected)
+    {
         return Ok(());
     }
     unlink_at(dirfd, name)?;
@@ -1567,7 +1583,10 @@ fn reopen_regular_blocking(
         return Err(std::io::Error::last_os_error());
     }
     let pin = unsafe { OwnedFd::from_raw_fd(pin) };
-    if !fstat(pin.as_fd()).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG) {
+    if !fstat(pin.as_raw_fd())
+        .ok()
+        .is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG)
+    {
         return Err(std::io::Error::from_raw_os_error(libc::ENXIO));
     }
     // The magic link is followed to the pinned inode: `O_NOFOLLOW` would
@@ -1613,7 +1632,7 @@ fn reopen_regular_by_name(
     } else {
         0
     };
-    match fstatat(dir_fd, name, stat_flags) {
+    match fstatat(dir_fd, name, stat_flags).ok() {
         Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFREG => {}
         Some(_) => return Err(std::io::Error::from_raw_os_error(libc::ENXIO)),
         None => return Err(std::io::Error::last_os_error()),
@@ -1684,7 +1703,10 @@ pub(crate) fn restore_dir_atime(entry: &ftw::Entry<'_>) {
         return;
     }
     let dir = unsafe { OwnedFd::from_raw_fd(fd) };
-    if fstat(dir.as_fd()).is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino())) {
+    if fstat(dir.as_raw_fd())
+        .ok()
+        .is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino()))
+    {
         restore_atime(dir.as_fd(), entry.path().as_inner(), metadata);
     }
 }
@@ -1977,26 +1999,6 @@ fn owner_unverified(policy: &AttrPolicy) -> PaxResult<()> {
     )))
 }
 
-/// `fstatat` with `AT_SYMLINK_NOFOLLOW`, for asking what a name *is* without
-/// following it anywhere.
-pub(crate) fn stat_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<libc::stat> {
-    fstatat(dirfd.as_raw_fd(), name, libc::AT_SYMLINK_NOFOLLOW)
-}
-
-/// `fstat` of an open descriptor.
-fn fstat(fd: BorrowedFd<'_>) -> Option<libc::stat> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
-    (r == 0).then_some(st)
-}
-
-/// `fstatat` from a raw directory descriptor such as a walk entry's.
-fn fstatat(dirfd: libc::c_int, name: &CStr, flags: libc::c_int) -> Option<libc::stat> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, flags) };
-    (r == 0).then_some(st)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2007,7 +2009,7 @@ mod tests {
 
     /// The inode a descriptor refers to.
     fn ino_of(fd: &OwnedFd) -> u64 {
-        stat_at(fd.as_fd(), c".").unwrap().st_ino
+        lstat_at(fd.as_raw_fd(), c".").unwrap().st_ino
     }
 
     fn ino_at(path: &Path) -> u64 {
@@ -2304,7 +2306,7 @@ mod tests {
         std::fs::write(dir.path().join("d"), "other\n").unwrap();
         let tree = DirTree::open_path(dir.path()).unwrap();
         let root = tree.root().as_raw_fd();
-        let source = file_id(&stat_at(tree.root(), c"a").unwrap());
+        let source = file_id(&lstat_at(tree.root().as_raw_fd(), c"a").unwrap());
 
         let path = dir.path().to_path_buf();
         let swap = move |point, _: libc::c_int, _: &CStr| {
@@ -2318,7 +2320,7 @@ mod tests {
             link_replacing_with(root, c"a", false, Some(source), tree.root(), c"d", false)
         });
         assert!(!linked.unwrap(), "skipped as already linked to itself");
-        let d = stat_at(tree.root(), c"d").unwrap();
+        let d = lstat_at(tree.root().as_raw_fd(), c"d").unwrap();
         assert_eq!(file_id(&d), source, "d does not hold the source");
     }
 
@@ -2331,14 +2333,14 @@ mod tests {
         let dir = plib::tmp::TempDir::new().unwrap();
         let tree = DirTree::open_path(dir.path()).unwrap();
         std::fs::create_dir(dir.path().join("u")).unwrap();
-        let u = file_id(&stat_at(tree.root(), c"u").unwrap());
+        let u = file_id(&lstat_at(tree.root().as_raw_fd(), c"u").unwrap());
         tree.unverified.borrow_mut().insert(u);
 
         let kept = make_dir_at(&tree, tree.root(), &member("u"), 0o755, true).unwrap();
         assert_eq!(kept, DirAttrs::Keep);
         let decided = make_dir_at(&tree, tree.root(), &member("u"), 0o755, false).unwrap();
         assert_eq!(decided, DirAttrs::Withheld(u));
-        let st = stat_at(tree.root(), c"u").unwrap();
+        let st = lstat_at(tree.root().as_raw_fd(), c"u").unwrap();
         assert!(tree.standing(&st, &member("u").key()) == Standing::Unverified);
     }
 
@@ -2353,7 +2355,7 @@ mod tests {
         for name in ["r", "u"] {
             std::fs::create_dir(dir.path().join(name)).unwrap();
         }
-        let id = |name: &CStr| file_id(&stat_at(tree.root(), name).unwrap());
+        let id = |name: &CStr| file_id(&lstat_at(tree.root().as_raw_fd(), name).unwrap());
         let (r, u) = (id(c"r"), id(c"u"));
         let (r_key, u_key) = (member("r").key(), member("u").key());
         assert!(matches!(tree.refuse_replaced(r), PaxError::Io(_)));
@@ -2367,9 +2369,12 @@ mod tests {
         assert!(tree.parent_of(&member("u/x"), true).is_ok());
         let decided = make_dir_at(&tree, tree.root(), &member("u"), 0o755, false).unwrap();
         assert_eq!(decided, DirAttrs::Withheld(u));
-        assert!(!tree.claim_implicit(&stat_at(tree.root(), c"u").unwrap(), &member("u")));
+        assert!(!tree.claim_implicit(
+            &lstat_at(tree.root().as_raw_fd(), c"u").unwrap(),
+            &member("u")
+        ));
 
-        let st = |name: &CStr| stat_at(tree.root(), name).unwrap();
+        let st = |name: &CStr| lstat_at(tree.root().as_raw_fd(), name).unwrap();
         assert!(tree.standing(&st(c"r"), &r_key) == Standing::Replaced);
         assert!(tree.standing(&st(c"u"), &u_key) == Standing::Unverified);
     }
@@ -2385,7 +2390,7 @@ mod tests {
         for name in ["r", "u"] {
             std::fs::create_dir(dir.path().join(name)).unwrap();
         }
-        let id = |name: &CStr| file_id(&stat_at(tree.root(), name).unwrap());
+        let id = |name: &CStr| file_id(&lstat_at(tree.root().as_raw_fd(), name).unwrap());
         tree.replaced.borrow_mut().insert(id(c"r"));
         tree.unverified.borrow_mut().insert(id(c"u"));
 

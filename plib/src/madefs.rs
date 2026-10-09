@@ -1091,23 +1091,29 @@ pub fn chmod_fd(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
     Ok(())
 }
 
-/// `fstat` of a descriptor.
-fn fstat(fd: RawFd) -> io::Result<libc::stat> {
+// The descriptor and name calls pax and cp share, each giving the error a failed call left:
+// `fstat` (`crate::tty::fstat`), `fstatat`, `lstat_at` and `cvt`.
+pub use crate::tty::fstat;
+
+/// `fstatat(2)` of `name` below `dirfd` (a descriptor, or `AT_FDCWD`), with `flags`.
+pub fn fstatat(dirfd: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    cvt(unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, flags) })?;
     Ok(st)
 }
 
-/// `fstatat` with `AT_SYMLINK_NOFOLLOW`.
-fn lstat_at(dirfd: RawFd, name: &CStr) -> io::Result<libc::stat> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let flags = libc::AT_SYMLINK_NOFOLLOW;
-    if unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, flags) } != 0 {
+/// `fstatat` with `AT_SYMLINK_NOFOLLOW`: the entry `name` itself, never what a symbolic link
+/// refers to.
+pub fn lstat_at(dirfd: RawFd, name: &CStr) -> io::Result<libc::stat> {
+    fstatat(dirfd, name, libc::AT_SYMLINK_NOFOLLOW)
+}
+
+/// `Ok(())` for a libc call that returned 0, the error it left otherwise.
+pub fn cvt(r: libc::c_int) -> io::Result<()> {
+    if r != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(st)
+    Ok(())
 }
 
 /// The `fchmodat2` system call number (Linux 6.6 and later), where it is the generic 452.

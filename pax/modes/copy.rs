@@ -18,12 +18,13 @@ use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
-    restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, stat_at, AttrPolicy,
-    Attrs, DirAttrs, DirTree, MemberPath, PendingDirs,
+    restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, AttrPolicy, Attrs,
+    DirAttrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::followed_link;
 use crate::modes::write::FileNames;
 use crate::subst::{substitute_name, Substitution};
+use plib::madefs::lstat_at;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
@@ -119,7 +120,7 @@ pub fn copy_files(
         dev_stack: RefCell::new(Vec::new()),
         fatal: RefCell::new(None),
     };
-    if let Some(st) = stat_at(tree.root(), c".") {
+    if let Ok(st) = lstat_at(tree.root().as_raw_fd(), c".") {
         walk.dest_ids.borrow_mut().insert(file_id(&st));
     }
 
@@ -347,7 +348,7 @@ impl CopyWalk<'_> {
         let pfd = parent.as_fd();
         let name = mp.leaf.as_c_str();
 
-        let existing = stat_at(pfd, name);
+        let existing = lstat_at(pfd.as_raw_fd(), name).ok();
         if self.options.no_clobber && existing.is_some() {
             return Ok(false);
         }
@@ -401,7 +402,7 @@ impl CopyWalk<'_> {
         if self.options.substitutions.is_empty() && !self.options.interactive {
             return;
         }
-        if let Some(dir) = stat_at(dirfd, c".") {
+        if let Ok(dir) = lstat_at(dirfd.as_raw_fd(), c".") {
             self.made_files
                 .borrow_mut()
                 .entry(file_id(&dir))
@@ -419,7 +420,8 @@ impl CopyWalk<'_> {
         }
         // SAFETY: the walk keeps the entry's directory open while it is visited.
         let dir = unsafe { BorrowedFd::borrow_raw(entry.dir_fd()) };
-        stat_at(dir, c".")
+        lstat_at(dir.as_raw_fd(), c".")
+            .ok()
             .and_then(|st| made.get(&file_id(&st)))
             .is_some_and(|names| names.contains(entry.file_name()))
     }
@@ -454,7 +456,7 @@ impl CopyWalk<'_> {
             return self.descend(member, metadata);
         };
         let parent = self.tree.parent_of(&mp, true)?;
-        let existing = stat_at(parent.as_fd(), &mp.leaf);
+        let existing = lstat_at(parent.as_raw_fd(), &mp.leaf).ok();
         if existing.is_some_and(|st| is_source(&st, entry, metadata)) {
             return self.dir_onto_itself(src, member, metadata);
         }
@@ -477,8 +479,7 @@ impl CopyWalk<'_> {
             DirAttrs::Keep => existing.map(|st| file_id(&st)),
         };
         let dir = self.tree.open_dir(parent.as_fd(), &mp.leaf, false)?;
-        let dest_st = stat_at(dir.as_fd(), c".")
-            .ok_or_else(|| PaxError::Io(std::io::Error::last_os_error()))?;
+        let dest_st = lstat_at(dir.as_raw_fd(), c".").map_err(PaxError::Io)?;
         if expected.is_some_and(|id| id != file_id(&dest_st)) {
             return Err(PaxError::Io(std::io::Error::other(
                 "directory was replaced after it was checked",
@@ -620,7 +621,9 @@ fn is_source(st: &libc::stat, entry: &ftw::Entry<'_>, metadata: &ftw::Metadata) 
     }
     // SAFETY: the walk keeps the entry's directory open while it is visited.
     let dir = unsafe { BorrowedFd::borrow_raw(entry.dir_fd()) };
-    stat_at(dir, entry.file_name()).is_some_and(|link| file_id(&link) == id)
+    lstat_at(dir.as_raw_fd(), entry.file_name())
+        .ok()
+        .is_some_and(|link| file_id(&link) == id)
 }
 
 /// Diagnose copying a file to its own name, as BSD pax words it, and skip it.
@@ -808,7 +811,9 @@ fn copy_file(
 
 /// Whether `name` in `dirfd` is the file `metadata` describes.
 fn is_file_at(dirfd: BorrowedFd<'_>, name: &CStr, metadata: &ftw::Metadata) -> bool {
-    stat_at(dirfd, name).is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino()))
+    lstat_at(dirfd.as_raw_fd(), name)
+        .ok()
+        .is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino()))
 }
 
 /// Actually copy file contents

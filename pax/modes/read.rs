@@ -15,12 +15,13 @@ use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, link_replacing, link_replacing_with, make_dir_at,
-    set_attrs_fd, set_made_node_attrs, stat_at, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree,
-    MemberPath, PendingDirs,
+    set_attrs_fd, set_made_node_attrs, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath,
+    PendingDirs,
 };
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
 use crate::subst::{substitute_link_target, substitute_name, Substitution};
+use plib::madefs::lstat_at;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::Write;
@@ -812,7 +813,9 @@ fn pin_file(dirfd: BorrowedFd<'_>, name: &CStr, file: (u64, u64)) -> Option<Owne
 
 /// (st_dev, st_ino) of a name below `dirfd`, not following a symlink.
 fn id_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<(u64, u64)> {
-    stat_at(dirfd, name).map(|st| crate::modes::anchored::file_id(&st))
+    lstat_at(dirfd.as_raw_fd(), name)
+        .ok()
+        .map(|st| crate::modes::anchored::file_id(&st))
 }
 
 /// (st_dev, st_ino) of an open file.
@@ -1021,10 +1024,12 @@ fn is_archive_newer(tree: &DirTree, entry: &ArchiveEntry) -> bool {
         return true; // no such directory, so nothing there: extract it
     };
     // A directory created here only to hold earlier members is not one.
-    stat_at(parent.as_fd(), &member.leaf).is_none_or(|st| {
-        tree.is_implicit(&st, &member)
-            || (entry.mtime, i64::from(entry.mtime_nsec)) > tree.mtime_before_run(&st)
-    })
+    lstat_at(parent.as_raw_fd(), &member.leaf)
+        .ok()
+        .is_none_or(|st| {
+            tree.is_implicit(&st, &member)
+                || (entry.mtime, i64::from(entry.mtime_nsec)) > tree.mtime_before_run(&st)
+        })
 }
 
 /// The ids to give an extracted file.

@@ -1678,16 +1678,16 @@ fn compress_reports_write_error_to_stdout() {
 }
 
 // A program name that is not valid UTF-8 still selects zcat by its ending;
-// reading it made compress panic.
+// reading it made compress panic.  The name is set as argv[0] directly,
+// which is all compress reads, so no file of that name is needed.
 #[cfg(unix)]
 #[test]
 fn zcat_invoked_by_non_utf8_name() {
     use plib::testing::{get_binary_path, os_bytes};
+    use std::os::unix::process::CommandExt;
     let compressed = compress_stdin_test("hello\n");
-    let dir = plib::tmp::tempdir().unwrap();
-    let link = dir.path().join(os_bytes(b"\xffzcat"));
-    std::os::unix::fs::symlink(get_binary_path("compress"), &link).unwrap();
-    let mut child = std::process::Command::new(&link)
+    let mut child = std::process::Command::new(get_binary_path("compress"))
+        .arg0(os_bytes(b"\xffzcat"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()

@@ -1713,14 +1713,14 @@ fn vi_non_utf8_argument_is_reported() {
 }
 
 // A program name that is not valid UTF-8 still selects ex by its ending;
-// reading it made the editor panic.
+// reading it made the editor panic.  The name is set as argv[0] directly,
+// which is all the editor reads, so no file of that name is needed.
 #[test]
 fn ex_invoked_by_non_utf8_name() {
     use plib::testing::{get_binary_path, os_bytes};
-    let dir = plib::tmp::tempdir().unwrap();
-    let link = dir.path().join(os_bytes(b"\xffex"));
-    std::os::unix::fs::symlink(get_binary_path("vi"), &link).unwrap();
-    let output = std::process::Command::new(&link)
+    use std::os::unix::process::CommandExt;
+    let output = std::process::Command::new(get_binary_path("vi"))
+        .arg0(os_bytes(b"\xffex"))
         .arg("-s")
         .stdin(std::process::Stdio::null())
         .output()

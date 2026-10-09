@@ -570,3 +570,10 @@ fn m4_option_argument_may_begin_with_hyphen() {
         plib::testing::assert_hyphen_option_argument("m4", &[opt, "-zq", "--help"]);
     }
 }
+
+// A write error on output that does not end in a <newline> is reported: that
+// output sat in stdout's line buffer until exit, where the error was lost.
+#[test]
+fn m4_reports_write_error_on_final_partial_line() {
+    plib::testing::assert_write_error_on_full_device("m4", &[], b"x", 1);
+}

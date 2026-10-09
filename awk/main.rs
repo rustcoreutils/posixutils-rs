@@ -114,5 +114,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("{}", gettext("missing program argument"));
         1
     };
+    // Output without a final <newline> is still in stdout's line buffer, and
+    // the flush at exit would discard its write error.
+    if !plib::diag::flush_stdout() {
+        std::process::exit(return_status.max(1));
+    }
     std::process::exit(return_status);
 }

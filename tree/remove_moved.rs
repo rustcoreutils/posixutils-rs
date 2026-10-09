@@ -49,6 +49,19 @@ pub fn remove_moved_source(
     inode_map: &mut InodeMap,
     verbose: bool,
 ) -> bool {
+    // `D/.` and `D/..` are no entries of their own to remove: removing through them would empty
+    // D, or D's parent. (mv refuses to copy them; this holds whatever the caller did.)
+    if source.names_dot_or_dotdot() {
+        eprintln!(
+            "mv: {}",
+            gettext!(
+                "refusing to remove '.' or '..' directory: skipping '{}'",
+                source.path().display()
+            )
+        );
+        return false;
+    }
+
     let removal = RefCell::new(Removal::default());
 
     let file_handler = |entry: ftw::Entry<'_>| -> Result<bool, ()> {
@@ -185,5 +198,32 @@ mod tests {
         assert!(!removed);
         assert_eq!(fs::read(dir.join("D/f")).unwrap(), b"f");
         assert!(fs::symlink_metadata(dir.join("link")).unwrap().is_symlink());
+    }
+
+    /// `D/.` and `D/..` name D and its parent, which are not removed by those names. Even with
+    /// everything there recorded as copied, the removal refuses them instead of emptying them.
+    #[test]
+    fn a_dot_or_dotdot_source_is_not_removed_through() {
+        let tmp = plib::tmp::tempdir().unwrap();
+        let p = tmp.path().join("P");
+        fs::create_dir_all(p.join("D")).unwrap();
+        fs::write(p.join("D/f"), b"f").unwrap();
+        fs::write(p.join("g"), b"g").unwrap();
+
+        let mut copied = CopiedSources::default();
+        for copy in ["", "D", "D/f", "g"] {
+            copied.record(SourceState::of(
+                &fs::symlink_metadata(p.join(copy)).unwrap(),
+            ));
+        }
+        for source in ["D/.", "D/..", "D/./", "D/../"] {
+            let source = PinnedDirs::default().pin(&p.join(source)).unwrap();
+
+            let removed = remove_moved_source(&source, &copied, &mut InodeMap::new(), false);
+
+            assert!(!removed);
+            assert_eq!(fs::read(p.join("D/f")).unwrap(), b"f");
+            assert_eq!(fs::read(p.join("g")).unwrap(), b"g");
+        }
     }
 }

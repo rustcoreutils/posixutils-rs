@@ -91,6 +91,19 @@ impl PinnedEntry {
         &self.display_parent
     }
 
+    /// Whether the last component, trailing slashes aside, is `.` or `..` (as for `D/.`, `D/..`,
+    /// `link/./` or `/`): a name for a directory that is not its entry in a parent, so that
+    /// nothing can be renamed or removed by it.
+    pub fn names_dot_or_dotdot(&self) -> bool {
+        let name = self.name.to_bytes();
+        let end = name
+            .iter()
+            .rposition(|&b| b != b'/')
+            .map_or(0, |last| last + 1);
+        let last = name[..end].rsplit(|&b| b == b'/').next().unwrap_or(b"");
+        matches!(last, b"." | b"..")
+    }
+
     /// `fstatat` of the entry in its pinned directory.
     pub fn metadata(&self, follow_symlinks: bool) -> io::Result<ftw::Metadata> {
         ftw::Metadata::new(self.dir_fd(), &self.name, follow_symlinks)

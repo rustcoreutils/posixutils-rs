@@ -398,6 +398,16 @@ fn move_file_deciding(
 
     // Fall through: source and target are on different filesystems; must copy.
 
+    // `D/.` and `D/..` are no entries the rename could move (EBUSY), and copying then removing
+    // them would empty D, or D's parent: fail as the rename does within one filesystem.
+    if source_entry.names_dot_or_dotdot() {
+        return Err(cannot_move(
+            source,
+            target,
+            &io::Error::from_raw_os_error(libc::EBUSY),
+        ));
+    }
+
     // `link/` is not a directory the rename could move (ENOTDIR), and copying it would follow
     // the link: fail as the rename does within one filesystem, rather than copy the directory
     // the link points to and then empty it.

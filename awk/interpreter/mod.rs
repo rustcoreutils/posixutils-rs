@@ -787,8 +787,9 @@ impl Interpreter {
                 OpCode::NextFile => return Ok(ExecutionResult::NextFile),
                 OpCode::Exit => {
                     let exit_code = stack.pop_scalar_value()?.scalar_as_f64();
-                    return Ok(ExecutionResult::Exit(exit_code as i32));
+                    return Ok(ExecutionResult::Exit(Some(exit_code as i32)));
                 }
+                OpCode::ExitKeepingStatus => return Ok(ExecutionResult::Exit(None)),
                 OpCode::Return => {
                     let return_value = stack.pop_scalar_value()?;
                     stack.restore_caller();
@@ -944,7 +945,8 @@ pub fn interpret(
     let mut interpreter = Interpreter::new(args, env, program.constants, program.globals_count);
     let mut global_env = GlobalEnv::default();
     let mut range_pattern_started = vec![false; program.rules.len()];
-    let mut return_value = 0;
+    let mut exit_status = 0;
+    let mut exiting = false;
 
     set_globals_with_assignment_arguments(
         &mut interpreter,
@@ -972,19 +974,24 @@ pub fn interpret(
             &mut global_env,
             &mut EmptyRecordReader::default(),
         )?;
-        if let ExecutionResult::Exit(val) = begin_result {
-            return_value = val;
+        if let ExecutionResult::Exit(status) = begin_result {
+            // `exit` in BEGIN skips the input, but not the END actions
+            exit_status = status.unwrap_or(exit_status);
+            exiting = true;
             break;
         }
     }
 
     if program.rules.is_empty() && program.end_actions.is_empty() {
-        return Ok(return_value);
+        return Ok(exit_status);
     }
 
     let mut current_arg_index = 1;
     let mut input_read = false;
     'file_loop: loop {
+        if exiting {
+            break;
+        }
         let argc = interpreter.globals[SpecialVar::Argc as usize]
             .get_mut()
             .scalar_as_f64() as usize;
@@ -1053,6 +1060,8 @@ pub fn interpret(
                 AwkValue::from(global_env.nr as f64).value;
 
             for (i, rule) in program.rules.iter().enumerate() {
+                // a `next`, `nextfile` or `exit` in a function a pattern calls
+                let mut control = None;
                 let should_execute = match &rule.pattern {
                     Pattern::All => true,
                     Pattern::Expr(expr) => interpreter
@@ -1064,7 +1073,7 @@ pub fn interpret(
                             &mut global_env,
                             reader,
                         )?
-                        .expr_to_bool(),
+                        .pattern_matched(&mut control),
                     Pattern::Range { start, end } => {
                         if range_pattern_started[i] {
                             let end_matches = interpreter
@@ -1076,7 +1085,7 @@ pub fn interpret(
                                     &mut global_env,
                                     reader,
                                 )?
-                                .expr_to_bool();
+                                .pattern_matched(&mut control);
                             if end_matches {
                                 range_pattern_started[i] = false;
                             }
@@ -1092,7 +1101,7 @@ pub fn interpret(
                                     &mut global_env,
                                     reader,
                                 )?
-                                .expr_to_bool();
+                                .pattern_matched(&mut control);
                             if should_start {
                                 // Check if end also matches on the same line
                                 let end_matches = interpreter
@@ -1104,7 +1113,7 @@ pub fn interpret(
                                         &mut global_env,
                                         reader,
                                     )?
-                                    .expr_to_bool();
+                                    .pattern_matched(&mut control);
                                 // If end matches on the same line, don't keep range open
                                 range_pattern_started[i] = !end_matches;
                             }
@@ -1112,28 +1121,32 @@ pub fn interpret(
                         }
                     }
                 };
-                if should_execute {
-                    let rule_result = interpreter.run(
+                let rule_result = if let Some(control) = control {
+                    control
+                } else if should_execute {
+                    interpreter.run(
                         &rule.action,
                         &program.functions,
                         &mut current_record,
                         &mut stack,
                         &mut global_env,
                         reader,
-                    )?;
-                    match rule_result {
-                        ExecutionResult::Next => break,
-                        ExecutionResult::NextFile => {
-                            global_env.fnr += 1;
-                            global_env.nr += 1;
-                            break 'record_loop;
-                        }
-                        ExecutionResult::Exit(val) => {
-                            return_value = val;
-                            break 'file_loop;
-                        }
-                        ExecutionResult::Expression(_) => {}
+                    )?
+                } else {
+                    continue;
+                };
+                match rule_result {
+                    ExecutionResult::Next => break,
+                    ExecutionResult::NextFile => {
+                        global_env.fnr += 1;
+                        global_env.nr += 1;
+                        break 'record_loop;
                     }
+                    ExecutionResult::Exit(status) => {
+                        exit_status = status.unwrap_or(exit_status);
+                        break 'file_loop;
+                    }
+                    ExecutionResult::Expression(_) => {}
                 }
             }
 
@@ -1153,11 +1166,11 @@ pub fn interpret(
             &mut global_env,
             &mut EmptyRecordReader::default(),
         )?;
-        if let ExecutionResult::Exit(val) = end_result {
-            return_value = val;
+        if let ExecutionResult::Exit(status) = end_result {
+            exit_status = status.unwrap_or(exit_status);
             break;
         }
     }
 
-    Ok(return_value)
+    Ok(exit_status)
 }

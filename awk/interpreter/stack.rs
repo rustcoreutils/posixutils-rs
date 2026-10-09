@@ -356,14 +356,25 @@ pub(crate) enum ExecutionResult {
     Expression(AwkValue),
     Next,
     NextFile,
-    Exit(i32),
+    /// `exit [status]`; no status keeps that of an earlier `exit status`
+    Exit(Option<i32>),
 }
 
 impl ExecutionResult {
-    pub(crate) fn expr_to_bool(self) -> bool {
-        self.unwrap_expr().scalar_as_bool()
+    /// The truth value of a pattern's result.  A `next`, `nextfile` or
+    /// `exit` executed by a function the pattern called is put in `control`,
+    /// and the pattern does not match.
+    pub(crate) fn pattern_matched(self, control: &mut Option<ExecutionResult>) -> bool {
+        match self {
+            ExecutionResult::Expression(value) => value.scalar_as_bool(),
+            other => {
+                *control = Some(other);
+                false
+            }
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn unwrap_expr(self) -> AwkValue {
         match self {
             ExecutionResult::Expression(value) => value,

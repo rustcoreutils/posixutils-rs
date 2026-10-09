@@ -1694,10 +1694,10 @@ impl Compiler {
                 let stmt_line_col = stmt.line_col();
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
+                    instructions.push(OpCode::Exit, stmt_line_col);
                 } else {
-                    instructions.push(OpCode::PushZero, stmt_line_col);
+                    instructions.push(OpCode::ExitKeepingStatus, stmt_line_col);
                 }
-                instructions.push(OpCode::Exit, stmt_line_col);
                 Ok(())
             }
             Rule::return_stmt => {
@@ -3400,7 +3400,7 @@ mod test {
     #[test]
     fn test_compile_exit() {
         let (instructions, _) = compile_stmt("exit;");
-        assert_eq!(instructions, vec![OpCode::PushZero, OpCode::Exit]);
+        assert_eq!(instructions, vec![OpCode::ExitKeepingStatus]);
 
         let (instructions, _) = compile_stmt("exit 1;");
         assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Exit]);

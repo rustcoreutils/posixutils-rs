@@ -1802,3 +1802,39 @@ fn awk_print_list_takes_comparisons() {
     );
     assert_eq!(status, Some(0));
 }
+
+// `exit` in BEGIN skips the input but runs the END actions, `exit` with no
+// expression keeps the status of an earlier `exit expr` (gawk's test
+// exitval3), and `exit` in a function called from a pattern ends the
+// program instead of panicking.
+#[test]
+fn awk_exit_skips_input_and_keeps_its_status() {
+    let cases = [
+        (
+            "BEGIN { exit 3 } { print \"main\" } END { print \"end\" }",
+            "end\n",
+            3,
+        ),
+        ("BEGIN { exit 42 } END { exit }", "", 42),
+        ("{ exit 4 } END { exit }", "", 4),
+        (
+            "function f() { exit 3 } f() { print \"matched\" } END { print \"end\" }",
+            "end\n",
+            3,
+        ),
+        (
+            "BEGIN { exit 1 } END { print \"e1\"; exit 6; print \"no\" } END { print \"e2\" }",
+            "e1\n",
+            6,
+        ),
+    ];
+    for (program, output, exit_status) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, "x\n");
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(exit_status), "{program}");
+    }
+}

@@ -106,7 +106,10 @@ pub enum OpCode {
 
     Next,
     NextFile,
+    // exit with the status on top of the stack
     Exit,
+    // exit keeping the status of an earlier exit
+    ExitKeepingStatus,
     Return,
 
     // invalid opcode. Cannot be inside a valid program

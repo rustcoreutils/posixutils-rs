@@ -550,3 +550,58 @@ fn ps_survives_reader_closing_after_first_line() {
         );
     }
 }
+
+/// `ps ARGS` over this test process alone: its header and its one line.
+fn ps_self(args: &[&str]) -> Vec<String> {
+    let mut argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    argv.extend(["-p".to_string(), std::process::id().to_string()]);
+    let output = plib::testing::run_test_base("ps", &argv, b"");
+    assert!(output.status.success(), "ps {argv:?} failed: {output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<String> = stdout.lines().map(String::from).collect();
+    assert_eq!(lines.len(), 2, "expected a header and one line: {stdout:?}");
+    lines
+}
+
+// The C column of -f is the processor utilization, an integer as procps
+// prints it (CPU time over elapsed time, as a percentage capped at 99),
+// right-aligned under its header; it was always "-".
+#[test]
+fn ps_full_format_c_is_an_integer() {
+    let lines = ps_self(&["-f"]);
+    let c = lines[1].split_whitespace().nth(3).unwrap();
+    let value: u32 = c
+        .parse()
+        .unwrap_or_else(|_| panic!("C is not an integer: {:?}", lines[1]));
+    assert!(value <= 99, "C is capped at 99: {value}");
+
+    let lines = ps_self(&["-o", "c,pid"]);
+    assert_eq!(lines[0].find('C'), Some(1), "header: {:?}", lines[0]);
+    assert!(
+        lines[1].as_bytes()[1].is_ascii_digit(),
+        "C is right-aligned: {:?}",
+        lines[1]
+    );
+}
+
+// The last column is not padded: no trailing blanks after CMD, and no blanks
+// before its header beyond the one separating it, as procps prints it.
+#[test]
+fn ps_last_column_is_not_padded() {
+    for args in [&["-f"][..], &["-l"], &[], &["-o", "pid,comm"]] {
+        let lines = ps_self(args);
+        for line in &lines {
+            assert!(
+                !line.ends_with(' '),
+                "ps {args:?}: trailing blanks in {line:?}"
+            );
+        }
+        let last = lines[0].rfind(' ').unwrap();
+        assert_ne!(
+            lines[0].as_bytes()[last - 1],
+            b' ',
+            "ps {args:?}: last header is padded: {:?}",
+            lines[0]
+        );
+    }
+}

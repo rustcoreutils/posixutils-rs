@@ -622,6 +622,17 @@ fn mark_defunct(command: &str, state: char) -> String {
     }
 }
 
+/// Processor utilization for scheduling, the `C` field: the CPU time used
+/// as a percentage of the time since the process started, capped at 99, as
+/// procps computes it.
+fn cpu_utilization(cpu_ms: u64, start_epoch: u64, now_epoch: u64) -> u64 {
+    let elapsed = now_epoch.saturating_sub(start_epoch);
+    if elapsed == 0 {
+        return 0;
+    }
+    (cpu_ms / 10 / elapsed).min(99)
+}
+
 /// Get field value for a process, using `ctx` for time-dependent fields.
 fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> String {
     match field {
@@ -652,7 +663,7 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> 
         "sz" => (proc.vsz / 4).to_string(), // Convert KB to blocks (4KB pages)
         "state" => proc.state.to_string(),
         "f" => format!("{:x}", proc.flags & 0xf),
-        "c" => "-".to_string(),    // CPU utilization - difficult to calculate
+        "c" => cpu_utilization(proc.cpu_ms, proc.start_time, ctx.now).to_string(),
         "addr" => "-".to_string(), // Memory address - implementation specific
         "wchan" => "-".to_string(), // Wait channel - implementation specific
         "stime" => format_stime(proc.start_time, ctx.now, &chrono::Local),
@@ -863,6 +874,27 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether a field's values are numbers, right-aligned in their column.
+fn is_numeric_field(name: &str) -> bool {
+    matches!(
+        name,
+        "pid" | "ppid" | "pgid" | "sid" | "uid" | "gid" | "nice" | "pri" | "vsz" | "sz" | "c"
+    )
+}
+
+/// Append `text` to `line` in a column `width` wide, right-aligned or
+/// left-aligned.  The last column is not padded on the right: a line does not
+/// end in blanks.
+fn push_cell(line: &mut String, text: &str, width: usize, right: bool, last: bool) {
+    let _ = if right {
+        write!(line, "{text:>width$}")
+    } else if last {
+        write!(line, "{text}")
+    } else {
+        write!(line, "{text:<width$}")
+    };
+}
+
 /// Write the header (unless every field's header is empty) and one line per
 /// process in `filtered`, each clipped to `line_limit`.
 fn write_listing(
@@ -881,7 +913,10 @@ fn write_listing(
             if i > 0 {
                 line.push(' ');
             }
-            let _ = write!(line, "{:>width$}", field.header, width = field.width);
+            let last = i + 1 == output_fields.len();
+            // A left-aligned last column's header starts where its values do.
+            let right = !last || is_numeric_field(field.name);
+            push_cell(&mut line, &field.header, field.width, right, last);
         }
         writeln!(out, "{}", truncate_line(&line, line_limit))?;
     }
@@ -894,15 +929,14 @@ fn write_listing(
                 line.push(' ');
             }
             let value = get_field_value(proc, field.name, ctx);
-            // Right-align numeric fields, left-align text
-            if matches!(
-                field.name,
-                "pid" | "ppid" | "pgid" | "sid" | "uid" | "gid" | "nice" | "pri" | "vsz" | "sz"
-            ) {
-                let _ = write!(line, "{:>width$}", value, width = field.width);
-            } else {
-                let _ = write!(line, "{:<width$}", value, width = field.width);
-            }
+            let last = i + 1 == output_fields.len();
+            push_cell(
+                &mut line,
+                &value,
+                field.width,
+                is_numeric_field(field.name),
+                last,
+            );
         }
         writeln!(out, "{}", truncate_line(&line, line_limit))?;
     }
@@ -968,6 +1002,18 @@ mod tests {
         // A 2-byte 'é' at the boundary is dropped whole, never split.
         assert_eq!(truncate_line("aé", 2), "a");
         assert_eq!(truncate_line("aé", 3), "aé");
+    }
+
+    #[test]
+    fn cpu_utilization_percent() {
+        assert_eq!(cpu_utilization(0, 100, 200), 0);
+        // 5 s of CPU over 100 s elapsed.
+        assert_eq!(cpu_utilization(5_000, 100, 200), 5);
+        // Multithreaded CPU time beyond the elapsed time is capped.
+        assert_eq!(cpu_utilization(500_000, 100, 200), 99);
+        // Started this second, or a clock that went backwards.
+        assert_eq!(cpu_utilization(5_000, 200, 200), 0);
+        assert_eq!(cpu_utilization(5_000, 300, 200), 0);
     }
 
     // Zombies are tagged <defunct> in the command column (#P10).

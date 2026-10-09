@@ -1292,6 +1292,20 @@ fn test_rm_no_operand() {
     rm_test(&[], "", "rm: missing operand\n", 1);
 }
 
+/// A directory whose name only ends in dots (`foo.`, `x..`) is an ordinary operand, not `.` or
+/// `..`: rm -r removes it.
+#[test]
+fn test_rm_r_name_ending_in_dots() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    for name in ["foo.", "x.."] {
+        let dir = tmp.path().join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::File::create(dir.join("f")).unwrap();
+        rm_test(&["-r", dir.to_str().unwrap()], "", "", 0);
+        assert!(fs::symlink_metadata(&dir).is_err(), "{name}");
+    }
+}
+
 #[test]
 fn test_rm_f_no_operand() {
     rm_test(&["-f"], "", "", 0);

@@ -99,7 +99,8 @@ fn report_removed(cfg: &RmConfig, is_dir: bool, name: &str) {
 // rm shall refuse `.`/`..` (as the basename) and an operand resolving to the root directory
 // (POSIX rm DESCRIPTION 113360-113362, APPLICATION USAGE 113466-113468).
 fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
-    let dot_dotdot_pattern = regex::bytes::Regex::new(r"(?:\.\/*|\.\.\/*)$").unwrap();
+    // The last component, trailing slashes aside, is exactly `.` or `..`.
+    let dot_dotdot_pattern = regex::bytes::Regex::new(r"(?:^|/)\.{1,2}/*$").unwrap();
     if dot_dotdot_pattern.is_match(filepath.as_os_str().as_bytes()) {
         let err_str = gettext!(
             "refusing to remove '.' or '..' directory: skipping '{}'",
@@ -651,9 +652,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rm_directory, Args, RmConfig};
+    use super::{refuse_dot_dotdot_root, rm_directory, Args, RmConfig};
     use clap::Parser;
-    use std::{fs, os::unix::fs::MetadataExt};
+    use std::{fs, os::unix::fs::MetadataExt, path::Path};
+
+    /// Only a last component that is `.` or `..` is refused, with or without trailing slashes:
+    /// a name that merely ends in dots is an ordinary name.
+    #[test]
+    fn only_dot_and_dot_dot_are_refused() {
+        for refused in [
+            ".", "..", "./", "../", ".//", "a/.", "a/..", "a/./", "/x/../",
+        ] {
+            assert!(
+                refuse_dot_dotdot_root(Path::new(refused)).is_err(),
+                "{refused}"
+            );
+        }
+        // None of these exists, so the root-directory check after the name check passes too.
+        for allowed in [
+            "nonexistent-foo.",
+            "nonexistent-x..",
+            "a-nonexistent/foo.",
+            "nonexistent-x../",
+            ".nonexistent-hidden",
+            "..nonexistent-x",
+        ] {
+            assert!(
+                refuse_dot_dotdot_root(Path::new(allowed)).is_ok(),
+                "{allowed}"
+            );
+        }
+    }
 
     /// The refusal of the root directory binds to the directory the walk opens, not to the
     /// operand's pathname: with a stand-in directory as "root", `rm -r link/` (link -> it) is

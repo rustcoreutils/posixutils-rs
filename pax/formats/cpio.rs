@@ -1066,15 +1066,26 @@ struct Substituted {
     stored: u64,
 }
 
+/// The owner stored for a uid or gid too wide for its field: the Linux
+/// kernel's own substitute for an id that does not fit a narrow field (the
+/// default of `/proc/sys/fs/overflowuid` and `overflowgid`, which the 16-bit
+/// uid system calls, NFS and user namespaces report), "nobody" on most
+/// systems. It fits both odc and binary fields. A constant, not the host's
+/// setting, so that the archive does not depend on the host that wrote it.
+const OVERFLOW_ID: u64 = 65534;
+
 /// c_mode, c_uid, c_gid and c_nlink as a header whose fields hold at most
 /// `max` stores them.
 ///
-/// An owner or link count too wide for the field is stored as `max`, the
-/// largest value that fits, and the file is archived; masking it, as GNU cpio
-/// does, would keep only the low bits, and uid 65536 masked to 16 bits
-/// archives the file as root's. A substitute owner is not the file's owner,
-/// so the set-user-ID or set-group-ID bit that would hand its privilege to
-/// that owner is cleared.
+/// The file is archived even when an owner or link count is too wide for the
+/// field. Masking the value, as GNU cpio does, would keep only its low bits,
+/// and uid 65536 masked to 16 bits archives the file as root's. The largest
+/// value that fits is no better for an owner: it is an arbitrary real id on
+/// many systems, and root extracting with `-pe` would hand the file to
+/// whoever holds it. An owner is stored as `OVERFLOW_ID` instead; a link count
+/// as `max`, which only says the file has many names. A substitute owner is
+/// not the file's owner either, so the set-user-ID or set-group-ID bit that
+/// would hand its privilege to that owner is cleared.
 struct OwnerFields {
     mode: u32,
     uid: u64,
@@ -1090,7 +1101,7 @@ impl OwnerFields {
         format: &'static str,
         substitutes: &mut Vec<Substituted>,
     ) -> Self {
-        let mut fit = |value: u64, field: &'static str| {
+        let mut fit = |value: u64, field: &'static str, stored: u64| {
             if value <= max {
                 return (value, false);
             }
@@ -1098,13 +1109,13 @@ impl OwnerFields {
                 field,
                 format,
                 value,
-                stored: max,
+                stored,
             });
-            (max, true)
+            (stored, true)
         };
-        let (uid, uid_substituted) = fit(entry.uid as u64, "c_uid");
-        let (gid, gid_substituted) = fit(entry.gid as u64, "c_gid");
-        let (nlink, _) = fit(nlink, "c_nlink");
+        let (uid, uid_substituted) = fit(entry.uid as u64, "c_uid", OVERFLOW_ID);
+        let (gid, gid_substituted) = fit(entry.gid as u64, "c_gid", OVERFLOW_ID);
+        let (nlink, _) = fit(nlink, "c_nlink", max);
         let mut mode = build_mode(entry);
         if uid_substituted {
             mode &= !C_ISUID;
@@ -1498,11 +1509,12 @@ mod tests {
 
     /// An odc c_uid holds 18 bits and a binary one 16. A wider owner, or a
     /// link count the field cannot hold, used to drop the file; masking it
-    /// instead, as GNU cpio does, archived uid 65536 as root. It is stored as
-    /// the largest value that fits, the substitute is recorded for the writer
-    /// to report, and a set-ID bit for a substituted id is cleared.
+    /// instead, as GNU cpio does, archived uid 65536 as root. An owner is
+    /// stored as the kernel's overflow id, 65534, and a link count as the
+    /// largest value that fits; the substitute is recorded for the writer to
+    /// report, and a set-ID bit for a substituted id is cleared.
     #[test]
-    fn test_wide_owner_ids_are_stored_as_the_largest_that_fits() {
+    fn test_wide_owner_ids_are_stored_as_the_overflow_id() {
         let owned = |uid, gid| ArchiveEntry {
             path: PathBuf::from("f"),
             mode: 0o6755,
@@ -1517,14 +1529,14 @@ mod tests {
         // odc: c_mode at 18, c_uid at 24, c_gid at 30, c_nlink at 36.
         let mut subs = Vec::new();
         let h = build_odc_header(&owned(300_000, 7), (1, 1 << 18), 2, &mut subs).unwrap();
-        assert_eq!(odc_field(&h, 24), 0o777777);
+        assert_eq!(odc_field(&h, 24), 65534);
         assert_eq!(odc_field(&h, 30), 7);
         assert_eq!(odc_field(&h, 36), 0o777777);
         assert_eq!(odc_field(&h, 18) as u32, C_ISREG | 0o2755);
         let fields: Vec<_> = subs.iter().map(|s| (s.field, s.value, s.stored)).collect();
         assert_eq!(
             fields,
-            [("c_uid", 300_000, 0o777777), ("c_nlink", 1 << 18, 0o777777)]
+            [("c_uid", 300_000, 65534), ("c_nlink", 1 << 18, 0o777777)]
         );
 
         // An id that fits is stored as it is, with nothing recorded.
@@ -1542,7 +1554,7 @@ mod tests {
         let mut subs = Vec::new();
         let h = build_bin_header(&owned(5, 1 << 16), (1, 1 << 16), 2, &mut subs).unwrap();
         let word = |i: usize| u16::from_ne_bytes([h[i * 2], h[i * 2 + 1]]);
-        assert_eq!((word(4), word(5), word(6)), (5, u16::MAX, u16::MAX));
+        assert_eq!((word(4), word(5), word(6)), (5, 65534, u16::MAX));
         assert_eq!(u32::from(word(3)), C_ISREG | 0o4755);
         let fields: Vec<_> = subs.iter().map(|s| (s.field, s.format)).collect();
         assert_eq!(fields, [("c_gid", "binary"), ("c_nlink", "binary")]);

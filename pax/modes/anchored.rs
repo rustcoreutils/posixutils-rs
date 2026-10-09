@@ -1375,7 +1375,24 @@ enum LinkSource<'a> {
         from_name: &'a CStr,
         flags: libc::c_int,
         expected: Option<(u64, u64)>,
+        /// A pin of the source, checked to be the file meant, held while it
+        /// is linked by name -- a symbolic link, which cannot be linked
+        /// through its pin -- and checked against the link made.
+        #[cfg(target_os = "linux")]
+        held: Option<PinFd<'a>>,
     },
+}
+
+/// What `LinkSource::pin` found.
+#[cfg(target_os = "linux")]
+enum Pinning<'a> {
+    /// The source, linked through its pin.
+    Through(LinkSource<'a>),
+    /// The source's pin, checked; the source is a symbolic link, linked by
+    /// name while the pin is held.
+    ByName(PinFd<'a>),
+    /// No verified procfs: nothing can be linked through a descriptor.
+    Unavailable,
 }
 
 impl<'a> LinkSource<'a> {
@@ -1390,9 +1407,13 @@ impl<'a> LinkSource<'a> {
         expected: Option<Expected<'a>>,
     ) -> PaxResult<Self> {
         #[cfg(target_os = "linux")]
+        let mut held = None;
+        #[cfg(target_os = "linux")]
         if let Some(expected) = expected {
-            if let Some(pinned) = Self::pin(from_dir, from_name, follow, expected)? {
-                return Ok(pinned);
+            match Self::pin(from_dir, from_name, follow, expected)? {
+                Pinning::Through(pinned) => return Ok(pinned),
+                Pinning::ByName(pin) => held = Some(pin),
+                Pinning::Unavailable => {}
             }
         }
         let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
@@ -1417,22 +1438,25 @@ impl<'a> LinkSource<'a> {
             from_name,
             flags,
             expected: expected.map(|e| e.id),
+            #[cfg(target_os = "linux")]
+            held,
         })
     }
 
-    /// The source as a descriptor to link through: the caller's pin, or one
-    /// opened here with `O_PATH` -- following a symbolic link exactly when
-    /// `linkat` would -- and required to be the file `expected`. `None`
-    /// without a verified procfs, where no descriptor can be linked.
+    /// The source as a descriptor: the caller's pin, or one opened here with
+    /// `O_PATH` -- following a symbolic link exactly when `linkat` would --
+    /// and required to be the file `expected` before anything else. Linked
+    /// through, unless it is a symbolic link; `Unavailable` without a
+    /// verified procfs.
     #[cfg(target_os = "linux")]
     fn pin(
         from_dir: libc::c_int,
         from_name: &CStr,
         follow: bool,
         expected: Expected<'a>,
-    ) -> PaxResult<Option<Self>> {
+    ) -> PaxResult<Pinning<'a>> {
         let Ok(proc_dir) = made::procfs_dir() else {
-            return Ok(None);
+            return Ok(Pinning::Unavailable);
         };
         let pin = match expected.pin {
             Some(pin) => PinFd::Borrowed(pin),
@@ -1449,14 +1473,6 @@ impl<'a> LinkSource<'a> {
         // A pin the caller holds is the file itself; one opened by name must
         // show the identity, and the ctime where known, of the file meant.
         let st = fstat(pin.as_raw_fd()).map_err(|_| source_changed())?;
-        // A symbolic link cannot be linked through its `self/fd/N` entry:
-        // `AT_SYMLINK_FOLLOW` goes on through the link to what it names. It
-        // is linked by name, checked by identity and ctime before and after;
-        // a pin the caller holds keeps its number from being reused
-        // meanwhile.
-        if st.st_mode & libc::S_IFMT == libc::S_IFLNK && !follow {
-            return Ok(None);
-        }
         let is_expected = match pin {
             PinFd::Borrowed(_) => file_id(&st) == expected.id,
             PinFd::Owned(_) => expected.matches(&st),
@@ -1464,7 +1480,18 @@ impl<'a> LinkSource<'a> {
         if !is_expected {
             return Err(source_changed());
         }
-        Ok(Some(LinkSource::Pinned { proc_dir, pin }))
+        // A symbolic link cannot be linked through its `self/fd/N` entry:
+        // `AT_SYMLINK_FOLLOW` goes on through the link to what it names. It
+        // is linked by name, checked before and after, while the pin is
+        // held: on a local filesystem that keeps its number from being
+        // reused meanwhile. Not on NFS, where another client can remove the
+        // file and the server give its number to another whatever this
+        // client holds, nor on a FUSE filesystem without stable inode
+        // numbers: there the checks are all there is.
+        if st.st_mode & libc::S_IFMT == libc::S_IFLNK && !follow {
+            return Ok(Pinning::ByName(pin));
+        }
+        Ok(Pinning::Through(LinkSource::Pinned { proc_dir, pin }))
     }
 
     /// The source's `(st_dev, st_ino)`: the pinned inode's, or the one the
@@ -1500,14 +1527,34 @@ impl<'a> LinkSource<'a> {
 
     /// After `link_to` made `name`: a pinned source can only have linked the
     /// file it pins. A name, resolved again, may have linked another file:
-    /// unless the link is the file expected (when given), remove it again
-    /// and fail. The residual: a writer of the destination who renames the
-    /// link away before this check keeps it.
+    /// unless the link is the file expected (when given) -- and, where a pin
+    /// of it is held, shows the identity and ctime the pin shows -- remove it
+    /// again and fail. The residual: a writer of the destination who renames
+    /// the link away before this check keeps it.
     fn check_linked(&self, dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<()> {
         match self {
             #[cfg(target_os = "linux")]
             LinkSource::Pinned { .. } => Ok(()),
-            LinkSource::Name { expected, .. } => linked_expected(dirfd, name, *expected),
+            LinkSource::Name { expected, .. } => {
+                linked_expected(dirfd, name, *expected)?;
+                #[cfg(target_os = "linux")]
+                if let LinkSource::Name {
+                    held: Some(pin), ..
+                } = self
+                {
+                    let as_pinned = fstat(pin.as_raw_fd())
+                        .ok()
+                        .map(|st| (file_id(&st), crate::modes::pins::ctime_of(&st)));
+                    let as_linked = lstat_at(dirfd.as_raw_fd(), name)
+                        .ok()
+                        .map(|st| (file_id(&st), crate::modes::pins::ctime_of(&st)));
+                    if as_pinned.is_none() || as_pinned != as_linked {
+                        unlink_at(dirfd, name)?;
+                        return Err(source_changed());
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -2486,6 +2533,41 @@ mod tests {
         });
         assert!(!linked.unwrap(), "skipped as already the link itself");
         assert_eq!(id(c"d"), target, "d does not hold the link's target");
+    }
+
+    /// A symbolic link to be linked by name is checked to be the one meant
+    /// before any link is made. It was let through to the by-name link
+    /// before its identity was checked, and only the check after the link
+    /// removed a link to the wrong one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_a_symlink_source_is_checked_before_it_is_linked() {
+        use crate::modes::race_hook::{with_hook, Point};
+        let dir = plib::tmp::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("t", dir.path().join("l")).unwrap();
+        std::fs::write(dir.path().join("other"), "x").unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let root = tree.root();
+        let other = file_id(&lstat_at(root.as_raw_fd(), c"other").unwrap());
+
+        let linked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = std::rc::Rc::clone(&linked);
+        let hook = move |point, _: libc::c_int, _: &CStr| {
+            if point == Point::Linked {
+                count.set(count.get() + 1);
+            }
+        };
+        let expected = Some(Expected::id(other));
+        let r = with_hook(hook, || {
+            link_replacing_with(root.as_raw_fd(), c"l", None, expected, root, c"g", false)
+        });
+        assert!(r.is_err());
+        assert_eq!(
+            linked.get(),
+            0,
+            "a link was made before the source was checked"
+        );
+        assert!(lstat_at(root.as_raw_fd(), c"g").is_err());
     }
 
     /// -k leaves an existing directory entirely alone, and says nothing: one

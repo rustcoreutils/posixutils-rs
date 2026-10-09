@@ -764,8 +764,9 @@ struct CreatedSet {
     /// later name (`LinkSets::settled_mut`), within the budget
     /// (`Links::pins`). Its names can be replaced by other members meanwhile,
     /// and a filesystem that reuses inode numbers (ext4) then hands this
-    /// file's number to the next file created. Pinned, it keeps its number;
-    /// unpinned, its ctime tells it from that file.
+    /// file's number to the next file created. Pinned, it keeps its number
+    /// (on a local filesystem: `pins`); unpinned, its ctime tells it from
+    /// that file.
     file: MadeFile,
     /// Whether that file has its contents yet. newc stores them with the last
     /// name of a set only, so the earlier names are created empty.

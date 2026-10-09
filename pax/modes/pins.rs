@@ -22,6 +22,14 @@
 //! later does not share -- unless it is made within the same tick of the
 //! coarse clock the kernel stamps `ctime` from (a few milliseconds): the
 //! residual of that fallback.
+//!
+//! A pin keeps a number in use on a local filesystem. Not on NFS, where
+//! another client can remove the file and the server hand its number to
+//! another whatever this client holds, nor on a FUSE filesystem without
+//! stable inode numbers: there a pin linked through is still the file
+//! itself, but a pin that only holds a number while a name is linked (a
+//! symbolic link, `LinkSource`) leaves the identity and ctime checks as all
+//! there is.
 
 use crate::modes::anchored::{file_id, Expected};
 use plib::madefs::{fstat, lstat_at};

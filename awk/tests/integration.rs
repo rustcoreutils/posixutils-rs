@@ -2007,3 +2007,43 @@ fn awk_printf_string_width_counts_characters() {
     );
     assert_eq!(out, "éa   |é|  é|\n".as_bytes());
 }
+
+// The escape sequences of awk EREs, which regcomp does not know, are
+// translated: `/\t/` never matched a tab, nor `/\141/` an "a", in an ERE
+// token or a string used as one.  Inside a bracket expression a backslash
+// escapes too, as in gawk and mawk (gawk's test regrange), and `\8` is a
+// plain 8, not a back-reference (gawk's test back89).
+#[test]
+fn awk_ere_escape_sequences() {
+    let cases = [
+        (
+            "/a\\tb/ { print \"tab\" } $0 ~ \"a\\\\tb\" { print \"dyntab\" } /[\\t]/ { print \"brtab\" } /\\141/ { print \"oct\" }",
+            "a\tb\n",
+            "tab\ndyntab\nbrtab\noct\n",
+        ),
+        ("/a\\8b/ { print \"a8b\" }", "a8b\n", "a8b\n"),
+        ("{ gsub(/\\//, \"|\"); print }", "a/b\n", "a|b\n"),
+        ("/a\\.b/ { print \"wrong\" } { print \"ok\" }", "axb\n", "ok\n"),
+        (
+            "{ print (\"\\\\\" ~ /[\\\\]/), (\"]\" ~ /[\\]]/), (\"a\" ~ /[\\]a]/), (\"-\" ~ /[a\\-z]/), (\"b\" ~ /[a\\-z]/), (\"^\" ~ /[\\^x]/) }",
+            "x\n",
+            "1 1 1 1 0 1\n",
+        ),
+    ];
+    for (program, input, output) in cases {
+        let (stdout, stderr, status) = awk_with_deadline_input(program, input);
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str()),
+            (output, ""),
+            "{program}"
+        );
+        assert_eq!(status, Some(0), "{program}");
+    }
+    // a range is the C locale's byte order only there
+    let out = awk_bytes_with_env(
+        &["{ print ($0 ~ /[\\[-\\]]/) }"],
+        b"\\\n",
+        &[("LC_ALL", "C")],
+    );
+    assert_eq!(out, b"1\n");
+}

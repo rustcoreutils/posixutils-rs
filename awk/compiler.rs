@@ -687,7 +687,9 @@ impl Compiler {
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::ere => {
-                let ere_c_str = crate::charset::to_cstring(primary.as_str().trim_matches('/'))
+                // only the delimiters: `/\//` ends in an escaped slash
+                let text = primary.as_str();
+                let ere_c_str = crate::charset::to_cstring(&text[1..text.len() - 1])
                     .map_err(|e| pest_error_from_span(primary.as_span(), e))?;
                 let regex = Regex::new(ere_c_str)
                     .map_err(|e| pest_error_from_span(primary.as_span(), e))?;

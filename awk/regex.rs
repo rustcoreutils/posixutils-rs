@@ -111,11 +111,147 @@ impl Iterator for MatchIter<'_> {
     }
 }
 
+/// The bytes of the character an escape sequence of an awk ERE stands for,
+/// and the length of the sequence, for the escapes regcomp does not know:
+/// `\a`, `\b`, `\f`, `\n`, `\r`, `\t`, `\v` and `\ddd` (POSIX awk,
+/// "Regular Expressions").  `escape` is the text after the backslash.
+fn awk_escape(escape: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let control = match escape.first()? {
+        b'a' => 0x07,
+        b'b' => 0x08,
+        b'f' => 0x0c,
+        b'n' => b'\n',
+        b'r' => b'\r',
+        b't' => b'\t',
+        b'v' => 0x0b,
+        b'0'..=b'7' => {
+            let digits = escape
+                .iter()
+                .take(3)
+                .take_while(|c| (b'0'..=b'7').contains(c))
+                .count();
+            let code = escape[..digits]
+                .iter()
+                .fold(0u32, |code, digit| code * 8 + u32::from(digit - b'0'));
+            // as in a string, the character with that code point, which is the
+            // byte itself in a single-byte locale
+            let c = char::from_u32(code)?;
+            return Some((charset::encode(&c.to_string()).into_owned(), digits));
+        }
+        _ => return None,
+    };
+    Some((vec![control], 1))
+}
+
+/// The characters with a meaning in an ERE outside a bracket expression.
+const ERE_SPECIAL: &[u8] = b".[]()*+?{}|^$\\";
+
+/// Translates the escape sequences of an awk ERE, which may also appear in
+/// bracket expressions, to what regcomp understands, where a backslash in a
+/// bracket expression is an ordinary character.
+///
+/// Outside a bracket expression `\t`, `\ddd` and the other escapes of
+/// [`awk_escape`] become their character, `\/` and `\"` a slash and a
+/// quote, and `\8` and `\9` the digit (there are no back-references in an
+/// ERE); any other escape is left to regcomp.  Inside one, every escaped
+/// character stands for itself, as in gawk and mawk: `[\]a]` holds `]` and
+/// `a`.  The characters a bracket expression would take as syntax are
+/// written as collating symbols, so that `[\[-\]]` is the range from `[` to
+/// `]`.
+fn translate_awk_escapes(pattern: &[u8]) -> Cow<'_, [u8]> {
+    // most patterns, `\.` and the like included, need no change
+    let changes = |w: &[u8]| {
+        w[0] == b'\\'
+            && matches!(
+                w[1],
+                b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v' | b'0'..=b'9' | b'/' | b'"'
+            )
+    };
+    if !pattern.contains(&b'\\') || !(pattern.contains(&b'[') || pattern.windows(2).any(changes)) {
+        return Cow::Borrowed(pattern);
+    }
+    let mut out = Vec::with_capacity(pattern.len() + 8);
+    let mut i = 0;
+    let mut in_bracket = false;
+    while i < pattern.len() {
+        let c = pattern[i];
+        if in_bracket {
+            match c {
+                b'[' if matches!(pattern.get(i + 1), Some(b':' | b'.' | b'=')) => {
+                    // a character class, collating symbol or equivalence
+                    // class: copy it up to its closing `:]`, `.]` or `=]`
+                    let delimiter = pattern[i + 1];
+                    let close = pattern[i + 2..]
+                        .windows(2)
+                        .position(|w| w == [delimiter, b']'])
+                        .map_or(pattern.len(), |p| i + 2 + p + 2);
+                    out.extend_from_slice(&pattern[i..close]);
+                    i = close;
+                }
+                b']' => {
+                    in_bracket = false;
+                    out.push(c);
+                    i += 1;
+                }
+                b'\\' if i + 1 < pattern.len() => {
+                    let (bytes, length) =
+                        awk_escape(&pattern[i + 1..]).unwrap_or((vec![pattern[i + 1]], 1));
+                    if let [b @ (b']' | b'[' | b'-' | b'^')] = bytes[..] {
+                        out.extend_from_slice(&[b'[', b'.', b, b'.', b']']);
+                    } else {
+                        out.extend_from_slice(&bytes);
+                    }
+                    i += 1 + length;
+                }
+                _ => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        } else if c == b'[' {
+            // a `]` or `^]` right after the `[` belongs to the expression
+            in_bracket = true;
+            out.push(c);
+            i += 1;
+            if pattern.get(i) == Some(&b'^') {
+                out.push(b'^');
+                i += 1;
+            }
+            if pattern.get(i) == Some(&b']') {
+                out.push(b']');
+                i += 1;
+            }
+        } else if c == b'\\' && i + 1 < pattern.len() {
+            let next = pattern[i + 1];
+            if let Some((bytes, length)) = awk_escape(&pattern[i + 1..]) {
+                if let [b] = bytes[..] {
+                    if ERE_SPECIAL.contains(&b) {
+                        out.push(b'\\');
+                    }
+                }
+                out.extend_from_slice(&bytes);
+                i += 1 + length;
+            } else {
+                if !matches!(next, b'/' | b'"' | b'8' | b'9') {
+                    out.push(b'\\');
+                }
+                out.push(next);
+                i += 2;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    Cow::Owned(out)
+}
+
 impl Regex {
-    /// Compile the pattern whose bytes are `regex`.
+    /// Compile the awk ERE whose bytes are `regex`.
     pub fn new(regex: CString) -> Result<Self, String> {
         let bytes = regex.into_bytes();
-        let inner = PlibRegex::new_bytes(&bytes, RegexFlags::ere()).map_err(|e| e.to_string())?;
+        let inner = PlibRegex::new_bytes(&translate_awk_escapes(&bytes), RegexFlags::ere())
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             inner,
             pattern_string: charset::decode(bytes),

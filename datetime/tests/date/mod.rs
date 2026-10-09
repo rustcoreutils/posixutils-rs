@@ -319,6 +319,23 @@ fn test_date_d_local_time() {
     );
 }
 
+/// -u is TZ=UTC0 for every conversion, %s and %Z included: %s used to be
+/// computed in the TZ zone from a UTC broken-down time, off by the offset.
+#[cfg(unix)]
+#[test]
+fn test_utc_flag_is_tz_utc0() {
+    date_d(&["-u", "-d", "@0", "+%s %Z"], "EST5", "0 UTC");
+    date_d(&["-u", "-d", "@1700000000", "+%s"], "EST5", "1700000000");
+    run_test_with_checker_and_env(date_plan(&["-u", "+%s"]), &[("TZ", "EST5")], |_, out| {
+        let shown: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!((now - shown).abs() < 60, "{shown} vs {now}");
+    });
+}
+
 /// No free-form dates, and with -d an operand must be a format.
 #[test]
 fn test_date_d_rejections() {

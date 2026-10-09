@@ -100,19 +100,28 @@ fn show_time(when: libc::time_t, utc: bool, formatstr: &str) {
 
 /// `now` formatted by `formatstr` with the C library's `strftime`, in UTC or
 /// local time.
+///
+/// POSIX has `-u` act as if `TZ` were `UTC0`, and that is what it does: a
+/// broken-down time from `gmtime_r` under another `TZ` gives `%s` (which
+/// `strftime` computes with `mktime`) off by the zone's offset, and `%Z`
+/// as `GMT`.
 #[cfg(unix)]
 fn format_time(now: libc::time_t, utc: bool, formatstr: &str) -> Result<Vec<u8>, &'static str> {
+    extern "C" {
+        fn tzset();
+    }
+
     let c_format = CString::new(formatstr).map_err(|_| "format string contains NUL byte")?;
+
+    if utc {
+        // date is single-threaded, so nothing reads the environment meanwhile.
+        std::env::set_var("TZ", "UTC0");
+        unsafe { tzset() };
+    }
 
     let mut tm = MaybeUninit::<libc::tm>::uninit();
 
-    let tm_ptr = unsafe {
-        if utc {
-            libc::gmtime_r(&now, tm.as_mut_ptr())
-        } else {
-            libc::localtime_r(&now, tm.as_mut_ptr())
-        }
-    };
+    let tm_ptr = unsafe { libc::localtime_r(&now, tm.as_mut_ptr()) };
 
     if tm_ptr.is_null() {
         return Err("failed to get current time");

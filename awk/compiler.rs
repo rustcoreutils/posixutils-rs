@@ -1440,9 +1440,11 @@ impl Compiler {
         let mut inner = do_while.into_inner();
         let start_index = instructions.len();
 
+        self.loop_stack.push(LoopStubs::default());
         let body = inner.next().unwrap();
         self.compile_stmt(body, instructions, locals)?;
 
+        let condition_start = instructions.len();
         let condition = inner.next().unwrap();
         let condition_line_col = condition.line_col();
         self.compile_expr(condition, instructions, locals)?;
@@ -1451,6 +1453,13 @@ impl Compiler {
             condition_line_col,
         );
 
+        let loop_stubs = self.loop_stack.pop().unwrap();
+        for stub in loop_stubs.break_stubs {
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, instructions.len()));
+        }
+        for stub in loop_stubs.continue_stubs {
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, condition_start));
+        }
         Ok(())
     }
 

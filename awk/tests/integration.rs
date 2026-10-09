@@ -1947,3 +1947,13 @@ fn awk_for_in_loop_can_be_left_and_its_array_added_to() {
         assert_eq!(status, Some(0), "{program}");
     }
 }
+
+// `break` and `continue` work in a do-while loop, where they were
+// rejected as being outside a loop.
+#[test]
+fn awk_do_while_takes_break_and_continue() {
+    let program = "BEGIN { do { n++; break } while (1); do { m++; if (m < 3) continue; break } while (1); i = 0; while (i < 2) { i++; do { break } while (1); k++ }; print n, m, k }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("1 3 2\n", ""));
+    assert_eq!(status, Some(0));
+}

@@ -33,10 +33,12 @@
 
 use crate::modes::anchored::{file_id, Expected};
 use plib::madefs::{fstat, lstat_at};
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::rc::Rc;
 
 /// A file this run made, as a later name of it is to be linked to it.
 #[derive(Debug)]
@@ -45,8 +47,10 @@ pub(crate) struct MadeFile {
     id: (u64, u64),
     /// Its `ctime` as this run last left it: changed by everything this run
     /// does to it, a link included, and by nothing anyone else can make it
-    /// equal to on a file of their own.
-    ctime: (i64, i64),
+    /// equal to on a file of their own. Shared by every record of the file
+    /// (`share`, `known`): a link made through one changes the file's ctime
+    /// for all of them.
+    ctime: Rc<Cell<(i64, i64)>>,
     /// The file itself, held open with `O_PATH`, while the budget allows.
     pin: Option<OwnedFd>,
 }
@@ -60,7 +64,7 @@ impl MadeFile {
         let st = fstat(fd.as_raw_fd())?;
         Ok(MadeFile {
             id: file_id(&st),
-            ctime: ctime_of(&st),
+            ctime: Rc::new(Cell::new(ctime_of(&st))),
             pin: if pin { reopen_path(fd) } else { None },
         })
     }
@@ -79,7 +83,7 @@ impl MadeFile {
         };
         Ok(MadeFile {
             id: file_id(&st),
-            ctime: ctime_of(&st),
+            ctime: Rc::new(Cell::new(ctime_of(&st))),
             pin: (dup >= 0).then(|| unsafe { OwnedFd::from_raw_fd(dup) }),
         })
     }
@@ -90,7 +94,7 @@ impl MadeFile {
     pub(crate) fn unpinned(st: &libc::stat) -> Self {
         MadeFile {
             id: file_id(st),
-            ctime: ctime_of(st),
+            ctime: Rc::new(Cell::new(ctime_of(st))),
             pin: None,
         }
     }
@@ -100,7 +104,7 @@ impl MadeFile {
     pub(crate) fn refresh(&mut self, fd: BorrowedFd<'_>) {
         if let Ok(st) = fstat(fd.as_raw_fd()) {
             if file_id(&st) == self.id {
-                self.ctime = ctime_of(&st);
+                self.ctime.set(ctime_of(&st));
             }
         }
     }
@@ -120,7 +124,7 @@ impl MadeFile {
             .map(|st| ctime_of(&st));
         Expected {
             id: self.id,
-            ctime: Some(pinned_ctime.unwrap_or(self.ctime)),
+            ctime: Some(pinned_ctime.unwrap_or(self.ctime.get())),
             pin: self.pin.as_ref().map(|pin| pin.as_fd()),
         }
     }
@@ -134,7 +138,7 @@ impl MadeFile {
     pub(crate) fn unpin(&mut self) {
         if let Some(pin) = self.pin.take() {
             if let Ok(st) = fstat(pin.as_raw_fd()) {
-                self.ctime = ctime_of(&st);
+                self.ctime.set(ctime_of(&st));
             }
         }
     }
@@ -144,7 +148,7 @@ impl MadeFile {
     pub(crate) fn known(&self) -> Self {
         MadeFile {
             id: self.id,
-            ctime: self.ctime,
+            ctime: Rc::clone(&self.ctime),
             pin: None,
         }
     }
@@ -158,7 +162,7 @@ impl MadeFile {
         });
         MadeFile {
             id: self.id,
-            ctime: self.ctime,
+            ctime: Rc::clone(&self.ctime),
             pin,
         }
     }
@@ -172,7 +176,7 @@ impl MadeFile {
         }
         if let Ok(st) = lstat_at(dirfd.as_raw_fd(), name) {
             if file_id(&st) == self.id {
-                self.ctime = ctime_of(&st);
+                self.ctime.set(ctime_of(&st));
             }
         }
     }
@@ -349,7 +353,7 @@ mod tests {
         assert_ne!(ctime_of(&planted_st), ctime_of(&made_st));
         let made = MadeFile {
             id: file_id(&planted_st),
-            ctime: ctime_of(&made_st),
+            ctime: Rc::new(Cell::new(ctime_of(&made_st))),
             pin: None,
         };
 

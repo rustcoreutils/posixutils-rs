@@ -800,3 +800,57 @@ fn a_later_member_of_a_renamed_name_ends_the_rename() {
         PathBuf::from("again")
     );
 }
+
+/// Every link to a file changes its ctime, so every record of that file must
+/// see the change: a chain of link members -- f, a -> f, b -> f, c -> a --
+/// each made in a later clock tick, links them all. Each record held its own
+/// copy of the ctime, and the link for c, made through a's record, found it
+/// stale and failed: "source file changed before it could be linked".
+#[test]
+fn a_chain_of_link_members_is_linked() {
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let named = |name: &str, target: &str| {
+        let mut entry = link_member(target);
+        entry.path = PathBuf::from(name);
+        entry
+    };
+    let members = vec![
+        own_member("f", EntryType::Regular, 0o644),
+        named("a", "f"),
+        named("b", "f"),
+        named("c", "a"),
+    ];
+    let mut archive = Members(members.into_iter());
+    // Each link in a later tick of the clock ctime is stamped from.
+    let hook = |point, _: libc::c_int, _: &CStr| {
+        if point == Point::Linking {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let results: Vec<_> = race_hook::with_hook(hook, || {
+        let mut results = Vec::new();
+        while let Some(entry) = archive.read_entry().unwrap() {
+            let r = extract_entry(
+                &mut archive,
+                &entry,
+                &ReadOptions::default(),
+                &mut links,
+                &tree,
+                &mut pending,
+            );
+            results.push(r.map_err(|e| e.to_string()));
+        }
+        results
+    });
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    let id = |name: &str| {
+        let md = std::fs::metadata(tmp.path().join(name)).unwrap();
+        (md.dev(), md.ino())
+    };
+    for name in ["a", "b", "c"] {
+        assert_eq!(id(name), id("f"), "{name}");
+    }
+}

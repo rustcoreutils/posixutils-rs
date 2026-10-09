@@ -303,6 +303,10 @@ but no daemon to run them.  Behavior follows Vixie cron:
 
 ### ed
 
+ * `-` — the historic spelling of `-s`, withdrawn from POSIX, as in
+   `ed - file`, which GNU patch runs to apply an ed-style diff.  It is the
+   option only before the file operand and `--`, and never as the
+   option-argument of `-p`.
  * `x` — synonym for `wq`.
  * `z` — scroll.
  * `#` — null command / comment.

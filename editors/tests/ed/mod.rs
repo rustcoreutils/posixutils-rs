@@ -2283,3 +2283,83 @@ fn test_ed_shell_write_to_a_command_that_stops_reading() {
 fn option_argument_may_begin_with_hyphen() {
     plib::testing::assert_hyphen_option_argument("ed", &["-p", "-zq", "--help"]);
 }
+
+/// Run ed in `dir` with `args` on `stdin`.
+fn ed_in(dir: &std::path::Path, args: &[&str], stdin: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("ed"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run ed");
+    // ed may exit, on a usage error, before it reads its input.
+    let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+// A lone `-` before the file operand is the historic spelling of -s; GNU
+// patch runs `ed - FILE` to apply an ed-style diff.
+#[test]
+fn lone_dash_option_means_s() {
+    let dir = plib::tmp::tempdir().unwrap();
+    fs::write(dir.path().join("f"), "hello\nworld\n").unwrap();
+
+    for args in [
+        &["-", "f"][..],
+        &["-s", "-", "f"],
+        &["-", "-s", "f"],
+        &["-", "-", "f"],
+    ] {
+        let out = ed_in(dir.path(), args, ",p\nq\n");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "hello\nworld\n",
+            "{args:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{args:?}");
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+    }
+
+    // With no file operand at all.
+    let out = ed_in(dir.path(), &["-"], "a\nx\n.\n,p\nQ\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x\n");
+    assert_eq!(out.status.code(), Some(0));
+
+    // An edit written back, as patch does it.
+    let out = ed_in(dir.path(), &["-", "f"], "1s/hello/HELLO/\nw\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("f")).unwrap(),
+        "HELLO\nworld\n"
+    );
+}
+
+// `-` is the option only where an option may be: the option-argument of -p
+// is a prompt, and a `-` after `--` is a file operand.
+#[test]
+fn lone_dash_elsewhere_is_not_s() {
+    let dir = plib::tmp::tempdir().unwrap();
+    fs::write(dir.path().join("f"), "hello\nworld\n").unwrap();
+    fs::write(dir.path().join("-"), "dash\n").unwrap();
+
+    let out = ed_in(dir.path(), &["-p", "-", "f"], ",p\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n-hello\nworld\n-");
+    assert_eq!(out.status.code(), Some(0));
+
+    let out = ed_in(dir.path(), &["-p-", "f"], ",p\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "12\n-hello\nworld\n-");
+
+    let out = ed_in(dir.path(), &["--", "-"], ",p\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "5\ndash\n");
+    assert_eq!(out.status.code(), Some(0));
+
+    // After the file operand it is not an option, and ed takes one operand.
+    let out = ed_in(dir.path(), &["f", "-"], ",p\nq\n");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert!(!out.stderr.is_empty());
+    assert_ne!(out.status.code(), Some(0));
+}

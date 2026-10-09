@@ -14,13 +14,11 @@
 
 use chrono::{DateTime, Utc};
 use gettextrs::gettext;
-use libc::{getpwuid, getuid, passwd};
+use libc::getuid;
 
 use std::{
     collections::HashSet,
-    env,
-    ffi::CStr,
-    fs,
+    env, fs,
     io::{self, ErrorKind, Read, Seek, Write},
     os::unix::fs::OpenOptionsExt,
     os::unix::io::AsRawFd,
@@ -465,53 +463,28 @@ impl User {
     pub fn current() -> Option<Self> {
         const DEFAULT_SHELL: &str = "/bin/sh";
 
-        // SAFETY: getpwuid() is read-only; we copy every field we keep out of
-        // the returned struct before it can be invalidated by another call.
-        unsafe {
-            let passwd {
-                pw_uid,
-                pw_gid,
-                pw_name,
-                pw_shell,
-                ..
-            } = *resolve_passwd()?;
+        // SAFETY: getuid never fails.
+        let pw = plib::user::get_by_uid(unsafe { getuid() })?;
+        let name = pw.name.into_string().ok()?;
 
-            let name = CStr::from_ptr(pw_name).to_str().ok()?.to_owned();
+        // #B6: POSIX (batch.md 86991-86994) makes `SHELL` authoritative for
+        // the command interpreter that runs an at-job, and mandates that
+        // when it is "unset or null, sh shall be used". Consulting the
+        // passwd shell first inverted that -- and left the unset case
+        // running the login shell rather than sh, which the spec does not
+        // permit. The passwd entry is no longer consulted for job
+        // execution; only `$SHELL`, then `sh`.
+        let shell = match std::env::var("SHELL") {
+            Ok(v) if !v.is_empty() => v,
+            _ => DEFAULT_SHELL.to_owned(),
+        };
 
-            // #B6: POSIX (batch.md 86991-86994) makes `SHELL` authoritative for
-            // the command interpreter that runs an at-job, and mandates that
-            // when it is "unset or null, sh shall be used". Consulting the
-            // passwd shell first inverted that -- and left the unset case
-            // running the login shell rather than sh, which the spec does not
-            // permit. The passwd entry is no longer consulted for job
-            // execution; only `$SHELL`, then `sh`.
-            let _ = pw_shell;
-            let shell = match std::env::var("SHELL") {
-                Ok(v) if !v.is_empty() => v,
-                _ => DEFAULT_SHELL.to_owned(),
-            };
-
-            Some(Self {
-                shell,
-                uid: pw_uid,
-                gid: pw_gid,
-                name,
-            })
-        }
-    }
-}
-
-/// `getpwuid(getuid())`, returning the raw passwd pointer or `None`.
-///
-/// # Safety
-/// The returned pointer aliases libc's static passwd buffer and must be copied
-/// from before the next passwd lookup.
-unsafe fn resolve_passwd() -> Option<*const passwd> {
-    let pw_ptr = getpwuid(getuid());
-    if pw_ptr.is_null() {
-        None
-    } else {
-        Some(pw_ptr)
+        Some(Self {
+            shell,
+            uid: pw.uid,
+            gid: pw.gid,
+            name,
+        })
     }
 }
 

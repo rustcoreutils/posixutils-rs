@@ -10,7 +10,6 @@
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
 use gettextrs::gettext;
 use std::collections::BTreeSet;
-use std::ffi::CStr;
 use std::iter::Peekable;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
@@ -172,52 +171,27 @@ pub struct UserInfo {
 }
 
 impl UserInfo {
-    /// Look up user info from username using getpwnam
+    /// Look up user info from a username.
     pub fn from_username(username: &str) -> Option<Self> {
-        use std::ffi::CString;
-
-        let c_username = CString::new(username).ok()?;
-
-        // SAFETY: getpwnam() is thread-safe for read-only access.
-        // We copy all needed data before returning.
-        unsafe {
-            let pwd = libc::getpwnam(c_username.as_ptr());
-            if pwd.is_null() {
-                return None;
-            }
-
-            let pw = &*pwd;
-            let name = CStr::from_ptr(pw.pw_name).to_string_lossy().into_owned();
-            let home = CStr::from_ptr(pw.pw_dir).to_string_lossy().into_owned();
-
-            Some(UserInfo {
-                uid: pw.pw_uid,
-                gid: pw.pw_gid,
-                name,
-                home,
-            })
-        }
+        Self::from_user(plib::user::get_by_name(username)?)
     }
 
-    /// Look up user info from a uid using getpwuid. Used to resolve the run-as
-    /// identity of an at-spool job from the file's owner (audit #X1).
+    /// Look up user info from a uid. Used to resolve the run-as identity of
+    /// an at-spool job from the file's owner (audit #X1).
     pub fn from_uid(uid: u32) -> Option<Self> {
-        // SAFETY: getpwuid() is read-only; all fields are copied before return.
-        unsafe {
-            let pwd = libc::getpwuid(uid);
-            if pwd.is_null() {
-                return None;
-            }
-            let pw = &*pwd;
-            let name = CStr::from_ptr(pw.pw_name).to_string_lossy().into_owned();
-            let home = CStr::from_ptr(pw.pw_dir).to_string_lossy().into_owned();
-            Some(UserInfo {
-                uid: pw.pw_uid,
-                gid: pw.pw_gid,
-                name,
-                home,
-            })
-        }
+        Self::from_user(plib::user::get_by_uid(uid)?)
+    }
+
+    /// `None` for a name or home directory that is not UTF-8: a lossy copy
+    /// would hand initgroups(3) and chdir(2) some other name than the user's,
+    /// so such an entry runs nothing rather than the wrong thing.
+    fn from_user(user: plib::user::User) -> Option<Self> {
+        Some(UserInfo {
+            uid: user.uid,
+            gid: user.gid,
+            name: user.name.into_string().ok()?,
+            home: user.dir.into_os_string().into_string().ok()?,
+        })
     }
 }
 

@@ -221,7 +221,8 @@ fn fmt_value(value: u64, radix: OutputType) -> String {
 
 /// Print the collected symbols. `prefix` is the per-line `-A` prefix
 /// (`"file: "` / `"file[member]: "`), or empty when `-A` is not set.
-fn print_symbols(symbols: &[SymInfo], args: &Args, radix: OutputType, prefix: &str) {
+/// `width` is the default format's value column width.
+fn print_symbols(symbols: &[SymInfo], args: &Args, radix: OutputType, prefix: &str, width: usize) {
     for s in symbols {
         if args.portable {
             // POSIX STDOUT 108784-108792: "<name> <type> <value> <size>" with
@@ -234,16 +235,18 @@ fn print_symbols(symbols: &[SymInfo], args: &Args, radix: OutputType, prefix: &s
             };
             println!("{}{} {} {} {}", prefix, s.name, s.type_char, value, size);
         } else {
-            // Default (POSIX-unspecified) format: value, type, name. Undefined
-            // symbols leave the value column blank.
+            // Default (POSIX-unspecified) format: value, type, name. As in GNU
+            // and BSD nm, the value is zero-padded to the address width, and
+            // an undefined symbol's is as many spaces, so the columns are
+            // single-space separated (db5.3 runs `nm | cut -d" " -f3`).
             print!("{}", prefix);
             if s.undefined {
-                print!("{:>16} ", "");
+                print!("{:width$} ", "");
             } else {
                 match radix {
-                    OutputType::X => print!("{:016x} ", s.value),
-                    OutputType::O => print!("{:016o} ", s.value),
-                    OutputType::D => print!("{:16} ", s.value),
+                    OutputType::X => print!("{:0width$x} ", s.value),
+                    OutputType::O => print!("{:0width$o} ", s.value),
+                    OutputType::D => print!("{:0width$} ", s.value),
                 }
             }
             println!("{} {}", s.type_char, s.name);
@@ -254,7 +257,9 @@ fn print_symbols(symbols: &[SymInfo], args: &Args, radix: OutputType, prefix: &s
 /// Process one parsed object (a standalone file or an archive member).
 fn show_object(file: &object::File<'_>, args: &Args, radix: OutputType, prefix: &str) {
     let symbols = collect_symbols(file, args);
-    print_symbols(&symbols, args, radix, prefix);
+    // As many digits as a hexadecimal address has, whatever the radix.
+    let width = if file.is_64() { 16 } else { 8 };
+    print_symbols(&symbols, args, radix, prefix, width);
 }
 
 fn process_input(args: &Args, path: &str, radix: OutputType, multiple: bool) -> Result<(), ()> {

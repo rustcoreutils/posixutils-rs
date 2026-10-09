@@ -134,7 +134,7 @@ pattern_and_action = {
 
 function_definition = { "function" ~ name ~ "(" ~ param_list? ~ ")" ~ opt_newline ~ action }
 
-param_list = { name ~ ("," ~ name)* }
+param_list = { name ~ ("," ~ opt_newline ~ name)* }
 
 normal_pattern = { range_pattern | expr }
 range_pattern  = { expr ~ "," ~ opt_newline ~ expr }
@@ -286,8 +286,8 @@ add        = { "+" }
 binary_sub = { "-" }
 match_op   = { "~" }
 not_match  = { "!~" }
-and        = { "&&" }
-or         = { "||" }
+and        = { "&&" ~ opt_newline }
+or         = { "||" ~ opt_newline }
 concat     = { "" }
 in_op      = @{ "in" ~ !(letter | "_" | digit) }
 

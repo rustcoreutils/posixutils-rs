@@ -1196,3 +1196,34 @@ fn awk_keywords_are_whole_words() {
         });
     }
 }
+
+// A newline may follow `&&`, `||` and the comma of a parameter list, with a
+// comment before it (POSIX awk, Lexical Conventions); texindex.awk relies on
+// all three.
+#[test]
+fn awk_newline_after_and_or_and_parameter_comma() {
+    let cases = [
+        ("BEGIN { if (1 &&\n 2) print \"and\" }", "and\n"),
+        ("BEGIN { if (0 ||  # why\n\n 2) print \"or\" }", "or\n"),
+        ("BEGIN { x = 1 &&\n 0; print x }", "0\n"),
+        (
+            "function q(a,\t# parameters\n\tb) { return a b }\nBEGIN { print q(1, 2) }",
+            "12\n",
+        ),
+        (
+            "function q(a,\n\n b,\n c) { return c }\nBEGIN { print q(1, 2, 3) }",
+            "3\n",
+        ),
+        ("/x/ &&\n/y/ { print }", "xy\n"),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::from("xy\nx\n"),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

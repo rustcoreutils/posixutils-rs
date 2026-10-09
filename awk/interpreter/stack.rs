@@ -224,6 +224,36 @@ impl<'i, 's> Stack<'i, 's> {
         }
     }
 
+    /// Returns a pointer to local `index` for assigning it as a scalar.  A
+    /// parameter that still aliases the caller's unset variable stops
+    /// aliasing it here: the caller's variable becomes a scalar, as in gawk,
+    /// but what is assigned to the parameter stays local.  If the caller's
+    /// variable has meanwhile become an array the alias is kept, and the
+    /// assignment reports an array used in scalar context.
+    pub(crate) fn local_scalar_ref_ptr(&mut self, index: usize) -> Option<*mut AwkValue> {
+        if unsafe { self.sp.offset_from(self.bp) } <= index as isize {
+            return None;
+        }
+        let slot = unsafe { &mut *self.bp.add(index) };
+        if let StackValue::UninitializedRef(caller_var) = slot {
+            // valid by stack invariance: the caller's variable outlives this frame
+            let caller_var = unsafe { &mut **caller_var };
+            match caller_var.value {
+                AwkValueVariant::Array(_) => return Some(caller_var),
+                AwkValueVariant::Uninitialized => {
+                    caller_var.value = AwkValueVariant::UninitializedScalar
+                }
+                _ => {}
+            }
+            let local = AwkValue {
+                value: caller_var.value.clone(),
+                ref_type: AwkRefType::None,
+            };
+            *slot = StackValue::Value(UnsafeCell::new(local));
+        }
+        self.get_mut_value_ptr(index)
+    }
+
     pub(crate) fn pop_value(&mut self) -> AwkValue {
         // safe by type invariance
         unsafe {
@@ -256,15 +286,11 @@ impl<'i, 's> Stack<'i, 's> {
 
     pub(crate) fn call_function(&mut self, function: &'i Function) {
         unsafe { assert!(self.sp.offset_from(self.bp) >= function.parameters_count as isize) };
+        // A parameter bound to the caller's unset variable stays an
+        // `UninitializedRef` to it, so that using the parameter as an array
+        // makes the caller's variable that array; `local_scalar_ref_ptr`
+        // ends the alias when the parameter is assigned as a scalar.
         let new_bp = unsafe { self.sp.sub(function.parameters_count) };
-        // Convert UninitializedRef parameters to owned values to break aliasing
-        // between function parameters and the caller's variables
-        for i in 0..function.parameters_count {
-            let param = unsafe { &mut *new_bp.add(i) };
-            if let StackValue::UninitializedRef(_) = param {
-                *param = StackValue::Value(UnsafeCell::new(AwkValue::uninitialized()));
-            }
-        }
         let caller_frame = CallFrame {
             bp: self.bp,
             sp: new_bp,

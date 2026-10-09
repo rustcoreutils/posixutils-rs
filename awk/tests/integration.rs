@@ -1270,3 +1270,61 @@ fn awk_for_clauses_may_be_empty() {
         });
     }
 }
+
+// An unset variable passed to a function becomes an array in the caller when
+// the function uses its parameter as one (filling it with split, assigning
+// an element, passing it on), as in gawk, mawk and the one true awk; a
+// scalar assigned to the parameter stays local.  texindex.awk's char_split
+// fills its caller's local with split(string, array, "").
+#[test]
+fn awk_unset_argument_becomes_the_callers_array() {
+    let cases = [
+        (
+            "function f(arr) { split(\"x y\", arr) } BEGIN { f(b); print length(b), b[2] }",
+            "2 y\n",
+        ),
+        (
+            "function f(arr) { arr[1] = \"set\" } BEGIN { f(b); print b[1] }",
+            "set\n",
+        ),
+        (
+            "function f(arr) { return split(\"p q\", arr) }
+             function g(  loc, n) { n = f(loc); return n \"-\" loc[2] }
+             BEGIN { print g() }",
+            "2-q\n",
+        ),
+        (
+            "function h(a) { split(\"m n\", a) } function f(arr) { h(arr) }
+             BEGIN { f(b); print b[2] }",
+            "n\n",
+        ),
+        (
+            "function g(b) { b[\"k\"] = \"v\" } function f(a) { g(a); return a[\"k\"] }
+             BEGIN { print f(x), x[\"k\"] }",
+            "v v\n",
+        ),
+        (
+            "function f(a) { a = 5; return a } BEGIN { print f(x); print \"[\" x \"]\" }",
+            "5\n[]\n",
+        ),
+        (
+            "function f(a) { a++; a++; return a } function g(  l) { f(l); return \"[\" l \"]\" }
+             BEGIN { print g() }",
+            "[]\n",
+        ),
+        (
+            "function f(a) { print \"r\" a } BEGIN { f(x); x = 3; print x }",
+            "r\n3\n",
+        ),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::new(),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

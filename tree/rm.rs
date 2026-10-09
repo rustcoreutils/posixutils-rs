@@ -56,6 +56,7 @@ struct RmConfig {
     args: Args,
     is_tty: bool,
     /// `(st_dev, st_ino)` of the root directory, which a recursive removal refuses to enter.
+    /// `None` when `/` could not be stat'ed: every recursive removal is then refused.
     root_identity: Option<(u64, u64)>,
 }
 
@@ -318,6 +319,16 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 
     // It's not allowed to `rm` . and .. or the root directory.
     refuse_dot_dotdot_root(filepath)?;
+
+    // The walk refuses the root directory by its identity; without that identity it cannot, so
+    // the removal is refused rather than walked unguarded.
+    if cfg.root_identity.is_none() {
+        let err_str = gettext!(
+            "cannot remove '{}': the root directory could not be identified",
+            display_cleaned(filepath)
+        );
+        return Err(io::Error::other(err_str));
+    }
 
     let success = traverse_directory(
         filepath,
@@ -669,5 +680,23 @@ mod tests {
         assert!(!walked_ok);
         assert!(fake_root.join("f").exists());
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    }
+
+    /// Without the root's identity there is nothing to refuse the root by, so a recursive
+    /// removal is refused outright, removing nothing, rather than walked unguarded.
+    #[test]
+    fn unknown_root_identity_refuses_recursive_removal() {
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("f"), b"x").unwrap();
+
+        let cfg = RmConfig {
+            args: Args::parse_from(["rm", "-rf", dir.to_str().unwrap()]),
+            is_tty: false,
+            root_identity: None,
+        };
+        assert!(rm_directory(&cfg, &dir).is_err());
+        assert!(dir.join("f").exists());
     }
 }

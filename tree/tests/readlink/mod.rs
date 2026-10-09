@@ -128,3 +128,24 @@ fn readlink_reports_write_error() {
     plib::testing::assert_write_error_on_full_device("readlink", &[link], b"", 1);
     plib::testing::assert_write_error_on_full_device("readlink", &["-n", link], b"", 1);
 }
+
+// Any error the system reports is the system's own message, as other utilities give it, not
+// "Unknown error: ... (os error N)": `link/` naming a link to a file is ENOTDIR.
+#[test]
+fn test_readlink_trailing_slash_on_link_to_file() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("file.txt");
+    let symlink_path = dir.path().join("symlink.txt");
+    File::create(&file_path).unwrap();
+    symlink(&file_path, &symlink_path).unwrap();
+    let operand = format!("{}/", symlink_path.to_str().unwrap());
+
+    run_test(TestPlan {
+        cmd: String::from("readlink"),
+        args: vec![operand.clone()],
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: format!("readlink: {operand}: Not a directory\n"),
+        expected_exit_code: 1,
+    });
+}

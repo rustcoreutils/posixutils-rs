@@ -35,18 +35,17 @@ struct Args {
     )]
     niceval: i32,
 
-    #[arg(help = gettext("Utility to invoke"))]
-    util: String,
-
-    // See the note in `timeout.rs`: `trailing_var_arg` + `allow_hyphen_values`
-    // are both needed, or the utility's own options are parsed as nice's and
-    // `nice ls -l` fails with "unexpected argument found".
+    // XBD 12.2 Guideline 9: nice's options all precede the utility, so the
+    // utility name and every word after it are one trailing operand list.
+    // With the utility as a positional of its own, clap went on parsing
+    // options after it: `nice echo -n 5 x` took `-n 5` as nice's increment.
     #[arg(
+        value_name = "UTILITY",
+        required = true,
         trailing_var_arg = true,
-        allow_hyphen_values = true,
-        help = gettext("Utility arguments")
+        help = gettext("Utility to invoke and its arguments")
     )]
-    util_args: Vec<String>,
+    command: Vec<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -98,5 +97,9 @@ fn main() {
 
     apply_increment(args.niceval);
 
-    exec_util(&args.util, &args.util_args);
+    let (util, util_args) = args
+        .command
+        .split_first()
+        .expect("clap requires the utility operand");
+    exec_util(util, util_args);
 }

@@ -356,6 +356,17 @@ table is present.
  * `<<EOF>>` rules (without start-condition prefixes).
  * A "Output written to <file>" notice on standard error.
 
+### ln
+
+ * `-r` / `--relative` (with `-s` only) — write each link's text as the
+   source's path relative to the link's directory.  The source is taken from
+   the current directory; both paths are resolved through any symbolic links
+   that exist, and need not exist themselves (`realpath -m`).  libselinux
+   runs `ln -sf --relative`.
+ * A single operand links into the current directory under the operand's last
+   component, as `ln SOURCE .` would.  POSIX requires two.  perl's build runs
+   `ln -s regen-configure/U`.
+
 ### localedef
 
  * `-v` — verbose.

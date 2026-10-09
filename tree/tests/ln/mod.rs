@@ -163,3 +163,120 @@ fn test_ln_logical_physical() {
 
     fs::remove_dir_all(&d).unwrap();
 }
+
+fn run_ln_in(cwd: &str, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ln"))
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+}
+
+fn link_text(p: &str) -> String {
+    fs::read_link(p).unwrap().to_str().unwrap().to_string()
+}
+
+// -s -r: the link text is the source's path relative to the link's directory.
+// libselinux runs `ln -sf --relative /abs/dir/lib.so.1 /abs/dir/lib.so`.
+#[test]
+fn test_ln_relative_symlink() {
+    let d = dir("test_ln_relative_symlink");
+    fs::create_dir_all(format!("{d}/sub/deeper")).unwrap();
+    fs::create_dir_all(format!("{d}/x/y")).unwrap();
+    fs::write(format!("{d}/lib.so.1"), b"l").unwrap();
+    fs::write(format!("{d}/lib.so"), b"old").unwrap();
+
+    let out = run_ln(&[
+        "-sf",
+        "--relative",
+        &format!("{d}/lib.so.1"),
+        &format!("{d}/lib.so"),
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_text(&format!("{d}/lib.so")), "lib.so.1");
+
+    // Down, up, and a source that does not exist (resolved lexically).
+    let link = format!("{d}/down");
+    assert!(run_ln(&["-sr", &format!("{d}/sub/deeper/t"), &link])
+        .status
+        .success());
+    assert_eq!(link_text(&link), "sub/deeper/t");
+
+    let link = format!("{d}/x/y/up");
+    assert!(run_ln(&["-s", "-r", &format!("{d}/lib.so.1"), &link])
+        .status
+        .success());
+    assert_eq!(link_text(&link), "../../lib.so.1");
+
+    // Target-directory form: the link lands in sub/ and points back up.
+    assert!(
+        run_ln(&["-sr", &format!("{d}/lib.so.1"), &format!("{d}/sub")])
+            .status
+            .success()
+    );
+    assert_eq!(link_text(&format!("{d}/sub/lib.so.1")), "../lib.so.1");
+
+    // A relative source names a path from the current directory, not from
+    // the link's directory.
+    let out = run_ln_in(&d, &["-sr", "lib.so.1", "x/y/rel"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_text(&format!("{d}/x/y/rel")), "../../lib.so.1");
+
+    fs::remove_dir_all(&d).unwrap();
+}
+
+// -r resolves symbolic links in the link's directory before computing the path.
+#[test]
+fn test_ln_relative_through_symlinked_dir() {
+    let d = dir("test_ln_relative_through_symlinked_dir");
+    fs::create_dir_all(format!("{d}/real/inner")).unwrap();
+    std::os::unix::fs::symlink("real/inner", format!("{d}/alias")).unwrap();
+    fs::write(format!("{d}/t"), b"t").unwrap();
+
+    assert!(run_ln(&["-sr", &format!("{d}/t"), &format!("{d}/alias/l")])
+        .status
+        .success());
+    assert_eq!(link_text(&format!("{d}/real/inner/l")), "../../t");
+    assert_eq!(fs::read(format!("{d}/alias/l")).unwrap(), b"t");
+
+    fs::remove_dir_all(&d).unwrap();
+}
+
+// -r needs -s.
+#[test]
+fn test_ln_relative_requires_symbolic() {
+    let d = dir("test_ln_relative_requires_symbolic");
+    fs::write(format!("{d}/a"), b"a").unwrap();
+    let out = run_ln(&["-r", &format!("{d}/a"), &format!("{d}/b")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!Path::new(&format!("{d}/b")).exists());
+    fs::remove_dir_all(&d).unwrap();
+}
+
+// One operand links into the current directory under its last component.
+// perl's build runs `ln -s regen-configure/U`.
+#[test]
+fn test_ln_single_operand() {
+    let d = dir("test_ln_single_operand");
+    fs::create_dir_all(format!("{d}/regen-configure/U")).unwrap();
+
+    let out = run_ln_in(&d, &["-s", "regen-configure/U"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(link_text(&format!("{d}/U")), "regen-configure/U");
+
+    // A hard link of a file in another directory.
+    fs::write(format!("{d}/regen-configure/f"), b"f").unwrap();
+    assert!(run_ln_in(&d, &["regen-configure/f"]).status.success());
+    assert_eq!(
+        fs::metadata(format!("{d}/f")).unwrap().ino(),
+        fs::metadata(format!("{d}/regen-configure/f"))
+            .unwrap()
+            .ino()
+    );
+
+    // The name already exists in the current directory.
+    let out = run_ln_in(&d, &["f"]);
+    assert_eq!(out.status.code(), Some(1));
+
+    fs::remove_dir_all(&d).unwrap();
+}

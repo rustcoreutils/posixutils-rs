@@ -1429,27 +1429,42 @@ impl Compiler {
 
         self.loop_stack.push(LoopStubs::default());
 
+        // for_init, for_cond and for_update are always there, each holding
+        // its clause or nothing; the body is absent for `for (...);`.
         let init = inner.next().unwrap();
-        self.compile_simple_statement(init, instructions, locals)?;
+        if let Some(init) = init.into_inner().next() {
+            self.compile_simple_statement(init, instructions, locals)?;
+        }
 
         let condition_start = instructions.len();
         let condition = inner.next().unwrap();
         let condition_line_col = condition.line_col();
-        self.compile_expr(condition, instructions, locals)?;
-        let for_jump_index = instructions.len();
-        instructions.push(OpCode::Invalid, condition_line_col);
+        // An empty condition is true: the loop has no exit jump.
+        let for_jump_index = match condition.into_inner().next() {
+            Some(condition) => {
+                self.compile_expr(condition, instructions, locals)?;
+                instructions.push(OpCode::Invalid, condition_line_col);
+                Some(instructions.len() - 1)
+            }
+            None => None,
+        };
 
         let update = inner.next().unwrap();
-        let body = inner.next().unwrap();
-        self.compile_stmt(body, instructions, locals)?;
+        if let Some(body) = inner.next() {
+            self.compile_stmt(body, instructions, locals)?;
+        }
         let update_start = instructions.len();
-        self.compile_simple_statement(update, instructions, locals)?;
+        if let Some(update) = update.into_inner().next() {
+            self.compile_simple_statement(update, instructions, locals)?;
+        }
         instructions.push(
             OpCode::Jump(distance(instructions.len(), condition_start)),
             condition_line_col,
         );
-        instructions.opcodes[for_jump_index] =
-            OpCode::JumpIfFalse(distance(for_jump_index, instructions.len()));
+        if let Some(for_jump_index) = for_jump_index {
+            instructions.opcodes[for_jump_index] =
+                OpCode::JumpIfFalse(distance(for_jump_index, instructions.len()));
+        }
 
         let loop_stubs = self.loop_stack.pop().unwrap();
         for stub in loop_stubs.break_stubs {

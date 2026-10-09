@@ -1227,3 +1227,46 @@ fn awk_newline_after_and_or_and_parameter_comma() {
         });
     }
 }
+
+// Each of the three clauses of `for (init; cond; update)` may be empty, and
+// so may the body; an empty condition is true.  The compiler took the
+// children in order and panicked when one was missing (texindex.awk has
+// `for (; i <= j; i++)`).
+#[test]
+fn awk_for_clauses_may_be_empty() {
+    let cases = [
+        (
+            "BEGIN { i = 1; for (; i <= 3; i++) printf i; print \"\" }",
+            "123\n",
+        ),
+        (
+            "BEGIN { for (i = 1; ; i++) if (i > 2) break; print i }",
+            "3\n",
+        ),
+        ("BEGIN { for (i = 1; i < 3;) i++; print i }", "3\n"),
+        (
+            "BEGIN { for (;;) { n++; if (n == 4) break }; print n }",
+            "4\n",
+        ),
+        ("BEGIN { for (i = 0; i < 5; i++); print i }", "5\n"),
+        ("BEGIN { for (i = 0; i < 6; i++) {}\nprint i }", "6\n"),
+        (
+            "BEGIN { for (i = 0; i < 4; i++) { if (i % 2) continue; s = s i }; print s }",
+            "02\n",
+        ),
+        (
+            "BEGIN { i = 0; for (;; i++) if (i == 7) break; print i }",
+            "7\n",
+        ),
+    ];
+    for (program, output) in cases {
+        run_test(TestPlan {
+            cmd: String::from("awk"),
+            args: vec![String::from(program)],
+            stdin_data: String::new(),
+            expected_out: String::from(output),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        });
+    }
+}

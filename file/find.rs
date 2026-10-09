@@ -27,7 +27,11 @@ use plib::modestr;
 ///
 /// Neither `-name` nor `-path` sets `FNM_PATHNAME`: POSIX `-path` explicitly
 /// does not treat a `<slash>` specially, and `-name` only ever sees a basename.
-fn fnmatch(pattern: &str, string: &str, fold: bool) -> bool {
+///
+/// Both are byte strings, as pathnames are: fnmatch(3) reads them in the
+/// current locale, so a byte that is not part of a valid character still
+/// matches itself.
+fn fnmatch(pattern: &[u8], string: &[u8], fold: bool) -> bool {
     use std::ffi::CString;
     let (Ok(p), Ok(s)) = (CString::new(pattern), CString::new(string)) else {
         return false;
@@ -168,11 +172,11 @@ struct ExecBatch {
 enum Primary {
     // Tests
     Name {
-        pattern: String,
+        pattern: Vec<u8>,
         fold: bool,
     },
     Path {
-        pattern: String,
+        pattern: Vec<u8>,
         fold: bool,
     },
     Type(FileTypeMatch),
@@ -338,8 +342,9 @@ impl FindState {
 
 /// Parse command line arguments, returning (symlink_mode, paths, expression)
 ///
-/// A starting point is a pathname and is taken byte for byte.  The expression
-/// is parsed as text, so an operand in it that is not valid UTF-8 is an error.
+/// A starting point is a pathname and is taken byte for byte, as is a
+/// -name, -iname, -path or -ipath pattern.  Any other expression operand is
+/// read as text, so one that is not valid UTF-8 is an error.
 fn parse_args(args: &[OsString]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), String> {
     let mut symlink_mode = SymlinkMode::Never;
     let mut idx = 1; // skip program name
@@ -377,25 +382,14 @@ fn parse_args(args: &[OsString]) -> Result<(SymlinkMode, Vec<PathBuf>, Expr), St
     }
 
     // Parse expression
-    let expr_args = args[idx..]
-        .iter()
-        .map(|s| {
-            s.to_str().ok_or_else(|| {
-                format!(
-                    "{}: {}",
-                    s.to_string_lossy(),
-                    gettext("expression operand is not valid UTF-8")
-                )
-            })
-        })
-        .collect::<Result<Vec<&str>, String>>()?;
+    let expr_args: Vec<&OsStr> = args[idx..].iter().map(|s| s.as_os_str()).collect();
     let expr = parse_expression(&expr_args)?;
 
     Ok((symlink_mode, paths, expr))
 }
 
 /// Parse an expression from arguments
-fn parse_expression(args: &[&str]) -> Result<Expr, String> {
+fn parse_expression(args: &[&OsStr]) -> Result<Expr, String> {
     if args.is_empty() {
         // Default expression is -print
         return Ok(Expr::Primary(Primary::Print));
@@ -408,31 +402,33 @@ fn parse_expression(args: &[&str]) -> Result<Expr, String> {
 
 /// Is `tok` the OR operator? `-or` is GNU's spelling of `-o`, forced by
 /// debhelper (dh_install, dh_installdocs, dh_shlibdeps, `-X` exclusions).
-fn is_or(tok: &str) -> bool {
+fn is_or(tok: &OsStr) -> bool {
     tok == "-o" || tok == "-or"
 }
 
 /// Is `tok` the AND operator? `-and` is GNU's spelling of `-a`, forced by
 /// debhelper (dh_install, dh_installdocs, dh_installexamples).
-fn is_and(tok: &str) -> bool {
+fn is_and(tok: &OsStr) -> bool {
     tok == "-a" || tok == "-and"
 }
 
 /// Fail unless an operand follows operator `op`, whose operand would start
 /// at `tokens[idx]`. The wording is GNU find's.
-fn expect_operand(tokens: &[&str], idx: usize, op: &str) -> Result<(), String> {
+fn expect_operand(tokens: &[&OsStr], idx: usize, op: &OsStr) -> Result<(), String> {
+    let op = op.display();
     match tokens.get(idx) {
         None => Err(format!("expected an expression after '{op}'")),
-        Some(&")") => Err(format!("expected an expression between '{op}' and ')'")),
+        Some(&next) if next == ")" => Err(format!("expected an expression between '{op}' and ')'")),
         Some(&next) if is_or(next) || is_and(next) => Err(format!(
-            "invalid expression; you have used a binary operator '{next}' with nothing before it."
+            "invalid expression; you have used a binary operator '{}' with nothing before it.",
+            next.display()
         )),
         Some(_) => Ok(()),
     }
 }
 
 /// Parse OR expression (lowest precedence)
-fn parse_or_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
+fn parse_or_expr(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
     let mut left = parse_and_expr(tokens, idx)?;
 
     while *idx < tokens.len() && is_or(tokens[*idx]) {
@@ -446,7 +442,7 @@ fn parse_or_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 }
 
 /// Parse AND expression
-fn parse_and_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
+fn parse_and_expr(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
     let mut left = parse_unary_expr(tokens, idx)?;
 
     while *idx < tokens.len() {
@@ -470,14 +466,14 @@ fn parse_and_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 }
 
 /// Parse unary expression (NOT or primary)
-fn parse_unary_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
+fn parse_unary_expr(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
     if *idx >= tokens.len() {
         return Err("unexpected end of expression".to_string());
     }
 
     if tokens[*idx] == "!" {
         *idx += 1;
-        expect_operand(tokens, *idx, "!")?;
+        expect_operand(tokens, *idx, OsStr::new("!"))?;
         let expr = parse_unary_expr(tokens, idx)?;
         return Ok(Expr::Not(Box::new(expr)));
     }
@@ -496,40 +492,40 @@ fn parse_unary_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 }
 
 /// Parse a primary
-fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
+fn parse_primary(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> {
     if *idx >= tokens.len() {
         return Err("unexpected end of expression".to_string());
     }
 
-    let tok = tokens[*idx];
+    let tok = token_str(tokens[*idx])?;
     *idx += 1;
 
     match tok {
         "-name" => {
-            let pattern = get_arg(tokens, idx, "-name")?;
+            let pattern = get_os_arg(tokens, idx, "-name")?;
             Ok(Expr::Primary(Primary::Name {
-                pattern: pattern.to_string(),
+                pattern: pattern.as_bytes().to_vec(),
                 fold: false,
             }))
         }
         "-iname" => {
-            let pattern = get_arg(tokens, idx, "-iname")?;
+            let pattern = get_os_arg(tokens, idx, "-iname")?;
             Ok(Expr::Primary(Primary::Name {
-                pattern: pattern.to_string(),
+                pattern: pattern.as_bytes().to_vec(),
                 fold: true,
             }))
         }
         "-path" => {
-            let pattern = get_arg(tokens, idx, "-path")?;
+            let pattern = get_os_arg(tokens, idx, "-path")?;
             Ok(Expr::Primary(Primary::Path {
-                pattern: pattern.to_string(),
+                pattern: pattern.as_bytes().to_vec(),
                 fold: false,
             }))
         }
         "-ipath" => {
-            let pattern = get_arg(tokens, idx, "-ipath")?;
+            let pattern = get_os_arg(tokens, idx, "-ipath")?;
             Ok(Expr::Primary(Primary::Path {
-                pattern: pattern.to_string(),
+                pattern: pattern.as_bytes().to_vec(),
                 fold: true,
             }))
         }
@@ -861,13 +857,34 @@ fn parse_newermt_date(date: &str) -> Result<SystemTime, String> {
 }
 
 /// Get the next argument or return an error
-fn get_arg<'a>(tokens: &[&'a str], idx: &mut usize, primary: &str) -> Result<&'a str, String> {
+fn get_arg<'a>(tokens: &[&'a OsStr], idx: &mut usize, primary: &str) -> Result<&'a str, String> {
+    token_str(get_os_arg(tokens, idx, primary)?)
+}
+
+/// Get the next argument as the byte string it is, or return an error
+fn get_os_arg<'a>(
+    tokens: &[&'a OsStr],
+    idx: &mut usize,
+    primary: &str,
+) -> Result<&'a OsStr, String> {
     if *idx >= tokens.len() {
         return Err(format!("{} requires an argument", primary));
     }
     let arg = tokens[*idx];
     *idx += 1;
     Ok(arg)
+}
+
+/// An expression operand that is read as text, or an error if it is not
+/// valid UTF-8.
+fn token_str(token: &OsStr) -> Result<&str, String> {
+    token.to_str().ok_or_else(|| {
+        format!(
+            "{}: {}",
+            token.to_string_lossy(),
+            gettext("expression operand is not valid UTF-8")
+        )
+    })
 }
 
 /// Parse -perm argument
@@ -947,12 +964,12 @@ fn resolve_group(name: &str) -> Result<u32, String> {
 }
 
 /// Parse -exec primary arguments
-fn parse_exec(tokens: &[&str], idx: &mut usize) -> Result<ExecMode, String> {
+fn parse_exec(tokens: &[&OsStr], idx: &mut usize) -> Result<ExecMode, String> {
     if *idx >= tokens.len() {
         return Err("-exec requires an argument".to_string());
     }
 
-    let utility = tokens[*idx].to_string();
+    let utility = token_str(tokens[*idx])?.to_string();
     *idx += 1;
 
     let mut args = Vec::new();
@@ -982,19 +999,19 @@ fn parse_exec(tokens: &[&str], idx: &mut usize) -> Result<ExecMode, String> {
         if tok == "{}" {
             has_placeholder = true;
         }
-        args.push(tok.to_string());
+        args.push(token_str(tok)?.to_string());
     }
 
     Err("-exec not terminated by ; or {} +".to_string())
 }
 
 /// Parse -ok primary arguments
-fn parse_ok(tokens: &[&str], idx: &mut usize) -> Result<(String, Vec<String>), String> {
+fn parse_ok(tokens: &[&OsStr], idx: &mut usize) -> Result<(String, Vec<String>), String> {
     if *idx >= tokens.len() {
         return Err("-ok requires an argument".to_string());
     }
 
-    let utility = tokens[*idx].to_string();
+    let utility = token_str(tokens[*idx])?.to_string();
     *idx += 1;
 
     let mut args = Vec::new();
@@ -1006,7 +1023,7 @@ fn parse_ok(tokens: &[&str], idx: &mut usize) -> Result<(String, Vec<String>), S
         if tok == ";" {
             return Ok((utility, args));
         }
-        args.push(tok.to_string());
+        args.push(token_str(tok)?.to_string());
     }
 
     Err("-ok not terminated by ;".to_string())
@@ -1138,12 +1155,10 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
     match primary {
         Primary::Name { pattern, fold } => {
             let name = ctx.path.file_name().unwrap_or(OsStr::new(""));
-            let name_str = name.to_string_lossy();
-            EvalResult::new(fnmatch(pattern, &name_str, *fold))
+            EvalResult::new(fnmatch(pattern, name.as_bytes(), *fold))
         }
         Primary::Path { pattern, fold } => {
-            let path_str = ctx.path.to_string_lossy();
-            EvalResult::new(fnmatch(pattern, &path_str, *fold))
+            EvalResult::new(fnmatch(pattern, ctx.path.as_os_str().as_bytes(), *fold))
         }
         // POSIX -H/-L: a symbolic link that is followed has the type of the
         // file it references, so `-type l` matches only a link that could

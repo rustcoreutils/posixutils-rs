@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod bytes;
 mod debhelper;
 mod newermt;
 mod race;
@@ -1070,15 +1071,16 @@ fn find_non_utf8_path_and_exec() {
     assert_eq!(output.stdout, expected);
 }
 
-// An expression operand that is not valid UTF-8 is reported as an error,
-// not a panic.
+// An operand read as text (here a user name) that is not valid UTF-8 is
+// reported as an error, not a panic.  Pattern operands are byte strings and
+// are accepted (see bytes.rs).
 #[test]
 fn find_non_utf8_expression_operand_is_an_error() {
     use plib::testing::os_bytes;
     let dir = tempdir().unwrap();
     let output = Command::new(get_binary_path("find"))
         .arg(dir.path())
-        .arg("-name")
+        .arg("-user")
         .arg(os_bytes(b"x\xff"))
         .output()
         .unwrap();

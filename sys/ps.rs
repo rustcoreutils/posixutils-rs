@@ -16,17 +16,13 @@ mod psmacos;
 mod pslinux;
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::CStr;
 use std::fmt::Write as _; // write! into a String (distinct from io::Write below)
 use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
 use gettextrs::gettext;
-use libc::{
-    geteuid, getgrgid, getgrnam, getpwnam, getpwuid, isatty, ttyname, STDERR_FILENO, STDIN_FILENO,
-    STDOUT_FILENO,
-};
+use libc::{geteuid, isatty, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -40,56 +36,22 @@ mod platform {
 
 /// Convert UID to username
 fn uid_to_name(uid: u32) -> Option<String> {
-    unsafe {
-        let pw = getpwuid(uid);
-        if pw.is_null() {
-            return None;
-        }
-        let name = (*pw).pw_name;
-        if name.is_null() {
-            return None;
-        }
-        Some(CStr::from_ptr(name).to_string_lossy().into_owned())
-    }
+    plib::user::get_by_uid(uid).map(|u| u.name.to_string_lossy().into_owned())
 }
 
 /// Convert username to UID
 fn name_to_uid(name: &str) -> Option<u32> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    unsafe {
-        let pw = getpwnam(c_name.as_ptr());
-        if pw.is_null() {
-            return None;
-        }
-        Some((*pw).pw_uid)
-    }
+    plib::user::get_by_name(name).map(|u| u.uid)
 }
 
 /// Convert GID to group name
 fn gid_to_name(gid: u32) -> Option<String> {
-    unsafe {
-        let gr = getgrgid(gid);
-        if gr.is_null() {
-            return None;
-        }
-        let name = (*gr).gr_name;
-        if name.is_null() {
-            return None;
-        }
-        Some(CStr::from_ptr(name).to_string_lossy().into_owned())
-    }
+    plib::group::get_by_gid(gid).map(|g| g.name.to_string_lossy().into_owned())
 }
 
 /// Convert group name to GID
 fn groupname_to_gid(name: &str) -> Option<u32> {
-    let c_name = std::ffi::CString::new(name).ok()?;
-    unsafe {
-        let gr = getgrnam(c_name.as_ptr());
-        if gr.is_null() {
-            return None;
-        }
-        Some((*gr).gr_gid)
-    }
+    plib::group::get_by_name(name).map(|g| g.gid)
 }
 
 /// ps - report process status
@@ -616,22 +578,19 @@ fn truncate_line(line: &str, max_bytes: usize) -> &str {
 /// prefix stripped, to match the names derived from each process's `tty_nr`.
 fn get_current_tty() -> Option<String> {
     for fd in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
-        unsafe {
-            if isatty(fd) == 0 {
-                continue;
-            }
-            let name = ttyname(fd);
-            if name.is_null() {
-                continue;
-            }
-            let name_str = std::ffi::CStr::from_ptr(name).to_string_lossy().to_string();
-            return Some(
-                name_str
-                    .strip_prefix("/dev/")
-                    .map(str::to_string)
-                    .unwrap_or(name_str),
-            );
+        // SAFETY: isatty has no preconditions.
+        if unsafe { isatty(fd) } == 0 {
+            continue;
         }
+        let Some(name_str) = plib::curuser::ttyname_of(fd) else {
+            continue;
+        };
+        return Some(
+            name_str
+                .strip_prefix("/dev/")
+                .map(str::to_string)
+                .unwrap_or(name_str),
+        );
     }
     None
 }

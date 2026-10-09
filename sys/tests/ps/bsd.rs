@@ -11,7 +11,6 @@
 //! and column layout are procps-ng 4's.
 
 use plib::testing::get_binary_path;
-use std::ffi::CStr;
 use std::process::{Command, Output};
 
 const U_HEADER: &str = "USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND";
@@ -38,11 +37,11 @@ fn ok_lines(args: &[&str]) -> Vec<String> {
 /// The USER column for the user running the tests: procps shows a name of
 /// more than 8 bytes as its first 7 and a `+`.
 fn my_user_column() -> String {
-    let name = unsafe {
-        let pw = libc::getpwuid(libc::geteuid());
-        assert!(!pw.is_null());
-        CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
-    };
+    let name = plib::user::get_by_uid(unsafe { libc::geteuid() })
+        .expect("the test user has a passwd entry")
+        .name
+        .to_string_lossy()
+        .into_owned();
     if name.len() > 8 {
         format!("{}+", &name[..7])
     } else {

@@ -49,7 +49,7 @@ struct Args {
     #[arg(short = 'S', help = gettext("Append .mo suffix to output file names"))]
     add_suffix: bool,
 
-    #[arg(short = 'v', help = gettext("Verbose mode - print warnings"))]
+    #[arg(short = 'v', long, help = gettext("Verbose mode - print warnings"))]
     verbose: bool,
 
     #[arg(short = 'D', allow_hyphen_values = true, action = clap::ArgAction::Append, help = gettext("Add directory to search path for input files"))]

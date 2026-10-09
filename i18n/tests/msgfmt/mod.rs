@@ -521,3 +521,41 @@ msgstr "D"
         )
     );
 }
+
+/// `--verbose` is GNU's long spelling of -v. gettext's stock po/Makefile.in.in builds each
+/// catalog with `msgfmt -c --statistics --verbose -o xx.gmo xx.po`; the counts are written once.
+#[test]
+fn test_msgfmt_long_verbose() {
+    let (dir, po_path) = create_temp_po_file(
+        r#"
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "a"
+msgstr "A"
+
+msgid "c"
+msgstr ""
+"#,
+    );
+    let po = po_path.to_str().unwrap();
+    let counts = "1 translated message, 1 untranslated message.\n";
+    for args in [
+        ["--verbose", "-o", "/dev/null", po, "", ""],
+        ["-c", "--statistics", "--verbose", "-o", "xx.gmo", po],
+    ] {
+        let args: Vec<&str> = args.into_iter().filter(|a| !a.is_empty()).collect();
+        let (err, status) = msgfmt_status(dir.path(), &args);
+        assert_eq!(status, 0, "{err}");
+        assert_eq!(err.matches(counts).count(), 1, "{err}");
+        assert!(err.ends_with(counts), "{err}");
+        // Everything else written is what -v writes.
+        let short: Vec<&str> = args
+            .iter()
+            .map(|a| if *a == "--verbose" { "-v" } else { a })
+            .collect();
+        assert_eq!(msgfmt_status(dir.path(), &short), (err, 0));
+    }
+    assert!(dir.path().join("xx.gmo").exists());
+}

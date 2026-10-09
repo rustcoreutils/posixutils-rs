@@ -549,7 +549,7 @@ fn extract_hardlink(
     link_replacing_with(
         target_parent.as_raw_fd(),
         &target_member.leaf,
-        false,
+        None,
         expected,
         dirfd,
         name,
@@ -740,7 +740,7 @@ fn join_link_set<R: ArchiveReader>(
             link_replacing_with(
                 src_dir.as_raw_fd(),
                 &src_leaf,
-                false,
+                None,
                 Some(set.file),
                 dirfd,
                 name,
@@ -820,7 +820,7 @@ fn move_names_to(
         // even under -k. The link is to the file made, pinned, never to
         // whatever has been put at its name since.
         let from = dirfd.as_raw_fd();
-        link_replacing_with(from, name, false, Some(file), dir.as_fd(), &leaf, false)?;
+        link_replacing_with(from, name, None, Some(file), dir.as_fd(), &leaf, false)?;
         names.push(path);
     }
     Ok(names)

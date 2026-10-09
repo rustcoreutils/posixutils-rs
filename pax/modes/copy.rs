@@ -624,11 +624,16 @@ fn is_source(st: &libc::stat, entry: &ftw::Entry<'_>, metadata: &ftw::Metadata) 
     if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK || !followed_link(entry, metadata) {
         return false;
     }
-    // SAFETY: the walk keeps the entry's directory open while it is visited.
-    let dir = unsafe { BorrowedFd::borrow_raw(entry.dir_fd()) };
-    lstat_at(dir.as_raw_fd(), entry.file_name())
-        .ok()
-        .is_some_and(|link| file_id(&link) == id)
+    // The link the walk examined, by the identity it saw.
+    entry.symlink_id() == Some(id)
+}
+
+/// The failure for a followed symbolic link the walk gave no identity for --
+/// which it gives every link it reports (`ftw::Entry::symlink_id`).
+fn link_not_identified() -> PaxError {
+    PaxError::Io(std::io::Error::other(
+        "symbolic link not identified by the walk",
+    ))
 }
 
 /// Diagnose copying a file to its own name, as BSD pax words it, and skip it.
@@ -756,10 +761,13 @@ fn copy_file(
         // `pax -rwl tree .` names every file as its own destination. Under
         // -H/-L the walk followed a symbolic link here, and the link made is
         // to the file it refers to, as POSIX requires of -l.
+        let follow = followed_link(entry, metadata)
+            .then(|| entry.symlink_id().ok_or_else(link_not_identified))
+            .transpose()?;
         let linked = link_replacing_with(
             entry.dir_fd(),
             entry.file_name(),
-            followed_link(entry, metadata),
+            follow,
             Some((metadata.dev(), metadata.ino())),
             dirfd,
             name,
@@ -803,7 +811,7 @@ fn copy_file(
         link_replacing_with(
             target_dir.as_raw_fd(),
             &target.leaf,
-            false,
+            None,
             copy,
             dirfd,
             name,

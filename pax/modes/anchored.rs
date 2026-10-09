@@ -1245,7 +1245,9 @@ fn created(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
 /// a symbolic link refers to. With `follow` the link itself counts too, being
 /// just as much the source (`pax -rwl -H link .`).
 ///
-/// With `follow`, the file a symbolic link `from_name` refers to is linked --
+/// `follow` is the `(st_dev, st_ino)` of the symbolic link `from_name` the
+/// caller examined, when the link is to be followed (the walk's own `lstat`,
+/// `ftw::Entry::symlink_id`); the file it refers to is then linked --
 /// copy mode's `-l` under `-H`/`-L`, where POSIX says "the hard link created
 /// ... shall be to the file referenced by the symbolic link". Without it,
 /// `from_name` itself is linked, whatever it is.
@@ -1263,7 +1265,7 @@ fn created(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
 pub(crate) fn link_replacing_with(
     from_dir: libc::c_int,
     from_name: &CStr,
-    follow: bool,
+    follow: Option<(u64, u64)>,
     expected: Option<(u64, u64)>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
@@ -1271,7 +1273,7 @@ pub(crate) fn link_replacing_with(
 ) -> PaxResult<bool> {
     #[cfg(test)]
     crate::modes::race_hook::reached(crate::modes::race_hook::Point::Linking, from_dir, from_name);
-    let source = LinkSource::new(from_dir, from_name, follow, expected)?;
+    let source = LinkSource::new(from_dir, from_name, follow.is_some(), expected)?;
     let link = || source.link_to(dirfd, name);
 
     match link() {
@@ -1295,18 +1297,19 @@ pub(crate) fn link_replacing_with(
         // now, which would skip the member as linked to itself. Only a source
         // known by neither is resolved again.
         let resolved = source.identity().or_else(|| {
-            let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+            let src_flags = if follow.is_some() {
+                0
+            } else {
+                libc::AT_SYMLINK_NOFOLLOW
+            };
             fstatat(from_dir, from_name, src_flags)
                 .ok()
                 .map(|st| file_id(&st))
         });
         // Followed, the link itself is the source just as much
-        // (`pax -rwl -H link .`).
-        let link = follow
-            .then(|| fstatat(from_dir, from_name, libc::AT_SYMLINK_NOFOLLOW).ok())
-            .flatten()
-            .map(|st| file_id(&st));
-        if [resolved, link]
+        // (`pax -rwl -H link .`): the link the caller examined, by the
+        // identity it saw, not by its name resolved again.
+        if [resolved, follow]
             .into_iter()
             .flatten()
             .any(|src| src == file_id(&dst))
@@ -2309,11 +2312,53 @@ mod tests {
             }
         };
         let linked = with_hook(swap, || {
-            link_replacing_with(root, c"a", false, Some(source), tree.root(), c"d", false)
+            link_replacing_with(root, c"a", None, Some(source), tree.root(), c"d", false)
         });
         assert!(!linked.unwrap(), "skipped as already linked to itself");
         let d = lstat_at(tree.root().as_raw_fd(), c"d").unwrap();
         assert_eq!(file_id(&d), source, "d does not hold the source");
+    }
+
+    /// Under -H/-L the symbolic link itself counts as the source too, so a
+    /// destination that already is that link is left alone. It was recognised
+    /// by resolving the link's name again, which someone who can rename in the
+    /// source directory can point at the destination's file once the link's
+    /// target is pinned: the member was then skipped. The link is the one the
+    /// walk examined, by its identity.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_link_replacing_judges_a_followed_link_by_the_walks_identity() {
+        use crate::modes::race_hook::{with_hook, Point};
+        let dir = plib::tmp::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("t"), "target\n").unwrap();
+        std::os::unix::fs::symlink("t", dir.path().join("l")).unwrap();
+        std::fs::write(dir.path().join("d"), "other\n").unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let root = tree.root().as_raw_fd();
+        let id = |name: &CStr| file_id(&lstat_at(root, name).unwrap());
+        let (link, target) = (id(c"l"), id(c"t"));
+
+        let path = dir.path().to_path_buf();
+        let swap = move |point, _: libc::c_int, _: &CStr| {
+            if point == Point::LinkExists {
+                // `l` now names the destination's file.
+                std::fs::remove_file(path.join("l")).unwrap();
+                std::fs::hard_link(path.join("d"), path.join("l")).unwrap();
+            }
+        };
+        let linked = with_hook(swap, || {
+            link_replacing_with(
+                root,
+                c"l",
+                Some(link),
+                Some(target),
+                tree.root(),
+                c"d",
+                false,
+            )
+        });
+        assert!(!linked.unwrap(), "skipped as already the link itself");
+        assert_eq!(id(c"d"), target, "d does not hold the link's target");
     }
 
     /// -k leaves an existing directory entirely alone, and says nothing: one
@@ -2597,7 +2642,7 @@ mod tests {
         let same = link_replacing_with(
             dir.root().as_raw_fd(),
             &f,
-            false,
+            None,
             None,
             dir.root(),
             &f,
@@ -2624,7 +2669,7 @@ mod tests {
         let same = link_replacing_with(
             dir.root().as_raw_fd(),
             &f,
-            false,
+            None,
             None,
             dir.root(),
             &g,

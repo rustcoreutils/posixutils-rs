@@ -379,6 +379,8 @@ struct TreeNode {
     metadata: Metadata,
     /// Whether the directory entry is itself a symbolic link (one the walk followed).
     is_symlink: Option<bool>,
+    /// That link's own identity (`Entry::symlink_id`).
+    symlink_id: Option<(u64, u64)>,
     path_depth: usize,
 }
 
@@ -397,6 +399,7 @@ impl TreeNode {
         )
         .with_shown_name(self.shown_name.clone());
         entry.is_symlink = self.is_symlink;
+        entry.symlink_id = self.symlink_id;
         entry
     }
 
@@ -420,6 +423,9 @@ pub struct Entry<'a> {
     shown_name: Option<Rc<[libc::c_char]>>,
     metadata: Option<Metadata>,
     is_symlink: Option<bool>,
+    /// `(st_dev, st_ino)` of the entry itself when it is a symbolic link, from the walk's own
+    /// `lstat` of it.
+    symlink_id: Option<(u64, u64)>,
     read_link: Option<Rc<[libc::c_char]>>,
 }
 
@@ -437,6 +443,7 @@ impl<'a> Entry<'a> {
             shown_name: None,
             metadata,
             is_symlink: None,
+            symlink_id: None,
             read_link: None,
         }
     }
@@ -468,6 +475,15 @@ impl<'a> Entry<'a> {
     /// Check if this entry is a symlink.
     pub fn is_symlink(&self) -> Option<bool> {
         self.is_symlink
+    }
+
+    /// `(st_dev, st_ino)` of the entry itself when it is a symbolic link -- set exactly when
+    /// `is_symlink` is `Some(true)` -- from the `lstat` the walk made of it, the link it examined.
+    /// When the walk follows the link, `metadata` is its target's, and this is the only record of
+    /// the link: a caller asking whether a name is still that link compares against it rather
+    /// than resolving the name again.
+    pub fn symlink_id(&self) -> Option<(u64, u64)> {
+        self.symlink_id
     }
 
     /// Reads the symbolic link.
@@ -630,6 +646,10 @@ where
         }
     };
     let is_symlink = entry_symlink_metadata.file_type() == FileType::SymbolicLink;
+    let symlink_id = is_symlink.then(|| {
+        use std::os::unix::fs::MetadataExt;
+        (entry_symlink_metadata.dev(), entry_symlink_metadata.ino())
+    });
 
     // Read the link target for every symbolic link, whether or not this walk follows links:
     // consumers need it either way -- `cp -P` and `mv` recreate the link from it, `ls -l` prints
@@ -686,6 +706,7 @@ where
     let mut entry = Entry::new(dir_fd, path_stack, entry_filename, Some(entry_metadata))
         .with_shown_name(shown_name.cloned());
     entry.is_symlink = Some(is_symlink);
+    entry.symlink_id = symlink_id;
     entry.read_link = entry_readlink;
 
     if must_be_dir {
@@ -1221,6 +1242,7 @@ where
                             filename: dir_filename,
                             shown_name,
                             is_symlink: entry.is_symlink,
+                            symlink_id: entry.symlink_id,
                             metadata: entry.metadata.unwrap(),
                             path_depth: path_stack.len(),
                         };
@@ -1481,6 +1503,7 @@ where
                                             filename: entry_filename,
                                             shown_name: None,
                                             is_symlink: entry.is_symlink,
+                                            symlink_id: entry.symlink_id,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1498,6 +1521,7 @@ where
                                             filename: entry_filename,
                                             shown_name: None,
                                             is_symlink: entry.is_symlink,
+                                            symlink_id: entry.symlink_id,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1532,6 +1556,7 @@ where
                                             filename: entry_filename,
                                             shown_name: None,
                                             is_symlink: entry.is_symlink,
+                                            symlink_id: entry.symlink_id,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }

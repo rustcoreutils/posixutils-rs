@@ -166,7 +166,20 @@ fn show_iso_time(when: libc::time_t, nanos: u32, utc: bool, format: IsoFormat) {
         text.insert(text.len() - 2, b':');
     }
     text.push(b'\n');
-    let _ = io::stdout().lock().write_all(&text);
+    write_stdout(&text);
+}
+
+/// Write `text` to standard output, failing on a write error rather than
+/// exiting 0 with the output lost.
+fn write_stdout(text: &[u8]) {
+    let mut out = io::stdout().lock();
+    if let Err(e) = out.write_all(text).and_then(|()| out.flush()) {
+        fail(&format!(
+            "{}: {}",
+            gettext("write error"),
+            diag::io_error_text(&e)
+        ));
+    }
 }
 
 /// The current time: seconds since the Epoch, and nanoseconds past that.
@@ -194,16 +207,15 @@ fn current_time() -> libc::time_t {
 /// Write `when` formatted by `formatstr`, in UTC or local time.
 fn show_time(when: libc::time_t, utc: bool, formatstr: &str) {
     if formatstr.is_empty() {
-        println!();
+        write_stdout(b"\n");
         return;
     }
 
     match format_time(when, utc, formatstr) {
-        Ok(text) => {
+        Ok(mut text) => {
             // Write the raw bytes so non-UTF-8 locale output is preserved.
-            let mut out = io::stdout().lock();
-            let _ = out.write_all(&text);
-            let _ = out.write_all(b"\n");
+            text.push(b'\n');
+            write_stdout(&text);
         }
         Err(msg) => {
             diag::error(&gettext(msg));

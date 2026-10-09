@@ -445,3 +445,11 @@ fn test_iso_8601_rejections() {
         });
     }
 }
+
+// A failed write of the date is an error: date discarded it and exited 0.
+#[test]
+fn test_date_reports_write_error() {
+    plib::testing::assert_write_error_on_full_device("date", &["+x"], b"", 1);
+    plib::testing::assert_write_error_on_full_device("date", &["+"], b"", 1);
+    plib::testing::assert_write_error_on_full_device("date", &["-Iseconds"], b"", 1);
+}

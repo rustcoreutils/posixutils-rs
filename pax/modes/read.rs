@@ -126,6 +126,7 @@ fn extract_members<R: ArchiveReader>(
     pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
     let mut link_sets: LinkSets<CreatedSet> = LinkSets::default();
+    let mut pins = PinBudget::new();
     let mut selector = Selector::new(
         &options.patterns,
         options.exclude,
@@ -167,6 +168,7 @@ fn extract_members<R: ArchiveReader>(
         if let Some(set) = link_sets.settled_mut(&entry) {
             set.unpin();
         }
+        pins.account(&entry, &mut link_sets);
         // A newc set's data comes with its last name, which -n must still
         // read even when every pattern has been used by an earlier one.
         if selector.is_done() && link_sets.all_settled() {
@@ -526,6 +528,69 @@ fn extract_hardlink(
     Ok(())
 }
 
+/// The link sets whose files are pinned (`CreatedSet::pin`), oldest first,
+/// and how many may be at once.
+///
+/// A newc set waits for its data until c_nlink of its names have been read,
+/// and an archive can start any number of sets that never finish: one name
+/// each, with a c_nlink of 2 or of 0xffffffff. Pinned until the end, one
+/// descriptor each, they would leave none for the members after them. Past
+/// the budget the oldest set's pin is closed, and that set falls back to the
+/// bare `(st_dev, st_ino)` check every set relies on once its data is in.
+struct PinBudget {
+    /// The keys (`LinkSets::key`) of the sets holding a pin, oldest first.
+    held: std::collections::VecDeque<(u64, u64)>,
+    /// How many may be held at once: a quarter of the descriptor limit, and
+    /// at most 256.
+    limit: usize,
+}
+
+impl PinBudget {
+    fn new() -> Self {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            lim.rlim_cur
+        } else {
+            0
+        };
+        PinBudget {
+            held: std::collections::VecDeque::new(),
+            limit: usize::try_from(soft / 4).map_or(256, |quarter| quarter.min(256)),
+        }
+    }
+
+    /// Account for the set `entry` is a name of, after the member: forget it
+    /// once it holds no pin, note it when it has taken one, and close the
+    /// oldest pin when that puts the budget over.
+    fn account(&mut self, entry: &ArchiveEntry, link_sets: &mut LinkSets<CreatedSet>) {
+        let Some(key) = LinkSets::<CreatedSet>::key(entry) else {
+            return;
+        };
+        let Some(set) = link_sets.by_key_mut(key) else {
+            return;
+        };
+        let held_at = self.held.iter().position(|&k| k == key);
+        match (set.pin.is_some(), held_at) {
+            (false, Some(at)) => {
+                self.held.remove(at);
+            }
+            (true, None) => self.held.push_back(key),
+            _ => {}
+        }
+        while self.held.len() > self.limit {
+            let Some(oldest) = self.held.pop_front() else {
+                break;
+            };
+            if let Some(set) = link_sets.by_key_mut(oldest) {
+                set.unpin();
+            }
+        }
+    }
+}
+
 /// What extraction remembers about a cpio link set.
 struct CreatedSet {
     /// The names created for the set so far, as extracted (after -s and -i).
@@ -537,10 +602,11 @@ struct CreatedSet {
     /// name of a set only, so the earlier names are created empty.
     has_data: bool,
     /// The file held open while data may still come for it on a later name
-    /// (`LinkSets::settled_mut`). Its names can be replaced by other members
-    /// meanwhile, and a filesystem that reuses inode numbers (ext4) then hands
-    /// this file's number to the next file created, which `file` would take
-    /// for this one. Open, it keeps its number.
+    /// (`LinkSets::settled_mut`), within the budget (`PinBudget`). Its names
+    /// can be replaced by other members meanwhile, and a filesystem that
+    /// reuses inode numbers (ext4) then hands this file's number to the next
+    /// file created, which `file` would take for this one. Open, it keeps its
+    /// number.
     pin: Option<OwnedFd>,
 }
 

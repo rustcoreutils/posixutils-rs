@@ -928,3 +928,62 @@ fn test_cpio_first_match_stops_after_an_empty_link_set() {
     assert_eq!(fs::read(dest.join("sel")).unwrap(), b"selected");
     assert_eq!(file_id(&dest.join("e1")), file_id(&dest.join("e2")));
 }
+
+/// A newc set waits for data until c_nlink of its names have been read, and
+/// its file stays pinned meanwhile. A crafted archive can start any number of
+/// sets that never finish -- one name each, with c_nlink 2 or 0xffffffff --
+/// and held one descriptor each, every member after the descriptor limit
+/// failed. The pins are capped; past the cap the oldest is closed.
+#[test]
+fn test_cpio_unfinished_link_sets_do_not_exhaust_descriptors() {
+    const SETS: u32 = 300;
+    let mut archive = Vec::new();
+    for i in 0..SETS {
+        let name = format!("s{i}");
+        let nlink = if i % 2 == 0 { 2 } else { u32::MAX };
+        archive.extend_from_slice(
+            &CpioNewc {
+                name: name.as_bytes(),
+                ino: i + 1,
+                nlink,
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    for i in 0..20 {
+        let name = format!("later{i}");
+        let body = format!("body {i}\n");
+        archive.extend_from_slice(
+            &CpioNewc {
+                name: name.as_bytes(),
+                body: body.as_bytes(),
+                ino: SETS + 1 + i,
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"TRAILER!!!",
+            ..Default::default()
+        }
+        .member(),
+    );
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("archive.cpio");
+    fs::write(&path, &archive).unwrap();
+    let dest = temp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    let out = pax_with_fd_limit(&["-r", "-f", path.to_str().unwrap()], &dest, 64);
+    assert_success(&out, &format!("pax -r of {SETS} unfinished newc link sets"));
+    for i in 0..SETS {
+        assert_eq!(fs::read(dest.join(format!("s{i}"))).unwrap(), b"");
+    }
+    for i in 0..20 {
+        let body = fs::read_to_string(dest.join(format!("later{i}"))).unwrap();
+        assert_eq!(body, format!("body {i}\n"));
+    }
+}

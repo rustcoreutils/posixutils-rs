@@ -495,7 +495,7 @@ impl<T> Default for LinkSets<T> {
 impl<T> LinkSets<T> {
     /// The key of the set `entry` would be a name of, or `None` for a member
     /// that is not one of several names of a file.
-    fn key(entry: &ArchiveEntry) -> Option<(u64, u64)> {
+    pub fn key(entry: &ArchiveEntry) -> Option<(u64, u64)> {
         (entry.entry_type == EntryType::Regular && entry.nlink > 1)
             .then_some((entry.dev, entry.ino))
     }
@@ -519,6 +519,11 @@ impl<T> LinkSets<T> {
         if let Some(set) = Self::key(entry).and_then(|key| self.sets.get_mut(&key)) {
             set.names = set.names.saturating_add(1);
         }
+    }
+
+    /// What was remembered about the set whose key (`key`) is `key`.
+    pub fn by_key_mut(&mut self, key: (u64, u64)) -> Option<&mut T> {
+        self.sets.get_mut(&key).map(|set| &mut set.value)
     }
 
     /// Whether no set started so far awaits data on a later name.

@@ -1968,3 +1968,18 @@ fn awk_close_of_a_pipe_returns_the_exit_status() {
     assert_eq!((stdout.as_str(), stderr.as_str()), ("9\n3\n265\n-1\n", ""));
     assert_eq!(status, Some(0));
 }
+
+// The `#` flag follows printf(3): `%#x` of 0 has no 0x prefix, and `%#o`
+// makes the first digit a zero even with a precision that leaves room for
+// none (gawk's test printf1).
+#[test]
+fn awk_printf_alternative_form_of_zero() {
+    let program =
+        "BEGIN { printf \"%#.0o|%#x|%#X|%#o|%#.2o|%#x|%#5x|\\n\", 0, 0, 0, 0, 8, 255, 0 }";
+    let (stdout, stderr, status) = awk_with_deadline(program);
+    assert_eq!(
+        (stdout.as_str(), stderr.as_str()),
+        ("0|0|0|0|010|0xff|    0|\n", "")
+    );
+    assert_eq!(status, Some(0));
+}

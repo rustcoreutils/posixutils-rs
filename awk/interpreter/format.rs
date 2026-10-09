@@ -426,12 +426,20 @@ pub fn fmt_write_unsigned(
     // regarding the alternative form for octal numbers:
     // > For the o conversion specifier, it shall increase
     // > the precision to force the first digit of the result to be a zero
-    if args.alternative_form && integer_format == IntegerFormat::Octal && precision < buffer_length
+    // The digits of a number never start with a zero, and those of 0 are
+    // none at all, so only zeros of precision put one first.
+    if args.alternative_form && integer_format == IntegerFormat::Octal && precision <= buffer_length
     {
         precision = buffer_length + 1;
     }
 
-    let hex_prefix = integer_hex_prefix_str(integer_format, args);
+    // > For x or X conversion specifiers, a non-zero result shall have 0x
+    // > (or 0X) prefixed to it.
+    let hex_prefix = if value == 0 {
+        ""
+    } else {
+        integer_hex_prefix_str(integer_format, args)
+    };
 
     // left justified:
     //    hex_prefix precision buffer padding

@@ -148,7 +148,27 @@ fn xargs_exit_255() {
         ],
         stdin_data: String::from("one\ntwo\nstop\nthree\nfour\n"),
         expected_out: String::from("one\ntwo\n"),
-        expected_err: String::from(""),
+        expected_err: String::from("xargs: sh: exited with status 255; aborting\n"),
+        expected_exit_code: 1,
+    });
+}
+
+/// An invocation killed by a signal stops xargs too, with a diagnostic, and
+/// no further input is processed (POSIX xargs, CONSEQUENCES OF ERRORS).
+#[test]
+fn xargs_utility_killed_by_a_signal() {
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec![
+            "-n".to_string(),
+            "1".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"case "$0" in stop) kill -TERM $$;; *) echo "$0";; esac"#.to_string(),
+        ],
+        stdin_data: String::from("one\nstop\nthree\n"),
+        expected_out: String::from("one\n"),
+        expected_err: String::from("xargs: sh: terminated by signal 15\n"),
         expected_exit_code: 1,
     });
 }

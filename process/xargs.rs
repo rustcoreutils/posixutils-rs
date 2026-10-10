@@ -14,7 +14,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::mem;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
@@ -211,6 +211,8 @@ impl Args {
 enum ExecResult {
     /// Command executed and returned this exit code
     Exited(i32),
+    /// Command was terminated by this signal
+    Signaled(i32),
     /// Command was not found (exit 127)
     NotFound,
     /// Command found but could not be invoked (exit 126)
@@ -283,10 +285,10 @@ fn exec_util(
         .stderr(Stdio::inherit())
         .output()
     {
-        Ok(output) => {
-            let code = exit_code_from_status(output.status);
-            Ok(ExecResult::Exited(code))
-        }
+        Ok(output) => Ok(match output.status.signal() {
+            Some(sig) => ExecResult::Signaled(sig),
+            None => ExecResult::Exited(output.status.code().unwrap_or(1)),
+        }),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
                 diag::error(&format!(
@@ -300,18 +302,6 @@ fn exec_util(
                 Ok(ExecResult::CannotInvoke)
             }
         }
-    }
-}
-
-/// Convert ExitStatus to exit code
-fn exit_code_from_status(status: ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        code
-    } else if let Some(sig) = status.signal() {
-        // Killed by signal: return 128 + signal number
-        128 + sig
-    } else {
-        1
     }
 }
 
@@ -714,26 +704,36 @@ fn exec_insert_mode(
     exec_util(&args.util, util_args, trace, prompt)
 }
 
-/// Helper macro to handle exec result
-macro_rules! handle_exec_result {
-    ($result:expr, $any_failed:expr) => {
-        match $result {
-            ExecResult::Exited(255) => {
-                return Ok(1);
-            }
-            ExecResult::Exited(code) if code != 0 => {
-                $any_failed = true;
-            }
-            ExecResult::NotFound => {
-                return Ok(127);
-            }
-            ExecResult::CannotInvoke => {
-                return Ok(126);
-            }
-            ExecResult::Skipped | ExecResult::Exited(0) => {}
-            ExecResult::Exited(_) => {}
+/// What one invocation's result means for xargs: `Some` exit status when it
+/// must stop, without processing any remaining input; a nonzero exit is
+/// recorded in `any_failed`.
+fn stop_after(result: ExecResult, util: &OsStr, any_failed: &mut bool) -> Option<i32> {
+    match result {
+        // POSIX: an invocation that exits 255 or is terminated by a signal
+        // makes xargs write a diagnostic and stop.
+        ExecResult::Exited(255) => {
+            diag::error(
+                &gettext("{}: exited with status 255; aborting")
+                    .replace("{}", &util.to_string_lossy()),
+            );
+            Some(1)
         }
-    };
+        ExecResult::Signaled(sig) => {
+            diag::error(
+                &gettext("{}: terminated by signal {}")
+                    .replacen("{}", &util.to_string_lossy(), 1)
+                    .replacen("{}", &sig.to_string(), 1),
+            );
+            Some(1)
+        }
+        ExecResult::NotFound => Some(127),
+        ExecResult::CannotInvoke => Some(126),
+        ExecResult::Exited(0) | ExecResult::Skipped => None,
+        ExecResult::Exited(_) => {
+            *any_failed = true;
+            None
+        }
+    }
 }
 
 /// Emit the "argument line too long" diagnostic.
@@ -798,7 +798,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
 
                 invoked = true;
                 let result = exec_util(&args.util, util_args, trace, args.prompt)?;
-                handle_exec_result!(result, any_failed);
+                if let Some(code) = stop_after(result, &args.util, &mut any_failed) {
+                    return Ok(code);
+                }
             }
         }
     } else {
@@ -837,7 +839,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
 
                     invoked = true;
                     let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
-                    handle_exec_result!(result, any_failed);
+                    if let Some(code) = stop_after(result, &args.util, &mut any_failed) {
+                        return Ok(code);
+                    }
                 }
             } else {
                 // Normal mode: batch arguments
@@ -861,7 +865,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
 
                     invoked = true;
                     let result = exec_util(&args.util, util_args, trace, args.prompt)?;
-                    handle_exec_result!(result, any_failed);
+                    if let Some(code) = stop_after(result, &args.util, &mut any_failed) {
+                        return Ok(code);
+                    }
                 }
             }
         }
@@ -889,7 +895,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
 
             invoked = true;
             let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
-            handle_exec_result!(result, any_failed);
+            if let Some(code) = stop_after(result, &args.util, &mut any_failed) {
+                return Ok(code);
+            }
         }
     } else {
         // The last argument read can overflow the batch, so what remains may
@@ -906,7 +914,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
 
             invoked = true;
             let result = exec_util(&args.util, util_args, trace, args.prompt)?;
-            handle_exec_result!(result, any_failed);
+            if let Some(code) = stop_after(result, &args.util, &mut any_failed) {
+                return Ok(code);
+            }
         }
     }
 
@@ -915,7 +925,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
     // mode substitutes per input line, so an empty input means zero runs.)
     if !invoked && !insert_mode && !args.no_run_if_empty {
         let result = exec_util(&args.util, args.util_args.clone(), trace, args.prompt)?;
-        handle_exec_result!(result, any_failed);
+        if let Some(code) = stop_after(result, &args.util, &mut any_failed) {
+            return Ok(code);
+        }
     }
 
     Ok(if any_failed { 1 } else { 0 })

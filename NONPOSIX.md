@@ -450,6 +450,8 @@ table is present.
  * `-or` / `-and` — spellings of `-o` / `-a`.  Forced by debhelper
    (`dh_install`, `dh_installdocs`, `dh_shlibdeps`, and the `-X` exclusions
    of every dh_* tool).
+ * `-not` — a spelling of `!`.  Forced by Debian's perl packaging
+   (`debian/perl.install`, `debian/perl-doc.install`).
  * `-true` / `-false` — primaries that are always true / always false.
    Forced by debhelper (`dh_fixperms` joins every walk with `-a -true`,
    `dh_compress` prunes with `-prune -false`).

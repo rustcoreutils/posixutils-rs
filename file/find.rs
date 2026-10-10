@@ -412,6 +412,12 @@ fn is_and(tok: &OsStr) -> bool {
     tok == "-a" || tok == "-and"
 }
 
+/// Is `tok` the NOT operator? `-not` is GNU's spelling of `!`, forced by
+/// Debian's perl packaging (debian/perl.install, debian/perl-doc.install).
+fn is_not(tok: &OsStr) -> bool {
+    tok == "!" || tok == "-not"
+}
+
 /// Fail unless an operand follows operator `op`, whose operand would start
 /// at `tokens[idx]`. The wording is GNU find's.
 fn expect_operand(tokens: &[&OsStr], idx: usize, op: &OsStr) -> Result<(), String> {
@@ -471,9 +477,10 @@ fn parse_unary_expr(tokens: &[&OsStr], idx: &mut usize) -> Result<Expr, String> 
         return Err("unexpected end of expression".to_string());
     }
 
-    if tokens[*idx] == "!" {
+    if is_not(tokens[*idx]) {
+        let op = tokens[*idx];
         *idx += 1;
-        expect_operand(tokens, *idx, OsStr::new("!"))?;
+        expect_operand(tokens, *idx, op)?;
         let expr = parse_unary_expr(tokens, idx)?;
         return Ok(Expr::Not(Box::new(expr)));
     }

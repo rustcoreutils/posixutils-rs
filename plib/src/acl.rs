@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Access control lists: reading a file's ACLs, and the forms they travel in.
+//! Access control lists: reading a file's ACLs, writing them to a copy, and the forms they
+//! travel in.
 //!
 //! POSIX.2024 has no ACL interface (POSIX.1e was withdrawn); XBD 4.7 leaves room for
 //! "additional or alternate" access mechanisms, and this is the one each system has:
@@ -16,7 +17,7 @@
 //!   `system.cifs_acl`) are kept as the bytes the filesystem hands out (`Native`).
 //! - macOS: NFSv4-style extended ACLs, reached through the libSystem `acl(3)` calls and kept
 //!   in their external form (`acl_copy_ext`).
-//! - Anything else: no ACL is read (EOPNOTSUPP).
+//! - Anything else: no ACL is read or written (EOPNOTSUPP).
 
 use gettextrs::gettext;
 use std::ffi::CStr;
@@ -87,17 +88,21 @@ impl Acl {
     /// native ACL but a trivial NFSv4 one or a CIFS security descriptor -- which every file
     /// there has, so its being there tells nothing.
     pub fn is_trivial(&self) -> bool {
-        let native_trivial = match &self.native {
+        self.access.as_ref().is_none_or(PosixAcl::is_trivial)
+            && self.default.is_none()
+            && self.native_is_trivial()
+    }
+
+    /// Whether its native ACL, if any, says nothing the mode does not (`is_trivial`).
+    fn native_is_trivial(&self) -> bool {
+        match &self.native {
             None => true,
             Some(Native { kind, bytes }) => match kind {
                 NativeKind::Nfs4 => nfs4_is_trivial(bytes),
                 NativeKind::Cifs => true,
                 NativeKind::Darwin => false,
             },
-        };
-        self.access.as_ref().is_none_or(PosixAcl::is_trivial)
-            && self.default.is_none()
-            && native_trivial
+        }
     }
 }
 
@@ -459,9 +464,114 @@ pub fn read_xattr(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Give the file open on `fd` the ACLs `acl`, in place of the ones it has: an ACL `acl` lacks
+/// -- or has only trivially, saying nothing the mode does not -- is removed. Its default ACL is
+/// a directory's only. Each kind of ACL is written only where it is that kind: POSIX ACLs
+/// (Linux xattrs), NFSv4 ones (`system.nfs4_acl`, written back as read), macOS ones (by
+/// `acl_set_fd_np`); anywhere else, or on a filesystem that holds none, the write fails with
+/// EOPNOTSUPP. Not written: a CIFS security descriptor, which every file there has anyway.
+///
+/// `fd` may be an `O_PATH` descriptor, written through `/proc/self/fd/N` as `read_fd` reads one.
+/// Writing an access ACL sets the group bits of the mode to its mask: the caller sets the mode
+/// first, then the ACL, as gnulib's `qcopy_acl` does. Residual: an NFSv4 ACL the destination
+/// already has is not removed when `acl` has none; the mode set before it is what the server
+/// makes of it.
+pub fn write_fd(fd: RawFd, acl: &Acl) -> io::Result<()> {
+    sys::write(fd, acl)
+}
+
+/// Copy the ACLs `acl`, a source's, to the file open on `fd`, its copy, already given the
+/// source's mode (`write_fd`). A filesystem that holds no ACL fails it with EOPNOTSUPP, which
+/// is no failure when the ACLs said nothing the mode does not (`loses_nothing`).
+pub fn copy_to_fd(acl: &Acl, fd: RawFd) -> io::Result<()> {
+    match write_fd(fd, acl) {
+        Err(e) if loses_nothing(acl, &e) => Ok(()),
+        written => written,
+    }
+}
+
+/// Whether the failure `e` to copy the ACLs `acl` loses nothing of them: the destination holds
+/// no ACL at all (EOPNOTSUPP), and `acl` is trivial -- the mode already carried everything.
+pub fn loses_nothing(acl: &Acl, e: &io::Error) -> bool {
+    let unsupported = e
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EOPNOTSUPP || code == libc::ENOTSUP);
+    unsupported && acl.is_trivial()
+}
+
+/// The mode a copy keeps where its source's ACLs `acl` -- `None` where they could not be read
+/// -- could not be set on it, `mode` being the source's: one granting no more than the source
+/// did.
+///
+/// An access ACL's mask shows as the mode's group bits, though the owning group itself may
+/// have had less: its own entry, masked. Without the ACL those bits are the owning group's, so
+/// they become that entry, masked. A native ACL may deny what the mode grants, and ACLs not
+/// read may be anything: the group and other bits are then cleared. A default ACL lost costs
+/// the copy itself nothing.
+pub fn mode_without(acl: Option<&Acl>, mode: u32) -> u32 {
+    let Some(acl) = acl.filter(|acl| acl.native_is_trivial()) else {
+        return mode & !0o077;
+    };
+    let Some(access) = acl.access.as_ref().filter(|a| !a.is_trivial()) else {
+        return mode;
+    };
+    let perm = |tag| {
+        access
+            .entries
+            .iter()
+            .find(|e| e.tag == tag)
+            .map(|e| u32::from(e.perm))
+    };
+    let group = perm(Tag::GroupObj).unwrap_or(0) & perm(Tag::Mask).unwrap_or(7);
+    (mode & !0o070) | (group << 3)
+}
+
+/// The size of a macOS `acl_copy_ext` form's header -- a `kauth_filesec`: magic, owner and
+/// group GUIDs, entry count, flags -- and of each entry after it.
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_HEADER: usize = 44;
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_ENTRY: usize = 24;
+
+/// Fail unless `bytes` hold a whole macOS external ACL, as `acl_copy_int` reads it with no
+/// length: the `kauth_filesec` magic (in either byte order), and every entry its count
+/// (`KAUTH_FILESEC_NOACL` for none) says follows.
+#[cfg(any(target_os = "macos", test))]
+fn check_darwin_external(bytes: &[u8]) -> io::Result<()> {
+    const MAGIC: u32 = 0x012c_c16d;
+    const NO_ACL: u32 = u32::MAX;
+    let bad = || io::Error::from_raw_os_error(libc::EINVAL);
+    let word = |at: usize| -> [u8; 4] { bytes[at..at + 4].try_into().expect("four bytes") };
+    if bytes.len() < DARWIN_HEADER {
+        return Err(bad());
+    }
+    let read: fn([u8; 4]) -> u32 = if u32::from_be_bytes(word(0)) == MAGIC {
+        u32::from_be_bytes
+    } else if u32::from_le_bytes(word(0)) == MAGIC {
+        u32::from_le_bytes
+    } else {
+        return Err(bad());
+    };
+    let count = read(word(36));
+    let entries = if count == NO_ACL {
+        0
+    } else {
+        usize::try_from(count).map_err(|_| bad())?
+    };
+    let need = entries
+        .checked_mul(DARWIN_ENTRY)
+        .and_then(|n| n.checked_add(DARWIN_HEADER))
+        .ok_or_else(bad)?;
+    if bytes.len() < need {
+        return Err(bad());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 mod sys {
-    use super::{absent, Acl, Native, NativeKind, PosixAcl};
+    use super::{absent, nfs4_is_trivial, Acl, Native, NativeKind, PosixAcl};
+    use gettextrs::gettext;
     use std::ffi::{CStr, CString};
     use std::io;
     use std::os::unix::io::RawFd;
@@ -472,16 +582,17 @@ mod sys {
         Path(&'a CStr, bool),
     }
 
-    /// Run `read` on `fd`, or, where `fd` is an `O_PATH` descriptor that refuses it (EBADF),
-    /// on its `/proc/self/fd/N` (`read_fd`).
-    pub fn on_fd<T>(fd: RawFd, read: impl Fn(&Target) -> io::Result<T>) -> io::Result<T> {
-        match read(&Target::Fd(fd)) {
+    /// Run `call` on `fd`, or, where `fd` is an `O_PATH` descriptor that refuses it (EBADF),
+    /// on its `/proc/self/fd/N` (`read_fd`). The first attribute call `call` makes is the one
+    /// refused, so nothing is done twice.
+    pub fn on_fd<T>(fd: RawFd, call: impl Fn(&Target) -> io::Result<T>) -> io::Result<T> {
+        match call(&Target::Fd(fd)) {
             Err(e) if e.raw_os_error() == Some(libc::EBADF) => {
                 crate::madefs::procfs_dir()?;
                 let name = crate::madefs::proc_fd_name(fd);
                 let path = CString::new(format!("/proc/{}", name.to_string_lossy()))
                     .expect("a formatted number has no NUL");
-                read(&Target::Path(&path, true))
+                call(&Target::Path(&path, true))
             }
             other => other,
         }
@@ -572,6 +683,95 @@ mod sys {
             },
         })
     }
+
+    /// Set the attribute `name` of `target` to `value`.
+    fn set(target: &Target, name: &CStr, value: &[u8]) -> io::Result<()> {
+        let (name, ptr, len) = (name.as_ptr(), value.as_ptr().cast(), value.len());
+        let ret = unsafe {
+            match *target {
+                Target::Fd(fd) => libc::fsetxattr(fd, name, ptr, len, 0),
+                Target::Path(p, true) => libc::setxattr(p.as_ptr(), name, ptr, len, 0),
+                Target::Path(p, false) => libc::lsetxattr(p.as_ptr(), name, ptr, len, 0),
+            }
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Remove the attribute `name` of `target`; one it does not have, or cannot have, is
+    /// removed already.
+    fn remove(target: &Target, name: &CStr) -> io::Result<()> {
+        let ret = unsafe {
+            match *target {
+                Target::Fd(fd) => libc::fremovexattr(fd, name.as_ptr()),
+                Target::Path(p, true) => libc::removexattr(p.as_ptr(), name.as_ptr()),
+                Target::Path(p, false) => libc::lremovexattr(p.as_ptr(), name.as_ptr()),
+            }
+        };
+        if ret != 0 {
+            let e = io::Error::last_os_error();
+            if !absent(&e) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// `super::write_fd`.
+    pub fn write(fd: RawFd, acl: &Acl) -> io::Result<()> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        on_fd(fd, |target| {
+            let written = write_to(target, acl, is_dir);
+            // A directory whose ACLs are not the source's must not keep a default ACL that
+            // is not either -- its own, or one inherited -- for what is made in it later.
+            if written.is_err() && is_dir {
+                let _ = remove(target, c"system.posix_acl_default");
+            }
+            written
+        })
+    }
+
+    /// The POSIX ACLs first -- set, or removed where `acl` has none beyond the mode -- then a
+    /// native one, so that one the destination cannot hold fails only once the stale POSIX ones
+    /// are gone. An NFSv4 ACL is written as read, trivial or not, in place of the
+    /// destination's; where the source has none, a destination's own that says more than its
+    /// mode cannot be removed (the NFS client takes no removal) and fails the write, so the
+    /// copy does not pass for the source's.
+    fn write_to(target: &Target, acl: &Acl, is_dir: bool) -> io::Result<()> {
+        let posix = |name: &CStr, acl: Option<&PosixAcl>| match acl {
+            Some(acl) => set(target, name, &acl.to_xattr()),
+            None => remove(target, name),
+        };
+        let access = acl.access.as_ref().filter(|a| !a.is_trivial());
+        posix(c"system.posix_acl_access", access)?;
+        if is_dir {
+            let default = acl.default.as_ref().filter(|a| !a.entries.is_empty());
+            posix(c"system.posix_acl_default", default)?;
+        }
+        match &acl.native {
+            Some(Native {
+                kind: NativeKind::Nfs4,
+                bytes,
+            }) => set(target, c"system.nfs4_acl", bytes),
+            Some(Native {
+                kind: NativeKind::Darwin,
+                ..
+            }) => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            _ => match get(target, c"system.nfs4_acl") {
+                Ok(own) if !nfs4_is_trivial(&own) => Err(io::Error::other(gettext(
+                    "the destination's NFSv4 ACL cannot be removed",
+                ))),
+                Err(e) if !absent(&e) => Err(e),
+                _ => Ok(()),
+            },
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -599,6 +799,13 @@ mod sys {
             size: libc::ssize_t,
         ) -> libc::ssize_t;
         fn acl_free(obj_p: *mut libc::c_void) -> libc::c_int;
+        fn acl_copy_int(buf: *const libc::c_void) -> *mut libc::c_void;
+        fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+        fn acl_set_fd_np(
+            fd: libc::c_int,
+            acl: *mut libc::c_void,
+            acl_type: libc::c_uint,
+        ) -> libc::c_int;
     }
     const ACL_TYPE_EXTENDED: libc::c_uint = 0x0000_0100;
     const ACL_FIRST_ENTRY: libc::c_int = 0;
@@ -636,6 +843,35 @@ mod sys {
         })
     }
 
+    /// `super::write_fd`: the extended ACL `acl` has, or an empty one, which removes the one
+    /// the file has (as `chmod -N` does). macOS has no POSIX ACL to write.
+    pub fn write(fd: RawFd, acl: &Acl) -> io::Result<()> {
+        if acl.access.is_some() || acl.default.is_some() {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+        let made = match &acl.native {
+            None => unsafe { acl_init(0) },
+            Some(Native {
+                kind: NativeKind::Darwin,
+                bytes,
+            }) => {
+                super::check_darwin_external(bytes)?;
+                unsafe { acl_copy_int(bytes.as_ptr().cast()) }
+            }
+            Some(_) => return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+        };
+        if made.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let ret = unsafe { acl_set_fd_np(fd, made, ACL_TYPE_EXTENDED) };
+        let e = io::Error::last_os_error();
+        unsafe { acl_free(made) };
+        if ret != 0 {
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// `acl` in external form, or `None` for one with no entry.
     fn external(acl: *mut libc::c_void) -> io::Result<Option<Vec<u8>>> {
         let mut entry = std::ptr::null_mut();
@@ -662,6 +898,10 @@ mod sys {
     }
 
     pub fn read(_target: &Target) -> io::Result<Acl> {
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
+
+    pub fn write(_fd: RawFd, _acl: &Acl) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
     }
 }
@@ -1030,6 +1270,146 @@ mod tests {
         assert!(native(NativeKind::Cifs).is_trivial());
         assert!(!native(NativeKind::Darwin).is_trivial());
         assert!(Acl::default().is_trivial());
+    }
+
+    /// A failed copy loses nothing only where the destination holds no ACL and the source's
+    /// said nothing the mode does not.
+    #[test]
+    fn which_failed_copies_lose_nothing() {
+        let unsupported = std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+        let notsup = std::io::Error::from_raw_os_error(libc::ENOTSUP);
+        let denied = std::io::Error::from_raw_os_error(libc::EPERM);
+        let trivial = Acl::default();
+        let named = Acl {
+            access: Some(full()),
+            ..Acl::default()
+        };
+        let default_only = Acl {
+            default: Some(full()),
+            ..Acl::default()
+        };
+        assert!(loses_nothing(&trivial, &unsupported));
+        assert!(loses_nothing(&trivial, &notsup));
+        assert!(!loses_nothing(&trivial, &denied));
+        assert!(!loses_nothing(&named, &unsupported));
+        assert!(!loses_nothing(&default_only, &unsupported));
+        let darwin = Acl {
+            native: Some(Native {
+                kind: NativeKind::Darwin,
+                bytes: vec![1],
+            }),
+            ..Acl::default()
+        };
+        assert!(!loses_nothing(&darwin, &unsupported));
+    }
+
+    /// A copy that lost its ACLs grants no more than the source did: the owning group gets its
+    /// own entry, masked, not the mask; a native ACL lost, or ACLs never read, leave the owner
+    /// alone.
+    #[test]
+    fn the_mode_kept_without_the_acls() {
+        let e = |tag, perm| Entry { tag, perm };
+        let named = |group, mask| Acl {
+            access: Some(PosixAcl {
+                entries: vec![
+                    e(Tag::UserObj, 6),
+                    e(Tag::User(65534), 6),
+                    e(Tag::GroupObj, group),
+                    e(Tag::Mask, mask),
+                    e(Tag::Other, 4),
+                ],
+            }),
+            ..Acl::default()
+        };
+        assert_eq!(mode_without(Some(&named(0, 6)), 0o4664), 0o4604);
+        assert_eq!(mode_without(Some(&named(7, 5)), 0o654), 0o654);
+        assert_eq!(mode_without(Some(&named(4, 6)), 0o664), 0o644);
+        assert_eq!(mode_without(Some(&Acl::default()), 0o664), 0o664);
+        let default_only = Acl {
+            default: named(0, 6).access,
+            ..Acl::default()
+        };
+        assert_eq!(mode_without(Some(&default_only), 0o775), 0o775);
+        assert_eq!(mode_without(None, 0o1777), 0o1700);
+        let darwin = Acl {
+            native: Some(Native {
+                kind: NativeKind::Darwin,
+                bytes: vec![1],
+            }),
+            ..Acl::default()
+        };
+        assert_eq!(mode_without(Some(&darwin), 0o755), 0o700);
+    }
+
+    /// A macOS external ACL is taken only whole: its magic, and every entry its count says.
+    #[test]
+    fn darwin_external_form_is_checked_whole() {
+        let form = |magic: u32, count: u32, entries: usize, be: bool| {
+            let word = |w: u32| if be { w.to_be_bytes() } else { w.to_le_bytes() };
+            let mut out = word(magic).to_vec();
+            out.extend([0u8; 32]);
+            out.extend(word(count));
+            out.extend(word(0));
+            out.extend(vec![0u8; entries * DARWIN_ENTRY]);
+            out
+        };
+        const MAGIC: u32 = 0x012c_c16d;
+        for be in [true, false] {
+            assert!(check_darwin_external(&form(MAGIC, 2, 2, be)).is_ok());
+            assert!(check_darwin_external(&form(MAGIC, u32::MAX, 0, be)).is_ok());
+            assert!(check_darwin_external(&form(MAGIC, 3, 2, be)).is_err());
+            assert!(check_darwin_external(&form(MAGIC + 1, 0, 0, be)).is_err());
+        }
+        assert!(check_darwin_external(&[]).is_err());
+        assert!(check_darwin_external(&form(MAGIC, 0, 0, true)[..43]).is_err());
+    }
+
+    /// What `write_fd` writes reads back, through a descriptor and through an `O_PATH` one (the
+    /// procfs route); it replaces what was there, so an ACL the source lacks is removed, and a
+    /// directory's default ACL with it. Skipped where `setfacl` is missing or the filesystem
+    /// takes no ACLs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writes_replace_what_was_there() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let dir = crate::tmp::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::write(&src, "x").unwrap();
+        if !crate::testing::grant_named_acl(&src) {
+            return;
+        }
+        let acl = read_path(&src, true).unwrap();
+        assert!(!acl.is_trivial());
+
+        let dst = dir.path().join("dst");
+        let file = std::fs::File::create(&dst).unwrap();
+        copy_to_fd(&acl, file.as_raw_fd()).unwrap();
+        assert_eq!(read_path(&dst, true).unwrap(), acl);
+        write_fd(file.as_raw_fd(), &Acl::default()).unwrap();
+        assert_eq!(read_path(&dst, true).unwrap(), Acl::default());
+
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let both = std::process::Command::new("setfacl")
+            .args(["-m", "u:65534:rx,d:u:65534:rwx"])
+            .arg(&sub)
+            .status()
+            .unwrap();
+        assert!(both.success());
+        let dir_acl = read_path(&sub, true).unwrap();
+        assert!(dir_acl.access.is_some() && dir_acl.default.is_some());
+        let made = dir.path().join("made");
+        std::fs::create_dir(&made).unwrap();
+        let path = std::ffi::CString::new(made.as_os_str().as_encoded_bytes()).unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        write_fd(fd.as_raw_fd(), &dir_acl).unwrap();
+        assert_eq!(read_path(&made, true).unwrap(), dir_acl);
+        write_fd(fd.as_raw_fd(), &acl).unwrap();
+        let replaced = read_path(&made, true).unwrap();
+        assert_eq!(replaced.access, acl.access);
+        assert!(replaced.default.is_none());
     }
 
     /// The ACLs `setfacl` gives a directory read back, by path and through an `O_PATH`

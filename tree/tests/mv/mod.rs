@@ -19,6 +19,7 @@ use std::os::unix::{
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+mod acl;
 mod race;
 mod verbose;
 

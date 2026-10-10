@@ -232,6 +232,19 @@ dh_installexamples), with GNU cp's meaning:
    quoted as GNU coreutils quotes them.  sysvinit installs with
    `cp -afv etc/* $(DESTDIR)...`.
 
+#### ACLs under `-p`
+
+POSIX leaves the effect of `-p` on additional and alternate access controls
+implementation-defined.  `cp -p` (and `-a`) and `mv` across filesystems give
+the copy the source's ACLs in place of the destination's own: access and,
+for a directory, default ACL; a source without one leaves the copy without
+one, removing what an existing destination had or a new one inherited.  GNU
+cp keeps the destination's named entries, masked by the new mode, which
+gives them the access the source grants its group class -- more than the
+source grants them.  An ACL that cannot be set is diagnosed (cp exits 1, mv
+completes with status 0) unless the source had none beyond its mode, and
+the copy then keeps a mode granting no more than the source did.
+
 #### Existing directories under `-p`
 
 `cp -p` (and `-a`) and `pax -p` give a directory that already existed in the

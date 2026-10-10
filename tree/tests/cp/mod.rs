@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod acl;
 mod debhelper;
 mod dirmode;
 mod existing_dir;

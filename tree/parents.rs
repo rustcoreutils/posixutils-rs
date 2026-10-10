@@ -17,8 +17,8 @@
 
 use crate::common::{
     copy_file, copy_file_at, error_string, finish_made_dir_mode, made_dir_open_error,
-    open_made_dir, preserve_through_fd, report_verbose_bytes, ChainTrust, CopyConfig, CopyRun,
-    InodeMap, MadeDirs, MadeTrust, OperandTrust,
+    open_made_dir, preserve_through_fd, report_verbose_bytes, source_acl, ChainTrust, CopyConfig,
+    CopyRun, InodeMap, MadeDirs, MadeTrust, OperandTrust,
 };
 use gettextrs::gettext;
 use plib::madefs::NamedAnchor;
@@ -35,6 +35,8 @@ use std::rc::Rc;
 struct MadeDir {
     dest: Rc<File>,
     source: std::fs::Metadata,
+    /// The source directory, held for its ACLs (-p): the descriptor `source` came from.
+    source_dir: File,
     /// Where it is, for diagnostics only.
     path: PathBuf,
     /// How far `verify_made_dir` trusts it: -p gives it an owner and mode only in full.
@@ -192,6 +194,7 @@ fn make_parents(
             made.push(MadeDir {
                 dest: Rc::clone(&next_dest),
                 source: src_md,
+                source_dir: next_src.try_clone()?,
                 path: dest_path.clone(),
                 trust: made_trust,
             });
@@ -258,7 +261,7 @@ fn report_made_dir(source: &Path, dest: &Path) {
 
 /// The final attributes of a directory `--parents` made, set once the copy below it is done.
 ///
-/// Under -p: owner, mode and times of its source directory.
+/// Under -p: owner, mode, ACLs and times of its source directory.
 /// The same code as every other -p through a held descriptor (`preserve_through_fd`): set-user-ID
 /// and set-group-ID are dropped when the owner cannot be copied, and a directory trusted only
 /// as owned like its parent gets times but no owner or mode.
@@ -269,7 +272,8 @@ fn report_made_dir(source: &Path, dest: &Path) {
 fn finish_dir(dir: &MadeDir, preserve: bool, umask: u32) -> io::Result<()> {
     let fd = dir.dest.as_raw_fd();
     if preserve {
-        preserve_through_fd(fd, &dir.source, &dir.path, dir.trust)
+        let acl = || source_acl(dir.source_dir.as_raw_fd());
+        preserve_through_fd(fd, &dir.source, acl, &dir.path, dir.trust)
     } else {
         finish_made_dir_mode(fd, &dir.source, umask, &dir.path)
     }

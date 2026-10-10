@@ -11,6 +11,7 @@ use super::pinned::{CopiedSources, PinnedEntry, SourceState};
 use super::{error_string, quote, Verbose};
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
+use plib::acl::Acl;
 pub use plib::madefs::ChainTrust;
 pub use plib::madefs::MadeTrust;
 #[cfg(target_os = "linux")]
@@ -638,6 +639,10 @@ enum CopyResult {
     Skipped,
 }
 
+/// A regular file just copied: the source read, open still, with its `fstat` from before the
+/// read, and the destination written.
+type CopiedData = (fs::File, fs::Metadata, fs::File);
+
 /// A non-directory this copy made.
 struct CopiedFile {
     /// `(st_dev, st_ino)` of what was made, when known for certain (`FirstCopy::made`).
@@ -693,16 +698,124 @@ fn preserve_mode_error(target: &Path, e: &io::Error) -> io::Error {
     ))
 }
 
-/// -p through a descriptor cp holds for the destination it created or opened: times, then
-/// owner, then mode. Nothing is resolved by name, so a file renamed over the destination after
-/// cp opened it is never touched. The mode (set-user-ID included) is applied last, only to a
-/// file whose owner is already final.
+/// The -p failure to give the copy the source's ACLs, in GNU cp's words.
+fn preserve_acl_error(target: &Path, e: &io::Error) -> io::Error {
+    io::Error::other(gettext!(
+        "preserving permissions for '{}': {}",
+        target.display(),
+        error_string(e)
+    ))
+}
+
+/// The ACLs of the source open on `fd`, the descriptor its data or metadata came from, for -p.
+/// Where none can be read at all (EOPNOTSUPP: a system no ACL is read on), it has none to
+/// lose.
+pub fn source_acl(fd: libc::c_int) -> io::Result<Acl> {
+    match plib::acl::read_fd(fd) {
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(Acl::default()),
+        read => read,
+    }
+}
+
+/// The ACLs of the directory or special file the walk recorded at `source` (`source_acl`),
+/// read through a descriptor of its own, required to be the very file recorded -- its
+/// `(st_dev, st_ino)` and type -- as `fresh_source_md` requires its metadata to be.
 ///
-/// For an object trusted only as `ParentOwnerOnly` the times are applied and the owner and
-/// mode are not: that is reported (`owner_unverified_error`).
+/// A directory is opened for reading, and its ACLs read with plain `f*xattr` calls, which need
+/// no procfs. One cp cannot read (EACCES) is, on Linux, pinned `O_PATH` instead, as a special
+/// file always is there: that needs no permission on the file and opens no device or FIFO, and
+/// its attributes are read through its `self/fd/N` under a verified procfs
+/// (`plib::acl::read_fd`); without one nothing is read, and -p reports that. Elsewhere a
+/// special file's ACLs are never read (`preserve_made_node`).
+fn entry_acl(source: &ftw::Entry) -> io::Result<Acl> {
+    let changed = || io::Error::other(gettext!("'{}' changed during the copy", source.path()));
+    let recorded = source.metadata().ok_or_else(changed)?;
+    // The walk recorded a followed link's referent; open the same thing.
+    let follow = source.is_symlink() == Some(true) && !recorded.is_symlink();
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+    let open = |flags| open_fd_at(source.dir_fd(), source.file_name(), flags | nofollow);
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    #[cfg(target_os = "linux")]
+    let fd = {
+        let pin = || open(libc::O_PATH | libc::O_CLOEXEC);
+        if recorded.file_type() != ftw::FileType::Directory {
+            pin()
+        } else {
+            match open(dir_flags) {
+                Err(e) if e.raw_os_error() == Some(libc::EACCES) => pin(),
+                opened => opened,
+            }
+        }
+    }?;
+    #[cfg(not(target_os = "linux"))]
+    let fd = open(dir_flags)?;
+    let md = fd_metadata(fd.as_raw_fd())?;
+    if (md.dev(), md.ino()) != (recorded.dev(), recorded.ino())
+        || !same_file_type(md.file_type(), recorded.file_type())
+    {
+        return Err(changed());
+    }
+    source_acl(fd.as_raw_fd())
+}
+
+/// Give the copy open on `fd` the source's mode `mode` and ACLs, through `chmod`, which sets
+/// the mode of the file `fd` is open on.
+///
+/// The ACLs are read by `acl` only now, and set in place of the copy's own, or removed where
+/// the source has none (`plib::acl::copy_to_fd`). Until they are, the copy may hold ACL
+/// entries the source does not -- its old ones, or ones a new file inherited from its parent's
+/// default ACL -- whose permission is capped by the mask, the mode's group bits; so the group
+/// and other bits are cleared first, and the mode is given in full only once the ACLs are the
+/// source's (or the access ACL has set those bits itself, to the same).
+///
+/// One that cannot be set is a -p failure -- unless the copy loses nothing by it
+/// (`plib::acl::loses_nothing`) -- and then the copy keeps a mode granting no more than the
+/// source did (`plib::acl::mode_without`): the mode's group bits are a mask the source's
+/// owning group need not have had.
+fn set_mode_and_acl(
+    chmod: impl Fn(libc::mode_t) -> io::Result<()>,
+    fd: libc::c_int,
+    mode: libc::mode_t,
+    acl: impl FnOnce() -> io::Result<Acl>,
+    target: &Path,
+) -> io::Result<()> {
+    // Cast needed: `mode_t` is u16 on macOS, u32 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let (mode, owner_only) = (mode as u32, (mode as u32) & !0o077);
+    let set_mode =
+        |mode: u32| chmod(mode as libc::mode_t).map_err(|e| preserve_mode_error(target, &e));
+    set_mode(owner_only)?;
+    let (written, kept) = match acl() {
+        Ok(acl) => match plib::acl::copy_to_fd(&acl, fd) {
+            Ok(()) => (Ok(()), mode),
+            Err(e) => (Err(e), plib::acl::mode_without(Some(&acl), mode)),
+        },
+        Err(e) => (Err(e), plib::acl::mode_without(None, mode)),
+    };
+    set_mode(kept)?;
+    written.map_err(|e| preserve_acl_error(target, &e))
+}
+
+/// `fchmod(fd, mode)`.
+fn fchmod(fd: libc::c_int, mode: libc::mode_t) -> io::Result<()> {
+    if unsafe { libc::fchmod(fd, mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// -p through a descriptor cp holds for the destination it created or opened: times, then
+/// owner, then mode and the ACLs the source has (`acl`, `set_mode_and_acl`). Nothing is resolved
+/// by name, so a file renamed over the destination after cp opened it is never touched. The
+/// mode (set-user-ID included) and the ACLs, which can grant more than it, are applied last,
+/// only to a file whose owner is already final.
+///
+/// For an object trusted only as `ParentOwnerOnly` the times are applied and the owner, mode
+/// and ACLs are not: that is reported (`owner_unverified_error`).
 pub fn preserve_through_fd(
     fd: libc::c_int,
     source_md: &impl MetadataExt,
+    acl: impl FnOnce() -> io::Result<Acl>,
     target: &Path,
     trust: MadeTrust,
 ) -> io::Result<()> {
@@ -716,10 +829,8 @@ pub fn preserve_through_fd(
     // A failure to duplicate the owner is not itself reported (POSIX leaves it unspecified);
     // its consequence is the mode below.
     let chown_ok = unsafe { libc::fchown(fd, source_md.uid(), source_md.gid()) } == 0;
-    if unsafe { libc::fchmod(fd, preserved_mode(source_md, chown_ok)) } != 0 {
-        return Err(preserve_mode_error(target, &io::Error::last_os_error()));
-    }
-    Ok(())
+    let mode = preserved_mode(source_md, chown_ok);
+    set_mode_and_acl(|mode| fchmod(fd, mode), fd, mode, acl, target)
 }
 
 /// The mode a directory cp made without -p ends with (POSIX cp 2.g): the source's nine file
@@ -755,8 +866,8 @@ pub fn finish_made_dir_mode(
 }
 
 /// A destination directory's attributes, once its contents are copied so nothing written into
-/// it moves its times afterwards: under -p the source's owner, mode and times on one this copy
-/// made, and on one it found only where nobody else could have created its name
+/// it moves its times afterwards: under -p the source's owner, mode, ACLs and times on one this
+/// copy made, and on one it found only where nobody else could have created its name
 /// (`found_dir_trust`); without -p the final mode of one this copy made
 /// (`finish_made_dir_mode`), and nothing on one it found. Applied through `fd`, the descriptor
 /// the copy has held for the directory since it entered it, never by name. The source's
@@ -784,8 +895,8 @@ fn finish_dir(
         .ok_or_else(|| io::Error::other(gettext!("cannot stat '{}'", source.path())))?;
     if preserve {
         // A directory made but trusted only as owned like its parent gets no owner and no
-        // mode.
-        preserve_through_fd(fd, source_md, target, trust)
+        // mode. Its ACLs, the default one included, are read once it is filled.
+        preserve_through_fd(fd, source_md, || entry_acl(source), target, trust)
     } else {
         finish_made_dir_mode(fd, source_md, umask, target)
     }
@@ -820,6 +931,11 @@ fn fresh_source_md(source: &ftw::Entry) -> io::Result<ftw::Metadata> {
 /// the residual is a replacement between that check and the call. A symbolic link's own mode
 /// is never set: Linux has none to set, and no access check reads it anywhere.
 ///
+/// A special file's ACLs (`acl`) follow its mode on Linux, set through the pin's `self/fd/N`
+/// (`plib::acl::write_fd`), as GNU cp sets them; a symbolic link has none. Elsewhere they are
+/// not copied: nothing pins the node there, and reading or setting them goes by name or opens
+/// the file -- a residual, the copy keeping the mode alone.
+///
 /// The parent's owner is read from `dirfd` itself (`.` relative to it resolves no name). An
 /// operand resolved from the working directory has no parent descriptor, so only an object
 /// owned by cp's effective user is accepted there.
@@ -828,6 +944,7 @@ fn preserve_made_node(
     name: &CStr,
     made_type: ftw::FileType,
     source_md: &ftw::Metadata,
+    acl: impl FnOnce() -> io::Result<Acl>,
     target: &Path,
 ) -> io::Result<()> {
     let parent_uid = if dirfd == libc::AT_FDCWD {
@@ -850,7 +967,7 @@ fn preserve_made_node(
             ))),
         }
     };
-    preserve_node_attributes(dirfd, name, made_type, check, source_md, target)
+    preserve_node_attributes(dirfd, name, made_type, check, source_md, acl, target)
 }
 
 #[cfg(target_os = "linux")]
@@ -860,6 +977,7 @@ fn preserve_node_attributes(
     made_type: ftw::FileType,
     check: impl Fn(u32, u64, bool, FsOwners) -> io::Result<MadeTrust>,
     source_md: &ftw::Metadata,
+    acl: impl FnOnce() -> io::Result<Acl>,
     target: &Path,
 ) -> io::Result<()> {
     let fd = unsafe {
@@ -909,8 +1027,8 @@ fn preserve_node_attributes(
         )
     } == 0;
     if made_type != ftw::FileType::SymbolicLink {
-        chmod_pinned(fd, preserved_mode(source_md, chown_ok))
-            .map_err(|e| preserve_mode_error(target, &e))?;
+        let mode = preserved_mode(source_md, chown_ok);
+        set_mode_and_acl(|mode| chmod_pinned(fd, mode), fd, mode, acl, target)?;
     }
     Ok(())
 }
@@ -959,8 +1077,11 @@ fn preserve_node_attributes(
     made_type: ftw::FileType,
     check: impl Fn(u32, u64, bool, FsOwners) -> io::Result<MadeTrust>,
     source_md: &ftw::Metadata,
+    acl: impl FnOnce() -> io::Result<Acl>,
     target: &Path,
 ) -> io::Result<()> {
+    // The ACLs are not copied here (`preserve_made_node`).
+    drop(acl);
     let made = ftw::Metadata::new(dirfd, name, false)?;
     // Without the filesystem type, owners are taken to be stored: only cp's own are trusted.
     let trust = check(
@@ -1296,9 +1417,9 @@ where
             } else {
                 libc::O_EXCL
             };
-        // Returns the source's metadata from before the read, and the new destination, still
-        // open; or `None` for a -n skip.
-        let create_target_then_copy = || -> io::Result<Option<(fs::Metadata, fs::File)>> {
+        // Returns the source, its metadata from before the read, and the new destination, all
+        // still open; or `None` for a -n skip.
+        let create_target_then_copy = || -> io::Result<Option<CopiedData>> {
             let (mut source_file, source_before_read) =
                 open_source(source, source_md, source_open_flags)?;
 
@@ -1349,7 +1470,7 @@ where
             // 3.d
             io::copy(&mut source_file, &mut target_file)?;
 
-            Ok(Some((source_before_read, target_file)))
+            Ok(Some((source_file, source_before_read, target_file)))
         };
 
         // -n: any existing destination, a dangling link included, is left alone.
@@ -1543,7 +1664,7 @@ where
             ));
         }
 
-        let (source_before_read, target_file) = if replacing_existing {
+        let (source_file, source_before_read, target_file) = if replacing_existing {
             if target_is_dir {
                 let err_str = gettext!(
                     "cannot overwrite directory '{}' with non-directory '{}'",
@@ -1613,7 +1734,7 @@ where
                 }
 
                 io::copy(&mut source_file, &mut target_file)?;
-                (source_before_read, target_file)
+                (source_file, source_before_read, target_file)
             } else {
                 // 3.a.iii
                 if cfg.force {
@@ -1658,12 +1779,14 @@ where
 
         // -p through the descriptor just written, before it is closed; the source's metadata
         // from the fstat of the descriptor that was then read, taken before the read moved its
-        // access time (GNU keeps the original access time too).
+        // access time (GNU keeps the original access time too), and its ACLs from that same
+        // descriptor.
         let preserve_error = if cfg.preserve {
             // The file is cp's own: created with O_EXCL, or the very file the decision checked.
             preserve_through_fd(
                 target_file.as_raw_fd(),
                 &source_before_read,
+                || source_acl(source_file.as_raw_fd()),
                 target,
                 MadeTrust::Full,
             )
@@ -1991,7 +2114,10 @@ fn preserve_made(
     }
     let name = unsafe { CStr::from_ptr(target_filename) };
     fresh_source_md(source)
-        .and_then(|source_md| preserve_made_node(target_dirfd, name, made_type, &source_md, target))
+        .and_then(|source_md| {
+            let acl = || entry_acl(source);
+            preserve_made_node(target_dirfd, name, made_type, &source_md, acl, target)
+        })
         .err()
 }
 
@@ -2820,6 +2946,7 @@ mod tests {
         let result = preserve_through_fd(
             target_file.as_raw_fd(),
             &source_md,
+            || -> std::io::Result<plib::acl::Acl> { panic!("the ACLs were read") },
             &target,
             MadeTrust::ParentOwnerOnly,
         );

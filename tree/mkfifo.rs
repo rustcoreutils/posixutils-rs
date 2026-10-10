@@ -52,7 +52,18 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Resul
         None
     };
 
-    let res = unsafe { libc::mkfifo(c_path.as_ptr(), mode_val as libc::mode_t) };
+    // Off Linux the FIFO is pinned to set its mode by a real open, for reading
+    // (`pin_made_fifo`), which its owner must be allowed: it is made with the owner's read
+    // permission lent, which giving it the mode `-m` names then takes back.
+    #[cfg(not(target_os = "linux"))]
+    let made_mode = if explicit_mode {
+        mode_val | 0o400
+    } else {
+        mode_val
+    };
+    #[cfg(target_os = "linux")]
+    let made_mode = mode_val;
+    let res = unsafe { libc::mkfifo(c_path.as_ptr(), made_mode as libc::mode_t) };
 
     // Restore the original umask if we changed it
     if let Some(umask) = old_umask {

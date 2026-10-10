@@ -187,3 +187,20 @@ fn test_mkfifo_newline_rejected() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// `-m` gives exactly the mode it names, one denying the owner reading included, with a
+/// set-user-ID bit `mkfifo(2)` may not take. Off Linux the FIFO is opened for reading to have
+/// its mode set, which a mode without owner read used to refuse (EACCES); macOS CI runs that
+/// path, Linux sets the mode through an `O_PATH` pin.
+#[cfg(unix)]
+#[test]
+fn mkfifo_m_gives_a_mode_without_owner_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    for (mode, name) in [("4222", "a"), ("0222", "b"), ("0200", "c")] {
+        let path = fifo_in(&dir, name);
+        run_mkfifo_test(vec!["-m", mode, &path], 0);
+        let got = fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(format!("{got:04o}"), mode, "mkfifo -m {mode}");
+    }
+}

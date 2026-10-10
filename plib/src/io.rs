@@ -129,6 +129,9 @@ fn set_created_mode(file: &fs::File, parent: BorrowedFd<'_>) -> io::Result<()> {
     let default = match crate::acl::read_fd(parent.as_raw_fd()) {
         Ok(acl) => acl.default,
         Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
+        // A directory only searched (`write_atomic_with`), on a system with no procfs to
+        // read its attributes through: taken to have no default ACL, as before any was read.
+        Err(e) if crate::xattr::no_procfs_route(&e) => None,
         Err(e) => return Err(e),
     };
     #[cfg(not(target_os = "linux"))]
@@ -178,12 +181,7 @@ fn write_atomic_with(
         .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
     let name = c_string(name.as_bytes())?;
     let parent = c_string(parent_of(path).as_os_str().as_bytes())?;
-    let flags = crate::madefs::SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    let dirfd = unsafe { libc::open(parent.as_ptr(), flags) };
-    if dirfd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let dir = unsafe { OwnedFd::from_raw_fd(dirfd) };
+    let dir = open_parent(&parent)?;
 
     // Made in the same directory as `path` so the final rename stays within
     // one filesystem and is atomic.
@@ -201,6 +199,30 @@ fn write_atomic_with(
     }
     tmp.renamed = true;
     Ok(())
+}
+
+/// Open the directory `parent` to make a file in: for reading, so that its default ACL is
+/// read with plain `fgetxattr` and no procfs is needed; or, where it may be searched but not
+/// read (EACCES), search-only (`madefs::SEARCH_ONLY`), its ACL then read through procfs where
+/// there is one (`set_created_mode`).
+#[cfg(unix)]
+fn open_parent(parent: &std::ffi::CStr) -> io::Result<OwnedFd> {
+    let open = |access: libc::c_int| {
+        let fd = unsafe {
+            libc::open(
+                parent.as_ptr(),
+                access | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        match fd {
+            -1 => Err(io::Error::last_os_error()),
+            fd => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        }
+    };
+    match open(libc::O_RDONLY) {
+        Err(e) if e.raw_os_error() == Some(libc::EACCES) => open(crate::madefs::SEARCH_ONLY),
+        opened => opened,
+    }
 }
 
 /// A temporary file made 0600 and `O_EXCL` under a fresh name in the directory
@@ -673,5 +695,65 @@ mod tests {
             crate::testing::mode_and_acl(&path),
             "660 user::rw- user:65534:rwx group::r-x mask::rw- other::---"
         );
+    }
+
+    /// Without `/proc` -- here, every attribute read by path refused as a `/proc/self/fd/N`
+    /// that is not there would be -- a file is still created, and `0o666` less the umask:
+    /// the directory's default ACL is read through a descriptor that needs no procfs. Run in
+    /// a child process of its own, which the seccomp filter is installed in.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn write_atomic_creates_without_procfs() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "PLIB_WRITE_ATOMIC_NO_PROCFS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "io::tests::write_atomic_creates_without_procfs",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            crate::testing::seccomp::refuse_path_xattr_reads(&mut command);
+            let out = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "child: {stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let umask = crate::modestr::umask();
+        let dir = crate::tmp::tempdir().unwrap();
+        let path = dir.path().join("new.bin");
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o666 & !umask);
+    }
+
+    /// A directory that may be searched but not read (0300) still takes a new file: its
+    /// default ACL is read through a search-only descriptor where a readable one is refused.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_creates_in_an_unreadable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = crate::tmp::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o300)).unwrap();
+        let written = write_atomic(&sub.join("new.bin"), b"new");
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        written.unwrap();
+        assert_eq!(fs::read(sub.join("new.bin")).unwrap(), b"new");
     }
 }

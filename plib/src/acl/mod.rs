@@ -1131,37 +1131,34 @@ mod tests {
     }
 
     /// The set-ID bits are withheld from a copy whose native ACL lets anyone but the owner
-    /// change it -- decided from the archived text, as pax decides it -- and kept otherwise. A
-    /// native ACL not read for certain may let anyone.
+    /// change it, and kept otherwise. A native ACL not read for certain may let anyone.
+    ///
+    /// Decided on the NFSv4 form of the archived text, which reads the same on every system:
+    /// on macOS `native_from_ace_text` makes an extended ACL of it instead, which has no place
+    /// for `owner@`, `group@` and `everyone@` entries, so the special-only grants below come
+    /// out granting nobody anything (`darwin_special_grants_are_dropped`).
     #[test]
     fn setid_bits_withheld_where_others_may_change_the_file() {
-        let from_text = |text: &str, mode: u32| {
-            let native = native_from_ace_text(text, mode).unwrap_or_else(|_| {
-                // Elsewhere than Linux the text is made into this system's kind, or fails;
-                // the decision is the same on the XDR.
-                Some(Native {
-                    kind: NativeKind::Nfs4,
-                    bytes: Nfs4Acl::from_ace_text(text).unwrap().to_xdr(),
-                })
-            });
-            Acl {
-                native,
-                ..Acl::default()
-            }
+        let from_text = |text: &str| Acl {
+            native: Some(Native {
+                kind: NativeKind::Nfs4,
+                bytes: Nfs4Acl::from_ace_text(text).unwrap().to_xdr(),
+            }),
+            ..Acl::default()
         };
         let named_write = "user:3999999001:w::allow:3999999001";
-        assert!(setid_withheld(&from_text(named_write, 0o4755), 0o4755));
-        assert!(setid_withheld(&from_text(named_write, 0o2755), 0o2755));
-        assert!(!setid_withheld(&from_text(named_write, 0o755), 0o755));
+        assert!(setid_withheld(&from_text(named_write), 0o4755));
+        assert!(setid_withheld(&from_text(named_write), 0o2755));
+        assert!(!setid_withheld(&from_text(named_write), 0o755));
         for text in ["group@:p::allow,owner@:rwx::allow", "everyone@:C::allow"] {
-            assert!(setid_withheld(&from_text(text, 0o4755), 0o4755), "{text}");
+            assert!(setid_withheld(&from_text(text), 0o4755), "{text}");
         }
         for text in [
             "user:3999999001:w::deny:3999999001",
             "user:3999999001:rx::allow:3999999001",
             "owner@:rwxpCo::allow,user:3999999001:r::allow:3999999001",
         ] {
-            assert!(!setid_withheld(&from_text(text, 0o4755), 0o4755), "{text}");
+            assert!(!setid_withheld(&from_text(text), 0o4755), "{text}");
         }
         let unread = Acl {
             native: Some(Native {
@@ -1172,6 +1169,22 @@ mod tests {
         };
         assert!(setid_withheld(&unread, 0o4755));
         assert!(!setid_withheld(&Acl::default(), 0o4755));
+    }
+
+    /// On macOS a flagless allow for `owner@`, `group@` or `everyone@` is left out of the
+    /// extended ACL made from archived text, the mode carrying what it says
+    /// (`Nfs4Acl::specials_said_by_mode`): the ACL that is left lets nobody else change the
+    /// file, so a set-ID bit is kept.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_special_grants_are_dropped() {
+        for text in ["group@:p::allow,owner@:rwx::allow", "everyone@:C::allow"] {
+            let acl = Acl {
+                native: native_from_ace_text(text, 0o4755).unwrap(),
+                ..Acl::default()
+            };
+            assert!(!setid_withheld(&acl, 0o4755), "{text}");
+        }
     }
 
     /// An `everyone@` deny of what the mode grants others says more than the mode -- gnulib

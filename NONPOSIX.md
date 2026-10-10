@@ -225,6 +225,9 @@ dh_installexamples), with GNU cp's meaning:
  * `--reflink=auto` — accepted, and files are copied normally: `auto` asks
    for a copy-on-write clone only where one is available, so an ordinary copy
    is always a correct result.  Any other `--reflink` form is refused.
+ * `-t directory` — every operand is a source, copied into `directory`,
+   which must be an existing directory.  Forced by debputy, which
+   materializes every package with `cp --reflink=auto -t DIR FILE...`.
  * `--parents` — the destination of each source is the target directory
    followed by the source's path, and missing directories on that path are
    made from the source's (with `-p`, their owner, mode and times too).  The

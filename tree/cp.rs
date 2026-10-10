@@ -103,6 +103,11 @@ struct Args {
     #[arg(long, help = gettext("Append each source path to the target directory, creating missing directories"))]
     parents: bool,
 
+    /// GNU: every operand is a source, copied into this directory.
+    /// debputy materializes packages with `cp --reflink=auto -t DIR FILE...`.
+    #[arg(short = 't', value_name = "DIRECTORY", help = gettext("Copy every operand into DIRECTORY"))]
+    target_directory: Option<PathBuf>,
+
     #[arg(short, long, help = gettext("Write the name of each file copied and directory made"))]
     verbose: bool,
 
@@ -173,14 +178,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = plib::optarg::parse::<Args>();
 
-    if args.files.len() < 2 {
+    let min_operands = if args.target_directory.is_some() {
+        1
+    } else {
+        2
+    };
+    if args.files.len() < min_operands {
         eprintln!("{}", gettext("Must supply a source and target for copy"));
         std::process::exit(1);
     }
 
     // split sources and target
-    let sources = &args.files[0..args.files.len() - 1];
-    let target = &args.files[args.files.len() - 1];
+    let (sources, target) = match &args.target_directory {
+        Some(dir) => {
+            // -t names a directory that must exist: nothing is copied to a
+            // name that is not one.
+            let not_dir = match fs::metadata(dir) {
+                Ok(md) if md.is_dir() => None,
+                Ok(_) => Some(io::Error::from_raw_os_error(libc::ENOTDIR)),
+                Err(e) => Some(e),
+            };
+            if let Some(e) = not_dir {
+                eprintln!(
+                    "cp: {}",
+                    gettext!("target directory '{}': {}", dir.display(), error_string(&e))
+                );
+                std::process::exit(1);
+            }
+            (&args.files[..], dir)
+        }
+        None => (
+            &args.files[0..args.files.len() - 1],
+            &args.files[args.files.len() - 1],
+        ),
+    };
 
     // choose mode based on whether target is a directory
     let dir_exists = {

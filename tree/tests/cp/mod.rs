@@ -9,6 +9,7 @@
 
 mod acl;
 mod debhelper;
+mod debputy;
 mod dirmode;
 mod existing_dir;
 mod inherit;

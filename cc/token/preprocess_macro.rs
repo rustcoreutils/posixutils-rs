@@ -110,6 +110,17 @@ pub(super) struct MacroCall {
     pub(super) close_hide: Option<HashSet<String>>,
 }
 
+/// One operand of the replacement list, as [`Preprocessor::paste_operand`]
+/// emits it.
+struct PasteOperand {
+    /// The operand's tokens: one body token, or an argument as written.
+    tokens: Vec<Token>,
+    /// The spacing the operand stood with in the macro body.
+    whitespace: bool,
+    /// Whether a `##` stands between it and the operand before it.
+    after_paste: bool,
+}
+
 impl<'a> Preprocessor<'a> {
     /// Resolve one `defined` operator: `defined X` or `defined ( X )`.
     ///
@@ -1079,6 +1090,10 @@ impl<'a> Preprocessor<'a> {
 
         let mut result = Vec::new();
         let mut i = 0;
+        // Whether the left operand of the `##` being processed produced no
+        // tokens -- C17 6.10.3.3p2's placemarker -- and, if so, the spacing it
+        // stood with, which the right operand inherits.
+        let mut placemarker: Option<bool> = None;
 
         while i < mac.body.len() {
             let mt = &mac.body[i];
@@ -1119,8 +1134,12 @@ impl<'a> Preprocessor<'a> {
                         continue;
                     }
                     // The group's content stands only when there are variadic
-                    // arguments; otherwise skip past its end entirely.
+                    // arguments; otherwise skip past its end entirely. An
+                    // empty group is a placemarker to a `##` after it.
                     if empty {
+                        if !prev_was_paste {
+                            placemarker = Some(mt.whitespace);
+                        }
                         i = *end;
                         continue;
                     }
@@ -1143,6 +1162,7 @@ impl<'a> Preprocessor<'a> {
                         args.get(*idx).cloned().unwrap_or_default()
                     };
                     let text = self.stringify_arg(&arg, idents);
+                    placemarker = None;
                     // The result is one token of the expansion, not the
                     // invocation: it takes the `#` operator's spacing, and it
                     // never starts a line. Copying `*pos` verbatim gave a
@@ -1162,19 +1182,14 @@ impl<'a> Preprocessor<'a> {
                     let arg_start = result.len();
 
                     if next_is_paste || prev_was_paste {
-                        // Don't expand for token pasting
-                        if prev_was_paste && !result.is_empty() {
-                            // Paste with previous token
-                            let prev = result.pop().unwrap();
-                            let pasted = self.paste_tokens(&prev, &arg, pos, idents);
-                            result.extend(pasted);
-                        } else {
-                            // Raw argument tokens, straight from the file. An
-                            // argument may span lines, and a token that still
-                            // says it begins one would be read back as
-                            // starting a directive.
-                            result.extend(arg.into_iter().map(clear_newline));
-                        }
+                        // An operand of `##` is the argument as written,
+                        // not macro-replaced (C17 6.10.3.1p1).
+                        let operand = PasteOperand {
+                            tokens: arg,
+                            whitespace: mt.whitespace,
+                            after_paste: prev_was_paste,
+                        };
+                        self.paste_operand(&mut result, operand, &mut placemarker, pos, idents);
                     } else {
                         // Expand the argument once, however many times the body
                         // names the parameter. C17 6.10.3.1p1 replaces a
@@ -1224,6 +1239,20 @@ impl<'a> Preprocessor<'a> {
                     // Variadic arguments
                     let start = mac.params.len();
 
+                    if next_is_paste || prev_was_paste {
+                        // As an operand of `##`, `__VA_ARGS__` is the whole
+                        // variadic sequence as written: its first token
+                        // pastes onto what is before it, its last onto what is
+                        // after, and an empty one is a placemarker.
+                        let operand = PasteOperand {
+                            tokens: Self::join_variadic_args(args, commas, start),
+                            whitespace: mt.whitespace,
+                            after_paste: prev_was_paste,
+                        };
+                        self.paste_operand(&mut result, operand, &mut placemarker, pos, idents);
+                        i += 1;
+                        continue;
+                    }
                     let va_start = result.len();
                     for (j, arg) in args.iter().enumerate().skip(start) {
                         if j > start {
@@ -1235,25 +1264,20 @@ impl<'a> Preprocessor<'a> {
                             };
                             result.push(comma);
                         }
-                        if next_is_paste || prev_was_paste {
-                            result.extend(arg.clone());
-                        } else {
-                            let expanded = self.preprocess(arg.clone(), idents);
-                            for mut tok in expanded {
-                                if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd)
-                                {
-                                    continue;
-                                }
-                                // Keep each token's own spacing. Overwriting
-                                // it with the macro body's position gave every
-                                // argument a leading space, so `X(1,2,3)`
-                                // expanded to `1 , 2 , 3`.
-                                let whitespace = tok.pos.whitespace;
-                                tok.pos = *pos;
-                                tok.pos.newline = false;
-                                tok.pos.whitespace = whitespace;
-                                result.push(tok);
+                        let expanded = self.preprocess(arg.clone(), idents);
+                        for mut tok in expanded {
+                            if matches!(tok.typ, TokenType::StreamBegin | TokenType::StreamEnd) {
+                                continue;
                             }
+                            // Keep each token's own spacing. Overwriting
+                            // it with the macro body's position gave every
+                            // argument a leading space, so `X(1,2,3)`
+                            // expanded to `1 , 2 , 3`.
+                            let whitespace = tok.pos.whitespace;
+                            tok.pos = *pos;
+                            tok.pos.newline = false;
+                            tok.pos.whitespace = whitespace;
+                            result.push(tok);
                         }
                     }
                     // The sequence as a whole is spaced as `__VA_ARGS__` was
@@ -1266,15 +1290,12 @@ impl<'a> Preprocessor<'a> {
                 }
                 _ => {
                     let token = self.macro_token_to_token(mt, pos, idents);
-
-                    if prev_was_paste && !result.is_empty() {
-                        // Paste with previous token
-                        let prev = result.pop().unwrap();
-                        let pasted = self.paste_tokens(&prev, &[token], pos, idents);
-                        result.extend(pasted);
-                    } else {
-                        result.push(token);
-                    }
+                    let operand = PasteOperand {
+                        whitespace: token.pos.whitespace,
+                        tokens: vec![token],
+                        after_paste: prev_was_paste,
+                    };
+                    self.paste_operand(&mut result, operand, &mut placemarker, pos, idents);
                 }
             }
 
@@ -1309,6 +1330,49 @@ impl<'a> Preprocessor<'a> {
         }
 
         Some(filtered)
+    }
+
+    /// Emit one operand of the replacement list onto `result`, pasting it
+    /// onto the token before it when a `##` stands between them.
+    ///
+    /// C17 6.10.3.3p2: an operand that is an empty argument is a placemarker.
+    /// `placemarker ## x` is `x`, and `x ## placemarker` is `x`, so a paste
+    /// whose left operand was empty must leave the token before it alone --
+    /// `{ mod##INC` with `mod` empty is `{ INC`, not a paste of `{` and `INC`.
+    /// `placemarker` carries that state from one operand to the next, with
+    /// the spacing the empty operand stood with, which gcc gives to the
+    /// operand that takes its place.
+    fn paste_operand(
+        &self,
+        result: &mut Vec<Token>,
+        operand: PasteOperand,
+        placemarker: &mut Option<bool>,
+        pos: &Position,
+        idents: &mut IdentTable,
+    ) {
+        let PasteOperand {
+            mut tokens,
+            whitespace,
+            after_paste,
+        } = operand;
+        if after_paste && placemarker.is_none() {
+            if let Some(prev) = result.pop() {
+                result.extend(self.paste_tokens(&prev, &tokens, pos, idents));
+                return;
+            }
+        }
+        let stood_with = match *placemarker {
+            Some(ws) if after_paste => ws,
+            _ => whitespace,
+        };
+        *placemarker = tokens.is_empty().then_some(stood_with);
+        if let Some(first) = tokens.first_mut() {
+            first.pos.whitespace = stood_with;
+        }
+        // Raw argument tokens, straight from the file. An argument may span
+        // lines, and a token that still says it begins one would be read
+        // back as starting a directive.
+        result.extend(tokens.into_iter().map(clear_newline));
     }
 
     fn paste_tokens(

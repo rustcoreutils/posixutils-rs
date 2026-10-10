@@ -889,6 +889,42 @@ fn test_token_paste_function_macro_suffix() {
     assert!(strs.contains(&"my_func".to_string()));
 }
 
+/// C17 6.10.3.3p2: an empty argument next to `##` is a placemarker, so the
+/// paste never reaches the token before the operand.
+#[test]
+fn test_token_paste_empty_operand_is_placemarker() {
+    let input = "#define C(mod, v) { mod##INC(v); }\n\
+                 #define CAT3(a, b, c) < a ## b ## c >\n\
+                 C(, v) CAT3(, , ) CAT3(, b, ) CAT3(a, , c)\n";
+    crate::diag::capture_diagnostics();
+    let (tokens, idents) = preprocess_str(input);
+    let diags = crate::diag::take_captured_diagnostics();
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        get_token_strings(&tokens, &idents).join(" "),
+        "{ INC ( v ) ; } < > < b > < ac >"
+    );
+}
+
+/// `name ## __VA_ARGS__` pastes the first variadic token onto `name`, and
+/// `__VA_ARGS__ ## name` the last; an empty `__VA_ARGS__` is a placemarker.
+/// The GNU `, ## __VA_ARGS__` still elides the comma.
+#[test]
+fn test_token_paste_va_args() {
+    let input = "#define SEL(...) [ name ## __VA_ARGS__ ]\n\
+                 #define SUF(...) [ __VA_ARGS__ ## suffix ]\n\
+                 #define E(f, ...) g(f, ## __VA_ARGS__)\n\
+                 SEL() SEL(_a, b) SUF() SUF(a, my_) E(x) E(x, 1)\n";
+    crate::diag::capture_diagnostics();
+    let (tokens, idents) = preprocess_str(input);
+    let diags = crate::diag::take_captured_diagnostics();
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        get_token_strings(&tokens, &idents).join(" "),
+        "[ name ] [ name_a , b ] [ suffix ] [ a , my_suffix ] g ( x ) g ( x , 1 )"
+    );
+}
+
 #[test]
 fn test_token_paste_creates_identifier() {
     // Pasting should create a new identifier that can be used
@@ -2493,6 +2529,15 @@ fn test_assembly_leaves_unknown_directives_alone() {
     assert!(lines.is_empty(), "{lines:?}");
 }
 
+/// gcc's alternate keyword spellings are keywords, not macros: they reach
+/// the parser as written, `#ifdef` does not see them, and a program's own
+/// `#define inline ...` does not reach `__inline`.
+/// `-fgnu89-inline` predefines `__GNUC_GNU_INLINE__` and not
+/// `__GNUC_STDC_INLINE__`; the default is the other way round.
+/// In assembly a `#` line that names no directive -- a number among them --
+/// is passed through, macro-replaced, as gcc's `-lang-asm` does: never a
+/// linemarker, so it neither renumbers the lines after it nor joins the next
+/// line onto the one before.
 /// C17 6.10.1p4 evaluates `#if` in `intmax_t`, where signed overflow is
 /// undefined. gcc's default pedwarn "integer overflow in preprocessor
 /// expression" covers `+`, `-`, `*`, `/`, unary `-` and a signed left shift

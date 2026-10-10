@@ -785,6 +785,62 @@ pub fn grant_named_acl(path: &Path) -> bool {
     granted
 }
 
+/// What `default_acl_text` shows of the default ACL `set_default_acl` gives a directory.
+#[cfg(unix)]
+pub const DEFAULT_ACL_TEXT: &str = "default:user::rwx default:user:65534:rwx \
+     default:group::r-x default:mask::rwx default:other::---";
+
+/// Give the directory `dir` a default ACL granting uid 65534 (nobody) rwx, the owning group r-x
+/// and others nothing, with a mask of rwx, with `setfacl`. On Linux what is made in it takes
+/// the access ACL that default masked by the mode the creating call asks for, and the umask
+/// plays no part. `false`, with a note, as for `grant_named_acl`.
+#[cfg(unix)]
+pub fn set_default_acl(dir: &Path) -> bool {
+    let set = Command::new("setfacl")
+        .args(["-d", "-m", "u:65534:rwx,g::r-x,m::rwx,o::---"])
+        .arg(dir)
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !set {
+        eprintln!("note: setfacl is missing or this filesystem takes no ACLs; case skipped");
+    }
+    set
+}
+
+/// The permission bits of `path` in octal, then its ACLs as `getfacl` prints them, numeric and
+/// without the effective rights, one entry after another on a line: `750 user::rwx
+/// user:65534:rwx group::r-x mask::r-x other::---`.
+#[cfg(unix)]
+pub fn mode_and_acl(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let mode = std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let out = Command::new("getfacl")
+        .args(["-cpnE"])
+        .arg(path)
+        .output()
+        .expect("getfacl runs where setfacl did");
+    assert!(out.status.success(), "getfacl {}", path.display());
+    let acl = String::from_utf8(out.stdout).unwrap();
+    let entries: Vec<&str> = acl.split_whitespace().collect();
+    format!("{mode:o} {}", entries.join(" "))
+}
+
+/// Run `program` with `args` in `dir` under the umask `umask`, set by a shell in between so
+/// that this process's own, which every test thread shares, is left alone.
+#[cfg(unix)]
+pub fn run_under_umask(program: &Path, args: &[&str], dir: &Path, umask: u32) -> Output {
+    Command::new("sh")
+        .args(["-c", "umask \"$0\" && exec \"$@\""])
+        .arg(format!("{umask:03o}"))
+        .arg(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("sh runs")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_until_full, TempFile};

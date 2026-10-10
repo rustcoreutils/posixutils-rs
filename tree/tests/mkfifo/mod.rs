@@ -8,6 +8,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod acl;
+
 use plib::testing::{run_test_with_checker, TestPlan};
 use plib::tmp::{tempdir, TempDir};
 use std::fs;

@@ -668,6 +668,15 @@ Debian source packages, with GNU patch's meaning:
    volume.  Written in ustar format only, and incompatible with `-z`.
  * `-p` on a directory that already existed follows the rule under
    [cp, existing directories under `-p`](#existing-directories-under--p).
+ * `-p p` and `-p e` give each member its archived mode and no ACL beyond
+   it, as GNU tar `--acls -p` does with an archive that records none: the ACL
+   a new member inherited from its directory's default ACL is removed, and so
+   are the access and default ACLs of an existing directory pax is allowed to
+   give its mode -- the rule of
+   [cp, ACLs under `-p`](#acls-under--p).  Without `-p p` a member is made by
+   the normal file-creation action, so on Linux under a default ACL it takes
+   the ACL inherited from that, masked by its archived mode, and the umask
+   plays no part.
  * `-x bcpio`, `-x sv4cpio`, `-x sv4crc` — the historic pax names for the old
    binary cpio header and the SVR4 "newc" headers without and with a data
    checksum.  POSIX names only `cpio` (odc), `pax` and `ustar`.  All three are

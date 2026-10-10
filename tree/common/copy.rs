@@ -833,20 +833,42 @@ pub fn preserve_through_fd(
     set_mode_and_acl(|mode| fchmod(fd, mode), fd, mode, acl, target)
 }
 
-/// The mode a directory cp made without -p ends with (POSIX cp 2.g): the source's nine file
-/// permission bits less the umask, in place of the S_IRWXU-widened ones 2.e created it with.
-/// Every bit above those nine stays as `made` has it -- the sticky bit `mkdirat` applied, a
-/// set-group-ID bit inherited from its parent -- as GNU cp leaves them.
-fn made_dir_mode(made: u32, source: u32, umask: u32) -> u32 {
-    (made & 0o7000) | (source & 0o777 & !umask)
+/// The mode a directory cp made without -p is to be made with, as if `mkdir` had made it so
+/// (POSIX cp 2.g), in place of the S_IRWXU-widened one 2.e created it with: the source's nine
+/// file permission bits less `withheld` (`finish_made_dir_mode`), the umask then applied as
+/// `mkdir` applies it. Every bit above those nine stays as `made` has it -- the sticky bit
+/// `mkdirat` applied, a set-group-ID bit inherited from its parent -- as GNU cp leaves them.
+fn made_dir_mode(made: u32, source: u32, withheld: u32) -> u32 {
+    (made & 0o7000) | (source & 0o777 & !withheld)
 }
 
-/// POSIX cp 2.g without -p, for a directory cp made, once its contents are copied: set its
-/// mode (`made_dir_mode`) through the descriptor cp holds for it, never by name. Nothing is
-/// changed when the mode is already right.
+/// The mode cp makes a directory with without -p, to fill it before it is finished
+/// (`finish_made_dir_mode`): its source's permission bits less group and other write, as GNU
+/// makes it, OR'ed with S_IRWXU (POSIX cp 2.e).
+pub fn made_dir_interim_mode(source: u32) -> libc::mode_t {
+    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let mode = (source & 0o7777 & !0o022) as libc::mode_t;
+    mode | libc::S_IRWXU
+}
+
+/// The bits of a source directory's mode GNU cp -R withholds from the directory it makes in
+/// its place, under the umask `umask`: it makes the directory without the source's group and
+/// other write permission, and gives those back only where the umask allows them. Under a
+/// default ACL, where the umask applies to nothing else, that shows.
+fn withheld_by_cp_r(umask: u32) -> u32 {
+    0o022 & umask
+}
+
+/// POSIX cp 2.g without -p, for a directory cp made, once its contents are copied: give it
+/// what `mkdir` with the source's mode less `withheld` (`made_dir_mode`) would have -- that
+/// less the umask, or, under the default ACL it inherited, the access ACL that default gives
+/// (`plib::acl::set_made_dir_mode`) -- through the descriptor cp holds for it, never by name.
+/// The mode is not set again when it is already right.
 pub fn finish_made_dir_mode(
     fd: libc::c_int,
     source_md: &impl MetadataExt,
+    withheld: u32,
     umask: u32,
     target: &Path,
 ) -> io::Result<()> {
@@ -858,11 +880,14 @@ pub fn finish_made_dir_mode(
         ))
     };
     let made = fd_metadata(fd).map_err(|e| set_mode_error(&e))?.mode() & 0o7777;
-    let wanted = made_dir_mode(made, source_md.mode(), umask);
-    if wanted != made && unsafe { libc::fchmod(fd, wanted as libc::mode_t) } != 0 {
-        return Err(set_mode_error(&io::Error::last_os_error()));
-    }
-    Ok(())
+    let wanted = made_dir_mode(made, source_md.mode(), withheld);
+    let chmod = |mode: u32| {
+        if mode == made {
+            return Ok(());
+        }
+        fchmod(fd, mode as libc::mode_t)
+    };
+    plib::acl::set_made_dir_mode(fd, wanted, umask, chmod).map_err(|e| set_mode_error(&e))
 }
 
 /// A destination directory's attributes, once its contents are copied so nothing written into
@@ -898,7 +923,7 @@ fn finish_dir(
         // mode. Its ACLs, the default one included, are read once it is filled.
         preserve_through_fd(fd, source_md, || entry_acl(source), target, trust)
     } else {
-        finish_made_dir_mode(fd, source_md, umask, target)
+        finish_made_dir_mode(fd, source_md, withheld_by_cp_r(umask), umask, target)
     }
 }
 
@@ -1352,12 +1377,16 @@ where
                 // (2.g; under -p, the source's without the umask) is set by `finish_dir` once
                 // its contents are copied. Under -p it is made owner-only: until `finish_dir`
                 // duplicates the owner, the directory belongs to whoever ran cp, and group or
-                // other write permission would let others plant entries in it.
+                // other write permission would let others plant entries in it. Without -p it
+                // is made, as GNU makes it, without the source's group and other write
+                // permission too, which `finish_dir` gives back where the umask allows: under a
+                // default ACL the mode is the ACL's mask, and the directory is then no wider
+                // while it is filled than when it is finished.
                 let mode = if cfg.preserve {
                     libc::S_IRWXU
                 } else {
                     // OR'ed with S_IRWXU according to the spec
-                    source_md.mode() as libc::mode_t | libc::S_IRWXU
+                    made_dir_interim_mode(source_md.mode())
                 };
                 let ret = libc::mkdirat(target_dirfd, target_filename, mode);
 
@@ -3019,6 +3048,55 @@ mod tests {
         let x = fs::metadata(dest.join("x")).unwrap();
         assert_eq!(x.mode() & 0o7777, 0o750);
         assert!(dest.join("x/f").exists() && dest.join("x/g").exists());
+    }
+
+    std::thread_local! {
+        /// The mode `record_interim_mode` saw.
+        static INTERIM_MODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn record_interim_mode(fd: libc::c_int) {
+        use std::os::unix::fs::MetadataExt;
+        let mode = super::fd_metadata(fd).unwrap().mode() & 0o7777;
+        INTERIM_MODE.with(|m| m.set(mode));
+    }
+
+    /// cp -R without -p makes a directory as GNU does, without the source's group and other
+    /// write permission (and with S_IRWXU, to fill it): under a default ACL, whose mask that
+    /// mode sets, it is never wider while being filled than the mode it ends with.
+    #[test]
+    fn a_made_directory_is_filled_without_group_write() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("s/x")).unwrap();
+        fs::write(dir.join("s/x/f"), b"data").unwrap();
+        fs::set_permissions(dir.join("s/x"), fs::Permissions::from_mode(0o775)).unwrap();
+        let dest = dir.join("dest");
+        fs::create_dir(&dest).unwrap();
+        if !plib::testing::set_default_acl(&dest) {
+            return;
+        }
+        let cfg = super::CopyConfig {
+            preserve: false,
+            ..cp_pr_config()
+        };
+        super::BEFORE_FINISHING_OWN.with(|hook| hook.set(Some(record_interim_mode)));
+        let copied = super::copy_file(
+            &cfg,
+            &dir.join("s/x"),
+            &dest.join("x"),
+            super::OperandTrust::Parent,
+            &mut super::CopyRun::default(),
+            None,
+            |_| false,
+        );
+        super::BEFORE_FINISHING_OWN.with(|hook| hook.set(None));
+        assert!(copied.is_ok(), "{copied:?}");
+        // The default ACL's mask r-x, as the mode 0755 makes it; not rwx.
+        assert_eq!(INTERIM_MODE.with(|m| m.get()), 0o750);
     }
 
     /// The anchor of a found operand is the directory its name is in only while that name is

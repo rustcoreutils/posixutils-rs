@@ -1562,16 +1562,20 @@ mod tests {
         assert!(!rename_member(&mut linked(EntryType::Hardlink), &drop_b, 0));
     }
 
-    /// Without explicit `-p p`/`-p e` the mode a made node ends up with is
-    /// the archived mode masked by the umask (normal file-creation action);
-    /// with preservation the exact archived mode is restored.
+    /// Without explicit `-p p`/`-p e` a made node keeps the mode its creating
+    /// call gave it, the archived mode with the umask or a default ACL applied
+    /// (normal file-creation action) -- here 0o640 -- and the archived mode is
+    /// not applied again over it; with preservation the exact archived mode is
+    /// restored.
     #[test]
-    fn test_set_permissions_umask_vs_preserve() {
+    fn test_set_permissions_created_vs_preserve() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = plib::tmp::TempDir::new().unwrap();
         let path = tmp.path().join("member");
         let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o640) }, 0);
+        // Whatever this process's umask took off.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
 
         // Attributes are applied relative to an open parent directory.
         let dir = std::fs::File::open(tmp.path()).unwrap();
@@ -1590,7 +1594,7 @@ mod tests {
                 & 0o7777
         };
 
-        // Not preserved: 0o777 & ~0o022 == 0o755.
+        // Not preserved: as created.
         let opts = ReadOptions {
             preserve_perms: false,
             preserve_mtime: false,
@@ -1607,7 +1611,7 @@ mod tests {
             &mut Making::new(false),
         )
         .unwrap();
-        assert_eq!(mode(), 0o755);
+        assert_eq!(mode(), 0o640);
 
         // Preserved: exact 0o777 regardless of umask.
         let opts = ReadOptions {

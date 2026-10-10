@@ -696,7 +696,9 @@ fn copy_special_file(
     use std::os::unix::fs::FileTypeExt;
 
     let ft = metadata.file_type();
-    let perm = (metadata.mode() & 0o7777) as libc::mode_t;
+    // The normal file-creation action, never a set-id bit (`creation_mode`):
+    // those, and under -p p the exact mode, come with the attributes below.
+    let perm = policy_of(options).creation_mode(&attrs_of(metadata)) as libc::mode_t;
     let made_type = metadata.mode() as libc::mode_t & libc::S_IFMT;
 
     let created = if ft.is_fifo() {
@@ -737,9 +739,10 @@ fn copy_special_file(
         return Ok(());
     }
 
-    // mkfifoat and mknodat both apply the process umask, so the mode they were
-    // given is not necessarily the mode on disk; and neither carries ownership
-    // or times. Extraction restores all three here, so a copy must too --
+    // mkfifoat and mknodat both apply the process umask (or a default ACL), the
+    // normal file-creation action, so under -p p the mode they were given is
+    // not necessarily the mode on disk; and neither carries ownership, times or
+    // set-id bits. Extraction restores those here, so a copy must too --
     // through the node just made, never by name.
     set_made_node_attrs(
         dirfd,

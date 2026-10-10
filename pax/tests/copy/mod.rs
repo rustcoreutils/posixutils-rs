@@ -480,6 +480,42 @@ fn test_copy_mode_restores_fifo_mode() {
     );
 }
 
+/// Without -p a FIFO is made by the normal file-creation action: its nine
+/// permission bits less the umask, and never the set-user-ID bit of a source
+/// owned by whoever that is -- the copy belongs to the user running pax.
+#[cfg(unix)]
+#[test]
+fn test_copy_mode_drops_a_fifos_set_id_bit_without_p() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let dst_dir = temp.path().join("dest");
+    fs::create_dir(&src_dir).unwrap();
+    fs::create_dir(&dst_dir).unwrap();
+
+    let fifo = src_dir.join("pipe");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+        eprintln!("Skipping FIFO test: mkfifo failed");
+        return;
+    }
+    fs::set_permissions(&fifo, fs::Permissions::from_mode(0o4766)).unwrap();
+
+    let pax = plib::testing::get_binary_path("pax");
+    let output = plib::testing::run_under_umask(
+        &pax,
+        &["-r", "-w", "source", dst_dir.to_str().unwrap()],
+        temp.path(),
+        0o022,
+    );
+    assert_success(&output, "copy a FIFO");
+
+    let got = fs::symlink_metadata(dst_dir.join("source").join("pipe")).unwrap();
+    assert_eq!(got.permissions().mode() & 0o7777, 0o744);
+}
+
 /// A directory whose archived mode denies write or search permission must still
 /// receive its contents: the mode belongs on the directory only once the
 /// subtree below it exists. Applying it at creation time made every child fail

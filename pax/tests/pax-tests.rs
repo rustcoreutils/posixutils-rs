@@ -9,6 +9,7 @@
 
 mod common;
 
+mod acl;
 mod append;
 mod archive;
 mod compression;

@@ -16,9 +16,9 @@
 //! descriptors.
 
 use crate::common::{
-    copy_file, copy_file_at, error_string, finish_made_dir_mode, made_dir_open_error,
-    open_made_dir, preserve_through_fd, report_verbose_bytes, source_acl, ChainTrust, CopyConfig,
-    CopyRun, InodeMap, MadeDirs, MadeTrust, OperandTrust,
+    copy_file, copy_file_at, error_string, finish_made_dir_mode, made_dir_interim_mode,
+    made_dir_open_error, open_made_dir, preserve_through_fd, report_verbose_bytes, source_acl,
+    ChainTrust, CopyConfig, CopyRun, InodeMap, MadeDirs, MadeTrust, OperandTrust,
 };
 use gettextrs::gettext;
 use plib::madefs::NamedAnchor;
@@ -153,15 +153,15 @@ fn make_parents(
         }
         let src_md = next_src.metadata()?;
 
-        // Owner search and write are needed to fill the directory; without -p the umask
-        // applies as it does to cp -R, and `finish_dir` takes back the owner bits the source
-        // lacks. Under -p it is made owner-only, and `finish_dir` sets
+        // Owner search and write are needed to fill the directory; without -p it is made as
+        // cp -R makes one, the umask applying (`made_dir_interim_mode`), and `finish_dir`
+        // gives it its final mode. Under -p it is made owner-only, and `finish_dir` sets
         // the exact mode through its descriptor once the owner is duplicated: until then it
         // belongs to whoever ran cp, and must not let others plant entries in it.
         let mode = if preserve {
             libc::S_IRWXU
         } else {
-            (src_md.mode() & 0o7777) as libc::mode_t | libc::S_IRWXU
+            made_dir_interim_mode(src_md.mode())
         };
         let created = unsafe { libc::mkdirat(dest_dir.as_raw_fd(), name.as_ptr(), mode) } == 0;
         if !created {
@@ -266,8 +266,9 @@ fn report_made_dir(source: &Path, dest: &Path) {
 /// and set-group-ID are dropped when the owner cannot be copied, and a directory trusted only
 /// as owned like its parent gets times but no owner or mode.
 ///
-/// Without -p it gets its source's permission bits less the umask (`finish_made_dir_mode`),
-/// taking back the S_IRWXU `make_parents` added. POSIX has no --parents; this is the mode GNU
+/// Without -p it gets its source's permission bits as `mkdir` would give them there -- less the
+/// umask, or under a default ACL (`finish_made_dir_mode`) -- taking back the S_IRWXU
+/// `make_parents` added. POSIX has no --parents; this is the mode GNU
 /// cp gives these directories, and the one POSIX cp 2.g gives a directory `cp -R` makes.
 fn finish_dir(dir: &MadeDir, preserve: bool, umask: u32) -> io::Result<()> {
     let fd = dir.dest.as_raw_fd();
@@ -275,7 +276,8 @@ fn finish_dir(dir: &MadeDir, preserve: bool, umask: u32) -> io::Result<()> {
         let acl = || source_acl(dir.source_dir.as_raw_fd());
         preserve_through_fd(fd, &dir.source, acl, &dir.path, dir.trust)
     } else {
-        finish_made_dir_mode(fd, &dir.source, umask, &dir.path)
+        // GNU cp makes these with the source's whole mode (`withheld_by_cp_r` is cp -R's).
+        finish_made_dir_mode(fd, &dir.source, 0, umask, &dir.path)
     }
 }
 

@@ -7,8 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// open file, or stdin
@@ -71,9 +77,12 @@ pub fn input_reader(
 /// content intact or, on success, the new content fully visible.
 ///
 /// If `path` already exists, the new file inherits its mode (`st_mode &
-/// 0o7777`). If it does not, the file is created `0o666 & ~umask`, which is
-/// what XCU 1.1.1.4 requires of a utility that creates a file. On Windows the
-/// mode is the read-only attribute (see [`crate::perm`]).
+/// 0o7777`). If it does not, it gets what XCU 1.1.1.4 requires of a utility
+/// that creates a file: what creating it with `0o666` would give it, which is
+/// `0o666 & ~umask` -- or, on Linux in a directory with a default ACL, the
+/// access ACL inherited from that default masked by `0o666`, the umask playing
+/// no part. On Windows the mode is the read-only attribute (see
+/// [`crate::perm`]).
 ///
 /// The mode has to be set explicitly because the temporary this writes through
 /// is created `O_EXCL|0600` — deliberately, since it is world-visible in the
@@ -83,17 +92,18 @@ pub fn input_reader(
 /// Used by utilities like `ar` that rewrite a binary in place
 /// where a partial write would corrupt the artifact on disk.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mode = match fs::metadata(path) {
-        Ok(meta) => crate::perm::mode_of(&meta.permissions()),
+    match fs::metadata(path) {
+        Ok(meta) => write_atomic_mode(path, bytes, crate::perm::mode_of(&meta.permissions())),
         // Only "there is no file here" means a file is being created. Every
         // other stat failure is reported rather than read as absence: an
         // `Err(_)` arm would take, say, EACCES on a path component or ENOTDIR
         // on a parent as "missing" and go on to pick a mode for a file it
         // could not have looked at.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => crate::perm::new_file_mode(),
-        Err(e) => return Err(e),
-    };
-    write_atomic_mode(path, bytes, mode)
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            write_atomic_with(path, bytes, set_created_mode)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// `write_atomic`, with the resulting file's mode named outright.
@@ -102,12 +112,162 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// rather than deriving it — `crontab` writes the spool copy `0600` whether or
 /// not one was already there.
 pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    use std::io::Write;
+    write_atomic_with(path, bytes, |file, _| {
+        let mut perm = file.metadata()?.permissions();
+        crate::perm::set_mode(&mut perm, mode);
+        file.set_permissions(perm)
+    })
+}
 
-    let parent = path
-        .parent()
+/// Give `file`, the temporary just made in the directory `parent`, what
+/// creating it there with `0o666` would have (`write_atomic`). Only Linux has
+/// default ACLs to inherit; they are read through `parent`, the descriptor the
+/// temporary was made and is renamed through.
+#[cfg(unix)]
+fn set_created_mode(file: &fs::File, parent: BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let default = match crate::acl::read_fd(parent.as_raw_fd()) {
+        Ok(acl) => acl.default,
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
+        Err(e) => return Err(e),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let default = {
+        let _ = parent;
+        None
+    };
+    let fd = file.as_raw_fd();
+    crate::acl::set_created_mode(fd, default, 0o666, crate::modestr::umask(), |mode| {
+        // Cast needed: `mode_t` is u16 on macOS and u32 on Linux.
+        crate::madefs::cvt(unsafe { libc::fchmod(fd, mode as libc::mode_t) })
+    })
+}
+
+/// Windows has no umask and no default ACL to inherit from: a new file is an
+/// ordinary writable one (`perm::new_file_mode`).
+#[cfg(windows)]
+fn set_created_mode(file: &fs::File, _parent: &Path) -> io::Result<()> {
+    let mut perm = file.metadata()?.permissions();
+    crate::perm::set_mode(&mut perm, crate::perm::new_file_mode());
+    file.set_permissions(perm)
+}
+
+/// The directory `path` is in: `.` for a bare name.
+fn parent_of(path: &Path) -> &Path {
+    path.parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// `write_atomic`, giving the temporary its mode with `set_mode`, which takes
+/// it and the directory it was made in.
+///
+/// The directory is opened once, and the temporary is made in it, given its
+/// mode and renamed over `path` all through that descriptor: every step acts
+/// on the one directory, whatever happens to its path meanwhile.
+#[cfg(unix)]
+fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    set_mode: impl FnOnce(&fs::File, BorrowedFd<'_>) -> io::Result<()>,
+) -> io::Result<()> {
+    let c_string =
+        |bytes: &[u8]| CString::new(bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL));
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let name = c_string(name.as_bytes())?;
+    let parent = c_string(parent_of(path).as_os_str().as_bytes())?;
+    let flags = crate::madefs::SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let dirfd = unsafe { libc::open(parent.as_ptr(), flags) };
+    if dirfd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dir = unsafe { OwnedFd::from_raw_fd(dirfd) };
+
+    // Made in the same directory as `path` so the final rename stays within
+    // one filesystem and is atomic.
+    let mut tmp = TempAt::new(dir.as_fd())?;
+    tmp.file.write_all(bytes)?;
+    tmp.file.sync_all()?;
+
+    // Before the rename, so the file is never visible at `path` under the
+    // temporary's 0600.
+    set_mode(&tmp.file, dir.as_fd())?;
+
+    let (dirfd, from, to) = (dir.as_raw_fd(), tmp.name.as_ptr(), name.as_ptr());
+    if unsafe { libc::renameat(dirfd, from, dirfd, to) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    tmp.renamed = true;
+    Ok(())
+}
+
+/// A temporary file made 0600 and `O_EXCL` under a fresh name in the directory
+/// `dir`, removed from it again when dropped unless it was renamed.
+#[cfg(unix)]
+struct TempAt<'a> {
+    dir: BorrowedFd<'a>,
+    name: CString,
+    file: fs::File,
+    renamed: bool,
+}
+
+#[cfg(unix)]
+impl<'a> TempAt<'a> {
+    fn new(dir: BorrowedFd<'a>) -> io::Result<Self> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let flags = libc::O_WRONLY
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_NOFOLLOW
+            | libc::O_NOCTTY
+            | libc::O_CLOEXEC;
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        for n in 0..100u32 {
+            let name = format!(".tmp{}.{seed:x}.{n}", std::process::id());
+            let name = CString::new(name).expect("no NUL in a formatted name");
+            let mode: libc::c_uint = 0o600;
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, mode) };
+            if fd >= 0 {
+                let file = unsafe { fs::File::from_raw_fd(fd) };
+                let renamed = false;
+                return Ok(TempAt {
+                    dir,
+                    name,
+                    file,
+                    renamed,
+                });
+            }
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EEXIST) {
+                return Err(e);
+            }
+        }
+        Err(io::Error::from_raw_os_error(libc::EEXIST))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempAt<'_> {
+    fn drop(&mut self) {
+        if !self.renamed {
+            unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0) };
+        }
+    }
+}
+
+/// `write_atomic`, giving the temporary its mode with `set_mode`, which takes
+/// it and the directory it was made in.
+#[cfg(windows)]
+fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    set_mode: impl FnOnce(&fs::File, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = parent_of(path);
     // Tempfile is created in the same directory as `path` so the final
     // `rename(2)` stays within one filesystem and is atomic.
     let mut tmp = crate::tmp::NamedTempFile::new_in(parent)?;
@@ -116,17 +276,9 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
 
     // Before the rename, so the file is never visible at `path` under the
     // temporary's 0600.
-    let mut perm = tmp.as_file().metadata()?.permissions();
-    crate::perm::set_mode(&mut perm, mode);
-    tmp.as_file().set_permissions(perm)?;
+    set_mode(tmp.as_file(), parent)?;
 
     replace_with(tmp, path)
-}
-
-/// Rename `tmp` over `path`, replacing whatever is there.
-#[cfg(unix)]
-fn replace_with(tmp: crate::tmp::NamedTempFile, path: &Path) -> io::Result<()> {
-    tmp.persist(path).map(drop).map_err(|e| e.error)
 }
 
 /// Rename `tmp` over `path`, replacing whatever is there.
@@ -503,5 +655,23 @@ mod tests {
         // Wine will not delete a read-only file; clear it for the TempDir.
         crate::perm::set_mode(&mut perm, 0o644);
         fs::set_permissions(&path, perm).unwrap();
+    }
+
+    /// A file created in a directory with a default ACL takes what `creat(2)` would give it
+    /// there: the default masked by 0666, the umask playing no part -- not 0666 less the umask
+    /// set over the ACL its temporary inherited, which let others read it.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_creates_a_file_under_the_default_acl() {
+        let dir = crate::tmp::tempdir().unwrap();
+        if !crate::testing::set_default_acl(dir.path()) {
+            return;
+        }
+        let path = dir.path().join("new.bin");
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(
+            crate::testing::mode_and_acl(&path),
+            "660 user::rw- user:65534:rwx group::r-x mask::rw- other::---"
+        );
     }
 }

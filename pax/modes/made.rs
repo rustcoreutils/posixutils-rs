@@ -181,6 +181,17 @@ mod linux {
             chmod_pinned(self.fd.as_raw_fd(), mode)
         }
 
+        /// The node's status, through the pin.
+        pub(crate) fn stat(&self) -> io::Result<libc::stat> {
+            fstat(self.fd.as_raw_fd())
+        }
+
+        /// The descriptor its ACLs are read and written through: the pin
+        /// (`plib::acl::write_fd` takes an `O_PATH` one).
+        pub(crate) fn acl_fd(&self) -> Option<libc::c_int> {
+            Some(self.fd.as_raw_fd())
+        }
+
         /// `utimensat` with `AT_EMPTY_PATH` (Linux 5.8 and later). Before
         /// that -- on EINVAL from that call, and only then -- a FIFO or device
         /// through `/proc/self/fd`, which names exactly the pinned inode. A
@@ -332,6 +343,27 @@ mod other {
                     let (dirfd, name) = (dirfd.as_raw_fd(), name.as_ptr());
                     cvt(unsafe { libc::fchmodat(dirfd, name, mode, flags) })
                 }
+            }
+        }
+
+        /// The node's status, through the descriptor, or by name once the name
+        /// is seen still to hold it.
+        pub(crate) fn stat(&self) -> io::Result<libc::stat> {
+            match self.held {
+                Held::Fd(ref fd) => fstat(fd.as_raw_fd()),
+                Held::Name { dirfd, name, .. } => {
+                    self.still_made()?;
+                    lstat_at(dirfd.as_raw_fd(), name)
+                }
+            }
+        }
+
+        /// The descriptor its ACLs are read and written through; `None` for a
+        /// node held by name.
+        pub(crate) fn acl_fd(&self) -> Option<libc::c_int> {
+            match self.held {
+                Held::Fd(ref fd) => Some(fd.as_raw_fd()),
+                Held::Name { .. } => None,
             }
         }
 

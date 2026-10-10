@@ -130,6 +130,29 @@ impl PosixAcl {
             .all(|e| matches!(e.tag, Tag::UserObj | Tag::GroupObj | Tag::Other))
     }
 
+    /// What a file made with the permission bits `mode` in a directory whose default ACL this
+    /// is takes, by Linux's `posix_acl_create`: this ACL with the owner's, the mask's (the owning
+    /// group's, where there is no mask) and others' entries masked by the matching bits of
+    /// `mode`, and the permission bits that then show it. The umask plays no part.
+    pub fn inherited(&self, mode: u32) -> (PosixAcl, u32) {
+        let has_mask = self.entries.iter().any(|e| e.tag == Tag::Mask);
+        let mut acl = self.clone();
+        let mut bits = 0;
+        for e in &mut acl.entries {
+            let shift = match e.tag {
+                Tag::UserObj => 6,
+                Tag::Mask => 3,
+                Tag::GroupObj if !has_mask => 3,
+                Tag::Other => 0,
+                _ => continue,
+            };
+            // At most `rwx`: three bits.
+            e.perm &= ((mode >> shift) & 7) as u8;
+            bits |= u32::from(e.perm) << shift;
+        }
+        (acl, bits)
+    }
+
     /// Whether it names a user or group besides the owner and owning group.
     fn names_others(&self) -> bool {
         self.entries
@@ -524,6 +547,53 @@ pub fn mode_without(acl: Option<&Acl>, mode: u32) -> u32 {
     };
     let group = perm(Tag::GroupObj).unwrap_or(0) & perm(Tag::Mask).unwrap_or(7);
     (mode & !0o070) | (group << 3)
+}
+
+/// Give the file open on `fd`, which this process made in a directory whose default ACL is
+/// `default` (`None`: one with none) and has since held at a mode of its own, the permissions
+/// creating it there with `mode` would have given it. Under a default ACL that is the access
+/// ACL inherited from it (`PosixAcl::inherited`), the umask playing no part; without one,
+/// `mode` less `umask`. The bits of `mode` above the nine permission bits are given as they
+/// are.
+///
+/// `chmod` sets the mode of the file `fd` is open on. The mode is set first, then the ACL
+/// (`write_fd`; a directory's default ACL is written as `default`, the one it inherited).
+pub fn set_created_mode(
+    fd: RawFd,
+    default: Option<PosixAcl>,
+    mode: u32,
+    umask: u32,
+    chmod: impl Fn(u32) -> io::Result<()>,
+) -> io::Result<()> {
+    let special = mode & 0o7000;
+    let Some(default) = default else {
+        return chmod(special | (mode & 0o777 & !umask));
+    };
+    let (access, bits) = default.inherited(mode);
+    chmod(special | bits)?;
+    let acl = Acl {
+        access: Some(access),
+        default: Some(default),
+        native: None,
+    };
+    write_fd(fd, &acl)
+}
+
+/// `set_created_mode` for a directory this process made: the default ACL it was made under is
+/// its own, which the kernel copied from its parent's, read through `fd`. Where no ACL can be
+/// read (EOPNOTSUPP) it has none.
+pub fn set_made_dir_mode(
+    fd: RawFd,
+    mode: u32,
+    umask: u32,
+    chmod: impl Fn(u32) -> io::Result<()>,
+) -> io::Result<()> {
+    let default = match read_fd(fd) {
+        Ok(acl) => acl.default,
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
+        Err(e) => return Err(e),
+    };
+    set_created_mode(fd, default, mode, umask, chmod)
 }
 
 /// The size of a macOS `acl_copy_ext` form's header -- a `kauth_filesec`: magic, owner and
@@ -1182,6 +1252,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(acl.entries[1].tag, Tag::User(4321));
+    }
+
+    /// `posix_acl_create`: the owner, mask and others entries are masked by the mode, a named
+    /// entry is not, and the owning group's is masked only where there is no mask.
+    #[test]
+    fn inherited_masks_by_the_creating_mode() {
+        let default = PosixAcl::from_text("u::rwx,u:3999999001:rwx,g::r-x,m::rwx,o::---").unwrap();
+        let (acl, bits) = default.inherited(0o754);
+        assert_eq!(bits, 0o750);
+        let want = PosixAcl::from_text("u::rwx,u:3999999001:rwx,g::r-x,m::r-x,o::---").unwrap();
+        assert_eq!(acl, want);
+
+        let (acl, bits) = default.inherited(0o600);
+        assert_eq!(bits, 0o600);
+        let want = PosixAcl::from_text("u::rw-,u:3999999001:rwx,g::r-x,m::---,o::---").unwrap();
+        assert_eq!(acl, want);
+
+        let plain = PosixAcl::from_text("u::rwx,g::rwx,o::r-x").unwrap();
+        let (acl, bits) = plain.inherited(0o751);
+        assert_eq!(bits, 0o751);
+        assert_eq!(acl, PosixAcl::from_text("u::rwx,g::r-x,o::--x").unwrap());
     }
 
     #[test]

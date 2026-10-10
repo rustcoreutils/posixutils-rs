@@ -11,6 +11,7 @@ mod acl;
 mod debhelper;
 mod dirmode;
 mod existing_dir;
+mod inherit;
 mod link;
 #[cfg(all(
     target_os = "linux",

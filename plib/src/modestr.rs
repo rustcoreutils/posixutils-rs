@@ -394,18 +394,34 @@ pub fn mutate(init_mode: u32, is_dir: bool, symbolic: &ChmodSymbolic) -> u32 {
             }
 
             if action.execute_dir && (is_dir || has_any_exec_bits) {
-                let mask = if who_is_not_specified { get_umask() } else { 0 };
+                // The execute bits of the classes the clause names -- all three, less what
+                // the umask masks, where it names none.
+                let bits = if who_is_not_specified {
+                    (S_IXUSR | S_IXGRP | S_IXOTH) as u32 & !get_umask()
+                } else {
+                    let mut bits = 0;
+                    if clause.user {
+                        bits |= S_IXUSR as u32;
+                    }
+                    if clause.group {
+                        bits |= S_IXGRP as u32;
+                    }
+                    if clause.others {
+                        bits |= S_IXOTH as u32;
+                    }
+                    bits
+                };
 
                 match action.op {
                     ChmodActionOp::Add | ChmodActionOp::Set => {
-                        user |= S_IXUSR as u32 & !mask;
-                        group |= S_IXGRP as u32 & !mask;
-                        others |= S_IXOTH as u32 & !mask;
+                        user |= bits & S_IXUSR as u32;
+                        group |= bits & S_IXGRP as u32;
+                        others |= bits & S_IXOTH as u32;
                     }
                     ChmodActionOp::Remove => {
-                        user &= !S_IXUSR as u32 & !mask;
-                        group &= !S_IXGRP as u32 & !mask;
-                        others &= !S_IXOTH as u32 & !mask;
+                        user &= !(bits & S_IXUSR as u32);
+                        group &= !(bits & S_IXGRP as u32);
+                        others &= !(bits & S_IXOTH as u32);
                     }
                 }
             }
@@ -538,9 +554,12 @@ mod tests {
     #[test]
     fn test_mutate_mode_exec_dir() {
         let plus_exec_dir = parse_symbolic("+X");
+        // With no who, what X adds or removes is masked by the umask (XCU chmod): the
+        // execute bits it may touch here.
+        let x = 0o111 & !umask();
 
         // Always apply X on directories
-        assert_eq!(mutate(0o444, true, &plus_exec_dir), 0o555);
+        assert_eq!(mutate(0o444, true, &plus_exec_dir), 0o444 | x);
 
         // Ignore X on non-directories not having any execute bits
         assert_eq!(
@@ -549,24 +568,37 @@ mod tests {
         );
 
         // Apply X when file has an execute bit
-        assert_eq!(mutate(0o544, false, &plus_exec_dir), 0o555);
-        assert_eq!(mutate(0o454, false, &plus_exec_dir), 0o555);
-        assert_eq!(mutate(0o445, false, &plus_exec_dir), 0o555);
-        assert_eq!(mutate(0o554, false, &plus_exec_dir), 0o555);
-        assert_eq!(mutate(0o545, false, &plus_exec_dir), 0o555);
-        assert_eq!(mutate(0o455, false, &plus_exec_dir), 0o555);
-        assert_eq!(mutate(0o555, false, &plus_exec_dir), 0o555);
+        for init in [0o544, 0o454, 0o445, 0o554, 0o545, 0o455, 0o555] {
+            assert_eq!(mutate(init, false, &plus_exec_dir), init | x, "{init:o}");
+        }
 
         // =X should clear the read permission on user
-        assert_eq!(mutate(0o500, false, &parse_symbolic("=X")), 0o111);
+        assert_eq!(mutate(0o500, false, &parse_symbolic("=X")), x);
         // +X should retain the read permission on user
-        assert_eq!(mutate(0o500, false, &parse_symbolic("+X")), 0o511);
+        assert_eq!(mutate(0o500, false, &parse_symbolic("+X")), 0o500 | x);
 
         // -X removes execute permission on everyone
-        assert_eq!(mutate(0o711, false, &parse_symbolic("-X")), 0o600);
+        assert_eq!(mutate(0o711, false, &parse_symbolic("-X")), 0o711 & !x);
 
         // Add execute permission on user then +X
-        assert_eq!(mutate(0o400, false, &parse_symbolic("u=x,+X")), 0o111);
+        assert_eq!(mutate(0o400, false, &parse_symbolic("u=x,+X")), 0o100 | x);
+    }
+
+    /// X touches only the execute bits of the classes the clause names, and removing it
+    /// clears nothing else (GNU chmod, measured).
+    #[test]
+    fn test_mutate_mode_exec_dir_by_class() {
+        assert_eq!(mutate(0o644, true, &parse_symbolic("u+X")), 0o744);
+        assert_eq!(mutate(0o600, true, &parse_symbolic("o+X")), 0o601);
+        assert_eq!(mutate(0o711, false, &parse_symbolic("g+X")), 0o711);
+        assert_eq!(mutate(0o701, false, &parse_symbolic("g+X")), 0o711);
+        assert_eq!(mutate(0o771, false, &parse_symbolic("u-X")), 0o671);
+        assert_eq!(mutate(0o771, false, &parse_symbolic("go-X")), 0o760);
+        assert_eq!(mutate(0o771, true, &parse_symbolic("a-X")), 0o660);
+        assert_eq!(mutate(0o640, true, &parse_symbolic("g=X")), 0o610);
+        // With no who, the umask keeps what it masks, and removal clears no other bit.
+        let x = 0o111 & !umask();
+        assert_eq!(mutate(0o771, false, &parse_symbolic("-X")), 0o771 & !x);
     }
 
     #[test]

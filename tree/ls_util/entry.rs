@@ -669,7 +669,7 @@ fn get_file_mode_string(metadata: &ftw::Metadata, path: &std::path::Path) -> Str
         }
     });
 
-    // Alternate-access-method flag: '+' when the file carries a POSIX ACL.
+    // Alternate-access-method flag: '+' when the file carries an ACL.
     // It describes the file this line is about: a symbolic link listed as
     // itself is probed without following it, while a link that -L or -H
     // followed (so `metadata` is the target's) is probed through the link.
@@ -767,68 +767,20 @@ fn display_width(s: &str) -> usize {
         .sum()
 }
 
-/// True if `path` carries an ACL (an "alternate access method"); used to append the `+` flag to the
-/// `-l` mode string. When `path` is a symbolic link, `follow` picks whether the link itself or the
-/// file it names is asked. The probe is platform-specific: Linux exposes a POSIX access ACL through
-/// the `system.posix_acl_access` extended attribute, while macOS/BSD report an extended ACL through
-/// the `acl(3)` API (`getxattr` there has a different, 6-argument signature and does not surface
-/// ACLs by that name).
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// True if `path` carries an ACL (an "alternate access method") that says more than its mode;
+/// used to append the `+` flag to the `-l` mode string. When `path` is a symbolic link, `follow`
+/// picks whether the link itself or the file it names is asked.
+///
+/// As GNU ls has it (gnulib `file_has_aclinfo`): an access ACL beyond owner, group and others;
+/// a default ACL, even alone; an NFSv4 ACL a mode cannot express; any macOS extended ACL. An
+/// ACL the user may not read (EACCES) may be there, and counts; so does one that is there but
+/// malformed.
 fn has_acl(path: &std::path::Path, follow: bool) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    const NAME: &[u8] = b"system.posix_acl_access\0";
-    let name = NAME.as_ptr() as *const libc::c_char;
-    let ret = unsafe {
-        if follow {
-            libc::getxattr(cpath.as_ptr(), name, std::ptr::null_mut(), 0)
-        } else {
-            libc::lgetxattr(cpath.as_ptr(), name, std::ptr::null_mut(), 0)
+    match plib::acl::read_path(path, follow) {
+        Ok(acl) => !acl.is_trivial(),
+        Err(e) => {
+            e.raw_os_error() == Some(libc::EACCES) || e.kind() == std::io::ErrorKind::InvalidData
         }
-    };
-    ret >= 0
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn has_acl(path: &std::path::Path, follow: bool) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    // macOS/BSD: an extended ACL is present iff `acl_get_file` (following a symlink) or
-    // `acl_get_link_np` (not following) with `ACL_TYPE_EXTENDED` returns a non-empty list
-    // (matching what BSD `ls` does for the `+` flag). These symbols live in libSystem but are not
-    // surfaced by the `libc` crate on every target, so declare them directly. `acl_t` /
-    // `acl_entry_t` are opaque pointers.
-    extern "C" {
-        fn acl_get_file(path: *const libc::c_char, acl_type: libc::c_uint) -> *mut libc::c_void;
-        fn acl_get_link_np(path: *const libc::c_char, acl_type: libc::c_uint) -> *mut libc::c_void;
-        fn acl_get_entry(
-            acl: *mut libc::c_void,
-            entry_id: libc::c_int,
-            entry_p: *mut *mut libc::c_void,
-        ) -> libc::c_int;
-        fn acl_free(obj_p: *mut libc::c_void) -> libc::c_int;
-    }
-    const ACL_TYPE_EXTENDED: libc::c_uint = 0x0000_0100;
-    const ACL_FIRST_ENTRY: libc::c_int = 0;
-
-    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    unsafe {
-        let acl = if follow {
-            acl_get_file(cpath.as_ptr(), ACL_TYPE_EXTENDED)
-        } else {
-            acl_get_link_np(cpath.as_ptr(), ACL_TYPE_EXTENDED)
-        };
-        if acl.is_null() {
-            return false;
-        }
-        // An allocated-but-entryless ACL is treated as "no ACL" (no `+`).
-        let mut entry: *mut libc::c_void = std::ptr::null_mut();
-        let has_entry = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) == 0;
-        acl_free(acl);
-        has_entry
     }
 }
 

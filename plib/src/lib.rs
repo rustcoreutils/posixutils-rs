@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+#[cfg(unix)]
+pub mod acl;
 pub mod archive;
 pub mod cscan;
 #[cfg(unix)]

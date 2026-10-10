@@ -364,7 +364,7 @@ mod tests {
 
         let (code, out, err) = man(&["-M", "/nonexistent", "-w", "cat", "-C", "man.test.conf"]);
         assert_eq!(code, Some(1), "stdout: {out}");
-        assert!(err.contains("not found"), "stderr: {err}");
+        assert!(err.contains("No manual entry for cat"), "stderr: {err}");
     }
 
     #[test]
@@ -612,9 +612,27 @@ mod tests {
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("system documentation for \"nonexistent_cmd\" not found"),
-            "Expected 'system documentation for \"nonexistent_cmd\" not found', got:\n{stderr}"
+            stderr.contains("No manual entry for nonexistent_cmd"),
+            "Expected 'No manual entry for nonexistent_cmd', got:\n{stderr}"
         );
+    }
+
+    /// A missing page is reported in the historic wording (man-db, BSD man),
+    /// which perl's lib/perl5db.t matches after running `man -M DIR NAME`.
+    #[test]
+    fn a_missing_page_has_no_manual_entry() {
+        let dir = plib::tmp::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_man"))
+            .arg("-M")
+            .arg(dir.path())
+            .arg("perlrules")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("Failed to run man -M DIR perlrules");
+
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr, "man: No manual entry for perlrules\n");
     }
 
     // -------------------------------------------------------------------------

@@ -109,6 +109,12 @@ impl<'a> Preprocessor<'a> {
             None => return, // Empty directive, ignore
         };
 
+        if self.passes_through_as_text(&directive_token) {
+            output.push(hash_token.clone());
+            iter.unread(vec![directive_token]);
+            return;
+        }
+
         // Get directive StringId
         let directive_id = match &directive_token.typ {
             TokenType::Ident => {
@@ -210,12 +216,31 @@ impl<'a> Preprocessor<'a> {
     /// Whether a `#` line that names no directive is an error here.
     ///
     /// Not in a skipped group, whose lines are only searched for the
-    /// conditionals that nest (C17 6.10.1p6). And not in assembly, where `#`
-    /// also introduces a comment, so such a line is prose rather than a
-    /// mistake -- `# save the frame pointer` is ordinary in a `.S` file. gcc
-    /// is silent about both.
+    /// conditionals that nest (C17 6.10.1p6); gcc is silent there. Assembly
+    /// never gets this far: see [`Self::passes_through_as_text`].
     fn reports_invalid_directives(&self) -> bool {
-        !self.is_skipping() && self.lexer_mode != LexerMode::Assembly
+        !self.is_skipping()
+    }
+
+    /// Whether the `#` line whose first token after the `#` is `first` is
+    /// ordinary text rather than a directive.
+    ///
+    /// In assembly `#` also introduces a comment, so a line naming no
+    /// directive is prose -- `# save the frame pointer` -- and gcc's
+    /// `-lang-asm` passes it through, macro-replaced like any other line. A
+    /// number is no exception: `# 7/12-bit word rotation` is a comment, and
+    /// even `# 100 "foo.S"` is left for the assembler rather than taken as a
+    /// linemarker, so it changes neither `__LINE__` nor where the next line
+    /// is written. A skipped group's lines are only searched for the
+    /// conditionals that nest (C17 6.10.1p6), and are dropped as before.
+    fn passes_through_as_text(&self, first: &Token) -> bool {
+        if self.lexer_mode != LexerMode::Assembly || self.is_skipping() {
+            return false;
+        }
+        match (&first.typ, &first.value) {
+            (TokenType::Ident, TokenValue::Ident(id)) => !Self::is_known_directive(*id),
+            _ => true,
+        }
     }
 
     /// Consume a `# N ["file" [flags]]` linemarker and record the attribution

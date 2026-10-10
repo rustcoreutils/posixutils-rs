@@ -864,3 +864,66 @@ int main(void)
 "#;
     assert_eq!(compile_and_run("pp_conditionals_in_args", code, &[]), 0);
 }
+
+/// In assembly a `#` line that names no directive is passed through,
+/// macro-replaced, as gcc's `-lang-asm` does -- a number after the `#` is no
+/// linemarker there. Linux's chacha-ssse3-x86_64.S has an indented
+/// `# 7/12-bit ...` comment after a macro line; taken as a linemarker it
+/// joined the next line onto the previous one (`endbr64and $~63,%rsp`).
+/// Expected text is gcc 13's `-E -P -x assembler-with-cpp`, line by line.
+#[test]
+fn preprocessor_assembly_hash_number_line_is_text() {
+    let src = "#define START(n) .globl n ; n: endbr64\n\
+               #define FOO bar\n\
+               START(f)\n\
+               \t# 7/12-bit word rotation uses traditional shift+OR.\n\
+               \tand $~63,%rsp\n\
+               # 42 is the answer FOO\n\
+               # 100 \"foo.S\"\n\
+               \t.long __LINE__\n\
+               # save FOO\n\
+               #! FOO\n\
+               #\n\
+               #if 0\n\
+               # 5 skipped\n\
+               #endif\n\
+               \tret\n";
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_asm_hash_number_")
+        .tempdir()
+        .unwrap();
+    let s = dir.path().join("t.S");
+    std::fs::write(&s, src).unwrap();
+    let r = run_c17(&["-E", "-P", &s.to_string_lossy()]);
+    assert!(r.success, "-E of a .S failed: {}", r.stderr);
+    let lines: Vec<&str> = r
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ".globl f ; f: endbr64",
+            "# 7/12-bit word rotation uses traditional shift+OR.",
+            "and $~63,%rsp",
+            "# 42 is the answer bar",
+            "# 100 \"foo.S\"",
+            ".long 8",
+            "# save bar",
+            "#! bar",
+            "ret",
+        ],
+        "{}",
+        r.stdout
+    );
+
+    // And the whole pipeline assembles it.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let o = dir.path().join("t.o");
+        let r = run_c17(&["-c", &s.to_string_lossy(), "-o", &o.to_string_lossy()]);
+        assert!(r.success, "assembling the .S failed: {}", r.stderr);
+    }
+}

@@ -2538,6 +2538,37 @@ fn test_assembly_leaves_unknown_directives_alone() {
 /// is passed through, macro-replaced, as gcc's `-lang-asm` does: never a
 /// linemarker, so it neither renumbers the lines after it nor joins the next
 /// line onto the one before.
+#[test]
+fn test_assembly_hash_lines_pass_through() {
+    let out = preprocess_asm_file(
+        b"#define FOO bar\nret\n# 7/12-bit rotation\nand $~63,%rsp\n\
+          # 100 \"foo.S\"\n.long __LINE__\n# save FOO\n#if 0\n# 5 x\n#endif\nnop\n",
+        &Target::host(),
+        "t.S",
+        &AsmPreprocessConfig::default(),
+    )
+    .expect("preprocesses");
+    let text = String::from_utf8_lossy(&out.text);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("# 1 "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "ret",
+            "# 7/12-bit rotation",
+            "and $~63,%rsp",
+            "# 100 \"foo.S\"",
+            ".long 6",
+            "# save bar",
+            "nop"
+        ],
+        "{text}"
+    );
+}
+
 /// C17 6.10.1p4 evaluates `#if` in `intmax_t`, where signed overflow is
 /// undefined. gcc's default pedwarn "integer overflow in preprocessor
 /// expression" covers `+`, `-`, `*`, `/`, unary `-` and a signed left shift

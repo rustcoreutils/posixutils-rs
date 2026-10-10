@@ -178,6 +178,14 @@ spelling is taken in silence; C90 (`-ansi` included) draws a warning that
    reach C source.  Accepted because `c17` accepts it, so the two tools read
    the same files.
 
+### cmp
+
+ * `-n count` — compare at most `count` bytes.
+ * `skip1` and `skip2` operands — decimal byte counts to skip in the first and
+   second file before comparing; byte and line numbers count from the first
+   byte compared.  Both forced by util-linux's mkswap test
+   (`cmp -n OFFSET IMG /dev/zero`, `cmp IMG IMG.offset 0 OFFSET`).
+
 ### chown
 
  * An `owner:` operand with an empty group resolves the group to the owner's

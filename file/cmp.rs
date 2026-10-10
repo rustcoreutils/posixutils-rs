@@ -50,6 +50,19 @@ struct Args {
         )
     )]
     file2: PathBuf,
+
+    /// GNU: compare at most this many bytes.  util-linux's tests run
+    /// `cmp -n OFFSET FILE /dev/zero`.
+    #[arg(short = 'n', value_name = "COUNT", help = gettext("Compare at most COUNT bytes"))]
+    bytes: Option<u64>,
+
+    /// GNU and BSD: bytes of the first file to skip before comparing.
+    #[arg(value_name = "SKIP1", help = gettext("Bytes of the first file to skip"))]
+    skip1: Option<u64>,
+
+    /// GNU and BSD: bytes of the second file to skip before comparing.
+    #[arg(value_name = "SKIP2", help = gettext("Bytes of the second file to skip"))]
+    skip2: Option<u64>,
 }
 
 /// Reads a single byte from a `BufReader`.
@@ -84,11 +97,21 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
     };
     let mut reader1 = open(&args.file1)?;
     let mut reader2 = open(&args.file2)?;
+    // Skipped bytes are read and dropped: either file may be a pipe.
+    for (reader, skip) in [(&mut reader1, args.skip1), (&mut reader2, args.skip2)] {
+        io::copy(
+            &mut reader.by_ref().take(skip.unwrap_or(0)),
+            &mut io::sink(),
+        )?;
+    }
 
     let mut lines: u64 = 1;
     let mut bytes: u64 = 0;
 
     loop {
+        if args.bytes == Some(bytes) {
+            break;
+        }
         let c1 = getc(&mut reader1)?;
         let c2 = getc(&mut reader2)?;
 

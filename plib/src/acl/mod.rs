@@ -42,10 +42,10 @@ pub use posix::{Entry, PosixAcl, Tag};
 
 use gettextrs::gettext;
 use std::ffi::CStr;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
 use std::ffi::CString;
 use std::io;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::Path;
@@ -293,10 +293,66 @@ pub fn read_path(path: &Path, follow: bool) -> io::Result<Acl> {
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         sys::read(&sys::Target::Path(&path, follow))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "android")]
+    {
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        android::read_path(&path, follow)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
     {
         let _ = (path, follow);
         Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
+}
+
+/// Android: the POSIX ACLs of a file by name, read from their extended attributes as on Linux,
+/// for `ls -l`'s `+` (`read_path`). Nothing else of the ACL code is built there.
+#[cfg(target_os = "android")]
+mod android {
+    use super::{absent, Acl, PosixAcl};
+    use std::ffi::CStr;
+    use std::io;
+
+    pub fn read_path(path: &CStr, follow: bool) -> io::Result<Acl> {
+        let get = |name: &CStr| -> io::Result<Option<PosixAcl>> {
+            match get(path, name, follow) {
+                Ok(bytes) => PosixAcl::parse_xattr(&bytes).map(Some),
+                Err(e) if absent(&e) => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+        Ok(Acl {
+            access: get(c"system.posix_acl_access")?,
+            default: get(c"system.posix_acl_default")?,
+            native: None,
+        })
+    }
+
+    /// The attribute `name` of `path`, of a symbolic link itself unless `follow`.
+    fn get(path: &CStr, name: &CStr, follow: bool) -> io::Result<Vec<u8>> {
+        let call = |buf: *mut libc::c_void, len: usize| unsafe {
+            if follow {
+                libc::getxattr(path.as_ptr(), name.as_ptr(), buf, len)
+            } else {
+                libc::lgetxattr(path.as_ptr(), name.as_ptr(), buf, len)
+            }
+        };
+        loop {
+            let size = call(std::ptr::null_mut(), 0);
+            let size = usize::try_from(size).map_err(|_| io::Error::last_os_error())?;
+            let mut buf = vec![0u8; size];
+            let got = call(buf.as_mut_ptr().cast(), buf.len());
+            match usize::try_from(got) {
+                Ok(got) => {
+                    buf.truncate(got);
+                    return Ok(buf);
+                }
+                // Grown since it was sized: size it again.
+                Err(_) if io::Error::last_os_error().raw_os_error() == Some(libc::ERANGE) => {}
+                Err(_) => return Err(io::Error::last_os_error()),
+            }
+        }
     }
 }
 

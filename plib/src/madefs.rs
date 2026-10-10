@@ -1225,6 +1225,24 @@ mod tests {
     use std::path::Path;
     use std::rc::Rc;
 
+    /// Make the directory `path`, and each one missing above it, mode 0755 whatever the
+    /// umask: these tests' verdicts turn on who may write each directory, and other tests in
+    /// this binary hold the umask at 0 for a moment (`modestr::umask` reads it so), in which a
+    /// directory made by `mkdir` alone would be 0777.
+    fn make_dir(path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        let mut missing = Vec::new();
+        let mut at = path;
+        while std::fs::symlink_metadata(at).is_err() {
+            missing.push(at.to_path_buf());
+            at = at.parent().expect("the scratch directory exists");
+        }
+        std::fs::create_dir_all(path).unwrap();
+        for dir in missing {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
     /// A parent directory of `uid` with permission bits `mode`.
     fn parent(uid: u32, mode: libc::mode_t) -> libc::stat {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1277,8 +1295,8 @@ mod tests {
         }
         let tmp = crate::tmp::TempDir::new().unwrap();
         let root = tmp.path();
-        std::fs::create_dir_all(root.join("x/y/z")).unwrap();
-        std::fs::create_dir_all(root.join("open/z")).unwrap();
+        make_dir(root.join("x/y/z"));
+        make_dir(root.join("open/z"));
         for (dir, mode) in [("", 0o755), ("x", 0o755), ("x/y", 0o755), ("open", 0o777)] {
             let path = root.join(dir);
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1374,7 +1392,7 @@ mod tests {
         };
         let tmp = crate::tmp::TempDir::new().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::create_dir(tmp.path().join("x")).unwrap();
+        make_dir(tmp.path().join("x"));
         let in_tmp = Rc::new(std::fs::File::open(tmp.path()).unwrap());
         let x = std::fs::File::open(tmp.path().join("x")).unwrap();
         let anchor = ChainTrust::link_as(None, &in_tmp, ChainStart::Anchor, 0).unwrap();
@@ -1582,7 +1600,7 @@ mod tests {
         let tmp = crate::tmp::TempDir::new().unwrap();
         let root = tmp.path();
         // anchor 0755 / g 0777 (someone else can create here, whatever its group) / x 0755 / d
-        std::fs::create_dir_all(root.join("g/x/d")).unwrap();
+        make_dir(root.join("g/x/d"));
         for (dir, mode) in [("", 0o755), ("g", 0o777), ("g/x", 0o755)] {
             let path = root.join(dir);
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1664,8 +1682,8 @@ mod tests {
         let tmp = crate::tmp::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         let open = tmp.path().join("open");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir(&open).unwrap();
+        make_dir(&home);
+        make_dir(&open);
         std::os::unix::fs::symlink(&home, open.join("l")).unwrap();
         let mode = Preserve {
             mode: true,
@@ -1695,7 +1713,7 @@ mod tests {
         assert_eq!(named.hands.found_dir(&*held, mode), FoundDir::AsRequested);
         // A name that holds another directory than the one opened.
         std::fs::rename(&home, tmp.path().join("moved")).unwrap();
-        std::fs::create_dir(&home).unwrap();
+        make_dir(&home);
         let named = ChainTrust::named(&home, &held).unwrap();
         assert_eq!(named.named_dir(mode), FoundDir::LeaveAlone);
         assert_eq!(named.hands.found_dir(&*held, mode), FoundDir::LeaveAlone);
@@ -1712,7 +1730,7 @@ mod tests {
         // home (0755) / sub, x; open (0777) / d -> ../home/sub, m -> ../home;
         // safe (0755) / l -> ../home, e -> ../open/m; loop (0755) / a -> b, b -> a.
         for dir in ["home/sub", "home/x", "open", "safe", "loop"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
+            make_dir(root.join(dir));
         }
         let link = |target: &str, at: &str| std::os::unix::fs::symlink(target, root.join(at));
         link("../home/sub", "open/d").unwrap();
@@ -1850,8 +1868,8 @@ mod tests {
         let tmp = crate::tmp::TempDir::new().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let parent = std::fs::File::open(tmp.path()).unwrap();
-        std::fs::create_dir(tmp.path().join("fresh")).unwrap();
-        std::fs::create_dir(tmp.path().join("full")).unwrap();
+        make_dir(tmp.path().join("fresh"));
+        make_dir(tmp.path().join("full"));
         std::fs::write(tmp.path().join("full/f"), "").unwrap();
         // As under umask 0400.
         for name in ["fresh", "full"] {
@@ -1882,7 +1900,7 @@ mod tests {
     fn read_is_lent_only_when_the_check_needs_it() {
         let tmp = crate::tmp::TempDir::new().unwrap();
         let path = tmp.path().join("d");
-        std::fs::create_dir(&path).unwrap();
+        make_dir(&path);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
         let fd = open_search(&std::fs::File::open(tmp.path()).unwrap(), c"d");
         let st = {

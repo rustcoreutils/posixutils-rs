@@ -569,7 +569,7 @@ pub fn mode_without(acl: Option<&Acl>, mode: u32) -> u32 {
 ///
 /// `chmod` sets the mode of the file `fd` is open on. The mode is set first, then the ACL
 /// (`write_fd`; a directory's default ACL is written as `default`, the one it inherited).
-pub fn set_created_mode(
+fn set_created_mode(
     fd: RawFd,
     default: Option<PosixAcl>,
     mode: u32,

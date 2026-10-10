@@ -41,18 +41,22 @@ enum Finish {
     /// `named_bits`) otherwise: `mkdir` takes no set-user-ID or set-group-ID bit, and under a
     /// default ACL its mode only masks the ACL the directory inherits.
     Named(libc::mode_t, u32),
-    /// Owner write and search added where missing, as POSIX asks of a `-p` intermediate.
+    /// Owner write and search added where missing, as POSIX asks of a `-p` intermediate. Made
+    /// under a umask that leaves both (`make_dir`), it lacks them only where its parent's
+    /// default ACL withheld them.
     OwnerWriteSearch,
 }
 
-/// Create the directory `path` with the given mode, then finish its mode (`Finish`). When
-/// `bypass_umask` is set, the umask is temporarily cleared so the directory is made with
-/// exactly `mode` (used for an explicit `-m`). Returns `Ok(false)` if the path already exists
-/// as a directory (so `-p` can skip it), `Ok(true)` if newly created.
+/// Create the directory `path` with the given mode, then finish its mode (`Finish`). Where
+/// `umask` is given, it is the process's umask while the directory is made: 0, so that it is
+/// made with exactly `mode` (an explicit `-m`), or the umask less the owner's write and search
+/// bits (a `-p` intermediate). The kernel applies it only where the parent has no default ACL,
+/// as it would the umask itself. Returns `Ok(false)` if the path already exists as a directory
+/// (so `-p` can skip it), `Ok(true)` if newly created.
 fn make_dir(
     path: &Path,
     mode: libc::mode_t,
-    bypass_umask: bool,
+    umask: Option<libc::mode_t>,
     finish: Finish,
 ) -> io::Result<bool> {
     let bytes = path.as_os_str().as_bytes();
@@ -64,11 +68,7 @@ fn make_dir(
     }
     let c_path = CString::new(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    let saved = if bypass_umask {
-        Some(unsafe { libc::umask(0) })
-    } else {
-        None
-    };
+    let saved = umask.map(|umask| unsafe { libc::umask(umask) });
     let ret = unsafe { libc::mkdir(c_path.as_ptr(), mode) };
     let err = io::Error::last_os_error();
     if let Some(prev) = saved {
@@ -198,16 +198,21 @@ fn do_mkdir(
         ChmodMode::Symbolic(sym) => modestr::mutate(0o777, true, sym),
     }) as libc::mode_t;
     // GNU mkdir sets the bits `-m` names once the directory is made.
-    let leaf_finish = if explicit_mode {
-        Finish::Named(leaf_mode, named_bits(mode, umask))
+    let (leaf_umask, leaf_finish) = if explicit_mode {
+        (Some(0), Finish::Named(leaf_mode, named_bits(mode, umask)))
     } else {
-        Finish::AsMade
+        (None, Finish::AsMade)
     };
 
     if parents {
         // POSIX: intermediate components get the default mode modified by umask, plus write and
         // search permission for the owner, so the descendants can always be created. They are
-        // made as a plain `mkdir` makes one, so a default ACL applies to them as it does there.
+        // made under the umask less the owner's write and search bits, which gives exactly that
+        // with no chmod; and as a plain `mkdir` makes one, so a default ACL, where there is one,
+        // applies to them as it does there, the umask playing no part.
+        // Cast for macOS, where libc mode constants are u16.
+        #[allow(clippy::unnecessary_cast)]
+        let inter_umask = (umask & !0o300) as libc::mode_t;
 
         let parts: Vec<&str> = dirname.split('/').filter(|p| !p.is_empty()).collect();
         let last = parts.len().saturating_sub(1);
@@ -219,13 +224,13 @@ fn do_mkdir(
         for (i, part) in parts.iter().enumerate() {
             path.push(part);
             if i == last {
-                make_dir(&path, leaf_mode, explicit_mode, leaf_finish)?;
+                make_dir(&path, leaf_mode, leaf_umask, leaf_finish)?;
             } else {
-                make_dir(&path, 0o777, false, Finish::OwnerWriteSearch)?;
+                make_dir(&path, 0o777, Some(inter_umask), Finish::OwnerWriteSearch)?;
             }
         }
         Ok(())
-    } else if make_dir(Path::new(dirname), leaf_mode, explicit_mode, leaf_finish)? {
+    } else if make_dir(Path::new(dirname), leaf_mode, leaf_umask, leaf_finish)? {
         Ok(())
     } else {
         // Without `-p`, an existing directory is an error.

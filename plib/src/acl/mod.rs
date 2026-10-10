@@ -451,6 +451,45 @@ pub fn copy_with_mode(acl: &Acl, fd: RawFd, mode: u32) -> (u32, Option<io::Error
     }
 }
 
+/// Give the file open on `fd`, a copy, its source's mode `mode` and ACLs `acl` -- `Err` where
+/// they could not be read, the failure -- through `chmod`, which sets the mode of the file `fd`
+/// is open on: the one rule cp -p and pax -p p follow. Returned: the failure to report, if any
+/// (`copy_with_mode`); only a failure to set the mode at all is an `Err`.
+///
+/// A source with no ACLs, on a copy with none to remove -- the usual case -- takes one read of
+/// the copy's and one chmod. Where none can be read at all (EOPNOTSUPP: a system no ACL is read
+/// on) there is none to remove. Otherwise the copy holds `interim_mode(mode)` while the ACLs are
+/// written (`copy_with_mode`; for ACLs not read, those it has are removed), then the mode it is
+/// to keep.
+pub fn set_preserved_mode(
+    chmod: impl Fn(u32) -> io::Result<()>,
+    fd: RawFd,
+    mode: u32,
+    acl: Result<&Acl, io::Error>,
+) -> io::Result<Option<io::Error>> {
+    let none = Acl::default();
+    let (wanted, kept, failed) = match acl {
+        Ok(acl) => (acl, mode, None),
+        Err(e) => (&none, mode_without(None, mode), Some(e)),
+    };
+    if *wanted == none {
+        match read_fd(fd) {
+            Ok(own) if own == none => return chmod(kept).map(|()| failed),
+            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                return chmod(kept).map(|()| failed)
+            }
+            _ => {}
+        }
+    }
+    chmod(interim_mode(mode))?;
+    let (kept, failed) = match (copy_with_mode(wanted, fd, mode), failed) {
+        (_, Some(failed)) => (kept, Some(failed)),
+        (copied, None) => copied,
+    };
+    chmod(kept)?;
+    Ok(failed)
+}
+
 /// Whether a copy whose ACLs `acl` were written keeps no set-user-ID or set-group-ID bit of
 /// its mode `mode`: it has one, and a native ACL, not one saying only what the mode does, that
 /// lets anyone but the owner change it.

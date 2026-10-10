@@ -846,6 +846,9 @@ fn copy_xattrs(
 /// (`plib::acl::loses_nothing`) -- and then the copy keeps a mode granting no more than the
 /// source did (`plib::acl::mode_without`): the mode's group bits are a mask the source's
 /// owning group need not have had.
+///
+/// Where neither the source nor the copy has an ACL, the usual case, the copy is given its
+/// mode with one chmod (`plib::acl::set_preserved_mode`, which pax -p p shares).
 fn set_mode_and_acl(
     chmod: impl Fn(libc::mode_t) -> io::Result<()>,
     fd: libc::c_int,
@@ -858,12 +861,10 @@ fn set_mode_and_acl(
     let mode = mode as u32;
     let set_mode =
         |mode: u32| chmod(mode as libc::mode_t).map_err(|e| preserve_mode_error(target, &e));
-    set_mode(plib::acl::interim_mode(mode))?;
-    let (kept, failed) = match acl() {
-        Ok(acl) => plib::acl::copy_with_mode(&acl, fd, mode),
-        Err(e) => (plib::acl::mode_without(None, mode), Some(e)),
-    };
-    set_mode(kept)?;
+    let failed = match acl() {
+        Ok(acl) => plib::acl::set_preserved_mode(set_mode, fd, mode, Ok(&acl)),
+        Err(e) => plib::acl::set_preserved_mode(set_mode, fd, mode, Err(e)),
+    }?;
     failed.map_or(Ok(()), |e| Err(preserve_acl_error(target, &e)))
 }
 

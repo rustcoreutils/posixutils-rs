@@ -2202,53 +2202,34 @@ fn set_xattrs(
 /// native ACL letting others write withholds the set-ID bits, also a failure.
 /// Only a failure to set the mode at all is an `Err`.
 ///
-/// `fd` is the file the ACLs are written through; `None` where pax holds none
-/// (a node held by name), whose ACL is then left as it is, and which takes
-/// none of the source's.
+/// `fd` is the file the ACLs are written through
+/// (`plib::acl::set_preserved_mode`, which cp -p shares); `None` where pax
+/// holds none (a node held by name), whose ACL is then left as it is, and
+/// which takes none of the source's.
 fn set_preserved_mode(
     chmod: impl Fn(u32) -> std::io::Result<()>,
     fd: Option<libc::c_int>,
     mode: u32,
     acl: &Result<plib::acl::Acl, String>,
 ) -> std::io::Result<Option<std::io::Error>> {
-    use plib::acl::{mode_without, Acl};
-    let unsupported = || std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
-    let (wanted, kept, failed) = match acl {
-        Ok(acl) => (acl, mode, None),
-        Err(reason) => (
-            &Acl::default(),
-            mode_without(None, mode),
-            Some(std::io::Error::other(reason.clone())),
-        ),
-    };
+    use plib::acl::mode_without;
     let Some(fd) = fd else {
-        return match (acl, failed) {
-            (Ok(acl), None) if !acl.is_trivial_for(mode) => {
+        return match acl {
+            Ok(acl) if !acl.is_trivial_for(mode) => {
                 chmod(mode_without(Some(acl), mode))?;
-                Ok(Some(unsupported()))
+                Ok(Some(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)))
             }
-            (_, failed) => chmod(kept).map(|()| failed),
+            Ok(_) => chmod(mode).map(|()| None),
+            Err(reason) => {
+                chmod(mode_without(None, mode))?;
+                Ok(Some(std::io::Error::other(reason.clone())))
+            }
         };
     };
-    // A source with no ACLs, on a file with none to remove, the usual case:
-    // one read. Where none can be read at all (EOPNOTSUPP: a system no ACL is
-    // read on) there is none to remove.
-    if *wanted == Acl::default() {
-        match plib::acl::read_fd(fd) {
-            Ok(own) if own == Acl::default() => return chmod(kept).map(|()| failed),
-            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
-                return chmod(kept).map(|()| failed)
-            }
-            _ => {}
-        }
-    }
-    chmod(plib::acl::interim_mode(mode))?;
-    let (kept, failed) = match (plib::acl::copy_with_mode(wanted, fd, mode), failed) {
-        (_, Some(failed)) => (kept, Some(failed)),
-        (copied, None) => copied,
-    };
-    chmod(kept)?;
-    Ok(failed)
+    let acl = acl
+        .as_ref()
+        .map_err(|reason| std::io::Error::other(reason.clone()));
+    plib::acl::set_preserved_mode(chmod, fd, mode, acl)
 }
 
 /// Without `-p p`: a file or node made by this run already has the permission

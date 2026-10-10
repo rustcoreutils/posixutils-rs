@@ -365,6 +365,14 @@ but no daemon to run them.  Behavior follows Vixie cron:
 
  * Block-size suffixes `c`, `K`, `m`, `M`, `g` and `G`.  POSIX defines `b`
    (512), `k` (1024) and `x` products.
+ * `conv=fsync` — after the last block is written, `fsync` the output, data
+   and metadata.  Standard output is synced too, as GNU does, so a pipe or
+   `/dev/null` there fails: `fsync failed for 'NAME'`, then the statistics,
+   then exit status 1.  Forced by util-linux's test suite
+   (`tests/ts/fadvise/drop`).
+ * `status=none` — write no statistics; errors are still reported.  Any
+   other level is an invalid status level.  Forced by util-linux's test
+   suite (`tests/ts/lsfd/error-eperm`).
 
 ### df
 

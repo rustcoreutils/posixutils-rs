@@ -13,6 +13,8 @@ use std::path::PathBuf;
 
 use plib::testing::{run_test_u8, TestPlanU8};
 
+mod gnu_ext;
+
 fn get_test_file_path(filename: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests");

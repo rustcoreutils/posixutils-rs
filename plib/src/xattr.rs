@@ -111,6 +111,56 @@ pub fn set_fd(fd: RawFd, name: &CStr, value: &[u8]) -> io::Result<()> {
     sys::set_fd(fd, name, value)
 }
 
+/// Give the file open on `fd` each attribute of `values` (`set_fd`), returning the result for
+/// each, in order. The caller made the file, or verified it as one it may give attributes to:
+/// it is never a directory found that is not trusted.
+///
+/// Setting a `user.` attribute takes write permission on the file, which a copy of a read-only
+/// source (0444, 0555) is already denied. Where one is refused so (EACCES) and the file is a
+/// regular file or directory the effective user owns whose mode denies the owner writing, the
+/// owner's write bit is lent through `chmod` while the refused ones are set again, and the
+/// exact mode is put back at once, as GNU cp -a and tar --xattrs -xp do. The outer error is
+/// that of lending or putting back the mode. Residual: a chmod by a user outside the file's
+/// group clears its set-group-ID bit, which putting the mode back cannot set again; the
+/// caller gives the file its final mode afterwards in any case.
+pub fn set_all_lending_write(
+    fd: RawFd,
+    values: &[(&CStr, &[u8])],
+    chmod: impl Fn(u32) -> io::Result<()>,
+) -> io::Result<Vec<io::Result<()>>> {
+    let mut results: Vec<_> = values
+        .iter()
+        .map(|(name, value)| set_fd(fd, name, value))
+        .collect();
+    let refused =
+        |r: &io::Result<()>| matches!(r, Err(e) if e.raw_os_error() == Some(libc::EACCES));
+    if !results.iter().any(refused) {
+        return Ok(results);
+    }
+    let st = crate::madefs::fstat(fd)?;
+    // Casts needed: `mode_t` is u16 on macOS and u32 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let (kind, mode) = (
+        st.st_mode as u32 & libc::S_IFMT as u32,
+        st.st_mode as u32 & 0o7777,
+    );
+    #[allow(clippy::unnecessary_cast)]
+    let lendable = [libc::S_IFREG as u32, libc::S_IFDIR as u32].contains(&kind)
+        && st.st_uid == unsafe { libc::geteuid() }
+        && mode & 0o200 == 0;
+    if !lendable {
+        return Ok(results);
+    }
+    chmod(mode | 0o200)?;
+    for (result, (name, value)) in results.iter_mut().zip(values) {
+        if refused(result) {
+            *result = set_fd(fd, name, value);
+        }
+    }
+    chmod(mode)?;
+    Ok(results)
+}
+
 /// Remove the extended attribute `name` of the file open on `fd`.
 pub fn remove_fd(fd: RawFd, name: &CStr) -> io::Result<()> {
     sys::remove_fd(fd, name)

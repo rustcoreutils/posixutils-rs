@@ -257,6 +257,38 @@ fn pax_rw_p_e_copies_xattrs() {
     assert_no_xattrs(temp.path(), "pax -rw -p p");
 }
 
+/// A read-only file (0444) and directory (0555) still take their attributes under `-p e`, in
+/// read and in copy mode, and keep their modes, as GNU tar --xattrs -xp gives them theirs:
+/// write permission is lent to the file pax made while they are set.
+#[test]
+fn pax_p_e_sets_xattrs_on_read_only_members() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(temp) = tree_with_xattrs() else {
+        return;
+    };
+    let src = temp.path().join("src");
+    fs::set_permissions(src.join("f"), fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(src.join("d"), fs::Permissions::from_mode(0o555)).unwrap();
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let check = |out: &Output, what: &str| {
+        assert_ok(out, what);
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{what}");
+        assert_same_xattrs(temp.path(), what);
+        assert_eq!(mode(&temp.path().join("x/f")), 0o444, "{what}");
+        assert_eq!(mode(&temp.path().join("x/d")), 0o555, "{what}");
+    };
+    let out = run_pax_in_dir(&["-w", "-x", "pax", "-f", "../a.pax", "f", "d"], &src);
+    assert_ok(&out, "pax -w -x pax");
+
+    let x = clear_x(temp.path());
+    let out = run_pax_in_dir(&["-r", "-p", "e", "-f", "../a.pax"], &x);
+    check(&out, "pax -r -p e");
+
+    clear_x(temp.path());
+    let out = run_pax_in_dir(&["-rw", "-p", "e", "f", "d", "../x"], &src);
+    check(&out, "pax -rw -p e");
+}
+
 /// What GNU tar --xattrs writes, pax -r -p e restores; what pax writes, GNU tar --xattrs -xp
 /// restores.
 #[test]

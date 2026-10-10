@@ -2055,7 +2055,9 @@ fn set_attrs_with(
     // file capability.
     let mut xattrs_failed = None;
     if with_mode && policy.preserve_xattrs {
-        xattrs_failed = set_xattrs(Some(target.fd().as_raw_fd()), &attrs.xattrs, owner_set);
+        let chmod = |mode: u32| cvt(target.chmod(mode as libc::mode_t));
+        let fd = Some(target.fd().as_raw_fd());
+        xattrs_failed = set_xattrs(fd, &attrs.xattrs, owner_set, Some(&chmod));
     }
 
     let mut acl_failed = None;
@@ -2126,10 +2128,17 @@ fn attr_failure(xattrs: Option<String>, acl: Option<std::io::Error>) -> PaxResul
 /// `fd` may be an `O_PATH` pin (Linux), set through its `/proc/self/fd/N`
 /// under a verified procfs (`plib::xattr::set_fd`): a symbolic link's own,
 /// never what it names.
+///
+/// `chmod`, given for a file or directory pax made or verified (one that is
+/// to take its mode), changes its mode: a read-only one is lent its owner's
+/// write permission while its attributes are set
+/// (`plib::xattr::set_all_lending_write`); a failure to lend or put back
+/// the mode is the failure returned.
 fn set_xattrs(
     fd: Option<libc::c_int>,
     xattrs: &Result<Xattrs, String>,
     owner_set: bool,
+    chmod: Option<&dyn Fn(u32) -> std::io::Result<()>>,
 ) -> Option<String> {
     let xattrs = match xattrs {
         Ok(xattrs) => xattrs,
@@ -2144,11 +2153,24 @@ fn set_xattrs(
         }
         return None;
     };
-    for (name, value) in &xattrs.values {
-        if !plib::xattr::is_copied_to(name.to_bytes(), owner_set) {
-            continue;
-        }
-        match plib::xattr::set_fd(fd, name, value) {
+    let values: Vec<(&CStr, &[u8])> = xattrs
+        .values
+        .iter()
+        .filter(|(name, _)| plib::xattr::is_copied_to(name.to_bytes(), owner_set))
+        .map(|(name, value)| (name.as_c_str(), value.as_slice()))
+        .collect();
+    let results = match chmod {
+        Some(chmod) => match plib::xattr::set_all_lending_write(fd, &values, chmod) {
+            Ok(results) => results,
+            Err(e) => return Some(e.to_string()),
+        },
+        None => values
+            .iter()
+            .map(|(name, value)| plib::xattr::set_fd(fd, name, value))
+            .collect(),
+    };
+    for ((name, _), result) in values.iter().zip(results) {
+        match result {
             Err(e) if !plib::xattr::unsupported(&e) => crate::error::report_warning(
                 &xattrs.of,
                 format!(
@@ -2356,7 +2378,7 @@ fn apply_node_attrs(
         policy.preserve_owner && set_owner(attrs.uid, attrs.gid, |uid, gid| node.chown(uid, gid))?;
     let mut xattrs_failed = None;
     if policy.preserve_xattrs {
-        xattrs_failed = set_xattrs(node.acl_fd(), &attrs.xattrs, owner_set);
+        xattrs_failed = set_xattrs(node.acl_fd(), &attrs.xattrs, owner_set, None);
     }
     let mut acl_failed = None;
     if made_type != libc::S_IFLNK {

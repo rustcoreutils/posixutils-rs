@@ -70,6 +70,35 @@ fn mv_across_filesystems_keeps_xattrs() {
     assert_eq!(xattrs(&moved.join("f")), [pair("user.foo", b"file")]);
 }
 
+/// A read-only file (0444) and empty directory (0555) moved across filesystems keep their
+/// attributes and their modes, as with GNU mv.
+#[test]
+fn mv_across_filesystems_keeps_xattrs_of_read_only_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some((temp, shm)) = two_filesystems() else {
+        return;
+    };
+    let (f, d) = (temp.path().join("f"), temp.path().join("d"));
+    fs::write(&f, "f\n").unwrap();
+    fs::create_dir(&d).unwrap();
+    if !set_xattr(&f, b"user.foo", b"file")
+        || !set_xattr(&d, b"user.foo", b"dir")
+        || !set_xattr(shm.path(), b"user.probe", b"")
+    {
+        return;
+    }
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = mv(&[&f, &d, shm.path()]);
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert_eq!(out.status.code(), Some(0));
+    let (f, d) = (shm.path().join("f"), shm.path().join("d"));
+    let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o7777;
+    assert_eq!((mode(&f), mode(&d)), (0o444, 0o555));
+    assert_eq!(xattrs(&f), [pair("user.foo", b"file")]);
+    assert_eq!(xattrs(&d), [pair("user.foo", b"dir")]);
+}
+
 /// A value the destination cannot hold -- 64 KiB from `/dev/shm` onto a filesystem whose limit
 /// is lower, ext4's block -- is diagnosed in GNU mv's words, naming the destination; the
 /// others are copied, and the move completes with exit status 0. Skipped where the scratch

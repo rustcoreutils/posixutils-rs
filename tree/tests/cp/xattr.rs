@@ -57,6 +57,40 @@ fn cp_a_copies_the_xattrs_of_a_file_and_a_directory() {
     assert_eq!(xattrs(&out.join("f")), [pair("user.foo", b"file")]);
 }
 
+/// A read-only file (0444) and directory (0555) take their attributes and keep their modes:
+/// cp makes each at a mode of its own and gives it the source's last, as GNU cp -a does. An
+/// existing read-only directory it copies into is not lent write permission: GNU cp -a leaves
+/// its attributes as they are, without a word.
+#[test]
+fn cp_a_copies_the_xattrs_of_read_only_files_and_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(temp) = with_tree() else { return };
+    let d = temp.path().join("d");
+    fs::set_permissions(d.join("f"), fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+    let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o7777;
+    assert_ok(&cp(temp.path(), &["-a", "d", "out"]));
+    let out = temp.path().join("out");
+    assert_eq!(xattrs(&out), [pair("user.foo", b"dir")]);
+    assert_eq!(xattrs(&out.join("f")), [pair("user.foo", b"file")]);
+    assert_eq!((mode(&out), mode(&out.join("f"))), (0o555, 0o444));
+
+    let e = temp.path().join("e");
+    fs::create_dir(&e).unwrap();
+    assert!(set_xattr(&e, b"user.foo", b"empty"));
+    fs::set_permissions(&e, fs::Permissions::from_mode(0o555)).unwrap();
+    let found = temp.path().join("found");
+    fs::create_dir_all(found.join("e")).unwrap();
+    fs::set_permissions(found.join("e"), fs::Permissions::from_mode(0o555)).unwrap();
+    let copied = cp(temp.path(), &["-a", "e", "found"]);
+    let left = xattrs(&found.join("e"));
+    for dir in [&d, &out, &e, &found.join("e")] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_ok(&copied);
+    assert_eq!(left, []);
+}
+
 /// -p preserves mode, owner and times, -R alone nothing: neither copies an extended attribute.
 #[test]
 fn cp_p_and_plain_cp_copy_no_xattr() {

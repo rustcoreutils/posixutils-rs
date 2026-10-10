@@ -183,19 +183,14 @@ struct TempAt<'a> {
 #[cfg(unix)]
 impl<'a> TempAt<'a> {
     fn new(dir: BorrowedFd<'a>, mode: libc::c_uint) -> io::Result<Self> {
-        use std::time::{SystemTime, UNIX_EPOCH};
         let flags = libc::O_WRONLY
             | libc::O_CREAT
             | libc::O_EXCL
             | libc::O_NOFOLLOW
             | libc::O_NOCTTY
             | libc::O_CLOEXEC;
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        for n in 0..100u32 {
-            let name = format!(".tmp{}.{seed:x}.{n}", std::process::id());
-            let name = CString::new(name).expect("no NUL in a formatted name");
+        for _ in 0..100 {
+            let name = temp_name();
             let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, mode) };
             if fd >= 0 {
                 let file = unsafe { fs::File::from_raw_fd(fd) };
@@ -214,6 +209,14 @@ impl<'a> TempAt<'a> {
         }
         Err(io::Error::from_raw_os_error(libc::EEXIST))
     }
+}
+
+/// A fresh name for a temporary beside the file `write_atomic` replaces,
+/// drawn anew for every try (`tmp::random_name_part`).
+#[cfg(unix)]
+fn temp_name() -> CString {
+    let name = format!(".tmp{}", crate::tmp::random_name_part());
+    CString::new(name).expect("no NUL in a formatted name")
 }
 
 #[cfg(unix)]
@@ -699,5 +702,25 @@ mod tests {
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
         written.unwrap();
         assert_eq!(fs::read(sub.join("new.bin")).unwrap(), b"new");
+    }
+
+    /// A temporary's name is drawn fresh for every try, from nothing another
+    /// user could know: not the process ID, not the clock. Another user who can
+    /// create entries in the directory must not be able to make every name
+    /// taken in advance.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_temp_names_are_unpredictable() {
+        let pid = std::process::id().to_string();
+        let names: Vec<_> = (0..64).map(|_| temp_name()).collect();
+        for name in &names {
+            let name = name.to_str().unwrap();
+            assert!(name.starts_with(".tmp"), "{name}");
+            assert!(!name.contains(&pid), "{name} holds the process ID");
+        }
+        let mut distinct = names.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), names.len(), "{names:?}");
     }
 }

@@ -264,10 +264,10 @@ const ATTEMPTS: u32 = 1 << 16;
 /// std has no random-number API; `RandomState` is seeded from the system's
 /// random source once per thread and stepped per instance, and the counter
 /// and clock make every call differ even so. Unpredictability is not what
-/// keeps a temporary safe -- `CREATE_NEW` is -- so this need only rarely
-/// collide.
-#[cfg(windows)]
-fn random_name_part() -> String {
+/// keeps a temporary safe -- exclusive creation is -- but it keeps another
+/// user who can create entries in the directory from taking every name
+/// first (`io::write_atomic`).
+pub(crate) fn random_name_part() -> String {
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
 

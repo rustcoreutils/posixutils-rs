@@ -726,11 +726,19 @@ fn entry_acl(source: &ftw::Entry) -> io::Result<Acl> {
 /// the mode of the file `fd` is open on.
 ///
 /// The ACLs are read by `acl` only now, and set in place of the copy's own, or removed where
-/// the source has none (`plib::acl::copy_to_fd`). Until they are, the copy may hold ACL
+/// the source has none (`plib::acl::copy_with_mode`). Until they are, the copy may hold ACL
 /// entries the source does not -- its old ones, or ones a new file inherited from its parent's
-/// default ACL -- whose permission is capped by the mask, the mode's group bits; so the group
-/// and other bits are cleared first, and the mode is given in full only once the ACLs are the
-/// source's (or the access ACL has set those bits itself, to the same).
+/// default ACL -- whose permission is capped by the mask, the mode's group bits; so the copy
+/// holds the owner's bits alone first (`plib::acl::interim_mode`), and the mode is given in
+/// full only once the ACLs are the source's (or the access ACL has set those bits itself, to
+/// the same).
+///
+/// A native ACL (macOS, an NFSv4 mount) is written in the same order. The mode does not cap
+/// it: a macOS allow entry grants its access at once. It is the source's own, which the
+/// finished copy holds anyway, and it replaces the copy's old or inherited entries as early as
+/// it can. But the set-ID bits are not held meanwhile, and are withheld for good where the ACL
+/// lets anyone but the owner write the file -- a -p failure -- so that nobody's writing becomes
+/// a set-ID program (`plib::acl::copy_with_mode`, the rule pax -p p follows too).
 ///
 /// One that cannot be set is a -p failure -- unless the copy loses nothing by it
 /// (`plib::acl::loses_nothing`) -- and then the copy keeps a mode granting no more than the
@@ -745,19 +753,16 @@ fn set_mode_and_acl(
 ) -> io::Result<()> {
     // Cast needed: `mode_t` is u16 on macOS, u32 on Linux.
     #[allow(clippy::unnecessary_cast)]
-    let (mode, owner_only) = (mode as u32, (mode as u32) & !0o077);
+    let mode = mode as u32;
     let set_mode =
         |mode: u32| chmod(mode as libc::mode_t).map_err(|e| preserve_mode_error(target, &e));
-    set_mode(owner_only)?;
-    let (written, kept) = match acl() {
-        Ok(acl) => match plib::acl::copy_to_fd(&acl, fd, owner_only) {
-            Ok(()) => (Ok(()), mode),
-            Err(e) => (Err(e), plib::acl::mode_without(Some(&acl), mode)),
-        },
-        Err(e) => (Err(e), plib::acl::mode_without(None, mode)),
+    set_mode(plib::acl::interim_mode(mode))?;
+    let (kept, failed) = match acl() {
+        Ok(acl) => plib::acl::copy_with_mode(&acl, fd, mode),
+        Err(e) => (plib::acl::mode_without(None, mode), Some(e)),
     };
     set_mode(kept)?;
-    written.map_err(|e| preserve_acl_error(target, &e))
+    failed.map_or(Ok(()), |e| Err(preserve_acl_error(target, &e)))
 }
 
 /// `fchmod(fd, mode)`.

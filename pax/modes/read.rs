@@ -1362,12 +1362,17 @@ fn recorded_attrs(entry: &ArchiveEntry) -> Attrs {
     }
 }
 
-/// The ACLs a member records (`SCHILY.acl.access`, and a directory's
-/// `SCHILY.acl.default`), to be given it under `-p p`; the reason, naming the
-/// record, where one is not an ACL this host can set.
+/// The ACLs a member records (`SCHILY.acl.access`, a directory's
+/// `SCHILY.acl.default`, and an NFSv4-style `SCHILY.acl.ace`), to be given it
+/// under `-p p`; the reason, naming the record, where one is not an ACL this
+/// host can set.
 ///
 /// A user or group is named as star names one: by the name, looked up here,
 /// then by the number after it -- as the member's own owner is (`owner_ids`).
+/// An NFSv4-style ACL becomes the kind this system holds one in
+/// (`plib::acl::native_from_ace_text`); one that says exactly what the mode
+/// does is dropped. A member with both kinds is given the kind its file takes,
+/// and the other is a loss (`plib::acl::copy_with_mode`).
 fn member_acl(entry: &ArchiveEntry) -> Result<plib::acl::Acl, String> {
     let parse = |keyword: &str, text: Option<&str>| {
         text.map(plib::acl::PosixAcl::from_text)
@@ -1379,10 +1384,15 @@ fn member_acl(entry: &ArchiveEntry) -> Result<plib::acl::Acl, String> {
     } else {
         None
     };
+    let native = match entry.acl_ace.as_deref() {
+        Some(text) => plib::acl::native_from_ace_text(text, entry.mode)
+            .map_err(|e| format!("SCHILY.acl.ace: {e}"))?,
+        None => None,
+    };
     Ok(plib::acl::Acl {
         access: parse("SCHILY.acl.access", entry.acl_access.as_deref())?,
         default,
-        native: None,
+        native,
     })
 }
 

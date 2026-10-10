@@ -15,6 +15,7 @@
 //! the inherited one replaced, as GNU tar --acls -p and cp -p do. Each case needs
 //! `setfacl`/`getfacl` and a filesystem that takes ACLs, and is skipped without them.
 
+mod ace;
 mod archived;
 
 use plib::testing::{

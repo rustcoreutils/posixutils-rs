@@ -138,6 +138,10 @@ pub struct ArchiveEntry {
     pub acl_access: Option<String>,
     /// A directory member's default ACL (`SCHILY.acl.default`), in the same form.
     pub acl_default: Option<String>,
+    /// The member's NFSv4-style ACL -- a macOS one, or a Linux NFSv4 mount's -- in the text
+    /// form libarchive writes (`SCHILY.acl.ace`: `owner@:rwxpaARWcCos::allow,...`). Only one
+    /// that says more than the mode is written.
+    pub acl_ace: Option<String>,
     /// The pax extended-header records this member carried that no field
     /// above already holds: `charset`, `hdrcharset`, `comment` and whatever
     /// implementation extensions the archive used.
@@ -179,6 +183,7 @@ impl ArchiveEntry {
             data_checksum: None,
             acl_access: None,
             acl_default: None,
+            acl_ace: None,
             ext_records: ExtRecords::default(),
             source_header: None,
         }

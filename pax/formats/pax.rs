@@ -112,6 +112,9 @@ pub struct ExtendedHeader {
     pub acl_access: Option<String>,
     /// SCHILY.acl.default - a directory's default ACL, likewise.
     pub acl_default: Option<String>,
+    /// SCHILY.acl.ace - an NFSv4-style ACL, in the text form libarchive
+    /// writes (`ArchiveEntry::acl_ace`), likewise.
+    pub acl_ace: Option<String>,
     /// Additional custom keywords
     pub extra: HashMap<String, String>,
     /// Keywords a zero-length record (`keyword=`) deleted.
@@ -145,11 +148,14 @@ const STANDARD_KEYWORDS: &[&str] = &[
     "gname",
     ACL_ACCESS,
     ACL_DEFAULT,
+    ACL_ACE,
 ];
 
 /// The keywords star, bsdtar and GNU tar --acls record POSIX.1e ACLs under.
 const ACL_ACCESS: &str = "SCHILY.acl.access";
 const ACL_DEFAULT: &str = "SCHILY.acl.default";
+/// The keyword star and bsdtar record an NFSv4-style ACL under.
+const ACL_ACE: &str = "SCHILY.acl.ace";
 
 impl ExtendedHeader {
     /// Create a new empty extended header
@@ -174,6 +180,7 @@ impl ExtendedHeader {
             "gname" => self.gname.is_some(),
             ACL_ACCESS => self.acl_access.is_some(),
             ACL_DEFAULT => self.acl_default.is_some(),
+            ACL_ACE => self.acl_ace.is_some(),
             _ => false,
         }
     }
@@ -194,6 +201,7 @@ impl ExtendedHeader {
             "gname" => self.gname = None,
             ACL_ACCESS => self.acl_access = None,
             ACL_DEFAULT => self.acl_default = None,
+            ACL_ACE => self.acl_ace = None,
             _ => {
                 self.extra.remove(keyword);
             }
@@ -230,6 +238,7 @@ impl ExtendedHeader {
         for (keyword, mine, theirs) in [
             (ACL_ACCESS, &mut self.acl_access, &later.acl_access),
             (ACL_DEFAULT, &mut self.acl_default, &later.acl_default),
+            (ACL_ACE, &mut self.acl_ace, &later.acl_ace),
         ] {
             if theirs.is_some() {
                 mine.clone_from(theirs);
@@ -276,6 +285,7 @@ impl ExtendedHeader {
             hdrcharset: self.hdrcharset.clone(),
             acl_access: self.acl_access.clone(),
             acl_default: self.acl_default.clone(),
+            acl_ace: self.acl_ace.clone(),
             extra: HashMap::new(),
             deleted: STANDARD_KEYWORDS
                 .iter()
@@ -454,6 +464,9 @@ impl ExtendedHeader {
             ACL_DEFAULT => {
                 self.acl_default = Some(value.to_string());
             }
+            ACL_ACE => {
+                self.acl_ace = Some(value.to_string());
+            }
             _ => {
                 // Store unknown keywords for potential future use
                 self.extra.insert(keyword.to_string(), value.to_string());
@@ -565,6 +578,9 @@ impl ExtendedHeader {
         if let Some(ref acl) = self.acl_default {
             rec!(ACL_DEFAULT, acl);
         }
+        if let Some(ref acl) = self.acl_ace {
+            rec!(ACL_ACE, acl);
+        }
         // Sorted: iterating a HashMap made the record order differ between runs
         // of the same command, so two invocations produced different bytes for
         // the same input -- hostile to reproducible builds and to diffing.
@@ -667,6 +683,10 @@ impl ExtendedHeader {
             entry.acl_default = Some(acl.clone());
             entry.set_ext_record(ACL_DEFAULT, acl);
         }
+        if let Some(ref acl) = self.acl_ace {
+            entry.acl_ace = Some(acl.clone());
+            entry.set_ext_record(ACL_ACE, acl);
+        }
         for (keyword, value) in &self.extra {
             entry.set_ext_record(keyword, value);
         }
@@ -686,6 +706,9 @@ impl ExtendedHeader {
         }
         if self.deleted.contains(ACL_DEFAULT) {
             entry.acl_default = None;
+        }
+        if self.deleted.contains(ACL_ACE) {
+            entry.acl_ace = None;
         }
     }
 
@@ -829,6 +852,7 @@ impl ExtendedHeader {
         // Its ACLs, which only an extended header can carry.
         header.acl_access.clone_from(&entry.acl_access);
         header.acl_default.clone_from(&entry.acl_default);
+        header.acl_ace.clone_from(&entry.acl_ace);
 
         header
     }
@@ -2091,6 +2115,8 @@ mod tests {
         let mut entry = ArchiveEntry::new(PathBuf::from("d"), EntryType::Directory);
         entry.acl_access = Some(access.to_string());
         entry.acl_default = Some("user::rwx,group::r-x,other::---".to_string());
+        let ace = "owner@:rwxpaARWcCos::allow,user:nobody:raRcs::allow:65534";
+        entry.acl_ace = Some(ace.to_string());
         let ext = ExtendedHeader::from_entry(&entry, &FormatOptions::default());
         let parsed = ExtendedHeader::parse(&ext.serialize(&FormatOptions::default())).unwrap();
         assert!(parsed.extra.is_empty());
@@ -2099,7 +2125,9 @@ mod tests {
         parsed.apply_to(&mut read);
         assert_eq!(read.acl_access, entry.acl_access);
         assert_eq!(read.acl_default, entry.acl_default);
+        assert_eq!(read.acl_ace, entry.acl_ace);
         assert_eq!(read.ext_record(ACL_ACCESS), Some(access));
+        assert_eq!(read.ext_record(ACL_ACE), Some(ace));
 
         let mut global = ExtendedHeader::new();
         global.merge(&parsed);
@@ -2108,6 +2136,11 @@ mod tests {
         global.apply_to(&mut read);
         assert_eq!(read.acl_access, None);
         assert_eq!(read.acl_default, entry.acl_default);
+        assert_eq!(read.acl_ace, entry.acl_ace);
+        global.merge(&ExtendedHeader::parse(&pax_record_bytes(ACL_ACE, b"")).unwrap());
+        let mut read = ArchiveEntry::new(PathBuf::from("d"), EntryType::Directory);
+        global.apply_to(&mut read);
+        assert_eq!(read.acl_ace, None);
     }
 
     fn pax_record_bytes(keyword: &str, value: &[u8]) -> Vec<u8> {

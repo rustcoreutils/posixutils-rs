@@ -2077,15 +2077,17 @@ fn acl_error(e: std::io::Error) -> PaxError {
 /// ACL of its directory, or a directory found existing has; none beyond the
 /// mode where the source has none -- as GNU tar --acls -p and cp -p do. While
 /// an ACL that is not the source's is there its named entries are capped by
-/// the mode's group bits (the mask), so those and the other bits are withheld
-/// until it is replaced -- and the ACL is written no wider than that withheld
-/// mode (`plib::acl::copy_to_fd`).
+/// the mode's group bits (the mask), and a native one may let others write at
+/// once, so the file holds the owner's bits alone until they are written
+/// (`plib::acl::interim_mode`), by the rule cp -p follows too
+/// (`plib::acl::copy_with_mode`).
 ///
 /// ACLs that cannot be set, or were not read (`Err`), are returned as the
 /// failure, unless that loses nothing (`plib::acl::loses_nothing`); the mode is
 /// then one granting no more than the source's ACLs did
 /// (`plib::acl::mode_without`), and the file is left no POSIX ACL, access or
-/// default, that a write failing part way had set (`plib::acl::write_fd`).
+/// default, that a write failing part way had set (`plib::acl::write_fd`). A
+/// native ACL letting others write withholds the set-ID bits, also a failure.
 /// Only a failure to set the mode at all is an `Err`.
 ///
 /// `fd` is the file the ACLs are written through; `None` where pax holds none
@@ -2109,7 +2111,7 @@ fn set_preserved_mode(
     };
     let Some(fd) = fd else {
         return match (acl, failed) {
-            (Ok(acl), None) if !acl.is_trivial() => {
+            (Ok(acl), None) if !acl.is_trivial_for(mode) => {
                 chmod(mode_without(Some(acl), mode))?;
                 Ok(Some(unsupported()))
             }
@@ -2128,11 +2130,10 @@ fn set_preserved_mode(
             _ => {}
         }
     }
-    chmod(mode & !0o077)?;
-    let (kept, failed) = match (plib::acl::copy_to_fd(wanted, fd, mode & !0o077), failed) {
+    chmod(plib::acl::interim_mode(mode))?;
+    let (kept, failed) = match (plib::acl::copy_with_mode(wanted, fd, mode), failed) {
         (_, Some(failed)) => (kept, Some(failed)),
-        (Ok(()), None) => (mode, None),
-        (Err(e), None) => (mode_without(Some(wanted), mode), Some(e)),
+        (copied, None) => copied,
     };
     chmod(kept)?;
     Ok(failed)

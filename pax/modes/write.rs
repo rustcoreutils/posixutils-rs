@@ -750,36 +750,53 @@ fn write_file<W: ArchiveWriter>(
     Ok(())
 }
 
-/// Give `member` the POSIX.1e ACLs of its source, the file the walk recorded at `source`, where
-/// the archive has a place for them (`supports_acls`) -- an access ACL only where it says more
-/// than the mode, a default ACL only on a directory. `read` reads them through a descriptor
-/// already checked to be that file, `None` when it is not. A failure to read them is reported,
-/// and the member written without them.
+/// Give `member` the ACLs of its source, the file the walk recorded at `source`, where the
+/// archive has a place for them (`supports_acls`): a POSIX.1e access ACL only where it says
+/// more than the mode, a default ACL only on a directory, an NFSv4-style one -- macOS's, or a
+/// Linux NFSv4 mount's -- only where it says more than the mode (`plib::acl::Acl::nfs4_text`).
+/// `read` reads them through a descriptor already checked to be that file, `None` when it is
+/// not. A failure to read them is reported, and the member written without them.
 ///
-/// Only Linux has POSIX ACLs to read; elsewhere nothing is read.
+/// Only Linux and macOS have ACLs to read. On macOS a FIFO or device cannot be opened to read
+/// its ACL without acting on it, so only a directory's and a regular file's are read there.
 fn add_acls<W: ArchiveWriter>(
     archive: &W,
     member: &mut ArchiveEntry,
     source: &ftw::Entry<'_>,
     read: impl FnOnce() -> std::io::Result<Option<plib::acl::Acl>>,
 ) {
-    if !cfg!(target_os = "linux") || !archive.supports_acls() {
+    let readable = if cfg!(target_os = "linux") {
+        true
+    } else if cfg!(target_os = "macos") {
+        member.is_dir() || member.entry_type == EntryType::Regular
+    } else {
+        false
+    };
+    if !readable || !archive.supports_acls() {
         return;
     }
     let path = source.path();
+    let report = |reason: String| crate::error::report_error(path.as_inner(), reason);
     let acl = match read() {
         Ok(Some(acl)) => acl,
         Ok(None) => {
-            let changed = gettextrs::gettext("cannot read ACL: file changed as we read it");
-            crate::error::report_error(path.as_inner(), changed);
+            report(gettextrs::gettext(
+                "cannot read ACL: file changed as we read it",
+            ));
             return;
         }
         Err(e) => {
-            let reason = gettextrs::gettext("cannot read ACL");
-            crate::error::report_error(path.as_inner(), format!("{reason}: {e}"));
+            report(format!("{}: {e}", gettextrs::gettext("cannot read ACL")));
             return;
         }
     };
+    match acl.nfs4_text(member.mode) {
+        Ok(ace) => member.acl_ace = ace,
+        Err(e) => {
+            report(format!("{}: {e}", gettextrs::gettext("cannot read ACL")));
+            return;
+        }
+    }
     member.acl_access = acl
         .access
         .filter(|access| !access.is_trivial())

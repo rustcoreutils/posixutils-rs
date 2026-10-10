@@ -118,6 +118,15 @@ struct Args {
     /// POSIX; accepted for conformance and otherwise ignored.
     #[arg(short = 'n', allow_hyphen_values = true, value_name = "namelist", help = gettext("Specify an alternative namelist file (accepted; ignored)"))]
     namelist: Option<String>,
+
+    /// procps: write no header line. util-linux's tests run
+    /// `ps --no-headers -ostat PID`.
+    #[arg(long = "no-headers", help = gettext("Write no header line"))]
+    no_headers: bool,
+
+    /// procps: process IDs given as operands select as -p does.
+    #[arg(value_name = "PID", help = gettext("Write information for these processes, as -p does"))]
+    pids: Vec<String>,
 }
 
 /// Field definition for -o option
@@ -151,6 +160,8 @@ fn get_posix_fields() -> HashMap<&'static str, (&'static str, usize)> {
         ("gid", ("GID", 5)),
         ("sid", ("SID", 5)),
         ("state", ("S", 1)),
+        // procps: the state and its flags, as BSD-style `ps u` shows them
+        ("stat", ("STAT", 4)),
         ("pri", ("PRI", 3)),
         ("addr", ("ADDR", 8)),
         ("sz", ("SZ", 6)),
@@ -278,6 +289,7 @@ fn parse_output_format(format_specs: &[String]) -> Result<Vec<OutputField>, Stri
                         "gid" => "gid",
                         "sid" => "sid",
                         "state" => "state",
+                        "stat" => "stat",
                         "pri" => "pri",
                         "addr" => "addr",
                         "sz" => "sz",
@@ -662,6 +674,7 @@ fn get_field_value(proc: &platform::ProcessInfo, field: &str, ctx: &Context) -> 
         "vsz" => proc.vsz.to_string(),
         "sz" => (proc.vsz / 4).to_string(), // Convert KB to blocks (4KB pages)
         "state" => proc.state.to_string(),
+        "stat" => psbsd::stat_column(proc),
         "f" => format!("{:x}", proc.flags & 0xf),
         "c" => cpu_utilization(proc.cpu_ms, proc.start_time, ctx.now).to_string(),
         "addr" => "-".to_string(), // Memory address - implementation specific
@@ -710,6 +723,7 @@ fn main() -> ExitCode {
         || args.session_leaders.is_some()
         || args.real_group.is_some()
         || args.pid_list.is_some()
+        || !args.pids.is_empty()
         || args.term_list.is_some()
         || args.user_list.is_some()
         || args.real_user.is_some();
@@ -724,11 +738,20 @@ fn main() -> ExitCode {
     let real_group_filter: Option<HashSet<u32>> =
         args.real_group.as_ref().map(|s| parse_group_list(s));
 
-    let pid_filter: Option<HashSet<i32>> = args.pid_list.as_ref().and_then(|s| {
+    let mut pid_filter: Option<HashSet<i32>> = args.pid_list.as_ref().and_then(|s| {
         parse_numeric_list(s)
             .map_err(|e| eprintln!("ps: -p: {}", e))
             .ok()
     });
+    for operand in &args.pids {
+        match parse_numeric_list(operand) {
+            Ok(pids) => pid_filter.get_or_insert_with(HashSet::new).extend(pids),
+            Err(e) => {
+                eprintln!("ps: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     let term_filter: Option<HashSet<String>> = args.term_list.as_ref().map(|s| parse_list(s));
 
@@ -845,7 +868,7 @@ fn main() -> ExitCode {
     };
 
     // Check if we should print header (all headers non-empty)
-    let print_header = output_fields.iter().any(|f| !f.header.is_empty());
+    let print_header = !args.no_headers && output_fields.iter().any(|f| !f.header.is_empty());
 
     // Capture the current time once so time-dependent fields are consistent
     // across the whole listing.

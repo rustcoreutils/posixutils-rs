@@ -7,9 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod acl;
 mod debhelper;
+mod debputy;
 mod dirmode;
 mod existing_dir;
+mod inherit;
 mod link;
 #[cfg(all(
     target_os = "linux",
@@ -19,6 +22,8 @@ mod old_kernel;
 mod race;
 mod umask;
 mod verbose;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod xattr;
 
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;

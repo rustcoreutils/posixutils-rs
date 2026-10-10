@@ -14,9 +14,9 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::mem;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 use plib::{diag, BUFSZ};
 
@@ -71,7 +71,6 @@ struct Args {
         short = 'L',
         long,
         allow_hyphen_values = true,
-        conflicts_with_all = ["maxnum", "replstr"],
         help = gettext(
             "The utility shall be executed for each non-empty number lines of arguments from standard input"
         )
@@ -82,7 +81,6 @@ struct Args {
         short = 'n',
         long,
         allow_hyphen_values = true,
-        conflicts_with_all = ["lines", "replstr"],
         help = gettext(
             "Invoke utility using as many standard input arguments as possible, up to number"
         )
@@ -112,7 +110,6 @@ struct Args {
         short = 'I',
         long,
         allow_hyphen_values = true,
-        conflicts_with_all = ["lines", "maxnum"],
         help = gettext("Insert mode: execute utility for each line, replacing replstr with input")
     )]
     replstr: Option<OsString>,
@@ -142,6 +139,15 @@ struct Args {
     )]
     exit: bool,
 
+    #[arg(
+        short = 'P',
+        allow_hyphen_values = true,
+        value_name = "MAXPROCS",
+        default_value_t = 1,
+        help = gettext("Run up to maxprocs invocations of the utility at once (0: no limit)")
+    )]
+    max_procs: usize,
+
     // XBD 12.2 Guideline 9: xargs's options all precede the utility, so the
     // utility name and every word after it are one trailing operand list.
     // Two separate positionals let clap go on parsing options after the
@@ -165,11 +171,47 @@ impl Args {
     /// Parse the command line and split the operand list into the utility
     /// and its arguments.
     fn parse_command_line() -> Self {
-        let mut args = plib::optarg::parse::<Args>();
+        let matches = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
+        let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        args.keep_last_batching_option(&matches);
         let mut command = std::mem::take(&mut args.command).into_iter();
         args.util = command.next().unwrap_or_else(|| OsString::from("echo"));
         args.util_args = command.collect();
         args
+    }
+
+    /// -I, -L and -n are mutually exclusive: the last one specified takes
+    /// effect, as POSIX permits, and each one it cancels is warned about.
+    /// `-n 1` after -I leaves -I in effect, silently, as GNU xargs does: each
+    /// -I command takes one line anyway, and util-linux's test runner passes
+    /// `-I '{}' ... -n 1`.
+    fn keep_last_batching_option(&mut self, matches: &clap::ArgMatches) {
+        let mut given: Vec<(usize, char)> = [("replstr", 'I'), ("lines", 'L'), ("maxnum", 'n')]
+            .into_iter()
+            .filter_map(|(id, opt)| Some((matches.index_of(id)?, opt)))
+            .collect();
+        given.sort();
+        let mut in_effect: Option<char> = None;
+        for (_, opt) in given {
+            if in_effect == Some('I') && opt == 'n' && self.maxnum == Some(1) {
+                self.maxnum = None;
+                continue;
+            }
+            if let Some(earlier) = in_effect {
+                diag::warning(
+                    &gettext("options -{} and -{} are mutually exclusive; ignoring -{}")
+                        .replacen("{}", &earlier.to_string(), 1)
+                        .replacen("{}", &opt.to_string(), 1)
+                        .replacen("{}", &earlier.to_string(), 1),
+                );
+                match earlier {
+                    'I' => self.replstr = None,
+                    'L' => self.lines = None,
+                    _ => self.maxnum = None,
+                }
+            }
+            in_effect = Some(opt);
+        }
     }
 }
 
@@ -178,12 +220,12 @@ impl Args {
 enum ExecResult {
     /// Command executed and returned this exit code
     Exited(i32),
+    /// Command was terminated by this signal
+    Signaled(i32),
     /// Command was not found (exit 127)
     NotFound,
     /// Command found but could not be invoked (exit 126)
     CannotInvoke,
-    /// User declined to execute (for -p mode)
-    Skipped,
 }
 
 /// The command line `util util_args...` as the bytes that -t and -p write,
@@ -221,64 +263,146 @@ fn prompt_confirm(util: &OsStr, util_args: &[OsString]) -> io::Result<bool> {
     ))
 }
 
-/// Execute the utility with the given arguments
-fn exec_util(
-    util: &OsStr,
-    util_args: Vec<OsString>,
+/// Runs the invocations of the utility, up to `max_procs` at once (0: no
+/// limit), and gathers what their results mean for xargs (`stop_after`).
+struct Runner<'a> {
+    util: &'a OsStr,
     trace: bool,
     prompt: bool,
-) -> io::Result<ExecResult> {
-    // If prompting, ask user for confirmation
-    if prompt {
-        match prompt_confirm(util, &util_args) {
-            Ok(true) => {} // proceed
-            Ok(false) => return Ok(ExecResult::Skipped),
-            Err(_) => return Ok(ExecResult::Skipped), // if can't read tty, skip
+    max_procs: usize,
+    running: Vec<Child>,
+    any_failed: bool,
+    /// The exit status once xargs must stop launching invocations.
+    stop: Option<i32>,
+}
+
+impl<'a> Runner<'a> {
+    fn new(args: &'a Args) -> Self {
+        Runner {
+            util: &args.util,
+            trace: args.trace || args.prompt, // -p implies -t
+            prompt: args.prompt,
+            max_procs: args.max_procs,
+            running: Vec::new(),
+            any_failed: false,
+            stop: None,
         }
-    } else if trace {
-        // If tracing (and not prompting, since prompt implies trace output),
-        // write command to stderr
-        let mut line = command_line_bytes(util, &util_args);
-        line.push(b'\n');
-        io::stderr().write_all(&line)?;
     }
 
-    match Command::new(util)
-        .args(util_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .output()
-    {
-        Ok(output) => {
-            let code = exit_code_from_status(output.status);
-            Ok(ExecResult::Exited(code))
+    /// Invoke the utility with `util_args`, first waiting for one running
+    /// invocation if `max_procs` are. False once xargs must stop: then
+    /// nothing more is launched, and `finish` gives its exit status.
+    fn run(&mut self, util_args: Vec<OsString>) -> io::Result<bool> {
+        if self.max_procs != 0 && self.running.len() >= self.max_procs {
+            self.reap_one()?;
         }
-        Err(e) => {
-            if e.kind() == io::ErrorKind::NotFound {
-                diag::error(&format!(
-                    "{}: {}",
-                    util.to_string_lossy(),
-                    gettext("No such file or directory")
-                ));
-                Ok(ExecResult::NotFound)
-            } else {
-                diag::error(&format!("{}: {}", util.to_string_lossy(), e));
-                Ok(ExecResult::CannotInvoke)
+        if self.stop.is_some() {
+            return Ok(false);
+        }
+        match self.spawn(util_args)? {
+            Some(child) => self.running.push(child),
+            None => return Ok(self.stop.is_none()),
+        }
+        // One at a time: the invocation ends before the next input is read.
+        if self.max_procs == 1 {
+            self.reap_one()?;
+        }
+        Ok(self.stop.is_none())
+    }
+
+    /// Start the utility after -p's prompt or -t's trace; `None` when -p is
+    /// declined or the utility cannot be started (recorded).
+    fn spawn(&mut self, util_args: Vec<OsString>) -> io::Result<Option<Child>> {
+        let util = self.util;
+        if self.prompt {
+            // A tty that cannot be read declines.
+            if !prompt_confirm(util, &util_args).unwrap_or(false) {
+                return Ok(None);
+            }
+        } else if self.trace {
+            // If tracing (and not prompting, since prompt implies trace
+            // output), write command to stderr
+            let mut line = command_line_bytes(util, &util_args);
+            line.push(b'\n');
+            io::stderr().write_all(&line)?;
+        }
+
+        match Command::new(util)
+            .args(util_args)
+            .stdin(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => Ok(Some(child)),
+            Err(e) => {
+                let result = if e.kind() == io::ErrorKind::NotFound {
+                    diag::error(&format!(
+                        "{}: {}",
+                        util.to_string_lossy(),
+                        gettext("No such file or directory")
+                    ));
+                    ExecResult::NotFound
+                } else {
+                    diag::error(&format!("{}: {}", util.to_string_lossy(), e));
+                    ExecResult::CannotInvoke
+                };
+                self.record(result);
+                Ok(None)
             }
         }
     }
-}
 
-/// Convert ExitStatus to exit code
-fn exit_code_from_status(status: ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        code
-    } else if let Some(sig) = status.signal() {
-        // Killed by signal: return 128 + signal number
-        128 + sig
-    } else {
-        1
+    /// Wait for one running invocation to end, and record its result.
+    fn reap_one(&mut self) -> io::Result<()> {
+        let status = if self.running.len() == 1 {
+            self.running.pop().expect("one running").wait()?
+        } else {
+            // Any of them: xargs has no children but these.
+            loop {
+                let mut status = 0;
+                let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+                if pid < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                if let Some(i) = self.running.iter().position(|c| c.id() == pid as u32) {
+                    // Reaped by the waitpid above.
+                    #[allow(clippy::zombie_processes)]
+                    self.running.swap_remove(i);
+                    break ExitStatus::from_raw(status);
+                }
+            }
+        };
+        self.record(match status.signal() {
+            Some(sig) => ExecResult::Signaled(sig),
+            None => ExecResult::Exited(status.code().unwrap_or(1)),
+        });
+        Ok(())
+    }
+
+    fn record(&mut self, result: ExecResult) {
+        if let Some(code) = stop_after(result, self.util, &mut self.any_failed) {
+            self.stop.get_or_insert(code);
+        }
+    }
+
+    /// Wait for every running invocation, and give xargs's exit status:
+    /// `status` when xargs itself failed, else what the invocations gave.
+    fn finish(&mut self, status: i32) -> i32 {
+        while !self.running.is_empty() {
+            if let Err(e) = self.reap_one() {
+                diag::error(&e.to_string());
+                self.running.clear();
+                self.stop.get_or_insert(1);
+            }
+        }
+        match self.stop {
+            Some(code) => code,
+            None if status != 0 => status,
+            None => i32::from(self.any_failed),
+        }
     }
 }
 
@@ -648,15 +772,9 @@ impl ParseState {
     }
 }
 
-/// Execute for insert mode (-I): one invocation per input line,
-/// replacing replstr in utility args with the input
-fn exec_insert_mode(
-    args: &Args,
-    replstr: &OsStr,
-    input_arg: &[u8],
-    trace: bool,
-    prompt: bool,
-) -> io::Result<ExecResult> {
+/// The utility's arguments for one input line in insert mode (-I), each
+/// replstr replaced with the line.
+fn insert_args(args: &Args, replstr: &OsStr, input_arg: &[u8]) -> io::Result<Vec<OsString>> {
     // Replace replstr with input_arg in each utility argument
     let util_args: Vec<OsString> = args
         .util_args
@@ -678,29 +796,39 @@ fn exec_insert_mode(
         ));
     }
 
-    exec_util(&args.util, util_args, trace, prompt)
+    Ok(util_args)
 }
 
-/// Helper macro to handle exec result
-macro_rules! handle_exec_result {
-    ($result:expr, $any_failed:expr) => {
-        match $result {
-            ExecResult::Exited(255) => {
-                return Ok(1);
-            }
-            ExecResult::Exited(code) if code != 0 => {
-                $any_failed = true;
-            }
-            ExecResult::NotFound => {
-                return Ok(127);
-            }
-            ExecResult::CannotInvoke => {
-                return Ok(126);
-            }
-            ExecResult::Skipped | ExecResult::Exited(0) => {}
-            ExecResult::Exited(_) => {}
+/// What one invocation's result means for xargs: `Some` exit status when it
+/// must stop, without processing any remaining input; a nonzero exit is
+/// recorded in `any_failed`.
+fn stop_after(result: ExecResult, util: &OsStr, any_failed: &mut bool) -> Option<i32> {
+    match result {
+        // POSIX: an invocation that exits 255 or is terminated by a signal
+        // makes xargs write a diagnostic and stop.
+        ExecResult::Exited(255) => {
+            diag::error(
+                &gettext("{}: exited with status 255; aborting")
+                    .replace("{}", &util.to_string_lossy()),
+            );
+            Some(1)
         }
-    };
+        ExecResult::Signaled(sig) => {
+            diag::error(
+                &gettext("{}: terminated by signal {}")
+                    .replacen("{}", &util.to_string_lossy(), 1)
+                    .replacen("{}", &sig.to_string(), 1),
+            );
+            Some(1)
+        }
+        ExecResult::NotFound => Some(127),
+        ExecResult::CannotInvoke => Some(126),
+        ExecResult::Exited(0) => None,
+        ExecResult::Exited(_) => {
+            *any_failed = true;
+            None
+        }
+    }
 }
 
 /// Emit the "argument line too long" diagnostic.
@@ -718,11 +846,12 @@ fn check_quote_error(state: &ParseState) -> bool {
     }
 }
 
-fn read_and_spawn(args: &Args) -> io::Result<i32> {
+/// Read the input and invoke the utility through `runner`: the status of
+/// xargs's own failure, 0 when there was none (and when the runner stopped,
+/// which holds the status then).
+fn read_and_spawn(args: &Args, runner: &mut Runner) -> io::Result<i32> {
     let mut state = ParseState::new(args);
-    let mut any_failed = false;
     let mut invoked = false;
-    let trace = args.trace || args.prompt; // -p implies -t
     let insert_mode = args.replstr.is_some();
     let line_mode = args.lines.is_some();
 
@@ -764,8 +893,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
                 util_args.extend(batch);
 
                 invoked = true;
-                let result = exec_util(&args.util, util_args, trace, args.prompt)?;
-                handle_exec_result!(result, any_failed);
+                if !runner.run(util_args)? {
+                    return Ok(0);
+                }
             }
         }
     } else {
@@ -803,8 +933,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
                     }
 
                     invoked = true;
-                    let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
-                    handle_exec_result!(result, any_failed);
+                    if !runner.run(insert_args(args, replstr, &input_arg)?)? {
+                        return Ok(0);
+                    }
                 }
             } else {
                 // Normal mode: batch arguments
@@ -827,8 +958,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
                     util_args.extend(batch);
 
                     invoked = true;
-                    let result = exec_util(&args.util, util_args, trace, args.prompt)?;
-                    handle_exec_result!(result, any_failed);
+                    if !runner.run(util_args)? {
+                        return Ok(0);
+                    }
                 }
             }
         }
@@ -855,8 +987,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
             }
 
             invoked = true;
-            let result = exec_insert_mode(args, replstr, &input_arg, trace, args.prompt)?;
-            handle_exec_result!(result, any_failed);
+            if !runner.run(insert_args(args, replstr, &input_arg)?)? {
+                return Ok(0);
+            }
         }
     } else {
         // The last argument read can overflow the batch, so what remains may
@@ -872,8 +1005,9 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
             util_args.extend(batch);
 
             invoked = true;
-            let result = exec_util(&args.util, util_args, trace, args.prompt)?;
-            handle_exec_result!(result, any_failed);
+            if !runner.run(util_args)? {
+                return Ok(0);
+            }
         }
     }
 
@@ -881,11 +1015,11 @@ fn read_and_spawn(args: &Args) -> io::Result<i32> {
     // executed exactly once unless -r (--no-run-if-empty) was given. (Insert
     // mode substitutes per input line, so an empty input means zero runs.)
     if !invoked && !insert_mode && !args.no_run_if_empty {
-        let result = exec_util(&args.util, args.util_args.clone(), trace, args.prompt)?;
-        handle_exec_result!(result, any_failed);
+        // Whether it stops xargs or not, nothing follows it.
+        runner.run(args.util_args.clone())?;
     }
 
-    Ok(if any_failed { 1 } else { 0 })
+    Ok(0)
 }
 
 fn main() {
@@ -893,13 +1027,15 @@ fn main() {
 
     let args = Args::parse_command_line();
 
-    let exit_code = match read_and_spawn(&args) {
+    let mut runner = Runner::new(&args);
+    let status = match read_and_spawn(&args, &mut runner) {
         Ok(code) => code,
         Err(e) => {
             diag::error(&e.to_string());
             1
         }
     };
+    let exit_code = runner.finish(status);
 
     std::process::exit(exit_code);
 }

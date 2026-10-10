@@ -1014,6 +1014,38 @@ fn test_ls_acl_plus_flag() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
+/// A directory whose only ACL is a default ACL -- what its new entries inherit -- still
+/// carries an alternate access method, and gets the `+` (as GNU ls shows it). Gated like
+/// `test_ls_acl_plus_flag`.
+#[test]
+fn test_ls_acl_plus_flag_for_a_default_acl_alone() {
+    let dir = plib::tmp::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    let sub = sub.to_str().unwrap();
+
+    let ok = std::process::Command::new("setfacl")
+        .args(["-d", "-m", "u:65534:rx", sub])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("Skipping: setfacl unavailable or filesystem lacks ACL support");
+        return;
+    }
+
+    ls_test_with_checker(&["-ld", sub], |_, output| {
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mode = stdout.split_whitespace().next().unwrap_or("");
+        assert!(
+            mode.starts_with('d') && mode.ends_with('+'),
+            "a default ACL alone should give '+': {stdout}"
+        );
+    });
+}
+
 // Explicit `-q` replaces non-printable filename characters with `?`.
 #[test]
 fn test_ls_q_non_printable() {

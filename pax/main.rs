@@ -471,6 +471,7 @@ fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         preserve_mtime: should_preserve_mtime(&args.privs),
         preserve_atime: should_preserve_atime(&args.privs),
         preserve_owner: should_preserve_owner(&args.privs),
+        preserve_xattrs: should_preserve_xattrs(&args.privs),
         interactive: args.interactive,
         update: args.update,
         update_final_name: args.update_final_name,
@@ -741,6 +742,7 @@ fn run_copy(args: &Args, name_lists: Vec<NameList>) -> PaxResult<()> {
         preserve_mtime: should_preserve_mtime(&args.privs),
         preserve_atime: should_preserve_atime(&args.privs),
         preserve_owner: should_preserve_owner(&args.privs),
+        preserve_xattrs: should_preserve_xattrs(&args.privs),
         link: args.link,
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,
@@ -1040,7 +1042,8 @@ fn parse_privs(privs: &[String]) -> (bool, bool, bool, bool) {
     // - atime: preserved (so 'a' disables it)
     // - mtime: preserved (so 'm' disables it)
     // - perms: NOT preserved unless 'p' or 'e' is given; otherwise the mode is
-    //   set as part of the normal file-creation action (archived mode & ~umask)
+    //   set as part of the normal file-creation action (archived mode & ~umask,
+    //   or under a default ACL the ACL it masks)
     // - owner: NOT preserved (so 'o' or 'e' enables it)
     let mut preserve_atime = true;
     let mut preserve_mtime = true;
@@ -1094,6 +1097,12 @@ fn current_umask() -> u32 {
 /// Check if permissions should be preserved
 fn should_preserve_perms(privs: &[String]) -> bool {
     parse_privs(privs).2
+}
+
+/// Check if extended attributes should be preserved: only `e` asks for them,
+/// and no later character takes them back.
+fn should_preserve_xattrs(privs: &[String]) -> bool {
+    privs.iter().any(|s| s.contains('e'))
 }
 
 /// Check if modification time should be preserved
@@ -1239,8 +1248,8 @@ mod tests {
     #[test]
     fn test_preserve_flags() {
         // Default (no -p): preserve atime, mtime; do NOT preserve perms (the mode
-        // is set as part of normal file creation, i.e. archived mode & ~umask) or
-        // owner.
+        // is set as part of normal file creation, i.e. archived mode & ~umask,
+        // or under a default ACL the ACL it masks) or owner.
         assert!(should_preserve_atime(&[]));
         assert!(should_preserve_mtime(&[]));
         assert!(!should_preserve_perms(&[]));
@@ -1257,6 +1266,10 @@ mod tests {
         assert!(should_preserve_mtime(&p(&["e"])));
         assert!(should_preserve_perms(&p(&["e"])));
         assert!(should_preserve_owner(&p(&["e"])));
+        assert!(should_preserve_xattrs(&p(&["e"])));
+        assert!(should_preserve_xattrs(&p(&["ea"])));
+        assert!(!should_preserve_xattrs(&p(&["pom"])));
+        assert!(!should_preserve_xattrs(&[]));
 
         // Combined flags
         assert!(!should_preserve_atime(&p(&["am"])));

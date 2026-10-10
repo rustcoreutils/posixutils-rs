@@ -132,6 +132,20 @@ pub struct ArchiveEntry {
     /// true from `ArchiveWriter::needs_data_checksum` asks its caller to fill
     /// this in first; every other format leaves it `None`.
     pub data_checksum: Option<u32>,
+    /// The member's POSIX.1e access ACL, in the text form a pax archive carries it in
+    /// (`SCHILY.acl.access`: `user::rw-,user:alice:r--:1000,...`). Only one that says more
+    /// than the mode is written; only the pax format has a place for it.
+    pub acl_access: Option<String>,
+    /// A directory member's default ACL (`SCHILY.acl.default`), in the same form.
+    pub acl_default: Option<String>,
+    /// The member's NFSv4-style ACL -- a macOS one, or a Linux NFSv4 mount's -- in the text
+    /// form libarchive writes (`SCHILY.acl.ace`: `owner@:rwxpaARWcCos::allow,...`). Only one
+    /// that says more than the mode is written.
+    pub acl_ace: Option<String>,
+    /// The member's extended attributes, as the records of a pax archive spell them
+    /// (`XattrRecord`), in the order they came: decoded only where `-p e` applies them. Only
+    /// the pax format has a place for them.
+    pub xattrs: Vec<XattrRecord>,
     /// The pax extended-header records this member carried that no field
     /// above already holds: `charset`, `hdrcharset`, `comment` and whatever
     /// implementation extensions the archive used.
@@ -171,6 +185,10 @@ impl ArchiveEntry {
             devmajor: 0,
             devminor: 0,
             data_checksum: None,
+            acl_access: None,
+            acl_default: None,
+            acl_ace: None,
+            xattrs: Vec::new(),
             ext_records: ExtRecords::default(),
             source_header: None,
         }
@@ -223,6 +241,16 @@ impl ArchiveEntry {
     pub fn is_dir(&self) -> bool {
         self.entry_type == EntryType::Directory
     }
+}
+
+/// One extended attribute, as a pax extended-header record carries it: `keyword` is the
+/// record's whole keyword -- `SCHILY.xattr.` and the name as it stands, as GNU tar and star
+/// write it, or `LIBARCHIVE.xattr.` and the name %-encoded, with the value base64 -- held as
+/// bytes, since a name need not be UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XattrRecord {
+    pub keyword: Vec<u8>,
+    pub value: Vec<u8>,
 }
 
 /// The extended-header records a member carried that no typed field of
@@ -363,6 +391,14 @@ pub trait ArchiveWriter {
     /// header ahead of the data it covers. Callers that say true here must read
     /// the member's contents once to sum them before handing over the entry.
     fn needs_data_checksum(&self) -> bool {
+        false
+    }
+
+    /// Whether the format has a place for a member's ACLs and extended
+    /// attributes (`ArchiveEntry::acl_access`, `ArchiveEntry::xattrs`). Only the
+    /// pax format does; a writer that returns `false` is handed none, and no
+    /// file's are read for it.
+    fn supports_acls(&self) -> bool {
         false
     }
 }

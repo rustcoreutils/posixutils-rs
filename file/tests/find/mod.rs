@@ -9,6 +9,7 @@
 
 mod bytes;
 mod debhelper;
+mod debian_perl;
 mod newermt;
 mod race;
 

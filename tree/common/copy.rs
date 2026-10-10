@@ -8,9 +8,10 @@
 //
 
 use super::pinned::{CopiedSources, PinnedEntry, SourceState};
-use super::{error_string, quote, Verbose};
+use super::{error_string, quote, quote_bytes, Verbose, Xattrs};
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
+use plib::acl::Acl;
 pub use plib::madefs::ChainTrust;
 pub use plib::madefs::MadeTrust;
 #[cfg(target_os = "linux")]
@@ -186,6 +187,9 @@ pub struct CopyConfig {
     pub destination: Destination,
     /// GNU `-v`: write each step done to standard output, in this wording.
     pub verbose: Option<Verbose>,
+    /// Whether the source's extended attributes are copied with its other characteristics,
+    /// where -p gives the copy those (cp -a, mv).
+    pub xattrs: Xattrs,
 }
 
 /// With `-v`, write to standard output what a copy step just did: `made_dir` when it made the
@@ -638,6 +642,10 @@ enum CopyResult {
     Skipped,
 }
 
+/// A regular file just copied: the source read, open still, with its `fstat` from before the
+/// read, and the destination written.
+type CopiedData = (fs::File, fs::Metadata, fs::File);
+
 /// A non-directory this copy made.
 struct CopiedFile {
     /// `(st_dev, st_ino)` of what was made, when known for certain (`FirstCopy::made`).
@@ -693,16 +701,195 @@ fn preserve_mode_error(target: &Path, e: &io::Error) -> io::Error {
     ))
 }
 
-/// -p through a descriptor cp holds for the destination it created or opened: times, then
-/// owner, then mode. Nothing is resolved by name, so a file renamed over the destination after
-/// cp opened it is never touched. The mode (set-user-ID included) is applied last, only to a
-/// file whose owner is already final.
+/// The -p failure to give the copy the source's ACLs, in GNU cp's words.
+fn preserve_acl_error(target: &Path, e: &io::Error) -> io::Error {
+    io::Error::other(gettext!(
+        "preserving permissions for '{}': {}",
+        target.display(),
+        error_string(e)
+    ))
+}
+
+/// The ACLs of the source open on `fd`, the descriptor its data or metadata came from, for -p
+/// (`plib::acl::read_source_fd`).
+pub fn source_acl(fd: libc::c_int) -> io::Result<Acl> {
+    plib::acl::read_source_fd(fd)
+}
+
+/// The directory, symbolic link or special file the walk recorded, whose ACLs and extended
+/// attributes -p and -a copy: read through one descriptor of its own, opened when first needed
+/// and required to be the very file recorded, as `fresh_source_md` requires its metadata to
+/// be (`plib::xattr::open_entry`).
 ///
-/// For an object trusted only as `ParentOwnerOnly` the times are applied and the owner and
-/// mode are not: that is reported (`owner_unverified_error`).
+/// `target` is the copy's path, and `cfg` says whether its extended attributes are copied.
+struct EntrySource<'a, 'e> {
+    entry: &'a ftw::Entry<'e>,
+    cfg: &'a CopyConfig,
+    target: &'a Path,
+    opened: std::cell::OnceCell<io::Result<Option<plib::xattr::EntryFd>>>,
+}
+
+impl<'a, 'e> EntrySource<'a, 'e> {
+    fn new(entry: &'a ftw::Entry<'e>, cfg: &'a CopyConfig, target: &'a Path) -> Self {
+        EntrySource {
+            entry,
+            cfg,
+            target,
+            opened: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The descriptor, or why there is none.
+    fn fd(&self) -> io::Result<&plib::xattr::EntryFd> {
+        match self
+            .opened
+            .get_or_init(|| plib::xattr::open_entry(self.entry))
+        {
+            Ok(Some(fd)) => Ok(fd),
+            Ok(None) => Err(io::Error::other(gettext!(
+                "'{}' changed during the copy",
+                self.entry.path()
+            ))),
+            Err(e) => Err(match e.raw_os_error() {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => io::Error::new(e.kind(), e.to_string()),
+            }),
+        }
+    }
+
+    /// Its ACLs (`plib::acl::read_opened`); without a procfs to read an `O_PATH` one through
+    /// nothing is read, and -p reports that.
+    fn acl(&self) -> io::Result<Acl> {
+        plib::acl::read_opened(self.fd()?)
+    }
+
+    /// Copy its extended attributes to the copy open on `dst` (`copy_xattrs`), where `cfg`
+    /// asks for them; `owner_kept` is whether the copy was given its owner. One that could not
+    /// be opened, or is no longer the file recorded, gives none, which is reported where `cfg`
+    /// asks for that (mv).
+    fn copy_xattrs(&self, dst: libc::c_int, owner_kept: bool) {
+        if self.cfg.xattrs == Xattrs::Skip {
+            return;
+        }
+        let source = self.entry.path();
+        let copy = || match self.fd() {
+            Ok(src) => plib::xattr::copy_from_entry(src, dst, owner_kept),
+            Err(e) => vec![plib::xattr::CopyFailure::List(e)],
+        };
+        copy_xattrs(self.cfg, copy, &source, self.target);
+    }
+}
+
+/// Copy the extended attributes of the source to the copy open on `dst` as `cfg.xattrs` asks
+/// (`plib::xattr::copy_fd`), `copy` doing it. What cannot be copied is diagnosed only where
+/// `cfg.xattrs` asks for that (mv, as GNU mv does), and never changes the exit status; cp -a,
+/// as GNU's, says nothing.
+fn copy_xattrs(
+    cfg: &CopyConfig,
+    copy: impl FnOnce() -> Vec<plib::xattr::CopyFailure>,
+    source: &Path,
+    target: &Path,
+) {
+    use plib::xattr::CopyFailure;
+    if cfg.xattrs == Xattrs::Skip {
+        return;
+    }
+    let failed = copy();
+    if cfg.xattrs != Xattrs::Report {
+        return;
+    }
+    for failure in failed {
+        let message = match failure {
+            CopyFailure::List(e) => {
+                gettext!(
+                    "listing attributes of {}: {}",
+                    quote(source),
+                    error_string(&e)
+                )
+            }
+            CopyFailure::Get(name, e) => gettext!(
+                "getting attribute {} of {}: {}",
+                quote_bytes(name.to_bytes()),
+                quote(source),
+                error_string(&e)
+            ),
+            CopyFailure::Set(name, e) => gettext!(
+                "setting attribute {} for {}: {}",
+                quote_bytes(name.to_bytes()),
+                quote(target),
+                error_string(&e)
+            ),
+        };
+        eprintln!("{}: {}", cfg.prog, message);
+    }
+}
+
+/// Give the copy open on `fd` the source's mode `mode` and ACLs, through `chmod`, which sets
+/// the mode of the file `fd` is open on.
+///
+/// The ACLs are read by `acl` only now, and set in place of the copy's own, or removed where
+/// the source has none (`plib::acl::copy_with_mode`). Until they are, the copy may hold ACL
+/// entries the source does not -- its old ones, or ones a new file inherited from its parent's
+/// default ACL -- whose permission is capped by the mask, the mode's group bits; so the copy
+/// holds the owner's bits alone first (`plib::acl::interim_mode`), and the mode is given in
+/// full only once the ACLs are the source's (or the access ACL has set those bits itself, to
+/// the same).
+///
+/// A native ACL (macOS, an NFSv4 mount) is written in the same order. The mode does not cap
+/// it: a macOS allow entry grants its access at once. It is the source's own, which the
+/// finished copy holds anyway, and it replaces the copy's old or inherited entries as early as
+/// it can. But the set-ID bits are not held meanwhile, and are withheld for good where the ACL
+/// lets anyone but the owner write the file -- a -p failure -- so that nobody's writing becomes
+/// a set-ID program (`plib::acl::copy_with_mode`, the rule pax -p p follows too).
+///
+/// One that cannot be set is a -p failure -- unless the copy loses nothing by it
+/// (`plib::acl::loses_nothing`) -- and then the copy keeps a mode granting no more than the
+/// source did (`plib::acl::mode_without`): the mode's group bits are a mask the source's
+/// owning group need not have had.
+///
+/// Where neither the source nor the copy has an ACL, the usual case, the copy is given its
+/// mode with one chmod (`plib::acl::set_preserved_mode`, which pax -p p shares).
+fn set_mode_and_acl(
+    chmod: impl Fn(libc::mode_t) -> io::Result<()>,
+    fd: libc::c_int,
+    mode: libc::mode_t,
+    acl: impl FnOnce() -> io::Result<Acl>,
+    target: &Path,
+) -> io::Result<()> {
+    // Cast needed: `mode_t` is u16 on macOS, u32 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let mode = mode as u32;
+    let set_mode =
+        |mode: u32| chmod(mode as libc::mode_t).map_err(|e| preserve_mode_error(target, &e));
+    let failed = match acl() {
+        Ok(acl) => plib::acl::set_preserved_mode(set_mode, fd, mode, Ok(&acl)),
+        Err(e) => plib::acl::set_preserved_mode(set_mode, fd, mode, Err(e)),
+    }?;
+    failed.map_or(Ok(()), |e| Err(preserve_acl_error(target, &e)))
+}
+
+/// `fchmod(fd, mode)`.
+fn fchmod(fd: libc::c_int, mode: libc::mode_t) -> io::Result<()> {
+    if unsafe { libc::fchmod(fd, mode) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// -p through a descriptor cp holds for the destination it created or opened: times, then
+/// owner, then the extended attributes (`xattrs`, given the descriptor and whether the owner
+/// was set; after the owner, as a change of owner clears a file capability), then mode and the ACLs the source has (`acl`,
+/// `set_mode_and_acl`). Nothing is resolved by name, so a file renamed over the destination
+/// after cp opened it is never touched. The mode (set-user-ID included) and the ACLs, which
+/// can grant more than it, are applied last, only to a file whose owner is already final.
+///
+/// For an object trusted only as `ParentOwnerOnly` the times are applied and the owner,
+/// extended attributes, mode and ACLs are not: that is reported (`owner_unverified_error`).
 pub fn preserve_through_fd(
     fd: libc::c_int,
     source_md: &impl MetadataExt,
+    acl: impl FnOnce() -> io::Result<Acl>,
+    xattrs: impl FnOnce(libc::c_int, bool),
     target: &Path,
     trust: MadeTrust,
 ) -> io::Result<()> {
@@ -716,26 +903,47 @@ pub fn preserve_through_fd(
     // A failure to duplicate the owner is not itself reported (POSIX leaves it unspecified);
     // its consequence is the mode below.
     let chown_ok = unsafe { libc::fchown(fd, source_md.uid(), source_md.gid()) } == 0;
-    if unsafe { libc::fchmod(fd, preserved_mode(source_md, chown_ok)) } != 0 {
-        return Err(preserve_mode_error(target, &io::Error::last_os_error()));
-    }
-    Ok(())
+    xattrs(fd, chown_ok);
+    let mode = preserved_mode(source_md, chown_ok);
+    set_mode_and_acl(|mode| fchmod(fd, mode), fd, mode, acl, target)
 }
 
-/// The mode a directory cp made without -p ends with (POSIX cp 2.g): the source's nine file
-/// permission bits less the umask, in place of the S_IRWXU-widened ones 2.e created it with.
-/// Every bit above those nine stays as `made` has it -- the sticky bit `mkdirat` applied, a
-/// set-group-ID bit inherited from its parent -- as GNU cp leaves them.
-fn made_dir_mode(made: u32, source: u32, umask: u32) -> u32 {
-    (made & 0o7000) | (source & 0o777 & !umask)
+/// The mode a directory cp made without -p is to be made with, as if `mkdir` had made it so
+/// (POSIX cp 2.g), in place of the S_IRWXU-widened one 2.e created it with: the source's nine
+/// file permission bits less `withheld` (`finish_made_dir_mode`), the umask then applied as
+/// `mkdir` applies it. Every bit above those nine stays as `made` has it -- the sticky bit
+/// `mkdirat` applied, a set-group-ID bit inherited from its parent -- as GNU cp leaves them.
+fn made_dir_mode(made: u32, source: u32, withheld: u32) -> u32 {
+    (made & 0o7000) | (source & 0o777 & !withheld)
 }
 
-/// POSIX cp 2.g without -p, for a directory cp made, once its contents are copied: set its
-/// mode (`made_dir_mode`) through the descriptor cp holds for it, never by name. Nothing is
-/// changed when the mode is already right.
+/// The mode cp makes a directory with without -p, to fill it before it is finished
+/// (`finish_made_dir_mode`): its source's permission bits less group and other write, as GNU
+/// makes it, OR'ed with S_IRWXU (POSIX cp 2.e).
+pub fn made_dir_interim_mode(source: u32) -> libc::mode_t {
+    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let mode = (source & 0o7777 & !0o022) as libc::mode_t;
+    mode | libc::S_IRWXU
+}
+
+/// The bits of a source directory's mode GNU cp -R withholds from the directory it makes in
+/// its place, under the umask `umask`: it makes the directory without the source's group and
+/// other write permission, and gives those back only where the umask allows them. Under a
+/// default ACL, where the umask applies to nothing else, that shows.
+fn withheld_by_cp_r(umask: u32) -> u32 {
+    0o022 & umask
+}
+
+/// POSIX cp 2.g without -p, for a directory cp made, once its contents are copied: give it
+/// what `mkdir` with the source's mode less `withheld` (`made_dir_mode`) would have -- that
+/// less the umask, or, under the default ACL it inherited, the access ACL that default gives
+/// (`plib::acl::set_made_dir_mode`) -- through the descriptor cp holds for it, never by name.
+/// The mode is not set again when it is already right.
 pub fn finish_made_dir_mode(
     fd: libc::c_int,
     source_md: &impl MetadataExt,
+    withheld: u32,
     umask: u32,
     target: &Path,
 ) -> io::Result<()> {
@@ -747,16 +955,19 @@ pub fn finish_made_dir_mode(
         ))
     };
     let made = fd_metadata(fd).map_err(|e| set_mode_error(&e))?.mode() & 0o7777;
-    let wanted = made_dir_mode(made, source_md.mode(), umask);
-    if wanted != made && unsafe { libc::fchmod(fd, wanted as libc::mode_t) } != 0 {
-        return Err(set_mode_error(&io::Error::last_os_error()));
-    }
-    Ok(())
+    let wanted = made_dir_mode(made, source_md.mode(), withheld);
+    let chmod = |mode: u32| {
+        if mode == made {
+            return Ok(());
+        }
+        fchmod(fd, mode as libc::mode_t)
+    };
+    plib::acl::set_made_dir_mode(fd, wanted, umask, chmod).map_err(|e| set_mode_error(&e))
 }
 
 /// A destination directory's attributes, once its contents are copied so nothing written into
-/// it moves its times afterwards: under -p the source's owner, mode and times on one this copy
-/// made, and on one it found only where nobody else could have created its name
+/// it moves its times afterwards: under -p the source's owner, mode, ACLs and times on one this
+/// copy made, and on one it found only where nobody else could have created its name
 /// (`found_dir_trust`); without -p the final mode of one this copy made
 /// (`finish_made_dir_mode`), and nothing on one it found. Applied through `fd`, the descriptor
 /// the copy has held for the directory since it entered it, never by name. The source's
@@ -766,10 +977,11 @@ fn finish_dir(
     fd: libc::c_int,
     source: &ftw::Entry<'_>,
     finish: DirFinish,
-    preserve: bool,
+    cfg: &CopyConfig,
     umask: u32,
     target: &Path,
 ) -> io::Result<()> {
+    let preserve = cfg.preserve;
     let trust = match finish {
         DirFinish::Made(trust) => trust,
         // cp's -p asks for the times along with the mode and owner, and without it a
@@ -784,10 +996,13 @@ fn finish_dir(
         .ok_or_else(|| io::Error::other(gettext!("cannot stat '{}'", source.path())))?;
     if preserve {
         // A directory made but trusted only as owned like its parent gets no owner and no
-        // mode.
-        preserve_through_fd(fd, source_md, target, trust)
+        // mode. Its ACLs, the default one included, and its extended attributes are read once
+        // it is filled, through one descriptor of its own.
+        let entry = EntrySource::new(source, cfg, target);
+        let xattrs = |dst, owner_kept| entry.copy_xattrs(dst, owner_kept);
+        preserve_through_fd(fd, source_md, || entry.acl(), xattrs, target, trust)
     } else {
-        finish_made_dir_mode(fd, source_md, umask, target)
+        finish_made_dir_mode(fd, source_md, withheld_by_cp_r(umask), umask, target)
     }
 }
 
@@ -820,6 +1035,13 @@ fn fresh_source_md(source: &ftw::Entry) -> io::Result<ftw::Metadata> {
 /// the residual is a replacement between that check and the call. A symbolic link's own mode
 /// is never set: Linux has none to set, and no access check reads it anywhere.
 ///
+/// A special file's ACLs (`source`) follow its mode on Linux, set through the pin's
+/// `self/fd/N` (`plib::acl::write_fd`), as GNU cp sets them; a symbolic link has none. Its
+/// extended attributes (cp -a, mv), a symbolic link's too, follow its owner the same way:
+/// that path ends at the link itself, and GNU cp -a copies a link's. Elsewhere neither is
+/// copied: nothing pins the node there, and reading or setting them goes by name or opens the
+/// file -- a residual, the copy keeping the mode alone.
+///
 /// The parent's owner is read from `dirfd` itself (`.` relative to it resolves no name). An
 /// operand resolved from the working directory has no parent descriptor, so only an object
 /// owned by cp's effective user is accepted there.
@@ -828,8 +1050,9 @@ fn preserve_made_node(
     name: &CStr,
     made_type: ftw::FileType,
     source_md: &ftw::Metadata,
-    target: &Path,
+    source: &EntrySource,
 ) -> io::Result<()> {
+    let target = source.target;
     let parent_uid = if dirfd == libc::AT_FDCWD {
         None
     } else {
@@ -850,7 +1073,7 @@ fn preserve_made_node(
             ))),
         }
     };
-    preserve_node_attributes(dirfd, name, made_type, check, source_md, target)
+    preserve_node_attributes(dirfd, name, made_type, check, source_md, source)
 }
 
 #[cfg(target_os = "linux")]
@@ -860,8 +1083,9 @@ fn preserve_node_attributes(
     made_type: ftw::FileType,
     check: impl Fn(u32, u64, bool, FsOwners) -> io::Result<MadeTrust>,
     source_md: &ftw::Metadata,
-    target: &Path,
+    source: &EntrySource,
 ) -> io::Result<()> {
+    let target = source.target;
     let fd = unsafe {
         libc::openat(
             dirfd,
@@ -908,9 +1132,12 @@ fn preserve_node_attributes(
             libc::AT_EMPTY_PATH,
         )
     } == 0;
+    // Through the pin's `self/fd/N`, which ends at a symbolic link itself.
+    source.copy_xattrs(fd, chown_ok);
     if made_type != ftw::FileType::SymbolicLink {
-        chmod_pinned(fd, preserved_mode(source_md, chown_ok))
-            .map_err(|e| preserve_mode_error(target, &e))?;
+        let mode = preserved_mode(source_md, chown_ok);
+        let acl = || source.acl();
+        set_mode_and_acl(|mode| chmod_pinned(fd, mode), fd, mode, acl, target)?;
     }
     Ok(())
 }
@@ -959,8 +1186,10 @@ fn preserve_node_attributes(
     made_type: ftw::FileType,
     check: impl Fn(u32, u64, bool, FsOwners) -> io::Result<MadeTrust>,
     source_md: &ftw::Metadata,
-    target: &Path,
+    source: &EntrySource,
 ) -> io::Result<()> {
+    // Neither the ACLs nor the extended attributes are copied here (`preserve_made_node`).
+    let target = source.target;
     let made = ftw::Metadata::new(dirfd, name, false)?;
     // Without the filesystem type, owners are taken to be stored: only cp's own are trusted.
     let trust = check(
@@ -1231,12 +1460,16 @@ where
                 // (2.g; under -p, the source's without the umask) is set by `finish_dir` once
                 // its contents are copied. Under -p it is made owner-only: until `finish_dir`
                 // duplicates the owner, the directory belongs to whoever ran cp, and group or
-                // other write permission would let others plant entries in it.
+                // other write permission would let others plant entries in it. Without -p it
+                // is made, as GNU makes it, without the source's group and other write
+                // permission too, which `finish_dir` gives back where the umask allows: under a
+                // default ACL the mode is the ACL's mask, and the directory is then no wider
+                // while it is filled than when it is finished.
                 let mode = if cfg.preserve {
                     libc::S_IRWXU
                 } else {
                     // OR'ed with S_IRWXU according to the spec
-                    source_md.mode() as libc::mode_t | libc::S_IRWXU
+                    made_dir_interim_mode(source_md.mode())
                 };
                 let ret = libc::mkdirat(target_dirfd, target_filename, mode);
 
@@ -1296,9 +1529,9 @@ where
             } else {
                 libc::O_EXCL
             };
-        // Returns the source's metadata from before the read, and the new destination, still
-        // open; or `None` for a -n skip.
-        let create_target_then_copy = || -> io::Result<Option<(fs::Metadata, fs::File)>> {
+        // Returns the source, its metadata from before the read, and the new destination, all
+        // still open; or `None` for a -n skip.
+        let create_target_then_copy = || -> io::Result<Option<CopiedData>> {
             let (mut source_file, source_before_read) =
                 open_source(source, source_md, source_open_flags)?;
 
@@ -1349,7 +1582,7 @@ where
             // 3.d
             io::copy(&mut source_file, &mut target_file)?;
 
-            Ok(Some((source_before_read, target_file)))
+            Ok(Some((source_file, source_before_read, target_file)))
         };
 
         // -n: any existing destination, a dangling link included, is left alone.
@@ -1543,7 +1776,7 @@ where
             ));
         }
 
-        let (source_before_read, target_file) = if replacing_existing {
+        let (source_file, source_before_read, target_file) = if replacing_existing {
             if target_is_dir {
                 let err_str = gettext!(
                     "cannot overwrite directory '{}' with non-directory '{}'",
@@ -1613,7 +1846,7 @@ where
                 }
 
                 io::copy(&mut source_file, &mut target_file)?;
-                (source_before_read, target_file)
+                (source_file, source_before_read, target_file)
             } else {
                 // 3.a.iii
                 if cfg.force {
@@ -1658,12 +1891,19 @@ where
 
         // -p through the descriptor just written, before it is closed; the source's metadata
         // from the fstat of the descriptor that was then read, taken before the read moved its
-        // access time (GNU keeps the original access time too).
+        // access time (GNU keeps the original access time too), and its ACLs from that same
+        // descriptor.
         let preserve_error = if cfg.preserve {
             // The file is cp's own: created with O_EXCL, or the very file the decision checked.
+            let src = source_file.as_raw_fd();
             preserve_through_fd(
                 target_file.as_raw_fd(),
                 &source_before_read,
+                || source_acl(src),
+                |dst, owner_kept| {
+                    let copy = || plib::xattr::copy_fd(src, dst, owner_kept);
+                    copy_xattrs(cfg, copy, &source.path(), target)
+                },
                 target,
                 MadeTrust::Full,
             )
@@ -1991,7 +2231,10 @@ fn preserve_made(
     }
     let name = unsafe { CStr::from_ptr(target_filename) };
     fresh_source_md(source)
-        .and_then(|source_md| preserve_made_node(target_dirfd, name, made_type, &source_md, target))
+        .and_then(|source_md| {
+            let entry = EntrySource::new(source, cfg, target);
+            preserve_made_node(target_dirfd, name, made_type, &source_md, &entry)
+        })
         .err()
 }
 
@@ -2530,14 +2773,7 @@ where
             if own {
                 BEFORE_FINISHING_OWN.with(|hook| hook.get().map(|hook| hook(fd.as_raw_fd())));
             }
-            let finished = finish_dir(
-                fd.as_raw_fd(),
-                &source,
-                finish,
-                cfg.preserve,
-                umask,
-                &dir_path,
-            );
+            let finished = finish_dir(fd.as_raw_fd(), &source, finish, cfg, umask, &dir_path);
             if let Err(e) = finished {
                 // Same policy as the file case: never fatal, exit-status only for cp.
                 eprintln!("{}: {}", cfg.prog, error_string(&e));
@@ -2820,6 +3056,8 @@ mod tests {
         let result = preserve_through_fd(
             target_file.as_raw_fd(),
             &source_md,
+            || -> std::io::Result<plib::acl::Acl> { panic!("the ACLs were read") },
+            |_, _| panic!("the extended attributes were copied"),
             &target,
             MadeTrust::ParentOwnerOnly,
         );
@@ -2892,6 +3130,55 @@ mod tests {
         let x = fs::metadata(dest.join("x")).unwrap();
         assert_eq!(x.mode() & 0o7777, 0o750);
         assert!(dest.join("x/f").exists() && dest.join("x/g").exists());
+    }
+
+    std::thread_local! {
+        /// The mode `record_interim_mode` saw.
+        static INTERIM_MODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn record_interim_mode(fd: libc::c_int) {
+        use std::os::unix::fs::MetadataExt;
+        let mode = super::fd_metadata(fd).unwrap().mode() & 0o7777;
+        INTERIM_MODE.with(|m| m.set(mode));
+    }
+
+    /// cp -R without -p makes a directory as GNU does, without the source's group and other
+    /// write permission (and with S_IRWXU, to fill it): under a default ACL, whose mask that
+    /// mode sets, it is never wider while being filled than the mode it ends with.
+    #[test]
+    fn a_made_directory_is_filled_without_group_write() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("s/x")).unwrap();
+        fs::write(dir.join("s/x/f"), b"data").unwrap();
+        fs::set_permissions(dir.join("s/x"), fs::Permissions::from_mode(0o775)).unwrap();
+        let dest = dir.join("dest");
+        fs::create_dir(&dest).unwrap();
+        if !plib::testing::set_default_acl(&dest) {
+            return;
+        }
+        let cfg = super::CopyConfig {
+            preserve: false,
+            ..cp_pr_config()
+        };
+        super::BEFORE_FINISHING_OWN.with(|hook| hook.set(Some(record_interim_mode)));
+        let copied = super::copy_file(
+            &cfg,
+            &dir.join("s/x"),
+            &dest.join("x"),
+            super::OperandTrust::Parent,
+            &mut super::CopyRun::default(),
+            None,
+            |_| false,
+        );
+        super::BEFORE_FINISHING_OWN.with(|hook| hook.set(None));
+        assert!(copied.is_ok(), "{copied:?}");
+        // The default ACL's mask r-x, as the mode 0755 makes it; not rwx.
+        assert_eq!(INTERIM_MODE.with(|m| m.get()), 0o750);
     }
 
     /// The anchor of a found operand is the directory its name is in only while that name is
@@ -3115,6 +3402,7 @@ mod tests {
             continue_on_error: true,
             destination: super::Destination::MayExist,
             verbose: None,
+            xattrs: super::Xattrs::Skip,
         }
     }
 
@@ -3239,6 +3527,7 @@ mod tests {
             continue_on_error: false,
             destination: super::Destination::MustCreate,
             verbose: None,
+            xattrs: super::Xattrs::Skip,
         }
     }
 

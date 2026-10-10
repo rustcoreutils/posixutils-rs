@@ -632,7 +632,7 @@ enum DirWriters {
 ///     root's private group, and that check reads the group's member list, not every account's
 ///     primary group: on RHEL and Fedora, `sync`, `shutdown`, `halt` and `operator` have
 ///     primary gid 0 and can write such a directory, which is now trusted for every user;
-///   - on macOS an ACL is never read (`acls_let_others_write`), so one granting someone else
+///   - on macOS an ACL is never read (`acl::lets_others_write`), so one granting someone else
 ///     write on a directory of root's goes unseen, as it does on the user's own;
 /// - for root, on Linux only (`ROOT_WORKS_FOR_USERS`), one user other than root, the one the
 ///   copy or extraction is for -- root extracting into `/home/alice`, which alice owns, with
@@ -677,7 +677,7 @@ fn dir_writers(
 
 /// Whether root trusts a tree one other user owns alone (`dir_writers`): on Linux only, the one
 /// system where every ACL that could let someone else write such a directory is read
-/// (`acls_let_others_write`). Elsewhere an ACL is never read -- a macOS ACL granting bob write
+/// (`acl::lets_others_write`). Elsewhere an ACL is never read -- a macOS ACL granting bob write
 /// on alice's 0755 directory would go unseen -- so root trusts only its own directories, as
 /// the private-group rule is off there too (`is_private_group`).
 const ROOT_WORKS_FOR_USERS: bool = cfg!(target_os = "linux");
@@ -736,7 +736,7 @@ fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
 /// permission either unless its group is the user's private group (`is_private_group`, asked
 /// of the directory's owner) -- the user's alone, so the directories a umask of 002 leaves group-writable, as Debian-style user
 /// private groups intend, count as the user's; and no ACL it carries may let others write
-/// (`acls_let_others_write`: POSIX, NFSv4 and CIFS ACLs on Linux), read last, only when the
+/// (`acl::lets_others_write`: POSIX, NFSv4 and CIFS ACLs on Linux), read last, only when the
 /// rest says the user's. A sticky directory others may write counts as one they can create
 /// entries in.
 ///
@@ -744,9 +744,8 @@ fn nobody_else_can_create(fd: RawFd) -> io::Result<bool> {
 /// below a directory such an ACL lets others write, a directory found existing, possibly one
 /// of theirs renamed there, is given the mode or owner asked for.
 fn only_the_user_writes(writers: DirWriters, dir: Option<RawFd>) -> bool {
-    let acls_allow = |group_writable| {
-        dir.is_some_and(|fd| !acls_let_others_write(|name| read_xattr(fd, name), group_writable))
-    };
+    let acls_allow =
+        |group_writable| dir.is_some_and(|fd| !crate::acl::lets_others_write(fd, group_writable));
     match writers {
         DirWriters::Others => false,
         DirWriters::Owner { .. } => acls_allow(false),
@@ -810,105 +809,6 @@ fn rests_on_roots_own(fd: RawFd, owner: u32) -> bool {
         held = Some(up);
     }
     false
-}
-
-/// Whether an ACL of a directory may let others write it, `read` reading one of its extended
-/// attributes, failing with ENODATA or EOPNOTSUPP where it has none or they are not supported:
-/// - an NFSv4 or CIFS ACL (`system.nfs4_acl`, `system.nfs4_acl_xdr`, `system.cifs_acl`): its
-///   attribute being there at all, its entries unread -- one may grant anyone write whatever
-///   the mode shows;
-/// - where the directory is group-writable, a POSIX access ACL (`system.posix_acl_access`)
-///   with a named user or group entry (`acl_names_others`), which shows in the mode as group
-///   write permission (the ACL mask) and nowhere else.
-///
-/// Any other failure to read one counts as one that does. Residual: an ACL a server applies
-/// that the client does not show as an attribute at all, which nothing here can see.
-fn acls_let_others_write(
-    read: impl Fn(&CStr) -> io::Result<Vec<u8>>,
-    group_writable: bool,
-) -> bool {
-    const NFS4_OR_CIFS: [&CStr; 3] = [
-        c"system.nfs4_acl",
-        c"system.nfs4_acl_xdr",
-        c"system.cifs_acl",
-    ];
-    let absent = |e: &io::Error| {
-        e.raw_os_error()
-            .is_some_and(|code| [libc::ENODATA, libc::EOPNOTSUPP, libc::ENOTSUP].contains(&code))
-    };
-    for name in NFS4_OR_CIFS {
-        match read(name) {
-            Err(e) if absent(&e) => {}
-            _ => return true,
-        }
-    }
-    if !group_writable {
-        return false;
-    }
-    match read(c"system.posix_acl_access") {
-        Ok(xattr) => acl_names_others(&xattr),
-        Err(e) => !absent(&e),
-    }
-}
-
-/// The extended attribute `name` of the directory open on `fd`.
-///
-/// An `O_PATH` descriptor takes no `fgetxattr` (EBADF); the attribute is then read through
-/// `/proc/self/fd/N`, once `/proc` is verified to be procfs (`procfs_dir`), which names the
-/// same inode and needs no permission on it to read a `system.` attribute. (The path is
-/// resolved again after the check: only root can mount something else over `/proc`.) Without
-/// a procfs to read through, the read fails, and the directory counts as one others may write.
-#[cfg(target_os = "linux")]
-fn read_xattr(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; 4096];
-    let read = |n: isize, mut buf: Vec<u8>| {
-        let len = usize::try_from(n).map_err(|_| io::Error::last_os_error())?;
-        buf.truncate(len);
-        Ok(buf)
-    };
-    let n = unsafe { libc::fgetxattr(fd, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
-        return read(n, buf);
-    }
-    procfs_dir()?;
-    let path = CString::new(format!("/proc/{}", proc_fd_name(fd).to_string_lossy()))
-        .expect("a formatted number has no NUL");
-    let n = unsafe {
-        libc::getxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
-    read(n, buf)
-}
-
-/// No extended attribute is read here: none is supported (EOPNOTSUPP), and only the mode tells.
-#[cfg(not(target_os = "linux"))]
-fn read_xattr(_fd: RawFd, _name: &CStr) -> io::Result<Vec<u8>> {
-    Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
-}
-
-/// Whether the `system.posix_acl_access` attribute `xattr` has an entry beyond the owner, the
-/// owning group, the mask and others -- or is not one this reads for certain. Its format is
-/// the kernel's: a little-endian 32-bit version (2), then 8-byte entries of a 16-bit tag, a
-/// 16-bit permission set and a 32-bit id.
-fn acl_names_others(xattr: &[u8]) -> bool {
-    const USER_OBJ: u16 = 0x01;
-    const GROUP_OBJ: u16 = 0x04;
-    const MASK: u16 = 0x10;
-    const OTHER: u16 = 0x20;
-    let Some((version, entries)) = xattr.split_first_chunk::<4>() else {
-        return true;
-    };
-    if u32::from_le_bytes(*version) != 2 || entries.len() % 8 != 0 {
-        return true;
-    }
-    entries.as_chunks::<8>().0.iter().any(|entry| {
-        let tag = u16::from_le_bytes([entry[0], entry[1]]);
-        !matches!(tag, USER_OBJ | GROUP_OBJ | MASK | OTHER)
-    })
 }
 
 /// Whether the group `gid` is the private group of the user `euid`, by the user-private-group
@@ -1215,7 +1115,7 @@ pub fn chmod_pinned(fd: RawFd, mode: libc::mode_t) -> io::Result<()> {
 /// call hands out the same descriptor. A pinned chmod, link or reopen used to open `/proc` by
 /// name and `fstatfs` it every time, a pair of system calls per file. Holding the verified
 /// descriptor is also safer than reopening by name: a lookup made relative to it goes through
-/// what was checked, whatever is mounted at `/proc` since. (`read_xattr` is the exception: no
+/// what was checked, whatever is mounted at `/proc` since. (`acl::read_xattr` is the exception: no
 /// `*at` form of `getxattr` takes the descriptor, so it still names `/proc` by path.) `self`
 /// resolves to whichever process looks it up, so a child forked after the first call that uses
 /// the descriptor still reaches its own `fd/N`. It is `O_CLOEXEC`, so nothing exec'd inherits
@@ -1314,17 +1214,34 @@ pub fn utimens_link_if_still(
 #[cfg(test)]
 mod tests {
     use super::{
-        acl_names_others, acls_let_others_write, dir_writers, empty_lending_read, group_entry,
-        group_is_private, is_private_group, made_by_us, others_can_rename, read_private_group,
-        trusted_owner, user_entry, utimens_link_if_still, verify_made_dir, ChainStart, ChainTrust,
-        DirWriters, FoundDir, FsOwners, MadeObject, MadeTrust, Preserve, UserEntry,
-        ROOT_WORKS_FOR_USERS,
+        dir_writers, empty_lending_read, group_entry, group_is_private, is_private_group,
+        made_by_us, others_can_rename, read_private_group, trusted_owner, user_entry,
+        utimens_link_if_still, verify_made_dir, ChainStart, ChainTrust, DirWriters, FoundDir,
+        FsOwners, MadeObject, MadeTrust, Preserve, UserEntry, ROOT_WORKS_FOR_USERS,
     };
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
     use std::rc::Rc;
+
+    /// Make the directory `path`, and each one missing above it, mode 0755 whatever the
+    /// umask: these tests' verdicts turn on who may write each directory, and other tests in
+    /// this binary hold the umask at 0 for a moment (`modestr::umask` reads it so), in which a
+    /// directory made by `mkdir` alone would be 0777.
+    fn make_dir(path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        let mut missing = Vec::new();
+        let mut at = path;
+        while std::fs::symlink_metadata(at).is_err() {
+            missing.push(at.to_path_buf());
+            at = at.parent().expect("the scratch directory exists");
+        }
+        std::fs::create_dir_all(path).unwrap();
+        for dir in missing {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
 
     /// A parent directory of `uid` with permission bits `mode`.
     fn parent(uid: u32, mode: libc::mode_t) -> libc::stat {
@@ -1378,8 +1295,8 @@ mod tests {
         }
         let tmp = crate::tmp::TempDir::new().unwrap();
         let root = tmp.path();
-        std::fs::create_dir_all(root.join("x/y/z")).unwrap();
-        std::fs::create_dir_all(root.join("open/z")).unwrap();
+        make_dir(root.join("x/y/z"));
+        make_dir(root.join("open/z"));
         for (dir, mode) in [("", 0o755), ("x", 0o755), ("x/y", 0o755), ("open", 0o777)] {
             let path = root.join(dir);
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1475,7 +1392,7 @@ mod tests {
         };
         let tmp = crate::tmp::TempDir::new().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::create_dir(tmp.path().join("x")).unwrap();
+        make_dir(tmp.path().join("x"));
         let in_tmp = Rc::new(std::fs::File::open(tmp.path()).unwrap());
         let x = std::fs::File::open(tmp.path().join("x")).unwrap();
         let anchor = ChainTrust::link_as(None, &in_tmp, ChainStart::Anchor, 0).unwrap();
@@ -1612,91 +1529,6 @@ mod tests {
         assert!(!group_is_private(500, &us, b"us", [None]));
     }
 
-    /// An NFSv4 or CIFS ACL may let anyone write, whatever the mode shows: its attribute being
-    /// there at all, or not readable for certain, makes a directory others may write -- with
-    /// group write permission or without. A POSIX ACL widens only group write permission, and
-    /// counts only then.
-    #[test]
-    fn which_acl_attributes_let_others_write() {
-        use std::ffi::CStr;
-        let absent = || Err(std::io::Error::from_raw_os_error(libc::ENODATA));
-        let unsupported = || Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-        let named_user = {
-            let mut xattr = 2u32.to_le_bytes().to_vec();
-            for tag in [0x01u16, 0x02, 0x04, 0x10, 0x20] {
-                xattr.extend(tag.to_le_bytes());
-                xattr.extend(7u16.to_le_bytes());
-                xattr.extend(0u32.to_le_bytes());
-            }
-            xattr
-        };
-        // Each case: the one attribute present (or failing), and whether that lets others
-        // write without group write permission and with it.
-        let cases: [(&CStr, std::io::Result<Vec<u8>>, bool, bool); 6] = [
-            (c"system.nfs4_acl", Ok(vec![0; 8]), true, true),
-            (c"system.nfs4_acl_xdr", Ok(Vec::new()), true, true),
-            (c"system.cifs_acl", Ok(vec![1]), true, true),
-            (
-                c"system.cifs_acl",
-                Err(std::io::Error::from_raw_os_error(libc::EIO)),
-                true,
-                true,
-            ),
-            (c"system.posix_acl_access", Ok(named_user), false, true),
-            (c"system.posix_acl_access", unsupported(), false, false),
-        ];
-        for (name, value, without_group, with_group) in cases {
-            let read = |asked: &CStr| -> std::io::Result<Vec<u8>> {
-                if asked != name {
-                    return absent();
-                }
-                match &value {
-                    Ok(value) => Ok(value.clone()),
-                    Err(e) => Err(std::io::Error::from_raw_os_error(e.raw_os_error().unwrap())),
-                }
-            };
-            assert_eq!(
-                acls_let_others_write(read, false),
-                without_group,
-                "{name:?}"
-            );
-            assert_eq!(acls_let_others_write(read, true), with_group, "{name:?}");
-        }
-        // No attribute at all, or none supported: the mode tells.
-        assert!(!acls_let_others_write(|_| absent(), true));
-        assert!(!acls_let_others_write(|_| unsupported(), true));
-    }
-
-    /// An access ACL names someone else when it has any entry but the owner's, the owning
-    /// group's, the mask and others'; one that cannot be read for certain counts as naming.
-    #[test]
-    fn which_access_acls_name_others() {
-        let acl = |tags: &[u16]| {
-            let mut xattr = 2u32.to_le_bytes().to_vec();
-            for &tag in tags {
-                xattr.extend(tag.to_le_bytes());
-                xattr.extend(7u16.to_le_bytes());
-                xattr.extend(u32::MAX.to_le_bytes());
-            }
-            xattr
-        };
-        // Owner, owning group, others; with a mask.
-        assert!(!acl_names_others(&acl(&[0x01, 0x04, 0x20])));
-        assert!(!acl_names_others(&acl(&[0x01, 0x04, 0x10, 0x20])));
-        // A named user, a named group, a tag not known.
-        assert!(acl_names_others(&acl(&[0x01, 0x02, 0x04, 0x10, 0x20])));
-        assert!(acl_names_others(&acl(&[0x01, 0x04, 0x08, 0x10, 0x20])));
-        assert!(acl_names_others(&acl(&[0x01, 0x04, 0x40, 0x20])));
-        // Not the format read here.
-        let mut other_version = acl(&[0x01, 0x04, 0x20]);
-        other_version[0] = 3;
-        assert!(acl_names_others(&other_version));
-        let mut torn = acl(&[0x01, 0x04, 0x20]);
-        torn.pop();
-        assert!(acl_names_others(&torn));
-        assert!(acl_names_others(&[2, 0]));
-    }
-
     /// The test user's own primary group, read from the real databases, agrees with the rule
     /// applied to what those databases list -- and an unknown user or group is never private.
     #[test]
@@ -1768,7 +1600,7 @@ mod tests {
         let tmp = crate::tmp::TempDir::new().unwrap();
         let root = tmp.path();
         // anchor 0755 / g 0777 (someone else can create here, whatever its group) / x 0755 / d
-        std::fs::create_dir_all(root.join("g/x/d")).unwrap();
+        make_dir(root.join("g/x/d"));
         for (dir, mode) in [("", 0o755), ("g", 0o777), ("g/x", 0o755)] {
             let path = root.join(dir);
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1850,8 +1682,8 @@ mod tests {
         let tmp = crate::tmp::TempDir::new().unwrap();
         let home = tmp.path().join("home");
         let open = tmp.path().join("open");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir(&open).unwrap();
+        make_dir(&home);
+        make_dir(&open);
         std::os::unix::fs::symlink(&home, open.join("l")).unwrap();
         let mode = Preserve {
             mode: true,
@@ -1881,7 +1713,7 @@ mod tests {
         assert_eq!(named.hands.found_dir(&*held, mode), FoundDir::AsRequested);
         // A name that holds another directory than the one opened.
         std::fs::rename(&home, tmp.path().join("moved")).unwrap();
-        std::fs::create_dir(&home).unwrap();
+        make_dir(&home);
         let named = ChainTrust::named(&home, &held).unwrap();
         assert_eq!(named.named_dir(mode), FoundDir::LeaveAlone);
         assert_eq!(named.hands.found_dir(&*held, mode), FoundDir::LeaveAlone);
@@ -1898,7 +1730,7 @@ mod tests {
         // home (0755) / sub, x; open (0777) / d -> ../home/sub, m -> ../home;
         // safe (0755) / l -> ../home, e -> ../open/m; loop (0755) / a -> b, b -> a.
         for dir in ["home/sub", "home/x", "open", "safe", "loop"] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
+            make_dir(root.join(dir));
         }
         let link = |target: &str, at: &str| std::os::unix::fs::symlink(target, root.join(at));
         link("../home/sub", "open/d").unwrap();
@@ -2036,8 +1868,8 @@ mod tests {
         let tmp = crate::tmp::TempDir::new().unwrap();
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let parent = std::fs::File::open(tmp.path()).unwrap();
-        std::fs::create_dir(tmp.path().join("fresh")).unwrap();
-        std::fs::create_dir(tmp.path().join("full")).unwrap();
+        make_dir(tmp.path().join("fresh"));
+        make_dir(tmp.path().join("full"));
         std::fs::write(tmp.path().join("full/f"), "").unwrap();
         // As under umask 0400.
         for name in ["fresh", "full"] {
@@ -2068,7 +1900,7 @@ mod tests {
     fn read_is_lent_only_when_the_check_needs_it() {
         let tmp = crate::tmp::TempDir::new().unwrap();
         let path = tmp.path().join("d");
-        std::fs::create_dir(&path).unwrap();
+        make_dir(&path);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
         let fd = open_search(&std::fs::File::open(tmp.path()).unwrap(), c"d");
         let st = {

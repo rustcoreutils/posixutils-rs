@@ -191,6 +191,12 @@ fn bsd_words_do_not_mix() {
     );
     assert!(out.stdout.is_empty());
 
+    // Not a BSD word, and not a process ID operand either.
     let out = ps(&["auxf"]);
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "ps: invalid number: auxf\n"
+    );
+    assert!(out.stdout.is_empty());
 }

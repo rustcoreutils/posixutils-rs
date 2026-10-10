@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, Read, Seek, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -244,6 +244,10 @@ impl<A: ArchiveWriter> ArchiveWriter for ArchiveSink<'_, A> {
 
     fn supports_sockets(&self) -> bool {
         self.0.supports_sockets()
+    }
+
+    fn supports_acls(&self) -> bool {
+        self.0.supports_acls()
     }
 }
 
@@ -469,7 +473,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             if !up_to_date {
                 // A header the format refuses (a time before 1970 in ustar,
                 // say) loses this entry, not everything below it.
-                match write_dir_entry(archive, &archive_path, metadata) {
+                match write_dir_entry(archive, entry, &archive_path, metadata) {
                     Err(e) if !crate::modes::is_fatal(&e) => crate::error::report_error(path, e),
                     r => r?,
                 }
@@ -486,7 +490,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
                 .ok_or_else(|| {
                     PaxError::InvalidHeader("symbolic link with no target".to_string())
                 })?;
-            write_symlink(archive, &archive_path, metadata, target)?;
+            write_symlink(archive, entry, &archive_path, metadata, target)?;
         } else if metadata.is_file() {
             write_file(
                 archive,
@@ -500,7 +504,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             // Block and character devices, FIFOs and sockets are archived from
             // their metadata; none of them is ever opened, so a FIFO with no
             // writer cannot block the walk.
-            write_special(archive, &archive_path, metadata, self.options)?;
+            write_special(archive, entry, &archive_path, metadata, self.options)?;
         }
 
         Ok(false)
@@ -510,10 +514,14 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
 /// Write a directory's header.
 fn write_dir_entry<W: ArchiveWriter>(
     archive: &mut W,
+    source: &ftw::Entry<'_>,
     archive_path: &Path,
     metadata: &ftw::Metadata,
 ) -> PaxResult<()> {
-    let dir_entry = build_entry(archive_path, metadata, EntryType::Directory)?;
+    let mut dir_entry = build_entry(archive_path, metadata, EntryType::Directory)?;
+    add_attrs(&*archive, &mut dir_entry, source, || {
+        plib::acl::read_entry_attrs(source, true)
+    });
     archive.write_entry(&dir_entry)?;
     archive.finish_entry()
 }
@@ -521,6 +529,7 @@ fn write_dir_entry<W: ArchiveWriter>(
 /// Write a symlink
 fn write_symlink<W: ArchiveWriter>(
     archive: &mut W,
+    source: &ftw::Entry<'_>,
     archive_path: &Path,
     metadata: &ftw::Metadata,
     target: PathBuf,
@@ -539,6 +548,10 @@ fn write_symlink<W: ArchiveWriter>(
     if archive.needs_data_checksum() {
         entry.data_checksum = Some(checksum_bytes(0, &target_bytes));
     }
+    // Its extended attributes, the link's own, as GNU tar archives them.
+    add_attrs(&*archive, &mut entry, source, || {
+        plib::acl::read_entry_attrs(source, true)
+    });
 
     archive.write_entry(&entry)?;
     // Write the symlink target as data (needed for cpio format)
@@ -552,6 +565,7 @@ fn write_symlink<W: ArchiveWriter>(
 #[cfg(unix)]
 fn write_special<W: ArchiveWriter>(
     archive: &mut W,
+    source: &ftw::Entry<'_>,
     path: &Path,
     metadata: &ftw::Metadata,
     options: &WriteOptions,
@@ -589,7 +603,10 @@ fn write_special<W: ArchiveWriter>(
         return Ok(());
     };
 
-    let entry = build_entry(path, metadata, entry_type)?;
+    let mut entry = build_entry(path, metadata, entry_type)?;
+    add_attrs(&*archive, &mut entry, source, || {
+        plib::acl::read_entry_attrs(source, true)
+    });
     archive.write_entry(&entry)?;
     archive.finish_entry()?;
 
@@ -599,6 +616,7 @@ fn write_special<W: ArchiveWriter>(
 #[cfg(not(unix))]
 fn write_special<W: ArchiveWriter>(
     _archive: &mut W,
+    _source: &ftw::Entry<'_>,
     path: &Path,
     _metadata: &ftw::Metadata,
     _options: &WriteOptions,
@@ -712,6 +730,10 @@ fn write_file<W: ArchiveWriter>(
         entry.data_checksum = Some(file_checksum(&mut file)?);
         file.rewind()?;
     }
+    // Its ACLs and extended attributes, read through the same descriptor.
+    add_attrs(&*archive, &mut entry, entry_ref, || {
+        plib::acl::read_source_attrs(file.as_raw_fd(), true).map(Some)
+    });
 
     // Write regular file
     archive.write_entry(&entry)?;
@@ -731,6 +753,118 @@ fn write_file<W: ArchiveWriter>(
     }
 
     Ok(())
+}
+
+/// Give `member` the ACLs and the extended attributes of its source, the file the walk
+/// recorded at `source`, where the archive has a place for them (`supports_acls`). Of the
+/// ACLs: a POSIX.1e access ACL only where it says more than the mode, a default ACL only on a
+/// directory, an NFSv4-style one -- macOS's, or a Linux NFSv4 mount's -- only where it says
+/// more than the mode (`plib::acl::Acl::nfs4_text`); none for a symbolic link. Of the
+/// extended attributes: each `plib::xattr::is_copied` admits (`add_xattrs`). `read` reads
+/// them through a descriptor already checked to be that file, `None` when it is not. A
+/// failure to read them is reported, and the member written without them.
+///
+/// Only Linux and macOS have them to read. On macOS a FIFO, device or symbolic link cannot be
+/// opened to read them without acting on it, so only a directory's and a regular file's are
+/// read there.
+fn add_attrs<W: ArchiveWriter>(
+    archive: &W,
+    member: &mut ArchiveEntry,
+    source: &ftw::Entry<'_>,
+    read: impl FnOnce() -> std::io::Result<Option<plib::acl::SourceAttrs>>,
+) {
+    let readable = if cfg!(target_os = "linux") {
+        true
+    } else if cfg!(target_os = "macos") {
+        member.is_dir() || member.entry_type == EntryType::Regular
+    } else {
+        false
+    };
+    if !readable || !archive.supports_acls() {
+        return;
+    }
+    let path = source.path();
+    let report = |reason: String| crate::error::report_error(path.as_inner(), reason);
+    let attrs = match read() {
+        Ok(Some(attrs)) => attrs,
+        Ok(None) => {
+            report(gettextrs::gettext(
+                "cannot read ACL or extended attributes: file changed as we read it",
+            ));
+            return;
+        }
+        Err(e) => {
+            report(format!(
+                "{}: {e}",
+                gettextrs::gettext("cannot read ACL or extended attributes")
+            ));
+            return;
+        }
+    };
+    add_xattrs(member, attrs.xattrs, &report);
+    if member.entry_type == EntryType::Symlink {
+        return;
+    }
+    add_acls(member, attrs.acl, &report);
+}
+
+/// Give `member` the ACLs `acl` read from its source: its NFSv4-style one as
+/// `SCHILY.acl.ace` text, and its POSIX access and (a directory's) default ones. A native ACL
+/// that cannot be made text is reported, and the POSIX ones are still given.
+fn add_acls(member: &mut ArchiveEntry, acl: plib::acl::Acl, report: &dyn Fn(String)) {
+    match acl.nfs4_text(member.mode) {
+        Ok(ace) => member.acl_ace = ace,
+        Err(e) => report(format!("{}: {e}", gettextrs::gettext("cannot read ACL"))),
+    }
+    member.acl_access = acl
+        .access
+        .filter(|access| !access.is_trivial())
+        .map(|access| access.to_text());
+    if member.is_dir() {
+        member.acl_default = acl.default.map(|default| default.to_text());
+    }
+}
+
+/// The most bytes of extended attribute values one member carries: the extended header's
+/// limit, less room for its other records. Only a macOS resource fork, which
+/// `XATTR_VALUE_MAX` does not bound, comes near it.
+const XATTR_BYTES_MAX: u64 = crate::formats::MAX_EXTENDED_HEADER - (1 << 20);
+
+/// Give `member` the extended attributes `xattrs` read from its source, each as a
+/// `SCHILY.xattr.<name>` record holding the value as it stands and the name as GNU tar
+/// --xattrs spells it (`formats::pax::schily_encode`) -- each a reader takes back
+/// (`formats::pax::decode_xattrs`). Left out and reported: one that could not be read; one
+/// larger than a reader takes.
+fn add_xattrs(member: &mut ArchiveEntry, xattrs: plib::xattr::Values, report: &dyn Fn(String)) {
+    use crate::formats::pax::{schily_encode, RESOURCE_FORK, XATTR_VALUE_MAX};
+    let lossy = |name: &std::ffi::CStr| String::from_utf8_lossy(name.to_bytes()).into_owned();
+    for (name, e) in xattrs.unread {
+        report(format!(
+            "{} {}: {e}",
+            gettextrs::gettext("cannot read extended attribute"),
+            lossy(&name)
+        ));
+    }
+    let mut bytes = 0u64;
+    for (name, value) in xattrs.read {
+        let name_bytes = name.to_bytes();
+        let too_large = (value.len() > XATTR_VALUE_MAX && name_bytes != RESOURCE_FORK)
+            || bytes + value.len() as u64 > XATTR_BYTES_MAX;
+        if too_large {
+            report(format!(
+                "{} {}: {}",
+                gettextrs::gettext("cannot archive extended attribute"),
+                lossy(&name),
+                gettextrs::gettext("value too large")
+            ));
+            continue;
+        }
+        bytes += value.len() as u64;
+        member.xattrs.push(crate::archive::XattrRecord {
+            keyword: [b"SCHILY.xattr.".as_slice(), &schily_encode(name_bytes)].concat(),
+            value,
+        });
+    }
 }
 
 /// Sum a file's bytes for the cpio "crc" format's c_check field
@@ -1039,6 +1173,34 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A native ACL that cannot be made text -- NFSv4 XDR that does not parse -- is reported,
+    /// and the POSIX access and default ACLs read with it are archived all the same.
+    #[test]
+    fn a_bad_nfs4_acl_keeps_the_posix_acls() {
+        use plib::acl::{Acl, Native, NativeKind, PosixAcl};
+        let access = "user::rwx,user:65534:r-x,group::r-x,mask::r-x,other::---";
+        let default = "user::rwx,group::r-x,other::---";
+        let acl = Acl {
+            access: Some(PosixAcl::from_text(access).unwrap()),
+            default: Some(PosixAcl::from_text(default).unwrap()),
+            native: Some(Native {
+                kind: NativeKind::Nfs4,
+                bytes: vec![0xff; 3],
+            }),
+        };
+        let mut member = ArchiveEntry::new(PathBuf::from("d"), EntryType::Directory);
+        member.mode = 0o750;
+        let reported = std::cell::RefCell::new(Vec::new());
+        add_acls(&mut member, acl.clone(), &|reason| {
+            reported.borrow_mut().push(reason)
+        });
+        assert_eq!(reported.borrow().len(), 1, "{:?}", reported.borrow());
+        assert!(reported.borrow()[0].starts_with("cannot read ACL: "));
+        assert_eq!(member.acl_ace, None);
+        assert_eq!(member.acl_access, acl.access.map(|a| a.to_text()));
+        assert_eq!(member.acl_default, acl.default.map(|d| d.to_text()));
+    }
 
     /// Collects member data; fails every call with `fail` once that is set.
     #[derive(Default)]

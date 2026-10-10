@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+#[cfg(unix)]
+pub mod acl;
 pub mod archive;
 pub mod cscan;
 #[cfg(unix)]
@@ -52,6 +54,8 @@ pub mod tty;
 pub mod user;
 #[cfg(unix)]
 pub mod utmpx;
+#[cfg(unix)]
+pub mod xattr;
 
 pub const BUFSZ: usize = 8 * 1024;
 

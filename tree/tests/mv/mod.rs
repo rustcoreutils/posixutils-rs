@@ -19,8 +19,11 @@ use std::os::unix::{
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+mod acl;
 mod race;
 mod verbose;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod xattr;
 
 fn mv_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

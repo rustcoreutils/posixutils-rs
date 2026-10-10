@@ -847,6 +847,7 @@ fn set_attrs_search_only(
     let proc_dir = made::procfs_dir()?;
     let name = made::proc_fd_name(fd.as_raw_fd());
     let target = AttrTarget::Proc {
+        fd,
         dir: proc_dir.as_fd(),
         name: &name,
     };
@@ -1852,6 +1853,23 @@ pub(crate) struct Attrs {
     /// modification time stands in for it.
     pub atime: Option<i64>,
     pub atime_nsec: i64,
+    /// The ACLs `-p p` gives it with its mode (`set_preserved_mode`): none
+    /// beyond the mode where the source has none, as is all that is known
+    /// without `-p p`; the reason, where the source's could not be read.
+    pub acl: Result<plib::acl::Acl, String>,
+    /// The extended attributes `-p e` gives it after its owner (`set_xattrs`):
+    /// none where the source has none, as is all that is known without `-p e`;
+    /// the reason, where the source's could not be read.
+    pub xattrs: Result<Xattrs, String>,
+}
+
+/// The extended attributes a file takes from its source (`Attrs::xattrs`).
+#[derive(Default)]
+pub(crate) struct Xattrs {
+    /// The name a failure to set one is reported under.
+    pub of: PathBuf,
+    /// Each, with its value.
+    pub values: Vec<(CString, Vec<u8>)>,
 }
 
 /// Which of those attributes the user asked to keep (`-p`).
@@ -1860,6 +1878,8 @@ pub(crate) struct AttrPolicy {
     pub preserve_perms: bool,
     pub preserve_mtime: bool,
     pub preserve_atime: bool,
+    /// `-p e` alone: the extended attributes.
+    pub preserve_xattrs: bool,
     pub umask: u32,
 }
 
@@ -1872,18 +1892,19 @@ impl AttrPolicy {
     /// reason, pax shall not set the S_ISUID and S_ISGID bits". Without
     /// `-p o`/`-p e` that is never, and a chown refused with EPERM leaves the
     /// file belonging to whoever ran pax -- a set-id bit there would hand out
-    /// that user's identity, not the archived one. Without `-p p`/`-p e` the
-    /// file is created by the normal file-creation action, so the mode is
-    /// modified by the umask exactly as `open()` or `mkdir()` would do.
+    /// that user's identity, not the archived one.
+    ///
+    /// Under `-p p`/`-p e` the member ends with exactly these bits. Without it
+    /// the file is created by the normal file-creation action: these are the
+    /// bits it is created with, which the umask modifies -- or, on Linux under a
+    /// parent's default ACL, which mask the ACL the member inherits -- exactly as
+    /// `open()` or `mkdir()` would do (`set_mode`).
     pub fn mode(&self, attrs: &Attrs, owner_set: bool) -> u32 {
         let mut mode = attrs.mode;
         if !(self.preserve_owner && owner_set) {
             #[allow(clippy::unnecessary_cast)] // u16 on macOS, u32 on Linux
             let setid = !((libc::S_ISUID | libc::S_ISGID) as u32);
             mode &= setid;
-        }
-        if !self.preserve_perms {
-            mode &= !self.umask;
         }
         mode
     }
@@ -1901,6 +1922,9 @@ impl AttrPolicy {
     /// `set_attrs_fd` applies [`AttrPolicy::mode`] through the descriptor once
     /// the data is complete, so any set-id bit the archive legitimately carries
     /// arrives then, on a file whose contents are already final.
+    ///
+    /// The umask is not applied here: the creating call applies it, or, under a
+    /// default ACL, does not.
     pub fn creation_mode(&self, attrs: &Attrs) -> u32 {
         self.mode(attrs, false) & 0o777
     }
@@ -1959,20 +1983,30 @@ pub(crate) fn set_attrs_fd(
 enum AttrTarget<'a> {
     Fd(BorrowedFd<'a>),
     /// A `self/fd/N` entry under a verified procfs `dir`, which cannot be
-    /// redirected: see `set_attrs_search_only`.
+    /// redirected: see `set_attrs_search_only`. `fd` is the descriptor it names.
     #[cfg(target_os = "linux")]
     Proc {
+        fd: BorrowedFd<'a>,
         dir: BorrowedFd<'a>,
         name: &'a CStr,
     },
 }
 
 impl AttrTarget<'_> {
+    /// The descriptor the attributes are for.
+    fn fd(&self) -> BorrowedFd<'_> {
+        match self {
+            AttrTarget::Fd(fd) => *fd,
+            #[cfg(target_os = "linux")]
+            AttrTarget::Proc { fd, .. } => *fd,
+        }
+    }
+
     fn chown(&self, uid: libc::uid_t, gid: libc::gid_t) -> libc::c_int {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) },
             #[cfg(target_os = "linux")]
-            AttrTarget::Proc { dir, name } => unsafe {
+            AttrTarget::Proc { dir, name, .. } => unsafe {
                 libc::fchownat(dir.as_raw_fd(), name.as_ptr(), uid, gid, 0)
             },
         }
@@ -1982,7 +2016,7 @@ impl AttrTarget<'_> {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::fchmod(fd.as_raw_fd(), mode) },
             #[cfg(target_os = "linux")]
-            AttrTarget::Proc { dir, name } => unsafe {
+            AttrTarget::Proc { dir, name, .. } => unsafe {
                 libc::fchmodat(dir.as_raw_fd(), name.as_ptr(), mode, 0)
             },
         }
@@ -1992,7 +2026,7 @@ impl AttrTarget<'_> {
         match self {
             AttrTarget::Fd(fd) => unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) },
             #[cfg(target_os = "linux")]
-            AttrTarget::Proc { dir, name } => unsafe {
+            AttrTarget::Proc { dir, name, .. } => unsafe {
                 libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times.as_ptr(), 0)
             },
         }
@@ -2017,8 +2051,30 @@ fn set_attrs_with(
     let owner_set = policy.preserve_owner
         && set_owner(attrs.uid, attrs.gid, |uid, gid| cvt(target.chown(uid, gid)))?;
 
-    if with_mode && target.chmod(policy.mode(attrs, owner_set) as libc::mode_t) != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    // Then the extended attributes, on what takes the mode: a chown clears a
+    // file capability.
+    let mut xattrs_failed = None;
+    if with_mode && policy.preserve_xattrs {
+        let chmod = |mode: u32| cvt(target.chmod(mode as libc::mode_t));
+        let fd = Some(target.fd().as_raw_fd());
+        xattrs_failed = set_xattrs(fd, &attrs.xattrs, owner_set, Some(&chmod));
+    }
+
+    let mut acl_failed = None;
+    if with_mode {
+        let chmod = |mode: u32| cvt(target.chmod(mode as libc::mode_t));
+        let mode = policy.mode(attrs, owner_set);
+        let fd = target.fd().as_raw_fd();
+        if policy.preserve_perms {
+            acl_failed = set_preserved_mode(chmod, Some(fd), mode, &attrs.acl)?;
+        } else if fstat(fd)?.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            // Made by this run at a mode of its own (`make_dir_at`, or 0777 to
+            // hold members below it): given what `mkdir()` with the member's
+            // mode would have.
+            plib::acl::set_made_dir_mode(fd, mode, policy.umask, chmod)?;
+        } else {
+            add_special_bits(|| fstat(fd), chmod, mode)?;
+        }
     }
 
     if let Some(times) = policy.times(attrs) {
@@ -2031,7 +2087,170 @@ fn set_attrs_with(
         }
     }
 
-    Ok(())
+    attr_failure(xattrs_failed, acl_failed)
+}
+
+/// The failure to give a member its extended attributes (`set_xattrs`) or its
+/// ACLs (`set_preserved_mode`), in the words of pax's other attribute
+/// failures; `Ok` where there was neither.
+fn attr_failure(xattrs: Option<String>, acl: Option<std::io::Error>) -> PaxResult<()> {
+    let reasons: Vec<String> = [
+        xattrs.map(|reason| format!("cannot set extended attributes: {reason}")),
+        acl.map(|e| format!("cannot set ACL: {e}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(PaxError::Io(std::io::Error::other(reasons.join("; "))))
+}
+
+/// `-p e`: give the file open on `fd` the extended attributes `xattrs` of its
+/// source, each that `plib::xattr::is_copied_to` admits for a file given its
+/// source's owner or not (`owner_set`) -- a file capability only to one that
+/// was -- as bsdtar -p and cp -a do. Each is created or replaced,
+/// and the file's others are left. It comes after the owner, whose change
+/// clears a file capability, and before the mode and ACLs.
+///
+/// From an archive, only those `plib::xattr::is_restored_from_archive` admits
+/// are handed here (`read::attrs_of`).
+///
+/// One the file cannot hold at all (`plib::xattr::unsupported`) is lost without
+/// a word, as cp -a loses it. One refused otherwise -- a `user.` one on a
+/// symbolic link or a FIFO, a `trusted.` one without privilege -- is warned
+/// of, naming the file, and the run still succeeds, as GNU tar 1.35 warns of
+/// it; so is every one where pax holds no descriptor of the file (`fd` is
+/// `None`, a node held by name), which then takes none. Records that do not
+/// decode (`Err`) are the failure returned, and none is set.
+///
+/// `fd` may be an `O_PATH` pin (Linux), set through its `/proc/self/fd/N`
+/// under a verified procfs (`plib::xattr::set_fd`): a symbolic link's own,
+/// never what it names.
+///
+/// `chmod`, given for a file or directory pax made or verified (one that is
+/// to take its mode), changes its mode: a read-only one is lent its owner's
+/// write permission while its attributes are set
+/// (`plib::xattr::set_all_lending_write`); a failure to lend or put back
+/// the mode is the failure returned.
+fn set_xattrs(
+    fd: Option<libc::c_int>,
+    xattrs: &Result<Xattrs, String>,
+    owner_set: bool,
+    chmod: Option<&dyn Fn(u32) -> std::io::Result<()>>,
+) -> Option<String> {
+    let xattrs = match xattrs {
+        Ok(xattrs) => xattrs,
+        Err(reason) => return Some(reason.clone()),
+    };
+    let Some(fd) = fd else {
+        if !xattrs.values.is_empty() {
+            crate::error::report_warning(
+                &xattrs.of,
+                "cannot set extended attributes: the file is not held open",
+            );
+        }
+        return None;
+    };
+    let values: Vec<(&CStr, &[u8])> = xattrs
+        .values
+        .iter()
+        .filter(|(name, _)| plib::xattr::is_copied_to(name.to_bytes(), owner_set))
+        .map(|(name, value)| (name.as_c_str(), value.as_slice()))
+        .collect();
+    let results = match chmod {
+        Some(chmod) => match plib::xattr::set_all_lending_write(fd, &values, chmod) {
+            Ok(results) => results,
+            Err(e) => return Some(e.to_string()),
+        },
+        None => values
+            .iter()
+            .map(|(name, value)| plib::xattr::set_fd(fd, name, value))
+            .collect(),
+    };
+    for ((name, _), result) in values.iter().zip(results) {
+        match result {
+            Err(e) if !plib::xattr::unsupported(&e) => crate::error::report_warning(
+                &xattrs.of,
+                format!(
+                    "cannot set extended attribute {}: {e}",
+                    String::from_utf8_lossy(name.to_bytes())
+                ),
+            ),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `-p p`: give a member, through `chmod`, exactly the mode `mode` and the
+/// ACLs `acl` its source has -- in place of any it inherited from a default
+/// ACL of its directory, or a directory found existing has; none beyond the
+/// mode where the source has none -- as GNU tar --acls -p and cp -p do. While
+/// an ACL that is not the source's is there its named entries are capped by
+/// the mode's group bits (the mask), and a native one may let others write at
+/// once, so the file holds the owner's bits alone until they are written
+/// (`plib::acl::interim_mode`), by the rule cp -p follows too
+/// (`plib::acl::copy_with_mode`).
+///
+/// ACLs that cannot be set, or were not read (`Err`), are returned as the
+/// failure, unless that loses nothing (`plib::acl::loses_nothing`); the mode is
+/// then one granting no more than the source's ACLs did
+/// (`plib::acl::mode_without`), and the file is left no POSIX ACL, access or
+/// default, that a write failing part way had set (`plib::acl::write_fd`). A
+/// native ACL letting others write withholds the set-ID bits, also a failure.
+/// Only a failure to set the mode at all is an `Err`.
+///
+/// `fd` is the file the ACLs are written through
+/// (`plib::acl::set_preserved_mode`, which cp -p shares); `None` where pax
+/// holds none (a node held by name), whose ACL is then left as it is, and
+/// which takes none of the source's.
+fn set_preserved_mode(
+    chmod: impl Fn(u32) -> std::io::Result<()>,
+    fd: Option<libc::c_int>,
+    mode: u32,
+    acl: &Result<plib::acl::Acl, String>,
+) -> std::io::Result<Option<std::io::Error>> {
+    use plib::acl::mode_without;
+    let Some(fd) = fd else {
+        return match acl {
+            Ok(acl) if !acl.is_trivial_for(mode) => {
+                chmod(mode_without(Some(acl), mode))?;
+                Ok(Some(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)))
+            }
+            Ok(_) => chmod(mode).map(|()| None),
+            Err(reason) => {
+                chmod(mode_without(None, mode))?;
+                Ok(Some(std::io::Error::other(reason.clone())))
+            }
+        };
+    };
+    let acl = acl
+        .as_ref()
+        .map_err(|reason| std::io::Error::other(reason.clone()));
+    plib::acl::set_preserved_mode(chmod, fd, mode, acl)
+}
+
+/// Without `-p p`: a file or node made by this run already has the permission
+/// bits its creating call gave it (`AttrPolicy::creation_mode`), with the umask
+/// or a default ACL applied; only the bits above those nine are made `mode`'s
+/// -- set-user-ID and set-group-ID once the owner is right, the sticky bit --
+/// through `chmod`, keeping the nine bits `stat` reads. One the creating call
+/// was handed anyway is taken off.
+fn add_special_bits(
+    stat: impl FnOnce() -> std::io::Result<libc::stat>,
+    chmod: impl Fn(u32) -> std::io::Result<()>,
+    mode: u32,
+) -> std::io::Result<()> {
+    let special = mode & 0o7000;
+    // Cast needed: `mode_t` is u16 on macOS and u32 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let made = stat()?.st_mode as u32 & 0o7777;
+    if made & 0o7000 == special {
+        return Ok(());
+    }
+    chmod((made & 0o777) | special)
 }
 
 /// Set the owner to `uid`/`gid` with `chown`, one of the chown calls, and say
@@ -2138,11 +2357,22 @@ fn apply_node_attrs(
 
     let owner_set =
         policy.preserve_owner && set_owner(attrs.uid, attrs.gid, |uid, gid| node.chown(uid, gid))?;
+    let mut xattrs_failed = None;
+    if policy.preserve_xattrs {
+        xattrs_failed = set_xattrs(node.acl_fd(), &attrs.xattrs, owner_set, None);
+    }
+    let mut acl_failed = None;
     if made_type != libc::S_IFLNK {
-        node.chmod(policy.mode(attrs, owner_set) as libc::mode_t)?;
+        let chmod = |mode: u32| node.chmod(mode as libc::mode_t);
+        let mode = policy.mode(attrs, owner_set);
+        if policy.preserve_perms {
+            acl_failed = set_preserved_mode(chmod, node.acl_fd(), mode, &attrs.acl)?;
+        } else {
+            add_special_bits(|| node.stat(), chmod, mode)?;
+        }
     }
     set_node_times(node, attrs, policy);
-    Ok(())
+    attr_failure(xattrs_failed, acl_failed)
 }
 
 /// The times `policy` asks for, through `node`; a failure is a warning.
@@ -2737,6 +2967,8 @@ mod tests {
             mtime_nsec: 0,
             atime: None,
             atime_nsec: 0,
+            acl: Ok(plib::acl::Acl::default()),
+            xattrs: Ok(Xattrs::default()),
         }
     }
 
@@ -2781,6 +3013,7 @@ mod tests {
             preserve_perms,
             preserve_mtime: false,
             preserve_atime: false,
+            preserve_xattrs: false,
             umask: 0o022,
         }
     }
@@ -2833,8 +3066,9 @@ mod tests {
     fn test_creation_mode_keeps_the_permission_bits() {
         // -p p preserves the mode exactly; the umask does not apply.
         assert_eq!(policy(true, true).creation_mode(&attrs(0o4755)), 0o755);
-        // Without -p p the normal file-creation action applies the umask.
-        assert_eq!(policy(false, false).creation_mode(&attrs(0o4777)), 0o755);
+        // Without -p p the creating call applies the umask (or a default ACL)
+        // itself: the bits are passed to it as archived.
+        assert_eq!(policy(false, false).creation_mode(&attrs(0o4777)), 0o777);
     }
 
     /// Set-id bits survive only when ownership was asked for *and* the chown

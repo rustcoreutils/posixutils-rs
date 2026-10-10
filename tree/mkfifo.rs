@@ -10,9 +10,11 @@
 use clap::Parser;
 use gettextrs::gettext;
 use modestr::ChmodMode;
+use plib::madefs::{chmod_fd, fs_owners, fstat, lstat_at, made_by_us, MadeObject, MadeTrust};
 use plib::modestr;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// mkfifo - make FIFO special files
 #[derive(Parser)]
@@ -50,7 +52,18 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Resul
         None
     };
 
-    let res = unsafe { libc::mkfifo(c_path.as_ptr(), mode_val as libc::mode_t) };
+    // Off Linux the FIFO is pinned to set its mode by a real open, for reading
+    // (`pin_made_fifo`), which its owner must be allowed: it is made with the owner's read
+    // permission lent, which giving it the mode `-m` names then takes back.
+    #[cfg(not(target_os = "linux"))]
+    let made_mode = if explicit_mode {
+        mode_val | 0o400
+    } else {
+        mode_val
+    };
+    #[cfg(target_os = "linux")]
+    let made_mode = mode_val;
+    let res = unsafe { libc::mkfifo(c_path.as_ptr(), made_mode as libc::mode_t) };
 
     // Restore the original umask if we changed it
     if let Some(umask) = old_umask {
@@ -61,7 +74,63 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode, explicit_mode: bool) -> io::Resul
         return Err(io::Error::last_os_error());
     }
 
+    // GNU mkfifo then sets the mode `-m` gives: `mkfifo` may take no set-user-ID or
+    // set-group-ID bit, and under a default ACL its mode only masks the ACL the FIFO inherits.
+    if explicit_mode {
+        // Cast for macOS, where `mode_t` is u16.
+        #[allow(clippy::unnecessary_cast)]
+        set_made_mode(&c_path, mode_val as libc::mode_t)?;
+    }
     Ok(())
+}
+
+/// Give the FIFO `path`, just made, the mode `mode`, through a descriptor checked to be that
+/// FIFO: a file put in its place meanwhile is not touched. Nothing is opened where the mode is
+/// already right.
+fn set_made_mode(path: &CStr, mode: libc::mode_t) -> io::Result<()> {
+    let st = lstat_at(libc::AT_FDCWD, path)?;
+    if st.st_mode & 0o7777 == mode & 0o7777 {
+        return Ok(());
+    }
+    let pin = pin_made_fifo(path, &st)?;
+    chmod_fd(pin.as_raw_fd(), mode)
+}
+
+/// The FIFO `path` names, opened without following a symbolic link and without waiting for a
+/// writer (`O_PATH` on Linux, `O_NONBLOCK` for reading elsewhere), and checked to be the one
+/// `st` saw, a FIFO this user owns with one link: one just made (`made_by_us`).
+fn pin_made_fifo(path: &CStr, st: &libc::stat) -> io::Result<OwnedFd> {
+    let replaced = || io::Error::other(gettext("it was replaced after it was made"));
+    // Off Linux the open is a real one: nothing but a FIFO is opened -- not a device put in
+    // its place, whose open could act on it -- and never as a controlling terminal.
+    if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(replaced());
+    }
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags =
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pin = unsafe { OwnedFd::from_raw_fd(fd) };
+    let held = fstat(pin.as_raw_fd())?;
+    let made = MadeObject {
+        uid: held.st_uid,
+        // Cast needed: `nlink_t` is u16 on macOS and u64 on Linux.
+        #[allow(clippy::unnecessary_cast)]
+        nlink: held.st_nlink as u64,
+        is_dir: false,
+        owners: fs_owners(pin.as_raw_fd()),
+    };
+    let same = (held.st_dev, held.st_ino) == (st.st_dev, st.st_ino)
+        && held.st_mode & libc::S_IFMT == libc::S_IFIFO;
+    match made_by_us(made, None, unsafe { libc::geteuid() }) {
+        Some(MadeTrust::Full) if same => Ok(pin),
+        _ => Err(replaced()),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

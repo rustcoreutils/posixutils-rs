@@ -8,6 +8,7 @@
 //
 
 mod bsd;
+mod procps;
 
 use plib::testing::{run_test_with_checker, TestPlan};
 use std::process::Output;

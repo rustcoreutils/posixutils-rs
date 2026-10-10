@@ -198,10 +198,12 @@ impl std::fmt::Display for ManError {
         match self {
             ManError::ManPaths => write!(f, "{}", gettext("man paths to man pages doesn't exist")),
             ManError::NoNames => write!(f, "{}", gettext("no names specified")),
+            // The historic wording (man-db, BSD man), which scripts and test
+            // suites match: perl's lib/perl5db.t, for one.
             ManError::PageNotFound(name) => write!(
                 f,
                 "{}",
-                gettext("system documentation for \"{}\" not found").replace("{}", name)
+                gettext("No manual entry for {}").replace("{}", name)
             ),
             ManError::ConfigFileNotFound(path) => write!(
                 f,
@@ -1446,7 +1448,7 @@ mod tests {
             (ManError::NoNames, "no names specified"),
             (
                 ManError::PageNotFound("ls".into()),
-                "system documentation for \"ls\" not found",
+                "No manual entry for ls",
             ),
             (
                 ManError::ConfigFileNotFound("/etc/man.conf".into()),

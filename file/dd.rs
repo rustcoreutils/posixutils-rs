@@ -12,6 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEF_BLOCK_SIZE: usize = 512;
@@ -107,10 +108,14 @@ struct Stats {
     out_full: u64,    // Full output blocks written
     out_partial: u64, // Partial output blocks written
     truncated: u64,   // Truncated records (for conv=block)
+    quiet: bool,      // status=none: write no statistics
 }
 
 impl Stats {
     fn print(&self) {
+        if self.quiet {
+            return;
+        }
         eprintln!("{}+{} records in", self.in_full, self.in_partial);
         eprintln!("{}+{} records out", self.out_full, self.out_partial);
         if self.truncated > 0 {
@@ -138,6 +143,8 @@ struct Config {
     notrunc: bool,
     bs_mode: bool,          // True if bs= was used (passthrough mode)
     iflags_fullblock: bool, // iflags=fullblock: accumulate a full ibs per block
+    fsync: bool,            // conv=fsync (GNU): fsync the output before exiting
+    quiet: bool,            // status=none (GNU): write no statistics
 }
 
 impl Default for Config {
@@ -156,6 +163,8 @@ impl Default for Config {
             notrunc: Default::default(),
             bs_mode: false,
             iflags_fullblock: false,
+            fsync: false,
+            quiet: false,
         }
     }
 }
@@ -375,6 +384,26 @@ impl OutputFile {
         }
     }
 
+    /// conv=fsync: commit the written data and metadata to the device.
+    /// Standard output is synced too, as GNU dd does, so a pipe or terminal
+    /// there fails the same way it does with GNU.
+    fn fsync(&self) -> io::Result<()> {
+        let fd = match self {
+            OutputFile::Stdout(s) => s.as_raw_fd(),
+            OutputFile::File(f) => f.as_raw_fd(),
+        };
+        loop {
+            // SAFETY: `fd` is open for the life of `self`.
+            if unsafe { libc::fsync(fd) } == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+
     fn try_seek(&mut self, pos: SeekFrom) -> io::Result<bool> {
         match self {
             OutputFile::Stdout(_) => Ok(false),
@@ -404,8 +433,24 @@ fn read_block(ifile: &mut InputFile, buf: &mut [u8], fullblock: bool) -> io::Res
     Ok(got)
 }
 
-fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error>> {
-    let mut stats = Stats::default();
+/// Name the output in a diagnostic the way GNU dd does.
+fn output_name(config: &Config) -> String {
+    let name = if config.ofile.is_empty() {
+        gettext("standard output")
+    } else {
+        config.ofile.to_string_lossy().into_owned()
+    };
+    format!("'{}'", name)
+}
+
+/// Copy input to output.  Returns the statistics and whether the copy
+/// succeeded; a failure already reported here (a failed conv=fsync) still
+/// leaves the statistics to be written.
+fn copy_convert_file(config: &Config) -> Result<(Stats, bool), Box<dyn std::error::Error>> {
+    let mut stats = Stats {
+        quiet: config.quiet,
+        ..Stats::default()
+    };
 
     // Open input file
     let mut ifile: InputFile = if config.ifile.is_empty() {
@@ -564,7 +609,21 @@ fn copy_convert_file(config: &Config) -> Result<Stats, Box<dyn std::error::Error
 
     ofile.flush()?;
 
-    Ok(stats)
+    // An interrupted copy ends as soon as the statistics are out, as GNU's
+    // does; only a finished one is synced.
+    if config.fsync && !INTERRUPTED.load(Ordering::SeqCst) {
+        if let Err(e) = ofile.fsync() {
+            eprintln!(
+                "dd: {} {}: {}",
+                gettext("fsync failed for"),
+                output_name(config),
+                plib::diag::io_error_text(&e)
+            );
+            return Ok((stats, false));
+        }
+    }
+
+    Ok((stats, true))
 }
 
 fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -585,6 +644,10 @@ fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::erro
             }
             "notrunc" => {
                 config.notrunc = true;
+                continue;
+            }
+            "fsync" => {
+                config.fsync = true;
                 continue;
             }
             _ => {
@@ -686,6 +749,16 @@ fn parse_cmdline(args: &[OsString]) -> Result<Config, Box<dyn std::error::Error>
 
             "conv" => parse_conv_list(&mut config, &oparg)?,
 
+            // GNU extension; only `none` is needed (util-linux's tests).
+            "status" => match oparg.as_str() {
+                "none" => config.quiet = true,
+                _ => {
+                    let msg = format!("{}: '{}'", gettext("invalid status level"), oparg);
+                    eprintln!("dd: {}", msg);
+                    return Err(msg.into());
+                }
+            },
+
             "iflags" => {
                 for flag in oparg.split(',') {
                     match flag {
@@ -730,7 +803,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let config = parse_cmdline(&args)?;
 
-    let stats = copy_convert_file(&config)?;
+    let (stats, copied) = copy_convert_file(&config)?;
     stats.print();
 
     // On SIGINT, terminate "as if by the default action" so the parent sees
@@ -743,5 +816,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if !copied {
+        std::process::exit(1);
+    }
     Ok(())
 }

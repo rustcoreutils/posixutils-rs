@@ -16,7 +16,7 @@ use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, link_replacing_with, make_dir_at, set_attrs_fd,
     set_made_node_attrs_recording, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, Expected,
-    MemberPath, PendingDirs,
+    MemberPath, PendingDirs, Xattrs,
 };
 use crate::modes::pins::{MadeFile, Making, PinBudget};
 use crate::modes::select::Selector;
@@ -50,6 +50,8 @@ pub struct ReadOptions {
     pub preserve_atime: bool,
     /// Preserve owner (requires privileges)
     pub preserve_owner: bool,
+    /// Preserve extended attributes (`-p e` alone)
+    pub preserve_xattrs: bool,
     /// Interactive rename mode
     pub interactive: bool,
     /// Update mode - only extract if archive member is newer
@@ -91,6 +93,7 @@ impl Default for ReadOptions {
             preserve_mtime: true,
             preserve_atime: true,
             preserve_owner: false,
+            preserve_xattrs: false,
             interactive: false,
             update: false,
             update_final_name: false,
@@ -1101,7 +1104,7 @@ fn extract_device(
     // Created without the set-id bits; set_made_attrs applies the archived
     // mode below, once the node exists.
     let mode: libc::mode_t =
-        (policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::mode_t) | type_bits;
+        (policy_of(options).creation_mode(&recorded_attrs(entry)) as libc::mode_t) | type_bits;
 
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         let r = unsafe { libc::mknodat(dirfd.as_raw_fd(), name.as_ptr(), mode, dev) };
@@ -1138,7 +1141,7 @@ fn extract_fifo(
             libc::mkfifoat(
                 dirfd.as_raw_fd(),
                 name.as_ptr(),
-                policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::mode_t,
+                policy_of(options).creation_mode(&recorded_attrs(entry)) as libc::mode_t,
             )
         };
         if r != 0 {
@@ -1201,7 +1204,7 @@ fn create_file(
             dirfd.as_raw_fd(),
             name.as_ptr(),
             flags,
-            policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::c_uint,
+            policy_of(options).creation_mode(&recorded_attrs(entry)) as libc::c_uint,
         )
     };
     if fd < 0 {
@@ -1333,22 +1336,79 @@ fn owner_ids(entry: &ArchiveEntry) -> (u32, u32) {
 /// The archived attributes of a member, in the shared shape.
 ///
 /// The owner is only ever applied under `-p o`, so only then are the user and
-/// group databases consulted for it: a lookup per member is not free.
+/// group databases consulted for it: a lookup per member is not free. Nor is
+/// reading its ACLs (a lookup per name in them), done only under `-p p`, nor
+/// decoding its extended attributes, done only under `-p e`. Each
+/// is done once per member, where the attributes are applied.
 fn attrs_of(entry: &ArchiveEntry, options: &ReadOptions) -> Attrs {
-    let (uid, gid) = if options.preserve_owner {
-        owner_ids(entry)
-    } else {
-        (entry.uid, entry.gid)
-    };
+    let mut attrs = recorded_attrs(entry);
+    if options.preserve_owner {
+        (attrs.uid, attrs.gid) = owner_ids(entry);
+    }
+    if options.preserve_perms {
+        attrs.acl = member_acl(entry);
+    }
+    // Only `user.` attributes, as GNU tar restores: the rest are dropped
+    // without a word, as it drops them.
+    if options.preserve_xattrs {
+        let keep = plib::xattr::is_restored_from_archive;
+        attrs.xattrs =
+            crate::formats::pax::decode_xattrs(&entry.xattrs, keep).map(|values| Xattrs {
+                of: entry.path.clone(),
+                values,
+            });
+    }
+    attrs
+}
+
+/// The attributes a member records, as they stand: no name looked up, no ACL
+/// read. What it is created with (`AttrPolicy::creation_mode`) needs no more.
+fn recorded_attrs(entry: &ArchiveEntry) -> Attrs {
     Attrs {
         mode: entry.mode,
-        uid,
-        gid,
+        uid: entry.uid,
+        gid: entry.gid,
         mtime: entry.mtime,
         mtime_nsec: entry.mtime_nsec as i64,
         atime: entry.atime,
         atime_nsec: entry.atime_nsec as i64,
+        acl: Ok(plib::acl::Acl::default()),
+        xattrs: Ok(Xattrs::default()),
     }
+}
+
+/// The ACLs a member records (`SCHILY.acl.access`, a directory's
+/// `SCHILY.acl.default`, and an NFSv4-style `SCHILY.acl.ace`), to be given it
+/// under `-p p`; the reason, naming the record, where one is not an ACL this
+/// host can set.
+///
+/// A user or group is named as star names one: by the name, looked up here,
+/// then by the number after it -- as the member's own owner is (`owner_ids`).
+/// An NFSv4-style ACL becomes the kind this system holds one in
+/// (`plib::acl::native_from_ace_text`); one that says exactly what the mode
+/// does is dropped. A member with both kinds is given the kind its file takes,
+/// and the other is a loss (`plib::acl::copy_with_mode`).
+fn member_acl(entry: &ArchiveEntry) -> Result<plib::acl::Acl, String> {
+    let parse = |keyword: &str, text: Option<&str>| {
+        text.map(plib::acl::PosixAcl::from_text)
+            .transpose()
+            .map_err(|e| format!("{keyword}: {e}"))
+    };
+    let default = if entry.is_dir() {
+        parse("SCHILY.acl.default", entry.acl_default.as_deref())?
+    } else {
+        None
+    };
+    let native = match entry.acl_ace.as_deref() {
+        Some(text) => plib::acl::native_from_ace_text(text, entry.mode)
+            .map_err(|e| format!("SCHILY.acl.ace: {e}"))?,
+        None => None,
+    };
+    Ok(plib::acl::Acl {
+        access: parse("SCHILY.acl.access", entry.acl_access.as_deref())?,
+        default,
+        native,
+    })
 }
 
 /// What `-p` asked to keep, in the shared shape.
@@ -1358,6 +1418,7 @@ fn policy_of(options: &ReadOptions) -> AttrPolicy {
         preserve_perms: options.preserve_perms,
         preserve_mtime: options.preserve_mtime,
         preserve_atime: options.preserve_atime,
+        preserve_xattrs: options.preserve_xattrs,
         umask: options.umask,
     }
 }
@@ -1562,16 +1623,20 @@ mod tests {
         assert!(!rename_member(&mut linked(EntryType::Hardlink), &drop_b, 0));
     }
 
-    /// Without explicit `-p p`/`-p e` the mode a made node ends up with is
-    /// the archived mode masked by the umask (normal file-creation action);
-    /// with preservation the exact archived mode is restored.
+    /// Without explicit `-p p`/`-p e` a made node keeps the mode its creating
+    /// call gave it, the archived mode with the umask or a default ACL applied
+    /// (normal file-creation action) -- here 0o640 -- and the archived mode is
+    /// not applied again over it; with preservation the exact archived mode is
+    /// restored.
     #[test]
-    fn test_set_permissions_umask_vs_preserve() {
+    fn test_set_permissions_created_vs_preserve() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = plib::tmp::TempDir::new().unwrap();
         let path = tmp.path().join("member");
         let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o640) }, 0);
+        // Whatever this process's umask took off.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
 
         // Attributes are applied relative to an open parent directory.
         let dir = std::fs::File::open(tmp.path()).unwrap();
@@ -1590,7 +1655,7 @@ mod tests {
                 & 0o7777
         };
 
-        // Not preserved: 0o777 & ~0o022 == 0o755.
+        // Not preserved: as created.
         let opts = ReadOptions {
             preserve_perms: false,
             preserve_mtime: false,
@@ -1607,7 +1672,7 @@ mod tests {
             &mut Making::new(false),
         )
         .unwrap();
-        assert_eq!(mode(), 0o755);
+        assert_eq!(mode(), 0o640);
 
         // Preserved: exact 0o777 regardless of umask.
         let opts = ReadOptions {

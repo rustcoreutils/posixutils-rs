@@ -82,6 +82,13 @@ utility below:
    POSIX calls bc an arbitrary precision calculator, and the limits it does
    grant by name — `{BC_SCALE_MAX}`, `{BC_BASE_MAX}`, `{BC_DIM_MAX}`,
    `{BC_STRING_MAX}` — do not include a ceiling on a value's digit count.
+ * A relational expression (`<`, `>`, `<=`, `>=`, `==`, `!=`) may appear in
+   any expression, not only as the condition of an `if`, `while` or `for`;
+   its value is 1 if the relation holds and 0 if not, so `2 > 1` as a
+   statement writes `1`.  As in GNU bc, the relational operators bind looser
+   than assignment and associate to the left: `a = 2 > 1` assigns 2 and
+   writes `1`, and `3 > 2 > 1` is `(3 > 2) > 1`.  Forced by util-linux's test
+   suite (`tests/ts/ipcs/functions.sh`).
 
 ### c17
 
@@ -178,6 +185,14 @@ spelling is taken in silence; C90 (`-ansi` included) draws a warning that
    reach C source.  Accepted because `c17` accepts it, so the two tools read
    the same files.
 
+### cmp
+
+ * `-n count` — compare at most `count` bytes.
+ * `skip1` and `skip2` operands — decimal byte counts to skip in the first and
+   second file before comparing; byte and line numbers count from the first
+   byte compared.  Both forced by util-linux's mkswap test
+   (`cmp -n OFFSET IMG /dev/zero`, `cmp IMG IMG.offset 0 OFFSET`).
+
 ### chown
 
  * An `owner:` operand with an empty group resolves the group to the owner's
@@ -201,8 +216,8 @@ dh_install, dh_installdocs, dh_installexamples and dh_strip,
 dh_installexamples), with GNU cp's meaning:
 
  * `-a` / `--archive` — `-R -P -p`, and files hard-linked to each other in
-   the source are hard-linked in the copy.  Extended attributes are not
-   copied.
+   the source are hard-linked in the copy, and extended attributes are
+   copied (see below).
  * `-d` — `-P`, with hard links kept as for `-a`.
  * `-n` / `--no-clobber` — an existing destination (other than a directory
    being merged into) is left alone, silently and without affecting the exit
@@ -210,6 +225,9 @@ dh_installexamples), with GNU cp's meaning:
  * `--reflink=auto` — accepted, and files are copied normally: `auto` asks
    for a copy-on-write clone only where one is available, so an ordinary copy
    is always a correct result.  Any other `--reflink` form is refused.
+ * `-t directory` — every operand is a source, copied into `directory`,
+   which must be an existing directory.  Forced by debputy, which
+   materializes every package with `cp --reflink=auto -t DIR FILE...`.
  * `--parents` — the destination of each source is the target directory
    followed by the source's path, and missing directories on that path are
    made from the source's (with `-p`, their owner, mode and times too).  The
@@ -231,6 +249,35 @@ dh_installexamples), with GNU cp's meaning:
    and `source -> dest` unquoted for each directory `--parents` makes, names
    quoted as GNU coreutils quotes them.  sysvinit installs with
    `cp -afv etc/* $(DESTDIR)...`.
+
+#### ACLs under `-p`
+
+POSIX leaves the effect of `-p` on additional and alternate access controls
+implementation-defined.  `cp -p` (and `-a`) and `mv` across filesystems give
+the copy the source's ACLs in place of the destination's own: access and,
+for a directory, default ACL; a source without one leaves the copy without
+one, removing what an existing destination had or a new one inherited.  GNU
+cp keeps the destination's named entries, masked by the new mode, which
+gives them the access the source grants its group class -- more than the
+source grants them.  An ACL that cannot be set is diagnosed (cp exits 1, mv
+completes with status 0) unless the source had none beyond its mode, and
+the copy then keeps a mode granting no more than the source did.
+
+#### Extended attributes under `-a`
+
+`cp -a` and `mv` across filesystems copy each extended attribute of a file,
+directory, special file or symbolic link, as GNU does; `-p` alone copies
+none.  An attribute already on an existing destination is kept unless the
+source has one of the same name.  Not copied: the ACLs (`system.posix_acl_*`,
+the NFSv4 and CIFS ones, macOS's), which go with the mode, and what libattr's
+`/etc/xattr.conf` skips: XFS's `trusted.SGI_ACL_FILE`, `SGI_ACL_DEFAULT`,
+`SGI_CAP_FILE`, `SGI_MAC_FILE` and `SGI_DMI_*`, `xfsroot.*`,
+`user.Beagle.*`, `security.evm` and `afs.*`.  `security.selinux` and
+`security.capability` are copied (setting either takes privilege).  One the
+destination's filesystem cannot hold is lost silently; any other failure is
+silent under `cp -a` and diagnosed by `mv`, and neither changes the exit
+status.  `cp --parents` gives the directories it makes none, as GNU's does.
+On macOS a special file's or symbolic link's are not copied.
 
 #### Existing directories under `-p`
 
@@ -328,6 +375,14 @@ but no daemon to run them.  Behavior follows Vixie cron:
 
  * Block-size suffixes `c`, `K`, `m`, `M`, `g` and `G`.  POSIX defines `b`
    (512), `k` (1024) and `x` products.
+ * `conv=fsync` — after the last block is written, `fsync` the output, data
+   and metadata.  Standard output is synced too, as GNU does, so a pipe or
+   `/dev/null` there fails: `fsync failed for 'NAME'`, then the statistics,
+   then exit status 1.  Forced by util-linux's test suite
+   (`tests/ts/fadvise/drop`).
+ * `status=none` — write no statistics; errors are still reported.  Any
+   other level is an invalid status level.  Forced by util-linux's test
+   suite (`tests/ts/lsfd/error-eperm`).
 
 ### df
 
@@ -414,13 +469,17 @@ table is present.
    entries deeper than `n` are not walked.  The path operand is depth 0.
    Forced by debhelper (`dh_update_autotools_config`, `dh_movelibkdeinit`).
  * `-printf format` — an action writing `format` for each file, with only
-   the directives `%p`, `%P` (path without its starting point), `%s`, `%T@`
-   and `%%` and the escapes `\n`, `\\` and `\NNN` (octal, so `\0` is NUL).
-   Any other directive or escape is an error.  Forced by debhelper
-   (`dh_autoreconf`, `dh_installdeb`, `dh_md5sums`, `dh_installgsettings`).
+   the directives `%p`, `%P` (path without its starting point), `%f` (path
+   without its leading directories), `%s`, `%T@` and `%%` and the escapes
+   `\n`, `\\` and `\NNN` (octal, so `\0` is NUL).  Any other directive or
+   escape is an error.  Forced by debhelper (`dh_autoreconf`,
+   `dh_installdeb`, `dh_md5sums`, `dh_installgsettings`); `%f` by Debian's
+   perl packaging (`debian/perl.install`, `debian/perl-doc.install`).
  * `-or` / `-and` — spellings of `-o` / `-a`.  Forced by debhelper
    (`dh_install`, `dh_installdocs`, `dh_shlibdeps`, and the `-X` exclusions
    of every dh_* tool).
+ * `-not` — a spelling of `!`.  Forced by Debian's perl packaging
+   (`debian/perl.install`, `debian/perl-doc.install`).
  * `-true` / `-false` — primaries that are always true / always false.
    Forced by debhelper (`dh_fixperms` joins every walk with `-a -true`,
    `dh_compress` prunes with `-prune -false`).
@@ -470,6 +529,16 @@ table is present.
    `:`, and `--` between groups that do not touch (in a later file too).
    `-A` and `-B` win over `-C`.  Only the output of lines changes, not `-c`,
    `-l` or `-q`.  gzip's zgrep tests run `grep -15`.
+ * `-o` / `--only-matching` — write each non-empty matched part of a
+   selected line on a line of its own, after the line's prefixes: leftmost
+   first, the longest of those starting there, without overlap.  An empty
+   match is not written but still selects its line.  `-w`, `-x`, `-i` and
+   `-F` decide what matches as they do for lines.  Under `-v` a selected line
+   writes nothing; with context options, context lines write nothing except
+   under `-v`, where their matches are written marked with `-`, and `--`
+   still separates groups, all as in GNU grep.  `-c`, `-l` and `-q` are
+   unchanged.  Forced by util-linux's test suite
+   (`tests/ts/libmount/debug`).
 
 ### head
 
@@ -655,6 +724,59 @@ Debian source packages, with GNU patch's meaning:
    volume.  Written in ustar format only, and incompatible with `-z`.
  * `-p` on a directory that already existed follows the rule under
    [cp, existing directories under `-p`](#existing-directories-under--p).
+ * POSIX.1e ACLs.  `-x pax` always records a file's access ACL, where it
+   says more than the mode, and a directory's default ACL, as the
+   `SCHILY.acl.access` and `SCHILY.acl.default` records star, bsdtar and GNU
+   tar `--acls` write, in star's text form (`user:alice:r--:1000`: the name,
+   then the number).  ustar and cpio have no place for one, and get none.
+   Reading, a name is looked up first and the number used only where the
+   name is unknown, as for a member's owner.
+ * `-p p` and `-p e` give each member its archived mode and ACLs, and no ACL
+   beyond them, as GNU tar `--acls -p` does: the ACL a new member inherited
+   from its directory's default ACL is replaced, and so are the access and
+   default ACLs of an existing directory pax is allowed to give its mode --
+   the rule of [cp, ACLs under `-p`](#acls-under--p).  An ACL that cannot be
+   set, or a record that is not one, is diagnosed and the exit status is 1;
+   the member keeps a mode granting no more than the ACL did.  A
+   directory's archived default ACL is applied as recorded, not bounded by
+   its mode, and from then on governs what is created in that directory,
+   whatever the umask, as with GNU tar, bsdtar and star.  Copy mode copies
+   the source's ACLs under the same options, as cp `-p` does.
+   Without `-p p` no ACL is applied: a member is made by the normal
+   file-creation action, so on Linux under a default ACL it takes the ACL
+   inherited from that, masked by its archived mode, and the umask plays no
+   part.
+ * NFSv4-style ACLs (macOS, Linux NFSv4 mounts).  `-x pax` records one that
+   says more than the mode as libarchive's `SCHILY.acl.ace` record, in its
+   compact text form (`user:alice:raRcs::allow:1000`).  `-p p` and `-p e`
+   restore it only where the filesystem holds that kind of ACL; anywhere
+   else, as for a member carrying both kinds where only one can be kept, the
+   loss is diagnosed, the exit status is 1, and the mode is narrowed.  The
+   set-user-ID and set-group-ID bits are withheld, and that reported, from a
+   file whose ACL lets anyone but its owner write it; on macOS an `owner@`,
+   `group@` or `everyone@` entry the mode does not say is a loss, never
+   dropped silently.
+ * Extended attributes.  `-x pax` always records each extended attribute of
+   a file, directory, special file or symbolic link that cp `-a` copies (see
+   [cp, extended attributes under `-a`](#extended-attributes-under--a)) as a
+   `SCHILY.xattr.<name>` record holding the value as it stands, as GNU tar
+   `--xattrs` writes it, a `%` in the name spelled `%25` and a `=` `%3D`.
+   ustar and cpio have no place for one, and get none.  Reading takes those
+   records and libarchive's `LIBARCHIVE.xattr.<name>` ones (the name
+   %-encoded, the value base64), the latter where both name one attribute;
+   one in a global `g` header is not applied, as neither GNU tar nor
+   libarchive applies it.  Only `-p e` restores them, in copy mode too: on
+   each member pax made or may give its mode, after its owner and before its
+   mode and ACLs, and on a symbolic link the link itself.  From an archive
+   only `user.` attributes are restored, even by root, as GNU tar `--xattrs`
+   restores them; the rest (`security.capability`, `security.selinux`,
+   `trusted.*`) are dropped without a word, as GNU drops them.  Copy mode
+   reads files, not an archive, and copies every attribute cp `-a` copies, a
+   file capability only to a copy given the source's owner.  One the
+   destination cannot hold is lost silently; any other failure is a warning
+   naming the member and leaves the exit status alone, as with GNU tar.  A
+   record that does not decode, a value over 64 KiB, or names together over
+   64 KiB, is diagnosed, the member gets none, and the exit status is 1.
  * `-x bcpio`, `-x sv4cpio`, `-x sv4crc` — the historic pax names for the old
    binary cpio header and the SVR4 "newc" headers without and with a data
    checksum.  POSIX names only `cpio` (odc), `pax` and `ustar`.  All three are
@@ -681,6 +803,10 @@ Debian source packages, with GNU patch's meaning:
    COMMAND`.  Columns, `STAT` flags, `%CPU` (CPU time over lifetime) and
    `%MEM` follow procps; a control character in the command is shown as `?`.
    binutils' `debian/rules` runs `ps aux`.
+ * procps' `--no-headers` (no header line), the `-o stat` field (the `STAT`
+   column above), and process IDs given as operands, which select as `-p`
+   does.  util-linux's tests wait with
+   `until [[ $(ps --no-headers -ostat PID) =~ S.* ]]`.
 
 ### prs
 
@@ -756,6 +882,11 @@ being redirected through a directory operand swapped for a symbolic link.
    (GNU applies the controls there too), and an empty text is still an
    error where GNU appends nothing.  perl's and binutils' Debian builds use
    it.
+ * In an RE, outside a bracket expression, `\t`, `\r`, `\a`, `\f` and `\v`
+   match those controls, as `\n` matches a <newline>; POSIX leaves `\c`
+   there unspecified.  Inside a bracket expression a `\` stays an ordinary
+   character (but for `\n`), as POSIX requires.  util-linux's ipcs test
+   cuts at a tab with `s/\t.*//`.
  * `PROJECT_NAME` — selects the gettext text domain.
 
 ### sh
@@ -938,6 +1069,11 @@ No `uucp`, `uux` or `uustat` *options* are extensions.
 ### who
 
  * `--userproc` — hidden internal selection flag.
+
+### xargs
+
+ * `-P maxprocs` — run up to *maxprocs* invocations of the utility at once;
+   `0` means no limit.  util-linux's test runner passes it.
 
 ### xgettext
 

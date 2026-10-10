@@ -632,7 +632,8 @@ fn parse_number(chars: &[char], i: &mut usize) -> Result<Option<usize>, SedError
 /// delimiter. Returns `None` when the text is unterminated.
 ///
 /// POSIX: a backslash followed by the delimiter stands for the literal
-/// delimiter, and `\n` in an RE matches a <newline>. A backslash followed by a
+/// delimiter, and `\n` in an RE matches a <newline>; so do the other
+/// [`control_escape`]s their controls. A backslash followed by a
 /// <newline> is a literal <newline>. Every other `\x` pair is kept intact
 /// for the regex compiler or the replacement expander; in a replacement whose
 /// delimiter is `&`, `\&` stays escaped so it remains a literal `&`. In an
@@ -652,8 +653,12 @@ fn scan_delimited(chars: &[char], i: &mut usize, delim: char, is_re: bool) -> Op
                     text.push('\n');
                 } else if next == delim && (is_re || delim != '&') {
                     text.push(delim);
-                } else if next == 'n' && is_re {
-                    text.push('\n');
+                } else if let Some(control) = control_escape(next).filter(|_| is_re) {
+                    // `\n`, and the C escapes `\t`, `\r`, `\a`, `\f` and `\v` as GNU
+                    // sed reads them (POSIX leaves `\c` outside a bracket
+                    // expression unspecified): util-linux's tests cut at a tab
+                    // with `s/\t.*//`.
+                    text.push(control);
                 } else {
                     text.push('\\');
                     text.push(next);

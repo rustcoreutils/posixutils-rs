@@ -785,6 +785,235 @@ pub fn grant_named_acl(path: &Path) -> bool {
     granted
 }
 
+/// What `default_acl_text` shows of the default ACL `set_default_acl` gives a directory.
+#[cfg(unix)]
+pub const DEFAULT_ACL_TEXT: &str = "default:user::rwx default:user:65534:rwx \
+     default:group::r-x default:mask::rwx default:other::---";
+
+/// Give the directory `dir` a default ACL granting uid 65534 (nobody) rwx, the owning group r-x
+/// and others nothing, with a mask of rwx, with `setfacl`. On Linux what is made in it takes
+/// the access ACL that default masked by the mode the creating call asks for, and the umask
+/// plays no part. `false`, with a note, as for `grant_named_acl`.
+#[cfg(unix)]
+pub fn set_default_acl(dir: &Path) -> bool {
+    let set = Command::new("setfacl")
+        .args(["-d", "-m", "u:65534:rwx,g::r-x,m::rwx,o::---"])
+        .arg(dir)
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !set {
+        eprintln!("note: setfacl is missing or this filesystem takes no ACLs; case skipped");
+    }
+    set
+}
+
+/// The permission bits of `path` in octal, then its ACLs as `getfacl` prints them, numeric and
+/// without the effective rights, one entry after another on a line: `750 user::rwx
+/// user:65534:rwx group::r-x mask::r-x other::---`.
+#[cfg(unix)]
+pub fn mode_and_acl(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let mode = std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let out = Command::new("getfacl")
+        .args(["-cpnE"])
+        .arg(path)
+        .output()
+        .expect("getfacl runs where setfacl did");
+    assert!(out.status.success(), "getfacl {}", path.display());
+    let acl = String::from_utf8(out.stdout).unwrap();
+    let entries: Vec<&str> = acl.split_whitespace().collect();
+    format!("{mode:o} {}", entries.join(" "))
+}
+
+/// Give `path` -- a symbolic link itself, not followed -- the extended attribute `name` with
+/// the value `value`. `false`, with a note, where the filesystem refuses it (a test then skips
+/// its case).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn set_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let name = CString::new(name).unwrap();
+    let (ptr, len) = (value.as_ptr().cast(), value.len());
+    #[cfg(target_os = "linux")]
+    let ret = unsafe { libc::lsetxattr(path.as_ptr(), name.as_ptr(), ptr, len, 0) };
+    #[cfg(target_os = "macos")]
+    let ret = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            ptr,
+            len,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if ret != 0 {
+        eprintln!(
+            "note: this filesystem refused the extended attribute {:?}: {}",
+            name,
+            std::io::Error::last_os_error()
+        );
+    }
+    ret == 0
+}
+
+/// The extended attributes of `path` -- a symbolic link itself, not followed -- as (name,
+/// value) pairs sorted by name, leaving out the POSIX ACLs (`system.posix_acl_*`), which
+/// other tests compare.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn xattrs(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // Two calls each, the size then the bytes: nothing changes the file meanwhile.
+    let read = |call: &dyn Fn(*mut libc::c_char, usize) -> isize| -> Vec<u8> {
+        let size = call(std::ptr::null_mut(), 0);
+        assert!(size >= 0, "{}", std::io::Error::last_os_error());
+        let mut buf = vec![0u8; size as usize];
+        let size = call(buf.as_mut_ptr().cast(), buf.len());
+        assert!(size >= 0, "{}", std::io::Error::last_os_error());
+        buf.truncate(size as usize);
+        buf
+    };
+    #[cfg(target_os = "linux")]
+    let names = read(&|buf, len| unsafe { libc::llistxattr(path.as_ptr(), buf, len) });
+    #[cfg(target_os = "macos")]
+    let names =
+        read(&|buf, len| unsafe { libc::listxattr(path.as_ptr(), buf, len, libc::XATTR_NOFOLLOW) });
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = names
+        .split(|&b| b == 0)
+        .filter(|n| !n.is_empty() && !n.starts_with(b"system.posix_acl"))
+        .map(|n| {
+            let name = CString::new(n).unwrap();
+            let name: &CStr = &name;
+            #[cfg(target_os = "linux")]
+            let value = read(&|buf, len| unsafe {
+                libc::lgetxattr(path.as_ptr(), name.as_ptr(), buf.cast(), len)
+            });
+            #[cfg(target_os = "macos")]
+            let value = read(&|buf, len| unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.cast(),
+                    len,
+                    0,
+                    libc::XATTR_NOFOLLOW,
+                )
+            });
+            (n.to_vec(), value)
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// Run `program` with `args` in `dir` under the umask `umask`, set by a shell in between so
+/// that this process's own, which every test thread shares, is left alone.
+#[cfg(unix)]
+pub fn run_under_umask(program: &Path, args: &[&str], dir: &Path, umask: u32) -> Output {
+    Command::new("sh")
+        .args(["-c", "umask \"$0\" && exec \"$@\""])
+        .arg(format!("{umask:03o}"))
+        .arg(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("sh runs")
+}
+
+/// seccomp filters that make a child process see a system it is not on: an older kernel, or
+/// one without `/proc`. Each answers exactly the calls concerned so.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod seccomp {
+    use std::io;
+    use std::process::Command;
+
+    /// `getxattr` and `listxattr`, by path and following links: the calls an
+    /// attribute read through `/proc/self/fd/N` makes.
+    #[cfg(target_arch = "x86_64")]
+    const SYS_PATH_XATTR: [u32; 2] = [191, 194];
+    #[cfg(target_arch = "aarch64")]
+    const SYS_PATH_XATTR: [u32; 2] = [8, 11];
+
+    /// One BPF instruction.
+    #[repr(C)]
+    pub struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+
+    // BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_JMP|BPF_JSET|BPF_K,
+    // BPF_RET|BPF_K. In the seccomp data the system call number is at offset
+    // 0 and argument N at 16 + 8 * N, its low word first (little-endian).
+    pub const LD: u16 = 0x20;
+    pub const JEQ: u16 = 0x15;
+    pub const JSET: u16 = 0x45;
+    pub const RET: u16 = 0x06;
+    pub const RET_ERRNO: u32 = 0x0005_0000;
+    pub const RET_ALLOW: u32 = 0x7fff_0000;
+
+    pub fn op(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
+        SockFilter { code, jt, jf, k }
+    }
+
+    /// Make `command`'s process answer every attribute read by path with
+    /// ENOENT, as a `/proc/self/fd/N` that is not there would: what a system
+    /// without procfs leaves of the route an `O_PATH` descriptor's attributes
+    /// are read through. Every other call, the `f*xattr` ones included, is
+    /// allowed.
+    pub fn refuse_path_xattr_reads(command: &mut Command) {
+        let enoent = RET_ERRNO | u32::try_from(libc::ENOENT).unwrap();
+        install_filter(
+            command,
+            vec![
+                op(LD, 0, 0, 0),
+                op(JEQ, 1, 0, SYS_PATH_XATTR[0]),
+                op(JEQ, 0, 1, SYS_PATH_XATTR[1]),
+                op(RET, 0, 0, enoent),
+                op(RET, 0, 0, RET_ALLOW),
+            ],
+        );
+    }
+
+    /// Install the seccomp `filter` in `command`'s process just before exec.
+    pub fn install_filter(command: &mut Command, filter: Vec<SockFilter>) {
+        use std::os::unix::process::CommandExt;
+
+        #[repr(C)]
+        struct SockFprog {
+            len: u16,
+            filter: *const SockFilter,
+        }
+        const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+        const PR_SET_SECCOMP: libc::c_int = 22;
+        const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+
+        unsafe {
+            command.pre_exec(move || {
+                let prog = SockFprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr(),
+                };
+                if libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_until_full, TempFile};

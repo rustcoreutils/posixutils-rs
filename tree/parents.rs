@@ -35,8 +35,9 @@ use std::rc::Rc;
 struct MadeDir {
     dest: Rc<File>,
     source: std::fs::Metadata,
-    /// The source directory, held for its ACLs (-p): the descriptor `source` came from.
-    source_dir: File,
+    /// The source directory, held for its ACLs under -p only: the descriptor `source` came
+    /// from. Without -p no descriptor is kept for it.
+    source_dir: Option<File>,
     /// Where it is, for diagnostics only.
     path: PathBuf,
     /// How far `verify_made_dir` trusts it: -p gives it an owner and mode only in full.
@@ -194,7 +195,10 @@ fn make_parents(
             made.push(MadeDir {
                 dest: Rc::clone(&next_dest),
                 source: src_md,
-                source_dir: next_src.try_clone()?,
+                source_dir: match preserve {
+                    true => Some(next_src.try_clone()?),
+                    false => None,
+                },
                 path: dest_path.clone(),
                 trust: made_trust,
             });
@@ -261,7 +265,8 @@ fn report_made_dir(source: &Path, dest: &Path) {
 
 /// The final attributes of a directory `--parents` made, set once the copy below it is done.
 ///
-/// Under -p: owner, mode, ACLs and times of its source directory.
+/// Under -p, where it holds its source directory (`MadeDir::source_dir`): owner, mode, ACLs and
+/// times of that directory.
 /// The same code as every other -p through a held descriptor (`preserve_through_fd`): set-user-ID
 /// and set-group-ID are dropped when the owner cannot be copied, and a directory trusted only
 /// as owned like its parent gets times but no owner or mode.
@@ -270,15 +275,16 @@ fn report_made_dir(source: &Path, dest: &Path) {
 /// umask, or under a default ACL (`finish_made_dir_mode`) -- taking back the S_IRWXU
 /// `make_parents` added. POSIX has no --parents; this is the mode GNU
 /// cp gives these directories, and the one POSIX cp 2.g gives a directory `cp -R` makes.
-fn finish_dir(dir: &MadeDir, preserve: bool, umask: u32) -> io::Result<()> {
+fn finish_dir(dir: &MadeDir, umask: u32) -> io::Result<()> {
     let fd = dir.dest.as_raw_fd();
-    if preserve {
-        let acl = || source_acl(dir.source_dir.as_raw_fd());
-        // GNU cp --parents gives these no extended attribute, -a or not.
-        preserve_through_fd(fd, &dir.source, acl, |_, _| {}, &dir.path, dir.trust)
-    } else {
+    match &dir.source_dir {
+        Some(source_dir) => {
+            let acl = || source_acl(source_dir.as_raw_fd());
+            // GNU cp --parents gives these no extended attribute, -a or not.
+            preserve_through_fd(fd, &dir.source, acl, |_, _| {}, &dir.path, dir.trust)
+        }
         // GNU cp makes these with the source's whole mode (`withheld_by_cp_r` is cp -R's).
-        finish_made_dir_mode(fd, &dir.source, 0, umask, &dir.path)
+        None => finish_made_dir_mode(fd, &dir.source, 0, umask, &dir.path),
     }
 }
 
@@ -396,7 +402,7 @@ where
             ok = false;
         }
         for dir in &made {
-            if let Err(e) = finish_dir(dir, cfg.preserve, umask) {
+            if let Err(e) = finish_dir(dir, umask) {
                 eprintln!("cp: {}", error_string(&e));
                 ok = false;
             }

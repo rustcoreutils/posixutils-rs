@@ -706,6 +706,16 @@ Debian source packages, with GNU patch's meaning:
    file-creation action, so on Linux under a default ACL it takes the ACL
    inherited from that, masked by its archived mode, and the umask plays no
    part.
+ * NFSv4-style ACLs (macOS, Linux NFSv4 mounts).  `-x pax` records one that
+   says more than the mode as libarchive's `SCHILY.acl.ace` record, in its
+   compact text form (`user:alice:raRcs::allow:1000`).  `-p p` and `-p e`
+   restore it only where the filesystem holds that kind of ACL; anywhere
+   else, as for a member carrying both kinds where only one can be kept, the
+   loss is diagnosed, the exit status is 1, and the mode is narrowed.  The
+   set-user-ID and set-group-ID bits are withheld, and that reported, from a
+   file whose ACL lets anyone but its owner write it; on macOS an `owner@`,
+   `group@` or `everyone@` entry the mode does not say is a loss, never
+   dropped silently.
  * Extended attributes.  `-x pax` always records each extended attribute of
    a file, directory, special file or symbolic link that cp `-a` copies (see
    [cp, extended attributes under `-a`](#extended-attributes-under--a)) as a
@@ -724,9 +734,9 @@ Debian source packages, with GNU patch's meaning:
    reads files, not an archive, and copies every attribute cp `-a` copies, a
    file capability only to a copy given the source's owner.  One the
    destination cannot hold is lost silently; any other failure is a warning
-   naming the member and leaves the exit status alone, as with GNU tar.  A record that does not decode, a value over 64
-   KiB (but a macOS resource fork's), or names together over 64 KiB, is
-   diagnosed, the member gets none, and the exit status is 1.
+   naming the member and leaves the exit status alone, as with GNU tar.  A
+   record that does not decode, a value over 64 KiB, or names together over
+   64 KiB, is diagnosed, the member gets none, and the exit status is 1.
  * `-x bcpio`, `-x sv4cpio`, `-x sv4crc` — the historic pax names for the old
    binary cpio header and the SVR4 "newc" headers without and with a data
    checksum.  POSIX names only `cpio` (odc), `pax` and `ustar`.  All three are

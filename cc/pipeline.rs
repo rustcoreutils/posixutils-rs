@@ -87,6 +87,8 @@ pub struct CodegenOptions<'a> {
     pub stack_clash: bool,
     /// `-fstack-protector` and its levels.
     pub stack_protector: crate::target::StackProtection,
+    /// `-pg`, and the shape of its call.
+    pub profiling: Option<crate::target::Profiling>,
     /// The name DWARF records for the primary source file.
     pub source_name: &'a str,
     /// `-fdebug-prefix-map`: rewrites every path the debug information and
@@ -271,6 +273,11 @@ pub fn compile_tokens(
     // `_Float16` one -- becomes that call after the optimizer, which could
     // still fold it.
     arch::mapping::call_library_fallbacks(&mut module, &types, target);
+    // `-pg`'s call, after the inliner, so a body inlined into another is
+    // counted as the function it now is.
+    if let Some(profiling) = opts.profiling {
+        arch::mapping::call_profiler(&mut module, &types, target, profiling);
+    }
     ir::validate::verify(&module, ir::validate::Stage::Ssa, "optimization");
 
     if !observer.stage("post-opt", &module, &types, Some(&report)) {
@@ -299,6 +306,8 @@ pub fn compile_tokens(
         opts.stack_clash,
     );
     codegen.set_stack_protector(opts.stack_protector);
+    codegen.set_profiling(opts.profiling);
+    codegen.set_optimizing(opts.optimization.optimizes());
     let asm = codegen.generate(&module, &types);
 
     // Codegen can diagnose too. Inline asm is the case that reaches here: a

@@ -3092,6 +3092,8 @@ pub struct PreprocessConfig<'a> {
     pub position: crate::target::PositionIndependence,
     /// The x86-64 extensions the code may assume; see [`define_isa_macros`].
     pub isa: crate::target::X86Isa,
+    /// `-fcf-protection`, which `__CET__` describes.
+    pub cf_protection: crate::target::CfProtection,
     /// `-fmacro-prefix-map` (and the macro half of `-ffile-prefix-map`).
     pub macro_prefix_map: PrefixMap,
     /// What optimization was asked for.
@@ -3167,6 +3169,14 @@ fn define_isa_macros(pp: &mut Preprocessor, target: &Target, isa: crate::target:
     }
 }
 
+/// Define gcc's `__CET__` for the `-fcf-protection` level; see
+/// [`crate::target::CfProtection::cet_macro`].
+fn define_cet_macro(pp: &mut Preprocessor, target: &Target, cf: crate::target::CfProtection) {
+    if let Some(value) = cf.cet_macro(target) {
+        pp.define_macro(Macro::predefined("__CET__", Some(&value.to_string())));
+    }
+}
+
 /// What preprocessing found, beyond the tokens.
 ///
 /// The `Preprocessor` is a local of the function below and is dropped when it
@@ -3218,6 +3228,7 @@ pub fn preprocess_collecting(
     define_optimization_macros(&mut pp, config.optimization);
     define_pic_macros(&mut pp, target, config.position);
     define_isa_macros(&mut pp, target, config.isa);
+    define_cet_macro(&mut pp, target, config.cf_protection);
 
     pp.set_include_paths(config.include_paths);
 
@@ -3271,6 +3282,9 @@ pub struct AsmPreprocessConfig<'a> {
     pub position: crate::target::PositionIndependence,
     /// See [`PreprocessConfig::isa`].
     pub isa: crate::target::X86Isa,
+    /// See [`PreprocessConfig::cf_protection`]: a `.S` reads `__CET__` to
+    /// decide whether to start its functions with `endbr64`.
+    pub cf_protection: crate::target::CfProtection,
     /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
     /// is mapped as in C.
     pub macro_prefix_map: PrefixMap,
@@ -3365,6 +3379,7 @@ pub fn preprocess_asm_file(
     define_optimization_macros(&mut pp, config.optimization);
     define_pic_macros(&mut pp, target, config.position);
     define_isa_macros(&mut pp, target, config.isa);
+    define_cet_macro(&mut pp, target, config.cf_protection);
 
     // -nostdinc: the directories are dropped in `Preprocessor::new`; the
     // bundled headers go with them.

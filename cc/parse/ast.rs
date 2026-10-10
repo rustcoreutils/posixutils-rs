@@ -3059,6 +3059,9 @@ pub struct FunctionAttrs {
     /// function rather than into it. Recorded so `__has_attribute` can answer
     /// for it; c17 emits no such debug annotation.
     pub artificial: bool,
+    /// `__attribute__((no_instrument_function))`: no `-pg` call to the
+    /// profiler at this function's entry.
+    pub no_instrument: bool,
     /// `__attribute__((pure))` or `((const))`, as the programmer's promise.
     ///
     /// A promise, not a derivation: it is seeded *fixed* into the inference
@@ -3114,6 +3117,7 @@ impl FunctionAttrs {
         self.always_inline |= other.always_inline;
         self.gnu_inline |= other.gnu_inline;
         self.artificial |= other.artificial;
+        self.no_instrument |= other.no_instrument;
         // The cleanest claim wins: the attribute may be on the prototype,
         // the definition, or both, and each spelling is a promise.
         self.effect = self.effect.min(other.effect);

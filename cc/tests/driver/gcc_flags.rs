@@ -957,6 +957,18 @@ fn gcc_flags_missing_object_is_an_error_without_linking() {
     }
 }
 
+/// Compile `src` (written as `name`) to assembly with `flags`: a target
+/// other than the host's needs no assembler.
+fn assemble_with(name: &str, src: &str, flags: &[&str]) -> crate::common::C17Run {
+    let (dir, path) = scratch(name, src);
+    let out = dir.path().join("out.s");
+    let mut args: Vec<&str> = flags.to_vec();
+    args.extend(["-S", "-o", out.to_str().unwrap(), path.to_str().unwrap()]);
+    run_c17(&args)
+}
+
+const X86_64_LINUX: &str = "--target=x86_64-unknown-linux-gnu";
+
 /// `-fcf-protection` is honoured, not ignored: every level gcc has is
 /// accepted without the "unrecognized option" warning, as is
 /// `-fno-cf-protection`, and a level gcc does not have is an error in its
@@ -972,7 +984,7 @@ fn gcc_flags_cf_protection() {
         "-fcf-protection=check",
         "-fno-cf-protection",
     ] {
-        let r = compile_with("cet.c", MAIN, &[flag]);
+        let r = assemble_with("cet.c", MAIN, &[X86_64_LINUX, flag]);
         assert!(r.success, "{flag}: {}", r.stderr);
         assert!(!r.stderr.contains("unrecognized"), "{flag}: {}", r.stderr);
     }
@@ -984,6 +996,167 @@ fn gcc_flags_cf_protection() {
         "{}",
         r.stderr
     );
+}
+
+/// CET is x86-64's, and its note ELF's: on aarch64 and on Darwin a level
+/// that asks for a protection is an error in gcc's words, the bare flag
+/// being `full`, even for `-E`. `none` and `check` ask for none, and are
+/// accepted.
+#[test]
+fn gcc_flags_cf_protection_needs_cet() {
+    for target in [
+        "--target=aarch64-unknown-linux-gnu",
+        "--target=aarch64-apple-darwin",
+        "--target=x86_64-apple-darwin",
+    ] {
+        for (flag, level) in [
+            ("-fcf-protection", "full"),
+            ("-fcf-protection=full", "full"),
+            ("-fcf-protection=branch", "branch"),
+            ("-fcf-protection=return", "return"),
+        ] {
+            let r = assemble_with("cet.c", MAIN, &[target, flag]);
+            assert!(!r.success, "{target} {flag}");
+            let msg = format!("error: '-fcf-protection={level}' is not supported for this target");
+            assert!(r.stderr.contains(&msg), "{target} {flag}: {}", r.stderr);
+            let r = preprocess_text("cet", MAIN, &[target, flag]);
+            assert!(!r.success, "{target} {flag} -E");
+        }
+        for flag in ["-fcf-protection=none", "-fcf-protection=check"] {
+            let r = assemble_with("cet.c", MAIN, &[target, flag]);
+            assert!(r.success, "{target} {flag}: {}", r.stderr);
+        }
+    }
+}
+
+/// gcc's `__CET__`, for C and for a `.S` alike: 1 for branch protection, 2
+/// for return protection, 3 for both and 8 for `check`; nothing for `none`,
+/// nor on a target without CET.
+#[test]
+fn gcc_flags_cet_macro() {
+    let src = "#ifdef __CET__\ncet __CET__\n#else\nno cet\n#endif\n";
+    for (flag, want) in [
+        ("-fcf-protection", "cet 3"),
+        ("-fcf-protection=full", "cet 3"),
+        ("-fcf-protection=branch", "cet 1"),
+        ("-fcf-protection=return", "cet 2"),
+        ("-fcf-protection=check", "cet 8"),
+        ("-fcf-protection=none", "no cet"),
+        ("-fno-cf-protection", "no cet"),
+    ] {
+        let r = preprocess_text("cet", src, &[X86_64_LINUX, flag]);
+        assert!(r.success, "{flag}: {}", r.stderr);
+        assert!(r.stdout.contains(want), "{flag}: {}", r.stdout);
+        let r = preprocess_text(
+            "cet",
+            src,
+            &[X86_64_LINUX, flag, "-x", "assembler-with-cpp"],
+        );
+        assert!(r.success, "{flag} .S: {}", r.stderr);
+        assert!(r.stdout.contains(want), "{flag} .S: {}", r.stdout);
+    }
+    let r = preprocess_text("cet", src, &[X86_64_LINUX]);
+    assert!(r.stdout.contains("no cet"), "default: {}", r.stdout);
+    let r = preprocess_text(
+        "cet",
+        src,
+        &[
+            "--target=aarch64-unknown-linux-gnu",
+            "-fcf-protection=check",
+        ],
+    );
+    assert!(r.stdout.contains("no cet"), "aarch64: {}", r.stdout);
+}
+
+/// `-pg` refuses what gcc refuses: a frame pointer omitted by the last of
+/// `-f[no-]omit-frame-pointer` (but not for `-E`), and Darwin, where clang
+/// has no `-pg` either. `-mnop-mcount` is refused in position-independent
+/// code, the PIE default included, with or without `-pg`. The `-m` options
+/// that reshape the call are x86-64's.
+#[test]
+fn gcc_flags_pg_refusals() {
+    let incompatible = "error: -pg and -fomit-frame-pointer are incompatible";
+    let r = assemble_with("pg.c", MAIN, &[X86_64_LINUX, "-pg", "-fomit-frame-pointer"]);
+    assert!(
+        !r.success && r.stderr.contains(incompatible),
+        "{}",
+        r.stderr
+    );
+    let r = assemble_with("pg.c", MAIN, &["-fomit-frame-pointer", X86_64_LINUX, "-p"]);
+    assert!(
+        !r.success && r.stderr.contains(incompatible),
+        "{}",
+        r.stderr
+    );
+    let r = assemble_with(
+        "pg.c",
+        MAIN,
+        &[
+            X86_64_LINUX,
+            "-pg",
+            "-fomit-frame-pointer",
+            "-fno-omit-frame-pointer",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let r = preprocess_text("pg", MAIN, &[X86_64_LINUX, "-pg", "-fomit-frame-pointer"]);
+    assert!(r.success, "-E: {}", r.stderr);
+    let r = assemble_with("pg.c", MAIN, &["-fomit-frame-pointer"]);
+    assert!(r.success, "no -pg: {}", r.stderr);
+
+    for target in [
+        "--target=aarch64-apple-darwin",
+        "--target=x86_64-apple-darwin",
+    ] {
+        let r = assemble_with("pg.c", MAIN, &[target, "-pg"]);
+        assert!(!r.success, "{target}");
+        assert!(
+            r.stderr
+                .contains("error: '-pg' is not supported for this target"),
+            "{target}: {}",
+            r.stderr
+        );
+    }
+
+    let nop = "error: '-mnop-mcount' is not implemented for '-fPIC'";
+    for flags in [
+        &[X86_64_LINUX, "-pg", "-mnop-mcount"][..],
+        &[X86_64_LINUX, "-pg", "-mnop-mcount", "-fPIC"],
+        &[X86_64_LINUX, "-mnop-mcount", "-fpie"],
+    ] {
+        let r = assemble_with("pg.c", MAIN, flags);
+        assert!(
+            !r.success && r.stderr.contains(nop),
+            "{flags:?}: {}",
+            r.stderr
+        );
+    }
+    for flags in [
+        &[X86_64_LINUX, "-pg", "-mnop-mcount", "-fno-pic"][..],
+        &[X86_64_LINUX, "-pg", "-mfentry", "-mrecord-mcount", "-fPIC"],
+        &[
+            X86_64_LINUX,
+            "-mfentry",
+            "-mno-fentry",
+            "-mno-record-mcount",
+            "-mno-nop-mcount",
+        ],
+    ] {
+        let r = assemble_with("pg.c", MAIN, flags);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+    }
+    let r = assemble_with(
+        "pg.c",
+        MAIN,
+        &["--target=aarch64-unknown-linux-gnu", "-pg", "-mfentry"],
+    );
+    assert!(
+        !r.success && r.stderr.contains("unsupported machine flag: -mfentry"),
+        "{}",
+        r.stderr
+    );
+    let r = assemble_with("pg.c", MAIN, &["--target=aarch64-unknown-linux-gnu", "-pg"]);
+    assert!(r.success, "{}", r.stderr);
 }
 
 /// `-ftls-model=` takes gcc's four model names, and refuses anything else in

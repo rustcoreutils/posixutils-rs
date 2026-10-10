@@ -3117,6 +3117,10 @@ pub struct Function {
     /// The stack-protector level `optimize("...")` gives this function in
     /// place of the command line's; see `FunctionAttrs::stack_protector`.
     pub stack_protector: Option<crate::target::StackProtector>,
+    /// `__attribute__((no_instrument_function))`: no `-pg` call at entry.
+    /// An inlined body brings none either way: the call is made after the
+    /// inliner, for the functions that remain.
+    pub no_instrument: bool,
     /// `__attribute__((constructor))`: emit a pointer to this function in
     /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
     /// without a priority; `Some(Some(p))` carries one.
@@ -3174,6 +3178,7 @@ impl Default for Function {
             is_always_inline: false,
             stack_protect: Default::default(),
             stack_protector: None,
+            no_instrument: false,
             constructor: None,
             destructor: None,
             is_inline: false,
@@ -4390,7 +4395,7 @@ impl Module {
     /// errs toward keeping: an identifier that merely *looks* like a
     /// candidate in an assembly template counts.
     pub fn referenced_symbols(&self, candidates: &HashSet<String>) -> HashSet<String> {
-        self.references_from(candidates, |_| true)
+        self.references_from(candidates, |_| true, true)
     }
 
     /// [`Self::referenced_symbols`], counting only the functions that are
@@ -4399,13 +4404,24 @@ impl Module {
     /// only its `gnu_inline` bodies name, and a `.hidden` for one made an
     /// untyped undefined symbol that the linker refuses beside the TLS one.
     pub fn referenced_in_output(&self, candidates: &HashSet<String>) -> HashSet<String> {
-        self.references_from(candidates, |f| f.emit)
+        self.references_from(candidates, |f| f.emit, true)
     }
 
+    /// The names among `candidates` the output refers to other than by
+    /// calling them directly: whose address is taken, in code, in an
+    /// initializer, by an alias or in an asm statement. A function not
+    /// among them is only ever reached by a call that names it.
+    pub fn address_taken(&self, candidates: &HashSet<String>) -> HashSet<String> {
+        self.references_from(candidates, |f| f.emit, false)
+    }
+
+    /// The references [`Self::referenced_symbols`] describes, from the
+    /// functions `counts` accepts, a direct call counting when `calls`.
     fn references_from(
         &self,
         candidates: &HashSet<String>,
         counts: impl Fn(&Function) -> bool,
+        calls: bool,
     ) -> HashSet<String> {
         let mut referenced = HashSet::new();
         let mut note = |name: &str| {
@@ -4417,7 +4433,7 @@ impl Module {
             for insn in func.blocks.iter().flat_map(|bb| &bb.insns) {
                 // A direct call. An indirect one is named `<indirect>`, so it
                 // cannot collide with a real symbol.
-                if insn.op == Opcode::Call {
+                if calls && insn.op == Opcode::Call {
                     if let Some(name) = &insn.extra().func_name {
                         note(name);
                     }

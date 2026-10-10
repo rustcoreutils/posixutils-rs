@@ -1169,6 +1169,13 @@ pub enum Directive {
     /// symbol into the next: every label it invents is `L`-private.
     UnitEnd,
 
+    /// The ELF `.note.gnu.property` of an x86-64 unit built for CET, in
+    /// gcc's text: one `GNU_PROPERTY_X86_FEATURE_1_AND` property holding
+    /// these bits (IBT 1, SHSTK 2). The linker keeps a bit in the output only
+    /// if every object has it, and the loader enables only what the output
+    /// says.
+    X86FeatureNote(u32),
+
     /// A file-scope asm's text, written exactly as the source gave it and
     /// ended with a newline, as gcc writes it.
     Verbatim(String),
@@ -1742,6 +1749,26 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, "    .section .note.GNU-stack,\"\",@progbits");
                 }
             },
+            Directive::X86FeatureNote(bits) => {
+                let _ = writeln!(out, "    .section .note.gnu.property,\"a\"");
+                let _ = writeln!(out, "    .align 8");
+                let _ = writeln!(out, "    .long 1f - 0f");
+                let _ = writeln!(out, "    .long 4f - 1f");
+                // NT_GNU_PROPERTY_TYPE_0
+                let _ = writeln!(out, "    .long 5");
+                let _ = writeln!(out, "0:");
+                let _ = writeln!(out, "    .string \"GNU\"");
+                let _ = writeln!(out, "1:");
+                let _ = writeln!(out, "    .align 8");
+                // GNU_PROPERTY_X86_FEATURE_1_AND
+                let _ = writeln!(out, "    .long 0xc0000002");
+                let _ = writeln!(out, "    .long 3f - 2f");
+                let _ = writeln!(out, "2:");
+                let _ = writeln!(out, "    .long {bits:#x}");
+                let _ = writeln!(out, "3:");
+                let _ = writeln!(out, "    .align 8");
+                let _ = writeln!(out, "4:");
+            }
             Directive::Verbatim(text) => {
                 let _ = writeln!(out, "{}", text);
             }

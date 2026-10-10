@@ -778,6 +778,7 @@ fn preprocess_assembler(
         optimization: Default::default(),
         position: Default::default(),
         isa: Default::default(),
+        cf_protection: Default::default(),
         macro_prefix_map: Default::default(),
         collect_dependencies: false,
         pre_includes: &[],

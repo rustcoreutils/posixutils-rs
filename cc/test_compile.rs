@@ -61,6 +61,8 @@ struct Options {
     ssp_buffer_size: Option<u64>,
     verbose_asm: bool,
     cf_protection: target::CfProtection,
+    /// `-pg` or `-p`.
+    profile: bool,
     math_errno: bool,
     trapping_math: bool,
     defines: Vec<String>,
@@ -116,6 +118,7 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-O" => o.optimization = Optimization::from_flag("1").unwrap(),
             "-shared" | "--shared" | "-G" => o.shared = true,
             "-fverbose-asm" => o.verbose_asm = true,
+            "-pg" | "-p" => o.profile = true,
             "-fstack-clash-protection" => o.stack_clash = true,
             "-fmath-errno" => o.math_errno = true,
             "-fno-math-errno" => o.math_errno = false,
@@ -224,6 +227,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             optimization: o.optimization,
             position,
             isa: target::X86Isa::from_flags(&o.mflags),
+            cf_protection: o.cf_protection,
             macro_prefix_map: prefix_maps.macros,
         },
     );
@@ -243,6 +247,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
         stack_clash: o.stack_clash,
+        profiling: o.profile.then(|| target::Profiling::from_flags(&o.mflags)),
         stack_protector: target::StackProtection {
             level: o.stack_protector,
             buffer_size: o

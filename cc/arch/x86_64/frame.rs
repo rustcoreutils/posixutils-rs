@@ -295,7 +295,12 @@ impl X86_64CodeGen {
         } else {
             Vec::new()
         };
+        if self.indirect_entries.contains(&func.name) {
+            self.push_lir(X86Inst::Endbr64);
+        }
+        self.emit_profile_call(func, true);
         self.emit_prologue(stack_size, reg_save_area_size, &homes);
+        self.emit_profile_call(func, false);
         // An over-aligned frame's `andq` moves `%rsp` on by up to the
         // alignment.
         let realign = match self.frame_base {

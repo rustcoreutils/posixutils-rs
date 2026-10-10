@@ -94,6 +94,55 @@ pub fn call_library_fallbacks(module: &mut Module, types: &TypeTable, target: &T
     }
 }
 
+/// `-pg` on aarch64: `_mcount(__builtin_return_address(0))` at the top of
+/// every function body, gcc's call. It is an ordinary call, which
+/// clobbers the argument registers, so it is put into the IR where the
+/// register allocator sees it, as gcc's is. x86-64's `mcount` preserves
+/// them and is called from the prologue itself: the backend's.
+///
+/// `no_instrument_function` exempts a function, as in gcc.
+pub fn call_profiler(
+    module: &mut Module,
+    types: &TypeTable,
+    target: &Target,
+    profiling: crate::target::Profiling,
+) {
+    if target.arch != Arch::Aarch64 {
+        return;
+    }
+    let routine = profiling.routine(target);
+    let void_ptr = types.void_ptr_id;
+    for func in module
+        .functions
+        .iter_mut()
+        .filter(|f| f.emit && !f.no_instrument)
+    {
+        let ret_addr = func.create_reg_pseudo();
+        let mut read = Instruction::frame_walk(Opcode::ReturnAddress, ret_addr, 0, void_ptr);
+        let mut call = Instruction::call_with_abi(
+            None,
+            routine,
+            vec![ret_addr],
+            vec![void_ptr],
+            types.void_id,
+            CallingConv::C,
+            types,
+            target,
+        );
+        let entry = func.entry;
+        let block = func.get_block_mut(entry).expect("the entry block exists");
+        let at = block
+            .insns
+            .iter()
+            .position(|i| i.op == Opcode::Entry)
+            .map_or(0, |i| i + 1);
+        let pos = block.insns.get(at).and_then(|i| i.pos);
+        read.pos = pos;
+        call.pos = pos;
+        block.insns.splice(at..at, [read, call]);
+    }
+}
+
 /// The call that computes `insn` on this target, as [`call_library_fallbacks`]
 /// describes, or [`MappedInsn::Legal`] if the backend computes it in place.
 pub(crate) fn library_call(

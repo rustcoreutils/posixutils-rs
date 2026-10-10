@@ -81,6 +81,7 @@ The arguments of an unrecognised attribute are skipped without being parsed.
 | `always_inline` | Functions | Inlined at every call site regardless of size, and at `-O0` too. `noinline` outranks it, as in gcc |
 | `stack_protect` | Functions | Under any `-fstack-protector` level the function gets a canary, whatever its locals; `-fstack-protector-explicit` protects only these. With no level it does nothing, as in gcc |
 | `no_stack_protector` | Functions | The function never gets a canary, `-fstack-protector-all` included. With `stack_protect` on the same function -- in one list or across its declarations -- the first written wins and gcc's warning names the other ("ignoring attribute 'X' because it conflicts with attribute 'Y'"). Either attribute belongs to the function's own body: inlined into a caller, the body is protected as the caller is, as in gcc |
+| `no_instrument_function` | Functions | Under `-pg` the function makes no call to the profiler at its entry, as in gcc. A body inlined into another is counted as the function it is inlined into either way, since the call is made after the inliner |
 | `gnu_inline` | Functions | GNU89 inline semantics for this definition: plain `inline` emits an external definition, `extern inline` does not (the reverse of C99). `-fgnu89-inline` makes it the default. glibc's `__fortify_function` relies on it |
 | `constructor` | Functions | Runs before `main`, via `.init_array` (`__DATA,__mod_init_func` on Mach-O). An optional priority orders it: ELF encodes it in the section name; Mach-O has no equivalent, so it only orders the entries within one translation unit. An unprioritised entry runs after prioritised ones |
 | `destructor` | Functions | Runs after `main` returns or on `exit`. ELF lists it in `.fini_array`. Mach-O does not run `__mod_term_func` for a main executable, so each destructor is rewritten (`ir/mach_o_dtors.rs`) into an `atexit` registration made from a synthesized constructor of the same priority |
@@ -117,7 +118,7 @@ the result of a correct program. glibc puts most of them on every declaration.
 `nonstring`, `malloc`, `sentinel`, `nonnull`, `nonnull_if_nonzero`,
 `returns_nonnull`, `nothrow`, `access`, `returns_twice`, `externally_visible`,
 `abi_tag`, `weakref`, `simd`, `regparm`, `leaf`, `alloc_size`, `alloc_align`,
-`noclone`, `no_instrument_function`, `copy`, `designated_init`, `may_alias`,
+`noclone`, `copy`, `designated_init`, `may_alias`,
 `artificial`, `no_sanitize_memory`, `no_sanitize_address`, `no_sanitize_thread`,
 `optimize`.
 

@@ -36,7 +36,8 @@ fn compile_in(dir: &Path, path: &Path, flags: &[&str]) -> crate::common::C17Run 
 
 const CLEAN: &str = "int main(void) { return 0; }\n";
 
-/// Debian trixie's `dpkg-buildflags --get CFLAGS`, and Ubuntu 24.04's.
+/// Debian trixie's `dpkg-buildflags --get CFLAGS`, and Ubuntu 24.04's, on
+/// amd64: elsewhere they have no `-fcf-protection`, which only x86-64 has.
 const DEBIAN: &[&str] = &[
     "-g",
     "-O2",
@@ -76,6 +77,9 @@ fn distribution_flags_compile_under_werror() {
         // The Ubuntu set's `-mno-omit-leaf-frame-pointer` is x86-64's and
         // aarch64's alike.
         let mut args = flags.to_vec();
+        if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            args.retain(|&f| f != "-fcf-protection");
+        }
         args.push("-Werror");
         let r = compile_in(dir.path(), &path, &args);
         assert!(r.success, "{flags:?}: {}", r.stderr);
@@ -151,6 +155,9 @@ fn build_system_defaults_are_silent() {
         ],
     ] {
         let mut args = flags.to_vec();
+        if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            args.retain(|&f| f != "-fcf-protection");
+        }
         args.push("-Werror");
         let r = compile_in(dir.path(), &path, &args);
         assert!(r.success, "{flags:?}: {}", r.stderr);

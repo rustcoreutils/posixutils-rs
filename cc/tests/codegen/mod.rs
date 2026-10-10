@@ -28,6 +28,9 @@ mod binary128;
 mod bitfield_layout;
 mod block_moves;
 mod call_args;
+// CET and its ELF note are x86-64 Linux's.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod cf_protection;
 mod complex_fold;
 mod constant_branch;
 mod cross_abi;
@@ -54,6 +57,9 @@ mod named_sections;
 mod optimizer;
 mod pic;
 mod plain_char;
+// `-pg` is refused on Darwin, as clang refuses it.
+#[cfg(target_os = "linux")]
+mod profiling;
 mod promotion;
 mod regalloc;
 mod scaling;

@@ -76,6 +76,16 @@ pub struct X86_64CodeGen {
     pub(super) tls_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries and PIE)
     pic_mode: bool,
+    /// `-pg`, and the shape of its call.
+    pub(super) profiling: Option<crate::target::Profiling>,
+    /// Whether the unit is optimized; see [`Self::plan_landing_pads`].
+    optimizing: bool,
+    /// Under branch protection, the functions an indirect call may reach,
+    /// which start with `endbr64`; see [`Self::plan_landing_pads`].
+    pub(super) indirect_entries: HashSet<String>,
+    /// Under branch protection, the labels a computed goto may reach,
+    /// which start with `endbr64` too.
+    pub(super) indirect_labels: HashSet<String>,
     /// Long double constants to emit (label_bits -> value_bits).
     /// BTreeMap so the .rodata emission order in `emit_ld_constants`
     /// is deterministic (HashMap iteration would vary the layout
@@ -132,6 +142,10 @@ impl X86_64CodeGen {
             global_registers: Vec::new(),
             tls_symbols: HashSet::new(),
             pic_mode: false,
+            profiling: None,
+            optimizing: false,
+            indirect_entries: HashSet::new(),
+            indirect_labels: HashSet::new(),
             ld_constants: std::collections::BTreeMap::new(),
             double_constants: std::collections::BTreeMap::new(),
             quad_constants: std::collections::BTreeMap::new(),
@@ -145,6 +159,66 @@ impl X86_64CodeGen {
             win64_xmm_saves: Vec::new(),
             incoming_pointers: HashSet::new(),
         }
+    }
+
+    /// Under `-fcf-protection=branch`, where an indirect branch may land, as
+    /// gcc decides: the entry of every function but a static one only ever
+    /// called directly -- which gcc knows only when optimizing, so at -O0
+    /// every function is one -- and every label whose address is taken. A
+    /// static function's address may be taken in code, in an initializer or
+    /// by an alias; one that runs from `.init_array` or `.fini_array`, or
+    /// that `used` keeps for whoever names it, is reached indirectly too.
+    fn plan_landing_pads(&mut self, module: &Module) {
+        self.indirect_entries.clear();
+        self.indirect_labels.clear();
+        if !self.base.cf_protection.branch {
+            return;
+        }
+        let statics: HashSet<String> = module
+            .functions
+            .iter()
+            .filter(|f| f.is_static)
+            .map(|f| f.name.clone())
+            .collect();
+        let taken = module.address_taken(&statics);
+        let optimizing = self.optimizing;
+        self.indirect_entries = module
+            .functions
+            .iter()
+            .filter(|f| {
+                !optimizing
+                    || !f.is_static
+                    || taken.contains(&f.name)
+                    || f.symbol_attrs.used
+                    || f.constructor.is_some()
+                    || f.destructor.is_some()
+            })
+            .map(|f| f.name.clone())
+            .collect();
+        let labels: HashSet<String> = module
+            .functions
+            .iter()
+            .filter(|f| f.takes_label_addr || f.saves_label_in_static)
+            .flat_map(|f| f.blocks.iter().map(|bb| bb.id.label_symbol(&f.name)))
+            .collect();
+        self.indirect_labels = module.referenced_in_output(&labels);
+    }
+
+    /// `-pg`'s call, when `func` makes one: `before_prologue` asks for
+    /// `-mfentry`'s, the other for `mcount`'s, which follows it.
+    pub(super) fn emit_profile_call(&mut self, func: &crate::ir::Function, before_prologue: bool) {
+        let Some(profiling) = self.profiling else {
+            return;
+        };
+        if func.no_instrument || profiling.fentry != before_prologue {
+            return;
+        }
+        self.push_lir(X86Inst::ProfileCall {
+            routine: profiling.routine(&self.base.target),
+            via_got: self.pic_mode,
+            nop: profiling.nop,
+            record: profiling.record,
+        });
     }
 
     /// Push a LIR instruction to the buffer (deferred emission)
@@ -585,6 +659,12 @@ impl X86_64CodeGen {
             &self.base.current_fn,
             block.id.0,
         ))));
+        if self
+            .indirect_labels
+            .contains(&block.id.label_symbol(&self.base.current_fn))
+        {
+            self.push_lir(X86Inst::Endbr64);
+        }
 
         // Emit instructions
         for insn in &block.insns {
@@ -1686,6 +1766,7 @@ impl CodeGenerator for X86_64CodeGen {
         // Emit file header
         self.base.plan_named_sections(module, self.pic_mode);
         self.base.plan_local_binding(module);
+        self.plan_landing_pads(module);
         self.emit_header();
 
         // Emit .file directives unconditionally (useful for diagnostics/profiling)
@@ -1772,6 +1853,9 @@ impl CodeGenerator for X86_64CodeGen {
         }
 
         self.base.push_directive(Directive::UnitEnd);
+        if let Some(bits) = self.base.cf_protection.feature_bits() {
+            self.base.push_directive(Directive::X86FeatureNote(bits));
+        }
 
         // Emit all buffered LIR instructions to output string
         self.base.emit_all();
@@ -1805,5 +1889,13 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_stack_protector(&mut self, protection: crate::target::StackProtection) {
         self.base.stack_protector = protection;
+    }
+
+    fn set_profiling(&mut self, profiling: Option<crate::target::Profiling>) {
+        self.profiling = profiling;
+    }
+
+    fn set_optimizing(&mut self, on: bool) {
+        self.optimizing = on;
     }
 }

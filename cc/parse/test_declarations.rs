@@ -839,6 +839,31 @@ fn test_stack_protect_attributes_reach_the_definition() {
     assert_eq!(attr("b2"), StackProtectAttr::Protect);
 }
 
+/// `no_instrument_function` reaches the definition, in either spelling and
+/// from a prototype too.
+#[test]
+fn test_no_instrument_function_reaches_the_definition() {
+    let src = "__attribute__((no_instrument_function)) int a(void) { return 0; }\n\
+               int __attribute__((__no_instrument_function__)) b(void) { return 0; }\n\
+               __attribute__((no_instrument_function)) int c(void);\n\
+               int c(void) { return 0; }\n\
+               int d(void) { return 0; }\n";
+    let (tu, _, strings, _) = parse_tu(src).unwrap();
+    let exempt = |name: &str| {
+        tu.items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == name => {
+                    Some(f.attrs.no_instrument)
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert!(exempt("a") && exempt("b") && exempt("c"));
+    assert!(!exempt("d"));
+}
+
 /// `optimize` naming a stack-protector option gives the function that level,
 /// whether the option is written with `-f` or without, among others in one
 /// comma-separated string or in a string of its own; the last one written

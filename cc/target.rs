@@ -185,31 +185,132 @@ impl PositionIndependence {
 /// `-fcf-protection`: which of Intel CET's two protections x86-64 code is
 /// built to cooperate with. The default is neither, as Debian's gcc has it.
 ///
-/// c17 honours it only where code built by another compiler reads what c17
-/// wrote: gcc's `__builtin_setjmp` buffer, whose layout and `longjmp`
-/// sequence follow `ret`, and whose resume point starts with `endbr64`
-/// under `branch`. Nothing else c17 emits changes with it.
+/// Branch protection puts `endbr64` wherever an indirect branch may land;
+/// either protection is announced to the linker by the unit's
+/// `.note.gnu.property`, and to the source by `__CET__`. gcc's
+/// `__builtin_setjmp` buffer, which code built by another compiler may read,
+/// follows it too. Only x86-64 ELF has CET: elsewhere a level that asks for a
+/// protection is an error, as in gcc.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CfProtection {
     /// Indirect-branch tracking: an indirect jump lands on an `endbr64`.
     pub branch: bool,
     /// The shadow stack: return addresses are kept on a second stack.
     pub ret: bool,
+    /// `check`: gcc's link-time optimizer checks that the objects agree.
+    /// Nothing is built differently, but `__CET__` says so.
+    pub check: bool,
 }
 
 impl CfProtection {
     /// The protection `-fcf-protection=<level>` selects, or `None` for a
-    /// level gcc does not have. `check` concerns only gcc's link-time
-    /// optimization, and gcc builds under it what it builds under `none`.
+    /// level gcc does not have.
     pub fn from_level(level: &str) -> Option<Self> {
-        let (branch, ret) = match level {
-            "none" | "check" => (false, false),
-            "branch" => (true, false),
-            "return" => (false, true),
-            "full" => (true, true),
+        let (branch, ret, check) = match level {
+            "none" => (false, false, false),
+            "check" => (false, false, true),
+            "branch" => (true, false, false),
+            "return" => (false, true, false),
+            "full" => (true, true, false),
             _ => return None,
         };
-        Some(Self { branch, ret })
+        Some(Self { branch, ret, check })
+    }
+
+    /// The level's name, as [`Self::from_level`] reads it.
+    pub fn level(self) -> &'static str {
+        match (self.branch, self.ret, self.check) {
+            (true, true, _) => "full",
+            (true, false, _) => "branch",
+            (false, true, _) => "return",
+            (false, false, true) => "check",
+            (false, false, false) => "none",
+        }
+    }
+
+    /// Whether code is built for either protection, which only x86-64 ELF
+    /// can be.
+    pub fn protects(self) -> bool {
+        self.branch || self.ret
+    }
+
+    /// Whether `target` can be built for this level: gcc refuses one that
+    /// asks for a protection where there is no CET -- aarch64, and Mach-O,
+    /// which has no property note to carry it.
+    pub fn supported_on(self, target: &Target) -> bool {
+        !self.protects() || (target.arch == Arch::X86_64 && target.os != Os::MacOS)
+    }
+
+    /// gcc's `__CET__`: 1 for branch protection, 2 for return protection,
+    /// their sum for both and 8 for `check`; not defined for `none`, nor
+    /// for a target without CET.
+    pub fn cet_macro(self, target: &Target) -> Option<u32> {
+        if target.arch != Arch::X86_64 {
+            return None;
+        }
+        let value = u32::from(self.branch) | u32::from(self.ret) << 1 | u32::from(self.check) << 3;
+        (value != 0).then_some(value)
+    }
+
+    /// The `GNU_PROPERTY_X86_FEATURE_1_AND` bits the unit's
+    /// `.note.gnu.property` carries: IBT (1) and SHSTK (2). `None`: no note.
+    pub fn feature_bits(self) -> Option<u32> {
+        self.protects()
+            .then_some(u32::from(self.branch) | u32::from(self.ret) << 1)
+    }
+}
+
+/// `-pg` (or `-p`): a call to the profiler's counting routine at the entry
+/// of every function, and the x86-64 options that reshape it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Profiling {
+    /// `-mfentry`: call `__fentry__` before the prologue instead of `mcount`
+    /// after it.
+    pub fentry: bool,
+    /// `-mrecord-mcount`: record the address of each call in `__mcount_loc`.
+    pub record: bool,
+    /// `-mnop-mcount`: a five-byte nop where the call would be, for a tracer
+    /// to patch.
+    pub nop: bool,
+}
+
+impl Profiling {
+    /// The `-m` options that shape the call, in both senses: x86-64's only.
+    pub const MACHINE_FLAGS: [&'static str; 6] = [
+        "-mfentry",
+        "-mno-fentry",
+        "-mrecord-mcount",
+        "-mno-record-mcount",
+        "-mnop-mcount",
+        "-mno-nop-mcount",
+    ];
+
+    /// The shape the `-m` options in `flags` give the call, the last of each
+    /// pair winning.
+    pub fn from_flags(flags: &[String]) -> Self {
+        let mut p = Self::default();
+        for flag in flags {
+            match flag.as_str() {
+                "-mfentry" => p.fentry = true,
+                "-mno-fentry" => p.fentry = false,
+                "-mrecord-mcount" => p.record = true,
+                "-mno-record-mcount" => p.record = false,
+                "-mnop-mcount" => p.nop = true,
+                "-mno-nop-mcount" => p.nop = false,
+                _ => {}
+            }
+        }
+        p
+    }
+
+    /// The routine the call names on `target`: x86-64's `mcount` or
+    /// `__fentry__`, aarch64's `_mcount`.
+    pub fn routine(self, target: &Target) -> &'static str {
+        match target.arch {
+            Arch::X86_64 if self.fentry => "__fentry__",
+            Arch::X86_64 => "mcount",
+            Arch::Aarch64 => "_mcount",
+        }
     }
 }
 

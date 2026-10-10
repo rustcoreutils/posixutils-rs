@@ -1126,6 +1126,7 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Call {
             target: CallTarget::Direct(Symbol::global(insn.library_callee())),
         });
+        self.emit_second_return_landing_pad(insn.library_callee());
 
         // Store result from EAX to target
         let dst_loc = self.get_location(target);

@@ -1507,6 +1507,15 @@ pub trait CodeGenerator {
 
     /// Set the `-fstack-protector` level.
     fn set_stack_protector(&mut self, protection: crate::target::StackProtection);
+
+    /// Set `-pg` and the shape of its call. A target whose call is an
+    /// ordinary one has it put into the IR instead
+    /// (`arch::mapping::call_profiler`), and ignores this.
+    fn set_profiling(&mut self, _profiling: Option<crate::target::Profiling>) {}
+
+    /// Say whether the unit is optimized. A target with CET reads it: as in
+    /// gcc, only optimization finds a static function needs no `endbr64`.
+    fn set_optimizing(&mut self, _on: bool) {}
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit
@@ -1781,6 +1790,20 @@ pub fn asm_comment_prefix(target: &Target) -> &'static str {
         crate::target::Arch::Aarch64 => "//",
         _ => "#",
     }
+}
+
+/// Whether a call of `name` may return twice, by gcc's list: `setjmp` and
+/// `sigsetjmp` under up to two leading underscores, and `savectx`, `vfork`
+/// and `getcontext` as spelled. The second return comes by an indirect
+/// jump, so under branch protection the call is followed by `endbr64`.
+pub fn returns_twice(name: &str) -> bool {
+    let bare = name
+        .strip_prefix("__")
+        .or_else(|| name.strip_prefix('_'))
+        .unwrap_or(name);
+    name.len() <= 11
+        && (matches!(bare, "setjmp" | "sigsetjmp")
+            || matches!(name, "savectx" | "vfork" | "getcontext"))
 }
 
 /// Create a code generator for the given target

@@ -2332,6 +2332,35 @@ fn test_if_conditional_operator() {
     assert_eq!(get_token_strings(&tokens, &idents), ["A", "B"]);
 }
 
+/// `__CET__` is gcc's value for the `-fcf-protection` level, on x86-64
+/// only, and absent for `none`.
+#[test]
+fn test_cet_macro_follows_the_protection() {
+    use crate::target::CfProtection;
+    let expand = |level: &str, target: &Target| {
+        let config = PreprocessConfig {
+            cf_protection: CfProtection::from_level(level).unwrap(),
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let tokens = Tokenizer::new(b"__CET__", 0, &mut idents).tokenize();
+        let (out, _) = preprocess_collecting(tokens, target, &mut idents, "<test>", &config);
+        get_token_strings(&out, &idents)
+    };
+    let x86 = Target::from_triple("x86_64-unknown-linux-gnu").unwrap();
+    for (level, value) in [
+        ("full", "3"),
+        ("branch", "1"),
+        ("return", "2"),
+        ("check", "8"),
+        ("none", "__CET__"),
+    ] {
+        assert_eq!(expand(level, &x86), [value], "{level}");
+    }
+    let aarch64 = Target::from_triple("aarch64-unknown-linux-gnu").unwrap();
+    assert_eq!(expand("check", &aarch64), ["__CET__"]);
+}
+
 /// `__PIC__`/`__pic__` and `__PIE__`/`__pie__` describe the position
 /// independence the code is generated with.
 #[test]

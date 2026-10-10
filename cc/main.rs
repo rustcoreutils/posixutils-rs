@@ -481,6 +481,15 @@ struct Args {
     #[arg(long = "c17-linker-flag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     linker_flags: Vec<String>,
 
+    /// `-pg` or `-p`: call the profiler at every function's entry.
+    #[arg(long = "c17-pg", hide = true)]
+    profile: bool,
+
+    /// `-fomit-frame-pointer` was the last of it and its `-fno-` form, which
+    /// `-pg` forbids.
+    #[arg(long = "c17-omit-frame-pointer", hide = true)]
+    omit_frame_pointer: bool,
+
     /// Machine (`-m`) flags captured by preprocess_args, judged against the
     /// target once it is known: see [`check_machine_flags`].
     #[arg(long = "c17-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
@@ -871,6 +880,7 @@ fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8
         optimization: args.optimization(),
         position: position_independence(args, target),
         isa: target::X86Isa::from_flags(&args.mflags),
+        cf_protection: args.cf_protection.unwrap_or_default(),
         defines: &args.defines,
         undefines: &args.undefines,
         include_paths: &args.include_paths,
@@ -1371,6 +1381,7 @@ fn process_file(
             optimization: args.optimization(),
             position: position_independence(args, target),
             isa: target::X86Isa::from_flags(&args.mflags),
+            cf_protection: args.cf_protection.unwrap_or_default(),
             macro_prefix_map: prefix_maps.macros,
         },
     );
@@ -1433,6 +1444,9 @@ fn process_file(
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
         stack_clash: args.stack_clash,
+        profiling: args
+            .profile
+            .then(|| target::Profiling::from_flags(&args.mflags)),
         stack_protector: target::StackProtection {
             level: args.stack_protector.unwrap_or_default(),
             buffer_size: args
@@ -1976,12 +1990,19 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     // its compiler.
     let mut driver_errors = Vec::new();
     let mut werror_errors = Vec::new();
+    // `-f[no-]omit-frame-pointer`, last one wins; only `-pg` asks.
+    let mut omit_frame_pointer = false;
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
         let f_spelling = two_dash_prefix_map(arg);
         let arg = f_spelling.as_ref().unwrap_or(arg);
         let spelled = clap_spelling(arg);
+        match arg.as_str() {
+            "-fomit-frame-pointer" => omit_frame_pointer = true,
+            "-fno-omit-frame-pointer" => omit_frame_pointer = false,
+            _ => {}
+        }
 
         if i + 1 == raw_args.len() && takes_next_word(arg) {
             return Err(format!("{} '{arg}'", gettext("error: missing argument to")));
@@ -2323,7 +2344,12 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             result.push(dir.to_string());
             i += 1;
         } else if arg == "-p" || arg == "-pg" {
-            // Profiling flags - silently ignore (c17 doesn't support profiling)
+            // gcc's two spellings are one on Linux: the code calls the
+            // profiler, and the link takes the profiling startup file
+            // (gcrt1.o) that writes `gmon.out`, which the host driver picks
+            // for `-pg`.
+            result.push("--c17-pg".to_string());
+            result.push("--c17-linker-flag=-pg".to_string());
             i += 1;
         } else if arg == "-pipe" {
             // Misc GCC flags - silently ignore
@@ -2438,6 +2464,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     );
     if stack_clash {
         trailer.push("--c17-stack-clash".to_string());
+    }
+    if omit_frame_pointer {
+        trailer.push("--c17-omit-frame-pointer".to_string());
     }
     if let Some(bytes) = ssp_buffer_size {
         trailer.push(format!("--c17-ssp-buffer-size={bytes}"));
@@ -2827,6 +2856,7 @@ fn check_machine_flags(flags: &[String], target: &Target) {
                                 | "-mfpmath=sse"
                                 | "-mcmodel=small"
                         )
+                        || target::Profiling::MACHINE_FLAGS.contains(&flag)
                 }
                 target::Arch::Aarch64 => {
                     matches!(flag, "-mabi=lp64" | "-mlittle-endian" | "-mcmodel=small")
@@ -2848,6 +2878,39 @@ fn check_machine_flags(flags: &[String], target: &Target) {
     }
     for flag in refused {
         eprintln!("c17: {}: {}", gettext("unsupported machine flag"), flag);
+    }
+    std::process::exit(1);
+}
+
+/// Refuse what `-fcf-protection` and `-pg` cannot do here, in gcc's words:
+/// a protection the target has no CET for, `-pg` without a frame pointer or
+/// on Darwin, and `-mnop-mcount`'s nop in position-independent code, which
+/// gcc refuses whether or not `-pg` is given.
+fn check_instrumentation(args: &Args, target: &Target) {
+    let cf = args.cf_protection.unwrap_or_default();
+    let mut errors = Vec::new();
+    if !cf.supported_on(target) {
+        errors.push(gettext_args(
+            "'-fcf-protection={0}' is not supported for this target",
+            &[cf.level()],
+        ));
+    }
+    if args.profile && target.os == target::Os::MacOS {
+        errors.push(gettext("'-pg' is not supported for this target"));
+    }
+    if args.profile && args.omit_frame_pointer && !args.preprocess_only {
+        errors.push(gettext("-pg and -fomit-frame-pointer are incompatible"));
+    }
+    let pic = producing_shared(args) || position_independence(args, target).is_pic();
+    if target.arch == target::Arch::X86_64 && pic && target::Profiling::from_flags(&args.mflags).nop
+    {
+        errors.push(gettext("'-mnop-mcount' is not implemented for '-fPIC'"));
+    }
+    if errors.is_empty() {
+        return;
+    }
+    for error in errors {
+        eprintln!("c17: {}: {}", gettext("error"), error);
     }
     std::process::exit(1);
 }
@@ -3481,6 +3544,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     check_machine_flags(&args.mflags, &target);
+    check_instrumentation(&args, &target);
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&args.mflags);
     }
@@ -3920,7 +3984,7 @@ mod tests {
 
     /// `-fcf-protection[=level]` and `-fno-cf-protection` are one option,
     /// the last occurrence winning. No flag is `none`, the bare flag is
-    /// `full`, and `check` builds what `none` does, as in gcc.
+    /// `full`, and `check` asks for no protection, as in gcc.
     #[test]
     fn test_cf_protection_last_flag_wins() {
         use target::CfProtection;
@@ -3938,14 +4002,16 @@ mod tests {
         let full = CfProtection {
             branch: true,
             ret: true,
+            check: false,
         };
         let branch = CfProtection {
             branch: true,
-            ret: false,
+            ..none
         };
-        let ret = CfProtection {
-            branch: false,
-            ret: true,
+        let ret = CfProtection { ret: true, ..none };
+        let check = CfProtection {
+            check: true,
+            ..none
         };
         assert_eq!(parse(&["foo.c"]), none);
         assert_eq!(parse(&["-fcf-protection", "foo.c"]), full);
@@ -3953,7 +4019,15 @@ mod tests {
         assert_eq!(parse(&["-fcf-protection=branch", "foo.c"]), branch);
         assert_eq!(parse(&["-fcf-protection=return", "foo.c"]), ret);
         assert_eq!(parse(&["-fcf-protection=none", "foo.c"]), none);
-        assert_eq!(parse(&["-fcf-protection=check", "foo.c"]), none);
+        assert_eq!(parse(&["-fcf-protection=check", "foo.c"]), check);
+        assert!(!check.protects());
+        assert_eq!(
+            parse(&["-fcf-protection=full", "-fcf-protection=check", "foo.c"]),
+            check
+        );
+        for c in [none, full, branch, ret, check] {
+            assert_eq!(CfProtection::from_level(c.level()), Some(c));
+        }
         assert_eq!(parse(&["-fno-cf-protection", "foo.c"]), none);
         assert_eq!(
             parse(&["-fcf-protection", "-fno-cf-protection", "foo.c"]),

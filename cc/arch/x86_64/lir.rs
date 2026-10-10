@@ -678,6 +678,19 @@ pub enum X86Inst {
     /// indirect-branch tracking; a NOP otherwise.
     Endbr64,
 
+    /// `-pg`'s call to the profiler at a function's entry, in gcc's text: a
+    /// `1:` label for `-mrecord-mcount` to name, then `call routine` --
+    /// through the GOT in position-independent code -- or, under
+    /// `-mnop-mcount`, a five-byte nop in its place. Not a `Call` for
+    /// register allocation: `mcount` preserves the argument registers, and
+    /// `__fentry__` runs before the function has any state.
+    ProfileCall {
+        routine: &'static str,
+        via_got: bool,
+        nop: bool,
+        record: bool,
+    },
+
     /// RDSSPQ - read the shadow-stack pointer. A NOP when the shadow stack
     /// is off, leaving `dst` as it was.
     Rdssp { dst: Reg },
@@ -1150,6 +1163,27 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Endbr64 => {
                 let _ = writeln!(out, "    endbr64");
+            }
+
+            X86Inst::ProfileCall {
+                routine,
+                via_got,
+                nop,
+                record,
+            } => {
+                let _ = writeln!(out, "1:");
+                if *nop {
+                    let _ = writeln!(out, "    .byte 0x0f, 0x1f, 0x44, 0x00, 0x00");
+                } else if *via_got {
+                    let _ = writeln!(out, "    call *{routine}@GOTPCREL(%rip)");
+                } else {
+                    let _ = writeln!(out, "    call {routine}");
+                }
+                if *record {
+                    let _ = writeln!(out, "    .section __mcount_loc, \"a\",@progbits");
+                    let _ = writeln!(out, "    .quad 1b");
+                    let _ = writeln!(out, "    .previous");
+                }
             }
 
             X86Inst::Rdssp { dst } => {

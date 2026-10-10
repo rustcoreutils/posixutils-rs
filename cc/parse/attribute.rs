@@ -372,6 +372,7 @@ impl AttributeList {
             destructor: self.destructor_priority(),
             gnu_inline: self.has_attr("gnu_inline"),
             artificial: self.has_attr("artificial"),
+            no_instrument: self.has_attr("no_instrument_function"),
             effect: self.mem_effect(),
             align: self.get_alignment().filter(|n| n.is_power_of_two()),
             noreturn: self.has_noreturn(),

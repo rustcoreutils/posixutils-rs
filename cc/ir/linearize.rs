@@ -2102,6 +2102,7 @@ impl<'a> Linearizer<'a> {
         ir_func.is_always_inline = func.attrs.always_inline;
         ir_func.stack_protect = func.attrs.stack_protect;
         ir_func.stack_protector = func.attrs.stack_protector;
+        ir_func.no_instrument = func.attrs.no_instrument;
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function

@@ -125,7 +125,9 @@ impl Aarch64CodeGen {
         // - On Linux: required for PIE (default) and when linking with shared libs
         // - In PIC mode: always required
         // Using GOT unconditionally for external symbols is safe and matches GCC/Clang behavior
-        self.extern_symbols.contains(name)
+        // -- except for one that binds within the output, which gcc reaches
+        // PC-relative even when it is defined elsewhere.
+        self.extern_symbols.contains(name) && !self.base.binds_locally.contains(name)
     }
 
     /// Compute the actual FP-relative offset for a stack location.
@@ -846,6 +848,9 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Brk { imm: 1 });
             }
 
+            // gcc's `__builtin_trap`: `brk #1000`, SIGTRAP.
+            Opcode::Trap => self.push_lir(Aarch64Inst::Brk { imm: 1000 }),
+
             Opcode::FrameAddress => {
                 // __builtin_frame_address(level)
                 self.emit_frame_address(insn);
@@ -1373,6 +1378,8 @@ impl CodeGenerator for Aarch64CodeGen {
             .collect();
 
         // Emit file header
+        self.base.plan_named_sections(module, self.pic_mode);
+        self.base.plan_local_binding(module);
         self.emit_header();
 
         // Emit .file directives unconditionally (useful for diagnostics/profiling)

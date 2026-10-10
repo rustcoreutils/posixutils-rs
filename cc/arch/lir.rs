@@ -897,6 +897,21 @@ pub enum WeakKind {
     Reference,
 }
 
+/// The ELF flags of a section the program named, as one unit's definitions
+/// in it decide them together (see `CodeGenBase::plan_named_sections`).
+/// Ordered by what a section shared by several must give way to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SectionFlags {
+    /// `"a"`: read-only data.
+    ReadOnly,
+    /// `"aw"`: data, or read-only data the loader must relocate first.
+    Writable,
+    /// `"awT"`: thread-local data.
+    ThreadLocal,
+    /// `"ax"`: code.
+    Code,
+}
+
 /// Assembler directives that are common across architectures.
 /// These control the assembler behavior, emit data, or provide metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -932,15 +947,11 @@ pub enum Directive {
     /// `__attribute__((section("...")))`, instead of the one the object's
     /// contents would have chosen.
     ///
-    /// `executable` says whether code or data is going there, because ELF
-    /// needs the flags spelled out and they differ: `"ax"` against `"aw"`.
-    /// Getting it wrong is not cosmetic -- a function in a non-executable
-    /// section segfaults when called.
-    NamedSection {
-        name: String,
-        executable: bool,
-        writable: bool,
-    },
+    /// `flags` says what is going there, because ELF needs the flags spelled
+    /// out and they differ: `"ax"` against `"aw"`. Getting it wrong is not
+    /// cosmetic -- a function in a non-executable section segfaults when
+    /// called.
+    NamedSection { name: String, flags: SectionFlags },
 
     /// Mark a symbol weak: another definition overrides it, and an
     /// unresolved reference is null rather than a link error.
@@ -1319,11 +1330,7 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".text");
                 }
             },
-            Directive::NamedSection {
-                name,
-                executable,
-                writable,
-            } => match target.os {
+            Directive::NamedSection { name, flags } => match target.os {
                 // Mach-O names a segment and a section together, and the
                 // program supplies both -- `section("__DATA,__mine")`.
                 Os::MacOS => {
@@ -1339,14 +1346,15 @@ impl EmitAsm for Directive {
                         // Read-only data asked for a named section is still
                         // read-only: spelling it "aw" put it in a writable
                         // segment and lost its page protection.
-                        let flags = if *executable {
-                            "ax"
-                        } else if *writable {
-                            "aw"
-                        } else {
-                            "a"
+                        let flags = match flags {
+                            SectionFlags::Code => "\"ax\"",
+                            SectionFlags::ReadOnly => "\"a\"",
+                            SectionFlags::Writable => "\"aw\"",
+                            // Without `T` a thread-local symbol in it is
+                            // an assembler error.
+                            SectionFlags::ThreadLocal => "\"awT\",@progbits",
                         };
-                        let _ = writeln!(out, ".section {},\"{}\"", name, flags);
+                        let _ = writeln!(out, ".section {},{}", name, flags);
                     }
                 }
             },

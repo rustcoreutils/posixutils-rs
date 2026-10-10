@@ -485,3 +485,57 @@ int get(int i) { return y + x + s[i] + t; }
         );
     }
 }
+
+/// Position-independent code reaches a symbol that binds within the output
+/// -- `static`, or hidden or internal whether defined here or only declared
+/// -- PC-relative, never through the GOT, as gcc does: the Linux vDSO is
+/// built `-fPIC` and linked with no dynamic relocations, and glibc's loader
+/// runs before its GOT is relocated. A default or protected one, and a weak
+/// declaration that may stay null, still goes through the GOT.
+#[test]
+fn codegen_locally_bound_symbols_skip_the_got_under_pic() {
+    let src = r#"
+extern int hv __attribute__((visibility("hidden")));
+extern int iv __attribute__((visibility("internal")));
+static int sv = 1;
+__attribute__((visibility("hidden"))) int dv = 2;
+extern int ev;
+extern int wv __attribute__((weak, visibility("hidden")));
+extern int pv __attribute__((visibility("protected")));
+void set(int x) { sv = x; }
+int get(void) { return hv + iv + sv + dv + ev + pv; }
+int *addr_w(void) { return &wv; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let x86 = triple == X86_64_LINUX;
+        let direct = |n: &str| {
+            if x86 {
+                format!("{n}(%rip)")
+            } else {
+                format!(":lo12:{n}]")
+            }
+        };
+        let got = |n: &str| {
+            if x86 {
+                format!("{n}@GOTPCREL")
+            } else {
+                format!(":got:{n}")
+            }
+        };
+        for pic in ["-fPIC", "-fpic", "-fPIE"] {
+            let asm = asm_for_with("local_binding_pic", triple, src, &["-O2", pic]);
+            let get = body_of(&asm, "get");
+            for name in ["hv", "iv", "sv", "dv"] {
+                assert!(
+                    get.contains(&direct(name)) && !get.contains(&got(name)),
+                    "{triple} {pic}: {name} must be PC-relative:\n{get}"
+                );
+            }
+            for name in ["ev", "pv"] {
+                assert!(get.contains(&got(name)), "{triple} {pic}: {name}:\n{get}");
+            }
+            let addr = body_of(&asm, "addr_w");
+            assert!(addr.contains(&got("wv")), "{triple} {pic}:\n{addr}");
+        }
+    }
+}

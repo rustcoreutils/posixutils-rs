@@ -747,6 +747,20 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_TRAP => Some((|| {
+                // __builtin_trap() - the target's trap instruction. Takes no
+                // arguments, returns void, never returns.
+                let call_pos = self.current_pos();
+                self.expect_special(b'(')?;
+                let args = self.parse_argument_list()?;
+                self.expect_special(b')')?;
+                self.check_argument_count(Some(name_id), args.len(), 0, Some(0), call_pos);
+                Ok(Self::typed_expr(
+                    ExprKind::Trap,
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_UNWIND_INIT => Some((|| {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
@@ -982,7 +996,10 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            crate::kw::SETJMP | crate::kw::SETJMP2 => Some((|| {
+            // Named anywhere but in a call -- `__typeof(_setjmp)`,
+            // `&setjmp` -- they are the library functions, which a header
+            // declares like any other.
+            crate::kw::SETJMP | crate::kw::SETJMP2 if self.is_special(b'(') => Some((|| {
                 // setjmp(env) - saves execution context, returns int
                 // Returns 0 on direct call, non-zero when returning via longjmp
                 self.expect_special(b'(')?;
@@ -1007,8 +1024,9 @@ impl Parser<'_> {
                     self.types.int_id,
                     token_pos,
                 ))
-            })()),
-            crate::kw::LONGJMP | crate::kw::LONGJMP2 => Some((|| {
+            })(
+            )),
+            crate::kw::LONGJMP | crate::kw::LONGJMP2 if self.is_special(b'(') => Some((|| {
                 // longjmp(env, val) - restores execution context (never returns)
                 // Causes corresponding setjmp to return val (or 1 if val == 0)
                 self.expect_special(b'(')?;
@@ -1025,7 +1043,8 @@ impl Parser<'_> {
                     self.types.void_id,
                     token_pos,
                 ))
-            })()),
+            })(
+            )),
             crate::kw::BUILTIN_SETJMP => Some((|| {
                 // gcc's `int __builtin_setjmp(void *)`: 0 directly, 1 when
                 // `__builtin_longjmp` resumes it.
@@ -2066,11 +2085,8 @@ impl Parser<'_> {
                 // Fortified builtins: __builtin___snprintf_chk etc.
                 // Strip __builtin_ prefix → __snprintf_chk, which is a
                 // real libc function (declared by macOS/glibc headers).
-                // `__builtin_trap` has no same-named library entry
-                // point; its contract is abnormal termination, which
-                // is `abort`. Everything else keeps its own name.
+                // Everything else keeps its own name.
                 let real_name = match name_str {
-                    "__builtin_trap" => "abort",
                     // gcc's own equality-only spelling of `memcmp`. There is
                     // no library entry point of that name; answering the
                     // ordering as well is a correct implementation of it.
@@ -2483,7 +2499,6 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_STRDUP
                 | crate::kw::BUILTIN_STRNDUP
                 | crate::kw::BUILTIN_MEMCMP_EQ
-                | crate::kw::BUILTIN_TRAP
                 | crate::kw::BUILTIN_ABORT
                 | crate::kw::BUILTIN_EXIT
                 | crate::kw::BUILTIN_PRINTF

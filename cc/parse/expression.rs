@@ -2302,6 +2302,12 @@ impl<'a> Parser<'a> {
     ///
     /// Only the *count* need be constant, as in gcc: `x << 64` warns.
     fn check_shift_count(&mut self, op: BinaryOp, promoted_left: TypeId, right: &Expr) {
+        // Not in an operand that is never evaluated, as gcc: generic code
+        // guards a shift by a computed width with a constant condition,
+        // `W > 64 ? x << (64 - W - 1) : x`.
+        if self.unevaluated > 0 {
+            return;
+        }
         let Some(count) = self.eval_const_expr(right) else {
             return;
         };

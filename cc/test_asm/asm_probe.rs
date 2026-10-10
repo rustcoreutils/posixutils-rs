@@ -112,9 +112,8 @@ pub fn count_in_body(asm: &str, func: &str, needle: &str) -> usize {
     body_of(asm, func).matches(needle).count()
 }
 
-/// The section directive in force where `name:` is defined. Only the ELF
-/// section tests use it, and they run on an x86-64 Linux host.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// The section directive in force where `name:` is defined, in ELF
+/// assembly: a host's, or any host's asked for with an ELF triple.
 pub fn section_of<'a>(asm: &'a str, name: &str) -> Option<&'a str> {
     let label = format!("{name}:");
     let mut current = None;

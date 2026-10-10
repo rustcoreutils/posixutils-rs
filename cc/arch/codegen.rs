@@ -9,7 +9,9 @@
 // Architecture-independent code generation interface
 //
 
-use crate::arch::lir::{is_private_name, Directive, EmitAsm, LirInst, OperandSize, Symbol};
+use crate::arch::lir::{
+    is_private_name, Directive, EmitAsm, LirInst, OperandSize, SectionFlags, Symbol,
+};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::float::{FloatVal, FpFormat};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
@@ -175,6 +177,12 @@ pub struct CodeGenBase<I: LirInst> {
     /// Extended asm statements emitted so far in this module: the next one's
     /// `%=` number; see [`CodeGenBase::next_asm_instance`].
     pub asm_instances: u32,
+    /// The flags of each section the program named, decided for all of its
+    /// definitions at once; see [`CodeGenBase::plan_named_sections`].
+    pub named_sections: std::collections::HashMap<String, SectionFlags>,
+    /// The symbols the static linker resolves within the output being
+    /// built; see [`CodeGenBase::plan_local_binding`].
+    pub binds_locally: std::collections::HashSet<String>,
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -200,6 +208,81 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
             asm_instances: 0,
+            named_sections: std::collections::HashMap::new(),
+            binds_locally: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Note which symbols bind within the output being built, whatever
+    /// else is linked with it -- a `static` definition, or one with hidden
+    /// or internal visibility, defined here or only declared -- so position-
+    /// independent code reaches them PC-relative instead of through the GOT,
+    /// as gcc does (`binds_local_p`). The Linux vDSO, built `-fPIC`, is
+    /// linked with no dynamic relocations at all, and glibc's loader runs
+    /// code before its own GOT is relocated.
+    ///
+    /// A weak declaration may stay undefined, and only the GOT can hold its
+    /// null; a protected object may be copied into the executable, so its
+    /// address is the GOT's to give too. ELF only: Mach-O's `.private_extern`
+    /// is left to the GOT, as before.
+    pub fn plan_local_binding(&mut self, module: &Module) {
+        self.binds_locally.clear();
+        if self.target.os == Os::MacOS {
+            return;
+        }
+        let local_visibility = |attrs: &crate::parse::ast::SymbolAttrs| {
+            matches!(attrs.visibility.as_deref(), Some("hidden" | "internal"))
+        };
+        let functions = module
+            .functions
+            .iter()
+            .filter(|f| f.is_static || local_visibility(&f.symbol_attrs))
+            .map(|f| &f.name);
+        let objects = module
+            .globals
+            .iter()
+            .filter(|g| g.is_static || local_visibility(&g.symbol_attrs))
+            .map(|g| &g.name);
+        let declared = module
+            .declared_symbol_attrs
+            .iter()
+            .filter(|(_, attrs)| local_visibility(attrs) && !attrs.weak)
+            .map(|(name, _)| name);
+        self.binds_locally = functions.chain(objects).chain(declared).cloned().collect();
+    }
+
+    /// Decide the flags of every section the program named, before any
+    /// definition is emitted into one: one ELF section has one set, so its
+    /// definitions decide them together, as gcc's `get_section` does.
+    ///
+    /// A `const` object holding addresses is read-only in position-dependent
+    /// code -- the kernel's `__initconst`, which is `"a"` for every object in
+    /// it -- but in position-independent code the loader writes it before
+    /// it can be protected, `.data.rel.ro`'s case, so it is `"aw"`, and the
+    /// read-only objects sharing its section go there with it. Pairs that
+    /// cannot share at all were reported by the linearizer
+    /// (`check_section_conflicts`); the strongest claim stands for them.
+    pub fn plan_named_sections(&mut self, module: &Module, pic: bool) {
+        use crate::ir::SectionUse;
+        self.named_sections.clear();
+        let functions = module
+            .functions
+            .iter()
+            .filter(|f| f.emit)
+            .filter_map(|f| Some((f.symbol_attrs.section.as_ref()?, SectionFlags::Code)));
+        let objects = module.globals.iter().filter_map(|g| {
+            let flags = match g.section_use() {
+                SectionUse::Code => SectionFlags::Code,
+                SectionUse::ThreadLocal => SectionFlags::ThreadLocal,
+                SectionUse::Writable => SectionFlags::Writable,
+                SectionUse::ReadOnly { relocs } if relocs && pic => SectionFlags::Writable,
+                SectionUse::ReadOnly { .. } => SectionFlags::ReadOnly,
+            };
+            Some((g.symbol_attrs.section.as_ref()?, flags))
+        });
+        for (name, flags) in functions.chain(objects) {
+            let slot = self.named_sections.entry(name.clone()).or_insert(flags);
+            *slot = (*slot).max(flags);
         }
     }
 
@@ -473,10 +556,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     pub fn emit_declared_symbol_attrs(&mut self, module: &Module) {
         let declared: std::collections::HashSet<String> =
             module.declared_symbol_attrs.keys().cloned().collect();
-        let referenced = module.referenced_symbols(&declared);
+        let referenced = module.referenced_in_output(&declared);
         for (name, attrs) in &module.declared_symbol_attrs {
+            // An inline definition defines nothing: a name that has only
+            // one is a reference to the symbol, like any other.
             if !referenced.contains(name)
-                || module.functions.iter().any(|f| f.name == *name)
+                || module.functions.iter().any(|f| f.name == *name && f.emit)
                 || module.globals.iter().any(|g| g.name == *name)
             {
                 continue;
@@ -581,13 +666,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
         // Select appropriate section for TLS vs regular data
         if let Some(name) = &named_section {
+            let flags = self.named_sections[name];
             self.push_directive(Directive::NamedSection {
                 name: name.clone(),
-                executable: false,
-                // Const data that needs relocations cannot be mapped read-only
-                // until the dynamic linker has run, so it is writable in the
-                // object the same way `.data.rel.ro` is.
-                writable: !global.is_const || global.init.has_reloc(),
+                flags,
             });
         } else if global.is_thread_local {
             if matches!(global.init, Initializer::None) {

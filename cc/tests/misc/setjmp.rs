@@ -129,6 +129,36 @@ int main(void) {
     assert_eq!(compile_and_run("misc_setjmp_mega", code, &[]), 0);
 }
 
+/// `setjmp` and `_setjmp` named outside a call -- in `__typeof`, as glibc's
+/// `libc_hidden_proto (_setjmp)` writes, and for their addresses -- are the
+/// library functions, and calls after such a redeclaration still save and
+/// resume the context. Both were parse errors ("expected '('").
+#[test]
+fn misc_setjmp_names_outside_a_call() {
+    let code = r#"
+#include <setjmp.h>
+extern __typeof(_setjmp) _setjmp;
+extern __typeof(setjmp) setjmp;
+static jmp_buf env;
+int main(void)
+{
+    volatile int n = 0;
+    if (&setjmp == 0 || &_setjmp == 0 || &longjmp == 0)
+        return 1;
+    if (_setjmp(env) == 0) {
+        n++;
+        _longjmp(env, 1);
+    }
+    if (setjmp(env) == 0) {
+        n++;
+        longjmp(env, 1);
+    }
+    return n == 2 ? 0 : 2;
+}
+"#;
+    crate::common::compile_and_run_everywhere("misc_setjmp_names", code);
+}
+
 /// gcc's `__builtin_setjmp` / `__builtin_longjmp`: a five-word buffer, the
 /// second return is always 1, the jump comes from another function, and
 /// `volatile` locals of the setjmp's frame survive it.

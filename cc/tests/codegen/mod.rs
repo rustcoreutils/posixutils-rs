@@ -50,6 +50,7 @@ mod macho_labels;
 mod memopt;
 mod memopt_blockops;
 mod ms_abi;
+mod named_sections;
 mod optimizer;
 mod pic;
 mod plain_char;

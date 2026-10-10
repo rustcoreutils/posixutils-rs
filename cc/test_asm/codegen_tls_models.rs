@@ -11,7 +11,7 @@
 // run halves are in `tests/codegen/tls_models.rs`.
 //
 
-use super::asm_probe::{asm_for_with, body_of};
+use super::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 
 /// A thread-local reached through a block-scope `extern` inside a function
 /// whose parameter has the same name. The parameter's address is taken, so it
@@ -536,4 +536,36 @@ fn tls_model_option_leaves_macho_alone() {
     );
     let body = body_of(&asm, "_rt");
     assert!(body.contains("@TLVPPAGE"), "{body}");
+}
+
+/// glibc's <ctype.h>: hidden `extern __thread` declarations named only by
+/// `gnu_inline` bodies, which are never emitted. A reference from a body
+/// that is not in the output is no reference, so gcc writes nothing for the
+/// names; c17 wrote `.hidden`, which made each an undefined *untyped* symbol,
+/// and the linker rejects that beside the TLS definition or reference of
+/// the same name in another object. Once a body is inlined into emitted code
+/// the name is referenced, as a thread-local, and is declared hidden.
+#[test]
+fn tls_extern_named_only_by_an_inline_body_is_not_declared() {
+    let src = r#"
+extern __thread const unsigned short *tsd_b __attribute__((visibility("hidden")));
+extern __thread const int *tsd_u __attribute__((visibility("hidden")));
+extern __inline __attribute__((__gnu_inline__)) const unsigned short **b_loc(void) { return &tsd_b; }
+extern __inline __attribute__((__gnu_inline__)) const int **u_loc(void) { return &tsd_u; }
+int f(void) { return 0; }
+int g(void) { return **u_loc(); }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        for opt in ["-O0", "-O2"] {
+            let asm = asm_for_with("tls_inline_only", triple, src, &[opt, "-fPIC"]);
+            assert!(!asm.contains("tsd_b"), "{triple} {opt}:\n{asm}");
+            // Inlined at -O2 only, as gcc inlines it.
+            let inlined = opt == "-O2";
+            assert_eq!(
+                asm.contains(".hidden tsd_u"),
+                inlined,
+                "{triple} {opt}:\n{asm}"
+            );
+        }
+    }
 }

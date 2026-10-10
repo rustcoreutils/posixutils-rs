@@ -61,3 +61,22 @@ fn mode_attribute_of_the_same_class_is_applied() {
                }\n";
     compile_and_run_everywhere("mode_same_class", src);
 }
+
+/// libgcc's modes, as glibc's soft-fp declares `__gcc_CMPtype` with them:
+/// the widths libgcc's routines use -- a comparison result is a word on
+/// x86-64 and 32 bits on aarch64, a shift count a word on both.
+#[test]
+fn mode_attribute_libgcc_modes_have_libgcc_widths() {
+    let src = "typedef int cmp_t __attribute__((__mode__(__libgcc_cmp_return__)));\n\
+               typedef unsigned sh_t __attribute__((__mode__(__libgcc_shift_count__)));\n\
+               int main(void) {\n\
+               #ifdef __aarch64__\n\
+                   if (sizeof(cmp_t) != 4) return 1;\n\
+               #else\n\
+                   if (sizeof(cmp_t) != 8) return 1;\n\
+               #endif\n\
+                   cmp_t c = -1; sh_t s = 0; s--;\n\
+                   return sizeof(sh_t) == 8 && c < 0 && s == ~0ULL ? 0 : 2;\n\
+               }\n";
+    compile_and_run_everywhere("mode_libgcc", src);
+}

@@ -732,3 +732,51 @@ int main(void) {
         }
     }
 }
+
+/// A range, then an element that initializes one of the range's slots
+/// again (Linux's fs/proc/task_mmu.c `mnemonics[BITS_PER_LONG][2]`). A
+/// braced list or string for the whole slot replaces what the range put
+/// there; a brace-elided value only overwrites from the slot's start, as
+/// gcc does. The later element was appended to the range's, so a string
+/// was "not constant", a static struct kept the range's first member, and an
+/// automatic char array read garbage.
+#[test]
+fn c99_range_then_override_of_one_slot() {
+    let code = r#"
+#include <string.h>
+struct t { int x, y, z; };
+static const char mn[8][3] = { [0 ... 7] = "??", [2] = "rd" };
+static const char s[3][4] = { [0 ... 2] = "abc", [1] = "x", [2] = {'q'} };
+static int e[4] = { [0 ... 3] = 1, [1] = 5, 6 };
+static struct t a[3] = { [0 ... 2] = {1, 2, 3}, [1] = {7} };
+static struct t b[3] = { [0 ... 2] = {1, 2, 3}, [1] = 7 };
+static struct t c[3] = { [0 ... 2] = {1, 2, 3}, [0] = 7, 8, 9, 10 };
+static struct t d[3] = { [0 ... 2] = {1, 2, 3}, [1].y = 7, 8 };
+static int m[3][2] = { [0 ... 2] = {1, 2}, [1] = 7 };
+static int eq(const struct t *v, int x, int y, int z) { return v->x == x && v->y == y && v->z == z; }
+int main(void)
+{
+    const char lmn[4][3] = { [0 ... 3] = "??", [2] = "rd" };
+    struct t la[3] = { [0 ... 2] = {1, 2, 3}, [1] = {7} };
+    struct t lb[3] = { [0 ... 2] = {1, 2, 3}, [1] = 7 };
+    if (memcmp(mn[0], "??", 3) || memcmp(mn[2], "rd", 3) || memcmp(mn[7], "??", 3))
+        return 1;
+    if (strcmp(s[0], "abc") || memcmp(s[1], "x\0\0", 4) || memcmp(s[2], "q\0\0", 4))
+        return 2;
+    if (e[0] != 1 || e[1] != 5 || e[2] != 6 || e[3] != 1)
+        return 3;
+    if (!eq(&a[0], 1, 2, 3) || !eq(&a[1], 7, 0, 0) || !eq(&a[2], 1, 2, 3))
+        return 4;
+    if (!eq(&b[1], 7, 2, 3) || !eq(&c[0], 7, 8, 9) || !eq(&c[1], 10, 2, 3) || !eq(&c[2], 1, 2, 3))
+        return 5;
+    if (!eq(&d[1], 1, 7, 8) || m[1][0] != 7 || m[1][1] != 2 || m[2][0] != 1)
+        return 6;
+    if (memcmp(lmn[2], "rd", 3) || memcmp(lmn[3], "??", 3))
+        return 7;
+    if (!eq(&la[1], 7, 0, 0) || !eq(&lb[1], 7, 2, 3) || !eq(&lb[2], 1, 2, 3))
+        return 8;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("c99_range_override", code);
+}

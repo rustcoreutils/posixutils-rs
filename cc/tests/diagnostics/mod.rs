@@ -760,6 +760,21 @@ fn diagnostics_shift_count_warnings_can_be_turned_off() {
     }
 }
 
+/// A shift by a width-derived count in the arm a constant condition
+/// discards builds under `-Werror` and runs, as with gcc: the guard is how
+/// generic code keeps the shift from ever happening.
+#[test]
+fn diagnostics_shift_count_in_a_discarded_arm_builds_under_werror() {
+    let src = "#define W 64\n\
+               static unsigned long f(unsigned long x) { return W > 64 ? x << (64 - W - 1) : x; }\n\
+               static unsigned long g(unsigned long x) { return W <= 64 ? x : x >> (W - 128); }\n\
+               int main(void) { return !(f(5) == 5 && g(6) == 6); }\n";
+    assert_eq!(
+        crate::common::compile_and_run("shift_discarded_arm", src, &["-Werror".to_string()]),
+        0
+    );
+}
+
 /// C17 6.5.7p3: "the type of the result is that of the promoted left operand".
 /// The right operand's type never reaches the result, and c17 took the usual
 /// arithmetic conversions instead -- so `1 << 1L` came out `long` and

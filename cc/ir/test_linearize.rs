@@ -1580,6 +1580,54 @@ fn test_alias_declarations_become_symbol_aliases() {
     }
 }
 
+/// glibc's `libc_hidden_weak` over a function <bits/stdio.h> also gives a
+/// `gnu_inline` body: the hidden asm name `__GI_g` is both that body's name
+/// and an alias of `__g`, and the public `g` an alias of `__GI_g`. The body
+/// emits no symbol, so the alias is what `__GI_g` names and `g` resolves
+/// through it -- it was "aliased to external symbol '__GI_g'". A body with
+/// no alias behind it is still an external target.
+#[test]
+fn test_alias_through_a_name_with_an_inline_body() {
+    let src = "extern __inline __attribute__((__gnu_inline__)) int g(int x) { return x + 1; }\n\
+               extern __typeof(g) g __asm__(\"__GI_g\") __attribute__((visibility(\"hidden\")));\n\
+               int __g(int x) { return x + 1; }\n\
+               extern __typeof(__g) g __attribute__((weak, alias(\"__g\")));\n\
+               extern __typeof(g) __EI_g __asm__(\"g\");\n\
+               extern __typeof(g) __EI_g __attribute__((alias(\"__GI_g\"))) __attribute__((weak));\n\
+               int use(int x) { return g(x); }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let errors = crate::diag::error_count();
+    let module = linearize_source(src, &target);
+    assert_eq!(crate::diag::error_count(), errors, "rejected");
+    let undecorated = crate::arch::lir::undecorated;
+    let found: Vec<(&str, &str, bool, Option<&str>)> = module
+        .aliases
+        .iter()
+        .map(|a| {
+            let vis = a.visibility.as_deref();
+            (undecorated(&a.name), undecorated(&a.target), a.weak, vis)
+        })
+        .collect();
+    // `__GI_g` is hidden by its earlier declaration, as gcc makes it.
+    assert_eq!(
+        found,
+        [
+            ("__GI_g", "__g", true, Some("hidden")),
+            ("g", "__GI_g", true, None)
+        ]
+    );
+
+    let lone = "extern __inline __attribute__((__gnu_inline__)) int k(int x) { return x; }\n\
+                int a(int) __attribute__((alias(\"k\")));\n";
+    let errors = crate::diag::error_count();
+    let module = linearize_source(lone, &target);
+    assert!(
+        crate::diag::error_count() > errors,
+        "an inline body alone accepted"
+    );
+    assert!(module.aliases.is_empty());
+}
+
 /// An `ifunc` declaration becomes a `SymbolAlias` of the `Ifunc` form naming
 /// its resolver -- not a definition, and not the resolver: a call to it is a
 /// call to an external symbol, reached through the GOT, which is where the

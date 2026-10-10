@@ -1282,6 +1282,7 @@ fn opcode_clobbers_aarch64_scratches(op: Opcode) -> bool {
             | Opcode::Phi
             | Opcode::PhiSource
             | Opcode::Unreachable
+            | Opcode::Trap
             | Opcode::Fence
             | Opcode::VaEnd
     )

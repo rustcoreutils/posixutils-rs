@@ -507,8 +507,12 @@ impl MachineModeClass {
             "QI" | "byte" => MachineModeClass::Int(8),
             "HI" => MachineModeClass::Int(16),
             "SI" => MachineModeClass::Int(32),
-            "DI" | "word" | "pointer" | "unwind_word" | "libgcc_cmp_return"
-            | "libgcc_shift_count" => MachineModeClass::Int(64),
+            "DI" | "word" | "pointer" | "unwind_word" | "libgcc_shift_count" => {
+                MachineModeClass::Int(64)
+            }
+            // What libgcc's comparison routines return: a word on x86-64,
+            // and `SImode` on aarch64 (`aarch64_libgcc_cmp_return_mode`).
+            "libgcc_cmp_return" => MachineModeClass::Int(if x86 { 64 } else { 32 }),
             "TI" => MachineModeClass::Int(128),
             "HF" | "BF" | "SF" | "DF" | "TF" | "SD" | "DD" | "TD" => MachineModeClass::Float,
             "XF" if x86 => MachineModeClass::Float,
@@ -1292,17 +1296,17 @@ impl Parser<'_> {
         }
         let unsigned = self.types.is_unsigned(typ);
         let t = &self.types;
-        let mapped = match mode.as_str() {
-            // Integer modes, named for their width in bytes.
-            // `byte` is a byte, and `word`, `pointer` and `unwind_word` are
-            // eight bytes on every target c17 has.
-            "QI" | "byte" => Some(if unsigned { t.uchar_id } else { t.schar_id }),
-            "HI" => Some(if unsigned { t.ushort_id } else { t.short_id }),
-            "SI" => Some(if unsigned { t.uint_id } else { t.int_id }),
-            "DI" | "word" | "pointer" | "unwind_word" => {
-                Some(if unsigned { t.ulong_id } else { t.long_id })
+        let mapped = match (class, mode.as_str()) {
+            // Integer modes, by the width `MachineModeClass::of` gives each
+            // name -- `QI` to `TI`, and gcc's aliases for the ones the target
+            // picks: `byte`, `word`, `pointer`, `unwind_word` and libgcc's.
+            (MachineModeClass::Int(8), _) => Some(if unsigned { t.uchar_id } else { t.schar_id }),
+            (MachineModeClass::Int(16), _) => Some(if unsigned { t.ushort_id } else { t.short_id }),
+            (MachineModeClass::Int(32), _) => Some(if unsigned { t.uint_id } else { t.int_id }),
+            (MachineModeClass::Int(64), _) => Some(if unsigned { t.ulong_id } else { t.long_id }),
+            (MachineModeClass::Int(128), _) => {
+                Some(if unsigned { t.uint128_id } else { t.int128_id })
             }
-            "TI" => Some(if unsigned { t.uint128_id } else { t.int128_id }),
             // Floating modes. `XF` is the x87 extended format and `TF` IEEE
             // binary128 -- both sixteen bytes on x86-64 and *not*
             // interchangeable, so they map to their own types rather than to a
@@ -1316,19 +1320,19 @@ impl Parser<'_> {
             // arm64 produced a type needing `__divtf3` and `__multf3`, which
             // that platform has no equivalent of. `has_float128` is the one
             // condition both places ask.
-            "HF" => Some(t.float16_id),
-            "SF" => Some(t.float_id),
-            "DF" => Some(t.double_id),
-            "XF" => Some(t.longdouble_id),
-            "TF" if t.has_float128() => Some(t.float128_id),
+            (_, "HF") => Some(t.float16_id),
+            (_, "SF") => Some(t.float_id),
+            (_, "DF") => Some(t.double_id),
+            (_, "XF") => Some(t.longdouble_id),
+            (_, "TF") if t.has_float128() => Some(t.float128_id),
             // Complex modes, named for the format of each half. glibc's
             // <bits/floatn.h> declares `__cfloat128` with `mode(TC)`, which was
             // 285 of the warnings a CPython build produced.
-            "HC" => Some(t.complex_float16_id),
-            "SC" => Some(t.complex_float_id),
-            "DC" => Some(t.complex_double_id),
-            "XC" => Some(t.complex_longdouble_id),
-            "TC" if t.has_float128() => Some(t.complex_float128_id),
+            (_, "HC") => Some(t.complex_float16_id),
+            (_, "SC") => Some(t.complex_float_id),
+            (_, "DC") => Some(t.complex_double_id),
+            (_, "XC") => Some(t.complex_longdouble_id),
+            (_, "TC") if t.has_float128() => Some(t.complex_float128_id),
             _ => None,
         };
         match mapped {
@@ -1432,21 +1436,6 @@ impl Parser<'_> {
             if self.is_attribute_keyword() {
                 let pos = self.current_pos();
                 let attrs = self.parse_attributes();
-                if declarator_scoped {
-                    if let Some(align) = attrs.get_alignment() {
-                        if align > 0 && align.is_power_of_two() {
-                            self.pending_declarator_align = Some(
-                                self.pending_declarator_align
-                                    .map_or(align, |a| a.max(align)),
-                            );
-                        }
-                    }
-                } else {
-                    self.apply_attribute_alignment(&attrs);
-                }
-                if attrs.has_transparent_union() {
-                    self.pending_transparent_union = Some(self.current_pos());
-                }
                 // A struct or union's order is written in its specifier; on
                 // a declaration or declarator gcc ignores it, and says so.
                 if attrs.find("scalar_storage_order").is_some() {
@@ -1457,10 +1446,7 @@ impl Parser<'_> {
                         &["scalar_storage_order"],
                     );
                 }
-                self.pending_packed |= attrs.has_packed();
-                self.merge_symbol_attrs(&attrs);
-                self.merge_calling_conv(&attrs, pos);
-                self.merge_fn_attrs(&attrs, pos);
+                self.apply_declaration_attrs(&attrs, pos, declarator_scoped);
             } else if self.is_asm_keyword() {
                 self.parse_asm_label();
             } else if self.is_nullability_qualifier() {
@@ -1469,6 +1455,37 @@ impl Parser<'_> {
                 break;
             }
         }
+    }
+
+    /// Hand an attribute list written in a declaration to the slots of the
+    /// declaration being parsed: among its specifiers, or, when
+    /// `declarator_scoped`, after one declarator (where `aligned` is that
+    /// declarator's alone).
+    pub(super) fn apply_declaration_attrs(
+        &mut self,
+        attrs: &AttributeList,
+        pos: Position,
+        declarator_scoped: bool,
+    ) {
+        if declarator_scoped {
+            if let Some(align) = attrs.get_alignment() {
+                if align > 0 && align.is_power_of_two() {
+                    self.pending_declarator_align = Some(
+                        self.pending_declarator_align
+                            .map_or(align, |a| a.max(align)),
+                    );
+                }
+            }
+        } else {
+            self.apply_attribute_alignment(attrs);
+        }
+        if attrs.has_transparent_union() {
+            self.pending_transparent_union = Some(self.current_pos());
+        }
+        self.pending_packed |= attrs.has_packed();
+        self.merge_symbol_attrs(attrs);
+        self.merge_calling_conv(attrs, pos);
+        self.merge_fn_attrs(attrs, pos);
     }
 }
 

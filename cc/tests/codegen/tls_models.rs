@@ -673,3 +673,29 @@ fn tls_freebsd_shared_object_links() {
         String::from_utf8_lossy(&linked.stderr)
     );
 }
+
+/// glibc's <ctype.h> pattern across two objects: one declares a hidden
+/// `extern __thread` named only by an un-emitted `gnu_inline` body, the other
+/// defines and reads it. The first object's stray `.hidden` made the name an
+/// untyped undefined symbol, and the link failed with "TLS definition ...
+/// mismatches non-TLS reference" -- libc.so's own link failure.
+#[test]
+fn tls_extern_named_only_by_an_inline_body_links() {
+    let unit_a = r#"
+extern __thread const int *tsd_u __attribute__((visibility("hidden")));
+extern __inline __attribute__((__gnu_inline__)) const int **u_loc(void) { return &tsd_u; }
+int f(void) { return 1; }
+"#;
+    let unit_b = r#"
+__attribute__((visibility("hidden"))) __thread const int *tsd_u;
+int f(void);
+int main(void) { return f() - 1 + (tsd_u != 0); }
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run_two_units("tls_inline_only", unit_a, unit_b, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}

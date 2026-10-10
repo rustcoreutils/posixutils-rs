@@ -1269,6 +1269,10 @@ pub enum ExprKind {
     /// Used for optimization hints and silencing warnings.
     Unreachable,
 
+    /// `__builtin_trap()`: abnormal termination by the target's trap
+    /// instruction, never a library call. Does not return.
+    Trap,
+
     /// `__builtin_unwind_init()`: every callee-saved register is saved in
     /// the current function's frame, so a scan of the stack sees what the
     /// callers held in them -- a conservative collector's register flush.
@@ -1679,6 +1683,15 @@ pub fn designated_span(
     };
     let end = ObjectWalk::new(types, elements).slot_end(start, &slot, rest, None);
     start..end.max((start + 1).min(elements.len()))
+}
+
+/// The designator naming the first subobject of `typ` a positional
+/// element lands in -- index 0 of an array, the first initializable member
+/// of a structure or union -- or `None` for a type with none.
+pub fn first_subobject(types: &TypeTable, typ: TypeId) -> Option<Designator> {
+    ObjectWalk::new(types, &[])
+        .positional(typ, 0)
+        .map(|slot| slot.name)
 }
 
 /// Where the brace list `elements`, initializing an object of type `typ`,
@@ -2522,6 +2535,7 @@ impl Expr {
             | K::VaArgPack
             | K::VaArgPackLen
             | K::Unreachable
+            | K::Trap
             | K::UnwindInit
             | K::StackSave
             | K::FrameAddress { .. }

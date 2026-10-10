@@ -817,6 +817,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             declarator.explicit_align,
             storage,
         );
+        // Its `section`, `used` and the rest are the object's, exactly as
+        // at file scope: Linux puts its `__dyndbg` descriptors and
+        // `.data.once` flags in named sections from inside functions.
+        if declarator.symbol_attrs.section.is_some() {
+            let shown = self
+                .str(self.symbols.get(declarator.symbol).name)
+                .to_string();
+            self.record_section_definition(&global_name, declarator.pos, shown);
+        }
+        self.module
+            .set_symbol_attrs(&global_name, declarator.symbol_attrs.clone());
     }
 
     /// Linearize an initializer list for arrays or structs

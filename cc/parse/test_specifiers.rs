@@ -70,6 +70,57 @@ fn test_named_machine_modes() {
     assert_eq!(size("uw"), (8, true));
 }
 
+/// `setjmp` and `_setjmp` are ordinary identifiers wherever they are not
+/// called: glibc's `libc_hidden_proto (_setjmp)` is `extern __typeof
+/// (_setjmp) _setjmp __attribute__((visibility("hidden")));`, and a program
+/// may take their addresses. The parser wanted a `(` after either name.
+#[test]
+fn test_setjmp_names_outside_a_call() {
+    let src = "typedef int jb[8];\n\
+               extern int setjmp(jb);\n\
+               extern int _setjmp(jb);\n\
+               extern void longjmp(jb, int);\n\
+               extern __typeof(_setjmp) _setjmp __attribute__((visibility(\"hidden\")));\n\
+               extern __typeof(setjmp) setjmp;\n\
+               int (*p)(jb) = &setjmp, (*q)(jb) = _setjmp;\n\
+               void (*r)(jb, int) = longjmp;\n\
+               jb env;\n\
+               int f(void) { return setjmp(env) + _setjmp(env) + (p == q); }\n";
+    let before = crate::diag::error_count();
+    let parsed = parse_tu(src);
+    assert!(parsed.is_ok(), "{:?}", parsed.err());
+    assert_eq!(crate::diag::error_count(), before);
+}
+
+/// libgcc's own modes, which glibc's soft-fp declares its comparison results
+/// and shift counts with (`__gcc_CMPtype`), so they must be libgcc's widths:
+/// the shift count is a word everywhere, and the comparison result a word
+/// on x86-64 but `SImode` on aarch64 -- gcc 13 and aarch64-linux-gnu-gcc 13
+/// answer `sizeof` 8 and 8, 4 and 8. They were "not implemented" and kept
+/// the declared `int`.
+#[test]
+fn test_libgcc_machine_modes() {
+    let src = "typedef int cmp_t __attribute__((mode(__libgcc_cmp_return__)));\n\
+               typedef unsigned sh_t __attribute__((__mode__(libgcc_shift_count)));";
+    for (arch, cmp_bytes) in [(Arch::X86_64, 8), (Arch::Aarch64, 4)] {
+        let target = Target::new(arch, Os::Linux);
+        let before = crate::diag::warning_count();
+        let (_, types, strings, symbols): (_, _, _, SymbolTable) =
+            parse_tu_for(src, &target).expect("parses");
+        assert_eq!(crate::diag::warning_count(), before, "{arch:?}: warned");
+        let size = |name: &str| {
+            let id = strings.lookup(name).expect("interned");
+            let typ = symbols
+                .lookup(id, Namespace::Ordinary)
+                .expect("declared")
+                .typ;
+            (types.size_bytes(typ), types.is_unsigned(typ))
+        };
+        assert_eq!(size("cmp_t"), (cmp_bytes, false), "{arch:?}");
+        assert_eq!(size("sh_t"), (8, true), "{arch:?}");
+    }
+}
+
 /// The declarators of the last function in `src`'s body, in order: each
 /// one's name, type and initializer.
 fn body_declarators(src: &str) -> (Vec<(String, TypeId, Option<Expr>)>, TypeTable) {

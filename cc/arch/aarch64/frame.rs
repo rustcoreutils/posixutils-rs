@@ -19,7 +19,8 @@ use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
-    complex_fp_info, plan_pair_move, CondCode, Directive, FpSize, OperandSize, PairMove, Symbol,
+    complex_fp_info, plan_pair_move, CondCode, Directive, FpSize, OperandSize, PairMove,
+    SectionFlags, Symbol,
 };
 use crate::ir::{Function, Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -341,8 +342,7 @@ impl Aarch64CodeGen {
         if let Some(sec) = &func.symbol_attrs.section {
             self.push_lir(Aarch64Inst::Directive(Directive::NamedSection {
                 name: sec.clone(),
-                executable: true,
-                writable: false,
+                flags: SectionFlags::Code,
             }));
         }
 

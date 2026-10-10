@@ -510,6 +510,9 @@ pub enum Opcode {
 
     // Optimization hints
     Unreachable, // Code path is never reached (undefined behavior if reached)
+    // `__builtin_trap()`: the target's trap instruction. Ends its block, like
+    // `Unreachable`, but it is no hint: reaching it is the program's choice.
+    Trap,
 
     // Stack introspection
     FrameAddress, // __builtin_frame_address(level) - frame pointer `frame_level()` frames up
@@ -901,7 +904,7 @@ impl Opcode {
             | VaStart | VaArg | VaEnd | VaCopy | VaArgPackLen | ConstantP | ObjectSize(_)
             | Bswap16 | Bswap32 | Bswap64 | Ctz32 | Ctz64 | Clz32 | Clz64 | Popcount32
             | Popcount64 | Alloca | StackSave | StackRestore | Memset | Memcpy | Memmove
-            | Unreachable | FrameAddress | ReturnAddress | Setjmp | Longjmp | AtomicLoad
+            | Unreachable | Trap | FrameAddress | ReturnAddress | Setjmp | Longjmp | AtomicLoad
             | AtomicStore | AtomicSwap | AtomicCas | AtomicFetchAdd | AtomicFetchSub
             | AtomicFetchAnd | AtomicFetchOr | AtomicFetchXor | Fence | Lo64 | Hi64 | Pair64
             | AddC | AdcC | SubC | SbcC | UMulHi | LifetimeEnd => FpRaise::Never,
@@ -973,6 +976,7 @@ impl Opcode {
                 | Opcode::Switch
                 | Opcode::IndirectBr
                 | Opcode::Unreachable
+                | Opcode::Trap
                 | Opcode::Longjmp
         )
     }
@@ -1005,6 +1009,9 @@ impl Opcode {
                 | Opcode::StackRestore
                 | Opcode::Setjmp
                 | Opcode::Longjmp
+                // A signal handler runs where it traps, and may read
+                // anything the program stored before it.
+                | Opcode::Trap
                 | Opcode::Asm
                 | Opcode::Fence
         ) || self.is_atomic()
@@ -1169,6 +1176,7 @@ impl Opcode {
             Opcode::Memmove => "memmove",
             Opcode::Signbit => "signbit",
             Opcode::Unreachable => "unreachable",
+            Opcode::Trap => "trap",
             Opcode::FrameAddress => "frame_address",
             Opcode::ReturnAddress => "return_address",
             Opcode::Setjmp => "setjmp",
@@ -1323,7 +1331,7 @@ every_opcode! {
     Store, Phi, PhiSource, Copy, SymAddr, TlsAddr, Call, Select, SetVal, Nop, VaStart, VaArg,
     VaEnd, VaCopy, VaArgPackLen, ConstantP, Bswap16, Bswap32, Bswap64, Ctz32, Ctz64, Clz32, Clz64,
     Popcount32, Popcount64, Alloca, StackSave, StackRestore, Memset, Memcpy, Memmove, Signbit,
-    Unreachable, FrameAddress, ReturnAddress, Setjmp, Longjmp, Asm, AtomicLoad, AtomicStore,
+    Unreachable, Trap, FrameAddress, ReturnAddress, Setjmp, Longjmp, Asm, AtomicLoad, AtomicStore,
     AtomicSwap, AtomicCas, AtomicFetchAdd, AtomicFetchSub, AtomicFetchAnd, AtomicFetchOr,
     AtomicFetchXor, Fence, Lo64, Hi64, Pair64, AddC, AdcC, SubC, SbcC, UMulHi, LifetimeEnd,
 }
@@ -2145,7 +2153,7 @@ impl Instruction {
                 .asm_data
                 .as_ref()
                 .is_some_and(|d| d.clobbers.iter().any(|c| c == "memory")),
-            Opcode::Fence | Opcode::Call | Opcode::Setjmp | Opcode::Longjmp => true,
+            Opcode::Fence | Opcode::Call | Opcode::Setjmp | Opcode::Longjmp | Opcode::Trap => true,
             op => op.is_atomic(),
         }
     }
@@ -3880,6 +3888,47 @@ impl GlobalDef {
         self.is_const = is_const;
         self
     }
+
+    /// What this object asks of a section the program names for it.
+    pub fn section_use(&self) -> SectionUse {
+        if self.is_thread_local {
+            SectionUse::ThreadLocal
+        } else if self.is_const {
+            SectionUse::ReadOnly {
+                relocs: self.init.has_reloc(),
+            }
+        } else {
+            SectionUse::Writable
+        }
+    }
+}
+
+/// What a definition placed in a named section (`section("...")`) asks of
+/// it, which decides the ELF flags the one section gets for everything in
+/// it -- and whether two definitions can share it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionUse {
+    /// A function: allocated and executable.
+    Code,
+    /// A `const` object, holding addresses the loader relocates or not.
+    ReadOnly { relocs: bool },
+    /// Any other object.
+    Writable,
+    /// A thread-local object: the image each thread's copy starts from.
+    ThreadLocal,
+}
+
+impl SectionUse {
+    /// Whether two definitions can share one section, by gcc's rule
+    /// (`get_section` in varasm.c): only when they ask the same thing, or
+    /// are both read-only -- a read-only object beside one that needs
+    /// relocating goes where the relocated one does.
+    pub fn compatible(self, other: SectionUse) -> bool {
+        match (self, other) {
+            (SectionUse::ReadOnly { .. }, SectionUse::ReadOnly { .. }) => true,
+            _ => self == other,
+        }
+    }
 }
 
 /// A second name for a definition in this translation unit, from
@@ -4341,13 +4390,30 @@ impl Module {
     /// errs toward keeping: an identifier that merely *looks* like a
     /// candidate in an assembly template counts.
     pub fn referenced_symbols(&self, candidates: &HashSet<String>) -> HashSet<String> {
+        self.references_from(candidates, |_| true)
+    }
+
+    /// [`Self::referenced_symbols`], counting only the functions that are
+    /// emitted: a name an inline definition alone refers to is not in the
+    /// output at all. glibc's <ctype.h> declares hidden thread-locals that
+    /// only its `gnu_inline` bodies name, and a `.hidden` for one made an
+    /// untyped undefined symbol that the linker refuses beside the TLS one.
+    pub fn referenced_in_output(&self, candidates: &HashSet<String>) -> HashSet<String> {
+        self.references_from(candidates, |f| f.emit)
+    }
+
+    fn references_from(
+        &self,
+        candidates: &HashSet<String>,
+        counts: impl Fn(&Function) -> bool,
+    ) -> HashSet<String> {
         let mut referenced = HashSet::new();
         let mut note = |name: &str| {
             if candidates.contains(name) {
                 referenced.insert(name.to_string());
             }
         };
-        for func in &self.functions {
+        for func in self.functions.iter().filter(|f| counts(f)) {
             for insn in func.blocks.iter().flat_map(|bb| &bb.insns) {
                 // A direct call. An indirect one is named `<indirect>`, so it
                 // cannot collide with a real symbol.
@@ -4741,8 +4807,9 @@ mod tests {
                 }
             }
         }
-        // Fence, Call, Setjmp, Longjmp and the atomics, each twice, and Asm once.
-        assert_eq!(barriers, 2 * 13 + 1);
+        // Fence, Call, Setjmp, Longjmp, Trap and the atomics, each twice,
+        // and Asm once.
+        assert_eq!(barriers, 2 * 14 + 1);
     }
 
     /// A vector operation computes in registers: it touches no memory, so
@@ -5051,6 +5118,48 @@ mod tests {
         let mut got: Vec<&str> = got.iter().map(String::as_str).collect();
         got.sort_unstable();
         assert_eq!(got, ["called", "from_init", "in_template", "loaded"]);
+    }
+
+    /// A function that is not emitted -- an inline definition -- still
+    /// counts for the inliner's purposes, and not for what the output names.
+    #[test]
+    fn test_module_referenced_in_output_skips_inline_definitions() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        for (name, callee, emit) in [("body", "from_body", false), ("real", "from_real", true)] {
+            let mut func = Function::new(name, types.int_id);
+            func.emit = emit;
+            let mut bb = BasicBlock::new(BasicBlockId(0));
+            bb.add_insn(Instruction::new(Opcode::Entry));
+            bb.add_insn(Instruction::call(
+                None,
+                callee,
+                vec![],
+                vec![],
+                types.int_id,
+                32,
+            ));
+            bb.add_insn(Instruction::ret(None));
+            func.add_block(bb);
+            module.add_function(func);
+        }
+        let candidates: HashSet<String> = ["from_body", "from_real"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let sorted = |set: HashSet<String>| {
+            let mut v: Vec<String> = set.into_iter().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            sorted(module.referenced_symbols(&candidates)),
+            ["from_body", "from_real"]
+        );
+        assert_eq!(
+            sorted(module.referenced_in_output(&candidates)),
+            ["from_real"]
+        );
     }
 
     #[test]
@@ -5956,6 +6065,19 @@ mod tests {
         // setjmp/longjmp save/restore arbitrary execution context.
         assert!(Instruction::new(Opcode::Setjmp).is_memory_barrier());
         assert!(Instruction::new(Opcode::Longjmp).is_memory_barrier());
+    }
+
+    /// `__builtin_trap`'s opcode ends its block and is never deleted, and a
+    /// store before it stays: the handler of the signal it raises may read
+    /// anything.
+    #[test]
+    fn test_trap_is_a_barrier_terminator() {
+        let op = Opcode::Trap;
+        assert!(op.is_terminator());
+        assert!(op.has_side_effects());
+        assert!(op.may_access_memory());
+        assert!(Instruction::new(op).is_memory_barrier());
+        assert_eq!(op.name(), "trap");
     }
 
     fn constraint(c: &str, matching_output: Option<usize>) -> AsmConstraint {

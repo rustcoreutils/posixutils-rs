@@ -1018,3 +1018,28 @@ int main(void) {
 "#,
     );
 }
+
+/// `__builtin_trap` raises the hardware trap -- SIGILL from x86-64's `ud2`,
+/// SIGTRAP from aarch64's `brk` -- not the SIGABRT of the `abort` call it used
+/// to be; a handler for the trap sees it, and the code before it ran.
+#[test]
+fn builtins_trap_raises_the_hardware_trap() {
+    let src = r#"
+#include <signal.h>
+#include <unistd.h>
+static volatile int before;
+static void caught(int sig) { (void)sig; _exit(before == 1 ? 0 : 3); }
+int main(int argc, char **argv)
+{
+    (void)argv;
+    signal(SIGILL, caught);
+    signal(SIGTRAP, caught);
+    signal(SIGABRT, SIG_DFL);
+    before = argc;
+    if (argc > 0)
+        __builtin_trap();
+    return 2;
+}
+"#;
+    crate::common::compile_and_run_everywhere("builtin_trap_signal", src);
+}

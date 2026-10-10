@@ -412,13 +412,13 @@ impl X86_64CodeGen {
     }
 
     /// Check if a symbol needs GOT access
-    /// - In PIC mode: all non-local symbols need GOT access (interposition)
+    /// - In PIC mode: all symbols that may bind outside the output do
     /// - On macOS: external symbols always need GOT access (even without PIC)
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
-        // In PIC mode, all non-local symbols need GOT access because they
-        // could be interposed at runtime (the default for global symbols).
-        // A name c17 made up is local and can't be interposed.
-        if self.pic_mode && !is_private_name(name) {
+        // In PIC mode, a global symbol needs GOT access because it could be
+        // interposed at runtime, or defined in another module. A name c17
+        // made up, and a symbol that binds within the output, cannot.
+        if self.pic_mode && !is_private_name(name) && !self.base.binds_locally.contains(name) {
             return true;
         }
         // External symbols need GOT access on macOS for dynamic linking.
@@ -1240,6 +1240,9 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Ud2);
             }
 
+            // gcc's `__builtin_trap` too: SIGILL.
+            Opcode::Trap => self.push_lir(X86Inst::Ud2),
+
             Opcode::FrameAddress => {
                 // __builtin_frame_address(level)
                 self.emit_frame_address(insn);
@@ -1681,6 +1684,8 @@ impl CodeGenerator for X86_64CodeGen {
             .collect();
 
         // Emit file header
+        self.base.plan_named_sections(module, self.pic_mode);
+        self.base.plan_local_binding(module);
         self.emit_header();
 
         // Emit .file directives unconditionally (useful for diagnostics/profiling)

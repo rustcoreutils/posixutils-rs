@@ -209,3 +209,37 @@ int main(void) {
         0
     );
 }
+
+/// Hidden objects defined in another unit and reached PC-relative, and a
+/// static and a hidden function's address, link and read back in a `-fPIC`
+/// build, as the GOT-free access must.
+#[test]
+fn codegen_pic_hidden_symbols_across_units() {
+    let unit_a = r#"
+extern int hv __attribute__((visibility("hidden")));
+extern int hv_arr[4] __attribute__((visibility("hidden")));
+extern int hfn(int) __attribute__((visibility("hidden")));
+static int sv = 3;
+static int sfn(int x) { return x + sv; }
+int main(void)
+{
+    int (*volatile fp)(int) = hfn;
+    int (*volatile sp)(int) = sfn;
+    hv_arr[2] = 9;
+    return !(hv == 5 && fp(1) == 2 && sp(1) == 4 && hv_arr[2] == 9 && &hv_arr[3] - &hv_arr[0] == 3);
+}
+"#;
+    let unit_b = r#"
+__attribute__((visibility("hidden"))) int hv = 5;
+__attribute__((visibility("hidden"))) int hv_arr[4];
+__attribute__((visibility("hidden"))) int hfn(int x) { return x + 1; }
+"#;
+    for opt in ["-O0", "-O2"] {
+        let opts = vec!["-fPIC".to_string(), opt.to_string()];
+        assert_eq!(
+            crate::common::compile_and_run_two_units("pic_hidden_units", unit_a, unit_b, &opts),
+            0,
+            "{opt}"
+        );
+    }
+}

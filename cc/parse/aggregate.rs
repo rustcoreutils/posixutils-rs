@@ -502,6 +502,7 @@ impl Parser<'_> {
         let mut storage_order = early_attrs.storage_order(specifier_pos);
 
         // Parse __attribute__ after tag name but before '{'
+        let pre_pos = self.current_pos();
         let pre_attrs = self.parse_attributes();
         is_packed = is_packed || pre_attrs.has_packed();
         is_transparent = is_transparent || pre_attrs.has_transparent_union();
@@ -656,13 +657,16 @@ impl Parser<'_> {
 
             Ok(struct_type)
         } else {
-            // A reference, not a definition: the type already exists, so an
-            // `aligned` written on it is the declaration's -- gcc aligns `x` in
-            // `struct S __attribute__((aligned(32))) x;`, and a type-name's
-            // type in `_Alignof(struct S __attribute__((aligned(32))))`.
-            if let Some(align) = struct_align {
+            // A reference, not a definition: the type already exists, so
+            // what is written after its tag is the declaration's, as after
+            // `int` -- gcc aligns `x` in `struct S __attribute__((aligned(32)))
+            // x;` (and a type-name's type in `_Alignof(struct S
+            // __attribute__((aligned(32))))`), and puts `p` in the section in
+            // Linux's `static struct T __used __section("_ftrace_events") *p`.
+            if let Some(align) = early_attrs.get_alignment() {
                 self.raise_pending_alignas(align);
             }
+            self.apply_declaration_attrs(&pre_attrs, pre_pos, false);
             if let Some(tag_name) = tag {
                 // C17 6.7.2.3p7: `struct S;` by itself declares the tag in
                 // this scope, a new incomplete type that hides any `struct S`

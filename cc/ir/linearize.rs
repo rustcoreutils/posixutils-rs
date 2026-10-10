@@ -851,6 +851,9 @@ pub struct Linearizer<'a> {
     /// whole unit has been read, because the target may be defined after the
     /// alias that names it.
     pub(crate) declared_aliases: Vec<super::linearize_init::DeclaredAlias>,
+    /// Where each definition placed in a named section was written, and its
+    /// name as the program spells it, for `check_section_conflicts`.
+    pub(crate) section_definitions: HashMap<String, (Position, String)>,
     /// Every function the translation unit defines, by name, weak ones aside:
     /// a call to a library builtin that yields to a definition reaches the
     /// program's own wherever it is (`InlineLibraryFn::yields_to_a_definition`).
@@ -932,6 +935,7 @@ impl<'a> Linearizer<'a> {
             current_calling_conv: CallingConv::default(),
             local_scope_stack: Vec::new(),
             declared_aliases: Vec::new(),
+            section_definitions: HashMap::new(),
             defined_functions: std::collections::HashSet::new(),
             trapping_math: true,
             isa: target.x86_isa,
@@ -1183,6 +1187,7 @@ impl<'a> Linearizer<'a> {
             }
         }
         self.resolve_aliases();
+        self.check_section_conflicts();
         self.place_after_asm(placed);
         for &name in super::FOLD_CALLEES {
             if !self.library_function_available(name) {
@@ -2080,6 +2085,10 @@ impl<'a> Linearizer<'a> {
         // `alias` or `ifunc` on a definition -- written on it, or on an
         // earlier prototype -- asks for two things one symbol cannot be.
         // Recorded like any other alias, so `resolve_aliases` reports it once.
+        if ir_func.symbol_attrs.section.is_some() {
+            let shown = self.str(func.name).to_string();
+            self.record_section_definition(&ir_func.name, func.pos, shown);
+        }
         if ir_func.symbol_attrs.alias.take().is_some() {
             let typ = self
                 .symbols
@@ -2977,6 +2986,9 @@ impl<'a> Linearizer<'a> {
             // untaken arm of gnulib's `(R) ? (void) 0 :
             // __builtin_unreachable ()` -- it kills a correct program.
             ExprKind::Unreachable => !speculative,
+
+            // It ends the program.
+            ExprKind::Trap => false,
 
             // It writes the frame.
             ExprKind::UnwindInit => false,
@@ -6280,6 +6292,12 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::Trap => {
+                let insn = Instruction::new(Opcode::Trap).with_type(self.types.void_id);
+                self.emit_no_return(insn);
+                self.alloc_pseudo()
+            }
+
             ExprKind::UnwindInit => {
                 // An asm that clobbers every callee-saved register: the
                 // prologue saves each one an asm clobbers, which is all the
@@ -7317,6 +7335,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable
+            | ExprKind::Trap
             | ExprKind::UnwindInit
             | ExprKind::FrameAddress { .. }
             | ExprKind::ReturnAddress { .. }

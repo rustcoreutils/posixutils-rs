@@ -56,12 +56,7 @@ impl EscapeInfo {
         // ordering claim a memory pass makes is void -- and C17 7.13.2.1p3
         // already makes a non-`volatile` local modified after `setjmp`
         // indeterminate. `&&label` is the same problem by another route.
-        let give_up = func.takes_label_addr
-            || func.blocks.iter().any(|bb| {
-                bb.insns
-                    .iter()
-                    .any(|i| matches!(i.op, Opcode::Setjmp | Opcode::Longjmp))
-            });
+        let give_up = func.takes_label_addr || func.has_nonlocal_control();
 
         let mut escaped = HashSet::new();
         if give_up {
@@ -419,6 +414,21 @@ mod tests {
         let info = EscapeInfo::analyze(&f, &host_types());
         assert!(info.gave_up());
         assert!(info.is_captured(&MemBase::Local(PseudoId(0))));
+    }
+
+    /// So does a call of a function that returns twice, the library's
+    /// `setjmp` among them -- and an ordinary call does not.
+    #[test]
+    fn escape_returns_twice_call_gives_up() {
+        for twice in [true, false] {
+            let f = with_local(|t, bb| {
+                bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
+                let mut call = Instruction::call(None, "_setjmp", vec![], vec![], t, 32);
+                call.extra_mut().returns_twice_call = twice;
+                bb.add_insn(call);
+            });
+            assert_eq!(EscapeInfo::analyze(&f, &host_types()).gave_up(), twice);
+        }
     }
 
     /// `&&label` is the same problem by another route.

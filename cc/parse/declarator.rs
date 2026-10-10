@@ -560,20 +560,16 @@ impl Parser<'_> {
                 // The inner declarator is Function(Pointer(Void), [int])
                 // We need to substitute Void with the actual return type
                 let inner_base_id = decl_type.base.unwrap(); // return type (placeholder)
-                let decl_params = decl_type.params.clone();
-                let decl_variadic = decl_type.variadic;
-                let decl_noreturn = decl_type.noreturn;
-                let decl_conv = decl_type.conv;
-                let new_ret_id = self.substitute_base_type(inner_base_id, actual_base_id);
-                let func_type = Type {
+                let mut func_type = Type {
                     kind: TypeKind::Function,
-                    base: Some(new_ret_id),
-                    params: decl_params,
-                    variadic: decl_variadic,
-                    noreturn: decl_noreturn,
-                    conv: decl_conv,
+                    params: decl_type.params.clone(),
+                    variadic: decl_type.variadic,
+                    noreturn: decl_type.noreturn,
+                    returns_twice: decl_type.returns_twice,
+                    conv: decl_type.conv,
                     ..Default::default()
                 };
+                func_type.base = Some(self.substitute_base_type(inner_base_id, actual_base_id));
                 self.types.intern(func_type)
             }
             _ => decl_type_id, // Other types don't need substitution

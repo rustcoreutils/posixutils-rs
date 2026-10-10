@@ -67,6 +67,7 @@ The arguments of an unrecognised attribute are skipped without being parsed.
 
 | Attribute | Applies to | Effect |
 |-----------|-----------|--------|
+| `returns_twice` | Functions | Part of the function *type*, as `noreturn` is, but only on a function's declaration: gcc ignores it on a typedef or a pointer, so only a direct call of the declared function sees it. Such a call is treated as gcc treats `setjmp` (`Instruction::returns_twice`): no value is kept in a register across it, each value live across it keeps its slot to the end of the function, the memory passes give up on the function, the function is never inlined ("can never be inlined because it uses setjmp", an error under `always_inline`), and under `-fcf-protection=branch` the call is followed by `endbr64`. gcc's list of names (`setjmp`, `sigsetjmp` under up to two leading underscores, `savectx`, `vfork`, `getcontext`, external functions only) gets the same treatment without the attribute. gcc's warning that it is ignored elsewhere is not given |
 | `noreturn` | Functions | Part of the function *type*. The linearizer emits an `Unreachable` after every call through such a type, which the backends lower to `ud2` (x86-64) or `brk #1` (AArch64), and which ends the block for the optimizer. A noreturn function's own body is compiled normally |
 | `ms_abi` | Function types (x86-64) | The Microsoft x64 calling convention, carried on the function *type* (`Type::conv`): every call is classified by the type it calls through, directly or through a pointer (`CallingConv::of_callee`), and a definition by its own (`abi::Win64Abi`). The x86-64 backend assigns the argument positions, the 32-byte shadow area and the callee-saved RSI, RDI and XMM6-XMM15 (`arch/x86_64/win64.rs`). As in gcc it goes to the declared function or to the function a declared pointer points at, and on anything else warns "'ms_abi' attribute only applies to function types". Two function types differing only in convention are incompatible: a pointer assignment between them warns, a redeclaration that changes it is "conflicting types", and `ms_abi` with `sysv_abi` on one declaration is an error. On aarch64 it is not an attribute: it warns "directive ignored", `__has_attribute` answers 0, and the native convention applies, as in gcc |
 | `sysv_abi` | Function types (x86-64) | The x86-64 default convention, placed and checked as `ms_abi` is. Not an attribute on aarch64 |
@@ -105,8 +106,8 @@ _Noreturn void my_exit(int code);
 
 The property is carried on the function type, gathered from `_Noreturn` among
 the specifiers or the attribute on this or any earlier declaration of the name
-(`Parser::function_declarator_attrs`). `setjmp`/`longjmp` need no attribute:
-they are recognised by name and lowered to `Opcode::Setjmp` / `Opcode::Longjmp`.
+(`Parser::function_declarator_attrs`). The library's `longjmp` family takes
+it from <setjmp.h> like any other function.
 
 ## Accepted and Ignored
 
@@ -116,7 +117,7 @@ the result of a correct program. glibc puts most of them on every declaration.
 
 `unused`, `deprecated`, `hot`, `cold`, `warn_unused_result`, `format`,
 `nonstring`, `malloc`, `sentinel`, `nonnull`, `nonnull_if_nonzero`,
-`returns_nonnull`, `nothrow`, `access`, `returns_twice`, `externally_visible`,
+`returns_nonnull`, `nothrow`, `access`, `externally_visible`,
 `abi_tag`, `weakref`, `simd`, `regparm`, `leaf`, `alloc_size`, `alloc_align`,
 `noclone`, `copy`, `designated_init`, `may_alias`,
 `artificial`, `no_sanitize_memory`, `no_sanitize_address`, `no_sanitize_thread`,

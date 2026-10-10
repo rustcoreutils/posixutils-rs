@@ -8983,6 +8983,49 @@ fn test_every_declarator_position_binds_the_same_way() {
     assert_eq!(seen, ["a", "b", "c", "d", "e", "k"]);
 }
 
+/// `returns_twice` is carried into the function's type, as `noreturn` is,
+/// from this declaration or an earlier one of the name, so every direct call
+/// after it sees it. gcc ignores it on a typedef or a pointer, and so does
+/// c17: those types stay ordinary.
+#[test]
+fn test_returns_twice_is_carried_on_the_function_type() {
+    let src = "int a(void *) __attribute__((returns_twice));\n\
+               int b(void *);\n\
+               int b(void *) __attribute__((__returns_twice__));\n\
+               int b(void *);\n\
+               int c(void *);\n\
+               typedef int T(void *) __attribute__((returns_twice));\n\
+               int (*p)(void *) __attribute__((returns_twice));\n";
+    let (tu, types, strings, symbols) = parse_tu(src).unwrap();
+    let mut seen = Vec::new();
+    for item in &tu.items {
+        let ExternalDecl::Declaration(decl) = item else {
+            continue;
+        };
+        for d in &decl.declarators {
+            let name = strings.get(symbols.get(d.symbol).name).to_string();
+            let typ = types.get(d.typ);
+            let twice = if typ.kind == crate::types::TypeKind::Pointer {
+                types.get(typ.base.unwrap()).returns_twice
+            } else {
+                typ.returns_twice
+            };
+            seen.push((name, twice));
+        }
+    }
+    let expect = [
+        ("a", true),
+        ("b", false),
+        ("b", true),
+        ("b", true),
+        ("c", false),
+        ("T", false),
+        ("p", false),
+    ];
+    let expect: Vec<(String, bool)> = expect.iter().map(|&(n, t)| (n.to_string(), t)).collect();
+    assert_eq!(seen, expect);
+}
+
 /// A later typedef declarator gets its trailing alignment, and a later or
 /// grouped declarator completes an earlier `extern` array.
 #[test]

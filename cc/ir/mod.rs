@@ -518,9 +518,10 @@ pub enum Opcode {
     FrameAddress, // __builtin_frame_address(level) - frame pointer `frame_level()` frames up
     ReturnAddress, // __builtin_return_address(level) - return address `frame_level()` frames up
 
-    // Non-local jumps (setjmp/longjmp)
-    Setjmp,  // Save execution context, returns 0 or value from longjmp
-    Longjmp, // Restore execution context (never returns)
+    // gcc's non-local goto. The library's `setjmp` family are `Call`s; see
+    // `Instruction::returns_twice`.
+    Setjmp,  // __builtin_setjmp: save frame/stack/resume, 0 or 1 from a longjmp
+    Longjmp, // __builtin_longjmp: resume a Setjmp (never returns)
 
     // Inline assembly
     Asm, // Inline assembly statement
@@ -1830,6 +1831,9 @@ pub struct InsnExtra {
     /// For calls: true if the called function is noreturn (never returns).
     /// Code after a noreturn call is unreachable.
     pub is_noreturn_call: bool,
+    /// For direct calls: the callee may return twice, as `setjmp` does. Ask
+    /// [`Instruction::returns_twice`], which also answers for `Setjmp`.
+    pub returns_twice_call: bool,
     /// For direct calls: whether `func_name` may be a definition in this
     /// module or is only ever the external library function. See
     /// [`Instruction::local_callee`], which is how a pass should ask.
@@ -1855,9 +1859,6 @@ pub struct InsnExtra {
     pub lifetime_of: Option<PseudoId>,
     /// For `Simd(Shuffle)`: the lanes it picks.
     pub shuffle: Option<ShuffleIndices>,
-    /// For `Setjmp` and `Longjmp`: the library's, or gcc's builtin pair.
-    /// Read it through [`Instruction::jmp_kind`].
-    pub jmp_kind: crate::parse::ast::JmpKind,
 }
 
 /// What an instruction with no extra fields answers: every one empty.
@@ -1869,6 +1870,7 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     variadic_arg_start: None,
     ends_with_va_arg_pack: false,
     is_noreturn_call: false,
+    returns_twice_call: false,
     callee_binding: crate::parse::ast::CalleeBinding::Declared,
     known: None,
     indirect_target: None,
@@ -1878,7 +1880,6 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     fence_scope: FenceScope::Thread,
     lifetime_of: None,
     shuffle: None,
-    jmp_kind: crate::parse::ast::JmpKind::Library,
 };
 
 impl Default for Instruction {
@@ -2044,7 +2045,7 @@ impl Instruction {
     }
 
     /// The C library function an opcode the backends lower to a call
-    /// (`Memcpy`, `Memset`, `Memmove`, `Setjmp`, `Longjmp`) calls, or a libm
+    /// (`Memcpy`, `Memset`, `Memmove`) calls, or a libm
     /// opcode (`Sqrt`) calls on a target without the instruction, by its
     /// assembler name.
     ///
@@ -2059,19 +2060,23 @@ impl Instruction {
         }
     }
 
-    /// Which `setjmp`/`longjmp` a `Setjmp` or `Longjmp` is: the library's,
-    /// a call naming [`Self::library_callee`], or gcc's builtin pair, which
-    /// names none and is generated inline.
-    pub fn jmp_kind(&self) -> crate::parse::ast::JmpKind {
-        self.extra().jmp_kind
-    }
-
-    /// Is this gcc's `__builtin_setjmp`? Control resumes just after it with
-    /// no register intact but the frame and stack pointers, so the register
-    /// allocator keeps nothing in a register across it, and the function
-    /// saves every callee-saved register.
-    pub fn is_builtin_setjmp(&self) -> bool {
-        self.op == Opcode::Setjmp && self.jmp_kind() == crate::parse::ast::JmpKind::Builtin
+    /// Can control come back to just after this instruction a second time?
+    ///
+    /// gcc's `__builtin_setjmp` (`Setjmp`), and a direct call of a function
+    /// that returns twice: the library's `setjmp` family and the rest of
+    /// gcc's list of such names, and any function declared
+    /// `__attribute__((returns_twice))`. The second return comes from a
+    /// jump the CFG does not model, after code the analyses believed the
+    /// values live across this point were dead in, and with no register the
+    /// program can count on but the frame and stack pointers -- so the
+    /// register allocator keeps nothing in a register across it, and keeps
+    /// every slot of such a value to the end of the function.
+    pub fn returns_twice(&self) -> bool {
+        match self.op {
+            Opcode::Setjmp => true,
+            Opcode::Call => self.extra().returns_twice_call,
+            _ => false,
+        }
     }
 
     /// Set bit size
@@ -2119,8 +2124,8 @@ impl Instruction {
     ///   `Relaxed`-ordered ones — see note below).
     /// - `Opcode::Call` — a callee may read or write any memory it can
     ///   reach, and this predicate does not ask what that is.
-    /// - `Opcode::Setjmp` / `Opcode::Longjmp` — non-local control flow
-    ///   makes register/memory state observable at any saved jmp_buf.
+    /// - `Opcode::Setjmp` / `Opcode::Longjmp` — gcc's non-local goto makes
+    ///   register/memory state observable at any saved buffer.
     ///
     /// **Contract**: an IR pass MUST NOT move a memory operation across an
     /// instruction for which this returns `true`. This is the load-bearing
@@ -3329,7 +3334,29 @@ impl Function {
         self.blocks
             .iter()
             .flat_map(|b| &b.insns)
-            .any(Instruction::is_builtin_setjmp)
+            .any(|i| i.op == Opcode::Setjmp)
+    }
+
+    /// Does this function call one that returns twice -- a direct call that
+    /// [`Instruction::returns_twice`] answers for? gcc never inlines such a
+    /// function ("can never be inlined because it uses setjmp"): the second
+    /// return lands in whatever frame made the call.
+    pub fn calls_returns_twice(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(|i| i.op == Opcode::Call && i.returns_twice())
+    }
+
+    /// Can control resume inside this function at a point the CFG does not
+    /// model: does it contain an instruction that returns twice, or a
+    /// `__builtin_longjmp`? Every ordering claim a memory pass makes is then
+    /// void, and every local lives for the whole function.
+    pub fn has_nonlocal_control(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(|i| i.returns_twice() || i.op == Opcode::Longjmp)
     }
 
     /// The local variable that `sym` *is*, if it is one.

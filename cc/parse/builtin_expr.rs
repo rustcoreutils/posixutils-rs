@@ -11,8 +11,7 @@
 //
 
 use super::ast::{
-    BinaryOp, CalleeBinding, Expr, ExprKind, FpCompare, GnuAtomicOp, JmpKind, LibFn, OffsetOfPath,
-    UnaryOp,
+    BinaryOp, CalleeBinding, Expr, ExprKind, FpCompare, GnuAtomicOp, LibFn, OffsetOfPath, UnaryOp,
 };
 use super::builtin_args::ConstantArgument;
 use super::library_builtin::LibraryBuiltin;
@@ -251,13 +250,11 @@ impl Parser<'_> {
     /// Whether a declaration in scope displaces the builtin meaning the parser
     /// would otherwise give `name_id`.
     ///
-    /// `offsetof`, `alignof`, `setjmp` and `longjmp` are not C17 keywords --
-    /// the first is a macro, the second a C23 spelling, the last two ordinary
-    /// library functions -- so a program may use any of them as an identifier,
-    /// and gcc accepts that. `setjmp` and `longjmp` are the exception, and
-    /// only against a *function* declaration: `<setjmp.h>` declares exactly
-    /// those, and they need code generation an ordinary call cannot produce.
-    /// The library builtins (`abs`, `fabs`, `floor`, ...) survive a function
+    /// `offsetof` and `alignof` are not C17 keywords -- the first is a macro,
+    /// the second a C23 spelling -- so a program may use either as an
+    /// identifier, and gcc accepts that. `alloca` yields to an object but not
+    /// to a function declaration, which is what <alloca.h> provides. The
+    /// library builtins (`abs`, `fabs`, `floor`, ...) survive a function
     /// declaration only if it is compatible with the prototype their table
     /// gives (see `library_prototype_matches`), and the functions gcc expands
     /// late (`sqrt`, `floor`, `memcpy`, ...) not a definition of the function
@@ -269,16 +266,7 @@ impl Parser<'_> {
     pub(super) fn builtin_is_shadowed(&self, name_id: StringId) -> bool {
         let shadowed_by_any_decl = matches!(name_id, crate::kw::OFFSETOF | crate::kw::ALIGNOF_C23);
         let library = LibraryBuiltin::by_bare_name(name_id);
-        let shadowable = shadowed_by_any_decl
-            || library.is_some()
-            || matches!(
-                name_id,
-                crate::kw::SETJMP
-                    | crate::kw::SETJMP2
-                    | crate::kw::LONGJMP
-                    | crate::kw::LONGJMP2
-                    | crate::kw::ALLOCA
-            );
+        let shadowable = shadowed_by_any_decl || library.is_some() || name_id == crate::kw::ALLOCA;
         if !shadowable {
             return false;
         }
@@ -1037,55 +1025,6 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            // Named anywhere but in a call -- `__typeof(_setjmp)`,
-            // `&setjmp` -- they are the library functions, which a header
-            // declares like any other.
-            crate::kw::SETJMP | crate::kw::SETJMP2 if self.is_special(b'(') => Some((|| {
-                // setjmp(env) - saves execution context, returns int
-                // Returns 0 on direct call, non-zero when returning via longjmp
-                self.expect_special(b'(')?;
-                // `setjmp()` with no argument is a call to an unprototyped
-                // function, which old code writes and gcc accepts. Reaching
-                // for the argument unconditionally turned it into "unexpected
-                // token in expression", a parse error where an arity
-                // diagnostic belonged -- and there is nothing to save, so the
-                // builtin cannot handle it either: hand it back as an
-                // ordinary call.
-                if self.is_special(b')') {
-                    self.advance();
-                    return self.unprototyped_call(name_id, token_pos);
-                }
-                let env = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Setjmp {
-                        env: Box::new(env),
-                        kind: JmpKind::Library,
-                    },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })(
-            )),
-            crate::kw::LONGJMP | crate::kw::LONGJMP2 if self.is_special(b'(') => Some((|| {
-                // longjmp(env, val) - restores execution context (never returns)
-                // Causes corresponding setjmp to return val (or 1 if val == 0)
-                self.expect_special(b'(')?;
-                let env = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let val = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Longjmp {
-                        env: Box::new(env),
-                        val: Box::new(val),
-                        kind: JmpKind::Library,
-                    },
-                    self.types.void_id,
-                    token_pos,
-                ))
-            })(
-            )),
             crate::kw::BUILTIN_SETJMP => Some((|| {
                 // gcc's `int __builtin_setjmp(void *)`: 0 directly, 1 when
                 // `__builtin_longjmp` resumes it.
@@ -1095,10 +1034,7 @@ impl Parser<'_> {
                     return Ok(self.diagnosed_call(self.types.int_id, token_pos));
                 };
                 Ok(Self::typed_expr(
-                    ExprKind::Setjmp {
-                        env: Box::new(env),
-                        kind: JmpKind::Builtin,
-                    },
+                    ExprKind::Setjmp { env: Box::new(env) },
                     self.types.int_id,
                     token_pos,
                 ))
@@ -1124,7 +1060,6 @@ impl Parser<'_> {
                     ExprKind::Longjmp {
                         env: Box::new(env),
                         val: Box::new(val),
-                        kind: JmpKind::Builtin,
                     },
                     self.types.void_id,
                     token_pos,
@@ -1835,43 +1770,6 @@ impl Parser<'_> {
         Ok(Self::typed_expr(
             ExprKind::IntLit(i64::from(lock_free)),
             bool_id,
-            pos,
-        ))
-    }
-
-    /// A call to `name` with no arguments, when a builtin cannot take it.
-    ///
-    /// The name is declared as the unprototyped `int name()` if nothing has
-    /// declared it, which is what an implicit declaration gives and what
-    /// `check_call_arity` then declines to check.
-    fn unprototyped_call(&mut self, name_id: StringId, pos: Position) -> ParseResult<Expr> {
-        let sym = match self.symbols.lookup_id(name_id, Namespace::Ordinary) {
-            Some(sym) => sym,
-            None => {
-                let int_id = self.types.int_id;
-                let func_type = self.types.intern(Type {
-                    kind: TypeKind::Function,
-                    base: Some(int_id),
-                    params: None,
-                    ..Default::default()
-                });
-                let symbol = Symbol::function(name_id, func_type, self.symbols.depth())
-                    .with_linkage(crate::symbol::Linkage::External);
-                self.symbols
-                    .declare(symbol)
-                    .map_err(|_| ParseError::new("cannot declare an implicit function", pos))?
-            }
-        };
-        let sym_typ = self.symbols.get(sym).typ;
-        let ret = self.types.base_type(sym_typ).unwrap_or(self.types.int_id);
-        Ok(Self::typed_expr(
-            ExprKind::Call {
-                func: Box::new(Self::typed_expr(ExprKind::Ident(sym), ret, pos)),
-                args: Vec::new(),
-                binding: CalleeBinding::Declared,
-                known: None,
-            },
-            ret,
             pos,
         ))
     }

@@ -39,6 +39,7 @@ mod c99_identifiers;
 mod c99_initializers;
 mod c99_stdlib_headers;
 mod c99_types;
+mod calls_returns_twice;
 mod codegen_aggregate_abi;
 mod codegen_asm_attributes;
 mod codegen_asm_probe;

@@ -1163,10 +1163,10 @@ pub fn get_constraint_info_aarch64(
         return Some((clobbers, involved));
     }
 
-    if insn.is_builtin_setjmp() {
+    if insn.returns_twice() {
         let mut clobbers = Reg::allocatable().to_vec();
         clobbers.extend(AARCH64_SCRATCH_REGS);
-        return Some(crate::arch::regalloc::builtin_setjmp_constraint(
+        return Some(crate::arch::regalloc::returns_twice_constraint(
             insn, &clobbers,
         ));
     }

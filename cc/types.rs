@@ -592,6 +592,12 @@ pub struct Type {
     /// Set via __attribute__((noreturn)) or _Noreturn keyword
     pub noreturn: bool,
 
+    /// Does a call of this function return twice, as `setjmp` does? Set by
+    /// `__attribute__((returns_twice))` on a function's declaration, never
+    /// on a typedef or a pointer: gcc ignores it there, so only a direct
+    /// call of the declared function sees it.
+    pub returns_twice: bool,
+
     /// The calling convention of a function type: `__attribute__((ms_abi))`
     /// makes it [`CallingConv::Win64`]. Part of the type, so two function
     /// types differing only here are distinct and incompatible.
@@ -619,6 +625,7 @@ impl Default for Type {
             params: None,
             variadic: false,
             noreturn: false,
+            returns_twice: false,
             conv: CallingConv::C,
             composite: None,
             explicit_align: None,
@@ -1023,6 +1030,7 @@ enum TypeKey {
         params: Option<Vec<TypeId>>,
         variadic: bool,
         noreturn: bool,
+        returns_twice: bool,
         conv: CallingConv,
         modifiers: u32,
     },
@@ -1559,6 +1567,7 @@ impl TypeTable {
                     params: typ.params.clone(),
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
+                    returns_twice: typ.returns_twice,
                     conv: typ.conv,
                     modifiers: typ.modifiers.bits(),
                 })

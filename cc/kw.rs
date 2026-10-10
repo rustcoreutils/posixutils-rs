@@ -762,16 +762,12 @@ define_keywords! {
     (C11_ATOMIC_THREAD_FENCE, "__c11_atomic_thread_fence", BUILTIN),
     (C11_ATOMIC_SIGNAL_FENCE, "__c11_atomic_signal_fence", BUILTIN),
 
-    // ---- setjmp/longjmp (special-cased in parser, not true builtins) ----
+    // ---- Library functions the parser special-cases ----
     // gcc predefines bare `alloca` as well as `__builtin_alloca`, and code in
     // the wild calls it without including <alloca.h>. Tagged 0, not BUILTIN:
     // `__has_builtin` asks about the reserved spelling, and a user declaration
     // may still displace this one (see `builtin_is_shadowed`).
     (ALLOCA,            "alloca",            0),
-    (SETJMP,            "setjmp",            0),
-    (SETJMP2,           "_setjmp",           0),
-    (LONGJMP,           "longjmp",           0),
-    (LONGJMP2,          "_longjmp",          0),
 
     // ---- Plain spellings of libm entry points ----
     // gcc recognizes the standard names whether or not <math.h> was included,

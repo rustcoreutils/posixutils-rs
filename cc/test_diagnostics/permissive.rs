@@ -185,6 +185,20 @@ fn diagnostics_always_inline_bodies_gcc_never_copies() {
              int f(int n) { return sj(n); }\n",
             "function 'sj' can never be copied because it receives a non-local goto",
         ),
+        (
+            "extern long jb[64]; extern int _setjmp(long *);\n\
+             static inline __attribute__((always_inline)) int ls(int n)\n\
+             { if (_setjmp(jb)) return 1; return n; }\n\
+             int f(int n) { return ls(n); }\n",
+            "function 'ls' can never be inlined because it uses setjmp",
+        ),
+        (
+            "extern int rt(void *) __attribute__((returns_twice)); extern long jb[64];\n\
+             static inline __attribute__((always_inline)) int at(int n)\n\
+             { if (rt(jb)) return 1; return n; }\n\
+             int f(int n) { return at(n); }\n",
+            "function 'at' can never be inlined because it uses setjmp",
+        ),
     ];
     for (src, expected) in cases {
         for opt in ["-O0", "-O2"] {

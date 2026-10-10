@@ -595,8 +595,8 @@ pub fn get_constraint_info(
         return Some((clobbers, involved));
     }
 
-    if insn.is_builtin_setjmp() {
-        return Some(crate::arch::regalloc::builtin_setjmp_constraint(
+    if insn.returns_twice() {
+        return Some(crate::arch::regalloc::returns_twice_constraint(
             insn,
             Reg::allocatable(),
         ));

@@ -1418,15 +1418,12 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Call {
                 target: CallTarget::Direct(Symbol::global(func_name.to_string())),
             });
-            self.emit_second_return_landing_pad(func_name);
-        }
-    }
-
-    /// The `endbr64` after a call of a function that returns twice, under
-    /// branch protection: `longjmp` comes back to it by an indirect jump.
-    pub(super) fn emit_second_return_landing_pad(&mut self, callee: &str) {
-        if self.base.cf_protection.branch && crate::arch::codegen::returns_twice(callee) {
-            self.push_lir(X86Inst::Endbr64);
+            // The second return of a function that returns twice comes by
+            // an indirect jump, so under branch protection it lands on
+            // `endbr64`.
+            if self.base.cf_protection.branch && insn.returns_twice() {
+                self.push_lir(X86Inst::Endbr64);
+            }
         }
     }
 

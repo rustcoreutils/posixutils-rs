@@ -461,3 +461,127 @@ int main(void)
         &["-fcf-protection=full"],
     );
 }
+
+/// `_setjmp` saves no signal mask, so a mask changed before the `_longjmp`
+/// stays changed, while `sigsetjmp(env, 1)` saves it and `siglongjmp`
+/// restores it. c17 called `setjmp` for `_setjmp` -- which on glibc and
+/// Darwin alike is the function that saves the mask -- so the blocked signal
+/// came back unblocked.
+#[test]
+fn misc_underscore_setjmp_leaves_the_signal_mask() {
+    let code = r#"
+#include <setjmp.h>
+#include <signal.h>
+static jmp_buf env;
+static sigjmp_buf senv;
+static int blocked(void)
+{
+    sigset_t s;
+    sigprocmask(SIG_BLOCK, 0, &s);
+    return sigismember(&s, SIGUSR1);
+}
+static void mask(int how)
+{
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, SIGUSR1);
+    sigprocmask(how, &s, 0);
+}
+int main(void)
+{
+    mask(SIG_UNBLOCK);
+    if (_setjmp(env) == 0) {
+        mask(SIG_BLOCK);
+        _longjmp(env, 1);
+    }
+    if (blocked() != 1)
+        return 1;
+    mask(SIG_UNBLOCK);
+    if (sigsetjmp(senv, 1) == 0) {
+        mask(SIG_BLOCK);
+        siglongjmp(senv, 1);
+    }
+    if (blocked() != 0)
+        return 2;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("misc_setjmp_signal_mask", code);
+}
+
+/// A function declared `__attribute__((returns_twice))` is called as
+/// `setjmp` is: the pair here, in assembly, keeps only the frame pointer,
+/// the stack pointer and the resume address, and scribbles every
+/// callee-saved register before jumping back. Values computed before the
+/// call and read after its second return must not be in a register, and a
+/// `volatile` local stored between the returns is read back as stored --
+/// what gcc gives at every level, on both targets.
+#[test]
+fn misc_returns_twice_attribute_keeps_values() {
+    let code = r#"
+#if defined(__APPLE__)
+#define S(x) "_" #x
+#else
+#define S(x) #x
+#endif
+#if defined(__x86_64__)
+__asm__(".text\n.globl " S(rt_save) "\n" S(rt_save) ":\n"
+        "  movq %rbp, 0(%rdi)\n  leaq 8(%rsp), %rax\n  movq %rax, 8(%rdi)\n"
+        "  movq (%rsp), %rax\n  movq %rax, 16(%rdi)\n  xorl %eax, %eax\n  ret\n"
+        ".globl " S(rt_jump) "\n" S(rt_jump) ":\n"
+        "  movl %esi, %eax\n  movq $-1, %rbx\n  movq $-1, %r12\n  movq $-1, %r13\n"
+        "  movq $-1, %r14\n  movq $-1, %r15\n"
+        "  movq 0(%rdi), %rbp\n  movq 8(%rdi), %rsp\n  jmp *16(%rdi)\n");
+#elif defined(__aarch64__)
+__asm__(".text\n.globl " S(rt_save) "\n.p2align 2\n" S(rt_save) ":\n"
+        "  str x29, [x0]\n  mov x9, sp\n  str x9, [x0, #8]\n  str x30, [x0, #16]\n"
+        "  mov w0, #0\n  ret\n"
+        ".globl " S(rt_jump) "\n.p2align 2\n" S(rt_jump) ":\n"
+        "  mov w9, w1\n"
+        "  mov x19, #-1\n  mov x20, #-1\n  mov x21, #-1\n  mov x22, #-1\n  mov x23, #-1\n"
+        "  mov x24, #-1\n  mov x25, #-1\n  mov x26, #-1\n  mov x27, #-1\n  mov x28, #-1\n"
+        "  fmov d8, x19\n  fmov d9, x19\n  fmov d10, x19\n  fmov d11, x19\n"
+        "  fmov d12, x19\n  fmov d13, x19\n  fmov d14, x19\n  fmov d15, x19\n"
+        "  ldr x29, [x0]\n  ldr x10, [x0, #8]\n  mov sp, x10\n  ldr x30, [x0, #16]\n"
+        "  mov w0, w9\n  ret\n");
+#endif
+
+extern int rt_save(void **buf) __attribute__((returns_twice));
+extern void rt_jump(void **buf, int v) __attribute__((noreturn));
+
+void *buf[3];
+int calls;
+
+__attribute__((noinline)) int opaque(int x)
+{
+    __asm__ volatile("" ::: "memory");
+    return x;
+}
+__attribute__((noinline)) void jump(int v)
+{
+    calls++;
+    rt_jump(buf, v);
+}
+__attribute__((noinline)) long twice(int n)
+{
+    int a = opaque(n), b = opaque(n * 3);
+    long c = (long)opaque(n) * 7;
+    double d = opaque(n) * 0.5;
+    volatile int m = 0;
+    int r = rt_save(buf);
+    if (r == 0) {
+        m = 5;
+        jump(9);
+    }
+    return a + b + c + (long)(d * 4) + m * 1000 + r * 100000;
+}
+int main(void)
+{
+    /* a + b + c + 4d = 26, m = 5, r = 9 */
+    if (twice(2) != 905026)
+        return 1;
+    return calls == 1 ? 0 : 2;
+}
+"#;
+    crate::common::compile_and_run_everywhere("misc_returns_twice_attr", code);
+}

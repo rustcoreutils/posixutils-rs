@@ -1317,64 +1317,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    // setjmp/longjmp/alloca support
-
-    /// Emit setjmp(env) - saves execution context
-    /// AAPCS64: env in X0, returns int in W0
-    pub(super) fn emit_setjmp(&mut self, insn: &Instruction) {
-        let env = match insn.src.first() {
-            Some(&e) => e,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Put env argument in X0 (first argument register)
-        self.emit_move(env, Reg::X0, 64);
-
-        // Call setjmp
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Store result from W0 to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
-    }
-
-    /// Emit longjmp(env, val) - restores execution context (noreturn)
-    /// AAPCS64: env in X0, val in X1
-    pub(super) fn emit_longjmp(&mut self, insn: &Instruction) {
-        let env = match insn.src.first() {
-            Some(&e) => e,
-            None => return,
-        };
-        let val = match insn.src.get(1) {
-            Some(&v) => v,
-            None => return,
-        };
-
-        // CONSTRAINT: Load val into X1 BEFORE loading env into X0.
-        // If env is loaded into X0 first and val happens to be in X0 (first
-        // function argument), it would be overwritten. This is a manual constraint
-        // that will be expressible through the constraint system when inline asm
-        // support is added.
-        self.emit_move(val, Reg::X1, 32);
-
-        // Put env argument in X0 (first argument register)
-        self.emit_move(env, Reg::X0, 64);
-
-        // Call longjmp (noreturn - control never comes back)
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Emit brk after longjmp since it never returns
-        // This helps catch any bugs where longjmp somehow returns
-        self.push_lir(Aarch64Inst::Brk { imm: 1 });
-    }
+    // gcc's non-local goto
 
     /// gcc's `__builtin_setjmp(buf)`: inline, with no library call.
     ///

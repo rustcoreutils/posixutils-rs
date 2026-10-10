@@ -404,13 +404,15 @@ pub fn asm_clobbered<R>(insn: &Instruction, parse: impl Fn(&str) -> Option<R>) -
     }
 }
 
-/// The constraint point of a `__builtin_setjmp`, which clobbers every
-/// register in `regs`: control comes back to it from a `__builtin_longjmp`
-/// with only the frame and stack pointers restored, so no value may be in a
-/// register across it. The result alone is exempt -- both paths write it,
-/// after they join -- and not the buffer operand, which a value read again
-/// later would otherwise keep in a register the resumed path has lost.
-pub fn builtin_setjmp_constraint<R: Copy>(
+/// The constraint point of an instruction that returns twice (see
+/// [`Instruction::returns_twice`]), which clobbers every register in `regs`:
+/// control comes back to it with only the frame and stack pointers restored
+/// -- by a `__builtin_longjmp`, or by whatever a `returns_twice` function
+/// does, which gcc assumes keeps nothing -- so no value may be in a register
+/// across it. The result alone is exempt -- both paths write it, after they
+/// join -- and not the buffer operand, which a value read again later would
+/// otherwise keep in a register the resumed path has lost.
+pub fn returns_twice_constraint<R: Copy>(
     insn: &Instruction,
     regs: &[R],
 ) -> (Vec<R>, Vec<PseudoId>) {
@@ -846,7 +848,8 @@ where
     }
 }
 
-/// Stretch every value live across a `setjmp` to the end of the function.
+/// Stretch every value live across an instruction that returns twice (see
+/// [`Instruction::returns_twice`]) to the end of the function.
 ///
 /// A `longjmp` resumes at the setjmp from whatever call it is made under,
 /// and the CFG has no edge for that: a value live across the setjmp is read
@@ -865,7 +868,7 @@ fn extend_across_returns_twice(func: &Function, intervals: &mut [LiveInterval], 
         .iter()
         .flat_map(|b| &b.insns)
         .enumerate()
-        .filter(|(_, insn)| insn.op == Opcode::Setjmp)
+        .filter(|(_, insn)| insn.returns_twice())
         .map(|(pos, _)| pos)
         .collect();
     if positions.is_empty() {
@@ -1037,12 +1040,7 @@ fn local_lifetimes(
 ) -> HashMap<PseudoId, (usize, usize)> {
     let locals: Vec<PseudoId> = func.locals.values().map(|l| l.sym).collect();
     let last = block_end_pos.last().copied().unwrap_or(0);
-    let returns_twice = func
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insns)
-        .any(|i| matches!(i.op, Opcode::Setjmp | Opcode::Longjmp));
-    if returns_twice {
+    if func.has_nonlocal_control() {
         return locals.into_iter().map(|l| (l, (0, last))).collect();
     }
     let index: HashMap<PseudoId, usize> = locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
@@ -2041,8 +2039,9 @@ mod tests {
     /// before `.L2`, which is where the `longjmp` comes from. Its interval
     /// reaches the end of the function, or `.L2` could take its slot and the
     /// second return read `%5`. `%5`, defined after the setjmp, and the
-    /// setjmp's own result are not stretched.
-    fn value_across_setjmp(kind: crate::parse::ast::JmpKind) -> Function {
+    /// setjmp's own result are not stretched. `setjmp` is `twice`, a
+    /// `__builtin_setjmp` or a call of a function that returns twice.
+    fn value_across_setjmp(mut twice: Instruction) -> Function {
         use crate::ir::{BasicBlock, Pseudo};
         let types = TypeTable::new(&crate::target::Target::host());
         let mut f = Function::new("f", types.int_id);
@@ -2063,11 +2062,8 @@ mod tests {
             types.int_id,
             32,
         ));
-        let mut setjmp = Instruction::new(Opcode::Setjmp)
-            .with_target(PseudoId(4))
-            .with_type_and_size(types.int_id, 32);
-        setjmp.extra_mut().jmp_kind = kind;
-        entry.add_insn(setjmp);
+        twice.target = Some(PseudoId(4));
+        entry.add_insn(twice.with_type_and_size(types.int_id, 32));
         entry.add_insn(Instruction::cbr(PseudoId(4), b1, b2));
         entry.children = vec![b1, b2];
         let mut resumed = BasicBlock::new(b1);
@@ -2092,9 +2088,13 @@ mod tests {
 
     #[test]
     fn a_value_live_across_setjmp_spans_to_the_end() {
-        use crate::parse::ast::JmpKind;
-        for kind in [JmpKind::Library, JmpKind::Builtin] {
-            let f = value_across_setjmp(kind);
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, 32);
+        call.extra_mut().returns_twice_call = true;
+        for twice in [Instruction::new(Opcode::Setjmp), call] {
+            let kind = twice.op;
+            assert!(twice.returns_twice());
+            let f = value_across_setjmp(twice);
             let last = 6;
             assert_eq!(
                 lifetime_of(&f, 3),

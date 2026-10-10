@@ -175,6 +175,10 @@ pub struct InlineCandidate {
     /// be copied because it receives a non-local goto"), and neither does
     /// c17: the resume point belongs to the function's own frame.
     pub receives_nonlocal_goto: bool,
+    /// Whether the function calls one that returns twice -- see
+    /// `Function::calls_returns_twice`. gcc never inlines one ("can never be
+    /// inlined because it uses setjmp"), and neither does c17.
+    pub calls_returns_twice: bool,
     /// Whether the function forwards its caller's variadic arguments with
     /// `__builtin_va_arg_pack()` or `__builtin_va_arg_pack_len()`. Such a
     /// function has no out-of-line form -- what it forwards exists only at a
@@ -215,6 +219,8 @@ impl InlineCandidate {
             Some("function '{0}' can never be inlined because it contains a computed goto")
         } else if self.receives_nonlocal_goto {
             Some("function '{0}' can never be copied because it receives a non-local goto")
+        } else if self.calls_returns_twice {
+            Some("function '{0}' can never be inlined because it uses setjmp")
         } else {
             None
         }
@@ -392,6 +398,7 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
     let mut candidate = InlineCandidate {
         saves_label_in_static: func.saves_label_in_static,
         receives_nonlocal_goto: func.receives_nonlocal_goto(),
+        calls_returns_twice: func.calls_returns_twice(),
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
         is_interposable: func.symbol_attrs.weak && !func.is_static,
@@ -1991,6 +1998,7 @@ mod tests {
             has_computed_goto: false,
             saves_label_in_static: false,
             receives_nonlocal_goto: false,
+            calls_returns_twice: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2026,6 +2034,7 @@ mod tests {
             has_computed_goto: false,
             saves_label_in_static: false,
             receives_nonlocal_goto: false,
+            calls_returns_twice: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2079,6 +2088,7 @@ mod tests {
             has_computed_goto: false,
             saves_label_in_static: false,
             receives_nonlocal_goto: false,
+            calls_returns_twice: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2108,6 +2118,7 @@ mod tests {
             has_computed_goto: false,
             saves_label_in_static: false,
             receives_nonlocal_goto: false,
+            calls_returns_twice: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2137,6 +2148,7 @@ mod tests {
             has_computed_goto: false,
             saves_label_in_static: false,
             receives_nonlocal_goto: false,
+            calls_returns_twice: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2166,6 +2178,7 @@ mod tests {
             has_computed_goto: false,
             saves_label_in_static: false,
             receives_nonlocal_goto: false,
+            calls_returns_twice: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -3444,6 +3457,36 @@ int caller(void) { return recv(); }
             },
             false
         ));
+    }
+
+    /// A function calling one that returns twice -- by gcc's list of names
+    /// or by `__attribute__((returns_twice))` -- is never inlined ("can never
+    /// be inlined because it uses setjmp"); one calling an ordinary function
+    /// of a name close to them is.
+    #[test]
+    fn test_returns_twice_caller_is_not_inlined() {
+        let src = r#"
+extern int _setjmp(long *);
+extern int rt(void *) __attribute__((returns_twice));
+extern int setjmpx(long *);
+long jb[64];
+static int lib(void) { return _setjmp(jb); }
+static int attr(void) { return rt(jb); }
+static int plain(void) { return setjmpx(jb); }
+int caller(void) { return lib() + attr() + plain(); }
+"#;
+        let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+        let mut module = crate::ir::linearize::test_linearize::linearize_source(src, &target);
+        let candidates = analyze_all_functions(&module);
+        for name in ["lib", "attr"] {
+            assert!(candidates[name].calls_returns_twice, "{name}");
+            assert!(candidates[name].cannot_be_inlined(), "{name}");
+        }
+        assert!(!candidates["plain"].calls_returns_twice);
+        run(&mut module, opt_at(2));
+        assert_eq!(calls_left(&module, "caller", "lib"), 1, "lib was inlined");
+        assert_eq!(calls_left(&module, "caller", "attr"), 1, "attr was inlined");
+        assert_eq!(calls_left(&module, "caller", "plain"), 0, "plain was not");
     }
 
     #[test]

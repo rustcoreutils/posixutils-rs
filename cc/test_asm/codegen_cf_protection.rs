@@ -81,7 +81,7 @@ fn cf_branch_marks_every_indirect_entry() {
 }
 
 /// A function that returns twice comes back by an indirect jump, so the call
-/// is followed by `endbr64`: `setjmp` (through glibc's `_setjmp`) and the rest
+/// is followed by `endbr64`: `_setjmp` (glibc's `setjmp`) and the rest
 /// of gcc's list of such names. A label whose address is taken is the target
 /// of a computed goto and starts with one too.
 #[test]
@@ -93,7 +93,7 @@ fn cf_branch_marks_returns_twice_and_label_targets() {
             PROGRAM,
             &[opt, "-fcf-protection=branch"],
         );
-        assert_body_contains(&asm, "sj", "setjmp@PLT\n    endbr64\n", opt);
+        assert_body_contains(&asm, "sj", "call _setjmp@PLT\n    endbr64\n", opt);
         assert_body_contains(&asm, "vf", "call vfork@PLT\n    endbr64\n", opt);
         // The entry and each of the two labels.
         assert_eq!(count_in_body(&asm, "cg", "endbr64"), 3, "{opt}:\n{asm}");

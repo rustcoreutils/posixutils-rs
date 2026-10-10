@@ -158,7 +158,7 @@ says otherwise, `typ`/`size` describe the result.
 | `switch` | Multi-way branch on `src[0]`: `switch_cases` holds `(low, high, block)` ranges, `switch_default` the rest |
 | `indirectbr` | GNU computed goto to the address in `src[0]`. The instruction cannot name its targets (any address-taken label may be one), so the edges are recorded on the block, as for `asm goto` |
 | `unreachable` | Undefined if reached; the back ends emit a trap (`ud2`, `brk #1`). Follows every `noreturn` call, so ending in one does not make a block dead: DCE treats a block as unreachable only when `unreachable` is its first instruction with an effect |
-| `longjmp` | Restore a `setjmp` context; never returns |
+| `longjmp` | gcc's `__builtin_longjmp`: resume a `setjmp`; never returns |
 
 ### Integer Arithmetic and Bitwise (binary)
 
@@ -366,7 +366,7 @@ Operands are `(dst, src-or-byte, n)`. The back ends emit the libc call; one whos
 |--------|-------------|
 | `alloca` | Dynamic stack allocation |
 | `stacksave`, `stackrestore` | Capture and restore the stack pointer. A VLA's scope is bracketed with them, and so is an inlined callee that `alloca`s, so its allocation is released where the call would have returned instead of accumulating in the caller (a loop would otherwise grow the stack every iteration). `__builtin_stack_save` and `__builtin_stack_restore` are these two |
-| `setjmp` | Save context; returns 0, or the value a `longjmp` passed (`longjmp` is a terminator, above). `JmpKind::Builtin` is gcc's `__builtin_setjmp`, generated inline: no register survives it, and it always resumes with 1 |
+| `setjmp` | gcc's `__builtin_setjmp`, generated inline: returns 0, and 1 when its `longjmp` (a terminator, above) resumes it; no register survives it. The library's `setjmp` family are `call`s, which `Instruction::returns_twice` answers for |
 | `frame_address` | `__builtin_frame_address(level)`; the level is `frame_level()` |
 | `return_address` | `__builtin_return_address(level)` |
 

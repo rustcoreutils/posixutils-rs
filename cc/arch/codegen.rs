@@ -1792,20 +1792,6 @@ pub fn asm_comment_prefix(target: &Target) -> &'static str {
     }
 }
 
-/// Whether a call of `name` may return twice, by gcc's list: `setjmp` and
-/// `sigsetjmp` under up to two leading underscores, and `savectx`, `vfork`
-/// and `getcontext` as spelled. The second return comes by an indirect
-/// jump, so under branch protection the call is followed by `endbr64`.
-pub fn returns_twice(name: &str) -> bool {
-    let bare = name
-        .strip_prefix("__")
-        .or_else(|| name.strip_prefix('_'))
-        .unwrap_or(name);
-    name.len() <= 11
-        && (matches!(bare, "setjmp" | "sigsetjmp")
-            || matches!(name, "savectx" | "vfork" | "getcontext"))
-}
-
 /// Create a code generator for the given target
 pub fn create_codegen(
     target: Target,

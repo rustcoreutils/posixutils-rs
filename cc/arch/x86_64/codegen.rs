@@ -21,7 +21,6 @@ use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, X87Scratch, XmmReg};
 use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to_float};
 use crate::ir::{Instruction, Module, NanCompare, Opcode, PseudoId, PseudoKind};
-use crate::parse::ast::JmpKind;
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
@@ -1333,16 +1332,9 @@ impl X86_64CodeGen {
                 self.emit_return_address(insn);
             }
 
-            // setjmp/longjmp support
-            Opcode::Setjmp => match insn.jmp_kind() {
-                JmpKind::Library => self.emit_setjmp(insn),
-                JmpKind::Builtin => self.emit_builtin_setjmp(insn),
-            },
-
-            Opcode::Longjmp => match insn.jmp_kind() {
-                JmpKind::Library => self.emit_longjmp(insn),
-                JmpKind::Builtin => self.emit_builtin_longjmp(insn),
-            },
+            // gcc's non-local goto
+            Opcode::Setjmp => self.emit_builtin_setjmp(insn),
+            Opcode::Longjmp => self.emit_builtin_longjmp(insn),
 
             Opcode::Asm => {
                 self.emit_inline_asm(insn);

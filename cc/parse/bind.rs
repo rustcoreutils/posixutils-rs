@@ -824,7 +824,7 @@ impl Parser<'_> {
     }
 
     /// The attributes of a function declarator, and its type made to carry
-    /// `noreturn` when anything said so.
+    /// `noreturn` and `returns_twice` when anything said so.
     ///
     /// Answers the attributes accumulated under the function's name, or
     /// `None` for a typedef, which names a type and no function.
@@ -849,9 +849,15 @@ impl Parser<'_> {
             || attrs
                 .as_ref()
                 .map_or(self.pending_fn_attrs.noreturn, |a| a.noreturn);
-        if noreturn && !self.types.get(*typ).noreturn {
-            let mut func = self.types.get(*typ).clone();
-            func.noreturn = true;
+        // `returns_twice` too, but only on a function's declaration: gcc
+        // ignores it on a typedef, so a call through a pointer to that type
+        // is an ordinary one.
+        let returns_twice = attrs.as_ref().is_some_and(|a| a.returns_twice);
+        let current = self.types.get(*typ);
+        if (noreturn && !current.noreturn) || (returns_twice && !current.returns_twice) {
+            let mut func = current.clone();
+            func.noreturn |= noreturn;
+            func.returns_twice |= returns_twice;
             *typ = self.types.intern(func);
         }
         attrs

@@ -1317,30 +1317,29 @@ pub enum ExprKind {
     },
 
     // =========================================================================
-    // setjmp/longjmp (non-local jumps)
+    // gcc's non-local goto: `__builtin_setjmp` / `__builtin_longjmp`
     // =========================================================================
-    /// setjmp(env)
-    /// Saves the current execution context in env.
-    /// Returns 0 on direct call, non-zero when returning via longjmp.
+    /// `__builtin_setjmp(env)`: inline code over a five-word buffer holding
+    /// the frame pointer, the resume address and the stack pointer. 0 on the
+    /// direct return, 1 when `__builtin_longjmp` resumes it. Nothing else is
+    /// saved, so the function containing it assumes every register is lost
+    /// when control resumes there, and saves every callee-saved register in
+    /// its prologue.
+    ///
+    /// The library's `setjmp` family is not this: those are calls of the
+    /// function the program names, which return twice.
     Setjmp {
-        /// The jmp_buf to save the context to
+        /// The buffer to save the context to
         env: Box<Expr>,
-        /// The library's `setjmp`, or gcc's `__builtin_setjmp`.
-        kind: JmpKind,
     },
 
-    /// longjmp(env, val)
-    /// Restores the execution context saved in env.
-    /// Causes the corresponding setjmp to return val (or 1 if val == 0).
-    /// This function never returns (noreturn).
+    /// `__builtin_longjmp(env, 1)`: resume the `__builtin_setjmp` that
+    /// filled `env`. Never returns.
     Longjmp {
-        /// The jmp_buf containing the saved context
+        /// The buffer the context was saved to
         env: Box<Expr>,
-        /// The value to return from setjmp (1 if 0 is passed)
+        /// Always the constant 1, which the parser checked.
         val: Box<Expr>,
-        /// The library's `longjmp`, or gcc's `__builtin_longjmp`, whose
-        /// `val` is always the constant 1.
-        kind: JmpKind,
     },
 
     // =========================================================================
@@ -2221,24 +2220,6 @@ pub enum CalleeBinding {
     Library,
 }
 
-/// Which non-local jump a `setjmp`/`longjmp` pair is.
-///
-/// The two never mix: a buffer one fills only the other's partner reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum JmpKind {
-    /// The C library's `setjmp`/`longjmp` (and `_setjmp`/`_longjmp`): a call,
-    /// which saves the callee-saved registers and whatever else the library
-    /// keeps in a `jmp_buf`.
-    #[default]
-    Library,
-    /// gcc's `__builtin_setjmp`/`__builtin_longjmp`: inline code over a
-    /// five-word buffer holding the frame pointer, the resume address and
-    /// the stack pointer. Nothing else is saved, so the function containing
-    /// the setjmp assumes every register is lost when control resumes there,
-    /// and saves every callee-saved register in its prologue.
-    Builtin,
-}
-
 // Inline Assembly Support (GCC Extended Asm)
 
 /// An operand in an inline assembly statement
@@ -3075,6 +3056,10 @@ pub struct FunctionAttrs {
     /// `__attribute__((noreturn))`. What a call site reads is the function
     /// *type*'s `noreturn`, which the declarator is given from this.
     pub noreturn: bool,
+    /// `__attribute__((returns_twice))`. Like `noreturn`, what a call site
+    /// reads is the function *type*'s, which the declarator is given from
+    /// this.
+    pub returns_twice: bool,
     /// `__attribute__((stack_protect))` or `((no_stack_protector))`.
     pub stack_protect: StackProtectAttr,
     /// The stack-protector level `__attribute__((optimize("...")))` sets for
@@ -3131,6 +3116,7 @@ impl FunctionAttrs {
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
         self.noreturn |= other.noreturn;
+        self.returns_twice |= other.returns_twice;
         // The first declaration's wins; see `Parser::merge_fn_attrs`.
         self.stack_protect = self
             .stack_protect

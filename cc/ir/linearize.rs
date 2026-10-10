@@ -25,7 +25,7 @@ use crate::ir::linearize_emit::CompoundAssign;
 use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
-    GnuAtomicOp, InitElement, InlineLibraryFn, JmpKind, LabelId, MemoryFn, NarrowedLibraryCall,
+    GnuAtomicOp, InitElement, InlineLibraryFn, LabelId, MemoryFn, NarrowedLibraryCall,
     OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
@@ -625,6 +625,7 @@ struct CallFacts {
     variadic_arg_start: Option<usize>,
     ends_with_va_arg_pack: bool,
     is_noreturn: bool,
+    returns_twice: bool,
     binding: crate::parse::ast::CalleeBinding,
     known: Option<crate::parse::ast::LibFn>,
     abi_info: Box<CallAbiInfo>,
@@ -4404,6 +4405,8 @@ impl<'a> Linearizer<'a> {
             variadic_arg_start: sig.variadic_arg_start,
             ends_with_va_arg_pack,
             is_noreturn: sig.is_noreturn,
+            returns_twice: matches!(target, CallTarget::Direct(_))
+                && self.callee_returns_twice(func_expr),
             binding,
             known,
             abi_info: Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv)),
@@ -4439,6 +4442,31 @@ impl<'a> Linearizer<'a> {
             return self.vector_returned(result_sym, typ, expr_typ, conv);
         }
         result_sym
+    }
+
+    /// Whether the function a direct call names returns twice, as gcc
+    /// decides it: declared `__attribute__((returns_twice))`, which its type
+    /// carries, or an external function on gcc's list of such names --
+    /// `setjmp` and `sigsetjmp` under up to two leading underscores, and
+    /// `savectx`, `vfork` and `getcontext` as spelled, the name being the
+    /// one the program wrote, at most 11 characters.
+    fn callee_returns_twice(&self, func_expr: &Expr) -> bool {
+        let ExprKind::Ident(symbol_id) = func_expr.kind else {
+            return false;
+        };
+        let sym = self.symbols.get(symbol_id);
+        if self.types.get(sym.typ).returns_twice {
+            return true;
+        }
+        let name = self.str(sym.name);
+        let bare = name
+            .strip_prefix("__")
+            .or_else(|| name.strip_prefix('_'))
+            .unwrap_or(name);
+        sym.linkage == crate::symbol::Linkage::External
+            && name.len() <= 11
+            && (matches!(bare, "setjmp" | "sigsetjmp")
+                || matches!(name, "savectx" | "vfork" | "getcontext"))
     }
 
     /// Which definition a direct call reaches, refining what the parser
@@ -4840,6 +4868,7 @@ impl<'a> Linearizer<'a> {
         extra.variadic_arg_start = facts.variadic_arg_start;
         extra.ends_with_va_arg_pack = facts.ends_with_va_arg_pack;
         extra.is_noreturn_call = facts.is_noreturn;
+        extra.returns_twice_call = facts.returns_twice;
         extra.callee_binding = facts.binding;
         extra.known = facts.known;
         extra.abi_info = Some(facts.abi_info);
@@ -6336,44 +6365,25 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Setjmp { env, kind } => {
-                // setjmp(env) - saves execution context, returns int
+            ExprKind::Setjmp { env } => {
                 let env_val = self.linearize_expr(env);
                 let result = self.alloc_pseudo();
-
-                let mut insn = Instruction::new(Opcode::Setjmp)
+                let insn = Instruction::new(Opcode::Setjmp)
                     .with_target(result)
                     .with_src(env_val)
                     .with_type_and_size(self.types.int_id, 32);
-                match kind {
-                    JmpKind::Library => insn = insn.with_func(self.library_function_name("setjmp")),
-                    JmpKind::Builtin => insn.extra_mut().jmp_kind = JmpKind::Builtin,
-                }
                 self.emit(insn);
                 result
             }
 
-            ExprKind::Longjmp { env, val, kind } => {
-                // longjmp(env, val) - restores execution context (never returns)
+            // The value is the constant 1, which the parser checked, and the
+            // setjmp's receiver supplies it itself.
+            ExprKind::Longjmp { env, .. } => {
                 let env_val = self.linearize_expr(env);
                 let result = self.alloc_pseudo();
-
-                let mut insn = Instruction::new(Opcode::Longjmp);
+                let mut insn = Instruction::new(Opcode::Longjmp).with_src(env_val);
                 insn.target = Some(result);
                 insn.typ = Some(self.types.void_id);
-                match kind {
-                    JmpKind::Library => {
-                        let val_val = self.linearize_expr(val);
-                        insn = insn.with_func(self.library_function_name("longjmp"));
-                        insn.src = vec![env_val, val_val];
-                    }
-                    // The value is the constant 1, which the parser checked,
-                    // and the setjmp's receiver supplies it itself.
-                    JmpKind::Builtin => {
-                        insn.extra_mut().jmp_kind = JmpKind::Builtin;
-                        insn.src = vec![env_val];
-                    }
-                }
                 self.emit_no_return(insn);
                 result
             }

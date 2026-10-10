@@ -15,8 +15,7 @@ the keyword tag is not consulted while parsing.
 
 - **Reserved spellings** (`__builtin_*`, `__sync_*`, ...) are never
   displaced, whatever the program declares (C17 7.1.3).
-- **Bare spellings** -- `alloca`, `offsetof`, `setjmp`, `_setjmp`, `longjmp`,
-  `_longjmp`, and the library functions computed in place (`abs`, `fabs`,
+- **Bare spellings** -- `alloca`, `offsetof`, and the library functions computed in place (`abs`, `fabs`,
   `sqrt`, `memcpy`, ...; see below) -- are displaced by `-fno-builtin`,
   `-fno-builtin-NAME`, a declaration that is not a function, and (library
   functions only) a function declaration whose type is not the library
@@ -386,14 +385,16 @@ C23 7.12.17.1 requires. The results are exact.
 | `__builtin_return_address(level)` | `Opcode::ReturnAddress` |
 | `__builtin_extract_return_addr(addr)` | The identity on both targets (it exists for ARM Thumb's flag bit); `addr` is evaluated once |
 | `__builtin___clear_cache(begin, end)` | A call to libgcc's `__clear_cache`: a no-op on x86-64, required on AArch64 for code written as data |
-| `setjmp(env)`, `_setjmp(env)` | Bare names parsed as builtins: `Opcode::Setjmp`, calling the library function under the name its declaration gives it. `setjmp()` with no argument is an ordinary unprototyped call |
-| `longjmp(env, val)`, `_longjmp(env, val)` | `Opcode::Longjmp`, a terminator |
-| `__builtin_setjmp(buf)` | `int (void *)`. `Opcode::Setjmp` with `JmpKind::Builtin`: inline code, no library call. Returns 0, and 1 when resumed |
-| `__builtin_longjmp(buf, 1)` | `void (void *, int)`. `Opcode::Longjmp` with `JmpKind::Builtin`, a terminator. A value other than the constant 1 is an error, as in gcc |
+| `__builtin_setjmp(buf)` | `int (void *)`. `Opcode::Setjmp`: inline code, no library call. Returns 0, and 1 when resumed |
+| `__builtin_longjmp(buf, 1)` | `void (void *, int)`. `Opcode::Longjmp`, a terminator. A value other than the constant 1 is an error, as in gcc |
 
-`setjmp` and `longjmp` are displaced only by a declaration that is not a
-function, or by `-fno-builtin`; `<setjmp.h>`'s function declarations keep
-them.
+The library's `setjmp`, `_setjmp`, `sigsetjmp`, `longjmp` and the rest are
+not builtins: each is an ordinary call of the function the program names,
+after <setjmp.h>'s macros (glibc's `setjmp(env)` is `_setjmp(env)`, which
+saves no signal mask). A direct call of `setjmp`, `sigsetjmp` (under up to
+two leading underscores), `savectx`, `vfork`, `getcontext`, or a function
+declared `returns_twice`, returns twice, and is treated as `__builtin_setjmp`
+is in what follows except the prologue (see ATTR.md).
 
 `__builtin_setjmp` stores gcc's layout in the first three of its five words:
 the frame pointer, the address of a resume label inside the instruction's own
@@ -403,7 +404,7 @@ code is the same on every target, Mach-O included. No signal mask and no
 other register is saved, so the function containing the setjmp:
 
 - keeps no value in a register across it: the setjmp is a constraint point
-  that clobbers every allocatable register (`builtin_setjmp_constraint`), and
+  that clobbers every allocatable register (`returns_twice_constraint`), and
   a call-like opcode, so floating values go to the stack too;
 - saves every callee-saved register in its prologue, since the jump skips the
   epilogues of the frames it unwinds;

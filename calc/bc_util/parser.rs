@@ -12,8 +12,9 @@
 //! The expression grammar follows the precedence table of POSIX.1-2024,
 //! XCU `bc`, Table 3-3, with one function per precedence level. In order of
 //! decreasing precedence: `++`/`--`, unary `-`, `^` (right associative),
-//! `*` `/` `%`, `+` binary `-`, assignment, and the relational operators —
-//! which the grammar admits only inside an `if`, `while` or `for` condition.
+//! `*` `/` `%`, `+` binary `-`, assignment, and the relational operators.
+//! POSIX admits the relational operators only in an `if`, `while` or `for`
+//! condition; accepting them in any expression is a GNU extension.
 //!
 //! Assignment is recognised where its left side is syntactically a named
 //! expression, so `1 + a = 2` is `1 + (a = 2)`, matching historical bc.
@@ -221,7 +222,50 @@ impl<'a> Parser<'a> {
 
     // ---- expressions -------------------------------------------------
 
+    /// An expression: the relational operators, left associative and lowest
+    /// in precedence, over additive operands.
+    ///
+    /// POSIX admits a relational operator only in the condition of an `if`,
+    /// `while` or `for`; accepting one in any expression, valued 1 or 0, is
+    /// the GNU extension that util-linux's test suite relies on.
+    ///
+    /// The relational level lives here rather than in a function of its own:
+    /// every nesting level recurses through this function, and one more frame
+    /// per level is enough to overflow a default-sized thread stack in an
+    /// unoptimized build before `MAX_PARSE_DEPTH` is reached.
     fn parse_expr(&mut self) -> PResult<ExprInstruction> {
+        self.enter()?;
+        let mut lhs = self.parse_additive();
+        while let Ok(left) = lhs {
+            let op = match self.peek() {
+                Some(Token::Eq) => RelOp::Eq,
+                Some(Token::Ne) => RelOp::Ne,
+                Some(Token::Lt) => RelOp::Lt,
+                Some(Token::Le) => RelOp::Le,
+                Some(Token::Gt) => RelOp::Gt,
+                Some(Token::Ge) => RelOp::Ge,
+                _ => {
+                    lhs = Ok(left);
+                    break;
+                }
+            };
+            self.advance();
+            lhs = self
+                .parse_additive()
+                .map(|right| ExprInstruction::Relation {
+                    op,
+                    lhs: Box::new(left),
+                    rhs: Box::new(right),
+                });
+        }
+        self.leave();
+        lhs
+    }
+
+    /// The value on the right of an assignment operator. Assignment binds
+    /// tighter than the relational operators, as in GNU bc, so `a = 2 > 1`
+    /// assigns 2 and compares the result with 1.
+    fn parse_assigned_value(&mut self) -> PResult<ExprInstruction> {
         self.enter()?;
         let r = self.parse_additive();
         self.leave();
@@ -438,7 +482,7 @@ impl<'a> Parser<'a> {
                 let target = self.parse_target()?;
                 if let Some(op) = self.assign_op() {
                     self.advance();
-                    let value = self.parse_expr()?;
+                    let value = self.parse_assigned_value()?;
                     return Ok(build_assignment(target, &op, value));
                 }
                 match target {
@@ -476,26 +520,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_condition(&mut self) -> PResult<ConditionInstruction> {
-        let left = self.parse_expr()?;
-        let build: fn(ExprInstruction, ExprInstruction) -> ConditionInstruction = match self.peek()
-        {
-            Some(Token::Eq) => ConditionInstruction::Eq,
-            Some(Token::Ne) => ConditionInstruction::Ne,
-            Some(Token::Lt) => ConditionInstruction::Lt,
-            Some(Token::Le) => ConditionInstruction::Leq,
-            Some(Token::Gt) => ConditionInstruction::Gt,
-            Some(Token::Ge) => ConditionInstruction::Geq,
-            _ => return Ok(ConditionInstruction::Expr(left)),
-        };
-        self.advance();
-        let right = self.parse_expr()?;
-        Ok(build(left, right))
-    }
-
-    fn parse_parenthesized_condition(&mut self) -> PResult<ConditionInstruction> {
+    fn parse_parenthesized_condition(&mut self) -> PResult<ExprInstruction> {
         self.expect(Token::LParen, "'('")?;
-        let condition = self.parse_condition()?;
+        let condition = self.parse_expr()?;
         self.expect(Token::RParen, "')'")?;
         Ok(condition)
     }
@@ -598,7 +625,7 @@ impl<'a> Parser<'a> {
                 self.expect(Token::LParen, "'('")?;
                 let init = self.parse_expr()?;
                 self.expect(Token::Semicolon, "';'")?;
-                let condition = self.parse_condition()?;
+                let condition = self.parse_expr()?;
                 self.expect(Token::Semicolon, "';'")?;
                 let update = self.parse_expr()?;
                 self.expect(Token::RParen, "')'")?;
@@ -1208,7 +1235,7 @@ mod test {
         assert_eq!(
             stmt,
             StmtInstruction::While {
-                condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                condition: ExprInstruction::Number("1".to_string()),
                 instruction_count: 1,
                 body: vec![StmtInstruction::Break]
             }
@@ -1221,10 +1248,11 @@ mod test {
         assert_eq!(
             stmt,
             StmtInstruction::If {
-                condition: ConditionInstruction::Lt(
-                    ExprInstruction::Number("1".to_string()),
-                    ExprInstruction::Number("2".to_string())
-                ),
+                condition: ExprInstruction::Relation {
+                    op: RelOp::Lt,
+                    lhs: Box::new(ExprInstruction::Number("1".to_string())),
+                    rhs: Box::new(ExprInstruction::Number("2".to_string()))
+                },
                 instruction_count: 1,
                 body: vec![StmtInstruction::Expr(ExprInstruction::Number(
                     "3".to_string()
@@ -1238,45 +1266,51 @@ mod test {
         for (text, expected) in [
             (
                 "if (1 == 2) 3\n",
-                ConditionInstruction::Eq(
-                    ExprInstruction::Number("1".to_string()),
-                    ExprInstruction::Number("2".to_string()),
-                ),
+                ExprInstruction::Relation {
+                    op: RelOp::Eq,
+                    lhs: Box::new(ExprInstruction::Number("1".to_string())),
+                    rhs: Box::new(ExprInstruction::Number("2".to_string())),
+                },
             ),
             (
                 "if (1 != 2) 3\n",
-                ConditionInstruction::Ne(
-                    ExprInstruction::Number("1".to_string()),
-                    ExprInstruction::Number("2".to_string()),
-                ),
+                ExprInstruction::Relation {
+                    op: RelOp::Ne,
+                    lhs: Box::new(ExprInstruction::Number("1".to_string())),
+                    rhs: Box::new(ExprInstruction::Number("2".to_string())),
+                },
             ),
             (
                 "if (1 < 2) 3\n",
-                ConditionInstruction::Lt(
-                    ExprInstruction::Number("1".to_string()),
-                    ExprInstruction::Number("2".to_string()),
-                ),
+                ExprInstruction::Relation {
+                    op: RelOp::Lt,
+                    lhs: Box::new(ExprInstruction::Number("1".to_string())),
+                    rhs: Box::new(ExprInstruction::Number("2".to_string())),
+                },
             ),
             (
                 "if (1 <= 2) 3\n",
-                ConditionInstruction::Leq(
-                    ExprInstruction::Number("1".to_string()),
-                    ExprInstruction::Number("2".to_string()),
-                ),
+                ExprInstruction::Relation {
+                    op: RelOp::Le,
+                    lhs: Box::new(ExprInstruction::Number("1".to_string())),
+                    rhs: Box::new(ExprInstruction::Number("2".to_string())),
+                },
             ),
             (
                 "if (1 > 2) 3\n",
-                ConditionInstruction::Gt(
-                    ExprInstruction::Number("1".to_string()),
-                    ExprInstruction::Number("2".to_string()),
-                ),
+                ExprInstruction::Relation {
+                    op: RelOp::Gt,
+                    lhs: Box::new(ExprInstruction::Number("1".to_string())),
+                    rhs: Box::new(ExprInstruction::Number("2".to_string())),
+                },
             ),
             (
                 "if (1 >= 2) 3\n",
-                ConditionInstruction::Geq(
-                    ExprInstruction::Number("1".to_string()),
-                    ExprInstruction::Number("2".to_string()),
-                ),
+                ExprInstruction::Relation {
+                    op: RelOp::Ge,
+                    lhs: Box::new(ExprInstruction::Number("1".to_string())),
+                    rhs: Box::new(ExprInstruction::Number("2".to_string())),
+                },
             ),
         ] {
             let stmt = parse_stmt(text);
@@ -1293,7 +1327,7 @@ mod test {
         assert_eq!(
             stmt,
             StmtInstruction::While {
-                condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                condition: ExprInstruction::Number("1".to_string()),
                 instruction_count: 1,
                 body: vec![StmtInstruction::Expr(ExprInstruction::Number(
                     "2".to_string()
@@ -1312,10 +1346,11 @@ mod test {
                     named: NamedExpr::VariableNumber('i'),
                     value: Box::new(ExprInstruction::Number("0".to_string()))
                 },
-                condition: ConditionInstruction::Lt(
-                    ExprInstruction::Named(NamedExpr::VariableNumber('i')),
-                    ExprInstruction::Number("5".to_string())
-                ),
+                condition: ExprInstruction::Relation {
+                    op: RelOp::Lt,
+                    lhs: Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('i'))),
+                    rhs: Box::new(ExprInstruction::Number("5".to_string()))
+                },
                 update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('i')),
                 instruction_count: 1,
                 body: vec![StmtInstruction::Expr(ExprInstruction::Number(
@@ -1511,12 +1546,56 @@ mod test {
         );
     }
 
-    /// Relational operators appear only in conditions.
+    /// A relational expression is accepted anywhere an expression is (a GNU
+    /// extension), binding looser than assignment and associating left.
     #[test]
-    fn test_relational_operators_outside_conditions_are_an_error() {
-        assert!(parse_program("1 < 2\n", None).is_err());
-        assert!(parse_program("a = 1 < 2\n", None).is_err());
-        assert!(parse_program("if (1 < 2 < 3) 1\n", None).is_err());
+    fn test_relational_operators_in_expressions() {
+        let num = |n: &str| Box::new(ExprInstruction::Number(n.to_string()));
+        assert_eq!(
+            parse_expr("1 < 2\n"),
+            ExprInstruction::Relation {
+                op: RelOp::Lt,
+                lhs: num("1"),
+                rhs: num("2"),
+            }
+        );
+        // `a = 1 < 2` is `(a = 1) < 2`.
+        assert_eq!(
+            parse_expr("a = 1 < 2\n"),
+            ExprInstruction::Relation {
+                op: RelOp::Lt,
+                lhs: Box::new(ExprInstruction::Assignment {
+                    named: NamedExpr::VariableNumber('a'),
+                    value: num("1"),
+                }),
+                rhs: num("2"),
+            }
+        );
+        // `1 < 2 > 3` is `(1 < 2) > 3`.
+        assert_eq!(
+            parse_expr("1 < 2 > 3\n"),
+            ExprInstruction::Relation {
+                op: RelOp::Gt,
+                lhs: Box::new(ExprInstruction::Relation {
+                    op: RelOp::Lt,
+                    lhs: num("1"),
+                    rhs: num("2"),
+                }),
+                rhs: num("3"),
+            }
+        );
+        // `1 + 2 == 3` is `(1 + 2) == 3`.
+        assert_eq!(
+            parse_expr("1 + 2 == 3\n"),
+            ExprInstruction::Relation {
+                op: RelOp::Eq,
+                lhs: Box::new(ExprInstruction::Add(num("1"), num("2"))),
+                rhs: num("3"),
+            }
+        );
+        assert!(parse_program("if (1 < 2 < 3) 1\n", None).is_ok());
+        // The left side of an assignment is still a named expression.
+        assert!(parse_program("1 < 2 = 3\n", None).is_err());
     }
 
     /// A one-line definition is rejected: POSIX requires a newline after '{'.

@@ -30,18 +30,18 @@ pub enum StmtInstruction {
     Return,
     ReturnExpr(ExprInstruction),
     If {
-        condition: ConditionInstruction,
+        condition: ExprInstruction,
         instruction_count: usize,
         body: Vec<StmtInstruction>,
     },
     While {
-        condition: ConditionInstruction,
+        condition: ExprInstruction,
         instruction_count: usize,
         body: Vec<StmtInstruction>,
     },
     For {
         init: ExprInstruction,
-        condition: ConditionInstruction,
+        condition: ExprInstruction,
         update: ExprInstruction,
         instruction_count: usize,
         body: Vec<StmtInstruction>,
@@ -121,17 +121,42 @@ pub enum ExprInstruction {
     Div(Box<ExprInstruction>, Box<ExprInstruction>),
     Mod(Box<ExprInstruction>, Box<ExprInstruction>),
     Pow(Box<ExprInstruction>, Box<ExprInstruction>),
+    /// `lhs op rhs`, valued 1 if the relation holds and 0 otherwise.
+    ///
+    /// POSIX admits a relational expression only as the condition of an `if`,
+    /// `while` or `for`; using one as a general expression is a GNU extension.
+    /// A condition is any expression, true when nonzero, so the two uses share
+    /// this one node.
+    Relation {
+        op: RelOp,
+        lhs: Box<ExprInstruction>,
+        rhs: Box<ExprInstruction>,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ConditionInstruction {
-    Expr(ExprInstruction),
-    Eq(ExprInstruction, ExprInstruction),
-    Ne(ExprInstruction, ExprInstruction),
-    Lt(ExprInstruction, ExprInstruction),
-    Leq(ExprInstruction, ExprInstruction),
-    Gt(ExprInstruction, ExprInstruction),
-    Geq(ExprInstruction, ExprInstruction),
+/// A relational operator: `==`, `!=`, `<`, `<=`, `>`, `>=`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl RelOp {
+    /// Whether the relation holds between two values that compare as `ordering`.
+    pub fn holds(self, ordering: std::cmp::Ordering) -> bool {
+        match self {
+            RelOp::Eq => ordering.is_eq(),
+            RelOp::Ne => ordering.is_ne(),
+            RelOp::Lt => ordering.is_lt(),
+            RelOp::Le => ordering.is_le(),
+            RelOp::Gt => ordering.is_gt(),
+            RelOp::Ge => ordering.is_ge(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

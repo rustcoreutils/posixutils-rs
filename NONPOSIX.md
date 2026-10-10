@@ -82,6 +82,13 @@ utility below:
    POSIX calls bc an arbitrary precision calculator, and the limits it does
    grant by name — `{BC_SCALE_MAX}`, `{BC_BASE_MAX}`, `{BC_DIM_MAX}`,
    `{BC_STRING_MAX}` — do not include a ceiling on a value's digit count.
+ * A relational expression (`<`, `>`, `<=`, `>=`, `==`, `!=`) may appear in
+   any expression, not only as the condition of an `if`, `while` or `for`;
+   its value is 1 if the relation holds and 0 if not, so `2 > 1` as a
+   statement writes `1`.  As in GNU bc, the relational operators bind looser
+   than assignment and associate to the left: `a = 2 > 1` assigns 2 and
+   writes `1`, and `3 > 2 > 1` is `(3 > 2) > 1`.  Forced by util-linux's test
+   suite (`tests/ts/ipcs/functions.sh`).
 
 ### c17
 

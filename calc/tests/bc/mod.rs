@@ -527,6 +527,14 @@ fn test_bc_operator_precedence() {
     test_bc!(operator_precedence)
 }
 
+// GNU extension: a relational expression anywhere an expression may be, with
+// the value 1 or 0. Relational operators bind looser than assignment and
+// associate to the left, so `a = 2 > 1` is `(a = 2) > 1` and writes 1.
+#[test]
+fn test_bc_relational_expressions() {
+    test_bc!(relational_expressions)
+}
+
 #[test]
 fn test_bc_output_base_1097() {
     test_bc!(output_base_1097)

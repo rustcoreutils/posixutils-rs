@@ -1221,7 +1221,14 @@ impl<'a> Preprocessor<'a> {
             GNUC_VERSION.join(".")
         );
         self.define_macro(Macro::predefined("__VERSION__", Some(&version)));
-        self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));
+        // Which rule a plain `inline` follows, as gcc says it: GNU89's under
+        // `-fgnu89-inline`, C99's otherwise.
+        let inline_rule = if crate::builtins::gnu89_inline() {
+            "__GNUC_GNU_INLINE__"
+        } else {
+            "__GNUC_STDC_INLINE__"
+        };
+        self.define_macro(Macro::predefined(inline_rule, Some("1")));
 
         // Note: C99/C11 bool, true, false are NOT pre-defined here.
         // They should only be available after #include <stdbool.h>.

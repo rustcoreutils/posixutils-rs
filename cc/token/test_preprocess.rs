@@ -2549,6 +2549,20 @@ fn test_gnu_keyword_spellings_are_not_macros() {
 
 /// `-fgnu89-inline` predefines `__GNUC_GNU_INLINE__` and not
 /// `__GNUC_STDC_INLINE__`; the default is the other way round.
+#[test]
+fn test_inline_predefine_follows_gnu89_inline() {
+    let input =
+        "#ifdef __GNUC_GNU_INLINE__\ngnu\n#endif\n#ifdef __GNUC_STDC_INLINE__\nstdc\n#endif\n";
+    let run = |gnu89| {
+        crate::builtins::set_gnu89_inline(gnu89);
+        let (tokens, idents) = preprocess_str(input);
+        crate::builtins::set_gnu89_inline(false);
+        get_token_strings(&tokens, &idents)
+    };
+    assert_eq!(run(false), ["stdc"]);
+    assert_eq!(run(true), ["gnu"]);
+}
+
 /// In assembly a `#` line that names no directive -- a number among them --
 /// is passed through, macro-replaced, as gcc's `-lang-asm` does: never a
 /// linemarker, so it neither renumbers the lines after it nor joins the next

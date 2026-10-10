@@ -368,3 +368,29 @@ fn syntax_only_checks_and_writes_nothing() {
     }
     assert_eq!(listing(dir.path()), ["t.c"]);
 }
+
+/// `-fgnu89-inline` predefines `__GNUC_GNU_INLINE__` in place of
+/// `__GNUC_STDC_INLINE__`, as gcc does, and the last of it and
+/// `-fno-gnu89-inline` decides. glibc's <sys/cdefs.h> picks its
+/// `__extern_inline` spelling from these.
+#[test]
+fn fgnu89_inline_selects_the_inline_predefine() {
+    let src = "#ifdef __GNUC_GNU_INLINE__\ngnu __GNUC_GNU_INLINE__\n#endif\n\
+               #ifdef __GNUC_STDC_INLINE__\nstdc __GNUC_STDC_INLINE__\n#endif\n";
+    let (_dir, path) = scratch("inl.c", src);
+    let path = path.to_string_lossy();
+    for (flags, want) in [
+        (&[][..], "stdc 1"),
+        (&["-fgnu89-inline"][..], "gnu 1"),
+        (&["-fno-gnu89-inline"][..], "stdc 1"),
+        (&["-fgnu89-inline", "-fno-gnu89-inline"][..], "stdc 1"),
+        (&["-fno-gnu89-inline", "-fgnu89-inline"][..], "gnu 1"),
+    ] {
+        let mut args = vec!["-E", "-P"];
+        args.extend(flags);
+        args.push(&path);
+        let r = run_c17(&args);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        assert_eq!(r.stdout.trim(), want, "{flags:?}");
+    }
+}

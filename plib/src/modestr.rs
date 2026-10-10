@@ -191,19 +191,56 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
 
 /// The process file mode creation mask.
 ///
-/// There is no `getumask(2)`: the only portable way to read the mask is to set
-/// it and put back what was there. That makes this a read-modify-write on
-/// process-global state.
-///
-/// WARNING:
-/// Potential umask race-condition. A test that *sets* the umask must not run in
-/// parallel with one that reads or depends on it, so such tests live in a test
-/// binary of their own — `tree/tests/tree-tests-umask.rs` and
+/// There is no `getumask(2)`. On Linux the mask is read from the `Umask:` line of
+/// `/proc/self/status` (Linux 4.7 and later), under a `/proc` verified to be procfs
+/// (`madefs::procfs_dir`): nothing is changed, so any thread may read it while others create
+/// files. Elsewhere, or where that cannot be read, the only portable way is to set the mask and
+/// put back what was there -- a read-modify-write on process-global state, during which a file
+/// another thread creates gets a mask of 0. Where it is read that way, a test that *sets* the
+/// umask must not run in parallel with one that reads or depends on it, so such tests live in
+/// a test binary of their own -- `tree/tests/tree-tests-umask.rs` and
 /// `plib/tests/write_atomic_umask.rs`.
 pub fn umask() -> u32 {
+    #[cfg(target_os = "linux")]
+    if let Some(mask) = procfs_umask() {
+        return mask;
+    }
     let m = unsafe { libc::umask(0) };
     unsafe { libc::umask(m) }; // Immediately revert
     m as u32 // Cast for macOS
+}
+
+/// The umask as `/proc/self/status` shows it (`umask`); `None` where it cannot be read. A
+/// kernel whose status has no `Umask:` line (before Linux 4.7) is remembered, and not asked
+/// again.
+#[cfg(target_os = "linux")]
+fn procfs_umask() -> Option<u32> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static NO_UMASK_LINE: AtomicBool = AtomicBool::new(false);
+    if NO_UMASK_LINE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let proc = crate::madefs::procfs_dir().ok()?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let fd = unsafe { libc::openat(proc.as_raw_fd(), c"self/status".as_ptr(), flags) };
+    if fd < 0 {
+        return None;
+    }
+    let mut status = Vec::new();
+    unsafe { std::fs::File::from_raw_fd(fd) }
+        .read_to_end(&mut status)
+        .ok()?;
+    let mask = status
+        .split(|&b| b == b'\n')
+        .find_map(|line| line.strip_prefix(b"Umask:"))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| u32::from_str_radix(value.trim(), 8).ok());
+    if mask.is_none() {
+        NO_UMASK_LINE.store(true, Ordering::Relaxed);
+    }
+    mask
 }
 
 /// The mode a utility must give a file it creates, per XCU 1.1.1.4 "File Read,
@@ -485,14 +522,64 @@ mod tests {
         }
     }
 
+    /// `umask` reads the mask without setting it, so it is the same under a filter that
+    /// refuses umask(2) (EPERM): no other thread of the process ever sees a mask of 0 while it
+    /// reads. Run in a child process of its own, given the mask 027 and then the filter.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn umask_is_read_without_setting_it() {
+        use crate::testing::seccomp::{install_filter, op, JEQ, LD, RET, RET_ALLOW, RET_ERRNO};
+        use std::os::unix::process::CommandExt;
+        #[cfg(target_arch = "x86_64")]
+        const SYS_UMASK: u32 = 95;
+        #[cfg(target_arch = "aarch64")]
+        const SYS_UMASK: u32 = 166;
+        const CHILD: &str = "PLIB_UMASK_READ_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "modestr::tests::umask_is_read_without_setting_it",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o027);
+                    Ok(())
+                });
+            }
+            let eperm = RET_ERRNO | u32::try_from(libc::EPERM).unwrap();
+            install_filter(
+                &mut command,
+                vec![
+                    op(LD, 0, 0, 0),
+                    op(JEQ, 0, 1, SYS_UMASK),
+                    op(RET, 0, 0, eperm),
+                    op(RET, 0, 0, RET_ALLOW),
+                ],
+            );
+            let out = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "child: {stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        assert_eq!(umask(), 0o027);
+        assert_eq!(default_create_mode(), 0o640);
+    }
+
     #[test]
     fn test_mutate_mode_empty_who() {
-        // NOTE: Potential umask race condition here
-        let umask = unsafe {
-            let m = libc::umask(0);
-            libc::umask(m);
-            m as u32
-        };
+        let umask = umask();
 
         let mode = mutate(0, false, &parse_symbolic("=rwx"));
 

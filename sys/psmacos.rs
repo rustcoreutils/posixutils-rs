@@ -277,15 +277,7 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
         }
     });
 
-    // Get process state character
-    let state = match bsd_info.pbi_status {
-        2 => 'R', // SRUN
-        1 => 'S', // SIDL
-        3 => 'S', // SSLEEP
-        4 => 'T', // SSTOP
-        5 => 'Z', // SZOMB
-        _ => 'S', // Default to sleeping
-    };
+    let state = process_state(pid, bsd_info.pbi_status, threads);
 
     // Get process group ID and session ID
     let pgid = unsafe { getpgid(pid) };
@@ -316,6 +308,87 @@ fn get_process_info(pid: pid_t, dev_map: &HashMap<u64, String>) -> Option<Proces
         comm,
         args,
     })
+}
+
+/// `proc_pidinfo` flavor listing a process's thread handles (XNU
+/// `PROC_PIDLISTTHREADS`; not in the libc crate).
+const PROC_PIDLISTTHREADS: c_int = 6;
+
+/// Seconds a waiting thread sleeps before Apple's ps calls it idle (`MAXSLP`).
+const MAXSLP: i32 = 20;
+
+/// The state letter, as Apple's ps writes it.  XNU leaves the BSD `p_stat` at
+/// `SRUN` for every live process, sleeping or not, so the state comes from the
+/// process's threads: the most runnable of them (running, then
+/// uninterruptible, waiting, stopped, halted) gives `R`, `U`, `S` (`I` when it
+/// has slept longer than `MAXSLP` seconds), `T` or `?`.  A zombie is `Z`, and
+/// where the threads cannot be read, `p_stat` decides.
+fn process_state(pid: pid_t, p_stat: u32, threads: u32) -> char {
+    let by_p_stat = match p_stat {
+        4 => 'T', // SSTOP
+        5 => 'Z', // SZOMB
+        2 => 'R', // SRUN
+        _ => 'S',
+    };
+    if p_stat == 5 {
+        return by_p_stat;
+    }
+    let mut handles = vec![0u64; threads as usize + 8];
+    let bytes = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDLISTTHREADS,
+            0,
+            handles.as_mut_ptr() as *mut c_void,
+            (handles.len() * std::mem::size_of::<u64>()) as c_int,
+        )
+    };
+    if bytes <= 0 {
+        return by_p_stat;
+    }
+    handles.truncate(bytes as usize / std::mem::size_of::<u64>());
+
+    // (order, sleep time) of the most runnable thread; the lowest order wins,
+    // and among waiting threads the shortest sleep.
+    let order = |run_state: i32| match run_state {
+        libc::TH_STATE_RUNNING => 1,
+        libc::TH_STATE_UNINTERRUPTIBLE => 2,
+        libc::TH_STATE_WAITING => 3,
+        libc::TH_STATE_STOPPED => 4,
+        libc::TH_STATE_HALTED => 5,
+        _ => 6,
+    };
+    let mut best: Option<(i32, i32)> = None;
+    for handle in handles {
+        let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_threadinfo>() as c_int;
+        let got = unsafe {
+            proc_pidinfo(
+                pid,
+                libc::PROC_PIDTHREADINFO,
+                handle,
+                info.as_mut_ptr() as *mut c_void,
+                size,
+            )
+        };
+        if got != size {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        let this = (order(info.pth_run_state), info.pth_sleep_time);
+        if best.is_none_or(|b| this < b) {
+            best = Some(this);
+        }
+    }
+    match best {
+        None => by_p_stat,
+        Some((1, _)) => 'R',
+        Some((2, _)) => 'U',
+        Some((3, slept)) if slept > MAXSLP => 'I',
+        Some((3, _)) => 'S',
+        Some((4, _)) => 'T',
+        Some(_) => '?',
+    }
 }
 
 /// Resolve a controlling-terminal device number to a /dev name via the

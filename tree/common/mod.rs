@@ -138,8 +138,8 @@ pub fn quote_bytes(name: &[u8]) -> String {
 // cp and mv
 pub use copy::{
     copy_file, copy_file_at, copy_files, copy_moved_file, finish_made_dir_mode,
-    made_dir_open_error, open_made_dir, preserve_through_fd, CopyConfig, DerefMode, Destination,
-    InodeMap, MadeTrust, MoveSource,
+    made_dir_open_error, open_made_dir, preserve_through_fd, ChainTrust, CopyConfig, CopyRun,
+    DerefMode, Destination, InodeMap, MadeDirs, MadeTrust, MoveSource, OperandTrust,
 };
 
 // mv

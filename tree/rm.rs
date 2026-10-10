@@ -9,20 +9,20 @@
 
 mod common;
 
-use self::common::{error_string, exit_after_verbose, report_verbose};
+use self::common::{error_string, exit_after_verbose, quote_bytes, report_verbose};
 use clap::Parser;
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
 use std::{
-    cell::Cell,
-    ffi::{CStr, CString},
+    cell::{Cell, RefCell},
+    ffi::{CStr, CString, OsString},
     fs,
     io::{self, IsTerminal},
     os::{
         fd::AsRawFd,
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 /// rm - remove directory entries
@@ -44,13 +44,9 @@ struct Args {
     #[arg(short, long, help = gettext("Write the name of each removed file to standard output"))]
     verbose: bool,
 
-    #[arg(value_parser = parse_pathbuf, help = gettext("Filepaths to remove"))]
-    files: Vec<PathBuf>,
-}
-
-// Parser for `PathBuf` that allows empty strings
-fn parse_pathbuf(s: &str) -> Result<PathBuf, String> {
-    Ok(PathBuf::from(s))
+    // Any bytes but NUL, the empty string included.
+    #[arg(value_parser = clap::builder::ValueParser::os_string(), help = gettext("Filepaths to remove"))]
+    files: Vec<OsString>,
 }
 
 struct RmConfig {
@@ -71,13 +67,24 @@ fn prompt_user(prompt: &str) -> bool {
     plib::locale::is_affirmative(response.trim_end_matches(['\r', '\n']))
 }
 
-// Simplifies trailing slashes
-fn display_cleaned(filepath: &Path) -> String {
-    let mut s = format!("{}", filepath.display());
-    while s.ends_with("//") {
-        s.pop();
+/// `filepath`'s bytes with any run of trailing slashes reduced to one.
+fn cleaned_bytes(filepath: &Path) -> &[u8] {
+    let mut name = filepath.as_os_str().as_bytes();
+    while name.ends_with(b"//") {
+        name = &name[..name.len() - 1];
     }
-    s
+    name
+}
+
+/// `filepath` as diagnostics, prompts and `-v` show it: trailing slashes reduced to one, and
+/// quoted as cp and mv quote names, so that every byte of it comes out unambiguous.
+fn display_cleaned(filepath: &Path) -> String {
+    quote_bytes(cleaned_bytes(filepath))
+}
+
+/// The path of a walked entry, shown as `display_cleaned` shows an operand.
+fn entry_shown(entry: &ftw::Entry) -> String {
+    display_cleaned(entry.path().as_inner())
 }
 
 /// Whether `e` only says that the file is not there, which with `-f` is no error and no
@@ -93,13 +100,15 @@ fn ask_for_prompt(cfg: &RmConfig, writable: bool) -> bool {
 }
 
 // With `-v`, write the name of each removed entry to standard output (format unspecified by POSIX;
-// matches the `removed '…'` / `removed directory '…'` wording of common implementations).
-fn report_removed(cfg: &RmConfig, is_dir: bool, name: &str) {
+// matches the `removed '…'` / `removed directory '…'` wording of common implementations), quoted
+// as diagnostics show names (`display_cleaned`).
+fn report_removed(cfg: &RmConfig, is_dir: bool, path: &Path) {
     if cfg.args.verbose {
+        let name = display_cleaned(path);
         let msg = if is_dir {
-            gettext!("removed directory '{}'", name)
+            gettext!("removed directory {}", name)
         } else {
-            gettext!("removed '{}'", name)
+            gettext!("removed {}", name)
         };
         report_verbose(&msg);
     }
@@ -112,7 +121,7 @@ fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
     let dot_dotdot_pattern = regex::bytes::Regex::new(r"(?:^|/)\.{1,2}/*$").unwrap();
     if dot_dotdot_pattern.is_match(filepath.as_os_str().as_bytes()) {
         let err_str = gettext!(
-            "refusing to remove '.' or '..' directory: skipping '{}'",
+            "refusing to remove '.' or '..' directory: skipping {}",
             display_cleaned(filepath)
         );
         return Err(io::Error::other(err_str));
@@ -121,7 +130,7 @@ fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
     if let Ok(abspath) = fs::canonicalize(filepath) {
         if abspath.as_os_str() == "/" {
             return Err(io::Error::other(dangerous_root_message(
-                &filepath.display().to_string(),
+                filepath.as_os_str().as_bytes(),
             )));
         }
     }
@@ -130,13 +139,13 @@ fn refuse_dot_dotdot_root(filepath: &Path) -> io::Result<()> {
 }
 
 /// The refusal of an operand that is the root directory, named as `shown`.
-fn dangerous_root_message(shown: &str) -> String {
-    if shown == "/" {
+fn dangerous_root_message(shown: &[u8]) -> String {
+    if shown == b"/" {
         gettext("it is dangerous to operate recursively on '/'")
     } else {
         gettext!(
-            "it is dangerous to operate recursively on '{}' (same as '/')",
-            shown
+            "it is dangerous to operate recursively on {} (same as '/')",
+            quote_bytes(shown)
         )
     }
 }
@@ -165,14 +174,11 @@ fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry) -> bool {
     let writable = entry.is_writable();
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
-            gettext!(
-                "descend into directory '{}'?",
-                entry.path().clean_trailing_slashes()
-            )
+            gettext!("descend into directory {}?", entry_shown(entry))
         } else {
             gettext!(
-                "descend into write-protected directory '{}'?",
-                entry.path().clean_trailing_slashes()
+                "descend into write-protected directory {}?",
+                entry_shown(entry)
             )
         };
         if !prompt_user(&prompt) {
@@ -186,15 +192,9 @@ fn should_remove_directory(cfg: &RmConfig, entry: &ftw::Entry) -> bool {
     let writable = entry.is_writable();
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
-            gettext!(
-                "remove directory '{}'?",
-                entry.path().clean_trailing_slashes()
-            )
+            gettext!("remove directory {}?", entry_shown(entry))
         } else {
-            gettext!(
-                "remove write-protected directory '{}'?",
-                entry.path().clean_trailing_slashes(),
-            )
+            gettext!("remove write-protected directory {}?", entry_shown(entry),)
         };
         if !prompt_user(&prompt) {
             return false;
@@ -220,44 +220,44 @@ where
         let file_type = metadata.file_type();
         let prompt = match file_type {
             ftw::FileType::Socket => {
-                gettext!("remove socket '{}'?", filename_fn())
+                gettext!("remove socket {}?", filename_fn())
             }
             ftw::FileType::SymbolicLink => {
-                gettext!("remove symbolic link '{}'?", filename_fn())
+                gettext!("remove symbolic link {}?", filename_fn())
             }
             ftw::FileType::BlockDevice => {
-                gettext!("remove block special file '{}'?", filename_fn())
+                gettext!("remove block special file {}?", filename_fn())
             }
             ftw::FileType::CharacterDevice => {
-                gettext!("remove character special file '{}'?", filename_fn())
+                gettext!("remove character special file {}?", filename_fn())
             }
             ftw::FileType::Fifo => {
-                gettext!("remove fifo '{}'?", filename_fn())
+                gettext!("remove fifo {}?", filename_fn())
             }
             ftw::FileType::RegularFile => {
                 let is_empty = metadata.size() == 0;
                 if writable {
                     if is_empty {
-                        gettext!("remove regular empty file '{}'?", filename_fn())
+                        gettext!("remove regular empty file {}?", filename_fn())
                     } else {
-                        gettext!("remove regular file '{}'?", filename_fn())
+                        gettext!("remove regular file {}?", filename_fn())
                     }
                 } else if is_empty {
                     gettext!(
-                        "remove write-protected regular empty file '{}'?",
+                        "remove write-protected regular empty file {}?",
                         filename_fn()
                     )
                 } else {
-                    gettext!("remove write-protected regular file '{}'?", filename_fn())
+                    gettext!("remove write-protected regular file {}?", filename_fn())
                 }
             }
             // Directories are handled by the caller before reaching here; fall back to a generic
             // prompt rather than panicking if that ever changes.
             ftw::FileType::Directory => {
-                gettext!("remove directory '{}'?", filename_fn())
+                gettext!("remove directory {}?", filename_fn())
             }
             ftw::FileType::Unknown => {
-                gettext!("remove '{}'?", filename_fn())
+                gettext!("remove {}?", filename_fn())
             }
         };
 
@@ -272,7 +272,10 @@ where
 enum DirAction {
     Removed,
     Entered,
-    Skipped,
+    /// Kept: its prompt was declined.
+    Declined,
+    /// Removed meanwhile by someone else, which with `-f` is no error.
+    Gone,
 }
 
 /// Directly remove a directory or enter it.
@@ -284,35 +287,35 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
         if should_remove_directory(cfg, entry) {
             if let Err(e2) = entry.unlink(libc::AT_REMOVEDIR) {
                 if is_already_gone(cfg, &e2) {
-                    return Ok(DirAction::Skipped);
+                    return Ok(DirAction::Gone);
                 }
                 let err_str = if let Err(e1) = dir_is_empty {
                     gettext!(
-                        "cannot remove '{}': {}",
-                        entry.path().clean_trailing_slashes(),
+                        "cannot remove {}: {}",
+                        entry_shown(entry),
                         error_string(&e1)
                     )
                 } else {
                     gettext!(
-                        "cannot remove directory '{}': {}",
-                        entry.path().clean_trailing_slashes(),
+                        "cannot remove directory {}: {}",
+                        entry_shown(entry),
                         error_string(&e2)
                     )
                 };
                 Err(io::Error::other(err_str))
             } else {
-                report_removed(cfg, true, &entry.path().clean_trailing_slashes());
+                report_removed(cfg, true, entry.path().as_inner());
                 Ok(DirAction::Removed)
             }
         } else {
-            Ok(DirAction::Skipped)
+            Ok(DirAction::Declined)
         }
 
     // Else, manually traverse the directory to remove the contents one-by-one
     } else if descend_into_directory(cfg, entry) {
         Ok(DirAction::Entered)
     } else {
-        Ok(DirAction::Skipped)
+        Ok(DirAction::Declined)
     }
 }
 
@@ -324,7 +327,7 @@ fn process_directory(cfg: &RmConfig, entry: &ftw::Entry) -> io::Result<DirAction
 fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     if !cfg.args.recurse {
         let err_str = gettext!(
-            "cannot remove '{}': Is a directory",
+            "cannot remove {}: Is a directory",
             display_cleaned(filepath)
         );
         return Err(io::Error::other(err_str));
@@ -337,7 +340,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     // the removal is refused rather than walked unguarded.
     if cfg.root_identity.is_none() {
         let err_str = gettext!(
-            "cannot remove '{}': the root directory could not be identified",
+            "cannot remove {}: the root directory could not be identified",
             display_cleaned(filepath)
         );
         return Err(io::Error::other(err_str));
@@ -346,19 +349,33 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     // Set by every diagnostic. The walk's own result cannot stand for the exit status: it also
     // counts the errors `is_already_gone` excuses.
     let had_error = Cell::new(false);
+    let left = LeftBehind::default();
+    let failed = || {
+        had_error.set(true);
+        left.leave();
+    };
     traverse_directory(
         filepath,
-        |entry| {
-            let result = remove_walked(cfg, &entry);
-            if result.is_err() {
-                had_error.set(true);
+        |entry| match remove_walked(cfg, &entry) {
+            Ok(Walked::Entered) => {
+                left.enter();
+                Ok(true)
             }
-            result
+            Ok(Walked::Done) => Ok(false),
+            Ok(Walked::Declined) => {
+                left.leave();
+                Ok(false)
+            }
+            Err(()) => {
+                failed();
+                Err(())
+            }
         },
         |entry, exit| {
-            let result = remove_left_directory(cfg, &entry, exit);
+            let holds_left = left.exit();
+            let result = remove_left_directory(cfg, &entry, exit, holds_left);
             if result.is_err() {
-                had_error.set(true);
+                failed();
             }
             result
         },
@@ -368,7 +385,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             if is_already_gone(cfg, &error) {
                 return;
             }
-            had_error.set(true);
+            failed();
             report_walk_error(&entry, kind, &error);
         },
         ftw::TraverseDirectoryOpts::default(),
@@ -377,9 +394,50 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     Ok(!had_error.get())
 }
 
+/// What a recursive removal has left behind, which keeps the directories holding it.
+///
+/// As GNU rm does, an entry counts once it has been reported, or kept at a directory's first
+/// prompt (a declined descent, or a declined removal of an empty directory): a directory holding
+/// one is neither prompted for nor reported again. A declined file, or a declined removal of a
+/// directory already emptied, does not count: its directory is still prompted for, and rmdir's
+/// "Directory not empty" is reported.
+#[derive(Default)]
+struct LeftBehind {
+    /// Entries left behind so far.
+    count: Cell<usize>,
+    /// `count` when each directory being walked was entered.
+    on_entry: RefCell<Vec<usize>>,
+}
+
+impl LeftBehind {
+    fn leave(&self) {
+        self.count.set(self.count.get() + 1);
+    }
+
+    fn enter(&self) {
+        self.on_entry.borrow_mut().push(self.count.get());
+    }
+
+    /// Leave the directory being walked: whether anything was left behind under it.
+    fn exit(&self) -> bool {
+        let on_entry = self.on_entry.borrow_mut().pop().unwrap_or(0);
+        self.count.get() > on_entry
+    }
+}
+
+/// What `remove_walked` did with an entry.
+enum Walked {
+    /// A directory with contents, entered to remove them.
+    Entered,
+    /// Removed, kept at a file's prompt, or gone meanwhile (with `-f`).
+    Done,
+    /// A directory kept at its first prompt.
+    Declined,
+}
+
 /// The walk's `file_handler` for `rm_directory`: remove `entry`, or enter it if it is a
 /// directory with contents. `Err` means a diagnostic was written.
-fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<bool, ()> {
+fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<Walked, ()> {
     let md = entry.metadata().unwrap();
 
     if md.file_type() == ftw::FileType::Directory {
@@ -391,22 +449,23 @@ fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<bool, ()> {
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot remove '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot remove {}: {}",
+                    entry_shown(entry),
                     error_string(&io::Error::from_raw_os_error(libc::ENOTDIR))
                 )
             );
             return Err(());
         }
         if is_root_directory(cfg, md) {
-            let shown = entry.path().clean_trailing_slashes();
-            eprintln!("rm: {}", dangerous_root_message(&shown));
+            let path = entry.path();
+            eprintln!("rm: {}", dangerous_root_message(cleaned_bytes(&path)));
             return Err(());
         }
         match process_directory(cfg, entry) {
             Ok(dir_action) => match dir_action {
-                DirAction::Entered => Ok(true),
-                DirAction::Removed | DirAction::Skipped => Ok(false),
+                DirAction::Entered => Ok(Walked::Entered),
+                DirAction::Declined => Ok(Walked::Declined),
+                DirAction::Removed | DirAction::Gone => Ok(Walked::Done),
             },
             Err(e) => {
                 eprintln!("rm: {}", error_string(&e));
@@ -414,44 +473,54 @@ fn remove_walked(cfg: &RmConfig, entry: &ftw::Entry) -> Result<bool, ()> {
             }
         }
     } else {
-        if let Err(e) = remove_nondir_at(cfg, entry.dir_fd(), entry.file_name(), md, || {
-            entry.path().clean_trailing_slashes()
-        }) {
+        if let Err(e) = remove_nondir_at(cfg, entry.dir_fd(), entry.file_name(), md, &entry.path())
+        {
             eprintln!("rm: {}", error_string(&e));
             return Err(());
         }
-        Ok(true)
+        Ok(Walked::Done)
     }
 }
 
 /// The walk's `postprocess_dir` for `rm_directory`: remove the directory `entry` once its
-/// contents are gone. `Err` means a diagnostic was written.
-fn remove_left_directory(cfg: &RmConfig, entry: &ftw::Entry, exit: ftw::DirExit) -> Result<(), ()> {
-    // A directory the traversal could not descend into still has its contents, so
-    // prompting for it and attempting the removal would only produce a second diagnostic
-    // on top of the one already reported.
-    if exit == ftw::DirExit::NotDescended {
+/// contents are gone, unless it holds something left behind (`holds_left`, see `LeftBehind`).
+/// `Err` means a diagnostic was written.
+fn remove_left_directory(
+    cfg: &RmConfig,
+    entry: &ftw::Entry,
+    exit: ftw::DirExit,
+    holds_left: bool,
+) -> Result<(), ()> {
+    // A directory the traversal could not descend into still has its contents, and one holding
+    // an entry already reported or kept stays for it: prompting for either and attempting the
+    // removal would only add a `Directory not empty` on top of what was already said.
+    if exit == ftw::DirExit::NotDescended || holds_left {
         return Ok(());
     }
 
     if should_remove_directory(cfg, entry) {
         // Remove the directory
         if let Err(e) = entry.unlink(libc::AT_REMOVEDIR) {
-            // `ENOTEMPTY` means one or more subdirectories were not
-            // removed. Do not flood the output by recursively
-            // printing `Directory not empty` errors. With -f a directory
-            // someone else removed meanwhile is no error either.
-            if e.raw_os_error() != Some(libc::ENOTEMPTY) && !is_already_gone(cfg, &e) {
-                let err_str = gettext!(
-                    "cannot remove directory '{}': {}",
-                    entry.path().clean_trailing_slashes(),
-                    error_string(&e)
-                );
-                eprintln!("rm: {}", err_str);
-                return Err(());
+            // With -f a directory someone else removed meanwhile is no error.
+            if is_already_gone(cfg, &e) {
+                return Ok(());
             }
+            // Not empty: an entry the removal did not know of appeared in it meanwhile, or
+            // one was kept at its prompt.
+            let not_empty = matches!(e.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST));
+            let err_str = if not_empty {
+                gettext!("cannot remove {}: {}", entry_shown(entry), error_string(&e))
+            } else {
+                gettext!(
+                    "cannot remove directory {}: {}",
+                    entry_shown(entry),
+                    error_string(&e)
+                )
+            };
+            eprintln!("rm: {}", err_str);
+            return Err(());
         } else {
-            report_removed(cfg, true, &entry.path().clean_trailing_slashes());
+            report_removed(cfg, true, entry.path().as_inner());
         }
     }
 
@@ -465,8 +534,8 @@ fn report_walk_error(entry: &ftw::Entry, kind: ftw::ErrorKind, error: &io::Error
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot access directory '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot access directory {}: {}",
+                    entry_shown(entry),
                     error_string(error)
                 )
             );
@@ -474,18 +543,15 @@ fn report_walk_error(entry: &ftw::Entry, kind: ftw::ErrorKind, error: &io::Error
         ftw::ErrorKind::ReadDir => {
             eprintln!(
                 "rm: {}",
-                gettext!(
-                    "error accessing directory entry: {}",
-                    entry.path().clean_trailing_slashes(),
-                )
+                gettext!("error accessing directory entry: {}", entry_shown(entry),)
             );
         }
         ftw::ErrorKind::Stat | ftw::ErrorKind::Cycle => {
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot remove '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot remove {}: {}",
+                    entry_shown(entry),
                     error_string(error)
                 )
             );
@@ -494,8 +560,8 @@ fn report_walk_error(entry: &ftw::Entry, kind: ftw::ErrorKind, error: &io::Error
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot remove '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot remove {}: {}",
+                    entry_shown(entry),
                     error_string(error)
                 )
             );
@@ -505,8 +571,8 @@ fn report_walk_error(entry: &ftw::Entry, kind: ftw::ErrorKind, error: &io::Error
             eprintln!(
                 "rm: {}",
                 gettext!(
-                    "cannot read symbolic link '{}': {}",
-                    entry.path().clean_trailing_slashes(),
+                    "cannot read symbolic link {}: {}",
+                    entry_shown(entry),
                     error_string(error)
                 )
             );
@@ -562,26 +628,24 @@ fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
         parent_fd.as_raw_fd(),
         &basename_cstr,
         &metadata,
-        || display_cleaned(filepath),
+        filepath,
     )?;
     Ok(true)
 }
 
 /// Removes the non-directory `file_name` in the directory open on `dirfd`, which `metadata`
-/// describes, after prompting as the options require; `shown` names it in messages.
+/// describes, after prompting as the options require; `path` names it in messages.
 ///
 /// Declining the prompt is not an error. The returned error carries the full diagnostic.
-fn remove_nondir_at<F>(
+fn remove_nondir_at(
     cfg: &RmConfig,
     dirfd: libc::c_int,
     file_name: &CStr,
     metadata: &ftw::Metadata,
-    shown: F,
-) -> io::Result<()>
-where
-    F: Fn() -> String,
-{
-    if !should_remove_file(cfg, dirfd, file_name, metadata, &shown) {
+    path: &Path,
+) -> io::Result<()> {
+    let shown = || display_cleaned(path);
+    if !should_remove_file(cfg, dirfd, file_name, metadata, shown) {
         return Ok(());
     }
     let ret = unsafe { libc::unlinkat(dirfd, file_name.as_ptr(), 0) };
@@ -590,10 +654,10 @@ where
         if is_already_gone(cfg, &e) {
             return Ok(());
         }
-        let err_str = gettext!("cannot remove '{}': {}", shown(), error_string(&e));
+        let err_str = gettext!("cannot remove {}: {}", shown(), error_string(&e));
         return Err(io::Error::other(err_str));
     }
-    report_removed(cfg, false, &shown());
+    report_removed(cfg, false, path);
     Ok(())
 }
 
@@ -610,10 +674,10 @@ fn rm_dir_empty(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     let writable = ftw::is_writable_at(libc::AT_FDCWD, &filename_cstr);
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
-            gettext!("remove directory '{}'?", display_cleaned(filepath))
+            gettext!("remove directory {}?", display_cleaned(filepath))
         } else {
             gettext!(
-                "remove write-protected directory '{}'?",
+                "remove write-protected directory {}?",
                 display_cleaned(filepath)
             )
         };
@@ -623,11 +687,11 @@ fn rm_dir_empty(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     }
 
     match fs::remove_dir(filepath) {
-        Ok(()) => report_removed(cfg, true, &display_cleaned(filepath)),
+        Ok(()) => report_removed(cfg, true, filepath),
         Err(e) if is_already_gone(cfg, &e) => (),
         Err(e) => {
             let err_str = gettext!(
-                "cannot remove '{}': {}",
+                "cannot remove {}: {}",
                 display_cleaned(filepath),
                 error_string(&e)
             );
@@ -647,7 +711,7 @@ fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                 return Ok(true);
             } else {
                 let err_str = gettext!(
-                    "cannot remove '{}': {}",
+                    "cannot remove {}: {}",
                     display_cleaned(filepath),
                     error_string(&e)
                 );
@@ -695,7 +759,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for filepath in &cfg.args.files {
-        match rm_path(&cfg, filepath) {
+        match rm_path(&cfg, Path::new(filepath)) {
             Ok(success) => {
                 if !success {
                     exit_code = 1;
@@ -818,7 +882,7 @@ mod tests {
         let md = ftw::Metadata::new(dir_fd.as_raw_fd(), c"x.o", false).unwrap();
         fs::remove_file(tmp.path().join("x.o")).unwrap();
 
-        let shown = || String::from("x.o");
+        let shown = Path::new("x.o");
         assert!(remove_nondir_at(&config("-f"), dir_fd.as_raw_fd(), c"x.o", &md, shown).is_ok());
         let err = remove_nondir_at(&config("-v"), dir_fd.as_raw_fd(), c"x.o", &md, shown)
             .unwrap_err()

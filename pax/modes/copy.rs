@@ -17,15 +17,17 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    attrs_withheld, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
-    restore_atime, restore_dir_atime, set_attrs_fd, set_made_node_attrs, stat_at, AttrPolicy,
-    Attrs, DirAttrs, DirTree, MemberPath, PendingDirs,
+    attrs_withheld, create_replacing, file_id, link_replacing_with, make_dir_at, restore_atime,
+    restore_dir_atime, set_attrs_fd, set_made_node_attrs, AttrPolicy, Attrs, DirAttrs, DirTree,
+    Expected, MemberPath, PendingDirs,
 };
 use crate::modes::followed_link;
+use crate::modes::pins::{MadeFile, PinBudget};
 use crate::modes::write::FileNames;
 use crate::subst::{substitute_name, Substitution};
+use plib::madefs::lstat_at;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -100,13 +102,15 @@ pub fn copy_files(
     // copy as an archive round-trip, so the destination gets the same treatment
     // extraction gives it: each component of a member name is opened with
     // O_NOFOLLOW, and the leaf is created fresh rather than written through.
-    let tree = DirTree::open_path(dest_dir)?;
+    let preserving = options.preserve_perms || options.preserve_owner;
+    let tree = DirTree::open_dest(dest_dir, preserving)?;
 
     let walk = CopyWalk {
         tree: &tree,
         options,
-        link_tracker: RefCell::new(HardLinkTracker::new()),
+        link_tracker: RefCell::new(CopiedLinks::new()),
         dest_ids: RefCell::new(HashSet::new()),
+        made_files: RefCell::new(HashMap::new()),
         prompter: RefCell::new(if options.interactive {
             Some(InteractivePrompter::new()?)
         } else {
@@ -117,7 +121,7 @@ pub fn copy_files(
         dev_stack: RefCell::new(Vec::new()),
         fatal: RefCell::new(None),
     };
-    if let Some(st) = stat_at(tree.root(), c".") {
+    if let Ok(st) = lstat_at(tree.root().as_raw_fd(), c".") {
         walk.dest_ids.borrow_mut().insert(file_id(&st));
     }
 
@@ -167,6 +171,49 @@ impl CopyWalk<'_> {
     }
 }
 
+/// The first copy of each multiply-linked file: the member path it was made
+/// at, and the copy made there (`MadeFile`, pinned within the budget).
+struct CopiedLinks {
+    names: HardLinkTracker<(PathBuf, MadeFile)>,
+    pins: PinBudget<(u64, u64)>,
+}
+
+impl CopiedLinks {
+    fn new() -> Self {
+        CopiedLinks {
+            names: HardLinkTracker::new(),
+            pins: PinBudget::new(),
+        }
+    }
+
+    /// Record the first copy of the source file `(dev, ino)`, `made` at
+    /// `member`, within the budget of pins. Nothing is recorded where -k
+    /// kept a file already at the name (`made` is `None`) -- found there
+    /// before the copy, or at the moment it was made: its later names are
+    /// then copied themselves, not linked to that file.
+    fn record(
+        &mut self,
+        (dev, ino): (u64, u64),
+        nlink: u32,
+        member: &Path,
+        made: Option<MadeFile>,
+    ) {
+        // A file with one name has no later name to be linked to it.
+        let Some(made) = made.filter(|_| nlink > 1) else {
+            return;
+        };
+        let pinned = made.is_pinned();
+        self.names
+            .record(dev, ino, nlink, (member.to_path_buf(), made));
+        let names = &mut self.names;
+        self.pins.note((dev, ino), pinned, |key| {
+            if let Some((_, made)) = names.by_key_mut(*key) {
+                made.unpin();
+            }
+        });
+    }
+}
+
 /// State the three traversal callbacks share.
 ///
 /// The destination side is untouched by this: every leaf is still resolved
@@ -178,10 +225,20 @@ impl CopyWalk<'_> {
 struct CopyWalk<'a> {
     tree: &'a DirTree,
     options: &'a CopyOptions,
-    link_tracker: RefCell<HardLinkTracker>,
+    link_tracker: RefCell<CopiedLinks>,
     /// `(st_dev, st_ino)` of every destination directory this copy has created
-    /// or entered. A source directory found in here is one being copied *into*.
+    /// or entered, and of every directory that maps onto itself. A source
+    /// directory found in here is one being copied *into* -- unless this copy
+    /// made it (`DirTree::made_by_run`).
     dest_ids: RefCell<HashSet<(u64, u64)>>,
+    /// The names of the files this copy has made under -s or -i, by the
+    /// `(st_dev, st_ino)` of the directory they were made in. -s and -i can
+    /// put a file inside a directory the walk has still to read -- the very
+    /// one being read, when that maps onto itself -- and the walk then meets
+    /// the copy's own output, which is not copied again. A name, not the
+    /// file's identity: under -l the file made is the source itself, linked,
+    /// and another name the source already had is still to be copied.
+    made_files: RefCell<HashMap<(u64, u64), HashSet<CString>>>,
     prompter: RefCell<Option<InteractivePrompter>>,
     /// Destination directories still to take their source attributes, which
     /// wait until everything -- not only the walk below them, but any later
@@ -267,12 +324,20 @@ impl CopyWalk<'_> {
         // into itself until the pathname runs out of room; identity cannot be
         // spelled two ways, where a path comparison could be defeated by any
         // other spelling.
-        if metadata.is_dir()
-            && self
-                .dest_ids
-                .borrow()
-                .contains(&(metadata.dev(), metadata.ino()))
-        {
+        //
+        // A source this copy made is its own output, met again by a walk that
+        // is still reading the directory -s or -i put it in: a file
+        // (`made_here`), or a directory, made for a member or only to hold
+        // members below it. Walked, such a directory is copied again under
+        // the same substitution, one level deeper each time, without end.
+        if self.made_here(entry, metadata) {
+            return Ok(false);
+        }
+        let id = (metadata.dev(), metadata.ino());
+        if metadata.is_dir() && self.tree.made_by_run(id) {
+            return Ok(false);
+        }
+        if metadata.is_dir() && self.dest_ids.borrow().contains(&id) {
             // The path is not repeated in the message: `visit` reports this
             // against `src`, byte-accurately, as the diagnostic's subject.
             // Interpolating `src.display()` here both duplicated it and
@@ -327,7 +392,7 @@ impl CopyWalk<'_> {
         let pfd = parent.as_fd();
         let name = mp.leaf.as_c_str();
 
-        let existing = stat_at(pfd, name);
+        let existing = lstat_at(pfd.as_raw_fd(), name).ok();
         if self.options.no_clobber && existing.is_some() {
             return Ok(false);
         }
@@ -365,9 +430,44 @@ impl CopyWalk<'_> {
             )?;
         } else if let Err(e) = copy_special_file(pfd, name, metadata, self.options) {
             crate::error::report_error(src, e);
+            return Ok(false);
         }
+        self.record_made_file(pfd, name);
 
         Ok(false)
+    }
+
+    /// Under -s or -i, record `name` in `dirfd` as a file this copy made
+    /// (`made_files`). Only a renamed member can land in a directory the walk
+    /// has still to read; without -s or -i every member lands at its source's
+    /// own name below the destination, which the walk never enters
+    /// (`dest_ids`).
+    fn record_made_file(&self, dirfd: BorrowedFd<'_>, name: &CStr) {
+        if self.options.substitutions.is_empty() && !self.options.interactive {
+            return;
+        }
+        if let Ok(dir) = lstat_at(dirfd.as_raw_fd(), c".") {
+            self.made_files
+                .borrow_mut()
+                .entry(file_id(&dir))
+                .or_default()
+                .insert(name.to_owned());
+        }
+    }
+
+    /// Whether the non-directory `entry` is a file this copy made, at the name
+    /// and in the directory the walk found it.
+    fn made_here(&self, entry: &ftw::Entry<'_>, metadata: &ftw::Metadata) -> bool {
+        let made = self.made_files.borrow();
+        if made.is_empty() || metadata.is_dir() {
+            return false;
+        }
+        // SAFETY: the walk keeps the entry's directory open while it is visited.
+        let dir = unsafe { BorrowedFd::borrow_raw(entry.dir_fd()) };
+        lstat_at(dir.as_raw_fd(), c".")
+            .ok()
+            .and_then(|st| made.get(&file_id(&st)))
+            .is_some_and(|names| names.contains(entry.file_name()))
     }
 
     /// Create the destination directory and arrange for its attributes to be
@@ -400,7 +500,7 @@ impl CopyWalk<'_> {
             return self.descend(member, metadata);
         };
         let parent = self.tree.parent_of(&mp, true)?;
-        let existing = stat_at(parent.as_fd(), &mp.leaf);
+        let existing = lstat_at(parent.as_raw_fd(), &mp.leaf).ok();
         if existing.is_some_and(|st| is_source(&st, entry, metadata)) {
             return self.dir_onto_itself(src, member, metadata);
         }
@@ -423,8 +523,7 @@ impl CopyWalk<'_> {
             DirAttrs::Keep => existing.map(|st| file_id(&st)),
         };
         let dir = self.tree.open_dir(parent.as_fd(), &mp.leaf, false)?;
-        let dest_st = stat_at(dir.as_fd(), c".")
-            .ok_or_else(|| PaxError::Io(std::io::Error::last_os_error()))?;
+        let dest_st = lstat_at(dir.as_raw_fd(), c".").map_err(PaxError::Io)?;
         if expected.is_some_and(|id| id != file_id(&dest_st)) {
             return Err(PaxError::Io(std::io::Error::other(
                 "directory was replaced after it was checked",
@@ -465,6 +564,10 @@ impl CopyWalk<'_> {
         if self.options.substitutions.is_empty() && !self.options.interactive {
             return overwrites_itself(src);
         }
+        // It is a destination, and is being read while it is written to.
+        self.dest_ids
+            .borrow_mut()
+            .insert((metadata.dev(), metadata.ino()));
         self.print_verbose(src);
         self.descend(member, metadata)
     }
@@ -560,9 +663,16 @@ fn is_source(st: &libc::stat, entry: &ftw::Entry<'_>, metadata: &ftw::Metadata) 
     if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK || !followed_link(entry, metadata) {
         return false;
     }
-    // SAFETY: the walk keeps the entry's directory open while it is visited.
-    let dir = unsafe { BorrowedFd::borrow_raw(entry.dir_fd()) };
-    stat_at(dir, entry.file_name()).is_some_and(|link| file_id(&link) == id)
+    // The link the walk examined, by the identity it saw.
+    entry.symlink_id() == Some(id)
+}
+
+/// The failure for a followed symbolic link the walk gave no identity for --
+/// which it gives every link it reports (`ftw::Entry::symlink_id`).
+fn link_not_identified() -> PaxError {
+    PaxError::Io(std::io::Error::other(
+        "symbolic link not identified by the walk",
+    ))
 }
 
 /// Diagnose copying a file to its own name, as BSD pax words it, and skip it.
@@ -677,7 +787,7 @@ fn copy_file(
     name: &CStr,
     member: &Path,
     options: &CopyOptions,
-    link_tracker: &mut HardLinkTracker,
+    link_tracker: &mut CopiedLinks,
     metadata: &ftw::Metadata,
 ) -> PaxResult<()> {
     let src_path = entry.path();
@@ -690,17 +800,14 @@ fn copy_file(
         // `pax -rwl tree .` names every file as its own destination. Under
         // -H/-L the walk followed a symbolic link here, and the link made is
         // to the file it refers to, as POSIX requires of -l.
-        #[cfg(test)]
-        crate::modes::race_hook::reached(
-            crate::modes::race_hook::Point::Linking,
-            entry.dir_fd(),
-            entry.file_name(),
-        );
+        let follow = followed_link(entry, metadata)
+            .then(|| entry.symlink_id().ok_or_else(link_not_identified))
+            .transpose()?;
         let linked = link_replacing_with(
             entry.dir_fd(),
             entry.file_name(),
-            followed_link(entry, metadata),
-            Some((metadata.dev(), metadata.ino())),
+            follow,
+            Some(Expected::id((metadata.dev(), metadata.ino()))),
             dirfd,
             name,
             options.no_clobber,
@@ -729,44 +836,54 @@ fn copy_file(
     // `linkat`, which resolves an absolute path from the root of the filesystem
     // and ignores the anchor descriptor entirely.
     let (dev, ino, nlink) = (metadata.dev(), metadata.ino(), metadata.nlink() as u32);
-    if let Some(link_target) = link_tracker.lookup(dev, ino, nlink) {
-        let Some(target) = MemberPath::parse(&link_target)? else {
-            return do_copy_file(entry, dirfd, name, metadata, options);
+    if let Some((link_target, copy)) = link_tracker.names.lookup_mut(dev, ino, nlink) {
+        let Some(target) = MemberPath::parse(link_target)? else {
+            return do_copy_file(entry, dirfd, name, metadata, options, false).map(|_| ());
         };
         let target_dir = tree.parent_of(&target, false)?;
         // Resolved one component at a time from the destination anchor, the
         // same way the file itself was created. A name that already is that
         // copy -- this very name visited again, from the list and from the
         // walk -- is left alone rather than unlinked out from under itself.
-        link_replacing(
+        // The link is to the copy made, pinned: someone who can write the
+        // copy's directory can have put another file at its name since.
+        link_replacing_with(
             target_dir.as_raw_fd(),
             &target.leaf,
+            None,
+            Some(copy.expected()),
             dirfd,
             name,
             options.no_clobber,
         )?;
+        // Linking a name changed its ctime.
+        copy.linked(dirfd, name);
         return Ok(());
     }
 
-    do_copy_file(entry, dirfd, name, metadata, options)?;
+    let copy = do_copy_file(entry, dirfd, name, metadata, options, nlink > 1)?;
     // Only a copy that exists can be linked to by the file's later names.
-    link_tracker.record(dev, ino, nlink, member);
+    link_tracker.record((dev, ino), nlink, member, copy);
     Ok(())
 }
 
 /// Whether `name` in `dirfd` is the file `metadata` describes.
 fn is_file_at(dirfd: BorrowedFd<'_>, name: &CStr, metadata: &ftw::Metadata) -> bool {
-    stat_at(dirfd, name).is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino()))
+    lstat_at(dirfd.as_raw_fd(), name)
+        .ok()
+        .is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino()))
 }
 
-/// Actually copy file contents
+/// Actually copy file contents, returning the copy made, known from its
+/// descriptor (`MadeFile`); `None` where -k kept a file already at the name.
 fn do_copy_file(
     entry: &ftw::Entry<'_>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     metadata: &ftw::Metadata,
     options: &CopyOptions,
-) -> PaxResult<()> {
+    pin: bool,
+) -> PaxResult<Option<MadeFile>> {
     // From the descriptor of the directory the walk found it in, and re-checked
     // against the (dev, ino) the walk saw, rather than re-resolving the whole
     // source path. Whether the walk dereferenced this entry is observable from
@@ -803,7 +920,7 @@ fn do_copy_file(
 
     let Some(mut dest_file) = opened else {
         debug_assert!(!created);
-        return Ok(());
+        return Ok(None);
     };
 
     copy_contents(&mut src_file, &mut dest_file, metadata.size())?;
@@ -812,9 +929,11 @@ fn do_copy_file(
     }
 
     set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))?;
+    // Known once its attributes are set, which change its ctime.
+    let copy = MadeFile::of(dest_file.as_fd(), pin)?;
     // A filesystem that defers writes reports their failure on close.
     crate::blocked_io::close_file(dest_file)?;
-    Ok(())
+    Ok(Some(copy))
 }
 
 /// The largest buffer `copy_contents` reads through.
@@ -943,6 +1062,70 @@ mod tests {
     use super::*;
     use plib::tmp::TempDir;
     use std::fs;
+
+    /// A later name of a file already copied is linked to that copy, found by
+    /// the name the copy was made at. In a destination directory others can
+    /// write, someone can rename their own file over that name first, and the
+    /// later name -- in a directory only pax's user writes -- became a link
+    /// to theirs. The link is made to the copy itself, or not at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_copy_links_later_names_only_to_the_copy_made() {
+        use crate::modes::race_hook::{with_hook, Point};
+        let src = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        fs::create_dir(src.path().join("pub")).unwrap();
+        fs::create_dir(src.path().join("priv")).unwrap();
+        fs::write(src.path().join("pub/f"), "source\n").unwrap();
+        fs::hard_link(src.path().join("pub/f"), src.path().join("priv/g")).unwrap();
+        let f = src.path().join("pub/f");
+        let g = src.path().join("priv/g");
+        let copied = |path: &std::path::Path| dest.path().join(member_name(path));
+
+        let (copy_of_f, planted) = (copied(&f), dest.path().join("planted"));
+        let swap = move |point, _: libc::c_int, name: &CStr| {
+            if point == Point::Linking && name == c"f" {
+                fs::write(&planted, "planted\n").unwrap();
+                fs::rename(&planted, &copy_of_f).unwrap();
+            }
+        };
+        let options = CopyOptions::default();
+        let mut operands = [f.clone(), g.clone()].into_iter();
+        let _ = with_hook(swap, || copy_files(&mut operands, dest.path(), &options));
+        let later = fs::read_to_string(copied(&g)).unwrap_or_default();
+        assert_ne!(
+            later, "planted\n",
+            "the later name was linked to the planted file"
+        );
+    }
+
+    /// A file with one name has no later name to be linked to it: its copy is
+    /// not remembered, and takes nothing from the budget of pins.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_a_copy_with_one_name_takes_no_pin() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f");
+        fs::write(&path, "x").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let made = MadeFile::of(file.as_fd(), true).unwrap();
+        assert!(made.is_pinned());
+        let mut links = CopiedLinks::new();
+        links.record((1, 2), 1, Path::new("f"), Some(made));
+        assert_eq!(links.pins.held(), 0);
+        assert!(links.names.lookup(1, 2, 2).is_none());
+    }
+
+    /// Under -k a copy that finds its name taken at the moment it is made --
+    /// the check before it saw nothing there -- makes nothing, and its later
+    /// names are not linked to whatever holds that name: nothing is
+    /// remembered, as when -k finds the name taken beforehand.
+    #[test]
+    fn test_a_copy_kept_by_k_is_not_remembered() {
+        let mut links = CopiedLinks::new();
+        links.record((1, 2), 2, Path::new("f"), None);
+        assert!(links.names.lookup(1, 2, 2).is_none());
+    }
 
     #[test]
     fn test_copy_file() {

@@ -133,18 +133,82 @@ fn test_reextract_into_a_group_writable_destination_without_p() {
     assert_eq!(mode_of(&dest.join("d")), 0o700);
 }
 
-/// The same with -p e: group members could have created the name first.
+/// The same with -p e, the group being one others are in: they could have created the name
+/// first.
 #[test]
 fn test_reextract_into_a_group_writable_destination_with_pe() {
+    let Some(shared) = plib::testing::shared_group() else {
+        eprintln!("note: the user belongs to no group shared with others; test skipped");
+        return;
+    };
     let temp = TempDir::new().unwrap();
     let archive = archive_with_open_directory(&temp);
     let dest = dest_with_private_d(&temp, 0o775);
+    std::os::unix::fs::chown(&dest, None, Some(shared)).unwrap();
 
     let out = pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(stderr.contains(DIAGNOSTIC), "stderr: {stderr}");
     assert_eq!(mode_of(&dest.join("d")), 0o700);
+}
+
+/// Under a umask of 002 the destination is group-writable; when its group is
+/// the user's private group -- nobody else in it, nobody else's primary
+/// group -- that write permission is the user's own, and -p e gives the
+/// existing directory the member's mode, in both modes.
+#[test]
+fn test_pe_stamps_an_existing_directory_in_a_destination_of_the_users_private_group() {
+    if plib::testing::user_private_group().is_none() {
+        eprintln!("note: this host gives the user no private group; test skipped");
+        return;
+    }
+    for copy in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let archive = archive_with_open_directory(&temp);
+        let src = temp.path().join("src");
+        let dest = dest_with_private_d(&temp, 0o775);
+        let out = if copy {
+            pax(&src, &["-rw", "-p", "e", "d", dest.to_str().unwrap()])
+        } else {
+            pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()])
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "copy={copy}: stderr: {stderr}");
+        assert_eq!(mode_of(&dest.join("d")), 0o755, "copy={copy}");
+    }
+}
+
+/// An ACL entry naming another user widens the group bits of the mode to the
+/// ACL's mask: a destination of the user's private group, 0755 but for an
+/// ACL granting someone else write, shows 0775 -- and others can create
+/// entries in it. Under -p e the existing directory keeps its mode, in both
+/// modes.
+#[test]
+fn test_pe_leaves_an_existing_directory_alone_where_an_acl_lets_others_write() {
+    if plib::testing::user_private_group().is_none() {
+        eprintln!("note: this host gives the user no private group; test skipped");
+        return;
+    }
+    for copy in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let archive = archive_with_open_directory(&temp);
+        let src = temp.path().join("src");
+        let dest = dest_with_private_d(&temp, 0o755);
+        if !plib::testing::grant_named_acl(&dest) {
+            return;
+        }
+        assert_eq!(mode_of(&dest), 0o775, "the mask shows in the group bits");
+        let out = if copy {
+            pax(&src, &["-rw", "-p", "e", "d", dest.to_str().unwrap()])
+        } else {
+            pax(&dest, &["-r", "-p", "e", "-f", archive.to_str().unwrap()])
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(mode_of(&dest.join("d")), 0o700, "copy={copy}: opened up");
+        assert_eq!(out.status.code(), Some(1), "copy={copy}: stderr: {stderr}");
+        assert!(stderr.contains(DIAGNOSTIC), "copy={copy}: stderr: {stderr}");
+    }
 }
 
 /// In a destination only the user can create entries in, -p e gives an
@@ -248,7 +312,8 @@ fn test_extract_trust_holds_along_the_chain() {
     for (privs, code) in [(Some("e"), 1), (None, 0)] {
         let temp = TempDir::new().unwrap();
         let (_, archive) = deep_source(&temp);
-        let dest = dest_with_renamed_chain(&temp, 0o775);
+        // World-writable: others can write it whatever its group.
+        let dest = dest_with_renamed_chain(&temp, 0o777);
         let mut args = vec!["-r"];
         if let Some(p) = privs {
             args.extend(["-p", p]);
@@ -273,7 +338,8 @@ fn test_copy_trust_holds_along_the_chain() {
     for (privs, code) in [(Some("e"), 1), (None, 0)] {
         let temp = TempDir::new().unwrap();
         let (src, _) = deep_source(&temp);
-        let dest = dest_with_renamed_chain(&temp, 0o775);
+        // World-writable: others can write it whatever its group.
+        let dest = dest_with_renamed_chain(&temp, 0o777);
         let mut args = vec!["-rw"];
         if let Some(p) = privs {
             args.extend(["-p", p]);
@@ -310,5 +376,109 @@ fn test_a_private_chain_still_stamps_under_pe() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "copy={copy}: stderr: {stderr}");
         assert_eq!(mode_of(&dest.join("p/secret")), 0o777, "copy={copy}");
+    }
+}
+
+/// A copy-mode destination named through a symbolic link that sits in a
+/// directory others can write: whoever planted the link chose the directory
+/// it leads to, so nothing found there is trusted, and under -p e the
+/// existing directory keeps its mode. In a directory only the user can write,
+/// the link is the user's own, and the directory is stamped.
+#[test]
+fn test_copy_trusts_no_destination_reached_through_a_link_others_could_plant() {
+    // The link as the last component, or in the middle (`m -> ..`, then `dest`).
+    for dest in ["../open/l/", "../open/m/dest"] {
+        for (open_mode, code, mode) in [(0o777, 1, 0o700), (0o755, 0, 0o755)] {
+            let temp = TempDir::new().unwrap();
+            let src = source_tree(&temp);
+            let home = dest_with_private_d(&temp, 0o755);
+            let open = temp.path().join("open");
+            fs::create_dir(&open).unwrap();
+            std::os::unix::fs::symlink(&home, open.join("l")).unwrap();
+            std::os::unix::fs::symlink("..", open.join("m")).unwrap();
+            fs::set_permissions(&open, fs::Permissions::from_mode(open_mode)).unwrap();
+            let out = pax(&src, &["-rw", "-p", "e", "d", dest]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
+            let case = format!("{dest} in {open_mode:o}");
+            assert_eq!(out.status.code(), Some(code), "{case}: {stderr}");
+            assert_eq!(mode_of(&home.join("d")), mode, "{case}");
+            assert!(home.join("d/f").exists(), "{case}");
+        }
+    }
+}
+
+/// Run pax with `args` in `dir` under umask 002.
+fn pax_umask_002(dir: &Path, args: &[&str]) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pax"));
+    command.args(args).current_dir(dir).stdin(Stdio::null());
+    // SAFETY: umask is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+/// The modification time of `path`, in seconds.
+fn mtime_of(path: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).unwrap().mtime()
+}
+
+/// Set the modification time of the directory or file `path`.
+fn set_mtime(path: &Path, time: std::time::SystemTime) {
+    fs::File::open(path).unwrap().set_modified(time).unwrap();
+}
+
+/// A tree made under a umask of 002 -- every directory group-writable, of the
+/// user's private group, as Debian-style user private groups intend -- and
+/// extracted again with -p e: every directory found there is the user's alone,
+/// so each takes the member's times and mode, with no diagnostic and exit 0.
+/// Any group-writable directory on the way used to leave every directory
+/// found below it untouched, with "not applying owner, mode or times" and
+/// exit 1.
+#[test]
+fn test_pe_reextracts_a_umask_002_tree_of_the_users_private_group() {
+    if plib::testing::user_private_group().is_none() {
+        eprintln!("note: this host gives the user no private group; test skipped");
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dirs = ["t", "t/a", "t/a/b"];
+    fs::create_dir_all(src.join("t/a/b")).unwrap();
+    fs::write(src.join("t/a/b/f"), "data\n").unwrap();
+    let then = std::time::UNIX_EPOCH + std::time::Duration::from_secs(978_307_200);
+    for dir in dirs.iter().rev() {
+        fs::set_permissions(src.join(dir), fs::Permissions::from_mode(0o775)).unwrap();
+        set_mtime(&src.join(dir), then);
+    }
+    let out = pax(&src, &["-w", "-f", "../a.tar", "t"]);
+    assert!(out.status.success(), "pax -w");
+    let archive = temp.path().join("a.tar");
+    let archive = archive.to_str().unwrap();
+
+    let dest = temp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o775)).unwrap();
+    let out = pax_umask_002(&dest, &["-r", "-f", archive]);
+    assert!(out.status.success(), "first extraction");
+    let now = std::time::SystemTime::now();
+    for dir in dirs {
+        assert_eq!(mode_of(&dest.join(dir)), 0o775, "{dir}");
+        set_mtime(&dest.join(dir), now);
+    }
+
+    let out = pax_umask_002(&dest, &["-r", "-p", "e", "-f", archive]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains(DIAGNOSTIC), "stderr: {stderr}");
+    for dir in dirs {
+        assert_eq!(mtime_of(&dest.join(dir)), 978_307_200, "{dir}: times");
+        assert_eq!(mode_of(&dest.join(dir)), 0o775, "{dir}: mode");
     }
 }

@@ -30,11 +30,14 @@ pub(crate) enum Point {
     Made,
     /// A directory has just been made at `name` with `mkdirat`.
     MadeDir,
-    /// Copy mode's `-l` is about to link the source `name`, which the walk
-    /// has already examined.
+    /// A hard link is about to be made to the source `name`, which the
+    /// caller has already examined: copy mode's `-l`, a cpio link set's names.
     Linking,
     /// `-l` has just made the link `name` in the destination.
     Linked,
+    /// A link to the source, already pinned, found the destination `name`
+    /// taken.
+    LinkExists,
 }
 
 type Hook = Box<dyn FnMut(Point, libc::c_int, &CStr)>;

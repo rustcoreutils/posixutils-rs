@@ -150,6 +150,10 @@ const C_ISCHR: u32 = 0o020000;
 const C_ISFIFO: u32 = 0o010000;
 const C_ISSOCK: u32 = 0o140000;
 
+// c_mode set-ID bits
+const C_ISUID: u32 = 0o004000;
+const C_ISGID: u32 = 0o002000;
+
 // c_mode permission mask
 const C_PERM_MASK: u32 = 0o7777;
 
@@ -313,6 +317,9 @@ pub struct CpioWriter<W: Write> {
     linked_ino: u64,
     /// c_ino given to each multiply-linked file, by its (dev, ino) on disk
     link_inos: HashMap<(u64, u64), u64>,
+    /// The fields a substitute value has been stored in and reported for
+    /// (`Substituted`): each is reported once per run.
+    substituted: Vec<&'static str>,
 }
 
 impl<W: Write> CpioWriter<W> {
@@ -326,6 +333,27 @@ impl<W: Write> CpioWriter<W> {
             single_ino: 0,
             linked_ino: format.max_ino() + 1,
             link_inos: HashMap::new(),
+            substituted: Vec::new(),
+        }
+    }
+
+    /// Report the substitutes stored for `entry`, the first time each field
+    /// takes one. Reported as an error, so that the run's exit status says
+    /// the archive does not hold the file's real owner or link count.
+    fn report_substitutes(&mut self, entry: &ArchiveEntry, substitutes: &[Substituted]) {
+        for sub in substitutes {
+            if self.substituted.contains(&sub.field) {
+                continue;
+            }
+            self.substituted.push(sub.field);
+            crate::error::report_error(
+                &entry.path,
+                format!(
+                    "value {} too large for the {} field of the cpio {} format; \
+                     stored as {}, here and for every later member that needs it",
+                    sub.value, sub.field, sub.format, sub.stored
+                ),
+            );
         }
     }
 
@@ -415,13 +443,15 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
             )));
         }
 
+        let mut substitutes = Vec::new();
         let header = match self.format {
-            CpioFormat::Odc => build_odc_header(entry, ids, namesize)?,
+            CpioFormat::Odc => build_odc_header(entry, ids, namesize, &mut substitutes)?,
             CpioFormat::Newc | CpioFormat::NewcCrc => {
                 build_newc_header(entry, ids, namesize, self.format)?
             }
-            CpioFormat::Binary => build_bin_header(entry, ids, namesize)?,
+            CpioFormat::Binary => build_bin_header(entry, ids, namesize, &mut substitutes)?,
         };
+        self.report_substitutes(entry, &substitutes);
         self.writer.write_all(&header)?;
         self.writer.write_all(name)?;
         self.writer.write_all(&[0])?;
@@ -881,12 +911,17 @@ fn header_nlink(entry: &ArchiveEntry) -> u64 {
 }
 
 /// Build a cpio ODC (POSIX octet-oriented) header. `ids` is the (c_ino,
-/// c_nlink) the writer assigned.
+/// c_nlink) the writer assigned; an owner or link count too wide for its field
+/// is stored as a substitute and recorded in `substitutes` (`OwnerFields`).
 fn build_odc_header(
     entry: &ArchiveEntry,
     (ino, nlink): (u64, u64),
     namesize: usize,
+    substitutes: &mut Vec<Substituted>,
 ) -> PaxResult<Vec<u8>> {
+    // Six octal digits: 18 bits.
+    let owner = OwnerFields::fit(entry, nlink, 0o777777, "odc", substitutes);
+
     let mut header = Vec::with_capacity(ODC_HEADER_SIZE);
 
     // c_magic
@@ -899,16 +934,12 @@ fn build_odc_header(
     write_octal_field_masked(&mut header, ino, 6);
 
     // c_mode (file type + permissions)
-    let mode = build_mode(entry);
-    write_octal_field(&mut header, mode as u64, 6, "c_mode")?;
+    write_octal_field(&mut header, owner.mode as u64, 6, "c_mode")?;
 
-    // c_uid and c_gid: six digits, 18 bits. A wider id is refused, not
-    // masked onto some other owner.
-    write_octal_field(&mut header, entry.uid as u64, 6, "c_uid")?;
-    write_octal_field(&mut header, entry.gid as u64, 6, "c_gid")?;
-
-    // c_nlink
-    write_octal_field(&mut header, nlink, 6, "c_nlink")?;
+    // c_uid, c_gid and c_nlink, each within its field (`OwnerFields::fit`).
+    write_octal_field(&mut header, owner.uid, 6, "c_uid")?;
+    write_octal_field(&mut header, owner.gid, 6, "c_gid")?;
+    write_octal_field(&mut header, owner.nlink, 6, "c_nlink")?;
 
     // c_rdev (device major/minor for block/char devices)
     write_octal_field(&mut header, packed_rdev(entry)?, 6, "c_rdev")?;
@@ -990,7 +1021,9 @@ fn build_bin_header(
     entry: &ArchiveEntry,
     (ino, nlink): (u64, u64),
     namesize: usize,
+    substitutes: &mut Vec<Substituted>,
 ) -> PaxResult<Vec<u8>> {
+    let owner = OwnerFields::fit(entry, nlink, u16::MAX.into(), "binary", substitutes);
     let mut header = Vec::with_capacity(BIN_HEADER_SIZE);
 
     let mut push_u16 = |val: u64| header.extend_from_slice(&(val as u16).to_ne_bytes());
@@ -998,12 +1031,10 @@ fn build_bin_header(
     push_u16(BIN_MAGIC as u64);
     push_u16(entry.dev & 0xffff);
     push_u16(ino & 0xffff);
-    push_u16(build_mode(entry) as u64 & 0xffff);
-    // A wider owner or link count is refused, not masked: uid 65536 masked
-    // to 0 archived a setuid file as root's.
-    push_u16(fit_bin(entry.uid as u64, u16::MAX, "c_uid")?);
-    push_u16(fit_bin(entry.gid as u64, u16::MAX, "c_gid")?);
-    push_u16(fit_bin(nlink, u16::MAX, "c_nlink")?);
+    push_u16(owner.mode as u64 & 0xffff);
+    push_u16(owner.uid);
+    push_u16(owner.gid);
+    push_u16(owner.nlink);
     push_u16(packed_rdev(entry)?);
 
     let mtime = fit_bin(entry.unsigned_mtime()?, u32::MAX, "c_mtime")?;
@@ -1023,6 +1054,82 @@ fn build_bin_header(
     push_u16(size & 0xffff);
 
     Ok(header)
+}
+
+/// A value too large for its header field, and the substitute stored in its
+/// place.
+#[derive(Debug, PartialEq, Eq)]
+struct Substituted {
+    field: &'static str,
+    format: &'static str,
+    value: u64,
+    stored: u64,
+}
+
+/// The owner stored for a uid or gid too wide for its field: the Linux
+/// kernel's own substitute for an id that does not fit a narrow field (the
+/// default of `/proc/sys/fs/overflowuid` and `overflowgid`, which the 16-bit
+/// uid system calls, NFS and user namespaces report), "nobody" on most
+/// systems. It fits both odc and binary fields. A constant, not the host's
+/// setting, so that the archive does not depend on the host that wrote it.
+const OVERFLOW_ID: u64 = 65534;
+
+/// c_mode, c_uid, c_gid and c_nlink as a header whose fields hold at most
+/// `max` stores them.
+///
+/// The file is archived even when an owner or link count is too wide for the
+/// field. Masking the value, as GNU cpio does, would keep only its low bits,
+/// and uid 65536 masked to 16 bits archives the file as root's. The largest
+/// value that fits is no better for an owner: it is an arbitrary real id on
+/// many systems, and root extracting with `-pe` would hand the file to
+/// whoever holds it. An owner is stored as `OVERFLOW_ID` instead; a link count
+/// as `max`, which only says the file has many names. A substitute owner is
+/// not the file's owner either, so the set-user-ID or set-group-ID bit that
+/// would hand its privilege to that owner is cleared.
+struct OwnerFields {
+    mode: u32,
+    uid: u64,
+    gid: u64,
+    nlink: u64,
+}
+
+impl OwnerFields {
+    fn fit(
+        entry: &ArchiveEntry,
+        nlink: u64,
+        max: u64,
+        format: &'static str,
+        substitutes: &mut Vec<Substituted>,
+    ) -> Self {
+        let mut fit = |value: u64, field: &'static str, stored: u64| {
+            if value <= max {
+                return (value, false);
+            }
+            substitutes.push(Substituted {
+                field,
+                format,
+                value,
+                stored,
+            });
+            (stored, true)
+        };
+        let (uid, uid_substituted) = fit(entry.uid as u64, "c_uid", OVERFLOW_ID);
+        let (gid, gid_substituted) = fit(entry.gid as u64, "c_gid", OVERFLOW_ID);
+        let (nlink, _) = fit(nlink, "c_nlink", max);
+        let mut mode = build_mode(entry);
+        if uid_substituted {
+            mode &= !C_ISUID;
+        }
+        if gid_substituted {
+            mode &= !C_ISGID;
+        }
+        OwnerFields {
+            mode,
+            uid,
+            gid,
+            nlink,
+        }
+    }
 }
 
 /// A binary header value that must fit its field whole: one or two 16-bit
@@ -1273,7 +1380,7 @@ mod tests {
             ..Default::default()
         };
 
-        let header = build_bin_header(&entry, (3, 1), 6).unwrap();
+        let header = build_bin_header(&entry, (3, 1), 6, &mut Vec::new()).unwrap();
         assert_eq!(header.len(), BIN_HEADER_SIZE);
         let word = |i: usize| u16::from_ne_bytes([header[i * 2], header[i * 2 + 1]]);
         assert_eq!(word(0), BIN_MAGIC);
@@ -1292,7 +1399,7 @@ mod tests {
             size: u32::MAX as u64 + 1,
             ..entry
         };
-        assert!(build_bin_header(&too_big, (3, 1), 6).is_err());
+        assert!(build_bin_header(&too_big, (3, 1), 6, &mut Vec::new()).is_err());
     }
 
     #[test]
@@ -1391,42 +1498,96 @@ mod tests {
             ..Default::default()
         };
         for (major, minor) in [(300, 1), (1, 300)] {
-            assert!(build_odc_header(&device(major, minor), (1, 1), 4).is_err());
-            assert!(build_bin_header(&device(major, minor), (1, 1), 4).is_err());
+            assert!(build_odc_header(&device(major, minor), (1, 1), 4, &mut Vec::new()).is_err());
+            assert!(build_bin_header(&device(major, minor), (1, 1), 4, &mut Vec::new()).is_err());
         }
-        assert!(build_odc_header(&device(255, 255), (1, 1), 4).is_ok());
-        assert!(build_bin_header(&device(255, 255), (1, 1), 4).is_ok());
+        assert!(build_odc_header(&device(255, 255), (1, 1), 4, &mut Vec::new()).is_ok());
+        assert!(build_bin_header(&device(255, 255), (1, 1), 4, &mut Vec::new()).is_ok());
         // newc has a field for each, and stores them whole.
         assert!(build_newc_header(&device(300, 300), (1, 1), 4, CpioFormat::Newc).is_ok());
     }
 
-    /// An odc c_uid holds 18 bits and a binary one 16; a wider owner used to
-    /// be masked, so a setuid file of uid 262144 (odc) or 65536 (binary) was
-    /// archived as root's. It is refused, as a wide device number is. So is
-    /// a link count the binary format cannot hold, which odc already refused.
+    /// An odc c_uid holds 18 bits and a binary one 16. A wider owner, or a
+    /// link count the field cannot hold, used to drop the file; masking it
+    /// instead, as GNU cpio does, archived uid 65536 as root. An owner is
+    /// stored as the kernel's overflow id, 65534, and a link count as the
+    /// largest value that fits; the substitute is recorded for the writer to
+    /// report, and a set-ID bit for a substituted id is cleared.
     #[test]
-    fn test_wide_owner_ids_are_refused_by_odc_and_binary() {
+    fn test_wide_owner_ids_are_stored_as_the_overflow_id() {
         let owned = |uid, gid| ArchiveEntry {
             path: PathBuf::from("f"),
-            mode: 0o4755,
+            mode: 0o6755,
             entry_type: EntryType::Regular,
             uid,
             gid,
             ..Default::default()
         };
-        for (uid, gid) in [(1 << 18, 0), (0, 1 << 18)] {
-            assert!(build_odc_header(&owned(uid, gid), (1, 1), 2).is_err());
-        }
-        assert!(build_odc_header(&owned((1 << 18) - 1, (1 << 18) - 1), (1, 1), 2).is_ok());
-        for (uid, gid) in [(1 << 16, 0), (0, 1 << 16)] {
-            assert!(build_bin_header(&owned(uid, gid), (1, 1), 2).is_err());
-        }
-        assert!(build_bin_header(&owned(0xffff, 0xffff), (1, 1), 2).is_ok());
-        assert!(build_bin_header(&owned(0, 0), (1, 1 << 16), 2).is_err());
-        assert!(build_odc_header(&owned(0, 0), (1, 1 << 18), 2).is_err());
-        // newc's fields are 32 bits, as wide as a uid_t.
+        let odc_field = |h: &[u8], at: usize| {
+            u64::from_str_radix(std::str::from_utf8(&h[at..at + 6]).unwrap(), 8).unwrap()
+        };
+        // odc: c_mode at 18, c_uid at 24, c_gid at 30, c_nlink at 36.
+        let mut subs = Vec::new();
+        let h = build_odc_header(&owned(300_000, 7), (1, 1 << 18), 2, &mut subs).unwrap();
+        assert_eq!(odc_field(&h, 24), 65534);
+        assert_eq!(odc_field(&h, 30), 7);
+        assert_eq!(odc_field(&h, 36), 0o777777);
+        assert_eq!(odc_field(&h, 18) as u32, C_ISREG | 0o2755);
+        let fields: Vec<_> = subs.iter().map(|s| (s.field, s.value, s.stored)).collect();
+        assert_eq!(
+            fields,
+            [("c_uid", 300_000, 65534), ("c_nlink", 1 << 18, 0o777777)]
+        );
+
+        // An id that fits is stored as it is, with nothing recorded.
+        let mut subs = Vec::new();
+        let max = (1 << 18) - 1;
+        let h = build_odc_header(&owned(max, max), (1, 1), 2, &mut subs).unwrap();
+        assert_eq!(
+            (odc_field(&h, 24), odc_field(&h, 30)),
+            (max as u64, max as u64)
+        );
+        assert_eq!(odc_field(&h, 18) as u32, C_ISREG | 0o6755);
+        assert!(subs.is_empty());
+
+        // binary: c_mode is word 3, c_uid 4, c_gid 5, c_nlink 6.
+        let mut subs = Vec::new();
+        let h = build_bin_header(&owned(5, 1 << 16), (1, 1 << 16), 2, &mut subs).unwrap();
+        let word = |i: usize| u16::from_ne_bytes([h[i * 2], h[i * 2 + 1]]);
+        assert_eq!((word(4), word(5), word(6)), (5, 65534, u16::MAX));
+        assert_eq!(u32::from(word(3)), C_ISREG | 0o4755);
+        let fields: Vec<_> = subs.iter().map(|s| (s.field, s.format)).collect();
+        assert_eq!(fields, [("c_gid", "binary"), ("c_nlink", "binary")]);
+
+        let mut subs = Vec::new();
+        assert!(build_bin_header(&owned(0xffff, 0xffff), (1, 1), 2, &mut subs).is_ok());
+        assert!(subs.is_empty());
+
+        // newc's fields are 32 bits, as wide as a uid_t, a gid_t and the
+        // link count an entry carries: nothing needs a substitute there.
         let wide = owned(u32::MAX, u32::MAX);
-        assert!(build_newc_header(&wide, (1, 1), 2, CpioFormat::Newc).is_ok());
+        let h = build_newc_header(&wide, (1, u32::MAX.into()), 2, CpioFormat::Newc).unwrap();
+        assert_eq!(&h[6 + 16..6 + 40], b"FFFFFFFFFFFFFFFFFFFFFFFF");
+    }
+
+    /// The writer reports each field's first substitute once, as an error,
+    /// and archives every member.
+    #[test]
+    fn test_writer_reports_each_substituted_field_once() {
+        let mut out = Vec::new();
+        let mut w = CpioWriter::with_format(&mut out, CpioFormat::Odc);
+        for (name, uid) in [("a", 300_000), ("b", 300_001), ("c", 0)] {
+            let mut e = ArchiveEntry::new(PathBuf::from(name), EntryType::Regular);
+            e.uid = uid;
+            w.write_entry(&e).unwrap();
+            w.finish_entry().unwrap();
+        }
+        assert_eq!(w.substituted, ["c_uid"]);
+        w.finish().unwrap();
+        let names = [&b"a\0"[..], b"b\0", b"c\0"];
+        for name in names {
+            assert!(out.windows(2).any(|win| win == name));
+        }
     }
 
     #[test]

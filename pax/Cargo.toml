@@ -35,6 +35,7 @@ ftw = { path = "../ftw" }
 
 [dev-dependencies]
 filetime = "0.2"
+plib = { path = "../plib", features = ["test-hooks"] }
 
 [[bin]]
 name = "pax"

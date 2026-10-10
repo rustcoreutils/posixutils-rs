@@ -1369,3 +1369,258 @@ fn test_rm_r_trailing_slash_symlink_to_directory() {
 
     fs::remove_dir_all(test_dir).unwrap();
 }
+
+/// Read `stderr` until what it has written ends with `prompt`.
+fn await_prompt(stderr: &mut impl io::Read, seen: &mut Vec<u8>, prompt: &str) {
+    let mut byte = [0u8];
+    while !seen.ends_with(prompt.as_bytes()) {
+        let n = stderr.read(&mut byte).unwrap();
+        assert_eq!(n, 1, "rm exited before asking {prompt:?}: {seen:?}");
+        seen.push(byte[0]);
+    }
+}
+
+/// A directory that gains an entry while `rm -r` empties it is not removed, and rm says so:
+/// rmdir's ENOTEMPTY is no error only for a directory that holds something rm already reported
+/// or was told to keep. The entry is added while rm waits for the answer to the directory's
+/// own prompt, so the order is fixed.
+#[test]
+fn test_rm_r_dir_that_gained_an_entry_is_reported() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let d = &format!("{}/d", tmp.path().display());
+    fs::create_dir(d).unwrap();
+    fs::write(format!("{d}/f"), b"f").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rm"))
+        .args(["-ri", d])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let mut seen = Vec::new();
+
+    await_prompt(
+        &mut stderr,
+        &mut seen,
+        &format!("descend into directory '{d}'? "),
+    );
+    stdin.write_all(b"y\n").unwrap();
+    await_prompt(
+        &mut stderr,
+        &mut seen,
+        &format!("remove regular file '{d}/f'? "),
+    );
+    stdin.write_all(b"y\n").unwrap();
+    await_prompt(&mut stderr, &mut seen, &format!("remove directory '{d}'? "));
+    fs::write(format!("{d}/new"), b"new").unwrap();
+    stdin.write_all(b"y\n").unwrap();
+    drop(stdin);
+
+    io::Read::read_to_end(&mut stderr, &mut seen).unwrap();
+    let status = child.wait().unwrap();
+    let seen = String::from_utf8(seen).unwrap();
+    assert!(
+        seen.ends_with(&format!("? rm: cannot remove '{d}': Directory not empty\n")),
+        "{seen:?}"
+    );
+    assert_eq!(status.code(), Some(1));
+    assert!(Path::new(&format!("{d}/new")).exists());
+}
+
+/// What `-i` was told to keep, as GNU coreutils 9.4 treats it: a declined file, or a declined
+/// removal of an emptied directory, leaves its parent not empty, which is reported; a declined
+/// descent, or a declined removal of an empty directory, keeps its ancestors without asking.
+#[test]
+fn test_rm_ri_declined_entries_and_their_parent() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let d = &format!("{}/d", tmp.path().display());
+    let s = &format!("{d}/s");
+
+    // A declined file.
+    fs::create_dir(d).unwrap();
+    fs::write(format!("{d}/f"), b"f").unwrap();
+    rm_test_with_stdin(
+        &["-ri", d],
+        "y\nn\ny\n",
+        "",
+        &format!(
+            "rm: descend into directory '{d}'? rm: remove regular file '{d}/f'? \
+             rm: remove directory '{d}'? rm: cannot remove '{d}': Directory not empty\n"
+        ),
+        1,
+    );
+    assert!(Path::new(&format!("{d}/f")).exists());
+    fs::remove_dir_all(d).unwrap();
+
+    // A declined removal of a directory, once emptied.
+    fs::create_dir_all(s).unwrap();
+    fs::write(format!("{s}/f"), b"f").unwrap();
+    rm_test_with_stdin(
+        &["-ri", d],
+        "y\ny\ny\nn\ny\n",
+        "",
+        &format!(
+            "rm: descend into directory '{d}'? rm: descend into directory '{s}'? \
+             rm: remove regular file '{s}/f'? rm: remove directory '{s}'? \
+             rm: remove directory '{d}'? rm: cannot remove '{d}': Directory not empty\n"
+        ),
+        1,
+    );
+    assert!(Path::new(s).exists());
+    fs::remove_dir_all(d).unwrap();
+
+    // A declined descent.
+    fs::create_dir_all(s).unwrap();
+    fs::write(format!("{s}/f"), b"f").unwrap();
+    rm_test_with_stdin(
+        &["-ri", d],
+        "y\nn\n",
+        "",
+        &format!("rm: descend into directory '{d}'? rm: descend into directory '{s}'? "),
+        0,
+    );
+    assert!(Path::new(&format!("{s}/f")).exists());
+    fs::remove_dir_all(d).unwrap();
+
+    // A declined removal of an empty directory.
+    fs::create_dir_all(s).unwrap();
+    rm_test_with_stdin(
+        &["-ri", d],
+        "y\nn\n",
+        "",
+        &format!("rm: descend into directory '{d}'? rm: remove directory '{s}'? "),
+        0,
+    );
+    assert!(Path::new(s).exists());
+}
+
+/// `-v` quotes each name as GNU coreutils 9.4 does (and as cp and mv do): a newline, a quote and
+/// a byte that is not a character all come out unambiguous, from names in a directory and from
+/// operands alike.
+#[test]
+fn test_rm_v_quotes_names() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path();
+    let rm_in = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_rm"))
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+        assert_eq!(output.status.code(), Some(0));
+        let mut lines: Vec<String> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        lines.sort();
+        lines
+    };
+
+    fs::create_dir(dir.join("d")).unwrap();
+    fs::File::create(dir.join("d/a\nb")).unwrap();
+    fs::File::create(dir.join("d/it's")).unwrap();
+    let non_utf8 = plib::testing::create_non_utf8(&dir.join("d"), b"x\xffy", |p| {
+        fs::File::create(p).map(drop)
+    });
+    let mut expected = vec![
+        "removed 'd/a'$'\\n''b'",
+        "removed directory 'd'",
+        "removed \"d/it's\"",
+    ];
+    if non_utf8.is_some() {
+        expected.push("removed 'd/x'$'\\377''y'");
+    }
+    expected.sort();
+    assert_eq!(rm_in(&["-rv", "d"]), expected);
+
+    fs::File::create(dir.join("a\nb")).unwrap();
+    fs::File::create(dir.join("it's")).unwrap();
+    fs::create_dir(dir.join("e\nf")).unwrap();
+    assert_eq!(
+        rm_in(&["-v", "a\nb", "it's"]),
+        ["removed \"it's\"", "removed 'a'$'\\n''b'"]
+    );
+    assert_eq!(rm_in(&["-dv", "e\nf"]), ["removed directory 'e'$'\\n''f'"]);
+}
+
+/// Operands that are not valid UTF-8 are file names like any other, and every diagnostic shows
+/// a name's bytes quoted as GNU coreutils 9.4 does, not a lossy rendering of them.
+#[test]
+fn test_rm_non_utf8_operands_and_quoted_diagnostics() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path();
+    let rm_in = |args: &[&OsStr]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_rm"))
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+            output.status.code().unwrap_or(-1),
+        )
+    };
+    let os = |s: &'static str| OsStr::new(s);
+
+    // A quote in a name is shown the way the shell would read it back.
+    assert_eq!(
+        rm_in(&[os("it's")]),
+        (
+            String::new(),
+            "rm: cannot remove \"it's\": No such file or directory\n".into(),
+            1
+        )
+    );
+
+    let Some(file) =
+        plib::testing::create_non_utf8(dir, b"x\xffy", |p| fs::File::create(p).map(drop))
+    else {
+        return;
+    };
+    let name = OsStr::from_bytes(b"x\xffy");
+    assert_eq!(
+        rm_in(&[os("-v"), name]),
+        (String::from("removed 'x'$'\\377''y'\n"), String::new(), 0)
+    );
+    assert!(!file.exists());
+    assert_eq!(
+        rm_in(&[name]),
+        (
+            String::new(),
+            "rm: cannot remove 'x'$'\\377''y': No such file or directory\n".into(),
+            1
+        )
+    );
+
+    fs::create_dir(&file).unwrap();
+    assert_eq!(
+        rm_in(&[name]),
+        (
+            String::new(),
+            "rm: cannot remove 'x'$'\\377''y': Is a directory\n".into(),
+            1
+        )
+    );
+    let dot = OsStr::from_bytes(b"x\xffy/.");
+    assert_eq!(
+        rm_in(&[os("-r"), dot]),
+        (
+            String::new(),
+            "rm: refusing to remove '.' or '..' directory: skipping 'x'$'\\377''y/.'\n".into(),
+            1
+        )
+    );
+    assert_eq!(rm_in(&[os("-d"), name]), (String::new(), String::new(), 0));
+    assert!(!file.exists());
+}

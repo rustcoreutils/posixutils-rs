@@ -91,6 +91,14 @@ impl PinnedEntry {
         &self.display_parent
     }
 
+    /// Whether the last component, trailing slashes aside, is `.` or `..` (as for `D/.`, `D/..`
+    /// or `link/./`), or the name is the root directory (`/`, pinned as `.` in it, or kept whole
+    /// when reached by pathname): a name for a directory that is not its entry in a parent, so
+    /// that nothing can be renamed or removed by it.
+    pub fn names_dot_or_dotdot(&self) -> bool {
+        names_dot_or_dotdot(self.name.to_bytes())
+    }
+
     /// `fstatat` of the entry in its pinned directory.
     pub fn metadata(&self, follow_symlinks: bool) -> io::Result<ftw::Metadata> {
         ftw::Metadata::new(self.dir_fd(), &self.name, follow_symlinks)
@@ -178,6 +186,15 @@ impl PinnedDir {
             anchor: Anchor::Held,
         })
     }
+}
+
+/// `PinnedEntry::names_dot_or_dotdot` for the name `name`.
+fn names_dot_or_dotdot(name: &[u8]) -> bool {
+    let Some(last) = name.iter().rposition(|&b| b != b'/') else {
+        return !name.is_empty();
+    };
+    let component = name[..=last].rsplit(|&b| b == b'/').next().unwrap_or(b"");
+    matches!(component, b"." | b"..")
 }
 
 /// `path` split before its last component: the part before it (`None` when there is none) and
@@ -287,7 +304,28 @@ impl CopiedSources {
 
 #[cfg(test)]
 mod tests {
-    use super::{split_last_component, Anchor, PinnedDir, PinnedDirs};
+    use super::{names_dot_or_dotdot, split_last_component, Anchor, PinnedDir, PinnedDirs};
+
+    /// `.` and `..` as the last component, and the root directory however it is spelled or
+    /// reached, name no entry in a parent; any other name does.
+    #[test]
+    fn dot_dotdot_and_root_name_no_entry() {
+        for name in [
+            ".", "..", "./", "D/.", "D/..", "D//./", "link/./", "/", "//", "/.",
+        ] {
+            assert!(names_dot_or_dotdot(name.as_bytes()), "{name:?}");
+        }
+        for name in ["", "D", "D/", "/D", ".D", "D.", "...", "D/.x"] {
+            assert!(!names_dot_or_dotdot(name.as_bytes()), "{name:?}");
+        }
+        let pinned = |p: &str| PinnedDirs::default().pin(p.as_ref()).unwrap();
+        for operand in ["/", "//"] {
+            assert!(pinned(operand).names_dot_or_dotdot(), "{operand:?}");
+        }
+        let tmp = plib::tmp::tempdir().unwrap();
+        assert!(!pinned(tmp.path().to_str().unwrap()).names_dot_or_dotdot());
+        assert!(pinned(&format!("{}/.", tmp.path().display())).names_dot_or_dotdot());
+    }
 
     /// A directory that may not be opened leaves the operand reached by its pathname, for a
     /// rename to report on as it always did, instead of failing the pin.

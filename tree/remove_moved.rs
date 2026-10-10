@@ -49,10 +49,30 @@ pub fn remove_moved_source(
     inode_map: &mut InodeMap,
     verbose: bool,
 ) -> bool {
+    // `D/.` and `D/..` are no entries of their own to remove: removing through them would empty
+    // D, or D's parent. (mv refuses to copy them; this holds whatever the caller did.)
+    if source.names_dot_or_dotdot() {
+        eprintln!(
+            "mv: {}",
+            gettext!(
+                "refusing to remove '.' or '..' directory: skipping '{}'",
+                source.path().display()
+            )
+        );
+        return false;
+    }
+
     let removal = RefCell::new(Removal::default());
 
     let file_handler = |entry: ftw::Entry<'_>| -> Result<bool, ()> {
         let mut removal = removal.borrow_mut();
+        // `link/` is walked as `.` in the directory the link points to, which no removal takes
+        // away by that name: refuse it rather than empty that directory.
+        if entry.reached_through_symlink() {
+            let enotdir = io::Error::from_raw_os_error(libc::ENOTDIR);
+            removal.leave(cannot_remove(&entry, &enotdir));
+            return Ok(false);
+        }
         let Some(md) = entry.metadata().filter(|md| copied.unchanged(md)) else {
             removal.leave(gettext!(
                 "not removing '{}': it changed during the move",
@@ -147,4 +167,63 @@ fn remove_emptied_dir(entry: &ftw::Entry<'_>, holds_reported: bool, removal: &mu
 
 fn cannot_remove(entry: &ftw::Entry<'_>, e: &io::Error) -> String {
     gettext!("cannot remove '{}': {}", entry.path(), error_string(e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_moved_source;
+    use crate::common::{CopiedSources, InodeMap, PinnedDirs, SourceState};
+    use std::fs;
+
+    /// `link/` is walked as `.` in the directory the link points to. Even with everything there
+    /// recorded as copied, the removal refuses it instead of emptying that directory.
+    #[test]
+    fn a_symlink_with_a_trailing_slash_is_not_removed_through() {
+        let tmp = plib::tmp::tempdir().unwrap();
+        let dir = tmp.path();
+        fs::create_dir(dir.join("D")).unwrap();
+        fs::write(dir.join("D/f"), b"f").unwrap();
+        std::os::unix::fs::symlink("D", dir.join("link")).unwrap();
+
+        let mut copied = CopiedSources::default();
+        for copy in ["D", "D/f"] {
+            copied.record(SourceState::of(
+                &fs::symlink_metadata(dir.join(copy)).unwrap(),
+            ));
+        }
+        let source = PinnedDirs::default().pin(&dir.join("link/")).unwrap();
+
+        let removed = remove_moved_source(&source, &copied, &mut InodeMap::new(), false);
+
+        assert!(!removed);
+        assert_eq!(fs::read(dir.join("D/f")).unwrap(), b"f");
+        assert!(fs::symlink_metadata(dir.join("link")).unwrap().is_symlink());
+    }
+
+    /// `D/.` and `D/..` name D and its parent, which are not removed by those names. Even with
+    /// everything there recorded as copied, the removal refuses them instead of emptying them.
+    #[test]
+    fn a_dot_or_dotdot_source_is_not_removed_through() {
+        let tmp = plib::tmp::tempdir().unwrap();
+        let p = tmp.path().join("P");
+        fs::create_dir_all(p.join("D")).unwrap();
+        fs::write(p.join("D/f"), b"f").unwrap();
+        fs::write(p.join("g"), b"g").unwrap();
+
+        let mut copied = CopiedSources::default();
+        for copy in ["", "D", "D/f", "g"] {
+            copied.record(SourceState::of(
+                &fs::symlink_metadata(p.join(copy)).unwrap(),
+            ));
+        }
+        for source in ["D/.", "D/..", "D/./", "D/../"] {
+            let source = PinnedDirs::default().pin(&p.join(source)).unwrap();
+
+            let removed = remove_moved_source(&source, &copied, &mut InodeMap::new(), false);
+
+            assert!(!removed);
+            assert_eq!(fs::read(p.join("D/f")).unwrap(), b"f");
+            assert_eq!(fs::read(p.join("g")).unwrap(), b"g");
+        }
+    }
 }

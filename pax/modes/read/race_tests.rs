@@ -271,25 +271,17 @@ fn unverified_intermediate_directory_is_not_stamped() {
 /// attributes -- and says so, rather than dropping them in silence.
 #[test]
 fn unverified_directory_member_is_diagnosed() {
-    use crate::archive::LinkSets;
     use crate::modes::made::MadeTrust;
     let tmp = TempDir::new().unwrap();
     let tree = DirTree::open_path(tmp.path()).unwrap();
     let mut pending = PendingDirs::default();
-    let mut link_sets = LinkSets::default();
+    let mut links = super::Links::new();
     let entry = own_member("d", EntryType::Directory, 0o751);
     let mut archive = Members(Vec::new().into_iter());
     let options = preserve_everything();
     let r = race_hook::with_dir_trust(MadeTrust::ParentOwnerOnly, || {
         let pending = &mut pending;
-        extract_entry(
-            &mut archive,
-            &entry,
-            &options,
-            &mut link_sets,
-            &tree,
-            pending,
-        )
+        extract_entry(&mut archive, &entry, &options, &mut links, &tree, pending)
     });
 
     assert!(r.is_err(), "withholding the attributes went unreported");
@@ -305,26 +297,18 @@ fn unverified_directory_member_is_diagnosed() {
 /// appended archive -- and gets no attributes then either.
 #[test]
 fn unverified_directory_named_twice_is_withheld_both_times() {
-    use crate::archive::LinkSets;
     use crate::modes::made::MadeTrust;
     let tmp = TempDir::new().unwrap();
     let tree = DirTree::open_path(tmp.path()).unwrap();
     let mut pending = PendingDirs::default();
-    let mut link_sets = LinkSets::default();
+    let mut links = super::Links::new();
     let entry = own_member("d", EntryType::Directory, 0o751);
     let mut archive = Members(Vec::new().into_iter());
     let options = preserve_everything();
     let results = race_hook::with_dir_trust(MadeTrust::ParentOwnerOnly, || {
         let mut extract = || {
             let pending = &mut pending;
-            extract_entry(
-                &mut archive,
-                &entry,
-                &options,
-                &mut link_sets,
-                &tree,
-                pending,
-            )
+            extract_entry(&mut archive, &entry, &options, &mut links, &tree, pending)
         };
         [extract().is_err(), extract().is_err()]
     });
@@ -366,27 +350,6 @@ fn made_directories_take_their_mode_and_an_existing_one_keeps_its_own() {
     assert_eq!(mode("a"), 0o753);
     assert_eq!(mode("e"), 0o700);
     assert!(dest.join("e/kept").exists());
-}
-
-/// A terminal found where a link set's first name was made is not pinned --
-/// and must not become the controlling terminal of a pax that has none in
-/// the open before the identity check refuses it.
-#[cfg(target_os = "linux")]
-#[test]
-fn pin_file_never_adopts_a_terminal() {
-    if !race_hook::in_new_session() {
-        race_hook::rerun_in_new_session(
-            "modes::read::race_tests::pin_file_never_adopts_a_terminal",
-        );
-        return;
-    }
-    let (_master, pts, slave) = race_hook::open_pty();
-    assert!(!race_hook::has_controlling_tty());
-    assert!(pin_file(pts.as_fd(), &slave, (0, 0)).is_none());
-    assert!(
-        !race_hook::has_controlling_tty(),
-        "pinning the file made it the controlling terminal"
-    );
 }
 
 /// A directory this run made for one member, renamed by someone else to the
@@ -434,4 +397,520 @@ fn fifo_and_symlink_take_their_attributes() {
     let md = std::fs::symlink_metadata(tmp.path().join("l")).unwrap();
     assert!(md.file_type().is_symlink());
     assert_eq!(md.mtime(), 23456);
+}
+
+/// An archive of `members` whose data cannot be read: every regular member
+/// fails after its file is created.
+#[cfg(target_os = "linux")]
+struct DataFails(std::vec::IntoIter<ArchiveEntry>);
+
+#[cfg(target_os = "linux")]
+impl ArchiveReader for DataFails {
+    fn read_entry(&mut self) -> PaxResult<Option<ArchiveEntry>> {
+        Ok(self.0.next())
+    }
+    fn read_data(&mut self, _buf: &mut [u8]) -> PaxResult<usize> {
+        Err(PaxError::Io(std::io::Error::other("data unreadable")))
+    }
+    fn skip_data(&mut self) -> PaxResult<()> {
+        Ok(())
+    }
+}
+
+/// A tar link member `g` naming the member `target`.
+fn link_member(target: &str) -> ArchiveEntry {
+    let mut entry = own_member("g", EntryType::Hardlink, 0o644);
+    entry.link_target = Some(PathBuf::from(target));
+    entry
+}
+
+/// Extract `members` in order below `dest` with `archive`, a writer renaming
+/// the file `planted` over `target` just before the link to it is made.
+#[cfg(target_os = "linux")]
+fn extract_linked_while_planted<R: ArchiveReader>(
+    dest: &Path,
+    archive: &mut R,
+    target: &'static CStr,
+) {
+    let tree = DirTree::open_path(dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let options = ReadOptions::default();
+    let path = dest.to_path_buf();
+    let hook = move |point, _: libc::c_int, name: &CStr| {
+        if point == Point::Linking && name == target {
+            std::fs::write(path.join("planted"), "planted\n").unwrap();
+            let target = std::ffi::OsStr::from_bytes(target.to_bytes());
+            std::fs::rename(path.join("planted"), path.join(target)).unwrap();
+        }
+    };
+    race_hook::with_hook(hook, || {
+        while let Some(entry) = archive.read_entry().unwrap() {
+            let _ = extract_entry(archive, &entry, &options, &mut links, &tree, &mut pending);
+        }
+    });
+}
+
+/// A link member naming a symbolic link member is linked to that very link,
+/// the one this run made, or not at all -- never to whatever is at its name
+/// by then. Only regular files were recorded; a symbolic link was linked by
+/// name, whatever the name held. (A symbolic link cannot be linked through
+/// its pin, so with its name taken the member fails.)
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_to_a_symlink_member_links_only_the_link_made() {
+    let tmp = TempDir::new().unwrap();
+    let mut symlink = own_member("s", EntryType::Symlink, 0o777);
+    symlink.link_target = Some(PathBuf::from("made-target"));
+    let mut archive = Members(vec![symlink, link_member("s")].into_iter());
+    extract_linked_while_planted(tmp.path(), &mut archive, c"s");
+    let g = tmp.path().join("g");
+    if std::fs::symlink_metadata(&g).is_ok() {
+        assert_eq!(
+            std::fs::read_link(&g).ok(),
+            Some(PathBuf::from("made-target")),
+            "g is not the symbolic link made"
+        );
+    }
+}
+
+/// Without a writer in the way, the link member is linked to the symbolic
+/// link made: by name, checked by identity and ctime.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_to_a_symlink_member_is_linked() {
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let options = ReadOptions::default();
+    let mut symlink = own_member("s", EntryType::Symlink, 0o777);
+    symlink.link_target = Some(PathBuf::from("made-target"));
+    let mut archive = Members(vec![symlink, link_member("s")].into_iter());
+    while let Some(entry) = archive.read_entry().unwrap() {
+        extract_entry(
+            &mut archive,
+            &entry,
+            &options,
+            &mut links,
+            &tree,
+            &mut pending,
+        )
+        .unwrap();
+    }
+    let g = std::fs::symlink_metadata(tmp.path().join("g")).unwrap();
+    let s = std::fs::symlink_metadata(tmp.path().join("s")).unwrap();
+    assert_eq!((g.dev(), g.ino()), (s.dev(), s.ino()));
+}
+
+/// A regular member whose data fails after its file is made still leaves
+/// that file, and a link member naming it is linked to it -- not to what is
+/// at its name by then.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_to_a_failed_member_links_the_file_made() {
+    let tmp = TempDir::new().unwrap();
+    let mut file = own_member("f", EntryType::Regular, 0o644);
+    file.size = 10;
+    let mut archive = DataFails(vec![file, link_member("f")].into_iter());
+    extract_linked_while_planted(tmp.path(), &mut archive, c"f");
+    let g = std::fs::read_to_string(tmp.path().join("g")).unwrap_or_default();
+    assert_ne!(g, "planted\n", "g was linked to the planted file");
+}
+
+/// -i renames a member as it is extracted; a later link member still names
+/// it by its name in the archive, and is linked to it at the name it was
+/// given -- the file this run made -- not to whatever is at the old name.
+#[test]
+fn link_member_follows_a_target_renamed_by_i() {
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let options = ReadOptions::default();
+    // The member `f`, renamed to `renamed` at the prompt.
+    let file = own_member("renamed", EntryType::Regular, 0o644);
+    links.named(Some(Path::new("f")), Path::new("renamed"));
+    let mut archive = Members(vec![file, link_member("f")].into_iter());
+    while let Some(entry) = archive.read_entry().unwrap() {
+        let _ = extract_entry(
+            &mut archive,
+            &entry,
+            &options,
+            &mut links,
+            &tree,
+            &mut pending,
+        );
+    }
+    let g = std::fs::metadata(tmp.path().join("g")).ok();
+    let made = std::fs::metadata(tmp.path().join("renamed")).unwrap();
+    assert_eq!(
+        g.map(|g| (g.dev(), g.ino())),
+        Some((made.dev(), made.ino()))
+    );
+}
+
+/// Under -k a link member whose name is taken leaves that file alone, and
+/// its name is not the file it names: a later link member naming it is
+/// linked to the file that was there, not to the earlier member's target.
+#[test]
+fn link_member_kept_by_k_is_not_recorded_as_its_target() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("g"), "was here\n").unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let options = ReadOptions {
+        no_clobber: true,
+        ..Default::default()
+    };
+    let file = own_member("f", EntryType::Regular, 0o644);
+    let mut h = link_member("g");
+    h.path = PathBuf::from("h");
+    let mut archive = Members(vec![file, link_member("f"), h].into_iter());
+    while let Some(entry) = archive.read_entry().unwrap() {
+        let _ = extract_entry(
+            &mut archive,
+            &entry,
+            &options,
+            &mut links,
+            &tree,
+            &mut pending,
+        );
+    }
+    let id = |name: &str| {
+        let md = std::fs::metadata(tmp.path().join(name)).unwrap();
+        (md.dev(), md.ino())
+    };
+    assert_ne!(id("g"), id("f"), "-k replaced g");
+    assert_eq!(id("h"), id("g"), "h is not the file g holds");
+}
+
+/// Extract `archive` below `dest` under `options`, a writer putting the
+/// file `planted` at `target` just before any link to it is made.
+#[cfg(target_os = "linux")]
+fn extract_with_plant_at_link<R: ArchiveReader>(
+    dest: &Path,
+    archive: &mut R,
+    options: &ReadOptions,
+    target: &'static str,
+) {
+    let tree = DirTree::open_path(dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let path = dest.to_path_buf();
+    let hook = move |point, _: libc::c_int, name: &CStr| {
+        if point == Point::Linking && name.to_bytes() == target.as_bytes() {
+            let at = path.join(target);
+            if at.is_dir() {
+                std::fs::remove_dir_all(&at).unwrap();
+            }
+            std::fs::write(path.join("planted"), "planted\n").unwrap();
+            std::fs::rename(path.join("planted"), &at).unwrap();
+        }
+    };
+    race_hook::with_hook(hook, || {
+        while let Some(entry) = archive.read_entry().unwrap() {
+            let _ = extract_entry(archive, &entry, options, &mut links, &tree, &mut pending);
+        }
+    });
+}
+
+/// A target member whose file could not be made -- a non-empty directory in
+/// its way -- leaves no file of this run's at its name, and a link member
+/// naming it fails: linked by name it took whatever was put there by then.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_to_a_target_that_failed_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("a")).unwrap();
+    std::fs::write(tmp.path().join("a/inside"), "x").unwrap();
+    let file = own_member("a", EntryType::Regular, 0o644);
+    let mut archive = Members(vec![file, link_member("a")].into_iter());
+    extract_with_plant_at_link(tmp.path(), &mut archive, &ReadOptions::default(), "a");
+    let g = std::fs::read_to_string(tmp.path().join("g")).unwrap_or_default();
+    assert_ne!(g, "planted\n", "g was linked to what was put at the name");
+}
+
+/// Under -k a second member of a name already extracted is skipped, and
+/// leaves the first one's file -- and its pin -- in place: a link member
+/// naming it is linked to that file.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_member_after_a_k_duplicate_links_the_first_file() {
+    let tmp = TempDir::new().unwrap();
+    let file = own_member("a", EntryType::Regular, 0o644);
+    let again = own_member("a", EntryType::Regular, 0o644);
+    let mut archive = Members(vec![file, again, link_member("a")].into_iter());
+    let options = ReadOptions {
+        no_clobber: true,
+        ..Default::default()
+    };
+    extract_with_plant_at_link(tmp.path(), &mut archive, &options, "a");
+    let g = std::fs::read_to_string(tmp.path().join("g")).unwrap_or_default();
+    assert_ne!(g, "planted\n", "g was linked to what was put at the name");
+}
+
+/// A later name of a cpio link set is linked to the set's file, found at an
+/// earlier name. Once the set's pin is closed, a file of someone else's at
+/// that name with the set file's inode number -- the number reused,
+/// simulated by giving the record the planted file's number -- is told
+/// apart by its ctime, and not linked.
+#[cfg(target_os = "linux")]
+#[test]
+fn link_set_name_is_not_linked_to_a_file_with_a_reused_number() {
+    use crate::modes::pins::{ctime_of, MadeFile};
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let root = tree.root();
+    std::fs::write(tmp.path().join("a"), "set\n").unwrap();
+    let made_st = plib::madefs::lstat_at(root.as_raw_fd(), c"a").unwrap();
+    std::fs::write(tmp.path().join("planted"), "planted\n").unwrap();
+    // A later clock tick for the planted file, as a file made after the
+    // set's was removed would have.
+    let planted = tmp.path().join("planted");
+    let mut planted_st = plib::madefs::lstat_at(root.as_raw_fd(), c"planted").unwrap();
+    for _ in 0..200 {
+        if ctime_of(&planted_st) != ctime_of(&made_st) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let perms = std::fs::metadata(&planted).unwrap().permissions();
+        std::fs::set_permissions(&planted, perms).unwrap();
+        planted_st = plib::madefs::lstat_at(root.as_raw_fd(), c"planted").unwrap();
+    }
+    std::fs::rename(&planted, tmp.path().join("a")).unwrap();
+    // The record: the planted file's number, the set file's ctime.
+    let mut reused = made_st;
+    reused.st_dev = planted_st.st_dev;
+    reused.st_ino = planted_st.st_ino;
+    let mut set = CreatedSet {
+        names: vec![PathBuf::from("a")],
+        file: MadeFile::unpinned(&reused),
+        has_data: true,
+    };
+    let entry = ArchiveEntry {
+        nlink: 2,
+        ..own_member("b", EntryType::Regular, 0o644)
+    };
+    let member = MemberPath::parse(Path::new("b")).unwrap().unwrap();
+    let mut archive = Members(Vec::new().into_iter());
+    let options = ReadOptions::default();
+    let _ = join_link_set(
+        &mut archive,
+        &tree,
+        root,
+        &member,
+        &entry,
+        &options,
+        &mut set,
+    );
+    let b = std::fs::read_to_string(tmp.path().join("b")).unwrap_or_default();
+    assert_ne!(
+        b, "planted\n",
+        "the later name was linked to the planted file"
+    );
+}
+
+/// Whether the file a member at `name` made below `dest` was recorded pinned.
+#[cfg(target_os = "linux")]
+fn recorded_pinned(dest: &Path, entry: ArchiveEntry) -> bool {
+    let tree = DirTree::open_path(dest).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let key = MemberPath::parse(&entry.path).unwrap().unwrap().key();
+    let mut archive = Members(vec![entry].into_iter());
+    while let Some(entry) = archive.read_entry().unwrap() {
+        extract_entry(
+            &mut archive,
+            &entry,
+            &ReadOptions::default(),
+            &mut links,
+            &tree,
+            &mut pending,
+        )
+        .unwrap();
+    }
+    let set_pinned = links
+        .sets
+        .by_key_mut((0, 0))
+        .is_some_and(|set| set.file.is_pinned());
+    match links.made.get(&key) {
+        Some(super::Record::File(made)) => made.is_pinned() || set_pinned,
+        _ => panic!("nothing recorded"),
+    }
+}
+
+/// A pin costs a reopen through procfs per file; it is held only where a
+/// later member could name the file and someone else could replace it at
+/// its name meanwhile. A tar member is pinned where others can rename in its
+/// directory, a cpio member where its file has other names; every other is
+/// known by identity and ctime alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_made_file_is_pinned_only_where_it_could_be_needed() {
+    use crate::archive::SourceHeader;
+    use crate::formats::cpio::CpioFormat;
+    let tmp = TempDir::new().unwrap();
+    let private = tmp.path().join("private");
+    let open = tmp.path().join("open");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let tar = |name| own_member(name, EntryType::Regular, 0o644);
+    assert!(
+        !recorded_pinned(&private, tar("t")),
+        "tar, private directory"
+    );
+    assert!(recorded_pinned(&open, tar("t")), "tar, others can rename");
+
+    let cpio = |name, nlink| ArchiveEntry {
+        nlink,
+        source_header: Some(SourceHeader::Cpio {
+            format: CpioFormat::Newc,
+        }),
+        ..own_member(name, EntryType::Regular, 0o644)
+    };
+    assert!(!recorded_pinned(&open, cpio("c1", 1)), "cpio, one name");
+    assert!(
+        recorded_pinned(&private, cpio("c2", 2)),
+        "cpio, other names"
+    );
+}
+
+/// A later member of the name -i renamed an earlier one away from, kept at
+/// its own name, is the one a link member naming that name refers to: the
+/// earlier rename no longer applies.
+#[test]
+fn a_later_member_of_a_renamed_name_ends_the_rename() {
+    let mut links = super::Links::new();
+    links.named(Some(Path::new("f")), Path::new("renamed"));
+    assert_eq!(
+        links.link_target(PathBuf::from("f")),
+        PathBuf::from("renamed")
+    );
+    links.named(None, Path::new("f"));
+    assert_eq!(links.link_target(PathBuf::from("f")), PathBuf::from("f"));
+    // A later rename of the name overrides an earlier one.
+    links.named(Some(Path::new("f")), Path::new("again"));
+    assert_eq!(
+        links.link_target(PathBuf::from("f")),
+        PathBuf::from("again")
+    );
+}
+
+/// Every link to a file changes its ctime, so every record of that file must
+/// see the change: a chain of link members -- f, a -> f, b -> f, c -> a --
+/// each made in a later clock tick, links them all. Each record held its own
+/// copy of the ctime, and the link for c, made through a's record, found it
+/// stale and failed: "source file changed before it could be linked".
+#[test]
+fn a_chain_of_link_members_is_linked() {
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let named = |name: &str, target: &str| {
+        let mut entry = link_member(target);
+        entry.path = PathBuf::from(name);
+        entry
+    };
+    let members = vec![
+        own_member("f", EntryType::Regular, 0o644),
+        named("a", "f"),
+        named("b", "f"),
+        named("c", "a"),
+    ];
+    let mut archive = Members(members.into_iter());
+    // Each link in a later tick of the clock ctime is stamped from.
+    let hook = |point, _: libc::c_int, _: &CStr| {
+        if point == Point::Linking {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let results: Vec<_> = race_hook::with_hook(hook, || {
+        let mut results = Vec::new();
+        while let Some(entry) = archive.read_entry().unwrap() {
+            let r = extract_entry(
+                &mut archive,
+                &entry,
+                &ReadOptions::default(),
+                &mut links,
+                &tree,
+                &mut pending,
+            );
+            results.push(r.map_err(|e| e.to_string()));
+        }
+        results
+    });
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    let id = |name: &str| {
+        let md = std::fs::metadata(tmp.path().join(name)).unwrap();
+        (md.dev(), md.ino())
+    };
+    for name in ["a", "b", "c"] {
+        assert_eq!(id(name), id("f"), "{name}");
+    }
+}
+
+/// A link member whose name, once linked, no longer holds the file -- taken
+/// by someone else at once -- leaves nothing this run can vouch for at its
+/// name: not the record of an earlier member there.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_link_member_whose_name_is_taken_at_once_leaves_a_tombstone() {
+    let tmp = TempDir::new().unwrap();
+    let tree = DirTree::open_path(tmp.path()).unwrap();
+    let mut pending = PendingDirs::default();
+    let mut links = super::Links::new();
+    let mut archive = Members(
+        vec![
+            own_member("f", EntryType::Regular, 0o644),
+            own_member("g", EntryType::Regular, 0o644),
+            link_member("f"),
+        ]
+        .into_iter(),
+    );
+    let path = tmp.path().to_path_buf();
+    let hook = move |point, _: libc::c_int, name: &CStr| {
+        if point == Point::Linked && name == c"g" {
+            std::fs::write(path.join("planted"), "planted\n").unwrap();
+            std::fs::rename(path.join("planted"), path.join("g")).unwrap();
+        }
+    };
+    race_hook::with_hook(hook, || {
+        while let Some(entry) = archive.read_entry().unwrap() {
+            let _ = extract_entry(
+                &mut archive,
+                &entry,
+                &ReadOptions::default(),
+                &mut links,
+                &tree,
+                &mut pending,
+            );
+        }
+    });
+    let g = MemberPath::parse(Path::new("g")).unwrap().unwrap().key();
+    assert!(matches!(links.made.get(&g), Some(super::Record::Failed)));
+}
+
+/// A later member of a name -i renamed, turned away -- by a pattern, -u, or
+/// -i's skip -- is still the latest member of that name: the earlier rename
+/// no longer applies to a link member naming it. The name is taken after -s.
+#[test]
+fn a_member_turned_away_ends_an_earlier_rename() {
+    let mut links = super::Links::new();
+    links.named(Some(Path::new("f")), Path::new("renamed"));
+    links.turned_away(PathBuf::from("f"), &ReadOptions::default());
+    assert_eq!(links.link_target(PathBuf::from("f")), PathBuf::from("f"));
+
+    links.named(Some(Path::new("f")), Path::new("renamed"));
+    let options = ReadOptions {
+        substitutions: vec![crate::subst::Substitution::parse(",^x$,f,").unwrap()],
+        ..Default::default()
+    };
+    links.turned_away(PathBuf::from("x"), &options);
+    assert_eq!(links.link_target(PathBuf::from("f")), PathBuf::from("f"));
 }

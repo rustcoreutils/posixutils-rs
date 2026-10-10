@@ -25,8 +25,9 @@
 //! The trust rules and the pinned-inode primitives are cp's, shared through
 //! `plib::madefs`.
 
+use crate::modes::pins::MadeFile;
 pub(crate) use plib::madefs::MadeTrust;
-use plib::madefs::{fs_owners, made_by_us, others_can_rename, FsOwners, MadeObject};
+use plib::madefs::{cvt, fs_owners, fstat, made_by_us, others_can_rename, FsOwners, MadeObject};
 #[cfg(target_os = "linux")]
 pub(crate) use plib::madefs::{proc_fd_name, procfs_dir};
 use std::ffi::CStr;
@@ -57,23 +58,6 @@ pub(crate) fn replaced() -> io::Error {
     io::Error::other("replaced after it was made")
 }
 
-/// `fstat` of a descriptor.
-fn fstat(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(st)
-}
-
-/// `Ok(())` for a successful libc call's return value, the error otherwise.
-pub(crate) fn cvt(r: libc::c_int) -> io::Result<()> {
-    if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 /// How far a node of type `made_type` (`S_IFIFO`, ...), found with `st` on a
 /// filesystem keeping owners as `owners`, is trusted to be the one pax just
 /// made in `dirfd`.
@@ -84,7 +68,7 @@ fn check_node(
     owners: FsOwners,
 ) -> io::Result<MadeTrust> {
     let type_ok = st.st_mode & libc::S_IFMT == made_type;
-    let parent = fstat(dirfd)?;
+    let parent = fstat(dirfd.as_raw_fd())?;
     let euid = unsafe { libc::geteuid() };
     node_trust(made_object(st, owners), type_ok, &parent, euid).ok_or_else(replaced)
 }
@@ -166,7 +150,7 @@ mod linux {
                 return Err(io::Error::last_os_error());
             }
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            let st = fstat(fd.as_fd())?;
+            let st = fstat(fd.as_raw_fd())?;
             let trust = check_node(&st, made_type, dirfd, owners_of(fd.as_fd()))?;
             Ok(MadeNode {
                 fd,
@@ -175,6 +159,12 @@ mod linux {
                 dirfd,
                 name,
             })
+        }
+
+        /// The node as a later name of it is to be linked to it: pinned by a
+        /// duplicate of this pin.
+        pub(crate) fn made_file(&self, pin: bool) -> Option<MadeFile> {
+            MadeFile::held(self.fd.as_fd(), pin).ok()
         }
 
         pub(crate) fn trust(&self) -> MadeTrust {
@@ -212,7 +202,7 @@ mod linux {
                 return Err(err);
             }
             if self.symlink {
-                let pinned = file_id(&fstat(self.fd.as_fd())?);
+                let pinned = file_id(&fstat(self.fd.as_raw_fd())?);
                 let dirfd = self.dirfd.as_raw_fd();
                 return match utimens_link_if_still(dirfd, self.name, pinned, times)? {
                     true => Ok(()),
@@ -248,6 +238,7 @@ mod linux {
 mod other {
     use super::*;
     use crate::modes::anchored::file_id;
+    use plib::madefs::lstat_at;
     use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
     /// How a made node is held.
@@ -277,12 +268,12 @@ mod other {
             name: &'a CStr,
             made_type: libc::mode_t,
         ) -> io::Result<Self> {
-            let st = lstat_at(dirfd, name)?;
+            let st = lstat_at(dirfd.as_raw_fd(), name)?;
             if st.st_mode & libc::S_IFMT != made_type {
                 return Err(replaced());
             }
             if let Some(fd) = open_node(dirfd, name, made_type)? {
-                let held = fstat(fd.as_fd())?;
+                let held = fstat(fd.as_raw_fd())?;
                 if file_id(&held) != file_id(&st) {
                     return Err(replaced());
                 }
@@ -299,6 +290,21 @@ mod other {
                 id,
             };
             Ok(MadeNode { held, trust })
+        }
+
+        /// The node as a later name of it is to be linked to it, known by its
+        /// identity and ctime: nothing here can be linked through a
+        /// descriptor.
+        pub(crate) fn made_file(&self, _pin: bool) -> Option<MadeFile> {
+            let st = match self.held {
+                Held::Fd(ref fd) => fstat(fd.as_raw_fd()).ok()?,
+                Held::Name {
+                    dirfd, name, id, ..
+                } => lstat_at(dirfd.as_raw_fd(), name)
+                    .ok()
+                    .filter(|st| file_id(st) == id)?,
+            };
+            Some(MadeFile::unpinned(&st))
         }
 
         pub(crate) fn trust(&self) -> MadeTrust {
@@ -352,7 +358,7 @@ mod other {
             else {
                 return Ok(());
             };
-            let st = lstat_at(dirfd, name)?;
+            let st = lstat_at(dirfd.as_raw_fd(), name)?;
             if file_id(&st) != id || st.st_mode & libc::S_IFMT != made_type {
                 return Err(replaced());
             }
@@ -396,14 +402,6 @@ mod other {
     /// support opening a symbolic link as itself.
     fn held_by_name_after(errno: libc::c_int) -> bool {
         errno == libc::EACCES || errno == libc::ENOTSUP || errno == libc::EOPNOTSUPP
-    }
-
-    /// `fstatat` with `AT_SYMLINK_NOFOLLOW`.
-    fn lstat_at(dirfd: BorrowedFd<'_>, name: &CStr) -> io::Result<libc::stat> {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let flags = libc::AT_SYMLINK_NOFOLLOW;
-        cvt(unsafe { libc::fstatat(dirfd.as_raw_fd(), name.as_ptr(), &mut st, flags) })?;
-        Ok(st)
     }
 
     #[cfg(test)]

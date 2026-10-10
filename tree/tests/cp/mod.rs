@@ -9,6 +9,7 @@
 
 mod debhelper;
 mod dirmode;
+mod existing_dir;
 mod link;
 #[cfg(all(
     target_os = "linux",

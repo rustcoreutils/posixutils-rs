@@ -14,6 +14,7 @@ pub mod append;
 pub mod copy;
 pub mod list;
 pub(crate) mod made;
+pub(crate) mod pins;
 #[cfg(test)]
 pub(crate) mod race_hook;
 pub mod read;

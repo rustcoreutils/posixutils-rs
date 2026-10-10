@@ -9,18 +9,21 @@
 
 //! Read mode implementation - extract archive contents
 
-use crate::archive::{ArchiveEntry, ArchiveReader, EntryType, LinkSets};
+use crate::archive::{ArchiveEntry, ArchiveReader, EntryType, LinkSets, SourceHeader};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    attrs_withheld, create_replacing, link_replacing, make_dir_at, set_attrs_fd,
-    set_made_node_attrs, stat_at, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, MemberPath,
-    PendingDirs,
+    attrs_withheld, create_replacing, link_replacing_with, make_dir_at, set_attrs_fd,
+    set_made_node_attrs_recording, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, Expected,
+    MemberPath, PendingDirs,
 };
+use crate::modes::pins::{MadeFile, Making, PinBudget};
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
 use crate::subst::{substitute_link_target, substitute_name, Substitution};
+use plib::madefs::lstat_at;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::Write;
@@ -125,7 +128,7 @@ fn extract_members<R: ArchiveReader>(
     tree: &DirTree,
     pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
-    let mut link_sets: LinkSets<CreatedSet> = LinkSets::default();
+    let mut links = Links::new();
     let mut selector = Selector::new(
         &options.patterns,
         options.exclude,
@@ -149,22 +152,48 @@ fn extract_members<R: ArchiveReader>(
         if let Some(ref records) = option_records {
             records.apply(&mut entry);
         }
-        if select_member(&mut selector, &mut entry, options, &mut prompter, tree)? {
+        links.sets.count_name(&entry);
+        // Under -i, a member turned away still ends an earlier rename of its
+        // name (`Links::turned_away`).
+        let original = (!links.aliases.is_empty()).then(|| entry.path.clone());
+        let mut renamed_from = None;
+        let selected = select_member(
+            &mut selector,
+            &mut entry,
+            options,
+            &mut prompter,
+            tree,
+            &mut renamed_from,
+        )?;
+        if selected {
+            links.named(renamed_from.as_deref(), &entry.path);
+        } else if let Some(original) = original {
+            links.turned_away(original, options);
+        }
+        if selected {
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
             // set a non-zero exit, but continue with the next member. Skip any
             // unconsumed data of the failed entry to realign the reader.
             // A failure every later member would meet too -- -O's output
             // gone, end of file on the terminal -- ends the run instead.
-            let r = extract_entry(archive, &entry, options, &mut link_sets, tree, pending_dirs);
+            let r = extract_entry(archive, &entry, options, &mut links, tree, pending_dirs);
             report_unless_fatal(&entry, r)?;
-        } else if let Some(set) = link_sets.find_mut(&entry) {
+        } else if let Some(set) = links.sets.find_mut(&entry) {
             let r = fill_link_set(archive, tree, &entry, options, set);
+            if r.is_ok() {
+                links.record_set(&entry);
+            }
             report_unless_fatal(&entry, r)?;
         }
         archive.skip_data()?;
+        // A set no data can still come for needs its file pinned no longer.
+        if let Some(set) = links.sets.settled_mut(&entry) {
+            set.unpin();
+        }
+        links.account_set(&entry);
         // A newc set's data comes with its last name, which -n must still
         // read even when every pattern has been used by an earlier one.
-        if selector.is_done() && link_sets.values().all(|set| set.has_data) {
+        if selector.is_done() && links.sets.all_settled() {
             reached_end = false;
             break;
         }
@@ -200,6 +229,7 @@ fn select_member(
     options: &ReadOptions,
     prompter: &mut Option<InteractivePrompter>,
     tree: &DirTree,
+    renamed_from: &mut Option<PathBuf>,
 ) -> PaxResult<bool> {
     let Some(selection) = selector.select(entry) else {
         return Ok(false);
@@ -219,7 +249,9 @@ fn select_member(
         match p.prompt(&entry.path)? {
             RenameResult::Skip => return Ok(false),
             RenameResult::UseOriginal => {}
-            RenameResult::Rename(new_path) => entry.path = new_path,
+            RenameResult::Rename(new_path) => {
+                *renamed_from = Some(std::mem::replace(&mut entry.path, new_path));
+            }
         }
     }
     Ok(!(options.update && options.update_final_name && !is_archive_newer(tree, entry)))
@@ -316,7 +348,7 @@ fn extract_entry<R: ArchiveReader>(
     archive: &mut R,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    link_sets: &mut LinkSets<CreatedSet>,
+    links: &mut Links,
     tree: &DirTree,
     pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
@@ -359,9 +391,19 @@ fn extract_entry<R: ArchiveReader>(
         let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
     }
 
+    // Each arm settles what it left at its name (`Links::left`): a file this
+    // run made, nothing it can vouch for, or the name as it was.
+    let pin = links.wants_pin(entry, &parent);
+    links.pin_member = pin;
     match entry.entry_type {
         EntryType::Directory => {
-            let decided = extract_directory(tree, pfd, &member, entry, options)?;
+            let decided = extract_directory(tree, pfd, &member, entry, options);
+            // A directory is nothing a link member can be linked to; -k
+            // leaves the name as it was.
+            if !matches!(decided, Ok(DirAttrs::Keep)) {
+                links.left(&member, true, None);
+            }
+            let decided = decided?;
             archive.skip_data()?;
             match decided {
                 // Its attributes are applied once the subtree exists, if it
@@ -372,23 +414,36 @@ fn extract_entry<R: ArchiveReader>(
             }
         }
         EntryType::Symlink => {
-            extract_symlink(pfd, name, entry, options)?;
+            let mut made = Making::new(pin);
+            let result = extract_symlink(pfd, name, entry, options, &mut made);
+            links.left(&member, result.is_err(), made.file);
+            result?;
             archive.skip_data()?;
         }
         EntryType::Hardlink => {
-            extract_hardlink(tree, pfd, name, entry, options)?;
+            let result = extract_hardlink(tree, pfd, &member, entry, options, links);
+            if result.is_err() {
+                links.left(&member, true, None);
+            }
+            result?;
             archive.skip_data()?;
         }
         EntryType::Regular => {
-            extract_regular(archive, tree, pfd, &member, entry, options, link_sets)?;
+            extract_regular(archive, tree, pfd, &member, entry, options, links)?;
             archive.skip_data()?; // Skip padding to block boundary
         }
         EntryType::BlockDevice | EntryType::CharDevice => {
-            extract_device(pfd, name, entry, options)?;
+            let mut made = Making::new(pin);
+            let result = extract_device(pfd, name, entry, options, &mut made);
+            links.left(&member, result.is_err(), made.file);
+            result?;
             archive.skip_data()?;
         }
         EntryType::Fifo => {
-            extract_fifo(pfd, name, entry, options)?;
+            let mut made = Making::new(pin);
+            let result = extract_fifo(pfd, name, entry, options, &mut made);
+            links.left(&member, result.is_err(), made.file);
+            result?;
             archive.skip_data()?;
         }
         EntryType::Socket => {
@@ -460,6 +515,7 @@ fn extract_symlink(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made: &mut Making,
 ) -> PaxResult<()> {
     let target = entry
         .link_target
@@ -477,24 +533,248 @@ fn extract_symlink(
     })?;
 
     if created {
-        set_made_attrs(dirfd, name, libc::S_IFLNK, entry, options)?;
+        set_made_attrs(dirfd, name, libc::S_IFLNK, entry, options, made)?;
     }
     Ok(())
+}
+
+/// What extraction keeps about the files later members name: the cpio link
+/// sets, the file this run made at each member path, and the pins both hold,
+/// within one budget.
+struct Links {
+    sets: LinkSets<CreatedSet>,
+    /// What this run left at each member path (`MemberPath::key`) it tried
+    /// to extract -- a tar link member's target.
+    made: HashMap<Vec<u8>, Record>,
+    pins: PinBudget<PinKey>,
+    /// The name -i gave each member it renamed, by the member path
+    /// (`MemberPath::key`) it had before.
+    aliases: HashMap<Vec<u8>, PathBuf>,
+    /// Whether the member being extracted is to pin what it makes
+    /// (`wants_pin`), as decided for it.
+    pin_member: bool,
+    /// The directory last asked about in `wants_pin`, and the answer.
+    last_dir: Option<(Rc<OwnedFd>, bool)>,
+}
+
+/// What this run left at a member path it tried to extract.
+enum Record {
+    /// The file it made there, known from the descriptor that made it.
+    File(MadeFile),
+    /// Nothing it can vouch for: the member failed before a file of this
+    /// run's was verified at its name, which may hold anything now. A link
+    /// member naming it fails rather than link whatever that is.
+    Failed,
+}
+
+/// What holds a pin in `Links`.
+#[derive(PartialEq, Eq, Debug)]
+enum PinKey {
+    /// A cpio link set (`LinkSets::key`), until it is settled.
+    Set((u64, u64)),
+    /// The file made at a member path.
+    Member(Vec<u8>),
+}
+
+impl Links {
+    fn new() -> Self {
+        Links {
+            sets: LinkSets::default(),
+            made: HashMap::new(),
+            pins: PinBudget::new(),
+            aliases: HashMap::new(),
+            pin_member: false,
+            last_dir: None,
+        }
+    }
+
+    /// Whether the file a member makes is to be pinned (`MadeFile`): only where
+    /// a later member could name it while someone else could replace it at
+    /// its name. A cpio member, where its file has other names. A tar or pax
+    /// member, whose later link members cannot be known ahead in a streamed
+    /// archive, where anyone but the user pax runs as can create, rename or
+    /// remove entries in `parent`, its directory
+    /// (`plib::madefs::only_the_user_writes_in`, asked once per directory).
+    /// Every other file is known by identity and ctime alone.
+    fn wants_pin(&mut self, entry: &ArchiveEntry, parent: &Rc<OwnedFd>) -> bool {
+        if matches!(entry.source_header, Some(SourceHeader::Cpio { .. })) {
+            return entry.nlink > 1;
+        }
+        if let Some((dir, answer)) = &self.last_dir {
+            if Rc::ptr_eq(dir, parent) {
+                return *answer;
+            }
+        }
+        let answer = !plib::madefs::only_the_user_writes_in(parent.as_raw_fd());
+        self.last_dir = Some((Rc::clone(parent), answer));
+        answer
+    }
+
+    /// Account for the pin of the set `entry` is a name of, after the member.
+    fn account_set(&mut self, entry: &ArchiveEntry) {
+        let Some(key) = LinkSets::<CreatedSet>::key(entry) else {
+            return;
+        };
+        let Some(set) = self.sets.by_key_mut(key) else {
+            return;
+        };
+        let pinned = set.file.is_pinned();
+        self.note(PinKey::Set(key), pinned);
+    }
+
+    /// Record `made` as the file this run made at the member path `key`.
+    fn record_made(&mut self, key: Vec<u8>, made: MadeFile) {
+        let pinned = made.is_pinned();
+        self.made.insert(key.clone(), Record::File(made));
+        self.note(PinKey::Member(key), pinned);
+    }
+
+    /// Settle what a member at `member`, which `failed` or not, left at its
+    /// name: the file it made (`made`), even if it then failed; nothing this
+    /// run can vouch for, when it failed without one; and, when it succeeded
+    /// without making one -- -k kept the name, a socket was skipped -- the
+    /// name is as it was, and so is its record.
+    fn left(&mut self, member: &MemberPath, failed: bool, made: Option<MadeFile>) {
+        match made {
+            Some(made) => self.record_made(member.key(), made),
+            None if failed => self.tombstone(member.key()),
+            None => {}
+        }
+    }
+
+    /// Record that the member at `key` left nothing this run can vouch for.
+    fn tombstone(&mut self, key: Vec<u8>) {
+        self.made.insert(key.clone(), Record::Failed);
+        self.note(PinKey::Member(key), false);
+    }
+
+    /// What a link member is to be linked to at the member path `key`: the
+    /// file this run made there; `None` for a name this run never tried to
+    /// extract, which is linked by name; an error for one it tried and left
+    /// nothing it can vouch for at.
+    fn target(&self, key: &[u8]) -> PaxResult<Option<Expected<'_>>> {
+        match self.made.get(key) {
+            Some(Record::File(made)) => Ok(Some(made.expected())),
+            Some(Record::Failed) => Err(PaxError::Io(std::io::Error::other(
+                "link target was not extracted; not linked",
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Note the name a selected member is extracted at, `path`: -i gave it
+    /// that name in place of `renamed_from` (its name after -s), or it keeps
+    /// its own. A link member names the latest member of a name in the
+    /// archive: renamed, that one is at `path`; not renamed, it is at its
+    /// own name, and an earlier member's rename no longer applies.
+    fn named(&mut self, renamed_from: Option<&Path>, path: &Path) {
+        let key = |p: &Path| MemberPath::parse(p).ok().flatten().map(|m| m.key());
+        match renamed_from {
+            Some(before) => {
+                if let Some(before) = key(before) {
+                    self.aliases.insert(before, path.to_path_buf());
+                }
+            }
+            None => {
+                if let Some(own) = key(path) {
+                    self.aliases.remove(&own);
+                }
+            }
+        }
+    }
+
+    /// A member at `original` (its name in the archive) was turned away -- by
+    /// a pattern, -u, or -i's skip. It is still the latest member of its
+    /// name, which a link member naming it refers to, and it was not
+    /// extracted: an earlier rename of the name no longer applies. Its name
+    /// after -s (and --strip-components) is what renames are kept under,
+    /// substituted here without reporting it: a `p` substitution reports a
+    /// member's rename where -s renames the member, if it gets that far.
+    fn turned_away(&mut self, original: PathBuf, options: &ReadOptions) {
+        let named =
+            substitute_link_target(&options.substitutions, &original).and_then(
+                |name| match options.strip_components {
+                    0 => Some(name),
+                    n => strip_leading_components(&name, n),
+                },
+            );
+        if let Some(named) = named {
+            self.named(None, &named);
+        }
+    }
+
+    /// The name a link member's `target` is to be found at: the name -i gave
+    /// that member, where it gave one. A link member names its target by its
+    /// name in the archive (after -s), which -i does not rename.
+    fn link_target(&self, target: PathBuf) -> PathBuf {
+        let key = MemberPath::parse(&target).ok().flatten().map(|m| m.key());
+        key.and_then(|key| self.aliases.get(&key).cloned())
+            .unwrap_or(target)
+    }
+
+    /// Record the file of the set `entry` is a name of for every name the set
+    /// has now: a join or a fill has just put it there.
+    fn record_set(&mut self, entry: &ArchiveEntry) {
+        let Some(set) = LinkSets::<CreatedSet>::key(entry).and_then(|k| self.sets.by_key_mut(k))
+        else {
+            return;
+        };
+        let file = set.file.known();
+        let keys: Vec<Vec<u8>> = set
+            .names
+            .iter()
+            .filter_map(|path| MemberPath::parse(path).ok().flatten())
+            .map(|member| member.key())
+            .collect();
+        for key in keys {
+            self.record_made(key, file.known());
+        }
+    }
+
+    /// Forget what this run made at the member path `key`.
+    fn forget(&mut self, key: &[u8]) {
+        if self.made.remove(key).is_some() {
+            self.note(PinKey::Member(key.to_vec()), false);
+        }
+    }
+
+    /// `PinBudget::note`, closing the oldest pin -- a set's or a file's --
+    /// when the budget is over.
+    fn note(&mut self, key: PinKey, pinned: bool) {
+        let Links {
+            sets, made, pins, ..
+        } = self;
+        pins.note(key, pinned, |oldest| match oldest {
+            PinKey::Set(key) => {
+                if let Some(set) = sets.by_key_mut(*key) {
+                    set.unpin();
+                }
+            }
+            PinKey::Member(key) => {
+                if let Some(Record::File(made)) = made.get_mut(key) {
+                    made.unpin();
+                }
+            }
+        });
+    }
 }
 
 /// Extract a hard link
 fn extract_hardlink(
     tree: &DirTree,
     dirfd: BorrowedFd<'_>,
-    name: &CStr,
+    member: &MemberPath,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    links: &mut Links,
 ) -> PaxResult<()> {
+    let name = member.leaf.as_c_str();
     let Some(target) = entry.link_target.clone() else {
         return Err(PaxError::InvalidHeader(
             "hard link target not found".to_string(),
         ));
     };
+    let target = links.link_target(target);
 
     let Some(target_member) = MemberPath::parse(&target)? else {
         return Err(PaxError::InvalidHeader(
@@ -510,13 +790,46 @@ fn extract_hardlink(
     // earlier member of this very archive -- could link a file from outside
     // the extraction directory into it. A member linked to its own name, or
     // to a name it already shares, finds the file in place and keeps it.
-    link_replacing(
+    //
+    // To the file this run extracted at the target's name, pinned, when it
+    // made one: someone who can write that directory can have put another
+    // file at the name since. A target this run did not make is linked by
+    // name -- under -k, that includes a file someone put at the name before
+    // the run, which is what GNU tar and cp -n link to as well.
+    let target_key = target_member.key();
+    link_replacing_with(
         target_parent.as_raw_fd(),
         &target_member.leaf,
+        None,
+        links.target(&target_key)?,
         dirfd,
         name,
         options.no_clobber,
     )?;
+    #[cfg(test)]
+    crate::modes::race_hook::reached(
+        crate::modes::race_hook::Point::Linked,
+        dirfd.as_raw_fd(),
+        name,
+    );
+    // Linking it changed the file's ctime. And this name holds that file
+    // now, for a later member linked to it -- unless -k left another file
+    // there. Linked by name, it holds what the name held.
+    let Some(Record::File(target)) = links.made.get_mut(&target_key) else {
+        links.forget(&member.key());
+        return Ok(());
+    };
+    target.linked(dirfd, name);
+    let holds_it = lstat_at(dirfd.as_raw_fd(), name)
+        .is_ok_and(|st| crate::modes::anchored::file_id(&st) == target.id());
+    if holds_it {
+        let shared = target.share();
+        links.record_made(member.key(), shared);
+    } else if !options.no_clobber {
+        // Linked, then taken at once: nothing this run can vouch for is
+        // there. Under -k the name was left as it was, and so is its record.
+        links.tombstone(member.key());
+    }
 
     Ok(())
 }
@@ -525,36 +838,35 @@ fn extract_hardlink(
 struct CreatedSet {
     /// The names created for the set so far, as extracted (after -s and -i).
     names: Vec<PathBuf>,
-    /// (st_dev, st_ino) of the file they share on disk -- not the archive's
-    /// c_dev/c_ino.
-    file: (u64, u64),
+    /// The file they share on disk (`MadeFile`): its (st_dev, st_ino) -- not
+    /// the archive's c_dev/c_ino -- and ctime, and its pin, the descriptor
+    /// that made it reopened, held while data may still come for it on a
+    /// later name (`LinkSets::settled_mut`), within the budget
+    /// (`Links::pins`). Its names can be replaced by other members meanwhile,
+    /// and a filesystem that reuses inode numbers (ext4) then hands this
+    /// file's number to the next file created. Pinned, it keeps its number
+    /// (on a local filesystem: `pins`); unpinned, its ctime tells it from
+    /// that file.
+    file: MadeFile,
     /// Whether that file has its contents yet. newc stores them with the last
     /// name of a set only, so the earlier names are created empty.
     has_data: bool,
-    /// The file held open until its data arrives. Its names can be replaced
-    /// by other members meanwhile, and a filesystem that reuses inode numbers
-    /// (ext4) then hands this file's number to the next file created, which
-    /// `file` would take for this one. Open, it keeps its number.
-    _pin: Option<OwnedFd>,
 }
 
 impl CreatedSet {
-    /// The set as created at `name` below `dirfd`: pinned while the data is
-    /// still to come on a later name.
-    fn new(
-        names: Vec<PathBuf>,
-        file: (u64, u64),
-        has_data: bool,
-        dirfd: BorrowedFd<'_>,
-        name: &CStr,
-    ) -> Self {
-        let _pin = (!has_data).then(|| pin_file(dirfd, name, file)).flatten();
+    /// The set of `file`, as created at `names`: pinned, until the extract
+    /// loop finds no data can still come for it (`unpin`).
+    fn new(names: Vec<PathBuf>, file: MadeFile, has_data: bool) -> Self {
         CreatedSet {
             names,
             file,
             has_data,
-            _pin,
         }
+    }
+
+    /// Close the pin once no data can still come for the set.
+    fn unpin(&mut self) {
+        self.file.unpin();
     }
 
     /// The names that still hold the set's file, each with the directory and
@@ -563,7 +875,7 @@ impl CreatedSet {
     fn holders(&self, tree: &DirTree) -> Vec<((Rc<OwnedFd>, CString), PathBuf)> {
         self.names
             .iter()
-            .filter_map(|path| holding_name(tree, path, self.file).map(|h| (h, path.clone())))
+            .filter_map(|path| holding_name(tree, path, self.file.id()).map(|h| (h, path.clone())))
             .collect()
     }
 }
@@ -580,19 +892,47 @@ fn extract_regular<R: ArchiveReader>(
     member: &MemberPath,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    link_sets: &mut LinkSets<CreatedSet>,
+    links: &mut Links,
 ) -> PaxResult<()> {
-    if let Some(set) = link_sets.find_mut(entry) {
-        return join_link_set(archive, tree, dirfd, member, entry, options, set);
+    if let Some(set) = links.sets.find_mut(entry) {
+        let result = join_link_set(archive, tree, dirfd, member, entry, options, set);
+        match result {
+            Err(_) => links.left(member, true, None),
+            Ok(()) => links.record_set(entry),
+        }
+        return result;
     }
 
-    if let Some(file) = extract_file(archive, dirfd, member.leaf.as_c_str(), entry, options)? {
-        link_sets.insert(entry, || {
-            let names = vec![member.display.clone()];
-            CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
-        });
-    }
-    Ok(())
+    let mut making = Making::new(links.pin_member);
+    let result = extract_file(
+        archive,
+        dirfd,
+        member.leaf.as_c_str(),
+        entry,
+        options,
+        &mut making,
+    );
+    let made = making.file;
+    // A file made is recorded for a later link member to name, even when its
+    // data or attributes then failed: it is at that name all the same.
+    // The first name of a cpio link set: the set holds the file's pin, and
+    // the name's record knows it by identity and ctime.
+    let starts_set = result.is_ok()
+        && LinkSets::<CreatedSet>::key(entry)
+            .is_some_and(|key| links.sets.by_key_mut(key).is_none());
+    let made = match made {
+        Some(file) if starts_set => {
+            let known = file.known();
+            links.sets.insert(entry, || {
+                let names = vec![member.display.clone()];
+                CreatedSet::new(names, file, entry.size > 0)
+            });
+            Some(known)
+        }
+        made => made,
+    };
+    links.left(member, result.is_err(), made);
+    result
 }
 
 /// Extract a later name of a link set whose file is already on disk.
@@ -619,18 +959,23 @@ fn join_link_set<R: ArchiveReader>(
         let holder = set
             .names
             .iter()
-            .find_map(|path| holding_name(tree, path, set.file));
+            .find_map(|path| holding_name(tree, path, set.file.id()));
         if let Some((src_dir, src_leaf)) = holder {
-            link_replacing(
+            // To the set's file, pinned: the holder was found holding it, but
+            // its name can be given another file before the link is made.
+            link_replacing_with(
                 src_dir.as_raw_fd(),
                 &src_leaf,
+                None,
+                Some(set.file.expected()),
                 dirfd,
                 name,
                 options.no_clobber,
             )?;
+            set.file.linked(dirfd, name);
             // -k leaves an existing name alone, and that name is no part of
             // the set.
-            if id_at(dirfd, name) == Some(set.file) {
+            if id_at(dirfd, name) == Some(set.file.id()) {
                 set.names.push(member.display.clone());
             }
             return Ok(());
@@ -638,15 +983,18 @@ fn join_link_set<R: ArchiveReader>(
     }
 
     let holders = set.holders(tree);
-    let Some(file) = extract_file(archive, dirfd, name, entry, options)? else {
+    // A set's file has other names: pinned.
+    let mut made = Making::new(true);
+    extract_file(archive, dirfd, name, entry, options, &mut made)?;
+    let Some(mut file) = made.file else {
         // -k kept what was there; the data is still the earlier names'.
         return fill_link_set(archive, tree, entry, options, set);
     };
-    let mut names = move_names_to(holders, dirfd, name)?;
+    let mut names = move_names_to(holders, dirfd, name, &mut file)?;
     names.push(member.display.clone());
     // Created empty when no earlier name survived to link to: the data is
     // then still to come, on a later name.
-    *set = CreatedSet::new(names, file, entry.size > 0, dirfd, name);
+    *set = CreatedSet::new(names, file, entry.size > 0);
     Ok(())
 }
 
@@ -673,32 +1021,44 @@ fn fill_link_set<R: ArchiveReader>(
     };
     let dir = Rc::clone(dir);
     let (temp, file) = create_temp_file(dir.as_fd(), entry, options)?;
-    let filled = write_file_data(archive, file, entry, options)
-        .and_then(|id| Ok((id, move_names_to(holders, dir.as_fd(), &temp)?)));
+    let mut made = Making::new(true);
+    let filled = write_file_data(archive, file, entry, options, &mut made).and_then(|()| {
+        let mut made = made.file.ok_or_else(crate::modes::made::replaced)?;
+        let names = move_names_to(holders, dir.as_fd(), &temp, &mut made)?;
+        Ok((made, names))
+    });
     let removed = unlink_at(dir.as_fd(), &temp);
     let (file, names) = filled?;
     removed?;
-    *set = CreatedSet {
-        names,
-        file,
-        has_data: true,
-        _pin: None,
-    };
+    *set = CreatedSet::new(names, file, true);
     Ok(())
 }
 
 /// Link each of `holders` -- names of a set, with the directory and leaf they
-/// were found at -- to `name` in `dirfd`, returning their paths.
+/// were found at -- to `name` in `dirfd`, the file `file` this extraction has
+/// just made, returning their paths.
 fn move_names_to(
     holders: Vec<((Rc<OwnedFd>, CString), PathBuf)>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
+    file: &mut MadeFile,
 ) -> PaxResult<Vec<PathBuf>> {
     let mut names = Vec::with_capacity(holders.len() + 1);
     for ((dir, leaf), path) in holders {
         // These names were created by this extraction, so they are replaced
-        // even under -k.
-        link_replacing(dirfd.as_raw_fd(), name, dir.as_fd(), &leaf, false)?;
+        // even under -k. The link is to the file made, pinned, never to
+        // whatever has been put at its name since.
+        let from = dirfd.as_raw_fd();
+        link_replacing_with(
+            from,
+            name,
+            None,
+            Some(file.expected()),
+            dir.as_fd(),
+            &leaf,
+            false,
+        )?;
+        file.linked(dir.as_fd(), &leaf);
         names.push(path);
     }
     Ok(names)
@@ -711,29 +1071,11 @@ fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(Rc<Own
     (id_at(dir.as_fd(), &member.leaf) == Some(file)).then_some((dir, member.leaf))
 }
 
-/// The file at `name` below `dirfd`, opened without following a symlink,
-/// blocking, or adopting a terminal as the controlling one, when it is still
-/// the file `file`. A failure only leaves the set unpinned.
-fn pin_file(dirfd: BorrowedFd<'_>, name: &CStr, file: (u64, u64)) -> Option<OwnedFd> {
-    let flags =
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return None;
-    }
-    let file_held = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    (file_id(&file_held.metadata().ok()?) == file).then(|| file_held.into())
-}
-
 /// (st_dev, st_ino) of a name below `dirfd`, not following a symlink.
 fn id_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<(u64, u64)> {
-    stat_at(dirfd, name).map(|st| crate::modes::anchored::file_id(&st))
-}
-
-/// (st_dev, st_ino) of an open file.
-fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
+    lstat_at(dirfd.as_raw_fd(), name)
+        .ok()
+        .map(|st| crate::modes::anchored::file_id(&st))
 }
 
 /// Extract a block or character device (requires root privileges)
@@ -742,6 +1084,7 @@ fn extract_device(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made: &mut Making,
 ) -> PaxResult<()> {
     // makedev has different signatures on different platforms:
     // - Linux: makedev(major: u32, minor: u32) -> u64
@@ -779,7 +1122,7 @@ fn extract_device(
         Err(e) => return Err(e),
     }
 
-    set_made_attrs(dirfd, name, type_bits, entry, options)
+    set_made_attrs(dirfd, name, type_bits, entry, options, made)
 }
 
 /// Extract a FIFO
@@ -788,6 +1131,7 @@ fn extract_fifo(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made: &mut Making,
 ) -> PaxResult<()> {
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         let r = unsafe {
@@ -814,18 +1158,20 @@ fn extract_fifo(
         Err(e) => return Err(e),
     }
 
-    set_made_attrs(dirfd, name, libc::S_IFIFO, entry, options)
+    set_made_attrs(dirfd, name, libc::S_IFIFO, entry, options, made)
 }
 
-/// Extract a regular file, returning the (st_dev, st_ino) of the file created,
-/// or `None` when -k left an existing one in place.
+/// Extract a regular file, leaving in `made` the file created -- whether or
+/// not its data and attributes then all went in -- or `None` when -k left an
+/// existing one in place.
 fn extract_file<R: ArchiveReader>(
     archive: &mut R,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<Option<(u64, u64)>> {
+    made: &mut Making,
+) -> PaxResult<()> {
     let mut opened: Option<File> = None;
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         opened = Some(create_file(dirfd, name, entry, options)?);
@@ -836,9 +1182,9 @@ fn extract_file<R: ArchiveReader>(
         // -k: the name already exists, so the member is skipped. Its data is
         // consumed by the caller's skip_data.
         debug_assert!(!created);
-        return Ok(None);
+        return Ok(());
     };
-    write_file_data(archive, file, entry, options).map(Some)
+    write_file_data(archive, file, entry, options, made)
 }
 
 /// Create `name` in `dirfd` exclusively, never following a symlink, with the
@@ -890,16 +1236,23 @@ fn write_file_data<R: ArchiveReader>(
     mut file: File,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<(u64, u64)> {
-    copy_file_data(archive, &mut file, entry.size)?;
-
-    // Through the descriptor the data was just written to, not by name.
-    set_attrs_fd(file.as_fd(), &attrs_of(entry, options), &policy_of(options))?;
-    let id = file_id(&file.metadata()?);
+    made: &mut Making,
+) -> PaxResult<()> {
+    // Known from the descriptor that made it, whatever happens next.
+    made.file = Some(MadeFile::of(file.as_fd(), made.pin)?);
+    let written = copy_file_data(archive, &mut file, entry.size).and_then(|()| {
+        // Through the descriptor the data was just written to, not by name.
+        set_attrs_fd(file.as_fd(), &attrs_of(entry, options), &policy_of(options))
+    });
+    // Its data and attributes changed its ctime.
+    if let Some(made) = made.file.as_mut() {
+        made.refresh(file.as_fd());
+    }
+    written?;
     // A filesystem that defers writes -- NFS, a quota checked late -- reports
     // their failure here, and the member is then not extracted after all.
     crate::blocked_io::close_file(file)?;
-    Ok(id)
+    Ok(())
 }
 
 /// Copy file data from archive to file
@@ -936,10 +1289,12 @@ fn is_archive_newer(tree: &DirTree, entry: &ArchiveEntry) -> bool {
         return true; // no such directory, so nothing there: extract it
     };
     // A directory created here only to hold earlier members is not one.
-    stat_at(parent.as_fd(), &member.leaf).is_none_or(|st| {
-        tree.is_implicit(&st, &member)
-            || (entry.mtime, i64::from(entry.mtime_nsec)) > tree.mtime_before_run(&st)
-    })
+    lstat_at(parent.as_raw_fd(), &member.leaf)
+        .ok()
+        .is_none_or(|st| {
+            tree.is_implicit(&st, &member)
+                || (entry.mtime, i64::from(entry.mtime_nsec)) > tree.mtime_before_run(&st)
+        })
 }
 
 /// The ids to give an extracted file.
@@ -1016,15 +1371,87 @@ fn set_made_attrs(
     made_type: libc::mode_t,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    made: &mut Making,
 ) -> PaxResult<()> {
     let attrs = attrs_of(entry, options);
-    set_made_node_attrs(dirfd, name, made_type, &attrs, &policy_of(options))
+    set_made_node_attrs_recording(dirfd, name, made_type, &attrs, &policy_of(options), made)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
+    /// A link set's earlier names are moved over to the file just made for
+    /// its data by linking that file's name again. Someone who can rename in
+    /// that directory can put another file at the name first, and the set's
+    /// names became links to it. The link is made to the file made, or not
+    /// at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_link_set_names_move_only_to_the_file_made() {
+        use crate::modes::race_hook::{with_hook, Point};
+        let dir = plib::tmp::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("new"), "data\n").unwrap();
+        std::fs::write(dir.path().join("old"), "").unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let new_st = lstat_at(tree.root().as_raw_fd(), c"new").unwrap();
+        let mut made = MadeFile::unpinned(&new_st);
+        let root = Rc::new(tree.root().try_clone_to_owned().unwrap());
+        let holders = vec![((Rc::clone(&root), c"old".to_owned()), PathBuf::from("old"))];
+
+        let path = dir.path().to_path_buf();
+        let swap = move |point, _: libc::c_int, name: &CStr| {
+            if point == Point::Linking && name == c"new" {
+                std::fs::write(path.join("planted"), "planted\n").unwrap();
+                std::fs::rename(path.join("planted"), path.join("new")).unwrap();
+            }
+        };
+        let moved = with_hook(swap, || {
+            move_names_to(holders, root.as_fd(), c"new", &mut made)
+        });
+        assert!(moved.is_err(), "linked to the file put in its place");
+        assert_eq!(std::fs::read(dir.path().join("old")).unwrap(), b"");
+    }
+
+    /// A tar link member is linked to its target member, found by the name
+    /// the target was extracted at. In a directory others can write, someone
+    /// can rename their own file over that name first, and the link member
+    /// became a link to theirs. The link is made to the file extracted, or
+    /// not at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_hardlink_member_links_only_to_the_file_extracted() {
+        use crate::modes::race_hook::{with_hook, Point};
+        let dir = plib::tmp::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f"), "extracted\n").unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let mut links = Links::new();
+        let target = MemberPath::parse(Path::new("f")).unwrap().unwrap();
+        let f = std::fs::File::open(dir.path().join("f")).unwrap();
+        links.record_made(target.key(), MadeFile::of(f.as_fd(), true).unwrap());
+        drop(f);
+
+        let path = dir.path().to_path_buf();
+        let swap = move |point, _: libc::c_int, name: &CStr| {
+            if point == Point::Linking && name == c"f" {
+                std::fs::write(path.join("planted"), "planted\n").unwrap();
+                std::fs::rename(path.join("planted"), path.join("f")).unwrap();
+            }
+        };
+        let mut entry = ArchiveEntry::new(PathBuf::from("g"), EntryType::Hardlink);
+        entry.link_target = Some(PathBuf::from("f"));
+        let member = MemberPath::parse(Path::new("g")).unwrap().unwrap();
+        let options = ReadOptions::default();
+        let _ = with_hook(swap, || {
+            extract_hardlink(&tree, tree.root(), &member, &entry, &options, &mut links)
+        });
+        let linked = std::fs::read_to_string(dir.path().join("g")).unwrap_or_default();
+        assert_ne!(
+            linked, "planted\n",
+            "the link member was linked to the planted file"
+        );
+    }
 
     /// POSIX, ustar Interchange Format: "When the file is restored by a
     /// privileged, protection-preserving version of the utility, the user and
@@ -1171,7 +1598,15 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts).unwrap();
+        set_made_attrs(
+            dir.as_fd(),
+            &name,
+            libc::S_IFIFO,
+            &entry,
+            &opts,
+            &mut Making::new(false),
+        )
+        .unwrap();
         assert_eq!(mode(), 0o755);
 
         // Preserved: exact 0o777 regardless of umask.
@@ -1182,7 +1617,15 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_made_attrs(dir.as_fd(), &name, libc::S_IFIFO, &entry, &opts).unwrap();
+        set_made_attrs(
+            dir.as_fd(),
+            &name,
+            libc::S_IFIFO,
+            &entry,
+            &opts,
+            &mut Making::new(false),
+        )
+        .unwrap();
         assert_eq!(mode(), 0o777);
     }
 

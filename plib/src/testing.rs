@@ -741,6 +741,50 @@ impl AsRef<std::ffi::OsStr> for TempFile {
     }
 }
 
+/// The effective user's private group (`plib::madefs::is_private_group`), when its primary
+/// group is one and is also the process's effective group, so that the directories a test
+/// makes belong to it. `None` on a host without user private groups.
+#[cfg(unix)]
+pub fn user_private_group() -> Option<u32> {
+    let euid = unsafe { libc::geteuid() };
+    let gid = crate::user::lookup_by_uid(euid).ok()??.gid;
+    let ours = gid == unsafe { libc::getegid() };
+    (ours && crate::madefs::is_private_group(gid, euid)).then_some(gid)
+}
+
+/// A group the effective user belongs to that is not the user's private group, which a test can
+/// give a directory (`chown`) to make its group write permission someone else's too. `None`
+/// when the user belongs to no such group.
+#[cfg(unix)]
+pub fn shared_group() -> Option<u32> {
+    let euid = unsafe { libc::geteuid() };
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0 as libc::gid_t; usize::try_from(count).ok()?];
+    let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    groups.truncate(usize::try_from(count).ok()?);
+    groups.push(unsafe { libc::getegid() });
+    groups
+        .into_iter()
+        .find(|&gid| !crate::madefs::is_private_group(gid, euid))
+}
+
+/// Give `path` a POSIX ACL entry granting uid 65534 (nobody) rwx, with `setfacl`; the group
+/// bits of its mode then show the ACL mask. `false`, with a note, when `setfacl` is missing or
+/// the filesystem takes no ACLs.
+#[cfg(unix)]
+pub fn grant_named_acl(path: &Path) -> bool {
+    let granted = Command::new("setfacl")
+        .args(["-m", "u:65534:rwx"])
+        .arg(path)
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !granted {
+        eprintln!("note: setfacl is missing or this filesystem takes no ACLs; case skipped");
+    }
+    granted
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_until_full, TempFile};

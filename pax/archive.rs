@@ -9,7 +9,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Type of archive entry
@@ -374,39 +374,62 @@ pub trait ArchiveWriter {
 /// pax -w` lists it and walks it), and a file forgotten before the repeat would
 /// be stored again in full -- splitting a hard-linked pair on extraction,
 /// depending on the order.
-#[derive(Debug, Default)]
-pub struct HardLinkTracker {
-    /// The first path each file was stored under, by (dev, ino)
-    stored: HashMap<(u64, u64), PathBuf>,
+///
+/// `T` is what is remembered of the first name: the archive member path when
+/// writing; when copying, the destination path and the identity of the copy
+/// made there.
+#[derive(Debug)]
+pub struct HardLinkTracker<T = PathBuf> {
+    /// What was remembered of each file's first name, by (dev, ino)
+    stored: HashMap<(u64, u64), T>,
 }
 
-impl HardLinkTracker {
+impl<T> Default for HardLinkTracker<T> {
+    fn default() -> Self {
+        HardLinkTracker {
+            stored: HashMap::new(),
+        }
+    }
+}
+
+impl<T> HardLinkTracker<T> {
     /// Create a new tracker
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The name a multiply-linked file was first stored under, if one of its
-    /// names already has been.
-    pub fn lookup(&self, dev: u64, ino: u64, nlink: u32) -> Option<PathBuf> {
+    /// What was remembered of the name a multiply-linked file was first
+    /// stored under, if one of its names already has been.
+    pub fn lookup(&self, dev: u64, ino: u64, nlink: u32) -> Option<&T> {
         if nlink <= 1 {
             return None;
         }
-        self.stored.get(&(dev, ino)).cloned()
+        self.stored.get(&(dev, ino))
     }
 
-    /// Note that a file's first name has been stored, as `stored`: the archive
-    /// member path when writing, the destination path when copying.
+    /// `lookup`, to change what was remembered.
+    pub fn lookup_mut(&mut self, dev: u64, ino: u64, nlink: u32) -> Option<&mut T> {
+        if nlink <= 1 {
+            return None;
+        }
+        self.stored.get_mut(&(dev, ino))
+    }
+
+    /// What was remembered of the file `(dev, ino)`.
+    pub fn by_key_mut(&mut self, key: (u64, u64)) -> Option<&mut T> {
+        self.stored.get_mut(&key)
+    }
+
+    /// Note that a file's first name has been stored, and what to remember of
+    /// it (`stored`).
     ///
     /// Separate from `lookup` because it must only happen once that name
     /// really is in the archive or the destination. Recording a file before
     /// its data was read made every later name of an unreadable file a link
     /// to a member that was never written.
-    pub fn record(&mut self, dev: u64, ino: u64, nlink: u32, stored: &Path) {
+    pub fn record(&mut self, dev: u64, ino: u64, nlink: u32, stored: T) {
         if nlink > 1 {
-            self.stored
-                .entry((dev, ino))
-                .or_insert_with(|| stored.to_path_buf());
+            self.stored.entry((dev, ino)).or_insert(stored);
         }
     }
 }
@@ -446,6 +469,37 @@ struct LinkSet<T> {
     /// The (size, mode, mtime) of the first of its names to carry data. newc
     /// stores the data with the last name only, the earlier ones empty.
     data: Option<(u64, u32, i64)>,
+    /// Whether its format stores the data with the last name only
+    /// (`defers_link_data`).
+    defers_data: bool,
+    /// The c_nlink its first name recorded.
+    nlink: u32,
+    /// How many of its names have been read (`count_name`).
+    names: u32,
+}
+
+impl<T> LinkSet<T> {
+    /// Whether data may still come on a later name: none has come yet, the
+    /// format stores it with the last name, and not every name has been read.
+    /// A file every name of which is empty is empty: in odc and the old
+    /// binary format each name carries the data, so the first one shows it,
+    /// and in newc the last one does.
+    fn awaits_data(&self) -> bool {
+        self.data.is_none() && self.defers_data && self.names < self.nlink
+    }
+}
+
+/// Whether `entry`'s format stores a link set's data with its last name only,
+/// the earlier ones empty: newc and crc. odc and the old binary format store it
+/// with every name.
+fn defers_link_data(entry: &ArchiveEntry) -> bool {
+    use crate::formats::cpio::CpioFormat;
+    matches!(
+        entry.source_header,
+        Some(SourceHeader::Cpio {
+            format: CpioFormat::Newc | CpioFormat::NewcCrc
+        })
+    )
 }
 
 /// The (size, mode, mtime) a member carrying data brings, if it brings any.
@@ -464,7 +518,7 @@ impl<T> Default for LinkSets<T> {
 impl<T> LinkSets<T> {
     /// The key of the set `entry` would be a name of, or `None` for a member
     /// that is not one of several names of a file.
-    fn key(entry: &ArchiveEntry) -> Option<(u64, u64)> {
+    pub fn key(entry: &ArchiveEntry) -> Option<(u64, u64)> {
         (entry.entry_type == EntryType::Regular && entry.nlink > 1)
             .then_some((entry.dev, entry.ino))
     }
@@ -482,9 +536,29 @@ impl<T> LinkSets<T> {
         Some(&mut set.value)
     }
 
-    /// What was remembered about every set started so far.
-    pub fn values(&self) -> impl Iterator<Item = &T> {
-        self.sets.values().map(|set| &set.value)
+    /// Count `entry` as a name read of the set an earlier name started, if
+    /// it is one, whether or not it is extracted.
+    pub fn count_name(&mut self, entry: &ArchiveEntry) {
+        if let Some(set) = Self::key(entry).and_then(|key| self.sets.get_mut(&key)) {
+            set.names = set.names.saturating_add(1);
+        }
+    }
+
+    /// What was remembered about the set whose key (`key`) is `key`.
+    pub fn by_key_mut(&mut self, key: (u64, u64)) -> Option<&mut T> {
+        self.sets.get_mut(&key).map(|set| &mut set.value)
+    }
+
+    /// Whether no set started so far awaits data on a later name.
+    pub fn all_settled(&self) -> bool {
+        !self.sets.values().any(LinkSet::awaits_data)
+    }
+
+    /// What was remembered about the set `entry` is a name of, once no data
+    /// can still come for it on a later name.
+    pub fn settled_mut(&mut self, entry: &ArchiveEntry) -> Option<&mut T> {
+        let set = self.sets.get_mut(&Self::key(entry)?)?;
+        (!set.awaits_data()).then_some(&mut set.value)
     }
 
     /// Start a set at `entry`, its first name. Nothing happens for a member
@@ -495,6 +569,9 @@ impl<T> LinkSets<T> {
             self.sets.entry(key).or_insert_with(|| LinkSet {
                 value: value(),
                 data: data_shape(entry),
+                defers_data: defers_link_data(entry),
+                nlink: entry.nlink,
+                names: 1,
             });
         }
     }
@@ -524,6 +601,7 @@ impl std::fmt::Display for ArchiveFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn member(entry_type: EntryType, ino: u64, nlink: u32) -> ArchiveEntry {
         ArchiveEntry {
@@ -557,6 +635,40 @@ mod tests {
         }
     }
 
+    /// A set awaits data only while its format stores it with the last name,
+    /// none has come, and not every name has been read: an empty file's set
+    /// settles too.
+    #[test]
+    fn test_link_sets_settle_when_no_data_can_follow() {
+        use crate::formats::cpio::CpioFormat;
+        let in_format = |format, ino, size| ArchiveEntry {
+            source_header: Some(SourceHeader::Cpio { format }),
+            ..named(ino, 3, size)
+        };
+        let mut sets: LinkSets<&str> = LinkSets::default();
+
+        // odc: every name carries the data, so an empty first name is final.
+        sets.insert(&in_format(CpioFormat::Odc, 1, 0), || "odc");
+        assert_eq!(sets.settled_mut(&named(1, 3, 0)).copied(), Some("odc"));
+
+        // newc: waits for its last name, or for one bringing data.
+        let newc = |ino, size| in_format(CpioFormat::Newc, ino, size);
+        sets.insert(&newc(2, 0), || "empty");
+        sets.insert(&newc(3, 0), || "data");
+        assert!(!sets.all_settled());
+        for _ in 0..2 {
+            assert_eq!(sets.settled_mut(&newc(2, 0)), None);
+            sets.count_name(&newc(2, 0));
+            sets.find_mut(&newc(2, 0));
+        }
+        assert_eq!(sets.settled_mut(&newc(2, 0)).copied(), Some("empty"));
+        assert!(!sets.all_settled());
+        sets.count_name(&newc(3, 4));
+        sets.find_mut(&newc(3, 4));
+        assert_eq!(sets.settled_mut(&newc(3, 0)).copied(), Some("data"));
+        assert!(sets.all_settled());
+    }
+
     /// Members sharing a key whose data differs are unrelated files; the
     /// newc set whose data arrives with its last name is still one file.
     #[test]
@@ -581,15 +693,18 @@ mod tests {
     fn test_hard_link_tracker_keeps_the_first_name() {
         let mut links = HardLinkTracker::new();
         // A file with one name is never remembered.
-        links.record(1, 7, 1, Path::new("solo"));
+        links.record(1, 7, 1, PathBuf::from("solo"));
         assert_eq!(links.lookup(1, 7, 1), None);
 
-        links.record(1, 9, 2, Path::new("a"));
+        links.record(1, 9, 2, PathBuf::from("a"));
         // Recording a second time keeps the first name, and the file stays
         // remembered however many of its names go by.
-        links.record(1, 9, 2, Path::new("b"));
+        links.record(1, 9, 2, PathBuf::from("b"));
         for _ in 0..3 {
-            assert_eq!(links.lookup(1, 9, 2).as_deref(), Some(Path::new("a")));
+            assert_eq!(
+                links.lookup(1, 9, 2).map(PathBuf::as_path),
+                Some(Path::new("a"))
+            );
         }
     }
 }

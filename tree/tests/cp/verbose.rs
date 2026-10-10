@@ -189,3 +189,61 @@ fn verbose_write_error_finishes_the_copy() {
     assert_eq!(fs::read_to_string(copied).unwrap(), "b\n");
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A directory made for the copy is reported only once it has been opened and checked to be the
+/// one made: one that cannot be opened is reported as an error, not as copied. The open is made
+/// to fail by a limit on open files, tried at each limit in turn, so that whichever opens the
+/// limit falls on, every directory reported as made is one the copy could open.
+#[test]
+#[cfg(target_os = "linux")]
+fn test_cp_verbose_reports_a_made_directory_only_once_opened() {
+    use std::os::unix::process::CommandExt;
+
+    let tmp = plib::tmp::tempdir().unwrap();
+    let dir = tmp.path();
+    fs::create_dir_all(dir.join("d/s")).unwrap();
+    fs::write(dir.join("d/s/f"), "f").unwrap();
+
+    let mut made_dir_failures = 0;
+    for limit in 3..32 {
+        let _ = fs::remove_dir_all(dir.join("dst"));
+        let mut command = Command::new(get_binary_path("cp"));
+        command
+            .args(["-Rv", "d", "dst"])
+            .current_dir(dir)
+            .stdin(Stdio::null());
+        // SAFETY: setrlimit is async-signal-safe, and nothing else runs in the child.
+        unsafe {
+            command.pre_exec(move || {
+                let rlim = libc::rlimit {
+                    rlim_cur: limit,
+                    rlim_max: limit,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for made in ["dst", "dst/s"] {
+            if stderr.contains(&format!("cannot open directory '{made}'")) {
+                made_dir_failures += 1;
+                assert!(
+                    !stdout.contains(&format!("-> '{made}'\n")),
+                    "limit {limit}: '{made}' reported as made: {stdout:?} {stderr:?}"
+                );
+            }
+        }
+        if output.status.success() {
+            break;
+        }
+    }
+    assert!(
+        made_dir_failures > 0,
+        "no limit made a directory fail to open"
+    );
+}

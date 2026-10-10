@@ -180,3 +180,38 @@ fn cp_lp_does_not_take_a_symlink_to_the_same_file_for_the_link() {
     assert_eq!((err.as_str(), code), ("", 0));
     assert_eq!(ident(&d.join("s2")), ident(&d.join("s1")));
 }
+
+/// A symbolic link at a destination name below the operand is not written through by -l, which
+/// writes nothing: the link is replaced by the hard link under -f, and refused as any existing
+/// destination is without it. Either way the file it points to is untouched (GNU coreutils 9.4).
+#[test]
+fn cp_rl_replaces_a_symlink_below_the_operand_only_under_f() {
+    let tmp = plib::tmp::tempdir().unwrap();
+    let d = tmp.path();
+    fs::create_dir_all(d.join("src/sub")).unwrap();
+    fs::write(d.join("src/sub/f"), "new\n").unwrap();
+    fs::write(d.join("victim"), "victim\n").unwrap();
+    fs::create_dir_all(d.join("dst/src/sub")).unwrap();
+    symlink("../../../victim", d.join("dst/src/sub/f")).unwrap();
+    let victim = ident(&d.join("victim"));
+
+    let (err, code) = cp_in(d, &["-Rl", "src", "dst"]);
+    assert_eq!(
+        (err.as_str(), code),
+        (
+            "cp: cannot create hard link 'dst/src/sub/f' to 'src/sub/f': File exists\n",
+            1
+        )
+    );
+    assert!(fs::symlink_metadata(d.join("dst/src/sub/f"))
+        .unwrap()
+        .is_symlink());
+
+    let (err, code) = cp_in(d, &["-Rlf", "src", "dst"]);
+    assert_eq!((err.as_str(), code), ("", 0));
+    assert_eq!(ident(&d.join("dst/src/sub/f")), ident(&d.join("src/sub/f")));
+
+    assert_eq!(ident(&d.join("victim")), victim);
+    assert_eq!(fs::read(d.join("victim")).unwrap(), b"victim\n");
+    assert_eq!(fs::metadata(d.join("victim")).unwrap().nlink(), 1);
+}

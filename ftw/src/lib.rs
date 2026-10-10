@@ -379,6 +379,8 @@ struct TreeNode {
     metadata: Metadata,
     /// Whether the directory entry is itself a symbolic link (one the walk followed).
     is_symlink: Option<bool>,
+    /// That link's own identity (`Entry::symlink_id`).
+    symlink_id: Option<(u64, u64)>,
     path_depth: usize,
 }
 
@@ -397,6 +399,7 @@ impl TreeNode {
         )
         .with_shown_name(self.shown_name.clone());
         entry.is_symlink = self.is_symlink;
+        entry.symlink_id = self.symlink_id;
         entry
     }
 
@@ -420,6 +423,9 @@ pub struct Entry<'a> {
     shown_name: Option<Rc<[libc::c_char]>>,
     metadata: Option<Metadata>,
     is_symlink: Option<bool>,
+    /// `(st_dev, st_ino)` of the entry itself when it is a symbolic link, from the walk's own
+    /// `lstat` of it.
+    symlink_id: Option<(u64, u64)>,
     read_link: Option<Rc<[libc::c_char]>>,
 }
 
@@ -437,6 +443,7 @@ impl<'a> Entry<'a> {
             shown_name: None,
             metadata,
             is_symlink: None,
+            symlink_id: None,
             read_link: None,
         }
     }
@@ -468,6 +475,15 @@ impl<'a> Entry<'a> {
     /// Check if this entry is a symlink.
     pub fn is_symlink(&self) -> Option<bool> {
         self.is_symlink
+    }
+
+    /// `(st_dev, st_ino)` of the entry itself when it is a symbolic link -- set exactly when
+    /// `is_symlink` is `Some(true)` -- from the `lstat` the walk made of it, the link it examined.
+    /// When the walk follows the link, `metadata` is its target's, and this is the only record of
+    /// the link: a caller asking whether a name is still that link compares against it rather
+    /// than resolving the name again.
+    pub fn symlink_id(&self) -> Option<(u64, u64)> {
+        self.symlink_id
     }
 
     /// Reads the symbolic link.
@@ -630,6 +646,10 @@ where
         }
     };
     let is_symlink = entry_symlink_metadata.file_type() == FileType::SymbolicLink;
+    let symlink_id = is_symlink.then(|| {
+        use std::os::unix::fs::MetadataExt;
+        (entry_symlink_metadata.dev(), entry_symlink_metadata.ino())
+    });
 
     // Read the link target for every symbolic link, whether or not this walk follows links:
     // consumers need it either way -- `cp -P` and `mv` recreate the link from it, `ls -l` prints
@@ -686,6 +706,7 @@ where
     let mut entry = Entry::new(dir_fd, path_stack, entry_filename, Some(entry_metadata))
         .with_shown_name(shown_name.cloned());
     entry.is_symlink = Some(is_symlink);
+    entry.symlink_id = symlink_id;
     entry.read_link = entry_readlink;
 
     if must_be_dir {
@@ -759,14 +780,15 @@ where
 /// Every prefix component is opened `O_RDONLY | O_DIRECTORY | O_CLOEXEC` plus `open_flags` (a
 /// walk's descent flags, so `O_NOFOLLOW` when it does not follow links). `O_DIRECTORY` refuses a
 /// FIFO or device swapped in for a component before the open can block on it or open the
-/// device. With `identities` (one recorded `(dev, ino)` per component of `path`), each opened
-/// component must also be the very directory the walk recorded there.
+/// device. With `identities` (giving one recorded `(dev, ino)` per component of `path`, and
+/// called only once a component is to be opened), each opened component must also be the very
+/// directory the walk recorded there.
 fn open_long_filename<'a, H>(
     mut starting_dir: FileDescriptor,
     path: &'a Path,
     mut path_stack: Option<&mut Vec<Rc<[libc::c_char]>>>,
     open_flags: libc::c_int,
-    identities: Option<&[(libc::dev_t, libc::ino_t)]>,
+    identities: Option<&dyn Fn() -> Vec<(libc::dev_t, libc::ino_t)>>,
     err_reporter: &mut H,
 ) -> io::Result<(FileDescriptor, std::path::Components<'a>)>
 where
@@ -774,6 +796,7 @@ where
 {
     let mut path_components = path.components();
     let mut opened = 0usize;
+    let mut recorded: Option<Vec<(libc::dev_t, libc::ino_t)>> = None;
 
     // If `path` is too long, start at a prefix of `path`
     loop {
@@ -823,7 +846,7 @@ where
         )
         .and_then(|fd| match identities {
             // Fail closed: a component with no recorded identity, or the wrong one, is refused.
-            Some(ids) => match ids.get(opened) {
+            Some(gather) => match recorded.get_or_insert_with(gather).get(opened) {
                 Some(&(dev, ino)) if fd_matches(&fd, dev, ino) => Ok(fd),
                 _ => Err(io::Error::from_raw_os_error(libc::ENOTDIR)),
             },
@@ -1072,8 +1095,9 @@ where
 /// the path to it is resolved again, so renaming or replacing one of its ancestors after `dir`
 /// was opened cannot redirect the walk. `name` is a single component (it may carry trailing
 /// slashes), looked up in `dir` exactly as `traverse_directory` looks up an operand's last
-/// component; and `postprocess_dir` for the starting point itself receives `dir` as the
-/// containing directory.
+/// component: a symbolic link named with a trailing slash is walked as `.` in the directory it
+/// names (`Entry::reached_through_symlink`). `postprocess_dir` for the starting point itself
+/// receives `dir` as the containing directory (or, for such a link, the directory it names).
 ///
 /// `display_parent` is only shown: each entry's `path()` is `display_parent` joined with the
 /// entry's path from `name`. It is never resolved.
@@ -1112,6 +1136,23 @@ where
             return false;
         }
     };
+
+    // A trailing slash after a name that may be a symbolic link: as in `traverse_directory`.
+    let name_bytes = name.to_bytes();
+    let (bare, suffix) = name_bytes.split_at(name_bytes.len() - directory_suffix_len(name_bytes));
+    if !suffix.is_empty() && !matches!(bare, b"" | b"." | b"..") {
+        let bare = CString::new(bare).expect("taken from a C string");
+        return walk_slash_operand(
+            starting_dir,
+            path_stack,
+            cstring_to_rc(&bare),
+            suffix,
+            file_handler,
+            postprocess_dir,
+            err_reporter,
+            opts,
+        );
+    }
     walk_from(
         starting_dir,
         path_stack,
@@ -1201,6 +1242,7 @@ where
                             filename: dir_filename,
                             shown_name,
                             is_symlink: entry.is_symlink,
+                            symlink_id: entry.symlink_id,
                             metadata: entry.metadata.unwrap(),
                             path_depth: path_stack.len(),
                         };
@@ -1461,6 +1503,7 @@ where
                                             filename: entry_filename,
                                             shown_name: None,
                                             is_symlink: entry.is_symlink,
+                                            symlink_id: entry.symlink_id,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1478,6 +1521,7 @@ where
                                             filename: entry_filename,
                                             shown_name: None,
                                             is_symlink: entry.is_symlink,
+                                            symlink_id: entry.symlink_id,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1512,6 +1556,7 @@ where
                                             filename: entry_filename,
                                             shown_name: None,
                                             is_symlink: entry.is_symlink,
+                                            symlink_id: entry.symlink_id,
                                             metadata: entry.metadata.unwrap(),
                                             path_depth,
                                         }
@@ -1626,7 +1671,8 @@ fn lists_nothing(dir: OwnedDir) -> io::Result<bool> {
 /// Whether the directory open on `dir_fd` is empty.
 ///
 /// It is read through a new open of `.` relative to `dir_fd` -- the same directory, which no
-/// rename can swap -- so `dir_fd`'s own read position is left alone.
+/// rename can swap -- so `dir_fd` itself (its read position, or a descriptor held for search
+/// only) is left alone. `plib::madefs` checks a directory it made with this too.
 pub fn is_empty_dir_fd(dir_fd: RawFd) -> io::Result<bool> {
     let fd = unsafe {
         libc::openat(

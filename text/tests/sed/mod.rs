@@ -9,6 +9,7 @@
 
 mod bytes;
 mod change;
+mod escapes;
 mod files;
 mod inplace;
 mod oneline;

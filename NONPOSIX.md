@@ -864,6 +864,11 @@ being redirected through a directory operand swapped for a symbolic link.
    (GNU applies the controls there too), and an empty text is still an
    error where GNU appends nothing.  perl's and binutils' Debian builds use
    it.
+ * In an RE, outside a bracket expression, `\t`, `\r`, `\a`, `\f` and `\v`
+   match those controls, as `\n` matches a <newline>; POSIX leaves `\c`
+   there unspecified.  Inside a bracket expression a `\` stays an ordinary
+   character (but for `\n`), as POSIX requires.  util-linux's ipcs test
+   cuts at a tab with `s/\t.*//`.
  * `PROJECT_NAME` — selects the gettext text domain.
 
 ### sh

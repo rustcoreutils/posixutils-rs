@@ -187,8 +187,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             let storage_class = declarator.storage_class;
             let name = self.symbol_name(declarator.symbol);
 
-            // Skip typedef declarations - they don't define storage
+            // Skip typedef declarations - they don't define storage.
             if storage_class.contains(TypeModifiers::TYPEDEF) {
+                continue;
+            }
+            // Nor does a register variable, which is its register: one the
+            // whole unit leaves alone.
+            if storage_class.contains(TypeModifiers::REGISTER) {
+                let reg = self.symbols.get(declarator.symbol).global_register();
+                if let Some(reg) = reg.filter(|r| !self.module.global_registers.contains(r)) {
+                    self.module.global_registers.push(reg);
+                }
                 continue;
             }
 

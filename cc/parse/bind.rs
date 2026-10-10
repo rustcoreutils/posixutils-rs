@@ -535,13 +535,27 @@ impl Parser<'_> {
         };
 
         match scope {
+            // A `register` variable's label names its register, not a symbol.
+            _ if !is_fn && specs.storage_class.contains(TypeModifiers::REGISTER) => {
+                self.bind_register_variable(symbol, name, typ, scope, init.is_some(), pos)
+            }
             DeclScope::File => self.settle_declaration_facts(name, specs.storage_class),
             // A block-scope declaration with linkage names the same object or
             // function a file-scope one would, under the same assembler name.
             DeclScope::Block { .. } if is_fn || specs.is_extern() => self.settle_asm_label(name),
             // One without names nothing an asm label could rename, and must
-            // not hand its label to the next declarator of the list.
-            DeclScope::Block { .. } => self.pending_asm_label = None,
+            // not hand its label to the next declarator of the list. gcc
+            // warns of it on an automatic variable.
+            DeclScope::Block { .. } => {
+                let label = self.pending_asm_label.take();
+                if label.is_some() && !specs.storage_class.contains(TypeModifiers::STATIC) {
+                    diag::warning_args(
+                        pos,
+                        "ignoring 'asm' specifier for non-static local variable '{0}'",
+                        &[self.idents.get_opt(name).unwrap_or("")],
+                    );
+                }
+            }
         }
 
         let Some(symbol) = symbol else {

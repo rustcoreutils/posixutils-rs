@@ -10,6 +10,7 @@
 // Scope-aware symbol management with C99 namespace support
 //
 
+use crate::arch::asm_constraints::PinnedGp;
 use crate::strings::StringId;
 use crate::types::TypeId;
 use std::collections::HashMap;
@@ -112,6 +113,17 @@ pub struct Symbol {
     /// headers, so ignoring it makes those headers fail to link.
     pub asm_label: Option<String>,
 
+    /// The register a GNU register variable names: `register long x
+    /// asm("r10")`. Not an asm label -- the variable is still the
+    /// declared one, not a symbol called `r10`.
+    ///
+    /// At block scope the variable keeps its storage, and the binding means
+    /// one thing: as an inline-asm register operand, the variable is in this
+    /// register (glibc's syscall wrappers rely on it). At file scope the
+    /// variable has no storage at all and *is* the register (Linux's
+    /// `current_stack_pointer`).
+    pub hard_register: Option<PinnedGp>,
+
     /// Whether this symbol's declaration was given size *expressions*, whose
     /// values it recorded -- so that an expression rooted in the symbol has
     /// somewhere to read its variable extents from. The type says which
@@ -156,6 +168,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            hard_register: None,
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
@@ -174,6 +187,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            hard_register: None,
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
@@ -192,6 +206,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            hard_register: None,
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
@@ -211,6 +226,7 @@ impl Symbol {
             enum_value: Some(value),
             explicit_align: None,
             asm_label: None,
+            hard_register: None,
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
@@ -230,6 +246,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            hard_register: None,
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
@@ -248,6 +265,7 @@ impl Symbol {
             enum_value: None,
             explicit_align: None,
             asm_label: None,
+            hard_register: None,
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
@@ -277,6 +295,13 @@ impl Symbol {
 
     pub fn is_enum_constant(&self) -> bool {
         self.kind == SymbolKind::EnumConstant
+    }
+
+    /// The register a file-scope register variable *is*, if this is one: it
+    /// has no storage, and a read or write of it is a read or write of the
+    /// register.
+    pub fn global_register(&self) -> Option<PinnedGp> {
+        self.hard_register.filter(|_| self.scope_depth == 0)
     }
 
     pub fn is_typedef(&self) -> bool {

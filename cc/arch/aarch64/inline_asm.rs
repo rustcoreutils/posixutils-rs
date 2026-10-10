@@ -13,12 +13,14 @@
 use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::legalize::{single_offset_fits, LEGALIZE_REG};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
-use crate::arch::aarch64::regalloc::{parse_gp_clobber_name, Loc, Reg, VReg};
+use crate::arch::aarch64::regalloc::{
+    asm_pinned_regs_aarch64, parse_gp_clobber_name, Loc, Reg, VReg,
+};
 use crate::arch::asm_constraints::{
     canonical_int, AsmAccess, AsmMemClass, AsmOperandClass, AsmRegClass,
 };
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
-use crate::arch::lir::{Directive, FpSize, OperandSize, Symbol};
+use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep, OperandSize, Symbol};
 use crate::ir::{AsmData, Instruction, PseudoId};
 
 /// What goes in a scratch register before the template: a memory operand's
@@ -45,6 +47,9 @@ enum OperandSetup {
 /// live value or another operand. A register the statement names as a
 /// clobber is not used: the template would destroy what it holds.
 ///
+/// Nor is a register the statement pins an operand to: it is loaded with
+/// that operand just before the template.
+///
 /// X15 is lent here under the one rule `legalize.rs` states for it: it is held
 /// only from its own setup, emitted last, to the template, and only by an
 /// operand whose setup never needs X15 as a temporary of its own. The
@@ -70,10 +75,11 @@ struct OperandRegs {
 }
 
 impl OperandRegs {
-    fn new(clobbers: &[String], legalize_reg_first: bool) -> Self {
+    fn new(clobbers: &[String], pinned: &[Reg], legalize_reg_first: bool) -> Self {
         let clobbered: Vec<Reg> = clobbers
             .iter()
             .filter_map(|c| parse_gp_clobber_name(c))
+            .chain(pinned.iter().copied())
             .collect();
         let ip = [Reg::X17, Reg::X16]
             .into_iter()
@@ -191,6 +197,21 @@ pub(super) fn asm_reg_name_32(reg: Reg) -> &'static str {
     }
 }
 
+/// An operand moved into or out of the register it is pinned to, around the
+/// template.
+#[derive(Clone)]
+struct PinnedMove {
+    /// The register the template sees the operand in.
+    pin: Reg,
+    /// The operand's value, where it lives.
+    pseudo: PseudoId,
+    loc: Loc,
+    size: u32,
+    /// A scratch to stage through, when `pin` is the stack pointer and
+    /// `loc` is memory: `sp` can be neither loaded nor stored.
+    via: Option<Reg>,
+}
+
 /// Whether the class asks for a vector (SIMD/FP) register.
 fn requires_vector(class: &AsmOperandClass) -> bool {
     class.reg == Some(AsmRegClass::Vector)
@@ -221,11 +242,22 @@ impl Aarch64CodeGen {
         let operand_count = asm_data.outputs.len() + asm_data.inputs.len();
         let mut slots: Vec<crate::arch::AsmOperandSlot<Reg>> = Vec::with_capacity(operand_count);
 
+        // Operands pinned to one register (a register variable's), loaded
+        // there before the template and stored from there after it. No
+        // scratch may be one of these registers.
+        let pins = asm_pinned_regs_aarch64(asm_data);
+        let pinned: Vec<Reg> = pins.iter().flatten().copied().collect();
+        let mut pinned_in: Vec<PinnedMove> = Vec::new();
+        let mut pinned_out: Vec<PinnedMove> = Vec::new();
+
         // Scratch budgets, shared by the output and input loops so two
         // operands can never be handed the same register. `Reg::scratch_regs`
         // reserves X9/X10/X11 and `VReg::allocatable` reserves V16/V17/V18.
         // Popped from the end so X9 and V16 go first.
-        let mut gp_scratch: Vec<Reg> = vec![Reg::X11, Reg::X10, Reg::X9];
+        let mut gp_scratch: Vec<Reg> = [Reg::X11, Reg::X10, Reg::X9]
+            .into_iter()
+            .filter(|r| !pinned.contains(r))
+            .collect();
         let mut v_scratch: Vec<VReg> = vec![VReg::V18, VReg::V17, VReg::V16];
         // Vector operands copied back out of their scratch after the template.
         let mut vec_output_moves: Vec<(VReg, Loc, u32)> = Vec::new();
@@ -234,6 +266,7 @@ impl Aarch64CodeGen {
         // Operands that have to be put in a scratch register first.
         let mut addr_regs = OperandRegs::new(
             &asm_data.clobbers,
+            &pinned,
             asm_data
                 .outputs
                 .iter()
@@ -245,7 +278,7 @@ impl Aarch64CodeGen {
         let mut gp_output_moves: Vec<(Reg, Loc, u32)> = Vec::new();
 
         // Process output operands (they go first: %0, %1, etc.)
-        for output in &asm_data.outputs {
+        for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
             let requires_mem = output.is_memory();
             let read_write = output.class.access == AsmAccess::ReadWrite;
@@ -256,6 +289,27 @@ impl Aarch64CodeGen {
                 size: op_size,
                 name: op_name.clone(),
             };
+            if let Some(pin) = pins[idx] {
+                slots.push(mk(AsmOperandValue::Reg(pin)));
+                if loc != Loc::Reg(pin) {
+                    let Some(m) = self.pinned_move(
+                        pin,
+                        output.pseudo,
+                        op_size,
+                        &mut addr_regs,
+                        &mut gp_scratch,
+                        insn,
+                    ) else {
+                        continue;
+                    };
+                    // A `"+r"` operand's value goes in before the template.
+                    if read_write {
+                        pinned_in.push(m.clone());
+                    }
+                    pinned_out.push(m);
+                }
+                continue;
+            }
             match loc {
                 Loc::Reg(r) if requires_mem => {
                     // Memory-class constraint with the address in a
@@ -357,10 +411,32 @@ impl Aarch64CodeGen {
         let mut hidden: Vec<usize> = Vec::new();
 
         // Process input operands
-        for input in &asm_data.inputs {
+        for (input_idx, input) in asm_data.inputs.iter().enumerate() {
             if let Some(match_idx) = input.matching_output {
                 if match_idx < num_outputs && input.is_hidden_readwrite_input() {
                     hidden.push(match_idx);
+                    continue;
+                }
+                // Tied to a pinned output, whose pseudo the linearizer gave
+                // this input's value: loaded into the pin before the
+                // template.
+                if let Some(pin) = pins.get(match_idx).copied().flatten() {
+                    let pseudo = asm_data.outputs[match_idx].pseudo;
+                    let mut slot = slots[match_idx].clone();
+                    slot.name = input.name.clone();
+                    slots.push(slot);
+                    if self.get_location(pseudo) != Loc::Reg(pin) {
+                        if let Some(m) = self.pinned_move(
+                            pin,
+                            pseudo,
+                            input.size,
+                            &mut addr_regs,
+                            &mut gp_scratch,
+                            insn,
+                        ) {
+                            pinned_in.push(m);
+                        }
+                    }
                     continue;
                 }
                 // An explicit tied input (`"0"`) names its output's operand:
@@ -401,6 +477,48 @@ impl Aarch64CodeGen {
                 value,
                 size: op_size,
                 name: op_name.clone(),
+            };
+            if let Some(pin) = pins[num_outputs + input_idx] {
+                slots.push(mk(AsmOperandValue::Reg(pin)));
+                if loc != Loc::Reg(pin) {
+                    if let Some(m) = self.pinned_move(
+                        pin,
+                        input.pseudo,
+                        op_size,
+                        &mut addr_regs,
+                        &mut gp_scratch,
+                        insn,
+                    ) {
+                        pinned_in.push(m);
+                    }
+                }
+                continue;
+            }
+            // An operand that shares its pseudo with a pinned one may sit in
+            // another operand's pin, which is overwritten before the
+            // template: it is copied to a scratch first.
+            let loc = match loc {
+                Loc::Reg(r) if pinned.contains(&r) => {
+                    let size = if requires_mem { 64 } else { op_size };
+                    let Some(reg) = addr_regs.take(&mut gp_scratch, false) else {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "too many register operands in one asm statement; \
+                             c17 has no register left to give one",
+                        );
+                        slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
+                        continue;
+                    };
+                    addr_regs.setups.push((
+                        reg,
+                        OperandSetup::Value {
+                            pseudo: input.pseudo,
+                            size,
+                        },
+                    ));
+                    Loc::Reg(reg)
+                }
+                other => other,
             };
             match loc {
                 // A symbolic constant (`"S"`): the global's address, written
@@ -647,11 +765,18 @@ impl Aarch64CodeGen {
             self.emit_vec_load_from_loc(*vreg, loc, *size, insn.pos);
         }
 
-        // Scratch operands, last: nothing may run between these and the
-        // template, since the legalizer writes X15 expanding anything.
-        let mut setups = std::mem::take(&mut addr_regs.setups);
-        setups.sort_by_key(|(reg, _)| *reg == LEGALIZE_REG);
-        for (reg, setup) in setups {
+        // Scratch operands, then the pinned ones, then whatever went in X15:
+        // nothing may run between that and the template, since the
+        // legalizer writes X15 expanding anything -- a pinned operand's load
+        // from a far stack slot among them.
+        let (late, early): (Vec<_>, Vec<_>) = std::mem::take(&mut addr_regs.setups)
+            .into_iter()
+            .partition(|(reg, _)| *reg == LEGALIZE_REG);
+        for (reg, setup) in early {
+            self.emit_operand_setup(reg, setup);
+        }
+        self.emit_pinned_inputs(&pinned_in);
+        for (reg, setup) in late {
             self.emit_operand_setup(reg, setup);
         }
 
@@ -682,16 +807,16 @@ impl Aarch64CodeGen {
         // Register outputs held in a scratch go back where they live. Only on
         // the fall-through: a jump to an `asm goto` label skips these, so
         // such a statement must not need any.
-        if !gp_output_moves.is_empty() && !asm_data.goto_labels.is_empty() {
+        if (!gp_output_moves.is_empty() || !pinned_out.is_empty())
+            && !asm_data.goto_labels.is_empty()
+        {
             crate::diag::error(
                 insn.pos.unwrap_or_default(),
                 "an asm goto output needs a register of its own, and this statement \
                  has more register operands than c17 can give them",
             );
         }
-        for (reg, loc, size) in &gp_output_moves {
-            self.emit_move_to_loc(*reg, loc, *size);
-        }
+        self.emit_register_outputs(&gp_output_moves, &pinned_out);
 
         // Copy vector outputs out of their scratch into where the operand
         // actually lives.
@@ -703,6 +828,134 @@ impl Aarch64CodeGen {
         // allocator honours (`regalloc::get_constraint_info_aarch64`), and a
         // `"memory"` clobber makes the asm a barrier in the IR
         // (`Instruction::is_memory_barrier`).
+    }
+
+    /// The move of `pseudo` into or out of `pin`, the register an operand
+    /// is pinned to. `None`, reported, when the stack pointer needs a
+    /// scratch to stage through and none is left.
+    fn pinned_move(
+        &self,
+        pin: Reg,
+        pseudo: PseudoId,
+        size: u32,
+        addr_regs: &mut OperandRegs,
+        gp_scratch: &mut Vec<Reg>,
+        insn: &Instruction,
+    ) -> Option<PinnedMove> {
+        let loc = self.get_location(pseudo);
+        let via = if pin == Reg::SP && !matches!(loc, Loc::Reg(_)) {
+            let Some(reg) = addr_regs.take(gp_scratch, false) else {
+                crate::diag::error(
+                    insn.pos.unwrap_or_default(),
+                    "too many register operands in one asm statement; \
+                     c17 has no register left to give one",
+                );
+                return None;
+            };
+            Some(reg)
+        } else {
+            None
+        };
+        Some(PinnedMove {
+            pin,
+            pseudo,
+            loc,
+            size,
+            via,
+        })
+    }
+
+    /// Load each pinned input into its register, as though all at once: one
+    /// operand's register may hold another's value. A cycle is broken by
+    /// exchanging two registers, three `eor`s, since every scratch may be
+    /// spoken for.
+    fn emit_pinned_inputs(&mut self, moves: &[PinnedMove]) {
+        let planned: Vec<(Option<Reg>, Option<Reg>)> = moves
+            .iter()
+            .map(|m| (Some(m.pin), Self::loc_reg(&m.loc)))
+            .collect();
+        // X15 last: the legalizer may still want it for the others.
+        let (late, early): (Vec<_>, Vec<_>) = plan_parallel_moves(&planned)
+            .into_iter()
+            .partition(|step| matches!(step, MoveStep::Move { index, .. } if moves[*index].pin == LEGALIZE_REG));
+        for step in early.into_iter().chain(late) {
+            match step {
+                MoveStep::Move { index, from } => {
+                    let m = &moves[index];
+                    match (from, m.via) {
+                        (Some(r), _) => self.emit_reg_move(r, m.pin),
+                        (None, Some(via)) => {
+                            self.emit_move(m.pseudo, via, 64);
+                            self.emit_reg_move(via, m.pin);
+                        }
+                        (None, None) => self.emit_move(m.pseudo, m.pin, m.size),
+                    }
+                }
+                MoveStep::Swap(a, b) => self.emit_reg_swap(a, b),
+            }
+        }
+    }
+
+    /// Store each register output where it lives -- a scratch the template
+    /// wrote (`scratch`), or a pinned register -- as though all at once: one
+    /// output's home may be the register another was pinned to.
+    fn emit_register_outputs(&mut self, scratch: &[(Reg, Loc, u32)], pinned: &[PinnedMove]) {
+        let outs: Vec<(Reg, &Loc, u32, Option<Reg>)> = scratch
+            .iter()
+            .map(|(reg, loc, size)| (*reg, loc, *size, None))
+            .chain(pinned.iter().map(|m| (m.pin, &m.loc, m.size, m.via)))
+            .collect();
+        let planned: Vec<(Option<Reg>, Option<Reg>)> = outs
+            .iter()
+            .map(|(src, loc, _, _)| (Self::loc_reg(loc), Some(*src)))
+            .collect();
+        for step in plan_parallel_moves(&planned) {
+            match step {
+                MoveStep::Move { index, from } => {
+                    let (src, loc, size, via) = outs[index];
+                    let src = from.unwrap_or(src);
+                    match via {
+                        Some(via) => {
+                            self.emit_reg_move(src, via);
+                            self.emit_move_to_loc(via, loc, size);
+                        }
+                        None => self.emit_move_to_loc(src, loc, size),
+                    }
+                }
+                MoveStep::Swap(a, b) => self.emit_reg_swap(a, b),
+            }
+        }
+    }
+
+    /// The register `loc` is, if it is one.
+    fn loc_reg(loc: &Loc) -> Option<Reg> {
+        match loc {
+            Loc::Reg(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// `dst = src`, all 64 bits; either may be the stack pointer.
+    fn emit_reg_move(&mut self, src: Reg, dst: Reg) {
+        if src != dst {
+            self.push_lir(Aarch64Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(src),
+                dst,
+            });
+        }
+    }
+
+    /// Exchange two general registers without a third.
+    fn emit_reg_swap(&mut self, a: Reg, b: Reg) {
+        for (src1, src2, dst) in [(a, b, a), (a, b, b), (a, b, a)] {
+            self.push_lir(Aarch64Inst::Eor {
+                size: OperandSize::B64,
+                src1,
+                src2: GpOperand::Reg(src2),
+                dst,
+            });
+        }
     }
 
     /// The text of a memory-class operand whose address is not already in a

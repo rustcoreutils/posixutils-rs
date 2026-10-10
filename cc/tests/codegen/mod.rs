@@ -22,6 +22,7 @@ mod asm_memory_outputs;
 mod asm_operand_modifiers;
 mod asm_pinned_operands;
 pub mod asm_probe;
+mod asm_register_vars;
 mod asm_template_syntax;
 mod binary128;
 mod bitfield_layout;

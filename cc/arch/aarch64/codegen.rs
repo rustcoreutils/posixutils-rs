@@ -67,6 +67,9 @@ pub struct Aarch64CodeGen {
     pub(super) darwin_va_sp_slot: Option<i32>,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
+    /// The registers the unit's file-scope register variables are, which no
+    /// function may allocate; see `Module::global_registers`.
+    pub(super) global_registers: Vec<crate::arch::aarch64::regalloc::Reg>,
     /// Thread-local storage symbols (need TLS access)
     pub(super) tls_symbols: HashSet<String>,
     /// Every data symbol's known alignment in bytes -- definitions here and
@@ -101,6 +104,7 @@ impl Aarch64CodeGen {
             named_stack_param_bytes: 0,
             darwin_va_sp_slot: None,
             extern_symbols: HashSet::new(),
+            global_registers: Vec::new(),
             tls_symbols: HashSet::new(),
             sym_align: HashMap::new(),
             pic_mode: false,
@@ -1336,6 +1340,11 @@ impl CodeGenerator for Aarch64CodeGen {
         self.base.reset_debug_state();
         self.base.emit_debug = module.debug;
         self.extern_symbols = module.extern_symbols.clone();
+        self.global_registers = module
+            .global_registers
+            .iter()
+            .filter_map(|r| r.aarch64())
+            .collect();
 
         // Collect thread-local storage symbols (both defined and extern)
         self.tls_symbols = module

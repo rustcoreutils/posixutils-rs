@@ -69,6 +69,9 @@ pub struct X86_64CodeGen {
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
+    /// The registers the unit's file-scope register variables are, which no
+    /// function may allocate; see `Module::global_registers`.
+    pub(super) global_registers: Vec<crate::arch::x86_64::regalloc::Reg>,
     /// Thread-local storage symbols (need TLS access via FS segment)
     pub(super) tls_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries and PIE)
@@ -126,6 +129,7 @@ impl X86_64CodeGen {
             named_incoming_end: 16,
             unique_label_counter: 0,
             extern_symbols: HashSet::new(),
+            global_registers: Vec::new(),
             tls_symbols: HashSet::new(),
             pic_mode: false,
             ld_constants: std::collections::BTreeMap::new(),
@@ -1661,6 +1665,11 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.reset_debug_state();
         self.base.emit_debug = module.debug;
         self.extern_symbols = module.extern_symbols.clone();
+        self.global_registers = module
+            .global_registers
+            .iter()
+            .filter_map(|r| r.x86_64())
+            .collect();
 
         // Collect thread-local storage symbols (both defined and extern)
         self.tls_symbols = module

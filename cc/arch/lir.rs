@@ -425,6 +425,82 @@ pub fn plan_pair_move(first_clobbers_second: bool, second_clobbers_first: bool) 
     }
 }
 
+/// One step of a parallel move, in the order [`plan_parallel_moves`] gives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoveStep<R> {
+    /// Perform move `index`. `from` is the register its value is in now --
+    /// not necessarily the one it was planned from, once a swap has moved it
+    /// -- or `None` for a source no move writes.
+    Move { index: usize, from: Option<R> },
+    /// Exchange the contents of two registers.
+    Swap(R, R),
+}
+
+/// Order moves that must happen as though all at once -- the operands an
+/// inline asm wants in named registers, each of which may be another's
+/// source.
+///
+/// `moves[i]` is `(destination, source)`: the destination register, or
+/// `None` for memory, which no other move reads; the source register, or
+/// `None` for a source no move can overwrite (memory, a constant). Moved in
+/// the order written, `mov %rsi, %rdi; mov %rdi, %rsi` handed both operands
+/// the same value. A move is made only once nothing still pending reads its
+/// destination, a move whose source is its destination is dropped, and a
+/// cycle, which has no such order, is broken with a swap.
+pub fn plan_parallel_moves<R: Copy + Eq>(moves: &[(Option<R>, Option<R>)]) -> Vec<MoveStep<R>> {
+    let mut pending: Vec<(usize, Option<R>, Option<R>)> = moves
+        .iter()
+        .enumerate()
+        .map(|(i, &(dst, src))| (i, dst, src))
+        .collect();
+    let mut steps = Vec::with_capacity(moves.len());
+    loop {
+        pending.retain(|&(_, dst, src)| dst.is_none() || dst != src);
+        if pending.is_empty() {
+            return steps;
+        }
+        let read_by_another = |k: usize, pending: &[(usize, Option<R>, Option<R>)]| {
+            let dst = pending[k].1;
+            dst.is_some()
+                && pending
+                    .iter()
+                    .enumerate()
+                    .any(|(j, m)| j != k && m.2 == dst)
+        };
+        if let Some(k) = (0..pending.len()).find(|&k| !read_by_another(k, &pending)) {
+            let (index, _, from) = pending.remove(k);
+            steps.push(MoveStep::Move { index, from });
+            continue;
+        }
+        // Every destination is still to be read: the moves form at least
+        // one cycle. Walk from any move to a move reading its destination
+        // until one repeats; that one is on a cycle, and every move on a
+        // cycle reads a register.
+        let mut seen = vec![false; pending.len()];
+        let mut k = 0;
+        while !seen[k] {
+            seen[k] = true;
+            let dst = pending[k].1;
+            k = (0..pending.len())
+                .find(|&j| j != k && pending[j].2 == dst)
+                .expect("every pending destination is read");
+        }
+        let (_, dst, src) = pending.remove(k);
+        let (Some(d), Some(s)) = (dst, src) else {
+            unreachable!("a move on a cycle is register to register")
+        };
+        steps.push(MoveStep::Swap(d, s));
+        // The swap made this move, and left what `d` held in `s`.
+        for m in &mut pending {
+            if m.2 == Some(d) {
+                m.2 = Some(s);
+            } else if m.2 == Some(s) {
+                m.2 = Some(d);
+            }
+        }
+    }
+}
+
 // Complex Type Helpers
 
 /// How many SSE registers a complex argument occupies under System V AMD64.
@@ -1669,6 +1745,66 @@ impl EmitAsm for Directive {
 mod tests {
     use super::*;
     use crate::target::Arch;
+
+    /// Run a plan over registers 0..8 holding their own numbers, with memory
+    /// sources holding 100 + the move's index, and answer what each
+    /// destination ended up with.
+    fn run_parallel_moves(moves: &[(Option<u8>, Option<u8>)]) -> Vec<u32> {
+        let mut regs: Vec<u32> = (0..8).collect();
+        let mut mem = vec![0u32; moves.len()];
+        for step in plan_parallel_moves(moves) {
+            match step {
+                MoveStep::Move { index, from } => {
+                    let v = from.map_or(100 + index as u32, |r| regs[r as usize]);
+                    match moves[index].0 {
+                        Some(d) => regs[d as usize] = v,
+                        None => mem[index] = v,
+                    }
+                }
+                MoveStep::Swap(a, b) => regs.swap(a as usize, b as usize),
+            }
+        }
+        moves
+            .iter()
+            .enumerate()
+            .map(|(i, &(dst, _))| dst.map_or(mem[i], |d| regs[d as usize]))
+            .collect()
+    }
+
+    /// Every destination receives what its source held before any move, as
+    /// though the moves were simultaneous: chains in either order, a value
+    /// read twice, a two- and a three-register cycle, a cycle with a chain
+    /// hanging off it, and memory on either side.
+    #[test]
+    fn parallel_moves_read_every_source_before_it_is_written() {
+        let cases: &[&[(Option<u8>, Option<u8>)]] = &[
+            &[(Some(0), Some(7)), (Some(7), Some(6)), (Some(6), Some(5))],
+            &[(Some(6), Some(5)), (Some(7), Some(6)), (Some(0), Some(7))],
+            &[(Some(1), Some(2)), (Some(2), Some(1))],
+            &[(Some(1), Some(2)), (Some(2), Some(3)), (Some(3), Some(1))],
+            &[
+                (Some(1), Some(2)),
+                (Some(2), Some(1)),
+                (Some(4), Some(1)),
+                (Some(5), Some(2)),
+            ],
+            &[
+                (Some(3), Some(3)),
+                (Some(4), Some(3)),
+                (Some(5), None),
+                (None, Some(4)),
+            ],
+            &[(None, Some(1)), (Some(1), Some(2)), (Some(2), Some(1))],
+        ];
+        for moves in cases {
+            let want: Vec<u32> = moves
+                .iter()
+                .enumerate()
+                .map(|(i, &(_, src))| src.map_or(100 + i as u32, u32::from))
+                .collect();
+            assert_eq!(run_parallel_moves(moves), want, "{moves:?}");
+        }
+    }
 
     /// The last register of a composite parameter carries what is left of the
     /// object, not a whole eightbyte.

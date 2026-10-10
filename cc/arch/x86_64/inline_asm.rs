@@ -12,7 +12,7 @@
 
 use crate::arch::asm_constraints::{canonical_int, AsmOperandClass, AsmRegClass, X87Slot};
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
-use crate::arch::lir::{Directive, FpSize};
+use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::X86Inst;
 use crate::arch::x86_64::regalloc::{asm_pinned_regs, Loc, Reg, XmmReg};
@@ -711,9 +711,37 @@ impl X86_64CodeGen {
             self.emit_fp_move(*pseudo, *xmm, fp_size);
         }
 
-        for (specific_reg, actual_loc, size) in input_moves.iter() {
-            self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
+        // As though all at once: one operand's register may be another's
+        // source, as when two register variables want each other's
+        // registers.
+        let planned: Vec<(Option<Reg>, Option<Reg>)> = input_moves
+            .iter()
+            .map(|(dst, loc, _)| (Some(*dst), Self::loc_reg(loc)))
+            .collect();
+        for step in plan_parallel_moves(&planned) {
+            match step {
+                MoveStep::Move { index, from } => {
+                    let (dst, loc, size) = &input_moves[index];
+                    let src = from.map_or_else(|| loc.clone(), Loc::Reg);
+                    self.emit_raw_mov_from_loc(&src, *dst, *size);
+                }
+                MoveStep::Swap(a, b) => self.emit_reg_swap(a, b),
+            }
         }
+    }
+
+    /// The register `loc` is, if it is one.
+    fn loc_reg(loc: &Loc) -> Option<Reg> {
+        match loc {
+            Loc::Reg(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Exchange two general registers, for a cycle of operand moves.
+    fn emit_reg_swap(&mut self, a: Reg, b: Reg) {
+        let text = format!("xchgq %{}, %{}", self.reg_name_64(a), self.reg_name_64(b));
+        self.push_lir(X86Inst::Directive(Directive::Raw(text)));
     }
 
     /// Substitute the operands into the template and emit it as raw text.
@@ -819,14 +847,31 @@ impl X86_64CodeGen {
             );
         }
 
-        // Emit moves from specific registers to actual locations (for outputs)
-        for (_idx, specific_reg, actual_loc, size) in output_moves.iter() {
-            self.emit_raw_mov_to_loc(*specific_reg, actual_loc, *size);
-        }
-
-        // Emit remap restore moves (for outputs that conflicted with reserved regs)
-        for (temp, _orig, actual_loc, size) in remap_restore.iter() {
-            self.emit_raw_mov_to_loc(*temp, actual_loc, *size);
+        // Move outputs out of the registers the template wrote -- a pinned
+        // one, or a temp standing in for a reserved one -- to where they
+        // live, as though all at once: one output's home may be the register
+        // another was pinned to.
+        let outs: Vec<(Reg, &Loc, u32)> = output_moves
+            .iter()
+            .map(|(_, reg, loc, size)| (*reg, loc, *size))
+            .chain(
+                remap_restore
+                    .iter()
+                    .map(|(temp, _, loc, size)| (*temp, loc, *size)),
+            )
+            .collect();
+        let planned: Vec<(Option<Reg>, Option<Reg>)> = outs
+            .iter()
+            .map(|(src, loc, _)| (Self::loc_reg(loc), Some(*src)))
+            .collect();
+        for step in plan_parallel_moves(&planned) {
+            match step {
+                MoveStep::Move { index, from } => {
+                    let (src, loc, size) = outs[index];
+                    self.emit_raw_mov_to_loc(from.unwrap_or(src), loc, size);
+                }
+                MoveStep::Swap(a, b) => self.emit_reg_swap(a, b),
+            }
         }
 
         // Clobbers emit nothing here. A register clobber is a constraint the

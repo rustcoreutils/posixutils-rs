@@ -838,3 +838,78 @@ fn test_stack_protect_attributes_reach_the_definition() {
     assert_eq!(attr("b1"), StackProtectAttr::Exempt);
     assert_eq!(attr("b2"), StackProtectAttr::Protect);
 }
+
+/// A `register` declarator's asm label binds it to a register, on the target
+/// being compiled for and in any spelling a clobber list takes; it is no asm
+/// label. A label on an automatic variable without `register` binds nothing.
+#[test]
+fn test_register_variables_bind_their_register() {
+    use crate::arch::aarch64::regalloc::Reg as A64Reg;
+    use crate::arch::asm_constraints::PinnedGp;
+    use crate::arch::x86_64::regalloc::Reg as X86Reg;
+    use crate::symbol::SymbolId;
+    let cases = [
+        (
+            Arch::X86_64,
+            "rsp",
+            "%r10",
+            PinnedGp::X86_64(X86Reg::Rsp),
+            PinnedGp::X86_64(X86Reg::R10),
+        ),
+        (
+            Arch::Aarch64,
+            "sp",
+            "w8",
+            PinnedGp::Aarch64(A64Reg::SP),
+            PinnedGp::Aarch64(A64Reg::X8),
+        ),
+    ];
+    for (arch, global, local, want_global, want_local) in cases {
+        let src = format!(
+            "register unsigned long g asm(\"{global}\");\n\
+             void f(void) {{ register long l asm(\"{local}\"); long plain asm(\"x9\"); }}\n"
+        );
+        let (_, _, strings, symbols) = parse_tu_for(&src, &Target::new(arch, Os::Linux)).unwrap();
+        let named = |name: &str| {
+            let id = strings.lookup(name).expect("interned");
+            (0..symbols.len() as u32)
+                .map(|i| symbols.get(SymbolId(i)))
+                .find(|s| s.name == id)
+                .expect("declared")
+        };
+        let (g, l, plain) = (named("g"), named("l"), named("plain"));
+        assert_eq!(g.hard_register, Some(want_global), "{arch:?}");
+        assert_eq!(g.global_register(), Some(want_global), "{arch:?}");
+        assert_eq!(g.asm_label, None, "{arch:?}");
+        assert_eq!(l.hard_register, Some(want_local), "{arch:?}");
+        assert_eq!(l.global_register(), None, "{arch:?}");
+        assert_eq!(plain.hard_register, None, "{arch:?}");
+    }
+}
+
+/// What a register variable may not be: a name that is no register of the
+/// target, an initialized global, a global in a caller-saved register or
+/// the frame pointer, a local in the stack or frame pointer, or a type no
+/// general register holds.
+#[test]
+fn test_register_variable_rejections() {
+    for src in [
+        "void f(void) { register long x asm(\"bogus\"); }",
+        "void f(void) { register long x asm(\"x0\"); }",
+        "register unsigned long s asm(\"rsp\") = 4;",
+        "register unsigned long s asm(\"r11\");",
+        "register unsigned long s asm(\"rbp\");",
+        "void f(void) { register long x asm(\"rbp\"); }",
+        "void f(void) { register long x asm(\"rsp\"); }",
+        "void f(void) { register double x asm(\"rax\"); }",
+        "void f(void) { register struct { long a; } x asm(\"rax\"); }",
+        "register unsigned long s asm(\"rsp\"); unsigned long *f(void) { return &s; }",
+    ] {
+        let before = crate::diag::error_count();
+        let failed = parse_tu_for(src, &Target::new(Arch::X86_64, Os::Linux)).is_err();
+        assert!(
+            failed || crate::diag::error_count() > before,
+            "{src}: accepted"
+        );
+    }
+}

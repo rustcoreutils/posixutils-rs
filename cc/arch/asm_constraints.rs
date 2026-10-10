@@ -22,8 +22,10 @@
 // register on one and a symbolic constant on the other -- which is why the
 // classifier takes the target.
 
+use crate::arch::aarch64::regalloc::Reg as A64Reg;
+use crate::arch::x86_64::regalloc::Reg as X86Reg;
 use crate::float::FloatVal;
-use crate::ir::{AsmData, PseudoId};
+use crate::ir::{AsmConstraint, AsmData, PseudoId};
 use crate::target::Arch;
 
 /// How the template accesses an operand: `=` writes it, `+` reads and
@@ -44,15 +46,86 @@ pub enum X87Slot {
     Second,
 }
 
-/// A general register one x86-64 letter names: `a`, `b`, `c`, `d`, `S`, `D`.
+/// The one general register an operand is pinned to: by an x86-64 letter
+/// (`a`, `b`, `c`, `d`, `S`, `D`), or on either target by a GNU register
+/// variable (`register long x asm("r10")`) used as a register operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinnedGp {
-    Rax,
-    Rbx,
-    Rcx,
-    Rdx,
-    Rsi,
-    Rdi,
+    X86_64(X86Reg),
+    Aarch64(A64Reg),
+}
+
+impl PinnedGp {
+    /// The general register `name` spells on `arch` -- as a clobber list
+    /// spells it, so `rax`, `eax`, `r10` and `%rdx` all name one on x86-64,
+    /// `x0`, `w0` and `sp` on aarch64. `None` for anything else, which a
+    /// register variable reports as an invalid register name. The zero
+    /// register holds nothing, so it is none.
+    pub fn named(name: &str, arch: Arch) -> Option<Self> {
+        match arch {
+            Arch::X86_64 => {
+                crate::arch::x86_64::regalloc::parse_gp_clobber_name(name).map(Self::X86_64)
+            }
+            Arch::Aarch64 => crate::arch::aarch64::regalloc::parse_gp_clobber_name(name)
+                .filter(|&r| r != A64Reg::Xzr)
+                .map(Self::Aarch64),
+        }
+    }
+
+    /// The x86-64 register this is, if it is one.
+    pub fn x86_64(self) -> Option<X86Reg> {
+        match self {
+            Self::X86_64(r) => Some(r),
+            Self::Aarch64(_) => None,
+        }
+    }
+
+    /// The aarch64 register this is, if it is one.
+    pub fn aarch64(self) -> Option<A64Reg> {
+        match self {
+            Self::Aarch64(r) => Some(r),
+            Self::X86_64(_) => None,
+        }
+    }
+
+    /// Whether a file-scope register variable may live here: the stack
+    /// pointer, which is never allocated, or a callee-saved register, which
+    /// a function in another unit preserves and this unit withholds from
+    /// allocation everywhere -- %rbx, %r12-%r15; x19-x28. A caller-saved
+    /// register would need every call to save it, and the frame pointer is
+    /// every c17 function's own; gcc takes them (with a warning for the
+    /// first), c17 does not.
+    pub fn can_hold_global(self) -> bool {
+        use A64Reg as A;
+        use X86Reg as X;
+        matches!(
+            self,
+            Self::X86_64(X::Rsp | X::Rbx | X::R12 | X::R13 | X::R14 | X::R15)
+                | Self::Aarch64(
+                    A::SP
+                        | A::X19
+                        | A::X20
+                        | A::X21
+                        | A::X22
+                        | A::X23
+                        | A::X24
+                        | A::X25
+                        | A::X26
+                        | A::X27
+                        | A::X28
+                )
+        )
+    }
+
+    /// The stack pointer: `%rsp`, `sp`.
+    pub fn is_stack_pointer(self) -> bool {
+        matches!(self, Self::X86_64(X86Reg::Rsp) | Self::Aarch64(A64Reg::SP))
+    }
+
+    /// The frame pointer, which every c17 function keeps: `%rbp`, `x29`.
+    pub fn is_frame_pointer(self) -> bool {
+        matches!(self, Self::X86_64(X86Reg::Rbp) | Self::Aarch64(A64Reg::X29))
+    }
 }
 
 /// The register class an operand may be given.
@@ -60,7 +133,7 @@ pub enum PinnedGp {
 pub enum AsmRegClass {
     /// Any general register: `r`, and x86-64 `q`, `R`, `l`.
     General,
-    /// The one general register an x86-64 letter names.
+    /// The one general register an operand is pinned to; see [`PinnedGp`].
     Pinned(PinnedGp),
     /// x86-64 `Q`: a general register with an addressable high byte -- one
     /// of `a`, `b`, `c`, `d`, which the backend chooses per statement.
@@ -498,6 +571,34 @@ impl AsmOperandClass {
         Ok(class)
     }
 
+    /// An operand in `reg` and nowhere else, accessed as `access`: how a
+    /// file-scope register variable is read and written.
+    pub fn in_register(reg: PinnedGp, access: AsmAccess) -> Self {
+        AsmOperandClass {
+            access,
+            early_clobber: false,
+            reg: Some(AsmRegClass::Pinned(reg)),
+            mem: None,
+            imm: AsmImm::default(),
+            tied: None,
+        }
+    }
+
+    /// This class, narrowed to `reg` when it offers any general register:
+    /// what a register variable as the operand of `"r"`, `"+r"`, `"g"` or
+    /// `"rm"` asks for, since gcc then places the operand in the variable's
+    /// register. A class that names its own register (`"a"`), or offers
+    /// none, is left alone, as is a tied input, which takes its output's.
+    pub fn pinned_to(self, reg: PinnedGp) -> Self {
+        if self.reg != Some(AsmRegClass::General) || self.tied.is_some() {
+            return self;
+        }
+        AsmOperandClass {
+            early_clobber: self.early_clobber,
+            ..Self::in_register(reg, self.access)
+        }
+    }
+
     fn add_reg(&mut self, r: AsmRegClass) {
         if self.reg.is_none_or(|have| r.rank() > have.rank()) {
             self.reg = Some(r);
@@ -546,12 +647,12 @@ fn letter(c: char, arch: Arch) -> Option<Letter> {
         (Arch::X86_64, 'Z') => Letter::Imm(AsmImm::ints(IntRange::X86Unsigned32)),
         (Arch::X86_64, 's') => Letter::Imm(AsmImm::SYMBOL),
         (Arch::X86_64, 'q' | 'R' | 'l') => Letter::Reg(General),
-        (Arch::X86_64, 'a') => Letter::Reg(Pinned(PinnedGp::Rax)),
-        (Arch::X86_64, 'b') => Letter::Reg(Pinned(PinnedGp::Rbx)),
-        (Arch::X86_64, 'c') => Letter::Reg(Pinned(PinnedGp::Rcx)),
-        (Arch::X86_64, 'd') => Letter::Reg(Pinned(PinnedGp::Rdx)),
-        (Arch::X86_64, 'S') => Letter::Reg(Pinned(PinnedGp::Rsi)),
-        (Arch::X86_64, 'D') => Letter::Reg(Pinned(PinnedGp::Rdi)),
+        (Arch::X86_64, 'a') => Letter::Reg(Pinned(PinnedGp::X86_64(X86Reg::Rax))),
+        (Arch::X86_64, 'b') => Letter::Reg(Pinned(PinnedGp::X86_64(X86Reg::Rbx))),
+        (Arch::X86_64, 'c') => Letter::Reg(Pinned(PinnedGp::X86_64(X86Reg::Rcx))),
+        (Arch::X86_64, 'd') => Letter::Reg(Pinned(PinnedGp::X86_64(X86Reg::Rdx))),
+        (Arch::X86_64, 'S') => Letter::Reg(Pinned(PinnedGp::X86_64(X86Reg::Rsi))),
+        (Arch::X86_64, 'D') => Letter::Reg(Pinned(PinnedGp::X86_64(X86Reg::Rdi))),
         (Arch::X86_64, 'Q') => Letter::Reg(HighByte),
         (Arch::X86_64, 'x' | 'v') => Letter::Reg(Vector),
         (Arch::X86_64, 'f') => Letter::Reg(X87(X87Slot::Any)),
@@ -598,6 +699,28 @@ pub struct InstrConstraints<R> {
     /// clobber is not one of these: it orders memory rather than claiming a
     /// register, and is answered by `Instruction::is_memory_barrier`.
     pub clobbers: Vec<R>,
+}
+
+/// The register each operand of `asm` is pinned to -- outputs, then inputs,
+/// in order -- given what `pin` answers for an operand in its own right. A
+/// tied input names its output's operand, so it takes the output's register
+/// whatever its own class says; `pin` is not asked about it.
+pub fn operand_pins<R: Copy>(
+    asm: &AsmData,
+    mut pin: impl FnMut(&AsmConstraint) -> Option<R>,
+) -> Vec<Option<R>> {
+    let mut pins: Vec<Option<R>> = Vec::with_capacity(asm.outputs.len() + asm.inputs.len());
+    for (idx, c) in asm.outputs.iter().chain(&asm.inputs).enumerate() {
+        let tied = c
+            .matching_output
+            .filter(|&i| idx >= asm.outputs.len() && i < asm.outputs.len());
+        let p = match tied {
+            Some(i) => pins[i],
+            None => pin(c),
+        };
+        pins.push(p);
+    }
+    pins
 }
 
 impl<R: Copy + Ord> InstrConstraints<R> {
@@ -665,6 +788,11 @@ mod tests {
         AsmOperandClass::parse(s, Arch::Aarch64).unwrap()
     }
 
+    /// The class of an operand an x86-64 letter pins to `r`.
+    fn pin(r: X86Reg) -> Option<AsmRegClass> {
+        Some(Pinned(PinnedGp::X86_64(r)))
+    }
+
     /// `(reg, mem, imm)` for a constraint body.
     type Allows = (Option<AsmRegClass>, Option<AsmMemClass>, bool);
 
@@ -700,12 +828,12 @@ mod tests {
     #[test]
     fn x86_64_letters() {
         let table: &[(&str, Allows)] = &[
-            ("a", (Some(Pinned(PinnedGp::Rax)), None, false)),
-            ("b", (Some(Pinned(PinnedGp::Rbx)), None, false)),
-            ("c", (Some(Pinned(PinnedGp::Rcx)), None, false)),
-            ("d", (Some(Pinned(PinnedGp::Rdx)), None, false)),
-            ("S", (Some(Pinned(PinnedGp::Rsi)), None, false)),
-            ("D", (Some(Pinned(PinnedGp::Rdi)), None, false)),
+            ("a", (pin(X86Reg::Rax), None, false)),
+            ("b", (pin(X86Reg::Rbx), None, false)),
+            ("c", (pin(X86Reg::Rcx), None, false)),
+            ("d", (pin(X86Reg::Rdx), None, false)),
+            ("S", (pin(X86Reg::Rsi), None, false)),
+            ("D", (pin(X86Reg::Rdi), None, false)),
             // A register class, not memory as on aarch64.
             ("Q", (Some(HighByte), None, false)),
             ("q", (Some(General), None, false)),
@@ -722,7 +850,7 @@ mod tests {
             ("s", (None, None, true)),
             ("O", (None, None, true)),
             // A named register outranks a class listed beside it.
-            ("ra", (Some(Pinned(PinnedGp::Rax)), None, false)),
+            ("ra", (pin(X86Reg::Rax), None, false)),
         ];
         for &(s, want) in table {
             assert_eq!(allows(x86(s)), want, "{s:?}");
@@ -768,7 +896,7 @@ mod tests {
             assert_eq!((c.access, c.early_clobber), (access, early), "{s:?}");
         }
         // The modifiers do not disturb the class.
-        assert_eq!(x86("=&d").reg, Some(Pinned(PinnedGp::Rdx)));
+        assert_eq!(x86("=&d").reg, pin(X86Reg::Rdx));
         assert_eq!(a64("+wm").reg, Some(Vector));
     }
 

@@ -263,3 +263,84 @@ fn test_no_file_scope_asm_leaves_one_run() {
     assert!(module.globals.iter().all(|g| g.asm_before == 0));
     assert!(module.functions.iter().all(|f| f.asm_before == 0));
 }
+
+/// A register variable as a register operand is pinned to its register in
+/// the operand's own class, after SSA has promoted the variable -- the class
+/// is the only place the binding survives that and inlining. Here the
+/// operand has become the parameter's value. A tied input follows its
+/// output, an operand with its own letter keeps it, and a plain operand is
+/// left to the allocator. A file-scope register variable defines no global:
+/// it is read and written by empty asms pinned to it.
+#[test]
+fn test_register_variable_operands_are_pinned() {
+    use crate::arch::aarch64::regalloc::Reg as A64Reg;
+    use crate::arch::asm_constraints::{AsmRegClass, PinnedGp};
+    use crate::arch::x86_64::regalloc::Reg as X86Reg;
+    use crate::ir::{AsmConstraint, AsmData};
+    use crate::target::{Arch, Os};
+    let cases = [
+        (
+            Arch::X86_64,
+            "rsp",
+            "r10",
+            PinnedGp::X86_64(X86Reg::Rsp),
+            PinnedGp::X86_64(X86Reg::R10),
+        ),
+        (
+            Arch::Aarch64,
+            "sp",
+            "x8",
+            PinnedGp::Aarch64(A64Reg::SP),
+            PinnedGp::Aarch64(A64Reg::X8),
+        ),
+    ];
+    for (arch, global, local, sp, reg) in cases {
+        let src = format!(
+            "register unsigned long cur asm(\"{global}\");\n\
+             long f(long a) {{\n\
+                 register long r asm(\"{local}\") = a;\n\
+                 long out;\n\
+                 asm(\"\" : \"=r\"(out), \"+r\"(cur) : \"r\"(r), \"g\"(a), \"0\"(r));\n\
+                 return out + (long)cur;\n\
+             }}\n"
+        );
+        let module = linearize_source(&src, &Target::new(arch, Os::Linux));
+        assert!(module
+            .globals
+            .iter()
+            .all(|g| g.name != "cur" && g.name != global));
+        let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+        let asms: Vec<&AsmData> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .filter_map(|i| i.extra().asm_data.as_deref())
+            .collect();
+        let pinned = |c: &AsmConstraint| match c.class.reg {
+            Some(AsmRegClass::Pinned(p)) => Some(p),
+            _ => None,
+        };
+        let stmt = asms
+            .iter()
+            .find(|a| a.outputs.len() == 2)
+            .expect("the statement");
+        assert_eq!(pinned(&stmt.outputs[0]), None, "{arch:?}");
+        assert_eq!(pinned(&stmt.outputs[1]), Some(sp), "{arch:?}");
+        let ins: Vec<Option<PinnedGp>> = stmt.inputs.iter().map(pinned).collect();
+        // The hidden input of "+r"(cur), then r, a and the tied "0"(r).
+        assert_eq!(ins, vec![Some(sp), Some(reg), None, None], "{arch:?}");
+        assert_eq!(stmt.inputs[3].matching_output, Some(0), "{arch:?}");
+        // `cur` is read before the statement, written after it, and read
+        // again in the return: one empty asm each, pinned to the register.
+        let accesses: Vec<(usize, usize)> = asms
+            .iter()
+            .filter(|a| a.template.is_empty() && a.outputs.len() + a.inputs.len() == 1)
+            .map(|a| {
+                let c = a.outputs.first().or(a.inputs.first()).unwrap();
+                assert_eq!(pinned(c), Some(sp), "{arch:?}");
+                (a.outputs.len(), a.inputs.len())
+            })
+            .collect();
+        assert_eq!(accesses, vec![(1, 0), (0, 1), (1, 0)], "{arch:?}");
+    }
+}

@@ -15,7 +15,7 @@ use super::linearize_emit::Controlling;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, GlobalStorage, Initializer, Instruction, Opcode, PseudoId,
 };
-use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
+use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass, PinnedGp};
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
@@ -2681,6 +2681,103 @@ impl<'a> super::linearize::Linearizer<'a> {
         )
     }
 
+    /// Pin each operand that is a register variable to its register, when
+    /// its class offers a general one -- gcc's one documented guarantee for a
+    /// local register variable, and what glibc's syscall wrappers stand on:
+    /// `register long _a4 asm("r10") = arg4;` then `"r"(_a4)`.
+    ///
+    /// Decided here, from the operand expression, and carried in the
+    /// operand's class: by the time the optimizer has promoted the variable,
+    /// substituted its value and inlined the function, nothing else could
+    /// tell which value was the variable.
+    ///
+    /// The register cannot also be a clobber, which the template may write
+    /// before it reads the operand. gcc refuses the same.
+    fn pin_register_variables(
+        &self,
+        ops: &[AsmOperand],
+        classes: &mut [AsmOperandClass],
+        clobbers: &[String],
+    ) {
+        for (op, class) in ops.iter().zip(classes) {
+            let ExprKind::Ident(sym) = op.expr.kind else {
+                continue;
+            };
+            let Some(reg) = self.symbols.get(sym).hard_register else {
+                continue;
+            };
+            let pinned = class.pinned_to(reg);
+            if pinned.reg == class.reg {
+                continue;
+            }
+            *class = pinned;
+            let arch = self.target.arch;
+            if clobbers
+                .iter()
+                .any(|c| PinnedGp::named(c, arch) == Some(reg))
+            {
+                crate::diag::error_args(
+                    op.expr.pos,
+                    "'asm' specifier for variable '{0}' conflicts with 'asm' clobber list",
+                    &[self.str(self.symbols.get(sym).name)],
+                );
+            }
+        }
+    }
+
+    /// The value in the register a file-scope register variable is, read by
+    /// an empty asm whose one output is pinned there -- for Linux's
+    /// `current_stack_pointer` on x86-64, a `mov %rsp, ...`.
+    pub(crate) fn emit_register_read(&mut self, reg: PinnedGp, typ: TypeId) -> PseudoId {
+        let pseudo = self.alloc_reg_pseudo();
+        let output = self.register_operand(pseudo, reg, AsmAccess::Write, typ);
+        self.emit(Instruction::asm(AsmData {
+            template: String::new(),
+            outputs: vec![output],
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        pseudo
+    }
+
+    /// Store `val` into the register a file-scope register variable is: an
+    /// empty asm whose one input is pinned there.
+    pub(crate) fn emit_register_write(&mut self, reg: PinnedGp, val: PseudoId, typ: TypeId) {
+        let input = self.register_operand(val, reg, AsmAccess::Read, typ);
+        self.emit(Instruction::asm(AsmData {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: vec![input],
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+    }
+
+    /// An asm operand of type `typ` in `reg` and nowhere else.
+    fn register_operand(
+        &self,
+        pseudo: PseudoId,
+        reg: PinnedGp,
+        access: AsmAccess,
+        typ: TypeId,
+    ) -> AsmConstraint {
+        AsmConstraint {
+            pseudo,
+            name: None,
+            matching_output: None,
+            constraint: if access == AsmAccess::Read { "r" } else { "=r" }.to_string(),
+            class: AsmOperandClass::in_register(reg, access),
+            size: self.types.size_bits(typ),
+            offset: 0,
+        }
+    }
+
+    /// The register a file-scope register variable `sym` is, if it is one.
+    pub(crate) fn global_register(&self, sym: SymbolId) -> Option<PinnedGp> {
+        self.symbols.get(sym).global_register()
+    }
+
     /// An immediate-only operand that is a constant expression, as the
     /// constant: gcc's front end folds it at every level, so `"i"(~MASK)` or
     /// `"i"(-1.0)` at -O0 must not reach the backend as an instruction
@@ -2736,7 +2833,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Bare `+r` with no tied input must still load the lvalue's
         // current value (only producer of the initial register contents),
         // so the load is gated on whether any input matches this output.
-        let (output_classes, input_classes) = self.asm_operand_classes(outputs, inputs);
+        let (mut output_classes, mut input_classes) = self.asm_operand_classes(outputs, inputs);
+        self.pin_register_variables(outputs, &mut output_classes, clobbers);
+        self.pin_register_variables(inputs, &mut input_classes, clobbers);
         let tied_inputs: Vec<bool> = {
             let mut out_has_tied_input = vec![false; outputs.len()];
             for class in &input_classes {

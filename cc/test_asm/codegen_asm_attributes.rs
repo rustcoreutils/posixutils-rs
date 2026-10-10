@@ -71,11 +71,11 @@ int call(int x) { return myfn(x) + my_var; }
 /// defined in the source.
 #[test]
 fn codegen_asm_label_does_not_leak_to_the_next_declaration() {
-    let src = r#"
+    let template = r#"
 extern int keep_me;
 
 /* GCC's local register variable: a register constraint, not a rename. */
-void with_register(void) { register long r __asm__("rdi"); (void)r; }
+void with_register(void) { register long r __asm__("REG"); (void)r; }
 int after_register = 1;
 
 void with_local(void) { int x __asm__("bogus_local"); (void)x; }
@@ -93,8 +93,10 @@ int after_for_init = 5;
 int keep_me = 6;
 "#;
 
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("asm_label_leak", triple, src, &["-O"]);
+    // The register variable names one of its own target's registers.
+    for (triple, reg) in [(X86_64_LINUX, "rdi"), (AARCH64_LINUX, "x9")] {
+        let src = template.replace("REG", reg);
+        let asm = asm_for_with("asm_label_leak", triple, &src, &["-O"]);
         for name in [
             "after_register",
             "after_local",
@@ -108,8 +110,9 @@ int keep_me = 6;
                 "{triple}: {name} should be emitted under its own name:\n{asm}"
             );
         }
+        let stolen_reg = format!("{reg}:");
         for stolen in [
-            "rdi:",
+            stolen_reg.as_str(),
             "bogus_local",
             "bogus_static",
             "bogus_struct",

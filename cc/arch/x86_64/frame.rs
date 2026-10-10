@@ -239,6 +239,7 @@ impl X86_64CodeGen {
         // Register allocation
         let guarded = crate::arch::stack_protect::protects(func, types, self.base.stack_protector);
         let mut alloc = RegAlloc::new()
+            .with_global_registers(&self.global_registers)
             .with_tls_access(self.base.tls_access())
             .with_stack_guard(guarded);
         self.locations = alloc.allocate(func, types);

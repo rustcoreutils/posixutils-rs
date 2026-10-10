@@ -10,12 +10,17 @@
 //
 
 use super::ast::{AsmOperand, ExternalDecl, LabelId, Stmt};
+use super::bind::DeclScope;
 use super::parser::{ParseError, ParseResult, Parser};
+use crate::arch::asm_constraints::PinnedGp;
+use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::Namespace;
+use crate::symbol::{Namespace, SymbolId};
+use crate::token::lexer::Position;
 use crate::token::lexer::{payload_text, TokenType, TokenValue};
 use crate::token::literal;
-use crate::types::TypeModifiers;
+use crate::types::{TypeId, TypeKind, TypeModifiers};
+use gettextrs::gettext;
 
 impl Parser<'_> {
     /// Check if current token is __asm or __asm__
@@ -132,6 +137,74 @@ impl Parser<'_> {
         if let (Some(label), Some(id)) = (label, self.symbols.lookup_id(name, Namespace::Ordinary))
         {
             self.symbols.get_mut(id).asm_label = Some(label);
+        }
+    }
+
+    /// Bind a `register` declarator to the register its asm label names: a
+    /// GNU register variable, `register long x asm("r10")`.
+    ///
+    /// The label is no assembler name -- nothing is emitted under it. At
+    /// block scope the variable is an ordinary automatic one, and the
+    /// binding pins it as an inline-asm register operand; at file scope it
+    /// has no storage and is the register itself, so it may have no
+    /// initializer. A plain `register` declaration has no label and binds
+    /// nothing.
+    ///
+    /// c17 binds a local in any general register it can hand an asm operand
+    /// -- every one but the stack and frame pointers -- and a global in the
+    /// stack pointer (Linux's `current_stack_pointer`) or a callee-saved
+    /// register, which every function of the unit then leaves alone; see
+    /// [`PinnedGp::can_hold_global`].
+    pub(super) fn bind_register_variable(
+        &mut self,
+        symbol: Option<SymbolId>,
+        name: StringId,
+        typ: TypeId,
+        scope: DeclScope,
+        initialized: bool,
+        pos: Position,
+    ) {
+        let Some(label) = self.pending_asm_label.take() else {
+            return;
+        };
+        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+        let global = scope == DeclScope::File;
+        if global && initialized {
+            diag::error(pos, &gettext("global register variable has initial value"));
+        }
+        let Some(reg) = PinnedGp::named(&label, self.types.target().arch) else {
+            diag::error_args(pos, "invalid register name for '{0}'", &[&spelled]);
+            return;
+        };
+        let scalar = self.types.is_integer(typ) || self.types.kind(typ) == TypeKind::Pointer;
+        if !scalar || self.types.size_bits(typ) > 64 {
+            diag::error_args(
+                pos,
+                "data type of '{0}' isn't suitable for a general register",
+                &[&spelled],
+            );
+            return;
+        }
+        if global && !reg.can_hold_global() {
+            diag::error_args(
+                pos,
+                "global register variable '{0}' in '{1}' is not supported; c17 \
+                 supports one only in the stack pointer or a callee-saved register",
+                &[&spelled, &label],
+            );
+            return;
+        }
+        if !global && (reg.is_stack_pointer() || reg.is_frame_pointer()) {
+            diag::error_args(
+                pos,
+                "local register variable '{0}' in '{1}' is not supported; c17 \
+                 cannot hand an asm operand the stack or frame pointer",
+                &[&spelled, &label],
+            );
+            return;
+        }
+        if let Some(id) = symbol {
+            self.symbols.get_mut(id).hard_register = Some(reg);
         }
     }
 

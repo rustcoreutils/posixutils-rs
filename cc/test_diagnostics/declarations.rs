@@ -250,10 +250,17 @@ fn storage_classes_where_they_belong() {
          for (register int i = 0, j = 1; i < j; i++) r++; return r; }\n",
     );
     // gcc's global register variable names its register, and is accepted.
+    // In a caller-saved register every call would have to save it; gcc only
+    // warns, c17 refuses.
     if cfg!(target_arch = "x86_64") {
         compile_expect_ok(
             "sc_global_register",
             "register unsigned int reg __asm(\"r14\");\nunsigned f(void) { return reg; }\n",
+        );
+        compile_expect_error(
+            "sc_global_register_r11",
+            "register unsigned int reg __asm(\"r11\");\nunsigned f(void) { return reg; }\n",
+            "global register variable 'reg' in 'r11' is not supported",
         );
     }
     for (name, src, expected) in [

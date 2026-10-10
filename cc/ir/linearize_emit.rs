@@ -14,6 +14,7 @@ use super::{
     BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode, Pseudo, PseudoId,
 };
 use crate::abi::get_abi_for_conv;
+use crate::arch::asm_constraints::PinnedGp;
 use crate::constexpr::{ConstScope, IntConversion};
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
@@ -32,16 +33,26 @@ use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 /// `b[i++] += 5` incremented `i` twice and updated the wrong element,
 /// `*p++ += 1` advanced `p` by two, and `a[f()] |= 1` called `f` twice.
 ///
-/// `base` addresses the object -- a `Sym` pseudo when the target names a
-/// symbol's own storage -- or its storage unit when `bitfield` is set: a
-/// bit-field has no address of its own, so it carries its placement instead.
+/// `at` says where the target is: see [`PlaceAt`].
 pub(crate) struct RmwPlace {
-    base: PseudoId,
-    /// The bit-field's placement and its type as the access reaches it.
-    bitfield: Option<(Bitfield, TypeId)>,
+    at: PlaceAt,
     /// The identifier the target is, when it is a bare name: a read through
     /// the place is then a reference to whatever that identifier resolves to.
     ident: Option<SymbolId>,
+}
+
+/// Where a read-modify-write target is.
+enum PlaceAt {
+    /// At an address -- a `Sym` pseudo when the target names a symbol's own
+    /// storage.
+    Object(PseudoId),
+    /// In a bit-field, which has no address of its own: the address of its
+    /// storage unit, its placement there, and its type as the access
+    /// reaches it.
+    Bitfield(PseudoId, Bitfield, TypeId),
+    /// In a register: a file-scope register variable, which has no storage
+    /// (`register unsigned long sp asm("rsp")`).
+    Register(PinnedGp),
 }
 
 /// Everything `E1 op= E2` needs beyond the two operand *values*: the operator
@@ -2825,12 +2836,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
-    /// The address this place names, or `None` when it is a bit-field.
+    /// The address this place names, or `None` when it is a bit-field or a
+    /// register.
     ///
-    /// A bit-field has no address, so a consumer that can only work with one
+    /// Neither has an address, so a consumer that can only work with one
     /// -- a memory-class `asm` operand, say -- has to know that.
     pub(crate) fn rmw_place_address(place: &RmwPlace) -> Option<PseudoId> {
-        place.bitfield.is_none().then_some(place.base)
+        match place.at {
+            PlaceAt::Object(addr) => Some(addr),
+            PlaceAt::Bitfield(..) | PlaceAt::Register(_) => None,
+        }
     }
 
     /// Resolve a read-modify-write target, evaluating its subexpressions once.
@@ -2839,6 +2854,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             // A name stands for its symbol: the frame slot, or the global a
             // static local or a file-scope object is emitted as.
             ExprKind::Ident(symbol_id) => {
+                if let Some(reg) = self.global_register(*symbol_id) {
+                    return RmwPlace {
+                        at: PlaceAt::Register(reg),
+                        ident: Some(*symbol_id),
+                    };
+                }
                 let binding = self.locals.get(symbol_id).map(|l| l.binding.clone());
                 let base = match binding {
                     Some(LocalBinding::Frame {
@@ -2860,8 +2881,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 };
                 RmwPlace {
-                    base,
-                    bitfield: None,
+                    at: PlaceAt::Object(base),
                     ident: Some(*symbol_id),
                 }
             }
@@ -2883,8 +2903,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // `linearize_lvalue` is what evaluates the subexpressions, and it
             // does so once.
             _ => RmwPlace {
-                base: self.linearize_lvalue(target),
-                bitfield: None,
+                at: PlaceAt::Object(self.linearize_lvalue(target)),
                 ident: None,
             },
         }
@@ -2916,28 +2935,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             .types
             .find_member(struct_type, member)
             .unwrap_or_else(|| MemberInfo::standing_in(target_typ));
-        let bitfield = match info.bitfield() {
+        let at = match info.bitfield() {
             // The target expression's type, not the member's declared one:
             // they name the same width and sign, and only the expression's
             // carries the object's qualifiers (C17 6.5.2.3p3), which is what
             // tells the bit-field emitters that the access is volatile.
-            Some(bf) => Some((bf, target_typ)),
+            Some(bf) => PlaceAt::Bitfield(base, bf, target_typ),
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
-            _ => {
-                let base = self.offset_address(base, info.offset as i64);
-                return RmwPlace {
-                    base,
-                    bitfield: None,
-                    ident: None,
-                };
-            }
+            _ => PlaceAt::Object(self.offset_address(base, info.offset as i64)),
         };
-        RmwPlace {
-            base,
-            bitfield,
-            ident: None,
-        }
+        RmwPlace { at, ident: None }
     }
 
     /// `base + offset` as an address, or `base` itself when the offset is zero.
@@ -2963,9 +2971,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         if self.reject_incomplete_object(typ) {
             return self.emit_const(0, self.types.int_id);
         }
-        if let Some((bf, field_typ)) = place.bitfield {
-            return self.emit_bitfield_load(place.base, bf, field_typ);
-        }
+        let base = match place.at {
+            PlaceAt::Object(base) => base,
+            PlaceAt::Bitfield(base, bf, field_typ) => {
+                return self.emit_bitfield_load(base, bf, field_typ);
+            }
+            PlaceAt::Register(reg) => return self.emit_register_read(reg, typ),
+        };
         // A read of a name is a read like `linearize_ident`'s, and answers to
         // the same inline-definition constraint.
         if let Some(ident) = place.ident {
@@ -2973,7 +2985,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let size = self.types.size_bits(typ);
         let val = self.alloc_reg_pseudo();
-        self.emit(Instruction::load(val, place.base, 0, typ, size));
+        self.emit(Instruction::load(val, base, 0, typ, size));
         val
     }
 
@@ -2988,12 +3000,15 @@ impl<'a> super::linearize::Linearizer<'a> {
         val: PseudoId,
         typ: TypeId,
     ) -> Option<(u32, TypeId)> {
-        if let Some((bf, field_typ)) = place.bitfield {
-            self.emit_bitfield_store(place.base, bf, val, field_typ);
-            return Some((bf.bit_width, field_typ));
-        }
         let size = self.types.size_bits(typ);
-        self.emit(Instruction::store(val, place.base, 0, typ, size));
+        match place.at {
+            PlaceAt::Object(base) => self.emit(Instruction::store(val, base, 0, typ, size)),
+            PlaceAt::Bitfield(base, bf, field_typ) => {
+                self.emit_bitfield_store(base, bf, val, field_typ);
+                return Some((bf.bit_width, field_typ));
+            }
+            PlaceAt::Register(reg) => self.emit_register_write(reg, val, typ),
+        }
         None
     }
 

@@ -3255,6 +3255,17 @@ impl<'a> Linearizer<'a> {
                         binding: LocalBinding::ExtentsOnly,
                         ..
                     }) => unreachable!("no identifier names a type name's extents"),
+                    // A register has no address. The parser refuses `&`
+                    // of one; this is a memory-class asm operand (`"m"`).
+                    None if self.global_register(*symbol_id).is_some() => {
+                        let name = self.str(self.symbols.get(*symbol_id).name).to_string();
+                        crate::diag::error_args(
+                            expr.pos,
+                            "address of global register variable '{0}' requested",
+                            &[&name],
+                        );
+                        return self.emit_const(0, self.types.pointer_to(self.expr_type(expr)));
+                    }
                     None => {
                         let name = self.symbol_name(*symbol_id);
                         (self.sym_pseudo(name), self.expr_type(expr))
@@ -5468,6 +5479,11 @@ impl<'a> Linearizer<'a> {
                 }
             };
             self.read_object(place, local.typ)
+        }
+        // A file-scope register variable is its register: no storage.
+        else if let Some(reg) = self.global_register(symbol_id) {
+            let typ = self.expr_type(expr);
+            self.emit_register_read(reg, typ)
         }
         // Global variable - create symbol reference and load
         else {

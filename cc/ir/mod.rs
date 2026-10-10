@@ -3981,6 +3981,10 @@ pub struct Module {
     pub toplevel_asm: Vec<String>,
     /// Global variables
     pub globals: Vec<GlobalDef>,
+    /// The registers the unit's file-scope register variables are
+    /// (`register long r asm("r14")`). Each is the variable, so no function
+    /// of the unit may allocate it, save it or restore it.
+    pub global_registers: Vec<crate::arch::asm_constraints::PinnedGp>,
     /// String literals (label, content)
     pub strings: Vec<(String, String)>,
     /// `u"..."` literals referenced by address, as char16_t code units.

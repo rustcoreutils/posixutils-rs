@@ -1099,11 +1099,12 @@ impl Parser<'_> {
             .contains(TypeModifiers::REGISTER)
         {
             let name = self.str(sym.name).to_string();
-            diag::error_args(
-                pos,
-                "address of register variable '{0}' requested",
-                &[&name],
-            );
+            let msg = if sym.global_register().is_some() {
+                "address of global register variable '{0}' requested"
+            } else {
+                "address of register variable '{0}' requested"
+            };
+            diag::error_args(pos, msg, &[&name]);
         }
     }
 

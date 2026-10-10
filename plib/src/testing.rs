@@ -841,6 +841,95 @@ pub fn run_under_umask(program: &Path, args: &[&str], dir: &Path, umask: u32) ->
         .expect("sh runs")
 }
 
+/// seccomp filters that make a child process see a system it is not on: an older kernel, or
+/// one without `/proc`. Each answers exactly the calls concerned so.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod seccomp {
+    use std::io;
+    use std::process::Command;
+
+    /// `getxattr` and `listxattr`, by path and following links: the calls an
+    /// attribute read through `/proc/self/fd/N` makes.
+    #[cfg(target_arch = "x86_64")]
+    const SYS_PATH_XATTR: [u32; 2] = [191, 194];
+    #[cfg(target_arch = "aarch64")]
+    const SYS_PATH_XATTR: [u32; 2] = [8, 11];
+
+    /// One BPF instruction.
+    #[repr(C)]
+    pub struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+
+    // BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_JMP|BPF_JSET|BPF_K,
+    // BPF_RET|BPF_K. In the seccomp data the system call number is at offset
+    // 0 and argument N at 16 + 8 * N, its low word first (little-endian).
+    pub const LD: u16 = 0x20;
+    pub const JEQ: u16 = 0x15;
+    pub const JSET: u16 = 0x45;
+    pub const RET: u16 = 0x06;
+    pub const RET_ERRNO: u32 = 0x0005_0000;
+    pub const RET_ALLOW: u32 = 0x7fff_0000;
+
+    pub fn op(code: u16, jt: u8, jf: u8, k: u32) -> SockFilter {
+        SockFilter { code, jt, jf, k }
+    }
+
+    /// Make `command`'s process answer every attribute read by path with
+    /// ENOENT, as a `/proc/self/fd/N` that is not there would: what a system
+    /// without procfs leaves of the route an `O_PATH` descriptor's attributes
+    /// are read through. Every other call, the `f*xattr` ones included, is
+    /// allowed.
+    pub fn refuse_path_xattr_reads(command: &mut Command) {
+        let enoent = RET_ERRNO | u32::try_from(libc::ENOENT).unwrap();
+        install_filter(
+            command,
+            vec![
+                op(LD, 0, 0, 0),
+                op(JEQ, 1, 0, SYS_PATH_XATTR[0]),
+                op(JEQ, 0, 1, SYS_PATH_XATTR[1]),
+                op(RET, 0, 0, enoent),
+                op(RET, 0, 0, RET_ALLOW),
+            ],
+        );
+    }
+
+    /// Install the seccomp `filter` in `command`'s process just before exec.
+    pub fn install_filter(command: &mut Command, filter: Vec<SockFilter>) {
+        use std::os::unix::process::CommandExt;
+
+        #[repr(C)]
+        struct SockFprog {
+            len: u16,
+            filter: *const SockFilter,
+        }
+        const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+        const PR_SET_SECCOMP: libc::c_int = 22;
+        const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+
+        unsafe {
+            command.pre_exec(move || {
+                let prog = SockFprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr(),
+                };
+                if libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{read_until_full, TempFile};

@@ -1853,6 +1853,10 @@ pub(crate) struct Attrs {
     /// modification time stands in for it.
     pub atime: Option<i64>,
     pub atime_nsec: i64,
+    /// The ACLs `-p p` gives it with its mode (`set_preserved_mode`): none
+    /// beyond the mode where the source has none, as is all that is known
+    /// without `-p p`; the reason, where the source's could not be read.
+    pub acl: Result<plib::acl::Acl, String>,
 }
 
 /// Which of those attributes the user asked to keep (`-p`).
@@ -2032,12 +2036,13 @@ fn set_attrs_with(
     let owner_set = policy.preserve_owner
         && set_owner(attrs.uid, attrs.gid, |uid, gid| cvt(target.chown(uid, gid)))?;
 
+    let mut acl_failed = None;
     if with_mode {
         let chmod = |mode: u32| cvt(target.chmod(mode as libc::mode_t));
         let mode = policy.mode(attrs, owner_set);
         let fd = target.fd().as_raw_fd();
         if policy.preserve_perms {
-            set_preserved_mode(chmod, Some(fd), mode)?;
+            acl_failed = set_preserved_mode(chmod, Some(fd), mode, &attrs.acl)?;
         } else if fstat(fd)?.st_mode & libc::S_IFMT == libc::S_IFDIR {
             // Made by this run at a mode of its own (`make_dir_at`, or 0777 to
             // hold members below it): given what `mkdir()` with the member's
@@ -2058,37 +2063,79 @@ fn set_attrs_with(
         }
     }
 
-    Ok(())
+    acl_failed.map_or(Ok(()), |e| Err(acl_error(e)))
 }
 
-/// `-p p`: give a member, through `chmod`, exactly the mode `mode` and no ACL
-/// beyond it -- in place of any it inherited from a default ACL of its
-/// directory, or a directory found existing has -- as GNU tar --acls -p does
-/// for an archive that records none, and cp -p for a source that has none.
-/// While an ACL is there its named entries are capped by the mode's group bits
-/// (the mask), so those and the other bits are withheld until it is gone.
+/// The failure to give a member its ACLs (`set_preserved_mode`), in the
+/// words of pax's other attribute failures.
+fn acl_error(e: std::io::Error) -> PaxError {
+    PaxError::Io(std::io::Error::other(format!("cannot set ACL: {e}")))
+}
+
+/// `-p p`: give a member, through `chmod`, exactly the mode `mode` and the
+/// ACLs `acl` its source has -- in place of any it inherited from a default
+/// ACL of its directory, or a directory found existing has; none beyond the
+/// mode where the source has none -- as GNU tar --acls -p and cp -p do. While
+/// an ACL that is not the source's is there its named entries are capped by
+/// the mode's group bits (the mask), so those and the other bits are withheld
+/// until it is replaced -- and the ACL is written no wider than that withheld
+/// mode (`plib::acl::copy_to_fd`).
 ///
-/// `fd` is the file the ACL is removed through; `None` where pax holds none
-/// (a node held by name), whose ACL is then left as it is.
+/// ACLs that cannot be set, or were not read (`Err`), are returned as the
+/// failure, unless that loses nothing (`plib::acl::loses_nothing`); the mode is
+/// then one granting no more than the source's ACLs did
+/// (`plib::acl::mode_without`), and the file is left no POSIX ACL, access or
+/// default, that a write failing part way had set (`plib::acl::write_fd`).
+/// Only a failure to set the mode at all is an `Err`.
+///
+/// `fd` is the file the ACLs are written through; `None` where pax holds none
+/// (a node held by name), whose ACL is then left as it is, and which takes
+/// none of the source's.
 fn set_preserved_mode(
     chmod: impl Fn(u32) -> std::io::Result<()>,
     fd: Option<libc::c_int>,
     mode: u32,
-) -> std::io::Result<()> {
-    let Some(fd) = fd else {
-        return chmod(mode);
+    acl: &Result<plib::acl::Acl, String>,
+) -> std::io::Result<Option<std::io::Error>> {
+    use plib::acl::{mode_without, Acl};
+    let unsupported = || std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+    let (wanted, kept, failed) = match acl {
+        Ok(acl) => (acl, mode, None),
+        Err(reason) => (
+            &Acl::default(),
+            mode_without(None, mode),
+            Some(std::io::Error::other(reason.clone())),
+        ),
     };
-    // Nothing to remove, the usual case: one read. Where none can be read at
-    // all (EOPNOTSUPP: a system no ACL is read on) there is none to remove.
-    match plib::acl::read_fd(fd) {
-        Ok(acl) if acl == plib::acl::Acl::default() => return chmod(mode),
-        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => return chmod(mode),
-        _ => {}
+    let Some(fd) = fd else {
+        return match (acl, failed) {
+            (Ok(acl), None) if !acl.is_trivial() => {
+                chmod(mode_without(Some(acl), mode))?;
+                Ok(Some(unsupported()))
+            }
+            (_, failed) => chmod(kept).map(|()| failed),
+        };
+    };
+    // A source with no ACLs, on a file with none to remove, the usual case:
+    // one read. Where none can be read at all (EOPNOTSUPP: a system no ACL is
+    // read on) there is none to remove.
+    if *wanted == Acl::default() {
+        match plib::acl::read_fd(fd) {
+            Ok(own) if own == Acl::default() => return chmod(kept).map(|()| failed),
+            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                return chmod(kept).map(|()| failed)
+            }
+            _ => {}
+        }
     }
     chmod(mode & !0o077)?;
-    let removed = plib::acl::copy_to_fd(&plib::acl::Acl::default(), fd);
-    chmod(mode)?;
-    removed
+    let (kept, failed) = match (plib::acl::copy_to_fd(wanted, fd, mode & !0o077), failed) {
+        (_, Some(failed)) => (kept, Some(failed)),
+        (Ok(()), None) => (mode, None),
+        (Err(e), None) => (mode_without(Some(wanted), mode), Some(e)),
+    };
+    chmod(kept)?;
+    Ok(failed)
 }
 
 /// Without `-p p`: a file or node made by this run already has the permission
@@ -2216,17 +2263,18 @@ fn apply_node_attrs(
 
     let owner_set =
         policy.preserve_owner && set_owner(attrs.uid, attrs.gid, |uid, gid| node.chown(uid, gid))?;
+    let mut acl_failed = None;
     if made_type != libc::S_IFLNK {
         let chmod = |mode: u32| node.chmod(mode as libc::mode_t);
         let mode = policy.mode(attrs, owner_set);
         if policy.preserve_perms {
-            set_preserved_mode(chmod, node.acl_fd(), mode)?;
+            acl_failed = set_preserved_mode(chmod, node.acl_fd(), mode, &attrs.acl)?;
         } else {
             add_special_bits(|| node.stat(), chmod, mode)?;
         }
     }
     set_node_times(node, attrs, policy);
-    Ok(())
+    acl_failed.map_or(Ok(()), |e| Err(acl_error(e)))
 }
 
 /// The times `policy` asks for, through `node`; a failure is a warning.
@@ -2821,6 +2869,7 @@ mod tests {
             mtime_nsec: 0,
             atime: None,
             atime_nsec: 0,
+            acl: Ok(plib::acl::Acl::default()),
         }
     }
 

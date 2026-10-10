@@ -428,7 +428,7 @@ impl CopyWalk<'_> {
                 &mut self.link_tracker.borrow_mut(),
                 metadata,
             )?;
-        } else if let Err(e) = copy_special_file(pfd, name, metadata, self.options) {
+        } else if let Err(e) = copy_special_file(entry, pfd, name, metadata, self.options) {
             crate::error::report_error(src, e);
             return Ok(false);
         }
@@ -538,9 +538,9 @@ impl CopyWalk<'_> {
 
         match decided {
             DirAttrs::Apply(id) => {
-                self.pending_dirs
-                    .borrow_mut()
-                    .push(&mp, id, attrs_of(metadata));
+                let read = || plib::acl::read_entry(entry);
+                let attrs = with_acl(attrs_of(metadata), self.options, read);
+                self.pending_dirs.borrow_mut().push(&mp, id, attrs);
             }
             // Copied into all the same.
             DirAttrs::Withheld(_) => crate::error::report_error(src, attrs_withheld()),
@@ -688,6 +688,7 @@ fn overwrites_itself(src: &Path) -> PaxResult<bool> {
 /// meaningfully recreated and are reported as an unsupported type. The error
 /// message is context-free; the caller adds the pathname via `report_error`.
 fn copy_special_file(
+    entry: &ftw::Entry<'_>,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     metadata: &ftw::Metadata,
@@ -744,13 +745,14 @@ fn copy_special_file(
     // not necessarily the mode on disk; and neither carries ownership, times or
     // set-id bits. Extraction restores those here, so a copy must too --
     // through the node just made, never by name.
-    set_made_node_attrs(
-        dirfd,
-        name,
-        made_type,
-        &attrs_of(metadata),
-        &policy_of(options),
-    )
+    // Its ACLs too, on Linux, where the node is pinned (`MadeNode`). Elsewhere
+    // nothing pins it, and reading the source's would open it: as cp -p, the
+    // copy keeps the mode alone.
+    let mut attrs = attrs_of(metadata);
+    if cfg!(target_os = "linux") {
+        attrs = with_acl(attrs, options, || plib::acl::read_entry(entry));
+    }
+    set_made_node_attrs(dirfd, name, made_type, &attrs, &policy_of(options))
 }
 
 /// Copy a symlink
@@ -931,7 +933,10 @@ fn do_copy_file(
         restore_atime(src_file.as_fd(), entry.path().as_inner(), metadata);
     }
 
-    set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))?;
+    let attrs = with_acl(attrs_of(metadata), options, || {
+        plib::acl::read_source_fd(src_file.as_raw_fd()).map(Some)
+    });
+    set_attrs_fd(dest_file.as_fd(), &attrs, &policy_of(options))?;
     // Known once its attributes are set, which change its ctime.
     let copy = MadeFile::of(dest_file.as_fd(), pin)?;
     // A filesystem that defers writes reports their failure on close.
@@ -1044,7 +1049,27 @@ fn attrs_of(metadata: &ftw::Metadata) -> Attrs {
         mtime_nsec: metadata.mtime_nsec(),
         atime: Some(metadata.atime()),
         atime_nsec: metadata.atime_nsec(),
+        acl: Ok(plib::acl::Acl::default()),
     }
+}
+
+/// `attrs` with the ACLs of their source, which `read` reads through a
+/// descriptor checked to be the file the walk recorded (`None` when it is
+/// not), where -p p is to give them to the copy (`set_preserved_mode`), as
+/// cp -p does; the reason, where they cannot be read.
+fn with_acl(
+    mut attrs: Attrs,
+    options: &CopyOptions,
+    read: impl FnOnce() -> std::io::Result<Option<plib::acl::Acl>>,
+) -> Attrs {
+    if options.preserve_perms {
+        attrs.acl = match read() {
+            Ok(Some(acl)) => Ok(acl),
+            Ok(None) => Err(gettextrs::gettext("source file changed as it was read")),
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    attrs
 }
 
 /// What `-p` asked to keep, in the shape the anchored helpers take.

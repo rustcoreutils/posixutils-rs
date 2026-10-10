@@ -15,6 +15,8 @@
 //! the inherited one replaced, as GNU tar --acls -p and cp -p do. Each case needs
 //! `setfacl`/`getfacl` and a filesystem that takes ACLs, and is skipped without them.
 
+mod archived;
+
 use plib::testing::{
     get_binary_path, mode_and_acl, run_under_umask, set_default_acl, DEFAULT_ACL_TEXT,
 };

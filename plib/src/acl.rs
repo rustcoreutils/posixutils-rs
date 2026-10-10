@@ -153,6 +153,26 @@ impl PosixAcl {
         (acl, bits)
     }
 
+    /// This ACL with the entries a mode shows set to the bits of `mode`, as `chmod` sets them
+    /// (Linux's `posix_acl_chmod`): the owner's, the mask's -- the owning group's where there is
+    /// no mask -- and others'. Named entries, and the owning group's under a mask, are kept.
+    pub fn with_mode(&self, mode: u32) -> PosixAcl {
+        let has_mask = self.entries.iter().any(|e| e.tag == Tag::Mask);
+        let mut acl = self.clone();
+        for e in &mut acl.entries {
+            let shift = match e.tag {
+                Tag::UserObj => 6,
+                Tag::Mask => 3,
+                Tag::GroupObj if !has_mask => 3,
+                Tag::Other => 0,
+                _ => continue,
+            };
+            // At most `rwx`: three bits.
+            e.perm = ((mode >> shift) & 7) as u8;
+        }
+        acl
+    }
+
     /// Whether it names a user or group besides the owner and owning group.
     fn names_others(&self) -> bool {
         self.entries
@@ -473,6 +493,96 @@ pub fn read_path(path: &Path, follow: bool) -> io::Result<Acl> {
     }
 }
 
+/// The ACLs of the source open on `fd`, the descriptor its data or metadata came from, to copy
+/// or archive them (`read_fd`). Where none can be read at all (EOPNOTSUPP: a system no ACL is
+/// read on), it has none to lose.
+pub fn read_source_fd(fd: RawFd) -> io::Result<Acl> {
+    match read_fd(fd) {
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(Acl::default()),
+        read => read,
+    }
+}
+
+/// The ACLs of the directory or special file a tree walk recorded at `entry`
+/// (`read_source_fd`), read through a descriptor of its own, required to be the very file
+/// recorded -- its `(st_dev, st_ino)` and type; `None` when it is not.
+///
+/// A directory is opened for reading, and its ACLs read with plain `f*xattr` calls, which need
+/// no procfs. One that cannot be opened so (EACCES) is, on Linux, pinned `O_PATH` instead, as a
+/// special file always is there: that needs no permission on the file and opens no device or
+/// FIFO, and its attributes are read through its `self/fd/N` under a verified procfs
+/// (`read_fd`). Without one a directory's are not read, an error; a special file's are taken
+/// to be none (`no_procfs_route`), as it rarely has any. Elsewhere only a directory's ACLs are
+/// read: a special file cannot be opened without acting on it.
+pub fn read_entry(entry: &ftw::Entry) -> io::Result<Option<Acl>> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    let Some(recorded) = entry.metadata() else {
+        return Ok(None);
+    };
+    // The walk recorded a followed link's referent; open the same thing.
+    let follow = entry.is_symlink() == Some(true) && !recorded.is_symlink();
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+    let open = |flags: libc::c_int| {
+        let fd = unsafe {
+            libc::openat(
+                entry.dir_fd(),
+                entry.file_name().as_ptr(),
+                flags | nofollow | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    #[cfg(target_os = "linux")]
+    let fd = {
+        let pin = || open(libc::O_PATH);
+        if !recorded.is_dir() {
+            pin()
+        } else {
+            match open(dir_flags) {
+                Err(e) if e.raw_os_error() == Some(libc::EACCES) => pin(),
+                opened => opened,
+            }
+        }
+    }?;
+    #[cfg(not(target_os = "linux"))]
+    let fd = open(dir_flags)?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Casts needed: `dev_t` is i32 on macOS, `mode_t` u16 there.
+    #[allow(clippy::unnecessary_cast)]
+    let same = (st.st_dev as u64, st.st_ino as u64) == (recorded.dev(), recorded.ino())
+        && (st.st_mode & libc::S_IFMT) as u32 == recorded.mode() & libc::S_IFMT as u32;
+    let special = !recorded.is_dir() && !recorded.is_file();
+    if !same {
+        return Ok(None);
+    }
+    match read_source_fd(fd.as_raw_fd()) {
+        Err(e) if special && no_procfs_route(&e) => Ok(Some(Acl::default())),
+        read => read.map(Some),
+    }
+}
+
+/// Whether the failure `e` to read the ACLs of a file pinned `O_PATH` is that there is no
+/// procfs to read them through (`read_fd`): no `/proc/self/fd/N` (ENOENT), or no `/proc`
+/// verified to be procfs. A special file is read no other way, so then none can be read at
+/// all, as on a filesystem that holds none (EOPNOTSUPP).
+#[cfg(target_os = "linux")]
+fn no_procfs_route(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENOENT) || crate::madefs::procfs_dir().is_err()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn no_procfs_route(_e: &io::Error) -> bool {
+    false
+}
+
 /// The extended attribute `name` of the file open on `fd`, `O_PATH` or not (`read_fd`).
 /// Elsewhere than Linux none is read: EOPNOTSUPP.
 pub fn read_xattr(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
@@ -496,18 +606,29 @@ pub fn read_xattr(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
 ///
 /// `fd` may be an `O_PATH` descriptor, written through `/proc/self/fd/N` as `read_fd` reads one.
 /// Writing an access ACL sets the group bits of the mode to its mask: the caller sets the mode
-/// first, then the ACL, as gnulib's `qcopy_acl` does. Residual: an NFSv4 ACL the destination
-/// already has is not removed when `acl` has none; the mode set before it is what the server
-/// makes of it.
+/// first, then the ACL, as gnulib's `qcopy_acl` does. A write that fails leaves no POSIX ACL
+/// on the file, access or default, so that what it keeps is its mode alone. Residual: an NFSv4
+/// ACL the destination already has is not removed when `acl` has none; the mode set before it
+/// is what the server makes of it.
 pub fn write_fd(fd: RawFd, acl: &Acl) -> io::Result<()> {
     sys::write(fd, acl)
 }
 
-/// Copy the ACLs `acl`, a source's, to the file open on `fd`, its copy, already given the
-/// source's mode (`write_fd`). A filesystem that holds no ACL fails it with EOPNOTSUPP, which
-/// is no failure when the ACLs said nothing the mode does not (`loses_nothing`).
-pub fn copy_to_fd(acl: &Acl, fd: RawFd) -> io::Result<()> {
-    match write_fd(fd, acl) {
+/// Copy the ACLs `acl`, a source's, to the file open on `fd`, its copy, which holds the mode
+/// `mode` while they are written (`write_fd`). A filesystem that holds no ACL fails it with
+/// EOPNOTSUPP, which is no failure when the ACLs said nothing the mode does not
+/// (`loses_nothing`).
+///
+/// Writing an access ACL sets the mode's bits from its owner, mask (or owning group) and other
+/// entries, so the access ACL is written with those set to `mode`'s (`PosixAcl::with_mode`):
+/// one wider than `mode` -- an archive's, say -- leaves the file no more open than `mode` until
+/// the caller gives it its own mode, which sets those entries once more.
+pub fn copy_to_fd(acl: &Acl, fd: RawFd, mode: u32) -> io::Result<()> {
+    let held = Acl {
+        access: acl.access.as_ref().map(|access| access.with_mode(mode)),
+        ..acl.clone()
+    };
+    match write_fd(fd, &held) {
         Err(e) if loses_nothing(acl, &e) => Ok(()),
         written => written,
     }
@@ -669,8 +790,17 @@ mod sys {
     }
 
     /// Call `call` with a buffer until it fits what is read, asking the size again when the
-    /// attribute grew between the calls (ERANGE).
+    /// attribute grew between the calls (ERANGE). The first buffer is on the stack: a file with
+    /// no attributes, the usual case, then costs no allocation.
     fn sized(call: impl Fn(*mut u8, usize) -> isize) -> io::Result<Vec<u8>> {
+        let mut small = [0u8; 256];
+        if let Ok(len) = usize::try_from(call(small.as_mut_ptr(), small.len())) {
+            return Ok(small[..len].to_vec());
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ERANGE) {
+            return Err(e);
+        }
         let mut buf = vec![0u8; 4096];
         for _ in 0..8 {
             let n = call(buf.as_mut_ptr(), buf.len());
@@ -796,15 +926,35 @@ mod sys {
             return Err(io::Error::last_os_error());
         }
         let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
-        on_fd(fd, |target| {
+        let written = on_fd(fd, |target| {
             let written = write_to(target, acl, is_dir);
-            // A directory whose ACLs are not the source's must not keep a default ACL that
-            // is not either -- its own, or one inherited -- for what is made in it later.
-            if written.is_err() && is_dir {
-                let _ = remove(target, c"system.posix_acl_default");
+            // A file whose ACLs are not the source's keeps none: not an access ACL written
+            // before what failed, nor a default ACL -- its own, or one inherited -- for what is
+            // made in a directory later.
+            if written.is_err() {
+                let _ = remove(target, c"system.posix_acl_access");
+                if is_dir {
+                    let _ = remove(target, c"system.posix_acl_default");
+                }
             }
             written
-        })
+        });
+        match written {
+            // A special file is written only through its pin's `self/fd/N`: with no procfs to
+            // write through, none can be written, as on a filesystem that holds none.
+            Err(e) if is_special(st.st_mode) && super::no_procfs_route(&e) => {
+                Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            }
+            written => written,
+        }
+    }
+
+    /// Whether the mode `mode` is a FIFO's, a device's or a socket's.
+    fn is_special(mode: libc::mode_t) -> bool {
+        matches!(
+            mode & libc::S_IFMT,
+            libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK
+        )
     }
 
     /// The POSIX ACLs first -- set, or removed where `acl` has none beyond the mode -- then a
@@ -840,6 +990,30 @@ mod sys {
                 Err(e) if !absent(&e) => Err(e),
                 _ => Ok(()),
             },
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// What does not fit the stack buffer is read whole into one that does, and what
+        /// does fit comes back as it is.
+        #[test]
+        fn sized_reads_past_the_stack_buffer() {
+            for size in [0usize, 9, 256, 257, 5000] {
+                let value: Vec<u8> = (0..size).map(|i| i as u8).collect();
+                let read = super::sized(|buf, len| {
+                    if buf.is_null() {
+                        return size as isize;
+                    }
+                    if len < size {
+                        unsafe { *libc::__errno_location() = libc::ERANGE };
+                        return -1;
+                    }
+                    unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), buf, size) };
+                    size as isize
+                });
+                assert_eq!(read.unwrap(), value, "{size} bytes");
+            }
         }
     }
 }
@@ -1455,6 +1629,49 @@ mod tests {
         assert!(check_darwin_external(&form(MAGIC, 0, 0, true)[..43]).is_err());
     }
 
+    /// The entries a mode shows follow the mode, as `chmod` sets them: the owner's, the mask's
+    /// (the owning group's where there is no mask) and others'; named entries are untouched.
+    #[test]
+    fn with_mode_sets_what_the_mode_shows() {
+        let wide =
+            PosixAcl::from_text("user::rwx,user:7:rwx,group::rwx,mask::rwx,other::rwx").unwrap();
+        let narrowed = PosixAcl::from_text("user::rwx,user:7:rwx,group::rwx,mask::---,other::---");
+        assert_eq!(wide.with_mode(0o4700), narrowed.unwrap());
+        let plain = PosixAcl::from_text("user::rwx,group::rwx,other::rwx").unwrap();
+        let narrowed = PosixAcl::from_text("user::r--,group::r-x,other::--x").unwrap();
+        assert_eq!(plain.with_mode(0o451), narrowed);
+    }
+
+    /// Writing an access ACL sets the mode's bits from it: `copy_to_fd` writes one wider than
+    /// the mode the file holds no wider, so the file is never more open than that mode while
+    /// the caller has yet to give it its own. Skipped where the filesystem takes no ACLs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_to_fd_keeps_the_mode_the_file_holds() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::tmp::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let file = std::fs::File::create(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let wide = PosixAcl::from_text("user::rwx,user:65534:rwx,group::rwx,mask::rwx,other::rwx");
+        let acl = Acl {
+            access: Some(wide.unwrap()),
+            ..Acl::default()
+        };
+        match copy_to_fd(&acl, file.as_raw_fd(), 0o700) {
+            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => return,
+            written => written.unwrap(),
+        }
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o700);
+        let named = read_path(&path, true).unwrap().access.unwrap();
+        assert!(named.entries.contains(&Entry {
+            tag: Tag::User(65534),
+            perm: 7
+        }));
+    }
+
     /// What `write_fd` writes reads back, through a descriptor and through an `O_PATH` one (the
     /// procfs route); it replaces what was there, so an ACL the source lacks is removed, and a
     /// directory's default ACL with it. Skipped where `setfacl` is missing or the filesystem
@@ -1474,7 +1691,8 @@ mod tests {
 
         let dst = dir.path().join("dst");
         let file = std::fs::File::create(&dst).unwrap();
-        copy_to_fd(&acl, file.as_raw_fd()).unwrap();
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&src).unwrap());
+        copy_to_fd(&acl, file.as_raw_fd(), mode).unwrap();
         assert_eq!(read_path(&dst, true).unwrap(), acl);
         write_fd(file.as_raw_fd(), &Acl::default()).unwrap();
         assert_eq!(read_path(&dst, true).unwrap(), Acl::default());

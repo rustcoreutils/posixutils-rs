@@ -707,55 +707,19 @@ fn preserve_acl_error(target: &Path, e: &io::Error) -> io::Error {
     ))
 }
 
-/// The ACLs of the source open on `fd`, the descriptor its data or metadata came from, for -p.
-/// Where none can be read at all (EOPNOTSUPP: a system no ACL is read on), it has none to
-/// lose.
+/// The ACLs of the source open on `fd`, the descriptor its data or metadata came from, for -p
+/// (`plib::acl::read_source_fd`).
 pub fn source_acl(fd: libc::c_int) -> io::Result<Acl> {
-    match plib::acl::read_fd(fd) {
-        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(Acl::default()),
-        read => read,
-    }
+    plib::acl::read_source_fd(fd)
 }
 
-/// The ACLs of the directory or special file the walk recorded at `source` (`source_acl`),
-/// read through a descriptor of its own, required to be the very file recorded -- its
-/// `(st_dev, st_ino)` and type -- as `fresh_source_md` requires its metadata to be.
-///
-/// A directory is opened for reading, and its ACLs read with plain `f*xattr` calls, which need
-/// no procfs. One cp cannot read (EACCES) is, on Linux, pinned `O_PATH` instead, as a special
-/// file always is there: that needs no permission on the file and opens no device or FIFO, and
-/// its attributes are read through its `self/fd/N` under a verified procfs
-/// (`plib::acl::read_fd`); without one nothing is read, and -p reports that. Elsewhere a
-/// special file's ACLs are never read (`preserve_made_node`).
+/// The ACLs of the directory or special file the walk recorded at `source`, read through a
+/// descriptor of its own, required to be the very file recorded, as `fresh_source_md` requires
+/// its metadata to be (`plib::acl::read_entry`); without a procfs to read an `O_PATH` one
+/// through nothing is read, and -p reports that.
 fn entry_acl(source: &ftw::Entry) -> io::Result<Acl> {
-    let changed = || io::Error::other(gettext!("'{}' changed during the copy", source.path()));
-    let recorded = source.metadata().ok_or_else(changed)?;
-    // The walk recorded a followed link's referent; open the same thing.
-    let follow = source.is_symlink() == Some(true) && !recorded.is_symlink();
-    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
-    let open = |flags| open_fd_at(source.dir_fd(), source.file_name(), flags | nofollow);
-    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    #[cfg(target_os = "linux")]
-    let fd = {
-        let pin = || open(libc::O_PATH | libc::O_CLOEXEC);
-        if recorded.file_type() != ftw::FileType::Directory {
-            pin()
-        } else {
-            match open(dir_flags) {
-                Err(e) if e.raw_os_error() == Some(libc::EACCES) => pin(),
-                opened => opened,
-            }
-        }
-    }?;
-    #[cfg(not(target_os = "linux"))]
-    let fd = open(dir_flags)?;
-    let md = fd_metadata(fd.as_raw_fd())?;
-    if (md.dev(), md.ino()) != (recorded.dev(), recorded.ino())
-        || !same_file_type(md.file_type(), recorded.file_type())
-    {
-        return Err(changed());
-    }
-    source_acl(fd.as_raw_fd())
+    plib::acl::read_entry(source)?
+        .ok_or_else(|| io::Error::other(gettext!("'{}' changed during the copy", source.path())))
 }
 
 /// Give the copy open on `fd` the source's mode `mode` and ACLs, through `chmod`, which sets
@@ -786,7 +750,7 @@ fn set_mode_and_acl(
         |mode: u32| chmod(mode as libc::mode_t).map_err(|e| preserve_mode_error(target, &e));
     set_mode(owner_only)?;
     let (written, kept) = match acl() {
-        Ok(acl) => match plib::acl::copy_to_fd(&acl, fd) {
+        Ok(acl) => match plib::acl::copy_to_fd(&acl, fd, owner_only) {
             Ok(()) => (Ok(()), mode),
             Err(e) => (Err(e), plib::acl::mode_without(Some(&acl), mode)),
         },

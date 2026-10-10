@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, Read, Seek, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -244,6 +244,10 @@ impl<A: ArchiveWriter> ArchiveWriter for ArchiveSink<'_, A> {
 
     fn supports_sockets(&self) -> bool {
         self.0.supports_sockets()
+    }
+
+    fn supports_acls(&self) -> bool {
+        self.0.supports_acls()
     }
 }
 
@@ -469,7 +473,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             if !up_to_date {
                 // A header the format refuses (a time before 1970 in ustar,
                 // say) loses this entry, not everything below it.
-                match write_dir_entry(archive, &archive_path, metadata) {
+                match write_dir_entry(archive, entry, &archive_path, metadata) {
                     Err(e) if !crate::modes::is_fatal(&e) => crate::error::report_error(path, e),
                     r => r?,
                 }
@@ -500,7 +504,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             // Block and character devices, FIFOs and sockets are archived from
             // their metadata; none of them is ever opened, so a FIFO with no
             // writer cannot block the walk.
-            write_special(archive, &archive_path, metadata, self.options)?;
+            write_special(archive, entry, &archive_path, metadata, self.options)?;
         }
 
         Ok(false)
@@ -510,10 +514,14 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
 /// Write a directory's header.
 fn write_dir_entry<W: ArchiveWriter>(
     archive: &mut W,
+    source: &ftw::Entry<'_>,
     archive_path: &Path,
     metadata: &ftw::Metadata,
 ) -> PaxResult<()> {
-    let dir_entry = build_entry(archive_path, metadata, EntryType::Directory)?;
+    let mut dir_entry = build_entry(archive_path, metadata, EntryType::Directory)?;
+    add_acls(&*archive, &mut dir_entry, source, || {
+        plib::acl::read_entry(source)
+    });
     archive.write_entry(&dir_entry)?;
     archive.finish_entry()
 }
@@ -552,6 +560,7 @@ fn write_symlink<W: ArchiveWriter>(
 #[cfg(unix)]
 fn write_special<W: ArchiveWriter>(
     archive: &mut W,
+    source: &ftw::Entry<'_>,
     path: &Path,
     metadata: &ftw::Metadata,
     options: &WriteOptions,
@@ -589,7 +598,10 @@ fn write_special<W: ArchiveWriter>(
         return Ok(());
     };
 
-    let entry = build_entry(path, metadata, entry_type)?;
+    let mut entry = build_entry(path, metadata, entry_type)?;
+    add_acls(&*archive, &mut entry, source, || {
+        plib::acl::read_entry(source)
+    });
     archive.write_entry(&entry)?;
     archive.finish_entry()?;
 
@@ -599,6 +611,7 @@ fn write_special<W: ArchiveWriter>(
 #[cfg(not(unix))]
 fn write_special<W: ArchiveWriter>(
     _archive: &mut W,
+    _source: &ftw::Entry<'_>,
     path: &Path,
     _metadata: &ftw::Metadata,
     _options: &WriteOptions,
@@ -712,6 +725,10 @@ fn write_file<W: ArchiveWriter>(
         entry.data_checksum = Some(file_checksum(&mut file)?);
         file.rewind()?;
     }
+    // Its ACLs, read through the same descriptor.
+    add_acls(&*archive, &mut entry, entry_ref, || {
+        plib::acl::read_source_fd(file.as_raw_fd()).map(Some)
+    });
 
     // Write regular file
     archive.write_entry(&entry)?;
@@ -731,6 +748,45 @@ fn write_file<W: ArchiveWriter>(
     }
 
     Ok(())
+}
+
+/// Give `member` the POSIX.1e ACLs of its source, the file the walk recorded at `source`, where
+/// the archive has a place for them (`supports_acls`) -- an access ACL only where it says more
+/// than the mode, a default ACL only on a directory. `read` reads them through a descriptor
+/// already checked to be that file, `None` when it is not. A failure to read them is reported,
+/// and the member written without them.
+///
+/// Only Linux has POSIX ACLs to read; elsewhere nothing is read.
+fn add_acls<W: ArchiveWriter>(
+    archive: &W,
+    member: &mut ArchiveEntry,
+    source: &ftw::Entry<'_>,
+    read: impl FnOnce() -> std::io::Result<Option<plib::acl::Acl>>,
+) {
+    if !cfg!(target_os = "linux") || !archive.supports_acls() {
+        return;
+    }
+    let path = source.path();
+    let acl = match read() {
+        Ok(Some(acl)) => acl,
+        Ok(None) => {
+            let changed = gettextrs::gettext("cannot read ACL: file changed as we read it");
+            crate::error::report_error(path.as_inner(), changed);
+            return;
+        }
+        Err(e) => {
+            let reason = gettextrs::gettext("cannot read ACL");
+            crate::error::report_error(path.as_inner(), format!("{reason}: {e}"));
+            return;
+        }
+    };
+    member.acl_access = acl
+        .access
+        .filter(|access| !access.is_trivial())
+        .map(|access| access.to_text());
+    if member.is_dir() {
+        member.acl_default = acl.default.map(|default| default.to_text());
+    }
 }
 
 /// Sum a file's bytes for the cpio "crc" format's c_check field

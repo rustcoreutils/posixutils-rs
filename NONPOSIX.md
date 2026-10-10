@@ -668,15 +668,28 @@ Debian source packages, with GNU patch's meaning:
    volume.  Written in ustar format only, and incompatible with `-z`.
  * `-p` on a directory that already existed follows the rule under
    [cp, existing directories under `-p`](#existing-directories-under--p).
- * `-p p` and `-p e` give each member its archived mode and no ACL beyond
-   it, as GNU tar `--acls -p` does with an archive that records none: the ACL
-   a new member inherited from its directory's default ACL is removed, and so
-   are the access and default ACLs of an existing directory pax is allowed to
-   give its mode -- the rule of
-   [cp, ACLs under `-p`](#acls-under--p).  Without `-p p` a member is made by
-   the normal file-creation action, so on Linux under a default ACL it takes
-   the ACL inherited from that, masked by its archived mode, and the umask
-   plays no part.
+ * POSIX.1e ACLs.  `-x pax` always records a file's access ACL, where it
+   says more than the mode, and a directory's default ACL, as the
+   `SCHILY.acl.access` and `SCHILY.acl.default` records star, bsdtar and GNU
+   tar `--acls` write, in star's text form (`user:alice:r--:1000`: the name,
+   then the number).  ustar and cpio have no place for one, and get none.
+   Reading, a name is looked up first and the number used only where the
+   name is unknown, as for a member's owner.
+ * `-p p` and `-p e` give each member its archived mode and ACLs, and no ACL
+   beyond them, as GNU tar `--acls -p` does: the ACL a new member inherited
+   from its directory's default ACL is replaced, and so are the access and
+   default ACLs of an existing directory pax is allowed to give its mode --
+   the rule of [cp, ACLs under `-p`](#acls-under--p).  An ACL that cannot be
+   set, or a record that is not one, is diagnosed and the exit status is 1;
+   the member keeps a mode granting no more than the ACL did.  A
+   directory's archived default ACL is applied as recorded, not bounded by
+   its mode, and from then on governs what is created in that directory,
+   whatever the umask, as with GNU tar, bsdtar and star.  Copy mode copies
+   the source's ACLs under the same options, as cp `-p` does.
+   Without `-p p` no ACL is applied: a member is made by the normal
+   file-creation action, so on Linux under a default ACL it takes the ACL
+   inherited from that, masked by its archived mode, and the umask plays no
+   part.
  * `-x bcpio`, `-x sv4cpio`, `-x sv4crc` — the historic pax names for the old
    binary cpio header and the SVR4 "newc" headers without and with a data
    checksum.  POSIX names only `cpio` (odc), `pax` and `ustar`.  All three are

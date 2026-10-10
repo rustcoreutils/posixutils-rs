@@ -132,6 +132,12 @@ pub struct ArchiveEntry {
     /// true from `ArchiveWriter::needs_data_checksum` asks its caller to fill
     /// this in first; every other format leaves it `None`.
     pub data_checksum: Option<u32>,
+    /// The member's POSIX.1e access ACL, in the text form a pax archive carries it in
+    /// (`SCHILY.acl.access`: `user::rw-,user:alice:r--:1000,...`). Only one that says more
+    /// than the mode is written; only the pax format has a place for it.
+    pub acl_access: Option<String>,
+    /// A directory member's default ACL (`SCHILY.acl.default`), in the same form.
+    pub acl_default: Option<String>,
     /// The pax extended-header records this member carried that no field
     /// above already holds: `charset`, `hdrcharset`, `comment` and whatever
     /// implementation extensions the archive used.
@@ -171,6 +177,8 @@ impl ArchiveEntry {
             devmajor: 0,
             devminor: 0,
             data_checksum: None,
+            acl_access: None,
+            acl_default: None,
             ext_records: ExtRecords::default(),
             source_header: None,
         }
@@ -363,6 +371,13 @@ pub trait ArchiveWriter {
     /// header ahead of the data it covers. Callers that say true here must read
     /// the member's contents once to sum them before handing over the entry.
     fn needs_data_checksum(&self) -> bool {
+        false
+    }
+
+    /// Whether the format has a place for a member's ACLs
+    /// (`ArchiveEntry::acl_access`). Only the pax format does; a writer that
+    /// returns `false` is handed none, and no file's ACLs are read for it.
+    fn supports_acls(&self) -> bool {
         false
     }
 }

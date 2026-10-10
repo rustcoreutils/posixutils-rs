@@ -1101,7 +1101,7 @@ fn extract_device(
     // Created without the set-id bits; set_made_attrs applies the archived
     // mode below, once the node exists.
     let mode: libc::mode_t =
-        (policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::mode_t) | type_bits;
+        (policy_of(options).creation_mode(&recorded_attrs(entry)) as libc::mode_t) | type_bits;
 
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         let r = unsafe { libc::mknodat(dirfd.as_raw_fd(), name.as_ptr(), mode, dev) };
@@ -1138,7 +1138,7 @@ fn extract_fifo(
             libc::mkfifoat(
                 dirfd.as_raw_fd(),
                 name.as_ptr(),
-                policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::mode_t,
+                policy_of(options).creation_mode(&recorded_attrs(entry)) as libc::mode_t,
             )
         };
         if r != 0 {
@@ -1201,7 +1201,7 @@ fn create_file(
             dirfd.as_raw_fd(),
             name.as_ptr(),
             flags,
-            policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::c_uint,
+            policy_of(options).creation_mode(&recorded_attrs(entry)) as libc::c_uint,
         )
     };
     if fd < 0 {
@@ -1333,22 +1333,57 @@ fn owner_ids(entry: &ArchiveEntry) -> (u32, u32) {
 /// The archived attributes of a member, in the shared shape.
 ///
 /// The owner is only ever applied under `-p o`, so only then are the user and
-/// group databases consulted for it: a lookup per member is not free.
+/// group databases consulted for it: a lookup per member is not free. Nor is
+/// reading its ACLs (a lookup per name in them), done only under `-p p`. Each
+/// is done once per member, where the attributes are applied.
 fn attrs_of(entry: &ArchiveEntry, options: &ReadOptions) -> Attrs {
-    let (uid, gid) = if options.preserve_owner {
-        owner_ids(entry)
-    } else {
-        (entry.uid, entry.gid)
-    };
+    let mut attrs = recorded_attrs(entry);
+    if options.preserve_owner {
+        (attrs.uid, attrs.gid) = owner_ids(entry);
+    }
+    if options.preserve_perms {
+        attrs.acl = member_acl(entry);
+    }
+    attrs
+}
+
+/// The attributes a member records, as they stand: no name looked up, no ACL
+/// read. What it is created with (`AttrPolicy::creation_mode`) needs no more.
+fn recorded_attrs(entry: &ArchiveEntry) -> Attrs {
     Attrs {
         mode: entry.mode,
-        uid,
-        gid,
+        uid: entry.uid,
+        gid: entry.gid,
         mtime: entry.mtime,
         mtime_nsec: entry.mtime_nsec as i64,
         atime: entry.atime,
         atime_nsec: entry.atime_nsec as i64,
+        acl: Ok(plib::acl::Acl::default()),
     }
+}
+
+/// The ACLs a member records (`SCHILY.acl.access`, and a directory's
+/// `SCHILY.acl.default`), to be given it under `-p p`; the reason, naming the
+/// record, where one is not an ACL this host can set.
+///
+/// A user or group is named as star names one: by the name, looked up here,
+/// then by the number after it -- as the member's own owner is (`owner_ids`).
+fn member_acl(entry: &ArchiveEntry) -> Result<plib::acl::Acl, String> {
+    let parse = |keyword: &str, text: Option<&str>| {
+        text.map(plib::acl::PosixAcl::from_text)
+            .transpose()
+            .map_err(|e| format!("{keyword}: {e}"))
+    };
+    let default = if entry.is_dir() {
+        parse("SCHILY.acl.default", entry.acl_default.as_deref())?
+    } else {
+        None
+    };
+    Ok(plib::acl::Acl {
+        access: parse("SCHILY.acl.access", entry.acl_access.as_deref())?,
+        default,
+        native: None,
+    })
 }
 
 /// What `-p` asked to keep, in the shared shape.

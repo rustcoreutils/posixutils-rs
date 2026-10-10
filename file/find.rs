@@ -241,6 +241,8 @@ enum PrintfItem {
     Path,
     /// `%P`: the pathname with its starting point removed
     RelativePath,
+    /// `%f`: the pathname with its leading directories removed
+    Basename,
     /// `%s`: the size in bytes
     Size,
     /// `%T@`: the modification time in seconds since the Epoch
@@ -776,6 +778,21 @@ fn copy_bracket(
 
 /// Parse a `-printf` format into literal runs and directives. Unsupported
 /// directives and escapes are an error, never silently wrong output.
+/// `%f`: `path` without its leading directories, as GNU find writes it: the
+/// last component with any trailing slashes it has, and `/` for a path of
+/// slashes alone.
+fn basename(path: &[u8]) -> &[u8] {
+    let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    if end == 0 {
+        return if path.is_empty() { path } else { b"/" };
+    }
+    let start = path[..end]
+        .iter()
+        .rposition(|&b| b == b'/')
+        .map_or(0, |i| i + 1);
+    &path[start..]
+}
+
 fn parse_printf_format(format: &str) -> Result<Vec<PrintfItem>, String> {
     let mut items = Vec::new();
     let mut literal = Vec::new();
@@ -788,6 +805,7 @@ fn parse_printf_format(format: &str) -> Result<Vec<PrintfItem>, String> {
                     [b'%', ..] => None,
                     [b'p', ..] => Some((PrintfItem::Path, 2)),
                     [b'P', ..] => Some((PrintfItem::RelativePath, 2)),
+                    [b'f', ..] => Some((PrintfItem::Basename, 2)),
                     [b's', ..] => Some((PrintfItem::Size, 2)),
                     [b'T', b'@', ..] => Some((PrintfItem::MTimeEpoch, 3)),
                     rest => {
@@ -1385,6 +1403,9 @@ fn format_printf(items: &[PrintfItem], ctx: &EvalContext) -> Vec<u8> {
             PrintfItem::RelativePath => {
                 let rel = ctx.path.strip_prefix(ctx.root).unwrap_or(Path::new(""));
                 out.extend_from_slice(rel.as_os_str().as_bytes());
+            }
+            PrintfItem::Basename => {
+                out.extend_from_slice(basename(ctx.path.as_os_str().as_bytes()))
             }
             PrintfItem::Size => out.extend_from_slice(ctx.metadata.size().to_string().as_bytes()),
             PrintfItem::MTimeEpoch => {

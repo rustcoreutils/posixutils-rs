@@ -62,3 +62,30 @@ fn find_not_is_bang() {
         1,
     );
 }
+
+/// `-printf %f` writes the basename: `find usr/share/man/man1 -type f -printf "%f\n"`.
+#[test]
+fn find_printf_basename() {
+    let tmp = scratch_dir();
+    let dir = tmp.path();
+    fs::create_dir(dir.join("man1")).unwrap();
+    fs::write(dir.join("man1/perl.1"), "").unwrap();
+    fs::write(dir.join("man1/h2ph.1"), "").unwrap();
+    let d = dir.to_str().unwrap();
+    let man1 = format!("{d}/man1");
+    run_test_find_sorted(
+        &[&man1, "-type", "f", "-printf", "%f\\n"],
+        &["h2ph.1", "perl.1"],
+        "",
+        0,
+    );
+    // A starting point's is its last component, any trailing slashes kept,
+    // as in GNU find; `/` is its own.
+    run_test_find_sorted(
+        &[&format!("{man1}/"), "-maxdepth", "0", "-printf", "%f\\n"],
+        &["man1/"],
+        "",
+        0,
+    );
+    run_test_find_sorted(&["/", "-maxdepth", "0", "-printf", "%f\\n"], &["/"], "", 0);
+}

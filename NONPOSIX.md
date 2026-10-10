@@ -443,10 +443,12 @@ table is present.
    entries deeper than `n` are not walked.  The path operand is depth 0.
    Forced by debhelper (`dh_update_autotools_config`, `dh_movelibkdeinit`).
  * `-printf format` — an action writing `format` for each file, with only
-   the directives `%p`, `%P` (path without its starting point), `%s`, `%T@`
-   and `%%` and the escapes `\n`, `\\` and `\NNN` (octal, so `\0` is NUL).
-   Any other directive or escape is an error.  Forced by debhelper
-   (`dh_autoreconf`, `dh_installdeb`, `dh_md5sums`, `dh_installgsettings`).
+   the directives `%p`, `%P` (path without its starting point), `%f` (path
+   without its leading directories), `%s`, `%T@` and `%%` and the escapes
+   `\n`, `\\` and `\NNN` (octal, so `\0` is NUL).  Any other directive or
+   escape is an error.  Forced by debhelper (`dh_autoreconf`,
+   `dh_installdeb`, `dh_md5sums`, `dh_installgsettings`); `%f` by Debian's
+   perl packaging (`debian/perl.install`, `debian/perl-doc.install`).
  * `-or` / `-and` — spellings of `-o` / `-a`.  Forced by debhelper
    (`dh_install`, `dh_installdocs`, `dh_shlibdeps`, and the `-X` exclusions
    of every dh_* tool).

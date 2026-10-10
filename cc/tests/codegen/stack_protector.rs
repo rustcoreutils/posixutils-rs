@@ -141,6 +141,58 @@ fn stack_protector_attribute_exempts() {
     assert!(!smashed(&out), "no_stack_protector was ignored");
 }
 
+/// `optimize` sets one function's level, as gcc's does: glibc's
+/// `inhibit_stack_protector`, `optimize("-fno-stack-protector")`, leaves an
+/// overrun unchecked under `-fstack-protector-all`, and
+/// `optimize("stack-protector-all")` checks one with no level given.
+#[test]
+fn stack_protector_optimize_attribute_sets_the_level() {
+    let src = overrun(
+        24,
+        "__attribute__((__optimize__(\"-fno-stack-protector\")))",
+    );
+    for opt in ["-O0", "-O2"] {
+        let out = run_host("ssp_inhibit", &src, &["-fstack-protector-all", opt]);
+        assert!(
+            !smashed(&out),
+            "{opt}: optimize(-fno-stack-protector) was ignored"
+        );
+    }
+    let src = overrun(64, "__attribute__((optimize(\"O2,stack-protector-all\")))");
+    for opt in ["-O0", "-O2"] {
+        let out = run_host("ssp_opt_all", &src, &[opt]);
+        assert!(
+            smashed(&out),
+            "{opt}: optimize(stack-protector-all) was ignored"
+        );
+    }
+}
+
+/// `--param ssp-buffer-size=N` moves plain `-fstack-protector`'s threshold:
+/// above the 16-byte array, its overrun goes unchecked, as under gcc; at it,
+/// in either spelling, the overrun is caught.
+#[test]
+fn stack_protector_ssp_buffer_size() {
+    let src = overrun(24, "");
+    let out = run_host(
+        "ssp_param_big",
+        &src,
+        &["-fstack-protector", "--param=ssp-buffer-size=17", "-O0"],
+    );
+    assert!(
+        !smashed(&out),
+        "ssp-buffer-size=17 still protected a 16-byte array"
+    );
+    let src = overrun(64, "");
+    for flags in [
+        &["-fstack-protector", "--param=ssp-buffer-size=16", "-O2"][..],
+        &["-fstack-protector", "--param", "ssp-buffer-size=4", "-O2"],
+    ] {
+        let out = run_host("ssp_param_small", &src, flags);
+        assert!(smashed(&out), "{flags:?}: the overrun was not caught");
+    }
+}
+
 /// A frame whose locals need more than the stack's own alignment is
 /// addressed from a second base register, and a VLA moves the stack pointer
 /// at run time: the canary is found through neither, and both still catch

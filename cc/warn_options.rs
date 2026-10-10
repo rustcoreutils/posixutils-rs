@@ -71,7 +71,7 @@ const PLAIN: &[(&str, Effect)] = &[
     // gcc 14's, not 13's; the torture suite passes it (compile/pr106537-2).
     ("compare-distinct-pointer-types", Accepted),
     ("conversion", Accepted),
-    ("cpp", Accepted),
+    ("cpp", Implemented),
     ("dangling-else", Accepted),
     ("dangling-pointer", Accepted),
     ("date-time", Accepted),
@@ -81,7 +81,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("designated-init", Accepted),
     ("disabled-optimization", Accepted),
     ("discarded-array-qualifiers", Accepted),
-    ("discarded-qualifiers", Accepted),
+    ("discarded-qualifiers", Implemented),
     ("div-by-zero", Accepted),
     ("double-promotion", Accepted),
     ("duplicate-decl-specifier", Accepted),
@@ -116,11 +116,11 @@ const PLAIN: &[(&str, Effect)] = &[
     ("implicit-fallthrough", Accepted),
     ("implicit-function-declaration", Implemented),
     ("implicit-int", Implemented),
-    ("incompatible-pointer-types", Accepted),
+    ("incompatible-pointer-types", Implemented),
     ("infinite-recursion", Accepted),
     ("init-self", Accepted),
     ("inline", Accepted),
-    ("int-conversion", Accepted),
+    ("int-conversion", Implemented),
     ("int-in-bool-context", Accepted),
     ("int-to-pointer-cast", Accepted),
     ("invalid-memory-model", Implemented),
@@ -161,9 +161,9 @@ const PLAIN: &[(&str, Effect)] = &[
     ("parentheses", Accepted),
     ("pedantic", Implemented),
     ("pointer-arith", Accepted),
-    ("pointer-sign", Accepted),
+    ("pointer-sign", Implemented),
     ("pointer-to-int-cast", Accepted),
-    ("pragmas", Accepted),
+    ("pragmas", Implemented),
     ("psabi", Accepted),
     ("redundant-decls", Accepted),
     ("restrict", Accepted),
@@ -280,10 +280,57 @@ const JOINED: &[(&str, Value)] = &[
     ("vla-larger-than", Value::Size),
 ];
 
-/// The units gcc takes after a [`Value::Size`] count.
-const SIZE_UNITS: &[&str] = &[
-    "kB", "KB", "KiB", "kiB", "MB", "MiB", "GB", "GiB", "TB", "TiB", "PB", "PiB", "EB", "EiB",
+/// The units gcc takes after a [`Value::Size`] count, with what each
+/// multiplies it by.
+const SIZE_UNITS: &[(&str, u64)] = &[
+    ("kB", 1000),
+    ("KB", 1000),
+    ("KiB", 1 << 10),
+    ("kiB", 1 << 10),
+    ("MB", 1_000_000),
+    ("MiB", 1 << 20),
+    ("GB", 1_000_000_000),
+    ("GiB", 1 << 30),
+    ("TB", 1_000_000_000_000),
+    ("TiB", 1 << 40),
+    ("PB", 1_000_000_000_000_000),
+    ("PiB", 1 << 50),
+    ("EB", 1_000_000_000_000_000_000),
+    ("EiB", 1 << 60),
 ];
+
+/// The bytes a [`Value::Size`] value names -- digits, then optionally one
+/// of [`SIZE_UNITS`] -- or `None` if it is not one. A count too large for
+/// 64 bits is the largest there is, past any frame.
+pub fn size_value(value: &str) -> Option<u64> {
+    let digits = value.trim_end_matches(|c: char| !c.is_ascii_digit());
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let scale = match &value[digits.len()..] {
+        "" => 1,
+        unit => SIZE_UNITS.iter().find(|(u, _)| *u == unit)?.1,
+    };
+    Some(
+        digits
+            .parse::<u64>()
+            .unwrap_or(u64::MAX)
+            .saturating_mul(scale),
+    )
+}
+
+/// The warning group a `-Werror=<target>` or `-Wno-error=<target>` names,
+/// as gcc tags its warnings: an option with a value is its stem and `=`
+/// (`-Werror=frame-larger-than=100` names `frame-larger-than=`), and any
+/// other name is itself.
+pub fn werror_group(target: &str) -> &str {
+    match target.split_once('=') {
+        Some((stem, _)) if plain(target).is_none() && joined(stem).is_some() => {
+            &target[..=stem.len()]
+        }
+        _ => target,
+    }
+}
 
 /// What becomes of one `-W<name>` option.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -415,16 +462,12 @@ fn check_value(stem: &str, kind: Value, value: &str) -> Verdict {
         Value::Level(max) if value.parse::<u64>().map_or(true, |n| n > max) => Some(format!(
             "argument to '-W{stem}=' is not between 0 and {max}"
         )),
-        Value::Size => {
-            let digits = value.trim_end_matches(|c: char| !c.is_ascii_digit());
-            let unit = &value[digits.len()..];
-            (!all_digits(digits) || !(unit.is_empty() || SIZE_UNITS.contains(&unit))).then(|| {
-                format!(
-                    "argument to '-W{stem}=' should be a non-negative integer \
-                     optionally followed by a size unit"
-                )
-            })
-        }
+        Value::Size => size_value(value).is_none().then(|| {
+            format!(
+                "argument to '-W{stem}=' should be a non-negative integer \
+                 optionally followed by a size unit"
+            )
+        }),
         Value::Choice(words) if !words.contains(&value) => {
             return Verdict::DriverError(vec![
                 format!("error: argument '{value}' to '-W{stem}' not recognized"),
@@ -475,6 +518,12 @@ mod tests {
         for name in [
             "attributes",
             "c17-dialect",
+            "cpp",
+            "discarded-qualifiers",
+            "incompatible-pointer-types",
+            "int-conversion",
+            "pointer-sign",
+            "pragmas",
             "c17-unsupported-option",
             "implicit-function-declaration",
             "implicit-int",
@@ -525,6 +574,22 @@ mod tests {
         ] {
             assert_eq!(classify(name), Verdict::Known(Accepted), "-W{name}");
         }
+    }
+
+    #[test]
+    fn sizes_and_groups() {
+        assert_eq!(size_value("100"), Some(100));
+        assert_eq!(size_value("2KiB"), Some(2048));
+        assert_eq!(size_value("2kB"), Some(2000));
+        assert_eq!(size_value("99999999999999999999EiB"), Some(u64::MAX));
+        for bad in ["", "KB", "1 KB", "1k", "-1"] {
+            assert_eq!(size_value(bad), None, "{bad:?}");
+        }
+        assert_eq!(werror_group("frame-larger-than=100"), "frame-larger-than=");
+        assert_eq!(werror_group("frame-larger-than="), "frame-larger-than=");
+        assert_eq!(werror_group("format=2"), "format=");
+        assert_eq!(werror_group("shadow=local"), "shadow=local");
+        assert_eq!(werror_group("overflow"), "overflow");
     }
 
     #[test]

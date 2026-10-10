@@ -107,3 +107,42 @@ fn codegen_backtrace_walks_every_frame() {
         }
     }
 }
+
+/// With unwind tables off, an object has no `.eh_frame`; with `-g` as well
+/// it keeps the rules for the debugger in `.debug_frame`, as gcc's does.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_no_unwind_tables_object_sections() {
+    let c_file = create_c_file(
+        "no_eh_frame",
+        "int g(int);\nint f(int x) { return g(x) + 1; }\n",
+    );
+    let src = c_file.path().to_str().unwrap().to_string();
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_unwind_obj_")
+        .tempdir()
+        .expect("tempdir");
+    let sections = |opts: &[&str]| -> String {
+        let obj = dir.path().join("out.o");
+        let obj = obj.to_str().unwrap();
+        let mut args = vec!["-O2", "-c", "-o", obj];
+        args.extend(opts);
+        args.push(&src);
+        let r = run_c17(&args);
+        assert!(r.success, "{opts:?}: {}", r.stderr);
+        let dump = std::process::Command::new("objdump")
+            .args(["-h", obj])
+            .output()
+            .expect("failed to run objdump");
+        String::from_utf8_lossy(&dump.stdout).into_owned()
+    };
+    let off = ["-fno-asynchronous-unwind-tables", "-fno-unwind-tables"];
+    let plain = sections(&[]);
+    assert!(plain.contains(".eh_frame"), "{plain}");
+    let none = sections(&off);
+    assert!(!none.contains(".eh_frame"), "{none}");
+    assert!(!none.contains(".debug_frame"), "{none}");
+    let debug = sections(&[off[0], off[1], "-g"]);
+    assert!(!debug.contains(".eh_frame"), "{debug}");
+    assert!(debug.contains(".debug_frame"), "{debug}");
+}

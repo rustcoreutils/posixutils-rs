@@ -20,7 +20,7 @@ use crate::strings::StringId;
 use crate::symbol::SymbolKind;
 use crate::token::lexer::Position;
 use crate::types::{AssignFault, TypeId, TypeKind, TypeModifiers};
-use gettextrs::gettext;
+use gettextrs::{gettext, gettext_args};
 
 /// Where a value is converted as if by assignment (C17 6.5.16.1). The
 /// constraints are the same in each; only the wording of a fault differs.
@@ -240,28 +240,40 @@ impl Parser<'_> {
         p_name: &str,
         a_name: &str,
     ) {
-        match (fault.is_error(), callee) {
-            (true, Some(f)) => diag::error_args(
-                pos,
-                "incompatible type for argument {0} of '{1}': expected '{2}', got '{3}'",
-                &[n, f, p_name, a_name],
+        let Some(group) = fault.group() else {
+            match callee {
+                Some(f) => diag::error_args(
+                    pos,
+                    "incompatible type for argument {0} of '{1}': expected '{2}', got '{3}'",
+                    &[n, f, p_name, a_name],
+                ),
+                None => diag::error_args(
+                    pos,
+                    "incompatible type for argument {0}: expected '{1}', got '{2}'",
+                    &[n, p_name, a_name],
+                ),
+            }
+            return;
+        };
+        let (template, args): (&str, &[&str]) = match (fault, callee) {
+            (AssignFault::PointerSign, Some(f)) => (
+                "pointer targets in passing argument {0} of '{1}' differ in signedness",
+                &[n, f],
             ),
-            (true, None) => diag::error_args(
-                pos,
-                "incompatible type for argument {0}: expected '{1}', got '{2}'",
-                &[n, p_name, a_name],
+            (AssignFault::PointerSign, None) => (
+                "pointer targets in passing argument {0} differ in signedness",
+                &[n],
             ),
-            (false, Some(f)) => diag::pedwarn_default_args(
-                pos,
+            (_, Some(f)) => (
                 "passing argument {0} of '{1}' as '{2}' from '{3}' {4}",
                 &[n, f, p_name, a_name, fault.describe()],
             ),
-            (false, None) => diag::pedwarn_default_args(
-                pos,
+            (_, None) => (
                 "passing argument {0} as '{1}' from '{2}' {3}",
                 &[n, p_name, a_name, fault.describe()],
             ),
-        }
+        };
+        diag::group_pedwarn_default(group, pos, &gettext_args(template, args));
     }
 
     /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type. A
@@ -767,6 +779,17 @@ impl Parser<'_> {
             (ConversionSite::Return, true) => {
                 "incompatible types when returning type '{1}' but '{0}' was expected"
             }
+            // gcc words a signedness mismatch apart, naming no fault.
+            (ConversionSite::Assignment, false) if fault == AssignFault::PointerSign => {
+                "pointer targets in assignment from '{1}' to '{0}' differ in signedness"
+            }
+            (ConversionSite::Initialization, false) if fault == AssignFault::PointerSign => {
+                "pointer targets in initialization of '{0}' from '{1}' differ in signedness"
+            }
+            (ConversionSite::Return, false) if fault == AssignFault::PointerSign => {
+                "pointer targets in returning '{1}' from a function with return type '{0}' \
+                 differ in signedness"
+            }
             (ConversionSite::Assignment, false) => "assignment to '{0}' from '{1}' {2}",
             (ConversionSite::Initialization, false) => "initialization of '{0}' from '{1}' {2}",
             (ConversionSite::Return, false) => {
@@ -774,10 +797,11 @@ impl Parser<'_> {
             }
         };
         let args: &[&str] = &[&t_name, &v_name, fault.describe()];
-        if fault.is_error() {
-            diag::error_args(pos, template, args);
-        } else {
-            diag::pedwarn_default_args(pos, template, args);
+        match fault.group() {
+            Some(group) => {
+                diag::group_pedwarn_default(group, pos, &gettext_args(template, args));
+            }
+            None => diag::error_args(pos, template, args),
         }
     }
 

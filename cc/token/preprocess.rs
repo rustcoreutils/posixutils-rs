@@ -898,6 +898,9 @@ enum PackTok {
     Punct(char),
 }
 
+/// gcc's warning group for a malformed pragma it knows.
+pub const PRAGMAS_WARNING: &str = "pragmas";
+
 /// Parse the body of a `pack` pragma, `(` through `)`.
 ///
 /// Accepts the four forms gcc and MSVC share: `pack(n)` sets the cap,
@@ -907,7 +910,11 @@ enum PackTok {
 fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
     let mut it = toks.iter();
     if it.next() != Some(&PackTok::Punct('(')) {
-        diag::warning(pos, &gettext("expected '(' after '#pragma pack'"));
+        diag::group_warning(
+            PRAGMAS_WARNING,
+            pos,
+            &gettext("expected '(' after '#pragma pack'"),
+        );
         return None;
     }
 
@@ -915,13 +922,18 @@ fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
     // a bad value is dropped rather than applied.
     let number = |t: Option<&PackTok>| -> Option<u32> {
         let PackTok::Num(text) = t? else {
-            diag::warning(pos, &gettext("expected an alignment in '#pragma pack'"));
+            diag::group_warning(
+                PRAGMAS_WARNING,
+                pos,
+                &gettext("expected an alignment in '#pragma pack'"),
+            );
             return None;
         };
         match text.parse::<u32>() {
             Ok(n) if n > 0 && n.is_power_of_two() && n <= 16 => Some(n),
             _ => {
-                diag::warning(
+                diag::group_warning(
+                    PRAGMAS_WARNING,
                     pos,
                     &gettext("alignment in '#pragma pack' must be 1, 2, 4, 8 or 16"),
                 );
@@ -939,12 +951,20 @@ fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
         },
         Some(PackTok::Word(w)) if w == "pop" => Some(PackAction::Pop),
         Some(PackTok::Word(_)) => {
-            diag::warning(pos, &gettext("unrecognized '#pragma pack' argument"));
+            diag::group_warning(
+                PRAGMAS_WARNING,
+                pos,
+                &gettext("unrecognized '#pragma pack' argument"),
+            );
             None
         }
         t @ Some(PackTok::Num(_)) => Some(PackAction::Set(number(t))),
         _ => {
-            diag::warning(pos, &gettext("expected an alignment in '#pragma pack'"));
+            diag::group_warning(
+                PRAGMAS_WARNING,
+                pos,
+                &gettext("expected an alignment in '#pragma pack'"),
+            );
             None
         }
     }

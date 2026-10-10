@@ -408,3 +408,133 @@ __attribute__((no_stack_protector)) int refuser(int i) { return callee(i) + 2; }
     );
     assert_body_lacks(&asm, "refuser", "__stack_chk_fail", "no_stack_protector");
 }
+
+/// `optimize` naming a stack-protector option sets that function's level,
+/// as gcc's does: glibc's `inhibit_stack_protector` on its ifunc resolvers
+/// and its early startup code, `optimize("-fno-stack-protector")`. Written
+/// with or without `-f`, in one string with commas or in several. Other
+/// `optimize` options leave the level alone.
+const OPTIMIZE_ATTR: &str = r#"
+void use(char *);
+__attribute__((optimize("-fno-stack-protector"))) void a(void) { char b[200]; use(b); }
+__attribute__((__optimize__("no-stack-protector"))) void b(void) { char b[200]; use(b); }
+__attribute__((optimize("-fstack-protector-all"))) void c(void) { int x; use((char*)&x); }
+__attribute__((optimize("O2,stack-protector-strong"))) void d(void) { int x[2]; use((char*)x); }
+__attribute__((optimize("-O2", "-fstack-protector-all"))) void e(void) { int x; use((char*)&x); }
+__attribute__((optimize("-fno-stack-protector"), stack_protect)) void f(void) { char b[200]; use(b); }
+__attribute__((optimize("-fstack-protector-explicit"))) void g(void) { char b[200]; use(b); }
+__attribute__((optimize("-fstack-protector-explicit"), stack_protect)) void h(void) { int x; use((char*)&x); }
+__attribute__((optimize("-O3", "-fno-omit-frame-pointer"))) void i(void) { char b[200]; use(b); }
+void j(void) __attribute__((optimize("-fno-stack-protector")));
+void j(void) { char b[200]; use(b); }
+void plain(void) { char b[200]; use(b); }
+void small(void) { int x; use((char*)&x); }
+"#;
+
+/// What gcc 13 protects of [`OPTIMIZE_ATTR`] under each level, read off
+/// `gcc -O2 -S`.
+#[test]
+fn stack_protector_optimize_attribute_sets_the_level() {
+    let funcs = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "plain", "small",
+    ];
+    for (level, want) in [
+        ("-fno-stack-protector", &["c", "d", "e", "h"][..]),
+        ("-fstack-protector", &["c", "d", "e", "h", "i", "plain"]),
+        (
+            "-fstack-protector-strong",
+            &["c", "d", "e", "h", "i", "plain", "small"],
+        ),
+        (
+            "-fstack-protector-all",
+            &["c", "d", "e", "h", "i", "plain", "small"],
+        ),
+    ] {
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            for opt in ["-O0", "-O2"] {
+                let asm = asm_for_with("ssp_optimize", triple, OPTIMIZE_ATTR, &[level, opt]);
+                let got: Vec<&str> = funcs
+                    .iter()
+                    .copied()
+                    .filter(|f| body_of(&asm, f).contains("__stack_chk_fail"))
+                    .collect();
+                assert_eq!(got, want, "{triple} {level} {opt}");
+            }
+        }
+    }
+}
+
+/// Plain `-fstack-protector` guards a 200-byte `char` buffer that is passed
+/// out, copied into or indexed, as gcc does, under the kernel's `-fno-pie`
+/// at -O0 and -O2 on both targets. (gcc at -O0 also guards a buffer nothing
+/// touches; c17 gives that one no stack slot at any level, so there is
+/// nothing there to guard.)
+#[test]
+fn stack_protector_guards_a_used_char_buffer() {
+    let src = r#"
+void use(char *);
+void out(void) { char buf[200]; use(buf); }
+void copied(const char *s) { char buf[200]; __builtin_memcpy(buf, s, 200); use(buf); }
+int indexed(int i) { char buf[200]; buf[i] = 1; return buf[3]; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        for opt in ["-O0", "-O2"] {
+            let asm = asm_for_with(
+                "ssp_char200",
+                triple,
+                src,
+                &["-fstack-protector", "-fno-pie", opt],
+            );
+            for f in ["out", "copied", "indexed"] {
+                assert_body_contains(&asm, f, "__stack_chk_fail", &format!("{triple} {opt}"));
+            }
+        }
+    }
+}
+
+/// `--param ssp-buffer-size=N` is plain `-fstack-protector`'s threshold: a
+/// `char` array of N bytes or more, alone or in an aggregate, as gcc 13
+/// chooses at -O2 on both targets. `-strong` does not read it, and
+/// `alloca` is protected whatever it is.
+#[test]
+fn stack_protector_ssp_buffer_size() {
+    let src = r#"
+void use(void *);
+void c3(void) { char b[3]; use(b); }
+void c4(void) { char b[4]; use(b); }
+void c8(void) { char b[8]; use(b); }
+void c200(void) { char b[200]; use(b); }
+void c300(void) { char b[300]; use(b); }
+struct s4 { char c[4]; int x; };
+void s4(void) { struct s4 s; use(&s); }
+void i100(void) { int b[100]; use(b); }
+void al(int n) { use(__builtin_alloca(n)); }
+"#;
+    let funcs = ["c3", "c4", "c8", "c200", "c300", "s4", "i100", "al"];
+    let strong = &["c3", "c4", "c8", "c200", "c300", "s4", "i100", "al"][..];
+    for (param, plain) in [
+        (None, &["c8", "c200", "c300", "al"][..]),
+        (Some("4"), &["c4", "c8", "c200", "c300", "s4", "al"]),
+        (Some("300"), &["c300", "al"]),
+        (Some("1"), &["c3", "c4", "c8", "c200", "c300", "s4", "al"]),
+    ] {
+        for (level, want) in [
+            ("-fstack-protector", plain),
+            ("-fstack-protector-strong", strong),
+        ] {
+            for triple in [X86_64_LINUX, AARCH64_LINUX] {
+                let p = param.map(|n| format!("--param=ssp-buffer-size={n}"));
+                let mut flags = vec![level, "-O2"];
+                flags.extend(p.as_deref());
+                let asm = asm_for_with("ssp_buffer_size", triple, src, &flags);
+                let got: Vec<&str> = funcs
+                    .iter()
+                    .copied()
+                    .filter(|f| body_of(&asm, f).contains("__stack_chk_fail"))
+                    .collect();
+                let want: Vec<&str> = funcs.iter().copied().filter(|f| want.contains(f)).collect();
+                assert_eq!(got, want, "{triple} {flags:?}");
+            }
+        }
+    }
+}

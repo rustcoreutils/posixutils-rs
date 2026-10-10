@@ -199,13 +199,6 @@ fn unknown_option_is_an_error() {
 #[test]
 fn unsupported_option_warns() {
     let (dir, path) = scratch("t.c", CLEAN);
-    let r = compile_in(dir.path(), &path, &["-fsanitize=address"]);
-    assert!(r.success, "{}", r.stderr);
-    assert_eq!(
-        r.stderr,
-        "c17: warning: '-fsanitize=address' is not supported; ignored\n"
-    );
-
     let r = compile_in(dir.path(), &path, &["-fcommon", "-fcommon", "-Werror"]);
     assert!(r.success, "{}", r.stderr);
     assert_eq!(
@@ -231,6 +224,76 @@ fn unsupported_option_warns() {
         r.stderr,
         "c17: error: '-ftrapv' is not supported; ignored [-Werror=c17-unsupported-option]\n"
     );
+}
+
+/// c17 instruments nothing, so a sanitizer request is refused: taking it
+/// with a warning left a build believing it was checked, and a probe that
+/// adds `-Werror` believing the compiler had one. A later `-fno-sanitize=`
+/// withdraws a request, as gcc's does, and the modifiers that only tune a
+/// sanitizer are taken in silence.
+#[test]
+fn sanitizers_are_refused() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for (flags, refused) in [
+        (&["-fsanitize=address"][..], &["-fsanitize=address"][..]),
+        (&["-fsanitize=undefined", "-w"], &["-fsanitize=undefined"]),
+        (
+            &[
+                "-fsanitize=kernel-address",
+                "-fsanitize-address-use-after-scope",
+            ],
+            &["-fsanitize=kernel-address"],
+        ),
+        (
+            &["-fsanitize-coverage=trace-pc"],
+            &["-fsanitize-coverage=trace-pc"],
+        ),
+        (
+            &["-fsanitize=address,undefined", "-fno-sanitize=undefined"],
+            &["-fsanitize=address,undefined"],
+        ),
+        (
+            &["-fsanitize=address", "-fsanitize=thread"],
+            &["-fsanitize=address", "-fsanitize=thread"],
+        ),
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(!r.success, "{flags:?}: {}", r.stderr);
+        let expected: String = refused
+            .iter()
+            .map(|o| format!("c17: error: '{o}' is not supported\n"))
+            .collect();
+        assert_eq!(r.stderr, expected, "{flags:?}");
+    }
+    for flags in [
+        &["-fno-sanitize=all"][..],
+        &["-fsanitize=address", "-fno-sanitize=address"],
+        &["-fsanitize=address,undefined", "-fno-sanitize=all"],
+        &[
+            "-fsanitize-coverage=trace-pc",
+            "-fno-sanitize-coverage=trace-pc",
+        ],
+        &[
+            "-fsanitize-address-use-after-scope",
+            "-fno-sanitize-recover",
+        ],
+        &["-fsanitize-recover=all", "-fsanitize-trap=undefined"],
+        &[
+            "-fsanitize-undefined-trap-on-error",
+            "-fno-sanitize-recover=all",
+        ],
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+    }
+    for option in ["-fsanitize=", "-fno-sanitize=", "-fsanitize-coverage="] {
+        let r = compile_in(dir.path(), &path, &[option]);
+        assert!(!r.success, "{option}");
+        assert_eq!(
+            r.stderr,
+            format!("c17: error: missing argument to '{option}'\n")
+        );
+    }
 }
 
 /// A function whose frame reaches the guard page, or that allocates on the
@@ -429,4 +492,57 @@ fn f_options_other_language_options_warn_as_gcc() {
     // gcc 13 takes `-fcheck-new` for C in silence.
     let r = compile_in(dir.path(), &path, &["-fcheck-new", "-fno-check-new"]);
     assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+}
+
+/// `--param` names one of gcc 13's tuning parameters, which are taken in
+/// silence; any other name, or a value gcc would refuse, is refused in gcc's
+/// words -- `allow-store-data-races` among them, an `-f` option since gcc 10.
+#[test]
+fn param_names_are_gccs() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for flags in [
+        &["--param=max-inline-insns-single=10"][..],
+        &["--param", "max-inline-insns-single=10"],
+        &["--param=openacc-kernels=decompose"],
+        &["--param=align-threshold=65536", "--param=asan-stack=0"],
+        &["--param", "ssp-buffer-size=4", "-Werror"],
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+    }
+    for (flags, text) in [
+        (
+            &["--param=allow-store-data-races=0"][..],
+            "error: unrecognized command-line option '--param=allow-store-data-races=0'",
+        ),
+        (
+            &["--param", "foo=1"],
+            "error: unrecognized command-line option '--param=foo=1'",
+        ),
+        (
+            &["--param=max-inline-insns-single"],
+            "error: unrecognized command-line option '--param=max-inline-insns-single'",
+        ),
+        (
+            &["--param=max-inline-insns-single="],
+            "error: missing argument to '--param=max-inline-insns-single='",
+        ),
+        (
+            &["--param=max-inline-insns-single=-1"],
+            "error: argument to '--param=max-inline-insns-single=' should be a non-negative integer",
+        ),
+        (
+            &["--param=align-threshold=0"],
+            "error: argument to '--param=align-threshold=' is not between 1 and 65536",
+        ),
+        (
+            &["--param=openacc-kernels=foo"],
+            "error: unrecognized argument in option '--param=openacc-kernels=foo'\n\
+             c17: note: valid arguments to '--param=openacc-kernels=' are: decompose parloops",
+        ),
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(!r.success, "{flags:?}");
+        assert_eq!(r.stderr, format!("c17: {text}\n"), "{flags:?}");
+    }
 }

@@ -13,10 +13,9 @@
 
 use crate::test_compile::{compile, compile_accepted, compile_rejected_with};
 
-/// A warning c17 has no option name for: gcc's `-Wincompatible-pointer-types`.
-const INCOMPATIBLE: &str = "char c; int *g(void){return &c;}\n";
-const INCOMPATIBLE_MSG: &str =
-    "returning 'char *' from a function with return type 'int *' incompatible pointer type";
+/// A warning gcc gives in no group, so `-Werror` tags it `[-Werror]`.
+const UNNAMED: &str = "int f(char *p){return p == 1;}\n";
+const UNNAMED_MSG: &str = "comparison between pointer and integer";
 
 /// One `-Woverflow` warning and one `-Wattributes` warning. The overflow is
 /// found after parsing, which an error stops, so where the attribute's
@@ -49,12 +48,12 @@ fn lacks(stderr: &str, text: &str) {
 /// the unit ends with gcc's "all warnings" line.
 #[test]
 fn werror_makes_a_warning_an_error() {
-    let plain = compile_accepted("werror_plain", INCOMPATIBLE, &[]);
-    has(&plain, &format!("warning: {INCOMPATIBLE_MSG}\n"));
+    let plain = compile_accepted("werror_plain", UNNAMED, &[]);
+    has(&plain, &format!("warning: {UNNAMED_MSG}\n"));
     lacks(&plain, "-Werror");
 
-    let strict = compile_rejected_with("werror_all", INCOMPATIBLE, &["-Werror"]);
-    has(&strict, &format!("error: {INCOMPATIBLE_MSG} [-Werror]\n"));
+    let strict = compile_rejected_with("werror_all", UNNAMED, &["-Werror"]);
+    has(&strict, &format!("error: {UNNAMED_MSG} [-Werror]\n"));
     has(&strict, &format!("{ALL}\n"));
     lacks(&strict, "warning:");
 }
@@ -63,7 +62,7 @@ fn werror_makes_a_warning_an_error() {
 #[test]
 fn werror_with_w_is_silent() {
     for flags in [&["-Werror", "-w"][..], &["-w", "-Werror"]] {
-        let c = compile("werror_w", INCOMPATIBLE, flags);
+        let c = compile("werror_w", UNNAMED, flags);
         assert!(c.success && c.stderr.is_empty(), "{flags:?}:\n{}", c.stderr);
     }
 }
@@ -168,11 +167,11 @@ fn werror_named_enables_its_group() {
 /// `-Wno-error` wins, and neither undoes a named verdict.
 #[test]
 fn werror_options_fold_in_order() {
-    let c = compile_rejected_with("werror_last", INCOMPATIBLE, &["-Wno-error", "-Werror"]);
-    has(&c, &format!("error: {INCOMPATIBLE_MSG} [-Werror]\n"));
+    let c = compile_rejected_with("werror_last", UNNAMED, &["-Wno-error", "-Werror"]);
+    has(&c, &format!("error: {UNNAMED_MSG} [-Werror]\n"));
 
-    let ok = compile_accepted("werror_undone", INCOMPATIBLE, &["-Werror", "-Wno-error"]);
-    has(&ok, &format!("warning: {INCOMPATIBLE_MSG}\n"));
+    let ok = compile_accepted("werror_undone", UNNAMED, &["-Werror", "-Wno-error"]);
+    has(&ok, &format!("warning: {UNNAMED_MSG}\n"));
     lacks(&ok, "-Werror");
 
     let named = compile_rejected_with(

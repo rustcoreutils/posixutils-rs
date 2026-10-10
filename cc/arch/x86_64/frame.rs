@@ -304,6 +304,8 @@ impl X86_64CodeGen {
         };
         self.base
             .check_stack_clash(func, self.stack_alloc_size as i64 + realign);
+        self.base
+            .check_frame_size(i64::from(stack_size + reg_save_area_size));
         self.emit_stack_guard_set();
 
         // Store spilled arguments before any calls can clobber them
@@ -337,7 +339,7 @@ impl X86_64CodeGen {
         }
 
         // CFI: End procedure
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(X86Inst::Directive(Directive::CfiEndProc));
         }
 
@@ -461,7 +463,7 @@ impl X86_64CodeGen {
         self.base.emit_function_entry_loc(func);
 
         // CFI: Start procedure (enables stack unwinding for this function)
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(X86Inst::Directive(Directive::CfiStartProc));
         }
     }
@@ -490,7 +492,7 @@ impl X86_64CodeGen {
     /// not with `-g`. Each follows the instruction that makes it true, so the
     /// CFA and every saved register are described at every instruction.
     pub(super) fn push_cfi(&mut self, rule: Directive) {
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(X86Inst::Directive(rule));
         }
     }

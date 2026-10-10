@@ -376,7 +376,41 @@ impl AttributeList {
             align: self.get_alignment().filter(|n| n.is_power_of_two()),
             noreturn: self.has_noreturn(),
             stack_protect: self.stack_protect().unwrap_or_else(|kept| kept),
+            stack_protector: self.optimize_stack_protector(),
         }
+    }
+
+    /// The stack-protector level the `optimize` attributes in this list
+    /// name, the last one winning. gcc reads each string argument as a
+    /// comma-separated list of options, an option with no leading `-` being
+    /// `-O<x>` if it starts with a digit or `O`, and `-f<option>` otherwise.
+    /// The other options are hints about how hard to optimize, which c17
+    /// takes and ignores.
+    pub fn optimize_stack_protector(&self) -> Option<crate::target::StackProtector> {
+        let mut level = None;
+        for attr in self
+            .attrs
+            .iter()
+            .filter(|a| a.name.trim_matches('_') == "optimize")
+        {
+            for arg in &attr.args {
+                let AttributeArg::String(list) = arg else {
+                    continue;
+                };
+                for option in list.split(',').map(str::trim) {
+                    let name = match option.strip_prefix("-f") {
+                        Some(name) => name,
+                        None if option.starts_with(['-', 'O']) => continue,
+                        None if option.starts_with(|c: char| c.is_ascii_digit()) => continue,
+                        None => option,
+                    };
+                    if let Some(l) = crate::target::StackProtector::from_option(name) {
+                        level = Some(l);
+                    }
+                }
+            }
+        }
+        level
     }
 
     /// What `stack_protect` and `no_stack_protector` in this list ask, in

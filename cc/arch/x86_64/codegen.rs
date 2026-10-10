@@ -1774,8 +1774,8 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.output.clone()
     }
 
-    fn set_emit_unwind_tables(&mut self, emit: bool) {
-        self.base.emit_unwind_tables = emit;
+    fn set_cfi(&mut self, cfi: crate::target::Cfi) {
+        self.base.cfi = cfi;
     }
 
     fn set_pic_mode(&mut self, pic: bool) {
@@ -1798,7 +1798,7 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.stack_clash = on;
     }
 
-    fn set_stack_protector(&mut self, level: crate::target::StackProtector) {
-        self.base.stack_protector = level;
+    fn set_stack_protector(&mut self, protection: crate::target::StackProtection) {
+        self.base.stack_protector = protection;
     }
 }

@@ -213,6 +213,102 @@ impl CfProtection {
     }
 }
 
+/// `-f[no-]asynchronous-unwind-tables`, `-f[no-]unwind-tables` and
+/// `-f[no-]exceptions`, each the last one given (`None`: not given), which
+/// together decide whether a unit has unwind tables; see [`Self::cfi`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnwindTables {
+    pub asynchronous: Option<bool>,
+    pub synchronous: Option<bool>,
+    pub exceptions: Option<bool>,
+}
+
+/// Where a unit's call frame information goes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Cfi {
+    /// `.eh_frame`, the unwind tables `backtrace()` and the C++ runtime read.
+    #[default]
+    EhFrame,
+    /// `.debug_frame` only (`.cfi_sections .debug_frame`): no unwind tables,
+    /// but `-g` keeps the rules for the debugger.
+    DebugFrame,
+    /// None at all.
+    Omitted,
+}
+
+impl Cfi {
+    /// Whether any CFI directives are emitted.
+    pub fn emitted(self) -> bool {
+        self != Cfi::Omitted
+    }
+}
+
+impl UnwindTables {
+    /// The request after the option `-f<name>`, or `None` for an option
+    /// that is not one of the six.
+    pub fn after(self, name: &str) -> Option<Self> {
+        let (on, stem) = match name.strip_prefix("no-") {
+            Some(stem) => (false, stem),
+            None => (true, name),
+        };
+        let mut next = self;
+        match stem {
+            "asynchronous-unwind-tables" => next.asynchronous = Some(on),
+            "unwind-tables" => next.synchronous = Some(on),
+            "exceptions" => next.exceptions = Some(on),
+            _ => return None,
+        }
+        Some(next)
+    }
+
+    /// Where `target`'s CFI goes, `debug` being `-g`. As in gcc 13, a unit
+    /// has unwind tables unless both kinds are off and `-fexceptions` does
+    /// not need them: the asynchronous kind is on by default for both
+    /// targets, and the synchronous kind for aarch64 alone, so x86-64 drops
+    /// them for `-fno-asynchronous-unwind-tables` and aarch64 only with
+    /// `-fno-unwind-tables` too. Without them, `-g` still gives the debugger
+    /// its rules, in `.debug_frame`.
+    ///
+    /// Mach-O keeps its tables whatever the options say: Apple's linker
+    /// builds the compact unwind table every Darwin unwinder reads from them,
+    /// and c17 has no other way to give it one.
+    pub fn cfi(self, target: &Target, debug: bool) -> Cfi {
+        let tables = self.exceptions.unwrap_or(false)
+            || self.asynchronous.unwrap_or(true)
+            || self.synchronous.unwrap_or(target.arch == Arch::Aarch64);
+        if tables || target.os == Os::MacOS {
+            Cfi::EhFrame
+        } else if debug {
+            Cfi::DebugFrame
+        } else {
+            Cfi::Omitted
+        }
+    }
+}
+
+/// The stack protector as the command line sets it: the level, and gcc's
+/// `--param ssp-buffer-size`, the bytes from which plain `-fstack-protector`
+/// counts a `char` array (`arch::stack_protect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackProtection {
+    pub level: StackProtector,
+    pub buffer_size: u64,
+}
+
+impl StackProtection {
+    /// gcc's default `ssp-buffer-size`.
+    pub const DEFAULT_BUFFER_SIZE: u64 = 8;
+}
+
+impl Default for StackProtection {
+    fn default() -> Self {
+        Self {
+            level: StackProtector::Off,
+            buffer_size: Self::DEFAULT_BUFFER_SIZE,
+        }
+    }
+}
+
 /// `-fstack-protector` and its levels: which functions get a canary between
 /// their locals and their saved registers, checked before every return
 /// (`arch::stack_protect`). The default is none, as Debian's gcc has it;

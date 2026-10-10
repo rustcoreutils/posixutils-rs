@@ -839,6 +839,45 @@ fn test_stack_protect_attributes_reach_the_definition() {
     assert_eq!(attr("b2"), StackProtectAttr::Protect);
 }
 
+/// `optimize` naming a stack-protector option gives the function that level,
+/// whether the option is written with `-f` or without, among others in one
+/// comma-separated string or in a string of its own; the last one written
+/// wins, across declarations too. Every other option leaves it unset.
+#[test]
+fn test_optimize_attribute_sets_the_stack_protector_level() {
+    use crate::target::StackProtector;
+    let src = "__attribute__((optimize(\"-fno-stack-protector\"))) int a(void) { return 0; }\n\
+               __attribute__((__optimize__(\"O2, stack-protector-strong\"))) int b(void) { return 0; }\n\
+               __attribute__((optimize(\"-O2\", \"-fstack-protector-all\"))) int c(void) { return 0; }\n\
+               __attribute__((optimize(\"-fstack-protector\", \"-fstack-protector-explicit\"))) int d(void) { return 0; }\n\
+               __attribute__((optimize(\"-O3\", \"unroll-loops\"))) int e(void) { return 0; }\n\
+               __attribute__((optimize(2))) int f(void) { return 0; }\n\
+               __attribute__((optimize(\"-fstack-protector-all\"))) int g(void);\n\
+               __attribute__((optimize(\"no-stack-protector\"))) int g(void) { return 0; }\n\
+               int h(void) __attribute__((optimize(\"stack-protector-strong\")));\n\
+               int h(void) { return 0; }\n";
+    let (tu, _, strings, _) = parse_tu(src).unwrap();
+    let level = |name: &str| {
+        tu.items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == name => {
+                    Some(f.attrs.stack_protector)
+                }
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(level("a"), Some(StackProtector::Off));
+    assert_eq!(level("b"), Some(StackProtector::Strong));
+    assert_eq!(level("c"), Some(StackProtector::All));
+    assert_eq!(level("d"), Some(StackProtector::Explicit));
+    assert_eq!(level("e"), None);
+    assert_eq!(level("f"), None);
+    assert_eq!(level("g"), Some(StackProtector::Off));
+    assert_eq!(level("h"), Some(StackProtector::Strong));
+}
+
 /// A `register` declarator's asm label binds it to a register, on the target
 /// being compiled for and in any spelling a clobber list takes; it is no asm
 /// label. A label on an automatic variable without `register` binds nothing.

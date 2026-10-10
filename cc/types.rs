@@ -1048,6 +1048,11 @@ pub enum AssignFault {
     PointerFromInteger,
     /// Two pointers whose referenced types are not compatible.
     PointerMismatch,
+    /// Two pointers whose referenced types are the same integer type but
+    /// for its signedness (`char *` against `unsigned char *`): gcc's
+    /// `-Wpointer-sign`, which it keeps apart from [`Self::PointerMismatch`]
+    /// and gives only under `-Wall` or `-Wpedantic`.
+    PointerSign,
     /// The target's referenced type drops a qualifier the source's had.
     QualifierDiscard,
     /// A function pointer against `void *`. The 6.5.16.1p1 carve-out is for a
@@ -1058,9 +1063,10 @@ pub enum AssignFault {
 }
 
 impl AssignFault {
-    /// Whether this fault is fatal. Only a missing conversion is.
+    /// Whether this fault is fatal. Only a missing conversion is: the one
+    /// with no warning group.
     pub fn is_error(self) -> bool {
-        self == AssignFault::Incompatible
+        self.group().is_none()
     }
 
     /// The clause naming what went wrong, as gcc words it.
@@ -1070,8 +1076,25 @@ impl AssignFault {
             AssignFault::IntegerFromPointer => "makes integer from pointer without a cast",
             AssignFault::PointerFromInteger => "makes pointer from integer without a cast",
             AssignFault::PointerMismatch => "incompatible pointer type",
+            AssignFault::PointerSign => "pointer targets differ in signedness",
             AssignFault::QualifierDiscard => "discards a qualifier from the pointer target type",
             AssignFault::FunctionPointerVoid => "converts between a function pointer and 'void *'",
+        }
+    }
+
+    /// The warning group of a fault that is a warning, as gcc names it:
+    /// the one `-Wno-<name>` silences and `-Werror=<name>` makes an error.
+    /// `None` for the one that is an error.
+    pub fn group(self) -> Option<&'static str> {
+        match self {
+            AssignFault::Incompatible => None,
+            AssignFault::FunctionPointerVoid => Some("pedantic"),
+            AssignFault::IntegerFromPointer | AssignFault::PointerFromInteger => {
+                Some("int-conversion")
+            }
+            AssignFault::PointerMismatch => Some("incompatible-pointer-types"),
+            AssignFault::PointerSign => Some("pointer-sign"),
+            AssignFault::QualifierDiscard => Some("discarded-qualifiers"),
         }
     }
 }
@@ -2708,16 +2731,22 @@ impl TypeTable {
                 self.kind(t_pointee) == TypeKind::Void,
                 self.kind(v_pointee) == TypeKind::Void,
             );
-            if !(t_void || v_void) && !self.types_compatible(t_pointee, v_pointee) {
+            let mismatched = !(t_void || v_void) && !self.types_compatible(t_pointee, v_pointee);
+            let sign_only = mismatched && self.differ_only_in_signedness(t_pointee, v_pointee);
+            if mismatched && !sign_only {
                 return Some(AssignFault::PointerMismatch);
             }
             // Compatible targets, or one of them `void`, but the assignment
             // must not silently gain write access: the target's qualifiers
             // have to include the source's (6.5.16.1p1 says so of both
-            // cases), so `void *v = (const int *)p` is diagnosed too.
+            // cases), so `void *v = (const int *)p` is diagnosed too. gcc
+            // asks this before signedness, and reports only the qualifier.
             let t_quals = self.qualifiers(t_pointee);
             let v_quals = self.qualifiers(v_pointee);
-            return (!t_quals.contains(v_quals)).then_some(AssignFault::QualifierDiscard);
+            if !t_quals.contains(v_quals) {
+                return Some(AssignFault::QualifierDiscard);
+            }
+            return sign_only.then_some(AssignFault::PointerSign);
         }
 
         if t_ptr {
@@ -2746,6 +2775,29 @@ impl TypeTable {
         }
 
         None
+    }
+
+    /// Are `a` and `b` one integer type but for signedness -- `char`,
+    /// `signed char` and `unsigned char`, or `int` and `unsigned int`? gcc
+    /// asks this of two incompatible pointer targets to tell its
+    /// `-Wpointer-sign` from an incompatible pointer, comparing the
+    /// unqualified types' signed and unsigned versions and their atomicity.
+    /// An enumerated type and `_Bool` have no such counterpart here, as in
+    /// gcc, and a pointer one level further down is incompatible outright.
+    fn differ_only_in_signedness(&self, a: TypeId, b: TypeId) -> bool {
+        let kind = self.kind(a);
+        matches!(
+            kind,
+            TypeKind::Char
+                | TypeKind::Short
+                | TypeKind::Int
+                | TypeKind::Long
+                | TypeKind::LongLong
+                | TypeKind::Int128
+        ) && kind == self.kind(b)
+            && !self.is_vector(a)
+            && !self.is_vector(b)
+            && self.is_atomic(a) == self.is_atomic(b)
     }
 
     /// The type an array or function has in an expression: C17 6.3.2.1p3-4

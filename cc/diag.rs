@@ -313,6 +313,10 @@ thread_local! {
     static SUPPRESSED_GROUPS: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
 
+    /// The groups of [`OFF_BY_DEFAULT`] the options turn on.
+    static OPTED_IN_GROUPS: RefCell<std::collections::HashSet<&'static str>> =
+        RefCell::new(std::collections::HashSet::new());
+
     /// `-fpermissive`; see [`set_permissive`].
     static PERMISSIVE: Cell<bool> = const { Cell::new(false) };
 
@@ -321,6 +325,9 @@ thread_local! {
 
     /// `-Werror` and its relatives; see [`Werror`].
     static WERROR: RefCell<Werror> = RefCell::new(Werror::default());
+
+    /// `-Wframe-larger-than=`'s limit; see [`frame_larger_than`].
+    static FRAME_LARGER_THAN: Cell<Option<u64>> = const { Cell::new(None) };
 
     /// Warnings made errors by [`WERROR`] in this translation unit, for
     /// [`finish_unit`].
@@ -399,6 +406,48 @@ fn suppressed_groups<'a>(
     off
 }
 
+/// The warning groups gcc leaves off until asked for, each with the options
+/// that turn it on as a side effect. An explicit `-W<name>`,
+/// `-Werror=<name>` or `-Wno-<name>` decides alone; failing that, the last
+/// of the side-effect options and their `-Wno-` forms does, as gcc's
+/// `LangEnabledBy` does (`-Wall -Wno-pedantic` leaves `-Wpointer-sign` off).
+/// `-pedantic` and `-pedantic-errors` count as `-Wpedantic`.
+const OFF_BY_DEFAULT: &[(&str, &[&str])] = &[("pointer-sign", &["all", "pedantic"])];
+
+/// The groups of [`OFF_BY_DEFAULT`] the options in `names` turn on.
+fn opted_in_groups<'a>(
+    names: impl IntoIterator<Item = &'a str> + Clone,
+) -> std::collections::HashSet<&'static str> {
+    let mut on = std::collections::HashSet::new();
+    for &(group, enablers) in OFF_BY_DEFAULT {
+        let mut explicit = None;
+        let mut implied = false;
+        for name in names.clone() {
+            let name = if name == "pedantic-errors" {
+                "pedantic"
+            } else {
+                name
+            };
+            if name == group || name.strip_prefix("error=") == Some(group) {
+                explicit = Some(true);
+            } else if name.strip_prefix("no-") == Some(group) {
+                explicit = Some(false);
+            } else if enablers.contains(&name) {
+                implied = true;
+            } else if name
+                .strip_prefix("no-")
+                .is_some_and(|n| enablers.contains(&n))
+            {
+                implied = false;
+            }
+        }
+        if explicit.unwrap_or(implied) {
+            on.insert(group);
+        }
+    }
+    on
+}
+
 /// Set every switch the `-W<name>` options in `names` select, in
 /// command-line order, for the rest of this thread's compilation: the groups
 /// left on, [`Pedantic`] and [`Werror`]. The driver passes `-pedantic` as the
@@ -412,8 +461,33 @@ pub fn set_warning_options(names: &[&str]) {
             .collect(),
     );
     SUPPRESSED_GROUPS.replace(suppressed_groups(names.iter().copied()));
+    OPTED_IN_GROUPS.replace(opted_in_groups(names.iter().copied()));
     PEDANTIC.set(Pedantic::from_warning_options(names.iter().copied()));
     WERROR.replace(Werror::from_warning_options(names.iter().copied()));
+    FRAME_LARGER_THAN.set(frame_limit(names.iter().copied()));
+}
+
+/// The warning group of "the frame size of B bytes is larger than N bytes",
+/// as gcc tags it.
+pub const FRAME_LARGER_THAN_WARNING: &str = "frame-larger-than=";
+
+/// The limit the `-Wframe-larger-than=<size>` options in `names` set: the
+/// last one's, `-Werror=frame-larger-than=<size>` setting it as well, and
+/// none after `-Wno-frame-larger-than`.
+fn frame_limit<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<u64> {
+    names.into_iter().fold(None, |limit, name| {
+        let name = name.strip_prefix("error=").unwrap_or(name);
+        match name.strip_prefix(FRAME_LARGER_THAN_WARNING) {
+            Some(size) => warn_options::size_value(size).or(limit),
+            None if name == "no-frame-larger-than" => None,
+            None => limit,
+        }
+    })
+}
+
+/// The frame size `-Wframe-larger-than=` warns above, if it is in effect.
+pub fn frame_larger_than() -> Option<u64> {
+    FRAME_LARGER_THAN.get()
 }
 
 /// Is `-pedantic` (or `-pedantic-errors`) in effect? For a warning gcc gives
@@ -422,9 +496,14 @@ pub fn pedantic() -> bool {
     PEDANTIC.get().enabled
 }
 
-/// Is the warning group `name` still on? A diagnostic in a group goes
-/// through [`group_warning`], which asks this itself.
+/// Is the warning group `name` on? A diagnostic in a group goes through
+/// [`group_warning`], which asks this itself. A group is on unless
+/// `-Wno-<name>` turned it off -- or, for one of [`OFF_BY_DEFAULT`], unless
+/// an option turned it on.
 pub fn warning_group_enabled(name: &str) -> bool {
+    if OFF_BY_DEFAULT.iter().any(|&(group, _)| group == name) {
+        return OPTED_IN_GROUPS.with_borrow(|groups| groups.contains(name));
+    }
     !SUPPRESSED_GROUPS.with_borrow(|groups| groups.contains(name))
 }
 
@@ -613,10 +692,11 @@ impl Werror {
             "error" => self.all = true,
             "no-error" => self.all = false,
             _ => {
-                let (group, verdict) = match name.strip_prefix("error=") {
-                    Some(group) => (group, true),
+                let (target, verdict) = match name.strip_prefix("error=") {
+                    Some(target) => (target, true),
                     None => (name.strip_prefix("no-error=")?, false),
                 };
+                let group = warn_options::werror_group(target);
                 self.groups.insert(group.to_string(), verdict);
             }
         }
@@ -1125,6 +1205,64 @@ mod tests {
         assert!(off(&["error=overflow", "no-overflow"]).contains("overflow"));
         assert!(off(&["no-overflow", "no-error=overflow"]).contains("overflow"));
         assert!(off(&["no-error=overflow", "no-error", "error"]).is_empty());
+    }
+
+    /// A group off by default is on after `-W<name>`, `-Werror=<name>`, or
+    /// one of its enabling options; its own name outranks those in either
+    /// order, and among them the last wins.
+    #[test]
+    fn opted_in_groups_fold_as_gcc_does() {
+        let on = |names: &[&str]| opted_in_groups(names.iter().copied()).contains("pointer-sign");
+        assert!(!on(&[]));
+        assert!(!on(&["extra"]));
+        for names in [
+            &["all"][..],
+            &["pedantic"],
+            &["pedantic-errors"],
+            &["pointer-sign"],
+            &["error=pointer-sign"],
+            &["no-all", "all"],
+            &["pointer-sign", "no-all"],
+            &["no-pedantic", "all"],
+        ] {
+            assert!(on(names), "{names:?}");
+        }
+        for names in [
+            &["all", "no-pointer-sign"][..],
+            &["no-pointer-sign", "all"],
+            &["all", "no-all"],
+            &["all", "no-pedantic"],
+            &["error=pointer-sign", "no-pointer-sign"],
+            &["no-error=pointer-sign"],
+        ] {
+            assert!(!on(names), "{names:?}");
+        }
+    }
+
+    /// The last `-Wframe-larger-than=` sets the limit, `-Werror=` spelling
+    /// included, and `-Wno-frame-larger-than` lifts it.
+    #[test]
+    fn frame_limit_folds_in_order() {
+        let limit = |names: &[&str]| frame_limit(names.iter().copied());
+        assert_eq!(limit(&[]), None);
+        assert_eq!(limit(&["frame-larger-than=100"]), Some(100));
+        assert_eq!(limit(&["error=frame-larger-than=2KiB"]), Some(2048));
+        assert_eq!(
+            limit(&["frame-larger-than=100", "frame-larger-than=200"]),
+            Some(200)
+        );
+        assert_eq!(
+            limit(&["frame-larger-than=100", "no-frame-larger-than"]),
+            None
+        );
+        assert_eq!(
+            limit(&["no-frame-larger-than", "frame-larger-than=100"]),
+            Some(100)
+        );
+        assert!(werror(&["error=frame-larger-than=100"]).promotes(Some("frame-larger-than=")));
+        assert!(
+            !werror(&["error", "no-error=frame-larger-than="]).promotes(Some("frame-larger-than="))
+        );
     }
 
     /// `-Werror=pedantic` turns `-Wpedantic` on, as gcc's does, without

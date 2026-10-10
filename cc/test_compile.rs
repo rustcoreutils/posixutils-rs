@@ -52,10 +52,13 @@ struct Options {
     /// `-ftls-model=`.
     tls_model: target::TlsModel,
     shared: bool,
-    no_unwind_tables: bool,
+    /// The unwind-table options, folded.
+    unwind: target::UnwindTables,
     stack_clash: bool,
     /// The last of `-fstack-protector`'s levels and `-fno-stack-protector`.
     stack_protector: target::StackProtector,
+    /// `--param=ssp-buffer-size=`.
+    ssp_buffer_size: Option<u64>,
     verbose_asm: bool,
     cf_protection: target::CfProtection,
     math_errno: bool,
@@ -112,7 +115,6 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-g" => o.debug = true,
             "-O" => o.optimization = Optimization::from_flag("1").unwrap(),
             "-shared" | "--shared" | "-G" => o.shared = true,
-            "--fno-unwind-tables" => o.no_unwind_tables = true,
             "-fverbose-asm" => o.verbose_asm = true,
             "-fstack-clash-protection" => o.stack_clash = true,
             "-fmath-errno" => o.math_errno = true,
@@ -129,11 +131,16 @@ fn apply_flags(flags: &[&str]) -> Options {
             _ => {
                 if let Some(position) = target::PositionIndependence::from_flag(flag) {
                     o.position = Some(position);
+                } else if let Some(unwind) = flag.strip_prefix("-f").and_then(|n| o.unwind.after(n))
+                {
+                    o.unwind = unwind;
                 } else if let Some(level) = flag
                     .strip_prefix("-f")
                     .and_then(target::StackProtector::from_option)
                 {
                     o.stack_protector = level;
+                } else if let Some(bytes) = flag.strip_prefix("--param=ssp-buffer-size=") {
+                    o.ssp_buffer_size = Some(bytes.parse().unwrap());
                 } else if let Some(model) = flag.strip_prefix("-ftls-model=") {
                     o.tls_model = target::TlsModel::from_name(model).unwrap();
                 } else if let Some(level) = flag.strip_prefix("-O") {
@@ -232,11 +239,16 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             floor: o.tls_model,
         },
         pic: o.shared || position.is_pic(),
-        unwind_tables: !o.no_unwind_tables,
+        cfi: o.unwind.cfi(&target, o.debug),
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
         stack_clash: o.stack_clash,
-        stack_protector: o.stack_protector,
+        stack_protector: target::StackProtection {
+            level: o.stack_protector,
+            buffer_size: o
+                .ssp_buffer_size
+                .unwrap_or(target::StackProtection::DEFAULT_BUFFER_SIZE),
+        },
         source_name: &source_name,
         debug_prefix_map: &prefix_maps.debug,
     };

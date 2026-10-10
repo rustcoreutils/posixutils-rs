@@ -59,13 +59,21 @@ pub enum Why {
     /// It chooses which section code or data goes in. Every choice gives
     /// the same program on a hosted system, where `.bss` starts zeroed.
     Placement,
-    /// It asks c17 to omit unwind tables. c17 always emits CFI; extra
-    /// unwind tables change no program's behaviour.
-    UnwindTables,
     /// It tunes a feature of another language that C does not have, and
     /// gcc 13 takes it for C without a word.
     OtherLanguage,
+    /// It tunes a sanitizer, and alone asks for none: c17 refuses every
+    /// `-fsanitize=` request (see [`SANITIZERS`]), so there is nothing for
+    /// it to tune.
+    SanitizerModifier,
 }
+
+/// The stems that ask for instrumentation c17 does not provide, each a
+/// comma-separated list the driver keeps, `-fno-<stem>=` withdrawing names
+/// from it (`all` every one). What remains is refused: a sanitizer taken
+/// with a warning left a build believing its code was checked, and a
+/// configure probe believing the compiler had one.
+pub const SANITIZERS: &[&str] = &["sanitize", "sanitize-coverage"];
 
 /// What c17 does with an `-f` option it accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,8 +105,8 @@ const PLAIN: &[(&str, Effect)] = &[
     ("PIC", Implemented),
     ("PIE", Implemented),
     ("associative-math", Accepted(Permission)),
-    // c17 emits `.cfi_startproc` and frame rules for every function.
-    ("asynchronous-unwind-tables", Accepted(Default)),
+    // The unwind tables: `target::UnwindTables`.
+    ("asynchronous-unwind-tables", Implemented),
     // Main driver: `-fcf-protection` and its `=` form.
     ("cf-protection", Implemented),
     // A tentative definition is an ordinary definition, not a common
@@ -156,7 +164,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-PIC", Implemented),
     ("no-PIE", Implemented),
     ("no-associative-math", Accepted(Default)),
-    ("no-asynchronous-unwind-tables", Accepted(UnwindTables)),
+    ("no-asynchronous-unwind-tables", Implemented),
     ("no-builtin", Implemented),
     // c17's own spelling of `-fcf-protection=none`; gcc 13 has no such
     // option.
@@ -207,6 +215,11 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-printf-return-value", Accepted(Pass)),
     ("no-reorder-blocks-and-partition", Accepted(Pass)),
     ("no-rtti", CXX_D_OBJCXX),
+    (
+        "no-sanitize-address-use-after-scope",
+        Accepted(SanitizerModifier),
+    ),
+    ("no-sanitize-recover", Accepted(SanitizerModifier)),
     ("no-schedule-insns", Accepted(Pass)),
     ("no-schedule-insns2", Accepted(Pass)),
     ("no-semantic-interposition", Accepted(Permission)),
@@ -248,7 +261,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-tree-vrp", Accepted(Pass)),
     ("no-unroll-loops", Accepted(Pass)),
     ("no-unsigned-char", Implemented),
-    ("no-unwind-tables", Accepted(UnwindTables)),
+    ("no-unwind-tables", Implemented),
     ("no-use-cxa-atexit", CXX_OBJCXX),
     ("no-vect-cost-model", Accepted(Pass)),
     ("no-wrapv", Accepted(Permission)),
@@ -269,6 +282,16 @@ const PLAIN: &[(&str, Effect)] = &[
     ("profile-generate", Unsupported),
     ("profile-use", Accepted(Pass)),
     ("rtti", CXX_D_OBJCXX),
+    (
+        "sanitize-address-use-after-scope",
+        Accepted(SanitizerModifier),
+    ),
+    ("sanitize-recover", Accepted(SanitizerModifier)),
+    ("sanitize-trap", Accepted(SanitizerModifier)),
+    (
+        "sanitize-undefined-trap-on-error",
+        Accepted(SanitizerModifier),
+    ),
     // No optimization record is written.
     ("save-optimization-record", Unsupported),
     ("sched-stalled-insns", Accepted(Pass)),
@@ -310,8 +333,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("unroll-loops", Accepted(Pass)),
     ("unsigned-char", Implemented),
     ("unswitch-loops", Accepted(Pass)),
-    // c17 emits CFI for every function.
-    ("unwind-tables", Accepted(Default)),
+    ("unwind-tables", Implemented),
     // Handed to the host compiler driver, which links.
     ("use-ld=bfd", Implemented),
     ("use-ld=gold", Implemented),
@@ -393,11 +415,21 @@ const JOINED: &[(&str, Value, Effect)] = &[
     ),
     ("macro-prefix-map", Value::Driver, Implemented),
     ("message-length", Value::Unsigned, Accepted(Presentation)),
+    ("no-sanitize", Value::Driver, Implemented),
+    ("no-sanitize-coverage", Value::Driver, Implemented),
+    (
+        "no-sanitize-recover",
+        Value::Any,
+        Accepted(SanitizerModifier),
+    ),
+    ("no-sanitize-trap", Value::Any, Accepted(SanitizerModifier)),
     // Every struct keeps its natural layout.
     ("pack-struct", Value::PackAlign, Unsupported),
-    // No sanitizer instruments the code, and no `__SANITIZE_*__` macro is
-    // defined.
-    ("sanitize", Value::Any, Unsupported),
+    // Refused by the driver unless withdrawn; see `SANITIZERS`.
+    ("sanitize", Value::Driver, Implemented),
+    ("sanitize-coverage", Value::Driver, Implemented),
+    ("sanitize-recover", Value::Any, Accepted(SanitizerModifier)),
+    ("sanitize-trap", Value::Any, Accepted(SanitizerModifier)),
     ("tls-model", Value::Driver, Implemented),
     ("tree-parallelize-loops", Value::Unsigned, Accepted(Pass)),
     ("visibility", Value::Driver, Implemented),
@@ -551,7 +583,11 @@ mod tests {
             ("no-fat-lto-objects", Accepted(Pass)),
             ("PIC", Implemented),
             ("visibility=hidden", Implemented),
-            ("sanitize=address,undefined", Unsupported),
+            ("sanitize=address,undefined", Implemented),
+            (
+                "sanitize-address-use-after-scope",
+                Accepted(SanitizerModifier),
+            ),
         ] {
             assert_eq!(classify(name), Verdict::Known(effect), "-f{name}");
         }
@@ -659,6 +695,7 @@ mod tests {
     #[test]
     fn families() {
         assert_eq!(family("sanitize=address"), "sanitize");
+        assert_eq!(family("no-sanitize=all"), "no-sanitize");
         assert_eq!(family("pack-struct=4"), "pack-struct");
         assert_eq!(family("trapv"), "trapv");
     }

@@ -186,6 +186,8 @@ impl Aarch64CodeGen {
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
         self.base.check_stack_clash(func, total_frame as i64);
+        self.base
+            .check_frame_size(i64::from(stack_size + reg_save_area_size));
 
         self.emit_frame_base_latch();
         self.emit_stack_guard_set();
@@ -224,7 +226,7 @@ impl Aarch64CodeGen {
         }
 
         // CFI: End procedure
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiEndProc));
         }
 
@@ -381,7 +383,7 @@ impl Aarch64CodeGen {
         self.base.emit_function_entry_loc(func);
 
         // CFI: Start procedure (enables stack unwinding for this function)
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiStartProc));
         }
     }
@@ -394,7 +396,7 @@ impl Aarch64CodeGen {
     /// not with `-g`. Each follows the instruction that makes it true, so the
     /// CFA and every saved register are described at every instruction.
     fn push_cfi(&mut self, rule: Directive) {
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(rule));
         }
     }

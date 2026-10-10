@@ -28,6 +28,7 @@ pub mod kw;
 pub mod linkargs;
 pub mod opt;
 pub mod os;
+pub mod param_options;
 pub mod parse;
 pub mod pipeline;
 pub mod ppargs;

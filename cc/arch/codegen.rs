@@ -128,8 +128,8 @@ pub struct CodeGenBase<I: LirInst> {
     /// The x86-64 ISA of the function being emitted (`ir::Function::isa`),
     /// which picks the instructions a vector operation becomes.
     pub isa: crate::target::X86Isa,
-    /// Whether to emit unwind tables (the CFI procedures and their frame rules)
-    pub emit_unwind_tables: bool,
+    /// Where the CFI procedures and their frame rules go, if anywhere.
+    pub cfi: crate::target::Cfi,
     /// A source position for the function being emitted, for a backend
     /// diagnostic that has no nearer one -- `crate::abi::slot_bytes` and
     /// `crate::arch::regalloc::grow_frame` report against it. Set from
@@ -153,7 +153,7 @@ pub struct CodeGenBase<I: LirInst> {
     /// `-fstack-clash-protection`; see [`CodeGenBase::check_stack_clash`].
     pub stack_clash: bool,
     /// `-fstack-protector` and its levels; see `arch::stack_protect`.
-    pub stack_protector: crate::target::StackProtector,
+    pub stack_protector: crate::target::StackProtection,
     /// Trailing comments to hang off individual LIR instructions, by their
     /// index in `lir_buffer`.
     ///
@@ -186,7 +186,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             output: String::new(),
             lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
             current_fn: String::new(),
-            emit_unwind_tables: true,
+            cfi: crate::target::Cfi::EhFrame,
             func_pos: crate::diag::Position::default(),
             last_debug_line: 0,
             last_debug_file: 0,
@@ -195,7 +195,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             verbose_asm: false,
             cf_protection: crate::target::CfProtection::default(),
             stack_clash: false,
-            stack_protector: crate::target::StackProtector::Off,
+            stack_protector: crate::target::StackProtection::default(),
             lir_comments: std::collections::HashMap::new(),
             value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
@@ -241,6 +241,29 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 self.func_pos,
                 "'-fstack-clash-protection' is not supported; the stack of '{0}' is not probed",
                 &[&self.current_fn],
+            );
+        }
+    }
+
+    /// `-Wframe-larger-than=`: warn, as gcc does, when this function's
+    /// frame is larger than the limit. The size is gcc's measure as near as
+    /// c17's frame allows -- the locals, the spill slots and the variadic
+    /// register save area -- and leaves out what gcc leaves out: the saved
+    /// registers, the return address and frame record, the outgoing
+    /// arguments, and what `alloca` and variable-length arrays take at run
+    /// time. gcc points at the function's closing brace; c17 has no position
+    /// for it and names the function's first line instead.
+    pub fn check_frame_size(&self, frame_bytes: i64) {
+        let Some(limit) = crate::diag::frame_larger_than() else {
+            return;
+        };
+        let size = frame_bytes.max(0) as u64;
+        if size > limit {
+            crate::diag::group_warning_args(
+                crate::diag::FRAME_LARGER_THAN_WARNING,
+                self.func_pos,
+                "the frame size of {0} bytes is larger than {1} bytes",
+                &[&size.to_string(), &limit.to_string()],
             );
         }
     }
@@ -340,6 +363,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::Comment(comment));
         }
         self.push_directive(Directive::Text);
+        if self.cfi == crate::target::Cfi::DebugFrame {
+            self.push_directive(Directive::Raw(".cfi_sections .debug_frame".into()));
+        }
     }
 
     /// Emit .loc directive for source line tracking
@@ -968,6 +994,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         self.push_directive(Directive::Text);
+        if self.cfi == crate::target::Cfi::DebugFrame {
+            self.push_directive(Directive::Raw(".cfi_sections .debug_frame".into()));
+        }
     }
 
     /// Emit `u"..."` literals referenced by address.
@@ -985,6 +1014,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::Short(0));
         }
         self.push_directive(Directive::Text);
+        if self.cfi == crate::target::Cfi::DebugFrame {
+            self.push_directive(Directive::Raw(".cfi_sections .debug_frame".into()));
+        }
     }
 
     /// Emit `U"..."` and `L"..."` literals referenced by address.
@@ -1002,6 +1034,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::Long(0));
         }
         self.push_directive(Directive::Text);
+        if self.cfi == crate::target::Cfi::DebugFrame {
+            self.push_directive(Directive::Raw(".cfi_sections .debug_frame".into()));
+        }
     }
 }
 
@@ -1370,8 +1405,8 @@ pub trait CodeGenerator {
     /// Generate assembly code for the given IR module
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String;
 
-    /// Set whether to emit unwind tables (the CFI procedures and their frame rules)
-    fn set_emit_unwind_tables(&mut self, emit: bool);
+    /// Set where the CFI procedures and their frame rules go, if anywhere.
+    fn set_cfi(&mut self, cfi: crate::target::Cfi);
 
     /// Set position-independent code mode (for shared libraries and PIE)
     fn set_pic_mode(&mut self, pic: bool);
@@ -1389,7 +1424,7 @@ pub trait CodeGenerator {
     fn set_stack_clash(&mut self, on: bool);
 
     /// Set the `-fstack-protector` level.
-    fn set_stack_protector(&mut self, level: crate::target::StackProtector);
+    fn set_stack_protector(&mut self, protection: crate::target::StackProtection);
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit
@@ -1669,7 +1704,7 @@ pub fn asm_comment_prefix(target: &Target) -> &'static str {
 /// Create a code generator for the given target
 pub fn create_codegen(
     target: Target,
-    emit_unwind_tables: bool,
+    cfi: crate::target::Cfi,
     pic_mode: bool,
     tls: crate::target::TlsPolicy,
     verbose_asm: bool,
@@ -1682,7 +1717,7 @@ pub fn create_codegen(
         Arch::X86_64 => Box::new(super::x86_64::codegen::X86_64CodeGen::new(target)),
         Arch::Aarch64 => Box::new(super::aarch64::codegen::Aarch64CodeGen::new(target)),
     };
-    codegen.set_emit_unwind_tables(emit_unwind_tables);
+    codegen.set_cfi(cfi);
     codegen.set_pic_mode(pic_mode);
     codegen.set_tls_policy(tls);
     codegen.set_verbose_asm(verbose_asm);

@@ -490,7 +490,8 @@ impl<'a> Parser<'a> {
             }
             PackAction::Pop => match self.pack_stack.pop() {
                 Some(prev) => self.pack_current = prev,
-                None => diag::warning(
+                None => diag::group_warning(
+                    crate::token::preprocess::PRAGMAS_WARNING,
                     self.current_pos(),
                     &gettext("'#pragma pack(pop)' with no matching push"),
                 ),

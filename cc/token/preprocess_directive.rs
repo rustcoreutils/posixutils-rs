@@ -1390,7 +1390,8 @@ impl<'a> Preprocessor<'a> {
 
         let tokens = self.collect_to_eol(iter);
         let msg = self.tokens_to_message(&tokens, idents);
-        diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
+        // gcc's `-Wcpp` is the group of `#warning`.
+        diag::group_warning_args("cpp", *pos, "#warning {0}", &[&msg.to_string()]);
     }
 
     /// The macro name in `#pragma push_macro("FOO")`.

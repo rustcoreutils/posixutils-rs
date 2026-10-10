@@ -1126,7 +1126,9 @@ define_keywords! {
     (_, "copy",                    SUPPORTED_ATTR),
     (_, "designated_init",         SUPPORTED_ATTR),
     (_, "may_alias",               SUPPORTED_ATTR),
-    // How gcc optimizes one function, which ignoring cannot make wrong.
+    // How gcc optimizes one function, which ignoring cannot make wrong --
+    // but for a stack-protector option, which sets the function's level
+    // (`AttributeList::optimize_stack_protector`).
     (_, "optimize",                SUPPORTED_ATTR),
     // GNU forms (__foo__)
     // Note: __noreturn__ is already defined above with NORETURN_KW | SUPPORTED_ATTR

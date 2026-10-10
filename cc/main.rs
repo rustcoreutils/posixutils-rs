@@ -255,9 +255,17 @@ struct Args {
     #[arg(short = 'g', action = clap::ArgAction::Count, help = gettext("Generate debug information"))]
     debug: u8,
 
-    /// Disable CFI unwind tables (enabled by default)
-    #[arg(long = "fno-unwind-tables", help = gettext("Disable CFI unwind table generation"))]
-    no_unwind_tables: bool,
+    /// The unwind-table options (`-f[no-]asynchronous-unwind-tables`,
+    /// `-f[no-]unwind-tables`, `-f[no-]exceptions`), as their `-f` names in
+    /// command-line order, carried by `preprocess_args_from`.
+    #[arg(
+        long = "c17-unwind",
+        hide = true,
+        action = clap::ArgAction::Append,
+        value_name = "option",
+        value_parser = parse_unwind_option
+    )]
+    unwind: Vec<String>,
 
     /// A member of gcc's `-fpic` family (`-fpic`, `-fPIC`, `-fpie`, `-fPIE`
     /// and their `-fno-` forms), carried in its gcc spelling by
@@ -515,6 +523,11 @@ struct Args {
         value_parser = parse_stack_protector
     )]
     stack_protector: Option<target::StackProtector>,
+
+    /// The last `--param ssp-buffer-size=` (rewritten by
+    /// `preprocess_args_from`): plain `-fstack-protector`'s threshold.
+    #[arg(long = "c17-ssp-buffer-size", hide = true, value_name = "bytes")]
+    ssp_buffer_size: Option<u64>,
 }
 
 /// The `-Wno-` name for the "`-std=` was not honoured" warning.
@@ -1410,11 +1423,22 @@ fn process_file(
         default_visibility: args.default_visibility.as_deref(),
         tls,
         pic: producing_shared(args) || position.is_pic(),
-        unwind_tables: !args.no_unwind_tables,
+        cfi: args
+            .unwind
+            .iter()
+            .fold(target::UnwindTables::default(), |u, name| {
+                u.after(name).unwrap_or(u)
+            })
+            .cfi(target, args.debug > 0),
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
         stack_clash: args.stack_clash,
-        stack_protector: args.stack_protector.unwrap_or_default(),
+        stack_protector: target::StackProtection {
+            level: args.stack_protector.unwrap_or_default(),
+            buffer_size: args
+                .ssp_buffer_size
+                .unwrap_or(target::StackProtection::DEFAULT_BUFFER_SIZE),
+        },
         source_name: path,
         debug_prefix_map: &prefix_maps.debug,
     };
@@ -1743,6 +1767,15 @@ fn parse_cf_protection(s: &str) -> Result<target::CfProtection, String> {
     target::CfProtection::from_level(s).ok_or_else(|| format!("invalid cf-protection level '{s}'"))
 }
 
+/// The value of the internal `--c17-unwind` option: the `-f` name of an
+/// unwind-table option.
+fn parse_unwind_option(s: &str) -> Result<String, String> {
+    match target::UnwindTables::default().after(s) {
+        Some(_) => Ok(s.to_string()),
+        None => Err(format!("not an unwind-table option: '{s}'")),
+    }
+}
+
 /// The value of the internal `--c17-stack-protector` option: the `-f` name
 /// of a stack-protector level.
 fn parse_stack_protector(s: &str) -> Result<target::StackProtector, String> {
@@ -1927,10 +1960,17 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     // (`f_options::family`): a later one of a family replaces an earlier
     // one, and `-fno-<family>` withdraws it. Warned about after the parse.
     let mut unsupported: Vec<(String, String)> = Vec::new();
+    // The sanitizers asked for, as (stem, name, option), less those a later
+    // `-fno-<stem>=` withdrew; see `f_options::SANITIZERS`.
+    let mut sanitizers: Vec<(String, String, String)> = Vec::new();
+    // The unwind-table options, in order; see `target::UnwindTables`.
+    let mut unwind = Vec::new();
     // `-fstack-clash-protection`, last one wins.
     let mut stack_clash = false;
     // `-fstack-protector`, its levels and `-fno-stack-protector`: last wins.
     let mut stack_protector = None;
+    // `--param ssp-buffer-size=`, last wins.
+    let mut ssp_buffer_size = None;
     // The `-W<name>` and `-f<name>` options refused as gcc refuses them: by
     // its driver, and -- only if the driver let everything through -- by
     // its compiler.
@@ -2191,6 +2231,31 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             // Which linker the host driver runs, so it goes to the link.
             result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
+        } else if let Some((stem, list)) = arg
+            .strip_prefix("-f")
+            .and_then(|name| name.split_once('='))
+            .filter(|(stem, _)| {
+                f_options::SANITIZERS.contains(&stem.strip_prefix("no-").unwrap_or(stem))
+            })
+        {
+            // c17 instruments nothing. A request is kept until the scan is
+            // done, as gcc keeps it, so that `-fno-sanitize=` can withdraw
+            // it; whatever is left is refused below.
+            let (withdraw, family) = match stem.strip_prefix("no-") {
+                Some(family) => (true, family),
+                None => (false, stem),
+            };
+            if list.is_empty() {
+                driver_errors.push(format!("error: missing argument to '-f{stem}='"));
+            }
+            for name in list.split(',').filter(|n| !n.is_empty()) {
+                if withdraw {
+                    sanitizers.retain(|(f, n, _)| f != family || (name != "all" && n != name));
+                } else {
+                    sanitizers.push((family.to_string(), name.to_string(), arg.clone()));
+                }
+            }
+            i += 1;
         } else if let Some(name) = arg.strip_prefix("-f") {
             // Every other `-f` option, as `f_options` classifies it: taken
             // in silence when c17's output already is what it asks for, taken
@@ -2204,7 +2269,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
                     unsupported.push((family.to_string(), arg.clone()));
                 }
                 f_options::Verdict::Known(Effect::Implemented) => {
-                    debug_assert!(false, "{arg} is implemented, so parsed above");
+                    debug_assert!(
+                        target::UnwindTables::default().after(name).is_some(),
+                        "{arg} is implemented, so parsed above"
+                    );
                 }
                 f_options::Verdict::Known(Effect::ForLanguages(_)) => {
                     result.push(format!("--c17-other-language={arg}"));
@@ -2215,17 +2283,34 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             if let Some(family) = name.strip_prefix("no-") {
                 unsupported.retain(|(f, _)| f != family);
             }
+            // The unwind-table options, `-fexceptions` among them, which
+            // needs the tables too; see `target::UnwindTables`.
+            if target::UnwindTables::default().after(name).is_some() {
+                unwind.push(format!("--c17-unwind={name}"));
+            }
             i += 1;
         } else if arg == "--param" || arg.starts_with("--param=") {
             // `--param name=value` tunes a gcc heuristic -- inlining limits,
-            // GC thresholds, unrolling budgets. Every one of them names an
-            // internal gcc parameter, so there is nothing for c17 to honour
-            // and nothing it could get wrong by ignoring. It still has to be
-            // *consumed*: the separated spelling puts the setting in the next
-            // argument, and leaving that behind made clap read `ggc-min-expand=1`
-            // as a source file.
-            if arg == "--param" {
-                i += 1; // the setting travels separately
+            // GC thresholds, unrolling budgets -- which nothing in c17
+            // corresponds to, so a name gcc 13 knows is taken in silence and
+            // any other refused in gcc's words. The separated spelling puts
+            // the setting in the next argument, which is consumed with it.
+            let setting = match arg.strip_prefix("--param=") {
+                Some(setting) => setting,
+                None => {
+                    i += 1;
+                    raw_args.get(i).map_or("", String::as_str)
+                }
+            };
+            match posixutils_cc::param_options::check(setting) {
+                // The one parameter that changes what c17 emits: the
+                // threshold of plain `-fstack-protector`.
+                Ok(()) => {
+                    if let Some(bytes) = setting.strip_prefix("ssp-buffer-size=") {
+                        ssp_buffer_size = Some(bytes.to_string());
+                    }
+                }
+                Err(lines) => driver_errors.extend(lines),
             }
             i += 1;
         } else if let Some(dir) = arg.strip_prefix("-iquote").filter(|d| !d.is_empty()) {
@@ -2313,6 +2398,19 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
         }
     }
 
+    // A sanitizer still asked for is refused, once per option.
+    let mut unsanitized: Vec<String> = Vec::new();
+    for (_, _, option) in sanitizers {
+        if !unsanitized.contains(&option) {
+            unsanitized.push(option);
+        }
+    }
+    driver_errors.extend(
+        unsanitized
+            .iter()
+            .map(|option| format!("error: '{option}' is not supported")),
+    );
+
     // A configure probe passes a `-W` or `-f` option to learn whether the
     // compiler takes it, so one c17 does not know fails the run as gcc's
     // would.
@@ -2332,6 +2430,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     // which everything is an operand.
     let mut trailer = lang_overrides;
     trailer.append(&mut ignored);
+    trailer.append(&mut unwind);
     trailer.extend(
         unsupported
             .into_iter()
@@ -2339,6 +2438,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     );
     if stack_clash {
         trailer.push("--c17-stack-clash".to_string());
+    }
+    if let Some(bytes) = ssp_buffer_size {
+        trailer.push(format!("--c17-ssp-buffer-size={bytes}"));
     }
     if let Some(level) = stack_protector {
         trailer.push(format!("--c17-stack-protector={}", level.option()));
@@ -4111,7 +4213,7 @@ mod tests {
     /// withdrawing it.
     #[test]
     fn test_preprocess_unsupported_f_flags_are_kept_for_the_warning() {
-        for flag in &["-fsanitize=address", "-fcommon", "-ftrapv"] {
+        for flag in &["-fcommon", "-ftrapv"] {
             let result = run_preprocess(&[flag, "foo.c"]);
             assert!(
                 result.contains(&format!("--c17-unsupported={flag}")),
@@ -4126,8 +4228,8 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            unsupported(&["-fsanitize=address", "-fsanitize=undefined"]),
-            ["--c17-unsupported=-fsanitize=undefined"]
+            unsupported(&["-fpack-struct=2", "-fpack-struct=4"]),
+            ["--c17-unsupported=-fpack-struct=4"]
         );
         assert!(unsupported(&["-ftrapv", "-fno-trapv"]).is_empty());
         assert_eq!(

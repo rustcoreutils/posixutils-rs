@@ -62,6 +62,9 @@ int main() {
     );
 }
 
+/// Mach-O keeps its CFI whatever the options say; see
+/// `test_asm::codegen_unwind`.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn codegen_cfi_disabled() {
     let c_file = create_c_file(
@@ -80,7 +83,8 @@ int main() {
             "-S".to_string(),
             "-o".to_string(),
             "-".to_string(),
-            "--fno-unwind-tables".to_string(),
+            "-fno-asynchronous-unwind-tables".to_string(),
+            "-fno-unwind-tables".to_string(),
             c_path.to_string_lossy().to_string(),
         ],
         &[],
@@ -88,18 +92,18 @@ int main() {
 
     assert!(
         output.status.success(),
-        "c17 -S -o - --fno-unwind-tables failed: {}",
+        "c17 -S -o - -fno-asynchronous-unwind-tables -fno-unwind-tables failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
     let asm = String::from_utf8_lossy(&output.stdout);
     assert!(
         !asm.contains(".cfi_startproc"),
-        "Unexpected .cfi_startproc with --fno-unwind-tables"
+        "Unexpected .cfi_startproc without unwind tables"
     );
     assert!(
         !asm.contains(".cfi_endproc"),
-        "Unexpected .cfi_endproc with --fno-unwind-tables"
+        "Unexpected .cfi_endproc without unwind tables"
     );
 }
 

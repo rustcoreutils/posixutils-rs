@@ -325,12 +325,67 @@ fn codegen_cfi_describes_every_frame() {
     }
 }
 
-/// `--fno-unwind-tables` drops the rules along with the procedure brackets.
-#[test]
-fn codegen_cfi_off_means_no_rules() {
+/// The CFI a translation unit gets under `opts`: whether it has rules, and
+/// whether they go to `.debug_frame` rather than `.eh_frame`.
+fn cfi_of(triple: &str, opts: &[&str]) -> (bool, bool) {
     let src = format!("{FRAMES}{DEPTH_STUB}");
-    for triple in [AARCH64_LINUX, X86_64_LINUX] {
-        let asm = asm_for_with("cfi_off", triple, &src, &["-O2", "--fno-unwind-tables"]);
-        assert!(!asm.contains(".cfi_"), "{triple}:\n{asm}");
+    let asm = asm_for_with("cfi_matrix", triple, &src, opts);
+    let rules = asm.contains(".cfi_startproc") && asm.contains(".cfi_def_cfa");
+    assert_eq!(
+        rules,
+        asm.contains(".cfi_"),
+        "{triple} {opts:?}: half the CFI:\n{asm}"
+    );
+    let debug_frame = asm.contains(".cfi_sections .debug_frame");
+    (rules, debug_frame)
+}
+
+/// gcc 13's tables, option by option: x86-64 needs only
+/// `-fno-asynchronous-unwind-tables` to drop them, aarch64 also
+/// `-fno-unwind-tables`, which it turns on by default; `-funwind-tables` and
+/// `-fexceptions` bring them back; and with `-g` and no tables the rules stay,
+/// for the debugger, in `.debug_frame`.
+#[test]
+fn codegen_unwind_table_options_match_gcc() {
+    const ASYNC: &str = "-fno-asynchronous-unwind-tables";
+    const SYNC: &str = "-fno-unwind-tables";
+    let eh = (true, false);
+    let none = (false, false);
+    let debug = (true, true);
+    for (opts, x86, arm) in [
+        (&[][..], eh, eh),
+        (&[ASYNC][..], none, eh),
+        (&[SYNC][..], eh, eh),
+        (&[ASYNC, SYNC][..], none, none),
+        (&[SYNC, ASYNC][..], none, none),
+        (&[ASYNC, SYNC, "-g"][..], debug, debug),
+        (&[ASYNC, "-g"][..], debug, eh),
+        (&[ASYNC, SYNC, "-funwind-tables"][..], eh, eh),
+        (&[ASYNC, SYNC, "-fasynchronous-unwind-tables"][..], eh, eh),
+        (&[ASYNC, SYNC, "-fexceptions"][..], eh, eh),
+        (
+            &[ASYNC, SYNC, "-fexceptions", "-fno-exceptions"][..],
+            none,
+            none,
+        ),
+    ] {
+        let mut o = vec!["-O2"];
+        o.extend(opts);
+        assert_eq!(cfi_of(X86_64_LINUX, &o), x86, "x86-64 {opts:?}");
+        assert_eq!(cfi_of(AARCH64_LINUX, &o), arm, "aarch64 {opts:?}");
+    }
+}
+
+/// Mach-O keeps its CFI whatever the options say: the linker builds the
+/// compact unwind table every Darwin unwinder reads from it.
+#[test]
+fn codegen_darwin_keeps_its_cfi() {
+    for triple in [AARCH64_DARWIN, "x86_64-apple-darwin"] {
+        let opts = [
+            "-O2",
+            "-fno-asynchronous-unwind-tables",
+            "-fno-unwind-tables",
+        ];
+        assert_eq!(cfi_of(triple, &opts), (true, false), "{triple}");
     }
 }

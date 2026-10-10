@@ -77,7 +77,8 @@ pub struct CodegenOptions<'a> {
     pub tls: crate::target::TlsPolicy,
     /// Position-independent code.
     pub pic: bool,
-    pub unwind_tables: bool,
+    /// Where the unit's CFI goes; see [`crate::target::UnwindTables::cfi`].
+    pub cfi: crate::target::Cfi,
     /// `-fverbose-asm`.
     pub verbose_asm: bool,
     /// `-fcf-protection`.
@@ -85,7 +86,7 @@ pub struct CodegenOptions<'a> {
     /// `-fstack-clash-protection`.
     pub stack_clash: bool,
     /// `-fstack-protector` and its levels.
-    pub stack_protector: crate::target::StackProtector,
+    pub stack_protector: crate::target::StackProtection,
     /// The name DWARF records for the primary source file.
     pub source_name: &'a str,
     /// `-fdebug-prefix-map`: rewrites every path the debug information and
@@ -290,7 +291,7 @@ pub fn compile_tokens(
     // thread-locals at link time. gcc draws the line in the same place.
     let mut codegen = arch::codegen::create_codegen(
         target.clone(),
-        opts.unwind_tables,
+        opts.cfi,
         opts.pic,
         opts.tls,
         opts.verbose_asm,

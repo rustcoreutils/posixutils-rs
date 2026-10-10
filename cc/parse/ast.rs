@@ -3060,6 +3060,10 @@ pub struct FunctionAttrs {
     pub noreturn: bool,
     /// `__attribute__((stack_protect))` or `((no_stack_protector))`.
     pub stack_protect: StackProtectAttr,
+    /// The stack-protector level `__attribute__((optimize("...")))` sets for
+    /// this function in place of the command line's: glibc's
+    /// `optimize("-fno-stack-protector")`, say. `None` if it names none.
+    pub stack_protector: Option<crate::target::StackProtector>,
     /// `__attribute__((target("...")))`: the ISA this function alone is
     /// compiled for, relative to the translation unit's.
     pub target: Option<crate::target::IsaRequest>,
@@ -3114,6 +3118,10 @@ impl FunctionAttrs {
             .stack_protect
             .combine(other.stack_protect)
             .unwrap_or_else(|kept| kept);
+        // A later `optimize` level replaces an earlier one, as gcc's does.
+        if other.stack_protector.is_some() {
+            self.stack_protector = other.stack_protector;
+        }
         // A later declaration's ISA request replaces an earlier one's.
         if other.target.is_some() {
             self.target = other.target.clone();

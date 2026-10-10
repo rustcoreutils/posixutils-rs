@@ -3106,6 +3106,9 @@ pub struct Function {
     /// the back end, which decides about the canary once inlining is done,
     /// so an inlined callee's attribute is gone with its body, as in gcc.
     pub stack_protect: crate::parse::ast::StackProtectAttr,
+    /// The stack-protector level `optimize("...")` gives this function in
+    /// place of the command line's; see `FunctionAttrs::stack_protector`.
+    pub stack_protector: Option<crate::target::StackProtector>,
     /// `__attribute__((constructor))`: emit a pointer to this function in
     /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
     /// without a priority; `Some(Some(p))` carries one.
@@ -3162,6 +3165,7 @@ impl Default for Function {
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,
             stack_protect: Default::default(),
+            stack_protector: None,
             constructor: None,
             destructor: None,
             is_inline: false,

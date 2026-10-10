@@ -918,3 +918,153 @@ fn xargs_lines_after_n_takes_effect() {
         "xargs: warning: options -n and -L are mutually exclusive; ignoring -n\n",
     );
 }
+
+// -P maxprocs (an extension: util-linux's test runner passes it).
+
+/// Runs `xargs -P procs -n 1 sh -c RENDEZVOUS DIR` on "a\nb\n": each
+/// invocation marks itself in DIR and waits up to five seconds for the other's
+/// mark, so both finish only when they run at the same time.
+fn xargs_rendezvous(procs: &str) -> std::process::Output {
+    let dir = plib::tmp::tempdir().unwrap();
+    let script = r#"touch "$0/$1"; n=0
+until [ -e "$0/a" ] && [ -e "$0/b" ]; do
+    n=$((n + 1)); [ "$n" -gt 5 ] && exit 3; sleep 1
+done
+echo "$1""#;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_xargs"))
+        .args(["-P", procs, "-n", "1", "sh", "-c", script])
+        .arg(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(b"a\nb\n").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn xargs_parallel_runs_invocations_at_once() {
+    let out = xargs_rendezvous("2");
+    let mut lines: Vec<_> = std::str::from_utf8(&out.stdout).unwrap().lines().collect();
+    lines.sort();
+    assert_eq!(lines, ["a", "b"], "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// `-P 0`: as many at once as there are invocations.
+#[test]
+fn xargs_parallel_zero_is_no_limit() {
+    let out = xargs_rendezvous("0");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+}
+
+#[test]
+fn xargs_parallel_one_runs_in_order() {
+    xargs_test_err("a b c\n", &["-P", "1", "-n", "1", "echo"], "a\nb\nc\n", "");
+}
+
+/// A failure among invocations run at once is xargs's exit status 1, and
+/// every invocation still runs.
+#[test]
+fn xargs_parallel_failure_is_reported() {
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("xargs"),
+            args: ["-P", "3", "-n", "1", "sh", "-c", r#"echo "$0"; exit "$0""#]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            stdin_data: String::from("0 1 0\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 1,
+        },
+        |_, out| {
+            let mut lines: Vec<_> = std::str::from_utf8(&out.stdout).unwrap().lines().collect();
+            lines.sort();
+            assert_eq!(lines, ["0", "0", "1"], "{out:?}");
+            assert!(out.stderr.is_empty(), "{out:?}");
+            assert_eq!(out.status.code(), Some(1));
+        },
+    );
+}
+
+/// An exit status of 255 stops further invocations, but the ones already
+/// running are waited for.
+#[test]
+fn xargs_parallel_255_waits_for_the_running_ones() {
+    xargs_test_exit(
+        "slow\nstop\nlater\n",
+        &[
+            "-P",
+            "2",
+            "-n",
+            "1",
+            "sh",
+            "-c",
+            r#"case "$0" in stop) exit 255;; slow) sleep 1;; esac; echo "$0""#,
+        ],
+        "slow\n",
+        "xargs: sh: exited with status 255; aborting\n",
+        1,
+    );
+}
+
+#[test]
+fn xargs_parallel_rejects_a_bad_count() {
+    for bad in ["x", "-1"] {
+        run_test_with_checker(
+            TestPlan {
+                cmd: String::from("xargs"),
+                args: vec!["-P".to_string(), bad.to_string(), "echo".to_string()],
+                stdin_data: String::from("a\n"),
+                expected_out: String::new(),
+                expected_err: String::new(),
+                expected_exit_code: 2,
+            },
+            |_, out| {
+                assert!(out.stdout.is_empty(), "{bad}: {out:?}");
+                assert!(
+                    String::from_utf8_lossy(&out.stderr).contains("-P"),
+                    "{bad}: {out:?}"
+                );
+                assert_ne!(out.status.code(), Some(0), "{bad}");
+            },
+        );
+    }
+}
+
+/// util-linux's tests/run.sh, verbatim but for the job count and command.
+#[test]
+fn xargs_util_linux_test_runner_line() {
+    xargs_test_err(
+        "t1\nt2\n",
+        &[
+            "-I",
+            "{}",
+            "-P",
+            "1",
+            "-n",
+            "1",
+            "sh",
+            "-c",
+            "'{}' x 2>/dev/null || echo failed {}",
+        ],
+        "failed t1\nfailed t2\n",
+        "",
+    );
+}
+
+fn xargs_test_exit(input: &str, args: &[&str], out: &str, err: &str, code: i32) {
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        stdin_data: String::from(input),
+        expected_out: String::from(out),
+        expected_err: String::from(err),
+        expected_exit_code: code,
+    });
+}

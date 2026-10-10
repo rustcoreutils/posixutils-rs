@@ -1021,6 +1021,11 @@ No `uucp`, `uux` or `uustat` *options* are extensions.
 
  * `--userproc` — hidden internal selection flag.
 
+### xargs
+
+ * `-P maxprocs` — run up to *maxprocs* invocations of the utility at once;
+   `0` means no limit.  util-linux's test runner passes it.
+
 ### xgettext
 
  * Rust (`.rs`) source files are parsed for translatable strings in addition to

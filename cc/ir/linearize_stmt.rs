@@ -191,13 +191,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.reg_aggregate_return_type {
                         self.emit_reg_aggregate_return(e, ret_type);
+                    } else if self.types.kind(func_ret_type) == TypeKind::Void {
+                        // GNU C `return f();` in a void function, `f` void
+                        // too: the expression runs for its effects and the
+                        // function returns nothing. Returning the call's
+                        // result pseudo instead handed every consumer a
+                        // value that has no definition once the inliner
+                        // splices `f` (a void callee builds no return phi),
+                        // and a callee mixing such a return with a plain
+                        // one gave its inlined copy a return phi missing
+                        // the plain one's edge.
+                        self.linearize_expr(e);
+                        self.emit_return(Instruction::ret(None));
                     } else {
                         // Converted as if by assignment (C17 6.8.6.4p3).
-                        let converted_val = if self.types.kind(func_ret_type) == TypeKind::Void {
-                            self.linearize_expr(e)
-                        } else {
-                            self.linearize_converted(e, func_ret_type)
-                        };
+                        let converted_val = self.linearize_converted(e, func_ret_type);
                         let converted_val = self.outlive_cleanups(converted_val, func_ret_type, 0);
                         // Function types decay to pointers when returned
                         let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
@@ -783,6 +791,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.static_local_counter
         );
         self.static_local_counter += 1;
+        if let Some(func) = &mut self.current_func {
+            func.static_locals.push(global_name.clone());
+        }
         if let Some(statics) = &mut self.clone_statics {
             statics.insert(declarator.symbol, global_name.clone());
         }

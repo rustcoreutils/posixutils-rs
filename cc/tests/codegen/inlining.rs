@@ -2004,3 +2004,137 @@ int main(void) { return bar() == 2 ? 0 : 1; }
         }
     }
 }
+
+/// `always_inline` is spliced into a recursive caller of any size, at every
+/// level, as gcc splices it (the kernel's fs/quota/quota_tree.c calling a
+/// FORTIFY helper). The helper is `extern inline` `gnu_inline`, so nothing
+/// defines it out of line: a call c17's caller caps left standing failed to
+/// link. A chain of them, longer than the inliner's ordinary rounds, is
+/// spliced through too.
+#[test]
+fn codegen_always_inline_into_a_large_recursive_caller() {
+    let calls: String = (0..120)
+        .map(|i| format!("    acc += (int)my_strlen(s + {}) * {i};\n", i % 4))
+        .collect();
+    // Three levels of recursion, each summing strlen("abcdefgh" + i % 4) * i.
+    let expected: i32 = 3 * (0..120).map(|i| (8 - i % 4) * i).sum::<i32>();
+    let src = format!(
+        r#"
+#include <stddef.h>
+extern inline __attribute__((__always_inline__, __gnu_inline__)) size_t my_strlen(const char *p)
+{{ size_t n = 0; while (p[n]) n++; return n; }}
+#define LINK(a, b) extern inline __attribute__((__always_inline__, __gnu_inline__)) \
+    int a(int x) {{ return b(x) + 1; }}
+extern inline __attribute__((__always_inline__, __gnu_inline__)) int c9(int x) {{ return x; }}
+LINK(c8, c9) LINK(c7, c8) LINK(c6, c7) LINK(c5, c6) LINK(c4, c5)
+LINK(c3, c4) LINK(c2, c3) LINK(c1, c2) LINK(c0, c1)
+static int rec(const char *s, int d)
+{{
+    int acc = 0;
+{calls}    if (d < 2) acc += rec(s, d + 1);
+    return acc + c0(0) - 9;
+}}
+int main(void) {{ return rec("abcdefgh", 0) == {expected} ? 0 : 1; }}
+"#
+    );
+    compile_and_run_everywhere("always_inline_recursive_big", &src);
+}
+
+/// The kernel's static-key branch (x86 jump_label.h) inside a large
+/// recursive function: the `always_inline` `arch_static_branch` passes
+/// `&key` to an `"i"` operand printed with `%c`, which is a constant only
+/// once the call is spliced. c17's recursive-caller cap left the call, and
+/// the out-of-line copy's operand could not be satisfied.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn codegen_always_inline_static_key_in_a_large_recursive_caller() {
+    let sums: String = (0..150)
+        .map(|i| format!("    acc += n->v[{}] * {i};\n", i % 8))
+        .collect();
+    let src = format!(
+        r#"
+struct static_key {{ int enabled; }};
+struct static_key_false {{ struct static_key key; }};
+static inline __attribute__((__always_inline__)) _Bool arch_static_branch(struct static_key *key, _Bool branch)
+{{
+    asm goto("1: jmp %l[l_yes]\n\t.pushsection __jump_table, \"aw\"\n\t.long 1b - ., %l[l_yes] - .\n\t.quad %c0 + %c1 - .\n\t.popsection"
+             : : "i" (key), "i" (branch) : : l_yes);
+    return 0;
+l_yes:
+    return 1;
+}}
+static struct static_key_false k1;
+struct node {{ struct node *child; int v[8]; }};
+int walk(struct node *n)
+{{
+    int acc = 0;
+{sums}    if (__builtin_expect(arch_static_branch(&k1.key, 0), 0)) acc++;
+    if (n->child) acc += walk(n->child);
+    return acc;
+}}
+int main(void)
+{{
+    struct node leaf = {{ 0, {{ 1, 1, 1, 1, 1, 1, 1, 1 }} }};
+    /* The unpatched branch is a `jmp` to the yes arm. */
+    return walk(&leaf) == 149 * 150 / 2 + 1 ? 0 : 1;
+}}
+"#
+    );
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                "always_inline_static_key",
+                &src,
+                &[
+                    opt.to_string(),
+                    "-fno-pic".to_string(),
+                    "-no-pie".to_string()
+                ]
+            ),
+            0,
+            "{opt}"
+        );
+    }
+}
+
+/// GNU C `return f();` between void functions, nested two inlinings deep
+/// (reduced from the kernel's fs/afs/fsclient.c `afs_fs_fetch_data`): once
+/// `nomem` is spliced into `fetch64`, that copy's two returns -- one of
+/// them `return nomem(p);` -- must both reach the continuation when
+/// `fetch64` is spliced into `fetch`. The value-carrying return left the
+/// plain one's edge out of the return phi, and -O1/-O2 died in the IR
+/// validator.
+#[test]
+fn codegen_inline_void_return_of_void_call() {
+    compile_and_run_everywhere(
+        "inline_void_return_void_call",
+        r#"
+static int status;
+static void nomem(int *p) { *p = -12; }
+static void fetch64(int *p, int fail)
+{
+    if (fail)
+        return nomem(p);
+    *p = 64;
+    status++;
+}
+void fetch(int *p, int big, int fail)
+{
+    if (big)
+        return fetch64(p, fail);
+    *p = 32;
+}
+int main(void)
+{
+    int v = 0;
+    fetch(&v, 1, 1);
+    if (v != -12) return 1;
+    fetch(&v, 1, 0);
+    if (v != 64 || status != 1) return 2;
+    fetch(&v, 0, 0);
+    if (v != 32) return 3;
+    return 0;
+}
+"#,
+    );
+}

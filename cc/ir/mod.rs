@@ -3107,6 +3107,13 @@ pub struct Function {
     /// gcc never copies such a function ("saves address of local label in a
     /// static variable"), and neither does the inliner.
     pub saves_label_in_static: bool,
+    /// The globals that are this function's block-scope statics, by name.
+    ///
+    /// They are the function's own: when it is dropped as unreferenced, gcc
+    /// emits none of them either, and one left behind still names whatever
+    /// its initializer points at -- the kernel's `static inline` helpers
+    /// keep tables of objects that may not be configured in.
+    pub static_locals: Vec<String>,
     /// `__attribute__((always_inline))`: inline at every call site regardless
     /// of size, and at `-O0` too. `is_noinline` wins if both are present.
     pub is_always_inline: bool,
@@ -3161,6 +3168,7 @@ impl Default for Function {
             align: None,
             takes_label_addr: false,
             saves_label_in_static: false,
+            static_locals: Vec::new(),
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             blocks: Vec::new(),
@@ -4388,12 +4396,14 @@ impl Module {
     /// The names among `candidates` that something in the module still
     /// refers to: a direct call, any instruction operand naming the symbol
     /// (its address taken, a load or store through it), an inline asm
-    /// operand or a name written into an asm template, a global's
-    /// initializer, or the target of an alias.
+    /// operand, a global's initializer, or the target of an alias.
     ///
-    /// Missing a kind of reference here deletes a live function, so this
-    /// errs toward keeping: an identifier that merely *looks* like a
-    /// candidate in an assembly template counts.
+    /// A name written into an asm *template* is not a reference, as it is
+    /// not to gcc: an assembly template is text the compiler does not read,
+    /// and a static function called only from one needs `used`. Counting
+    /// every identifier-shaped word kept an unused `static inline void
+    /// wbinvd(void)` alive wherever `asm("wbinvd")` appeared, with whatever
+    /// undefined symbols its body named.
     pub fn referenced_symbols(&self, candidates: &HashSet<String>) -> HashSet<String> {
         self.references_from(candidates, |_| true, true)
     }
@@ -4448,10 +4458,7 @@ impl Module {
                         note(name);
                     }
                 }
-                // A name written into the assembly text itself -- `asm("call
-                // foo")` -- reaches the assembler with no IR reference at all.
                 if let Some(ref asm) = insn.extra().asm_data {
-                    for_each_word(&asm.template, &mut note);
                     for operand in asm.inputs.iter().chain(&asm.outputs) {
                         if let Some(name) = func.global_sym_name(operand.pseudo) {
                             note(name);
@@ -4473,21 +4480,6 @@ impl Module {
             note(&alias.target);
         }
         referenced
-    }
-}
-
-/// Every identifier-shaped word in an assembly template.
-fn for_each_word(template: &str, f: &mut impl FnMut(&str)) {
-    let mut word = String::new();
-    for ch in template.chars().chain(std::iter::once(' ')) {
-        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
-            word.push(ch);
-            continue;
-        }
-        if !word.is_empty() {
-            f(&word);
-            word.clear();
-        }
     }
 }
 
@@ -5068,8 +5060,9 @@ mod tests {
         assert_eq!(module.functions.len(), 1);
     }
 
-    /// Each kind of reference counts; a candidate nothing names does not, and
-    /// a local spelled like a candidate is not a reference to it.
+    /// Each kind of reference counts; a candidate nothing names does not, a
+    /// local spelled like a candidate is not a reference to it, and neither
+    /// is a word of an asm template (gcc does not read the template).
     #[test]
     fn test_module_referenced_symbols() {
         let types = TypeTable::new(&Target::host());
@@ -5133,7 +5126,7 @@ mod tests {
         let got = module.referenced_symbols(&candidates);
         let mut got: Vec<&str> = got.iter().map(String::as_str).collect();
         got.sort_unstable();
-        assert_eq!(got, ["called", "from_init", "in_template", "loaded"]);
+        assert_eq!(got, ["called", "from_init", "loaded"]);
     }
 
     /// A function that is not emitted -- an inline definition -- still

@@ -436,40 +436,49 @@ fn suppress_forwarding_bodies(module: &mut Module) {
     }
 }
 
-/// Diagnose a pack the inliner could not resolve.
+/// Diagnose a call the inliner had to splice and could not.
 ///
-/// Reachable when `always_inline` is refused for a reason of its own -- a
-/// callee that also uses `va_start`, or `alloca`, is turned down in
-/// `ir::inline` before the attribute is consulted. The body is already
-/// suppressed by then, so what is wrong is the surviving *call site*, and that
-/// is what this looks for. GCC reports the same situation as an error.
+/// Two kinds of function must never be left as a call. A
+/// `__builtin_va_arg_pack` forwarder is suppressed on the assumption it always
+/// inlines. And an `always_inline` function is, to gcc, always inlined: one
+/// whose body can never be copied -- it builds its own variadic frame,
+/// contains a computed goto, saves a label in a static, receives a non-local
+/// goto -- is rejected wherever it is called, out-of-line copy or not, in
+/// gcc's words. One that is merely recursive, returns an address or is also
+/// `noinline` is an error only when no out-of-line copy exists to call; gcc
+/// at -O2 leaves a self-recursive one's inner call standing too.
+///
+/// Nothing about a *caller* -- its size, its recursion -- refuses an
+/// `always_inline` splice (`ir::inline::should_inline`), so no such call
+/// survives for a reason this does not know.
+///
+/// A plain C99 inline definition is deliberately not in this set: its
+/// external definition may live in another translation unit, so an ordinary
+/// call to it is correct and the linker resolves it.
 fn check_forwarding_resolved(module: &Module) {
-    // Two kinds of function have no out-of-line copy to fall back on. A
-    // `__builtin_va_arg_pack` forwarder is suppressed on the assumption it
-    // always inlines. And an inline definition marked `always_inline` that no
-    // call site *can* substitute -- it reads its own variadic frame, is
-    // recursive, takes a label's address, returns an address, or is also
-    // marked `noinline` -- is a contradiction gcc rejects too.
-    //
-    // A plain C99 inline definition is deliberately not in this set: its
-    // external definition may live in another translation unit, so an ordinary
-    // call to it is correct and the linker resolves it.
-    //
-    // Neither is an `always_inline` function the inliner merely *declined*.
-    // Its caps on caller size and on recursive stack depth are c17's own, and
-    // gcc has no counterpart: treating those refusals as unresolvable rejected
-    // programs gcc compiles, which any recursive function over a few hundred
-    // instructions calling a glibc `__fortify_function` reached. The call is
-    // left standing and the linker resolves it against the out-of-line
-    // definition the inline definition promises.
+    enum Unresolved {
+        Forwarder,
+        NeverCopied(&'static str),
+        NoOutOfLineCopy,
+    }
     let impossible = crate::ir::inline::impossible_always_inline(module);
-    let suppressed: std::collections::BTreeMap<&str, bool> = module
+    let unresolved: std::collections::BTreeMap<&str, Unresolved> = module
         .functions
         .iter()
-        .filter(|f| !f.emit && (forwards_caller_arguments(f) || impossible.contains(&f.name)))
-        .map(|f| (f.name.as_str(), forwards_caller_arguments(f)))
+        .filter_map(|f| {
+            let why = if !f.emit && forwards_caller_arguments(f) {
+                Unresolved::Forwarder
+            } else {
+                match impossible.get(&f.name) {
+                    Some(Some(reason)) => Unresolved::NeverCopied(reason),
+                    Some(None) if !f.emit => Unresolved::NoOutOfLineCopy,
+                    _ => return None,
+                }
+            };
+            Some((f.name.as_str(), why))
+        })
         .collect();
-    if suppressed.is_empty() {
+    if unresolved.is_empty() {
         return;
     }
 
@@ -482,25 +491,19 @@ fn check_forwarding_resolved(module: &Module) {
             let Some(callee) = insn.local_callee() else {
                 continue;
             };
-            let Some(&forwards) = suppressed.get(callee) else {
+            let Some(why) = unresolved.get(callee) else {
                 continue;
             };
             if reported.insert(callee) {
                 // The call site, not line 0: it is the thing that cannot be
                 // resolved, and the only position either function still has.
-                if forwards {
-                    crate::diag::error_args(
-                        insn.pos.unwrap_or_default(),
-                        "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
-                        &[callee],
-                    );
-                } else {
-                    crate::diag::error_args(
-                        insn.pos.unwrap_or_default(),
-                        "inlining failed in call to 'always_inline' '{0}', which has no out-of-line definition",
-                        &[callee],
-                    );
-                }
+                let pos = insn.pos.unwrap_or_default();
+                let text = match why {
+                    Unresolved::Forwarder => "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
+                    Unresolved::NeverCopied(reason) => reason,
+                    Unresolved::NoOutOfLineCopy => "inlining failed in call to 'always_inline' '{0}', which has no out-of-line definition",
+                };
+                crate::diag::error_args(pos, text, &[callee]);
             }
         }
     }

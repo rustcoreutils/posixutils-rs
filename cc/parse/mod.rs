@@ -58,6 +58,8 @@ mod test_local_labels;
 #[cfg(test)]
 mod test_member_list;
 #[cfg(test)]
+mod test_object_size;
+#[cfg(test)]
 mod test_offsetof;
 #[cfg(test)]
 mod test_overflow_p_constant;

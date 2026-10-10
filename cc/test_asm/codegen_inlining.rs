@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Assembly cases of tests/codegen/inlining.rs, in process: which calls the
-// inliner keeps (`noinline`, `always_inline` and its stack guard, weak
+// inliner keeps (`noinline`, `always_inline` past the stack guard, weak
 // definitions), which inline spellings emit a symbol, and the TLS model of an
 // `extern` thread-local.
 //
@@ -138,24 +138,18 @@ fn codegen_always_inline_spellings_and_conflict() {
     );
 }
 
-/// `always_inline` overrides the *desirability* heuristics, not the
-/// stack-safety guards.
+/// `always_inline` overrides c17's stack-safety guard on a recursive caller,
+/// as it overrides every other heuristic: gcc always splices it.
 ///
-/// The distinction is c17-specific and load-bearing. gcc can honour the
-/// attribute unconditionally because its frames are compact; c17 has no
-/// register promotion, so every inlined copy adds roughly eight bytes of
-/// stack, which is why `should_inline` caps growth into a recursive caller at
-/// `RECURSIVE_CALLER_MAX_STACK`. Inlining past that cap does not produce wrong
-/// code -- it exhausts the stack at a recursion depth the program's own guard
-/// thought was safe.
-///
-/// Found by the CPython gate: `test_isinstance` segfaulted in
-/// `test_infinitely_many_bases`, which recurses until it expects a
-/// `RecursionError`, once `always_inline` was allowed to bypass this check.
-/// CPython documents the same hazard in `Include/pyport.h`, noting that
-/// forcing inlining takes its per-call stack from 6 KB to 15 KB.
+/// The guard used to win, and the call it left standing was wrong twice over
+/// in the kernel: FORTIFY's `extern inline` `gnu_inline` helpers have no
+/// out-of-line copy (an undefined reference at link), and a static key's
+/// `"i"(&key)` operand is a constant only once spliced. The cost is stack:
+/// c17's copies are bigger than gcc's, which once made CPython's
+/// `test_isinstance` (`test_infinitely_many_bases`) overflow before its
+/// recursion guard fired.
 #[test]
-fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
+fn codegen_always_inline_ignores_the_recursive_stack_guard() {
     // Big enough that caller_size * 8 clears RECURSIVE_CALLER_MAX_STACK --
     // after simplification, so no statement may undo the ones before it: a
     // shift by `i % 7` alone is `s ^= s` every seventh line.
@@ -170,10 +164,8 @@ fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
 
     let asm = asm_for_with("always_inline_recursive", X86_64_LINUX, &src, &["-O2"]);
     assert!(
-        asm.lines().any(|l| l.trim().starts_with("call helper")),
-        "always_inline must not inline into a recursive caller past the \
-         stack cap; the frame growth overflows the stack at a depth the \
-         program's own recursion guard considers safe:\n{asm}"
+        !asm.lines().any(|l| l.trim().starts_with("call helper")),
+        "always_inline is spliced into a recursive caller of any size:\n{asm}"
     );
 }
 

@@ -26,28 +26,59 @@ use crate::token::lexer::Position;
 use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
-/// A statically known object, and where inside it a pointer points.
+/// What is statically known about the object a pointer points into, and
+/// where inside it the pointer points.
 ///
 /// `whole` / `offset` describe the complete object; `sub` / `sub_offset`
 /// describe the innermost aggregate containing the designated byte. For a
 /// plain array the two coincide.
+///
+/// Through a pointer -- `p->name`, `(*p).name`, `p[1].name` -- the complete
+/// object is unknown (`whole` is `None`) while the member named is not: its
+/// declared size is the subobject, which is what `__builtin_object_size`
+/// types 1 and 3 answer with, as gcc does once optimizing. A trailing array
+/// of such an object is not: it may be a flexible array in all but name
+/// (`open_end`), so its subobject is unknown too.
 #[derive(Clone, Copy)]
 pub(crate) struct ObjectExtent {
-    whole: u64,
+    whole: Option<u64>,
     offset: u64,
-    sub: u64,
+    sub: Option<u64>,
     sub_offset: u64,
+    /// The current subobject reaches the end of an object whose size is not
+    /// known, so storage may continue past its declared end.
+    open_end: bool,
 }
 
 impl ObjectExtent {
     /// A pointer to the start of an object of `size` bytes.
     fn whole_of(size: u64) -> Option<Self> {
         Some(ObjectExtent {
-            whole: size,
+            whole: Some(size),
             offset: 0,
-            sub: size,
+            sub: Some(size),
             sub_offset: 0,
+            open_end: false,
         })
+    }
+
+    /// What a pointer of unknown provenance points at: an object of unknown
+    /// size, nothing yet known about its subobjects.
+    fn pointee() -> Self {
+        ObjectExtent {
+            whole: None,
+            offset: 0,
+            sub: None,
+            sub_offset: 0,
+            open_end: true,
+        }
+    }
+
+    /// Whether the complete object is one the expression names, so that the
+    /// answer needs no optimization to find: gcc answers through a pointer
+    /// only once optimizing.
+    pub(super) fn names_the_object(&self) -> bool {
+        self.whole.is_some()
     }
 
     /// Move the pointer by `bytes`, staying inside both objects.
@@ -55,37 +86,47 @@ impl ObjectExtent {
         let offset = i128::from(self.offset).checked_add(bytes)?;
         let sub_offset = i128::from(self.sub_offset).checked_add(bytes)?;
         // Out of bounds either way: gcc gives up rather than reporting a size
-        // that would licence an overrun.
-        if offset < 0 || offset > i128::from(self.whole) {
-            return None;
+        // that would licence an overrun. An unknown object has no bound to
+        // leave, and an unknown subobject none to check.
+        if let Some(whole) = self.whole {
+            if offset < 0 || offset > i128::from(whole) {
+                return None;
+            }
         }
-        if sub_offset < 0 || sub_offset > i128::from(self.sub) {
-            return None;
+        if let Some(sub) = self.sub {
+            if sub_offset < 0 || sub_offset > i128::from(sub) {
+                return None;
+            }
         }
         Some(ObjectExtent {
-            offset: offset as u64,
-            sub_offset: sub_offset as u64,
+            offset: u64::try_from(offset).unwrap_or(0),
+            sub_offset: u64::try_from(sub_offset).unwrap_or(0),
             ..self
         })
     }
 
     /// Step into a member at `offset` bytes with size `size`, which becomes
-    /// the new innermost subobject.
-    fn narrow(self, offset: u64, size: u64) -> Option<Self> {
+    /// the new innermost subobject. `at_end` says the member ends its
+    /// container, and `array` that it is an array: one at the end of an
+    /// object of unknown size is not bounded by its declared size.
+    fn narrow(self, offset: u64, size: u64, at_end: bool, array: bool) -> Option<Self> {
+        let open_end = self.open_end && at_end;
         Some(ObjectExtent {
             whole: self.whole,
             offset: self.offset.checked_add(offset)?,
-            sub: size,
+            sub: (!(open_end && array)).then_some(size),
             sub_offset: 0,
+            open_end,
         })
     }
 
-    /// Bytes from the pointer to the end of the selected object.
-    pub(super) fn remaining(self, closest_subobject: bool) -> u64 {
+    /// Bytes from the pointer to the end of the selected object, when that
+    /// object's size is known.
+    pub(super) fn remaining(self, closest_subobject: bool) -> Option<u64> {
         if closest_subobject {
-            self.sub.saturating_sub(self.sub_offset)
+            Some(self.sub?.saturating_sub(self.sub_offset))
         } else {
-            self.whole.saturating_sub(self.offset)
+            Some(self.whole?.saturating_sub(self.offset))
         }
     }
 }
@@ -2286,15 +2327,35 @@ impl Parser<'_> {
 
             ExprKind::Member { expr: base, member } => {
                 let base_typ = self.lvalue_type(base)?;
-                let info = self.types.find_member(base_typ, *member)?;
                 let outer = self.lvalue_extent(base)?;
-                outer.narrow(info.offset as u64, self.byte_size(info.typ)?)
+                self.member_extent(outer, base_typ, *member)
             }
 
-            // `a[i]` with a constant index, where `a` is an array we can see.
+            // `p->m` is `(*p).m`.
+            ExprKind::Arrow { expr: ptr, member } => {
+                let base_typ = self.types.base_type(ptr.typ?)?;
+                self.member_extent(ObjectExtent::pointee(), base_typ, *member)
+            }
+
+            // `*p` is an object of unknown size.
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand,
+            } if operand
+                .typ
+                .is_some_and(|t| self.types.kind(t) == TypeKind::Pointer) =>
+            {
+                Some(ObjectExtent::pointee())
+            }
+
+            // `a[i]` with a constant index, where `a` is an array we can see
+            // or a pointer into an object of unknown size.
             ExprKind::Index { array, index } => {
                 let n = self.eval_const_expr(index)?;
-                let outer = self.object_extent(array)?;
+                let outer = self.object_extent(array).or_else(|| {
+                    let typ = array.typ?;
+                    (self.types.kind(typ) == TypeKind::Pointer).then(ObjectExtent::pointee)
+                })?;
                 let elem = self.pointee_size(array)?;
                 outer.advance(i128::from(elem).checked_mul(n)?)
             }
@@ -2303,11 +2364,34 @@ impl Parser<'_> {
         }
     }
 
-    /// `Member` and `Index` reached without an `&`, i.e. an array-typed
-    /// subobject that decayed to a pointer.
+    /// `outer` narrowed to its member `member`, `outer` being of type
+    /// `container`.
+    fn member_extent(
+        &self,
+        outer: ObjectExtent,
+        container: TypeId,
+        member: StringId,
+    ) -> Option<ObjectExtent> {
+        let info = self.types.find_member(container, member)?;
+        // Nothing starts after it: the last member of a structure, any
+        // member of a union.
+        let at_end = self
+            .types
+            .get(container)
+            .composite
+            .as_ref()?
+            .members
+            .iter()
+            .all(|m| m.offset <= info.offset);
+        let array = self.types.kind(info.typ) == TypeKind::Array;
+        outer.narrow(info.offset as u64, self.byte_size(info.typ)?, at_end, array)
+    }
+
+    /// `Member`, `Arrow` and `Index` reached without an `&`, i.e. an
+    /// array-typed subobject that decayed to a pointer.
     fn object_extent_of_lvalue_forms(&self, expr: &Expr) -> Option<ObjectExtent> {
         match &expr.kind {
-            ExprKind::Member { .. } | ExprKind::Index { .. } => {
+            ExprKind::Member { .. } | ExprKind::Arrow { .. } | ExprKind::Index { .. } => {
                 let typ = self.lvalue_type(expr)?;
                 if self.types.kind(typ) != TypeKind::Array {
                     return None;
@@ -2325,6 +2409,10 @@ impl Parser<'_> {
             ExprKind::Ident(id) => Some(self.symbols.get(*id).typ),
             ExprKind::Member { expr, member } => {
                 let base = self.lvalue_type(expr)?;
+                Some(self.types.find_member(base, *member)?.typ)
+            }
+            ExprKind::Arrow { expr, member } => {
+                let base = self.types.base_type(expr.typ?)?;
                 Some(self.types.find_member(base, *member)?.typ)
             }
             ExprKind::Index { array, .. } => {

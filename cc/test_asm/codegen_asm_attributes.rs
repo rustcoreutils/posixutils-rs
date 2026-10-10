@@ -352,24 +352,36 @@ int plain_g = 7, aligned_h __attribute__((aligned(64))) = 8;
     );
 }
 
-/// A name that appears only inside an assembly template still refers to the
-/// function: it reaches the assembler with no IR reference for the prune to
-/// find.
+/// A name that appears only inside an assembly template is not a reference,
+/// as it is not to gcc, which does not read the template: a static called
+/// only from one needs `used`. Counting template words emitted the kernel's
+/// unused `static inline void wbinvd(void)` wherever `asm("wbinvd")` was.
 #[test]
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn codegen_asm_template_reference_keeps_a_static_alive() {
+fn codegen_asm_template_word_does_not_keep_a_static_alive() {
     let asm = asm_for_at(
         "c17_asm_names_static_",
         r#"
 static int helper(void) { return 7; }
-int main(void) { __asm__ volatile ("call helper" ::: "memory"); return 0; }
+__attribute__((used)) static int used_helper(void) { return 8; }
+static inline void wbinvd(void) { extern void never_defined(void); never_defined(); }
+int main(void)
+{
+    __asm__ volatile ("call helper; call used_helper; wbinvd" ::: "memory");
+    return 0;
+}
 "#,
         &["-O2"],
     );
     assert!(
-        asm.contains("\nhelper:"),
-        "a static named only in an asm template must survive:\n{asm}"
+        !asm.contains("\nhelper:") && !asm.contains("\nwbinvd:"),
+        "a static named only in an asm template goes:\n{asm}"
     );
+    assert!(
+        !asm.contains("never_defined"),
+        "nor does what its body names:\n{asm}"
+    );
+    assert!(asm.contains("\nused_helper:"), "`used` keeps one:\n{asm}");
 }
 
 /// The directives an alias is made of, as gcc writes them on ELF: `.set` for

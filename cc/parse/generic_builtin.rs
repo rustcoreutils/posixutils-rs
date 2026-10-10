@@ -433,15 +433,22 @@ impl Parser<'_> {
             return Ok(self.diagnosed_call(size_t, pos));
         };
         let otype = ObjectSizeType::from_bits(otype as u64);
-        let size = match self.object_extent(&ptr) {
+        let optimizing = self.library_call_policy.optimizing;
+        let known = self
+            .object_extent(&ptr)
+            // Through a pointer, gcc knows a member's size only once
+            // optimizing.
+            .filter(|extent| extent.names_the_object() || optimizing)
+            .and_then(|extent| extent.remaining(otype.subobject));
+        let size = match known {
             // A statically known object has the same minimum and maximum
             // size, so bit 1 does not change the answer.
-            Some(extent) => extent.remaining(otype.subobject),
+            Some(size) => size,
             // Not known from the expression: gcc finds the object after
             // inlining and propagation, which only an optimizing compile
             // runs. At `-O0` it answers at once, with the answer for an
             // unknown object.
-            None if self.library_call_policy.optimizing => {
+            None if optimizing => {
                 let deferred = ExprKind::ObjectSize {
                     ptr: Box::new(ptr),
                     otype,

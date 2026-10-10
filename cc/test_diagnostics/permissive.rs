@@ -133,8 +133,8 @@ fn diagnostics_fpermissive_is_not_a_dialect() {
 ///
 /// A C99 inline definition has no out-of-line copy, so refusing the attribute
 /// silently produced `undefined reference` at link time -- a message naming
-/// neither the attribute nor the reason. gcc rejects the same program
-/// ("can never be inlined because it uses variable argument lists").
+/// neither the attribute nor the reason. gcc rejects the same program, in
+/// these words, whether or not an out-of-line copy exists.
 ///
 /// `va_start` is the refusal being exercised: it reads the enclosing
 /// function's register save area, which no splice carries.
@@ -155,7 +155,52 @@ int main(void) { bad(1, 42L); return 0; }
     compile_expect_error(
         "diag_always_inline_refused",
         code,
-        "inlining failed in call to 'always_inline' 'bad'",
+        "function 'bad' can never be inlined because it uses variable argument lists",
+    );
+}
+
+/// The other bodies gcc can never copy are rejected as `always_inline`, in
+/// gcc's words, though each has an out-of-line copy to call: gcc splices
+/// `always_inline` without exception, so a call it cannot splice is an error
+/// rather than a call -- at -O0 as at -O2. An unused one is not.
+#[test]
+fn diagnostics_always_inline_bodies_gcc_never_copies() {
+    let cases = [
+        (
+            "static inline __attribute__((always_inline)) int cg(int n)\n\
+             { void *t[] = { &&a, &&b }; goto *t[n]; a: return 1; b: return 2; }\n\
+             int f(int n) { return cg(n); }\n",
+            "function 'cg' can never be inlined because it contains a computed goto",
+        ),
+        (
+            "static inline __attribute__((always_inline)) int sl(int n)\n\
+             { static void *t[] = { &&a, &&b }; goto *t[n]; a: return 1; b: return 2; }\n\
+             int f(int n) { return sl(n); }\n",
+            "function 'sl' can never be copied because it saves address of local label in a static variable",
+        ),
+        (
+            "extern void *buf[5];\n\
+             static inline __attribute__((always_inline)) int sj(int n)\n\
+             { if (__builtin_setjmp(buf)) return 1; return n; }\n\
+             int f(int n) { return sj(n); }\n",
+            "function 'sj' can never be copied because it receives a non-local goto",
+        ),
+    ];
+    for (src, expected) in cases {
+        for opt in ["-O0", "-O2"] {
+            let run = compile("diag_always_inline_never_copied", src, &[opt]);
+            assert!(
+                !run.success && run.stderr.contains(expected),
+                "{opt}: expected {expected:?}:\n{}",
+                run.stderr
+            );
+        }
+    }
+    compile_expect_ok(
+        "diag_always_inline_never_copied_unused",
+        "static inline __attribute__((always_inline)) int cg(int n)\n\
+         { void *t[] = { &&a, &&b }; goto *t[n]; a: return 1; b: return 2; }\n\
+         int f(int n) { return n; }\n",
     );
 }
 

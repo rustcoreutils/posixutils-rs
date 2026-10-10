@@ -31,6 +31,7 @@ mod call_args;
 // CET and its ELF note are x86-64 Linux's.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod cf_protection;
+mod compiletime_folds;
 mod complex_fold;
 mod constant_branch;
 mod cross_abi;

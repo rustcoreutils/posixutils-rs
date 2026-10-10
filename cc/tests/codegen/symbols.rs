@@ -1389,3 +1389,73 @@ int main(void)
         );
     }
 }
+
+/// An unused `static inline` function is not emitted because its name is a
+/// word of some asm template, and the block-scope statics of a function
+/// dropped as unused go with it -- at every level, as in gcc. The program
+/// links only if neither leaves its references to undefined symbols behind:
+/// the kernel's `wbinvd`, `rdtsc` and friends were emitted out of line in
+/// every object, and erofs's `xattr_handler_map[]` named handlers that may
+/// not be configured in.
+#[test]
+fn codegen_unused_static_inline_and_its_statics_are_not_emitted() {
+    compile_and_run_everywhere(
+        "unused_static_inline_statics",
+        r#"
+extern void never_defined(void);
+extern const int handler_a, handler_b;
+
+/* Named in an asm template below, referenced by nothing. */
+static inline void wbinvd(void) { never_defined(); }
+
+/* A table, and a static naming it, inside an unused static inline. */
+static inline const int *prefix(unsigned idx)
+{
+    static const int *const map[] = { &handler_a, &handler_b };
+    static const int *const *const outer = map;
+    return idx < 2 ? outer[idx] : 0;
+}
+
+/* Used and inlined: its static stays, and still names `lens`. */
+static int lens[] = { 3, 5, 7 };
+static inline int len_of(unsigned i)
+{
+    static const int *const table = lens;
+    return table[i];
+}
+
+int main(void)
+{
+    __asm__ volatile(".ifdef wbinvd\n.endif\n.ifdef prefix\n.endif" ::: "memory");
+    return len_of(2) == 7 ? 0 : 1;
+}
+"#,
+    );
+}
+
+/// Above -O0 gcc drops any static object nothing refers to -- a file-scope
+/// one, and a plain (non-`inline`) static function with its own statics --
+/// but keeps one marked `used`. At -O0 it emits both, so this links only
+/// when optimizing.
+#[test]
+fn codegen_unreferenced_static_objects_are_dropped_when_optimizing() {
+    let src = r#"
+extern const int handler_a;
+extern void never_defined(void);
+static const int *const file_table[] = { &handler_a };
+static void plain(void)
+{
+    static void (*const hook)(void) = never_defined;
+    hook();
+}
+__attribute__((used)) static int kept = 42;
+int main(void) { return 0; }
+"#;
+    for level in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("unreferenced_static_objects", src, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+    }
+}

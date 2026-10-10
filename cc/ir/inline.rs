@@ -21,7 +21,9 @@ use std::collections::{HashMap, HashSet};
 
 // Inlining Constants
 
-/// Maximum iterations for the inlining pass (handles nested inlining)
+/// Iterations of the inlining pass that consider every call site (handles
+/// nested inlining). Past these, only `always_inline` call sites are
+/// spliced, for as many more iterations as a chain of them takes.
 const MAX_INLINE_ITERATIONS: usize = 3;
 
 /// Functions with this many instructions or fewer are always inlined
@@ -198,39 +200,160 @@ fn isa_allows_inlining(caller: crate::target::X86Isa, callee: crate::target::X86
 }
 
 impl InlineCandidate {
+    /// Why no copy of this function's body can ever be made, in gcc's words
+    /// (`{0}` is the function): a property of the body that no call site
+    /// changes. gcc rejects an `always_inline` function that has one, at
+    /// every level, wherever it is called.
+    fn never_copied(&self) -> Option<&'static str> {
+        if self.defines_varargs_frame {
+            Some("function '{0}' can never be inlined because it uses variable argument lists")
+        } else if self.saves_label_in_static {
+            // Before the computed goto that usually reads the table, as gcc
+            // checks them.
+            Some("function '{0}' can never be copied because it saves address of local label in a static variable")
+        } else if self.has_computed_goto {
+            Some("function '{0}' can never be inlined because it contains a computed goto")
+        } else if self.receives_nonlocal_goto {
+            Some("function '{0}' can never be copied because it receives a non-local goto")
+        } else {
+            None
+        }
+    }
+
     /// Whether no call site can ever substitute this function's body.
     ///
-    /// Every one of these is a property of the *callee* and a reason the body
-    /// cannot be spliced at all, so `__attribute__((always_inline))` on such a
-    /// function is a contradiction -- gcc rejects the program, and
-    /// `opt::check_forwarding_resolved` does too.
-    ///
-    /// The size and stack-safety caps in [`should_inline`] are a different
-    /// thing entirely: c17's own budget, which gcc has no counterpart for. A
-    /// call refused by one of those is an ordinary call that links against the
-    /// out-of-line definition, and diagnosing it rejected programs gcc
-    /// compiles -- a recursive function of any size calling a glibc
-    /// `__fortify_function` was enough.
+    /// Every one of these is a property of the *callee* -- the body cannot
+    /// be spliced at all, or (recursion, an address-valued return,
+    /// `noinline`) is not -- so `__attribute__((always_inline))` on such a
+    /// function is a contradiction, which `opt::check_forwarding_resolved`
+    /// reports as gcc does. Nothing about the *caller* -- its size, its
+    /// recursion -- ever refuses an `always_inline` callee: see
+    /// [`should_inline`].
     fn cannot_be_inlined(&self) -> bool {
-        self.defines_varargs_frame
+        self.never_copied().is_some()
             || self.is_recursive
-            || self.has_computed_goto
-            || self.saves_label_in_static
-            || self.receives_nonlocal_goto
             || self.ret_is_address
             || self.is_noinline
     }
 }
 
-/// The `always_inline` functions no call site can ever substitute.
+/// The `always_inline` functions no call site can ever substitute, each with
+/// gcc's reason when its body can never be copied at all
+/// ([`InlineCandidate::never_copied`]).
 ///
 /// What `opt::check_forwarding_resolved` reports. Asked of the same analysis
 /// the inliner itself uses, so the two cannot drift apart.
-pub(crate) fn impossible_always_inline(module: &Module) -> std::collections::BTreeSet<String> {
+pub(crate) fn impossible_always_inline(
+    module: &Module,
+) -> std::collections::BTreeMap<String, Option<&'static str>> {
     analyze_all_functions(module)
         .into_iter()
-        .filter(|(_, c)| c.is_always_inline && c.cannot_be_inlined())
-        .map(|(name, _)| name)
+        .filter(|(_, c)| c.is_always_inline && !c.is_noinline && c.cannot_be_inlined())
+        .map(|(name, c)| (name, c.never_copied()))
+        .collect()
+}
+
+/// The `always_inline` functions on a cycle of calls among `always_inline`
+/// functions: `a` calls `b` calls `a`. Each splice of one brings in a call to
+/// the other, so forcing them would never end; they are recursive, as a
+/// function that calls itself is. A cycle through any other function ends by
+/// itself, since only `always_inline` calls are spliced without limit.
+///
+/// Tarjan's strongly connected components over that call graph.
+fn always_inline_cycles(module: &Module) -> HashSet<String> {
+    let forced: HashMap<&str, usize> = module
+        .functions
+        .iter()
+        .filter(|f| f.is_always_inline && !f.is_noinline)
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    let names: Vec<&str> = {
+        let mut v = vec![""; forced.len()];
+        for (&name, &i) in &forced {
+            v[i] = name;
+        }
+        v
+    };
+    let edges: Vec<Vec<usize>> = module
+        .functions
+        .iter()
+        .filter(|f| f.is_always_inline && !f.is_noinline)
+        .map(|f| {
+            let mut out: Vec<usize> = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insns)
+                .filter_map(|insn| insn.local_callee())
+                .filter_map(|callee| forced.get(callee).copied())
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .collect();
+
+    struct Tarjan<'a> {
+        edges: &'a [Vec<usize>],
+        index: Vec<Option<usize>>,
+        low: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        next: usize,
+        cyclic: Vec<bool>,
+    }
+    impl Tarjan<'_> {
+        fn visit(&mut self, v: usize) {
+            self.index[v] = Some(self.next);
+            self.low[v] = self.next;
+            self.next += 1;
+            self.stack.push(v);
+            self.on_stack[v] = true;
+            for &w in &self.edges[v] {
+                match self.index[w] {
+                    None => {
+                        self.visit(w);
+                        self.low[v] = self.low[v].min(self.low[w]);
+                    }
+                    Some(iw) if self.on_stack[w] => self.low[v] = self.low[v].min(iw),
+                    Some(_) => {}
+                }
+            }
+            if Some(self.low[v]) == self.index[v] {
+                let mut component = Vec::new();
+                while let Some(w) = self.stack.pop() {
+                    self.on_stack[w] = false;
+                    component.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                // One function alone is a cycle only through itself.
+                let cycle = component.len() > 1 || self.edges[v].contains(&v);
+                for w in component {
+                    self.cyclic[w] = cycle;
+                }
+            }
+        }
+    }
+    let n = names.len();
+    let mut t = Tarjan {
+        edges: &edges,
+        index: vec![None; n],
+        low: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        next: 0,
+        cyclic: vec![false; n],
+    };
+    for v in 0..n {
+        if t.index[v].is_none() {
+            t.visit(v);
+        }
+    }
+    (0..n)
+        .filter(|&v| t.cyclic[v])
+        .map(|v| names[v].to_string())
         .collect()
 }
 
@@ -252,10 +375,12 @@ fn build_call_count_map(module: &Module) -> HashMap<String, usize> {
 /// Analyze all functions in a module for inlineability
 pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate> {
     let call_counts = build_call_count_map(module);
+    let cycles = always_inline_cycles(module);
     let mut candidates = HashMap::with_capacity(module.functions.len());
 
     for func in &module.functions {
-        let candidate = analyze_function(func, &call_counts);
+        let mut candidate = analyze_function(func, &call_counts);
+        candidate.is_recursive |= cycles.contains(&func.name);
         candidates.insert(func.name.clone(), candidate);
     }
 
@@ -353,44 +478,45 @@ fn should_inline(
         return true;
     }
 
+    // `__attribute__((always_inline))` is the mirror of `noinline`: a
+    // directive, not a hint, and in gcc a mandatory one -- a call it cannot
+    // splice is an error, never a call left standing. So it is answered
+    // before anything below: the opt-level bail (gcc honours it at `-O0`),
+    // the size heuristics, and c17's own caps on the caller's size and on a
+    // recursive caller's stack. Those caps left calls the program cannot
+    // link: the kernel's FORTIFY helpers are `extern inline` `gnu_inline`
+    // with no out-of-line copy anywhere, and a static-key `"i"(&key)`
+    // operand is a constant only once spliced, in any recursive function of
+    // a few hundred instructions. Only what makes a splice impossible --
+    // `cannot_be_inlined`, above -- refuses one.
+    //
+    // c17's frames are larger than gcc's, so splicing into a deep recursive
+    // caller costs more stack than gcc's copy does; CPython's
+    // `Include/pyport.h` documents the same trade under gcc at -O0.
+    if candidate.is_always_inline {
+        return true;
+    }
+
     // Consuming a `va_list` is safe to splice, but it is only done on request.
     // Lifting the restriction generally would make every small `va_list`
     // helper inlinable at -O2 -- a large new surface for no correctness gain.
-    if candidate.consumes_va_list && !candidate.is_always_inline {
+    if candidate.consumes_va_list {
         return false;
     }
-
-    // `__attribute__((always_inline))` is the mirror of `noinline`: a
-    // directive, not a hint. gcc honours it at `-O0` too, so it is checked
-    // before the opt-level bail. The disqualifiers above still win -- gcc
-    // rejects the program outright in those cases, where c17 keeps the call.
-    //
-    // It overrides the *desirability* heuristics further down (the size
-    // thresholds and the growth limit), but deliberately not the two
-    // stack-safety caps below it. Those are c17-specific: without register
-    // promotion every inlined copy costs roughly eight bytes of stack, so
-    // obeying the attribute into a deep recursive caller overflows the stack
-    // at a depth the program's own recursion guard believes is safe. CPython
-    // documents the same hazard for gcc in `Include/pyport.h` -- forcing
-    // inlining takes its per-call stack from 6 KB to 15 KB -- and its
-    // `test_isinstance` segfaults when this check is skipped.
-    let forced = candidate.is_always_inline;
 
     // A `weak` definition is interposable: the linker may bind the call to a
     // different definition entirely, so this body is not authoritative and
     // splicing it in is a miscompile whenever the two differ.
     //
-    // After `forced`, deliberately. `always_inline` on a weak function is a
-    // contradiction the program has asked for explicitly, and gcc resolves it
-    // in favour of the attribute; putting interposability in
-    // `cannot_be_inlined` instead would turn that into a hard error from
-    // `opt::check_forwarding_resolved`.
-    if candidate.is_interposable && !forced {
+    // After `always_inline`, deliberately: the attribute on a weak function
+    // is a contradiction the program asked for explicitly, and gcc resolves
+    // it in favour of the attribute.
+    if candidate.is_interposable {
         return false;
     }
 
-    // At -O0, inline nothing but the forced functions.
-    if !opt.inlines_generally() && !forced {
+    // At -O0, inline nothing but the `always_inline` functions.
+    if !opt.inlines_generally() {
         return false;
     }
 
@@ -411,20 +537,6 @@ fn should_inline(
         if estimated_stack > RECURSIVE_CALLER_MAX_STACK {
             return false;
         }
-    }
-
-    // Past the safety caps, a forced callee skips every desirability test --
-    // but the recursive-caller cap above measures the caller as it stands,
-    // which is still small the first time a large callee is spliced into it.
-    // For a forced inline that is the whole risk, so re-check it against the
-    // size the caller is about to become.
-    if forced {
-        if caller_is_recursive
-            && (caller_size + candidate.estimated_size) * 8 > RECURSIVE_CALLER_MAX_STACK
-        {
-            return false;
-        }
-        return true;
     }
 
     // Check if the callee passes size thresholds for inlining desirability
@@ -1537,8 +1649,13 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
     let mut any_changed = false;
     let original_sizes: Vec<usize> = module.functions.iter().map(function_size).collect();
 
-    // Iterate to handle nested inlining
-    for _iteration in 0..MAX_INLINE_ITERATIONS {
+    // Iterate to handle nested inlining: every call site for the first
+    // `MAX_INLINE_ITERATIONS` rounds, then only `always_inline` ones, until a
+    // round splices nothing. That ends: the `always_inline` calls that are
+    // spliced form no cycle (`always_inline_cycles`), so each round shortens
+    // the longest chain of them left.
+    for iteration in 0.. {
+        let forced_only = iteration >= MAX_INLINE_ITERATIONS;
         // Re-analyze functions each iteration
         let candidates = analyze_all_functions(module);
 
@@ -1576,6 +1693,9 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
                         continue;
                     };
                     if let Some(candidate) = candidates.get(callee_name) {
+                        if forced_only && !candidate.is_always_inline {
+                            continue;
+                        }
                         // Don't inline recursive calls
                         if callee_name != caller_name
                             && isa_allows_inlining(caller_isa, candidate.isa)
@@ -1668,9 +1788,26 @@ fn remove_dead_functions(module: &mut Module, only_inline: bool) {
     // to go is not a reference. One round leaves exactly that behind -- an
     // unreferenced `bar` calling `foo` keeps `foo` alive on a count that its
     // own removal has already invalidated.
+    //
+    // The block-scope statics of a removed function go with it unless
+    // something that stays still names them -- an inlined copy of the body
+    // does -- or they are `used`. Their initializers are references in turn,
+    // so removing one may free a function, and the loop runs on. Above -O0
+    // every static object is such a candidate, as gcc drops any it finds
+    // unreferenced; at -O0 gcc emits each file-scope one regardless.
+    let mut orphans: HashSet<String> = if only_inline {
+        HashSet::new()
+    } else {
+        module
+            .globals
+            .iter()
+            .filter(|g| g.is_static)
+            .map(|g| g.name.clone())
+            .collect()
+    };
     loop {
         let referenced = collect_referenced_functions(module);
-        let before = module.functions.len();
+        let before = (module.functions.len(), module.globals.len());
         let mut dead_labels = HashSet::new();
         module.functions.retain(|f| {
             let keep = f.name == "main"
@@ -1685,15 +1822,39 @@ fn remove_dead_functions(module: &mut Module, only_inline: bool) {
                 // backend emits, which is created after this pass runs.
                 || f.constructor.is_some()
                 || f.destructor.is_some();
-            if !keep && f.saves_label_in_static {
-                dead_labels.extend(f.blocks.iter().map(|bb| bb.id.label_symbol(&f.name)));
+            if !keep {
+                if f.saves_label_in_static {
+                    dead_labels.extend(f.blocks.iter().map(|bb| bb.id.label_symbol(&f.name)));
+                }
+                orphans.extend(f.static_locals.iter().cloned());
             }
             keep
         });
         remove_tables_of_dead_labels(module, dead_labels);
-        if module.functions.len() == before {
+        remove_unreferenced_orphans(module, &mut orphans);
+        if (module.functions.len(), module.globals.len()) == before {
             return;
         }
+    }
+}
+
+/// Remove each of `orphans` -- static objects that may have lost their last
+/// reference -- that nothing left in the module names and that is not
+/// `used`, to a
+/// fixpoint: one static's initializer may be all that names another.
+/// What stays named stays in `orphans`, as a removal later may free it.
+fn remove_unreferenced_orphans(module: &mut Module, orphans: &mut HashSet<String>) {
+    loop {
+        let referenced = module.referenced_symbols(orphans);
+        let before = module.globals.len();
+        module.globals.retain(|g| {
+            !orphans.contains(&g.name) || g.symbol_attrs.used || referenced.contains(&g.name)
+        });
+        if module.globals.len() == before {
+            return;
+        }
+        let left: HashSet<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        orphans.retain(|name| left.contains(name.as_str()));
     }
 }
 
@@ -2036,12 +2197,14 @@ mod tests {
     }
 
     /// c17's caps on the caller -- its stack in a recursive function, its
-    /// size in any -- refuse a plain `always_inline` callee, which is then an
-    /// ordinary call. A `__builtin_va_arg_pack` forwarder has no ordinary call
-    /// to fall back on, so they never refuse one; what makes a splice
-    /// impossible still does.
+    /// size in any -- refuse neither an `always_inline` callee, which gcc
+    /// always splices, nor a `__builtin_va_arg_pack` forwarder; both have
+    /// calls nothing can stand in for (the kernel's FORTIFY helpers have no
+    /// out-of-line copy, a static key's `"i"` operand is constant only once
+    /// spliced). They still refuse an ordinary callee, and what makes a
+    /// splice impossible still refuses all of them.
     #[test]
-    fn test_forwarder_ignores_the_caller_caps() {
+    fn test_always_inline_and_forwarders_ignore_the_caller_caps() {
         let forced = InlineCandidate {
             estimated_size: 4,
             is_always_inline: true,
@@ -2051,24 +2214,132 @@ mod tests {
             forwards_caller_arguments: true,
             ..forced.clone()
         };
+        let plain = InlineCandidate {
+            is_always_inline: false,
+            ..forced.clone()
+        };
         let huge = CallerSize::unchanged(HARD_CALLER_SIZE_CAP + 1);
         let recursive_large = CallerSize::unchanged(RECURSIVE_CALLER_MAX_STACK);
         for opt in [opt_at(0), opt_at(2)] {
-            assert!(!should_inline(&forced, opt, huge, false));
-            assert!(!should_inline(&forced, opt, recursive_large, true));
+            assert!(should_inline(&forced, opt, huge, false));
+            assert!(should_inline(&forced, opt, recursive_large, true));
             assert!(should_inline(&forwarder, opt, huge, false));
             assert!(should_inline(&forwarder, opt, recursive_large, true));
+            assert!(!should_inline(&plain, opt, huge, false));
+            assert!(!should_inline(&plain, opt, recursive_large, true));
         }
-        let noinline = InlineCandidate {
-            is_noinline: true,
-            ..forwarder
-        };
-        assert!(!should_inline(
-            &noinline,
-            opt_at(2),
-            CallerSize::unchanged(10),
-            false
-        ));
+        for impossible in [
+            InlineCandidate {
+                is_noinline: true,
+                ..forwarder.clone()
+            },
+            InlineCandidate {
+                is_recursive: true,
+                ..forced.clone()
+            },
+            InlineCandidate {
+                defines_varargs_frame: true,
+                ..forced
+            },
+        ] {
+            assert!(!should_inline(
+                &impossible,
+                opt_at(2),
+                CallerSize::unchanged(10),
+                false
+            ));
+        }
+    }
+
+    /// A function with the given name, `always_inline`, calling `callees`.
+    fn forced_fn(types: &TypeTable, name: &str, callees: &[&str]) -> Function {
+        let mut f = Function::new(name, types.int_id);
+        f.is_static = true;
+        f.is_inline = true;
+        f.is_always_inline = true;
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        for callee in callees {
+            bb.add_insn(Instruction::call(
+                None,
+                callee,
+                vec![],
+                vec![],
+                types.int_id,
+                32,
+            ));
+        }
+        bb.add_insn(Instruction::ret(None));
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        f
+    }
+
+    /// Only a cycle of `always_inline` calls makes its members recursive:
+    /// `a` <-> `b` and `self_rec` are, `top` (which only reaches the cycle)
+    /// and `leaf` are not, and a cycle through an ordinary function is not
+    /// one, since only `always_inline` calls are spliced without limit.
+    #[test]
+    fn test_always_inline_cycles_are_found() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        module
+            .functions
+            .push(forced_fn(&types, "top", &["a", "leaf"]));
+        module.functions.push(forced_fn(&types, "a", &["b"]));
+        module
+            .functions
+            .push(forced_fn(&types, "b", &["a", "leaf"]));
+        module
+            .functions
+            .push(forced_fn(&types, "self_rec", &["self_rec"]));
+        module.functions.push(forced_fn(&types, "leaf", &[]));
+        module
+            .functions
+            .push(forced_fn(&types, "via_plain", &["plain"]));
+        module
+            .functions
+            .push(static_fn(&types, "plain", Some("via_plain")));
+        let mut cycles: Vec<String> = always_inline_cycles(&module).into_iter().collect();
+        cycles.sort();
+        assert_eq!(cycles, ["a", "b", "self_rec"]);
+        let candidates = analyze_all_functions(&module);
+        assert!(candidates["a"].is_recursive && candidates["b"].is_recursive);
+        assert!(!candidates["top"].is_recursive && !candidates["via_plain"].is_recursive);
+    }
+
+    /// A chain of `always_inline` calls longer than the iterations that
+    /// consider every call site is spliced all the way down, at -O0 too: gcc
+    /// leaves no `always_inline` call standing.
+    #[test]
+    fn test_a_long_always_inline_chain_is_spliced_through() {
+        let types = TypeTable::new(&Target::host());
+        let names: Vec<String> = (0..MAX_INLINE_ITERATIONS * 3)
+            .map(|i| format!("f{i}"))
+            .collect();
+        for level in [0, 2] {
+            let mut module = Module::default();
+            let mut main_func = forced_fn(&types, "main", &["f0"]);
+            main_func.is_always_inline = false;
+            main_func.is_static = false;
+            module.functions.push(main_func);
+            // Caller first: each round splices into `main` a callee that has
+            // itself absorbed only one round's worth of the chain, so `main`
+            // needs more rounds than `MAX_INLINE_ITERATIONS`.
+            for (i, name) in names.iter().enumerate() {
+                let callees: Vec<&str> = names.get(i + 1).map(String::as_str).into_iter().collect();
+                module.functions.push(forced_fn(&types, name, &callees));
+            }
+            run(&mut module, opt_at(level));
+            let main_func = module.functions.iter().find(|f| f.name == "main").unwrap();
+            let calls: Vec<&str> = main_func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insns)
+                .filter_map(|i| i.local_callee())
+                .collect();
+            assert!(calls.is_empty(), "-O{level}: left {calls:?}");
+        }
     }
 
     #[test]
@@ -2332,20 +2603,25 @@ mod tests {
         assert_eq!(build_call_count_map(&module).get("strncpy"), None);
     }
 
-    /// A name written into the assembly text reaches the assembler with no IR
-    /// reference at all, so nothing else in this pass can see it.
+    /// A name written into the assembly text is not a reference, as it is not
+    /// to gcc: a static named only there goes unless it is `used`. Counting
+    /// template words kept the kernel's unused `static inline void
+    /// wbinvd(void)` wherever `asm("wbinvd")` appeared.
     #[test]
-    fn test_asm_template_reference_keeps_a_static_alive() {
+    fn test_asm_template_word_does_not_keep_a_static_alive() {
         let types = TypeTable::new(&Target::host());
         let mut module = Module::default();
         module.functions.push(static_fn(&types, "helper", None));
+        let mut used = static_fn(&types, "used_helper", None);
+        used.symbol_attrs.used = true;
+        module.functions.push(used);
 
         let mut main_func = Function::new("main", types.int_id);
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
         let mut asm = Instruction::new(Opcode::Asm);
         asm.extra_mut().asm_data = Some(Box::new(AsmData {
-            template: "call helper".to_string(),
+            template: "call helper; call used_helper".to_string(),
             outputs: Vec::new(),
             inputs: Vec::new(),
             clobbers: Vec::new(),
@@ -2359,10 +2635,93 @@ mod tests {
 
         remove_dead_functions(&mut module, false);
 
-        assert!(
-            module.functions.iter().any(|f| f.name == "helper"),
-            "a static named only in an asm template must survive"
+        let names: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["used_helper", "main"]);
+    }
+
+    /// The block-scope statics of a removed function go with it, to a
+    /// fixpoint through their initializers, at -O0 too; one an inlined copy
+    /// still names, or one marked `used`, stays. Left behind, a static table
+    /// in an unused header inline named objects nothing defines.
+    #[test]
+    fn test_statics_of_a_removed_function_go_with_it() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let mut dead = static_fn(&types, "dead", None);
+        dead.is_inline = true;
+        dead.static_locals = vec![
+            "dead.map.0".to_string(),
+            "dead.outer.1".to_string(),
+            "dead.kept.2".to_string(),
+            "dead.shared.3".to_string(),
+        ];
+        module.functions.push(dead);
+        module.add_global(
+            "dead.map.0",
+            types.int_id,
+            Initializer::SymAddr("handler".to_string()),
         );
+        module.add_global(
+            "dead.outer.1",
+            types.int_id,
+            Initializer::SymAddr("dead.map.0".to_string()),
+        );
+        module.add_global("dead.kept.2", types.int_id, Initializer::Int(1));
+        module.globals.last_mut().unwrap().symbol_attrs.used = true;
+        module.add_global("dead.shared.3", types.int_id, Initializer::Int(2));
+        // A file-scope static nothing names stays at -O0, as in gcc.
+        module.add_global("file_static", types.int_id, Initializer::Int(3));
+        module.globals.last_mut().unwrap().is_static = true;
+
+        // `main` holds an inlined copy's reference to one of them.
+        let mut main_func = Function::new("main", types.int_id);
+        main_func.add_pseudo(Pseudo::sym(PseudoId(1), "dead.shared.3".to_string()));
+        main_func.next_pseudo = 3;
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(Instruction::load(
+            PseudoId(2),
+            PseudoId(1),
+            0,
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::ret(None));
+        main_func.add_block(bb);
+        main_func.entry = BasicBlockId(0);
+        module.functions.push(main_func);
+
+        remove_dead_functions(&mut module, true);
+
+        let names: Vec<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["dead.kept.2", "dead.shared.3", "file_static"]);
+    }
+
+    /// Above -O0 every unreferenced static object goes, as gcc drops them,
+    /// and with it a static function only its initializer named.
+    #[test]
+    fn test_unreferenced_static_objects_go_when_optimizing() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        module
+            .functions
+            .push(static_fn(&types, "only_in_table", None));
+        module.add_global(
+            "table",
+            types.int_id,
+            Initializer::SymAddr("only_in_table".to_string()),
+        );
+        module.globals.last_mut().unwrap().is_static = true;
+        module.add_global("external", types.int_id, Initializer::Int(1));
+
+        remove_dead_functions(&mut module, false);
+
+        assert!(
+            module.functions.is_empty(),
+            "the table was its only reference"
+        );
+        let names: Vec<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["external"]);
     }
 
     /// A `weak` definition may be replaced at link time, so its body is not

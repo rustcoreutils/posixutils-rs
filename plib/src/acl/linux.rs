@@ -10,7 +10,7 @@
 //! Linux: POSIX ACLs in the `system.posix_acl_*` extended attributes, read and written without
 //! libacl; NFSv4 and CIFS ACLs as the attributes the filesystem hands out.
 
-use super::{absent, nfs4_is_trivial, Acl, Native, NativeKind, PosixAcl};
+use super::{absent, nfs4_is_trivial, Acl, Native, NativeKind, PosixAcl, SourceAttrs};
 pub(crate) use crate::xattr::Target;
 use crate::xattr::{self, get, list, on_fd, set};
 use gettextrs::gettext;
@@ -28,10 +28,32 @@ pub fn read(target: &Target) -> io::Result<Acl> {
 }
 
 fn read_listed(target: &Target) -> io::Result<Acl> {
-    let names = match list(target) {
-        Err(e) if absent(&e) => return Ok(Acl::default()),
-        names => names?,
-    };
+    match list(target) {
+        Err(e) if absent(&e) => Ok(Acl::default()),
+        names => from_listing(target, &names?),
+    }
+}
+
+/// `super::read_attrs`: the ACLs and, where `xattrs`, the other extended attributes of the
+/// file open on `fd`, from one listing of its attributes.
+pub fn read_attrs(fd: RawFd, xattrs: bool) -> io::Result<SourceAttrs> {
+    on_fd(fd, |target| {
+        let names = match list(target) {
+            Err(e) if absent(&e) => return Ok(SourceAttrs::default()),
+            names => names?,
+        };
+        Ok(SourceAttrs {
+            acl: from_listing(target, &names)?,
+            xattrs: match xattrs {
+                true => xattr::read_listed(&names, |name| get(target, name)),
+                false => xattr::Values::default(),
+            },
+        })
+    })
+}
+
+/// The ACLs of `target`, whose attributes `names` lists, each ending in a NUL.
+fn from_listing(target: &Target, names: &[u8]) -> io::Result<Acl> {
     let listed = |name: &CStr| -> io::Result<Option<Vec<u8>>> {
         if !names.split(|&b| b == 0).any(|n| n == name.to_bytes()) {
             return Ok(None);

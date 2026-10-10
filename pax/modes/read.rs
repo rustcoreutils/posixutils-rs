@@ -16,7 +16,7 @@ use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, link_replacing_with, make_dir_at, set_attrs_fd,
     set_made_node_attrs_recording, unlink_at, AttrPolicy, Attrs, DirAttrs, DirTree, Expected,
-    MemberPath, PendingDirs,
+    MemberPath, PendingDirs, Xattrs,
 };
 use crate::modes::pins::{MadeFile, Making, PinBudget};
 use crate::modes::select::Selector;
@@ -50,6 +50,8 @@ pub struct ReadOptions {
     pub preserve_atime: bool,
     /// Preserve owner (requires privileges)
     pub preserve_owner: bool,
+    /// Preserve extended attributes (`-p e` alone)
+    pub preserve_xattrs: bool,
     /// Interactive rename mode
     pub interactive: bool,
     /// Update mode - only extract if archive member is newer
@@ -91,6 +93,7 @@ impl Default for ReadOptions {
             preserve_mtime: true,
             preserve_atime: true,
             preserve_owner: false,
+            preserve_xattrs: false,
             interactive: false,
             update: false,
             update_final_name: false,
@@ -1334,7 +1337,8 @@ fn owner_ids(entry: &ArchiveEntry) -> (u32, u32) {
 ///
 /// The owner is only ever applied under `-p o`, so only then are the user and
 /// group databases consulted for it: a lookup per member is not free. Nor is
-/// reading its ACLs (a lookup per name in them), done only under `-p p`. Each
+/// reading its ACLs (a lookup per name in them), done only under `-p p`, nor
+/// decoding its extended attributes, done only under `-p e`. Each
 /// is done once per member, where the attributes are applied.
 fn attrs_of(entry: &ArchiveEntry, options: &ReadOptions) -> Attrs {
     let mut attrs = recorded_attrs(entry);
@@ -1343,6 +1347,16 @@ fn attrs_of(entry: &ArchiveEntry, options: &ReadOptions) -> Attrs {
     }
     if options.preserve_perms {
         attrs.acl = member_acl(entry);
+    }
+    // Only `user.` attributes, as GNU tar restores: the rest are dropped
+    // without a word, as it drops them.
+    if options.preserve_xattrs {
+        let keep = plib::xattr::is_restored_from_archive;
+        attrs.xattrs =
+            crate::formats::pax::decode_xattrs(&entry.xattrs, keep).map(|values| Xattrs {
+                of: entry.path.clone(),
+                values,
+            });
     }
     attrs
 }
@@ -1359,6 +1373,7 @@ fn recorded_attrs(entry: &ArchiveEntry) -> Attrs {
         atime: entry.atime,
         atime_nsec: entry.atime_nsec as i64,
         acl: Ok(plib::acl::Acl::default()),
+        xattrs: Ok(Xattrs::default()),
     }
 }
 
@@ -1403,6 +1418,7 @@ fn policy_of(options: &ReadOptions) -> AttrPolicy {
         preserve_perms: options.preserve_perms,
         preserve_mtime: options.preserve_mtime,
         preserve_atime: options.preserve_atime,
+        preserve_xattrs: options.preserve_xattrs,
         umask: options.umask,
     }
 }

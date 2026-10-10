@@ -58,8 +58,17 @@ pub fn is_copied(name: &[u8]) -> bool {
 /// (`owner_kept`) or not: `is_copied`, but a file capability (`security.capability`) only to
 /// a copy owned as the source is -- one whose owner could not be given, as its set-user-ID
 /// and set-group-ID bits are withheld, gets none.
-fn is_copied_to(name: &[u8], owner_kept: bool) -> bool {
+pub fn is_copied_to(name: &[u8], owner_kept: bool) -> bool {
     is_copied(name) && (owner_kept || name != b"security.capability")
+}
+
+/// Whether the attribute `name` an archive records is restored from it: a `user.` one only
+/// (that `is_copied` admits), as GNU tar --xattrs restores by default, even for root. The
+/// others -- `security.capability`, `security.selinux`, `trusted.`, `system.` -- say what
+/// privilege or which policy a file has, which is not an archive's to grant; a copy of a file
+/// on disk (`copy_fd`) takes them by `is_copied_to` instead.
+pub fn is_restored_from_archive(name: &[u8]) -> bool {
+    name.starts_with(b"user.") && is_copied(name)
 }
 
 /// Whether `e` says the file can hold no extended attribute, or none of that name.
@@ -69,7 +78,7 @@ pub fn unsupported(e: &io::Error) -> bool {
 }
 
 /// Whether `e` says the file has no attribute of the name asked.
-fn no_such_attr(e: &io::Error) -> bool {
+pub fn no_such_attr(e: &io::Error) -> bool {
     #[cfg(target_os = "linux")]
     let code = Some(libc::ENODATA);
     #[cfg(target_os = "macos")]
@@ -105,6 +114,46 @@ pub fn set_fd(fd: RawFd, name: &CStr, value: &[u8]) -> io::Result<()> {
 /// Remove the extended attribute `name` of the file open on `fd`.
 pub fn remove_fd(fd: RawFd, name: &CStr) -> io::Result<()> {
     sys::remove_fd(fd, name)
+}
+
+/// The extended attributes of a file, each that `is_copied` admits, read to be copied later
+/// or archived (`read_fd`).
+#[derive(Debug, Default)]
+pub struct Values {
+    /// Each one read, with its value, in the order the system listed them.
+    pub read: Vec<(CString, Vec<u8>)>,
+    /// Each one listed that could not be read, and why.
+    pub unread: Vec<(CString, io::Error)>,
+}
+
+/// The extended attributes of the file open on `fd` (`Values`), `O_PATH` or not (Linux,
+/// through procfs as `copy_fd` reads one). A file with none costs one call; where it can
+/// hold none at all (`unsupported`), it has none.
+pub fn read_fd(fd: RawFd) -> io::Result<Values> {
+    match sys::list_fd(fd) {
+        Err(e) if unsupported(&e) => Ok(Values::default()),
+        Err(e) => Err(e),
+        Ok(names) => Ok(read_listed(&names, |name| get_fd(fd, name))),
+    }
+}
+
+/// The values of the attributes `names` lists, each ending in a NUL as the system lists
+/// them, that `is_copied` admits, each read by `get`. One gone since it was listed, or
+/// refused as unsupported, is left out.
+pub(crate) fn read_listed(names: &[u8], get: impl Fn(&CStr) -> io::Result<Vec<u8>>) -> Values {
+    let mut values = Values::default();
+    for name in names
+        .split(|&b| b == 0)
+        .filter(|name| !name.is_empty() && is_copied(name))
+    {
+        let name = CString::new(name).expect("split at every NUL");
+        match get(&name) {
+            Ok(value) => values.read.push((name, value)),
+            Err(e) if no_such_attr(&e) || unsupported(&e) => {}
+            Err(e) => values.unread.push((name, e)),
+        }
+    }
+    values
 }
 
 /// What `copy_fd` could not copy.
@@ -588,6 +637,28 @@ mod tests {
         assert!(!super::is_copied_to(b"security.capability", false));
         assert!(super::is_copied_to(b"user.foo", false));
         assert!(!super::is_copied_to(b"system.posix_acl_access", true));
+    }
+
+    /// Only a `user.` attribute is restored from an archive.
+    #[test]
+    fn only_user_attributes_are_restored_from_an_archive() {
+        use super::is_restored_from_archive;
+        for name in [&b"user.foo"[..], b"user.", b"user.\xff"] {
+            assert!(is_restored_from_archive(name));
+        }
+        for name in [
+            &b"security.capability"[..],
+            b"security.selinux",
+            b"trusted.foo",
+            b"system.posix_acl_access",
+            b"com.apple.quarantine",
+            b"user",
+            b"User.foo",
+            b"user.Beagle.x",
+            b"",
+        ] {
+            assert!(!is_restored_from_archive(name));
+        }
     }
 
     /// A value is copied whole, a piece at a time, none larger than `CHUNK`; one that shrank

@@ -706,6 +706,27 @@ Debian source packages, with GNU patch's meaning:
    file-creation action, so on Linux under a default ACL it takes the ACL
    inherited from that, masked by its archived mode, and the umask plays no
    part.
+ * Extended attributes.  `-x pax` always records each extended attribute of
+   a file, directory, special file or symbolic link that cp `-a` copies (see
+   [cp, extended attributes under `-a`](#extended-attributes-under--a)) as a
+   `SCHILY.xattr.<name>` record holding the value as it stands, as GNU tar
+   `--xattrs` writes it, a `%` in the name spelled `%25` and a `=` `%3D`.
+   ustar and cpio have no place for one, and get none.  Reading takes those
+   records and libarchive's `LIBARCHIVE.xattr.<name>` ones (the name
+   %-encoded, the value base64), the latter where both name one attribute;
+   one in a global `g` header is not applied, as neither GNU tar nor
+   libarchive applies it.  Only `-p e` restores them, in copy mode too: on
+   each member pax made or may give its mode, after its owner and before its
+   mode and ACLs, and on a symbolic link the link itself.  From an archive
+   only `user.` attributes are restored, even by root, as GNU tar `--xattrs`
+   restores them; the rest (`security.capability`, `security.selinux`,
+   `trusted.*`) are dropped without a word, as GNU drops them.  Copy mode
+   reads files, not an archive, and copies every attribute cp `-a` copies, a
+   file capability only to a copy given the source's owner.  One the
+   destination cannot hold is lost silently; any other failure is a warning
+   naming the member and leaves the exit status alone, as with GNU tar.  A record that does not decode, a value over 64
+   KiB (but a macOS resource fork's), or names together over 64 KiB, is
+   diagnosed, the member gets none, and the exit status is 1.
  * `-x bcpio`, `-x sv4cpio`, `-x sv4crc` — the historic pax names for the old
    binary cpio header and the SVR4 "newc" headers without and with a data
    checksum.  POSIX names only `cpio` (odc), `pax` and `ustar`.  All three are

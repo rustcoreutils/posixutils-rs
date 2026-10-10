@@ -333,6 +333,62 @@ pub fn read_opened(fd: &crate::xattr::EntryFd) -> io::Result<Acl> {
     }
 }
 
+/// The ACLs of a source and its other extended attributes, read together
+/// (`read_source_attrs`).
+#[derive(Debug, Default)]
+pub struct SourceAttrs {
+    pub acl: Acl,
+    /// Each extended attribute `xattr::is_copied` admits: none of the ACL ones.
+    pub xattrs: crate::xattr::Values,
+}
+
+/// `read_source_fd`, and where `xattrs` the source's other extended attributes with its ACLs,
+/// from the one listing of its attributes that reading its ACLs takes on Linux: a file with
+/// neither, the usual case, costs one call there.
+pub fn read_source_attrs(fd: RawFd, xattrs: bool) -> io::Result<SourceAttrs> {
+    match read_attrs(fd, xattrs) {
+        Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => Ok(SourceAttrs::default()),
+        read => read,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_attrs(fd: RawFd, xattrs: bool) -> io::Result<SourceAttrs> {
+    sys::read_attrs(fd, xattrs)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_attrs(fd: RawFd, xattrs: bool) -> io::Result<SourceAttrs> {
+    Ok(SourceAttrs {
+        acl: read_fd(fd)?,
+        xattrs: match xattrs {
+            true => crate::xattr::read_fd(fd)?,
+            false => crate::xattr::Values::default(),
+        },
+    })
+}
+
+/// `read_source_attrs` of the file `xattr::open_entry` opened, as `read_opened` reads its
+/// ACLs: a special file's, where there is no procfs to read them through, are none.
+pub fn read_opened_attrs(fd: &crate::xattr::EntryFd, xattrs: bool) -> io::Result<SourceAttrs> {
+    use std::os::unix::io::AsRawFd;
+    match read_source_attrs(fd.as_raw_fd(), xattrs) {
+        Err(e) if fd.is_special() && crate::xattr::no_procfs_route(&e) => {
+            Ok(SourceAttrs::default())
+        }
+        read => read,
+    }
+}
+
+/// `read_opened_attrs` of the file a tree walk recorded at `entry`, as `read_entry` reads its
+/// ACLs; `None` when the file opened is not the one recorded.
+pub fn read_entry_attrs(entry: &ftw::Entry, xattrs: bool) -> io::Result<Option<SourceAttrs>> {
+    match crate::xattr::open_entry(entry)? {
+        Some(fd) => read_opened_attrs(&fd, xattrs).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// The extended attribute `name` of the file open on `fd`, `O_PATH` or not (`read_fd`).
 /// Elsewhere than Linux none is read: EOPNOTSUPP.
 pub fn read_xattr(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {

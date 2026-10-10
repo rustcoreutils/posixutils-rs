@@ -19,7 +19,7 @@ use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     attrs_withheld, create_replacing, file_id, link_replacing_with, make_dir_at, restore_atime,
     restore_dir_atime, set_attrs_fd, set_made_node_attrs, AttrPolicy, Attrs, DirAttrs, DirTree,
-    Expected, MemberPath, PendingDirs,
+    Expected, MemberPath, PendingDirs, Xattrs,
 };
 use crate::modes::followed_link;
 use crate::modes::pins::{MadeFile, PinBudget};
@@ -51,6 +51,8 @@ pub struct CopyOptions {
     pub preserve_atime: bool,
     /// Preserve owner and group
     pub preserve_owner: bool,
+    /// Preserve extended attributes (`-p e` alone)
+    pub preserve_xattrs: bool,
     /// Create hard links instead of copying
     pub link: bool,
     /// Follow symlinks on command line
@@ -416,7 +418,7 @@ impl CopyWalk<'_> {
                 .ok_or_else(|| {
                     PaxError::InvalidHeader("symbolic link with no target".to_string())
                 })?;
-            copy_symlink(target, pfd, name, metadata, self.options)?;
+            copy_symlink(entry, target, pfd, name, metadata, self.options)?;
         } else if metadata.is_file() {
             copy_file(
                 entry,
@@ -538,8 +540,8 @@ impl CopyWalk<'_> {
 
         match decided {
             DirAttrs::Apply(id) => {
-                let read = || plib::acl::read_entry(entry);
-                let attrs = with_acl(attrs_of(metadata), self.options, read);
+                let read = |xattrs| plib::acl::read_entry_attrs(entry, xattrs);
+                let attrs = with_source_attrs(attrs_of(metadata), self.options, src, read);
                 self.pending_dirs.borrow_mut().push(&mp, id, attrs);
             }
             // Copied into all the same.
@@ -745,18 +747,20 @@ fn copy_special_file(
     // not necessarily the mode on disk; and neither carries ownership, times or
     // set-id bits. Extraction restores those here, so a copy must too --
     // through the node just made, never by name.
-    // Its ACLs too, on Linux, where the node is pinned (`MadeNode`). Elsewhere
-    // nothing pins it, and reading the source's would open it: as cp -p, the
-    // copy keeps the mode alone.
+    // Its ACLs and extended attributes too, on Linux, where the node is
+    // pinned (`MadeNode`). Elsewhere nothing pins it, and reading the source's
+    // would open it: as cp -p, the copy keeps the mode alone.
     let mut attrs = attrs_of(metadata);
     if cfg!(target_os = "linux") {
-        attrs = with_acl(attrs, options, || plib::acl::read_entry(entry));
+        let read = |xattrs| plib::acl::read_entry_attrs(entry, xattrs);
+        attrs = with_source_attrs(attrs, options, entry.path().as_inner(), read);
     }
     set_made_node_attrs(dirfd, name, made_type, &attrs, &policy_of(options))
 }
 
 /// Copy a symlink
 fn copy_symlink(
+    entry: &ftw::Entry<'_>,
     target: PathBuf,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
@@ -778,8 +782,13 @@ fn copy_symlink(
     }
 
     // A symlink's own mode is meaningless, so only owner and times are
-    // restored.
-    let (attrs, policy) = (attrs_of(metadata), policy_of(options));
+    // restored -- and under -p e its extended attributes, on Linux, where the
+    // link is pinned to read them (`plib::xattr::open_entry`) and to set them.
+    let (mut attrs, policy) = (attrs_of(metadata), policy_of(options));
+    if cfg!(target_os = "linux") && options.preserve_xattrs {
+        let read = |xattrs| plib::acl::read_entry_attrs(entry, xattrs);
+        attrs = with_source_attrs(attrs, options, entry.path().as_inner(), read);
+    }
     set_made_node_attrs(dirfd, name, libc::S_IFLNK, &attrs, &policy)
 }
 
@@ -933,8 +942,9 @@ fn do_copy_file(
         restore_atime(src_file.as_fd(), entry.path().as_inner(), metadata);
     }
 
-    let attrs = with_acl(attrs_of(metadata), options, || {
-        plib::acl::read_source_fd(src_file.as_raw_fd()).map(Some)
+    let source = entry.path();
+    let attrs = with_source_attrs(attrs_of(metadata), options, source.as_inner(), |xattrs| {
+        plib::acl::read_source_attrs(src_file.as_raw_fd(), xattrs).map(Some)
     });
     set_attrs_fd(dest_file.as_fd(), &attrs, &policy_of(options))?;
     // Known once its attributes are set, which change its ctime.
@@ -1050,24 +1060,53 @@ fn attrs_of(metadata: &ftw::Metadata) -> Attrs {
         atime: Some(metadata.atime()),
         atime_nsec: metadata.atime_nsec(),
         acl: Ok(plib::acl::Acl::default()),
+        xattrs: Ok(Xattrs::default()),
     }
 }
 
-/// `attrs` with the ACLs of their source, which `read` reads through a
-/// descriptor checked to be the file the walk recorded (`None` when it is
-/// not), where -p p is to give them to the copy (`set_preserved_mode`), as
-/// cp -p does; the reason, where they cannot be read.
-fn with_acl(
+/// `attrs` with the ACLs of their source where -p p is to give them to the
+/// copy (`set_preserved_mode`), as cp -p does, and its extended attributes
+/// where -p e is (`set_xattrs`), as cp -a does: `read` reads them, the
+/// extended attributes only when handed `true`, through a descriptor checked
+/// to be the file the walk recorded (`None` when it is not). The reason,
+/// where they cannot be read; an attribute that alone cannot be is left out,
+/// as cp -a leaves it. A failure to set one is reported under `src`. Every
+/// one `plib::xattr::is_copied_to` admits is copied, as cp -a copies it: a
+/// file on disk, unlike an archive, says what it holds.
+fn with_source_attrs(
     mut attrs: Attrs,
     options: &CopyOptions,
-    read: impl FnOnce() -> std::io::Result<Option<plib::acl::Acl>>,
+    src: &Path,
+    read: impl FnOnce(bool) -> std::io::Result<Option<plib::acl::SourceAttrs>>,
 ) -> Attrs {
-    if options.preserve_perms {
-        attrs.acl = match read() {
-            Ok(Some(acl)) => Ok(acl),
-            Ok(None) => Err(gettextrs::gettext("source file changed as it was read")),
-            Err(e) => Err(e.to_string()),
-        };
+    if !options.preserve_perms && !options.preserve_xattrs {
+        return attrs;
+    }
+    let read = match read(options.preserve_xattrs) {
+        Ok(Some(read)) => Ok(read),
+        Ok(None) => Err(gettextrs::gettext("source file changed as it was read")),
+        Err(e) => Err(e.to_string()),
+    };
+    match read {
+        Ok(read) => {
+            if options.preserve_perms {
+                attrs.acl = Ok(read.acl);
+            }
+            if options.preserve_xattrs {
+                attrs.xattrs = Ok(Xattrs {
+                    of: src.to_path_buf(),
+                    values: read.xattrs.read,
+                });
+            }
+        }
+        Err(reason) => {
+            if options.preserve_perms {
+                attrs.acl = Err(reason.clone());
+            }
+            if options.preserve_xattrs {
+                attrs.xattrs = Err(reason);
+            }
+        }
     }
     attrs
 }
@@ -1081,6 +1120,7 @@ fn policy_of(options: &CopyOptions) -> AttrPolicy {
         preserve_perms: options.preserve_perms,
         preserve_mtime: options.preserve_mtime,
         preserve_atime: options.preserve_atime,
+        preserve_xattrs: options.preserve_xattrs,
         umask: options.umask,
     }
 }

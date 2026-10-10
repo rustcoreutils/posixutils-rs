@@ -490,7 +490,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
                 .ok_or_else(|| {
                     PaxError::InvalidHeader("symbolic link with no target".to_string())
                 })?;
-            write_symlink(archive, &archive_path, metadata, target)?;
+            write_symlink(archive, entry, &archive_path, metadata, target)?;
         } else if metadata.is_file() {
             write_file(
                 archive,
@@ -519,8 +519,8 @@ fn write_dir_entry<W: ArchiveWriter>(
     metadata: &ftw::Metadata,
 ) -> PaxResult<()> {
     let mut dir_entry = build_entry(archive_path, metadata, EntryType::Directory)?;
-    add_acls(&*archive, &mut dir_entry, source, || {
-        plib::acl::read_entry(source)
+    add_attrs(&*archive, &mut dir_entry, source, || {
+        plib::acl::read_entry_attrs(source, true)
     });
     archive.write_entry(&dir_entry)?;
     archive.finish_entry()
@@ -529,6 +529,7 @@ fn write_dir_entry<W: ArchiveWriter>(
 /// Write a symlink
 fn write_symlink<W: ArchiveWriter>(
     archive: &mut W,
+    source: &ftw::Entry<'_>,
     archive_path: &Path,
     metadata: &ftw::Metadata,
     target: PathBuf,
@@ -547,6 +548,10 @@ fn write_symlink<W: ArchiveWriter>(
     if archive.needs_data_checksum() {
         entry.data_checksum = Some(checksum_bytes(0, &target_bytes));
     }
+    // Its extended attributes, the link's own, as GNU tar archives them.
+    add_attrs(&*archive, &mut entry, source, || {
+        plib::acl::read_entry_attrs(source, true)
+    });
 
     archive.write_entry(&entry)?;
     // Write the symlink target as data (needed for cpio format)
@@ -599,8 +604,8 @@ fn write_special<W: ArchiveWriter>(
     };
 
     let mut entry = build_entry(path, metadata, entry_type)?;
-    add_acls(&*archive, &mut entry, source, || {
-        plib::acl::read_entry(source)
+    add_attrs(&*archive, &mut entry, source, || {
+        plib::acl::read_entry_attrs(source, true)
     });
     archive.write_entry(&entry)?;
     archive.finish_entry()?;
@@ -725,9 +730,9 @@ fn write_file<W: ArchiveWriter>(
         entry.data_checksum = Some(file_checksum(&mut file)?);
         file.rewind()?;
     }
-    // Its ACLs, read through the same descriptor.
-    add_acls(&*archive, &mut entry, entry_ref, || {
-        plib::acl::read_source_fd(file.as_raw_fd()).map(Some)
+    // Its ACLs and extended attributes, read through the same descriptor.
+    add_attrs(&*archive, &mut entry, entry_ref, || {
+        plib::acl::read_source_attrs(file.as_raw_fd(), true).map(Some)
     });
 
     // Write regular file
@@ -750,20 +755,23 @@ fn write_file<W: ArchiveWriter>(
     Ok(())
 }
 
-/// Give `member` the ACLs of its source, the file the walk recorded at `source`, where the
-/// archive has a place for them (`supports_acls`): a POSIX.1e access ACL only where it says
-/// more than the mode, a default ACL only on a directory, an NFSv4-style one -- macOS's, or a
-/// Linux NFSv4 mount's -- only where it says more than the mode (`plib::acl::Acl::nfs4_text`).
-/// `read` reads them through a descriptor already checked to be that file, `None` when it is
-/// not. A failure to read them is reported, and the member written without them.
+/// Give `member` the ACLs and the extended attributes of its source, the file the walk
+/// recorded at `source`, where the archive has a place for them (`supports_acls`). Of the
+/// ACLs: a POSIX.1e access ACL only where it says more than the mode, a default ACL only on a
+/// directory, an NFSv4-style one -- macOS's, or a Linux NFSv4 mount's -- only where it says
+/// more than the mode (`plib::acl::Acl::nfs4_text`); none for a symbolic link. Of the
+/// extended attributes: each `plib::xattr::is_copied` admits (`add_xattrs`). `read` reads
+/// them through a descriptor already checked to be that file, `None` when it is not. A
+/// failure to read them is reported, and the member written without them.
 ///
-/// Only Linux and macOS have ACLs to read. On macOS a FIFO or device cannot be opened to read
-/// its ACL without acting on it, so only a directory's and a regular file's are read there.
-fn add_acls<W: ArchiveWriter>(
+/// Only Linux and macOS have them to read. On macOS a FIFO, device or symbolic link cannot be
+/// opened to read them without acting on it, so only a directory's and a regular file's are
+/// read there.
+fn add_attrs<W: ArchiveWriter>(
     archive: &W,
     member: &mut ArchiveEntry,
     source: &ftw::Entry<'_>,
-    read: impl FnOnce() -> std::io::Result<Option<plib::acl::Acl>>,
+    read: impl FnOnce() -> std::io::Result<Option<plib::acl::SourceAttrs>>,
 ) {
     let readable = if cfg!(target_os = "linux") {
         true
@@ -777,19 +785,27 @@ fn add_acls<W: ArchiveWriter>(
     }
     let path = source.path();
     let report = |reason: String| crate::error::report_error(path.as_inner(), reason);
-    let acl = match read() {
-        Ok(Some(acl)) => acl,
+    let attrs = match read() {
+        Ok(Some(attrs)) => attrs,
         Ok(None) => {
             report(gettextrs::gettext(
-                "cannot read ACL: file changed as we read it",
+                "cannot read ACL or extended attributes: file changed as we read it",
             ));
             return;
         }
         Err(e) => {
-            report(format!("{}: {e}", gettextrs::gettext("cannot read ACL")));
+            report(format!(
+                "{}: {e}",
+                gettextrs::gettext("cannot read ACL or extended attributes")
+            ));
             return;
         }
     };
+    add_xattrs(member, attrs.xattrs, &report);
+    if member.entry_type == EntryType::Symlink {
+        return;
+    }
+    let acl = attrs.acl;
     match acl.nfs4_text(member.mode) {
         Ok(ace) => member.acl_ace = ace,
         Err(e) => {
@@ -803,6 +819,48 @@ fn add_acls<W: ArchiveWriter>(
         .map(|access| access.to_text());
     if member.is_dir() {
         member.acl_default = acl.default.map(|default| default.to_text());
+    }
+}
+
+/// The most bytes of extended attribute values one member carries: the extended header's
+/// limit, less room for its other records. Only a macOS resource fork, which
+/// `XATTR_VALUE_MAX` does not bound, comes near it.
+const XATTR_BYTES_MAX: u64 = crate::formats::MAX_EXTENDED_HEADER - (1 << 20);
+
+/// Give `member` the extended attributes `xattrs` read from its source, each as a
+/// `SCHILY.xattr.<name>` record holding the value as it stands and the name as GNU tar
+/// --xattrs spells it (`formats::pax::schily_encode`) -- each a reader takes back
+/// (`formats::pax::decode_xattrs`). Left out and reported: one that could not be read; one
+/// larger than a reader takes.
+fn add_xattrs(member: &mut ArchiveEntry, xattrs: plib::xattr::Values, report: &dyn Fn(String)) {
+    use crate::formats::pax::{schily_encode, RESOURCE_FORK, XATTR_VALUE_MAX};
+    let lossy = |name: &std::ffi::CStr| String::from_utf8_lossy(name.to_bytes()).into_owned();
+    for (name, e) in xattrs.unread {
+        report(format!(
+            "{} {}: {e}",
+            gettextrs::gettext("cannot read extended attribute"),
+            lossy(&name)
+        ));
+    }
+    let mut bytes = 0u64;
+    for (name, value) in xattrs.read {
+        let name_bytes = name.to_bytes();
+        let too_large = (value.len() > XATTR_VALUE_MAX && name_bytes != RESOURCE_FORK)
+            || bytes + value.len() as u64 > XATTR_BYTES_MAX;
+        if too_large {
+            report(format!(
+                "{} {}: {}",
+                gettextrs::gettext("cannot archive extended attribute"),
+                lossy(&name),
+                gettextrs::gettext("value too large")
+            ));
+            continue;
+        }
+        bytes += value.len() as u64;
+        member.xattrs.push(crate::archive::XattrRecord {
+            keyword: [b"SCHILY.xattr.".as_slice(), &schily_encode(name_bytes)].concat(),
+            value,
+        });
     }
 }
 

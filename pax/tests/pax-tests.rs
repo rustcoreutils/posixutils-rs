@@ -25,3 +25,5 @@ mod special;
 mod subst;
 mod tar;
 mod update;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod xattr;

@@ -471,6 +471,7 @@ fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         preserve_mtime: should_preserve_mtime(&args.privs),
         preserve_atime: should_preserve_atime(&args.privs),
         preserve_owner: should_preserve_owner(&args.privs),
+        preserve_xattrs: should_preserve_xattrs(&args.privs),
         interactive: args.interactive,
         update: args.update,
         update_final_name: args.update_final_name,
@@ -741,6 +742,7 @@ fn run_copy(args: &Args, name_lists: Vec<NameList>) -> PaxResult<()> {
         preserve_mtime: should_preserve_mtime(&args.privs),
         preserve_atime: should_preserve_atime(&args.privs),
         preserve_owner: should_preserve_owner(&args.privs),
+        preserve_xattrs: should_preserve_xattrs(&args.privs),
         link: args.link,
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,
@@ -1097,6 +1099,12 @@ fn should_preserve_perms(privs: &[String]) -> bool {
     parse_privs(privs).2
 }
 
+/// Check if extended attributes should be preserved: only `e` asks for them,
+/// and no later character takes them back.
+fn should_preserve_xattrs(privs: &[String]) -> bool {
+    privs.iter().any(|s| s.contains('e'))
+}
+
 /// Check if modification time should be preserved
 fn should_preserve_mtime(privs: &[String]) -> bool {
     parse_privs(privs).1
@@ -1258,6 +1266,10 @@ mod tests {
         assert!(should_preserve_mtime(&p(&["e"])));
         assert!(should_preserve_perms(&p(&["e"])));
         assert!(should_preserve_owner(&p(&["e"])));
+        assert!(should_preserve_xattrs(&p(&["e"])));
+        assert!(should_preserve_xattrs(&p(&["ea"])));
+        assert!(!should_preserve_xattrs(&p(&["pom"])));
+        assert!(!should_preserve_xattrs(&[]));
 
         // Combined flags
         assert!(!should_preserve_atime(&p(&["am"])));

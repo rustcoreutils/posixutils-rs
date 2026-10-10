@@ -1857,6 +1857,19 @@ pub(crate) struct Attrs {
     /// beyond the mode where the source has none, as is all that is known
     /// without `-p p`; the reason, where the source's could not be read.
     pub acl: Result<plib::acl::Acl, String>,
+    /// The extended attributes `-p e` gives it after its owner (`set_xattrs`):
+    /// none where the source has none, as is all that is known without `-p e`;
+    /// the reason, where the source's could not be read.
+    pub xattrs: Result<Xattrs, String>,
+}
+
+/// The extended attributes a file takes from its source (`Attrs::xattrs`).
+#[derive(Default)]
+pub(crate) struct Xattrs {
+    /// The name a failure to set one is reported under.
+    pub of: PathBuf,
+    /// Each, with its value.
+    pub values: Vec<(CString, Vec<u8>)>,
 }
 
 /// Which of those attributes the user asked to keep (`-p`).
@@ -1865,6 +1878,8 @@ pub(crate) struct AttrPolicy {
     pub preserve_perms: bool,
     pub preserve_mtime: bool,
     pub preserve_atime: bool,
+    /// `-p e` alone: the extended attributes.
+    pub preserve_xattrs: bool,
     pub umask: u32,
 }
 
@@ -2036,6 +2051,13 @@ fn set_attrs_with(
     let owner_set = policy.preserve_owner
         && set_owner(attrs.uid, attrs.gid, |uid, gid| cvt(target.chown(uid, gid)))?;
 
+    // Then the extended attributes, on what takes the mode: a chown clears a
+    // file capability.
+    let mut xattrs_failed = None;
+    if with_mode && policy.preserve_xattrs {
+        xattrs_failed = set_xattrs(Some(target.fd().as_raw_fd()), &attrs.xattrs, owner_set);
+    }
+
     let mut acl_failed = None;
     if with_mode {
         let chmod = |mode: u32| cvt(target.chmod(mode as libc::mode_t));
@@ -2063,13 +2085,81 @@ fn set_attrs_with(
         }
     }
 
-    acl_failed.map_or(Ok(()), |e| Err(acl_error(e)))
+    attr_failure(xattrs_failed, acl_failed)
 }
 
-/// The failure to give a member its ACLs (`set_preserved_mode`), in the
-/// words of pax's other attribute failures.
-fn acl_error(e: std::io::Error) -> PaxError {
-    PaxError::Io(std::io::Error::other(format!("cannot set ACL: {e}")))
+/// The failure to give a member its extended attributes (`set_xattrs`) or its
+/// ACLs (`set_preserved_mode`), in the words of pax's other attribute
+/// failures; `Ok` where there was neither.
+fn attr_failure(xattrs: Option<String>, acl: Option<std::io::Error>) -> PaxResult<()> {
+    let reasons: Vec<String> = [
+        xattrs.map(|reason| format!("cannot set extended attributes: {reason}")),
+        acl.map(|e| format!("cannot set ACL: {e}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(PaxError::Io(std::io::Error::other(reasons.join("; "))))
+}
+
+/// `-p e`: give the file open on `fd` the extended attributes `xattrs` of its
+/// source, each that `plib::xattr::is_copied_to` admits for a file given its
+/// source's owner or not (`owner_set`) -- a file capability only to one that
+/// was -- as bsdtar -p and cp -a do. Each is created or replaced,
+/// and the file's others are left. It comes after the owner, whose change
+/// clears a file capability, and before the mode and ACLs.
+///
+/// From an archive, only those `plib::xattr::is_restored_from_archive` admits
+/// are handed here (`read::attrs_of`).
+///
+/// One the file cannot hold at all (`plib::xattr::unsupported`) is lost without
+/// a word, as cp -a loses it. One refused otherwise -- a `user.` one on a
+/// symbolic link or a FIFO, a `trusted.` one without privilege -- is warned
+/// of, naming the file, and the run still succeeds, as GNU tar 1.35 warns of
+/// it; so is every one where pax holds no descriptor of the file (`fd` is
+/// `None`, a node held by name), which then takes none. Records that do not
+/// decode (`Err`) are the failure returned, and none is set.
+///
+/// `fd` may be an `O_PATH` pin (Linux), set through its `/proc/self/fd/N`
+/// under a verified procfs (`plib::xattr::set_fd`): a symbolic link's own,
+/// never what it names.
+fn set_xattrs(
+    fd: Option<libc::c_int>,
+    xattrs: &Result<Xattrs, String>,
+    owner_set: bool,
+) -> Option<String> {
+    let xattrs = match xattrs {
+        Ok(xattrs) => xattrs,
+        Err(reason) => return Some(reason.clone()),
+    };
+    let Some(fd) = fd else {
+        if !xattrs.values.is_empty() {
+            crate::error::report_warning(
+                &xattrs.of,
+                "cannot set extended attributes: the file is not held open",
+            );
+        }
+        return None;
+    };
+    for (name, value) in &xattrs.values {
+        if !plib::xattr::is_copied_to(name.to_bytes(), owner_set) {
+            continue;
+        }
+        match plib::xattr::set_fd(fd, name, value) {
+            Err(e) if !plib::xattr::unsupported(&e) => crate::error::report_warning(
+                &xattrs.of,
+                format!(
+                    "cannot set extended attribute {}: {e}",
+                    String::from_utf8_lossy(name.to_bytes())
+                ),
+            ),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `-p p`: give a member, through `chmod`, exactly the mode `mode` and the
@@ -2264,6 +2354,10 @@ fn apply_node_attrs(
 
     let owner_set =
         policy.preserve_owner && set_owner(attrs.uid, attrs.gid, |uid, gid| node.chown(uid, gid))?;
+    let mut xattrs_failed = None;
+    if policy.preserve_xattrs {
+        xattrs_failed = set_xattrs(node.acl_fd(), &attrs.xattrs, owner_set);
+    }
     let mut acl_failed = None;
     if made_type != libc::S_IFLNK {
         let chmod = |mode: u32| node.chmod(mode as libc::mode_t);
@@ -2275,7 +2369,7 @@ fn apply_node_attrs(
         }
     }
     set_node_times(node, attrs, policy);
-    acl_failed.map_or(Ok(()), |e| Err(acl_error(e)))
+    attr_failure(xattrs_failed, acl_failed)
 }
 
 /// The times `policy` asks for, through `node`; a failure is a warning.
@@ -2871,6 +2965,7 @@ mod tests {
             atime: None,
             atime_nsec: 0,
             acl: Ok(plib::acl::Acl::default()),
+            xattrs: Ok(Xattrs::default()),
         }
     }
 
@@ -2915,6 +3010,7 @@ mod tests {
             preserve_perms,
             preserve_mtime: false,
             preserve_atime: false,
+            preserve_xattrs: false,
             umask: 0o022,
         }
     }

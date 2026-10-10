@@ -23,7 +23,7 @@
 //! - typeflag 'g' for global extended headers
 //! - Data format: "%d %s=%s\n" (length, keyword, value)
 
-use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
+use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, XattrRecord};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
     calculate_checksum, entry_type_to_flag, long_name_record, member_data_size,
@@ -36,7 +36,7 @@ use crate::formats::ustar::{
 use crate::formats::{ArchiveStream, MAX_EXTENDED_HEADER, MAX_NAME};
 use crate::options::FormatOptions;
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::io::{Read, Seek, Write};
 use std::ops::Range;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -115,6 +115,20 @@ pub struct ExtendedHeader {
     /// SCHILY.acl.ace - an NFSv4-style ACL, in the text form libarchive
     /// writes (`ArchiveEntry::acl_ace`), likewise.
     pub acl_ace: Option<String>,
+    /// SCHILY.xattr.<name> and LIBARCHIVE.xattr.<name> - extended attributes,
+    /// each record as the archive spells it, in the order its keyword was
+    /// first read, a later record of the same keyword replacing the earlier
+    /// one's value (`put_xattr`): decoded only where -p e applies them
+    /// (`decode_xattrs`), so a record that does not decode is that member's
+    /// failure, not the archive's. An empty `SCHILY.xattr.<name>=` record is
+    /// an attribute whose value is empty, not a deletion, as GNU tar writes
+    /// and reads one. A global header's are never applied (`merge_global`).
+    pub xattrs: Vec<XattrRecord>,
+    /// Where in `xattrs` each keyword is.
+    xattr_at: HashMap<Vec<u8>, usize>,
+    /// The bytes of the names in `xattrs`, as spelled, one more for each
+    /// (`XATTR_SPELLED_MAX`).
+    xattr_spelled: usize,
     /// Additional custom keywords
     pub extra: HashMap<String, String>,
     /// Keywords a zero-length record (`keyword=`) deleted.
@@ -156,6 +170,22 @@ const ACL_ACCESS: &str = "SCHILY.acl.access";
 const ACL_DEFAULT: &str = "SCHILY.acl.default";
 /// The keyword star and bsdtar record an NFSv4-style ACL under.
 const ACL_ACE: &str = "SCHILY.acl.ace";
+
+/// The keyword prefix of an extended attribute's record as GNU tar and star write it: the
+/// name and the value as they stand.
+const SCHILY_XATTR: &[u8] = b"SCHILY.xattr.";
+/// The keyword prefix of one as libarchive writes it: the name %-encoded, the value base64.
+const LIBARCHIVE_XATTR: &[u8] = b"LIBARCHIVE.xattr.";
+
+/// The most bytes the names of one header's extended attribute records may
+/// spell, one more for each: a name of `XATTR_NAMES_MAX` bytes %-encoded takes
+/// three times as many, and libarchive records every name twice.
+const XATTR_SPELLED_MAX: usize = 6 * XATTR_NAMES_MAX;
+
+/// Whether `keyword` is an extended attribute's (`ExtendedHeader::xattrs`).
+fn is_xattr_keyword(keyword: &[u8]) -> bool {
+    keyword.starts_with(SCHILY_XATTR) || keyword.starts_with(LIBARCHIVE_XATTR)
+}
 
 impl ExtendedHeader {
     /// Create a new empty extended header
@@ -249,6 +279,28 @@ impl ExtendedHeader {
             self.extra.insert(keyword.clone(), value.clone());
             self.deleted.remove(keyword);
         }
+        for record in &later.xattrs {
+            self.put_xattr(record.clone());
+        }
+    }
+
+    /// Hold the extended attribute record `record`: a later record of a
+    /// keyword replaces the value of the one held, so that a header repeating
+    /// one costs no more than the last of them.
+    fn put_xattr(&mut self, record: XattrRecord) {
+        if let Some(&at) = self.xattr_at.get(&record.keyword) {
+            self.xattrs[at].value = record.value;
+            return;
+        }
+        let prefix = if record.keyword.starts_with(SCHILY_XATTR) {
+            SCHILY_XATTR.len()
+        } else {
+            LIBARCHIVE_XATTR.len()
+        };
+        self.xattr_spelled += record.keyword.len() - prefix + 1;
+        self.xattr_at
+            .insert(record.keyword.clone(), self.xattrs.len());
+        self.xattrs.push(record);
     }
 
     /// Forget every value, and every deletion, whose keyword `keep` rejects,
@@ -261,6 +313,29 @@ impl ExtendedHeader {
         }
         self.extra.retain(|keyword, _| keep(keyword));
         self.deleted.retain(|keyword| keep(keyword));
+        let held = std::mem::take(&mut self.xattrs);
+        (self.xattr_at, self.xattr_spelled) = (HashMap::new(), 0);
+        for record in held {
+            if keep(&String::from_utf8_lossy(&record.keyword)) {
+                self.put_xattr(record);
+            }
+        }
+    }
+
+    /// Take the extended attributes out of a global header's records: none is applied to
+    /// any member, as GNU tar and libarchive apply none, and each would otherwise be copied
+    /// into every member after it. One whose keyword and value are text stays, among the
+    /// extension records, for `-o listopt` to report.
+    fn xattrs_to_extra(&mut self) {
+        (self.xattr_at, self.xattr_spelled) = (HashMap::new(), 0);
+        for record in std::mem::take(&mut self.xattrs) {
+            if let (Ok(keyword), Ok(value)) = (
+                String::from_utf8(record.keyword),
+                String::from_utf8(record.value),
+            ) {
+                self.extra.insert(keyword, value);
+            }
+        }
     }
 
     /// This header without its extension records (`extra`): the typed fields,
@@ -286,6 +361,9 @@ impl ExtendedHeader {
             acl_access: self.acl_access.clone(),
             acl_default: self.acl_default.clone(),
             acl_ace: self.acl_ace.clone(),
+            xattrs: self.xattrs.clone(),
+            xattr_at: self.xattr_at.clone(),
+            xattr_spelled: self.xattr_spelled,
             extra: HashMap::new(),
             deleted: STANDARD_KEYWORDS
                 .iter()
@@ -358,13 +436,27 @@ impl ExtendedHeader {
             return Ok(()); // no separator: not a record we can use
         };
 
+        // An extended attribute's keyword holds its name, which need not be
+        // UTF-8 (GNU tar writes it as it stands), and its value is any bytes,
+        // an empty one included.
+        if is_xattr_keyword(&record[..eq_pos]) {
+            self.put_xattr(XattrRecord {
+                keyword: record[..eq_pos].to_vec(),
+                value: record[eq_pos + 1..].to_vec(),
+            });
+            if self.xattr_spelled > XATTR_SPELLED_MAX {
+                return Err(PaxError::InvalidHeader(format!(
+                    "extended attribute names exceed {XATTR_SPELLED_MAX} bytes"
+                )));
+            }
+            return Ok(());
+        }
+
         // Keyword must be valid UTF-8
         let keyword = std::str::from_utf8(&record[..eq_pos]).map_err(|_| {
             PaxError::InvalidHeader("invalid UTF-8 in extended header keyword".to_string())
         })?;
 
-        // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
-        // For binary-capable keywords, skip if not valid UTF-8
         let value_bytes = &record[eq_pos + 1..];
         // A zero-length value is a deletion, not a value: an empty time or id
         // is not something to parse, and a pax writer emits one on purpose
@@ -412,9 +504,6 @@ impl ExtendedHeader {
         }
         if let Ok(value) = std::str::from_utf8(value_bytes) {
             self.set_keyword(keyword, value)
-        } else if keyword.starts_with("SCHILY.xattr.") {
-            // Binary extended attributes - skip silently (we don't support xattrs)
-            Ok(())
         } else {
             // Other keywords with invalid UTF-8 - try lossy conversion
             let value = String::from_utf8_lossy(value_bytes);
@@ -581,6 +670,19 @@ impl ExtendedHeader {
         if let Some(ref acl) = self.acl_ace {
             rec!(ACL_ACE, acl);
         }
+        // Each as it stands, its keyword and value raw bytes, as GNU tar writes
+        // them: the record's length says where it ends.
+        for record in &self.xattrs {
+            let keyword = String::from_utf8_lossy(&record.keyword);
+            if options.should_delete_keyword(&keyword) {
+                continue;
+            }
+            let value = match std::str::from_utf8(&record.keyword) {
+                Ok(keyword) => per_file.get(keyword).unwrap_or(&record.value),
+                Err(_) => &record.value,
+            };
+            write_pax_record_raw(&mut data, &record.keyword, value);
+        }
         // Sorted: iterating a HashMap made the record order differ between runs
         // of the same command, so two invocations produced different bytes for
         // the same input -- hostile to reproducible builds and to diffing.
@@ -613,7 +715,10 @@ impl ExtendedHeader {
                 continue;
             }
             // Skip standard keywords that were already handled above
-            if !STANDARD_KEYWORDS.contains(&key.as_str()) && !self.extra.contains_key(key) {
+            if !STANDARD_KEYWORDS.contains(&key.as_str())
+                && !self.extra.contains_key(key)
+                && !self.xattrs.iter().any(|x| x.keyword == key.as_bytes())
+            {
                 write_pax_record_bytes(&mut data, key, value);
             }
         }
@@ -631,7 +736,9 @@ impl ExtendedHeader {
     /// archive, `path` would leave the member nameless, and a time or an id
     /// of zero would be an invented value rather than a missing one, so their
     /// header block value stands.
-    fn apply_to(&self, entry: &mut ArchiveEntry) {
+    ///
+    /// The extended attributes are moved onto the entry, not copied.
+    fn apply_to(&mut self, entry: &mut ArchiveEntry) {
         if let Some(ref path) = self.path {
             entry.path = PathBuf::from(OsString::from_vec(path.clone()));
         }
@@ -686,6 +793,19 @@ impl ExtendedHeader {
         if let Some(ref acl) = self.acl_ace {
             entry.acl_ace = Some(acl.clone());
             entry.set_ext_record(ACL_ACE, acl);
+        }
+        // Applied under -p e; listed as any other record where it is text.
+        if !self.xattrs.is_empty() {
+            for record in &self.xattrs {
+                if let (Ok(keyword), Ok(value)) = (
+                    std::str::from_utf8(&record.keyword),
+                    std::str::from_utf8(&record.value),
+                ) {
+                    entry.set_ext_record(keyword, value);
+                }
+            }
+            entry.xattrs = std::mem::take(&mut self.xattrs);
+            (self.xattr_at, self.xattr_spelled) = (HashMap::new(), 0);
         }
         for (keyword, value) in &self.extra {
             entry.set_ext_record(keyword, value);
@@ -853,6 +973,10 @@ impl ExtendedHeader {
         header.acl_access.clone_from(&entry.acl_access);
         header.acl_default.clone_from(&entry.acl_default);
         header.acl_ace.clone_from(&entry.acl_ace);
+        // And its extended attributes.
+        for record in &entry.xattrs {
+            header.put_xattr(record.clone());
+        }
 
         header
     }
@@ -1026,9 +1150,15 @@ fn format_pax_time(time: PaxTime) -> String {
 /// The record length counts bytes, not characters, so this is also the correct
 /// path for any value that merely happens to be UTF-8.
 fn write_pax_record_bytes(data: &mut Vec<u8>, keyword: &str, value: &[u8]) {
+    write_pax_record_raw(data, keyword.as_bytes(), value);
+}
+
+/// `write_pax_record_bytes`, for a keyword that need not be UTF-8: an
+/// extended attribute's, which holds its name (`ExtendedHeader::xattrs`).
+fn write_pax_record_raw(data: &mut Vec<u8>, keyword: &[u8], value: &[u8]) {
     let mut content = Vec::with_capacity(keyword.len() + value.len() + 3);
     content.push(b' ');
-    content.extend_from_slice(keyword.as_bytes());
+    content.extend_from_slice(keyword);
     content.push(b'=');
     content.extend_from_slice(value);
     content.push(b'\n');
@@ -1065,8 +1195,10 @@ impl OptionRecords {
     /// Parse the operands' values as the records they stand for, so that a
     /// value no archive record could carry is refused up front.
     pub fn new(options: &FormatOptions) -> PaxResult<Self> {
+        let mut global = ExtendedHeader::from_options(options.global_options(), "=")?;
+        global.xattrs_to_extra();
         Ok(OptionRecords {
-            global: ExtendedHeader::from_options(options.global_options(), "=")?,
+            global,
             per_file: ExtendedHeader::from_options(options.per_file_options(), ":=")?,
         })
     }
@@ -1079,6 +1211,216 @@ impl OptionRecords {
         records.merge(&self.per_file);
         records.apply_to(entry);
     }
+}
+
+/// The most bytes one extended attribute's value may hold: Linux's
+/// `XATTR_SIZE_MAX`, more than any Linux file can hold.
+pub const XATTR_VALUE_MAX: usize = 64 * 1024;
+
+/// The most bytes the names of one member's extended attributes may hold
+/// together, a NUL ending each: Linux's `XATTR_LIST_MAX`, which no Linux file's
+/// listing exceeds. It bounds how many a member can have set.
+pub const XATTR_NAMES_MAX: usize = 64 * 1024;
+
+/// The one attribute whose value `XATTR_VALUE_MAX` does not bound on write: a
+/// macOS resource fork, archived whole for the tools that restore one. pax
+/// never restores it from an archive (`plib::xattr::is_restored_from_archive`).
+pub const RESOURCE_FORK: &[u8] = b"com.apple.ResourceFork";
+
+/// The extended attributes a member's records name (`ExtendedHeader::xattrs`)
+/// that `keep` keeps, decoded, in the order first named, each with the value
+/// its last record gives: a `SCHILY.xattr.<name>` record's value as it stands
+/// and its name as GNU tar spells it (`schily_encode`), a
+/// `LIBARCHIVE.xattr.<name>` record's name %-encoded and its value base64
+/// (padded or not), as libarchive's reader decodes them. libarchive writes
+/// both for each attribute, the `SCHILY` one's name %-encoded too, so a
+/// `SCHILY` record whose name is spelled as a `LIBARCHIVE` one's, encoded or
+/// decoded, is that attribute again, and the exact `LIBARCHIVE` one is taken.
+///
+/// Refused, naming the record: a name that is empty, holds a NUL or is not
+/// %-encoded right; and, of those kept, a value longer than `XATTR_VALUE_MAX`
+/// -- checked before it is decoded or copied -- or not base64, or names
+/// together longer than `XATTR_NAMES_MAX`. A value not kept is never read.
+pub fn decode_xattrs(
+    records: &[XattrRecord],
+    keep: impl Fn(&[u8]) -> bool,
+) -> Result<Vec<(CString, Vec<u8>)>, String> {
+    let fail = |record: &XattrRecord, reason: &str| {
+        format!("{}: {reason}", String::from_utf8_lossy(&record.keyword))
+    };
+    let too_large = |record: &XattrRecord, len: usize| {
+        fail(
+            record,
+            &format!("value of {len} bytes exceeds {XATTR_VALUE_MAX}"),
+        )
+    };
+    // The `LIBARCHIVE` names first, so that a `SCHILY` record before its twin
+    // is known for one.
+    let mut libarchive = HashSet::new();
+    let mut names = Vec::with_capacity(records.len());
+    for record in records {
+        let Some(encoded) = record.keyword.strip_prefix(LIBARCHIVE_XATTR) else {
+            names.push(None);
+            continue;
+        };
+        let name = url_decode(encoded).ok_or_else(|| fail(record, "bad %-encoding"))?;
+        libarchive.insert(encoded.to_vec());
+        libarchive.insert(name.clone());
+        names.push(Some(name));
+    }
+    let mut taken: Vec<(CString, Vec<u8>)> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut names_len = 0usize;
+    for (record, name) in records.iter().zip(names) {
+        let base64 = name.is_some();
+        let name = match name {
+            Some(name) => name,
+            None => {
+                let spelled = record
+                    .keyword
+                    .strip_prefix(SCHILY_XATTR)
+                    .unwrap_or_default();
+                let name = schily_decode(spelled);
+                if libarchive.contains(spelled) || libarchive.contains(&name) {
+                    continue;
+                }
+                name
+            }
+        };
+        if name.is_empty() {
+            return Err(fail(record, "empty attribute name"));
+        }
+        if name.contains(&0) {
+            return Err(fail(record, "NUL in attribute name"));
+        }
+        if !keep(&name) {
+            continue;
+        }
+        let value = if base64 {
+            // Four characters for every three bytes, and a padded group.
+            if record.value.len() > XATTR_VALUE_MAX * 4 / 3 + 4 {
+                return Err(too_large(record, record.value.len() / 4 * 3));
+            }
+            base64_decode(&record.value).ok_or_else(|| fail(record, "bad base64 value"))?
+        } else {
+            if record.value.len() > XATTR_VALUE_MAX {
+                return Err(too_large(record, record.value.len()));
+            }
+            record.value.clone()
+        };
+        if value.len() > XATTR_VALUE_MAX {
+            return Err(too_large(record, value.len()));
+        }
+        match index.get(&name) {
+            Some(&at) => taken[at].1 = value,
+            None => {
+                names_len += name.len() + 1;
+                if names_len > XATTR_NAMES_MAX {
+                    return Err(fail(
+                        record,
+                        &format!("attribute names exceed {XATTR_NAMES_MAX} bytes"),
+                    ));
+                }
+                let cname = CString::new(name.clone()).expect("checked for a NUL");
+                index.insert(name, taken.len());
+                taken.push((cname, value));
+            }
+        }
+    }
+    Ok(taken)
+}
+
+/// An extended attribute's name as GNU tar spells it in a `SCHILY.xattr.`
+/// keyword: each `%` as `%25` and each `=` as `%3D`, since a `=` would end the
+/// keyword there; every other byte as it stands.
+pub fn schily_encode(name: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len());
+    for &b in name {
+        match b {
+            b'%' => out.extend_from_slice(b"%25"),
+            b'=' => out.extend_from_slice(b"%3D"),
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
+/// The name `schily_encode` spelled as `spelled`, as GNU tar reads it back:
+/// `%25` and `%3D` decoded, any other `%` taken as itself.
+fn schily_decode(spelled: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(spelled.len());
+    let mut rest = spelled;
+    while let Some((&b, tail)) = rest.split_first() {
+        let decoded = match tail {
+            [b'2', b'5', ..] if b == b'%' => Some(b'%'),
+            [b'3', b'D', ..] if b == b'%' => Some(b'='),
+            _ => None,
+        };
+        match decoded {
+            Some(d) => {
+                out.push(d);
+                rest = &tail[2..];
+            }
+            None => {
+                out.push(b);
+                rest = tail;
+            }
+        }
+    }
+    out
+}
+
+/// `encoded` with each `%XX` turned into the byte it names; `None` where a `%`
+/// is not followed by two hex digits. libarchive's own reader takes such a `%`
+/// as itself, but its writer never makes one.
+fn url_decode(encoded: &[u8]) -> Option<Vec<u8>> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.iter();
+    while let Some(&b) = bytes.next() {
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        let high = hex(*bytes.next()?)?;
+        let low = hex(*bytes.next()?)?;
+        out.push(high << 4 | low);
+    }
+    Some(out)
+}
+
+/// The bytes the base64 text `text` encodes (RFC 4648, the standard alphabet),
+/// with or without its `=` padding -- libarchive writes none; `None` where it
+/// is not base64. libarchive's own reader skips any character outside the
+/// alphabet, but its writer never makes one.
+fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
+    let digit = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let unpadded = match text {
+        [rest @ .., b'=', b'='] | [rest @ .., b'='] if text.len().is_multiple_of(4) => rest,
+        _ => text,
+    };
+    if unpadded.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(unpadded.len() / 4 * 3 + 2);
+    for group in unpadded.chunks(4) {
+        let mut v = 0u32;
+        for &c in group {
+            v = v << 6 | digit(c)?;
+        }
+        v <<= 6 * (4 - group.len() as u32);
+        out.extend_from_slice(&v.to_be_bytes()[1..group.len()]);
+    }
+    Some(out)
 }
 
 /// pax archive reader
@@ -1191,6 +1533,7 @@ impl<R: Read> PaxReader<R> {
     /// Distinct keywords accumulate there, one `g` header after another, so
     /// the whole is held to the limit a single header is.
     fn merge_global(&mut self, mut later: ExtendedHeader) -> PaxResult<()> {
+        later.xattrs_to_extra();
         let extra = std::mem::take(&mut later.extra);
         let shared = Arc::make_mut(&mut self.global_extra);
         let mut bytes = self.global_extra_bytes;
@@ -1359,7 +1702,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     self.saw_extended_header = true;
                 }
                 _ => {
-                    let records = self.member_records(extended_header.as_ref());
+                    let mut records = self.member_records(extended_header.as_ref());
                     let rule = self.size_rule();
                     if !long_names.superseded(records.path.is_some(), records.linkpath.is_some()) {
                         // The records and the member are dropped together,
@@ -2118,7 +2461,7 @@ mod tests {
         let ace = "owner@:rwxpaARWcCos::allow,user:nobody:raRcs::allow:65534";
         entry.acl_ace = Some(ace.to_string());
         let ext = ExtendedHeader::from_entry(&entry, &FormatOptions::default());
-        let parsed = ExtendedHeader::parse(&ext.serialize(&FormatOptions::default())).unwrap();
+        let mut parsed = ExtendedHeader::parse(&ext.serialize(&FormatOptions::default())).unwrap();
         assert!(parsed.extra.is_empty());
 
         let mut read = ArchiveEntry::new(PathBuf::from("d"), EntryType::Directory);
@@ -2141,6 +2484,198 @@ mod tests {
         let mut read = ArchiveEntry::new(PathBuf::from("d"), EntryType::Directory);
         global.apply_to(&mut read);
         assert_eq!(read.acl_ace, None);
+    }
+
+    fn xattr(keyword: &[u8], value: &[u8]) -> XattrRecord {
+        XattrRecord {
+            keyword: keyword.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    /// An entry's extended attributes go out as `SCHILY.xattr.*` records, the
+    /// keyword and the value raw bytes, and come back as they went, an empty
+    /// value as an empty value rather than a deletion.
+    #[test]
+    fn test_xattr_records_roundtrip() {
+        let mut entry = ArchiveEntry::new(PathBuf::from("f"), EntryType::Regular);
+        entry.xattrs = vec![
+            xattr(b"SCHILY.xattr.user.raw\xff", b"\x00\n\xff= "),
+            xattr(b"SCHILY.xattr.user.empty", b""),
+            xattr(b"SCHILY.xattr.user.text", b"t"),
+        ];
+        let ext = ExtendedHeader::from_entry(&entry, &FormatOptions::default());
+        let data = ext.serialize(&FormatOptions::default());
+        let mut want = Vec::new();
+        for record in &entry.xattrs {
+            write_pax_record_raw(&mut want, &record.keyword, &record.value);
+        }
+        assert_eq!(data, want);
+        let mut parsed = ExtendedHeader::parse(&data).unwrap();
+        assert!(parsed.extra.is_empty() && parsed.deleted.is_empty());
+        let mut read = ArchiveEntry::new(PathBuf::from("f"), EntryType::Regular);
+        parsed.apply_to(&mut read);
+        assert_eq!(read.xattrs, entry.xattrs);
+        assert_eq!(read.ext_record("SCHILY.xattr.user.text"), Some("t"));
+
+        // `-o delete=` drops them on write.
+        let options = FormatOptions::parse("delete=SCHILY.xattr.user.r*").unwrap();
+        let parsed = ExtendedHeader::parse(&ext.serialize(&options)).unwrap();
+        assert_eq!(parsed.xattrs, entry.xattrs[1..]);
+    }
+
+    /// A member's records are its own: the next member carries none of them,
+    /// a global header's are never applied, and `-o delete=` removes them on
+    /// read.
+    #[test]
+    fn test_xattrs_are_per_member_and_never_global() {
+        let mut out = Vec::new();
+        let options = FormatOptions::parse("SCHILY.xattr.user.g=G").unwrap();
+        let mut writer = PaxWriter::with_options(&mut out, options);
+        let mut first = ArchiveEntry::new(PathBuf::from("a"), EntryType::Regular);
+        first.xattrs = vec![
+            xattr(b"SCHILY.xattr.user.a", b"1"),
+            xattr(b"SCHILY.xattr.user.b", b"2"),
+        ];
+        writer.write_entry(&first).unwrap();
+        writer.finish_entry().unwrap();
+        let second = ArchiveEntry::new(PathBuf::from("b"), EntryType::Regular);
+        writer.write_entry(&second).unwrap();
+        writer.finish_entry().unwrap();
+        writer.finish().unwrap();
+        assert!(out.windows(19).any(|w| w == b"SCHILY.xattr.user.g"));
+
+        let read = |options: &str| {
+            let mut reader = PaxReader::seekable(std::io::Cursor::new(&out))
+                .with_options(FormatOptions::parse(options).unwrap())
+                .unwrap();
+            let mut all = Vec::new();
+            while let Some(entry) = reader.read_entry().unwrap() {
+                all.push(entry);
+            }
+            all
+        };
+        let members = read("");
+        assert_eq!(members[0].xattrs, first.xattrs);
+        assert_eq!(members[1].xattrs, vec![]);
+        // Listed all the same.
+        assert_eq!(members[1].ext_record("SCHILY.xattr.user.g"), Some("G"));
+        let members = read("delete=SCHILY.xattr.user.a");
+        assert_eq!(members[0].xattrs, first.xattrs[1..]);
+        // An operator's `-o keyword:=value` applies to each member.
+        let members = read("SCHILY.xattr.user.o:=O");
+        assert_eq!(members[1].xattrs, vec![xattr(b"SCHILY.xattr.user.o", b"O")]);
+    }
+
+    /// A keyword repeated is held once, with its last value, in the place it
+    /// was first read; names past `XATTR_SPELLED_MAX` refuse the header.
+    #[test]
+    fn test_repeated_xattr_records_are_held_once() {
+        let repeated = [
+            pax_record_bytes("SCHILY.xattr.user.a", b"1"),
+            pax_record_bytes("SCHILY.xattr.user.b", b"2"),
+        ]
+        .concat()
+        .repeat(1000);
+        let last = pax_record_bytes("SCHILY.xattr.user.a", b"3");
+        let parsed = ExtendedHeader::parse(&[repeated, last].concat()).unwrap();
+        assert_eq!(
+            parsed.xattrs,
+            vec![
+                xattr(b"SCHILY.xattr.user.a", b"3"),
+                xattr(b"SCHILY.xattr.user.b", b"2")
+            ]
+        );
+        let names = |count: usize| -> Vec<u8> {
+            (0..count)
+                .flat_map(|i| pax_record_bytes(&format!("SCHILY.xattr.{i:07}"), b""))
+                .collect()
+        };
+        // Seven digits and one more: 8 bytes each.
+        assert!(ExtendedHeader::parse(&names(XATTR_SPELLED_MAX / 8)).is_ok());
+        assert!(ExtendedHeader::parse(&names(XATTR_SPELLED_MAX / 8 + 1)).is_err());
+    }
+
+    #[test]
+    fn test_decode_xattrs() {
+        let decode = |records: &[XattrRecord]| {
+            decode_xattrs(records, |_| true).map(|all| {
+                all.into_iter()
+                    .map(|(name, value)| (name.into_bytes(), value))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let pair = |name: &[u8], value: &[u8]| (name.to_vec(), value.to_vec());
+        // GNU tar's spelling of `%` and `=`, and nothing else.
+        assert_eq!(
+            decode(&[xattr(b"SCHILY.xattr.user.a%3Db%25c%20", b"v")]),
+            Ok(vec![pair(b"user.a=b%c%20", b"v")])
+        );
+        assert_eq!(schily_encode(b"user.a=b%c%20"), b"user.a%3Db%25c%2520");
+        // libarchive's, padded or not; its SCHILY twin, before or after it,
+        // is the same attribute; of two of one kind the later wins.
+        assert_eq!(
+            decode(&[
+                xattr(b"SCHILY.xattr.user.x%20y", b"twin"),
+                xattr(b"LIBARCHIVE.xattr.user.x%20y", b"aGk"),
+                xattr(b"LIBARCHIVE.xattr.user.p", b"aGk="),
+                xattr(b"SCHILY.xattr.user.p", b"twin"),
+                xattr(b"SCHILY.xattr.user.s", b"1"),
+                xattr(b"SCHILY.xattr.user.s", b"2"),
+                xattr(b"LIBARCHIVE.xattr.user.e", b""),
+            ]),
+            Ok(vec![
+                pair(b"user.x y", b"hi"),
+                pair(b"user.p", b"hi"),
+                pair(b"user.s", b"2"),
+                pair(b"user.e", b""),
+            ])
+        );
+        for (keyword, value) in [
+            (&b"LIBARCHIVE.xattr.user.x"[..], &b"a"[..]),
+            (b"LIBARCHIVE.xattr.user.x", b"a=bc"),
+            (b"LIBARCHIVE.xattr.user.x", b"a b="),
+            (b"LIBARCHIVE.xattr.user.%4", b""),
+            (b"LIBARCHIVE.xattr.user.%zz", b""),
+            (b"LIBARCHIVE.xattr.user.%00", b""),
+            (b"LIBARCHIVE.xattr.", b""),
+            (b"SCHILY.xattr.", b""),
+        ] {
+            let err = decode(&[xattr(keyword, value)]).unwrap_err();
+            assert!(err.starts_with(&*String::from_utf8_lossy(keyword)), "{err}");
+        }
+        // The bounds: a value, and the names together.
+        let big = vec![0u8; XATTR_VALUE_MAX];
+        assert!(decode(&[xattr(b"SCHILY.xattr.user.v", &big)]).is_ok());
+        let bigger = vec![0u8; XATTR_VALUE_MAX + 1];
+        assert!(decode(&[xattr(b"SCHILY.xattr.user.v", &bigger)]).is_err());
+        assert!(decode(&[xattr(b"SCHILY.xattr.com.apple.ResourceFork", &bigger)]).is_err());
+        let base64 = vec![b'A'; XATTR_VALUE_MAX * 4 / 3 + 8];
+        assert!(decode(&[xattr(b"LIBARCHIVE.xattr.user.v", &base64)]).is_err());
+        // A value not kept is not read: neither its size nor its encoding.
+        let user = |name: &[u8]| name.starts_with(b"user.");
+        let records = [
+            xattr(b"SCHILY.xattr.com.apple.ResourceFork", &bigger),
+            xattr(b"LIBARCHIVE.xattr.trusted.x", b"!!"),
+            xattr(b"SCHILY.xattr.user.u", b"u"),
+        ];
+        let kept = decode_xattrs(&records, user).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0.as_bytes(), b"user.u");
+        // A name that is no name is refused whether kept or not.
+        assert!(decode_xattrs(&[xattr(b"SCHILY.xattr.", b"")], user).is_err());
+        let named = |count: usize| -> Vec<XattrRecord> {
+            (0..count)
+                .map(|i| xattr(format!("SCHILY.xattr.user.{i:010}").as_bytes(), b""))
+                .collect()
+        };
+        // "user." and ten digits and a NUL: 16 bytes each.
+        assert!(decode(&named(XATTR_NAMES_MAX / 16)).is_ok());
+        assert!(decode(&named(XATTR_NAMES_MAX / 16 + 1)).is_err());
+        // A name repeated is counted once.
+        let mut repeated = named(XATTR_NAMES_MAX / 16);
+        repeated.extend(named(1));
+        assert!(decode(&repeated).is_ok());
     }
 
     fn pax_record_bytes(keyword: &str, value: &[u8]) -> Vec<u8> {

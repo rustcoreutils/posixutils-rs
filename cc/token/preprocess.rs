@@ -125,12 +125,12 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
     // redefinition to the same thing is quiet. So is any redefinition in a
     // system header, since warnings there are not shown.
     //
-    // The feature-test macros are the exception. c17 predefines them where
-    // gcc does not (see `os::linux`), so a program's own
-    // `#define _GNU_SOURCE` or `#define _XOPEN_SOURCE 700` is not
-    // redefining anything as far as its author can tell.
+    // `_FORTIFY_SOURCE` is the exception. c17 predefines it as 0 on macOS,
+    // where Apple clang leaves it to the program (see `os::macos`), so a
+    // program's own `-D_FORTIFY_SOURCE=2` is not redefining anything as far
+    // as its author can tell.
     if old.predefined {
-        if is_feature_test_macro(&old.name) {
+        if old.name == "_FORTIFY_SOURCE" {
             return None;
         }
         let same = old.is_function == new.is_function
@@ -161,13 +161,6 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
         return Some("the replacement lists differ");
     }
     None
-}
-
-/// A feature-test macro: the program's request for a namespace (POSIX.1-2024
-/// 2.2.1), such as `_GNU_SOURCE`, `_XOPEN_SOURCE` or `_POSIX_C_SOURCE`.
-fn is_feature_test_macro(name: &str) -> bool {
-    name.starts_with('_')
-        && (name.ends_with("_SOURCE") || name.ends_with("_SOURCE_EXTENDED") || name == "_REENTRANT")
 }
 
 /// A name C17 6.10.8 predefines, which p2 says may be neither `#define`d nor

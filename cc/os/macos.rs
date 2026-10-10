@@ -26,10 +26,6 @@ pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
         // Disable _FORTIFY_SOURCE — macOS headers redirect memset/memcpy/strcpy
         // to __memset_chk etc. which requires full fortification builtin support
         ("_FORTIFY_SOURCE", Some("0".into())),
-        // Darwin/BSD feature test macros - enables SIGWINCH, SA_RESTART, etc.
-        ("_DARWIN_C_SOURCE", Some("1".into())),
-        // POSIX threads
-        ("_REENTRANT", Some("1".into())),
         // Version - match current macOS version (26.0.0 = macOS Tahoe)
         (
             "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__",

@@ -159,8 +159,6 @@ Language and preprocessor additions:
  * Digraphs, and the C23 one-argument `_Static_assert`.
  * `__GNUC__`, `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__`, `__VERSION__` and
    `__GNUC_STDC_INLINE__` are predefined.
- * On Linux, `_GNU_SOURCE`, `_XOPEN_SOURCE=800` and `_XOPEN_SOURCE_EXTENDED`
-   are predefined unconditionally.
 
 Deviation: `-std=` selects nothing — the language is C17 and
 `__STDC_VERSION__` is `201710L` whatever it names.  A C99, C11 or C17

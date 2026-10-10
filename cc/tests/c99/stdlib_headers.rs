@@ -446,6 +446,10 @@ const LIMITS_H: &str = r#"
  *   21     c99_ssize_max_has_ssize_t_type
  */
 
+/* The XSI limits (IOV_MAX, LONG_BIT, WORD_BIT) are glibc's under
+   _XOPEN_SOURCE, which a program asks for, as with gcc. */
+#define _XOPEN_SOURCE 700
+
 /* SSIZE_MAX section: it must not be defined before <limits.h>. */
 #ifdef SSIZE_MAX
 #error "SSIZE_MAX is defined before <limits.h>"
@@ -541,13 +545,14 @@ int main(void) { return SSIZE_MAX - 5; }
 }
 
 /// `<complex.h>` belongs to the C library, which declares more than C17 lists:
-/// glibc adds `clog10` under `_GNU_SOURCE`, which c17 predefines. The bundled
+/// glibc adds `clog10` under `_GNU_SOURCE`, which the program defines. The bundled
 /// header used to stand in for glibc's and hid those declarations (guile's
 /// numbers.c calls `clog10`). The C17 7.3.1 macros must still hold.
 #[cfg(target_os = "linux")]
 #[test]
 fn c99_complex_h_keeps_the_c_librarys_declarations() {
     let code = r#"
+#define _GNU_SOURCE
 #include <complex.h>
 int main(void) {
     double complex z = CMPLX(10.0, 0.0);

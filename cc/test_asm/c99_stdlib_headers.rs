@@ -51,9 +51,10 @@ fn c99_ssize_max_comes_from_limits_h() {
 /// the bundled one owns only the integer sizes and forwards to the system's
 /// for the rest. It used to stop at the sizes, so `LINE_MAX`, `NGROUPS_MAX`,
 /// `IOV_MAX` and the like were undeclared. The POSIX base names are checked
-/// everywhere, the XSI ones against glibc; the sizes must still be the
-/// compiler's.
+/// everywhere, the XSI ones against glibc, which declares them under
+/// `_XOPEN_SOURCE`; the sizes must still be the compiler's.
 const POSIX_LIMITS: &str = r#"
+#define _XOPEN_SOURCE 700
 #include <limits.h>
 #include <stdio.h>
 #include <limits.h>

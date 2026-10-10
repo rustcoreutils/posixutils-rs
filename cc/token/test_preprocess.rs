@@ -577,6 +577,27 @@ fn test_macro_redefinition_conflict_detection() {
     assert!(macro_redefinition_conflict(&fnlike, &fnlike.clone()).is_none());
 }
 
+/// A predefine redefined to something else conflicts, as gcc warns, whatever
+/// the name looks like, a feature-test spelling such as `_GNU_SOURCE`
+/// included. `_FORTIFY_SOURCE`, which c17 predefines on macOS
+/// where Apple clang does not, stays the program's to redefine.
+#[test]
+fn test_predefine_redefinition_conflict() {
+    let predef = |name: &str, value: &str| Macro::predefined(name, Some(value));
+    for name in ["__CHAR_BIT__", "_GNU_SOURCE", "_XOPEN_SOURCE", "_REENTRANT"] {
+        assert!(
+            macro_redefinition_conflict(&predef(name, "1"), &predef(name, "2")).is_some(),
+            "{name}"
+        );
+        assert!(
+            macro_redefinition_conflict(&predef(name, "1"), &predef(name, "1")).is_none(),
+            "{name}"
+        );
+    }
+    let fortify = "_FORTIFY_SOURCE";
+    assert!(macro_redefinition_conflict(&predef(fortify, "0"), &predef(fortify, "2")).is_none());
+}
+
 #[test]
 fn test_replacement_lists_ignore_leading_whitespace() {
     // Whitespace before the first replacement token is not a separation

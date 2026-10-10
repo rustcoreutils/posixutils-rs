@@ -20,11 +20,6 @@ pub fn get_os_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
     let mut macros = vec![
         // POSIX compliance
         ("__STDC_HOSTED__", Some("1".into())),
-        ("_POSIX_SOURCE", Some("1".into())),
-        // POSIX.1-2024. Every delegated system header gates its 2024
-        // prototypes behind this, so a c17-branded compiler that left it at
-        // the 2008 value exposed a 16-year-old interface by default.
-        ("_POSIX_C_SOURCE", Some("202405L".into())),
     ];
 
     // The `unix` family names the ELF Unixes. Neither clang nor gcc defines

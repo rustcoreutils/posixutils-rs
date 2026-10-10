@@ -95,3 +95,47 @@ fn unknown_target_os_is_rejected() {
         );
     }
 }
+
+/// The feature-test macros are the program's to define (POSIX.1-2024 2.2.1):
+/// gcc predefines none of them, nor does Apple clang or FreeBSD's clang, and
+/// glibc's <features.h> computes `_DEFAULT_SOURCE` itself when a program
+/// names nothing. `-pthread` alone adds `_REENTRANT`, as in gcc.
+#[test]
+fn feature_test_macros_are_not_predefined() {
+    const FEATURE_MACROS: [&str; 8] = [
+        "_GNU_SOURCE",
+        "_DEFAULT_SOURCE",
+        "_XOPEN_SOURCE",
+        "_XOPEN_SOURCE_EXTENDED",
+        "_REENTRANT",
+        "_POSIX_C_SOURCE",
+        "_POSIX_SOURCE",
+        "_DARWIN_C_SOURCE",
+    ];
+    for triple in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-unknown-freebsd",
+        "aarch64-unknown-freebsd",
+    ] {
+        let m = predefines(triple);
+        for name in FEATURE_MACROS {
+            assert_eq!(defined(&m, name), None, "{name} on {triple}");
+        }
+    }
+
+    // The host, spelled as gcc users spell the probe.
+    let r = run_c17(&["-dM", "-E", "-x", "c", "/dev/null"]);
+    assert!(r.success, "{}", r.stderr);
+    for name in FEATURE_MACROS {
+        assert_eq!(defined(&r.stdout, name), None, "{name}");
+    }
+    let r = run_c17(&["-pthread", "-dM", "-E", "-x", "c", "/dev/null"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(defined(&r.stdout, "_REENTRANT").as_deref(), Some("1"));
+    for name in FEATURE_MACROS.iter().filter(|n| **n != "_REENTRANT") {
+        assert_eq!(defined(&r.stdout, name), None, "{name} with -pthread");
+    }
+}

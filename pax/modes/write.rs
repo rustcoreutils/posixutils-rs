@@ -805,13 +805,16 @@ fn add_attrs<W: ArchiveWriter>(
     if member.entry_type == EntryType::Symlink {
         return;
     }
-    let acl = attrs.acl;
+    add_acls(member, attrs.acl, &report);
+}
+
+/// Give `member` the ACLs `acl` read from its source: its NFSv4-style one as
+/// `SCHILY.acl.ace` text, and its POSIX access and (a directory's) default ones. A native ACL
+/// that cannot be made text is reported, and the POSIX ones are still given.
+fn add_acls(member: &mut ArchiveEntry, acl: plib::acl::Acl, report: &dyn Fn(String)) {
     match acl.nfs4_text(member.mode) {
         Ok(ace) => member.acl_ace = ace,
-        Err(e) => {
-            report(format!("{}: {e}", gettextrs::gettext("cannot read ACL")));
-            return;
-        }
+        Err(e) => report(format!("{}: {e}", gettextrs::gettext("cannot read ACL"))),
     }
     member.acl_access = acl
         .access
@@ -1170,6 +1173,34 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A native ACL that cannot be made text -- NFSv4 XDR that does not parse -- is reported,
+    /// and the POSIX access and default ACLs read with it are archived all the same.
+    #[test]
+    fn a_bad_nfs4_acl_keeps_the_posix_acls() {
+        use plib::acl::{Acl, Native, NativeKind, PosixAcl};
+        let access = "user::rwx,user:65534:r-x,group::r-x,mask::r-x,other::---";
+        let default = "user::rwx,group::r-x,other::---";
+        let acl = Acl {
+            access: Some(PosixAcl::from_text(access).unwrap()),
+            default: Some(PosixAcl::from_text(default).unwrap()),
+            native: Some(Native {
+                kind: NativeKind::Nfs4,
+                bytes: vec![0xff; 3],
+            }),
+        };
+        let mut member = ArchiveEntry::new(PathBuf::from("d"), EntryType::Directory);
+        member.mode = 0o750;
+        let reported = std::cell::RefCell::new(Vec::new());
+        add_acls(&mut member, acl.clone(), &|reason| {
+            reported.borrow_mut().push(reason)
+        });
+        assert_eq!(reported.borrow().len(), 1, "{:?}", reported.borrow());
+        assert!(reported.borrow()[0].starts_with("cannot read ACL: "));
+        assert_eq!(member.acl_ace, None);
+        assert_eq!(member.acl_access, acl.access.map(|a| a.to_text()));
+        assert_eq!(member.acl_default, acl.default.map(|d| d.to_text()));
+    }
 
     /// Collects member data; fails every call with `fail` once that is set.
     #[derive(Default)]

@@ -2806,3 +2806,67 @@ fn test_cmdline_undefine_name_must_be_an_identifier() {
     assert_eq!((errors, warnings), (0, 0));
     assert_eq!(out, ["X"]);
 }
+
+// ============================================================================
+// The search chain: gcc's duplicate removal
+// ============================================================================
+
+/// A scratch directory holding `a`, `b` and `c`, and `link` naming `a`.
+fn search_dirs() -> (plib::tmp::TempDir, impl Fn(&str) -> String) {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_search_chain_unit_")
+        .tempdir()
+        .unwrap();
+    for d in ["a", "b", "c"] {
+        std::fs::create_dir(dir.path().join(d)).unwrap();
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("link")).unwrap();
+    let root = dir.path().to_path_buf();
+    let path = move |d: &str| root.join(d).to_string_lossy().into_owned();
+    (dir, path)
+}
+
+#[test]
+fn test_search_chain_drops_a_repeated_dash_i() {
+    let (_dir, p) = search_dirs();
+    let chain = search_chain(&[], &[p("a"), p("b"), p("a"), p("a/"), p("b/../a")], &[]);
+    assert_eq!(chain.bracket, [p("a"), p("b")]);
+    #[cfg(unix)]
+    {
+        let chain = search_chain(&[], &[p("link"), p("a")], &[]);
+        assert_eq!(
+            chain.bracket,
+            [p("link")],
+            "the same directory by a symlink"
+        );
+    }
+}
+
+#[test]
+fn test_search_chain_system_directory_wins_over_dash_i() {
+    let (_dir, p) = search_dirs();
+    let chain = search_chain(&[p("b")], &[p("a"), p("c")], &[p("b"), p("a"), p("b")]);
+    assert_eq!(chain.iquote, Vec::<String>::new());
+    assert_eq!(chain.bracket, [p("c")]);
+    assert_eq!(chain.system, [p("b"), p("a")]);
+}
+
+#[test]
+fn test_search_chain_last_iquote_joining_dash_i_is_dropped() {
+    let (_dir, p) = search_dirs();
+    let chain = search_chain(&[p("a"), p("c"), p("a")], &[p("c"), p("b")], &[]);
+    // `a` again is a repeat. `c` was not last when gcc weighed it, the
+    // repeat still following it, so it stays.
+    assert_eq!(chain.iquote, [p("a"), p("c")]);
+    let chain = search_chain(&[p("a"), p("c")], &[p("c"), p("b")], &[]);
+    assert_eq!(chain.iquote, [p("a")]);
+    assert_eq!(chain.bracket, [p("c"), p("b")]);
+}
+
+#[test]
+fn test_search_chain_keeps_missing_directories_by_name() {
+    let (_dir, p) = search_dirs();
+    let chain = search_chain(&[], &[p("none"), p("a"), p("none")], &[]);
+    assert_eq!(chain.bracket, [p("none"), p("a")]);
+}

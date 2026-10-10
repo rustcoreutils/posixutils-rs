@@ -30,6 +30,12 @@
 //! c17's `-fno-cf-protection` and `-fpermissive` (gcc 13 gives C a warning
 //! for the second).
 //!
+//! A fourth kind is an option gcc knows only for another language:
+//! **ForLanguages** takes it with gcc's own warning, "command-line option
+//! '-fno-rtti' is valid for C++/D/ObjC++ but not for C". gcc's configure
+//! probes `-fno-rtti` with the C compiler and gives the answer to its C++
+//! flags, so refusing it is not what gcc does.
+//!
 //! `-ffreestanding` is not here: the driver refuses it, there being no
 //! freestanding environment to compile for.
 
@@ -56,6 +62,9 @@ pub enum Why {
     /// It asks c17 to omit unwind tables. c17 always emits CFI; extra
     /// unwind tables change no program's behaviour.
     UnwindTables,
+    /// It tunes a feature of another language that C does not have, and
+    /// gcc 13 takes it for C without a word.
+    OtherLanguage,
 }
 
 /// What c17 does with an `-f` option it accepts.
@@ -67,9 +76,17 @@ pub enum Effect {
     Accepted(Why),
     /// Taken with a warning: what it asks for is missing.
     Unsupported,
+    /// Taken with gcc's warning that it is valid only for these languages,
+    /// spelled as gcc lists them.
+    ForLanguages(&'static str),
 }
 
-use Effect::{Accepted, Implemented, Unsupported};
+use Effect::{Accepted, ForLanguages, Implemented, Unsupported};
+
+/// gcc's language lists for the [`ForLanguages`] options.
+const CXX_D_OBJCXX: Effect = ForLanguages("C++/D/ObjC++");
+const CXX_OBJCXX: Effect = ForLanguages("C++/ObjC++");
+const OBJC_OBJCXX: Effect = ForLanguages("ObjC/ObjC++");
 use Why::*;
 
 /// The options taken as `-f<name>`, exactly, sorted. A name with `=` here
@@ -86,6 +103,8 @@ const PLAIN: &[(&str, Effect)] = &[
     ("cf-protection", Implemented),
     // A tentative definition is an ordinary definition, not a common
     // symbol that merges with its namesakes in other units.
+    // C++'s `new` checks its result for null.
+    ("check-new", Accepted(OtherLanguage)),
     ("common", Unsupported),
     ("conserve-stack", Accepted(Pass)),
     ("cx-limited-range", Accepted(Permission)),
@@ -142,6 +161,7 @@ const PLAIN: &[(&str, Effect)] = &[
     // c17's own spelling of `-fcf-protection=none`; gcc 13 has no such
     // option.
     ("no-cf-protection", Implemented),
+    ("no-check-new", Accepted(OtherLanguage)),
     ("no-code-hoisting", Accepted(Pass)),
     // A tentative definition is an ordinary definition, as in gcc 10 and
     // later: `int x;` is a `.globl` object, never `.comm`.
@@ -153,6 +173,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-diagnostics-show-caret", Accepted(Presentation)),
     ("no-diagnostics-show-option", Accepted(Presentation)),
     ("no-early-inlining", Accepted(Pass)),
+    ("no-enforce-eh-specs", CXX_OBJCXX),
     ("no-exceptions", Accepted(Default)),
     ("no-fast-math", Accepted(Default)),
     ("no-fat-lto-objects", Accepted(Pass)),
@@ -173,6 +194,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-math-errno", Implemented),
     ("no-move-loop-invariants", Accepted(Pass)),
     ("no-non-call-exceptions", Accepted(Default)),
+    ("no-objc-exceptions", OBJC_OBJCXX),
     // Every prologue sets up %rbp, or x29, leaf function or not.
     ("no-omit-frame-pointer", Accepted(Default)),
     ("no-optimize-sibling-calls", Accepted(Pass)),
@@ -184,6 +206,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-plt", Accepted(Pass)),
     ("no-printf-return-value", Accepted(Pass)),
     ("no-reorder-blocks-and-partition", Accepted(Pass)),
+    ("no-rtti", CXX_D_OBJCXX),
     ("no-schedule-insns", Accepted(Pass)),
     ("no-schedule-insns2", Accepted(Pass)),
     ("no-semantic-interposition", Accepted(Permission)),
@@ -202,6 +225,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-strict-aliasing", Accepted(Default)),
     // gcc's spelling of `-fwrapv`; see `wrapv`.
     ("no-strict-overflow", Accepted(Default)),
+    ("no-threadsafe-statics", CXX_OBJCXX),
     ("no-tracer", Accepted(Pass)),
     ("no-trapping-math", Implemented),
     // Signed overflow wraps; nothing traps it.
@@ -225,6 +249,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-unroll-loops", Accepted(Pass)),
     ("no-unsigned-char", Implemented),
     ("no-unwind-tables", Accepted(UnwindTables)),
+    ("no-use-cxa-atexit", CXX_OBJCXX),
     ("no-vect-cost-model", Accepted(Pass)),
     ("no-wrapv", Accepted(Permission)),
     ("no-zero-initialized-in-bss", Accepted(Placement)),
@@ -243,6 +268,7 @@ const PLAIN: &[(&str, Effect)] = &[
     // No instrumentation, so no `.gcda` profile is written.
     ("profile-generate", Unsupported),
     ("profile-use", Accepted(Pass)),
+    ("rtti", CXX_D_OBJCXX),
     // No optimization record is written.
     ("save-optimization-record", Unsupported),
     ("sched-stalled-insns", Accepted(Pass)),
@@ -271,6 +297,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("strict-overflow", Accepted(Permission)),
     // Main driver: check, write nothing. libxcrypt's symbol-version probe.
     ("syntax-only", Implemented),
+    ("threadsafe-statics", CXX_OBJCXX),
     ("tracer", Accepted(Pass)),
     ("trapping-math", Implemented),
     // Signed overflow wraps rather than aborting.
@@ -295,6 +322,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("verbose-asm", Implemented),
     // Signed arithmetic wraps: c17 does not fold `x + 1 > x`, nor assume
     // anything else from signed overflow being undefined.
+    ("visibility-inlines-hidden", CXX_OBJCXX),
     ("wrapv", Accepted(Default)),
 ];
 
@@ -601,6 +629,31 @@ mod tests {
                 format!("error: structure alignment must be a small power of two, not {v}")
             );
         }
+    }
+
+    /// gcc 13's language lists, from its warning for each in C.
+    #[test]
+    fn other_language_options() {
+        for (name, langs) in [
+            ("rtti", "C++/D/ObjC++"),
+            ("no-rtti", "C++/D/ObjC++"),
+            ("threadsafe-statics", "C++/ObjC++"),
+            ("no-threadsafe-statics", "C++/ObjC++"),
+            ("visibility-inlines-hidden", "C++/ObjC++"),
+            ("no-enforce-eh-specs", "C++/ObjC++"),
+            ("no-use-cxa-atexit", "C++/ObjC++"),
+            ("no-objc-exceptions", "ObjC/ObjC++"),
+        ] {
+            assert_eq!(
+                classify(name),
+                Verdict::Known(ForLanguages(langs)),
+                "-f{name}"
+            );
+        }
+        assert_eq!(
+            classify("check-new"),
+            Verdict::Known(Accepted(OtherLanguage))
+        );
     }
 
     #[test]

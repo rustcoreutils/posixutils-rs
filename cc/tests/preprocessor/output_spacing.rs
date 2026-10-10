@@ -121,3 +121,80 @@ fn preprocessor_output_never_pastes_tokens_together() {
          x y; 1 1; . 1; 1+1; L 'c'; %: %:"
     );
 }
+
+/// Each line keeps its indentation, as gcc keeps it: the first token of a
+/// line goes back to its column. glibc's `versions.awk` reads the
+/// preprocessed `Versions` files by indentation, and with every line flush
+/// left it found no version nodes at all. Under `-P` and without it, and
+/// after a macro expansion, which stands where its name stood.
+#[test]
+fn preprocessor_output_keeps_leading_indentation() {
+    let src = "lib {\n  VER {\n    sym;\n  };\n};\n\
+               #define M(a) a+1\n    M(q) r;\nfoo(a,\n      b);\n   /**/v;\n";
+    let want = "lib {\n  VER {\n    sym;\n  };\n};\n    q+1 r;\nfoo(a,\n      b);\n       v;\n";
+    let r = preprocess_text("pp_indent", src, &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(r.stdout, want);
+
+    let r = preprocess_text("pp_indent_markers", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let text: Vec<&str> = r
+        .stdout
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .collect();
+    assert_eq!(text.join("\n") + "\n", want);
+}
+
+/// A tab is one column, as gcc counts it, however it mixes with spaces and
+/// wherever a macro's expansion starts the line. The expected text is
+/// gcc 13's.
+#[test]
+fn preprocessor_output_indents_a_tab_as_one_column() {
+    let src = "\tx;\n \t x;\n\t\ty;\n#define M(a) a+1\n\t  M(q) r;\n\
+               foo(a,\n\t\tb);\n";
+    let want = " x;\n   x;\n  y;\n   q+1 r;\nfoo(a,\n  b);\n";
+    let r = preprocess_text("pp_indent_tab", src, &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(r.stdout, want);
+
+    let r = preprocess_text("pp_indent_tab_markers", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let text: Vec<&str> = r
+        .stdout
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .collect();
+    assert_eq!(text.join("\n") + "\n", want);
+
+    // A macro invocation running onto the next line, under `-P`.
+    let r = preprocess_text(
+        "pp_indent_tab_args",
+        "#define M(a) a+1\n\tM(\n\tq) s;\n",
+        &["-P"],
+    );
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(r.stdout, " q+1 s;\n");
+}
+
+/// The same for an assembler source, whose `-E` text is written apart.
+#[test]
+fn preprocessor_asm_output_keeps_leading_indentation() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_pp_asm_indent_")
+        .tempdir()
+        .unwrap();
+    let s = dir.path().join("t.S");
+    std::fs::write(&s, "#define R ret\n  foo:\n    movl $1, %eax\n    R\n").unwrap();
+    let r = run_c17(&["-E", "-P", &s.to_string_lossy()]);
+    assert!(r.success, "-E of a .S failed: {}", r.stderr);
+    let text: Vec<&str> = r.stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(text, ["  foo:", "    movl $1, %eax", "    ret"]);
+
+    // Tabs, as gcc 13 writes them.
+    std::fs::write(&s, "\tfoo:\n \t movl $1, %eax\n#define R ret\n\t\tR\n").unwrap();
+    let r = run_c17(&["-E", "-P", &s.to_string_lossy()]);
+    assert!(r.success, "-E of a .S failed: {}", r.stderr);
+    let text: Vec<&str> = r.stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(text, [" foo:", "   movl $1, %eax", "  ret"]);
+}

@@ -1286,6 +1286,32 @@ fn test_tokens_to_source_bytes_multiline() {
     assert!(text.contains("int"));
 }
 
+/// A line keeps its indentation, as in gcc's `-E`: a space for each byte
+/// before its first token, a tab counting as one.
+#[test]
+fn test_tokens_to_source_bytes_keeps_indentation() {
+    assert_eq!(
+        source_text("lib {\n  VER {\n    sym; x;\n  };\n};"),
+        "lib {\n  VER {\n    sym; x;\n  };\n};\n"
+    );
+    assert_eq!(source_text("a\n\tb\n \t c\n\t\td"), "a\n b\n   c\n  d\n");
+}
+
+/// The lexer records the bytes before each token on its physical line --
+/// a tab is one, a comment counts, a splice starts the count again -- and
+/// leaves the column counting a tab to the next multiple of 8.
+#[test]
+fn test_token_line_offset_counts_bytes() {
+    let (tokens, _) = tokenize_str("x\n\t y /**/z\n\\\n  w");
+    let at: Vec<(u16, u8)> = tokens
+        .iter()
+        .filter(|t| t.typ == TokenType::Ident)
+        .map(|t| (t.pos.col, t.pos.line_offset))
+        .collect();
+    assert_eq!(at, [(1, 0), (10, 2), (16, 8), (3, 2)]);
+    assert_eq!(indentation(tokens[2].pos), 2);
+}
+
 #[test]
 fn test_tokens_to_source_bytes_ends_with_newline() {
     assert!(source_text("x").ends_with('\n'));

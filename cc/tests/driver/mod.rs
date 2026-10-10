@@ -14,12 +14,14 @@
 //
 
 mod asm_dependencies;
+mod asm_input;
 mod aux_info;
 mod f_options;
 mod gcc_flags;
 mod link_options;
 mod linker_input;
 mod prefix_map;
+mod subprogram_options;
 mod warn_options;
 mod werror;
 
@@ -741,20 +743,17 @@ fn driver_accepts_mandated_options() {
     }
 }
 
-/// `-B` takes only the two modes the spec names.
+/// `-B` binds only for the two modes the spec names; any other value is
+/// gcc's program prefix, which gcc accepts whether or not it exists.
 #[test]
-fn driver_rejects_unknown_binding_mode() {
+fn driver_other_b_value_is_a_program_prefix() {
     let w = WorkDir::new("badbind");
     let src = w.write("t.c", "int main(void){return 0;}\n");
     let exe = w.join("t.out");
 
     let r = run_c17(&["-B", "bogus", &s(&src), "-o", &s(&exe)]);
-    assert!(!r.success, "-B bogus must be rejected");
-    assert!(
-        r.stderr.contains("-B"),
-        "expected a diagnostic naming -B, got:\n{}",
-        r.stderr
-    );
+    assert!(r.success, "-B bogus is a prefix, as in gcc: {}", r.stderr);
+    assert_eq!(run_exe(&exe), 0);
 }
 
 /// `-s` strips the symbol table.

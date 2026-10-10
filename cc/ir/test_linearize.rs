@@ -24,14 +24,7 @@ use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeTable};
 
 /// Create a default position for test code
 pub(super) fn test_pos() -> Position {
-    Position {
-        stream: 0,
-        line: 1,
-        col: 1,
-        newline: false,
-        whitespace: false,
-        noexpand: false,
-    }
+    Position::new(0, 1, 1)
 }
 
 /// Test context that provides StringTable, TypeTable, and SymbolTable for tests.

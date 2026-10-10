@@ -1379,6 +1379,53 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
+    /// Preprocess a translation unit's tokens, the `-include` files first.
+    ///
+    /// They run after `-D`/`-U`, because a header may well test what they
+    /// defined, and before the source, because that is what "as if it were
+    /// the first line" means.
+    pub fn preprocess_unit(
+        &mut self,
+        tokens: Vec<Token>,
+        pre_includes: &[String],
+        idents: &mut IdentTable,
+    ) -> Vec<Token> {
+        let mut included = Vec::new();
+        for path in pre_includes {
+            self.include_from_cmdline(path, &mut included, idents);
+        }
+
+        let mut output = self.preprocess(tokens, idents);
+        self.report_unterminated_conditionals();
+
+        if !included.is_empty() {
+            // After the source's own `StreamBegin`, not before it. The marker
+            // says where the translation unit starts, and everything
+            // downstream reads the stream structure -- a `StreamBegin`
+            // arriving partway through the token vector is not something any
+            // consumer expects.
+            let at = usize::from(matches!(
+                output.first().map(|t| t.typ),
+                Some(TokenType::StreamBegin)
+            ));
+            output.splice(at..at, included);
+        }
+        output
+    }
+
+    /// Take the `-I` directories, and settle the whole search chain as gcc
+    /// does; see [`search_chain`].
+    fn set_include_paths(&mut self, include_paths: &[String]) {
+        let chain = search_chain(
+            &self.iquote_include_paths,
+            include_paths,
+            &self.system_include_paths,
+        );
+        self.iquote_include_paths = chain.iquote;
+        self.quote_include_paths = chain.bracket;
+        self.system_include_paths = chain.system;
+    }
+
     /// Apply one command-line `-D` specification.
     ///
     /// The spec is rewritten as the equivalent `#define` directive and run
@@ -2806,6 +2853,73 @@ pub struct SystemSearch<'a> {
     pub no_std_inc: bool,
 }
 
+/// The include search chain the command line names, with gcc's duplicates
+/// removed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchChain {
+    /// `-iquote`, for the `"..."` form only.
+    pub iquote: Vec<String>,
+    /// `-I`.
+    pub bracket: Vec<String>,
+    /// `-isystem`, the target's own directories, then `-idirafter`.
+    pub system: Vec<String>,
+}
+
+/// gcc's search chain from its three parts (`merge_include_chains` in its
+/// `incpath.c`): a directory named twice is searched where it was first
+/// named, and a `-I` or `-iquote` directory that is also a system directory
+/// is dropped, so it keeps its place, and its status, as a system one. The
+/// last `-iquote` directory goes too when it is the first `-I` one, the
+/// chain going straight on into it.
+///
+/// `#include_next` resumes just past where a header was found, so a
+/// duplicate left in the chain brings a header back to itself: glibc names
+/// `-I../include` twice, and its `stackinfo.h` reached itself instead of
+/// the header it wraps. Directories are the same when they are the same
+/// directory, however spelled -- gcc compares inodes, this compares
+/// canonical paths -- and one that cannot be resolved is compared by name.
+pub fn search_chain(iquote: &[String], bracket: &[String], system: &[String]) -> SearchChain {
+    let system = remove_duplicate_dirs(system, &[], None);
+    let system_ids: Vec<PathBuf> = system.iter().map(|d| dir_identity(d)).collect();
+    let bracket = remove_duplicate_dirs(bracket, &system_ids, system_ids.first());
+    let after_iquote = bracket.first().map(|d| dir_identity(d));
+    let iquote = remove_duplicate_dirs(
+        iquote,
+        &system_ids,
+        after_iquote.as_ref().or(system_ids.first()),
+    );
+    SearchChain {
+        iquote,
+        bracket,
+        system,
+    }
+}
+
+/// What makes two search directories the same one.
+fn dir_identity(dir: &str) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir))
+}
+
+/// `chain` without the directories in `system`, those named earlier in
+/// `chain`, and its last one when that is `next`, the directory the chain
+/// continues into.
+fn remove_duplicate_dirs(
+    chain: &[String],
+    system: &[PathBuf],
+    next: Option<&PathBuf>,
+) -> Vec<String> {
+    let mut kept: Vec<(String, PathBuf)> = Vec::with_capacity(chain.len());
+    for (i, dir) in chain.iter().enumerate() {
+        let id = dir_identity(dir);
+        let last_joins_next = i + 1 == chain.len() && next == Some(&id);
+        if system.contains(&id) || kept.iter().any(|(_, k)| *k == id) || last_joins_next {
+            continue;
+        }
+        kept.push((dir.clone(), id));
+    }
+    kept.into_iter().map(|(dir, _)| dir).collect()
+}
+
 /// Configuration for preprocessing command-line options
 #[derive(Default)]
 pub struct PreprocessConfig<'a> {
@@ -2968,10 +3082,7 @@ pub fn preprocess_collecting(
     define_pic_macros(&mut pp, target, config.position);
     define_isa_macros(&mut pp, target, config.isa);
 
-    // Add -I include paths
-    for path in config.include_paths {
-        pp.quote_include_paths.push(path.clone());
-    }
+    pp.set_include_paths(config.include_paths);
 
     // -D, then -U, which wins
     pp.apply_cmdline_macros(config.defines, config.undefines, idents);
@@ -2985,28 +3096,7 @@ pub fn preprocess_collecting(
         Vec::new()
     };
 
-    // `-include` runs after `-D`/`-U`, because a header may well test what
-    // they defined, and before the source, because that is what "as if it were
-    // the first line" means.
-    let mut included = Vec::new();
-    for path in config.pre_includes {
-        pp.include_from_cmdline(path, &mut included, idents);
-    }
-
-    let mut output = pp.preprocess(tokens, idents);
-    pp.report_unterminated_conditionals();
-
-    if !included.is_empty() {
-        // After the source's own `StreamBegin`, not before it. The marker says
-        // where the translation unit starts, and everything downstream reads
-        // the stream structure -- a `StreamBegin` arriving partway through the
-        // token vector is not something any consumer expects.
-        let at = usize::from(matches!(
-            output.first().map(|t| t.typ),
-            Some(TokenType::StreamBegin)
-        ));
-        output.splice(at..at, included);
-    }
+    let output = pp.preprocess_unit(tokens, config.pre_includes, idents);
 
     let outcome = PreprocessOutcome {
         macro_definitions: if config.dump_macros {
@@ -3050,6 +3140,10 @@ pub struct AsmPreprocessConfig<'a> {
     /// See [`PreprocessConfig::collect_dependencies`]: a `.S` is preprocessed,
     /// so the `-M` family has a rule to write for it.
     pub collect_dependencies: bool,
+    /// See [`PreprocessConfig::pre_includes`]: gcc applies `-include` to a
+    /// `.S` as to C, and glibc and Kbuild force-include their configuration
+    /// headers into every one.
+    pub pre_includes: &'a [String],
 }
 
 /// A preprocessed `.S`: the text for `as`, and the headers it read.
@@ -3141,17 +3235,12 @@ pub fn preprocess_asm_file(
         pp.use_builtin_headers = false;
     }
 
-    // Add -I include paths
-    for path in config.include_paths {
-        pp.quote_include_paths.push(path.clone());
-    }
+    pp.set_include_paths(config.include_paths);
 
     // -D, then -U, which wins
     pp.apply_cmdline_macros(config.defines, config.undefines, &mut strings);
 
-    // Preprocess
-    let preprocessed = pp.preprocess(tokens, &mut strings);
-    pp.report_unterminated_conditionals();
+    let preprocessed = pp.preprocess_unit(tokens, config.pre_includes, &mut strings);
 
     // Convert tokens back to text
     let text = tokens_to_source_bytes(&preprocessed, &strings);

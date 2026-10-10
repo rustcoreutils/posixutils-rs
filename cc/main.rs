@@ -33,7 +33,7 @@ use posixutils_cc::warn_options::{self, Verdict};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{gettext, gettext_args};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::process::Command;
 
@@ -378,9 +378,33 @@ struct Args {
     #[arg(short = 'R', action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add directory to the runtime library search path"))]
     run_paths: Vec<String>,
 
-    /// Library binding preference — POSIX -B dynamic|static.
-    #[arg(short = 'B', value_name = "mode", help = gettext("Library binding: 'dynamic' or 'static'"))]
+    /// Library binding preference — POSIX -B dynamic|static. Any other
+    /// `-B` value is gcc's program prefix, rewritten by
+    /// `preprocess_args_from` into `--c17-prefix`.
+    #[arg(short = 'B', value_name = "mode",
+          value_parser = clap::builder::PossibleValuesParser::new(["dynamic", "static"]),
+          help = gettext("Library binding: 'dynamic' or 'static'"))]
     binding: Option<String>,
+
+    /// gcc's `-B<prefix>`: where the assembler and the link's programs and
+    /// startup files are looked for first (rewritten by
+    /// `preprocess_args_from`), in command-line order.
+    #[arg(long = "c17-prefix", action = clap::ArgAction::Append, value_name = "prefix",
+          allow_hyphen_values = true, hide = true)]
+    prefixes: Vec<String>,
+
+    /// The options `-Wa,` and `-Xassembler` give the assembler, one word
+    /// each, in command-line order (rewritten by `preprocess_args_from`).
+    #[arg(long = "c17-asm-option", action = clap::ArgAction::Append, value_name = "option",
+          allow_hyphen_values = true, hide = true)]
+    asm_options: Vec<String>,
+
+    /// The `-f` options gcc takes only for another language, each warned
+    /// about as gcc warns once `-w` and `-Werror` are known (rewritten by
+    /// `preprocess_args_from`).
+    #[arg(long = "c17-other-language", action = clap::ArgAction::Append, value_name = "option",
+          allow_hyphen_values = true, hide = true)]
+    other_language_options: Vec<String>,
 
     /// Produce a shared object — POSIX -G. Equivalent to --shared.
     #[arg(short = 'G', help = gettext("Produce a shared object"))]
@@ -825,7 +849,8 @@ fn preprocess_asm_operand(
 /// translation phase 1 has no byte for it, and `as` reads the leading 0xEF as
 /// the first character of a mnemonic.
 fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8>> {
-    let content = strip_bom(&std::fs::read(path)?).to_vec();
+    let (content, name) = read_operand(path)?;
+    let content = strip_bom(&content);
     // Only a `.S` is preprocessed, so only a `.S` has a rule: gcc writes none
     // for a `.s`, under `-M` or `-MD`.
     let collect_dependencies = args.wants_dependencies() && args.lang_of(path) == Lang::AsmCpp;
@@ -840,9 +865,10 @@ fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8
         no_std_inc: args.no_std_inc,
         macro_prefix_map: args.prefix_maps().macros,
         collect_dependencies,
+        pre_includes: &args.pre_includes,
     };
     // Catches #error, a missing include, and friends.
-    let preprocessed = preprocess_asm_file(&content, target, path, &config).map_err(|e| {
+    let preprocessed = preprocess_asm_file(content, target, name, &config).map_err(|e| {
         diag::reset_counts();
         io::Error::new(io::ErrorKind::InvalidData, e.to_string())
     })?;
@@ -852,13 +878,28 @@ fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8
     Ok(preprocessed.text)
 }
 
-/// Write the make rule for one translation unit.
+/// An operand's bytes, and the name its diagnostics and line markers give
+/// it: `-` is standard input, named `<stdin>` as gcc names it.
+fn read_operand(path: &str) -> io::Result<(Vec<u8>, &str)> {
+    if path == "-" {
+        let mut buffer = Vec::new();
+        io::stdin().read_to_end(&mut buffer)?;
+        Ok((buffer, "<stdin>"))
+    } else {
+        Ok((std::fs::read(path)?, path))
+    }
+}
+
+/// Write the make rule for one translation unit, read from the operand
+/// `source`.
 ///
 /// The shape is gcc's, which is what a makefile's `include` expects:
 /// `target: source header...`, wrapped at a sensible width with a trailing
 /// backslash, and -- under `-MP` -- a bare `header:` rule for each
-/// prerequisite so that deleting a header does not break the build before the
-/// makefile is regenerated.
+/// header so that deleting a header does not break the build before the
+/// makefile is regenerated. Standard input is no file make could find, so
+/// it is not a prerequisite, as it is not in gcc's rule: glibc's next `make`
+/// stopped at "No rule to make target '<stdin>'".
 fn write_dependency_rule(
     args: &Args,
     source: &str,
@@ -866,13 +907,13 @@ fn write_dependency_rule(
 ) -> io::Result<()> {
     let target = dependency_target(args, source);
 
-    let mut prerequisites = vec![escape_for_make(source)];
-    for (path, is_system) in dependencies {
-        if *is_system && args.dependencies_omit_system() {
-            continue;
-        }
-        prerequisites.push(escape_for_make(&path.to_string_lossy()));
-    }
+    let headers: Vec<String> = dependencies
+        .iter()
+        .filter(|(_, is_system)| !(*is_system && args.dependencies_omit_system()))
+        .map(|(path, _)| escape_for_make(&path.to_string_lossy()))
+        .collect();
+    let named_source = (source != "-").then(|| escape_for_make(source));
+    let prerequisites: Vec<&String> = named_source.iter().chain(&headers).collect();
 
     // gcc wraps near 80 columns; the exact column is cosmetic, the
     // backslash-newline is not.
@@ -895,8 +936,8 @@ fn write_dependency_rule(
     if args.deps_phony {
         // Not for the source itself: it is not a header, and a rule for it
         // would shadow the real one.
-        for prereq in prerequisites.iter().skip(1) {
-            rule.push_str(prereq);
+        for header in &headers {
+            rule.push_str(header);
             rule.push_str(":\n");
         }
     }
@@ -948,13 +989,14 @@ fn source_basename_with(source: &str, extension: &str) -> String {
 /// a caller writes a target make already understands, so escaping it would be
 /// wrong. Otherwise the compiling forms take `-o` -- the object really being
 /// built is what the rule is about -- and everything else falls back to the
-/// source's basename with `.o`.
+/// source's basename with `.o`, or to gcc's `-` for standard input.
 fn dependency_target(args: &Args, source: &str) -> String {
     if !args.deps_target.is_empty() {
         return args.deps_target.join(" ");
     }
     match &args.output {
         Some(out) if !args.dependencies_replace_output() && out != "-" => escape_for_make(out),
+        _ if source == "-" => source.to_string(),
         _ => escape_for_make(&source_basename_with(source, "o")),
     }
 }
@@ -1192,6 +1234,9 @@ fn emit_preprocessed(
             // source byte, so writing `text` re-encoded every byte >= 0x80
             // as two and `c17 -E` changed what the string held.
             spelling.clear();
+            if at_line_start {
+                spelling.resize(token::lexer::indentation(token.pos), b' ');
+            }
             write_token(&mut spelling, token, strings);
             out.preprocessed.write_all(&spelling)?;
             at_line_start = false;
@@ -1240,17 +1285,7 @@ fn process_file(
     scratch: &Path,
     operand_id: usize,
 ) -> io::Result<Compiled> {
-    // Read file (or stdin if path is "-")
-    let mut buffer = Vec::new();
-    let display_path = if path == "-" {
-        io::stdin().read_to_end(&mut buffer)?;
-        "<stdin>"
-    } else {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        reader.read_to_end(&mut buffer)?;
-        path
-    };
+    let (buffer, display_path) = read_operand(path)?;
 
     // POSIX 87981-87983: a `.i` operand is the output of `c17 -E`, and the
     // processing that produced it "shall not be repeated when the file is
@@ -1331,7 +1366,7 @@ fn process_file(
     // here whichever form asked for it -- before `-E` decides what to print,
     // and before compilation, which `-MD`/`-MMD` do not suppress.
     if args.wants_dependencies() {
-        write_dependency_rule(args, display_path, &outcome.dependencies)?;
+        write_dependency_rule(args, path, &outcome.dependencies)?;
         if args.dependencies_replace_output() {
             // `-M` and `-MM` produce the rule *instead of* anything else --
             // but a rule built from a translation unit that did not
@@ -1440,15 +1475,9 @@ fn process_file(
         ObjectName::Temp(p) => (p.clone(), true),
     };
 
-    let status = AssemblerCommand::new(
-        target.os,
-        args.debug > 0,
-        &prefix_maps.debug,
-        &temp_asm,
-        &obj_file,
-    )
-    .command()
-    .status()?;
+    let status = AssemblerCommand::new(target.os, &args.asm_settings(), &temp_asm, &obj_file)
+        .command()
+        .status()?;
 
     let _ = std::fs::remove_file(&temp_asm);
 
@@ -1557,6 +1586,10 @@ fn link_objects(
         link_cmd.arg(mode);
     }
     link_cmd.args(["-o", exe_file]);
+    // gcc's `-B` prefixes, for the host driver to find the linker and the
+    // startup files in, as gcc's own driver would: glibc links its shared
+    // objects with `-B$(csu-objpfx)` to take its fresh `crti.o`.
+    link_cmd.args(args.prefixes.iter().map(|p| format!("-B{p}")));
 
     // -B selects which form of a library `-l` prefers. GNU ld spells this
     // -Bstatic / -Bdynamic and it is positional, so it goes ahead of the
@@ -1856,7 +1889,7 @@ fn takes_next_word(arg: &str) -> bool {
     // Bare `-W` is `-Wextra`, given its value by the pre-pass.
     arg != "-W"
         && (takes_separate_value(&clap_spelling(arg))
-            || matches!(arg, "-x" | "-Xlinker" | "--param"))
+            || matches!(arg, "-x" | "-Xlinker" | "-Xassembler" | "--param"))
 }
 
 /// Preprocess command-line arguments for gcc compatibility.
@@ -1919,6 +1952,35 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             result.push("-W".to_string());
             result.push("extra".to_string());
             i += 1;
+        } else if let Some(value) = arg.strip_prefix("-B") {
+            // POSIX's `-B dynamic|static`, in either spelling; any other
+            // value is gcc's program prefix, `-B<prefix>` or `-B <prefix>`.
+            let (value, used) = if value.is_empty() {
+                (raw_args[i + 1].as_str(), 2)
+            } else {
+                (value, 1)
+            };
+            if matches!(value, "dynamic" | "static") {
+                result.push("-B".to_string());
+                result.push(value.to_string());
+            } else {
+                result.push(format!("--c17-prefix={value}"));
+            }
+            i += used;
+        } else if let Some(list) = arg.strip_prefix("-Wa,") {
+            // gcc splits at the commas and gives each word to `as`.
+            result.extend(
+                list.split(',')
+                    .filter(|w| !w.is_empty())
+                    .map(|w| format!("--c17-asm-option={w}")),
+            );
+            i += 1;
+        } else if arg == "-Xassembler" {
+            result.push(format!("--c17-asm-option={}", raw_args[i + 1]));
+            i += 2;
+        } else if let Some(list) = arg.strip_prefix("-Wp,") {
+            result.extend(preprocessor_pass_through(arg, list)?);
+            i += 1;
         } else if takes_separate_value(&spelled) {
             // `-I dir`, `-o file`, `-include file`, ...: the next word is the
             // value as written, even one that looks like an option
@@ -1980,11 +2042,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
         } else if arg.starts_with("-R") && arg.len() > 2 {
             // -R/opt/lib → -R /opt/lib
             result.push("-R".to_string());
-            result.push(arg[2..].to_string());
-            i += 1;
-        } else if arg.starts_with("-B") && arg.len() > 2 {
-            // -Bstatic → -B static
-            result.push("-B".to_string());
             result.push(arg[2..].to_string());
             i += 1;
         } else if let Some(spec) = arg.strip_prefix("-std=") {
@@ -2149,6 +2206,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
                 f_options::Verdict::Known(Effect::Implemented) => {
                     debug_assert!(false, "{arg} is implemented, so parsed above");
                 }
+                f_options::Verdict::Known(Effect::ForLanguages(_)) => {
+                    result.push(format!("--c17-other-language={arg}"));
+                }
                 f_options::Verdict::Error(lines) => driver_errors.extend(lines),
             }
             // `-fno-<family>` withdraws an earlier request.
@@ -2303,6 +2363,56 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
+/// The options a `-Wp,<list>` gives the preprocessor, as c17's own.
+///
+/// gcc splits the list at its commas and hands the words to the
+/// preprocessor, where `-MD <file>` and `-MMD <file>` take the file as the
+/// next word: Kbuild compiles every object with `-Wp,-MMD,./.x.o.d`, which
+/// is `-MMD -MF ./.x.o.d`. The other options taken are the ones that mean the
+/// same to c17's driver: `-D`, `-U` and `-I`, their value attached or the
+/// next word, and `-MF`, `-MT` and `-MP`. Anything else is refused rather
+/// than dropped, since the preprocessor would not have done what it says.
+fn preprocessor_pass_through(arg: &str, list: &str) -> Result<Vec<String>, String> {
+    let words: Vec<&str> = list.split(',').filter(|w| !w.is_empty()).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+        let mut value = || {
+            i += 1;
+            words.get(i).map(|v| v.to_string()).ok_or_else(|| {
+                format!("{} '{word}' ({arg})", gettext("error: missing argument to"))
+            })
+        };
+        match word {
+            "-MD" | "-MMD" => {
+                let file = value()?;
+                out.extend([format!("-{word}"), "--MF".to_string(), file]);
+            }
+            "-MF" | "-MT" => {
+                let v = value()?;
+                out.extend([format!("-{word}"), v]);
+            }
+            "-MP" => out.push("--MP".to_string()),
+            "-D" | "-U" | "-I" => {
+                let v = value()?;
+                out.extend([word.to_string(), v]);
+            }
+            _ if ["-D", "-U", "-I"].iter().any(|o| word.starts_with(o)) => {
+                out.extend([word[..2].to_string(), word[2..].to_string()]);
+            }
+            _ => {
+                return Err(format!(
+                    "{}: '{word}' ({arg})",
+                    gettext("error: preprocessor option not supported")
+                ))
+            }
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
 /// The `-f` spelling of a path prefix map written `--NAME=VALUE`.
 ///
 /// gcc's driver takes `--NAME` for `-fNAME`, and gmp passes
@@ -2381,20 +2491,23 @@ fn query_target(raw_args: &[String]) -> Target {
 /// that is not a directory or the bundled headers are off.
 fn include_search_list(args: &Args, target: &Target) -> String {
     let search = system_search(args);
-    let mut angle: Vec<String> = args.include_paths.clone();
+    let mut system: Vec<String> = search.isystem.to_vec();
+    if !search.no_std_inc {
+        system.extend(os::get_include_paths(target, search.sysroot));
+    }
+    system.extend(search.idirafter.iter().cloned());
+    let chain = token::preprocess::search_chain(search.iquote, &args.include_paths, &system);
+
+    let mut angle = chain.bracket;
     if !args.no_std_inc && !args.no_builtin_inc {
         angle.extend(host_include_dir());
     }
-    angle.extend(search.isystem.iter().cloned());
-    if !search.no_std_inc {
-        angle.extend(os::get_include_paths(target, search.sysroot));
-    }
-    angle.extend(search.idirafter.iter().cloned());
+    angle.extend(chain.system);
 
     let exists = |dir: &&String| Path::new(dir).is_dir();
     let entry = |dir: &String| format!(" {dir}\n");
     let mut out = String::from("#include \"...\" search starts here:\n");
-    out.extend(search.iquote.iter().filter(exists).map(entry));
+    out.extend(chain.iquote.iter().filter(exists).map(entry));
     out.push_str("#include <...> search starts here:\n");
     out.extend(angle.iter().filter(exists).map(entry));
     out.push_str("End of search list.\n");
@@ -2897,15 +3010,10 @@ fn assemble_operand(
         path.to_string()
     };
 
-    let status = AssemblerCommand::new(
-        target.os,
-        args.debug > 0,
-        &args.prefix_maps().debug,
-        &asm_to_assemble,
-        &obj_file,
-    )
-    .command()
-    .status()?;
+    let status =
+        AssemblerCommand::new(target.os, &args.asm_settings(), &asm_to_assemble, &obj_file)
+            .command()
+            .status()?;
 
     if needs_cpp {
         let _ = std::fs::remove_file(&asm_to_assemble);
@@ -2924,43 +3032,110 @@ fn assemble_operand(
 
 /// How to assemble one `.s` file: the program and its arguments.
 ///
-/// Normally this is the system `as`. On Darwin with a debug prefix map in
-/// effect it is the host driver instead: Apple's assembler is clang's
-/// integrated assembler, which records its own working directory in the DWARF
-/// line table unless it is told the mapping, and only the driver forwards
-/// `-fdebug-prefix-map` to it. GNU `as` records no such directory.
+/// Normally this is `as`: the first one in a `-B` prefix, else the system's.
+/// Every `.s` is assembled so -- the code generated for a `.c` too -- so the
+/// `-Wa,` options reach the assembler whatever the operand was. On Darwin
+/// with a debug prefix map in effect it is the host driver instead: Apple's
+/// assembler is clang's integrated assembler, which records its own working
+/// directory in the DWARF line table unless it is told the mapping, and only
+/// the driver forwards `-fdebug-prefix-map` to it. GNU `as` records no such
+/// directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AssemblerCommand {
-    program: &'static str,
+    program: String,
     args: Vec<String>,
 }
 
+/// What every assembler run of one invocation is given, whatever the
+/// operand: a `.s`, a preprocessed `.S`, or the code generated for a `.c`.
+struct AsmSettings<'a> {
+    debug: bool,
+    debug_map: PrefixMap,
+    /// `-Wa,` and `-Xassembler`, passed on in order as gcc passes them.
+    options: &'a [String],
+    /// gcc's `-B` prefixes, searched for the assembler.
+    prefixes: &'a [String],
+}
+
+impl Args {
+    fn asm_settings(&self) -> AsmSettings<'_> {
+        AsmSettings {
+            debug: self.debug > 0,
+            debug_map: self.prefix_maps().debug,
+            options: &self.asm_options,
+            prefixes: &self.prefixes,
+        }
+    }
+}
+
+/// The program `name` as gcc's driver finds it: the first `-B` prefix that
+/// holds it, the prefix and the name simply concatenated (`-B/x/foo-` names
+/// `/x/foo-as`), else `name` alone, found on PATH. A prefix naming a
+/// directory without its trailing `/` is given one, as gcc gives it.
+fn find_subprogram(prefixes: &[String], name: &str) -> String {
+    prefixes
+        .iter()
+        .map(|prefix| {
+            if !prefix.ends_with('/') && Path::new(prefix).is_dir() {
+                format!("{prefix}/{name}")
+            } else {
+                format!("{prefix}{name}")
+            }
+        })
+        .find(|candidate| is_executable_file(Path::new(candidate)))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Whether `path` is a regular file this process may run.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
 impl AssemblerCommand {
-    fn new(os: Os, debug: bool, debug_map: &PrefixMap, input: &str, output: &str) -> Self {
+    fn new(os: Os, settings: &AsmSettings, input: &str, output: &str) -> Self {
         let mut args = Vec::new();
-        let program = if os == Os::MacOS && !debug_map.is_empty() {
+        let program = if os == Os::MacOS && !settings.debug_map.is_empty() {
             args.extend(["-c", "-x", "assembler", input, "-o", output].map(String::from));
-            if debug {
+            if settings.debug {
                 args.push("-g".to_string());
             }
             args.extend(
-                debug_map
+                settings
+                    .debug_map
                     .entries()
                     .map(|(old, new)| format!("-fdebug-prefix-map={old}={new}")),
             );
-            linkargs::HOST_DRIVER
+            // The driver finds its assembler by the prefixes too, and hands
+            // it each option whole.
+            args.extend(settings.prefixes.iter().map(|p| format!("-B{p}")));
+            for option in settings.options {
+                args.extend(["-Xassembler".to_string(), option.clone()]);
+            }
+            linkargs::HOST_DRIVER.to_string()
         } else {
-            if debug {
+            if settings.debug {
                 args.push("-g".to_string());
             }
+            args.extend(settings.options.iter().cloned());
             args.extend(["-o", output, input].map(String::from));
-            "as"
+            find_subprogram(settings.prefixes, "as")
         };
         AssemblerCommand { program, args }
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(self.program);
+        let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
         cmd
     }
@@ -3133,6 +3308,16 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             option
         ));
     }
+    for option in &args.other_language_options {
+        if let f_options::Verdict::Known(Effect::ForLanguages(languages)) =
+            f_options::classify(&option[2..])
+        {
+            refused |= driver_leniency(&gettext_args(
+                "command-line option '{0}' is valid for {1} but not for C",
+                &[option, languages],
+            ));
+        }
+    }
     for option in &args.unsupported_options {
         refused |= diag::command_line_group_warning(
             f_options::UNSUPPORTED_WARNING,
@@ -3285,17 +3470,6 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if refused {
         std::process::exit(1);
-    }
-
-    if let Some(mode) = args.binding.as_deref() {
-        if mode != "dynamic" && mode != "static" {
-            eprintln!(
-                "c17: -B: {}: '{}'",
-                gettext("expected 'dynamic' or 'static'"),
-                mode
-            );
-            std::process::exit(1);
-        }
     }
 
     // One scratch directory for the whole run. `tempfile` places it under
@@ -3718,13 +3892,93 @@ mod tests {
         assert_eq!(args.files, ["foo.c"]);
     }
 
-    fn assembler(os: Os, debug: bool, map: &[(&str, &str)]) -> (&'static str, Vec<String>) {
+    fn assembler(os: Os, debug: bool, map: &[(&str, &str)]) -> (String, Vec<String>) {
+        assembler_with(os, debug, map, &[])
+    }
+
+    fn assembler_with(
+        os: Os,
+        debug: bool,
+        map: &[(&str, &str)],
+        options: &[String],
+    ) -> (String, Vec<String>) {
         let mut debug_map = PrefixMap::default();
         for (old, new) in map {
             debug_map.push(old, new);
         }
-        let cmd = AssemblerCommand::new(os, debug, &debug_map, "t.s", "t.o");
+        let settings = AsmSettings {
+            debug,
+            debug_map,
+            options,
+            prefixes: &[],
+        };
+        let cmd = AssemblerCommand::new(os, &settings, "t.s", "t.o");
         (cmd.program, cmd.args)
+    }
+
+    /// `-Wa,` words go to `as` ahead of its operands, and through the
+    /// driver each goes whole with `-Xassembler`.
+    #[test]
+    fn test_assembler_options_are_passed_on() {
+        let opts = ["--defsym".to_string(), "A=1,2".to_string()];
+        let (program, args) = assembler_with(Os::Linux, false, &[], &opts);
+        assert_eq!(program, "as");
+        assert_eq!(args, ["--defsym", "A=1,2", "-o", "t.o", "t.s"]);
+        let (_, args) = assembler_with(Os::MacOS, false, &[("/b", ".")], &opts);
+        assert!(args.ends_with(&[
+            "-Xassembler".to_string(),
+            "--defsym".to_string(),
+            "-Xassembler".to_string(),
+            "A=1,2".to_string()
+        ]));
+    }
+
+    /// `-Wa,` is split at its commas, empty words dropped; `-Xassembler`
+    /// is not split. `-Wp,` becomes the driver's own options.
+    #[test]
+    fn test_preprocess_wa_and_wp() {
+        let r = run_preprocess(&[
+            "-Wa,--noexecstack,,--defsym,X=1",
+            "-Xassembler",
+            "a,b",
+            "f.c",
+        ]);
+        assert_eq!(
+            r[1..],
+            [
+                "--c17-asm-option=--noexecstack",
+                "--c17-asm-option=--defsym",
+                "--c17-asm-option=X=1",
+                "--c17-asm-option=a,b",
+                "f.c"
+            ]
+        );
+        let r = run_preprocess(&["-Wp,-MMD,.f.d,-DA=1,-U,B", "f.c"]);
+        assert_eq!(
+            r[1..],
+            ["--MMD", "--MF", ".f.d", "-D", "A=1", "-U", "B", "f.c"]
+        );
+        assert!(preprocess_err(&["-Wp,-dD", "f.c"]).contains("'-dD'"));
+        assert!(preprocess_err(&["-Wp,-MD", "f.c"]).contains("missing argument"));
+    }
+
+    /// `-B` is POSIX's binding for `dynamic` and `static`, gcc's prefix for
+    /// anything else, in both spellings.
+    #[test]
+    fn test_preprocess_b_binding_or_prefix() {
+        for (argv, want) in [
+            (&["-Bstatic"][..], &["-B", "static"][..]),
+            (&["-B", "dynamic"], &["-B", "dynamic"]),
+            (&["-B/x/"], &["--c17-prefix=/x/"]),
+            (&["-B", "/x"], &["--c17-prefix=/x"]),
+            (&["-B", "-Wall"], &["--c17-prefix=-Wall"]),
+        ] {
+            let mut full = argv.to_vec();
+            full.push("f.c");
+            let mut want = want.to_vec();
+            want.push("f.c");
+            assert_eq!(run_preprocess(&full)[1..], want, "{argv:?}");
+        }
     }
 
     #[test]
@@ -3774,14 +4028,17 @@ mod tests {
             assert_eq!(
                 assembler(os, true, map),
                 (
-                    "as",
+                    "as".to_string(),
                     vec!["-g".into(), "-o".into(), "t.o".into(), "t.s".into()]
                 ),
                 "{os:?}"
             );
             assert_eq!(
                 assembler(os, false, map),
-                ("as", vec!["-o".into(), "t.o".into(), "t.s".into()]),
+                (
+                    "as".to_string(),
+                    vec!["-o".into(), "t.o".into(), "t.s".into()]
+                ),
                 "{os:?}"
             );
         }
@@ -4317,7 +4574,6 @@ mod tests {
             assert_eq!(field(parse(opt)), [v], "{opt}");
         }
         assert_eq!(one(parse("-o").output), [v]);
-        assert_eq!(one(parse("-B").binding), [v]);
         assert_eq!(one(parse("-MF").deps_file), [v]);
         assert_eq!(one(parse("-aux-info").aux_info), [v]);
         assert_eq!(one(parse("--sysroot").sysroot), [v]);

@@ -394,3 +394,39 @@ fn fgnu89_inline_selects_the_inline_predefine() {
         assert_eq!(r.stdout.trim(), want, "{flags:?}");
     }
 }
+
+/// The `-f` options gcc takes for other languages are taken for C with
+/// gcc's warning, exit status 0: gcc-14's configure probes `-fno-rtti`
+/// with `CC` and puts the answer into its C++ flags. `-w` silences the
+/// warning and `-Werror` makes it an error, as with gcc.
+#[test]
+fn f_options_other_language_options_warn_as_gcc() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for (opt, langs) in [
+        ("-fno-rtti", "C++/D/ObjC++"),
+        ("-frtti", "C++/D/ObjC++"),
+        ("-fno-threadsafe-statics", "C++/ObjC++"),
+        ("-fvisibility-inlines-hidden", "C++/ObjC++"),
+        ("-fno-enforce-eh-specs", "C++/ObjC++"),
+        ("-fno-use-cxa-atexit", "C++/ObjC++"),
+        ("-fno-objc-exceptions", "ObjC/ObjC++"),
+    ] {
+        let r = compile_in(dir.path(), &path, &[opt]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        assert_eq!(
+            r.stderr,
+            format!(
+                "c17: warning: command-line option '{opt}' is valid for {langs} but not for C\n"
+            ),
+            "{opt}"
+        );
+        let r = compile_in(dir.path(), &path, &["-w", opt]);
+        assert!(r.success && r.stderr.is_empty(), "-w {opt}: {}", r.stderr);
+        let r = compile_in(dir.path(), &path, &["-Werror", opt]);
+        assert!(!r.success, "-Werror {opt} passed");
+        assert!(r.stderr.contains("[-Werror]"), "{}", r.stderr);
+    }
+    // gcc 13 takes `-fcheck-new` for C in silence.
+    let r = compile_in(dir.path(), &path, &["-fcheck-new", "-fno-check-new"]);
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+}

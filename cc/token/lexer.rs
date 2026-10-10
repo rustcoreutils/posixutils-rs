@@ -819,6 +819,9 @@ pub struct Tokenizer<'a, 'b> {
     stream_id: u16,
     line: u32,
     col: u16,
+    /// Where the current physical line starts in `buffer`, for
+    /// `Position::line_offset`.
+    line_start: usize,
     newline: bool,
     whitespace: bool,
 
@@ -852,6 +855,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             stream_id,
             line: 1,
             col: 0,
+            line_start: 0,
             newline: true,
             whitespace: false,
             strings,
@@ -884,6 +888,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             self.offset = offset;
             self.line += lines;
             self.col = 0;
+            self.line_start = offset;
         }
 
         if self.offset >= self.buffer.len() {
@@ -900,6 +905,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
             self.line += 1;
             self.col = 0;
+            self.line_start = self.offset;
             self.newline = true;
             return b'\n' as i32;
         }
@@ -908,6 +914,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         if c == b'\n' {
             self.line += 1;
             self.col = 0;
+            self.line_start = self.offset;
             self.newline = true;
             return c as i32;
         }
@@ -1650,6 +1657,8 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             // does start a line.
             let newline = std::mem::take(&mut self.newline);
             let whitespace = std::mem::take(&mut self.whitespace);
+            // `c` is the token's first byte, just read.
+            let line_offset = u8::try_from(self.offset - 1 - self.line_start).unwrap_or(u8::MAX);
 
             // C99 6.4.7: where a header name can appear, it is one token and
             // none of the ordinary rules apply inside it.
@@ -1665,6 +1674,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 Some(mut token) => {
                     token.pos.newline = newline;
                     token.pos.whitespace = whitespace;
+                    token.pos.line_offset = line_offset;
                     header_pos = self.next_header_name_pos(header_pos, &token);
                     tokens.push(token);
                 }
@@ -1968,6 +1978,16 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
 
 // Token to Text Conversion (for preprocessing output)
 
+/// The spaces that put a token starting an output line back in its column,
+/// as gcc's `-E` puts it: one for each byte before it on its line, a tab
+/// counting as one, so the line keeps its indentation. Scripts read
+/// preprocessed text by its indentation -- glibc's `versions.awk` finds a
+/// version node by it -- and a token of a macro's expansion stands where the
+/// macro's name stood.
+pub fn indentation(pos: Position) -> usize {
+    usize::from(pos.line_offset)
+}
+
 /// Convert preprocessed tokens back to source text, byte for byte.
 ///
 /// Handles whitespace/newline preservation based on token positions. Used for
@@ -2016,6 +2036,7 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
                 result.push(b'\n');
                 last_line += 1;
             }
+            result.resize(result.len() + indentation(token.pos), b' ');
             result.extend_from_slice(&spelling);
         } else if start > 0 {
             // Need a space if the original had whitespace, or if the adjacent

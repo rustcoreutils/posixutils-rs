@@ -18,5 +18,6 @@ mod macros;
 mod output_spacing;
 mod paste;
 mod pp_diagnostics;
+mod search_chain;
 mod std_dialect;
 mod target_predefines;

@@ -28,8 +28,14 @@ pub struct Position {
     pub stream: u16,
     /// Line number (1-based)
     pub line: u32,
-    /// Column position (1-based, 0 means unknown)
+    /// Column position (1-based, 0 means unknown), a tab reaching the next
+    /// multiple of 8 as gcc's diagnostics count it.
     pub col: u16,
+    /// The bytes before the token on its physical line, up to 255: gcc's
+    /// byte column less one, a tab counting as one. `-E` indents a line by
+    /// it, as gcc does; see `token::lexer::indentation`. Kept to a byte so
+    /// that it fits where the struct had padding.
+    pub line_offset: u8,
     /// Token preceded by newline
     pub newline: bool,
     /// Token preceded by whitespace
@@ -44,6 +50,7 @@ impl Position {
             stream,
             line,
             col,
+            line_offset: 0,
             newline: false,
             whitespace: false,
             noexpand: false,

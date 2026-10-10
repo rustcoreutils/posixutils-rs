@@ -42,6 +42,33 @@ fn empty_hex_escape_is_an_error() {
     }
 }
 
+/// GNU `\e` and `\E` are not ISO escapes: gcc is silent by default, warns
+/// "non-ISO-standard escape sequence" under `-pedantic`, and refuses them
+/// under `-pedantic-errors` -- in a string, a character constant, and `#if`.
+#[test]
+fn gnu_escape_is_a_pedantic_warning() {
+    for (name, src, letter) in [
+        ("esc_string", "const char *s = \"\\e[\";\n", 'e'),
+        ("esc_char", "int c = '\\E';\n", 'E'),
+        ("esc_wide", "int c = L'\\e';\n", 'e'),
+        ("esc_if", "#if '\\e' != 27\n#error\n#endif\nint x;\n", 'e'),
+    ] {
+        let msg = format!("non-ISO-standard escape sequence, '\\{letter}'");
+        let quiet = compile_accepted(name, src, &[]);
+        assert!(quiet.is_empty(), "{name}: {quiet}");
+        let warned = compile_accepted(name, src, &["-Wpedantic"]);
+        assert!(
+            warned.contains(&format!("warning: {msg}")),
+            "{name}: {warned}"
+        );
+        let refused = compile_rejected_with(name, src, &["-pedantic-errors"]);
+        assert!(
+            refused.contains(&format!("error: {msg}")),
+            "{name}: {refused}"
+        );
+    }
+}
+
 /// A literal that is never decoded is never diagnosed: gcc is silent about
 /// `\x` in a skipped group or a macro nobody expands.
 #[test]

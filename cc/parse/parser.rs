@@ -16,7 +16,9 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Linkage, Namespace, Symbol, SymbolId, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
-use crate::token::preprocess::{LayoutPragma, PackAction, StorageOrderPragma};
+use crate::token::preprocess::{
+    LayoutPragma, PackAction, StorageOrderPragma, SymbolVisibility, VisibilityPragma,
+};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 use std::collections::{BTreeMap, HashMap};
@@ -338,8 +340,8 @@ pub struct Parser<'a> {
     /// Where a `[*]` was written directly in the parameter list being
     /// parsed; see [`ParameterList::star`].
     pub(super) star_in_params: Option<Position>,
-    /// `#pragma pack` and `#pragma scalar_storage_order` directives, and
-    /// where they stood in the token stream.
+    /// `#pragma pack`, `#pragma scalar_storage_order` and `#pragma GCC
+    /// visibility` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `layout_cursor` is how far the parser has consumed
     /// them. A directive takes effect for every structure defined after it,
@@ -353,6 +355,10 @@ pub struct Parser<'a> {
     /// The storage order `#pragma scalar_storage_order` gives a struct or
     /// union whose own attributes name none.
     storage_order_current: StorageOrderPragma,
+    /// The `#pragma GCC visibility push`ed visibilities, innermost last: the
+    /// last is the one a declaration with external linkage and no
+    /// visibility of its own takes.
+    visibility_stack: Vec<SymbolVisibility>,
     /// Typedef names that specify a variably modified type, and how many
     /// run-time extents each carries (C17 6.7.7).
     ///
@@ -435,6 +441,7 @@ impl<'a> Parser<'a> {
             pack_current: None,
             pack_stack: Vec::new(),
             storage_order_current: StorageOrderPragma::Default,
+            visibility_stack: Vec::new(),
         }
     }
 
@@ -463,6 +470,13 @@ impl<'a> Parser<'a> {
         self.storage_order_current
     }
 
+    /// The visibility `#pragma GCC visibility` puts on a declaration made
+    /// here, if one is pushed.
+    pub(super) fn current_pragma_visibility(&mut self) -> Option<SymbolVisibility> {
+        self.apply_layout_pragmas();
+        self.visibility_stack.last().copied()
+    }
+
     /// Apply every layout pragma the parse position has now passed.
     fn apply_layout_pragmas(&mut self) {
         while self
@@ -475,6 +489,14 @@ impl<'a> Parser<'a> {
             match pragma {
                 LayoutPragma::Pack(action) => self.apply_pack(action),
                 LayoutPragma::StorageOrder(order) => self.storage_order_current = order,
+                LayoutPragma::Visibility(VisibilityPragma::Push(how)) => {
+                    self.visibility_stack.push(how)
+                }
+                // One with nothing pushed was reported where it stood, by
+                // the preprocessor, and pops nothing.
+                LayoutPragma::Visibility(VisibilityPragma::Pop) => {
+                    self.visibility_stack.pop();
+                }
             }
         }
     }

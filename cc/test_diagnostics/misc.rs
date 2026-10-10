@@ -486,3 +486,19 @@ fn diagnostics_local_label_protected_scopes() {
         crate::test_compile::compile_expect_error(name, src, want);
     }
 }
+
+/// `#pragma GCC visibility` warns as gcc does: at the pragma's `GCC`, and
+/// not at all under `-Wno-pragmas`.
+#[test]
+fn visibility_pragma_warnings_are_wpragmas() {
+    let src = "int a;\n#pragma GCC visibility pop\n#pragma GCC visibility push(bogus)\n";
+    let stderr = crate::test_compile::compile_accepted("vis_pragma_warn", src, &[]);
+    for want in [
+        ":2:9: warning: no matching push for '#pragma GCC visibility pop'",
+        ":3:9: warning: '#pragma GCC visibility push()' must specify 'default', 'internal', 'hidden' or 'protected'",
+    ] {
+        assert!(stderr.contains(want), "no {want:?} in:\n{stderr}");
+    }
+    let quiet = crate::test_compile::compile_accepted("vis_pragma_quiet", src, &["-Wno-pragmas"]);
+    assert!(!quiet.contains("visibility"), "{quiet}");
+}

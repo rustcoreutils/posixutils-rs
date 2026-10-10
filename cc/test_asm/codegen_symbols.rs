@@ -539,3 +539,85 @@ int *addr_w(void) { return &wv; }
         }
     }
 }
+
+/// `#pragma GCC visibility push(hidden)` makes the declarations it encloses
+/// hidden -- an `extern` one too, unlike `-fvisibility=hidden` -- so they are
+/// marked `.hidden` and reached PC-relative under `-fPIC`, as gcc does: Linux
+/// force-includes the pragma into its PIE decompressor and EFI stub so they
+/// have no GOT. An explicit `visibility("default")` wins, the pushes nest,
+/// and after the last `pop` nothing is hidden. A block-scope `extern` is
+/// one of the declarations, as is one with its own attribute.
+#[test]
+fn codegen_visibility_pragma_hides_enclosed_declarations() {
+    let src = r#"
+#pragma GCC visibility push(hidden)
+extern int hv;
+extern int hfn(void);
+extern int ev __attribute__((visibility("default")));
+#pragma GCC visibility push(default)
+extern int dv;
+#pragma GCC visibility pop
+extern int hv2;
+int get(void) { extern int bv; return hv + hfn() + ev + dv + hv2 + bv; }
+#pragma GCC visibility pop
+extern int zv;
+int get2(void) { extern int ba __attribute__((visibility("hidden"))); return zv + ba; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let x86 = triple == X86_64_LINUX;
+        let direct = |n: &str| {
+            if x86 {
+                format!("{n}(%rip)")
+            } else {
+                format!(":lo12:{n}]")
+            }
+        };
+        let got = |n: &str| {
+            if x86 {
+                format!("{n}@GOTPCREL")
+            } else {
+                format!(":got:{n}")
+            }
+        };
+        let asm = asm_for_with("vis_pragma_pic", triple, src, &["-O2", "-fPIC"]);
+        let hidden: Vec<&str> = asm
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(".hidden "))
+            .collect();
+        for name in ["hv", "hfn", "hv2", "bv", "ba", "get"] {
+            assert!(
+                hidden.contains(&name),
+                "{triple}: {name} not hidden:\n{asm}"
+            );
+        }
+        for name in ["ev", "dv", "zv", "get2"] {
+            assert!(!hidden.contains(&name), "{triple}: {name} hidden:\n{asm}");
+        }
+        let get_body = body_of(&asm, "get");
+        for name in ["hv", "hv2", "bv"] {
+            assert!(
+                get_body.contains(&direct(name)) && !get_body.contains(&got(name)),
+                "{triple}: {name} must be PC-relative:\n{get_body}"
+            );
+        }
+        for name in ["ev", "dv"] {
+            assert!(
+                get_body.contains(&got(name)),
+                "{triple}: {name}:\n{get_body}"
+            );
+        }
+        let get2 = body_of(&asm, "get2");
+        assert!(get2.contains(&got("zv")), "{triple}:\n{get2}");
+        assert!(get2.contains(&direct("ba")), "{triple}:\n{get2}");
+    }
+    // Mach-O spells hidden `.private_extern`.
+    let asm = asm_for_with("vis_pragma_macho", AARCH64_DARWIN, src, &["-O2"]);
+    for name in ["_hv", "_hfn", "_hv2", "_bv", "_get"] {
+        assert!(
+            asm.lines()
+                .any(|l| l.trim() == format!(".private_extern {name}")),
+            "{name}:\n{asm}"
+        );
+    }
+    assert!(!asm.contains(".private_extern _zv"), "{asm}");
+}

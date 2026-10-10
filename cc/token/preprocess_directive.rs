@@ -1460,13 +1460,7 @@ impl<'a> Preprocessor<'a> {
                         let pos = self.remap_pos(token.pos);
                         iter.next(); // consume "pack"
                         if let Some(action) = self.parse_pack_pragma(iter, idents, pos) {
-                            // The parser decides layout, so the pragma has to
-                            // reach it. It travels as a marker in the stream
-                            // because that is the only ordering that survives
-                            // include splicing.
-                            let mut marker = Token::new(TokenType::Pragma, pos);
-                            marker.value = TokenValue::String(LayoutPragma::Pack(action).encode());
-                            output.push(marker);
+                            self.push_parser_pragma(output, LayoutPragma::Pack(action), pos);
                         }
                         self.skip_to_eol(iter);
                         return;
@@ -1477,11 +1471,20 @@ impl<'a> Preprocessor<'a> {
                         let pos = self.remap_pos(token.pos);
                         let body = verbatim.strip_prefix("#pragma").unwrap_or(&verbatim);
                         if let Some(pragma) = parse_pragma_text(body, pos) {
-                            let mut marker = Token::new(TokenType::Pragma, pos);
-                            marker.value = TokenValue::String(pragma.encode());
-                            output.push(marker);
+                            self.push_parser_pragma(output, pragma, pos);
                         }
                         self.skip_to_eol(iter);
+                        return;
+                    } else if name == "GCC" {
+                        // `GCC visibility` is the parser's, and travels the
+                        // same way; every other `GCC` pragma, and a
+                        // visibility one that does nothing, as its text.
+                        let pos = self.remap_pos(token.pos);
+                        let body = verbatim.strip_prefix("#pragma").unwrap_or(&verbatim);
+                        match parse_pragma_text(body, pos) {
+                            Some(pragma) => self.push_parser_pragma(output, pragma, pos),
+                            None => emit_verbatim(self, output),
+                        }
                         return;
                     } else if name == "push_macro" || name == "pop_macro" {
                         // MSVC's, adopted by gcc and clang and relied on by
@@ -1628,20 +1631,22 @@ impl<'a> Preprocessor<'a> {
         // be the same wrong struct in the spelling nobody tested.
         if let TokenValue::String(body) = &token.value {
             let pos = self.remap_pos(token.pos);
-            let mut marker = Token::new(TokenType::Pragma, pos);
-            marker.value = TokenValue::String(match parse_pragma_text(body, token.pos) {
-                Some(pragma) => pragma.encode(),
+            match parse_pragma_text(body, pos) {
+                Some(pragma) => self.push_parser_pragma(output, pragma, pos),
                 // Not one c17 acts on, so it travels as the directive it
                 // stands for. C99 6.10.9p1 makes `_Pragma("x")` mean
                 // `#pragma x`, and the operand is a string literal, so the
                 // escaping the lexer kept has to come back off.
-                None => format!(
-                    "{}#pragma {}",
-                    PRAGMA_TEXT_PREFIX,
-                    destringify(&payload_text(body))
-                ),
-            });
-            output.push(marker);
+                None => {
+                    let mut marker = Token::new(TokenType::Pragma, pos);
+                    marker.value = TokenValue::String(format!(
+                        "{}#pragma {}",
+                        PRAGMA_TEXT_PREFIX,
+                        destringify(&payload_text(body))
+                    ));
+                    output.push(marker);
+                }
+            }
         }
 
         if iter.peek().is_some_and(|t| is_punct(t, b')')) {
@@ -1649,6 +1654,30 @@ impl<'a> Preprocessor<'a> {
         } else {
             Self::pragma_operand_error(pragma_pos);
         }
+    }
+
+    /// Hand `pragma` to the parser, which acts on it: as a marker in the
+    /// stream, because that is the only ordering that survives include
+    /// splicing.
+    ///
+    /// A `#pragma GCC visibility pop` with nothing pushed is gcc's warning,
+    /// given here where the pragma stands; the parser pops nothing for it.
+    fn push_parser_pragma(&mut self, output: &mut Vec<Token>, pragma: LayoutPragma, pos: Position) {
+        match pragma {
+            LayoutPragma::Visibility(VisibilityPragma::Push(_)) => self.visibility_depth += 1,
+            LayoutPragma::Visibility(VisibilityPragma::Pop) => match self.visibility_depth {
+                0 => diag::group_warning(
+                    PRAGMAS_WARNING,
+                    pos,
+                    &gettext("no matching push for '#pragma GCC visibility pop'"),
+                ),
+                _ => self.visibility_depth -= 1,
+            },
+            LayoutPragma::Pack(_) | LayoutPragma::StorageOrder(_) => {}
+        }
+        let mut marker = Token::new(TokenType::Pragma, pos);
+        marker.value = TokenValue::String(pragma.encode());
+        output.push(marker);
     }
 
     fn pragma_operand_error(pos: Position) {

@@ -379,6 +379,7 @@ impl Parser<'_> {
             defines: true,
             gnu_extern_inline: attrs.gnu_inline_only(specs.storage_class),
         });
+        self.settle_visibility(name, linkage, true, &mut attrs.symbol.visibility);
         // After the definition the name has the composite type of it and any
         // earlier declaration (C17 6.2.7p4): `int (*fp(void))[6] { .. }`
         // keeps the extent an earlier `int (*fp(void))[];` lacked, and an

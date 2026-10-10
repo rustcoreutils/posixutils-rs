@@ -46,6 +46,9 @@ pub(crate) struct LinkedName {
     /// `inline` declaration or real definition has followed. gcc lets a
     /// `static` declaration take such a name over.
     gnu_extern_inline: bool,
+    /// Whether one of them gave the name a visibility, by attribute or by
+    /// `#pragma GCC visibility`, which a later pragma does not override.
+    visibility_given: bool,
 }
 
 /// One declaration of an object or a function, as linkage sees it.
@@ -159,6 +162,7 @@ impl Parser<'_> {
             defined: d.defines,
             inline_only,
             gnu_extern_inline: d.gnu_extern_inline && linkage == Linkage::External,
+            visibility_given: false,
         };
         let Some(&prior) = self.linked_names.get(&d.name) else {
             self.linked_names.insert(d.name, first);
@@ -225,6 +229,40 @@ impl Parser<'_> {
             prior.gnu_extern_inline = false;
         }
         linkage
+    }
+
+    /// Give a declaration of `name` with `linkage` the visibility
+    /// `#pragma GCC visibility` has pushed, in `slot` -- the declaration's
+    /// own visibility attribute, if it has one.
+    ///
+    /// As in gcc, the pragma reaches every declaration with external
+    /// linkage, an `extern` one too, which `-fvisibility` leaves alone; and
+    /// it yields to a visibility this or any earlier declaration of the name
+    /// has given it, by attribute or by the pragma. A function's is recorded
+    /// with its other attributes too, for a definition outside the pragma
+    /// to inherit.
+    pub(super) fn settle_visibility(
+        &mut self,
+        name: StringId,
+        linkage: Linkage,
+        is_fn: bool,
+        slot: &mut Option<String>,
+    ) {
+        if linkage != Linkage::External {
+            return;
+        }
+        let pushed = self.current_pragma_visibility();
+        let Some(linked) = self.linked_names.get_mut(&name) else {
+            return;
+        };
+        if slot.is_none() && !linked.visibility_given {
+            *slot = pushed.map(|how| how.spelling().to_string());
+            if is_fn && slot.is_some() {
+                let declared = self.declared_fn_attrs.entry(name).or_default();
+                declared.symbol.visibility = slot.clone();
+            }
+        }
+        linked.visibility_given |= slot.is_some();
     }
 
     /// 6.2.7p2: every declaration of one entity has a compatible type. One

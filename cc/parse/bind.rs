@@ -501,6 +501,9 @@ impl Parser<'_> {
                     .as_ref()
                     .is_some_and(|attrs| attrs.gnu_inline_only(specs.storage_class)),
             });
+            let mut visibility = self.pending_symbol_attrs.visibility.take();
+            self.settle_visibility(name, linkage, is_fn, &mut visibility);
+            self.pending_symbol_attrs.visibility = visibility;
             let sym = self
                 .declared_symbol(name, typ, align)
                 .with_variably_modified_array(!vla.is_empty())

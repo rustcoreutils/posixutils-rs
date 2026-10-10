@@ -69,6 +69,8 @@ mod test_specifiers;
 mod test_storage_order;
 #[cfg(test)]
 mod test_vectors;
+#[cfg(test)]
+mod test_visibility_pragma;
 
 // Re-export parser used by main.rs
 pub(crate) use cpu_builtin::cpu_feature_location;

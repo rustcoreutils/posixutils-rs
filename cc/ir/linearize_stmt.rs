@@ -408,6 +408,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // sequence for `extern _Thread_local`. A name this unit also
                 // defines is not external, so it is left alone.
                 let name = self.symbol_name(declarator.symbol).to_string();
+                // Its attributes are the symbol's, as at file scope: a
+                // visibility given here hides the reference, and a
+                // definition later in the unit inherits them.
+                if self.module.globals.iter().any(|g| g.name == name) {
+                    self.module
+                        .set_symbol_attrs(&name, declarator.symbol_attrs.clone());
+                } else if !self
+                    .module
+                    .functions
+                    .iter()
+                    .any(|f| f.name == name && f.emit)
+                {
+                    self.module
+                        .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
+                }
                 if !is_block_scope_function && !self.module.globals.iter().any(|g| g.name == name) {
                     self.module.extern_symbols.insert(name.clone());
                     self.module.extern_object_align.insert(

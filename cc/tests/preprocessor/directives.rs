@@ -530,6 +530,36 @@ fn preprocessor_storage_order_pragma_survives_dash_e() {
     }
 }
 
+/// `#pragma GCC visibility` survives `-E`, in either spelling, as gcc writes
+/// it: the visibility of every declaration after it depends on it.
+#[test]
+fn preprocessor_visibility_pragma_survives_dash_e() {
+    let src = "#pragma GCC visibility push(hidden)\n\
+               extern int x;\n\
+               _Pragma(\"GCC visibility push(default)\")\n\
+               #pragma GCC visibility pop\n\
+               #pragma GCC visibility pop\n\
+               int q;\n";
+    let r = preprocess_text("vis_pragma_e", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let pragmas: Vec<&str> = r
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("#pragma"))
+        .collect();
+    assert_eq!(
+        pragmas,
+        [
+            "#pragma GCC visibility push(hidden)",
+            "#pragma GCC visibility push(default)",
+            "#pragma GCC visibility pop",
+            "#pragma GCC visibility pop",
+        ],
+        "{}",
+        r.stdout
+    );
+}
+
 /// `#include_next` resumes the search *after* the directory the current file
 /// came from -- and `-I` directories are part of that search.
 ///

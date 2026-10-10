@@ -477,6 +477,11 @@ pub struct Preprocessor<'a> {
     /// absence back.
     pushed_macros: HashMap<String, Vec<Option<std::rc::Rc<Macro>>>>,
 
+    /// How many `#pragma GCC visibility push`es are not yet popped. The
+    /// parser keeps the stack itself; this is only what lets an unmatched
+    /// `pop` be reported where it stands.
+    visibility_depth: usize,
+
     /// Conditional compilation stack
     cond_stack: Vec<Conditional>,
 
@@ -705,8 +710,8 @@ pub fn pragma_weak_names(tokens: &[Token]) -> Vec<String> {
         .collect()
 }
 
-/// A pragma that changes how the parser lays out the structures and unions
-/// defined after it.
+/// A pragma the parser acts on: how it lays out the structures and unions
+/// defined after it, or the visibility of the symbols declared after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutPragma {
     /// `#pragma pack`: the alignment cap on every member.
@@ -714,6 +719,9 @@ pub enum LayoutPragma {
     /// `#pragma scalar_storage_order`: the byte order of the scalars of a
     /// struct or union that does not name one in an attribute.
     StorageOrder(StorageOrderPragma),
+    /// `#pragma GCC visibility`: the visibility of every declaration with
+    /// external linkage that names none of its own.
+    Visibility(VisibilityPragma),
 }
 
 impl LayoutPragma {
@@ -723,6 +731,10 @@ impl LayoutPragma {
         match self {
             LayoutPragma::Pack(action) => action.encode(),
             LayoutPragma::StorageOrder(order) => format!("sso:{}", order.spelling()),
+            LayoutPragma::Visibility(VisibilityPragma::Push(how)) => {
+                format!("vis:push:{}", how.spelling())
+            }
+            LayoutPragma::Visibility(VisibilityPragma::Pop) => "vis:pop".to_string(),
         }
     }
 
@@ -732,6 +744,12 @@ impl LayoutPragma {
             LayoutPragma::Pack(action) => action.to_pragma_text(),
             LayoutPragma::StorageOrder(order) => {
                 format!("#pragma scalar_storage_order {}", order.spelling())
+            }
+            LayoutPragma::Visibility(VisibilityPragma::Push(how)) => {
+                format!("#pragma GCC visibility push({})", how.spelling())
+            }
+            LayoutPragma::Visibility(VisibilityPragma::Pop) => {
+                "#pragma GCC visibility pop".to_string()
             }
         }
     }
@@ -748,8 +766,97 @@ impl LayoutPragma {
         if let Some(word) = s.strip_prefix("sso:") {
             return StorageOrderPragma::from_word(word).map(LayoutPragma::StorageOrder);
         }
+        if s == "vis:pop" {
+            return Some(LayoutPragma::Visibility(VisibilityPragma::Pop));
+        }
+        if let Some(word) = s.strip_prefix("vis:push:") {
+            return SymbolVisibility::from_word(word)
+                .map(|how| LayoutPragma::Visibility(VisibilityPragma::Push(how)));
+        }
         PackAction::decode(s).map(LayoutPragma::Pack)
     }
+}
+
+/// An ELF symbol visibility, as `#pragma GCC visibility push(...)` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolVisibility {
+    Default,
+    Internal,
+    Hidden,
+    Protected,
+}
+
+impl SymbolVisibility {
+    fn from_word(word: &str) -> Option<SymbolVisibility> {
+        match word {
+            "default" => Some(SymbolVisibility::Default),
+            "internal" => Some(SymbolVisibility::Internal),
+            "hidden" => Some(SymbolVisibility::Hidden),
+            "protected" => Some(SymbolVisibility::Protected),
+            _ => None,
+        }
+    }
+
+    /// The name, as the `visibility` attribute spells it too.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            SymbolVisibility::Default => "default",
+            SymbolVisibility::Internal => "internal",
+            SymbolVisibility::Hidden => "hidden",
+            SymbolVisibility::Protected => "protected",
+        }
+    }
+}
+
+/// What a `#pragma GCC visibility` directive does to the visibility stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibilityPragma {
+    /// `push(how)`: save the visibility in force and make `how` it.
+    Push(SymbolVisibility),
+    /// `pop`: restore the visibility the matching `push` saved.
+    Pop,
+}
+
+/// Read the body of `#pragma GCC visibility`, the tokens after
+/// `visibility`, warning in gcc's words about each malformed form.
+///
+/// gcc acts before it checks what follows: `push(hidden` still pushes, and
+/// `pop extra` still pops, each with a warning. A `pop` with nothing pushed
+/// is the caller's to report, since only it knows the depth.
+fn parse_visibility_body(toks: &[PragmaTok], pos: Position) -> Option<VisibilityPragma> {
+    let warn = |msg: &str| diag::group_warning(PRAGMAS_WARNING, pos, &gettext(msg));
+    let mut it = toks.iter();
+    let action = match it.next() {
+        Some(PragmaTok::Word(w)) if w == "pop" => VisibilityPragma::Pop,
+        Some(PragmaTok::Word(w)) if w == "push" => {
+            const NO_PAREN: &str = "missing '(' after '#pragma GCC visibility push' - ignored";
+            if it.next() != Some(&PragmaTok::Punct('(')) {
+                warn(NO_PAREN);
+                return None;
+            }
+            let Some(PragmaTok::Word(name)) = it.next() else {
+                warn("malformed '#pragma GCC visibility push'");
+                return None;
+            };
+            let Some(how) = SymbolVisibility::from_word(name) else {
+                warn("'#pragma GCC visibility push()' must specify 'default', 'internal', 'hidden' or 'protected'");
+                return None;
+            };
+            if it.next() != Some(&PragmaTok::Punct(')')) {
+                warn(NO_PAREN);
+                return Some(VisibilityPragma::Push(how));
+            }
+            VisibilityPragma::Push(how)
+        }
+        _ => {
+            warn("'#pragma GCC visibility' must be followed by 'push' or 'pop'");
+            return None;
+        }
+    };
+    if it.next().is_some() {
+        warn("junk at end of '#pragma GCC visibility'");
+    }
+    Some(action)
 }
 
 /// What `#pragma scalar_storage_order` makes the default storage order of the
@@ -886,13 +993,14 @@ pub fn extract_pragma_directives(tokens: &mut Vec<Token>) -> Vec<(usize, LayoutP
     directives
 }
 
-/// The only shapes `#pragma pack` bodies are made of.
+/// The only shapes the bodies of `#pragma pack` and `#pragma GCC visibility`
+/// are made of.
 ///
 /// `#pragma pack(...)` arrives as preprocessor tokens and `_Pragma("pack(...)")`
 /// as a string, so both are reduced to this before being read. One reduction
 /// each, and one rule -- rather than two parsers that agree until they don't.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PackTok {
+enum PragmaTok {
     Word(String),
     Num(String),
     Punct(char),
@@ -907,9 +1015,9 @@ pub const PRAGMAS_WARNING: &str = "pragmas";
 /// `pack()` clears it, `pack(push, n)` / `pack(push)` save it, and
 /// `pack(pop)` restores. An unrecognised body is a pragma we do not
 /// implement, and is ignored rather than guessed at.
-fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
+fn parse_pack_body(toks: &[PragmaTok], pos: Position) -> Option<PackAction> {
     let mut it = toks.iter();
-    if it.next() != Some(&PackTok::Punct('(')) {
+    if it.next() != Some(&PragmaTok::Punct('(')) {
         diag::group_warning(
             PRAGMAS_WARNING,
             pos,
@@ -920,8 +1028,8 @@ fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
 
     // C has no meaning for a non-power-of-two alignment, and gcc rejects it;
     // a bad value is dropped rather than applied.
-    let number = |t: Option<&PackTok>| -> Option<u32> {
-        let PackTok::Num(text) = t? else {
+    let number = |t: Option<&PragmaTok>| -> Option<u32> {
+        let PragmaTok::Num(text) = t? else {
             diag::group_warning(
                 PRAGMAS_WARNING,
                 pos,
@@ -944,13 +1052,13 @@ fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
 
     match it.next() {
         // `pack()` -- clear.
-        Some(PackTok::Punct(')')) => Some(PackAction::Set(None)),
-        Some(PackTok::Word(w)) if w == "push" => match it.next() {
-            Some(PackTok::Punct(',')) => Some(PackAction::Push(number(it.next()))),
+        Some(PragmaTok::Punct(')')) => Some(PackAction::Set(None)),
+        Some(PragmaTok::Word(w)) if w == "push" => match it.next() {
+            Some(PragmaTok::Punct(',')) => Some(PackAction::Push(number(it.next()))),
             _ => Some(PackAction::Push(None)),
         },
-        Some(PackTok::Word(w)) if w == "pop" => Some(PackAction::Pop),
-        Some(PackTok::Word(_)) => {
+        Some(PragmaTok::Word(w)) if w == "pop" => Some(PackAction::Pop),
+        Some(PragmaTok::Word(_)) => {
             diag::group_warning(
                 PRAGMAS_WARNING,
                 pos,
@@ -958,7 +1066,7 @@ fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
             );
             None
         }
-        t @ Some(PackTok::Num(_)) => Some(PackAction::Set(number(t))),
+        t @ Some(PragmaTok::Num(_)) => Some(PackAction::Set(number(t))),
         _ => {
             diag::group_warning(
                 PRAGMAS_WARNING,
@@ -970,11 +1078,11 @@ fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
     }
 }
 
-/// Read the text of a pragma c17 acts on: `pack`, as `PackTok`s, or
-/// `scalar_storage_order`.
+/// Read the text of a pragma c17 acts on: `pack` and `GCC visibility`, as
+/// `PragmaTok`s, or `scalar_storage_order`.
 ///
 /// Returns `None` for anything else, which is every pragma c17 does not act
-/// on, and for a body of one of the two that names nothing it can apply.
+/// on, and for a body of one of these that names nothing it can apply.
 fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
     let mut chars = body.trim_start().chars().peekable();
     let mut word = String::new();
@@ -988,7 +1096,7 @@ fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
         let rest: String = chars.collect();
         return StorageOrderPragma::parse_body(&rest, pos).map(LayoutPragma::StorageOrder);
     }
-    if word != "pack" {
+    if word != "pack" && word != "GCC" {
         return None;
     }
 
@@ -1001,7 +1109,7 @@ fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
             while chars.peek().is_some_and(|d| d.is_ascii_digit()) {
                 n.push(chars.next().unwrap());
             }
-            toks.push(PackTok::Num(n));
+            toks.push(PragmaTok::Num(n));
         } else if c.is_alphabetic() || c == '_' {
             let mut w = String::new();
             while chars
@@ -1010,13 +1118,21 @@ fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
             {
                 w.push(chars.next().unwrap());
             }
-            toks.push(PackTok::Word(w));
+            toks.push(PragmaTok::Word(w));
         } else {
             chars.next();
-            toks.push(PackTok::Punct(c));
+            toks.push(PragmaTok::Punct(c));
         }
     }
-    parse_pack_body(&toks, pos).map(LayoutPragma::Pack)
+    if word == "pack" {
+        return parse_pack_body(&toks, pos).map(LayoutPragma::Pack);
+    }
+    match toks.split_first() {
+        Some((PragmaTok::Word(w), rest)) if w == "visibility" => {
+            parse_visibility_body(rest, pos).map(LayoutPragma::Visibility)
+        }
+        _ => None,
+    }
 }
 
 impl<'a> Preprocessor<'a> {
@@ -1104,6 +1220,7 @@ impl<'a> Preprocessor<'a> {
             target,
             macros: HashMap::with_capacity(DEFAULT_MACRO_CAPACITY),
             pushed_macros: HashMap::new(),
+            visibility_depth: 0,
             cond_stack: Vec::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             system_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
             iquote_include_paths: search.iquote.to_vec(),
@@ -1871,7 +1988,7 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Reduce `#pragma pack(...)`'s tokens to `PackTok`s and read them.
+    /// Reduce `#pragma pack(...)`'s tokens to `PragmaTok`s and read them.
     fn parse_pack_pragma(
         &mut self,
         iter: &mut TokenCursor,
@@ -1884,12 +2001,12 @@ impl<'a> Preprocessor<'a> {
                 break;
             }
             let reduced = match &tok.value {
-                TokenValue::Ident(id) => PackTok::Word(idents.get_opt(*id)?.to_string()),
-                TokenValue::Number(n) => PackTok::Num(n.clone()),
-                TokenValue::Special(c) => PackTok::Punct(char::from_u32(*c)?),
+                TokenValue::Ident(id) => PragmaTok::Word(idents.get_opt(*id)?.to_string()),
+                TokenValue::Number(n) => PragmaTok::Num(n.clone()),
+                TokenValue::Special(c) => PragmaTok::Punct(char::from_u32(*c)?),
                 _ => break,
             };
-            let closing = reduced == PackTok::Punct(')');
+            let closing = reduced == PragmaTok::Punct(')');
             toks.push(reduced);
             iter.next();
             if closing {

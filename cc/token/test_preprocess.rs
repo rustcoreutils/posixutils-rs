@@ -2479,6 +2479,129 @@ fn test_storage_order_pragma_becomes_a_layout_marker() {
     );
 }
 
+/// `#pragma GCC visibility push(...)` and `pop` reach the parser as markers,
+/// in either spelling, and each spells itself back for `-E`.
+#[test]
+fn test_visibility_pragma_becomes_a_parser_marker() {
+    let (mut tokens, _) = preprocess_str(
+        "#pragma GCC visibility push(hidden)\n\
+         int a;\n\
+         _Pragma(\"GCC visibility push (protected)\")\n\
+         #pragma GCC visibility push(default)\n\
+         #pragma GCC visibility push(internal)\n\
+         #pragma GCC visibility pop\n\
+         int b;\n",
+    );
+    let pragmas = extract_pragma_directives(&mut tokens);
+    let got: Vec<LayoutPragma> = pragmas.iter().map(|(_, p)| *p).collect();
+    use SymbolVisibility::*;
+    assert_eq!(
+        got,
+        [
+            LayoutPragma::Visibility(VisibilityPragma::Push(Hidden)),
+            LayoutPragma::Visibility(VisibilityPragma::Push(Protected)),
+            LayoutPragma::Visibility(VisibilityPragma::Push(Default)),
+            LayoutPragma::Visibility(VisibilityPragma::Push(Internal)),
+            LayoutPragma::Visibility(VisibilityPragma::Pop),
+        ]
+    );
+    // The first stands before `int a`, the others after it.
+    assert!(pragmas[0].0 < pragmas[1].0);
+    assert_eq!(
+        got[1].to_pragma_text(),
+        "#pragma GCC visibility push(protected)"
+    );
+    assert_eq!(got[4].to_pragma_text(), "#pragma GCC visibility pop");
+}
+
+/// gcc's warnings for `#pragma GCC visibility`, and what each form still
+/// does: gcc pushes before it checks for the `)` and acts before it checks
+/// for junk at the end, so those two still push or pop; a `pop` with no
+/// `push` before it pops nothing.
+#[test]
+fn test_visibility_pragma_diagnostics() {
+    use SymbolVisibility::Hidden;
+    const POP: LayoutPragma = LayoutPragma::Visibility(VisibilityPragma::Pop);
+    const PUSH: LayoutPragma = LayoutPragma::Visibility(VisibilityPragma::Push(Hidden));
+    let cases: [(&str, &str, &[LayoutPragma]); 11] = [
+        (
+            "#pragma GCC visibility pop\n",
+            "no matching push for '#pragma GCC visibility pop'",
+            &[POP],
+        ),
+        (
+            "_Pragma(\"GCC visibility pop\")\n",
+            "no matching push for '#pragma GCC visibility pop'",
+            &[POP],
+        ),
+        (
+            "#pragma GCC visibility push(bogus)\n",
+            "'#pragma GCC visibility push()' must specify 'default', 'internal', 'hidden' or 'protected'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push()\n",
+            "malformed '#pragma GCC visibility push'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push(1)\n",
+            "malformed '#pragma GCC visibility push'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push hidden\n",
+            "missing '(' after '#pragma GCC visibility push' - ignored",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push(hidden\n",
+            "missing '(' after '#pragma GCC visibility push' - ignored",
+            &[PUSH],
+        ),
+        (
+            "#pragma GCC visibility\n",
+            "'#pragma GCC visibility' must be followed by 'push' or 'pop'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility frob\n",
+            "'#pragma GCC visibility' must be followed by 'push' or 'pop'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push(hidden)\n#pragma GCC visibility pop extra\n",
+            "junk at end of '#pragma GCC visibility'",
+            &[PUSH, POP],
+        ),
+        (
+            "#pragma GCC visibility push(hidden)) extra\n",
+            "junk at end of '#pragma GCC visibility'",
+            &[PUSH],
+        ),
+    ];
+    for (src, want, acts) in cases {
+        let diags = preprocess_diagnostics(src);
+        assert!(
+            mentions(&diags, &format!("warning: {want}")),
+            "{src:?}: no warning {want:?} in {diags:?}"
+        );
+        let (mut tokens, _) = preprocess_str(src);
+        let acted: Vec<LayoutPragma> = extract_pragma_directives(&mut tokens)
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(acted, acts, "{src:?}");
+    }
+    let balanced = preprocess_diagnostics(
+        "#pragma GCC visibility push(hidden)\n\
+         #pragma GCC visibility push ( default )\n\
+         #pragma GCC visibility pop\n\
+         #pragma GCC visibility pop\n",
+    );
+    assert!(balanced.is_empty(), "{balanced:?}");
+}
+
 /// Preprocess `src` and return every diagnostic it produced.
 fn preprocess_diagnostics(src: &str) -> Vec<String> {
     crate::diag::capture_diagnostics();

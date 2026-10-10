@@ -243,3 +243,52 @@ __attribute__((visibility("hidden"))) int hfn(int x) { return x + 1; }
         );
     }
 }
+
+/// `#pragma GCC visibility push(hidden)` around `extern` declarations, as
+/// Linux force-includes it into its PIE decompressor: the object built
+/// `-fPIE` reaches them with no GOT relocation, and the program links and
+/// runs against the unit that defines them under the same pragma.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_pie_visibility_pragma_needs_no_got() {
+    let unit_a = r#"
+#pragma GCC visibility push(hidden)
+extern int hv;
+extern int harr[4];
+extern int hfn(int);
+#pragma GCC visibility pop
+int main(void)
+{
+    int (*volatile fp)(int) = hfn;
+    harr[1] = 7;
+    return !(hv == 5 && fp(1) == 2 && harr[1] == 7);
+}
+"#;
+    let unit_b = r#"
+#pragma GCC visibility push(hidden)
+int hv = 5;
+int harr[4];
+int hfn(int x) { return x + 1; }
+#pragma GCC visibility pop
+"#;
+    let dir = crate::common::work_dir("vis_pragma_pie");
+    for opt in ["-O0", "-O2"] {
+        let obj =
+            crate::common::c17_object_with("vis_pragma_main", unit_a, opt, &["-fPIE"], dir.path());
+        let relocs = std::process::Command::new("readelf")
+            .args(["-rW", &obj])
+            .output()
+            .expect("readelf");
+        let relocs = String::from_utf8_lossy(&relocs.stdout);
+        assert!(
+            !relocs.contains("GOT"),
+            "{opt}: GOT relocation in:\n{relocs}"
+        );
+        let opts = vec!["-fPIE".to_string(), opt.to_string()];
+        assert_eq!(
+            crate::common::compile_and_run_two_units("vis_pragma_units", unit_a, unit_b, &opts),
+            0,
+            "{opt}"
+        );
+    }
+}

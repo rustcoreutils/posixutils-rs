@@ -566,6 +566,7 @@ impl Parser<'_> {
                     variadic: decl_type.variadic,
                     noreturn: decl_type.noreturn,
                     returns_twice: decl_type.returns_twice,
+                    nothrow: decl_type.nothrow,
                     conv: decl_type.conv,
                     ..Default::default()
                 };

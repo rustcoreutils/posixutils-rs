@@ -12,7 +12,7 @@
 // refuses it.
 //
 
-use crate::common::run_c17;
+use crate::common::{preprocess_text, run_c17};
 use std::path::{Path, PathBuf};
 
 /// A scratch directory holding `name` with `content`.
@@ -551,5 +551,51 @@ fn param_names_are_gccs() {
         let r = compile_in(dir.path(), &path, flags);
         assert!(!r.success, "{flags:?}");
         assert_eq!(r.stderr, format!("c17: {text}\n"), "{flags:?}");
+    }
+}
+
+/// `-fexceptions` predefines gcc's `__EXCEPTIONS`, for C and for a `.S`
+/// alike, the last of `-f[no-]exceptions` deciding; and it is taken in
+/// silence, under `-Werror` too, as an option c17 implements.
+#[test]
+fn fexceptions_defines_exceptions_macro() {
+    let (dir, path) = scratch("m.c", "");
+    let out = dir.path().join("m.i");
+    let src = "#ifdef __EXCEPTIONS\neh __EXCEPTIONS\n#else\nno eh\n#endif\n";
+    for (flags, defined) in [
+        (&[][..], false),
+        (&["-fexceptions"][..], true),
+        (&["-fexceptions", "-fno-exceptions"][..], false),
+        (&["-fno-exceptions", "-fexceptions"][..], true),
+    ] {
+        let mut args = flags.to_vec();
+        args.extend([
+            "-Werror",
+            "-dM",
+            "-E",
+            "-o",
+            out.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ]);
+        let r = run_c17(&args);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+        let defs = std::fs::read_to_string(&out).expect("read -dM output");
+        let eh: String = defs
+            .lines()
+            .filter(|l| l.contains("EXCEPTIONS"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let want = if defined {
+            "#define __EXCEPTIONS 1\n"
+        } else {
+            ""
+        };
+        assert_eq!(eh, want, "{flags:?}");
+        let mut asm_args = flags.to_vec();
+        asm_args.extend(["-x", "assembler-with-cpp"]);
+        let r = preprocess_text("eh", src, &asm_args);
+        assert!(r.success, "{flags:?} .S: {}", r.stderr);
+        let want = if defined { "eh 1" } else { "no eh" };
+        assert!(r.stdout.contains(want), "{flags:?} .S: {}", r.stdout);
     }
 }

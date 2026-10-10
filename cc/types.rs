@@ -597,6 +597,10 @@ pub struct Type {
     /// on a typedef or a pointer: gcc ignores it there, so only a direct
     /// call of the declared function sees it.
     pub returns_twice: bool,
+    /// Does a call to this function never throw? (for functions) Set by
+    /// `__attribute__((nothrow))`, which glibc's `__THROW` puts on most of
+    /// libc. Under `-fexceptions` such a call needs no landing pad.
+    pub nothrow: bool,
 
     /// The calling convention of a function type: `__attribute__((ms_abi))`
     /// makes it [`CallingConv::Win64`]. Part of the type, so two function
@@ -626,6 +630,7 @@ impl Default for Type {
             variadic: false,
             noreturn: false,
             returns_twice: false,
+            nothrow: false,
             conv: CallingConv::C,
             composite: None,
             explicit_align: None,
@@ -1031,6 +1036,7 @@ enum TypeKey {
         variadic: bool,
         noreturn: bool,
         returns_twice: bool,
+        nothrow: bool,
         conv: CallingConv,
         modifiers: u32,
     },
@@ -1568,6 +1574,7 @@ impl TypeTable {
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
                     returns_twice: typ.returns_twice,
+                    nothrow: typ.nothrow,
                     conv: typ.conv,
                     modifiers: typ.modifiers.bits(),
                 })

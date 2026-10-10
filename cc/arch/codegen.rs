@@ -183,6 +183,8 @@ pub struct CodeGenBase<I: LirInst> {
     /// The symbols the static linker resolves within the output being
     /// built; see [`CodeGenBase::plan_local_binding`].
     pub binds_locally: std::collections::HashSet<String>,
+    /// The `-fexceptions` tables: the LSDAs and what they name.
+    pub eh: super::eh::EhTables,
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -210,6 +212,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             asm_instances: 0,
             named_sections: std::collections::HashMap::new(),
             binds_locally: std::collections::HashSet::new(),
+            eh: Default::default(),
         }
     }
 

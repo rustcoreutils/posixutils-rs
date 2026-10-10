@@ -79,6 +79,9 @@ pub struct CodegenOptions<'a> {
     pub pic: bool,
     /// Where the unit's CFI goes; see [`crate::target::UnwindTables::cfi`].
     pub cfi: crate::target::Cfi,
+    /// `-fexceptions`: unwinding a frame runs the cleanups in scope; see
+    /// `ir::linearize_cleanup`.
+    pub exceptions: bool,
     /// `-fverbose-asm`.
     pub verbose_asm: bool,
     /// `-fcf-protection`.
@@ -205,8 +208,11 @@ pub fn compile_tokens(
         &types,
         strings,
         target,
-        opts.debug,
-        opts.trapping_math,
+        ir::linearize::LinearizeOptions {
+            debug: opts.debug,
+            trapping_math: opts.trapping_math,
+            exceptions: opts.exceptions,
+        },
     );
     if let Some(how) = opts.default_visibility {
         module.apply_default_visibility(how);

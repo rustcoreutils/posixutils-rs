@@ -3094,6 +3094,8 @@ pub struct PreprocessConfig<'a> {
     pub isa: crate::target::X86Isa,
     /// `-fcf-protection`, which `__CET__` describes.
     pub cf_protection: crate::target::CfProtection,
+    /// `-fexceptions`, which `__EXCEPTIONS` says.
+    pub exceptions: bool,
     /// `-fmacro-prefix-map` (and the macro half of `-ffile-prefix-map`).
     pub macro_prefix_map: PrefixMap,
     /// What optimization was asked for.
@@ -3177,6 +3179,15 @@ fn define_cet_macro(pp: &mut Preprocessor, target: &Target, cf: crate::target::C
     }
 }
 
+/// Define gcc's `__EXCEPTIONS` under `-fexceptions`, which glibc's libio
+/// and `<pthread.h>` read to choose the `cleanup` attribute for their locks
+/// and cancellation handlers.
+fn define_exceptions_macro(pp: &mut Preprocessor, exceptions: bool) {
+    if exceptions {
+        pp.define_macro(Macro::predefined("__EXCEPTIONS", Some("1")));
+    }
+}
+
 /// What preprocessing found, beyond the tokens.
 ///
 /// The `Preprocessor` is a local of the function below and is dropped when it
@@ -3229,6 +3240,7 @@ pub fn preprocess_collecting(
     define_pic_macros(&mut pp, target, config.position);
     define_isa_macros(&mut pp, target, config.isa);
     define_cet_macro(&mut pp, target, config.cf_protection);
+    define_exceptions_macro(&mut pp, config.exceptions);
 
     pp.set_include_paths(config.include_paths);
 
@@ -3285,6 +3297,9 @@ pub struct AsmPreprocessConfig<'a> {
     /// See [`PreprocessConfig::cf_protection`]: a `.S` reads `__CET__` to
     /// decide whether to start its functions with `endbr64`.
     pub cf_protection: crate::target::CfProtection,
+    /// See [`PreprocessConfig::exceptions`]: gcc defines `__EXCEPTIONS` for
+    /// a `.S` too.
+    pub exceptions: bool,
     /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
     /// is mapped as in C.
     pub macro_prefix_map: PrefixMap,
@@ -3380,6 +3395,7 @@ pub fn preprocess_asm_file(
     define_pic_macros(&mut pp, target, config.position);
     define_isa_macros(&mut pp, target, config.isa);
     define_cet_macro(&mut pp, target, config.cf_protection);
+    define_exceptions_macro(&mut pp, config.exceptions);
 
     // -nostdinc: the directories are dropped in `Preprocessor::new`; the
     // bundled headers go with them.

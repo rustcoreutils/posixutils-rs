@@ -377,6 +377,7 @@ impl AttributeList {
             align: self.get_alignment().filter(|n| n.is_power_of_two()),
             noreturn: self.has_noreturn(),
             returns_twice: self.has_attr("returns_twice"),
+            nothrow: self.has_attr("nothrow"),
             stack_protect: self.stack_protect().unwrap_or_else(|kept| kept),
             stack_protector: self.optimize_stack_protector(),
         }

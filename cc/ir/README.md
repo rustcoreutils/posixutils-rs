@@ -289,6 +289,14 @@ Call fields (all but `src` live in `InsnExtra`):
 - `returns_via_sret()`: derived from abi_info — large struct return via hidden pointer
 - `returns_two_regs()`: derived from abi_info — 9-16 byte struct via RAX+RDX / X0+X1
 - `known`: the library function the parser recognised, for `libcall_fold`
+- `may_throw`: under `-fexceptions`, the callee may unwind through this frame
+  (it is not `nothrow`)
+- `landing_pad`: where an unwind through the call goes to run the cleanups in
+  scope (`linearize_cleanup.rs`). A CFG edge like any other, named by the call
+  rather than the terminator, as an `asm goto`'s labels are; until lowering
+  the call is the last instruction before its block's terminator. Printed as
+  `unwind .Ln` after the call. Inlining a call with a pad gives the pad to
+  every throwing call of the spliced body (`Function::unwind_calls_to`)
 
 ### ABI Classification (`abi_info`)
 
@@ -407,6 +415,7 @@ Emitted by target mapping (`arch/mapping.rs`), which expands `__int128` operatio
 | `nop` | No operation. A deleted instruction becomes one (`Instruction::kill`), and `remove_nops` compacts them |
 | `asm` | Inline assembly (see `AsmData`) |
 | `lifetime.end` | The lifetime of the local `lifetime_of` names ends: control falls out of the block that declared it. Named out of band, never in `src`, so it is no use and no escape; kept by DCE, dropped with its local by `mem2reg`, and read by the allocators, which let locals whose lifetimes never meet share a slot |
+| `landingpad` | The exception object the unwinder hands a landing pad, in the first return register. Only ever the first instruction of a block that some call names as its `landing_pad` and no branch reaches (validator I14); a DCE root |
 
 ## Data Structures
 
@@ -462,6 +471,8 @@ is_noreturn_call        - the callee never returns
 callee_binding          - whether func_name may be defined in this module;
                           ask through `Instruction::local_callee`
 known                   - the library function a call is, for libcall_fold
+may_throw               - under -fexceptions, the callee may unwind
+landing_pad             - the block an unwind through the call goes to
 abi_info                - CallAbiInfo (see below)
 switch_cases/default    - switch ranges and default target
 asm_data                - inline assembly (template, operands, clobbers)
@@ -595,7 +606,7 @@ after that, because merging would undo the splitting the copies depend on. See
 | `copyprop.rs` | Each use of a no-op `copy` (same width, same register class) reads the copy's source instead; `dce` collects the copies |
 | `dse.rs` | Dead-store elimination, for two cases: a store whose every byte is overwritten before any is read (a forward walk within a block), and a store to a non-escaping local that nothing reads before the function returns (a backward walk over the CFG) |
 | `dce.rs` | Mark-sweep from the roots, which are any opcode with `has_side_effects()` plus any volatile access. It also folds a branch into a block that does nothing but `unreachable`, and removes unreachable blocks |
-| `cfg.rs` | Every edit to the CFG goes through here: successors (including `asm goto` labels), edge removal, critical-edge splitting, unreachable-block removal, and `simplify_cfg` (forwarder threading and block merging) |
+| `cfg.rs` | Every edit to the CFG goes through here: successors (including `asm goto` labels and landing pads), edge removal, critical-edge splitting, unreachable-block removal, and `simplify_cfg` (forwarder threading and block merging) |
 
 ### Analyses and shared rules (not passes)
 

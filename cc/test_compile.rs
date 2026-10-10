@@ -228,6 +228,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             position,
             isa: target::X86Isa::from_flags(&o.mflags),
             cf_protection: o.cf_protection,
+            exceptions: o.unwind.exceptions(),
             macro_prefix_map: prefix_maps.macros,
         },
     );
@@ -244,6 +245,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         },
         pic: o.shared || position.is_pic(),
         cfi: o.unwind.cfi(&target, o.debug),
+        exceptions: o.unwind.exceptions(),
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
         stack_clash: o.stack_clash,

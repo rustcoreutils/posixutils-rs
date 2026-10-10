@@ -1408,22 +1408,32 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit the actual call instruction (direct or indirect)
-    pub(super) fn emit_call_instruction(&mut self, insn: &Instruction, func_name: &str) {
+    /// The call instruction of `insn`, `args_size` bytes of its arguments
+    /// on the stack, between the labels of its call-site entry when it has
+    /// a landing pad (`arch::eh`).
+    pub(super) fn emit_call_instruction(
+        &mut self,
+        insn: &Instruction,
+        func_name: &str,
+        args_size: usize,
+    ) {
+        let site = self.base.eh_call_begin(insn, args_size as i64);
         if insn.extra().indirect_target.is_some() {
             self.push_lir(X86Inst::Call {
                 target: CallTarget::Indirect(Reg::R11),
             });
+            self.base.eh_call_end(site);
         } else {
             self.push_lir(X86Inst::Call {
                 target: CallTarget::Direct(Symbol::global(func_name.to_string())),
             });
             // The second return of a function that returns twice comes by
             // an indirect jump, so under branch protection it lands on
-            // `endbr64`.
+            // `endbr64`, which gcc keeps inside the call's call-site entry.
             if self.base.cf_protection.branch && insn.returns_twice() {
                 self.push_lir(X86Inst::Endbr64);
             }
+            self.base.eh_call_end(site);
         }
     }
 

@@ -296,7 +296,7 @@ pub(crate) trait SparseAnalysis {
             func.blocks[idx].insns.last().map(|i| i.op),
             Some(Opcode::Br) | Some(Opcode::Cbr) | Some(Opcode::Switch) | Some(Opcode::IndirectBr)
         );
-        if func.blocks[idx].has_asm_goto() || !modelled_terminator {
+        if func.blocks[idx].has_mid_block_edge() || !modelled_terminator {
             self.mark_all_successors(func, idx);
         }
     }

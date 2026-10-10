@@ -347,6 +347,7 @@ impl X86_64CodeGen {
         if self.base.cfi.emitted() {
             self.push_lir(X86Inst::Directive(Directive::CfiEndProc));
         }
+        self.base.eh_end_function();
 
         // The label `DW_AT_high_pc` names, before `.size` so it marks the end
         // of the code rather than a point after the directive.
@@ -470,6 +471,7 @@ impl X86_64CodeGen {
         if self.base.cfi.emitted() {
             self.push_lir(X86Inst::Directive(Directive::CfiStartProc));
         }
+        self.base.eh_begin_function(func, self.pic_mode);
     }
 
     /// The `Arg` pseudos whose parameter is a pointer; see

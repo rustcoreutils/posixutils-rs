@@ -881,6 +881,7 @@ fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8
         position: position_independence(args, target),
         isa: target::X86Isa::from_flags(&args.mflags),
         cf_protection: args.cf_protection.unwrap_or_default(),
+        exceptions: args.unwind_tables().exceptions(),
         defines: &args.defines,
         undefines: &args.undefines,
         include_paths: &args.include_paths,
@@ -1382,6 +1383,7 @@ fn process_file(
             position: position_independence(args, target),
             isa: target::X86Isa::from_flags(&args.mflags),
             cf_protection: args.cf_protection.unwrap_or_default(),
+            exceptions: args.unwind_tables().exceptions(),
             macro_prefix_map: prefix_maps.macros,
         },
     );
@@ -1434,13 +1436,8 @@ fn process_file(
         default_visibility: args.default_visibility.as_deref(),
         tls,
         pic: producing_shared(args) || position.is_pic(),
-        cfi: args
-            .unwind
-            .iter()
-            .fold(target::UnwindTables::default(), |u, name| {
-                u.after(name).unwrap_or(u)
-            })
-            .cfi(target, args.debug > 0),
+        cfi: args.unwind_tables().cfi(target, args.debug > 0),
+        exceptions: args.unwind_tables().exceptions(),
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
         stack_clash: args.stack_clash,
@@ -1763,6 +1760,11 @@ impl Args {
     /// The maps the `-f*-prefix-map=` options build, in command-line order.
     fn prefix_maps(&self) -> PrefixMaps {
         PrefixMaps::from_options(&self.prefix_maps)
+    }
+
+    /// What the unwind-table options ask for, `-fexceptions` among them.
+    fn unwind_tables(&self) -> target::UnwindTables {
+        target::UnwindTables::from_names(&self.unwind)
     }
 }
 

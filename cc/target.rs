@@ -362,6 +362,21 @@ impl UnwindTables {
         Some(next)
     }
 
+    /// The request the options named `names` make, in order, the last of
+    /// each kind winning; a name that is not one of the six is passed over.
+    pub fn from_names<S: AsRef<str>>(names: &[S]) -> Self {
+        names.iter().fold(Self::default(), |u, name| {
+            u.after(name.as_ref()).unwrap_or(u)
+        })
+    }
+
+    /// `-fexceptions`: a frame that a `cleanup` variable is in scope in runs
+    /// the variable's cleanup when it is unwound, and `__EXCEPTIONS` is
+    /// defined. Off by default, as C's default is in gcc.
+    pub fn exceptions(self) -> bool {
+        self.exceptions.unwrap_or(false)
+    }
+
     /// Where `target`'s CFI goes, `debug` being `-g`. As in gcc 13, a unit
     /// has unwind tables unless both kinds are off and `-fexceptions` does
     /// not need them: the asynchronous kind is on by default for both
@@ -374,7 +389,7 @@ impl UnwindTables {
     /// builds the compact unwind table every Darwin unwinder reads from them,
     /// and c17 has no other way to give it one.
     pub fn cfi(self, target: &Target, debug: bool) -> Cfi {
-        let tables = self.exceptions.unwrap_or(false)
+        let tables = self.exceptions()
             || self.asynchronous.unwrap_or(true)
             || self.synchronous.unwrap_or(target.arch == Arch::Aarch64);
         if tables || target.os == Os::MacOS {

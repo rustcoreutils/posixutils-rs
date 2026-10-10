@@ -995,6 +995,17 @@ pub enum Directive {
     /// (`.fini_array` on ELF, `__DATA,__mod_term_func` on Mach-O).
     FiniArray(Option<u16>),
 
+    /// Switch to the section of the LSDAs, which the personality routine
+    /// reads (`.gcc_except_table` on ELF, `__TEXT,__gcc_except_tab` on
+    /// Mach-O).
+    GccExceptTable,
+
+    /// ELF only: switch to the writable section of the COMDAT group named
+    /// for `sym`, which holds `sym` alone, so that the linker keeps one copy
+    /// of it for every object that defines it (`.data.rel.local.<sym>`, as
+    /// gcc names the one for `DW.ref.__gcc_personality_v0`).
+    ComdatData(Symbol),
+
     // ========================================================================
     // Symbol Visibility and Attributes
     // ========================================================================
@@ -1115,6 +1126,18 @@ pub enum Directive {
     /// .cfi_restore_state - pop the rules the last remember pushed
     CfiRestoreState,
 
+    /// `.cfi_personality encoding, sym`: the routine the unwinder calls for
+    /// the procedure's frames, encoded as `encoding` says (`arch::eh`).
+    CfiPersonality { encoding: u8, sym: Symbol },
+
+    /// `.cfi_lsda encoding, sym`: the procedure's LSDA, which the personality
+    /// routine reads.
+    CfiLsda { encoding: u8, sym: Symbol },
+
+    /// `.cfi_GNU_args_size n`: from here, the stack pointer sits `n` bytes
+    /// of outgoing arguments below where a landing pad expects it.
+    CfiGnuArgsSize(i64),
+
     // ========================================================================
     // Debug Information
     // ========================================================================
@@ -1140,6 +1163,9 @@ pub enum Directive {
 
     /// .uleb128 value - unsigned LEB128 encoding for DWARF
     Uleb128(u64),
+    /// `.uleb128 end-start`: the distance between two labels, which the
+    /// assembler resolves -- an LSDA call-site entry.
+    Uleb128Diff { end: Symbol, start: Symbol },
     /// A signed LEB128 -- DWARF location expressions take frame offsets this way.
     Sleb128(i64),
 
@@ -1471,6 +1497,21 @@ impl EmitAsm for Directive {
             Directive::FiniArray(priority) => {
                 emit_init_array_section(out, target, ".fini_array", "__mod_term_func", *priority)
             }
+            Directive::GccExceptTable => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section __TEXT,__gcc_except_tab");
+                }
+                Os::Linux | Os::FreeBSD => {
+                    let _ = writeln!(out, ".section .gcc_except_table,\"a\",@progbits");
+                }
+            },
+            Directive::ComdatData(sym) => {
+                let name = sym.format_for_target(target);
+                let _ = writeln!(
+                    out,
+                    ".section .data.rel.local.{name},\"awG\",@progbits,{name},comdat"
+                );
+            }
 
             // Symbol visibility
             Directive::Global(sym) => {
@@ -1679,6 +1720,17 @@ impl EmitAsm for Directive {
             Directive::CfiRestoreState => {
                 let _ = writeln!(out, "    .cfi_restore_state");
             }
+            Directive::CfiPersonality { encoding, sym } => {
+                let name = sym.format_for_target(target);
+                let _ = writeln!(out, "    .cfi_personality {encoding:#x},{name}");
+            }
+            Directive::CfiLsda { encoding, sym } => {
+                let name = sym.format_for_target(target);
+                let _ = writeln!(out, "    .cfi_lsda {encoding:#x},{name}");
+            }
+            Directive::CfiGnuArgsSize(n) => {
+                let _ = writeln!(out, "    .cfi_GNU_args_size {n}");
+            }
 
             // Debug info
             Directive::File { index, path } => {
@@ -1723,6 +1775,14 @@ impl EmitAsm for Directive {
             },
             Directive::Uleb128(v) => {
                 let _ = writeln!(out, "    .uleb128 {}", v);
+            }
+            Directive::Uleb128Diff { end, start } => {
+                let _ = writeln!(
+                    out,
+                    "    .uleb128 {}-{}",
+                    end.format_for_target(target),
+                    start.format_for_target(target)
+                );
             }
             Directive::Sleb128(v) => {
                 let _ = writeln!(out, "    .sleb128 {}", v);

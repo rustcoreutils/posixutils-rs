@@ -552,6 +552,12 @@ pub enum Opcode {
     /// out of band, never in `src`, so no analysis counts it as a use, an
     /// escape or a reason to keep the local. See `arch::regalloc::LocalLifetimes`.
     LifetimeEnd,
+    /// The exception object a landing pad receives: the value the unwinder
+    /// leaves in the first return register (`%rax`, `x0`) when it transfers
+    /// control to the pad. Only ever the first instruction of a block that
+    /// is the [`InsnExtra::landing_pad`] of some call and that no other edge
+    /// reaches. See `ir::linearize_cleanup`.
+    LandingPad,
     /// A lane-wise operation on whole GNU vectors, computed by the target's
     /// packed instructions: `typ` is the vector type, which says the lanes,
     /// and `size` its width, 128 or 64. Each operand and the result is the
@@ -908,7 +914,7 @@ impl Opcode {
             | Unreachable | Trap | FrameAddress | ReturnAddress | Setjmp | Longjmp | AtomicLoad
             | AtomicStore | AtomicSwap | AtomicCas | AtomicFetchAdd | AtomicFetchSub
             | AtomicFetchAnd | AtomicFetchOr | AtomicFetchXor | Fence | Lo64 | Hi64 | Pair64
-            | AddC | AdcC | SubC | SbcC | UMulHi | LifetimeEnd => FpRaise::Never,
+            | AddC | AdcC | SubC | SbcC | UMulHi | LifetimeEnd | LandingPad => FpRaise::Never,
         }
     }
 
@@ -1040,8 +1046,10 @@ impl Opcode {
             || (self.may_access_memory() && *self != Opcode::Load)
             // `Entry` marks where the function begins. `LifetimeEnd` is not
             // an effect of the program's, but a fact the allocator reads,
-            // which deleting would lose.
-            || matches!(self, Opcode::Entry | Opcode::LifetimeEnd)
+            // which deleting would lose. `LandingPad` takes the exception
+            // object out of its register, and has to stay where it is, first
+            // in its block, until the code generator reads it there.
+            || matches!(self, Opcode::Entry | Opcode::LifetimeEnd | Opcode::LandingPad)
     }
 
     /// True for the atomic memory operations (not `Fence`, which touches no
@@ -1202,6 +1210,7 @@ impl Opcode {
             Opcode::SbcC => "sbcc",
             Opcode::UMulHi => "umulhi",
             Opcode::LifetimeEnd => "lifetime.end",
+            Opcode::LandingPad => "landingpad",
         }
     }
 }
@@ -1335,6 +1344,7 @@ every_opcode! {
     Unreachable, Trap, FrameAddress, ReturnAddress, Setjmp, Longjmp, Asm, AtomicLoad, AtomicStore,
     AtomicSwap, AtomicCas, AtomicFetchAdd, AtomicFetchSub, AtomicFetchAnd, AtomicFetchOr,
     AtomicFetchXor, Fence, Lo64, Hi64, Pair64, AddC, AdcC, SubC, SbcC, UMulHi, LifetimeEnd,
+    LandingPad,
 }
 
 impl fmt::Display for Opcode {
@@ -1834,6 +1844,16 @@ pub struct InsnExtra {
     /// For direct calls: the callee may return twice, as `setjmp` does. Ask
     /// [`Instruction::returns_twice`], which also answers for `Setjmp`.
     pub returns_twice_call: bool,
+    /// For calls, under `-fexceptions`: the callee may unwind through this
+    /// frame -- it is not `nothrow`. A call the compiler makes for itself
+    /// (a library fallback, a block copy) never does.
+    pub may_throw: bool,
+    /// For calls: the block the unwinder transfers control to when the
+    /// callee unwinds through this frame, which runs the cleanups in scope
+    /// and resumes the unwind. An edge of the CFG like any other, out of a
+    /// block whose next instruction is its terminator, into a block that
+    /// starts with [`Opcode::LandingPad`] and has no phi.
+    pub landing_pad: Option<BasicBlockId>,
     /// For direct calls: whether `func_name` may be a definition in this
     /// module or is only ever the external library function. See
     /// [`Instruction::local_callee`], which is how a pass should ask.
@@ -1871,6 +1891,8 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     ends_with_va_arg_pack: false,
     is_noreturn_call: false,
     returns_twice_call: false,
+    may_throw: false,
+    landing_pad: None,
     callee_binding: crate::parse::ast::CalleeBinding::Declared,
     known: None,
     indirect_target: None,
@@ -2802,6 +2824,9 @@ impl fmt::Display for InstructionDisplay<'_> {
                     write!(f, "{}", ctx.pseudo(*arg))?;
                 }
                 write!(f, ")")?;
+                if let Some(pad) = this.extra().landing_pad {
+                    write!(f, " unwind {}", pad)?;
+                }
             }
             Opcode::Switch => {
                 if let Some(val) = this.src.first() {

@@ -53,6 +53,7 @@ mod codegen_cross_abi;
 mod codegen_cross_abi_types;
 mod codegen_cross_abi_varargs;
 mod codegen_debug_info;
+mod codegen_exceptions;
 mod codegen_file_scope_asm;
 mod codegen_floating;
 mod codegen_fp_compare;

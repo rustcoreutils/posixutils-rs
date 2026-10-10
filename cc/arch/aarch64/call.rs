@@ -1059,7 +1059,16 @@ impl Aarch64CodeGen {
     }
 
     /// Emit the actual call instruction (direct or indirect)
-    pub(super) fn emit_call_instruction(&mut self, insn: &Instruction, func_name: &str) {
+    /// The call instruction of `insn`, `stack_args` sixteen-byte units of
+    /// its arguments on the stack, between the labels of its call-site entry
+    /// when it has a landing pad (`arch::eh`).
+    pub(super) fn emit_call_instruction(
+        &mut self,
+        insn: &Instruction,
+        func_name: &str,
+        stack_args: i32,
+    ) {
+        let site = self.base.eh_call_begin(insn, i64::from(stack_args) * 16);
         if insn.extra().indirect_target.is_some() {
             self.push_lir(Aarch64Inst::Bl {
                 target: CallTarget::Indirect(Reg::X16),
@@ -1069,6 +1078,7 @@ impl Aarch64CodeGen {
                 target: CallTarget::Direct(Symbol::global(func_name)),
             });
         }
+        self.base.eh_call_end(site);
     }
 
     /// Clean up stack after call

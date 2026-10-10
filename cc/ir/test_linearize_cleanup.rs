@@ -10,8 +10,8 @@
 // `fn(&var)`, in what order, and after what.
 //
 
-use super::test_linearize::linearize_source;
-use crate::ir::{BasicBlock, Function, Module, Opcode};
+use super::test_linearize::{linearize_source, linearize_source_eh};
+use crate::ir::{BasicBlock, BasicBlockId, Function, Instruction, Module, Opcode};
 use crate::target::{Arch, Os, Target};
 
 fn targets() -> [Target; 2] {
@@ -225,5 +225,101 @@ fn a_goto_runs_the_cleanups_of_the_scopes_it_leaves() {
             "{:?}",
             target.arch
         );
+    }
+}
+
+/// The call in `f` to `name`, the `n`th of them in block order.
+fn call_to<'a>(f: &'a Function, name: &str, n: usize) -> &'a Instruction {
+    f.blocks
+        .iter()
+        .flat_map(|bb| &bb.insns)
+        .filter(|i| i.op == Opcode::Call && i.extra().func_name.as_deref() == Some(name))
+        .nth(n)
+        .unwrap_or_else(|| panic!("no call {n} to {name}"))
+}
+
+/// Starting at `pad`, the functions called on the way to `_Unwind_Resume`,
+/// following each block's terminator (the normal way out of every call).
+fn unwind_path(f: &Function, pad: BasicBlockId) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = pad;
+    for _ in 0..f.blocks.len() {
+        let bb = f.get_block(at).expect("a block on the path");
+        out.extend(callees(bb).into_iter().map(str::to_string));
+        match bb.insns.last() {
+            Some(t) if t.op == Opcode::Br => at = t.bb_true.unwrap(),
+            _ => break,
+        }
+    }
+    out
+}
+
+const EH_SOURCE: &str = "void c(int *); void d(int *); void g(void);\n\
+                         void h(void) __attribute__((nothrow));\n\
+                         void f(void) {\n\
+                           g();\n\
+                           int a __attribute__((cleanup(c))) = 1;\n\
+                           g();\n\
+                           {\n\
+                             int b __attribute__((cleanup(d))) = 2;\n\
+                             g();\n\
+                             h();\n\
+                           }\n\
+                         }\n";
+
+/// Under `-fexceptions` each call that may throw in a cleanup's scope gets
+/// a landing pad of its own, which starts with `landingpad` and runs the
+/// cleanups in force, innermost first, then resumes the unwind; a call
+/// outside every such scope, or to a `nothrow` callee, gets none. A call
+/// in a cleanup unwinds through the cleanups below it only.
+#[test]
+fn fexceptions_gives_calls_in_cleanup_scopes_landing_pads() {
+    for target in targets() {
+        let module = linearize_source_eh(EH_SOURCE, &target);
+        crate::ir::validate::validate_module_at(&module, crate::ir::validate::Stage::Ssa)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let f = func(&module, "f");
+        let pad = |i: &Instruction| i.extra().landing_pad;
+        assert_eq!(pad(call_to(f, "g", 0)), None, "{:?}", target.arch);
+        assert_eq!(pad(call_to(f, "h", 0)), None, "{:?}", target.arch);
+        let in_a = pad(call_to(f, "g", 1)).expect("g in a's scope");
+        let in_b = pad(call_to(f, "g", 2)).expect("g in b's scope");
+        assert_ne!(in_a, in_b);
+        for p in [in_a, in_b] {
+            let block = f.get_block(p).unwrap();
+            assert_eq!(block.insns[0].op, Opcode::LandingPad, "{:?}", target.arch);
+            assert_eq!(block.parents.len(), 1, "{:?}", target.arch);
+        }
+        assert_eq!(unwind_path(f, in_a), ["c", "_Unwind_Resume"]);
+        assert_eq!(unwind_path(f, in_b), ["d", "c", "_Unwind_Resume"]);
+        // `b`'s cleanup on the normal path unwinds through `a`'s; `a`'s
+        // through nothing.
+        let calls_of = |name: &'static str| {
+            f.blocks
+                .iter()
+                .flat_map(|bb| &bb.insns)
+                .filter(move |i| i.extra().func_name.as_deref() == Some(name))
+        };
+        assert!(calls_of("d")
+            .any(|i| pad(i).is_some_and(|p| unwind_path(f, p) == ["c", "_Unwind_Resume"])));
+        assert!(calls_of("c").all(|i| pad(i).is_none()));
+        let resume = call_to(f, "_Unwind_Resume", 0);
+        assert!(resume.extra().is_noreturn_call && resume.extra().may_throw);
+    }
+}
+
+/// Without `-fexceptions` -- C's default -- the same function has no
+/// landing pad and no `landingpad`, and no call is marked as throwing: the
+/// IR is what it always was.
+#[test]
+fn no_fexceptions_no_landing_pads() {
+    for target in targets() {
+        let module = linearize_source(EH_SOURCE, &target);
+        let f = func(&module, "f");
+        for i in f.blocks.iter().flat_map(|bb| &bb.insns) {
+            assert_ne!(i.op, Opcode::LandingPad);
+            assert_eq!(i.extra().landing_pad, None);
+            assert!(!i.extra().may_throw);
+        }
     }
 }

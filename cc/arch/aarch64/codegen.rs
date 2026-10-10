@@ -75,7 +75,7 @@ pub struct Aarch64CodeGen {
     /// `extern` declarations -- for [`Self::lo12_folds`].
     pub(super) sym_align: HashMap<String, u32>,
     /// Position-independent code mode (for shared libraries)
-    pic_mode: bool,
+    pub(super) pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
     unique_label_counter: u32,
     /// Bytes the prologue allocates for locals: what a dynamically aligned
@@ -829,6 +829,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::StackSave => self.emit_stack_save(insn),
+            Opcode::LandingPad => self.emit_landing_pad(insn),
             Opcode::StackRestore => self.emit_stack_restore(insn),
 
             Opcode::Fabs => self.emit_fp_abs(insn, types),
@@ -1116,7 +1117,7 @@ impl Aarch64CodeGen {
         }
 
         // Emit the call instruction
-        self.emit_call_instruction(insn, &func_name);
+        self.emit_call_instruction(insn, &func_name, stack_args);
 
         // Clean up stack
         self.cleanup_call_stack(stack_args);
@@ -1440,6 +1441,7 @@ impl CodeGenerator for Aarch64CodeGen {
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
 
+        self.base.emit_eh_tables(self.pic_mode);
         self.base.push_directive(Directive::UnitEnd);
 
         // Flush all buffered LIR instructions to output

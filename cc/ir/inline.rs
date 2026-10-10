@@ -1240,6 +1240,7 @@ fn inline_call_site(
     }
     let call_args = call_insn.src.clone();
     let return_target = call_insn.target;
+    let landing_pad = call_insn.extra().landing_pad;
     let forwarded = forwarded_args(call_insn, callee);
     let call_bb_id = call_bb.id;
 
@@ -1275,6 +1276,11 @@ fn inline_call_site(
         inlined_entry,
         ctx.return_continuation_bb,
     );
+    // An unwind out of the body passes through the call's cleanups.
+    if let Some(pad) = landing_pad {
+        ctx.caller.remove_edge(ctx.return_continuation_bb, pad);
+        ctx.caller.unwind_calls_to(&body, pad);
+    }
 
     // The copy's label addresses now name blocks of the caller, which takes
     // on everything that means -- memory analysis gives up on it, and a

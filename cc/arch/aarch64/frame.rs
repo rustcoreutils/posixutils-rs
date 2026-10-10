@@ -230,6 +230,7 @@ impl Aarch64CodeGen {
         if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiEndProc));
         }
+        self.base.eh_end_function();
 
         // The label `DW_AT_high_pc` names, before `.size` so it marks the end
         // of the code rather than a point after the directive.
@@ -386,6 +387,7 @@ impl Aarch64CodeGen {
         if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiStartProc));
         }
+        self.base.eh_begin_function(func, self.pic_mode);
     }
 
     /// Push a CFI rule, when unwind tables are on.

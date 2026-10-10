@@ -86,3 +86,42 @@ fn codegen_macho_output_assembles() {
         }
     }
 }
+
+/// The `-fexceptions` tables -- personality, LSDA, landing pads -- assemble
+/// as Mach-O for both Darwin targets.
+#[test]
+fn codegen_macho_exception_tables_assemble() {
+    let program = "extern void g(int);\n\
+                   static void cl(int *p) { g(*p); }\n\
+                   int f(int x) {\n\
+                       int a __attribute__((cleanup(cl))) = x;\n\
+                       g(1);\n\
+                       { int b __attribute__((cleanup(cl))) = x + 1; g(2); }\n\
+                       return a;\n\
+                   }\n";
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_macho_eh_")
+        .tempdir()
+        .expect("failed to create work dir");
+    let s = dir.path().join("t.s");
+    let o = dir.path().join("t.o");
+    let (s_path, o_path) = (s.to_string_lossy(), o.to_string_lossy());
+    for (triple, arch) in [(AARCH64_DARWIN, "arm64"), (X86_64_DARWIN, "x86_64")] {
+        for level in ["-O0", "-O2"] {
+            let asm = asm_for_with("macho_eh", triple, program, &[level, "-fexceptions"]);
+            assert!(asm.contains(".cfi_lsda"), "{triple} {level}:\n{asm}");
+            std::fs::write(&s, &asm).expect("failed to write assembly");
+            let Some(out) = assemble_macho(arch, &s_path, &o_path) else {
+                eprintln!(
+                    "SKIP codegen_macho_exception_tables_assemble: no llvm-mc and not a macOS host"
+                );
+                return;
+            };
+            assert!(
+                out.status.success(),
+                "{triple} {level}: the Mach-O assembler rejected c17's output:\n{}\n{asm}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+}

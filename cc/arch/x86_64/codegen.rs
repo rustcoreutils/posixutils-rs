@@ -74,7 +74,7 @@ pub struct X86_64CodeGen {
     /// Thread-local storage symbols (need TLS access via FS segment)
     pub(super) tls_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries and PIE)
-    pic_mode: bool,
+    pub(super) pic_mode: bool,
     /// `-pg`, and the shape of its call.
     pub(super) profiling: Option<crate::target::Profiling>,
     /// Whether the unit is optimized; see [`Self::plan_landing_pads`].
@@ -1298,6 +1298,7 @@ impl X86_64CodeGen {
 
             Opcode::StackSave => self.emit_stack_save(insn),
             Opcode::StackRestore => self.emit_stack_restore(insn),
+            Opcode::LandingPad => self.emit_landing_pad(insn),
 
             Opcode::Memset => {
                 self.emit_memset(insn);
@@ -1445,7 +1446,7 @@ impl X86_64CodeGen {
         }
 
         // Emit the call instruction
-        self.emit_call_instruction(insn, &func_name);
+        self.emit_call_instruction(insn, &func_name, stack_args);
 
         // Clean up stack
         self.cleanup_call_stack(stack_args);
@@ -1844,6 +1845,7 @@ impl CodeGenerator for X86_64CodeGen {
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
 
+        self.base.emit_eh_tables(self.pic_mode);
         self.base.push_directive(Directive::UnitEnd);
         if let Some(bits) = self.base.cf_protection.feature_bits() {
             self.base.push_directive(Directive::X86FeatureNote(bits));

@@ -74,8 +74,7 @@ impl TestContext {
             &self.types,
             &self.strings,
             &target,
-            false,
-            true,
+            Default::default(),
         )
     }
 }
@@ -99,7 +98,7 @@ pub(super) fn test_linearize(
 ) -> Module {
     let symbols = SymbolTable::new();
     let target = Target::host();
-    linearize(tu, &symbols, types, strings, &target, false, true)
+    linearize(tu, &symbols, types, strings, &target, Default::default())
 }
 
 pub(super) fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDef {
@@ -1253,7 +1252,7 @@ fn test_linearize_with_symbols(
     strings: &StringTable,
 ) -> Module {
     let target = Target::host();
-    linearize(tu, symbols, types, strings, &target, false, true)
+    linearize(tu, symbols, types, strings, &target, Default::default())
 }
 
 #[test]
@@ -1425,6 +1424,22 @@ pub(super) fn linearize_source_trapping(
     policy: crate::parse::LibraryCallPolicy,
     trapping_math: bool,
 ) -> (Module, TypeTable) {
+    linearize_source_with(src, target, policy, trapping_math, false)
+}
+
+/// [`linearize_source`] under `-fexceptions`.
+pub(crate) fn linearize_source_eh(src: &str, target: &Target) -> Module {
+    linearize_source_with(src, target, Default::default(), true, true).0
+}
+
+/// Linearize `src` for `target` with each option as given.
+fn linearize_source_with(
+    src: &str,
+    target: &Target,
+    policy: crate::parse::LibraryCallPolicy,
+    trapping_math: bool,
+    exceptions: bool,
+) -> (Module, TypeTable) {
     let mut strings = StringTable::new();
     let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
@@ -1442,8 +1457,11 @@ pub(super) fn linearize_source_trapping(
         &types,
         &strings,
         target,
-        false,
-        trapping_math,
+        super::LinearizeOptions {
+            debug: false,
+            trapping_math,
+            exceptions,
+        },
     );
     (module, types)
 }

@@ -3060,6 +3060,9 @@ pub struct FunctionAttrs {
     /// reads is the function *type*'s, which the declarator is given from
     /// this.
     pub returns_twice: bool,
+    /// `__attribute__((nothrow))`, which, like `noreturn`, a call site reads
+    /// off the function *type*.
+    pub nothrow: bool,
     /// `__attribute__((stack_protect))` or `((no_stack_protector))`.
     pub stack_protect: StackProtectAttr,
     /// The stack-protector level `__attribute__((optimize("...")))` sets for
@@ -3117,6 +3120,7 @@ impl FunctionAttrs {
         self.align = self.align.max(other.align);
         self.noreturn |= other.noreturn;
         self.returns_twice |= other.returns_twice;
+        self.nothrow |= other.nothrow;
         // The first declaration's wins; see `Parser::merge_fn_attrs`.
         self.stack_protect = self
             .stack_protect

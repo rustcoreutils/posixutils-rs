@@ -124,9 +124,9 @@ const PLAIN: &[(&str, Effect)] = &[
     ("dump-rtl-reload", Unsupported),
     ("dump-tree-optimized", Unsupported),
     ("dump-tree-ssa", Unsupported),
-    // c17 emits no LSDA, so a `cleanup` variable is not cleaned up when an
-    // exception or a thread cancellation unwinds through its frame.
-    ("exceptions", Unsupported),
+    // The unwind tables, and the landing pads that run a `cleanup`
+    // variable's cleanup when its frame is unwound: `target::UnwindTables`.
+    ("exceptions", Implemented),
     ("expensive-optimizations", Accepted(Pass)),
     ("fast-math", Accepted(Permission)),
     // c17's objects hold machine code, which is what a fat LTO object
@@ -182,7 +182,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-diagnostics-show-option", Accepted(Presentation)),
     ("no-early-inlining", Accepted(Pass)),
     ("no-enforce-eh-specs", CXX_OBJCXX),
-    ("no-exceptions", Accepted(Default)),
+    ("no-exceptions", Implemented),
     ("no-fast-math", Accepted(Default)),
     ("no-fat-lto-objects", Accepted(Pass)),
     ("no-finite-math-only", Accepted(Default)),
@@ -266,9 +266,11 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-vect-cost-model", Accepted(Pass)),
     ("no-wrapv", Accepted(Permission)),
     ("no-zero-initialized-in-bss", Accepted(Placement)),
-    // The OpenMP pragmas are ignored and `_OPENMP` is not defined.
+    // Only a call has a landing pad: a trapping instruction's signal
+    // handler cannot throw through the frame and run its cleanups.
     ("non-call-exceptions", Unsupported),
     ("omit-frame-pointer", Accepted(Permission)),
+    // The OpenMP pragmas are ignored and `_OPENMP` is not defined.
     ("openmp", Unsupported),
     ("optimize-strlen", Accepted(Pass)),
     // Every struct keeps its natural layout.

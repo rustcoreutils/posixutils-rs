@@ -290,10 +290,14 @@ fn collect(func: &Function, ctx: &FoldCtx) -> Vec<FoldSite> {
 }
 
 /// Whether `insn` is a call by name, with nothing appended at inlining.
+///
+/// A call with a landing pad is left alone: it ends its block with an edge
+/// into the pad, which what it folds to would have to take over.
 fn is_direct_call(insn: &Instruction) -> bool {
     insn.op == Opcode::Call
         && insn.extra().indirect_target.is_none()
         && !insn.extra().ends_with_va_arg_pack
+        && insn.extra().landing_pad.is_none()
 }
 
 /// What the call `insn` to `known` folds to, by the family it is in.

@@ -611,6 +611,8 @@ struct CalleeSignature {
     variadic_arg_start: Option<usize>,
     /// The callee does not return.
     is_noreturn: bool,
+    /// The callee is `nothrow`: it never unwinds through its caller.
+    is_nothrow: bool,
 }
 
 /// A call's lowered arguments: the values and, in step, the types the ABI
@@ -626,6 +628,8 @@ struct CallFacts {
     ends_with_va_arg_pack: bool,
     is_noreturn: bool,
     returns_twice: bool,
+    /// Under `-fexceptions`, the callee may unwind through this frame.
+    may_throw: bool,
     binding: crate::parse::ast::CalleeBinding,
     known: Option<crate::parse::ast::LibFn>,
     abi_info: Box<CallAbiInfo>,
@@ -864,6 +868,13 @@ pub struct Linearizer<'a> {
     /// is emitted even where its answer is known. `-fno-trapping-math` turns
     /// it off.
     pub(crate) trapping_math: bool,
+    /// `-fexceptions`: a call that may throw inside the scope of a `cleanup`
+    /// variable gets a landing pad that runs the cleanup when the frame is
+    /// unwound. See [`super::linearize_cleanup`].
+    pub(crate) exceptions: bool,
+    /// The landing pads of the function being linearized; see
+    /// [`super::linearize_cleanup::UnwindState`].
+    pub(crate) unwind: super::linearize_cleanup::UnwindState,
     /// The x86-64 ISA of the function being linearized: what decides which
     /// vector operations are one packed instruction. See
     /// [`Linearizer::function_isa`].
@@ -939,6 +950,8 @@ impl<'a> Linearizer<'a> {
             section_definitions: HashMap::new(),
             defined_functions: std::collections::HashSet::new(),
             trapping_math: true,
+            exceptions: false,
+            unwind: Default::default(),
             isa: target.x86_isa,
             clone_statics: None,
         }
@@ -1925,6 +1938,7 @@ impl<'a> Linearizer<'a> {
         self.pending_goto_vla.clear();
         self.vla_marks.clear();
         self.cleanups.clear();
+        self.unwind = Default::default();
         self.func_has_vla = Self::declares_vla(&func.body);
         self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
@@ -4407,6 +4421,7 @@ impl<'a> Linearizer<'a> {
             is_noreturn: sig.is_noreturn,
             returns_twice: matches!(target, CallTarget::Direct(_))
                 && self.callee_returns_twice(func_expr),
+            may_throw: self.exceptions && !sig.is_nothrow,
             binding,
             known,
             abi_info: Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv)),
@@ -4588,6 +4603,7 @@ impl<'a> Linearizer<'a> {
             .filter(|ft| ft.variadic)
             .and_then(|ft| ft.params.as_ref().map(|p| p.len()));
         let is_noreturn = callee.is_some_and(|ft| ft.noreturn);
+        let is_nothrow = callee.is_some_and(|ft| ft.nothrow);
 
         CalleeSignature {
             conv,
@@ -4595,6 +4611,7 @@ impl<'a> Linearizer<'a> {
             unprototyped,
             variadic_arg_start,
             is_noreturn,
+            is_nothrow,
         }
     }
 
@@ -4872,12 +4889,8 @@ impl<'a> Linearizer<'a> {
         extra.callee_binding = facts.binding;
         extra.known = facts.known;
         extra.abi_info = Some(facts.abi_info);
-        self.emit(call_insn);
-        if facts.is_noreturn {
-            self.emit_no_return(
-                Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
-            );
-        }
+        extra.may_throw = facts.may_throw;
+        self.emit_call(call_insn, facts.is_noreturn);
     }
 
     /// Linearize a post-increment or post-decrement expression
@@ -7438,19 +7451,40 @@ impl<'a> Linearizer<'a> {
 
 // Public API
 
+/// The command-line options that change what [`linearize`] emits.
+#[derive(Debug, Clone, Copy)]
+pub struct LinearizeOptions {
+    /// `-g`.
+    pub debug: bool,
+    /// `-ftrapping-math`, the default; see [`Linearizer::trapping_math`].
+    pub trapping_math: bool,
+    /// `-fexceptions`; see [`Linearizer::exceptions`].
+    pub exceptions: bool,
+}
+
+impl Default for LinearizeOptions {
+    fn default() -> Self {
+        Self {
+            debug: false,
+            trapping_math: true,
+            exceptions: false,
+        }
+    }
+}
+
 pub fn linearize(
     tu: &TranslationUnit,
     symbols: &SymbolTable,
     types: &TypeTable,
     strings: &StringTable,
     target: &Target,
-    debug: bool,
-    trapping_math: bool,
+    opts: LinearizeOptions,
 ) -> Module {
     let mut linearizer = Linearizer::new(symbols, types, strings, target);
-    linearizer.trapping_math = trapping_math;
+    linearizer.trapping_math = opts.trapping_math;
+    linearizer.exceptions = opts.exceptions;
     let mut module = linearizer.linearize(tu);
-    module.debug = debug;
+    module.debug = opts.debug;
     // Get all source files from the stream registry (includes all #included files)
     // The stream IDs in Position map directly to indices in this vector
     // Filter out synthetic file names (like "<paste>", "<built-in>") which start with '<'

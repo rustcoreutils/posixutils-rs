@@ -1555,6 +1555,15 @@ impl Aarch64CodeGen {
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
     }
 
+    /// The start of a landing pad, where the unwinder jumps with the
+    /// exception object in X0: the object to its home.
+    pub(super) fn emit_landing_pad(&mut self, insn: &Instruction) {
+        if let Some(target) = insn.target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::X0, &dst_loc, 64);
+        }
+    }
+
     /// Put SP back to a saved value, releasing everything alloca'd since.
     pub(super) fn emit_stack_restore(&mut self, insn: &Instruction) {
         let Some(&src) = insn.src.first() else {

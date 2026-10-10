@@ -767,6 +767,10 @@ Debian source packages, with GNU patch's meaning:
    COMMAND`.  Columns, `STAT` flags, `%CPU` (CPU time over lifetime) and
    `%MEM` follow procps; a control character in the command is shown as `?`.
    binutils' `debian/rules` runs `ps aux`.
+ * procps' `--no-headers` (no header line), the `-o stat` field (the `STAT`
+   column above), and process IDs given as operands, which select as `-p`
+   does.  util-linux's tests wait with
+   `until [[ $(ps --no-headers -ostat PID) =~ S.* ]]`.
 
 ### prs
 

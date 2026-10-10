@@ -169,7 +169,7 @@ fn per_mille_text(per_mille: u64) -> String {
 /// The state letter, then procps' flags: `<` raised priority, `N` lowered,
 /// `L` locked pages, `s` session leader, `l` multi-threaded, and `+` in the
 /// foreground process group of its terminal.
-fn stat_column(proc: &ProcessInfo) -> String {
+pub(crate) fn stat_column(proc: &ProcessInfo) -> String {
     let mut stat = String::from(proc.state);
     if proc.nice < 0 {
         stat.push('<');

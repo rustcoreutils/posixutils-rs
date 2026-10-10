@@ -119,10 +119,11 @@ pub fn set_fd(fd: RawFd, name: &CStr, value: &[u8]) -> io::Result<()> {
 /// source (0444, 0555) is already denied. Where one is refused so (EACCES) and the file is a
 /// regular file or directory the effective user owns whose mode denies the owner writing, the
 /// owner's write bit is lent through `chmod` while the refused ones are set again, and the
-/// exact mode is put back at once, as GNU cp -a and tar --xattrs -xp do. The outer error is
-/// that of lending or putting back the mode. Residual: a chmod by a user outside the file's
-/// group clears its set-group-ID bit, which putting the mode back cannot set again; the
-/// caller gives the file its final mode afterwards in any case.
+/// exact mode is put back at once, as GNU cp -a and tar --xattrs -xp do; putting it back is
+/// tried a second time if it fails. The outer error is that of lending the mode or of both
+/// tries to put it back. Residual: a chmod by a user outside the file's group clears its
+/// set-group-ID bit, which putting the mode back cannot set again; the caller gives the file
+/// its final mode afterwards in any case.
 pub fn set_all_lending_write(
     fd: RawFd,
     values: &[(&CStr, &[u8])],
@@ -157,7 +158,9 @@ pub fn set_all_lending_write(
             *result = set_fd(fd, name, value);
         }
     }
-    chmod(mode)?;
+    // Putting the mode back is tried twice before the file is left
+    // writable by its owner and the failure returned.
+    chmod(mode).or_else(|_| chmod(mode))?;
     Ok(results)
 }
 
@@ -687,6 +690,42 @@ mod tests {
         assert!(!super::is_copied_to(b"security.capability", false));
         assert!(super::is_copied_to(b"user.foo", false));
         assert!(!super::is_copied_to(b"system.posix_acl_access", true));
+    }
+
+    /// A read-only file lent its owner's write permission gets its mode back
+    /// even when the first chmod putting it back fails, and the results of the
+    /// sets are still returned.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_lent_write_bit_is_taken_back_when_the_first_restore_fails() {
+        use std::cell::Cell;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root is never refused, so nothing is lent
+        }
+        let dir = crate::tmp::tempdir().unwrap();
+        let path = dir.path().join("ro");
+        let file = std::fs::File::create(&path).unwrap();
+        let fd = file.as_raw_fd();
+        if super::set_fd(fd, c"user.probe", b"1").is_err() {
+            return; // no user attributes on this filesystem
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        let calls = Cell::new(0);
+        let chmod = |mode: u32| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                return Err(std::io::Error::from_raw_os_error(libc::EINTR));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+        };
+        let results = super::set_all_lending_write(fd, &[(c"user.x", &b"v"[..])], chmod).unwrap();
+        assert!(results[0].is_ok(), "{results:?}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o444);
+        assert_eq!(super::get_fd(fd, c"user.x").unwrap(), b"v");
     }
 
     /// Only a `user.` attribute is restored from an archive.

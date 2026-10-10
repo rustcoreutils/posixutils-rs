@@ -729,6 +729,8 @@ impl Parser<'_> {
                 continue;
             }
 
+            self.skip_gnu_extension();
+
             // Check for _Static_assert in struct (C11 6.7.2.1p1)
             if self.is_static_assert() {
                 self.parse_static_assert()?;

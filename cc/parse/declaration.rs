@@ -978,7 +978,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     modifiers |= TypeModifiers::NORETURN;
                 }
-                crate::kw::SIGNED => {
+                crate::kw::SIGNED | crate::kw::GNU_SIGNED | crate::kw::GNU_SIGNED2 => {
                     tally.note_sign("signed", pos);
                     self.advance();
                     modifiers |= TypeModifiers::SIGNED;

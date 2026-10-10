@@ -1231,6 +1231,14 @@ define_keywords! {
     (_, "__stack_protect__",         SUPPORTED_ATTR),
     (_, "no_stack_protector",        SUPPORTED_ATTR),
     (_, "__no_stack_protector__",    SUPPORTED_ATTR),
+    // gcc's spellings of `signed`, keywords as in gcc rather than macros, so
+    // `#ifdef __signed__` is false and `-E` keeps them. Appended, as above.
+    (GNU_SIGNED,        "__signed__",        TYPE_SPEC | TYPE_KEYWORD),
+    (GNU_SIGNED2,       "__signed",          TYPE_SPEC | TYPE_KEYWORD),
+    // `__extension__`: marks a GNU construct. Taken before a declaration,
+    // a block item or a member declaration, and as a unary prefix; it means
+    // nothing else. Appended, as above.
+    (GNU_EXTENSION,     "__extension__",     RESERVED_NAME),
 }
 
 // Tag query API

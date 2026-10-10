@@ -810,6 +810,10 @@ impl<'a> Parser<'a> {
 
     /// Parse unary expression: ++x, --x, &x, *x, +x, -x, ~x, !x, sizeof
     fn parse_unary_expr(&mut self) -> ParseResult<Expr> {
+        // GNU `__extension__ cast-expression`: the operand, unchanged. Casts
+        // are parsed here too, so what follows is this expression.
+        self.skip_gnu_extension();
+
         // Check for prefix operators
         if self.is_special_token(SpecialToken::Increment) {
             let op_pos = self.current_pos();

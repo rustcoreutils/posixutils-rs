@@ -146,11 +146,11 @@ impl Parser<'_> {
         let mut _is_goto = false;
         while let Some(name_id) = self.current_ident() {
             match name_id {
-                crate::kw::VOLATILE | crate::kw::GNU_VOLATILE => {
+                crate::kw::VOLATILE | crate::kw::GNU_VOLATILE | crate::kw::GNU_VOLATILE2 => {
                     is_volatile = true;
                     self.advance();
                 }
-                crate::kw::INLINE | crate::kw::GNU_INLINE => {
+                crate::kw::INLINE | crate::kw::GNU_INLINE | crate::kw::GNU_INLINE2 => {
                     self.advance();
                 }
                 crate::kw::GOTO => {

@@ -2532,6 +2532,21 @@ fn test_assembly_leaves_unknown_directives_alone() {
 /// gcc's alternate keyword spellings are keywords, not macros: they reach
 /// the parser as written, `#ifdef` does not see them, and a program's own
 /// `#define inline ...` does not reach `__inline`.
+#[test]
+fn test_gnu_keyword_spellings_are_not_macros() {
+    let spellings = "__inline __inline__ __volatile __volatile__ __restrict __restrict__ \
+                     __signed __signed__ __extension__";
+    let input = format!(
+        "{spellings}\n#if defined __inline || defined __inline__ || defined __signed__ \
+         || defined __volatile__ || defined __restrict || defined __extension__\nX\n#endif\n\
+         #define inline inline Y\n__inline\n"
+    );
+    let (tokens, idents) = preprocess_str(&input);
+    let mut want: Vec<&str> = spellings.split_whitespace().collect();
+    want.push("__inline");
+    assert_eq!(get_token_strings(&tokens, &idents), want);
+}
+
 /// `-fgnu89-inline` predefines `__GNUC_GNU_INLINE__` and not
 /// `__GNUC_STDC_INLINE__`; the default is the other way round.
 /// In assembly a `#` line that names no directive -- a number among them --

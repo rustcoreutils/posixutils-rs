@@ -736,6 +736,18 @@ impl<'a> Parser<'a> {
 }
 
 impl Parser<'_> {
+    /// Consume any `__extension__` keywords here.
+    ///
+    /// gcc takes `__extension__` before an external declaration, a block
+    /// item, a member declaration and a `for` declaration, and as a unary
+    /// prefix; it marks a GNU construct and changes nothing about what
+    /// follows. The callers are those places.
+    pub(super) fn skip_gnu_extension(&mut self) {
+        while self.is_keyword(crate::kw::GNU_EXTENSION) {
+            self.advance();
+        }
+    }
+
     pub(super) fn is_declaration_start(&self) -> bool {
         let Some(name_id) = self.current_ident() else {
             return false;

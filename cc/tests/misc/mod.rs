@@ -17,6 +17,7 @@ mod cleanup_attr;
 mod enumerator_attributes;
 mod float_n;
 mod gnu_escape;
+mod gnu_keywords;
 mod labeled_declaration;
 mod local_label;
 mod no_current_block;

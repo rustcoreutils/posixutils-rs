@@ -188,3 +188,77 @@ fn test_auto_type_misuse_is_refused() {
         );
     }
 }
+
+/// gcc's `__signed` and `__signed__` are keywords spelling `signed`, not
+/// macros, so the parser meets them as written -- in a `.i` from gcc, or
+/// wherever the preprocessor leaves them.
+#[test]
+fn test_gnu_signed_spellings_are_signed() {
+    for spelled in ["__signed", "__signed__"] {
+        let src = format!("{spelled} char c; {spelled} x; long {spelled} int l;");
+        let (_, types, strings, symbols) = parse_tu(&src).unwrap();
+        let type_of = |name: &str| {
+            let id = strings.lookup(name).expect(name);
+            symbols.lookup(id, Namespace::Ordinary).expect(name).typ
+        };
+        let c = type_of("c");
+        assert_eq!(types.kind(c), TypeKind::Char, "{spelled}");
+        assert!(
+            types.modifiers(c).contains(TypeModifiers::SIGNED),
+            "{spelled}"
+        );
+        assert_eq!(types.kind(type_of("x")), TypeKind::Int, "{spelled}");
+        assert_eq!(types.kind(type_of("l")), TypeKind::Long, "{spelled}");
+    }
+    let before = crate::diag::error_count();
+    let _ = parse_tu("__signed__ unsigned u;");
+    assert!(crate::diag::error_count() > before, "signed and unsigned");
+}
+
+/// `__extension__` is a keyword, not a macro for nothing: the parser takes
+/// it where gcc does -- before an external declaration, a block item, a
+/// member declaration, a `for` declaration, and as a unary prefix.
+#[test]
+fn test_gnu_extension_keyword_positions() {
+    let src = "__extension__ typedef long long ll;\n\
+               __extension__ __extension__ static int z;\n\
+               struct s { __extension__ union { int a; }; __extension__ int b; };\n\
+               int f(void) {\n\
+                 __extension__ int x = __extension__ 1;\n\
+                 for (__extension__ int i = 0; i < 1; i++) x += i;\n\
+                 __extension__ x++;\n\
+                 return __extension__ ({ x; }) + (__extension__ sizeof(ll));\n\
+               }\n";
+    let before = crate::diag::error_count();
+    let parsed = parse_tu(src);
+    assert!(parsed.is_ok(), "{:?}", parsed.err().map(|e| e.message));
+    assert_eq!(crate::diag::error_count(), before);
+}
+
+/// Every spelling of `volatile`, `inline` and `goto` qualifies an asm
+/// statement, after any spelling of `asm`.
+#[test]
+fn test_asm_qualifier_spellings() {
+    for asm in ["asm", "__asm", "__asm__"] {
+        for quals in [
+            "__inline volatile",
+            "__inline__ __volatile__",
+            "volatile __inline",
+            "__volatile",
+            "inline",
+            "goto __inline",
+        ] {
+            let src = if quals.contains("goto") {
+                format!("void f(void) {{ {asm} {quals}(\"\" ::: \"memory\" : l); l:; }}")
+            } else {
+                format!("void f(void) {{ {asm} {quals}(\"\" ::: \"memory\"); }}")
+            };
+            let parsed = parse_tu(&src);
+            assert!(
+                parsed.is_ok(),
+                "{src}: {:?}",
+                parsed.err().map(|e| e.message)
+            );
+        }
+    }
+}

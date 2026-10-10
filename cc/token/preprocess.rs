@@ -410,30 +410,6 @@ impl Macro {
         }
     }
 
-    /// Create a keyword alias macro (value is treated as an identifier/keyword)
-    pub fn keyword_alias(name: &str, value: &str) -> Self {
-        let body = if value.is_empty() {
-            vec![]
-        } else {
-            vec![MacroToken {
-                typ: TokenType::Ident,
-                value: MacroTokenValue::Ident(value.to_string()),
-                whitespace: false,
-                spelling: Spelling::Canonical,
-            }]
-        };
-        Self {
-            name: name.to_string(),
-            body,
-            is_function: false,
-            params: vec![],
-            is_variadic: false,
-            variadic_name: None,
-            builtin: None,
-            predefined: true,
-        }
-    }
-
     /// Create a builtin macro
     pub fn builtin(name: &str, builtin: BuiltinMacro, is_function: bool) -> Self {
         Self {
@@ -1246,17 +1222,6 @@ impl<'a> Preprocessor<'a> {
         );
         self.define_macro(Macro::predefined("__VERSION__", Some(&version)));
         self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));
-
-        // GCC type keyword compatibility
-        self.define_macro(Macro::keyword_alias("__signed", "signed"));
-        self.define_macro(Macro::keyword_alias("__signed__", "signed"));
-        self.define_macro(Macro::keyword_alias("__inline", "inline"));
-        self.define_macro(Macro::keyword_alias("__inline__", "inline"));
-        self.define_macro(Macro::keyword_alias("__volatile", "volatile"));
-        self.define_macro(Macro::keyword_alias("__volatile__", "volatile"));
-        self.define_macro(Macro::keyword_alias("__extension__", "")); // expands to nothing
-        self.define_macro(Macro::keyword_alias("__restrict", "restrict"));
-        self.define_macro(Macro::keyword_alias("__restrict__", "restrict"));
 
         // Note: C99/C11 bool, true, false are NOT pre-defined here.
         // They should only be available after #include <stdbool.h>.

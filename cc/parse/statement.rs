@@ -275,6 +275,7 @@ impl Parser<'_> {
         self.symbols.enter_scope();
 
         // Parse init (can be declaration or expression)
+        self.skip_gnu_extension();
         let init = if self.is_special(b';') {
             self.advance();
             None
@@ -475,6 +476,7 @@ impl Parser<'_> {
     fn parse_block_item_list(&mut self) -> ParseResult<Vec<BlockItem>> {
         let mut items = Vec::new();
         while !self.is_special(b'}') && !self.is_eof() {
+            self.skip_gnu_extension();
             if self.at_block_declaration() {
                 let decl = self.parse_declaration_and_bind()?;
                 items.push(BlockItem::Declaration(decl));

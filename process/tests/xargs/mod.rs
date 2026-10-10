@@ -831,3 +831,70 @@ fn many_arguments_fit_the_default_size() {
     assert_eq!(words.len(), count);
     assert_eq!(words.last(), Some(&"200000"));
 }
+
+/// Runs xargs with `args` on `input`, expecting success with `out` and `err`.
+fn xargs_test_err(input: &str, args: &[&str], out: &str, err: &str) {
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        stdin_data: String::from(input),
+        expected_out: String::from(out),
+        expected_err: String::from(err),
+        expected_exit_code: 0,
+    });
+}
+
+// -I, -L and -n are mutually exclusive; POSIX lets the last one specified
+// take effect, and that one does, with a warning for each one it cancels.
+
+/// `-n 1` after -I leaves -I in effect, silently: util-linux's tests/run.sh
+/// runs `xargs -I '{}' -P N -n 1 ...`.
+#[test]
+fn xargs_insert_mode_with_n1_stays_insert_mode() {
+    xargs_test_err(
+        "a b\nc\n",
+        &["-I", "{}", "-n", "1", "echo", "X{}Y"],
+        "Xa bY\nXcY\n",
+        "",
+    );
+}
+
+#[test]
+fn xargs_n_after_insert_mode_takes_effect() {
+    xargs_test_err(
+        "a\nb\nc\n",
+        &["-I", "{}", "-n", "2", "echo", "X{}Y"],
+        "X{}Y a b\nX{}Y c\n",
+        "xargs: warning: options -I and -n are mutually exclusive; ignoring -I\n",
+    );
+}
+
+#[test]
+fn xargs_insert_mode_after_n_takes_effect() {
+    xargs_test_err(
+        "a\nb\n",
+        &["-n", "1", "-I", "{}", "echo", "X{}Y"],
+        "XaY\nXbY\n",
+        "xargs: warning: options -n and -I are mutually exclusive; ignoring -n\n",
+    );
+}
+
+#[test]
+fn xargs_insert_mode_after_lines_takes_effect() {
+    xargs_test_err(
+        "a\nb\n",
+        &["-L", "2", "-I", "{}", "echo", "X{}"],
+        "Xa\nXb\n",
+        "xargs: warning: options -L and -I are mutually exclusive; ignoring -L\n",
+    );
+}
+
+#[test]
+fn xargs_lines_after_n_takes_effect() {
+    xargs_test_err(
+        "a b\nc\n",
+        &["-n", "1", "-L", "2", "echo"],
+        "a b c\n",
+        "xargs: warning: options -n and -L are mutually exclusive; ignoring -n\n",
+    );
+}

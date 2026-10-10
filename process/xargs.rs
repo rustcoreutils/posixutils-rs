@@ -16,7 +16,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::gettext;
 use plib::{diag, BUFSZ};
 
@@ -71,7 +71,6 @@ struct Args {
         short = 'L',
         long,
         allow_hyphen_values = true,
-        conflicts_with_all = ["maxnum", "replstr"],
         help = gettext(
             "The utility shall be executed for each non-empty number lines of arguments from standard input"
         )
@@ -82,7 +81,6 @@ struct Args {
         short = 'n',
         long,
         allow_hyphen_values = true,
-        conflicts_with_all = ["lines", "replstr"],
         help = gettext(
             "Invoke utility using as many standard input arguments as possible, up to number"
         )
@@ -112,7 +110,6 @@ struct Args {
         short = 'I',
         long,
         allow_hyphen_values = true,
-        conflicts_with_all = ["lines", "maxnum"],
         help = gettext("Insert mode: execute utility for each line, replacing replstr with input")
     )]
     replstr: Option<OsString>,
@@ -165,11 +162,47 @@ impl Args {
     /// Parse the command line and split the operand list into the utility
     /// and its arguments.
     fn parse_command_line() -> Self {
-        let mut args = plib::optarg::parse::<Args>();
+        let matches = Args::command().get_matches_from(plib::optarg::args_os::<Args>());
+        let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        args.keep_last_batching_option(&matches);
         let mut command = std::mem::take(&mut args.command).into_iter();
         args.util = command.next().unwrap_or_else(|| OsString::from("echo"));
         args.util_args = command.collect();
         args
+    }
+
+    /// -I, -L and -n are mutually exclusive: the last one specified takes
+    /// effect, as POSIX permits, and each one it cancels is warned about.
+    /// `-n 1` after -I leaves -I in effect, silently, as GNU xargs does: each
+    /// -I command takes one line anyway, and util-linux's test runner passes
+    /// `-I '{}' ... -n 1`.
+    fn keep_last_batching_option(&mut self, matches: &clap::ArgMatches) {
+        let mut given: Vec<(usize, char)> = [("replstr", 'I'), ("lines", 'L'), ("maxnum", 'n')]
+            .into_iter()
+            .filter_map(|(id, opt)| Some((matches.index_of(id)?, opt)))
+            .collect();
+        given.sort();
+        let mut in_effect: Option<char> = None;
+        for (_, opt) in given {
+            if in_effect == Some('I') && opt == 'n' && self.maxnum == Some(1) {
+                self.maxnum = None;
+                continue;
+            }
+            if let Some(earlier) = in_effect {
+                diag::warning(
+                    &gettext("options -{} and -{} are mutually exclusive; ignoring -{}")
+                        .replacen("{}", &earlier.to_string(), 1)
+                        .replacen("{}", &opt.to_string(), 1)
+                        .replacen("{}", &earlier.to_string(), 1),
+                );
+                match earlier {
+                    'I' => self.replstr = None,
+                    'L' => self.lines = None,
+                    _ => self.maxnum = None,
+                }
+            }
+            in_effect = Some(opt);
+        }
     }
 }
 

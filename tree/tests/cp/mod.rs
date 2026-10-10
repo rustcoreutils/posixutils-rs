@@ -21,6 +21,8 @@ mod old_kernel;
 mod race;
 mod umask;
 mod verbose;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod xattr;
 
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;

@@ -274,7 +274,8 @@ fn finish_dir(dir: &MadeDir, preserve: bool, umask: u32) -> io::Result<()> {
     let fd = dir.dest.as_raw_fd();
     if preserve {
         let acl = || source_acl(dir.source_dir.as_raw_fd());
-        preserve_through_fd(fd, &dir.source, acl, &dir.path, dir.trust)
+        // GNU cp --parents gives these no extended attribute, -a or not.
+        preserve_through_fd(fd, &dir.source, acl, |_, _| {}, &dir.path, dir.trust)
     } else {
         // GNU cp makes these with the source's whole mode (`withheld_by_cp_r` is cp -R's).
         finish_made_dir_mode(fd, &dir.source, 0, umask, &dir.path)

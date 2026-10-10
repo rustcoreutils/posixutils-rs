@@ -826,6 +826,90 @@ pub fn mode_and_acl(path: &Path) -> String {
     format!("{mode:o} {}", entries.join(" "))
 }
 
+/// Give `path` -- a symbolic link itself, not followed -- the extended attribute `name` with
+/// the value `value`. `false`, with a note, where the filesystem refuses it (a test then skips
+/// its case).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn set_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let name = CString::new(name).unwrap();
+    let (ptr, len) = (value.as_ptr().cast(), value.len());
+    #[cfg(target_os = "linux")]
+    let ret = unsafe { libc::lsetxattr(path.as_ptr(), name.as_ptr(), ptr, len, 0) };
+    #[cfg(target_os = "macos")]
+    let ret = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            ptr,
+            len,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if ret != 0 {
+        eprintln!(
+            "note: this filesystem refused the extended attribute {:?}: {}",
+            name,
+            std::io::Error::last_os_error()
+        );
+    }
+    ret == 0
+}
+
+/// The extended attributes of `path` -- a symbolic link itself, not followed -- as (name,
+/// value) pairs sorted by name, leaving out the POSIX ACLs (`system.posix_acl_*`), which
+/// other tests compare.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn xattrs(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // Two calls each, the size then the bytes: nothing changes the file meanwhile.
+    let read = |call: &dyn Fn(*mut libc::c_char, usize) -> isize| -> Vec<u8> {
+        let size = call(std::ptr::null_mut(), 0);
+        assert!(size >= 0, "{}", std::io::Error::last_os_error());
+        let mut buf = vec![0u8; size as usize];
+        let size = call(buf.as_mut_ptr().cast(), buf.len());
+        assert!(size >= 0, "{}", std::io::Error::last_os_error());
+        buf.truncate(size as usize);
+        buf
+    };
+    #[cfg(target_os = "linux")]
+    let names = read(&|buf, len| unsafe { libc::llistxattr(path.as_ptr(), buf, len) });
+    #[cfg(target_os = "macos")]
+    let names =
+        read(&|buf, len| unsafe { libc::listxattr(path.as_ptr(), buf, len, libc::XATTR_NOFOLLOW) });
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = names
+        .split(|&b| b == 0)
+        .filter(|n| !n.is_empty() && !n.starts_with(b"system.posix_acl"))
+        .map(|n| {
+            let name = CString::new(n).unwrap();
+            let name: &CStr = &name;
+            #[cfg(target_os = "linux")]
+            let value = read(&|buf, len| unsafe {
+                libc::lgetxattr(path.as_ptr(), name.as_ptr(), buf.cast(), len)
+            });
+            #[cfg(target_os = "macos")]
+            let value = read(&|buf, len| unsafe {
+                libc::getxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    buf.cast(),
+                    len,
+                    0,
+                    libc::XATTR_NOFOLLOW,
+                )
+            });
+            (n.to_vec(), value)
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
 /// Run `program` with `args` in `dir` under the umask `umask`, set by a shell in between so
 /// that this process's own, which every test thread shares, is left alone.
 #[cfg(unix)]

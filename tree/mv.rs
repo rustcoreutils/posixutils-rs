@@ -12,7 +12,7 @@ mod common;
 mod remove_moved;
 
 use self::common::{
-    copy_moved_file, error_string, exit_after_verbose, quote, report_verbose, Verbose,
+    copy_moved_file, error_string, exit_after_verbose, quote, report_verbose, Verbose, Xattrs,
 };
 use clap::Parser;
 use common::{
@@ -134,6 +134,8 @@ fn copy_hierarchy(
         // during the move, and is neither written into nor filled.
         destination: Destination::MustCreate,
         verbose: verbose.then_some(Verbose::Move),
+        // GNU mv copies them too, diagnosing any it cannot.
+        xattrs: Xattrs::Report,
     };
 
     let mut copied = CopiedSources::default();

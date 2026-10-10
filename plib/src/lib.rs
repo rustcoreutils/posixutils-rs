@@ -54,6 +54,8 @@ pub mod tty;
 pub mod user;
 #[cfg(unix)]
 pub mod utmpx;
+#[cfg(unix)]
+pub mod xattr;
 
 pub const BUFSZ: usize = 8 * 1024;
 

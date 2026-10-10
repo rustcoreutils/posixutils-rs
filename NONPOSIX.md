@@ -201,8 +201,8 @@ dh_install, dh_installdocs, dh_installexamples and dh_strip,
 dh_installexamples), with GNU cp's meaning:
 
  * `-a` / `--archive` — `-R -P -p`, and files hard-linked to each other in
-   the source are hard-linked in the copy.  Extended attributes are not
-   copied.
+   the source are hard-linked in the copy, and extended attributes are
+   copied (see below).
  * `-d` — `-P`, with hard links kept as for `-a`.
  * `-n` / `--no-clobber` — an existing destination (other than a directory
    being merged into) is left alone, silently and without affecting the exit
@@ -244,6 +244,22 @@ gives them the access the source grants its group class -- more than the
 source grants them.  An ACL that cannot be set is diagnosed (cp exits 1, mv
 completes with status 0) unless the source had none beyond its mode, and
 the copy then keeps a mode granting no more than the source did.
+
+#### Extended attributes under `-a`
+
+`cp -a` and `mv` across filesystems copy each extended attribute of a file,
+directory, special file or symbolic link, as GNU does; `-p` alone copies
+none.  An attribute already on an existing destination is kept unless the
+source has one of the same name.  Not copied: the ACLs (`system.posix_acl_*`,
+the NFSv4 and CIFS ones, macOS's), which go with the mode, and what libattr's
+`/etc/xattr.conf` skips: XFS's `trusted.SGI_ACL_FILE`, `SGI_ACL_DEFAULT`,
+`SGI_CAP_FILE`, `SGI_MAC_FILE` and `SGI_DMI_*`, `xfsroot.*`,
+`user.Beagle.*`, `security.evm` and `afs.*`.  `security.selinux` and
+`security.capability` are copied (setting either takes privilege).  One the
+destination's filesystem cannot hold is lost silently; any other failure is
+silent under `cp -a` and diagnosed by `mv`, and neither changes the exit
+status.  `cp --parents` gives the directories it makes none, as GNU's does.
+On macOS a special file's or symbolic link's are not copied.
 
 #### Existing directories under `-p`
 

@@ -12,7 +12,7 @@ mod parents;
 
 use self::common::{
     copy_file, copy_files, error_string, exit_after_verbose, CopyConfig, CopyRun, DerefMode,
-    Destination, InodeMap, OperandTrust, Verbose,
+    Destination, InodeMap, OperandTrust, Verbose, Xattrs,
 };
 use clap::Parser;
 use gettextrs::gettext;
@@ -148,6 +148,12 @@ impl CopyConfig {
             continue_on_error: true,
             destination: Destination::MayExist,
             verbose: args.verbose.then_some(Verbose::Copy),
+            // -a copies the extended attributes too, silently losing any it cannot (GNU).
+            xattrs: if args.archive {
+                Xattrs::Quiet
+            } else {
+                Xattrs::Skip
+            },
         }
     }
 }

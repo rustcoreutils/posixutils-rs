@@ -312,82 +312,25 @@ pub fn read_source_fd(fd: RawFd) -> io::Result<Acl> {
 
 /// The ACLs of the directory or special file a tree walk recorded at `entry`
 /// (`read_source_fd`), read through a descriptor of its own, required to be the very file
-/// recorded -- its `(st_dev, st_ino)` and type; `None` when it is not.
-///
-/// A directory is opened for reading, and its ACLs read with plain `f*xattr` calls, which need
-/// no procfs. One that cannot be opened so (EACCES) is, on Linux, pinned `O_PATH` instead, as a
-/// special file always is there: that needs no permission on the file and opens no device or
-/// FIFO, and its attributes are read through its `self/fd/N` under a verified procfs
-/// (`read_fd`). Without one a directory's are not read, an error; a special file's are taken
-/// to be none (`no_procfs_route`), as it rarely has any. Elsewhere only a directory's ACLs are
-/// read: a special file cannot be opened without acting on it.
+/// recorded (`xattr::open_entry`); `None` when it is not.
 pub fn read_entry(entry: &ftw::Entry) -> io::Result<Option<Acl>> {
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-    let Some(recorded) = entry.metadata() else {
-        return Ok(None);
-    };
-    // The walk recorded a followed link's referent; open the same thing.
-    let follow = entry.is_symlink() == Some(true) && !recorded.is_symlink();
-    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
-    let open = |flags: libc::c_int| {
-        let fd = unsafe {
-            libc::openat(
-                entry.dir_fd(),
-                entry.file_name().as_ptr(),
-                flags | nofollow | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    };
-    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY;
-    #[cfg(target_os = "linux")]
-    let fd = {
-        let pin = || open(libc::O_PATH);
-        if !recorded.is_dir() {
-            pin()
-        } else {
-            match open(dir_flags) {
-                Err(e) if e.raw_os_error() == Some(libc::EACCES) => pin(),
-                opened => opened,
-            }
-        }
-    }?;
-    #[cfg(not(target_os = "linux"))]
-    let fd = open(dir_flags)?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-        return Err(io::Error::last_os_error());
+    match crate::xattr::open_entry(entry)? {
+        Some(fd) => read_opened(&fd).map(Some),
+        None => Ok(None),
     }
-    // Casts needed: `dev_t` is i32 on macOS, `mode_t` u16 there.
-    #[allow(clippy::unnecessary_cast)]
-    let same = (st.st_dev as u64, st.st_ino as u64) == (recorded.dev(), recorded.ino())
-        && (st.st_mode & libc::S_IFMT) as u32 == recorded.mode() & libc::S_IFMT as u32;
-    let special = !recorded.is_dir() && !recorded.is_file();
-    if !same {
-        return Ok(None);
-    }
+}
+
+/// The ACLs of the file `xattr::open_entry` opened (`read_source_fd`). A directory's are read
+/// with plain `f*xattr` calls where it could be opened for reading; a special file's, and those
+/// of a directory that could not (EACCES), only through procfs (Linux): without one a
+/// directory's are not read, an error, and a special file's are taken to be none
+/// (`xattr::no_procfs_route`), as it rarely has any.
+pub fn read_opened(fd: &crate::xattr::EntryFd) -> io::Result<Acl> {
+    use std::os::unix::io::AsRawFd;
     match read_source_fd(fd.as_raw_fd()) {
-        Err(e) if special && no_procfs_route(&e) => Ok(Some(Acl::default())),
-        read => read.map(Some),
+        Err(e) if fd.is_special() && crate::xattr::no_procfs_route(&e) => Ok(Acl::default()),
+        read => read,
     }
-}
-
-/// Whether the failure `e` to read the ACLs of a file pinned `O_PATH` is that there is no
-/// procfs to read them through (`read_fd`): no `/proc/self/fd/N` (ENOENT), or no `/proc`
-/// verified to be procfs. A special file is read no other way, so then none can be read at
-/// all, as on a filesystem that holds none (EOPNOTSUPP).
-#[cfg(target_os = "linux")]
-fn no_procfs_route(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ENOENT) || crate::madefs::procfs_dir().is_err()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn no_procfs_route(_e: &io::Error) -> bool {
-    false
 }
 
 /// The extended attribute `name` of the file open on `fd`, `O_PATH` or not (`read_fd`).
@@ -395,7 +338,7 @@ fn no_procfs_route(_e: &io::Error) -> bool {
 pub fn read_xattr(fd: RawFd, name: &CStr) -> io::Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
-        sys::on_fd(fd, |target| sys::get(target, name))
+        crate::xattr::get_fd(fd, name)
     }
     #[cfg(not(target_os = "linux"))]
     {

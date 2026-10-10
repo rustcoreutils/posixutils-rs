@@ -31,6 +31,18 @@ pub enum Verbose {
     Move,
 }
 
+/// What a copy does with its source's extended attributes (`plib::xattr::copy_fd`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Xattrs {
+    /// None is copied: cp without -a.
+    Skip,
+    /// Each is copied, and one that cannot be is lost without a word: cp -a, as GNU's is.
+    Quiet,
+    /// Each is copied, and one that cannot be is diagnosed, the exit status left alone: mv
+    /// across filesystems, as GNU's is.
+    Report,
+}
+
 /// `path` quoted as GNU coreutils quotes a file name in its messages (`quotearg`'s
 /// shell-escape-always style), so the name can be pasted back into a shell.
 pub fn quote(path: &Path) -> String {

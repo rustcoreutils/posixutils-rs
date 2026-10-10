@@ -11,6 +11,7 @@
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 mod context;
+mod only_matching;
 mod word;
 
 const LINES_INPUT: &str =

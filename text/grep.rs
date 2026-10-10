@@ -12,10 +12,12 @@ use gettextrs::gettext;
 use plib::optarg::OptionArguments;
 use plib::regex::{Regex, RegexFlags};
 use std::{
+    cmp::Reverse,
     collections::VecDeque,
     ffi::OsString,
     fs::File,
     io::{self, BufRead, BufReader, Write},
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -27,7 +29,15 @@ use std::{
 /// character (not valid UTF-8 in a UTF-8 locale, or above 0x7F in the C
 /// locale) is kept as it is.
 fn locale_lower(bytes: &[u8]) -> Vec<u8> {
+    fold_case(bytes, None)
+}
+
+/// As [`locale_lower`], also recording in `origin`, for each byte of the folded text and one
+/// past its end, the offset in `bytes` of the character it came from, since folding can change
+/// a character's length: `-o -F -i` finds a match in the folded text and writes the line's own.
+fn fold_case(bytes: &[u8], mut origin: Option<&mut Vec<usize>>) -> Vec<u8> {
     let mut folded = Vec::with_capacity(bytes.len());
+    let mut offset = 0;
     for ch in plib::locale::mb_char_slices(bytes) {
         match std::str::from_utf8(ch) {
             Ok(s) => {
@@ -37,13 +47,27 @@ fn locale_lower(bytes: &[u8]) -> Vec<u8> {
             }
             Err(_) => folded.extend_from_slice(ch),
         }
+        if let Some(origin) = origin.as_deref_mut() {
+            origin.resize(folded.len(), offset);
+        }
+        offset += ch.len();
+    }
+    if let Some(origin) = origin {
+        origin.push(bytes.len());
     }
     folded
 }
 
-/// Whether `needle` occurs in `haystack`.
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+/// The first occurrence of `needle` in `haystack` at or after `from`, as its start and end.
+fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return Some((from, from));
+    }
+    let start = from
+        + haystack[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)?;
+    Some((start, start + needle.len()))
 }
 
 /// Whether the character in `ch` (one character of the locale, or one byte that is none) is a
@@ -76,17 +100,16 @@ fn is_word_at(line: &[u8], start: usize, end: usize) -> bool {
     !word_before && !word_after
 }
 
-/// `-w` for a regular expression: some match of `re` in `line` stands as a word. As GNU grep
-/// does, a match that does not is tried again shorter from the same start, and then the
-/// search goes on from the next character.
-fn regex_matches_word(re: &Regex, line: &[u8]) -> bool {
-    let mut from = 0;
+/// `-w` for a regular expression: the first match of `re` in `line`, at or after `from`, that
+/// stands as a word, as its start and end. As GNU grep does, a match that does not is tried
+/// again shorter from the same start, and then the search goes on from the next character.
+fn regex_find_word(re: &Regex, line: &[u8], mut from: usize) -> Option<(usize, usize)> {
     while let Some(m) = re.find_bytes_in_line(&line[from..], from > 0, false) {
         let start = from + m.start;
         let mut end = from + m.end;
         loop {
             if is_word_at(line, start, end) {
-                return true;
+                return Some((start, end));
             }
             if end == start {
                 break;
@@ -99,34 +122,41 @@ fn regex_matches_word(re: &Regex, line: &[u8]) -> bool {
                 _ => break,
             }
         }
-        match plib::locale::next_char_offset(line, start) {
-            Some(next) => from = next,
-            None => break,
-        }
+        from = plib::locale::next_char_offset(line, start)?;
     }
-    false
+    None
 }
 
-/// `-w` for a fixed string: some occurrence of `needle` in `line` stands as a word.
-fn fixed_matches_word(line: &[u8], needle: &[u8]) -> bool {
-    let mut from = 0;
+/// `-w` for a fixed string: the first occurrence of `needle` in `line`, at or after `from`,
+/// that stands as a word, as its start and end.
+fn fixed_find_word(line: &[u8], needle: &[u8], mut from: usize) -> Option<(usize, usize)> {
     loop {
-        let found = if needle.is_empty() {
-            Some(0)
-        } else {
-            line[from..].windows(needle.len()).position(|w| w == needle)
-        };
-        let Some(i) = found else {
-            return false;
-        };
-        let start = from + i;
-        if is_word_at(line, start, start + needle.len()) {
-            return true;
+        let (start, end) = find_bytes(line, needle, from)?;
+        if is_word_at(line, start, end) {
+            return Some((start, end));
         }
-        match plib::locale::next_char_offset(line, start) {
-            Some(next) => from = next,
-            None => return false,
-        }
+        from = plib::locale::next_char_offset(line, start)?;
+    }
+}
+
+/// The first match of fixed string `needle` in `line` at or after `from`, as its start and
+/// end, where `whole` says what part of the line it has to be.
+fn fixed_find(line: &[u8], needle: &[u8], whole: Whole, from: usize) -> Option<(usize, usize)> {
+    match whole {
+        Whole::Any => find_bytes(line, needle, from),
+        Whole::Word => fixed_find_word(line, needle, from),
+        Whole::Line => (from == 0 && line == needle).then_some((0, line.len())),
+    }
+}
+
+/// The first match of `re` in `line` at or after `from`, as its start and end, where `whole`
+/// says what part of the line it has to be (under -x, `re` is anchored already).
+fn regex_find(re: &Regex, line: &[u8], whole: Whole, from: usize) -> Option<(usize, usize)> {
+    match whole {
+        Whole::Word => regex_find_word(re, line, from),
+        Whole::Any | Whole::Line => re
+            .find_bytes_in_line(&line[from..], from > 0, false)
+            .map(|m| (from + m.start, from + m.end)),
     }
 }
 
@@ -189,6 +219,9 @@ struct Args {
 
     #[arg(short = 'w', long, help = gettext("Match only whole words"))]
     word_regexp: bool,
+
+    #[arg(short = 'o', long, help = gettext("Write only the matched parts of selected lines, each on its own line"))]
+    only_matching: bool,
 
     #[arg(short = 'A', long, value_name = "NUM", help = gettext("Print NUM lines of context after each selected line"))]
     after_context: Option<usize>,
@@ -339,6 +372,7 @@ impl Args {
             line_number: self.line_number,
             no_messages: self.no_messages,
             invert_match: self.invert_match,
+            only_matching: self.only_matching,
             // -H and -h override each other, so at most one is set.
             with_filename: self.with_filename || (!self.no_filename && self.input_files.len() > 1),
             stdin_name: self
@@ -455,16 +489,68 @@ impl Patterns {
                 } else {
                     input
                 };
-                patterns.iter().any(|p| match whole {
-                    Whole::Any => contains_bytes(input, p),
-                    Whole::Word => fixed_matches_word(input, p),
-                    Whole::Line => input == p.as_slice(),
-                })
+                patterns
+                    .iter()
+                    .any(|p| fixed_find(input, p, *whole, 0).is_some())
             }
-            Patterns::Regex(patterns, Whole::Word) => {
-                patterns.iter().any(|re| regex_matches_word(re, input))
-            }
+            Patterns::Regex(patterns, Whole::Word) => patterns
+                .iter()
+                .any(|re| regex_find_word(re, input, 0).is_some()),
             Patterns::Regex(patterns, _) => patterns.iter().any(|re| re.is_match_bytes(input)),
+        }
+    }
+
+    /// The parts of the line `input` that `-o` writes: each non-empty match, leftmost first,
+    /// the search going on after each one.  Of the matches starting at the same place the
+    /// longest is taken, and an empty match is skipped by one character, as in GNU grep.
+    fn matched_parts(&self, input: &[u8]) -> Vec<Range<usize>> {
+        let Patterns::Fixed(_, true, _) = self else {
+            return self.matched_parts_in(input);
+        };
+        // The patterns are folded, so the match is found in the folded line, and the part
+        // written is the line's own.
+        let mut origin = Vec::new();
+        let folded = fold_case(input, Some(&mut origin));
+        self.matched_parts_in(&folded)
+            .into_iter()
+            .map(|part| origin[part.start]..origin[part.end])
+            .collect()
+    }
+
+    /// As [`Patterns::matched_parts`], for `text` already folded under `-F -i`.
+    fn matched_parts_in(&self, text: &[u8]) -> Vec<Range<usize>> {
+        let mut parts = Vec::new();
+        let mut from = 0;
+        while from < text.len() {
+            let Some((start, end)) = self.find_from(text, from) else {
+                break;
+            };
+            if end > start {
+                parts.push(start..end);
+                from = end;
+            } else {
+                match plib::locale::next_char_offset(text, start) {
+                    Some(next) => from = next,
+                    None => break,
+                }
+            }
+        }
+        parts
+    }
+
+    /// The earliest match of any pattern in `text` at or after `from`, the longest of those
+    /// starting there, as its start and end.
+    fn find_from(&self, text: &[u8], from: usize) -> Option<(usize, usize)> {
+        let earliest_longest = |&(start, end): &(usize, usize)| (start, Reverse(end));
+        match self {
+            Patterns::Fixed(patterns, _, whole) => patterns
+                .iter()
+                .filter_map(|p| fixed_find(text, p, *whole, from))
+                .min_by_key(earliest_longest),
+            Patterns::Regex(patterns, whole) => patterns
+                .iter()
+                .filter_map(|re| regex_find(re, text, *whole, from))
+                .min_by_key(earliest_longest),
         }
     }
 }
@@ -485,6 +571,8 @@ struct GrepModel {
     line_number: bool,
     no_messages: bool,
     invert_match: bool,
+    /// `-o`: write the matched parts of a line rather than the line.
+    only_matching: bool,
     /// Whether output lines and counts carry the input's name: by default
     /// when there is more than one input, always under -H, never under -h.
     with_filename: bool,
@@ -678,7 +766,16 @@ impl GrepModel {
             prefix.extend_from_slice(number.to_string().as_bytes());
             prefix.push(sep);
         }
-        write_line(&prefix, text);
+        if !self.only_matching {
+            write_line(&prefix, text);
+        } else if (sep == b':') != self.invert_match {
+            // Under -o a line that matches has its matches written: a selected line, or under
+            // -v a context line, as in GNU grep.  Other lines write nothing, but still join or
+            // separate groups.
+            for part in self.patterns.matched_parts(text) {
+                write_line(&prefix, &text[part]);
+            }
+        }
         pending.last_printed = Some(number);
         self.printed_any = true;
     }

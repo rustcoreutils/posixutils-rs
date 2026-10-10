@@ -503,6 +503,16 @@ table is present.
    `:`, and `--` between groups that do not touch (in a later file too).
    `-A` and `-B` win over `-C`.  Only the output of lines changes, not `-c`,
    `-l` or `-q`.  gzip's zgrep tests run `grep -15`.
+ * `-o` / `--only-matching` — write each non-empty matched part of a
+   selected line on a line of its own, after the line's prefixes: leftmost
+   first, the longest of those starting there, without overlap.  An empty
+   match is not written but still selects its line.  `-w`, `-x`, `-i` and
+   `-F` decide what matches as they do for lines.  Under `-v` a selected line
+   writes nothing; with context options, context lines write nothing except
+   under `-v`, where their matches are written marked with `-`, and `--`
+   still separates groups, all as in GNU grep.  `-c`, `-l` and `-q` are
+   unchanged.  Forced by util-linux's test suite
+   (`tests/ts/libmount/debug`).
 
 ### head
 

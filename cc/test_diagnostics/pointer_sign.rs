@@ -235,3 +235,71 @@ void t(void) {
         assert_eq!(err.matches("warning: ").count(), 4 - count, "{err}");
     }
 }
+
+/// Pointers to arrays whose elements differ only in qualifiers: C2x makes
+/// the arrays so qualified, and gcc 13 converts between them as between
+/// differently qualified pointers -- `-pedantic` notes that C17 calls the
+/// array types different, and dropping a qualifier is
+/// `-Wdiscarded-array-qualifiers`, by default. `_Atomic` is no such
+/// qualifier, and a pointer to such a pointer is incompatible as before.
+const QUALIFIED_ARRAYS: &str = "\
+void takes_v(volatile int (*p)[3]);
+void takes(int (*p)[3]);
+void f(int (*p)[3], const int (*c)[3], const volatile int (*cv)[3]) {
+  volatile int (*v)[3] = p;
+  const int (*c2)[3]; c2 = p;
+  takes_v(p);
+  int (*q)[3]; q = c;
+  takes(cv);
+  const int (*m)[2][3] = (int (*)[2][3])0 + 1;
+  _Atomic int (*a)[3] = p;
+  const int (**pp)[3] = &p;
+  (void)v; (void)c2; (void)q; (void)m; (void)a; (void)pp;
+}
+const int (*g(int (*p)[3]))[3] { return p; }
+int (*h(const int (*p)[3]))[3] { return p; }
+";
+
+#[test]
+fn pointers_to_differently_qualified_arrays_convert_as_gcc() {
+    const PEDANTIC: &str =
+        "invalid use of pointers to arrays with different qualifiers in ISO C before C2X [-Wpedantic]";
+    let by_default = [
+        "7:18: assignment discards 'const' qualifier from pointer target type \
+         [-Wdiscarded-array-qualifiers]",
+        "8:9: passing argument 1 of 'takes' discards 'const volatile' qualifier from pointer \
+         target type [-Wdiscarded-array-qualifiers]",
+        "10:25: initialization of '_Atomic int (*)[3]' from incompatible pointer type \
+         'int (*)[3]' [-Wincompatible-pointer-types]",
+        "11:25: initialization of 'const int (**)[3]' from incompatible pointer type \
+         'int (**)[3]' [-Wincompatible-pointer-types]",
+        "15:41: return discards 'const' qualifier from pointer target type \
+         [-Wdiscarded-array-qualifiers]",
+    ];
+    let quiet = compile_warnings("qual_arrays", QUALIFIED_ARRAYS, &[]);
+    assert_eq!(quiet, by_default, "{quiet:#?}");
+
+    let loud = compile_warnings("qual_arrays_pedantic", QUALIFIED_ARRAYS, &["-pedantic"]);
+    let pedantic: Vec<&str> = loud
+        .iter()
+        .filter(|w| w.ends_with(PEDANTIC))
+        .map(|w| w.split(": ").next().unwrap())
+        .collect();
+    assert_eq!(
+        pedantic,
+        ["4:26", "5:26", "6:11", "7:18", "8:9", "9:26", "14:41", "15:41"],
+        "{loud:#?}"
+    );
+    assert_eq!(loud.len(), pedantic.len() + by_default.len(), "{loud:#?}");
+
+    let err = compile_rejected_with(
+        "qual_arrays_err",
+        QUALIFIED_ARRAYS,
+        &["-Werror=discarded-array-qualifiers"],
+    );
+    assert_eq!(
+        err.matches("[-Werror=discarded-array-qualifiers]").count(),
+        3,
+        "{err}"
+    );
+}

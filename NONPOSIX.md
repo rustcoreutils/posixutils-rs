@@ -152,9 +152,11 @@ Language and preprocessor additions:
    accessors use `__seg_gs` when its `CC_HAS_NAMED_AS` probe passes.
    Atomic operations, `__int128` and `long double` in a named space are
    refused ("sorry, unimplemented").
- * Pointers to arrays whose elements differ only in qualifiers subtract and
-   compare (C2x's rule, which gcc applies): glibc's nss subtracts a
-   `const char (*)[N]` from a `char (*)[N]`.  `-pedantic` warns.
+ * Pointers to arrays whose elements differ only in qualifiers subtract,
+   compare, convert as if by assignment and meet in `?:` (C2x's rule, which
+   gcc applies): glibc's nss subtracts a `const char (*)[N]` from a
+   `char (*)[N]`.  `-pedantic` warns, and dropping a qualifier is
+   `-Wdiscarded-array-qualifiers`.  `_Atomic` is no such qualifier.
  * `(size_t)&((T *)0)->m`, the offsetof spelling from before `<stddef.h>`,
    and `&*(T *)0`, are constant expressions, through `->`, `.`, `*` and
    `[]` alike, as in gcc: the Linux kernel's sysrq.c puts

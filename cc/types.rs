@@ -1140,6 +1140,16 @@ pub enum AssignFault {
     PointerSign,
     /// The target's referenced type drops a qualifier the source's had.
     QualifierDiscard,
+    /// Two pointers to arrays whose elements differ only in qualifiers, the
+    /// target's having every one the source's has. C2x makes the arrays so
+    /// qualified, and gcc converts as between differently qualified
+    /// pointers; C17 calls the arrays different types, which only
+    /// `-pedantic` reports.
+    ArrayQualifiers,
+    /// [`Self::ArrayQualifiers`], the target's elements dropping a qualifier
+    /// the source's had: gcc's `-Wdiscarded-array-qualifiers`, after the
+    /// pedantic report.
+    ArrayQualifierDiscard,
     /// A function pointer against `void *`. The 6.5.16.1p1 carve-out is for a
     /// pointer to an *object* type, so this is a constraint violation -- but
     /// one POSIX requires to work, since `dlsym` returns `void *` and every
@@ -1164,7 +1174,8 @@ impl AssignFault {
     pub fn group(self) -> Option<&'static str> {
         match self {
             AssignFault::Incompatible | AssignFault::AddressSpace => None,
-            AssignFault::FunctionPointerVoid => Some("pedantic"),
+            AssignFault::FunctionPointerVoid | AssignFault::ArrayQualifiers => Some("pedantic"),
+            AssignFault::ArrayQualifierDiscard => Some("discarded-array-qualifiers"),
             AssignFault::IntegerFromPointer | AssignFault::PointerFromInteger => {
                 Some("int-conversion")
             }
@@ -1323,6 +1334,20 @@ enum Spelling {
     /// space before each parameter list, and `/* ??? */` for parameters a
     /// declaration does not give.
     Gcc,
+}
+
+/// The type qualifiers among `modifiers`, in the order gcc names a type
+/// with them: `_Atomic const volatile int`, `int * const restrict`.
+fn qualifier_words(modifiers: TypeModifiers) -> impl Iterator<Item = &'static str> {
+    [
+        (TypeModifiers::ATOMIC, "_Atomic"),
+        (TypeModifiers::CONST, "const"),
+        (TypeModifiers::VOLATILE, "volatile"),
+        (TypeModifiers::RESTRICT, "restrict"),
+    ]
+    .into_iter()
+    .filter(move |&(bit, _)| modifiers.contains(bit))
+    .map(|(_, word)| word)
 }
 
 fn parenthesize_if_pointer(decl: String) -> String {
@@ -2073,11 +2098,9 @@ impl TypeTable {
                 // Qualifiers on the pointer belong after the star -- the
                 // `const` in `char *const` qualifies the pointer, not the char.
                 let mut inner = String::from("*");
-                if typ.modifiers.contains(TypeModifiers::CONST) {
-                    inner.push_str(" const");
-                }
-                if typ.modifiers.contains(TypeModifiers::VOLATILE) {
-                    inner.push_str(" volatile");
+                for word in qualifier_words(typ.modifiers) {
+                    inner.push(' ');
+                    inner.push_str(word);
                 }
                 if let Some(space) = AddressSpace::of(typ.modifiers).keyword() {
                     inner.push(' ');
@@ -2213,11 +2236,9 @@ impl TypeTable {
 
             _ => {
                 let mut result = String::new();
-                if typ.modifiers.contains(TypeModifiers::CONST) {
-                    result.push_str("const ");
-                }
-                if typ.modifiers.contains(TypeModifiers::VOLATILE) {
-                    result.push_str("volatile ");
+                for word in qualifier_words(typ.modifiers) {
+                    result.push_str(word);
+                    result.push(' ');
                 }
                 if let Some(space) = AddressSpace::of(typ.modifiers).keyword() {
                     result.push_str(space);
@@ -2880,6 +2901,15 @@ impl TypeTable {
             if self.pointees_pair_function_with_void(t_pointee, v_pointee) {
                 return Some(AssignFault::FunctionPointerVoid);
             }
+            if self.arrays_differ_in_qualifiers_only(t_pointee, v_pointee) {
+                let t_quals = self.qualifiers_through_arrays(t_pointee);
+                let v_quals = self.qualifiers_through_arrays(v_pointee);
+                return Some(if t_quals.contains(v_quals) {
+                    AssignFault::ArrayQualifiers
+                } else {
+                    AssignFault::ArrayQualifierDiscard
+                });
+            }
             let (t_void, v_void) = (
                 self.kind(t_pointee) == TypeKind::Void,
                 self.kind(v_pointee) == TypeKind::Void,
@@ -3109,12 +3139,14 @@ impl TypeTable {
     }
 
     /// The qualifiers of what `value` points to that what `target` points
-    /// to lacks -- what an [`AssignFault::QualifierDiscard`] discards --
+    /// to lacks -- what an [`AssignFault::QualifierDiscard`] discards, or an
+    /// [`AssignFault::ArrayQualifierDiscard`] of an array's elements --
     /// spelled as gcc spells them: `const volatile`.
     pub fn discarded_qualifiers(&self, target: TypeId, value: TypeId) -> String {
         let pointee_quals = |t: TypeId| {
-            self.base_type(t)
-                .map_or(TypeModifiers::empty(), |p| self.qualifiers(p))
+            self.base_type(t).map_or(TypeModifiers::empty(), |p| {
+                self.qualifiers_through_arrays(p)
+            })
         };
         let lost = pointee_quals(value) - pointee_quals(target);
         [
@@ -4248,10 +4280,12 @@ impl TypeTable {
     }
 
     /// [`Self::types_compatible`], with the qualifiers of array elements set
-    /// aside at every level of array derivation.
+    /// aside at every level of array derivation -- but not `_Atomic`, which
+    /// gcc does not count among them: an `_Atomic int` element is of another
+    /// type than an `int` one, its size and alignment free to differ.
     fn compatible_through_array_qualifiers(&self, a: TypeId, b: TypeId) -> bool {
         if self.kind(a) != TypeKind::Array || self.kind(b) != TypeKind::Array {
-            return self.types_compatible(a, b);
+            return self.types_compatible(a, b) && self.is_atomic(a) == self.is_atomic(b);
         }
         self.get(a).compatible_ignoring_base(self.get(b))
             && match (self.base_type(a), self.base_type(b)) {

@@ -75,6 +75,18 @@ fn register_variable(types: &TypeTable, symbols: &SymbolTable, expr: &Expr) -> O
     register.then_some(*symbol_id)
 }
 
+/// gcc's `-pedantic` report of two pointers to arrays whose elements differ
+/// only in qualifiers meeting in an operator, a conversion as if by
+/// assignment or a conditional: C2x makes them pointers to differently
+/// qualified versions of one type, and C17 calls them pointers to different
+/// types ([`TypeTable::arrays_differ_in_qualifiers_only`]).
+pub(super) fn pedwarn_qualified_arrays(pos: Position) {
+    diag::pedwarn(
+        pos,
+        &gettext("invalid use of pointers to arrays with different qualifiers in ISO C before C2X"),
+    );
+}
+
 impl Parser<'_> {
     /// Check a call's arguments against the function type it calls: their
     /// number, then each one's type (C17 6.5.2.2p2).
@@ -255,6 +267,11 @@ impl Parser<'_> {
             let callee = callee.and_then(|id| self.idents.get_opt(id));
             let quals = self.types.discarded_qualifiers(param, a);
             Self::report_argument_fault(fault, arg.pos, &n, callee, &quals);
+            // gcc's report that C17 calls the arrays different types has no
+            // note of its own.
+            if fault == AssignFault::ArrayQualifiers {
+                continue;
+            }
             diag::note_args(
                 note_pos,
                 "expected '{0}' but argument is of type '{1}'",
@@ -281,7 +298,14 @@ impl Parser<'_> {
         callee: Option<&str>,
         quals: &str,
     ) {
+        if matches!(
+            fault,
+            AssignFault::ArrayQualifiers | AssignFault::ArrayQualifierDiscard
+        ) {
+            pedwarn_qualified_arrays(pos);
+        }
         let (named, unnamed) = match fault {
+            AssignFault::ArrayQualifiers => return,
             AssignFault::Incompatible => (
                 "incompatible type for argument {0} of '{1}'",
                 "incompatible type for argument {0}",
@@ -306,7 +330,7 @@ impl Parser<'_> {
                 "passing argument {0} of '{1}' makes pointer from integer without a cast",
                 "passing argument {0} makes pointer from integer without a cast",
             ),
-            AssignFault::QualifierDiscard => (
+            AssignFault::QualifierDiscard | AssignFault::ArrayQualifierDiscard => (
                 "passing argument {0} of '{1}' discards '{2}' qualifier from pointer target type",
                 "passing argument {0} discards '{2}' qualifier from pointer target type",
             ),
@@ -599,13 +623,7 @@ impl Parser<'_> {
                 false
             }
             OperandVerdict::QualifiedArrays => {
-                diag::pedwarn(
-                    pos,
-                    &gettext(
-                        "invalid use of pointers to arrays with different qualifiers \
-                         in ISO C before C2X",
-                    ),
-                );
+                pedwarn_qualified_arrays(pos);
                 !matches!(op, BinaryOp::Sub)
                     || (self.check_pointer_steps(lt, pos) && self.check_pointer_steps(rt, pos))
             }
@@ -809,7 +827,9 @@ impl Parser<'_> {
         let Some(fault) = self.types.assignment_fault(t, v, null_constant) else {
             return;
         };
-        if fault == AssignFault::FunctionPointerVoid {
+        use AssignFault::*;
+        use ConversionSite::*;
+        if fault == FunctionPointerVoid {
             let msg = match site {
                 ConversionSite::Assignment => {
                     gettext("ISO C forbids assignment between function pointer and 'void *'")
@@ -823,6 +843,12 @@ impl Parser<'_> {
             };
             diag::pedwarn(pos, &msg);
             return;
+        }
+        if matches!(fault, ArrayQualifiers | ArrayQualifierDiscard) {
+            pedwarn_qualified_arrays(pos);
+            if fault == ArrayQualifiers {
+                return;
+            }
         }
         if fault.is_error() {
             // An aggregate initialized from something that is not a
@@ -847,8 +873,6 @@ impl Parser<'_> {
             self.types.format_type(t, Some(self.idents)),
             self.types.format_type(v, Some(self.idents)),
         );
-        use AssignFault::*;
-        use ConversionSite::*;
         let template = match (site, fault) {
             (Assignment, Incompatible) => {
                 "incompatible types when assigning to type '{0}' from type '{1}'"
@@ -878,13 +902,13 @@ impl Parser<'_> {
             (Return, PointerMismatch) => {
                 "returning '{1}' from a function with incompatible return type '{0}'"
             }
-            (Assignment, QualifierDiscard) => {
+            (Assignment, QualifierDiscard | ArrayQualifierDiscard) => {
                 "assignment discards '{2}' qualifier from pointer target type"
             }
-            (Initialization, QualifierDiscard) => {
+            (Initialization, QualifierDiscard | ArrayQualifierDiscard) => {
                 "initialization discards '{2}' qualifier from pointer target type"
             }
-            (Return, QualifierDiscard) => {
+            (Return, QualifierDiscard | ArrayQualifierDiscard) => {
                 "return discards '{2}' qualifier from pointer target type"
             }
             (Assignment, IntegerFromPointer) => {
@@ -912,7 +936,7 @@ impl Parser<'_> {
                 "initialization from pointer to non-enclosed address space"
             }
             (Return, AddressSpace) => "return from pointer to non-enclosed address space",
-            (_, FunctionPointerVoid) => unreachable!("reported above"),
+            (_, FunctionPointerVoid | ArrayQualifiers) => unreachable!("reported above"),
         };
         let quals = self.types.discarded_qualifiers(t, v);
         let args: &[&str] = &[&t_name, &v_name, &quals];

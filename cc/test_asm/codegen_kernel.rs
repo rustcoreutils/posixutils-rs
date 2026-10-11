@@ -666,6 +666,35 @@ fn codegen_kernel_zero_call_used_regs() {
     assert!(cleared("-fzero-call-used-regs=skip", "leaf").is_empty());
 }
 
+/// A register inline assembly clobbers is one the function uses, though no
+/// instruction c17 writes names it: `used-gpr` clears it, as gcc 13 does,
+/// or what the assembly left there survives the return.
+#[test]
+fn codegen_kernel_zero_call_used_regs_counts_asm_clobbers() {
+    let src = "long h(long x) { __asm__ volatile(\"\" ::: \"rcx\", \"r8\"); return x; }\n";
+    let asm = asm_for_with(
+        "zero_regs_asm",
+        X86_64_LINUX,
+        src,
+        &["-O2", "-fno-pie", "-fzero-call-used-regs=used-gpr"],
+    );
+    let body = body_of(&asm, "h");
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    let ret = lines.iter().rposition(|l| *l == "ret").unwrap();
+    let mut cleared: Vec<&str> = lines[..ret]
+        .iter()
+        .rev()
+        .take_while(|l| l.starts_with("xorl"))
+        .copied()
+        .collect();
+    cleared.reverse();
+    assert_eq!(
+        cleared,
+        ["xorl %ecx, %ecx", "xorl %edi, %edi", "xorl %r8d, %r8d"],
+        "{asm}"
+    );
+}
+
 /// Where the stack protector reads its guard, as gcc 13 reads it: glibc's
 /// `%fs:40` by default; under `-mcmodel=kernel` the kernel's per-CPU
 /// `%gs:40` (`scripts/gcc-x86_64-has-stack-protector.sh` greps for `%gs`);

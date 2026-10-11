@@ -1566,6 +1566,21 @@ impl X86_64CodeGen {
             named.insert(rest[..end].to_string());
             rest = &rest[end..];
         }
+        // And what its inline assembly clobbers, which no instruction c17
+        // writes need name: the assembly may leave a value there all the
+        // same, and gcc counts the register as used.
+        for asm in func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter_map(|insn| insn.extra().asm_data.as_deref())
+        {
+            named.extend(
+                asm.clobbers
+                    .iter()
+                    .map(|c| c.trim_start_matches('%').to_string()),
+            );
+        }
         let gp_used = |r: Reg| {
             // `%al`'s high twin `%ah`, for the four registers that have one.
             let low = &r.name8()[1..];

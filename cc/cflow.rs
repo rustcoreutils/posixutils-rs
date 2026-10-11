@@ -263,7 +263,9 @@ fn extract_calls_from_expr(
         ExprKind::SizeofExpr(e) | ExprKind::AlignofExpr(e) => {
             extract_calls_from_expr(e, strings, symbols, calls);
         }
-        ExprKind::Comma(exprs) | ExprKind::InlineLibraryCall { args: exprs, .. } => {
+        ExprKind::Comma(exprs)
+        | ExprKind::InlineLibraryCall { args: exprs, .. }
+        | ExprKind::MachineBuiltin { args: exprs, .. } => {
             for e in exprs {
                 extract_calls_from_expr(e, strings, symbols, calls);
             }
@@ -492,7 +494,9 @@ fn visit_subexprs(
         }
         ExprKind::Cast { expr, .. } => f(expr),
         ExprKind::SizeofExpr(e) | ExprKind::AlignofExpr(e) => f(e),
-        ExprKind::Comma(exprs) | ExprKind::InlineLibraryCall { args: exprs, .. } => {
+        ExprKind::Comma(exprs)
+        | ExprKind::InlineLibraryCall { args: exprs, .. }
+        | ExprKind::MachineBuiltin { args: exprs, .. } => {
             for e in exprs {
                 f(e);
             }

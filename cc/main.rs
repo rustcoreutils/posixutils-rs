@@ -2913,15 +2913,31 @@ fn version_banner(target: &Target) -> String {
 
 /// Refuse the `-m` flags that ask for code c17 does not generate.
 ///
-/// What stays is what changes nothing: the target's own word size, and
-/// choosing or tuning for a CPU, since c17 emits only the architecture's
-/// baseline instructions and baseline code runs on every CPU of it. A CPU
-/// choice does not define the feature macros (`__AVX2__`, ...) it would in
-/// gcc, so code that tests them takes its baseline path. On x86-64 `-msse`,
-/// `-msse2` and `-mfpmath=sse` name the baseline itself. Everything else --
-/// an instruction-set extension, an ABI or code-model change -- would make
-/// the code different from what was asked, so it is an error.
+/// What stays is what changes nothing c17 cannot honour: the target's own
+/// word size, choosing or tuning for a CPU, and on x86-64 gcc's
+/// instruction-set options (`-mavx2`, `-mno-mmx`, ...), which say what the
+/// target has (`target::X86Isa`). A CPU choice claims no more than SSE4.2
+/// and POPCNT of what it has, so code that tests `__AVX2__` and friends
+/// takes its baseline path. `-msse`, `-msse2` and `-mfpmath=sse` name the
+/// baseline itself; `-msse2avx` is the assembler's, and `-mvzeroupper` and
+/// `-mprefer-vector-width=` speak of code c17 never generates. Everything
+/// else -- an ABI or code-model change -- would make the code different
+/// from what was asked, so it is an error. gcc's aarch64 driver does not
+/// know the x86-64 instruction-set options at all, and nor does c17's.
 fn check_machine_flags(flags: &[String], target: &Target) {
+    if target.arch == target::Arch::Aarch64 {
+        let x86_only = |f: &str| {
+            target::is_isa_flag(f) || matches!(f, "-msse2avx" | "-mvzeroupper" | "-mno-vzeroupper")
+        };
+        if let Some(flag) = flags.iter().find(|f| x86_only(f)) {
+            eprintln!(
+                "c17: {} '{}'",
+                gettext("error: unrecognized command-line option"),
+                flag
+            );
+            std::process::exit(1);
+        }
+    }
     let accepted = |flag: &str| {
         flag.starts_with("-march=")
             || flag.starts_with("-mtune=")
@@ -2934,9 +2950,15 @@ fn check_machine_flags(flags: &[String], target: &Target) {
                             "-m64"
                                 | "-msse"
                                 | "-msse2"
-                                | "-mmmx"
+                                | "-msse2avx"
+                                | "-mvzeroupper"
+                                | "-mno-vzeroupper"
                                 | "-mfpmath=sse"
                                 | "-mcmodel=small"
+                                | "-mprefer-vector-width=none"
+                                | "-mprefer-vector-width=128"
+                                | "-mprefer-vector-width=256"
+                                | "-mprefer-vector-width=512"
                         )
                         || target::Profiling::MACHINE_FLAGS.contains(&flag)
                 }
@@ -3306,15 +3328,21 @@ struct AsmSettings<'a> {
     options: &'a [String],
     /// gcc's `-B` prefixes, searched for the assembler.
     prefixes: &'a [String],
+    /// `-msse2avx`: GNU `as` is to encode every SSE instruction with a VEX
+    /// prefix. gcc's spec passes it on unless `-mavx` is given, under which
+    /// gcc writes the VEX forms itself.
+    sse2avx: bool,
 }
 
 impl Args {
     fn asm_settings(&self) -> AsmSettings<'_> {
+        let given = |flag: &str| self.mflags.iter().any(|f| f == flag);
         AsmSettings {
             debug: self.debug > 0,
             debug_map: self.prefix_maps().debug,
             options: &self.asm_options,
             prefixes: &self.prefixes,
+            sse2avx: given("-msse2avx") && !given("-mavx"),
         }
     }
 }
@@ -3377,6 +3405,11 @@ impl AssemblerCommand {
         } else {
             if settings.debug {
                 args.push("-g".to_string());
+            }
+            // GNU `as` only: Apple's assembler has no such option, and the
+            // encoding is a matter of speed, not of what the code does.
+            if settings.sse2avx && os != Os::MacOS {
+                args.push("-msse2avx".to_string());
             }
             args.extend(settings.options.iter().cloned());
             args.extend(["-o", output, input].map(String::from));
@@ -4173,6 +4206,7 @@ mod tests {
             debug_map,
             options,
             prefixes: &[],
+            sse2avx: false,
         };
         let cmd = AssemblerCommand::new(os, &settings, "t.s", "t.o");
         (cmd.program, cmd.args)

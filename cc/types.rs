@@ -1159,6 +1159,9 @@ pub struct TypeTable {
     target_arch: Arch,
     /// Target OS for runtime type size calculations
     target_os: Os,
+    /// The target's `__BIGGEST_ALIGNMENT__`, which a bare
+    /// `__attribute__((aligned))` asks for. Copied from `Target`.
+    biggest_alignment: u32,
     /// Plain `char`'s signedness on the target (C17 6.2.5p15), as
     /// [`CharSignedness::of`] decides it. Copied from `Target` at construction
     /// rather than recomputed, because the table cannot reconstruct the
@@ -1279,6 +1282,7 @@ impl TypeTable {
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
+            biggest_alignment: target.biggest_alignment(),
             plain_char: target.plain_char,
             void_id: TypeId::INVALID,
             bool_id: TypeId::INVALID,
@@ -1464,6 +1468,18 @@ impl TypeTable {
         table.float_ptr_id = table.intern(Type::pointer(table.float_id));
         table.double_ptr_id = table.intern(Type::pointer(table.double_id));
         table.longdouble_ptr_id = table.intern(Type::pointer(table.longdouble_id));
+        // `modf`'s pointers for the `_FloatN` and `_FloatNx` types, which
+        // `pointer_to` finds here.
+        for (kind, class) in [
+            (TypeKind::Float, FloatClass::Interchange),
+            (TypeKind::Double, FloatClass::Interchange),
+            (TypeKind::Double, FloatClass::Extended),
+            (TypeKind::LongDouble, FloatClass::Extended),
+        ] {
+            let real = table.floating(kind, class);
+            table.intern(Type::pointer(real));
+        }
+        table.intern(Type::pointer(table.float128_id));
         table.va_list_id = table.intern(Type::basic(TypeKind::VaList));
         table.ms_va_list_id = table.intern(Type {
             modifiers: TypeModifiers::MS_VA_LIST,
@@ -3624,6 +3640,12 @@ impl TypeTable {
     /// `Target` is derived from those two.
     pub fn target(&self) -> Target {
         Target::new(self.target_arch, self.target_os)
+    }
+
+    /// The target's `__BIGGEST_ALIGNMENT__`; see
+    /// [`Target::biggest_alignment`].
+    pub fn biggest_alignment(&self) -> u32 {
+        self.biggest_alignment
     }
 
     /// The unqualified real floating type of `kind` and `class`: `float`,

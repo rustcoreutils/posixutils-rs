@@ -374,7 +374,9 @@ impl AttributeList {
             artificial: self.has_attr("artificial"),
             no_instrument: self.has_attr("no_instrument_function"),
             effect: self.mem_effect(),
-            align: self.get_alignment().filter(|n| n.is_power_of_two()),
+            align: self
+                .get_alignment(target.biggest_alignment())
+                .filter(|n| n.is_power_of_two()),
             noreturn: self.has_noreturn(),
             returns_twice: self.has_attr("returns_twice"),
             nothrow: self.has_attr("nothrow"),
@@ -464,12 +466,15 @@ impl AttributeList {
     }
 
     /// The alignment `aligned` asks for: a power of two, since
-    /// `check_integer_args` drops any other with a diagnostic.
-    pub fn get_alignment(&self) -> Option<u32> {
+    /// `check_integer_args` drops any other with a diagnostic. With no
+    /// argument it is gcc's "largest alignment ever used for any data type
+    /// on the target machine", `__BIGGEST_ALIGNMENT__`: `biggest`, the
+    /// target's [`crate::target::Target::biggest_alignment`].
+    pub fn get_alignment(&self, biggest: u32) -> Option<u32> {
         for attr in &self.attrs {
             if attr.is_named("aligned") {
                 if attr.args.is_empty() {
-                    return Some(16); // GCC default: max useful alignment
+                    return Some(biggest);
                 }
                 if let Some(AttributeArg::Int(n)) = attr.args.first() {
                     return Some(*n as u32);
@@ -1456,7 +1461,7 @@ impl Parser<'_> {
     /// Apply alignment from __attribute__((aligned(N))) to pending_alignas.
     /// Merges max: multiple aligned attrs → strictest wins.
     fn apply_attribute_alignment(&mut self, attrs: &AttributeList) {
-        if let Some(align) = attrs.get_alignment() {
+        if let Some(align) = attrs.get_alignment(self.types.biggest_alignment()) {
             self.raise_pending_alignas(align);
         }
     }
@@ -1518,7 +1523,7 @@ impl Parser<'_> {
         declarator_scoped: bool,
     ) {
         if declarator_scoped {
-            if let Some(align) = attrs.get_alignment() {
+            if let Some(align) = attrs.get_alignment(self.types.biggest_alignment()) {
                 if align > 0 && align.is_power_of_two() {
                     self.pending_declarator_align = Some(
                         self.pending_declarator_align

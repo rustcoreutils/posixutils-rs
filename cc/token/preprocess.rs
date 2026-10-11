@@ -3153,10 +3153,10 @@ fn define_pic_macros(
     }
 }
 
-/// Define the feature macros of the x86-64 extensions `-msse3` ..
-/// `-msse4.2`, `-mpopcnt` and `-march=` ask for (`__SSE4_1__` and the rest),
-/// as gcc does. Code tests them to choose its path; the baseline's
-/// `__SSE2__` is among the target's own macros.
+/// Define the feature macros of the x86-64 extensions the ISA options and
+/// `-march=` ask for (`__MMX__`, `__SSE4_1__`, `__AVX2__` and the rest), as
+/// gcc does. Code tests them to choose its path; `__SSE2__`, which no
+/// option turns off, is among the target's own macros.
 fn define_isa_macros(pp: &mut Preprocessor, target: &Target, isa: crate::target::X86Isa) {
     if target.arch != crate::target::Arch::X86_64 {
         return;

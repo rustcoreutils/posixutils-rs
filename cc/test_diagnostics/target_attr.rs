@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 // `__attribute__((target("...")))` and `target_clones(...)`: what gcc 13
-// refuses, in its words, and the ISA beyond c17's SSE4.2 ceiling that is
-// ignored in silence. Every case names its target and runs the same on any
+// refuses, in its words, and the `target_clones` versions above SSE4.2 it
+// does not build. Every case names its target and runs the same on any
 // host.
 //
 

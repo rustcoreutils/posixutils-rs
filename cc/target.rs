@@ -538,6 +538,183 @@ impl StackProtector {
     }
 }
 
+/// One x86-64 instruction-set extension gcc 13 has an `-m` option for, and
+/// that `__attribute__((target("...")))` names the same way.
+struct IsaFeature {
+    /// The option's name: `-m<name>`, `-mno-<name>`, `target("<name>")`.
+    name: &'static str,
+    /// The macro gcc defines to 1 while the extension is on, if it has one.
+    macro_name: Option<&'static str>,
+    /// The extensions it is built on: turning it on turns them on, and what
+    /// they are built on, and turning one of them off turns it off (gcc's
+    /// `OPTION_MASK_ISA_*_SET` and `_UNSET`).
+    needs: &'static [&'static str],
+    /// Extensions turning it on turns on too, which it survives the loss of.
+    brings: &'static [&'static str],
+    /// Turning it on turns on what it needs, but not what those need: gcc's
+    /// AMX sets name AMX-TILE and not AMX-TILE's own XSAVE.
+    shallow: bool,
+}
+
+const fn isa(
+    name: &'static str,
+    macro_name: &'static str,
+    needs: &'static [&'static str],
+) -> IsaFeature {
+    IsaFeature {
+        name,
+        macro_name: Some(macro_name),
+        needs,
+        brings: &[],
+        shallow: false,
+    }
+}
+
+/// An AMX extension built on AMX-TILE: see [`IsaFeature::shallow`].
+const fn amx(name: &'static str, macro_name: &'static str) -> IsaFeature {
+    IsaFeature {
+        name,
+        macro_name: Some(macro_name),
+        needs: &["amx-tile"],
+        brings: &[],
+        shallow: true,
+    }
+}
+
+/// An extension gcc defines no macro for.
+const fn unnamed(name: &'static str) -> IsaFeature {
+    IsaFeature {
+        name,
+        macro_name: None,
+        needs: &[],
+        brings: &[],
+        shallow: false,
+    }
+}
+
+/// Every extension gcc 13's x86-64 options name, apart from SSE and SSE2,
+/// which are the baseline and cannot be turned off. In the order their
+/// macros are listed. The needs are gcc 13's, read off its `-dM -E` for
+/// each `-mX` and for `-mno-X` after every other.
+#[rustfmt::skip]
+const ISA_FEATURES: &[IsaFeature] = &[
+    isa("mmx",          "__MMX__",          &[]),
+    isa("fxsr",         "__FXSR__",         &[]),
+    isa("sse3",         "__SSE3__",         &[]),
+    isa("ssse3",        "__SSSE3__",        &["sse3"]),
+    isa("sse4.1",       "__SSE4_1__",       &["ssse3"]),
+    isa("sse4.2",       "__SSE4_2__",       &["sse4.1"]),
+    isa("popcnt",       "__POPCNT__",       &[]),
+    isa("crc32",        "__CRC32__",        &[]),
+    isa("sse4a",        "__SSE4A__",        &["sse3"]),
+    isa("xsave",        "__XSAVE__",        &[]),
+    isa("xsavec",       "__XSAVEC__",       &["xsave"]),
+    isa("xsaveopt",     "__XSAVEOPT__",     &["xsave"]),
+    isa("xsaves",       "__XSAVES__",       &["xsave"]),
+    isa("avx",          "__AVX__",          &["sse4.2", "xsave"]),
+    isa("avx2",         "__AVX2__",         &["avx"]),
+    isa("f16c",         "__F16C__",         &["avx"]),
+    isa("fma",          "__FMA__",          &["avx"]),
+    isa("fma4",         "__FMA4__",         &["sse4a", "avx"]),
+    isa("xop",          "__XOP__",          &["fma4"]),
+    isa("avx512f",      "__AVX512F__",      &["avx2"]),
+    isa("avx512bw",     "__AVX512BW__",     &["avx512f"]),
+    isa("avx512dq",     "__AVX512DQ__",     &["avx512f"]),
+    IsaFeature {
+        name: "avx512vp2intersect",
+        macro_name: Some("__AVX512VP2INTERSECT__"),
+        needs: &["avx512f"],
+        brings: &["avx512dq"],
+        shallow: false,
+    },
+    isa("avx512cd",     "__AVX512CD__",     &["avx512f"]),
+    isa("avx512er",     "__AVX512ER__",     &["avx512f"]),
+    isa("avx512pf",     "__AVX512PF__",     &["avx512f"]),
+    isa("avx512vl",     "__AVX512VL__",     &["avx512f"]),
+    isa("avx512ifma",   "__AVX512IFMA__",   &["avx512f"]),
+    isa("avx512vbmi",   "__AVX512VBMI__",   &["avx512bw"]),
+    isa("avx512vbmi2",  "__AVX512VBMI2__",  &["avx512f"]),
+    isa("avx512vnni",   "__AVX512VNNI__",   &["avx512f"]),
+    isa("avx512bitalg", "__AVX512BITALG__", &["avx512f"]),
+    isa("avx512vpopcntdq", "__AVX512VPOPCNTDQ__", &["avx512f"]),
+    isa("avx5124fmaps", "__AVX5124FMAPS__", &["avx512f"]),
+    isa("avx5124vnniw", "__AVX5124VNNIW__", &["avx512f"]),
+    isa("avx512bf16",   "__AVX512BF16__",   &["avx512bw"]),
+    isa("avx512fp16",   "__AVX512FP16__",   &["avx512bw"]),
+    isa("avxvnni",      "__AVXVNNI__",      &["avx2"]),
+    isa("avxifma",      "__AVXIFMA__",      &["avx2"]),
+    isa("avxneconvert", "__AVXNECONVERT__", &["avx2"]),
+    isa("avxvnniint8",  "__AVXVNNIINT8__",  &["avx2"]),
+    isa("lzcnt",        "__LZCNT__",        &[]),
+    isa("abm",          "__ABM__",          &[]),
+    isa("bmi",          "__BMI__",          &[]),
+    isa("bmi2",         "__BMI2__",         &[]),
+    isa("tbm",          "__TBM__",          &[]),
+    isa("adx",          "__ADX__",          &[]),
+    isa("aes",          "__AES__",          &[]),
+    isa("pclmul",       "__PCLMUL__",       &[]),
+    isa("vaes",         "__VAES__",         &[]),
+    isa("vpclmulqdq",   "__VPCLMULQDQ__",   &[]),
+    isa("gfni",         "__GFNI__",         &[]),
+    isa("sha",          "__SHA__",          &[]),
+    isa("rtm",          "__RTM__",          &[]),
+    isa("shstk",        "__SHSTK__",        &[]),
+    isa("rdrnd",        "__RDRND__",        &[]),
+    isa("rdseed",       "__RDSEED__",       &[]),
+    isa("rdpid",        "__RDPID__",        &[]),
+    isa("fsgsbase",     "__FSGSBASE__",     &[]),
+    isa("movbe",        "__MOVBE__",        &[]),
+    isa("prfchw",       "__PRFCHW__",       &[]),
+    isa("prefetchwt1",  "__PREFETCHWT1__",  &[]),
+    isa("prefetchi",    "__PREFETCHI__",    &[]),
+    isa("clflushopt",   "__CLFLUSHOPT__",   &[]),
+    isa("clwb",         "__CLWB__",         &[]),
+    isa("clzero",       "__CLZERO__",       &[]),
+    isa("cldemote",     "__CLDEMOTE__",     &[]),
+    isa("cmpccxadd",    "__CMPCCXADD__",    &[]),
+    isa("enqcmd",       "__ENQCMD__",       &[]),
+    isa("hreset",       "__HRESET__",       &[]),
+    isa("kl",           "__KL__",           &[]),
+    isa("widekl",       "__WIDEKL__",       &["kl"]),
+    isa("lwp",          "__LWP__",          &[]),
+    isa("movdir64b",    "__MOVDIR64B__",    &[]),
+    isa("movdiri",      "__MOVDIRI__",      &[]),
+    isa("mwaitx",       "__MWAITX__",       &[]),
+    isa("pconfig",      "__PCONFIG__",      &[]),
+    isa("pku",          "__PKU__",          &[]),
+    isa("ptwrite",      "__PTWRITE__",      &[]),
+    isa("raoint",       "__RAOINT__",       &[]),
+    isa("sahf",         "__LAHF_SAHF__",    &[]),
+    isa("serialize",    "__SERIALIZE__",    &[]),
+    isa("sgx",          "__SGX__",          &[]),
+    isa("tsxldtrk",     "__TSXLDTRK__",     &[]),
+    isa("uintr",        "__UINTR__",        &[]),
+    isa("waitpkg",      "__WAITPKG__",      &[]),
+    isa("wbnoinvd",     "__WBNOINVD__",     &[]),
+    isa("3dnow",        "__3dNOW__",        &["mmx"]),
+    isa("3dnowa",       "__3dNOW_A__",      &["3dnow"]),
+    isa("amx-tile",     "__AMX_TILE__",     &["xsave"]),
+    amx("amx-int8",     "__AMX_INT8__"),
+    amx("amx-bf16",     "__AMX_BF16__"),
+    amx("amx-fp16",     "__AMX_FP16__"),
+    amx("amx-complex",  "__AMX_COMPLEX__"),
+    // gcc defines no macro for these two.
+    unnamed("hle"),
+    unnamed("mwait"),
+    // gcc's `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16` says the `__sync`
+    // builtins are lock-free at 16 bytes, and c17's are not: CMPXCHG16B is
+    // an extension it never generates, so the option names nothing more.
+    unnamed("cx16"),
+];
+
+/// Extensions gcc turns on for another once every option has been read,
+/// unless an option named them: POPCNT and CRC32 for SSE4.2, POPCNT and
+/// LZCNT for ABM. `-mavx -mno-sse4.1` so has neither POPCNT nor CRC32.
+const ISA_FOLLOWERS: &[(&str, &[&str])] = &[
+    ("sse4.2", &["popcnt", "crc32"]),
+    ("abm", &["popcnt", "lzcnt"]),
+];
+
 /// The x86-64 SIMD extensions code may assume beyond the SSE2 baseline,
 /// in order: each implies the ones before it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -551,39 +728,134 @@ pub enum X86Simd {
 }
 
 /// The x86-64 instruction-set extensions a compilation may assume, from
-/// `-msse3` .. `-msse4.2`, `-mpopcnt`, their `-mno-` forms and `-march=`.
+/// gcc's ISA options (`-msse4.1`, `-mavx2`, `-mno-mmx`, ...) and `-march=`.
 /// They are statements about the target, which the feature macros
-/// (`__SSE4_1__` and the rest) report as gcc's do, and which pick the packed
-/// instructions vector operations use (`arch::simd`). c17's intrinsic
-/// headers provide every function whatever the level, since they are
-/// written in portable C. AVX and later are not modelled:
-/// `-march=x86-64-v3` claims only what v2 does.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// (`__SSE4_1__`, `__AVX2__` and the rest) report as gcc's do. Code is
+/// chosen by them where c17 has a choice to make: the packed instructions
+/// vector operations use (`arch::simd`), up to SSE4.2, and `fma` by FMA.
+/// c17's intrinsic headers provide every function whatever the level,
+/// since they are written in portable C. A `-march=` CPU claims no more
+/// than SSE4.2 and POPCNT: c17 has no AVX intrinsics for code that tests
+/// `__AVX__` to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct X86Isa {
-    pub simd: X86Simd,
-    pub popcnt: bool,
+    set: IsaSet,
 }
 
-/// A set of the x86-64 extensions [`X86Isa`] models, as gcc's option
-/// handling sees them: one bit each.
+impl Default for X86Isa {
+    /// The x86-64 baseline: MMX and FXSR, beside SSE and SSE2.
+    fn default() -> Self {
+        Self {
+            set: IsaSet::BASELINE,
+        }
+    }
+}
+
+/// A set of the x86-64 extensions in [`ISA_FEATURES`]: one bit each, in
+/// table order.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct IsaSet(u8);
+pub(crate) struct IsaSet(u128);
+
+/// Whether two names are the same; `str` has no `const` comparison.
+const fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 impl IsaSet {
-    const SSE3: Self = Self(1);
-    const SSSE3: Self = Self(2);
-    const SSE41: Self = Self(4);
-    const SSE42: Self = Self(8);
-    const POPCNT: Self = Self(16);
+    const SSE3: Self = Self::named("sse3");
+    const SSSE3: Self = Self::named("ssse3");
+    const SSE41: Self = Self::named("sse4.1");
+    const SSE42: Self = Self::named("sse4.2");
+    const POPCNT: Self = Self::named("popcnt");
+    const AVX: Self = Self::named("avx");
+    const FMA: Self = Self::named("fma");
+    const FMA4: Self = Self::named("fma4");
+    const AVX512F: Self = Self::named("avx512f");
+    const BASELINE: Self = Self(Self::named("mmx").0 | Self::named("fxsr").0);
 
-    /// SSE3 .. SSE4.2 up to `top`: an extension and every one it needs.
-    const fn and_below(top: Self) -> Self {
-        Self(top.0 | (top.0 - 1) & 15)
+    /// The extension `name`, found at compile time.
+    const fn named(name: &str) -> Self {
+        let mut i = 0;
+        while i < ISA_FEATURES.len() {
+            if same_name(ISA_FEATURES[i].name, name) {
+                return Self(1 << i);
+            }
+            i += 1;
+        }
+        panic!("not an ISA_FEATURES name")
     }
 
-    /// `bottom` and every SIMD extension that needs it.
-    const fn and_above(bottom: Self) -> Self {
-        Self(!(bottom.0 - 1) & 15)
+    /// The extension an option or `target` item names, if it is one.
+    fn by_name(name: &str) -> Option<Self> {
+        ISA_FEATURES
+            .iter()
+            .position(|f| f.name == name)
+            .map(|i| Self(1 << i))
+    }
+
+    fn of_names(names: &[&str]) -> Self {
+        names.iter().fold(Self::default(), |set, name| {
+            set.with(Self::by_name(name).expect("an ISA_FEATURES name"))
+        })
+    }
+
+    fn members(self) -> impl Iterator<Item = (usize, &'static IsaFeature)> {
+        ISA_FEATURES
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| self.0 & (1 << i) != 0)
+    }
+
+    /// These extensions and every one they are built on, following `needs`
+    /// -- and `brings` too, with `bringing`.
+    fn closed(self, bringing: bool) -> Self {
+        let mut set = self;
+        loop {
+            let grown = set.members().fold(set, |acc, (_, f)| {
+                let acc = acc.with(Self::of_names(f.needs));
+                if bringing {
+                    acc.with(Self::of_names(f.brings))
+                } else {
+                    acc
+                }
+            });
+            if grown == set {
+                return set;
+            }
+            set = grown;
+        }
+    }
+
+    /// What turning these on turns on: them, and what they need and bring
+    /// -- only what they need, for a [`IsaFeature::shallow`] one.
+    fn enabling(self) -> Self {
+        self.members().fold(self, |set, (i, f)| {
+            if f.shallow {
+                set.with(Self::of_names(f.needs))
+            } else {
+                set.with(Self(1 << i).closed(true))
+            }
+        })
+    }
+
+    /// What turning these off turns off: them, and every extension built
+    /// on one of them.
+    fn disabling(self) -> Self {
+        (0..ISA_FEATURES.len())
+            .map(|i| Self(1 << i))
+            .filter(|one| one.closed(false).0 & self.0 != 0)
+            .fold(Self::default(), Self::with)
     }
 
     pub(crate) const fn with(self, other: Self) -> Self {
@@ -598,20 +870,36 @@ impl IsaSet {
         self.0 & other.0 == other.0
     }
 
+    /// [`ISA_FOLLOWERS`]: what `self` brings at the end, of what `named`
+    /// leaves alone, for each leader `raised` says to consider.
+    fn with_followers(self, named: Self, raised: impl Fn(Self) -> bool) -> Self {
+        ISA_FOLLOWERS
+            .iter()
+            .map(|(leader, followers)| (Self::of_names(&[leader]), Self::of_names(followers)))
+            .filter(|&(leader, _)| self.has(leader) && raised(leader))
+            .fold(self, |set, (_, followers)| {
+                set.with(followers.without(named))
+            })
+    }
+
     /// What `-march=cpu` enables, of these: gcc 13's `-dM -E` for each
-    /// 64-bit name in its roster. A name not listed here -- `x86-64`,
-    /// `k8`, `opteron`, `athlon64`, `athlon-fx` -- is the SSE2 baseline.
+    /// 64-bit name in its roster, as far as SSE4.2 and POPCNT. A name not
+    /// listed here -- `x86-64`, `k8`, `opteron`, `athlon64`, `athlon-fx` --
+    /// is the baseline.
     pub(crate) fn of_arch(cpu: &str) -> Self {
-        let sse42 = Self::and_below(Self::SSE42).with(Self::POPCNT);
+        let sse3 = Self::BASELINE.with(Self::SSE3);
+        let ssse3 = Self::BASELINE.with(Self::SSSE3.enabling());
+        let sse41 = Self::BASELINE.with(Self::SSE41.enabling());
+        let sse42 = Self::BASELINE
+            .with(Self::SSE42.enabling())
+            .with(Self::POPCNT);
         match cpu {
             "native" => Self::host(),
-            "nocona" | "k8-sse3" | "opteron-sse3" | "athlon64-sse3" | "eden-x2" => Self::SSE3,
-            "core2" | "bonnell" | "atom" | "nano" | "nano-1000" | "nano-2000" => {
-                Self::and_below(Self::SSSE3)
-            }
-            "nano-3000" | "nano-x2" | "eden-x4" | "nano-x4" => Self::and_below(Self::SSE41),
-            "amdfam10" | "barcelona" => Self::SSE3.with(Self::POPCNT),
-            "btver1" => Self::and_below(Self::SSSE3).with(Self::POPCNT),
+            "nocona" | "k8-sse3" | "opteron-sse3" | "athlon64-sse3" | "eden-x2" => sse3,
+            "core2" | "bonnell" | "atom" | "nano" | "nano-1000" | "nano-2000" => ssse3,
+            "nano-3000" | "nano-x2" | "eden-x4" | "nano-x4" => sse41,
+            "amdfam10" | "barcelona" => sse3.with(Self::POPCNT),
+            "btver1" => ssse3.with(Self::POPCNT),
             "nehalem" | "corei7" | "westmere" | "sandybridge" | "corei7-avx" | "ivybridge"
             | "core-avx-i" | "haswell" | "core-avx2" | "broadwell" | "skylake"
             | "skylake-avx512" | "cannonlake" | "icelake-client" | "rocketlake"
@@ -621,15 +909,16 @@ impl IsaSet {
             | "tremont" | "gracemont" | "sierraforest" | "grandridge" | "knl" | "knm"
             | "x86-64-v2" | "x86-64-v3" | "x86-64-v4" | "lujiazui" | "bdver1" | "bdver2"
             | "bdver3" | "bdver4" | "znver1" | "znver2" | "znver3" | "znver4" | "btver2" => sse42,
-            _ => Self::default(),
+            _ => Self::BASELINE,
         }
     }
 
-    /// What `-march=native` finds on this machine, when it is an x86-64.
+    /// What `-march=native` finds on this machine, when it is an x86-64,
+    /// as far as [`Self::of_arch`] goes.
     fn host() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            let mut set = Self::default();
+            let mut set = Self::BASELINE;
             for (on, ext) in [
                 (std::arch::is_x86_feature_detected!("sse3"), Self::SSE3),
                 (std::arch::is_x86_feature_detected!("ssse3"), Self::SSSE3),
@@ -645,7 +934,7 @@ impl IsaSet {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            Self::default()
+            Self::BASELINE
         }
     }
 }
@@ -660,20 +949,16 @@ pub(crate) enum IsaEdit {
 
 /// The edit an ISA `-m` option makes, or `None` for any other flag.
 pub(crate) fn isa_edit(flag: &str) -> Option<IsaEdit> {
-    use IsaEdit::{Disable, Enable};
-    Some(match flag {
-        "-msse3" => Enable(IsaSet::and_below(IsaSet::SSE3)),
-        "-mssse3" => Enable(IsaSet::and_below(IsaSet::SSSE3)),
-        "-msse4.1" => Enable(IsaSet::and_below(IsaSet::SSE41)),
-        "-msse4.2" | "-msse4" => Enable(IsaSet::and_below(IsaSet::SSE42)),
-        "-mpopcnt" => Enable(IsaSet::POPCNT),
-        "-mno-sse3" => Disable(IsaSet::and_above(IsaSet::SSE3)),
-        "-mno-ssse3" => Disable(IsaSet::and_above(IsaSet::SSSE3)),
+    let item = flag.strip_prefix("-m")?;
+    match item {
+        "sse4" => return Some(IsaEdit::Enable(IsaSet::SSE42.enabling())),
         // gcc's -mno-sse4 is -mno-sse4.1, not the inverse of -msse4.
-        "-mno-sse4.1" | "-mno-sse4" => Disable(IsaSet::and_above(IsaSet::SSE41)),
-        "-mno-sse4.2" => Disable(IsaSet::SSE42),
-        "-mno-popcnt" => Disable(IsaSet::POPCNT),
-        _ => return None,
+        "no-sse4" => return Some(IsaEdit::Disable(IsaSet::SSE41.disabling())),
+        _ => {}
+    }
+    Some(match item.strip_prefix("no-") {
+        Some(name) => IsaEdit::Disable(IsaSet::by_name(name)?.disabling()),
+        None => IsaEdit::Enable(IsaSet::by_name(item)?.enabling()),
     })
 }
 
@@ -687,20 +972,25 @@ fn isa_option(flag: &str) -> &str {
     }
 }
 
-/// Whether `flag` is one of the ISA options [`X86Isa`] models: `-msse3` ..
-/// `-msse4.2`, `-msse4`, `-mpopcnt`, and their `-mno-` forms.
+/// Whether `flag` is one of gcc's x86-64 ISA options: an extension of
+/// [`ISA_FEATURES`] or `-msse4`, either sense.
 pub fn is_isa_flag(flag: &str) -> bool {
     isa_edit(flag).is_some()
+}
+
+/// Whether `name` is an extension a `target` attribute may name.
+pub(crate) fn is_isa_name(name: &str) -> bool {
+    name == "sse4" || IsaSet::by_name(name).is_some()
 }
 
 impl X86Isa {
     /// The extensions `flags` -- the `-m` options, in order -- ask for, as
     /// gcc decides them: the last `-march=` gives a base, the ISA options
     /// edit it in order wherever they stand, and an extension one of them
-    /// named keeps the state it gave, whatever the CPU has. SSE4.2 brings
-    /// POPCNT unless an option named POPCNT.
+    /// named keeps the state it gave, whatever the CPU has. Last, the
+    /// [`ISA_FOLLOWERS`] of what is on, but for those an option named.
     pub fn from_flags(flags: &[String]) -> Self {
-        let mut arch = IsaSet::default();
+        let mut arch = IsaSet::BASELINE;
         let mut set = IsaSet::default();
         let mut named = IsaSet::default();
         for (i, flag) in flags.iter().enumerate() {
@@ -731,42 +1021,27 @@ impl X86Isa {
             named = named.with(exts);
         }
         set = set.with(arch.without(named));
-        if set.has(IsaSet::SSE42) && !named.has(IsaSet::POPCNT) {
-            set = set.with(IsaSet::POPCNT);
-        }
-        Self::from_set(set)
-    }
-
-    /// This ISA as the set of extensions it holds.
-    fn to_set(self) -> IsaSet {
-        let simd = match self.simd {
-            X86Simd::Sse2 => IsaSet::default(),
-            X86Simd::Sse3 => IsaSet::SSE3,
-            X86Simd::Ssse3 => IsaSet::and_below(IsaSet::SSSE3),
-            X86Simd::Sse41 => IsaSet::and_below(IsaSet::SSE41),
-            X86Simd::Sse42 => IsaSet::and_below(IsaSet::SSE42),
-        };
-        if self.popcnt {
-            simd.with(IsaSet::POPCNT)
-        } else {
-            simd
+        Self {
+            set: set.with_followers(named, |_| true),
         }
     }
 
     /// The ISA a function with `__attribute__((target(...)))` is compiled
     /// for, when the translation unit's is `self`: an `arch=` adds what
     /// that CPU has, and the feature edits apply on top in order, as the
-    /// `-m` options do. Enabling SSE4.2 brings POPCNT unless the request
-    /// named POPCNT, as `-msse4.2` does.
+    /// `-m` options do. A leader of [`ISA_FOLLOWERS`] the request turns on
+    /// brings its followers unless the request named them, as the option
+    /// does.
     pub fn with_request(self, request: &IsaRequest) -> Self {
-        let mut set = self.to_set();
-        if let Some(arch) = request.arch {
+        let mut set = self.set;
+        let arch = request.arch();
+        if let Some(arch) = arch {
             set = set.with(arch);
         }
         let mut named = IsaSet::default();
-        let mut enabled = IsaSet::default();
-        for edit in &request.edits {
-            match *edit {
+        let mut enabled = arch.unwrap_or_default();
+        for edit in request.edits() {
+            match edit {
                 IsaEdit::Enable(exts) => {
                     set = set.with(exts);
                     enabled = enabled.with(exts);
@@ -778,77 +1053,143 @@ impl X86Isa {
                 }
             }
         }
-        let raised_sse42 =
-            enabled.has(IsaSet::SSE42) || request.arch.is_some_and(|a| a.has(IsaSet::SSE42));
-        if raised_sse42 && set.has(IsaSet::SSE42) && !named.has(IsaSet::POPCNT) {
-            set = set.with(IsaSet::POPCNT);
+        Self {
+            set: set.with_followers(named, |leader| enabled.has(leader)),
         }
-        Self::from_set(set)
     }
 
     /// Whether code compiled for `other` may run as part of code compiled
     /// for `self`: every extension `other` uses, `self` has. gcc's rule for
     /// inlining one `target` function into another.
     pub fn includes(self, other: Self) -> bool {
-        self.simd >= other.simd && (self.popcnt || !other.popcnt)
+        self.set.has(other.set)
     }
 
-    /// The level `set` reaches: SSE3 .. SSE4.2, each needing the one before.
-    fn from_set(set: IsaSet) -> Self {
-        let simd = [
+    /// The SSE level reached: SSE3 .. SSE4.2, each needing the one before.
+    pub fn simd(self) -> X86Simd {
+        [
             (IsaSet::SSE42, X86Simd::Sse42),
             (IsaSet::SSE41, X86Simd::Sse41),
             (IsaSet::SSSE3, X86Simd::Ssse3),
             (IsaSet::SSE3, X86Simd::Sse3),
         ]
         .into_iter()
-        .find(|&(ext, _)| set.has(IsaSet::and_below(ext)))
-        .map_or(X86Simd::Sse2, |(_, level)| level);
-        Self {
-            simd,
-            popcnt: set.has(IsaSet::POPCNT),
+        .find(|&(ext, _)| self.set.has(ext.enabling()))
+        .map_or(X86Simd::Sse2, |(_, level)| level)
+    }
+
+    /// The fused multiply-add instruction this ISA has for a scalar, if
+    /// any: FMA's three-operand `vfmadd213s*` (AVX512F has it too), or
+    /// FMA4's four-operand `vfmadds*`.
+    pub fn fused_multiply_add(self) -> Option<FusedMultiplyAdd> {
+        if self.set.has(IsaSet::FMA) || self.set.has(IsaSet::AVX512F) {
+            Some(FusedMultiplyAdd::Fma3)
+        } else if self.set.has(IsaSet::FMA4) {
+            Some(FusedMultiplyAdd::Fma4)
+        } else {
+            None
         }
     }
 
-    /// The feature macros this level defines, beyond the baseline's.
-    pub fn macros(self) -> Vec<&'static str> {
-        let mut m = Vec::new();
-        for (level, name) in [
-            (X86Simd::Sse3, "__SSE3__"),
-            (X86Simd::Ssse3, "__SSSE3__"),
-            (X86Simd::Sse41, "__SSE4_1__"),
-            (X86Simd::Sse42, "__SSE4_2__"),
-        ] {
-            if self.simd >= level {
-                m.push(name);
-            }
+    /// gcc's `__BIGGEST_ALIGNMENT__`, and what `__attribute__((aligned))`
+    /// with no argument asks for: the widest register's, 16 bytes for SSE,
+    /// 32 with AVX's and 64 with AVX512F's.
+    pub fn biggest_alignment(self) -> u32 {
+        if self.set.has(IsaSet::AVX512F) {
+            64
+        } else if self.set.has(IsaSet::AVX) {
+            32
+        } else {
+            16
         }
-        if self.popcnt {
-            m.push("__POPCNT__");
+    }
+
+    /// The feature macros this ISA defines to 1, beyond SSE's and SSE2's:
+    /// one per extension, and `__FP_FAST_FMA` and its siblings where `fma`
+    /// is an instruction ([`Self::fused_multiply_add`]).
+    pub fn macros(self) -> Vec<&'static str> {
+        let mut m: Vec<&'static str> = self
+            .set
+            .members()
+            .filter_map(|(_, f)| f.macro_name)
+            .collect();
+        if self.fused_multiply_add().is_some() {
+            m.extend([
+                "__FP_FAST_FMA",
+                "__FP_FAST_FMAF",
+                "__FP_FAST_FMAF32",
+                "__FP_FAST_FMAF64",
+                "__FP_FAST_FMAF32x",
+            ]);
         }
         m
     }
+}
+
+/// The scalar fused multiply-add an x86-64 ISA has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedMultiplyAdd {
+    /// FMA (and AVX512F): `vfmadd213sd b, a, acc`, whose destination is an
+    /// operand.
+    Fma3,
+    /// AMD's FMA4: `vfmaddsd c, b, a, dst`, four operands.
+    Fma4,
 }
 
 /// What `__attribute__((target("...")))` asks of one function's x86-64
 /// ISA, relative to the translation unit's: the extensions an `arch=` CPU
 /// has, and the feature edits (`sse4.1`, `no-sse4.2`, `popcnt`) in order.
 /// Read from the attribute by `crate::target_attr`; applied by
-/// [`X86Isa::with_request`].
+/// [`X86Isa::with_request`]. One list, so that a function's attributes stay
+/// a pointer's size here whatever an [`IsaSet`] holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IsaRequest {
-    pub(crate) arch: Option<IsaSet>,
-    pub(crate) edits: Vec<IsaEdit>,
+    items: Vec<IsaRequestItem>,
+}
+
+/// One item of an [`IsaRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsaRequestItem {
+    /// `arch=`: what that CPU has.
+    Arch(IsaSet),
+    /// A feature turned on or off.
+    Edit(IsaEdit),
 }
 
 impl IsaRequest {
+    /// Ask for what `arch=` of a CPU with `set` asks.
+    pub(crate) fn push_arch(&mut self, set: IsaSet) {
+        self.items.push(IsaRequestItem::Arch(set));
+    }
+
+    /// Ask for a feature edit, after those already asked for.
+    pub(crate) fn push_edit(&mut self, edit: IsaEdit) {
+        self.items.push(IsaRequestItem::Edit(edit));
+    }
+
+    /// The extensions of every `arch=` CPU asked for, if there is one.
+    fn arch(&self) -> Option<IsaSet> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                IsaRequestItem::Arch(set) => Some(*set),
+                IsaRequestItem::Edit(_) => None,
+            })
+            .reduce(IsaSet::with)
+    }
+
+    /// The feature edits, in order.
+    fn edits(&self) -> impl Iterator<Item = IsaEdit> + '_ {
+        self.items.iter().filter_map(|item| match item {
+            IsaRequestItem::Edit(edit) => Some(*edit),
+            IsaRequestItem::Arch(_) => None,
+        })
+    }
+
     /// `other` asked after this: its CPU's extensions join any this names,
     /// and its edits follow these.
     pub fn extend(&mut self, other: IsaRequest) {
-        if let Some(set) = other.arch {
-            self.arch = Some(self.arch.map_or(set, |a| a.with(set)));
-        }
-        self.edits.extend(other.edits);
+        self.items.extend(other.items);
     }
 }
 
@@ -1329,6 +1670,17 @@ impl Target {
         }
     }
 
+    /// gcc's `__BIGGEST_ALIGNMENT__`, the alignment a bare
+    /// `__attribute__((aligned))` asks for: the widest vector register's,
+    /// which on x86-64 depends on the ISA ([`X86Isa::biggest_alignment`])
+    /// and on aarch64 is always 16.
+    pub fn biggest_alignment(&self) -> u32 {
+        match self.arch {
+            Arch::X86_64 => self.x86_isa.biggest_alignment(),
+            Arch::Aarch64 => 16,
+        }
+    }
+
     /// `wint_t` (C17 7.29.1), which has to hold every `wchar_t` value *plus*
     /// `WEOF`, and the platforms solve that differently. glibc makes it
     /// `unsigned int`, so `WEOF` -- `(wint_t)-1` -- is `0xffffffff`, a value
@@ -1537,33 +1889,58 @@ mod tests {
     }
 
     /// Each level implies the ones below it, enabling options accumulate, and
-    /// gcc's -msse4.2 brings POPCNT with it.
+    /// gcc's -msse4.2 brings POPCNT and CRC32 with it.
     #[test]
     fn test_x86_isa_from_flags() {
         let isa = |flags: &[&str]| {
             let owned: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
             X86Isa::from_flags(&owned)
         };
+        let has = |flags: &[&str], name: &str| isa(flags).macros().contains(&name);
         assert_eq!(isa(&[]), X86Isa::default());
-        assert_eq!(isa(&["-msse4.1", "-msse3"]).simd, X86Simd::Sse41);
-        assert!(!isa(&["-msse4.1"]).popcnt);
-        assert_eq!(
-            isa(&["-msse4.2"]),
-            X86Isa {
-                simd: X86Simd::Sse42,
-                popcnt: true
-            }
-        );
+        assert_eq!(isa(&[]).macros(), vec!["__MMX__", "__FXSR__"]);
+        assert_eq!(isa(&["-msse4.1", "-msse3"]).simd(), X86Simd::Sse41);
+        assert!(!has(&["-msse4.1"], "__POPCNT__"));
+        assert_eq!(isa(&["-msse4.2"]).simd(), X86Simd::Sse42);
+        assert!(has(&["-msse4.2"], "__POPCNT__"));
         assert_eq!(isa(&["-march=x86-64-v2"]), isa(&["-msse4.2"]));
-        assert_eq!(isa(&["-msse3"]).macros(), vec!["__SSE3__"]);
-        assert_eq!(isa(&["-mpopcnt"]).macros(), vec!["__POPCNT__"]);
+        assert_eq!(isa(&["-mavx2"]).simd(), X86Simd::Sse42);
+        assert!(isa(&["-mavx2"]).includes(isa(&["-mavx"])));
+        assert!(!isa(&["-mavx"]).includes(isa(&["-mavx2"])));
+        assert!(isa(&[]).includes(isa(&["-mno-mmx"])));
+        assert_eq!(
+            isa(&["-mfma"]).fused_multiply_add(),
+            Some(FusedMultiplyAdd::Fma3)
+        );
+        assert_eq!(
+            isa(&["-mfma4"]).fused_multiply_add(),
+            Some(FusedMultiplyAdd::Fma4)
+        );
+        assert_eq!(
+            isa(&["-mavx512f"]).fused_multiply_add(),
+            Some(FusedMultiplyAdd::Fma3)
+        );
+        assert_eq!(isa(&["-mfma", "-mno-avx"]).fused_multiply_add(), None);
+        assert_eq!(isa(&["-mavx2"]).biggest_alignment(), 32);
+        assert_eq!(isa(&["-mavx512f"]).biggest_alignment(), 64);
+        assert_eq!(isa(&["-mavx512f", "-mno-avx512bw"]).biggest_alignment(), 64);
+        assert!(ISA_FEATURES.len() <= 128, "IsaSet holds 128");
+        for f in ISA_FEATURES {
+            assert!(is_isa_flag(&format!("-m{}", f.name)), "{}", f.name);
+            assert!(is_isa_flag(&format!("-mno-{}", f.name)), "{}", f.name);
+        }
+        for flag in ["-msse", "-msse2", "-mavx10.1", "-mno-red-zone", "-mavx2x"] {
+            assert!(!is_isa_flag(flag), "{flag}");
+        }
     }
 
     /// The last `-march=` sets the base and the `-m` options, wherever they
-    /// stand, apply on top in order, as gcc 13's `-dM -E` reports.
+    /// stand, apply on top in order, as gcc 13's `-dM -E` reports: of the
+    /// SSE levels, POPCNT and CRC32, which SSE4.2 brings only at the end
+    /// and only if no option named it.
     #[test]
     fn test_x86_isa_flag_order_matches_gcc() {
-        const ALL: &str = "SSE3 SSSE3 SSE4_1 SSE4_2 POPCNT";
+        const ALL: &str = "SSE3 SSSE3 SSE4_1 SSE4_2 POPCNT CRC32";
         let cases: &[(&str, &str)] = &[
             ("-march=x86-64-v2 -march=x86-64", ""),
             ("-march=x86-64 -march=x86-64-v2", ALL),
@@ -1576,7 +1953,14 @@ mod tests {
             ("-march=x86-64-v2 -mno-sse4", "SSE3 SSSE3 POPCNT"),
             ("-march=x86-64-v2 -mno-ssse3", "SSE3 POPCNT"),
             ("-march=x86-64-v2 -mno-sse3", "POPCNT"),
-            ("-march=x86-64-v2 -mno-popcnt", "SSE3 SSSE3 SSE4_1 SSE4_2"),
+            (
+                "-march=x86-64-v2 -mno-popcnt",
+                "SSE3 SSSE3 SSE4_1 SSE4_2 CRC32",
+            ),
+            (
+                "-march=x86-64-v2 -mno-crc32",
+                "SSE3 SSSE3 SSE4_1 SSE4_2 POPCNT",
+            ),
             ("-mssse3 -march=x86-64-v2 -mno-sse3", "POPCNT"),
             ("-msse4.2 -march=x86-64-v2 -mno-sse4.1", "SSE3 SSSE3 POPCNT"),
             (
@@ -1590,12 +1974,13 @@ mod tests {
             ("-msse4.2 -mno-sse3 -mssse3", "SSE3 SSSE3"),
             ("-msse4 -mno-sse4", "SSE3 SSSE3"),
             ("-msse4 -mno-sse4.2", "SSE3 SSSE3 SSE4_1"),
-            ("-msse4.2 -mno-popcnt", "SSE3 SSSE3 SSE4_1 SSE4_2"),
-            ("-mno-popcnt -msse4.2", "SSE3 SSSE3 SSE4_1 SSE4_2"),
+            ("-msse4.2 -mno-popcnt", "SSE3 SSSE3 SSE4_1 SSE4_2 CRC32"),
+            ("-mno-popcnt -msse4.2", "SSE3 SSSE3 SSE4_1 SSE4_2 CRC32"),
             ("-mpopcnt -mno-sse4.2", "POPCNT"),
             ("-msse4.2 -mpopcnt -mno-sse4.2", "POPCNT"),
             ("-msse4.1 -mno-ssse3", "SSE3"),
             ("-mno-ssse3 -msse4.1", "SSE3 SSSE3 SSE4_1"),
+            ("-mcrc32", "CRC32"),
             ("-march=k8", ""),
             ("-march=nocona", "SSE3"),
             ("-march=core2", "SSE3 SSSE3"),
@@ -1605,12 +1990,14 @@ mod tests {
             ("-march=znver4", ALL),
             ("-march=x86-64-v4", ALL),
         ];
+        let levels = ["SSE3", "SSSE3", "SSE4_1", "SSE4_2", "POPCNT", "CRC32"];
         for (flags, gcc) in cases {
             let owned: Vec<String> = flags.split(' ').map(String::from).collect();
-            let got: Vec<String> = X86Isa::from_flags(&owned)
+            let got: Vec<&str> = X86Isa::from_flags(&owned)
                 .macros()
                 .iter()
-                .map(|m| m.trim_matches('_').to_string())
+                .map(|m| m.trim_matches('_'))
+                .filter(|m| levels.contains(m))
                 .collect();
             assert_eq!(got.join(" "), *gcc, "{flags}");
         }

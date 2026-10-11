@@ -133,9 +133,11 @@ Supported:
 Not yet implemented:
 - assembly peephole optimizations
 - the AVX families of intrinsics (`avxintrin.h` and later): `<immintrin.h>`
-  stops at SSE4.2, and `-march=x86-64-v3` claims no more than v2. The SSE
-  through SSE4.2 headers and a core `<arm_neon.h>` are bundled, written in C
-  over `vector_size` values
+  stops at SSE4.2 (with SHA-NI, RTM and CET's shadow stack), and
+  `-march=x86-64-v3` claims no more than v2. `-mavx2` and the rest of gcc's
+  ISA options are accepted and define gcc's macros, but c17 vectorizes
+  nothing with them. The SSE through SSE4.2 headers and a core
+  `<arm_neon.h>` are bundled, written in C over `vector_size` values
 
 Will not implement:
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested

@@ -1165,7 +1165,9 @@ impl X86_64CodeGen {
             // Only a `float` or `double` `floor`, `ceil`, `trunc` or `rint`
             // gets here; the rest are calls by now.
             Opcode::RoundToIntegral(how) => self.emit_fp_round_to_integral(insn, how, types),
-            Opcode::FMin | Opcode::FMax | Opcode::Fma => {
+            // Only where the function's ISA has a fused multiply-add.
+            Opcode::Fma => self.emit_fp_fma(insn, types),
+            Opcode::FMin | Opcode::FMax => {
                 unreachable!("{:?} is a call on x86-64 (see computes_in_place)", insn.op)
             }
 

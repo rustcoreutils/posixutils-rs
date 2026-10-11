@@ -112,3 +112,93 @@ fn cf_protection_object_note_and_landing_pads() {
         }
     }
 }
+
+/// gcc's `<cet.h>`: in assembly, `_CET_ENDBR` is `endbr64` under branch
+/// protection and nothing otherwise, and including it gives the object the
+/// property note for the `__CET__` level; in C it defines nothing. libffi's
+/// and guile's sources include it once `__CET__` is defined.
+#[test]
+fn cf_protection_cet_h_for_c_and_assembly() {
+    let dir = work_dir("cet_h");
+    let c = dir.path().join("c.c");
+    std::fs::write(
+        &c,
+        "#include <cet.h>\n#ifdef _CET_ENDBR\n#error not in C\n#endif\n\
+         int main(void) { return __CET__ == 3 ? 0 : 1; }\n",
+    )
+    .unwrap();
+    let exe = dir.path().join("c");
+    let (e, cs) = (exe.to_str().unwrap(), c.to_str().unwrap());
+    let run = run_c17(&["-fcf-protection", "-o", e, cs]);
+    assert!(run.success, "{}", run.stderr);
+    assert_eq!(Command::new(&exe).status().expect("run").code(), Some(0));
+
+    let s = dir.path().join("a.S");
+    std::fs::write(
+        &s,
+        "#include <cet.h>\n\t.text\n\t.globl f\nf:\n\t_CET_ENDBR\n\tret\n\
+         \t.section .note.GNU-stack,\"\",@progbits\n",
+    )
+    .unwrap();
+    for (level, feature) in [
+        ("full", Some("IBT, SHSTK")),
+        ("branch", Some("IBT")),
+        ("return", Some("SHSTK")),
+        ("none", None),
+    ] {
+        let flag = format!("-fcf-protection={level}");
+        let obj = dir.path().join("a.o");
+        let (o, src) = (obj.to_str().unwrap(), s.to_str().unwrap());
+        let run = run_c17(&[&flag, "-c", "-o", o, src]);
+        assert!(run.success, "{flag}: {}", run.stderr);
+        let notes = tool("readelf", &["-n", o]);
+        match feature {
+            Some(f) => assert!(
+                notes.contains(&format!("x86 feature: {f}\n")),
+                "{flag}:\n{notes}"
+            ),
+            None => assert!(!notes.contains("x86 feature"), "{flag}:\n{notes}"),
+        }
+        let dis = tool("objdump", &["-d", o]);
+        let branch = level == "full" || level == "branch";
+        assert_eq!(dis.contains("endbr64"), branch, "{flag}:\n{dis}");
+    }
+}
+
+/// `-mshstk` and the shadow-stack intrinsics of `<immintrin.h>`, as pcre2
+/// uses them once `__CET__` says the shadow stack may be on: `_get_ssp` is
+/// 0 where it is not enabled (RDSSP is a no-op there; INCSSP would fault).
+#[test]
+fn cf_protection_shstk_intrinsics() {
+    let dir = work_dir("shstk");
+    let c = dir.path().join("s.c");
+    std::fs::write(
+        &c,
+        "#include <immintrin.h>\n#ifndef __SHSTK__\n#error no __SHSTK__\n#endif\n\
+         int main(void) {\n\
+             unsigned long long ssp = _get_ssp();\n\
+             if (ssp != 0) _inc_ssp(0);\n\
+             (void)&_saveprevssp; (void)&_rstorssp; (void)&_wrssd; (void)&_wrssq;\n\
+             (void)&_wrussd; (void)&_wrussq; (void)&_setssbsy; (void)&_clrssbsy;\n\
+             return 0;\n}\n",
+    )
+    .unwrap();
+    let cs = c.to_str().unwrap();
+    for opt in ["-O0", "-O2"] {
+        let exe = dir.path().join("s");
+        let e = exe.to_str().unwrap();
+        let run = run_c17(&[opt, "-mshstk", "-fcf-protection", "-o", e, cs]);
+        assert!(run.success, "{opt}: {}", run.stderr);
+        let status = Command::new(&exe).status().expect("run");
+        assert_eq!(status.code(), Some(0), "{opt}");
+        let obj = dir.path().join("s.o");
+        let o = obj.to_str().unwrap();
+        let run = run_c17(&[opt, "-mshstk", "-c", "-o", o, cs]);
+        assert!(run.success, "{opt}: {}", run.stderr);
+        let dis = tool("objdump", &["-d", o]);
+        assert!(
+            dis.contains("rdsspq") && dis.contains("incsspq"),
+            "{opt}:\n{dis}"
+        );
+    }
+}

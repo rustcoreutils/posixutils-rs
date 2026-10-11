@@ -28,8 +28,8 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         ("__SSE2__", Some("1")),
         ("__SSE_MATH__", Some("1")),
         ("__SSE2_MATH__", Some("1")),
-        // MMX is implied by SSE
-        ("__MMX__", Some("1")),
+        // `__MMX__` and `__FXSR__` are the ISA's, which `-mno-mmx` and
+        // `-mno-fxsr` can turn off: `target::X86Isa::macros`.
         // The `__sync_*` family is implemented, so the macro that guards it is
         // a true statement about this compiler and is defined. It says the
         // compare-and-swap builtins exist at 1, 2, 4 and 8 bytes, which is

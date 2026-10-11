@@ -790,6 +790,7 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_TGMATH => Some(self.parse_tgmath(token_pos)),
             crate::kw::BUILTIN_UNWIND_INIT => Some((|| {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
@@ -2144,6 +2145,9 @@ impl Parser<'_> {
         if let Some(result) = self.parse_cpu_builtin(name_id, token_pos) {
             return Some(result);
         }
+        if let Some(result) = self.parse_machine_builtin(name_id, token_pos) {
+            return Some(result);
+        }
         if let Some(result) = self.parse_choose_expr(name_id) {
             return Some(result);
         }
@@ -2480,6 +2484,119 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_LDEXPL
                 | crate::kw::BUILTIN_SQRTF128
                 | crate::kw::BUILTIN_FMAF128
+                | crate::kw::BUILTIN_ROUNDEVENL
+                | crate::kw::BUILTIN_ROUNDEVENF64X
+                | crate::kw::BUILTIN_ROUNDEVENF128
+                | crate::kw::BUILTIN_LRINT
+                | crate::kw::BUILTIN_LRINTF
+                | crate::kw::BUILTIN_LRINTL
+                | crate::kw::BUILTIN_LRINTF32
+                | crate::kw::BUILTIN_LRINTF64
+                | crate::kw::BUILTIN_LRINTF32X
+                | crate::kw::BUILTIN_LRINTF64X
+                | crate::kw::BUILTIN_LRINTF128
+                | crate::kw::BUILTIN_LLRINT
+                | crate::kw::BUILTIN_LLRINTF
+                | crate::kw::BUILTIN_LLRINTL
+                | crate::kw::BUILTIN_LLRINTF32
+                | crate::kw::BUILTIN_LLRINTF64
+                | crate::kw::BUILTIN_LLRINTF32X
+                | crate::kw::BUILTIN_LLRINTF64X
+                | crate::kw::BUILTIN_LLRINTF128
+                | crate::kw::BUILTIN_LROUND
+                | crate::kw::BUILTIN_LROUNDF
+                | crate::kw::BUILTIN_LROUNDL
+                | crate::kw::BUILTIN_LROUNDF32
+                | crate::kw::BUILTIN_LROUNDF64
+                | crate::kw::BUILTIN_LROUNDF32X
+                | crate::kw::BUILTIN_LROUNDF64X
+                | crate::kw::BUILTIN_LROUNDF128
+                | crate::kw::BUILTIN_LLROUND
+                | crate::kw::BUILTIN_LLROUNDF
+                | crate::kw::BUILTIN_LLROUNDL
+                | crate::kw::BUILTIN_LLROUNDF32
+                | crate::kw::BUILTIN_LLROUNDF64
+                | crate::kw::BUILTIN_LLROUNDF32X
+                | crate::kw::BUILTIN_LLROUNDF64X
+                | crate::kw::BUILTIN_LLROUNDF128
+                | crate::kw::BUILTIN_SCALBN
+                | crate::kw::BUILTIN_SCALBNF
+                | crate::kw::BUILTIN_SCALBNL
+                | crate::kw::BUILTIN_SCALBNF32
+                | crate::kw::BUILTIN_SCALBNF64
+                | crate::kw::BUILTIN_SCALBNF32X
+                | crate::kw::BUILTIN_SCALBNF64X
+                | crate::kw::BUILTIN_SCALBNF128
+                | crate::kw::BUILTIN_SCALBLN
+                | crate::kw::BUILTIN_SCALBLNF
+                | crate::kw::BUILTIN_SCALBLNL
+                | crate::kw::BUILTIN_SCALBLNF32
+                | crate::kw::BUILTIN_SCALBLNF64
+                | crate::kw::BUILTIN_SCALBLNF32X
+                | crate::kw::BUILTIN_SCALBLNF64X
+                | crate::kw::BUILTIN_SCALBLNF128
+                | crate::kw::BUILTIN_ROUNDF64X
+                | crate::kw::BUILTIN_ROUNDF128
+                | crate::kw::BUILTIN_RINTF64X
+                | crate::kw::BUILTIN_RINTF128
+                | crate::kw::BUILTIN_NEARBYINTF64X
+                | crate::kw::BUILTIN_NEARBYINTF128
+                | crate::kw::BUILTIN_TRUNCF64X
+                | crate::kw::BUILTIN_TRUNCF128
+                | crate::kw::BUILTIN_FLOORF64X
+                | crate::kw::BUILTIN_FLOORF128
+                | crate::kw::BUILTIN_CEILF64X
+                | crate::kw::BUILTIN_CEILF128
+                | crate::kw::BUILTIN_LOGBF32
+                | crate::kw::BUILTIN_LOGBF64
+                | crate::kw::BUILTIN_LOGBF32X
+                | crate::kw::BUILTIN_LOGBF64X
+                | crate::kw::BUILTIN_LOGBF128
+                | crate::kw::BUILTIN_CBRTF32
+                | crate::kw::BUILTIN_CBRTF64
+                | crate::kw::BUILTIN_CBRTF32X
+                | crate::kw::BUILTIN_CBRTF64X
+                | crate::kw::BUILTIN_CBRTF128
+                | crate::kw::BUILTIN_FMINF64X
+                | crate::kw::BUILTIN_FMINF128
+                | crate::kw::BUILTIN_FMAXF64X
+                | crate::kw::BUILTIN_FMAXF128
+                | crate::kw::BUILTIN_FMAF64X
+                | crate::kw::BUILTIN_ILOGBF32
+                | crate::kw::BUILTIN_ILOGBF64
+                | crate::kw::BUILTIN_ILOGBF32X
+                | crate::kw::BUILTIN_ILOGBF64X
+                | crate::kw::BUILTIN_ILOGBF128
+                | crate::kw::BUILTIN_LDEXPF32
+                | crate::kw::BUILTIN_LDEXPF64
+                | crate::kw::BUILTIN_LDEXPF32X
+                | crate::kw::BUILTIN_LDEXPF64X
+                | crate::kw::BUILTIN_LDEXPF128
+                | crate::kw::BUILTIN_FREXPF32
+                | crate::kw::BUILTIN_FREXPF64
+                | crate::kw::BUILTIN_FREXPF32X
+                | crate::kw::BUILTIN_FREXPF64X
+                | crate::kw::BUILTIN_FREXPF128
+                | crate::kw::BUILTIN_MODFF32
+                | crate::kw::BUILTIN_MODFF64
+                | crate::kw::BUILTIN_MODFF32X
+                | crate::kw::BUILTIN_MODFF64X
+                | crate::kw::BUILTIN_MODFF128
+                | crate::kw::BUILTIN_NEXTAFTERF32
+                | crate::kw::BUILTIN_NEXTAFTERF64
+                | crate::kw::BUILTIN_NEXTAFTERF32X
+                | crate::kw::BUILTIN_NEXTAFTERF64X
+                | crate::kw::BUILTIN_NEXTAFTERF128
+                | crate::kw::BUILTIN_FDIMF32
+                | crate::kw::BUILTIN_FDIMF64
+                | crate::kw::BUILTIN_FDIMF32X
+                | crate::kw::BUILTIN_FDIMF64X
+                | crate::kw::BUILTIN_FDIMF128
+                | crate::kw::BUILTIN_HYPOTF32
+                | crate::kw::BUILTIN_HYPOTF64
+                | crate::kw::BUILTIN_HYPOTF32X
+                | crate::kw::BUILTIN_HYPOTF64X
+                | crate::kw::BUILTIN_HYPOTF128
                 | crate::kw::BUILTIN_STRCASECMP
                 | crate::kw::BUILTIN_STRNCASECMP
                 | crate::kw::BUILTIN_STRDUP

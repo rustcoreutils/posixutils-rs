@@ -18,7 +18,7 @@ use crate::common::{compile_and_run, compile_and_run_aarch64_with};
 
 /// Run `code` at -O0 and -O2 on the host and on aarch64, with `opts` and,
 /// when `libm` is set, `-lm`.
-fn run_everywhere(name: &str, code: &str, opts: &[&str], libm: bool) {
+pub(super) fn run_everywhere(name: &str, code: &str, opts: &[&str], libm: bool) {
     let libs: &[&str] = if libm { &["-lm"] } else { &[] };
     for opt in ["-O0", "-O2"] {
         let mut args: Vec<String> = vec![opt.to_string()];
@@ -559,6 +559,38 @@ int main(void)
 }
 "#;
     run_everywhere("libm_values", code, &[], true);
+    // Again where `roundsd` computes the roundings (SSE4.1) and `vfmadd`
+    // the fused multiply-adds (FMA), on a host that has them.
+    if cfg!(target_arch = "x86_64") {
+        for (flag, feature) in [("-msse4.1", "sse4.1"), ("-mfma", "fma")] {
+            if !host_has(feature) {
+                continue;
+            }
+            for opt in ["-O0", "-O2"] {
+                let flags: Vec<String> = [opt, flag, "-lm"].map(String::from).to_vec();
+                let rc = compile_and_run(&format!("libm_values{flag}"), code, &flags);
+                assert_eq!(rc, 0, "{flag} {opt}");
+            }
+        }
+    }
+}
+
+/// Whether this machine has the x86-64 extension `feature`, by the name
+/// `is_x86_feature_detected!` knows it.
+pub(super) fn host_has(feature: &str) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match feature {
+            "sse4.1" => std::arch::is_x86_feature_detected!("sse4.1"),
+            "fma" => std::arch::is_x86_feature_detected!("fma"),
+            _ => false,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = feature;
+        false
+    }
 }
 
 /// Constant libm calls in static initializers, linked without -lm: what they

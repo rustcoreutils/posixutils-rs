@@ -1816,17 +1816,14 @@ fn test_target_clones_become_versions_and_a_resolver() {
             .find(|f| f.name == name)
             .unwrap_or_else(|| panic!("no {name}"))
     };
-    let sse42 = X86Isa {
-        simd: X86Simd::Sse42,
-        popcnt: true,
-    };
+    let sse42 = X86Isa::from_flags(&["-msse4.2".to_string()]);
     assert!(func("sum.default").is_static);
     assert_eq!(func("sum.default").isa, X86Isa::default());
     assert!(func("sum.sse4_2").is_static);
     assert_eq!(func("sum.sse4_2").isa, sse42);
     assert!(!func("sum.resolver").is_static);
     assert!(func("sum.resolver").symbol_attrs.weak);
-    assert_eq!(func("t").isa.simd, X86Simd::Ssse3);
+    assert_eq!(func("t").isa.simd(), X86Simd::Ssse3);
     assert_eq!(func("plain").isa, X86Isa::default());
     assert!(module.functions.iter().all(|f| f.name != "sum"));
     let alias = module.aliases.iter().find(|a| a.name == "sum").unwrap();

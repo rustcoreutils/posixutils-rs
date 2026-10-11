@@ -17,6 +17,7 @@ use crate::arch::mapping::{
 use crate::float::{FpFormat, IntegralRounding};
 use crate::ir::{Instruction, Opcode};
 use crate::rtlib::RtlibNames;
+use crate::target::{X86Isa, X86Simd};
 use crate::types::TypeKind;
 
 /// x86-64 instruction mapper.
@@ -53,19 +54,34 @@ impl ArchMapper for X86_64Mapper {
     /// The baseline has no `roundsd` (SSE4.1), so the roundings are gcc's
     /// SSE2 sequences, for `float` and `double`: `floor`, `ceil` and `trunc`
     /// through a truncating conversion, `rint` by adding and subtracting
-    /// 2^52. `round` has no such sequence and gcc calls it; nor does
-    /// `nearbyint`, which must not raise *inexact* where the `rint` one does.
+    /// 2^52. `round` has no such sequence and gcc calls it; nor do
+    /// `nearbyint`, which must not raise *inexact* where the `rint` one
+    /// does, and `roundeven` -- but for a function with SSE4.1, where
+    /// `roundsd` does all but `round`.
     ///
-    /// `fmin`, `fmax` and `fma` are calls too, as in gcc: the baseline has no
-    /// FMA, and `minsd` is not `fmin` -- it answers its second operand for a
-    /// NaN where C asks for the number.
-    fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool {
+    /// `fmin` and `fmax` are calls too, as in gcc: `minsd` is not `fmin` --
+    /// it answers its second operand for a NaN where C asks for the number.
+    /// So is `fma`, unless the function's ISA has a fused multiply-add
+    /// (FMA, FMA4 or AVX512F), as gcc does.
+    fn computes_in_place(&self, op: Opcode, fmt: FpFormat, isa: X86Isa) -> bool {
         let sse = matches!(fmt, FpFormat::Binary32 | FpFormat::Binary64);
         match op {
             Opcode::Sqrt => sse || fmt == FpFormat::X87Extended,
+            // SSE4.1's `roundsd` does every rounding but `round`'s ties away
+            // from zero, as gcc has it.
             Opcode::RoundToIntegral(how) => {
-                sse && !matches!(how, IntegralRounding::Round | IntegralRounding::NearbyInt)
+                sse && match how {
+                    IntegralRounding::Round => false,
+                    IntegralRounding::NearbyInt | IntegralRounding::RoundEven => {
+                        isa.simd() >= X86Simd::Sse41
+                    }
+                    IntegralRounding::Floor
+                    | IntegralRounding::Ceil
+                    | IntegralRounding::Trunc
+                    | IntegralRounding::Rint => true,
+                }
             }
+            Opcode::Fma => sse && isa.fused_multiply_add().is_some(),
             _ => false,
         }
     }

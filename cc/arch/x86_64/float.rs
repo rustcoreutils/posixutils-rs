@@ -15,6 +15,7 @@ use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::{FloatVal, IntegralRounding};
 use crate::ir::{FloatCmp, Instruction, NanCompare, Opcode, PseudoId};
+use crate::target::{FusedMultiplyAdd, X86Simd};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 /// What `emit_fp_sign_bit_op` does to the sign bit.
@@ -446,6 +447,167 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Where `p` can be read in place as an instruction's XMM-or-memory
+    /// operand: a register, or a frame slot. A constant, a general register
+    /// or a global cannot.
+    fn xmm_operand_of(&mut self, p: PseudoId) -> Option<XmmOperand> {
+        match self.get_location(p) {
+            Loc::Xmm(x) => Some(XmmOperand::Reg(x)),
+            Loc::Stack(offset) => Some(XmmOperand::Mem(self.stack_mem(offset))),
+            Loc::IncomingArg(offset) => Some(XmmOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset,
+            })),
+            _ => None,
+        }
+    }
+
+    /// Emit `Fma` of a `float` or `double`, `a * b + c` rounded once, as the
+    /// function's fused multiply-add ([`crate::target::X86Isa`]): FMA's
+    /// `vfmadd213`/`vfmadd231`, or FMA4's `vfmadd`.
+    ///
+    /// Each takes two registers and one register-or-memory operand, and
+    /// only xmm14 and xmm15 are free, so one of the three is read where it
+    /// lies: `c` as the addend, or else either factor, since the product
+    /// commutes. When none of them lies in a register or a frame slot --
+    /// all constants -- the result's own place holds `c` first: none of the
+    /// three can be in it, as none is in a register or a slot.
+    pub(super) fn emit_fp_fma(&mut self, insn: &Instruction, types: &TypeTable) {
+        let (&[a, b, c], Some(target)) = (insn.src.as_slice(), insn.target) else {
+            return;
+        };
+        let size = self.fp_format(insn.typ, insn.size, types);
+        let form = self
+            .base
+            .isa
+            .fused_multiply_add()
+            .expect("an Fma reaches codegen only with a fused multiply-add");
+        let dst_loc = self.get_location(target);
+        let (x, y) = (XmmReg::Xmm15, XmmReg::Xmm14);
+        if let Some(addend) = self.xmm_operand_of(c) {
+            // x = a * y + addend.
+            self.emit_fp_move(a, x, size);
+            self.emit_fp_move(b, y, size);
+            self.push_lir(match form {
+                FusedMultiplyAdd::Fma3 => X86Inst::FmaAddend {
+                    size,
+                    addend,
+                    mul: y,
+                    dst: x,
+                },
+                FusedMultiplyAdd::Fma4 => X86Inst::Fma4 {
+                    size,
+                    add: addend,
+                    mul: XmmOperand::Reg(y),
+                    a: x,
+                    dst: x,
+                },
+            });
+        } else if let Some((factor, other)) = [(a, b), (b, a)]
+            .into_iter()
+            .find_map(|(f, o)| self.xmm_operand_of(f).map(|op| (op, o)))
+        {
+            // x = y * factor + x, with x holding `c`.
+            self.emit_fp_move(c, x, size);
+            self.emit_fp_move(other, y, size);
+            self.push_lir(match form {
+                FusedMultiplyAdd::Fma3 => X86Inst::FmaAccumulate {
+                    size,
+                    mul: factor,
+                    acc_mul: y,
+                    acc: x,
+                },
+                FusedMultiplyAdd::Fma4 => X86Inst::Fma4 {
+                    size,
+                    add: XmmOperand::Reg(x),
+                    mul: factor,
+                    a: y,
+                    dst: x,
+                },
+            });
+        } else {
+            let addend = match dst_loc {
+                Loc::Xmm(d) => {
+                    self.emit_fp_move(c, d, size);
+                    XmmOperand::Reg(d)
+                }
+                _ => {
+                    self.emit_fp_move(c, x, size);
+                    self.emit_fp_move_from_xmm(x, &dst_loc, size);
+                    self.xmm_operand_of(target)
+                        .expect("a floating result lives in a register or a frame slot")
+                }
+            };
+            self.emit_fp_move(a, x, size);
+            self.emit_fp_move(b, y, size);
+            self.push_lir(match form {
+                FusedMultiplyAdd::Fma3 => X86Inst::FmaAddend {
+                    size,
+                    addend,
+                    mul: y,
+                    dst: x,
+                },
+                FusedMultiplyAdd::Fma4 => X86Inst::Fma4 {
+                    size,
+                    add: addend,
+                    mul: XmmOperand::Reg(y),
+                    a: x,
+                    dst: x,
+                },
+            });
+        }
+        if !matches!(&dst_loc, Loc::Xmm(d) if *d == x) {
+            self.emit_fp_move_from_xmm(x, &dst_loc, size);
+        }
+    }
+
+    /// `RoundToIntegral` in a function with SSE4.1: one `roundss`/`roundsd`,
+    /// whose immediate names the direction -- or MXCSR's, for `rint` and
+    /// `nearbyint` -- and, but for `rint`, suppresses *inexact*. gcc's
+    /// immediates; `round`, whose ties go away from zero, is no direction
+    /// the instruction has, and stays a call.
+    fn emit_sse41_round(
+        &mut self,
+        src: PseudoId,
+        target: PseudoId,
+        how: IntegralRounding,
+        size: FpSize,
+    ) {
+        const SUPPRESS_INEXACT: u8 = 8;
+        let imm = match how {
+            IntegralRounding::RoundEven => SUPPRESS_INEXACT,
+            IntegralRounding::Floor => SUPPRESS_INEXACT | 1,
+            IntegralRounding::Ceil => SUPPRESS_INEXACT | 2,
+            IntegralRounding::Trunc => SUPPRESS_INEXACT | 3,
+            IntegralRounding::Rint => 4,
+            IntegralRounding::NearbyInt => SUPPRESS_INEXACT | 4,
+            IntegralRounding::Round => {
+                unreachable!("round is a call on x86-64 (see computes_in_place)")
+            }
+        };
+        let dst_loc = self.get_location(target);
+        let dst = match &dst_loc {
+            Loc::Xmm(x) => *x,
+            _ => XmmReg::Xmm15,
+        };
+        let src = match self.xmm_operand_of(src) {
+            Some(op) => op,
+            None => {
+                self.emit_fp_move(src, XmmReg::Xmm14, size);
+                XmmOperand::Reg(XmmReg::Xmm14)
+            }
+        };
+        self.push_lir(X86Inst::RoundFp {
+            size,
+            imm,
+            src,
+            dst,
+        });
+        if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst) {
+            self.emit_fp_move_from_xmm(dst, &dst_loc, size);
+        }
+    }
+
     /// Emit `RoundToIntegral` of a `float` or `double` -- `floor`, `ceil`,
     /// `trunc` or `rint` -- with SSE2 alone: gcc's sequences at the x86-64
     /// baseline, which has no `roundsd`.
@@ -485,6 +647,10 @@ impl X86_64CodeGen {
             return;
         };
         let fp_size = self.fp_format(insn.typ, insn.size, types);
+        if self.base.isa.simd() >= X86Simd::Sse41 {
+            self.emit_sse41_round(src, target, how, fp_size);
+            return;
+        }
         let size = Self::fp_bits_size(fp_size);
         // The stored significand's width, and the biased exponent of the
         // format's first power of two with no fraction bits.
@@ -595,8 +761,8 @@ impl X86_64CodeGen {
                 });
                 self.emit_fp_integral_step(how, fp_size, x, int);
             }
-            IntegralRounding::Round | IntegralRounding::NearbyInt => {
-                unreachable!("{how:?} is a call on x86-64 (see computes_in_place)")
+            IntegralRounding::Round | IntegralRounding::NearbyInt | IntegralRounding::RoundEven => {
+                unreachable!("{how:?} is a call on x86-64 without SSE4.1 (see computes_in_place)")
             }
         }
 

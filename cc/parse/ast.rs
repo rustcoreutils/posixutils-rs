@@ -528,6 +528,23 @@ impl BinaryOp {
     }
 }
 
+/// The instruction a [`ExprKind::MachineBuiltin`] is, as gcc 13 emits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineOp {
+    /// `__builtin_ia32_rdtsc()`: `rdtsc`, the time-stamp counter as an
+    /// `unsigned long long`.
+    Rdtsc,
+    /// `__builtin_ia32_rdtscp(unsigned *aux)`: `rdtscp`, the counter, with
+    /// `IA32_TSC_AUX` stored through `aux`.
+    Rdtscp,
+    /// `__builtin_ia32_cvtpd2ps(v2df)`: `cvtpd2ps`, both `double` lanes
+    /// rounded to `float` in the current direction, the upper two lanes 0.
+    Cvtpd2ps,
+    /// `__builtin_thread_pointer()`: the TLS ABI's thread pointer, `%fs:0`
+    /// on x86-64 and `tpidr_el0` on aarch64.
+    ThreadPointer,
+}
+
 /// Which classification question a [`ExprKind::FpTest`] asks.
 ///
 /// The variants are named for the builtins they answer: `__builtin_isnan`,
@@ -1277,6 +1294,14 @@ pub enum ExprKind {
     /// the current function's frame, so a scan of the stack sees what the
     /// callers held in them -- a conservative collector's register flush.
     UnwindInit,
+
+    /// A builtin that is one machine instruction: `__builtin_ia32_rdtsc()`
+    /// and the rest of [`MachineOp`]. `args` have been checked and
+    /// converted to the builtin's parameter types.
+    MachineBuiltin {
+        op: MachineOp,
+        args: Vec<Expr>,
+    },
 
     /// __builtin_complex(real, imag) — construct complex value from two reals
     /// `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` and
@@ -2661,7 +2686,8 @@ impl Expr {
             K::Call { func, args, .. } => std::iter::once(&**func).chain(args).collect(),
             K::Comma(exprs)
             | K::SizeofType(_, exprs)
-            | K::InlineLibraryCall { args: exprs, .. } => exprs.iter().collect(),
+            | K::InlineLibraryCall { args: exprs, .. }
+            | K::MachineBuiltin { args: exprs, .. } => exprs.iter().collect(),
             K::FpClassify { classes, arg } => {
                 classes.iter().chain(std::iter::once(&**arg)).collect()
             }

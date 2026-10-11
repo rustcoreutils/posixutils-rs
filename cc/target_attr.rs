@@ -10,11 +10,10 @@
 // `__attribute__((target_clones("...", ...)))`: what each asks of a
 // function's ISA, and what in them c17 refuses or does not support.
 //
-// c17 models the x86-64 SIMD extensions up to SSE4.2 and POPCNT
-// (`target::X86Isa`) and nothing above: an ISA gcc knows beyond that is
-// warned about by name and ignored, so the function is compiled at the
-// translation unit's ISA. Every name gcc 13 rejects is an error here too,
-// in gcc's words.
+// Every extension gcc 13 names is one of `target::X86Isa`'s, and turns on
+// or off for the function what the `-m` option of its name does for the
+// translation unit. Every name gcc 13 rejects is an error here too, in
+// gcc's words.
 //
 
 use crate::target::{isa_edit, Arch, IsaRequest, IsaSet};
@@ -97,105 +96,9 @@ const X86_CPUS: &[&str] = &[
     "native",
 ];
 
-/// The x86-64 baseline: extensions every x86-64 CPU has, so asking for one
-/// asks for nothing.
-const X86_BASELINE: &[&str] = &["mmx", "sse", "sse2", "fxsr"];
-
-/// Every other ISA name gcc 13's `target` attribute accepts and c17 does not
-/// model: each was probed with gcc. c17's SIMD ceiling is SSE4.2, so all of
-/// these are beyond what it generates code for.
-const X86_UNMODELLED_ISAS: &[&str] = &[
-    "3dnow",
-    "3dnowa",
-    "abm",
-    "adx",
-    "aes",
-    "amx-bf16",
-    "amx-complex",
-    "amx-fp16",
-    "amx-int8",
-    "amx-tile",
-    "avx",
-    "avx2",
-    "avx5124fmaps",
-    "avx5124vnniw",
-    "avx512bf16",
-    "avx512bitalg",
-    "avx512bw",
-    "avx512cd",
-    "avx512dq",
-    "avx512er",
-    "avx512f",
-    "avx512fp16",
-    "avx512ifma",
-    "avx512pf",
-    "avx512vbmi",
-    "avx512vbmi2",
-    "avx512vl",
-    "avx512vnni",
-    "avx512vp2intersect",
-    "avx512vpopcntdq",
-    "avxifma",
-    "avxneconvert",
-    "avxvnni",
-    "avxvnniint8",
-    "bmi",
-    "bmi2",
-    "cldemote",
-    "clflushopt",
-    "clwb",
-    "clzero",
-    "cmpccxadd",
-    "crc32",
-    "cx16",
-    "enqcmd",
-    "f16c",
-    "fma",
-    "fma4",
-    "fsgsbase",
-    "gfni",
-    "hle",
-    "hreset",
-    "kl",
-    "lwp",
-    "lzcnt",
-    "movbe",
-    "movdir64b",
-    "movdiri",
-    "mwait",
-    "mwaitx",
-    "pclmul",
-    "pconfig",
-    "pku",
-    "prefetchi",
-    "prefetchwt1",
-    "prfchw",
-    "ptwrite",
-    "raoint",
-    "rdpid",
-    "rdrnd",
-    "rdseed",
-    "rtm",
-    "sahf",
-    "serialize",
-    "sgx",
-    "sha",
-    "shstk",
-    "sse4a",
-    "tbm",
-    "tsxldtrk",
-    "uintr",
-    "vaes",
-    "vpclmulqdq",
-    "waitpkg",
-    "wbnoinvd",
-    "widekl",
-    "xop",
-    "xsave",
-    "xsavec",
-    "xsaveopt",
-    "xsaves",
-];
+/// The x86-64 baseline c17 cannot do without: asking for SSE or SSE2 asks
+/// for nothing, and turning one off is beyond it.
+const X86_BASELINE: &[&str] = &["sse", "sse2"];
 
 /// gcc 13's code-generation switches that `target` accepts, each with a
 /// `no-` form: none is an ISA, and c17 implements none of them.
@@ -222,8 +125,6 @@ pub enum TargetIssue {
     /// `fpmath=` or `prefer-vector-width=` with a value gcc does not know:
     /// an error.
     BadOptionValue(String),
-    /// An ISA beyond what c17 models: warned about by name and ignored.
-    BeyondCeiling(String),
     /// A baseline ISA turned off, or a code-generation switch: c17 cannot do
     /// either, and says so.
     Unsupported(String),
@@ -234,17 +135,13 @@ pub enum TargetIssue {
 impl TargetIssue {
     /// Whether gcc refuses the program for it.
     pub fn is_error(&self) -> bool {
-        !matches!(
-            self,
-            Self::Empty | Self::BeyondCeiling(_) | Self::Unsupported(_)
-        )
+        !matches!(self, Self::Empty | Self::Unsupported(_))
     }
 }
 
 /// What one x86-64 `target` item asks for.
 enum X86Item {
-    /// Nothing c17 acts on: `tune=`, `fpmath=sse`, a baseline ISA, a
-    /// disabled ISA c17 never generates.
+    /// Nothing c17 acts on: `tune=`, `fpmath=sse`, SSE or SSE2.
     Nothing,
     Arch(IsaSet),
     Edit(crate::target::IsaEdit),
@@ -301,14 +198,6 @@ fn x86_item(item: &str) -> Result<X86Item, TargetIssue> {
             Ok(X86Item::Nothing)
         };
     }
-    if X86_UNMODELLED_ISAS.contains(&name) {
-        // Turning off what c17 never generates asks for what is already so.
-        return if negated {
-            Ok(X86Item::Nothing)
-        } else {
-            Err(TargetIssue::BeyondCeiling(item.to_string()))
-        };
-    }
     if X86_SWITCHES.contains(&name) {
         return Err(TargetIssue::Unsupported(item.to_string()));
     }
@@ -355,10 +244,8 @@ pub fn parse_target(text: &str, arch: Arch) -> (IsaRequest, Vec<TargetIssue>) {
         match arch {
             Arch::X86_64 => match x86_item(item) {
                 Ok(X86Item::Nothing) => {}
-                Ok(X86Item::Arch(set)) => {
-                    request.arch = Some(request.arch.map_or(set, |a| a.with(set)))
-                }
-                Ok(X86Item::Edit(edit)) => request.edits.push(edit),
+                Ok(X86Item::Arch(set)) => request.push_arch(set),
+                Ok(X86Item::Edit(edit)) => request.push_edit(edit),
                 Err(issue) => issues.push(issue),
             },
             Arch::Aarch64 => {
@@ -465,7 +352,7 @@ fn x86_clone(item: &str) -> Result<CloneVersion, ClonesIssue> {
     let known_cpu = item
         .strip_prefix("arch=")
         .is_some_and(|cpu| X86_CPUS.contains(&cpu));
-    if known_cpu || item == "sse4" || X86_UNMODELLED_ISAS.contains(&item) {
+    if known_cpu || crate::target::is_isa_name(item) {
         return Err(ClonesIssue::Dropped(item.to_string()));
     }
     Err(ClonesIssue::Unknown(item.to_string()))
@@ -531,24 +418,33 @@ mod tests {
 
     #[test]
     fn target_strings_edit_the_unit_isa() {
-        assert_eq!(isa("sse4.1").simd, X86Simd::Sse41);
-        assert!(!isa("sse4.1").popcnt);
+        let popcnt = |i: X86Isa| i.macros().contains(&"__POPCNT__");
+        assert_eq!(isa("sse4.1").simd(), X86Simd::Sse41);
+        assert!(!popcnt(isa("sse4.1")));
         assert_eq!(isa("sse4.2"), isa("arch=x86-64-v2"));
-        assert!(isa("sse4.2").popcnt);
-        assert!(!isa("sse4.2,no-popcnt").popcnt);
-        assert_eq!(isa("sse4.1,popcnt").simd, X86Simd::Sse41);
-        assert!(isa("sse4.1,popcnt").popcnt);
+        assert!(popcnt(isa("sse4.2")));
+        assert!(!popcnt(isa("sse4.2,no-popcnt")));
+        assert_eq!(isa("sse4.1,popcnt").simd(), X86Simd::Sse41);
+        assert!(popcnt(isa("sse4.1,popcnt")));
         assert_eq!(isa("tune=generic,fpmath=sse"), X86Isa::default());
+        // Every extension the `-m` options name, the same way.
+        for (text, flags) in [
+            ("avx2", &["-mavx2"][..]),
+            ("fma,no-avx2", &["-mfma", "-mno-avx2"][..]),
+            ("rtm,shstk,sha", &["-mrtm", "-mshstk", "-msha"][..]),
+            ("no-mmx", &["-mno-mmx"][..]),
+            ("amx-int8", &["-mamx-int8"][..]),
+        ] {
+            let owned: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            assert_eq!(isa(text), X86Isa::from_flags(&owned), "{text}");
+        }
         // A `no-` lowers a unit compiled higher.
-        let unit = X86Isa {
-            simd: X86Simd::Sse42,
-            popcnt: true,
-        };
+        let unit = X86Isa::from_flags(&["-msse4.2".to_string()]);
         let (no42, _) = parse_target("no-sse4.2", Arch::X86_64);
-        assert_eq!(unit.with_request(&no42).simd, X86Simd::Sse41);
+        assert_eq!(unit.with_request(&no42).simd(), X86Simd::Sse41);
         let (no3, _) = parse_target("no-sse3", Arch::X86_64);
-        assert_eq!(unit.with_request(&no3).simd, X86Simd::Sse2);
-        assert!(unit.with_request(&no3).popcnt);
+        assert_eq!(unit.with_request(&no3).simd(), X86Simd::Sse2);
+        assert!(popcnt(unit.with_request(&no3)));
     }
 
     #[test]
@@ -567,11 +463,13 @@ mod tests {
                 value: "foo".into()
             }]
         );
-        assert_eq!(
-            issues("avx2,sse4.1"),
-            vec![TargetIssue::BeyondCeiling("avx2".into())]
-        );
+        assert!(issues("avx2,sse4.1").is_empty());
         assert!(issues("no-avx2").is_empty());
+        assert!(issues("no-mmx,no-fxsr,amx-tile,avx512vp2intersect").is_empty());
+        assert_eq!(
+            issues("avx10.1"),
+            vec![TargetIssue::Unknown("avx10.1".into())]
+        );
         assert_eq!(
             issues("no-sse2"),
             vec![TargetIssue::Unsupported("no-sse2".into())]
@@ -635,7 +533,7 @@ mod tests {
         assert_eq!(v.suffix, "arch_x86_64_v2");
         assert_eq!(v.feature, "x86-64-v2");
         assert_eq!(
-            X86Isa::default().with_request(&v.request).simd,
+            X86Isa::default().with_request(&v.request).simd(),
             X86Simd::Sse42
         );
     }

@@ -1578,6 +1578,8 @@ impl EmitAsm for Aarch64Inst {
                     IntegralRounding::Round => "frinta",
                     IntegralRounding::Rint => "frintx",
                     IntegralRounding::NearbyInt => "frinti",
+                    // To nearest with ties to even, whatever FPCR says.
+                    IntegralRounding::RoundEven => "frintn",
                 };
                 let _ = writeln!(
                     out,
@@ -2421,6 +2423,7 @@ mod tests {
             (Round, "frinta d1, d2"),
             (Rint, "frintx d1, d2"),
             (NearbyInt, "frinti d1, d2"),
+            (RoundEven, "frintn d1, d2"),
         ] {
             let inst = Aarch64Inst::Frint {
                 how,

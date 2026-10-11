@@ -18,6 +18,7 @@ mod asm_input;
 mod aux_info;
 mod f_options;
 mod gcc_flags;
+mod isa_flags;
 mod link_options;
 mod linker_input;
 mod prefix_map;

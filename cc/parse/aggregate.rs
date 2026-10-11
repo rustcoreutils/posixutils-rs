@@ -496,7 +496,8 @@ impl Parser<'_> {
         // `packed`, for the same reason: gcc accepts it at any of them.
         let mut is_transparent = early_attrs.has_transparent_union();
         // Track struct-level aligned attribute (max across all positions)
-        let mut struct_align: Option<u32> = early_attrs.get_alignment();
+        let mut struct_align: Option<u32> =
+            early_attrs.get_alignment(self.types.biggest_alignment());
         // `scalar_storage_order`, accepted at the same three positions; the
         // last one written decides, as in gcc.
         let mut storage_order = early_attrs.storage_order(specifier_pos);
@@ -515,7 +516,7 @@ impl Parser<'_> {
         }
         is_packed = is_packed || pre_attrs.has_packed();
         is_transparent = is_transparent || pre_attrs.has_transparent_union();
-        if let Some(a) = pre_attrs.get_alignment() {
+        if let Some(a) = pre_attrs.get_alignment(self.types.biggest_alignment()) {
             struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
         }
         storage_order = pre_attrs.storage_order(specifier_pos).or(storage_order);
@@ -544,7 +545,7 @@ impl Parser<'_> {
             let attrs = self.parse_attributes();
             is_packed = is_packed || attrs.has_packed();
             is_transparent = is_transparent || attrs.has_transparent_union();
-            if let Some(a) = attrs.get_alignment() {
+            if let Some(a) = attrs.get_alignment(self.types.biggest_alignment()) {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
             storage_order = attrs.storage_order(specifier_pos).or(storage_order);
@@ -672,7 +673,7 @@ impl Parser<'_> {
             // x;` (and a type-name's type in `_Alignof(struct S
             // __attribute__((aligned(32))))`), and puts `p` in the section in
             // Linux's `static struct T __used __section("_ftrace_events") *p`.
-            if let Some(align) = early_attrs.get_alignment() {
+            if let Some(align) = early_attrs.get_alignment(self.types.biggest_alignment()) {
                 self.raise_pending_alignas(align);
             }
             self.apply_declaration_attrs(&pre_attrs, pre_pos, false);

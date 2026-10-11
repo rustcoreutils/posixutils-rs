@@ -25,7 +25,7 @@ use crate::ir::linearize_emit::CompoundAssign;
 use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
-    GnuAtomicOp, InitElement, InlineLibraryFn, LabelId, MemoryFn, NarrowedLibraryCall,
+    GnuAtomicOp, InitElement, InlineLibraryFn, LabelId, MachineOp, MemoryFn, NarrowedLibraryCall,
     OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
@@ -3006,6 +3006,13 @@ impl<'a> Linearizer<'a> {
 
             // It writes the frame.
             ExprKind::UnwindInit => false,
+
+            // The counter reads differ, and `rdtscp` stores; a conversion
+            // or the thread pointer is a value.
+            ExprKind::MachineBuiltin { op, args } => {
+                matches!(op, MachineOp::Cvtpd2ps | MachineOp::ThreadPointer)
+                    && args.iter().all(|a| self.is_pure_expr(a, how))
+            }
 
             // Frame/return address builtins are pure (just read registers)
             ExprKind::FrameAddress { .. } | ExprKind::ReturnAddress { .. } => true,
@@ -7375,6 +7382,10 @@ impl<'a> Linearizer<'a> {
             | ExprKind::ReturnAddress { .. }
             | ExprKind::Setjmp { .. }
             | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
+
+            ExprKind::MachineBuiltin { op, args } => {
+                self.linearize_machine_builtin(*op, args, self.expr_type(expr))
+            }
 
             ExprKind::InlineLibraryCall {
                 func,

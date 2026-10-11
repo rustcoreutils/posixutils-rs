@@ -153,8 +153,9 @@ fn gcc_flags_cpu_selection_is_accepted() {
         let r = compile_with("cpu.c", MAIN, &[flag]);
         assert!(r.success, "{flag}: {}", r.stderr);
     }
-    // An instruction-set extension or an ABI change is still refused.
-    for flag in ["-mavx2", "-mno-red-zone", "-mgeneral-regs-only"] {
+    // An ABI change is still refused. (The instruction-set options are
+    // `isa_flags.rs`'s.)
+    for flag in ["-mno-red-zone", "-mgeneral-regs-only"] {
         let r = compile_with("cpu.c", MAIN, &[flag]);
         assert!(!r.success, "{flag} accepted");
         assert!(

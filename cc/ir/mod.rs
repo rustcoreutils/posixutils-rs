@@ -1142,6 +1142,7 @@ impl Opcode {
                 IntegralRounding::Round => "fround",
                 IntegralRounding::Rint => "frint",
                 IntegralRounding::NearbyInt => "fnearbyint",
+                IntegralRounding::RoundEven => "froundeven",
             },
             Opcode::Trunc => "trunc",
             Opcode::Zext => "zext",
@@ -1235,6 +1236,7 @@ macro_rules! every_opcode {
                 Opcode::RoundToIntegral(IntegralRounding::Round),
                 Opcode::RoundToIntegral(IntegralRounding::Rint),
                 Opcode::RoundToIntegral(IntegralRounding::NearbyInt),
+                Opcode::RoundToIntegral(IntegralRounding::RoundEven),
                 Opcode::Simd(SimdOp::Add),
                 Opcode::Simd(SimdOp::Sub),
                 Opcode::Simd(SimdOp::And),
@@ -1287,7 +1289,8 @@ macro_rules! every_opcode {
                         | IntegralRounding::Trunc
                         | IntegralRounding::Round
                         | IntegralRounding::Rint
-                        | IntegralRounding::NearbyInt,
+                        | IntegralRounding::NearbyInt
+                        | IntegralRounding::RoundEven,
                     ) => true,
                     Opcode::Simd(
                         SimdOp::Add
@@ -5412,7 +5415,7 @@ mod tests {
     #[test]
     fn test_round_to_integral_opcodes() {
         use IntegralRounding::*;
-        let names: Vec<&str> = [Floor, Ceil, Trunc, Round, Rint, NearbyInt]
+        let names: Vec<&str> = [Floor, Ceil, Trunc, Round, Rint, NearbyInt, RoundEven]
             .into_iter()
             .map(|how| {
                 let op = Opcode::RoundToIntegral(how);
@@ -5422,7 +5425,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["ffloor", "fceil", "ftrunc", "fround", "frint", "fnearbyint"]
+            [
+                "ffloor",
+                "fceil",
+                "ftrunc",
+                "fround",
+                "frint",
+                "fnearbyint",
+                "froundeven"
+            ]
         );
         assert_ne!(Opcode::RoundToIntegral(Trunc).name(), Opcode::Trunc.name());
     }

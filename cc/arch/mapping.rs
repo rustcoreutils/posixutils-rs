@@ -19,7 +19,7 @@ use crate::ir::{
     CallAbiInfo, FloatCmp, Function, Instruction, Module, NanCompare, Opcode, PseudoId,
 };
 use crate::rtlib::{Float16Abi, RtlibNames};
-use crate::target::{Arch, Target};
+use crate::target::{Arch, Target, X86Isa};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 // Trait and types
@@ -47,9 +47,10 @@ pub trait ArchMapper {
     fn map_insn(&self, insn: &Instruction, ctx: &mut MappingCtx<'_>) -> MappedInsn;
 
     /// Whether the backend computes the libm opcode `op` ([`Opcode::is_libm`])
-    /// on a value in format `fmt` with its own instructions. Where it does
-    /// not, [`call_library_fallbacks`] calls the library function instead.
-    fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool;
+    /// on a value in format `fmt` with its own instructions, in a function
+    /// compiled for `isa`. Where it does not, [`call_library_fallbacks`]
+    /// calls the library function instead.
+    fn computes_in_place(&self, op: Opcode, fmt: FpFormat, isa: X86Isa) -> bool;
 
     /// The calls that compute `insn` where this target has no instruction
     /// for a format it computes in software, apart from binary128 -- which
@@ -66,8 +67,8 @@ pub trait ArchMapper {
 ///
 /// Asked by the linearizer too, which leaves out the `errno` guard in front
 /// of an opcode that is going to be a call anyway.
-pub fn computes_in_place(op: Opcode, fmt: FpFormat, target: &Target) -> bool {
-    create_mapper(target).computes_in_place(op, fmt)
+pub fn computes_in_place(op: Opcode, fmt: FpFormat, target: &Target, isa: X86Isa) -> bool {
+    create_mapper(target).computes_in_place(op, fmt, isa)
 }
 
 /// Turn every opcode the target computes by a library call into that call.
@@ -152,7 +153,7 @@ pub(crate) fn library_call(
 ) -> MappedInsn {
     let fmt = insn.typ.and_then(|t| ctx.types.fp_format(t));
     if let Some(fmt) = fmt.filter(|_| insn.op.is_libm()) {
-        if mapper.computes_in_place(insn.op, fmt) {
+        if mapper.computes_in_place(insn.op, fmt, ctx.func.isa) {
             return MappedInsn::Legal;
         }
         let call = build_binop_rtlib_call(insn, insn.library_callee(), ctx.types, ctx.target);
@@ -2312,35 +2313,64 @@ mod tests {
     fn test_computes_in_place_by_target() {
         let x86 = Target::new(Arch::X86_64, Os::Linux);
         let a64 = Target::new(Arch::Aarch64, Os::Linux);
+        let base = X86Isa::default();
         for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
-            assert!(computes_in_place(Opcode::Sqrt, fmt, &x86));
-            assert!(computes_in_place(Opcode::Sqrt, fmt, &a64));
+            assert!(computes_in_place(Opcode::Sqrt, fmt, &x86, base));
+            assert!(computes_in_place(Opcode::Sqrt, fmt, &a64, base));
         }
-        assert!(computes_in_place(Opcode::Sqrt, FpFormat::X87Extended, &x86));
-        assert!(!computes_in_place(Opcode::Sqrt, FpFormat::Binary128, &x86));
-        assert!(!computes_in_place(Opcode::Sqrt, FpFormat::Binary128, &a64));
+        assert!(computes_in_place(
+            Opcode::Sqrt,
+            FpFormat::X87Extended,
+            &x86,
+            base
+        ));
+        assert!(!computes_in_place(
+            Opcode::Sqrt,
+            FpFormat::Binary128,
+            &x86,
+            base
+        ));
+        assert!(!computes_in_place(
+            Opcode::Sqrt,
+            FpFormat::Binary128,
+            &a64,
+            base
+        ));
 
-        // Every rounding on aarch64; on x86-64 all but `round` and
-        // `nearbyint`, which SSE2 has no sequence for.
+        // Every rounding on aarch64; on x86-64 all but `round`, `nearbyint`
+        // and `roundeven`, which SSE2 has no sequence for -- and with
+        // SSE4.1's `roundsd`, all but `round`.
         use crate::float::IntegralRounding::*;
-        for how in [Floor, Ceil, Trunc, Round, Rint, NearbyInt] {
+        let sse41 = X86Isa::from_flags(&["-msse4.1".to_string()]);
+        for how in [Floor, Ceil, Trunc, Round, Rint, NearbyInt, RoundEven] {
             let op = Opcode::RoundToIntegral(how);
-            let sse = !matches!(how, Round | NearbyInt);
+            let sse = !matches!(how, Round | NearbyInt | RoundEven);
             for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
-                assert!(computes_in_place(op, fmt, &a64), "{how:?}");
-                assert_eq!(computes_in_place(op, fmt, &x86), sse, "{how:?}");
+                assert!(computes_in_place(op, fmt, &a64, base), "{how:?}");
+                assert_eq!(computes_in_place(op, fmt, &x86, base), sse, "{how:?}");
+                let in_place = computes_in_place(op, fmt, &x86, sse41);
+                assert_eq!(in_place, how != Round, "{how:?} with SSE4.1");
             }
-            assert!(!computes_in_place(op, FpFormat::Binary128, &a64));
-            assert!(!computes_in_place(op, FpFormat::X87Extended, &x86));
+            assert!(!computes_in_place(op, FpFormat::Binary128, &a64, base));
+            assert!(!computes_in_place(op, FpFormat::X87Extended, &x86, base));
         }
 
-        // fmin, fmax and fma: instructions on aarch64, calls on x86-64.
+        // fmin, fmax and fma: instructions on aarch64, calls on x86-64 --
+        // but for `fma` where the function's ISA has a fused multiply-add.
+        let isa = |flag: &str| X86Isa::from_flags(&[flag.to_string()]);
         for op in [Opcode::FMin, Opcode::FMax, Opcode::Fma] {
             for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
-                assert!(computes_in_place(op, fmt, &a64), "{op:?}");
-                assert!(!computes_in_place(op, fmt, &x86), "{op:?}");
+                assert!(computes_in_place(op, fmt, &a64, base), "{op:?}");
+                assert!(!computes_in_place(op, fmt, &x86, base), "{op:?}");
+                for fused in ["-mfma", "-mfma4", "-mavx512f"] {
+                    let in_place = computes_in_place(op, fmt, &x86, isa(fused));
+                    assert_eq!(in_place, op == Opcode::Fma, "{op:?} {fused}");
+                }
+                assert!(!computes_in_place(op, fmt, &x86, isa("-mavx2")), "{op:?}");
             }
-            assert!(!computes_in_place(op, FpFormat::Binary128, &a64));
+            assert!(!computes_in_place(op, FpFormat::Binary128, &a64, base));
+            let x87 = FpFormat::X87Extended;
+            assert!(!computes_in_place(op, x87, &x86, isa("-mfma")), "{op:?}");
         }
     }
 

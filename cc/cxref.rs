@@ -224,7 +224,9 @@ fn extract_refs_from_expr(
         ExprKind::SizeofExpr(e) | ExprKind::AlignofExpr(e) => {
             extract_refs_from_expr(e, strings, symbols, xref);
         }
-        ExprKind::Comma(exprs) | ExprKind::InlineLibraryCall { args: exprs, .. } => {
+        ExprKind::Comma(exprs)
+        | ExprKind::InlineLibraryCall { args: exprs, .. }
+        | ExprKind::MachineBuiltin { args: exprs, .. } => {
             for e in exprs {
                 extract_refs_from_expr(e, strings, symbols, xref);
             }

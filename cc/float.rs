@@ -44,7 +44,7 @@ const QUIET_BIT: u128 = 1 << 126;
 const SIG_BITS: u32 = 128;
 
 /// Which integer a value rounds to: the choice between `floor`, `ceil`,
-/// `trunc`, `round`, `rint` and `nearbyint`, named after them.
+/// `trunc`, `round`, `rint`, `nearbyint` and `roundeven`, named after them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IntegralRounding {
     /// Toward negative infinity.
@@ -60,6 +60,9 @@ pub enum IntegralRounding {
     Rint,
     /// In the current rounding direction, raising nothing.
     NearbyInt,
+    /// To nearest, a tie to even, raising nothing: C23's `roundeven`,
+    /// whichever the rounding direction.
+    RoundEven,
 }
 
 /// Which of the two kinds of NaN a value is.
@@ -1676,6 +1679,7 @@ impl FloatVal {
             IntegralRounding::Ceil => !a.neg,
             IntegralRounding::Trunc => false,
             IntegralRounding::Round => rem >= half,
+            IntegralRounding::RoundEven => rem > half || (rem == half && int & 1 == 1),
             IntegralRounding::Rint | IntegralRounding::NearbyInt => return None,
         };
         Some(Self::from_parts(a.neg, int + u128::from(away), 0))
@@ -4196,7 +4200,25 @@ mod tests {
             below.round_to_integral(Round, fmt),
             Some(v(4503599627370496.0))
         );
-        for how in [Floor, Ceil, Trunc, Round, Rint, NearbyInt] {
+        // Ties go to even, the rest to nearest, whatever the direction.
+        for (x, even) in [
+            (2.5, 2.0),
+            (3.5, 4.0),
+            (-2.5, -2.0),
+            (0.5, 0.0),
+            (-0.5, -0.0),
+            (2.75, 3.0),
+            (-1.25, -1.0),
+            (4503599627370495.5, 4503599627370496.0),
+        ] {
+            let got = v(x).round_to_integral(RoundEven, fmt).unwrap();
+            assert_eq!(
+                got.to_bits_at_width(64),
+                v(even).to_bits_at_width(64),
+                "{x}"
+            );
+        }
+        for how in [Floor, Ceil, Trunc, Round, Rint, NearbyInt, RoundEven] {
             assert_eq!(v(3.0).round_to_integral(how, fmt), Some(v(3.0)), "{how:?}");
             let inf = v(f64::NEG_INFINITY);
             assert_eq!(inf.round_to_integral(how, fmt), Some(inf), "{how:?}");

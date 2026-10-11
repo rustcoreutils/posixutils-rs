@@ -11,14 +11,17 @@
 use super::linearize::{BlockVolatility, LocalBinding, ObjectPlace, Storage};
 use super::memexpand::{self, BlockOp};
 use super::{
-    BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode, Pseudo, PseudoId,
+    AsmConstraint, AsmData, BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode,
+    Pseudo, PseudoId,
 };
 use crate::abi::get_abi_for_conv;
-use crate::arch::asm_constraints::PinnedGp;
+use crate::arch::asm_constraints::{AsmOperandClass, PinnedGp};
 use crate::constexpr::{ConstScope, IntConversion};
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
-use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
+use crate::parse::ast::{
+    AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MachineOp, MathErrno, UnaryOp,
+};
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::Bitfield;
@@ -1964,7 +1967,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let callee = self.library_function_name(self.strings.get(callee));
         let in_place = self.types.fp_format(typ).is_some_and(|fmt| {
-            crate::arch::mapping::computes_in_place(Opcode::Sqrt, fmt, self.target)
+            crate::arch::mapping::computes_in_place(Opcode::Sqrt, fmt, self.target, self.isa)
         });
         let sqrt = |lin: &mut Self| lin.emit_libm_insn(Opcode::Sqrt, &[x], typ, &callee);
         match errno {
@@ -3306,5 +3309,90 @@ impl<'a> super::linearize::Linearizer<'a> {
             Some((bit_width, typ)) => self.narrow_to_bitfield(final_val, bit_width, typ),
             None => final_val,
         }
+    }
+
+    /// A builtin that is one machine instruction ([`MachineOp`]), with the
+    /// value gcc 13 gives it. The time-stamp counter and the thread pointer
+    /// are an asm statement's outputs, as the instruction's own registers;
+    /// `cvtpd2ps` is a lane-by-lane conversion, which is what the
+    /// instruction computes.
+    pub(crate) fn linearize_machine_builtin(
+        &mut self,
+        op: MachineOp,
+        args: &[Expr],
+        typ: TypeId,
+    ) -> PseudoId {
+        match op {
+            MachineOp::Rdtsc | MachineOp::Rdtscp => {
+                let (uint, ulonglong) = (self.types.uint_id, self.types.ulonglong_id);
+                let aux = args.first().map(|p| self.linearize_expr(p));
+                let (template, outputs) = match aux {
+                    Some(_) => ("rdtscp", &[("=a", uint), ("=d", uint), ("=c", uint)][..]),
+                    None => ("rdtsc", &[("=a", uint), ("=d", uint)][..]),
+                };
+                let regs = self.emit_machine_asm(template, outputs);
+                if let Some(aux) = aux {
+                    self.emit(Instruction::store(regs[2], aux, 0, uint, 32));
+                }
+                let lo = self.emit_convert(regs[0], uint, ulonglong);
+                let hi = self.emit_convert(regs[1], uint, ulonglong);
+                let shift = self.emit_const(32, ulonglong);
+                let hi = self.emit_binary(BinaryOp::Shl, hi, shift, ulonglong, ulonglong);
+                self.emit_binary(BinaryOp::BitOr, hi, lo, ulonglong, ulonglong)
+            }
+            MachineOp::Cvtpd2ps => {
+                let (double, float) = (self.types.double_id, self.types.float_id);
+                let src = self.vector_addr(&args[0]);
+                let result = self.frame_temp_addr("__vec", typ);
+                for lane in 0..4 {
+                    let value = if lane < 2 {
+                        let d = self.alloc_reg_pseudo();
+                        self.emit(Instruction::load(d, src, lane * 8, double, 64));
+                        self.emit_convert(d, double, float)
+                    } else {
+                        self.emit_fconst(FloatVal::ZERO, float)
+                    };
+                    self.emit(Instruction::store(value, result, lane * 4, float, 32));
+                }
+                result
+            }
+            MachineOp::ThreadPointer => {
+                use crate::target::{Arch, Os};
+                let template = match (self.target.arch, self.target.os) {
+                    (Arch::X86_64, Os::MacOS) => "movq %%gs:0, %0",
+                    (Arch::X86_64, _) => "movq %%fs:0, %0",
+                    (Arch::Aarch64, _) => "mrs %0, tpidr_el0",
+                };
+                self.emit_machine_asm(template, &[("=r", self.types.void_ptr_id)])[0]
+            }
+        }
+    }
+
+    /// An asm statement of `template` with only register `outputs`, each
+    /// a constraint and the type of its value: the pseudos it writes.
+    fn emit_machine_asm(&mut self, template: &str, outputs: &[(&str, TypeId)]) -> Vec<PseudoId> {
+        let arch = self.target.arch;
+        let outputs: Vec<AsmConstraint> = outputs
+            .iter()
+            .map(|&(constraint, typ)| AsmConstraint {
+                pseudo: self.alloc_pseudo(),
+                name: None,
+                matching_output: None,
+                constraint: constraint.to_string(),
+                class: AsmOperandClass::parse(constraint, arch)
+                    .expect("a builtin's constraint is a valid one"),
+                size: self.types.size_bits(typ),
+                offset: 0,
+            })
+            .collect();
+        let written = outputs.iter().map(|o| o.pseudo).collect();
+        self.emit(Instruction::asm(AsmData {
+            template: template.to_string(),
+            outputs,
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        written
     }
 }

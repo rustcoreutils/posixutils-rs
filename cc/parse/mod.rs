@@ -28,10 +28,12 @@ mod generic_builtin;
 mod library_builtin;
 mod linkage;
 mod lowering_builtin;
+mod machine_builtin;
 mod operand_rule;
 pub mod parser;
 mod statement;
 mod target_attr;
+mod tgmath_builtin;
 mod toplevel;
 mod typename;
 mod vector_builtin;
@@ -49,6 +51,8 @@ mod test_expr_constraints;
 mod test_file_scope_asm;
 #[cfg(test)]
 mod test_float_n;
+#[cfg(test)]
+mod test_gnu_builtins;
 #[cfg(test)]
 mod test_incomplete;
 #[cfg(test)]

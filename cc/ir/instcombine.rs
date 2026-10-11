@@ -3171,6 +3171,10 @@ mod tests {
                 (Round, -0.5, -1.0),
                 (Rint, 4.0, 4.0),
                 (NearbyInt, -8.0, -8.0),
+                // Ties to even, whatever the direction.
+                (RoundEven, 2.5, 2.0),
+                (RoundEven, -3.5, -4.0),
+                (RoundEven, 1.75, 2.0),
             ] {
                 assert_eq!(
                     fold(how, arg).map(|v| v.to_f64()),

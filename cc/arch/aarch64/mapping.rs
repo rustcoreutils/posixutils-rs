@@ -45,7 +45,7 @@ impl ArchMapper for Aarch64Mapper {
     /// `fsqrt`, the six `frint` instructions, `fminnm`, `fmaxnm` and
     /// `fmadd` for the scalar formats; binary128, `long double` on Linux, is
     /// software.
-    fn computes_in_place(&self, op: Opcode, fmt: FpFormat) -> bool {
+    fn computes_in_place(&self, op: Opcode, fmt: FpFormat, _isa: crate::target::X86Isa) -> bool {
         match op {
             Opcode::Sqrt
             | Opcode::RoundToIntegral(_)

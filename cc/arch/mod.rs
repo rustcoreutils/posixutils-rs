@@ -337,12 +337,17 @@ pub fn get_additional_sizeof_macros(target: &Target) -> Vec<(&'static str, &'sta
 }
 
 /// Get miscellaneous macros
-pub fn get_misc_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_misc_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+    let biggest_alignment = match target.biggest_alignment() {
+        64 => "64",
+        32 => "32",
+        _ => "16",
+    };
     vec![
         // Pointer width in bits (always 64 on our targets)
         ("__POINTER_WIDTH__", "64"),
         // Alignment
-        ("__BIGGEST_ALIGNMENT__", "16"),
+        ("__BIGGEST_ALIGNMENT__", biggest_alignment),
         ("__BOOL_WIDTH__", "8"),
         // Byte order (all our supported architectures are little-endian),
         // and the order of the words of a multi-word floating type, which

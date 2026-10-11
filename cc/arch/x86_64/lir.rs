@@ -758,6 +758,43 @@ pub enum X86Inst {
         dst: XmmReg,
     },
 
+    /// SSE4.1's `rounds{s,d} $imm, src, dst`: `src` rounded to an integer
+    /// as `imm` says, into `dst`.
+    RoundFp {
+        size: FpSize,
+        imm: u8,
+        src: XmmOperand,
+        dst: XmmReg,
+    },
+
+    /// FMA's `vfmadd213s{s,d} addend, mul, dst`: `dst = mul * dst + addend`,
+    /// rounded once.
+    FmaAddend {
+        size: FpSize,
+        addend: XmmOperand,
+        mul: XmmReg,
+        dst: XmmReg,
+    },
+
+    /// FMA's `vfmadd231s{s,d} mul, acc_mul, acc`:
+    /// `acc = acc_mul * mul + acc`, rounded once.
+    FmaAccumulate {
+        size: FpSize,
+        mul: XmmOperand,
+        acc_mul: XmmReg,
+        acc: XmmReg,
+    },
+
+    /// FMA4's `vfmadds{s,d} add, mul, a, dst`: `dst = a * mul + add`,
+    /// rounded once. At most one of `add` and `mul` is in memory.
+    Fma4 {
+        size: FpSize,
+        add: XmmOperand,
+        mul: XmmOperand,
+        a: XmmReg,
+        dst: XmmReg,
+    },
+
     /// XORPS/XORPD - XOR packed floating-point (used for zeroing/negation)
     XorFp {
         size: FpSize,
@@ -1232,6 +1269,67 @@ impl EmitAsm for X86Inst {
             }
             X86Inst::SqrtFp { size, src, dst } => {
                 Self::emit_fp_alu("sqrt", size, src, dst, target, out)
+            }
+            X86Inst::RoundFp {
+                size,
+                imm,
+                src,
+                dst,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "    round{} ${imm}, {}, {}",
+                    size.x86_suffix(),
+                    src.format(target),
+                    dst.name()
+                );
+            }
+            X86Inst::FmaAddend {
+                size,
+                addend,
+                mul,
+                dst,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "    vfmadd213{} {}, {}, {}",
+                    size.x86_suffix(),
+                    addend.format(target),
+                    mul.name(),
+                    dst.name()
+                );
+            }
+            X86Inst::FmaAccumulate {
+                size,
+                mul,
+                acc_mul,
+                acc,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "    vfmadd231{} {}, {}, {}",
+                    size.x86_suffix(),
+                    mul.format(target),
+                    acc_mul.name(),
+                    acc.name()
+                );
+            }
+            X86Inst::Fma4 {
+                size,
+                add,
+                mul,
+                a,
+                dst,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "    vfmadd{} {}, {}, {}, {}",
+                    size.x86_suffix(),
+                    add.format(target),
+                    mul.format(target),
+                    a.name(),
+                    dst.name()
+                );
             }
             X86Inst::XorFp { size, src, dst } => {
                 let _ = writeln!(

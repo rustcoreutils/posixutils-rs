@@ -151,12 +151,23 @@ pub(crate) fn library_call(
     ctx: &mut MappingCtx<'_>,
     mapper: &dyn ArchMapper,
 ) -> MappedInsn {
-    let fmt = insn.typ.and_then(|t| ctx.types.fp_format(t));
+    // The format computed in: the operand's for one that converts it.
+    let operand = if insn.op.is_conversion() {
+        insn.src_typ
+    } else {
+        insn.typ
+    };
+    let fmt = operand.and_then(|t| ctx.types.fp_format(t));
     if let Some(fmt) = fmt.filter(|_| insn.op.is_libm()) {
         if mapper.computes_in_place(insn.op, fmt, ctx.func.isa) {
             return MappedInsn::Legal;
         }
-        let call = build_binop_rtlib_call(insn, insn.library_callee(), ctx.types, ctx.target);
+        let callee = insn.library_callee();
+        let call = if insn.op.is_conversion() {
+            build_convert_rtlib_call(insn, callee, ctx.types, ctx.target)
+        } else {
+            build_binop_rtlib_call(insn, callee, ctx.types, ctx.target)
+        };
         return MappedInsn::Replace(vec![call]);
     }
     // First, so that a conversion between `_Float16` and binary128 is the
@@ -2307,6 +2318,33 @@ mod tests {
         module
     }
 
+    /// `lround` on x86-64 is a call to it: of its floating operand, for its
+    /// integer result -- the conversion's two types, not one.
+    #[test]
+    fn test_round_to_integer_fallback_is_a_conversion_call() {
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&x86);
+        let op = Opcode::RoundToInteger(crate::float::IntegerRounding::Round);
+        let mut module = libm_module(&types, op, types.long_id, "lround");
+        let insn = &mut module.functions[0].blocks[0].insns[1];
+        insn.src_typ = Some(types.double_id);
+        insn.src_size = 64;
+        call_library_fallbacks(&mut module, &types, &x86);
+        let call = &module.functions[0].blocks[0].insns[1];
+        assert_eq!(call.op, Opcode::Call);
+        assert_eq!(call.extra().func_name.as_deref(), Some("lround"));
+        assert_eq!(call.typ, Some(types.long_id));
+        assert_eq!(call.extra().arg_types, vec![types.double_id]);
+
+        let rint = Opcode::RoundToInteger(crate::float::IntegerRounding::Rint);
+        let mut module = libm_module(&types, rint, types.long_id, "lrint");
+        let insn = &mut module.functions[0].blocks[0].insns[1];
+        insn.src_typ = Some(types.double_id);
+        insn.src_size = 64;
+        call_library_fallbacks(&mut module, &types, &x86);
+        assert_eq!(module.functions[0].blocks[0].insns[1].op, rint);
+    }
+
     /// What each target computes in place: SSE2 and x87 on x86-64, the
     /// scalar formats on aarch64, and binary128 nowhere.
     #[test]
@@ -2350,6 +2388,20 @@ mod tests {
                 assert_eq!(computes_in_place(op, fmt, &x86, base), sse, "{how:?}");
                 let in_place = computes_in_place(op, fmt, &x86, sse41);
                 assert_eq!(in_place, how != Round, "{how:?} with SSE4.1");
+            }
+            assert!(!computes_in_place(op, FpFormat::Binary128, &a64, base));
+            assert!(!computes_in_place(op, FpFormat::X87Extended, &x86, base));
+        }
+
+        // `lrint` on both; `lround` on aarch64 only, as in gcc. Never for
+        // binary128 or x87's format.
+        use crate::float::IntegerRounding;
+        for how in [IntegerRounding::Rint, IntegerRounding::Round] {
+            let op = Opcode::RoundToInteger(how);
+            for fmt in [FpFormat::Binary32, FpFormat::Binary64] {
+                assert!(computes_in_place(op, fmt, &a64, base), "{how:?}");
+                let x86_has = how == IntegerRounding::Rint;
+                assert_eq!(computes_in_place(op, fmt, &x86, sse41), x86_has, "{how:?}");
             }
             assert!(!computes_in_place(op, FpFormat::Binary128, &a64, base));
             assert!(!computes_in_place(op, FpFormat::X87Extended, &x86, base));

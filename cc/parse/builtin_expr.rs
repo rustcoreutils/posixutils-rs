@@ -2517,32 +2517,24 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_ROUNDEVENL
                 | crate::kw::BUILTIN_ROUNDEVENF64X
                 | crate::kw::BUILTIN_ROUNDEVENF128
-                | crate::kw::BUILTIN_LRINT
-                | crate::kw::BUILTIN_LRINTF
                 | crate::kw::BUILTIN_LRINTL
                 | crate::kw::BUILTIN_LRINTF32
                 | crate::kw::BUILTIN_LRINTF64
                 | crate::kw::BUILTIN_LRINTF32X
                 | crate::kw::BUILTIN_LRINTF64X
                 | crate::kw::BUILTIN_LRINTF128
-                | crate::kw::BUILTIN_LLRINT
-                | crate::kw::BUILTIN_LLRINTF
                 | crate::kw::BUILTIN_LLRINTL
                 | crate::kw::BUILTIN_LLRINTF32
                 | crate::kw::BUILTIN_LLRINTF64
                 | crate::kw::BUILTIN_LLRINTF32X
                 | crate::kw::BUILTIN_LLRINTF64X
                 | crate::kw::BUILTIN_LLRINTF128
-                | crate::kw::BUILTIN_LROUND
-                | crate::kw::BUILTIN_LROUNDF
                 | crate::kw::BUILTIN_LROUNDL
                 | crate::kw::BUILTIN_LROUNDF32
                 | crate::kw::BUILTIN_LROUNDF64
                 | crate::kw::BUILTIN_LROUNDF32X
                 | crate::kw::BUILTIN_LROUNDF64X
                 | crate::kw::BUILTIN_LROUNDF128
-                | crate::kw::BUILTIN_LLROUND
-                | crate::kw::BUILTIN_LLROUNDF
                 | crate::kw::BUILTIN_LLROUNDL
                 | crate::kw::BUILTIN_LLROUNDF32
                 | crate::kw::BUILTIN_LLROUNDF64

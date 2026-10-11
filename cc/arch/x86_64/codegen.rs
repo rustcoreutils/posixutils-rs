@@ -1165,7 +1165,9 @@ impl X86_64CodeGen {
                 }
             }
 
-            // Float to integer conversions
+            // Float to integer conversions; `lrint` reaches here only for a
+            // `float` or `double`, the mapping having made any other a call.
+            Opcode::RoundToInteger(_) => self.emit_float_to_int(insn, types),
             Opcode::FCvtU | Opcode::FCvtS => {
                 if is_x87_float_to_int(insn, types) {
                     self.emit_x87_float_to_int(insn);

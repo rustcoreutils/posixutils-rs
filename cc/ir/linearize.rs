@@ -2760,6 +2760,7 @@ impl<'a> Linearizer<'a> {
         let op = match func {
             InlineLibraryFn::Sqrt(_) => Opcode::Sqrt,
             InlineLibraryFn::RoundToIntegral(how) => Opcode::RoundToIntegral(how),
+            InlineLibraryFn::RoundToInteger(how) => Opcode::RoundToInteger(how),
             InlineLibraryFn::FMin => Opcode::FMin,
             InlineLibraryFn::FMax => Opcode::FMax,
             InlineLibraryFn::Fma => Opcode::Fma,
@@ -5380,6 +5381,11 @@ impl<'a> Linearizer<'a> {
             }
             (InlineLibraryFn::RoundToIntegral(how), [_]) => {
                 self.linearize_libm(Opcode::RoundToIntegral(how), args, typ, name)
+            }
+            (InlineLibraryFn::RoundToInteger(how), [arg]) => {
+                let val = self.linearize_expr(arg);
+                let from = self.expr_type(arg);
+                self.emit_round_to_integer(how, val, from, typ, name)
             }
             (InlineLibraryFn::FMin, [_, _]) => self.linearize_libm(Opcode::FMin, args, typ, name),
             (InlineLibraryFn::FMax, [_, _]) => self.linearize_libm(Opcode::FMax, args, typ, name),

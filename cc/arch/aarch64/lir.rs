@@ -932,6 +932,15 @@ pub enum Aarch64Inst {
         dst: Reg,
     },
 
+    /// FCVTAS - FP to signed int, to nearest with ties away from zero:
+    /// `lround`
+    Fcvtas {
+        fp_size: FpSize,
+        int_size: OperandSize,
+        src: VReg,
+        dst: Reg,
+    },
+
     /// FCVTZU - FP to unsigned int (truncate toward zero)
     Fcvtzu {
         fp_size: FpSize,
@@ -1699,6 +1708,12 @@ impl EmitAsm for Aarch64Inst {
                 src,
                 dst,
             } => Self::emit_fp_to_int("fcvtzu", fp_size, int_size, src, dst, out),
+            Aarch64Inst::Fcvtas {
+                fp_size,
+                int_size,
+                src,
+                dst,
+            } => Self::emit_fp_to_int("fcvtas", fp_size, int_size, src, dst, out),
             Aarch64Inst::Fcvt {
                 src_size,
                 dst_size,

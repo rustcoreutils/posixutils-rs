@@ -229,7 +229,9 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &RunFacts) -> Opti
         }
         Opcode::FCvtF => simplify_fcvtf(insn, consts, facts),
         op if op.is_float_comparison() => simplify_fcmp(insn, consts, facts),
-        Opcode::FCvtS | Opcode::FCvtU | Opcode::Signbit => simplify_fcvt(insn, consts, facts),
+        Opcode::FCvtS | Opcode::FCvtU | Opcode::RoundToInteger(_) | Opcode::Signbit => {
+            simplify_fcvt(insn, consts, facts)
+        }
 
         // Unary
         Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),

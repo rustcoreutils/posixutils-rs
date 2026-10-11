@@ -65,6 +65,27 @@ pub enum IntegralRounding {
     RoundEven,
 }
 
+/// Which integer `lrint` and `lround` (and their `ll` forms) convert a value
+/// to: C17 7.12.9.5 and 7.12.9.7.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntegerRounding {
+    /// `lrint`: in the current rounding direction.
+    Rint,
+    /// `lround`: to nearest, a tie away from zero, whatever the direction.
+    Round,
+}
+
+impl IntegerRounding {
+    /// The integral value the conversion converts: the one the function of
+    /// the same rounding computes.
+    pub fn integral(self) -> IntegralRounding {
+        match self {
+            IntegerRounding::Rint => IntegralRounding::Rint,
+            IntegerRounding::Round => IntegralRounding::Round,
+        }
+    }
+}
+
 /// The rounding direction a floating-point operation folded at translation
 /// time may assume.
 ///

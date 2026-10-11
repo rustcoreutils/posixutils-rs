@@ -194,6 +194,7 @@ instruction turns them into that call (`arch::mapping::call_library_fallbacks`).
 | `fmin`, `fmax` | Smaller / larger operand; a NaN operand is ignored for the other. *libm* |
 | `fma` | `src[0] * src[1] + src[2]`, rounded once. *libm* |
 | `ffloor`, `fceil`, `ftrunc`, `fround`, `frint`, `fnearbyint` | One opcode, `RoundToIntegral`, keyed on the rounding: the integral value of `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint`, as a float with its sign. *libm* |
+| `lrint`, `lround` | One opcode, `RoundToInteger`, a conversion: the integer of type `typ` the floating `src_typ` operand rounds to, in the current direction (`lrint`) or with ties away from zero (`lround`), not truncated as by `fcvts`. *libm* |
 
 ### Comparisons (result: 0 or 1)
 

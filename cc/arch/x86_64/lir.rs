@@ -1039,8 +1039,11 @@ pub enum X86Inst {
         dst: XmmReg,
     },
 
-    /// CVTTSS2SI/CVTTSD2SI - Convert scalar FP to integer (truncate toward zero)
+    /// CVTTSS2SI/CVTTSD2SI - Convert scalar FP to integer, truncating toward
+    /// zero; or, unless `truncate`, CVTSS2SI/CVTSD2SI, in the current
+    /// rounding direction (MXCSR's)
     CvtFpToInt {
+        truncate: bool,
         fp_size: FpSize,
         int_size: OperandSize,
         src: XmmOperand,
@@ -1625,11 +1628,12 @@ impl EmitAsm for X86Inst {
                 dst,
             } => Self::emit_cvt_int_to_fp(int_size, fp_size, src, dst, target, out),
             X86Inst::CvtFpToInt {
+                truncate,
                 fp_size,
                 int_size,
                 src,
                 dst,
-            } => Self::emit_cvt_fp_to_int(fp_size, int_size, src, dst, target, out),
+            } => Self::emit_cvt_fp_to_int(*truncate, fp_size, int_size, src, dst, target, out),
             X86Inst::CvtFpFp {
                 src_size,
                 dst_size,
@@ -2011,6 +2015,7 @@ impl X86Inst {
     }
 
     fn emit_cvt_fp_to_int(
+        truncate: bool,
         fp_size: &FpSize,
         int_size: &OperandSize,
         src: &XmmOperand,
@@ -2021,7 +2026,8 @@ impl X86Inst {
         let int_suffix = if int_size.bits() <= 32 { "l" } else { "q" };
         let _ = writeln!(
             out,
-            "    cvtt{}2si{} {}, {}",
+            "    cvt{}{}2si{} {}, {}",
+            if truncate { "t" } else { "" },
             fp_size.x86_suffix(),
             int_suffix,
             src.format(target),

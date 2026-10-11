@@ -598,11 +598,22 @@ pub(crate) fn eval_fcvtf(
 /// `Signbit` folds for every operand, the infinities and NaN included: it
 /// reads a bit and raises nothing, and rounding to a format never changes a
 /// sign.
+///
+/// `RoundToInteger` folds only where the answer is the function's for every
+/// rounding direction and in range: an `lround`, or an `lrint` of a value
+/// already integral ([`FloatVal::round_to_integral`]), that the integer type
+/// holds. Out of range the function's answer is unspecified and it raises
+/// invalid, so that is left to run time.
 pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVal) -> Option<i128> {
     let signed = match op {
         Opcode::FCvtS => true,
         Opcode::FCvtU => false,
         Opcode::Signbit => return Some(i128::from(a.sign_bit())),
+        Opcode::RoundToInteger(how) => {
+            return a
+                .round_to_integral(how.integral(), src_fmt)?
+                .to_integer(dst_size.clamp(1, 128), true);
+        }
         _ => return None,
     };
     Some(
@@ -1303,6 +1314,29 @@ mod tests {
         for op in [Opcode::Load, Opcode::UMulHi, Opcode::FAdd, Opcode::Lo64] {
             assert!(!is_int_foldable(op), "{op:?}");
         }
+    }
+
+    /// `lround` of a constant folds to its tie away from zero, `lrint` only
+    /// of an integral value, whose answer no rounding direction changes; and
+    /// neither out of the integer's range, where the function's answer is
+    /// unspecified.
+    #[test]
+    fn round_to_integer_folds_only_what_every_direction_agrees_on() {
+        use crate::float::IntegerRounding::{Rint, Round};
+        let v = FloatVal::from_f64;
+        let d = FpFormat::Binary64;
+        let fold = |how, bits, x| eval_fcvt(Opcode::RoundToInteger(how), bits, d, v(x));
+        assert_eq!(fold(Round, 64, 2.5), Some(3));
+        assert_eq!(fold(Round, 64, -2.5), Some(-3));
+        assert_eq!(fold(Round, 64, 2.4999), Some(2));
+        assert_eq!(fold(Rint, 64, -7.0), Some(-7));
+        assert_eq!(fold(Rint, 64, 2.5), None);
+        assert_eq!(fold(Round, 32, 3e9), None);
+        assert_eq!(fold(Rint, 64, 1e300), None);
+        assert_eq!(
+            eval_fcvt(Opcode::RoundToInteger(Rint), 64, d, FloatVal::nan()),
+            None
+        );
     }
 
     /// A float-to-integer conversion out of range folds to gcc's saturated

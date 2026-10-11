@@ -22,7 +22,7 @@ use super::ast::{
 use super::builtin_args::BuiltinArgs;
 use super::parser::{ParseResult, Parser};
 use crate::constexpr::ConstScope;
-use crate::float::IntegralRounding;
+use crate::float::{IntegerRounding, IntegralRounding};
 use crate::kw;
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
@@ -79,7 +79,14 @@ impl LibraryCallPolicy {
     /// and stores or the library call is decided on the IR
     /// (`ir::memexpand`), where a length that only inlining makes constant
     /// can still be seen.
+    ///
+    /// `lrint` and `lround` are computed in place only under
+    /// `-fno-math-errno`: they have no instruction that sets `errno` for an
+    /// argument out of range, and gcc then calls them at every level.
     fn in_place(self, func: InlineLibraryFn, spelling: Spelling) -> bool {
+        if matches!(func, InlineLibraryFn::RoundToInteger(_)) && self.math_errno {
+            return false;
+        }
         if self.optimizing {
             return true;
         }
@@ -94,6 +101,7 @@ impl LibraryCallPolicy {
             InlineLibraryFn::Sqrt(MathErrno::Set) => false,
             InlineLibraryFn::Sqrt(MathErrno::Ignored)
             | InlineLibraryFn::RoundToIntegral(_)
+            | InlineLibraryFn::RoundToInteger(_)
             | InlineLibraryFn::FMin
             | InlineLibraryFn::FMax
             | InlineLibraryFn::Fma => spelling == Spelling::Reserved,
@@ -326,6 +334,7 @@ const fn plain(
 #[rustfmt::skip]
 static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     use InlineLibraryFn as F;
+    use IntegerRounding as I;
     use IntegralRounding as R;
     use LibFn as L;
     use MemoryFn as M;
@@ -571,32 +580,32 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         entry(kw::ROUNDEVENF32X, kw::BUILTIN_ROUNDEVENF32X, Float32x, &[Float32x], F::RoundToIntegral(R::RoundEven)),
         plain(kw::ROUNDEVENF64X, Float64x, &[Float64x], FIXED),
         plain(kw::ROUNDEVENF128, Float128, &[Float128], FIXED),
-        plain(kw::LRINT, Long, &[Double], FIXED),
-        plain(kw::LRINTF, Long, &[Float], FIXED),
+        entry(kw::LRINT, kw::BUILTIN_LRINT, Long, &[Double], F::RoundToInteger(I::Rint)),
+        entry(kw::LRINTF, kw::BUILTIN_LRINTF, Long, &[Float], F::RoundToInteger(I::Rint)),
         plain(kw::LRINTL, Long, &[LongDouble], FIXED),
         plain(kw::LRINTF32, Long, &[Float32], FIXED),
         plain(kw::LRINTF64, Long, &[Float64], FIXED),
         plain(kw::LRINTF32X, Long, &[Float32x], FIXED),
         plain(kw::LRINTF64X, Long, &[Float64x], FIXED),
         plain(kw::LRINTF128, Long, &[Float128], FIXED),
-        plain(kw::LLRINT, LongLong, &[Double], FIXED),
-        plain(kw::LLRINTF, LongLong, &[Float], FIXED),
+        entry(kw::LLRINT, kw::BUILTIN_LLRINT, LongLong, &[Double], F::RoundToInteger(I::Rint)),
+        entry(kw::LLRINTF, kw::BUILTIN_LLRINTF, LongLong, &[Float], F::RoundToInteger(I::Rint)),
         plain(kw::LLRINTL, LongLong, &[LongDouble], FIXED),
         plain(kw::LLRINTF32, LongLong, &[Float32], FIXED),
         plain(kw::LLRINTF64, LongLong, &[Float64], FIXED),
         plain(kw::LLRINTF32X, LongLong, &[Float32x], FIXED),
         plain(kw::LLRINTF64X, LongLong, &[Float64x], FIXED),
         plain(kw::LLRINTF128, LongLong, &[Float128], FIXED),
-        plain(kw::LROUND, Long, &[Double], FIXED),
-        plain(kw::LROUNDF, Long, &[Float], FIXED),
+        entry(kw::LROUND, kw::BUILTIN_LROUND, Long, &[Double], F::RoundToInteger(I::Round)),
+        entry(kw::LROUNDF, kw::BUILTIN_LROUNDF, Long, &[Float], F::RoundToInteger(I::Round)),
         plain(kw::LROUNDL, Long, &[LongDouble], FIXED),
         plain(kw::LROUNDF32, Long, &[Float32], FIXED),
         plain(kw::LROUNDF64, Long, &[Float64], FIXED),
         plain(kw::LROUNDF32X, Long, &[Float32x], FIXED),
         plain(kw::LROUNDF64X, Long, &[Float64x], FIXED),
         plain(kw::LROUNDF128, Long, &[Float128], FIXED),
-        plain(kw::LLROUND, LongLong, &[Double], FIXED),
-        plain(kw::LLROUNDF, LongLong, &[Float], FIXED),
+        entry(kw::LLROUND, kw::BUILTIN_LLROUND, LongLong, &[Double], F::RoundToInteger(I::Round)),
+        entry(kw::LLROUNDF, kw::BUILTIN_LLROUNDF, LongLong, &[Float], F::RoundToInteger(I::Round)),
         plain(kw::LLROUNDL, LongLong, &[LongDouble], FIXED),
         plain(kw::LLROUNDF32, LongLong, &[Float32], FIXED),
         plain(kw::LLROUNDF64, LongLong, &[Float64], FIXED),

@@ -774,6 +774,7 @@ impl X86_64CodeGen {
             }
             IntegralRounding::Floor | IntegralRounding::Ceil | IntegralRounding::Trunc => {
                 self.push_lir(X86Inst::CvtFpToInt {
+                    truncate: true,
                     fp_size,
                     int_size: size,
                     src: XmmOperand::Reg(x),
@@ -1402,6 +1403,9 @@ impl X86_64CodeGen {
         // the same question one step closer to the answer, and it is the
         // question `emit_int_to_float` already asks for the other direction.
         let is_unsigned = insn.op == Opcode::FCvtU;
+        // C's conversion truncates; `lrint` converts in the current
+        // rounding direction, which is what `cvtsd2si` does.
+        let truncate = !matches!(insn.op, Opcode::RoundToInteger(_));
 
         if is_unsigned && dst_size == 64 && matches!(fp_size, FpSize::Single | FpSize::Double) {
             // cvttss2si/cvttsd2si are *signed*: every value at or above 2^63
@@ -1410,7 +1414,8 @@ impl X86_64CodeGen {
             // Split the range, mirroring emit_int_to_float's unsigned path.
             self.emit_float_to_u64(fp_size, dst_reg);
         } else {
-            // Convert using cvttss2si/cvttsd2si (truncate toward zero).
+            // Convert using cvttss2si/cvttsd2si (truncate toward zero), or
+            // for `lrint` cvtss2si/cvtsd2si.
             // For unsigned 32-bit targets, use 64-bit conversion to avoid
             // overflow for values >= 2^31 that fit in uint32_t but not int32_t.
             // A Half source cannot reach 2^63 at all, so it needs no split.
@@ -1420,6 +1425,7 @@ impl X86_64CodeGen {
                 OperandSize::from_bits(dst_size)
             };
             self.push_lir(X86Inst::CvtFpToInt {
+                truncate,
                 fp_size,
                 int_size,
                 src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -1495,6 +1501,7 @@ impl X86_64CodeGen {
 
         // Below 2^63: the signed conversion is already the right answer.
         self.push_lir(X86Inst::CvtFpToInt {
+            truncate: true,
             fp_size,
             int_size: OperandSize::B64,
             src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -1511,6 +1518,7 @@ impl X86_64CodeGen {
             dst: XmmReg::Xmm15,
         });
         self.push_lir(X86Inst::CvtFpToInt {
+            truncate: true,
             fp_size,
             int_size: OperandSize::B64,
             src: XmmOperand::Reg(XmmReg::Xmm15),

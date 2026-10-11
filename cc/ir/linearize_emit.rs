@@ -2082,6 +2082,32 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// `lrint` or `lround` of `val`, of the floating type `from`, as the
+    /// integer type `typ`: the libm opcode that reads another type, named
+    /// for the function `callee` that a target without the instruction
+    /// calls instead.
+    pub(crate) fn emit_round_to_integer(
+        &mut self,
+        how: crate::float::IntegerRounding,
+        val: PseudoId,
+        from: TypeId,
+        typ: TypeId,
+        callee: StringId,
+    ) -> PseudoId {
+        let callee = self.library_function_name(self.strings.get(callee));
+        let result = self.alloc_pseudo();
+        let mut insn = Instruction::new(Opcode::RoundToInteger(how))
+            .with_target(result)
+            .with_size(self.types.size_bits(typ))
+            .with_type(typ)
+            .with_func(callee);
+        insn.src = vec![val];
+        insn.src_typ = Some(from);
+        insn.src_size = self.types.size_bits(from);
+        self.emit(insn);
+        result
+    }
+
     /// A call to the C library function `callee` (its assembler name) with
     /// `args`, each with its type, returning `typ`.
     pub(crate) fn emit_library_call(

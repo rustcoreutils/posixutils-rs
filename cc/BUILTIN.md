@@ -244,7 +244,7 @@ The magnitudes, `copysign`, the complex accessors and the block memory
 functions are computed at every level.
 
 A libm function computed in place is one IR opcode keyed on its type
-(`Sqrt`, `RoundToIntegral`, `FMin`, `FMax`, `Fma`; `Opcode::is_libm`). Where
+(`Sqrt`, `RoundToIntegral`, `RoundToInteger`, `FMin`, `FMax`, `Fma`; `Opcode::is_libm`). Where
 the target has no instruction for that type (`ArchMapper::computes_in_place`:
 binary128 on aarch64; on x86-64 `round`, `fmin` and `fmax`, and
 `nearbyint`, `roundeven` and `fma` unless the function's ISA has SSE4.1 or
@@ -267,6 +267,7 @@ complex accessors do not (defining a reserved library name is undefined, C17
 | `copysign`, `copysignf`, `copysignl` | `Opcode::CopySign`: moves one bit, from a zero or a NaN as from anything else. Never a call. `bits/floatn.h` uses `__builtin_copysignf` |
 | `sqrt`, `sqrtf`, `sqrtl` | `Opcode::Sqrt`: `sqrtsd`/`sqrtss` and x87 `fsqrt` on x86-64, `fsqrt` on aarch64; binary128 (`sqrtl` on aarch64 Linux) is a call. With `-fmath-errno` (the default) an argument with `x < 0` (ordered, so not `-0` or NaN) still calls the library to set `EDOM`; `-fno-math-errno` drops that call, and then `sqrt(x) < 0` folds to 0. A constant folds, in a static initializer too, except a negative one |
 | `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint`, `roundeven`, `f` forms | `Opcode::RoundToIntegral`: `frintm`, `frintp`, `frintz`, `frinta`, `frintx`, `frinti`, `frintn` on aarch64. On x86-64 with SSE4.1 (`-msse4.1`, `target("sse4.1")`) `roundss`/`roundsd` with gcc's immediates for all but `round`; without it (no `roundsd` in the baseline) gcc's SSE2 sequences for `floor`, `ceil`, `trunc` and `rint`, which set the result's sign rather than or-ing it in, so they are right in every rounding direction; `round`, `nearbyint` and `roundeven` are calls. A `float` argument to the `double` function is computed by the `f` form (`NarrowedLibraryCall`): exact, because the result is an integer no larger than `x`; the call is still a `double` and still names `floor`. Constants fold, except a `rint`/`nearbyint` of a non-integer, whose answer depends on the rounding direction |
+| `lrint`, `llrint`, `lround`, `llround`, `f` forms | Calls under `-fmath-errno` (the default), at every level, since an argument out of range is a domain error. Under `-fno-math-errno` `Opcode::RoundToInteger`, as gcc: `lrint` is `cvtsd2si`/`cvtss2si` on x86-64, which converts in the current rounding direction, and `frintx` then `fcvtzs` on aarch64; `lround` is `fcvtas` on aarch64 and a call on x86-64, which has no instruction that ties away from zero. `long double` and the `_FloatN` forms are calls. A constant folds only where no rounding direction and no range matters: an `lround`, or an `lrint` of an integral value, that fits |
 | `fmin`, `fmax`, `fma`, `f` forms | `fminnm`, `fmaxnm`, `fmadd` on aarch64; calls on x86-64 (`minsd` does not ignore a NaN), but for `fma` in a function whose ISA has FMA or AVX512F (`vfmadd213`/`vfmadd231`) or FMA4 (`vfmadd`), where `__FP_FAST_FMA` says so. Constants fold on both targets: `fmin(+0, -0)` is -0 and `fmax(-0, +0)` +0; a NaN argument is not a constant in a static initializer |
 | `creal`, `cimag`, `conj` (each precision) | The half read in place, as `__real__`/`__imag__` read it; `conj` negates the imaginary half as `~z` does, so a zero imaginary part becomes -0. The argument converts to the suffix's complex type first (`crealf` of a `double _Complex` is the rounded `float` half) |
 | `memcpy`, `memset`, `memmove` | `Opcode::Memcpy` / `Memset` / `Memmove`, at every level |
@@ -525,7 +526,7 @@ implicit declaration of one of these names takes the row's return type.
 | `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `ilogb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
 | `__builtin_modf`, `frexp`, `ldexp` and `f`/`l` forms | The second parameter is a pointer or an `int` |
 | `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl`, `roundevenl`, `fminl`, `fmaxl`, `fmal` | The `long double` forms of functions computed in place, and their `f64x` and `f128` forms |
-| `__builtin_lrint`, `llrint`, `lround`, `llround`, `scalbn`, `scalbln` and every type's form (`f`, `l`, `f32`, `f64`, `f32x`, `f64x`, `f128`) | Calls, as gcc's at its default `-fmath-errno` |
+| `__builtin_lrintl`, `llrintl`, `lroundl`, `llroundl`, `scalbn`, `scalbln` and every type's form of each (`f`, `l`, `f32`, `f64`, `f32x`, `f64x`, `f128`), and the `_FloatN` forms of `lrint`, `llrint`, `lround`, `llround` | Calls |
 | `__builtin_logbf32`, ..., and the `_FloatN`/`_FloatNx` forms of `logb`, `ilogb`, `cbrt`, `ldexp`, `frexp`, `modf`, `nextafter`, `fdim`, `hypot` | Calls of the function of the builtin's own name (`hypotf128`), as gcc's |
 
 ### Machine instructions and type-generic calls

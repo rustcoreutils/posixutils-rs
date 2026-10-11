@@ -787,8 +787,8 @@ impl Aarch64CodeGen {
                 self.emit_int_to_float(insn, types);
             }
 
-            // Float to int conversions
-            Opcode::FCvtU | Opcode::FCvtS => {
+            // Float to int conversions, `lrint` and `lround` among them
+            Opcode::FCvtU | Opcode::FCvtS | Opcode::RoundToInteger(_) => {
                 self.emit_float_to_int(insn, types);
             }
 

@@ -11,7 +11,7 @@
 //
 
 use crate::diag::Position;
-use crate::float::{FloatVal, IntegralRounding};
+use crate::float::{FloatVal, IntegerRounding, IntegralRounding};
 use crate::strings::StringId;
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
@@ -80,6 +80,11 @@ pub enum InlineLibraryFn {
     /// `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint` and their `f`
     /// forms: the integer the argument rounds to, at the expression's type.
     RoundToIntegral(IntegralRounding),
+    /// `lrint`, `llrint`, `lround`, `llround` and their `f` forms: the
+    /// argument rounded to an integer of the call's type. Computed in place
+    /// only under `-fno-math-errno`: an argument out of range is a domain
+    /// error (C17 7.12.9.5p2, 7.12.9.7p2).
+    RoundToInteger(IntegerRounding),
     /// `fmin`, `fminf`: the smaller argument, a NaN one ignored.
     FMin,
     /// `fmax`, `fmaxf`: the larger argument, a NaN one ignored.
@@ -389,7 +394,8 @@ impl InlineLibraryFn {
             | InlineLibraryFn::ComplexImag
             | InlineLibraryFn::Conjugate
             | InlineLibraryFn::Sqrt(_)
-            | InlineLibraryFn::RoundToIntegral(_) => 1,
+            | InlineLibraryFn::RoundToIntegral(_)
+            | InlineLibraryFn::RoundToInteger(_) => 1,
         }
     }
 
@@ -439,6 +445,7 @@ impl InlineLibraryFn {
             self,
             InlineLibraryFn::Sqrt(_)
                 | InlineLibraryFn::RoundToIntegral(_)
+                | InlineLibraryFn::RoundToInteger(_)
                 | InlineLibraryFn::FMin
                 | InlineLibraryFn::FMax
                 | InlineLibraryFn::Fma

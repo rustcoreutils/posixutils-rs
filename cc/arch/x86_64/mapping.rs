@@ -14,7 +14,7 @@ use crate::arch::mapping::{
     expand_float16_neg, float_suffix, map_int128_divmod, map_int128_expand,
     map_int128_float_convert, ArchMapper, MappedInsn, MappingCtx,
 };
-use crate::float::{FpFormat, IntegralRounding};
+use crate::float::{FpFormat, IntegerRounding, IntegralRounding};
 use crate::ir::{Instruction, Opcode};
 use crate::rtlib::RtlibNames;
 use crate::target::{X86Isa, X86Simd};
@@ -82,6 +82,10 @@ impl ArchMapper for X86_64Mapper {
                 }
             }
             Opcode::Fma => sse && isa.fused_multiply_add().is_some(),
+            // `cvtsd2si` converts in the current direction, which is
+            // `lrint`; nothing ties away from zero, and `lround` is a call,
+            // as in gcc.
+            Opcode::RoundToInteger(how) => sse && how == IntegerRounding::Rint,
             _ => false,
         }
     }

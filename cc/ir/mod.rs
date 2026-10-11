@@ -59,7 +59,7 @@ pub mod vrp;
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::diag::Position;
-use crate::float::{FloatVal, IntegralRounding};
+use crate::float::{FloatVal, IntegerRounding, IntegralRounding};
 use crate::target::Target;
 use crate::types::{AddressSpace, TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -398,6 +398,12 @@ pub enum Opcode {
     // the width of `typ`: the integer it rounds to, with its sign. Named in
     // `func_name` like `Sqrt`.
     RoundToIntegral(IntegralRounding),
+    // `lrint` or `lround` of src[0]: the integer of type `typ` the floating
+    // `src_typ` operand rounds to, in the current direction or with ties
+    // away from zero -- not truncated, as `FCvtS` does. A conversion, and a
+    // libm opcode too: named in `func_name` like `Sqrt`, for a target or a
+    // format with no instruction for it.
+    RoundToInteger(IntegerRounding),
     // `fmin` and `fmax` of src[0] and src[1], at the width of `typ`: a NaN
     // operand is ignored for the other. Named in `func_name` like `Sqrt`.
     FMin,
@@ -897,7 +903,7 @@ impl Opcode {
         match self {
             FAdd | FSub | FMul | FDiv | Sqrt | RoundToIntegral(_) | FMin | FMax | Fma | Call
             | Asm => FpRaise::May,
-            FCvtU | FCvtS | UCvtF | SCvtF | FCvtF => FpRaise::Conversion,
+            FCvtU | FCvtS | UCvtF | SCvtF | FCvtF | RoundToInteger(_) => FpRaise::Conversion,
             FCmpOEq | FCmpONe | FCmpOLt | FCmpOLe | FCmpOGt | FCmpOGe | FCmpsOLt | FCmpsOLe
             | FCmpsOGt | FCmpsOGe => match self.float_cmp().map(FloatCmp::nan) {
                 Some(NanCompare::Signaling) => FpRaise::May,
@@ -949,7 +955,12 @@ impl Opcode {
         self.is_int_width_change()
             || matches!(
                 self,
-                Opcode::FCvtS | Opcode::FCvtU | Opcode::SCvtF | Opcode::UCvtF | Opcode::FCvtF
+                Opcode::FCvtS
+                    | Opcode::FCvtU
+                    | Opcode::SCvtF
+                    | Opcode::UCvtF
+                    | Opcode::FCvtF
+                    | Opcode::RoundToInteger(_)
             )
     }
 
@@ -1030,7 +1041,12 @@ impl Opcode {
     pub fn is_libm(&self) -> bool {
         matches!(
             self,
-            Opcode::Sqrt | Opcode::RoundToIntegral(_) | Opcode::FMin | Opcode::FMax | Opcode::Fma
+            Opcode::Sqrt
+                | Opcode::RoundToIntegral(_)
+                | Opcode::RoundToInteger(_)
+                | Opcode::FMin
+                | Opcode::FMax
+                | Opcode::Fma
         )
     }
 
@@ -1144,6 +1160,10 @@ impl Opcode {
                 IntegralRounding::NearbyInt => "fnearbyint",
                 IntegralRounding::RoundEven => "froundeven",
             },
+            Opcode::RoundToInteger(how) => match how {
+                IntegerRounding::Rint => "lrint",
+                IntegerRounding::Round => "lround",
+            },
             Opcode::Trunc => "trunc",
             Opcode::Zext => "zext",
             Opcode::Sext => "sext",
@@ -1237,6 +1257,8 @@ macro_rules! every_opcode {
                 Opcode::RoundToIntegral(IntegralRounding::Rint),
                 Opcode::RoundToIntegral(IntegralRounding::NearbyInt),
                 Opcode::RoundToIntegral(IntegralRounding::RoundEven),
+                Opcode::RoundToInteger(IntegerRounding::Rint),
+                Opcode::RoundToInteger(IntegerRounding::Round),
                 Opcode::Simd(SimdOp::Add),
                 Opcode::Simd(SimdOp::Sub),
                 Opcode::Simd(SimdOp::And),
@@ -1292,6 +1314,7 @@ macro_rules! every_opcode {
                         | IntegralRounding::NearbyInt
                         | IntegralRounding::RoundEven,
                     ) => true,
+                    Opcode::RoundToInteger(IntegerRounding::Rint | IntegerRounding::Round) => true,
                     Opcode::Simd(
                         SimdOp::Add
                         | SimdOp::Sub

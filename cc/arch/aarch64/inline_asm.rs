@@ -229,8 +229,14 @@ pub(super) fn vector_operand_pseudos(asm: &AsmData) -> impl Iterator<Item = Pseu
 // AsmOperandFormatter trait implementation
 
 impl Aarch64CodeGen {
-    /// Emit inline assembly instruction
+    /// Emit inline assembly instruction. A statement is reported on once for
+    /// each thing wrong with it, as gcc does, however many of its operands
+    /// run into it.
     pub(super) fn emit_inline_asm(&mut self, insn: &Instruction) {
+        crate::diag::each_once(|| self.emit_inline_asm_statement(insn));
+    }
+
+    fn emit_inline_asm_statement(&mut self, insn: &Instruction) {
         let asm_data = match &insn.extra().asm_data {
             Some(data) => data,
             None => return,
@@ -357,11 +363,7 @@ impl Aarch64CodeGen {
                     if !requires_mem && output.class.reg.is_some() =>
                 {
                     let Some(reg) = addr_regs.take(&mut gp_scratch, false) else {
-                        crate::diag::error(
-                            insn.pos.unwrap_or_default(),
-                            "too many register operands in one asm statement; \
-                             c17 has no register left to give one",
-                        );
+                        crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
                         slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
@@ -501,11 +503,7 @@ impl Aarch64CodeGen {
                 Loc::Reg(r) if pinned.contains(&r) => {
                     let size = if requires_mem { 64 } else { op_size };
                     let Some(reg) = addr_regs.take(&mut gp_scratch, false) else {
-                        crate::diag::error(
-                            insn.pos.unwrap_or_default(),
-                            "too many register operands in one asm statement; \
-                             c17 has no register left to give one",
-                        );
+                        crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
                         slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
@@ -553,11 +551,7 @@ impl Aarch64CodeGen {
                     if class.reg.is_some() && !class.imm.int.admits(canonical_int(v, op_size)) =>
                 {
                     let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
-                        crate::diag::error(
-                            insn.pos.unwrap_or_default(),
-                            "too many register operands in one asm statement; \
-                             c17 has no register left to give one",
-                        );
+                        crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
                         slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
@@ -703,11 +697,7 @@ impl Aarch64CodeGen {
                     };
                     let x15_ok = !self.setup_borrows_legalize_reg(&setup);
                     let Some(reg) = addr_regs.take(&mut gp_scratch, x15_ok) else {
-                        crate::diag::error(
-                            insn.pos.unwrap_or_default(),
-                            "too many register operands in one asm statement; \
-                             c17 has no register left to give one",
-                        );
+                        crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
                         slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
@@ -845,11 +835,7 @@ impl Aarch64CodeGen {
         let loc = self.get_location(pseudo);
         let via = if pin == Reg::SP && !matches!(loc, Loc::Reg(_)) {
             let Some(reg) = addr_regs.take(gp_scratch, false) else {
-                crate::diag::error(
-                    insn.pos.unwrap_or_default(),
-                    "too many register operands in one asm statement; \
-                     c17 has no register left to give one",
-                );
+                crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
                 return None;
             };
             Some(reg)

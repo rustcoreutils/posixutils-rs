@@ -1542,6 +1542,16 @@ pub fn impossible_constant(operand: usize, value: i128, constraint: &str) -> Str
     )
 }
 
+/// Report an asm statement that wants more registers than are left to give
+/// its operands, once its pinned operands and clobbers have taken theirs --
+/// in gcc's words, which it gives for the same statement.
+pub fn report_asm_registers_exhausted(pos: Option<crate::diag::Position>) {
+    crate::diag::error(
+        pos.unwrap_or_default(),
+        "'asm' operand has impossible constraints",
+    );
+}
+
 /// How a template names an operand: by number or by `[name]`.
 enum OperandRef {
     Number(usize),

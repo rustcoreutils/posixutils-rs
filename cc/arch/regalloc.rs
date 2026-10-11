@@ -9,6 +9,7 @@
 // Common register allocator utilities shared between architectures
 //
 
+use crate::arch::asm_constraints::AsmRegClass;
 use crate::ir::bitset::BitSet;
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
@@ -1642,6 +1643,15 @@ pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId
 /// value the allocator chose to spill, and then codegen had to find it a
 /// register at the last moment -- on x86-64 by borrowing one that held another
 /// operand or a live value.
+///
+/// An operand pinned to one register (x86-64 `"a"`, a register variable) is
+/// not among them. The asm wants it in that register, not in one of its own:
+/// codegen moves it there from wherever it lives, a stack slot included, and
+/// the pinned register is kept from every other operand. Colored first, a
+/// pinned operand that could not be precolored -- its register still held
+/// another value -- took a free register ahead of the operands that need
+/// one, and the Linux kernel's paravirt calls, which pin five operands and
+/// clobber the rest of the caller-saved registers, ran out.
 pub fn asm_register_operands(func: &Function) -> std::collections::BTreeSet<PseudoId> {
     let mut out = std::collections::BTreeSet::new();
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
@@ -1654,6 +1664,14 @@ pub fn asm_register_operands(func: &Function) -> std::collections::BTreeSet<Pseu
             continue;
         };
         for c in asm.outputs.iter().chain(asm.inputs.iter()) {
+            // A tied input is in its output's register.
+            let class = match c.matching_output {
+                Some(i) if i < asm.outputs.len() => &asm.outputs[i].class,
+                _ => &c.class,
+            };
+            if matches!(class.reg, Some(AsmRegClass::Pinned(_))) {
+                continue;
+            }
             // A memory operand whose address is a run-time value needs that
             // address in a base register just as much, which is how gcc
             // treats it. One that names its object's `Sym` is addressed in
@@ -1955,6 +1973,46 @@ impl AbiLowering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The asm register operands are the ones the template needs in a
+    /// register of their own: `"r"`, and a `"0"` tied to one. An operand
+    /// pinned to its register -- `"=a"`, `"D"`, the `"0"` tied to `"=a"` --
+    /// is moved there wherever it lives, and is left out.
+    #[test]
+    fn asm_register_operands_leave_out_the_pinned_ones() {
+        use crate::ir::{AsmConstraint, AsmData, BasicBlock, Pseudo};
+        use crate::target::Arch;
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.int_id);
+        for id in 0..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 6;
+        let op = |p: u32, c: &str, tied: Option<usize>| AsmConstraint {
+            matching_output: tied,
+            ..AsmConstraint::new(PseudoId(p), c, Arch::X86_64, 64)
+        };
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: vec![op(0, "=a", None), op(1, "=r", None)],
+            inputs: vec![
+                op(0, "0", Some(0)),
+                op(1, "1", Some(1)),
+                op(2, "D", None),
+                op(3, "r", None),
+            ],
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(asm);
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        let got: Vec<u32> = asm_register_operands(&f).iter().map(|p| p.0).collect();
+        assert_eq!(got, [1, 3]);
+    }
 
     /// One block: `a` used and ended, then `b` used and ended, a parameter's
     /// local `p` read at the end, and a `setjmp` when `returns_twice`.

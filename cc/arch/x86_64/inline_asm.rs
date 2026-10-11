@@ -204,17 +204,18 @@ fn find_temp_reg(
             return r;
         }
     }
-    crate::diag::error(
-        pos.unwrap_or_default(),
-        "too many register operands in one asm statement; c17 has no register \
-         left to give one",
-    );
+    crate::arch::codegen::report_asm_registers_exhausted(pos);
     Reg::R10
 }
 
 impl X86_64CodeGen {
-    /// Emit inline assembly
+    /// Emit inline assembly. A statement is reported on once for each thing
+    /// wrong with it, as gcc does, however many of its operands run into it.
     pub(super) fn emit_inline_asm(&mut self, insn: &Instruction) {
+        crate::diag::each_once(|| self.emit_inline_asm_statement(insn));
+    }
+
+    fn emit_inline_asm_statement(&mut self, insn: &Instruction) {
         let asm_data = match &insn.extra().asm_data {
             Some(data) => data.as_ref(),
             None => return,

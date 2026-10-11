@@ -648,6 +648,12 @@ impl<'a> Preprocessor<'a> {
             if !result.is_empty() && token.pos.whitespace {
                 result.push(' ');
             }
+            // A comment `-C` kept in the argument is spelled as written; its
+            // value is its text, not a literal's.
+            if let (TokenType::Comment, TokenValue::String(text)) = (token.typ, &token.value) {
+                result.push_str(&literal_payload(text));
+                continue;
+            }
             match &token.value {
                 TokenValue::Ident(id) => {
                     if let Some(name) = idents.get_opt(*id) {
@@ -817,8 +823,25 @@ impl<'a> Preprocessor<'a> {
         // The `)` carries a hide set of its own, and the invocation's result
         // hides only what both ends were hiding.
         let mut close_hide = None;
+        // `-C` keeps the comments among the arguments, as gcc's does: each is
+        // a token of its argument, substituted, stringified and counted with
+        // it. They go on past the line they were written on, so a `//` one
+        // becomes a `/* */` one.
+        let keep_comments = self.comments.lexed();
+        let next = |iter: &mut TokenCursor| {
+            if keep_comments {
+                iter.next_or_comment()
+            } else {
+                iter.next()
+            }
+        };
 
-        while let Some(token) = iter.next() {
+        while let Some(mut token) = next(iter) {
+            if token.typ == TokenType::Comment {
+                block_comment(&mut token);
+                current_arg.push(token);
+                continue;
+            }
             if self.is_file_directive(&token, iter) {
                 self.directive_in_macro_args(iter, &token, &mut current_arg, idents);
                 continue;

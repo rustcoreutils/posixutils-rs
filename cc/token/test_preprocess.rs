@@ -3184,3 +3184,38 @@ fn test_undef_and_imacros() {
     assert_eq!(all[7], "1", "__OPTIMIZE__");
     assert_eq!(&all[11..], ["3", "7"]);
 }
+
+/// The output's comments and strings, in order, preprocessing `input` with
+/// `comments` kept.
+fn kept_comments(input: &str, comments: Comments) -> Vec<String> {
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents)
+        .keeping_comments(comments.lexed())
+        .tokenize();
+    let config = PreprocessConfig {
+        comments,
+        preprocess_only: true,
+        ..Default::default()
+    };
+    let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+    out.iter()
+        .filter_map(|t| match (t.typ, &t.value) {
+            (TokenType::Comment | TokenType::String, TokenValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Under `-C` a comment among a macro's arguments is a token of the
+/// argument: substituted once per use, spelled by `#`, and a `//` one
+/// rewritten `/* */` with gcc's `|` for each `/` beside a `*`.
+#[test]
+fn test_comments_in_macro_arguments_are_kept() {
+    let src = "#define D(x) x x\n#define S(x) #x\n#define I(x) x\n\
+               D(1 /* c */)\nS(a /* s */ b)\nI(1 // a/*b*/c\n)\n";
+    assert_eq!(
+        kept_comments(src, Comments::InText),
+        ["/* c */", "/* c */", "a /* s */ b", "/* a|*b*|c*/"]
+    );
+    assert_eq!(kept_comments(src, Comments::Dropped), ["a b"]);
+}

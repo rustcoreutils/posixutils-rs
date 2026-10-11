@@ -227,6 +227,43 @@ fn cmdline_options_cc_keeps_comments_in_macros() {
     assert_eq!(r.stdout, "int x = 1 + 2;\nint h = ;\n");
 }
 
+/// `-C` keeps the comments among a macro's arguments, as gcc's does: they
+/// are tokens of the argument, so they stand wherever it is substituted,
+/// once per use, are spelled by `#`, and make a variadic part non-empty. A
+/// `//` comment becomes a `/* */` one, since the expansion goes on past its
+/// line, with each `/` beside a `*` in its text made `|` so the comment
+/// cannot end early or nest -- in a macro body under `-CC` too. c17 dropped
+/// every comment in an argument.
+#[test]
+fn cmdline_options_c_keeps_comments_in_macro_arguments() {
+    let src = "#define S(x) #x\n\
+               #define D(x) x x\n\
+               #define V(a, ...) a __VA_OPT__(has) __VA_ARGS__\n\
+               #define I(x) x\n\
+               #define F(x, y) x + y\n\
+               #define B 1 // a/*b*/c\n\
+               s S(a /* c */ b);\n\
+               d D(1 /* c */);\n\
+               v V(1, /* c */);\n\
+               i I(I(/* in */ x));\n\
+               c I(1 // a/*b*/c\n  );\n\
+               int a = F(1 /* one */, /* two */ 2);\n\
+               int d = I(3 /* multi\nline */ );\n\
+               b B;\n";
+    let args = "s \"a /* c */ b\";\n\
+                d 1 /* c */ 1 /* c */;\n\
+                v 1 has /* c */;\n\
+                i /* in */ x;\n\
+                c 1 /* a|*b*|c*/;\n\
+                int a = 1 /* one */ + /* two */ 2;\n\
+                int d = 3 /* multi\nline */;\n";
+    for (flag, b) in [("-C", "b 1;\n"), ("-CC", "b 1 /* a|*b*|c*/;\n")] {
+        let r = preprocess_text("arg_comments.c", src, &[flag, "-P"]);
+        assert!(r.success, "{flag}: {}", r.stderr);
+        assert_eq!(r.stdout, format!("{args}{b}"), "{flag}");
+    }
+}
+
 /// Without `-E` there is no text for a comment to be kept in, and gcc takes
 /// `-C` and `-CC` regardless.
 #[test]

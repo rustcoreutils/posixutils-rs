@@ -708,6 +708,28 @@ pub(crate) fn bundled_header_stream(name: &str) -> String {
     format!("<builtin:{name}>")
 }
 
+/// Make a kept `//` comment a `/* */` one, as gcc does for a comment it
+/// carries into a macro expansion -- one of a definition under `-CC`, or of
+/// an argument under `-C` -- where the text after it goes on on the same
+/// line. Each `/` next to a `*` in the comment's text becomes `|`, as in
+/// gcc, so that the text can neither end the comment early nor open one.
+pub(super) fn block_comment(token: &mut Token) {
+    let (TokenType::Comment, TokenValue::String(text)) = (token.typ, &token.value) else {
+        return;
+    };
+    let Some(body) = text.strip_prefix("//") else {
+        return;
+    };
+    let mut converted: Vec<char> = format!("/*{body}*/").chars().collect();
+    let end = converted.len() - 2;
+    for i in 2..end {
+        if converted[i] == '/' && (converted[i - 1] == '*' || converted[i + 1] == '*') {
+            converted[i] = '|';
+        }
+    }
+    token.value = TokenValue::String(converted.into_iter().collect());
+}
+
 /// The file a `-E` line marker names for a stream.
 ///
 /// A bundled header is compiled into c17 and has no path, so its marker
@@ -2077,11 +2099,7 @@ impl<'a> Preprocessor<'a> {
             let Some(mut token) = iter.next_or_comment() else {
                 break;
             };
-            if let (TokenType::Comment, TokenValue::String(text)) = (token.typ, &token.value) {
-                if let Some(line) = text.strip_prefix("//") {
-                    token.value = TokenValue::String(format!("/*{line}*/"));
-                }
-            }
+            block_comment(&mut token);
             tokens.push(token);
         }
         tokens

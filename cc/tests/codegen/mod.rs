@@ -59,6 +59,7 @@ mod memopt;
 mod memopt_blockops;
 mod ms_abi;
 mod named_sections;
+mod object_layout;
 mod optimizer;
 mod pic;
 mod plain_char;

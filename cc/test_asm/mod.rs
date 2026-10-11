@@ -66,6 +66,7 @@ mod codegen_memopt_blockops;
 mod codegen_ms_abi;
 mod codegen_named_sections;
 mod codegen_narrow_initializers;
+mod codegen_object_layout;
 mod codegen_optimizer;
 mod codegen_profiling;
 mod codegen_promotion;

@@ -115,18 +115,18 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Check if a symbol needs GOT access
-    /// - In PIC mode: all external symbols need GOT access
-    /// - On macOS: external symbols always need GOT access (even without PIC)
+    /// Check if a symbol needs GOT access: in ELF position-independent code,
+    /// every symbol that may bind outside the output -- an exported
+    /// definition in shared-object code too, which the executable may
+    /// interpose -- and, wherever the code goes, every symbol defined
+    /// elsewhere that does not bind within it. On macOS that is what makes
+    /// dynamic linking work; on Linux gcc would reach an external object
+    /// in position-dependent code through a copy relocation instead, and
+    /// the GOT gives the same address.
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
-        // External symbols always need GOT access:
-        // - On macOS: required for dynamic linking
-        // - On Linux: required for PIE (default) and when linking with shared libs
-        // - In PIC mode: always required
-        // Using GOT unconditionally for external symbols is safe and matches GCC/Clang behavior
-        // -- except for one that binds within the output, which gcc reaches
-        // PC-relative even when it is defined elsewhere.
-        self.extern_symbols.contains(name) && !self.base.binds_locally.contains(name)
+        let elf_pic = self.base.target.os != Os::MacOS && self.pic_mode;
+        self.base.pic_needs_got(name, elf_pic)
+            || (self.extern_symbols.contains(name) && !self.base.binds_locally.contains(name))
     }
 
     /// Compute the actual FP-relative offset for a stack location.
@@ -1422,12 +1422,16 @@ impl CodeGenerator for Aarch64CodeGen {
             let comp_dir = module.comp_dir.as_deref().unwrap_or(".");
 
             // Only reference text labels if we have code (functions)
-            // Data-only files use 0 for low_pc/high_pc
-            let (low_pc, high_pc) = if module.functions.is_empty() {
-                (None, None)
-            } else {
-                (Some(".Ltext0"), Some(".Ltext_end"))
-            };
+            // Data-only files use 0 for low_pc/high_pc, as does a unit
+            // whose functions each have a section of their own: no one
+            // range covers them, and a debugger takes the unit's extent
+            // from its functions' DIEs instead.
+            let (low_pc, high_pc) =
+                if module.functions.is_empty() || self.base.layout.function_sections {
+                    (None, None)
+                } else {
+                    (Some(".Ltext0"), Some(".Ltext_end"))
+                };
 
             super::super::dwarf::generate_abbrev_table(&mut self.base);
             let fns = std::mem::take(&mut self.base.fn_dies);
@@ -1437,6 +1441,7 @@ impl CodeGenerator for Aarch64CodeGen {
                 comp_dir,
                 low_pc_label: low_pc,
                 high_pc_label: high_pc,
+                globals: &module.globals,
             };
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
@@ -1456,6 +1461,10 @@ impl CodeGenerator for Aarch64CodeGen {
 
     fn set_pic_mode(&mut self, pic: bool) {
         self.pic_mode = pic;
+    }
+
+    fn set_object_layout(&mut self, layout: crate::target::ObjectLayout) {
+        self.base.layout = layout;
     }
 
     fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy) {

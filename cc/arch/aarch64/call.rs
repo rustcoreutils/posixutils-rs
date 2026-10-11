@@ -1078,6 +1078,23 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Bl {
                 target: CallTarget::Indirect(Reg::X16),
             });
+        } else if self.pic_mode && self.base.calls_through_got(func_name) {
+            // `-fno-plt` in position-independent code: the address from the
+            // GOT, in the register an indirect call uses. Position-dependent
+            // code calls directly, as gcc's does.
+            let sym = Symbol::extern_sym(func_name);
+            self.push_lir(Aarch64Inst::AdrpGotPage {
+                sym: sym.clone(),
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::LdrSymGotPageOff {
+                sym,
+                base: Reg::X16,
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::Bl {
+                target: CallTarget::Indirect(Reg::X16),
+            });
         } else {
             self.push_lir(Aarch64Inst::Bl {
                 target: CallTarget::Direct(Symbol::global(func_name)),

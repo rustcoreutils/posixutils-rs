@@ -81,6 +81,12 @@ pub struct CodegenOptions<'a> {
     pub tls: crate::target::TlsPolicy,
     /// Position-independent code.
     pub pic: bool,
+    /// `-fsemantic-interposition` (the default) rather than
+    /// `-fno-semantic-interposition`; see
+    /// [`ir::Module::exports_interposable`].
+    pub semantic_interposition: bool,
+    /// `-ffunction-sections`, `-fdata-sections`, `-fcommon`, `-fno-plt`.
+    pub layout: crate::target::ObjectLayout,
     /// Where the unit's CFI goes; see [`crate::target::UnwindTables::cfi`].
     pub cfi: crate::target::Cfi,
     /// `-fexceptions`: unwinding a frame runs the cleanups in scope; see
@@ -222,6 +228,7 @@ pub fn compile_tokens(
     if let Some(how) = opts.default_visibility {
         module.apply_default_visibility(how);
     }
+    module.exports_interposable = opts.tls.shared_code && opts.semantic_interposition;
     module.apply_pragma_weak(&weak_names);
 
     // Check for errors during linearization (e.g., unsupported global initializers)
@@ -319,6 +326,7 @@ pub fn compile_tokens(
     codegen.set_stack_protector(opts.stack_protector);
     codegen.set_profiling(opts.profiling);
     codegen.set_optimizing(opts.optimization.optimizes());
+    codegen.set_object_layout(opts.layout);
     let asm = codegen.generate(&module, &types);
 
     // Codegen can diagnose too. Inline asm is the case that reaches here: a

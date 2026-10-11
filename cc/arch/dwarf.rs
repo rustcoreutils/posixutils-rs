@@ -11,6 +11,7 @@
 
 use super::codegen::{escape_path, CodeGenBase};
 use super::lir::{Directive, EmitAsm, LirInst, OperandSize, Symbol};
+use crate::ir::GlobalDef;
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashMap;
 
@@ -60,6 +61,7 @@ pub const DW_AT_DECL_FILE: u64 = 0x3a;
 pub const DW_AT_DECL_LINE: u64 = 0x3b;
 pub const DW_AT_TYPE: u64 = 0x49;
 
+pub const DW_FORM_UDATA: u64 = 0x0f;
 pub const DW_FORM_BLOCK1: u64 = 0x0a;
 pub const DW_FORM_DATA1: u64 = 0x0b;
 pub const DW_FORM_FLAG: u64 = 0x0c;
@@ -73,6 +75,8 @@ pub const DW_ATE_SIGNED_CHAR: u64 = 0x06;
 pub const DW_ATE_UNSIGNED: u64 = 0x07;
 pub const DW_ATE_UNSIGNED_CHAR: u64 = 0x08;
 
+/// `DW_OP_addr` -- a target address, the operand that follows.
+pub const DW_OP_ADDR: i64 = 0x03;
 /// `DW_OP_breg0` -- register N's value plus a signed offset.
 pub const DW_OP_BREG0: i64 = 0x70;
 
@@ -92,6 +96,8 @@ const ABBREV_ARRAY: u64 = 11;
 const ABBREV_SUBRANGE: u64 = 12;
 const ABBREV_STRUCT: u64 = 13;
 const ABBREV_UNION: u64 = 14;
+const ABBREV_GLOBAL_VAR: u64 = 15;
+const ABBREV_GLOBAL_VAR_NOLOC: u64 = 16;
 
 /// Where a variable lives, as the code generator computed it: a register and a
 /// byte offset from it.
@@ -236,6 +242,33 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
         abbrev(base, code_noloc, tag, DW_CHILDREN_NO, var_attrs);
     }
 
+    // A file-scope object: where it was declared -- in any file of the unit,
+    // so the file is a `.file` number rather than always the first -- whether
+    // it is exported, and its address. A thread-local one has no address.
+    let global_attrs: &[(u64, u64)] = &[
+        (DW_AT_NAME, DW_FORM_STRING),
+        (DW_AT_DECL_FILE, DW_FORM_UDATA),
+        (DW_AT_DECL_LINE, DW_FORM_DATA4),
+        (DW_AT_TYPE, DW_FORM_REF4),
+        (DW_AT_EXTERNAL, DW_FORM_FLAG),
+    ];
+    let mut global_with_loc = global_attrs.to_vec();
+    global_with_loc.push((DW_AT_LOCATION, DW_FORM_BLOCK1));
+    abbrev(
+        base,
+        ABBREV_GLOBAL_VAR,
+        DW_TAG_VARIABLE,
+        DW_CHILDREN_NO,
+        &global_with_loc,
+    );
+    abbrev(
+        base,
+        ABBREV_GLOBAL_VAR_NOLOC,
+        DW_TAG_VARIABLE,
+        DW_CHILDREN_NO,
+        global_attrs,
+    );
+
     abbrev(
         base,
         ABBREV_BASE_TYPE,
@@ -311,11 +344,14 @@ struct TypeDies {
 }
 
 impl TypeDies {
-    fn collect(fns: &[FnDie], types: &TypeTable) -> Self {
+    fn collect(fns: &[FnDie], globals: &[GlobalDef], types: &TypeTable) -> Self {
         let mut this = TypeDies {
             index: HashMap::new(),
             order: Vec::new(),
         };
+        for g in globals.iter().filter(|g| g.decl_pos.is_some()) {
+            this.add(g.typ, types, 0);
+        }
         for f in fns {
             if let Some(t) = f.ret_typ {
                 this.add(t, types, 0);
@@ -554,6 +590,40 @@ fn emit_fn_die<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, f: &FnDie, dies:
     base.push_directive(Directive::Byte(0)); // end of this subprogram's children
 }
 
+/// Emit the DIE for each file-scope object of the unit, in definition order.
+///
+/// ld finds the source location of a reference from data by the variable
+/// whose address range holds it, so without these a link warning about a
+/// symbol referenced from an initializer (binutils' `beginwarn`) named a
+/// section offset where gcc's objects give the file and line.
+fn emit_global_dies<I: LirInst + EmitAsm>(
+    base: &mut CodeGenBase<I>,
+    globals: &[GlobalDef],
+    dies: &TypeDies,
+) {
+    for g in globals {
+        let (Some(pos), Some(ty)) = (g.decl_pos, dies.label(g.typ)) else {
+            continue;
+        };
+        base.push_directive(Directive::Uleb128(if g.is_thread_local {
+            ABBREV_GLOBAL_VAR_NOLOC
+        } else {
+            ABBREV_GLOBAL_VAR
+        }));
+        base.push_directive(Directive::Asciz(g.name.clone()));
+        base.push_directive(Directive::Uleb128(u64::from(pos.stream) + 1));
+        base.push_directive(Directive::Long(i64::from(pos.line)));
+        type_ref(base, &ty);
+        base.push_directive(Directive::Byte(if g.is_static { 0 } else { 1 }));
+        if !g.is_thread_local {
+            // `DW_OP_addr` and the eight-byte address: a nine-byte block.
+            base.push_directive(Directive::Byte(9));
+            base.push_directive(Directive::Byte(DW_OP_ADDR));
+            base.push_directive(Directive::QuadSym(Symbol::global(&g.name)));
+        }
+    }
+}
+
 /// The name a debugger should show, without the linearizer's uniquing suffix.
 ///
 /// A local is keyed as `c.4` in `func.locals` -- the trailing number keeps two
@@ -594,6 +664,8 @@ pub struct UnitInfo<'a> {
     /// Labels bounding the unit's code; `None` for a file with no functions.
     pub low_pc_label: Option<&'a str>,
     pub high_pc_label: Option<&'a str>,
+    /// The unit's objects; those declared at file scope get a DIE.
+    pub globals: &'a [GlobalDef],
 }
 
 pub fn generate_debug_info<I: LirInst + EmitAsm>(
@@ -608,8 +680,9 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
         comp_dir,
         low_pc_label,
         high_pc_label,
+        globals,
     } = *unit;
-    let dies = TypeDies::collect(fns, types);
+    let dies = TypeDies::collect(fns, globals, types);
     // Switch to .debug_info section
     base.push_directive(Directive::DebugInfo);
 
@@ -679,9 +752,11 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
         base.push_directive(Directive::Quad(0));
     }
 
-    // The compile unit's children: every type the functions mention, then the
-    // functions themselves. A zero byte closes the list.
+    // The compile unit's children: every type the objects and functions
+    // mention, then the objects, then the functions. A zero byte closes the
+    // list.
     emit_type_dies(base, &dies, types);
+    emit_global_dies(base, globals, &dies);
     for f in fns {
         emit_fn_die(base, f, &dies);
     }

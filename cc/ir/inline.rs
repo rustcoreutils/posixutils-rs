@@ -148,14 +148,12 @@ pub struct InlineCandidate {
     /// `va_list`: never inlined, never emitted, and the call left dangling at
     /// link.
     pub consumes_va_list: bool,
-    /// Whether another translation unit may replace this definition at link
-    /// time -- a `weak` definition with external linkage.
+    /// Whether another object may replace this definition, at link time or
+    /// at load time: [`Function::is_interposable`].
     ///
     /// Its body is therefore not authoritative: what runs may be some other
     /// definition entirely, so splicing this one in is a miscompile whenever
-    /// the two differ. gcc never inlines one. `static` is excluded because a
-    /// symbol with internal linkage cannot be interposed even if someone
-    /// writes `weak` on it.
+    /// the two differ. gcc never inlines one.
     pub is_interposable: bool,
     /// Whether the function contains a computed `goto *p`.
     ///
@@ -391,6 +389,7 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
     for (i, func) in module.functions.iter().enumerate() {
         let mut candidate = analyze_function(func, &call_counts);
         candidate.is_recursive |= cyclic.contains(&i);
+        candidate.is_interposable = func.is_interposable(module.exports_interposable);
         candidates.insert(func.name.clone(), candidate);
     }
 
@@ -405,7 +404,7 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
         calls_returns_twice: func.calls_returns_twice(),
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
-        is_interposable: func.symbol_attrs.weak && !func.is_static,
+        is_interposable: func.is_interposable(false),
         has_inline_hint: func.is_inline,
         ret_is_address: func.ret_is_address,
         isa: func.isa,
@@ -515,9 +514,10 @@ fn should_inline(
         return false;
     }
 
-    // A `weak` definition is interposable: the linker may bind the call to a
-    // different definition entirely, so this body is not authoritative and
-    // splicing it in is a miscompile whenever the two differ.
+    // An interposable definition -- `weak`, or exported from a shared
+    // object -- may not be the one the call reaches, so this body is not
+    // authoritative and splicing it in is a miscompile whenever the two
+    // differ.
     //
     // After `always_inline`, deliberately: the attribute on a weak function
     // is a contradiction the program asked for explicitly, and gcc resolves
@@ -2834,6 +2834,43 @@ mod tests {
         weak_static.symbol_attrs.weak = true;
         weak_static.is_static = true;
         assert!(!analyze_function(&weak_static, &HashMap::new()).is_interposable);
+    }
+
+    /// In a shared object an exported definition may be interposed at load
+    /// time, so its body is not inlined, as gcc's `-fPIC` default: unless its
+    /// visibility keeps it in the object, it is declared `inline`, or the
+    /// unit was built `-fno-semantic-interposition`.
+    #[test]
+    fn test_exported_definition_in_shared_object_is_interposable() {
+        let types = TypeTable::new(&Target::host());
+        let exported = Function::new("exported", types.int_id);
+        let mut hidden = Function::new("hidden", types.int_id);
+        hidden.symbol_attrs.visibility = Some("hidden".into());
+        let mut protected = Function::new("protected", types.int_id);
+        protected.symbol_attrs.visibility = Some("protected".into());
+        let mut inline = Function::new("inline", types.int_id);
+        inline.is_inline = true;
+        let mut local = Function::new("local", types.int_id);
+        local.is_static = true;
+        let mut weak = Function::new("weak", types.int_id);
+        weak.symbol_attrs.weak = true;
+        let mut module = Module {
+            functions: vec![exported, hidden, protected, inline, local, weak],
+            ..Default::default()
+        };
+        let interposable = |module: &Module| {
+            let candidates = analyze_all_functions(module);
+            let mut names: Vec<String> = candidates
+                .into_iter()
+                .filter(|(_, c)| c.is_interposable)
+                .map(|(name, _)| name)
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(interposable(&module), ["weak"]);
+        module.exports_interposable = true;
+        assert_eq!(interposable(&module), ["exported", "weak"]);
     }
 
     #[test]

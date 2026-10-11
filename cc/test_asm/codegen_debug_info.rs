@@ -358,3 +358,48 @@ fn codegen_debug_paths_are_escaped() {
         assert!(!asm.contains("q\"d\\e"), "{triple}: unescaped path:\n{asm}");
     }
 }
+
+/// `-g` describes each file-scope object with a `DW_TAG_variable`: its
+/// name, the file and line it was declared on, its type and its address
+/// (`DW_OP_addr`), a `static` one too, as gcc does. ld names a warning
+/// symbol's referencing object by that file and line ("beginwarn.c:7:"),
+/// and a debugger finds the object by it. A thread-local one has no fixed
+/// address and gets no location.
+#[test]
+fn codegen_debug_emits_file_scope_variable_dies() {
+    let src = "int counter = 3;\n\
+               static const char tag[] = \"t\";\n\
+               \n\
+               __thread int per_thread;\n\
+               int get(void) { return counter + tag[0] + per_thread; }\n";
+    for triple in [X86_64_LINUX, AARCH64_LINUX, DARWIN] {
+        let asm = asm_for_with("debug_globals", triple, src, &["-g", "-O0"]);
+        let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+        let prefix = if triple == DARWIN { "_" } else { "" };
+        for (name, line) in [("counter", 1), ("tag", 2)] {
+            let at = lines
+                .iter()
+                .position(|l| *l == format!(".asciz \"{name}\""))
+                .unwrap_or_else(|| panic!("{triple}: no DIE named {name}:\n{asm}"));
+            // decl_file, decl_line, type, external, then the 9-byte
+            // `DW_OP_addr` block.
+            let die = &lines[at..at + 9];
+            assert_eq!(die[2], format!(".long {line}"), "{triple} {name}:\n{die:?}");
+            assert_eq!(die[5], ".byte 9", "{triple} {name}:\n{die:?}");
+            assert_eq!(die[6], ".byte 3", "{triple} {name}:\n{die:?}");
+            assert_eq!(
+                die[7],
+                format!(".quad {prefix}{name}"),
+                "{triple}:\n{die:?}"
+            );
+        }
+        assert!(
+            lines.contains(&".asciz \"per_thread\""),
+            "{triple}: no DIE for the thread-local:\n{asm}"
+        );
+        assert!(
+            !lines.contains(&format!(".quad {prefix}per_thread").as_str()),
+            "{triple}: a thread-local has no fixed address:\n{asm}"
+        );
+    }
+}

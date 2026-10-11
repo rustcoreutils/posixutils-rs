@@ -1041,6 +1041,11 @@ pub enum Directive {
     /// and emits no common symbols at all.
     BssGlobal { sym: Symbol, size: u64, align: u32 },
 
+    /// `.comm sym,size,align`: a common symbol, `-fcommon`'s tentative
+    /// definition, which the linker merges with every other definition of
+    /// the name. ELF only; the alignment is in bytes.
+    Comm { sym: Symbol, size: u64, align: u32 },
+
     // ========================================================================
     // Alignment
     // ========================================================================
@@ -1578,6 +1583,15 @@ impl EmitAsm for Directive {
                         let _ = writeln!(out, ".zero {size}");
                     }
                 }
+            }
+            Directive::Comm { sym, size, align } => {
+                let _ = writeln!(
+                    out,
+                    ".comm {},{},{}",
+                    sym.format_for_target(target),
+                    size,
+                    align
+                );
             }
             Directive::BssLocal { sym, size, align } => match target.os {
                 Os::MacOS => {

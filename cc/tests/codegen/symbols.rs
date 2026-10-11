@@ -1459,3 +1459,69 @@ int main(void) { return 0; }
         );
     }
 }
+
+/// ld names where a warning symbol is referenced from by the referencing
+/// object's DWARF: for a reference from data, the `DW_TAG_variable` whose
+/// address range holds it. With file-scope objects described, a c17 object
+/// gets gcc's "beginwarn.c:7:" (binutils' ld-elf beginwarn test) instead of
+/// a bare section offset, and readelf shows the variable's line.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_debug_variables_locate_link_warnings() {
+    let dir = crate::common::work_dir("beginwarn");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(
+        p("beginwarn.c"),
+        "static const char _evoke_link_warning_foo []\n\
+         \x20 __attribute__ ((used, section (\".gnu.warning.foo\")))\n\
+         \x20   = \"function foo is deprecated\";\n\
+         \n\
+         extern void foo (void);\n\
+         \n\
+         static void (*const init_array []) (void)\n\
+         \x20 __attribute__ ((used, section (\".init_array\"), aligned (sizeof (void *))))\n\
+         \x20 = { foo };\n",
+    )
+    .unwrap();
+    std::fs::write(p("foo.c"), "void foo (void) { }\n").unwrap();
+    let r = crate::common::run_c17(&[
+        "-g",
+        "-fPIC",
+        "-c",
+        "-o",
+        &p("beginwarn.o"),
+        &p("beginwarn.c"),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let r = crate::common::run_c17(&["-shared", "-fPIC", "-o", &p("libfoo.so"), &p("foo.c")]);
+    assert!(r.success, "{}", r.stderr);
+    let r = crate::common::run_c17(&[
+        "-shared",
+        "-o",
+        &p("libbarw.so"),
+        &p("beginwarn.o"),
+        &p("libfoo.so"),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(
+        r.stderr.contains("beginwarn.c:7:") && r.stderr.contains("function foo is deprecated"),
+        "{}",
+        r.stderr
+    );
+
+    let info = Command::new("readelf")
+        .args(["--debug-dump=info", &p("beginwarn.o")])
+        .output()
+        .expect("readelf");
+    let info = String::from_utf8_lossy(&info.stdout);
+    let die = info
+        .split("DW_TAG_variable")
+        .find(|d| d.contains("init_array"))
+        .unwrap_or_else(|| panic!("no DIE for init_array:\n{info}"));
+    let line = die
+        .lines()
+        .find_map(|l| l.split("DW_AT_decl_line").nth(1))
+        .map(|v| v.trim_start_matches([' ', ':']).trim());
+    assert!(matches!(line, Some("7" | "0x7")), "{die}");
+    assert!(die.contains("DW_OP_addr"), "{die}");
+}

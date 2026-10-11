@@ -182,6 +182,35 @@ impl PositionIndependence {
     }
 }
 
+/// How the object file lays out and links to its symbols: gcc's
+/// `-ffunction-sections`, `-fdata-sections`, `-fcommon` and `-fno-plt`.
+/// ELF only; a Mach-O object places every symbol in its own atom anyway,
+/// and clang ignores these there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLayout {
+    /// `-ffunction-sections`: each function in `.text.NAME`.
+    pub function_sections: bool,
+    /// `-fdata-sections`: each object in `.data.NAME`, `.bss.NAME`,
+    /// `.rodata.NAME` and the like.
+    pub data_sections: bool,
+    /// `-fcommon`: a tentative definition is a common symbol.
+    pub common: bool,
+    /// Not `-fno-plt`: a call to a function that may be defined elsewhere
+    /// goes through a PLT stub, rather than loading its GOT entry.
+    pub plt: bool,
+}
+
+impl Default for ObjectLayout {
+    fn default() -> Self {
+        Self {
+            function_sections: false,
+            data_sections: false,
+            common: false,
+            plt: true,
+        }
+    }
+}
+
 /// `-fstack-clash-protection`'s two `--param`s, as written: each the log2 of
 /// a byte count. c17 probes no stack; these move where gcc would, and so
 /// which functions c17 warns about.

@@ -184,8 +184,41 @@ pub struct CodeGenBase<I: LirInst> {
     /// The symbols the static linker resolves within the output being
     /// built; see [`CodeGenBase::plan_local_binding`].
     pub binds_locally: std::collections::HashSet<String>,
+    /// `-ffunction-sections`, `-fdata-sections`, `-fcommon`, `-fno-plt`.
+    pub layout: crate::target::ObjectLayout,
     /// The `-fexceptions` tables: the LSDAs and what they name.
     pub eh: super::eh::EhTables,
+}
+
+/// `-fdata-sections`' own section for `global`, named as gcc names it:
+/// the section it would otherwise share, then `.` and its name --
+/// `.bss.x`, `.tdata.x`, `.rodata.x`, `.data.rel.ro.x`, `.data.x`.
+fn own_data_section(global: &crate::ir::GlobalDef, zero_init: bool) -> Directive {
+    let name = &global.name;
+    let (name, flags) = if global.is_thread_local {
+        if matches!(global.init, Initializer::None) {
+            (
+                format!(".tbss.{name},\"awT\",@nobits"),
+                SectionFlags::ThreadLocal,
+            )
+        } else {
+            (format!(".tdata.{name}"), SectionFlags::ThreadLocal)
+        }
+    } else if global.is_const {
+        if global.init.has_reloc() {
+            (format!(".data.rel.ro.{name}"), SectionFlags::Writable)
+        } else {
+            (format!(".rodata.{name}"), SectionFlags::ReadOnly)
+        }
+    } else if zero_init {
+        (
+            format!(".bss.{name},\"aw\",@nobits"),
+            SectionFlags::Writable,
+        )
+    } else {
+        (format!(".data.{name}"), SectionFlags::Writable)
+    };
+    Directive::NamedSection { name, flags }
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -213,17 +246,26 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             asm_instances: 0,
             named_sections: std::collections::HashMap::new(),
             binds_locally: std::collections::HashSet::new(),
+            layout: Default::default(),
             eh: Default::default(),
         }
     }
 
     /// Note which symbols bind within the output being built, whatever
-    /// else is linked with it -- a `static` definition, or one with hidden
-    /// or internal visibility, defined here or only declared -- so position-
-    /// independent code reaches them PC-relative instead of through the GOT,
-    /// as gcc does (`binds_local_p`). The Linux vDSO, built `-fPIC`, is
-    /// linked with no dynamic relocations at all, and glibc's loader runs
-    /// code before its own GOT is relocated.
+    /// else is linked with it, so position-independent code reaches them
+    /// PC-relative instead of through the GOT, as gcc does (`binds_local_p`).
+    /// The Linux vDSO, built `-fPIC`, is linked with no dynamic relocations
+    /// at all, and glibc's loader runs code before its own GOT is relocated.
+    ///
+    /// Wherever the code goes, that is a `static` definition, and one with
+    /// hidden or internal visibility, defined here or only declared; and a
+    /// protected function defined here, whose address the dynamic linker
+    /// never gives to another object's definition. Code for an executable
+    /// (a PIE) also binds everything it defines but a common symbol, which
+    /// may be merged with another object's definition: nothing loaded later
+    /// can replace an executable's definition. Shared-object code does not: an
+    /// exported definition may be interposed at load time by one in the
+    /// executable or an earlier library.
     ///
     /// A weak declaration may stay undefined, and only the GOT can hold its
     /// null; a protected object may be copied into the executable, so its
@@ -234,25 +276,99 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         if self.target.os == Os::MacOS {
             return;
         }
-        let local_visibility = |attrs: &crate::parse::ast::SymbolAttrs| {
-            matches!(attrs.visibility.as_deref(), Some("hidden" | "internal"))
-        };
+        let executable = !self.tls.shared_code;
+        let local_visibility =
+            |visibility: Option<&str>| matches!(visibility, Some("hidden" | "internal"));
         let functions = module
             .functions
             .iter()
-            .filter(|f| f.is_static || local_visibility(&f.symbol_attrs))
+            .filter(|f| {
+                let visibility = f.symbol_attrs.visibility.as_deref();
+                f.is_static
+                    || local_visibility(visibility)
+                    || (f.emit && (executable || visibility == Some("protected")))
+            })
             .map(|f| &f.name);
         let objects = module
             .globals
             .iter()
-            .filter(|g| g.is_static || local_visibility(&g.symbol_attrs))
+            .filter(|g| {
+                g.is_static
+                    || local_visibility(g.symbol_attrs.visibility.as_deref())
+                    || (executable && !self.is_common(g))
+            })
             .map(|g| &g.name);
+        // An indirect function's address is the one its resolver picks,
+        // which only the GOT gives in every kind of output.
+        let aliases = module
+            .aliases
+            .iter()
+            .filter(|a| a.form == crate::parse::ast::AliasForm::Alias)
+            .filter(|a| a.is_static || executable || local_visibility(a.visibility.as_deref()))
+            .map(|a| &a.name);
         let declared = module
             .declared_symbol_attrs
             .iter()
-            .filter(|(_, attrs)| local_visibility(attrs) && !attrs.weak)
+            .filter(|(_, attrs)| local_visibility(attrs.visibility.as_deref()) && !attrs.weak)
             .map(|(name, _)| name);
-        self.binds_locally = functions.chain(objects).chain(declared).cloned().collect();
+        let binds_locally = functions
+            .chain(objects)
+            .chain(aliases)
+            .chain(declared)
+            .cloned()
+            .collect();
+        self.binds_locally = binds_locally;
+    }
+
+    /// Whether `global` is emitted as a common symbol: `-fcommon`'s
+    /// tentative definition -- one with no initializer anywhere in the unit
+    /// -- unless it has internal linkage, is thread-local, is weak or names
+    /// its section, as gcc. A common symbol may be merged with a definition
+    /// elsewhere, so it never binds locally in position-independent code.
+    pub fn is_common(&self, global: &crate::ir::GlobalDef) -> bool {
+        self.layout.common
+            && self.target.os != Os::MacOS
+            && !global.is_static
+            && !global.is_thread_local
+            && !global.symbol_attrs.weak
+            && global.symbol_attrs.section.is_none()
+            && !is_private_name(&global.name)
+            && matches!(global.init, Initializer::None)
+    }
+
+    /// The section `func` goes in, when it is not `.text`: the one its
+    /// `section` attribute names, or under `-ffunction-sections` its own
+    /// `.text.NAME`, gcc's name, so that `ld --gc-sections` can drop it.
+    pub fn function_section(&self, func: &Function) -> Option<Directive> {
+        let name = match &func.symbol_attrs.section {
+            Some(name) => name.clone(),
+            None if self.layout.function_sections && self.target.os != Os::MacOS => {
+                format!(".text.{}", func.name)
+            }
+            None => return None,
+        };
+        Some(Directive::NamedSection {
+            name,
+            flags: SectionFlags::Code,
+        })
+    }
+
+    /// `-fno-plt`: whether a call to `name` loads the function's address
+    /// from its GOT entry and calls that, rather than calling a PLT stub --
+    /// every function that may bind outside the output, in ELF code, as
+    /// gcc does.
+    pub fn calls_through_got(&self, name: &str) -> bool {
+        !self.layout.plt
+            && self.target.os != Os::MacOS
+            && !is_private_name(name)
+            && !self.binds_locally.contains(name)
+    }
+
+    /// Whether position-independent code reaches `name` through the GOT:
+    /// every symbol that may bind outside the output being built (see
+    /// [`Self::plan_local_binding`]), except a name c17 made up.
+    pub fn pic_needs_got(&self, name: &str, pic: bool) -> bool {
+        pic && !super::lir::is_private_name(name) && !self.binds_locally.contains(name)
     }
 
     /// Decide the flags of every section the program named, before any
@@ -652,7 +768,25 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             && named_section.is_none()
             && !global.symbol_attrs.weak
             && global.symbol_attrs.visibility.is_none();
-        if zero_init && !is_local_label {
+        if self.is_common(global) {
+            if let Some(how) = &global.symbol_attrs.visibility {
+                self.push_directive(Directive::Visibility(
+                    Symbol::global(&global.name),
+                    how.clone(),
+                ));
+            }
+            self.push_directive(Directive::Comm {
+                sym: Symbol::global(&global.name),
+                size,
+                align,
+            });
+            return;
+        }
+        let own_section = self.layout.data_sections
+            && self.target.os != Os::MacOS
+            && !is_local_label
+            && named_section.is_none();
+        if zero_init && !is_local_label && !own_section {
             if global.is_static {
                 self.push_directive(Directive::bss_local(&global.name, size, align));
             } else {
@@ -672,6 +806,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 name: name.clone(),
                 flags,
             });
+        } else if own_section {
+            self.push_directive(own_data_section(global, zero_init));
         } else if global.is_thread_local {
             if matches!(global.init, Initializer::None) {
                 // Uninitialized TLS: .tbss section
@@ -1517,6 +1653,10 @@ pub trait CodeGenerator {
     /// Say whether the unit is optimized. A target with CET reads it: as in
     /// gcc, only optimization finds a static function needs no `endbr64`.
     fn set_optimizing(&mut self, _on: bool) {}
+
+    /// Set `-ffunction-sections`, `-fdata-sections`, `-fcommon` and
+    /// `-fno-plt`.
+    fn set_object_layout(&mut self, layout: crate::target::ObjectLayout);
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit

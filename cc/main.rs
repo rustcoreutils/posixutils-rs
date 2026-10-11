@@ -509,6 +509,48 @@ struct Args {
     #[arg(long = "fno-rounding-math", overrides_with = "frounding_math", help = gettext("Assume the default rounding direction (default)"))]
     fno_rounding_math: bool,
 
+    /// `-fno-semantic-interposition`: an exported definition in a shared
+    /// object is the one its own calls reach, so its body may be inlined.
+    #[arg(long = "fno-semantic-interposition", help = gettext("Assume a shared object's exported functions are not replaced at load time"))]
+    fno_semantic_interposition: bool,
+
+    /// Undo `-fno-semantic-interposition`: the default.
+    #[arg(long = "fsemantic-interposition", overrides_with = "fno_semantic_interposition", help = gettext("Let another object replace a shared object's exported functions (default)"))]
+    fsemantic_interposition: bool,
+
+    /// `-ffunction-sections`: each function in a section of its own.
+    #[arg(long = "ffunction-sections", help = gettext("Place each function in a section of its own"))]
+    ffunction_sections: bool,
+
+    /// Undo `-ffunction-sections`: the default.
+    #[arg(long = "fno-function-sections", overrides_with = "ffunction_sections", help = gettext("Place the functions together in .text (default)"))]
+    fno_function_sections: bool,
+
+    /// `-fdata-sections`: each object in a section of its own.
+    #[arg(long = "fdata-sections", help = gettext("Place each object in a section of its own"))]
+    fdata_sections: bool,
+
+    /// Undo `-fdata-sections`: the default.
+    #[arg(long = "fno-data-sections", overrides_with = "fdata_sections", help = gettext("Place the objects together in .data, .bss and .rodata (default)"))]
+    fno_data_sections: bool,
+
+    /// `-fcommon`: a tentative definition is a common symbol.
+    #[arg(long = "fcommon", help = gettext("Make a tentative definition a common symbol"))]
+    fcommon: bool,
+
+    /// Undo `-fcommon`: the default.
+    #[arg(long = "fno-common", overrides_with = "fcommon", help = gettext("Make a tentative definition an ordinary definition (default)"))]
+    fno_common: bool,
+
+    /// `-fno-plt`: call a function that may be defined elsewhere through
+    /// its GOT entry.
+    #[arg(long = "fno-plt", help = gettext("Call external functions through the GOT, not the PLT"))]
+    fno_plt: bool,
+
+    /// Undo `-fno-plt`: the default.
+    #[arg(long = "fplt", overrides_with = "fno_plt", help = gettext("Call external functions through the PLT (default)"))]
+    fplt: bool,
+
     /// Undo `-fno-trapping-math`: the default. Accepted so the last flag on
     /// the line wins.
     #[arg(long = "ftrapping-math", overrides_with = "fno_trapping_math", help = gettext("Keep every floating-point exception the program can observe (default)"))]
@@ -1547,6 +1589,13 @@ fn process_file(
         default_visibility: args.default_visibility.as_deref(),
         tls,
         pic: producing_shared(args) || position.is_pic(),
+        semantic_interposition: !args.fno_semantic_interposition,
+        layout: target::ObjectLayout {
+            function_sections: args.ffunction_sections,
+            data_sections: args.fdata_sections,
+            common: args.fcommon,
+            plt: !args.fno_plt,
+        },
         cfi: args.unwind_tables().cfi(target, args.debug > 0),
         exceptions: args.unwind_tables().exceptions(),
         verbose_asm: args.verbose_asm,
@@ -1690,6 +1739,12 @@ impl StripBy {
 /// as written, among the other linker flags.
 fn link_mode_flag(args: &Args, target: &Target) -> Option<&'static str> {
     let has = |flag: &str| args.linker_flags.iter().any(|f| f == flag);
+    // `-r` links a relocatable object: the host driver passes it to the
+    // linker with no startup files or libraries, and the linker refuses it
+    // beside `-pie`.
+    if has("-r") {
+        return None;
+    }
     Some(if producing_shared(args) {
         "-shared"
     } else if target.os == Os::MacOS {
@@ -2017,17 +2072,27 @@ const GCC_ONE_DASH_LONG: &[&str] = &[
     "-aux-info",
     "-dD",
     "-dM",
+    "-fcommon",
+    "-fdata-sections",
     "-fdiagnostics-show-option",
+    "-ffunction-sections",
     "-fgnu89-inline",
     "-fmath-errno",
     "-fno-builtin",
+    "-fno-common",
+    "-fno-data-sections",
     "-fno-diagnostics-show-option",
+    "-fno-function-sections",
     "-fno-gnu89-inline",
     "-fno-math-errno",
+    "-fno-plt",
     "-fno-rounding-math",
+    "-fno-semantic-interposition",
     "-fno-trapping-math",
     "-fpermissive",
+    "-fplt",
     "-frounding-math",
+    "-fsemantic-interposition",
     "-fsyntax-only",
     "-ftrapping-math",
     "-fverbose-asm",
@@ -2052,7 +2117,8 @@ const GCC_ONE_DASH_LONG: &[&str] = &[
 /// objects: the startup files, the C library, libgcc and the kind of
 /// executable. c17 links through the host driver and adds nothing of its own
 /// there, so each goes to that driver as written. `-static` and
-/// `-static-pie` also decide the link's leading option (`link_mode_flag`).
+/// `-static-pie` also decide the link's leading option (`link_mode_flag`),
+/// and `-r` that it has none.
 /// clap would read every one as a short cluster (`-shared-libgcc` as
 /// `-s -h ...`, which printed the help).
 const HOST_LINK_OPTIONS: &[&str] = &[
@@ -2060,6 +2126,7 @@ const HOST_LINK_OPTIONS: &[&str] = &[
     "-nolibc",
     "-nostartfiles",
     "-nostdlib",
+    "-r",
     "-shared-libgcc",
     "-static",
     "-static-libgcc",
@@ -2528,6 +2595,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             i += 1;
         } else if arg == "-pipe" {
             // Misc GCC flags - silently ignore
+            i += 1;
+        } else if arg == "--static" {
+            // gcc's second spelling of `-static`.
+            result.push("--c17-linker-flag=-static".to_string());
             i += 1;
         } else if arg == "-pie" || arg == "-no-pie" {
             // Link options only: what the code is compiled as is the `-fpic`
@@ -4556,7 +4627,7 @@ mod tests {
     /// withdrawing it.
     #[test]
     fn test_preprocess_unsupported_f_flags_are_kept_for_the_warning() {
-        for flag in &["-fcommon", "-ftrapv"] {
+        for flag in &["-fharden-compares", "-ftrapv"] {
             let result = run_preprocess(&[flag, "foo.c"]);
             assert!(
                 result.contains(&format!("--c17-unsupported={flag}")),
@@ -4624,10 +4695,8 @@ mod tests {
     #[test]
     fn test_preprocess_accepted_f_flags_leave_nothing() {
         for flag in &[
-            "-fno-semantic-interposition",
             "-fno-reorder-blocks-and-partition",
-            "-fno-plt",
-            "-fno-common",
+            "-feliminate-dwarf2-dups",
             "-fdiagnostics-color=always",
             "-flto=auto",
             "-ffat-lto-objects",

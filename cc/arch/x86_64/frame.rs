@@ -14,7 +14,7 @@ use crate::abi::{get_abi, Abi, ArgClass, RegClass};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
     complex_fp_info, complex_sse_regs, eightbyte_bytes, plan_pair_move, CallTarget, CondCode,
-    Directive, FpSize, Label, OperandSize, PairMove, SectionFlags, Symbol,
+    Directive, FpSize, Label, OperandSize, PairMove, Symbol,
 };
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
@@ -426,11 +426,8 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Directive(Directive::Text));
 
         // A named section replaces .text for this function.
-        if let Some(sec) = &func.symbol_attrs.section {
-            self.push_lir(X86Inst::Directive(Directive::NamedSection {
-                name: sec.clone(),
-                flags: SectionFlags::Code,
-            }));
+        if let Some(section) = self.base.function_section(func) {
+            self.push_lir(X86Inst::Directive(section));
         }
 
         // Skip .globl for static functions (internal linkage)

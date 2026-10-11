@@ -82,6 +82,10 @@ struct Options {
     prefix_maps: Vec<MapOption>,
     /// `-fvisibility=`.
     default_visibility: Option<String>,
+    /// `-fno-semantic-interposition`.
+    no_semantic_interposition: bool,
+    /// `-ffunction-sections`, `-fdata-sections`, `-fcommon`, `-fno-plt`.
+    layout: target::ObjectLayout,
 }
 
 /// Apply `flags` the way the driver does: the switches that live in
@@ -129,6 +133,11 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-fno-trapping-math" => o.trapping_math = false,
             "-frounding-math" => o.fp_rounding = crate::float::FpRounding::Dynamic,
             "-fno-inline" => o.inlining = Some(false),
+            "-fno-semantic-interposition" => o.no_semantic_interposition = true,
+            "-ffunction-sections" => o.layout.function_sections = true,
+            "-fdata-sections" => o.layout.data_sections = true,
+            "-fcommon" => o.layout.common = true,
+            "-fno-plt" => o.layout.plt = false,
             "-finline" => o.inlining = Some(true),
             "-fsigned-char" | "-fno-unsigned-char" => {
                 o.plain_char = Some(target::CharSignedness::Signed)
@@ -263,6 +272,8 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             floor: o.tls_model,
         },
         pic: o.shared || position.is_pic(),
+        semantic_interposition: !o.no_semantic_interposition,
+        layout: o.layout,
         cfi: o.unwind.cfi(&target, o.debug),
         exceptions: o.unwind.exceptions(),
         verbose_asm: o.verbose_asm,

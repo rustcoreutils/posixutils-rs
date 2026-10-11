@@ -3241,6 +3241,30 @@ impl Default for Function {
 }
 
 impl Function {
+    /// May what runs when this unit calls the function be some other
+    /// definition than this body? Then the body is no evidence about the
+    /// call, and is neither inlined nor analyzed, as gcc's `AVAIL_INTERPOSABLE`.
+    ///
+    /// A `weak` definition exists to be replaced at link time. In a shared
+    /// object (`exports_interposable`, see [`Module::exports_interposable`])
+    /// so may any exported one at load time, by a definition in the
+    /// executable or an earlier library -- unless its visibility keeps it in
+    /// the object, or it is declared `inline`, which gcc takes as a promise
+    /// that every definition does the same. `static` is never replaced.
+    pub fn is_interposable(&self, exports_interposable: bool) -> bool {
+        if self.is_static {
+            return false;
+        }
+        if self.symbol_attrs.weak {
+            return true;
+        }
+        let exported = matches!(
+            self.symbol_attrs.visibility.as_deref(),
+            None | Some("default")
+        );
+        exports_interposable && exported && !self.is_inline
+    }
+
     pub fn new(name: impl Into<String>, return_type: TypeId) -> Self {
         Self {
             name: name.into(),
@@ -3929,6 +3953,10 @@ pub struct GlobalDef {
     /// How many file-scope asm statements precede this definition in the
     /// source; see [`Function::asm_before`].
     pub asm_before: usize,
+    /// Where a file-scope object was first declared, for `-g`'s
+    /// `DW_TAG_variable`; `None` for an object the program does not name at
+    /// file scope -- a block-scope `static`, a compound literal.
+    pub decl_pos: Option<Position>,
 }
 
 impl GlobalDef {
@@ -3944,6 +3972,7 @@ impl GlobalDef {
             explicit_align: None,
             symbol_attrs: Default::default(),
             asm_before: 0,
+            decl_pos: None,
         }
     }
 
@@ -4132,6 +4161,11 @@ pub struct Module {
     /// External symbols (declared extern but not defined in this module)
     /// These need GOT access on macOS
     pub extern_symbols: HashSet<String>,
+    /// Whether an exported definition of this unit may be replaced at load
+    /// time by another object's -- gcc's semantic interposition: code for a
+    /// shared object (`-fpic`, `-fPIC`, `-shared`) without
+    /// `-fno-semantic-interposition`. See [`Function::is_interposable`].
+    pub exports_interposable: bool,
     /// Attributes written on a symbol this translation unit declares but does
     /// not define. `weak` is the point of it: `extern int f(void)
     /// __attribute__((weak));` has to reach the object file as `.weak f`, or

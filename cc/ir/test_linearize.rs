@@ -2082,3 +2082,25 @@ fn test_stack_protect_attribute_reaches_the_function() {
     assert_eq!(attr("n"), StackProtectAttr::Exempt);
     assert_eq!(attr("d"), StackProtectAttr::Unspecified);
 }
+
+/// A file-scope object records where it was first declared, for `-g`'s
+/// `DW_TAG_variable` -- a tentative definition completed later keeps the
+/// first line -- and a block-scope `static` records nothing, having no
+/// file-scope DIE.
+#[test]
+fn test_file_scope_objects_record_their_declaration() {
+    let src = "int a;\n\nstatic int b = 1;\nint a = 2;\nint f(void) { static int c; return c; }\n";
+    let module = linearize_source(src, &Target::host());
+    let line = |name: &str| {
+        module
+            .globals
+            .iter()
+            .find(|g| g.name == name || g.name.contains(&format!("{name}.")))
+            .unwrap_or_else(|| panic!("no global {name}"))
+            .decl_pos
+            .map(|p| p.line)
+    };
+    assert_eq!(line("a"), Some(1));
+    assert_eq!(line("b"), Some(3));
+    assert_eq!(line("c"), None);
+}

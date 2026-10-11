@@ -344,3 +344,101 @@ extern __inline__ __attribute__((__gnu_inline__)) int scm_car(int x) { return x 
     }
 }
 
+/// An executable's definitions interpose a shared object's exported ones,
+/// and the library's own calls and accesses reach them, as with gcc's
+/// `-fPIC` default (binutils' ld-vsb, elfweak): the library calls `f`
+/// through the PLT and reads `gv` through the GOT. Its hidden function, and
+/// everything once built `-fno-semantic-interposition`, still binds within
+/// the library for calls.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_pic_executable_interposes_library_definitions() {
+    let lib = r#"
+int gv = 1;
+int f(void) { return 10; }
+__attribute__((visibility("hidden"))) int hf(void) { return 100; }
+int lib_entry(void) { return f() + gv + hf(); }
+"#;
+    let main = r#"
+int gv = 2;
+int f(void) { return 20; }
+int lib_entry(void);
+int main(void) { return lib_entry(); }
+"#;
+    let dir = crate::common::work_dir("pic_interpose");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(p("lib.c"), lib).unwrap();
+    std::fs::write(p("main.c"), main).unwrap();
+    for (opt, extra, expect) in [
+        ("-O0", None, 122),
+        ("-O2", None, 122),
+        ("-O2", Some("-fno-semantic-interposition"), 112),
+    ] {
+        let mut args = vec![opt, "-shared", "-fPIC", "-o"];
+        let so = p("libinterpose.so");
+        args.push(&so);
+        let src = p("lib.c");
+        args.push(&src);
+        args.extend(extra);
+        let r = crate::common::run_c17(&args);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let r = crate::common::run_c17(&[
+            "-o",
+            &p("main"),
+            &p("main.c"),
+            &so,
+            &format!("-Wl,-rpath,{}", dir.path().display()),
+        ]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let code = std::process::Command::new(p("main"))
+            .status()
+            .unwrap()
+            .code();
+        assert_eq!(code, Some(expect), "{opt} {extra:?}");
+    }
+}
+
+/// A position-dependent executable and a shared library agree on the
+/// address of the library's function: the executable takes it as an
+/// absolute immediate, as gcc does, so the linker makes its PLT entry the
+/// one canonical address and the library's GOT holds the same. A
+/// PC-relative `leaq` got the PLT entry without telling the linker it was
+/// an address, and the two pointers differed (binutils' indirect4,
+/// protected-func-2, pr23169).
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_no_pie_function_address_equals_library_one() {
+    let lib = r#"
+int lf(void) { return 1; }
+void *lib_addr(void) { return (void *)lf; }
+"#;
+    let main = r#"
+int lf(void);
+void *lib_addr(void);
+int main(void) { void *volatile p = (void *)lf; return p != lib_addr(); }
+"#;
+    let dir = crate::common::work_dir("nopie_fnaddr");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(p("lib.c"), lib).unwrap();
+    std::fs::write(p("main.c"), main).unwrap();
+    let so = p("libfnaddr.so");
+    let r = crate::common::run_c17(&["-O2", "-shared", "-fPIC", "-o", &so, &p("lib.c")]);
+    assert!(r.success, "{}", r.stderr);
+    for opt in ["-O0", "-O2"] {
+        let r = crate::common::run_c17(&[
+            opt,
+            "-fno-pie",
+            "-o",
+            &p("main"),
+            &p("main.c"),
+            &so,
+            &format!("-Wl,-rpath,{}", dir.path().display()),
+        ]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let code = std::process::Command::new(p("main"))
+            .status()
+            .unwrap()
+            .code();
+        assert_eq!(code, Some(0), "{opt}: the two addresses differ");
+    }
+}

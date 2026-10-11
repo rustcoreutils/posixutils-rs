@@ -109,14 +109,14 @@ const PLAIN: &[(&str, Effect)] = &[
     ("asynchronous-unwind-tables", Implemented),
     // Main driver: `-fcf-protection` and its `=` form.
     ("cf-protection", Implemented),
-    // A tentative definition is an ordinary definition, not a common
-    // symbol that merges with its namesakes in other units.
     // C++'s `new` checks its result for null.
     ("check-new", Accepted(OtherLanguage)),
-    ("common", Unsupported),
+    // A tentative definition is a common symbol, merged with its
+    // namesakes in other units; `-fno-` (the default), an ordinary one.
+    ("common", Implemented),
     ("conserve-stack", Accepted(Pass)),
     ("cx-limited-range", Accepted(Permission)),
-    ("data-sections", Accepted(Placement)),
+    ("data-sections", Implemented),
     ("diagnostics-color", Accepted(Presentation)),
     ("diagnostics-format=text", Accepted(Presentation)),
     // Main driver: whether a diagnostic names its option.
@@ -129,6 +129,8 @@ const PLAIN: &[(&str, Effect)] = &[
     // writes it; `-fno-` is refused by the driver, c17 having no tables of
     // its own to write instead.
     ("dwarf2-cfi-asm", Accepted(Default)),
+    // Obsolete: gcc 13 takes it and does nothing.
+    ("eliminate-dwarf2-dups", Accepted(Pass)),
     // The unwind tables, and the landing pads that run a `cleanup`
     // variable's cleanup when its frame is unwound: `target::UnwindTables`.
     ("exceptions", Implemented),
@@ -143,7 +145,9 @@ const PLAIN: &[(&str, Effect)] = &[
     // c17 keeps no excess precision: `float` and `double` live in SSE or
     // FP registers of their own width.
     ("float-store", Accepted(Default)),
-    ("function-sections", Accepted(Placement)),
+    // Each function, or object, in a section of its own: `.text.NAME`,
+    // `.data.NAME` and the rest.
+    ("function-sections", Implemented),
     // The GIMPLE front end.
     ("gimple", Unsupported),
     ("gnu89-inline", Implemented),
@@ -182,11 +186,10 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-cf-protection", Implemented),
     ("no-check-new", Accepted(OtherLanguage)),
     ("no-code-hoisting", Accepted(Pass)),
-    // A tentative definition is an ordinary definition, as in gcc 10 and
-    // later: `int x;` is a `.globl` object, never `.comm`.
-    ("no-common", Accepted(Default)),
+    ("no-common", Implemented),
     // c17 calls `__muldc3` and `__divdc3`, Annex G's full range.
     ("no-cx-limited-range", Accepted(Default)),
+    ("no-data-sections", Implemented),
     ("no-dce", Accepted(Pass)),
     ("no-diagnostics-color", Accepted(Presentation)),
     ("no-diagnostics-show-caret", Accepted(Presentation)),
@@ -199,6 +202,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-fat-lto-objects", Accepted(Pass)),
     ("no-finite-math-only", Accepted(Default)),
     ("no-float-store", Accepted(Permission)),
+    ("no-function-sections", Implemented),
     ("no-gcse", Accepted(Pass)),
     ("no-gnu89-inline", Implemented),
     ("no-guess-branch-probability", Accepted(Pass)),
@@ -222,8 +226,9 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-peel-loops", Accepted(Pass)),
     ("no-pic", Implemented),
     ("no-pie", Implemented),
-    // A call through the PLT reaches the same function.
-    ("no-plt", Accepted(Pass)),
+    // A call to a function that may be defined elsewhere goes through its
+    // GOT entry rather than a PLT stub.
+    ("no-plt", Implemented),
     ("no-printf-return-value", Accepted(Pass)),
     ("no-reorder-blocks-and-partition", Accepted(Pass)),
     ("no-rounding-math", Implemented),
@@ -235,7 +240,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-sanitize-recover", Accepted(SanitizerModifier)),
     ("no-schedule-insns", Accepted(Pass)),
     ("no-schedule-insns2", Accepted(Pass)),
-    ("no-semantic-interposition", Accepted(Permission)),
+    ("no-semantic-interposition", Implemented),
     // An enum is `int`-sized.
     ("no-short-enums", Accepted(Default)),
     ("no-signaling-nans", Implemented),
@@ -292,6 +297,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("permissive", Implemented),
     ("pic", Implemented),
     ("pie", Implemented),
+    ("plt", Implemented),
     ("profile-correction", Accepted(Pass)),
     // No instrumentation, so no `.gcda` profile is written.
     ("profile-generate", Unsupported),
@@ -319,7 +325,7 @@ const PLAIN: &[(&str, Effect)] = &[
     // At -O1 and above c17 inlines a global function into its callers in
     // the same unit even under -fPIC, so an interposed definition is not
     // the one they call.
-    ("semantic-interposition", Unsupported),
+    ("semantic-interposition", Implemented),
     ("signaling-nans", Implemented),
     ("signed-char", Implemented),
     ("signed-zeros", Accepted(Default)),

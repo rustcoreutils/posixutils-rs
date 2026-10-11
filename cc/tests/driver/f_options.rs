@@ -153,6 +153,15 @@ fn build_system_defaults_are_silent() {
             "-fwrapv",
             "-fno-semantic-interposition",
         ],
+        // What binutils' ld test suite passes.
+        &["-feliminate-dwarf2-dups", "-fsemantic-interposition"],
+        &["-fno-plt", "-fplt", "-fcommon", "-fno-common"],
+        &[
+            "-ffunction-sections",
+            "-fno-function-sections",
+            "-fdata-sections",
+            "-fno-data-sections",
+        ],
     ] {
         let mut args = flags.to_vec();
         if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
@@ -206,18 +215,26 @@ fn unknown_option_is_an_error() {
 #[test]
 fn unsupported_option_warns() {
     let (dir, path) = scratch("t.c", CLEAN);
-    let r = compile_in(dir.path(), &path, &["-fcommon", "-fcommon", "-Werror"]);
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &["-fharden-compares", "-fharden-compares", "-Werror"],
+    );
     assert!(r.success, "{}", r.stderr);
     assert_eq!(
         r.stderr,
-        "c17: warning: '-fcommon' is not supported; ignored\n"
+        "c17: warning: '-fharden-compares' is not supported; ignored\n"
     );
 
-    let r = compile_in(dir.path(), &path, &["-ftrapv", "-fno-trapv", "-fcommon"]);
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &["-ftrapv", "-fno-trapv", "-fharden-compares"],
+    );
     assert!(r.success, "{}", r.stderr);
     assert_eq!(
         r.stderr,
-        "c17: warning: '-fcommon' is not supported; ignored\n"
+        "c17: warning: '-fharden-compares' is not supported; ignored\n"
     );
 
     // `-Werror=` names the group, and then it is an error.

@@ -16,7 +16,7 @@
 use crate::arch::codegen::SelectOperands;
 use crate::arch::codegen::{AsmModifierError, AsmOperandSlot, AsmOperandValue};
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
-use crate::arch::lir::{is_private_name, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, X87Scratch, XmmReg};
 use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to_float};
@@ -491,7 +491,7 @@ impl X86_64CodeGen {
         // In PIC mode, a global symbol needs GOT access because it could be
         // interposed at runtime, or defined in another module. A name c17
         // made up, and a symbol that binds within the output, cannot.
-        if self.pic_mode && !is_private_name(name) && !self.base.binds_locally.contains(name) {
+        if self.base.pic_needs_got(name, self.pic_mode) {
             return true;
         }
         // External symbols need GOT access on macOS for dynamic linking.
@@ -1005,6 +1005,26 @@ impl X86_64CodeGen {
                                 name.clone(),
                             ))),
                             dst: GpOperand::Reg(dst_reg),
+                        });
+                    } else if !self.pic_mode
+                        && self.base.target.os != Os::MacOS
+                        && !Symbol::named(name.as_str())
+                            .format_for_target(&self.base.target)
+                            .starts_with('"')
+                    {
+                        // Position-dependent ELF code takes the address as
+                        // an absolute immediate, as gcc does. For a function
+                        // in a shared library, that is what makes the linker
+                        // give the executable's PLT entry as its one
+                        // canonical address; a PC-relative `leaq` did not,
+                        // and a pointer the library compared with its own
+                        // came out different. A name the assembler reads
+                        // only quoted -- an asm label such as `bar@SIZE` --
+                        // keeps the `leaq`: gas splits a quoted immediate's
+                        // `@` suffix from the name wrongly ("bar ").
+                        self.push_lir(X86Inst::MovSymAddr {
+                            sym: Symbol::named(name),
+                            dst: dst_reg,
                         });
                     } else {
                         self.push_lir(X86Inst::Lea {
@@ -1828,12 +1848,16 @@ impl CodeGenerator for X86_64CodeGen {
             let comp_dir = module.comp_dir.as_deref().unwrap_or(".");
 
             // Only reference text labels if we have code (functions)
-            // Data-only files use 0 for low_pc/high_pc
-            let (low_pc, high_pc) = if module.functions.is_empty() {
-                (None, None)
-            } else {
-                (Some(".Ltext0"), Some(".Ltext_end"))
-            };
+            // Data-only files use 0 for low_pc/high_pc, as does a unit
+            // whose functions each have a section of their own: no one
+            // range covers them, and a debugger takes the unit's extent
+            // from its functions' DIEs instead.
+            let (low_pc, high_pc) =
+                if module.functions.is_empty() || self.base.layout.function_sections {
+                    (None, None)
+                } else {
+                    (Some(".Ltext0"), Some(".Ltext_end"))
+                };
 
             super::super::dwarf::generate_abbrev_table(&mut self.base);
             let fns = std::mem::take(&mut self.base.fn_dies);
@@ -1843,6 +1867,7 @@ impl CodeGenerator for X86_64CodeGen {
                 comp_dir,
                 low_pc_label: low_pc,
                 high_pc_label: high_pc,
+                globals: &module.globals,
             };
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
@@ -1865,6 +1890,10 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_pic_mode(&mut self, pic: bool) {
         self.pic_mode = pic;
+    }
+
+    fn set_object_layout(&mut self, layout: crate::target::ObjectLayout) {
+        self.base.layout = layout;
     }
 
     fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy) {

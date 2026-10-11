@@ -1427,9 +1427,14 @@ impl X86_64CodeGen {
             });
             self.base.eh_call_end(site);
         } else {
-            self.push_lir(X86Inst::Call {
-                target: CallTarget::Direct(Symbol::global(func_name.to_string())),
-            });
+            let sym = Symbol::global(func_name.to_string());
+            if self.base.calls_through_got(func_name) {
+                self.push_lir(X86Inst::CallGot { sym });
+            } else {
+                self.push_lir(X86Inst::Call {
+                    target: CallTarget::Direct(sym),
+                });
+            }
             // The second return of a function that returns twice comes by
             // an indirect jump, so under branch protection it lands on
             // `endbr64`, which gcc keeps inside the call's call-site entry.

@@ -464,6 +464,15 @@ pub enum X86Inst {
     /// LEA - Load effective address
     Lea { addr: MemAddr, dst: Reg },
 
+    /// `call *sym@GOTPCREL(%rip)`: a call through the function's GOT entry,
+    /// `-fno-plt`'s.
+    CallGot { sym: Symbol },
+
+    /// `movl $sym, %dst32`: a symbol's address as an absolute 32-bit
+    /// immediate, zero-extended -- position-dependent code's spelling, which
+    /// gcc uses (`R_X86_64_32`).
+    MovSymAddr { sym: Symbol, dst: Reg },
+
     /// PUSH - Push value onto stack
     Push { src: GpOperand },
 
@@ -1033,6 +1042,21 @@ impl EmitAsm for X86Inst {
             } => Self::emit_movsx(src_size, dst_size, src, dst, target, out),
             X86Inst::Lea { addr, dst } => {
                 let _ = writeln!(out, "    leaq {}, {}", addr.format(target), dst.name64());
+            }
+            X86Inst::CallGot { sym } => {
+                let _ = writeln!(
+                    out,
+                    "    call *{}@GOTPCREL(%rip)",
+                    sym.format_for_target(target)
+                );
+            }
+            X86Inst::MovSymAddr { sym, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    movl ${}, {}",
+                    sym.format_for_target(target),
+                    dst.name32()
+                );
             }
 
             X86Inst::Push { src } => {

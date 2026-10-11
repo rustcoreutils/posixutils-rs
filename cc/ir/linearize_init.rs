@@ -329,6 +329,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 declarator.explicit_align,
                 storage,
             );
+            if let Some(global) = self.module.global_mut(&name) {
+                global.decl_pos.get_or_insert(declarator.pos);
+            }
             if attrs.section.is_some() {
                 let shown = self
                     .str(self.symbols.get(declarator.symbol).name)

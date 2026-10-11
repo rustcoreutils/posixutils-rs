@@ -650,3 +650,135 @@ void init(void) { p = scm_car; }
     }
 }
 
+/// Shared-object code calls an exported function of its own through the
+/// PLT and never inlines it, as gcc's `-fPIC` default: the executable may
+/// interpose its own definition, and the library's calls must reach that
+/// one (binutils' ld-vsb tests). Code for an executable, a hidden or
+/// `inline` callee, and `-fno-semantic-interposition` inline it.
+#[test]
+fn codegen_shared_object_calls_interposable_functions() {
+    let src = r#"
+int f(void) { return 1; }
+__attribute__((visibility("hidden"))) int hf(void) { return 2; }
+inline int inf(void) { return 3; }
+extern int inf(void);
+int g(void) { return f(); }
+int hg(void) { return hf() + inf(); }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let call = if triple == X86_64_LINUX {
+            "f@PLT"
+        } else {
+            "bl f"
+        };
+        let asm = asm_for_with("interpose_pic", triple, src, &["-O2", "-fPIC"]);
+        let g = body_of(&asm, "g");
+        assert!(g.contains(call), "{triple}: f inlined:\n{g}");
+        let hg = body_of(&asm, "hg");
+        assert!(
+            !hg.contains("hf") && !hg.contains("inf"),
+            "{triple}: hf and inf bind locally:\n{hg}"
+        );
+        for flags in [
+            &["-O2", "-fPIE"][..],
+            &["-O2", "-fPIC", "-fno-semantic-interposition"],
+        ] {
+            let asm = asm_for_with("interpose_pie", triple, src, flags);
+            let g = body_of(&asm, "g");
+            assert!(!g.contains(call), "{triple} {flags:?}:\n{g}");
+        }
+    }
+}
+
+/// aarch64 shared-object code reaches its own exported objects and takes
+/// its own exported functions' addresses through the GOT, as gcc does: the
+/// executable may interpose them, and `ld -shared` refuses a page-relative
+/// reference to a symbol that may bind elsewhere. Code for an executable
+/// reaches them directly; a `gnu_inline` body defines nothing, so its
+/// address is the GOT's even under `-fvisibility=hidden`.
+#[test]
+fn codegen_aarch64_shared_object_exports_go_through_the_got() {
+    let src = r#"
+int gv = 3;
+static int sv = 4;
+__attribute__((visibility("hidden"))) int hv = 5;
+int f(void) { return 1; }
+__attribute__((visibility("protected"))) int pf(void) { return 2; }
+extern __inline__ __attribute__((__gnu_inline__)) int scm_car(int x) { return x + 1; }
+int get(void) { return gv + sv + hv; }
+void *addr_f(void) { return f; }
+void *addr_pf(void) { return pf; }
+void *addr_car(void) { return scm_car; }
+"#;
+    let asm = asm_for_with(
+        "aarch64_pic_exports",
+        AARCH64_LINUX,
+        src,
+        &["-O2", "-fPIC", "-fvisibility=default"],
+    );
+    let get = body_of(&asm, "get");
+    assert!(get.contains(":got:gv"), "{get}");
+    for name in ["sv", "hv"] {
+        assert!(!get.contains(&format!(":got:{name}")), "{name}:\n{get}");
+    }
+    assert!(body_of(&asm, "addr_f").contains(":got:f"), "{asm}");
+    assert!(!body_of(&asm, "addr_pf").contains(":got:"), "{asm}");
+    for flags in [
+        &["-O2", "-fPIC"][..],
+        &["-O2", "-fPIC", "-fvisibility=hidden"],
+    ] {
+        let asm = asm_for_with("aarch64_pic_car", AARCH64_LINUX, src, flags);
+        let car = body_of(&asm, "addr_car");
+        assert!(car.contains(":got:scm_car"), "{flags:?}:\n{car}");
+    }
+    let asm = asm_for_with("aarch64_pie_exports", AARCH64_LINUX, src, &["-O2", "-fPIE"]);
+    assert!(!body_of(&asm, "get").contains(":got:"), "{asm}");
+    assert!(!body_of(&asm, "addr_f").contains(":got:"), "{asm}");
+}
+
+/// Position-dependent x86-64 code takes a symbol's address as an absolute
+/// 32-bit immediate (`R_X86_64_32`), as gcc does, which is what makes the
+/// linker give a library function its canonical PLT address; PIE and PIC
+/// code keep `leaq` and the GOT. Mach-O code is position independent
+/// whatever it is told.
+#[test]
+fn codegen_no_pie_symbol_address_is_an_immediate() {
+    let src = r#"
+extern int f(void);
+extern int ev;
+static int sv;
+void *a(void) { return (void *)f; }
+int *b(void) { return &ev; }
+int *c(void) { return &sv; }
+int d(void) { return ev; }
+"#;
+    let asm = asm_for_with("nopie_addr", X86_64_LINUX, src, &["-O2", "-fno-pie"]);
+    for (func, name) in [("a", "f"), ("b", "ev"), ("c", "sv")] {
+        let body = body_of(&asm, func);
+        assert!(
+            body.contains(&format!("movl ${name}, %")),
+            "{func}:\n{body}"
+        );
+    }
+    // A load is still PC-relative, as gcc's.
+    assert!(body_of(&asm, "d").contains("ev(%rip)"), "{asm}");
+    // A name only read quoted keeps `leaq`: gas misreads a quoted
+    // immediate's `@` suffix (binutils' ld-size `bar@SIZE`).
+    let sized = "extern char size_of_bar __asm__(\"bar@SIZE\");\n\
+                 long e(void) { return (long)&size_of_bar; }\n";
+    let asm = asm_for_with("nopie_quoted", X86_64_LINUX, sized, &["-O2", "-fno-pie"]);
+    assert!(
+        body_of(&asm, "e").contains("leaq \"bar@SIZE\"(%rip)"),
+        "{asm}"
+    );
+    let asm = asm_for_with("pie_addr", X86_64_LINUX, src, &["-O2", "-fPIE"]);
+    assert!(body_of(&asm, "a").contains("f@GOTPCREL"), "{asm}");
+    assert!(body_of(&asm, "c").contains("leaq sv(%rip)"), "{asm}");
+    let asm = asm_for_with(
+        "macho_addr",
+        "x86_64-apple-darwin",
+        src,
+        &["-O2", "-fno-pie"],
+    );
+    assert!(!asm.contains("movl $"), "{asm}");
+}

@@ -610,9 +610,10 @@ fn elf_linkage(path: &std::path::Path) -> ElfLinkage {
     }
 }
 
-/// `-static` links a program with no dynamic loader that runs, whatever PIE
-/// request came before it -- gcc's answer to `-pie -static` is a static,
-/// fixed-address executable -- and `-static-pie` links a static PIE.
+/// `-static` (or gcc's `--static`) links a program with no dynamic loader
+/// that runs, whatever PIE request came before it -- gcc's answer to `-pie
+/// -static` is a static, fixed-address executable -- and `-static-pie`
+/// links a static PIE.
 #[cfg(target_os = "linux")]
 #[test]
 fn gcc_flags_static_links_without_an_interpreter() {
@@ -620,6 +621,7 @@ fn gcc_flags_static_links_without_an_interpreter() {
     let exe = dir.path().join("st");
     for (flags, e_type) in [
         (&["-static"][..], 2u16),
+        (&["--static"], 2),
         (&["-pie", "-static"], 2),
         (&["-static", "-pie"], 2),
         (&["-static-pie"], 3),
@@ -635,6 +637,44 @@ fn gcc_flags_static_links_without_an_interpreter() {
         let status = std::process::Command::new(&exe).status().expect("run");
         assert_eq!(status.code(), Some(7), "{flags:?}");
     }
+}
+
+/// `-r` links the objects into one relocatable object, as gcc's does: no
+/// startup files, no libraries and no `-pie`, so the result still has
+/// `main` and the other unit's function to itself, and links into a program
+/// that runs. binutils' ld tests build their inputs this way.
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_r_links_a_relocatable_object() {
+    let (dir, path) = scratch(
+        "main.c",
+        "int other(void);
+int main(void) { return other(); }
+",
+    );
+    let other = dir.path().join("other.c");
+    std::fs::write(
+        &other,
+        "int other(void) { return 9; }
+",
+    )
+    .unwrap();
+    let combined = dir.path().join("combined.o");
+    let r = run_c17(&[
+        "-r",
+        "-o",
+        combined.to_str().unwrap(),
+        path.to_str().unwrap(),
+        other.to_str().unwrap(),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let elf = elf_linkage(&combined);
+    assert_eq!(elf.e_type, 1, "not ET_REL");
+    let exe = dir.path().join("prog");
+    let r = run_c17(&["-o", exe.to_str().unwrap(), combined.to_str().unwrap()]);
+    assert!(r.success, "{}", r.stderr);
+    let status = std::process::Command::new(&exe).status().expect("run");
+    assert_eq!(status.code(), Some(9));
 }
 
 // ---------------------------------------------------------------------------

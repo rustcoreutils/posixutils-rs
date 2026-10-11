@@ -132,6 +132,8 @@ pub struct VarDie {
 pub struct FnDie {
     pub name: String,
     pub external: bool,
+    /// The `.file` number of the file it is defined in; 0 for none.
+    pub decl_file: u32,
     pub decl_line: u32,
     /// Label marking the first byte past the function, for `DW_AT_high_pc`.
     pub end_label: String,
@@ -198,7 +200,7 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
     let subprogram_attrs: &[(u64, u64)] = &[
         (DW_AT_EXTERNAL, DW_FORM_FLAG),
         (DW_AT_NAME, DW_FORM_STRING),
-        (DW_AT_DECL_FILE, DW_FORM_DATA1),
+        (DW_AT_DECL_FILE, DW_FORM_UDATA),
         (DW_AT_DECL_LINE, DW_FORM_DATA4),
         (DW_AT_LOW_PC, DW_FORM_ADDR),
         (DW_AT_HIGH_PC, DW_FORM_ADDR),
@@ -224,7 +226,7 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
     // location.
     let var_attrs: &[(u64, u64)] = &[
         (DW_AT_NAME, DW_FORM_STRING),
-        (DW_AT_DECL_FILE, DW_FORM_DATA1),
+        (DW_AT_DECL_FILE, DW_FORM_UDATA),
         (DW_AT_DECL_LINE, DW_FORM_DATA4),
         (DW_AT_TYPE, DW_FORM_REF4),
     ];
@@ -515,7 +517,7 @@ fn emit_fn_die<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, f: &FnDie, dies:
     }));
     base.push_directive(Directive::Byte(if f.external { 1 } else { 0 }));
     base.push_directive(Directive::Asciz(f.name.clone()));
-    base.push_directive(Directive::Byte(1)); // DW_AT_decl_file
+    base.push_directive(Directive::Uleb128(f.decl_file.into()));
     base.push_directive(Directive::Long(f.decl_line as i64));
     base.push_directive(Directive::QuadSym(Symbol::global(&f.name)));
     base.push_directive(Directive::QuadSym(Symbol::local(&f.end_label)));
@@ -567,7 +569,9 @@ fn emit_fn_die<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, f: &FnDie, dies:
         };
         base.push_directive(Directive::Uleb128(code));
         base.push_directive(Directive::Asciz(name.to_string()));
-        base.push_directive(Directive::Byte(1)); // DW_AT_decl_file
+        // A variable has no position of its own yet; it is in its function's
+        // file.
+        base.push_directive(Directive::Uleb128(f.decl_file.into()));
         base.push_directive(Directive::Long(v.decl_line as i64));
         type_ref(base, &ty);
         if let Some(loc) = v.loc {
@@ -611,7 +615,8 @@ fn emit_global_dies<I: LirInst + EmitAsm>(
             ABBREV_GLOBAL_VAR
         }));
         base.push_directive(Directive::Asciz(g.name.clone()));
-        base.push_directive(Directive::Uleb128(u64::from(pos.stream) + 1));
+        let file = base.source_files.file_of(pos.stream).unwrap_or(0);
+        base.push_directive(Directive::Uleb128(file.into()));
         base.push_directive(Directive::Long(i64::from(pos.line)));
         type_ref(base, &ty);
         base.push_directive(Directive::Byte(if g.is_static { 0 } else { 1 }));

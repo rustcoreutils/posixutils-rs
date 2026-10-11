@@ -15,6 +15,7 @@ use super::ssa::ssa_convert;
 use super::{
     conversion_raises_fp, BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, FpRaise, Function,
     Initializer, Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
+    SourceFiles,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::constexpr::ConstScope;
@@ -7537,21 +7538,9 @@ pub fn linearize(
     linearizer.auto_var_init = opts.auto_var_init;
     let mut module = linearizer.linearize(tu);
     module.debug = opts.debug;
-    // Get all source files from the stream registry (includes all #included files)
-    // The stream IDs in Position map directly to indices in this vector
-    // Filter out synthetic file names (like "<paste>", "<built-in>") which start with '<'
-    module.source_files = get_all_stream_names()
-        .into_iter()
-        .map(|name| {
-            if name.starts_with('<') {
-                // Replace synthetic names with empty string - still need placeholder
-                // to keep stream ID indices aligned with .file directive numbers
-                String::new()
-            } else {
-                name
-            }
-        })
-        .collect();
+    // The line table's files: every stream's, each file once, none for a
+    // synthetic stream such as `<built-in>`.
+    module.source_files = SourceFiles::from_stream_names(get_all_stream_names());
     module
 }
 

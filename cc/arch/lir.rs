@@ -1159,9 +1159,15 @@ pub enum Directive {
     // ========================================================================
     // Debug Information
     // ========================================================================
-    /// .file index "path" - declare source file for debug info. `path` is
-    /// the file's name as text; emission escapes it.
-    File { index: u32, path: String },
+    /// .file index ["dir"] "path" - declare source file for debug info.
+    /// `path` is the file's name as text; emission escapes it. A `dir` is
+    /// written as its own operand: entry 0, the compilation directory and
+    /// primary source, takes that form.
+    File {
+        index: u32,
+        dir: Option<String>,
+        path: String,
+    },
 
     /// .loc file line column - source location for debug info
     Loc { file: u32, line: u32, col: u32 },
@@ -1335,6 +1341,7 @@ impl Directive {
     pub fn file(index: u32, path: impl Into<String>) -> Self {
         Directive::File {
             index,
+            dir: None,
             path: path.into(),
         }
     }
@@ -1770,13 +1777,12 @@ impl EmitAsm for Directive {
             }
 
             // Debug info
-            Directive::File { index, path } => {
-                let _ = writeln!(
-                    out,
-                    "    .file {} \"{}\"",
-                    index,
-                    super::codegen::escape_path(path)
-                );
+            Directive::File { index, dir, path } => {
+                let _ = write!(out, "    .file {}", index);
+                if let Some(dir) = dir {
+                    let _ = write!(out, " \"{}\"", super::codegen::escape_path(dir));
+                }
+                let _ = writeln!(out, " \"{}\"", super::codegen::escape_path(path));
             }
             Directive::Loc { file, line, col } => {
                 let _ = writeln!(out, "    .loc {} {} {}", file, line, col);

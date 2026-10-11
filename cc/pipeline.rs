@@ -246,14 +246,13 @@ pub fn compile_tokens(
 
     // Set DWARF metadata. Every path it records goes through the debug
     // prefix map, as gcc's does: the compilation directory, the primary
-    // source's name, and each `.file`. A placeholder for a synthetic stream
-    // is not a path and stays empty.
+    // source's name, and each `.file`.
     let map = opts.debug_prefix_map;
     module.source_name = Some(map.apply(opts.source_name).into_owned());
     module.comp_dir = std::env::current_dir()
         .ok()
         .map(|p| map.apply(&p.to_string_lossy()).into_owned());
-    for file in module.source_files.iter_mut().filter(|f| !f.is_empty()) {
+    for file in module.source_files.paths.iter_mut() {
         if let Cow::Owned(mapped) = map.apply(file) {
             *file = mapped;
         }

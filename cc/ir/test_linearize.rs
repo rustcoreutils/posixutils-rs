@@ -2105,3 +2105,28 @@ fn test_file_scope_objects_record_their_declaration() {
     assert_eq!(line("b"), Some(3));
     assert_eq!(line("c"), None);
 }
+
+/// The line table numbers files, not preprocessor streams: a header
+/// included twice is one `.file`, and a synthetic stream -- the predefined
+/// macros, the command-line `-D`s -- is none.
+#[test]
+fn test_source_files_number_each_file_once() {
+    let names = [
+        "t.c",
+        "<built-in>",
+        "h.h",
+        "",
+        "g.h",
+        "h.h",
+        "<command-line>",
+    ];
+    let files = SourceFiles::from_stream_names(names.iter().map(|n| n.to_string()));
+    assert_eq!(files.paths, ["t.c", "h.h", "g.h"]);
+    let numbered: Vec<Option<u32>> = (0..names.len() as u16 + 1)
+        .map(|s| files.file_of(s))
+        .collect();
+    assert_eq!(
+        numbered,
+        [Some(1), None, Some(2), None, Some(3), Some(2), None, None]
+    );
+}

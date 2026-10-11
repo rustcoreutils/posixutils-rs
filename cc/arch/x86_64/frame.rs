@@ -417,18 +417,15 @@ impl X86_64CodeGen {
         }
 
         let ret_typ = (types.kind(func.return_type) != TypeKind::Void).then_some(func.return_type);
-        let decl_line = func
-            .blocks
-            .iter()
-            .flat_map(|b| b.insns.iter())
-            .find_map(|i| i.pos.as_ref())
-            .map(|p| p.line)
-            .unwrap_or(0);
+        // Declared where its first instruction is; a function made in no
+        // file (a synthetic stream) names none.
+        let pos = self.base.func_pos;
 
         self.base.fn_dies.push(crate::arch::dwarf::FnDie {
             name: func.name.clone(),
             external: !func.is_static,
-            decl_line,
+            decl_file: self.base.source_files.file_of(pos.stream).unwrap_or(0),
+            decl_line: pos.line,
             end_label,
             ret_typ,
             vars,

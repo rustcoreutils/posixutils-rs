@@ -140,7 +140,10 @@ pub struct CodeGenBase<I: LirInst> {
     /// Last emitted source line (for avoiding duplicate .loc directives)
     pub last_debug_line: u32,
     /// Last emitted source file index
-    pub last_debug_file: u16,
+    pub last_debug_file: u32,
+    /// The line table's files, and which one each preprocessor stream
+    /// reads: what a `.loc` and a `DW_AT_decl_file` number a position by.
+    pub source_files: crate::ir::SourceFiles,
     /// Whether to emit debug info (.file/.loc directives)
     pub emit_debug: bool,
     /// What selects the thread-local access model: whether the output has
@@ -309,6 +312,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             func_pos: crate::diag::Position::default(),
             last_debug_line: 0,
             last_debug_file: 0,
+            source_files: Default::default(),
             emit_debug: false,
             tls: crate::target::TlsPolicy::default(),
             verbose_asm: false,
@@ -656,17 +660,52 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
+    /// Emit the line table's file list, one `.file` per distinct source
+    /// file, and keep the stream-to-file numbering for the `.loc`s and DIEs
+    /// that follow. Emitted with or without `-g`, as the file names are
+    /// useful to diagnostics and profilers either way.
+    pub fn emit_file_table(&mut self, module: &Module) {
+        self.source_files = module.source_files.clone();
+        // Entry 0 names the compilation directory and the primary source, as
+        // gcc's does, which makes the assembler write a version 5 line
+        // table. An older table has no entry 0, and a reader fills that slot
+        // with the directory itself: gprofng then archives the
+        // "file" `<comp_dir>` and reports it missing. Apple's assembler
+        // keeps the older form.
+        if let (true, false, Some(dir), Some(name)) = (
+            self.emit_debug,
+            self.target.os == crate::target::Os::MacOS,
+            &module.comp_dir,
+            &module.source_name,
+        ) {
+            self.push_directive(Directive::File {
+                index: 0,
+                dir: Some(dir.clone()),
+                path: name.clone(),
+            });
+        }
+        for (i, path) in module.source_files.paths.iter().enumerate() {
+            // File indices in DWARF start at 1
+            self.push_directive(Directive::file((i + 1) as u32, path.clone()));
+        }
+    }
+
     /// Emit .loc directive for source line tracking
     /// Returns true if a directive was emitted
     pub fn emit_loc(&mut self, insn: &Instruction) -> bool {
         if !self.emit_debug {
             return false;
         }
-        if let Some(pos) = &insn.pos {
-            let file = pos.stream + 1; // DWARF file indices start at 1
+        // A position in a synthetic stream (`<built-in>`) is in no file and
+        // leaves the line table where it was.
+        if let Some((pos, file)) = insn
+            .pos
+            .as_ref()
+            .and_then(|p| Some((p, self.source_files.file_of(p.stream)?)))
+        {
             let line = pos.line;
             if line != self.last_debug_line || file != self.last_debug_file {
-                self.push_directive(Directive::loc(file.into(), line, pos.col.into()));
+                self.push_directive(Directive::loc(file, line, pos.col.into()));
                 self.last_debug_line = line;
                 self.last_debug_file = file;
                 return true;
@@ -700,8 +739,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         else {
             return;
         };
-        let file = pos.stream + 1; // DWARF file indices start at 1
-        self.push_directive(Directive::loc(file.into(), pos.line, pos.col.into()));
+        let Some(file) = self.source_files.file_of(pos.stream) else {
+            return;
+        };
+        self.push_directive(Directive::loc(file, pos.line, pos.col.into()));
         self.last_debug_line = pos.line;
         self.last_debug_file = file;
     }

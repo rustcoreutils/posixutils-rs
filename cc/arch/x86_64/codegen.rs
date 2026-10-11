@@ -1789,19 +1789,7 @@ impl CodeGenerator for X86_64CodeGen {
         );
         self.emit_header();
 
-        // Emit .file directives unconditionally (useful for diagnostics/profiling)
-        // Use "." as placeholder for empty paths (synthetic files like <paste>)
-        // to keep file numbers sequential for .loc directives
-        for (i, path) in module.source_files.iter().enumerate() {
-            let file_path = if path.is_empty() {
-                ".".to_string()
-            } else {
-                path.clone()
-            };
-            // File indices in DWARF start at 1
-            self.base
-                .push_directive(Directive::file((i + 1) as u32, file_path));
-        }
+        self.base.emit_file_table(module);
 
         // The definitions, in runs between the file-scope asm statements:
         // each run's globals, then its functions, then the asm after it.

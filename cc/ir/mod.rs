@@ -4149,6 +4149,49 @@ impl Module {
     }
 }
 
+/// The source files of a unit as the DWARF line table numbers them.
+///
+/// A preprocessor stream is one *inclusion*, not one file: a header
+/// included twice is two streams, and the predefined macros and the
+/// command-line `-D`s are streams with no file at all (`<built-in>`,
+/// `<command-line>`). The line table lists each file once, as gcc's does,
+/// and nothing for a synthetic stream -- an entry naming no file sends a
+/// consumer such as gprofng's source archiver looking for a file called
+/// "." in the compilation directory.
+#[derive(Debug, Clone, Default)]
+pub struct SourceFiles {
+    /// The distinct paths, in order of first appearance: `.file N` names
+    /// `paths[N - 1]`.
+    pub paths: Vec<String>,
+    /// Stream id -> its `.file` number; `None` for a synthetic stream.
+    by_stream: Vec<Option<u32>>,
+}
+
+impl SourceFiles {
+    /// Number the files of the streams `names` (indexed by stream id). A
+    /// name in angle brackets is a synthetic stream's.
+    pub fn from_stream_names(names: impl IntoIterator<Item = String>) -> Self {
+        let mut files = SourceFiles::default();
+        let mut number: HashMap<String, u32> = HashMap::new();
+        for name in names {
+            let file = (!name.is_empty() && !name.starts_with('<')).then(|| {
+                *number.entry(name).or_insert_with_key(|name| {
+                    files.paths.push(name.clone());
+                    files.paths.len() as u32
+                })
+            });
+            files.by_stream.push(file);
+        }
+        files
+    }
+
+    /// The `.file` number of the file stream `stream` reads, or `None` for a
+    /// synthetic stream.
+    pub fn file_of(&self, stream: u16) -> Option<u32> {
+        self.by_stream.get(usize::from(stream)).copied().flatten()
+    }
+}
+
 /// A module containing multiple functions
 #[derive(Debug, Clone, Default)]
 pub struct Module {
@@ -4174,8 +4217,8 @@ pub struct Module {
     pub utf32_strings: Vec<(String, Vec<u32>)>,
     /// Generate debug info
     pub debug: bool,
-    /// Source file paths (stream id -> path) for .file directives
-    pub source_files: Vec<String>,
+    /// The line table's files, and which one each preprocessor stream is.
+    pub source_files: SourceFiles,
     /// External symbols (declared extern but not defined in this module)
     /// These need GOT access on macOS
     pub extern_symbols: HashSet<String>,

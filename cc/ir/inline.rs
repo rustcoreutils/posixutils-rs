@@ -1260,6 +1260,7 @@ fn inline_call_site(
         ctx.inline_id,
     );
     build_return_phi(&ctx, &mut continuation_bb);
+    end_inlined_lifetimes(&ctx, callee, &mut continuation_bb);
     if let Some(mark) = stack_mark {
         bracket_alloca(ctx.caller, call_bb_idx, &mut continuation_bb, mark);
     }
@@ -1496,6 +1497,32 @@ fn build_return_phi(ctx: &InlineContext, continuation_bb: &mut BasicBlock) {
     let mut phi = Instruction::phi(target, typ, ctx.ret_size);
     phi.phi_list = ctx.ret_arms.clone();
     continuation_bb.insns.insert(0, phi);
+}
+
+/// End the lifetime of every copied local where the copied body returns,
+/// as the call's own frame ended there.
+///
+/// The callee's outermost locals carry no `LifetimeEnd` of their own -- a
+/// return ends them -- so without one here each copy stayed live from its
+/// first mention to the end of the caller: no two copies' slots could be
+/// shared, and the allocator's per-block lifetime sets grew with blocks
+/// times copies, which made compile time quadratic in the number of calls
+/// spliced into one function.
+fn end_inlined_lifetimes(ctx: &InlineContext, callee: &Function, continuation: &mut BasicBlock) {
+    let at = continuation
+        .insns
+        .iter()
+        .position(|i| i.op != Opcode::Phi)
+        .unwrap_or(continuation.insns.len());
+    let mut ends: Vec<PseudoId> = callee
+        .locals
+        .values()
+        .filter_map(|local| ctx.pseudo_map.get(&local.sym).copied())
+        .collect();
+    ends.sort_unstable();
+    continuation
+        .insns
+        .splice(at..at, ends.into_iter().map(Instruction::lifetime_end));
 }
 
 /// Record the edges of the spliced body, once its blocks are in `caller`.

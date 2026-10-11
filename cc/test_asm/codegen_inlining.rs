@@ -12,7 +12,7 @@
 // `extern` thread-local.
 //
 
-use crate::test_asm::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
+use crate::test_asm::asm_probe::{asm_for_with, frame_size, AARCH64_LINUX, X86_64_LINUX};
 
 /// `__attribute__((noinline))` is a directive, not a hint.
 ///
@@ -167,6 +167,42 @@ fn codegen_always_inline_ignores_the_recursive_stack_guard() {
         !asm.lines().any(|l| l.trim().starts_with("call helper")),
         "always_inline is spliced into a recursive caller of any size:\n{asm}"
     );
+}
+
+/// A copied body's locals end where the copy returns, as the call's frame
+/// did, so the copies of one callee share a frame slot.
+///
+/// They had no end: a function's outermost locals are ended by its return,
+/// which a copy no longer has, so each copy was live to the end of the
+/// caller. Eight copies of a 512-byte buffer took 4 KB, and liveness over
+/// blocks x copies made compile time quadratic in the calls spliced into
+/// one function -- the SSE4.1 intrinsic fixture, a few hundred
+/// `always_inline` calls in one function, took three times as long.
+#[test]
+fn codegen_inlined_locals_end_at_the_copy_s_return() {
+    let src = r#"
+static inline __attribute__((always_inline)) int fill(int x)
+{
+    volatile char buf[512];
+    buf[x & 511] = (char)x;
+    return buf[x & 511];
+}
+int many(int x)
+{
+    return fill(x) + fill(x + 1) + fill(x + 2) + fill(x + 3) + fill(x + 4)
+         + fill(x + 5) + fill(x + 6) + fill(x + 7);
+}
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        for opt in ["-O0", "-O2"] {
+            let asm = asm_for_with("inlined_locals_share", triple, src, &[opt]);
+            let frame = frame_size(&asm, "many");
+            assert!(
+                frame.is_some_and(|n| n < 1024),
+                "{triple} {opt}: the copies' buffers share one slot, frame {frame:?}:\n{asm}"
+            );
+        }
+    }
 }
 
 /// The four inline spellings differ in whether they emit an external symbol.

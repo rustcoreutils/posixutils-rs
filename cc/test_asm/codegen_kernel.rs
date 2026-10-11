@@ -506,6 +506,44 @@ fn codegen_kernel_retpolines_and_sls() {
     assert!(!none.contains("int3"), "{none}");
 }
 
+/// `-mharden-sls=indirect-jmp` stops speculation past every indirect jump,
+/// the ones made through a retpoline thunk too: gcc 13 follows `jmp
+/// __x86_indirect_thunk_<reg>` with an `int3`, as it does `jmp *%reg`.
+/// The return thunk's jump, a return, takes none.
+#[test]
+fn codegen_kernel_sls_after_thunk_jumps() {
+    let src = "void h(int i) {\n\
+               static void *t[] = { &&a, &&b };\n\
+               goto *t[i];\n\
+               a: __asm__ volatile(\"nop\");\n\
+               b: return;\n\
+               }\n";
+    for flags in [
+        &["-mharden-sls=all", "-mindirect-branch=thunk-extern"][..],
+        &["-mharden-sls=indirect-jmp", "-mindirect-branch=thunk"],
+        &[
+            "-mharden-sls=all",
+            "-mindirect-branch=thunk-extern",
+            "-mindirect-branch-cs-prefix",
+        ],
+    ] {
+        let mut all = vec!["-O2", "-fno-pie", "-mfunction-return=thunk-extern"];
+        all.extend_from_slice(flags);
+        let asm = asm_for_with("sls_thunk", X86_64_LINUX, src, &all);
+        let lines: Vec<&str> = body_of(&asm, "h").lines().map(str::trim).collect();
+        let jmp = lines
+            .iter()
+            .position(|l| l.starts_with("jmp __x86_indirect_thunk_"))
+            .unwrap_or_else(|| panic!("{flags:?}: no thunk jump:\n{asm}"));
+        assert_eq!(lines[jmp + 1], "int3", "{flags:?}:\n{asm}");
+        let ret = lines
+            .iter()
+            .position(|l| *l == "jmp __x86_return_thunk")
+            .unwrap_or_else(|| panic!("{flags:?}: no return thunk:\n{asm}"));
+        assert_ne!(lines.get(ret + 1), Some(&"int3"), "{flags:?}:\n{asm}");
+    }
+}
+
 /// `-fpatchable-function-entry=N,M` puts `M` nops before the function's
 /// label and `N - M` after it -- after `endbr64` -- and records where they
 /// start in `__patchable_function_entries`, a section linked to the

@@ -232,6 +232,10 @@ fn emit_indirect_branch(
                 let _ = writeln!(out, "    cs");
             }
             let _ = writeln!(out, "    {op} {}", indirect_thunk_name(reg));
+            // Still an indirect jump, which gcc stops speculation past.
+            if branch == Branch::Jmp && x86.sls.indirect_jmp {
+                let _ = writeln!(out, "    int3");
+            }
         }
         Thunk::Inline => {
             if branch == Branch::Call {

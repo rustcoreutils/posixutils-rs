@@ -99,7 +99,11 @@ void f(void) { static struct ev __attribute__((used, section("s6"))) *lp = &even
     assert_eq!(at("up"), ".section s5,\"aw\"", "{asm}");
     assert_eq!(at("f.lp.0"), ".section s6,\"aw\"", "{asm}");
     assert!(asm.contains(".weak wv"), "{asm}");
-    assert!(asm.contains(".p2align 6\nav:"), "{asm}");
+    // The alignment comes before `.type` and `.size`, as gcc writes it.
+    assert!(
+        asm.contains(".p2align 6\n.type av, @object\n.size av, 4\nav:"),
+        "{asm}"
+    );
     // The definition's trailing attribute and the one before the tag are
     // the type's: no section for either object.
     assert_eq!(at("dv"), ".data", "{asm}");

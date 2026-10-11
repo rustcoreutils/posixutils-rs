@@ -1046,6 +1046,15 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             ));
         }
 
+        // Alignment, before `.type` and `.size` as gcc writes it: they
+        // create the symbol, and gas orders a section's symbols by creation.
+        // After them, aarch64's `$d` mapping symbol, made at the first byte,
+        // followed a static object at its address, and ld, naming a link
+        // warning's location by the last symbol there, found no variable.
+        if align > 1 {
+            self.push_directive(Directive::Align(align.trailing_zeros()));
+        }
+
         // ELF-only type and size (handled by Directive::emit which skips on macOS)
         // TLS objects have TLS type instead of regular object type
         if global.is_thread_local {
@@ -1054,11 +1063,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::type_object(&global.name));
         }
         self.push_directive(Directive::size(&global.name, size));
-
-        // Alignment
-        if align > 1 {
-            self.push_directive(Directive::Align(align.trailing_zeros()));
-        }
 
         // Label - use local_label for names starting with '.'
         if is_local_label {

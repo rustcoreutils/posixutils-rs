@@ -447,3 +447,43 @@ fn codegen_debug_emits_file_scope_variable_dies() {
         );
     }
 }
+
+/// An object's alignment is written before its `.type` and `.size`, as gcc
+/// writes it. Those directives create the symbol, and gas orders a section's
+/// symbols by creation: written first, they put `init_array` ahead of the
+/// `$d` mapping symbol gas makes at the object's first byte on aarch64. ld
+/// names the location of a link warning by the last symbol at the address,
+/// found `$d`, matched no `DW_TAG_variable`, and gave a bare section offset
+/// where gcc's object gives "beginwarn.c:7:" (binutils' ld-elf beginwarn).
+#[test]
+fn codegen_object_alignment_precedes_its_type() {
+    let src = "extern void foo(void);\n\
+               static void (*const init_array[])(void)\n\
+               \x20 __attribute__((used, section(\".init_array\"), aligned(sizeof(void *))))\n\
+               \x20 = { foo };\n\
+               int counter = 1;\n";
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("align_before_type", triple, src, &["-g"]);
+        for name in ["init_array", "counter"] {
+            let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+            let ty = lines
+                .iter()
+                .position(|l| l.starts_with(".type") && l.contains(&format!("{name},")))
+                .unwrap_or_else(|| panic!("{triple}: no .type for {name}:\n{asm}"));
+            let label = lines
+                .iter()
+                .position(|l| *l == format!("{name}:"))
+                .unwrap_or_else(|| panic!("{triple}: no label {name}:\n{asm}"));
+            let align = lines[..ty]
+                .iter()
+                .rposition(|l| l.starts_with(".p2align") || l.starts_with(".align"));
+            let sect = lines[..ty]
+                .iter()
+                .rposition(|l| l.starts_with(".section") || *l == ".data");
+            assert!(
+                align.is_some() && align > sect && ty < label,
+                "{triple}: {name}'s alignment is not between its section and its .type:\n{asm}"
+            );
+        }
+    }
+}

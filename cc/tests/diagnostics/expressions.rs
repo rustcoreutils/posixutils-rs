@@ -12,7 +12,7 @@
 // garbage, a cast reinterpreted a structure as an integer.
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_everywhere, compile_expect_error};
 
 /// C17 6.7.9p7: a designator names a member, or an index, of the object
 /// being initialized -- followed into nested lists.
@@ -88,4 +88,50 @@ fn cast_to_the_operands_own_structure_type() {
                    return 0;\n\
                }\n";
     assert_eq!(compile_and_run("cast_struct_self", src, &[]), 0);
+}
+
+/// A `register` array is read and written at constant indices inside its
+/// bounds without an address, and a `register` structure travels by value --
+/// but neither may decay or yield an address (C17 6.3.2.1p3, 6.5.3.2p1), as
+/// gcc refuses. A tagged structure's `register` was dropped with its tag, so
+/// `&s.m` compiled.
+#[test]
+fn register_arrays_and_structures() {
+    let src = r#"
+struct S { int m[3]; int k; };
+static struct S twice(struct S s) { s.k *= 2; return s; }
+int main(void) {
+    register int a[4] = {1, 2, 3, 4};
+    register int m[2][3] = {{1, 2, 3}, {4, 5, 6}};
+    register struct S s = {{7, 8, 9}, 10};
+    register struct S t;
+    a[3] = a[0] + a[2];
+    m[1][2] += m[0][1];
+    t = twice(s);
+    s.m[1] = t.k;
+    if (a[3] != 4 || 2[a] != 3 || m[1][2] != 8) return 1;
+    if (t.k != 20 || s.m[1] != 20 || s.m[2] != 9) return 2;
+    return sizeof a == 4 * sizeof(int) ? 0 : 3;
+}
+"#;
+    compile_and_run_everywhere("register_aggregates", src);
+    for (name, src, who) in [
+        (
+            "register_array_decays",
+            "int main(void) { register int a[2] = {0}; int i = 1; return a[i]; }\n",
+            "a",
+        ),
+        (
+            "register_tagged_member_address",
+            "struct S { int m; };\n\
+             int main(void) { register struct S s = {0}; return *&s.m; }\n",
+            "s",
+        ),
+    ] {
+        compile_expect_error(
+            name,
+            src,
+            &format!("address of register variable '{who}' requested"),
+        );
+    }
 }

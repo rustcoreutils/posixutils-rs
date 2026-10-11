@@ -55,21 +55,24 @@ pub(crate) fn register_address_refusal(
             _ => break,
         };
     }
-    let ExprKind::Ident(symbol_id) = &root.kind else {
-        return None;
-    };
-    let sym = symbols.get(*symbol_id);
-    if !matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
-        || !types.modifiers(sym.typ).contains(TypeModifiers::REGISTER)
-    {
-        return None;
-    }
-    let msg = if sym.global_register().is_some() {
+    let symbol_id = register_variable(types, symbols, root)?;
+    let msg = if symbols.get(symbol_id).global_register().is_some() {
         "address of global register variable '{0}' requested"
     } else {
         "address of register variable '{0}' requested"
     };
-    Some((*symbol_id, msg))
+    Some((symbol_id, msg))
+}
+
+/// The `register` variable `expr` names, if it names one.
+fn register_variable(types: &TypeTable, symbols: &SymbolTable, expr: &Expr) -> Option<SymbolId> {
+    let ExprKind::Ident(symbol_id) = &expr.kind else {
+        return None;
+    };
+    let sym = symbols.get(*symbol_id);
+    let register = matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+        && types.modifiers(sym.typ).contains(TypeModifiers::REGISTER);
+    register.then_some(*symbol_id)
 }
 
 impl Parser<'_> {
@@ -1229,6 +1232,59 @@ impl Parser<'_> {
         }
         if let Some((sym, msg)) = register_address_refusal(self.types, self.symbols, operand) {
             diag::error_args(pos, msg, &[self.str(self.symbols.get(sym).name)]);
+        }
+    }
+
+    /// An array used where it converts to a pointer to its first element
+    /// (C17 6.3.2.1p3) -- anywhere but the operand of `sizeof`, `_Alignof`,
+    /// `typeof` or `&`, or the array of a subscript that needs no address
+    /// ([`Self::check_register_array_subscript`]). The pointer is an address,
+    /// which a `register` array has none of: 6.3.2.1p3 leaves the conversion
+    /// undefined, and gcc refuses it in the words of unary `&`, even inside
+    /// `sizeof (a + 0)`.
+    pub(super) fn check_register_array_decay(&self, operand: &Expr) {
+        if !self.is_decaying_array(operand) {
+            return;
+        }
+        if let Some((sym, msg)) = register_address_refusal(self.types, self.symbols, operand) {
+            diag::error_args(operand.pos, msg, &[self.str(self.symbols.get(sym).name)]);
+        }
+    }
+
+    /// Whether `e` is an array, which decays, rather than a GNU vector,
+    /// which c17 types as an array too but which is a value.
+    fn is_decaying_array(&self, e: &Expr) -> bool {
+        e.typ
+            .is_some_and(|t| self.types.kind(t) == TypeKind::Array && !self.types.is_vector(t))
+    }
+
+    /// The array operand of `base[index]` (either may be it, 6.5.2.1p2)
+    /// when that is a `register` array. gcc reads an element at an integer
+    /// constant index inside the bounds without an address, objecting only
+    /// under `-pedantic`; any other index decays the array.
+    pub(super) fn check_register_array_subscript(&self, base: &Expr, index: &Expr, pos: Position) {
+        let (array, index) = match (self.is_decaying_array(base), self.is_decaying_array(index)) {
+            (true, false) => (base, index),
+            (false, true) => (index, base),
+            _ => return,
+        };
+        let bound = array.typ.and_then(|t| self.types.array_extent(t).known());
+        let in_bounds = match (self.eval_const_expr(index), bound) {
+            (Some(i), Some(n)) => (0..n as i128).contains(&i),
+            _ => false,
+        };
+        if !in_bounds {
+            self.check_register_array_decay(array);
+            return;
+        }
+        // gcc follows members to the variable, but not elements: `m[1][2]`
+        // subscripts the row `m[1]`, which is not a variable.
+        let mut root = array;
+        while let ExprKind::Member { expr, .. } = &root.kind {
+            root = expr;
+        }
+        if register_variable(self.types, self.symbols, root).is_some() {
+            diag::pedwarn(pos, &gettext("ISO C forbids subscripting 'register' array"));
         }
     }
 

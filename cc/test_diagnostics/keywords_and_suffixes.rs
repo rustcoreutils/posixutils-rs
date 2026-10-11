@@ -1,4 +1,4 @@
-use crate::test_compile::{compile_expect_error, compile_expect_ok};
+use crate::test_compile::{compile_accepted, compile_expect_error, compile_expect_ok};
 
 // ============================================================================
 // Keywords are not declarator names
@@ -568,6 +568,101 @@ int main(void) {
 }
 "#;
     compile_expect_ok("ordinary_lvalues", src);
+}
+
+/// A `register` array has no address, so it cannot decay to a pointer to its
+/// first element (C17 6.3.2.1p3 leaves that undefined), and gcc refuses every
+/// use that decays it -- even under `sizeof`, whose operand is converted
+/// before it is measured. c17 refused only an explicit `&`.
+#[test]
+fn diagnostics_register_array_decay_is_rejected() {
+    let decl = "register int a[4] = {1, 2, 3, 4};";
+    for (name, body, who) in [
+        ("variable_index", "return a[i];", "a"),
+        ("variable_index_reversed", "return i[a];", "a"),
+        ("deref", "return *a;", "a"),
+        ("argument", "return g(a);", "a"),
+        ("initializer", "int *p = a; return *p;", "a"),
+        ("assignment", "int *p; p = a; return *p;", "a"),
+        ("arithmetic", "return *(a + 1);", "a"),
+        ("parenthesized", "return *(a);", "a"),
+        ("comparison", "return a != 0;", "a"),
+        ("not", "return !a;", "a"),
+        ("cast", "(void)a; return 0;", "a"),
+        ("expression_statement", "a; return 0;", "a"),
+        ("comma_left", "return (a, 0);", "a"),
+        ("comma_right", "return *(0, a);", "a"),
+        ("conditional_arms", "return *(i ? a : a);", "a"),
+        ("condition", "if (a) return 1; return 0;", "a"),
+        ("under_sizeof", "return sizeof (a + 0);", "a"),
+        ("generic_selection", "return _Generic(0, int: a)[i];", "a"),
+        (
+            "memory_asm_operand",
+            "__asm__(\"\" : : \"m\"(a)); return 0;",
+            "a",
+        ),
+        ("index_past_end", "return a[4];", "a"),
+        ("negative_index", "return a[-1];", "a"),
+        ("const_object_index", "const int c = 1; return a[c];", "a"),
+        (
+            "row_variable_index",
+            "register int m[2][3] = {{0}}; return m[1][i];",
+            "m",
+        ),
+        (
+            "row_decayed",
+            "register int m[2][3] = {{0}}; return *m[1];",
+            "m",
+        ),
+        (
+            "member_array",
+            "register struct { int m[4]; } s = {{0}}; return s.m[i];",
+            "s",
+        ),
+        (
+            "arrow",
+            "struct T { int x; }; register struct T t[2] = {{0}}; return t->x;",
+            "t",
+        ),
+    ] {
+        let src = format!("int g(int *);\nint f(int i) {{ {decl} {body} }}\n");
+        compile_expect_error(
+            name,
+            &src,
+            &format!("address of register variable '{who}' requested"),
+        );
+    }
+}
+
+/// What does not decay a `register` array: `sizeof`, `_Alignof` and
+/// `typeof` of it, and a subscript by an integer constant inside its bounds,
+/// which gcc reads without an address and objects to only under `-pedantic`.
+#[test]
+fn diagnostics_register_array_without_decay_is_accepted() {
+    let src = r#"
+struct S { int m[4]; };
+int f(void) {
+    register int a[4] = {1, 2, 3, 4};
+    register int m[2][3] = {{1, 2, 3}, {4, 5, 6}};
+    register struct S s = {{1, 2, 3, 4}};
+    enum { E = 2 };
+    __typeof__(a) b = {0};
+    typedef int v4 __attribute__((vector_size(16)));
+    register v4 v = {1, 2, 3, 4};
+    v = v + v;
+    a[3] = 7 + v[1];
+    return sizeof a + _Alignof(a) + a[0] + 1[a] + a[1 + 1] + a[E] + a[(long)1.5]
+        + sizeof (a)[0] + m[1][2] + s.m[3] + b[0];
+}
+"#;
+    let quiet = compile_accepted("register_array_ok", src, &[]);
+    let msg = "ISO C forbids subscripting 'register' array";
+    assert!(!quiet.contains(msg), "warned by default:\n{quiet}");
+    let loud = compile_accepted("register_array_ok", src, &["-pedantic"]);
+    // a[3], a[0], 1[a], a[1 + 1], a[E], a[(long)1.5], (a)[0], m[1] and
+    // s.m[3]: a member is followed to its structure, but `m[1][2]` subscripts
+    // a row, which is no variable, and `b` is only of a register's type.
+    assert_eq!(loud.matches(msg).count(), 9, "{loud}");
 }
 
 // ==== assignment compatibility (C17 6.5.16.1, and 6.8.6.4p3 / 6.5.2.2p2) ====

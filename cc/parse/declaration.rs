@@ -1247,7 +1247,7 @@ impl<'a> Parser<'a> {
                         Ok(match p.try_parse_type_name_vm() {
                             Some(named) => named,
                             None => {
-                                let expr = p.parse_expression()?;
+                                let expr = p.parse_expression_raw()?;
                                 p.exempt_reverse_atomic_operand(&expr);
                                 let dims = p.typeof_object_extents(&expr);
                                 let typ = expr.typ.unwrap_or(p.types.int_id);

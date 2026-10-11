@@ -34,18 +34,33 @@ impl<'a> Parser<'a> {
     // runs from lowest (comma) to highest (primary), each level delegating to
     // the next.
 
-    /// Parse an expression (comma expression, lowest precedence)
+    /// Parse an expression (comma expression, lowest precedence) whose value
+    /// is used.
     pub fn parse_expression(&mut self) -> ParseResult<Expr> {
+        let expr = self.parse_expression_raw()?;
+        self.check_register_array_decay(&expr);
+        Ok(expr)
+    }
+
+    /// Parse an expression whose consumer decides whether an array in it
+    /// decays: a parenthesized primary, a subscript, and the operand of
+    /// `sizeof`, `_Alignof` and `typeof`. Every other caller wants
+    /// [`Self::parse_expression`].
+    pub(crate) fn parse_expression_raw(&mut self) -> ParseResult<Expr> {
         self.parse_comma_expr()
     }
 
     /// Parse a comma expression: expr, expr, ...
     /// Result type is the type of the rightmost expression
     fn parse_comma_expr(&mut self) -> ParseResult<Expr> {
-        let mut expr = self.parse_assignment_expr()?;
+        let mut expr = self.parse_assignment_expr_raw()?;
 
         while self.is_special(b',') {
             self.advance();
+            // Each operand of a comma is a value (6.5.17p2).
+            if !matches!(expr.kind, ExprKind::Comma(_)) {
+                self.check_register_array_decay(&expr);
+            }
             let right = self.parse_assignment_expr()?;
             // C17 6.5.17p2: the result is the *value* of the right operand,
             // so the lvalue conversion runs -- an array or a function
@@ -86,8 +101,17 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    /// Parse an assignment expression (right-to-left associative)
+    /// Parse an assignment expression (right-to-left associative) whose
+    /// value is used.
     pub(crate) fn parse_assignment_expr(&mut self) -> ParseResult<Expr> {
+        let expr = self.parse_assignment_expr_raw()?;
+        self.check_register_array_decay(&expr);
+        Ok(expr)
+    }
+
+    /// [`Self::parse_assignment_expr`] for [`Self::parse_comma_expr`], which
+    /// leaves a lone operand to its own consumer.
+    fn parse_assignment_expr_raw(&mut self) -> ParseResult<Expr> {
         // Parse left side (could be lvalue for assignment)
         let left = self.parse_conditional_expr()?;
 
@@ -583,6 +607,7 @@ impl<'a> Parser<'a> {
 
         if self.is_special(b'?') {
             self.advance();
+            self.check_register_array_decay(&cond);
             let cond_tested = self.check_truth_value(&cond);
             // The arm a constant condition discards is not evaluated.
             let truth = self.constant_truth(&cond);
@@ -596,6 +621,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let else_expr =
                     self.unevaluated_if(truth == Some(true), Self::parse_conditional_expr)?;
+                self.check_register_array_decay(&else_expr);
 
                 // The condition is also an arm here, so one that cannot be
                 // tested has been reported as the operand it is.
@@ -622,6 +648,7 @@ impl<'a> Parser<'a> {
             // Right-to-left: parse else as another conditional
             let else_expr =
                 self.unevaluated_if(truth == Some(true), Self::parse_conditional_expr)?;
+            self.check_register_array_decay(&else_expr);
 
             let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
@@ -943,6 +970,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             // Deref produces the base type of the pointer.
             // Function types: *func is a no-op in C (6.5.3.2, 6.3.2.1).
             // A function identifier has function type which decays to pointer-
@@ -989,6 +1017,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             let valid = self.check_unary_operand(UnaryOperator::Plus, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let e = Self::typed_expr(
@@ -1006,6 +1035,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             let valid = self.check_unary_operand(UnaryOperator::Minus, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
@@ -1027,6 +1057,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             let valid = self.check_unary_operand(UnaryOperator::Complement, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
@@ -1046,6 +1077,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             let valid = self.check_unary_operand(UnaryOperator::Not, &operand, op_pos);
             // Logical not always produces int (0 or 1)
             let e = Self::typed_expr(
@@ -1091,6 +1123,7 @@ impl<'a> Parser<'a> {
                 let op_pos = self.current_pos();
                 self.advance();
                 let operand = self.parse_unary_expr()?;
+                self.check_register_array_decay(&operand);
                 let op_typ = operand.typ.unwrap_or(self.types.double_id);
                 // A half of a complex object stored in reverse order is
                 // stored so too, and assigning through it has to know.
@@ -1158,7 +1191,7 @@ impl<'a> Parser<'a> {
 
         // A rewind parses the operand again; what it held goes with it.
         let mark = self.reverse_atomic_mark();
-        let Ok(expr) = self.parse_expression() else {
+        let Ok(expr) = self.parse_expression_raw() else {
             self.pos = saved;
             self.take_reverse_atomic_members(mark);
             return Ok(None);
@@ -1653,7 +1686,7 @@ impl<'a> Parser<'a> {
     /// starting a type-name, the `(` already consumed: a parenthesized
     /// expression and whatever postfix operators follow it.
     fn parse_parenthesized_operand(&mut self) -> ParseResult<Expr> {
-        let expr = self.parse_expression()?;
+        let expr = self.parse_expression_raw()?;
         self.expect_special(b')')?;
         self.parse_postfix_suffixes(expr)
     }
@@ -1730,10 +1763,12 @@ impl<'a> Parser<'a> {
                 expr = Self::typed_expr(ExprKind::PostDec(Box::new(expr)), typ, base_pos);
             } else if self.is_special(b'[') {
                 // Array subscript
+                let bracket_pos = self.current_pos();
                 self.advance();
-                let index = self.parse_expression()?;
+                let index = self.parse_expression_raw()?;
                 self.expect_special(b']')?;
                 self.check_subscript(&expr, &index, base_pos);
+                self.check_register_array_subscript(&expr, &index, bracket_pos);
                 // C17 6.5.2.1p2 defines `E1[E2]` as `(*((E1)+(E2)))`, so the
                 // two operands are interchangeable: `N[p]` is `p[N]`. The
                 // element type therefore comes from whichever operand is the
@@ -1805,6 +1840,7 @@ impl<'a> Parser<'a> {
                 let arrow_pos = self.current_pos();
                 self.advance();
                 let member = self.expect_identifier()?;
+                self.check_register_array_decay(&expr);
                 // Get member type: dereference the pointer, then find the member
                 let member_type = if let Some(t) = expr.typ {
                     // C17 6.5.2.3p2: the operand of `->` is a pointer (an
@@ -2151,6 +2187,8 @@ impl<'a> Parser<'a> {
 
     /// Create a typed binary expression, computing result type from operands
     fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr, op_pos: Position) -> Expr {
+        self.check_register_array_decay(&left);
+        self.check_register_array_decay(&right);
         let valid = self.check_binary_operands(op, &left, &right, left.pos);
 
         // A bit-field operand promotes before anything else looks at it
@@ -2661,7 +2699,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.expect_special(b':')?;
                 let mark = self.reverse_atomic_mark();
-                let expr = self.parse_assignment_expr()?;
+                // The selection is the association itself (6.5.1.1p3), which
+                // what it is used in converts.
+                let expr = self.parse_assignment_expr_raw()?;
                 let held = self.take_reverse_atomic_members(mark);
 
                 if default_pos.is_some() {
@@ -2699,7 +2739,9 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_special(b':')?;
                 let mark = self.reverse_atomic_mark();
-                let expr = self.parse_assignment_expr()?;
+                // The selection is the association itself (6.5.1.1p3), which
+                // what it is used in converts.
+                let expr = self.parse_assignment_expr_raw()?;
                 let held = self.take_reverse_atomic_members(mark);
 
                 // 6.5.1.1p2: no two associations may name compatible types.
@@ -3033,6 +3075,7 @@ impl<'a> Parser<'a> {
 
                         // Regular cast expression
                         let expr = self.parse_unary_expr()?;
+                        self.check_register_array_decay(&expr);
                         // C17 6.5.4p2: a cast names a scalar type or `void`.
                         // An array was converted as if it were its first
                         // element's address. (A union stays: gcc casts to
@@ -3093,7 +3136,7 @@ impl<'a> Parser<'a> {
                     }
 
                     // Regular parenthesized expression
-                    let expr = self.parse_expression()?;
+                    let expr = self.parse_expression_raw()?;
                     self.expect_special(b')')?;
                     Ok(expr)
                 } else {

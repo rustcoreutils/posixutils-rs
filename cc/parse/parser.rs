@@ -19,7 +19,7 @@ use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, 
 use crate::token::preprocess::{
     LayoutPragma, PackAction, StorageOrderPragma, SymbolVisibility, VisibilityPragma,
 };
-use crate::types::{Type, TypeId, TypeKind, TypeTable};
+use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -763,16 +763,19 @@ impl<'a> Parser<'a> {
     /// a different type. `typedef struct S TS;` used as `TS x;` in a block
     /// that defines its own `struct S` declared `x` with the inner type.
     ///
-    /// Only the type qualifiers carry over. A storage class -- `typedef`
-    /// above all -- is the declaration's, not the type's: keeping it would
-    /// make `typedef struct Foo Foo;` a different `TypeId` from the tag.
+    /// Only the type qualifiers carry over, and `register`. A storage class
+    /// -- `typedef` above all -- is the declaration's, not the type's:
+    /// keeping it would make `typedef struct Foo Foo;` a different `TypeId`
+    /// from the tag. But `register` is read off the object's type, by every
+    /// refusal of its address, as it is for a scalar: dropped here,
+    /// `register struct S s; &s.m` was accepted.
     ///
     /// [`CompositeType::tag_type`]: crate::types::CompositeType::tag_type
     pub(super) fn intern_type_with_tag(&mut self, typ: &Type) -> TypeId {
         let Some(tag_type) = typ.composite.as_ref().and_then(|c| c.tag_type) else {
             return self.types.intern(typ.clone());
         };
-        let qualifiers = typ.modifiers & Type::QUALIFIERS;
+        let qualifiers = typ.modifiers & (Type::QUALIFIERS | TypeModifiers::REGISTER);
         if qualifiers.is_empty() {
             return tag_type;
         }

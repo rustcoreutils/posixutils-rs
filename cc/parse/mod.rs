@@ -22,7 +22,7 @@ mod builtin_expr;
 mod cpu_builtin;
 mod declaration;
 mod declarator;
-mod expr_check;
+pub(crate) mod expr_check;
 mod expression;
 mod generic_builtin;
 mod library_builtin;

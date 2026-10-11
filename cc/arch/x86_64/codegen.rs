@@ -1877,8 +1877,8 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.cf_protection = cf_protection;
     }
 
-    fn set_stack_clash(&mut self, on: bool) {
-        self.base.stack_clash = on;
+    fn set_stack_clash(&mut self, stack_clash: Option<crate::target::StackClash>) {
+        self.base.stack_clash = stack_clash;
     }
 
     fn set_stack_protector(&mut self, protection: crate::target::StackProtection) {

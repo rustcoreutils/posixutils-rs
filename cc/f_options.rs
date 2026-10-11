@@ -124,6 +124,10 @@ const PLAIN: &[(&str, Effect)] = &[
     ("dump-rtl-reload", Unsupported),
     ("dump-tree-optimized", Unsupported),
     ("dump-tree-ssa", Unsupported),
+    // Call frame information as `.cfi_*` directives, the only way c17
+    // writes it; `-fno-` is refused by the driver, c17 having no tables of
+    // its own to write instead.
+    ("dwarf2-cfi-asm", Accepted(Default)),
     // The unwind tables, and the landing pads that run a `cleanup`
     // variable's cleanup when its frame is unwound: `target::UnwindTables`.
     ("exceptions", Implemented),
@@ -180,6 +184,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-diagnostics-color", Accepted(Presentation)),
     ("no-diagnostics-show-caret", Accepted(Presentation)),
     ("no-diagnostics-show-option", Accepted(Presentation)),
+    ("no-dwarf2-cfi-asm", Implemented),
     ("no-early-inlining", Accepted(Pass)),
     ("no-enforce-eh-specs", CXX_OBJCXX),
     ("no-exceptions", Implemented),

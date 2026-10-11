@@ -35,7 +35,8 @@ fn defined(macros: &str, name: &str) -> Option<String> {
 }
 
 /// Apple clang's: `__APPLE__`, `__MACH__`, `__APPLE_CC__` 6000, and none of
-/// the `__DARWIN__` / `__MACH_O__` that no Darwin compiler defines.
+/// the `__DARWIN__` / `__MACH_O__` that no Darwin compiler defines, nor
+/// `_FORTIFY_SOURCE`.
 #[test]
 fn darwin_predefines_match_clang() {
     for triple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
@@ -48,6 +49,10 @@ fn darwin_predefines_match_clang() {
             "{triple}"
         );
         assert_eq!(defined(&m, "__DARWIN__"), None, "{triple}");
+        // Nor `_FORTIFY_SOURCE`, which the SDK's headers decide on and
+        // which c17 had to pin at 0 while their `__builtin___*_chk`
+        // calls were not all known.
+        assert_eq!(defined(&m, "_FORTIFY_SOURCE"), None, "{triple}");
         assert_eq!(defined(&m, "__MACH_O__"), None, "{triple}");
         assert_eq!(
             defined(&m, "__WINT_TYPE__").as_deref(),

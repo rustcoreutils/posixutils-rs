@@ -182,6 +182,62 @@ impl PositionIndependence {
     }
 }
 
+/// `-fstack-clash-protection`'s two `--param`s, as written: each the log2 of
+/// a byte count. c17 probes no stack; these move where gcc would, and so
+/// which functions c17 warns about.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StackClash {
+    /// `stack-clash-protection-guard-size`.
+    pub guard_size: Option<u32>,
+    /// `stack-clash-protection-probe-interval`.
+    pub probe_interval: Option<u32>,
+}
+
+impl StackClash {
+    /// The space aarch64 leaves for the caller's own use of the guard,
+    /// gcc's `STACK_CLASH_CALLER_GUARD`.
+    const AARCH64_CALLER_GUARD: i64 = 1024;
+
+    /// The smallest static allocation gcc probes on `arch`. On x86-64 one of
+    /// at least the guard size is probed every interval, so it is probed
+    /// once it reaches both (gcc's defaults: 4 KiB each). aarch64 keeps the
+    /// two equal (64 KiB by default) and probes once a frame passes the
+    /// guard less what the caller may have used of it.
+    pub fn probed_from(self, arch: Arch) -> i64 {
+        match arch {
+            Arch::X86_64 => {
+                let guard = self.guard_size.unwrap_or(12);
+                let interval = self.probe_interval.unwrap_or(12);
+                1i64 << guard.max(interval)
+            }
+            Arch::Aarch64 => (1i64 << self.guard_size.unwrap_or(16)) - Self::AARCH64_CALLER_GUARD,
+        }
+    }
+
+    /// What gcc's aarch64 back end refuses of the two, in its words: a
+    /// guard of other than 4 KiB or 64 KiB, and an interval that is not the
+    /// guard, which an unset interval follows. With or without the
+    /// protection asked for, as in gcc.
+    pub fn aarch64_errors(self) -> Vec<String> {
+        let guard = self.guard_size.unwrap_or(16);
+        let interval = self.probe_interval.unwrap_or(guard);
+        let mut errors = Vec::new();
+        if guard != 12 && guard != 16 {
+            errors.push(format!(
+                "only values 12 (4 KB) and 16 (64 KB) are supported for guard size.  \
+                 Given value {guard} ({} KB) is out of range",
+                (1u64 << guard) / 1024
+            ));
+        }
+        if guard != interval {
+            errors.push(format!(
+                "stack clash guard size '{guard}' must be equal to probing interval '{interval}'"
+            ));
+        }
+        errors
+    }
+}
+
 /// `-fcf-protection`: which of Intel CET's two protections x86-64 code is
 /// built to cooperate with. The default is neither, as Debian's gcc has it.
 ///

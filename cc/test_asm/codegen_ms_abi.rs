@@ -31,3 +31,20 @@ fn codegen_ms_abi_is_ignored_on_aarch64_with_a_warning() {
     let quiet = compile_expect_warning_with("ms_abi_a64_quiet", src, &args);
     assert!(!quiet.contains("ms_abi"), "{quiet}");
 }
+
+/// An `ms_abi` function saves `%rsi` and `%rdi`, callee-saved under Win64 --
+/// but not one that is a global register variable, which is the variable's:
+/// restoring it on the way out undid every store the function made to it.
+#[test]
+fn codegen_ms_abi_does_not_save_a_global_register() {
+    use super::asm_probe::{asm_for_with, body_of, X86_64_LINUX};
+    let src = "register long g asm(\"rdi\");\n\
+               __attribute__((ms_abi)) long w(long a) { g = a; return a + 1; }\n";
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_with("ms_abi_global_reg", X86_64_LINUX, src, &[opt]);
+        let body = body_of(&asm, "w");
+        assert!(body.contains("pushq %rsi"), "{opt}:\n{body}");
+        assert!(!body.contains("pushq %rdi"), "{opt}:\n{body}");
+        assert!(!body.contains("popq %rdi"), "{opt}:\n{body}");
+    }
+}

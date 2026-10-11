@@ -425,7 +425,9 @@ impl Parser<'_> {
 
         let is_fn = self.types.kind(typ) == TypeKind::Function;
         self.check_derived_types(typ, name, pos);
-        if !is_typedef {
+        if is_typedef {
+            self.check_typedef_function_specifiers(specs, name, pos);
+        } else {
             self.check_storage_for_declarator(specs, name, is_fn, scope, pos);
         }
         let fn_attrs = if is_fn {
@@ -669,6 +671,19 @@ impl Parser<'_> {
         self.checked_call(callee, vec![arg], c.pos, c.pos)
     }
 
+    /// C17 6.7.4p1: the function specifiers declare functions, and a
+    /// typedef declares none -- not even a typedef of a function type. gcc
+    /// warns, and the type is the one written without them.
+    fn check_typedef_function_specifiers(&self, specs: &DeclSpecs, name: StringId, pos: Position) {
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        if specs.storage_class.contains(TypeModifiers::INLINE) {
+            diag::pedwarn_default_args(pos, "typedef '{0}' declared 'inline'", &[spelled]);
+        }
+        if specs.ty.modifiers.contains(TypeModifiers::NORETURN) {
+            diag::pedwarn_default_args(pos, "typedef '{0}' declared '_Noreturn'", &[spelled]);
+        }
+    }
+
     /// The storage-class and function specifiers a declarator of this kind,
     /// at this scope, may not have.
     fn check_storage_for_declarator(
@@ -827,45 +842,42 @@ impl Parser<'_> {
     /// `noreturn`, `returns_twice` and `nothrow` when anything said so.
     ///
     /// Answers the attributes accumulated under the function's name, or
-    /// `None` for a typedef, which names a type and no function.
+    /// `None` for a typedef, which names a type and no function: gcc keeps
+    /// all three on a function's declaration, so on a typedef it warns and
+    /// ignores them, and a function declared through the typedef is an
+    /// ordinary one.
     fn function_declarator_attrs(
         &mut self,
         specs: &DeclSpecs,
         name: StringId,
         typ: &mut TypeId,
     ) -> Option<FunctionAttrs> {
-        let attrs = if specs.is_typedef() {
-            None
-        } else {
-            // C11 6.7.5p2: not on a function. A pointer to function is an
-            // object and stays legal, so this asks the finished type.
-            self.reject_alignas_in("a function");
-            Some(self.accumulate_fn_attrs(name))
-        };
-        // `noreturn` belongs to the function *type*, since that is what a
-        // call site reads: `_Noreturn` among the specifiers, or the attribute
-        // on this declarator or on any earlier declaration of the name.
-        let noreturn = specs.ty.modifiers.contains(TypeModifiers::NORETURN)
-            || attrs
-                .as_ref()
-                .map_or(self.pending_fn_attrs.noreturn, |a| a.noreturn);
-        // `returns_twice` and `nothrow` too, but only on a function's
-        // declaration: gcc ignores them on a typedef, so a call through a
-        // pointer to that type is an ordinary one.
-        let returns_twice = attrs.as_ref().is_some_and(|a| a.returns_twice);
-        let nothrow = attrs.as_ref().is_some_and(|a| a.nothrow);
+        if specs.is_typedef() {
+            self.drop_fn_decl_attrs();
+            return None;
+        }
+        // C11 6.7.5p2: not on a function. A pointer to function is an
+        // object and stays legal, so this asks the finished type.
+        self.reject_alignas_in("a function");
+        let attrs = self.accumulate_fn_attrs(name);
+        // c17 records them on the declared function's *type*, where a call
+        // naming the function reads them: `_Noreturn` among the specifiers,
+        // or the attribute on this declarator or on any earlier declaration
+        // of the name. `__typeof__` of the function takes them off again
+        // (`TypeTable::without_function_decl_attrs`).
+        let noreturn = specs.ty.modifiers.contains(TypeModifiers::NORETURN) || attrs.noreturn;
         let current = self.types.get(*typ);
         if (noreturn && !current.noreturn)
-            || (returns_twice && !current.returns_twice)
-            || (nothrow && !current.nothrow)
+            || (attrs.returns_twice && !current.returns_twice)
+            || (attrs.nothrow && !current.nothrow)
         {
             let mut func = current.clone();
             func.noreturn |= noreturn;
-            func.returns_twice |= returns_twice;
-            func.nothrow |= nothrow;
+            func.returns_twice |= attrs.returns_twice;
+            func.nothrow |= attrs.nothrow;
             *typ = self.types.intern(func);
         }
-        attrs
+        Some(attrs)
     }
 
     /// Declare `sym`, or answer the symbol an earlier declaration of the name

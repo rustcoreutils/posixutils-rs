@@ -12,7 +12,7 @@
 use super::ast::{AsmOperand, ExternalDecl, LabelId, Stmt};
 use super::bind::DeclScope;
 use super::parser::{ParseError, ParseResult, Parser};
-use crate::arch::asm_constraints::PinnedGp;
+use crate::arch::asm_constraints::{GlobalHold, PinnedGp};
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, SymbolId};
@@ -151,10 +151,10 @@ impl Parser<'_> {
     /// nothing.
     ///
     /// c17 binds a local in any general register it can hand an asm operand
-    /// -- every one but the stack and frame pointers -- and a global in the
-    /// stack pointer (Linux's `current_stack_pointer`) or a callee-saved
-    /// register, which every function of the unit then leaves alone; see
-    /// [`PinnedGp::can_hold_global`].
+    /// -- every one but the stack and frame pointers -- and a global in any
+    /// register its own generated code leaves to the allocator, which every
+    /// function of the unit then leaves alone; see
+    /// [`PinnedGp::global_hold`].
     pub(super) fn bind_register_variable(
         &mut self,
         symbol: Option<SymbolId>,
@@ -185,14 +185,22 @@ impl Parser<'_> {
             );
             return;
         }
-        if global && !reg.can_hold_global() {
-            diag::error_args(
+        match reg.global_hold() {
+            _ if !global => {}
+            GlobalHold::Reserved | GlobalHold::FramePointer => {}
+            GlobalHold::CallClobbered => diag::warning(
                 pos,
-                "global register variable '{0}' in '{1}' is not supported; c17 \
-                 supports one only in the stack pointer or a callee-saved register",
-                &[&spelled, &label],
-            );
-            return;
+                &gettext("call-clobbered register used for global register variable"),
+            ),
+            GlobalHold::Unavailable => {
+                diag::error_args(
+                    pos,
+                    "global register variable '{0}' in '{1}' is not supported; \
+                     code c17 generates uses that register itself",
+                    &[&spelled, &label],
+                );
+                return;
+            }
         }
         if !global && (reg.is_stack_pointer() || reg.is_frame_pointer()) {
             diag::error_args(

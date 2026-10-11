@@ -2691,12 +2691,16 @@ impl<'a> Parser<'a> {
                 if let TokenValue::Ident(id) = &token.value {
                     let name_id = *id;
 
-                    // `__label__` declares local labels at the head of a
-                    // block and nowhere else; anywhere a statement or an
-                    // expression is wanted, gcc takes it as neither.
-                    if name_id == crate::kw::GNU_LABEL {
+                    // A statement keyword starts no expression: `__label__`
+                    // declares local labels at the head of a block and
+                    // nowhere else, and `case` after `__extension__` is no
+                    // label. gcc takes it as neither.
+                    if crate::kw::has_tag(name_id, crate::kw::STMT_KW) {
                         return Err(ParseError::new(
-                            gettext("expected expression before '__label__'"),
+                            gettext_args(
+                                "expected expression before '{0}'",
+                                &[self.idents.get_opt(name_id).unwrap_or("")],
+                            ),
                             token_pos,
                         ));
                     }

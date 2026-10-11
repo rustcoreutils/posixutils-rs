@@ -291,3 +291,47 @@ int main(void)
     return 0;
 }
 "#;
+
+/// The macOS SDK's own fortified headers, which c17 used to switch off by
+/// predefining `_FORTIFY_SOURCE` as 0: by default, at level 1 and at level
+/// 2, every rewritten function compiles and does its work. Only a macOS host
+/// has the headers.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_sdk_fortified_headers() {
+    let src = r#"
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+int main(void)
+{
+    char d[16], e[16];
+    if (strlcpy(d, "abc", sizeof d) != 3 || strcmp(d, "abc") != 0) return 1;
+    if (strlcat(d, "de", sizeof d) != 5 || strcmp(d, "abcde") != 0) return 2;
+    memcpy(e, d, 6);
+    if (memccpy(e, "xyz", 'y', sizeof e) != e + 2) return 3;
+    strcpy(d, "q");
+    strcat(d, "r");
+    strncat(d, "stu", 2);
+    if (strcmp(d, "qrst") != 0) return 4;
+    if (snprintf(e, sizeof e, "%d-%s", 7, d) != 6 || strcmp(e, "7-qrst") != 0) return 5;
+    sprintf(e, "%s", "ok");
+    bzero(d, sizeof d);
+    bcopy(e, d, 3);
+    stpcpy(d + 2, "!");
+    return strcmp(d, "ok!") != 0 ? 6 : 0;
+}
+"#;
+    for opts in [
+        vec!["-O2".to_string()],
+        vec!["-O2".to_string(), "-D_FORTIFY_SOURCE=1".to_string()],
+        vec!["-O2".to_string(), "-D_FORTIFY_SOURCE=2".to_string()],
+        vec!["-O0".to_string(), "-D_FORTIFY_SOURCE=2".to_string()],
+    ] {
+        assert_eq!(
+            crate::common::compile_and_run("macos_sdk_fortified", src, &opts),
+            0,
+            "{opts:?}"
+        );
+    }
+}

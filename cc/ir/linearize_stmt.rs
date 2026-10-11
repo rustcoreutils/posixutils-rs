@@ -23,6 +23,7 @@ use crate::parse::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Label,
     LabelId, Stmt, UnaryOp,
 };
+use crate::parse::expr_check::register_address_refusal;
 use crate::symbol::SymbolId;
 use crate::token::lexer::payload_bytes;
 use crate::types::TypeTable;
@@ -2706,11 +2707,29 @@ impl<'a> super::linearize::Linearizer<'a> {
                 Ok(class) => asm_operand_misuse(&class, is_output, outputs.len())
                     .map_or(Ok(class), |why| Err(why.to_string())),
             };
-            reason.unwrap_or_else(|msg| {
-                error(op.expr.pos, &msg);
+            let plain = || {
                 let plain = if is_output { "=r" } else { "r" };
                 AsmOperandClass::parse(plain, self.target.arch).expect("a register class")
-            })
+            };
+            match reason {
+                Err(msg) => {
+                    error(op.expr.pos, &msg);
+                    plain()
+                }
+                // A memory operand is its object's address, which a
+                // `register` object has none of.
+                Ok(class) if class.is_memory_only() => {
+                    match register_address_refusal(self.types, self.symbols, &op.expr) {
+                        Some((sym, msg)) => {
+                            let name = self.str(self.symbols.get(sym).name);
+                            crate::diag::error_args(op.expr.pos, msg, &[name]);
+                            plain()
+                        }
+                        None => class,
+                    }
+                }
+                Ok(class) => class,
+            }
         };
         (
             outputs.iter().map(|op| classify(op, true)).collect(),

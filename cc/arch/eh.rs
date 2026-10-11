@@ -27,7 +27,11 @@
 //! which is the one at the call. c17 reserves a call's stacked arguments
 //! below the frame and releases them after the call, so the pad would start
 //! that much lower than the code around it; `.cfi_GNU_args_size` tells the
-//! unwinder to add it back, as gcc does for pushed arguments.
+//! unwinder to add it back, as gcc does for pushed arguments. An area whose
+//! size is only known at run time -- a Darwin variadic call realigning `sp`
+//! past sixteen -- has no such constant: its call says 0, and its call-site
+//! entry lands on a detour that restores `sp` from where the call saved it
+//! and then jumps to the pad ([`SpDetour`]).
 //!
 //! The personality routine is named PC-relative through a pointer the
 //! linker resolves, `DW.ref.__gcc_personality_v0`: a hidden weak object in a
@@ -38,7 +42,7 @@
 
 use super::codegen::CodeGenBase;
 use super::lir::{internal_label, Directive, EmitAsm, Label, LirInst, Symbol, SymbolType};
-use crate::ir::{BasicBlockId, Function, Instruction};
+use crate::ir::{Function, Instruction};
 use crate::target::Os;
 
 /// gcc's personality routine for C.
@@ -60,6 +64,28 @@ const PCREL: u8 = 0x10;
 const OMIT: i64 = 0xff;
 /// `DW_EH_PE_uleb128`.
 const ULEB128: i64 = 0x01;
+
+/// What a call's outgoing argument area did to the stack pointer, for the
+/// landing pad to undo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallArgsArea {
+    /// `sp` was lowered by this many bytes, which `.cfi_GNU_args_size`
+    /// gives back.
+    Fixed(i64),
+    /// `sp` was realigned by an amount only known at run time, and its old
+    /// value stored this many bytes above the new one.
+    Realigned { saved_sp: i32 },
+}
+
+/// The landing of a call whose argument area was realigned: a few
+/// instructions, after the function's blocks, that load `sp` from
+/// `saved_sp` bytes above it and jump to the pad. Emitted by the backend,
+/// which knows the instructions ([`CodeGenBase::take_eh_detours`]).
+pub struct SpDetour {
+    pub label: Label,
+    pub saved_sp: i32,
+    pub pad: Label,
+}
 
 /// One call that has a landing pad: the labels around the call instruction,
 /// and the pad's.
@@ -86,6 +112,8 @@ pub struct EhTables {
     current: Option<Lsda>,
     /// The `.cfi_GNU_args_size` in force in the function being emitted.
     args_size: i64,
+    /// The function's landing detours, for the backend to emit.
+    detours: Vec<SpDetour>,
     /// Every function's, to be written at the end of the unit.
     done: Vec<Lsda>,
     /// The next number for a label of these tables.
@@ -146,12 +174,16 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         });
     }
 
-    /// Just before the call instruction of `insn`, with `args_size` bytes
-    /// of stacked arguments below the frame: its landing pad, if it has
-    /// one, with the label its call-site entry starts at.
-    pub fn eh_call_begin(&mut self, insn: &Instruction, args_size: i64) -> Option<CallSite> {
+    /// Just before the call instruction of `insn`, with `area` below the
+    /// frame: its landing pad, if it has one, with the label its call-site
+    /// entry starts at.
+    pub fn eh_call_begin(&mut self, insn: &Instruction, area: CallArgsArea) -> Option<CallSite> {
         let pad = insn.extra().landing_pad?;
         self.eh.current.as_ref()?;
+        let args_size = match area {
+            CallArgsArea::Fixed(bytes) => bytes,
+            CallArgsArea::Realigned { .. } => 0,
+        };
         if args_size != self.eh.args_size {
             self.push_directive(Directive::CfiGnuArgsSize(args_size));
             self.eh.args_size = args_size;
@@ -159,11 +191,31 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         let begin = self.eh.label("LEHB");
         let end = self.eh.label("LEHE");
         self.push_directive(Directive::GlobalLabel(begin.clone()));
+        let pad = Label::block(&self.current_fn, pad.0);
+        let pad = match area {
+            CallArgsArea::Fixed(_) => pad,
+            CallArgsArea::Realigned { saved_sp } => {
+                let n = self.eh.next_label;
+                self.eh.next_label += 1;
+                let label = Label::internal("LEHD", n);
+                self.eh.detours.push(SpDetour {
+                    label: label.clone(),
+                    saved_sp,
+                    pad,
+                });
+                label
+            }
+        };
         Some(CallSite {
             begin,
             end,
-            pad: self.landing_pad_label(pad),
+            pad: pad.symbol(),
         })
+    }
+
+    /// The function's landing detours, once its blocks are emitted.
+    pub fn take_eh_detours(&mut self) -> Vec<SpDetour> {
+        std::mem::take(&mut self.eh.detours)
     }
 
     /// Just after the call instruction `eh_call_begin` answered `site` for.
@@ -175,11 +227,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         if let Some(lsda) = &mut self.eh.current {
             lsda.sites.push(site);
         }
-    }
-
-    /// The label of block `pad` of the function being emitted.
-    fn landing_pad_label(&self, pad: BasicBlockId) -> Symbol {
-        Label::block(&self.current_fn, pad.0).symbol()
     }
 
     /// At `.cfi_endproc`: the function's LSDA, if any, waits for the end of

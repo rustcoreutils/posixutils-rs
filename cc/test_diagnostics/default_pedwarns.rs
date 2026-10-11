@@ -193,6 +193,16 @@ const DEFAULT_PEDWARNS: &[(&str, &str, &str)] = &[
         "variable 'x' declared 'inline'",
     ),
     (
+        "typedef_declared_inline",
+        "typedef inline int f(void);\n",
+        "typedef 'f' declared 'inline'",
+    ),
+    (
+        "typedef_declared_noreturn",
+        "typedef _Noreturn void f(void);\n",
+        "typedef 'f' declared '_Noreturn'",
+    ),
+    (
         "variable_declared_noreturn",
         "_Noreturn int x;\n",
         "variable 'x' declared '_Noreturn'",

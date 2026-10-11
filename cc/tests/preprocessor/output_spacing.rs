@@ -198,3 +198,72 @@ fn preprocessor_asm_output_keeps_leading_indentation() {
     let text: Vec<&str> = r.stdout.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(text, [" foo:", "   movl $1, %eax", "  ret"]);
 }
+
+/// Without `-P`, a token written on a later source line than the output line
+/// it would join goes back to its own line, as gcc's does: one with white
+/// space before it, and the first token of a macro's expansion or the first
+/// after one. A function-like macro's arguments are the usual way there --
+/// the expansion stands on the line of its name, and what follows the `)`
+/// on the line of the `)`. c17 left it on the expansion's line and wrote the
+/// lines it skipped afterwards, so the next token's line was right but its
+/// own was not. From eight lines a marker moves the text, as at the start of
+/// a line, where c17 wrote blank lines for exactly eight. Each expected text
+/// is gcc 13's, after its marker for the file.
+#[test]
+fn preprocessor_output_returns_a_token_to_its_line() {
+    let cases = [
+        (
+            "#define M(x) [x]\n\tM(\n\tq) s;\nt;\n",
+            "\n [q]\n    s;\nt;\n",
+        ),
+        (
+            "#define M(x,y) [x y]\nint a = M(1,\n\n\n2) + 3;\nint b;\n",
+            "\nint a = [1 2]\n\n\n   + 3;\nint b;\n",
+        ),
+        (
+            "#define M(x) [x]\nM(a\n)M(b\n) end\nlast\n",
+            "\n[a]\n [b]\n  end\nlast\n",
+        ),
+        (
+            "#define M(x) [x]\n#define N M\nN\n(z) w\nv\n",
+            "\n\n[z]\n    w\nv\n",
+        ),
+        (
+            "#define M(x) [x]\nfoo M\n\n\n(\nq\n) bar\nbaz\n",
+            "\nfoo [q]\n\n\n\n\n  bar\nbaz\n",
+        ),
+        (
+            "#define M(x) [x]\n  x = M(1\n      ) + M(2\n  ); y;\n",
+            "\n  x = [1]\n        + [2]\n   ; y;\n",
+        ),
+        ("#define M(x) [x]\nM(1\n)x\n", "\n[1]\n x\n"),
+        (
+            "#define M(x,y) [x y]\nint a = M(1,\n\n\n\n\n\n\n\n\n\n2) + 3;\nint b;\n",
+            "\nint a = [1 2]\n# 12\n   + 3;\nint b;\n",
+        ),
+        // The threshold itself, between two lines of plain text: seven
+        // blank lines are written out, eight are a marker.
+        ("a\n\n\n\n\n\n\n\nb\n", "a\n\n\n\n\n\n\n\nb\n"),
+        ("a\n\n\n\n\n\n\n\n\nb\n", "a\n# 10\nb\n"),
+    ];
+    for (i, (src, want)) in cases.iter().enumerate() {
+        let r = preprocess_text(&format!("pp_token_line{i}"), src, &[]);
+        assert!(r.success, "-E failed: {}", r.stderr);
+        // The text after the marker naming the file, each later marker
+        // without the file name, which is the test's own temporary path.
+        let text: String = r
+            .stdout
+            .lines()
+            .skip_while(|l| !l.starts_with("# 1 \""))
+            .skip(1)
+            .map(|l| match l.strip_prefix("# ") {
+                Some(rest) => format!("# {}\n", rest.split(' ').next().unwrap_or("")),
+                None => format!("{l}\n"),
+            })
+            .collect();
+        assert_eq!(text, *want, "source:\n{src}");
+    }
+    // `-P` keeps the run on one line, as gcc's does.
+    let r = preprocess_text("pp_token_line_p", cases[0].0, &["-P"]);
+    assert_eq!(r.stdout, " [q] s;\nt;\n");
+}

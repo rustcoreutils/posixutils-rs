@@ -1255,7 +1255,10 @@ impl<'a> Parser<'a> {
                                 let expr = p.parse_expression()?;
                                 p.exempt_reverse_atomic_operand(&expr);
                                 let dims = p.typeof_object_extents(&expr);
-                                (expr.typ.unwrap_or(p.types.int_id), dims)
+                                let typ = expr.typ.unwrap_or(p.types.int_id);
+                                let of_name = matches!(expr.kind, ExprKind::Ident(_));
+                                let typ = p.types.without_function_decl_attrs(typ, of_name);
+                                (typ, dims)
                             }
                         })
                     })?;

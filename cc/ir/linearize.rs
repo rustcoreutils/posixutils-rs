@@ -611,8 +611,6 @@ struct CalleeSignature {
     variadic_arg_start: Option<usize>,
     /// The callee does not return.
     is_noreturn: bool,
-    /// The callee is `nothrow`: it never unwinds through its caller.
-    is_nothrow: bool,
 }
 
 /// A call's lowered arguments: the values and, in step, the types the ABI
@@ -3284,16 +3282,10 @@ impl<'a> Linearizer<'a> {
                         binding: LocalBinding::ExtentsOnly,
                         ..
                     }) => unreachable!("no identifier names a type name's extents"),
-                    // A register has no address. The parser refuses `&`
-                    // of one; this is a memory-class asm operand (`"m"`).
+                    // A register has no address: the parser refuses `&` of
+                    // one, and `asm_operand_classes` a memory operand.
                     None if self.global_register(*symbol_id).is_some() => {
-                        let name = self.str(self.symbols.get(*symbol_id).name).to_string();
-                        crate::diag::error_args(
-                            expr.pos,
-                            "address of global register variable '{0}' requested",
-                            &[&name],
-                        );
-                        return self.emit_const(0, self.types.pointer_to(self.expr_type(expr)));
+                        unreachable!("the address of a global register variable is refused")
                     }
                     None => {
                         let name = self.symbol_name(*symbol_id);
@@ -4419,9 +4411,8 @@ impl<'a> Linearizer<'a> {
             variadic_arg_start: sig.variadic_arg_start,
             ends_with_va_arg_pack,
             is_noreturn: sig.is_noreturn,
-            returns_twice: matches!(target, CallTarget::Direct(_))
-                && self.callee_returns_twice(func_expr),
-            may_throw: self.exceptions && !sig.is_nothrow,
+            returns_twice: self.callee_returns_twice(func_expr),
+            may_throw: self.exceptions && !self.callee_nothrow(func_expr),
             binding,
             known,
             abi_info: Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv)),
@@ -4459,14 +4450,36 @@ impl<'a> Linearizer<'a> {
         result_sym
     }
 
-    /// Whether the function a direct call names returns twice, as gcc
-    /// decides it: declared `__attribute__((returns_twice))`, which its type
-    /// carries, or an external function on gcc's list of such names --
+    /// The function a call names, as gcc's `get_callee_fndecl` finds it:
+    /// `f`, `&f`, `*f`. Its declaration's `returns_twice` and `nothrow`
+    /// reach the call, and only then: gcc keeps them on the declaration, so
+    /// a call through any pointer -- even one holding `&f` -- is an ordinary
+    /// call. (`noreturn` travels in a pointer's type as well; see
+    /// [`Self::callee_signature`].)
+    fn designated_function(&self, func_expr: &Expr) -> Option<SymbolId> {
+        let mut e = func_expr;
+        loop {
+            match &e.kind {
+                ExprKind::Unary {
+                    op: UnaryOp::AddrOf | UnaryOp::Deref,
+                    operand,
+                } => e = operand,
+                ExprKind::Ident(id) => {
+                    let typ = self.symbols.get(*id).typ;
+                    return (self.types.kind(typ) == TypeKind::Function).then_some(*id);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Whether the function a call names returns twice, as gcc decides it:
+    /// declared `__attribute__((returns_twice))`, which its type carries, or an external function on gcc's list of such names --
     /// `setjmp` and `sigsetjmp` under up to two leading underscores, and
     /// `savectx`, `vfork` and `getcontext` as spelled, the name being the
     /// one the program wrote, at most 11 characters.
     fn callee_returns_twice(&self, func_expr: &Expr) -> bool {
-        let ExprKind::Ident(symbol_id) = func_expr.kind else {
+        let Some(symbol_id) = self.designated_function(func_expr) else {
             return false;
         };
         let sym = self.symbols.get(symbol_id);
@@ -4482,6 +4495,13 @@ impl<'a> Linearizer<'a> {
             && name.len() <= 11
             && (matches!(bare, "setjmp" | "sigsetjmp")
                 || matches!(name, "savectx" | "vfork" | "getcontext"))
+    }
+
+    /// Whether the function a call names is declared `nothrow`: it never
+    /// unwinds through its caller.
+    fn callee_nothrow(&self, func_expr: &Expr) -> bool {
+        self.designated_function(func_expr)
+            .is_some_and(|id| self.types.get(self.symbols.get(id).typ).nothrow)
     }
 
     /// Which definition a direct call reaches, refining what the parser
@@ -4515,20 +4535,12 @@ impl<'a> Linearizer<'a> {
     /// callee expression evaluates to. Emits that evaluation, so it runs
     /// before the arguments are lowered.
     fn lower_callee(&mut self, func_expr: &Expr) -> CallTarget {
-        // Determine if this is a direct or indirect call.
-        // We need to check the TYPE of the function expression:
-        // - If it's TypeKind::Function, it's a direct call to a function
-        // - If it's TypeKind::Pointer to Function, it's an indirect call through function pointer
-        let is_function_pointer = func_expr.typ.is_some_and(|t| {
-            let typ = self.types.get(t);
-            typ.kind == TypeKind::Pointer
-        });
-
+        // `f()`, `(&f)()` and `(*f)()` all call `f` by name, as gcc's do.
+        if let Some(id) = self.designated_function(func_expr) {
+            return CallTarget::Direct(self.symbol_name(id));
+        }
+        // Anything else calls through a pointer.
         match &func_expr.kind {
-            ExprKind::Ident(symbol_id) if !is_function_pointer => {
-                // Direct call to named function (not a function pointer variable)
-                CallTarget::Direct(self.symbol_name(*symbol_id))
-            }
             ExprKind::Unary {
                 op: UnaryOp::Deref,
                 operand,
@@ -4603,7 +4615,6 @@ impl<'a> Linearizer<'a> {
             .filter(|ft| ft.variadic)
             .and_then(|ft| ft.params.as_ref().map(|p| p.len()));
         let is_noreturn = callee.is_some_and(|ft| ft.noreturn);
-        let is_nothrow = callee.is_some_and(|ft| ft.nothrow);
 
         CalleeSignature {
             conv,
@@ -4611,7 +4622,6 @@ impl<'a> Linearizer<'a> {
             unprototyped,
             variadic_arg_start,
             is_noreturn,
-            is_nothrow,
         }
     }
 

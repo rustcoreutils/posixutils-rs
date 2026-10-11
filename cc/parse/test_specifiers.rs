@@ -286,6 +286,72 @@ fn test_gnu_extension_keyword_positions() {
     assert_eq!(crate::diag::error_count(), before);
 }
 
+/// Before a block item that is no declaration, `__extension__` is the unary
+/// operator of an expression statement, as in gcc, which consumes all but
+/// the last of a run to tell: no label follows one. c17 skipped the run and
+/// took `__extension__ l:` as the label `l`.
+#[test]
+fn test_gnu_extension_before_a_label_is_an_expression() {
+    for (src, want) in [
+        (
+            "int f(void) { int l = 0; __extension__ l: return l; }",
+            "expected ';'",
+        ),
+        (
+            "int f(void) { int l = 0; __extension__ __extension__ l: return l; }",
+            "expected ';'",
+        ),
+        (
+            "int f(int c) { switch (c) { __extension__ case 1: return 0; } return 1; }",
+            "expected expression before 'case'",
+        ),
+        (
+            "int f(int c) { switch (c) { __extension__ default: return 0; } return 1; }",
+            "expected expression before 'default'",
+        ),
+    ] {
+        let Err(err) = parse_tu(src) else {
+            panic!("{src}: accepted");
+        };
+        assert!(err.message.contains(want), "{src}: {}", err.message);
+    }
+    // A label then `__extension__` is the label on an expression statement.
+    let parsed = parse_tu("int f(int x) { l: __extension__ x++; return x; }");
+    assert!(parsed.is_ok(), "{:?}", parsed.err().map(|e| e.message));
+}
+
+/// An attribute between a struct, union or enum tag and a body ends the
+/// specifier, as in gcc: the attributes are the declaration's, so the body
+/// has nothing to belong to. c17 laid the struct or union out with them.
+/// Before the tag, after the body, and after a tag with no body, they stay.
+#[test]
+fn test_attribute_between_tag_and_body_is_refused() {
+    const GCC: &str = "expected identifier or '(' before '{' token";
+    for (src, want) in [
+        ("struct T __attribute__((packed)) { int a; char b; };", GCC),
+        ("union U __attribute__((aligned(16))) { int a; };", GCC),
+        ("struct T __attribute__((unknown_thing)) { int a; };", GCC),
+        // An enum's attributes were never read there; the declarator
+        // refuses the brace.
+        (
+            "enum E __attribute__((packed)) { X };",
+            "expected identifier",
+        ),
+    ] {
+        let Err(err) = parse_tu(src) else {
+            panic!("{src}: accepted");
+        };
+        assert!(err.message.contains(want), "{src}: {}", err.message);
+    }
+    let ok = "struct __attribute__((packed)) P { int a; char b; };\n\
+              struct Q { int a; char b; } __attribute__((packed));\n\
+              struct __attribute__((packed)) __attribute__((aligned(4))) { int a; } anon;\n\
+              struct P __attribute__((aligned(32))) aligned_p;\n\
+              int size_p = sizeof(struct P);";
+    let parsed = parse_tu(ok);
+    assert!(parsed.is_ok(), "{:?}", parsed.err().map(|e| e.message));
+}
+
 /// Every spelling of `volatile`, `inline` and `goto` qualifies an asm
 /// statement, after any spelling of `asm`.
 #[test]

@@ -152,8 +152,9 @@ pub struct CodeGenBase<I: LirInst> {
     /// `-fcf-protection`, which only x86-64's `__builtin_setjmp` and
     /// `__builtin_longjmp` read.
     pub cf_protection: crate::target::CfProtection,
-    /// `-fstack-clash-protection`; see [`CodeGenBase::check_stack_clash`].
-    pub stack_clash: bool,
+    /// `-fstack-clash-protection` and its `--param`s; see
+    /// [`CodeGenBase::check_stack_clash`].
+    pub stack_clash: Option<crate::target::StackClash>,
     /// `-fstack-protector` and its levels; see `arch::stack_protect`.
     pub stack_protector: crate::target::StackProtection,
     /// Trailing comments to hang off individual LIR instructions, by their
@@ -204,7 +205,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             tls: crate::target::TlsPolicy::default(),
             verbose_asm: false,
             cf_protection: crate::target::CfProtection::default(),
-            stack_clash: false,
+            stack_clash: None,
             stack_protector: crate::target::StackProtection::default(),
             lir_comments: std::collections::HashMap::new(),
             value_widths: ValueWidths::default(),
@@ -309,13 +310,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// default: 4 KiB on x86-64; 64 KiB on aarch64, less the 1 KiB a caller
     /// may leave untouched below its own frame.
     pub fn check_stack_clash(&self, func: &Function, adjustment: i64) {
-        if !self.stack_clash {
+        let Some(stack_clash) = self.stack_clash else {
             return;
-        }
-        let guard = match self.target.arch {
-            crate::target::Arch::X86_64 => 4096,
-            crate::target::Arch::Aarch64 => 64 * 1024 - 1024,
         };
+        let guard = stack_clash.probed_from(self.target.arch);
         let dynamic = func
             .blocks
             .iter()
@@ -1506,7 +1504,7 @@ pub trait CodeGenerator {
     fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection);
 
     /// Set `-fstack-clash-protection`.
-    fn set_stack_clash(&mut self, on: bool);
+    fn set_stack_clash(&mut self, stack_clash: Option<crate::target::StackClash>);
 
     /// Set the `-fstack-protector` level.
     fn set_stack_protector(&mut self, protection: crate::target::StackProtection);
@@ -1811,7 +1809,7 @@ pub fn create_codegen(
     tls: crate::target::TlsPolicy,
     verbose_asm: bool,
     cf_protection: crate::target::CfProtection,
-    stack_clash: bool,
+    stack_clash: Option<crate::target::StackClash>,
 ) -> Box<dyn CodeGenerator> {
     use crate::target::Arch;
 

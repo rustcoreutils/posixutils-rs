@@ -952,9 +952,10 @@ fn test_register_variables_bind_their_register() {
 }
 
 /// What a register variable may not be: a name that is no register of the
-/// target, an initialized global, a global in a caller-saved register or
-/// the frame pointer, a local in the stack or frame pointer, or a type no
-/// general register holds.
+/// target, an initialized global, a global in a register c17's generated
+/// code uses itself, a local in the stack or frame pointer, or a type no
+/// general register holds. (A global in the frame pointer is refused once a
+/// function is compiled, not here.)
 #[test]
 fn test_register_variable_rejections() {
     for src in [
@@ -962,7 +963,8 @@ fn test_register_variable_rejections() {
         "void f(void) { register long x asm(\"x0\"); }",
         "register unsigned long s asm(\"rsp\") = 4;",
         "register unsigned long s asm(\"r11\");",
-        "register unsigned long s asm(\"rbp\");",
+        "register unsigned long s asm(\"r10\");",
+        "register unsigned long s asm(\"rdx\");",
         "void f(void) { register long x asm(\"rbp\"); }",
         "void f(void) { register long x asm(\"rsp\"); }",
         "void f(void) { register double x asm(\"rax\"); }",

@@ -125,3 +125,15 @@ fn tag_declaration_with_useless_specifier() {
         "'inline' in empty declaration",
     );
 }
+
+/// `struct T __attribute__((packed)) { ... }`: after a tag, attributes end
+/// the specifier, and gcc refuses the body after them in these words. c17
+/// accepted it and laid the struct out packed.
+#[test]
+fn attribute_between_tag_and_body_is_rejected() {
+    compile_expect_error(
+        "attr_between_tag_and_body",
+        "struct T __attribute__((packed)) { int a; char b; };\nint main(void) { return 0; }\n",
+        "expected identifier or '(' before '{' token",
+    );
+}

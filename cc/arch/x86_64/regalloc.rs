@@ -1221,8 +1221,11 @@ impl RegAlloc {
         }
         let win64 = func.conv == crate::abi::CallingConv::Win64;
         if win64 {
-            self.used_callee_saved
-                .extend_from_slice(&super::win64::CALLEE_SAVED_GP);
+            // Less a global register, which is the variable's, never saved.
+            let saved = super::win64::CALLEE_SAVED_GP
+                .into_iter()
+                .filter(|r| !self.global_registers.contains(r));
+            self.used_callee_saved.extend(saved);
         }
         if func.receives_nonlocal_goto() {
             for &reg in &allocatable {

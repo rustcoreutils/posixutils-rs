@@ -1634,12 +1634,18 @@ fn preprocessor_expansion_keeps_the_invocation_line_break() {
 /// A macro argument may span lines, and its tokens go into the expansion
 /// carrying the file's flags. One that still says it begins a line would be
 /// read back as starting a directive once expansions are rescanned in place.
+/// The `;` after the invocation goes back to the line it was written on, as
+/// gcc lays it out.
 #[test]
 fn preprocessor_multiline_argument_does_not_begin_a_line() {
     let src = "#define C(a,b) a##b\nint xy_z = 1;\nint v = C(x,\ny_z);\n";
     let r = preprocess_text("multiline_arg", src, &[]);
     assert!(r.success, "-E failed: {}", r.stderr);
-    assert_has(&r.stdout, "int v = xy_z;", "pasted across a line break");
+    assert_has(
+        &r.stdout,
+        "int v = xy_z\n    ;\n",
+        "pasted across a line break",
+    );
 }
 
 /// Recursion is stopped by the hide set carried on the expansion's tokens, so

@@ -234,6 +234,70 @@ fn codegen_noreturn_reaches_the_type_from_every_declarator() {
     }
 }
 
+/// Which calls are noreturn, by gcc's rule: the attribute is the
+/// declaration's, so a call naming the function sees it, and so does a call
+/// through its address -- gcc writes it into the pointer type, as a
+/// `volatile` function, and that is also what the attribute on a pointer
+/// declarator means. `__typeof__` of the function is its bare type, and a
+/// typedef of a function type cannot carry the attribute at all, so what is
+/// declared from either is an ordinary function. Each verdict is gcc's
+/// `-Wreturn-type` answer for `int g(void) { CALL; }`.
+#[test]
+fn codegen_noreturn_follows_gccs_declaration_rule() {
+    let decls = r#"
+void nr(void) __attribute__((noreturn));
+_Noreturn void knr(void);
+void pl(void);
+__typeof__(nr) *q1;
+__typeof__(nr) nr2;
+__typeof__(knr) *q3;
+typedef void vfn(void) __attribute__((noreturn));
+vfn *q4;
+vfn d5;
+void (*q6)(void) __attribute__((noreturn));
+__typeof__(q6) q7;
+__typeof__(*q6) *q8;
+typedef void (*pfn)(void) __attribute__((noreturn));
+pfn q9;
+void __attribute__((noreturn)) (*q10)(void);
+struct S { void (*m)(void) __attribute__((noreturn)); } s12;
+void (*q13)(void);
+__typeof__(&nr) q14;
+"#;
+    let calls = [
+        ("q1()", false),
+        ("nr2()", false),
+        ("q3()", false),
+        ("q4()", false),
+        ("d5()", false),
+        ("{ void (*q)(void) = nr; q(); }", false),
+        ("q6()", true),
+        ("q7()", true),
+        ("q8()", true),
+        ("q9()", true),
+        ("q10()", true),
+        ("s12.m()", true),
+        ("((__typeof__(q6))q13)()", true),
+        ("q14()", true),
+        ("{ __auto_type q = nr; q(); }", true),
+        ("(0 ? nr : knr)()", true),
+        ("nr()", true),
+        ("(&nr)()", true),
+        ("(*nr)()", true),
+    ];
+    for (i, (call, noreturn)) in calls.iter().enumerate() {
+        let src = format!("{decls}int g(void) {{ {call}; return 12345; }}\n");
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with(&format!("noreturn_rule{i}"), triple, &src, &["-O2"]);
+            assert_eq!(
+                !body_of(&asm, "g").contains("12345"),
+                *noreturn,
+                "{call} on {triple}: noreturn should be {noreturn}:\n{asm}"
+            );
+        }
+    }
+}
+
 /// The bound itself, not just the answer: above the threshold the zero-fill is
 /// a `memset` call, below it is still stores.
 ///

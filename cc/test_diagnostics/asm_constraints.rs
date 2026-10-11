@@ -334,3 +334,66 @@ fn asm_constraint_on_the_wrong_side() {
         expect_rejected(name, &src, X86, "-O0", wanted, 3);
     }
 }
+
+/// A memory operand is its object's address, and a `register` object has
+/// none: gcc refuses `"m"`, `"o"` and `"=m"` of one -- a plain `register`
+/// local, one bound to a register by name, a member of one, an element of a
+/// `register` array -- on both targets. An operand that may also be a
+/// register (`"rm"`, `"g"`, `"X"`) is not refused.
+#[test]
+fn asm_memory_operand_of_a_register_variable() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("asm_mem_register", "register long x = 1;", "::\"m\"(x)"),
+        (
+            "asm_mem_named_x86",
+            "register long x asm(\"r10\") = 1;",
+            "::\"m\"(x)",
+        ),
+        (
+            "asm_mem_named_a64",
+            "register long x asm(\"x9\") = 1;",
+            "::\"m\"(x)",
+        ),
+        ("asm_mem_output", "register long x = 1;", ":\"=m\"(x)"),
+        ("asm_mem_offsettable", "register long x = 1;", "::\"o\"(x)"),
+        (
+            "asm_mem_member",
+            "register struct { long a; } x = {1};",
+            "::\"m\"(x.a)",
+        ),
+        (
+            "asm_mem_element",
+            "register long x[2] = {1};",
+            "::\"m\"(x[1])",
+        ),
+    ];
+    for &(name, decl, operands) in cases {
+        let src = format!(
+            "void f(void) {{\n\
+             {decl}\n\
+             __asm__ volatile(\"\" {operands});\n\
+             }}\n"
+        );
+        for target in [X86, A64] {
+            if name.ends_with(if target == X86 { "_a64" } else { "_x86" }) {
+                continue;
+            }
+            expect_rejected(
+                name,
+                &src,
+                target,
+                "-O0",
+                "address of register variable 'x' requested",
+                3,
+            );
+        }
+    }
+    let src = "long f(void) {\n\
+               register long x = 1;\n\
+               __asm__ volatile(\"\" :: \"rm\"(x), \"g\"(x), \"X\"(x));\n\
+               return x;\n\
+               }\n";
+    for target in [X86, A64] {
+        expect_accepted("asm_mem_alternatives", src, target, "-O0");
+    }
+}

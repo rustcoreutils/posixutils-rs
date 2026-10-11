@@ -478,6 +478,11 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin___strcpy_chk",
     "__builtin___strncat_chk",
     "__builtin___strncpy_chk",
+    "__builtin___stpncpy_chk",
+    "__builtin___vsprintf_chk",
+    "__builtin___memccpy_chk",
+    "__builtin___strlcpy_chk",
+    "__builtin___strlcat_chk",
     // C11 atomic builtins (Clang-style)
     "__c11_atomic_init",
     "__c11_atomic_load",

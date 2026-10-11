@@ -124,15 +124,7 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
     // C17 6.10.8p2 forbids it outright for the standard's own names. A
     // redefinition to the same thing is quiet. So is any redefinition in a
     // system header, since warnings there are not shown.
-    //
-    // `_FORTIFY_SOURCE` is the exception. c17 predefines it as 0 on macOS,
-    // where Apple clang leaves it to the program (see `os::macos`), so a
-    // program's own `-D_FORTIFY_SOURCE=2` is not redefining anything as far
-    // as its author can tell.
     if old.predefined {
-        if old.name == "_FORTIFY_SOURCE" {
-            return None;
-        }
         let same = old.is_function == new.is_function
             && old.params.len() == new.params.len()
             && replacement_lists_identical(&old.body, &new.body);
@@ -3096,6 +3088,9 @@ pub struct PreprocessConfig<'a> {
     pub cf_protection: crate::target::CfProtection,
     /// `-fexceptions`, which `__EXCEPTIONS` says.
     pub exceptions: bool,
+    /// Where the unit's call frame information goes, which
+    /// `__GCC_HAVE_DWARF2_CFI_ASM` says.
+    pub cfi: crate::target::Cfi,
     /// `-fmacro-prefix-map` (and the macro half of `-ffile-prefix-map`).
     pub macro_prefix_map: PrefixMap,
     /// What optimization was asked for.
@@ -3179,6 +3174,18 @@ fn define_cet_macro(pp: &mut Preprocessor, target: &Target, cf: crate::target::C
     }
 }
 
+/// Define gcc's `__GCC_HAVE_DWARF2_CFI_ASM` when the unit's call frame
+/// information is written as `.cfi_*` directives -- as gcc's
+/// `dwarf2out_do_cfi_asm` answers: whenever there are unwind tables, or
+/// `-g` keeps the rules for the debugger. Hand-written assembly and inline
+/// `asm` (glibc's `CFI_*` macros, the Linux kernel's) write their own
+/// directives only then: with none open, the assembler refuses them.
+fn define_cfi_macro(pp: &mut Preprocessor, cfi: crate::target::Cfi) {
+    if cfi.emitted() {
+        pp.define_macro(Macro::predefined("__GCC_HAVE_DWARF2_CFI_ASM", Some("1")));
+    }
+}
+
 /// Define gcc's `__EXCEPTIONS` under `-fexceptions`, which glibc's libio
 /// and `<pthread.h>` read to choose the `cleanup` attribute for their locks
 /// and cancellation handlers.
@@ -3241,6 +3248,7 @@ pub fn preprocess_collecting(
     define_isa_macros(&mut pp, target, config.isa);
     define_cet_macro(&mut pp, target, config.cf_protection);
     define_exceptions_macro(&mut pp, config.exceptions);
+    define_cfi_macro(&mut pp, config.cfi);
 
     pp.set_include_paths(config.include_paths);
 
@@ -3300,6 +3308,9 @@ pub struct AsmPreprocessConfig<'a> {
     /// See [`PreprocessConfig::exceptions`]: gcc defines `__EXCEPTIONS` for
     /// a `.S` too.
     pub exceptions: bool,
+    /// See [`PreprocessConfig::cfi`]: a `.S` reads
+    /// `__GCC_HAVE_DWARF2_CFI_ASM` to decide whether to write `.cfi_*`.
+    pub cfi: crate::target::Cfi,
     /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
     /// is mapped as in C.
     pub macro_prefix_map: PrefixMap,
@@ -3396,6 +3407,7 @@ pub fn preprocess_asm_file(
     define_isa_macros(&mut pp, target, config.isa);
     define_cet_macro(&mut pp, target, config.cf_protection);
     define_exceptions_macro(&mut pp, config.exceptions);
+    define_cfi_macro(&mut pp, config.cfi);
 
     // -nostdinc: the directories are dropped in `Preprocessor::new`; the
     // bundled headers go with them.

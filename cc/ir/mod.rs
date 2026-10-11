@@ -4480,7 +4480,7 @@ impl Module {
 
     /// The references [`Self::referenced_symbols`] describes, from the
     /// functions `counts` accepts, a direct call counting when `calls`.
-    fn references_from(
+    pub(crate) fn references_from(
         &self,
         candidates: &HashSet<String>,
         counts: impl Fn(&Function) -> bool,

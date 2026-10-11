@@ -504,6 +504,15 @@ impl Parser<'_> {
         // Parse __attribute__ after tag name but before '{'
         let pre_pos = self.current_pos();
         let pre_attrs = self.parse_attributes();
+        // After a tag they end the specifier: `struct T __attribute__((x))`
+        // names the type, and the attributes are the declaration's. A body
+        // cannot follow, and gcc says so in these words.
+        if tag.is_some() && !pre_attrs.attrs.is_empty() && self.is_special(b'{') {
+            return Err(ParseError::new(
+                gettext("expected identifier or '(' before '{' token"),
+                self.current_pos(),
+            ));
+        }
         is_packed = is_packed || pre_attrs.has_packed();
         is_transparent = is_transparent || pre_attrs.has_transparent_union();
         if let Some(a) = pre_attrs.get_alignment() {

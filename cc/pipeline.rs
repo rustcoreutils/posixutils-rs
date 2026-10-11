@@ -87,7 +87,7 @@ pub struct CodegenOptions<'a> {
     /// `-fcf-protection`.
     pub cf_protection: crate::target::CfProtection,
     /// `-fstack-clash-protection`.
-    pub stack_clash: bool,
+    pub stack_clash: Option<crate::target::StackClash>,
     /// `-fstack-protector` and its levels.
     pub stack_protector: crate::target::StackProtection,
     /// `-pg`, and the shape of its call.

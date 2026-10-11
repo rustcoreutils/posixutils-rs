@@ -564,6 +564,9 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         known(kw::VSPRINTF_CHK,  Int,         &[CharPtr, Int, SizeT, ConstCharPtr, VaList],         FIXED,    L::VsprintfChk),
         known(kw::VSNPRINTF_CHK, Int,         &[CharPtr, SizeT, Int, SizeT, ConstCharPtr, VaList],  FIXED,    L::VsnprintfChk),
         //    name               returns           parameters                                   `...`
+        plain(kw::MEMCCPY_CHK,      VoidPtr,           &[VoidPtr, ConstVoidPtr, Int, SizeT, SizeT], FIXED),
+        plain(kw::STRLCPY_CHK,      SizeT,             &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
+        plain(kw::STRLCAT_CHK,      SizeT,             &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
         plain(kw::SNPRINTF,         Int,               &[CharPtr, SizeT, ConstCharPtr], VARIADIC),
         plain(kw::BCMP,             Int,               &[ConstVoidPtr, ConstVoidPtr, SizeT], FIXED),
         plain(kw::BZERO,            Void,              &[VoidPtr, SizeT],        FIXED),

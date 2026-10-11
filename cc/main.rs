@@ -523,6 +523,18 @@ struct Args {
     #[arg(long = "c17-stack-clash", hide = true)]
     stack_clash: bool,
 
+    /// The last `--param stack-clash-protection-guard-size=`, rewritten.
+    #[arg(long = "c17-stack-clash-guard-size", hide = true, value_name = "log2")]
+    stack_clash_guard_size: Option<u32>,
+
+    /// The last `--param stack-clash-protection-probe-interval=`, rewritten.
+    #[arg(
+        long = "c17-stack-clash-probe-interval",
+        hide = true,
+        value_name = "log2"
+    )]
+    stack_clash_probe_interval: Option<u32>,
+
     /// The last of `-fstack-protector`, its levels and `-fno-stack-protector`
     /// (rewritten by `preprocess_args_from`), as its `-f` name.
     #[arg(
@@ -882,6 +894,7 @@ fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8
         isa: target::X86Isa::from_flags(&args.mflags),
         cf_protection: args.cf_protection.unwrap_or_default(),
         exceptions: args.unwind_tables().exceptions(),
+        cfi: args.unwind_tables().cfi(target, args.debug > 0),
         defines: &args.defines,
         undefines: &args.undefines,
         include_paths: &args.include_paths,
@@ -1120,6 +1133,8 @@ fn emit_preprocessed(
     let mut emitted_marker_for: Vec<u16> = vec![stream_id];
     let mut current_stream: Option<u16> = Some(stream_id);
     let mut at_line_start = true;
+    // The next token was sent back to its own source line.
+    let mut returned = false;
     // The source line the next output line stands for.
     //
     // Directives and blank lines produce no tokens, so without this the
@@ -1215,9 +1230,9 @@ fn emit_preprocessed(
             if at_line_start {
                 let (name, line, _) = diag::effective_position(token.pos);
                 if line > current_line {
-                    // GCC's threshold: a handful of blank lines is smaller
-                    // than a marker, past that a marker is smaller.
-                    const MAX_BLANK_RUN: u32 = 8;
+                    // GCC's threshold: up to seven blank lines are smaller
+                    // than a marker, eight or more are not.
+                    const MAX_BLANK_RUN: u32 = 7;
                     if !markers {
                         // `-P` is asked for by things that are not C
                         // compilers, which want the text and nothing
@@ -1259,8 +1274,12 @@ fn emit_preprocessed(
             // as two and `c17 -E` changed what the string held.
             spelling.clear();
             if at_line_start {
-                spelling.resize(token::lexer::indentation(token.pos), b' ');
+                // A token sent back to its line (below) keeps at least the
+                // one space its separation from the last token asked for.
+                let indent = token::lexer::indentation(token.pos);
+                spelling.resize(indent.max(usize::from(returned)), b' ');
             }
+            returned = false;
             write_token(&mut spelling, token, strings);
             out.preprocessed.write_all(&spelling)?;
             at_line_start = false;
@@ -1270,6 +1289,22 @@ fn emit_preprocessed(
                     writeln!(out.preprocessed)?;
                     current_line += 1;
                     at_line_start = true;
+                } else if markers
+                    && next.pos.stream == token.pos.stream
+                    && diag::effective_position(next.pos).1 > current_line
+                {
+                    // A token from a later line than this one, though no
+                    // newline precedes it: one after a macro invocation
+                    // whose arguments ran on, or the first of an expansion
+                    // after one. gcc puts it back on its own line (its
+                    // `do_line_change`), so the text keeps its lines; the
+                    // start of the next line reopens the gap. Only for
+                    // white space or an expansion boundary in gcc, but
+                    // nothing else reaches a later line without a newline.
+                    writeln!(out.preprocessed)?;
+                    current_line += 1;
+                    at_line_start = true;
+                    returned = true;
                 } else {
                     // A space where the source had one, and wherever the
                     // two would otherwise lex back as different tokens.
@@ -1384,6 +1419,7 @@ fn process_file(
             isa: target::X86Isa::from_flags(&args.mflags),
             cf_protection: args.cf_protection.unwrap_or_default(),
             exceptions: args.unwind_tables().exceptions(),
+            cfi: args.unwind_tables().cfi(target, args.debug > 0),
             macro_prefix_map: prefix_maps.macros,
         },
     );
@@ -1440,7 +1476,7 @@ fn process_file(
         exceptions: args.unwind_tables().exceptions(),
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
-        stack_clash: args.stack_clash,
+        stack_clash: args.stack_clash.then(|| args.stack_clash_params()),
         profiling: args
             .profile
             .then(|| target::Profiling::from_flags(&args.mflags)),
@@ -1762,6 +1798,14 @@ impl Args {
         PrefixMaps::from_options(&self.prefix_maps)
     }
 
+    /// The `--param`s of `-fstack-clash-protection`.
+    fn stack_clash_params(&self) -> target::StackClash {
+        target::StackClash {
+            guard_size: self.stack_clash_guard_size,
+            probe_interval: self.stack_clash_probe_interval,
+        }
+    }
+
     /// What the unwind-table options ask for, `-fexceptions` among them.
     fn unwind_tables(&self) -> target::UnwindTables {
         target::UnwindTables::from_names(&self.unwind)
@@ -1987,6 +2031,11 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     let mut stack_protector = None;
     // `--param ssp-buffer-size=`, last wins.
     let mut ssp_buffer_size = None;
+    // `-fno-dwarf2-cfi-asm`, unless a later `-fdwarf2-cfi-asm` withdraws it.
+    let mut no_cfi_asm = false;
+    // `--param stack-clash-protection-{guard-size,probe-interval}=`, the
+    // last of each.
+    let mut stack_clash_params: Vec<String> = Vec::new();
     // The `-W<name>` and `-f<name>` options refused as gcc refuses them: by
     // its driver, and -- only if the driver let everything through -- by
     // its compiler.
@@ -2207,6 +2256,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
                 std::process::exit(1);
             }
             i += 1;
+        } else if arg == "-fno-dwarf2-cfi-asm" || arg == "-fdwarf2-cfi-asm" {
+            no_cfi_asm = arg == "-fno-dwarf2-cfi-asm";
+            i += 1;
         } else if arg == "-fno-inline" || arg == "-finline" {
             // Both spellings become one option so clap's last-wins applies,
             // as it does in GCC. Note `-fno-inline-functions` is a *different*
@@ -2332,6 +2384,14 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
                     if let Some(bytes) = setting.strip_prefix("ssp-buffer-size=") {
                         ssp_buffer_size = Some(bytes.to_string());
                     }
+                    for name in ["guard-size", "probe-interval"] {
+                        let param = format!("stack-clash-protection-{name}=");
+                        if let Some(log2) = setting.strip_prefix(&param) {
+                            let flag = format!("--c17-stack-clash-{name}=");
+                            stack_clash_params.retain(|f| !f.starts_with(&flag));
+                            stack_clash_params.push(format!("{flag}{log2}"));
+                        }
+                    }
                 }
                 Err(lines) => driver_errors.extend(lines),
             }
@@ -2449,6 +2509,15 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             .map(|option| format!("error: '{option}' is not supported")),
     );
 
+    // gcc writes the unwind tables itself under `-fno-dwarf2-cfi-asm`, where
+    // c17 can only write `.cfi_*` directives for the assembler to build them.
+    if no_cfi_asm {
+        driver_errors.push(gettext(
+            "error: '-fno-dwarf2-cfi-asm' is not supported: c17 writes call frame \
+             information only as '.cfi' directives",
+        ));
+    }
+
     // A configure probe passes a `-W` or `-f` option to learn whether the
     // compiler takes it, so one c17 does not know fails the run as gcc's
     // would.
@@ -2483,6 +2552,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     if let Some(bytes) = ssp_buffer_size {
         trailer.push(format!("--c17-ssp-buffer-size={bytes}"));
     }
+    trailer.extend(stack_clash_params);
     if let Some(level) = stack_protector {
         trailer.push(format!("--c17-stack-protector={}", level.option()));
         // gcc's `__SSP__` family, defined as gcc defines it.
@@ -2897,10 +2967,14 @@ fn check_machine_flags(flags: &[String], target: &Target) {
 /// Refuse what `-fcf-protection` and `-pg` cannot do here, in gcc's words:
 /// a protection the target has no CET for, `-pg` without a frame pointer or
 /// on Darwin, and `-mnop-mcount`'s nop in position-independent code, which
-/// gcc refuses whether or not `-pg` is given.
+/// gcc refuses whether or not `-pg` is given. And the stack-clash `--param`s
+/// aarch64 cannot use, refused whether or not the protection is asked for.
 fn check_instrumentation(args: &Args, target: &Target) {
     let cf = args.cf_protection.unwrap_or_default();
     let mut errors = Vec::new();
+    if target.arch == target::Arch::Aarch64 {
+        errors.extend(args.stack_clash_params().aarch64_errors());
+    }
     if !cf.supported_on(target) {
         errors.push(gettext_args(
             "'-fcf-protection={0}' is not supported for this target",

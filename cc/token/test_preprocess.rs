@@ -579,12 +579,18 @@ fn test_macro_redefinition_conflict_detection() {
 
 /// A predefine redefined to something else conflicts, as gcc warns, whatever
 /// the name looks like, a feature-test spelling such as `_GNU_SOURCE`
-/// included. `_FORTIFY_SOURCE`, which c17 predefines on macOS
-/// where Apple clang does not, stays the program's to redefine.
+/// included -- and `_FORTIFY_SOURCE`, which c17 no longer predefines
+/// anywhere, has no exception.
 #[test]
 fn test_predefine_redefinition_conflict() {
     let predef = |name: &str, value: &str| Macro::predefined(name, Some(value));
-    for name in ["__CHAR_BIT__", "_GNU_SOURCE", "_XOPEN_SOURCE", "_REENTRANT"] {
+    for name in [
+        "__CHAR_BIT__",
+        "_GNU_SOURCE",
+        "_XOPEN_SOURCE",
+        "_REENTRANT",
+        "_FORTIFY_SOURCE",
+    ] {
         assert!(
             macro_redefinition_conflict(&predef(name, "1"), &predef(name, "2")).is_some(),
             "{name}"
@@ -594,8 +600,6 @@ fn test_predefine_redefinition_conflict() {
             "{name}"
         );
     }
-    let fortify = "_FORTIFY_SOURCE";
-    assert!(macro_redefinition_conflict(&predef(fortify, "0"), &predef(fortify, "2")).is_none());
 }
 
 #[test]
@@ -3021,4 +3025,43 @@ fn test_search_chain_keeps_missing_directories_by_name() {
     let (_dir, p) = search_dirs();
     let chain = search_chain(&[], &[p("none"), p("a"), p("none")], &[]);
     assert_eq!(chain.bracket, [p("none"), p("a")]);
+}
+
+/// `__GCC_HAVE_DWARF2_CFI_ASM` says whether the unit's call frame
+/// information is written as `.cfi_*` directives -- for C and for a `.S` --
+/// which is so whenever there is any: unwind tables, or `-g`'s
+/// `.debug_frame`. glibc's and the kernel's assembly write their own `.cfi_*`
+/// only then.
+#[test]
+fn test_cfi_asm_macro_follows_the_cfi() {
+    use crate::target::Cfi;
+    for (cfi, defined) in [
+        (Cfi::EhFrame, true),
+        (Cfi::DebugFrame, true),
+        (Cfi::Omitted, false),
+    ] {
+        let config = PreprocessConfig {
+            cfi,
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let input = "#ifdef __GCC_HAVE_DWARF2_CFI_ASM\nyes __GCC_HAVE_DWARF2_CFI_ASM\n#endif\n";
+        let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+        let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "t.c", &config);
+        let numbers: Vec<_> = out.iter().filter(|t| t.typ == TokenType::Number).collect();
+        assert_eq!(numbers.len(), usize::from(defined), "{cfi:?}");
+
+        let config = AsmPreprocessConfig {
+            cfi,
+            ..Default::default()
+        };
+        let text = preprocess_asm_file(input.as_bytes(), &Target::host(), "t.S", &config)
+            .expect("preprocesses")
+            .text;
+        assert_eq!(
+            String::from_utf8_lossy(&text).contains("yes 1"),
+            defined,
+            "{cfi:?}"
+        );
+    }
 }

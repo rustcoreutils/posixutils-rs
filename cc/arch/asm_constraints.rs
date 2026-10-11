@@ -88,33 +88,46 @@ impl PinnedGp {
         }
     }
 
-    /// Whether a file-scope register variable may live here: the stack
-    /// pointer, which is never allocated, or a callee-saved register, which
-    /// a function in another unit preserves and this unit withholds from
-    /// allocation everywhere -- %rbx, %r12-%r15; x19-x28. A caller-saved
-    /// register would need every call to save it, and the frame pointer is
-    /// every c17 function's own; gcc takes them (with a warning for the
-    /// first), c17 does not.
-    pub fn can_hold_global(self) -> bool {
+    /// What a file-scope register variable here would be. Every function
+    /// of the unit leaves the register alone -- never allocates, saves or
+    /// restores it -- and only the transfers the calling convention makes
+    /// write it, as in gcc.
+    pub fn global_hold(self) -> GlobalHold {
         use A64Reg as A;
         use X86Reg as X;
-        matches!(
-            self,
+        match self {
             Self::X86_64(X::Rsp | X::Rbx | X::R12 | X::R13 | X::R14 | X::R15)
-                | Self::Aarch64(
-                    A::SP
-                        | A::X19
-                        | A::X20
-                        | A::X21
-                        | A::X22
-                        | A::X23
-                        | A::X24
-                        | A::X25
-                        | A::X26
-                        | A::X27
-                        | A::X28
-                )
-        )
+            | Self::Aarch64(
+                A::SP
+                | A::X19
+                | A::X20
+                | A::X21
+                | A::X22
+                | A::X23
+                | A::X24
+                | A::X25
+                | A::X26
+                | A::X27
+                | A::X28,
+            ) => GlobalHold::Reserved,
+            // An argument register, or one only the allocator hands out.
+            Self::X86_64(X::Rsi | X::Rdi)
+            | Self::Aarch64(
+                A::X0
+                | A::X1
+                | A::X2
+                | A::X3
+                | A::X4
+                | A::X5
+                | A::X6
+                | A::X7
+                | A::X12
+                | A::X13
+                | A::X14,
+            ) => GlobalHold::CallClobbered,
+            Self::X86_64(X::Rbp) | Self::Aarch64(A::X29) => GlobalHold::FramePointer,
+            _ => GlobalHold::Unavailable,
+        }
     }
 
     /// The stack pointer: `%rsp`, `sp`.
@@ -126,6 +139,28 @@ impl PinnedGp {
     pub fn is_frame_pointer(self) -> bool {
         matches!(self, Self::X86_64(X86Reg::Rbp) | Self::Aarch64(A64Reg::X29))
     }
+}
+
+/// What a file-scope register variable can be in its register
+/// ([`PinnedGp::global_hold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalHold {
+    /// The stack pointer, which is never allocated, or a callee-saved
+    /// register, which a function in another unit preserves.
+    Reserved,
+    /// A register a call may clobber: a function in another unit is free to
+    /// change it, and an argument or return value in it overwrites the
+    /// variable. gcc takes it with a warning, and so does c17.
+    CallClobbered,
+    /// The frame pointer, which every c17 function keeps: gcc refuses a
+    /// function needing one ("frame pointer required, but reserved"), and
+    /// every c17 function does.
+    FramePointer,
+    /// A register c17's generated code uses for its own purposes -- a
+    /// scratch register, or one an instruction such as a division or a
+    /// shift writes -- which gcc takes, saving it around such an
+    /// instruction, and c17 cannot.
+    Unavailable,
 }
 
 /// The register class an operand may be given.

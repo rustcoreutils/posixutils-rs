@@ -746,6 +746,11 @@ define_keywords! {
     (_, "__builtin___strcpy_chk", BUILTIN),
     (_, "__builtin___strncat_chk", BUILTIN),
     (_, "__builtin___strncpy_chk", BUILTIN),
+    (_, "__builtin___stpncpy_chk", BUILTIN),
+    (_, "__builtin___vsprintf_chk", BUILTIN),
+    (_, "__builtin___memccpy_chk", BUILTIN),
+    (_, "__builtin___strlcpy_chk", BUILTIN),
+    (_, "__builtin___strlcat_chk", BUILTIN),
 
     // ---- C11 atomic builtins (BUILTIN) ----
     (C11_ATOMIC_INIT,    "__c11_atomic_init",    BUILTIN),
@@ -878,6 +883,11 @@ define_keywords! {
     (VSNPRINTF_CHK,     "__vsnprintf_chk",      0),
     (VPRINTF_CHK,       "__vprintf_chk",        0),
     (VFPRINTF_CHK,      "__vfprintf_chk",       0),
+    // Darwin's own: its `<secure/_string.h>` calls them through the
+    // `__builtin___` spelling, and its C library has them.
+    (MEMCCPY_CHK,       "__memccpy_chk",        0),
+    (STRLCPY_CHK,       "__strlcpy_chk",        0),
+    (STRLCAT_CHK,       "__strlcat_chk",        0),
     // Same reason, for the builtins that are just the library function: a
     // translation unit may call `__builtin_strlen` without having included
     // the header that declares `strlen`, exactly as gcc allows.

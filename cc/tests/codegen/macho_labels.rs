@@ -88,15 +88,20 @@ fn codegen_macho_output_assembles() {
 }
 
 /// The `-fexceptions` tables -- personality, LSDA, landing pads -- assemble
-/// as Mach-O for both Darwin targets.
+/// as Mach-O for both Darwin targets, with the detour an arm64 variadic call
+/// realigning `sp` lands on.
 #[test]
 fn codegen_macho_exception_tables_assemble() {
     let program = "extern void g(int);\n\
+                   extern void gv(int, ...);\n\
+                   typedef long al32 __attribute__((aligned(32)));\n\
                    static void cl(int *p) { g(*p); }\n\
                    int f(int x) {\n\
                        int a __attribute__((cleanup(cl))) = x;\n\
                        g(1);\n\
                        { int b __attribute__((cleanup(cl))) = x + 1; g(2); }\n\
+                       al32 v = x;\n\
+                       gv(1, v);\n\
                        return a;\n\
                    }\n";
     let dir = plib::tmp::Builder::new()
@@ -110,6 +115,9 @@ fn codegen_macho_exception_tables_assemble() {
         for level in ["-O0", "-O2"] {
             let asm = asm_for_with("macho_eh", triple, program, &[level, "-fexceptions"]);
             assert!(asm.contains(".cfi_lsda"), "{triple} {level}:\n{asm}");
+            if arch == "arm64" {
+                assert!(asm.contains("L.LEHD."), "{triple} {level}:\n{asm}");
+            }
             std::fs::write(&s, &asm).expect("failed to write assembly");
             let Some(out) = assemble_macho(arch, &s_path, &o_path) else {
                 eprintln!(

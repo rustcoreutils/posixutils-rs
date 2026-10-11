@@ -455,7 +455,7 @@ fn suppress_forwarding_bodies(module: &mut Module) {
 /// A plain C99 inline definition is deliberately not in this set: its
 /// external definition may live in another translation unit, so an ordinary
 /// call to it is correct and the linker resolves it.
-fn check_forwarding_resolved(module: &Module) {
+fn check_forwarding_resolved(module: &Module, already: &HashSet<&str>) {
     enum Unresolved {
         Forwarder,
         NeverCopied(&'static str),
@@ -494,7 +494,7 @@ fn check_forwarding_resolved(module: &Module) {
             let Some(why) = unresolved.get(callee) else {
                 continue;
             };
-            if reported.insert(callee) {
+            if !already.contains(callee) && reported.insert(callee) {
                 // The call site, not line 0: it is the thing that cannot be
                 // resolved, and the only position either function still has.
                 let pos = insn.pos.unwrap_or_default();
@@ -507,6 +507,90 @@ fn check_forwarding_resolved(module: &Module) {
             }
         }
     }
+}
+
+/// A file-scope register variable in the frame pointer, which every c17
+/// function sets up for its own frame. gcc refuses a function that needs
+/// one, once per unit, at the first; to c17 every function does. A unit
+/// that defines none compiles.
+fn check_reserved_frame_pointer(module: &Module) {
+    if !module.global_registers.iter().any(|r| r.is_frame_pointer()) {
+        return;
+    }
+    if let Some(func) = module.functions.iter().find(|f| f.emit) {
+        crate::diag::error(
+            crate::arch::func_pos(func),
+            &gettext("frame pointer required, but reserved"),
+        );
+    }
+}
+
+/// gcc's verdict on recursion among `always_inline` functions, which it can
+/// never finish splicing; answers the functions it named.
+///
+/// A cycle through two or more ([`inline::always_inline_cycles`]) is
+/// rejected at every level once anything keeps it, naming the first one
+/// defined, at its call from inside the cycle. A function that calls itself
+/// is rejected at -O0 when another function calls it -- gcc splices that
+/// call and leaves the recursive ones inside the copy -- and at -O1 and -Og
+/// whenever it is kept. From -O2 gcc's verdict turns on whether its
+/// tail-recursion pass removed the call first; c17 has no such pass to match
+/// and accepts, calling the out-of-line copy as it does at every level.
+///
+/// Reported at each recursive call site, the `called from here` of gcc's
+/// note: the position c17 has for a call.
+fn check_always_inline_recursion(module: &Module, opt: Optimization) -> HashSet<&str> {
+    let calls_to = |caller: &'_ Function, callee: &str| -> Vec<crate::diag::Position> {
+        let mut sites: Vec<_> = caller
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .filter(|insn| insn.local_callee() == Some(callee))
+            .map(|insn| insn.pos.unwrap_or_default())
+            .collect();
+        sites.dedup();
+        sites
+    };
+    let mut named = HashSet::new();
+    for cycle in inline::always_inline_cycles(module) {
+        let first = &module.functions[cycle[0]];
+        let (template, sites) = if cycle.len() > 1 {
+            if !cycle.iter().any(|&i| module.functions[i].emit) {
+                continue;
+            }
+            let site = cycle[1..]
+                .iter()
+                .flat_map(|&i| calls_to(&module.functions[i], &first.name))
+                .take(1)
+                .collect();
+            (
+                "inlining failed in call to 'always_inline' '{0}': function not inlinable",
+                site,
+            )
+        } else if !opt.optimizes() {
+            let called_elsewhere = module
+                .functions
+                .iter()
+                .filter(|f| f.emit && f.name != first.name)
+                .any(|f| !calls_to(f, &first.name).is_empty());
+            if !called_elsewhere {
+                continue;
+            }
+            ("inlining failed in call to 'always_inline' '{0}': function not considered for inlining", calls_to(first, &first.name))
+        } else if !opt.inlines_aggressively() && first.emit {
+            (
+                "inlining failed in call to 'always_inline' '{0}': recursive inlining",
+                calls_to(first, &first.name),
+            )
+        } else {
+            continue;
+        };
+        for pos in sites {
+            crate::diag::error_args(pos, template, &[&first.name]);
+        }
+        named.insert(first.name.as_str());
+    }
+    named
 }
 
 /// Optimize a module as `opt` asks.
@@ -544,7 +628,9 @@ pub fn optimize_module(
     // Every pack should have been resolved by the splice above. One that
     // survives would be emitted as a call with its arguments missing, so say
     // so instead.
-    check_forwarding_resolved(module);
+    check_reserved_frame_pointer(module);
+    let recursive = check_always_inline_recursion(module, opt);
+    check_forwarding_resolved(module, &recursive);
 
     // A `memcpy`, `memset` or `memmove` of a small constant length becomes
     // loads and stores at every level, as the linearizer's own aggregate

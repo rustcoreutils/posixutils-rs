@@ -1075,6 +1075,7 @@ impl Parser<'_> {
     /// so every path that finishes a declarator calls this rather than
     /// remembering which attributes exist.
     pub(super) fn apply_pending_type_attrs(&mut self, typ: TypeId) -> TypeId {
+        let typ = self.apply_pending_noreturn_pointer(typ);
         let typ = self.apply_pending_calling_conv(typ);
         let typ = self.apply_pending_mode(typ);
         let typ = self.apply_pending_vector_size(typ);
@@ -1086,6 +1087,52 @@ impl Parser<'_> {
             }
         }
         typ
+    }
+
+    /// `noreturn` on a declarator that declares no function: on a pointer to
+    /// a function it makes the function noreturn, as gcc's `volatile`
+    /// function type does, so every call through the pointer is one that
+    /// does not return. Anywhere else gcc warns and ignores it, as it does
+    /// `returns_twice` and `nothrow`, which only a function's declaration
+    /// can carry. A function declarator has consumed all three already.
+    fn apply_pending_noreturn_pointer(&mut self, typ: TypeId) -> TypeId {
+        if self.types.kind(typ) == TypeKind::Function {
+            return typ;
+        }
+        let pointee = self
+            .types
+            .base_type(typ)
+            .filter(|_| self.types.kind(typ) == TypeKind::Pointer)
+            .filter(|&f| self.types.kind(f) == TypeKind::Function);
+        let typ = match pointee {
+            Some(func) if std::mem::take(&mut self.pending_fn_attrs.noreturn) => {
+                let mut func = self.types.get(func).clone();
+                func.noreturn = true;
+                let func = self.types.intern(func);
+                let mut ptr = self.types.get(typ).clone();
+                ptr.base = Some(func);
+                self.types.intern(ptr)
+            }
+            _ => typ,
+        };
+        self.drop_fn_decl_attrs();
+        typ
+    }
+
+    /// gcc's warning for each of `noreturn`, `returns_twice` and `nothrow`
+    /// still pending on a declarator that declares no function, which drops
+    /// them.
+    pub(super) fn drop_fn_decl_attrs(&mut self) {
+        let pos = self.current_pos();
+        let attrs = &mut self.pending_fn_attrs;
+        let dropped = [
+            (std::mem::take(&mut attrs.noreturn), "noreturn"),
+            (std::mem::take(&mut attrs.returns_twice), "returns_twice"),
+            (std::mem::take(&mut attrs.nothrow), "nothrow"),
+        ];
+        for (_, name) in dropped.iter().filter(|(set, _)| *set) {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[name]);
+        }
     }
 
     /// Fold the function attributes `attrs` carries into those pending for

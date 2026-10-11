@@ -476,6 +476,23 @@ fn diagnostics_non_lvalue_targets_are_rejected() {
             "int main(void){ register int a=1; return *&a; }\n",
             "address of register variable 'a' requested",
         ),
+        // An element's address is inside its array's, and a member's inside
+        // its structure's.
+        (
+            "address_of_register_element",
+            "int main(void){ register int a[2]={0}; return *&a[1]; }\n",
+            "address of register variable 'a' requested",
+        ),
+        (
+            "address_of_register_element_reversed",
+            "int main(void){ register int a[2]={0}; return *&1[a]; }\n",
+            "address of register variable 'a' requested",
+        ),
+        (
+            "address_of_register_member",
+            "int main(void){ register struct { int m; } a={0}; return *&a.m; }\n",
+            "address of register variable 'a' requested",
+        ),
         // Unary `&` needs an lvalue or a function designator (6.5.3.2p1).
         // Anything else compiled, and took the address of a temporary.
         (

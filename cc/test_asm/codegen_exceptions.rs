@@ -219,3 +219,113 @@ fn returns_twice_call_with_landing_pad_keeps_endbr64_in_its_entry() {
         assert!(body[call + 2].starts_with(".L.LEHE."), "{level}: {body:?}");
     }
 }
+
+/// `nothrow` is the declaration's, as gcc has it: a call naming the function
+/// -- through `&` or `*` too -- needs no landing pad, and a call of a
+/// function declared through `__typeof__` of it, or through a pointer to it,
+/// does. gcc ignores the attribute on a pointer declarator, with a warning.
+#[test]
+fn nothrow_is_the_declarations() {
+    let decls = r#"
+static void cl(int *p) { (void)p; }
+extern int nt(void) __attribute__((nothrow));
+__typeof__(nt) nt2;
+__typeof__(&nt) pnt;
+int (*p7)(void) __attribute__((nothrow));
+"#;
+    for (call, nothrow) in [
+        ("nt()", true),
+        ("(&nt)()", true),
+        ("(*nt)()", true),
+        ("nt2()", false),
+        ("pnt()", false),
+        ("p7()", false),
+        ("({ __auto_type q = nt; q(); })", false),
+    ] {
+        let src = format!(
+            "{decls}int g(void) {{ int a __attribute__((cleanup(cl))) = 0; return {call}; }}\n"
+        );
+        for triple in [X86_64_LINUX, AARCH64_LINUX] {
+            let asm = asm_for_with("eh_nothrow_decl", triple, &src, &["-O0", "-fexceptions"]);
+            let why = format!("{call} on {triple}");
+            if nothrow {
+                assert_body_lacks(&asm, "g", ".cfi_lsda", &why);
+            } else {
+                assert_body_contains(&asm, "g", ".cfi_lsda", &why);
+            }
+        }
+    }
+}
+
+/// An arm64 Darwin variadic call whose argument area must be aligned past
+/// sixteen realigns `sp` by an amount only known at run time, so no
+/// `.cfi_GNU_args_size` can give it back: the unwinder would hand the pad a
+/// stack pointer somewhere inside the realigned area. The call says 0, and
+/// its call-site entry lands on a detour that reloads `sp` from where the
+/// call saved it -- as the call's own return path does -- and then jumps to
+/// the pad. A call with an ordinary area keeps its constant.
+#[test]
+fn fexceptions_realigned_darwin_variadic_call_lands_on_a_detour() {
+    let src = r#"
+typedef long al32 __attribute__((aligned(32)));
+extern void g(int, ...);
+extern void h(int);
+static void cl(int *p) { h(*p); }
+int f(int x) {
+    int a __attribute__((cleanup(cl))) = x;
+    al32 v = x;
+    g(1, v);
+    g(2, 3L, 4L, 5L);
+    return a;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        let asm = asm_for_with(
+            "eh_darwin_realign",
+            AARCH64_DARWIN,
+            src,
+            &[level, "-fexceptions"],
+        );
+        let why = format!("{level}:\n{asm}");
+        let body = body_of(&asm, "f");
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        // The realigning call saves the old `sp` and reads it back after.
+        let saved = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("str x16, [sp, #"))
+            .and_then(|l| l.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("no saved sp: {why}"));
+        let detour = lines
+            .iter()
+            .position(|l| l.starts_with("L.LEHD.") && l.ends_with(':'))
+            .unwrap_or_else(|| panic!("no detour: {why}"));
+        assert_eq!(
+            lines[detour + 1],
+            format!("ldr x16, [sp, #{saved}]"),
+            "{why}"
+        );
+        assert_eq!(lines[detour + 2], "add sp, x16, #0", "{why}");
+        assert!(lines[detour + 3].starts_with("b Lf_"), "{why}");
+        // The LSDA names the detour as that call's pad.
+        let label = lines[detour].trim_end_matches(':');
+        assert!(
+            lsda_of(&asm, "f")
+                .iter()
+                .any(|l| l == &format!(".uleb128 {label}-L.LFB.0")),
+            "{why}"
+        );
+        // The realigning call, first, leaves the size at 0; the other's
+        // three stacked longs keep their constant, 32 bytes.
+        let first_call = lines
+            .iter()
+            .position(|l| l.starts_with("L.LEHB."))
+            .unwrap_or_else(|| panic!("no call site: {why}"));
+        assert!(
+            !lines[..first_call]
+                .iter()
+                .any(|l| l.starts_with(".cfi_GNU_args_size")),
+            "{why}"
+        );
+        assert!(lines.contains(&".cfi_GNU_args_size 32"), "{why}");
+    }
+}

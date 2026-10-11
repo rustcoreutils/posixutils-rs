@@ -780,6 +780,8 @@ fn preprocess_assembler(
         isa: Default::default(),
         cf_protection: Default::default(),
         exceptions: false,
+        // What a compile would write, which the assembly may test.
+        cfi: Default::default(),
         macro_prefix_map: Default::default(),
         collect_dependencies: false,
         pre_includes: &[],

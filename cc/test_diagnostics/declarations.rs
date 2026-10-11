@@ -15,7 +15,8 @@
 //
 
 use crate::test_compile::{
-    compile_expect_error, compile_expect_no_diagnostic, compile_expect_ok, compile_expect_warning,
+    compile, compile_accepted, compile_expect_error, compile_expect_no_diagnostic,
+    compile_expect_ok, compile_expect_warning,
 };
 
 /// Each case must be rejected with a diagnostic naming the given text.
@@ -250,8 +251,8 @@ fn storage_classes_where_they_belong() {
          for (register int i = 0, j = 1; i < j; i++) r++; return r; }\n",
     );
     // gcc's global register variable names its register, and is accepted.
-    // In a caller-saved register every call would have to save it; gcc only
-    // warns, c17 refuses.
+    // In %r11, the back end's own scratch register, c17 refuses it
+    // (`global_register_holds`).
     if cfg!(target_arch = "x86_64") {
         compile_expect_ok(
             "sc_global_register",
@@ -478,4 +479,84 @@ fn tentative_array_completed_later_in_the_unit() {
         "int a[];\nint *g(void) { extern int a[5]; return a; }\n",
         "type of array 'a' completed incompatibly with implicit initialization",
     );
+}
+
+/// Which registers a file-scope register variable may name, on both
+/// targets, and what each draws. gcc takes any general register, warning
+/// "call-clobbered register used for global register variable" for one a
+/// call may clobber; c17 takes each one its generated code leaves to the
+/// allocator, with gcc's warning, and refuses the rest -- the scratch
+/// registers, and those an instruction writes on its own (a division's
+/// `%rax`/`%rdx`, a shift's `%rcx`, an atomic's `%r8`/`%r9`, aarch64's
+/// `x8`). The frame pointer, which every c17 function keeps, takes gcc's
+/// error for a function that needs one -- at the first function, once -- and
+/// a unit that defines none compiles.
+#[test]
+fn global_register_holds() {
+    const WARN: &str = "call-clobbered register used for global register variable";
+    // Per target: the registers taken quietly, with the warning, refused.
+    type Holds<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a [&'a str]);
+    let cases: &[Holds] = &[
+        (
+            "x86_64-unknown-linux-gnu",
+            &["rsp", "rbx", "r12", "r13", "r14", "r15", "ebx"],
+            &["rsi", "rdi", "esi"],
+            &["rax", "rcx", "rdx", "r8", "r9", "r10", "r11", "eax"],
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            &["sp", "x19", "x28", "w19"],
+            &["x0", "x5", "x7", "x12", "x14", "w3"],
+            &["x8", "x9", "x11", "x15", "x16", "x17", "x30"],
+        ),
+    ];
+    for &(triple, quiet, warned, refused) in cases {
+        let target = format!("--target={triple}");
+        let src = |reg: &str| {
+            format!("register long g asm(\"{reg}\");\nlong f(long a) {{ return a + g; }}\n")
+        };
+        for reg in quiet {
+            let stderr = compile_accepted("global_reg_quiet", &src(reg), &[&target]);
+            assert!(!stderr.contains("warning"), "{triple} {reg}:\n{stderr}");
+        }
+        for reg in warned {
+            let stderr = compile_accepted("global_reg_warned", &src(reg), &[&target]);
+            assert!(stderr.contains(WARN), "{triple} {reg}:\n{stderr}");
+        }
+        for reg in refused {
+            let run = compile("global_reg_refused", &src(reg), &[&target]);
+            assert!(
+                !run.success
+                    && run.stderr.contains(&format!(
+                        "global register variable 'g' in '{reg}' is not supported"
+                    )),
+                "{triple} {reg}:\n{}",
+                run.stderr
+            );
+        }
+    }
+    for (triple, fp) in [
+        ("x86_64-unknown-linux-gnu", "rbp"),
+        ("aarch64-unknown-linux-gnu", "x29"),
+    ] {
+        let target = format!("--target={triple}");
+        let decl = format!("register long g asm(\"{fp}\");\n");
+        let src = format!("long f(long a) {{ return a; }}\n{decl}long h(void) {{ return g; }}\n");
+        let run = compile("global_reg_fp", &src, &[&target]);
+        assert!(!run.success, "{triple}:\n{}", run.stderr);
+        assert_eq!(
+            run.stderr
+                .matches("frame pointer required, but reserved")
+                .count(),
+            1,
+            "{triple}:\n{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains(":1:"),
+            "{triple}: at f:\n{}",
+            run.stderr
+        );
+        compile_accepted("global_reg_fp_alone", &decl, &[&target]);
+    }
 }

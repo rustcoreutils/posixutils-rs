@@ -1686,6 +1686,41 @@ impl TypeTable {
         self.intern(stripped)
     }
 
+    /// `id` as `__typeof__` gives it: without what a function's
+    /// *declaration* says about its calls, which c17 records on the declared
+    /// function's type and gcc on the declaration. `returns_twice` and
+    /// `nothrow` go wherever a function type appears in `id`. `noreturn`,
+    /// which gcc also writes into a pointer to the function (as a `volatile`
+    /// function type), goes only from a function type `id` itself, and only
+    /// when `of_name` -- when the operand is the function's name, as in
+    /// `__typeof__(f)`; `__typeof__(*f)` and `__typeof__(&f)` keep it.
+    pub fn without_function_decl_attrs(&mut self, id: TypeId, of_name: bool) -> TypeId {
+        let t = self.get(id);
+        let (base, params) = (t.base, t.params.clone());
+        let new_base = base.map(|b| self.without_function_decl_attrs(b, false));
+        let new_params = params.as_ref().map(|ps| {
+            ps.iter()
+                .map(|&p| self.without_function_decl_attrs(p, false))
+                .collect::<Vec<_>>()
+        });
+        let t = self.get(id);
+        let is_fn = t.kind == TypeKind::Function;
+        let drops_noreturn = is_fn && of_name && t.noreturn;
+        if !(is_fn && (t.returns_twice || t.nothrow) || drops_noreturn)
+            && new_base == base
+            && new_params == params
+        {
+            return id;
+        }
+        let mut bare = t.clone();
+        bare.base = new_base;
+        bare.params = new_params;
+        bare.returns_twice = false;
+        bare.nothrow = false;
+        bare.noreturn &= !drops_noreturn;
+        self.intern(bare)
+    }
+
     /// Look up an existing pointer type to the given base type
     /// Returns void_ptr_id if not found (since all pointers are same size)
     pub fn pointer_to(&self, base: TypeId) -> TypeId {

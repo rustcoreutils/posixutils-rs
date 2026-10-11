@@ -229,6 +229,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             isa: target::X86Isa::from_flags(&o.mflags),
             cf_protection: o.cf_protection,
             exceptions: o.unwind.exceptions(),
+            cfi: o.unwind.cfi(&target, o.debug),
             macro_prefix_map: prefix_maps.macros,
         },
     );
@@ -248,7 +249,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         exceptions: o.unwind.exceptions(),
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
-        stack_clash: o.stack_clash,
+        stack_clash: o.stack_clash.then(target::StackClash::default),
         profiling: o.profile.then(|| target::Profiling::from_flags(&o.mflags)),
         stack_protector: target::StackProtection {
             level: o.stack_protector,

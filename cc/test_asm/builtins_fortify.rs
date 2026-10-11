@@ -150,3 +150,43 @@ fn builtins_fortify_keeps_every_check_at_o0() {
         assert_eq!(calls_in(&asm, "f"), ["__memcpy_chk"], "{triple}");
     }
 }
+
+/// The macOS SDK's `<secure/_string.h>`, `<secure/_strings.h>` and
+/// `<secure/_stdio.h>` turn the string and formatted-output functions into
+/// these builtins whenever fortification is on, through `__darwin_obsz`,
+/// whose type argument is an expression. Each reaches its checking function
+/// in the C library -- `memccpy`, `strlcpy` and `strlcat` among them, which
+/// c17 did not know, so it pinned `_FORTIFY_SOURCE` at 0 on Darwin.
+#[test]
+fn darwin_secure_header_builtins() {
+    let src = "typedef unsigned long size_t;\n\
+        typedef __builtin_va_list va_list;\n\
+        #define _USE_FORTIFY_LEVEL 2\n\
+        #define __darwin_obsz0(object) __builtin_object_size (object, 0)\n\
+        #define __darwin_obsz(object) __builtin_object_size (object, _USE_FORTIFY_LEVEL > 1 ? 1 : 0)\n\
+        extern char *d;\n\
+        size_t f(const char *s, int c, size_t n, va_list ap) {\n\
+            __builtin___memccpy_chk(d, s, c, n, __darwin_obsz0(d));\n\
+            __builtin___stpncpy_chk(d, s, n, __darwin_obsz(d));\n\
+            __builtin___vsprintf_chk(d, 0, __darwin_obsz(d), s, ap);\n\
+            return __builtin___strlcpy_chk(d, s, n, __darwin_obsz(d))\n\
+                + __builtin___strlcat_chk(d, s, n, __darwin_obsz(d));\n\
+        }\n\
+        int has = __has_builtin(__builtin___strlcpy_chk) + __has_builtin(__builtin___memccpy_chk)\n\
+            + __has_builtin(__builtin___strlcat_chk) + __has_builtin(__builtin___stpncpy_chk)\n\
+            + __has_builtin(__builtin___vsprintf_chk);\n";
+    for triple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        let asm = asm_for_with("darwin_secure", triple, src, &["-O2"]);
+        // (`__vsprintf_chk` of an object of unknown size folds to
+        // `vsprintf`, as on Linux.)
+        for callee in [
+            "___memccpy_chk",
+            "___strlcpy_chk",
+            "___strlcat_chk",
+            "_vsprintf",
+        ] {
+            assert!(asm.contains(callee), "{triple} {callee}:\n{asm}");
+        }
+        assert!(asm.contains(".long 5"), "{triple}: __has_builtin:\n{asm}");
+    }
+}

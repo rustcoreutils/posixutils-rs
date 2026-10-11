@@ -28,6 +28,7 @@ mod binary128;
 mod bitfield_layout;
 mod block_moves;
 mod call_args;
+mod call_attributes;
 // CET and its ELF note are x86-64 Linux's.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod cf_protection;

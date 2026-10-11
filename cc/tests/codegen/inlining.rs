@@ -12,7 +12,7 @@
 
 use crate::common::{
     compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere,
-    compile_and_run_optimized, compile_and_run_two_units,
+    compile_and_run_optimized, compile_and_run_two_units, compile_expect_error,
 };
 
 // ============================================================================
@@ -2136,5 +2136,29 @@ int main(void)
     return 0;
 }
 "#,
+    );
+}
+
+/// Two `always_inline` functions that call each other can never be spliced
+/// to an end. gcc rejects the program at every level, naming the first one
+/// defined; c17 called the out-of-line copies. Two that nothing keeps are
+/// dropped, as gcc drops them, and the program builds.
+#[test]
+fn codegen_always_inline_cycle_is_rejected() {
+    let cycle = "static inline __attribute__((always_inline)) int b(int n);\n\
+                 static inline __attribute__((always_inline)) int a(int n) { return n ? b(n - 1) + 1 : 0; }\n\
+                 static inline __attribute__((always_inline)) int b(int n) { return n ? a(n - 1) + 2 : 0; }\n";
+    compile_expect_error(
+        "always_inline_cycle",
+        &format!("{cycle}int main(void) {{ return b(3); }}\n"),
+        "inlining failed in call to 'always_inline' 'a': function not inlinable",
+    );
+    assert_eq!(
+        compile_and_run(
+            "always_inline_dead_cycle",
+            &format!("{cycle}int main(void) {{ return 0; }}\n"),
+            &[],
+        ),
+        0
     );
 }

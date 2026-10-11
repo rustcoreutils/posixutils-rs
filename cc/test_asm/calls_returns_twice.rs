@@ -163,3 +163,42 @@ int f(void) { return a() + b(); }
         assert_eq!(callees(&asm, "f", triple), ["a", "b"], "{triple}:\n{asm}");
     }
 }
+
+/// `returns_twice` is the declaration's, as gcc has it: a call naming the
+/// function -- through `&` or `*` too -- returns twice, and a function
+/// declared through `__typeof__` of it is an ordinary one, as is a call
+/// through a pointer however the pointer was declared.
+#[test]
+fn returns_twice_is_the_declarations() {
+    let src = r#"
+extern int rt(void) __attribute__((returns_twice));
+__typeof__(rt) rt2;
+__typeof__(&rt) prt;
+int a(void) { return rt(); }
+int b(void) { return (&rt)(); }
+int c(void) { return (*rt)(); }
+int d(void) { return rt2(); }
+int e(void) { return prt(); }
+int f(void) { __auto_type q = rt; return q(); }
+"#;
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_with(
+            "rt_decl",
+            X86_64_LINUX,
+            src,
+            &[opt, "-fcf-protection=branch"],
+        );
+        for (func, twice) in [
+            ("a", true),
+            ("b", true),
+            ("c", true),
+            ("d", false),
+            ("e", false),
+            ("f", false),
+        ] {
+            let body = body_of(&asm, func);
+            let landings = body.matches("endbr64").count() - 1;
+            assert_eq!(landings, usize::from(twice), "{opt} {func}:\n{body}");
+        }
+    }
+}

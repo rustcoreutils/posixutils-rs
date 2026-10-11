@@ -342,6 +342,123 @@ fn stack_clash_protection_names_unprobed_functions() {
     }
 }
 
+/// `--param stack-clash-protection-guard-size=` and `-probe-interval=` move
+/// where gcc probes, and so which functions c17 names. On x86-64 a frame is
+/// probed once it reaches both the guard and the interval (each a log2 of
+/// bytes, 12 by default); aarch64 takes only a guard of 12 or 16, with the
+/// interval equal to it, and probes past the guard less the caller's 1 KiB
+/// -- refusing anything else, in gcc's words, with or without the option.
+/// The parameters were accepted and changed nothing.
+#[test]
+fn stack_clash_protection_params_move_the_threshold() {
+    let src = "void use(char *);\n\
+               void f(void) { char b[5000]; use(b); }\n";
+    let (dir, path) = scratch("p.c", src);
+    let asm = dir.path().join("p.s");
+    let run = |extra: &[&str]| {
+        let mut args = vec!["-fstack-clash-protection", "-S", "-o"];
+        args.push(asm.to_str().unwrap());
+        args.push(path.to_str().unwrap());
+        args.extend(extra);
+        run_c17(&args)
+    };
+    let warns = |extra: &[&str]| {
+        let r = run(extra);
+        assert!(r.success, "{extra:?}: {}", r.stderr);
+        r.stderr.contains("the stack of 'f' is not probed")
+    };
+    const A64: &str = "--target=aarch64-unknown-linux-gnu";
+    for (extra, want) in [
+        (&[][..], true),
+        (
+            &["--param", "stack-clash-protection-guard-size=13"][..],
+            false,
+        ),
+        (
+            &["--param=stack-clash-protection-probe-interval=14"][..],
+            false,
+        ),
+        (
+            &["--param", "stack-clash-protection-guard-size=12"][..],
+            true,
+        ),
+        (&[A64][..], false),
+        (
+            &[A64, "--param", "stack-clash-protection-guard-size=12"][..],
+            true,
+        ),
+    ] {
+        assert_eq!(warns(extra), want, "{extra:?}");
+    }
+    for (extra, error) in [
+        (
+            &[A64, "--param", "stack-clash-protection-guard-size=13"][..],
+            "only values 12 (4 KB) and 16 (64 KB) are supported for guard size.  \
+             Given value 13 (8 KB) is out of range",
+        ),
+        (
+            &[A64, "--param", "stack-clash-protection-probe-interval=12"][..],
+            "stack clash guard size '16' must be equal to probing interval '12'",
+        ),
+    ] {
+        let r = run(extra);
+        assert!(
+            !r.success && r.stderr.contains(error),
+            "{extra:?}: {}",
+            r.stderr
+        );
+        let mut without: Vec<&str> = extra.to_vec();
+        without.push("-fno-stack-clash-protection");
+        let r = run(&without);
+        assert!(
+            !r.success && r.stderr.contains(error),
+            "{without:?}: {}",
+            r.stderr
+        );
+    }
+}
+
+/// `__GCC_HAVE_DWARF2_CFI_ASM` is defined exactly when gcc 13 defines it:
+/// whenever call frame information is written -- by default on both
+/// targets, with `-fexceptions` or `-g` -- and not when every unwind table
+/// is off and there is no debug information, where aarch64 also needs
+/// `-fno-unwind-tables`. c17 never defined it. `-fno-dwarf2-cfi-asm`, which
+/// has gcc write the tables itself, is refused: c17 cannot.
+#[test]
+fn dwarf2_cfi_asm_macro_matches_gcc() {
+    let (_dir, path) = scratch("cfi.c", "int x;\n");
+    let defined = |extra: &[&str]| {
+        let mut args = vec!["-E", "-dM", path.to_str().unwrap()];
+        args.extend(extra);
+        let r = run_c17(&args);
+        assert!(r.success, "{extra:?}: {}", r.stderr);
+        r.stdout.contains("#define __GCC_HAVE_DWARF2_CFI_ASM 1")
+    };
+    const A64: &str = "--target=aarch64-unknown-linux-gnu";
+    const NO_ASYNC: &str = "-fno-asynchronous-unwind-tables";
+    const NO_SYNC: &str = "-fno-unwind-tables";
+    for (extra, want) in [
+        (&[][..], true),
+        (&[NO_ASYNC][..], false),
+        (&[NO_ASYNC, NO_SYNC][..], false),
+        (&[NO_ASYNC, NO_SYNC, "-g"][..], true),
+        (&[NO_ASYNC, NO_SYNC, "-g0"][..], false),
+        (&[NO_ASYNC, NO_SYNC, "-fexceptions"][..], true),
+        (&[A64][..], true),
+        (&[A64, NO_ASYNC][..], true),
+        (&[A64, NO_ASYNC, NO_SYNC][..], false),
+        (&["-fdwarf2-cfi-asm"][..], true),
+    ] {
+        assert_eq!(defined(extra), want, "{extra:?}");
+    }
+    let r = run_c17(&["-c", "-fno-dwarf2-cfi-asm", path.to_str().unwrap()]);
+    assert!(
+        !r.success && r.stderr.contains("'-fno-dwarf2-cfi-asm' is not supported"),
+        "{}",
+        r.stderr
+    );
+}
+
 /// `-fuse-ld=` reaches the link, as gcc's does: a linker that does not
 /// exist fails it. Linux only: the host compiler driver is gcc there.
 #[cfg(target_os = "linux")]

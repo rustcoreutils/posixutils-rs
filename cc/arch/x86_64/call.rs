@@ -13,6 +13,7 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::abi::{Abi, ArgClass, RegClass};
+use crate::arch::eh::CallArgsArea;
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeKind, TypeTable};
@@ -1417,7 +1418,9 @@ impl X86_64CodeGen {
         func_name: &str,
         args_size: usize,
     ) {
-        let site = self.base.eh_call_begin(insn, args_size as i64);
+        let site = self
+            .base
+            .eh_call_begin(insn, CallArgsArea::Fixed(args_size as i64));
         if insn.extra().indirect_target.is_some() {
             self.push_lir(X86Inst::Call {
                 target: CallTarget::Indirect(Reg::R11),

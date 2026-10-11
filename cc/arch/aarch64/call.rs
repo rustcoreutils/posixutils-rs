@@ -14,6 +14,7 @@ use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::abi::{ArgClass, HfaBase, RegClass};
+use crate::arch::eh::CallArgsArea;
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -1068,7 +1069,11 @@ impl Aarch64CodeGen {
         func_name: &str,
         stack_args: i32,
     ) {
-        let site = self.base.eh_call_begin(insn, i64::from(stack_args) * 16);
+        let area = match self.darwin_va_sp_slot {
+            Some(saved_sp) => CallArgsArea::Realigned { saved_sp },
+            None => CallArgsArea::Fixed(i64::from(stack_args) * 16),
+        };
+        let site = self.base.eh_call_begin(insn, area);
         if insn.extra().indirect_target.is_some() {
             self.push_lir(Aarch64Inst::Bl {
                 target: CallTarget::Indirect(Reg::X16),

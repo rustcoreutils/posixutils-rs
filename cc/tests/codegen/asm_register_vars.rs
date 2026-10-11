@@ -334,6 +334,62 @@ int main(void)
     compile_and_run_everywhere("asm_regvar_global_callee_saved", src);
 }
 
+/// A global register variable in a register a call may clobber, as gcc
+/// takes it with a warning: an argument register (`%rsi`, `x5`) and, on
+/// aarch64, one only the allocator hands out (`x13`). No function of the
+/// unit allocates it, so under pressure, across calls that pass nothing in
+/// it, and through `asm`, the variable keeps its value. (A call passing an
+/// argument in it overwrites it, and a function of another unit -- the C
+/// library's -- may change it, so the program has neither while it is live.)
+#[test]
+fn global_register_vars_in_call_clobbered_registers() {
+    let src = r#"
+#if defined(__x86_64__)
+register long g asm("rsi");
+#define CLOBBERED 1
+#elif defined(__aarch64__)
+register long g asm("x13");
+register long k asm("x5");
+#define CLOBBERED 1
+#endif
+#ifdef CLOBBERED
+__attribute__((noinline)) long sink(long x) { return x * 3 + 1; }
+__attribute__((noinline)) long pressure(long x)
+{
+	long a = sink(x), b = sink(a), c = sink(b), d = sink(c), e = sink(d);
+	long f = sink(e), i = sink(f), j = sink(i), m = sink(j), l = sink(m);
+	long n = a * b + c * d - e * f + i * j - m * l;
+	return a + b + c + d + e + f + i + j + m + l + n;
+}
+__attribute__((noinline)) void bump(void) { g = g * 2 + 1; }
+__attribute__((noinline)) long two(long a, long b) { return a - b; }
+#endif
+int main(void)
+{
+#ifdef CLOBBERED
+	g = 5;
+	long want = pressure(2);
+	bump();
+	if (g != 11) return 1;
+	if (pressure(2) != want || g != 11) return 2;
+	long out;
+#if defined(__x86_64__)
+	asm("mov %%rsi, %0" : "=r"(out));
+#else
+	asm("mov %0, x13" : "=r"(out));
+	k = 40;
+	if (pressure(3) == 0 || k != 40) return 4;
+	/* A call passing two arguments leaves x5 alone. */
+	if (two(1, 2) != -1 || k != 40) return 5;
+#endif
+	if (out != 11) return 3;
+#endif
+	return 0;
+}
+"#;
+    compile_and_run_everywhere("asm_regvar_global_call_clobbered", src);
+}
+
 /// A unit with a global register variable compiles as gcc's torture test
 /// for PR rtl-optimization/17825 has it: a 32-bit variable in a 64-bit
 /// register, read, divided and merged back.
@@ -456,5 +512,20 @@ fn register_var_diagnostics() {
         "regvar_global_other",
         &format!("register long g asm(\"{caller_saved}\");\n"),
         "global register variable 'g'",
+    );
+}
+
+/// A memory operand is the address of its object, which a block-scope
+/// register variable has none of; gcc refuses it as it refuses `&`.
+#[test]
+fn local_register_var_as_memory_operand() {
+    #[cfg(target_arch = "x86_64")]
+    let reg = "r10";
+    #[cfg(not(target_arch = "x86_64"))]
+    let reg = "x9";
+    compile_expect_error(
+        "regvar_local_memory",
+        &format!("void f(void) {{ register long x asm(\"{reg}\") = 1; asm(\"\" :: \"m\"(x)); }}\n"),
+        "address of register variable 'x' requested",
     );
 }

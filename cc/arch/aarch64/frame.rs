@@ -226,6 +226,27 @@ impl Aarch64CodeGen {
             self.emit_block(block, &frame_info, types);
         }
 
+        // The landings of calls whose argument area was realigned: `sp`
+        // back from where the call saved it, then the pad (`arch::eh`).
+        for detour in self.base.take_eh_detours() {
+            self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(detour.label)));
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::SP,
+                    offset: detour.saved_sp,
+                },
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::X16,
+                src2: GpOperand::Imm(0),
+                dst: Reg::sp(),
+            });
+            self.push_lir(Aarch64Inst::B { target: detour.pad });
+        }
+
         // CFI: End procedure
         if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiEndProc));

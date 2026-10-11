@@ -259,34 +259,32 @@ pub(crate) fn impossible_always_inline(
         .collect()
 }
 
-/// The `always_inline` functions on a cycle of calls among `always_inline`
-/// functions: `a` calls `b` calls `a`. Each splice of one brings in a call to
-/// the other, so forcing them would never end; they are recursive, as a
-/// function that calls itself is. A cycle through any other function ends by
-/// itself, since only `always_inline` calls are spliced without limit.
+/// The cycles of calls among `always_inline` functions: `a` calls `b` calls
+/// `a`, or `f` calls itself. Each splice of one brings in a call to the
+/// next, so forcing them would never end; they are recursive. A cycle
+/// through any other function ends by itself, since only `always_inline`
+/// calls are spliced without limit.
 ///
-/// Tarjan's strongly connected components over that call graph.
-fn always_inline_cycles(module: &Module) -> HashSet<String> {
-    let forced: HashMap<&str, usize> = module
+/// Each cycle is its members' indices in `module.functions`, in definition
+/// order; a single member is a function that calls itself. Tarjan's
+/// strongly connected components over that call graph.
+pub(crate) fn always_inline_cycles(module: &Module) -> Vec<Vec<usize>> {
+    let members: Vec<usize> = module
         .functions
         .iter()
-        .filter(|f| f.is_always_inline && !f.is_noinline)
         .enumerate()
-        .map(|(i, f)| (f.name.as_str(), i))
+        .filter(|(_, f)| f.is_always_inline && !f.is_noinline)
+        .map(|(i, _)| i)
         .collect();
-    let names: Vec<&str> = {
-        let mut v = vec![""; forced.len()];
-        for (&name, &i) in &forced {
-            v[i] = name;
-        }
-        v
-    };
-    let edges: Vec<Vec<usize>> = module
-        .functions
+    let forced: HashMap<&str, usize> = members
         .iter()
-        .filter(|f| f.is_always_inline && !f.is_noinline)
-        .map(|f| {
-            let mut out: Vec<usize> = f
+        .enumerate()
+        .map(|(v, &i)| (module.functions[i].name.as_str(), v))
+        .collect();
+    let edges: Vec<Vec<usize>> = members
+        .iter()
+        .map(|&i| {
+            let mut out: Vec<usize> = module.functions[i]
                 .blocks
                 .iter()
                 .flat_map(|b| &b.insns)
@@ -306,7 +304,7 @@ fn always_inline_cycles(module: &Module) -> HashSet<String> {
         on_stack: Vec<bool>,
         stack: Vec<usize>,
         next: usize,
-        cyclic: Vec<bool>,
+        cycles: Vec<Vec<usize>>,
     }
     impl Tarjan<'_> {
         fn visit(&mut self, v: usize) {
@@ -335,14 +333,13 @@ fn always_inline_cycles(module: &Module) -> HashSet<String> {
                     }
                 }
                 // One function alone is a cycle only through itself.
-                let cycle = component.len() > 1 || self.edges[v].contains(&v);
-                for w in component {
-                    self.cyclic[w] = cycle;
+                if component.len() > 1 || self.edges[v].contains(&v) {
+                    self.cycles.push(component);
                 }
             }
         }
     }
-    let n = names.len();
+    let n = members.len();
     let mut t = Tarjan {
         edges: &edges,
         index: vec![None; n],
@@ -350,17 +347,24 @@ fn always_inline_cycles(module: &Module) -> HashSet<String> {
         on_stack: vec![false; n],
         stack: Vec::new(),
         next: 0,
-        cyclic: vec![false; n],
+        cycles: Vec::new(),
     };
     for v in 0..n {
         if t.index[v].is_none() {
             t.visit(v);
         }
     }
-    (0..n)
-        .filter(|&v| t.cyclic[v])
-        .map(|v| names[v].to_string())
-        .collect()
+    let mut cycles: Vec<Vec<usize>> = t
+        .cycles
+        .into_iter()
+        .map(|c| {
+            let mut c: Vec<usize> = c.into_iter().map(|v| members[v]).collect();
+            c.sort_unstable();
+            c
+        })
+        .collect();
+    cycles.sort_unstable();
+    cycles
 }
 
 /// Build a map of function name -> call count across the entire module in a single pass.
@@ -381,12 +385,12 @@ fn build_call_count_map(module: &Module) -> HashMap<String, usize> {
 /// Analyze all functions in a module for inlineability
 pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate> {
     let call_counts = build_call_count_map(module);
-    let cycles = always_inline_cycles(module);
+    let cyclic: HashSet<usize> = always_inline_cycles(module).into_iter().flatten().collect();
     let mut candidates = HashMap::with_capacity(module.functions.len());
 
-    for func in &module.functions {
+    for (i, func) in module.functions.iter().enumerate() {
         let mut candidate = analyze_function(func, &call_counts);
-        candidate.is_recursive |= cycles.contains(&func.name);
+        candidate.is_recursive |= cyclic.contains(&i);
         candidates.insert(func.name.clone(), candidate);
     }
 
@@ -1824,10 +1828,9 @@ pub(crate) fn collect_func_refs_from_initializer(
 /// Remove functions that are static and have no callers -- with
 /// `only_inline`, only those declared `inline`.
 fn remove_dead_functions(module: &mut Module, only_inline: bool) {
-    // To a fixpoint: a reference held only by a function that is itself about
-    // to go is not a reference. One round leaves exactly that behind -- an
-    // unreferenced `bar` calling `foo` keeps `foo` alive on a count that its
-    // own removal has already invalidated.
+    // A reference held only by a function that is itself about to go is not
+    // a reference: an unreferenced `bar` calling `foo` does not keep `foo`,
+    // nor do two that call each other (`live_functions`).
     //
     // The block-scope statics of a removed function go with it unless
     // something that stays still names them -- an inlined copy of the body
@@ -1845,23 +1848,25 @@ fn remove_dead_functions(module: &mut Module, only_inline: bool) {
             .map(|g| g.name.clone())
             .collect()
     };
+    let is_root = |f: &Function| {
+        f.name == "main"
+            || !f.is_static
+            || (only_inline && !f.is_inline)
+            // `__attribute__((used))` means exactly "keep this even though
+            // nothing refers to it".
+            || f.symbol_attrs.used
+            // A constructor or destructor is called by neither: its only
+            // reference is the `.init_array` / `.fini_array` entry the
+            // backend emits, which is created after this pass runs.
+            || f.constructor.is_some()
+            || f.destructor.is_some()
+    };
     loop {
-        let referenced = collect_referenced_functions(module);
+        let live = live_functions(module, is_root);
         let before = (module.functions.len(), module.globals.len());
         let mut dead_labels = HashSet::new();
         module.functions.retain(|f| {
-            let keep = f.name == "main"
-                || !f.is_static
-                || (only_inline && !f.is_inline)
-                // `__attribute__((used))` means exactly "keep this even
-                // though nothing refers to it".
-                || f.symbol_attrs.used
-                || referenced.contains(&f.name)
-                // A constructor or destructor is called by neither: its only
-                // reference is the `.init_array` / `.fini_array` entry the
-                // backend emits, which is created after this pass runs.
-                || f.constructor.is_some()
-                || f.destructor.is_some();
+            let keep = live.contains(&f.name);
             if !keep {
                 if f.saves_label_in_static {
                     dead_labels.extend(f.blocks.iter().map(|bb| bb.id.label_symbol(&f.name)));
@@ -1923,10 +1928,26 @@ fn remove_tables_of_dead_labels(module: &mut Module, mut dead: HashSet<String>) 
     }
 }
 
-/// Every function name something in the module still refers to.
-fn collect_referenced_functions(module: &Module) -> HashSet<String> {
+/// The functions the program can reach: each one `is_root` keeps for its own
+/// sake, and each one a global, an alias or a reachable function refers to.
+/// Static functions that refer only to one another -- `a` calls `b` calls
+/// `a`, and nothing else names either -- are not reached, as gcc drops them.
+fn live_functions(module: &Module, is_root: impl Fn(&Function) -> bool) -> HashSet<String> {
     let func_names: HashSet<String> = module.functions.iter().map(|f| f.name.clone()).collect();
-    module.referenced_symbols(&func_names)
+    let mut live: HashSet<String> = module
+        .functions
+        .iter()
+        .filter(|f| is_root(f))
+        .map(|f| f.name.clone())
+        .collect();
+    loop {
+        let reached = module.references_from(&func_names, |f| live.contains(&f.name), true);
+        let before = live.len();
+        live.extend(reached);
+        if live.len() == before {
+            return live;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2346,9 +2367,12 @@ mod tests {
         module
             .functions
             .push(static_fn(&types, "plain", Some("via_plain")));
-        let mut cycles: Vec<String> = always_inline_cycles(&module).into_iter().collect();
-        cycles.sort();
-        assert_eq!(cycles, ["a", "b", "self_rec"]);
+        let name = |i: usize| module.functions[i].name.as_str();
+        let cycles: Vec<Vec<&str>> = always_inline_cycles(&module)
+            .into_iter()
+            .map(|c| c.into_iter().map(name).collect())
+            .collect();
+        assert_eq!(cycles, [vec!["a", "b"], vec!["self_rec"]]);
         let candidates = analyze_all_functions(&module);
         assert!(candidates["a"].is_recursive && candidates["b"].is_recursive);
         assert!(!candidates["top"].is_recursive && !candidates["via_plain"].is_recursive);
@@ -2498,6 +2522,27 @@ mod tests {
             "and so must one whose only caller went with it"
         );
         assert!(module.functions.iter().any(|f| f.name == "main"));
+    }
+
+    /// Statics that call only one another are as dead as one nothing calls:
+    /// counting each other's references kept a cycle alive at every level,
+    /// where gcc emits neither. One that a live function calls stays, and
+    /// keeps the other.
+    #[test]
+    fn test_dead_static_cycle_is_pruned() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        module.functions.push(static_fn(&types, "a", Some("b")));
+        module.functions.push(static_fn(&types, "b", Some("a")));
+        module.functions.push(static_fn(&types, "c", Some("d")));
+        module.functions.push(static_fn(&types, "d", Some("c")));
+        module.functions.push(static_fn(&types, "main", Some("c")));
+        module.functions.last_mut().unwrap().is_static = false;
+
+        remove_dead_functions(&mut module, false);
+
+        let left: Vec<&str> = module.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(left, ["c", "d", "main"]);
     }
 
     /// `int f(int helper) { sink(&helper); }` takes the address of a

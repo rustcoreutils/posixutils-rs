@@ -11,7 +11,7 @@
 // predefined macros.
 //
 
-use crate::common::{compile_and_run_everywhere, preprocess_text, run_c17};
+use crate::common::{compile_and_run_everywhere, compile_expect_error, preprocess_text, run_c17};
 
 /// `echo __inline | gcc -E -` prints `__inline`, and none of the spellings
 /// is a macro to `#ifdef`. Expected text is gcc 13's `-E -P`.
@@ -102,4 +102,22 @@ fn gnu_keyword_spellings_in_preprocessed_input() {
     let o = dir.path().join("t.o");
     let r = run_c17(&["-c", &i.to_string_lossy(), "-o", &o.to_string_lossy()]);
     assert!(r.success, "{}", r.stderr);
+}
+
+/// `__extension__` before a label is gcc's unary operator, not a prefix the
+/// label may follow: `__extension__ l:` is the expression `__extension__ l`
+/// without its `;`, and `__extension__ case 1:` no expression at all. c17
+/// accepted both as labels.
+#[test]
+fn gnu_extension_before_a_label_is_rejected() {
+    compile_expect_error(
+        "gnu_ext_label",
+        "int f(void) { int l = 0; __extension__ l: return l; }\n",
+        "expected ';'",
+    );
+    compile_expect_error(
+        "gnu_ext_case",
+        "int f(int c) { switch (c) { __extension__ case 1: return 0; } return 1; }\n",
+        "expected expression before 'case'",
+    );
 }

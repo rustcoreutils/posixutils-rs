@@ -218,6 +218,115 @@ fn diagnostics_always_inline_bodies_gcc_never_copies() {
     );
 }
 
+/// Recursion among `always_inline` functions, which gcc can never finish
+/// splicing, with gcc 13's verdict at each level.
+///
+/// A cycle through two or more of them is rejected at every level, once,
+/// naming the first one defined, wherever it is called from -- even when only
+/// its address is taken -- unless nothing keeps the cycle at all. A function
+/// that calls itself is rejected at -O0 when another function calls it, the
+/// call gcc splices while leaving the recursive one inside the copy; at -O1
+/// and -Og whenever it is kept. (From -O2 gcc's verdict turns on whether its
+/// tail-recursion pass removed the call first, which c17 has no pass to
+/// match: it accepts there.)
+#[test]
+fn diagnostics_always_inline_recursion() {
+    const AI: &str = "static inline __attribute__((always_inline))";
+    let cycle = format!(
+        "{AI} int b(int n);\n\
+         {AI} int a(int n) {{ return n ? b(n - 1) + 1 : 0; }}\n\
+         {AI} int b(int n) {{ return n ? a(n - 1) + 2 : 0; }}\n"
+    );
+    let reversed = format!(
+        "{AI} int a(int n);\n\
+         {AI} int b(int n) {{ return n ? a(n - 1) + 2 : 0; }}\n\
+         {AI} int a(int n) {{ return n ? b(n - 1) + 1 : 0; }}\n"
+    );
+    let three = format!(
+        "{AI} int c(int n);\n{AI} int b(int n);\n\
+         {AI} int a(int n) {{ return n ? b(n - 1) + 1 : 0; }}\n\
+         {AI} int b(int n) {{ return n ? c(n - 1) + 2 : 0; }}\n\
+         {AI} int c(int n) {{ return n ? a(n - 1) + 3 : 0; }}\n"
+    );
+    let selfrec = format!("{AI} int f(int n) {{ return n ? f(n - 1) + 1 : 0; }}\n");
+    let not_inlinable = |f: &str| {
+        format!("inlining failed in call to 'always_inline' '{f}': function not inlinable")
+    };
+    let not_considered =
+        "inlining failed in call to 'always_inline' 'f': function not considered for inlining";
+    let recursive = "inlining failed in call to 'always_inline' 'f': recursive inlining";
+    let cases: Vec<(String, [Option<String>; 3])> = vec![
+        (
+            format!("{cycle}int g(int n) {{ return a(n); }}\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("a"))),
+        ),
+        (
+            format!("{cycle}int g(int n) {{ return b(n); }}\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("a"))),
+        ),
+        (
+            format!("{reversed}int g(int n) {{ return a(n); }}\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("b"))),
+        ),
+        (
+            format!("{three}int g(int n) {{ return a(n); }}\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("a"))),
+        ),
+        (
+            format!("{cycle}int (*p)(int) = a;\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("a"))),
+        ),
+        (
+            format!("{cycle}int g(int n) {{ return n; }}\n"),
+            [None, None, None],
+        ),
+        (
+            format!("{selfrec}int g(int n) {{ return f(n); }}\n"),
+            [
+                Some(not_considered.to_string()),
+                Some(recursive.to_string()),
+                None,
+            ],
+        ),
+        (
+            format!("{selfrec}int (*p)(int) = f;\n"),
+            [None, Some(recursive.to_string()), None],
+        ),
+        (
+            format!("{selfrec}int g(int n) {{ return n; }}\n"),
+            [None, None, None],
+        ),
+    ];
+    for (src, verdicts) in &cases {
+        for (opt, verdict) in ["-O0", "-O1", "-O2"].iter().zip(verdicts) {
+            let run = compile("diag_always_inline_recursion", src, &[opt]);
+            match verdict {
+                Some(msg) => assert!(
+                    !run.success && run.stderr.contains(msg.as_str()),
+                    "{opt}: expected {msg:?} for\n{src}\ngot:\n{}",
+                    run.stderr
+                ),
+                None => assert!(
+                    run.success && !run.stderr.contains("inlining failed"),
+                    "{opt}: expected no error for\n{src}\ngot:\n{}",
+                    run.stderr
+                ),
+            }
+        }
+    }
+    // `-Og` is gcc's -O1 here.
+    let run = compile(
+        "diag_always_inline_recursion_og",
+        &format!("{selfrec}int (*p)(int) = f;\n"),
+        &["-Og"],
+    );
+    assert!(
+        !run.success && run.stderr.contains(recursive),
+        "{}",
+        run.stderr
+    );
+}
+
 // ============================================================================
 // What `-fpermissive` relaxes
 // ============================================================================

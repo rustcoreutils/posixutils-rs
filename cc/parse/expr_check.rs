@@ -17,9 +17,9 @@ use super::operand_rule::{
 use super::parser::Parser;
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::SymbolKind;
+use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 use crate::token::lexer::Position;
-use crate::types::{AssignFault, TypeId, TypeKind, TypeModifiers};
+use crate::types::{AssignFault, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::{gettext, gettext_args};
 
 /// Where a value is converted as if by assignment (C17 6.5.16.1). The
@@ -32,6 +32,44 @@ enum ConversionSite {
     Initialization,
     /// A `return` statement's value (6.8.6.4p3).
     Return,
+}
+
+/// The `register` variable whose address `operand`'s address would be, and
+/// gcc's words for refusing it: unary `&` (C17 6.5.3.2p1) and a memory-class
+/// asm operand (`"m"`, `"o"`) both need the object's address, which a
+/// `register` object has none of -- gcc refuses even when the storage class
+/// is only a hint. The address of a member, or of an element of an array
+/// (not of what a pointer points at), is the address of the object it is in.
+pub(crate) fn register_address_refusal(
+    types: &TypeTable,
+    symbols: &SymbolTable,
+    operand: &Expr,
+) -> Option<(SymbolId, &'static str)> {
+    let is_array = |e: &Expr| e.typ.is_some_and(|t| types.kind(t) == TypeKind::Array);
+    let mut root = operand;
+    loop {
+        root = match &root.kind {
+            ExprKind::Member { expr, .. } => expr,
+            ExprKind::Index { array, .. } if is_array(array) => array,
+            ExprKind::Index { index, .. } if is_array(index) => index,
+            _ => break,
+        };
+    }
+    let ExprKind::Ident(symbol_id) = &root.kind else {
+        return None;
+    };
+    let sym = symbols.get(*symbol_id);
+    if !matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+        || !types.modifiers(sym.typ).contains(TypeModifiers::REGISTER)
+    {
+        return None;
+    }
+    let msg = if sym.global_register().is_some() {
+        "address of global register variable '{0}' requested"
+    } else {
+        "address of register variable '{0}' requested"
+    };
+    Some((*symbol_id, msg))
 }
 
 impl Parser<'_> {
@@ -1104,31 +1142,8 @@ impl Parser<'_> {
         if self.check_reverse_order_address(operand, pos) {
             return;
         }
-        // The address of a member is the address of the object it is in, so
-        // `&s.a` of a `register` structure asks for the register's.
-        let mut root = operand;
-        while let ExprKind::Member { expr, .. } = &root.kind {
-            root = expr;
-        }
-        let ExprKind::Ident(symbol_id) = &root.kind else {
-            return;
-        };
-        let sym = self.symbols.get(*symbol_id);
-        if !matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
-            return;
-        }
-        if self
-            .types
-            .modifiers(sym.typ)
-            .contains(TypeModifiers::REGISTER)
-        {
-            let name = self.str(sym.name).to_string();
-            let msg = if sym.global_register().is_some() {
-                "address of global register variable '{0}' requested"
-            } else {
-                "address of register variable '{0}' requested"
-            };
-            diag::error_args(pos, msg, &[&name]);
+        if let Some((sym, msg)) = register_address_refusal(self.types, self.symbols, operand) {
+            diag::error_args(pos, msg, &[self.str(self.symbols.get(sym).name)]);
         }
     }
 

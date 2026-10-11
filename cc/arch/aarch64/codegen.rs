@@ -1486,6 +1486,10 @@ impl CodeGenerator for Aarch64CodeGen {
     fn set_stack_protector(&mut self, protection: crate::target::StackProtection) {
         self.base.stack_protector = protection;
     }
+
+    fn set_optimizing(&mut self, on: bool) {
+        self.base.optimizing = on;
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ pub mod asm_constraints;
 pub mod codegen;
 pub mod dwarf;
 pub mod eh;
+pub mod landing_pads;
 pub mod lir;
 pub mod mapping;
 pub mod regalloc;

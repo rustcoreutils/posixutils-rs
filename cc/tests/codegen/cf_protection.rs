@@ -202,3 +202,55 @@ fn cf_protection_shstk_intrinsics() {
         );
     }
 }
+
+/// `nocf_check`, as the Linux kernel's `__nocf_check` uses it: the function
+/// has no `endbr64`, the call through a pointer of its type is `notrack`, and
+/// the program runs -- at every level, the call reaching the function whether
+/// or not the processor tracks branches.
+#[test]
+fn cf_protection_nocf_check_object_and_run() {
+    let dir = work_dir("nocf");
+    let src = dir.path().join("nocf.c");
+    std::fs::write(
+        &src,
+        "__attribute__((nocf_check)) int untracked(int x) { return x * 3; }\n\
+         int tracked(int x) { return x + 4; }\n\
+         typedef int (*nocf_fn)(int) __attribute__((nocf_check));\n\
+         nocf_fn volatile up = untracked;\n\
+         int (*volatile tp)(int) = tracked;\n\
+         int main(void) { return up(5) == 15 && tp(5) == 9 ? 0 : 1; }\n",
+    )
+    .unwrap();
+    for opt in ["-O0", "-O2"] {
+        let obj = dir.path().join("nocf.o");
+        let exe = dir.path().join("nocf");
+        let (o, s, e) = (
+            obj.to_str().unwrap(),
+            src.to_str().unwrap(),
+            exe.to_str().unwrap(),
+        );
+        let run = run_c17(&[opt, "-fcf-protection=branch", "-c", "-o", o, s]);
+        assert!(run.success, "{opt}: {}", run.stderr);
+        let dis = tool("objdump", &["-d", "--no-show-raw-insn", o]);
+        let first_after = |label: &str| {
+            let at = dis
+                .find(label)
+                .unwrap_or_else(|| panic!("no {label}:\n{dis}"));
+            dis[at..].lines().nth(1).unwrap_or("").to_string()
+        };
+        assert!(
+            !first_after("<untracked>:").contains("endbr64"),
+            "{opt}:\n{dis}"
+        );
+        assert!(
+            first_after("<tracked>:").contains("endbr64"),
+            "{opt}:\n{dis}"
+        );
+        assert_eq!(dis.matches("notrack call").count(), 1, "{opt}:\n{dis}");
+
+        let run = run_c17(&[opt, "-fcf-protection=branch", "-o", e, s]);
+        assert!(run.success, "{opt}: {}", run.stderr);
+        let status = Command::new(&exe).status().expect("run");
+        assert_eq!(status.code(), Some(0), "{opt}");
+    }
+}

@@ -170,3 +170,50 @@ fn cf_branch_endbr_precedes_the_profiling_call() {
         "-mfentry",
     );
 }
+
+/// `__attribute__((nocf_check))` is part of the function type, as in gcc: a
+/// function of that type has no `endbr64` at its entry, whatever its linkage
+/// and at every level, and a call through a pointer to one is `notrack`, so
+/// the processor does not ask for one. The attribute reaches the type through
+/// a typedef of the function or of the pointer, `__typeof__` of the function,
+/// and a declarator's pointer. A call through a plain pointer still tracks.
+#[test]
+fn cf_branch_nocf_check_drops_endbr_and_calls_notrack() {
+    let src = r#"
+extern int g(int);
+__attribute__((nocf_check)) int f(int x) { return g(x) + 1; }
+int plain(int x) { return g(x) + 2; }
+typedef int (*np)(int) __attribute__((nocf_check));
+typedef int nft(int) __attribute__((nocf_check));
+int via_typedef(np p, int x) { return p(x) + 3; }
+int via_fn_typedef(nft *p, int x) { return p(x) + 4; }
+__typeof__(f) *tp;
+int via_typeof(int x) { return tp(x) + 5; }
+int (*__attribute__((nocf_check)) q)(int);
+int via_decl(int x) { return q(x) + 6; }
+int via_plain(int (*p)(int), int x) { return p(x) + 7; }
+int direct(int x) { return f(x) + 8; }
+"#;
+    for opt in ["-O0", "-O2"] {
+        for level in ["branch", "full"] {
+            let flag = format!("-fcf-protection={level}");
+            let asm = asm_for_with("cf_nocf", X86_64_LINUX, src, &[opt, &flag]);
+            assert_body_lacks(&asm, "f", "endbr64", "a nocf_check function");
+            for func in ["plain", "via_typedef", "via_plain", "direct"] {
+                assert!(starts_with_endbr(&asm, func), "{flag} {opt} {func}:\n{asm}");
+            }
+            for func in ["via_typedef", "via_fn_typedef", "via_typeof", "via_decl"] {
+                assert_body_contains(&asm, func, "notrack call *", &format!("{opt} {func}"));
+            }
+            assert_body_lacks(&asm, "via_plain", "notrack", opt);
+            assert_body_contains(&asm, "via_plain", "call *", opt);
+            assert_body_lacks(&asm, "direct", "notrack", opt);
+        }
+        // Without branch protection the attribute is ignored, with gcc's
+        // warning, and nothing is `notrack`.
+        for flags in [&[opt][..], &[opt, "-fcf-protection=return"]] {
+            let asm = asm_for_with("cf_nocf_off", X86_64_LINUX, src, flags);
+            assert!(!asm.contains("notrack"), "{flags:?}:\n{asm}");
+        }
+    }
+}

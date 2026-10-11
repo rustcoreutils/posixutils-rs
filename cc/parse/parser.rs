@@ -272,11 +272,15 @@ pub struct Parser<'a> {
     /// specifiers, between the type and the declarator, or after the
     /// parameter list. Cleared at the start of each external declaration.
     pub(super) pending_fn_attrs: crate::parse::ast::FunctionAttrs,
-    /// `__attribute__((ms_abi))` or `((sysv_abi))` awaiting the declarator
-    /// whose function type it belongs to, with where it was written. A
-    /// property of the type, so it is applied with the other type attributes
-    /// (`apply_pending_type_attrs`) and taken there.
-    pub(super) pending_calling_conv: Option<(crate::abi::CallingConv, Position)>,
+    /// The function-type attributes -- `ms_abi`, `sysv_abi`, `nocf_check`
+    /// -- awaiting the declarator whose function type they belong to. A
+    /// property of the type, so they are applied with the other type
+    /// attributes (`apply_pending_type_attrs`) and taken there.
+    pub(super) pending_fn_type: super::attribute::FnTypeAttrs,
+    /// Whether `nocf_check` means anything: only under
+    /// `-fcf-protection=branch`, as in gcc, which otherwise warns that it
+    /// is ignored.
+    pub(super) cf_branch: bool,
 
     /// What the variadic builtins need to know of the function whose body
     /// is being parsed; the default outside any function. This is the last
@@ -428,7 +432,8 @@ impl<'a> Parser<'a> {
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
-            pending_calling_conv: None,
+            pending_fn_type: Default::default(),
+            cf_branch: false,
             enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
             reverse_atomic_members: Vec::new(),
@@ -465,6 +470,12 @@ impl<'a> Parser<'a> {
     /// [`LibraryCallPolicy::default`](super::library_builtin::LibraryCallPolicy).
     pub fn set_library_call_policy(&mut self, policy: super::library_builtin::LibraryCallPolicy) {
         self.library_call_policy = policy;
+    }
+
+    /// Whether the unit is built under `-fcf-protection=branch`, which is
+    /// what gives `__attribute__((nocf_check))` a meaning. Off by default.
+    pub fn set_cf_branch(&mut self, branch: bool) {
+        self.cf_branch = branch;
     }
 
     /// The alignment cap `#pragma pack` puts on a structure defined here.

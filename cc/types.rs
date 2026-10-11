@@ -607,6 +607,12 @@ pub struct Type {
     /// types differing only here are distinct and incompatible.
     pub conv: CallingConv,
 
+    /// `__attribute__((nocf_check))` under `-fcf-protection=branch`: the
+    /// function has no `endbr64` at its entry, and an indirect call through
+    /// a pointer to it is `notrack`. Part of the type, as `conv` is: gcc
+    /// calls two function types differing only here incompatible.
+    pub nocf_check: bool,
+
     /// Composite type data (for struct, union, enum)
     pub composite: Option<Box<CompositeType>>,
 
@@ -632,6 +638,7 @@ impl Default for Type {
             returns_twice: false,
             nothrow: false,
             conv: CallingConv::C,
+            nocf_check: false,
             composite: None,
             explicit_align: None,
             float_class: FloatClass::Standard,
@@ -892,6 +899,10 @@ impl Type {
         if self.conv != other.conv {
             return false;
         }
+        // So is `nocf_check`, for the same reason.
+        if self.nocf_check != other.nocf_check {
+            return false;
+        }
 
         // The base is compared by the caller, which can recurse. Comparing it
         // here by TypeId called two structurally identical types different
@@ -1038,6 +1049,7 @@ enum TypeKey {
         returns_twice: bool,
         nothrow: bool,
         conv: CallingConv,
+        nocf_check: bool,
         modifiers: u32,
     },
 }
@@ -1579,6 +1591,7 @@ impl TypeTable {
                     returns_twice: typ.returns_twice,
                     nothrow: typ.nothrow,
                     conv: typ.conv,
+                    nocf_check: typ.nocf_check,
                     modifiers: typ.modifiers.bits(),
                 })
             }
@@ -2075,6 +2088,14 @@ impl TypeTable {
                     CallingConv::C => decl,
                     CallingConv::Win64 if decl.is_empty() => " __attribute__((ms_abi))".to_string(),
                     CallingConv::Win64 => format!("__attribute__((ms_abi)) {decl}"),
+                };
+                // And `nocf_check`, which gcc spells only inside a declarator:
+                // `void (__attribute__((nocf_check)) *)(void)`, but the
+                // function type itself as `void(void)`.
+                let decl = if typ.nocf_check && !decl.is_empty() {
+                    format!("__attribute__((nocf_check)) {}", decl.trim_start())
+                } else {
+                    decl
                 };
                 let mut sig = parenthesize_if_pointer(decl);
                 if style == Spelling::Gcc && !sig.is_empty() {

@@ -291,7 +291,7 @@ impl Parser<'_> {
         self.pending_transparent_union = None;
         self.pending_packed = false;
         self.pending_fn_attrs = Default::default();
-        self.pending_calling_conv = None;
+        self.pending_fn_type = Default::default();
         // And any asm label the previous declaration left behind.
         //
         // `skip_extensions` collects one wherever it runs, which is most

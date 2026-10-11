@@ -1193,7 +1193,7 @@ impl X86_64CodeGen {
         });
 
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(resume)));
-        if cf.branch {
+        if self.base.landing_pads.active() {
             self.push_lir(X86Inst::Endbr64);
         }
         self.emit_frame_base_latch_from_rbp();
@@ -1402,7 +1402,7 @@ impl X86_64CodeGen {
     /// exception object in %rax: an `endbr64` under branch protection, the
     /// jump being an indirect one, then the object to its home.
     pub(super) fn emit_landing_pad(&mut self, insn: &Instruction) {
-        if self.base.cf_protection.branch {
+        if self.base.landing_pads.active() {
             self.push_lir(X86Inst::Endbr64);
         }
         if let Some(target) = insn.target {

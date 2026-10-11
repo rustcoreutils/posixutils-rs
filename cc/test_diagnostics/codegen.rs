@@ -9,7 +9,9 @@
 // Compile-only cases of the codegen suite (tests/codegen), in process.
 //
 
-use crate::test_compile::{compile_expect_error, compile_expect_warning};
+use crate::test_compile::{
+    compile_expect_error, compile_expect_warning, compile_rejected_with, compile_warnings,
+};
 
 // ============================================================================
 // tests/codegen/ms_abi.rs:
@@ -59,6 +61,91 @@ fn codegen_ms_abi_function_types_are_distinct() {
          __builtin_va_list ap; __builtin_va_start(ap, n); return 0; }\n",
         "'va_start' used in Win64 ABI function",
     );
+}
+
+// ============================================================================
+// `__attribute__((nocf_check))` under `-fcf-protection=branch`
+// ============================================================================
+
+/// Under branch protection `nocf_check` is part of the function type, as in
+/// gcc: assigning between a pointer to such a function and a plain one warns
+/// either way, spelled as gcc spells the type; a redeclaration that adds or
+/// drops it conflicts; and on anything but a function type it warns and is
+/// ignored.
+#[test]
+fn nocf_check_function_types_are_distinct() {
+    let x86 = [
+        "--target=x86_64-unknown-linux-gnu",
+        "-fcf-protection=branch",
+    ];
+    let warnings = |name: &str, src: &str| compile_warnings(name, src, &x86).join("\n");
+    let w = warnings(
+        "nocf_ptr",
+        "__attribute__((nocf_check)) void f(void) {}\nvoid g(void) {}\n\
+         typedef void (*np)(void) __attribute__((nocf_check));\n\
+         void (*a)(void) = f;\nnp b = g;\nnp c = f;\n",
+    );
+    assert!(
+        w.contains(
+            "4:19: initialization of 'void (*)(void)' from incompatible pointer type \
+             'void (__attribute__((nocf_check)) *)(void)'"
+        ),
+        "{w}"
+    );
+    // gcc names the typedef too ("'np' {aka '...'}"), which c17 does not
+    // keep for any type in this message.
+    assert!(
+        w.contains(
+            "5:8: initialization of 'void (__attribute__((nocf_check)) *)(void)' \
+             from incompatible pointer type 'void (*)(void)'"
+        ),
+        "{w}"
+    );
+    assert!(!w.contains("6:"), "{w}");
+    for (name, src) in [
+        (
+            "nocf_redecl",
+            "__attribute__((nocf_check)) void f(void);\nvoid f(void) {}\n",
+        ),
+        (
+            "nocf_redecl_add",
+            "void g(void);\n__attribute__((nocf_check)) void g(void) {}\n",
+        ),
+    ] {
+        let stderr = compile_rejected_with(name, src, &x86);
+        assert!(stderr.contains("conflicting types"), "{name}:\n{stderr}");
+    }
+    let w = warnings("nocf_object", "int x __attribute__((nocf_check));\n");
+    assert!(
+        w.contains("'nocf_check' attribute only applies to function types"),
+        "{w}"
+    );
+}
+
+/// Without branch protection -- no `-fcf-protection`, `return` only, or a
+/// target with no CET -- gcc ignores `nocf_check` and says why, and the types
+/// stay compatible.
+#[test]
+fn nocf_check_ignored_without_branch_protection() {
+    let src = "__attribute__((nocf_check)) void f(void) {}\nvoid (*a)(void) = f;\n";
+    for flags in [
+        &["--target=x86_64-unknown-linux-gnu"][..],
+        &[
+            "--target=x86_64-unknown-linux-gnu",
+            "-fcf-protection=return",
+        ],
+        &["--target=aarch64-unknown-linux-gnu"],
+    ] {
+        let w = compile_warnings("nocf_off", src, flags);
+        assert_eq!(
+            w,
+            [
+                "1:1: 'nocf_check' attribute ignored. Use '-fcf-protection' option to enable it \
+              [-Wattributes]"
+            ],
+            "{flags:?}"
+        );
+    }
 }
 
 // ============================================================================

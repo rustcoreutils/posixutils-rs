@@ -194,6 +194,7 @@ pub fn compile_tokens(
         optimizing: opts.optimization.optimizes(),
         math_errno: opts.math_errno,
     });
+    parser.set_cf_branch(opts.cf_protection.branch);
     // A syntax error is reported where it is, like every other diagnostic:
     // its position may be in a header, and only `diag` knows which file a
     // position belongs to and which includes reached it.

@@ -309,7 +309,7 @@ impl AttributeList {
 
     /// The calling convention this list names: `ms_abi` is Win64, and
     /// `sysv_abi` is the x86-64 default. `None` for neither -- or for both,
-    /// which [`Parser::merge_calling_conv`] reports.
+    /// which [`Parser::merge_fn_type_attrs`] reports.
     ///
     /// Read only on x86-64: anywhere else the names are not attributes, and
     /// `parse_single_attribute` has already warned that they are ignored.
@@ -1051,7 +1051,7 @@ impl Parser<'_> {
         SpecifierAttrs {
             fn_attrs: self.pending_fn_attrs.clone(),
             symbol_attrs: self.pending_symbol_attrs.clone(),
-            calling_conv: self.pending_calling_conv,
+            fn_type: self.pending_fn_type,
         }
     }
 
@@ -1060,7 +1060,7 @@ impl Parser<'_> {
     pub(super) fn begin_declarator(&mut self, spec: &SpecifierAttrs) {
         self.pending_fn_attrs = spec.fn_attrs.clone();
         self.pending_symbol_attrs = spec.symbol_attrs.clone();
-        self.pending_calling_conv = spec.calling_conv;
+        self.pending_fn_type = spec.fn_type;
         self.pending_declarator_align = None;
     }
 
@@ -1221,7 +1221,7 @@ impl Parser<'_> {
     /// remembering which attributes exist.
     pub(super) fn apply_pending_type_attrs(&mut self, typ: TypeId) -> TypeId {
         let typ = self.apply_pending_noreturn_pointer(typ);
-        let typ = self.apply_pending_calling_conv(typ);
+        let typ = self.apply_pending_fn_type_attrs(typ);
         let typ = self.apply_pending_mode(typ);
         let typ = self.apply_pending_vector_size(typ);
         if let Some(pos) = self.pending_transparent_union.take() {
@@ -1365,15 +1365,28 @@ impl Parser<'_> {
         );
     }
 
-    /// Hold the calling convention `attrs` names for the declarator being
-    /// parsed, refusing a second one that disagrees with it -- in the same
-    /// list or another -- as gcc does.
-    fn merge_calling_conv(&mut self, attrs: &AttributeList, pos: Position) {
+    /// Hold the function-type attributes `attrs` names for the declarator
+    /// being parsed: a calling convention, refusing a second one that
+    /// disagrees with it -- in the same list or another -- as gcc does; and
+    /// `nocf_check`, which only branch protection gives a meaning, gcc
+    /// warning that it is ignored otherwise.
+    fn merge_fn_type_attrs(&mut self, attrs: &AttributeList, pos: Position) {
+        if attrs.has_attr("nocf_check") {
+            if self.cf_branch {
+                self.pending_fn_type.nocf_check = Some(pos);
+            } else {
+                diag::group_warning(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "'nocf_check' attribute ignored. Use '-fcf-protection' option to enable it",
+                );
+            }
+        }
         if self.types.target().arch != crate::target::Arch::X86_64 {
             return;
         }
         let both = attrs.find("ms_abi").is_some() && attrs.find("sysv_abi").is_some();
-        let conflict = match (self.pending_calling_conv, attrs.calling_conv()) {
+        let conflict = match (self.pending_fn_type.conv, attrs.calling_conv()) {
             (Some((held, _)), Some(new)) => held != new,
             _ => false,
         };
@@ -1382,11 +1395,12 @@ impl Parser<'_> {
             return;
         }
         if let Some(conv) = attrs.calling_conv() {
-            self.pending_calling_conv = Some((conv, pos));
+            self.pending_fn_type.conv = Some((conv, pos));
         }
     }
 
-    /// Give the declared type the calling convention its declaration names.
+    /// Give the declared type the function-type attributes its declaration
+    /// names.
     ///
     /// gcc's placement rule for an attribute that needs a function type: a
     /// function takes it, a pointer to a function hands it to the function it
@@ -1394,48 +1408,50 @@ impl Parser<'_> {
     /// to an `ms_abi` function -- and anything else, including a pointer to
     /// such a pointer, warns and ignores it. `sysv_abi` names the default,
     /// so it changes nothing but is placed by the same rule.
-    fn apply_pending_calling_conv(&mut self, typ: TypeId) -> TypeId {
-        let Some((conv, pos)) = self.pending_calling_conv.take() else {
+    fn apply_pending_fn_type_attrs(&mut self, typ: TypeId) -> TypeId {
+        let pending = std::mem::take(&mut self.pending_fn_type);
+        if pending.conv.is_none() && pending.nocf_check.is_none() {
             return typ;
+        }
+        let func = match self.types.kind(typ) {
+            TypeKind::Function => Some(typ),
+            TypeKind::Pointer => self
+                .types
+                .base_type(typ)
+                .filter(|&b| self.types.kind(b) == TypeKind::Function),
+            _ => None,
         };
-        match self.types.kind(typ) {
-            TypeKind::Function => self.with_calling_conv(typ, conv),
-            TypeKind::Pointer
-                if self
-                    .types
-                    .base_type(typ)
-                    .is_some_and(|b| self.types.kind(b) == TypeKind::Function) =>
-            {
-                let func = self.types.base_type(typ).expect("checked above");
-                let func = self.with_calling_conv(func, conv);
-                let mut ptr = self.types.get(typ).clone();
-                ptr.base = Some(func);
-                self.types.intern(ptr)
-            }
-            _ => {
+        let Some(func) = func else {
+            let conv = pending.conv.map(|(conv, pos)| {
                 let name = match conv {
                     crate::abi::CallingConv::Win64 => "ms_abi",
                     crate::abi::CallingConv::C => "sysv_abi",
                 };
+                (name, pos)
+            });
+            let nocf = pending.nocf_check.map(|pos| ("nocf_check", pos));
+            for (name, pos) in conv.into_iter().chain(nocf) {
                 diag::group_warning_args(
                     ATTRIBUTE_WARNING,
                     pos,
                     "'{0}' attribute only applies to function types",
                     &[name],
                 );
-                typ
             }
-        }
-    }
-
-    /// The function type `func` with calling convention `conv`.
-    fn with_calling_conv(&mut self, func: TypeId, conv: crate::abi::CallingConv) -> TypeId {
-        if self.types.get(func).conv == conv {
-            return func;
-        }
+            return typ;
+        };
         let mut changed = self.types.get(func).clone();
-        changed.conv = conv;
-        self.types.intern(changed)
+        if let Some((conv, _)) = pending.conv {
+            changed.conv = conv;
+        }
+        changed.nocf_check |= pending.nocf_check.is_some();
+        let changed = self.types.intern(changed);
+        if func == typ {
+            return changed;
+        }
+        let mut ptr = self.types.get(typ).clone();
+        ptr.base = Some(changed);
+        self.types.intern(ptr)
     }
 
     /// Apply `__attribute__((vector_size(N)))` to a declared type.
@@ -1727,7 +1743,7 @@ impl Parser<'_> {
         }
         self.pending_packed |= attrs.has_packed();
         self.merge_symbol_attrs(attrs);
-        self.merge_calling_conv(attrs, pos);
+        self.merge_fn_type_attrs(attrs, pos);
         self.merge_fn_attrs(attrs, pos);
     }
 }
@@ -1747,7 +1763,18 @@ impl Parser<'_> {
 pub(super) struct SpecifierAttrs {
     fn_attrs: crate::parse::ast::FunctionAttrs,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
-    calling_conv: Option<(crate::abi::CallingConv, Position)>,
+    fn_type: FnTypeAttrs,
+}
+
+/// The attributes of a function *type* awaiting the declarator they belong
+/// to, each with where it was written: placed by
+/// [`Parser::apply_pending_fn_type_attrs`].
+#[derive(Clone, Copy, Default)]
+pub(super) struct FnTypeAttrs {
+    /// `ms_abi` or `sysv_abi` (x86-64 only).
+    conv: Option<(crate::abi::CallingConv, Position)>,
+    /// `nocf_check`, under branch protection.
+    nocf_check: Option<Position>,
 }
 
 /// Every slot an attribute list writes for the declaration being parsed.
@@ -1771,7 +1798,7 @@ pub(super) struct PendingDeclAttrs {
     packed: bool,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
     fn_attrs: crate::parse::ast::FunctionAttrs,
-    calling_conv: Option<(crate::abi::CallingConv, Position)>,
+    fn_type: FnTypeAttrs,
     asm_label: Option<String>,
 }
 
@@ -1791,7 +1818,7 @@ impl Parser<'_> {
             packed: take(&mut self.pending_packed),
             symbol_attrs: take(&mut self.pending_symbol_attrs),
             fn_attrs: take(&mut self.pending_fn_attrs),
-            calling_conv: take(&mut self.pending_calling_conv),
+            fn_type: take(&mut self.pending_fn_type),
             asm_label: take(&mut self.pending_asm_label),
         }
     }
@@ -1809,7 +1836,7 @@ impl Parser<'_> {
         self.pending_packed = saved.packed;
         self.pending_symbol_attrs = saved.symbol_attrs;
         self.pending_fn_attrs = saved.fn_attrs;
-        self.pending_calling_conv = saved.calling_conv;
+        self.pending_fn_type = saved.fn_type;
         self.pending_asm_label = saved.asm_label;
     }
 }

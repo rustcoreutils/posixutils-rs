@@ -1848,6 +1848,9 @@ pub struct InsnExtra {
     /// For direct calls: the callee may return twice, as `setjmp` does. Ask
     /// [`Instruction::returns_twice`], which also answers for `Setjmp`.
     pub returns_twice_call: bool,
+    /// For calls: the callee's type is `nocf_check`, so an indirect call to
+    /// it asks for no landing pad -- x86-64 makes it `notrack`.
+    pub nocf_check_call: bool,
     /// For calls, under `-fexceptions`: the callee may unwind through this
     /// frame -- it is not `nothrow`. A call the compiler makes for itself
     /// (a library fallback, a block copy) never does.
@@ -1895,6 +1898,7 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     ends_with_va_arg_pack: false,
     is_noreturn_call: false,
     returns_twice_call: false,
+    nocf_check_call: false,
     may_throw: false,
     landing_pad: None,
     callee_binding: crate::parse::ast::CalleeBinding::Declared,
@@ -3168,6 +3172,9 @@ pub struct Function {
     /// An inlined body brings none either way: the call is made after the
     /// inliner, for the functions that remain.
     pub no_instrument: bool,
+    /// The function's type is `nocf_check`: under branch protection its
+    /// entry is no landing pad.
+    pub nocf_check: bool,
     /// `__attribute__((constructor))`: emit a pointer to this function in
     /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
     /// without a priority; `Some(Some(p))` carries one.
@@ -3228,6 +3235,7 @@ impl Default for Function {
             stack_protect: Default::default(),
             stack_protector: None,
             no_instrument: false,
+            nocf_check: false,
             constructor: None,
             destructor: None,
             is_inline: false,

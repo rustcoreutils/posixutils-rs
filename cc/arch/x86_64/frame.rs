@@ -295,7 +295,7 @@ impl X86_64CodeGen {
         } else {
             Vec::new()
         };
-        if self.indirect_entries.contains(&func.name) {
+        if self.base.landing_pads.entry(&func.name) {
             self.push_lir(X86Inst::Endbr64);
         }
         self.emit_profile_call(func, true);

@@ -611,6 +611,8 @@ struct CalleeSignature {
     variadic_arg_start: Option<usize>,
     /// The callee does not return.
     is_noreturn: bool,
+    /// The callee's type is `nocf_check`.
+    nocf_check: bool,
 }
 
 /// A call's lowered arguments: the values and, in step, the types the ABI
@@ -626,6 +628,7 @@ struct CallFacts {
     ends_with_va_arg_pack: bool,
     is_noreturn: bool,
     returns_twice: bool,
+    nocf_check: bool,
     /// Under `-fexceptions`, the callee may unwind through this frame.
     may_throw: bool,
     binding: crate::parse::ast::CalleeBinding,
@@ -2123,6 +2126,10 @@ impl<'a> Linearizer<'a> {
         ir_func.stack_protect = func.attrs.stack_protect;
         ir_func.stack_protector = func.attrs.stack_protector;
         ir_func.no_instrument = func.attrs.no_instrument;
+        ir_func.nocf_check = self
+            .symbols
+            .lookup(func.name, crate::symbol::Namespace::Ordinary)
+            .is_some_and(|s| self.types.get(s.typ).nocf_check);
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function
@@ -4426,6 +4433,7 @@ impl<'a> Linearizer<'a> {
             ends_with_va_arg_pack,
             is_noreturn: sig.is_noreturn,
             returns_twice: self.callee_returns_twice(func_expr),
+            nocf_check: sig.nocf_check,
             may_throw: self.exceptions && !self.callee_nothrow(func_expr),
             binding,
             known,
@@ -4629,6 +4637,7 @@ impl<'a> Linearizer<'a> {
             .filter(|ft| ft.variadic)
             .and_then(|ft| ft.params.as_ref().map(|p| p.len()));
         let is_noreturn = callee.is_some_and(|ft| ft.noreturn);
+        let nocf_check = callee.is_some_and(|ft| ft.nocf_check);
 
         CalleeSignature {
             conv,
@@ -4636,6 +4645,7 @@ impl<'a> Linearizer<'a> {
             unprototyped,
             variadic_arg_start,
             is_noreturn,
+            nocf_check,
         }
     }
 
@@ -4910,6 +4920,7 @@ impl<'a> Linearizer<'a> {
         extra.ends_with_va_arg_pack = facts.ends_with_va_arg_pack;
         extra.is_noreturn_call = facts.is_noreturn;
         extra.returns_twice_call = facts.returns_twice;
+        extra.nocf_check_call = facts.nocf_check;
         extra.callee_binding = facts.binding;
         extra.known = facts.known;
         extra.abi_info = Some(facts.abi_info);

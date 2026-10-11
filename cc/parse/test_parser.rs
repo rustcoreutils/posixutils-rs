@@ -9151,6 +9151,46 @@ fn test_calling_convention_conflicts() {
     assert_eq!(types.get(func).conv, crate::abi::CallingConv::C);
 }
 
+/// `nocf_check` under branch protection is placed as `ms_abi` is: on the
+/// declared function, on the function a declared pointer points at, through
+/// a typedef of either and `__typeof__`, and not on a pointer to a pointer.
+/// Without branch protection it is ignored and no type carries it.
+#[test]
+fn test_nocf_check_is_a_function_type_attribute() {
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let src = "__attribute__((nocf_check)) void f(void);\n\
+               void (*__attribute__((nocf_check)) p)(void);\n\
+               typedef void (*np)(void) __attribute__((nocf_check));\n\
+               np q;\n\
+               __typeof__(f) *r;\n\
+               void (**pp)(void) __attribute__((nocf_check));\n\
+               void g(void);\n";
+    let parse = |branch: bool| {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+        let tokens = tokenizer.tokenize();
+        let mut symbols = SymbolTable::new();
+        let mut types = TypeTable::new(&target);
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.set_cf_branch(branch);
+        parser.parse_translation_unit().unwrap();
+        let func_of = |name: &str| {
+            let id = strings.lookup(name).unwrap();
+            let mut t = symbols
+                .lookup(id, crate::symbol::Namespace::Ordinary)
+                .unwrap()
+                .typ;
+            while types.kind(t) != TypeKind::Function {
+                t = types.base_type(t).unwrap();
+            }
+            types.get(t).nocf_check
+        };
+        ["f", "p", "q", "r", "pp", "g"].map(func_of)
+    };
+    assert_eq!(parse(true), [true, true, true, true, false, false]);
+    assert_eq!(parse(false), [false; 6]);
+}
+
 /// On aarch64 neither attribute exists, as for gcc there: the type keeps the
 /// native convention.
 #[test]

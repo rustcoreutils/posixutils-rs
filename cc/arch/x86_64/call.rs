@@ -1422,9 +1422,14 @@ impl X86_64CodeGen {
             .base
             .eh_call_begin(insn, CallArgsArea::Fixed(args_size as i64));
         if insn.extra().indirect_target.is_some() {
-            self.push_lir(X86Inst::Call {
-                target: CallTarget::Indirect(Reg::R11),
-            });
+            // A callee whose type is `nocf_check` has no `endbr64` to land on.
+            if self.base.landing_pads.active() && insn.extra().nocf_check_call {
+                self.push_lir(X86Inst::NotrackCall { reg: Reg::R11 });
+            } else {
+                self.push_lir(X86Inst::Call {
+                    target: CallTarget::Indirect(Reg::R11),
+                });
+            }
             self.base.eh_call_end(site);
         } else {
             let sym = Symbol::global(func_name.to_string());
@@ -1438,7 +1443,7 @@ impl X86_64CodeGen {
             // The second return of a function that returns twice comes by
             // an indirect jump, so under branch protection it lands on
             // `endbr64`, which gcc keeps inside the call's call-site entry.
-            if self.base.cf_protection.branch && insn.returns_twice() {
+            if self.base.landing_pads.active() && insn.returns_twice() {
                 self.push_lir(X86Inst::Endbr64);
             }
             self.base.eh_call_end(site);

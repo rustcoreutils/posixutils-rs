@@ -149,8 +149,8 @@ pub struct CodeGenBase<I: LirInst> {
     pub tls: crate::target::TlsPolicy,
     /// `-fverbose-asm`: annotate the generated instructions.
     pub verbose_asm: bool,
-    /// `-fcf-protection`, which only x86-64's `__builtin_setjmp` and
-    /// `__builtin_longjmp` read.
+    /// `-fcf-protection`, which only x86-64 reads: for its landing pads, and
+    /// the layout of `__builtin_setjmp`'s buffer.
     pub cf_protection: crate::target::CfProtection,
     /// `-fstack-clash-protection` and its `--param`s; see
     /// [`CodeGenBase::check_stack_clash`].
@@ -188,6 +188,11 @@ pub struct CodeGenBase<I: LirInst> {
     pub layout: crate::target::ObjectLayout,
     /// The `-fexceptions` tables: the LSDAs and what they name.
     pub eh: super::eh::EhTables,
+    /// Whether the unit is optimized, which decides with what certainty a
+    /// static function is known to be called only directly.
+    pub optimizing: bool,
+    /// Under branch protection, where an indirect branch may land.
+    pub landing_pads: super::landing_pads::LandingPads,
 }
 
 /// `-fdata-sections`' own section for `global`, named as gcc names it:
@@ -248,6 +253,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             binds_locally: std::collections::HashSet::new(),
             layout: Default::default(),
             eh: Default::default(),
+            optimizing: false,
+            landing_pads: Default::default(),
         }
     }
 
@@ -1650,9 +1657,9 @@ pub trait CodeGenerator {
     /// (`arch::mapping::call_profiler`), and ignores this.
     fn set_profiling(&mut self, _profiling: Option<crate::target::Profiling>) {}
 
-    /// Say whether the unit is optimized. A target with CET reads it: as in
-    /// gcc, only optimization finds a static function needs no `endbr64`.
-    fn set_optimizing(&mut self, _on: bool) {}
+    /// Say whether the unit is optimized. Branch protection reads it: as in
+    /// gcc, only optimization finds a static function needs no landing pad.
+    fn set_optimizing(&mut self, on: bool);
 
     /// Set `-ffunction-sections`, `-fdata-sections`, `-fcommon` and
     /// `-fno-plt`.

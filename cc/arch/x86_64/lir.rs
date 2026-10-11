@@ -649,6 +649,12 @@ pub enum X86Inst {
     /// CALL - Function call
     Call { target: CallTarget<Reg> },
 
+    /// `notrack call *reg` -- an indirect call whose callee's type is
+    /// `nocf_check`, which under branch protection asks the processor for no
+    /// `endbr64` where it lands. Its own instruction because only a call
+    /// through a register can be one.
+    NotrackCall { reg: Reg },
+
     /// `call *sym@TLSCALL(%rax)` - invoke a TLS descriptor resolver.
     ///
     /// Its own instruction rather than a `CallTarget`, because the operand is
@@ -1205,6 +1211,10 @@ impl EmitAsm for X86Inst {
                     let _ = writeln!(out, "    call *{}", reg.name64());
                 }
             },
+
+            X86Inst::NotrackCall { reg } => {
+                let _ = writeln!(out, "    notrack call *{}", reg.name64());
+            }
 
             X86Inst::Ret => {
                 let _ = writeln!(out, "    ret");

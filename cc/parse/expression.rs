@@ -535,6 +535,12 @@ impl<'a> Parser<'a> {
             );
             return then_typ;
         }
+        // Arrays whose elements differ only in qualifiers meet as C2x has
+        // it, in the array qualified with both, and only `-pedantic` says
+        // that C17 calls them different types.
+        if self.types.arrays_differ_in_qualifiers_only(tp, ep) {
+            super::expr_check::pedwarn_qualified_arrays(pos);
+        }
         let quals =
             self.types.qualifiers_through_arrays(tp) | self.types.qualifiers_through_arrays(ep);
         let (tp, ep) = (

@@ -209,3 +209,33 @@ fn conditional_with_one_void_arm_is_pedantic_only() {
     let c = crate::test_compile::compile("void_arm_errors", src, &["-pedantic-errors"]);
     assert!(!c.success, "{}", c.stderr);
 }
+
+/// Pointers to arrays whose elements differ only in qualifiers meet in a
+/// pointer to the array qualified with both, as in C2x and gcc; only
+/// `-pedantic` objects, at the `:`, that C17 calls them different types.
+#[test]
+fn conditional_pointers_to_differently_qualified_arrays() {
+    let src = "int c; int *p, *q;\n\
+               void f(void) {\n\
+               __typeof__(c ? (int (*)[3])p : (const int (*)[3])q) a = 0;\n\
+               _Static_assert(_Generic(a, const int (*)[3]: 1, default: 0), \"a\");\n\
+               __typeof__(c ? (volatile int (*)[3])p : (const int (*)[3])q) b = 0;\n\
+               _Static_assert(_Generic(b, const volatile int (*)[3]: 1, default: 0), \"b\");\n\
+               (void)(c ? (const int (*)[3])p : (int (*)[3])q);\n\
+               (void)a; (void)b;\n\
+               }\n";
+    const MSG: &str = "invalid use of pointers to arrays with different qualifiers in ISO C \
+                       before C2X [-Wpedantic]";
+    let quiet = crate::test_compile::compile_warnings("cond_qual_arrays", src, &[]);
+    assert!(quiet.is_empty(), "{quiet:#?}");
+    let loud = crate::test_compile::compile_warnings("cond_qual_arrays_p", src, &["-pedantic"]);
+    assert_eq!(
+        loud,
+        [
+            format!("3:30: {MSG}"),
+            format!("5:39: {MSG}"),
+            format!("7:32: {MSG}"),
+        ],
+        "{loud:#?}"
+    );
+}

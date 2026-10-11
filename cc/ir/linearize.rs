@@ -866,6 +866,11 @@ pub struct Linearizer<'a> {
     /// is emitted even where its answer is known. `-fno-trapping-math` turns
     /// it off.
     pub(crate) trapping_math: bool,
+    /// The rounding direction a constant the linearizer folds may assume:
+    /// to nearest, or under `-frounding-math` whatever `fesetround` set, when
+    /// only an exact result is a constant. Recorded on every function for
+    /// the optimizer's folds too ([`Function::fp_rounding`]).
+    pub(crate) fp_rounding: crate::float::FpRounding,
     /// `-fexceptions`: a call that may throw inside the scope of a `cleanup`
     /// variable gets a landing pad that runs the cleanup when the frame is
     /// unwound. See [`super::linearize_cleanup`].
@@ -948,6 +953,7 @@ impl<'a> Linearizer<'a> {
             section_definitions: HashMap::new(),
             defined_functions: std::collections::HashSet::new(),
             trapping_math: true,
+            fp_rounding: Default::default(),
             exceptions: false,
             unwind: Default::default(),
             isa: target.x86_isa,
@@ -2036,6 +2042,7 @@ impl<'a> Linearizer<'a> {
             .as_ref()
             .map_or_else(|| self.function_isa(func.attrs.target.as_ref()), |v| v.isa);
         self.isa = ir_func.isa;
+        ir_func.fp_rounding = self.fp_rounding;
 
         // Whether this is an *inline definition*, which provides no external
         // definition and so must not be emitted.
@@ -7479,6 +7486,8 @@ pub struct LinearizeOptions {
     pub debug: bool,
     /// `-ftrapping-math`, the default; see [`Linearizer::trapping_math`].
     pub trapping_math: bool,
+    /// `-frounding-math`; see [`Linearizer::fp_rounding`].
+    pub fp_rounding: crate::float::FpRounding,
     /// `-fexceptions`; see [`Linearizer::exceptions`].
     pub exceptions: bool,
 }
@@ -7488,6 +7497,7 @@ impl Default for LinearizeOptions {
         Self {
             debug: false,
             trapping_math: true,
+            fp_rounding: Default::default(),
             exceptions: false,
         }
     }
@@ -7503,6 +7513,7 @@ pub fn linearize(
 ) -> Module {
     let mut linearizer = Linearizer::new(symbols, types, strings, target);
     linearizer.trapping_math = opts.trapping_math;
+    linearizer.fp_rounding = opts.fp_rounding;
     linearizer.exceptions = opts.exceptions;
     let mut module = linearizer.linearize(tu);
     module.debug = opts.debug;

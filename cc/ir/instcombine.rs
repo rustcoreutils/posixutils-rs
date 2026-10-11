@@ -744,7 +744,7 @@ fn simplify_fbinop(
     let a = consts.fget(insn.src[0], width)?;
     let b = consts.fget(insn.src[1], width)?;
     let fmt = facts.fp_format(insn.typ)?;
-    eval_fbinop(insn.op, fmt, a, b).map(Simplification::FoldToFloat)
+    eval_fbinop(insn.op, fmt, a, b, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
 
 /// Fold `Fma` of three constants.
@@ -760,7 +760,7 @@ fn simplify_fternop(
     let a = consts.fget(*a, width)?;
     let b = consts.fget(*b, width)?;
     let c = consts.fget(*c, width)?;
-    eval_fternop(insn.op, fmt, a, b, c).map(Simplification::FoldToFloat)
+    eval_fternop(insn.op, fmt, a, b, c, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
 
 /// Fold `FNeg` of a constant.
@@ -778,7 +778,7 @@ fn simplify_funop(
     }
     let a = consts.fget(insn.src[0], insn.size.max(1))?;
     let fmt = facts.fp_format(insn.typ)?;
-    eval_funop(insn.op, fmt, a).map(Simplification::FoldToFloat)
+    eval_funop(insn.op, fmt, a, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
 
 /// Fold a float-to-float conversion of a constant, to `typ`'s format.
@@ -793,7 +793,8 @@ fn simplify_fcvtf(
     let a = consts.fget(insn.src[0], insn.operand_width())?;
     let src_fmt = facts.fp_format(insn.operand_type())?;
     let dst_fmt = facts.fp_format(insn.typ)?;
-    eval_fcvtf(insn.op, src_fmt, dst_fmt, a).map(Simplification::FoldToFloat)
+    eval_fcvtf(insn.op, src_fmt, dst_fmt, a, facts.func.fp_rounding)
+        .map(Simplification::FoldToFloat)
 }
 
 /// Fold a float-to-integer conversion of a constant, or a `Signbit` of one,

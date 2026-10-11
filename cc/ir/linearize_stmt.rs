@@ -3994,6 +3994,10 @@ impl JumpScopeWalk {
 /// [`crate::constexpr`] owns the walk; what differs from the parser's half is
 /// the `const`-object folding gcc performs in a static initializer.
 impl crate::constexpr::ConstEnv for Linearizer<'_> {
+    fn fp_rounding(&self) -> crate::float::FpRounding {
+        self.fp_rounding
+    }
+
     /// A static initializer needs an answer; the linearizer's other folds --
     /// a constant `?:` condition, chiefly -- are optimizations, and one of
     /// those is exactly the shape `__builtin_constant_p` is written in.

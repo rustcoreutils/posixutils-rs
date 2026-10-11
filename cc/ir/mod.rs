@@ -3115,6 +3115,12 @@ pub struct Function {
     /// version asks. What the linearizer and the backend both read; set
     /// once, by `Linearizer::linearize_function`. The baseline elsewhere.
     pub isa: crate::target::X86Isa,
+    /// The rounding direction the optimizer may assume when it folds this
+    /// function's floating-point operations: to nearest, or under
+    /// `-frounding-math` whatever `fesetround` set. Set once, by
+    /// `Linearizer::linearize_function`; an inlined body takes its caller's,
+    /// which is the translation unit's too.
+    pub fp_rounding: crate::float::FpRounding,
     /// `__attribute__((pure))` / `((const))`, as written.
     ///
     /// The programmer's promise, kept separate from anything `ir/effects.rs`
@@ -3216,6 +3222,7 @@ impl Default for Function {
             conv: CallingConv::C,
             is_noinline: false,
             isa: Default::default(),
+            fp_rounding: Default::default(),
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,
             stack_protect: Default::default(),

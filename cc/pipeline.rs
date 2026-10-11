@@ -70,6 +70,8 @@ pub struct CodegenOptions<'a> {
     pub debug: bool,
     /// `-ftrapping-math` (the default) rather than `-fno-trapping-math`.
     pub trapping_math: bool,
+    /// `-frounding-math` (dynamic) rather than `-fno-rounding-math`.
+    pub fp_rounding: crate::float::FpRounding,
     /// `-fvisibility=`.
     pub default_visibility: Option<&'a str>,
     /// What thread-local accesses may assume: whether the code is for a
@@ -211,6 +213,7 @@ pub fn compile_tokens(
         ir::linearize::LinearizeOptions {
             debug: opts.debug,
             trapping_math: opts.trapping_math,
+            fp_rounding: opts.fp_rounding,
             exceptions: opts.exceptions,
         },
     );

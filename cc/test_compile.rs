@@ -65,6 +65,7 @@ struct Options {
     profile: bool,
     math_errno: bool,
     trapping_math: bool,
+    fp_rounding: crate::float::FpRounding,
     defines: Vec<String>,
     undefines: Vec<String>,
     include_paths: Vec<String>,
@@ -124,6 +125,7 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-fmath-errno" => o.math_errno = true,
             "-fno-math-errno" => o.math_errno = false,
             "-fno-trapping-math" => o.trapping_math = false,
+            "-frounding-math" => o.fp_rounding = crate::float::FpRounding::Dynamic,
             "-fno-inline" => o.inlining = Some(false),
             "-finline" => o.inlining = Some(true),
             "-fsigned-char" | "-fno-unsigned-char" => {
@@ -241,6 +243,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         math_errno: o.math_errno,
         debug: o.debug,
         trapping_math: o.trapping_math,
+        fp_rounding: o.fp_rounding,
         default_visibility: None,
         tls: target::TlsPolicy {
             shared_code: o.shared || position.is_shared_code(),

@@ -65,6 +65,47 @@ pub enum IntegralRounding {
     RoundEven,
 }
 
+/// The rounding direction a floating-point operation folded at translation
+/// time may assume.
+///
+/// C's default is to nearest, and a program may change it only with
+/// `#pragma STDC FENV_ACCESS ON` (7.6.1p2), which c17 does not take; gcc
+/// assumes it unless told `-frounding-math`. A static initializer is
+/// evaluated as if at translation time (F.8.5), where the direction is
+/// always to nearest, so it does not ask this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FpRounding {
+    /// `-fno-rounding-math`, the default: every operation rounds to nearest.
+    #[default]
+    ToNearest,
+    /// `-frounding-math`: the direction is whatever `fesetround` last set,
+    /// so a result is a constant only when every direction gives it.
+    Dynamic,
+}
+
+/// An operation's result, rounded to nearest, and whether every rounding
+/// direction gives that same result.
+#[derive(Clone, Copy, Debug)]
+pub struct Rounded {
+    pub value: FloatVal,
+    /// Nothing was rounded away, and no rounding direction picked the sign
+    /// of a zero: `x - x` is `-0` rounding downward.
+    pub exact: bool,
+}
+
+impl Rounded {
+    /// A result that needed no rounding.
+    pub(crate) fn exact(value: FloatVal) -> Self {
+        Rounded { value, exact: true }
+    }
+
+    /// The result as a constant under `rounding`: always to nearest, and
+    /// under a dynamic direction only when it is exact.
+    pub fn under(self, rounding: FpRounding) -> Option<FloatVal> {
+        (self.exact || rounding == FpRounding::ToNearest).then_some(self.value)
+    }
+}
+
 /// Which of the two kinds of NaN a value is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NanKind {
@@ -1257,13 +1298,20 @@ impl FloatVal {
     /// than turned into an infinity; no NaN c17 builds has that shape, since
     /// each is built in the format of its own type.
     pub fn round_to_format(self, fmt: FpFormat) -> Self {
+        self.rounded_to_format(fmt).value
+    }
+
+    /// [`Self::round_to_format`], saying whether the value was already one
+    /// `fmt` holds. A NaN's payload is not a value: losing some of it is
+    /// exact.
+    pub fn rounded_to_format(self, fmt: FpFormat) -> Rounded {
         if self.is_nan() {
             let kept = self.sig & !((1u128 << (SIG_BITS - fmt.precision())) - 1);
             let nan = FloatVal { sig: kept, ..self };
-            return if nan.is_nan() { nan } else { self.quieted() };
+            return Rounded::exact(if nan.is_nan() { nan } else { self.quieted() });
         }
         if self.exp == EXP_SPECIAL || self.is_zero() {
-            return self;
+            return Rounded::exact(self);
         }
         let (sig, exp2) = self.scaled();
         Self::round_wide(self.neg, U256::scaled127(sig), exp2 - 127, false, fmt)
@@ -1285,11 +1333,18 @@ impl FloatVal {
     /// appends zeros. Converting to the same format is no conversion at all
     /// and leaves a signalling NaN signalling.
     pub fn convert(self, src: FpFormat, dst: FpFormat) -> Self {
+        self.convert_rounded(src, dst).value
+    }
+
+    /// [`Self::convert`], saying whether `dst` holds the value `src` does:
+    /// the first rounding gives the value the program has, and only the
+    /// conversion is the program's.
+    pub fn convert_rounded(self, src: FpFormat, dst: FpFormat) -> Rounded {
         let v = self.round_to_format(src);
         if src == dst {
-            return v;
+            return Rounded::exact(v);
         }
-        v.quieted().round_to_format(dst)
+        v.quieted().rounded_to_format(dst)
     }
 
     /// The NaN an arithmetic operation on `a` and `b` gives when either of
@@ -1303,45 +1358,55 @@ impl FloatVal {
 
     /// `self + other`, rounded once to `fmt`.
     pub fn add(self, other: Self, fmt: FpFormat) -> Self {
-        self.add_rounded(other, fmt)
+        self.add_rounded(other, fmt).value
     }
 
     /// `self - other`, rounded once to `fmt`.
     pub fn sub(self, other: Self, fmt: FpFormat) -> Self {
+        self.sub_rounded(other, fmt).value
+    }
+
+    /// [`Self::sub`], saying whether it is exact.
+    pub fn sub_rounded(self, other: Self, fmt: FpFormat) -> Rounded {
         // A NaN subtrahend comes out with its own sign: the subtraction does
         // not negate it, so it is taken out before the negation below.
         let (a, b) = (self.round_to_format(fmt), other.round_to_format(fmt));
         if let Some(nan) = Self::propagated_nan(a, b) {
-            return nan;
+            return Rounded::exact(nan);
         }
         a.add_rounded(b.negated(), fmt)
     }
 
-    /// The common core of `add` and `sub`: `sub` negates first, since
-    /// `a - b` and `a + (-b)` are the same in every rounding mode.
-    fn add_rounded(self, other: Self, fmt: FpFormat) -> Self {
+    /// [`Self::add`], saying whether it is exact; the common core of `add`
+    /// and `sub`: `sub` negates first, since `a - b` and `a + (-b)` are the
+    /// same in every rounding mode.
+    pub fn add_rounded(self, other: Self, fmt: FpFormat) -> Rounded {
         let a = self.round_to_format(fmt);
         let b = other.round_to_format(fmt);
 
         if let Some(nan) = Self::propagated_nan(a, b) {
-            return nan;
+            return Rounded::exact(nan);
         }
         if a.is_infinite() || b.is_infinite() {
             // Infinities of opposite sign have no defined difference.
             if a.is_infinite() && b.is_infinite() && a.neg != b.neg {
-                return Self::nan();
+                return Rounded::exact(Self::nan());
             }
-            return if a.is_infinite() { a } else { b };
+            return Rounded::exact(if a.is_infinite() { a } else { b });
         }
         if a.is_zero() && b.is_zero() {
-            // Round to nearest gives +0 unless both addends are -0.
-            return Self::signed_zero(a.neg && b.neg);
+            // Round to nearest gives +0 unless both addends are -0; rounding
+            // downward, -0 unless both are +0.
+            return Rounded {
+                value: Self::signed_zero(a.neg && b.neg),
+                exact: a.neg == b.neg,
+            };
         }
         if a.is_zero() {
-            return b;
+            return Rounded::exact(b);
         }
         if b.is_zero() {
-            return a;
+            return Rounded::exact(a);
         }
 
         let (sig_a, exp_a) = a.scaled();
@@ -1365,7 +1430,13 @@ impl FloatVal {
         let (big, small, big_lost, small_lost, neg) = match wa.cmp(&wb) {
             std::cmp::Ordering::Greater => (wa, wb, lost_a, lost_b, a.neg),
             std::cmp::Ordering::Less => (wb, wa, lost_b, lost_a, b.neg),
-            std::cmp::Ordering::Equal => return Self::ZERO,
+            // `+0` rounding to nearest, `-0` rounding downward.
+            std::cmp::Ordering::Equal => {
+                return Rounded {
+                    value: Self::ZERO,
+                    exact: false,
+                }
+            }
         };
         let diff = big.sub(small);
         let (w, sticky) = if big_lost {
@@ -1384,21 +1455,26 @@ impl FloatVal {
 
     /// `self * other`, rounded once to `fmt`.
     pub fn mul(self, other: Self, fmt: FpFormat) -> Self {
+        self.mul_rounded(other, fmt).value
+    }
+
+    /// [`Self::mul`], saying whether it is exact.
+    pub fn mul_rounded(self, other: Self, fmt: FpFormat) -> Rounded {
         let a = self.round_to_format(fmt);
         let b = other.round_to_format(fmt);
 
         if let Some(nan) = Self::propagated_nan(a, b) {
-            return nan;
+            return Rounded::exact(nan);
         }
         let neg = a.neg != b.neg;
         if a.is_infinite() || b.is_infinite() {
             if a.is_zero() || b.is_zero() {
-                return Self::nan();
+                return Rounded::exact(Self::nan());
             }
-            return Self::infinity(neg);
+            return Rounded::exact(Self::infinity(neg));
         }
         if a.is_zero() || b.is_zero() {
-            return Self::signed_zero(neg);
+            return Rounded::exact(Self::signed_zero(neg));
         }
 
         let (sig_a, exp_a) = a.scaled();
@@ -1410,32 +1486,37 @@ impl FloatVal {
 
     /// `self / other`, rounded once to `fmt`.
     pub fn div(self, other: Self, fmt: FpFormat) -> Self {
+        self.div_rounded(other, fmt).value
+    }
+
+    /// [`Self::div`], saying whether it is exact.
+    pub fn div_rounded(self, other: Self, fmt: FpFormat) -> Rounded {
         let a = self.round_to_format(fmt);
         let b = other.round_to_format(fmt);
 
         if let Some(nan) = Self::propagated_nan(a, b) {
-            return nan;
+            return Rounded::exact(nan);
         }
         let neg = a.neg != b.neg;
         if a.is_infinite() {
-            return if b.is_infinite() {
+            return Rounded::exact(if b.is_infinite() {
                 Self::nan()
             } else {
                 Self::infinity(neg)
-            };
+            });
         }
         if b.is_infinite() {
-            return Self::signed_zero(neg);
+            return Rounded::exact(Self::signed_zero(neg));
         }
         if b.is_zero() {
-            return if a.is_zero() {
+            return Rounded::exact(if a.is_zero() {
                 Self::nan()
             } else {
                 Self::infinity(neg)
-            };
+            });
         }
         if a.is_zero() {
-            return Self::signed_zero(neg);
+            return Rounded::exact(Self::signed_zero(neg));
         }
 
         let (sig_a, exp_a) = a.scaled();
@@ -1470,18 +1551,23 @@ impl FloatVal {
     /// which is more than any format keeps, and a remainder is the sticky bit
     /// that settles a tie -- though a square root is never exactly half way.
     pub fn sqrt(self, fmt: FpFormat) -> Option<Self> {
+        self.sqrt_rounded(fmt).map(|r| r.value)
+    }
+
+    /// [`Self::sqrt`], saying whether it is exact.
+    pub fn sqrt_rounded(self, fmt: FpFormat) -> Option<Rounded> {
         let a = self.round_to_format(fmt);
         if a.is_nan() {
-            return (!a.is_signalling_nan()).then_some(a);
+            return (!a.is_signalling_nan()).then_some(Rounded::exact(a));
         }
         if a.is_zero() {
-            return Some(a);
+            return Some(Rounded::exact(a));
         }
         if a.neg {
             return None;
         }
         if a.is_infinite() {
-            return Some(a);
+            return Some(Rounded::exact(a));
         }
         // The value is `sig * 2^exp2`. Shifting `sig` up by 127 or 128 bits,
         // whichever leaves an even exponent, halves that exponent exactly.
@@ -1551,6 +1637,11 @@ impl FloatVal {
     /// a result that overflows -- the cases that raise, which arithmetic
     /// leaves to run time too.
     pub fn fma(self, y: Self, z: Self, fmt: FpFormat) -> Option<Self> {
+        self.fma_rounded(y, z, fmt).map(|r| r.value)
+    }
+
+    /// [`Self::fma`], saying whether it is exact.
+    pub fn fma_rounded(self, y: Self, z: Self, fmt: FpFormat) -> Option<Rounded> {
         let (a, b, c) = (
             self.round_to_format(fmt),
             y.round_to_format(fmt),
@@ -1562,10 +1653,14 @@ impl FloatVal {
         let neg_p = a.neg != b.neg;
         let r = if a.is_zero() || b.is_zero() {
             if c.is_zero() {
-                // Round to nearest gives +0 unless both addends are -0.
-                Self::signed_zero(neg_p && c.neg)
+                // Round to nearest gives +0 unless both addends are -0, as
+                // in `add_rounded`.
+                Rounded {
+                    value: Self::signed_zero(neg_p && c.neg),
+                    exact: neg_p == c.neg,
+                }
             } else {
-                c
+                Rounded::exact(c)
             }
         } else {
             let (sa, ea) = a.scaled();
@@ -1582,7 +1677,7 @@ impl FloatVal {
                 )
             }
         };
-        r.is_finite().then_some(r)
+        r.value.is_finite().then_some(r)
     }
 
     /// `p + c` for two nonzero values each `(sign, magnitude, exponent of its
@@ -1594,7 +1689,7 @@ impl FloatVal {
     /// is at least 28 bits below the larger's leading bit, far enough that a
     /// sticky bit in its place rounds exactly as the lost bits would (see
     /// `add_rounded`).
-    fn sum_exact(p: (bool, U256, i32), c: (bool, U256, i32), fmt: FpFormat) -> Self {
+    fn sum_exact(p: (bool, U256, i32), c: (bool, U256, i32), fmt: FpFormat) -> Rounded {
         // Trailing zeros cost nothing to drop, and dropping them leaves each
         // magnitude at most 226 bits: no format has more than 113.
         let trim = |(neg, m, e): (bool, U256, i32)| {
@@ -1620,8 +1715,13 @@ impl FloatVal {
             std::cmp::Ordering::Greater => (pm, cm, cl, pn),
             std::cmp::Ordering::Less => (cm, pm, pl, cn),
             // Only an exact tie cancels to zero: a lossy operand is far below
-            // the other.
-            std::cmp::Ordering::Equal => return Self::ZERO,
+            // the other. `+0` rounding to nearest, `-0` rounding downward.
+            std::cmp::Ordering::Equal => {
+                return Rounded {
+                    value: Self::ZERO,
+                    exact: false,
+                }
+            }
         };
         let diff = big.sub(small);
         // A lossy smaller operand is truly a little above `small`, so the
@@ -1688,10 +1788,14 @@ impl FloatVal {
     /// Round `w * 2^scale` to `fmt`, once, to nearest with ties to even.
     ///
     /// `sticky` says that a non-zero value smaller than `w`'s low bit was
-    /// discarded on the way here, which decides a tie and nothing else.
-    fn round_wide(neg: bool, w: U256, scale: i32, sticky: bool, fmt: FpFormat) -> Self {
+    /// discarded on the way here, which decides a tie, and makes the result
+    /// inexact.
+    fn round_wide(neg: bool, w: U256, scale: i32, sticky: bool, fmt: FpFormat) -> Rounded {
         if w.is_zero() {
-            return Self::signed_zero(neg);
+            return Rounded {
+                value: Self::signed_zero(neg),
+                exact: !sticky,
+            };
         }
 
         let msb = 255 - w.leading_zeros() as i32;
@@ -1707,6 +1811,7 @@ impl FloatVal {
 
         let drop = last.max(0) as u32;
         let kept = w.shr(drop);
+        let exact = !sticky && kept.shl(drop) == w;
         let round_up = if drop == 0 {
             // Nothing is being discarded here; a sticky from further back is
             // below half an ulp on its own.
@@ -1732,15 +1837,25 @@ impl FloatVal {
         // `kept` holds at most `precision` bits, plus one if rounding carried,
         // so it always fits the significand this type is built from.
         debug_assert!(kept.hi == 0, "rounded significand wider than 128 bits");
+        // Every bit of a non-zero `w` dropped: never exact.
         if kept.lo == 0 {
-            return Self::signed_zero(neg);
+            return Rounded {
+                value: Self::signed_zero(neg),
+                exact,
+            };
         }
 
         let exp2 = scale + drop as i32;
         if 127 - kept.lo.leading_zeros() as i32 + exp2 > fmt.emax() {
-            return Self::infinity(neg);
+            return Rounded {
+                value: Self::infinity(neg),
+                exact: false,
+            };
         }
-        Self::from_parts(neg, kept.lo, exp2)
+        Rounded {
+            value: Self::from_parts(neg, kept.lo, exp2),
+            exact,
+        }
     }
 }
 

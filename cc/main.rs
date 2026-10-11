@@ -15,6 +15,7 @@ use posixutils_cc::aux_info;
 use posixutils_cc::builtins;
 use posixutils_cc::diag;
 use posixutils_cc::f_options::{self, Effect};
+use posixutils_cc::float;
 use posixutils_cc::ir;
 use posixutils_cc::linkargs;
 use posixutils_cc::opt;
@@ -479,6 +480,15 @@ struct Args {
     /// be folded although a NaN `x` would have raised `FE_INVALID`.
     #[arg(long = "fno-trapping-math", help = gettext("Assume floating-point operations do not raise exceptions the program observes"))]
     fno_trapping_math: bool,
+
+    /// `-frounding-math`: the program may change the rounding direction, so
+    /// only an exact floating-point result is folded.
+    #[arg(long = "frounding-math", help = gettext("Fold no floating-point operation whose result depends on the rounding direction"))]
+    frounding_math: bool,
+
+    /// Undo `-frounding-math`: the default.
+    #[arg(long = "fno-rounding-math", overrides_with = "frounding_math", help = gettext("Assume the default rounding direction (default)"))]
+    fno_rounding_math: bool,
 
     /// Undo `-fno-trapping-math`: the default. Accepted so the last flag on
     /// the line wins.
@@ -1478,6 +1488,11 @@ fn process_file(
         math_errno: !args.fno_math_errno,
         debug: args.debug > 0,
         trapping_math: !args.fno_trapping_math,
+        fp_rounding: if args.frounding_math {
+            float::FpRounding::Dynamic
+        } else {
+            float::FpRounding::ToNearest
+        },
         default_visibility: args.default_visibility.as_deref(),
         tls,
         pic: producing_shared(args) || position.is_pic(),
@@ -1958,12 +1973,15 @@ const GCC_ONE_DASH_LONG: &[&str] = &[
     "-fno-diagnostics-show-option",
     "-fno-gnu89-inline",
     "-fno-math-errno",
+    "-fno-rounding-math",
     "-fno-trapping-math",
     "-fpermissive",
+    "-frounding-math",
     "-fsyntax-only",
     "-ftrapping-math",
     "-fverbose-asm",
     "-idirafter",
+    "-imacros",
     "-include",
     "-iquote",
     "-isystem",

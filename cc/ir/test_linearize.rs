@@ -1460,6 +1460,7 @@ fn linearize_source_with(
         super::LinearizeOptions {
             debug: false,
             trapping_math,
+            fp_rounding: Default::default(),
             exceptions,
         },
     );

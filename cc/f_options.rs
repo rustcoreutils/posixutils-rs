@@ -220,6 +220,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-plt", Accepted(Pass)),
     ("no-printf-return-value", Accepted(Pass)),
     ("no-reorder-blocks-and-partition", Accepted(Pass)),
+    ("no-rounding-math", Implemented),
     ("no-rtti", CXX_D_OBJCXX),
     (
         "no-sanitize-address-use-after-scope",
@@ -289,6 +290,8 @@ const PLAIN: &[(&str, Effect)] = &[
     // No instrumentation, so no `.gcda` profile is written.
     ("profile-generate", Unsupported),
     ("profile-use", Accepted(Pass)),
+    // Main driver: only an exact floating-point result is folded.
+    ("rounding-math", Implemented),
     ("rtti", CXX_D_OBJCXX),
     (
         "sanitize-address-use-after-scope",

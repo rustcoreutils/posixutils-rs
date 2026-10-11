@@ -30,9 +30,9 @@
 //
 
 use super::{CallSite, Folded};
-use crate::float::FloatVal;
 #[cfg(test)]
 use crate::float::{ComplexDivision, ComplexRoutineFormat, Contraction};
+use crate::float::{FloatVal, FpRounding};
 use crate::ir::build::Builder;
 use crate::ir::Instruction;
 use crate::parse::ast::LibFn;
@@ -43,6 +43,11 @@ use crate::target::{Arch, Os, Target};
 /// (`DivComplex`) computes, when its four halves are finite constants and so
 /// is its result.
 pub(super) fn fold(known: LibFn, insn: &Instruction, facts: &CallSite) -> Option<Folded> {
+    // Under `-frounding-math` the routine's products and quotients round in
+    // the direction in force when it runs, which no fold knows.
+    if facts.func.fp_rounding == FpRounding::Dynamic {
+        return None;
+    }
     // The halves are the last four arguments: a hidden pointer to the
     // result, where the ABI returns it through one, comes first.
     let first = insn.src.len().checked_sub(4)?;

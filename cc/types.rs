@@ -4137,6 +4137,33 @@ impl TypeTable {
         }
     }
 
+    /// Are `a` and `b` -- the targets of two pointers -- array types that are
+    /// compatible but for the qualifiers of their elements? C2x makes an
+    /// array exactly as qualified as its element type (6.2.5p28), so gcc
+    /// takes `char (*)[19]` and `const char (*)[19]` as pointers to
+    /// differently qualified versions of one type: they subtract and compare,
+    /// and only `-pedantic` objects, since C17 calls the arrays different
+    /// types.
+    pub fn arrays_differ_in_qualifiers_only(&self, a: TypeId, b: TypeId) -> bool {
+        self.kind(a) == TypeKind::Array
+            && self.kind(b) == TypeKind::Array
+            && !self.types_compatible(a, b)
+            && self.compatible_through_array_qualifiers(a, b)
+    }
+
+    /// [`Self::types_compatible`], with the qualifiers of array elements set
+    /// aside at every level of array derivation.
+    fn compatible_through_array_qualifiers(&self, a: TypeId, b: TypeId) -> bool {
+        if self.kind(a) != TypeKind::Array || self.kind(b) != TypeKind::Array {
+            return self.types_compatible(a, b);
+        }
+        self.get(a).compatible_ignoring_base(self.get(b))
+            && match (self.base_type(a), self.base_type(b)) {
+                (Some(x), Some(y)) => self.compatible_through_array_qualifiers(x, y),
+                _ => false,
+            }
+    }
+
     /// The unqualified version of `id`, where an array's qualifiers are its
     /// element type's: the inverse of [`Self::qualified_with`], which puts a
     /// qualifier of an array on its elements.

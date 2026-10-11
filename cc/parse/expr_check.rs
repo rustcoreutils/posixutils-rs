@@ -584,6 +584,17 @@ impl Parser<'_> {
                 );
                 true
             }
+            OperandVerdict::QualifiedArrays => {
+                diag::pedwarn(
+                    pos,
+                    &gettext(
+                        "invalid use of pointers to arrays with different qualifiers \
+                         in ISO C before C2X",
+                    ),
+                );
+                !matches!(op, BinaryOp::Sub)
+                    || (self.check_pointer_steps(lt, pos) && self.check_pointer_steps(rt, pos))
+            }
         }
     }
 

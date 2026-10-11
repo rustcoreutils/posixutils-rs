@@ -145,6 +145,9 @@ Language and preprocessor additions:
    The integer form `2i`, which gcc types `_Complex int`, is not accepted.
  * Clang nullability qualifiers `_Nonnull`, `_Nullable`, `_Null_unspecified`
    and their `__` spellings.
+ * Pointers to arrays whose elements differ only in qualifiers subtract and
+   compare (C2x's rule, which gcc applies): glibc's nss subtracts a
+   `const char (*)[N]` from a `char (*)[N]`.  `-pedantic` warns.
  * `(size_t)&((T *)0)->m`, the offsetof spelling from before `<stddef.h>`,
    and `&*(T *)0`, are constant expressions, through `->`, `.`, `*` and
    `[]` alike, as in gcc: the Linux kernel's sysrq.c puts

@@ -10053,6 +10053,55 @@ fn binary_operand_verdicts() {
     }
 }
 
+/// Pointers to arrays whose elements differ only in qualifiers: gcc takes
+/// C2x's rule that an array is exactly as qualified as its elements, so
+/// `char (*)[19] - const char (*)[19]` is a valid difference (glibc's nss
+/// subtracts so) and the comparisons are of compatible pointers; only
+/// `-pedantic` objects. Arrays of different element types stay invalid.
+#[test]
+fn binary_operand_verdicts_qualified_arrays() {
+    use super::operand_rule::{binary_operand_verdict, Operand, OperandVerdict::*};
+    use crate::types::{ArrayExtent, Type};
+    let mut ty = TypeTable::new(&Target::host());
+    let (char_id, int_id, long_id) = (ty.char_id, ty.int_id, ty.long_id);
+    let mut ptr_to_array = |elem: TypeId, n: usize, quals: TypeModifiers| {
+        let elem = ty.qualified_with(elem, quals);
+        let array = ty.intern(Type::array_of(elem, ArrayExtent::Known(n)));
+        Operand {
+            typ: ty.intern(Type::pointer(array)),
+            null_constant: false,
+        }
+    };
+    let plain = ptr_to_array(char_id, 19, TypeModifiers::empty());
+    let konst = ptr_to_array(char_id, 19, TypeModifiers::CONST);
+    let vol = ptr_to_array(int_id, 3, TypeModifiers::VOLATILE);
+    let cint = ptr_to_array(int_id, 3, TypeModifiers::CONST);
+    let clong = ptr_to_array(long_id, 3, TypeModifiers::CONST);
+    let short = ptr_to_array(char_id, 18, TypeModifiers::CONST);
+    use BinaryOp::*;
+    let table = [
+        (Sub, plain, konst, QualifiedArrays),
+        (Sub, konst, plain, QualifiedArrays),
+        (Sub, vol, cint, QualifiedArrays),
+        (Lt, plain, konst, QualifiedArrays),
+        (Eq, konst, plain, QualifiedArrays),
+        (Sub, konst, konst, Valid),
+        (Sub, cint, clong, Invalid),
+        (Sub, plain, short, Invalid),
+        (Eq, cint, clong, DistinctPointers),
+    ];
+    for (op, l, r, want) in table {
+        assert_eq!(
+            binary_operand_verdict(&ty, op, l, r),
+            want,
+            "{} {} {}",
+            ty.format_type(l.typ, None),
+            op.spelling(),
+            ty.format_type(r.typ, None)
+        );
+    }
+}
+
 /// C17 6.7.6.2p1: an array's element type shall be neither incomplete nor a
 /// function type, wherever the array type is formed -- a declaration, a
 /// parameter, a member, a pointer to it, a type-name -- and the type is still

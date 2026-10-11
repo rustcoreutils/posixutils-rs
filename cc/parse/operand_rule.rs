@@ -100,6 +100,10 @@ pub(crate) enum OperandVerdict {
     /// `void *` form is for object pointers, but gcc accepts it as an
     /// extension and objects only under `-pedantic`.
     FunctionPointerVoid,
+    /// Two pointers to arrays whose elements differ only in qualifiers,
+    /// subtracted or compared. C2x makes them pointers to compatible types;
+    /// gcc accepts them and objects only under `-pedantic`.
+    QualifiedArrays,
 }
 
 /// Check a binary operator's operands against C17 6.5.5p2 through 6.5.14p2.
@@ -134,11 +138,15 @@ fn pointer_form_verdict(
         BinaryOp::Sub if lp && is_int(right) => Some(OperandVerdict::Valid),
         BinaryOp::Sub if lp && rp => Some(if pointees_compatible(types, left, right) {
             OperandVerdict::Valid
+        } else if pointees_differ_in_array_qualifiers(types, left, right) {
+            OperandVerdict::QualifiedArrays
         } else {
             OperandVerdict::Invalid
         }),
         _ if op.is_comparison() && lp && rp => {
-            Some(if !pointers_comparable(types, op, left, right) {
+            Some(if pointees_differ_in_array_qualifiers(types, left, right) {
+                OperandVerdict::QualifiedArrays
+            } else if !pointers_comparable(types, op, left, right) {
                 OperandVerdict::DistinctPointers
             } else if pairs_function_with_void(types, left, right) {
                 OperandVerdict::FunctionPointerVoid
@@ -162,6 +170,15 @@ fn pointer_form_verdict(
 fn pointees_compatible(types: &TypeTable, left: Operand, right: Operand) -> bool {
     match (types.base_type(left.typ), types.base_type(right.typ)) {
         (Some(l), Some(r)) => types.types_compatible(l, r),
+        _ => false,
+    }
+}
+
+/// Do two pointers point at arrays that differ only in the qualifiers of
+/// their elements? See [`TypeTable::arrays_differ_in_qualifiers_only`].
+fn pointees_differ_in_array_qualifiers(types: &TypeTable, left: Operand, right: Operand) -> bool {
+    match (types.base_type(left.typ), types.base_type(right.typ)) {
+        (Some(l), Some(r)) => types.arrays_differ_in_qualifiers_only(l, r),
         _ => false,
     }
 }

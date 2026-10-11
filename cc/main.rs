@@ -2152,6 +2152,20 @@ const GCC_ONE_DASH_LONG: &[&str] = &[
     "-undef",
 ];
 
+/// The preprocessor options gcc takes with their operand joined as well as
+/// separate: `-isystemDIR` as `-isystem DIR`, `-includeFILE` as `-include
+/// FILE`.
+const JOINED_INCLUDE_OPTIONS: &[&str] =
+    &["-idirafter", "-imacros", "-include", "-iquote", "-isystem"];
+
+/// A joined include option -- the option, and the operand joined to it.
+fn joined_include_option(arg: &str) -> Option<(&'static str, &str)> {
+    JOINED_INCLUDE_OPTIONS.iter().find_map(|&option| {
+        let value = arg.strip_prefix(option)?;
+        (!value.is_empty()).then_some((option, value))
+    })
+}
+
 /// gcc's driver options that only choose what the link puts around the
 /// objects: the startup files, the C library, libgcc and the kind of
 /// executable. c17 links through the host driver and adds nothing of its own
@@ -2600,15 +2614,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
                 Err(lines) => driver_errors.extend(lines),
             }
             i += 1;
-        } else if let Some(dir) = arg.strip_prefix("-iquote").filter(|d| !d.is_empty()) {
-            // gcc takes the directory joined as well; guile writes `-iquote.`.
-            result.push("--iquote".to_string());
-            result.push(dir.to_string());
-            i += 1;
-        } else if let Some(file) = arg.strip_prefix("-imacros").filter(|f| !f.is_empty()) {
-            // Joined, as gcc takes it too.
-            result.push("--imacros".to_string());
-            result.push(file.to_string());
+        } else if let Some((option, value)) = joined_include_option(arg) {
+            // gcc takes the operand joined as well; guile writes `-iquote.`.
+            result.push(format!("-{option}"));
+            result.push(value.to_string());
             i += 1;
         } else if let Some(dir) = arg.strip_prefix("--sysroot=") {
             result.push("--sysroot".to_string());
@@ -5229,6 +5238,27 @@ mod tests {
         let args = try_parse(&run_preprocess(&["-I-I/common", "-L-Lx", "foo.c"])).unwrap();
         assert_eq!(args.include_paths, ["-I/common"]);
         assert_eq!(args.lib_paths, ["-Lx"]);
+    }
+
+    /// Each include option gcc takes joined reaches the field its separate
+    /// spelling fills, and the operand keeps whatever it starts with.
+    #[test]
+    fn include_options_take_their_operand_joined() {
+        let args = try_parse(&run_preprocess(&[
+            "-idirafter/a",
+            "-imacrosm.h",
+            "-include-x.h",
+            "-iquote.",
+            "-isystem/s",
+            "foo.c",
+        ]))
+        .unwrap();
+        assert_eq!(args.idirafter_paths, ["/a"]);
+        assert_eq!(args.imacros, ["m.h"]);
+        assert_eq!(args.pre_includes, ["-x.h"]);
+        assert_eq!(args.iquote_paths, ["."]);
+        assert_eq!(args.isystem_paths, ["/s"]);
+        assert_eq!(args.files, ["foo.c"]);
     }
 
     /// An option with nothing after it is still missing its argument, in

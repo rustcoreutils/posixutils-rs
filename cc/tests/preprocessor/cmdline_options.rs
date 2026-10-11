@@ -238,3 +238,28 @@ fn cmdline_options_c_without_e_compiles() {
         assert!(r.success, "{flag}: {}", r.stderr);
     }
 }
+
+/// `-isystemDIR`, `-idirafterDIR` and `-includeFILE` are taken joined as
+/// gcc takes them, as `-iquoteDIR` and `-imacrosFILE` already were; c17
+/// refused the three as unrecognized options.
+#[test]
+fn cmdline_options_joined_include_options() {
+    let (dir, header) = scratch("joined.h", "#define FROM_JOINED 7\n");
+    let dir_s = dir.path().to_str().unwrap();
+    let src = "#ifdef FROM_JOINED\nseen FROM_JOINED\n#endif\n";
+    let include_src = "#include <joined.h>\nseen FROM_JOINED\n";
+    for (option, value, text) in [
+        ("-isystem", dir_s, include_src),
+        ("-idirafter", dir_s, include_src),
+        ("-include", header.as_str(), src),
+    ] {
+        let joined = format!("{option}{value}");
+        for spelling in [vec![option, value], vec![joined.as_str()]] {
+            let mut args = vec!["-P"];
+            args.extend(&spelling);
+            let r = preprocess_text("joined_inc.c", text, &args);
+            assert!(r.success, "{spelling:?}: {}", r.stderr);
+            assert_eq!(r.stdout.trim(), "seen 7", "{spelling:?}");
+        }
+    }
+}

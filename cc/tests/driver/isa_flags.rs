@@ -188,8 +188,9 @@ fn isa_flags_are_unrecognized_on_aarch64() {
 
 /// `-msse2avx` is the assembler's: gcc passes it on, and leaves its own
 /// output as it was, so `as` encodes every SSE instruction with a VEX
-/// prefix. With `-mavx` it is not passed, as gcc's spec has it.
-#[cfg(target_os = "linux")]
+/// prefix. With `-mavx` it is not passed, as gcc's spec has it. On x86-64
+/// only: -msse2avx is an x86-64 option.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn isa_flags_sse2avx_reaches_the_assembler() {
     use std::os::unix::fs::PermissionsExt;

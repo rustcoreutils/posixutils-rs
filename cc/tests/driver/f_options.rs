@@ -367,19 +367,22 @@ fn stack_clash_protection_params_move_the_threshold() {
         assert!(r.success, "{extra:?}: {}", r.stderr);
         r.stderr.contains("the stack of 'f' is not probed")
     };
+    // The x86-64 rows name their target: on an aarch64 host the default
+    // threshold is aarch64's.
+    const X64: &str = "--target=x86_64-unknown-linux-gnu";
     const A64: &str = "--target=aarch64-unknown-linux-gnu";
     for (extra, want) in [
-        (&[][..], true),
+        (&[X64][..], true),
         (
-            &["--param", "stack-clash-protection-guard-size=13"][..],
+            &[X64, "--param", "stack-clash-protection-guard-size=13"][..],
             false,
         ),
         (
-            &["--param=stack-clash-protection-probe-interval=14"][..],
+            &[X64, "--param=stack-clash-protection-probe-interval=14"][..],
             false,
         ),
         (
-            &["--param", "stack-clash-protection-guard-size=12"][..],
+            &[X64, "--param", "stack-clash-protection-guard-size=12"][..],
             true,
         ),
         (&[A64][..], false),
@@ -434,20 +437,23 @@ fn dwarf2_cfi_asm_macro_matches_gcc() {
         assert!(r.success, "{extra:?}: {}", r.stderr);
         r.stdout.contains("#define __GCC_HAVE_DWARF2_CFI_ASM 1")
     };
+    // The x86-64 rows name their target: aarch64 keeps synchronous tables
+    // after -fno-asynchronous-unwind-tables, and Darwin always keeps CFI.
+    const X64: &str = "--target=x86_64-unknown-linux-gnu";
     const A64: &str = "--target=aarch64-unknown-linux-gnu";
     const NO_ASYNC: &str = "-fno-asynchronous-unwind-tables";
     const NO_SYNC: &str = "-fno-unwind-tables";
     for (extra, want) in [
-        (&[][..], true),
-        (&[NO_ASYNC][..], false),
-        (&[NO_ASYNC, NO_SYNC][..], false),
-        (&[NO_ASYNC, NO_SYNC, "-g"][..], true),
-        (&[NO_ASYNC, NO_SYNC, "-g0"][..], false),
-        (&[NO_ASYNC, NO_SYNC, "-fexceptions"][..], true),
+        (&[X64][..], true),
+        (&[X64, NO_ASYNC][..], false),
+        (&[X64, NO_ASYNC, NO_SYNC][..], false),
+        (&[X64, NO_ASYNC, NO_SYNC, "-g"][..], true),
+        (&[X64, NO_ASYNC, NO_SYNC, "-g0"][..], false),
+        (&[X64, NO_ASYNC, NO_SYNC, "-fexceptions"][..], true),
         (&[A64][..], true),
         (&[A64, NO_ASYNC][..], true),
         (&[A64, NO_ASYNC, NO_SYNC][..], false),
-        (&["-fdwarf2-cfi-asm"][..], true),
+        (&[X64, "-fdwarf2-cfi-asm"][..], true),
     ] {
         assert_eq!(defined(extra), want, "{extra:?}");
     }

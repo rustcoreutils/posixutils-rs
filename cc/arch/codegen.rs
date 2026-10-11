@@ -151,8 +151,11 @@ pub struct CodeGenBase<I: LirInst> {
     pub emit_debug: bool,
     /// What selects the thread-local access model: whether the output has
     /// to be able to live in a shared object (`-shared`, `-fpic`, `-fPIC`),
-    /// and `-ftls-model=`; see [`CodeGenBase::use_tls_dynamic`].
+    /// and `-ftls-model=`; see [`CodeGenBase::tls_model`].
     pub tls: crate::target::TlsPolicy,
+    /// The access model of each thread-local; see
+    /// [`CodeGenBase::plan_thread_locals`].
+    pub tls_models: std::collections::HashMap<String, crate::target::TlsModel>,
     /// `-fverbose-asm`: annotate the generated instructions.
     pub verbose_asm: bool,
     /// `-fcf-protection`, which only x86-64 reads: for its landing pads, and
@@ -194,6 +197,8 @@ pub struct CodeGenBase<I: LirInst> {
     pub layout: crate::target::ObjectLayout,
     /// `-falign-functions`, `-fpatchable-function-entry=` and their kin.
     pub shape: crate::target::FunctionShape,
+    /// The shape of the function being emitted: [`Self::shape_of`] it.
+    pub fn_shape: crate::target::FunctionShape,
     /// The `__patchable_function_entries` records written so far: the
     /// next one's label number.
     pub patchable_entries: u32,
@@ -206,15 +211,18 @@ pub struct CodeGenBase<I: LirInst> {
     pub landing_pads: super::landing_pads::LandingPads,
 }
 
-/// `-fdata-sections`' own section for `global`, named as gcc names it:
-/// the section it would otherwise share, then `.` and its name --
-/// `.bss.x`, `.tdata.x`, `.rodata.x`, `.data.rel.ro.x`, `.data.x`.
+/// The own section of `global` under `-fdata-sections` or `retain`, named as
+/// gcc names it: the section it would otherwise share, then `.` and its
+/// name -- `.bss.x`, `.tdata.x`, `.rodata.x`, `.data.rel.ro.x`, `.data.x`
+/// -- and marked `R` when retained.
 fn own_data_section(global: &crate::ir::GlobalDef, zero_init: bool) -> Directive {
     let name = &global.name;
+    let retain = global.symbol_attrs.retain;
+    let r = if retain { "R" } else { "" };
     let (name, flags) = if global.is_thread_local {
         if matches!(global.init, Initializer::None) {
             (
-                format!(".tbss.{name},\"awT\",@nobits"),
+                format!(".tbss.{name},\"awT{r}\",@nobits"),
                 SectionFlags::ThreadLocal,
             )
         } else {
@@ -228,13 +236,17 @@ fn own_data_section(global: &crate::ir::GlobalDef, zero_init: bool) -> Directive
         }
     } else if zero_init {
         (
-            format!(".bss.{name},\"aw\",@nobits"),
+            format!(".bss.{name},\"aw{r}\",@nobits"),
             SectionFlags::Writable,
         )
     } else {
         (format!(".data.{name}"), SectionFlags::Writable)
     };
-    Directive::NamedSection { name, flags }
+    Directive::NamedSection {
+        name,
+        flags,
+        retain,
+    }
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
@@ -268,6 +280,18 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         directives
     }
 
+    /// How `func` begins and ends: the options' shape, with what its own
+    /// `patchable_function_entry` and `zero_call_used_regs` say in place of
+    /// theirs. Mach-O has no `__patchable_function_entries`, and the option
+    /// is refused there, so the attribute asks for nothing.
+    pub fn shape_of(&self, func: &Function) -> crate::target::FunctionShape {
+        let mut shape = func.shape.apply(self.shape);
+        if self.target.os == Os::MacOS {
+            shape.patchable = None;
+        }
+        shape
+    }
+
     /// `-fpatchable-function-entry=N,M`'s part of `func`'s entry, as gcc
     /// writes it: before its label (`before_label`) the `M` nops, and after
     /// its landing pad (`endbr64`, `bti c`) the other `N - M`. The record of
@@ -276,7 +300,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// two together -- goes before the first of them, and so after the label
     /// when `M` is 0.
     pub fn patchable_entry(&mut self, func: &Function, before_label: bool) -> Vec<Directive> {
-        let Some(entry) = self.shape.patchable else {
+        let Some(entry) = self.shape_of(func).patchable else {
             return Vec::new();
         };
         let (nops, recorded_here) = if before_label {
@@ -319,6 +343,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             source_files: Default::default(),
             emit_debug: false,
             tls: crate::target::TlsPolicy::default(),
+            tls_models: std::collections::HashMap::new(),
             verbose_asm: false,
             cf_protection: crate::target::CfProtection::default(),
             stack_clash: None,
@@ -331,6 +356,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             binds_locally: std::collections::HashSet::new(),
             layout: Default::default(),
             shape: Default::default(),
+            fn_shape: Default::default(),
             patchable_entries: 0,
             eh: Default::default(),
             optimizing: false,
@@ -418,18 +444,27 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             && !global.is_static
             && !global.is_thread_local
             && !global.symbol_attrs.weak
+            && !global.symbol_attrs.retain
             && global.symbol_attrs.section.is_none()
             && !is_private_name(&global.name)
             && matches!(global.init, Initializer::None)
     }
 
+    /// Whether the definition with `attrs` is retained: `retain`, which
+    /// only ELF can express, as `SHF_GNU_RETAIN`.
+    pub fn retains(&self, attrs: &crate::parse::ast::SymbolAttrs) -> bool {
+        attrs.retain && self.target.os != Os::MacOS
+    }
+
     /// The section `func` goes in, when it is not `.text`: the one its
-    /// `section` attribute names, or under `-ffunction-sections` its own
-    /// `.text.NAME`, gcc's name, so that `ld --gc-sections` can drop it.
+    /// `section` attribute names, or under `-ffunction-sections` or `retain`
+    /// its own `.text.NAME`, gcc's name, so that `ld --gc-sections` can
+    /// drop it -- or, retained, must keep it.
     pub fn function_section(&self, func: &Function) -> Option<Directive> {
+        let retain = self.retains(&func.symbol_attrs);
         let name = match &func.symbol_attrs.section {
             Some(name) => name.clone(),
-            None if self.layout.function_sections && self.target.os != Os::MacOS => {
+            None if (self.layout.function_sections || retain) && self.target.os != Os::MacOS => {
                 format!(".text.{}", func.name)
             }
             None => return None,
@@ -437,6 +472,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         Some(Directive::NamedSection {
             name,
             flags: SectionFlags::Code,
+            retain,
         })
     }
 
@@ -564,41 +600,68 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
-    /// Whether thread-local access must use the dynamic model.
-    ///
-    /// Initial Exec resolves the offset through the GOT at load time, which
-    /// requires the object's thread-locals to fit in the loader's static-TLS
-    /// surplus -- so a library `dlopen`ed later with a large block is rejected.
-    /// Only the dynamic model has no such limit.
-    ///
-    /// `tls.shared_code` is set for `-shared` and for `-fPIC`, which asks for
-    /// code that can live in a shared object -- the same requirement. It is
-    /// *not* set for `-fPIE` or the PIE default, because a PIE executable
-    /// still resolves its own thread-locals at link time. And
-    /// `-ftls-model=initial-exec` or `local-exec` waives the requirement.
-    ///
-    /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given,
-    /// since that pass is what puts the address computation where the register
-    /// allocator can see it.
-    pub fn use_tls_dynamic(&self) -> bool {
-        self.tls_access() == crate::target::TlsAccess::ElfDescriptor
+    /// Record the access model of every thread-local `module` names, as
+    /// [`Module::tls_model`] gives it -- the rule `ir::tls` expanded the IR
+    /// by, so every access is emitted for the model it was expanded for.
+    pub fn plan_thread_locals(&mut self, module: &Module) {
+        self.tls_models = module
+            .thread_locals()
+            .map(|name| (name.to_string(), module.tls_model(name, self.tls)))
+            .collect();
     }
 
-    /// How this target obtains a thread-local's address; see
-    /// [`crate::target::Target::tls_access`], which `ir::tls` asks too.
-    pub fn tls_access(&self) -> crate::target::TlsAccess {
-        self.target.tls_access(self.tls)
+    /// The model of the thread-local `name`; see [`Self::plan_thread_locals`].
+    ///
+    /// The dynamic models compute the address by a call: Initial Exec
+    /// resolves the offset through the GOT at load time, which requires the
+    /// object's thread-locals to fit in the loader's static-TLS surplus, so
+    /// a library `dlopen`ed later with a large block is rejected; only the
+    /// dynamic models have no such limit. `tls.shared_code` is set for
+    /// `-shared` and for `-fPIC`, which asks for code that can live in a
+    /// shared object -- the same requirement -- and *not* for `-fPIE` or the
+    /// PIE default, because a PIE executable still resolves its own
+    /// thread-locals at link time. `-ftls-model=initial-exec` or
+    /// `local-exec` waives the requirement, and a `tls_model` attribute
+    /// decides one variable's model whatever the rest says.
+    pub fn tls_model(&self, name: &str) -> crate::target::TlsModel {
+        self.tls_models
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| self.tls.model(true, None))
     }
 
-    /// Whether a thread-local access must use the Initial Exec model rather
-    /// than Local Exec; see [`crate::target::TlsPolicy::initial_exec`].
+    /// How this target obtains the address of the thread-local `name`; see
+    /// [`crate::target::Target::tls_access`].
+    pub fn tls_access(&self, name: &str) -> crate::target::TlsAccess {
+        self.target.tls_access(self.tls_model(name))
+    }
+
+    /// What computing a thread-local's address by a call costs on this
+    /// target, which is what a `TlsAddr` does: `ir::tls` makes one only for
+    /// a thread-local whose access is a call.
+    pub fn tls_call_access(&self) -> crate::target::TlsAccess {
+        self.target
+            .tls_access(crate::target::TlsModel::GlobalDynamic)
+    }
+
+    /// The thread-locals whose every access `ir::tls` expanded into a
+    /// `TlsAddr`, which no other path may reach.
+    pub fn called_thread_locals(&self) -> std::collections::HashSet<String> {
+        self.tls_models
+            .keys()
+            .filter(|name| self.tls_access(name).is_call())
+            .cloned()
+            .collect()
+    }
+
+    /// Whether an access to the thread-local `name` reached statically is
+    /// Initial Exec rather than Local Exec.
     ///
-    /// On Linux shared code takes the descriptor model before it gets here;
-    /// on FreeBSD, which stays with the static models, leaving shared code
-    /// out put Local Exec in a shared object -- `%fs:t@TPOFF`, a relocation
+    /// On FreeBSD, which stays with the static models, shared code is
+    /// Initial Exec: Local Exec there was `%fs:t@TPOFF`, a relocation
     /// `ld -shared` refuses.
-    pub fn use_tls_ie(&self, is_extern: bool) -> bool {
-        self.use_tls_dynamic() || self.tls.initial_exec(is_extern)
+    pub fn use_tls_ie(&self, name: &str) -> bool {
+        self.tls_model(name) != crate::target::TlsModel::LocalExec
     }
 
     pub fn push_lir(&mut self, inst: I) {
@@ -915,7 +978,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             });
             return;
         }
-        let own_section = self.layout.data_sections
+        let retain = self.retains(&global.symbol_attrs);
+        let own_section = (self.layout.data_sections || retain)
             && self.target.os != Os::MacOS
             && !is_local_label
             && named_section.is_none();
@@ -938,6 +1002,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::NamedSection {
                 name: name.clone(),
                 flags,
+                retain,
             });
         } else if own_section {
             self.push_directive(own_data_section(global, zero_init));

@@ -266,6 +266,14 @@ pub struct Parser<'a> {
     /// an attribute may appear before the declarator, after it, or on the
     /// specifier, and the declarator is built once at the end.
     pub(super) pending_symbol_attrs: crate::parse::ast::SymbolAttrs,
+    /// Every attribute written on the declaration being parsed, as written:
+    /// what `__builtin_has_attribute` asks of the declaration once it is
+    /// bound (`written_attrs`). Carried as `pending_symbol_attrs` is.
+    pub(super) pending_written_attrs: Vec<super::attribute::Attribute>,
+    /// Every attribute written on each declaration of an entity, by what
+    /// it declared: what `__builtin_has_attribute` answers from.
+    pub(super) written_attrs:
+        HashMap<super::has_attribute::WrittenOn, Vec<super::attribute::Attribute>>,
     /// Emission-affecting function attributes seen so far in the declaration
     /// being parsed. Accumulated like `pending_alignas` because a
     /// `constructor` / `noinline` attribute may appear before the declaration
@@ -281,6 +289,9 @@ pub struct Parser<'a> {
     /// `-fcf-protection=branch`, as in gcc, which otherwise warns that it
     /// is ignored.
     pub(super) cf_branch: bool,
+    /// The x86-64 extensions the unit is compiled for; see
+    /// [`Parser::set_x86_isa`].
+    pub(super) x86_isa: crate::target::X86Isa,
     /// `-fstrict-flex-arrays=N`; see [`Parser::set_strict_flex_arrays`].
     pub(super) strict_flex_arrays: u8,
 
@@ -435,9 +446,12 @@ impl<'a> Parser<'a> {
             tentative_arrays: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
+            pending_written_attrs: Vec::new(),
+            written_attrs: HashMap::new(),
             pending_fn_attrs: Default::default(),
             pending_fn_type: Default::default(),
             cf_branch: false,
+            x86_isa: Default::default(),
             strict_flex_arrays: 0,
             enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
@@ -482,6 +496,14 @@ impl<'a> Parser<'a> {
     /// what gives `__attribute__((nocf_check))` a meaning. Off by default.
     pub fn set_cf_branch(&mut self, branch: bool) {
         self.cf_branch = branch;
+    }
+
+    /// The x86-64 extensions the unit is compiled for, by the `-m`
+    /// options: whether SSE is on decides whether a
+    /// `no_caller_saved_registers` function compiles. The baseline by
+    /// default.
+    pub fn set_x86_isa(&mut self, isa: crate::target::X86Isa) {
+        self.x86_isa = isa;
     }
 
     /// `-fstrict-flex-arrays=N`: which trailing arrays of an object of

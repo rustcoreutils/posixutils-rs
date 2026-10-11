@@ -13,7 +13,7 @@
 // stay in `tests/codegen/kernel.rs`.
 //
 
-use super::asm_probe::{asm_for_with, body_of, X86_64_LINUX};
+use super::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 
 /// `-mcmodel=kernel` puts code and data in the top 2 GB, where an absolute
 /// address fits only a sign-extended 32-bit immediate: gcc writes `movq
@@ -693,6 +693,149 @@ fn codegen_kernel_zero_call_used_regs_counts_asm_clobbers() {
         ["xorl %ecx, %ecx", "xorl %edi, %edi", "xorl %r8d, %r8d"],
         "{asm}"
     );
+}
+
+/// `patchable_function_entry(N[, M])` is one function's
+/// `-fpatchable-function-entry=N,M`, over the option or without it, as in
+/// gcc 13: `(0)` takes the function out, an `M` above `N` is 0 after
+/// gcc's warning, and the attribute's `M` is 0 when it gives none. On both
+/// targets; the attribute was ignored with a warning.
+#[test]
+fn codegen_kernel_patchable_function_entry_attribute() {
+    let src = "__attribute__((patchable_function_entry(3, 1))) int p31(int a) { return a + 1; }\n\
+               __attribute__((patchable_function_entry(0))) int p0(int a) { return a + 2; }\n\
+               __attribute__((__patchable_function_entry__(1))) int p1(int a) { return a + 3; }\n\
+               int plain(int a) { return a + 4; }\n";
+    // Nops before the label, and after it before the first instruction.
+    let nops = |asm: &str, name: &str| -> (usize, usize) {
+        let lines: Vec<&str> = asm
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with(".cfi") && !l.starts_with(".loc"))
+            .collect();
+        let at = lines.iter().position(|l| *l == format!("{name}:")).unwrap();
+        let before = lines[..at]
+            .iter()
+            .rev()
+            .skip_while(|l| l.starts_with(".type") || l.starts_with(".globl"))
+            .take_while(|l| **l == "nop")
+            .count();
+        let after = lines[at + 1..]
+            .iter()
+            .skip_while(|l| {
+                l.starts_with(".section")
+                    || l.starts_with(".p2align")
+                    || l.starts_with(".quad")
+                    || l.starts_with(".8byte")
+                    || **l == ".text"
+                    || l.starts_with(".LPFE")
+            })
+            .take_while(|l| **l == "nop")
+            .count();
+        (before, after)
+    };
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("patchable_attr", triple, src, &["-O2", "-fno-pie"]);
+        assert_eq!(nops(&asm, "p31"), (1, 2), "{triple}:\n{asm}");
+        assert_eq!(nops(&asm, "p0"), (0, 0), "{triple}:\n{asm}");
+        assert_eq!(nops(&asm, "p1"), (0, 1), "{triple}:\n{asm}");
+        assert_eq!(nops(&asm, "plain"), (0, 0), "{triple}:\n{asm}");
+        assert_eq!(
+            asm.matches("__patchable_function_entries").count(),
+            2,
+            "{asm}"
+        );
+        let asm = asm_for_with(
+            "patchable_attr_opt",
+            triple,
+            src,
+            &["-O2", "-fno-pie", "-fpatchable-function-entry=5,2"],
+        );
+        assert_eq!(nops(&asm, "p31"), (1, 2), "{triple}:\n{asm}");
+        assert_eq!(nops(&asm, "p0"), (0, 0), "{triple}:\n{asm}");
+        assert_eq!(nops(&asm, "p1"), (0, 1), "{triple}:\n{asm}");
+        assert_eq!(nops(&asm, "plain"), (2, 3), "{triple}:\n{asm}");
+    }
+}
+
+/// `zero_call_used_regs("...")` is one function's `-fzero-call-used-regs=`,
+/// over the option or without it, as in gcc 13: `skip` takes the function
+/// out. x86-64 only, as the option is in c17.
+#[test]
+fn codegen_kernel_zero_call_used_regs_attribute() {
+    let src = "__attribute__((zero_call_used_regs(\"skip\"))) long zs(long a, long b) { return a * b; }\n\
+               __attribute__((zero_call_used_regs(\"used-gpr\"))) long zu(long a, long b) { return a * b; }\n\
+               long zp(long a, long b) { return a * b; }\n";
+    let cleared = |asm: &str, func: &str| -> Vec<String> {
+        let lines: Vec<&str> = body_of(asm, func).lines().map(str::trim).collect();
+        let ret = lines.iter().rposition(|l| *l == "ret").unwrap();
+        let mut regs: Vec<String> = lines[..ret]
+            .iter()
+            .rev()
+            .take_while(|l| l.starts_with("xorl"))
+            .map(|l| {
+                l.split_whitespace()
+                    .last()
+                    .unwrap()
+                    .trim_start_matches('%')
+                    .to_string()
+            })
+            .collect();
+        regs.reverse();
+        regs
+    };
+    let asm = asm_for_with("zero_attr", X86_64_LINUX, src, &["-O2", "-fno-pie"]);
+    assert!(cleared(&asm, "zs").is_empty(), "{asm}");
+    let used = cleared(&asm, "zu");
+    assert!(
+        used.contains(&"esi".to_string()) && used.contains(&"edi".to_string()),
+        "{asm}"
+    );
+    assert!(cleared(&asm, "zp").is_empty(), "{asm}");
+    let asm = asm_for_with(
+        "zero_attr_opt",
+        X86_64_LINUX,
+        src,
+        &["-O2", "-fno-pie", "-fzero-call-used-regs=all-gpr"],
+    );
+    assert!(cleared(&asm, "zs").is_empty(), "{asm}");
+    assert_eq!(cleared(&asm, "zu"), used, "{asm}");
+    assert_eq!(cleared(&asm, "zp").len(), 8, "{asm}");
+}
+
+/// `no_caller_saved_registers` (x86-64, with no SSE, as gcc 13 needs): the
+/// function preserves every general register it changes, call-clobbered
+/// ones included, and around a call every call-clobbered one; `%rax` is
+/// restored too when the function returns nothing.
+#[test]
+fn codegen_kernel_no_caller_saved_registers() {
+    let src = "extern void ext(int);\n\
+               int g;\n\
+               __attribute__((no_caller_saved_registers)) void calls(void) { ext(1); }\n\
+               __attribute__((no_caller_saved_registers)) void leaf(int x, int y) { g = x * y + g / x; }\n";
+    let asm = asm_for_with(
+        "ncsr",
+        X86_64_LINUX,
+        src,
+        &["-O2", "-fno-pie", "-mgeneral-regs-only"],
+    );
+    let pushed = |func: &str| -> Vec<String> {
+        body_of(&asm, func)
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix("pushq %"))
+            .map(str::to_string)
+            .collect()
+    };
+    let calls = pushed("calls");
+    for reg in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] {
+        assert!(calls.contains(&reg.to_string()), "{reg}:\n{asm}");
+    }
+    let leaf = pushed("leaf");
+    // `idivl` writes %eax and %edx; the arguments arrive in %edi and %esi.
+    for reg in ["rax", "rdx"] {
+        assert!(leaf.contains(&reg.to_string()), "{reg}:\n{asm}");
+    }
 }
 
 /// Where the stack protector reads its guard, as gcc 13 reads it: glibc's

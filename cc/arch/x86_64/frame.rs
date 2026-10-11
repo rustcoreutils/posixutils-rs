@@ -224,14 +224,16 @@ impl X86_64CodeGen {
         self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
         self.base.func_pos = crate::arch::func_pos(func);
         self.base.isa = func.isa;
+        self.base.fn_shape = self.base.shape_of(func);
 
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
 
-        if self.base.tls_access().is_call() {
+        let called = self.base.called_thread_locals();
+        if !called.is_empty() {
             crate::arch::codegen::check_tls_reached_only_by_address(
                 func,
-                &self.tls_symbols,
+                &called,
                 self.base.func_pos,
             );
         }
@@ -246,7 +248,7 @@ impl X86_64CodeGen {
         let mut alloc = RegAlloc::new()
             .with_global_registers(&self.global_registers)
             .with_incoming_stack_align(self.base.target.x86.incoming_stack_align())
-            .with_tls_access(self.base.tls_access())
+            .with_tls_access(self.base.tls_call_access())
             .with_stack_guard(guarded);
         self.locations = alloc.allocate(func, types);
         self.stack_guard = alloc.stack_guard_slot();
@@ -262,6 +264,10 @@ impl X86_64CodeGen {
         self.win64_xmm_saves = alloc.win64_xmm_saves().to_vec();
         self.incoming_pointers = Self::incoming_pointers(func, types);
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
+        if func.saves_all_registers {
+            self.callee_saved_regs
+                .extend(Self::call_clobbered_to_preserve(func, types));
+        }
         self.max_local_align = alloc.max_local_align();
         self.frame_base = alloc.frame_base();
         self.x87_scratch = alloc.x87_scratch();
@@ -487,6 +493,41 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Directive(Directive::CfiStartProc));
         }
         self.base.eh_begin_function(func, self.pic_mode);
+    }
+
+    /// The call-clobbered general registers a `no_caller_saved_registers`
+    /// function saves and restores besides the callee-saved ones it uses:
+    /// every one but those its value is returned in -- `%rax`, and `%rdx`
+    /// too for a value of two eightbytes. Every one, not only those its own
+    /// code names, as what it calls may change any of them; gcc 13 saves
+    /// only those, which preserves the same registers.
+    fn call_clobbered_to_preserve(func: &Function, types: &TypeTable) -> Vec<Reg> {
+        let returned = if types.kind(func.return_type) == crate::types::TypeKind::Void {
+            &[][..]
+        } else if (9..=16).contains(&types.size_bytes(func.return_type)) {
+            &[Reg::Rax, Reg::Rdx][..]
+        } else {
+            &[Reg::Rax][..]
+        };
+        // System V lets a callee change these too; Microsoft x64 does not.
+        let argument_regs = match func.conv {
+            crate::abi::CallingConv::Win64 => &[][..],
+            crate::abi::CallingConv::C => &[Reg::Rsi, Reg::Rdi][..],
+        };
+        [
+            Reg::Rax,
+            Reg::Rcx,
+            Reg::Rdx,
+            Reg::R8,
+            Reg::R9,
+            Reg::R10,
+            Reg::R11,
+        ]
+        .iter()
+        .chain(argument_regs)
+        .filter(|r| !returned.contains(r))
+        .copied()
+        .collect()
     }
 
     /// The `Arg` pseudos whose parameter is a pointer; see
@@ -1525,7 +1566,7 @@ impl X86_64CodeGen {
         // %rbp is the caller's again, so the CFA follows %rsp.
         self.push_cfi(Directive::cfi_def_cfa("%rsp", 8));
         self.push_cfi(Directive::cfi_restore("%rbp"));
-        if self.base.shape.zero_regs.on {
+        if self.base.fn_shape.zero_regs.on {
             self.push_lir(X86Inst::ClearRegs { regs: Vec::new() });
         }
         self.push_lir(X86Inst::Ret);
@@ -1543,7 +1584,7 @@ impl X86_64CodeGen {
     fn fill_cleared_regs(&mut self, func: &Function, types: &TypeTable, first: usize) {
         use crate::arch::lir::EmitAsm;
         use crate::arch::x86_64::lir::ClearedReg;
-        let zero = self.base.shape.zero_regs;
+        let zero = self.base.fn_shape.zero_regs;
         if !zero.on {
             return;
         }

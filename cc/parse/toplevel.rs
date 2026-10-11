@@ -308,6 +308,7 @@ impl Parser<'_> {
         // function's section, and the conflicting "ax"/"aw" flags made the
         // assembler reject the file outright.
         self.pending_symbol_attrs = Default::default();
+        self.pending_written_attrs.clear();
     }
 
     pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {

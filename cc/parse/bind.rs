@@ -102,9 +102,9 @@ impl DeclSpecs {
 
 /// What binding one declarator produced.
 enum Bound {
-    Decl(InitDeclarator),
+    Decl(Box<InitDeclarator>),
     /// Only ever the first declarator at file scope: `int f(void) { .. }`.
-    FuncDef(super::ast::FunctionDef),
+    FuncDef(Box<super::ast::FunctionDef>),
     /// A block-scope redeclaration the symbol table refused, which binds
     /// nothing new.
     Nothing,
@@ -214,8 +214,8 @@ impl Parser<'_> {
                 // label.
                 self.skip_extensions_after_declarator();
                 match self.bind_declarator(&specs, d, scope, first)? {
-                    Bound::FuncDef(def) => return Ok(ExternalDecl::FunctionDef(def)),
-                    Bound::Decl(d) => declarators.push(d),
+                    Bound::FuncDef(def) => return Ok(ExternalDecl::FunctionDef(*def)),
+                    Bound::Decl(d) => declarators.push(*d),
                     Bound::Nothing => {}
                 }
                 if !self.is_special(b',') {
@@ -466,8 +466,18 @@ impl Parser<'_> {
                     );
                 }
                 let params = params.map(|list| list.params);
+                // gcc saves no SSE register for such a function, and so
+                // compiles none while SSE is enabled.
+                if attrs.saves_all_registers && self.x86_isa.has_sse() {
+                    diag::error(
+                        pos,
+                        "sorry, unimplemented: SSE instructions aren't allowed in a function \
+                         with the 'no_caller_saved_registers' attribute",
+                    );
+                }
+                self.record_written_attrs(super::has_attribute::WrittenOn::Linked(name));
                 let def = self.define_function(specs, name, pos, typ, params, attrs.clone())?;
-                return Ok(Bound::FuncDef(def));
+                return Ok(Bound::FuncDef(Box::new(def)));
             }
         }
 
@@ -578,8 +588,11 @@ impl Parser<'_> {
         }
 
         let Some(symbol) = symbol else {
+            self.pending_written_attrs.clear();
             return Ok(Bound::Nothing);
         };
+        let written_on = self.written_on(symbol);
+        self.record_written_attrs(written_on);
         // Checked after the initializer, which is what can still infer the
         // extent of `char a[] = { .. }`. `register` does not exempt an array:
         // it still has automatic storage duration.
@@ -598,6 +611,8 @@ impl Parser<'_> {
         let mut symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
         if !is_fn {
             Self::drop_ifunc(&mut symbol_attrs, pos);
+            // Already warned about as a function's attribute.
+            symbol_attrs.call_diagnostics = Default::default();
         }
         if is_typedef {
             self.drop_symbol_attrs(&mut symbol_attrs, name, pos, true);
@@ -605,7 +620,22 @@ impl Parser<'_> {
             let automatic = matches!(scope, DeclScope::Block { .. })
                 && !is_fn
                 && !specs.storage_class.intersects(NO_AUTO_DURATION);
+            let storage = specs.storage_class;
+            self.check_variable_attrs(&mut symbol_attrs, name, pos, is_fn, storage, automatic);
             self.check_private_symbol_attrs(&mut symbol_attrs, name, pos, linkage, automatic);
+            // `retain` keeps a definition: an object declared `extern` or
+            // automatic has none here, and gcc ignores it there.
+            if !is_fn
+                && (automatic || specs.is_extern())
+                && std::mem::take(&mut symbol_attrs.retain)
+            {
+                diag::group_warning_args(
+                    super::attribute::ATTRIBUTE_WARNING,
+                    pos,
+                    "'{0}' attribute ignored",
+                    &["retain"],
+                );
+            }
         }
         let cleanup = symbol_attrs.cleanup.take().and_then(|func| {
             let var = Cleanup {
@@ -626,7 +656,7 @@ impl Parser<'_> {
         if !is_fn && !is_typedef && static_duration {
             typ = self.types.without_decl_specifiers(typ);
         }
-        Ok(Bound::Decl(InitDeclarator {
+        Ok(Bound::Decl(Box::new(InitDeclarator {
             symbol_attrs,
             fn_effect: fn_attrs.map_or(pending_effect, |a| a.effect),
             cleanup,
@@ -638,7 +668,7 @@ impl Parser<'_> {
             // C11 6.7.5p2: a function has no alignment specifier.
             explicit_align: if is_fn { None } else { align },
             pos,
-        }))
+        })))
     }
 
     /// The call `__attribute__((cleanup(fn)))` asks for on the declarator

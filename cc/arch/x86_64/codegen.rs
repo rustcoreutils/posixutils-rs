@@ -319,7 +319,7 @@ impl X86_64CodeGen {
     /// Whether accessing the thread-local `name` needs the Initial Exec model
     /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
     pub(super) fn use_tls_ie(&self, name: &str) -> bool {
-        self.base.use_tls_ie(self.extern_symbols.contains(name))
+        self.base.use_tls_ie(name)
     }
 
     /// Compute the *address* of a thread-local into `dst`.
@@ -332,7 +332,7 @@ impl X86_64CodeGen {
     /// segfaults on a write.
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let symbol = Symbol::global(name.to_string());
-        if self.base.tls_access() == crate::target::TlsAccess::MachOTlv {
+        if self.base.tls_access(name) == crate::target::TlsAccess::MachOTlv {
             // Mach-O thread-local variable descriptor (clang's sequence):
             //   movq _v@TLVP(%rip), %rdi    ; the descriptor
             //   call *(%rdi)                ; its getter: the ADDRESS in %rax
@@ -362,7 +362,7 @@ impl X86_64CodeGen {
             }
             return;
         }
-        if self.base.use_tls_dynamic() {
+        if self.base.tls_access(name) == crate::target::TlsAccess::ElfDescriptor {
             // TLS descriptor, the dynamic model:
             //   leaq sym@TLSDESC(%rip), %rax
             //   call *sym@TLSCALL(%rax)      ; returns an OFFSET in %rax
@@ -1773,14 +1773,10 @@ impl CodeGenerator for X86_64CodeGen {
             .filter_map(|r| r.x86_64())
             .collect();
 
-        // Collect thread-local storage symbols (both defined and extern)
-        self.tls_symbols = module
-            .globals
-            .iter()
-            .filter(|g| g.is_thread_local)
-            .map(|g| g.name.clone())
-            .chain(module.extern_tls_symbols.iter().cloned())
-            .collect();
+        // Collect thread-local storage symbols (both defined and extern),
+        // each with its access model.
+        self.base.plan_thread_locals(module);
+        self.tls_symbols = self.base.tls_models.keys().cloned().collect();
 
         // Emit file header
         self.base.plan_named_sections(module, self.pic_mode);

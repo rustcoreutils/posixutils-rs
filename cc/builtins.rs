@@ -296,6 +296,7 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_constant_p",
     "__builtin_types_compatible_p",
     "__builtin_classify_type",
+    "__builtin_has_attribute",
     "__builtin_unreachable",
     // Spill every callee-saved register to the frame
     "__builtin_unwind_init",

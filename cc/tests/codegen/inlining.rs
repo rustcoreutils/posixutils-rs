@@ -2162,3 +2162,42 @@ fn codegen_always_inline_cycle_is_rejected() {
         0
     );
 }
+
+/// A `flatten` function with its whole call tree inlined computes what it
+/// computed as calls: a large callee with a loop, a callee of that callee,
+/// a static local shared by every copy, a mutually recursive pair (inlined
+/// down to the cycle), a `noinline` and a self-recursive callee left as
+/// calls.
+#[test]
+fn codegen_flatten_programs_run() {
+    compile_and_run_everywhere(
+        "flatten_run",
+        r#"
+static int counter(void) { static int n; return ++n; }
+static int leaf(int x) { return x * 3 + counter(); }
+static int mid(int x) {
+    int s = 0;
+    for (int i = 0; i < x; i++)
+        s += leaf(i) + leaf(i + 1) + leaf(i + 2) + leaf(i + 3) + leaf(i + 4) + leaf(i + 5)
+           + leaf(i + 6) + leaf(i + 7) + leaf(i + 8) + leaf(i + 9) + leaf(i + 10);
+    return s;
+}
+__attribute__((noinline)) int ni(int x) { return x + 1; }
+int rec(int x) { return x ? rec(x - 1) + 1 : 0; }
+static int ping(int x);
+static int pong(int x) { return x > 0 ? ping(x - 1) : 0; }
+static int ping(int x) { return x > 0 ? pong(x - 1) + 1 : 0; }
+__attribute__((flatten)) int top(int x) { return mid(x) + ni(x) + rec(x) + ping(x); }
+int main(void) {
+    int a = top(3);
+    int b = top(3);
+    /* the second call counts on from the first: 33 more increments */
+    if (a != 1164)
+        return 1;
+    if (b != 2253)
+        return 2;
+    return 0;
+}
+"#,
+    );
+}

@@ -1830,7 +1830,7 @@ impl<'a> Preprocessor<'a> {
                             return Some(vec![Token::with_value(
                                 TokenType::Number,
                                 *pos,
-                                TokenValue::Number(if result { "1" } else { "0" }.to_string()),
+                                TokenValue::Number(result.to_string()),
                             )]);
                         }
                     }
@@ -1873,21 +1873,23 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Evaluate __has_attribute, __has_builtin, etc.
+    /// Evaluate __has_attribute, __has_builtin, etc.: 0 for no, and for
+    /// yes 1 or, for `__has_attribute` of a standard attribute, gcc's
+    /// version number ([`crate::kw::has_attribute`]).
     fn eval_has_builtin(
         &self,
         builtin: BuiltinMacro,
         args: &[Vec<Token>],
         idents: &IdentTable,
-    ) -> bool {
+    ) -> i64 {
         if args.is_empty() {
-            return false;
+            return 0;
         }
 
         // Try to get the first token from the argument list
         let first_tok = match args[0].first() {
             Some(tok) => tok,
-            None => return false,
+            None => return 0,
         };
 
         // Try to get StringId directly for O(1) tag-based lookup
@@ -1901,14 +1903,14 @@ impl<'a> Preprocessor<'a> {
             BuiltinMacro::HasAttribute => {
                 let arch = self.target.arch;
                 if let Some(id) = arg_id {
-                    crate::kw::attribute_supported(id, arch)
+                    crate::kw::has_attribute(id, arch)
                 } else {
                     // One table decides this. A second hardcoded list here
                     // had already drifted from it in both directions.
                     let name = self.token_to_string(first_tok, idents);
                     idents
                         .lookup(&name)
-                        .is_some_and(|id| crate::kw::attribute_supported(id, arch))
+                        .map_or(0, |id| crate::kw::has_attribute(id, arch))
                 }
             }
             BuiltinMacro::HasBuiltin => {
@@ -1917,12 +1919,12 @@ impl<'a> Preprocessor<'a> {
                     Some(id) => crate::builtins::is_builtin_id(id),
                     None => crate::builtins::is_builtin(name.as_str()),
                 };
-                known && crate::builtins::available_on(name.as_str(), self.target)
+                i64::from(known && crate::builtins::available_on(name.as_str(), self.target))
             }
             BuiltinMacro::HasFeature | BuiltinMacro::HasExtension => {
                 let name = self.token_to_string(first_tok, idents);
                 // Return true for features/extensions we implement
-                matches!(
+                i64::from(matches!(
                     name.as_str(),
                     // GNU extensions
                     "statement_expressions" |
@@ -1935,9 +1937,9 @@ impl<'a> Preprocessor<'a> {
                     "c_alignof" |
                     "c_thread_local" |
                     "c_generic_selections"
-                )
+                ))
             }
-            _ => false,
+            _ => 0,
         }
     }
 }

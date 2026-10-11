@@ -696,6 +696,7 @@ impl Parser<'_> {
                 ))
             })()),
             crate::kw::BUILTIN_CLEAR_PADDING => Some(self.parse_clear_padding(token_pos)),
+            crate::kw::BUILTIN_HAS_ATTRIBUTE => Some(self.parse_has_attribute(token_pos)),
             crate::kw::BUILTIN_ALLOCA | crate::kw::ALLOCA => Some((|| {
                 // gcc's prototype is `void *(size_t)`, for either spelling.
                 use super::library_builtin::ProtoType::{SizeT, VoidPtr};

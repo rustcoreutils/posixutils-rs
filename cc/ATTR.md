@@ -10,6 +10,7 @@ what `__has_attribute` answers for it, and how to add a new one.
 - [Accepted and Ignored](#accepted-and-ignored)
 - [Not Recognised](#not-recognised)
 - [`__has_attribute`](#__has_attribute)
+- [`__builtin_has_attribute`](#__builtin_has_attribute)
 - [Adding an Attribute](#adding-an-attribute)
 - [References](#references)
 
@@ -53,11 +54,15 @@ diagnostic, in the `-Wattributes` group:
 
 | Written | Diagnostic |
 |---------|------------|
-| A function's own attribute (`cold`, `hot`, `noinline`, `always_inline`, `pure`, `constructor`, `destructor`, `leaf`, `noclone`, `gnu_inline`, `artificial`, `optimize`, `target`, `target_clones`, `stack_protect`, `no_stack_protector`, `no_sanitize_*`, `noreturn`, `returns_twice`, `nothrow`) on anything but a function | "'X' attribute ignored" |
+| A function's own attribute (`cold`, `hot`, `noinline`, `always_inline`, `pure`, `constructor`, `destructor`, `leaf`, `noclone`, `gnu_inline`, `artificial`, `optimize`, `target`, `target_clones`, `stack_protect`, `no_stack_protector`, `no_sanitize`, `no_sanitize_*`, `no_address_safety_analysis`, `noreturn`, `returns_twice`, `nothrow`, `error`, `warning`, `flatten`, `noipa`, `no_profile_instrument_function`, `indirect_branch`, `function_return`) on anything but a function | "'X' attribute ignored" |
 | `const` on anything but a function or a pointer to one, or on a typedef | "'const' attribute ignored" |
 | `malloc` on anything but a function | "'malloc' attribute ignored; valid only for functions" |
-| A function type's attribute (`nonnull`, `format`, `warn_unused_result`, `sentinel`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `access`) on anything but a function, a pointer to one, or a typedef of either | "'X' attribute only applies to function types" |
-| `no_instrument_function` on anything but a function | an error |
+| A function type's attribute (`nonnull`, `format`, `format_arg`, `warn_unused_result`, `sentinel`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `access`, `no_caller_saved_registers`) on anything but a function, a pointer to one, or a typedef of either | "'X' attribute only applies to function types" |
+| `no_instrument_function`, `zero_call_used_regs` on anything but a function | an error, "'X' attribute applies only to functions" |
+| `patchable_function_entry` on anything but a function | ignored in silence, as gcc does |
+| `tls_model` on a function, typedef, member or parameter; on an object that is not `_Thread_local` | "'tls_model' attribute ignored because 'x' is not a variable"; "... does not have thread storage duration" |
+| `uninitialized` on a function, typedef, member or parameter; on an object with static storage | "'uninitialized' attribute ignored because 'x' is not a variable"; "... is not a local variable" |
+| `retain` on a typedef, member, parameter, automatic variable or `extern` object | "'retain' attribute ignored" |
 | `weak` on a name without external linkage | an error, "weak declaration of 'x' must be public" |
 | `visibility` on a name without external linkage | "'visibility' attribute ignored" |
 | `alias` on a name with no linkage; `used` on an automatic object | "'X' attribute ignored" |
@@ -78,8 +83,12 @@ A bad argument drops the attribute after a diagnostic:
 | `aligned` | error unless a power of two no larger than 2^28; `aligned(0)` is a warning and ignored |
 | `vector_size` | error unless a positive constant |
 | `constructor`, `destructor` | error unless 0 to 65535 |
-| `nonnull`, `nonnull_if_nonzero`, `sentinel`, `alloc_size`, `alloc_align`, `regparm` | warning; the attribute is dropped |
+| `nonnull`, `sentinel`, `alloc_size`, `alloc_align`, `regparm` | warning; the attribute is dropped |
 | `assume_aligned` | warning unless one or two constants, the first a power of two and the second below it ("argument N is not a power of 2", "... is not in the range [0, N-1]"); the wrong count is an error |
+| `error`, `warning`, `tls_model` | one string, else an error ("wrong number of arguments specified for 'X' attribute", with gcc's note "expected 1, found N"); for `error` and `warning` an argument that is not a string warns "'X' attribute ignored"; for `tls_model` it is an error ("argument not a string"), as is a string naming no model |
+| `zero_call_used_regs` | one string naming one of `-fzero-call-used-regs=`'s choices, else gcc's error ("unrecognized ... attribute argument", "argument not a string", the count) |
+| `patchable_function_entry` | one or two counts from 0 to 65535: the wrong count is an error (note "expected between 1 and 2"); a negative or non-integer one warns "is not an integer constant", a larger one "exceeds 65535", and the attribute is dropped; a second count above the first warns "patchable function entry M exceeds size N" and is read as 0 |
+| `no_sanitize` | one or more strings, each a comma-separated list of sanitizers: none, or one not a string, is an error; a name gcc does not know warns "'name' attribute directive ignored", as gcc's does |
 
 The arguments of an unrecognised attribute are skipped without being parsed.
 
@@ -117,6 +126,16 @@ The arguments of an unrecognised attribute are skipped without being parsed.
 | `cleanup(fn)` | Automatic variables | `fn(&var)` runs whenever `var` leaves its scope, as in gcc: innermost scope first and in reverse declaration order; on falling out of a block, a `for` loop's declaration or a statement expression, after the statement expression's value is computed; on `return`, after the value returned is computed, side effects included; on `break` and `continue`, each time round; and on a `goto` out of the scope, forward or backward. A computed `goto`, an `asm goto`'s jump, `longjmp` and `exit` run none, as in gcc. A returned or statement-expression value the IR keeps in memory -- a complex number, a vector, an aggregate wider than a register -- is copied out before the cleanups run. The parser builds the call and checks it as any call (`Parser::cleanup_call`), so an argument the prototype cannot take draws the usual warning or error; the linearizer keeps the calls of the variables in scope on a stack, and one question, how much of it is still in scope where an exit lands, decides what every exit runs (`ir/linearize_cleanup.rs`); a `goto` learns its label's cleanup scopes from the jump-scope walk, which runs before lowering. A jump into the scope is accepted, as in gcc. An argument that is not a bare name is an error ("cleanup argument not an identifier"), as is a name that is not a function ("cleanup argument not a function") and anything but one argument. On a `static`, file-scope, `typedef`, function, member or parameter declaration it warns "'cleanup' attribute ignored"; on a block-scope `extern` it is ignored in silence, as gcc does. Under `-fexceptions` the cleanups also run when the frame is unwound through a call in their scope -- thread cancellation, `pthread_exit`, a forced or foreign unwind -- through gcc's LSDA, `__gcc_personality_v0` and a landing pad per call that may throw (`ir/linearize_cleanup.rs`, `arch/eh.rs`) |
 | `nothrow` | Functions | The function never unwinds through its caller, so under `-fexceptions` a call to it needs no landing pad, as in gcc; glibc's `__THROW` puts it on most of libc. Carried on the function type, as `noreturn` is |
 | `section("name")` | Functions, variables | Places the symbol in the named section, ahead of every other rule -- including the zero-initialized fast path, since `.comm` would let the linker choose. ELF flags follow the contents: `"ax"` for code, `"aw"` for mutable data, `"a"` for read-only data |
+| `retain` | Functions, objects with static storage | The definition goes in a section of its own, named as `-ffunction-sections` and `-fdata-sections` name it (`.text.f`, `.data.x`, `.bss.x`, `.rodata.x`, `.data.rel.ro.x`, `.tdata.x`, `.tbss.x`), or in the section it names, marked `SHF_GNU_RETAIN` (`R`) so `ld --gc-sections` keeps it, as gcc 13 writes it with binutils 2.36 and later; a tentative definition is no common symbol. It does not keep an unreferenced `static` the optimizer may drop -- that is `used`. gcc's warning when a retained and an unretained definition share a named section is not given. Mach-O has no such flag, and there it does nothing. The Linux kernel's `__retain` |
+| `error("msg")`, `warning("msg")` | Functions | Each call of the function that survives optimization is reported at the call, as gcc reports it: "call to 'f' declared with attribute error: msg" is an error, the `warning` form a warning in `-Wattribute-warning`; with both, both, the error first. Checked after the optimizer (`opt::report_attribute_calls`), so a call in a branch it proved dead -- or never generated, a constant condition being decided at `-O0` too -- or one it inlined away is no call; the Linux kernel's `BUILD_BUG_ON` and `compiletime_assert` rely on that, and glibc's `__warndecl`/`__errordecl`. Written on any declaration of the name, block-scope `extern` and after the call included. Carried in `SymbolAttrs::call_diagnostics`. A call through a pointer is reported only when it is a direct call by then, and c17's optimizer does not make it one where gcc's does |
+| `tls_model("model")` | Thread-locals | The variable's access model, as written, in place of what the code could prove and of `-ftls-model=`, as gcc does: `initial-exec` on an executable's own thread-local, `global-dynamic` anywhere, `local-exec` in shared code. `local-dynamic` is the descriptor call of `global-dynamic`, as `-ftls-model=` makes it. One rule, `ir::Module::tls_model`, decides each thread-local's model for both `ir::tls`, which expands only the accesses made by a call, and the backends. Mach-O always calls the TLV getter |
+| `flatten` | Functions | When optimizing, every call in the body whose callee this unit defines and can inline is inlined, and so is every call in what was inlined, past every size cap (`ir::inline::flatten_splices`), as gcc 13 flattens. A `noinline`, `noipa`, interposable or self-recursive callee stays a call, as does one on a cycle of calls; at `-O0` nothing is inlined, as in gcc |
+| `noipa` | Functions | No caller learns anything from the body: never inlined, and no memory effect is inferred from it (`ir::effects`), so a call to one is a call that may touch any memory |
+| `indirect_branch("choice")`, `function_return("choice")` | Functions (x86-64) | The function's own `-mindirect-branch=` and `-mfunction-return=`: `keep`, `thunk`, `thunk-inline` or `thunk-extern`, over the options. Anything else warns as gcc does and is dropped. Not attributes on aarch64 |
+| `patchable_function_entry(N[, M])` | Functions | The function's own `-fpatchable-function-entry=N,M`, over the option (`target::ShapeAttrs`, read by `CodeGenBase::shape_of`): `(0)` takes the function out of the option, and `M` is 0 when not given. ELF only; on Mach-O, which refuses the option, it does nothing. The Linux kernel's `notrace` |
+| `zero_call_used_regs("choice")` | Functions (x86-64) | The function's own `-fzero-call-used-regs=`, over the option: `skip` takes it out. Not an attribute on aarch64, where c17 has no `-fzero-call-used-regs=` either |
+| `no_caller_saved_registers` | Functions (x86-64) | The function preserves every general register it changes: besides the callee-saved ones it uses, it saves and restores every call-clobbered one but those its value is returned in (`X86_64CodeGen::call_clobbered_to_preserve`) -- all of them, where gcc saves only those it or its callees use, which preserves the same registers. gcc saves no SSE register for one and so compiles none while SSE is on: "sorry, unimplemented: SSE instructions aren't allowed in a function with the 'no_caller_saved_registers' attribute", unless `-mgeneral-regs-only` or `-mno-sse`. A caller does not rely on the registers it preserves. Not an attribute on aarch64. The Linux kernel's `__no_caller_saved_registers` |
+| `uninitialized` | Automatic variables | `-ftrivial-auto-var-init=` leaves the variable as C does, uninitialized |
 
 ### `noreturn` spellings
 
@@ -138,15 +157,21 @@ else happens. Each is either a pure hint or something ignoring cannot change
 the result of a correct program. glibc puts most of them on every declaration.
 
 `unused`, `deprecated`, `hot`, `cold`, `warn_unused_result`, `format`,
-`nonstring`, `malloc`, `sentinel`, `nonnull`, `nonnull_if_nonzero`,
+`format_arg` (glibc's `__attribute_format_arg__` on `gettext`),
+`nonstring`, `malloc`, `sentinel`, `nonnull`,
 `returns_nonnull`, `access`, `externally_visible`,
-`abi_tag`, `weakref`, `simd`, `regparm`, `leaf`, `alloc_size`, `alloc_align`,
-`assume_aligned` (the Linux kernel's `__assume_aligned`),
-`noclone`, `copy`, `designated_init`, `may_alias`,
-`artificial`, `no_sanitize_memory`, `no_sanitize_address`, `no_sanitize_thread`,
-`optimize`.
+`weakref`, `simd`, `regparm` (x86-64 only, as in gcc), `leaf`, `alloc_size`,
+`alloc_align`, `assume_aligned` (the Linux kernel's `__assume_aligned`),
+`noclone`, `copy`, `designated_init`, `may_alias`, `artificial`,
+`no_sanitize`, `no_sanitize_address`, `no_sanitize_thread`,
+`no_sanitize_undefined`, `no_sanitize_coverage`, `no_address_safety_analysis`
+(c17 refuses `-fsanitize=` and inserts no sanitizer),
+`no_profile_instrument_function` (the Linux kernel's `__no_profile`; c17
+refuses `-fprofile-arcs` and inserts no counter), `optimize`.
 
-No diagnostic comes from `deprecated`, `warn_unused_result` or `format`.
+No diagnostic comes from `deprecated`, `warn_unused_result`, `format` or
+`format_arg`: c17 has no `-Wformat`, so there is no format check for
+`format_arg` to look through.
 `optimize(...)` takes any arguments and is ignored without a word, as an ISA
 beyond the ceiling in `target` is: it only changes how gcc optimizes the one
 function (libzstd's `DONT_VECTORIZE`, `optimize("no-tree-vectorize")`, under
@@ -187,17 +212,49 @@ whatever it would have left pending for a declarator is discarded.
 ## Not Recognised
 
 Any other name warns "'name' attribute directive ignored", suppressible with
-`-Wno-attributes`, and its arguments are skipped.
+`-Wno-attributes`, and its arguments are skipped. Among them are gcc 13's own
+omissions -- `abi_tag` (C++'s), `nonnull_if_nonzero` and `counted_by` (gcc
+15's), `no_sanitize_memory` (clang's) -- which gcc 13 warns about too. The
+Linux kernel enables `__counted_by` only when a probe compiling one under
+`-Werror` passes, so it does not use it with c17, as with gcc 13.
 
 ## `__has_attribute`
 
-Answers 1 exactly when `kw::attribute_supported` does: the name carries the
-`SUPPORTED_ATTR` tag in `kw.rs` -- every attribute in the two sections above,
-in both spellings, plus `__const` -- and is not tagged `X86_64_ONLY` on
-another target (`ms_abi`, `sysv_abi`). The parser's "directive ignored"
-warning and both evaluators ask that one function -- `eval_has_attribute` in
-`token/preprocess.rs` (`#if`) and the `BuiltinMacro::HasAttribute` arm in
-`token/preprocess_macro.rs` -- so there is no second list to keep in step.
+Answers as gcc 13 does, through one function, `kw::has_attribute`, which
+both evaluators ask -- `eval_has_attribute` in `token/preprocess.rs` (`#if`)
+and the `BuiltinMacro::HasAttribute` arm in `token/preprocess_macro.rs` -- so
+there is no second list to keep in step. It is nonzero exactly when
+`kw::attribute_supported` is, which the parser's "directive ignored" warning
+asks too: the name carries the `SUPPORTED_ATTR` tag in `kw.rs` -- every
+attribute in the two sections above, in both spellings -- and is not tagged
+`X86_64_ONLY` on another target (`ms_abi`, `sysv_abi`, `regparm`,
+`indirect_branch`, `function_return`, `zero_call_used_regs`,
+`no_caller_saved_registers`). The value is 1, but for the three standard
+attributes gcc also knows by their GNU names, which answer the version of
+the C standard that added them, in either spelling: `deprecated` 201904,
+`fallthrough` 201910, `noreturn` 202202. `__const` is accepted as an
+attribute and answers 0, as in gcc.
+
+## `__builtin_has_attribute`
+
+`__builtin_has_attribute(T-or-E, attribute)` is an integer constant: whether
+the declaration `E` names (through `*&`, as gcc reads it) or, for a type-name
+or an expression naming no declaration, the type, has the attribute. The
+operand is not evaluated. Every attribute written on a declaration is
+recorded against what it declares (`Parser::written_attrs`, keyed by name
+for a declaration with linkage, whose definition binds a fresh symbol), and
+a declaration has the attribute when any of its declarations wrote it.
+Asked with arguments, gcc's comparison of them is applied where gcc compares
+them -- `aligned`'s value, a `section`, `visibility`, `error`/`warning`
+message, `alias`/`ifunc` target or `vector_size`, and `nonnull`'s positions
+(a `nonnull` naming none answers a query naming any, and a query naming none
+answers only one) -- and elsewhere the name alone decides, as gcc's does. A
+type has `aligned` (and its value), `packed`, `vector_size`,
+`transparent_union`, `scalar_storage_order` and, on a function type,
+`noreturn`. A name that is no attribute is gcc's error, "unknown attribute
+'X'". gcc's own oddities for `constructor` and `tls_model` with arguments,
+and for an attribute it applies to a scratch declaration to check, are not
+reproduced.
 
 ```c
 #if __has_attribute(noreturn)
@@ -264,6 +321,10 @@ In order:
    specifiers' share and `Parser::begin_declarator` restores it for each
    declarator. A value that must belong to one declarator only is *taken* when
    consumed, as `Parser::take_pending_fn_effect` takes the memory effect.
+   Every list also lands as written in `pending_written_attrs`, recorded for
+   `__builtin_has_attribute` when the declarator is bound; a new attribute
+   needs nothing there unless gcc compares its arguments
+   (`has_attribute::arguments_match`).
 
 5. **Semantics.** Apply it in the IR pass or backend that owns the behaviour,
    on both targets and both object formats; where a format cannot express it,

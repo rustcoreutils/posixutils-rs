@@ -394,6 +394,42 @@ pub struct FunctionShape {
     pub zero_regs: ZeroRegs,
 }
 
+/// What one function's own attributes say of how it begins and ends, over
+/// the command line's [`FunctionShape`]: `patchable_function_entry(N[, M])`
+/// and `zero_call_used_regs("...")`, each the per-function form of its
+/// option, as in gcc.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShapeAttrs {
+    /// `patchable_function_entry(N[, M])`: `Some(None)` for `N` 0, which
+    /// takes the function out of `-fpatchable-function-entry=`.
+    pub patchable: Option<Option<PatchableEntry>>,
+    /// `zero_call_used_regs("...")`.
+    pub zero_regs: Option<ZeroRegs>,
+}
+
+impl ShapeAttrs {
+    /// Fold in a later declaration's: what it gives replaces what an
+    /// earlier one gave.
+    pub fn merge(&mut self, other: ShapeAttrs) {
+        if other.patchable.is_some() {
+            self.patchable = other.patchable;
+        }
+        if other.zero_regs.is_some() {
+            self.zero_regs = other.zero_regs;
+        }
+    }
+
+    /// The shape of a function with these attributes, in a unit whose
+    /// options give `shape`.
+    pub fn apply(self, shape: FunctionShape) -> FunctionShape {
+        FunctionShape {
+            patchable: self.patchable.unwrap_or(shape.patchable),
+            zero_regs: self.zero_regs.unwrap_or(shape.zero_regs),
+            ..shape
+        }
+    }
+}
+
 /// `-fstack-clash-protection`'s two `--param`s, as written: each the log2 of
 /// a byte count. c17 probes no stack; these move where gcc would, and so
 /// which functions c17 warns about.
@@ -1929,6 +1965,20 @@ impl TlsPolicy {
     pub fn initial_exec(self, is_extern: bool) -> bool {
         self.floor < TlsModel::LocalExec && (is_extern || self.shared_code)
     }
+
+    /// The model of every access to a thread-local: the one its
+    /// `tls_model` attribute names (`declared`), which gcc uses as written
+    /// -- even where the code could prove a stronger one, and whatever
+    /// `-ftls-model=` says -- and otherwise the strongest this policy allows
+    /// for one defined here or, `is_extern`, elsewhere.
+    pub fn model(self, is_extern: bool, declared: Option<TlsModel>) -> TlsModel {
+        match declared {
+            Some(model) => model,
+            None if self.dynamic() => TlsModel::GlobalDynamic,
+            None if self.initial_exec(is_extern) => TlsModel::InitialExec,
+            None => TlsModel::LocalExec,
+        }
+    }
 }
 
 /// The order in which the bytes of a multi-byte scalar lie in memory: what
@@ -2255,18 +2305,19 @@ impl Default for Target {
 }
 
 impl Target {
-    /// How this target obtains a thread-local's address under `policy`.
+    /// How this target obtains the address of a thread-local of `model`
+    /// ([`TlsPolicy::model`]).
     ///
     /// ELF (Linux, FreeBSD) folds Local and Initial Exec into the access and
-    /// needs a descriptor call only where the policy is dynamic, and only
-    /// Linux takes the descriptor model here: FreeBSD's shared code uses
-    /// Initial Exec, never Local Exec (see [`TlsPolicy::initial_exec`]).
-    /// Mach-O always calls the TLV getter, whatever `-ftls-model=` says, as
+    /// needs a descriptor call only for a dynamic model, and only Linux takes
+    /// the descriptor model here: FreeBSD's shared code uses Initial Exec,
+    /// never Local Exec (see [`TlsPolicy::initial_exec`]). Mach-O always
+    /// calls the TLV getter, whatever `-ftls-model=` or `tls_model` says, as
     /// clang does.
-    pub fn tls_access(&self, policy: TlsPolicy) -> TlsAccess {
+    pub fn tls_access(&self, model: TlsModel) -> TlsAccess {
         match self.os {
             Os::MacOS => TlsAccess::MachOTlv,
-            Os::Linux if policy.dynamic() => TlsAccess::ElfDescriptor,
+            Os::Linux if model <= TlsModel::LocalDynamic => TlsAccess::ElfDescriptor,
             Os::Linux | Os::FreeBSD => TlsAccess::ElfStatic,
         }
     }
@@ -2546,11 +2597,12 @@ mod tests {
     /// and only Linux takes the descriptor model; FreeBSD is ELF too.
     #[test]
     fn test_tls_access_per_target() {
-        let exe = TlsPolicy::default();
+        let exe = TlsPolicy::default().model(false, None);
         let shared = TlsPolicy {
             shared_code: true,
             ..TlsPolicy::default()
-        };
+        }
+        .model(false, None);
         for arch in [Arch::X86_64, Arch::Aarch64] {
             let mac = Target::new(arch, Os::MacOS);
             assert_eq!(mac.tls_access(exe), TlsAccess::MachOTlv);
@@ -2596,6 +2648,33 @@ mod tests {
         assert_eq!(TlsModel::from_name("local-exec"), Some(LocalExec));
         assert_eq!(TlsModel::from_name("bogus"), None);
         assert!(GlobalDynamic < LocalDynamic && InitialExec < LocalExec);
+    }
+
+    /// A `tls_model` attribute is the access's model as written, weaker or
+    /// stronger than what the policy alone gives, as in gcc; without one
+    /// the model is the policy's.
+    #[test]
+    fn test_tls_model_attribute_overrides_the_policy() {
+        use TlsModel::*;
+        let exe = TlsPolicy::default();
+        let pic = TlsPolicy {
+            shared_code: true,
+            floor: GlobalDynamic,
+        };
+        let le = TlsPolicy {
+            shared_code: true,
+            floor: LocalExec,
+        };
+        for policy in [exe, pic, le] {
+            for model in [GlobalDynamic, LocalDynamic, InitialExec, LocalExec] {
+                assert_eq!(policy.model(false, Some(model)), model);
+                assert_eq!(policy.model(true, Some(model)), model);
+            }
+        }
+        assert_eq!(exe.model(false, None), LocalExec);
+        assert_eq!(exe.model(true, None), InitialExec);
+        assert_eq!(pic.model(false, None), GlobalDynamic);
+        assert_eq!(le.model(true, None), LocalExec);
     }
 
     /// The `-fpic` family: each spelling, the per-target default, and what

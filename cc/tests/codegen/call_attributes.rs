@@ -12,10 +12,11 @@
 // the *pointer* type as a `volatile` function -- does a call through the
 // function's address. `__typeof__` of the function names its bare type, and
 // a typedef of a function type cannot carry them at all, so a function or a
-// pointer declared from either is an ordinary one, free to return.
+// pointer declared from either is an ordinary one, free to return. And the
+// `error` attribute, which refuses only a call that survives optimization.
 //
 
-use crate::common::compile_and_run_everywhere;
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere};
 
 /// Each call below reaches a function that returns. c17 put `noreturn` on
 /// the function's type, so every declaration spelled through `__typeof__` or
@@ -48,4 +49,35 @@ int main(void)
 }
 "#;
     compile_and_run_everywhere("noreturn_typeof_typedef", src);
+}
+
+/// The Linux kernel's `BUILD_BUG_ON`: a call to a block-scope `__error__`
+/// function in a branch that folds away once `check` is inlined with a
+/// constant. Optimized, the program builds and runs on both targets.
+#[test]
+fn kernel_build_bug_on_builds_when_optimized() {
+    let src = r#"
+#define __compiletime_assert(condition, msg, prefix, suffix)            \
+    do {                                                                \
+        extern void prefix ## suffix(void) __attribute__((__error__(msg))); \
+        if (!(condition))                                               \
+            prefix ## suffix();                                         \
+    } while (0)
+#define _compiletime_assert(condition, msg, prefix, suffix) \
+    __compiletime_assert(condition, msg, prefix, suffix)
+#define BUILD_BUG_ON(cond) \
+    _compiletime_assert(!(cond), "BUILD_BUG_ON failed: " #cond, __compiletime_assert_, __COUNTER__)
+static inline int check(int n) { BUILD_BUG_ON(n > 8); return n * 2; }
+int main(void) { BUILD_BUG_ON(sizeof(int) != 4); return check(4) - 8; }
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("build_bug_on", src, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+        if let Some(code) = compile_and_run_aarch64("build_bug_on", src, opt) {
+            assert_eq!(code, 0, "aarch64 {opt}");
+        }
+    }
 }

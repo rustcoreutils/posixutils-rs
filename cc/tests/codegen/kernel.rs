@@ -306,3 +306,76 @@ int main(void) { return f(64) == 63 ? 0 : 1; }
         );
     }
 }
+
+/// `patchable_function_entry` and `zero_call_used_regs` give one function
+/// what their options give every function: a record and nops for `f`
+/// alone, `(0)` taking `g` out of the option, and cleared registers
+/// around a result that survives.
+#[test]
+fn codegen_kernel_per_function_attributes_run() {
+    let src = r#"
+extern const unsigned long __start___patchable_function_entries[];
+extern const unsigned long __stop___patchable_function_entries[];
+__attribute__((noinline, patchable_function_entry(3, 1))) int f(int x) { return x + 1; }
+__attribute__((noinline, patchable_function_entry(0))) int g(int x) { return x + 2; }
+__attribute__((noinline, zero_call_used_regs("all-gpr"))) long mix(long a, long b) { return a * b; }
+int main(void) {
+    long n = __stop___patchable_function_entries - __start___patchable_function_entries;
+    const unsigned char *fp = (const unsigned char *)f;
+    if (n < 1 || (const unsigned char *)__start___patchable_function_entries[0] != fp - 1)
+        return 1;
+    for (int k = 0; k < 3; k++)
+        if (fp[k - 1] != 0x90) return 2;
+    if (f(41) != 42 || g(40) != 42 || mix(6, 7) != 42) return 3;
+    return 0;
+}
+"#;
+    for flags in [
+        &["-O0"][..],
+        &["-O2"],
+        &["-O2", "-fpatchable-function-entry=2"],
+    ] {
+        assert_eq!(
+            compile_and_run("fn_shape_attrs", src, &opts(flags)),
+            0,
+            "{flags:?}"
+        );
+    }
+}
+
+/// A `no_caller_saved_registers` function, built with no SSE as gcc 13
+/// requires, returns with every general register as it found it, the
+/// call-clobbered ones included, though it calls an ordinary function that
+/// changes them: inline assembly loads each with a value, calls it, and
+/// sums them.
+#[test]
+fn codegen_kernel_no_caller_saved_registers_preserves_registers() {
+    let src = r#"
+int g;
+__attribute__((noinline)) void ext(int x) { g = g * 7 + x; }
+__attribute__((no_caller_saved_registers)) void keep(void) { ext(1); g = g * 3 / 2 + 5; }
+int main(void) {
+    long sum;
+    __asm__ volatile(
+        "movq $11, %%rcx\n\tmovq $12, %%rdx\n\tmovq $13, %%rsi\n\tmovq $14, %%rdi\n\t"
+        "movq $15, %%r8\n\tmovq $16, %%r9\n\tmovq $17, %%r10\n\tmovq $18, %%r11\n\t"
+        "movq $19, %%rax\n\t"
+        "subq $128, %%rsp\n\tcall keep\n\taddq $128, %%rsp\n\t"
+        "addq %%rcx, %%rax\n\taddq %%rdx, %%rax\n\taddq %%rsi, %%rax\n\taddq %%rdi, %%rax\n\t"
+        "addq %%r8, %%rax\n\taddq %%r9, %%rax\n\taddq %%r10, %%rax\n\taddq %%r11, %%rax\n\t"
+        "movq %%rax, %0"
+        : "=m"(sum)
+        :
+        : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory", "cc");
+    if (sum != 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19) return 1;
+    return g == 6 ? 0 : 2;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("ncsr_run", src, &opts(&[opt, "-mgeneral-regs-only"])),
+            0,
+            "{opt}"
+        );
+    }
+}

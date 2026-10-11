@@ -433,6 +433,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                 {
                     self.module
                         .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
+                } else {
+                    self.module
+                        .add_call_diagnostics(&name, &declarator.symbol_attrs.call_diagnostics);
                 }
                 if !is_block_scope_function && !self.module.globals.iter().any(|g| g.name == name) {
                     self.module.extern_symbols.insert(name.clone());

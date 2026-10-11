@@ -25,6 +25,7 @@ mod declarator;
 pub(crate) mod expr_check;
 mod expression;
 mod generic_builtin;
+mod has_attribute;
 mod library_builtin;
 mod linkage;
 mod lowering_builtin;
@@ -53,6 +54,8 @@ mod test_expr_constraints;
 mod test_file_scope_asm;
 #[cfg(test)]
 mod test_float_n;
+#[cfg(test)]
+mod test_gnu_attributes;
 #[cfg(test)]
 mod test_gnu_builtins;
 #[cfg(test)]

@@ -661,7 +661,65 @@ pub fn optimize_module(
     // An address that survived everything above would reach the link as an
     // undefined reference to the suppressed body.
     report_forwarder_copies(&forwarder_addresses(module, &forwarders));
+    report_attribute_calls(module);
     report
+}
+
+/// gcc's diagnostic for every call that survived optimization to a
+/// function declared with `error("msg")` or `warning("msg")`, at the call,
+/// the error first.
+///
+/// After the optimizer, as gcc reports them while expanding the calls that
+/// are left: a call in a branch the optimizer proved dead is no call, which
+/// is what the Linux kernel's `BUILD_BUG_ON` relies on, and a call inlined
+/// into another function is reported once, where it was written. A call
+/// through a pointer the optimizer made direct is a direct call by then.
+fn report_attribute_calls(module: &Module) {
+    use crate::parse::ast::CallDiagnostics;
+    let defined = module
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), &f.symbol_attrs.call_diagnostics));
+    let declared = module
+        .declared_symbol_attrs
+        .iter()
+        .map(|(name, attrs)| (name.as_str(), &attrs.call_diagnostics));
+    let said: std::collections::HashMap<&str, &CallDiagnostics> = defined
+        .chain(declared)
+        .filter(|(_, d)| d.error.is_some() || d.warning.is_some())
+        .collect();
+    if said.is_empty() {
+        return;
+    }
+    for func in module.functions.iter().filter(|f| f.emit) {
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            if insn.op != Opcode::Call {
+                continue;
+            }
+            let Some(callee) = insn.extra().func_name.as_deref() else {
+                continue;
+            };
+            let Some(diags) = said.get(callee) else {
+                continue;
+            };
+            let pos = insn.pos.unwrap_or_default();
+            if let Some(msg) = &diags.error {
+                crate::diag::error_args(
+                    pos,
+                    "call to '{0}' declared with attribute error: {1}",
+                    &[callee, msg],
+                );
+            }
+            if let Some(msg) = &diags.warning {
+                crate::diag::group_warning_args(
+                    "attribute-warning",
+                    pos,
+                    "call to '{0}' declared with attribute warning: {1}",
+                    &[callee, msg],
+                );
+            }
+        }
+    }
 }
 
 /// Run the per-function passes over every function, each for at most

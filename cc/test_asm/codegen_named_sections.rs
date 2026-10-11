@@ -208,3 +208,60 @@ fn codegen_named_section_type_conflicts_are_errors() {
         }
     }
 }
+
+/// `retain`: the definition gets a section of its own, as under
+/// `-ffunction-sections` and `-fdata-sections`, carrying `SHF_GNU_RETAIN`
+/// (`R`) so `ld --gc-sections` keeps it; in a section the program named, that
+/// section is marked so. A tentative definition is no common symbol, and a
+/// block-scope static is retained too. gcc 13's flags, with binutils 2.36 or
+/// later. The attribute was ignored with a warning.
+#[test]
+fn codegen_retain_marks_its_own_section() {
+    let src = r#"
+__attribute__((retain, used)) int rv = 1;
+__attribute__((__retain__)) int rz;
+__attribute__((retain)) int rt;
+__attribute__((retain)) const int rc = 5;
+__attribute__((retain)) const char *const rp = "x";
+__attribute__((retain)) __thread int rtl = 3;
+__attribute__((retain)) __thread int rtz;
+__attribute__((retain, used, section("mysec"))) int sv = 3;
+__attribute__((retain)) void rf(void) {}
+__attribute__((retain, section("fsec"))) void sf(void) {}
+extern int ext;
+int g(void) { static int s __attribute__((retain)) = 1; return s++ + ext; }
+"#;
+    let want = [
+        ("rv", ".section .data.rv,\"awR\""),
+        ("rz", ".section .bss.rz,\"awR\",@nobits"),
+        ("rt", ".section .bss.rt,\"awR\",@nobits"),
+        ("rc", ".section .rodata.rc,\"aR\""),
+        ("rp", ".section .data.rel.ro.rp,\"awR\""),
+        ("rtl", ".section .tdata.rtl,\"awTR\",@progbits"),
+        ("rtz", ".section .tbss.rtz,\"awTR\",@nobits"),
+        ("sv", ".section mysec,\"awR\""),
+        ("rf", ".section .text.rf,\"axR\""),
+        ("sf", ".section fsec,\"axR\""),
+        ("g.s.0", ".section .data.g.s.0,\"awR\""),
+    ];
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        for flags in [&["-O0"][..], &["-O2", "-fcommon"], &["-O2", "-fPIC"]] {
+            let mut all = vec![triple];
+            all.extend_from_slice(flags);
+            let target = format!("--target={triple}");
+            let mut args = vec![target.as_str()];
+            args.extend_from_slice(flags);
+            let c = compile("retain", src, &args);
+            assert!(c.stderr.is_empty(), "{all:?}:\n{}", c.stderr);
+            let asm = c.asm.expect("compiled");
+            for (name, section) in want {
+                assert_eq!(
+                    section_of(&asm, name),
+                    Some(section),
+                    "{all:?} {name}:\n{asm}"
+                );
+            }
+            assert_eq!(section_of(&asm, "ext"), None, "{all:?}:\n{asm}");
+        }
+    }
+}

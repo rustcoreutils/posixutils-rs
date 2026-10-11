@@ -2836,6 +2836,43 @@ pub struct SymbolAttrs {
     /// `uninitialized`: an automatic variable `-ftrivial-auto-var-init`
     /// leaves as C does, uninitialized.
     pub uninitialized: bool,
+    /// `warning("msg")` and `error("msg")`: what to say of each call to the
+    /// function that survives optimization. Carried with the symbol's
+    /// attributes because, as in gcc, one written on any declaration of the
+    /// name -- before or after a call, at block scope too -- applies to every
+    /// call; `opt::report_attribute_calls` reads them.
+    pub call_diagnostics: CallDiagnostics,
+    /// `tls_model("...")`: the access model of a thread-local, which gcc
+    /// uses whatever the code could prove and whatever `-ftls-model=` says
+    /// (`ir::Module::tls_model`).
+    pub tls_model: Option<crate::target::TlsModel>,
+    /// `retain`: the definition goes in a section of its own, or the one
+    /// it names, marked `SHF_GNU_RETAIN` so `ld --gc-sections` keeps it.
+    /// ELF only.
+    pub retain: bool,
+}
+
+/// The messages gcc's `error` and `warning` function attributes attach to
+/// every call of the function that survives optimization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallDiagnostics {
+    /// `error("msg")`: each such call is an error.
+    pub error: Option<String>,
+    /// `warning("msg")`: each such call is a warning, `-Wattribute-warning`.
+    pub warning: Option<String>,
+}
+
+impl CallDiagnostics {
+    /// Fold in another declaration's: a later message replaces an earlier
+    /// one, as a later attribute does in gcc.
+    pub fn merge(&mut self, other: &CallDiagnostics) {
+        if other.error.is_some() {
+            self.error = other.error.clone();
+        }
+        if other.warning.is_some() {
+            self.warning = other.warning.clone();
+        }
+    }
 }
 
 /// How a name declared with `alias` or `ifunc` is bound to the symbol its
@@ -2882,6 +2919,11 @@ impl SymbolAttrs {
             self.cleanup = other.cleanup;
         }
         self.uninitialized |= other.uninitialized;
+        self.call_diagnostics.merge(&other.call_diagnostics);
+        if other.tls_model.is_some() {
+            self.tls_model = other.tls_model;
+        }
+        self.retain |= other.retain;
     }
 }
 
@@ -3065,6 +3107,19 @@ pub struct FunctionAttrs {
     pub symbol: SymbolAttrs,
     /// `indirect_branch(...)` and `function_return(...)`.
     pub branches: crate::machine::BranchAttrs,
+    /// `patchable_function_entry(...)` and `zero_call_used_regs(...)`.
+    pub shape: crate::target::ShapeAttrs,
+    /// `__attribute__((flatten))`: when optimizing, every call in the body
+    /// is inlined, and every call in what is inlined, where the callee can
+    /// be.
+    pub flatten: bool,
+    /// `__attribute__((noipa))`: no caller learns anything from the body --
+    /// it is never inlined, and no effect is inferred from it.
+    pub noipa: bool,
+    /// `__attribute__((no_caller_saved_registers))` (x86-64): the function
+    /// preserves every general register it changes, the call-clobbered
+    /// ones included.
+    pub saves_all_registers: bool,
     /// `__attribute__((noinline))` -- never inline this function.
     pub noinline: bool,
     /// `__attribute__((always_inline))` -- inline this function at every call
@@ -3183,6 +3238,10 @@ impl FunctionAttrs {
             .combine(other.stack_protect)
             .unwrap_or_else(|kept| kept);
         self.branches.merge(other.branches);
+        self.shape.merge(other.shape);
+        self.flatten |= other.flatten;
+        self.noipa |= other.noipa;
+        self.saves_all_registers |= other.saves_all_registers;
         // A later `optimize` level replaces an earlier one, as gcc's does.
         if other.stack_protector.is_some() {
             self.stack_protector = other.stack_protector;

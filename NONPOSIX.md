@@ -130,6 +130,20 @@ Language and preprocessor additions:
    always_inline hot cold warn_unused_result format fallthrough nonstring
    malloc pure sentinel no_sanitize_* assume_aligned` and their `__name__`
    spellings (`assume_aligned`: the Linux kernel's `__assume_aligned`).
+ * The attributes `error` and `warning` (the Linux kernel's `BUILD_BUG_ON`
+   and `compiletime_assert`, glibc's `__errordecl`/`__warndecl`): a call
+   that survives optimization is reported, one the optimizer removed is
+   not.  `tls_model` (glibc's `attribute_tls_model_ie`), `format_arg`
+   (glibc's `<libintl.h>`), `flatten` (the kernel's `__flatten`), `retain`
+   (the kernel's `__retain`), `noipa` (gcc's c-torture suite),
+   `patchable_function_entry` (the kernel's `notrace`),
+   `zero_call_used_regs` (the per-function form of the kernel's
+   `-fzero-call-used-regs=`), `no_caller_saved_registers` (the kernel's
+   `kstack_erase.h`), `no_profile_instrument_function` (the kernel's
+   `__no_profile`),
+   `no_sanitize` and gcc's other sanitizer exemptions (the kernel's
+   `__signed_wrap`), each as gcc 13 does it.
+ * `__builtin_has_attribute(decl-or-type, attribute)`.
  * Statement expressions `({ ... })`.
  * `typeof` / `__typeof__` / `__typeof`, and the `__const`, `__volatile`,
    `__restrict`, `__inline`, `__signed`, `__extension__`, `__thread`,

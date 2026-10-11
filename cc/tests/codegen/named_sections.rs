@@ -15,7 +15,7 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::common::{compile_and_run, compile_and_run_everywhere};
+use crate::common::{compile_and_run, compile_and_run_aarch64_with, compile_and_run_everywhere};
 
 /// A section table built the way Linux builds its trace-event and dynamic-
 /// debug tables: pointers declared `static struct T __used __section(...)
@@ -79,5 +79,44 @@ int main(void)
             0,
             "{pic}"
         );
+    }
+}
+
+/// `retain` definitions, each in a section of its own marked `R` or in a
+/// named one, assemble, link under `--gc-sections` and keep their values,
+/// on both targets: data, zero-filled data, read-only data, a thread-local
+/// and a function, and a named-section table found by `__start_`/`__stop_`.
+#[test]
+fn codegen_retained_sections_link_and_run() {
+    let src = r#"
+__attribute__((retain)) int rv = 7;
+__attribute__((retain)) int rz;
+__attribute__((retain)) const int rc = 5;
+__attribute__((retain)) __thread int rt = 3;
+__attribute__((retain)) int rf(int x) { return x * 2; }
+__attribute__((retain, used, section("rtab"))) static const int t1 = 10;
+__attribute__((retain, used, section("rtab"))) static const int t2 = 20;
+extern const int __start_rtab[], __stop_rtab[];
+int main(void) {
+    int sum = 0;
+    for (const int *p = __start_rtab; p < __stop_rtab; p++)
+        sum += *p;
+    if (sum != 30) return 1;
+    rz += rv;
+    return rf(rz + rc + rt) == 30 ? 0 : 2;
+}
+"#;
+    let flags = [
+        "-O2",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-Wl,--gc-sections",
+    ];
+    for opts in [&["-O0"][..], &flags] {
+        let owned: Vec<String> = opts.iter().map(|s| s.to_string()).collect();
+        assert_eq!(compile_and_run("retain_run", src, &owned), 0, "{opts:?}");
+        if let Some(code) = compile_and_run_aarch64_with("retain_run", src, opts, &[]) {
+            assert_eq!(code, 0, "aarch64 {opts:?}");
+        }
     }
 }

@@ -267,11 +267,17 @@ pub(crate) fn impossible_always_inline(
 /// order; a single member is a function that calls itself. Tarjan's
 /// strongly connected components over that call graph.
 pub(crate) fn always_inline_cycles(module: &Module) -> Vec<Vec<usize>> {
+    call_cycles(module, |f| f.is_always_inline && !f.is_noinline)
+}
+
+/// The cycles of calls among the functions `member` admits, as
+/// [`always_inline_cycles`] gives them.
+fn call_cycles(module: &Module, member: impl Fn(&Function) -> bool) -> Vec<Vec<usize>> {
     let members: Vec<usize> = module
         .functions
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.is_always_inline && !f.is_noinline)
+        .filter(|(_, f)| member(f))
         .map(|(i, _)| i)
         .collect();
     let forced: HashMap<&str, usize> = members
@@ -402,7 +408,8 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
         saves_label_in_static: func.saves_label_in_static,
         receives_nonlocal_goto: func.receives_nonlocal_goto(),
         calls_returns_twice: func.calls_returns_twice(),
-        is_noinline: func.is_noinline,
+        // `noipa` is `noinline` and more: the more is in `ir::effects`.
+        is_noinline: func.is_noinline || func.is_noipa,
         is_always_inline: func.is_always_inline,
         is_interposable: func.is_interposable(false),
         has_inline_hint: func.is_inline,
@@ -589,6 +596,19 @@ fn should_inline(
     }
 
     true
+}
+
+/// Whether a `flatten` function splices a call to `candidate`, which is on
+/// a cycle of calls when `cyclic`.
+///
+/// Every callee whose body can be copied and is the one that runs, however
+/// large, as gcc 13 flattens: `flatten` is the program's request, so none
+/// of c17's size caps applies. Never a callee on a cycle, whose splices
+/// would never end -- gcc stops at the first call back into the cycle, and
+/// this at the first call into it -- and never what is impossible or not
+/// authoritative, for the reasons `should_inline` gives.
+fn flatten_splices(candidate: &InlineCandidate, cyclic: bool) -> bool {
+    !cyclic && !candidate.cannot_be_inlined() && !candidate.is_interposable
 }
 
 // Inline Context and Remapping
@@ -1683,7 +1703,12 @@ fn reorder_blocks_topologically(func: &mut Function) {
 /// optimization off, and code that uses it -- inline assembly wrappers,
 /// intrinsics headers -- is usually relying on the body being spliced in.
 pub fn run(module: &mut Module, opt: Optimization) -> bool {
-    if !opt.inlines_generally() && !module.functions.iter().any(|f| f.is_always_inline) {
+    // `flatten` asks for inlining only when optimizing, as in gcc.
+    let flattening = opt.optimizes() && module.functions.iter().any(|f| f.is_flatten);
+    if !opt.inlines_generally()
+        && !flattening
+        && !module.functions.iter().any(|f| f.is_always_inline)
+    {
         // Nothing to inline, but the dead statics go all the same: see the
         // end of this function.
         remove_dead_functions(module, !opt.optimizes());
@@ -1692,12 +1717,24 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
 
     let mut any_changed = false;
     let original_sizes: Vec<usize> = module.functions.iter().map(function_size).collect();
+    // The functions on a cycle of calls, which `flatten` does not splice:
+    // each splice of one brings in a call to the next.
+    let cyclic: HashSet<String> = if flattening {
+        call_cycles(module, |_| true)
+            .into_iter()
+            .flatten()
+            .map(|i| module.functions[i].name.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     // Iterate to handle nested inlining: every call site for the first
-    // `MAX_INLINE_ITERATIONS` rounds, then only `always_inline` ones, until a
-    // round splices nothing. That ends: the `always_inline` calls that are
-    // spliced form no cycle (`always_inline_cycles`), so each round shortens
-    // the longest chain of them left.
+    // `MAX_INLINE_ITERATIONS` rounds, then only `always_inline` ones and
+    // those in a `flatten` function, until a round splices nothing. That
+    // ends: the `always_inline` calls that are spliced form no cycle
+    // (`always_inline_cycles`), and neither do those `flatten` splices, so
+    // each round shortens the longest chain of them left.
     for iteration in 0.. {
         let forced_only = iteration >= MAX_INLINE_ITERATIONS;
         // Re-analyze functions each iteration
@@ -1716,6 +1753,7 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
             // against the same unchanged size.
             let mut caller_size = function_size(&module.functions[func_idx]);
             let caller_isa = module.functions[func_idx].isa;
+            let flatten = flattening && module.functions[func_idx].is_flatten;
 
             // Check if caller is recursive (calls itself directly).
             // NOTE: mutual recursion (A→B→A) is not detected; those callers
@@ -1737,13 +1775,13 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
                         continue;
                     };
                     if let Some(candidate) = candidates.get(callee_name) {
-                        if forced_only && !candidate.is_always_inline {
+                        if forced_only && !candidate.is_always_inline && !flatten {
                             continue;
                         }
-                        // Don't inline recursive calls
-                        if callee_name != caller_name
-                            && isa_allows_inlining(caller_isa, candidate.isa)
-                            && should_inline(
+                        let wanted = if flatten {
+                            flatten_splices(candidate, cyclic.contains(callee_name))
+                        } else {
+                            should_inline(
                                 candidate,
                                 opt,
                                 CallerSize {
@@ -1752,6 +1790,11 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
                                 },
                                 caller_is_recursive,
                             )
+                        };
+                        // Don't inline recursive calls
+                        if callee_name != caller_name
+                            && isa_allows_inlining(caller_isa, candidate.isa)
+                            && wanted
                         {
                             call_sites.push((bb_idx, insn_idx, callee_name.to_string()));
                             caller_size += candidate.estimated_size;
@@ -3753,6 +3796,39 @@ int caller(void) { return lib() + attr() + plain(); }
         assert_eq!(function_size(&module.functions[1]), 10);
         run(&mut module, opt_at(2));
         assert_eq!(calls_left(&module, "big", "leaf"), 4);
+    }
+
+    /// `flatten`: every call site of the caller is spliced past every cap,
+    /// and so are the calls the spliced bodies bring in -- but not at -O0,
+    /// and not a call into a cycle, nor a `noipa` callee.
+    #[test]
+    fn test_flatten_splices_the_whole_call_tree() {
+        let build = || {
+            let mut module = Module::default();
+            let mut big = sized_func("big", 490, 30, "mid");
+            big.is_static = false;
+            big.is_flatten = true;
+            module.functions.push(big);
+            // `mid` is far over every size cap, and calls `leaf` twice.
+            module.functions.push(sized_func("mid", 300, 2, "leaf"));
+            module.functions.push(sized_func("leaf", 9, 1, "ping"));
+            // Too large for anything but `flatten` to splice.
+            module.functions.push(sized_func("ping", 300, 1, "pong"));
+            module.functions.push(sized_func("pong", 300, 1, "ping"));
+            module
+        };
+        let mut module = build();
+        run(&mut module, opt_at(2));
+        assert_eq!(calls_left(&module, "big", "mid"), 0);
+        assert_eq!(calls_left(&module, "big", "leaf"), 0);
+        assert_eq!(calls_left(&module, "big", "ping"), 60);
+        let mut module = build();
+        run(&mut module, opt_at(0));
+        assert_eq!(calls_left(&module, "big", "mid"), 30);
+        let mut module = build();
+        module.functions[1].is_noipa = true;
+        run(&mut module, opt_at(2));
+        assert_eq!(calls_left(&module, "big", "mid"), 30);
     }
 
     /// A `target("sse4.1")` body is never spliced into a baseline function,

@@ -56,19 +56,29 @@ const FUNCTION_ONLY: &[(&str, FunctionOnly)] = &[
     ("const", FunctionOnly::Const),
     ("constructor", FunctionOnly::Declaration),
     ("destructor", FunctionOnly::Declaration),
+    ("error", FunctionOnly::Declaration),
+    ("flatten", FunctionOnly::Declaration),
     ("format", FunctionOnly::FunctionType),
+    ("format_arg", FunctionOnly::FunctionType),
     ("function_return", FunctionOnly::Declaration),
     ("gnu_inline", FunctionOnly::Declaration),
     ("hot", FunctionOnly::Declaration),
     ("indirect_branch", FunctionOnly::Declaration),
     ("leaf", FunctionOnly::Declaration),
     ("malloc", FunctionOnly::Malloc),
+    ("no_address_safety_analysis", FunctionOnly::Declaration),
+    ("no_caller_saved_registers", FunctionOnly::FunctionType),
     ("no_instrument_function", FunctionOnly::Refused),
+    ("no_profile_instrument_function", FunctionOnly::Declaration),
+    ("no_sanitize", FunctionOnly::Declaration),
     ("no_sanitize_address", FunctionOnly::Declaration),
+    ("no_sanitize_coverage", FunctionOnly::Declaration),
     ("no_sanitize_thread", FunctionOnly::Declaration),
+    ("no_sanitize_undefined", FunctionOnly::Declaration),
     ("no_stack_protector", FunctionOnly::Declaration),
     ("noclone", FunctionOnly::Declaration),
     ("noinline", FunctionOnly::Declaration),
+    ("noipa", FunctionOnly::Declaration),
     ("nonnull", FunctionOnly::FunctionType),
     ("optimize", FunctionOnly::Declaration),
     ("pure", FunctionOnly::Declaration),
@@ -78,6 +88,8 @@ const FUNCTION_ONLY: &[(&str, FunctionOnly)] = &[
     ("target", FunctionOnly::Declaration),
     ("target_clones", FunctionOnly::Declaration),
     ("warn_unused_result", FunctionOnly::FunctionType),
+    ("warning", FunctionOnly::Declaration),
+    ("zero_call_used_regs", FunctionOnly::Refused),
 ];
 
 /// gcc's verdict on the function-only attribute `name`, if it is one.
@@ -125,6 +137,9 @@ enum AttrArgs {
     General,
     /// `cleanup(fn)`: exactly one argument, the name of a function.
     Cleanup,
+    /// Strings and integer constant expressions, a name among them read as
+    /// the value it names: `patchable_function_entry(N, M)`.
+    Values,
     /// An attribute c17 does not recognise, whose arguments are not read.
     Unknown,
 }
@@ -140,10 +155,10 @@ impl AttrArgs {
             | "alloc_align"
             | "warn_if_not_aligned"
             | "nonnull"
-            | "nonnull_if_nonzero"
             | "sentinel"
             | "regparm" => AttrArgs::Integers(IntArgRole::Unused),
             "cleanup" if recognised => AttrArgs::Cleanup,
+            "patchable_function_entry" if recognised => AttrArgs::Values,
             _ if recognised => AttrArgs::General,
             _ => AttrArgs::Unknown,
         }
@@ -180,6 +195,37 @@ enum IntArgFault {
     TooLarge(i128),
     /// `assume_aligned`'s misalignment, not below its alignment.
     Misalignment(i128, i128),
+}
+
+/// Why a declaration cannot take a variable's attribute -- `tls_model`,
+/// which wants a thread-local, or `uninitialized`, which wants an automatic
+/// variable -- in gcc's words for it.
+#[derive(Clone, Copy, Debug)]
+enum NotTheVariable {
+    /// A function, typedef, member or parameter.
+    NotAVariable,
+    /// An object without thread storage duration.
+    NoThreadStorage,
+    /// An object with static storage duration.
+    NotLocal,
+}
+
+impl NotTheVariable {
+    /// gcc's warning that the attribute `attr` on `name` is ignored.
+    fn warn(self, attr: &str, name: &str, pos: Position) {
+        let template = match self {
+            NotTheVariable::NotAVariable => {
+                "'{0}' attribute ignored because '{1}' is not a variable"
+            }
+            NotTheVariable::NoThreadStorage => {
+                "'{0}' attribute ignored because '{1}' does not have thread storage duration"
+            }
+            NotTheVariable::NotLocal => {
+                "'{0}' attribute ignored because '{1}' is not a local variable"
+            }
+        };
+        diag::group_warning_args(ATTRIBUTE_WARNING, pos, template, &[attr, name]);
+    }
 }
 
 /// An attribute whose arguments have already been diagnosed, and which is
@@ -481,8 +527,40 @@ impl AttributeList {
             stack_protect: self.stack_protect().unwrap_or_else(|kept| kept),
             stack_protector: self.optimize_stack_protector(),
             branches: self.branch_attrs(),
+            shape: self.shape_attrs(),
+            flatten: self.has_attr("flatten"),
+            noipa: self.has_attr("noipa"),
+            saves_all_registers: target.arch == crate::target::Arch::X86_64
+                && self.has_attr("no_caller_saved_registers"),
             function_only: Vec::new(),
         }
+    }
+
+    /// What `patchable_function_entry` and `zero_call_used_regs` ask, the
+    /// last of each winning; their values were checked as they were read.
+    pub fn shape_attrs(&self) -> crate::target::ShapeAttrs {
+        let mut out = crate::target::ShapeAttrs::default();
+        for attr in &self.attrs {
+            match (attr.name.trim_matches('_'), attr.args.as_slice()) {
+                ("zero_call_used_regs", [AttributeArg::String(s)]) => {
+                    out.zero_regs = crate::target::ZeroRegs::from_name(s);
+                }
+                ("patchable_function_entry", args) => {
+                    let int = |i: usize| match args.get(i) {
+                        Some(AttributeArg::Int(n)) => u32::try_from(*n).unwrap_or(0),
+                        _ => 0,
+                    };
+                    let (total, before) = (int(0), int(1));
+                    out.patchable = Some((total > 0).then_some(crate::target::PatchableEntry {
+                        total,
+                        // An `M` above `N` was warned about, and is 0.
+                        before: if before > total { 0 } else { before },
+                    }));
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// What `indirect_branch` and `function_return` ask, the last of each
@@ -578,6 +656,13 @@ impl AttributeList {
                 "alias" => out.alias = alias(attr, AliasForm::Alias),
                 "ifunc" => out.alias = alias(attr, AliasForm::Ifunc),
                 "uninitialized" => out.uninitialized = true,
+                "retain" => out.retain = true,
+                "error" => out.call_diagnostics.error = text(attr),
+                "warning" => out.call_diagnostics.warning = text(attr),
+                // Checked as it was read (`check_tls_model_attr`).
+                "tls_model" => {
+                    out.tls_model = text(attr).and_then(|m| crate::target::TlsModel::from_name(&m))
+                }
                 _ => {}
             }
         }
@@ -791,7 +876,9 @@ impl Parser<'_> {
         if undeclared && matches!(expr.kind, ExprKind::IntLit(0)) {
             return Err(Diagnosed);
         }
-        if let (AttrArgs::General, ExprKind::StringLit(bytes)) = (grammar, &expr.kind) {
+        if let (AttrArgs::General | AttrArgs::Values, ExprKind::StringLit(bytes)) =
+            (grammar, &expr.kind)
+        {
             return Ok(Some(AttributeArg::String(payload_text(bytes))));
         }
         match (self.eval_const_expr(&expr), grammar) {
@@ -893,6 +980,221 @@ impl Parser<'_> {
         };
         diag::group_warning_args(ATTRIBUTE_WARNING, pos, warning, &[bare]);
         false
+    }
+
+    /// `error` and `warning` take one string, the message: any other count
+    /// is gcc's error, and an argument that is not a string drops the
+    /// attribute with gcc's warning. `false` drops the attribute.
+    fn check_call_diagnostic_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        let bare = name.trim_matches('_');
+        if !matches!(bare, "error" | "warning") {
+            return true;
+        }
+        match args {
+            [AttributeArg::String(_)] => return true,
+            [_] => {
+                diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[bare])
+            }
+            _ => Self::report_one_arg_expected(bare, args, pos),
+        }
+        false
+    }
+
+    /// `tls_model` takes one string naming one of gcc's four models; gcc
+    /// refuses anything else. `false` drops the attribute.
+    fn check_tls_model_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        if name.trim_matches('_') != "tls_model" {
+            return true;
+        }
+        match args {
+            [AttributeArg::String(s)] if crate::target::TlsModel::from_name(s).is_some() => {
+                return true
+            }
+            [AttributeArg::String(_)] => diag::error(
+                pos,
+                &gettext(
+                    "'tls_model' argument must be one of 'local-exec', 'initial-exec', \
+                     'local-dynamic', or 'global-dynamic'",
+                ),
+            ),
+            [_] => diag::error(pos, &gettext("'tls_model' argument not a string")),
+            _ => Self::report_one_arg_expected("tls_model", args, pos),
+        }
+        false
+    }
+
+    /// `zero_call_used_regs` takes one string naming one of
+    /// `-fzero-call-used-regs=`'s choices, and `patchable_function_entry`
+    /// one or two counts of nops up to 65535, the second no more than the
+    /// first: gcc's diagnostics for anything else. `false` drops the
+    /// attribute.
+    fn check_shape_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        match name.trim_matches('_') {
+            "zero_call_used_regs" => match args {
+                [AttributeArg::String(s)] if crate::target::ZeroRegs::from_name(s).is_some() => {
+                    true
+                }
+                [AttributeArg::String(s)] => {
+                    diag::error_args(
+                        pos,
+                        "unrecognized '{0}' attribute argument '{1}'",
+                        &["zero_call_used_regs", s],
+                    );
+                    false
+                }
+                [_] => {
+                    diag::error(pos, &gettext("'zero_call_used_regs' argument not a string"));
+                    false
+                }
+                _ => {
+                    Self::report_one_arg_expected("zero_call_used_regs", args, pos);
+                    false
+                }
+            },
+            "patchable_function_entry" => Self::check_patchable_entry(args, pos),
+            _ => true,
+        }
+    }
+
+    /// `patchable_function_entry(N[, M])`'s arguments, as gcc 13 checks
+    /// them; an `M` above `N` is warned about here and read as 0.
+    fn check_patchable_entry(args: &[AttributeArg], pos: Position) -> bool {
+        const NAME: &str = "patchable_function_entry";
+        if !(1..=2).contains(&args.len()) {
+            diag::error_args(
+                pos,
+                "wrong number of arguments specified for '{0}' attribute",
+                &[NAME],
+            );
+            diag::note_args(
+                pos,
+                "expected between 1 and 2, found {0}",
+                &[&args.len().to_string()],
+            );
+            return false;
+        }
+        let mut counts = Vec::with_capacity(2);
+        for arg in args {
+            let shown = match arg {
+                AttributeArg::Int(n) if (0..=65535).contains(n) => {
+                    counts.push(*n);
+                    continue;
+                }
+                AttributeArg::Int(n) if *n > 65535 => {
+                    diag::group_warning_args(
+                        ATTRIBUTE_WARNING,
+                        pos,
+                        "'{0}' attribute argument '{1}' exceeds 65535",
+                        &[NAME, &n.to_string()],
+                    );
+                    return false;
+                }
+                AttributeArg::Int(n) => n.to_string(),
+                AttributeArg::String(s) => format!("\"{s}\""),
+                AttributeArg::Ident(s) => s.clone(),
+            };
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument '{1}' is not an integer constant",
+                &[NAME, &shown],
+            );
+            return false;
+        }
+        if let [total, before] = counts[..] {
+            if before > total {
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "patchable function entry {0} exceeds size {1}",
+                    &[&before.to_string(), &total.to_string()],
+                );
+            }
+        }
+        true
+    }
+
+    /// `no_sanitize("...", ...)` names one or more sanitizers, each string a
+    /// comma-separated list of `-fsanitize=`'s names: gcc's error for no
+    /// argument or one that is not a string, and its warning -- naming the
+    /// sanitizer as if it were an attribute -- for a name it does not know.
+    /// c17 inserts no sanitizer, so a known name changes nothing. `false`
+    /// drops the attribute.
+    fn check_no_sanitize_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        /// gcc 13's sanitizer names.
+        const SANITIZERS: &[&str] = &[
+            "address",
+            "alignment",
+            "all",
+            "bool",
+            "bounds",
+            "bounds-strict",
+            "builtin",
+            "enum",
+            "float-cast-overflow",
+            "float-divide-by-zero",
+            "hwaddress",
+            "integer-divide-by-zero",
+            "kernel-address",
+            "kernel-hwaddress",
+            "leak",
+            "nonnull-attribute",
+            "null",
+            "object-size",
+            "pointer-compare",
+            "pointer-overflow",
+            "pointer-subtract",
+            "return",
+            "returns-nonnull-attribute",
+            "shadow-call-stack",
+            "shift",
+            "shift-base",
+            "shift-exponent",
+            "signed-integer-overflow",
+            "thread",
+            "undefined",
+            "unreachable",
+            "vla-bound",
+            "vptr",
+        ];
+        if name.trim_matches('_') != "no_sanitize" {
+            return true;
+        }
+        if args.is_empty() {
+            diag::error_args(
+                pos,
+                "wrong number of arguments specified for '{0}' attribute",
+                &["no_sanitize"],
+            );
+            diag::note(pos, &gettext("expected 1 or more, found 0"));
+            return false;
+        }
+        for arg in args {
+            let AttributeArg::String(list) = arg else {
+                diag::error(pos, &gettext("'no_sanitize' argument not a string"));
+                return false;
+            };
+            for unknown in list.split(',').filter(|s| !SANITIZERS.contains(s)) {
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "'{0}' attribute directive ignored",
+                    &[unknown],
+                );
+            }
+        }
+        true
+    }
+
+    /// gcc's error, and its note, for an attribute that takes exactly one
+    /// argument given `args`.
+    fn report_one_arg_expected(bare: &str, args: &[AttributeArg], pos: Position) {
+        diag::error_args(
+            pos,
+            "wrong number of arguments specified for '{0}' attribute",
+            &[bare],
+        );
+        diag::note_args(pos, "expected 1, found {0}", &[&args.len().to_string()]);
     }
 
     /// `cleanup` takes exactly one argument, in gcc's words.
@@ -1005,6 +1307,23 @@ impl Parser<'_> {
         Err(Diagnosed)
     }
 
+    /// An attribute as `__builtin_has_attribute` names it, a name c17
+    /// recognises: read as `__attribute__((...))` reads one, but checked by
+    /// nothing and given to no declaration, since a query may leave out the
+    /// arguments a declaration must give.
+    pub(super) fn parse_attribute_query(&mut self) -> Option<Attribute> {
+        let name = self.get_ident_name(self.current())?;
+        self.advance();
+        let args = if self.is_special(b'(') {
+            self.advance();
+            let grammar = AttrArgs::of(&name, true);
+            self.parse_attribute_args(&name, grammar).ok()?
+        } else {
+            Vec::new()
+        };
+        Some(Attribute::with_args(name, args))
+    }
+
     /// Parse a single attribute: name or name(args)
     ///
     /// `None` when there is no attribute here, or when its arguments were
@@ -1046,7 +1365,13 @@ impl Parser<'_> {
             AttrArgs::Cleanup => self.check_cleanup_function(&args, pos).ok()?,
             _ => {}
         }
-        if recognised && !Self::check_branch_attr(&name, &args, pos) {
+        if recognised
+            && !(Self::check_branch_attr(&name, &args, pos)
+                && Self::check_call_diagnostic_attr(&name, &args, pos)
+                && Self::check_tls_model_attr(&name, &args, pos)
+                && Self::check_shape_attr(&name, &args, pos)
+                && Self::check_no_sanitize_attr(&name, &args, pos))
+        {
             return None;
         }
         let target_attr = match name.trim_matches('_') {
@@ -1161,6 +1486,7 @@ impl Parser<'_> {
         SpecifierAttrs {
             fn_attrs: self.pending_fn_attrs.clone(),
             symbol_attrs: self.pending_symbol_attrs.clone(),
+            written: self.pending_written_attrs.clone(),
             fn_type: self.pending_fn_type,
         }
     }
@@ -1170,6 +1496,7 @@ impl Parser<'_> {
     pub(super) fn begin_declarator(&mut self, spec: &SpecifierAttrs) {
         self.pending_fn_attrs = spec.fn_attrs.clone();
         self.pending_symbol_attrs = spec.symbol_attrs.clone();
+        self.pending_written_attrs = spec.written.clone();
         self.pending_fn_type = spec.fn_type;
         self.pending_declarator_align = None;
     }
@@ -1200,6 +1527,7 @@ impl Parser<'_> {
     /// which names no symbol, dropped with gcc's diagnostic for each -- as
     /// `cleanup(fn)` is, there being no scope to leave.
     pub(super) fn drop_pending_symbol_attrs(&mut self, name: StringId, pos: Position) {
+        self.pending_written_attrs.clear();
         let mut attrs = std::mem::take(&mut self.pending_symbol_attrs);
         if attrs.cleanup.take().is_some() {
             Self::warn_cleanup_ignored(pos);
@@ -1208,10 +1536,10 @@ impl Parser<'_> {
         self.drop_symbol_attrs(&mut attrs, name, pos, false);
     }
 
-    /// gcc's diagnostic for each of `weak`, `used`, `visibility`, `alias`
-    /// and `section` in `attrs`, written on `name` at `pos`, which declares
-    /// no object or function: a `typedef`, a member or a parameter. Each is
-    /// dropped. gcc says nothing of `used` on a typedef.
+    /// gcc's diagnostic for each of `weak`, `used`, `visibility`, `alias`,
+    /// `retain`, `section` and `tls_model` in `attrs`, written on `name` at
+    /// `pos`, which declares no object or function: a `typedef`, a member or
+    /// a parameter. Each is dropped. gcc says nothing of `used` on a typedef.
     pub(super) fn drop_symbol_attrs(
         &self,
         attrs: &mut crate::parse::ast::SymbolAttrs,
@@ -1224,13 +1552,54 @@ impl Parser<'_> {
             (std::mem::take(&mut attrs.used) && !typedef, "used"),
             (attrs.visibility.take().is_some(), "visibility"),
             (attrs.alias.take().is_some(), "alias"),
+            (std::mem::take(&mut attrs.retain), "retain"),
         ];
         for (_, attr) in ignored.iter().filter(|(set, _)| *set) {
             diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[attr]);
         }
+        let spelled = self.idents.get_opt(name).unwrap_or("");
         if attrs.section.take().is_some() {
-            let spelled = self.idents.get_opt(name).unwrap_or("");
             diag::error_args(pos, "section attribute not allowed for '{0}'", &[spelled]);
+        }
+        if attrs.tls_model.take().is_some() {
+            NotTheVariable::NotAVariable.warn("tls_model", spelled, pos);
+        }
+        if std::mem::take(&mut attrs.uninitialized) {
+            NotTheVariable::NotAVariable.warn("uninitialized", spelled, pos);
+        }
+    }
+
+    /// A variable's attribute on a declaration of `name` that is not the
+    /// kind of variable it wants is dropped with gcc's warning: `tls_model`
+    /// wants a thread-local, `uninitialized` an automatic variable, and a
+    /// function is no variable at all.
+    pub(super) fn check_variable_attrs(
+        &self,
+        attrs: &mut crate::parse::ast::SymbolAttrs,
+        name: StringId,
+        pos: Position,
+        is_fn: bool,
+        storage: TypeModifiers,
+        automatic: bool,
+    ) {
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        let tls = match (is_fn, storage.contains(TypeModifiers::THREAD_LOCAL)) {
+            (true, _) => Some(NotTheVariable::NotAVariable),
+            (false, false) => Some(NotTheVariable::NoThreadStorage),
+            (false, true) => None,
+        };
+        if let Some(why) = tls.filter(|_| attrs.tls_model.is_some()) {
+            attrs.tls_model = None;
+            why.warn("tls_model", spelled, pos);
+        }
+        let local = match (is_fn, automatic) {
+            (true, _) => Some(NotTheVariable::NotAVariable),
+            (false, false) => Some(NotTheVariable::NotLocal),
+            (false, true) => None,
+        };
+        if let Some(why) = local.filter(|_| attrs.uninitialized) {
+            attrs.uninitialized = false;
+            why.warn("uninitialized", spelled, pos);
         }
     }
 
@@ -1437,10 +1806,14 @@ impl Parser<'_> {
     /// `no_stack_protector`, the first written wins and gcc's warning names
     /// the other -- in the same list or another.
     fn merge_fn_attrs(&mut self, attrs: &AttributeList, pos: Position) {
-        let mut fn_attrs = attrs.function_attrs(&self.types.target());
+        let target = self.types.target();
+        let mut fn_attrs = attrs.function_attrs(&target);
+        // An attribute this target does not have was warned about as
+        // unknown already.
         fn_attrs.function_only = attrs
             .attrs
             .iter()
+            .filter(|a| crate::kw::spelling_exists_on(&a.name, target.arch))
             .filter_map(|a| function_only(&a.name))
             .map(|(name, _)| (name, pos))
             .collect();
@@ -1855,6 +2228,8 @@ impl Parser<'_> {
             self.pending_transparent_union = Some(self.current_pos());
         }
         self.pending_packed |= attrs.has_packed();
+        self.pending_written_attrs
+            .extend(attrs.attrs.iter().cloned());
         self.merge_symbol_attrs(attrs);
         self.merge_fn_type_attrs(attrs, pos);
         self.merge_fn_attrs(attrs, pos);
@@ -1876,6 +2251,7 @@ impl Parser<'_> {
 pub(super) struct SpecifierAttrs {
     fn_attrs: crate::parse::ast::FunctionAttrs,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
+    written: Vec<Attribute>,
     fn_type: FnTypeAttrs,
 }
 
@@ -1910,6 +2286,7 @@ pub(super) struct PendingDeclAttrs {
     transparent_union: Option<Position>,
     packed: bool,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
+    written: Vec<Attribute>,
     fn_attrs: crate::parse::ast::FunctionAttrs,
     fn_type: FnTypeAttrs,
     asm_label: Option<String>,
@@ -1930,6 +2307,7 @@ impl Parser<'_> {
             transparent_union: take(&mut self.pending_transparent_union),
             packed: take(&mut self.pending_packed),
             symbol_attrs: take(&mut self.pending_symbol_attrs),
+            written: take(&mut self.pending_written_attrs),
             fn_attrs: take(&mut self.pending_fn_attrs),
             fn_type: take(&mut self.pending_fn_type),
             asm_label: take(&mut self.pending_asm_label),
@@ -1948,6 +2326,7 @@ impl Parser<'_> {
         self.pending_transparent_union = saved.transparent_union;
         self.pending_packed = saved.packed;
         self.pending_symbol_attrs = saved.symbol_attrs;
+        self.pending_written_attrs = saved.written;
         self.pending_fn_attrs = saved.fn_attrs;
         self.pending_fn_type = saved.fn_type;
         self.pending_asm_label = saved.asm_label;

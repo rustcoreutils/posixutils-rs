@@ -935,14 +935,14 @@ impl Aarch64CodeGen {
     /// Whether accessing the thread-local `name` needs the Initial Exec model
     /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
     pub(super) fn use_tls_ie(&self, name: &str) -> bool {
-        self.base.use_tls_ie(self.extern_symbols.contains(name))
+        self.base.use_tls_ie(name)
     }
 
     /// Emit TLS address computation into dst register.
     /// After this call, dst holds the address of the TLS variable.
     pub(super) fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let sym = Symbol::global(name);
-        if self.base.tls_access() == crate::target::TlsAccess::MachOTlv {
+        if self.base.tls_access(name) == crate::target::TlsAccess::MachOTlv {
             // Mach-O thread-local variable descriptor (clang's sequence):
             //   adrp  x0, _v@TLVPPAGE
             //   ldr   x0, [x0, _v@TLVPPAGEOFF]    ; the descriptor
@@ -982,7 +982,7 @@ impl Aarch64CodeGen {
             }
             return;
         }
-        if self.base.use_tls_dynamic() {
+        if self.base.tls_access(name) == crate::target::TlsAccess::ElfDescriptor {
             // TLS descriptor, the dynamic model:
             //   adrp  x0, :tlsdesc:sym
             //   ldr   x1, [x0, #:tlsdesc_lo12:sym]   ; resolver entry point
@@ -1352,14 +1352,10 @@ impl CodeGenerator for Aarch64CodeGen {
             .filter_map(|r| r.aarch64())
             .collect();
 
-        // Collect thread-local storage symbols (both defined and extern)
-        self.tls_symbols = module
-            .globals
-            .iter()
-            .filter(|g| g.is_thread_local)
-            .map(|g| g.name.clone())
-            .chain(module.extern_tls_symbols.iter().cloned())
-            .collect();
+        // Collect thread-local storage symbols (both defined and extern),
+        // each with its access model.
+        self.base.plan_thread_locals(module);
+        self.tls_symbols = self.base.tls_models.keys().cloned().collect();
 
         self.sym_align = module
             .globals

@@ -47,6 +47,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("array-bounds", Accepted),
     ("array-parameter", Accepted),
     ("attribute-alias", Accepted),
+    ("attribute-warning", Implemented),
     ("attributes", Implemented),
     ("bad-function-cast", Accepted),
     ("bool-compare", Accepted),

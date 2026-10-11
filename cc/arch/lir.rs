@@ -950,8 +950,13 @@ pub enum Directive {
     /// `flags` says what is going there, because ELF needs the flags spelled
     /// out and they differ: `"ax"` against `"aw"`. Getting it wrong is not
     /// cosmetic -- a function in a non-executable section segfaults when
-    /// called.
-    NamedSection { name: String, flags: SectionFlags },
+    /// called. `retain` adds `SHF_GNU_RETAIN`, `R`, which `ld --gc-sections`
+    /// never drops: the `retain` attribute.
+    NamedSection {
+        name: String,
+        flags: SectionFlags,
+        retain: bool,
+    },
 
     /// Mark a symbol weak: another definition overrides it, and an
     /// unresolved reference is null rather than a link error.
@@ -1389,7 +1394,11 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, ".text");
                 }
             },
-            Directive::NamedSection { name, flags } => match target.os {
+            Directive::NamedSection {
+                name,
+                flags,
+                retain,
+            } => match target.os {
                 // Mach-O names a segment and a section together, and the
                 // program supplies both -- `section("__DATA,__mine")`.
                 Os::MacOS => {
@@ -1405,13 +1414,14 @@ impl EmitAsm for Directive {
                         // Read-only data asked for a named section is still
                         // read-only: spelling it "aw" put it in a writable
                         // segment and lost its page protection.
+                        let r = if *retain { "R" } else { "" };
                         let flags = match flags {
-                            SectionFlags::Code => "\"ax\"",
-                            SectionFlags::ReadOnly => "\"a\"",
-                            SectionFlags::Writable => "\"aw\"",
+                            SectionFlags::Code => format!("\"ax{r}\""),
+                            SectionFlags::ReadOnly => format!("\"a{r}\""),
+                            SectionFlags::Writable => format!("\"aw{r}\""),
                             // Without `T` a thread-local symbol in it is
                             // an assembler error.
-                            SectionFlags::ThreadLocal => "\"awT\",@progbits",
+                            SectionFlags::ThreadLocal => format!("\"awT{r}\",@progbits"),
                         };
                         let _ = writeln!(out, ".section {},{}", name, flags);
                     }

@@ -3273,6 +3273,19 @@ pub struct Function {
     /// `indirect_branch(...)` and `function_return(...)`: this function's
     /// own mitigations, over `-mindirect-branch=` and `-mfunction-return=`.
     pub branches: crate::machine::BranchAttrs,
+    /// `patchable_function_entry(...)` and `zero_call_used_regs(...)`: this
+    /// function's own entry and exit, over the options'.
+    pub shape: crate::target::ShapeAttrs,
+    /// `__attribute__((flatten))`: when optimizing, the inliner splices
+    /// every call in this function's body, and every call in what it
+    /// splices, whose callee it can.
+    pub is_flatten: bool,
+    /// `__attribute__((noipa))`: no caller learns anything from this body
+    /// -- it is never inlined and no memory effect is inferred from it.
+    pub is_noipa: bool,
+    /// `__attribute__((no_caller_saved_registers))` (x86-64): the function
+    /// preserves every general register it changes.
+    pub saves_all_registers: bool,
     /// `__attribute__((no_instrument_function))`: no `-pg` call at entry.
     /// An inlined body brings none either way: the call is made after the
     /// inliner, for the functions that remain.
@@ -3342,6 +3355,10 @@ impl Default for Function {
             stack_protector: None,
             declared_locals: Vec::new(),
             branches: Default::default(),
+            shape: Default::default(),
+            is_flatten: false,
+            is_noipa: false,
+            saves_all_registers: false,
             no_instrument: false,
             nocf_check: false,
             constructor: None,
@@ -4516,6 +4533,46 @@ impl Module {
         }
         if let Some(g) = self.global_mut(name) {
             g.symbol_attrs.merge(&attrs);
+        }
+    }
+
+    /// Every thread-local the module names: those it defines, then those it
+    /// declares `extern`.
+    pub fn thread_locals(&self) -> impl Iterator<Item = &str> {
+        self.globals
+            .iter()
+            .filter(|g| g.is_thread_local)
+            .map(|g| g.name.as_str())
+            .chain(self.extern_tls_symbols.iter().map(String::as_str))
+    }
+
+    /// The access model of the thread-local `name` under `policy`: its
+    /// `tls_model` attribute's, on its definition or any declaration, else
+    /// the policy's for one defined here or elsewhere. The one answer
+    /// `ir::tls` and the backends both use, so the access a backend emits
+    /// is the one the IR was expanded for.
+    pub fn tls_model(
+        &self,
+        name: &str,
+        policy: crate::target::TlsPolicy,
+    ) -> crate::target::TlsModel {
+        let defined = self.globals.iter().find(|g| g.name == name);
+        let declared = match defined {
+            Some(g) => g.symbol_attrs.tls_model,
+            None => self
+                .declared_symbol_attrs
+                .get(name)
+                .and_then(|attrs| attrs.tls_model),
+        };
+        policy.model(defined.is_none(), declared)
+    }
+
+    /// Give the function `name`, defined here already, the `error` and
+    /// `warning` messages of a declaration after its definition: as in gcc,
+    /// they apply to every call all the same.
+    pub fn add_call_diagnostics(&mut self, name: &str, diags: &crate::parse::ast::CallDiagnostics) {
+        for func in self.functions.iter_mut().filter(|f| f.name == name) {
+            func.symbol_attrs.call_diagnostics.merge(diags);
         }
     }
 

@@ -103,10 +103,11 @@ impl Aarch64CodeGen {
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
 
-        if self.base.tls_access().is_call() {
+        let called = self.base.called_thread_locals();
+        if !called.is_empty() {
             crate::arch::codegen::check_tls_reached_only_by_address(
                 func,
-                &self.tls_symbols,
+                &called,
                 self.base.func_pos,
             );
         }
@@ -120,7 +121,7 @@ impl Aarch64CodeGen {
         );
         let mut alloc = RegAlloc::new(StackedArgs::of(&self.base.target))
             .with_global_registers(&self.global_registers)
-            .with_tls_access(self.base.tls_access())
+            .with_tls_access(self.base.tls_call_access())
             .with_stack_guard(guarded);
         self.locations = alloc.allocate(func, types);
         self.stack_guard = alloc.stack_guard_slot();

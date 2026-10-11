@@ -248,6 +248,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                             .insert(name.clone(), declarator.fn_effect);
                     }
                     self.module.extern_symbols.insert(name);
+                } else {
+                    self.module
+                        .add_call_diagnostics(&name, &declarator.symbol_attrs.call_diagnostics);
                 }
                 continue;
             }

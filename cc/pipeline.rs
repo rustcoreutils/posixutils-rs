@@ -198,6 +198,7 @@ pub fn compile_tokens(
         math_errno: opts.math_errno,
     });
     parser.set_cf_branch(opts.cf_protection.branch);
+    parser.set_x86_isa(target.x86_isa);
     parser.set_strict_flex_arrays(opts.code.strict_flex_arrays);
     // A syntax error is reported where it is, like every other diagnostic:
     // its position may be in a header, and only `diag` knows which file a
@@ -281,7 +282,7 @@ pub fn compile_tokens(
     // has to see the address computation -- see `ir::tls`. The backend below
     // is given the same `TlsPolicy`, so the pass and the backend agree on
     // the model.
-    ir::tls::expand_dynamic_tls(&mut module, target.tls_access(opts.tls).is_call(), &types);
+    ir::tls::expand_dynamic_tls(&mut module, target, opts.tls, &types);
 
     observer.stage("post-tls", &module, &types, None);
     ir::validate::verify(&module, ir::validate::Stage::Ssa, "target mapping");

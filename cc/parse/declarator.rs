@@ -599,6 +599,7 @@ impl Parser<'_> {
         let saved_align_kw = self.pending_alignas_kw.take();
         let saved_fn_attrs = std::mem::take(&mut self.pending_fn_attrs);
         let saved_symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
+        let saved_written_attrs = std::mem::take(&mut self.pending_written_attrs);
         let saved_fn_type = std::mem::take(&mut self.pending_fn_type);
         // The parameter scope is opened and closed here rather than inside, so
         // that it is balanced however the inner parse exits. It used to be left
@@ -619,6 +620,7 @@ impl Parser<'_> {
         self.pending_alignas_kw = saved_align_kw;
         self.pending_fn_attrs = saved_fn_attrs;
         self.pending_symbol_attrs = saved_symbol_attrs;
+        self.pending_written_attrs = saved_written_attrs;
         self.pending_fn_type = saved_fn_type;
         result
     }

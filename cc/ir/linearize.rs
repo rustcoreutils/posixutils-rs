@@ -2165,6 +2165,10 @@ impl<'a> Linearizer<'a> {
         ir_func.stack_protect = func.attrs.stack_protect;
         ir_func.stack_protector = func.attrs.stack_protector;
         ir_func.branches = func.attrs.branches;
+        ir_func.shape = func.attrs.shape;
+        ir_func.is_flatten = func.attrs.flatten;
+        ir_func.is_noipa = func.attrs.noipa;
+        ir_func.saves_all_registers = func.attrs.saves_all_registers;
         ir_func.no_instrument = func.attrs.no_instrument;
         ir_func.nocf_check = self
             .symbols
@@ -4487,6 +4491,9 @@ impl<'a> Linearizer<'a> {
             }
         }
 
+        // The call is where the call expression is, not where its last
+        // argument was: what the `error` and `warning` attributes report.
+        self.current_pos = Some(expr.pos);
         let abi = get_abi_for_conv(conv, self.target);
         let param_classes: Vec<_> = arg_types_vec
             .iter()

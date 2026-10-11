@@ -277,8 +277,9 @@ define_keywords! {
     (ENDIF,             "endif",             0),
     (INCLUDE,           "include",           0),
     (INCLUDE_NEXT,      "include_next",      0),
-    (PP_ERROR,          "error",             0),
-    (WARNING,           "warning",           0),
+    // Also the `error` and `warning` function attributes.
+    (PP_ERROR,          "error",             SUPPORTED_ATTR),
+    (WARNING,           "warning",           SUPPORTED_ATTR),
     (PRAGMA,            "pragma",            0),
     (LINE,              "line",              0),
     (PP_IDENT,          "ident",             0),
@@ -1409,7 +1410,6 @@ define_keywords! {
     (MALLOC, "malloc",               SUPPORTED_ATTR),
     (_, "pure",                 SUPPORTED_ATTR),
     (_, "sentinel",             SUPPORTED_ATTR),
-    (_, "no_sanitize_memory",   SUPPORTED_ATTR),
     (_, "no_sanitize_address",  SUPPORTED_ATTR),
     (_, "no_sanitize_thread",   SUPPORTED_ATTR),
     (_, "gnu_inline",              SUPPORTED_ATTR),
@@ -1430,18 +1430,16 @@ define_keywords! {
     (_, "access",                  SUPPORTED_ATTR),
     (_, "returns_twice",           SUPPORTED_ATTR),
     (_, "externally_visible",      SUPPORTED_ATTR),
-    (_, "abi_tag",                 SUPPORTED_ATTR),
     (_, "weakref",                 SUPPORTED_ATTR),
     (_, "transparent_union",       SUPPORTED_ATTR),
     (_, "simd",                    SUPPORTED_ATTR),
-    (_, "regparm",                 SUPPORTED_ATTR),
+    (_, "regparm",                 SUPPORTED_ATTR | X86_64_ONLY),
     (_, "leaf",                    SUPPORTED_ATTR),
     (_, "alloc_size",              SUPPORTED_ATTR),
     (_, "alloc_align",             SUPPORTED_ATTR),
     (_, "assume_aligned",          SUPPORTED_ATTR),
     (_, "noclone",                 SUPPORTED_ATTR),
     (_, "no_instrument_function",  SUPPORTED_ATTR),
-    (_, "nonnull_if_nonzero",      SUPPORTED_ATTR),
     (_, "copy",                    SUPPORTED_ATTR),
     (_, "designated_init",         SUPPORTED_ATTR),
     (_, "may_alias",               SUPPORTED_ATTR),
@@ -1473,7 +1471,6 @@ define_keywords! {
     (_, "__malloc__",           SUPPORTED_ATTR),
     (_, "__pure__",             SUPPORTED_ATTR),
     (_, "__sentinel__",         SUPPORTED_ATTR),
-    (_, "__no_sanitize_memory__",    SUPPORTED_ATTR),
     (_, "__no_sanitize_address__",   SUPPORTED_ATTR),
     (_, "__no_sanitize_thread__",    SUPPORTED_ATTR),
     (_, "__gnu_inline__",            SUPPORTED_ATTR),
@@ -1490,18 +1487,16 @@ define_keywords! {
     (_, "__access__",                SUPPORTED_ATTR),
     (_, "__returns_twice__",         SUPPORTED_ATTR),
     (_, "__externally_visible__",    SUPPORTED_ATTR),
-    (_, "__abi_tag__",               SUPPORTED_ATTR),
     (_, "__weakref__",               SUPPORTED_ATTR),
     (_, "__transparent_union__",     SUPPORTED_ATTR),
     (_, "__simd__",                  SUPPORTED_ATTR),
-    (_, "__regparm__",               SUPPORTED_ATTR),
+    (_, "__regparm__",               SUPPORTED_ATTR | X86_64_ONLY),
     (_, "__leaf__",                  SUPPORTED_ATTR),
     (_, "__alloc_size__",            SUPPORTED_ATTR),
     (_, "__alloc_align__",           SUPPORTED_ATTR),
     (_, "__assume_aligned__",        SUPPORTED_ATTR),
     (_, "__noclone__",               SUPPORTED_ATTR),
     (_, "__no_instrument_function__", SUPPORTED_ATTR),
-    (_, "__nonnull_if_nonzero__",    SUPPORTED_ATTR),
     (_, "__copy__",                  SUPPORTED_ATTR),
     (_, "__designated_init__",       SUPPORTED_ATTR),
     (_, "__may_alias__",             SUPPORTED_ATTR),
@@ -1573,6 +1568,52 @@ define_keywords! {
     (_, "__indirect_branch__",       SUPPORTED_ATTR | X86_64_ONLY),
     (_, "function_return",           SUPPORTED_ATTR | X86_64_ONLY),
     (_, "__function_return__",       SUPPORTED_ATTR | X86_64_ONLY),
+    // `error("msg")` and `warning("msg")`: each call that survives
+    // optimization is reported. The plain spellings are the preprocessor
+    // directives' entries above. Appended, as above.
+    (_, "__error__",                 SUPPORTED_ATTR),
+    (_, "__warning__",               SUPPORTED_ATTR),
+    // `tls_model("...")`: one thread-local's access model. Appended, as
+    // above.
+    (_, "tls_model",                 SUPPORTED_ATTR),
+    (_, "__tls_model__",             SUPPORTED_ATTR),
+    // `format_arg(N)`: a hint for `-Wformat`, which c17 does not check.
+    // `flatten`: every call in the body inlined. `retain`: the definition's
+    // section kept by `ld --gc-sections`. `noipa`: the function opaque to
+    // every interprocedural decision. `no_profile_instrument_function`: no
+    // `-fprofile-arcs` counters, which c17 never inserts. Appended, as
+    // above.
+    (_, "format_arg",                SUPPORTED_ATTR),
+    (_, "__format_arg__",            SUPPORTED_ATTR),
+    (_, "flatten",                   SUPPORTED_ATTR),
+    (_, "__flatten__",               SUPPORTED_ATTR),
+    (_, "retain",                    SUPPORTED_ATTR),
+    (_, "__retain__",                SUPPORTED_ATTR),
+    (_, "noipa",                     SUPPORTED_ATTR),
+    (_, "__noipa__",                 SUPPORTED_ATTR),
+    (_, "no_profile_instrument_function", SUPPORTED_ATTR),
+    (_, "__no_profile_instrument_function__", SUPPORTED_ATTR),
+    // One function's `-fpatchable-function-entry=` and, on x86-64 where
+    // c17 has the option, `-fzero-call-used-regs=`; and x86-64's
+    // `no_caller_saved_registers`. Appended, as above.
+    (_, "patchable_function_entry",  SUPPORTED_ATTR),
+    (_, "__patchable_function_entry__", SUPPORTED_ATTR),
+    (_, "zero_call_used_regs",       SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__zero_call_used_regs__",   SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "no_caller_saved_registers", SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__no_caller_saved_registers__", SUPPORTED_ATTR | X86_64_ONLY),
+    // gcc 13's other ways to exempt a function from a sanitizer, which c17
+    // never inserts (it refuses `-fsanitize=`). Appended, as above.
+    (_, "no_sanitize",               SUPPORTED_ATTR),
+    (_, "__no_sanitize__",           SUPPORTED_ATTR),
+    (_, "no_sanitize_undefined",     SUPPORTED_ATTR),
+    (_, "__no_sanitize_undefined__", SUPPORTED_ATTR),
+    (_, "no_sanitize_coverage",      SUPPORTED_ATTR),
+    (_, "__no_sanitize_coverage__",  SUPPORTED_ATTR),
+    (_, "no_address_safety_analysis", SUPPORTED_ATTR),
+    (_, "__no_address_safety_analysis__", SUPPORTED_ATTR),
+    // `__builtin_has_attribute(T-or-E, attr)`. Appended, as above.
+    (BUILTIN_HAS_ATTRIBUTE, "__builtin_has_attribute", BUILTIN),
 }
 
 // Tag query API
@@ -1601,6 +1642,31 @@ pub fn spelling_exists_on(name: &str, arch: crate::target::Arch) -> bool {
             .iter()
             .zip(KEYWORD_TAGS.iter())
             .any(|(s, &t)| *s == name && t & X86_64_ONLY != 0)
+}
+
+/// What `__has_attribute(id)` answers on a target of architecture `arch`,
+/// as gcc 13 answers it: 0 for an attribute c17 does not support ([`attribute_supported`]);
+/// for one of the standard attributes gcc also knows by its GNU name, the
+/// version of the C standard that added it, in either spelling --
+/// `deprecated` 201904, `fallthrough` 201910, `noreturn` 202202; and 1 for
+/// the rest. `__const` is accepted as an attribute but is no name gcc
+/// answers for, so it answers 0. The one answer both evaluators give.
+pub fn has_attribute(id: StringId, arch: crate::target::Arch) -> i64 {
+    if !attribute_supported(id, arch) {
+        return 0;
+    }
+    let spelled = KEYWORD_STRINGS[id.0 as usize - 1];
+    let bare = spelled
+        .strip_prefix("__")
+        .and_then(|n| n.strip_suffix("__"))
+        .unwrap_or(spelled);
+    match bare {
+        "deprecated" => 201904,
+        "fallthrough" => 201910,
+        "noreturn" => 202202,
+        "__const" => 0,
+        _ => 1,
+    }
 }
 
 /// Is `id` an attribute c17 supports on a target of architecture `arch`?
@@ -1965,6 +2031,10 @@ mod tests {
             "__optimize__",
             "uninitialized",
             "__uninitialized__",
+            "error",
+            "__error__",
+            "warning",
+            "__warning__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);
@@ -1974,6 +2044,60 @@ mod tests {
                 s
             );
         }
+    }
+
+    /// `__has_attribute` answers as gcc 13 does, on x86-64 and on aarch64,
+    /// in the plain spelling and the `__name__` one, for every attribute
+    /// c17 implements; and 0, as gcc 13 does, for those it answered 1 for
+    /// without gcc 13 knowing them (`abi_tag` is C++'s, the rest newer).
+    /// `zero_call_used_regs` is x86-64's alone in c17, which has no aarch64
+    /// `-fzero-call-used-regs=`.
+    #[test]
+    fn test_has_attribute_answers_as_gcc_13() {
+        use crate::target::Arch;
+        #[rustfmt::skip]
+        let rows: &[(&str, i64, i64)] = &[
+            ("access", 1, 1), ("alias", 1, 1), ("aligned", 1, 1),
+            ("alloc_align", 1, 1), ("alloc_size", 1, 1), ("always_inline", 1, 1),
+            ("artificial", 1, 1), ("assume_aligned", 1, 1), ("cleanup", 1, 1),
+            ("cold", 1, 1), ("const", 1, 1), ("constructor", 1, 1), ("copy", 1, 1),
+            ("deprecated", 201904, 201904), ("designated_init", 1, 1),
+            ("destructor", 1, 1), ("error", 1, 1), ("externally_visible", 1, 1),
+            ("fallthrough", 201910, 201910), ("flatten", 1, 1), ("format", 1, 1),
+            ("format_arg", 1, 1), ("function_return", 1, 0), ("gnu_inline", 1, 1),
+            ("hot", 1, 1), ("ifunc", 1, 1), ("indirect_branch", 1, 0), ("leaf", 1, 1),
+            ("malloc", 1, 1), ("may_alias", 1, 1), ("mode", 1, 1), ("ms_abi", 1, 0),
+            ("no_address_safety_analysis", 1, 1), ("no_caller_saved_registers", 1, 0),
+            ("nocf_check", 1, 1), ("noclone", 1, 1), ("noinline", 1, 1),
+            ("no_instrument_function", 1, 1), ("noipa", 1, 1), ("nonnull", 1, 1),
+            ("nonstring", 1, 1), ("no_profile_instrument_function", 1, 1),
+            ("noreturn", 202202, 202202), ("no_sanitize", 1, 1),
+            ("no_sanitize_address", 1, 1), ("no_sanitize_coverage", 1, 1),
+            ("no_sanitize_thread", 1, 1), ("no_sanitize_undefined", 1, 1),
+            ("no_stack_protector", 1, 1), ("nothrow", 1, 1), ("optimize", 1, 1),
+            ("packed", 1, 1), ("patchable_function_entry", 1, 1), ("pure", 1, 1),
+            ("regparm", 1, 0), ("retain", 1, 1), ("returns_nonnull", 1, 1),
+            ("returns_twice", 1, 1), ("scalar_storage_order", 1, 1), ("section", 1, 1),
+            ("sentinel", 1, 1), ("simd", 1, 1), ("stack_protect", 1, 1),
+            ("sysv_abi", 1, 0), ("target", 1, 1), ("target_clones", 1, 1),
+            ("tls_model", 1, 1), ("transparent_union", 1, 1), ("uninitialized", 1, 1),
+            ("unused", 1, 1), ("used", 1, 1), ("vector_size", 1, 1),
+            ("visibility", 1, 1), ("warning", 1, 1), ("warn_unused_result", 1, 1),
+            ("weak", 1, 1), ("weakref", 1, 1), ("zero_call_used_regs", 1, 0),
+            ("abi_tag", 0, 0), ("nonnull_if_nonzero", 0, 0),
+            ("no_sanitize_memory", 0, 0), ("counted_by", 0, 0),
+        ];
+        let table = StringTable::new();
+        let answer = |name: &str, arch| table.lookup(name).map_or(0, |id| has_attribute(id, arch));
+        for &(name, x86, a64) in rows {
+            let gnu = format!("__{name}__");
+            for spelled in [name, gnu.as_str()] {
+                assert_eq!(answer(spelled, Arch::X86_64), x86, "{spelled} on x86-64");
+                assert_eq!(answer(spelled, Arch::Aarch64), a64, "{spelled} on aarch64");
+            }
+        }
+        // Accepted as an attribute, but no name gcc answers for.
+        assert_eq!(answer("__const", Arch::X86_64), 0);
     }
 
     #[test]

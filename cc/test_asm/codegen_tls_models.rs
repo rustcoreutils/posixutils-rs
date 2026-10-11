@@ -569,3 +569,58 @@ int g(void) { return **u_loc(); }
         }
     }
 }
+
+/// `tls_model("...")` makes that model the variable's own, in place of
+/// what the code could prove and of `-ftls-model=`, as gcc 13 does: an
+/// executable's thread-local asked for `initial-exec` or `global-dynamic`
+/// gets it, and shared code reaches one asked for `local-exec` as Local
+/// Exec. `local-dynamic` is the descriptor call, as `-ftls-model=` makes
+/// it. Loads and addresses alike; the attribute was ignored with a warning.
+#[test]
+fn tls_model_attribute_is_the_variables_model() {
+    use Access::{Dynamic as GD, InitialExec as IE, LocalExec as LE};
+    let src = r#"
+__thread int a __attribute__((tls_model("initial-exec")));
+__thread int b __attribute__((tls_model("local-exec")));
+extern __thread int c __attribute__((tls_model("initial-exec")));
+extern __thread int d __attribute__((tls_model("local-exec")));
+__thread int e __attribute__((tls_model("global-dynamic")));
+__thread int f __attribute__((__tls_model__("local-dynamic")));
+extern __thread int g;
+int ra(void) { return a; }
+int rb(void) { return b; }
+int rc(void) { return c; }
+int rd(void) { return d; }
+int re(void) { return e; }
+int rf(void) { return f; }
+int rg(void) { return g; }
+int *pa(void) { return &a; }
+int *pb(void) { return &b; }
+int *pe(void) { return &e; }
+"#;
+    let rows: &[(&[&str], [Access; 10])] = &[
+        (&[], [IE, LE, IE, LE, GD, GD, IE, IE, LE, GD]),
+        (&["-fPIC"], [IE, LE, IE, LE, GD, GD, GD, IE, LE, GD]),
+        (
+            &["-ftls-model=local-exec"],
+            [IE, LE, IE, LE, GD, GD, LE, IE, LE, GD],
+        ),
+    ];
+    let functions = ["ra", "rb", "rc", "rd", "re", "rf", "rg", "pa", "pb", "pe"];
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        for opt in ["-O0", "-O2"] {
+            for &(flags, want) in rows {
+                let mut all = vec![opt];
+                all.extend_from_slice(flags);
+                let asm = asm_for_with("tls_model_attr", triple, src, &all);
+                for (name, want) in functions.iter().zip(want) {
+                    assert_eq!(
+                        access_in(body_of(&asm, name)),
+                        want,
+                        "{triple} {all:?} {name}:\n{asm}"
+                    );
+                }
+            }
+        }
+    }
+}

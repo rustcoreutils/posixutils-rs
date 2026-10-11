@@ -2985,15 +2985,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             None => return 0,
         };
 
-        if self
-            .idents
+        self.idents
             .lookup(&name)
-            .is_some_and(|id| crate::kw::attribute_supported(id, self.pp.target.arch))
-        {
-            1
-        } else {
-            0
-        }
+            .map_or(0, |id| crate::kw::has_attribute(id, self.pp.target.arch))
     }
 
     /// Evaluate __has_builtin(X)

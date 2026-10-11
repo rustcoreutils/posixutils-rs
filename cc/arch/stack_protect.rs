@@ -52,9 +52,11 @@ pub fn protects(func: &Function, types: &TypeTable, protection: StackProtection)
                 || locals(func).any(|(_, t)| large_char_array(t, types, protection.buffer_size))
         }
         StackProtector::Strong => {
+            let mentions = crate::ir::escape::Mentions::of(func);
             allocates(func)
-                || locals(func)
-                    .any(|(sym, t)| holds_array(t, types) || crate::ir::escape::escapes(func, sym))
+                || locals(func).any(|(sym, t)| {
+                    holds_array(t, types) || crate::ir::escape::escapes(func, &mentions, sym)
+                })
         }
     }
 }

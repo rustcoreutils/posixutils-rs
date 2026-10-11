@@ -171,9 +171,10 @@ fn gcc_flags_cpu_selection_is_accepted() {
 /// double` is the x87 80-bit format, its arithmetic is SSE's, and it reaches
 /// a dynamic thread-local through a TLS descriptor (`gnu2`), so
 /// `-mlong-double-80`, `-mfpmath=sse` and `-mtls-dialect=gnu2` change
-/// nothing. `long double` as `double` or as binary128, x87 arithmetic and
-/// `__tls_get_addr` are not what c17 generates. glibc's configure and tests
-/// pass all of these.
+/// nothing. `-mtls-dialect=gnu`, gcc's default, is taken as well: the
+/// descriptor sequence links and runs wherever `__tls_get_addr`'s does.
+/// `long double` as `double` or as binary128 and x87 arithmetic are not what
+/// c17 generates. glibc's configure and tests pass all of these.
 #[test]
 fn gcc_flags_x86_64_fp_and_tls_options() {
     let x86 = "--target=x86_64-unknown-linux-gnu";
@@ -185,6 +186,7 @@ fn gcc_flags_x86_64_fp_and_tls_options() {
         "-mlong-double-80",
         "-mfpmath=sse",
         "-mtls-dialect=gnu2",
+        "-mtls-dialect=gnu",
         "-mprefer-vector-width=128",
     ] {
         let asm = crate::common::asm_for_at("c17_fptls_", src, &[x86, "-fPIC", flag]);
@@ -203,7 +205,6 @@ fn gcc_flags_x86_64_fp_and_tls_options() {
         "-mfpmath=387",
         "-mfpmath=both",
         "-mfpmath=sse+387",
-        "-mtls-dialect=gnu",
     ] {
         let r = run_c17(&[x86, flag, "-S", "-o", "/dev/null", path.to_str().unwrap()]);
         assert!(!r.success, "{flag} accepted");
@@ -224,6 +225,57 @@ fn gcc_flags_x86_64_fp_and_tls_options() {
             path.to_str().unwrap(),
         ]);
         assert!(!r.success, "aarch64 {flag} accepted");
+    }
+}
+
+/// `-mtls-dialect=` names each architecture's own pair, as gcc's does: x86-64
+/// takes `gnu` and `gnu2`, aarch64 `desc` and `trad`. c17 reaches a dynamic
+/// thread-local through a TLS descriptor on both, so `desc` changes nothing;
+/// aarch64's `trad` asks for `__tls_get_addr` calls c17 does not generate,
+/// and is refused. Any other value -- the other architecture's included --
+/// is refused in gcc's words, with the valid ones listed. aarch64's `desc`
+/// was refused as an unsupported machine flag.
+#[test]
+fn gcc_flags_tls_dialect_per_architecture() {
+    let a64 = "--target=aarch64-unknown-linux-gnu";
+    let x86 = "--target=x86_64-unknown-linux-gnu";
+    let src = "__thread int tv;\nint *addr(void) { return &tv; }\n";
+    let plain = crate::common::asm_for_at("c17_tlsd_", src, &[a64, "-fPIC"]);
+    assert!(plain.contains(":tlsdesc:tv"), "{plain}");
+    let asm = crate::common::asm_for_at("c17_tlsd_", src, &[a64, "-fPIC", "-mtls-dialect=desc"]);
+    let strip = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.contains("c17_tlsd_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(strip(&asm), strip(&plain));
+
+    let (_dir, path) = scratch("tlsd.c", src);
+    let path = path.to_str().unwrap();
+    let r = run_c17(&[a64, "-mtls-dialect=trad", "-S", "-o", "/dev/null", path]);
+    assert!(!r.success, "trad accepted");
+    assert_eq!(
+        r.stderr,
+        "c17: unsupported machine flag: -mtls-dialect=trad\n"
+    );
+    for (target, value, valid) in [
+        (x86, "desc", "gnu gnu2"),
+        (x86, "bogus", "gnu gnu2"),
+        (a64, "gnu", "desc trad"),
+        (a64, "gnu2", "desc trad"),
+    ] {
+        let flag = format!("-mtls-dialect={value}");
+        let r = run_c17(&[target, &flag, "-S", "-o", "/dev/null", path]);
+        assert!(!r.success, "{target} {flag} accepted");
+        assert_eq!(
+            r.stderr,
+            format!(
+                "c17: error: unrecognized argument in option '{flag}'\n\
+                 c17: note: valid arguments to '-mtls-dialect=' are: {valid}\n"
+            ),
+            "{target} {flag}"
+        );
     }
 }
 

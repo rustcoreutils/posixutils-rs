@@ -3151,13 +3151,16 @@ fn version_banner(target: &Target) -> String {
 /// takes its baseline path. `-msse`, `-msse2` and `-mfpmath=sse` name the
 /// baseline itself; `-msse2avx` is the assembler's, and `-mvzeroupper` and
 /// `-mprefer-vector-width=` speak of code c17 never generates.
-/// `-mlong-double-80` is c17's `long double`, and `-mtls-dialect=gnu2` the
-/// TLS descriptors it reaches a dynamic thread-local through. Everything
-/// else -- an ABI or code-model change, x87 arithmetic (`-mfpmath=387`), a
-/// `long double` of 64 or 128 bits, `__tls_get_addr` (`-mtls-dialect=gnu`)
-/// -- would make the code different from what was asked, so it is an
-/// error. gcc's aarch64 driver does not
-/// know the x86-64 instruction-set options at all, and nor does c17's.
+/// `-mlong-double-80` is c17's `long double`, and `-mtls-dialect=gnu2`
+/// (aarch64's `desc`) the TLS descriptors it reaches a dynamic thread-local
+/// through. x86-64's `-mtls-dialect=gnu` is gcc's default there and is taken
+/// as well: the descriptor sequence links and runs wherever the
+/// `__tls_get_addr` one does, so nothing a build can observe changes.
+/// Everything else -- an ABI or code-model change, x87 arithmetic
+/// (`-mfpmath=387`), a `long double` of 64 or 128 bits, aarch64's
+/// `-mtls-dialect=trad` -- would make the code different from what was
+/// asked, so it is an error. gcc's aarch64 driver does not know the x86-64
+/// instruction-set options at all, and nor does c17's.
 fn check_machine_flags(flags: &[String], target: &Target) {
     // Options the other architecture's gcc driver does not know at all.
     let foreign = |f: &str| match target.arch {
@@ -3184,6 +3187,12 @@ fn check_machine_flags(flags: &[String], target: &Target) {
         );
         std::process::exit(1);
     }
+    if let Err(lines) = machine::check_tls_dialect(flags, target.arch) {
+        for line in lines {
+            eprintln!("c17: {line}");
+        }
+        std::process::exit(1);
+    }
     let accepted = |flag: &str| {
         flag.starts_with("-march=")
             || flag.starts_with("-mtune=")
@@ -3200,6 +3209,7 @@ fn check_machine_flags(flags: &[String], target: &Target) {
                                 | "-mno-vzeroupper"
                                 | "-mfpmath=sse"
                                 | "-mlong-double-80"
+                                | "-mtls-dialect=gnu"
                                 | "-mtls-dialect=gnu2"
                                 | "-mprefer-vector-width=none"
                                 | "-mprefer-vector-width=128"
@@ -3209,7 +3219,13 @@ fn check_machine_flags(flags: &[String], target: &Target) {
                         || target::Profiling::MACHINE_FLAGS.contains(&flag)
                 }
                 target::Arch::Aarch64 => {
-                    matches!(flag, "-mabi=lp64" | "-mlittle-endian" | "-mcmodel=small")
+                    matches!(
+                        flag,
+                        "-mabi=lp64"
+                            | "-mlittle-endian"
+                            | "-mcmodel=small"
+                            | "-mtls-dialect=desc"
+                    )
                         || flag.starts_with("-mbranch-protection=")
                         || flag.starts_with("-msign-return-address=")
                 }

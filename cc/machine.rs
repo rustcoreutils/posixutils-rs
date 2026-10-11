@@ -170,6 +170,27 @@ fn bad_choice(stem: &str, value: &str, valid: &[&str]) -> Vec<String> {
     ]
 }
 
+/// gcc's refusal of each `-mtls-dialect=` value the architecture has no
+/// such dialect for, the other architecture's included: x86-64's gcc takes
+/// `gnu` (`__tls_get_addr`, its default) and `gnu2` (TLS descriptors),
+/// aarch64's `desc` (descriptors, its default) and `trad`. Whether c17
+/// generates a dialect the architecture does have is the caller's question.
+pub fn check_tls_dialect(flags: &[String], arch: crate::target::Arch) -> Result<(), Vec<String>> {
+    const STEM: &str = "-mtls-dialect=";
+    let valid: &[&str] = match arch {
+        crate::target::Arch::X86_64 => &["gnu", "gnu2"],
+        crate::target::Arch::Aarch64 => &["desc", "trad"],
+    };
+    for flag in flags {
+        if let Some(value) = flag.strip_prefix(STEM) {
+            if !valid.contains(&value) {
+                return Err(bad_choice(STEM, value, valid));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A C integer constant as gcc's `strtol(value, 0, 0)` reads it, whole.
 fn parse_c_integer(value: &str) -> Option<i64> {
     let (negative, digits) = match value.strip_prefix('-') {
@@ -440,6 +461,34 @@ mod tests {
     fn parse(flags: &[&str]) -> Result<X86Options, Vec<String>> {
         let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
         X86Options::from_flags(&flags, false)
+    }
+
+    /// Each architecture takes its own two dialects and refuses the
+    /// other's, listing its own.
+    #[test]
+    fn tls_dialect_per_architecture() {
+        use crate::target::Arch;
+        let check = |flag: &str, arch| check_tls_dialect(&[flag.to_string()], arch);
+        for flag in ["-mtls-dialect=gnu", "-mtls-dialect=gnu2", "-mfpmath=sse"] {
+            assert_eq!(check(flag, Arch::X86_64), Ok(()), "{flag}");
+        }
+        for flag in ["-mtls-dialect=desc", "-mtls-dialect=trad"] {
+            assert_eq!(check(flag, Arch::Aarch64), Ok(()), "{flag}");
+        }
+        assert_eq!(
+            check("-mtls-dialect=desc", Arch::X86_64),
+            Err(vec![
+                "error: unrecognized argument in option '-mtls-dialect=desc'".to_string(),
+                "note: valid arguments to '-mtls-dialect=' are: gnu gnu2".to_string(),
+            ])
+        );
+        assert_eq!(
+            check("-mtls-dialect=gnu2", Arch::Aarch64),
+            Err(vec![
+                "error: unrecognized argument in option '-mtls-dialect=gnu2'".to_string(),
+                "note: valid arguments to '-mtls-dialect=' are: desc trad".to_string(),
+            ])
+        );
     }
 
     #[test]

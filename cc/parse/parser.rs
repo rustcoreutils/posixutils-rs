@@ -281,6 +281,8 @@ pub struct Parser<'a> {
     /// `-fcf-protection=branch`, as in gcc, which otherwise warns that it
     /// is ignored.
     pub(super) cf_branch: bool,
+    /// `-fstrict-flex-arrays=N`; see [`Parser::set_strict_flex_arrays`].
+    pub(super) strict_flex_arrays: u8,
 
     /// What the variadic builtins need to know of the function whose body
     /// is being parsed; the default outside any function. This is the last
@@ -434,6 +436,7 @@ impl<'a> Parser<'a> {
             pending_fn_attrs: Default::default(),
             pending_fn_type: Default::default(),
             cf_branch: false,
+            strict_flex_arrays: 0,
             enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
             reverse_atomic_members: Vec::new(),
@@ -476,6 +479,14 @@ impl<'a> Parser<'a> {
     /// what gives `__attribute__((nocf_check))` a meaning. Off by default.
     pub fn set_cf_branch(&mut self, branch: bool) {
         self.cf_branch = branch;
+    }
+
+    /// `-fstrict-flex-arrays=N`: which trailing arrays of an object of
+    /// unknown size `__builtin_object_size` takes for flexible ones -- any
+    /// (0, the default), those of zero or one element (1), of zero (2), or
+    /// only a true flexible array member (3).
+    pub fn set_strict_flex_arrays(&mut self, level: u8) {
+        self.strict_flex_arrays = level;
     }
 
     /// The alignment cap `#pragma pack` puts on a structure defined here.

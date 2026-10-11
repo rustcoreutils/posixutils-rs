@@ -18,6 +18,7 @@ use crate::arch::lir::{
     CallTarget, CondCode, Directive, EmitAsm, FpSize, Label, OperandSize, Symbol,
 };
 use crate::ir::NanCompare;
+use crate::machine::{CodeModel, SegReg, Thunk};
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
@@ -73,6 +74,17 @@ pub enum MemAddr {
     /// value, which the segment override can do in one instruction).
     FsAbsolute(i32),
 
+    /// `%gs:40`: a fixed offset from a segment base, where
+    /// `-mstack-protector-guard-reg=` and `-offset=` put the guard.
+    SegOffset { seg: SegReg, offset: i32 },
+
+    /// `%gs:sym(%rip)`: gcc 13's spelling of a guard at a symbol,
+    /// `-mstack-protector-guard-symbol=`.
+    SegRip { seg: SegReg, sym: Symbol },
+
+    /// `%gs:(%reg)`: a guard symbol's address loaded from the GOT.
+    SegBase { seg: SegReg, base: Reg },
+
     /// symbol@TPOFF(base) - Local Exec offset added to a base register.
     /// Pairs with `FsAbsolute(0)` to form a thread-local address:
     /// `movq %fs:0, %r` then `leaq sym@TPOFF(%r), %r`.
@@ -118,11 +130,174 @@ impl MemAddr {
                 // Absolute offset from the thread pointer: %fs:0 reads it.
                 format!("%fs:{}", offset)
             }
+            MemAddr::SegOffset { seg, offset } => format!("{seg}:{offset}"),
+            MemAddr::SegRip { seg, sym } => {
+                format!("{seg}:{}(%rip)", sym.format_for_target(target))
+            }
+            MemAddr::SegBase { seg, base } => format!("{seg}:({})", base.name64()),
             MemAddr::TlsTpoffBase { sym, base } => {
                 format!("{}@TPOFF({})", sym.format_for_target(target), base.name64())
             }
         }
     }
+}
+
+/// A register `-fzero-call-used-regs` clears before a return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearedReg {
+    Gp(Reg),
+    Xmm(XmmReg),
+    /// The whole x87 stack.
+    X87,
+}
+
+// Spectre and Straight-Line Speculation Mitigations
+
+/// The two kinds of indirect branch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Branch {
+    Call,
+    Jmp,
+}
+
+impl Branch {
+    fn mnemonic(self) -> &'static str {
+        match self {
+            Branch::Call => "call",
+            Branch::Jmp => "jmp",
+        }
+    }
+}
+
+/// The retpoline thunk for an indirect branch through `reg`, as gcc names
+/// it.
+pub fn indirect_thunk_name(reg: Reg) -> String {
+    format!("__x86_indirect_thunk_{}", &reg.name64()[1..])
+}
+
+/// The return thunk's name.
+pub const RETURN_THUNK: &str = "__x86_return_thunk";
+
+/// The speculation trap of a retpoline: a `call` to `done` leaves a return
+/// address the processor predicts its `ret` to, where it spins.
+fn emit_speculation_trap(out: &mut String) {
+    let _ = writeln!(out, "    call 9093f");
+    let _ = writeln!(out, "9092:");
+    let _ = writeln!(out, "    pause");
+    let _ = writeln!(out, "    lfence");
+    let _ = writeln!(out, "    jmp 9092b");
+    let _ = writeln!(out, "9093:");
+}
+
+/// A `call` or `jmp` through `reg`, as `-mindirect-branch=` has it made:
+/// directly (`notrack` for a `nocf_check` callee), through the retpoline
+/// thunk -- with `-mindirect-branch-cs-prefix` a `cs` prefix for
+/// `%r8`..`%r15`, which makes the instruction six bytes, as long as the
+/// `lfence; call *%r11` a kernel patches over it -- or through a retpoline
+/// written out in place, as gcc's `thunk-inline` writes it, with numeric
+/// labels that are its own. `-mharden-sls=indirect-jmp` stops speculation
+/// past a `jmp *%reg` with an `int3`.
+fn emit_indirect_branch(
+    out: &mut String,
+    target: &Target,
+    branch: Branch,
+    reg: Reg,
+    notrack: bool,
+) {
+    let x86 = &target.x86;
+    let op = branch.mnemonic();
+    match x86.indirect_branch {
+        Thunk::Keep => {
+            let prefix = if notrack { "notrack " } else { "" };
+            let _ = writeln!(out, "    {prefix}{op} *{}", reg.name64());
+            if branch == Branch::Jmp && x86.sls.indirect_jmp {
+                let _ = writeln!(out, "    int3");
+            }
+        }
+        Thunk::Thunk | Thunk::Extern => {
+            let high = !matches!(
+                reg,
+                Reg::Rax
+                    | Reg::Rbx
+                    | Reg::Rcx
+                    | Reg::Rdx
+                    | Reg::Rsi
+                    | Reg::Rdi
+                    | Reg::Rbp
+                    | Reg::Rsp
+            );
+            // On a line of its own, as gcc writes it: gas drops a `cs`
+            // written before a `call`.
+            if x86.indirect_branch_cs_prefix && high {
+                let _ = writeln!(out, "    cs");
+            }
+            let _ = writeln!(out, "    {op} {}", indirect_thunk_name(reg));
+        }
+        Thunk::Inline => {
+            if branch == Branch::Call {
+                let _ = writeln!(out, "    jmp 9094f");
+                let _ = writeln!(out, "9091:");
+            }
+            emit_speculation_trap(out);
+            let _ = writeln!(out, "    mov {}, (%rsp)", reg.name64());
+            let _ = writeln!(out, "    ret");
+            if branch == Branch::Call {
+                let _ = writeln!(out, "9094:");
+                let _ = writeln!(out, "    call 9091b");
+            }
+        }
+    }
+}
+
+/// A return, as `-mfunction-return=` has it made: `ret`, followed by an
+/// `int3` under `-mharden-sls=return`; a jump to the return thunk; or the
+/// thunk written out in place.
+fn emit_return(out: &mut String, target: &Target) {
+    let x86 = &target.x86;
+    match x86.function_return {
+        Thunk::Keep => {
+            let _ = writeln!(out, "    ret");
+            if x86.sls.ret {
+                let _ = writeln!(out, "    int3");
+            }
+        }
+        Thunk::Thunk | Thunk::Extern => {
+            let _ = writeln!(out, "    jmp {RETURN_THUNK}");
+        }
+        Thunk::Inline => {
+            emit_speculation_trap(out);
+            let _ = writeln!(out, "    lea 8(%rsp), %rsp");
+            let _ = writeln!(out, "    ret");
+        }
+    }
+}
+
+/// The comdat definition of a retpoline thunk the unit writes itself
+/// (`-mindirect-branch=thunk`, `-mfunction-return=thunk`), as gcc writes
+/// it: `reg`'s indirect-branch thunk, or with `None` the return thunk.
+pub fn retpoline_thunk_definition(reg: Option<Reg>) -> String {
+    let name = reg.map_or(RETURN_THUNK.to_string(), indirect_thunk_name);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "    .section .text.{name},\"axG\",@progbits,{name},comdat"
+    );
+    let _ = writeln!(out, "    .globl {name}");
+    let _ = writeln!(out, "    .hidden {name}");
+    let _ = writeln!(out, "    .type {name}, @function");
+    let _ = writeln!(out, "{name}:");
+    emit_speculation_trap(&mut out);
+    match reg {
+        Some(reg) => {
+            let _ = writeln!(out, "    mov {}, (%rsp)", reg.name64());
+        }
+        None => {
+            let _ = writeln!(out, "    lea 8(%rsp), %rsp");
+        }
+    }
+    let _ = writeln!(out, "    ret");
+    let _ = writeln!(out, "    .size {name}, .-{name}");
+    out
 }
 
 // General-Purpose Operands
@@ -468,9 +643,11 @@ pub enum X86Inst {
     /// `-fno-plt`'s.
     CallGot { sym: Symbol },
 
-    /// `movl $sym, %dst32`: a symbol's address as an absolute 32-bit
-    /// immediate, zero-extended -- position-dependent code's spelling, which
-    /// gcc uses (`R_X86_64_32`).
+    /// A symbol's address as an absolute 32-bit immediate --
+    /// position-dependent code's spelling, which gcc uses: `movl $sym,
+    /// %dst32`, zero-extended (`R_X86_64_32`), in the small code model, and
+    /// `movq $sym, %dst`, sign-extended (`R_X86_64_32S`), in the kernel's,
+    /// whose addresses are the top 2 GB.
     MovSymAddr { sym: Symbol, dst: Reg },
 
     /// PUSH - Push value onto stack
@@ -692,6 +869,17 @@ pub enum X86Inst {
     /// ENDBR64 - the landing pad an indirect branch needs under CET's
     /// indirect-branch tracking; a NOP otherwise.
     Endbr64,
+
+    /// `-fzero-call-used-regs`: the registers cleared before a return, in
+    /// order. Pushed empty at each return and filled once the function is
+    /// whole, when what it used is known.
+    ClearRegs { regs: Vec<ClearedReg> },
+
+    /// How the indirect branches and returns that follow are made, up to the
+    /// next of these: the function's own `indirect_branch(...)` and
+    /// `function_return(...)`, or the command line's. Emits nothing; the
+    /// emitter reads it (`X86_64CodeGen::retarget`).
+    BranchModes { indirect: Thunk, ret: Thunk },
 
     /// `-pg`'s call to the profiler at a function's entry, in gcc's text: a
     /// `1:` label for `-mrecord-mcount` to name, then `call routine` --
@@ -1050,19 +1238,22 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    leaq {}, {}", addr.format(target), dst.name64());
             }
             X86Inst::CallGot { sym } => {
-                let _ = writeln!(
-                    out,
-                    "    call *{}@GOTPCREL(%rip)",
-                    sym.format_for_target(target)
-                );
+                let sym = sym.format_for_target(target);
+                if target.x86.indirect_branch == Thunk::Keep {
+                    let _ = writeln!(out, "    call *{sym}@GOTPCREL(%rip)");
+                } else {
+                    // A thunk takes its target in a register: %r11, which
+                    // no argument travels in.
+                    let _ = writeln!(out, "    movq {sym}@GOTPCREL(%rip), %r11");
+                    emit_indirect_branch(out, target, Branch::Call, Reg::R11, false);
+                }
             }
             X86Inst::MovSymAddr { sym, dst } => {
-                let _ = writeln!(
-                    out,
-                    "    movl ${}, {}",
-                    sym.format_for_target(target),
-                    dst.name32()
-                );
+                let sym = sym.format_for_target(target);
+                let _ = match target.x86.code_model {
+                    CodeModel::Small => writeln!(out, "    movl ${sym}, {}", dst.name32()),
+                    CodeModel::Kernel => writeln!(out, "    movq ${sym}, {}", dst.name64()),
+                };
             }
 
             X86Inst::Push { src } => {
@@ -1173,7 +1364,7 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    jmp {}", lbl.name(target));
             }
             X86Inst::JmpIndirect { reg } => {
-                let _ = writeln!(out, "    jmp *{}", reg.name64());
+                emit_indirect_branch(out, target, Branch::Jmp, *reg, false);
             }
 
             X86Inst::Jcc { cc, target: lbl } => {
@@ -1207,18 +1398,15 @@ impl EmitAsm for X86Inst {
                     }
                 }
                 CallTarget::Indirect(reg) => {
-                    // Indirect call through register: call *%reg
-                    let _ = writeln!(out, "    call *{}", reg.name64());
+                    emit_indirect_branch(out, target, Branch::Call, *reg, false);
                 }
             },
 
             X86Inst::NotrackCall { reg } => {
-                let _ = writeln!(out, "    notrack call *{}", reg.name64());
+                emit_indirect_branch(out, target, Branch::Call, *reg, true);
             }
 
-            X86Inst::Ret => {
-                let _ = writeln!(out, "    ret");
-            }
+            X86Inst::Ret => emit_return(out, target),
 
             X86Inst::RepStosq => {
                 let _ = writeln!(out, "    rep stosq");
@@ -1234,6 +1422,31 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Endbr64 => {
                 let _ = writeln!(out, "    endbr64");
+            }
+
+            X86Inst::BranchModes { .. } => {}
+
+            X86Inst::ClearRegs { regs } => {
+                for reg in regs {
+                    match reg {
+                        ClearedReg::Gp(r) => {
+                            let _ = writeln!(out, "    xorl {0}, {0}", r.name32());
+                        }
+                        ClearedReg::Xmm(x) => {
+                            let _ = writeln!(out, "    pxor {0}, {0}", x.name());
+                        }
+                        // The x87 stack, emptied: eight zeros pushed and
+                        // popped overwrite all eight registers.
+                        ClearedReg::X87 => {
+                            for _ in 0..8 {
+                                let _ = writeln!(out, "    fldz");
+                            }
+                            for _ in 0..8 {
+                                let _ = writeln!(out, "    fstp %st(0)");
+                            }
+                        }
+                    }
+                }
             }
 
             X86Inst::ProfileCall {

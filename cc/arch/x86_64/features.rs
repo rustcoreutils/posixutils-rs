@@ -11,10 +11,10 @@
 
 use super::call::{BlockDst, UNROLL_LIMIT_BYTES};
 use super::codegen::X86_64CodeGen;
-use super::lir::{popcount_sequence, GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
-use super::regalloc::{Loc, Reg, XmmReg};
+use super::lir::{popcount_sequence, GpOperand, MemAddr, ShiftCount, X86Inst};
+use super::regalloc::{Loc, Reg};
 use crate::arch::codegen::BswapSize;
-use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{CallTarget, CondCode, Directive, Label, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::TypeTable;
 
@@ -967,10 +967,11 @@ impl X86_64CodeGen {
     /// eightbyte at a time.
     ///
     /// Only codegen scratch is used -- R10 and R11 for the two bases, the
-    /// reserved %xmm15 for the data. RAX, RCX and RDX, used here before, are
-    /// allocatable: a sum the allocator left in %eax across a `va_copy` in a
-    /// loop came back as a `gp_offset`. And each operand is read through
-    /// [`Self::va_list_base`], as `va_arg` reads it: a `va_list` parameter
+    /// reserved %xmm15 for the data ([`Self::copy_eightbytes`]). RAX, RCX
+    /// and RDX, used here before, are allocatable: a sum the allocator left
+    /// in %eax across a `va_copy` in a loop came back as a `gp_offset`. And
+    /// each operand is read through [`Self::va_list_base`], as `va_arg`
+    /// reads it: a `va_list` parameter
     /// spilled to the stack at -O0 holds a pointer, and was copied as if its
     /// slot were the object.
     pub(super) fn emit_va_copy(&mut self, insn: &Instruction) {
@@ -983,24 +984,7 @@ impl X86_64CodeGen {
         let Some((dst_base, dst_off)) = self.va_list_base(dest, Reg::R11) else {
             return;
         };
-        for field in [0, 8, 16] {
-            self.push_lir(X86Inst::MovFp {
-                size: FpSize::Double,
-                src: XmmOperand::Mem(MemAddr::BaseOffset {
-                    base: src_base,
-                    offset: src_off + field,
-                }),
-                dst: XmmOperand::Reg(XmmReg::Xmm15),
-            });
-            self.push_lir(X86Inst::MovFp {
-                size: FpSize::Double,
-                src: XmmOperand::Reg(XmmReg::Xmm15),
-                dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                    base: dst_base,
-                    offset: dst_off + field,
-                }),
-            });
-        }
+        self.copy_eightbytes((src_base, src_off), (dst_base, dst_off), 3);
     }
 
     // Byte-swapping and bit-scanning builtins

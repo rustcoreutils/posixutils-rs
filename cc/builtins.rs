@@ -674,6 +674,9 @@ thread_local! {
     /// reason -- they are not reserved to the implementation.
     static NO_BUILTIN: Cell<bool> = const { Cell::new(false) };
 
+    /// `-ffreestanding`.
+    static FREESTANDING: Cell<bool> = const { Cell::new(false) };
+
     /// Names disabled individually by `-fno-builtin-NAME`.
     static NO_BUILTIN_FUNCS: RefCell<std::collections::HashSet<String>> =
         RefCell::new(std::collections::HashSet::new());
@@ -698,6 +701,17 @@ pub fn set_gnu89_inline(on: bool) {
 /// Does an `inline` function without the attribute take the GNU89 rule?
 pub fn gnu89_inline() -> bool {
     GNU89_INLINE.get()
+}
+
+/// Say the unit is compiled for a freestanding environment
+/// (`-ffreestanding`): `__STDC_HOSTED__` is 0.
+pub fn set_freestanding() {
+    FREESTANDING.set(true);
+}
+
+/// Whether the unit is compiled for a freestanding environment.
+pub fn freestanding() -> bool {
+    FREESTANDING.get()
 }
 
 /// Turn off all non-reserved builtins (`-fno-builtin`).

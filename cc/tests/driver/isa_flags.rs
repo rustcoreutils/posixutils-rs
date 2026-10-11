@@ -283,3 +283,72 @@ int main(void) {
         );
     }
 }
+
+/// The baseline's own macros, which the kernel's options take away, as
+/// gcc 13's `-dM -E` does: `-mno-sse` takes SSE and everything built on it,
+/// SSE2 and SSE4.2 among them; `-mno-sse2` leaves SSE; `-mno-80387` and its
+/// spelling `-msoft-float` define `_SOFT_FLOAT`; and `-mgeneral-regs-only`
+/// takes all of it, MMX too. Without SSE2 c17 computes no floating point,
+/// so it no longer claims IEC 60559 arithmetic.
+#[test]
+fn isa_flags_baseline_macros() {
+    const NAMES: [&str; 8] = [
+        "__SSE__",
+        "__SSE2__",
+        "__SSE_MATH__",
+        "__SSE2_MATH__",
+        "__SSE4_2__",
+        "__MMX__",
+        "_SOFT_FLOAT",
+        "__STDC_IEC_559__",
+    ];
+    let rows: &[(&[&str], &str)] = &[
+        (
+            &[],
+            "__SSE__ __SSE2__ __SSE_MATH__ __SSE2_MATH__ __MMX__ __STDC_IEC_559__",
+        ),
+        (&["-msse4.2", "-mno-sse"], "__MMX__"),
+        (&["-mno-sse2"], "__SSE__ __SSE_MATH__ __MMX__"),
+        (
+            &["-mno-80387"],
+            "__SSE__ __SSE2__ __SSE_MATH__ __SSE2_MATH__ __MMX__ _SOFT_FLOAT __STDC_IEC_559__",
+        ),
+        (
+            &["-msoft-float"],
+            "__SSE__ __SSE2__ __SSE_MATH__ __SSE2_MATH__ __MMX__ _SOFT_FLOAT __STDC_IEC_559__",
+        ),
+        (&["-mgeneral-regs-only"], "_SOFT_FLOAT"),
+        (
+            &[
+                "-mno-sse",
+                "-mno-mmx",
+                "-mno-sse2",
+                "-mno-3dnow",
+                "-mno-avx",
+                "-mno-80387",
+                "-mno-fp-ret-in-387",
+            ],
+            "_SOFT_FLOAT",
+        ),
+        (
+            &["-mno-sse", "-msse2"],
+            "__SSE__ __SSE2__ __SSE_MATH__ __SSE2_MATH__ __MMX__ __STDC_IEC_559__",
+        ),
+    ];
+    for (flags, want) in rows {
+        let mut argv = vec!["--target=x86_64-unknown-linux-gnu", "-dM"];
+        argv.extend_from_slice(flags);
+        let r = preprocess_text("baseline_macros", "", &argv);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        let on: Vec<&str> = NAMES
+            .iter()
+            .copied()
+            .filter(|m| {
+                r.stdout
+                    .lines()
+                    .any(|l| l.starts_with(&format!("#define {m} ")))
+            })
+            .collect();
+        assert_eq!(on.join(" "), *want, "{flags:?}");
+    }
+}

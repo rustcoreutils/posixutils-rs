@@ -36,8 +36,10 @@
 //! probes `-fno-rtti` with the C compiler and gives the answer to its C++
 //! flags, so refusing it is not what gcc does.
 //!
-//! `-ffreestanding` is not here: the driver refuses it, there being no
-//! freestanding environment to compile for.
+//! The options that change what a unit means or how its functions are laid
+//! out -- `-fshort-wchar`, `-ffreestanding`, `-falign-functions=`,
+//! `-fpatchable-function-entry=` and the rest -- are folded by
+//! [`CodeOptions`].
 
 /// Why an [`Effect::Accepted`] option needs nothing from c17.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +106,13 @@ const PLAIN: &[(&str, Effect)] = &[
     // The `-fpic` family: `target::PositionIndependence`.
     ("PIC", Implemented),
     ("PIE", Implemented),
+    // `-falign-functions` and its value: `CodeOptions`.
+    ("align-functions", Implemented),
+    // Alignment of branch targets inside a function: a tuning hint.
+    ("align-jumps", Accepted(Pass)),
+    ("align-labels", Accepted(Pass)),
+    ("align-loops", Accepted(Pass)),
+    ("allow-store-data-races", Accepted(Permission)),
     ("associative-math", Accepted(Permission)),
     // The unwind tables: `target::UnwindTables`.
     ("asynchronous-unwind-tables", Implemented),
@@ -117,6 +126,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("conserve-stack", Accepted(Pass)),
     ("cx-limited-range", Accepted(Permission)),
     ("data-sections", Implemented),
+    ("delete-null-pointer-checks", Accepted(Permission)),
     ("diagnostics-color", Accepted(Presentation)),
     ("diagnostics-format=text", Accepted(Presentation)),
     // Main driver: whether a diagnostic names its option.
@@ -145,6 +155,7 @@ const PLAIN: &[(&str, Effect)] = &[
     // c17 keeps no excess precision: `float` and `double` live in SSE or
     // FP registers of their own width.
     ("float-store", Accepted(Default)),
+    ("freestanding", Implemented),
     // Each function, or object, in a section of its own: `.text.NAME`,
     // `.data.NAME` and the rest.
     ("function-sections", Implemented),
@@ -167,6 +178,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("ipa-modref", Accepted(Pass)),
     ("ipa-pta", Accepted(Pass)),
     ("ivopts", Accepted(Pass)),
+    ("jump-tables", Accepted(Permission)),
     ("live-range-shrinkage", Accepted(Pass)),
     ("loop-parallelize-all", Accepted(Pass)),
     ("lto", Accepted(Pass)),
@@ -178,6 +190,13 @@ const PLAIN: &[(&str, Effect)] = &[
     ("move-loop-invariants", Accepted(Pass)),
     ("no-PIC", Implemented),
     ("no-PIE", Implemented),
+    ("no-align-functions", Implemented),
+    ("no-align-jumps", Accepted(Pass)),
+    ("no-align-labels", Accepted(Pass)),
+    ("no-align-loops", Accepted(Pass)),
+    // c17 stores only what the program stores: no pass invents a store
+    // on a path that had none.
+    ("no-allow-store-data-races", Accepted(Default)),
     ("no-associative-math", Accepted(Default)),
     ("no-asynchronous-unwind-tables", Implemented),
     ("no-builtin", Implemented),
@@ -191,6 +210,9 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-cx-limited-range", Accepted(Default)),
     ("no-data-sections", Implemented),
     ("no-dce", Accepted(Pass)),
+    // No pass assumes a pointer is non-null because it was dereferenced:
+    // `*p; if (!p)` keeps its test.
+    ("no-delete-null-pointer-checks", Accepted(Default)),
     ("no-diagnostics-color", Accepted(Presentation)),
     ("no-diagnostics-show-caret", Accepted(Presentation)),
     ("no-diagnostics-show-option", Implemented),
@@ -214,6 +236,9 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-ipa-ra", Accepted(Pass)),
     ("no-ira-share-spill-slots", Accepted(Pass)),
     ("no-ivopts", Accepted(Pass)),
+    // c17 lowers a `switch` to compares and branches, never a table of
+    // addresses an indirect jump reads -- which a retpoline build forbids.
+    ("no-jump-tables", Accepted(Default)),
     ("no-lto", Accepted(Default)),
     ("no-math-errno", Implemented),
     ("no-move-loop-invariants", Accepted(Pass)),
@@ -243,9 +268,12 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-semantic-interposition", Implemented),
     // An enum is `int`-sized.
     ("no-short-enums", Accepted(Default)),
+    ("no-short-wchar", Implemented),
     ("no-signaling-nans", Implemented),
     ("no-signed-char", Implemented),
     ("no-signed-zeros", Accepted(Permission)),
+    // No stack probes: what c17 emits.
+    ("no-stack-check", Accepted(Default)),
     // Withdraws `-fstack-clash-protection`; the driver takes both.
     ("no-stack-clash-protection", Implemented),
     // The stack protector's levels and their withdrawal:
@@ -254,6 +282,7 @@ const PLAIN: &[(&str, Effect)] = &[
     // c17 does not assume aliasing by type: a store through `float *`
     // reloads an `int` read through `int *`.
     ("no-strict-aliasing", Accepted(Default)),
+    ("no-strict-flex-arrays", Implemented),
     // gcc's spelling of `-fwrapv`; see `wrapv`.
     ("no-strict-overflow", Accepted(Default)),
     ("no-threadsafe-statics", CXX_OBJCXX),
@@ -290,6 +319,8 @@ const PLAIN: &[(&str, Effect)] = &[
     ("omit-frame-pointer", Accepted(Permission)),
     // The OpenMP pragmas are ignored and `_OPENMP` is not defined.
     ("openmp", Unsupported),
+    // c17 makes no sibling call: every call returns to its caller.
+    ("optimize-sibling-calls", Accepted(Permission)),
     ("optimize-strlen", Accepted(Pass)),
     // Every struct keeps its natural layout.
     ("pack-struct", Unsupported),
@@ -326,11 +357,13 @@ const PLAIN: &[(&str, Effect)] = &[
     // the same unit even under -fPIC, so an interposed definition is not
     // the one they call.
     ("semantic-interposition", Implemented),
+    ("short-wchar", Implemented),
     ("signaling-nans", Implemented),
     ("signed-char", Implemented),
     ("signed-zeros", Accepted(Default)),
     // Hardening: no stack probes.
     ("stack-check", Unsupported),
+    ("stack-check=no", Accepted(Default)),
     // The driver takes it, and c17 warns for each function whose stack
     // gcc would probe: one whose frame reaches the guard, or that
     // allocates on the stack dynamically. Other functions need no probe.
@@ -340,6 +373,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("stack-protector-explicit", Implemented),
     ("stack-protector-strong", Implemented),
     ("strict-aliasing", Accepted(Permission)),
+    ("strict-flex-arrays", Implemented),
     ("strict-overflow", Accepted(Permission)),
     // Main driver: check, write nothing. libxcrypt's symbol-version probe.
     ("syntax-only", Implemented),
@@ -394,6 +428,8 @@ enum Value {
     PackAlign,
     /// `auto`, `jobserver` or a positive count: `-flto=`'s job count.
     Jobs,
+    /// An alignment, `N[:M[:N2[:M2]]]`, as `-falign-functions=` takes.
+    Align,
     /// One of these words.
     Choice(ChoiceText, &'static [&'static str]),
 }
@@ -402,6 +438,10 @@ enum Value {
 /// with its value and what c17 does with it. A value [`PLAIN`] names on its
 /// own is classified there first.
 const JOINED: &[(&str, Value, Effect)] = &[
+    ("align-functions", Value::Driver, Implemented),
+    ("align-jumps", Value::Align, Accepted(Pass)),
+    ("align-labels", Value::Align, Accepted(Pass)),
+    ("align-loops", Value::Align, Accepted(Pass)),
     ("cf-protection", Value::Driver, Implemented),
     ("debug-prefix-map", Value::Driver, Implemented),
     (
@@ -449,6 +489,7 @@ const JOINED: &[(&str, Value, Effect)] = &[
     ),
     ("macro-prefix-map", Value::Driver, Implemented),
     ("message-length", Value::Unsigned, Accepted(Presentation)),
+    ("min-function-alignment", Value::Driver, Implemented),
     ("no-sanitize", Value::Driver, Implemented),
     ("no-sanitize-coverage", Value::Driver, Implemented),
     (
@@ -459,6 +500,7 @@ const JOINED: &[(&str, Value, Effect)] = &[
     ("no-sanitize-trap", Value::Any, Accepted(SanitizerModifier)),
     // Every struct keeps its natural layout.
     ("pack-struct", Value::PackAlign, Unsupported),
+    ("patchable-function-entry", Value::Driver, Implemented),
     // The seed gcc makes up names from, so that its objects come out the
     // same every time. c17 makes up no name at random: its output is a
     // function of its input alone.
@@ -468,9 +510,15 @@ const JOINED: &[(&str, Value, Effect)] = &[
     ("sanitize-coverage", Value::Driver, Implemented),
     ("sanitize-recover", Value::Any, Accepted(SanitizerModifier)),
     ("sanitize-trap", Value::Any, Accepted(SanitizerModifier)),
+    // `no` is in `PLAIN`. `generic` and `specific` ask for stack probes,
+    // which c17 does not emit; gcc only warns of a value it does not know.
+    ("stack-check", Value::Any, Unsupported),
+    ("strict-flex-arrays", Value::Driver, Implemented),
     ("tls-model", Value::Driver, Implemented),
     ("tree-parallelize-loops", Value::Unsigned, Accepted(Pass)),
+    ("trivial-auto-var-init", Value::Driver, Implemented),
     ("visibility", Value::Driver, Implemented),
+    ("zero-call-used-regs", Value::Driver, Implemented),
 ];
 
 /// What becomes of one `-f<name>` option.
@@ -548,6 +596,9 @@ fn check_value(stem: &str, kind: Value, value: &str, effect: Effect) -> Verdict 
                 format!("error: structure alignment must be a small power of two, not {value}")
             })
         }
+        Value::Align => crate::target::AlignSpec::parse(stem, value, crate::target::Arch::X86_64)
+            .err()
+            .map(|e| format!("error: {e}")),
         Value::Jobs => {
             let count = digits && value.parse::<u64>().map_or(true, |n| n > 0);
             (!(count || value == "auto" || value == "jobserver"))
@@ -583,6 +634,171 @@ fn check_value(stem: &str, kind: Value, value: &str, effect: Effect) -> Verdict 
 /// can withdraw it: an option with a value is a request for that stem.
 pub fn family(name: &str) -> &str {
     name.split_once('=').map_or(name, |(stem, _)| stem)
+}
+
+/// What the `-f` options that change a unit's meaning or its functions'
+/// shape ask, folded in command-line order, the last of each winning:
+/// `-fshort-wchar`, `-ffreestanding`, `-falign-functions`,
+/// `-fmin-function-alignment=`, `-fpatchable-function-entry=`,
+/// `-fzero-call-used-regs=`, `-ftrivial-auto-var-init=` and
+/// `-fstrict-flex-arrays`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CodeOptions {
+    /// `-fshort-wchar`: `wchar_t` is `unsigned short`.
+    pub short_wchar: bool,
+    /// `-ffreestanding`: `__STDC_HOSTED__` is 0, and no library function is
+    /// a builtin (`-fno-builtin`).
+    pub freestanding: bool,
+    pub shape: crate::target::FunctionShape,
+    pub auto_var_init: crate::target::AutoVarInit,
+    /// `-fstrict-flex-arrays=N`: which trailing arrays are flexible -- any
+    /// (0), `[1]`, `[0]` and `[]` (1), `[0]` and `[]` (2), `[]` only (3).
+    pub strict_flex_arrays: u8,
+}
+
+impl CodeOptions {
+    /// Whether `-f<name>` is one of these.
+    pub fn owns(name: &str) -> bool {
+        const PLAIN: &[&str] = &[
+            "short-wchar",
+            "no-short-wchar",
+            "freestanding",
+            "hosted",
+            "align-functions",
+            "no-align-functions",
+            "strict-flex-arrays",
+            "no-strict-flex-arrays",
+        ];
+        const STEMS: &[&str] = &[
+            "align-functions=",
+            "min-function-alignment=",
+            "patchable-function-entry=",
+            "zero-call-used-regs=",
+            "trivial-auto-var-init=",
+            "strict-flex-arrays=",
+        ];
+        PLAIN.contains(&name) || STEMS.iter().any(|s| name.starts_with(s))
+    }
+
+    /// Fold `names` -- each an `-f` option without its `-f`, in order --
+    /// for `target`. `Err` is gcc's refusal, a line per message.
+    pub fn from_names(
+        names: &[String],
+        target: &crate::target::Target,
+    ) -> Result<Self, Vec<String>> {
+        use crate::target::{AlignSpec, AutoVarInit, PatchableEntry, ZeroRegs};
+        let mut o = Self::default();
+        for name in names {
+            let (stem, value) = name.split_once('=').unwrap_or((name, ""));
+            let fail = |msg: String| Err(vec![format!("error: {msg}")]);
+            match (stem, name.contains('=')) {
+                ("short-wchar", false) => o.short_wchar = true,
+                ("no-short-wchar", false) => o.short_wchar = false,
+                ("freestanding", false) => o.freestanding = true,
+                ("hosted", false) => o.freestanding = false,
+                ("align-functions", _) => {
+                    match AlignSpec::parse("align-functions", value, target.arch) {
+                        Ok(spec) => o.shape.align = Some(spec),
+                        Err(e) => return fail(e),
+                    }
+                }
+                ("no-align-functions", false) => o.shape.align = Some(AlignSpec::none()),
+                ("min-function-alignment", true) => match value.parse::<u32>() {
+                    Ok(n) if n <= 65536 => o.shape.min_align = n,
+                    Ok(_) => {
+                        return fail(
+                            "'-fmin-function-alignment' is not between 0 and 65536".to_string(),
+                        )
+                    }
+                    Err(_) => {
+                        return fail(
+                            "argument to '-fmin-function-alignment=' should be a \
+                             non-negative integer"
+                                .to_string(),
+                        )
+                    }
+                },
+                ("patchable-function-entry", true) => {
+                    let mut parts = value.splitn(2, ',').map(str::parse::<u32>);
+                    let total = parts.next().and_then(Result::ok);
+                    let before = parts.next().map_or(Some(0), Result::ok);
+                    match (total, before) {
+                        (Some(total), Some(before)) if before <= total => {
+                            o.shape.patchable =
+                                (total > 0).then_some(PatchableEntry { total, before });
+                        }
+                        _ => {
+                            return fail(
+                                "invalid arguments for '-fpatchable-function-entry'".to_string(),
+                            )
+                        }
+                    }
+                }
+                ("zero-call-used-regs", true) => match ZeroRegs::from_name(value) {
+                    Some(z) => o.shape.zero_regs = z,
+                    None => {
+                        return fail(format!(
+                            "unrecognized argument to '-fzero-call-used-regs=': '{value}'"
+                        ))
+                    }
+                },
+                ("trivial-auto-var-init", true) => {
+                    o.auto_var_init = match value {
+                        "uninitialized" => AutoVarInit::Uninitialized,
+                        "zero" => AutoVarInit::Zero,
+                        "pattern" => AutoVarInit::Pattern,
+                        _ => {
+                            return Err(vec![
+                                format!(
+                                    "error: unrecognized automatic variable initialization \
+                                     type '{value}'"
+                                ),
+                                "note: valid arguments to '-ftrivial-auto-var-init=' are: \
+                                 pattern uninitialized zero"
+                                    .to_string(),
+                            ])
+                        }
+                    }
+                }
+                ("strict-flex-arrays", false) => o.strict_flex_arrays = 3,
+                ("no-strict-flex-arrays", false) => o.strict_flex_arrays = 0,
+                ("strict-flex-arrays", true) => match value.parse::<u8>() {
+                    Ok(n @ 0..=3) => o.strict_flex_arrays = n,
+                    Ok(_) => {
+                        return fail(
+                            "argument to '-fstrict-flex-arrays=' is not between 0 and 3"
+                                .to_string(),
+                        )
+                    }
+                    Err(_) => {
+                        return fail(
+                            "argument to '-fstrict-flex-arrays=' should be a non-negative \
+                             integer"
+                                .to_string(),
+                        )
+                    }
+                },
+                _ => unreachable!("-f{name} is not a CodeOptions option"),
+            }
+        }
+        let mut errors = Vec::new();
+        let elf = target.os != crate::target::Os::MacOS;
+        if o.shape.patchable.is_some() && !elf {
+            errors.push(
+                "error: '-fpatchable-function-entry' is not supported for this target".to_string(),
+            );
+        }
+        if o.shape.zero_regs.on && target.arch != crate::target::Arch::X86_64 {
+            errors.push(
+                "error: '-fzero-call-used-regs' is not supported for this target".to_string(),
+            );
+        }
+        if errors.is_empty() {
+            Ok(o)
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 #[cfg(test)]

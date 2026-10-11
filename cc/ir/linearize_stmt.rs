@@ -489,6 +489,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Track in linearizer's locals map using SymbolId as key
             self.insert_local(declarator.symbol, LocalVarInfo::frame(sym_id, typ));
+            if let Some(func) = &mut self.current_func {
+                func.declared_locals.push(typ);
+            }
 
             // A pointer to a variably-modified array: the extents are the
             // pointee's, and they are what one index step off the pointer
@@ -499,6 +502,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             // which is adjusted to exactly this pointer type; see
             // `linearize_function`.
             self.record_pointee_extents(declarator.symbol, declarator.typ, &declarator.vla_sizes);
+
+            if declarator.init.is_none() && !declarator.symbol_attrs.uninitialized {
+                self.auto_var_init(sym_id, 0, self.types.size_bytes(typ) as i64, typ);
+            }
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -689,6 +696,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             .with_src(total_size)
             .with_type_and_size(self.types.void_ptr_id, self.ptr_bits());
         self.emit(alloca_insn);
+        if !declarator.symbol_attrs.uninitialized {
+            self.auto_var_init_vla(alloca_result, total_size);
+        }
 
         // Create a symbol pseudo for the VLA pointer variable
         // This symbol stores the pointer to the VLA memory (like a pointer variable)

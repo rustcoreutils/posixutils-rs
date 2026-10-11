@@ -107,6 +107,9 @@ pub struct CodegenOptions<'a> {
     /// `-fdebug-prefix-map`: rewrites every path the debug information and
     /// the `.file` directives record.
     pub debug_prefix_map: &'a PrefixMap,
+    /// `-falign-functions`, `-fpatchable-function-entry=`,
+    /// `-ftrivial-auto-var-init=` and their kin.
+    pub code: crate::f_options::CodeOptions,
 }
 
 /// The pipeline's points of interest to the driver: its dumps, `--stats`, and
@@ -195,6 +198,7 @@ pub fn compile_tokens(
         math_errno: opts.math_errno,
     });
     parser.set_cf_branch(opts.cf_protection.branch);
+    parser.set_strict_flex_arrays(opts.code.strict_flex_arrays);
     // A syntax error is reported where it is, like every other diagnostic:
     // its position may be in a header, and only `diag` knows which file a
     // position belongs to and which includes reached it.
@@ -224,6 +228,7 @@ pub fn compile_tokens(
             trapping_math: opts.trapping_math,
             fp_rounding: opts.fp_rounding,
             exceptions: opts.exceptions,
+            auto_var_init: opts.code.auto_var_init,
         },
     );
     if let Some(how) = opts.default_visibility {
@@ -299,6 +304,15 @@ pub fn compile_tokens(
     }
     ir::validate::verify(&module, ir::validate::Stage::Ssa, "optimization");
 
+    // `-mno-sse` and its kin: what survived optimization may need no
+    // register the ISA lacks.
+    if target.arch == crate::target::Arch::X86_64 {
+        arch::x86_64::fp_regs::check(&module, &types, target);
+        if diag::has_error() != 0 {
+            return Err(failed("compilation failed"));
+        }
+    }
+
     if !observer.stage("post-opt", &module, &types, Some(&report)) {
         return Ok(None);
     }
@@ -328,6 +342,7 @@ pub fn compile_tokens(
     codegen.set_profiling(opts.profiling);
     codegen.set_optimizing(opts.optimization.optimizes());
     codegen.set_object_layout(opts.layout);
+    codegen.set_function_shape(opts.code.shape);
     let asm = codegen.generate(&module, &types);
 
     // Codegen can diagnose too. Inline asm is the case that reaches here: a

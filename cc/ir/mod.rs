@@ -3168,6 +3168,14 @@ pub struct Function {
     /// The stack-protector level `optimize("...")` gives this function in
     /// place of the command line's; see `FunctionAttrs::stack_protector`.
     pub stack_protector: Option<crate::target::StackProtector>,
+    /// The type of every automatic object the source declares, unused ones
+    /// included: what an unoptimized frame holds, which gcc's stack
+    /// protector examines (`arch::stack_protect`), though `mem2reg` drops
+    /// the locals nothing names.
+    pub declared_locals: Vec<TypeId>,
+    /// `indirect_branch(...)` and `function_return(...)`: this function's
+    /// own mitigations, over `-mindirect-branch=` and `-mfunction-return=`.
+    pub branches: crate::machine::BranchAttrs,
     /// `__attribute__((no_instrument_function))`: no `-pg` call at entry.
     /// An inlined body brings none either way: the call is made after the
     /// inliner, for the functions that remain.
@@ -3234,6 +3242,8 @@ impl Default for Function {
             is_always_inline: false,
             stack_protect: Default::default(),
             stack_protector: None,
+            declared_locals: Vec::new(),
+            branches: Default::default(),
             no_instrument: false,
             nocf_check: false,
             constructor: None,

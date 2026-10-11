@@ -444,6 +444,45 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit_block_zero(base_sym, 0, total_bytes, volatile);
     }
 
+    /// `-ftrivial-auto-var-init=`: start the `size_bytes` of an automatic
+    /// object of type `typ` at `dst` + `offset`, declared without an
+    /// initializer, as the option says -- all zero bytes, or gcc's pattern,
+    /// each byte 0xFE -- rather than with whatever the stack held.
+    pub(crate) fn auto_var_init(
+        &mut self,
+        dst: PseudoId,
+        offset: i64,
+        size_bytes: i64,
+        typ: TypeId,
+    ) {
+        let byte = match self.auto_var_init {
+            crate::target::AutoVarInit::Uninitialized => return,
+            crate::target::AutoVarInit::Zero => 0,
+            crate::target::AutoVarInit::Pattern => 0xfe,
+        };
+        let volatile = self.types.contains_volatile(typ);
+        self.emit_block_fill(dst, offset, size_bytes, byte, volatile);
+    }
+
+    /// [`Self::auto_var_init`] for a variable length array: the
+    /// `size_bytes` (a pseudo, known at run time) at `ptr`.
+    pub(crate) fn auto_var_init_vla(&mut self, ptr: PseudoId, size_bytes: PseudoId) {
+        let byte = match self.auto_var_init {
+            crate::target::AutoVarInit::Uninitialized => return,
+            crate::target::AutoVarInit::Zero => 0,
+            crate::target::AutoVarInit::Pattern => 0xfe,
+        };
+        let byte = self.emit_const(byte, self.types.int_id);
+        let result = self.alloc_pseudo();
+        self.emit(
+            Instruction::new(BlockOp::Set.opcode())
+                .with_func(self.library_function_name(BlockOp::Set.c_name()))
+                .with_target(result)
+                .with_src3(ptr, byte, size_bytes)
+                .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
+        );
+    }
+
     /// Which ends of a block move between objects of type `dst` and `src`
     /// reach something volatile -- the answer every chunk of the move is
     /// marked with. By `contains_volatile`, the rule `emit` applies to a
@@ -488,22 +527,36 @@ impl<'a> super::linearize::Linearizer<'a> {
         size_bytes: i64,
         volatile: bool,
     ) {
+        self.emit_block_fill(dst, dst_base_offset, size_bytes, 0, volatile);
+    }
+
+    /// [`Self::emit_block_zero`] with every byte `byte`.
+    pub(crate) fn emit_block_fill(
+        &mut self,
+        dst: PseudoId,
+        dst_base_offset: i64,
+        size_bytes: i64,
+        byte: u8,
+        volatile: bool,
+    ) {
         if size_bytes <= 0 {
             return;
         }
         if volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES {
             for (offset, chunk) in memexpand::block_chunks(size_bytes) {
                 let (typ, bits) = (chunk.typ(self.types), chunk.bits());
-                let zero = self.emit_const(0, typ);
+                // Every byte the same: the chunk's value, sign-extended.
+                let pattern = i128::from(i64::from_ne_bytes([byte; 8]) >> (64 - bits));
+                let value = self.emit_const(pattern, typ);
                 self.emit(
-                    Instruction::store(zero, dst, dst_base_offset + offset, typ, bits)
+                    Instruction::store(value, dst, dst_base_offset + offset, typ, bits)
                         .with_volatile(true),
                 );
             }
             return;
         }
         let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
-        let byte = self.emit_const(0, self.types.int_id);
+        let byte = self.emit_const(i128::from(byte), self.types.int_id);
         let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(

@@ -86,6 +86,8 @@ struct Options {
     no_semantic_interposition: bool,
     /// `-ffunction-sections`, `-fdata-sections`, `-fcommon`, `-fno-plt`.
     layout: target::ObjectLayout,
+    /// The `-f` options `f_options::CodeOptions` folds, in order.
+    code_options: Vec<String>,
 }
 
 /// Apply `flags` the way the driver does: the switches that live in
@@ -146,7 +148,12 @@ fn apply_flags(flags: &[&str]) -> Options {
                 o.plain_char = Some(target::CharSignedness::Unsigned)
             }
             _ => {
-                if let Some(position) = target::PositionIndependence::from_flag(flag) {
+                if let Some(name) = flag
+                    .strip_prefix("-f")
+                    .filter(|n| crate::f_options::CodeOptions::owns(n))
+                {
+                    o.code_options.push(name.to_string());
+                } else if let Some(position) = target::PositionIndependence::from_flag(flag) {
                     o.position = Some(position);
                 } else if let Some(unwind) = flag.strip_prefix("-f").and_then(|n| o.unwind.after(n))
                 {
@@ -180,6 +187,14 @@ fn apply_flags(flags: &[&str]) -> Options {
                     o.target = Some(t.to_string());
                 } else if flag.starts_with("-m") && flag.len() > 2 {
                     o.mflags.push(flag.to_string());
+                } else if flag.strip_prefix("-f").is_some_and(|n| {
+                    matches!(
+                        crate::f_options::classify(n),
+                        crate::f_options::Verdict::Known(crate::f_options::Effect::Accepted(_))
+                    )
+                }) {
+                    // Taken in silence by the driver: c17's output already
+                    // is what it asks for.
                 } else {
                     panic!("test_compile: unsupported option {flag}");
                 }
@@ -209,11 +224,23 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     // As the driver: the `-m` ISA options select x86-64's instructions.
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&o.mflags);
+        target.x86 =
+            crate::machine::X86Options::from_flags(&o.mflags, target.os == target::Os::MacOS)
+                .expect("test_compile: refused machine flag");
     } else {
         target.branch_protection = target::BranchProtection::from_flags(&o.mflags).unwrap();
     }
     if let Some(signedness) = o.plain_char {
         target.plain_char = signedness;
+    }
+    // As the driver: `-fshort-wchar` and `-ffreestanding` before anything
+    // reads the types or the predefined macros.
+    let code = crate::f_options::CodeOptions::from_names(&o.code_options, &target)
+        .expect("test_compile: refused -f option");
+    target.short_wchar = code.short_wchar;
+    if code.freestanding {
+        crate::builtins::set_no_builtin();
+        crate::builtins::set_freestanding();
     }
     // As the driver's `position_independence`.
     let position = o
@@ -290,6 +317,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         },
         source_name: &source_name,
         debug_prefix_map: &prefix_maps.debug,
+        code,
     };
     let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
 

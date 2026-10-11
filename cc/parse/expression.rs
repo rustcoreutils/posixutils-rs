@@ -1975,6 +1975,19 @@ impl<'a> Parser<'a> {
             // pair -- while a unit an escape names is kept as the number it
             // is: `L"\xffffffff"` is one element, all ones. A character
             // beyond the BMP becomes a surrogate pair in a `u"..."` literal.
+            // `-fshort-wchar`: a 16-bit `wchar_t`, whose units are UTF-16's
+            // as gcc encodes them, laid out as a `u"..."` literal's.
+            Some(TokenType::WideString) if unit_bits == 16 => {
+                let units = literal::literal_utf16_units(&elements);
+                let t = self
+                    .types
+                    .intern(Type::array(self.types.wchar_id, units.len() + 1));
+                Ok(Self::typed_expr(
+                    ExprKind::Utf16StringLit(units),
+                    t,
+                    start_pos,
+                ))
+            }
             Some(TokenType::WideString) => {
                 let units = literal::literal_wide_chars(&elements);
                 let t = self

@@ -186,6 +186,11 @@ pub struct CodeGenBase<I: LirInst> {
     pub binds_locally: std::collections::HashSet<String>,
     /// `-ffunction-sections`, `-fdata-sections`, `-fcommon`, `-fno-plt`.
     pub layout: crate::target::ObjectLayout,
+    /// `-falign-functions`, `-fpatchable-function-entry=` and their kin.
+    pub shape: crate::target::FunctionShape,
+    /// The `__patchable_function_entries` records written so far: the
+    /// next one's label number.
+    pub patchable_entries: u32,
     /// The `-fexceptions` tables: the LSDAs and what they name.
     pub eh: super::eh::EhTables,
     /// Whether the unit is optimized, which decides with what certainty a
@@ -227,6 +232,71 @@ fn own_data_section(global: &crate::ir::GlobalDef, zero_init: bool) -> Directive
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
+    /// The alignment directives before `func`'s label, whose code the
+    /// target already aligns to `1 << least_log` bytes: the function's own
+    /// `aligned(N)`, raised to `-fmin-function-alignment=` (gcc 14's, which
+    /// every function gets); then, for a function that asked for none,
+    /// `-falign-functions`, as gcc writes it.
+    pub fn function_alignment(&self, func: &Function, least_log: u32) -> Vec<Directive> {
+        let user = func.align.map(u32::trailing_zeros);
+        let min = (self.shape.min_align > 1)
+            .then(|| self.shape.min_align.next_power_of_two().trailing_zeros());
+        let base = [user, min, Some(least_log)].into_iter().flatten().max();
+        let mut directives: Vec<Directive> = base
+            .filter(|&log| log > 0)
+            .map(Directive::Align)
+            .into_iter()
+            .collect();
+        if let (None, Some(spec)) = (user, self.shape.align) {
+            directives.extend(spec.levels().into_iter().map(|level| {
+                if level.limited() {
+                    Directive::AlignMax {
+                        log: level.log,
+                        max_skip: level.max_skip,
+                    }
+                } else {
+                    Directive::Align(level.log)
+                }
+            }));
+        }
+        directives
+    }
+
+    /// `-fpatchable-function-entry=N,M`'s part of `func`'s entry, as gcc
+    /// writes it: before its label (`before_label`) the `M` nops, and after
+    /// its landing pad (`endbr64`, `bti c`) the other `N - M`. The record of
+    /// where they start -- a `__patchable_function_entries` entry, its
+    /// section linked to the function's so the linker keeps or drops the
+    /// two together -- goes before the first of them, and so after the label
+    /// when `M` is 0.
+    pub fn patchable_entry(&mut self, func: &Function, before_label: bool) -> Vec<Directive> {
+        let Some(entry) = self.shape.patchable else {
+            return Vec::new();
+        };
+        let (nops, recorded_here) = if before_label {
+            (entry.before, entry.before > 0)
+        } else {
+            (entry.total - entry.before, entry.before == 0)
+        };
+        let mut directives = Vec::new();
+        if recorded_here {
+            let label = format!(".LPFE{}", self.patchable_entries);
+            self.patchable_entries += 1;
+            let word = match self.target.arch {
+                crate::target::Arch::X86_64 => ".quad",
+                crate::target::Arch::Aarch64 => ".8byte",
+            };
+            directives.push(Directive::Verbatim(format!(
+                "\t.section\t__patchable_function_entries,\"awo\",@progbits,{label}\n\
+                 \t.p2align 3\n\t{word}\t{label}"
+            )));
+            directives.push(self.function_section(func).unwrap_or(Directive::Text));
+            directives.push(Directive::local_label(label));
+        }
+        directives.extend((0..nops).map(|_| Directive::Raw("nop".to_string())));
+        directives
+    }
+
     /// Create a new CodeGenBase for the given target
     pub fn new(target: Target) -> Self {
         Self {
@@ -252,6 +322,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             named_sections: std::collections::HashMap::new(),
             binds_locally: std::collections::HashSet::new(),
             layout: Default::default(),
+            shape: Default::default(),
+            patchable_entries: 0,
             eh: Default::default(),
             optimizing: false,
             landing_pads: Default::default(),
@@ -531,10 +603,19 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
     /// Emit all buffered LIR instructions to the output string
     pub fn emit_all(&mut self) {
+        self.emit_all_with(|_, _| {});
+    }
+
+    /// [`Self::emit_all`], with `retarget` shown each instruction before it
+    /// is emitted and free to change the target it is emitted for: what a
+    /// function's own attributes change of the command line's choices.
+    pub fn emit_all_with(&mut self, mut retarget: impl FnMut(&I, &mut Target)) {
         let comment = asm_comment_prefix(&self.target);
+        let mut target = self.target.clone();
         for (idx, inst) in self.lir_buffer.iter().enumerate() {
             let before = self.output.len();
-            inst.emit(&self.target, &mut self.output);
+            retarget(inst, &mut target);
+            inst.emit(&target, &mut self.output);
             let Some(text) = self.lir_comments.get(&idx) else {
                 continue;
             };
@@ -1664,6 +1745,10 @@ pub trait CodeGenerator {
     /// Set `-ffunction-sections`, `-fdata-sections`, `-fcommon` and
     /// `-fno-plt`.
     fn set_object_layout(&mut self, layout: crate::target::ObjectLayout);
+
+    /// Set how each function begins and ends: `-falign-functions`,
+    /// `-fpatchable-function-entry=` and their kin.
+    fn set_function_shape(&mut self, shape: crate::target::FunctionShape);
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit

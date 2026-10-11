@@ -2292,8 +2292,31 @@ impl Parser<'_> {
             .members
             .iter()
             .all(|m| m.offset <= info.offset);
-        let array = self.types.kind(info.typ) == TypeKind::Array;
-        outer.narrow(info.offset as u64, self.byte_size(info.typ)?, at_end, array)
+        let is_array = self.types.kind(info.typ) == TypeKind::Array;
+        let extent = self.types.get(info.typ).extent;
+        let array = is_array && self.may_be_flexible(extent);
+        // A zero-length array that is not taken for a flexible one is a
+        // subobject of no bytes.
+        let size = match self.byte_size(info.typ) {
+            Some(size) => size,
+            None if is_array && extent == crate::types::ArrayExtent::Known(0) => 0,
+            None => return None,
+        };
+        outer.narrow(info.offset as u64, size, at_end, array)
+    }
+
+    /// Whether a trailing array of `extent` may be a flexible array in all
+    /// but name, at the `-fstrict-flex-arrays` level: any at 0, gcc's
+    /// default; one of zero or one element at 1; of zero at 2; and at 3
+    /// only a true flexible array member.
+    fn may_be_flexible(&self, extent: crate::types::ArrayExtent) -> bool {
+        use crate::types::ArrayExtent;
+        match (self.strict_flex_arrays, extent) {
+            (_, ArrayExtent::Unknown) | (0, _) => true,
+            (1, ArrayExtent::Known(n)) => n <= 1,
+            (2, ArrayExtent::Known(n)) => n == 0,
+            _ => false,
+        }
     }
 
     /// `Member`, `Arrow` and `Index` reached without an `&`, i.e. an

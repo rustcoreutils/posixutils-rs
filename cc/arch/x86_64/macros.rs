@@ -23,13 +23,9 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // Long double is 80-bit extended precision (padded to 128 bits)
         // `long double` is described by `get_float_limit_macros` and
         // `get_additional_sizeof_macros`; see the note in the aarch64 list.
-        // SSE is baseline for x86_64
-        ("__SSE__", Some("1")),
-        ("__SSE2__", Some("1")),
-        ("__SSE_MATH__", Some("1")),
-        ("__SSE2_MATH__", Some("1")),
-        // `__MMX__` and `__FXSR__` are the ISA's, which `-mno-mmx` and
-        // `-mno-fxsr` can turn off: `target::X86Isa::macros`.
+        // `__SSE__`, `__SSE2__` and their `_MATH__` macros, `__MMX__` and
+        // `__FXSR__` are the ISA's, which `-mno-sse`, `-mno-mmx` and the
+        // rest can turn off: `token::preprocess::define_isa_macros`.
         // The `__sync_*` family is implemented, so the macro that guards it is
         // a true statement about this compiler and is defined. It says the
         // compare-and-swap builtins exist at 1, 2, 4 and 8 bytes, which is

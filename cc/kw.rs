@@ -1556,6 +1556,17 @@ define_keywords! {
     // a block item or a member declaration, and as a unary prefix; it means
     // nothing else. Appended, as above.
     (GNU_EXTENSION,     "__extension__",     RESERVED_NAME),
+    // `uninitialized`: an automatic variable `-ftrivial-auto-var-init`
+    // leaves alone. Appended, as above.
+    (_, "uninitialized",             SUPPORTED_ATTR),
+    (_, "__uninitialized__",         SUPPORTED_ATTR),
+    // `indirect_branch` and `function_return`: one function's own
+    // `-mindirect-branch=` and `-mfunction-return=`. x86-64's alone.
+    // Appended, as above.
+    (_, "indirect_branch",           SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__indirect_branch__",       SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "function_return",           SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__function_return__",       SUPPORTED_ATTR | X86_64_ONLY),
 }
 
 // Tag query API
@@ -1946,6 +1957,8 @@ mod tests {
             "__target_clones__",
             "optimize",
             "__optimize__",
+            "uninitialized",
+            "__uninitialized__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

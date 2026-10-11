@@ -56,8 +56,10 @@ const FUNCTION_ONLY: &[(&str, FunctionOnly)] = &[
     ("constructor", FunctionOnly::Declaration),
     ("destructor", FunctionOnly::Declaration),
     ("format", FunctionOnly::FunctionType),
+    ("function_return", FunctionOnly::Declaration),
     ("gnu_inline", FunctionOnly::Declaration),
     ("hot", FunctionOnly::Declaration),
+    ("indirect_branch", FunctionOnly::Declaration),
     ("leaf", FunctionOnly::Declaration),
     ("malloc", FunctionOnly::Malloc),
     ("no_instrument_function", FunctionOnly::Refused),
@@ -444,8 +446,27 @@ impl AttributeList {
             nothrow: self.has_attr("nothrow"),
             stack_protect: self.stack_protect().unwrap_or_else(|kept| kept),
             stack_protector: self.optimize_stack_protector(),
+            branches: self.branch_attrs(),
             function_only: Vec::new(),
         }
+    }
+
+    /// What `indirect_branch` and `function_return` ask, the last of each
+    /// winning; their values were checked as they were read.
+    pub fn branch_attrs(&self) -> crate::machine::BranchAttrs {
+        let mut out = crate::machine::BranchAttrs::default();
+        for attr in &self.attrs {
+            let Some(AttributeArg::String(value)) = attr.args.first() else {
+                continue;
+            };
+            let thunk = crate::machine::Thunk::from_name(value);
+            match attr.name.trim_matches('_') {
+                "indirect_branch" => out.indirect = thunk,
+                "function_return" => out.ret = thunk,
+                _ => {}
+            }
+        }
+        out
     }
 
     /// The stack-protector level the `optimize` attributes in this list
@@ -522,6 +543,7 @@ impl AttributeList {
                 "visibility" => out.visibility = text(attr),
                 "alias" => out.alias = alias(attr, AliasForm::Alias),
                 "ifunc" => out.alias = alias(attr, AliasForm::Ifunc),
+                "uninitialized" => out.uninitialized = true,
                 _ => {}
             }
         }
@@ -818,6 +840,27 @@ impl Parser<'_> {
         Ok(None)
     }
 
+    /// `indirect_branch` and `function_return` take one of the
+    /// `-mindirect-branch=` choices, as a string; anything else is dropped
+    /// with gcc's warning. `false` drops the attribute.
+    fn check_branch_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        let bare = name.trim_matches('_');
+        if !matches!(bare, "indirect_branch" | "function_return") {
+            return true;
+        }
+        let warning = match args {
+            [AttributeArg::String(s)] if crate::machine::Thunk::from_name(s).is_some() => {
+                return true
+            }
+            [AttributeArg::String(_)] => {
+                "argument to '{0}' attribute is not (keep|thunk|thunk-inline|thunk-extern)"
+            }
+            _ => "'{0}' attribute requires a string constant argument",
+        };
+        diag::group_warning_args(ATTRIBUTE_WARNING, pos, warning, &[bare]);
+        false
+    }
+
     /// `cleanup` takes exactly one argument, in gcc's words.
     fn report_cleanup_arg_count(pos: Position) {
         diag::error_args(
@@ -938,6 +981,9 @@ impl Parser<'_> {
             AttrArgs::Integers(role) => self.check_integer_args(&name, role, &args, pos).ok()?,
             AttrArgs::Cleanup => self.check_cleanup_function(&args, pos).ok()?,
             _ => {}
+        }
+        if recognised && !Self::check_branch_attr(&name, &args, pos) {
+            return None;
         }
         let target_attr = match name.trim_matches('_') {
             "target" => Some(false),

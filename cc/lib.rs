@@ -26,6 +26,7 @@ pub mod float;
 pub mod ir;
 pub mod kw;
 pub mod linkargs;
+pub mod machine;
 pub mod opt;
 pub mod os;
 pub mod param_options;

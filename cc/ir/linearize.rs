@@ -878,6 +878,9 @@ pub struct Linearizer<'a> {
     /// variable gets a landing pad that runs the cleanup when the frame is
     /// unwound. See [`super::linearize_cleanup`].
     pub(crate) exceptions: bool,
+    /// `-ftrivial-auto-var-init=`: what an automatic variable declared
+    /// without an initializer starts as.
+    pub(crate) auto_var_init: crate::target::AutoVarInit,
     /// The landing pads of the function being linearized; see
     /// [`super::linearize_cleanup::UnwindState`].
     pub(crate) unwind: super::linearize_cleanup::UnwindState,
@@ -958,6 +961,7 @@ impl<'a> Linearizer<'a> {
             trapping_math: true,
             fp_rounding: Default::default(),
             exceptions: false,
+            auto_var_init: Default::default(),
             unwind: Default::default(),
             isa: target.x86_isa,
             clone_statics: None,
@@ -2125,6 +2129,7 @@ impl<'a> Linearizer<'a> {
         ir_func.is_always_inline = func.attrs.always_inline;
         ir_func.stack_protect = func.attrs.stack_protect;
         ir_func.stack_protector = func.attrs.stack_protector;
+        ir_func.branches = func.attrs.branches;
         ir_func.no_instrument = func.attrs.no_instrument;
         ir_func.nocf_check = self
             .symbols
@@ -7501,6 +7506,8 @@ pub struct LinearizeOptions {
     pub fp_rounding: crate::float::FpRounding,
     /// `-fexceptions`; see [`Linearizer::exceptions`].
     pub exceptions: bool,
+    /// `-ftrivial-auto-var-init=`; see [`Linearizer::auto_var_init`].
+    pub auto_var_init: crate::target::AutoVarInit,
 }
 
 impl Default for LinearizeOptions {
@@ -7510,6 +7517,7 @@ impl Default for LinearizeOptions {
             trapping_math: true,
             fp_rounding: Default::default(),
             exceptions: false,
+            auto_var_init: Default::default(),
         }
     }
 }
@@ -7526,6 +7534,7 @@ pub fn linearize(
     linearizer.trapping_math = opts.trapping_math;
     linearizer.fp_rounding = opts.fp_rounding;
     linearizer.exceptions = opts.exceptions;
+    linearizer.auto_var_init = opts.auto_var_init;
     let mut module = linearizer.linearize(tu);
     module.debug = opts.debug;
     // Get all source files from the stream registry (includes all #included files)

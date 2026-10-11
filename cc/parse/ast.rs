@@ -2813,6 +2813,9 @@ pub struct SymbolAttrs {
     /// and drops it with a warning from anything else, so no symbol is ever
     /// emitted carrying it.
     pub cleanup: Option<SymbolId>,
+    /// `uninitialized`: an automatic variable `-ftrivial-auto-var-init`
+    /// leaves as C does, uninitialized.
+    pub uninitialized: bool,
 }
 
 /// How a name declared with `alias` or `ifunc` is bound to the symbol its
@@ -2858,6 +2861,7 @@ impl SymbolAttrs {
         if other.cleanup.is_some() {
             self.cleanup = other.cleanup;
         }
+        self.uninitialized |= other.uninitialized;
     }
 }
 
@@ -3039,6 +3043,8 @@ pub struct FunctionAttrs {
     /// `weak`, `used`, `section(...)`, `visibility(...)` -- how the symbol is
     /// emitted, as opposed to how the body is compiled.
     pub symbol: SymbolAttrs,
+    /// `indirect_branch(...)` and `function_return(...)`.
+    pub branches: crate::machine::BranchAttrs,
     /// `__attribute__((noinline))` -- never inline this function.
     pub noinline: bool,
     /// `__attribute__((always_inline))` -- inline this function at every call
@@ -3156,6 +3162,7 @@ impl FunctionAttrs {
             .stack_protect
             .combine(other.stack_protect)
             .unwrap_or_else(|kept| kept);
+        self.branches.merge(other.branches);
         // A later `optimize` level replaces an earlier one, as gcc's does.
         if other.stack_protector.is_some() {
             self.stack_protector = other.stack_protector;

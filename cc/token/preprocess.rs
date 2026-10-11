@@ -1319,7 +1319,12 @@ impl<'a> Preprocessor<'a> {
         // `-std=` cannot change it; see `classify_std`.
         self.define_macro(Macro::predefined("__STDC__", Some("1")));
         self.define_macro(Macro::predefined("__STDC_VERSION__", Some(STDC_VERSION)));
-        self.define_macro(Macro::predefined("__STDC_HOSTED__", Some("1")));
+        let hosted = if crate::builtins::freestanding() {
+            "0"
+        } else {
+            "1"
+        };
+        self.define_macro(Macro::predefined("__STDC_HOSTED__", Some(hosted)));
 
         // __STRICT_ANSI__ is never defined: there is no strict mode to
         // advertise, and claiming one would tell system headers to hide the
@@ -3277,14 +3282,32 @@ fn define_pic_macros(
 
 /// Define the feature macros of the x86-64 extensions the ISA options and
 /// `-march=` ask for (`__MMX__`, `__SSE4_1__`, `__AVX2__` and the rest), as
-/// gcc does. Code tests them to choose its path; `__SSE2__`, which no
-/// option turns off, is among the target's own macros.
+/// gcc does. Code tests them to choose its path. The baseline's are here
+/// too: `__SSE__` and `__SSE2__` with their `_MATH__` forms, which
+/// `-mno-sse` and `-mno-sse2` take away, and gcc's `_SOFT_FLOAT` once
+/// `-mno-80387` has taken the x87. (`__STDC_IEC_559__` goes with SSE2.)
 fn define_isa_macros(pp: &mut Preprocessor, target: &Target, isa: crate::target::X86Isa) {
     if target.arch != crate::target::Arch::X86_64 {
         return;
     }
-    for name in isa.macros() {
+    let base = [
+        (isa.has_sse(), "__SSE__"),
+        (isa.has_sse2(), "__SSE2__"),
+        (isa.has_sse(), "__SSE_MATH__"),
+        (isa.has_sse2(), "__SSE2_MATH__"),
+        (!isa.has_x87(), "_SOFT_FLOAT"),
+    ];
+    let names = base
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .chain(isa.macros());
+    for name in names {
         pp.define_macro(Macro::predefined(name, Some("1")));
+    }
+    // c17 computes `float` and `double` in SSE2's registers only; without
+    // them it computes neither, so it claims no IEC 60559 arithmetic.
+    if !isa.has_sse2() {
+        pp.undef_macro("__STDC_IEC_559__");
     }
 }
 

@@ -17,10 +17,9 @@ use crate::target::{Os, Target};
 
 /// Get OS-specific predefined macros
 pub fn get_os_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
-    let mut macros = vec![
-        // POSIX compliance
-        ("__STDC_HOSTED__", Some("1".into())),
-    ];
+    // `__STDC_HOSTED__` is the language's, and `-ffreestanding`'s: see
+    // `token::preprocess`.
+    let mut macros = Vec::new();
 
     // The `unix` family names the ELF Unixes. Neither clang nor gcc defines
     // it for Darwin, which code tells apart by `__APPLE__` instead.

@@ -154,8 +154,8 @@ fn gcc_flags_cpu_selection_is_accepted() {
         assert!(r.success, "{flag}: {}", r.stderr);
     }
     // An ABI change is still refused. (The instruction-set options are
-    // `isa_flags.rs`'s.)
-    for flag in ["-mno-red-zone", "-mgeneral-regs-only"] {
+    // `isa_flags.rs`'s, and a kernel's `kernel_flags.rs`'s.)
+    for flag in ["-mabi=ms", "-mx32"] {
         let r = compile_with("cpu.c", MAIN, &[flag]);
         assert!(!r.success, "{flag} accepted");
         assert!(

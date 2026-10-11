@@ -1482,6 +1482,10 @@ impl CodeGenerator for Aarch64CodeGen {
         self.base.layout = layout;
     }
 
+    fn set_function_shape(&mut self, shape: crate::target::FunctionShape) {
+        self.base.shape = shape;
+    }
+
     fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy) {
         self.base.tls = tls;
     }

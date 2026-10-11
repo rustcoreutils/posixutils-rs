@@ -18,6 +18,7 @@ use posixutils_cc::f_options::{self, Effect};
 use posixutils_cc::float;
 use posixutils_cc::ir;
 use posixutils_cc::linkargs;
+use posixutils_cc::machine;
 use posixutils_cc::opt;
 use posixutils_cc::os;
 use posixutils_cc::parse;
@@ -286,6 +287,16 @@ struct Args {
         value_parser = parse_unwind_option
     )]
     unwind: Vec<String>,
+
+    /// The `-f` options `f_options::CodeOptions` folds, as their `-f` names
+    /// in command-line order, carried by `preprocess_args_from`.
+    #[arg(
+        long = "c17-fopt",
+        hide = true,
+        action = clap::ArgAction::Append,
+        value_name = "option"
+    )]
+    fopts: Vec<String>,
 
     /// A member of gcc's `-fpic` family (`-fpic`, `-fPIC`, `-fpie`, `-fPIE`
     /// and their `-fno-` forms), carried in its gcc spelling by
@@ -1612,6 +1623,9 @@ fn process_file(
         },
         source_name: path,
         debug_prefix_map: &prefix_maps.debug,
+        // Validated where the target was decided.
+        code: f_options::CodeOptions::from_names(&args.fopts, target)
+            .expect("the -f options were checked"),
     };
     let compiled = pipeline::compile_tokens(
         preprocessed,
@@ -2416,21 +2430,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             }
             result.push(format!("--c17-visibility={}", how));
             i += 1;
-        } else if arg == "-ffreestanding" || arg == "-fhosted" {
-            // Not swallowed by the catch-all below: there is no freestanding
-            // mode to enter (see #H1 — we do not bundle the freestanding
-            // header set), so accepting the flag and ignoring it would be a
-            // lie. Diagnose instead. `-fhosted` is what we already are.
-            if arg == "-ffreestanding" {
-                eprintln!(
-                    "c17: {}",
-                    gettext(
-                        "-ffreestanding is not supported: no freestanding environment is provided"
-                    )
-                );
-                std::process::exit(1);
-            }
-            i += 1;
         } else if arg == "-fno-dwarf2-cfi-asm" || arg == "-fdwarf2-cfi-asm" {
             no_cfi_asm = arg == "-fno-dwarf2-cfi-asm";
             i += 1;
@@ -2517,6 +2516,11 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
                     let family = f_options::family(name);
                     unsupported.retain(|(f, _)| f != family);
                     unsupported.push((family.to_string(), arg.clone()));
+                }
+                f_options::Verdict::Known(Effect::Implemented)
+                    if f_options::CodeOptions::owns(name) =>
+                {
+                    result.push(format!("--c17-fopt={name}"));
                 }
                 f_options::Verdict::Known(Effect::Implemented) => {
                     debug_assert!(
@@ -3143,7 +3147,15 @@ fn check_machine_flags(flags: &[String], target: &Target) {
     // Options the other architecture's gcc driver does not know at all.
     let foreign = |f: &str| match target.arch {
         target::Arch::Aarch64 => {
-            target::is_isa_flag(f) || matches!(f, "-msse2avx" | "-mvzeroupper" | "-mno-vzeroupper")
+            // aarch64 gcc has its own `-mgeneral-regs-only`, `-mcmodel=`,
+            // `-mharden-sls=` and stack-guard options.
+            let own = f == "-mgeneral-regs-only"
+                || f.starts_with("-mcmodel=")
+                || f.starts_with("-mharden-sls=")
+                || f.starts_with("-mstack-protector-guard");
+            !own && (target::is_isa_flag(f)
+                || machine::X86Options::owns(f)
+                || matches!(f, "-msse2avx" | "-mvzeroupper" | "-mno-vzeroupper"))
         }
         target::Arch::X86_64 => {
             f.starts_with("-mbranch-protection=") || f.starts_with("-msign-return-address=")
@@ -3164,18 +3176,16 @@ fn check_machine_flags(flags: &[String], target: &Target) {
             || match target.arch {
                 target::Arch::X86_64 => {
                     target::is_isa_flag(flag)
+                        || machine::X86Options::owns(flag)
                         || matches!(
                             flag,
                             "-m64"
-                                | "-msse"
-                                | "-msse2"
                                 | "-msse2avx"
                                 | "-mvzeroupper"
                                 | "-mno-vzeroupper"
                                 | "-mfpmath=sse"
                                 | "-mlong-double-80"
                                 | "-mtls-dialect=gnu2"
-                                | "-mcmodel=small"
                                 | "-mprefer-vector-width=none"
                                 | "-mprefer-vector-width=128"
                                 | "-mprefer-vector-width=256"
@@ -3207,6 +3217,26 @@ fn check_machine_flags(flags: &[String], target: &Target) {
         eprintln!("c17: {}: {}", gettext("unsupported machine flag"), flag);
     }
     std::process::exit(1);
+}
+
+/// x86-64's machine options (`machine::X86Options`), refused in gcc's words
+/// where gcc refuses them, alone or beside the rest of the command line.
+fn x86_options(args: &Args, target: &Target) -> machine::X86Options {
+    let fail = |lines: Vec<String>| -> ! {
+        for line in lines {
+            eprintln!("c17: {line}");
+        }
+        std::process::exit(1);
+    };
+    let options = machine::X86Options::from_flags(&args.mflags, target.os == target::Os::MacOS)
+        .unwrap_or_else(|e| fail(e));
+    let pic = producing_shared(args) || position_independence(args, target).is_pic();
+    let cf_return = args.cf_protection.unwrap_or_default().ret;
+    let conflicts = options.conflicts(pic, cf_return);
+    if !conflicts.is_empty() {
+        fail(conflicts);
+    }
+    options
 }
 
 /// aarch64's `-mbranch-protection=`, the last one given, refused in gcc's
@@ -3924,8 +3954,22 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     check_instrumentation(&args, &target);
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&args.mflags);
+        target.x86 = x86_options(&args, &target);
     } else {
         target.branch_protection = branch_protection(&args.mflags, &target);
+    }
+    let code_options =
+        f_options::CodeOptions::from_names(&args.fopts, &target).unwrap_or_else(|lines| {
+            for line in lines {
+                eprintln!("c17: {line}");
+            }
+            std::process::exit(1);
+        });
+    target.short_wchar = code_options.short_wchar;
+    if code_options.freestanding {
+        // gcc's `-ffreestanding` implies `-fno-builtin`.
+        builtins::set_no_builtin();
+        builtins::set_freestanding();
     }
     // Before anything reads it: the type system, the predefined macros and
     // the preprocessor's character constants all take it from the target.

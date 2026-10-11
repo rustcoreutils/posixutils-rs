@@ -32,6 +32,7 @@ mod block_moves;
 mod branch_protection;
 mod call_args;
 mod call_attributes;
+mod code_options;
 // CET and its ELF note are x86-64 Linux's.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod cf_protection;
@@ -55,6 +56,7 @@ mod ifunc;
 mod inline_asm;
 mod inlining;
 mod int128;
+mod kernel;
 mod label_diff;
 mod long_double_select;
 mod macho_labels;

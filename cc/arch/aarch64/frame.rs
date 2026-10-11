@@ -112,7 +112,12 @@ impl Aarch64CodeGen {
         }
 
         // Register allocation
-        let guarded = crate::arch::stack_protect::protects(func, types, self.base.stack_protector);
+        let guarded = crate::arch::stack_protect::protects(
+            func,
+            types,
+            self.base.stack_protector,
+            self.base.optimizing,
+        );
         let mut alloc = RegAlloc::new(StackedArgs::of(&self.base.target))
             .with_global_registers(&self.global_registers)
             .with_tls_access(self.base.tls_access())
@@ -185,6 +190,9 @@ impl Aarch64CodeGen {
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_entry_protection(func);
+        for directive in self.base.patchable_entry(func, false) {
+            self.push_lir(Aarch64Inst::Directive(directive));
+        }
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
         self.base.check_stack_clash(func, total_frame as i64);
         self.base
@@ -387,11 +395,13 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Directive(Directive::type_func(name)));
 
         // An instruction is four bytes, so that is the least; `aligned(N)`
-        // raises it.
-        let align = func.align.unwrap_or(4).max(4);
-        self.push_lir(Aarch64Inst::Directive(Directive::Align(
-            align.trailing_zeros(),
-        )));
+        // and the `-f` alignment options raise it.
+        for directive in self.base.function_alignment(func, 2) {
+            self.push_lir(Aarch64Inst::Directive(directive));
+        }
+        for directive in self.base.patchable_entry(func, true) {
+            self.push_lir(Aarch64Inst::Directive(directive));
+        }
 
         // Function label
         self.push_lir(Aarch64Inst::Directive(Directive::global_label(name)));

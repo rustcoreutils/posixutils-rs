@@ -211,6 +211,189 @@ impl Default for ObjectLayout {
     }
 }
 
+/// One `.p2align` gcc puts before code it aligns: to `1 << log` bytes,
+/// skipping at most `max_skip` bytes of padding to get there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignLevel {
+    pub log: u32,
+    pub max_skip: u32,
+}
+
+impl AlignLevel {
+    /// `n` bytes, padding at most `m - 1` (`m` = `n` when not given), as
+    /// gcc's `parse_N_M` reads them: `n` rounded up to a power of two.
+    fn of(n: u32, m: Option<u32>) -> Self {
+        let log = (2 * n.max(1) - 1).ilog2();
+        let full = (1 << log) - 1;
+        let max_skip = m.unwrap_or(n).saturating_sub(1).min(full);
+        Self { log, max_skip }
+    }
+
+    /// Whether the padding is limited: gcc's `ASM_OUTPUT_MAX_SKIP_ALIGN`
+    /// writes the limit only then, a limit of 0 meaning none.
+    pub fn limited(self) -> bool {
+        self.max_skip != 0 && self.max_skip < (1 << self.log) - 1
+    }
+}
+
+/// gcc's `-falign-functions=N[:M[:N2[:M2]]]`: what precedes each function,
+/// as gcc's `final` writes it -- the first alignment, and when that one is
+/// limited, the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignSpec {
+    first: AlignLevel,
+    second: Option<AlignLevel>,
+}
+
+impl AlignSpec {
+    /// gcc's largest alignment value.
+    const MAX: u32 = 65536;
+
+    /// `value` (`""` for the bare option) for `-f<option>=`, on `arch`;
+    /// `Err` is gcc's message. A value of 0, and the bare option, is the
+    /// target's default: 16 bytes on x86-64, and on aarch64 16 with at most
+    /// 11 bytes of padding.
+    pub fn parse(option: &str, value: &str, arch: Arch) -> Result<Self, String> {
+        let invalid = || format!("invalid arguments for '-f{option}' option: '{value}'");
+        let mut numbers = Vec::new();
+        if !value.is_empty() {
+            for part in value.split(':') {
+                let n: u64 = part.parse().map_err(|_| invalid())?;
+                if n > u64::from(Self::MAX) {
+                    return Err(format!("'-f{option}' is not between 0 and {}", Self::MAX));
+                }
+                numbers.push(n as u32);
+            }
+            if numbers.len() > 4 {
+                return Err(invalid());
+            }
+        }
+        if numbers.first().is_none_or(|&n| n == 0) {
+            numbers = match arch {
+                Arch::X86_64 => vec![16],
+                Arch::Aarch64 => vec![16, 12],
+            };
+        }
+        let first = AlignLevel::of(numbers[0], numbers.get(1).copied());
+        let second = match numbers.get(2) {
+            Some(&n2) => Some(AlignLevel::of(n2, numbers.get(3).copied())),
+            // x86's old secondary alignment, which gcc keeps when N2 is not
+            // given: to 8 bytes, after an alignment above it.
+            None if arch == Arch::X86_64 && first.log > 3 => Some(AlignLevel::of(8, None)),
+            None => None,
+        };
+        Ok(Self { first, second })
+    }
+
+    /// No alignment: `-fno-align-functions`, or a value of 1.
+    pub fn none() -> Self {
+        Self {
+            first: AlignLevel::of(1, None),
+            second: None,
+        }
+    }
+
+    /// The `.p2align`s, in order.
+    pub fn levels(self) -> Vec<AlignLevel> {
+        if self.first.log == 0 {
+            return Vec::new();
+        }
+        let mut levels = vec![self.first];
+        if self.first.limited() {
+            levels.extend(self.second.filter(|l| l.log != 0));
+        }
+        levels
+    }
+}
+
+/// `-fpatchable-function-entry=N,M`: `N` nops at each function's entry,
+/// `M` of them before its label, recorded in `__patchable_function_entries`
+/// for a tracer to patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchableEntry {
+    pub total: u32,
+    pub before: u32,
+}
+
+/// `-fzero-call-used-regs=`: which call-clobbered registers a function
+/// zeroes before it returns, so that what it computed does not survive into
+/// its caller for a gadget to use. gcc 13's choices; `leafy` is gcc 14's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZeroRegs {
+    /// Any register at all; `skip` is none.
+    pub on: bool,
+    /// Every one (`all`), rather than only those the function uses
+    /// (`used`).
+    pub all: bool,
+    /// General registers only (`-gpr`).
+    pub gpr_only: bool,
+    /// Argument registers only (`-arg`).
+    pub arg_only: bool,
+}
+
+impl ZeroRegs {
+    /// gcc 13's names, in its order.
+    pub const NAMES: [&'static str; 9] = [
+        "skip",
+        "used-gpr-arg",
+        "used-gpr",
+        "used-arg",
+        "used",
+        "all-gpr-arg",
+        "all-gpr",
+        "all-arg",
+        "all",
+    ];
+
+    /// The choice `name` names, if it is one of [`Self::NAMES`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        if !Self::NAMES.contains(&name) {
+            return None;
+        }
+        if name == "skip" {
+            return Some(Self::default());
+        }
+        let (scope, rest) = name.split_once('-').unwrap_or((name, ""));
+        Some(Self {
+            on: true,
+            all: scope == "all",
+            gpr_only: rest.starts_with("gpr"),
+            arg_only: rest.ends_with("arg"),
+        })
+    }
+}
+
+/// `-ftrivial-auto-var-init=`: what an automatic variable without an
+/// initializer starts as.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoVarInit {
+    /// Whatever its storage held: C's own rule.
+    #[default]
+    Uninitialized,
+    /// All bytes zero.
+    Zero,
+    /// gcc's repeated byte 0xFE, which makes an integer large, a pointer
+    /// invalid and a floating value a NaN.
+    Pattern,
+}
+
+/// How each function begins and ends: gcc's `-falign-functions=`,
+/// `-fmin-function-alignment=`, `-fpatchable-function-entry=` and
+/// `-fzero-call-used-regs=`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FunctionShape {
+    /// `-falign-functions`: for a function that asks no alignment of its
+    /// own.
+    pub align: Option<AlignSpec>,
+    /// `-fmin-function-alignment=N` (gcc 14), in bytes: every function,
+    /// whatever it asks.
+    pub min_align: u32,
+    /// `-fpatchable-function-entry=`.
+    pub patchable: Option<PatchableEntry>,
+    /// `-fzero-call-used-regs=`.
+    pub zero_regs: ZeroRegs,
+}
+
 /// `-fstack-clash-protection`'s two `--param`s, as written: each the log2 of
 /// a byte count. c17 probes no stack; these move where gcc would, and so
 /// which functions c17 warns about.
@@ -724,6 +907,17 @@ const fn amx(name: &'static str, macro_name: &'static str) -> IsaFeature {
     }
 }
 
+/// Part of the x86-64 baseline, whose macros the target defines.
+const fn base(name: &'static str, needs: &'static [&'static str]) -> IsaFeature {
+    IsaFeature {
+        name,
+        macro_name: None,
+        needs,
+        brings: &[],
+        shallow: false,
+    }
+}
+
 /// An extension gcc defines no macro for.
 const fn unnamed(name: &'static str) -> IsaFeature {
     IsaFeature {
@@ -735,15 +929,16 @@ const fn unnamed(name: &'static str) -> IsaFeature {
     }
 }
 
-/// Every extension gcc 13's x86-64 options name, apart from SSE and SSE2,
-/// which are the baseline and cannot be turned off. In the order their
-/// macros are listed. The needs are gcc 13's, read off its `-dM -E` for
-/// each `-mX` and for `-mno-X` after every other.
+/// Every extension gcc 13's x86-64 options name. In the order their
+/// macros are listed; SSE, SSE2 and the x87, the baseline, last, their
+/// macros being defined apart (`token::preprocess::define_isa_macros`).
+/// The needs are gcc 13's, read off its `-dM -E` for each `-mX` and for
+/// `-mno-X` after every other.
 #[rustfmt::skip]
 const ISA_FEATURES: &[IsaFeature] = &[
     isa("mmx",          "__MMX__",          &[]),
     isa("fxsr",         "__FXSR__",         &[]),
-    isa("sse3",         "__SSE3__",         &[]),
+    isa("sse3",         "__SSE3__",         &["sse2"]),
     isa("ssse3",        "__SSSE3__",        &["sse3"]),
     isa("sse4.1",       "__SSE4_1__",       &["ssse3"]),
     isa("sse4.2",       "__SSE4_2__",       &["sse4.1"]),
@@ -848,6 +1043,11 @@ const ISA_FEATURES: &[IsaFeature] = &[
     // builtins are lock-free at 16 bytes, and c17's are not: CMPXCHG16B is
     // an extension it never generates, so the option names nothing more.
     unnamed("cx16"),
+    // The baseline, which `-mno-sse`, `-mno-80387` (`-msoft-float`) and
+    // `-mgeneral-regs-only` take away.
+    base("sse", &[]),
+    base("sse2", &["sse"]),
+    base("80387", &[]),
 ];
 
 /// Extensions gcc turns on for another once every option has been read,
@@ -925,7 +1125,13 @@ impl IsaSet {
     const FMA: Self = Self::named("fma");
     const FMA4: Self = Self::named("fma4");
     const AVX512F: Self = Self::named("avx512f");
-    const BASELINE: Self = Self(Self::named("mmx").0 | Self::named("fxsr").0);
+    const SSE: Self = Self::named("sse");
+    const SSE2: Self = Self::named("sse2");
+    const X87: Self = Self::named("80387");
+    const MMX: Self = Self::named("mmx");
+    const BASELINE: Self = Self(
+        Self::named("mmx").0 | Self::named("fxsr").0 | Self::SSE.0 | Self::SSE2.0 | Self::X87.0,
+    );
 
     /// The extension `name`, found at compile time.
     const fn named(name: &str) -> Self {
@@ -1094,6 +1300,15 @@ pub(crate) enum IsaEdit {
 pub(crate) fn isa_edit(flag: &str) -> Option<IsaEdit> {
     let item = flag.strip_prefix("-m")?;
     match item {
+        // gcc's spellings of `-mno-80387` and `-m80387`.
+        "soft-float" => return Some(IsaEdit::Disable(IsaSet::X87.disabling())),
+        "hard-float" => return Some(IsaEdit::Enable(IsaSet::X87)),
+        // No register but the general ones: no SSE, MMX or x87, nor
+        // anything built on them.
+        "general-regs-only" => {
+            let regs = IsaSet::SSE.with(IsaSet::MMX).with(IsaSet::X87);
+            return Some(IsaEdit::Disable(regs.disabling()));
+        }
         "sse4" => return Some(IsaEdit::Enable(IsaSet::SSE42.enabling())),
         // gcc's -mno-sse4 is -mno-sse4.1, not the inverse of -msse4.
         "no-sse4" => return Some(IsaEdit::Disable(IsaSet::SSE41.disabling())),
@@ -1206,6 +1421,22 @@ impl X86Isa {
     /// inlining one `target` function into another.
     pub fn includes(self, other: Self) -> bool {
         self.set.has(other.set)
+    }
+
+    /// Whether SSE2 is on: c17 computes `float` and `double`, and moves
+    /// vectors, in SSE2's registers and nowhere else.
+    pub fn has_sse2(self) -> bool {
+        self.set.has(IsaSet::SSE2)
+    }
+
+    /// Whether SSE is on, whose `__SSE__` the target defines.
+    pub fn has_sse(self) -> bool {
+        self.set.has(IsaSet::SSE)
+    }
+
+    /// Whether the x87 is on: where c17 computes `long double`.
+    pub fn has_x87(self) -> bool {
+        self.set.has(IsaSet::X87)
     }
 
     /// The SSE level reached: SSE3 .. SSE4.2, each needing the one before.
@@ -1636,6 +1867,12 @@ pub struct Target {
     pub x86_isa: X86Isa,
     /// aarch64's `-mbranch-protection=`; none for any other target.
     pub branch_protection: BranchProtection,
+    /// x86-64's code model, mitigations and stack-guard options; the
+    /// defaults for any other target, where they mean nothing.
+    pub x86: crate::machine::X86Options,
+    /// `-fshort-wchar`: `wchar_t` is `unsigned short` whatever the ABI
+    /// says.
+    pub short_wchar: bool,
 }
 
 impl Target {
@@ -1671,6 +1908,8 @@ impl Target {
             max_aggregate_register_bits,
             x86_isa: X86Isa::default(),
             branch_protection: BranchProtection::default(),
+            x86: Default::default(),
+            short_wchar: false,
         }
     }
 
@@ -1808,8 +2047,12 @@ impl Target {
     /// makes it `int`, as x86-64 is everywhere. The type system, the
     /// predefines and `#if` all read this answer, so `L'\xffffffff' > 0`,
     /// `(wchar_t)-1 > 0` and `WCHAR_MIN == 0` agree with gcc on aarch64
-    /// Linux.
+    /// Linux. `-fshort-wchar` makes it `unsigned short` everywhere, as gcc
+    /// does.
     pub fn wchar_type(&self) -> IntType {
+        if self.short_wchar {
+            return IntType::UShort;
+        }
         match (self.arch, self.os) {
             (Arch::Aarch64, Os::Linux | Os::FreeBSD) => IntType::UInt,
             (Arch::Aarch64, Os::MacOS) | (Arch::X86_64, _) => IntType::Int,
@@ -2075,7 +2318,10 @@ mod tests {
             assert!(is_isa_flag(&format!("-m{}", f.name)), "{}", f.name);
             assert!(is_isa_flag(&format!("-mno-{}", f.name)), "{}", f.name);
         }
-        for flag in ["-msse", "-msse2", "-mavx10.1", "-mno-red-zone", "-mavx2x"] {
+        for flag in ["-msse", "-msse2", "-mno-80387", "-mgeneral-regs-only"] {
+            assert!(is_isa_flag(flag), "{flag}");
+        }
+        for flag in ["-mavx10.1", "-mno-red-zone", "-mavx2x"] {
             assert!(!is_isa_flag(flag), "{flag}");
         }
     }

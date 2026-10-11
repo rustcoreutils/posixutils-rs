@@ -796,6 +796,9 @@ pub struct RegAlloc {
     guard_requested: bool,
     /// The canary's slot: the frame's first, so above every other local.
     guard_slot: Option<i32>,
+    /// What `%rsp` is a multiple of at a call; see
+    /// [`RegAlloc::with_incoming_stack_align`].
+    incoming_stack_align: i32,
     /// Registers the unit's file-scope register variables are: never
     /// allocated, saved or restored in any of its functions. Set with
     /// `with_global_registers`.
@@ -931,7 +934,12 @@ impl FrameBase {
     /// an operand to it invalidates every local at a stroke: hard-coding `%rbx`
     /// made `asm("..." ::: "rbx")` beside an over-aligned array segfault on
     /// code gcc accepts.
-    fn of(func: &Function, types: &TypeTable, global_registers: &[Reg]) -> FrameBase {
+    fn of(
+        func: &Function,
+        types: &TypeTable,
+        global_registers: &[Reg],
+        incoming_align: i32,
+    ) -> FrameBase {
         let local_align = func
             .locals
             .values()
@@ -958,8 +966,10 @@ impl FrameBase {
             .map(|t| types.alignment(*t) as i32)
             .max()
             .unwrap_or(8);
+        // `%rbp` is as aligned as the stack was at the call, 16 bytes or,
+        // under `-mpreferred-stack-boundary=3`, 8.
         let align = local_align.max(call_align);
-        if align <= 16 {
+        if align <= incoming_align {
             return FrameBase::Rbp;
         }
 
@@ -1167,6 +1177,7 @@ impl RegAlloc {
             guard_requested: false,
             guard_slot: None,
             global_registers: Vec::new(),
+            incoming_stack_align: 16,
         }
     }
 
@@ -1177,6 +1188,14 @@ impl RegAlloc {
     /// variable on return.
     pub fn with_global_registers(mut self, regs: &[Reg]) -> Self {
         self.global_registers = regs.to_vec();
+        self
+    }
+
+    /// An allocator for code that may count on `%rsp` being a multiple of
+    /// `bytes` at a call: 16, or 8 under `-mpreferred-stack-boundary=3`,
+    /// where a local or argument aligned to 16 needs the frame realigned.
+    pub fn with_incoming_stack_align(mut self, bytes: i32) -> Self {
+        self.incoming_stack_align = bytes;
         self
     }
 
@@ -1202,7 +1221,12 @@ impl RegAlloc {
         self.func_pos = crate::arch::func_pos(func);
         // Before anything is coloured: the frame base claims a register, and
         // every palette below has to be built without it.
-        self.frame_base = FrameBase::of(func, types, &self.global_registers);
+        self.frame_base = FrameBase::of(
+            func,
+            types,
+            &self.global_registers,
+            self.incoming_stack_align,
+        );
         if let Some(base) = self.frame_base.reg() {
             self.free_regs.retain(|r| *r != base);
             // The prologue writes it, so the function must save it.

@@ -1461,8 +1461,13 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Set AL to number of XMM registers used (for variadic calls)
+    /// Set AL to number of XMM registers used (for variadic calls) -- but
+    /// for `-mskip-rax-setup` without SSE, as gcc: there is no XMM register
+    /// to count, and a kernel's variadic functions read none.
     pub(super) fn set_variadic_fp_count(&mut self, fp_arg_count: usize) {
+        if self.base.target.x86.skip_rax_setup && !self.base.isa.has_sse() {
+            return;
+        }
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B8,
             src: GpOperand::Imm(fp_arg_count as i64),

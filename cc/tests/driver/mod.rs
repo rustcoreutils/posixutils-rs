@@ -20,6 +20,7 @@ mod branch_protection;
 mod f_options;
 mod gcc_flags;
 mod isa_flags;
+mod kernel_flags;
 mod link_options;
 mod linker_input;
 mod prefix_map;

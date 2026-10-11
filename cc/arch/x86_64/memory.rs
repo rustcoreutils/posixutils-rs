@@ -840,28 +840,49 @@ impl X86_64CodeGen {
             _ => return,
         }
 
-        // Copy qword by qword using XMM15 as shuttle (R10=src, R11=dst).
-        // XMM15 is reserved scratch — avoids clobbering RAX which is
-        // allocatable and may hold a live pseudo.
-        for i in 0..num_qwords {
-            let byte_offset = (i * 8) as i32;
-            // LIR: load from source via XMM15
+        self.copy_eightbytes((Reg::R10, 0), (Reg::R11, 0), num_qwords);
+    }
+
+    /// Copy `count` eightbytes from `src` to `dst`, each a base register
+    /// and displacement, through the reserved %xmm15 -- or without SSE2,
+    /// where no XMM register may be touched, through %rax, saved around
+    /// the copy since it may hold a live pseudo. A base of %rsp is read
+    /// past the push.
+    pub(super) fn copy_eightbytes(&mut self, src: (Reg, i32), dst: (Reg, i32), count: u32) {
+        let at = |(base, offset): (Reg, i32), i: u32, pushed: i32| MemAddr::BaseOffset {
+            base,
+            offset: offset + (i * 8) as i32 + if base == Reg::Rsp { pushed } else { 0 },
+        };
+        if !self.base.isa.has_sse2() {
+            debug_assert!(src.0 != Reg::Rax && dst.0 != Reg::Rax);
+            self.push_lir(X86Inst::Push {
+                src: GpOperand::Reg(Reg::Rax),
+            });
+            for i in 0..count {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(at(src, i, 8)),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(at(dst, i, 8)),
+                });
+            }
+            self.push_lir(X86Inst::Pop { dst: Reg::Rax });
+            return;
+        }
+        for i in 0..count {
             self.push_lir(X86Inst::MovFp {
                 size: FpSize::Double,
-                src: XmmOperand::Mem(MemAddr::BaseOffset {
-                    base: Reg::R10,
-                    offset: byte_offset,
-                }),
+                src: XmmOperand::Mem(at(src, i, 0)),
                 dst: XmmOperand::Reg(XmmReg::Xmm15),
             });
-            // LIR: store to destination via XMM15
             self.push_lir(X86Inst::MovFp {
                 size: FpSize::Double,
                 src: XmmOperand::Reg(XmmReg::Xmm15),
-                dst: XmmOperand::Mem(MemAddr::BaseOffset {
-                    base: Reg::R11,
-                    offset: byte_offset,
-                }),
+                dst: XmmOperand::Mem(at(dst, i, 0)),
             });
         }
     }

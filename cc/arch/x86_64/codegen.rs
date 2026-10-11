@@ -1704,6 +1704,60 @@ impl X86_64CodeGen {
 
 // CodeGenerator trait implementation
 
+impl X86_64CodeGen {
+    /// The retpoline thunks the unit's code branches through and must
+    /// define itself, under `-mindirect-branch=thunk` and
+    /// `-mfunction-return=thunk`: one comdat section each, which the
+    /// linker keeps one copy of, as gcc writes them.
+    fn emit_retpoline_thunks(&mut self) {
+        use crate::machine::Thunk;
+        let mut target = self.base.target.clone();
+        let mut regs: Vec<Reg> = Vec::new();
+        let mut returns = false;
+        for inst in &self.base.lir_buffer {
+            Self::retarget(inst, &mut target);
+            let reg = match inst {
+                X86Inst::Call {
+                    target: crate::arch::lir::CallTarget::Indirect(reg),
+                }
+                | X86Inst::NotrackCall { reg }
+                | X86Inst::JmpIndirect { reg } => Some(*reg),
+                X86Inst::CallGot { .. } => Some(Reg::R11),
+                X86Inst::Ret => {
+                    returns |= target.x86.function_return == Thunk::Thunk;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(reg) =
+                reg.filter(|r| target.x86.indirect_branch == Thunk::Thunk && !regs.contains(r))
+            {
+                regs.push(reg);
+            }
+        }
+        regs.sort_by_key(|r| r.name64());
+        let mut text: String = regs
+            .into_iter()
+            .map(|reg| super::lir::retpoline_thunk_definition(Some(reg)))
+            .collect();
+        if returns {
+            text.push_str(&super::lir::retpoline_thunk_definition(None));
+        }
+        if !text.is_empty() {
+            self.base.push_directive(Directive::Verbatim(text));
+        }
+    }
+
+    /// What a function's [`X86Inst::BranchModes`] makes of the target its
+    /// instructions are emitted for.
+    fn retarget(inst: &X86Inst, target: &mut crate::target::Target) {
+        if let X86Inst::BranchModes { indirect, ret } = inst {
+            target.x86.indirect_branch = *indirect;
+            target.x86.function_return = *ret;
+        }
+    }
+}
+
 impl CodeGenerator for X86_64CodeGen {
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String {
         self.base.output.clear();
@@ -1824,13 +1878,15 @@ impl CodeGenerator for X86_64CodeGen {
         }
 
         self.base.emit_eh_tables(self.pic_mode);
+        self.emit_retpoline_thunks();
         self.base.push_directive(Directive::UnitEnd);
         if let Some(bits) = self.base.cf_protection.feature_bits() {
             self.base.push_directive(Directive::FeatureNote(bits));
         }
 
-        // Emit all buffered LIR instructions to output string
-        self.base.emit_all();
+        // Emit all buffered LIR instructions to output string, each
+        // function's branches made as it asks.
+        self.base.emit_all_with(Self::retarget);
 
         self.base.output.clone()
     }
@@ -1845,6 +1901,10 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_object_layout(&mut self, layout: crate::target::ObjectLayout) {
         self.base.layout = layout;
+    }
+
+    fn set_function_shape(&mut self, shape: crate::target::FunctionShape) {
+        self.base.shape = shape;
     }
 
     fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy) {

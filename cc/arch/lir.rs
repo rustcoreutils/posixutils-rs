@@ -1053,6 +1053,10 @@ pub enum Directive {
     /// Stores power of 2, emits appropriately for platform
     Align(u32),
 
+    /// `.p2align log,,max_skip`: align to `1 << log` unless that takes more
+    /// than `max_skip` bytes of padding -- gcc's `-falign-functions=N:M`.
+    AlignMax { log: u32, max_skip: u32 },
+
     // ========================================================================
     // Data Emission
     // ========================================================================
@@ -1649,6 +1653,9 @@ impl EmitAsm for Directive {
             // directive has always carried.
             Directive::Align(power) => {
                 let _ = writeln!(out, ".p2align {}", power);
+            }
+            Directive::AlignMax { log, max_skip } => {
+                let _ = writeln!(out, ".p2align {log},,{max_skip}");
             }
 
             // Data emission

@@ -96,10 +96,6 @@ const X86_CPUS: &[&str] = &[
     "native",
 ];
 
-/// The x86-64 baseline c17 cannot do without: asking for SSE or SSE2 asks
-/// for nothing, and turning one off is beyond it.
-const X86_BASELINE: &[&str] = &["sse", "sse2"];
-
 /// gcc 13's code-generation switches that `target` accepts, each with a
 /// `no-` form: none is an ISA, and c17 implements none of them.
 const X86_SWITCHES: &[&str] = &[
@@ -141,7 +137,7 @@ impl TargetIssue {
 
 /// What one x86-64 `target` item asks for.
 enum X86Item {
-    /// Nothing c17 acts on: `tune=`, `fpmath=sse`, SSE or SSE2.
+    /// Nothing c17 acts on: `tune=`, `fpmath=sse`.
     Nothing,
     Arch(IsaSet),
     Edit(crate::target::IsaEdit),
@@ -187,17 +183,7 @@ fn x86_item(item: &str) -> Result<X86Item, TargetIssue> {
     if let Some(edit) = isa_edit(&format!("-m{item}")) {
         return Ok(X86Item::Edit(edit));
     }
-    let (negated, name) = match item.strip_prefix("no-") {
-        Some(name) => (true, name),
-        None => (false, item),
-    };
-    if X86_BASELINE.contains(&name) {
-        return if negated {
-            Err(TargetIssue::Unsupported(item.to_string()))
-        } else {
-            Ok(X86Item::Nothing)
-        };
-    }
+    let name = item.strip_prefix("no-").unwrap_or(item);
     if X86_SWITCHES.contains(&name) {
         return Err(TargetIssue::Unsupported(item.to_string()));
     }
@@ -470,9 +456,12 @@ mod tests {
             issues("avx10.1"),
             vec![TargetIssue::Unknown("avx10.1".into())]
         );
+        // The baseline is an ISA like any other: a function may do without
+        // SSE2, and then may not use it.
+        assert!(issues("no-sse2,general-regs-only").is_empty());
         assert_eq!(
-            issues("no-sse2"),
-            vec![TargetIssue::Unsupported("no-sse2".into())]
+            issues("no-general-regs-only"),
+            vec![TargetIssue::Unsupported("no-general-regs-only".into())]
         );
         assert!(issues("arch=haswell,tune=intel,sse2").is_empty());
         let a64 = |t: &str| parse_target(t, Arch::Aarch64).1;

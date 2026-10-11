@@ -1462,6 +1462,7 @@ fn linearize_source_with(
             trapping_math,
             fp_rounding: Default::default(),
             exceptions,
+            ..Default::default()
         },
     );
     (module, types)

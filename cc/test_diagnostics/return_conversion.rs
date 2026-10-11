@@ -20,7 +20,9 @@ use crate::test_compile::{
 
 const INT_TO_POINTER: &str = "makes pointer from integer without a cast";
 
-const INCOMPATIBLE_POINTER: &str = "incompatible pointer type";
+/// What every incompatible pointer conversion ends with, whatever gcc's
+/// words for the place it happens.
+const INCOMPATIBLE_POINTER: &str = "[-Wincompatible-pointer-types]";
 
 /// Every null pointer constant, and every pointer of the right type, returns
 /// from a pointer function in silence -- including an array or a function,
@@ -79,7 +81,7 @@ fn return_typed_null_pointer_is_a_pointer_mismatch() {
     compile_expect_warning(
         "npc_const_void",
         "int *f(void){ return (const void*)0; }\n",
-        "discards a qualifier",
+        "discards 'const' qualifier",
     );
 }
 
@@ -181,7 +183,7 @@ fn return_without_value_is_reported_at_the_return() {
     assert!(!run.success, "stderr:\n{}", run.stderr);
     assert!(
         run.stderr
-            .contains(":4:5: error: 'return' with no value in a function returning non-void"),
+            .contains(":4:5: error: 'return' with no value, in function returning non-void"),
         "stderr:\n{}",
         run.stderr
     );

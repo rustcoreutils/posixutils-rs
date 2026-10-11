@@ -601,6 +601,13 @@ impl Parser<'_> {
                 "'{0}' is promoted to '{1}' when passed through '...'",
                 &[&named, &promoted],
             );
+            // gcc's second note, that the call will abort, is not given:
+            // c17 reads the promoted value and converts it.
+            diag::note_args(
+                pos,
+                "(so you should pass '{1}' not '{0}' to 'va_arg')",
+                &[&named, &promoted],
+            );
         }
         true
     }

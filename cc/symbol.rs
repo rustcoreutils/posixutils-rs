@@ -11,6 +11,7 @@
 //
 
 use crate::arch::asm_constraints::PinnedGp;
+use crate::diag::Position;
 use crate::strings::StringId;
 use crate::types::TypeId;
 use std::collections::HashMap;
@@ -154,6 +155,42 @@ pub struct Symbol {
 
     /// The linkage this declaration gave the identifier.
     pub linkage: Linkage,
+
+    /// The declaration a note about this symbol points back at.
+    pub declared: DeclaredAt,
+}
+
+/// Where a name was declared, for the note that a later diagnostic about it
+/// gives: "previous definition of 'x'" or "previous declaration of 'x'", as
+/// gcc words it.
+///
+/// The default is no declaration in the source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeclaredAt {
+    /// Where the declared name is written; line 0 for a name the compiler
+    /// declared itself, which no note points at.
+    pub pos: Position,
+    /// Whether that declaration is a definition as gcc's notes call one: a
+    /// function's with its body, an object's with an initializer, a
+    /// parameter's or an enumerator's.
+    pub definition: bool,
+}
+
+impl DeclaredAt {
+    /// The declaration at `pos`, a definition or not.
+    pub fn at(pos: Position, definition: bool) -> Self {
+        DeclaredAt { pos, definition }
+    }
+
+    /// The declaration a note points at after `later` is made: a definition
+    /// stays the one, and failing that the latest declaration is, as in gcc.
+    pub fn followed_by(self, later: DeclaredAt) -> DeclaredAt {
+        if self.definition && !later.definition {
+            self
+        } else {
+            later
+        }
+    }
 }
 
 impl Symbol {
@@ -173,6 +210,7 @@ impl Symbol {
             has_extern_decl: false,
             has_non_inline_decl: false,
             linkage: Linkage::None,
+            declared: DeclaredAt::default(),
         }
     }
 
@@ -192,6 +230,7 @@ impl Symbol {
             has_extern_decl: false,
             has_non_inline_decl: false,
             linkage: Linkage::None,
+            declared: DeclaredAt::default(),
         }
     }
 
@@ -211,6 +250,7 @@ impl Symbol {
             has_extern_decl: false,
             has_non_inline_decl: false,
             linkage: Linkage::None,
+            declared: DeclaredAt::default(),
         }
     }
 
@@ -231,6 +271,7 @@ impl Symbol {
             has_extern_decl: false,
             has_non_inline_decl: false,
             linkage: Linkage::None,
+            declared: DeclaredAt::default(),
         }
     }
 
@@ -251,6 +292,7 @@ impl Symbol {
             has_extern_decl: false,
             has_non_inline_decl: false,
             linkage: Linkage::None,
+            declared: DeclaredAt::default(),
         }
     }
 
@@ -270,7 +312,14 @@ impl Symbol {
             has_extern_decl: false,
             has_non_inline_decl: false,
             linkage: Linkage::None,
+            declared: DeclaredAt::default(),
         }
+    }
+
+    /// Record where the symbol was declared; see [`Symbol::declared`].
+    pub fn declared_at(mut self, declared: DeclaredAt) -> Self {
+        self.declared = declared;
+        self
     }
 
     /// Record the linkage the declaration gave the identifier.

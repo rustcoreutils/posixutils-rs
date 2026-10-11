@@ -475,7 +475,7 @@ fn diagnostics_local_label_protected_scopes() {
             "local_label_into_vla_scope",
             "void g(int *);\n\
              void f(int n) { { __label__ in; goto in; { int v[n]; in: g(v); } } }\n",
-            "jump into the scope of 'v', which has a variably modified type",
+            "jump into scope of identifier with variably modified type",
         ),
         (
             "local_label_into_stmt_expr",

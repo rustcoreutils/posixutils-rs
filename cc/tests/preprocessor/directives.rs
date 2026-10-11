@@ -560,6 +560,62 @@ fn preprocessor_visibility_pragma_survives_dash_e() {
     );
 }
 
+/// Under `-E` the pragmas the compiler acts on are not acted on, so they
+/// draw no warning -- gcc gives none -- and travel as written, which is what
+/// lets the compile of the `.i` give the warnings gcc gives there.
+#[test]
+fn preprocessor_dash_e_leaves_pragma_warnings_to_the_compile() {
+    let src = "#pragma pack(3)\n\
+               #pragma pack x\n\
+               #pragma pack( push , 4 )\n\
+               #pragma GCC visibility pop\n\
+               #pragma scalar_storage_order foo\n\
+               _Pragma(\"pack(5)\")\n\
+               #pragma STDC FOO\n\
+               int q;\n";
+    let r = preprocess_text("pragma_quiet_e", src, &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(r.stderr.is_empty(), "-E warned:\n{}", r.stderr);
+    let pragmas: Vec<&str> = r
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("#pragma"))
+        .collect();
+    assert_eq!(
+        pragmas,
+        [
+            "#pragma pack(3)",
+            "#pragma pack x",
+            "#pragma pack( push , 4 )",
+            "#pragma GCC visibility pop",
+            "#pragma scalar_storage_order foo",
+            "#pragma pack(5)",
+            "#pragma STDC FOO",
+        ],
+        "{}",
+        r.stdout
+    );
+
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_pragma_i_")
+        .tempdir()
+        .expect("tempdir");
+    let i = dir.path().join("t.i");
+    std::fs::write(&i, &r.stdout).expect("write");
+    let obj = dir.path().join("t.o");
+    let c = run_c17(&["-c", "-o", obj.to_str().unwrap(), i.to_str().unwrap()]);
+    assert!(c.success, "{}", c.stderr);
+    for want in [
+        "warning: alignment in '#pragma pack' must be 1, 2, 4, 8 or 16 [-Wpragmas]",
+        "warning: expected '(' after '#pragma pack' [-Wpragmas]",
+        "warning: no matching push for '#pragma GCC visibility pop' [-Wpragmas]",
+        "warning: expected 'big-endian', 'little-endian', or 'default' after \
+         '#pragma scalar_storage_order' [-Wpragmas]",
+    ] {
+        assert!(c.stderr.contains(want), "{want:?} in:\n{}", c.stderr);
+    }
+}
+
 /// `#include_next` resumes the search *after* the directory the current file
 /// came from -- and `-I` directories are part of that search.
 ///

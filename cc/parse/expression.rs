@@ -2673,6 +2673,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// An identifier used but never declared, in gcc's words: once for
+    /// each name in a function, the first time with gcc's note saying so,
+    /// and once for each outside them.
+    fn report_undeclared(&mut self, name: StringId, pos: Position) {
+        if !self.undeclared_reported.insert(name) {
+            return;
+        }
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        if self.enclosing_function.name.is_none() {
+            diag::error_args(pos, "'{0}' undeclared here (not in a function)", &[spelled]);
+            return;
+        }
+        diag::error_args(
+            pos,
+            "'{0}' undeclared (first use in this function)",
+            &[spelled],
+        );
+        if !std::mem::replace(&mut self.undeclared_noted, true) {
+            diag::note(
+                pos,
+                &gettext(
+                    "each undeclared identifier is reported only once for each function it \
+                     appears in",
+                ),
+            );
+        }
+    }
+
     fn parse_primary_expr(&mut self) -> ParseResult<Expr> {
         match self.peek() {
             TokenType::Number => {
@@ -2813,8 +2841,7 @@ impl<'a> Parser<'a> {
                     } else {
                         // C99 6.5.1: Undeclared identifier is an error
                         // (implicit int was removed in C99)
-                        let name_str = self.idents.get_opt(name_id).unwrap_or("");
-                        diag::error_args(token_pos, "undeclared identifier '{0}'", &[name_str]);
+                        self.report_undeclared(name_id, token_pos);
                         // Return a dummy expression to continue parsing
                         Ok(Self::typed_expr(
                             ExprKind::IntLit(0),

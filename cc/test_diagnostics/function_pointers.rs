@@ -145,7 +145,7 @@ fn diagnostics_pedantic_errors_are_fatal() {
         (
             "ped_err_ellipsis",
             "int f(...);\n",
-            "error: ISO C requires a named argument before '...'",
+            "error: ISO C requires a named argument before '...' before C2X",
         ),
     ] {
         let stderr = compile_rejected_with(name, src, &["-pedantic-errors"]);
@@ -161,7 +161,7 @@ fn diagnostics_pedantic_errors_are_fatal() {
 #[test]
 fn diagnostics_ellipsis_without_named_parameter_is_pedantic_only() {
     let src = "int f(...);\n";
-    let want = "ISO C requires a named argument before '...'";
+    let want = "ISO C requires a named argument before '...' before C2X";
     let quiet = compile_accepted("ellipsis_only_default", src, &[]);
     assert!(!quiet.contains(want), "warned without -pedantic:\n{quiet}");
     let loud = compile_accepted("ellipsis_only_pedantic", src, &["-Wpedantic"]);
@@ -258,7 +258,7 @@ fn diagnostics_transparent_union_on_a_non_union_warns() {
         compile_expect_warning(
             name,
             src,
-            "'transparent_union' attribute ignored on a non-union type",
+            "'transparent_union' attribute ignored [-Wattributes]",
         );
     }
 }
@@ -377,7 +377,7 @@ fn diagnostics_conflicting_declarations_are_rejected() {
         (
             "function_then_object",
             "int f(void);\nint f;\n",
-            "redeclared as a different kind of symbol",
+            "redeclared as different kind of symbol",
         ),
         (
             "array_size_mismatch",

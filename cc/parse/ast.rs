@@ -3102,6 +3102,10 @@ pub struct FunctionAttrs {
     /// `default` this function is compiled as, dispatched by a resolver.
     /// `None` when there is nothing to dispatch.
     pub clones: Option<crate::target_attr::TargetClones>,
+    /// The attributes written that only a function may carry, each with
+    /// where its list is: a declarator that declares no function ignores
+    /// them with gcc's diagnostic (`Parser::drop_fn_decl_attrs`).
+    pub function_only: Vec<(&'static str, crate::diag::Position)>,
 }
 
 impl FunctionAttrs {
@@ -3163,6 +3167,8 @@ impl FunctionAttrs {
         if other.clones.is_some() {
             self.clones = other.clones.clone();
         }
+        self.function_only
+            .extend(other.function_only.iter().copied());
     }
 }
 

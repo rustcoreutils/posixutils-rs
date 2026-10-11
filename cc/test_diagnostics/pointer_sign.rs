@@ -37,16 +37,22 @@ char *r(unsigned char *u) { return u; }
 ";
 
 const SIGN_WARNINGS: [&str; 6] = [
-    "8:5: pointer targets in passing argument 1 of 'g' differ in signedness",
-    "9:5: pointer targets in passing argument 1 of 'h' differ in signedness",
-    "10:15: pointer targets in passing argument 1 of 'try_cmpxchg' differ in signedness",
-    "11:23: pointer targets in initialization of 'unsigned char *' from 'char *' differ in signedness",
-    "12:16: pointer targets in assignment from 'unsigned char *' to 'char *' differ in signedness",
-    "15:36: pointer targets in returning 'unsigned char *' from a function with return type 'char *' differ in signedness",
+    "8:5: pointer targets in passing argument 1 of 'g' differ in signedness [-Wpointer-sign]",
+    "9:5: pointer targets in passing argument 1 of 'h' differ in signedness [-Wpointer-sign]",
+    "10:15: pointer targets in passing argument 1 of 'try_cmpxchg' differ in signedness \
+     [-Wpointer-sign]",
+    "11:23: pointer targets in initialization of 'unsigned char *' from 'char *' differ in \
+     signedness [-Wpointer-sign]",
+    "12:16: pointer targets in assignment from 'unsigned char *' to 'char *' differ in \
+     signedness [-Wpointer-sign]",
+    "15:36: pointer targets in returning 'unsigned char *' from a function with return type \
+     'char *' differ in signedness [-Wpointer-sign]",
 ];
 
+/// The mismatched pointer's warning, without its tag.
+const MISMATCH_MSG: &str = "passing argument 1 of 'f' from incompatible pointer type";
 const MISMATCH: &str =
-    "13:5: passing argument 1 of 'f' as 'long *' from 'int *' incompatible pointer type";
+    "13:5: passing argument 1 of 'f' from incompatible pointer type [-Wincompatible-pointer-types]";
 
 #[track_caller]
 fn warnings(flags: &[&str]) -> Vec<String> {
@@ -130,8 +136,7 @@ fn pointer_sign_answers_to_werror() {
     );
     assert!(
         c.contains(&format!(
-            "error: {} [-Werror=incompatible-pointer-types]\n",
-            MISMATCH.split_once(": ").unwrap().1
+            "error: {MISMATCH_MSG} [-Werror=incompatible-pointer-types]\n"
         )),
         "{c}"
     );
@@ -148,7 +153,7 @@ fn pointer_sign_is_a_pedwarn() {
     let c = compile_rejected_with("pointer_sign_pe", SIGNS, &["-pedantic-errors"]);
     assert!(c.contains(
         "pointer_sign_pe.c:9:5: error: pointer targets in passing argument 1 of 'h' \
-         differ in signedness\n"
+         differ in signedness [-Wpointer-sign]\n"
     ));
 }
 
@@ -171,12 +176,15 @@ void t(void) {
     let sign: Vec<&String> = w.iter().filter(|m| m.contains("signedness")).collect();
     assert_eq!(
         sign,
-        ["6:27: pointer targets in passing argument 1 of 'e' differ in signedness"],
+        [
+            "6:27: pointer targets in passing argument 1 of 'e' differ in signedness \
+          [-Wpointer-sign]"
+        ],
         "{w:#?}"
     );
     assert!(
         w.iter()
-            .any(|m| m.starts_with("6:20: ") && m.contains("discards a qualifier")),
+            .any(|m| m.starts_with("6:20: ") && m.contains("discards 'const' qualifier")),
         "{w:#?}"
     );
     assert_eq!(
@@ -204,7 +212,7 @@ void t(void) {
 ";
     let cases = [
         ("int-conversion", "makes pointer from integer", 2),
-        ("discarded-qualifiers", "discards a qualifier", 1),
+        ("discarded-qualifiers", "discards 'const' qualifier", 1),
         ("incompatible-pointer-types", "incompatible pointer type", 1),
     ];
     let all = compile_warnings("assign_groups", src, &[]);

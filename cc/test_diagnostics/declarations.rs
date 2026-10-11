@@ -37,12 +37,12 @@ fn redefinitions_are_rejected() {
         (
             "rd_block_static",
             "void f(void) { static int s; static int s; }\n",
-            "redefinition of 's'",
+            "redeclaration of 's' with no linkage",
         ),
         (
             "rd_param",
             "void f(int a) { int a; }\n",
-            "redefinition of 'a'",
+            "'a' redeclared as different kind of symbol",
         ),
         (
             "rd_object",
@@ -132,7 +132,7 @@ fn tags_are_declared_once_and_of_one_kind() {
         (
             "tag_enum_redef",
             "enum E { A };\nenum E { B };\n",
-            "redefinition of 'enum E'",
+            "redeclaration of 'enum E'",
         ),
         (
             "tag_kind",

@@ -343,6 +343,17 @@ thread_local! {
     /// Where diagnostics go when not to stderr; see [`capture_diagnostics`].
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 
+    /// `-fno-diagnostics-show-option` turns this off: the `[-W<name>]` tag
+    /// that names the option controlling a diagnostic.
+    static SHOW_OPTION: Cell<bool> = const { Cell::new(true) };
+
+    /// Whether the last warning or error was shown, for the [`note`]s that
+    /// follow it.
+    static LAST_SHOWN: Cell<bool> = const { Cell::new(false) };
+
+    /// How many [`without_warnings`] calls are running.
+    static QUIET: Cell<u32> = const { Cell::new(0) };
+
     /// The diagnostics given so far inside [`each_once`], which gives no
     /// diagnostic twice; `None` outside it.
     static GIVEN: RefCell<Option<std::collections::HashSet<DiagKey>>> =
@@ -366,6 +377,9 @@ pub fn each_once<R>(f: impl FnOnce() -> R) -> R {
 /// Whether this diagnostic was given before inside [`each_once`]; the first
 /// time, it is recorded.
 fn given_before(level: DiagLevel, pos: Position, msg: &str) -> bool {
+    if level == DiagLevel::Note {
+        return false;
+    }
     GIVEN.with_borrow_mut(|given| {
         given.as_mut().is_some_and(|given| {
             let key = (
@@ -378,6 +392,16 @@ fn given_before(level: DiagLevel, pos: Position, msg: &str) -> bool {
             !given.insert(key)
         })
     })
+}
+
+/// Run `f` giving none of its warnings, which are neither shown nor
+/// counted: for work whose warnings belong to a later stage, as `-E`'s
+/// pragmas belong to the compile that reads them. Errors are given as ever.
+pub fn without_warnings<R>(f: impl FnOnce() -> R) -> R {
+    QUIET.set(QUIET.get() + 1);
+    let result = f();
+    QUIET.set(QUIET.get() - 1);
+    result
 }
 
 /// Suppress warning output for the rest of this thread's compilation (`-w`).
@@ -512,14 +536,14 @@ pub fn warning_group_enabled(name: &str) -> bool {
 pub fn group_warning(name: &str, pos: Position, msg: &str) {
     if warning_group_enabled(name) {
         give_warning(Some(name), pos, msg);
+    } else {
+        LAST_SHOWN.set(false);
     }
 }
 
 /// [`group_warning`] with a translatable template; see [`warning_args`].
 pub fn group_warning_args(name: &str, pos: Position, template: &str, args: &[&str]) {
-    if warning_group_enabled(name) {
-        give_warning(Some(name), pos, &gettext_args(template, args));
-    }
+    group_warning(name, pos, &gettext_args(template, args));
 }
 
 /// Are warnings being printed?
@@ -590,9 +614,7 @@ pub fn permerror_accepted(group: &str) -> bool {
 /// The warning an accepted [`permerror_accepted`] construct still draws:
 /// none once `-Wno-<group>` has turned the group off.
 pub fn permerror_warning(group: &str, pos: Position, msg: &str) {
-    if warning_group_enabled(group) {
-        give_pedwarn(Some(group), pos, msg);
-    }
+    group_pedwarn_default(group, pos, msg);
 }
 
 /// A constraint violation gcc lets through with only a warning: an error
@@ -727,6 +749,19 @@ impl Werror {
 /// code, not about the compiler's.
 const BEYOND_PLAIN_WERROR: &[&str] = &[crate::f_options::UNSUPPORTED_WARNING];
 
+/// The `-W<name>` options of c17's own, which a warning does not name: gcc
+/// has none of them, and its tag names an option gcc knows. The error
+/// `-Werror=<name>` makes of one names it, being what made it an error.
+const C17_GROUPS: &[&str] = &[crate::f_options::UNSUPPORTED_WARNING, "c17-dialect"];
+
+/// The tag of a warning in `group`, as gcc's names its option.
+fn warning_tag(group: Option<&str>) -> String {
+    match group {
+        Some(g) if !C17_GROUPS.contains(&g) => option_tag(&format!("-W{g}")),
+        _ => String::new(),
+    }
+}
+
 /// A warning in the group `name` about the command line, which has no
 /// source position: given as the driver gives its own, unless `-w` or
 /// `-Wno-<name>` silences it, and an error, tagged as gcc tags one, when
@@ -736,10 +771,12 @@ pub fn command_line_group_warning(name: &str, msg: &str) -> bool {
         return false;
     }
     if WERROR.with_borrow(|w| w.promotes(Some(name))) {
-        emit_line(format!("c17: {}: {msg} [-Werror={name}]", gettext("error")));
+        let tag = option_tag(&format!("-Werror={name}"));
+        emit_line(format!("c17: {}: {msg}{tag}", gettext("error")));
         return true;
     }
-    emit_line(format!("c17: {}: {msg}", gettext("warning")));
+    let tag = warning_tag(Some(name));
+    emit_line(format!("c17: {}: {msg}{tag}", gettext("warning")));
     false
 }
 
@@ -785,12 +822,30 @@ pub fn finish_unit() {
 pub fn pedwarn(pos: Position, msg: &str) {
     if PEDANTIC.get().enabled {
         give_pedwarn(Some("pedantic"), pos, msg);
+    } else {
+        LAST_SHOWN.set(false);
     }
 }
 
 /// [`pedwarn`] with a translatable template; see [`warning_args`].
 pub fn pedwarn_args(pos: Position, template: &str, args: &[&str]) {
     pedwarn(pos, &gettext_args(template, args));
+}
+
+/// A pedwarn of gcc's preprocessor: given under `-pedantic` as [`pedwarn`]
+/// is, but in no warning group -- gcc tags it with no option, plain
+/// `-Werror` makes it an error and `-Werror=pedantic` does not.
+pub fn cpp_pedwarn(pos: Position, msg: &str) {
+    if PEDANTIC.get().enabled {
+        give_pedwarn(None, pos, msg);
+    } else {
+        LAST_SHOWN.set(false);
+    }
+}
+
+/// [`cpp_pedwarn`] with a translatable template; see [`warning_args`].
+pub fn cpp_pedwarn_args(pos: Position, template: &str, args: &[&str]) {
+    cpp_pedwarn(pos, &gettext_args(template, args));
 }
 
 /// Report a constraint violation gcc diagnoses by default but only warns
@@ -811,17 +866,27 @@ pub fn pedwarn_default_args(pos: Position, template: &str, args: &[&str]) {
 pub fn group_pedwarn_default(name: &str, pos: Position, msg: &str) {
     if warning_group_enabled(name) {
         give_pedwarn(Some(name), pos, msg);
+    } else {
+        LAST_SHOWN.set(false);
     }
+}
+
+/// [`group_pedwarn_default`] with a translatable template; see
+/// [`warning_args`].
+pub fn group_pedwarn_default_args(name: &str, pos: Position, template: &str, args: &[&str]) {
+    group_pedwarn_default(name, pos, &gettext_args(template, args));
 }
 
 /// A pedwarn that is given: an error under `-pedantic-errors`, a warning
 /// otherwise, in `group` as far as `-Werror` is concerned. As in gcc, `-w`
 /// and a system header leave it a warning, which is then not shown --
 /// `-pedantic-errors` does not reach into libc's headers, which use the
-/// extensions it objects to.
+/// extensions it objects to. The error still names its group as `-W<name>`,
+/// as gcc's does.
 fn give_pedwarn(group: Option<&str>, pos: Position, msg: &str) {
     if PEDANTIC.get().errors && !hidden(pos) {
-        do_diag(DiagLevel::Error, pos, msg);
+        let tag = warning_tag(group);
+        do_diag(DiagLevel::Error, pos, &format!("{msg}{tag}"));
     } else {
         give_warning(group, pos, msg);
     }
@@ -833,20 +898,44 @@ fn hidden(pos: Position) -> bool {
 }
 
 /// Every warning goes through here: a warning in `group` (`None`: in none
-/// gcc names), or the error `-Werror` makes of it, tagged as gcc tags one --
-/// `[-Werror=<group>]`, or `[-Werror]` for a warning with no name. A warning
-/// that is not shown is not promoted either.
+/// gcc names), tagged `[-W<group>]` as gcc tags one, or the error `-Werror`
+/// makes of it, tagged `[-Werror=<group>]`, or `[-Werror]` for a warning
+/// with no name. A warning that is not shown is not promoted either.
 fn give_warning(group: Option<&str>, pos: Position, msg: &str) {
+    if QUIET.get() > 0 {
+        LAST_SHOWN.set(false);
+        return;
+    }
     if hidden(pos) || !WERROR.with_borrow(|w| w.promotes(group)) {
-        do_diag(DiagLevel::Warning, pos, msg);
+        do_diag(
+            DiagLevel::Warning,
+            pos,
+            &format!("{msg}{}", warning_tag(group)),
+        );
         return;
     }
     PROMOTED.set(PROMOTED.get() + 1);
     let tag = match group {
-        Some(group) => format!("-Werror={group}"),
-        None => "-Werror".to_string(),
+        Some(group) => option_tag(&format!("-Werror={group}")),
+        None => option_tag("-Werror"),
     };
-    do_diag(DiagLevel::Error, pos, &format!("{msg} [{tag}]"));
+    do_diag(DiagLevel::Error, pos, &format!("{msg}{tag}"));
+}
+
+/// `-fdiagnostics-show-option` (the default) or its `-fno-` form, for the
+/// rest of this thread's compilation.
+pub fn set_show_option(show: bool) {
+    SHOW_OPTION.set(show);
+}
+
+/// The ` [<option>]` gcc appends to a diagnostic an option controls, or
+/// nothing under `-fno-diagnostics-show-option`.
+fn option_tag(option: &str) -> String {
+    if SHOW_OPTION.get() {
+        format!(" [{option}]")
+    } else {
+        String::new()
+    }
 }
 
 pub fn has_error() -> u32 {
@@ -892,6 +981,8 @@ pub fn reset_counts() {
 enum DiagLevel {
     Warning,
     Error,
+    /// More about the warning or error just given; see [`note`].
+    Note,
 }
 
 impl DiagLevel {
@@ -906,6 +997,7 @@ impl DiagLevel {
         match self {
             DiagLevel::Warning => format!("{}: ", gettext("warning")),
             DiagLevel::Error => format!("{}: ", gettext("error")),
+            DiagLevel::Note => format!("{}: ", gettext("note")),
         }
     }
 }
@@ -944,6 +1036,7 @@ fn prettify_path(path: &str) -> String {
 
 fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
     if given_before(level, pos, msg) {
+        LAST_SHOWN.set(false);
         return;
     }
     // Track errors/warnings
@@ -954,23 +1047,32 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
         }
         DiagLevel::Warning => {
             WARNING_COUNT.set(WARNING_COUNT.get() + 1);
-            if warnings_suppressed() {
+            if hidden(pos) {
+                LAST_SHOWN.set(false);
                 return;
             }
-            if STREAMS.with(|s| s.borrow().is_system(pos.stream)) {
+        }
+        DiagLevel::Note => {
+            if !LAST_SHOWN.get() || pos.line == 0 {
                 return;
             }
         }
     }
 
-    SHOWN.set(SHOWN.get() + 1);
-
     // Format the message
     let (filename, line, col) = STREAMS.with(|s| s.borrow().effective_position(pos));
     let filename = prettify_path(&filename);
 
-    // Check for include chain (only on first occurrence of a file)
-    let include_note = show_include_chain(pos.stream);
+    // A note belongs to the diagnostic before it, which gave the include
+    // chain if there was one.
+    let include_note = match level {
+        DiagLevel::Note => None,
+        _ => {
+            SHOWN.set(SHOWN.get() + 1);
+            LAST_SHOWN.set(true);
+            show_include_chain(pos.stream)
+        }
+    };
 
     // Print include context if present, under the name of the translation
     // unit the chain starts from. Stream 0 is only the first unit's: with
@@ -1012,6 +1114,20 @@ pub fn warning(pos: Position, msg: &str) {
 
 pub fn error(pos: Position, msg: &str) {
     do_diag(DiagLevel::Error, pos, msg);
+}
+
+/// A note at `pos` saying more about the warning or error just given -- where
+/// the name it is about was declared before, or what was expected -- shown
+/// right after it, as gcc's are. A note follows its diagnostic: it is not
+/// shown when that was not (`-w`, `-Wno-<name>`, a system header, a repeat),
+/// and gives nothing for a position that is not known.
+pub fn note(pos: Position, msg: &str) {
+    do_diag(DiagLevel::Note, pos, msg);
+}
+
+/// [`note`] with a translatable template; see [`warning_args`].
+pub fn note_args(pos: Position, template: &str, args: &[&str]) {
+    note(pos, &gettext_args(template, args));
 }
 
 /// Print a warning built from a translatable template.
@@ -1263,6 +1379,75 @@ mod tests {
         assert!(
             !werror(&["error", "no-error=frame-larger-than="]).promotes(Some("frame-larger-than="))
         );
+    }
+
+    /// A note follows the diagnostic before it: shown after one that was,
+    /// not after one a group or `each_once` kept back, and never counted.
+    #[test]
+    fn notes_follow_their_diagnostic() {
+        clear_streams();
+        let stream = init_stream("n.c");
+        let (a, b) = (Position::new(stream, 1, 5), Position::new(stream, 2, 3));
+        reset_counts();
+        set_warning_options(&["no-overflow"]);
+        capture_diagnostics();
+        group_warning("overflow", a, "off");
+        note(b, "after an unshown warning");
+        group_warning("attributes", a, "on");
+        note(b, "after a warning");
+        note(Position::default(), "nowhere");
+        error(a, "bad");
+        note(b, "after an error");
+        each_once(|| {
+            error(a, "twice");
+            error(a, "twice");
+            note(b, "after a repeat");
+        });
+        let lines = take_captured_diagnostics();
+        set_warning_options(&[]);
+        assert_eq!(
+            lines,
+            [
+                "n.c:1:5: warning: on [-Wattributes]",
+                "n.c:2:3: note: after a warning",
+                "n.c:1:5: error: bad",
+                "n.c:2:3: note: after an error",
+                "n.c:1:5: error: twice",
+            ]
+        );
+        assert_eq!(error_count(), 2);
+    }
+
+    /// `without_warnings` gives none of its warnings and counts none, and
+    /// lets an error through.
+    #[test]
+    fn without_warnings_gives_errors_only() {
+        clear_streams();
+        let stream = init_stream("q.c");
+        let pos = Position::new(stream, 1, 1);
+        reset_counts();
+        capture_diagnostics();
+        without_warnings(|| {
+            warning(pos, "quiet");
+            group_warning("pragmas", pos, "quiet too");
+            error(pos, "loud");
+        });
+        let lines = take_captured_diagnostics();
+        assert_eq!(lines, ["q.c:1:1: error: loud"]);
+        assert_eq!(warning_count(), 0);
+    }
+
+    /// The tag names gcc's option, none for a group of c17's own, and
+    /// nothing at all under `-fno-diagnostics-show-option`.
+    #[test]
+    fn warning_tags_name_gccs_options() {
+        assert_eq!(warning_tag(Some("overflow")), " [-Woverflow]");
+        assert_eq!(warning_tag(None), "");
+        assert_eq!(warning_tag(Some(crate::f_options::UNSUPPORTED_WARNING)), "");
+        set_show_option(false);
+        assert_eq!(warning_tag(Some("overflow")), "");
+        assert_eq!(option_tag("-Werror"), "");
+        set_show_option(true);
     }
 
     /// `-Werror=pedantic` turns `-Wpedantic` on, as gcc's does, without

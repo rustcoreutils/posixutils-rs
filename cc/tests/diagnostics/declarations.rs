@@ -137,3 +137,36 @@ fn attribute_between_tag_and_body_is_rejected() {
         "expected identifier or '(' before '{' token",
     );
 }
+
+/// A conflict with a declaration in a header points the note into the
+/// header, and an argument that does not suit a parameter declared there
+/// points at the parameter, as gcc's notes do.
+#[test]
+fn notes_point_into_the_header() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_notes_")
+        .tempdir()
+        .expect("tempdir");
+    std::fs::write(dir.path().join("decl.h"), "int x;\nvoid h(long *q);\n").expect("write");
+    let src = dir.path().join("t.c");
+    std::fs::write(
+        &src,
+        "#include \"decl.h\"\nlong x;\nvoid f(int *p) { h(p); }\n",
+    )
+    .expect("write");
+    let obj = dir.path().join("t.o");
+    let r = crate::common::run_c17(&["-c", "-o", obj.to_str().unwrap(), src.to_str().unwrap()]);
+    assert!(!r.success, "{}", r.stderr);
+    let header = dir.path().join("decl.h");
+    let header = header.to_str().unwrap();
+    for want in [
+        "t.c:2:6: error: conflicting types for 'x'; have 'long'\n".to_string(),
+        format!("{header}:1:5: note: previous declaration of 'x' with type 'int'\n"),
+        "t.c:3:20: warning: passing argument 1 of 'h' from incompatible pointer type \
+         [-Wincompatible-pointer-types]\n"
+            .to_string(),
+        format!("{header}:2:14: note: expected 'long *' but argument is of type 'int *'\n"),
+    ] {
+        assert!(r.stderr.contains(&want), "{want:?} in:\n{}", r.stderr);
+    }
+}

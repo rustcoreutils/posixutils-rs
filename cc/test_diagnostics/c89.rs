@@ -84,7 +84,7 @@ fn c89_functions_void_pointer_conversion_keeps_qualifiers() {
         compile_expect_warning(
             name,
             code,
-            "discards a qualifier from the pointer target type",
+            "qualifier from pointer target type [-Wdiscarded-qualifiers]",
         );
     }
 }

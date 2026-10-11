@@ -53,8 +53,8 @@ pub enum Why {
     /// It asks for something c17 always does. Each entry gives the
     /// evidence.
     Default,
-    /// It chooses how diagnostics look: colour, line wrapping, carets,
-    /// the option tag. c17's text is plain either way.
+    /// It chooses how diagnostics look: colour, line wrapping, carets.
+    /// c17's text is plain either way.
     Presentation,
     /// It chooses which section code or data goes in. Every choice gives
     /// the same program on a hosted system, where `.bss` starts zeroed.
@@ -119,7 +119,8 @@ const PLAIN: &[(&str, Effect)] = &[
     ("data-sections", Accepted(Placement)),
     ("diagnostics-color", Accepted(Presentation)),
     ("diagnostics-format=text", Accepted(Presentation)),
-    ("diagnostics-show-option", Accepted(Presentation)),
+    // Main driver: whether a diagnostic names its option.
+    ("diagnostics-show-option", Implemented),
     // gcc's dump files, which c17 does not write.
     ("dump-rtl-reload", Unsupported),
     ("dump-tree-optimized", Unsupported),
@@ -183,7 +184,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("no-dce", Accepted(Pass)),
     ("no-diagnostics-color", Accepted(Presentation)),
     ("no-diagnostics-show-caret", Accepted(Presentation)),
-    ("no-diagnostics-show-option", Accepted(Presentation)),
+    ("no-diagnostics-show-option", Implemented),
     ("no-dwarf2-cfi-asm", Implemented),
     ("no-early-inlining", Accepted(Pass)),
     ("no-enforce-eh-specs", CXX_OBJCXX),

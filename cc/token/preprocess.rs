@@ -158,6 +158,17 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
 /// A name C17 6.10.8 predefines, which p2 says may be neither `#define`d nor
 /// `#undef`ined: `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, and every
 /// `__STDC...` macro (the mandatory, conditional and environment ones).
+/// The warning group of redefining or undefining the built-in macro `name`:
+/// gcc's `-Wbuiltin-macro-redefined` covers the ones whose expansion names
+/// the file or the time of the build, and no others.
+pub(super) fn builtin_macro_group(name: &str) -> Option<&'static str> {
+    matches!(
+        name,
+        "__FILE__" | "__BASE_FILE__" | "__DATE__" | "__TIME__" | "__TIMESTAMP__"
+    )
+    .then_some("builtin-macro-redefined")
+}
+
 pub(super) fn is_standard_predefined(name: &str) -> bool {
     matches!(name, "__FILE__" | "__LINE__" | "__DATE__" | "__TIME__")
         || name.starts_with("__STDC_")
@@ -187,6 +198,9 @@ pub struct Macro {
     /// keyword alias, or a `-D` on the command line) rather than a `#define`
     /// directive in a translation unit.
     pub predefined: bool,
+    /// Where a `#define` directive named it, for the note on a conflicting
+    /// redefinition; unknown (line 0) for a predefined one.
+    pub defined_at: Position,
 }
 
 /// A token stored in a macro body
@@ -331,6 +345,7 @@ impl Macro {
             variadic_name: None,
             builtin: None,
             predefined: true,
+            defined_at: Position::default(),
         }
     }
 
@@ -358,6 +373,7 @@ impl Macro {
             variadic_name: None,
             builtin: None,
             predefined: true,
+            defined_at: Position::default(),
         }
     }
 
@@ -392,6 +408,7 @@ impl Macro {
             variadic_name: None,
             builtin: None,
             predefined: true,
+            defined_at: Position::default(),
         }
     }
 
@@ -413,6 +430,7 @@ impl Macro {
             variadic_name: None,
             builtin: Some(builtin),
             predefined: true,
+            defined_at: Position::default(),
         }
     }
 }
@@ -522,6 +540,9 @@ pub struct Preprocessor<'a> {
     /// `-dD`: carry each `#define` and `#undef` that takes effect into the
     /// output, as its own text; see [`PreprocessConfig::keep_definitions`].
     keep_definitions: bool,
+    /// `-E`: the pragmas travel to the compile that reads them, which gives
+    /// their warnings; see [`PreprocessConfig::preprocess_only`].
+    preprocess_only: bool,
 
     /// Files named by a `#pragma once`.
     once_files: HashSet<PathBuf>,
@@ -884,7 +905,8 @@ impl StorageOrderPragma {
     fn parse_body(body: &str, pos: Position) -> Option<StorageOrderPragma> {
         let word: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         if word.is_empty() {
-            diag::warning(
+            diag::group_warning(
+                PRAGMAS_WARNING,
                 pos,
                 &gettext("missing 'big-endian', 'little-endian', or 'default' after '#pragma scalar_storage_order'"),
             );
@@ -892,7 +914,8 @@ impl StorageOrderPragma {
         }
         let order = StorageOrderPragma::from_word(&word);
         if order.is_none() {
-            diag::warning(
+            diag::group_warning(
+                PRAGMAS_WARNING,
                 pos,
                 &gettext("expected 'big-endian', 'little-endian', or 'default' after '#pragma scalar_storage_order'"),
             );
@@ -1227,6 +1250,7 @@ impl<'a> Preprocessor<'a> {
             dependencies: Vec::new(),
             collect_dependencies: false,
             keep_definitions: false,
+            preprocess_only: false,
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             guarded_files: HashMap::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             compile_date,
@@ -3079,6 +3103,10 @@ pub struct PreprocessConfig<'a> {
     pub keep_definitions: bool,
     /// Collect the headers this translation unit depends on (the `-M` family).
     pub collect_dependencies: bool,
+    /// `-E`: the output is the preprocessed text, whose pragmas are not
+    /// acted on here and so draw no warning -- gcc gives those when it
+    /// compiles them.
+    pub preprocess_only: bool,
     /// The position independence code generation uses; see
     /// [`define_pic_macros`].
     pub position: crate::target::PositionIndependence,
@@ -3257,6 +3285,7 @@ pub fn preprocess_collecting(
 
     // `-dD`: what is defined now is what the source starts with; from here
     // on each directive is carried where it stands, `-include`d ones too.
+    pp.preprocess_only = config.preprocess_only;
     let initial_definitions = if config.keep_definitions {
         pp.keep_definitions = true;
         pp.macro_definitions(idents)

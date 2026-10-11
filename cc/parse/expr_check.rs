@@ -156,6 +156,7 @@ impl Parser<'_> {
         if !fewer && max.is_none_or(|max| given <= max) {
             return true;
         }
+        let declared = callee.and_then(|id| self.linked_names.get(&id).map(|l| l.declared));
         let callee = callee.and_then(|id| self.idents.get_opt(id));
         match (fewer, callee) {
             (true, Some(f)) => {
@@ -166,6 +167,9 @@ impl Parser<'_> {
                 diag::error_args(call_pos, "too many arguments to function '{0}'", &[f])
             }
             (false, None) => diag::error(call_pos, &gettext("too many arguments to function")),
+        }
+        if let Some(declared) = declared {
+            diag::note(declared.pos, &gettext("declared here"));
         }
         false
     }
@@ -238,28 +242,24 @@ impl Parser<'_> {
             if self.argument_matches_union_member(param, a) {
                 continue;
             }
+            // gcc's note points at the parameter in the callee's first
+            // declaration, or at the argument when the call is indirect.
+            let note_pos = callee
+                .and_then(|id| self.param_positions.get(&id))
+                .and_then(|positions| positions.get(i).copied())
+                .unwrap_or(arg.pos);
             let n = (i + 1).to_string();
             let callee = callee.and_then(|id| self.idents.get_opt(id));
-            if fault == AssignFault::FunctionPointerVoid {
-                match callee {
-                    Some(f) => diag::pedwarn_args(
-                        arg.pos,
-                        "ISO C forbids passing argument {0} of '{1}' between function pointer and 'void *'",
-                        &[&n, f],
-                    ),
-                    None => diag::pedwarn_args(
-                        arg.pos,
-                        "ISO C forbids passing argument {0} between function pointer and 'void *'",
-                        &[&n],
-                    ),
-                }
-                continue;
-            }
-            let (p_name, a_name) = (
-                self.types.format_type(param, Some(self.idents)),
-                self.types.format_type(a, Some(self.idents)),
+            let quals = self.types.discarded_qualifiers(param, a);
+            Self::report_argument_fault(fault, arg.pos, &n, callee, &quals);
+            diag::note_args(
+                note_pos,
+                "expected '{0}' but argument is of type '{1}'",
+                &[
+                    &self.types.format_type(param, Some(self.idents)),
+                    &self.types.format_type(a, Some(self.idents)),
+                ],
             );
-            Self::report_argument_fault(fault, arg.pos, &n, callee, &p_name, &a_name);
             if fault.is_error() {
                 sound = false;
             }
@@ -267,51 +267,56 @@ impl Parser<'_> {
         sound
     }
 
-    /// Report argument `n`, of type `a_name`, that `fault` keeps from being
-    /// assigned to its parameter of type `p_name`. The callee is named when
-    /// the call spelled one, as gcc names it.
+    /// Report argument `n` that `fault` keeps from being assigned to its
+    /// parameter, in gcc's words: the callee is named when the call spelled
+    /// one, and `quals` are the qualifiers a [`AssignFault::QualifierDiscard`]
+    /// discards. gcc's note on the types follows.
     fn report_argument_fault(
         fault: AssignFault,
         pos: Position,
         n: &str,
         callee: Option<&str>,
-        p_name: &str,
-        a_name: &str,
+        quals: &str,
     ) {
-        let Some(group) = fault.group() else {
-            match callee {
-                Some(f) => diag::error_args(
-                    pos,
-                    "incompatible type for argument {0} of '{1}': expected '{2}', got '{3}'",
-                    &[n, f, p_name, a_name],
-                ),
-                None => diag::error_args(
-                    pos,
-                    "incompatible type for argument {0}: expected '{1}', got '{2}'",
-                    &[n, p_name, a_name],
-                ),
-            }
-            return;
-        };
-        let (template, args): (&str, &[&str]) = match (fault, callee) {
-            (AssignFault::PointerSign, Some(f)) => (
+        let (named, unnamed) = match fault {
+            AssignFault::Incompatible => (
+                "incompatible type for argument {0} of '{1}'",
+                "incompatible type for argument {0}",
+            ),
+            AssignFault::FunctionPointerVoid => (
+                "ISO C forbids passing argument {0} of '{1}' between function pointer and 'void *'",
+                "ISO C forbids passing argument {0} between function pointer and 'void *'",
+            ),
+            AssignFault::PointerSign => (
                 "pointer targets in passing argument {0} of '{1}' differ in signedness",
-                &[n, f],
-            ),
-            (AssignFault::PointerSign, None) => (
                 "pointer targets in passing argument {0} differ in signedness",
-                &[n],
             ),
-            (_, Some(f)) => (
-                "passing argument {0} of '{1}' as '{2}' from '{3}' {4}",
-                &[n, f, p_name, a_name, fault.describe()],
+            AssignFault::PointerMismatch => (
+                "passing argument {0} of '{1}' from incompatible pointer type",
+                "passing argument {0} from incompatible pointer type",
             ),
-            (_, None) => (
-                "passing argument {0} as '{1}' from '{2}' {3}",
-                &[n, p_name, a_name, fault.describe()],
+            AssignFault::IntegerFromPointer => (
+                "passing argument {0} of '{1}' makes integer from pointer without a cast",
+                "passing argument {0} makes integer from pointer without a cast",
+            ),
+            AssignFault::PointerFromInteger => (
+                "passing argument {0} of '{1}' makes pointer from integer without a cast",
+                "passing argument {0} makes pointer from integer without a cast",
+            ),
+            AssignFault::QualifierDiscard => (
+                "passing argument {0} of '{1}' discards '{2}' qualifier from pointer target type",
+                "passing argument {0} discards '{2}' qualifier from pointer target type",
             ),
         };
-        diag::group_pedwarn_default(group, pos, &gettext_args(template, args));
+        let msg = match callee {
+            Some(f) => gettext_args(named, &[n, f, quals]),
+            None => gettext_args(unnamed, &[n, "", quals]),
+        };
+        match fault.group() {
+            None => diag::error(pos, &msg),
+            Some("pedantic") => diag::pedwarn(pos, &msg),
+            Some(group) => diag::group_pedwarn_default(group, pos, &msg),
+        }
     }
 
     /// C17 6.5.3.2p2: the operand of unary `*` shall have pointer type. A
@@ -724,17 +729,27 @@ impl Parser<'_> {
             return;
         };
         let returns_void = self.types.kind(declared) == TypeKind::Void;
+        // gcc's note on either points at the function.
+        let function = self
+            .enclosing_function
+            .name
+            .and_then(|name| self.linked_names.get(&name))
+            .map(|l| l.declared.pos);
         match value {
-            None if !returns_void => diag::permissive_error(
-                pos,
-                &gettext("'return' with no value in a function returning non-void"),
-            ),
+            None if !returns_void => {
+                diag::permissive_error(
+                    pos,
+                    &gettext("'return' with no value, in function returning non-void"),
+                );
+                diag::note(function.unwrap_or_default(), &gettext("declared here"));
+            }
             Some(e) if returns_void => {
                 if e.typ.is_some_and(|t| self.types.kind(t) != TypeKind::Void) {
                     diag::permissive_error(
                         e.pos,
-                        &gettext("'return' with a value in a function returning void"),
+                        &gettext("'return' with a value, in function returning void"),
                     );
+                    diag::note(function.unwrap_or_default(), &gettext("declared here"));
                 }
             }
             Some(e) => {
@@ -807,34 +822,70 @@ impl Parser<'_> {
             self.types.format_type(t, Some(self.idents)),
             self.types.format_type(v, Some(self.idents)),
         );
-        let template = match (site, fault.is_error()) {
-            (ConversionSite::Assignment, true) => {
+        use AssignFault::*;
+        use ConversionSite::*;
+        let template = match (site, fault) {
+            (Assignment, Incompatible) => {
                 "incompatible types when assigning to type '{0}' from type '{1}'"
             }
-            (ConversionSite::Initialization, true) => {
+            (Initialization, Incompatible) => {
                 "incompatible types when initializing type '{0}' using type '{1}'"
             }
-            (ConversionSite::Return, true) => {
+            (Return, Incompatible) => {
                 "incompatible types when returning type '{1}' but '{0}' was expected"
             }
-            // gcc words a signedness mismatch apart, naming no fault.
-            (ConversionSite::Assignment, false) if fault == AssignFault::PointerSign => {
+            (Assignment, PointerSign) => {
                 "pointer targets in assignment from '{1}' to '{0}' differ in signedness"
             }
-            (ConversionSite::Initialization, false) if fault == AssignFault::PointerSign => {
+            (Initialization, PointerSign) => {
                 "pointer targets in initialization of '{0}' from '{1}' differ in signedness"
             }
-            (ConversionSite::Return, false) if fault == AssignFault::PointerSign => {
+            (Return, PointerSign) => {
                 "pointer targets in returning '{1}' from a function with return type '{0}' \
                  differ in signedness"
             }
-            (ConversionSite::Assignment, false) => "assignment to '{0}' from '{1}' {2}",
-            (ConversionSite::Initialization, false) => "initialization of '{0}' from '{1}' {2}",
-            (ConversionSite::Return, false) => {
-                "returning '{1}' from a function with return type '{0}' {2}"
+            (Assignment, PointerMismatch) => {
+                "assignment to '{0}' from incompatible pointer type '{1}'"
             }
+            (Initialization, PointerMismatch) => {
+                "initialization of '{0}' from incompatible pointer type '{1}'"
+            }
+            (Return, PointerMismatch) => {
+                "returning '{1}' from a function with incompatible return type '{0}'"
+            }
+            (Assignment, QualifierDiscard) => {
+                "assignment discards '{2}' qualifier from pointer target type"
+            }
+            (Initialization, QualifierDiscard) => {
+                "initialization discards '{2}' qualifier from pointer target type"
+            }
+            (Return, QualifierDiscard) => {
+                "return discards '{2}' qualifier from pointer target type"
+            }
+            (Assignment, IntegerFromPointer) => {
+                "assignment to '{0}' from '{1}' makes integer from pointer without a cast"
+            }
+            (Initialization, IntegerFromPointer) => {
+                "initialization of '{0}' from '{1}' makes integer from pointer without a cast"
+            }
+            (Return, IntegerFromPointer) => {
+                "returning '{1}' from a function with return type '{0}' makes integer from \
+                 pointer without a cast"
+            }
+            (Assignment, PointerFromInteger) => {
+                "assignment to '{0}' from '{1}' makes pointer from integer without a cast"
+            }
+            (Initialization, PointerFromInteger) => {
+                "initialization of '{0}' from '{1}' makes pointer from integer without a cast"
+            }
+            (Return, PointerFromInteger) => {
+                "returning '{1}' from a function with return type '{0}' makes pointer from \
+                 integer without a cast"
+            }
+            (_, FunctionPointerVoid) => unreachable!("reported above"),
         };
-        let args: &[&str] = &[&t_name, &v_name, fault.describe()];
+        let quals = self.types.discarded_qualifiers(t, v);
+        let args: &[&str] = &[&t_name, &v_name, &quals];
         match fault.group() {
             Some(group) => {
                 diag::group_pedwarn_default(group, pos, &gettext_args(template, args));

@@ -84,12 +84,13 @@ fn c11_typedef_redefinition_needs_the_same_type() {
     compile_expect_error(
         "typedef_enum_vs_int",
         "enum E { A };\ntypedef enum E T;\ntypedef unsigned T;\n",
-        "typedef 'T' redefined with a different type ('enum E' then 'unsigned int')",
+        "error: conflicting types for 'T'; have 'unsigned int'\n\
+         typedef_enum_vs_int.c:2:16: note: previous declaration of 'T' with type 'T' {aka 'enum E'}",
     );
     compile_expect_error(
         "typedef_const_int",
         "typedef int T;\ntypedef const int T;\n",
-        "typedef 'T' redefined with a different type ('int' then 'const int')",
+        "conflicting types for 'T'; have 'const int'",
     );
     compile_expect_ok(
         "typedef_enum_repeated",

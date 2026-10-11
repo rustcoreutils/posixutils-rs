@@ -23,7 +23,7 @@ use super::parser::{
 };
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Linkage, Symbol, SymbolId};
+use crate::symbol::{DeclaredAt, Linkage, Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
 use crate::types::{ArrayExtent, Type, TypeId, TypeKind};
 use gettextrs::gettext;
@@ -242,8 +242,10 @@ impl Parser<'_> {
                 name: Some(name),
             },
         );
+        let outer_undeclared = std::mem::take(&mut self.undeclared_reported);
         let body = self.parse_block_stmt_no_scope();
         self.enclosing_function = outer;
+        self.undeclared_reported = outer_undeclared;
         body
     }
 
@@ -263,6 +265,8 @@ impl Parser<'_> {
             .pending_alignas
             .max(self.pending_declarator_align.take());
         self.pending_fn_attrs.align = self.pending_fn_attrs.align.max(declared_align);
+        // A function may carry every one of them.
+        self.pending_fn_attrs.function_only.clear();
         let pending = self.pending_fn_attrs.clone();
         let pos = self.current_pos();
         let seen = self.declared_fn_attrs.entry(name).or_default();
@@ -333,6 +337,16 @@ impl Parser<'_> {
     /// `typ` is the declarator's function type, already carrying `noreturn`;
     /// `attrs` the function's attributes accumulated over every declaration of
     /// its name.
+    /// Remember where the parameters of the function `name` are declared,
+    /// unless an earlier declaration has already said, as gcc's notes keep
+    /// the first that lists them.
+    pub(super) fn record_param_positions(&mut self, name: StringId, params: &[RawParam]) {
+        let recorded = self.param_positions.entry(name).or_default();
+        if recorded.is_empty() {
+            recorded.extend(params.iter().map(|p| p.pos));
+        }
+    }
+
     pub(super) fn define_function(
         &mut self,
         specs: &DeclSpecs,
@@ -344,6 +358,7 @@ impl Parser<'_> {
     ) -> ParseResult<FunctionDef> {
         super::target_attr::resolve_target_conflict(&mut attrs, pos);
         let mut params = params.unwrap_or_default();
+        self.record_param_positions(name, &params);
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
         self.check_parameters_complete(&params, pos);
         self.check_identifier_list_against_prototype(name, typ, &params, pos);
@@ -374,6 +389,7 @@ impl Parser<'_> {
             name,
             typ,
             pos,
+            name_pos: pos,
             storage: specs.storage_class,
             scope: DeclScope::File,
             defines: true,
@@ -387,7 +403,9 @@ impl Parser<'_> {
         // is checked against the definition's own type.
         let symbol_typ = self.composite_with_prior_declaration(name, typ, true);
         let _ = self.symbols.declare(
-            Symbol::function(name, symbol_typ, self.symbols.depth()).with_linkage(linkage),
+            Symbol::function(name, symbol_typ, self.symbols.depth())
+                .with_linkage(linkage)
+                .declared_at(DeclaredAt::at(pos, true)),
         );
         // A weak definition may be replaced at link time, so gcc leaves the
         // builtin in place of it; so does this.
@@ -598,9 +616,11 @@ impl Parser<'_> {
                     continue;
                 };
                 let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-                diag::pedwarn_default(
+                diag::group_pedwarn_default_args(
+                    "implicit-int",
                     self.current_pos(),
-                    &format!("type of '{spelled}' defaults to 'int'"),
+                    "type of '{0}' defaults to 'int'",
+                    &[&spelled],
                 );
             }
         }

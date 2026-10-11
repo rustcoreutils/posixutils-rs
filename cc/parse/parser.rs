@@ -56,6 +56,9 @@ pub type ParseResult<T> = Result<T, ParseError>;
 pub(crate) struct RawParam {
     /// Parameter name; None for an unnamed parameter such as `void f(int)`.
     pub(crate) name: Option<StringId>,
+    /// Where it is declared, as gcc's note about an argument passed to it
+    /// points: its name, or the start of an unnamed one's specifiers.
+    pub(crate) pos: Position,
     /// Parameter type, already adjusted from array/function to pointer.
     pub(crate) typ: TypeId,
     /// Run-time size expressions for a variably-modified element type; see
@@ -326,6 +329,15 @@ pub struct Parser<'a> {
     /// Every identifier with linkage declared so far, in any scope; see
     /// [`super::linkage`].
     pub(super) linked_names: std::collections::HashMap<StringId, super::linkage::LinkedName>,
+    /// Where each parameter of a function's first prototype is declared,
+    /// by the function's name, for the note on an argument that does not
+    /// suit its parameter.
+    pub(super) param_positions: std::collections::HashMap<StringId, Vec<Position>>,
+    /// The undeclared identifiers reported in the function being parsed, or
+    /// outside every function, each reported once there, as gcc does.
+    pub(super) undeclared_reported: std::collections::HashSet<StringId>,
+    /// Whether gcc's note saying so has been given; it is given once.
+    pub(super) undeclared_noted: bool,
     /// How many operands that are never evaluated enclose the expression
     /// being parsed -- of `sizeof`, `_Alignof`, `typeof`, the controlling
     /// expression of `_Generic`, an arm a constant condition discards. gcc
@@ -427,6 +439,9 @@ impl<'a> Parser<'a> {
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             defined_functions: std::collections::HashSet::new(),
             linked_names: std::collections::HashMap::new(),
+            param_positions: std::collections::HashMap::new(),
+            undeclared_reported: std::collections::HashSet::new(),
+            undeclared_noted: false,
             unevaluated: 0,
             last_tag_reference: false,
             param_list_depth: 0,
@@ -515,7 +530,9 @@ impl<'a> Parser<'a> {
                 None => diag::group_warning(
                     crate::token::preprocess::PRAGMAS_WARNING,
                     self.current_pos(),
-                    &gettext("'#pragma pack(pop)' with no matching push"),
+                    &gettext(
+                        "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'",
+                    ),
                 ),
             },
         }

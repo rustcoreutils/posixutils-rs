@@ -393,12 +393,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             let Some((pos, shown)) = at(name) else {
                 continue;
             };
-            let owner_shown = at(owner).map_or_else(|| owner.clone(), |(_, s)| s);
+            let (owner_pos, owner_shown) =
+                at(owner).unwrap_or_else(|| (Position::default(), owner.clone()));
             crate::diag::error_args(
                 pos,
                 "'{0}' causes a section type conflict with '{1}'",
                 &[&shown, &owner_shown],
             );
+            crate::diag::note_args(owner_pos, "'{0}' was declared here", &[&owner_shown]);
         }
     }
 

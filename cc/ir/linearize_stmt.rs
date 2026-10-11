@@ -27,6 +27,7 @@ use crate::parse::expr_check::register_address_refusal;
 use crate::symbol::SymbolId;
 use crate::token::lexer::payload_bytes;
 use crate::types::TypeTable;
+use gettextrs::gettext;
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
@@ -1717,9 +1718,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// The body is walked as any statement is, compound or not.
     pub(crate) fn collect_switch_cases(&self, body: &Stmt, conv: CaseConv) -> (CaseSet, bool) {
         let mut case_values = CaseSet::new(conv);
-        let mut has_default = false;
-        self.collect_cases_from_stmt(body, &mut case_values, &mut has_default);
-        (case_values, has_default)
+        let mut default = None;
+        self.collect_cases_from_stmt(body, &mut case_values, &mut default);
+        (case_values, default.is_some())
     }
 
     /// The block every computed `goto` in this function branches through,
@@ -1853,6 +1854,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             let (label, _, pos) = &w.labels[i];
             let spelled = self.strings.get(label.name).to_string();
             crate::diag::error_args(*pos, "duplicate label '{0}'", &[&spelled]);
+            // gcc gives a label the type `void` in its note.
+            if let Some(&first) = first_label.get(label) {
+                crate::diag::note_args(
+                    w.labels[first].2,
+                    "previous definition of '{0}' with type 'void'",
+                    &[&spelled],
+                );
+            }
         }
 
         // A `goto` is illegal exactly when its label sits inside a scope the
@@ -1863,14 +1872,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             let Some(&i) = first_label.get(&jump.label) else {
                 continue;
             };
-            let (_, to, label_pos) = &w.labels[i];
+            let (label, to, label_pos) = &w.labels[i];
             let pos = jump.pos.unwrap_or(*label_pos);
             for id in w.entered(&jump.from, to) {
-                self.report_protected_jump(&w.scopes[id], false, pos);
+                let label = Some((label.name, *label_pos));
+                self.report_protected_jump(&w.scopes[id], label, pos);
             }
         }
         for (id, pos) in w.bad_cases() {
-            self.report_protected_jump(&w.scopes[id], true, pos);
+            self.report_protected_jump(&w.scopes[id], None, pos);
         }
 
         for (pos, what) in &w.stray_jumps {
@@ -1891,18 +1901,33 @@ impl<'a> super::linearize::Linearizer<'a> {
         LabelScopes { written, cleanups }
     }
 
-    /// Report a jump into `scope`, by a `switch` reaching a label inside it
-    /// or by a `goto`.
-    fn report_protected_jump(&self, scope: &JumpScope, by_switch: bool, pos: Position) {
+    /// Report a jump into `scope`, by a `goto` to `label` (its name and
+    /// where it is written) or, with none, by a `switch` reaching a label
+    /// inside it.
+    fn report_protected_jump(
+        &self,
+        scope: &JumpScope,
+        label: Option<(crate::strings::StringId, Position)>,
+        pos: Position,
+    ) {
+        let by_switch = label.is_none();
         match scope {
             JumpScope::VariablyModified(symbol) => {
-                let what = if by_switch { "switch jump" } else { "jump" };
-                let name = self.strings.get(self.symbols.get(*symbol).name);
-                error(
-                    pos,
-                    &format!(
-                        "{what} into the scope of '{name}', which has a variably modified type",
-                    ),
+                let message = if by_switch {
+                    "switch jumps into scope of identifier with variably modified type"
+                } else {
+                    "jump into scope of identifier with variably modified type"
+                };
+                error(pos, &gettext(message));
+                if let Some((name, at)) = label {
+                    let spelled = self.strings.get(name);
+                    crate::diag::note_args(at, "label '{0}' defined here", &[spelled]);
+                }
+                let symbol = self.symbols.get(*symbol);
+                crate::diag::note_args(
+                    symbol.declared.pos,
+                    "'{0}' declared here",
+                    &[self.strings.get(symbol.name)],
                 );
             }
             // Entering one is legal: gcc accepts it in silence, and the
@@ -2033,36 +2058,38 @@ impl<'a> super::linearize::Linearizer<'a> {
             crate::diag::warning(expr.pos, "empty range specified");
             return;
         }
-        if let Some((lo2, hi2)) = case_values.overlap(lo, hi) {
-            let what = if lo == hi && lo2 == hi2 {
-                format!("duplicate case value '{}' in switch", lo)
-            } else {
-                format!(
-                    "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
-                    lo, hi, lo2, hi2
-                )
+        // gcc's words depend on whether the label just written is a range.
+        if let Some((lo2, _)) = case_values.overlap(lo, hi) {
+            let (what, earlier) = match high {
+                Some(_) => (
+                    "duplicate (or overlapping) case value",
+                    "this is the first entry overlapping that value",
+                ),
+                None => ("duplicate case value", "previously used here"),
             };
-            error(expr.pos, &what);
+            error(expr.pos, &gettext(what));
+            crate::diag::note(case_values.written_at(lo2), &gettext(earlier));
         }
-        case_values.insert(lo, hi);
+        case_values.insert(lo, hi, expr.pos);
     }
 
-    fn collect_default_label(&self, has_default: &mut bool) {
-        // C99 6.8.4.2p3: at most one default label per switch.
-        if *has_default {
-            error(
-                self.current_pos.unwrap_or_default(),
-                "multiple default labels in one switch",
-            );
+    /// C99 6.8.4.2p3: at most one default label per switch. `first` is
+    /// where the first one was written.
+    fn collect_default_label(&self, pos: Position, first: &mut Option<Position>) {
+        match *first {
+            Some(earlier) => {
+                error(pos, &gettext("multiple default labels in one switch"));
+                crate::diag::note(earlier, &gettext("this is the first default label"));
+            }
+            None => *first = Some(pos),
         }
-        *has_default = true;
     }
 
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
         case_values: &mut CaseSet,
-        has_default: &mut bool,
+        has_default: &mut Option<Position>,
     ) {
         match stmt {
             Stmt::Labeled { labels, stmt } => {
@@ -2071,7 +2098,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         Label::Case(expr, high) => {
                             self.collect_case_label(expr, high.as_ref(), case_values)
                         }
-                        Label::Default(_) => self.collect_default_label(has_default),
+                        Label::Default(pos) => self.collect_default_label(*pos, has_default),
                         Label::Named { .. } => {}
                     }
                 }
@@ -4197,7 +4224,8 @@ pub(crate) struct CaseSet {
     /// the labels were written.
     ranges: Vec<(i128, i128)>,
     /// Each range by its low end, as an order-preserving key, to its high end.
-    by_lo: std::collections::BTreeMap<i128, (i128, i128, i128)>,
+    /// And where it was written, for the note on a duplicate.
+    by_lo: std::collections::BTreeMap<i128, (i128, i128, i128, Position)>,
     /// What every endpoint entering the set is converted by.
     conv: CaseConv,
 }
@@ -4231,27 +4259,46 @@ impl CaseSet {
         }
     }
 
-    /// An earlier range sharing a value with `lo..=hi`, if any, as converted.
+    /// The lowest earlier range sharing a value with `lo..=hi`, if any, as
+    /// converted: the one gcc's note calls the first entry overlapping it.
     ///
-    /// The ranges recorded are disjoint -- an overlap is an error -- so the
-    /// only candidate is the one starting last at or before `hi`.
+    /// The ranges recorded are disjoint -- an overlap is an error -- so it is
+    /// the one holding `lo`, or else the first starting after `lo` but at
+    /// or before `hi`.
     fn overlap(&self, lo: i128, hi: i128) -> Option<(i128, i128)> {
         let (lo, hi) = (self.conv.convert(lo), self.conv.convert(hi));
-        let (_, &(hi_key, lo2, hi2)) = self.by_lo.range(..=self.key(hi)).next_back()?;
-        (hi_key >= self.key(lo)).then_some((lo2, hi2))
+        let (lo_key, hi_key) = (self.key(lo), self.key(hi));
+        if let Some((_, &(end, lo2, hi2, _))) = self.by_lo.range(..=lo_key).next_back() {
+            if end >= lo_key {
+                return Some((lo2, hi2));
+            }
+        }
+        let (_, &(_, lo2, hi2, _)) = self.by_lo.range(lo_key..=hi_key).next()?;
+        Some((lo2, hi2))
     }
 
-    fn insert(&mut self, lo: i128, hi: i128) {
+    fn insert(&mut self, lo: i128, hi: i128, pos: Position) {
         let (lo, hi) = (self.conv.convert(lo), self.conv.convert(hi));
         self.ranges.push((lo, hi));
         let (lo_key, hi_key) = (self.key(lo), self.key(hi));
-        self.by_lo.insert(lo_key, (hi_key, lo, hi));
+        // A duplicate, already reported, leaves the first in place, which
+        // is the one a later duplicate's note names.
+        self.by_lo.entry(lo_key).or_insert((hi_key, lo, hi, pos));
+    }
+
+    /// Where the range starting at `lo`, as [`Self::overlap`] answers it,
+    /// was written.
+    fn written_at(&self, lo: i128) -> Position {
+        self.by_lo
+            .get(&self.key(lo))
+            .map_or_else(Position::default, |&(.., pos)| pos)
     }
 }
 
 #[cfg(test)]
 mod case_set_tests {
     use super::{CaseConv, CaseIndex, CaseSet};
+    use crate::diag::Position;
 
     /// A 128-bit conversion is the identity, which is what the ranges below
     /// want: they are about ordering, not about width.
@@ -4333,11 +4380,11 @@ mod case_set_tests {
     fn the_index_finds_a_label_by_its_unconverted_constant() {
         let conv = CaseConv::new(32, false);
         let mut set = CaseSet::new(conv);
-        set.insert(0, 0);
-        set.insert(-1, -1);
-        set.insert(70000, 70005);
+        set.insert(0, 0, Position::default());
+        set.insert(-1, -1, Position::default());
+        set.insert(70000, 70005, Position::default());
         // Stored converted, and 2^32+3 is 3 in an `int` switch.
-        set.insert(4294967299, 4294967299);
+        set.insert(4294967299, 4294967299, Position::default());
         assert_eq!(set.ranges(), [(0, 0), (-1, -1), (70000, 70005), (3, 3)]);
 
         let index = CaseIndex::of(&set);
@@ -4352,7 +4399,7 @@ mod case_set_tests {
         // And a label the controlling type sees as negative.
         let uconv = CaseConv::new(32, true);
         let mut uset = CaseSet::new(uconv);
-        uset.insert(-1, -1);
+        uset.insert(-1, -1, Position::default());
         assert_eq!(uset.ranges(), [(4294967295, 4294967295)]);
         let uindex = CaseIndex::of(&uset);
         assert_eq!(uindex.lookup(-1, -1), Some(0));
@@ -4364,7 +4411,7 @@ mod case_set_tests {
     #[test]
     fn overlap_sees_the_converted_values() {
         let mut set = CaseSet::new(CaseConv::new(32, false));
-        set.insert(0, 0);
+        set.insert(0, 0, Position::default());
         assert_eq!(set.overlap(4294967296, 4294967296), Some((0, 0)));
         assert_eq!(set.overlap(1, 1), None);
     }
@@ -4372,9 +4419,9 @@ mod case_set_tests {
     #[test]
     fn overlap_finds_the_range_sharing_a_value() {
         let mut set = CaseSet::new(wide(false));
-        set.insert(-10, -5);
-        set.insert(0, 0);
-        set.insert(10, 20);
+        set.insert(-10, -5, Position::default());
+        set.insert(0, 0, Position::default());
+        set.insert(10, 20, Position::default());
         assert_eq!(set.overlap(-7, -7), Some((-10, -5)));
         assert_eq!(set.overlap(-4, -1), None);
         assert_eq!(set.overlap(-1, 1), Some((0, 0)));
@@ -4385,6 +4432,25 @@ mod case_set_tests {
         assert_eq!(set.ranges, [(-10, -5), (0, 0), (10, 20)]);
     }
 
+    /// A range overlapping several earlier labels answers the lowest -- gcc's
+    /// "first entry overlapping that value" -- and a duplicate, once
+    /// reported, leaves the first label's place for the next one's note.
+    #[test]
+    fn overlap_answers_the_first_entry() {
+        let at = |line| Position::new(0, line, 1);
+        let mut set = CaseSet::new(wide(false));
+        set.insert(1, 1, at(1));
+        set.insert(2, 2, at(2));
+        set.insert(5, 9, at(3));
+        assert_eq!(set.overlap(0, 2), Some((1, 1)));
+        assert_eq!(set.overlap(2, 6), Some((2, 2)));
+        assert_eq!(set.overlap(3, 7), Some((5, 9)));
+        assert_eq!(set.overlap(7, 7), Some((5, 9)));
+        set.insert(1, 1, at(4));
+        assert_eq!(set.written_at(1), at(1));
+        assert_eq!(set.ranges().len(), 4);
+    }
+
     /// Unsigned order: a value above `i64::MAX`, carried in an `i128` as a
     /// negative 128-bit pattern for `unsigned __int128`, still sorts above
     /// every small one.
@@ -4392,8 +4458,8 @@ mod case_set_tests {
     fn overlap_orders_by_the_switch_type_signedness() {
         let big = u128::MAX as i128; // -1 as i128, the largest unsigned value
         let mut set = CaseSet::new(wide(true));
-        set.insert(1, 5);
-        set.insert(big - 10, big);
+        set.insert(1, 5, Position::default());
+        set.insert(big - 10, big, Position::default());
         assert_eq!(set.overlap(big - 3, big - 3), Some((big - 10, big)));
         assert_eq!(set.overlap(6, 100), None);
         assert_eq!(set.overlap(0, 1), Some((1, 5)));

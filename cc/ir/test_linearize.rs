@@ -1554,10 +1554,10 @@ fn test_alias_declarations_become_symbol_aliases() {
                extern int b[4];\n\
                int a[4];\n\
                static int s;\n\
-               static int t __attribute__((weak, alias(\"s\")));\n\
+               static int t __attribute__((alias(\"s\")));\n\
                int f(void) { return 0; }\n\
                int g(void) __attribute__((alias(\"f\"), visibility(\"hidden\")));\n\
-               int h(void) __attribute__((alias(\"g\")));\n\
+               int h(void) __attribute__((weak, alias(\"g\")));\n\
                int use(void) { return b[0] + g(); }\n";
     // An ELF target: Mach-O has no aliases, and a Darwin host would reject
     // every one of these before recording it.
@@ -1577,9 +1577,9 @@ fn test_alias_declarations_become_symbol_aliases() {
         module.aliases,
         [
             alias("b", "a", false, false, None),
-            alias("t", "s", true, true, None),
+            alias("t", "s", true, false, None),
             alias("g", "f", false, false, Some("hidden")),
-            alias("h", "g", false, false, None),
+            alias("h", "g", false, true, None),
         ]
     );
     for name in ["b", "t", "g", "h"] {
@@ -1656,9 +1656,9 @@ fn test_ifunc_declarations_become_indirect_functions() {
     use crate::parse::ast::AliasForm;
     let src = "static int impl(int x) { return x; }\n\
                static void *res(void) { return (void *)impl; }\n\
-               int f(int) __attribute__((ifunc(\"res\")));\n\
+               int f(int) __attribute__((ifunc(\"res\"), visibility(\"hidden\")));\n\
                int f(int);\n\
-               static int g(int) __attribute__((ifunc(\"res\"), visibility(\"hidden\")));\n\
+               static int g(int) __attribute__((ifunc(\"res\")));\n\
                int use(void) { return f(1) + g(2); }\n";
     let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
     let module = linearize_source(src, &target);
@@ -1672,7 +1672,7 @@ fn test_ifunc_declarations_become_indirect_functions() {
     };
     assert_eq!(
         module.aliases,
-        [ifunc("f", false, None), ifunc("g", true, Some("hidden"))]
+        [ifunc("f", false, Some("hidden")), ifunc("g", true, None)]
     );
     for name in ["f", "g"] {
         assert!(

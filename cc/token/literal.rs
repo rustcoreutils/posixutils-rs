@@ -160,7 +160,7 @@ pub(crate) fn check_elements(elements: &[Escaped], unit_bits: u32, pos: Position
                 );
             }
             Escaped::EmptyHex => crate::diag::error(pos, "\\x used with no following hex digits"),
-            Escaped::NonIso { letter, .. } => crate::diag::pedwarn_args(
+            Escaped::NonIso { letter, .. } => crate::diag::cpp_pedwarn_args(
                 pos,
                 "non-ISO-standard escape sequence, '\\{0}'",
                 &[&letter.to_string()],

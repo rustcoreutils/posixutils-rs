@@ -46,6 +46,25 @@ rather than a missed optimization. `pure` and `const` are stricter than gcc:
 written among the specifiers they apply to the first declarator only, since
 wrongly believing a callee writes nothing is a miscompile at the call site.
 
+### On the wrong kind of declaration
+
+An attribute written where it cannot apply is dropped with gcc 13's
+diagnostic, in the `-Wattributes` group:
+
+| Written | Diagnostic |
+|---------|------------|
+| A function's own attribute (`cold`, `hot`, `noinline`, `always_inline`, `pure`, `constructor`, `destructor`, `leaf`, `noclone`, `gnu_inline`, `artificial`, `optimize`, `target`, `target_clones`, `stack_protect`, `no_stack_protector`, `no_sanitize_*`, `noreturn`, `returns_twice`, `nothrow`) on anything but a function | "'X' attribute ignored" |
+| `const` on anything but a function or a pointer to one, or on a typedef | "'const' attribute ignored" |
+| `malloc` on anything but a function | "'malloc' attribute ignored; valid only for functions" |
+| A function type's attribute (`nonnull`, `format`, `warn_unused_result`, `sentinel`, `returns_nonnull`, `alloc_size`, `alloc_align`, `access`) on anything but a function, a pointer to one, or a typedef of either | "'X' attribute only applies to function types" |
+| `no_instrument_function` on anything but a function | an error |
+| `weak` on a name without external linkage | an error, "weak declaration of 'x' must be public" |
+| `visibility` on a name without external linkage | "'visibility' attribute ignored" |
+| `alias` on a name with no linkage; `used` on an automatic object | "'X' attribute ignored" |
+| `section` on an automatic object | an error |
+| `weak`, `used`, `visibility`, `alias` on a typedef, a member or a parameter | "'X' attribute ignored" (`used` on a typedef in silence) |
+| `section` on a typedef, a member or a parameter | an error, "section attribute not allowed for 'x'" |
+
 ### Arguments
 
 An argument is read as gcc reads it: an optional leading bare name (`printf` in

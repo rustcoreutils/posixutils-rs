@@ -16,7 +16,7 @@ use super::parser::{
 };
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::Symbol;
+use crate::symbol::{DeclaredAt, Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType};
 use crate::types::{ArrayExtent, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -664,7 +664,7 @@ impl Parser<'_> {
                 if params.is_empty() {
                     diag::pedwarn(
                         self.current_pos(),
-                        &gettext("ISO C requires a named argument before '...'"),
+                        &gettext("ISO C requires a named argument before '...' before C2X"),
                     );
                 }
                 self.advance();
@@ -696,6 +696,7 @@ impl Parser<'_> {
             // - Arrays: int arr[], int arr[10]
             let ParsedDeclarator {
                 name: param_name,
+                name_pos: param_name_pos,
                 typ: mut typ_id,
                 vla: mut vla_sizes,
                 ..
@@ -707,7 +708,7 @@ impl Parser<'_> {
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
-            self.drop_pending_cleanup(param_pos);
+            self.drop_pending_symbol_attrs(param_name, param_pos);
 
             // A parameter's type attributes are the parameter's, and are
             // applied before the array-to-pointer adjustment below so a mode
@@ -825,6 +826,13 @@ impl Parser<'_> {
 
             params.push(RawParam {
                 name: name_opt,
+                // gcc's place for a parameter: its name, or for an unnamed
+                // one the start of its specifiers.
+                pos: if name_opt.is_some() {
+                    param_name_pos
+                } else {
+                    param_pos
+                },
                 typ: typ_id,
                 vm_dims,
                 discarded_dims,
@@ -835,7 +843,8 @@ impl Parser<'_> {
             // (C99 6.9.1p9: parameters are in scope for VLA sizes)
             if let Some(name) = name_opt {
                 let sym = Symbol::parameter(name, typ_id, self.symbols.depth())
-                    .with_variably_modified_array(!vla_sizes.is_empty());
+                    .with_variably_modified_array(!vla_sizes.is_empty())
+                    .declared_at(DeclaredAt::at(param_name_pos, true));
                 // 6.9.1p5: no two parameters may share a name. `declare`
                 // reports it and the `Err` was dropped, leaving the second
                 // parameter with no symbol at all -- so the function compiled
@@ -849,10 +858,13 @@ impl Parser<'_> {
                     Err(_) => {
                         let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
                         diag::error_args(
-                            self.current_pos(),
+                            param_name_pos,
                             "redefinition of parameter '{0}'",
                             &[&spelled],
                         );
+                        if let Some(first) = self.symbols.lookup_id(name, Namespace::Ordinary) {
+                            self.note_previous_symbol(first);
+                        }
                     }
                 }
             }

@@ -52,7 +52,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("bool-compare", Accepted),
     ("bool-operation", Accepted),
     ("builtin-declaration-mismatch", Accepted),
-    ("builtin-macro-redefined", Accepted),
+    ("builtin-macro-redefined", Implemented),
     ("c++-compat", Accepted),
     // c17's own: the "-std= ignored" driver warning.
     ("c17-dialect", Implemented),
@@ -88,7 +88,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("duplicated-branches", Accepted),
     ("duplicated-cond", Accepted),
     ("empty-body", Accepted),
-    ("endif-labels", Accepted),
+    ("endif-labels", Implemented),
     ("enum-compare", Accepted),
     ("enum-conversion", Accepted),
     ("enum-int-mismatch", Accepted),
@@ -517,9 +517,11 @@ mod tests {
     fn implemented_groups_are_in_the_table() {
         for name in [
             "attributes",
+            "builtin-macro-redefined",
             "c17-dialect",
             "cpp",
             "discarded-qualifiers",
+            "endif-labels",
             "incompatible-pointer-types",
             "int-conversion",
             "pointer-sign",

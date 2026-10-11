@@ -1083,19 +1083,6 @@ impl AssignFault {
         self.group().is_none()
     }
 
-    /// The clause naming what went wrong, as gcc words it.
-    pub fn describe(self) -> &'static str {
-        match self {
-            AssignFault::Incompatible => "incompatible types",
-            AssignFault::IntegerFromPointer => "makes integer from pointer without a cast",
-            AssignFault::PointerFromInteger => "makes pointer from integer without a cast",
-            AssignFault::PointerMismatch => "incompatible pointer type",
-            AssignFault::PointerSign => "pointer targets differ in signedness",
-            AssignFault::QualifierDiscard => "discards a qualifier from the pointer target type",
-            AssignFault::FunctionPointerVoid => "converts between a function pointer and 'void *'",
-        }
-    }
-
     /// The warning group of a fault that is a warning, as gcc names it:
     /// the one `-Wno-<name>` silences and `-Werror=<name>` makes an error.
     /// `None` for the one that is an error.
@@ -3020,6 +3007,28 @@ impl TypeTable {
     /// that wanted "is this `const`?" had to mask them off itself.
     pub fn qualifiers(&self, id: TypeId) -> TypeModifiers {
         self.modifiers(id) & Type::QUALIFIERS
+    }
+
+    /// The qualifiers of what `value` points to that what `target` points
+    /// to lacks -- what an [`AssignFault::QualifierDiscard`] discards --
+    /// spelled as gcc spells them: `const volatile`.
+    pub fn discarded_qualifiers(&self, target: TypeId, value: TypeId) -> String {
+        let pointee_quals = |t: TypeId| {
+            self.base_type(t)
+                .map_or(TypeModifiers::empty(), |p| self.qualifiers(p))
+        };
+        let lost = pointee_quals(value) - pointee_quals(target);
+        [
+            (TypeModifiers::CONST, "const"),
+            (TypeModifiers::VOLATILE, "volatile"),
+            (TypeModifiers::RESTRICT, "restrict"),
+            (TypeModifiers::ATOMIC, "_Atomic"),
+        ]
+        .iter()
+        .filter(|(bit, _)| lost.contains(*bit))
+        .map(|&(_, word)| word)
+        .collect::<Vec<_>>()
+        .join(" ")
     }
 
     /// The version of `id` qualified with `quals` -- the "so-qualified

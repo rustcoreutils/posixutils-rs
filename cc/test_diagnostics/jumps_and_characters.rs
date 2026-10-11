@@ -9,15 +9,16 @@ use crate::test_compile::{compile, compile_expect_error, compile_expect_ok};
 /// whatever the stack held -- so 6.8.6.1p1 forbids the jump outright. c17
 /// accepted every form of it.
 ///
-/// The diagnostic names the declaration that would have been skipped, where
-/// gcc names only the kind of type; `Stmt::Goto` carries no position, and the
-/// declaration is the more useful thing to point at anyway.
+/// The diagnostic is gcc's, which names only the kind of type; its notes
+/// name the label and the declaration that would have been skipped.
 #[test]
 fn diagnostics_jump_into_variably_modified_scope_is_rejected() {
     compile_expect_error(
         "goto_into_vla",
         "int main(void){int n=4; goto L; { int a[n]; L: return a[0]; } }\n",
-        "jump into the scope of 'a'",
+        "error: jump into scope of identifier with variably modified type\n\
+         goto_into_vla.c:1:45: note: label 'L' defined here\n\
+         goto_into_vla.c:1:39: note: 'a' declared here\n",
     );
     // The scope runs to the end of the block, so a label after the
     // declaration is inside it even without braces of its own.
@@ -30,7 +31,7 @@ fn diagnostics_jump_into_variably_modified_scope_is_rejected() {
     compile_expect_error(
         "goto_into_ptr_to_vla",
         "int main(void){int n=4; goto L; { int (*p)[n]; L: return p != 0; } }\n",
-        "jump into the scope of 'p'",
+        "note: 'p' declared here",
     );
     // A declaration in a for-init scopes over the body.
     compile_expect_error(
@@ -43,7 +44,7 @@ fn diagnostics_jump_into_variably_modified_scope_is_rejected() {
     compile_expect_error(
         "switch_into_vla",
         "int main(void){int n=4,k=1; switch(k){ int a[n]; case 1: return a[0]; } return 0; }\n",
-        "switch jump into the scope of 'a'",
+        "switch jumps into scope of identifier with variably modified type",
     );
 }
 
@@ -244,7 +245,7 @@ fn diagnostics_jump_rules_reach_inside_statement_expressions() {
     );
     assert_eq!(errors.len(), 2, "{errors:?}");
     assert!(
-        errors[0].contains("jump into the scope of 'a'"),
+        errors[0].contains("jump into scope of identifier with variably modified type"),
         "{errors:?}"
     );
     assert!(

@@ -112,6 +112,7 @@ fn apply_flags(flags: &[&str]) -> Options {
         match flag {
             "-w" => diag::suppress_warnings(),
             "-fpermissive" => diag::set_permissive(),
+            "-fno-diagnostics-show-option" => diag::set_show_option(false),
             "-fno-builtin" => crate::builtins::set_no_builtin(),
             "-fgnu89-inline" => crate::builtins::set_gnu89_inline(true),
             "-g" => o.debug = true,
@@ -224,6 +225,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             dump_macros: false,
             keep_definitions: false,
             collect_dependencies: false,
+            preprocess_only: false,
             optimization: o.optimization,
             position,
             isa: target::X86Isa::from_flags(&o.mflags),

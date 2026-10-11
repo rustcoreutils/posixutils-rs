@@ -289,7 +289,7 @@ fn diagnostics_jump_rules_reach_inside_statement_expressions() {
     );
     assert_eq!(errors.len(), 2, "{errors:?}");
     assert!(
-        errors[0].contains("jump into the scope of 'a'"),
+        errors[0].contains("jump into scope of identifier with variably modified type"),
         "{errors:?}"
     );
     assert!(

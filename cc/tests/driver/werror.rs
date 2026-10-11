@@ -35,7 +35,7 @@ fn compile_in(dir: &Path, path: &Path, flags: &[&str]) -> crate::common::C17Run 
 /// gcc's `-Wincompatible-pointer-types` probe, the one configure scripts use.
 const INCOMPATIBLE: &str = "char c; int *g(void){return &c;}\n";
 const INCOMPATIBLE_MSG: &str =
-    "returning 'char *' from a function with return type 'int *' incompatible pointer type";
+    "returning 'char *' from a function with incompatible return type 'int *'";
 
 #[test]
 fn werror_fails_the_compile() {
@@ -44,9 +44,9 @@ fn werror_fails_the_compile() {
     let plain = compile_in(dir.path(), &path, &[]);
     assert!(plain.success, "{}", plain.stderr);
     assert!(
-        plain
-            .stderr
-            .contains(&format!("warning: {INCOMPATIBLE_MSG}\n")),
+        plain.stderr.contains(&format!(
+            "warning: {INCOMPATIBLE_MSG} [-Wincompatible-pointer-types]\n"
+        )),
         "{}",
         plain.stderr
     );
@@ -125,7 +125,8 @@ fn pointer_sign_is_wall_only() {
     let wall = compile_in(dir.path(), &path, &["-Wall"]);
     assert!(wall.success, "{}", wall.stderr);
     assert!(
-        wall.stderr.contains(&format!("2:21: warning: {msg}\n")),
+        wall.stderr
+            .contains(&format!("2:21: warning: {msg} [-Wpointer-sign]\n")),
         "{}",
         wall.stderr
     );
@@ -294,8 +295,10 @@ fn frame_larger_than_fails_under_werror() {
     let warn = compile_in(dir.path(), &path, &["-O2", "-Wframe-larger-than=2048"]);
     assert!(warn.success, "{}", warn.stderr);
     assert!(
-        warn.stderr
-            .contains("2:1: warning: the frame size of 4096 bytes is larger than 2048 bytes\n"),
+        warn.stderr.contains(
+            "2:1: warning: the frame size of 4096 bytes is larger than 2048 bytes \
+                 [-Wframe-larger-than=]\n"
+        ),
         "{}",
         warn.stderr
     );

@@ -286,12 +286,12 @@ fn diagnostics_variably_modified_jumps_point_at_the_jump() {
     compile_expect_error(
         "vm_goto_position",
         "int main(void){\n  int n = 4;\n  goto L;\n  {\n    int a[n];\n    L: return a[0];\n  }\n}\n",
-        ":3:3: error: jump into the scope of 'a'",
+        ":3:3: error: jump into scope of identifier with variably modified type",
     );
     compile_expect_error(
         "vm_switch_position",
         "int main(void){\n  int n=4, k=1;\n  switch (k) {\n    int a[n];\n    case 1:\n      return a[0];\n  }\n  return 0;\n}\n",
-        ":5:10: error: switch jump into the scope of 'a'",
+        ":5:10: error: switch jumps into scope of identifier with variably modified type",
     );
     compile_expect_error(
         "undefined_label_position",

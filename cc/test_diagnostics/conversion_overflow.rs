@@ -41,26 +41,26 @@ fn diagnostics_static_initializer_conversion_overflow_warns() {
     assert_eq!(
         compile_warnings("cvo_static", src, &[X86_64]),
         [
-            "1:10: overflow in conversion from 'int' to 'char' changes value from '300' to '44'",
-            "2:20: unsigned conversion from 'int' to 'unsigned char' changes value from '300' to '44'",
-            "3:11: overflow in conversion from 'int' to 'short int' changes value from '70000' to '4464'",
-            "4:21: unsigned conversion from 'int' to 'short unsigned int' changes value from '70000' to '4464'",
-            "5:59: overflow in conversion from 'int' to 'char' changes value from '300' to '44'",
-            "5:64: overflow in conversion from 'int' to 'signed char:3' changes value from '9' to '1'",
-            "5:67: unsigned conversion from 'int' to 'unsigned char:2' changes value from '5' to '1'",
-            "6:20: overflow in conversion from 'int' to 'char' changes value from '256' to '0'",
-            "6:25: overflow in conversion from 'int' to 'char' changes value from '1000' to '-24'",
-            "7:9: overflow in conversion from 'long long int' to 'int' changes value from '4294967297' to '1'",
-            "8:15: unsigned conversion from 'long long int' to 'unsigned int' changes value from '4294967296' to '0'",
-            "9:18: overflow in conversion from 'int' to 'signed char' changes value from '-129' to '127'",
-            "10:32: overflow in conversion from 'int' to 'char' changes value from '300' to '44'",
-            "11:79: overflow in conversion from 'int' to 'short int:10' changes value from '2000' to '-48'",
-            "11:85: unsigned conversion from 'int' to 'unsigned int:20' changes value from '2000000' to '951424'",
-            "11:94: overflow in conversion from 'long long int' to 'long int:40' changes value from '2000000000000' to '-199023255552'",
-            "11:111: overflow in conversion from 'long long int' to 'int' changes value from '5000000000' to '705032704'",
-            "13:12: unsigned conversion from 'long long int' to 'enum E' changes value from '4294967296' to '0'",
-            "14:20: conversion from 'unsigned int' to 'unsigned char' changes value from '300' to '44'",
-            "15:11: overflow in conversion from 'int' to 'char' changes value from '297' to '41'",
+            "1:10: overflow in conversion from 'int' to 'char' changes value from '300' to '44' [-Woverflow]",
+            "2:20: unsigned conversion from 'int' to 'unsigned char' changes value from '300' to '44' [-Woverflow]",
+            "3:11: overflow in conversion from 'int' to 'short int' changes value from '70000' to '4464' [-Woverflow]",
+            "4:21: unsigned conversion from 'int' to 'short unsigned int' changes value from '70000' to '4464' [-Woverflow]",
+            "5:59: overflow in conversion from 'int' to 'char' changes value from '300' to '44' [-Woverflow]",
+            "5:64: overflow in conversion from 'int' to 'signed char:3' changes value from '9' to '1' [-Woverflow]",
+            "5:67: unsigned conversion from 'int' to 'unsigned char:2' changes value from '5' to '1' [-Woverflow]",
+            "6:20: overflow in conversion from 'int' to 'char' changes value from '256' to '0' [-Woverflow]",
+            "6:25: overflow in conversion from 'int' to 'char' changes value from '1000' to '-24' [-Woverflow]",
+            "7:9: overflow in conversion from 'long long int' to 'int' changes value from '4294967297' to '1' [-Woverflow]",
+            "8:15: unsigned conversion from 'long long int' to 'unsigned int' changes value from '4294967296' to '0' [-Woverflow]",
+            "9:18: overflow in conversion from 'int' to 'signed char' changes value from '-129' to '127' [-Woverflow]",
+            "10:32: overflow in conversion from 'int' to 'char' changes value from '300' to '44' [-Woverflow]",
+            "11:79: overflow in conversion from 'int' to 'short int:10' changes value from '2000' to '-48' [-Woverflow]",
+            "11:85: unsigned conversion from 'int' to 'unsigned int:20' changes value from '2000000' to '951424' [-Woverflow]",
+            "11:94: overflow in conversion from 'long long int' to 'long int:40' changes value from '2000000000000' to '-199023255552' [-Woverflow]",
+            "11:111: overflow in conversion from 'long long int' to 'int' changes value from '5000000000' to '705032704' [-Woverflow]",
+            "13:12: unsigned conversion from 'long long int' to 'enum E' changes value from '4294967296' to '0' [-Woverflow]",
+            "14:20: conversion from 'unsigned int' to 'unsigned char' changes value from '300' to '44' [-Woverflow]",
+            "15:11: overflow in conversion from 'int' to 'char' changes value from '297' to '41' [-Woverflow]",
         ]
     );
 }
@@ -74,15 +74,15 @@ fn diagnostics_plain_char_conversion_follows_the_target() {
     assert_eq!(
         compile_warnings("cvo_char_a64", src, &[AARCH64]),
         [
-            "1:10: unsigned conversion from 'int' to 'char' changes value from '300' to '44'",
-            "3:10: unsigned conversion from 'int' to 'char' changes value from '-200' to '56'",
+            "1:10: unsigned conversion from 'int' to 'char' changes value from '300' to '44' [-Woverflow]",
+            "3:10: unsigned conversion from 'int' to 'char' changes value from '-200' to '56' [-Woverflow]",
         ]
     );
     assert_eq!(
         compile_warnings("cvo_char_x86", src, &[X86_64]),
         [
-            "1:10: overflow in conversion from 'int' to 'char' changes value from '300' to '44'",
-            "3:10: overflow in conversion from 'int' to 'char' changes value from '-200' to '56'",
+            "1:10: overflow in conversion from 'int' to 'char' changes value from '300' to '44' [-Woverflow]",
+            "3:10: overflow in conversion from 'int' to 'char' changes value from '-200' to '56' [-Woverflow]",
         ]
     );
 }
@@ -98,14 +98,14 @@ fn diagnostics_runtime_conversion_overflow_warns() {
     assert_eq!(
         compile_warnings("cvo_runtime", src, &[X86_64]),
         [
-            "3:26: overflow in conversion from 'int' to 'char' changes value from '300' to '44'",
-            "3:36: overflow in conversion from 'int' to 'char' changes value from '400' to '-112'",
-            "3:59: unsigned conversion from 'int' to 'unsigned char' changes value from '-500' to '12'",
-            "3:67: overflow in conversion from 'int' to 'char' changes value from '300' to '44'",
-            "3:80: overflow in conversion from 'int' to 'signed char:3' changes value from '9' to '1'",
-            "3:90: unsigned conversion from 'int' to 'unsigned char:2' changes value from '5' to '1'",
-            "4:31: overflow in conversion from 'int' to 'signed char:3' changes value from '9' to '1'",
-            "4:34: unsigned conversion from 'int' to 'unsigned char:2' changes value from '5' to '1'",
+            "3:26: overflow in conversion from 'int' to 'char' changes value from '300' to '44' [-Woverflow]",
+            "3:36: overflow in conversion from 'int' to 'char' changes value from '400' to '-112' [-Woverflow]",
+            "3:59: unsigned conversion from 'int' to 'unsigned char' changes value from '-500' to '12' [-Woverflow]",
+            "3:67: overflow in conversion from 'int' to 'char' changes value from '300' to '44' [-Woverflow]",
+            "3:80: overflow in conversion from 'int' to 'signed char:3' changes value from '9' to '1' [-Woverflow]",
+            "3:90: unsigned conversion from 'int' to 'unsigned char:2' changes value from '5' to '1' [-Woverflow]",
+            "4:31: overflow in conversion from 'int' to 'signed char:3' changes value from '9' to '1' [-Woverflow]",
+            "4:34: unsigned conversion from 'int' to 'unsigned char:2' changes value from '5' to '1' [-Woverflow]",
         ]
     );
 }
@@ -146,7 +146,8 @@ fn diagnostics_pedantic_conversion_overflow_warns() {
     );
     assert_eq!(
         got,
-        ["1:18: overflow in conversion from 'int' to 'signed char' changes value from '200' to '-56'"]
+        ["1:18: overflow in conversion from 'int' to 'signed char' changes value from '200' to '-56' \
+          [-Woverflow]"]
     );
 }
 
@@ -161,8 +162,8 @@ fn diagnostics_saturated_conversion_names_gccs_types() {
     assert_eq!(
         got,
         [
-            "1:11: overflow in conversion from 'double' to 'short int' changes value",
-            "2:20: overflow in conversion from 'double' to 'long unsigned int' changes value",
+            "1:11: overflow in conversion from 'double' to 'short int' changes value [-Woverflow]",
+            "2:20: overflow in conversion from 'double' to 'long unsigned int' changes value [-Woverflow]",
         ]
     );
 }

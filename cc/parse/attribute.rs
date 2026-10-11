@@ -14,6 +14,7 @@
 use super::ast::ExprKind;
 use super::parser::Parser;
 use crate::diag;
+use crate::strings::StringId;
 use crate::symbol::Namespace;
 use crate::target::ByteOrder;
 use crate::token::lexer::{payload_text, Position, TokenType};
@@ -23,6 +24,67 @@ use std::fmt;
 
 /// The `-Wno-<name>` group the unimplemented-attribute warnings belong to.
 pub(crate) const ATTRIBUTE_WARNING: &str = "attributes";
+
+/// What gcc says of an attribute only a function may carry when it is
+/// written on a declarator that declares no function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FunctionOnly {
+    /// A declaration's attribute: "'X' attribute ignored" anywhere else, a
+    /// pointer to a function included.
+    Declaration,
+    /// `const`, which a pointer to a function may carry too.
+    Const,
+    /// `malloc`, in its own words.
+    Malloc,
+    /// An attribute of a function type: "'X' attribute only applies to
+    /// function types", unless the type is a function's or a pointer to one.
+    FunctionType,
+    /// `no_instrument_function`, which gcc refuses.
+    Refused,
+}
+
+/// The attributes c17 recognises that only a function may carry, by gcc's
+/// verdict on one written anywhere else.
+const FUNCTION_ONLY: &[(&str, FunctionOnly)] = &[
+    ("access", FunctionOnly::FunctionType),
+    ("alloc_align", FunctionOnly::FunctionType),
+    ("alloc_size", FunctionOnly::FunctionType),
+    ("always_inline", FunctionOnly::Declaration),
+    ("artificial", FunctionOnly::Declaration),
+    ("cold", FunctionOnly::Declaration),
+    ("const", FunctionOnly::Const),
+    ("constructor", FunctionOnly::Declaration),
+    ("destructor", FunctionOnly::Declaration),
+    ("format", FunctionOnly::FunctionType),
+    ("gnu_inline", FunctionOnly::Declaration),
+    ("hot", FunctionOnly::Declaration),
+    ("leaf", FunctionOnly::Declaration),
+    ("malloc", FunctionOnly::Malloc),
+    ("no_instrument_function", FunctionOnly::Refused),
+    ("no_sanitize_address", FunctionOnly::Declaration),
+    ("no_sanitize_thread", FunctionOnly::Declaration),
+    ("no_stack_protector", FunctionOnly::Declaration),
+    ("noclone", FunctionOnly::Declaration),
+    ("noinline", FunctionOnly::Declaration),
+    ("nonnull", FunctionOnly::FunctionType),
+    ("optimize", FunctionOnly::Declaration),
+    ("pure", FunctionOnly::Declaration),
+    ("returns_nonnull", FunctionOnly::FunctionType),
+    ("sentinel", FunctionOnly::FunctionType),
+    ("stack_protect", FunctionOnly::Declaration),
+    ("target", FunctionOnly::Declaration),
+    ("target_clones", FunctionOnly::Declaration),
+    ("warn_unused_result", FunctionOnly::FunctionType),
+];
+
+/// gcc's verdict on the function-only attribute `name`, if it is one.
+fn function_only(name: &str) -> Option<(&'static str, FunctionOnly)> {
+    let name = name.trim_matches('_');
+    FUNCTION_ONLY
+        .binary_search_by(|(n, _)| (*n).cmp(name))
+        .ok()
+        .map(|i| FUNCTION_ONLY[i])
+}
 
 // GCC __attribute__ Support
 
@@ -382,6 +444,7 @@ impl AttributeList {
             nothrow: self.has_attr("nothrow"),
             stack_protect: self.stack_protect().unwrap_or_else(|kept| kept),
             stack_protector: self.optimize_stack_protector(),
+            function_only: Vec::new(),
         }
     }
 
@@ -1023,11 +1086,87 @@ impl Parser<'_> {
         self.pending_symbol_attrs.merge(&symbol_attrs);
     }
 
-    /// `cleanup(fn)` on something that has no scope to leave -- a member, a
-    /// parameter -- is dropped with gcc's warning.
-    pub(super) fn drop_pending_cleanup(&mut self, pos: Position) {
-        if self.pending_symbol_attrs.cleanup.take().is_some() {
+    /// The symbol attributes pending on a member or a parameter `name`,
+    /// which names no symbol, dropped with gcc's diagnostic for each -- as
+    /// `cleanup(fn)` is, there being no scope to leave.
+    pub(super) fn drop_pending_symbol_attrs(&mut self, name: StringId, pos: Position) {
+        let mut attrs = std::mem::take(&mut self.pending_symbol_attrs);
+        if attrs.cleanup.take().is_some() {
             Self::warn_cleanup_ignored(pos);
+        }
+        Self::drop_ifunc(&mut attrs, pos);
+        self.drop_symbol_attrs(&mut attrs, name, pos, false);
+    }
+
+    /// gcc's diagnostic for each of `weak`, `used`, `visibility`, `alias`
+    /// and `section` in `attrs`, written on `name` at `pos`, which declares
+    /// no object or function: a `typedef`, a member or a parameter. Each is
+    /// dropped. gcc says nothing of `used` on a typedef.
+    pub(super) fn drop_symbol_attrs(
+        &self,
+        attrs: &mut crate::parse::ast::SymbolAttrs,
+        name: StringId,
+        pos: Position,
+        typedef: bool,
+    ) {
+        let ignored = [
+            (std::mem::take(&mut attrs.weak), "weak"),
+            (std::mem::take(&mut attrs.used) && !typedef, "used"),
+            (attrs.visibility.take().is_some(), "visibility"),
+            (attrs.alias.take().is_some(), "alias"),
+        ];
+        for (_, attr) in ignored.iter().filter(|(set, _)| *set) {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[attr]);
+        }
+        if attrs.section.take().is_some() {
+            let spelled = self.idents.get_opt(name).unwrap_or("");
+            diag::error_args(pos, "section attribute not allowed for '{0}'", &[spelled]);
+        }
+    }
+
+    /// gcc's diagnostics for the symbol attributes `attrs` on `name`, an
+    /// object or function with `linkage`, which only a name with external
+    /// linkage may carry: `weak` is an error, `visibility` is ignored, a
+    /// name with no linkage is no `alias` -- and an `automatic` object has
+    /// no symbol for `used` and `section` to act on. Each is dropped.
+    pub(super) fn check_private_symbol_attrs(
+        &self,
+        attrs: &mut crate::parse::ast::SymbolAttrs,
+        name: StringId,
+        pos: Position,
+        linkage: crate::symbol::Linkage,
+        automatic: bool,
+    ) {
+        if linkage == crate::symbol::Linkage::External {
+            return;
+        }
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        if std::mem::take(&mut attrs.weak) {
+            diag::error_args(pos, "weak declaration of '{0}' must be public", &[spelled]);
+        }
+        if attrs.visibility.take().is_some() {
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute ignored",
+                &["visibility"],
+            );
+        }
+        let ignored = [
+            (
+                linkage == crate::symbol::Linkage::None && attrs.alias.take().is_some(),
+                "alias",
+            ),
+            (automatic && std::mem::take(&mut attrs.used), "used"),
+        ];
+        for (_, attr) in ignored.iter().filter(|(set, _)| *set) {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[attr]);
+        }
+        if automatic && attrs.section.take().is_some() {
+            diag::error(
+                pos,
+                &gettext("section attribute cannot be specified for local variables"),
+            );
         }
     }
 
@@ -1066,10 +1205,11 @@ impl Parser<'_> {
     /// Shared by the two routes that can reach the mistake: on the
     /// struct-or-union specifier, and trailing after the declarator.
     pub(super) fn warn_transparent_union_ignored(&self, pos: Position) {
-        diag::group_warning(
+        diag::group_warning_args(
             ATTRIBUTE_WARNING,
             pos,
-            &gettext("'transparent_union' attribute ignored on a non-union type"),
+            "'{0}' attribute ignored",
+            &["transparent_union"],
         );
     }
 
@@ -1120,14 +1260,16 @@ impl Parser<'_> {
             }
             _ => typ,
         };
-        self.drop_fn_decl_attrs();
+        self.drop_fn_decl_attrs(typ);
         typ
     }
 
-    /// gcc's warning for each of `noreturn`, `returns_twice` and `nothrow`
-    /// still pending on a declarator that declares no function, which drops
-    /// them.
-    pub(super) fn drop_fn_decl_attrs(&mut self) {
+    /// gcc's diagnostic for each attribute only a function may carry that
+    /// is still pending on a declarator of type `typ` that declares no
+    /// function -- a typedef of a function type among them -- which drops
+    /// them: `noreturn`, `returns_twice` and `nothrow`, then the rest in
+    /// the order written.
+    pub(super) fn drop_fn_decl_attrs(&mut self, typ: TypeId) {
         let pos = self.current_pos();
         let attrs = &mut self.pending_fn_attrs;
         let dropped = [
@@ -1135,7 +1277,47 @@ impl Parser<'_> {
             (std::mem::take(&mut attrs.returns_twice), "returns_twice"),
             (std::mem::take(&mut attrs.nothrow), "nothrow"),
         ];
+        let written = std::mem::take(&mut attrs.function_only);
         for (_, name) in dropped.iter().filter(|(set, _)| *set) {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[name]);
+        }
+        let points_to_function = self.types.kind(typ) == TypeKind::Pointer
+            && self
+                .types
+                .base_type(typ)
+                .is_some_and(|f| self.types.kind(f) == TypeKind::Function);
+        let function_type = points_to_function || self.types.kind(typ) == TypeKind::Function;
+        for (name, pos) in written {
+            let Some((_, verdict)) = function_only(name) else {
+                continue;
+            };
+            match verdict {
+                FunctionOnly::Declaration => {}
+                FunctionOnly::Const if points_to_function => continue,
+                FunctionOnly::Const => {}
+                FunctionOnly::FunctionType if function_type => continue,
+                FunctionOnly::FunctionType => {
+                    diag::group_warning_args(
+                        ATTRIBUTE_WARNING,
+                        pos,
+                        "'{0}' attribute only applies to function types",
+                        &[name],
+                    );
+                    continue;
+                }
+                FunctionOnly::Malloc => {
+                    diag::group_warning(
+                        ATTRIBUTE_WARNING,
+                        pos,
+                        &gettext("'malloc' attribute ignored; valid only for functions"),
+                    );
+                    continue;
+                }
+                FunctionOnly::Refused => {
+                    diag::error_args(pos, "'{0}' attribute applies only to functions", &[name]);
+                    continue;
+                }
+            }
             diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[name]);
         }
     }
@@ -1145,7 +1327,13 @@ impl Parser<'_> {
     /// `no_stack_protector`, the first written wins and gcc's warning names
     /// the other -- in the same list or another.
     fn merge_fn_attrs(&mut self, attrs: &AttributeList, pos: Position) {
-        let fn_attrs = attrs.function_attrs(&self.types.target());
+        let mut fn_attrs = attrs.function_attrs(&self.types.target());
+        fn_attrs.function_only = attrs
+            .attrs
+            .iter()
+            .filter_map(|a| function_only(&a.name))
+            .map(|(name, _)| (name, pos))
+            .collect();
         let in_list = attrs.stack_protect().err();
         let across = self
             .pending_fn_attrs

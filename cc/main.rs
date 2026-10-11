@@ -456,6 +456,14 @@ struct Args {
     #[arg(long = "fno-gnu89-inline", overrides_with = "fgnu89_inline", help = gettext("Use C99 inline semantics (default)"))]
     fno_gnu89_inline: bool,
 
+    /// `-fno-diagnostics-show-option`: no `[-W<name>]` after a diagnostic.
+    #[arg(long = "fno-diagnostics-show-option", overrides_with = "fdiagnostics_show_option", help = gettext("Do not name the option that controls a diagnostic"))]
+    fno_diagnostics_show_option: bool,
+
+    /// Undo `-fno-diagnostics-show-option`, the last of the pair winning.
+    #[arg(long = "fdiagnostics-show-option", overrides_with = "fno_diagnostics_show_option", help = gettext("Name the option that controls a diagnostic (default)"))]
+    fdiagnostics_show_option: bool,
+
     /// A libm function computed in place need not set `errno` for a domain
     /// error, so `sqrt` keeps no call for a negative argument.
     #[arg(long = "fno-math-errno", help = gettext("Do not set errno after math functions computed in place"))]
@@ -1414,6 +1422,7 @@ fn process_file(
             // Only `-E` writes the text the directives are carried into.
             keep_definitions: args.dump_definitions && args.preprocess_only,
             collect_dependencies: args.wants_dependencies(),
+            preprocess_only: args.preprocess_only,
             optimization: args.optimization(),
             position: position_independence(args, target),
             isa: target::X86Isa::from_flags(&args.mflags),
@@ -1942,9 +1951,11 @@ const GCC_ONE_DASH_LONG: &[&str] = &[
     "-aux-info",
     "-dD",
     "-dM",
+    "-fdiagnostics-show-option",
     "-fgnu89-inline",
     "-fmath-errno",
     "-fno-builtin",
+    "-fno-diagnostics-show-option",
     "-fno-gnu89-inline",
     "-fno-math-errno",
     "-fno-trapping-math",
@@ -3561,6 +3572,9 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.fpermissive {
         diag::set_permissive();
+    }
+    if args.fno_diagnostics_show_option {
+        diag::set_show_option(false);
     }
     // Both of these were parsed into fields nothing read, so the flags were
     // accepted and did nothing. They now mean what they mean to gcc: the

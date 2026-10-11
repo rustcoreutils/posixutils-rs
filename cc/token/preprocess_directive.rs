@@ -367,11 +367,16 @@ impl<'a> Preprocessor<'a> {
     ///
     /// C17 6.10p1 gives `#else` and `#endif` no operands at all, and gcc warns
     /// about anything after them -- usually a stale `#endif MACRO` left from
-    /// before comments were the convention.
+    /// before comments were the convention -- in its `-Wendif-labels` group.
     fn warn_extra_tokens(&self, iter: &mut TokenCursor, directive: &str) {
         if iter.peek().is_some_and(|t| !t.pos.newline) {
             let pos = iter.peek().map(|t| t.pos).unwrap_or_default();
-            diag::pedwarn_default_args(pos, "extra tokens at end of #{0} directive", &[directive]);
+            let template = "extra tokens at end of #{0} directive";
+            if matches!(directive, "else" | "endif") {
+                diag::group_pedwarn_default_args("endif-labels", pos, template, &[directive]);
+            } else {
+                diag::pedwarn_default_args(pos, template, &[directive]);
+            }
         }
         self.skip_to_eol(iter);
     }
@@ -621,6 +626,7 @@ impl<'a> Preprocessor<'a> {
             variadic_name,
             builtin: None,
             predefined: false,
+            defined_at: name_pos,
         };
 
         // C17 6.10.3p2: a macro may be redefined only by a definition of the
@@ -630,10 +636,17 @@ impl<'a> Preprocessor<'a> {
         // break a great deal of code that redefines a macro benignly.
         if let Some(existing) = self.macros.get(&name) {
             if let Some(why) = macro_redefinition_conflict(existing, &mac) {
-                diag::pedwarn_default_args(
-                    name_pos,
-                    "'{0}' redefined: {1}",
-                    &[&name.to_string(), why],
+                let template = "'{0}' redefined: {1}";
+                let args = [name.as_str(), why];
+                match builtin_macro_group(&name) {
+                    Some(group) => {
+                        diag::group_pedwarn_default_args(group, name_pos, template, &args)
+                    }
+                    None => diag::pedwarn_default_args(name_pos, template, &args),
+                }
+                diag::note(
+                    existing.defined_at,
+                    &gettext("this is the location of the previous definition"),
                 );
             }
         }
@@ -663,7 +676,11 @@ impl<'a> Preprocessor<'a> {
             diag::error(pos, &gettext("\"defined\" cannot be used as a macro name"));
         } else {
             if is_standard_predefined(&name) {
-                diag::warning_args(pos, "undefining \"{0}\"", &[&name]);
+                let template = "undefining \"{0}\"";
+                match builtin_macro_group(&name) {
+                    Some(group) => diag::group_warning_args(group, pos, template, &[&name]),
+                    None => diag::warning_args(pos, template, &[&name]),
+                }
             }
             self.undef_macro(&name);
         }
@@ -1430,6 +1447,21 @@ impl<'a> Preprocessor<'a> {
         idents: &IdentTable,
         hash_pos: Position,
     ) {
+        if self.preprocess_only {
+            diag::without_warnings(|| self.handle_pragma_line(iter, output, idents, hash_pos));
+        } else {
+            self.handle_pragma_line(iter, output, idents, hash_pos);
+        }
+    }
+
+    /// [`Self::handle_pragma`], with its warnings given.
+    fn handle_pragma_line(
+        &mut self,
+        iter: &mut TokenCursor,
+        output: &mut Vec<Token>,
+        idents: &IdentTable,
+        hash_pos: Position,
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -1451,6 +1483,15 @@ impl<'a> Preprocessor<'a> {
         if let Some(token) = iter.peek() {
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
+                    // The pragmas the parser acts on travel under `-E` as
+                    // written, as gcc's do, for the compile that reads them
+                    // to act on and diagnose.
+                    if self.preprocess_only
+                        && matches!(name, "pack" | "scalar_storage_order" | "GCC")
+                    {
+                        emit_verbatim(self, output);
+                        return;
+                    }
                     if name == "pack" {
                         // A directive handler pulls its own tokens, so they
                         // never pass the remap in the main loop. Attribute the
@@ -1631,7 +1672,9 @@ impl<'a> Preprocessor<'a> {
         // be the same wrong struct in the spelling nobody tested.
         if let TokenValue::String(body) = &token.value {
             let pos = self.remap_pos(token.pos);
-            match parse_pragma_text(body, pos) {
+            // Under `-E` every one travels as its text; see `handle_pragma`.
+            let quiet = self.preprocess_only;
+            let mut act = || match parse_pragma_text(body, pos).filter(|_| !quiet) {
                 Some(pragma) => self.push_parser_pragma(output, pragma, pos),
                 // Not one c17 acts on, so it travels as the directive it
                 // stands for. C99 6.10.9p1 makes `_Pragma("x")` mean
@@ -1646,6 +1689,11 @@ impl<'a> Preprocessor<'a> {
                     ));
                     output.push(marker);
                 }
+            };
+            if quiet {
+                diag::without_warnings(act);
+            } else {
+                act();
             }
         }
 
@@ -1771,7 +1819,7 @@ impl<'a> Preprocessor<'a> {
         let message = gettext("line number out of range");
         match wide {
             Some(n) if (1..=2147483647).contains(&n) => {}
-            Some(n) if n <= u64::from(u32::MAX) => diag::pedwarn(pos, &message),
+            Some(n) if n <= u64::from(u32::MAX) => diag::cpp_pedwarn(pos, &message),
             _ => diag::pedwarn_default(pos, &message),
         }
         wrapped

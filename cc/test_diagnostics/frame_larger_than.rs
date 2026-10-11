@@ -55,7 +55,8 @@ fn frame_larger_than_warns_for_the_big_frame() {
             assert!(c.contains("frame_big.c:2:"), "{flags:?}:\n{c}");
             assert!(
                 c.contains(&format!(
-                    "warning: the frame size of {size} bytes is larger than 1000 bytes\n"
+                    "warning: the frame size of {size} bytes is larger than 1000 bytes \
+                     [-Wframe-larger-than=]\n"
                 )),
                 "{c}"
             );

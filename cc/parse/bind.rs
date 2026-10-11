@@ -20,7 +20,7 @@ use super::linkage::Declared;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Linkage, Namespace, Symbol, SymbolId};
+use crate::symbol::{DeclaredAt, Linkage, Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -389,6 +389,7 @@ impl Parser<'_> {
         let ParsedDeclarator {
             name,
             pos,
+            name_pos,
             mut typ,
             mut vla,
             vla_pos,
@@ -475,9 +476,10 @@ impl Parser<'_> {
         if (is_typedef || is_fn) && scope == (DeclScope::Block { for_init: true }) {
             self.report_for_init_non_variable(name, pos);
         }
-        let (symbol, init) = if is_typedef {
+        let (symbol, init, linkage) = if is_typedef {
             typ = self.align_typedef_type(typ, align);
-            (self.bind_typedef_name(scope, name, pos, typ, &vla)?, None)
+            let symbol = self.bind_typedef_name(scope, name, pos, typ, &vla)?;
+            (symbol, None, Linkage::None)
         } else {
             // gcc words this ahead of anything the declaration conflicts with.
             if !is_fn && (inferred_init.is_some() || self.is_special(b'=')) {
@@ -490,26 +492,32 @@ impl Parser<'_> {
             let has_linkage = scope == DeclScope::File || is_fn || specs.is_extern();
             typ = self.composite_with_prior_declaration(name, typ, has_linkage);
             self.check_redeclaration(name, typ, pos, Redeclared::Declaration);
+            // An initializer makes an object's declaration a definition
+            // (6.9.2p1); one without is at most a tentative definition.
+            let defines = !is_fn && self.is_special(b'=');
             let linkage = self.declare_linkage(Declared {
                 name,
                 typ,
                 pos,
+                name_pos,
                 storage: specs.storage_class,
                 scope,
-                // An initializer makes an object's declaration a definition
-                // (6.9.2p1); one without is at most a tentative definition.
-                defines: !is_fn && self.is_special(b'='),
+                defines,
                 gnu_extern_inline: fn_attrs
                     .as_ref()
                     .is_some_and(|attrs| attrs.gnu_inline_only(specs.storage_class)),
             });
+            if let Some(list) = params.as_ref().filter(|_| is_fn) {
+                self.record_param_positions(name, &list.params);
+            }
             let mut visibility = self.pending_symbol_attrs.visibility.take();
             self.settle_visibility(name, linkage, is_fn, &mut visibility);
             self.pending_symbol_attrs.visibility = visibility;
             let sym = self
                 .declared_symbol(name, typ, align)
                 .with_variably_modified_array(!vla.is_empty())
-                .with_linkage(linkage);
+                .with_linkage(linkage)
+                .declared_at(DeclaredAt::at(name_pos, defines));
             // Bound before the initializer: C99 6.2.1p7 starts the scope just
             // after the declarator, so `int *p = sizeof *p ...` sees `p`.
             let symbol = self.declare_in(scope, sym, name);
@@ -536,7 +544,7 @@ impl Parser<'_> {
             if !is_fn && !vla.is_empty() {
                 self.check_variably_modified_storage(specs.storage_class, name, typ, pos);
             }
-            (symbol, init)
+            (symbol, init, linkage)
         };
 
         match scope {
@@ -584,6 +592,14 @@ impl Parser<'_> {
         let mut symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
         if !is_fn {
             Self::drop_ifunc(&mut symbol_attrs, pos);
+        }
+        if is_typedef {
+            self.drop_symbol_attrs(&mut symbol_attrs, name, pos, true);
+        } else {
+            let automatic = matches!(scope, DeclScope::Block { .. })
+                && !is_fn
+                && !specs.storage_class.intersects(NO_AUTO_DURATION);
+            self.check_private_symbol_attrs(&mut symbol_attrs, name, pos, linkage, automatic);
         }
         let cleanup = symbol_attrs.cleanup.take().and_then(|func| {
             let var = Cleanup {
@@ -830,7 +846,8 @@ impl Parser<'_> {
             }
         }
         self.check_typedef_redefinition(name, typ, pos);
-        let sym = Symbol::typedef(name, typ, self.symbols.depth());
+        let sym = Symbol::typedef(name, typ, self.symbols.depth())
+            .declared_at(DeclaredAt::at(pos, false));
         let symbol = self.declare_in(scope, sym, name);
         if let Some(id) = symbol.filter(|_| !extents.is_empty()) {
             self.vm_typedefs.insert(id, extents.len() as u32);
@@ -853,7 +870,7 @@ impl Parser<'_> {
         typ: &mut TypeId,
     ) -> Option<FunctionAttrs> {
         if specs.is_typedef() {
-            self.drop_fn_decl_attrs();
+            self.drop_fn_decl_attrs(*typ);
             return None;
         }
         // C11 6.7.5p2: not on a function. A pointer to function is an

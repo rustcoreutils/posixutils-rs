@@ -1938,7 +1938,7 @@ fn takes_next_word(arg: &str) -> bool {
     // Bare `-W` is `-Wextra`, given its value by the pre-pass.
     arg != "-W"
         && (takes_separate_value(&clap_spelling(arg))
-            || matches!(arg, "-x" | "-Xlinker" | "-Xassembler" | "--param"))
+            || matches!(arg, "-x" | "-Xlinker" | "-Xassembler" | "--param" | "-z"))
 }
 
 /// Preprocess command-line arguments for gcc compatibility.
@@ -2367,6 +2367,16 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             // `-Wl,--as-needed` a driver option `--as-needed` it rejects, and
             // `-Wl,-soname,libx.so` two unrelated arguments.
             result.push(format!("--c17-linker-flag={}", arg));
+            i += 1;
+        } else if arg == "-z" {
+            // `-z keyword`, gcc's linker option: the same pair, for the host
+            // driver. Like every linker option it means nothing to `-c`.
+            result.push("--c17-linker-flag=-z".to_string());
+            result.push(format!("--c17-linker-flag={}", raw_args[i + 1]));
+            i += 2;
+        } else if arg.starts_with("-z") {
+            // `-zkeyword`, the joined spelling gcc takes too.
+            result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
         } else if arg == "-Xlinker" {
             // -Xlinker <arg> -> the same pair, for the host driver
@@ -4630,6 +4640,19 @@ mod tests {
             .expect("-Xlinker kept");
         assert_eq!(result[at + 1], "--c17-linker-flag=--hash-style=gnu");
         assert!(!result.contains(&"-Xlinker".to_string()));
+    }
+
+    /// `-z keyword` and `-zkeyword`, gcc's linker option, go to the link.
+    #[test]
+    fn test_preprocess_z() {
+        let result = run_preprocess(&["-z", "noexecstack", "-zrelro", "foo.c"]);
+        let at = result
+            .iter()
+            .position(|a| a == "--c17-linker-flag=-z")
+            .expect("-z kept");
+        assert_eq!(result[at + 1], "--c17-linker-flag=noexecstack");
+        assert!(result.contains(&"--c17-linker-flag=-zrelro".to_string()));
+        assert!(!result.iter().any(|a| a == "-z" || a == "noexecstack"));
     }
 
     #[test]

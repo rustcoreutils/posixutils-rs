@@ -1362,3 +1362,50 @@ fn gcc_flags_missing_argument_names_the_option_as_written() {
     }
     assert!(!dir.path().join("-D").exists(), "-o took an appended -D");
 }
+
+/// `-z keyword`, gcc's option for the linker, as binutils' own testsuite
+/// passes it (`-z noexecstack`), and its joined spelling. c17 refused it as
+/// an unknown option. Like every linker option it is ignored under `-c`,
+/// and it needs its argument.
+#[cfg(target_os = "linux")]
+#[test]
+fn z_options_reach_the_linker() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_z_option_")
+        .tempdir()
+        .unwrap();
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(p("m.c"), "int main(void) { return 0; }\n").unwrap();
+    let stack = |exe: &str| {
+        let out = std::process::Command::new("readelf")
+            .args(["-lW", exe])
+            .output()
+            .expect("readelf");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("GNU_STACK"))
+            .map(|l| l.contains("RWE"))
+            .expect("a GNU_STACK header")
+    };
+    let r = run_c17(&["-o", &p("exec"), &p("m.c"), "-z", "execstack"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(stack(&p("exec")), "-z execstack did not reach the linker");
+    let r = run_c17(&[
+        "-o",
+        &p("noexec"),
+        &p("m.c"),
+        "-znoexecstack",
+        "-z",
+        "relro",
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(!stack(&p("noexec")));
+    let r = run_c17(&["-c", "-o", &p("m.o"), &p("m.c"), "-z", "noexecstack"]);
+    assert!(r.success, "{}", r.stderr);
+    let r = run_c17(&[&p("m.c"), "-z"]);
+    assert!(
+        !r.success && r.stderr.contains("missing argument to '-z'"),
+        "{}",
+        r.stderr
+    );
+}

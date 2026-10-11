@@ -46,6 +46,7 @@ mod codegen_asm_probe;
 mod codegen_atomics_asm;
 mod codegen_binary128;
 mod codegen_block_moves;
+mod codegen_branch_protection;
 mod codegen_cf_protection;
 mod codegen_complex_fold;
 mod codegen_constant_branch;

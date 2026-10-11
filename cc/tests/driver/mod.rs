@@ -16,6 +16,7 @@
 mod asm_dependencies;
 mod asm_input;
 mod aux_info;
+mod branch_protection;
 mod f_options;
 mod gcc_flags;
 mod isa_flags;

@@ -84,6 +84,9 @@ pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static st
             if target.os == Os::MacOS {
                 macros.extend(aarch64::get_darwin_macros());
             }
+            macros.extend(aarch64::get_branch_protection_macros(
+                target.branch_protection,
+            ));
         }
     }
 

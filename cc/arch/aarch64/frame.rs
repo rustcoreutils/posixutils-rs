@@ -15,7 +15,7 @@ use crate::abi::aapcs64::StackedArgs;
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
-use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
+use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, Hint, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
@@ -184,6 +184,7 @@ impl Aarch64CodeGen {
         let first_inst = self.base.lir_buffer.len();
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
+        self.emit_entry_protection(func);
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
         self.base.check_stack_clash(func, total_frame as i64);
         self.base
@@ -405,6 +406,57 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiStartProc));
         }
         self.base.eh_begin_function(func, self.pic_mode);
+    }
+
+    /// What `-mbranch-protection` puts at a function's entry, before its
+    /// prologue saves x30. Under `pac-ret`, x30 signed, and the CFI saying
+    /// so: gcc signs in every function that saves x30, and every c17 frame
+    /// does, so `leaf` changes nothing. `paciasp` is a landing pad for an
+    /// indirect call too, so it is all a signing function needs; otherwise,
+    /// under `bti`, a function an indirect call may reach starts with
+    /// `bti c`.
+    fn emit_entry_protection(&mut self, func: &Function) {
+        match self.base.target.branch_protection.pac_ret {
+            Some(pac) => {
+                if pac.b_key {
+                    self.push_cfi(Directive::CfiBKeyFrame);
+                }
+                let sign = if pac.b_key {
+                    Hint::Pacibsp
+                } else {
+                    Hint::Paciasp
+                };
+                self.push_lir(Aarch64Inst::Hint(sign));
+                self.push_cfi(Directive::CfiWindowSave);
+            }
+            None if self.base.landing_pads.entry(&func.name) => {
+                self.push_lir(Aarch64Inst::Hint(Hint::BtiC));
+            }
+            None => {}
+        }
+    }
+
+    /// Under `pac-ret`, authenticate x30, reloaded by the epilogue, just
+    /// before the `ret` that branches to it, as gcc does.
+    fn emit_return_authentication(&mut self) {
+        if let Some(pac) = self.base.target.branch_protection.pac_ret {
+            let auth = if pac.b_key {
+                Hint::Autibsp
+            } else {
+                Hint::Autiasp
+            };
+            self.push_lir(Aarch64Inst::Hint(auth));
+            self.push_cfi(Directive::CfiWindowSave);
+        }
+    }
+
+    /// Under `bti`, the landing pad of a place an indirect jump reaches: the
+    /// return of a call that returns twice, an exception landing pad,
+    /// `__builtin_setjmp`'s resume point, a label a computed goto may take.
+    pub(super) fn emit_jump_landing_pad(&mut self) {
+        if self.base.landing_pads.active() {
+            self.push_lir(Aarch64Inst::Hint(Hint::BtiJ));
+        }
     }
 
     /// Push a CFI rule, when unwind tables are on.
@@ -1679,6 +1731,7 @@ impl Aarch64CodeGen {
             self.push_cfi(Directive::cfi_restore("x29"));
             self.emit_sp_adjust(dealloc, dealloc);
         }
+        self.emit_return_authentication();
         self.push_lir(Aarch64Inst::Ret);
         self.push_cfi(Directive::CfiRestoreState);
     }

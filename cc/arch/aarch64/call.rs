@@ -1099,6 +1099,12 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Bl {
                 target: CallTarget::Direct(Symbol::global(func_name)),
             });
+            // The second return of a function that returns twice comes by
+            // an indirect jump, so under `bti` it lands on `bti j`, which gcc
+            // keeps inside the call's call-site entry.
+            if insn.returns_twice() {
+                self.emit_jump_landing_pad();
+            }
         }
         self.base.eh_call_end(site);
     }

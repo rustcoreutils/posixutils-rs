@@ -3140,18 +3140,22 @@ fn version_banner(target: &Target) -> String {
 /// error. gcc's aarch64 driver does not
 /// know the x86-64 instruction-set options at all, and nor does c17's.
 fn check_machine_flags(flags: &[String], target: &Target) {
-    if target.arch == target::Arch::Aarch64 {
-        let x86_only = |f: &str| {
+    // Options the other architecture's gcc driver does not know at all.
+    let foreign = |f: &str| match target.arch {
+        target::Arch::Aarch64 => {
             target::is_isa_flag(f) || matches!(f, "-msse2avx" | "-mvzeroupper" | "-mno-vzeroupper")
-        };
-        if let Some(flag) = flags.iter().find(|f| x86_only(f)) {
-            eprintln!(
-                "c17: {} '{}'",
-                gettext("error: unrecognized command-line option"),
-                flag
-            );
-            std::process::exit(1);
         }
+        target::Arch::X86_64 => {
+            f.starts_with("-mbranch-protection=") || f.starts_with("-msign-return-address=")
+        }
+    };
+    if let Some(flag) = flags.iter().find(|f| foreign(f)) {
+        eprintln!(
+            "c17: {} '{}'",
+            gettext("error: unrecognized command-line option"),
+            flag
+        );
+        std::process::exit(1);
     }
     let accepted = |flag: &str| {
         flag.starts_with("-march=")
@@ -3181,6 +3185,8 @@ fn check_machine_flags(flags: &[String], target: &Target) {
                 }
                 target::Arch::Aarch64 => {
                     matches!(flag, "-mabi=lp64" | "-mlittle-endian" | "-mcmodel=small")
+                        || flag.starts_with("-mbranch-protection=")
+                        || flag.starts_with("-msign-return-address=")
                 }
             }
             // Both are no-ops. Every function's prologue sets up the frame
@@ -3201,6 +3207,38 @@ fn check_machine_flags(flags: &[String], target: &Target) {
         eprintln!("c17: {}: {}", gettext("unsupported machine flag"), flag);
     }
     std::process::exit(1);
+}
+
+/// aarch64's `-mbranch-protection=`, the last one given, refused in gcc's
+/// words when gcc would refuse it, and on Darwin, which has no property note
+/// to carry it, when it asks for a protection. gcc 13 no longer supports the
+/// older `-msign-return-address=`: it warns and ignores it.
+fn branch_protection(flags: &[String], target: &Target) -> target::BranchProtection {
+    for flag in flags {
+        if flag.starts_with("-msign-return-address=") {
+            driver_warning(&gettext_args(
+                "switch '{0}' is no longer supported",
+                &[flag],
+            ));
+        }
+    }
+    let fail = |msg: String| -> ! {
+        eprintln!("c17: {}: {}", gettext("error"), msg);
+        std::process::exit(1);
+    };
+    let protection = target::BranchProtection::from_flags(flags).unwrap_or_else(|e| fail(e));
+    if protection.protects() && target.os == target::Os::MacOS {
+        let value = flags
+            .iter()
+            .rev()
+            .find_map(|f| f.strip_prefix("-mbranch-protection="))
+            .unwrap_or_default();
+        fail(gettext_args(
+            "'-mbranch-protection={0}' is not supported for this target",
+            &[value],
+        ));
+    }
+    protection
 }
 
 /// Refuse what `-fcf-protection` and `-pg` cannot do here, in gcc's words:
@@ -3886,6 +3924,8 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     check_instrumentation(&args, &target);
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&args.mflags);
+    } else {
+        target.branch_protection = branch_protection(&args.mflags, &target);
     }
     // Before anything reads it: the type system, the predefined macros and
     // the preprocessor's character constants all take it from the target.

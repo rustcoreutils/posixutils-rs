@@ -64,6 +64,29 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
     ]
 }
 
+/// gcc's macros for `-mbranch-protection=`: `__ARM_FEATURE_BTI_DEFAULT`
+/// under `bti`, and under `pac-ret` `__ARM_FEATURE_PAC_DEFAULT`, whose bits
+/// say the key (1 for A, 2 for B) and `leaf` (4).
+pub fn get_branch_protection_macros(
+    protection: crate::target::BranchProtection,
+) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut macros = Vec::new();
+    if protection.bti {
+        macros.push(("__ARM_FEATURE_BTI_DEFAULT", Some("1")));
+    }
+    let pac = match protection.pac_macro() {
+        Some(1) => Some("1"),
+        Some(2) => Some("2"),
+        Some(5) => Some("5"),
+        Some(6) => Some("6"),
+        _ => None,
+    };
+    if let Some(value) = pac {
+        macros.push(("__ARM_FEATURE_PAC_DEFAULT", Some(value)));
+    }
+    macros
+}
+
 /// The macros clang adds for arm64 on Darwin alone. gcc on aarch64 Linux
 /// defines neither, and code reads `__arm64__` as "Apple".
 pub fn get_darwin_macros() -> Vec<(&'static str, Option<&'static str>)> {

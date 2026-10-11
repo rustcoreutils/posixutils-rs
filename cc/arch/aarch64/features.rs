@@ -12,7 +12,7 @@
 use super::call::HfaElem;
 use super::codegen::Aarch64CodeGen;
 use super::frame::UNROLL_LIMIT_BYTES;
-use super::lir::{Aarch64Inst, GpOperand, MemAddr};
+use super::lir::{Aarch64Inst, GpOperand, Hint, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::codegen::BswapSize;
 use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, OperandSize, Symbol};
@@ -1388,6 +1388,7 @@ impl Aarch64CodeGen {
         });
 
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(resume)));
+        self.emit_jump_landing_pad();
         self.emit_frame_base_latch();
         self.push_lir(Aarch64Inst::Mov {
             size: OperandSize::B32,
@@ -1479,14 +1480,34 @@ impl Aarch64CodeGen {
         // From the saved frame record, even at level 0: x30 itself is
         // overwritten by any call the function has made before this point.
         self.emit_frame_walk(insn.frame_level());
-        self.push_lir(Aarch64Inst::Ldr {
-            size: OperandSize::B64,
-            addr: MemAddr::BaseOffset {
-                base: Reg::X9,
-                offset: 8,
-            },
-            dst: Reg::X9,
-        });
+        if self.base.target.branch_protection.pac_ret.is_some() {
+            // Signed where it was saved: stripped of its signature, as gcc
+            // does, through x30 -- the one register `xpaclri` works on, and
+            // free here, since the epilogue reloads it from the frame.
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X9,
+                    offset: 8,
+                },
+                dst: Reg::lr(),
+            });
+            self.push_lir(Aarch64Inst::Hint(Hint::Xpaclri));
+            self.push_lir(Aarch64Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::lr()),
+                dst: Reg::X9,
+            });
+        } else {
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X9,
+                    offset: 8,
+                },
+                dst: Reg::X9,
+            });
+        }
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
     }
@@ -1556,8 +1577,10 @@ impl Aarch64CodeGen {
     }
 
     /// The start of a landing pad, where the unwinder jumps with the
-    /// exception object in X0: the object to its home.
+    /// exception object in X0: a `bti j` under `bti`, the jump being an
+    /// indirect one, then the object to its home.
     pub(super) fn emit_landing_pad(&mut self, insn: &Instruction) {
+        self.emit_jump_landing_pad();
         if let Some(target) = insn.target {
             let dst_loc = self.get_location(target);
             self.emit_move_to_loc(Reg::X0, &dst_loc, 64);

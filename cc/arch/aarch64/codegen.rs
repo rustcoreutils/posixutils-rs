@@ -302,6 +302,13 @@ impl Aarch64CodeGen {
             &self.base.current_fn,
             block.id.0,
         ))));
+        if self
+            .base
+            .landing_pads
+            .label(&block.id.label_symbol(&self.base.current_fn))
+        {
+            self.emit_jump_landing_pad();
+        }
 
         // Emit instructions
         for insn in &block.insns {
@@ -1373,6 +1380,11 @@ impl CodeGenerator for Aarch64CodeGen {
         // Emit file header
         self.base.plan_named_sections(module, self.pic_mode);
         self.base.plan_local_binding(module);
+        self.base.landing_pads = crate::arch::landing_pads::LandingPads::plan(
+            module,
+            self.base.optimizing,
+            self.base.target.branch_protection.bti,
+        );
         self.emit_header();
 
         // Emit .file directives unconditionally (useful for diagnostics/profiling)
@@ -1448,6 +1460,9 @@ impl CodeGenerator for Aarch64CodeGen {
 
         self.base.emit_eh_tables(self.pic_mode);
         self.base.push_directive(Directive::UnitEnd);
+        if let Some(bits) = self.base.target.branch_protection.feature_bits() {
+            self.base.push_directive(Directive::FeatureNote(bits));
+        }
 
         // Flush all buffered LIR instructions to output
         self.base.emit_all();

@@ -1131,6 +1131,15 @@ pub enum Directive {
     /// .cfi_restore_state - pop the rules the last remember pushed
     CfiRestoreState,
 
+    /// `.cfi_window_save`, which on aarch64 is
+    /// `DW_CFA_AARCH64_negate_ra_state`: the return address in x30 has just
+    /// been signed, or authenticated. gcc's spelling of it.
+    CfiWindowSave,
+
+    /// `.cfi_b_key_frame`: the procedure signs its return address with the
+    /// B key, which the unwinder must use to authenticate it.
+    CfiBKeyFrame,
+
     /// `.cfi_personality encoding, sym`: the routine the unwinder calls for
     /// the procedure's frames, encoded as `encoding` says (`arch::eh`).
     CfiPersonality { encoding: u8, sym: Symbol },
@@ -1200,12 +1209,13 @@ pub enum Directive {
     /// symbol into the next: every label it invents is `L`-private.
     UnitEnd,
 
-    /// The ELF `.note.gnu.property` of an x86-64 unit built for CET, in
-    /// gcc's text: one `GNU_PROPERTY_X86_FEATURE_1_AND` property holding
-    /// these bits (IBT 1, SHSTK 2). The linker keeps a bit in the output only
-    /// if every object has it, and the loader enables only what the output
-    /// says.
-    X86FeatureNote(u32),
+    /// The ELF `.note.gnu.property` of a unit built for branch or return
+    /// protection, in gcc's layout: one property, the architecture's
+    /// `FEATURE_1_AND` -- x86-64's for CET (IBT 1, SHSTK 2), aarch64's for
+    /// BTI (1) and PAC (2) -- holding these bits. The linker keeps a bit in
+    /// the output only if every object has it, and the loader enables only
+    /// what the output says.
+    FeatureNote(u32),
 
     /// A file-scope asm's text, written exactly as the source gave it and
     /// ended with a newline, as gcc writes it.
@@ -1734,6 +1744,12 @@ impl EmitAsm for Directive {
             Directive::CfiRestoreState => {
                 let _ = writeln!(out, "    .cfi_restore_state");
             }
+            Directive::CfiWindowSave => {
+                let _ = writeln!(out, "    .cfi_window_save");
+            }
+            Directive::CfiBKeyFrame => {
+                let _ = writeln!(out, "    .cfi_b_key_frame");
+            }
             Directive::CfiPersonality { encoding, sym } => {
                 let name = sym.format_for_target(target);
                 let _ = writeln!(out, "    .cfi_personality {encoding:#x},{name}");
@@ -1823,9 +1839,15 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, "    .section .note.GNU-stack,\"\",@progbits");
                 }
             },
-            Directive::X86FeatureNote(bits) => {
+            Directive::FeatureNote(bits) => {
+                // Eight-byte alignment, which aarch64's `.align` would read
+                // as a power of two; and the architecture's property.
+                let (align, property) = match target.arch {
+                    Arch::X86_64 => (".align 8", "0xc0000002"), // GNU_PROPERTY_X86_FEATURE_1_AND
+                    Arch::Aarch64 => (".p2align 3", "0xc0000000"), // GNU_PROPERTY_AARCH64_FEATURE_1_AND
+                };
                 let _ = writeln!(out, "    .section .note.gnu.property,\"a\"");
-                let _ = writeln!(out, "    .align 8");
+                let _ = writeln!(out, "    {align}");
                 let _ = writeln!(out, "    .long 1f - 0f");
                 let _ = writeln!(out, "    .long 4f - 1f");
                 // NT_GNU_PROPERTY_TYPE_0
@@ -1833,14 +1855,13 @@ impl EmitAsm for Directive {
                 let _ = writeln!(out, "0:");
                 let _ = writeln!(out, "    .string \"GNU\"");
                 let _ = writeln!(out, "1:");
-                let _ = writeln!(out, "    .align 8");
-                // GNU_PROPERTY_X86_FEATURE_1_AND
-                let _ = writeln!(out, "    .long 0xc0000002");
+                let _ = writeln!(out, "    {align}");
+                let _ = writeln!(out, "    .long {property}");
                 let _ = writeln!(out, "    .long 3f - 2f");
                 let _ = writeln!(out, "2:");
                 let _ = writeln!(out, "    .long {bits:#x}");
                 let _ = writeln!(out, "3:");
-                let _ = writeln!(out, "    .align 8");
+                let _ = writeln!(out, "    {align}");
                 let _ = writeln!(out, "4:");
             }
             Directive::Verbatim(text) => {

@@ -345,6 +345,120 @@ impl CfProtection {
     }
 }
 
+/// aarch64's `-mbranch-protection=`: whether indirect branches land only
+/// on `bti` landing pads, and whether return addresses are signed, with
+/// which key. The default is neither, as gcc's.
+///
+/// Like `-fcf-protection` on x86-64, announced to the linker and loader by
+/// the unit's `.note.gnu.property` and to the source by predefined macros.
+/// Only aarch64 ELF has it: Darwin has no property note, and x86-64 gcc does
+/// not know the option.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BranchProtection {
+    /// `bti`: every indirect branch lands on a `bti` instruction.
+    pub bti: bool,
+    /// `pac-ret`: the return address is signed where it is saved and
+    /// authenticated before the return.
+    pub pac_ret: Option<PacRet>,
+}
+
+/// How `pac-ret` signs return addresses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PacRet {
+    /// `+leaf`: sign in every function, not only one that saves the link
+    /// register. Every c17 frame saves it, so the code is the same.
+    pub leaf: bool,
+    /// `+b-key`: sign with the B key instead of the A key.
+    pub b_key: bool,
+}
+
+impl BranchProtection {
+    /// The protection `-mbranch-protection=<value>` selects, read as gcc 13
+    /// reads it: `+`-separated words, empty ones skipped; `none` and
+    /// `standard` reset everything and must be the last word, `bti` adds
+    /// landing pads, and `pac-ret` signs with the A key in the functions that
+    /// save the link register, as modified by the `leaf` and `b-key` words
+    /// directly after it. `Err` is gcc's message.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if value.is_empty() {
+            return Err("missing argument to '-mbranch-protection='".to_string());
+        }
+        let words: Vec<&str> = value.split('+').filter(|w| !w.is_empty()).collect();
+        if words.is_empty() {
+            return Err("missing argument for '-mbranch-protection='".to_string());
+        }
+        let mut protection = Self::default();
+        let mut i = 0;
+        while i < words.len() {
+            let (word, next) = (words[i], words.get(i + 1));
+            match word {
+                "none" | "standard" => {
+                    if let Some(next) = next {
+                        return Err(format!("unexpected '{next}' after '{word}'"));
+                    }
+                    protection = if word == "none" {
+                        Self::default()
+                    } else {
+                        Self {
+                            bti: true,
+                            pac_ret: Some(PacRet::default()),
+                        }
+                    };
+                }
+                "bti" => protection.bti = true,
+                "pac-ret" => {
+                    let mut pac = PacRet::default();
+                    while let Some(&modifier) = words.get(i + 1) {
+                        match modifier {
+                            "leaf" => pac.leaf = true,
+                            "b-key" => pac.b_key = true,
+                            _ => break,
+                        }
+                        i += 1;
+                    }
+                    protection.pac_ret = Some(pac);
+                }
+                _ => {
+                    return Err(format!(
+                        "invalid argument '{word}' for '-mbranch-protection='"
+                    ))
+                }
+            }
+            i += 1;
+        }
+        Ok(protection)
+    }
+
+    /// The protection the last `-mbranch-protection=` among the machine
+    /// `flags` selects; `Err` is gcc's message for it.
+    pub fn from_flags(flags: &[String]) -> Result<Self, String> {
+        flags
+            .iter()
+            .rev()
+            .find_map(|f| f.strip_prefix("-mbranch-protection="))
+            .map_or(Ok(Self::default()), Self::parse)
+    }
+
+    /// Whether code is built for either protection.
+    pub fn protects(self) -> bool {
+        self.bti || self.pac_ret.is_some()
+    }
+
+    /// gcc's `__ARM_FEATURE_PAC_DEFAULT`: bit 0 for the A key, bit 1 for
+    /// the B key, bit 2 for `leaf`; undefined without `pac-ret`.
+    pub fn pac_macro(self) -> Option<u32> {
+        self.pac_ret
+            .map(|p| if p.b_key { 2 } else { 1 } | u32::from(p.leaf) << 2)
+    }
+
+    /// The `GNU_PROPERTY_AARCH64_FEATURE_1_AND` bits the unit's
+    /// `.note.gnu.property` carries: BTI (1) and PAC (2). `None`: no note.
+    pub fn feature_bits(self) -> Option<u32> {
+        self.protects()
+            .then_some(u32::from(self.bti) | u32::from(self.pac_ret.is_some()) << 1)
+    }
+}
+
 /// `-pg` (or `-p`): a call to the profiler's counting routine at the entry
 /// of every function, and the x86-64 options that reshape it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1520,6 +1634,8 @@ pub struct Target {
     /// which packed instructions `arch::simd` lists. The baseline for any
     /// other target, where it means nothing.
     pub x86_isa: X86Isa,
+    /// aarch64's `-mbranch-protection=`; none for any other target.
+    pub branch_protection: BranchProtection,
 }
 
 impl Target {
@@ -1554,6 +1670,7 @@ impl Target {
             plain_char: CharSignedness::of(arch, os),
             max_aggregate_register_bits,
             x86_isa: X86Isa::default(),
+            branch_protection: BranchProtection::default(),
         }
     }
 

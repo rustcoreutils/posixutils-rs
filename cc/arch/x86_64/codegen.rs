@@ -1826,7 +1826,7 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.emit_eh_tables(self.pic_mode);
         self.base.push_directive(Directive::UnitEnd);
         if let Some(bits) = self.base.cf_protection.feature_bits() {
-            self.base.push_directive(Directive::X86FeatureNote(bits));
+            self.base.push_directive(Directive::FeatureNote(bits));
         }
 
         // Emit all buffered LIR instructions to output string

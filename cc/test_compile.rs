@@ -209,6 +209,8 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     // As the driver: the `-m` ISA options select x86-64's instructions.
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&o.mflags);
+    } else {
+        target.branch_protection = target::BranchProtection::from_flags(&o.mflags).unwrap();
     }
     if let Some(signedness) = o.plain_char {
         target.plain_char = signedness;

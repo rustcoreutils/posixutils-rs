@@ -16,7 +16,9 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Linkage, Namespace, Symbol, SymbolId, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
-use crate::token::preprocess::{LayoutPragma, PackAction, StorageOrderPragma};
+use crate::token::preprocess::{
+    LayoutPragma, PackAction, StorageOrderPragma, SymbolVisibility, VisibilityPragma,
+};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 use std::collections::{BTreeMap, HashMap};
@@ -54,6 +56,9 @@ pub type ParseResult<T> = Result<T, ParseError>;
 pub(crate) struct RawParam {
     /// Parameter name; None for an unnamed parameter such as `void f(int)`.
     pub(crate) name: Option<StringId>,
+    /// Where it is declared, as gcc's note about an argument passed to it
+    /// points: its name, or the start of an unnamed one's specifiers.
+    pub(crate) pos: Position,
     /// Parameter type, already adjusted from array/function to pointer.
     pub(crate) typ: TypeId,
     /// Run-time size expressions for a variably-modified element type; see
@@ -261,17 +266,34 @@ pub struct Parser<'a> {
     /// an attribute may appear before the declarator, after it, or on the
     /// specifier, and the declarator is built once at the end.
     pub(super) pending_symbol_attrs: crate::parse::ast::SymbolAttrs,
+    /// Every attribute written on the declaration being parsed, as written:
+    /// what `__builtin_has_attribute` asks of the declaration once it is
+    /// bound (`written_attrs`). Carried as `pending_symbol_attrs` is.
+    pub(super) pending_written_attrs: Vec<super::attribute::Attribute>,
+    /// Every attribute written on each declaration of an entity, by what
+    /// it declared: what `__builtin_has_attribute` answers from.
+    pub(super) written_attrs:
+        HashMap<super::has_attribute::WrittenOn, Vec<super::attribute::Attribute>>,
     /// Emission-affecting function attributes seen so far in the declaration
     /// being parsed. Accumulated like `pending_alignas` because a
     /// `constructor` / `noinline` attribute may appear before the declaration
     /// specifiers, between the type and the declarator, or after the
     /// parameter list. Cleared at the start of each external declaration.
     pub(super) pending_fn_attrs: crate::parse::ast::FunctionAttrs,
-    /// `__attribute__((ms_abi))` or `((sysv_abi))` awaiting the declarator
-    /// whose function type it belongs to, with where it was written. A
-    /// property of the type, so it is applied with the other type attributes
-    /// (`apply_pending_type_attrs`) and taken there.
-    pub(super) pending_calling_conv: Option<(crate::abi::CallingConv, Position)>,
+    /// The function-type attributes -- `ms_abi`, `sysv_abi`, `nocf_check`
+    /// -- awaiting the declarator whose function type they belong to. A
+    /// property of the type, so they are applied with the other type
+    /// attributes (`apply_pending_type_attrs`) and taken there.
+    pub(super) pending_fn_type: super::attribute::FnTypeAttrs,
+    /// Whether `nocf_check` means anything: only under
+    /// `-fcf-protection=branch`, as in gcc, which otherwise warns that it
+    /// is ignored.
+    pub(super) cf_branch: bool,
+    /// The x86-64 extensions the unit is compiled for; see
+    /// [`Parser::set_x86_isa`].
+    pub(super) x86_isa: crate::target::X86Isa,
+    /// `-fstrict-flex-arrays=N`; see [`Parser::set_strict_flex_arrays`].
+    pub(super) strict_flex_arrays: u8,
 
     /// What the variadic builtins need to know of the function whose body
     /// is being parsed; the default outside any function. This is the last
@@ -324,6 +346,15 @@ pub struct Parser<'a> {
     /// Every identifier with linkage declared so far, in any scope; see
     /// [`super::linkage`].
     pub(super) linked_names: std::collections::HashMap<StringId, super::linkage::LinkedName>,
+    /// Where each parameter of a function's first prototype is declared,
+    /// by the function's name, for the note on an argument that does not
+    /// suit its parameter.
+    pub(super) param_positions: std::collections::HashMap<StringId, Vec<Position>>,
+    /// The undeclared identifiers reported in the function being parsed, or
+    /// outside every function, each reported once there, as gcc does.
+    pub(super) undeclared_reported: std::collections::HashSet<StringId>,
+    /// Whether gcc's note saying so has been given; it is given once.
+    pub(super) undeclared_noted: bool,
     /// How many operands that are never evaluated enclose the expression
     /// being parsed -- of `sizeof`, `_Alignof`, `typeof`, the controlling
     /// expression of `_Generic`, an arm a constant condition discards. gcc
@@ -338,8 +369,8 @@ pub struct Parser<'a> {
     /// Where a `[*]` was written directly in the parameter list being
     /// parsed; see [`ParameterList::star`].
     pub(super) star_in_params: Option<Position>,
-    /// `#pragma pack` and `#pragma scalar_storage_order` directives, and
-    /// where they stood in the token stream.
+    /// `#pragma pack`, `#pragma scalar_storage_order` and `#pragma GCC
+    /// visibility` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `layout_cursor` is how far the parser has consumed
     /// them. A directive takes effect for every structure defined after it,
@@ -353,6 +384,10 @@ pub struct Parser<'a> {
     /// The storage order `#pragma scalar_storage_order` gives a struct or
     /// union whose own attributes name none.
     storage_order_current: StorageOrderPragma,
+    /// The `#pragma GCC visibility push`ed visibilities, innermost last: the
+    /// last is the one a declaration with external linkage and no
+    /// visibility of its own takes.
+    visibility_stack: Vec<SymbolVisibility>,
     /// Typedef names that specify a variably modified type, and how many
     /// run-time extents each carries (C17 6.7.7).
     ///
@@ -367,6 +402,8 @@ pub struct Parser<'a> {
     /// How a call to a library builtin is evaluated: the optimization level
     /// and `-f[no-]math-errno`. See [`Self::set_library_call_policy`].
     pub(super) library_call_policy: super::library_builtin::LibraryCallPolicy,
+    /// The last [`super::ast::ExprKind::RangeValue`] id given out.
+    pub(super) range_values: u32,
     /// How many `switch` bodies enclose the statement being parsed, which is
     /// all a `fallthrough` attribute statement needs to know to be valid.
     pub(super) switch_depth: u32,
@@ -409,8 +446,13 @@ impl<'a> Parser<'a> {
             tentative_arrays: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
+            pending_written_attrs: Vec::new(),
+            written_attrs: HashMap::new(),
             pending_fn_attrs: Default::default(),
-            pending_calling_conv: None,
+            pending_fn_type: Default::default(),
+            cf_branch: false,
+            x86_isa: Default::default(),
+            strict_flex_arrays: 0,
             enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
             reverse_atomic_members: Vec::new(),
@@ -421,6 +463,9 @@ impl<'a> Parser<'a> {
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             defined_functions: std::collections::HashSet::new(),
             linked_names: std::collections::HashMap::new(),
+            param_positions: std::collections::HashMap::new(),
+            undeclared_reported: std::collections::HashSet::new(),
+            undeclared_noted: false,
             unevaluated: 0,
             last_tag_reference: false,
             param_list_depth: 0,
@@ -429,12 +474,14 @@ impl<'a> Parser<'a> {
             layout_cursor: 0,
             vm_typedefs: HashMap::new(),
             library_call_policy: Default::default(),
+            range_values: 0,
             switch_depth: 0,
             local_labels: Vec::new(),
             next_local_label: 0,
             pack_current: None,
             pack_stack: Vec::new(),
             storage_order_current: StorageOrderPragma::Default,
+            visibility_stack: Vec::new(),
         }
     }
 
@@ -443,6 +490,28 @@ impl<'a> Parser<'a> {
     /// [`LibraryCallPolicy::default`](super::library_builtin::LibraryCallPolicy).
     pub fn set_library_call_policy(&mut self, policy: super::library_builtin::LibraryCallPolicy) {
         self.library_call_policy = policy;
+    }
+
+    /// Whether the unit is built under `-fcf-protection=branch`, which is
+    /// what gives `__attribute__((nocf_check))` a meaning. Off by default.
+    pub fn set_cf_branch(&mut self, branch: bool) {
+        self.cf_branch = branch;
+    }
+
+    /// The x86-64 extensions the unit is compiled for, by the `-m`
+    /// options: whether SSE is on decides whether a
+    /// `no_caller_saved_registers` function compiles. The baseline by
+    /// default.
+    pub fn set_x86_isa(&mut self, isa: crate::target::X86Isa) {
+        self.x86_isa = isa;
+    }
+
+    /// `-fstrict-flex-arrays=N`: which trailing arrays of an object of
+    /// unknown size `__builtin_object_size` takes for flexible ones -- any
+    /// (0, the default), those of zero or one element (1), of zero (2), or
+    /// only a true flexible array member (3).
+    pub fn set_strict_flex_arrays(&mut self, level: u8) {
+        self.strict_flex_arrays = level;
     }
 
     /// The alignment cap `#pragma pack` puts on a structure defined here.
@@ -463,6 +532,13 @@ impl<'a> Parser<'a> {
         self.storage_order_current
     }
 
+    /// The visibility `#pragma GCC visibility` puts on a declaration made
+    /// here, if one is pushed.
+    pub(super) fn current_pragma_visibility(&mut self) -> Option<SymbolVisibility> {
+        self.apply_layout_pragmas();
+        self.visibility_stack.last().copied()
+    }
+
     /// Apply every layout pragma the parse position has now passed.
     fn apply_layout_pragmas(&mut self) {
         while self
@@ -475,6 +551,14 @@ impl<'a> Parser<'a> {
             match pragma {
                 LayoutPragma::Pack(action) => self.apply_pack(action),
                 LayoutPragma::StorageOrder(order) => self.storage_order_current = order,
+                LayoutPragma::Visibility(VisibilityPragma::Push(how)) => {
+                    self.visibility_stack.push(how)
+                }
+                // One with nothing pushed was reported where it stood, by
+                // the preprocessor, and pops nothing.
+                LayoutPragma::Visibility(VisibilityPragma::Pop) => {
+                    self.visibility_stack.pop();
+                }
             }
         }
     }
@@ -490,9 +574,12 @@ impl<'a> Parser<'a> {
             }
             PackAction::Pop => match self.pack_stack.pop() {
                 Some(prev) => self.pack_current = prev,
-                None => diag::warning(
+                None => diag::group_warning(
+                    crate::token::preprocess::PRAGMAS_WARNING,
                     self.current_pos(),
-                    &gettext("'#pragma pack(pop)' with no matching push"),
+                    &gettext(
+                        "'#pragma pack (pop)' encountered without matching '#pragma pack (push)'",
+                    ),
                 ),
             },
         }
@@ -701,20 +788,19 @@ impl<'a> Parser<'a> {
     /// a different type. `typedef struct S TS;` used as `TS x;` in a block
     /// that defines its own `struct S` declared `x` with the inner type.
     ///
-    /// Only the type qualifiers carry over. A storage class -- `typedef`
-    /// above all -- is the declaration's, not the type's: keeping it would
-    /// make `typedef struct Foo Foo;` a different `TypeId` from the tag.
+    /// Only the type qualifiers carry over, and `register`. A storage class
+    /// -- `typedef` above all -- is the declaration's, not the type's:
+    /// keeping it would make `typedef struct Foo Foo;` a different `TypeId`
+    /// from the tag. But `register` is read off the object's type, by every
+    /// refusal of its address, as it is for a scalar: dropped here,
+    /// `register struct S s; &s.m` was accepted.
     ///
     /// [`CompositeType::tag_type`]: crate::types::CompositeType::tag_type
     pub(super) fn intern_type_with_tag(&mut self, typ: &Type) -> TypeId {
         let Some(tag_type) = typ.composite.as_ref().and_then(|c| c.tag_type) else {
             return self.types.intern(typ.clone());
         };
-        let type_qualifier_mask = TypeModifiers::CONST
-            | TypeModifiers::VOLATILE
-            | TypeModifiers::RESTRICT
-            | TypeModifiers::ATOMIC;
-        let qualifiers = typ.modifiers & type_qualifier_mask;
+        let qualifiers = typ.modifiers & (Type::QUALIFIERS | TypeModifiers::REGISTER);
         if qualifiers.is_empty() {
             return tag_type;
         }
@@ -736,6 +822,18 @@ impl<'a> Parser<'a> {
 }
 
 impl Parser<'_> {
+    /// Consume any `__extension__` keywords here.
+    ///
+    /// gcc takes `__extension__` before an external declaration, a block
+    /// item, a member declaration and a `for` declaration, and as a unary
+    /// prefix; it marks a GNU construct and changes nothing about what
+    /// follows. The callers are those places.
+    pub(super) fn skip_gnu_extension(&mut self) {
+        while self.is_keyword(crate::kw::GNU_EXTENSION) {
+            self.advance();
+        }
+    }
+
     pub(super) fn is_declaration_start(&self) -> bool {
         let Some(name_id) = self.current_ident() else {
             return false;

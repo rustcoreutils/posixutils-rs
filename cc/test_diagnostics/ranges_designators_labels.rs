@@ -189,13 +189,13 @@ fn diagnostics_computed_goto_requires_a_pointer() {
     );
 }
 
-/// An index range after a field designator takes a constant value.
+/// An index range after a field designator takes any value.
 ///
 /// `.m[0 ... 3] = v` stands for one designation per index (binutils'
-/// i386-dis.c writes `.op_index[0 ... MAX_OPERANDS - 1] = -1`), which is
-/// only the same thing as gcc's once-evaluated range when evaluating `v`
-/// several times cannot be told from once. A value that is not a constant
-/// is refused rather than silently evaluated again.
+/// i386-dis.c writes `.op_index[0 ... MAX_OPERANDS - 1] = -1`), each with a
+/// copy of `v` that is evaluated once, as gcc's range is: a value with an
+/// effect is accepted in an automatic object, and in a static one is not
+/// constant, as in gcc.
 #[test]
 fn diagnostics_index_range_after_field_designator() {
     compile_expect_ok(
@@ -203,11 +203,16 @@ fn diagnostics_index_range_after_field_designator() {
         "struct S { int m[4]; int t; };\nstruct S s = { .m[0 ... 3] = 7, .t = 9 };\n\
          int main(void){ return (s.m[0] == 7 && s.m[3] == 7 && s.t == 9) ? 0 : 1; }\n",
     );
-    compile_expect_error(
-        "range_after_field_not_constant",
+    compile_expect_ok(
+        "range_after_field_effect",
         "struct S { int m[4]; int t; };\n\
          int f(int *p){ struct S s = { .m[0 ... 3] = (*p)++ }; return s.m[0]; }\n",
-        "index range after a field designator needs a constant value",
+    );
+    compile_expect_error(
+        "range_after_field_static_effect",
+        "int g(void);\nstruct S { int m[4]; int t; };\n\
+         static struct S s = { .m[0 ... 3] = g() };\nstruct S *p = &s;\n",
+        "initializer element is not constant",
     );
     // The nested form works and is what the diagnostic points at.
     compile_expect_ok(

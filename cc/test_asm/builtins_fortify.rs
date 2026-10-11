@@ -20,7 +20,7 @@ const TRIPLES: [&str; 2] = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-g
 const PRELUDE: &str = "typedef unsigned long size_t;\n\
     typedef __builtin_va_list va_list;\n\
     #define os(p) __builtin_object_size(p, 0)\n\
-    char big[8192], small[8];\n\
+    char big[20000], small[8];\n\
     extern const char *s;\n\
     extern size_t n;\n\
     extern void use(char *);\n";
@@ -44,13 +44,15 @@ fn calls_in(asm: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Each case: a function body, and the one function it calls at `-O2`.
+/// Each case: a function body, and the one function it calls at `-O2`. A
+/// constant length that fits is past the 8 KB x86-64 does in place, so its
+/// plain call stays one.
 const CASES: &[(&str, &str)] = &[
     // A known object and a length known to fit: the plain call.
-    ("void *f(void) { return __builtin___memcpy_chk(big, s, 4096, os(big)); }", "memcpy"),
+    ("void *f(void) { return __builtin___memcpy_chk(big, s, 10000, os(big)); }", "memcpy"),
     // ... and the largest of two lengths fits.
     (
-        "void *f(int c) { return __builtin___memset_chk(big, 0, c ? 4096 : 5000, os(big)); }",
+        "void *f(int c) { return __builtin___memset_chk(big, 0, c ? 10000 : 12000, os(big)); }",
         "memset",
     ),
     // A known object and a length known only at run time: checked.
@@ -99,11 +101,11 @@ const CASES: &[(&str, &str)] = &[
     ),
     // A destination found only by propagation: a choice of two objects.
     (
-        "void *f(int c) { char *p = c ? big : big + 4000; return __builtin___memcpy_chk(p, s, 4096, os(p)); }",
+        "void *f(int c) { char *p = c ? big : big + 9000; return __builtin___memcpy_chk(p, s, 10000, os(p)); }",
         "memcpy",
     ),
     (
-        "void *f(int c) { char *p = c ? big + 8000 : small; return __builtin___memcpy_chk(p, s, 4096, os(p)); }",
+        "void *f(int c) { char *p = c ? big + 19000 : small; return __builtin___memcpy_chk(p, s, 10000, os(p)); }",
         "__memcpy_chk",
     ),
 ];
@@ -129,8 +131,8 @@ fn builtins_fortify_sees_through_an_inlined_wrapper() {
          static inline __attribute__((always_inline)) void *\n\
          my_memcpy(void *d, const void *s, size_t k)\n\
          {{ return __builtin___memcpy_chk(d, s, k, os(d)); }}\n\
-         void *fits(void) {{ return my_memcpy(big, s, 4096); }}\n\
-         void *overflows(void) {{ return my_memcpy(small, s, 4096); }}\n"
+         void *fits(void) {{ return my_memcpy(big, s, 10000); }}\n\
+         void *overflows(void) {{ return my_memcpy(small, s, 10000); }}\n"
     );
     for triple in TRIPLES {
         let asm = asm_for_with("fortify_inline", triple, &src, &["-O2"]);
@@ -148,5 +150,45 @@ fn builtins_fortify_keeps_every_check_at_o0() {
     for triple in TRIPLES {
         let asm = asm_for_with("fortify_o0", triple, &src, &["-O0"]);
         assert_eq!(calls_in(&asm, "f"), ["__memcpy_chk"], "{triple}");
+    }
+}
+
+/// The macOS SDK's `<secure/_string.h>`, `<secure/_strings.h>` and
+/// `<secure/_stdio.h>` turn the string and formatted-output functions into
+/// these builtins whenever fortification is on, through `__darwin_obsz`,
+/// whose type argument is an expression. Each reaches its checking function
+/// in the C library -- `memccpy`, `strlcpy` and `strlcat` among them, which
+/// c17 did not know, so it pinned `_FORTIFY_SOURCE` at 0 on Darwin.
+#[test]
+fn darwin_secure_header_builtins() {
+    let src = "typedef unsigned long size_t;\n\
+        typedef __builtin_va_list va_list;\n\
+        #define _USE_FORTIFY_LEVEL 2\n\
+        #define __darwin_obsz0(object) __builtin_object_size (object, 0)\n\
+        #define __darwin_obsz(object) __builtin_object_size (object, _USE_FORTIFY_LEVEL > 1 ? 1 : 0)\n\
+        extern char *d;\n\
+        size_t f(const char *s, int c, size_t n, va_list ap) {\n\
+            __builtin___memccpy_chk(d, s, c, n, __darwin_obsz0(d));\n\
+            __builtin___stpncpy_chk(d, s, n, __darwin_obsz(d));\n\
+            __builtin___vsprintf_chk(d, 0, __darwin_obsz(d), s, ap);\n\
+            return __builtin___strlcpy_chk(d, s, n, __darwin_obsz(d))\n\
+                + __builtin___strlcat_chk(d, s, n, __darwin_obsz(d));\n\
+        }\n\
+        int has = __has_builtin(__builtin___strlcpy_chk) + __has_builtin(__builtin___memccpy_chk)\n\
+            + __has_builtin(__builtin___strlcat_chk) + __has_builtin(__builtin___stpncpy_chk)\n\
+            + __has_builtin(__builtin___vsprintf_chk);\n";
+    for triple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        let asm = asm_for_with("darwin_secure", triple, src, &["-O2"]);
+        // (`__vsprintf_chk` of an object of unknown size folds to
+        // `vsprintf`, as on Linux.)
+        for callee in [
+            "___memccpy_chk",
+            "___strlcpy_chk",
+            "___strlcat_chk",
+            "_vsprintf",
+        ] {
+            assert!(asm.contains(callee), "{triple} {callee}:\n{asm}");
+        }
+        assert!(asm.contains(".long 5"), "{triple}: __has_builtin:\n{asm}");
     }
 }

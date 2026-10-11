@@ -46,21 +46,29 @@ int main(void) {
     assert_eq!(compile_and_run("cpython_flags_pthread", code, &extra), 0);
 }
 
+/// The instruction-set flags CPython's configure probes for its HACL*
+/// SIMD builds are x86-64 options: accepted there, with the macros that
+/// say so, and unrecognized on aarch64, as gcc has them.
 #[test]
-fn cpython_flags_m_flags_unsupported() {
+fn cpython_flags_m_flags() {
     let code = r#"
 int main(void) {
+#if defined(__x86_64__) && !(defined(__SSE4_2__) && defined(__AVX2__))
+    return 1;
+#endif
     return 0;
 }
 "#;
-    let extra = vec![
-        "-msse".to_string(),
-        "-msse2".to_string(),
-        "-mavx2".to_string(),
-        "-march=x86-64".to_string(),
-    ];
-    assert_ne!(
-        compile_and_run("cpython_flags_mflags_unsupported", code, &extra),
-        0
-    );
+    let extra: Vec<String> = [
+        "-msse", "-msse2", "-msse3", "-msse4.1", "-msse4.2", "-mavx2",
+    ]
+    .iter()
+    .map(|f| f.to_string())
+    .collect();
+    let code_of = compile_and_run("cpython_flags_mflags", code, &extra);
+    if cfg!(target_arch = "x86_64") {
+        assert_eq!(code_of, 0);
+    } else {
+        assert_ne!(code_of, 0);
+    }
 }

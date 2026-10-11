@@ -13,7 +13,7 @@ use super::codegen::Aarch64CodeGen;
 use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
-use crate::float::IntegralRounding;
+use crate::float::{IntegerRounding, IntegralRounding};
 use crate::ir::{FloatCmp, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
@@ -822,6 +822,30 @@ impl Aarch64CodeGen {
             }
             Opcode::FCvtS => {
                 self.push_lir(Aarch64Inst::Fcvtzs {
+                    fp_size,
+                    int_size,
+                    src: VReg::V17,
+                    dst: dst_reg,
+                });
+            }
+            // `lrint`: rounded in the current direction, then converted
+            // exactly, as gcc does it.
+            Opcode::RoundToInteger(IntegerRounding::Rint) => {
+                self.push_lir(Aarch64Inst::Frint {
+                    how: IntegralRounding::Rint,
+                    size: fp_size,
+                    src: VReg::V17,
+                    dst: VReg::V17,
+                });
+                self.push_lir(Aarch64Inst::Fcvtzs {
+                    fp_size,
+                    int_size,
+                    src: VReg::V17,
+                    dst: dst_reg,
+                });
+            }
+            Opcode::RoundToInteger(IntegerRounding::Round) => {
+                self.push_lir(Aarch64Inst::Fcvtas {
                     fp_size,
                     int_size,
                     src: VReg::V17,

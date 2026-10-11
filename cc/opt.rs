@@ -26,7 +26,7 @@ use crate::ir::loadfwd;
 use crate::ir::mem2reg::mem2reg;
 use crate::ir::memexpand;
 use crate::ir::memloc;
-use crate::ir::objsize::{self, ObjectSizes, Settle};
+use crate::ir::objsize::{self, ObjectSizes, Scope, Settle};
 use crate::ir::sccp;
 use crate::ir::vrp;
 use crate::ir::{Function, Module, Opcode};
@@ -202,7 +202,13 @@ const PASSES: [Pass; 13] = [
     // `libcall_fold` sees the size a `_chk` call checks against. One whose
     // object is still unknown waits for the end: see `optimize_function`.
     ("objsize", |f, c| {
-        objsize::run(f, c.types, c.sizes, Settle::Known)
+        objsize::run(
+            f,
+            c.types,
+            c.sizes,
+            Scope::Optimizing(c.fold),
+            Settle::Known,
+        )
     }),
     // `sccp` proves branches dead, which `instcombine` cannot, and leaves
     // behind `Copy` from a constant -- exactly the shape `instcombine`'s
@@ -436,40 +442,49 @@ fn suppress_forwarding_bodies(module: &mut Module) {
     }
 }
 
-/// Diagnose a pack the inliner could not resolve.
+/// Diagnose a call the inliner had to splice and could not.
 ///
-/// Reachable when `always_inline` is refused for a reason of its own -- a
-/// callee that also uses `va_start`, or `alloca`, is turned down in
-/// `ir::inline` before the attribute is consulted. The body is already
-/// suppressed by then, so what is wrong is the surviving *call site*, and that
-/// is what this looks for. GCC reports the same situation as an error.
-fn check_forwarding_resolved(module: &Module) {
-    // Two kinds of function have no out-of-line copy to fall back on. A
-    // `__builtin_va_arg_pack` forwarder is suppressed on the assumption it
-    // always inlines. And an inline definition marked `always_inline` that no
-    // call site *can* substitute -- it reads its own variadic frame, is
-    // recursive, takes a label's address, returns an address, or is also
-    // marked `noinline` -- is a contradiction gcc rejects too.
-    //
-    // A plain C99 inline definition is deliberately not in this set: its
-    // external definition may live in another translation unit, so an ordinary
-    // call to it is correct and the linker resolves it.
-    //
-    // Neither is an `always_inline` function the inliner merely *declined*.
-    // Its caps on caller size and on recursive stack depth are c17's own, and
-    // gcc has no counterpart: treating those refusals as unresolvable rejected
-    // programs gcc compiles, which any recursive function over a few hundred
-    // instructions calling a glibc `__fortify_function` reached. The call is
-    // left standing and the linker resolves it against the out-of-line
-    // definition the inline definition promises.
+/// Two kinds of function must never be left as a call. A
+/// `__builtin_va_arg_pack` forwarder is suppressed on the assumption it always
+/// inlines. And an `always_inline` function is, to gcc, always inlined: one
+/// whose body can never be copied -- it builds its own variadic frame,
+/// contains a computed goto, saves a label in a static, receives a non-local
+/// goto -- is rejected wherever it is called, out-of-line copy or not, in
+/// gcc's words. One that is merely recursive, returns an address or is also
+/// `noinline` is an error only when no out-of-line copy exists to call; gcc
+/// at -O2 leaves a self-recursive one's inner call standing too.
+///
+/// Nothing about a *caller* -- its size, its recursion -- refuses an
+/// `always_inline` splice (`ir::inline::should_inline`), so no such call
+/// survives for a reason this does not know.
+///
+/// A plain C99 inline definition is deliberately not in this set: its
+/// external definition may live in another translation unit, so an ordinary
+/// call to it is correct and the linker resolves it.
+fn check_forwarding_resolved(module: &Module, already: &HashSet<&str>) {
+    enum Unresolved {
+        Forwarder,
+        NeverCopied(&'static str),
+        NoOutOfLineCopy,
+    }
     let impossible = crate::ir::inline::impossible_always_inline(module);
-    let suppressed: std::collections::BTreeMap<&str, bool> = module
+    let unresolved: std::collections::BTreeMap<&str, Unresolved> = module
         .functions
         .iter()
-        .filter(|f| !f.emit && (forwards_caller_arguments(f) || impossible.contains(&f.name)))
-        .map(|f| (f.name.as_str(), forwards_caller_arguments(f)))
+        .filter_map(|f| {
+            let why = if !f.emit && forwards_caller_arguments(f) {
+                Unresolved::Forwarder
+            } else {
+                match impossible.get(&f.name) {
+                    Some(Some(reason)) => Unresolved::NeverCopied(reason),
+                    Some(None) if !f.emit => Unresolved::NoOutOfLineCopy,
+                    _ => return None,
+                }
+            };
+            Some((f.name.as_str(), why))
+        })
         .collect();
-    if suppressed.is_empty() {
+    if unresolved.is_empty() {
         return;
     }
 
@@ -482,28 +497,106 @@ fn check_forwarding_resolved(module: &Module) {
             let Some(callee) = insn.local_callee() else {
                 continue;
             };
-            let Some(&forwards) = suppressed.get(callee) else {
+            let Some(why) = unresolved.get(callee) else {
                 continue;
             };
-            if reported.insert(callee) {
+            if !already.contains(callee) && reported.insert(callee) {
                 // The call site, not line 0: it is the thing that cannot be
                 // resolved, and the only position either function still has.
-                if forwards {
-                    crate::diag::error_args(
-                        insn.pos.unwrap_or_default(),
-                        "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
-                        &[callee],
-                    );
-                } else {
-                    crate::diag::error_args(
-                        insn.pos.unwrap_or_default(),
-                        "inlining failed in call to 'always_inline' '{0}', which has no out-of-line definition",
-                        &[callee],
-                    );
-                }
+                let pos = insn.pos.unwrap_or_default();
+                let text = match why {
+                    Unresolved::Forwarder => "'__builtin_va_arg_pack' in '{0}' could not be forwarded: the function was not inlined",
+                    Unresolved::NeverCopied(reason) => reason,
+                    Unresolved::NoOutOfLineCopy => "inlining failed in call to 'always_inline' '{0}', which has no out-of-line definition",
+                };
+                crate::diag::error_args(pos, text, &[callee]);
             }
         }
     }
+}
+
+/// A file-scope register variable in the frame pointer, which every c17
+/// function sets up for its own frame. gcc refuses a function that needs
+/// one, once per unit, at the first; to c17 every function does. A unit
+/// that defines none compiles.
+fn check_reserved_frame_pointer(module: &Module) {
+    if !module.global_registers.iter().any(|r| r.is_frame_pointer()) {
+        return;
+    }
+    if let Some(func) = module.functions.iter().find(|f| f.emit) {
+        crate::diag::error(
+            crate::arch::func_pos(func),
+            &gettext("frame pointer required, but reserved"),
+        );
+    }
+}
+
+/// gcc's verdict on recursion among `always_inline` functions, which it can
+/// never finish splicing; answers the functions it named.
+///
+/// A cycle through two or more ([`inline::always_inline_cycles`]) is
+/// rejected at every level once anything keeps it, naming the first one
+/// defined, at its call from inside the cycle. A function that calls itself
+/// is rejected at -O0 when another function calls it -- gcc splices that
+/// call and leaves the recursive ones inside the copy -- and at -O1 and -Og
+/// whenever it is kept. From -O2 gcc's verdict turns on whether its
+/// tail-recursion pass removed the call first; c17 has no such pass to match
+/// and accepts, calling the out-of-line copy as it does at every level.
+///
+/// Reported at each recursive call site, the `called from here` of gcc's
+/// note: the position c17 has for a call.
+fn check_always_inline_recursion(module: &Module, opt: Optimization) -> HashSet<&str> {
+    let calls_to = |caller: &'_ Function, callee: &str| -> Vec<crate::diag::Position> {
+        let mut sites: Vec<_> = caller
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .filter(|insn| insn.local_callee() == Some(callee))
+            .map(|insn| insn.pos.unwrap_or_default())
+            .collect();
+        sites.dedup();
+        sites
+    };
+    let mut named = HashSet::new();
+    for cycle in inline::always_inline_cycles(module) {
+        let first = &module.functions[cycle[0]];
+        let (template, sites) = if cycle.len() > 1 {
+            if !cycle.iter().any(|&i| module.functions[i].emit) {
+                continue;
+            }
+            let site = cycle[1..]
+                .iter()
+                .flat_map(|&i| calls_to(&module.functions[i], &first.name))
+                .take(1)
+                .collect();
+            (
+                "inlining failed in call to 'always_inline' '{0}': function not inlinable",
+                site,
+            )
+        } else if !opt.optimizes() {
+            let called_elsewhere = module
+                .functions
+                .iter()
+                .filter(|f| f.emit && f.name != first.name)
+                .any(|f| !calls_to(f, &first.name).is_empty());
+            if !called_elsewhere {
+                continue;
+            }
+            ("inlining failed in call to 'always_inline' '{0}': function not considered for inlining", calls_to(first, &first.name))
+        } else if !opt.inlines_aggressively() && first.emit {
+            (
+                "inlining failed in call to 'always_inline' '{0}': recursive inlining",
+                calls_to(first, &first.name),
+            )
+        } else {
+            continue;
+        };
+        for pos in sites {
+            crate::diag::error_args(pos, template, &[&first.name]);
+        }
+        named.insert(first.name.as_str());
+    }
+    named
 }
 
 /// Optimize a module as `opt` asks.
@@ -541,7 +634,9 @@ pub fn optimize_module(
     // Every pack should have been resolved by the splice above. One that
     // survives would be emitted as a call with its arguments missing, so say
     // so instead.
-    check_forwarding_resolved(module);
+    check_reserved_frame_pointer(module);
+    let recursive = check_always_inline_recursion(module, opt);
+    check_forwarding_resolved(module, &recursive);
 
     // A `memcpy`, `memset` or `memmove` of a small constant length becomes
     // loads and stores at every level, as the linearizer's own aggregate
@@ -554,6 +649,12 @@ pub fn optimize_module(
     let report = if opt.optimizes() {
         optimize_functions(module, types, target, MAX_ITERATIONS)
     } else {
+        // gcc answers `__builtin_dynamic_object_size` of a fixed-size
+        // object at a run-time offset even unoptimized.
+        let sizes = ObjectSizes::build(module, types);
+        for func in &mut module.functions {
+            objsize::run(func, types, &sizes, Scope::Unoptimized, Settle::Everything);
+        }
         OptReport::default()
     };
 
@@ -572,7 +673,65 @@ pub fn optimize_module(
     // An address that survived everything above would reach the link as an
     // undefined reference to the suppressed body.
     report_forwarder_copies(&forwarder_addresses(module, &forwarders));
+    report_attribute_calls(module);
     report
+}
+
+/// gcc's diagnostic for every call that survived optimization to a
+/// function declared with `error("msg")` or `warning("msg")`, at the call,
+/// the error first.
+///
+/// After the optimizer, as gcc reports them while expanding the calls that
+/// are left: a call in a branch the optimizer proved dead is no call, which
+/// is what the Linux kernel's `BUILD_BUG_ON` relies on, and a call inlined
+/// into another function is reported once, where it was written. A call
+/// through a pointer the optimizer made direct is a direct call by then.
+fn report_attribute_calls(module: &Module) {
+    use crate::parse::ast::CallDiagnostics;
+    let defined = module
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), &f.symbol_attrs.call_diagnostics));
+    let declared = module
+        .declared_symbol_attrs
+        .iter()
+        .map(|(name, attrs)| (name.as_str(), &attrs.call_diagnostics));
+    let said: std::collections::HashMap<&str, &CallDiagnostics> = defined
+        .chain(declared)
+        .filter(|(_, d)| d.error.is_some() || d.warning.is_some())
+        .collect();
+    if said.is_empty() {
+        return;
+    }
+    for func in module.functions.iter().filter(|f| f.emit) {
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            if insn.op != Opcode::Call {
+                continue;
+            }
+            let Some(callee) = insn.extra().func_name.as_deref() else {
+                continue;
+            };
+            let Some(diags) = said.get(callee) else {
+                continue;
+            };
+            let pos = insn.pos.unwrap_or_default();
+            if let Some(msg) = &diags.error {
+                crate::diag::error_args(
+                    pos,
+                    "call to '{0}' declared with attribute error: {1}",
+                    &[callee, msg],
+                );
+            }
+            if let Some(msg) = &diags.warning {
+                crate::diag::group_warning_args(
+                    "attribute-warning",
+                    pos,
+                    "call to '{0}' declared with attribute warning: {1}",
+                    &[callee, msg],
+                );
+            }
+        }
+    }
 }
 
 /// Run the per-function passes over every function, each for at most
@@ -633,7 +792,8 @@ fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) 
         still_changing: Vec::new(),
     };
     run_passes(func, ctx, max_iterations, &mut c);
-    if objsize::run(func, ctx.types, ctx.sizes, Settle::Everything) {
+    let scope = Scope::Optimizing(ctx.fold);
+    if objsize::run(func, ctx.types, ctx.sizes, scope, Settle::Everything) {
         run_passes(func, ctx, max_iterations, &mut c);
     }
     c

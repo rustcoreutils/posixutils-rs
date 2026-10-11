@@ -401,7 +401,7 @@ fn diagnostics_typedef_and_object_in_one_scope_collide() {
         ("enumerator_then_td", "enum { E };\ntypedef int E;\n"),
         ("parameter_then_td", "void f(int x){ typedef int x; }\n"),
     ] {
-        compile_expect_error(name, src, "redeclared as a different kind of symbol");
+        compile_expect_error(name, src, "redeclared as different kind of symbol");
     }
     compile_expect_ok(
         "td_shadowed_in_inner_scope",
@@ -748,7 +748,7 @@ fn diagnostics_redeclaration_is_reported_at_the_declarator() {
     compile_expect_error(
         "typedef_redef_at_declarator",
         "typedef int T;\ntypedef\n  double U, T;\n",
-        ":3:13: error: typedef 'T' redefined",
+        ":3:13: error: conflicting types for 'T'",
     );
 }
 

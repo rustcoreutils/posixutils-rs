@@ -70,6 +70,57 @@ fn test_named_machine_modes() {
     assert_eq!(size("uw"), (8, true));
 }
 
+/// `setjmp` and `_setjmp` are ordinary identifiers wherever they are not
+/// called: glibc's `libc_hidden_proto (_setjmp)` is `extern __typeof
+/// (_setjmp) _setjmp __attribute__((visibility("hidden")));`, and a program
+/// may take their addresses. The parser wanted a `(` after either name.
+#[test]
+fn test_setjmp_names_outside_a_call() {
+    let src = "typedef int jb[8];\n\
+               extern int setjmp(jb);\n\
+               extern int _setjmp(jb);\n\
+               extern void longjmp(jb, int);\n\
+               extern __typeof(_setjmp) _setjmp __attribute__((visibility(\"hidden\")));\n\
+               extern __typeof(setjmp) setjmp;\n\
+               int (*p)(jb) = &setjmp, (*q)(jb) = _setjmp;\n\
+               void (*r)(jb, int) = longjmp;\n\
+               jb env;\n\
+               int f(void) { return setjmp(env) + _setjmp(env) + (p == q); }\n";
+    let before = crate::diag::error_count();
+    let parsed = parse_tu(src);
+    assert!(parsed.is_ok(), "{:?}", parsed.err());
+    assert_eq!(crate::diag::error_count(), before);
+}
+
+/// libgcc's own modes, which glibc's soft-fp declares its comparison results
+/// and shift counts with (`__gcc_CMPtype`), so they must be libgcc's widths:
+/// the shift count is a word everywhere, and the comparison result a word
+/// on x86-64 but `SImode` on aarch64 -- gcc 13 and aarch64-linux-gnu-gcc 13
+/// answer `sizeof` 8 and 8, 4 and 8. They were "not implemented" and kept
+/// the declared `int`.
+#[test]
+fn test_libgcc_machine_modes() {
+    let src = "typedef int cmp_t __attribute__((mode(__libgcc_cmp_return__)));\n\
+               typedef unsigned sh_t __attribute__((__mode__(libgcc_shift_count)));";
+    for (arch, cmp_bytes) in [(Arch::X86_64, 8), (Arch::Aarch64, 4)] {
+        let target = Target::new(arch, Os::Linux);
+        let before = crate::diag::warning_count();
+        let (_, types, strings, symbols): (_, _, _, SymbolTable) =
+            parse_tu_for(src, &target).expect("parses");
+        assert_eq!(crate::diag::warning_count(), before, "{arch:?}: warned");
+        let size = |name: &str| {
+            let id = strings.lookup(name).expect("interned");
+            let typ = symbols
+                .lookup(id, Namespace::Ordinary)
+                .expect("declared")
+                .typ;
+            (types.size_bytes(typ), types.is_unsigned(typ))
+        };
+        assert_eq!(size("cmp_t"), (cmp_bytes, false), "{arch:?}");
+        assert_eq!(size("sh_t"), (8, true), "{arch:?}");
+    }
+}
+
 /// The declarators of the last function in `src`'s body, in order: each
 /// one's name, type and initializer.
 fn body_declarators(src: &str) -> (Vec<(String, TypeId, Option<Expr>)>, TypeTable) {
@@ -186,5 +237,145 @@ fn test_auto_type_misuse_is_refused() {
             parsed.is_err() || crate::diag::error_count() > before,
             "{src}: accepted"
         );
+    }
+}
+
+/// gcc's `__signed` and `__signed__` are keywords spelling `signed`, not
+/// macros, so the parser meets them as written -- in a `.i` from gcc, or
+/// wherever the preprocessor leaves them.
+#[test]
+fn test_gnu_signed_spellings_are_signed() {
+    for spelled in ["__signed", "__signed__"] {
+        let src = format!("{spelled} char c; {spelled} x; long {spelled} int l;");
+        let (_, types, strings, symbols) = parse_tu(&src).unwrap();
+        let type_of = |name: &str| {
+            let id = strings.lookup(name).expect(name);
+            symbols.lookup(id, Namespace::Ordinary).expect(name).typ
+        };
+        let c = type_of("c");
+        assert_eq!(types.kind(c), TypeKind::Char, "{spelled}");
+        assert!(
+            types.modifiers(c).contains(TypeModifiers::SIGNED),
+            "{spelled}"
+        );
+        assert_eq!(types.kind(type_of("x")), TypeKind::Int, "{spelled}");
+        assert_eq!(types.kind(type_of("l")), TypeKind::Long, "{spelled}");
+    }
+    let before = crate::diag::error_count();
+    let _ = parse_tu("__signed__ unsigned u;");
+    assert!(crate::diag::error_count() > before, "signed and unsigned");
+}
+
+/// `__extension__` is a keyword, not a macro for nothing: the parser takes
+/// it where gcc does -- before an external declaration, a block item, a
+/// member declaration, a `for` declaration, and as a unary prefix.
+#[test]
+fn test_gnu_extension_keyword_positions() {
+    let src = "__extension__ typedef long long ll;\n\
+               __extension__ __extension__ static int z;\n\
+               struct s { __extension__ union { int a; }; __extension__ int b; };\n\
+               int f(void) {\n\
+                 __extension__ int x = __extension__ 1;\n\
+                 for (__extension__ int i = 0; i < 1; i++) x += i;\n\
+                 __extension__ x++;\n\
+                 return __extension__ ({ x; }) + (__extension__ sizeof(ll));\n\
+               }\n";
+    let before = crate::diag::error_count();
+    let parsed = parse_tu(src);
+    assert!(parsed.is_ok(), "{:?}", parsed.err().map(|e| e.message));
+    assert_eq!(crate::diag::error_count(), before);
+}
+
+/// Before a block item that is no declaration, `__extension__` is the unary
+/// operator of an expression statement, as in gcc, which consumes all but
+/// the last of a run to tell: no label follows one. c17 skipped the run and
+/// took `__extension__ l:` as the label `l`.
+#[test]
+fn test_gnu_extension_before_a_label_is_an_expression() {
+    for (src, want) in [
+        (
+            "int f(void) { int l = 0; __extension__ l: return l; }",
+            "expected ';'",
+        ),
+        (
+            "int f(void) { int l = 0; __extension__ __extension__ l: return l; }",
+            "expected ';'",
+        ),
+        (
+            "int f(int c) { switch (c) { __extension__ case 1: return 0; } return 1; }",
+            "expected expression before 'case'",
+        ),
+        (
+            "int f(int c) { switch (c) { __extension__ default: return 0; } return 1; }",
+            "expected expression before 'default'",
+        ),
+    ] {
+        let Err(err) = parse_tu(src) else {
+            panic!("{src}: accepted");
+        };
+        assert!(err.message.contains(want), "{src}: {}", err.message);
+    }
+    // A label then `__extension__` is the label on an expression statement.
+    let parsed = parse_tu("int f(int x) { l: __extension__ x++; return x; }");
+    assert!(parsed.is_ok(), "{:?}", parsed.err().map(|e| e.message));
+}
+
+/// An attribute between a struct, union or enum tag and a body ends the
+/// specifier, as in gcc: the attributes are the declaration's, so the body
+/// has nothing to belong to. c17 laid the struct or union out with them.
+/// Before the tag, after the body, and after a tag with no body, they stay.
+#[test]
+fn test_attribute_between_tag_and_body_is_refused() {
+    const GCC: &str = "expected identifier or '(' before '{' token";
+    for (src, want) in [
+        ("struct T __attribute__((packed)) { int a; char b; };", GCC),
+        ("union U __attribute__((aligned(16))) { int a; };", GCC),
+        ("struct T __attribute__((unknown_thing)) { int a; };", GCC),
+        // An enum's attributes were never read there; the declarator
+        // refuses the brace.
+        (
+            "enum E __attribute__((packed)) { X };",
+            "expected identifier",
+        ),
+    ] {
+        let Err(err) = parse_tu(src) else {
+            panic!("{src}: accepted");
+        };
+        assert!(err.message.contains(want), "{src}: {}", err.message);
+    }
+    let ok = "struct __attribute__((packed)) P { int a; char b; };\n\
+              struct Q { int a; char b; } __attribute__((packed));\n\
+              struct __attribute__((packed)) __attribute__((aligned(4))) { int a; } anon;\n\
+              struct P __attribute__((aligned(32))) aligned_p;\n\
+              int size_p = sizeof(struct P);";
+    let parsed = parse_tu(ok);
+    assert!(parsed.is_ok(), "{:?}", parsed.err().map(|e| e.message));
+}
+
+/// Every spelling of `volatile`, `inline` and `goto` qualifies an asm
+/// statement, after any spelling of `asm`.
+#[test]
+fn test_asm_qualifier_spellings() {
+    for asm in ["asm", "__asm", "__asm__"] {
+        for quals in [
+            "__inline volatile",
+            "__inline__ __volatile__",
+            "volatile __inline",
+            "__volatile",
+            "inline",
+            "goto __inline",
+        ] {
+            let src = if quals.contains("goto") {
+                format!("void f(void) {{ {asm} {quals}(\"\" ::: \"memory\" : l); l:; }}")
+            } else {
+                format!("void f(void) {{ {asm} {quals}(\"\" ::: \"memory\"); }}")
+            };
+            let parsed = parse_tu(&src);
+            assert!(
+                parsed.is_ok(),
+                "{src}: {:?}",
+                parsed.err().map(|e| e.message)
+            );
+        }
     }
 }

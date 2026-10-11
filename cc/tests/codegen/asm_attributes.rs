@@ -1051,6 +1051,45 @@ int main(void)
     }
 }
 
+/// glibc's `libc_hidden_weak` on a function with a `gnu_inline` body in its
+/// public header (`getc_unlocked`): `__GI_g` names that body and is a weak
+/// hidden alias of `__g`, and the public `g` a weak alias of `__GI_g`. c17
+/// refused it ("aliased to external symbol '__GI_g'"); every name must now
+/// reach the one definition from another unit.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn codegen_alias_through_a_name_with_an_inline_body() {
+    let unit_a = r#"
+extern __inline __attribute__((__gnu_inline__)) int g(int x) { return x + 1; }
+extern __typeof(g) g __asm__("__GI_g") __attribute__((visibility("hidden")));
+int __g(int x) { return x + 1; }
+extern __typeof(__g) g __attribute__((weak, alias("__g")));
+extern __typeof(g) __EI_g __asm__("g");
+extern __typeof(g) __EI_g __attribute__((alias("__GI_g"))) __attribute__((weak));
+int use(int x) { return g(x) + 1; }
+int (*addr(void))(int) { return g; }
+"#;
+    let unit_b = r#"
+int g(int);
+int __g(int);
+extern int gi(int) __asm__("__GI_g");
+int use(int);
+int (*addr(void))(int);
+int main(void)
+{
+    return !(g(1) == 2 && __g(2) == 3 && gi(3) == 4 && use(1) == 3 && addr()(5) == 6
+             && addr() == gi);
+}
+"#;
+    for opt in [&["-O0".to_string()][..], &["-O2".to_string()][..]] {
+        assert_eq!(
+            compile_and_run_two_units("alias_inline_body", unit_a, unit_b, opt),
+            0,
+            "{opt:?}"
+        );
+    }
+}
+
 /// GNU attributes inside a type-name -- in a cast, `sizeof`, `_Alignof`,
 /// `typeof` and a compound literal -- were rejected. `aligned` aligns the
 /// type named, `mode` and `vector_size` replace it, and none of them reach an

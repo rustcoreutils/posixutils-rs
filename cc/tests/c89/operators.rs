@@ -11,7 +11,43 @@
 // Consolidates: bitfield, mixed_cmp, ops_struct, short_circuit tests
 //
 
-use crate::common::{compile_and_run, compile_and_run_everywhere};
+use crate::common::{compile_and_run, compile_and_run_everywhere, compile_object_run};
+
+/// Pointers to arrays whose elements differ only in qualifiers subtract and
+/// compare as gcc's (C2x's rule: an array is as qualified as its elements):
+/// glibc's nss does `char (*p)[19] = bsearch(...); return p - names;` with
+/// `static const char names[][19]`. Only `-pedantic` objects, in gcc's words.
+#[test]
+fn c89_pointer_difference_of_differently_qualified_arrays() {
+    let src = r#"
+static const char names[][19] = { "alpha", "beta", "gamma" };
+__attribute__((noinline)) long idx(char (*p)[19]) { return p - names; }
+__attribute__((noinline)) long back(const char (*p)[19], char (*q)[19]) { return q - p; }
+__attribute__((noinline)) long vc(volatile int (*p)[2][3], const int (*q)[2][3]) { return p - q; }
+static int grid[4][2][3];
+int main(void) {
+    char (*p)[19] = (char (*)[19])&names[2];
+    if (idx(p) != 2) return 1;
+    if (back(&names[1], p) != 1) return 2;
+    if (!(p > names) || p == names || names >= p) return 3;
+    if (vc((volatile int (*)[2][3])&grid[3], (const int (*)[2][3])&grid[1]) != 2) return 4;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("qualified_array_difference", src);
+    let quiet = compile_object_run("qualified_array_difference", src, &["-Wall"]);
+    assert!(quiet.success && quiet.stderr.is_empty(), "{}", quiet.stderr);
+    let pedantic = compile_object_run("qualified_array_difference", src, &["-Wpedantic"]);
+    assert!(pedantic.success, "{}", pedantic.stderr);
+    let want = "warning: invalid use of pointers to arrays with different qualifiers \
+                in ISO C before C2X [-Wpedantic]";
+    assert_eq!(
+        pedantic.stderr.matches(want).count(),
+        6,
+        "{}",
+        pedantic.stderr
+    );
+}
 
 // ============================================================================
 // Mega-test: C89 operators (bitfield, mixed_cmp, ops_struct, short_circuit)

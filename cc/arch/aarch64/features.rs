@@ -12,7 +12,7 @@
 use super::call::HfaElem;
 use super::codegen::Aarch64CodeGen;
 use super::frame::UNROLL_LIMIT_BYTES;
-use super::lir::{Aarch64Inst, GpOperand, MemAddr};
+use super::lir::{Aarch64Inst, GpOperand, Hint, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::codegen::BswapSize;
 use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, OperandSize, Symbol};
@@ -1317,64 +1317,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    // setjmp/longjmp/alloca support
-
-    /// Emit setjmp(env) - saves execution context
-    /// AAPCS64: env in X0, returns int in W0
-    pub(super) fn emit_setjmp(&mut self, insn: &Instruction) {
-        let env = match insn.src.first() {
-            Some(&e) => e,
-            None => return,
-        };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Put env argument in X0 (first argument register)
-        self.emit_move(env, Reg::X0, 64);
-
-        // Call setjmp
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Store result from W0 to target
-        let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X0, &dst_loc, u32::BITS);
-    }
-
-    /// Emit longjmp(env, val) - restores execution context (noreturn)
-    /// AAPCS64: env in X0, val in X1
-    pub(super) fn emit_longjmp(&mut self, insn: &Instruction) {
-        let env = match insn.src.first() {
-            Some(&e) => e,
-            None => return,
-        };
-        let val = match insn.src.get(1) {
-            Some(&v) => v,
-            None => return,
-        };
-
-        // CONSTRAINT: Load val into X1 BEFORE loading env into X0.
-        // If env is loaded into X0 first and val happens to be in X0 (first
-        // function argument), it would be overwritten. This is a manual constraint
-        // that will be expressible through the constraint system when inline asm
-        // support is added.
-        self.emit_move(val, Reg::X1, 32);
-
-        // Put env argument in X0 (first argument register)
-        self.emit_move(env, Reg::X0, 64);
-
-        // Call longjmp (noreturn - control never comes back)
-        self.push_lir(Aarch64Inst::Bl {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
-
-        // Emit brk after longjmp since it never returns
-        // This helps catch any bugs where longjmp somehow returns
-        self.push_lir(Aarch64Inst::Brk { imm: 1 });
-    }
+    // gcc's non-local goto
 
     /// gcc's `__builtin_setjmp(buf)`: inline, with no library call.
     ///
@@ -1445,6 +1388,7 @@ impl Aarch64CodeGen {
         });
 
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(resume)));
+        self.emit_jump_landing_pad();
         self.emit_frame_base_latch();
         self.push_lir(Aarch64Inst::Mov {
             size: OperandSize::B32,
@@ -1536,14 +1480,34 @@ impl Aarch64CodeGen {
         // From the saved frame record, even at level 0: x30 itself is
         // overwritten by any call the function has made before this point.
         self.emit_frame_walk(insn.frame_level());
-        self.push_lir(Aarch64Inst::Ldr {
-            size: OperandSize::B64,
-            addr: MemAddr::BaseOffset {
-                base: Reg::X9,
-                offset: 8,
-            },
-            dst: Reg::X9,
-        });
+        if self.base.branch_protection.pac_ret.is_some() {
+            // Signed where it was saved: stripped of its signature, as gcc
+            // does, through x30 -- the one register `xpaclri` works on, and
+            // free here, since the epilogue reloads it from the frame.
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X9,
+                    offset: 8,
+                },
+                dst: Reg::lr(),
+            });
+            self.push_lir(Aarch64Inst::Hint(Hint::Xpaclri));
+            self.push_lir(Aarch64Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::lr()),
+                dst: Reg::X9,
+            });
+        } else {
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::X9,
+                    offset: 8,
+                },
+                dst: Reg::X9,
+            });
+        }
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
     }
@@ -1610,6 +1574,17 @@ impl Aarch64CodeGen {
         });
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
+    }
+
+    /// The start of a landing pad, where the unwinder jumps with the
+    /// exception object in X0: a `bti j` under `bti`, the jump being an
+    /// indirect one, then the object to its home.
+    pub(super) fn emit_landing_pad(&mut self, insn: &Instruction) {
+        self.emit_jump_landing_pad();
+        if let Some(target) = insn.target {
+            let dst_loc = self.get_location(target);
+            self.emit_move_to_loc(Reg::X0, &dst_loc, 64);
+        }
     }
 
     /// Put SP back to a saved value, releasing everything alloca'd since.

@@ -10,9 +10,11 @@
 // and the moves that place operands where a constraint demands
 //
 
-use crate::arch::asm_constraints::{canonical_int, AsmOperandClass, AsmRegClass, X87Slot};
+use crate::arch::asm_constraints::{
+    canonical_int, AsmOperandClass, AsmRegClass, FlagCondition, X87Slot,
+};
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
-use crate::arch::lir::{Directive, FpSize};
+use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::X86Inst;
 use crate::arch::x86_64::regalloc::{asm_pinned_regs, Loc, Reg, XmmReg};
@@ -66,6 +68,9 @@ struct AsmOperandBuild {
     /// Carries the output's index, which a tied input names.
     x87_store: Option<(usize, X87Operand)>,
     x87_slots: usize,
+    /// Flag outputs, read off the flags once the template has run:
+    /// (condition, destination, operand size in bits).
+    flag_outputs: Vec<(FlagCondition, Loc, u32)>,
 }
 
 /// One operand on the x87 register stack.
@@ -117,6 +122,16 @@ pub(super) fn sse_operands(asm: &AsmData) -> impl Iterator<Item = &AsmConstraint
         .iter()
         .chain(&asm.inputs)
         .filter(|c| !c.is_memory() && requires_sse(effective_class(asm, c)))
+}
+
+/// The memory operand `mem` of asm operand `c`, through the segment of the
+/// address space its object is in: `%gs:var(%rip)`.
+fn through_segment(c: &AsmConstraint, mem: String) -> String {
+    match c.addr_space {
+        crate::types::AddressSpace::Generic => mem,
+        crate::types::AddressSpace::SegFs => format!("%fs:{mem}"),
+        crate::types::AddressSpace::SegGs => format!("%gs:{mem}"),
+    }
 }
 
 /// Whether the class offers a general register.
@@ -173,6 +188,7 @@ impl AsmOperandBuild {
             x87_pushes: Vec::new(),
             x87_store: None,
             x87_slots: 0,
+            flag_outputs: Vec::new(),
         }
     }
 }
@@ -194,17 +210,18 @@ fn find_temp_reg(
             return r;
         }
     }
-    crate::diag::error(
-        pos.unwrap_or_default(),
-        "too many register operands in one asm statement; c17 has no register \
-         left to give one",
-    );
+    crate::arch::codegen::report_asm_registers_exhausted(pos);
     Reg::R10
 }
 
 impl X86_64CodeGen {
-    /// Emit inline assembly
+    /// Emit inline assembly. A statement is reported on once for each thing
+    /// wrong with it, as gcc does, however many of its operands run into it.
     pub(super) fn emit_inline_asm(&mut self, insn: &Instruction) {
+        crate::diag::each_once(|| self.emit_inline_asm_statement(insn));
+    }
+
+    fn emit_inline_asm_statement(&mut self, insn: &Instruction) {
         let asm_data = match &insn.extra().asm_data {
             Some(data) => data.as_ref(),
             None => return,
@@ -259,6 +276,7 @@ impl X86_64CodeGen {
             x87_store,
             x87_slots,
             pseudo_to_xmm,
+            flag_outputs,
             ..
         } = build;
         // Process output operands (they go first: %0, %1, etc.)
@@ -274,6 +292,14 @@ impl X86_64CodeGen {
                 size: op_size,
                 name: op_name.clone(),
             };
+
+            // A flag output takes no register: its value is read off the
+            // flags once the template has run.
+            if let Some(cond) = output.class.flag {
+                slots.push(mk(AsmOperandValue::Flag));
+                flag_outputs.push((cond, loc, op_size));
+                continue;
+            }
 
             // An operand pinned to one register
             if let Some(specific_reg) = pins[idx] {
@@ -335,7 +361,7 @@ impl X86_64CodeGen {
                             input_moves,
                             insn.pos,
                         );
-                        slots.push(mk(AsmOperandValue::Mem(mem_str)));
+                        slots.push(mk(AsmOperandValue::Mem(through_segment(output, mem_str))));
                     }
                     _ if requires_sse(&output.class) => {
                         match sse_scratch.pop() {
@@ -589,7 +615,7 @@ impl X86_64CodeGen {
                             used_regs.insert(temp);
                             input_moves.push((temp, loc.clone(), op_size));
                             let mem_str = format!("(%{})", self.reg_name_64(temp));
-                            slots.push(mk(AsmOperandValue::Mem(mem_str)));
+                            slots.push(mk(AsmOperandValue::Mem(through_segment(input, mem_str))));
                         }
                         _ if requires_mem => {
                             let mem_str = self.asm_memory_slot(
@@ -601,7 +627,7 @@ impl X86_64CodeGen {
                                 input_moves,
                                 insn.pos,
                             );
-                            slots.push(mk(AsmOperandValue::Mem(mem_str)));
+                            slots.push(mk(AsmOperandValue::Mem(through_segment(input, mem_str))));
                         }
                         // A symbolic constant: the global's address, written
                         // into the template as an immediate. The operand
@@ -711,9 +737,37 @@ impl X86_64CodeGen {
             self.emit_fp_move(*pseudo, *xmm, fp_size);
         }
 
-        for (specific_reg, actual_loc, size) in input_moves.iter() {
-            self.emit_raw_mov_from_loc(actual_loc, *specific_reg, *size);
+        // As though all at once: one operand's register may be another's
+        // source, as when two register variables want each other's
+        // registers.
+        let planned: Vec<(Option<Reg>, Option<Reg>)> = input_moves
+            .iter()
+            .map(|(dst, loc, _)| (Some(*dst), Self::loc_reg(loc)))
+            .collect();
+        for step in plan_parallel_moves(&planned) {
+            match step {
+                MoveStep::Move { index, from } => {
+                    let (dst, loc, size) = &input_moves[index];
+                    let src = from.map_or_else(|| loc.clone(), Loc::Reg);
+                    self.emit_raw_mov_from_loc(&src, *dst, *size);
+                }
+                MoveStep::Swap(a, b) => self.emit_reg_swap(a, b),
+            }
         }
+    }
+
+    /// The register `loc` is, if it is one.
+    fn loc_reg(loc: &Loc) -> Option<Reg> {
+        match loc {
+            Loc::Reg(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Exchange two general registers, for a cycle of operand moves.
+    fn emit_reg_swap(&mut self, a: Reg, b: Reg) {
+        let text = format!("xchgq %{}, %{}", self.reg_name_64(a), self.reg_name_64(b));
+        self.push_lir(X86Inst::Directive(Directive::Raw(text)));
     }
 
     /// Substitute the operands into the template and emit it as raw text.
@@ -775,6 +829,7 @@ impl X86_64CodeGen {
             remap_restore,
             sse_output_moves,
             x87_store,
+            flag_outputs,
             ..
         } = build;
         // Copy SSE outputs out of the scratch register into where the
@@ -819,20 +874,59 @@ impl X86_64CodeGen {
             );
         }
 
-        // Emit moves from specific registers to actual locations (for outputs)
-        for (_idx, specific_reg, actual_loc, size) in output_moves.iter() {
-            self.emit_raw_mov_to_loc(*specific_reg, actual_loc, *size);
+        // Move outputs out of the registers the template wrote -- a pinned
+        // one, or a temp standing in for a reserved one -- to where they
+        // live, as though all at once: one output's home may be the register
+        // another was pinned to.
+        let outs: Vec<(Reg, &Loc, u32)> = output_moves
+            .iter()
+            .map(|(_, reg, loc, size)| (*reg, loc, *size))
+            .chain(
+                remap_restore
+                    .iter()
+                    .map(|(temp, _, loc, size)| (*temp, loc, *size)),
+            )
+            .collect();
+        let planned: Vec<(Option<Reg>, Option<Reg>)> = outs
+            .iter()
+            .map(|(src, loc, _)| (Self::loc_reg(loc), Some(*src)))
+            .collect();
+        for step in plan_parallel_moves(&planned) {
+            match step {
+                MoveStep::Move { index, from } => {
+                    let (src, loc, size) = outs[index];
+                    self.emit_raw_mov_to_loc(from.unwrap_or(src), loc, size);
+                }
+                MoveStep::Swap(a, b) => self.emit_reg_swap(a, b),
+            }
         }
 
-        // Emit remap restore moves (for outputs that conflicted with reserved regs)
-        for (temp, _orig, actual_loc, size) in remap_restore.iter() {
-            self.emit_raw_mov_to_loc(*temp, actual_loc, *size);
+        // Flag outputs last: every move above is a `mov`, `xchg` or an
+        // x87 or SSE store, none of which touches the flags, and by now the
+        // temps are free to stage one through.
+        for (cond, loc, size) in flag_outputs.iter() {
+            self.emit_flag_output(*cond, loc, *size);
         }
 
         // Clobbers emit nothing here. A register clobber is a constraint the
         // allocator honours (`regalloc::get_constraint_info`), and a `"memory"`
         // clobber makes the asm a barrier in the IR
         // (`Instruction::is_memory_barrier`).
+    }
+
+    /// Write a flag output: `set<cond>` and a zero-extension, as gcc reads
+    /// one, into the operand's own register, or through %r10 into its slot.
+    fn emit_flag_output(&mut self, cond: FlagCondition, loc: &Loc, size: u32) {
+        let reg = Self::loc_reg(loc).unwrap_or(Reg::R10);
+        for text in [
+            format!("set{} {}", cond.suffix(), reg.name8()),
+            format!("movzbl {}, {}", reg.name8(), reg.name32()),
+        ] {
+            self.push_lir(X86Inst::Directive(Directive::Raw(text)));
+        }
+        if Self::loc_reg(loc).is_none() {
+            self.emit_raw_mov_to_loc(reg, loc, size);
+        }
     }
 
     /// Get the mov suffix and register size modifier for a given bit size

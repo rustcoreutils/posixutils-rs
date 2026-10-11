@@ -164,8 +164,8 @@ fn pp_paste_of_two_dots_is_invalid() {
 
 /// C17 6.10.8p2 forbids `#define` and `#undef` of the standard's names, and
 /// gcc warns when any predefine is redefined to something else. A
-/// redefinition to the same thing is quiet, as are the feature-test macros
-/// c17 predefines where gcc does not.
+/// redefinition to the same thing is quiet. The feature-test macros are not
+/// predefined, as in gcc, so a program defining them redefines nothing.
 #[test]
 fn pp_predefined_macro_redefinition() {
     let different = "redefined: it is predefined with a different definition";

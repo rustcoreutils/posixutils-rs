@@ -144,6 +144,11 @@ impl AddrMap {
         func.blocks.get(b)?.insns.get(i)
     }
 
+    /// Where the one instruction defining `id` is, if this function has it.
+    pub(crate) fn def_site(&self, id: PseudoId) -> Option<(usize, usize)> {
+        self.defs.get(&id).copied()
+    }
+
     /// The width and type of the value `id` holds: what its defining
     /// instruction produces, or for an incoming scalar argument, the type
     /// its parameter is passed as.
@@ -411,6 +416,17 @@ impl Footprint {
             Footprint::At(m) | Footprint::Object(m) => may_alias(m, loc, mi),
             Footprint::Escaped => esc.is_captured(&loc.base),
             Footprint::Anything => true,
+        }
+    }
+
+    /// The object this footprint is pinned to, when it is one: a known
+    /// location's base. [`may_alias`] keeps such a footprint apart from every
+    /// local but that base, so a pass asking about many locals at once need
+    /// ask [`Self::may_touch`] of that one alone.
+    pub(crate) fn pinned_base(&self) -> Option<&MemBase> {
+        match self {
+            Footprint::At(m) | Footprint::Object(m) if m.is_known() => Some(&m.base),
+            _ => None,
         }
     }
 

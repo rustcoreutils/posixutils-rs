@@ -404,6 +404,59 @@ bitflags::bitflags! {
         // of what makes two types compatible, and dropped by lvalue
         // conversion: only an *object* is stored in an order, never a value.
         const REVERSE_ORDER = 1 << 21;
+
+        // gcc's x86-64 named address spaces (ISO/IEC TR 18037): an object
+        // of a type so qualified is reached through the `%fs` or `%gs`
+        // segment, and a pointer to one is an offset from the segment's
+        // base. Qualifiers like the others -- they make pointees differ and
+        // travel to members -- but each space is disjoint from the generic
+        // one; see `AddressSpace`.
+        const SEG_FS = 1 << 22;
+        const SEG_GS = 1 << 23;
+    }
+}
+
+/// The address space an object is in: the generic one, or one of gcc's
+/// x86-64 named spaces, which an access reaches through a segment register.
+/// Every pair of distinct spaces is disjoint, as gcc has them: no pointer
+/// converts from one to another without a cast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressSpace {
+    #[default]
+    Generic,
+    SegFs,
+    SegGs,
+}
+
+impl AddressSpace {
+    /// The space the qualifiers `mods` name. Both segments at once is an
+    /// error the parser reports; `%gs` is then taken.
+    pub fn of(mods: TypeModifiers) -> Self {
+        if mods.contains(TypeModifiers::SEG_GS) {
+            AddressSpace::SegGs
+        } else if mods.contains(TypeModifiers::SEG_FS) {
+            AddressSpace::SegFs
+        } else {
+            AddressSpace::Generic
+        }
+    }
+
+    /// The qualifier keyword, as gcc names the space in diagnostics.
+    pub fn keyword(self) -> Option<&'static str> {
+        match self {
+            AddressSpace::Generic => None,
+            AddressSpace::SegFs => Some("__seg_fs"),
+            AddressSpace::SegGs => Some("__seg_gs"),
+        }
+    }
+
+    /// gcc's name for the space in a cast warning: `'__seg_gs'`, or
+    /// `generic`.
+    pub fn quoted(self) -> String {
+        match self.keyword() {
+            Some(k) => format!("'{k}'"),
+            None => "generic".to_string(),
+        }
     }
 }
 
@@ -592,10 +645,26 @@ pub struct Type {
     /// Set via __attribute__((noreturn)) or _Noreturn keyword
     pub noreturn: bool,
 
+    /// Does a call of this function return twice, as `setjmp` does? Set by
+    /// `__attribute__((returns_twice))` on a function's declaration, never
+    /// on a typedef or a pointer: gcc ignores it there, so only a direct
+    /// call of the declared function sees it.
+    pub returns_twice: bool,
+    /// Does a call to this function never throw? (for functions) Set by
+    /// `__attribute__((nothrow))`, which glibc's `__THROW` puts on most of
+    /// libc. Under `-fexceptions` such a call needs no landing pad.
+    pub nothrow: bool,
+
     /// The calling convention of a function type: `__attribute__((ms_abi))`
     /// makes it [`CallingConv::Win64`]. Part of the type, so two function
     /// types differing only here are distinct and incompatible.
     pub conv: CallingConv,
+
+    /// `__attribute__((nocf_check))` under `-fcf-protection=branch`: the
+    /// function has no `endbr64` at its entry, and an indirect call through
+    /// a pointer to it is `notrack`. Part of the type, as `conv` is: gcc
+    /// calls two function types differing only here incompatible.
+    pub nocf_check: bool,
 
     /// Composite type data (for struct, union, enum)
     pub composite: Option<Box<CompositeType>>,
@@ -619,7 +688,10 @@ impl Default for Type {
             params: None,
             variadic: false,
             noreturn: false,
+            returns_twice: false,
+            nothrow: false,
             conv: CallingConv::C,
+            nocf_check: false,
             composite: None,
             explicit_align: None,
             float_class: FloatClass::Standard,
@@ -753,7 +825,7 @@ impl Type {
     /// compatible with `int`. Invisible to `sizeof`, fatal to any comparison.
     pub const DECL_SPECIFIERS: TypeModifiers = Self::STORAGE_CLASS.union(TypeModifiers::NORETURN);
 
-    /// The type qualifiers of C17 6.7.3p1.
+    /// The type qualifiers of C17 6.7.3p1, and gcc's x86-64 address spaces.
     ///
     /// These are the bits a *type* carries at its top level, as opposed to the
     /// declaration specifiers above: `const int` and `int` are two types, while
@@ -764,13 +836,18 @@ impl Type {
     pub const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
         .union(TypeModifiers::VOLATILE)
         .union(TypeModifiers::RESTRICT)
-        .union(TypeModifiers::ATOMIC);
+        .union(TypeModifiers::ATOMIC)
+        .union(Type::ADDRESS_SPACES);
+
+    /// gcc's x86-64 named address space qualifiers; see [`AddressSpace`].
+    pub const ADDRESS_SPACES: TypeModifiers = TypeModifiers::SEG_FS.union(TypeModifiers::SEG_GS);
 
     /// The qualifiers a member inherits from the object that holds it.
     ///
     /// C17 6.5.2.3p3/p4 gives `s.m` the "so-qualified version" of the member's
-    /// type, which is the member's type plus the qualifiers of `s`. Not all
-    /// four travel:
+    /// type, which is the member's type plus the qualifiers of `s`. An
+    /// address space travels -- a member of an object in `%gs` is in `%gs`
+    /// -- but not every qualifier does:
     ///
     /// * `_Atomic` does not. A member of an `_Atomic` struct is not itself
     ///   atomic -- there is no lock-free way to read one out of an atomic
@@ -778,8 +855,9 @@ impl Type {
     ///   what `Parser::warn_atomic_member_access` already reports.
     /// * `restrict` cannot: 6.7.3p2 admits it only on a pointer to an object
     ///   type, so a composite never carries it in the first place.
-    pub const MEMBER_QUALIFIERS: TypeModifiers =
-        TypeModifiers::CONST.union(TypeModifiers::VOLATILE);
+    pub const MEMBER_QUALIFIERS: TypeModifiers = TypeModifiers::CONST
+        .union(TypeModifiers::VOLATILE)
+        .union(Type::ADDRESS_SPACES);
 
     /// The storage-class specifiers of C17 6.7.1, and `inline`.
     ///
@@ -878,6 +956,10 @@ impl Type {
         // `long (*)(long)` and `long (__attribute__((ms_abi)) *)(long)`
         // incompatible, and a redeclaration that changes it conflicting.
         if self.conv != other.conv {
+            return false;
+        }
+        // So is `nocf_check`, for the same reason.
+        if self.nocf_check != other.nocf_check {
             return false;
         }
 
@@ -1023,7 +1105,10 @@ enum TypeKey {
         params: Option<Vec<TypeId>>,
         variadic: bool,
         noreturn: bool,
+        returns_twice: bool,
+        nothrow: bool,
         conv: CallingConv,
+        nocf_check: bool,
         modifiers: u32,
     },
 }
@@ -1048,30 +1133,55 @@ pub enum AssignFault {
     PointerFromInteger,
     /// Two pointers whose referenced types are not compatible.
     PointerMismatch,
+    /// Two pointers whose referenced types are the same integer type but
+    /// for its signedness (`char *` against `unsigned char *`): gcc's
+    /// `-Wpointer-sign`, which it keeps apart from [`Self::PointerMismatch`]
+    /// and gives only under `-Wall` or `-Wpedantic`.
+    PointerSign,
     /// The target's referenced type drops a qualifier the source's had.
     QualifierDiscard,
+    /// Two pointers to arrays whose elements differ only in qualifiers, the
+    /// target's having every one the source's has. C2x makes the arrays so
+    /// qualified, and gcc converts as between differently qualified
+    /// pointers; C17 calls the arrays different types, which only
+    /// `-pedantic` reports.
+    ArrayQualifiers,
+    /// [`Self::ArrayQualifiers`], the target's elements dropping a qualifier
+    /// the source's had: gcc's `-Wdiscarded-array-qualifiers`, after the
+    /// pedantic report.
+    ArrayQualifierDiscard,
     /// A function pointer against `void *`. The 6.5.16.1p1 carve-out is for a
     /// pointer to an *object* type, so this is a constraint violation -- but
     /// one POSIX requires to work, since `dlsym` returns `void *` and every
     /// caller assigns it to a function pointer.
     FunctionPointerVoid,
+    /// Two pointers into different address spaces -- the generic one and
+    /// one of x86-64's segments, or both segments -- which gcc's disjoint
+    /// spaces make an error: only a cast converts between them.
+    AddressSpace,
 }
 
 impl AssignFault {
-    /// Whether this fault is fatal. Only a missing conversion is.
+    /// Whether this fault is fatal. Only a missing conversion is: the one
+    /// with no warning group.
     pub fn is_error(self) -> bool {
-        self == AssignFault::Incompatible
+        self.group().is_none()
     }
 
-    /// The clause naming what went wrong, as gcc words it.
-    pub fn describe(self) -> &'static str {
+    /// The warning group of a fault that is a warning, as gcc names it:
+    /// the one `-Wno-<name>` silences and `-Werror=<name>` makes an error.
+    /// `None` for the one that is an error.
+    pub fn group(self) -> Option<&'static str> {
         match self {
-            AssignFault::Incompatible => "incompatible types",
-            AssignFault::IntegerFromPointer => "makes integer from pointer without a cast",
-            AssignFault::PointerFromInteger => "makes pointer from integer without a cast",
-            AssignFault::PointerMismatch => "incompatible pointer type",
-            AssignFault::QualifierDiscard => "discards a qualifier from the pointer target type",
-            AssignFault::FunctionPointerVoid => "converts between a function pointer and 'void *'",
+            AssignFault::Incompatible | AssignFault::AddressSpace => None,
+            AssignFault::FunctionPointerVoid | AssignFault::ArrayQualifiers => Some("pedantic"),
+            AssignFault::ArrayQualifierDiscard => Some("discarded-array-qualifiers"),
+            AssignFault::IntegerFromPointer | AssignFault::PointerFromInteger => {
+                Some("int-conversion")
+            }
+            AssignFault::PointerMismatch => Some("incompatible-pointer-types"),
+            AssignFault::PointerSign => Some("pointer-sign"),
+            AssignFault::QualifierDiscard => Some("discarded-qualifiers"),
         }
     }
 }
@@ -1122,6 +1232,9 @@ pub struct TypeTable {
     target_arch: Arch,
     /// Target OS for runtime type size calculations
     target_os: Os,
+    /// The target's `__BIGGEST_ALIGNMENT__`, which a bare
+    /// `__attribute__((aligned))` asks for. Copied from `Target`.
+    biggest_alignment: u32,
     /// Plain `char`'s signedness on the target (C17 6.2.5p15), as
     /// [`CharSignedness::of`] decides it. Copied from `Target` at construction
     /// rather than recomputed, because the table cannot reconstruct the
@@ -1223,6 +1336,20 @@ enum Spelling {
     Gcc,
 }
 
+/// The type qualifiers among `modifiers`, in the order gcc names a type
+/// with them: `_Atomic const volatile int`, `int * const restrict`.
+fn qualifier_words(modifiers: TypeModifiers) -> impl Iterator<Item = &'static str> {
+    [
+        (TypeModifiers::ATOMIC, "_Atomic"),
+        (TypeModifiers::CONST, "const"),
+        (TypeModifiers::VOLATILE, "volatile"),
+        (TypeModifiers::RESTRICT, "restrict"),
+    ]
+    .into_iter()
+    .filter(move |&(bit, _)| modifiers.contains(bit))
+    .map(|(_, word)| word)
+}
+
 fn parenthesize_if_pointer(decl: String) -> String {
     if decl.contains('*') {
         format!("({})", decl)
@@ -1242,6 +1369,7 @@ impl TypeTable {
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
+            biggest_alignment: target.biggest_alignment(),
             plain_char: target.plain_char,
             void_id: TypeId::INVALID,
             bool_id: TypeId::INVALID,
@@ -1427,6 +1555,18 @@ impl TypeTable {
         table.float_ptr_id = table.intern(Type::pointer(table.float_id));
         table.double_ptr_id = table.intern(Type::pointer(table.double_id));
         table.longdouble_ptr_id = table.intern(Type::pointer(table.longdouble_id));
+        // `modf`'s pointers for the `_FloatN` and `_FloatNx` types, which
+        // `pointer_to` finds here.
+        for (kind, class) in [
+            (TypeKind::Float, FloatClass::Interchange),
+            (TypeKind::Double, FloatClass::Interchange),
+            (TypeKind::Double, FloatClass::Extended),
+            (TypeKind::LongDouble, FloatClass::Extended),
+        ] {
+            let real = table.floating(kind, class);
+            table.intern(Type::pointer(real));
+        }
+        table.intern(Type::pointer(table.float128_id));
         table.va_list_id = table.intern(Type::basic(TypeKind::VaList));
         table.ms_va_list_id = table.intern(Type {
             modifiers: TypeModifiers::MS_VA_LIST,
@@ -1536,7 +1676,10 @@ impl TypeTable {
                     params: typ.params.clone(),
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
+                    returns_twice: typ.returns_twice,
+                    nothrow: typ.nothrow,
                     conv: typ.conv,
+                    nocf_check: typ.nocf_check,
                     modifiers: typ.modifiers.bits(),
                 })
             }
@@ -1645,6 +1788,41 @@ impl TypeTable {
         stripped.base = new_base;
         stripped.params = new_params;
         self.intern(stripped)
+    }
+
+    /// `id` as `__typeof__` gives it: without what a function's
+    /// *declaration* says about its calls, which c17 records on the declared
+    /// function's type and gcc on the declaration. `returns_twice` and
+    /// `nothrow` go wherever a function type appears in `id`. `noreturn`,
+    /// which gcc also writes into a pointer to the function (as a `volatile`
+    /// function type), goes only from a function type `id` itself, and only
+    /// when `of_name` -- when the operand is the function's name, as in
+    /// `__typeof__(f)`; `__typeof__(*f)` and `__typeof__(&f)` keep it.
+    pub fn without_function_decl_attrs(&mut self, id: TypeId, of_name: bool) -> TypeId {
+        let t = self.get(id);
+        let (base, params) = (t.base, t.params.clone());
+        let new_base = base.map(|b| self.without_function_decl_attrs(b, false));
+        let new_params = params.as_ref().map(|ps| {
+            ps.iter()
+                .map(|&p| self.without_function_decl_attrs(p, false))
+                .collect::<Vec<_>>()
+        });
+        let t = self.get(id);
+        let is_fn = t.kind == TypeKind::Function;
+        let drops_noreturn = is_fn && of_name && t.noreturn;
+        if !(is_fn && (t.returns_twice || t.nothrow) || drops_noreturn)
+            && new_base == base
+            && new_params == params
+        {
+            return id;
+        }
+        let mut bare = t.clone();
+        bare.base = new_base;
+        bare.params = new_params;
+        bare.returns_twice = false;
+        bare.nothrow = false;
+        bare.noreturn &= !drops_noreturn;
+        self.intern(bare)
     }
 
     /// Look up an existing pointer type to the given base type
@@ -1920,11 +2098,13 @@ impl TypeTable {
                 // Qualifiers on the pointer belong after the star -- the
                 // `const` in `char *const` qualifies the pointer, not the char.
                 let mut inner = String::from("*");
-                if typ.modifiers.contains(TypeModifiers::CONST) {
-                    inner.push_str(" const");
+                for word in qualifier_words(typ.modifiers) {
+                    inner.push(' ');
+                    inner.push_str(word);
                 }
-                if typ.modifiers.contains(TypeModifiers::VOLATILE) {
-                    inner.push_str(" volatile");
+                if let Some(space) = AddressSpace::of(typ.modifiers).keyword() {
+                    inner.push(' ');
+                    inner.push_str(space);
                 }
                 if !decl.is_empty() {
                     // `**`, never `* *`; but `*const p` needs its space.
@@ -1948,6 +2128,10 @@ impl TypeTable {
                 }
                 if typ.modifiers.contains(TypeModifiers::VOLATILE) {
                     name.push_str("volatile ");
+                }
+                if let Some(space) = AddressSpace::of(typ.modifiers).keyword() {
+                    name.push_str(space);
+                    name.push(' ');
                 }
                 let elem = typ
                     .base
@@ -1999,6 +2183,14 @@ impl TypeTable {
                     CallingConv::Win64 if decl.is_empty() => " __attribute__((ms_abi))".to_string(),
                     CallingConv::Win64 => format!("__attribute__((ms_abi)) {decl}"),
                 };
+                // And `nocf_check`, which gcc spells only inside a declarator:
+                // `void (__attribute__((nocf_check)) *)(void)`, but the
+                // function type itself as `void(void)`.
+                let decl = if typ.nocf_check && !decl.is_empty() {
+                    format!("__attribute__((nocf_check)) {}", decl.trim_start())
+                } else {
+                    decl
+                };
                 let mut sig = parenthesize_if_pointer(decl);
                 if style == Spelling::Gcc && !sig.is_empty() {
                     sig.push(' ');
@@ -2044,11 +2236,13 @@ impl TypeTable {
 
             _ => {
                 let mut result = String::new();
-                if typ.modifiers.contains(TypeModifiers::CONST) {
-                    result.push_str("const ");
+                for word in qualifier_words(typ.modifiers) {
+                    result.push_str(word);
+                    result.push(' ');
                 }
-                if typ.modifiers.contains(TypeModifiers::VOLATILE) {
-                    result.push_str("volatile ");
+                if let Some(space) = AddressSpace::of(typ.modifiers).keyword() {
+                    result.push_str(space);
+                    result.push(' ');
                 }
                 let gcc_int = match style {
                     Spelling::Gcc => self.gcc_integer_name(id),
@@ -2694,6 +2888,9 @@ impl TypeTable {
             let (Some(t_pointee), Some(v_pointee)) = (t_pointee, v_pointee) else {
                 return None;
             };
+            if self.address_space(t_pointee) != self.address_space(v_pointee) {
+                return Some(AssignFault::AddressSpace);
+            }
             // `void *` converts to and from any object pointer (6.5.16.1p1).
             //
             // "Object" is the whole of it: the carve-out does not reach a
@@ -2704,20 +2901,35 @@ impl TypeTable {
             if self.pointees_pair_function_with_void(t_pointee, v_pointee) {
                 return Some(AssignFault::FunctionPointerVoid);
             }
+            if self.arrays_differ_in_qualifiers_only(t_pointee, v_pointee) {
+                let t_quals = self.qualifiers_through_arrays(t_pointee);
+                let v_quals = self.qualifiers_through_arrays(v_pointee);
+                return Some(if t_quals.contains(v_quals) {
+                    AssignFault::ArrayQualifiers
+                } else {
+                    AssignFault::ArrayQualifierDiscard
+                });
+            }
             let (t_void, v_void) = (
                 self.kind(t_pointee) == TypeKind::Void,
                 self.kind(v_pointee) == TypeKind::Void,
             );
-            if !(t_void || v_void) && !self.types_compatible(t_pointee, v_pointee) {
+            let mismatched = !(t_void || v_void) && !self.types_compatible(t_pointee, v_pointee);
+            let sign_only = mismatched && self.differ_only_in_signedness(t_pointee, v_pointee);
+            if mismatched && !sign_only {
                 return Some(AssignFault::PointerMismatch);
             }
             // Compatible targets, or one of them `void`, but the assignment
             // must not silently gain write access: the target's qualifiers
             // have to include the source's (6.5.16.1p1 says so of both
-            // cases), so `void *v = (const int *)p` is diagnosed too.
+            // cases), so `void *v = (const int *)p` is diagnosed too. gcc
+            // asks this before signedness, and reports only the qualifier.
             let t_quals = self.qualifiers(t_pointee);
             let v_quals = self.qualifiers(v_pointee);
-            return (!t_quals.contains(v_quals)).then_some(AssignFault::QualifierDiscard);
+            if !t_quals.contains(v_quals) {
+                return Some(AssignFault::QualifierDiscard);
+            }
+            return sign_only.then_some(AssignFault::PointerSign);
         }
 
         if t_ptr {
@@ -2746,6 +2958,29 @@ impl TypeTable {
         }
 
         None
+    }
+
+    /// Are `a` and `b` one integer type but for signedness -- `char`,
+    /// `signed char` and `unsigned char`, or `int` and `unsigned int`? gcc
+    /// asks this of two incompatible pointer targets to tell its
+    /// `-Wpointer-sign` from an incompatible pointer, comparing the
+    /// unqualified types' signed and unsigned versions and their atomicity.
+    /// An enumerated type and `_Bool` have no such counterpart here, as in
+    /// gcc, and a pointer one level further down is incompatible outright.
+    fn differ_only_in_signedness(&self, a: TypeId, b: TypeId) -> bool {
+        let kind = self.kind(a);
+        matches!(
+            kind,
+            TypeKind::Char
+                | TypeKind::Short
+                | TypeKind::Int
+                | TypeKind::Long
+                | TypeKind::LongLong
+                | TypeKind::Int128
+        ) && kind == self.kind(b)
+            && !self.is_vector(a)
+            && !self.is_vector(b)
+            && self.is_atomic(a) == self.is_atomic(b)
     }
 
     /// The type an array or function has in an expression: C17 6.3.2.1p3-4
@@ -2903,6 +3138,30 @@ impl TypeTable {
         self.modifiers(id) & Type::QUALIFIERS
     }
 
+    /// The qualifiers of what `value` points to that what `target` points
+    /// to lacks -- what an [`AssignFault::QualifierDiscard`] discards, or an
+    /// [`AssignFault::ArrayQualifierDiscard`] of an array's elements --
+    /// spelled as gcc spells them: `const volatile`.
+    pub fn discarded_qualifiers(&self, target: TypeId, value: TypeId) -> String {
+        let pointee_quals = |t: TypeId| {
+            self.base_type(t).map_or(TypeModifiers::empty(), |p| {
+                self.qualifiers_through_arrays(p)
+            })
+        };
+        let lost = pointee_quals(value) - pointee_quals(target);
+        [
+            (TypeModifiers::CONST, "const"),
+            (TypeModifiers::VOLATILE, "volatile"),
+            (TypeModifiers::RESTRICT, "restrict"),
+            (TypeModifiers::ATOMIC, "_Atomic"),
+        ]
+        .iter()
+        .filter(|(bit, _)| lost.contains(*bit))
+        .map(|&(_, word)| word)
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+
     /// The version of `id` qualified with `quals` -- the "so-qualified
     /// version" of C17 6.5.2.3p3/p4.
     ///
@@ -2969,6 +3228,41 @@ impl TypeTable {
         let mut unqualified = self.get(id).clone();
         unqualified.modifiers.remove(dropped);
         self.intern(unqualified)
+    }
+
+    /// The version of `id` without its top-level qualifiers, if the table
+    /// already holds one -- for a reader with the table shared, which
+    /// cannot intern. The scalars, `int` and the rest, are always there --
+    /// spelled `short` or `short int`, `signed` or not, a scalar met only
+    /// qualified answers with the table's own; a tagged struct, union or
+    /// enum answers with its tag's own type when that is unqualified. `None`
+    /// otherwise: a type only ever met qualified.
+    ///
+    /// Unlike [`Self::unqualified`] this drops only the qualifiers, not the
+    /// storage order.
+    pub fn existing_unqualified(&self, id: TypeId) -> Option<TypeId> {
+        if self.qualifiers(id).is_empty() {
+            return Some(id);
+        }
+        let typ = self.get(id);
+        if let Some(composite) = typ.composite.as_deref() {
+            return composite
+                .tag_type
+                .filter(|&t| self.qualifiers(t).is_empty());
+        }
+        let find = |drop: TypeModifiers| {
+            let mut plain = typ.clone();
+            plain.modifiers.remove(drop);
+            self.make_key(&plain)
+                .and_then(|key| self.lookup.get(&key).copied())
+        };
+        // The size words only spell the kind, and `signed` is the default
+        // for every integer but `char`.
+        let mut spelling = TypeModifiers::SHORT | TypeModifiers::LONG | TypeModifiers::LONGLONG;
+        if typ.kind != TypeKind::Char {
+            spelling |= TypeModifiers::SIGNED;
+        }
+        find(Type::QUALIFIERS).or_else(|| find(Type::QUALIFIERS | spelling))
     }
 
     /// Is an object of type `id` stored in the byte order opposite to the
@@ -3523,6 +3817,12 @@ impl TypeTable {
         Target::new(self.target_arch, self.target_os)
     }
 
+    /// The target's `__BIGGEST_ALIGNMENT__`; see
+    /// [`Target::biggest_alignment`].
+    pub fn biggest_alignment(&self) -> u32 {
+        self.biggest_alignment
+    }
+
     /// The unqualified real floating type of `kind` and `class`: `float`,
     /// `_Float32x`, ... A class `kind` has no member of falls back to the
     /// standard type of that kind.
@@ -3936,15 +4236,62 @@ impl TypeTable {
         self.intern(composite)
     }
 
+    /// The address space an object of type `id` is in -- an array's is its
+    /// elements'.
+    pub fn address_space(&self, id: TypeId) -> AddressSpace {
+        AddressSpace::of(self.qualifiers_through_arrays(id))
+    }
+
+    /// The address space the pointer type `id` points into; generic for
+    /// anything that is not a pointer.
+    pub fn pointee_address_space(&self, id: TypeId) -> AddressSpace {
+        match self.kind(id) {
+            TypeKind::Pointer => self
+                .base_type(id)
+                .map_or(AddressSpace::Generic, |p| self.address_space(p)),
+            _ => AddressSpace::Generic,
+        }
+    }
+
     /// The qualifiers of `id`, where those of an array type are its element
     /// type's (C17 6.7.3p10): `const int[3]` is as `const` as `const int`.
     pub fn qualifiers_through_arrays(&self, id: TypeId) -> TypeModifiers {
         match self.kind(id) {
-            TypeKind::Array => self
+            // A vector is a value, and holds its qualifiers itself.
+            TypeKind::Array if !self.is_vector(id) => self
                 .base_type(id)
                 .map_or_else(TypeModifiers::empty, |e| self.qualifiers_through_arrays(e)),
             _ => self.qualifiers(id),
         }
+    }
+
+    /// Are `a` and `b` -- the targets of two pointers -- array types that are
+    /// compatible but for the qualifiers of their elements? C2x makes an
+    /// array exactly as qualified as its element type (6.2.5p28), so gcc
+    /// takes `char (*)[19]` and `const char (*)[19]` as pointers to
+    /// differently qualified versions of one type: they subtract and compare,
+    /// and only `-pedantic` objects, since C17 calls the arrays different
+    /// types.
+    pub fn arrays_differ_in_qualifiers_only(&self, a: TypeId, b: TypeId) -> bool {
+        self.kind(a) == TypeKind::Array
+            && self.kind(b) == TypeKind::Array
+            && !self.types_compatible(a, b)
+            && self.compatible_through_array_qualifiers(a, b)
+    }
+
+    /// [`Self::types_compatible`], with the qualifiers of array elements set
+    /// aside at every level of array derivation -- but not `_Atomic`, which
+    /// gcc does not count among them: an `_Atomic int` element is of another
+    /// type than an `int` one, its size and alignment free to differ.
+    fn compatible_through_array_qualifiers(&self, a: TypeId, b: TypeId) -> bool {
+        if self.kind(a) != TypeKind::Array || self.kind(b) != TypeKind::Array {
+            return self.types_compatible(a, b) && self.is_atomic(a) == self.is_atomic(b);
+        }
+        self.get(a).compatible_ignoring_base(self.get(b))
+            && match (self.base_type(a), self.base_type(b)) {
+                (Some(x), Some(y)) => self.compatible_through_array_qualifiers(x, y),
+                _ => false,
+            }
     }
 
     /// The unqualified version of `id`, where an array's qualifiers are its

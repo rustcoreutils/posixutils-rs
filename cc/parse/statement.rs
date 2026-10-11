@@ -275,6 +275,7 @@ impl Parser<'_> {
         self.symbols.enter_scope();
 
         // Parse init (can be declaration or expression)
+        self.skip_gnu_extension();
         let init = if self.is_special(b';') {
             self.advance();
             None
@@ -475,6 +476,18 @@ impl Parser<'_> {
     fn parse_block_item_list(&mut self) -> ParseResult<Vec<BlockItem>> {
         let mut items = Vec::new();
         while !self.is_special(b'}') && !self.is_eof() {
+            // `__extension__` starts a declaration, or is the unary operator
+            // of an expression statement: gcc consumes all but the last to
+            // tell which, so a label never follows one -- `__extension__ l:`
+            // is the expression `__extension__ l` missing its `;`.
+            let mut last_extension = None;
+            while self.is_keyword(crate::kw::GNU_EXTENSION) {
+                last_extension = Some(self.pos);
+                self.advance();
+            }
+            if let Some(at) = last_extension.filter(|_| !self.at_block_declaration()) {
+                self.pos = at;
+            }
             if self.at_block_declaration() {
                 let decl = self.parse_declaration_and_bind()?;
                 items.push(BlockItem::Declaration(decl));

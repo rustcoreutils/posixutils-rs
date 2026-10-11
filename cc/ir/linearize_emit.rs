@@ -11,13 +11,18 @@
 use super::linearize::{BlockVolatility, LocalBinding, ObjectPlace, Storage};
 use super::memexpand::{self, BlockOp};
 use super::{
-    BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode, Pseudo, PseudoId,
+    AsmConstraint, AsmData, BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode,
+    Pseudo, PseudoId,
 };
 use crate::abi::get_abi_for_conv;
+use crate::arch::asm_constraints::{AsmOperandClass, PinnedGp};
 use crate::constexpr::{ConstScope, IntConversion};
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
-use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
+use crate::ir::Access;
+use crate::parse::ast::{
+    AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MachineOp, MathErrno, UnaryOp,
+};
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::Bitfield;
@@ -32,16 +37,26 @@ use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 /// `b[i++] += 5` incremented `i` twice and updated the wrong element,
 /// `*p++ += 1` advanced `p` by two, and `a[f()] |= 1` called `f` twice.
 ///
-/// `base` addresses the object -- a `Sym` pseudo when the target names a
-/// symbol's own storage -- or its storage unit when `bitfield` is set: a
-/// bit-field has no address of its own, so it carries its placement instead.
+/// `at` says where the target is: see [`PlaceAt`].
 pub(crate) struct RmwPlace {
-    base: PseudoId,
-    /// The bit-field's placement and its type as the access reaches it.
-    bitfield: Option<(Bitfield, TypeId)>,
+    at: PlaceAt,
     /// The identifier the target is, when it is a bare name: a read through
     /// the place is then a reference to whatever that identifier resolves to.
     ident: Option<SymbolId>,
+}
+
+/// Where a read-modify-write target is.
+enum PlaceAt {
+    /// At an address -- a `Sym` pseudo when the target names a symbol's own
+    /// storage.
+    Object(PseudoId),
+    /// In a bit-field, which has no address of its own: the address of its
+    /// storage unit, its placement there, and its type as the access
+    /// reaches it.
+    Bitfield(PseudoId, Bitfield, TypeId),
+    /// In a register: a file-scope register variable, which has no storage
+    /// (`register unsigned long sp asm("rsp")`).
+    Register(PinnedGp),
 }
 
 /// Everything `E1 op= E2` needs beyond the two operand *values*: the operator
@@ -426,19 +441,59 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the list does not reach is initialized as a static object would be.
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
         let total_bytes = self.types.size_bytes(typ) as i64;
-        let volatile = self.types.contains_volatile(typ);
-        self.emit_block_zero(base_sym, 0, total_bytes, volatile);
+        let access = Access::of(self.types, typ);
+        self.emit_block_zero(base_sym, 0, total_bytes, access);
     }
 
-    /// Which ends of a block move between objects of type `dst` and `src`
-    /// reach something volatile -- the answer every chunk of the move is
-    /// marked with. By `contains_volatile`, the rule `emit` applies to a
-    /// single access: a struct with one `volatile` member is read and written
-    /// whole, so every chunk of it is observable.
+    /// `-ftrivial-auto-var-init=`: start the `size_bytes` of an automatic
+    /// object of type `typ` at `dst` + `offset`, declared without an
+    /// initializer, as the option says -- all zero bytes, or gcc's pattern,
+    /// each byte 0xFE -- rather than with whatever the stack held.
+    pub(crate) fn auto_var_init(
+        &mut self,
+        dst: PseudoId,
+        offset: i64,
+        size_bytes: i64,
+        typ: TypeId,
+    ) {
+        let byte = match self.auto_var_init {
+            crate::target::AutoVarInit::Uninitialized => return,
+            crate::target::AutoVarInit::Zero => 0,
+            crate::target::AutoVarInit::Pattern => 0xfe,
+        };
+        let access = Access::of(self.types, typ);
+        self.emit_block_fill(dst, offset, size_bytes, byte, access);
+    }
+
+    /// [`Self::auto_var_init`] for a variable length array: the
+    /// `size_bytes` (a pseudo, known at run time) at `ptr`.
+    pub(crate) fn auto_var_init_vla(&mut self, ptr: PseudoId, size_bytes: PseudoId) {
+        let byte = match self.auto_var_init {
+            crate::target::AutoVarInit::Uninitialized => return,
+            crate::target::AutoVarInit::Zero => 0,
+            crate::target::AutoVarInit::Pattern => 0xfe,
+        };
+        let byte = self.emit_const(byte, self.types.int_id);
+        let result = self.alloc_pseudo();
+        self.emit(
+            Instruction::new(BlockOp::Set.opcode())
+                .with_func(self.library_function_name(BlockOp::Set.c_name()))
+                .with_target(result)
+                .with_src3(ptr, byte, size_bytes)
+                .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
+        );
+    }
+
+    /// How each end of a block move between objects of type `dst` and `src`
+    /// reaches its object -- the [`Access`] every chunk of the move is marked
+    /// with. By `contains_volatile`, the rule `emit` applies to a single
+    /// access: a struct with one `volatile` member is read and written whole,
+    /// so every chunk of it is observable; and an object in a segment is
+    /// reached through it by every chunk.
     pub(crate) fn block_volatility(&self, dst: TypeId, src: TypeId) -> BlockVolatility {
         BlockVolatility {
-            dst: self.types.contains_volatile(dst),
-            src: self.types.contains_volatile(src),
+            dst: Access::of(self.types, dst),
+            src: Access::of(self.types, src),
         }
     }
 
@@ -466,30 +521,47 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// volatility, so its stores come out unmarked and a pass may then drop
     /// them. Within the inline limit such a fill is emitted here, as stores
     /// marked for what they write; past it, the call stays a call, which
-    /// nothing deletes.
+    /// nothing deletes. An object in a segment is filled here at any size:
+    /// a call could not reach it.
     pub(crate) fn emit_block_zero(
         &mut self,
         dst: PseudoId,
         dst_base_offset: i64,
         size_bytes: i64,
-        volatile: bool,
+        access: Access,
+    ) {
+        self.emit_block_fill(dst, dst_base_offset, size_bytes, 0, access);
+    }
+
+    /// [`Self::emit_block_zero`] with every byte `byte`.
+    pub(crate) fn emit_block_fill(
+        &mut self,
+        dst: PseudoId,
+        dst_base_offset: i64,
+        size_bytes: i64,
+        byte: u8,
+        access: Access,
     ) {
         if size_bytes <= 0 {
             return;
         }
-        if volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES {
+        // An object in a segment has no address `memset` could take, so it
+        // is filled here at any size.
+        if access.in_segment() || (access.volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES) {
             for (offset, chunk) in memexpand::block_chunks(size_bytes) {
                 let (typ, bits) = (chunk.typ(self.types), chunk.bits());
-                let zero = self.emit_const(0, typ);
+                // Every byte the same: the chunk's value, sign-extended.
+                let pattern = i128::from(i64::from_ne_bytes([byte; 8]) >> (64 - bits));
+                let value = self.emit_const(pattern, typ);
                 self.emit(
-                    Instruction::store(zero, dst, dst_base_offset + offset, typ, bits)
-                        .with_volatile(true),
+                    Instruction::store(value, dst, dst_base_offset + offset, typ, bits)
+                        .with_access(access),
                 );
             }
             return;
         }
         let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
-        let byte = self.emit_const(0, self.types.int_id);
+        let byte = self.emit_const(i128::from(byte), self.types.int_id);
         let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(
@@ -517,12 +589,13 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// Above `memexpand::INLINE_LIMIT_BYTES` the copy is a `memcpy` call
     /// instead, by the same rule and in the same chunks as a `memcpy` the
-    /// program wrote.
+    /// program wrote -- unless an end is in a segment, which no call could
+    /// reach.
     ///
     /// Each chunk is marked with `vol`: the chunks are integers, so the
-    /// qualifier of the aggregate they move cannot be read back off their
-    /// type, and an unmarked chunk load of a `volatile` struct nothing
-    /// used was deleted outright from `-O1` up.
+    /// qualifiers and address space of the aggregate they move cannot be
+    /// read back off their type, and an unmarked chunk load of a `volatile`
+    /// struct nothing used was deleted outright from `-O1` up.
     pub(crate) fn emit_block_copy_at_offset(
         &mut self,
         dst: PseudoId,
@@ -531,7 +604,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         size_bytes: i64,
         vol: BlockVolatility,
     ) {
-        if size_bytes > memexpand::INLINE_LIMIT_BYTES {
+        // An object in a segment has no address `memcpy` could take, so it
+        // is copied here at any size.
+        let in_segment = vol.dst.in_segment() || vol.src.in_segment();
+        if size_bytes > memexpand::INLINE_LIMIT_BYTES && !in_segment {
             self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
             return;
         }
@@ -545,12 +621,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             || self.alloc_pseudo(),
         );
         for insn in copy {
-            let volatile = if insn.op == Opcode::Load {
+            let access = if insn.op == Opcode::Load {
                 vol.src
             } else {
                 vol.dst
             };
-            self.emit(insn.with_volatile(volatile));
+            self.emit(insn.with_access(access));
         }
     }
 
@@ -631,13 +707,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
 
         // 1. Load the entire storage unit, as a number in the target's order:
         // a unit stored in reverse order is swapped, and its fields are then
         // numbered from the most significant bit (see `bitfield_bit_offset`).
         let storage_val = self.alloc_pseudo();
-        self.load_bitfield_unit(storage_val, base, bf, typ, volatile);
+        self.load_bitfield_unit(storage_val, base, bf, typ, access);
         let bit_offset = self.bitfield_bit_offset(bf, typ);
 
         // 2. Shift right by bit_offset (using logical shift for unsigned extraction)
@@ -791,7 +867,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
         // Every byte of a volatile field is part of the one observable read.
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
         // In reverse order the field's bits run from the most significant end
         // of each byte, so its last byte holds its least significant bits.
         let reversed = self.types.reverses_storage(typ);
@@ -811,7 +887,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let byte = self.alloc_pseudo();
             self.emit(
                 Instruction::load(byte, base, (byte_offset + i as usize) as i64, byte_type, 8)
-                    .with_volatile(volatile),
+                    .with_access(access),
             );
             // Widen before shifting, or the shift is done at eight bits and
             // drops everything it moves. `uchar` is unsigned, so this is a
@@ -960,11 +1036,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
 
         // 1. Load current storage unit value, as `emit_bitfield_load` does.
         let old_val = self.alloc_pseudo();
-        self.load_bitfield_unit(old_val, base, bf, typ, volatile);
+        self.load_bitfield_unit(old_val, base, bf, typ, access);
         let bit_offset = self.bitfield_bit_offset(bf, typ);
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
@@ -1029,7 +1105,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // 6. Store back, in the unit's own order.
         if self.bitfield_unit_reversed(bf, typ) {
-            self.emit_reversed_store(combined, base, byte_offset as i64, storage_type, volatile);
+            self.emit_reversed_store(combined, base, byte_offset as i64, storage_type, access);
         } else {
             self.emit(
                 Instruction::store(
@@ -1039,7 +1115,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     storage_type,
                     storage_bits,
                 )
-                .with_volatile(volatile),
+                .with_access(access),
             );
         }
     }
@@ -1052,16 +1128,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         base: PseudoId,
         bf: Bitfield,
         typ: TypeId,
-        volatile: bool,
+        access: Access,
     ) {
         let storage_type = self.bitfield_storage_type(bf.access_bytes as usize);
         let offset = bf.offset as i64;
         if self.bitfield_unit_reversed(bf, typ) {
-            self.emit_reversed_load(target, base, offset, storage_type, volatile);
+            self.emit_reversed_load(target, base, offset, storage_type, access);
         } else {
             let bits = bf.access_bytes * 8;
             self.emit(
-                Instruction::load(target, base, offset, storage_type, bits).with_volatile(volatile),
+                Instruction::load(target, base, offset, storage_type, bits).with_access(access),
             );
         }
     }
@@ -1120,7 +1196,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
         // See `emit_bitfield_load_bytewise`.
         let reversed = self.types.reverses_storage(typ);
 
@@ -1200,9 +1276,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 placed
             } else {
                 let old = self.alloc_pseudo();
-                self.emit(
-                    Instruction::load(old, base, addr_off, byte_type, 8).with_volatile(volatile),
-                );
+                self.emit(Instruction::load(old, base, addr_off, byte_type, 8).with_access(access));
                 let keep = self.emit_const((!byte_mask & 0xff) as i128, byte_type);
                 let cleared = self.alloc_pseudo();
                 self.emit(Instruction::binop(
@@ -1238,7 +1312,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 out
             };
             self.emit(
-                Instruction::store(to_store, base, addr_off, byte_type, 8).with_volatile(volatile),
+                Instruction::store(to_store, base, addr_off, byte_type, 8).with_access(access),
             );
         }
     }
@@ -1953,7 +2027,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         let callee = self.library_function_name(self.strings.get(callee));
         let in_place = self.types.fp_format(typ).is_some_and(|fmt| {
-            crate::arch::mapping::computes_in_place(Opcode::Sqrt, fmt, self.target)
+            crate::arch::mapping::computes_in_place(Opcode::Sqrt, fmt, self.target, self.isa)
         });
         let sqrt = |lin: &mut Self| lin.emit_libm_insn(Opcode::Sqrt, &[x], typ, &callee);
         match errno {
@@ -2004,6 +2078,32 @@ impl<'a> super::linearize::Linearizer<'a> {
             .with_type(typ)
             .with_func(callee);
         insn.src = args.to_vec();
+        self.emit(insn);
+        result
+    }
+
+    /// `lrint` or `lround` of `val`, of the floating type `from`, as the
+    /// integer type `typ`: the libm opcode that reads another type, named
+    /// for the function `callee` that a target without the instruction
+    /// calls instead.
+    pub(crate) fn emit_round_to_integer(
+        &mut self,
+        how: crate::float::IntegerRounding,
+        val: PseudoId,
+        from: TypeId,
+        typ: TypeId,
+        callee: StringId,
+    ) -> PseudoId {
+        let callee = self.library_function_name(self.strings.get(callee));
+        let result = self.alloc_pseudo();
+        let mut insn = Instruction::new(Opcode::RoundToInteger(how))
+            .with_target(result)
+            .with_size(self.types.size_bits(typ))
+            .with_type(typ)
+            .with_func(callee);
+        insn.src = vec![val];
+        insn.src_typ = Some(from);
+        insn.src_size = self.types.size_bits(from);
         self.emit(insn);
         result
     }
@@ -2825,12 +2925,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
-    /// The address this place names, or `None` when it is a bit-field.
+    /// The address this place names, or `None` when it is a bit-field or a
+    /// register.
     ///
-    /// A bit-field has no address, so a consumer that can only work with one
+    /// Neither has an address, so a consumer that can only work with one
     /// -- a memory-class `asm` operand, say -- has to know that.
     pub(crate) fn rmw_place_address(place: &RmwPlace) -> Option<PseudoId> {
-        place.bitfield.is_none().then_some(place.base)
+        match place.at {
+            PlaceAt::Object(addr) => Some(addr),
+            PlaceAt::Bitfield(..) | PlaceAt::Register(_) => None,
+        }
     }
 
     /// Resolve a read-modify-write target, evaluating its subexpressions once.
@@ -2839,6 +2943,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             // A name stands for its symbol: the frame slot, or the global a
             // static local or a file-scope object is emitted as.
             ExprKind::Ident(symbol_id) => {
+                if let Some(reg) = self.global_register(*symbol_id) {
+                    return RmwPlace {
+                        at: PlaceAt::Register(reg),
+                        ident: Some(*symbol_id),
+                    };
+                }
                 let binding = self.locals.get(symbol_id).map(|l| l.binding.clone());
                 let base = match binding {
                     Some(LocalBinding::Frame {
@@ -2860,8 +2970,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 };
                 RmwPlace {
-                    base,
-                    bitfield: None,
+                    at: PlaceAt::Object(base),
                     ident: Some(*symbol_id),
                 }
             }
@@ -2883,8 +2992,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // `linearize_lvalue` is what evaluates the subexpressions, and it
             // does so once.
             _ => RmwPlace {
-                base: self.linearize_lvalue(target),
-                bitfield: None,
+                at: PlaceAt::Object(self.linearize_lvalue(target)),
                 ident: None,
             },
         }
@@ -2916,28 +3024,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             .types
             .find_member(struct_type, member)
             .unwrap_or_else(|| MemberInfo::standing_in(target_typ));
-        let bitfield = match info.bitfield() {
+        let at = match info.bitfield() {
             // The target expression's type, not the member's declared one:
             // they name the same width and sign, and only the expression's
             // carries the object's qualifiers (C17 6.5.2.3p3), which is what
             // tells the bit-field emitters that the access is volatile.
-            Some(bf) => Some((bf, target_typ)),
+            Some(bf) => PlaceAt::Bitfield(base, bf, target_typ),
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
-            _ => {
-                let base = self.offset_address(base, info.offset as i64);
-                return RmwPlace {
-                    base,
-                    bitfield: None,
-                    ident: None,
-                };
-            }
+            _ => PlaceAt::Object(self.offset_address(base, info.offset as i64)),
         };
-        RmwPlace {
-            base,
-            bitfield,
-            ident: None,
-        }
+        RmwPlace { at, ident: None }
     }
 
     /// `base + offset` as an address, or `base` itself when the offset is zero.
@@ -2963,9 +3060,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         if self.reject_incomplete_object(typ) {
             return self.emit_const(0, self.types.int_id);
         }
-        if let Some((bf, field_typ)) = place.bitfield {
-            return self.emit_bitfield_load(place.base, bf, field_typ);
-        }
+        let base = match place.at {
+            PlaceAt::Object(base) => base,
+            PlaceAt::Bitfield(base, bf, field_typ) => {
+                return self.emit_bitfield_load(base, bf, field_typ);
+            }
+            PlaceAt::Register(reg) => return self.emit_register_read(reg, typ),
+        };
         // A read of a name is a read like `linearize_ident`'s, and answers to
         // the same inline-definition constraint.
         if let Some(ident) = place.ident {
@@ -2973,7 +3074,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let size = self.types.size_bits(typ);
         let val = self.alloc_reg_pseudo();
-        self.emit(Instruction::load(val, place.base, 0, typ, size));
+        self.emit(Instruction::load(val, base, 0, typ, size));
         val
     }
 
@@ -2988,12 +3089,15 @@ impl<'a> super::linearize::Linearizer<'a> {
         val: PseudoId,
         typ: TypeId,
     ) -> Option<(u32, TypeId)> {
-        if let Some((bf, field_typ)) = place.bitfield {
-            self.emit_bitfield_store(place.base, bf, val, field_typ);
-            return Some((bf.bit_width, field_typ));
-        }
         let size = self.types.size_bits(typ);
-        self.emit(Instruction::store(val, place.base, 0, typ, size));
+        match place.at {
+            PlaceAt::Object(base) => self.emit(Instruction::store(val, base, 0, typ, size)),
+            PlaceAt::Bitfield(base, bf, field_typ) => {
+                self.emit_bitfield_store(base, bf, val, field_typ);
+                return Some((bf.bit_width, field_typ));
+            }
+            PlaceAt::Register(reg) => self.emit_register_write(reg, val, typ),
+        }
         None
     }
 
@@ -3123,20 +3227,18 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         let (real, imag, base_typ, base_bits) = self.load_complex_halves(src, complex_typ);
         let imag_offset = offset + (base_bits / 8) as i64;
+        // The halves are of the base type, which has lost the object's
+        // qualifiers and address space.
+        let access = Access::of(self.types, complex_typ);
         if self.types.reverses_storage(complex_typ) {
-            let volatile = self.types.contains_volatile(complex_typ);
-            self.emit_reversed_store(real, dst, offset, base_typ, volatile);
-            self.emit_reversed_store(imag, dst, imag_offset, base_typ, volatile);
+            self.emit_reversed_store(real, dst, offset, base_typ, access);
+            self.emit_reversed_store(imag, dst, imag_offset, base_typ, access);
             return;
         }
-        self.emit(Instruction::store(real, dst, offset, base_typ, base_bits));
-        self.emit(Instruction::store(
-            imag,
-            dst,
-            imag_offset,
-            base_typ,
-            base_bits,
-        ));
+        self.emit(Instruction::store(real, dst, offset, base_typ, base_bits).with_access(access));
+        self.emit(
+            Instruction::store(imag, dst, imag_offset, base_typ, base_bits).with_access(access),
+        );
     }
 
     pub(crate) fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
@@ -3291,5 +3393,91 @@ impl<'a> super::linearize::Linearizer<'a> {
             Some((bit_width, typ)) => self.narrow_to_bitfield(final_val, bit_width, typ),
             None => final_val,
         }
+    }
+
+    /// A builtin that is one machine instruction ([`MachineOp`]), with the
+    /// value gcc 13 gives it. The time-stamp counter and the thread pointer
+    /// are an asm statement's outputs, as the instruction's own registers;
+    /// `cvtpd2ps` is a lane-by-lane conversion, which is what the
+    /// instruction computes.
+    pub(crate) fn linearize_machine_builtin(
+        &mut self,
+        op: MachineOp,
+        args: &[Expr],
+        typ: TypeId,
+    ) -> PseudoId {
+        match op {
+            MachineOp::Rdtsc | MachineOp::Rdtscp => {
+                let (uint, ulonglong) = (self.types.uint_id, self.types.ulonglong_id);
+                let aux = args.first().map(|p| self.linearize_expr(p));
+                let (template, outputs) = match aux {
+                    Some(_) => ("rdtscp", &[("=a", uint), ("=d", uint), ("=c", uint)][..]),
+                    None => ("rdtsc", &[("=a", uint), ("=d", uint)][..]),
+                };
+                let regs = self.emit_machine_asm(template, outputs);
+                if let Some(aux) = aux {
+                    self.emit(Instruction::store(regs[2], aux, 0, uint, 32));
+                }
+                let lo = self.emit_convert(regs[0], uint, ulonglong);
+                let hi = self.emit_convert(regs[1], uint, ulonglong);
+                let shift = self.emit_const(32, ulonglong);
+                let hi = self.emit_binary(BinaryOp::Shl, hi, shift, ulonglong, ulonglong);
+                self.emit_binary(BinaryOp::BitOr, hi, lo, ulonglong, ulonglong)
+            }
+            MachineOp::Cvtpd2ps => {
+                let (double, float) = (self.types.double_id, self.types.float_id);
+                let src = self.vector_addr(&args[0]);
+                let result = self.frame_temp_addr("__vec", typ);
+                for lane in 0..4 {
+                    let value = if lane < 2 {
+                        let d = self.alloc_reg_pseudo();
+                        self.emit(Instruction::load(d, src, lane * 8, double, 64));
+                        self.emit_convert(d, double, float)
+                    } else {
+                        self.emit_fconst(FloatVal::ZERO, float)
+                    };
+                    self.emit(Instruction::store(value, result, lane * 4, float, 32));
+                }
+                result
+            }
+            MachineOp::ThreadPointer => {
+                use crate::target::{Arch, Os};
+                let template = match (self.target.arch, self.target.os) {
+                    (Arch::X86_64, Os::MacOS) => "movq %%gs:0, %0",
+                    (Arch::X86_64, _) => "movq %%fs:0, %0",
+                    (Arch::Aarch64, _) => "mrs %0, tpidr_el0",
+                };
+                self.emit_machine_asm(template, &[("=r", self.types.void_ptr_id)])[0]
+            }
+        }
+    }
+
+    /// An asm statement of `template` with only register `outputs`, each
+    /// a constraint and the type of its value: the pseudos it writes.
+    fn emit_machine_asm(&mut self, template: &str, outputs: &[(&str, TypeId)]) -> Vec<PseudoId> {
+        let arch = self.target.arch;
+        let outputs: Vec<AsmConstraint> = outputs
+            .iter()
+            .map(|&(constraint, typ)| AsmConstraint {
+                pseudo: self.alloc_pseudo(),
+                name: None,
+                matching_output: None,
+                constraint: constraint.to_string(),
+                class: AsmOperandClass::parse(constraint, arch)
+                    .expect("a builtin's constraint is a valid one"),
+                size: self.types.size_bits(typ),
+                offset: 0,
+                addr_space: crate::types::AddressSpace::Generic,
+            })
+            .collect();
+        let written = outputs.iter().map(|o| o.pseudo).collect();
+        self.emit(Instruction::asm(AsmData {
+            template: template.to_string(),
+            outputs,
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        written
     }
 }

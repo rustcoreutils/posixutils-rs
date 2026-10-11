@@ -63,10 +63,18 @@ pub const CPUID_H: &str = include_str!("include/cpuid.h");
 /// wins: builtin headers are searched after the includer's directory and -I.
 pub const TGMATH_H: &str = include_str!("include/tgmath.h");
 
-/// The x86-64 intrinsic headers, SSE through SSE4.2 (`<immintrin.h>` and
-/// `<x86intrin.h>` gather them), and `<mm_malloc.h>`. Written in C over GNU
-/// vectors; see each header's preamble.
+/// The x86-64 intrinsic headers, SSE through SSE4.2, SHA-NI and RTM
+/// (`<immintrin.h>` and `<x86intrin.h>` gather them), and `<mm_malloc.h>`.
+/// Written in C over GNU vectors, or inline assembly; see each header's
+/// preamble.
 const X86_INTRIN_HEADERS: &[(&str, &str)] = &[
+    ("x86gprintrin.h", include_str!("include/x86gprintrin.h")),
+    ("cetintrin.h", include_str!("include/cetintrin.h")),
+    // gcc's assembly-side CET header, which gcc has on x86 alone.
+    ("cet.h", include_str!("include/cet.h")),
+    ("rtmintrin.h", include_str!("include/rtmintrin.h")),
+    ("xtestintrin.h", include_str!("include/xtestintrin.h")),
+    ("shaintrin.h", include_str!("include/shaintrin.h")),
     ("mmintrin.h", include_str!("include/mmintrin.h")),
     ("xmmintrin.h", include_str!("include/xmmintrin.h")),
     ("emmintrin.h", include_str!("include/emmintrin.h")),

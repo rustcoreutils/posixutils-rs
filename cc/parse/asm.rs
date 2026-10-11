@@ -10,12 +10,17 @@
 //
 
 use super::ast::{AsmOperand, ExternalDecl, LabelId, Stmt};
+use super::bind::DeclScope;
 use super::parser::{ParseError, ParseResult, Parser};
+use crate::arch::asm_constraints::{GlobalHold, PinnedGp};
+use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::Namespace;
+use crate::symbol::{Namespace, SymbolId};
+use crate::token::lexer::Position;
 use crate::token::lexer::{payload_text, TokenType, TokenValue};
 use crate::token::literal;
-use crate::types::TypeModifiers;
+use crate::types::{TypeId, TypeKind, TypeModifiers};
+use gettextrs::gettext;
 
 impl Parser<'_> {
     /// Check if current token is __asm or __asm__
@@ -135,6 +140,82 @@ impl Parser<'_> {
         }
     }
 
+    /// Bind a `register` declarator to the register its asm label names: a
+    /// GNU register variable, `register long x asm("r10")`.
+    ///
+    /// The label is no assembler name -- nothing is emitted under it. At
+    /// block scope the variable is an ordinary automatic one, and the
+    /// binding pins it as an inline-asm register operand; at file scope it
+    /// has no storage and is the register itself, so it may have no
+    /// initializer. A plain `register` declaration has no label and binds
+    /// nothing.
+    ///
+    /// c17 binds a local in any general register it can hand an asm operand
+    /// -- every one but the stack and frame pointers -- and a global in any
+    /// register its own generated code leaves to the allocator, which every
+    /// function of the unit then leaves alone; see
+    /// [`PinnedGp::global_hold`].
+    pub(super) fn bind_register_variable(
+        &mut self,
+        symbol: Option<SymbolId>,
+        name: StringId,
+        typ: TypeId,
+        scope: DeclScope,
+        initialized: bool,
+        pos: Position,
+    ) {
+        let Some(label) = self.pending_asm_label.take() else {
+            return;
+        };
+        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+        let global = scope == DeclScope::File;
+        if global && initialized {
+            diag::error(pos, &gettext("global register variable has initial value"));
+        }
+        let Some(reg) = PinnedGp::named(&label, self.types.target().arch) else {
+            diag::error_args(pos, "invalid register name for '{0}'", &[&spelled]);
+            return;
+        };
+        let scalar = self.types.is_integer(typ) || self.types.kind(typ) == TypeKind::Pointer;
+        if !scalar || self.types.size_bits(typ) > 64 {
+            diag::error_args(
+                pos,
+                "data type of '{0}' isn't suitable for a general register",
+                &[&spelled],
+            );
+            return;
+        }
+        match reg.global_hold() {
+            _ if !global => {}
+            GlobalHold::Reserved | GlobalHold::FramePointer => {}
+            GlobalHold::CallClobbered => diag::warning(
+                pos,
+                &gettext("call-clobbered register used for global register variable"),
+            ),
+            GlobalHold::Unavailable => {
+                diag::error_args(
+                    pos,
+                    "global register variable '{0}' in '{1}' is not supported; \
+                     code c17 generates uses that register itself",
+                    &[&spelled, &label],
+                );
+                return;
+            }
+        }
+        if !global && (reg.is_stack_pointer() || reg.is_frame_pointer()) {
+            diag::error_args(
+                pos,
+                "local register variable '{0}' in '{1}' is not supported; c17 \
+                 cannot hand an asm operand the stack or frame pointer",
+                &[&spelled, &label],
+            );
+            return;
+        }
+        if let Some(id) = symbol {
+            self.symbols.get_mut(id).hard_register = Some(reg);
+        }
+    }
+
     /// Parse GCC extended inline assembly statement
     /// Format: __asm__ [volatile] [goto] ( "template" [: outputs [: inputs [: clobbers [: goto_labels]]]] );
     pub(super) fn parse_asm_statement(&mut self) -> ParseResult<Stmt> {
@@ -146,11 +227,11 @@ impl Parser<'_> {
         let mut _is_goto = false;
         while let Some(name_id) = self.current_ident() {
             match name_id {
-                crate::kw::VOLATILE | crate::kw::GNU_VOLATILE => {
+                crate::kw::VOLATILE | crate::kw::GNU_VOLATILE | crate::kw::GNU_VOLATILE2 => {
                     is_volatile = true;
                     self.advance();
                 }
-                crate::kw::INLINE | crate::kw::GNU_INLINE => {
+                crate::kw::INLINE | crate::kw::GNU_INLINE | crate::kw::GNU_INLINE2 => {
                     self.advance();
                 }
                 crate::kw::GOTO => {
@@ -208,6 +289,8 @@ impl Parser<'_> {
         self.expect_special(b')')?;
         self.expect_special(b';')?;
 
+        let (outputs, inputs) = self.resolve_asm_operand_names(pos, outputs, inputs, &goto_labels);
+
         // Every asm is already treated as volatile: `Opcode::Asm` is a memory
         // access, so DCE never deletes one and no pass reorders it past
         // another memory operation. The qualifier has nothing left to add.
@@ -221,6 +304,45 @@ impl Parser<'_> {
             clobbers,
             goto_labels,
         })
+    }
+
+    /// The operands with every `[name]` in a constraint rewritten as the
+    /// number of the operand it names, as gcc does before it reads the
+    /// constraint: `"[sum]"` is the matching constraint `"0"` when `sum` is
+    /// output 0. Names number outputs, then inputs, then `asm goto` labels.
+    ///
+    /// A name given twice is reported, and so is a constraint naming an
+    /// operand that does not exist, in gcc's words. The template's
+    /// `%[name]` is substituted where the operands are, in the backend.
+    fn resolve_asm_operand_names(
+        &self,
+        pos: Position,
+        outputs: Vec<AsmOperand>,
+        inputs: Vec<AsmOperand>,
+        labels: &[LabelId],
+    ) -> (Vec<AsmOperand>, Vec<AsmOperand>) {
+        let names: Vec<Option<&str>> = outputs
+            .iter()
+            .chain(&inputs)
+            .map(|op| op.name.map(|n| self.str(n)))
+            .chain(labels.iter().map(|l| Some(self.str(l.name))))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for name in names.iter().flatten() {
+            if !seen.insert(*name) {
+                diag::error_args(pos, "duplicate 'asm' operand name '{0}'", &[name]);
+            }
+        }
+        let resolve = |mut op: AsmOperand| {
+            match resolve_operand_names(&op.constraint, &names) {
+                Ok(c) => op.constraint = c,
+                Err(e) => diag::error(pos, &e.to_string()),
+            }
+            op
+        };
+        let outputs = outputs.into_iter().map(resolve).collect();
+        let inputs = inputs.into_iter().map(resolve).collect();
+        (outputs, inputs)
     }
 
     /// Parse GNU basic asm at file scope: `asm ( string-literal ) ;`, the
@@ -426,4 +548,53 @@ impl Parser<'_> {
 
         Ok(labels)
     }
+}
+
+/// Why a `[name]` in an asm constraint names no operand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OperandNameError {
+    /// `[` with no `]` after it.
+    MissingCloseBrace,
+    /// A name no operand or label of the statement has.
+    Undefined(String),
+}
+
+impl std::fmt::Display for OperandNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperandNameError::MissingCloseBrace => {
+                f.write_str(&gettext("missing close brace for named operand"))
+            }
+            OperandNameError::Undefined(name) => f.write_str(&gettextrs::gettext_args(
+                "undefined named operand '{0}'",
+                &[name],
+            )),
+        }
+    }
+}
+
+/// `constraint` with each `[name]` replaced by the number of the operand
+/// `names` gives it -- `names` lists the statement's operand names in gcc's
+/// numbering: outputs, inputs, then labels. A name may sit anywhere in the
+/// constraint (`"r[sum]"` is `"r0"`), as in gcc.
+pub(super) fn resolve_operand_names(
+    constraint: &str,
+    names: &[Option<&str>],
+) -> Result<String, OperandNameError> {
+    let mut out = String::with_capacity(constraint.len());
+    let mut rest = constraint;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find(']').ok_or(OperandNameError::MissingCloseBrace)?;
+        let name = &after[..close];
+        let number = names
+            .iter()
+            .position(|n| *n == Some(name))
+            .ok_or_else(|| OperandNameError::Undefined(name.to_string()))?;
+        out.push_str(&number.to_string());
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }

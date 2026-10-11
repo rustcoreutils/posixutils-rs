@@ -52,14 +52,20 @@ struct Options {
     /// `-ftls-model=`.
     tls_model: target::TlsModel,
     shared: bool,
-    no_unwind_tables: bool,
+    /// The unwind-table options, folded.
+    unwind: target::UnwindTables,
     stack_clash: bool,
     /// The last of `-fstack-protector`'s levels and `-fno-stack-protector`.
     stack_protector: target::StackProtector,
+    /// `--param=ssp-buffer-size=`.
+    ssp_buffer_size: Option<u64>,
     verbose_asm: bool,
     cf_protection: target::CfProtection,
+    /// `-pg` or `-p`.
+    profile: bool,
     math_errno: bool,
     trapping_math: bool,
+    fp_rounding: crate::float::FpRounding,
     defines: Vec<String>,
     undefines: Vec<String>,
     include_paths: Vec<String>,
@@ -74,6 +80,14 @@ struct Options {
     /// `-fdebug-prefix-map=`, `-fmacro-prefix-map=`, `-ffile-prefix-map=`,
     /// in order.
     prefix_maps: Vec<MapOption>,
+    /// `-fvisibility=`.
+    default_visibility: Option<String>,
+    /// `-fno-semantic-interposition`.
+    no_semantic_interposition: bool,
+    /// `-ffunction-sections`, `-fdata-sections`, `-fcommon`, `-fno-plt`.
+    layout: target::ObjectLayout,
+    /// The `-f` options `f_options::CodeOptions` folds, in order.
+    code_options: Vec<String>,
 }
 
 /// Apply `flags` the way the driver does: the switches that live in
@@ -107,18 +121,25 @@ fn apply_flags(flags: &[&str]) -> Options {
         match flag {
             "-w" => diag::suppress_warnings(),
             "-fpermissive" => diag::set_permissive(),
+            "-fno-diagnostics-show-option" => diag::set_show_option(false),
             "-fno-builtin" => crate::builtins::set_no_builtin(),
             "-fgnu89-inline" => crate::builtins::set_gnu89_inline(true),
             "-g" => o.debug = true,
             "-O" => o.optimization = Optimization::from_flag("1").unwrap(),
             "-shared" | "--shared" | "-G" => o.shared = true,
-            "--fno-unwind-tables" => o.no_unwind_tables = true,
             "-fverbose-asm" => o.verbose_asm = true,
+            "-pg" | "-p" => o.profile = true,
             "-fstack-clash-protection" => o.stack_clash = true,
             "-fmath-errno" => o.math_errno = true,
             "-fno-math-errno" => o.math_errno = false,
             "-fno-trapping-math" => o.trapping_math = false,
+            "-frounding-math" => o.fp_rounding = crate::float::FpRounding::Dynamic,
             "-fno-inline" => o.inlining = Some(false),
+            "-fno-semantic-interposition" => o.no_semantic_interposition = true,
+            "-ffunction-sections" => o.layout.function_sections = true,
+            "-fdata-sections" => o.layout.data_sections = true,
+            "-fcommon" => o.layout.common = true,
+            "-fno-plt" => o.layout.plt = false,
             "-finline" => o.inlining = Some(true),
             "-fsigned-char" | "-fno-unsigned-char" => {
                 o.plain_char = Some(target::CharSignedness::Signed)
@@ -127,13 +148,23 @@ fn apply_flags(flags: &[&str]) -> Options {
                 o.plain_char = Some(target::CharSignedness::Unsigned)
             }
             _ => {
-                if let Some(position) = target::PositionIndependence::from_flag(flag) {
+                if let Some(name) = flag
+                    .strip_prefix("-f")
+                    .filter(|n| crate::f_options::CodeOptions::owns(n))
+                {
+                    o.code_options.push(name.to_string());
+                } else if let Some(position) = target::PositionIndependence::from_flag(flag) {
                     o.position = Some(position);
+                } else if let Some(unwind) = flag.strip_prefix("-f").and_then(|n| o.unwind.after(n))
+                {
+                    o.unwind = unwind;
                 } else if let Some(level) = flag
                     .strip_prefix("-f")
                     .and_then(target::StackProtector::from_option)
                 {
                     o.stack_protector = level;
+                } else if let Some(bytes) = flag.strip_prefix("--param=ssp-buffer-size=") {
+                    o.ssp_buffer_size = Some(bytes.parse().unwrap());
                 } else if let Some(model) = flag.strip_prefix("-ftls-model=") {
                     o.tls_model = target::TlsModel::from_name(model).unwrap();
                 } else if let Some(level) = flag.strip_prefix("-O") {
@@ -150,10 +181,20 @@ fn apply_flags(flags: &[&str]) -> Options {
                     o.include_paths.push(i.to_string());
                 } else if let Some(level) = flag.strip_prefix("-fcf-protection=") {
                     o.cf_protection = target::CfProtection::from_level(level).unwrap();
+                } else if let Some(how) = flag.strip_prefix("-fvisibility=") {
+                    o.default_visibility = Some(how.to_string());
                 } else if let Some(t) = flag.strip_prefix("--target=") {
                     o.target = Some(t.to_string());
                 } else if flag.starts_with("-m") && flag.len() > 2 {
                     o.mflags.push(flag.to_string());
+                } else if flag.strip_prefix("-f").is_some_and(|n| {
+                    matches!(
+                        crate::f_options::classify(n),
+                        crate::f_options::Verdict::Known(crate::f_options::Effect::Accepted(_))
+                    )
+                }) {
+                    // Taken in silence by the driver: c17's output already
+                    // is what it asks for.
                 } else {
                     panic!("test_compile: unsupported option {flag}");
                 }
@@ -183,9 +224,24 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     // As the driver: the `-m` ISA options select x86-64's instructions.
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&o.mflags);
+        target.x86 =
+            crate::machine::X86Options::from_flags(&o.mflags, target.os == target::Os::MacOS)
+                .expect("test_compile: refused machine flag");
+    } else {
+        target.branch_protection = target::BranchProtection::from_flags(&o.mflags).unwrap();
+        target.arch_has_bti = target::aarch64_arch_has_bti(&o.mflags);
     }
     if let Some(signedness) = o.plain_char {
         target.plain_char = signedness;
+    }
+    // As the driver: `-fshort-wchar` and `-ffreestanding` before anything
+    // reads the types or the predefined macros.
+    let code = crate::f_options::CodeOptions::from_names(&o.code_options, &target)
+        .expect("test_compile: refused -f option");
+    target.short_wchar = code.short_wchar;
+    if code.freestanding {
+        crate::builtins::set_no_builtin();
+        crate::builtins::set_freestanding();
     }
     // As the driver's `position_independence`.
     let position = o
@@ -194,14 +250,21 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
 
     let prefix_maps = PrefixMaps::from_options(&o.prefix_maps);
     let mut strings = StringTable::new();
-    let (tokens, _) =
-        pipeline::source_tokens(src.as_bytes(), &source_name, false, false, &mut strings);
+    let (tokens, _) = pipeline::source_tokens(
+        src.as_bytes(),
+        &source_name,
+        false,
+        false,
+        Default::default(),
+        &mut strings,
+    );
     let (preprocessed, _) = preprocess_collecting(
         tokens,
         &target,
         &mut strings,
         &source_name,
         &PreprocessConfig {
+            language: Default::default(),
             defines: &o.defines,
             undefines: &o.undefines,
             include_paths: &o.include_paths,
@@ -211,12 +274,19 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             trigraphs: false,
             preprocessed: false,
             pre_includes: &[],
+            imacros: &[],
+            undef: false,
+            comments: Default::default(),
             dump_macros: false,
             keep_definitions: false,
             collect_dependencies: false,
+            preprocess_only: false,
             optimization: o.optimization,
             position,
             isa: target::X86Isa::from_flags(&o.mflags),
+            cf_protection: o.cf_protection,
+            exceptions: o.unwind.exceptions(),
+            cfi: o.unwind.cfi(&target, o.debug),
             macro_prefix_map: prefix_maps.macros,
         },
     );
@@ -226,19 +296,30 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         math_errno: o.math_errno,
         debug: o.debug,
         trapping_math: o.trapping_math,
-        default_visibility: None,
+        fp_rounding: o.fp_rounding,
+        default_visibility: o.default_visibility.as_deref(),
         tls: target::TlsPolicy {
             shared_code: o.shared || position.is_shared_code(),
             floor: o.tls_model,
         },
         pic: o.shared || position.is_pic(),
-        unwind_tables: !o.no_unwind_tables,
+        semantic_interposition: !o.no_semantic_interposition,
+        layout: o.layout,
+        cfi: o.unwind.cfi(&target, o.debug),
+        exceptions: o.unwind.exceptions(),
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
-        stack_clash: o.stack_clash,
-        stack_protector: o.stack_protector,
+        stack_clash: o.stack_clash.then(target::StackClash::default),
+        profiling: o.profile.then(|| target::Profiling::from_flags(&o.mflags)),
+        stack_protector: target::StackProtection {
+            level: o.stack_protector,
+            buffer_size: o
+                .ssp_buffer_size
+                .unwrap_or(target::StackProtection::DEFAULT_BUFFER_SIZE),
+        },
         source_name: &source_name,
         debug_prefix_map: &prefix_maps.debug,
+        code,
     };
     let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
 

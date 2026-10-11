@@ -11,7 +11,8 @@
 
 use super::codegen::{escape_path, CodeGenBase};
 use super::lir::{Directive, EmitAsm, LirInst, OperandSize, Symbol};
-use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::ir::GlobalDef;
+use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
 
 // DWARF Constants (DWARF Version 2)
@@ -50,6 +51,10 @@ pub const DW_TAG_BASE_TYPE: u64 = 0x24;
 pub const DW_TAG_SUBPROGRAM: u64 = 0x2e;
 pub const DW_TAG_VARIABLE: u64 = 0x34;
 pub const DW_TAG_SUBRANGE_TYPE: u64 = 0x21;
+pub const DW_TAG_CONST_TYPE: u64 = 0x26;
+pub const DW_TAG_VOLATILE_TYPE: u64 = 0x35;
+pub const DW_TAG_RESTRICT_TYPE: u64 = 0x37;
+pub const DW_TAG_ATOMIC_TYPE: u64 = 0x47;
 
 pub const DW_AT_BYTE_SIZE: u64 = 0x0b;
 pub const DW_AT_ENCODING: u64 = 0x3e;
@@ -60,6 +65,7 @@ pub const DW_AT_DECL_FILE: u64 = 0x3a;
 pub const DW_AT_DECL_LINE: u64 = 0x3b;
 pub const DW_AT_TYPE: u64 = 0x49;
 
+pub const DW_FORM_UDATA: u64 = 0x0f;
 pub const DW_FORM_BLOCK1: u64 = 0x0a;
 pub const DW_FORM_DATA1: u64 = 0x0b;
 pub const DW_FORM_FLAG: u64 = 0x0c;
@@ -73,6 +79,8 @@ pub const DW_ATE_SIGNED_CHAR: u64 = 0x06;
 pub const DW_ATE_UNSIGNED: u64 = 0x07;
 pub const DW_ATE_UNSIGNED_CHAR: u64 = 0x08;
 
+/// `DW_OP_addr` -- a target address, the operand that follows.
+pub const DW_OP_ADDR: i64 = 0x03;
 /// `DW_OP_breg0` -- register N's value plus a signed offset.
 pub const DW_OP_BREG0: i64 = 0x70;
 
@@ -92,6 +100,59 @@ const ABBREV_ARRAY: u64 = 11;
 const ABBREV_SUBRANGE: u64 = 12;
 const ABBREV_STRUCT: u64 = 13;
 const ABBREV_UNION: u64 = 14;
+const ABBREV_GLOBAL_VAR: u64 = 15;
+const ABBREV_GLOBAL_VAR_NOLOC: u64 = 16;
+const ABBREV_CONST: u64 = 17;
+const ABBREV_CONST_VOID: u64 = 18;
+const ABBREV_VOLATILE: u64 = 19;
+const ABBREV_VOLATILE_VOID: u64 = 20;
+const ABBREV_RESTRICT: u64 = 21;
+const ABBREV_RESTRICT_VOID: u64 = 22;
+const ABBREV_ATOMIC: u64 = 23;
+const ABBREV_ATOMIC_VOID: u64 = 24;
+
+/// A qualifier's modifier DIE: the qualifier, its tag, and its two shapes --
+/// over a type DIE, and over `void`, which has none to name.
+struct QualifierDie {
+    qual: TypeModifiers,
+    tag: u64,
+    abbrev: u64,
+    abbrev_void: u64,
+}
+
+/// The qualifiers in the order gcc nests their DIEs, innermost first:
+/// `const volatile int` is a volatile DIE over a const DIE over `int`.
+const QUALIFIER_DIES: [QualifierDie; 4] = [
+    QualifierDie {
+        qual: TypeModifiers::CONST,
+        tag: DW_TAG_CONST_TYPE,
+        abbrev: ABBREV_CONST,
+        abbrev_void: ABBREV_CONST_VOID,
+    },
+    QualifierDie {
+        qual: TypeModifiers::VOLATILE,
+        tag: DW_TAG_VOLATILE_TYPE,
+        abbrev: ABBREV_VOLATILE,
+        abbrev_void: ABBREV_VOLATILE_VOID,
+    },
+    QualifierDie {
+        qual: TypeModifiers::RESTRICT,
+        tag: DW_TAG_RESTRICT_TYPE,
+        abbrev: ABBREV_RESTRICT,
+        abbrev_void: ABBREV_RESTRICT_VOID,
+    },
+    QualifierDie {
+        qual: TypeModifiers::ATOMIC,
+        tag: DW_TAG_ATOMIC_TYPE,
+        abbrev: ABBREV_ATOMIC,
+        abbrev_void: ABBREV_ATOMIC_VOID,
+    },
+];
+
+/// The modifier DIE outermost for `quals`, which holds the DIE of the rest.
+fn outermost_qualifier(quals: TypeModifiers) -> Option<&'static QualifierDie> {
+    QUALIFIER_DIES.iter().rev().find(|q| quals.contains(q.qual))
+}
 
 /// Where a variable lives, as the code generator computed it: a register and a
 /// byte offset from it.
@@ -126,6 +187,8 @@ pub struct VarDie {
 pub struct FnDie {
     pub name: String,
     pub external: bool,
+    /// The `.file` number of the file it is defined in; 0 for none.
+    pub decl_file: u32,
     pub decl_line: u32,
     /// Label marking the first byte past the function, for `DW_AT_high_pc`.
     pub end_label: String,
@@ -169,6 +232,11 @@ fn abbrev<I: LirInst + EmitAsm>(
 /// Several shapes come in pairs because DWARF has no "absent" value: a
 /// function with no return type and one with a return type are different
 /// shapes, as are a variable that has a location and one that does not.
+///
+/// The entries go out in code order, 1, 2, 3, ...: DWARF allows any order,
+/// but gprofng's reader numbers the entries by position and drops the rest
+/// of the table at the first code out of place -- and with it every DIE
+/// that used one, so a profile lost its source.
 pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
     base.push_directive(Directive::DebugAbbrev);
     base.push_directive(Directive::local_label(".Ldebug_abbrev0"));
@@ -192,7 +260,7 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
     let subprogram_attrs: &[(u64, u64)] = &[
         (DW_AT_EXTERNAL, DW_FORM_FLAG),
         (DW_AT_NAME, DW_FORM_STRING),
-        (DW_AT_DECL_FILE, DW_FORM_DATA1),
+        (DW_AT_DECL_FILE, DW_FORM_UDATA),
         (DW_AT_DECL_LINE, DW_FORM_DATA4),
         (DW_AT_LOW_PC, DW_FORM_ADDR),
         (DW_AT_HIGH_PC, DW_FORM_ADDR),
@@ -218,7 +286,7 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
     // location.
     let var_attrs: &[(u64, u64)] = &[
         (DW_AT_NAME, DW_FORM_STRING),
-        (DW_AT_DECL_FILE, DW_FORM_DATA1),
+        (DW_AT_DECL_FILE, DW_FORM_UDATA),
         (DW_AT_DECL_LINE, DW_FORM_DATA4),
         (DW_AT_TYPE, DW_FORM_REF4),
     ];
@@ -293,29 +361,95 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
         );
     }
 
+    // A file-scope object: where it was declared -- in any file of the unit,
+    // so the file is a `.file` number rather than always the first -- whether
+    // it is exported, and its address. A thread-local one has no address.
+    let global_attrs: &[(u64, u64)] = &[
+        (DW_AT_NAME, DW_FORM_STRING),
+        (DW_AT_DECL_FILE, DW_FORM_UDATA),
+        (DW_AT_DECL_LINE, DW_FORM_DATA4),
+        (DW_AT_TYPE, DW_FORM_REF4),
+        (DW_AT_EXTERNAL, DW_FORM_FLAG),
+    ];
+    let mut global_with_loc = global_attrs.to_vec();
+    global_with_loc.push((DW_AT_LOCATION, DW_FORM_BLOCK1));
+    abbrev(
+        base,
+        ABBREV_GLOBAL_VAR,
+        DW_TAG_VARIABLE,
+        DW_CHILDREN_NO,
+        &global_with_loc,
+    );
+    abbrev(
+        base,
+        ABBREV_GLOBAL_VAR_NOLOC,
+        DW_TAG_VARIABLE,
+        DW_CHILDREN_NO,
+        global_attrs,
+    );
+
+    // A qualified type: a modifier DIE over the type without it, or over
+    // nothing for a qualified `void`.
+    for q in &QUALIFIER_DIES {
+        abbrev(
+            base,
+            q.abbrev,
+            q.tag,
+            DW_CHILDREN_NO,
+            &[(DW_AT_TYPE, DW_FORM_REF4)],
+        );
+        abbrev(base, q.abbrev_void, q.tag, DW_CHILDREN_NO, &[]);
+    }
+
     // A zero code ends the table.
     base.push_directive(Directive::Uleb128(0));
+}
+
+/// One type DIE: the type `core` stands for, without its top-level
+/// qualifiers, under the qualifiers `quals`. With none it is that type's own
+/// DIE; with some it is the modifier DIE for the outermost of them.
+///
+/// Keyed by the unqualified type rather than by `TypeId` so that `int`,
+/// `const int` and `volatile int` share one `int` DIE, and every `const int`
+/// one modifier DIE, as gcc's do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DieKey {
+    core: TypeId,
+    quals: u32,
+}
+
+impl DieKey {
+    fn quals(self) -> TypeModifiers {
+        TypeModifiers::from_bits_truncate(self.quals)
+    }
 }
 
 /// The type DIEs a set of functions needs, and where each one will sit.
 ///
 /// Types are reached transitively -- a pointer needs its pointee, an array its
-/// element. Emission follows `order`, the sequence in which they were first
-/// reached, so the table does not depend on hash iteration order.
+/// element, a qualified type the type without the qualifier. Emission follows
+/// `order`, the sequence in which they were first reached, so the table does
+/// not depend on hash iteration order.
 struct TypeDies {
-    /// Type -> index, which names its label `.Ldie_ty<N>`. Lookup only:
+    /// DIE -> index, which names its label `.Ldie_ty<N>`. Lookup only:
     /// emission walks `order`, so hash iteration never reaches the output.
-    index: HashMap<TypeId, usize>,
+    index: HashMap<DieKey, usize>,
     /// Emission order, so a DIE is written once and the table is stable.
-    order: Vec<TypeId>,
+    order: Vec<DieKey>,
+    /// Each type a DIE was asked for -> the index of its DIE.
+    by_type: HashMap<TypeId, usize>,
 }
 
 impl TypeDies {
-    fn collect(fns: &[FnDie], types: &TypeTable) -> Self {
+    fn collect(fns: &[FnDie], globals: &[GlobalDef], types: &TypeTable) -> Self {
         let mut this = TypeDies {
             index: HashMap::new(),
             order: Vec::new(),
+            by_type: HashMap::new(),
         };
+        for g in globals.iter().filter(|g| g.decl_pos.is_some()) {
+            this.add(g.typ, types, 0);
+        }
         for f in fns {
             if let Some(t) = f.ret_typ {
                 this.add(t, types, 0);
@@ -327,34 +461,85 @@ impl TypeDies {
         this
     }
 
-    /// Record `id` and whatever it refers to.
+    /// Record `id` and whatever it refers to; its DIE's index, or `None`
+    /// for a type with no DIE.
     ///
     /// `depth` guards against a type that reaches itself -- `struct s { struct
     /// s *next; };` is ordinary C, and the pointer arm would otherwise recurse
     /// forever. Aggregates emit no members here, so the walk stops at them
     /// anyway; the cap is for the pointer and array chains.
-    fn add(&mut self, id: TypeId, types: &TypeTable, depth: u32) {
-        if depth > 16 || self.index.contains_key(&id) {
-            return;
+    fn add(&mut self, id: TypeId, types: &TypeTable, depth: u32) -> Option<usize> {
+        if let Some(&n) = self.by_type.get(&id) {
+            return Some(n);
         }
-        let kind = types.kind(id);
-        // A type c17 has no DIE shape for is left out; the variable using it
-        // then has no `DW_AT_type` and is skipped rather than mislabelled.
-        if !describable(kind) {
-            return;
+        if depth > 16 {
+            return None;
         }
-        self.index.insert(id, self.order.len());
-        self.order.push(id);
-        if matches!(kind, TypeKind::Pointer | TypeKind::Array) {
-            if let Some(base) = types.base_type(id) {
-                self.add(base, types, depth + 1);
+        // A type met only qualified is its own unqualified stand-in: its DIE
+        // describes it without the qualifiers either way.
+        let core = types.existing_unqualified(id).unwrap_or(id);
+        let n = self.add_key(core, types.qualifiers(id), types, depth)?;
+        self.by_type.insert(id, n);
+        Some(n)
+    }
+
+    fn add_key(
+        &mut self,
+        core: TypeId,
+        quals: TypeModifiers,
+        types: &TypeTable,
+        depth: u32,
+    ) -> Option<usize> {
+        let key = DieKey {
+            core,
+            quals: quals.bits(),
+        };
+        if let Some(&n) = self.index.get(&key) {
+            return Some(n);
+        }
+        let kind = types.kind(core);
+        match outermost_qualifier(quals) {
+            None => {
+                // A type c17 has no DIE shape for is left out; the variable
+                // using it then has no `DW_AT_type` and is skipped rather
+                // than mislabelled.
+                if !describable(kind) {
+                    return None;
+                }
+                let n = self.push(key);
+                if matches!(kind, TypeKind::Pointer | TypeKind::Array) {
+                    if let Some(base) = types.base_type(core) {
+                        self.add(base, types, depth + 1);
+                    }
+                }
+                Some(n)
+            }
+            Some(outer) => {
+                // The qualifier's DIE wraps the DIE of the rest -- of which
+                // a qualified `void` has none.
+                let inner = quals - outer.qual;
+                if !(inner.is_empty() && kind == TypeKind::Void) {
+                    self.add_key(core, inner, types, depth)?;
+                }
+                Some(self.push(key))
             }
         }
     }
 
-    fn label(&self, id: TypeId) -> Option<String> {
-        self.index.get(&id).map(|n| format!(".Ldie_ty{}", n))
+    fn push(&mut self, key: DieKey) -> usize {
+        let n = self.order.len();
+        self.index.insert(key, n);
+        self.order.push(key);
+        n
     }
+
+    fn label(&self, id: TypeId) -> Option<String> {
+        self.by_type.get(&id).map(|&n| die_label(n))
+    }
+}
+
+fn die_label(n: usize) -> String {
+    format!(".Ldie_ty{}", n)
 }
 
 /// Whether this kind of type has a DIE shape in the abbreviation table.
@@ -416,8 +601,23 @@ fn emit_type_dies<I: LirInst + EmitAsm>(
     dies: &TypeDies,
     types: &TypeTable,
 ) {
-    for (n, &id) in dies.order.iter().enumerate() {
-        base.push_directive(Directive::local_label(format!(".Ldie_ty{}", n)));
+    for (n, &key) in dies.order.iter().enumerate() {
+        base.push_directive(Directive::local_label(die_label(n)));
+        if let Some(outer) = outermost_qualifier(key.quals()) {
+            let inner = DieKey {
+                core: key.core,
+                quals: (key.quals() - outer.qual).bits(),
+            };
+            match dies.index.get(&inner) {
+                Some(&m) => {
+                    base.push_directive(Directive::Uleb128(outer.abbrev));
+                    type_ref(base, &die_label(m));
+                }
+                None => base.push_directive(Directive::Uleb128(outer.abbrev_void)),
+            }
+            continue;
+        }
+        let id = key.core;
         let size = types.size_bytes(id) as i64;
         match types.kind(id) {
             TypeKind::Pointer => match types.base_type(id).and_then(|b| dies.label(b)) {
@@ -479,7 +679,7 @@ fn emit_fn_die<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, f: &FnDie, dies:
     }));
     base.push_directive(Directive::Byte(if f.external { 1 } else { 0 }));
     base.push_directive(Directive::Asciz(f.name.clone()));
-    base.push_directive(Directive::Byte(1)); // DW_AT_decl_file
+    base.push_directive(Directive::Uleb128(f.decl_file.into()));
     base.push_directive(Directive::Long(f.decl_line as i64));
     base.push_directive(Directive::QuadSym(Symbol::global(&f.name)));
     base.push_directive(Directive::QuadSym(Symbol::local(&f.end_label)));
@@ -531,7 +731,9 @@ fn emit_fn_die<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, f: &FnDie, dies:
         };
         base.push_directive(Directive::Uleb128(code));
         base.push_directive(Directive::Asciz(name.to_string()));
-        base.push_directive(Directive::Byte(1)); // DW_AT_decl_file
+        // A variable has no position of its own yet; it is in its function's
+        // file.
+        base.push_directive(Directive::Uleb128(f.decl_file.into()));
         base.push_directive(Directive::Long(v.decl_line as i64));
         type_ref(base, &ty);
         if let Some(loc) = v.loc {
@@ -552,6 +754,41 @@ fn emit_fn_die<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, f: &FnDie, dies:
     }
 
     base.push_directive(Directive::Byte(0)); // end of this subprogram's children
+}
+
+/// Emit the DIE for each file-scope object of the unit, in definition order.
+///
+/// ld finds the source location of a reference from data by the variable
+/// whose address range holds it, so without these a link warning about a
+/// symbol referenced from an initializer (binutils' `beginwarn`) named a
+/// section offset where gcc's objects give the file and line.
+fn emit_global_dies<I: LirInst + EmitAsm>(
+    base: &mut CodeGenBase<I>,
+    globals: &[GlobalDef],
+    dies: &TypeDies,
+) {
+    for g in globals {
+        let (Some(pos), Some(ty)) = (g.decl_pos, dies.label(g.typ)) else {
+            continue;
+        };
+        base.push_directive(Directive::Uleb128(if g.is_thread_local {
+            ABBREV_GLOBAL_VAR_NOLOC
+        } else {
+            ABBREV_GLOBAL_VAR
+        }));
+        base.push_directive(Directive::Asciz(g.name.clone()));
+        let file = base.source_files.file_of(pos.stream).unwrap_or(0);
+        base.push_directive(Directive::Uleb128(file.into()));
+        base.push_directive(Directive::Long(i64::from(pos.line)));
+        type_ref(base, &ty);
+        base.push_directive(Directive::Byte(if g.is_static { 0 } else { 1 }));
+        if !g.is_thread_local {
+            // `DW_OP_addr` and the eight-byte address: a nine-byte block.
+            base.push_directive(Directive::Byte(9));
+            base.push_directive(Directive::Byte(DW_OP_ADDR));
+            base.push_directive(Directive::QuadSym(Symbol::global(&g.name)));
+        }
+    }
 }
 
 /// The name a debugger should show, without the linearizer's uniquing suffix.
@@ -594,6 +831,8 @@ pub struct UnitInfo<'a> {
     /// Labels bounding the unit's code; `None` for a file with no functions.
     pub low_pc_label: Option<&'a str>,
     pub high_pc_label: Option<&'a str>,
+    /// The unit's objects; those declared at file scope get a DIE.
+    pub globals: &'a [GlobalDef],
 }
 
 pub fn generate_debug_info<I: LirInst + EmitAsm>(
@@ -608,8 +847,9 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
         comp_dir,
         low_pc_label,
         high_pc_label,
+        globals,
     } = *unit;
-    let dies = TypeDies::collect(fns, types);
+    let dies = TypeDies::collect(fns, globals, types);
     // Switch to .debug_info section
     base.push_directive(Directive::DebugInfo);
 
@@ -679,9 +919,11 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
         base.push_directive(Directive::Quad(0));
     }
 
-    // The compile unit's children: every type the functions mention, then the
-    // functions themselves. A zero byte closes the list.
+    // The compile unit's children: every type the objects and functions
+    // mention, then the objects, then the functions. A zero byte closes the
+    // list.
     emit_type_dies(base, &dies, types);
+    emit_global_dies(base, globals, &dies);
     for f in fns {
         emit_fn_die(base, f, &dies);
     }

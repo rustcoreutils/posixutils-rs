@@ -577,6 +577,31 @@ fn test_macro_redefinition_conflict_detection() {
     assert!(macro_redefinition_conflict(&fnlike, &fnlike.clone()).is_none());
 }
 
+/// A predefine redefined to something else conflicts, as gcc warns, whatever
+/// the name looks like, a feature-test spelling such as `_GNU_SOURCE`
+/// included -- and `_FORTIFY_SOURCE`, which c17 no longer predefines
+/// anywhere, has no exception.
+#[test]
+fn test_predefine_redefinition_conflict() {
+    let predef = |name: &str, value: &str| Macro::predefined(name, Some(value));
+    for name in [
+        "__CHAR_BIT__",
+        "_GNU_SOURCE",
+        "_XOPEN_SOURCE",
+        "_REENTRANT",
+        "_FORTIFY_SOURCE",
+    ] {
+        assert!(
+            macro_redefinition_conflict(&predef(name, "1"), &predef(name, "2")).is_some(),
+            "{name}"
+        );
+        assert!(
+            macro_redefinition_conflict(&predef(name, "1"), &predef(name, "1")).is_none(),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn test_replacement_lists_ignore_leading_whitespace() {
     // Whitespace before the first replacement token is not a separation
@@ -887,6 +912,42 @@ fn test_token_paste_function_macro_suffix() {
     let (tokens, idents) = preprocess_str(input);
     let strs = get_token_strings(&tokens, &idents);
     assert!(strs.contains(&"my_func".to_string()));
+}
+
+/// C17 6.10.3.3p2: an empty argument next to `##` is a placemarker, so the
+/// paste never reaches the token before the operand.
+#[test]
+fn test_token_paste_empty_operand_is_placemarker() {
+    let input = "#define C(mod, v) { mod##INC(v); }\n\
+                 #define CAT3(a, b, c) < a ## b ## c >\n\
+                 C(, v) CAT3(, , ) CAT3(, b, ) CAT3(a, , c)\n";
+    crate::diag::capture_diagnostics();
+    let (tokens, idents) = preprocess_str(input);
+    let diags = crate::diag::take_captured_diagnostics();
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        get_token_strings(&tokens, &idents).join(" "),
+        "{ INC ( v ) ; } < > < b > < ac >"
+    );
+}
+
+/// `name ## __VA_ARGS__` pastes the first variadic token onto `name`, and
+/// `__VA_ARGS__ ## name` the last; an empty `__VA_ARGS__` is a placemarker.
+/// The GNU `, ## __VA_ARGS__` still elides the comma.
+#[test]
+fn test_token_paste_va_args() {
+    let input = "#define SEL(...) [ name ## __VA_ARGS__ ]\n\
+                 #define SUF(...) [ __VA_ARGS__ ## suffix ]\n\
+                 #define E(f, ...) g(f, ## __VA_ARGS__)\n\
+                 SEL() SEL(_a, b) SUF() SUF(a, my_) E(x) E(x, 1)\n";
+    crate::diag::capture_diagnostics();
+    let (tokens, idents) = preprocess_str(input);
+    let diags = crate::diag::take_captured_diagnostics();
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_eq!(
+        get_token_strings(&tokens, &idents).join(" "),
+        "[ name ] [ name_a , b ] [ suffix ] [ a , my_suffix ] g ( x ) g ( x , 1 )"
+    );
 }
 
 #[test]
@@ -1968,7 +2029,7 @@ fn test_assembly_collects_dependencies_when_asked() {
     let tree = SearchTree::new(&[("q/regs.h", "#define RET ret\n")]);
     let include_paths = [tree.path("q")];
     let run = |collect_dependencies| {
-        let config = AsmPreprocessConfig {
+        let config = PreprocessConfig {
             include_paths: &include_paths,
             collect_dependencies,
             ..Default::default()
@@ -2011,11 +2072,23 @@ fn test_search_pos_order_is_the_search_order() {
         SearchPos::after(Some(SearchPos::System(4))),
         SearchPos::System(5)
     );
+    // The host gcc's include directory comes after every system directory,
+    // and `#include_next` from a header found there finds nothing more.
+    assert!(SearchPos::System(usize::MAX) < SearchPos::HostCompiler);
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::HostCompiler)),
+        SearchPos::End
+    );
+    assert!(SearchPos::HostCompiler < SearchPos::End);
+    assert!(SearchPos::HostCompiler.is_system());
+    assert!(!SearchPos::Quote(0).is_system());
 }
 
 /// `-dD`: each `#define` and `#undef` that takes effect travels in the
 /// output as its own text, where it stood, and the definitions in force
-/// before the source come back separately.
+/// before the source come back separately: the compiler's own, and the
+/// command line's `-D` and `-U` in the order applied, which gcc writes
+/// under `<built-in>` and `<command-line>` respectively.
 #[test]
 fn test_keep_definitions_carries_the_directives() {
     let input = "#define A  1\nA\n#undef A\n#if 0\n#define B 2\n#endif\n#define F(x) ( x+1 )\n";
@@ -2023,7 +2096,8 @@ fn test_keep_definitions_carries_the_directives() {
     let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
     let config = PreprocessConfig {
         keep_definitions: true,
-        defines: &["CMD=7".to_string()],
+        defines: &["CMD=7".to_string(), "GONE".to_string()],
+        undefines: &["GONE".to_string(), "NEVER".to_string()],
         ..Default::default()
     };
     let (out, outcome) =
@@ -2031,13 +2105,22 @@ fn test_keep_definitions_carries_the_directives() {
     let carried: Vec<String> = out.iter().filter_map(pragma_text).collect();
     assert_eq!(carried, ["#define A 1", "#undef A", "#define F(x) ( x+1 )"]);
     assert!(get_token_strings(&out, &idents).contains(&"1".to_string()));
-    for want in ["#define __STDC__ 1", "#define CMD 7"] {
-        assert!(
-            outcome.initial_definitions.iter().any(|d| d == want),
-            "{want}: {:?}",
-            outcome.initial_definitions
-        );
-    }
+    assert!(
+        outcome
+            .initial_definitions
+            .iter()
+            .any(|d| d == "#define __STDC__ 1"),
+        "{:?}",
+        outcome.initial_definitions
+    );
+    assert!(!outcome
+        .initial_definitions
+        .iter()
+        .any(|d| d.contains("CMD")));
+    assert_eq!(
+        outcome.cmdline_definitions,
+        ["#define CMD 7", "#undef GONE", "#undef NEVER"]
+    );
 
     // Without the option, nothing is carried and nothing collected.
     let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
@@ -2050,6 +2133,77 @@ fn test_keep_definitions_carries_the_directives() {
     );
     assert!(out.iter().all(|t| pragma_text(t).is_none()));
     assert!(outcome.initial_definitions.is_empty());
+    assert!(outcome.cmdline_definitions.is_empty());
+}
+
+/// For `-E`, each inclusion is bracketed by its entry and return, with the
+/// directive's line and the line after it, even for a header that yields
+/// no token; the `-include` files come first, entered from and returning to
+/// `<command-line>`'s line 0; and the source starts again at line 1 after
+/// them. A compile gets none of these.
+#[test]
+fn test_file_changes_mark_every_inclusion() {
+    let tree = SearchTree::new(&[
+        ("q/empty.h", "#define E 1\n"),
+        ("q/text.h", "int t;\n"),
+        ("q/pre.h", "int p;\n"),
+    ]);
+    let include_paths = [tree.path("q")];
+    let pre = [tree.path("q/pre.h")];
+    let input = "int a;\n#include \"empty.h\"\n#include \\\n\"text.h\"\nint b;\n";
+    let run = |preprocess_only| {
+        let mut idents = IdentTable::new();
+        let main = diag::init_stream("<test>");
+        let tokens = Tokenizer::new(input.as_bytes(), main, &mut idents).tokenize();
+        let config = PreprocessConfig {
+            include_paths: &include_paths,
+            pre_includes: &pre,
+            preprocess_only,
+            ..Default::default()
+        };
+        let (out, _) =
+            preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+        out.iter()
+            .filter_map(|t| match t.value {
+                TokenValue::FileChange(change) => {
+                    let (name, line, _) = diag::effective_position(t.pos);
+                    Some((change, name, line))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let changes = run(true);
+    let entered = |change: &FileChange| match change {
+        FileChange::Enter { stream } => diag::effective_position(Position::new(*stream, 1, 1)).0,
+        _ => String::new(),
+    };
+    let summary: Vec<String> = changes
+        .iter()
+        .map(|(change, name, line)| {
+            let what = match change {
+                FileChange::Enter { .. } => format!("enter {}", entered(change)),
+                FileChange::Return => "return".to_string(),
+                FileChange::Rename => "rename".to_string(),
+            };
+            format!("{what} @ {name}:{line}")
+        })
+        .collect();
+    let q = tree.path("q");
+    assert_eq!(
+        summary,
+        [
+            format!("enter {} @ <command-line>:0", pre[0]),
+            "return @ <command-line>:0".to_string(),
+            "rename @ <test>:1".to_string(),
+            format!("enter {q}/empty.h @ <test>:2"),
+            "return @ <test>:3".to_string(),
+            format!("enter {q}/text.h @ <test>:3"),
+            // The directive ran on over a spliced line.
+            "return @ <test>:5".to_string(),
+        ]
+    );
+    assert!(run(false).is_empty());
 }
 
 /// `-iquote` directories are searched for the `"..."` form only, after the
@@ -2238,6 +2392,24 @@ fn test_stream_end_survives_unfinished_constructs() {
     }
 }
 
+/// A `_Pragma` operand is macro-expanded, as gcc does: the Linux kernel's
+/// `__diag(s)` is `_Pragma(__diag_str(GCC diagnostic s))`, and glibc's
+/// `DIAG_IGNORE_NEEDS_COMMENT` is built the same way. The parenthesis may
+/// come from a macro too.
+#[test]
+fn test_pragma_operator_operand_is_macro_expanded() {
+    let before = crate::diag::error_count();
+    let (tokens, idents) = preprocess_str(
+        "#define S1(s) #s\n#define S(s) S1(s)\n#define D(s) _Pragma(S(GCC diagnostic s))\n\
+         #define PK \"pack(push, 1)\"\n#define LP (\n\
+         D(push) a _Pragma(PK) b _Pragma LP \"pack(pop)\" ) c\n",
+    );
+    assert_eq!(crate::diag::error_count(), before);
+    assert_eq!(get_token_strings(&tokens, &idents), ["a", "b", "c"]);
+    let pragmas = tokens.iter().filter(|t| t.typ == TokenType::Pragma).count();
+    assert_eq!(pragmas, 3);
+}
+
 /// A malformed `_Pragma` operand is gcc's error and consumes nothing that is
 /// not part of the operator.
 #[test]
@@ -2273,6 +2445,35 @@ fn test_if_conditional_operator() {
         "#if 1 ? 2 : (1/0)\nA\n#endif\n#if (1 ? -1 : 0u) > 0\nB\n#endif\n#if 0 ? -1 : 0u\nC\n#endif\n",
     );
     assert_eq!(get_token_strings(&tokens, &idents), ["A", "B"]);
+}
+
+/// `__CET__` is gcc's value for the `-fcf-protection` level, on x86-64
+/// only, and absent for `none`.
+#[test]
+fn test_cet_macro_follows_the_protection() {
+    use crate::target::CfProtection;
+    let expand = |level: &str, target: &Target| {
+        let config = PreprocessConfig {
+            cf_protection: CfProtection::from_level(level).unwrap(),
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let tokens = Tokenizer::new(b"__CET__", 0, &mut idents).tokenize();
+        let (out, _) = preprocess_collecting(tokens, target, &mut idents, "<test>", &config);
+        get_token_strings(&out, &idents)
+    };
+    let x86 = Target::from_triple("x86_64-unknown-linux-gnu").unwrap();
+    for (level, value) in [
+        ("full", "3"),
+        ("branch", "1"),
+        ("return", "2"),
+        ("check", "8"),
+        ("none", "__CET__"),
+    ] {
+        assert_eq!(expand(level, &x86), [value], "{level}");
+    }
+    let aarch64 = Target::from_triple("aarch64-unknown-linux-gnu").unwrap();
+    assert_eq!(expand("check", &aarch64), ["__CET__"]);
 }
 
 /// `__PIC__`/`__pic__` and `__PIE__`/`__pie__` describe the position
@@ -2422,6 +2623,129 @@ fn test_storage_order_pragma_becomes_a_layout_marker() {
     );
 }
 
+/// `#pragma GCC visibility push(...)` and `pop` reach the parser as markers,
+/// in either spelling, and each spells itself back for `-E`.
+#[test]
+fn test_visibility_pragma_becomes_a_parser_marker() {
+    let (mut tokens, _) = preprocess_str(
+        "#pragma GCC visibility push(hidden)\n\
+         int a;\n\
+         _Pragma(\"GCC visibility push (protected)\")\n\
+         #pragma GCC visibility push(default)\n\
+         #pragma GCC visibility push(internal)\n\
+         #pragma GCC visibility pop\n\
+         int b;\n",
+    );
+    let pragmas = extract_pragma_directives(&mut tokens);
+    let got: Vec<LayoutPragma> = pragmas.iter().map(|(_, p)| *p).collect();
+    use SymbolVisibility::*;
+    assert_eq!(
+        got,
+        [
+            LayoutPragma::Visibility(VisibilityPragma::Push(Hidden)),
+            LayoutPragma::Visibility(VisibilityPragma::Push(Protected)),
+            LayoutPragma::Visibility(VisibilityPragma::Push(Default)),
+            LayoutPragma::Visibility(VisibilityPragma::Push(Internal)),
+            LayoutPragma::Visibility(VisibilityPragma::Pop),
+        ]
+    );
+    // The first stands before `int a`, the others after it.
+    assert!(pragmas[0].0 < pragmas[1].0);
+    assert_eq!(
+        got[1].to_pragma_text(),
+        "#pragma GCC visibility push(protected)"
+    );
+    assert_eq!(got[4].to_pragma_text(), "#pragma GCC visibility pop");
+}
+
+/// gcc's warnings for `#pragma GCC visibility`, and what each form still
+/// does: gcc pushes before it checks for the `)` and acts before it checks
+/// for junk at the end, so those two still push or pop; a `pop` with no
+/// `push` before it pops nothing.
+#[test]
+fn test_visibility_pragma_diagnostics() {
+    use SymbolVisibility::Hidden;
+    const POP: LayoutPragma = LayoutPragma::Visibility(VisibilityPragma::Pop);
+    const PUSH: LayoutPragma = LayoutPragma::Visibility(VisibilityPragma::Push(Hidden));
+    let cases: [(&str, &str, &[LayoutPragma]); 11] = [
+        (
+            "#pragma GCC visibility pop\n",
+            "no matching push for '#pragma GCC visibility pop'",
+            &[POP],
+        ),
+        (
+            "_Pragma(\"GCC visibility pop\")\n",
+            "no matching push for '#pragma GCC visibility pop'",
+            &[POP],
+        ),
+        (
+            "#pragma GCC visibility push(bogus)\n",
+            "'#pragma GCC visibility push()' must specify 'default', 'internal', 'hidden' or 'protected'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push()\n",
+            "malformed '#pragma GCC visibility push'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push(1)\n",
+            "malformed '#pragma GCC visibility push'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push hidden\n",
+            "missing '(' after '#pragma GCC visibility push' - ignored",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push(hidden\n",
+            "missing '(' after '#pragma GCC visibility push' - ignored",
+            &[PUSH],
+        ),
+        (
+            "#pragma GCC visibility\n",
+            "'#pragma GCC visibility' must be followed by 'push' or 'pop'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility frob\n",
+            "'#pragma GCC visibility' must be followed by 'push' or 'pop'",
+            &[],
+        ),
+        (
+            "#pragma GCC visibility push(hidden)\n#pragma GCC visibility pop extra\n",
+            "junk at end of '#pragma GCC visibility'",
+            &[PUSH, POP],
+        ),
+        (
+            "#pragma GCC visibility push(hidden)) extra\n",
+            "junk at end of '#pragma GCC visibility'",
+            &[PUSH],
+        ),
+    ];
+    for (src, want, acts) in cases {
+        let diags = preprocess_diagnostics(src);
+        assert!(
+            mentions(&diags, &format!("warning: {want}")),
+            "{src:?}: no warning {want:?} in {diags:?}"
+        );
+        let (mut tokens, _) = preprocess_str(src);
+        let acted: Vec<LayoutPragma> = extract_pragma_directives(&mut tokens)
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(acted, acts, "{src:?}");
+    }
+    let balanced = preprocess_diagnostics(
+        "#pragma GCC visibility push(hidden)\n\
+         #pragma GCC visibility push ( default )\n\
+         #pragma GCC visibility pop\n\
+         #pragma GCC visibility pop\n",
+    );
+    assert!(balanced.is_empty(), "{balanced:?}");
+}
+
 /// Preprocess `src` and return every diagnostic it produced.
 fn preprocess_diagnostics(src: &str) -> Vec<String> {
     crate::diag::capture_diagnostics();
@@ -2486,11 +2810,115 @@ fn test_assembly_leaves_unknown_directives_alone() {
         b"# save the frame pointer\n#! odd\n#foo bar\n\tnop\n",
         &Target::host(),
         "t.S",
-        &AsmPreprocessConfig::default(),
+        &PreprocessConfig::default(),
     );
     let lines = crate::diag::take_captured_diagnostics();
     assert!(out.is_ok(), "{lines:?}");
     assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// gcc's alternate keyword spellings are keywords, not macros: they reach
+/// the parser as written, `#ifdef` does not see them, and a program's own
+/// `#define inline ...` does not reach `__inline`.
+#[test]
+fn test_gnu_keyword_spellings_are_not_macros() {
+    let spellings = "__inline __inline__ __volatile __volatile__ __restrict __restrict__ \
+                     __signed __signed__ __extension__";
+    let input = format!(
+        "{spellings}\n#if defined __inline || defined __inline__ || defined __signed__ \
+         || defined __volatile__ || defined __restrict || defined __extension__\nX\n#endif\n\
+         #define inline inline Y\n__inline\n"
+    );
+    let (tokens, idents) = preprocess_str(&input);
+    let mut want: Vec<&str> = spellings.split_whitespace().collect();
+    want.push("__inline");
+    assert_eq!(get_token_strings(&tokens, &idents), want);
+}
+
+/// `-fgnu89-inline` predefines `__GNUC_GNU_INLINE__` and not
+/// `__GNUC_STDC_INLINE__`; the default is the other way round.
+#[test]
+fn test_inline_predefine_follows_gnu89_inline() {
+    let input =
+        "#ifdef __GNUC_GNU_INLINE__\ngnu\n#endif\n#ifdef __GNUC_STDC_INLINE__\nstdc\n#endif\n";
+    let run = |gnu89| {
+        crate::builtins::set_gnu89_inline(gnu89);
+        let (tokens, idents) = preprocess_str(input);
+        crate::builtins::set_gnu89_inline(false);
+        get_token_strings(&tokens, &idents)
+    };
+    assert_eq!(run(false), ["stdc"]);
+    assert_eq!(run(true), ["gnu"]);
+}
+
+/// In assembly a `#` line that names no directive -- a number among them --
+/// is passed through, macro-replaced, as gcc's `-lang-asm` does: never a
+/// linemarker, so it neither renumbers the lines after it nor joins the next
+/// line onto the one before.
+#[test]
+fn test_assembly_hash_lines_pass_through() {
+    let out = preprocess_asm_file(
+        b"#define FOO bar\nret\n# 7/12-bit rotation\nand $~63,%rsp\n\
+          # 100 \"foo.S\"\n.long __LINE__\n# save FOO\n#if 0\n# 5 x\n#endif\nnop\n",
+        &Target::host(),
+        "t.S",
+        &PreprocessConfig::default(),
+    )
+    .expect("preprocesses");
+    let text = String::from_utf8_lossy(&out.text);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("# 1 "))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "ret",
+            "# 7/12-bit rotation",
+            "and $~63,%rsp",
+            "# 100 \"foo.S\"",
+            ".long 6",
+            "# save bar",
+            "nop"
+        ],
+        "{text}"
+    );
+}
+
+/// In assembly a `##` that forms no single token leaves its two operands
+/// side by side, unspaced, with no diagnostic, as gcc's `-lang-asm` does:
+/// the kernel's `.L__sym_size_##name` with `name` a `.macro` parameter
+/// `\name`, `initcall##level##.init` in vmlinux.lds.h, and `,##reg`.
+#[test]
+fn test_assembly_invalid_paste_keeps_both_tokens() {
+    crate::diag::capture_diagnostics();
+    let out = preprocess_asm_file(
+        b"#define SIZE(name) .set .L__sym_size_##name, 4\n\
+          #define SEC(level) .section .initcall##level##.init,\"a\"\n\
+          #define ARG(a, b) mov a,##b\n\
+          SIZE(\\name)\nSEC(1)\nARG(%eax, %ebx)\n",
+        &Target::host(),
+        "t.S",
+        &PreprocessConfig::default(),
+    );
+    let lines = crate::diag::take_captured_diagnostics();
+    assert!(lines.is_empty(), "{lines:?}");
+    let text = String::from_utf8_lossy(&out.expect("preprocesses").text).into_owned();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ".set .L__sym_size_\\name, 4",
+            ".section .initcall1.init,\"a\"",
+            "mov %eax, %ebx"
+        ],
+        "{text}"
+    );
 }
 
 /// C17 6.10.1p4 evaluates `#if` in `intmax_t`, where signed overflow is
@@ -2679,4 +3107,198 @@ fn test_cmdline_undefine_name_must_be_an_identifier() {
     let (out, errors, warnings) = preprocess_with_undefines("X\n", &["X"]);
     assert_eq!((errors, warnings), (0, 0));
     assert_eq!(out, ["X"]);
+}
+
+// ============================================================================
+// The search chain: gcc's duplicate removal
+// ============================================================================
+
+/// A scratch directory holding `a`, `b` and `c`, and `link` naming `a`.
+fn search_dirs() -> (plib::tmp::TempDir, impl Fn(&str) -> String) {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_search_chain_unit_")
+        .tempdir()
+        .unwrap();
+    for d in ["a", "b", "c"] {
+        std::fs::create_dir(dir.path().join(d)).unwrap();
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("link")).unwrap();
+    let root = dir.path().to_path_buf();
+    let path = move |d: &str| root.join(d).to_string_lossy().into_owned();
+    (dir, path)
+}
+
+#[test]
+fn test_search_chain_drops_a_repeated_dash_i() {
+    let (_dir, p) = search_dirs();
+    let chain = search_chain(&[], &[p("a"), p("b"), p("a"), p("a/"), p("b/../a")], &[]);
+    assert_eq!(chain.bracket, [p("a"), p("b")]);
+    #[cfg(unix)]
+    {
+        let chain = search_chain(&[], &[p("link"), p("a")], &[]);
+        assert_eq!(
+            chain.bracket,
+            [p("link")],
+            "the same directory by a symlink"
+        );
+    }
+}
+
+#[test]
+fn test_search_chain_system_directory_wins_over_dash_i() {
+    let (_dir, p) = search_dirs();
+    let chain = search_chain(&[p("b")], &[p("a"), p("c")], &[p("b"), p("a"), p("b")]);
+    assert_eq!(chain.iquote, Vec::<String>::new());
+    assert_eq!(chain.bracket, [p("c")]);
+    assert_eq!(chain.system, [p("b"), p("a")]);
+}
+
+#[test]
+fn test_search_chain_last_iquote_joining_dash_i_is_dropped() {
+    let (_dir, p) = search_dirs();
+    let chain = search_chain(&[p("a"), p("c"), p("a")], &[p("c"), p("b")], &[]);
+    // `a` again is a repeat. `c` was not last when gcc weighed it, the
+    // repeat still following it, so it stays.
+    assert_eq!(chain.iquote, [p("a"), p("c")]);
+    let chain = search_chain(&[p("a"), p("c")], &[p("c"), p("b")], &[]);
+    assert_eq!(chain.iquote, [p("a")]);
+    assert_eq!(chain.bracket, [p("c"), p("b")]);
+}
+
+#[test]
+fn test_search_chain_keeps_missing_directories_by_name() {
+    let (_dir, p) = search_dirs();
+    let chain = search_chain(&[], &[p("none"), p("a"), p("none")], &[]);
+    assert_eq!(chain.bracket, [p("none"), p("a")]);
+}
+
+/// `__GCC_HAVE_DWARF2_CFI_ASM` says whether the unit's call frame
+/// information is written as `.cfi_*` directives -- for C and for a `.S` --
+/// which is so whenever there is any: unwind tables, or `-g`'s
+/// `.debug_frame`. glibc's and the kernel's assembly write their own `.cfi_*`
+/// only then.
+#[test]
+fn test_cfi_asm_macro_follows_the_cfi() {
+    use crate::target::Cfi;
+    for (cfi, defined) in [
+        (Cfi::EhFrame, true),
+        (Cfi::DebugFrame, true),
+        (Cfi::Omitted, false),
+    ] {
+        let config = PreprocessConfig {
+            cfi,
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let input = "#ifdef __GCC_HAVE_DWARF2_CFI_ASM\nyes __GCC_HAVE_DWARF2_CFI_ASM\n#endif\n";
+        let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+        let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "t.c", &config);
+        let numbers: Vec<_> = out.iter().filter(|t| t.typ == TokenType::Number).collect();
+        assert_eq!(numbers.len(), usize::from(defined), "{cfi:?}");
+
+        let config = PreprocessConfig {
+            cfi,
+            ..Default::default()
+        };
+        let text = preprocess_asm_file(input.as_bytes(), &Target::host(), "t.S", &config)
+            .expect("preprocesses")
+            .text;
+        assert_eq!(
+            String::from_utf8_lossy(&text).contains("yes 1"),
+            defined,
+            "{cfi:?}"
+        );
+    }
+}
+
+/// `-undef` keeps the standard's macros and the dynamic ones, and drops the
+/// target's, the system's, gcc's and the options' -- `-D` and the `-imacros`
+/// files apply after it, and an `-imacros` file's text is not kept.
+#[test]
+fn test_undef_and_imacros() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_pp_undef_")
+        .tempdir()
+        .unwrap();
+    let macros = dir.path().join("m.h");
+    std::fs::write(&macros, "#define FROM_IMACROS 7\ntext_of_imacros\n").unwrap();
+    let macros = [macros.to_str().unwrap().to_string()];
+    let defines = ["USER=3".to_string()];
+    let input = "__STDC__ __STDC_VERSION__ __STDC_HOSTED__ __LINE__ __GNUC__ __x86_64__ \
+                 __aarch64__ __OPTIMIZE__ __PIC__ linux unix USER FROM_IMACROS\n";
+    let words = |undef: bool| -> Vec<String> {
+        let config = PreprocessConfig {
+            undef,
+            imacros: &macros,
+            defines: &defines,
+            optimization: crate::opt::Optimization::from_flag("2").unwrap(),
+            position: crate::target::PositionIndependence::from_flag("-fPIC").unwrap(),
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+        let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "t.c", &config);
+        out.iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .map(|t| show_token(t, &idents))
+            .collect()
+    };
+    assert_eq!(
+        words(true),
+        [
+            "1",
+            "201710L",
+            "1",
+            "1",
+            "__GNUC__",
+            "__x86_64__",
+            "__aarch64__",
+            "__OPTIMIZE__",
+            "__PIC__",
+            "linux",
+            "unix",
+            "3",
+            "7"
+        ]
+    );
+    let all = words(false);
+    assert_ne!(all[4], "__GNUC__");
+    assert_eq!(all[7], "1", "__OPTIMIZE__");
+    assert_eq!(&all[11..], ["3", "7"]);
+}
+
+/// The output's comments and strings, in order, preprocessing `input` with
+/// `comments` kept.
+fn kept_comments(input: &str, comments: Comments) -> Vec<String> {
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents)
+        .keeping_comments(comments.lexed())
+        .tokenize();
+    let config = PreprocessConfig {
+        comments,
+        preprocess_only: true,
+        ..Default::default()
+    };
+    let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+    out.iter()
+        .filter_map(|t| match (t.typ, &t.value) {
+            (TokenType::Comment | TokenType::String, TokenValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Under `-C` a comment among a macro's arguments is a token of the
+/// argument: substituted once per use, spelled by `#`, and a `//` one
+/// rewritten `/* */` with gcc's `|` for each `/` beside a `*`.
+#[test]
+fn test_comments_in_macro_arguments_are_kept() {
+    let src = "#define D(x) x x\n#define S(x) #x\n#define I(x) x\n\
+               D(1 /* c */)\nS(a /* s */ b)\nI(1 // a/*b*/c\n)\n";
+    assert_eq!(
+        kept_comments(src, Comments::InText),
+        ["/* c */", "/* c */", "a /* s */ b", "/* a|*b*|c*/"]
+    );
+    assert_eq!(kept_comments(src, Comments::Dropped), ["a b"]);
 }

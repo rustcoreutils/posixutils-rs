@@ -11,8 +11,7 @@
 //
 
 use super::ast::{
-    BinaryOp, CalleeBinding, Expr, ExprKind, FpCompare, GnuAtomicOp, JmpKind, LibFn, OffsetOfPath,
-    UnaryOp,
+    BinaryOp, CalleeBinding, Expr, ExprKind, FpCompare, GnuAtomicOp, LibFn, OffsetOfPath, UnaryOp,
 };
 use super::builtin_args::ConstantArgument;
 use super::library_builtin::LibraryBuiltin;
@@ -26,28 +25,59 @@ use crate::token::lexer::Position;
 use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
-/// A statically known object, and where inside it a pointer points.
+/// What is statically known about the object a pointer points into, and
+/// where inside it the pointer points.
 ///
 /// `whole` / `offset` describe the complete object; `sub` / `sub_offset`
 /// describe the innermost aggregate containing the designated byte. For a
 /// plain array the two coincide.
+///
+/// Through a pointer -- `p->name`, `(*p).name`, `p[1].name` -- the complete
+/// object is unknown (`whole` is `None`) while the member named is not: its
+/// declared size is the subobject, which is what `__builtin_object_size`
+/// types 1 and 3 answer with, as gcc does once optimizing. A trailing array
+/// of such an object is not: it may be a flexible array in all but name
+/// (`open_end`), so its subobject is unknown too.
 #[derive(Clone, Copy)]
 pub(crate) struct ObjectExtent {
-    whole: u64,
+    whole: Option<u64>,
     offset: u64,
-    sub: u64,
+    sub: Option<u64>,
     sub_offset: u64,
+    /// The current subobject reaches the end of an object whose size is not
+    /// known, so storage may continue past its declared end.
+    open_end: bool,
 }
 
 impl ObjectExtent {
     /// A pointer to the start of an object of `size` bytes.
     fn whole_of(size: u64) -> Option<Self> {
         Some(ObjectExtent {
-            whole: size,
+            whole: Some(size),
             offset: 0,
-            sub: size,
+            sub: Some(size),
             sub_offset: 0,
+            open_end: false,
         })
+    }
+
+    /// What a pointer of unknown provenance points at: an object of unknown
+    /// size, nothing yet known about its subobjects.
+    fn pointee() -> Self {
+        ObjectExtent {
+            whole: None,
+            offset: 0,
+            sub: None,
+            sub_offset: 0,
+            open_end: true,
+        }
+    }
+
+    /// Whether the complete object is one the expression names, so that the
+    /// answer needs no optimization to find: gcc answers through a pointer
+    /// only once optimizing.
+    pub(super) fn names_the_object(&self) -> bool {
+        self.whole.is_some()
     }
 
     /// Move the pointer by `bytes`, staying inside both objects.
@@ -55,37 +85,47 @@ impl ObjectExtent {
         let offset = i128::from(self.offset).checked_add(bytes)?;
         let sub_offset = i128::from(self.sub_offset).checked_add(bytes)?;
         // Out of bounds either way: gcc gives up rather than reporting a size
-        // that would licence an overrun.
-        if offset < 0 || offset > i128::from(self.whole) {
-            return None;
+        // that would licence an overrun. An unknown object has no bound to
+        // leave, and an unknown subobject none to check.
+        if let Some(whole) = self.whole {
+            if offset < 0 || offset > i128::from(whole) {
+                return None;
+            }
         }
-        if sub_offset < 0 || sub_offset > i128::from(self.sub) {
-            return None;
+        if let Some(sub) = self.sub {
+            if sub_offset < 0 || sub_offset > i128::from(sub) {
+                return None;
+            }
         }
         Some(ObjectExtent {
-            offset: offset as u64,
-            sub_offset: sub_offset as u64,
+            offset: u64::try_from(offset).unwrap_or(0),
+            sub_offset: u64::try_from(sub_offset).unwrap_or(0),
             ..self
         })
     }
 
     /// Step into a member at `offset` bytes with size `size`, which becomes
-    /// the new innermost subobject.
-    fn narrow(self, offset: u64, size: u64) -> Option<Self> {
+    /// the new innermost subobject. `at_end` says the member ends its
+    /// container, and `array` that it is an array: one at the end of an
+    /// object of unknown size is not bounded by its declared size.
+    fn narrow(self, offset: u64, size: u64, at_end: bool, array: bool) -> Option<Self> {
+        let open_end = self.open_end && at_end;
         Some(ObjectExtent {
             whole: self.whole,
             offset: self.offset.checked_add(offset)?,
-            sub: size,
+            sub: (!(open_end && array)).then_some(size),
             sub_offset: 0,
+            open_end,
         })
     }
 
-    /// Bytes from the pointer to the end of the selected object.
-    pub(super) fn remaining(self, closest_subobject: bool) -> u64 {
+    /// Bytes from the pointer to the end of the selected object, when that
+    /// object's size is known.
+    pub(super) fn remaining(self, closest_subobject: bool) -> Option<u64> {
         if closest_subobject {
-            self.sub.saturating_sub(self.sub_offset)
+            Some(self.sub?.saturating_sub(self.sub_offset))
         } else {
-            self.whole.saturating_sub(self.offset)
+            Some(self.whole?.saturating_sub(self.offset))
         }
     }
 }
@@ -210,13 +250,11 @@ impl Parser<'_> {
     /// Whether a declaration in scope displaces the builtin meaning the parser
     /// would otherwise give `name_id`.
     ///
-    /// `offsetof`, `alignof`, `setjmp` and `longjmp` are not C17 keywords --
-    /// the first is a macro, the second a C23 spelling, the last two ordinary
-    /// library functions -- so a program may use any of them as an identifier,
-    /// and gcc accepts that. `setjmp` and `longjmp` are the exception, and
-    /// only against a *function* declaration: `<setjmp.h>` declares exactly
-    /// those, and they need code generation an ordinary call cannot produce.
-    /// The library builtins (`abs`, `fabs`, `floor`, ...) survive a function
+    /// `offsetof` and `alignof` are not C17 keywords -- the first is a macro,
+    /// the second a C23 spelling -- so a program may use either as an
+    /// identifier, and gcc accepts that. `alloca` yields to an object but not
+    /// to a function declaration, which is what <alloca.h> provides. The
+    /// library builtins (`abs`, `fabs`, `floor`, ...) survive a function
     /// declaration only if it is compatible with the prototype their table
     /// gives (see `library_prototype_matches`), and the functions gcc expands
     /// late (`sqrt`, `floor`, `memcpy`, ...) not a definition of the function
@@ -228,16 +266,7 @@ impl Parser<'_> {
     pub(super) fn builtin_is_shadowed(&self, name_id: StringId) -> bool {
         let shadowed_by_any_decl = matches!(name_id, crate::kw::OFFSETOF | crate::kw::ALIGNOF_C23);
         let library = LibraryBuiltin::by_bare_name(name_id);
-        let shadowable = shadowed_by_any_decl
-            || library.is_some()
-            || matches!(
-                name_id,
-                crate::kw::SETJMP
-                    | crate::kw::SETJMP2
-                    | crate::kw::LONGJMP
-                    | crate::kw::LONGJMP2
-                    | crate::kw::ALLOCA
-            );
+        let shadowable = shadowed_by_any_decl || library.is_some() || name_id == crate::kw::ALLOCA;
         if !shadowable {
             return false;
         }
@@ -572,6 +601,13 @@ impl Parser<'_> {
                 "'{0}' is promoted to '{1}' when passed through '...'",
                 &[&named, &promoted],
             );
+            // gcc's second note, that the call will abort, is not given:
+            // c17 reads the promoted value and converts it.
+            diag::note_args(
+                pos,
+                "(so you should pass '{1}' not '{0}' to 'va_arg')",
+                &[&named, &promoted],
+            );
         }
         true
     }
@@ -660,6 +696,7 @@ impl Parser<'_> {
                 ))
             })()),
             crate::kw::BUILTIN_CLEAR_PADDING => Some(self.parse_clear_padding(token_pos)),
+            crate::kw::BUILTIN_HAS_ATTRIBUTE => Some(self.parse_has_attribute(token_pos)),
             crate::kw::BUILTIN_ALLOCA | crate::kw::ALLOCA => Some((|| {
                 // gcc's prototype is `void *(size_t)`, for either spelling.
                 use super::library_builtin::ProtoType::{SizeT, VoidPtr};
@@ -747,6 +784,21 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
+            crate::kw::BUILTIN_TRAP => Some((|| {
+                // __builtin_trap() - the target's trap instruction. Takes no
+                // arguments, returns void, never returns.
+                let call_pos = self.current_pos();
+                self.expect_special(b'(')?;
+                let args = self.parse_argument_list()?;
+                self.expect_special(b')')?;
+                self.check_argument_count(Some(name_id), args.len(), 0, Some(0), call_pos);
+                Ok(Self::typed_expr(
+                    ExprKind::Trap,
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_TGMATH => Some(self.parse_tgmath(token_pos)),
             crate::kw::BUILTIN_UNWIND_INIT => Some((|| {
                 self.expect_special(b'(')?;
                 self.expect_special(b')')?;
@@ -982,50 +1034,6 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            crate::kw::SETJMP | crate::kw::SETJMP2 => Some((|| {
-                // setjmp(env) - saves execution context, returns int
-                // Returns 0 on direct call, non-zero when returning via longjmp
-                self.expect_special(b'(')?;
-                // `setjmp()` with no argument is a call to an unprototyped
-                // function, which old code writes and gcc accepts. Reaching
-                // for the argument unconditionally turned it into "unexpected
-                // token in expression", a parse error where an arity
-                // diagnostic belonged -- and there is nothing to save, so the
-                // builtin cannot handle it either: hand it back as an
-                // ordinary call.
-                if self.is_special(b')') {
-                    self.advance();
-                    return self.unprototyped_call(name_id, token_pos);
-                }
-                let env = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Setjmp {
-                        env: Box::new(env),
-                        kind: JmpKind::Library,
-                    },
-                    self.types.int_id,
-                    token_pos,
-                ))
-            })()),
-            crate::kw::LONGJMP | crate::kw::LONGJMP2 => Some((|| {
-                // longjmp(env, val) - restores execution context (never returns)
-                // Causes corresponding setjmp to return val (or 1 if val == 0)
-                self.expect_special(b'(')?;
-                let env = self.parse_assignment_expr()?;
-                self.expect_special(b',')?;
-                let val = self.parse_assignment_expr()?;
-                self.expect_special(b')')?;
-                Ok(Self::typed_expr(
-                    ExprKind::Longjmp {
-                        env: Box::new(env),
-                        val: Box::new(val),
-                        kind: JmpKind::Library,
-                    },
-                    self.types.void_id,
-                    token_pos,
-                ))
-            })()),
             crate::kw::BUILTIN_SETJMP => Some((|| {
                 // gcc's `int __builtin_setjmp(void *)`: 0 directly, 1 when
                 // `__builtin_longjmp` resumes it.
@@ -1035,10 +1043,7 @@ impl Parser<'_> {
                     return Ok(self.diagnosed_call(self.types.int_id, token_pos));
                 };
                 Ok(Self::typed_expr(
-                    ExprKind::Setjmp {
-                        env: Box::new(env),
-                        kind: JmpKind::Builtin,
-                    },
+                    ExprKind::Setjmp { env: Box::new(env) },
                     self.types.int_id,
                     token_pos,
                 ))
@@ -1064,7 +1069,6 @@ impl Parser<'_> {
                     ExprKind::Longjmp {
                         env: Box::new(env),
                         val: Box::new(val),
-                        kind: JmpKind::Builtin,
                     },
                     self.types.void_id,
                     token_pos,
@@ -1779,43 +1783,6 @@ impl Parser<'_> {
         ))
     }
 
-    /// A call to `name` with no arguments, when a builtin cannot take it.
-    ///
-    /// The name is declared as the unprototyped `int name()` if nothing has
-    /// declared it, which is what an implicit declaration gives and what
-    /// `check_call_arity` then declines to check.
-    fn unprototyped_call(&mut self, name_id: StringId, pos: Position) -> ParseResult<Expr> {
-        let sym = match self.symbols.lookup_id(name_id, Namespace::Ordinary) {
-            Some(sym) => sym,
-            None => {
-                let int_id = self.types.int_id;
-                let func_type = self.types.intern(Type {
-                    kind: TypeKind::Function,
-                    base: Some(int_id),
-                    params: None,
-                    ..Default::default()
-                });
-                let symbol = Symbol::function(name_id, func_type, self.symbols.depth())
-                    .with_linkage(crate::symbol::Linkage::External);
-                self.symbols
-                    .declare(symbol)
-                    .map_err(|_| ParseError::new("cannot declare an implicit function", pos))?
-            }
-        };
-        let sym_typ = self.symbols.get(sym).typ;
-        let ret = self.types.base_type(sym_typ).unwrap_or(self.types.int_id);
-        Ok(Self::typed_expr(
-            ExprKind::Call {
-                func: Box::new(Self::typed_expr(ExprKind::Ident(sym), ret, pos)),
-                args: Vec::new(),
-                binding: CalleeBinding::Declared,
-                known: None,
-            },
-            ret,
-            pos,
-        ))
-    }
-
     /// Whether `ptr` may be the object operand of the `__atomic_*` or
     /// `__sync_*` builtin `name`, which is overloaded on it: gcc requires a
     /// pointer to an integer or a pointer, of a size an atomic operation
@@ -2066,11 +2033,8 @@ impl Parser<'_> {
                 // Fortified builtins: __builtin___snprintf_chk etc.
                 // Strip __builtin_ prefix → __snprintf_chk, which is a
                 // real libc function (declared by macOS/glibc headers).
-                // `__builtin_trap` has no same-named library entry
-                // point; its contract is abnormal termination, which
-                // is `abort`. Everything else keeps its own name.
+                // Everything else keeps its own name.
                 let real_name = match name_str {
-                    "__builtin_trap" => "abort",
                     // gcc's own equality-only spelling of `memcmp`. There is
                     // no library entry point of that name; answering the
                     // ordering as well is a correct implementation of it.
@@ -2189,6 +2153,9 @@ impl Parser<'_> {
         if let Some(result) = self.parse_cpu_builtin(name_id, token_pos) {
             return Some(result);
         }
+        if let Some(result) = self.parse_machine_builtin(name_id, token_pos) {
+            return Some(result);
+        }
         if let Some(result) = self.parse_choose_expr(name_id) {
             return Some(result);
         }
@@ -2270,15 +2237,35 @@ impl Parser<'_> {
 
             ExprKind::Member { expr: base, member } => {
                 let base_typ = self.lvalue_type(base)?;
-                let info = self.types.find_member(base_typ, *member)?;
                 let outer = self.lvalue_extent(base)?;
-                outer.narrow(info.offset as u64, self.byte_size(info.typ)?)
+                self.member_extent(outer, base_typ, *member)
             }
 
-            // `a[i]` with a constant index, where `a` is an array we can see.
+            // `p->m` is `(*p).m`.
+            ExprKind::Arrow { expr: ptr, member } => {
+                let base_typ = self.types.base_type(ptr.typ?)?;
+                self.member_extent(ObjectExtent::pointee(), base_typ, *member)
+            }
+
+            // `*p` is an object of unknown size.
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand,
+            } if operand
+                .typ
+                .is_some_and(|t| self.types.kind(t) == TypeKind::Pointer) =>
+            {
+                Some(ObjectExtent::pointee())
+            }
+
+            // `a[i]` with a constant index, where `a` is an array we can see
+            // or a pointer into an object of unknown size.
             ExprKind::Index { array, index } => {
                 let n = self.eval_const_expr(index)?;
-                let outer = self.object_extent(array)?;
+                let outer = self.object_extent(array).or_else(|| {
+                    let typ = array.typ?;
+                    (self.types.kind(typ) == TypeKind::Pointer).then(ObjectExtent::pointee)
+                })?;
                 let elem = self.pointee_size(array)?;
                 outer.advance(i128::from(elem).checked_mul(n)?)
             }
@@ -2287,11 +2274,57 @@ impl Parser<'_> {
         }
     }
 
-    /// `Member` and `Index` reached without an `&`, i.e. an array-typed
-    /// subobject that decayed to a pointer.
+    /// `outer` narrowed to its member `member`, `outer` being of type
+    /// `container`.
+    fn member_extent(
+        &self,
+        outer: ObjectExtent,
+        container: TypeId,
+        member: StringId,
+    ) -> Option<ObjectExtent> {
+        let info = self.types.find_member(container, member)?;
+        // Nothing starts after it: the last member of a structure, any
+        // member of a union.
+        let at_end = self
+            .types
+            .get(container)
+            .composite
+            .as_ref()?
+            .members
+            .iter()
+            .all(|m| m.offset <= info.offset);
+        let is_array = self.types.kind(info.typ) == TypeKind::Array;
+        let extent = self.types.get(info.typ).extent;
+        let array = is_array && self.may_be_flexible(extent);
+        // A zero-length array that is not taken for a flexible one is a
+        // subobject of no bytes.
+        let size = match self.byte_size(info.typ) {
+            Some(size) => size,
+            None if is_array && extent == crate::types::ArrayExtent::Known(0) => 0,
+            None => return None,
+        };
+        outer.narrow(info.offset as u64, size, at_end, array)
+    }
+
+    /// Whether a trailing array of `extent` may be a flexible array in all
+    /// but name, at the `-fstrict-flex-arrays` level: any at 0, gcc's
+    /// default; one of zero or one element at 1; of zero at 2; and at 3
+    /// only a true flexible array member.
+    fn may_be_flexible(&self, extent: crate::types::ArrayExtent) -> bool {
+        use crate::types::ArrayExtent;
+        match (self.strict_flex_arrays, extent) {
+            (_, ArrayExtent::Unknown) | (0, _) => true,
+            (1, ArrayExtent::Known(n)) => n <= 1,
+            (2, ArrayExtent::Known(n)) => n == 0,
+            _ => false,
+        }
+    }
+
+    /// `Member`, `Arrow` and `Index` reached without an `&`, i.e. an
+    /// array-typed subobject that decayed to a pointer.
     fn object_extent_of_lvalue_forms(&self, expr: &Expr) -> Option<ObjectExtent> {
         match &expr.kind {
-            ExprKind::Member { .. } | ExprKind::Index { .. } => {
+            ExprKind::Member { .. } | ExprKind::Arrow { .. } | ExprKind::Index { .. } => {
                 let typ = self.lvalue_type(expr)?;
                 if self.types.kind(typ) != TypeKind::Array {
                     return None;
@@ -2309,6 +2342,10 @@ impl Parser<'_> {
             ExprKind::Ident(id) => Some(self.symbols.get(*id).typ),
             ExprKind::Member { expr, member } => {
                 let base = self.lvalue_type(expr)?;
+                Some(self.types.find_member(base, *member)?.typ)
+            }
+            ExprKind::Arrow { expr, member } => {
+                let base = self.types.base_type(expr.typ?)?;
                 Some(self.types.find_member(base, *member)?.typ)
             }
             ExprKind::Index { array, .. } => {
@@ -2478,12 +2515,116 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_LDEXPL
                 | crate::kw::BUILTIN_SQRTF128
                 | crate::kw::BUILTIN_FMAF128
+                | crate::kw::BUILTIN_ROUNDEVENL
+                | crate::kw::BUILTIN_ROUNDEVENF64X
+                | crate::kw::BUILTIN_ROUNDEVENF128
+                | crate::kw::BUILTIN_LRINTL
+                | crate::kw::BUILTIN_LRINTF32
+                | crate::kw::BUILTIN_LRINTF64
+                | crate::kw::BUILTIN_LRINTF32X
+                | crate::kw::BUILTIN_LRINTF64X
+                | crate::kw::BUILTIN_LRINTF128
+                | crate::kw::BUILTIN_LLRINTL
+                | crate::kw::BUILTIN_LLRINTF32
+                | crate::kw::BUILTIN_LLRINTF64
+                | crate::kw::BUILTIN_LLRINTF32X
+                | crate::kw::BUILTIN_LLRINTF64X
+                | crate::kw::BUILTIN_LLRINTF128
+                | crate::kw::BUILTIN_LROUNDL
+                | crate::kw::BUILTIN_LROUNDF32
+                | crate::kw::BUILTIN_LROUNDF64
+                | crate::kw::BUILTIN_LROUNDF32X
+                | crate::kw::BUILTIN_LROUNDF64X
+                | crate::kw::BUILTIN_LROUNDF128
+                | crate::kw::BUILTIN_LLROUNDL
+                | crate::kw::BUILTIN_LLROUNDF32
+                | crate::kw::BUILTIN_LLROUNDF64
+                | crate::kw::BUILTIN_LLROUNDF32X
+                | crate::kw::BUILTIN_LLROUNDF64X
+                | crate::kw::BUILTIN_LLROUNDF128
+                | crate::kw::BUILTIN_SCALBN
+                | crate::kw::BUILTIN_SCALBNF
+                | crate::kw::BUILTIN_SCALBNL
+                | crate::kw::BUILTIN_SCALBNF32
+                | crate::kw::BUILTIN_SCALBNF64
+                | crate::kw::BUILTIN_SCALBNF32X
+                | crate::kw::BUILTIN_SCALBNF64X
+                | crate::kw::BUILTIN_SCALBNF128
+                | crate::kw::BUILTIN_SCALBLN
+                | crate::kw::BUILTIN_SCALBLNF
+                | crate::kw::BUILTIN_SCALBLNL
+                | crate::kw::BUILTIN_SCALBLNF32
+                | crate::kw::BUILTIN_SCALBLNF64
+                | crate::kw::BUILTIN_SCALBLNF32X
+                | crate::kw::BUILTIN_SCALBLNF64X
+                | crate::kw::BUILTIN_SCALBLNF128
+                | crate::kw::BUILTIN_ROUNDF64X
+                | crate::kw::BUILTIN_ROUNDF128
+                | crate::kw::BUILTIN_RINTF64X
+                | crate::kw::BUILTIN_RINTF128
+                | crate::kw::BUILTIN_NEARBYINTF64X
+                | crate::kw::BUILTIN_NEARBYINTF128
+                | crate::kw::BUILTIN_TRUNCF64X
+                | crate::kw::BUILTIN_TRUNCF128
+                | crate::kw::BUILTIN_FLOORF64X
+                | crate::kw::BUILTIN_FLOORF128
+                | crate::kw::BUILTIN_CEILF64X
+                | crate::kw::BUILTIN_CEILF128
+                | crate::kw::BUILTIN_LOGBF32
+                | crate::kw::BUILTIN_LOGBF64
+                | crate::kw::BUILTIN_LOGBF32X
+                | crate::kw::BUILTIN_LOGBF64X
+                | crate::kw::BUILTIN_LOGBF128
+                | crate::kw::BUILTIN_CBRTF32
+                | crate::kw::BUILTIN_CBRTF64
+                | crate::kw::BUILTIN_CBRTF32X
+                | crate::kw::BUILTIN_CBRTF64X
+                | crate::kw::BUILTIN_CBRTF128
+                | crate::kw::BUILTIN_FMINF64X
+                | crate::kw::BUILTIN_FMINF128
+                | crate::kw::BUILTIN_FMAXF64X
+                | crate::kw::BUILTIN_FMAXF128
+                | crate::kw::BUILTIN_FMAF64X
+                | crate::kw::BUILTIN_ILOGBF32
+                | crate::kw::BUILTIN_ILOGBF64
+                | crate::kw::BUILTIN_ILOGBF32X
+                | crate::kw::BUILTIN_ILOGBF64X
+                | crate::kw::BUILTIN_ILOGBF128
+                | crate::kw::BUILTIN_LDEXPF32
+                | crate::kw::BUILTIN_LDEXPF64
+                | crate::kw::BUILTIN_LDEXPF32X
+                | crate::kw::BUILTIN_LDEXPF64X
+                | crate::kw::BUILTIN_LDEXPF128
+                | crate::kw::BUILTIN_FREXPF32
+                | crate::kw::BUILTIN_FREXPF64
+                | crate::kw::BUILTIN_FREXPF32X
+                | crate::kw::BUILTIN_FREXPF64X
+                | crate::kw::BUILTIN_FREXPF128
+                | crate::kw::BUILTIN_MODFF32
+                | crate::kw::BUILTIN_MODFF64
+                | crate::kw::BUILTIN_MODFF32X
+                | crate::kw::BUILTIN_MODFF64X
+                | crate::kw::BUILTIN_MODFF128
+                | crate::kw::BUILTIN_NEXTAFTERF32
+                | crate::kw::BUILTIN_NEXTAFTERF64
+                | crate::kw::BUILTIN_NEXTAFTERF32X
+                | crate::kw::BUILTIN_NEXTAFTERF64X
+                | crate::kw::BUILTIN_NEXTAFTERF128
+                | crate::kw::BUILTIN_FDIMF32
+                | crate::kw::BUILTIN_FDIMF64
+                | crate::kw::BUILTIN_FDIMF32X
+                | crate::kw::BUILTIN_FDIMF64X
+                | crate::kw::BUILTIN_FDIMF128
+                | crate::kw::BUILTIN_HYPOTF32
+                | crate::kw::BUILTIN_HYPOTF64
+                | crate::kw::BUILTIN_HYPOTF32X
+                | crate::kw::BUILTIN_HYPOTF64X
+                | crate::kw::BUILTIN_HYPOTF128
                 | crate::kw::BUILTIN_STRCASECMP
                 | crate::kw::BUILTIN_STRNCASECMP
                 | crate::kw::BUILTIN_STRDUP
                 | crate::kw::BUILTIN_STRNDUP
                 | crate::kw::BUILTIN_MEMCMP_EQ
-                | crate::kw::BUILTIN_TRAP
                 | crate::kw::BUILTIN_ABORT
                 | crate::kw::BUILTIN_EXIT
                 | crate::kw::BUILTIN_PRINTF

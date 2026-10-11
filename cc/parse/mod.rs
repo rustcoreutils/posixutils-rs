@@ -22,21 +22,26 @@ mod builtin_expr;
 mod cpu_builtin;
 mod declaration;
 mod declarator;
-mod expr_check;
+pub(crate) mod expr_check;
 mod expression;
 mod generic_builtin;
+mod has_attribute;
 mod library_builtin;
 mod linkage;
 mod lowering_builtin;
+mod machine_builtin;
 mod operand_rule;
 pub mod parser;
 mod statement;
 mod target_attr;
+mod tgmath_builtin;
 mod toplevel;
 mod typename;
 mod vector_builtin;
 mod vector_check;
 
+#[cfg(test)]
+mod test_asm_operand_names;
 #[cfg(test)]
 mod test_constant_p;
 #[cfg(test)]
@@ -50,6 +55,10 @@ mod test_file_scope_asm;
 #[cfg(test)]
 mod test_float_n;
 #[cfg(test)]
+mod test_gnu_attributes;
+#[cfg(test)]
+mod test_gnu_builtins;
+#[cfg(test)]
 mod test_incomplete;
 #[cfg(test)]
 mod test_labeled_declaration;
@@ -57,6 +66,8 @@ mod test_labeled_declaration;
 mod test_local_labels;
 #[cfg(test)]
 mod test_member_list;
+#[cfg(test)]
+mod test_object_size;
 #[cfg(test)]
 mod test_offsetof;
 #[cfg(test)]
@@ -69,6 +80,8 @@ mod test_specifiers;
 mod test_storage_order;
 #[cfg(test)]
 mod test_vectors;
+#[cfg(test)]
+mod test_visibility_pragma;
 
 // Re-export parser used by main.rs
 pub(crate) use cpu_builtin::cpu_feature_location;
@@ -107,5 +120,21 @@ pub(crate) fn cv_qualifier_modifier(
             Some(M::RESTRICT)
         }
         _ => None,
+    }
+}
+
+/// The type qualifier this identifier spells on a target of architecture
+/// `arch`: a [`cv_qualifier_modifier`], or one of x86-64's named address
+/// spaces, which no other target has.
+pub(crate) fn type_qualifier_modifier(
+    id: crate::strings::StringId,
+    arch: crate::target::Arch,
+) -> Option<crate::types::TypeModifiers> {
+    use crate::types::TypeModifiers as M;
+    match id {
+        crate::kw::SEG_FS | crate::kw::SEG_GS if !crate::kw::exists_on(id, arch) => None,
+        crate::kw::SEG_FS => Some(M::SEG_FS),
+        crate::kw::SEG_GS => Some(M::SEG_GS),
+        _ => cv_qualifier_modifier(id),
     }
 }

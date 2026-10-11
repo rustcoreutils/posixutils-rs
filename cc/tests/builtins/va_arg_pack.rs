@@ -172,7 +172,6 @@ int main(void) {{
 fn builtins_va_arg_pack_forwarder_may_use_alloca() {
     let code = r#"
 #include <stdio.h>
-extern int snprintf(char *, unsigned long, const char *, ...);
 
 __attribute__((always_inline)) static inline int wrap(const char *fmt, ...) {
     char *buf = __builtin_alloca(64);

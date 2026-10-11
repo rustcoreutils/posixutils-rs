@@ -136,6 +136,50 @@ fn codegen_debug_abbrev_offset_is_relocatable() {
     }
 }
 
+/// The abbreviation table lists its codes in order, 1, 2, 3, ...
+///
+/// DWARF allows any order, but gprofng's reader numbers the entries by
+/// position and stops at the first code out of place. The file-scope
+/// variable shapes (15, 16) had gone out between 7 and 8, so gprofng lost
+/// every shape after them -- the type DIEs, so the whole unit -- and a
+/// profile of a c17 program had no source (binutils' gp-archive.exp).
+#[test]
+fn codegen_debug_abbrev_codes_are_in_order() {
+    let src = "volatile long v;\nconst int c = 1;\nint *const p = 0;\n\
+               int f(int a) { volatile int b = a; return b + c + v; }\n";
+    for triple in [X86_64_LINUX, AARCH64_LINUX, DARWIN] {
+        let asm = asm_for_with("debug_abbrev_order", triple, src, &["-g", "-O0"]);
+        // The table's numbers, from its label to the next section.
+        let table: Vec<u64> = asm
+            .split_once("debug_abbrev0:")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("{triple}: no abbreviation table:\n{asm}"))
+            .lines()
+            .map(str::trim)
+            .take_while(|l| !l.starts_with(".section"))
+            .filter_map(|l| {
+                let v = l
+                    .strip_prefix(".uleb128 ")
+                    .or_else(|| l.strip_prefix(".byte "))?;
+                v.parse().ok()
+            })
+            .collect();
+        // code, tag, children, then (attribute, form) pairs up to (0, 0).
+        let mut codes = Vec::new();
+        let mut at = 0;
+        while table[at] != 0 {
+            codes.push(table[at]);
+            at += 3;
+            while (table[at], table[at + 1]) != (0, 0) {
+                at += 2;
+            }
+            at += 2;
+        }
+        let expected: Vec<u64> = (1..=codes.len() as u64).collect();
+        assert_eq!(codes, expected, "{triple}: abbreviation codes out of order");
+    }
+}
+
 /// `-g` is what turns all of this on; without it none of it appears.
 #[test]
 fn codegen_debug_directives_need_dash_g() {
@@ -356,5 +400,90 @@ fn codegen_debug_paths_are_escaped() {
         );
         assert!(asm.contains(r#".asciz "/c\"w\\d""#), "{triple}:\n{asm}");
         assert!(!asm.contains("q\"d\\e"), "{triple}: unescaped path:\n{asm}");
+    }
+}
+
+/// `-g` describes each file-scope object with a `DW_TAG_variable`: its
+/// name, the file and line it was declared on, its type and its address
+/// (`DW_OP_addr`), a `static` one too, as gcc does. ld names a warning
+/// symbol's referencing object by that file and line ("beginwarn.c:7:"),
+/// and a debugger finds the object by it. A thread-local one has no fixed
+/// address and gets no location.
+#[test]
+fn codegen_debug_emits_file_scope_variable_dies() {
+    let src = "int counter = 3;\n\
+               static const char tag[] = \"t\";\n\
+               \n\
+               __thread int per_thread;\n\
+               int get(void) { return counter + tag[0] + per_thread; }\n";
+    for triple in [X86_64_LINUX, AARCH64_LINUX, DARWIN] {
+        let asm = asm_for_with("debug_globals", triple, src, &["-g", "-O0"]);
+        let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+        let prefix = if triple == DARWIN { "_" } else { "" };
+        for (name, line) in [("counter", 1), ("tag", 2)] {
+            let at = lines
+                .iter()
+                .position(|l| *l == format!(".asciz \"{name}\""))
+                .unwrap_or_else(|| panic!("{triple}: no DIE named {name}:\n{asm}"));
+            // decl_file, decl_line, type, external, then the 9-byte
+            // `DW_OP_addr` block.
+            let die = &lines[at..at + 9];
+            assert_eq!(die[2], format!(".long {line}"), "{triple} {name}:\n{die:?}");
+            assert_eq!(die[5], ".byte 9", "{triple} {name}:\n{die:?}");
+            assert_eq!(die[6], ".byte 3", "{triple} {name}:\n{die:?}");
+            assert_eq!(
+                die[7],
+                format!(".quad {prefix}{name}"),
+                "{triple}:\n{die:?}"
+            );
+        }
+        assert!(
+            lines.contains(&".asciz \"per_thread\""),
+            "{triple}: no DIE for the thread-local:\n{asm}"
+        );
+        assert!(
+            !lines.contains(&format!(".quad {prefix}per_thread").as_str()),
+            "{triple}: a thread-local has no fixed address:\n{asm}"
+        );
+    }
+}
+
+/// An object's alignment is written before its `.type` and `.size`, as gcc
+/// writes it. Those directives create the symbol, and gas orders a section's
+/// symbols by creation: written first, they put `init_array` ahead of the
+/// `$d` mapping symbol gas makes at the object's first byte on aarch64. ld
+/// names the location of a link warning by the last symbol at the address,
+/// found `$d`, matched no `DW_TAG_variable`, and gave a bare section offset
+/// where gcc's object gives "beginwarn.c:7:" (binutils' ld-elf beginwarn).
+#[test]
+fn codegen_object_alignment_precedes_its_type() {
+    let src = "extern void foo(void);\n\
+               static void (*const init_array[])(void)\n\
+               \x20 __attribute__((used, section(\".init_array\"), aligned(sizeof(void *))))\n\
+               \x20 = { foo };\n\
+               int counter = 1;\n";
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("align_before_type", triple, src, &["-g"]);
+        for name in ["init_array", "counter"] {
+            let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+            let ty = lines
+                .iter()
+                .position(|l| l.starts_with(".type") && l.contains(&format!("{name},")))
+                .unwrap_or_else(|| panic!("{triple}: no .type for {name}:\n{asm}"));
+            let label = lines
+                .iter()
+                .position(|l| *l == format!("{name}:"))
+                .unwrap_or_else(|| panic!("{triple}: no label {name}:\n{asm}"));
+            let align = lines[..ty]
+                .iter()
+                .rposition(|l| l.starts_with(".p2align") || l.starts_with(".align"));
+            let sect = lines[..ty]
+                .iter()
+                .rposition(|l| l.starts_with(".section") || *l == ".data");
+            assert!(
+                align.is_some() && align > sect && ty < label,
+                "{triple}: {name}'s alignment is not between its section and its .type:\n{asm}"
+            );
+        }
     }
 }

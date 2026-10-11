@@ -133,8 +133,8 @@ fn diagnostics_fpermissive_is_not_a_dialect() {
 ///
 /// A C99 inline definition has no out-of-line copy, so refusing the attribute
 /// silently produced `undefined reference` at link time -- a message naming
-/// neither the attribute nor the reason. gcc rejects the same program
-/// ("can never be inlined because it uses variable argument lists").
+/// neither the attribute nor the reason. gcc rejects the same program, in
+/// these words, whether or not an out-of-line copy exists.
 ///
 /// `va_start` is the refusal being exercised: it reads the enclosing
 /// function's register save area, which no splice carries.
@@ -155,7 +155,175 @@ int main(void) { bad(1, 42L); return 0; }
     compile_expect_error(
         "diag_always_inline_refused",
         code,
-        "inlining failed in call to 'always_inline' 'bad'",
+        "function 'bad' can never be inlined because it uses variable argument lists",
+    );
+}
+
+/// The other bodies gcc can never copy are rejected as `always_inline`, in
+/// gcc's words, though each has an out-of-line copy to call: gcc splices
+/// `always_inline` without exception, so a call it cannot splice is an error
+/// rather than a call -- at -O0 as at -O2. An unused one is not.
+#[test]
+fn diagnostics_always_inline_bodies_gcc_never_copies() {
+    let cases = [
+        (
+            "static inline __attribute__((always_inline)) int cg(int n)\n\
+             { void *t[] = { &&a, &&b }; goto *t[n]; a: return 1; b: return 2; }\n\
+             int f(int n) { return cg(n); }\n",
+            "function 'cg' can never be inlined because it contains a computed goto",
+        ),
+        (
+            "static inline __attribute__((always_inline)) int sl(int n)\n\
+             { static void *t[] = { &&a, &&b }; goto *t[n]; a: return 1; b: return 2; }\n\
+             int f(int n) { return sl(n); }\n",
+            "function 'sl' can never be copied because it saves address of local label in a static variable",
+        ),
+        (
+            "extern void *buf[5];\n\
+             static inline __attribute__((always_inline)) int sj(int n)\n\
+             { if (__builtin_setjmp(buf)) return 1; return n; }\n\
+             int f(int n) { return sj(n); }\n",
+            "function 'sj' can never be copied because it receives a non-local goto",
+        ),
+        (
+            "extern long jb[64]; extern int _setjmp(long *);\n\
+             static inline __attribute__((always_inline)) int ls(int n)\n\
+             { if (_setjmp(jb)) return 1; return n; }\n\
+             int f(int n) { return ls(n); }\n",
+            "function 'ls' can never be inlined because it uses setjmp",
+        ),
+        (
+            "extern int rt(void *) __attribute__((returns_twice)); extern long jb[64];\n\
+             static inline __attribute__((always_inline)) int at(int n)\n\
+             { if (rt(jb)) return 1; return n; }\n\
+             int f(int n) { return at(n); }\n",
+            "function 'at' can never be inlined because it uses setjmp",
+        ),
+    ];
+    for (src, expected) in cases {
+        for opt in ["-O0", "-O2"] {
+            let run = compile("diag_always_inline_never_copied", src, &[opt]);
+            assert!(
+                !run.success && run.stderr.contains(expected),
+                "{opt}: expected {expected:?}:\n{}",
+                run.stderr
+            );
+        }
+    }
+    compile_expect_ok(
+        "diag_always_inline_never_copied_unused",
+        "static inline __attribute__((always_inline)) int cg(int n)\n\
+         { void *t[] = { &&a, &&b }; goto *t[n]; a: return 1; b: return 2; }\n\
+         int f(int n) { return n; }\n",
+    );
+}
+
+/// Recursion among `always_inline` functions, which gcc can never finish
+/// splicing, with gcc 13's verdict at each level.
+///
+/// A cycle through two or more of them is rejected at every level, once,
+/// naming the first one defined, wherever it is called from -- even when only
+/// its address is taken -- unless nothing keeps the cycle at all. A function
+/// that calls itself is rejected at -O0 when another function calls it, the
+/// call gcc splices while leaving the recursive one inside the copy; at -O1
+/// and -Og whenever it is kept. (From -O2 gcc's verdict turns on whether its
+/// tail-recursion pass removed the call first, which c17 has no pass to
+/// match: it accepts there.)
+#[test]
+fn diagnostics_always_inline_recursion() {
+    const AI: &str = "static inline __attribute__((always_inline))";
+    let cycle = format!(
+        "{AI} int b(int n);\n\
+         {AI} int a(int n) {{ return n ? b(n - 1) + 1 : 0; }}\n\
+         {AI} int b(int n) {{ return n ? a(n - 1) + 2 : 0; }}\n"
+    );
+    let reversed = format!(
+        "{AI} int a(int n);\n\
+         {AI} int b(int n) {{ return n ? a(n - 1) + 2 : 0; }}\n\
+         {AI} int a(int n) {{ return n ? b(n - 1) + 1 : 0; }}\n"
+    );
+    let three = format!(
+        "{AI} int c(int n);\n{AI} int b(int n);\n\
+         {AI} int a(int n) {{ return n ? b(n - 1) + 1 : 0; }}\n\
+         {AI} int b(int n) {{ return n ? c(n - 1) + 2 : 0; }}\n\
+         {AI} int c(int n) {{ return n ? a(n - 1) + 3 : 0; }}\n"
+    );
+    let selfrec = format!("{AI} int f(int n) {{ return n ? f(n - 1) + 1 : 0; }}\n");
+    let not_inlinable = |f: &str| {
+        format!("inlining failed in call to 'always_inline' '{f}': function not inlinable")
+    };
+    let not_considered =
+        "inlining failed in call to 'always_inline' 'f': function not considered for inlining";
+    let recursive = "inlining failed in call to 'always_inline' 'f': recursive inlining";
+    let cases: Vec<(String, [Option<String>; 3])> = vec![
+        (
+            format!("{cycle}int g(int n) {{ return a(n); }}\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("a"))),
+        ),
+        (
+            format!("{cycle}int g(int n) {{ return b(n); }}\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("a"))),
+        ),
+        (
+            format!("{reversed}int g(int n) {{ return a(n); }}\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("b"))),
+        ),
+        (
+            format!("{three}int g(int n) {{ return a(n); }}\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("a"))),
+        ),
+        (
+            format!("{cycle}int (*p)(int) = a;\n"),
+            [0, 1, 2].map(|_| Some(not_inlinable("a"))),
+        ),
+        (
+            format!("{cycle}int g(int n) {{ return n; }}\n"),
+            [None, None, None],
+        ),
+        (
+            format!("{selfrec}int g(int n) {{ return f(n); }}\n"),
+            [
+                Some(not_considered.to_string()),
+                Some(recursive.to_string()),
+                None,
+            ],
+        ),
+        (
+            format!("{selfrec}int (*p)(int) = f;\n"),
+            [None, Some(recursive.to_string()), None],
+        ),
+        (
+            format!("{selfrec}int g(int n) {{ return n; }}\n"),
+            [None, None, None],
+        ),
+    ];
+    for (src, verdicts) in &cases {
+        for (opt, verdict) in ["-O0", "-O1", "-O2"].iter().zip(verdicts) {
+            let run = compile("diag_always_inline_recursion", src, &[opt]);
+            match verdict {
+                Some(msg) => assert!(
+                    !run.success && run.stderr.contains(msg.as_str()),
+                    "{opt}: expected {msg:?} for\n{src}\ngot:\n{}",
+                    run.stderr
+                ),
+                None => assert!(
+                    run.success && !run.stderr.contains("inlining failed"),
+                    "{opt}: expected no error for\n{src}\ngot:\n{}",
+                    run.stderr
+                ),
+            }
+        }
+    }
+    // `-Og` is gcc's -O1 here.
+    let run = compile(
+        "diag_always_inline_recursion_og",
+        &format!("{selfrec}int (*p)(int) = f;\n"),
+        &["-Og"],
+    );
+    assert!(
+        !run.success && run.stderr.contains(recursive),
+        "{}",
+        run.stderr
     );
 }
 

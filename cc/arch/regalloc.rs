@@ -9,6 +9,8 @@
 // Common register allocator utilities shared between architectures
 //
 
+use crate::arch::asm_constraints::AsmRegClass;
+use crate::ir::bitset::BitSet;
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -404,13 +406,15 @@ pub fn asm_clobbered<R>(insn: &Instruction, parse: impl Fn(&str) -> Option<R>) -
     }
 }
 
-/// The constraint point of a `__builtin_setjmp`, which clobbers every
-/// register in `regs`: control comes back to it from a `__builtin_longjmp`
-/// with only the frame and stack pointers restored, so no value may be in a
-/// register across it. The result alone is exempt -- both paths write it,
-/// after they join -- and not the buffer operand, which a value read again
-/// later would otherwise keep in a register the resumed path has lost.
-pub fn builtin_setjmp_constraint<R: Copy>(
+/// The constraint point of an instruction that returns twice (see
+/// [`Instruction::returns_twice`]), which clobbers every register in `regs`:
+/// control comes back to it with only the frame and stack pointers restored
+/// -- by a `__builtin_longjmp`, or by whatever a `returns_twice` function
+/// does, which gcc assumes keeps nothing -- so no value may be in a register
+/// across it. The result alone is exempt -- both paths write it, after they
+/// join -- and not the buffer operand, which a value read again later would
+/// otherwise keep in a register the resumed path has lost.
+pub fn returns_twice_constraint<R: Copy>(
     insn: &Instruction,
     regs: &[R],
 ) -> (Vec<R>, Vec<PseudoId>) {
@@ -512,8 +516,11 @@ where
         last_pos_map[0].entry(arg_pseudo).or_insert(0);
     }
 
+    // Each block's declared locals, which its walk in Phase C starts from.
+    let mut declared_in: Vec<Vec<PseudoId>> = vec![Vec::new(); num_blocks];
     for local_var in func.locals.values() {
         if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
+            declared_in[block_idx].push(local_var.sym);
             def_blocks
                 .entry(local_var.sym)
                 .or_default()
@@ -598,13 +605,21 @@ where
     // spanning its uses and no liveness. One with a def (a 128-bit constant's
     // `SetVal`, whose stack slot must survive to its last use) is tracked
     // like any value.
+    //
+    // Nor is a frame local, which has its slot before coloring
+    // (`place_locals`) and whose interval is its lifetime
+    // (`local_lifetimes`), whatever liveness would say. Tracked, every local
+    // whose declaring block an optimization had merged away -- or a copied
+    // parameter, declared in no block -- was carried back to the entry from
+    // every use: blocks x locals set entries, for nothing.
     let needs_no_liveness = |p: PseudoId| -> bool {
-        !def_blocks.contains_key(&p)
-            && func.get_pseudo(p).is_some_and(|ps| match &ps.kind {
-                PseudoKind::Val(_) | PseudoKind::FVal(_) => true,
-                PseudoKind::Sym(_) => func.local_of(p).is_none(),
-                _ => false,
-            })
+        func.get_pseudo(p).is_some_and(|ps| match &ps.kind {
+            PseudoKind::Sym(_) if func.local_of(p).is_some() => true,
+            PseudoKind::Val(_) | PseudoKind::FVal(_) | PseudoKind::Sym(_) => {
+                !def_blocks.contains_key(&p)
+            }
+            _ => false,
+        })
     };
 
     let propagate_use = |use_block: usize,
@@ -666,13 +681,7 @@ where
                 defined_so_far.insert(arg);
             }
         }
-        for local_var in func.locals.values() {
-            if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
-                if block_idx == idx {
-                    defined_so_far.insert(local_var.sym);
-                }
-            }
-        }
+        defined_so_far.extend(declared_in[idx].iter().copied());
 
         for insn in &block.insns {
             for &src in &insn.src {
@@ -846,7 +855,8 @@ where
     }
 }
 
-/// Stretch every value live across a `setjmp` to the end of the function.
+/// Stretch every value live across an instruction that returns twice (see
+/// [`Instruction::returns_twice`]) to the end of the function.
 ///
 /// A `longjmp` resumes at the setjmp from whatever call it is made under,
 /// and the CFG has no edge for that: a value live across the setjmp is read
@@ -865,7 +875,7 @@ fn extend_across_returns_twice(func: &Function, intervals: &mut [LiveInterval], 
         .iter()
         .flat_map(|b| &b.insns)
         .enumerate()
-        .filter(|(_, insn)| insn.op == Opcode::Setjmp)
+        .filter(|(_, insn)| insn.returns_twice())
         .map(|(pos, _)| pos)
         .collect();
     if positions.is_empty() {
@@ -1037,19 +1047,10 @@ fn local_lifetimes(
 ) -> HashMap<PseudoId, (usize, usize)> {
     let locals: Vec<PseudoId> = func.locals.values().map(|l| l.sym).collect();
     let last = block_end_pos.last().copied().unwrap_or(0);
-    let returns_twice = func
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insns)
-        .any(|i| matches!(i.op, Opcode::Setjmp | Opcode::Longjmp));
-    if returns_twice {
+    if func.has_nonlocal_control() {
         return locals.into_iter().map(|l| (l, (0, last))).collect();
     }
     let index: HashMap<PseudoId, usize> = locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
-    let words = locals.len().div_ceil(64);
-    let set = |bits: &mut Vec<u64>, i: usize| bits[i / 64] |= 1 << (i % 64);
-    let clear = |bits: &mut Vec<u64>, i: usize| bits[i / 64] &= !(1 << (i % 64));
-    let has = |bits: &[u64], i: usize| bits[i / 64] & (1 << (i % 64)) != 0;
 
     // Each block's events in order: (position, local, starts) -- a mention
     // starts (or continues) a lifetime, a `LifetimeEnd` ends one.
@@ -1071,13 +1072,13 @@ fn local_lifetimes(
     }
 
     // Forward "may be inside its lifetime", to a fixed point.
-    let mut live_in: Vec<Vec<u64>> = vec![vec![0; words]; func.blocks.len()];
-    let mut live_out: Vec<Vec<u64>> = vec![vec![0; words]; func.blocks.len()];
+    let mut live_in = vec![BitSet::new(locals.len()); func.blocks.len()];
+    let mut live_out = vec![BitSet::new(locals.len()); func.blocks.len()];
     let params: HashSet<&str> = func.params.iter().map(|(n, _)| n.as_str()).collect();
     if let Some(&entry) = bb_id_to_idx.get(&func.entry) {
         for (name, local) in &func.locals {
             if params.contains(name.as_str()) {
-                set(&mut live_in[entry], index[&local.sym]);
+                live_in[entry].insert(index[&local.sym]);
             }
         }
     }
@@ -1088,57 +1089,50 @@ fn local_lifetimes(
         let mut out = live_in[b].clone();
         for &(_, i, starts) in &events[b] {
             if starts {
-                set(&mut out, i);
+                out.insert(i);
             } else {
-                clear(&mut out, i);
+                out.remove(i);
             }
         }
         if out == live_out[b] {
             continue;
         }
-        live_out[b] = out;
         for child in &func.blocks[b].children {
             let Some(&c) = bb_id_to_idx.get(child) else {
                 continue;
             };
-            let mut changed = false;
-            for (w, word) in live_in[c].iter_mut().enumerate() {
-                let merged = *word | live_out[b][w];
-                changed |= merged != *word;
-                *word = merged;
-            }
-            if changed && !queued[c] {
+            if live_in[c].union_with(&out) && !queued[c] {
                 queued[c] = true;
                 work.push_back(c);
             }
         }
+        live_out[b] = out;
     }
 
     // The hull: a block's start where the object is live in, its end where
-    // live out, and every event in between.
-    let mut hull: HashMap<PseudoId, (usize, usize)> = HashMap::new();
+    // live out, and every event in between. Only the set bits are visited:
+    // a block's sets hold the few locals live there, not every local.
+    let mut hull: Vec<Option<(usize, usize)>> = vec![None; locals.len()];
     let mut widen = |i: usize, pos: usize| {
-        hull.entry(locals[i])
-            .and_modify(|(s, e)| {
-                *s = (*s).min(pos);
-                *e = (*e).max(pos);
-            })
-            .or_insert((pos, pos));
+        let (s, e) = hull[i].get_or_insert((pos, pos));
+        *s = (*s).min(pos);
+        *e = (*e).max(pos);
     };
     for b in 0..func.blocks.len() {
-        for i in 0..locals.len() {
-            if has(&live_in[b], i) {
-                widen(i, block_start_pos[b]);
-            }
-            if has(&live_out[b], i) {
-                widen(i, block_end_pos[b]);
-            }
+        for i in live_in[b].iter() {
+            widen(i, block_start_pos[b]);
+        }
+        for i in live_out[b].iter() {
+            widen(i, block_end_pos[b]);
         }
         for &(pos, i, _) in &events[b] {
             widen(i, pos);
         }
     }
-    hull
+    hull.into_iter()
+        .enumerate()
+        .filter_map(|(i, span)| Some((locals[i], span?)))
+        .collect()
 }
 
 /// Each pseudo's live interval, by pseudo -- the first, if several.
@@ -1649,6 +1643,15 @@ pub fn find_copy_coalesce_candidates(func: &Function) -> Vec<(PseudoId, PseudoId
 /// value the allocator chose to spill, and then codegen had to find it a
 /// register at the last moment -- on x86-64 by borrowing one that held another
 /// operand or a live value.
+///
+/// An operand pinned to one register (x86-64 `"a"`, a register variable) is
+/// not among them. The asm wants it in that register, not in one of its own:
+/// codegen moves it there from wherever it lives, a stack slot included, and
+/// the pinned register is kept from every other operand. Colored first, a
+/// pinned operand that could not be precolored -- its register still held
+/// another value -- took a free register ahead of the operands that need
+/// one, and the Linux kernel's paravirt calls, which pin five operands and
+/// clobber the rest of the caller-saved registers, ran out.
 pub fn asm_register_operands(func: &Function) -> std::collections::BTreeSet<PseudoId> {
     let mut out = std::collections::BTreeSet::new();
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
@@ -1661,6 +1664,14 @@ pub fn asm_register_operands(func: &Function) -> std::collections::BTreeSet<Pseu
             continue;
         };
         for c in asm.outputs.iter().chain(asm.inputs.iter()) {
+            // A tied input is in its output's register.
+            let class = match c.matching_output {
+                Some(i) if i < asm.outputs.len() => &asm.outputs[i].class,
+                _ => &c.class,
+            };
+            if matches!(class.reg, Some(AsmRegClass::Pinned(_))) {
+                continue;
+            }
             // A memory operand whose address is a run-time value needs that
             // address in a base register just as much, which is how gcc
             // treats it. One that names its object's `Sym` is addressed in
@@ -1963,6 +1974,46 @@ impl AbiLowering {
 mod tests {
     use super::*;
 
+    /// The asm register operands are the ones the template needs in a
+    /// register of their own: `"r"`, and a `"0"` tied to one. An operand
+    /// pinned to its register -- `"=a"`, `"D"`, the `"0"` tied to `"=a"` --
+    /// is moved there wherever it lives, and is left out.
+    #[test]
+    fn asm_register_operands_leave_out_the_pinned_ones() {
+        use crate::ir::{AsmConstraint, AsmData, BasicBlock, Pseudo};
+        use crate::target::Arch;
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.int_id);
+        for id in 0..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 6;
+        let op = |p: u32, c: &str, tied: Option<usize>| AsmConstraint {
+            matching_output: tied,
+            ..AsmConstraint::new(PseudoId(p), c, Arch::X86_64, 64)
+        };
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: vec![op(0, "=a", None), op(1, "=r", None)],
+            inputs: vec![
+                op(0, "0", Some(0)),
+                op(1, "1", Some(1)),
+                op(2, "D", None),
+                op(3, "r", None),
+            ],
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(asm);
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        let got: Vec<u32> = asm_register_operands(&f).iter().map(|p| p.0).collect();
+        assert_eq!(got, [1, 3]);
+    }
+
     /// One block: `a` used and ended, then `b` used and ended, a parameter's
     /// local `p` read at the end, and a `setjmp` when `returns_twice`.
     fn two_scopes(returns_twice: bool) -> Function {
@@ -2041,8 +2092,9 @@ mod tests {
     /// before `.L2`, which is where the `longjmp` comes from. Its interval
     /// reaches the end of the function, or `.L2` could take its slot and the
     /// second return read `%5`. `%5`, defined after the setjmp, and the
-    /// setjmp's own result are not stretched.
-    fn value_across_setjmp(kind: crate::parse::ast::JmpKind) -> Function {
+    /// setjmp's own result are not stretched. `setjmp` is `twice`, a
+    /// `__builtin_setjmp` or a call of a function that returns twice.
+    fn value_across_setjmp(mut twice: Instruction) -> Function {
         use crate::ir::{BasicBlock, Pseudo};
         let types = TypeTable::new(&crate::target::Target::host());
         let mut f = Function::new("f", types.int_id);
@@ -2063,11 +2115,8 @@ mod tests {
             types.int_id,
             32,
         ));
-        let mut setjmp = Instruction::new(Opcode::Setjmp)
-            .with_target(PseudoId(4))
-            .with_type_and_size(types.int_id, 32);
-        setjmp.extra_mut().jmp_kind = kind;
-        entry.add_insn(setjmp);
+        twice.target = Some(PseudoId(4));
+        entry.add_insn(twice.with_type_and_size(types.int_id, 32));
         entry.add_insn(Instruction::cbr(PseudoId(4), b1, b2));
         entry.children = vec![b1, b2];
         let mut resumed = BasicBlock::new(b1);
@@ -2092,9 +2141,13 @@ mod tests {
 
     #[test]
     fn a_value_live_across_setjmp_spans_to_the_end() {
-        use crate::parse::ast::JmpKind;
-        for kind in [JmpKind::Library, JmpKind::Builtin] {
-            let f = value_across_setjmp(kind);
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, 32);
+        call.extra_mut().returns_twice_call = true;
+        for twice in [Instruction::new(Opcode::Setjmp), call] {
+            let kind = twice.op;
+            assert!(twice.returns_twice());
+            let f = value_across_setjmp(twice);
             let last = 6;
             assert_eq!(
                 lifetime_of(&f, 3),

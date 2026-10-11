@@ -1286,6 +1286,32 @@ fn test_tokens_to_source_bytes_multiline() {
     assert!(text.contains("int"));
 }
 
+/// A line keeps its indentation, as in gcc's `-E`: a space for each byte
+/// before its first token, a tab counting as one.
+#[test]
+fn test_tokens_to_source_bytes_keeps_indentation() {
+    assert_eq!(
+        source_text("lib {\n  VER {\n    sym; x;\n  };\n};"),
+        "lib {\n  VER {\n    sym; x;\n  };\n};\n"
+    );
+    assert_eq!(source_text("a\n\tb\n \t c\n\t\td"), "a\n b\n   c\n  d\n");
+}
+
+/// The lexer records the bytes before each token on its physical line --
+/// a tab is one, a comment counts, a splice starts the count again -- and
+/// leaves the column counting a tab to the next multiple of 8.
+#[test]
+fn test_token_line_offset_counts_bytes() {
+    let (tokens, _) = tokenize_str("x\n\t y /**/z\n\\\n  w");
+    let at: Vec<(u16, u8)> = tokens
+        .iter()
+        .filter(|t| t.typ == TokenType::Ident)
+        .map(|t| (t.pos.col, t.pos.line_offset))
+        .collect();
+    assert_eq!(at, [(1, 0), (10, 2), (16, 8), (3, 2)]);
+    assert_eq!(indentation(tokens[2].pos), 2);
+}
+
 #[test]
 fn test_tokens_to_source_bytes_ends_with_newline() {
     assert!(source_text("x").ends_with('\n'));
@@ -1687,4 +1713,45 @@ fn test_spellings_merge_is_the_lexers_answer() {
     ] {
         assert!(!spellings_merge(left, right), "{left:?} {right:?}");
     }
+}
+
+/// Kept for `-C`, a comment is a token with its text as written -- a `//`
+/// one's without the newline ending it -- that takes its place's start of
+/// line and leaves it for the token after it, so a directive behind it is
+/// still one. Otherwise there is none.
+#[test]
+fn test_comments_kept_as_tokens() {
+    let src = "/* a\n b */ #define X 1 // x\nint y; /**/\n";
+    let mut strings = StringTable::new();
+    let tokens = Tokenizer::new(src.as_bytes(), 0, &mut strings)
+        .keeping_comments(true)
+        .tokenize();
+    let comments: Vec<(String, bool)> = tokens
+        .iter()
+        .filter(|t| t.typ == TokenType::Comment)
+        .map(|t| match &t.value {
+            TokenValue::String(s) => (s.clone(), t.pos.newline),
+            _ => panic!("a comment without its text"),
+        })
+        .collect();
+    assert_eq!(
+        comments,
+        [
+            ("/* a\n b */".to_string(), true),
+            ("// x".to_string(), false),
+            ("/**/".to_string(), false),
+        ]
+    );
+    let hash = tokens.iter().find(|t| t.typ == TokenType::Special).unwrap();
+    assert!(hash.pos.newline && hash.pos.whitespace, "{:?}", hash.pos);
+    let int = tokens
+        .iter()
+        .find(|t| show_token(t, &strings) == "int")
+        .unwrap();
+    assert!(int.pos.newline);
+
+    let mut strings = StringTable::new();
+    let plain = Tokenizer::new(src.as_bytes(), 0, &mut strings).tokenize();
+    assert!(plain.iter().all(|t| t.typ != TokenType::Comment));
+    assert_eq!(plain.len() + 3, tokens.len());
 }

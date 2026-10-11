@@ -17,10 +17,10 @@ use super::operand_rule::{
 use super::parser::Parser;
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::SymbolKind;
+use crate::symbol::{SymbolId, SymbolKind, SymbolTable};
 use crate::token::lexer::Position;
-use crate::types::{AssignFault, TypeId, TypeKind, TypeModifiers};
-use gettextrs::gettext;
+use crate::types::{AssignFault, TypeId, TypeKind, TypeModifiers, TypeTable};
+use gettextrs::{gettext, gettext_args};
 
 /// Where a value is converted as if by assignment (C17 6.5.16.1). The
 /// constraints are the same in each; only the wording of a fault differs.
@@ -32,6 +32,59 @@ enum ConversionSite {
     Initialization,
     /// A `return` statement's value (6.8.6.4p3).
     Return,
+}
+
+/// The `register` variable whose address `operand`'s address would be, and
+/// gcc's words for refusing it: unary `&` (C17 6.5.3.2p1) and a memory-class
+/// asm operand (`"m"`, `"o"`) both need the object's address, which a
+/// `register` object has none of -- gcc refuses even when the storage class
+/// is only a hint. The address of a member, or of an element of an array
+/// (not of what a pointer points at), is the address of the object it is in.
+pub(crate) fn register_address_refusal(
+    types: &TypeTable,
+    symbols: &SymbolTable,
+    operand: &Expr,
+) -> Option<(SymbolId, &'static str)> {
+    let is_array = |e: &Expr| e.typ.is_some_and(|t| types.kind(t) == TypeKind::Array);
+    let mut root = operand;
+    loop {
+        root = match &root.kind {
+            ExprKind::Member { expr, .. } => expr,
+            ExprKind::Index { array, .. } if is_array(array) => array,
+            ExprKind::Index { index, .. } if is_array(index) => index,
+            _ => break,
+        };
+    }
+    let symbol_id = register_variable(types, symbols, root)?;
+    let msg = if symbols.get(symbol_id).global_register().is_some() {
+        "address of global register variable '{0}' requested"
+    } else {
+        "address of register variable '{0}' requested"
+    };
+    Some((symbol_id, msg))
+}
+
+/// The `register` variable `expr` names, if it names one.
+fn register_variable(types: &TypeTable, symbols: &SymbolTable, expr: &Expr) -> Option<SymbolId> {
+    let ExprKind::Ident(symbol_id) = &expr.kind else {
+        return None;
+    };
+    let sym = symbols.get(*symbol_id);
+    let register = matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter)
+        && types.modifiers(sym.typ).contains(TypeModifiers::REGISTER);
+    register.then_some(*symbol_id)
+}
+
+/// gcc's `-pedantic` report of two pointers to arrays whose elements differ
+/// only in qualifiers meeting in an operator, a conversion as if by
+/// assignment or a conditional: C2x makes them pointers to differently
+/// qualified versions of one type, and C17 calls them pointers to different
+/// types ([`TypeTable::arrays_differ_in_qualifiers_only`]).
+pub(super) fn pedwarn_qualified_arrays(pos: Position) {
+    diag::pedwarn(
+        pos,
+        &gettext("invalid use of pointers to arrays with different qualifiers in ISO C before C2X"),
+    );
 }
 
 impl Parser<'_> {
@@ -118,6 +171,7 @@ impl Parser<'_> {
         if !fewer && max.is_none_or(|max| given <= max) {
             return true;
         }
+        let declared = callee.and_then(|id| self.linked_names.get(&id).map(|l| l.declared));
         let callee = callee.and_then(|id| self.idents.get_opt(id));
         match (fewer, callee) {
             (true, Some(f)) => {
@@ -128,6 +182,9 @@ impl Parser<'_> {
                 diag::error_args(call_pos, "too many arguments to function '{0}'", &[f])
             }
             (false, None) => diag::error(call_pos, &gettext("too many arguments to function")),
+        }
+        if let Some(declared) = declared {
+            diag::note(declared.pos, &gettext("declared here"));
         }
         false
     }
@@ -200,28 +257,29 @@ impl Parser<'_> {
             if self.argument_matches_union_member(param, a) {
                 continue;
             }
+            // gcc's note points at the parameter in the callee's first
+            // declaration, or at the argument when the call is indirect.
+            let note_pos = callee
+                .and_then(|id| self.param_positions.get(&id))
+                .and_then(|positions| positions.get(i).copied())
+                .unwrap_or(arg.pos);
             let n = (i + 1).to_string();
             let callee = callee.and_then(|id| self.idents.get_opt(id));
-            if fault == AssignFault::FunctionPointerVoid {
-                match callee {
-                    Some(f) => diag::pedwarn_args(
-                        arg.pos,
-                        "ISO C forbids passing argument {0} of '{1}' between function pointer and 'void *'",
-                        &[&n, f],
-                    ),
-                    None => diag::pedwarn_args(
-                        arg.pos,
-                        "ISO C forbids passing argument {0} between function pointer and 'void *'",
-                        &[&n],
-                    ),
-                }
+            let quals = self.types.discarded_qualifiers(param, a);
+            Self::report_argument_fault(fault, arg.pos, &n, callee, &quals);
+            // gcc's report that C17 calls the arrays different types has no
+            // note of its own.
+            if fault == AssignFault::ArrayQualifiers {
                 continue;
             }
-            let (p_name, a_name) = (
-                self.types.format_type(param, Some(self.idents)),
-                self.types.format_type(a, Some(self.idents)),
+            diag::note_args(
+                note_pos,
+                "expected '{0}' but argument is of type '{1}'",
+                &[
+                    &self.types.format_type(param, Some(self.idents)),
+                    &self.types.format_type(a, Some(self.idents)),
+                ],
             );
-            Self::report_argument_fault(fault, arg.pos, &n, callee, &p_name, &a_name);
             if fault.is_error() {
                 sound = false;
             }
@@ -229,38 +287,66 @@ impl Parser<'_> {
         sound
     }
 
-    /// Report argument `n`, of type `a_name`, that `fault` keeps from being
-    /// assigned to its parameter of type `p_name`. The callee is named when
-    /// the call spelled one, as gcc names it.
+    /// Report argument `n` that `fault` keeps from being assigned to its
+    /// parameter, in gcc's words: the callee is named when the call spelled
+    /// one, and `quals` are the qualifiers a [`AssignFault::QualifierDiscard`]
+    /// discards. gcc's note on the types follows.
     fn report_argument_fault(
         fault: AssignFault,
         pos: Position,
         n: &str,
         callee: Option<&str>,
-        p_name: &str,
-        a_name: &str,
+        quals: &str,
     ) {
-        match (fault.is_error(), callee) {
-            (true, Some(f)) => diag::error_args(
-                pos,
-                "incompatible type for argument {0} of '{1}': expected '{2}', got '{3}'",
-                &[n, f, p_name, a_name],
+        if matches!(
+            fault,
+            AssignFault::ArrayQualifiers | AssignFault::ArrayQualifierDiscard
+        ) {
+            pedwarn_qualified_arrays(pos);
+        }
+        let (named, unnamed) = match fault {
+            AssignFault::ArrayQualifiers => return,
+            AssignFault::Incompatible => (
+                "incompatible type for argument {0} of '{1}'",
+                "incompatible type for argument {0}",
             ),
-            (true, None) => diag::error_args(
-                pos,
-                "incompatible type for argument {0}: expected '{1}', got '{2}'",
-                &[n, p_name, a_name],
+            AssignFault::FunctionPointerVoid => (
+                "ISO C forbids passing argument {0} of '{1}' between function pointer and 'void *'",
+                "ISO C forbids passing argument {0} between function pointer and 'void *'",
             ),
-            (false, Some(f)) => diag::pedwarn_default_args(
-                pos,
-                "passing argument {0} of '{1}' as '{2}' from '{3}' {4}",
-                &[n, f, p_name, a_name, fault.describe()],
+            AssignFault::PointerSign => (
+                "pointer targets in passing argument {0} of '{1}' differ in signedness",
+                "pointer targets in passing argument {0} differ in signedness",
             ),
-            (false, None) => diag::pedwarn_default_args(
-                pos,
-                "passing argument {0} as '{1}' from '{2}' {3}",
-                &[n, p_name, a_name, fault.describe()],
+            AssignFault::PointerMismatch => (
+                "passing argument {0} of '{1}' from incompatible pointer type",
+                "passing argument {0} from incompatible pointer type",
             ),
+            AssignFault::IntegerFromPointer => (
+                "passing argument {0} of '{1}' makes integer from pointer without a cast",
+                "passing argument {0} makes integer from pointer without a cast",
+            ),
+            AssignFault::PointerFromInteger => (
+                "passing argument {0} of '{1}' makes pointer from integer without a cast",
+                "passing argument {0} makes pointer from integer without a cast",
+            ),
+            AssignFault::QualifierDiscard | AssignFault::ArrayQualifierDiscard => (
+                "passing argument {0} of '{1}' discards '{2}' qualifier from pointer target type",
+                "passing argument {0} discards '{2}' qualifier from pointer target type",
+            ),
+            AssignFault::AddressSpace => (
+                "passing argument {0} of '{1}' from pointer to non-enclosed address space",
+                "passing argument {0} from pointer to non-enclosed address space",
+            ),
+        };
+        let msg = match callee {
+            Some(f) => gettext_args(named, &[n, f, quals]),
+            None => gettext_args(unnamed, &[n, "", quals]),
+        };
+        match fault.group() {
+            None => diag::error(pos, &msg),
+            Some("pedantic") => diag::pedwarn(pos, &msg),
+            Some(group) => diag::group_pedwarn_default(group, pos, &msg),
         }
     }
 
@@ -529,6 +615,18 @@ impl Parser<'_> {
                 );
                 true
             }
+            OperandVerdict::DisjointAddressSpaces => {
+                diag::error(
+                    pos,
+                    &gettext("comparison of pointers to disjoint address spaces"),
+                );
+                false
+            }
+            OperandVerdict::QualifiedArrays => {
+                pedwarn_qualified_arrays(pos);
+                !matches!(op, BinaryOp::Sub)
+                    || (self.check_pointer_steps(lt, pos) && self.check_pointer_steps(rt, pos))
+            }
         }
     }
 
@@ -674,17 +772,27 @@ impl Parser<'_> {
             return;
         };
         let returns_void = self.types.kind(declared) == TypeKind::Void;
+        // gcc's note on either points at the function.
+        let function = self
+            .enclosing_function
+            .name
+            .and_then(|name| self.linked_names.get(&name))
+            .map(|l| l.declared.pos);
         match value {
-            None if !returns_void => diag::permissive_error(
-                pos,
-                &gettext("'return' with no value in a function returning non-void"),
-            ),
+            None if !returns_void => {
+                diag::permissive_error(
+                    pos,
+                    &gettext("'return' with no value, in function returning non-void"),
+                );
+                diag::note(function.unwrap_or_default(), &gettext("declared here"));
+            }
             Some(e) if returns_void => {
                 if e.typ.is_some_and(|t| self.types.kind(t) != TypeKind::Void) {
                     diag::permissive_error(
                         e.pos,
-                        &gettext("'return' with a value in a function returning void"),
+                        &gettext("'return' with a value, in function returning void"),
                     );
+                    diag::note(function.unwrap_or_default(), &gettext("declared here"));
                 }
             }
             Some(e) => {
@@ -719,7 +827,9 @@ impl Parser<'_> {
         let Some(fault) = self.types.assignment_fault(t, v, null_constant) else {
             return;
         };
-        if fault == AssignFault::FunctionPointerVoid {
+        use AssignFault::*;
+        use ConversionSite::*;
+        if fault == FunctionPointerVoid {
             let msg = match site {
                 ConversionSite::Assignment => {
                     gettext("ISO C forbids assignment between function pointer and 'void *'")
@@ -733,6 +843,12 @@ impl Parser<'_> {
             };
             diag::pedwarn(pos, &msg);
             return;
+        }
+        if matches!(fault, ArrayQualifiers | ArrayQualifierDiscard) {
+            pedwarn_qualified_arrays(pos);
+            if fault == ArrayQualifiers {
+                return;
+            }
         }
         if fault.is_error() {
             // An aggregate initialized from something that is not a
@@ -757,27 +873,85 @@ impl Parser<'_> {
             self.types.format_type(t, Some(self.idents)),
             self.types.format_type(v, Some(self.idents)),
         );
-        let template = match (site, fault.is_error()) {
-            (ConversionSite::Assignment, true) => {
+        let template = match (site, fault) {
+            (Assignment, Incompatible) => {
                 "incompatible types when assigning to type '{0}' from type '{1}'"
             }
-            (ConversionSite::Initialization, true) => {
+            (Initialization, Incompatible) => {
                 "incompatible types when initializing type '{0}' using type '{1}'"
             }
-            (ConversionSite::Return, true) => {
+            (Return, Incompatible) => {
                 "incompatible types when returning type '{1}' but '{0}' was expected"
             }
-            (ConversionSite::Assignment, false) => "assignment to '{0}' from '{1}' {2}",
-            (ConversionSite::Initialization, false) => "initialization of '{0}' from '{1}' {2}",
-            (ConversionSite::Return, false) => {
-                "returning '{1}' from a function with return type '{0}' {2}"
+            (Assignment, PointerSign) => {
+                "pointer targets in assignment from '{1}' to '{0}' differ in signedness"
             }
+            (Initialization, PointerSign) => {
+                "pointer targets in initialization of '{0}' from '{1}' differ in signedness"
+            }
+            (Return, PointerSign) => {
+                "pointer targets in returning '{1}' from a function with return type '{0}' \
+                 differ in signedness"
+            }
+            (Assignment, PointerMismatch) => {
+                "assignment to '{0}' from incompatible pointer type '{1}'"
+            }
+            (Initialization, PointerMismatch) => {
+                "initialization of '{0}' from incompatible pointer type '{1}'"
+            }
+            (Return, PointerMismatch) => {
+                "returning '{1}' from a function with incompatible return type '{0}'"
+            }
+            (Assignment, QualifierDiscard | ArrayQualifierDiscard) => {
+                "assignment discards '{2}' qualifier from pointer target type"
+            }
+            (Initialization, QualifierDiscard | ArrayQualifierDiscard) => {
+                "initialization discards '{2}' qualifier from pointer target type"
+            }
+            (Return, QualifierDiscard | ArrayQualifierDiscard) => {
+                "return discards '{2}' qualifier from pointer target type"
+            }
+            (Assignment, IntegerFromPointer) => {
+                "assignment to '{0}' from '{1}' makes integer from pointer without a cast"
+            }
+            (Initialization, IntegerFromPointer) => {
+                "initialization of '{0}' from '{1}' makes integer from pointer without a cast"
+            }
+            (Return, IntegerFromPointer) => {
+                "returning '{1}' from a function with return type '{0}' makes integer from \
+                 pointer without a cast"
+            }
+            (Assignment, PointerFromInteger) => {
+                "assignment to '{0}' from '{1}' makes pointer from integer without a cast"
+            }
+            (Initialization, PointerFromInteger) => {
+                "initialization of '{0}' from '{1}' makes pointer from integer without a cast"
+            }
+            (Return, PointerFromInteger) => {
+                "returning '{1}' from a function with return type '{0}' makes pointer from \
+                 integer without a cast"
+            }
+            (Assignment, AddressSpace) => "assignment from pointer to non-enclosed address space",
+            (Initialization, AddressSpace) => {
+                "initialization from pointer to non-enclosed address space"
+            }
+            (Return, AddressSpace) => "return from pointer to non-enclosed address space",
+            (_, FunctionPointerVoid | ArrayQualifiers) => unreachable!("reported above"),
         };
-        let args: &[&str] = &[&t_name, &v_name, fault.describe()];
-        if fault.is_error() {
-            diag::error_args(pos, template, args);
-        } else {
-            diag::pedwarn_default_args(pos, template, args);
+        let quals = self.types.discarded_qualifiers(t, v);
+        let args: &[&str] = &[&t_name, &v_name, &quals];
+        match fault.group() {
+            Some(group) => {
+                diag::group_pedwarn_default(group, pos, &gettext_args(template, args));
+            }
+            None => diag::error_args(pos, template, args),
+        }
+        if fault == AddressSpace {
+            diag::note_args(
+                pos,
+                "expected '{0}' but pointer is of type '{1}'",
+                &[&t_name, &v_name],
+            );
         }
     }
 
@@ -1080,30 +1254,61 @@ impl Parser<'_> {
         if self.check_reverse_order_address(operand, pos) {
             return;
         }
-        // The address of a member is the address of the object it is in, so
-        // `&s.a` of a `register` structure asks for the register's.
-        let mut root = operand;
+        if let Some((sym, msg)) = register_address_refusal(self.types, self.symbols, operand) {
+            diag::error_args(pos, msg, &[self.str(self.symbols.get(sym).name)]);
+        }
+    }
+
+    /// An array used where it converts to a pointer to its first element
+    /// (C17 6.3.2.1p3) -- anywhere but the operand of `sizeof`, `_Alignof`,
+    /// `typeof` or `&`, or the array of a subscript that needs no address
+    /// ([`Self::check_register_array_subscript`]). The pointer is an address,
+    /// which a `register` array has none of: 6.3.2.1p3 leaves the conversion
+    /// undefined, and gcc refuses it in the words of unary `&`, even inside
+    /// `sizeof (a + 0)`.
+    pub(super) fn check_register_array_decay(&self, operand: &Expr) {
+        if !self.is_decaying_array(operand) {
+            return;
+        }
+        if let Some((sym, msg)) = register_address_refusal(self.types, self.symbols, operand) {
+            diag::error_args(operand.pos, msg, &[self.str(self.symbols.get(sym).name)]);
+        }
+    }
+
+    /// Whether `e` is an array, which decays, rather than a GNU vector,
+    /// which c17 types as an array too but which is a value.
+    fn is_decaying_array(&self, e: &Expr) -> bool {
+        e.typ
+            .is_some_and(|t| self.types.kind(t) == TypeKind::Array && !self.types.is_vector(t))
+    }
+
+    /// The array operand of `base[index]` (either may be it, 6.5.2.1p2)
+    /// when that is a `register` array. gcc reads an element at an integer
+    /// constant index inside the bounds without an address, objecting only
+    /// under `-pedantic`; any other index decays the array.
+    pub(super) fn check_register_array_subscript(&self, base: &Expr, index: &Expr, pos: Position) {
+        let (array, index) = match (self.is_decaying_array(base), self.is_decaying_array(index)) {
+            (true, false) => (base, index),
+            (false, true) => (index, base),
+            _ => return,
+        };
+        let bound = array.typ.and_then(|t| self.types.array_extent(t).known());
+        let in_bounds = match (self.eval_const_expr(index), bound) {
+            (Some(i), Some(n)) => (0..n as i128).contains(&i),
+            _ => false,
+        };
+        if !in_bounds {
+            self.check_register_array_decay(array);
+            return;
+        }
+        // gcc follows members to the variable, but not elements: `m[1][2]`
+        // subscripts the row `m[1]`, which is not a variable.
+        let mut root = array;
         while let ExprKind::Member { expr, .. } = &root.kind {
             root = expr;
         }
-        let ExprKind::Ident(symbol_id) = &root.kind else {
-            return;
-        };
-        let sym = self.symbols.get(*symbol_id);
-        if !matches!(sym.kind, SymbolKind::Variable | SymbolKind::Parameter) {
-            return;
-        }
-        if self
-            .types
-            .modifiers(sym.typ)
-            .contains(TypeModifiers::REGISTER)
-        {
-            let name = self.str(sym.name).to_string();
-            diag::error_args(
-                pos,
-                "address of register variable '{0}' requested",
-                &[&name],
-            );
+        if register_variable(self.types, self.symbols, root).is_some() {
+            diag::pedwarn(pos, &gettext("ISO C forbids subscripting 'register' array"));
         }
     }
 

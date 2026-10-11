@@ -107,3 +107,92 @@ fn codegen_backtrace_walks_every_frame() {
         }
     }
 }
+
+/// With unwind tables off, an object has no `.eh_frame`; with `-g` as well
+/// it keeps the rules for the debugger in `.debug_frame`, as gcc's does.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_no_unwind_tables_object_sections() {
+    let c_file = create_c_file(
+        "no_eh_frame",
+        "int g(int);\nint f(int x) { return g(x) + 1; }\n",
+    );
+    let src = c_file.path().to_str().unwrap().to_string();
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_unwind_obj_")
+        .tempdir()
+        .expect("tempdir");
+    let sections = |opts: &[&str]| -> String {
+        let obj = dir.path().join("out.o");
+        let obj = obj.to_str().unwrap();
+        let mut args = vec!["-O2", "-c", "-o", obj];
+        args.extend(opts);
+        args.push(&src);
+        let r = run_c17(&args);
+        assert!(r.success, "{opts:?}: {}", r.stderr);
+        let dump = std::process::Command::new("objdump")
+            .args(["-h", obj])
+            .output()
+            .expect("failed to run objdump");
+        String::from_utf8_lossy(&dump.stdout).into_owned()
+    };
+    let off = ["-fno-asynchronous-unwind-tables", "-fno-unwind-tables"];
+    let plain = sections(&[]);
+    assert!(plain.contains(".eh_frame"), "{plain}");
+    let none = sections(&off);
+    assert!(!none.contains(".eh_frame"), "{none}");
+    assert!(!none.contains(".debug_frame"), "{none}");
+    let debug = sections(&[off[0], off[1], "-g"]);
+    assert!(!debug.contains(".eh_frame"), "{debug}");
+    assert!(debug.contains(".debug_frame"), "{debug}");
+}
+
+/// `<unwind.h>` is the compiler's own header, from gcc's private include
+/// directory, which c17 searches after every other: libbacktrace walks the
+/// stack with `_Unwind_Backtrace` and `_Unwind_GetIPInfo` and degrades to
+/// "no stack trace" without it. Each frame the walk reports has to be one
+/// of the functions on the stack. (macOS's SDK has its own `<unwind.h>`.)
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_unwind_h_walks_the_stack() {
+    let src = r#"
+#include <unwind.h>
+#include <stdint.h>
+
+struct walk { int n; uintptr_t ip[8]; };
+
+static _Unwind_Reason_Code step(struct _Unwind_Context *ctx, void *arg) {
+    struct walk *w = arg;
+    int before = 0;
+    uintptr_t ip = _Unwind_GetIPInfo(ctx, &before);
+    if (ip && w->n < 8)
+        w->ip[w->n++] = ip;
+    return _URC_NO_REASON;
+}
+
+__attribute__((noinline)) int inner(struct walk *w) {
+    w->n = 0;
+    return _Unwind_Backtrace(step, w) == _URC_END_OF_STACK ? w->n : -1;
+}
+
+__attribute__((noinline)) int outer(struct walk *w) { return inner(w) + 1; }
+
+static int within(uintptr_t ip, void *fn) {
+    uintptr_t f = (uintptr_t)fn;
+    return ip > f && ip - f < 256;
+}
+
+int main(void) {
+    struct walk w;
+    int n = outer(&w);
+    if (n < 4) return 10 + n;
+    if (!within(w.ip[0], (void *)inner)) return 2;
+    if (!within(w.ip[1], (void *)outer)) return 3;
+    if (!within(w.ip[2], (void *)main)) return 4;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(run_host_plain("unwind_h", src, &[opt]), 0, "at {opt}");
+    }
+}

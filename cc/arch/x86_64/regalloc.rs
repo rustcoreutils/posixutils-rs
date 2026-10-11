@@ -44,7 +44,7 @@
 
 use super::simd::{writes_spare_xmm, SPARE_XMM};
 use super::x87::{is_x87_float_to_int, uses_x87_scratch};
-use crate::arch::asm_constraints::{AsmOperandClass, AsmRegClass, PinnedGp};
+use crate::arch::asm_constraints::{operand_pins, AsmOperandClass, AsmRegClass, PinnedGp};
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
     asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
@@ -52,7 +52,7 @@ use crate::arch::regalloc::{
     LivenessResult,
 };
 use crate::float::FloatVal;
-use crate::ir::{AsmConstraint, AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
+use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -394,6 +394,7 @@ fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
             | Opcode::Phi
             | Opcode::PhiSource
             | Opcode::Unreachable
+            | Opcode::Trap
             | Opcode::Fence
             | Opcode::VaEnd
     )
@@ -428,7 +429,8 @@ pub fn is_call_like_x86_64(op: Opcode) -> bool {
 /// The register each operand of an inline-asm statement is pinned to --
 /// outputs, then inputs, in order -- or `None` for one the allocator places.
 ///
-/// A letter that names a register (`a` ... `D`) pins its operand there. `Q`
+/// A letter that names a register (`a` ... `D`) pins its operand there, as
+/// does a register variable (`register long x asm("r10")`). `Q`
 /// asks for any register with an addressable high byte, and gets the first of
 /// %rax, %rbx, %rcx, %rdx the statement neither pins nor clobbers: the
 /// allocator has no such class, so the choice is made here, once, and both
@@ -436,27 +438,18 @@ pub fn is_call_like_x86_64(op: Opcode) -> bool {
 /// its output's register.
 pub fn asm_pinned_regs(asm: &AsmData) -> Vec<Option<Reg>> {
     let named = |c: &AsmOperandClass| match c.reg {
-        Some(AsmRegClass::Pinned(p)) => Some(match p {
-            PinnedGp::Rax => Reg::Rax,
-            PinnedGp::Rbx => Reg::Rbx,
-            PinnedGp::Rcx => Reg::Rcx,
-            PinnedGp::Rdx => Reg::Rdx,
-            PinnedGp::Rsi => Reg::Rsi,
-            PinnedGp::Rdi => Reg::Rdi,
-        }),
+        Some(AsmRegClass::Pinned(PinnedGp::X86_64(r))) => Some(r),
         _ => None,
     };
-    let operands: Vec<&AsmConstraint> = asm.outputs.iter().chain(&asm.inputs).collect();
-    let mut taken: Vec<Reg> = operands.iter().filter_map(|c| named(&c.class)).collect();
+    let mut taken: Vec<Reg> = asm
+        .outputs
+        .iter()
+        .chain(&asm.inputs)
+        .filter_map(|c| named(&c.class))
+        .collect();
     taken.extend(asm.clobbers.iter().filter_map(|c| parse_gp_clobber_name(c)));
-    let mut pins: Vec<Option<Reg>> = Vec::with_capacity(operands.len());
-    for (idx, c) in operands.iter().enumerate() {
-        let tied = c
-            .matching_output
-            .filter(|&i| idx >= asm.outputs.len() && i < asm.outputs.len());
-        let pin = if let Some(i) = tied {
-            pins[i]
-        } else if c.class.reg == Some(AsmRegClass::HighByte) {
+    operand_pins(asm, |c| {
+        if c.class.reg == Some(AsmRegClass::HighByte) {
             let free = [Reg::Rax, Reg::Rbx, Reg::Rcx, Reg::Rdx]
                 .into_iter()
                 .find(|r| !taken.contains(r));
@@ -464,10 +457,8 @@ pub fn asm_pinned_regs(asm: &AsmData) -> Vec<Option<Reg>> {
             free
         } else {
             named(&c.class)
-        };
-        pins.push(pin);
-    }
-    pins
+        }
+    })
 }
 
 /// Every general register an inline asm of `func` may change: those it
@@ -505,7 +496,7 @@ fn parse_xmm_clobber_name(raw: &str) -> Option<u8> {
 /// `r10w`, `r10b`), and the GCC-style "%rax" with leading `%`.
 /// Returns `None` for names the GP table doesn't know about
 /// (XMM registers, `memory`, `cc`, x87 stack, ...).
-pub(super) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
+pub(crate) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     let s = raw.trim_start_matches('%').to_ascii_lowercase();
     Some(match s.as_str() {
         "rax" | "eax" | "ax" | "al" | "ah" => Reg::Rax,
@@ -604,8 +595,8 @@ pub fn get_constraint_info(
         return Some((clobbers, involved));
     }
 
-    if insn.is_builtin_setjmp() {
-        return Some(crate::arch::regalloc::builtin_setjmp_constraint(
+    if insn.returns_twice() {
+        return Some(crate::arch::regalloc::returns_twice_constraint(
             insn,
             Reg::allocatable(),
         ));
@@ -805,6 +796,13 @@ pub struct RegAlloc {
     guard_requested: bool,
     /// The canary's slot: the frame's first, so above every other local.
     guard_slot: Option<i32>,
+    /// What `%rsp` is a multiple of at a call; see
+    /// [`RegAlloc::with_incoming_stack_align`].
+    incoming_stack_align: i32,
+    /// Registers the unit's file-scope register variables are: never
+    /// allocated, saved or restored in any of its functions. Set with
+    /// `with_global_registers`.
+    global_registers: Vec<Reg>,
     /// How many GP argument registers the **named** parameters consumed, capped
     /// at the register file size. `va_start` needs this to seed `gp_offset`.
     named_gp_regs: usize,
@@ -936,7 +934,12 @@ impl FrameBase {
     /// an operand to it invalidates every local at a stroke: hard-coding `%rbx`
     /// made `asm("..." ::: "rbx")` beside an over-aligned array segfault on
     /// code gcc accepts.
-    fn of(func: &Function, types: &TypeTable) -> FrameBase {
+    fn of(
+        func: &Function,
+        types: &TypeTable,
+        global_registers: &[Reg],
+        incoming_align: i32,
+    ) -> FrameBase {
         let local_align = func
             .locals
             .values()
@@ -963,12 +966,15 @@ impl FrameBase {
             .map(|t| types.alignment(*t) as i32)
             .max()
             .unwrap_or(8);
+        // `%rbp` is as aligned as the stack was at the call, 16 bytes or,
+        // under `-mpreferred-stack-boundary=3`, 8.
         let align = local_align.max(call_align);
-        if align <= 16 {
+        if align <= incoming_align {
             return FrameBase::Rbp;
         }
 
-        let claimed = Self::asm_claimed_regs(func);
+        let mut claimed = Self::asm_claimed_regs(func);
+        claimed.extend(global_registers.iter().copied());
         // %rbp is the frame pointer and %rsp the stack pointer; the rest of the
         // callee-saved set is fair game, in the order the allocator would reach
         // for them last.
@@ -1170,7 +1176,27 @@ impl RegAlloc {
             tls_access: crate::target::TlsAccess::ElfStatic,
             guard_requested: false,
             guard_slot: None,
+            global_registers: Vec::new(),
+            incoming_stack_align: 16,
         }
+    }
+
+    /// The allocator for a unit whose file-scope register variables are
+    /// `regs` (`register long r asm("r14")`): each is the variable for the
+    /// whole unit, so no function may allocate it, use it for its frame
+    /// base, or save and restore it -- that would undo a write to the
+    /// variable on return.
+    pub fn with_global_registers(mut self, regs: &[Reg]) -> Self {
+        self.global_registers = regs.to_vec();
+        self
+    }
+
+    /// An allocator for code that may count on `%rsp` being a multiple of
+    /// `bytes` at a call: 16, or 8 under `-mpreferred-stack-boundary=3`,
+    /// where a local or argument aligned to 16 needs the frame realigned.
+    pub fn with_incoming_stack_align(mut self, bytes: i32) -> Self {
+        self.incoming_stack_align = bytes;
+        self
     }
 
     /// An allocator that reserves a stack-protector canary slot when
@@ -1195,12 +1221,19 @@ impl RegAlloc {
         self.func_pos = crate::arch::func_pos(func);
         // Before anything is coloured: the frame base claims a register, and
         // every palette below has to be built without it.
-        self.frame_base = FrameBase::of(func, types);
+        self.frame_base = FrameBase::of(
+            func,
+            types,
+            &self.global_registers,
+            self.incoming_stack_align,
+        );
         if let Some(base) = self.frame_base.reg() {
             self.free_regs.retain(|r| *r != base);
             // The prologue writes it, so the function must save it.
             self.used_callee_saved.push(base);
         }
+        let allocatable = self.allocatable_regs();
+        self.free_regs.retain(|r| allocatable.contains(r));
         // Before any other slot: the first is the highest, nearest the saved
         // registers, which is where the canary has to be -- and the arrays
         // right under it.
@@ -1212,18 +1245,22 @@ impl RegAlloc {
         }
         let win64 = func.conv == crate::abi::CallingConv::Win64;
         if win64 {
-            self.used_callee_saved
-                .extend_from_slice(&super::win64::CALLEE_SAVED_GP);
+            // Less a global register, which is the variable's, never saved.
+            let saved = super::win64::CALLEE_SAVED_GP
+                .into_iter()
+                .filter(|r| !self.global_registers.contains(r));
+            self.used_callee_saved.extend(saved);
         }
         if func.receives_nonlocal_goto() {
-            for &reg in Reg::allocatable() {
+            for &reg in &allocatable {
                 if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
                     self.used_callee_saved.push(reg);
                 }
             }
         }
-        // The frame pointer is the prologue's own, saved already.
-        for reg in asm_written_regs(func).filter(|r| Reg::allocatable().contains(r)) {
+        // The frame pointer is the prologue's own, saved already, and a
+        // global register is the variable's, never saved.
+        for reg in asm_written_regs(func).filter(|r| allocatable.contains(r)) {
             if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
                 self.used_callee_saved.push(reg);
             }
@@ -2361,6 +2398,7 @@ impl RegAlloc {
                     .get(&cp.position)
                     .is_some_and(|outs| outs.contains(&interval.pseudo))
         };
+        let allocatable = self.allocatable_regs();
         for (pid, reg) in collect_asm_fixed_precolors_x86_64(func) {
             // Only pre-color if the pseudo is a GP candidate. The
             // lowering already routes pinned-operand registers
@@ -2368,6 +2406,13 @@ impl RegAlloc {
             // pre-coloring is skipped here the operand remains
             // exempt via `involved_pseudos`.
             if !gp_candidates.contains(&pid) {
+                continue;
+            }
+            // Nor into a register no pseudo may have: a register variable
+            // can pin its operand to the codegen scratch %r10/%r11, to %rsp
+            // or to a global register. The asm codegen moves the operand
+            // there itself.
+            if !allocatable.contains(&reg) {
                 continue;
             }
             // Nor if something else writes that register while the pseudo
@@ -2385,7 +2430,23 @@ impl RegAlloc {
                     writes_it,
                 )
             });
-            if overwritten && !pre_colored.contains_key(&pid) && !goto_outputs.contains(&pid) {
+            // Nor if another value already colored that register is live
+            // with it: an argument still in %rsi when the operand pinned to
+            // %rsi is copied in. `swap(x, y)` into `"S"(x), "D"(y)` wrote x
+            // over y before y was read.
+            let shares_register = by_pseudo.get(&pid).is_some_and(|interval| {
+                pre_colored.iter().any(|(&other, &r)| {
+                    r == reg
+                        && other != pid
+                        && by_pseudo
+                            .get(&other)
+                            .is_some_and(|o| interval.start < o.end && o.start < interval.end)
+                })
+            });
+            if (overwritten || shares_register)
+                && !pre_colored.contains_key(&pid)
+                && !goto_outputs.contains(&pid)
+            {
                 continue;
             }
             // If the pseudo is already pre-colored (ABI-pinned, or an
@@ -2772,7 +2833,8 @@ impl RegAlloc {
     }
 
     /// The registers this function may colour with: the machine's allocatable
-    /// set, less whatever the frame has claimed for its base.
+    /// set, less whatever the frame has claimed for its base and the unit's
+    /// global registers.
     ///
     /// Every consumer must come through here rather than reading
     /// `Reg::allocatable()` -- the colourer builds its own preference orders,
@@ -2783,7 +2845,7 @@ impl RegAlloc {
         Reg::allocatable()
             .iter()
             .copied()
-            .filter(|r| Some(*r) != claimed)
+            .filter(|r| Some(*r) != claimed && !self.global_registers.contains(r))
             .collect()
     }
 

@@ -254,6 +254,52 @@ fn diagnostics_negative_shift_count_where_no_constant_is_needed() {
     }
 }
 
+/// gcc reports no shift count in an operand that is never evaluated -- the
+/// arm a constant condition discards, the right side of a constant `&&` or
+/// `||`, `sizeof` -- which is how generic code guards a shift by a width it
+/// computes (`W > 64 ? x << (64 - W - 1) : x`). A statement that is never
+/// reached is still evaluated code to gcc, and so is the arm a constant
+/// condition selects or a run-time condition may select.
+#[test]
+fn diagnostics_shift_count_in_an_unevaluated_operand_is_silent() {
+    let silent = [
+        "unsigned long f(unsigned long x) { return W > 64 ? x << (64 - W - 1) : x; }",
+        "unsigned long f(unsigned long x) { return W <= 64 ? x : x << (64 - W - 1); }",
+        "unsigned long f(unsigned long x) { return W > 64 ? x << 70 : x; }",
+        "unsigned long f(unsigned long x) { return W > 64 ? x >> -1 : x; }",
+        "unsigned long f(unsigned long x) { return 0 && (x << -1); }",
+        "unsigned long f(unsigned long x) { return 1 || (x << 99); }",
+        "unsigned long f(unsigned long x) { return sizeof(x << -1); }",
+        "int g = 1 ? 2 : (1 << -1);",
+    ];
+    let warned = [
+        (
+            "unsigned long f(unsigned long x) { if (0) return x << -1; return x; }",
+            "left shift count is negative",
+        ),
+        (
+            "unsigned long f(unsigned long x) { return x ? x << -1 : 0; }",
+            "left shift count is negative",
+        ),
+        (
+            "unsigned long f(unsigned long x) { return W == 64 ? x << 64 : x; }",
+            "left shift count >= width of type",
+        ),
+    ];
+    for src in silent {
+        let c = compile("shift_unevaluated", &format!("#define W 64\n{src}\n"), &[]);
+        assert!(
+            c.success && !c.stderr.contains("shift count"),
+            "{src}:\n{}",
+            c.stderr
+        );
+    }
+    for (src, want) in warned {
+        let c = compile("shift_evaluated", &format!("#define W 64\n{src}\n"), &[]);
+        assert!(c.success && c.stderr.contains(want), "{src}:\n{}", c.stderr);
+    }
+}
+
 /// `-Wno-shift-count-overflow` and `-Wno-shift-count-negative` turn the two
 /// groups off separately, as gcc spells them.
 #[test]

@@ -77,21 +77,30 @@ fn test_a_big_endian_struct_reverses_its_scalars() {
     assert_eq!(got, want);
 }
 
-/// The target's own order changes nothing, and the attribute is read in all
-/// three places gcc reads it: before the tag, between the tag and the
-/// brace, and after the closing brace -- on a union as on a struct.
+/// The target's own order changes nothing, and the attribute is read in
+/// both places gcc reads it on a definition: before the tag and after the
+/// closing brace -- on a union as on a struct. Between the tag and the brace
+/// it ends the specifier, and gcc refuses the body that follows.
 #[test]
 fn test_the_attribute_positions_and_the_native_order() {
     let src = "struct __attribute__((scalar_storage_order(\"little-endian\"))) L { int i; };\n\
-               struct M __attribute__((scalar_storage_order(\"big-endian\"))) { int i; };\n\
                struct T { int i; } __attribute__((scalar_storage_order(\"big-endian\")));\n\
                union __attribute__((scalar_storage_order(\"big-endian\"))) U { short h; };";
     let (_, types, strings, symbols) = parse_tu_for(src, &x86_64_linux()).unwrap();
     let one = |tag: &str| members_of(&types, &strings, &symbols, tag)[0].1;
     assert!(!one("L"));
-    assert!(one("M"));
     assert!(one("T"));
     assert!(one("U"));
+    let between = "struct M __attribute__((scalar_storage_order(\"big-endian\"))) { int i; };";
+    let err = parse_tu_for(between, &x86_64_linux())
+        .err()
+        .expect("refused");
+    assert!(
+        err.message
+            .contains("expected identifier or '(' before '{' token"),
+        "{}",
+        err.message
+    );
 }
 
 /// A member access carries the order -- through `.` and `->`, a subscript

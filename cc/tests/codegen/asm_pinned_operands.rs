@@ -84,3 +84,35 @@ int main(void) {
         0
     );
 }
+
+/// Operands pinned to the argument registers, each wanting another
+/// argument's: `x` arrives in %rdi and is wanted in %rsi, `y` the other way
+/// round. The allocator homed the copy of `x` in %rsi while `y` still lived
+/// there, so the asm saw `x` twice.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn asm_pinned_operands_trade_argument_registers() {
+    let src = r#"
+__attribute__((noinline)) long swap_sub(long x, long y) {
+    long out;
+    __asm__("mov %%rsi, %0\n\tsub %%rdi, %0" : "=&r"(out) : "S"(x), "D"(y));
+    return out;
+}
+__attribute__((noinline)) long rotate(long a, long b, long c) {
+    long out;
+    __asm__("lea (%%rsi,%%rdx,2), %0\n\tlea (%0,%%rdi,4), %0"
+            : "=&r"(out) : "S"(a), "d"(b), "D"(c));
+    return out;
+}
+int main(void) {
+    if (swap_sub(10, 3) != 7) return 1;
+    if (rotate(1, 2, 3) != 17) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_pinned_trade", src, &[]), 0);
+    assert_eq!(
+        compile_and_run("asm_pinned_trade_o2", src, &["-O2".to_string()]),
+        0
+    );
+}

@@ -565,12 +565,12 @@ fn diagnostics_repeated_declaration_parts_are_rejected() {
     compile_expect_error(
         "decl_enumerator_over_variable",
         "int Y;\nenum A { Y };\n",
-        "redeclared as a different kind of symbol",
+        "redeclared as different kind of symbol",
     );
     compile_expect_error(
         "decl_variable_over_enumerator",
         "enum A { Z };\nint Z;\n",
-        "redeclared as a different kind of symbol",
+        "redeclared as different kind of symbol",
     );
     compile_expect_error(
         "decl_dup_parameter",

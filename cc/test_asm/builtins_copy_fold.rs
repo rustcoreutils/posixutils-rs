@@ -127,10 +127,11 @@ fn builtins_copy_fold_unknown_sources() {
 }
 
 /// The calls a fold makes go to the program's names for `strcpy` and
-/// `memcpy`, asm label and all.
+/// `memcpy`, asm label and all. The string is past the 8 KB x86-64 copies
+/// in place, so the `memcpy` stays a call.
 #[test]
 fn builtins_copy_fold_follows_asm_labels() {
-    let long = "x".repeat(200);
+    let long = "x".repeat(9000);
     let src = format!(
         "typedef unsigned long size_t;\n\
          char *stpcpy(char *, const char *);\n\

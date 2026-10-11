@@ -27,7 +27,7 @@
 
 use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Which locals are reachable from outside this function.
 pub(crate) struct EscapeInfo {
@@ -56,18 +56,14 @@ impl EscapeInfo {
         // ordering claim a memory pass makes is void -- and C17 7.13.2.1p3
         // already makes a non-`volatile` local modified after `setjmp`
         // indeterminate. `&&label` is the same problem by another route.
-        let give_up = func.takes_label_addr
-            || func.blocks.iter().any(|bb| {
-                bb.insns
-                    .iter()
-                    .any(|i| matches!(i.op, Opcode::Setjmp | Opcode::Longjmp))
-            });
+        let give_up = func.takes_label_addr || func.has_nonlocal_control();
 
         let mut escaped = HashSet::new();
         if give_up {
             return EscapeInfo { escaped, give_up };
         }
 
+        let mentions = Mentions::of(func);
         for p in &func.pseudos {
             if !matches!(p.kind, PseudoKind::Sym(_)) {
                 continue;
@@ -77,11 +73,41 @@ impl EscapeInfo {
             };
             // Not an escape, but off limits all the same, and one set is
             // simpler to reason about than two.
-            if !local.is_ordinary(types) || escapes(func, p.id) {
+            if !local.is_ordinary(types) || escapes(func, &mentions, p.id) {
                 escaped.insert(p.id);
             }
         }
         EscapeInfo { escaped, give_up }
+    }
+}
+
+/// The instructions that name each pseudo, in any role: what [`escapes`]
+/// follows an address through.
+///
+/// Built once per function. Scanning the whole function for every holder of
+/// every local made the analysis locals x instructions, and a function into
+/// which hundreds of calls were spliced has thousands of each.
+pub(crate) struct Mentions<'a> {
+    by_pseudo: HashMap<PseudoId, Vec<&'a Instruction>>,
+}
+
+impl<'a> Mentions<'a> {
+    pub(crate) fn of(func: &'a Function) -> Self {
+        let mut by_pseudo: HashMap<PseudoId, Vec<&'a Instruction>> = HashMap::new();
+        for insn in func.blocks.iter().flat_map(|bb| &bb.insns) {
+            for p in insn.mentioned() {
+                let at = by_pseudo.entry(p).or_default();
+                // An instruction naming `p` twice is one instruction.
+                if !at.last().is_some_and(|&last| std::ptr::eq(last, insn)) {
+                    at.push(insn);
+                }
+            }
+        }
+        Mentions { by_pseudo }
+    }
+
+    fn of_pseudo(&self, p: PseudoId) -> &[&'a Instruction] {
+        self.by_pseudo.get(&p).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -95,48 +121,43 @@ impl EscapeInfo {
 /// Also `-fstack-protector-strong`'s "a local whose address is taken"
 /// (`arch::stack_protect`): an address used only to reach the object's
 /// members, as `s.a = 1` does, is not taken in gcc's sense either.
-pub(crate) fn escapes(func: &Function, sym: PseudoId) -> bool {
+pub(crate) fn escapes(func: &Function, mentions: &Mentions, sym: PseudoId) -> bool {
     let mut holders: HashSet<PseudoId> = HashSet::new();
     holders.insert(sym);
     let mut work = vec![sym];
 
     while let Some(p) = work.pop() {
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                if !insn.mentions(p) {
-                    continue;
-                }
-                // `mentions` answers "names this pseudo", and a target is a
-                // name. But an instruction that only *defines* a *value* is
-                // where that value came from, and that is already accounted
-                // for: it is in the holder set precisely because a recognized
-                // rule produced it. Only a *use* can let an address out, and
-                // SSA invariant I1 makes "defines and does not use"
-                // unambiguous.
-                //
-                // A `Sym` is the exception, and the reason this is not a
-                // blanket skip: a `Sym` names storage rather than a value, so
-                // targeting one is a *write to the object*, not a definition.
-                // A struct-returning call targets the receiving local
-                // directly, which means its address was handed to the callee.
-                let defines_value = insn.target == Some(p)
-                    && !insn.src.contains(&p)
-                    && !matches!(
-                        func.get_pseudo(p).map(|x| &x.kind),
-                        Some(PseudoKind::Sym(_))
-                    );
-                if defines_value {
-                    continue;
-                }
-                match holder_effect(insn, p) {
-                    Effect::Access => {}
-                    Effect::Holds(t) => {
-                        if holders.insert(t) {
-                            work.push(t);
-                        }
+        for &insn in mentions.of_pseudo(p) {
+            // `mentions` answers "names this pseudo", and a target is a
+            // name. But an instruction that only *defines* a *value* is
+            // where that value came from, and that is already accounted
+            // for: it is in the holder set precisely because a recognized
+            // rule produced it. Only a *use* can let an address out, and
+            // SSA invariant I1 makes "defines and does not use"
+            // unambiguous.
+            //
+            // A `Sym` is the exception, and the reason this is not a
+            // blanket skip: a `Sym` names storage rather than a value, so
+            // targeting one is a *write to the object*, not a definition.
+            // A struct-returning call targets the receiving local
+            // directly, which means its address was handed to the callee.
+            let defines_value = insn.target == Some(p)
+                && !insn.src.contains(&p)
+                && !matches!(
+                    func.get_pseudo(p).map(|x| &x.kind),
+                    Some(PseudoKind::Sym(_))
+                );
+            if defines_value {
+                continue;
+            }
+            match holder_effect(insn, p) {
+                Effect::Access => {}
+                Effect::Holds(t) => {
+                    if holders.insert(t) {
+                        work.push(t);
                     }
-                    Effect::Escapes => return true,
                 }
+                Effect::Escapes => return true,
             }
         }
     }
@@ -419,6 +440,21 @@ mod tests {
         let info = EscapeInfo::analyze(&f, &host_types());
         assert!(info.gave_up());
         assert!(info.is_captured(&MemBase::Local(PseudoId(0))));
+    }
+
+    /// So does a call of a function that returns twice, the library's
+    /// `setjmp` among them -- and an ordinary call does not.
+    #[test]
+    fn escape_returns_twice_call_gives_up() {
+        for twice in [true, false] {
+            let f = with_local(|t, bb| {
+                bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
+                let mut call = Instruction::call(None, "_setjmp", vec![], vec![], t, 32);
+                call.extra_mut().returns_twice_call = twice;
+                bb.add_insn(call);
+            });
+            assert_eq!(EscapeInfo::analyze(&f, &host_types()).gave_up(), twice);
+        }
     }
 
     /// `&&label` is the same problem by another route.

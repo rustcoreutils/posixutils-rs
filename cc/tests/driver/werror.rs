@@ -35,7 +35,7 @@ fn compile_in(dir: &Path, path: &Path, flags: &[&str]) -> crate::common::C17Run 
 /// gcc's `-Wincompatible-pointer-types` probe, the one configure scripts use.
 const INCOMPATIBLE: &str = "char c; int *g(void){return &c;}\n";
 const INCOMPATIBLE_MSG: &str =
-    "returning 'char *' from a function with return type 'int *' incompatible pointer type";
+    "returning 'char *' from a function with incompatible return type 'int *'";
 
 #[test]
 fn werror_fails_the_compile() {
@@ -44,9 +44,9 @@ fn werror_fails_the_compile() {
     let plain = compile_in(dir.path(), &path, &[]);
     assert!(plain.success, "{}", plain.stderr);
     assert!(
-        plain
-            .stderr
-            .contains(&format!("warning: {INCOMPATIBLE_MSG}\n")),
+        plain.stderr.contains(&format!(
+            "warning: {INCOMPATIBLE_MSG} [-Wincompatible-pointer-types]\n"
+        )),
         "{}",
         plain.stderr
     );
@@ -56,7 +56,9 @@ fn werror_fails_the_compile() {
     assert!(!strict.success, "{}", strict.stderr);
     let lines: Vec<&str> = strict.stderr.lines().collect();
     assert!(
-        lines[0].ends_with(&format!(": error: {INCOMPATIBLE_MSG} [-Werror]")),
+        lines[0].ends_with(&format!(
+            ": error: {INCOMPATIBLE_MSG} [-Werror=incompatible-pointer-types]"
+        )),
         "{}",
         strict.stderr
     );
@@ -70,6 +72,73 @@ fn werror_fails_the_compile() {
 
     let named = compile_in(dir.path(), &path, &["-Werror=overflow"]);
     assert!(named.success, "{}", named.stderr);
+}
+
+/// The probe's group answers to its own name, as gcc's does: an error
+/// under `-Werror=incompatible-pointer-types`, nothing under
+/// `-Wno-incompatible-pointer-types`.
+#[test]
+fn incompatible_pointer_types_is_a_group() {
+    let (dir, path) = scratch("ip.c", INCOMPATIBLE);
+    let named = compile_in(dir.path(), &path, &["-Werror=incompatible-pointer-types"]);
+    assert!(!named.success, "{}", named.stderr);
+    assert!(
+        named.stderr.contains(&format!(
+            "error: {INCOMPATIBLE_MSG} [-Werror=incompatible-pointer-types]\n"
+        )),
+        "{}",
+        named.stderr
+    );
+    assert!(
+        named
+            .stderr
+            .contains("c17: some warnings being treated as errors\n"),
+        "{}",
+        named.stderr
+    );
+    let quiet = compile_in(
+        dir.path(),
+        &path,
+        &["-Werror", "-Wno-incompatible-pointer-types"],
+    );
+    assert!(quiet.success && quiet.stderr.is_empty(), "{}", quiet.stderr);
+    let excused = compile_in(
+        dir.path(),
+        &path,
+        &["-Werror", "-Wno-error=incompatible-pointer-types"],
+    );
+    assert!(excused.success, "{}", excused.stderr);
+}
+
+/// Pointer targets that differ only in signedness are gcc's
+/// `-Wpointer-sign`: nothing by default, a warning under `-Wall`, an error
+/// under `-Werror=pointer-sign`.
+#[test]
+fn pointer_sign_is_wall_only() {
+    let (dir, path) = scratch(
+        "ps.c",
+        "void g(unsigned char *p);\nvoid t(char *c) { g(c); }\n",
+    );
+    let plain = compile_in(dir.path(), &path, &["-Werror"]);
+    assert!(plain.success && plain.stderr.is_empty(), "{}", plain.stderr);
+    let msg = "pointer targets in passing argument 1 of 'g' differ in signedness";
+    let wall = compile_in(dir.path(), &path, &["-Wall"]);
+    assert!(wall.success, "{}", wall.stderr);
+    assert!(
+        wall.stderr
+            .contains(&format!("2:21: warning: {msg} [-Wpointer-sign]\n")),
+        "{}",
+        wall.stderr
+    );
+    let strict = compile_in(dir.path(), &path, &["-Werror=pointer-sign"]);
+    assert!(!strict.success, "{}", strict.stderr);
+    assert!(
+        strict
+            .stderr
+            .contains(&format!("2:21: error: {msg} [-Werror=pointer-sign]\n")),
+        "{}",
+        strict.stderr
+    );
 }
 
 #[test]
@@ -96,7 +165,11 @@ fn werror_skips_system_headers() {
     // The same header through `-I` is the user's, and fails.
     let r = compile_in(dir.path(), &path, &["-Werror", "-I", inc.to_str().unwrap()]);
     assert!(!r.success, "{}", r.stderr);
-    assert!(r.stderr.contains("[-Werror]"), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("[-Werror=incompatible-pointer-types]"),
+        "{}",
+        r.stderr
+    );
 }
 
 /// gcc refuses an option it does not know. For a `-g` option c17 warns and
@@ -208,4 +281,40 @@ fn werror_leaves_driver_warnings_alone() {
         "{}",
         r.stderr
     );
+}
+
+/// `-Wframe-larger-than=` warns of a frame over the limit, and fails the
+/// compile under `-Werror`, as the kernel's `CONFIG_FRAME_WARN` with
+/// `CONFIG_WERROR` asks.
+#[test]
+fn frame_larger_than_fails_under_werror() {
+    let (dir, path) = scratch(
+        "fr.c",
+        "void use(char *);\nvoid big(void) { char b[4096]; use(b); }\n",
+    );
+    let warn = compile_in(dir.path(), &path, &["-O2", "-Wframe-larger-than=2048"]);
+    assert!(warn.success, "{}", warn.stderr);
+    assert!(
+        warn.stderr.contains(
+            "2:1: warning: the frame size of 4096 bytes is larger than 2048 bytes \
+                 [-Wframe-larger-than=]\n"
+        ),
+        "{}",
+        warn.stderr
+    );
+    let strict = compile_in(
+        dir.path(),
+        &path,
+        &["-O2", "-Wframe-larger-than=2048", "-Werror"],
+    );
+    assert!(!strict.success, "{}", strict.stderr);
+    assert!(
+        strict
+            .stderr
+            .contains("larger than 2048 bytes [-Werror=frame-larger-than=]\n"),
+        "{}",
+        strict.stderr
+    );
+    let roomy = compile_in(dir.path(), &path, &["-Wframe-larger-than=8192", "-Werror"]);
+    assert!(roomy.success && roomy.stderr.is_empty(), "{}", roomy.stderr);
 }

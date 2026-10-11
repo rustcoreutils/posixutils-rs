@@ -14,6 +14,7 @@ use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::abi::{ArgClass, HfaBase, RegClass};
+use crate::arch::eh::CallArgsArea;
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -1059,8 +1060,38 @@ impl Aarch64CodeGen {
     }
 
     /// Emit the actual call instruction (direct or indirect)
-    pub(super) fn emit_call_instruction(&mut self, insn: &Instruction, func_name: &str) {
+    /// The call instruction of `insn`, `stack_args` sixteen-byte units of
+    /// its arguments on the stack, between the labels of its call-site entry
+    /// when it has a landing pad (`arch::eh`).
+    pub(super) fn emit_call_instruction(
+        &mut self,
+        insn: &Instruction,
+        func_name: &str,
+        stack_args: i32,
+    ) {
+        let area = match self.darwin_va_sp_slot {
+            Some(saved_sp) => CallArgsArea::Realigned { saved_sp },
+            None => CallArgsArea::Fixed(i64::from(stack_args) * 16),
+        };
+        let site = self.base.eh_call_begin(insn, area);
         if insn.extra().indirect_target.is_some() {
+            self.push_lir(Aarch64Inst::Bl {
+                target: CallTarget::Indirect(Reg::X16),
+            });
+        } else if self.pic_mode && self.base.calls_through_got(func_name) {
+            // `-fno-plt` in position-independent code: the address from the
+            // GOT, in the register an indirect call uses. Position-dependent
+            // code calls directly, as gcc's does.
+            let sym = Symbol::extern_sym(func_name);
+            self.push_lir(Aarch64Inst::AdrpGotPage {
+                sym: sym.clone(),
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::LdrSymGotPageOff {
+                sym,
+                base: Reg::X16,
+                dst: Reg::X16,
+            });
             self.push_lir(Aarch64Inst::Bl {
                 target: CallTarget::Indirect(Reg::X16),
             });
@@ -1068,7 +1099,14 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Bl {
                 target: CallTarget::Direct(Symbol::global(func_name)),
             });
+            // The second return of a function that returns twice comes by
+            // an indirect jump, so under `bti` it lands on `bti j`, which gcc
+            // keeps inside the call's call-site entry.
+            if insn.returns_twice() {
+                self.emit_jump_landing_pad();
+            }
         }
+        self.base.eh_call_end(site);
     }
 
     /// Clean up stack after call

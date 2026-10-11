@@ -143,12 +143,12 @@ fn diagnostics_return_type_mismatch_is_rejected() {
     compile_expect_error(
         "return_value_from_void",
         "void f(void){ return 1; }\n",
-        "'return' with a value in a function returning void",
+        "'return' with a value, in function returning void",
     );
     compile_expect_error(
         "return_nothing_from_int",
         "int g(void){ return; }\n",
-        "'return' with no value in a function returning non-void",
+        "'return' with no value, in function returning non-void",
     );
 }
 
@@ -336,7 +336,7 @@ fn diagnostics_incompatible_typedef_redefinition_is_rejected() {
     compile_expect_error(
         "typedef_conflict",
         "typedef int foo; typedef char foo; foo x;\n",
-        "different type",
+        "conflicting types for",
     );
 }
 
@@ -510,7 +510,7 @@ fn diagnostics_typedef_may_be_shadowed_in_an_inner_scope() {
     compile_expect_error(
         "typedef_conflict_same_scope",
         "typedef int T;\ntypedef double T;\n",
-        "different type",
+        "conflicting types for",
     );
 }
 
@@ -540,7 +540,7 @@ fn diagnostics_return_of_a_void_expression_is_accepted() {
     compile_expect_error(
         "return_int_from_void",
         "void f(void){ return 1; }\n",
-        "'return' with a value in a function returning void",
+        "'return' with a value, in function returning void",
     );
 }
 

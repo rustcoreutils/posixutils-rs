@@ -12,7 +12,7 @@
 // refuses it.
 //
 
-use crate::common::run_c17;
+use crate::common::{preprocess_text, run_c17};
 use std::path::{Path, PathBuf};
 
 /// A scratch directory holding `name` with `content`.
@@ -36,7 +36,8 @@ fn compile_in(dir: &Path, path: &Path, flags: &[&str]) -> crate::common::C17Run 
 
 const CLEAN: &str = "int main(void) { return 0; }\n";
 
-/// Debian trixie's `dpkg-buildflags --get CFLAGS`, and Ubuntu 24.04's.
+/// Debian trixie's `dpkg-buildflags --get CFLAGS`, and Ubuntu 24.04's, on
+/// amd64: elsewhere they have no `-fcf-protection`, which only x86-64 has.
 const DEBIAN: &[&str] = &[
     "-g",
     "-O2",
@@ -76,6 +77,9 @@ fn distribution_flags_compile_under_werror() {
         // The Ubuntu set's `-mno-omit-leaf-frame-pointer` is x86-64's and
         // aarch64's alike.
         let mut args = flags.to_vec();
+        if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            args.retain(|&f| f != "-fcf-protection");
+        }
         args.push("-Werror");
         let r = compile_in(dir.path(), &path, &args);
         assert!(r.success, "{flags:?}: {}", r.stderr);
@@ -149,8 +153,20 @@ fn build_system_defaults_are_silent() {
             "-fwrapv",
             "-fno-semantic-interposition",
         ],
+        // What binutils' ld test suite passes.
+        &["-feliminate-dwarf2-dups", "-fsemantic-interposition"],
+        &["-fno-plt", "-fplt", "-fcommon", "-fno-common"],
+        &[
+            "-ffunction-sections",
+            "-fno-function-sections",
+            "-fdata-sections",
+            "-fno-data-sections",
+        ],
     ] {
         let mut args = flags.to_vec();
+        if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            args.retain(|&f| f != "-fcf-protection");
+        }
         args.push("-Werror");
         let r = compile_in(dir.path(), &path, &args);
         assert!(r.success, "{flags:?}: {}", r.stderr);
@@ -199,25 +215,26 @@ fn unknown_option_is_an_error() {
 #[test]
 fn unsupported_option_warns() {
     let (dir, path) = scratch("t.c", CLEAN);
-    let r = compile_in(dir.path(), &path, &["-fsanitize=address"]);
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &["-fharden-compares", "-fharden-compares", "-Werror"],
+    );
     assert!(r.success, "{}", r.stderr);
     assert_eq!(
         r.stderr,
-        "c17: warning: '-fsanitize=address' is not supported; ignored\n"
+        "c17: warning: '-fharden-compares' is not supported; ignored\n"
     );
 
-    let r = compile_in(dir.path(), &path, &["-fcommon", "-fcommon", "-Werror"]);
-    assert!(r.success, "{}", r.stderr);
-    assert_eq!(
-        r.stderr,
-        "c17: warning: '-fcommon' is not supported; ignored\n"
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &["-ftrapv", "-fno-trapv", "-fharden-compares"],
     );
-
-    let r = compile_in(dir.path(), &path, &["-ftrapv", "-fno-trapv", "-fcommon"]);
     assert!(r.success, "{}", r.stderr);
     assert_eq!(
         r.stderr,
-        "c17: warning: '-fcommon' is not supported; ignored\n"
+        "c17: warning: '-fharden-compares' is not supported; ignored\n"
     );
 
     // `-Werror=` names the group, and then it is an error.
@@ -231,6 +248,76 @@ fn unsupported_option_warns() {
         r.stderr,
         "c17: error: '-ftrapv' is not supported; ignored [-Werror=c17-unsupported-option]\n"
     );
+}
+
+/// c17 instruments nothing, so a sanitizer request is refused: taking it
+/// with a warning left a build believing it was checked, and a probe that
+/// adds `-Werror` believing the compiler had one. A later `-fno-sanitize=`
+/// withdraws a request, as gcc's does, and the modifiers that only tune a
+/// sanitizer are taken in silence.
+#[test]
+fn sanitizers_are_refused() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for (flags, refused) in [
+        (&["-fsanitize=address"][..], &["-fsanitize=address"][..]),
+        (&["-fsanitize=undefined", "-w"], &["-fsanitize=undefined"]),
+        (
+            &[
+                "-fsanitize=kernel-address",
+                "-fsanitize-address-use-after-scope",
+            ],
+            &["-fsanitize=kernel-address"],
+        ),
+        (
+            &["-fsanitize-coverage=trace-pc"],
+            &["-fsanitize-coverage=trace-pc"],
+        ),
+        (
+            &["-fsanitize=address,undefined", "-fno-sanitize=undefined"],
+            &["-fsanitize=address,undefined"],
+        ),
+        (
+            &["-fsanitize=address", "-fsanitize=thread"],
+            &["-fsanitize=address", "-fsanitize=thread"],
+        ),
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(!r.success, "{flags:?}: {}", r.stderr);
+        let expected: String = refused
+            .iter()
+            .map(|o| format!("c17: error: '{o}' is not supported\n"))
+            .collect();
+        assert_eq!(r.stderr, expected, "{flags:?}");
+    }
+    for flags in [
+        &["-fno-sanitize=all"][..],
+        &["-fsanitize=address", "-fno-sanitize=address"],
+        &["-fsanitize=address,undefined", "-fno-sanitize=all"],
+        &[
+            "-fsanitize-coverage=trace-pc",
+            "-fno-sanitize-coverage=trace-pc",
+        ],
+        &[
+            "-fsanitize-address-use-after-scope",
+            "-fno-sanitize-recover",
+        ],
+        &["-fsanitize-recover=all", "-fsanitize-trap=undefined"],
+        &[
+            "-fsanitize-undefined-trap-on-error",
+            "-fno-sanitize-recover=all",
+        ],
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+    }
+    for option in ["-fsanitize=", "-fno-sanitize=", "-fsanitize-coverage="] {
+        let r = compile_in(dir.path(), &path, &[option]);
+        assert!(!r.success, "{option}");
+        assert_eq!(
+            r.stderr,
+            format!("c17: error: missing argument to '{option}'\n")
+        );
+    }
 }
 
 /// A function whose frame reaches the guard page, or that allocates on the
@@ -270,6 +357,129 @@ fn stack_clash_protection_names_unprobed_functions() {
             assert!(r.success && r.stderr.is_empty(), "{quiet}: {}", r.stderr);
         }
     }
+}
+
+/// `--param stack-clash-protection-guard-size=` and `-probe-interval=` move
+/// where gcc probes, and so which functions c17 names. On x86-64 a frame is
+/// probed once it reaches both the guard and the interval (each a log2 of
+/// bytes, 12 by default); aarch64 takes only a guard of 12 or 16, with the
+/// interval equal to it, and probes past the guard less the caller's 1 KiB
+/// -- refusing anything else, in gcc's words, with or without the option.
+/// The parameters were accepted and changed nothing.
+#[test]
+fn stack_clash_protection_params_move_the_threshold() {
+    let src = "void use(char *);\n\
+               void f(void) { char b[5000]; use(b); }\n";
+    let (dir, path) = scratch("p.c", src);
+    let asm = dir.path().join("p.s");
+    let run = |extra: &[&str]| {
+        let mut args = vec!["-fstack-clash-protection", "-S", "-o"];
+        args.push(asm.to_str().unwrap());
+        args.push(path.to_str().unwrap());
+        args.extend(extra);
+        run_c17(&args)
+    };
+    let warns = |extra: &[&str]| {
+        let r = run(extra);
+        assert!(r.success, "{extra:?}: {}", r.stderr);
+        r.stderr.contains("the stack of 'f' is not probed")
+    };
+    // The x86-64 rows name their target: on an aarch64 host the default
+    // threshold is aarch64's.
+    const X64: &str = "--target=x86_64-unknown-linux-gnu";
+    const A64: &str = "--target=aarch64-unknown-linux-gnu";
+    for (extra, want) in [
+        (&[X64][..], true),
+        (
+            &[X64, "--param", "stack-clash-protection-guard-size=13"][..],
+            false,
+        ),
+        (
+            &[X64, "--param=stack-clash-protection-probe-interval=14"][..],
+            false,
+        ),
+        (
+            &[X64, "--param", "stack-clash-protection-guard-size=12"][..],
+            true,
+        ),
+        (&[A64][..], false),
+        (
+            &[A64, "--param", "stack-clash-protection-guard-size=12"][..],
+            true,
+        ),
+    ] {
+        assert_eq!(warns(extra), want, "{extra:?}");
+    }
+    for (extra, error) in [
+        (
+            &[A64, "--param", "stack-clash-protection-guard-size=13"][..],
+            "only values 12 (4 KB) and 16 (64 KB) are supported for guard size.  \
+             Given value 13 (8 KB) is out of range",
+        ),
+        (
+            &[A64, "--param", "stack-clash-protection-probe-interval=12"][..],
+            "stack clash guard size '16' must be equal to probing interval '12'",
+        ),
+    ] {
+        let r = run(extra);
+        assert!(
+            !r.success && r.stderr.contains(error),
+            "{extra:?}: {}",
+            r.stderr
+        );
+        let mut without: Vec<&str> = extra.to_vec();
+        without.push("-fno-stack-clash-protection");
+        let r = run(&without);
+        assert!(
+            !r.success && r.stderr.contains(error),
+            "{without:?}: {}",
+            r.stderr
+        );
+    }
+}
+
+/// `__GCC_HAVE_DWARF2_CFI_ASM` is defined exactly when gcc 13 defines it:
+/// whenever call frame information is written -- by default on both
+/// targets, with `-fexceptions` or `-g` -- and not when every unwind table
+/// is off and there is no debug information, where aarch64 also needs
+/// `-fno-unwind-tables`. c17 never defined it. `-fno-dwarf2-cfi-asm`, which
+/// has gcc write the tables itself, is refused: c17 cannot.
+#[test]
+fn dwarf2_cfi_asm_macro_matches_gcc() {
+    let (_dir, path) = scratch("cfi.c", "int x;\n");
+    let defined = |extra: &[&str]| {
+        let mut args = vec!["-E", "-dM", path.to_str().unwrap()];
+        args.extend(extra);
+        let r = run_c17(&args);
+        assert!(r.success, "{extra:?}: {}", r.stderr);
+        r.stdout.contains("#define __GCC_HAVE_DWARF2_CFI_ASM 1")
+    };
+    // The x86-64 rows name their target: aarch64 keeps synchronous tables
+    // after -fno-asynchronous-unwind-tables, and Darwin always keeps CFI.
+    const X64: &str = "--target=x86_64-unknown-linux-gnu";
+    const A64: &str = "--target=aarch64-unknown-linux-gnu";
+    const NO_ASYNC: &str = "-fno-asynchronous-unwind-tables";
+    const NO_SYNC: &str = "-fno-unwind-tables";
+    for (extra, want) in [
+        (&[X64][..], true),
+        (&[X64, NO_ASYNC][..], false),
+        (&[X64, NO_ASYNC, NO_SYNC][..], false),
+        (&[X64, NO_ASYNC, NO_SYNC, "-g"][..], true),
+        (&[X64, NO_ASYNC, NO_SYNC, "-g0"][..], false),
+        (&[X64, NO_ASYNC, NO_SYNC, "-fexceptions"][..], true),
+        (&[A64][..], true),
+        (&[A64, NO_ASYNC][..], true),
+        (&[A64, NO_ASYNC, NO_SYNC][..], false),
+        (&[X64, "-fdwarf2-cfi-asm"][..], true),
+    ] {
+        assert_eq!(defined(extra), want, "{extra:?}");
+    }
+    let r = run_c17(&["-c", "-fno-dwarf2-cfi-asm", path.to_str().unwrap()]);
+    assert!(
+        !r.success && r.stderr.contains("'-fno-dwarf2-cfi-asm' is not supported"),
+        "{}",
+        r.stderr
+    );
 }
 
 /// `-fuse-ld=` reaches the link, as gcc's does: a linker that does not
@@ -367,4 +577,235 @@ fn syntax_only_checks_and_writes_nothing() {
         assert!(!out.status.success(), "{bad}");
     }
     assert_eq!(listing(dir.path()), ["t.c"]);
+}
+
+/// `-fgnu89-inline` predefines `__GNUC_GNU_INLINE__` in place of
+/// `__GNUC_STDC_INLINE__`, as gcc does, and the last of it and
+/// `-fno-gnu89-inline` decides. glibc's <sys/cdefs.h> picks its
+/// `__extern_inline` spelling from these.
+#[test]
+fn fgnu89_inline_selects_the_inline_predefine() {
+    let src = "#ifdef __GNUC_GNU_INLINE__\ngnu __GNUC_GNU_INLINE__\n#endif\n\
+               #ifdef __GNUC_STDC_INLINE__\nstdc __GNUC_STDC_INLINE__\n#endif\n";
+    let (_dir, path) = scratch("inl.c", src);
+    let path = path.to_string_lossy();
+    for (flags, want) in [
+        (&[][..], "stdc 1"),
+        (&["-fgnu89-inline"][..], "gnu 1"),
+        (&["-fno-gnu89-inline"][..], "stdc 1"),
+        (&["-fgnu89-inline", "-fno-gnu89-inline"][..], "stdc 1"),
+        (&["-fno-gnu89-inline", "-fgnu89-inline"][..], "gnu 1"),
+    ] {
+        let mut args = vec!["-E", "-P"];
+        args.extend(flags);
+        args.push(&path);
+        let r = run_c17(&args);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        assert_eq!(r.stdout.trim(), want, "{flags:?}");
+    }
+}
+
+/// The `-f` options gcc takes for other languages are taken for C with
+/// gcc's warning, exit status 0: gcc-14's configure probes `-fno-rtti`
+/// with `CC` and puts the answer into its C++ flags. `-w` silences the
+/// warning and `-Werror` makes it an error, as with gcc.
+#[test]
+fn f_options_other_language_options_warn_as_gcc() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for (opt, langs) in [
+        ("-fno-rtti", "C++/D/ObjC++"),
+        ("-frtti", "C++/D/ObjC++"),
+        ("-fno-threadsafe-statics", "C++/ObjC++"),
+        ("-fvisibility-inlines-hidden", "C++/ObjC++"),
+        ("-fno-enforce-eh-specs", "C++/ObjC++"),
+        ("-fno-use-cxa-atexit", "C++/ObjC++"),
+        ("-fno-objc-exceptions", "ObjC/ObjC++"),
+    ] {
+        let r = compile_in(dir.path(), &path, &[opt]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        assert_eq!(
+            r.stderr,
+            format!(
+                "c17: warning: command-line option '{opt}' is valid for {langs} but not for C\n"
+            ),
+            "{opt}"
+        );
+        let r = compile_in(dir.path(), &path, &["-w", opt]);
+        assert!(r.success && r.stderr.is_empty(), "-w {opt}: {}", r.stderr);
+        let r = compile_in(dir.path(), &path, &["-Werror", opt]);
+        assert!(!r.success, "-Werror {opt} passed");
+        assert!(r.stderr.contains("[-Werror]"), "{}", r.stderr);
+    }
+    // gcc 13 takes `-fcheck-new` for C in silence.
+    let r = compile_in(dir.path(), &path, &["-fcheck-new", "-fno-check-new"]);
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+}
+
+/// `--param` names one of gcc 13's tuning parameters, which are taken in
+/// silence; any other name, or a value gcc would refuse, is refused in gcc's
+/// words -- `allow-store-data-races` among them, an `-f` option since gcc 10.
+#[test]
+fn param_names_are_gccs() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for flags in [
+        &["--param=max-inline-insns-single=10"][..],
+        &["--param", "max-inline-insns-single=10"],
+        &["--param=openacc-kernels=decompose"],
+        &["--param=align-threshold=65536", "--param=asan-stack=0"],
+        &["--param", "ssp-buffer-size=4", "-Werror"],
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+    }
+    for (flags, text) in [
+        (
+            &["--param=allow-store-data-races=0"][..],
+            "error: unrecognized command-line option '--param=allow-store-data-races=0'",
+        ),
+        (
+            &["--param", "foo=1"],
+            "error: unrecognized command-line option '--param=foo=1'",
+        ),
+        (
+            &["--param=max-inline-insns-single"],
+            "error: unrecognized command-line option '--param=max-inline-insns-single'",
+        ),
+        (
+            &["--param=max-inline-insns-single="],
+            "error: missing argument to '--param=max-inline-insns-single='",
+        ),
+        (
+            &["--param=max-inline-insns-single=-1"],
+            "error: argument to '--param=max-inline-insns-single=' should be a non-negative integer",
+        ),
+        (
+            &["--param=align-threshold=0"],
+            "error: argument to '--param=align-threshold=' is not between 1 and 65536",
+        ),
+        (
+            &["--param=openacc-kernels=foo"],
+            "error: unrecognized argument in option '--param=openacc-kernels=foo'\n\
+             c17: note: valid arguments to '--param=openacc-kernels=' are: decompose parloops",
+        ),
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(!r.success, "{flags:?}");
+        assert_eq!(r.stderr, format!("c17: {text}\n"), "{flags:?}");
+    }
+}
+
+/// `-fexceptions` predefines gcc's `__EXCEPTIONS`, for C and for a `.S`
+/// alike, the last of `-f[no-]exceptions` deciding; and it is taken in
+/// silence, under `-Werror` too, as an option c17 implements.
+#[test]
+fn fexceptions_defines_exceptions_macro() {
+    let (dir, path) = scratch("m.c", "");
+    let out = dir.path().join("m.i");
+    let src = "#ifdef __EXCEPTIONS\neh __EXCEPTIONS\n#else\nno eh\n#endif\n";
+    for (flags, defined) in [
+        (&[][..], false),
+        (&["-fexceptions"][..], true),
+        (&["-fexceptions", "-fno-exceptions"][..], false),
+        (&["-fno-exceptions", "-fexceptions"][..], true),
+    ] {
+        let mut args = flags.to_vec();
+        args.extend([
+            "-Werror",
+            "-dM",
+            "-E",
+            "-o",
+            out.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ]);
+        let r = run_c17(&args);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+        let defs = std::fs::read_to_string(&out).expect("read -dM output");
+        let eh: String = defs
+            .lines()
+            .filter(|l| l.contains("EXCEPTIONS"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let want = if defined {
+            "#define __EXCEPTIONS 1\n"
+        } else {
+            ""
+        };
+        assert_eq!(eh, want, "{flags:?}");
+        let mut asm_args = flags.to_vec();
+        asm_args.extend(["-x", "assembler-with-cpp"]);
+        let r = preprocess_text("eh", src, &asm_args);
+        assert!(r.success, "{flags:?} .S: {}", r.stderr);
+        let want = if defined { "eh 1" } else { "no eh" };
+        assert!(r.stdout.contains(want), "{flags:?} .S: {}", r.stdout);
+    }
+}
+
+/// `-frandom-seed=` and `-fmerge-all-constants` are taken in silence and
+/// change nothing c17 writes. c17 names nothing at random -- gcc reads the
+/// seed for names it makes up, and libbacktrace builds each object with
+/// `-frandom-seed=$@` so they come out the same every time, which c17's
+/// already do -- and merging constants is a permission c17 never uses:
+/// glibc compiles everything with `-fmerge-all-constants`.
+#[test]
+fn f_options_random_seed_and_merge_all_constants_change_nothing() {
+    let src = "static const int t[] = {1, 2, 3};\nconst char *s(void) { return \"x\"; }\n\
+               int f(int i) { return t[i]; }\n";
+    // Less the lines naming the scratch file, which differs per run.
+    let asm = |flags: &[&str]| -> String {
+        crate::common::asm_for_at("c17_seed_", src, flags)
+            .lines()
+            .filter(|l| !l.contains("c17_seed_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let plain = asm(&["-O2"]);
+    for flags in [
+        &["-frandom-seed=x.lo"][..],
+        &["-frandom-seed=0x1234"],
+        &["-fmerge-all-constants"],
+        &["-fmerge-all-constants", "-frandom-seed=y", "-Werror"],
+    ] {
+        let mut args = flags.to_vec();
+        args.push("-O2");
+        assert_eq!(asm(&args), plain, "{flags:?}");
+    }
+    let (dir, path) = scratch("t.c", CLEAN);
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &["-frandom-seed=x", "-fmerge-all-constants"],
+    );
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+    // `-fexcess-precision=16` rounds each `_Float16` operation to
+    // `_Float16`, which is what c17 does; `standard` and `fast` would keep
+    // the intermediate in `float` (gcc's code for them is the same), which
+    // c17 does not. `float` and `double` have no excess precision on either
+    // target under any of them.
+    let r = compile_in(dir.path(), &path, &["-fexcess-precision=16", "-Werror"]);
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+    for style in ["standard", "fast"] {
+        let flag = format!("-fexcess-precision={style}");
+        let r = compile_in(dir.path(), &path, &[&flag]);
+        assert!(r.success, "{flag}: {}", r.stderr);
+        assert!(
+            r.stderr
+                .contains(&format!("'{flag}' is not supported; ignored")),
+            "{flag}: {}",
+            r.stderr
+        );
+    }
+    let r = compile_in(dir.path(), &path, &["-fexcess-precision=double"]);
+    assert!(!r.success);
+    assert_eq!(
+        r.stderr,
+        "c17: error: unknown excess precision style 'double'\n\
+         c17: note: valid arguments to '-fexcess-precision=' are: 16 fast standard\n"
+    );
+    // gcc's text for a seed left out.
+    let r = compile_in(dir.path(), &path, &["-frandom-seed="]);
+    assert!(!r.success);
+    assert_eq!(
+        r.stderr,
+        "c17: error: missing argument to '-frandom-seed='\n"
+    );
 }

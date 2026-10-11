@@ -26,4 +26,4 @@ pub mod regalloc;
 mod relax;
 mod simd;
 
-pub use macros::{get_darwin_macros, get_macros};
+pub use macros::{get_branch_protection_macros, get_darwin_macros, get_macros};

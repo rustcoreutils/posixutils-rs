@@ -314,6 +314,11 @@ impl Linearizer<'_> {
             return None;
         }
 
+        // A struct is accessed as an integer of its size, which has lost the
+        // address space `emit_atomic_op` asks about.
+        if self.atomic_access_type(typ) != typ {
+            self.refuse_atomic_in_segment(typ);
+        }
         let size_bits = self.types.size_bits(typ);
         let addr = self.linearize_lvalue(expr);
         Some(AtomicLvalue {
@@ -335,6 +340,7 @@ impl Linearizer<'_> {
         value: Option<PseudoId>,
         order: MemoryOrder,
     ) -> PseudoId {
+        self.refuse_atomic_in_segment(lv.elem_typ);
         let target = self.alloc_reg_pseudo();
         let order_val = self.emit_const(order as i128, self.types.int_id);
 
@@ -352,6 +358,18 @@ impl Linearizer<'_> {
         self.emit(insn);
 
         target
+    }
+
+    /// gcc reaches an atomic object in one of x86-64's named address spaces
+    /// through its segment; c17's atomic instructions have no segment to
+    /// carry, so it refuses one rather than reach the generic address.
+    pub(crate) fn refuse_atomic_in_segment(&self, typ: TypeId) {
+        if self.types.address_space(typ) != crate::types::AddressSpace::Generic {
+            diag::error(
+                self.current_pos.unwrap_or_default(),
+                "sorry, unimplemented: an atomic operation in a named address space",
+            );
+        }
     }
 
     /// An atomic read of `lv`, as every ordinary rvalue use of an `_Atomic`
@@ -472,9 +490,10 @@ impl Linearizer<'_> {
         addr: PseudoId,
         exp_addr: PseudoId,
         desired: PseudoId,
-        bits: u32,
+        (elem_typ, bits): (TypeId, u32),
         order: MemoryOrder,
     ) -> PseudoId {
+        self.refuse_atomic_in_segment(elem_typ);
         let ok = self.alloc_reg_pseudo();
         let order_val = self.emit_const(order as i128, self.types.int_id);
         let mut cas = Instruction::new(Opcode::AtomicCas).with_target(ok);
@@ -547,7 +566,7 @@ impl Linearizer<'_> {
         self.emit(Instruction::load(old, exp_addr, 0, elem_typ, bits));
         let new = self.compound_assign_value(ca, old, value);
 
-        let ok = self.emit_atomic_cas(lv.addr, exp_addr, new, bits, order);
+        let ok = self.emit_atomic_cas(lv.addr, exp_addr, new, (elem_typ, bits), order);
 
         let cas_bb = self.current_or_unreachable_bb();
         self.emit(Instruction::cbr(ok, done_bb, loop_bb));

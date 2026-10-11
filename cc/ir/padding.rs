@@ -29,6 +29,7 @@
 use super::linearize::{Linearizer, VmDim};
 use super::{BasicBlockId, Instruction, Opcode, PseudoId};
 use crate::float::FpFormat;
+use crate::ir::Access;
 use crate::parse::ast::Expr;
 use crate::strings::StringId;
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -198,11 +199,11 @@ impl Linearizer<'_> {
         if self.types.kind(pointee) == TypeKind::Function {
             return;
         }
-        let volatile = self.types.contains_volatile(pointee);
+        let access = Access::of(self.types, pointee);
         if self.types.variable_array_levels(pointee) == 0 {
             // A flexible array member was reported by the parser.
             if let Ok(bits) = value_bits(self.types, pointee) {
-                self.emit_padding_ops(base, &padding_ops(&bits), volatile);
+                self.emit_padding_ops(base, &padding_ops(&bits), access);
             }
             return;
         }
@@ -219,7 +220,7 @@ impl Linearizer<'_> {
         let Some(count) = self.vm_extent_product(&dims) else {
             return;
         };
-        self.emit_padding_loop(base, count, bits.len(), &ops, volatile);
+        self.emit_padding_loop(base, count, bits.len(), &ops, access);
     }
 
     /// The extents of the variable length array `ptr` points at, outermost
@@ -253,7 +254,7 @@ impl Linearizer<'_> {
         count: PseudoId,
         elem_size: usize,
         ops: &[PaddingOp],
-        volatile: bool,
+        access: Access,
     ) {
         let ulong = self.types.ulong_id;
         let ptr_type = self.types.char_ptr_id;
@@ -299,7 +300,7 @@ impl Linearizer<'_> {
         self.switch_bb(body_bb);
         let cur = self.alloc_pseudo();
         self.emit(Instruction::load(cur, cursor, 0, ptr_type, 64));
-        self.emit_padding_ops(cur, ops, volatile);
+        self.emit_padding_ops(cur, ops, access);
         let next = self.alloc_pseudo();
         self.emit(Instruction::binop(
             Opcode::Add,
@@ -323,21 +324,21 @@ impl Linearizer<'_> {
     }
 
     /// The stores and masks of `ops`, at the object `base` points at.
-    fn emit_padding_ops(&mut self, base: PseudoId, ops: &[PaddingOp], volatile: bool) {
+    fn emit_padding_ops(&mut self, base: PseudoId, ops: &[PaddingOp], access: Access) {
         let uchar = self.types.uchar_id;
         for op in ops {
             match *op {
                 PaddingOp::Zero { at, len } => {
-                    self.emit_block_zero(base, at as i64, len as i64, volatile);
+                    self.emit_block_zero(base, at as i64, len as i64, access);
                 }
                 PaddingOp::Mask { at, keep } => {
                     let at = at as i64;
                     let byte = self.alloc_pseudo();
-                    self.emit(Instruction::load(byte, base, at, uchar, 8).with_volatile(volatile));
+                    self.emit(Instruction::load(byte, base, at, uchar, 8).with_access(access));
                     let mask = self.emit_const(i128::from(keep), uchar);
                     let kept = self.alloc_pseudo();
                     self.emit(Instruction::binop(Opcode::And, kept, byte, mask, uchar, 8));
-                    self.emit(Instruction::store(kept, base, at, uchar, 8).with_volatile(volatile));
+                    self.emit(Instruction::store(kept, base, at, uchar, 8).with_access(access));
                 }
             }
         }

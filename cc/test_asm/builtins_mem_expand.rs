@@ -66,13 +66,25 @@ fn builtins_mem_expand_no_call_for_small_constant_length() {
 
 #[test]
 fn builtins_mem_expand_keeps_the_call_otherwise() {
+    // Above the limit: not unrolled. x86-64 does a copy or a fill of up to
+    // 8 KB with `rep`, as gcc does; aarch64 calls.
+    for body in [
+        "void f(void *d, const void *s) { memcpy(d, s, 129); }",
+        "void f(void *d) { memset(d, 0, 129); }",
+    ] {
+        let src = format!("{PROTOTYPES}{body}\n");
+        for_each_target("mem_expand_rep", &src, &[], |asm, what| {
+            let called = mentions(asm, "memcpy") || mentions(asm, "memset");
+            assert!(called || asm.contains("rep "), "{what}: unrolled:\n{asm}");
+        });
+    }
     let cases: &[(&str, &str)] = &[
-        // Above the limit.
+        // Above the limit, and x86-64's 8 KB.
         (
             "memcpy",
-            "void f(void *d, const void *s) { memcpy(d, s, 129); }",
+            "void f(void *d, const void *s) { memcpy(d, s, 8193); }",
         ),
-        ("memset", "void f(void *d) { memset(d, 0, 129); }"),
+        ("memset", "void f(void *d) { memset(d, 0, 8193); }"),
         (
             "memmove",
             "void f(void *d, const void *s) { memmove(d, s, 65); }",

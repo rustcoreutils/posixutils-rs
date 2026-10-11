@@ -10,7 +10,7 @@
 //
 
 use crate::test_compile::{
-    compile_expect_error, compile_expect_no_diagnostic, compile_expect_warning,
+    compile_expect_error, compile_expect_no_diagnostic, compile_expect_warning, compile_rejected,
 };
 
 // ============================================================================
@@ -584,20 +584,22 @@ fn builtins_bit_ops_check_their_argument() {
         ("ffs", "__builtin_ffs(s)", "int"),
     ] {
         let builtin = call.split('(').next().unwrap();
-        compile_expect_error(
+        let stderr = compile_rejected(
             &format!("bit_ops_struct_{name}"),
             &format!("struct S {{ int a; }};\nint f(struct S s) {{ return {call}; }}\n"),
-            &format!(
-                "incompatible type for argument 1 of '{builtin}': \
-                 expected '{param}', got 'struct S'"
-            ),
         );
+        for want in [
+            format!("error: incompatible type for argument 1 of '{builtin}'\n"),
+            format!("note: expected '{param}' but argument is of type 'struct S'\n"),
+        ] {
+            assert!(stderr.contains(&want), "{want:?} in:\n{stderr}");
+        }
     }
     compile_expect_warning(
         "bit_ops_pointer",
         "int f(unsigned *p) { return __builtin_popcount(p); }\n",
-        "passing argument 1 of '__builtin_popcount' as 'unsigned int' from 'unsigned int *' \
-         makes integer from pointer without a cast",
+        "passing argument 1 of '__builtin_popcount' makes integer from pointer without a cast \
+         [-Wint-conversion]",
     );
 }
 
@@ -722,7 +724,7 @@ fn builtins_assume_aligned_warns_as_a_call_does() {
         (
             "assume_aligned_volatile",
             "__builtin_assume_aligned(v, 16)",
-            "discards a qualifier from the pointer target type",
+            "discards 'volatile' qualifier from pointer target type",
         ),
     ] {
         let code = format!(

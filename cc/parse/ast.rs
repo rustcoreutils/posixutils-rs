@@ -11,7 +11,7 @@
 //
 
 use crate::diag::Position;
-use crate::float::{FloatVal, IntegralRounding};
+use crate::float::{FloatVal, IntegerRounding, IntegralRounding};
 use crate::strings::StringId;
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
@@ -80,6 +80,11 @@ pub enum InlineLibraryFn {
     /// `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint` and their `f`
     /// forms: the integer the argument rounds to, at the expression's type.
     RoundToIntegral(IntegralRounding),
+    /// `lrint`, `llrint`, `lround`, `llround` and their `f` forms: the
+    /// argument rounded to an integer of the call's type. Computed in place
+    /// only under `-fno-math-errno`: an argument out of range is a domain
+    /// error (C17 7.12.9.5p2, 7.12.9.7p2).
+    RoundToInteger(IntegerRounding),
     /// `fmin`, `fminf`: the smaller argument, a NaN one ignored.
     FMin,
     /// `fmax`, `fmaxf`: the larger argument, a NaN one ignored.
@@ -167,6 +172,37 @@ impl ObjectSizeType {
     }
 }
 
+/// Which of the two object-size builtins asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectSizeForm {
+    /// `__builtin_object_size`: a constant, or the unknown answer.
+    Static,
+    /// `__builtin_dynamic_object_size`: also a size known only at run time
+    /// -- `malloc(n)` is `n` bytes -- computed where the builtin is.
+    Dynamic,
+}
+
+/// `alloc_size(i)` or `alloc_size(i, j)`, and what gcc knows of `malloc`,
+/// `calloc` and `realloc`: a call returns a pointer to an object of as many
+/// bytes as an argument says, or as the product of two. Indices count from
+/// 0, where the attribute counts from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocSize {
+    /// The argument holding the size, or the element size of a product.
+    pub size: usize,
+    /// The argument holding the element count, for a product.
+    pub count: Option<usize>,
+}
+
+/// `access(mode, ref, size)`: the pointer parameter `ptr` points to an
+/// object of at least as many elements of its pointee type as parameter
+/// `size` holds. Indices count from 0, where the attribute counts from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessSize {
+    pub ptr: usize,
+    pub size: usize,
+}
+
 /// A library function whose call stays a call, but whose result the
 /// optimizer may know from its arguments (C17 7.1.4p1): `strlen("abc")` is 3,
 /// `strchr(s, 0)` is `s + strlen(s)`.
@@ -214,6 +250,11 @@ pub enum LibFn {
     Putchar,
     Fputc,
     Fwrite,
+    Malloc,
+    Calloc,
+    Realloc,
+    Strdup,
+    Strndup,
     /// libgcc's `__mul?c3`, which a floating complex `*` calls, for the
     /// format its arguments are in. No program names it: the linearizer
     /// makes the call (`emit_complex_float_muldiv`), so it has no row in the
@@ -258,6 +299,9 @@ pub enum LibFamily {
     /// A `_chk` function that checks a write against the size of the object
     /// written to, and is the plain function where the write provably fits.
     Fortified,
+    /// A function that returns a new object, whose size
+    /// `__builtin_dynamic_object_size` knows from the arguments.
+    Allocation,
 }
 
 impl LibFn {
@@ -310,6 +354,7 @@ impl LibFn {
             | L::SnprintfChk
             | L::VsprintfChk
             | L::VsnprintfChk => LibFamily::Fortified,
+            L::Malloc | L::Calloc | L::Realloc | L::Strdup | L::Strndup => LibFamily::Allocation,
         }
     }
 
@@ -317,6 +362,18 @@ impl LibFn {
     /// leaves every object as it found it.
     pub fn only_reads(self) -> bool {
         self.family() == LibFamily::StringQuery
+    }
+
+    /// The `alloc_size` the function has whatever its declaration says, as
+    /// gcc knows it: `malloc(n)`, `calloc(n, m)`, `realloc(p, n)`.
+    pub fn alloc_size(self) -> Option<AllocSize> {
+        let (size, count) = match self {
+            LibFn::Malloc => (0, None),
+            LibFn::Calloc => (0, Some(1)),
+            LibFn::Realloc => (1, None),
+            _ => return None,
+        };
+        Some(AllocSize { size, count })
     }
 
     /// The function's name in C, which a call an optimizer pass makes to it
@@ -358,6 +415,11 @@ impl LibFn {
             L::Putchar => "putchar",
             L::Fputc => "fputc",
             L::Fwrite => "fwrite",
+            L::Malloc => "malloc",
+            L::Calloc => "calloc",
+            L::Realloc => "realloc",
+            L::Strdup => "strdup",
+            L::Strndup => "strndup",
             L::MemcpyChk => "__memcpy_chk",
             L::MempcpyChk => "__mempcpy_chk",
             L::MemmoveChk => "__memmove_chk",
@@ -389,7 +451,8 @@ impl InlineLibraryFn {
             | InlineLibraryFn::ComplexImag
             | InlineLibraryFn::Conjugate
             | InlineLibraryFn::Sqrt(_)
-            | InlineLibraryFn::RoundToIntegral(_) => 1,
+            | InlineLibraryFn::RoundToIntegral(_)
+            | InlineLibraryFn::RoundToInteger(_) => 1,
         }
     }
 
@@ -439,6 +502,7 @@ impl InlineLibraryFn {
             self,
             InlineLibraryFn::Sqrt(_)
                 | InlineLibraryFn::RoundToIntegral(_)
+                | InlineLibraryFn::RoundToInteger(_)
                 | InlineLibraryFn::FMin
                 | InlineLibraryFn::FMax
                 | InlineLibraryFn::Fma
@@ -526,6 +590,23 @@ impl BinaryOp {
             BinaryOp::Shr => ">>",
         }
     }
+}
+
+/// The instruction a [`ExprKind::MachineBuiltin`] is, as gcc 13 emits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineOp {
+    /// `__builtin_ia32_rdtsc()`: `rdtsc`, the time-stamp counter as an
+    /// `unsigned long long`.
+    Rdtsc,
+    /// `__builtin_ia32_rdtscp(unsigned *aux)`: `rdtscp`, the counter, with
+    /// `IA32_TSC_AUX` stored through `aux`.
+    Rdtscp,
+    /// `__builtin_ia32_cvtpd2ps(v2df)`: `cvtpd2ps`, both `double` lanes
+    /// rounded to `float` in the current direction, the upper two lanes 0.
+    Cvtpd2ps,
+    /// `__builtin_thread_pointer()`: the TLS ABI's thread pointer, `%fs:0`
+    /// on x86-64 and `tpidr_el0` on aarch64.
+    ThreadPointer,
 }
 
 /// Which classification question a [`ExprKind::FpTest`] asks.
@@ -954,6 +1035,18 @@ pub enum ExprKind {
         elements: Vec<InitElement>,
     },
 
+    /// The value of a GNU index range, `[lo ... hi] = value`, whose
+    /// evaluation has an effect. The range initializes every element it
+    /// covers with a copy of this node, and gcc evaluates the value once:
+    /// so does the linearizer, at the first copy the initialization keeps,
+    /// every other copy with the same `id` reading that one result. A copy
+    /// a later designator replaces is never evaluated, as in gcc.
+    RangeValue {
+        /// Shared by the copies of one range's value, unique otherwise.
+        id: u32,
+        value: Box<Expr>,
+    },
+
     // =========================================================================
     // GNU Statement Expressions
     // =========================================================================
@@ -1023,9 +1116,14 @@ pub enum ExprKind {
     /// answers it after inlining and propagation, at `-O1` and above, so it
     /// is deferred to `ir::objsize`; at `-O0` the parser answers it
     /// [`ObjectSizeType::unknown`] at once, as gcc does.
+    ///
+    /// `__builtin_dynamic_object_size` is deferred at every level: at `-O0`
+    /// gcc still answers a fixed-size object at a run-time offset, which only
+    /// the IR shows.
     ObjectSize {
         ptr: Box<Expr>,
         otype: ObjectSizeType,
+        form: ObjectSizeForm,
     },
 
     /// __builtin_va_copy(dest, src)
@@ -1269,10 +1367,22 @@ pub enum ExprKind {
     /// Used for optimization hints and silencing warnings.
     Unreachable,
 
+    /// `__builtin_trap()`: abnormal termination by the target's trap
+    /// instruction, never a library call. Does not return.
+    Trap,
+
     /// `__builtin_unwind_init()`: every callee-saved register is saved in
     /// the current function's frame, so a scan of the stack sees what the
     /// callers held in them -- a conservative collector's register flush.
     UnwindInit,
+
+    /// A builtin that is one machine instruction: `__builtin_ia32_rdtsc()`
+    /// and the rest of [`MachineOp`]. `args` have been checked and
+    /// converted to the builtin's parameter types.
+    MachineBuiltin {
+        op: MachineOp,
+        args: Vec<Expr>,
+    },
 
     /// __builtin_complex(real, imag) — construct complex value from two reals
     /// `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` and
@@ -1313,30 +1423,29 @@ pub enum ExprKind {
     },
 
     // =========================================================================
-    // setjmp/longjmp (non-local jumps)
+    // gcc's non-local goto: `__builtin_setjmp` / `__builtin_longjmp`
     // =========================================================================
-    /// setjmp(env)
-    /// Saves the current execution context in env.
-    /// Returns 0 on direct call, non-zero when returning via longjmp.
+    /// `__builtin_setjmp(env)`: inline code over a five-word buffer holding
+    /// the frame pointer, the resume address and the stack pointer. 0 on the
+    /// direct return, 1 when `__builtin_longjmp` resumes it. Nothing else is
+    /// saved, so the function containing it assumes every register is lost
+    /// when control resumes there, and saves every callee-saved register in
+    /// its prologue.
+    ///
+    /// The library's `setjmp` family is not this: those are calls of the
+    /// function the program names, which return twice.
     Setjmp {
-        /// The jmp_buf to save the context to
+        /// The buffer to save the context to
         env: Box<Expr>,
-        /// The library's `setjmp`, or gcc's `__builtin_setjmp`.
-        kind: JmpKind,
     },
 
-    /// longjmp(env, val)
-    /// Restores the execution context saved in env.
-    /// Causes the corresponding setjmp to return val (or 1 if val == 0).
-    /// This function never returns (noreturn).
+    /// `__builtin_longjmp(env, 1)`: resume the `__builtin_setjmp` that
+    /// filled `env`. Never returns.
     Longjmp {
-        /// The jmp_buf containing the saved context
+        /// The buffer the context was saved to
         env: Box<Expr>,
-        /// The value to return from setjmp (1 if 0 is passed)
+        /// Always the constant 1, which the parser checked.
         val: Box<Expr>,
-        /// The library's `longjmp`, or gcc's `__builtin_longjmp`, whose
-        /// `val` is always the constant 1.
-        kind: JmpKind,
     },
 
     // =========================================================================
@@ -1679,6 +1788,15 @@ pub fn designated_span(
     };
     let end = ObjectWalk::new(types, elements).slot_end(start, &slot, rest, None);
     start..end.max((start + 1).min(elements.len()))
+}
+
+/// The designator naming the first subobject of `typ` a positional
+/// element lands in -- index 0 of an array, the first initializable member
+/// of a structure or union -- or `None` for a type with none.
+pub fn first_subobject(types: &TypeTable, typ: TypeId) -> Option<Designator> {
+    ObjectWalk::new(types, &[])
+        .positional(typ, 0)
+        .map(|slot| slot.name)
 }
 
 /// Where the brace list `elements`, initializing an object of type `typ`,
@@ -2208,24 +2326,6 @@ pub enum CalleeBinding {
     Library,
 }
 
-/// Which non-local jump a `setjmp`/`longjmp` pair is.
-///
-/// The two never mix: a buffer one fills only the other's partner reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum JmpKind {
-    /// The C library's `setjmp`/`longjmp` (and `_setjmp`/`_longjmp`): a call,
-    /// which saves the callee-saved registers and whatever else the library
-    /// keeps in a `jmp_buf`.
-    #[default]
-    Library,
-    /// gcc's `__builtin_setjmp`/`__builtin_longjmp`: inline code over a
-    /// five-word buffer holding the frame pointer, the resume address and
-    /// the stack pointer. Nothing else is saved, so the function containing
-    /// the setjmp assumes every register is lost when control resumes there,
-    /// and saves every callee-saved register in its prologue.
-    Builtin,
-}
-
 // Inline Assembly Support (GCC Extended Asm)
 
 /// An operand in an inline assembly statement
@@ -2522,12 +2622,14 @@ impl Expr {
             | K::VaArgPack
             | K::VaArgPackLen
             | K::Unreachable
+            | K::Trap
             | K::UnwindInit
             | K::StackSave
             | K::FrameAddress { .. }
             | K::ReturnAddress { .. }
             | K::OffsetOf { .. } => Vec::new(),
             K::StmtExpr { result, .. } => vec![result],
+            K::RangeValue { value, .. } => vec![value],
             K::ConvertVector { value } => vec![value],
             K::VectorShuffle {
                 first,
@@ -2666,7 +2768,8 @@ impl Expr {
             K::Call { func, args, .. } => std::iter::once(&**func).chain(args).collect(),
             K::Comma(exprs)
             | K::SizeofType(_, exprs)
-            | K::InlineLibraryCall { args: exprs, .. } => exprs.iter().collect(),
+            | K::InlineLibraryCall { args: exprs, .. }
+            | K::MachineBuiltin { args: exprs, .. } => exprs.iter().collect(),
             K::FpClassify { classes, arg } => {
                 classes.iter().chain(std::iter::once(&**arg)).collect()
             }
@@ -2792,6 +2895,54 @@ pub struct SymbolAttrs {
     /// and drops it with a warning from anything else, so no symbol is ever
     /// emitted carrying it.
     pub cleanup: Option<SymbolId>,
+    /// `uninitialized`: an automatic variable `-ftrivial-auto-var-init`
+    /// leaves as C does, uninitialized.
+    pub uninitialized: bool,
+    /// `warning("msg")` and `error("msg")`: what to say of each call to the
+    /// function that survives optimization. Carried with the symbol's
+    /// attributes because, as in gcc, one written on any declaration of the
+    /// name -- before or after a call, at block scope too -- applies to every
+    /// call; `opt::report_attribute_calls` reads them.
+    pub call_diagnostics: CallDiagnostics,
+    /// `tls_model("...")`: the access model of a thread-local, which gcc
+    /// uses whatever the code could prove and whatever `-ftls-model=` says
+    /// (`ir::Module::tls_model`).
+    pub tls_model: Option<crate::target::TlsModel>,
+    /// `retain`: the definition goes in a section of its own, or the one
+    /// it names, marked `SHF_GNU_RETAIN` so `ld --gc-sections` keeps it.
+    /// ELF only.
+    pub retain: bool,
+    /// `alloc_size(...)`: how big the object a call returns is, which
+    /// `__builtin_dynamic_object_size` answers (`ir::objsize`). Carried with
+    /// the symbol's attributes for the reason `call_diagnostics` is.
+    pub alloc_size: Option<AllocSize>,
+    /// `access(mode, ref, size)` with a size: how big the objects the
+    /// function's pointer parameters point to are, which
+    /// `__builtin_dynamic_object_size` answers inside it.
+    pub access: Vec<AccessSize>,
+}
+
+/// The messages gcc's `error` and `warning` function attributes attach to
+/// every call of the function that survives optimization.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallDiagnostics {
+    /// `error("msg")`: each such call is an error.
+    pub error: Option<String>,
+    /// `warning("msg")`: each such call is a warning, `-Wattribute-warning`.
+    pub warning: Option<String>,
+}
+
+impl CallDiagnostics {
+    /// Fold in another declaration's: a later message replaces an earlier
+    /// one, as a later attribute does in gcc.
+    pub fn merge(&mut self, other: &CallDiagnostics) {
+        if other.error.is_some() {
+            self.error = other.error.clone();
+        }
+        if other.warning.is_some() {
+            self.warning = other.warning.clone();
+        }
+    }
 }
 
 /// How a name declared with `alias` or `ifunc` is bound to the symbol its
@@ -2836,6 +2987,20 @@ impl SymbolAttrs {
         }
         if other.cleanup.is_some() {
             self.cleanup = other.cleanup;
+        }
+        self.uninitialized |= other.uninitialized;
+        self.call_diagnostics.merge(&other.call_diagnostics);
+        if other.tls_model.is_some() {
+            self.tls_model = other.tls_model;
+        }
+        self.retain |= other.retain;
+        if other.alloc_size.is_some() {
+            self.alloc_size = other.alloc_size;
+        }
+        for &a in &other.access {
+            if !self.access.contains(&a) {
+                self.access.push(a);
+            }
         }
     }
 }
@@ -3018,6 +3183,21 @@ pub struct FunctionAttrs {
     /// `weak`, `used`, `section(...)`, `visibility(...)` -- how the symbol is
     /// emitted, as opposed to how the body is compiled.
     pub symbol: SymbolAttrs,
+    /// `indirect_branch(...)` and `function_return(...)`.
+    pub branches: crate::machine::BranchAttrs,
+    /// `patchable_function_entry(...)` and `zero_call_used_regs(...)`.
+    pub shape: crate::target::ShapeAttrs,
+    /// `__attribute__((flatten))`: when optimizing, every call in the body
+    /// is inlined, and every call in what is inlined, where the callee can
+    /// be.
+    pub flatten: bool,
+    /// `__attribute__((noipa))`: no caller learns anything from the body --
+    /// it is never inlined, and no effect is inferred from it.
+    pub noipa: bool,
+    /// `__attribute__((no_caller_saved_registers))` (x86-64): the function
+    /// preserves every general register it changes, the call-clobbered
+    /// ones included.
+    pub saves_all_registers: bool,
     /// `__attribute__((noinline))` -- never inline this function.
     pub noinline: bool,
     /// `__attribute__((always_inline))` -- inline this function at every call
@@ -3045,6 +3225,9 @@ pub struct FunctionAttrs {
     /// function rather than into it. Recorded so `__has_attribute` can answer
     /// for it; c17 emits no such debug annotation.
     pub artificial: bool,
+    /// `__attribute__((no_instrument_function))`: no `-pg` call to the
+    /// profiler at this function's entry.
+    pub no_instrument: bool,
     /// `__attribute__((pure))` or `((const))`, as the programmer's promise.
     ///
     /// A promise, not a derivation: it is seeded *fixed* into the inference
@@ -3058,8 +3241,19 @@ pub struct FunctionAttrs {
     /// `__attribute__((noreturn))`. What a call site reads is the function
     /// *type*'s `noreturn`, which the declarator is given from this.
     pub noreturn: bool,
+    /// `__attribute__((returns_twice))`. Like `noreturn`, what a call site
+    /// reads is the function *type*'s, which the declarator is given from
+    /// this.
+    pub returns_twice: bool,
+    /// `__attribute__((nothrow))`, which, like `noreturn`, a call site reads
+    /// off the function *type*.
+    pub nothrow: bool,
     /// `__attribute__((stack_protect))` or `((no_stack_protector))`.
     pub stack_protect: StackProtectAttr,
+    /// The stack-protector level `__attribute__((optimize("...")))` sets for
+    /// this function in place of the command line's: glibc's
+    /// `optimize("-fno-stack-protector")`, say. `None` if it names none.
+    pub stack_protector: Option<crate::target::StackProtector>,
     /// `__attribute__((target("...")))`: the ISA this function alone is
     /// compiled for, relative to the translation unit's.
     pub target: Option<crate::target::IsaRequest>,
@@ -3067,6 +3261,10 @@ pub struct FunctionAttrs {
     /// `default` this function is compiled as, dispatched by a resolver.
     /// `None` when there is nothing to dispatch.
     pub clones: Option<crate::target_attr::TargetClones>,
+    /// The attributes written that only a function may carry, each with
+    /// where its list is: a declarator that declares no function ignores
+    /// them with gcc's diagnostic (`Parser::drop_fn_decl_attrs`).
+    pub function_only: Vec<(&'static str, crate::diag::Position)>,
 }
 
 impl FunctionAttrs {
@@ -3096,6 +3294,7 @@ impl FunctionAttrs {
         self.always_inline |= other.always_inline;
         self.gnu_inline |= other.gnu_inline;
         self.artificial |= other.artificial;
+        self.no_instrument |= other.no_instrument;
         // The cleanest claim wins: the attribute may be on the prototype,
         // the definition, or both, and each spelling is a promise.
         self.effect = self.effect.min(other.effect);
@@ -3109,11 +3308,22 @@ impl FunctionAttrs {
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
         self.noreturn |= other.noreturn;
+        self.returns_twice |= other.returns_twice;
+        self.nothrow |= other.nothrow;
         // The first declaration's wins; see `Parser::merge_fn_attrs`.
         self.stack_protect = self
             .stack_protect
             .combine(other.stack_protect)
             .unwrap_or_else(|kept| kept);
+        self.branches.merge(other.branches);
+        self.shape.merge(other.shape);
+        self.flatten |= other.flatten;
+        self.noipa |= other.noipa;
+        self.saves_all_registers |= other.saves_all_registers;
+        // A later `optimize` level replaces an earlier one, as gcc's does.
+        if other.stack_protector.is_some() {
+            self.stack_protector = other.stack_protector;
+        }
         // A later declaration's ISA request replaces an earlier one's.
         if other.target.is_some() {
             self.target = other.target.clone();
@@ -3121,6 +3331,8 @@ impl FunctionAttrs {
         if other.clones.is_some() {
             self.clones = other.clones.clone();
         }
+        self.function_only
+            .extend(other.function_only.iter().copied());
     }
 }
 

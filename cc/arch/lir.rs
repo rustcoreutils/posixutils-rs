@@ -425,6 +425,82 @@ pub fn plan_pair_move(first_clobbers_second: bool, second_clobbers_first: bool) 
     }
 }
 
+/// One step of a parallel move, in the order [`plan_parallel_moves`] gives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoveStep<R> {
+    /// Perform move `index`. `from` is the register its value is in now --
+    /// not necessarily the one it was planned from, once a swap has moved it
+    /// -- or `None` for a source no move writes.
+    Move { index: usize, from: Option<R> },
+    /// Exchange the contents of two registers.
+    Swap(R, R),
+}
+
+/// Order moves that must happen as though all at once -- the operands an
+/// inline asm wants in named registers, each of which may be another's
+/// source.
+///
+/// `moves[i]` is `(destination, source)`: the destination register, or
+/// `None` for memory, which no other move reads; the source register, or
+/// `None` for a source no move can overwrite (memory, a constant). Moved in
+/// the order written, `mov %rsi, %rdi; mov %rdi, %rsi` handed both operands
+/// the same value. A move is made only once nothing still pending reads its
+/// destination, a move whose source is its destination is dropped, and a
+/// cycle, which has no such order, is broken with a swap.
+pub fn plan_parallel_moves<R: Copy + Eq>(moves: &[(Option<R>, Option<R>)]) -> Vec<MoveStep<R>> {
+    let mut pending: Vec<(usize, Option<R>, Option<R>)> = moves
+        .iter()
+        .enumerate()
+        .map(|(i, &(dst, src))| (i, dst, src))
+        .collect();
+    let mut steps = Vec::with_capacity(moves.len());
+    loop {
+        pending.retain(|&(_, dst, src)| dst.is_none() || dst != src);
+        if pending.is_empty() {
+            return steps;
+        }
+        let read_by_another = |k: usize, pending: &[(usize, Option<R>, Option<R>)]| {
+            let dst = pending[k].1;
+            dst.is_some()
+                && pending
+                    .iter()
+                    .enumerate()
+                    .any(|(j, m)| j != k && m.2 == dst)
+        };
+        if let Some(k) = (0..pending.len()).find(|&k| !read_by_another(k, &pending)) {
+            let (index, _, from) = pending.remove(k);
+            steps.push(MoveStep::Move { index, from });
+            continue;
+        }
+        // Every destination is still to be read: the moves form at least
+        // one cycle. Walk from any move to a move reading its destination
+        // until one repeats; that one is on a cycle, and every move on a
+        // cycle reads a register.
+        let mut seen = vec![false; pending.len()];
+        let mut k = 0;
+        while !seen[k] {
+            seen[k] = true;
+            let dst = pending[k].1;
+            k = (0..pending.len())
+                .find(|&j| j != k && pending[j].2 == dst)
+                .expect("every pending destination is read");
+        }
+        let (_, dst, src) = pending.remove(k);
+        let (Some(d), Some(s)) = (dst, src) else {
+            unreachable!("a move on a cycle is register to register")
+        };
+        steps.push(MoveStep::Swap(d, s));
+        // The swap made this move, and left what `d` held in `s`.
+        for m in &mut pending {
+            if m.2 == Some(d) {
+                m.2 = Some(s);
+            } else if m.2 == Some(s) {
+                m.2 = Some(d);
+            }
+        }
+    }
+}
+
 // Complex Type Helpers
 
 /// How many SSE registers a complex argument occupies under System V AMD64.
@@ -821,6 +897,21 @@ pub enum WeakKind {
     Reference,
 }
 
+/// The ELF flags of a section the program named, as one unit's definitions
+/// in it decide them together (see `CodeGenBase::plan_named_sections`).
+/// Ordered by what a section shared by several must give way to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SectionFlags {
+    /// `"a"`: read-only data.
+    ReadOnly,
+    /// `"aw"`: data, or read-only data the loader must relocate first.
+    Writable,
+    /// `"awT"`: thread-local data.
+    ThreadLocal,
+    /// `"ax"`: code.
+    Code,
+}
+
 /// Assembler directives that are common across architectures.
 /// These control the assembler behavior, emit data, or provide metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -856,14 +947,15 @@ pub enum Directive {
     /// `__attribute__((section("...")))`, instead of the one the object's
     /// contents would have chosen.
     ///
-    /// `executable` says whether code or data is going there, because ELF
-    /// needs the flags spelled out and they differ: `"ax"` against `"aw"`.
-    /// Getting it wrong is not cosmetic -- a function in a non-executable
-    /// section segfaults when called.
+    /// `flags` says what is going there, because ELF needs the flags spelled
+    /// out and they differ: `"ax"` against `"aw"`. Getting it wrong is not
+    /// cosmetic -- a function in a non-executable section segfaults when
+    /// called. `retain` adds `SHF_GNU_RETAIN`, `R`, which `ld --gc-sections`
+    /// never drops: the `retain` attribute.
     NamedSection {
         name: String,
-        executable: bool,
-        writable: bool,
+        flags: SectionFlags,
+        retain: bool,
     },
 
     /// Mark a symbol weak: another definition overrides it, and an
@@ -908,6 +1000,17 @@ pub enum Directive {
     /// (`.fini_array` on ELF, `__DATA,__mod_term_func` on Mach-O).
     FiniArray(Option<u16>),
 
+    /// Switch to the section of the LSDAs, which the personality routine
+    /// reads (`.gcc_except_table` on ELF, `__TEXT,__gcc_except_tab` on
+    /// Mach-O).
+    GccExceptTable,
+
+    /// ELF only: switch to the writable section of the COMDAT group named
+    /// for `sym`, which holds `sym` alone, so that the linker keeps one copy
+    /// of it for every object that defines it (`.data.rel.local.<sym>`, as
+    /// gcc names the one for `DW.ref.__gcc_personality_v0`).
+    ComdatData(Symbol),
+
     // ========================================================================
     // Symbol Visibility and Attributes
     // ========================================================================
@@ -943,12 +1046,21 @@ pub enum Directive {
     /// and emits no common symbols at all.
     BssGlobal { sym: Symbol, size: u64, align: u32 },
 
+    /// `.comm sym,size,align`: a common symbol, `-fcommon`'s tentative
+    /// definition, which the linker merges with every other definition of
+    /// the name. ELF only; the alignment is in bytes.
+    Comm { sym: Symbol, size: u64, align: u32 },
+
     // ========================================================================
     // Alignment
     // ========================================================================
     /// .p2align power (macOS) or .align bytes (Linux)
     /// Stores power of 2, emits appropriately for platform
     Align(u32),
+
+    /// `.p2align log,,max_skip`: align to `1 << log` unless that takes more
+    /// than `max_skip` bytes of padding -- gcc's `-falign-functions=N:M`.
+    AlignMax { log: u32, max_skip: u32 },
 
     // ========================================================================
     // Data Emission
@@ -1028,12 +1140,39 @@ pub enum Directive {
     /// .cfi_restore_state - pop the rules the last remember pushed
     CfiRestoreState,
 
+    /// `.cfi_window_save`, which on aarch64 is
+    /// `DW_CFA_AARCH64_negate_ra_state`: the return address in x30 has just
+    /// been signed, or authenticated. gcc's spelling of it.
+    CfiWindowSave,
+
+    /// `.cfi_b_key_frame`: the procedure signs its return address with the
+    /// B key, which the unwinder must use to authenticate it.
+    CfiBKeyFrame,
+
+    /// `.cfi_personality encoding, sym`: the routine the unwinder calls for
+    /// the procedure's frames, encoded as `encoding` says (`arch::eh`).
+    CfiPersonality { encoding: u8, sym: Symbol },
+
+    /// `.cfi_lsda encoding, sym`: the procedure's LSDA, which the personality
+    /// routine reads.
+    CfiLsda { encoding: u8, sym: Symbol },
+
+    /// `.cfi_GNU_args_size n`: from here, the stack pointer sits `n` bytes
+    /// of outgoing arguments below where a landing pad expects it.
+    CfiGnuArgsSize(i64),
+
     // ========================================================================
     // Debug Information
     // ========================================================================
-    /// .file index "path" - declare source file for debug info. `path` is
-    /// the file's name as text; emission escapes it.
-    File { index: u32, path: String },
+    /// .file index ["dir"] "path" - declare source file for debug info.
+    /// `path` is the file's name as text; emission escapes it. A `dir` is
+    /// written as its own operand: entry 0, the compilation directory and
+    /// primary source, takes that form.
+    File {
+        index: u32,
+        dir: Option<String>,
+        path: String,
+    },
 
     /// .loc file line column - source location for debug info
     Loc { file: u32, line: u32, col: u32 },
@@ -1053,6 +1192,9 @@ pub enum Directive {
 
     /// .uleb128 value - unsigned LEB128 encoding for DWARF
     Uleb128(u64),
+    /// `.uleb128 end-start`: the distance between two labels, which the
+    /// assembler resolves -- an LSDA call-site entry.
+    Uleb128Diff { end: Symbol, start: Symbol },
     /// A signed LEB128 -- DWARF location expressions take frame offsets this way.
     Sleb128(i64),
 
@@ -1081,6 +1223,14 @@ pub enum Directive {
     /// emits falls through or reaches by fixed offset from one non-private
     /// symbol into the next: every label it invents is `L`-private.
     UnitEnd,
+
+    /// The ELF `.note.gnu.property` of a unit built for branch or return
+    /// protection, in gcc's layout: one property, the architecture's
+    /// `FEATURE_1_AND` -- x86-64's for CET (IBT 1, SHSTK 2), aarch64's for
+    /// BTI (1) and PAC (2) -- holding these bits. The linker keeps a bit in
+    /// the output only if every object has it, and the loader enables only
+    /// what the output says.
+    FeatureNote(u32),
 
     /// A file-scope asm's text, written exactly as the source gave it and
     /// ended with a newline, as gcc writes it.
@@ -1196,6 +1346,7 @@ impl Directive {
     pub fn file(index: u32, path: impl Into<String>) -> Self {
         Directive::File {
             index,
+            dir: None,
             path: path.into(),
         }
     }
@@ -1245,8 +1396,8 @@ impl EmitAsm for Directive {
             },
             Directive::NamedSection {
                 name,
-                executable,
-                writable,
+                flags,
+                retain,
             } => match target.os {
                 // Mach-O names a segment and a section together, and the
                 // program supplies both -- `section("__DATA,__mine")`.
@@ -1263,14 +1414,16 @@ impl EmitAsm for Directive {
                         // Read-only data asked for a named section is still
                         // read-only: spelling it "aw" put it in a writable
                         // segment and lost its page protection.
-                        let flags = if *executable {
-                            "ax"
-                        } else if *writable {
-                            "aw"
-                        } else {
-                            "a"
+                        let r = if *retain { "R" } else { "" };
+                        let flags = match flags {
+                            SectionFlags::Code => format!("\"ax{r}\""),
+                            SectionFlags::ReadOnly => format!("\"a{r}\""),
+                            SectionFlags::Writable => format!("\"aw{r}\""),
+                            // Without `T` a thread-local symbol in it is
+                            // an assembler error.
+                            SectionFlags::ThreadLocal => format!("\"awT{r}\",@progbits"),
                         };
-                        let _ = writeln!(out, ".section {},\"{}\"", name, flags);
+                        let _ = writeln!(out, ".section {},{}", name, flags);
                     }
                 }
             },
@@ -1380,6 +1533,21 @@ impl EmitAsm for Directive {
             Directive::FiniArray(priority) => {
                 emit_init_array_section(out, target, ".fini_array", "__mod_term_func", *priority)
             }
+            Directive::GccExceptTable => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".section __TEXT,__gcc_except_tab");
+                }
+                Os::Linux | Os::FreeBSD => {
+                    let _ = writeln!(out, ".section .gcc_except_table,\"a\",@progbits");
+                }
+            },
+            Directive::ComdatData(sym) => {
+                let name = sym.format_for_target(target);
+                let _ = writeln!(
+                    out,
+                    ".section .data.rel.local.{name},\"awG\",@progbits,{name},comdat"
+                );
+            }
 
             // Symbol visibility
             Directive::Global(sym) => {
@@ -1447,6 +1615,15 @@ impl EmitAsm for Directive {
                     }
                 }
             }
+            Directive::Comm { sym, size, align } => {
+                let _ = writeln!(
+                    out,
+                    ".comm {},{},{}",
+                    sym.format_for_target(target),
+                    size,
+                    align
+                );
+            }
             Directive::BssLocal { sym, size, align } => match target.os {
                 Os::MacOS => {
                     // .zerofill SEG,SECT,name,size,align_log2
@@ -1493,6 +1670,9 @@ impl EmitAsm for Directive {
             // directive has always carried.
             Directive::Align(power) => {
                 let _ = writeln!(out, ".p2align {}", power);
+            }
+            Directive::AlignMax { log, max_skip } => {
+                let _ = writeln!(out, ".p2align {log},,{max_skip}");
             }
 
             // Data emission
@@ -1588,15 +1768,31 @@ impl EmitAsm for Directive {
             Directive::CfiRestoreState => {
                 let _ = writeln!(out, "    .cfi_restore_state");
             }
+            Directive::CfiWindowSave => {
+                let _ = writeln!(out, "    .cfi_window_save");
+            }
+            Directive::CfiBKeyFrame => {
+                let _ = writeln!(out, "    .cfi_b_key_frame");
+            }
+            Directive::CfiPersonality { encoding, sym } => {
+                let name = sym.format_for_target(target);
+                let _ = writeln!(out, "    .cfi_personality {encoding:#x},{name}");
+            }
+            Directive::CfiLsda { encoding, sym } => {
+                let name = sym.format_for_target(target);
+                let _ = writeln!(out, "    .cfi_lsda {encoding:#x},{name}");
+            }
+            Directive::CfiGnuArgsSize(n) => {
+                let _ = writeln!(out, "    .cfi_GNU_args_size {n}");
+            }
 
             // Debug info
-            Directive::File { index, path } => {
-                let _ = writeln!(
-                    out,
-                    "    .file {} \"{}\"",
-                    index,
-                    super::codegen::escape_path(path)
-                );
+            Directive::File { index, dir, path } => {
+                let _ = write!(out, "    .file {}", index);
+                if let Some(dir) = dir {
+                    let _ = write!(out, " \"{}\"", super::codegen::escape_path(dir));
+                }
+                let _ = writeln!(out, " \"{}\"", super::codegen::escape_path(path));
             }
             Directive::Loc { file, line, col } => {
                 let _ = writeln!(out, "    .loc {} {} {}", file, line, col);
@@ -1633,6 +1829,14 @@ impl EmitAsm for Directive {
             Directive::Uleb128(v) => {
                 let _ = writeln!(out, "    .uleb128 {}", v);
             }
+            Directive::Uleb128Diff { end, start } => {
+                let _ = writeln!(
+                    out,
+                    "    .uleb128 {}-{}",
+                    end.format_for_target(target),
+                    start.format_for_target(target)
+                );
+            }
             Directive::Sleb128(v) => {
                 let _ = writeln!(out, "    .sleb128 {}", v);
             }
@@ -1658,6 +1862,31 @@ impl EmitAsm for Directive {
                     let _ = writeln!(out, "    .section .note.GNU-stack,\"\",@progbits");
                 }
             },
+            Directive::FeatureNote(bits) => {
+                // Eight-byte alignment, which aarch64's `.align` would read
+                // as a power of two; and the architecture's property.
+                let (align, property) = match target.arch {
+                    Arch::X86_64 => (".align 8", "0xc0000002"), // GNU_PROPERTY_X86_FEATURE_1_AND
+                    Arch::Aarch64 => (".p2align 3", "0xc0000000"), // GNU_PROPERTY_AARCH64_FEATURE_1_AND
+                };
+                let _ = writeln!(out, "    .section .note.gnu.property,\"a\"");
+                let _ = writeln!(out, "    {align}");
+                let _ = writeln!(out, "    .long 1f - 0f");
+                let _ = writeln!(out, "    .long 4f - 1f");
+                // NT_GNU_PROPERTY_TYPE_0
+                let _ = writeln!(out, "    .long 5");
+                let _ = writeln!(out, "0:");
+                let _ = writeln!(out, "    .string \"GNU\"");
+                let _ = writeln!(out, "1:");
+                let _ = writeln!(out, "    {align}");
+                let _ = writeln!(out, "    .long {property}");
+                let _ = writeln!(out, "    .long 3f - 2f");
+                let _ = writeln!(out, "2:");
+                let _ = writeln!(out, "    .long {bits:#x}");
+                let _ = writeln!(out, "3:");
+                let _ = writeln!(out, "    {align}");
+                let _ = writeln!(out, "4:");
+            }
             Directive::Verbatim(text) => {
                 let _ = writeln!(out, "{}", text);
             }
@@ -1669,6 +1898,66 @@ impl EmitAsm for Directive {
 mod tests {
     use super::*;
     use crate::target::Arch;
+
+    /// Run a plan over registers 0..8 holding their own numbers, with memory
+    /// sources holding 100 + the move's index, and answer what each
+    /// destination ended up with.
+    fn run_parallel_moves(moves: &[(Option<u8>, Option<u8>)]) -> Vec<u32> {
+        let mut regs: Vec<u32> = (0..8).collect();
+        let mut mem = vec![0u32; moves.len()];
+        for step in plan_parallel_moves(moves) {
+            match step {
+                MoveStep::Move { index, from } => {
+                    let v = from.map_or(100 + index as u32, |r| regs[r as usize]);
+                    match moves[index].0 {
+                        Some(d) => regs[d as usize] = v,
+                        None => mem[index] = v,
+                    }
+                }
+                MoveStep::Swap(a, b) => regs.swap(a as usize, b as usize),
+            }
+        }
+        moves
+            .iter()
+            .enumerate()
+            .map(|(i, &(dst, _))| dst.map_or(mem[i], |d| regs[d as usize]))
+            .collect()
+    }
+
+    /// Every destination receives what its source held before any move, as
+    /// though the moves were simultaneous: chains in either order, a value
+    /// read twice, a two- and a three-register cycle, a cycle with a chain
+    /// hanging off it, and memory on either side.
+    #[test]
+    fn parallel_moves_read_every_source_before_it_is_written() {
+        let cases: &[&[(Option<u8>, Option<u8>)]] = &[
+            &[(Some(0), Some(7)), (Some(7), Some(6)), (Some(6), Some(5))],
+            &[(Some(6), Some(5)), (Some(7), Some(6)), (Some(0), Some(7))],
+            &[(Some(1), Some(2)), (Some(2), Some(1))],
+            &[(Some(1), Some(2)), (Some(2), Some(3)), (Some(3), Some(1))],
+            &[
+                (Some(1), Some(2)),
+                (Some(2), Some(1)),
+                (Some(4), Some(1)),
+                (Some(5), Some(2)),
+            ],
+            &[
+                (Some(3), Some(3)),
+                (Some(4), Some(3)),
+                (Some(5), None),
+                (None, Some(4)),
+            ],
+            &[(None, Some(1)), (Some(1), Some(2)), (Some(2), Some(1))],
+        ];
+        for moves in cases {
+            let want: Vec<u32> = moves
+                .iter()
+                .enumerate()
+                .map(|(i, &(_, src))| src.map_or(100 + i as u32, u32::from))
+                .collect();
+            assert_eq!(run_parallel_moves(moves), want, "{moves:?}");
+        }
+    }
 
     /// The last register of a composite parameter carries what is left of the
     /// object, not a whole eightbyte.

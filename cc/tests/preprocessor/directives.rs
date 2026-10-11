@@ -489,6 +489,58 @@ fn preprocessor_pragma_operator_destringifies() {
     );
 }
 
+/// The Linux kernel's `__diag(s)` builds `_Pragma(__diag_str(GCC
+/// diagnostic s))`: the operand comes from macro expansion, which gcc
+/// performs (`__bpf_kfunc_start_defs`, `__diag_ignore_all`; glibc's
+/// `DIAG_IGNORE_NEEDS_COMMENT`). c17 rejected every one. The `-E` text is
+/// gcc 13's, and the compiled program honours the pragmas: the diagnostic
+/// one silences `-Wmissing-prototypes -Werror`, the `pack` one packs.
+#[test]
+fn preprocessor_pragma_operator_operand_from_macros() {
+    let src = r#"#define __diag_str1(s) #s
+#define __diag_str(s) __diag_str1(s)
+#define __diag(s) _Pragma(__diag_str(GCC diagnostic s))
+#define __diag_ignore_all(option, comment) __diag(ignored option)
+#define PACK "pack(push, 1)"
+#define POP _Pragma(STRPOP)
+#define STRPOP "pack(pop)"
+__diag(push)
+__diag_ignore_all("-Wmissing-prototypes", "kfuncs")
+int kfunc(int x) { return x + 1; }
+__diag(pop)
+_Pragma(PACK)
+struct s { char c; int i; };
+POP
+int main(void) { return kfunc(-1) + (sizeof(struct s) != 5); }
+"#;
+    // With linemarkers too: the line after a `_Pragma` starts in column 1.
+    for opts in [&["-P"][..], &[]] {
+        let r = preprocess_text("pragma_macro_operand", src, opts);
+        assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+        let lines: Vec<&str> = r
+            .stdout
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with("# "))
+            .collect();
+        assert_eq!(lines, PRAGMA_MACRO_OPERAND_E, "{opts:?}");
+    }
+    let opts = ["-Wmissing-prototypes".to_string(), "-Werror".to_string()];
+    assert_eq!(compile_and_run("pragma_macro_operand", src, &opts), 0);
+}
+
+/// gcc 13's `-E` lines for the program above, blank lines and linemarkers
+/// aside.
+const PRAGMA_MACRO_OPERAND_E: [&str; 8] = [
+    "#pragma GCC diagnostic push",
+    "#pragma GCC diagnostic ignored \"-Wmissing-prototypes\"",
+    "int kfunc(int x) { return x + 1; }",
+    "#pragma GCC diagnostic pop",
+    "#pragma pack(push, 1)",
+    "struct s { char c; int i; };",
+    "#pragma pack(pop)",
+    "int main(void) { return kfunc(-1) + (sizeof(struct s) != 5); }",
+];
+
 /// Preprocessing to a `.i` and compiling that must lay a struct out the same
 /// way as compiling the source directly — which is the whole reason the
 /// pragmas have to survive.
@@ -527,6 +579,92 @@ fn preprocessor_storage_order_pragma_survives_dash_e() {
             "expected {want:?} in:\n{}",
             r.stdout
         );
+    }
+}
+
+/// `#pragma GCC visibility` survives `-E`, in either spelling, as gcc writes
+/// it: the visibility of every declaration after it depends on it.
+#[test]
+fn preprocessor_visibility_pragma_survives_dash_e() {
+    let src = "#pragma GCC visibility push(hidden)\n\
+               extern int x;\n\
+               _Pragma(\"GCC visibility push(default)\")\n\
+               #pragma GCC visibility pop\n\
+               #pragma GCC visibility pop\n\
+               int q;\n";
+    let r = preprocess_text("vis_pragma_e", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let pragmas: Vec<&str> = r
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("#pragma"))
+        .collect();
+    assert_eq!(
+        pragmas,
+        [
+            "#pragma GCC visibility push(hidden)",
+            "#pragma GCC visibility push(default)",
+            "#pragma GCC visibility pop",
+            "#pragma GCC visibility pop",
+        ],
+        "{}",
+        r.stdout
+    );
+}
+
+/// Under `-E` the pragmas the compiler acts on are not acted on, so they
+/// draw no warning -- gcc gives none -- and travel as written, which is what
+/// lets the compile of the `.i` give the warnings gcc gives there.
+#[test]
+fn preprocessor_dash_e_leaves_pragma_warnings_to_the_compile() {
+    let src = "#pragma pack(3)\n\
+               #pragma pack x\n\
+               #pragma pack( push , 4 )\n\
+               #pragma GCC visibility pop\n\
+               #pragma scalar_storage_order foo\n\
+               _Pragma(\"pack(5)\")\n\
+               #pragma STDC FOO\n\
+               int q;\n";
+    let r = preprocess_text("pragma_quiet_e", src, &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert!(r.stderr.is_empty(), "-E warned:\n{}", r.stderr);
+    let pragmas: Vec<&str> = r
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("#pragma"))
+        .collect();
+    assert_eq!(
+        pragmas,
+        [
+            "#pragma pack(3)",
+            "#pragma pack x",
+            "#pragma pack( push , 4 )",
+            "#pragma GCC visibility pop",
+            "#pragma scalar_storage_order foo",
+            "#pragma pack(5)",
+            "#pragma STDC FOO",
+        ],
+        "{}",
+        r.stdout
+    );
+
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_pragma_i_")
+        .tempdir()
+        .expect("tempdir");
+    let i = dir.path().join("t.i");
+    std::fs::write(&i, &r.stdout).expect("write");
+    let obj = dir.path().join("t.o");
+    let c = run_c17(&["-c", "-o", obj.to_str().unwrap(), i.to_str().unwrap()]);
+    assert!(c.success, "{}", c.stderr);
+    for want in [
+        "warning: alignment in '#pragma pack' must be 1, 2, 4, 8 or 16 [-Wpragmas]",
+        "warning: expected '(' after '#pragma pack' [-Wpragmas]",
+        "warning: no matching push for '#pragma GCC visibility pop' [-Wpragmas]",
+        "warning: expected 'big-endian', 'little-endian', or 'default' after \
+         '#pragma scalar_storage_order' [-Wpragmas]",
+    ] {
+        assert!(c.stderr.contains(want), "{want:?} in:\n{}", c.stderr);
     }
 }
 
@@ -863,4 +1001,67 @@ int main(void)
 }
 "#;
     assert_eq!(compile_and_run("pp_conditionals_in_args", code, &[]), 0);
+}
+
+/// In assembly a `#` line that names no directive is passed through,
+/// macro-replaced, as gcc's `-lang-asm` does -- a number after the `#` is no
+/// linemarker there. Linux's chacha-ssse3-x86_64.S has an indented
+/// `# 7/12-bit ...` comment after a macro line; taken as a linemarker it
+/// joined the next line onto the previous one (`endbr64and $~63,%rsp`).
+/// Expected text is gcc 13's `-E -P -x assembler-with-cpp`, line by line.
+#[test]
+fn preprocessor_assembly_hash_number_line_is_text() {
+    let src = "#define START(n) .globl n ; n: endbr64\n\
+               #define FOO bar\n\
+               START(f)\n\
+               \t# 7/12-bit word rotation uses traditional shift+OR.\n\
+               \tand $~63,%rsp\n\
+               # 42 is the answer FOO\n\
+               # 100 \"foo.S\"\n\
+               \t.long __LINE__\n\
+               # save FOO\n\
+               #! FOO\n\
+               #\n\
+               #if 0\n\
+               # 5 skipped\n\
+               #endif\n\
+               \tret\n";
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_asm_hash_number_")
+        .tempdir()
+        .unwrap();
+    let s = dir.path().join("t.S");
+    std::fs::write(&s, src).unwrap();
+    let r = run_c17(&["-E", "-P", &s.to_string_lossy()]);
+    assert!(r.success, "-E of a .S failed: {}", r.stderr);
+    let lines: Vec<&str> = r
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ".globl f ; f: endbr64",
+            "# 7/12-bit word rotation uses traditional shift+OR.",
+            "and $~63,%rsp",
+            "# 42 is the answer bar",
+            "# 100 \"foo.S\"",
+            ".long 8",
+            "# save bar",
+            "#! bar",
+            "ret",
+        ],
+        "{}",
+        r.stdout
+    );
+
+    // And the whole pipeline assembles it.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let o = dir.path().join("t.o");
+        let r = run_c17(&["-c", &s.to_string_lossy(), "-o", &o.to_string_lossy()]);
+        assert!(r.success, "assembling the .S failed: {}", r.stderr);
+    }
 }

@@ -32,7 +32,7 @@
 //        catches this at the optimizer/codegen boundary instead.
 //
 //        The targets are `Instruction::control_targets`: a branch's and a
-//        switch's, and an `asm goto`'s labels.
+//        switch's, an `asm goto`'s labels, and a call's landing pad.
 //
 //   I4 — NO PLACEHOLDER SURVIVES LOWERING
 //        `ConstantP`, `ObjectSize` and `VaArgPackLen` stand for a value
@@ -103,9 +103,18 @@
 //        the next allocation hands out again, giving a fresh value the name
 //        of an existing one.
 //
+//   I14 — A LANDING PAD IS REACHED ONLY BY UNWINDING
+//        A block that starts with `LandingPad` is entered from the unwinder,
+//        with the exception object in a register: `LandingPad` is its first
+//        instruction and nowhere else, and only a call's `landing_pad` names
+//        it -- a branch into it would read a register nothing set. Every
+//        call's landing pad is such a block. Until lowering, the call is the
+//        last instruction before its block's terminator, so that nothing the
+//        block computes after the call appears available in the pad.
+//
 // I2 and I5 hold for every program or for none: `Opcode::has_side_effects`
 // is derived from `may_access_memory`, and unit tests in `ir/mod.rs` check
-// both over `Opcode::ALL`. The validator checks the other eleven.
+// both over `Opcode::ALL`. The validator checks the other twelve.
 //
 // The validator runs always, in every build, through [`verify`]: after
 // linearization, after optimization, and after lowering. It is one walk over
@@ -193,6 +202,9 @@ pub enum Invariant {
     /// I13: `pseudo`, the highest id in the function, is not below
     /// `next_pseudo`.
     PseudoPastAllocator { pseudo: PseudoId, next_pseudo: u32 },
+    /// I14: a landing pad, or a call's edge to one, is not as unwinding
+    /// needs it.
+    LandingPad { what: &'static str },
 }
 
 impl Invariant {
@@ -212,6 +224,7 @@ impl Invariant {
             Invariant::StrayLifetimeEnd => "I11",
             Invariant::WidthChangeBackwards { .. } => "I12",
             Invariant::PseudoPastAllocator { .. } => "I13",
+            Invariant::LandingPad { .. } => "I14",
         }
     }
 }
@@ -287,6 +300,7 @@ impl fmt::Display for Invariant {
                 "pseudo {pseudo:?} is not below next_pseudo {next_pseudo}; \
                  the allocator will hand it out again"
             ),
+            Invariant::LandingPad { what } => write!(f, "{what}"),
         }
     }
 }
@@ -402,6 +416,8 @@ struct Walk<'a> {
     expected_parents: HashMap<BasicBlockId, HashSet<BasicBlockId>>,
     /// I13: the highest pseudo id the instructions name.
     max_pseudo: Option<PseudoId>,
+    /// I14: the blocks that start with `LandingPad`.
+    pads: HashSet<BasicBlockId>,
     out: Vec<ValidationError>,
 }
 
@@ -429,6 +445,12 @@ impl<'a> Walk<'a> {
             phis: Vec::new(),
             expected_parents: HashMap::new(),
             max_pseudo: None,
+            pads: func
+                .blocks
+                .iter()
+                .filter(|b| b.insns.first().is_some_and(|i| i.op == Opcode::LandingPad))
+                .map(|b| b.id)
+                .collect(),
             out: Vec::new(),
         }
     }
@@ -469,6 +491,7 @@ impl<'a> Walk<'a> {
         };
         for (index, insn) in bb.insns.iter().enumerate() {
             self.check_insn(&mut state, index, insn);
+            self.check_landing_pad(bb, index, insn);
         }
 
         self.check_block_edges(bb, &state);
@@ -562,6 +585,47 @@ impl<'a> Walk<'a> {
                 .is_some_and(|l| self.func.local_of(l).is_some())
         {
             self.report(at, Invariant::StrayLifetimeEnd);
+        }
+    }
+
+    /// I14 -- `LandingPad` only first in its block, a landing pad named only
+    /// by a call's `landing_pad`, and, until lowering, that call last before
+    /// the terminator.
+    fn check_landing_pad(&mut self, bb: &BasicBlock, index: usize, insn: &Instruction) {
+        let at = Location::Insn {
+            block: bb.id,
+            index,
+            opcode: insn.op,
+        };
+        if insn.op == Opcode::LandingPad && index != 0 {
+            let what = "landingpad is not the first instruction of its block";
+            self.report(at, Invariant::LandingPad { what });
+        }
+        let pad = insn.extra().landing_pad;
+        if let Some(pad) = pad {
+            if insn.op != Opcode::Call {
+                let what = "only a call has a landing pad";
+                self.report(at, Invariant::LandingPad { what });
+            } else if !self.pads.contains(&pad) {
+                let what = "a call's landing pad does not start with landingpad";
+                self.report(at, Invariant::LandingPad { what });
+            }
+            let next_ends = bb
+                .insns
+                .get(index + 1)
+                .is_some_and(|i| i.op.is_terminator());
+            if self.stage == Stage::Ssa && !next_ends {
+                let what = "a call with a landing pad is not last before the terminator";
+                self.report(at, Invariant::LandingPad { what });
+            }
+        }
+        let branches_into_pad = insn
+            .control_targets()
+            .into_iter()
+            .any(|t| self.pads.contains(&t) && Some(t) != pad);
+        if branches_into_pad {
+            let what = "a branch enters a landing pad";
+            self.report(at, Invariant::LandingPad { what });
         }
     }
 
@@ -1404,5 +1468,86 @@ mod tests {
                 "{op:?} {from:?} -> {to:?}"
             );
         }
+    }
+
+    /// I14: block 0 calls with landing pad 2 and falls into 1; block 1
+    /// branches to 2 as well when `branch_in`; `pad_first` decides whether
+    /// `landingpad` leads block 2; `call_last` whether the call is right
+    /// before block 0's terminator.
+    fn landing_pad_case(branch_in: bool, pad_first: bool, call_last: bool) -> Vec<Invariant> {
+        let types = TypeTable::new(&Target::host());
+        let mut f = Function::new("f", types.void_id);
+        f.next_pseudo = NEXT_PSEUDO;
+        f.entry = BasicBlockId(0);
+        let mut call = Instruction::call(None, "g", vec![], vec![], types.void_id, 0);
+        call.extra_mut().landing_pad = Some(BasicBlockId(2));
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(call);
+        if !call_last {
+            b0.add_insn(copy_insn(1, 1));
+        }
+        b0.add_insn(Instruction::br(BasicBlockId(1)));
+        let mut b1 = BasicBlock::new(BasicBlockId(1));
+        b1.add_insn(if branch_in {
+            Instruction::br(BasicBlockId(2))
+        } else {
+            Instruction::ret(None)
+        });
+        let landing = Instruction::new(Opcode::LandingPad)
+            .with_target(PseudoId(2))
+            .with_type(types.void_ptr_id)
+            .with_size(64);
+        let mut b2 = BasicBlock::new(BasicBlockId(2));
+        if pad_first {
+            b2.add_insn(landing);
+        } else {
+            b2.add_insn(Instruction::new(Opcode::Nop));
+            b2.add_insn(landing);
+        }
+        b2.add_insn(Instruction::ret(None));
+        for b in [b0, b1, b2] {
+            f.add_block(b);
+        }
+        f.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        f.add_edge(BasicBlockId(0), BasicBlockId(2));
+        f.add_edge(BasicBlockId(0), BasicBlockId(1));
+        if branch_in {
+            f.add_edge(BasicBlockId(1), BasicBlockId(2));
+        }
+        validate_function(&f)
+            .err()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.kind)
+            .filter(|k| matches!(k, Invariant::LandingPad { .. }))
+            .collect()
+    }
+
+    /// I14: a landing pad starts with `landingpad`, only a call's unwind
+    /// edge enters it, and until lowering the call ends its block.
+    #[test]
+    fn i14_landing_pads_are_entered_only_by_unwinding() {
+        assert_eq!(landing_pad_case(false, true, true), vec![]);
+        let what = |w| vec![Invariant::LandingPad { what: w }];
+        assert_eq!(
+            landing_pad_case(true, true, true),
+            what("a branch enters a landing pad")
+        );
+        assert_eq!(
+            landing_pad_case(false, false, true),
+            [
+                Invariant::LandingPad {
+                    what: "a call's landing pad does not start with landingpad"
+                },
+                Invariant::LandingPad {
+                    what: "landingpad is not the first instruction of its block"
+                }
+            ]
+        );
+        assert_eq!(
+            landing_pad_case(false, true, false),
+            what("a call with a landing pad is not last before the terminator")
+        );
     }
 }

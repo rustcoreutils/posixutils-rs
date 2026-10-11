@@ -12,6 +12,7 @@
 //
 
 pub mod asm_operand;
+pub(crate) mod bitset;
 mod build;
 pub mod cfg;
 pub(crate) mod constfold;
@@ -58,9 +59,9 @@ pub mod vrp;
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::diag::Position;
-use crate::float::{FloatVal, IntegralRounding};
+use crate::float::{FloatVal, IntegerRounding, IntegralRounding};
 use crate::target::Target;
-use crate::types::{TypeId, TypeTable};
+use crate::types::{AddressSpace, TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -397,6 +398,12 @@ pub enum Opcode {
     // the width of `typ`: the integer it rounds to, with its sign. Named in
     // `func_name` like `Sqrt`.
     RoundToIntegral(IntegralRounding),
+    // `lrint` or `lround` of src[0]: the integer of type `typ` the floating
+    // `src_typ` operand rounds to, in the current direction or with ties
+    // away from zero -- not truncated, as `FCvtS` does. A conversion, and a
+    // libm opcode too: named in `func_name` like `Sqrt`, for a target or a
+    // format with no instruction for it.
+    RoundToInteger(IntegerRounding),
     // `fmin` and `fmax` of src[0] and src[1], at the width of `typ`: a NaN
     // operand is ignored for the other. Named in `func_name` like `Sqrt`.
     FMin,
@@ -455,14 +462,17 @@ pub enum Opcode {
     /// `ir::lower` to 0 otherwise -- which is every case at `-O0`, where
     /// the optimizer does not run at all.
     ConstantP,
-    /// `__builtin_object_size(src[0], type)`, deferred until inlining and
-    /// propagation have shown what object `src[0]` points into.
+    /// `__builtin_object_size(src[0], type)`, or the dynamic form, deferred
+    /// until inlining and propagation have shown what object `src[0]`
+    /// points into.
     ///
     /// Answered by `ir::objsize` -- the moment its object is known, and
-    /// with the unknown object's answer once the optimizer has converged --
-    /// and by `ir::lower` with the unknown object's answer for anything
-    /// left. The parser answers at `-O0`, so no `-O0` function has one.
-    ObjectSize(crate::parse::ast::ObjectSizeType),
+    /// with the unknown object's answer, or for the dynamic form a size
+    /// computed at run time, once the optimizer has converged -- and by
+    /// `ir::lower` with the unknown object's answer for anything left. The
+    /// parser answers the static form at `-O0`, so there only the dynamic
+    /// form has one.
+    ObjectSize(ObjectSizeQuery),
 
     // Byte-swapping builtins
     Bswap16, // Byte-swap 16-bit value
@@ -510,14 +520,18 @@ pub enum Opcode {
 
     // Optimization hints
     Unreachable, // Code path is never reached (undefined behavior if reached)
+    // `__builtin_trap()`: the target's trap instruction. Ends its block, like
+    // `Unreachable`, but it is no hint: reaching it is the program's choice.
+    Trap,
 
     // Stack introspection
     FrameAddress, // __builtin_frame_address(level) - frame pointer `frame_level()` frames up
     ReturnAddress, // __builtin_return_address(level) - return address `frame_level()` frames up
 
-    // Non-local jumps (setjmp/longjmp)
-    Setjmp,  // Save execution context, returns 0 or value from longjmp
-    Longjmp, // Restore execution context (never returns)
+    // gcc's non-local goto. The library's `setjmp` family are `Call`s; see
+    // `Instruction::returns_twice`.
+    Setjmp,  // __builtin_setjmp: save frame/stack/resume, 0 or 1 from a longjmp
+    Longjmp, // __builtin_longjmp: resume a Setjmp (never returns)
 
     // Inline assembly
     Asm, // Inline assembly statement
@@ -548,6 +562,12 @@ pub enum Opcode {
     /// out of band, never in `src`, so no analysis counts it as a use, an
     /// escape or a reason to keep the local. See `arch::regalloc::LocalLifetimes`.
     LifetimeEnd,
+    /// The exception object a landing pad receives: the value the unwinder
+    /// leaves in the first return register (`%rax`, `x0`) when it transfers
+    /// control to the pad. Only ever the first instruction of a block that
+    /// is the [`InsnExtra::landing_pad`] of some call and that no other edge
+    /// reaches. See `ir::linearize_cleanup`.
+    LandingPad,
     /// A lane-wise operation on whole GNU vectors, computed by the target's
     /// packed instructions: `typ` is the vector type, which says the lanes,
     /// and `size` its width, 128 or 64. Each operand and the result is the
@@ -813,6 +833,41 @@ impl SimdOp {
     }
 }
 
+/// What an `ObjectSize` placeholder asks: the builtin's type and which
+/// builtin it is, in one byte, which keeps an [`Opcode`] two bytes wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectSizeQuery(u8);
+
+impl ObjectSizeQuery {
+    /// Bit 2: the dynamic form; bits 0 and 1 are the type's.
+    const DYNAMIC: u8 = 4;
+
+    pub const fn new(
+        otype: crate::parse::ast::ObjectSizeType,
+        form: crate::parse::ast::ObjectSizeForm,
+    ) -> Self {
+        let form = match form {
+            crate::parse::ast::ObjectSizeForm::Static => 0,
+            crate::parse::ast::ObjectSizeForm::Dynamic => Self::DYNAMIC,
+        };
+        ObjectSizeQuery(otype.subobject as u8 | (otype.minimum as u8) << 1 | form)
+    }
+
+    /// The builtin's second argument.
+    pub fn otype(self) -> crate::parse::ast::ObjectSizeType {
+        crate::parse::ast::ObjectSizeType::from_bits(u64::from(self.0 & 3))
+    }
+
+    /// Which of the two builtins asked.
+    pub fn form(self) -> crate::parse::ast::ObjectSizeForm {
+        if self.0 & Self::DYNAMIC != 0 {
+            crate::parse::ast::ObjectSizeForm::Dynamic
+        } else {
+            crate::parse::ast::ObjectSizeForm::Static
+        }
+    }
+}
+
 impl Opcode {
     /// Integer binary arithmetic: what `constfold::eval_binop` evaluates
     /// besides the comparisons.
@@ -886,7 +941,7 @@ impl Opcode {
         match self {
             FAdd | FSub | FMul | FDiv | Sqrt | RoundToIntegral(_) | FMin | FMax | Fma | Call
             | Asm => FpRaise::May,
-            FCvtU | FCvtS | UCvtF | SCvtF | FCvtF => FpRaise::Conversion,
+            FCvtU | FCvtS | UCvtF | SCvtF | FCvtF | RoundToInteger(_) => FpRaise::Conversion,
             FCmpOEq | FCmpONe | FCmpOLt | FCmpOLe | FCmpOGt | FCmpOGe | FCmpsOLt | FCmpsOLe
             | FCmpsOGt | FCmpsOGe => match self.float_cmp().map(FloatCmp::nan) {
                 Some(NanCompare::Signaling) => FpRaise::May,
@@ -901,10 +956,10 @@ impl Opcode {
             | VaStart | VaArg | VaEnd | VaCopy | VaArgPackLen | ConstantP | ObjectSize(_)
             | Bswap16 | Bswap32 | Bswap64 | Ctz32 | Ctz64 | Clz32 | Clz64 | Popcount32
             | Popcount64 | Alloca | StackSave | StackRestore | Memset | Memcpy | Memmove
-            | Unreachable | FrameAddress | ReturnAddress | Setjmp | Longjmp | AtomicLoad
+            | Unreachable | Trap | FrameAddress | ReturnAddress | Setjmp | Longjmp | AtomicLoad
             | AtomicStore | AtomicSwap | AtomicCas | AtomicFetchAdd | AtomicFetchSub
             | AtomicFetchAnd | AtomicFetchOr | AtomicFetchXor | Fence | Lo64 | Hi64 | Pair64
-            | AddC | AdcC | SubC | SbcC | UMulHi | LifetimeEnd => FpRaise::Never,
+            | AddC | AdcC | SubC | SbcC | UMulHi | LifetimeEnd | LandingPad => FpRaise::Never,
         }
     }
 
@@ -938,7 +993,12 @@ impl Opcode {
         self.is_int_width_change()
             || matches!(
                 self,
-                Opcode::FCvtS | Opcode::FCvtU | Opcode::SCvtF | Opcode::UCvtF | Opcode::FCvtF
+                Opcode::FCvtS
+                    | Opcode::FCvtU
+                    | Opcode::SCvtF
+                    | Opcode::UCvtF
+                    | Opcode::FCvtF
+                    | Opcode::RoundToInteger(_)
             )
     }
 
@@ -973,6 +1033,7 @@ impl Opcode {
                 | Opcode::Switch
                 | Opcode::IndirectBr
                 | Opcode::Unreachable
+                | Opcode::Trap
                 | Opcode::Longjmp
         )
     }
@@ -1005,6 +1066,9 @@ impl Opcode {
                 | Opcode::StackRestore
                 | Opcode::Setjmp
                 | Opcode::Longjmp
+                // A signal handler runs where it traps, and may read
+                // anything the program stored before it.
+                | Opcode::Trap
                 | Opcode::Asm
                 | Opcode::Fence
         ) || self.is_atomic()
@@ -1015,7 +1079,12 @@ impl Opcode {
     pub fn is_libm(&self) -> bool {
         matches!(
             self,
-            Opcode::Sqrt | Opcode::RoundToIntegral(_) | Opcode::FMin | Opcode::FMax | Opcode::Fma
+            Opcode::Sqrt
+                | Opcode::RoundToIntegral(_)
+                | Opcode::RoundToInteger(_)
+                | Opcode::FMin
+                | Opcode::FMax
+                | Opcode::Fma
         )
     }
 
@@ -1032,8 +1101,10 @@ impl Opcode {
             || (self.may_access_memory() && *self != Opcode::Load)
             // `Entry` marks where the function begins. `LifetimeEnd` is not
             // an effect of the program's, but a fact the allocator reads,
-            // which deleting would lose.
-            || matches!(self, Opcode::Entry | Opcode::LifetimeEnd)
+            // which deleting would lose. `LandingPad` takes the exception
+            // object out of its register, and has to stay where it is, first
+            // in its block, until the code generator reads it there.
+            || matches!(self, Opcode::Entry | Opcode::LifetimeEnd | Opcode::LandingPad)
     }
 
     /// True for the atomic memory operations (not `Fence`, which touches no
@@ -1125,6 +1196,11 @@ impl Opcode {
                 IntegralRounding::Round => "fround",
                 IntegralRounding::Rint => "frint",
                 IntegralRounding::NearbyInt => "fnearbyint",
+                IntegralRounding::RoundEven => "froundeven",
+            },
+            Opcode::RoundToInteger(how) => match how {
+                IntegerRounding::Rint => "lrint",
+                IntegerRounding::Round => "lround",
             },
             Opcode::Trunc => "trunc",
             Opcode::Zext => "zext",
@@ -1169,6 +1245,7 @@ impl Opcode {
             Opcode::Memmove => "memmove",
             Opcode::Signbit => "signbit",
             Opcode::Unreachable => "unreachable",
+            Opcode::Trap => "trap",
             Opcode::FrameAddress => "frame_address",
             Opcode::ReturnAddress => "return_address",
             Opcode::Setjmp => "setjmp",
@@ -1193,6 +1270,7 @@ impl Opcode {
             Opcode::SbcC => "sbcc",
             Opcode::UMulHi => "umulhi",
             Opcode::LifetimeEnd => "lifetime.end",
+            Opcode::LandingPad => "landingpad",
         }
     }
 }
@@ -1216,6 +1294,9 @@ macro_rules! every_opcode {
                 Opcode::RoundToIntegral(IntegralRounding::Round),
                 Opcode::RoundToIntegral(IntegralRounding::Rint),
                 Opcode::RoundToIntegral(IntegralRounding::NearbyInt),
+                Opcode::RoundToIntegral(IntegralRounding::RoundEven),
+                Opcode::RoundToInteger(IntegerRounding::Rint),
+                Opcode::RoundToInteger(IntegerRounding::Round),
                 Opcode::Simd(SimdOp::Add),
                 Opcode::Simd(SimdOp::Sub),
                 Opcode::Simd(SimdOp::And),
@@ -1251,10 +1332,38 @@ macro_rules! every_opcode {
                 Opcode::Simd(SimdOp::CvtUF),
                 Opcode::Simd(SimdOp::CvtFS),
                 Opcode::Simd(SimdOp::CvtFU),
-                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(0)),
-                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(1)),
-                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(2)),
-                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(3)),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(0),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(1),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(2),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(3),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(0),
+                    crate::parse::ast::ObjectSizeForm::Dynamic,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(1),
+                    crate::parse::ast::ObjectSizeForm::Dynamic,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(2),
+                    crate::parse::ast::ObjectSizeForm::Dynamic,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(3),
+                    crate::parse::ast::ObjectSizeForm::Dynamic,
+                )),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
@@ -1268,8 +1377,10 @@ macro_rules! every_opcode {
                         | IntegralRounding::Trunc
                         | IntegralRounding::Round
                         | IntegralRounding::Rint
-                        | IntegralRounding::NearbyInt,
+                        | IntegralRounding::NearbyInt
+                        | IntegralRounding::RoundEven,
                     ) => true,
+                    Opcode::RoundToInteger(IntegerRounding::Rint | IntegerRounding::Round) => true,
                     Opcode::Simd(
                         SimdOp::Add
                         | SimdOp::Sub
@@ -1323,9 +1434,10 @@ every_opcode! {
     Store, Phi, PhiSource, Copy, SymAddr, TlsAddr, Call, Select, SetVal, Nop, VaStart, VaArg,
     VaEnd, VaCopy, VaArgPackLen, ConstantP, Bswap16, Bswap32, Bswap64, Ctz32, Ctz64, Clz32, Clz64,
     Popcount32, Popcount64, Alloca, StackSave, StackRestore, Memset, Memcpy, Memmove, Signbit,
-    Unreachable, FrameAddress, ReturnAddress, Setjmp, Longjmp, Asm, AtomicLoad, AtomicStore,
+    Unreachable, Trap, FrameAddress, ReturnAddress, Setjmp, Longjmp, Asm, AtomicLoad, AtomicStore,
     AtomicSwap, AtomicCas, AtomicFetchAdd, AtomicFetchSub, AtomicFetchAnd, AtomicFetchOr,
     AtomicFetchXor, Fence, Lo64, Hi64, Pair64, AddC, AdcC, SubC, SbcC, UMulHi, LifetimeEnd,
+    LandingPad,
 }
 
 impl fmt::Display for Opcode {
@@ -1619,6 +1731,11 @@ pub struct AsmConstraint {
     /// operands than registers, was spilled -- and the slot holding the
     /// address was then substituted as if it were the object.
     pub offset: i64,
+    /// For a memory operand: the address space of the object, which the
+    /// operand is written through (`%gs:8(%rax)`) -- x86-64's `__seg_fs` and
+    /// `__seg_gs`. The Linux kernel's per-CPU asm leaves the prefix to the
+    /// operand when the compiler has named address spaces.
+    pub addr_space: AddressSpace,
 }
 
 impl AsmConstraint {
@@ -1634,6 +1751,7 @@ impl AsmConstraint {
             class: AsmOperandClass::parse(constraint, arch).expect("a modelled constraint"),
             size,
             offset: 0,
+            addr_space: AddressSpace::Generic,
         }
     }
 
@@ -1738,6 +1856,39 @@ macro_rules! mention_slots {
     }};
 }
 
+/// How a `Load` or `Store` reaches the object it accesses, as the
+/// object's type says: whether the object is `volatile`, and which address
+/// space it is in. A site whose access is of another type than the object's
+/// -- a bit-field's storage unit, an integer chunk of a struct -- says so
+/// with [`Instruction::with_access`], since nothing downstream can read the
+/// qualifiers back off the chunk's own type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Access {
+    pub volatile: bool,
+    pub space: AddressSpace,
+}
+
+impl Access {
+    /// The access to an object of type `typ`.
+    pub fn of(types: &TypeTable, typ: TypeId) -> Self {
+        Access {
+            volatile: types.contains_volatile(typ),
+            space: types.address_space(typ),
+        }
+    }
+
+    /// Is the access through a segment register?
+    pub fn in_segment(self) -> bool {
+        self.space != AddressSpace::Generic
+    }
+
+    /// Must the access stay exactly as written? A volatile one must, and
+    /// so must one through a segment, whose memory no pass can model.
+    pub fn observable(self) -> bool {
+        self.volatile || self.in_segment()
+    }
+}
+
 /// An IR instruction
 #[derive(Debug, Clone)]
 pub struct Instruction {
@@ -1783,6 +1934,12 @@ pub struct Instruction {
     /// Set for every access the linearizer emits, from the type it is
     /// accessing, in `Linearizer::mark_volatile_access`.
     pub is_volatile: bool,
+    /// For `Load` and `Store`: the address space of the object accessed --
+    /// x86-64's `__seg_fs`/`__seg_gs`, which the backend reaches through
+    /// the segment register. Set with [`Instruction::with_access`], which
+    /// marks such an access volatile too: what a segment base points to is
+    /// memory no pass can see.
+    pub addr_space: AddressSpace,
     /// The fields only calls, switches, `asm` and atomics use, in one box
     /// that every other instruction leaves empty. Read them through
     /// [`Instruction::extra`] and set them through [`Instruction::extra_mut`].
@@ -1822,6 +1979,22 @@ pub struct InsnExtra {
     /// For calls: true if the called function is noreturn (never returns).
     /// Code after a noreturn call is unreachable.
     pub is_noreturn_call: bool,
+    /// For direct calls: the callee may return twice, as `setjmp` does. Ask
+    /// [`Instruction::returns_twice`], which also answers for `Setjmp`.
+    pub returns_twice_call: bool,
+    /// For calls: the callee's type is `nocf_check`, so an indirect call to
+    /// it asks for no landing pad -- x86-64 makes it `notrack`.
+    pub nocf_check_call: bool,
+    /// For calls, under `-fexceptions`: the callee may unwind through this
+    /// frame -- it is not `nothrow`. A call the compiler makes for itself
+    /// (a library fallback, a block copy) never does.
+    pub may_throw: bool,
+    /// For calls: the block the unwinder transfers control to when the
+    /// callee unwinds through this frame, which runs the cleanups in scope
+    /// and resumes the unwind. An edge of the CFG like any other, out of a
+    /// block whose next instruction is its terminator, into a block that
+    /// starts with [`Opcode::LandingPad`] and has no phi.
+    pub landing_pad: Option<BasicBlockId>,
     /// For direct calls: whether `func_name` may be a definition in this
     /// module or is only ever the external library function. See
     /// [`Instruction::local_callee`], which is how a pass should ask.
@@ -1847,9 +2020,6 @@ pub struct InsnExtra {
     pub lifetime_of: Option<PseudoId>,
     /// For `Simd(Shuffle)`: the lanes it picks.
     pub shuffle: Option<ShuffleIndices>,
-    /// For `Setjmp` and `Longjmp`: the library's, or gcc's builtin pair.
-    /// Read it through [`Instruction::jmp_kind`].
-    pub jmp_kind: crate::parse::ast::JmpKind,
 }
 
 /// What an instruction with no extra fields answers: every one empty.
@@ -1861,6 +2031,10 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     variadic_arg_start: None,
     ends_with_va_arg_pack: false,
     is_noreturn_call: false,
+    returns_twice_call: false,
+    nocf_check_call: false,
+    may_throw: false,
+    landing_pad: None,
     callee_binding: crate::parse::ast::CalleeBinding::Declared,
     known: None,
     indirect_target: None,
@@ -1870,7 +2044,6 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     fence_scope: FenceScope::Thread,
     lifetime_of: None,
     shuffle: None,
-    jmp_kind: crate::parse::ast::JmpKind::Library,
 };
 
 impl Default for Instruction {
@@ -1889,6 +2062,7 @@ impl Default for Instruction {
             src_typ: None,
             pos: None,
             is_volatile: false,
+            addr_space: AddressSpace::Generic,
             extra: None,
         }
     }
@@ -1986,6 +2160,26 @@ impl Instruction {
         self
     }
 
+    /// Mark this `Load` or `Store` with how it reaches its object: see
+    /// [`Access`].
+    pub fn with_access(mut self, access: Access) -> Self {
+        debug_assert!(
+            access == Access::default() || matches!(self.op, Opcode::Load | Opcode::Store),
+            "only a Load or a Store carries an access"
+        );
+        self.is_volatile = access.observable();
+        self.addr_space = access.space;
+        self
+    }
+
+    /// How this `Load` or `Store` reaches its object; see [`Access`].
+    pub fn access(&self) -> Access {
+        Access {
+            volatile: self.is_volatile,
+            space: self.addr_space,
+        }
+    }
+
     /// Is this an access to a `volatile` object?
     ///
     /// Reading or writing one is observable behaviour (C17 5.1.2.3p6), so an
@@ -2036,7 +2230,7 @@ impl Instruction {
     }
 
     /// The C library function an opcode the backends lower to a call
-    /// (`Memcpy`, `Memset`, `Memmove`, `Setjmp`, `Longjmp`) calls, or a libm
+    /// (`Memcpy`, `Memset`, `Memmove`) calls, or a libm
     /// opcode (`Sqrt`) calls on a target without the instruction, by its
     /// assembler name.
     ///
@@ -2051,19 +2245,23 @@ impl Instruction {
         }
     }
 
-    /// Which `setjmp`/`longjmp` a `Setjmp` or `Longjmp` is: the library's,
-    /// a call naming [`Self::library_callee`], or gcc's builtin pair, which
-    /// names none and is generated inline.
-    pub fn jmp_kind(&self) -> crate::parse::ast::JmpKind {
-        self.extra().jmp_kind
-    }
-
-    /// Is this gcc's `__builtin_setjmp`? Control resumes just after it with
-    /// no register intact but the frame and stack pointers, so the register
-    /// allocator keeps nothing in a register across it, and the function
-    /// saves every callee-saved register.
-    pub fn is_builtin_setjmp(&self) -> bool {
-        self.op == Opcode::Setjmp && self.jmp_kind() == crate::parse::ast::JmpKind::Builtin
+    /// Can control come back to just after this instruction a second time?
+    ///
+    /// gcc's `__builtin_setjmp` (`Setjmp`), and a direct call of a function
+    /// that returns twice: the library's `setjmp` family and the rest of
+    /// gcc's list of such names, and any function declared
+    /// `__attribute__((returns_twice))`. The second return comes from a
+    /// jump the CFG does not model, after code the analyses believed the
+    /// values live across this point were dead in, and with no register the
+    /// program can count on but the frame and stack pointers -- so the
+    /// register allocator keeps nothing in a register across it, and keeps
+    /// every slot of such a value to the end of the function.
+    pub fn returns_twice(&self) -> bool {
+        match self.op {
+            Opcode::Setjmp => true,
+            Opcode::Call => self.extra().returns_twice_call,
+            _ => false,
+        }
     }
 
     /// Set bit size
@@ -2111,8 +2309,8 @@ impl Instruction {
     ///   `Relaxed`-ordered ones — see note below).
     /// - `Opcode::Call` — a callee may read or write any memory it can
     ///   reach, and this predicate does not ask what that is.
-    /// - `Opcode::Setjmp` / `Opcode::Longjmp` — non-local control flow
-    ///   makes register/memory state observable at any saved jmp_buf.
+    /// - `Opcode::Setjmp` / `Opcode::Longjmp` — gcc's non-local goto makes
+    ///   register/memory state observable at any saved buffer.
     ///
     /// **Contract**: an IR pass MUST NOT move a memory operation across an
     /// instruction for which this returns `true`. This is the load-bearing
@@ -2145,7 +2343,7 @@ impl Instruction {
                 .asm_data
                 .as_ref()
                 .is_some_and(|d| d.clobbers.iter().any(|c| c == "memory")),
-            Opcode::Fence | Opcode::Call | Opcode::Setjmp | Opcode::Longjmp => true,
+            Opcode::Fence | Opcode::Call | Opcode::Setjmp | Opcode::Longjmp | Opcode::Trap => true,
             op => op.is_atomic(),
         }
     }
@@ -2789,6 +2987,9 @@ impl fmt::Display for InstructionDisplay<'_> {
                     write!(f, "{}", ctx.pseudo(*arg))?;
                 }
                 write!(f, ")")?;
+                if let Some(pad) = this.extra().landing_pad {
+                    write!(f, " unwind {}", pad)?;
+                }
             }
             Opcode::Switch => {
                 if let Some(val) = this.src.first() {
@@ -2819,6 +3020,9 @@ impl fmt::Display for InstructionDisplay<'_> {
                 }
                 if this.is_volatile {
                     write!(f, " volatile")?;
+                }
+                if let Some(space) = this.addr_space.keyword() {
+                    write!(f, " {space}")?;
                 }
             }
             _ => {
@@ -3073,6 +3277,17 @@ pub struct Function {
     /// version asks. What the linearizer and the backend both read; set
     /// once, by `Linearizer::linearize_function`. The baseline elsewhere.
     pub isa: crate::target::X86Isa,
+    /// The aarch64 branch protection this function is built with: the
+    /// translation unit's `-mbranch-protection`, or what its
+    /// `target("branch-protection=...")` asks in its place. Set once, by
+    /// `Linearizer::linearize_function`; read by the backend.
+    pub branch_protection: crate::target::BranchProtection,
+    /// The rounding direction the optimizer may assume when it folds this
+    /// function's floating-point operations: to nearest, or under
+    /// `-frounding-math` whatever `fesetround` set. Set once, by
+    /// `Linearizer::linearize_function`; an inlined body takes its caller's,
+    /// which is the translation unit's too.
+    pub fp_rounding: crate::float::FpRounding,
     /// `__attribute__((pure))` / `((const))`, as written.
     ///
     /// The programmer's promise, kept separate from anything `ir/effects.rs`
@@ -3099,6 +3314,13 @@ pub struct Function {
     /// gcc never copies such a function ("saves address of local label in a
     /// static variable"), and neither does the inliner.
     pub saves_label_in_static: bool,
+    /// The globals that are this function's block-scope statics, by name.
+    ///
+    /// They are the function's own: when it is dropped as unreferenced, gcc
+    /// emits none of them either, and one left behind still names whatever
+    /// its initializer points at -- the kernel's `static inline` helpers
+    /// keep tables of objects that may not be configured in.
+    pub static_locals: Vec<String>,
     /// `__attribute__((always_inline))`: inline at every call site regardless
     /// of size, and at `-O0` too. `is_noinline` wins if both are present.
     pub is_always_inline: bool,
@@ -3106,6 +3328,37 @@ pub struct Function {
     /// the back end, which decides about the canary once inlining is done,
     /// so an inlined callee's attribute is gone with its body, as in gcc.
     pub stack_protect: crate::parse::ast::StackProtectAttr,
+    /// The stack-protector level `optimize("...")` gives this function in
+    /// place of the command line's; see `FunctionAttrs::stack_protector`.
+    pub stack_protector: Option<crate::target::StackProtector>,
+    /// The type of every automatic object the source declares, unused ones
+    /// included: what an unoptimized frame holds, which gcc's stack
+    /// protector examines (`arch::stack_protect`), though `mem2reg` drops
+    /// the locals nothing names.
+    pub declared_locals: Vec<TypeId>,
+    /// `indirect_branch(...)` and `function_return(...)`: this function's
+    /// own mitigations, over `-mindirect-branch=` and `-mfunction-return=`.
+    pub branches: crate::machine::BranchAttrs,
+    /// `patchable_function_entry(...)` and `zero_call_used_regs(...)`: this
+    /// function's own entry and exit, over the options'.
+    pub shape: crate::target::ShapeAttrs,
+    /// `__attribute__((flatten))`: when optimizing, the inliner splices
+    /// every call in this function's body, and every call in what it
+    /// splices, whose callee it can.
+    pub is_flatten: bool,
+    /// `__attribute__((noipa))`: no caller learns anything from this body
+    /// -- it is never inlined and no memory effect is inferred from it.
+    pub is_noipa: bool,
+    /// `__attribute__((no_caller_saved_registers))` (x86-64): the function
+    /// preserves every general register it changes.
+    pub saves_all_registers: bool,
+    /// `__attribute__((no_instrument_function))`: no `-pg` call at entry.
+    /// An inlined body brings none either way: the call is made after the
+    /// inliner, for the functions that remain.
+    pub no_instrument: bool,
+    /// The function's type is `nocf_check`: under branch protection its
+    /// entry is no landing pad.
+    pub nocf_check: bool,
     /// `__attribute__((constructor))`: emit a pointer to this function in
     /// `.init_array` so it runs before `main`. `Some(None)` is the attribute
     /// without a priority; `Some(Some(p))` carries one.
@@ -3146,6 +3399,7 @@ impl Default for Function {
             align: None,
             takes_label_addr: false,
             saves_label_in_static: false,
+            static_locals: Vec::new(),
             return_type: TypeId::INVALID,
             params: Vec::with_capacity(DEFAULT_PARAM_CAPACITY),
             blocks: Vec::new(),
@@ -3159,9 +3413,20 @@ impl Default for Function {
             conv: CallingConv::C,
             is_noinline: false,
             isa: Default::default(),
+            branch_protection: Default::default(),
+            fp_rounding: Default::default(),
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,
             stack_protect: Default::default(),
+            stack_protector: None,
+            declared_locals: Vec::new(),
+            branches: Default::default(),
+            shape: Default::default(),
+            is_flatten: false,
+            is_noipa: false,
+            saves_all_registers: false,
+            no_instrument: false,
+            nocf_check: false,
             constructor: None,
             destructor: None,
             is_inline: false,
@@ -3175,6 +3440,30 @@ impl Default for Function {
 }
 
 impl Function {
+    /// May what runs when this unit calls the function be some other
+    /// definition than this body? Then the body is no evidence about the
+    /// call, and is neither inlined nor analyzed, as gcc's `AVAIL_INTERPOSABLE`.
+    ///
+    /// A `weak` definition exists to be replaced at link time. In a shared
+    /// object (`exports_interposable`, see [`Module::exports_interposable`])
+    /// so may any exported one at load time, by a definition in the
+    /// executable or an earlier library -- unless its visibility keeps it in
+    /// the object, or it is declared `inline`, which gcc takes as a promise
+    /// that every definition does the same. `static` is never replaced.
+    pub fn is_interposable(&self, exports_interposable: bool) -> bool {
+        if self.is_static {
+            return false;
+        }
+        if self.symbol_attrs.weak {
+            return true;
+        }
+        let exported = matches!(
+            self.symbol_attrs.visibility.as_deref(),
+            None | Some("default")
+        );
+        exports_interposable && exported && !self.is_inline
+    }
+
     pub fn new(name: impl Into<String>, return_type: TypeId) -> Self {
         Self {
             name: name.into(),
@@ -3304,7 +3593,29 @@ impl Function {
         self.blocks
             .iter()
             .flat_map(|b| &b.insns)
-            .any(Instruction::is_builtin_setjmp)
+            .any(|i| i.op == Opcode::Setjmp)
+    }
+
+    /// Does this function call one that returns twice -- a direct call that
+    /// [`Instruction::returns_twice`] answers for? gcc never inlines such a
+    /// function ("can never be inlined because it uses setjmp"): the second
+    /// return lands in whatever frame made the call.
+    pub fn calls_returns_twice(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(|i| i.op == Opcode::Call && i.returns_twice())
+    }
+
+    /// Can control resume inside this function at a point the CFG does not
+    /// model: does it contain an instruction that returns twice, or a
+    /// `__builtin_longjmp`? Every ordering claim a memory pass makes is then
+    /// void, and every local lives for the whole function.
+    pub fn has_nonlocal_control(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(|i| i.returns_twice() || i.op == Opcode::Longjmp)
     }
 
     /// The local variable that `sym` *is*, if it is one.
@@ -3841,6 +4152,10 @@ pub struct GlobalDef {
     /// How many file-scope asm statements precede this definition in the
     /// source; see [`Function::asm_before`].
     pub asm_before: usize,
+    /// Where a file-scope object was first declared, for `-g`'s
+    /// `DW_TAG_variable`; `None` for an object the program does not name at
+    /// file scope -- a block-scope `static`, a compound literal.
+    pub decl_pos: Option<Position>,
 }
 
 impl GlobalDef {
@@ -3856,6 +4171,7 @@ impl GlobalDef {
             explicit_align: None,
             symbol_attrs: Default::default(),
             asm_before: 0,
+            decl_pos: None,
         }
     }
 
@@ -3875,6 +4191,47 @@ impl GlobalDef {
     pub fn with_const(mut self, is_const: bool) -> Self {
         self.is_const = is_const;
         self
+    }
+
+    /// What this object asks of a section the program names for it.
+    pub fn section_use(&self) -> SectionUse {
+        if self.is_thread_local {
+            SectionUse::ThreadLocal
+        } else if self.is_const {
+            SectionUse::ReadOnly {
+                relocs: self.init.has_reloc(),
+            }
+        } else {
+            SectionUse::Writable
+        }
+    }
+}
+
+/// What a definition placed in a named section (`section("...")`) asks of
+/// it, which decides the ELF flags the one section gets for everything in
+/// it -- and whether two definitions can share it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionUse {
+    /// A function: allocated and executable.
+    Code,
+    /// A `const` object, holding addresses the loader relocates or not.
+    ReadOnly { relocs: bool },
+    /// Any other object.
+    Writable,
+    /// A thread-local object: the image each thread's copy starts from.
+    ThreadLocal,
+}
+
+impl SectionUse {
+    /// Whether two definitions can share one section, by gcc's rule
+    /// (`get_section` in varasm.c): only when they ask the same thing, or
+    /// are both read-only -- a read-only object beside one that needs
+    /// relocating goes where the relocated one does.
+    pub fn compatible(self, other: SectionUse) -> bool {
+        match (self, other) {
+            (SectionUse::ReadOnly { .. }, SectionUse::ReadOnly { .. }) => true,
+            _ => self == other,
+        }
     }
 }
 
@@ -3919,6 +4276,10 @@ impl Module {
     /// asked for no visibility of its own -- function, object or alias --
     /// this one. A declaration of something defined elsewhere is not
     /// affected, as in gcc, and `visibility(...)` on the symbol still wins.
+    /// Nor is an inline definition (C99 6.7.4p7, or `gnu_inline`), which is
+    /// a body to inline and not the function's definition: its address is
+    /// whatever unit defines it out of line, so hiding it made a shared
+    /// object take that address PC-relative, which `ld` refuses.
     ///
     /// Ignoring the flag exported every symbol of a shared object built with
     /// `-fvisibility=hidden`, and its calls between its own functions then
@@ -3934,7 +4295,7 @@ impl Module {
                 *slot = Some(how.to_string());
             }
         };
-        for func in &mut self.functions {
+        for func in self.functions.iter_mut().filter(|f| f.emit) {
             set(&mut func.symbol_attrs.visibility, func.is_static);
         }
         for global in &mut self.globals {
@@ -3969,6 +4330,49 @@ impl Module {
     }
 }
 
+/// The source files of a unit as the DWARF line table numbers them.
+///
+/// A preprocessor stream is one *inclusion*, not one file: a header
+/// included twice is two streams, and the predefined macros and the
+/// command-line `-D`s are streams with no file at all (`<built-in>`,
+/// `<command-line>`). The line table lists each file once, as gcc's does,
+/// and nothing for a synthetic stream -- an entry naming no file sends a
+/// consumer such as gprofng's source archiver looking for a file called
+/// "." in the compilation directory.
+#[derive(Debug, Clone, Default)]
+pub struct SourceFiles {
+    /// The distinct paths, in order of first appearance: `.file N` names
+    /// `paths[N - 1]`.
+    pub paths: Vec<String>,
+    /// Stream id -> its `.file` number; `None` for a synthetic stream.
+    by_stream: Vec<Option<u32>>,
+}
+
+impl SourceFiles {
+    /// Number the files of the streams `names` (indexed by stream id). A
+    /// name in angle brackets is a synthetic stream's.
+    pub fn from_stream_names(names: impl IntoIterator<Item = String>) -> Self {
+        let mut files = SourceFiles::default();
+        let mut number: HashMap<String, u32> = HashMap::new();
+        for name in names {
+            let file = (!name.is_empty() && !name.starts_with('<')).then(|| {
+                *number.entry(name).or_insert_with_key(|name| {
+                    files.paths.push(name.clone());
+                    files.paths.len() as u32
+                })
+            });
+            files.by_stream.push(file);
+        }
+        files
+    }
+
+    /// The `.file` number of the file stream `stream` reads, or `None` for a
+    /// synthetic stream.
+    pub fn file_of(&self, stream: u16) -> Option<u32> {
+        self.by_stream.get(usize::from(stream)).copied().flatten()
+    }
+}
+
 /// A module containing multiple functions
 #[derive(Debug, Clone, Default)]
 pub struct Module {
@@ -3981,6 +4385,10 @@ pub struct Module {
     pub toplevel_asm: Vec<String>,
     /// Global variables
     pub globals: Vec<GlobalDef>,
+    /// The registers the unit's file-scope register variables are
+    /// (`register long r asm("r14")`). Each is the variable, so no function
+    /// of the unit may allocate it, save it or restore it.
+    pub global_registers: Vec<crate::arch::asm_constraints::PinnedGp>,
     /// String literals (label, content)
     pub strings: Vec<(String, String)>,
     /// `u"..."` literals referenced by address, as char16_t code units.
@@ -3990,11 +4398,16 @@ pub struct Module {
     pub utf32_strings: Vec<(String, Vec<u32>)>,
     /// Generate debug info
     pub debug: bool,
-    /// Source file paths (stream id -> path) for .file directives
-    pub source_files: Vec<String>,
+    /// The line table's files, and which one each preprocessor stream is.
+    pub source_files: SourceFiles,
     /// External symbols (declared extern but not defined in this module)
     /// These need GOT access on macOS
     pub extern_symbols: HashSet<String>,
+    /// Whether an exported definition of this unit may be replaced at load
+    /// time by another object's -- gcc's semantic interposition: code for a
+    /// shared object (`-fpic`, `-fPIC`, `-shared`) without
+    /// `-fno-semantic-interposition`. See [`Function::is_interposable`].
+    pub exports_interposable: bool,
     /// Attributes written on a symbol this translation unit declares but does
     /// not define. `weak` is the point of it: `extern int f(void)
     /// __attribute__((weak));` has to reach the object file as `.weak f`, or
@@ -4189,6 +4602,46 @@ impl Module {
         }
     }
 
+    /// Every thread-local the module names: those it defines, then those it
+    /// declares `extern`.
+    pub fn thread_locals(&self) -> impl Iterator<Item = &str> {
+        self.globals
+            .iter()
+            .filter(|g| g.is_thread_local)
+            .map(|g| g.name.as_str())
+            .chain(self.extern_tls_symbols.iter().map(String::as_str))
+    }
+
+    /// The access model of the thread-local `name` under `policy`: its
+    /// `tls_model` attribute's, on its definition or any declaration, else
+    /// the policy's for one defined here or elsewhere. The one answer
+    /// `ir::tls` and the backends both use, so the access a backend emits
+    /// is the one the IR was expanded for.
+    pub fn tls_model(
+        &self,
+        name: &str,
+        policy: crate::target::TlsPolicy,
+    ) -> crate::target::TlsModel {
+        let defined = self.globals.iter().find(|g| g.name == name);
+        let declared = match defined {
+            Some(g) => g.symbol_attrs.tls_model,
+            None => self
+                .declared_symbol_attrs
+                .get(name)
+                .and_then(|attrs| attrs.tls_model),
+        };
+        policy.model(defined.is_none(), declared)
+    }
+
+    /// Give the function `name`, defined here already, the `error` and
+    /// `warning` messages of a declaration after its definition: as in gcc,
+    /// they apply to every call all the same.
+    pub fn add_call_diagnostics(&mut self, name: &str, diags: &crate::parse::ast::CallDiagnostics) {
+        for func in self.functions.iter_mut().filter(|f| f.name == name) {
+            func.symbol_attrs.call_diagnostics.merge(diags);
+        }
+    }
+
     /// Record attributes on a symbol declared but not defined here, folded
     /// together over every such declaration. A later definition in the same
     /// unit takes them over: see `take_declared_symbol_attrs`.
@@ -4326,24 +4779,54 @@ impl Module {
     /// The names among `candidates` that something in the module still
     /// refers to: a direct call, any instruction operand naming the symbol
     /// (its address taken, a load or store through it), an inline asm
-    /// operand or a name written into an asm template, a global's
-    /// initializer, or the target of an alias.
+    /// operand, a global's initializer, or the target of an alias.
     ///
-    /// Missing a kind of reference here deletes a live function, so this
-    /// errs toward keeping: an identifier that merely *looks* like a
-    /// candidate in an assembly template counts.
+    /// A name written into an asm *template* is not a reference, as it is
+    /// not to gcc: an assembly template is text the compiler does not read,
+    /// and a static function called only from one needs `used`. Counting
+    /// every identifier-shaped word kept an unused `static inline void
+    /// wbinvd(void)` alive wherever `asm("wbinvd")` appeared, with whatever
+    /// undefined symbols its body named.
     pub fn referenced_symbols(&self, candidates: &HashSet<String>) -> HashSet<String> {
+        self.references_from(candidates, |_| true, true)
+    }
+
+    /// [`Self::referenced_symbols`], counting only the functions that are
+    /// emitted: a name an inline definition alone refers to is not in the
+    /// output at all. glibc's <ctype.h> declares hidden thread-locals that
+    /// only its `gnu_inline` bodies name, and a `.hidden` for one made an
+    /// untyped undefined symbol that the linker refuses beside the TLS one.
+    pub fn referenced_in_output(&self, candidates: &HashSet<String>) -> HashSet<String> {
+        self.references_from(candidates, |f| f.emit, true)
+    }
+
+    /// The names among `candidates` the output refers to other than by
+    /// calling them directly: whose address is taken, in code, in an
+    /// initializer, by an alias or in an asm statement. A function not
+    /// among them is only ever reached by a call that names it.
+    pub fn address_taken(&self, candidates: &HashSet<String>) -> HashSet<String> {
+        self.references_from(candidates, |f| f.emit, false)
+    }
+
+    /// The references [`Self::referenced_symbols`] describes, from the
+    /// functions `counts` accepts, a direct call counting when `calls`.
+    pub(crate) fn references_from(
+        &self,
+        candidates: &HashSet<String>,
+        counts: impl Fn(&Function) -> bool,
+        calls: bool,
+    ) -> HashSet<String> {
         let mut referenced = HashSet::new();
         let mut note = |name: &str| {
             if candidates.contains(name) {
                 referenced.insert(name.to_string());
             }
         };
-        for func in &self.functions {
+        for func in self.functions.iter().filter(|f| counts(f)) {
             for insn in func.blocks.iter().flat_map(|bb| &bb.insns) {
                 // A direct call. An indirect one is named `<indirect>`, so it
                 // cannot collide with a real symbol.
-                if insn.op == Opcode::Call {
+                if calls && insn.op == Opcode::Call {
                     if let Some(name) = &insn.extra().func_name {
                         note(name);
                     }
@@ -4358,10 +4841,7 @@ impl Module {
                         note(name);
                     }
                 }
-                // A name written into the assembly text itself -- `asm("call
-                // foo")` -- reaches the assembler with no IR reference at all.
                 if let Some(ref asm) = insn.extra().asm_data {
-                    for_each_word(&asm.template, &mut note);
                     for operand in asm.inputs.iter().chain(&asm.outputs) {
                         if let Some(name) = func.global_sym_name(operand.pseudo) {
                             note(name);
@@ -4383,21 +4863,6 @@ impl Module {
             note(&alias.target);
         }
         referenced
-    }
-}
-
-/// Every identifier-shaped word in an assembly template.
-fn for_each_word(template: &str, f: &mut impl FnMut(&str)) {
-    let mut word = String::new();
-    for ch in template.chars().chain(std::iter::once(' ')) {
-        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
-            word.push(ch);
-            continue;
-        }
-        if !word.is_empty() {
-            f(&word);
-            word.clear();
-        }
     }
 }
 
@@ -4495,7 +4960,7 @@ mod tests {
     }
 
     /// `-fvisibility=` reaches every external definition that named none,
-    /// and nothing else.
+    /// and nothing else: not an inline definition, which defines nothing.
     #[test]
     fn default_visibility_applies_to_external_definitions_only() {
         let types = TypeTable::new(&Target::host());
@@ -4504,8 +4969,10 @@ mod tests {
         let plain = Function::new("plain", types.int_id);
         let mut local = Function::new("local", types.int_id);
         local.is_static = true;
+        let mut inline_body = Function::new("inline_body", types.int_id);
+        inline_body.emit = false;
         let mut module = Module {
-            functions: vec![public, plain, local],
+            functions: vec![public, plain, local, inline_body],
             globals: vec![GlobalDef::new("g", types.int_id, Initializer::None)],
             aliases: vec![SymbolAlias {
                 name: "a".into(),
@@ -4524,7 +4991,7 @@ mod tests {
             .iter()
             .map(|f| f.symbol_attrs.visibility.as_deref())
             .collect();
-        assert_eq!(vis, [Some("default"), Some("hidden"), None]);
+        assert_eq!(vis, [Some("default"), Some("hidden"), None, None]);
         assert_eq!(
             module.globals[0].symbol_attrs.visibility.as_deref(),
             Some("hidden")
@@ -4733,8 +5200,9 @@ mod tests {
                 }
             }
         }
-        // Fence, Call, Setjmp, Longjmp and the atomics, each twice, and Asm once.
-        assert_eq!(barriers, 2 * 13 + 1);
+        // Fence, Call, Setjmp, Longjmp, Trap and the atomics, each twice,
+        // and Asm once.
+        assert_eq!(barriers, 2 * 14 + 1);
     }
 
     /// A vector operation computes in registers: it touches no memory, so
@@ -4977,8 +5445,9 @@ mod tests {
         assert_eq!(module.functions.len(), 1);
     }
 
-    /// Each kind of reference counts; a candidate nothing names does not, and
-    /// a local spelled like a candidate is not a reference to it.
+    /// Each kind of reference counts; a candidate nothing names does not, a
+    /// local spelled like a candidate is not a reference to it, and neither
+    /// is a word of an asm template (gcc does not read the template).
     #[test]
     fn test_module_referenced_symbols() {
         let types = TypeTable::new(&Target::host());
@@ -5042,7 +5511,49 @@ mod tests {
         let got = module.referenced_symbols(&candidates);
         let mut got: Vec<&str> = got.iter().map(String::as_str).collect();
         got.sort_unstable();
-        assert_eq!(got, ["called", "from_init", "in_template", "loaded"]);
+        assert_eq!(got, ["called", "from_init", "loaded"]);
+    }
+
+    /// A function that is not emitted -- an inline definition -- still
+    /// counts for the inliner's purposes, and not for what the output names.
+    #[test]
+    fn test_module_referenced_in_output_skips_inline_definitions() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        for (name, callee, emit) in [("body", "from_body", false), ("real", "from_real", true)] {
+            let mut func = Function::new(name, types.int_id);
+            func.emit = emit;
+            let mut bb = BasicBlock::new(BasicBlockId(0));
+            bb.add_insn(Instruction::new(Opcode::Entry));
+            bb.add_insn(Instruction::call(
+                None,
+                callee,
+                vec![],
+                vec![],
+                types.int_id,
+                32,
+            ));
+            bb.add_insn(Instruction::ret(None));
+            func.add_block(bb);
+            module.add_function(func);
+        }
+        let candidates: HashSet<String> = ["from_body", "from_real"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let sorted = |set: HashSet<String>| {
+            let mut v: Vec<String> = set.into_iter().collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            sorted(module.referenced_symbols(&candidates)),
+            ["from_body", "from_real"]
+        );
+        assert_eq!(
+            sorted(module.referenced_in_output(&candidates)),
+            ["from_real"]
+        );
     }
 
     #[test]
@@ -5233,7 +5744,7 @@ mod tests {
     #[test]
     fn test_round_to_integral_opcodes() {
         use IntegralRounding::*;
-        let names: Vec<&str> = [Floor, Ceil, Trunc, Round, Rint, NearbyInt]
+        let names: Vec<&str> = [Floor, Ceil, Trunc, Round, Rint, NearbyInt, RoundEven]
             .into_iter()
             .map(|how| {
                 let op = Opcode::RoundToIntegral(how);
@@ -5243,7 +5754,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["ffloor", "fceil", "ftrunc", "fround", "frint", "fnearbyint"]
+            [
+                "ffloor",
+                "fceil",
+                "ftrunc",
+                "fround",
+                "frint",
+                "fnearbyint",
+                "froundeven"
+            ]
         );
         assert_ne!(Opcode::RoundToIntegral(Trunc).name(), Opcode::Trunc.name());
     }
@@ -5948,6 +6467,19 @@ mod tests {
         // setjmp/longjmp save/restore arbitrary execution context.
         assert!(Instruction::new(Opcode::Setjmp).is_memory_barrier());
         assert!(Instruction::new(Opcode::Longjmp).is_memory_barrier());
+    }
+
+    /// `__builtin_trap`'s opcode ends its block and is never deleted, and a
+    /// store before it stays: the handler of the signal it raises may read
+    /// anything.
+    #[test]
+    fn test_trap_is_a_barrier_terminator() {
+        let op = Opcode::Trap;
+        assert!(op.is_terminator());
+        assert!(op.has_side_effects());
+        assert!(op.may_access_memory());
+        assert!(Instruction::new(op).is_memory_barrier());
+        assert_eq!(op.name(), "trap");
     }
 
     fn constraint(c: &str, matching_output: Option<usize>) -> AsmConstraint {

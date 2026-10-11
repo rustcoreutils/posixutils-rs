@@ -11,11 +11,15 @@
 // Tests for macro expansion, stringification, token pasting, and directives.
 //
 
+mod cmdline_options;
 mod conformance;
 mod directives;
 mod end_of_file;
+mod line_markers;
 mod macros;
 mod output_spacing;
+mod paste;
 mod pp_diagnostics;
+mod search_chain;
 mod std_dialect;
 mod target_predefines;

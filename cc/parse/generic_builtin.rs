@@ -17,7 +17,7 @@
 // the pointer of `__builtin_object_size`), the call is checked through it.
 //
 
-use super::ast::{CheckedOp, Expr, ExprKind, FpTest, ObjectSizeType};
+use super::ast::{CheckedOp, Expr, ExprKind, FpTest, ObjectSizeForm, ObjectSizeType};
 use super::builtin_args::{BuiltinArgs, ConstantArgument};
 use super::library_builtin::ProtoType;
 use super::parser::{ParseResult, Parser};
@@ -411,7 +411,8 @@ impl Parser<'_> {
     /// `__builtin_dynamic_object_size` takes the same arguments and may also
     /// answer with a size known only at run time. Every answer the static
     /// form gives is a correct one for it -- run-time sizes are a refinement
-    /// gcc offers, not a different meaning -- so it is the same builtin.
+    /// gcc offers, not a different meaning -- so it is answered the same way
+    /// here, and only `ir::objsize` computes the run-time sizes.
     ///
     /// gcc declares it `size_t (const void *, int)`; the type must then be
     /// an integer constant from 0 to 3. Bit 0 selects the closest
@@ -433,18 +434,32 @@ impl Parser<'_> {
             return Ok(self.diagnosed_call(size_t, pos));
         };
         let otype = ObjectSizeType::from_bits(otype as u64);
-        let size = match self.object_extent(&ptr) {
+        let form = if name == kw::BUILTIN_DYNAMIC_OBJECT_SIZE {
+            ObjectSizeForm::Dynamic
+        } else {
+            ObjectSizeForm::Static
+        };
+        let optimizing = self.library_call_policy.optimizing;
+        let known = self
+            .object_extent(&ptr)
+            // Through a pointer, gcc knows a member's size only once
+            // optimizing.
+            .filter(|extent| extent.names_the_object() || optimizing)
+            .and_then(|extent| extent.remaining(otype.subobject));
+        let size = match known {
             // A statically known object has the same minimum and maximum
             // size, so bit 1 does not change the answer.
-            Some(extent) => extent.remaining(otype.subobject),
+            Some(size) => size,
             // Not known from the expression: gcc finds the object after
             // inlining and propagation, which only an optimizing compile
             // runs. At `-O0` it answers at once, with the answer for an
-            // unknown object.
-            None if self.library_call_policy.optimizing => {
+            // unknown object -- except to the dynamic form, for an object
+            // of a fixed size at a run-time offset.
+            None if optimizing || form == ObjectSizeForm::Dynamic => {
                 let deferred = ExprKind::ObjectSize {
                     ptr: Box::new(ptr),
                     otype,
+                    form,
                 };
                 return Ok(Self::typed_expr(deferred, size_t, pos));
             }

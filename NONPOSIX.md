@@ -128,13 +128,37 @@ Language and preprocessor additions:
  * `__attribute__` (and `__attribute`), with `noreturn unused aligned packed
    deprecated weak section visibility constructor destructor used noinline
    always_inline hot cold warn_unused_result format fallthrough nonstring
-   malloc pure sentinel no_sanitize_*` and their `__name__` spellings.
+   malloc pure sentinel no_sanitize_* assume_aligned` and their `__name__`
+   spellings (`assume_aligned`: the Linux kernel's `__assume_aligned`).
+ * The attributes `error` and `warning` (the Linux kernel's `BUILD_BUG_ON`
+   and `compiletime_assert`, glibc's `__errordecl`/`__warndecl`): a call
+   that survives optimization is reported, one the optimizer removed is
+   not.  `tls_model` (glibc's `attribute_tls_model_ie`), `format_arg`
+   (glibc's `<libintl.h>`), `flatten` (the kernel's `__flatten`), `retain`
+   (the kernel's `__retain`), `noipa` (gcc's c-torture suite),
+   `patchable_function_entry` (the kernel's `notrace`),
+   `zero_call_used_regs` (the per-function form of the kernel's
+   `-fzero-call-used-regs=`), `no_caller_saved_registers` (the kernel's
+   `kstack_erase.h`), `no_profile_instrument_function` (the kernel's
+   `__no_profile`),
+   `no_sanitize` and gcc's other sanitizer exemptions (the kernel's
+   `__signed_wrap`), each as gcc 13 does it.
+ * `__builtin_has_attribute(decl-or-type, attribute)`.
  * Statement expressions `({ ... })`.
  * `typeof` / `__typeof__` / `__typeof`, and the `__const`, `__volatile`,
    `__restrict`, `__inline`, `__signed`, `__extension__`, `__thread`,
    `__alignof__` keyword aliases.
  * GCC extended inline assembly, including `asm goto`; `asm` / `__asm__` /
    `__asm`.
+ * Inline-asm flag outputs, `"=@cc<cond>"`, with gcc's condition names on
+   x86-64 and aarch64, and `__GCC_ASM_FLAG_OUTPUTS__` predefined: the output
+   is 1 when the condition holds on the flags the template leaves.  The
+   Linux kernel's x86 bitops, `cmpxchg` and per-CPU helpers write
+   `"=@ccz"`/`"=@ccc"` outputs (older kernels through `CC_SET`/`CC_OUT`,
+   when the macro is defined).
+ * Inline-asm operand names as matching constraints, `"[sum]"` for the
+   output named `sum`, anywhere in a constraint as gcc reads them: gcc's
+   own torture suite ties inputs to outputs so (`pr20314-2.c`).
  * `__int128`, `__int128_t`, `__uint128_t`, `_Float16`, `_Float32`, `_Float64`,
    `__builtin_va_list`.
  * GNU imaginary constants — `1.0i`, `2.2if`, `1.0fi`, `2.2iL`, `1.j`.  The
@@ -144,6 +168,22 @@ Language and preprocessor additions:
    The integer form `2i`, which gcc types `_Complex int`, is not accepted.
  * Clang nullability qualifiers `_Nonnull`, `_Nullable`, `_Null_unspecified`
    and their `__` spellings.
+ * On x86-64, gcc's named address spaces `__seg_fs` and `__seg_gs`, with
+   `__SEG_FS` and `__SEG_GS` predefined: an object so qualified is reached
+   through the `%fs` or `%gs` segment.  glibc's `THREAD_SELF` reads the
+   thread pointer through `__seg_fs`, and the Linux kernel's per-CPU
+   accessors use `__seg_gs` when its `CC_HAS_NAMED_AS` probe passes.
+   Atomic operations, `__int128` and `long double` in a named space are
+   refused ("sorry, unimplemented").
+ * Pointers to arrays whose elements differ only in qualifiers subtract,
+   compare, convert as if by assignment and meet in `?:` (C2x's rule, which
+   gcc applies): glibc's nss subtracts a `const char (*)[N]` from a
+   `char (*)[N]`.  `-pedantic` warns, and dropping a qualifier is
+   `-Wdiscarded-array-qualifiers`.  `_Atomic` is no such qualifier.
+ * `(size_t)&((T *)0)->m`, the offsetof spelling from before `<stddef.h>`,
+   and `&*(T *)0`, are constant expressions, through `->`, `.`, `*` and
+   `[]` alike, as in gcc: the Linux kernel's sysrq.c puts
+   `&(*(const T *)NULL)` in a static table.
  * Roughly 145 `__builtin_*` and `__c11_atomic_*` intrinsics, including the
    `__builtin___*_chk` FORTIFY family and the libc aliases (`__builtin_abort`,
    `__builtin_printf`, `__builtin_strcpy`, ...) that let a translation unit
@@ -151,16 +191,31 @@ Language and preprocessor additions:
  * `__FUNCTION__`, `__PRETTY_FUNCTION__`.
  * `#include_next`, `#warning`, `#pragma once`, `#pragma push_macro` and
    `#pragma pop_macro`.
+ * A `_Pragma` operand is macro-replaced before it is read, as gcc does:
+   the Linux kernel's `__diag()` writes `_Pragma(__diag_str(...))`, glibc's
+   `DIAG_IGNORE_NEEDS_COMMENT` the same.
+ * In assembler-with-cpp (`.S`) a `##` that forms no single token leaves its
+   operands side by side without a diagnostic, as gcc's `-lang-asm` does:
+   the Linux kernel pastes onto `.macro` parameters (`.L__sym_size_##name`)
+   and builds `initcall##level##.init` in its linker script.
+ * `#include <...>` searches the host gcc's own include directory last, for
+   the private headers c17 does not bundle: libbacktrace's `<unwind.h>`.
+ * `<limits.h>` defines gcc's `LONG_LONG_MIN`, `LONG_LONG_MAX` and
+   `ULONG_LONG_MAX` under glibc's `_GNU_SOURCE` (with another C library,
+   always): glibc's vfprintf stops without them.
  * `__has_attribute`, `__has_builtin`, `__has_feature`, `__has_extension`,
    `__has_include`, `__has_include_next`.
  * Named variadic macro parameters (`#define F(args...)`), an empty variadic
    tail, and the `, ## __VA_ARGS__` comma-swallow.
+ * Index range designators `[lo ... hi]`, also after a field designator,
+   `.f[lo ... hi] = v`, whose value is evaluated once, as gcc's is, and
+   stored into every element: the Linux kernel's ima_queue.c initializes a
+   hash table of `HLIST_HEAD_INIT` so, binutils' i386-dis.c an array of
+   `-1`.
  * Empty `enum { }` (diagnosed under `--pedantic`).
  * Digraphs, and the C23 one-argument `_Static_assert`.
  * `__GNUC__`, `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__`, `__VERSION__` and
    `__GNUC_STDC_INLINE__` are predefined.
- * On Linux, `_GNU_SOURCE`, `_XOPEN_SOURCE=800` and `_XOPEN_SOURCE_EXTENDED`
-   are predefined unconditionally.
 
 Deviation: `-std=` selects nothing — the language is C17 and
 `__STDC_VERSION__` is `201710L` whatever it names.  A C99, C11 or C17

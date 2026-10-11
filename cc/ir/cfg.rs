@@ -10,7 +10,8 @@
 // changes one.
 //
 // A block's instructions are what decide where control goes -- its
-// terminator's targets, and the labels an `asm goto` in it may jump to.
+// terminator's targets, the labels an `asm goto` in it may jump to, and the
+// landing pad an unwind through a call in it goes to.
 // `BasicBlock::children` and `parents` are a cache of that, kept because
 // nearly every pass wants predecessors and computing them is a walk of the
 // whole function. A cache is only as good as its upkeep, and edges were
@@ -46,7 +47,8 @@ use std::collections::{HashMap, HashSet};
 
 /// Every block an [`Instruction`] can transfer control to, as an iterator of
 /// references to its slots, repeats included: the true and false targets,
-/// each switch case and the default, then the `asm goto` labels. Expanded
+/// each switch case and the default, then the `asm goto` labels, then a
+/// call's landing pad. Expanded
 /// once over a shared instruction and once (with `mut`) over a unique one,
 /// so the walk that reads the targets and the walks that rewrite them are
 /// one list.
@@ -58,17 +60,23 @@ macro_rules! target_slots {
             extra,
             ..
         } = $insn;
-        let (cases, default, asm) = match extra {
+        let (cases, default, asm, pad) = match extra {
             Some(e) => {
                 let InsnExtra {
                     switch_cases,
                     switch_default,
                     asm_data,
+                    landing_pad,
                     ..
                 } = &$($m)? **e;
-                (Some(switch_cases), Some(switch_default), Some(asm_data))
+                (
+                    Some(switch_cases),
+                    Some(switch_default),
+                    Some(asm_data),
+                    Some(landing_pad),
+                )
             }
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         bb_true
             .into_iter()
@@ -81,13 +89,15 @@ macro_rules! target_slots {
                     .flat_map(|d| &$($m)? d.goto_labels)
                     .map(|(b, _)| b),
             )
+            .chain(pad.into_iter().flatten())
     }};
 }
 
 impl Instruction {
     /// Every block this instruction can transfer control to: a branch's and a
-    /// switch's targets, and the labels of an `asm goto`. Empty for anything
-    /// else, `IndirectBr` included -- it names no target.
+    /// switch's targets, the labels of an `asm goto`, and the landing pad a
+    /// call unwinds to. Empty for anything else, `IndirectBr` included -- it
+    /// names no target.
     pub fn control_targets(&self) -> Vec<BasicBlockId> {
         let mut out = Vec::new();
         // A switch can name thousands of cases, most landing together.
@@ -159,16 +169,19 @@ impl BasicBlock {
             .is_some_and(|i| i.op == Opcode::IndirectBr)
     }
 
-    /// Does an `asm goto` in this block name targets besides the
-    /// terminator's? Such a block ends in an ordinary `Br` to the
-    /// fallthrough, so an analysis that reads edges off the terminator alone
-    /// would miss the rest of them and find the labels unreachable.
-    pub fn has_asm_goto(&self) -> bool {
+    /// Does an instruction ahead of the terminator name successors -- an
+    /// `asm goto`'s labels, a call's landing pad? Such a block ends in an
+    /// ordinary `Br` to the fallthrough (or an `Unreachable` after a call
+    /// that does not return), so an analysis that reads edges off the
+    /// terminator alone would miss the rest of them and find those blocks
+    /// unreachable.
+    pub fn has_mid_block_edge(&self) -> bool {
         self.insns.iter().any(|i| {
-            i.extra()
-                .asm_data
-                .as_ref()
-                .is_some_and(|d| !d.goto_labels.is_empty())
+            i.extra().landing_pad.is_some()
+                || i.extra()
+                    .asm_data
+                    .as_ref()
+                    .is_some_and(|d| !d.goto_labels.is_empty())
         })
     }
 
@@ -249,6 +262,51 @@ impl Function {
             debug_assert!(b.children.is_empty(), "{to} already has successors");
             b.children = moved;
         }
+    }
+
+    /// Give every call in `blocks` that may throw and has no landing pad the
+    /// landing pad `pad`, ending its block after it as a call with a pad
+    /// must: what follows the call moves to a new block, with the edges out.
+    /// Returns the new blocks.
+    ///
+    /// For a body spliced into a call that had `pad`: an unwind out of any
+    /// call in it passes through the call site's cleanups too.
+    pub fn unwind_calls_to(
+        &mut self,
+        blocks: &[BasicBlockId],
+        pad: BasicBlockId,
+    ) -> Vec<BasicBlockId> {
+        let mut added = Vec::new();
+        let mut work: Vec<BasicBlockId> = blocks.to_vec();
+        while let Some(b) = work.pop() {
+            let Some(block) = self.get_block_mut(b) else {
+                continue;
+            };
+            let Some(k) = block.insns.iter().position(|i| {
+                i.op == Opcode::Call && i.extra().may_throw && i.extra().landing_pad.is_none()
+            }) else {
+                continue;
+            };
+            block.insns[k].extra_mut().landing_pad = Some(pad);
+            let ends = block.insns.get(k + 1).is_some_and(|i| i.op.is_terminator());
+            if !ends {
+                let rest = block.insns.split_off(k + 1);
+                let next = self.fresh_block_id();
+                self.get_block_mut(b)
+                    .expect("the block is still here")
+                    .insns
+                    .push(Instruction::br(next));
+                let mut tail = BasicBlock::new(next);
+                tail.insns = rest;
+                self.add_block(tail);
+                self.move_successors(b, next);
+                self.add_edge(b, next);
+                added.push(next);
+                work.push(next);
+            }
+            self.add_edge(b, pad);
+        }
+        added
     }
 
     /// Forget the edge `from` -> `to`, which no instruction of `from` names any
@@ -572,7 +630,7 @@ impl Function {
             return None;
         };
         let ends_in_br = block.insns.last().is_some_and(|t| t.op == Opcode::Br);
-        if !ends_in_br || block.has_asm_goto() || b == block.id || b == self.entry {
+        if !ends_in_br || block.has_mid_block_edge() || b == block.id || b == self.entry {
             return None;
         }
         let next = self.get_block(b)?;
@@ -896,6 +954,73 @@ mod tests {
                 (BasicBlockId(1), PseudoId(12))
             ]
         );
+        valid(&f);
+    }
+
+    /// Spliced into a call with a landing pad, a body's throwing calls take
+    /// the pad, each ending its block with the edge to it; a `nothrow` call
+    /// and one with a pad of its own are left as they are.
+    #[test]
+    fn unwind_calls_to_ends_each_throwing_call_s_block() {
+        let types = TypeTable::new(&Target::host());
+        let call = |name: &str, may_throw: bool| {
+            let mut c = Instruction::call(None, name, vec![], vec![], types.void_id, 0);
+            c.extra_mut().may_throw = may_throw;
+            c
+        };
+        let mut own = call("own", true);
+        own.extra_mut().landing_pad = Some(BasicBlockId(3));
+        let pad = |exception: u32| {
+            vec![
+                Instruction::new(Opcode::LandingPad)
+                    .with_target(PseudoId(exception))
+                    .with_type(types.void_ptr_id)
+                    .with_size(64),
+                br(4),
+            ]
+        };
+        let mut f = function(vec![
+            (
+                0,
+                vec![
+                    entry(),
+                    call("g", true),
+                    call("h", false),
+                    call("k", true),
+                    br(1),
+                ],
+                vec![1],
+            ),
+            (1, vec![own, br(4)], vec![3, 4]),
+            (2, pad(5), vec![4]),
+            (3, pad(6), vec![4]),
+            (4, vec![ret()], vec![]),
+        ]);
+        f.rebuild_block_idx();
+        let added = f.unwind_calls_to(&[BasicBlockId(0), BasicBlockId(1)], BasicBlockId(2));
+        // `k` is last before the terminator already, so only `g`'s block
+        // is split.
+        assert_eq!(added.len(), 1);
+        let block = |id: BasicBlockId| f.get_block(id).unwrap();
+        let ops = |id| block(id).insns.iter().map(|i| i.op).collect::<Vec<_>>();
+        assert_eq!(
+            ops(BasicBlockId(0)),
+            [Opcode::Entry, Opcode::Call, Opcode::Br]
+        );
+        assert_eq!(block(BasicBlockId(0)).children, [added[0], BasicBlockId(2)]);
+        assert_eq!(ops(added[0]), [Opcode::Call, Opcode::Call, Opcode::Br]);
+        assert_eq!(block(added[0]).insns[0].extra().landing_pad, None);
+        assert_eq!(
+            block(added[0]).insns[1].extra().landing_pad,
+            Some(BasicBlockId(2))
+        );
+        assert_eq!(block(added[0]).children, [BasicBlockId(1), BasicBlockId(2)]);
+        assert_eq!(block(BasicBlockId(1)).parents, [added[0]]);
+        assert_eq!(
+            block(BasicBlockId(1)).insns[0].extra().landing_pad,
+            Some(BasicBlockId(3))
+        );
+        assert_eq!(block(BasicBlockId(2)).parents, [BasicBlockId(0), added[0]]);
         valid(&f);
     }
 

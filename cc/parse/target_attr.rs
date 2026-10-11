@@ -14,7 +14,7 @@
 
 use super::attribute::{AttributeArg, AttributeList, ATTRIBUTE_WARNING};
 use crate::diag;
-use crate::target::{IsaRequest, Os, Target};
+use crate::target::{Arch, BranchProtection, IsaRequest, Os, Target};
 use crate::target_attr::{
     parse_target, parse_target_clones, ClonesIssue, TargetClones, TargetIssue,
 };
@@ -64,10 +64,6 @@ fn report_target_issue(pos: Position, issue: &TargetIssue) {
             "attribute value '{0}' is unknown in '{1}' attribute",
             &[item, "target"],
         ),
-        // `target` only permits an ISA: ignoring one c17 does not generate
-        // leaves plain C as it was, and a body that really used it fails on
-        // its own. libzstd's tests build such functions under -Werror.
-        TargetIssue::BeyondCeiling(_) => {}
         TargetIssue::Unsupported(item) => attr_warning(
             pos,
             "'{0}' in 'target' attribute is not supported and is ignored",
@@ -78,6 +74,7 @@ fn report_target_issue(pos: Position, issue: &TargetIssue) {
             "pragma or attribute 'target(\"{0}\")' is not valid",
             &[item],
         ),
+        TargetIssue::BranchProtection(e) => diag::error(pos, &e.attribute_message()),
     }
 }
 
@@ -140,7 +137,10 @@ pub(super) fn check_target_args(
     } else {
         let mut ok = true;
         for text in strings {
-            let (_, issues) = parse_target(text, target.arch);
+            let (_, mut issues) = parse_target(text, target.arch);
+            if target.os == Os::MacOS {
+                issues.extend(unsupported_branch_protection(text));
+            }
             for issue in &issues {
                 report_target_issue(pos, issue);
             }
@@ -148,6 +148,20 @@ pub(super) fn check_target_args(
         }
         ok
     }
+}
+
+/// The `branch-protection=` items of `text` that ask for a protection,
+/// which Darwin has no property note to carry: as `-mbranch-protection` is
+/// refused there, they are ignored with a warning.
+fn unsupported_branch_protection(text: &str) -> Vec<TargetIssue> {
+    text.split(',')
+        .filter(|item| {
+            item.strip_prefix("branch-protection=")
+                .and_then(|v| BranchProtection::parse(v).ok())
+                .is_some_and(BranchProtection::protects)
+        })
+        .map(|item| TargetIssue::Unsupported(item.to_string()))
+        .collect()
 }
 
 impl AttributeList {
@@ -160,6 +174,10 @@ impl AttributeList {
         for text in strings {
             let (part, _) = parse_target(text, target.arch);
             request.extend(part);
+        }
+        // Darwin's warning said the protection is ignored.
+        if target.os == Os::MacOS && target.arch == Arch::Aarch64 {
+            request.push_branch_protection(BranchProtection::default());
         }
         Some(request)
     }

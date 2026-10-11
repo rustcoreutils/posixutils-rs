@@ -14,7 +14,7 @@ use super::declaration::SpecContext;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol, SymbolId};
+use crate::symbol::{DeclaredAt, Namespace, Symbol, SymbolId};
 use crate::target::ByteOrder;
 use crate::token::lexer::{Position, TokenType, TokenValue};
 use crate::token::preprocess::StorageOrderPragma;
@@ -155,7 +155,7 @@ impl Parser<'_> {
         // the closing brace -- not between the tag and `{`, which it rejects.
         // Of them only `packed` means anything; gcc ignores `aligned` on an
         // enum, and on a declaration that is not a definition.
-        let (early_attrs, tag) = self.parse_attributed_tag()?;
+        let (early_attrs, tag, tag_pos) = self.parse_attributed_tag()?;
 
         // Check for definition vs forward reference
         if self.is_special(b'{') {
@@ -196,7 +196,9 @@ impl Parser<'_> {
                     if v < i32::MIN as i128 || v > i32::MAX as i128 {
                         diag::pedwarn(
                             value_pos,
-                            &gettext("ISO C restricts enumerator values to range of 'int'"),
+                            &gettext(
+                                "ISO C restricts enumerator values to range of 'int' before C2X",
+                            ),
                         );
                     }
                     v
@@ -209,7 +211,8 @@ impl Parser<'_> {
 
                 // Register enum constant in symbol table (Ordinary namespace)
                 let sym =
-                    Symbol::enum_constant(name, value, self.types.int_id, self.symbols.depth());
+                    Symbol::enum_constant(name, value, self.types.int_id, self.symbols.depth())
+                        .declared_at(DeclaredAt::at(name_pos, true));
                 // 6.7p3: an enumerator shares the ordinary name space, so a
                 // repeat -- of another enumerator or of a variable -- is a
                 // constraint violation. `declare` already detects it; the
@@ -219,20 +222,17 @@ impl Parser<'_> {
                     Ok(id) => constant_syms.push(id),
                     Err(_) => {
                         let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-                        let existing = self.symbols.lookup(name, Namespace::Ordinary);
-                        let redeclared = existing.is_some_and(|e| !e.is_enum_constant());
-                        if redeclared {
-                            diag::error_args(
-                                enum_pos,
-                                "'{0}' redeclared as a different kind of symbol",
-                                &[&spelled],
-                            );
+                        let existing = self.symbols.lookup_id(name, Namespace::Ordinary);
+                        let redeclared =
+                            existing.is_some_and(|e| !self.symbols.get(e).is_enum_constant());
+                        let template = if redeclared {
+                            "'{0}' redeclared as different kind of symbol"
                         } else {
-                            diag::error_args(
-                                enum_pos,
-                                "redeclaration of enumerator '{0}'",
-                                &[&spelled],
-                            );
+                            "redeclaration of enumerator '{0}'"
+                        };
+                        diag::error_args(name_pos, template, &[&spelled]);
+                        if let Some(existing) = existing {
+                            self.note_previous_symbol(existing);
                         }
                     }
                 }
@@ -287,7 +287,7 @@ impl Parser<'_> {
 
             // A forward reference to the tag made an incomplete enum; the
             // definition completes that same type, as a struct's does.
-            if let Some(redefined) = tag.and_then(|t| self.reused_tag(t, TypeKind::Enum)) {
+            if let Some(redefined) = tag.and_then(|t| self.reused_tag(t, tag_pos, TypeKind::Enum)) {
                 return Ok(self.types.get(redefined).clone());
             }
             if let Some(existing) = tag.and_then(|t| self.symbols.lookup_tag_in_current_scope(t)) {
@@ -297,6 +297,7 @@ impl Parser<'_> {
                     && forward.composite.as_ref().is_some_and(|c| !c.is_complete)
                 {
                     self.types.complete_enum(existing_typ, composite, unsigned);
+                    self.tag_defined_at(tag, tag_pos);
                     return Ok(self.types.get(existing_typ).clone());
                 }
             }
@@ -318,7 +319,8 @@ impl Parser<'_> {
             // which carries the tag's identity.
             if let Some(tag_name) = tag {
                 let enum_type_id = self.types.intern(enum_type);
-                let sym = Symbol::tag(tag_name, enum_type_id, self.symbols.depth());
+                let sym = Symbol::tag(tag_name, enum_type_id, self.symbols.depth())
+                    .declared_at(DeclaredAt::at(tag_pos, true));
                 let _ = self.symbols.declare(sym);
                 return Ok(self.types.get(enum_type_id).clone());
             }
@@ -417,8 +419,9 @@ impl Parser<'_> {
     /// instead, when an earlier declaration of the tag here forbids it --
     /// one of another kind (C17 6.7.2.3p2), or one already defined
     /// (6.7.2.3p1). `None` when the definition may go ahead.
-    fn reused_tag(&self, tag: StringId, kind: TypeKind) -> Option<TypeId> {
-        let existing = self.symbols.lookup_tag_in_current_scope(tag)?.typ;
+    fn reused_tag(&self, tag: StringId, tag_pos: Position, kind: TypeKind) -> Option<TypeId> {
+        let existing_sym = self.symbols.lookup_tag_in_current_scope(tag)?;
+        let (existing, defined) = (existing_sym.typ, existing_sym.declared);
         if !self.check_tag_kind(tag, existing, kind) {
             return Some(existing);
         }
@@ -437,11 +440,13 @@ impl Parser<'_> {
             _ => "struct",
         };
         let spelled = self.idents.get_opt(tag).unwrap_or("");
-        diag::error_args(
-            self.current_pos(),
-            "redefinition of '{0} {1}'",
-            &[keyword, spelled],
-        );
+        // gcc calls a second enumerator list a redeclaration.
+        let template = match kind {
+            TypeKind::Enum => "redeclaration of '{0} {1}'",
+            _ => "redefinition of '{0} {1}'",
+        };
+        diag::error_args(tag_pos, template, &[keyword, spelled]);
+        diag::note(defined.pos, &gettext("originally defined here"));
         Some(existing)
     }
 
@@ -464,14 +469,26 @@ impl Parser<'_> {
     /// The attributes written between a tag keyword and its tag, and the
     /// tag: `struct __attribute__((packed)) S`, `enum __attribute__((packed))
     /// E`, or with no tag at all.
-    fn parse_attributed_tag(&mut self) -> ParseResult<(AttributeList, Option<StringId>)> {
+    /// The third is where the tag is written, or the brace that follows
+    /// when there is none.
+    fn parse_attributed_tag(&mut self) -> ParseResult<(AttributeList, Option<StringId>, Position)> {
         let attrs = self.parse_attributes();
+        let tag_pos = self.current_pos();
         let tag = if self.peek() == TokenType::Ident && !self.is_special(b'{') {
             Some(self.expect_identifier()?)
         } else {
             None
         };
-        Ok((attrs, tag))
+        Ok((attrs, tag, tag_pos))
+    }
+
+    /// Record that the tag of this scope that was just completed was
+    /// defined at `pos`, for the note a redefinition gives.
+    fn tag_defined_at(&mut self, tag: Option<StringId>, pos: Position) {
+        let Some(id) = tag.and_then(|t| self.symbols.lookup_id(t, Namespace::Tag)) else {
+            return;
+        };
+        self.symbols.get_mut(id).declared = DeclaredAt::at(pos, true);
     }
 
     /// Parse a struct or union specifier
@@ -490,22 +507,33 @@ impl Parser<'_> {
 
         // Attributes between 'struct' and the tag name
         // (e.g., struct __attribute__((packed)) tagname { ... })
-        let (early_attrs, tag) = self.parse_attributed_tag()?;
+        let (early_attrs, tag, tag_pos) = self.parse_attributed_tag()?;
         let mut is_packed = early_attrs.has_packed();
         // `transparent_union` is collected at the same positions as
         // `packed`, for the same reason: gcc accepts it at any of them.
         let mut is_transparent = early_attrs.has_transparent_union();
         // Track struct-level aligned attribute (max across all positions)
-        let mut struct_align: Option<u32> = early_attrs.get_alignment();
+        let mut struct_align: Option<u32> =
+            early_attrs.get_alignment(self.types.biggest_alignment());
         // `scalar_storage_order`, accepted at the same three positions; the
         // last one written decides, as in gcc.
         let mut storage_order = early_attrs.storage_order(specifier_pos);
 
         // Parse __attribute__ after tag name but before '{'
+        let pre_pos = self.current_pos();
         let pre_attrs = self.parse_attributes();
+        // After a tag they end the specifier: `struct T __attribute__((x))`
+        // names the type, and the attributes are the declaration's. A body
+        // cannot follow, and gcc says so in these words.
+        if tag.is_some() && !pre_attrs.attrs.is_empty() && self.is_special(b'{') {
+            return Err(ParseError::new(
+                gettext("expected identifier or '(' before '{' token"),
+                self.current_pos(),
+            ));
+        }
         is_packed = is_packed || pre_attrs.has_packed();
         is_transparent = is_transparent || pre_attrs.has_transparent_union();
-        if let Some(a) = pre_attrs.get_alignment() {
+        if let Some(a) = pre_attrs.get_alignment(self.types.biggest_alignment()) {
             struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
         }
         storage_order = pre_attrs.storage_order(specifier_pos).or(storage_order);
@@ -534,7 +562,7 @@ impl Parser<'_> {
             let attrs = self.parse_attributes();
             is_packed = is_packed || attrs.has_packed();
             is_transparent = is_transparent || attrs.has_transparent_union();
-            if let Some(a) = attrs.get_alignment() {
+            if let Some(a) = attrs.get_alignment(self.types.biggest_alignment()) {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
             storage_order = attrs.storage_order(specifier_pos).or(storage_order);
@@ -617,7 +645,7 @@ impl Parser<'_> {
             } else {
                 TypeKind::Struct
             };
-            if let Some(redefined) = tag.and_then(|t| self.reused_tag(t, kind)) {
+            if let Some(redefined) = tag.and_then(|t| self.reused_tag(t, tag_pos, kind)) {
                 return Ok(self.types.get(redefined).clone());
             }
             if let Some(tag_name) = tag {
@@ -632,6 +660,7 @@ impl Parser<'_> {
                         .is_some_and(|c| !c.is_complete)
                     {
                         self.types.complete_struct(existing_typ, composite);
+                        self.tag_defined_at(tag, tag_pos);
                         return Ok(self.types.get(existing_typ).clone());
                     }
                 }
@@ -649,20 +678,24 @@ impl Parser<'_> {
             // which carries the tag's identity.
             if let Some(tag_name) = tag {
                 let typ_id = self.types.intern(struct_type);
-                let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth());
+                let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth())
+                    .declared_at(DeclaredAt::at(tag_pos, true));
                 let _ = self.symbols.declare(sym);
                 return Ok(self.types.get(typ_id).clone());
             }
 
             Ok(struct_type)
         } else {
-            // A reference, not a definition: the type already exists, so an
-            // `aligned` written on it is the declaration's -- gcc aligns `x` in
-            // `struct S __attribute__((aligned(32))) x;`, and a type-name's
-            // type in `_Alignof(struct S __attribute__((aligned(32))))`.
-            if let Some(align) = struct_align {
+            // A reference, not a definition: the type already exists, so
+            // what is written after its tag is the declaration's, as after
+            // `int` -- gcc aligns `x` in `struct S __attribute__((aligned(32)))
+            // x;` (and a type-name's type in `_Alignof(struct S
+            // __attribute__((aligned(32))))`), and puts `p` in the section in
+            // Linux's `static struct T __used __section("_ftrace_events") *p`.
+            if let Some(align) = early_attrs.get_alignment(self.types.biggest_alignment()) {
                 self.raise_pending_alignas(align);
             }
+            self.apply_declaration_attrs(&pre_attrs, pre_pos, false);
             if let Some(tag_name) = tag {
                 // C17 6.7.2.3p7: `struct S;` by itself declares the tag in
                 // this scope, a new incomplete type that hides any `struct S`
@@ -728,6 +761,8 @@ impl Parser<'_> {
                 self.advance();
                 continue;
             }
+
+            self.skip_gnu_extension();
 
             // Check for _Static_assert in struct (C11 6.7.2.1p1)
             if self.is_static_assert() {
@@ -864,6 +899,7 @@ impl Parser<'_> {
                     pos: member_pos,
                     ..
                 } = self.parse_declarator(member_base_type_id, DeclaratorContext::Declaration)?;
+                self.reject_address_space(typ, "structure field", name, member_pos);
 
                 // C99 6.7.5.2: VLAs cannot be members of structures or unions
                 if !vla.is_empty() {
@@ -901,7 +937,7 @@ impl Parser<'_> {
 
                 // Skip any __attribute__ after member declaration
                 self.skip_extensions();
-                self.drop_pending_cleanup(member_pos);
+                self.drop_pending_symbol_attrs(name, member_pos);
 
                 // A member's type attributes are the member's: consuming
                 // them here sizes the member, and keeps a `mode(M)` from

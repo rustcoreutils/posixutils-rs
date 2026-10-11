@@ -922,9 +922,9 @@ impl<'a> Parser<'a> {
 
         while let Some(name_id) = self.current_ident() {
             let pos = self.current_pos();
-            // Every spelling of `const`, `volatile` and `restrict`, from the
-            // one shared answer.
-            if let Some(m) = super::cv_qualifier_modifier(name_id) {
+            // Every spelling of `const`, `volatile` and `restrict`, and the
+            // target's address spaces, from the one shared answer.
+            if let Some(m) = super::type_qualifier_modifier(name_id, self.types.target().arch) {
                 self.advance();
                 modifiers |= m;
                 continue;
@@ -978,7 +978,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     modifiers |= TypeModifiers::NORETURN;
                 }
-                crate::kw::SIGNED => {
+                crate::kw::SIGNED | crate::kw::GNU_SIGNED | crate::kw::GNU_SIGNED2 => {
                     tally.note_sign("signed", pos);
                     self.advance();
                     modifiers |= TypeModifiers::SIGNED;
@@ -1037,12 +1037,7 @@ impl<'a> Parser<'a> {
                     };
                     self.expect_special(b')')?;
                     // C17 6.7.2.4p3: nor an atomic or qualified type.
-                    if self.types.modifiers(inner).intersects(
-                        TypeModifiers::CONST
-                            | TypeModifiers::VOLATILE
-                            | TypeModifiers::RESTRICT
-                            | TypeModifiers::ATOMIC,
-                    ) {
+                    if self.types.modifiers(inner).intersects(Type::QUALIFIERS) {
                         diag::error(pos, &gettext("'_Atomic' applied to a qualified type"));
                     }
                     tally.note_data_type("_Atomic", pos);
@@ -1252,10 +1247,13 @@ impl<'a> Parser<'a> {
                         Ok(match p.try_parse_type_name_vm() {
                             Some(named) => named,
                             None => {
-                                let expr = p.parse_expression()?;
+                                let expr = p.parse_expression_raw()?;
                                 p.exempt_reverse_atomic_operand(&expr);
                                 let dims = p.typeof_object_extents(&expr);
-                                (expr.typ.unwrap_or(p.types.int_id), dims)
+                                let typ = expr.typ.unwrap_or(p.types.int_id);
+                                let of_name = matches!(expr.kind, ExprKind::Ident(_));
+                                let typ = p.types.without_function_decl_attrs(typ, of_name);
+                                (typ, dims)
                             }
                         })
                     })?;
@@ -1416,6 +1414,17 @@ impl<'a> Parser<'a> {
             }
         };
 
+        // A type is in one address space at most.
+        let (mut ty, mut id) = (ty, id);
+        if ty.modifiers.contains(Type::ADDRESS_SPACES) {
+            diag::error(
+                start,
+                "incompatible address space qualifiers '__seg_fs' and '__seg_gs'",
+            );
+            ty.modifiers.remove(TypeModifiers::SEG_FS);
+            id = None;
+        }
+
         // C17 6.7.2.4p3 and 6.7.3p3: neither `_Atomic(T)` nor the `_Atomic`
         // qualifier may name an array or function type. The qualifier reaches
         // one only through a typedef -- `_Atomic int a[4]` is an array *of*
@@ -1507,6 +1516,26 @@ impl<'a> Parser<'a> {
         }
         self.advance();
         true
+    }
+
+    /// gcc's error for an object of type `typ` that cannot be in a named
+    /// address space, when it is: `what` is `"auto variable"`,
+    /// `"parameter"` or `"structure field"`. Only an object of static
+    /// storage duration lives in a segment.
+    pub(super) fn reject_address_space(
+        &self,
+        typ: TypeId,
+        what: &str,
+        name: StringId,
+        pos: Position,
+    ) {
+        if let Some(space) = self.types.address_space(typ).keyword() {
+            diag::error_args(
+                pos,
+                "'{0}' specified for {1} '{2}'",
+                &[space, what, self.str(name)],
+            );
+        }
     }
 
     /// C17 6.7.6.3p2: the only storage-class specifier a parameter
@@ -1750,28 +1779,16 @@ impl Parser<'_> {
         // so. The reverse direction -- an enumerator over a variable -- is
         // caught where enumerators are bound. Without this arm `enum A { Z };
         // int Z;` compiled and the two names collided silently.
-        if existing.kind == SymbolKind::EnumConstant && existing.scope_depth == self.symbols.depth()
-        {
-            let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-            diag::error_args(
-                pos,
-                "'{0}' redeclared as a different kind of symbol",
-                &[&spelled],
-            );
-            return;
-        }
+        //
         // A typedef name is in the ordinary name space too (C17 6.2.3), so an
         // object or function of the same name in the same scope is a second
         // kind of symbol. `typedef int T; T T;` compiled: the specifier loop
         // takes the first `T` as the type and the second as the declarator,
         // which is right, and nothing then noticed the collision.
-        if existing.is_typedef() && existing.scope_depth == self.symbols.depth() {
-            let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-            diag::error_args(
-                pos,
-                "'{0}' redeclared as a different kind of symbol",
-                &[&spelled],
-            );
+        if (existing.kind == SymbolKind::EnumConstant || existing.is_typedef())
+            && existing.scope_depth == self.symbols.depth()
+        {
+            self.report_different_kind(name, pos, existing_id);
             return;
         }
         // Typedefs have their own check; a tag is a different namespace.
@@ -1785,8 +1802,8 @@ impl Parser<'_> {
             return;
         }
         let old_kind = existing.kind;
-        let old_type = existing.typ;
-        let old_type = self.types.without_decl_specifiers(old_type);
+        let prior = self.prior_declaration(existing_id);
+        let old_type = prior.1;
         let new_type = self.types.without_decl_specifiers(new_type);
         if self.redeclaration_compatible(old_type, new_type, form) {
             return;
@@ -1800,21 +1817,42 @@ impl Parser<'_> {
             self.types.kind(old_type) == TypeKind::Function || old_kind == SymbolKind::Function;
         let new_is_func = self.types.kind(new_type) == TypeKind::Function;
         if old_is_func != new_is_func {
-            diag::error_args(
-                pos,
-                "'{0}' redeclared as a different kind of symbol",
-                &[&spelled],
-            );
+            self.report_different_kind(name, pos, existing_id);
             return;
         }
+        self.report_conflicting_types(name, &spelled, pos, new_type, prior);
+    }
+
+    /// gcc's "'x' redeclared as different kind of symbol", at `pos`, about
+    /// the name `existing` holds in this scope, with its note.
+    fn report_different_kind(&mut self, name: StringId, pos: Position, existing: SymbolId) {
+        let spelled = self.idents.get_opt(name).unwrap_or("");
         diag::error_args(
             pos,
-            "conflicting types for '{0}': '{1}' then '{2}'",
-            &[
-                &spelled,
-                &self.types.format_type(old_type, Some(self.idents)),
-                &self.types.format_type(new_type, Some(self.idents)),
-            ],
+            "'{0}' redeclared as different kind of symbol",
+            &[spelled],
+        );
+        self.note_previous_symbol(existing);
+    }
+
+    /// [`Self::note_previous`] about the declaration `symbol` records. A
+    /// typedef's type is the typedef name, which gcc spells with what it
+    /// stands for.
+    pub(super) fn note_previous_symbol(&mut self, symbol: SymbolId) {
+        let sym = self.symbols.get(symbol);
+        let (name, typ, declared) = (sym.name, sym.typ, sym.declared);
+        if !sym.is_typedef() {
+            let prior = self.prior_declaration(symbol);
+            self.note_previous(name, prior);
+            return;
+        }
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        let typ = self.types.without_decl_specifiers(typ);
+        let aka = self.types.format_type(typ, Some(self.idents));
+        diag::note_args(
+            declared.pos,
+            "previous declaration of '{0}' with type '{0}' {{aka '{1}'}}",
+            &[spelled, &aka],
         );
     }
 
@@ -1904,12 +1942,7 @@ impl Parser<'_> {
                         | SymbolKind::EnumConstant
                 )
             {
-                let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-                diag::error_args(
-                    pos,
-                    "'{0}' redeclared as a different kind of symbol",
-                    &[&spelled],
-                );
+                self.report_different_kind(name, pos, existing_id);
             }
             return;
         }
@@ -1933,16 +1966,16 @@ impl Parser<'_> {
         if self.types.types_same(old_type, new_type) {
             return;
         }
-        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+        let spelled = self.idents.get_opt(name).unwrap_or("");
         diag::error_args(
             pos,
-            "typedef '{0}' redefined with a different type ('{1}' then '{2}')",
+            "conflicting types for '{0}'; have '{1}'",
             &[
-                &spelled.to_string(),
-                &self.types.format_type(old_type, Some(self.idents)),
+                spelled,
                 &self.types.format_type(new_type, Some(self.idents)),
             ],
         );
+        self.note_previous_symbol(existing_id);
     }
 
     /// Diagnose a declaration that named no type (C99 removed implicit int;

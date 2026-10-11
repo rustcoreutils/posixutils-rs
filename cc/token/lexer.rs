@@ -244,6 +244,32 @@ pub enum TokenType {
     /// marker in the stream does. `extract_pragma_directives` removes these
     /// before parsing and hands the parser their positions in the stream.
     Pragma,
+    /// A comment, its text as written in the value, kept for `-C` and `-CC`
+    /// (see [`Tokenizer::keeping_comments`]); only `-E` ever lexes one. It
+    /// takes the start-of-line status of where it stands and leaves it for
+    /// the token after it, so that it hides no directive.
+    Comment,
+    /// Where `-E` writes a line marker for a change of file, the change in
+    /// the value (a [`FileChange`]). Only `-E` asks for them: an `#include`
+    /// enters a file and returns from it whether or not the file yields a
+    /// token, and the markers say so whatever the text between them.
+    FileChange,
+}
+
+/// A change of file `-E` marks, as gcc's `-E` marks it; the token's
+/// position says where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    /// An `#include`, or a `-include`, standing at the token's position,
+    /// enters the file of stream `stream` at its line 1 (gcc's flag 1).
+    Enter { stream: u16 },
+    /// Back in the includer, at the token's position: the line after the
+    /// `#include` (gcc's flag 2).
+    Return,
+    /// The text that follows is at the token's position, reached by no
+    /// inclusion: the primary source after the command line's `-include`
+    /// files, or what a `#line` or a linemarker without a flag names.
+    Rename,
 }
 
 /// Special tokens (operators and punctuators)
@@ -625,6 +651,8 @@ pub enum TokenValue {
     /// `<stdio.h>` or `"local.h"`. A payload like the literals above: one
     /// `char` per source byte.
     HeaderName(String),
+    /// What a [`TokenType::FileChange`] marks.
+    FileChange(FileChange),
 }
 
 // Token
@@ -819,6 +847,9 @@ pub struct Tokenizer<'a, 'b> {
     stream_id: u16,
     line: u32,
     col: u16,
+    /// Where the current physical line starts in `buffer`, for
+    /// `Position::line_offset`.
+    line_start: usize,
     newline: bool,
     whitespace: bool,
 
@@ -832,6 +863,9 @@ pub struct Tokenizer<'a, 'b> {
     // so a surviving backslash-newline is text the user meant, and GCC
     // likewise reports it rather than joining the lines a second time.
     splice: bool,
+
+    // `-C`: each comment is a `Comment` token rather than white space.
+    keep_comments: bool,
 }
 
 impl<'a, 'b> Tokenizer<'a, 'b> {
@@ -852,12 +886,21 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             stream_id,
             line: 1,
             col: 0,
+            line_start: 0,
             newline: true,
             whitespace: false,
             strings,
             mode,
             splice: true,
+            keep_comments: false,
         }
+    }
+
+    /// Lex each comment as a [`TokenType::Comment`] token instead of white
+    /// space (`-C`), for `-E` to write where it stood.
+    pub fn keeping_comments(mut self, keep: bool) -> Self {
+        self.keep_comments = keep;
+        self
     }
 
     /// Stop performing translation phase 2 (backslash-newline splicing).
@@ -884,6 +927,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             self.offset = offset;
             self.line += lines;
             self.col = 0;
+            self.line_start = offset;
         }
 
         if self.offset >= self.buffer.len() {
@@ -900,6 +944,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
             self.line += 1;
             self.col = 0;
+            self.line_start = self.offset;
             self.newline = true;
             return b'\n' as i32;
         }
@@ -908,6 +953,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         if c == b'\n' {
             self.line += 1;
             self.col = 0;
+            self.line_start = self.offset;
             self.newline = true;
             return c as i32;
         }
@@ -1292,6 +1338,26 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         token
     }
 
+    /// The comment that began at byte `start`, at `pos`, and ends where the
+    /// lexer now stands, as a token if comments are kept (`-C`). A `//`
+    /// comment's text stops short of the newline that ends it, which the
+    /// next token starts a line with.
+    fn comment_token(&self, start: usize, pos: Position) -> Option<Token> {
+        if !self.keep_comments {
+            return None;
+        }
+        let mut text = &self.buffer[start..self.offset.min(self.buffer.len())];
+        while let [rest @ .., b'\n' | b'\r'] = text {
+            text = rest;
+        }
+        let text = String::from_utf8_lossy(text).into_owned();
+        Some(Token::with_value(
+            TokenType::Comment,
+            pos,
+            TokenValue::String(text),
+        ))
+    }
+
     /// Skip a single-line comment (// ...)
     fn skip_line_comment(&mut self) {
         loop {
@@ -1372,17 +1438,18 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         // of "a b".
         if class & COMMENT != 0 {
             let next = self.peekchar();
+            let start = self.offset - 1;
             if next == b'/' as i32 {
                 self.nextchar();
                 self.skip_line_comment();
                 self.whitespace = true;
-                return None; // No token, continue tokenizing
+                return self.comment_token(start, pos);
             }
             if next == b'*' as i32 {
                 self.nextchar();
                 self.skip_block_comment(pos);
                 self.whitespace = true;
-                return None; // No token, continue tokenizing
+                return self.comment_token(start, pos);
             }
         }
 
@@ -1650,6 +1717,8 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             // does start a line.
             let newline = std::mem::take(&mut self.newline);
             let whitespace = std::mem::take(&mut self.whitespace);
+            // `c` is the token's first byte, just read.
+            let line_offset = u8::try_from(self.offset - 1 - self.line_start).unwrap_or(u8::MAX);
 
             // C99 6.4.7: where a header name can appear, it is one token and
             // none of the ordinary rules apply inside it.
@@ -1662,9 +1731,19 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             };
 
             match token.or_else(|| self.get_one_token(c as u8)) {
+                // A kept comment stands where it is, and is as transparent
+                // as a dropped one to the token after it.
+                Some(mut token) if token.typ == TokenType::Comment => {
+                    token.pos.newline = newline;
+                    token.pos.whitespace = whitespace;
+                    token.pos.line_offset = line_offset;
+                    self.newline |= newline;
+                    tokens.push(token);
+                }
                 Some(mut token) => {
                     token.pos.newline = newline;
                     token.pos.whitespace = whitespace;
+                    token.pos.line_offset = line_offset;
                     header_pos = self.next_header_name_pos(header_pos, &token);
                     tokens.push(token);
                 }
@@ -1906,9 +1985,17 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
     match token.typ {
         TokenType::StreamBegin => "<STREAM_BEGIN>".to_string(),
         TokenType::StreamEnd => "<STREAM_END>".to_string(),
+        TokenType::FileChange => match &token.value {
+            TokenValue::FileChange(change) => format!("<FILE_CHANGE {change:?}>"),
+            _ => "<FILE_CHANGE>".to_string(),
+        },
         TokenType::Pragma => match &token.value {
             TokenValue::String(s) => format!("<PRAGMA {s}>"),
             _ => "<PRAGMA>".to_string(),
+        },
+        TokenType::Comment => match &token.value {
+            TokenValue::String(s) => s.clone(),
+            _ => String::new(),
         },
         TokenType::Ident => {
             if let TokenValue::Ident(id) = &token.value {
@@ -1949,6 +2036,7 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
 pub fn token_type_name(typ: TokenType) -> &'static str {
     match typ {
         TokenType::Pragma => "PRAGMA",
+        TokenType::Comment => "COMMENT",
         TokenType::Ident => "IDENT",
         TokenType::Number => "NUMBER",
         TokenType::Char => "CHAR",
@@ -1963,10 +2051,21 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
         TokenType::Special => "SPECIAL",
         TokenType::StreamBegin => "STREAM_BEGIN",
         TokenType::StreamEnd => "STREAM_END",
+        TokenType::FileChange => "FILE_CHANGE",
     }
 }
 
 // Token to Text Conversion (for preprocessing output)
+
+/// The spaces that put a token starting an output line back in its column,
+/// as gcc's `-E` puts it: one for each byte before it on its line, a tab
+/// counting as one, so the line keeps its indentation. Scripts read
+/// preprocessed text by its indentation -- glibc's `versions.awk` finds a
+/// version node by it -- and a token of a macro's expansion stands where the
+/// macro's name stood.
+pub fn indentation(pos: Position) -> usize {
+    usize::from(pos.line_offset)
+}
 
 /// Convert preprocessed tokens back to source text, byte for byte.
 ///
@@ -1981,11 +2080,13 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
     let mut last_stream: u16 = 0;
     let mut last_line: u32 = 1;
     let mut last_char: Option<u8> = None;
+    // A comment `-C` keeps, which the token after it may share a line with.
+    let mut after_comment = false;
 
     for token in tokens {
         // Skip stream markers
         match token.typ {
-            TokenType::StreamBegin | TokenType::StreamEnd => continue,
+            TokenType::StreamBegin | TokenType::StreamEnd | TokenType::FileChange => continue,
             _ => {}
         }
 
@@ -2010,12 +2111,13 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
         // preceded it. The assembler then reports a confident wrong location --
         // `#define`/`#if` above the first instruction shifted a `.S` diagnostic
         // three lines in the case that found this.
-        if token.pos.newline {
+        if token.pos.newline && !(after_comment && token.pos.line == last_line) {
             let spelling: Vec<u8> = result.split_off(start);
             while last_line < token.pos.line {
                 result.push(b'\n');
                 last_line += 1;
             }
+            result.resize(result.len() + indentation(token.pos), b' ');
             result.extend_from_slice(&spelling);
         } else if start > 0 {
             // Need a space if the original had whitespace, or if the adjacent
@@ -2028,6 +2130,11 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
 
         last_char = result.last().copied();
         last_line = token.pos.line;
+        // A comment `-C` keeps may run over several lines.
+        after_comment = token.typ == TokenType::Comment;
+        if let (true, TokenValue::String(text)) = (after_comment, &token.value) {
+            last_line += text.matches('\n').count() as u32;
+        }
     }
 
     // Ensure file ends with newline

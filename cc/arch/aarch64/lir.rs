@@ -232,6 +232,56 @@ impl NeonOp {
     }
 }
 
+/// The branch-protection instructions of `-mbranch-protection`, each a
+/// `hint` that ARMv8.0 runs as a `nop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hint {
+    /// `bti c`: an indirect call (`blr`, or `br` through x16 or x17) may
+    /// land here.
+    BtiC,
+    /// `bti j`: an indirect jump (`br`) may land here.
+    BtiJ,
+    /// `paciasp`: sign x30 with the A key, the stack pointer the modifier.
+    /// Also a landing pad for an indirect call.
+    Paciasp,
+    /// `pacibsp`: the same with the B key.
+    Pacibsp,
+    /// `autiasp`: authenticate x30 signed by `paciasp`.
+    Autiasp,
+    /// `autibsp`: authenticate x30 signed by `pacibsp`.
+    Autibsp,
+    /// `xpaclri`: strip the signature from x30.
+    Xpaclri,
+}
+
+impl Hint {
+    /// The `hint` immediate.
+    fn number(self) -> u8 {
+        match self {
+            Hint::Xpaclri => 7,
+            Hint::Paciasp => 25,
+            Hint::Pacibsp => 27,
+            Hint::Autiasp => 29,
+            Hint::Autibsp => 31,
+            Hint::BtiC => 34,
+            Hint::BtiJ => 36,
+        }
+    }
+
+    /// The instruction's own name.
+    fn name(self) -> &'static str {
+        match self {
+            Hint::BtiC => "bti c",
+            Hint::BtiJ => "bti j",
+            Hint::Paciasp => "paciasp",
+            Hint::Pacibsp => "pacibsp",
+            Hint::Autiasp => "autiasp",
+            Hint::Autibsp => "autibsp",
+            Hint::Xpaclri => "xpaclri",
+        }
+    }
+}
+
 /// AArch64 Low-level IR instruction
 #[derive(Debug, Clone)]
 pub enum Aarch64Inst {
@@ -664,6 +714,10 @@ pub enum Aarch64Inst {
     /// RET - Return from subroutine
     Ret,
 
+    /// A branch-protection instruction, in the hint space so that a
+    /// processor without the feature runs it as a `nop`.
+    Hint(Hint),
+
     /// BRK - Software breakpoint (trap)
     /// Used for __builtin_unreachable() to signal unreachable code
     Brk {
@@ -872,6 +926,15 @@ pub enum Aarch64Inst {
 
     /// FCVTZS - FP to signed int (truncate toward zero)
     Fcvtzs {
+        fp_size: FpSize,
+        int_size: OperandSize,
+        src: VReg,
+        dst: Reg,
+    },
+
+    /// FCVTAS - FP to signed int, to nearest with ties away from zero:
+    /// `lround`
+    Fcvtas {
         fp_size: FpSize,
         int_size: OperandSize,
         src: VReg,
@@ -1407,6 +1470,12 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(out, "    ret");
             }
 
+            Aarch64Inst::Hint(hint) => {
+                // gcc's spelling, which every assembler takes whatever
+                // architecture it is told the code is for.
+                let _ = writeln!(out, "    hint {} // {}", hint.number(), hint.name());
+            }
+
             Aarch64Inst::Brk { imm } => {
                 let _ = writeln!(out, "    brk #{}", imm);
             }
@@ -1578,6 +1647,8 @@ impl EmitAsm for Aarch64Inst {
                     IntegralRounding::Round => "frinta",
                     IntegralRounding::Rint => "frintx",
                     IntegralRounding::NearbyInt => "frinti",
+                    // To nearest with ties to even, whatever FPCR says.
+                    IntegralRounding::RoundEven => "frintn",
                 };
                 let _ = writeln!(
                     out,
@@ -1637,6 +1708,12 @@ impl EmitAsm for Aarch64Inst {
                 src,
                 dst,
             } => Self::emit_fp_to_int("fcvtzu", fp_size, int_size, src, dst, out),
+            Aarch64Inst::Fcvtas {
+                fp_size,
+                int_size,
+                src,
+                dst,
+            } => Self::emit_fp_to_int("fcvtas", fp_size, int_size, src, dst, out),
             Aarch64Inst::Fcvt {
                 src_size,
                 dst_size,
@@ -2421,6 +2498,7 @@ mod tests {
             (Round, "frinta d1, d2"),
             (Rint, "frintx d1, d2"),
             (NearbyInt, "frinti d1, d2"),
+            (RoundEven, "frintn d1, d2"),
         ] {
             let inst = Aarch64Inst::Frint {
                 how,

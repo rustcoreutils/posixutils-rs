@@ -23,7 +23,7 @@ use super::parser::{
 };
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Linkage, Symbol, SymbolId};
+use crate::symbol::{DeclaredAt, Linkage, Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
 use crate::types::{ArrayExtent, Type, TypeId, TypeKind};
 use gettextrs::gettext;
@@ -242,8 +242,10 @@ impl Parser<'_> {
                 name: Some(name),
             },
         );
+        let outer_undeclared = std::mem::take(&mut self.undeclared_reported);
         let body = self.parse_block_stmt_no_scope();
         self.enclosing_function = outer;
+        self.undeclared_reported = outer_undeclared;
         body
     }
 
@@ -263,6 +265,8 @@ impl Parser<'_> {
             .pending_alignas
             .max(self.pending_declarator_align.take());
         self.pending_fn_attrs.align = self.pending_fn_attrs.align.max(declared_align);
+        // A function may carry every one of them.
+        self.pending_fn_attrs.function_only.clear();
         let pending = self.pending_fn_attrs.clone();
         let pos = self.current_pos();
         let seen = self.declared_fn_attrs.entry(name).or_default();
@@ -287,7 +291,7 @@ impl Parser<'_> {
         self.pending_transparent_union = None;
         self.pending_packed = false;
         self.pending_fn_attrs = Default::default();
-        self.pending_calling_conv = None;
+        self.pending_fn_type = Default::default();
         // And any asm label the previous declaration left behind.
         //
         // `skip_extensions` collects one wherever it runs, which is most
@@ -304,9 +308,11 @@ impl Parser<'_> {
         // function's section, and the conflicting "ax"/"aw" flags made the
         // assembler reject the file outright.
         self.pending_symbol_attrs = Default::default();
+        self.pending_written_attrs.clear();
     }
 
     pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+        self.skip_gnu_extension();
         // `__label__` declares labels local to a block; at file scope gcc
         // reads it as a misplaced keyword where a declarator should begin.
         if self.current_ident() == Some(crate::kw::GNU_LABEL) {
@@ -332,6 +338,16 @@ impl Parser<'_> {
     /// `typ` is the declarator's function type, already carrying `noreturn`;
     /// `attrs` the function's attributes accumulated over every declaration of
     /// its name.
+    /// Remember where the parameters of the function `name` are declared,
+    /// unless an earlier declaration has already said, as gcc's notes keep
+    /// the first that lists them.
+    pub(super) fn record_param_positions(&mut self, name: StringId, params: &[RawParam]) {
+        let recorded = self.param_positions.entry(name).or_default();
+        if recorded.is_empty() {
+            recorded.extend(params.iter().map(|p| p.pos));
+        }
+    }
+
     pub(super) fn define_function(
         &mut self,
         specs: &DeclSpecs,
@@ -343,6 +359,7 @@ impl Parser<'_> {
     ) -> ParseResult<FunctionDef> {
         super::target_attr::resolve_target_conflict(&mut attrs, pos);
         let mut params = params.unwrap_or_default();
+        self.record_param_positions(name, &params);
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
         self.check_parameters_complete(&params, pos);
         self.check_identifier_list_against_prototype(name, typ, &params, pos);
@@ -373,11 +390,13 @@ impl Parser<'_> {
             name,
             typ,
             pos,
+            name_pos: pos,
             storage: specs.storage_class,
             scope: DeclScope::File,
             defines: true,
             gnu_extern_inline: attrs.gnu_inline_only(specs.storage_class),
         });
+        self.settle_visibility(name, linkage, true, &mut attrs.symbol.visibility);
         // After the definition the name has the composite type of it and any
         // earlier declaration (C17 6.2.7p4): `int (*fp(void))[6] { .. }`
         // keeps the extent an earlier `int (*fp(void))[];` lacked, and an
@@ -385,7 +404,9 @@ impl Parser<'_> {
         // is checked against the definition's own type.
         let symbol_typ = self.composite_with_prior_declaration(name, typ, true);
         let _ = self.symbols.declare(
-            Symbol::function(name, symbol_typ, self.symbols.depth()).with_linkage(linkage),
+            Symbol::function(name, symbol_typ, self.symbols.depth())
+                .with_linkage(linkage)
+                .declared_at(DeclaredAt::at(pos, true)),
         );
         // A weak definition may be replaced at link time, so gcc leaves the
         // builtin in place of it; so does this.
@@ -533,6 +554,7 @@ impl Parser<'_> {
                     ..
                 } = self.parse_declarator(knr_base_id, DeclaratorContext::OldStyleParameter)?;
                 self.check_parameter_specifiers(knr_type.modifiers, decl_name, knr_pos);
+                self.reject_address_space(decl_typ, "parameter", decl_name, knr_pos);
                 // C99 6.7.5.3: array/function params adjusted to pointers;
                 // a vector is passed by value.
                 let adjusted = self.types.get(decl_typ);
@@ -596,9 +618,11 @@ impl Parser<'_> {
                     continue;
                 };
                 let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-                diag::pedwarn_default(
+                diag::group_pedwarn_default_args(
+                    "implicit-int",
                     self.current_pos(),
-                    &format!("type of '{spelled}' defaults to 'int'"),
+                    "type of '{0}' defaults to 'int'",
+                    &[&spelled],
                 );
             }
         }

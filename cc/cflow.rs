@@ -21,8 +21,7 @@ use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
 use posixutils_cc::token::{
-    preprocess_asm_file, preprocess_collecting, AsmPreprocessConfig, PreprocessConfig, StreamTable,
-    Tokenizer,
+    preprocess_asm_file, preprocess_collecting, PreprocessConfig, StreamTable, Tokenizer,
 };
 use posixutils_cc::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -263,7 +262,9 @@ fn extract_calls_from_expr(
         ExprKind::SizeofExpr(e) | ExprKind::AlignofExpr(e) => {
             extract_calls_from_expr(e, strings, symbols, calls);
         }
-        ExprKind::Comma(exprs) | ExprKind::InlineLibraryCall { args: exprs, .. } => {
+        ExprKind::Comma(exprs)
+        | ExprKind::InlineLibraryCall { args: exprs, .. }
+        | ExprKind::MachineBuiltin { args: exprs, .. } => {
             for e in exprs {
                 extract_calls_from_expr(e, strings, symbols, calls);
             }
@@ -492,7 +493,9 @@ fn visit_subexprs(
         }
         ExprKind::Cast { expr, .. } => f(expr),
         ExprKind::SizeofExpr(e) | ExprKind::AlignofExpr(e) => f(e),
-        ExprKind::Comma(exprs) | ExprKind::InlineLibraryCall { args: exprs, .. } => {
+        ExprKind::Comma(exprs)
+        | ExprKind::InlineLibraryCall { args: exprs, .. }
+        | ExprKind::MachineBuiltin { args: exprs, .. } => {
             for e in exprs {
                 f(e);
             }
@@ -768,7 +771,7 @@ fn preprocess_assembler(
     let content = std::fs::read(file)?;
     let target = Target::host();
 
-    let config = AsmPreprocessConfig {
+    let config = PreprocessConfig {
         defines,
         undefines,
         include_paths: &args.include_paths,
@@ -778,8 +781,17 @@ fn preprocess_assembler(
         optimization: Default::default(),
         position: Default::default(),
         isa: Default::default(),
+        cf_protection: Default::default(),
+        exceptions: false,
+        // What a compile would write, which the assembly may test.
+        cfi: Default::default(),
         macro_prefix_map: Default::default(),
         collect_dependencies: false,
+        pre_includes: &[],
+        imacros: &[],
+        undef: false,
+        comments: Default::default(),
+        ..Default::default()
     };
     // A #error or a missing include makes the remaining bytes not worth
     // assembling: `as` would bury the real diagnostic under syntax errors.

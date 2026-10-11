@@ -27,20 +27,11 @@ pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
         // <features.h>, and gcc does not predefine them either. binutils'
         // config.h refuses to be read after a system header, which it detects
         // by `__GLIBC__` being defined.
-        // Thread model
-        ("_REENTRANT", Some("1".into())),
-        // Feature test macros, predefined -- which gcc does not do (its C
-        // modes predefine none; `gnu17` gets glibc's `_DEFAULT_SOURCE` from
-        // <features.h>). A deliberate divergence, recorded in DECISIONS.md
-        // with what it costs: the whole GNU namespace is visible to every
-        // program, and glibc 2.38+ binds `strtol` and the `scanf` family to
-        // its C2X forms. POSIX only *encourages* restricting visibility here
-        // (88196-88203). Defined before any -D/-U, so `-U_GNU_SOURCE`
-        // withdraws it.
-        ("_GNU_SOURCE", Some("1".into())),
-        ("_DEFAULT_SOURCE", Some("1".into())),
-        ("_XOPEN_SOURCE", Some("800".into())),
-        ("_XOPEN_SOURCE_EXTENDED", Some("1".into())),
+        // No feature-test macros (`_GNU_SOURCE`, `_POSIX_C_SOURCE`, ...) and
+        // no `_REENTRANT`: they are the program's to define (POSIX.1-2024
+        // 2.2.1), and gcc predefines none of them. A program that names none
+        // gets glibc's defaults from <features.h>, `_DEFAULT_SOURCE` among
+        // them. `-pthread` defines `_REENTRANT`, as gcc's does.
     ]
 }
 

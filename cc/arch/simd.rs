@@ -42,7 +42,7 @@ pub fn native(target: &Target, isa: X86Isa, op: SimdOp, vec: TypeId, types: &Typ
         return false;
     }
     match target.arch {
-        Arch::X86_64 => x86_64(op, bytes, lane_bytes, float, isa.simd),
+        Arch::X86_64 => x86_64(op, bytes, lane_bytes, float, isa.simd()),
         Arch::Aarch64 => aarch64(op, lane_bytes),
     }
 }
@@ -67,7 +67,7 @@ pub fn native_shuffle(
         Arch::X86_64 => {
             bytes == 16
                 && (x86_64_shuffle(idx, lane_bytes).is_some()
-                    || (isa.simd >= X86Simd::Ssse3
+                    || (isa.simd() >= X86Simd::Ssse3
                         && x86_64_byte_shuffle(idx, lane_bytes).is_some()))
         }
         Arch::Aarch64 => true,
@@ -369,15 +369,15 @@ mod tests {
         }
         assert!(!native(&x86, x86.x86_isa, SimdOp::CmpGtU, v2du, &types));
         assert!(!native_shuffle(&x86, x86.x86_isa, &words, v8hu, &types));
-        x86.x86_isa.simd = X86Simd::Ssse3;
+        x86.x86_isa = X86Isa::from_flags(&["-mssse3".to_string()]);
         assert!(native_shuffle(&x86, x86.x86_isa, &words, v8hu, &types));
-        x86.x86_isa.simd = X86Simd::Sse41;
+        x86.x86_isa = X86Isa::from_flags(&["-msse4.1".to_string()]);
         assert!(native(&x86, x86.x86_isa, SimdOp::Mul, v4si, &types));
         assert!(native(&x86, x86.x86_isa, SimdOp::CmpEq, v2di, &types));
         assert!(!native(&x86, x86.x86_isa, SimdOp::CmpGt, v2di, &types));
         assert!(native(&x86, x86.x86_isa, SimdOp::CmpGtU, v8hu, &types));
         assert!(!native(&x86, x86.x86_isa, SimdOp::CmpGtU, v2di, &types));
-        x86.x86_isa.simd = X86Simd::Sse42;
+        x86.x86_isa = X86Isa::from_flags(&["-msse4.2".to_string()]);
         assert!(native(&x86, x86.x86_isa, SimdOp::CmpGe, v2di, &types));
         // The control of a word reversal, its unspecified lane zero.
         let (src, ctl) = x86_64_byte_shuffle(&words, 2).unwrap();

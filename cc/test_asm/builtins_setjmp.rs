@@ -115,9 +115,13 @@ fn builtin_setjmp_x86_64_resume_point_landing_pad() {
         let resume = ".L.sjlj_resume.0:\n    endbr64\n";
         if landing_pad {
             assert_body_contains(&asm, "f", resume, &why);
-            assert_eq!(count_in_body(&asm, "f", "endbr64"), 1, "{why}");
+            // The resume point's, and the entry's of a function with
+            // external linkage.
+            assert_eq!(count_in_body(&asm, "f", "endbr64"), 2, "{why}");
+            assert_eq!(count_in_body(&asm, "j", "endbr64"), 1, "{why}");
         } else {
             assert_body_lacks(&asm, "f", "endbr64", &why);
+            assert_body_lacks(&asm, "j", "endbr64", &why);
         }
         if level == "branch" {
             assert_body_contains(&asm, "f", "movq %rsp, 16(%r10)", &why);
@@ -125,8 +129,6 @@ fn builtin_setjmp_x86_64_resume_point_landing_pad() {
             assert_body_lacks(&asm, "f", "rdsspq", &why);
             assert_body_lacks(&asm, "j", "rdsspq", &why);
         }
-        // Function entries are not landing pads: that is general IBT.
-        assert_body_lacks(&asm, "j", "endbr64", &why);
     }
 }
 

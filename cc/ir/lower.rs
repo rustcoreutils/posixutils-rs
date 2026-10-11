@@ -330,7 +330,7 @@ fn resolve_placeholders(func: &mut Function) {
 fn settled_answer(op: Opcode) -> Option<i128> {
     match op {
         Opcode::ConstantP => Some(0),
-        Opcode::ObjectSize(otype) => Some(super::objsize::size_constant(otype.unknown())),
+        Opcode::ObjectSize(query) => Some(super::objsize::size_constant(query.otype().unknown())),
         _ => None,
     }
 }
@@ -922,10 +922,13 @@ mod tests {
         b0.add_insn(Instruction::new(Opcode::Entry));
         for (t, bits) in [(1, 0), (2, 2)] {
             b0.add_insn(
-                Instruction::new(Opcode::ObjectSize(ObjectSizeType::from_bits(bits)))
-                    .with_target(PseudoId(t))
-                    .with_src(PseudoId(0))
-                    .with_type_and_size(ulong, 64),
+                Instruction::new(Opcode::ObjectSize(crate::ir::ObjectSizeQuery::new(
+                    ObjectSizeType::from_bits(bits),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )))
+                .with_target(PseudoId(t))
+                .with_src(PseudoId(0))
+                .with_type_and_size(ulong, 64),
             );
         }
         b0.add_insn(Instruction::ret(Some(PseudoId(1))));

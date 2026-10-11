@@ -29,7 +29,8 @@
 //! model, and also reads a thread-local its executable defines.
 
 use crate::common::{
-    aarch64_cross_available, compile_and_run_two_units, create_c_file, cross_link_and_run, run_c17,
+    aarch64_cross_available, compile_and_run, compile_and_run_everywhere,
+    compile_and_run_two_units, create_c_file, cross_link_and_run, run_c17,
 };
 use plib::tmp::NamedTempFile;
 use std::process::Command;
@@ -672,4 +673,68 @@ fn tls_freebsd_shared_object_links() {
         "{}",
         String::from_utf8_lossy(&linked.stderr)
     );
+}
+
+/// glibc's <ctype.h> pattern across two objects: one declares a hidden
+/// `extern __thread` named only by an un-emitted `gnu_inline` body, the other
+/// defines and reads it. The first object's stray `.hidden` made the name an
+/// untyped undefined symbol, and the link failed with "TLS definition ...
+/// mismatches non-TLS reference" -- libc.so's own link failure.
+#[test]
+fn tls_extern_named_only_by_an_inline_body_links() {
+    let unit_a = r#"
+extern __thread const int *tsd_u __attribute__((visibility("hidden")));
+extern __inline __attribute__((__gnu_inline__)) const int **u_loc(void) { return &tsd_u; }
+int f(void) { return 1; }
+"#;
+    let unit_b = r#"
+__attribute__((visibility("hidden"))) __thread const int *tsd_u;
+int f(void);
+int main(void) { return f() - 1 + (tsd_u != 0); }
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run_two_units("tls_inline_only", unit_a, unit_b, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}
+
+/// Thread-locals each given its model by `tls_model`, every model on one
+/// executable: reads, writes and addresses agree whichever sequence reaches
+/// the variable, at every level, on both targets, and position-independent
+/// on the host.
+#[test]
+fn tls_model_attribute_programs_run() {
+    let src = r#"
+__thread int a __attribute__((tls_model("initial-exec"))) = 1;
+__thread int b __attribute__((tls_model("local-exec"))) = 2;
+extern __thread int c __attribute__((tls_model("initial-exec")));
+__thread int c = 3;
+__thread long e[4] __attribute__((tls_model("global-dynamic"))) = {4, 5, 6, 7};
+__thread double f __attribute__((tls_model("local-dynamic"))) = 8.5;
+static __thread int s __attribute__((tls_model("global-dynamic"))) = 9;
+__attribute__((noinline)) int *pa(void) { return &a; }
+__attribute__((noinline)) long *pe(int i) { return &e[i]; }
+__attribute__((noinline)) double *pf(void) { return &f; }
+int main(void) {
+    a += 10; b += 20; c += 30; e[2] += 40; f += 50.0; s += 60;
+    if (*pa() != 11 || b != 22 || c != 33 || *pe(2) != 46 || e[3] != 7)
+        return 1;
+    if (*pf() != 58.5 || s != 69)
+        return 2;
+    *pe(0) = 100;
+    return e[0] == 100 ? 0 : 3;
+}
+"#;
+    compile_and_run_everywhere("tls_model_attr", src);
+    for opt in ["-O0", "-O2"] {
+        let flags = [opt.to_string(), "-fPIC".to_string()];
+        assert_eq!(
+            compile_and_run("tls_model_attr_pic", src, &flags),
+            0,
+            "{opt}"
+        );
+    }
 }

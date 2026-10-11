@@ -284,7 +284,7 @@ impl X86_64CodeGen {
         if let Some(func_addr) = insn.extra().indirect_target {
             self.emit_move(func_addr, Reg::R11, 64);
         }
-        self.emit_call_instruction(insn, func_name);
+        self.emit_call_instruction(insn, func_name, area as usize);
         self.cleanup_call_stack(area as usize);
         self.handle_call_return_value(insn, types);
     }

@@ -1242,9 +1242,9 @@ mod tests {
     fn test_local_stays_in_memory_under_builtin_setjmp() {
         let types = TypeTable::new(&Target::host());
         let mut func = make_straight_line_cfg(&types);
-        let mut setjmp = Instruction::new(Opcode::Setjmp);
-        setjmp.extra_mut().jmp_kind = crate::parse::ast::JmpKind::Builtin;
-        func.blocks[0].insns.insert(1, setjmp);
+        func.blocks[0]
+            .insns
+            .insert(1, Instruction::new(Opcode::Setjmp));
         ssa_convert(&mut func, &types);
         let ops: Vec<Opcode> = func.blocks[0].insns.iter().map(|i| i.op).collect();
         assert!(ops.contains(&Opcode::Store), "store was promoted: {ops:?}");

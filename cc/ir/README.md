@@ -158,7 +158,7 @@ says otherwise, `typ`/`size` describe the result.
 | `switch` | Multi-way branch on `src[0]`: `switch_cases` holds `(low, high, block)` ranges, `switch_default` the rest |
 | `indirectbr` | GNU computed goto to the address in `src[0]`. The instruction cannot name its targets (any address-taken label may be one), so the edges are recorded on the block, as for `asm goto` |
 | `unreachable` | Undefined if reached; the back ends emit a trap (`ud2`, `brk #1`). Follows every `noreturn` call, so ending in one does not make a block dead: DCE treats a block as unreachable only when `unreachable` is its first instruction with an effect |
-| `longjmp` | Restore a `setjmp` context; never returns |
+| `longjmp` | gcc's `__builtin_longjmp`: resume a `setjmp`; never returns |
 
 ### Integer Arithmetic and Bitwise (binary)
 
@@ -194,6 +194,7 @@ instruction turns them into that call (`arch::mapping::call_library_fallbacks`).
 | `fmin`, `fmax` | Smaller / larger operand; a NaN operand is ignored for the other. *libm* |
 | `fma` | `src[0] * src[1] + src[2]`, rounded once. *libm* |
 | `ffloor`, `fceil`, `ftrunc`, `fround`, `frint`, `fnearbyint` | One opcode, `RoundToIntegral`, keyed on the rounding: the integral value of `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint`, as a float with its sign. *libm* |
+| `lrint`, `lround` | One opcode, `RoundToInteger`, a conversion: the integer of type `typ` the floating `src_typ` operand rounds to, in the current direction (`lrint`) or with ties away from zero (`lround`), not truncated as by `fcvts`. *libm* |
 
 ### Comparisons (result: 0 or 1)
 
@@ -264,6 +265,20 @@ survives every optimization level: `dce::is_root` treats it as a root,
 `constglobal` will not answer one from an initializer, and `ssa` will not
 promote the object it reaches out of memory.
 
+They also carry an **address space**, `Instruction::addr_space`: generic, or
+one of x86-64's `__seg_fs`/`__seg_gs`, which the backend reaches through the
+segment register (`%gs:8(%rax)`), printed as a trailing `__seg_gs` in a dump.
+It is set the same way, from the type the access reaches, or by the site
+itself through `Instruction::with_access` where the access is of another type
+than the object -- a bit-field's storage unit, an integer chunk of a struct
+copy. An access through a segment is marked volatile as well
+(`Access::observable`): what the segment base points to is memory no pass can
+model. An `asm` memory operand carries its object's space in
+`AsmConstraint::addr_space`. A value held in storage -- a struct, complex or
+vector -- read out of a segment is copied into the frame first
+(`Linearizer::readable_storage`), since each of its consumers reads it with
+accesses of its own.
+
 ### SSA Operations
 
 | Opcode | Description |
@@ -289,6 +304,14 @@ Call fields (all but `src` live in `InsnExtra`):
 - `returns_via_sret()`: derived from abi_info — large struct return via hidden pointer
 - `returns_two_regs()`: derived from abi_info — 9-16 byte struct via RAX+RDX / X0+X1
 - `known`: the library function the parser recognised, for `libcall_fold`
+- `may_throw`: under `-fexceptions`, the callee may unwind through this frame
+  (it is not `nothrow`)
+- `landing_pad`: where an unwind through the call goes to run the cleanups in
+  scope (`linearize_cleanup.rs`). A CFG edge like any other, named by the call
+  rather than the terminator, as an `asm goto`'s labels are; until lowering
+  the call is the last instruction before its block's terminator. Printed as
+  `unwind .Ln` after the call. Inlining a call with a pad gives the pad to
+  every throwing call of the spliced body (`Function::unwind_calls_to`)
 
 ### ABI Classification (`abi_info`)
 
@@ -366,7 +389,7 @@ Operands are `(dst, src-or-byte, n)`. The back ends emit the libc call; one whos
 |--------|-------------|
 | `alloca` | Dynamic stack allocation |
 | `stacksave`, `stackrestore` | Capture and restore the stack pointer. A VLA's scope is bracketed with them, and so is an inlined callee that `alloca`s, so its allocation is released where the call would have returned instead of accumulating in the caller (a loop would otherwise grow the stack every iteration). `__builtin_stack_save` and `__builtin_stack_restore` are these two |
-| `setjmp` | Save context; returns 0, or the value a `longjmp` passed (`longjmp` is a terminator, above). `JmpKind::Builtin` is gcc's `__builtin_setjmp`, generated inline: no register survives it, and it always resumes with 1 |
+| `setjmp` | gcc's `__builtin_setjmp`, generated inline: returns 0, and 1 when its `longjmp` (a terminator, above) resumes it; no register survives it. The library's `setjmp` family are `call`s, which `Instruction::returns_twice` answers for |
 | `frame_address` | `__builtin_frame_address(level)`; the level is `frame_level()` |
 | `return_address` | `__builtin_return_address(level)` |
 
@@ -407,6 +430,7 @@ Emitted by target mapping (`arch/mapping.rs`), which expands `__int128` operatio
 | `nop` | No operation. A deleted instruction becomes one (`Instruction::kill`), and `remove_nops` compacts them |
 | `asm` | Inline assembly (see `AsmData`) |
 | `lifetime.end` | The lifetime of the local `lifetime_of` names ends: control falls out of the block that declared it. Named out of band, never in `src`, so it is no use and no escape; kept by DCE, dropped with its local by `mem2reg`, and read by the allocators, which let locals whose lifetimes never meet share a slot |
+| `landingpad` | The exception object the unwinder hands a landing pad, in the first return register. Only ever the first instruction of a block that some call names as its `landing_pad` and no branch reaches (validator I14); a DCE root |
 
 ## Data Structures
 
@@ -462,6 +486,8 @@ is_noreturn_call        - the callee never returns
 callee_binding          - whether func_name may be defined in this module;
                           ask through `Instruction::local_callee`
 known                   - the library function a call is, for libcall_fold
+may_throw               - under -fexceptions, the callee may unwind
+landing_pad             - the block an unwind through the call goes to
 abi_info                - CallAbiInfo (see below)
 switch_cases/default    - switch ranges and default target
 asm_data                - inline assembly (template, operands, clobbers)
@@ -595,7 +621,7 @@ after that, because merging would undo the splitting the copies depend on. See
 | `copyprop.rs` | Each use of a no-op `copy` (same width, same register class) reads the copy's source instead; `dce` collects the copies |
 | `dse.rs` | Dead-store elimination, for two cases: a store whose every byte is overwritten before any is read (a forward walk within a block), and a store to a non-escaping local that nothing reads before the function returns (a backward walk over the CFG) |
 | `dce.rs` | Mark-sweep from the roots, which are any opcode with `has_side_effects()` plus any volatile access. It also folds a branch into a block that does nothing but `unreachable`, and removes unreachable blocks |
-| `cfg.rs` | Every edit to the CFG goes through here: successors (including `asm goto` labels), edge removal, critical-edge splitting, unreachable-block removal, and `simplify_cfg` (forwarder threading and block merging) |
+| `cfg.rs` | Every edit to the CFG goes through here: successors (including `asm goto` labels and landing pads), edge removal, critical-edge splitting, unreachable-block removal, and `simplify_cfg` (forwarder threading and block merging) |
 
 ### Analyses and shared rules (not passes)
 

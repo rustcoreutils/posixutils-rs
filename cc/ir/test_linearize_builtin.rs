@@ -1020,10 +1020,10 @@ fn object_size(
     let f = module.functions.iter().find(|f| f.name == "f").unwrap();
     let insns = insns_of(&module, "f");
     if let Some(insn) = insns.iter().find(|i| matches!(i.op, Opcode::ObjectSize(_))) {
-        let Opcode::ObjectSize(otype) = insn.op else {
+        let Opcode::ObjectSize(query) = insn.op else {
             unreachable!()
         };
-        return Err(otype);
+        return Err(query.otype());
     }
     Ok(insns
         .iter()

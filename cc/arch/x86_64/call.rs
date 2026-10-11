@@ -13,6 +13,7 @@ use super::codegen::X86_64CodeGen;
 use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::abi::{Abi, ArgClass, RegClass};
+use crate::arch::eh::CallArgsArea;
 use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeKind, TypeTable};
@@ -1408,16 +1409,44 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit the actual call instruction (direct or indirect)
-    pub(super) fn emit_call_instruction(&mut self, insn: &Instruction, func_name: &str) {
+    /// The call instruction of `insn`, `args_size` bytes of its arguments
+    /// on the stack, between the labels of its call-site entry when it has
+    /// a landing pad (`arch::eh`).
+    pub(super) fn emit_call_instruction(
+        &mut self,
+        insn: &Instruction,
+        func_name: &str,
+        args_size: usize,
+    ) {
+        let site = self
+            .base
+            .eh_call_begin(insn, CallArgsArea::Fixed(args_size as i64));
         if insn.extra().indirect_target.is_some() {
-            self.push_lir(X86Inst::Call {
-                target: CallTarget::Indirect(Reg::R11),
-            });
+            // A callee whose type is `nocf_check` has no `endbr64` to land on.
+            if self.base.landing_pads.active() && insn.extra().nocf_check_call {
+                self.push_lir(X86Inst::NotrackCall { reg: Reg::R11 });
+            } else {
+                self.push_lir(X86Inst::Call {
+                    target: CallTarget::Indirect(Reg::R11),
+                });
+            }
+            self.base.eh_call_end(site);
         } else {
-            self.push_lir(X86Inst::Call {
-                target: CallTarget::Direct(Symbol::global(func_name.to_string())),
-            });
+            let sym = Symbol::global(func_name.to_string());
+            if self.base.calls_through_got(func_name) {
+                self.push_lir(X86Inst::CallGot { sym });
+            } else {
+                self.push_lir(X86Inst::Call {
+                    target: CallTarget::Direct(sym),
+                });
+            }
+            // The second return of a function that returns twice comes by
+            // an indirect jump, so under branch protection it lands on
+            // `endbr64`, which gcc keeps inside the call's call-site entry.
+            if self.base.landing_pads.active() && insn.returns_twice() {
+                self.push_lir(X86Inst::Endbr64);
+            }
+            self.base.eh_call_end(site);
         }
     }
 
@@ -1432,8 +1461,13 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Set AL to number of XMM registers used (for variadic calls)
+    /// Set AL to number of XMM registers used (for variadic calls) -- but
+    /// for `-mskip-rax-setup` without SSE, as gcc: there is no XMM register
+    /// to count, and a kernel's variadic functions read none.
     pub(super) fn set_variadic_fp_count(&mut self, fp_arg_count: usize) {
+        if self.base.target.x86.skip_rax_setup && !self.base.isa.has_sse() {
+            return;
+        }
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B8,
             src: GpOperand::Imm(fp_arg_count as i64),

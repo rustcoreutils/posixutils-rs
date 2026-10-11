@@ -16,7 +16,7 @@ use super::parser::{
 };
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::Symbol;
+use crate::symbol::{DeclaredAt, Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType};
 use crate::types::{ArrayExtent, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -72,9 +72,9 @@ impl Parser<'_> {
     pub(super) fn parse_pointer_qualifiers(&mut self) -> TypeModifiers {
         let mut modifiers = TypeModifiers::empty();
         while let Some(name_id) = self.current_ident() {
-            // Every spelling of the three CV qualifiers, from the one shared
-            // answer.
-            if let Some(m) = super::cv_qualifier_modifier(name_id) {
+            // Every spelling of the three CV qualifiers, and the target's
+            // address spaces, from the one shared answer.
+            if let Some(m) = super::type_qualifier_modifier(name_id, self.types.target().arch) {
                 modifiers |= m;
                 self.advance();
                 continue;
@@ -363,7 +363,8 @@ impl Parser<'_> {
         while let Some(name_id) = self.current_ident() {
             match name_id {
                 crate::kw::STATIC | crate::kw::ATOMIC => {}
-                _ if super::cv_qualifier_modifier(name_id).is_some() => {}
+                _ if super::type_qualifier_modifier(name_id, self.types.target().arch)
+                    .is_some() => {}
                 _ => break,
             }
             qualified = true;
@@ -560,20 +561,18 @@ impl Parser<'_> {
                 // The inner declarator is Function(Pointer(Void), [int])
                 // We need to substitute Void with the actual return type
                 let inner_base_id = decl_type.base.unwrap(); // return type (placeholder)
-                let decl_params = decl_type.params.clone();
-                let decl_variadic = decl_type.variadic;
-                let decl_noreturn = decl_type.noreturn;
-                let decl_conv = decl_type.conv;
-                let new_ret_id = self.substitute_base_type(inner_base_id, actual_base_id);
-                let func_type = Type {
+                let mut func_type = Type {
                     kind: TypeKind::Function,
-                    base: Some(new_ret_id),
-                    params: decl_params,
-                    variadic: decl_variadic,
-                    noreturn: decl_noreturn,
-                    conv: decl_conv,
+                    params: decl_type.params.clone(),
+                    variadic: decl_type.variadic,
+                    noreturn: decl_type.noreturn,
+                    returns_twice: decl_type.returns_twice,
+                    nothrow: decl_type.nothrow,
+                    conv: decl_type.conv,
+                    nocf_check: decl_type.nocf_check,
                     ..Default::default()
                 };
+                func_type.base = Some(self.substitute_base_type(inner_base_id, actual_base_id));
                 self.types.intern(func_type)
             }
             _ => decl_type_id, // Other types don't need substitution
@@ -600,7 +599,8 @@ impl Parser<'_> {
         let saved_align_kw = self.pending_alignas_kw.take();
         let saved_fn_attrs = std::mem::take(&mut self.pending_fn_attrs);
         let saved_symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
-        let saved_calling_conv = self.pending_calling_conv.take();
+        let saved_written_attrs = std::mem::take(&mut self.pending_written_attrs);
+        let saved_fn_type = std::mem::take(&mut self.pending_fn_type);
         // The parameter scope is opened and closed here rather than inside, so
         // that it is balanced however the inner parse exits. It used to be left
         // open on the `?` paths and on the trailing-comma `return Err`.
@@ -620,7 +620,8 @@ impl Parser<'_> {
         self.pending_alignas_kw = saved_align_kw;
         self.pending_fn_attrs = saved_fn_attrs;
         self.pending_symbol_attrs = saved_symbol_attrs;
-        self.pending_calling_conv = saved_calling_conv;
+        self.pending_written_attrs = saved_written_attrs;
+        self.pending_fn_type = saved_fn_type;
         result
     }
 
@@ -667,7 +668,7 @@ impl Parser<'_> {
                 if params.is_empty() {
                     diag::pedwarn(
                         self.current_pos(),
-                        &gettext("ISO C requires a named argument before '...'"),
+                        &gettext("ISO C requires a named argument before '...' before C2X"),
                     );
                 }
                 self.advance();
@@ -699,6 +700,7 @@ impl Parser<'_> {
             // - Arrays: int arr[], int arr[10]
             let ParsedDeclarator {
                 name: param_name,
+                name_pos: param_name_pos,
                 typ: mut typ_id,
                 vla: mut vla_sizes,
                 ..
@@ -707,10 +709,11 @@ impl Parser<'_> {
             // other declaration: `typeof(a) b` beside `int (*a)[n]`.
             vla_sizes.extend(param_specs.vm_dims);
             self.check_parameter_specifiers(param_type.modifiers, param_name, param_pos);
+            self.reject_address_space(typ_id, "parameter", param_name, param_pos);
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
-            self.drop_pending_cleanup(param_pos);
+            self.drop_pending_symbol_attrs(param_name, param_pos);
 
             // A parameter's type attributes are the parameter's, and are
             // applied before the array-to-pointer adjustment below so a mode
@@ -828,6 +831,13 @@ impl Parser<'_> {
 
             params.push(RawParam {
                 name: name_opt,
+                // gcc's place for a parameter: its name, or for an unnamed
+                // one the start of its specifiers.
+                pos: if name_opt.is_some() {
+                    param_name_pos
+                } else {
+                    param_pos
+                },
                 typ: typ_id,
                 vm_dims,
                 discarded_dims,
@@ -838,7 +848,8 @@ impl Parser<'_> {
             // (C99 6.9.1p9: parameters are in scope for VLA sizes)
             if let Some(name) = name_opt {
                 let sym = Symbol::parameter(name, typ_id, self.symbols.depth())
-                    .with_variably_modified_array(!vla_sizes.is_empty());
+                    .with_variably_modified_array(!vla_sizes.is_empty())
+                    .declared_at(DeclaredAt::at(param_name_pos, true));
                 // 6.9.1p5: no two parameters may share a name. `declare`
                 // reports it and the `Err` was dropped, leaving the second
                 // parameter with no symbol at all -- so the function compiled
@@ -852,10 +863,13 @@ impl Parser<'_> {
                     Err(_) => {
                         let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
                         diag::error_args(
-                            self.current_pos(),
+                            param_name_pos,
                             "redefinition of parameter '{0}'",
                             &[&spelled],
                         );
+                        if let Some(first) = self.symbols.lookup_id(name, Namespace::Ordinary) {
+                            self.note_previous_symbol(first);
+                        }
                     }
                 }
             }

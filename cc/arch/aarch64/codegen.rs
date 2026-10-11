@@ -26,7 +26,6 @@ use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::float::FloatVal;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
-use crate::parse::ast::JmpKind;
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -67,13 +66,16 @@ pub struct Aarch64CodeGen {
     pub(super) darwin_va_sp_slot: Option<i32>,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
+    /// The registers the unit's file-scope register variables are, which no
+    /// function may allocate; see `Module::global_registers`.
+    pub(super) global_registers: Vec<crate::arch::aarch64::regalloc::Reg>,
     /// Thread-local storage symbols (need TLS access)
     pub(super) tls_symbols: HashSet<String>,
     /// Every data symbol's known alignment in bytes -- definitions here and
     /// `extern` declarations -- for [`Self::lo12_folds`].
     pub(super) sym_align: HashMap<String, u32>,
     /// Position-independent code mode (for shared libraries)
-    pic_mode: bool,
+    pub(super) pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
     unique_label_counter: u32,
     /// Bytes the prologue allocates for locals: what a dynamically aligned
@@ -101,6 +103,7 @@ impl Aarch64CodeGen {
             named_stack_param_bytes: 0,
             darwin_va_sp_slot: None,
             extern_symbols: HashSet::new(),
+            global_registers: Vec::new(),
             tls_symbols: HashSet::new(),
             sym_align: HashMap::new(),
             pic_mode: false,
@@ -112,16 +115,18 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Check if a symbol needs GOT access
-    /// - In PIC mode: all external symbols need GOT access
-    /// - On macOS: external symbols always need GOT access (even without PIC)
+    /// Check if a symbol needs GOT access: in ELF position-independent code,
+    /// every symbol that may bind outside the output -- an exported
+    /// definition in shared-object code too, which the executable may
+    /// interpose -- and, wherever the code goes, every symbol defined
+    /// elsewhere that does not bind within it. On macOS that is what makes
+    /// dynamic linking work; on Linux gcc would reach an external object
+    /// in position-dependent code through a copy relocation instead, and
+    /// the GOT gives the same address.
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
-        // External symbols always need GOT access:
-        // - On macOS: required for dynamic linking
-        // - On Linux: required for PIE (default) and when linking with shared libs
-        // - In PIC mode: always required
-        // Using GOT unconditionally for external symbols is safe and matches GCC/Clang behavior
-        self.extern_symbols.contains(name)
+        let elf_pic = self.base.target.os != Os::MacOS && self.pic_mode;
+        self.base.pic_needs_got(name, elf_pic)
+            || (self.extern_symbols.contains(name) && !self.base.binds_locally.contains(name))
     }
 
     /// Compute the actual FP-relative offset for a stack location.
@@ -297,6 +302,13 @@ impl Aarch64CodeGen {
             &self.base.current_fn,
             block.id.0,
         ))));
+        if self
+            .base
+            .landing_pads
+            .label(&block.id.label_symbol(&self.base.current_fn))
+        {
+            self.emit_jump_landing_pad();
+        }
 
         // Emit instructions
         for insn in &block.insns {
@@ -775,8 +787,8 @@ impl Aarch64CodeGen {
                 self.emit_int_to_float(insn, types);
             }
 
-            // Float to int conversions
-            Opcode::FCvtU | Opcode::FCvtS => {
+            // Float to int conversions, `lrint` and `lround` among them
+            Opcode::FCvtU | Opcode::FCvtS | Opcode::RoundToInteger(_) => {
                 self.emit_float_to_int(insn, types);
             }
 
@@ -824,6 +836,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::StackSave => self.emit_stack_save(insn),
+            Opcode::LandingPad => self.emit_landing_pad(insn),
             Opcode::StackRestore => self.emit_stack_restore(insn),
 
             Opcode::Fabs => self.emit_fp_abs(insn, types),
@@ -842,6 +855,9 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Brk { imm: 1 });
             }
 
+            // gcc's `__builtin_trap`: `brk #1000`, SIGTRAP.
+            Opcode::Trap => self.push_lir(Aarch64Inst::Brk { imm: 1000 }),
+
             Opcode::FrameAddress => {
                 // __builtin_frame_address(level)
                 self.emit_frame_address(insn);
@@ -852,16 +868,9 @@ impl Aarch64CodeGen {
                 self.emit_return_address(insn);
             }
 
-            // setjmp/longjmp support
-            Opcode::Setjmp => match insn.jmp_kind() {
-                JmpKind::Library => self.emit_setjmp(insn),
-                JmpKind::Builtin => self.emit_builtin_setjmp(insn),
-            },
-
-            Opcode::Longjmp => match insn.jmp_kind() {
-                JmpKind::Library => self.emit_longjmp(insn),
-                JmpKind::Builtin => self.emit_builtin_longjmp(insn),
-            },
+            // gcc's non-local goto
+            Opcode::Setjmp => self.emit_builtin_setjmp(insn),
+            Opcode::Longjmp => self.emit_builtin_longjmp(insn),
 
             // Inline Assembly
             Opcode::Asm => {
@@ -926,14 +935,14 @@ impl Aarch64CodeGen {
     /// Whether accessing the thread-local `name` needs the Initial Exec model
     /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
     pub(super) fn use_tls_ie(&self, name: &str) -> bool {
-        self.base.use_tls_ie(self.extern_symbols.contains(name))
+        self.base.use_tls_ie(name)
     }
 
     /// Emit TLS address computation into dst register.
     /// After this call, dst holds the address of the TLS variable.
     pub(super) fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let sym = Symbol::global(name);
-        if self.base.tls_access() == crate::target::TlsAccess::MachOTlv {
+        if self.base.tls_access(name) == crate::target::TlsAccess::MachOTlv {
             // Mach-O thread-local variable descriptor (clang's sequence):
             //   adrp  x0, _v@TLVPPAGE
             //   ldr   x0, [x0, _v@TLVPPAGEOFF]    ; the descriptor
@@ -973,7 +982,7 @@ impl Aarch64CodeGen {
             }
             return;
         }
-        if self.base.use_tls_dynamic() {
+        if self.base.tls_access(name) == crate::target::TlsAccess::ElfDescriptor {
             // TLS descriptor, the dynamic model:
             //   adrp  x0, :tlsdesc:sym
             //   ldr   x1, [x0, #:tlsdesc_lo12:sym]   ; resolver entry point
@@ -1115,7 +1124,7 @@ impl Aarch64CodeGen {
         }
 
         // Emit the call instruction
-        self.emit_call_instruction(insn, &func_name);
+        self.emit_call_instruction(insn, &func_name, stack_args);
 
         // Clean up stack
         self.cleanup_call_stack(stack_args);
@@ -1296,6 +1305,7 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
                     "aarch64 writes only a floating constant `fmov` encodes as an immediate",
                 ))?,
                 V::Symbol(sym) => sym.clone(),
+                V::Flag => return Err(AsmModifierError::Inapplicable),
             },
             _ => return Err(AsmModifierError::Unsupported),
         })
@@ -1336,15 +1346,16 @@ impl CodeGenerator for Aarch64CodeGen {
         self.base.reset_debug_state();
         self.base.emit_debug = module.debug;
         self.extern_symbols = module.extern_symbols.clone();
-
-        // Collect thread-local storage symbols (both defined and extern)
-        self.tls_symbols = module
-            .globals
+        self.global_registers = module
+            .global_registers
             .iter()
-            .filter(|g| g.is_thread_local)
-            .map(|g| g.name.clone())
-            .chain(module.extern_tls_symbols.iter().cloned())
+            .filter_map(|r| r.aarch64())
             .collect();
+
+        // Collect thread-local storage symbols (both defined and extern),
+        // each with its access model.
+        self.base.plan_thread_locals(module);
+        self.tls_symbols = self.base.tls_models.keys().cloned().collect();
 
         self.sym_align = module
             .globals
@@ -1364,21 +1375,15 @@ impl CodeGenerator for Aarch64CodeGen {
             .collect();
 
         // Emit file header
+        self.base.plan_named_sections(module, self.pic_mode);
+        self.base.plan_local_binding(module);
+        self.base.landing_pads =
+            crate::arch::landing_pads::LandingPads::plan(module, self.base.optimizing, |f| {
+                f.branch_protection.bti
+            });
         self.emit_header();
 
-        // Emit .file directives unconditionally (useful for diagnostics/profiling)
-        // Use "." as placeholder for empty paths (synthetic files like <paste>)
-        // to keep file numbers sequential for .loc directives
-        for (i, path) in module.source_files.iter().enumerate() {
-            let file_path = if path.is_empty() {
-                ".".to_string()
-            } else {
-                path.clone()
-            };
-            // File indices in DWARF start at 1
-            self.base
-                .push_directive(Directive::file((i + 1) as u32, file_path));
-        }
+        self.base.emit_file_table(module);
 
         // The definitions, in runs between the file-scope asm statements:
         // each run's globals, then its functions, then the asm after it.
@@ -1413,12 +1418,16 @@ impl CodeGenerator for Aarch64CodeGen {
             let comp_dir = module.comp_dir.as_deref().unwrap_or(".");
 
             // Only reference text labels if we have code (functions)
-            // Data-only files use 0 for low_pc/high_pc
-            let (low_pc, high_pc) = if module.functions.is_empty() {
-                (None, None)
-            } else {
-                (Some(".Ltext0"), Some(".Ltext_end"))
-            };
+            // Data-only files use 0 for low_pc/high_pc, as does a unit
+            // whose functions each have a section of their own: no one
+            // range covers them, and a debugger takes the unit's extent
+            // from its functions' DIEs instead.
+            let (low_pc, high_pc) =
+                if module.functions.is_empty() || self.base.layout.function_sections {
+                    (None, None)
+                } else {
+                    (Some(".Ltext0"), Some(".Ltext_end"))
+                };
 
             super::super::dwarf::generate_abbrev_table(&mut self.base);
             let fns = std::mem::take(&mut self.base.fn_dies);
@@ -1428,11 +1437,16 @@ impl CodeGenerator for Aarch64CodeGen {
                 comp_dir,
                 low_pc_label: low_pc,
                 high_pc_label: high_pc,
+                globals: &module.globals,
             };
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
 
+        self.base.emit_eh_tables(self.pic_mode);
         self.base.push_directive(Directive::UnitEnd);
+        if let Some(bits) = self.base.target.branch_protection.feature_bits() {
+            self.base.push_directive(Directive::FeatureNote(bits));
+        }
 
         // Flush all buffered LIR instructions to output
         self.base.emit_all();
@@ -1440,12 +1454,20 @@ impl CodeGenerator for Aarch64CodeGen {
         self.base.output.clone()
     }
 
-    fn set_emit_unwind_tables(&mut self, emit: bool) {
-        self.base.emit_unwind_tables = emit;
+    fn set_cfi(&mut self, cfi: crate::target::Cfi) {
+        self.base.cfi = cfi;
     }
 
     fn set_pic_mode(&mut self, pic: bool) {
         self.pic_mode = pic;
+    }
+
+    fn set_object_layout(&mut self, layout: crate::target::ObjectLayout) {
+        self.base.layout = layout;
+    }
+
+    fn set_function_shape(&mut self, shape: crate::target::FunctionShape) {
+        self.base.shape = shape;
     }
 
     fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy) {
@@ -1460,12 +1482,16 @@ impl CodeGenerator for Aarch64CodeGen {
         self.base.cf_protection = cf_protection;
     }
 
-    fn set_stack_clash(&mut self, on: bool) {
-        self.base.stack_clash = on;
+    fn set_stack_clash(&mut self, stack_clash: Option<crate::target::StackClash>) {
+        self.base.stack_clash = stack_clash;
     }
 
-    fn set_stack_protector(&mut self, level: crate::target::StackProtector) {
-        self.base.stack_protector = level;
+    fn set_stack_protector(&mut self, protection: crate::target::StackProtection) {
+        self.base.stack_protector = protection;
+    }
+
+    fn set_optimizing(&mut self, on: bool) {
+        self.base.optimizing = on;
     }
 }
 

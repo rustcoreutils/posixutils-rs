@@ -34,18 +34,33 @@ impl<'a> Parser<'a> {
     // runs from lowest (comma) to highest (primary), each level delegating to
     // the next.
 
-    /// Parse an expression (comma expression, lowest precedence)
+    /// Parse an expression (comma expression, lowest precedence) whose value
+    /// is used.
     pub fn parse_expression(&mut self) -> ParseResult<Expr> {
+        let expr = self.parse_expression_raw()?;
+        self.check_register_array_decay(&expr);
+        Ok(expr)
+    }
+
+    /// Parse an expression whose consumer decides whether an array in it
+    /// decays: a parenthesized primary, a subscript, and the operand of
+    /// `sizeof`, `_Alignof` and `typeof`. Every other caller wants
+    /// [`Self::parse_expression`].
+    pub(crate) fn parse_expression_raw(&mut self) -> ParseResult<Expr> {
         self.parse_comma_expr()
     }
 
     /// Parse a comma expression: expr, expr, ...
     /// Result type is the type of the rightmost expression
     fn parse_comma_expr(&mut self) -> ParseResult<Expr> {
-        let mut expr = self.parse_assignment_expr()?;
+        let mut expr = self.parse_assignment_expr_raw()?;
 
         while self.is_special(b',') {
             self.advance();
+            // Each operand of a comma is a value (6.5.17p2).
+            if !matches!(expr.kind, ExprKind::Comma(_)) {
+                self.check_register_array_decay(&expr);
+            }
             let right = self.parse_assignment_expr()?;
             // C17 6.5.17p2: the result is the *value* of the right operand,
             // so the lvalue conversion runs -- an array or a function
@@ -86,8 +101,17 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    /// Parse an assignment expression (right-to-left associative)
+    /// Parse an assignment expression (right-to-left associative) whose
+    /// value is used.
     pub(crate) fn parse_assignment_expr(&mut self) -> ParseResult<Expr> {
+        let expr = self.parse_assignment_expr_raw()?;
+        self.check_register_array_decay(&expr);
+        Ok(expr)
+    }
+
+    /// [`Self::parse_assignment_expr`] for [`Self::parse_comma_expr`], which
+    /// leaves a lone operand to its own consumer.
+    fn parse_assignment_expr_raw(&mut self) -> ParseResult<Expr> {
         // Parse left side (could be lvalue for assignment)
         let left = self.parse_conditional_expr()?;
 
@@ -189,10 +213,13 @@ impl<'a> Parser<'a> {
     /// the one subobject it names, where such a range names many. A range
     /// first in the chain is kept whole; the initializer walk handles it.
     ///
-    /// gcc evaluates the value of a range once, so the expansion is made only
-    /// for an integer constant value, whose copies cannot be told apart from
-    /// it. binutils' i386-dis.c needs it: `.op_index[0 ... MAX_OPERANDS - 1]
-    /// = -1`.
+    /// gcc evaluates the value of a range once, and so do the copies: one
+    /// whose evaluation has an effect was made a [`ExprKind::RangeValue`] as
+    /// it was parsed ([`Self::evaluated_once`]). binutils' i386-dis.c needs
+    /// it:
+    /// `.op_index[0 ... MAX_OPERANDS - 1] = -1`; and the Linux kernel's
+    /// ima_queue.c, with a braced address constant:
+    /// `.queue[0 ... IMA_MEASURE_HTABLE_SIZE - 1] = HLIST_HEAD_INIT`.
     fn push_init_element(
         &self,
         elements: &mut Vec<InitElement>,
@@ -206,13 +233,6 @@ impl<'a> Parser<'a> {
         if !inner_range {
             elements.push(element);
             return Ok(());
-        }
-        if self.eval_const_expr(&element.value).is_none() {
-            return Err(ParseError::new(
-                "an index range after a field designator needs a constant value; \
-                 write '.field = { [lo ... hi] = value }'",
-                element.value.pos,
-            ));
         }
         // Every index of every range in the chain, the last varying fastest.
         let mut chains: Vec<Vec<Designator>> = vec![Vec::new()];
@@ -243,6 +263,85 @@ impl<'a> Parser<'a> {
             value: element.value.clone(),
         }));
         Ok(())
+    }
+
+    /// The value of an index range, `[lo ... hi] = value`, made to be
+    /// evaluated once however many elements it initializes, as gcc evaluates
+    /// it ([`ExprKind::RangeValue`]): a value whose evaluation has an effect
+    /// is wrapped, and in a braced value each such part of it. One that
+    /// [`Self::evaluates_alike_repeated`] stays as it is, so that a constant
+    /// is still one.
+    fn evaluated_once(&mut self, value: Expr) -> Expr {
+        if self.evaluates_alike_repeated(&value) {
+            return value;
+        }
+        let (typ, pos) = (value.typ, value.pos);
+        let kind = match value.kind {
+            ExprKind::InitList { elements } => ExprKind::InitList {
+                elements: elements
+                    .into_iter()
+                    .map(|el| InitElement {
+                        designators: el.designators,
+                        value: Box::new(self.evaluated_once(*el.value)),
+                    })
+                    .collect(),
+            },
+            kind => {
+                self.range_values += 1;
+                ExprKind::RangeValue {
+                    id: self.range_values,
+                    value: Box::new(Expr { kind, ..value }),
+                }
+            }
+        };
+        Expr {
+            typ,
+            ..Expr::new(kind, pos)
+        }
+    }
+
+    /// Whether evaluating `e` once per element of a range cannot be told
+    /// from evaluating it once: it has no effect -- no call, assignment,
+    /// increment or statement expression -- touches nothing volatile, and
+    /// makes no object, as a compound literal would, whose address each copy
+    /// would see differently. Any initializer of a static object qualifies.
+    fn evaluates_alike_repeated(&self, e: &Expr) -> bool {
+        if e.typ.is_some_and(|t| self.types.contains_volatile(t)) {
+            return false;
+        }
+        let alike = |e: &Expr| self.evaluates_alike_repeated(e);
+        match &e.kind {
+            ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::CharLit(_)
+            | ExprKind::StringLit(_)
+            | ExprKind::WideStringLit(_)
+            | ExprKind::FuncName
+            | ExprKind::Ident(_)
+            | ExprKind::LabelAddr(_)
+            | ExprKind::AlignofType(_)
+            | ExprKind::AlignofExpr(_)
+            // Evaluated once, however many copies there are.
+            | ExprKind::RangeValue { .. } => true,
+            ExprKind::Unary { op, operand } => {
+                !matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) && alike(operand)
+            }
+            ExprKind::Binary { left, right, .. } => alike(left) && alike(right),
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => alike(cond) && alike(then_expr) && alike(else_expr),
+            ExprKind::CondElvis { cond, else_expr } => alike(cond) && alike(else_expr),
+            ExprKind::Member { expr, .. }
+            | ExprKind::Arrow { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::SizeofExpr(expr) => alike(expr),
+            ExprKind::Index { array, index } => alike(array) && alike(index),
+            ExprKind::SizeofType(_, dims) | ExprKind::Comma(dims) => dims.iter().all(alike),
+            ExprKind::InitList { elements } => elements.iter().all(|el| alike(&el.value)),
+            _ => false,
+        }
     }
 
     /// Parse a single element of an initializer list
@@ -341,6 +440,14 @@ impl<'a> Parser<'a> {
 
         // Parse the initializer value (can be nested initializer list)
         let value = self.parse_initializer()?;
+        let ranged = designators
+            .iter()
+            .any(|d| matches!(d, Designator::IndexRange(..)));
+        let value = if ranged {
+            self.evaluated_once(value)
+        } else {
+            value
+        };
 
         Ok(InitElement {
             designators,
@@ -460,6 +567,19 @@ impl<'a> Parser<'a> {
         ) else {
             return then_typ;
         };
+        if self.types.address_space(tp) != self.types.address_space(ep) {
+            diag::error(
+                pos,
+                &gettext("pointers to disjoint address spaces used in conditional expression"),
+            );
+            return then_typ;
+        }
+        // Arrays whose elements differ only in qualifiers meet as C2x has
+        // it, in the array qualified with both, and only `-pedantic` says
+        // that C17 calls them different types.
+        if self.types.arrays_differ_in_qualifiers_only(tp, ep) {
+            super::expr_check::pedwarn_qualified_arrays(pos);
+        }
         let quals =
             self.types.qualifiers_through_arrays(tp) | self.types.qualifiers_through_arrays(ep);
         let (tp, ep) = (
@@ -532,6 +652,7 @@ impl<'a> Parser<'a> {
 
         if self.is_special(b'?') {
             self.advance();
+            self.check_register_array_decay(&cond);
             let cond_tested = self.check_truth_value(&cond);
             // The arm a constant condition discards is not evaluated.
             let truth = self.constant_truth(&cond);
@@ -545,6 +666,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let else_expr =
                     self.unevaluated_if(truth == Some(true), Self::parse_conditional_expr)?;
+                self.check_register_array_decay(&else_expr);
 
                 // The condition is also an arm here, so one that cannot be
                 // tested has been reported as the operand it is.
@@ -571,6 +693,7 @@ impl<'a> Parser<'a> {
             // Right-to-left: parse else as another conditional
             let else_expr =
                 self.unevaluated_if(truth == Some(true), Self::parse_conditional_expr)?;
+            self.check_register_array_decay(&else_expr);
 
             let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
@@ -810,6 +933,10 @@ impl<'a> Parser<'a> {
 
     /// Parse unary expression: ++x, --x, &x, *x, +x, -x, ~x, !x, sizeof
     fn parse_unary_expr(&mut self) -> ParseResult<Expr> {
+        // GNU `__extension__ cast-expression`: the operand, unchanged. Casts
+        // are parsed here too, so what follows is this expression.
+        self.skip_gnu_extension();
+
         // Check for prefix operators
         if self.is_special_token(SpecialToken::Increment) {
             let op_pos = self.current_pos();
@@ -888,6 +1015,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             // Deref produces the base type of the pointer.
             // Function types: *func is a no-op in C (6.5.3.2, 6.3.2.1).
             // A function identifier has function type which decays to pointer-
@@ -934,6 +1062,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             let valid = self.check_unary_operand(UnaryOperator::Plus, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let e = Self::typed_expr(
@@ -951,6 +1080,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             let valid = self.check_unary_operand(UnaryOperator::Minus, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
@@ -972,6 +1102,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             let valid = self.check_unary_operand(UnaryOperator::Complement, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
@@ -991,6 +1122,7 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            self.check_register_array_decay(&operand);
             let valid = self.check_unary_operand(UnaryOperator::Not, &operand, op_pos);
             // Logical not always produces int (0 or 1)
             let e = Self::typed_expr(
@@ -1036,6 +1168,7 @@ impl<'a> Parser<'a> {
                 let op_pos = self.current_pos();
                 self.advance();
                 let operand = self.parse_unary_expr()?;
+                self.check_register_array_decay(&operand);
                 let op_typ = operand.typ.unwrap_or(self.types.double_id);
                 // A half of a complex object stored in reverse order is
                 // stored so too, and assigning through it has to know.
@@ -1103,7 +1236,7 @@ impl<'a> Parser<'a> {
 
         // A rewind parses the operand again; what it held goes with it.
         let mark = self.reverse_atomic_mark();
-        let Ok(expr) = self.parse_expression() else {
+        let Ok(expr) = self.parse_expression_raw() else {
             self.pos = saved;
             self.take_reverse_atomic_members(mark);
             return Ok(None);
@@ -1242,7 +1375,25 @@ impl<'a> Parser<'a> {
         } else if target_kind == TypeKind::Pointer && self.types.is_float(from) {
             diag::error(pos, &gettext("cannot convert to a pointer type"));
         } else if target_kind == TypeKind::Pointer && from_kind == TypeKind::Pointer {
+            self.warn_address_space_cast(target, from, expr, pos);
             self.check_function_object_pointer_cast(target, from, expr, pos);
+        }
+    }
+
+    /// gcc's warning for a cast between pointers into disjoint address
+    /// spaces, which it performs as it would between two generic pointers.
+    /// A null pointer constant points nowhere, and converts in silence.
+    fn warn_address_space_cast(&self, target: TypeId, from: TypeId, expr: &Expr, pos: Position) {
+        let (to, of) = (
+            self.types.pointee_address_space(target),
+            self.types.pointee_address_space(from),
+        );
+        if to != of && !self.is_null_pointer_constant(expr) {
+            diag::warning_args(
+                pos,
+                "cast to {0} address space pointer from disjoint {1} address space pointer",
+                &[&to.quoted(), &of.quoted()],
+            );
         }
     }
 
@@ -1580,7 +1731,7 @@ impl<'a> Parser<'a> {
     /// starting a type-name, the `(` already consumed: a parenthesized
     /// expression and whatever postfix operators follow it.
     fn parse_parenthesized_operand(&mut self) -> ParseResult<Expr> {
-        let expr = self.parse_expression()?;
+        let expr = self.parse_expression_raw()?;
         self.expect_special(b')')?;
         self.parse_postfix_suffixes(expr)
     }
@@ -1657,10 +1808,12 @@ impl<'a> Parser<'a> {
                 expr = Self::typed_expr(ExprKind::PostDec(Box::new(expr)), typ, base_pos);
             } else if self.is_special(b'[') {
                 // Array subscript
+                let bracket_pos = self.current_pos();
                 self.advance();
-                let index = self.parse_expression()?;
+                let index = self.parse_expression_raw()?;
                 self.expect_special(b']')?;
                 self.check_subscript(&expr, &index, base_pos);
+                self.check_register_array_subscript(&expr, &index, bracket_pos);
                 // C17 6.5.2.1p2 defines `E1[E2]` as `(*((E1)+(E2)))`, so the
                 // two operands are interchangeable: `N[p]` is `p[N]`. The
                 // element type therefore comes from whichever operand is the
@@ -1732,6 +1885,7 @@ impl<'a> Parser<'a> {
                 let arrow_pos = self.current_pos();
                 self.advance();
                 let member = self.expect_identifier()?;
+                self.check_register_array_decay(&expr);
                 // Get member type: dereference the pointer, then find the member
                 let member_type = if let Some(t) = expr.typ {
                     // C17 6.5.2.3p2: the operand of `->` is a pointer (an
@@ -1971,6 +2125,19 @@ impl<'a> Parser<'a> {
             // pair -- while a unit an escape names is kept as the number it
             // is: `L"\xffffffff"` is one element, all ones. A character
             // beyond the BMP becomes a surrogate pair in a `u"..."` literal.
+            // `-fshort-wchar`: a 16-bit `wchar_t`, whose units are UTF-16's
+            // as gcc encodes them, laid out as a `u"..."` literal's.
+            Some(TokenType::WideString) if unit_bits == 16 => {
+                let units = literal::literal_utf16_units(&elements);
+                let t = self
+                    .types
+                    .intern(Type::array(self.types.wchar_id, units.len() + 1));
+                Ok(Self::typed_expr(
+                    ExprKind::Utf16StringLit(units),
+                    t,
+                    start_pos,
+                ))
+            }
             Some(TokenType::WideString) => {
                 let units = literal::literal_wide_chars(&elements);
                 let t = self
@@ -2065,6 +2232,8 @@ impl<'a> Parser<'a> {
 
     /// Create a typed binary expression, computing result type from operands
     fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr, op_pos: Position) -> Expr {
+        self.check_register_array_decay(&left);
+        self.check_register_array_decay(&right);
         let valid = self.check_binary_operands(op, &left, &right, left.pos);
 
         // A bit-field operand promotes before anything else looks at it
@@ -2298,6 +2467,12 @@ impl<'a> Parser<'a> {
     ///
     /// Only the *count* need be constant, as in gcc: `x << 64` warns.
     fn check_shift_count(&mut self, op: BinaryOp, promoted_left: TypeId, right: &Expr) {
+        // Not in an operand that is never evaluated, as gcc: generic code
+        // guards a shift by a computed width with a constant condition,
+        // `W > 64 ? x << (64 - W - 1) : x`.
+        if self.unevaluated > 0 {
+            return;
+        }
         let Some(count) = self.eval_const_expr(right) else {
             return;
         };
@@ -2569,7 +2744,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.expect_special(b':')?;
                 let mark = self.reverse_atomic_mark();
-                let expr = self.parse_assignment_expr()?;
+                // The selection is the association itself (6.5.1.1p3), which
+                // what it is used in converts.
+                let expr = self.parse_assignment_expr_raw()?;
                 let held = self.take_reverse_atomic_members(mark);
 
                 if default_pos.is_some() {
@@ -2607,7 +2784,9 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_special(b':')?;
                 let mark = self.reverse_atomic_mark();
-                let expr = self.parse_assignment_expr()?;
+                // The selection is the association itself (6.5.1.1p3), which
+                // what it is used in converts.
+                let expr = self.parse_assignment_expr_raw()?;
                 let held = self.take_reverse_atomic_members(mark);
 
                 // 6.5.1.1p2: no two associations may name compatible types.
@@ -2663,6 +2842,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// An identifier used but never declared, in gcc's words: once for
+    /// each name in a function, the first time with gcc's note saying so,
+    /// and once for each outside them.
+    fn report_undeclared(&mut self, name: StringId, pos: Position) {
+        if !self.undeclared_reported.insert(name) {
+            return;
+        }
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        if self.enclosing_function.name.is_none() {
+            diag::error_args(pos, "'{0}' undeclared here (not in a function)", &[spelled]);
+            return;
+        }
+        diag::error_args(
+            pos,
+            "'{0}' undeclared (first use in this function)",
+            &[spelled],
+        );
+        if !std::mem::replace(&mut self.undeclared_noted, true) {
+            diag::note(
+                pos,
+                &gettext(
+                    "each undeclared identifier is reported only once for each function it \
+                     appears in",
+                ),
+            );
+        }
+    }
+
     fn parse_primary_expr(&mut self) -> ParseResult<Expr> {
         match self.peek() {
             TokenType::Number => {
@@ -2681,12 +2888,16 @@ impl<'a> Parser<'a> {
                 if let TokenValue::Ident(id) = &token.value {
                     let name_id = *id;
 
-                    // `__label__` declares local labels at the head of a
-                    // block and nowhere else; anywhere a statement or an
-                    // expression is wanted, gcc takes it as neither.
-                    if name_id == crate::kw::GNU_LABEL {
+                    // A statement keyword starts no expression: `__label__`
+                    // declares local labels at the head of a block and
+                    // nowhere else, and `case` after `__extension__` is no
+                    // label. gcc takes it as neither.
+                    if crate::kw::has_tag(name_id, crate::kw::STMT_KW) {
                         return Err(ParseError::new(
-                            gettext("expected expression before '__label__'"),
+                            gettext_args(
+                                "expected expression before '{0}'",
+                                &[self.idents.get_opt(name_id).unwrap_or("")],
+                            ),
                             token_pos,
                         ));
                     }
@@ -2799,8 +3010,7 @@ impl<'a> Parser<'a> {
                     } else {
                         // C99 6.5.1: Undeclared identifier is an error
                         // (implicit int was removed in C99)
-                        let name_str = self.idents.get_opt(name_id).unwrap_or("");
-                        diag::error_args(token_pos, "undeclared identifier '{0}'", &[name_str]);
+                        self.report_undeclared(name_id, token_pos);
                         // Return a dummy expression to continue parsing
                         Ok(Self::typed_expr(
                             ExprKind::IntLit(0),
@@ -2910,6 +3120,7 @@ impl<'a> Parser<'a> {
 
                         // Regular cast expression
                         let expr = self.parse_unary_expr()?;
+                        self.check_register_array_decay(&expr);
                         // C17 6.5.4p2: a cast names a scalar type or `void`.
                         // An array was converted as if it were its first
                         // element's address. (A union stays: gcc casts to
@@ -2970,7 +3181,7 @@ impl<'a> Parser<'a> {
                     }
 
                     // Regular parenthesized expression
-                    let expr = self.parse_expression()?;
+                    let expr = self.parse_expression_raw()?;
                     self.expect_special(b')')?;
                     Ok(expr)
                 } else {

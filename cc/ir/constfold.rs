@@ -24,7 +24,7 @@
 // shift count).
 //
 
-use crate::float::{FloatVal, FpFormat};
+use crate::float::{FloatVal, FpFormat, FpRounding};
 
 use std::cmp::Ordering;
 
@@ -475,7 +475,17 @@ fn eval_shift(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 /// bit, raises nothing, and keeps a NaN's payload. `FMin` and `FMax` fold
 /// as [`FloatVal::fmin`] says, a quiet NaN operand included, since neither
 /// raises anything for one.
-pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -> Option<FloatVal> {
+///
+/// Under [`FpRounding::Dynamic`] (`-frounding-math`) an arithmetic result is
+/// folded only when it is exact, as gcc folds it: any other one is the
+/// rounding direction's at run time.
+pub(crate) fn eval_fbinop(
+    op: Opcode,
+    fmt: FpFormat,
+    a: FloatVal,
+    b: FloatVal,
+    rounding: FpRounding,
+) -> Option<FloatVal> {
     let (a, b) = (a.round_to_format(fmt), b.round_to_format(fmt));
     match op {
         Opcode::CopySign => return Some(a.with_sign_of(b)),
@@ -487,28 +497,30 @@ pub(crate) fn eval_fbinop(op: Opcode, fmt: FpFormat, a: FloatVal, b: FloatVal) -
         return None;
     }
     let r = match op {
-        Opcode::FAdd => a.add(b, fmt),
-        Opcode::FSub => a.sub(b, fmt),
-        Opcode::FMul => a.mul(b, fmt),
+        Opcode::FAdd => a.add_rounded(b, fmt),
+        Opcode::FSub => a.sub_rounded(b, fmt),
+        Opcode::FMul => a.mul_rounded(b, fmt),
         // A zero divisor gives infinity and raises `FE_DIVBYZERO`, so it
         // falls to the same rule as the operands above.
-        Opcode::FDiv if !b.is_zero() => a.div(b, fmt),
+        Opcode::FDiv if !b.is_zero() => a.div_rounded(b, fmt),
         _ => return None,
     };
-    r.is_finite().then_some(r)
+    r.under(rounding).filter(|v| v.is_finite())
 }
 
 /// A float operation of three constants: `Fma`, as [`FloatVal::fma`] says --
-/// rounded once, and held to the arithmetic's rule for what raises.
+/// rounded once, and held to the arithmetic's rule for what raises and to
+/// [`eval_fbinop`]'s for the rounding direction.
 pub(crate) fn eval_fternop(
     op: Opcode,
     fmt: FpFormat,
     a: FloatVal,
     b: FloatVal,
     c: FloatVal,
+    rounding: FpRounding,
 ) -> Option<FloatVal> {
     match op {
-        Opcode::Fma => a.fma(b, c, fmt),
+        Opcode::Fma => a.fma_rounded(b, c, fmt)?.under(rounding),
         _ => None,
     }
 }
@@ -528,11 +540,19 @@ pub(crate) fn eval_fternop(
 /// `RoundToIntegral` folds as [`FloatVal::round_to_integral`] says: exactly,
 /// except a signalling NaN, and a `rint` or `nearbyint` whose answer is the
 /// rounding direction's.
-pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<FloatVal> {
+///
+/// `Sqrt` is held to [`eval_fbinop`]'s rule for the rounding direction; the
+/// others are exact.
+pub(crate) fn eval_funop(
+    op: Opcode,
+    fmt: FpFormat,
+    a: FloatVal,
+    rounding: FpRounding,
+) -> Option<FloatVal> {
     match op {
         Opcode::FNeg => Some(a.round_to_format(fmt).negated()),
         Opcode::Fabs => Some(a.round_to_format(fmt).magnitude()),
-        Opcode::Sqrt => a.sqrt(fmt),
+        Opcode::Sqrt => a.sqrt_rounded(fmt)?.under(rounding),
         Opcode::RoundToIntegral(how) => a.round_to_integral(how, fmt),
         _ => None,
     }
@@ -545,18 +565,21 @@ pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<Float
 /// NaN raises invalid and a narrowing that overflows to infinity raises
 /// overflow, so both are left to run time. An infinity converts exactly and
 /// a quiet NaN raises nothing, so both fold -- `float x = -INFINITY;` is
-/// then a constant to the float-to-integer fold below, as it is in gcc.
+/// then a constant to the float-to-integer fold below, as it is in gcc. A
+/// narrowing that rounds is held to [`eval_fbinop`]'s rule for the rounding
+/// direction.
 pub(crate) fn eval_fcvtf(
     op: Opcode,
     src_fmt: FpFormat,
     dst_fmt: FpFormat,
     a: FloatVal,
+    rounding: FpRounding,
 ) -> Option<FloatVal> {
     let a = a.round_to_format(src_fmt);
     if op != Opcode::FCvtF || a.is_signalling_nan() {
         return None;
     }
-    let r = a.convert(src_fmt, dst_fmt);
+    let r = a.convert_rounded(src_fmt, dst_fmt).under(rounding)?;
     (r.is_finite() || !a.is_finite()).then_some(r)
 }
 
@@ -575,11 +598,22 @@ pub(crate) fn eval_fcvtf(
 /// `Signbit` folds for every operand, the infinities and NaN included: it
 /// reads a bit and raises nothing, and rounding to a format never changes a
 /// sign.
+///
+/// `RoundToInteger` folds only where the answer is the function's for every
+/// rounding direction and in range: an `lround`, or an `lrint` of a value
+/// already integral ([`FloatVal::round_to_integral`]), that the integer type
+/// holds. Out of range the function's answer is unspecified and it raises
+/// invalid, so that is left to run time.
 pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVal) -> Option<i128> {
     let signed = match op {
         Opcode::FCvtS => true,
         Opcode::FCvtU => false,
         Opcode::Signbit => return Some(i128::from(a.sign_bit())),
+        Opcode::RoundToInteger(how) => {
+            return a
+                .round_to_integral(how.integral(), src_fmt)?
+                .to_integer(dst_size.clamp(1, 128), true);
+        }
         _ => return None,
     };
     Some(
@@ -1282,6 +1316,29 @@ mod tests {
         }
     }
 
+    /// `lround` of a constant folds to its tie away from zero, `lrint` only
+    /// of an integral value, whose answer no rounding direction changes; and
+    /// neither out of the integer's range, where the function's answer is
+    /// unspecified.
+    #[test]
+    fn round_to_integer_folds_only_what_every_direction_agrees_on() {
+        use crate::float::IntegerRounding::{Rint, Round};
+        let v = FloatVal::from_f64;
+        let d = FpFormat::Binary64;
+        let fold = |how, bits, x| eval_fcvt(Opcode::RoundToInteger(how), bits, d, v(x));
+        assert_eq!(fold(Round, 64, 2.5), Some(3));
+        assert_eq!(fold(Round, 64, -2.5), Some(-3));
+        assert_eq!(fold(Round, 64, 2.4999), Some(2));
+        assert_eq!(fold(Rint, 64, -7.0), Some(-7));
+        assert_eq!(fold(Rint, 64, 2.5), None);
+        assert_eq!(fold(Round, 32, 3e9), None);
+        assert_eq!(fold(Rint, 64, 1e300), None);
+        assert_eq!(
+            eval_fcvt(Opcode::RoundToInteger(Rint), 64, d, FloatVal::nan()),
+            None
+        );
+    }
+
     /// A float-to-integer conversion out of range folds to gcc's saturated
     /// answer at every width, rounding at the source format first: the
     /// `float` nearest 2147483647 is 2^31, one past `INT_MAX`.
@@ -1326,7 +1383,7 @@ mod tests {
     #[test]
     fn fcvtf_folds_what_raises_nothing() {
         let (d, f) = (FpFormat::Binary64, FpFormat::Binary32);
-        let conv = |x| eval_fcvtf(Opcode::FCvtF, d, f, x);
+        let conv = |x| eval_fcvtf(Opcode::FCvtF, d, f, x, FpRounding::ToNearest);
         let inf = FloatVal::infinity(true);
         assert_eq!(conv(inf), Some(inf));
         let quiet = conv(FloatVal::nan()).expect("a quiet NaN folds");
@@ -1335,5 +1392,64 @@ mod tests {
         assert_eq!(conv(snan), None, "raises invalid");
         assert_eq!(conv(FloatVal::from_f64(1e300)), None, "raises overflow");
         assert!(conv(FloatVal::from_f64(0.1)).is_some_and(|r| r.is_finite()));
+    }
+
+    /// Under `-frounding-math` only a result every rounding direction gives
+    /// is folded: an exact one. A zero difference is not, whose sign is the
+    /// direction's (`-0` downward). To nearest, everything finite folds.
+    #[test]
+    fn dynamic_rounding_folds_only_exact_results() {
+        let v = FloatVal::from_f64;
+        let d = FpFormat::Binary64;
+        let dynamic = FpRounding::Dynamic;
+        let bin = |op, a: f64, b: f64, r| eval_fbinop(op, d, v(a), v(b), r).map(|x| x.to_f64());
+        assert_eq!(bin(Opcode::FDiv, 1.0, 3.0, dynamic), None);
+        assert_eq!(
+            bin(Opcode::FDiv, 1.0, 3.0, FpRounding::ToNearest),
+            Some(1.0 / 3.0)
+        );
+        assert_eq!(bin(Opcode::FDiv, 1.0, 4.0, dynamic), Some(0.25));
+        assert_eq!(bin(Opcode::FAdd, 0.1, 0.7, dynamic), None);
+        assert_eq!(bin(Opcode::FAdd, 0.5, 0.25, dynamic), Some(0.75));
+        assert_eq!(bin(Opcode::FMul, 0.1, 3.0, dynamic), None);
+        assert_eq!(bin(Opcode::FMul, 1.5, 3.0, dynamic), Some(4.5));
+        assert_eq!(bin(Opcode::FSub, 1.0, 1.0, dynamic), None, "+0 or -0");
+        assert_eq!(
+            bin(Opcode::FSub, 1.0, 1.0, FpRounding::ToNearest),
+            Some(0.0)
+        );
+        assert_eq!(bin(Opcode::FSub, 2.0, 0.5, dynamic), Some(1.5));
+        // Exact even far below the larger operand's last bit, and not when
+        // a bit falls off.
+        assert_eq!(
+            bin(Opcode::FAdd, 1.0, f64::EPSILON, dynamic),
+            Some(1.0 + f64::EPSILON)
+        );
+        assert_eq!(bin(Opcode::FAdd, 1.0, f64::EPSILON / 2.0, dynamic), None);
+        // A result too small for the format is never exact.
+        assert_eq!(bin(Opcode::FMul, 1e-300, 1e-300, dynamic), None);
+
+        assert_eq!(
+            eval_funop(Opcode::Sqrt, d, v(2.0), dynamic),
+            None,
+            "an irrational root"
+        );
+        assert_eq!(
+            eval_funop(Opcode::Sqrt, d, v(2.25), dynamic).map(|x| x.to_f64()),
+            Some(1.5)
+        );
+        assert_eq!(
+            eval_fternop(Opcode::Fma, d, v(0.1), v(3.0), v(1.0), dynamic),
+            None
+        );
+        assert_eq!(
+            eval_fternop(Opcode::Fma, d, v(1.5), v(2.0), v(1.0), dynamic).map(|x| x.to_f64()),
+            Some(4.0)
+        );
+        let f = FpFormat::Binary32;
+        let narrow = |x, r| eval_fcvtf(Opcode::FCvtF, d, f, v(x), r);
+        assert_eq!(narrow(0.1, dynamic), None);
+        assert!(narrow(0.1, FpRounding::ToNearest).is_some());
+        assert_eq!(narrow(0.5, dynamic).map(|x| x.to_f64()), Some(0.5));
     }
 }

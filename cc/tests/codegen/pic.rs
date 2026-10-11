@@ -209,3 +209,236 @@ int main(void) {
         0
     );
 }
+
+/// Hidden objects defined in another unit and reached PC-relative, and a
+/// static and a hidden function's address, link and read back in a `-fPIC`
+/// build, as the GOT-free access must.
+#[test]
+fn codegen_pic_hidden_symbols_across_units() {
+    let unit_a = r#"
+extern int hv __attribute__((visibility("hidden")));
+extern int hv_arr[4] __attribute__((visibility("hidden")));
+extern int hfn(int) __attribute__((visibility("hidden")));
+static int sv = 3;
+static int sfn(int x) { return x + sv; }
+int main(void)
+{
+    int (*volatile fp)(int) = hfn;
+    int (*volatile sp)(int) = sfn;
+    hv_arr[2] = 9;
+    return !(hv == 5 && fp(1) == 2 && sp(1) == 4 && hv_arr[2] == 9 && &hv_arr[3] - &hv_arr[0] == 3);
+}
+"#;
+    let unit_b = r#"
+__attribute__((visibility("hidden"))) int hv = 5;
+__attribute__((visibility("hidden"))) int hv_arr[4];
+__attribute__((visibility("hidden"))) int hfn(int x) { return x + 1; }
+"#;
+    for opt in ["-O0", "-O2"] {
+        let opts = vec!["-fPIC".to_string(), opt.to_string()];
+        assert_eq!(
+            crate::common::compile_and_run_two_units("pic_hidden_units", unit_a, unit_b, &opts),
+            0,
+            "{opt}"
+        );
+    }
+}
+
+/// `#pragma GCC visibility push(hidden)` around `extern` declarations, as
+/// Linux force-includes it into its PIE decompressor: the object built
+/// `-fPIE` reaches them with no GOT relocation, and the program links and
+/// runs against the unit that defines them under the same pragma.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_pie_visibility_pragma_needs_no_got() {
+    let unit_a = r#"
+#pragma GCC visibility push(hidden)
+extern int hv;
+extern int harr[4];
+extern int hfn(int);
+#pragma GCC visibility pop
+int main(void)
+{
+    int (*volatile fp)(int) = hfn;
+    harr[1] = 7;
+    return !(hv == 5 && fp(1) == 2 && harr[1] == 7);
+}
+"#;
+    let unit_b = r#"
+#pragma GCC visibility push(hidden)
+int hv = 5;
+int harr[4];
+int hfn(int x) { return x + 1; }
+#pragma GCC visibility pop
+"#;
+    let dir = crate::common::work_dir("vis_pragma_pie");
+    for opt in ["-O0", "-O2"] {
+        let obj =
+            crate::common::c17_object_with("vis_pragma_main", unit_a, opt, &["-fPIE"], dir.path());
+        let relocs = std::process::Command::new("readelf")
+            .args(["-rW", &obj])
+            .output()
+            .expect("readelf");
+        let relocs = String::from_utf8_lossy(&relocs.stdout);
+        assert!(
+            !relocs.contains("GOT"),
+            "{opt}: GOT relocation in:\n{relocs}"
+        );
+        let opts = vec!["-fPIE".to_string(), opt.to_string()];
+        assert_eq!(
+            crate::common::compile_and_run_two_units("vis_pragma_units", unit_a, unit_b, &opts),
+            0,
+            "{opt}"
+        );
+    }
+}
+
+/// A shared object built `-fvisibility=hidden` that takes the address of a
+/// `gnu_inline` function defined out of line in another of its units links
+/// and runs: the inline body is no definition, so the address comes from
+/// the GOT. Taken PC-relative, as for a hidden symbol, it made guile's
+/// library unlinkable ("relocation R_X86_64_PC32 against symbol `scm_car'
+/// can not be used when making a shared object").
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_pic_fvisibility_inline_definition_address() {
+    let header = r#"
+extern __inline__ __attribute__((__gnu_inline__)) int scm_car(int x) { return x + 1; }
+"#;
+    let user = format!(
+        "{header}int (*p)(int);\n\
+         __attribute__((visibility(\"default\"))) int lib_call(int x) {{ p = scm_car; return p(x); }}\n"
+    );
+    let definer = "__attribute__((visibility(\"default\"))) int scm_car(int x) { return x + 1; }\n";
+    let main = "int lib_call(int);\nint main(void) { return lib_call(41) != 42; }\n";
+    let dir = crate::common::work_dir("pic_fvis_inline");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(p("user.c"), user).unwrap();
+    std::fs::write(p("definer.c"), definer).unwrap();
+    std::fs::write(p("main.c"), main).unwrap();
+    for opt in ["-O0", "-O2"] {
+        let r = crate::common::run_c17(&[
+            opt,
+            "-shared",
+            "-fPIC",
+            "-fvisibility=hidden",
+            "-o",
+            &p("libfvis.so"),
+            &p("user.c"),
+            &p("definer.c"),
+        ]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let r = crate::common::run_c17(&[
+            "-o",
+            &p("main"),
+            &p("main.c"),
+            &p("libfvis.so"),
+            &format!("-Wl,-rpath,{}", dir.path().display()),
+        ]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let code = std::process::Command::new(p("main"))
+            .status()
+            .unwrap()
+            .code();
+        assert_eq!(code, Some(0), "{opt}");
+    }
+}
+
+/// An executable's definitions interpose a shared object's exported ones,
+/// and the library's own calls and accesses reach them, as with gcc's
+/// `-fPIC` default (binutils' ld-vsb, elfweak): the library calls `f`
+/// through the PLT and reads `gv` through the GOT. Its hidden function, and
+/// everything once built `-fno-semantic-interposition`, still binds within
+/// the library for calls.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_pic_executable_interposes_library_definitions() {
+    let lib = r#"
+int gv = 1;
+int f(void) { return 10; }
+__attribute__((visibility("hidden"))) int hf(void) { return 100; }
+int lib_entry(void) { return f() + gv + hf(); }
+"#;
+    let main = r#"
+int gv = 2;
+int f(void) { return 20; }
+int lib_entry(void);
+int main(void) { return lib_entry(); }
+"#;
+    let dir = crate::common::work_dir("pic_interpose");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(p("lib.c"), lib).unwrap();
+    std::fs::write(p("main.c"), main).unwrap();
+    for (opt, extra, expect) in [
+        ("-O0", None, 122),
+        ("-O2", None, 122),
+        ("-O2", Some("-fno-semantic-interposition"), 112),
+    ] {
+        let mut args = vec![opt, "-shared", "-fPIC", "-o"];
+        let so = p("libinterpose.so");
+        args.push(&so);
+        let src = p("lib.c");
+        args.push(&src);
+        args.extend(extra);
+        let r = crate::common::run_c17(&args);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let r = crate::common::run_c17(&[
+            "-o",
+            &p("main"),
+            &p("main.c"),
+            &so,
+            &format!("-Wl,-rpath,{}", dir.path().display()),
+        ]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let code = std::process::Command::new(p("main"))
+            .status()
+            .unwrap()
+            .code();
+        assert_eq!(code, Some(expect), "{opt} {extra:?}");
+    }
+}
+
+/// A position-dependent executable and a shared library agree on the
+/// address of the library's function: the executable takes it as an
+/// absolute immediate, as gcc does, so the linker makes its PLT entry the
+/// one canonical address and the library's GOT holds the same. A
+/// PC-relative `leaq` got the PLT entry without telling the linker it was
+/// an address, and the two pointers differed (binutils' indirect4,
+/// protected-func-2, pr23169).
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_no_pie_function_address_equals_library_one() {
+    let lib = r#"
+int lf(void) { return 1; }
+void *lib_addr(void) { return (void *)lf; }
+"#;
+    let main = r#"
+int lf(void);
+void *lib_addr(void);
+int main(void) { void *volatile p = (void *)lf; return p != lib_addr(); }
+"#;
+    let dir = crate::common::work_dir("nopie_fnaddr");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(p("lib.c"), lib).unwrap();
+    std::fs::write(p("main.c"), main).unwrap();
+    let so = p("libfnaddr.so");
+    let r = crate::common::run_c17(&["-O2", "-shared", "-fPIC", "-o", &so, &p("lib.c")]);
+    assert!(r.success, "{}", r.stderr);
+    for opt in ["-O0", "-O2"] {
+        let r = crate::common::run_c17(&[
+            opt,
+            "-fno-pie",
+            "-o",
+            &p("main"),
+            &p("main.c"),
+            &so,
+            &format!("-Wl,-rpath,{}", dir.path().display()),
+        ]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let code = std::process::Command::new(p("main"))
+            .status()
+            .unwrap()
+            .code();
+        assert_eq!(code, Some(0), "{opt}: the two addresses differ");
+    }
+}

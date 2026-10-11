@@ -24,7 +24,7 @@
 
 use crate::ir::{Function, Opcode, PseudoId};
 use crate::parse::ast::StackProtectAttr;
-use crate::target::StackProtector;
+use crate::target::{StackProtection, StackProtector};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashSet;
 
@@ -32,12 +32,16 @@ use std::collections::HashSet;
 pub const GUARD_SYMBOL: &str = "__stack_chk_guard";
 pub const FAIL_SYMBOL: &str = "__stack_chk_fail";
 
-/// gcc's `--param ssp-buffer-size`: the size from which `-fstack-protector`
-/// counts a `char` array.
-const SSP_BUFFER_SIZE: usize = 8;
-
-/// Does `func` get a canary under `level`?
-pub fn protects(func: &Function, types: &TypeTable, level: StackProtector) -> bool {
+/// Does `func` get a canary under `protection`'s level, or under the level
+/// its `optimize` attribute names instead? `optimizing` says whether the
+/// unit is optimized, which decides what is still in the frame.
+pub fn protects(
+    func: &Function,
+    types: &TypeTable,
+    protection: StackProtection,
+    optimizing: bool,
+) -> bool {
+    let level = func.stack_protector.unwrap_or(protection.level);
     if level == StackProtector::Off {
         return false;
     }
@@ -50,12 +54,19 @@ pub fn protects(func: &Function, types: &TypeTable, level: StackProtector) -> bo
         StackProtector::Off | StackProtector::Explicit => false,
         StackProtector::All => true,
         StackProtector::Default => {
-            allocates(func) || locals(func).any(|(_, t)| large_char_array(t, types))
-        }
-        StackProtector::Strong => {
             allocates(func)
                 || locals(func)
-                    .any(|(sym, t)| holds_array(t, types) || crate::ir::escape::escapes(func, sym))
+                    .map(|(_, t)| t)
+                    .chain(unused_locals(func, optimizing))
+                    .any(|t| large_char_array(t, types, protection.buffer_size))
+        }
+        StackProtector::Strong => {
+            let mentions = crate::ir::escape::Mentions::of(func);
+            allocates(func)
+                || unused_locals(func, optimizing).any(|t| holds_array(t, types))
+                || locals(func).any(|(sym, t)| {
+                    holds_array(t, types) || crate::ir::escape::escapes(func, &mentions, sym)
+                })
         }
     }
 }
@@ -66,6 +77,17 @@ fn allocates(func: &Function) -> bool {
         .iter()
         .flat_map(|b| &b.insns)
         .any(|i| i.op == Opcode::Alloca)
+}
+
+/// The types of the automatic variables nothing uses, which an unoptimized
+/// gcc frame holds all the same -- `char X[200];` alone is what the Linux
+/// kernel's `gcc-x86_64-has-stack-protector.sh` compiles -- and an
+/// optimized one does not.
+fn unused_locals(func: &Function, optimizing: bool) -> impl Iterator<Item = TypeId> + '_ {
+    func.declared_locals
+        .iter()
+        .copied()
+        .filter(move |_| !optimizing)
 }
 
 /// The objects gcc examines: the function's own automatic variables, not
@@ -88,20 +110,23 @@ fn locals(func: &Function) -> impl Iterator<Item = (PseudoId, TypeId)> + '_ {
 }
 
 /// gcc's `SPCT_HAS_LARGE_CHAR_ARRAY`: an array of `char`, `signed char` or
-/// `unsigned char` of [`SSP_BUFFER_SIZE`] bytes or more, alone or as a
+/// `unsigned char` of `buffer_size` bytes or more (gcc's
+/// `--param ssp-buffer-size`), alone or as a
 /// member at any depth. An array of anything else -- of arrays of `char`
 /// included -- is not one.
-fn large_char_array(t: TypeId, types: &TypeTable) -> bool {
+fn large_char_array(t: TypeId, types: &TypeTable, buffer_size: u64) -> bool {
     match types.kind(t) {
         TypeKind::Array => {
             types
                 .base_type(t)
                 .is_some_and(|e| types.kind(e) == TypeKind::Char)
-                && types.size_bytes(t) >= SSP_BUFFER_SIZE
+                && types.size_bytes(t) as u64 >= buffer_size
         }
-        TypeKind::Struct | TypeKind::Union => types
-            .composite(t)
-            .is_some_and(|c| c.members.iter().any(|m| large_char_array(m.typ, types))),
+        TypeKind::Struct | TypeKind::Union => types.composite(t).is_some_and(|c| {
+            c.members
+                .iter()
+                .any(|m| large_char_array(m.typ, types, buffer_size))
+        }),
         _ => false,
     }
 }

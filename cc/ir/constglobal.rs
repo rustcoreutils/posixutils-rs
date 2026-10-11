@@ -26,6 +26,11 @@
 // way and for the same reason: `"hi"[0]` is `'h'`, as gcc folds it, and
 // that is what makes `__builtin_constant_p("hi"[0])` 1.
 //
+// So does an integer element or member of a `const` array or structure,
+// read whole at its own offset: `table[2].function` once the index is a
+// constant, which is what the kernel's `BUILD_BUG_ON`s over its `static
+// const` tables rely on gcc to fold at -O2.
+//
 // What it declines is as load-bearing as what it folds, and each refusal
 // below names the thing that could otherwise change the value underneath
 // it: an `extern` declaration whose definition is in another translation
@@ -55,6 +60,9 @@ struct KnownGlobal {
 pub struct KnownGlobals {
     /// The scalars, whose initializer is the value of the whole object.
     scalars: HashMap<String, KnownGlobal>,
+    /// The arrays and structures, whose initializer holds each element's and
+    /// member's value: see [`element_load`].
+    aggregates: HashMap<String, Initializer>,
     /// The objects whose every byte is known.
     bytes: ConstBytes,
 }
@@ -69,13 +77,26 @@ pub struct KnownGlobals {
 /// address resolves only once `instcombine` has folded the arithmetic that
 /// forms it.
 pub fn run(func: &mut Function, types: &TypeTable, known: &KnownGlobals) -> bool {
-    !(known.scalars.is_empty() && known.bytes.is_empty()) && propagate(func, types, known)
+    !(known.scalars.is_empty() && known.aggregates.is_empty() && known.bytes.is_empty())
+        && propagate(func, types, known)
 }
 
 impl KnownGlobals {
     pub fn collect(module: &Module, types: &TypeTable) -> KnownGlobals {
         KnownGlobals {
             scalars: collect(module, types),
+            aggregates: module
+                .globals
+                .iter()
+                .filter(|g| {
+                    matches!(
+                        g.init,
+                        Initializer::Array { .. } | Initializer::Struct { .. }
+                    )
+                })
+                .filter(|g| qualifies(g, types))
+                .map(|g| (g.name.clone(), g.init.clone()))
+                .collect(),
             bytes: ConstBytes::build(module, types),
         }
     }
@@ -97,10 +118,8 @@ fn collect(module: &Module, types: &TypeTable) -> HashMap<String, KnownGlobal> {
         let value = match &g.init {
             Initializer::Int(v) => ConstValue::Int(*v),
             Initializer::Float(v) | Initializer::Float128(v) => ConstValue::Float(*v),
-            // Everything else is an aggregate, a string or absent. An
-            // aggregate is foldable in principle, one member at a time, but
-            // it needs the load's offset matched against the member list
-            // rather than a whole-object compare.
+            // Everything else is an aggregate (`aggregates`), a string or
+            // absent.
             _ => continue,
         };
         known.insert(
@@ -181,7 +200,92 @@ fn foldable_load(
     }
     let loc = am.resolve(func, insn.src[0], insn.offset, insn.size, insn.typ);
     scalar_load(types, &known.scalars, insn, &loc)
+        .or_else(|| element_load(types, &known.aggregates, insn, &loc))
         .or_else(|| byte_load(types, &known.bytes, insn, &loc))
+}
+
+/// The integer element or member of a known aggregate that `insn` loads
+/// whole from `loc`: an `Int` of the initializer at exactly the load's
+/// offset and width, or a byte range the initializer leaves out, which is
+/// zero.
+///
+/// Integers only, read as the load's type -- a pointer's null included,
+/// since it is an `Int` too. A float member would need its format matched,
+/// and an address is not a constant this can name. A load that straddles
+/// members, or reads part of one, is a pun whose answer needs a byte order,
+/// and is left alone, as is a `_Bool` read of anything but 0 or 1.
+fn element_load(
+    types: &TypeTable,
+    aggregates: &HashMap<String, Initializer>,
+    insn: &Instruction,
+    loc: &MemLoc,
+) -> Option<ConstValue> {
+    let typ = insn.typ?;
+    if !(types.is_integer(typ) || types.kind(typ) == TypeKind::Pointer)
+        || !insn.size.is_multiple_of(8)
+    {
+        return None;
+    }
+    let MemBase::Global(name) = &loc.base else {
+        return None;
+    };
+    let offset = usize::try_from(loc.offset?).ok()?;
+    let width = usize::try_from(insn.size / 8).ok()?;
+    let v = int_at(aggregates.get(name.as_str())?, offset, width)?;
+    let v = at_width(v, insn.size, !types.is_unsigned(typ));
+    if types.kind(typ) == TypeKind::Bool && !(0..=1).contains(&v) {
+        return None;
+    }
+    Some(ConstValue::Int(v))
+}
+
+/// The integer `init` holds in the `width` bytes at `offset`, when they are
+/// exactly one `Int` of it or bytes it does not initialize at all (zero).
+fn int_at(init: &Initializer, offset: usize, width: usize) -> Option<i128> {
+    let end = offset.checked_add(width)?;
+    // The parts of `init` overlapping the bytes asked for, as (start, size,
+    // initializer).
+    let parts: Vec<(usize, usize, &Initializer)> = match init {
+        Initializer::Array {
+            elem_size,
+            total_size,
+            elements,
+        } => {
+            if end > *total_size {
+                return None;
+            }
+            elements
+                .iter()
+                .map(|(at, e)| (*at, *elem_size, e))
+                .filter(|&(at, size, _)| at < end && offset < at + size)
+                .collect()
+        }
+        Initializer::Struct { total_size, fields } => {
+            if end > *total_size {
+                return None;
+            }
+            fields
+                .iter()
+                .map(|(at, size, f)| (*at, *size, f))
+                .filter(|&(at, size, _)| at < end && offset < at + size)
+                .collect()
+        }
+        Initializer::Int(v) => return (offset == 0).then_some(*v),
+        Initializer::None => return Some(0),
+        _ => return None,
+    };
+    match parts.as_slice() {
+        [] => Some(0),
+        [(at, size, part)] if *at <= offset && end <= at + size => {
+            // Wholly inside one element or member: an `Int` must be exactly
+            // the bytes asked for; anything else is looked into.
+            match part {
+                Initializer::Int(_) if (*at, *size) != (offset, width) => None,
+                _ => int_at(part, offset - at, width),
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The initializer of the scalar `insn` loads whole from `loc`.
@@ -501,6 +605,75 @@ mod tests {
         assert_eq!(string_byte(&types, "hi", types.schar_id, 8, -1), None);
         assert_eq!(string_byte(&types, "hi", types.short_id, 16, 0), None);
         assert_eq!(string_byte(&types, "hi", types.bool_id, 8, 0), None);
+    }
+
+    /// `{ {1, 0, 3}, {0x80000001, 0, -2}, [3] = {9, 2, 0} }` as an array of
+    /// `struct { unsigned function, index; signed char reg; }`: 12-byte
+    /// elements, each a struct of two 4-byte members and a byte.
+    fn cpuid_table() -> Initializer {
+        let entry = |function: i128, index: i128, reg: i128| Initializer::Struct {
+            total_size: 12,
+            fields: vec![
+                (0, 4, Initializer::Int(function)),
+                (4, 4, Initializer::Int(index)),
+                (8, 1, Initializer::Int(reg)),
+            ],
+        };
+        Initializer::Array {
+            elem_size: 12,
+            total_size: 48,
+            elements: vec![
+                (0, entry(1, 0, 3)),
+                (12, entry(0x8000_0001, 0, -2)),
+                (36, entry(9, 2, 0)),
+            ],
+        }
+    }
+
+    /// What a load of `typ` at `size` bits, `offset` bytes into the `const`
+    /// aggregate `init`, folds to, or `None`.
+    fn element(init: Initializer, typ: TypeId, size: u32, offset: i64) -> Option<i128> {
+        let types = TypeTable::new(&Target::host());
+        let g = const_global("table", types.int_id, init);
+        let mut m = module_loading_through_address(g, &types, offset);
+        let load = &mut m.functions[0].blocks[0].insns[2];
+        load.typ = Some(typ);
+        load.size = size;
+        let known = KnownGlobals::collect(&m, &types);
+        run(&mut m.functions[0], &types, &known);
+        let func = &m.functions[0];
+        (func.blocks[0].insns[2].op == Opcode::SetVal)
+            .then(|| func.const_val(PseudoId(1)))
+            .flatten()
+    }
+
+    /// An integer element or member of a `const` aggregate, loaded whole at
+    /// its own offset, is its initializer read as the load's type; one the
+    /// initializer leaves out is zero.
+    #[test]
+    fn an_element_of_a_const_aggregate_folds() {
+        let types = TypeTable::new(&Target::host());
+        let (uint, schar, uchar) = (types.uint_id, types.schar_id, types.uchar_id);
+        assert_eq!(element(cpuid_table(), uint, 32, 0), Some(1));
+        assert_eq!(element(cpuid_table(), uint, 32, 12), Some(0x8000_0001));
+        assert_eq!(element(cpuid_table(), schar, 8, 20), Some(-2));
+        assert_eq!(element(cpuid_table(), uchar, 8, 20), Some(254));
+        assert_eq!(element(cpuid_table(), uint, 32, 40), Some(2));
+        // Element 2 is not in the initializer, and padding is not either.
+        assert_eq!(element(cpuid_table(), uint, 32, 24), Some(0));
+        assert_eq!(element(cpuid_table(), schar, 8, 9), Some(0));
+    }
+
+    /// A load that reads part of a member, straddles two, or runs past the
+    /// object is a pun whose answer needs a byte order, and is left alone,
+    /// as is a float read of an integer.
+    #[test]
+    fn a_load_that_is_not_one_whole_member_is_left_alone() {
+        let types = TypeTable::new(&Target::host());
+        assert_eq!(element(cpuid_table(), types.ushort_id, 16, 0), None);
+        assert_eq!(element(cpuid_table(), types.ulong_id, 64, 0), None);
+        assert_eq!(element(cpuid_table(), types.uint_id, 32, 46), None);
+        assert_eq!(element(cpuid_table(), types.float_id, 32, 0), None);
     }
 
     /// A load narrower than the object is reading part of it.

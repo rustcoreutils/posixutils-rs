@@ -68,6 +68,10 @@ pub(crate) enum Escaped {
     /// `\x` with no hex digit after it (C17 6.4.4.4p1 requires one). It
     /// names nothing, so it is an error; it decodes as its letter.
     EmptyHex,
+    /// A GNU escape ISO C does not have: `\e` and `\E`, ESC. One code unit
+    /// like [`Escaped::Unit`], kept apart so `-pedantic` can name the
+    /// `letter` the program wrote, as gcc does.
+    NonIso { unit: u32, letter: char },
 }
 
 /// An octal or hexadecimal escape's value.
@@ -156,6 +160,11 @@ pub(crate) fn check_elements(elements: &[Escaped], unit_bits: u32, pos: Position
                 );
             }
             Escaped::EmptyHex => crate::diag::error(pos, "\\x used with no following hex digits"),
+            Escaped::NonIso { letter, .. } => crate::diag::cpp_pedwarn_args(
+                pos,
+                "non-ISO-standard escape sequence, '\\{0}'",
+                &[&letter.to_string()],
+            ),
             Escaped::Numeric(n) if !n.fits(unit_bits) => {
                 crate::diag::pedwarn_default(pos, n.out_of_range_message())
             }
@@ -239,6 +248,13 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
         'b' => (Escaped::Unit(0x08), 1), // backspace
         'f' => (Escaped::Unit(0x0C), 1), // form feed
         'v' => (Escaped::Unit(0x0B), 1), // vertical tab
+        'e' | 'E' => (
+            Escaped::NonIso {
+                unit: 0x1B, // escape
+                letter: chars[i],
+            },
+            1,
+        ),
         'x' => {
             // Hex escape \xHH - consume all hex digits
             let mut hex_chars = 0;
@@ -401,7 +417,9 @@ pub(crate) fn literal_utf16_units(elements: &[Escaped]) -> Vec<u16> {
     for e in elements {
         match e {
             Escaped::SourceByte(b) => run.push(*b),
-            Escaped::Unit(u) | Escaped::Numeric(NumericEscape { unit: u, .. }) => {
+            Escaped::Unit(u)
+            | Escaped::Numeric(NumericEscape { unit: u, .. })
+            | Escaped::NonIso { unit: u, .. } => {
                 flush(&mut run, &mut out);
                 out.push(*u as u16);
             }
@@ -474,9 +492,9 @@ pub(crate) fn literal_bytes(elements: &[Escaped]) -> String {
     let mut out = String::with_capacity(elements.len());
     for e in elements {
         match e {
-            Escaped::Unit(u) | Escaped::Numeric(NumericEscape { unit: u, .. }) => {
-                out.push(*u as u8 as char)
-            }
+            Escaped::Unit(u)
+            | Escaped::Numeric(NumericEscape { unit: u, .. })
+            | Escaped::NonIso { unit: u, .. } => out.push(*u as u8 as char),
             Escaped::SourceByte(b) => out.push(*b as char),
             // Already diagnosed where the literal was parsed; encoded as
             // written so the rest of the literal still makes sense.
@@ -514,7 +532,9 @@ pub(crate) fn literal_wide_chars(elements: &[Escaped]) -> Vec<u32> {
     for e in elements {
         match e {
             Escaped::SourceByte(b) => run.push(*b),
-            Escaped::Unit(u) | Escaped::Numeric(NumericEscape { unit: u, .. }) => {
+            Escaped::Unit(u)
+            | Escaped::Numeric(NumericEscape { unit: u, .. })
+            | Escaped::NonIso { unit: u, .. } => {
                 flush(&mut run, &mut out);
                 out.push(*u);
             }

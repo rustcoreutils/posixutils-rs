@@ -224,22 +224,31 @@ impl X86_64CodeGen {
         self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
         self.base.func_pos = crate::arch::func_pos(func);
         self.base.isa = func.isa;
+        self.base.fn_shape = self.base.shape_of(func);
 
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
 
-        if self.base.tls_access().is_call() {
+        let called = self.base.called_thread_locals();
+        if !called.is_empty() {
             crate::arch::codegen::check_tls_reached_only_by_address(
                 func,
-                &self.tls_symbols,
+                &called,
                 self.base.func_pos,
             );
         }
 
         // Register allocation
-        let guarded = crate::arch::stack_protect::protects(func, types, self.base.stack_protector);
+        let guarded = crate::arch::stack_protect::protects(
+            func,
+            types,
+            self.base.stack_protector,
+            self.base.optimizing,
+        );
         let mut alloc = RegAlloc::new()
-            .with_tls_access(self.base.tls_access())
+            .with_global_registers(&self.global_registers)
+            .with_incoming_stack_align(self.base.target.x86.incoming_stack_align())
+            .with_tls_access(self.base.tls_call_access())
             .with_stack_guard(guarded);
         self.locations = alloc.allocate(func, types);
         self.stack_guard = alloc.stack_guard_slot();
@@ -255,6 +264,10 @@ impl X86_64CodeGen {
         self.win64_xmm_saves = alloc.win64_xmm_saves().to_vec();
         self.incoming_pointers = Self::incoming_pointers(func, types);
         self.callee_saved_regs = alloc.callee_saved_used().to_vec();
+        if func.saves_all_registers {
+            self.callee_saved_regs
+                .extend(Self::call_clobbered_to_preserve(func, types));
+        }
         self.max_local_align = alloc.max_local_align();
         self.frame_base = alloc.frame_base();
         self.x87_scratch = alloc.x87_scratch();
@@ -286,6 +299,12 @@ impl X86_64CodeGen {
         };
 
         // Emit function header (directives, label, CFI start)
+        let first = self.base.lir_buffer.len();
+        let x86 = &self.base.target.x86;
+        self.push_lir(X86Inst::BranchModes {
+            indirect: func.branches.indirect.unwrap_or(x86.indirect_branch),
+            ret: func.branches.ret.unwrap_or(x86.function_return),
+        });
         self.emit_function_header(func);
 
         // Emit prologue (push rbp, callee-saved regs, allocate stack)
@@ -294,7 +313,16 @@ impl X86_64CodeGen {
         } else {
             Vec::new()
         };
+        self.base.landing_pads.enter(&func.name);
+        if self.base.landing_pads.entry(&func.name) {
+            self.push_lir(X86Inst::Endbr64);
+        }
+        for directive in self.base.patchable_entry(func, false) {
+            self.push_lir(X86Inst::Directive(directive));
+        }
+        self.emit_profile_call(func, true);
         self.emit_prologue(stack_size, reg_save_area_size, &homes);
+        self.emit_profile_call(func, false);
         // An over-aligned frame's `andq` moves `%rsp` on by up to the
         // alignment.
         let realign = match self.frame_base {
@@ -303,6 +331,8 @@ impl X86_64CodeGen {
         };
         self.base
             .check_stack_clash(func, self.stack_alloc_size as i64 + realign);
+        self.base
+            .check_frame_size(i64::from(stack_size + reg_save_area_size));
         self.emit_stack_guard_set();
 
         // Store spilled arguments before any calls can clobber them
@@ -336,9 +366,10 @@ impl X86_64CodeGen {
         }
 
         // CFI: End procedure
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(X86Inst::Directive(Directive::CfiEndProc));
         }
+        self.base.eh_end_function();
 
         // The label `DW_AT_high_pc` names, before `.size` so it marks the end
         // of the code rather than a point after the directive.
@@ -351,6 +382,7 @@ impl X86_64CodeGen {
         // `.size f, .-f`: without it the symbol records st_size = 0 and a
         // debugger cannot tell which function owns an address inside it.
         self.push_lir(X86Inst::Directive(Directive::size_to_here(&func.name)));
+        self.fill_cleared_regs(func, types, first);
     }
 
     /// Record what `-g` has to say about this function.
@@ -392,18 +424,15 @@ impl X86_64CodeGen {
         }
 
         let ret_typ = (types.kind(func.return_type) != TypeKind::Void).then_some(func.return_type);
-        let decl_line = func
-            .blocks
-            .iter()
-            .flat_map(|b| b.insns.iter())
-            .find_map(|i| i.pos.as_ref())
-            .map(|p| p.line)
-            .unwrap_or(0);
+        // Declared where its first instruction is; a function made in no
+        // file (a synthetic stream) names none.
+        let pos = self.base.func_pos;
 
         self.base.fn_dies.push(crate::arch::dwarf::FnDie {
             name: func.name.clone(),
             external: !func.is_static,
-            decl_line,
+            decl_file: self.base.source_files.file_of(pos.stream).unwrap_or(0),
+            decl_line: pos.line,
             end_label,
             ret_typ,
             vars,
@@ -417,12 +446,8 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Directive(Directive::Text));
 
         // A named section replaces .text for this function.
-        if let Some(sec) = &func.symbol_attrs.section {
-            self.push_lir(X86Inst::Directive(Directive::NamedSection {
-                name: sec.clone(),
-                executable: true,
-                writable: false,
-            }));
+        if let Some(section) = self.base.function_section(func) {
+            self.push_lir(X86Inst::Directive(section));
         }
 
         // Skip .globl for static functions (internal linkage)
@@ -446,9 +471,13 @@ impl X86_64CodeGen {
         // ELF-only type (handled by Directive::emit which skips on macOS)
         self.push_lir(X86Inst::Directive(Directive::type_func(name)));
 
-        // x86-64 code has no alignment of its own; `aligned(N)` asks for one.
-        if let Some(align) = func.align {
-            self.push_lir(X86Inst::Directive(Directive::Align(align.trailing_zeros())));
+        // x86-64 code has no alignment of its own; `aligned(N)` and the
+        // `-f` alignment options ask for one.
+        for directive in self.base.function_alignment(func, 0) {
+            self.push_lir(X86Inst::Directive(directive));
+        }
+        for directive in self.base.patchable_entry(func, true) {
+            self.push_lir(X86Inst::Directive(directive));
         }
 
         // Function label
@@ -460,9 +489,45 @@ impl X86_64CodeGen {
         self.base.emit_function_entry_loc(func);
 
         // CFI: Start procedure (enables stack unwinding for this function)
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(X86Inst::Directive(Directive::CfiStartProc));
         }
+        self.base.eh_begin_function(func, self.pic_mode);
+    }
+
+    /// The call-clobbered general registers a `no_caller_saved_registers`
+    /// function saves and restores besides the callee-saved ones it uses:
+    /// every one but those its value is returned in -- `%rax`, and `%rdx`
+    /// too for a value of two eightbytes. Every one, not only those its own
+    /// code names, as what it calls may change any of them; gcc 13 saves
+    /// only those, which preserves the same registers.
+    fn call_clobbered_to_preserve(func: &Function, types: &TypeTable) -> Vec<Reg> {
+        let returned = if types.kind(func.return_type) == crate::types::TypeKind::Void {
+            &[][..]
+        } else if (9..=16).contains(&types.size_bytes(func.return_type)) {
+            &[Reg::Rax, Reg::Rdx][..]
+        } else {
+            &[Reg::Rax][..]
+        };
+        // System V lets a callee change these too; Microsoft x64 does not.
+        let argument_regs = match func.conv {
+            crate::abi::CallingConv::Win64 => &[][..],
+            crate::abi::CallingConv::C => &[Reg::Rsi, Reg::Rdi][..],
+        };
+        [
+            Reg::Rax,
+            Reg::Rcx,
+            Reg::Rdx,
+            Reg::R8,
+            Reg::R9,
+            Reg::R10,
+            Reg::R11,
+        ]
+        .iter()
+        .chain(argument_regs)
+        .filter(|r| !returned.contains(r))
+        .copied()
+        .collect()
     }
 
     /// The `Arg` pseudos whose parameter is a pointer; see
@@ -489,7 +554,7 @@ impl X86_64CodeGen {
     /// not with `-g`. Each follows the instruction that makes it true, so the
     /// CFA and every saved register are described at every instruction.
     pub(super) fn push_cfi(&mut self, rule: Directive) {
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(X86Inst::Directive(rule));
         }
     }
@@ -654,6 +719,12 @@ impl X86_64CodeGen {
             });
         }
 
+        // Without SSE there is no XMM register to save, nor may one be
+        // touched: gcc's `-mno-sse` prologue saves the general registers
+        // alone, and `va_arg` of a floating type is refused (`fp_regs`).
+        if !self.base.isa.has_sse() {
+            return;
+        }
         // Save XMM0-XMM7 at offsets 48-175 from register save area base
         // AMD64 ABI: XMM regs start at offset 48 from reg_save_area base
         // Each XMM slot is 16 bytes (128-bit aligned)
@@ -1495,28 +1566,189 @@ impl X86_64CodeGen {
         // %rbp is the caller's again, so the CFA follows %rsp.
         self.push_cfi(Directive::cfi_def_cfa("%rsp", 8));
         self.push_cfi(Directive::cfi_restore("%rbp"));
+        if self.base.fn_shape.zero_regs.on {
+            self.push_lir(X86Inst::ClearRegs { regs: Vec::new() });
+        }
         self.push_lir(X86Inst::Ret);
         self.push_cfi(Directive::CfiRestoreState);
     }
 
-    /// The stack-protector guard as an operand, reached through `scratch`
-    /// when it has to be: glibc keeps it in the thread control block at
-    /// `%fs:40`, as gcc reads it; elsewhere it is the global
-    /// `__stack_chk_guard`, through the GOT.
-    fn stack_guard_operand(&mut self, scratch: Reg) -> GpOperand {
-        if self.base.target.os == crate::target::Os::Linux {
-            return GpOperand::Mem(MemAddr::FsAbsolute(40));
+    /// Fill in what `-fzero-call-used-regs` clears at each of the
+    /// function's returns -- its LIR from `first` on -- as gcc decides it:
+    /// the call-clobbered registers, or only the argument registers
+    /// (`-arg`), of the general file alone (`-gpr`) or with the SSE and x87
+    /// files too, that the function uses (`used`) or every one (`all`);
+    /// never one that carries the return value. In gcc's register order:
+    /// the x87 stack, then `%rax`, `%rdx`, `%rcx`, `%rsi`, `%rdi`, `%xmm0`
+    /// to `%xmm7`, `%r8` to `%r11` and `%xmm8` to `%xmm15`.
+    fn fill_cleared_regs(&mut self, func: &Function, types: &TypeTable, first: usize) {
+        use crate::arch::lir::EmitAsm;
+        use crate::arch::x86_64::lir::ClearedReg;
+        let zero = self.base.fn_shape.zero_regs;
+        if !zero.on {
+            return;
         }
-        let sym = Symbol::extern_sym(crate::arch::stack_protect::GUARD_SYMBOL);
-        self.push_lir(X86Inst::Mov {
-            size: OperandSize::B64,
-            src: GpOperand::Mem(MemAddr::GotPcrel(sym)),
-            dst: GpOperand::Reg(scratch),
-        });
-        GpOperand::Mem(MemAddr::BaseOffset {
-            base: scratch,
-            offset: 0,
-        })
+        // What the function's code names, read off its assembly.
+        let mut named: HashSet<String> = HashSet::new();
+        let mut text = String::new();
+        for inst in &self.base.lir_buffer[first..] {
+            if !matches!(inst, X86Inst::ClearRegs { .. }) {
+                inst.emit(&self.base.target, &mut text);
+            }
+        }
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find('%') {
+            rest = &rest[at + 1..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len());
+            named.insert(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        // And what its inline assembly clobbers, which no instruction c17
+        // writes need name: the assembly may leave a value there all the
+        // same, and gcc counts the register as used.
+        for asm in func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter_map(|insn| insn.extra().asm_data.as_deref())
+        {
+            named.extend(
+                asm.clobbers
+                    .iter()
+                    .map(|c| c.trim_start_matches('%').to_string()),
+            );
+        }
+        let gp_used = |r: Reg| {
+            // `%al`'s high twin `%ah`, for the four registers that have one.
+            let low = &r.name8()[1..];
+            let high = (low.len() == 2).then(|| format!("{}h", &low[..1]));
+            [r.name64(), r.name32(), r.name16(), r.name8()]
+                .iter()
+                .any(|n| named.contains(&n[1..]))
+                || high.is_some_and(|h| named.contains(&h))
+        };
+        let xmm_used = |x: XmmReg| named.contains(&x.name()[1..]);
+        let x87_used = named.iter().any(|n| n.starts_with("st"));
+
+        // The registers the return value comes back in.
+        let abi = get_abi(&self.base.target);
+        let (mut gp_ret, mut sse_ret, mut x87_ret) = (Vec::new(), Vec::new(), false);
+        match abi.classify_return(func.return_type, types) {
+            ArgClass::Direct { classes, .. } => {
+                for class in classes {
+                    match class {
+                        RegClass::Integer => gp_ret.push([Reg::Rax, Reg::Rdx][gp_ret.len().min(1)]),
+                        RegClass::Sse => {
+                            sse_ret.push([XmmReg::Xmm0, XmmReg::Xmm1][sse_ret.len().min(1)])
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ArgClass::Extend { .. } => gp_ret.push(Reg::Rax),
+            // The hidden pointer comes back in %rax.
+            ArgClass::Indirect { .. } => gp_ret.push(Reg::Rax),
+            ArgClass::X87 { .. } => x87_ret = true,
+            _ => {}
+        }
+
+        let isa = self.base.isa;
+        let mut regs = Vec::new();
+        let gp = |r: Reg, regs: &mut Vec<ClearedReg>| {
+            let arg = r != Reg::R10 && r != Reg::R11;
+            if !gp_ret.contains(&r) && (!zero.arg_only || arg) && (zero.all || gp_used(r)) {
+                regs.push(ClearedReg::Gp(r));
+            }
+        };
+        let xmm = |x: XmmReg, regs: &mut Vec<ClearedReg>| {
+            let arg = XmmReg::arg_regs().contains(&x);
+            if !zero.gpr_only
+                && isa.has_sse()
+                && !sse_ret.contains(&x)
+                && (!zero.arg_only || arg)
+                && (zero.all || xmm_used(x))
+            {
+                regs.push(ClearedReg::Xmm(x));
+            }
+        };
+        if !zero.gpr_only && !zero.arg_only && isa.has_x87() && !x87_ret && (zero.all || x87_used) {
+            regs.push(ClearedReg::X87);
+        }
+        for r in [Reg::Rax, Reg::Rdx, Reg::Rcx, Reg::Rsi, Reg::Rdi] {
+            gp(r, &mut regs);
+        }
+        for &x in XmmReg::arg_regs() {
+            xmm(x, &mut regs);
+        }
+        for r in [Reg::R8, Reg::R9, Reg::R10, Reg::R11] {
+            gp(r, &mut regs);
+        }
+        for x in [
+            XmmReg::Xmm8,
+            XmmReg::Xmm9,
+            XmmReg::Xmm10,
+            XmmReg::Xmm11,
+            XmmReg::Xmm12,
+            XmmReg::Xmm13,
+            XmmReg::Xmm14,
+            XmmReg::Xmm15,
+        ] {
+            xmm(x, &mut regs);
+        }
+        for inst in &mut self.base.lir_buffer[first..] {
+            if let X86Inst::ClearRegs { regs: slot } = inst {
+                slot.clone_from(&regs);
+            }
+        }
+    }
+
+    /// The stack-protector guard as an operand, reached through `scratch`
+    /// when it has to be. glibc keeps it in the thread control block at
+    /// `%fs:40`, as gcc reads it; a kernel (`-mcmodel=kernel`) at `%gs:40`;
+    /// elsewhere it is the global `__stack_chk_guard`. The
+    /// `-mstack-protector-guard` options move it, as gcc's do: to another
+    /// register or offset, to a symbol read through the segment register
+    /// (gcc 13's `%gs:sym(%rip)`), or to the global.
+    fn stack_guard_operand(&mut self, scratch: Reg) -> GpOperand {
+        use crate::machine::StackGuard;
+        let tls_default = self.base.target.os == crate::target::Os::Linux;
+        match self.base.target.x86.stack_guard(tls_default) {
+            StackGuard::Tls { seg, offset } => GpOperand::Mem(MemAddr::SegOffset { seg, offset }),
+            StackGuard::TlsSymbol { seg, symbol } => {
+                if !tls_default || self.needs_got_access(&symbol) {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::GotPcrel(Symbol::extern_sym(symbol))),
+                        dst: GpOperand::Reg(scratch),
+                    });
+                    GpOperand::Mem(MemAddr::SegBase { seg, base: scratch })
+                } else {
+                    GpOperand::Mem(MemAddr::SegRip {
+                        seg,
+                        sym: Symbol::extern_sym(symbol),
+                    })
+                }
+            }
+            StackGuard::Global => {
+                let name = crate::arch::stack_protect::GUARD_SYMBOL;
+                let sym = Symbol::extern_sym(name);
+                // Darwin's and FreeBSD's guard is libc's, in another module.
+                if tls_default && !self.needs_got_access(name) {
+                    return GpOperand::Mem(MemAddr::RipRelative(sym));
+                }
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Mem(MemAddr::GotPcrel(sym)),
+                    dst: GpOperand::Reg(scratch),
+                });
+                GpOperand::Mem(MemAddr::BaseOffset {
+                    base: scratch,
+                    offset: 0,
+                })
+            }
+        }
     }
 
     /// Copy the guard into the canary slot, after the prologue: R11 is the

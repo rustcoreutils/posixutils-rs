@@ -2050,3 +2050,24 @@ fn test_local_labels_of_one_name_are_two_blocks() {
     }
     assert_ne!(blocks[0].parents, blocks[1].parents);
 }
+
+/// `return g();` in a void function, `g` void too (GNU C), returns nothing:
+/// the call runs and the `Ret` carries no value. Returning the call's result
+/// pseudo left a value with no definition once the inliner spliced `g`, and
+/// a void callee mixing that return with a plain one gave its inlined copy a
+/// return phi missing the plain one's edge (an ICE in the IR validator).
+#[test]
+fn a_void_return_of_a_void_call_carries_no_value() {
+    let src = "void g(void);\nvoid h(int x) { if (x) return g(); }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let module = linearize_source(src, &target);
+    let func = module.functions.iter().find(|f| f.name == "h").expect("h");
+    let insns = || func.blocks.iter().flat_map(|bb| &bb.insns);
+    assert!(
+        insns().any(|i| i.local_callee() == Some("g")),
+        "the call still runs"
+    );
+    let rets: Vec<_> = insns().filter(|i| i.op == Opcode::Ret).collect();
+    assert_eq!(rets.len(), 2);
+    assert!(rets.iter().all(|r| r.src.is_empty()), "{rets:?}");
+}

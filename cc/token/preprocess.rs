@@ -20,8 +20,8 @@ use std::time::SystemTime;
 use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
     decode_string_spelling, escape_c_string, literal_payload, payload_bytes, payload_text,
-    show_token, tokens_to_source_bytes, write_token, IdentTable, LexerMode, Position, Punctuator,
-    SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
+    show_token, tokens_to_source_bytes, write_token, FileChange, IdentTable, LexerMode, Position,
+    Punctuator, SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
 };
 use super::literal;
 use crate::arch;
@@ -51,7 +51,9 @@ const DEFAULT_INCLUDE_TRACK_CAPACITY: usize = 32;
 ///
 /// The chain is gcc's: the `-iquote` directories (for the `"..."` form
 /// only), the `-I` directories, then the directory of headers the compiler
-/// owns (here, the bundled ones), then the system directories.
+/// owns (here, the bundled ones), then the system directories, and last
+/// the host gcc's own include directory, for its private headers that c17
+/// does not bundle (`<unwind.h>`).
 /// `#include_next` resumes just after the position the current file came
 /// from, so a bundled header that forwards reaches the system's, and a `-I`
 /// header that forwards reaches the bundled one first. The variant order is
@@ -67,6 +69,14 @@ pub enum SearchPos {
     /// The system directory at this index: `-isystem`, the target's own,
     /// then `-idirafter`.
     System(usize),
+    /// The host gcc's include directory. gcc searches it ahead of the
+    /// target's directories; here it comes after them, where it costs a
+    /// query of the host driver only when nothing else has the header, and
+    /// what it holds that the bundled headers do not is found in neither.
+    HostCompiler,
+    /// Past the end of the chain: where `#include_next` resumes in a file
+    /// found at the very end.
+    End,
 }
 
 impl SearchPos {
@@ -79,7 +89,17 @@ impl SearchPos {
             Some(SearchPos::Quote(i)) => SearchPos::Quote(i + 1),
             Some(SearchPos::Bundled) => SearchPos::System(0),
             Some(SearchPos::System(i)) => SearchPos::System(i + 1),
+            Some(SearchPos::HostCompiler | SearchPos::End) => SearchPos::End,
         }
+    }
+
+    /// Whether a header found here is a system header, as gcc has it: one
+    /// from a system directory or the compiler's own.
+    pub(super) fn is_system(self) -> bool {
+        matches!(
+            self,
+            SearchPos::Bundled | SearchPos::System(_) | SearchPos::HostCompiler
+        )
     }
 }
 
@@ -124,15 +144,7 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
     // C17 6.10.8p2 forbids it outright for the standard's own names. A
     // redefinition to the same thing is quiet. So is any redefinition in a
     // system header, since warnings there are not shown.
-    //
-    // The feature-test macros are the exception. c17 predefines them where
-    // gcc does not (see `os::linux`), so a program's own
-    // `#define _GNU_SOURCE` or `#define _XOPEN_SOURCE 700` is not
-    // redefining anything as far as its author can tell.
     if old.predefined {
-        if is_feature_test_macro(&old.name) {
-            return None;
-        }
         let same = old.is_function == new.is_function
             && old.params.len() == new.params.len()
             && replacement_lists_identical(&old.body, &new.body);
@@ -163,16 +175,20 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
     None
 }
 
-/// A feature-test macro: the program's request for a namespace (POSIX.1-2024
-/// 2.2.1), such as `_GNU_SOURCE`, `_XOPEN_SOURCE` or `_POSIX_C_SOURCE`.
-fn is_feature_test_macro(name: &str) -> bool {
-    name.starts_with('_')
-        && (name.ends_with("_SOURCE") || name.ends_with("_SOURCE_EXTENDED") || name == "_REENTRANT")
-}
-
 /// A name C17 6.10.8 predefines, which p2 says may be neither `#define`d nor
 /// `#undef`ined: `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, and every
 /// `__STDC...` macro (the mandatory, conditional and environment ones).
+/// The warning group of redefining or undefining the built-in macro `name`:
+/// gcc's `-Wbuiltin-macro-redefined` covers the ones whose expansion names
+/// the file or the time of the build, and no others.
+pub(super) fn builtin_macro_group(name: &str) -> Option<&'static str> {
+    matches!(
+        name,
+        "__FILE__" | "__BASE_FILE__" | "__DATE__" | "__TIME__" | "__TIMESTAMP__"
+    )
+    .then_some("builtin-macro-redefined")
+}
+
 pub(super) fn is_standard_predefined(name: &str) -> bool {
     matches!(name, "__FILE__" | "__LINE__" | "__DATE__" | "__TIME__")
         || name.starts_with("__STDC_")
@@ -202,6 +218,9 @@ pub struct Macro {
     /// keyword alias, or a `-D` on the command line) rather than a `#define`
     /// directive in a translation unit.
     pub predefined: bool,
+    /// Where a `#define` directive named it, for the note on a conflicting
+    /// redefinition; unknown (line 0) for a predefined one.
+    pub defined_at: Position,
 }
 
 /// A token stored in a macro body
@@ -324,7 +343,8 @@ impl Macro {
                             // one is lexed only inside #include -- but the
                             // type carries it back either way.
                             TokenValue::HeaderName(h) => MacroTokenValue::String(h.clone()),
-                            TokenValue::None => MacroTokenValue::None,
+                            // A change of file is never inside a definition.
+                            TokenValue::None | TokenValue::FileChange(_) => MacroTokenValue::None,
                         };
                         MacroToken {
                             typ: token.typ,
@@ -346,6 +366,7 @@ impl Macro {
             variadic_name: None,
             builtin: None,
             predefined: true,
+            defined_at: Position::default(),
         }
     }
 
@@ -373,6 +394,7 @@ impl Macro {
             variadic_name: None,
             builtin: None,
             predefined: true,
+            defined_at: Position::default(),
         }
     }
 
@@ -407,30 +429,7 @@ impl Macro {
             variadic_name: None,
             builtin: None,
             predefined: true,
-        }
-    }
-
-    /// Create a keyword alias macro (value is treated as an identifier/keyword)
-    pub fn keyword_alias(name: &str, value: &str) -> Self {
-        let body = if value.is_empty() {
-            vec![]
-        } else {
-            vec![MacroToken {
-                typ: TokenType::Ident,
-                value: MacroTokenValue::Ident(value.to_string()),
-                whitespace: false,
-                spelling: Spelling::Canonical,
-            }]
-        };
-        Self {
-            name: name.to_string(),
-            body,
-            is_function: false,
-            params: vec![],
-            is_variadic: false,
-            variadic_name: None,
-            builtin: None,
-            predefined: true,
+            defined_at: Position::default(),
         }
     }
 
@@ -452,6 +451,7 @@ impl Macro {
             variadic_name: None,
             builtin: Some(builtin),
             predefined: true,
+            defined_at: Position::default(),
         }
     }
 }
@@ -490,6 +490,36 @@ struct Conditional {
     pos: Position,
 }
 
+/// Where an inclusion stands in its includer, as the `-E` line markers
+/// around the included text say.
+#[derive(Debug, Clone, Copy)]
+struct IncludeSite {
+    /// The line of the `#include`, which the output is brought up to before
+    /// the file is entered.
+    from: Position,
+    /// The line after it, where the includer resumes.
+    back: Position,
+}
+
+/// What `-E` keeps of the source's comments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Comments {
+    /// Each is one space (C17 5.1.1.2p1, phase 3): the default.
+    #[default]
+    Dropped,
+    /// `-C`: those of the text, where they stand. A directive's go with it.
+    InText,
+    /// `-CC`: those of a macro definition too, in each of its expansions.
+    InTextAndMacros,
+}
+
+impl Comments {
+    /// Whether the lexer makes a token of each comment.
+    pub fn lexed(self) -> bool {
+        self != Comments::Dropped
+    }
+}
+
 // Preprocessor
 
 pub struct Preprocessor<'a> {
@@ -507,6 +537,11 @@ pub struct Preprocessor<'a> {
     /// headers push a name, define their own, and pop expecting the original
     /// absence back.
     pushed_macros: HashMap<String, Vec<Option<std::rc::Rc<Macro>>>>,
+
+    /// How many `#pragma GCC visibility push`es are not yet popped. The
+    /// parser keeps the stack itself; this is only what lets an unmatched
+    /// `pop` be reported where it stands.
+    visibility_depth: usize,
 
     /// Conditional compilation stack
     cond_stack: Vec<Conditional>,
@@ -556,6 +591,9 @@ pub struct Preprocessor<'a> {
     /// `-dD`: carry each `#define` and `#undef` that takes effect into the
     /// output, as its own text; see [`PreprocessConfig::keep_definitions`].
     keep_definitions: bool,
+    /// `-E`: the pragmas travel to the compile that reads them, which gives
+    /// their warnings; see [`PreprocessConfig::preprocess_only`].
+    preprocess_only: bool,
 
     /// Files named by a `#pragma once`.
     once_files: HashSet<PathBuf>,
@@ -635,6 +673,9 @@ pub struct Preprocessor<'a> {
     /// `defined` that an expansion produces, and expanding first destroys the
     /// operand: `#define D defined(FOO)` / `#if D` would evaluate `0 (1)`.
     in_if_condition: bool,
+    /// The comments `-C` and `-CC` keep, which each included file is lexed
+    /// for too.
+    pub(super) comments: Comments,
 }
 
 /// Where a linemarker says the text after it really came from.
@@ -677,6 +718,28 @@ pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
 /// The stream name of a bundled header, which diagnostics show.
 pub(crate) fn bundled_header_stream(name: &str) -> String {
     format!("<builtin:{name}>")
+}
+
+/// Make a kept `//` comment a `/* */` one, as gcc does for a comment it
+/// carries into a macro expansion -- one of a definition under `-CC`, or of
+/// an argument under `-C` -- where the text after it goes on on the same
+/// line. Each `/` next to a `*` in the comment's text becomes `|`, as in
+/// gcc, so that the text can neither end the comment early nor open one.
+pub(super) fn block_comment(token: &mut Token) {
+    let (TokenType::Comment, TokenValue::String(text)) = (token.typ, &token.value) else {
+        return;
+    };
+    let Some(body) = text.strip_prefix("//") else {
+        return;
+    };
+    let mut converted: Vec<char> = format!("/*{body}*/").chars().collect();
+    let end = converted.len() - 2;
+    for i in 2..end {
+        if converted[i] == '/' && (converted[i - 1] == '*' || converted[i + 1] == '*') {
+            converted[i] = '|';
+        }
+    }
+    token.value = TokenValue::String(converted.into_iter().collect());
 }
 
 /// The file a `-E` line marker names for a stream.
@@ -736,8 +799,8 @@ pub fn pragma_weak_names(tokens: &[Token]) -> Vec<String> {
         .collect()
 }
 
-/// A pragma that changes how the parser lays out the structures and unions
-/// defined after it.
+/// A pragma the parser acts on: how it lays out the structures and unions
+/// defined after it, or the visibility of the symbols declared after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutPragma {
     /// `#pragma pack`: the alignment cap on every member.
@@ -745,6 +808,9 @@ pub enum LayoutPragma {
     /// `#pragma scalar_storage_order`: the byte order of the scalars of a
     /// struct or union that does not name one in an attribute.
     StorageOrder(StorageOrderPragma),
+    /// `#pragma GCC visibility`: the visibility of every declaration with
+    /// external linkage that names none of its own.
+    Visibility(VisibilityPragma),
 }
 
 impl LayoutPragma {
@@ -754,6 +820,10 @@ impl LayoutPragma {
         match self {
             LayoutPragma::Pack(action) => action.encode(),
             LayoutPragma::StorageOrder(order) => format!("sso:{}", order.spelling()),
+            LayoutPragma::Visibility(VisibilityPragma::Push(how)) => {
+                format!("vis:push:{}", how.spelling())
+            }
+            LayoutPragma::Visibility(VisibilityPragma::Pop) => "vis:pop".to_string(),
         }
     }
 
@@ -763,6 +833,12 @@ impl LayoutPragma {
             LayoutPragma::Pack(action) => action.to_pragma_text(),
             LayoutPragma::StorageOrder(order) => {
                 format!("#pragma scalar_storage_order {}", order.spelling())
+            }
+            LayoutPragma::Visibility(VisibilityPragma::Push(how)) => {
+                format!("#pragma GCC visibility push({})", how.spelling())
+            }
+            LayoutPragma::Visibility(VisibilityPragma::Pop) => {
+                "#pragma GCC visibility pop".to_string()
             }
         }
     }
@@ -779,8 +855,97 @@ impl LayoutPragma {
         if let Some(word) = s.strip_prefix("sso:") {
             return StorageOrderPragma::from_word(word).map(LayoutPragma::StorageOrder);
         }
+        if s == "vis:pop" {
+            return Some(LayoutPragma::Visibility(VisibilityPragma::Pop));
+        }
+        if let Some(word) = s.strip_prefix("vis:push:") {
+            return SymbolVisibility::from_word(word)
+                .map(|how| LayoutPragma::Visibility(VisibilityPragma::Push(how)));
+        }
         PackAction::decode(s).map(LayoutPragma::Pack)
     }
+}
+
+/// An ELF symbol visibility, as `#pragma GCC visibility push(...)` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolVisibility {
+    Default,
+    Internal,
+    Hidden,
+    Protected,
+}
+
+impl SymbolVisibility {
+    fn from_word(word: &str) -> Option<SymbolVisibility> {
+        match word {
+            "default" => Some(SymbolVisibility::Default),
+            "internal" => Some(SymbolVisibility::Internal),
+            "hidden" => Some(SymbolVisibility::Hidden),
+            "protected" => Some(SymbolVisibility::Protected),
+            _ => None,
+        }
+    }
+
+    /// The name, as the `visibility` attribute spells it too.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            SymbolVisibility::Default => "default",
+            SymbolVisibility::Internal => "internal",
+            SymbolVisibility::Hidden => "hidden",
+            SymbolVisibility::Protected => "protected",
+        }
+    }
+}
+
+/// What a `#pragma GCC visibility` directive does to the visibility stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibilityPragma {
+    /// `push(how)`: save the visibility in force and make `how` it.
+    Push(SymbolVisibility),
+    /// `pop`: restore the visibility the matching `push` saved.
+    Pop,
+}
+
+/// Read the body of `#pragma GCC visibility`, the tokens after
+/// `visibility`, warning in gcc's words about each malformed form.
+///
+/// gcc acts before it checks what follows: `push(hidden` still pushes, and
+/// `pop extra` still pops, each with a warning. A `pop` with nothing pushed
+/// is the caller's to report, since only it knows the depth.
+fn parse_visibility_body(toks: &[PragmaTok], pos: Position) -> Option<VisibilityPragma> {
+    let warn = |msg: &str| diag::group_warning(PRAGMAS_WARNING, pos, &gettext(msg));
+    let mut it = toks.iter();
+    let action = match it.next() {
+        Some(PragmaTok::Word(w)) if w == "pop" => VisibilityPragma::Pop,
+        Some(PragmaTok::Word(w)) if w == "push" => {
+            const NO_PAREN: &str = "missing '(' after '#pragma GCC visibility push' - ignored";
+            if it.next() != Some(&PragmaTok::Punct('(')) {
+                warn(NO_PAREN);
+                return None;
+            }
+            let Some(PragmaTok::Word(name)) = it.next() else {
+                warn("malformed '#pragma GCC visibility push'");
+                return None;
+            };
+            let Some(how) = SymbolVisibility::from_word(name) else {
+                warn("'#pragma GCC visibility push()' must specify 'default', 'internal', 'hidden' or 'protected'");
+                return None;
+            };
+            if it.next() != Some(&PragmaTok::Punct(')')) {
+                warn(NO_PAREN);
+                return Some(VisibilityPragma::Push(how));
+            }
+            VisibilityPragma::Push(how)
+        }
+        _ => {
+            warn("'#pragma GCC visibility' must be followed by 'push' or 'pop'");
+            return None;
+        }
+    };
+    if it.next().is_some() {
+        warn("junk at end of '#pragma GCC visibility'");
+    }
+    Some(action)
 }
 
 /// What `#pragma scalar_storage_order` makes the default storage order of the
@@ -816,7 +981,8 @@ impl StorageOrderPragma {
     fn parse_body(body: &str, pos: Position) -> Option<StorageOrderPragma> {
         let word: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         if word.is_empty() {
-            diag::warning(
+            diag::group_warning(
+                PRAGMAS_WARNING,
                 pos,
                 &gettext("missing 'big-endian', 'little-endian', or 'default' after '#pragma scalar_storage_order'"),
             );
@@ -824,7 +990,8 @@ impl StorageOrderPragma {
         }
         let order = StorageOrderPragma::from_word(&word);
         if order.is_none() {
-            diag::warning(
+            diag::group_warning(
+                PRAGMAS_WARNING,
                 pos,
                 &gettext("expected 'big-endian', 'little-endian', or 'default' after '#pragma scalar_storage_order'"),
             );
@@ -917,17 +1084,21 @@ pub fn extract_pragma_directives(tokens: &mut Vec<Token>) -> Vec<(usize, LayoutP
     directives
 }
 
-/// The only shapes `#pragma pack` bodies are made of.
+/// The only shapes the bodies of `#pragma pack` and `#pragma GCC visibility`
+/// are made of.
 ///
 /// `#pragma pack(...)` arrives as preprocessor tokens and `_Pragma("pack(...)")`
 /// as a string, so both are reduced to this before being read. One reduction
 /// each, and one rule -- rather than two parsers that agree until they don't.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PackTok {
+enum PragmaTok {
     Word(String),
     Num(String),
     Punct(char),
 }
+
+/// gcc's warning group for a malformed pragma it knows.
+pub const PRAGMAS_WARNING: &str = "pragmas";
 
 /// Parse the body of a `pack` pragma, `(` through `)`.
 ///
@@ -935,24 +1106,33 @@ enum PackTok {
 /// `pack()` clears it, `pack(push, n)` / `pack(push)` save it, and
 /// `pack(pop)` restores. An unrecognised body is a pragma we do not
 /// implement, and is ignored rather than guessed at.
-fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
+fn parse_pack_body(toks: &[PragmaTok], pos: Position) -> Option<PackAction> {
     let mut it = toks.iter();
-    if it.next() != Some(&PackTok::Punct('(')) {
-        diag::warning(pos, &gettext("expected '(' after '#pragma pack'"));
+    if it.next() != Some(&PragmaTok::Punct('(')) {
+        diag::group_warning(
+            PRAGMAS_WARNING,
+            pos,
+            &gettext("expected '(' after '#pragma pack'"),
+        );
         return None;
     }
 
     // C has no meaning for a non-power-of-two alignment, and gcc rejects it;
     // a bad value is dropped rather than applied.
-    let number = |t: Option<&PackTok>| -> Option<u32> {
-        let PackTok::Num(text) = t? else {
-            diag::warning(pos, &gettext("expected an alignment in '#pragma pack'"));
+    let number = |t: Option<&PragmaTok>| -> Option<u32> {
+        let PragmaTok::Num(text) = t? else {
+            diag::group_warning(
+                PRAGMAS_WARNING,
+                pos,
+                &gettext("expected an alignment in '#pragma pack'"),
+            );
             return None;
         };
         match text.parse::<u32>() {
             Ok(n) if n > 0 && n.is_power_of_two() && n <= 16 => Some(n),
             _ => {
-                diag::warning(
+                diag::group_warning(
+                    PRAGMAS_WARNING,
                     pos,
                     &gettext("alignment in '#pragma pack' must be 1, 2, 4, 8 or 16"),
                 );
@@ -963,29 +1143,37 @@ fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
 
     match it.next() {
         // `pack()` -- clear.
-        Some(PackTok::Punct(')')) => Some(PackAction::Set(None)),
-        Some(PackTok::Word(w)) if w == "push" => match it.next() {
-            Some(PackTok::Punct(',')) => Some(PackAction::Push(number(it.next()))),
+        Some(PragmaTok::Punct(')')) => Some(PackAction::Set(None)),
+        Some(PragmaTok::Word(w)) if w == "push" => match it.next() {
+            Some(PragmaTok::Punct(',')) => Some(PackAction::Push(number(it.next()))),
             _ => Some(PackAction::Push(None)),
         },
-        Some(PackTok::Word(w)) if w == "pop" => Some(PackAction::Pop),
-        Some(PackTok::Word(_)) => {
-            diag::warning(pos, &gettext("unrecognized '#pragma pack' argument"));
+        Some(PragmaTok::Word(w)) if w == "pop" => Some(PackAction::Pop),
+        Some(PragmaTok::Word(_)) => {
+            diag::group_warning(
+                PRAGMAS_WARNING,
+                pos,
+                &gettext("unrecognized '#pragma pack' argument"),
+            );
             None
         }
-        t @ Some(PackTok::Num(_)) => Some(PackAction::Set(number(t))),
+        t @ Some(PragmaTok::Num(_)) => Some(PackAction::Set(number(t))),
         _ => {
-            diag::warning(pos, &gettext("expected an alignment in '#pragma pack'"));
+            diag::group_warning(
+                PRAGMAS_WARNING,
+                pos,
+                &gettext("expected an alignment in '#pragma pack'"),
+            );
             None
         }
     }
 }
 
-/// Read the text of a pragma c17 acts on: `pack`, as `PackTok`s, or
-/// `scalar_storage_order`.
+/// Read the text of a pragma c17 acts on: `pack` and `GCC visibility`, as
+/// `PragmaTok`s, or `scalar_storage_order`.
 ///
 /// Returns `None` for anything else, which is every pragma c17 does not act
-/// on, and for a body of one of the two that names nothing it can apply.
+/// on, and for a body of one of these that names nothing it can apply.
 fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
     let mut chars = body.trim_start().chars().peekable();
     let mut word = String::new();
@@ -999,7 +1187,7 @@ fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
         let rest: String = chars.collect();
         return StorageOrderPragma::parse_body(&rest, pos).map(LayoutPragma::StorageOrder);
     }
-    if word != "pack" {
+    if word != "pack" && word != "GCC" {
         return None;
     }
 
@@ -1012,7 +1200,7 @@ fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
             while chars.peek().is_some_and(|d| d.is_ascii_digit()) {
                 n.push(chars.next().unwrap());
             }
-            toks.push(PackTok::Num(n));
+            toks.push(PragmaTok::Num(n));
         } else if c.is_alphabetic() || c == '_' {
             let mut w = String::new();
             while chars
@@ -1021,13 +1209,21 @@ fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
             {
                 w.push(chars.next().unwrap());
             }
-            toks.push(PackTok::Word(w));
+            toks.push(PragmaTok::Word(w));
         } else {
             chars.next();
-            toks.push(PackTok::Punct(c));
+            toks.push(PragmaTok::Punct(c));
         }
     }
-    parse_pack_body(&toks, pos).map(LayoutPragma::Pack)
+    if word == "pack" {
+        return parse_pack_body(&toks, pos).map(LayoutPragma::Pack);
+    }
+    match toks.split_first() {
+        Some((PragmaTok::Word(w), rest)) if w == "visibility" => {
+            parse_visibility_body(rest, pos).map(LayoutPragma::Visibility)
+        }
+        _ => None,
+    }
 }
 
 impl<'a> Preprocessor<'a> {
@@ -1115,6 +1311,7 @@ impl<'a> Preprocessor<'a> {
             target,
             macros: HashMap::with_capacity(DEFAULT_MACRO_CAPACITY),
             pushed_macros: HashMap::new(),
+            visibility_depth: 0,
             cond_stack: Vec::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             system_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
             iquote_include_paths: search.iquote.to_vec(),
@@ -1129,6 +1326,7 @@ impl<'a> Preprocessor<'a> {
             dependencies: Vec::new(),
             collect_dependencies: false,
             keep_definitions: false,
+            preprocess_only: false,
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             guarded_files: HashMap::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             compile_date,
@@ -1144,6 +1342,7 @@ impl<'a> Preprocessor<'a> {
             expansion_budget: EXPANSION_BUDGET,
             paste_stream: std::cell::Cell::new(None),
             in_if_condition: false,
+            comments: Comments::Dropped,
         };
 
         // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
@@ -1174,7 +1373,12 @@ impl<'a> Preprocessor<'a> {
         // `-std=` cannot change it; see `classify_std`.
         self.define_macro(Macro::predefined("__STDC__", Some("1")));
         self.define_macro(Macro::predefined("__STDC_VERSION__", Some(STDC_VERSION)));
-        self.define_macro(Macro::predefined("__STDC_HOSTED__", Some("1")));
+        let hosted = if crate::builtins::freestanding() {
+            "0"
+        } else {
+            "1"
+        };
+        self.define_macro(Macro::predefined("__STDC_HOSTED__", Some(hosted)));
 
         // __STRICT_ANSI__ is never defined: there is no strict mode to
         // advertise, and claiming one would tell system headers to hide the
@@ -1245,18 +1449,14 @@ impl<'a> Preprocessor<'a> {
             GNUC_VERSION.join(".")
         );
         self.define_macro(Macro::predefined("__VERSION__", Some(&version)));
-        self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));
-
-        // GCC type keyword compatibility
-        self.define_macro(Macro::keyword_alias("__signed", "signed"));
-        self.define_macro(Macro::keyword_alias("__signed__", "signed"));
-        self.define_macro(Macro::keyword_alias("__inline", "inline"));
-        self.define_macro(Macro::keyword_alias("__inline__", "inline"));
-        self.define_macro(Macro::keyword_alias("__volatile", "volatile"));
-        self.define_macro(Macro::keyword_alias("__volatile__", "volatile"));
-        self.define_macro(Macro::keyword_alias("__extension__", "")); // expands to nothing
-        self.define_macro(Macro::keyword_alias("__restrict", "restrict"));
-        self.define_macro(Macro::keyword_alias("__restrict__", "restrict"));
+        // Which rule a plain `inline` follows, as gcc says it: GNU89's under
+        // `-fgnu89-inline`, C99's otherwise.
+        let inline_rule = if crate::builtins::gnu89_inline() {
+            "__GNUC_GNU_INLINE__"
+        } else {
+            "__GNUC_STDC_INLINE__"
+        };
+        self.define_macro(Macro::predefined(inline_rule, Some("1")));
 
         // Note: C99/C11 bool, true, false are NOT pre-defined here.
         // They should only be available after #include <stdbool.h>.
@@ -1398,20 +1598,96 @@ impl<'a> Preprocessor<'a> {
     ) {
         let stream_id = diag::init_stream("<command-line>");
         let hash = Token::new(TokenType::Special, Position::new(stream_id, 1, 1));
+        // gcc's `<command-line>` has the one line, 0, and the file returns
+        // to it.
+        let line_zero = Position::new(stream_id, 0, 1);
+        let site = IncludeSite {
+            from: line_zero,
+            back: line_zero,
+        };
 
-        // Searched like `#include "..."`: the working directory first, then
-        // `-I`, then the system paths.
-        match self.find_include_file(path, false, false) {
+        // Searched like `#include "..."`, but from the working directory
+        // rather than the source's, as gcc's `-include` is -- and named from
+        // it, `./inc.h` -- then `-I`, then the system paths.
+        let source_dir = std::mem::replace(&mut self.current_dir, ".".to_string());
+        let found = self.find_include_file(path, false, false);
+        self.current_dir = source_dir;
+        match found {
             Some((IncludeSource::File(found), pos)) => {
                 // A `-include` is a dependency exactly as a `#include` is.
                 self.record_dependency(&found, pos);
-                self.include_file(&found, output, idents, &hash, pos)
+                self.include_file(&found, output, idents, &hash, site, pos)
             }
             Some((IncludeSource::Builtin(content), _)) => {
-                self.include_builtin(path, content, output, idents, &hash)
+                self.include_builtin(path, content, output, idents, &hash, site)
             }
             None => diag::error_args(hash.pos, "'{0}': file not found", &[path]),
         }
+    }
+
+    /// Preprocess a translation unit's tokens, the `-imacros` files and then
+    /// the `-include` files first.
+    ///
+    /// They run after `-D`/`-U`, because a header may well test what they
+    /// defined, and before the source, because that is what "as if it were
+    /// the first line" means. An `-imacros` file is read for its macros
+    /// alone, before every `-include`, as gcc orders them: its text is
+    /// thrown away.
+    pub fn preprocess_unit(
+        &mut self,
+        tokens: Vec<Token>,
+        imacros: &[String],
+        pre_includes: &[String],
+        idents: &mut IdentTable,
+    ) -> Vec<Token> {
+        // An `-imacros` file's text is thrown away, but `-E` still marks
+        // entering and leaving it, as gcc's does.
+        let mut included = Vec::new();
+        for path in imacros {
+            let mut text = Vec::new();
+            self.include_from_cmdline(path, &mut text, idents);
+            included.extend(text.into_iter().filter(|t| t.typ == TokenType::FileChange));
+        }
+        for path in pre_includes {
+            self.include_from_cmdline(path, &mut included, idents);
+        }
+        // Where `-E` names the source again, after the command line -- but
+        // not a `.i`, whose own markers name what it holds, as gcc's
+        // `-fpreprocessed` has it.
+        if let Some(first) = tokens.first().filter(|_| !self.preprocessed) {
+            let pos = Position::new(first.pos.stream, 1, 1);
+            self.mark_file_change(&mut included, FileChange::Rename, pos);
+        }
+
+        let mut output = self.preprocess(tokens, idents);
+        self.report_unterminated_conditionals();
+
+        if !included.is_empty() {
+            // After the source's own `StreamBegin`, not before it. The marker
+            // says where the translation unit starts, and everything
+            // downstream reads the stream structure -- a `StreamBegin`
+            // arriving partway through the token vector is not something any
+            // consumer expects.
+            let at = usize::from(matches!(
+                output.first().map(|t| t.typ),
+                Some(TokenType::StreamBegin)
+            ));
+            output.splice(at..at, included);
+        }
+        output
+    }
+
+    /// Take the `-I` directories, and settle the whole search chain as gcc
+    /// does; see [`search_chain`].
+    fn set_include_paths(&mut self, include_paths: &[String]) {
+        let chain = search_chain(
+            &self.iquote_include_paths,
+            include_paths,
+            &self.system_include_paths,
+        );
+        self.iquote_include_paths = chain.iquote;
+        self.quote_include_paths = chain.bracket;
+        self.system_include_paths = chain.system;
     }
 
     /// Apply one command-line `-D` specification.
@@ -1482,6 +1758,26 @@ impl<'a> Preprocessor<'a> {
         self.macros.remove(name);
     }
 
+    /// `-undef`: drop every predefined macro but those the C standard names
+    /// (C17 6.10.8), as gcc does -- nothing of the target, the system or the
+    /// compiler is left: no `__GNUC__`, `__x86_64__`, `linux` or `unix`. The
+    /// dynamic ones (`__LINE__`, `__FILE__`, `__has_include`) are operators
+    /// more than macros, and gcc keeps them too.
+    pub(crate) fn keep_only_standard_macros(&mut self) {
+        const STANDARD: &[&str] = &[
+            "__STDC__",
+            "__STDC_HOSTED__",
+            "__STDC_IEC_559__",
+            "__STDC_ISO_10646__",
+            "__STDC_NO_THREADS__",
+            "__STDC_UTF_16__",
+            "__STDC_UTF_32__",
+            "__STDC_VERSION__",
+        ];
+        self.macros
+            .retain(|name, mac| mac.builtin.is_some() || STANDARD.contains(&name.as_str()));
+    }
+
     /// Apply the command line's `-D` and then its `-U` options.
     ///
     /// POSIX c17: "The -D option has lower precedence than the -U option.
@@ -1491,21 +1787,30 @@ impl<'a> Preprocessor<'a> {
     /// that name redefines nothing and is not reported: zstd builds its
     /// programs with `-DZSTD_LEGACY_SUPPORT=5 -UZSTD_LEGACY_SUPPORT
     /// -DZSTD_LEGACY_SUPPORT=0` under `-Werror`.
+    ///
+    /// Returns the directives applied, as `-dD` writes them, in order.
     fn apply_cmdline_macros(
         &mut self,
         defines: &[String],
         undefines: &[String],
         idents: &mut IdentTable,
-    ) {
+    ) -> Vec<String> {
+        let mut applied = Vec::new();
         for def in defines {
             let name_end = def.find(['=', '(']).unwrap_or(def.len());
-            if !undefines.iter().any(|u| *u == def[..name_end]) {
+            let name = &def[..name_end];
+            if !undefines.iter().any(|u| u == name) {
                 self.define_from_cmdline(def, idents);
+                if let Some(mac) = self.macros.get(name).cloned() {
+                    applied.push(self.render_definition(&mac, idents));
+                }
             }
         }
         for undef in undefines {
             self.undef_from_cmdline(undef, idents);
+            applied.push(format!("#undef {undef}"));
         }
+        applied
     }
 
     /// Check if a macro is defined
@@ -1540,8 +1845,10 @@ impl<'a> Preprocessor<'a> {
         // expansion; inert outside a controlling expression.
         let mut defined_scan = DefinedScan::Idle;
         let mut cursor = TokenCursor::new(tokens);
+        // A directive just handled, whose line's comments `-C` drops with it.
+        let mut on_directive_line = false;
 
-        while let Some(mut token) = cursor.next() {
+        while let Some(mut token) = cursor.next_or_comment() {
             // Attribute the token before anything looks at it, so that macro
             // expansion, diagnostics and the `-E` marker writer all inherit
             // the position a linemarker established. The physical position is
@@ -1561,6 +1868,16 @@ impl<'a> Preprocessor<'a> {
                 token.pos = self.remap_pos(token.pos);
             }
 
+            if token.typ == TokenType::Comment {
+                // `-C`: a comment of the text, where it stands.
+                on_directive_line &= !token.pos.newline;
+                if !on_directive_line && !self.is_skipping() && !self.in_if_condition {
+                    output.push(token);
+                }
+                continue;
+            }
+            on_directive_line = false;
+
             match token.typ {
                 TokenType::StreamBegin | TokenType::StreamEnd => {
                     // Pass through stream markers
@@ -1571,6 +1888,7 @@ impl<'a> Preprocessor<'a> {
                     // `#` at start of line, from the file: a directive.
                     if self.is_file_directive(&token, &cursor) {
                         self.handle_directive(&mut cursor, &token, &mut output, idents);
+                        on_directive_line = true;
                         continue;
                     }
                     if !self.is_skipping() {
@@ -1626,7 +1944,12 @@ impl<'a> Preprocessor<'a> {
                             // Handle the _Pragma operator (C99):
                             // `_Pragma("string")` is `#pragma string`.
                             if is_pragma {
-                                self.handle_pragma_operator(&mut cursor, &mut output, token.pos);
+                                self.handle_pragma_operator(
+                                    &mut cursor,
+                                    &mut output,
+                                    token.pos,
+                                    idents,
+                                );
                                 continue;
                             }
 
@@ -1676,6 +1999,45 @@ impl<'a> Preprocessor<'a> {
         }
 
         output
+    }
+
+    /// Macro-replace what `cursor` holds next until it no longer starts with
+    /// a macro invocation, for an operator that reads its operand token by
+    /// token rather than through the main loop: gcc's `_Pragma` operand gets
+    /// the replacement the main loop would give it. A name that turns out
+    /// not to be an invocation goes back where it came from.
+    pub(super) fn expand_ahead(&mut self, cursor: &mut TokenCursor, idents: &mut IdentTable) {
+        loop {
+            let Some(token) = cursor.peek() else {
+                return;
+            };
+            let TokenValue::Ident(id) = &token.value else {
+                return;
+            };
+            let Some(name) = idents.get_opt(*id) else {
+                return;
+            };
+            if !self.macros.contains_key(name) || token.is_no_expand(name) {
+                return;
+            }
+            let name = name.to_string();
+            let token = cursor.next().expect("peeked");
+            let from_file = cursor.provenance() == Provenance::Main;
+            match self.try_expand_macro(&name, &token, cursor, idents) {
+                Some(expanded) if self.charge_expansion(token.pos) => {
+                    cursor.push_expansion(expanded, token.pos.whitespace, token.pos.newline);
+                }
+                _ => {
+                    let (whitespace, newline) = (token.pos.whitespace, token.pos.newline);
+                    if from_file {
+                        cursor.unread(vec![token]);
+                    } else {
+                        cursor.push_expansion(vec![token], whitespace, newline);
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Account for one expansion, and say whether it may proceed.
@@ -1745,7 +2107,9 @@ impl<'a> Preprocessor<'a> {
     /// Establish that the physical line after the current directive is line
     /// `line` of `name` (or of the file it already belongs to): what `#line`
     /// (C17 6.10.4) and a `# N "file"` linemarker both mean.
-    fn set_line_marker(&mut self, line: u32, name: Option<String>, is_system: bool) {
+    ///
+    /// Returns the stream the text after the directive is attributed to.
+    fn set_line_marker(&mut self, line: u32, name: Option<String>, is_system: bool) -> u16 {
         let origin = self.physical_stream;
         let prior = self.linemarkers.get(&origin);
         let (target, name) = match name {
@@ -1766,6 +2130,37 @@ impl<'a> Preprocessor<'a> {
                 name,
             },
         );
+        target
+    }
+
+    /// For `-E`, which writes a line marker for it, put a change of file at
+    /// `pos` in the output.
+    fn mark_file_change(&self, output: &mut Vec<Token>, change: FileChange, pos: Position) {
+        if self.preprocess_only {
+            output.push(Token::with_value(
+                TokenType::FileChange,
+                pos,
+                TokenValue::FileChange(change),
+            ));
+        }
+    }
+
+    /// A `#define`'s replacement list: the rest of the line, with its
+    /// comments under `-CC`. A `//` comment becomes a `/* */` one, as gcc
+    /// writes it, so that what follows an expansion on its line stays there.
+    fn collect_macro_body(&self, iter: &mut TokenCursor) -> Vec<Token> {
+        if self.comments != Comments::InTextAndMacros {
+            return self.collect_to_eol(iter);
+        }
+        let mut tokens = Vec::new();
+        while iter.peek_or_comment().is_some_and(|t| !t.pos.newline) {
+            let Some(mut token) = iter.next_or_comment() else {
+                break;
+            };
+            block_comment(&mut token);
+            tokens.push(token);
+        }
+        tokens
     }
 
     /// Collect tokens until end of line
@@ -1839,7 +2234,7 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Reduce `#pragma pack(...)`'s tokens to `PackTok`s and read them.
+    /// Reduce `#pragma pack(...)`'s tokens to `PragmaTok`s and read them.
     fn parse_pack_pragma(
         &mut self,
         iter: &mut TokenCursor,
@@ -1852,12 +2247,12 @@ impl<'a> Preprocessor<'a> {
                 break;
             }
             let reduced = match &tok.value {
-                TokenValue::Ident(id) => PackTok::Word(idents.get_opt(*id)?.to_string()),
-                TokenValue::Number(n) => PackTok::Num(n.clone()),
-                TokenValue::Special(c) => PackTok::Punct(char::from_u32(*c)?),
+                TokenValue::Ident(id) => PragmaTok::Word(idents.get_opt(*id)?.to_string()),
+                TokenValue::Number(n) => PragmaTok::Num(n.clone()),
+                TokenValue::Special(c) => PragmaTok::Punct(char::from_u32(*c)?),
                 _ => break,
             };
-            let closing = reduced == PackTok::Punct(')');
+            let closing = reduced == PragmaTok::Punct(')');
             toks.push(reduced);
             iter.next();
             if closing {
@@ -2590,15 +2985,9 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             None => return 0,
         };
 
-        if self
-            .idents
+        self.idents
             .lookup(&name)
-            .is_some_and(|id| crate::kw::attribute_supported(id, self.pp.target.arch))
-        {
-            1
-        } else {
-            0
-        }
+            .map_or(0, |id| crate::kw::has_attribute(id, self.pp.target.arch))
     }
 
     /// Evaluate __has_builtin(X)
@@ -2841,9 +3230,80 @@ pub struct SystemSearch<'a> {
     pub no_std_inc: bool,
 }
 
+/// The include search chain the command line names, with gcc's duplicates
+/// removed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchChain {
+    /// `-iquote`, for the `"..."` form only.
+    pub iquote: Vec<String>,
+    /// `-I`.
+    pub bracket: Vec<String>,
+    /// `-isystem`, the target's own directories, then `-idirafter`.
+    pub system: Vec<String>,
+}
+
+/// gcc's search chain from its three parts (`merge_include_chains` in its
+/// `incpath.c`): a directory named twice is searched where it was first
+/// named, and a `-I` or `-iquote` directory that is also a system directory
+/// is dropped, so it keeps its place, and its status, as a system one. The
+/// last `-iquote` directory goes too when it is the first `-I` one, the
+/// chain going straight on into it.
+///
+/// `#include_next` resumes just past where a header was found, so a
+/// duplicate left in the chain brings a header back to itself: glibc names
+/// `-I../include` twice, and its `stackinfo.h` reached itself instead of
+/// the header it wraps. Directories are the same when they are the same
+/// directory, however spelled -- gcc compares inodes, this compares
+/// canonical paths -- and one that cannot be resolved is compared by name.
+pub fn search_chain(iquote: &[String], bracket: &[String], system: &[String]) -> SearchChain {
+    let system = remove_duplicate_dirs(system, &[], None);
+    let system_ids: Vec<PathBuf> = system.iter().map(|d| dir_identity(d)).collect();
+    let bracket = remove_duplicate_dirs(bracket, &system_ids, system_ids.first());
+    let after_iquote = bracket.first().map(|d| dir_identity(d));
+    let iquote = remove_duplicate_dirs(
+        iquote,
+        &system_ids,
+        after_iquote.as_ref().or(system_ids.first()),
+    );
+    SearchChain {
+        iquote,
+        bracket,
+        system,
+    }
+}
+
+/// What makes two search directories the same one.
+fn dir_identity(dir: &str) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir))
+}
+
+/// `chain` without the directories in `system`, those named earlier in
+/// `chain`, and its last one when that is `next`, the directory the chain
+/// continues into.
+fn remove_duplicate_dirs(
+    chain: &[String],
+    system: &[PathBuf],
+    next: Option<&PathBuf>,
+) -> Vec<String> {
+    let mut kept: Vec<(String, PathBuf)> = Vec::with_capacity(chain.len());
+    for (i, dir) in chain.iter().enumerate() {
+        let id = dir_identity(dir);
+        let last_joins_next = i + 1 == chain.len() && next == Some(&id);
+        if system.contains(&id) || kept.iter().any(|(_, k)| *k == id) || last_joins_next {
+            continue;
+        }
+        kept.push((dir.clone(), id));
+    }
+    kept.into_iter().map(|(dir, _)| dir).collect()
+}
+
 /// Configuration for preprocessing command-line options
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PreprocessConfig<'a> {
+    /// What the source is written in: C, or gcc's assembler-with-cpp (a
+    /// `.S`), which lexes a few characters differently, predefines
+    /// `__ASSEMBLER__` and none of the C standard's `__STDC__` macros.
+    pub language: LexerMode,
     /// Command-line -D defines
     pub defines: &'a [String],
     /// Command-line -U undefines
@@ -2861,9 +3321,18 @@ pub struct PreprocessConfig<'a> {
     /// If true, the input is a `.i` operand -- already the output of `c17 -E`
     /// -- and the processing that produced it must not be repeated.
     pub preprocessed: bool,
+    /// `-C`, `-CC`: the comments kept; see [`Comments`]. The source's own
+    /// tokens must have been lexed for them too.
+    pub comments: Comments,
     /// Files to process as if each were a `#include "..."` on the line before
     /// the source, in the order given (`-include`).
     pub pre_includes: &'a [String],
+    /// Files read for their macros alone, ahead of `pre_includes`
+    /// (`-imacros`).
+    pub imacros: &'a [String],
+    /// `-undef`: predefine only what the C standard names; see
+    /// [`Preprocessor::keep_only_standard_macros`].
+    pub undef: bool,
     /// Collect every macro definition for `-dM` instead of only the tokens.
     pub dump_macros: bool,
     /// `-dD`: carry each `#define` and `#undef` in the output where it
@@ -2871,11 +3340,22 @@ pub struct PreprocessConfig<'a> {
     pub keep_definitions: bool,
     /// Collect the headers this translation unit depends on (the `-M` family).
     pub collect_dependencies: bool,
+    /// `-E`: the output is the preprocessed text, whose pragmas are not
+    /// acted on here and so draw no warning -- gcc gives those when it
+    /// compiles them.
+    pub preprocess_only: bool,
     /// The position independence code generation uses; see
     /// [`define_pic_macros`].
     pub position: crate::target::PositionIndependence,
     /// The x86-64 extensions the code may assume; see [`define_isa_macros`].
     pub isa: crate::target::X86Isa,
+    /// `-fcf-protection`, which `__CET__` describes.
+    pub cf_protection: crate::target::CfProtection,
+    /// `-fexceptions`, which `__EXCEPTIONS` says.
+    pub exceptions: bool,
+    /// Where the unit's call frame information goes, which
+    /// `__GCC_HAVE_DWARF2_CFI_ASM` says.
+    pub cfi: crate::target::Cfi,
     /// `-fmacro-prefix-map` (and the macro half of `-ffile-prefix-map`).
     pub macro_prefix_map: PrefixMap,
     /// What optimization was asked for.
@@ -2938,16 +3418,63 @@ fn define_pic_macros(
     }
 }
 
-/// Define the feature macros of the x86-64 extensions `-msse3` ..
-/// `-msse4.2`, `-mpopcnt` and `-march=` ask for (`__SSE4_1__` and the rest),
-/// as gcc does. Code tests them to choose its path; the baseline's
-/// `__SSE2__` is among the target's own macros.
+/// Define the feature macros of the x86-64 extensions the ISA options and
+/// `-march=` ask for (`__MMX__`, `__SSE4_1__`, `__AVX2__` and the rest), as
+/// gcc does. Code tests them to choose its path. The baseline's are here
+/// too: `__SSE__` and `__SSE2__` with their `_MATH__` forms, which
+/// `-mno-sse` and `-mno-sse2` take away, and gcc's `_SOFT_FLOAT` once
+/// `-mno-80387` has taken the x87. (`__STDC_IEC_559__` goes with SSE2.)
 fn define_isa_macros(pp: &mut Preprocessor, target: &Target, isa: crate::target::X86Isa) {
     if target.arch != crate::target::Arch::X86_64 {
         return;
     }
-    for name in isa.macros() {
+    let base = [
+        (isa.has_sse(), "__SSE__"),
+        (isa.has_sse2(), "__SSE2__"),
+        (isa.has_sse(), "__SSE_MATH__"),
+        (isa.has_sse2(), "__SSE2_MATH__"),
+        (!isa.has_x87(), "_SOFT_FLOAT"),
+    ];
+    let names = base
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .chain(isa.macros());
+    for name in names {
         pp.define_macro(Macro::predefined(name, Some("1")));
+    }
+    // c17 computes `float` and `double` in SSE2's registers only; without
+    // them it computes neither, so it claims no IEC 60559 arithmetic.
+    if !isa.has_sse2() {
+        pp.undef_macro("__STDC_IEC_559__");
+    }
+}
+
+/// Define gcc's `__CET__` for the `-fcf-protection` level; see
+/// [`crate::target::CfProtection::cet_macro`].
+fn define_cet_macro(pp: &mut Preprocessor, target: &Target, cf: crate::target::CfProtection) {
+    if let Some(value) = cf.cet_macro(target) {
+        pp.define_macro(Macro::predefined("__CET__", Some(&value.to_string())));
+    }
+}
+
+/// Define gcc's `__GCC_HAVE_DWARF2_CFI_ASM` when the unit's call frame
+/// information is written as `.cfi_*` directives -- as gcc's
+/// `dwarf2out_do_cfi_asm` answers: whenever there are unwind tables, or
+/// `-g` keeps the rules for the debugger. Hand-written assembly and inline
+/// `asm` (glibc's `CFI_*` macros, the Linux kernel's) write their own
+/// directives only then: with none open, the assembler refuses them.
+fn define_cfi_macro(pp: &mut Preprocessor, cfi: crate::target::Cfi) {
+    if cfi.emitted() {
+        pp.define_macro(Macro::predefined("__GCC_HAVE_DWARF2_CFI_ASM", Some("1")));
+    }
+}
+
+/// Define gcc's `__EXCEPTIONS` under `-fexceptions`, which glibc's libio
+/// and `<pthread.h>` read to choose the `cleanup` attribute for their locks
+/// and cancellation handlers.
+fn define_exceptions_macro(pp: &mut Preprocessor, exceptions: bool) {
+    if exceptions {
+        pp.define_macro(Macro::predefined("__EXCEPTIONS", Some("1")));
     }
 }
 
@@ -2960,9 +3487,12 @@ pub struct PreprocessOutcome {
     /// Every macro in force at the end, as `#define` lines, sorted (`-dM`).
     /// Empty unless asked for: rendering them is not free.
     pub macro_definitions: Vec<String>,
-    /// Under `-dD`, the macros in force before the source -- predefined and
-    /// from the command line -- as `#define` lines, sorted. Empty otherwise.
+    /// Under `-dD`, the macros the compiler predefines, as `#define` lines,
+    /// sorted. Empty otherwise.
     pub initial_definitions: Vec<String>,
+    /// Under `-dD`, the command line's `-D` and `-U` as the `#define` and
+    /// `#undef` lines they stand for, in the order applied. Empty otherwise.
+    pub cmdline_definitions: Vec<String>,
     /// Every header opened, in the order first opened, with whether it came
     /// from a system directory (the `-M` family). Empty unless asked for.
     pub dependencies: Vec<(PathBuf, bool)>,
@@ -2994,58 +3524,62 @@ pub fn preprocess_collecting(
     if config.no_builtin_inc {
         pp.use_builtin_headers = false;
     }
+    // Included files are lexed as the source is.
+    pp.lexer_mode = config.language;
     pp.trigraphs = config.trigraphs;
     pp.preprocessed = config.preprocessed;
+    pp.comments = config.comments;
     pp.collect_dependencies = config.collect_dependencies;
     pp.macro_prefix_map = config.macro_prefix_map.clone();
 
-    define_optimization_macros(&mut pp, config.optimization);
-    define_pic_macros(&mut pp, target, config.position);
-    define_isa_macros(&mut pp, target, config.isa);
-
-    // Add -I include paths
-    for path in config.include_paths {
-        pp.quote_include_paths.push(path.clone());
+    let assembly = config.language == LexerMode::Assembly;
+    // Assembly is not C, so nothing the C standard predefines applies.
+    if assembly {
+        pp.undef_macro("__STDC__");
+        pp.undef_macro("__STDC_VERSION__");
+        pp.undef_macro("__STDC_HOSTED__");
     }
 
-    // -D, then -U, which wins
-    pp.apply_cmdline_macros(config.defines, config.undefines, idents);
+    if config.undef {
+        pp.keep_only_standard_macros();
+    } else {
+        define_optimization_macros(&mut pp, config.optimization);
+        define_pic_macros(&mut pp, target, config.position);
+        define_isa_macros(&mut pp, target, config.isa);
+        define_cet_macro(&mut pp, target, config.cf_protection);
+        define_exceptions_macro(&mut pp, config.exceptions);
+        define_cfi_macro(&mut pp, config.cfi);
+    }
+    // gcc's mark of assembler-with-cpp, which `-undef` keeps.
+    if assembly {
+        pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
+    }
 
-    // `-dD`: what is defined now is what the source starts with; from here
-    // on each directive is carried where it stands, `-include`d ones too.
+    pp.set_include_paths(config.include_paths);
+
+    // `-dD`: the definitions the compiler starts with, then the command
+    // line's directives as applied; from the source on each directive is
+    // carried where it stands, `-include`d ones too.
     let initial_definitions = if config.keep_definitions {
-        pp.keep_definitions = true;
         pp.macro_definitions(idents)
     } else {
         Vec::new()
     };
+    // -D, then -U, which wins
+    let cmdline_definitions = pp.apply_cmdline_macros(config.defines, config.undefines, idents);
+    pp.preprocess_only = config.preprocess_only;
+    pp.keep_definitions = config.keep_definitions;
 
-    // `-include` runs after `-D`/`-U`, because a header may well test what
-    // they defined, and before the source, because that is what "as if it were
-    // the first line" means.
-    let mut included = Vec::new();
-    for path in config.pre_includes {
-        pp.include_from_cmdline(path, &mut included, idents);
-    }
-
-    let mut output = pp.preprocess(tokens, idents);
-    pp.report_unterminated_conditionals();
-
-    if !included.is_empty() {
-        // After the source's own `StreamBegin`, not before it. The marker says
-        // where the translation unit starts, and everything downstream reads
-        // the stream structure -- a `StreamBegin` arriving partway through the
-        // token vector is not something any consumer expects.
-        let at = usize::from(matches!(
-            output.first().map(|t| t.typ),
-            Some(TokenType::StreamBegin)
-        ));
-        output.splice(at..at, included);
-    }
+    let output = pp.preprocess_unit(tokens, config.imacros, config.pre_includes, idents);
 
     let outcome = PreprocessOutcome {
         macro_definitions: if config.dump_macros {
             pp.macro_definitions(idents)
+        } else {
+            Vec::new()
+        },
+        cmdline_definitions: if config.keep_definitions {
+            cmdline_definitions
         } else {
             Vec::new()
         },
@@ -3056,36 +3590,6 @@ pub fn preprocess_collecting(
 }
 
 // Assembly File Preprocessing
-
-/// Configuration for assembly file preprocessing
-#[derive(Debug, Clone, Default)]
-pub struct AsmPreprocessConfig<'a> {
-    /// Command-line -D defines
-    pub defines: &'a [String],
-    /// Command-line -U undefines
-    pub undefines: &'a [String],
-    /// Command-line -I include paths
-    pub include_paths: &'a [String],
-    /// Where the system headers are; see [`SystemSearch`].
-    pub search: SystemSearch<'a>,
-    /// If true, disable system include paths (-nostdinc)
-    pub no_std_inc: bool,
-    /// What optimization was asked for; see [`PreprocessConfig::optimization`].
-    /// GCC defines these for `.S` files too.
-    pub optimization: crate::opt::Optimization,
-    /// See [`PreprocessConfig::position`]; gcc defines the macros for `.S`
-    /// files too, where hand-written assembly chooses GOT or direct accesses
-    /// by them.
-    pub position: crate::target::PositionIndependence,
-    /// See [`PreprocessConfig::isa`].
-    pub isa: crate::target::X86Isa,
-    /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
-    /// is mapped as in C.
-    pub macro_prefix_map: PrefixMap,
-    /// See [`PreprocessConfig::collect_dependencies`]: a `.S` is preprocessed,
-    /// so the `-M` family has a rule to write for it.
-    pub collect_dependencies: bool,
-}
 
 /// A preprocessed `.S`: the text for `as`, and the headers it read.
 #[derive(Debug, Default)]
@@ -3111,14 +3615,40 @@ impl std::fmt::Display for AsmPreprocessFailed {
 
 impl std::error::Error for AsmPreprocessFailed {}
 
+/// Lex and preprocess an assembly file (`.S`) as gcc's assembler-with-cpp
+/// does: the preprocessed tokens, what [`PreprocessConfig`] asked to be
+/// collected, and the stream the file was registered as.
+///
+/// The same preprocessor as C, whatever `config.language` says: the file is
+/// lexed in assembly mode (`'` opens no literal, `#` that names no directive
+/// is text), its headers likewise, and the predefined macros are
+/// assembler-with-cpp's.
+pub fn preprocess_asm_collecting(
+    content: &[u8],
+    target: &Target,
+    idents: &mut IdentTable,
+    filename: &str,
+    config: &PreprocessConfig<'_>,
+) -> (Vec<Token>, PreprocessOutcome, u16) {
+    let stream_id = diag::init_stream(filename);
+    let tokens = Tokenizer::new_with_mode(content, stream_id, idents, LexerMode::Assembly)
+        .keeping_comments(config.comments.lexed())
+        .tokenize();
+    let config = PreprocessConfig {
+        language: LexerMode::Assembly,
+        ..config.clone()
+    };
+    let (tokens, outcome) = preprocess_collecting(tokens, target, idents, filename, &config);
+    (tokens, outcome, stream_id)
+}
+
 /// Preprocess an assembly file (.S) and return the preprocessed text.
 ///
-/// This uses the same preprocessor as C files but with assembly-specific
-/// comment syntax (`;` for line comments, no `//` or `/* */`).
+/// See [`preprocess_asm_collecting`].
 ///
 /// # Returns
 /// The preprocessed assembly text, as bytes, with the headers read when
-/// [`AsmPreprocessConfig::collect_dependencies`] asks: a string literal's payload is a
+/// [`PreprocessConfig::collect_dependencies`] asks: a string literal's payload is a
 /// byte sequence, so rendering it through a Rust `String` would re-encode
 /// every byte >= 0x80. `Err` means this call reported a diagnostic -- a
 /// `#error`, a missing include -- and the bytes are not worth assembling.
@@ -3132,63 +3662,12 @@ pub fn preprocess_asm_file(
     content: &[u8],
     target: &Target,
     filename: &str,
-    config: &AsmPreprocessConfig<'_>,
+    config: &PreprocessConfig<'_>,
 ) -> Result<AsmPreprocessed, AsmPreprocessFailed> {
     let errors_on_entry = diag::error_count();
-    // Create string table for tokenization
     let mut strings = IdentTable::new();
-
-    // Initialize stream for this file
-    let stream_id = diag::init_stream(filename);
-
-    // Tokenize with assembly mode (`;` comments)
-    let tokens = {
-        let mut tokenizer =
-            Tokenizer::new_with_mode(content, stream_id, &mut strings, LexerMode::Assembly);
-        tokenizer.tokenize()
-    };
-
-    // Create preprocessor with assembly-specific predefined macros. The C
-    // standard macros are undefined immediately below, so nothing the language
-    // mode contributes survives into an assembly translation unit.
-    let mut pp = Preprocessor::new(target, filename, &config.search);
-
-    // Use assembly lexer mode for included files as well
-    pp.lexer_mode = LexerMode::Assembly;
-    pp.macro_prefix_map = config.macro_prefix_map.clone();
-    pp.collect_dependencies = config.collect_dependencies;
-
-    // Undefine C-specific macros that don't apply to assembly
-    pp.undef_macro("__STDC__");
-    pp.undef_macro("__STDC_VERSION__");
-    pp.undef_macro("__STDC_HOSTED__");
-
-    // Define __ASSEMBLER__ (GCC-compatible, indicates assembly preprocessing)
-    pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
-
-    define_optimization_macros(&mut pp, config.optimization);
-    define_pic_macros(&mut pp, target, config.position);
-    define_isa_macros(&mut pp, target, config.isa);
-
-    // -nostdinc: the directories are dropped in `Preprocessor::new`; the
-    // bundled headers go with them.
-    if config.no_std_inc {
-        pp.use_builtin_headers = false;
-    }
-
-    // Add -I include paths
-    for path in config.include_paths {
-        pp.quote_include_paths.push(path.clone());
-    }
-
-    // -D, then -U, which wins
-    pp.apply_cmdline_macros(config.defines, config.undefines, &mut strings);
-
-    // Preprocess
-    let preprocessed = pp.preprocess(tokens, &mut strings);
-    pp.report_unterminated_conditionals();
-
-    // Convert tokens back to text
+    let (preprocessed, outcome, _) =
+        preprocess_asm_collecting(content, target, &mut strings, filename, config);
     let text = tokens_to_source_bytes(&preprocessed, &strings);
 
     if diag::error_count() != errors_on_entry {
@@ -3196,7 +3675,7 @@ pub fn preprocess_asm_file(
     }
     Ok(AsmPreprocessed {
         text,
-        dependencies: std::mem::take(&mut pp.dependencies),
+        dependencies: outcome.dependencies,
     })
 }
 

@@ -7,9 +7,10 @@
  * SPDX-License-Identifier: MIT
  *
  * Written from the instruction semantics in Intel's Intrinsics Guide, over
- * GNU vectors and c17's vector builtins: no `__builtin_ia32_*`. Every
- * function is available whatever -m flags are given; the feature macros
- * (`__SSE4_1__` and the rest) follow the flags, as gcc's do.
+ * GNU vectors and c17's vector builtins: no `__builtin_ia32_*` but
+ * `cvtpd2ps`'s, which glibc calls by that name too. Every function is
+ * available whatever -m flags are given; the feature macros (`__SSE4_1__`
+ * and the rest) follow the flags, as gcc's do.
  */
 
 #ifndef _EMMINTRIN_H_INCLUDED
@@ -862,7 +863,7 @@ __C17_INTRIN __m128d _mm_cvtpi32_pd(__m64 __a)
 
 __C17_INTRIN __m128 _mm_cvtpd_ps(__m128d __a)
 {
-    return (__m128)(__v4sf){(float)__a[0], (float)__a[1], 0.0f, 0.0f};
+    return (__m128)__builtin_ia32_cvtpd2ps((__v2df)__a);
 }
 
 __C17_INTRIN __m128d _mm_cvtps_pd(__m128 __a)

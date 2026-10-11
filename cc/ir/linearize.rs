@@ -13,8 +13,9 @@ use super::mem2reg::mem2reg;
 use super::memexpand::BlockOp;
 use super::ssa::ssa_convert;
 use super::{
-    conversion_raises_fp, BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, FpRaise, Function,
-    Initializer, Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
+    conversion_raises_fp, Access, BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, FpRaise,
+    Function, Initializer, Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
+    SourceFiles,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::constexpr::ConstScope;
@@ -25,13 +26,15 @@ use crate::ir::linearize_emit::CompoundAssign;
 use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
-    GnuAtomicOp, InitElement, InlineLibraryFn, JmpKind, LabelId, MemoryFn, NarrowedLibraryCall,
+    GnuAtomicOp, InitElement, InlineLibraryFn, LabelId, MachineOp, MemoryFn, NarrowedLibraryCall,
     OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
-use crate::types::{ArrayExtent, MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{
+    AddressSpace, ArrayExtent, MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable,
+};
 use std::collections::{HashMap, HashSet};
 
 const DEFAULT_LOCALS_CAPACITY: usize = 64;
@@ -490,12 +493,19 @@ pub(crate) struct ArrayInitGroups {
     pub(crate) indices: Vec<i64>,
 }
 
-/// Which ends of a block copy reach a `volatile` object. See
-/// [`Linearizer::block_volatility`].
+/// How each end of a block copy reaches its object: volatile or not, and
+/// in which address space. See [`Linearizer::block_volatility`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct BlockVolatility {
-    pub(crate) dst: bool,
-    pub(crate) src: bool,
+    pub(crate) dst: Access,
+    pub(crate) src: Access,
+}
+
+impl BlockVolatility {
+    /// Do both ends reach ordinary memory, with nothing to keep?
+    pub(crate) fn is_plain(self) -> bool {
+        self.dst == Access::default() && self.src == Access::default()
+    }
 }
 
 /// A field visit from walking struct/union initializer elements.
@@ -611,6 +621,8 @@ struct CalleeSignature {
     variadic_arg_start: Option<usize>,
     /// The callee does not return.
     is_noreturn: bool,
+    /// The callee's type is `nocf_check`.
+    nocf_check: bool,
 }
 
 /// A call's lowered arguments: the values and, in step, the types the ABI
@@ -625,6 +637,10 @@ struct CallFacts {
     variadic_arg_start: Option<usize>,
     ends_with_va_arg_pack: bool,
     is_noreturn: bool,
+    returns_twice: bool,
+    nocf_check: bool,
+    /// Under `-fexceptions`, the callee may unwind through this frame.
+    may_throw: bool,
     binding: crate::parse::ast::CalleeBinding,
     known: Option<crate::parse::ast::LibFn>,
     abi_info: Box<CallAbiInfo>,
@@ -851,6 +867,9 @@ pub struct Linearizer<'a> {
     /// whole unit has been read, because the target may be defined after the
     /// alias that names it.
     pub(crate) declared_aliases: Vec<super::linearize_init::DeclaredAlias>,
+    /// Where each definition placed in a named section was written, and its
+    /// name as the program spells it, for `check_section_conflicts`.
+    pub(crate) section_definitions: HashMap<String, (Position, String)>,
     /// Every function the translation unit defines, by name, weak ones aside:
     /// a call to a library builtin that yields to a definition reaches the
     /// program's own wherever it is (`InlineLibraryFn::yields_to_a_definition`).
@@ -860,6 +879,21 @@ pub struct Linearizer<'a> {
     /// is emitted even where its answer is known. `-fno-trapping-math` turns
     /// it off.
     pub(crate) trapping_math: bool,
+    /// The rounding direction a constant the linearizer folds may assume:
+    /// to nearest, or under `-frounding-math` whatever `fesetround` set, when
+    /// only an exact result is a constant. Recorded on every function for
+    /// the optimizer's folds too ([`Function::fp_rounding`]).
+    pub(crate) fp_rounding: crate::float::FpRounding,
+    /// `-fexceptions`: a call that may throw inside the scope of a `cleanup`
+    /// variable gets a landing pad that runs the cleanup when the frame is
+    /// unwound. See [`super::linearize_cleanup`].
+    pub(crate) exceptions: bool,
+    /// `-ftrivial-auto-var-init=`: what an automatic variable declared
+    /// without an initializer starts as.
+    pub(crate) auto_var_init: crate::target::AutoVarInit,
+    /// The landing pads of the function being linearized; see
+    /// [`super::linearize_cleanup::UnwindState`].
+    pub(crate) unwind: super::linearize_cleanup::UnwindState,
     /// The x86-64 ISA of the function being linearized: what decides which
     /// vector operations are one packed instruction. See
     /// [`Linearizer::function_isa`].
@@ -868,6 +902,9 @@ pub struct Linearizer<'a> {
     /// global each of its static locals became in the first version, which
     /// every later one shares, as gcc's clones share them.
     pub(crate) clone_statics: Option<HashMap<SymbolId, String>>,
+    /// The value each GNU range value ([`ExprKind::RangeValue`]) of the
+    /// function being linearized was evaluated to, by its id.
+    pub(crate) range_values: HashMap<u32, PseudoId>,
 }
 
 /// One compilation of a function definition other than its own: a
@@ -932,10 +969,16 @@ impl<'a> Linearizer<'a> {
             current_calling_conv: CallingConv::default(),
             local_scope_stack: Vec::new(),
             declared_aliases: Vec::new(),
+            section_definitions: HashMap::new(),
             defined_functions: std::collections::HashSet::new(),
             trapping_math: true,
+            fp_rounding: Default::default(),
+            exceptions: false,
+            auto_var_init: Default::default(),
+            unwind: Default::default(),
             isa: target.x86_isa,
             clone_statics: None,
+            range_values: HashMap::new(),
         }
     }
 
@@ -1183,6 +1226,7 @@ impl<'a> Linearizer<'a> {
             }
         }
         self.resolve_aliases();
+        self.check_section_conflicts();
         self.place_after_asm(placed);
         for &name in super::FOLD_CALLEES {
             if !self.library_function_available(name) {
@@ -1333,8 +1377,22 @@ impl<'a> Linearizer<'a> {
     /// An access addressed through [`Self::volatile_init_object`] is marked
     /// whatever its type says, which is how an initializer's accesses to the
     /// members of a `volatile` object are marked.
+    ///
+    /// The address space is read here the same way, and an access through a
+    /// segment is kept as a volatile one is; see [`Access::observable`].
     fn mark_volatile_access(&self, mut insn: Instruction) -> Instruction {
-        if !matches!(insn.op, Opcode::Load | Opcode::Store) || insn.is_volatile {
+        if !matches!(insn.op, Opcode::Load | Opcode::Store) {
+            return insn;
+        }
+        if insn.addr_space == AddressSpace::Generic {
+            if let Some(typ) = insn.typ {
+                insn.addr_space = self.types.address_space(typ);
+            }
+        }
+        if insn.addr_space != AddressSpace::Generic {
+            insn.is_volatile = true;
+        }
+        if insn.is_volatile {
             return insn;
         }
         if self.volatile_init_object.is_some()
@@ -1776,8 +1834,8 @@ impl<'a> Linearizer<'a> {
             // `offset < size` rounds *up* -- a 12-byte struct wrote 16
             // bytes, four of them past the local.
             let vol = BlockVolatility {
-                dst: self.types.contains_volatile(typ),
-                src: false,
+                dst: Access::of(self.types, typ),
+                src: Access::default(),
             };
             self.emit_block_copy(local_sym, addr_pseudo, typ_bytes, vol);
         } else if typ_size > 64 || self.passed_by_reference(typ, conv) {
@@ -1786,8 +1844,8 @@ impl<'a> Linearizer<'a> {
             // three-byte struct or `long double`.
             // Copy each 8-byte chunk through pointer dereference.
             let vol = BlockVolatility {
-                dst: self.types.contains_volatile(typ),
-                src: false,
+                dst: Access::of(self.types, typ),
+                src: Access::default(),
             };
             self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
         } else if typ_bytes > 0 {
@@ -1904,6 +1962,7 @@ impl<'a> Linearizer<'a> {
         self.locals.clear();
         self.local_scope_stack.clear();
         self.label_map.clear();
+        self.range_values.clear();
         self.break_targets.clear();
         self.continue_targets.clear();
         self.switch_stack.clear();
@@ -1919,6 +1978,7 @@ impl<'a> Linearizer<'a> {
         self.pending_goto_vla.clear();
         self.vla_marks.clear();
         self.cleanups.clear();
+        self.unwind = Default::default();
         self.func_has_vla = Self::declares_vla(&func.body);
         self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
@@ -2018,6 +2078,13 @@ impl<'a> Linearizer<'a> {
             .as_ref()
             .map_or_else(|| self.function_isa(func.attrs.target.as_ref()), |v| v.isa);
         self.isa = ir_func.isa;
+        ir_func.branch_protection = func
+            .attrs
+            .target
+            .as_ref()
+            .and_then(|r| r.branch_protection())
+            .unwrap_or(self.target.branch_protection);
+        ir_func.fp_rounding = self.fp_rounding;
 
         // Whether this is an *inline definition*, which provides no external
         // definition and so must not be emitted.
@@ -2080,6 +2147,10 @@ impl<'a> Linearizer<'a> {
         // `alias` or `ifunc` on a definition -- written on it, or on an
         // earlier prototype -- asks for two things one symbol cannot be.
         // Recorded like any other alias, so `resolve_aliases` reports it once.
+        if ir_func.symbol_attrs.section.is_some() {
+            let shown = self.str(func.name).to_string();
+            self.record_section_definition(&ir_func.name, func.pos, shown);
+        }
         if ir_func.symbol_attrs.alias.take().is_some() {
             let typ = self
                 .symbols
@@ -2092,6 +2163,17 @@ impl<'a> Linearizer<'a> {
         ir_func.declared_effect = func.attrs.effect;
         ir_func.is_always_inline = func.attrs.always_inline;
         ir_func.stack_protect = func.attrs.stack_protect;
+        ir_func.stack_protector = func.attrs.stack_protector;
+        ir_func.branches = func.attrs.branches;
+        ir_func.shape = func.attrs.shape;
+        ir_func.is_flatten = func.attrs.flatten;
+        ir_func.is_noipa = func.attrs.noipa;
+        ir_func.saves_all_registers = func.attrs.saves_all_registers;
+        ir_func.no_instrument = func.attrs.no_instrument;
+        ir_func.nocf_check = self
+            .symbols
+            .lookup(func.name, crate::symbol::Namespace::Ordinary)
+            .is_some_and(|s| self.types.get(s.typ).nocf_check);
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function
@@ -2468,8 +2550,8 @@ impl<'a> Linearizer<'a> {
         // copied exactly rather than rounded up past the caller's object.
         // The caller's buffer is its own temporary, never a volatile object.
         let vol = BlockVolatility {
-            dst: false,
-            src: self.types.contains_volatile(self.expr_type(e)),
+            dst: Access::default(),
+            src: Access::of(self.types, self.expr_type(e)),
         };
         self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64, vol);
 
@@ -2532,6 +2614,7 @@ impl<'a> Linearizer<'a> {
     /// how on the `Ret`.
     pub(crate) fn emit_reg_aggregate_return(&mut self, e: &Expr, ret_type: TypeId) {
         let src_addr = self.linearize_lvalue(e);
+        let src_addr = self.readable_storage(src_addr, self.expr_type(e));
         let struct_size = self.types.size_bits(ret_type);
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
         let ret_class = abi.classify_return(ret_type, self.types);
@@ -2686,6 +2769,7 @@ impl<'a> Linearizer<'a> {
         let op = match func {
             InlineLibraryFn::Sqrt(_) => Opcode::Sqrt,
             InlineLibraryFn::RoundToIntegral(how) => Opcode::RoundToIntegral(how),
+            InlineLibraryFn::RoundToInteger(how) => Opcode::RoundToInteger(how),
             InlineLibraryFn::FMin => Opcode::FMin,
             InlineLibraryFn::FMax => Opcode::FMax,
             InlineLibraryFn::Fma => Opcode::Fma,
@@ -2722,9 +2806,12 @@ impl<'a> Linearizer<'a> {
     /// with a `volatile` member reads that member. The type of a member or
     /// an element carries the object's qualifiers (C17 6.5.2.3p3), so this
     /// covers a volatile member and a member of a volatile object alike.
+    ///
+    /// A read through a segment counts as one, as its access does
+    /// ([`Access::observable`]).
     fn reads_volatile(&self, expr: &Expr) -> bool {
         expr.typ
-            .is_some_and(|typ| self.types.contains_volatile(typ))
+            .is_some_and(|typ| Access::of(self.types, typ).observable())
     }
 
     /// Whether `expr` may be computed for the operand of a deferred
@@ -2915,6 +3002,9 @@ impl<'a> Linearizer<'a> {
             // Statement expressions have side effects
             ExprKind::StmtExpr { .. } => false,
 
+            // A range's value is made one only for a value with an effect.
+            ExprKind::RangeValue { .. } => false,
+
             // Variadic builtins have side effects
             ExprKind::VaStart { .. }
             | ExprKind::VaArg { .. }
@@ -2977,8 +3067,18 @@ impl<'a> Linearizer<'a> {
             // __builtin_unreachable ()` -- it kills a correct program.
             ExprKind::Unreachable => !speculative,
 
+            // It ends the program.
+            ExprKind::Trap => false,
+
             // It writes the frame.
             ExprKind::UnwindInit => false,
+
+            // The counter reads differ, and `rdtscp` stores; a conversion
+            // or the thread pointer is a value.
+            ExprKind::MachineBuiltin { op, args } => {
+                matches!(op, MachineOp::Cvtpd2ps | MachineOp::ThreadPointer)
+                    && args.iter().all(|a| self.is_pure_expr(a, how))
+            }
 
             // Frame/return address builtins are pure (just read registers)
             ExprKind::FrameAddress { .. } | ExprKind::ReturnAddress { .. } => true,
@@ -3028,6 +3128,7 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn complex_operand_addr(&mut self, expr: &Expr) -> PseudoId {
         let addr = self.complex_storage_addr(expr);
         let typ = self.expr_type(expr);
+        let addr = self.readable_storage(addr, typ);
         self.complex_in_native_order(addr, typ)
     }
 
@@ -3104,6 +3205,21 @@ impl<'a> Linearizer<'a> {
     /// For a value that has to outlive whatever storage it was read from --
     /// an object whose lifetime ends, or that a cleanup is about to change --
     /// before anything has used it.
+    /// Where a value of type `typ` held in storage at `addr` can be read:
+    /// `addr` itself, or, for one in a named address space, a copy in the
+    /// frame read out through the segment once.
+    ///
+    /// A value held in storage is read where it lies, by whatever consumes
+    /// it -- a return, an argument, complex arithmetic -- each with accesses
+    /// of its own types; one in a segment lies at an address none of those
+    /// accesses could follow.
+    pub(crate) fn readable_storage(&mut self, addr: PseudoId, typ: TypeId) -> PseudoId {
+        if self.types.address_space(typ) == AddressSpace::Generic {
+            return addr;
+        }
+        self.detach_value(addr, typ)
+    }
+
     pub(crate) fn detach_value(&mut self, value: PseudoId, typ: TypeId) -> PseudoId {
         if !self.value_is_storage(typ) {
             return value;
@@ -3111,8 +3227,8 @@ impl<'a> Linearizer<'a> {
         let copy = self.frame_temp_addr("__value_copy", typ);
         let bytes = self.types.size_bytes(typ) as i64;
         let vol = BlockVolatility {
-            dst: false,
-            src: self.types.contains_volatile(typ),
+            dst: Access::default(),
+            src: Access::of(self.types, typ),
         };
         self.emit_block_copy(copy, value, bytes, vol);
         copy
@@ -3190,7 +3306,7 @@ impl<'a> Linearizer<'a> {
             return self.complex_in_native_order(addr, typ);
         }
         if self.object_reads_as_address(typ) {
-            return match place {
+            let addr = match place {
                 ObjectPlace::Sym(sym) => {
                     // An array's address is its first element's (6.3.2.1p3).
                     let pointee = match self.types.kind(typ) {
@@ -3204,6 +3320,7 @@ impl<'a> Linearizer<'a> {
                 }
                 ObjectPlace::At(base, offset) => self.offset_address(base, offset),
             };
+            return self.readable_storage(addr, typ);
         }
         let (base, offset) = match place {
             ObjectPlace::Sym(sym) => (sym, 0),
@@ -3255,6 +3372,11 @@ impl<'a> Linearizer<'a> {
                         binding: LocalBinding::ExtentsOnly,
                         ..
                     }) => unreachable!("no identifier names a type name's extents"),
+                    // A register has no address: the parser refuses `&` of
+                    // one, and `asm_operand_classes` a memory operand.
+                    None if self.global_register(*symbol_id).is_some() => {
+                        unreachable!("the address of a global register variable is refused")
+                    }
                     None => {
                         let name = self.symbol_name(*symbol_id);
                         (self.sym_pseudo(name), self.expr_type(expr))
@@ -4369,6 +4491,9 @@ impl<'a> Linearizer<'a> {
             }
         }
 
+        // The call is where the call expression is, not where its last
+        // argument was: what the `error` and `warning` attributes report.
+        self.current_pos = Some(expr.pos);
         let abi = get_abi_for_conv(conv, self.target);
         let param_classes: Vec<_> = arg_types_vec
             .iter()
@@ -4379,6 +4504,9 @@ impl<'a> Linearizer<'a> {
             variadic_arg_start: sig.variadic_arg_start,
             ends_with_va_arg_pack,
             is_noreturn: sig.is_noreturn,
+            returns_twice: self.callee_returns_twice(func_expr),
+            nocf_check: sig.nocf_check,
+            may_throw: self.exceptions && !self.callee_nothrow(func_expr),
             binding,
             known,
             abi_info: Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv)),
@@ -4416,6 +4544,60 @@ impl<'a> Linearizer<'a> {
         result_sym
     }
 
+    /// The function a call names, as gcc's `get_callee_fndecl` finds it:
+    /// `f`, `&f`, `*f`. Its declaration's `returns_twice` and `nothrow`
+    /// reach the call, and only then: gcc keeps them on the declaration, so
+    /// a call through any pointer -- even one holding `&f` -- is an ordinary
+    /// call. (`noreturn` travels in a pointer's type as well; see
+    /// [`Self::callee_signature`].)
+    fn designated_function(&self, func_expr: &Expr) -> Option<SymbolId> {
+        let mut e = func_expr;
+        loop {
+            match &e.kind {
+                ExprKind::Unary {
+                    op: UnaryOp::AddrOf | UnaryOp::Deref,
+                    operand,
+                } => e = operand,
+                ExprKind::Ident(id) => {
+                    let typ = self.symbols.get(*id).typ;
+                    return (self.types.kind(typ) == TypeKind::Function).then_some(*id);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Whether the function a call names returns twice, as gcc decides it:
+    /// declared `__attribute__((returns_twice))`, which its type carries, or an external function on gcc's list of such names --
+    /// `setjmp` and `sigsetjmp` under up to two leading underscores, and
+    /// `savectx`, `vfork` and `getcontext` as spelled, the name being the
+    /// one the program wrote, at most 11 characters.
+    fn callee_returns_twice(&self, func_expr: &Expr) -> bool {
+        let Some(symbol_id) = self.designated_function(func_expr) else {
+            return false;
+        };
+        let sym = self.symbols.get(symbol_id);
+        if self.types.get(sym.typ).returns_twice {
+            return true;
+        }
+        let name = self.str(sym.name);
+        let bare = name
+            .strip_prefix("__")
+            .or_else(|| name.strip_prefix('_'))
+            .unwrap_or(name);
+        sym.linkage == crate::symbol::Linkage::External
+            && name.len() <= 11
+            && (matches!(bare, "setjmp" | "sigsetjmp")
+                || matches!(name, "savectx" | "vfork" | "getcontext"))
+    }
+
+    /// Whether the function a call names is declared `nothrow`: it never
+    /// unwinds through its caller.
+    fn callee_nothrow(&self, func_expr: &Expr) -> bool {
+        self.designated_function(func_expr)
+            .is_some_and(|id| self.types.get(self.symbols.get(id).typ).nothrow)
+    }
+
     /// Which definition a direct call reaches, refining what the parser
     /// decided.
     ///
@@ -4447,20 +4629,12 @@ impl<'a> Linearizer<'a> {
     /// callee expression evaluates to. Emits that evaluation, so it runs
     /// before the arguments are lowered.
     fn lower_callee(&mut self, func_expr: &Expr) -> CallTarget {
-        // Determine if this is a direct or indirect call.
-        // We need to check the TYPE of the function expression:
-        // - If it's TypeKind::Function, it's a direct call to a function
-        // - If it's TypeKind::Pointer to Function, it's an indirect call through function pointer
-        let is_function_pointer = func_expr.typ.is_some_and(|t| {
-            let typ = self.types.get(t);
-            typ.kind == TypeKind::Pointer
-        });
-
+        // `f()`, `(&f)()` and `(*f)()` all call `f` by name, as gcc's do.
+        if let Some(id) = self.designated_function(func_expr) {
+            return CallTarget::Direct(self.symbol_name(id));
+        }
+        // Anything else calls through a pointer.
         match &func_expr.kind {
-            ExprKind::Ident(symbol_id) if !is_function_pointer => {
-                // Direct call to named function (not a function pointer variable)
-                CallTarget::Direct(self.symbol_name(*symbol_id))
-            }
             ExprKind::Unary {
                 op: UnaryOp::Deref,
                 operand,
@@ -4535,6 +4709,7 @@ impl<'a> Linearizer<'a> {
             .filter(|ft| ft.variadic)
             .and_then(|ft| ft.params.as_ref().map(|p| p.len()));
         let is_noreturn = callee.is_some_and(|ft| ft.noreturn);
+        let nocf_check = callee.is_some_and(|ft| ft.nocf_check);
 
         CalleeSignature {
             conv,
@@ -4542,6 +4717,7 @@ impl<'a> Linearizer<'a> {
             unprototyped,
             variadic_arg_start,
             is_noreturn,
+            nocf_check,
         }
     }
 
@@ -4685,6 +4861,7 @@ impl<'a> Linearizer<'a> {
         // hands back the temporary's address, so both cases are the
         // same call.
         let addr = self.linearize_lvalue(a);
+        let addr = self.readable_storage(addr, self.expr_type(a));
         let val = if self.passed_by_reference(arg_type, conv) {
             let vol = self.block_volatility(arg_type, self.expr_type(a));
             self.argument_copy(addr, arg_type, true, vol)
@@ -4815,15 +4992,13 @@ impl<'a> Linearizer<'a> {
         extra.variadic_arg_start = facts.variadic_arg_start;
         extra.ends_with_va_arg_pack = facts.ends_with_va_arg_pack;
         extra.is_noreturn_call = facts.is_noreturn;
+        extra.returns_twice_call = facts.returns_twice;
+        extra.nocf_check_call = facts.nocf_check;
         extra.callee_binding = facts.binding;
         extra.known = facts.known;
         extra.abi_info = Some(facts.abi_info);
-        self.emit(call_insn);
-        if facts.is_noreturn {
-            self.emit_no_return(
-                Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
-            );
-        }
+        extra.may_throw = facts.may_throw;
+        self.emit_call(call_insn, facts.is_noreturn);
     }
 
     /// Linearize a post-increment or post-decrement expression
@@ -5222,6 +5397,11 @@ impl<'a> Linearizer<'a> {
             (InlineLibraryFn::RoundToIntegral(how), [_]) => {
                 self.linearize_libm(Opcode::RoundToIntegral(how), args, typ, name)
             }
+            (InlineLibraryFn::RoundToInteger(how), [arg]) => {
+                let val = self.linearize_expr(arg);
+                let from = self.expr_type(arg);
+                self.emit_round_to_integer(how, val, from, typ, name)
+            }
             (InlineLibraryFn::FMin, [_, _]) => self.linearize_libm(Opcode::FMin, args, typ, name),
             (InlineLibraryFn::FMax, [_, _]) => self.linearize_libm(Opcode::FMax, args, typ, name),
             (InlineLibraryFn::Fma, [_, _, _]) => self.linearize_libm(Opcode::Fma, args, typ, name),
@@ -5468,6 +5648,11 @@ impl<'a> Linearizer<'a> {
                 }
             };
             self.read_object(place, local.typ)
+        }
+        // A file-scope register variable is its register: no storage.
+        else if let Some(reg) = self.global_register(symbol_id) {
+            let typ = self.expr_type(expr);
+            self.emit_register_read(reg, typ)
         }
         // Global variable - create symbol reference and load
         else {
@@ -6263,6 +6448,12 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::Trap => {
+                let insn = Instruction::new(Opcode::Trap).with_type(self.types.void_id);
+                self.emit_no_return(insn);
+                self.alloc_pseudo()
+            }
+
             ExprKind::UnwindInit => {
                 // An asm that clobbers every callee-saved register: the
                 // prologue saves each one an asm clobbers, which is all the
@@ -6300,44 +6491,25 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Setjmp { env, kind } => {
-                // setjmp(env) - saves execution context, returns int
+            ExprKind::Setjmp { env } => {
                 let env_val = self.linearize_expr(env);
                 let result = self.alloc_pseudo();
-
-                let mut insn = Instruction::new(Opcode::Setjmp)
+                let insn = Instruction::new(Opcode::Setjmp)
                     .with_target(result)
                     .with_src(env_val)
                     .with_type_and_size(self.types.int_id, 32);
-                match kind {
-                    JmpKind::Library => insn = insn.with_func(self.library_function_name("setjmp")),
-                    JmpKind::Builtin => insn.extra_mut().jmp_kind = JmpKind::Builtin,
-                }
                 self.emit(insn);
                 result
             }
 
-            ExprKind::Longjmp { env, val, kind } => {
-                // longjmp(env, val) - restores execution context (never returns)
+            // The value is the constant 1, which the parser checked, and the
+            // setjmp's receiver supplies it itself.
+            ExprKind::Longjmp { env, .. } => {
                 let env_val = self.linearize_expr(env);
                 let result = self.alloc_pseudo();
-
-                let mut insn = Instruction::new(Opcode::Longjmp);
+                let mut insn = Instruction::new(Opcode::Longjmp).with_src(env_val);
                 insn.target = Some(result);
                 insn.typ = Some(self.types.void_id);
-                match kind {
-                    JmpKind::Library => {
-                        let val_val = self.linearize_expr(val);
-                        insn = insn.with_func(self.library_function_name("longjmp"));
-                        insn.src = vec![env_val, val_val];
-                    }
-                    // The value is the constant 1, which the parser checked,
-                    // and the setjmp's receiver supplies it itself.
-                    JmpKind::Builtin => {
-                        insn.extra_mut().jmp_kind = JmpKind::Builtin;
-                        insn.src = vec![env_val];
-                    }
-                }
                 self.emit_no_return(insn);
                 result
             }
@@ -6460,7 +6632,13 @@ impl<'a> Linearizer<'a> {
         self.emit(Instruction::store(exp_val, exp_addr, 0, elem_typ, bits));
 
         // `__sync_*` is sequentially consistent and has no order argument.
-        let ok = self.emit_atomic_cas(addr, exp_addr, des_val, bits, MemoryOrder::SeqCst);
+        let ok = self.emit_atomic_cas(
+            addr,
+            exp_addr,
+            des_val,
+            (elem_typ, bits),
+            MemoryOrder::SeqCst,
+        );
 
         if !returns_old {
             return ok;
@@ -6495,6 +6673,7 @@ impl<'a> Linearizer<'a> {
 
         let ptr_type = self.expr_type(ptr);
         let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        self.refuse_atomic_in_segment(elem_type);
         let size = self.types.size_bits(elem_type);
         let result = self.alloc_pseudo();
 
@@ -6556,7 +6735,13 @@ impl<'a> Linearizer<'a> {
                 let ptr_type = self.expr_type(ptr);
                 let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
                 let elem_size = self.types.size_bits(elem_type);
-                self.emit_atomic_cas(ptr_val, expected_ptr, desired_val, elem_size, memory_order)
+                self.emit_atomic_cas(
+                    ptr_val,
+                    expected_ptr,
+                    desired_val,
+                    (elem_type, elem_size),
+                    memory_order,
+                )
             }
 
             ExprKind::GnuAtomicRmw {
@@ -7057,7 +7242,7 @@ impl<'a> Linearizer<'a> {
             // argument: gcc answers one with side effects as an unknown
             // object at once, and a computation without is dead once the
             // placeholder is answered.
-            ExprKind::ObjectSize { ptr, otype } => {
+            ExprKind::ObjectSize { ptr, otype, form } => {
                 let size_t = self.types.ulong_id;
                 if !self.is_discardable(ptr) {
                     return self.emit_const(super::objsize::size_constant(otype.unknown()), size_t);
@@ -7065,10 +7250,12 @@ impl<'a> Linearizer<'a> {
                 let operand = self.linearize_expr(ptr);
                 let result = self.alloc_reg_pseudo();
                 self.emit(
-                    Instruction::new(Opcode::ObjectSize(*otype))
-                        .with_target(result)
-                        .with_src(operand)
-                        .with_type_and_size(size_t, self.types.size_bits(size_t)),
+                    Instruction::new(Opcode::ObjectSize(super::ObjectSizeQuery::new(
+                        *otype, *form,
+                    )))
+                    .with_target(result)
+                    .with_src(operand)
+                    .with_type_and_size(size_t, self.types.size_bits(size_t)),
                 );
                 result
             }
@@ -7272,6 +7459,17 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::CompoundLiteral { .. } => self.linearize_compound_literal(expr),
 
+            // A range's value, evaluated where the first copy kept is and
+            // read again at every other.
+            ExprKind::RangeValue { id, value } => match self.range_values.get(id) {
+                Some(&evaluated) => evaluated,
+                None => {
+                    let evaluated = self.linearize_expr(value);
+                    self.range_values.insert(*id, evaluated);
+                    evaluated
+                }
+            },
+
             ExprKind::VaStart { .. }
             | ExprKind::VaArg { .. }
             | ExprKind::VaEnd { .. }
@@ -7300,11 +7498,16 @@ impl<'a> Linearizer<'a> {
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
             | ExprKind::Unreachable
+            | ExprKind::Trap
             | ExprKind::UnwindInit
             | ExprKind::FrameAddress { .. }
             | ExprKind::ReturnAddress { .. }
             | ExprKind::Setjmp { .. }
             | ExprKind::Longjmp { .. } => self.linearize_builtin(expr),
+
+            ExprKind::MachineBuiltin { op, args } => {
+                self.linearize_machine_builtin(*op, args, self.expr_type(expr))
+            }
 
             ExprKind::InlineLibraryCall {
                 func,
@@ -7391,34 +7594,51 @@ impl<'a> Linearizer<'a> {
 
 // Public API
 
+/// The command-line options that change what [`linearize`] emits.
+#[derive(Debug, Clone, Copy)]
+pub struct LinearizeOptions {
+    /// `-g`.
+    pub debug: bool,
+    /// `-ftrapping-math`, the default; see [`Linearizer::trapping_math`].
+    pub trapping_math: bool,
+    /// `-frounding-math`; see [`Linearizer::fp_rounding`].
+    pub fp_rounding: crate::float::FpRounding,
+    /// `-fexceptions`; see [`Linearizer::exceptions`].
+    pub exceptions: bool,
+    /// `-ftrivial-auto-var-init=`; see [`Linearizer::auto_var_init`].
+    pub auto_var_init: crate::target::AutoVarInit,
+}
+
+impl Default for LinearizeOptions {
+    fn default() -> Self {
+        Self {
+            debug: false,
+            trapping_math: true,
+            fp_rounding: Default::default(),
+            exceptions: false,
+            auto_var_init: Default::default(),
+        }
+    }
+}
+
 pub fn linearize(
     tu: &TranslationUnit,
     symbols: &SymbolTable,
     types: &TypeTable,
     strings: &StringTable,
     target: &Target,
-    debug: bool,
-    trapping_math: bool,
+    opts: LinearizeOptions,
 ) -> Module {
     let mut linearizer = Linearizer::new(symbols, types, strings, target);
-    linearizer.trapping_math = trapping_math;
+    linearizer.trapping_math = opts.trapping_math;
+    linearizer.fp_rounding = opts.fp_rounding;
+    linearizer.exceptions = opts.exceptions;
+    linearizer.auto_var_init = opts.auto_var_init;
     let mut module = linearizer.linearize(tu);
-    module.debug = debug;
-    // Get all source files from the stream registry (includes all #included files)
-    // The stream IDs in Position map directly to indices in this vector
-    // Filter out synthetic file names (like "<paste>", "<built-in>") which start with '<'
-    module.source_files = get_all_stream_names()
-        .into_iter()
-        .map(|name| {
-            if name.starts_with('<') {
-                // Replace synthetic names with empty string - still need placeholder
-                // to keep stream ID indices aligned with .file directive numbers
-                String::new()
-            } else {
-                name
-            }
-        })
-        .collect();
+    module.debug = opts.debug;
+    // The line table's files: every stream's, each file once, none for a
+    // synthetic stream such as `<built-in>`.
+    module.source_files = SourceFiles::from_stream_names(get_all_stream_names());
     module
 }
 

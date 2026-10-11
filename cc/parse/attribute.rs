@@ -14,6 +14,7 @@
 use super::ast::ExprKind;
 use super::parser::Parser;
 use crate::diag;
+use crate::strings::StringId;
 use crate::symbol::Namespace;
 use crate::target::ByteOrder;
 use crate::token::lexer::{payload_text, Position, TokenType};
@@ -23,6 +24,82 @@ use std::fmt;
 
 /// The `-Wno-<name>` group the unimplemented-attribute warnings belong to.
 pub(crate) const ATTRIBUTE_WARNING: &str = "attributes";
+
+/// What gcc says of an attribute only a function may carry when it is
+/// written on a declarator that declares no function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FunctionOnly {
+    /// A declaration's attribute: "'X' attribute ignored" anywhere else, a
+    /// pointer to a function included.
+    Declaration,
+    /// `const`, which a pointer to a function may carry too.
+    Const,
+    /// `malloc`, in its own words.
+    Malloc,
+    /// An attribute of a function type: "'X' attribute only applies to
+    /// function types", unless the type is a function's or a pointer to one.
+    FunctionType,
+    /// `no_instrument_function`, which gcc refuses.
+    Refused,
+}
+
+/// The attributes c17 recognises that only a function may carry, by gcc's
+/// verdict on one written anywhere else.
+const FUNCTION_ONLY: &[(&str, FunctionOnly)] = &[
+    ("access", FunctionOnly::FunctionType),
+    ("alloc_align", FunctionOnly::FunctionType),
+    ("alloc_size", FunctionOnly::FunctionType),
+    ("always_inline", FunctionOnly::Declaration),
+    ("artificial", FunctionOnly::Declaration),
+    ("assume_aligned", FunctionOnly::FunctionType),
+    ("cold", FunctionOnly::Declaration),
+    ("const", FunctionOnly::Const),
+    ("constructor", FunctionOnly::Declaration),
+    ("destructor", FunctionOnly::Declaration),
+    ("error", FunctionOnly::Declaration),
+    ("flatten", FunctionOnly::Declaration),
+    ("format", FunctionOnly::FunctionType),
+    ("format_arg", FunctionOnly::FunctionType),
+    ("function_return", FunctionOnly::Declaration),
+    ("gnu_inline", FunctionOnly::Declaration),
+    ("hot", FunctionOnly::Declaration),
+    ("indirect_branch", FunctionOnly::Declaration),
+    ("leaf", FunctionOnly::Declaration),
+    ("malloc", FunctionOnly::Malloc),
+    ("no_address_safety_analysis", FunctionOnly::Declaration),
+    ("no_caller_saved_registers", FunctionOnly::FunctionType),
+    ("no_instrument_function", FunctionOnly::Refused),
+    ("no_profile_instrument_function", FunctionOnly::Declaration),
+    ("no_sanitize", FunctionOnly::Declaration),
+    ("no_sanitize_address", FunctionOnly::Declaration),
+    ("no_sanitize_coverage", FunctionOnly::Declaration),
+    ("no_sanitize_thread", FunctionOnly::Declaration),
+    ("no_sanitize_undefined", FunctionOnly::Declaration),
+    ("no_stack_protector", FunctionOnly::Declaration),
+    ("noclone", FunctionOnly::Declaration),
+    ("noinline", FunctionOnly::Declaration),
+    ("noipa", FunctionOnly::Declaration),
+    ("nonnull", FunctionOnly::FunctionType),
+    ("optimize", FunctionOnly::Declaration),
+    ("pure", FunctionOnly::Declaration),
+    ("returns_nonnull", FunctionOnly::FunctionType),
+    ("sentinel", FunctionOnly::FunctionType),
+    ("stack_protect", FunctionOnly::Declaration),
+    ("target", FunctionOnly::Declaration),
+    ("target_clones", FunctionOnly::Declaration),
+    ("warn_unused_result", FunctionOnly::FunctionType),
+    ("warning", FunctionOnly::Declaration),
+    ("zero_call_used_regs", FunctionOnly::Refused),
+];
+
+/// gcc's verdict on the function-only attribute `name`, if it is one.
+fn function_only(name: &str) -> Option<(&'static str, FunctionOnly)> {
+    let name = name.trim_matches('_');
+    FUNCTION_ONLY
+        .binary_search_by(|(n, _)| (*n).cmp(name))
+        .ok()
+        .map(|i| FUNCTION_ONLY[i])
+}
 
 // GCC __attribute__ Support
 
@@ -60,6 +137,9 @@ enum AttrArgs {
     General,
     /// `cleanup(fn)`: exactly one argument, the name of a function.
     Cleanup,
+    /// Strings and integer constant expressions, a name among them read as
+    /// the value it names: `patchable_function_entry(N, M)`.
+    Values,
     /// An attribute c17 does not recognise, whose arguments are not read.
     Unknown,
 }
@@ -70,15 +150,15 @@ impl AttrArgs {
             "aligned" => AttrArgs::Integers(IntArgRole::Alignment),
             "vector_size" => AttrArgs::Integers(IntArgRole::VectorSize),
             "constructor" | "destructor" => AttrArgs::Integers(IntArgRole::Priority),
+            "assume_aligned" => AttrArgs::Integers(IntArgRole::AssumedAlignment),
             "alloc_size"
             | "alloc_align"
-            | "assume_aligned"
             | "warn_if_not_aligned"
             | "nonnull"
-            | "nonnull_if_nonzero"
             | "sentinel"
             | "regparm" => AttrArgs::Integers(IntArgRole::Unused),
             "cleanup" if recognised => AttrArgs::Cleanup,
+            "patchable_function_entry" if recognised => AttrArgs::Values,
             _ if recognised => AttrArgs::General,
             _ => AttrArgs::Unknown,
         }
@@ -95,6 +175,10 @@ enum IntArgRole {
     VectorSize,
     /// `constructor(P)` / `destructor(P)`: an init priority, 0 to 65535.
     Priority,
+    /// `assume_aligned(N[, M])`: a power of two, and the misalignment from
+    /// it, below it. Accepted and not acted on; a bad argument drops the
+    /// attribute with gcc's warning.
+    AssumedAlignment,
     /// `nonnull(1, 2)`, `alloc_size(1)`, `sentinel(0)`, ...: accepted and not
     /// acted on, so a bad argument drops the attribute with a warning, as gcc
     /// does.
@@ -109,6 +193,39 @@ enum IntArgFault {
     Zero,
     OutOfRange(i128),
     TooLarge(i128),
+    /// `assume_aligned`'s misalignment, not below its alignment.
+    Misalignment(i128, i128),
+}
+
+/// Why a declaration cannot take a variable's attribute -- `tls_model`,
+/// which wants a thread-local, or `uninitialized`, which wants an automatic
+/// variable -- in gcc's words for it.
+#[derive(Clone, Copy, Debug)]
+enum NotTheVariable {
+    /// A function, typedef, member or parameter.
+    NotAVariable,
+    /// An object without thread storage duration.
+    NoThreadStorage,
+    /// An object with static storage duration.
+    NotLocal,
+}
+
+impl NotTheVariable {
+    /// gcc's warning that the attribute `attr` on `name` is ignored.
+    fn warn(self, attr: &str, name: &str, pos: Position) {
+        let template = match self {
+            NotTheVariable::NotAVariable => {
+                "'{0}' attribute ignored because '{1}' is not a variable"
+            }
+            NotTheVariable::NoThreadStorage => {
+                "'{0}' attribute ignored because '{1}' does not have thread storage duration"
+            }
+            NotTheVariable::NotLocal => {
+                "'{0}' attribute ignored because '{1}' is not a local variable"
+            }
+        };
+        diag::group_warning_args(ATTRIBUTE_WARNING, pos, template, &[attr, name]);
+    }
 }
 
 /// An attribute whose arguments have already been diagnosed, and which is
@@ -160,6 +277,33 @@ impl IntArgRole {
                     &[&n.to_string()],
                 )
             }
+            (_, IntArgFault::Misalignment(m, n)) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument {1} is not in the range [0, {2}]",
+                &[name, &m.to_string(), &(n - 1).to_string()],
+            ),
+            (IntArgRole::AssumedAlignment, IntArgFault::NotConstant) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument is not an integer constant",
+                &[name],
+            ),
+            (
+                IntArgRole::AssumedAlignment,
+                IntArgFault::OutOfRange(n) | IntArgFault::TooLarge(n),
+            ) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument {1} is not a power of 2",
+                &[name, &n.to_string()],
+            ),
+            (IntArgRole::AssumedAlignment, IntArgFault::Zero) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument {1} is not a power of 2",
+                &[name, "0"],
+            ),
             (IntArgRole::Priority, _) => diag::error_args(
                 pos,
                 "{0} priorities must be integers from 0 to 65535 inclusive",
@@ -247,7 +391,7 @@ impl AttributeList {
 
     /// The calling convention this list names: `ms_abi` is Win64, and
     /// `sysv_abi` is the x86-64 default. `None` for neither -- or for both,
-    /// which [`Parser::merge_calling_conv`] reports.
+    /// which [`Parser::merge_fn_type_attrs`] reports.
     ///
     /// Read only on x86-64: anywhere else the names are not attributes, and
     /// `parse_single_attribute` has already warned that they are ignored.
@@ -372,11 +516,102 @@ impl AttributeList {
             destructor: self.destructor_priority(),
             gnu_inline: self.has_attr("gnu_inline"),
             artificial: self.has_attr("artificial"),
+            no_instrument: self.has_attr("no_instrument_function"),
             effect: self.mem_effect(),
-            align: self.get_alignment().filter(|n| n.is_power_of_two()),
+            align: self
+                .get_alignment(target.biggest_alignment())
+                .filter(|n| n.is_power_of_two()),
             noreturn: self.has_noreturn(),
+            returns_twice: self.has_attr("returns_twice"),
+            nothrow: self.has_attr("nothrow"),
             stack_protect: self.stack_protect().unwrap_or_else(|kept| kept),
+            stack_protector: self.optimize_stack_protector(),
+            branches: self.branch_attrs(),
+            shape: self.shape_attrs(),
+            flatten: self.has_attr("flatten"),
+            noipa: self.has_attr("noipa"),
+            saves_all_registers: target.arch == crate::target::Arch::X86_64
+                && self.has_attr("no_caller_saved_registers"),
+            function_only: Vec::new(),
         }
+    }
+
+    /// What `patchable_function_entry` and `zero_call_used_regs` ask, the
+    /// last of each winning; their values were checked as they were read.
+    pub fn shape_attrs(&self) -> crate::target::ShapeAttrs {
+        let mut out = crate::target::ShapeAttrs::default();
+        for attr in &self.attrs {
+            match (attr.name.trim_matches('_'), attr.args.as_slice()) {
+                ("zero_call_used_regs", [AttributeArg::String(s)]) => {
+                    out.zero_regs = crate::target::ZeroRegs::from_name(s);
+                }
+                ("patchable_function_entry", args) => {
+                    let int = |i: usize| match args.get(i) {
+                        Some(AttributeArg::Int(n)) => u32::try_from(*n).unwrap_or(0),
+                        _ => 0,
+                    };
+                    let (total, before) = (int(0), int(1));
+                    out.patchable = Some((total > 0).then_some(crate::target::PatchableEntry {
+                        total,
+                        // An `M` above `N` was warned about, and is 0.
+                        before: if before > total { 0 } else { before },
+                    }));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// What `indirect_branch` and `function_return` ask, the last of each
+    /// winning; their values were checked as they were read.
+    pub fn branch_attrs(&self) -> crate::machine::BranchAttrs {
+        let mut out = crate::machine::BranchAttrs::default();
+        for attr in &self.attrs {
+            let Some(AttributeArg::String(value)) = attr.args.first() else {
+                continue;
+            };
+            let thunk = crate::machine::Thunk::from_name(value);
+            match attr.name.trim_matches('_') {
+                "indirect_branch" => out.indirect = thunk,
+                "function_return" => out.ret = thunk,
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The stack-protector level the `optimize` attributes in this list
+    /// name, the last one winning. gcc reads each string argument as a
+    /// comma-separated list of options, an option with no leading `-` being
+    /// `-O<x>` if it starts with a digit or `O`, and `-f<option>` otherwise.
+    /// The other options are hints about how hard to optimize, which c17
+    /// takes and ignores.
+    pub fn optimize_stack_protector(&self) -> Option<crate::target::StackProtector> {
+        let mut level = None;
+        for attr in self
+            .attrs
+            .iter()
+            .filter(|a| a.name.trim_matches('_') == "optimize")
+        {
+            for arg in &attr.args {
+                let AttributeArg::String(list) = arg else {
+                    continue;
+                };
+                for option in list.split(',').map(str::trim) {
+                    let name = match option.strip_prefix("-f") {
+                        Some(name) => name,
+                        None if option.starts_with(['-', 'O']) => continue,
+                        None if option.starts_with(|c: char| c.is_ascii_digit()) => continue,
+                        None => option,
+                    };
+                    if let Some(l) = crate::target::StackProtector::from_option(name) {
+                        level = Some(l);
+                    }
+                }
+            }
+        }
+        level
     }
 
     /// What `stack_protect` and `no_stack_protector` in this list ask, in
@@ -420,6 +655,16 @@ impl AttributeList {
                 "visibility" => out.visibility = text(attr),
                 "alias" => out.alias = alias(attr, AliasForm::Alias),
                 "ifunc" => out.alias = alias(attr, AliasForm::Ifunc),
+                "uninitialized" => out.uninitialized = true,
+                "retain" => out.retain = true,
+                "error" => out.call_diagnostics.error = text(attr),
+                "warning" => out.call_diagnostics.warning = text(attr),
+                // Checked as it was read (`check_tls_model_attr`).
+                "tls_model" => {
+                    out.tls_model = text(attr).and_then(|m| crate::target::TlsModel::from_name(&m))
+                }
+                "alloc_size" => out.alloc_size = alloc_size(&attr.args),
+                "access" => out.access.extend(access_size(&attr.args)),
                 _ => {}
             }
         }
@@ -427,12 +672,15 @@ impl AttributeList {
     }
 
     /// The alignment `aligned` asks for: a power of two, since
-    /// `check_integer_args` drops any other with a diagnostic.
-    pub fn get_alignment(&self) -> Option<u32> {
+    /// `check_integer_args` drops any other with a diagnostic. With no
+    /// argument it is gcc's "largest alignment ever used for any data type
+    /// on the target machine", `__BIGGEST_ALIGNMENT__`: `biggest`, the
+    /// target's [`crate::target::Target::biggest_alignment`].
+    pub fn get_alignment(&self, biggest: u32) -> Option<u32> {
         for attr in &self.attrs {
             if attr.is_named("aligned") {
                 if attr.args.is_empty() {
-                    return Some(16); // GCC default: max useful alignment
+                    return Some(biggest);
                 }
                 if let Some(AttributeArg::Int(n)) = attr.args.first() {
                     return Some(*n as u32);
@@ -441,6 +689,50 @@ impl AttributeList {
         }
         None
     }
+}
+
+/// A parameter number an attribute names, counting from 1, as an index
+/// counting from 0.
+fn param_index(arg: &AttributeArg) -> Option<usize> {
+    match arg {
+        AttributeArg::Int(n) => usize::try_from(*n).ok()?.checked_sub(1),
+        _ => None,
+    }
+}
+
+/// `alloc_size(i)` or `alloc_size(i, j)`. Whether the parameters are
+/// integers is asked where a call is read, which knows the arguments.
+fn alloc_size(args: &[AttributeArg]) -> Option<crate::parse::ast::AllocSize> {
+    use crate::parse::ast::AllocSize;
+    match args {
+        [size] => Some(AllocSize {
+            size: param_index(size)?,
+            count: None,
+        }),
+        [size, count] => Some(AllocSize {
+            size: param_index(size)?,
+            count: Some(param_index(count)?),
+        }),
+        _ => None,
+    }
+}
+
+/// `access(mode, ref, size)`, when it names a size: the bare
+/// `access(mode, ref)` says nothing of one.
+fn access_size(args: &[AttributeArg]) -> Option<crate::parse::ast::AccessSize> {
+    let [AttributeArg::Ident(mode), ptr, size] = args else {
+        return None;
+    };
+    if !matches!(
+        mode.as_str(),
+        "read_only" | "write_only" | "read_write" | "none"
+    ) {
+        return None;
+    }
+    Some(crate::parse::ast::AccessSize {
+        ptr: param_index(ptr)?,
+        size: param_index(size)?,
+    })
 }
 
 /// What gcc's `mode` attribute makes of a machine mode name, on the target
@@ -473,8 +765,12 @@ impl MachineModeClass {
             "QI" | "byte" => MachineModeClass::Int(8),
             "HI" => MachineModeClass::Int(16),
             "SI" => MachineModeClass::Int(32),
-            "DI" | "word" | "pointer" | "unwind_word" | "libgcc_cmp_return"
-            | "libgcc_shift_count" => MachineModeClass::Int(64),
+            "DI" | "word" | "pointer" | "unwind_word" | "libgcc_shift_count" => {
+                MachineModeClass::Int(64)
+            }
+            // What libgcc's comparison routines return: a word on x86-64,
+            // and `SImode` on aarch64 (`aarch64_libgcc_cmp_return_mode`).
+            "libgcc_cmp_return" => MachineModeClass::Int(if x86 { 64 } else { 32 }),
             "TI" => MachineModeClass::Int(128),
             "HF" | "BF" | "SF" | "DF" | "TF" | "SD" | "DD" | "TD" => MachineModeClass::Float,
             "XF" if x86 => MachineModeClass::Float,
@@ -626,7 +922,9 @@ impl Parser<'_> {
         if undeclared && matches!(expr.kind, ExprKind::IntLit(0)) {
             return Err(Diagnosed);
         }
-        if let (AttrArgs::General, ExprKind::StringLit(bytes)) = (grammar, &expr.kind) {
+        if let (AttrArgs::General | AttrArgs::Values, ExprKind::StringLit(bytes)) =
+            (grammar, &expr.kind)
+        {
             return Ok(Some(AttributeArg::String(payload_text(bytes))));
         }
         match (self.eval_const_expr(&expr), grammar) {
@@ -709,6 +1007,242 @@ impl Parser<'_> {
         Ok(None)
     }
 
+    /// `indirect_branch` and `function_return` take one of the
+    /// `-mindirect-branch=` choices, as a string; anything else is dropped
+    /// with gcc's warning. `false` drops the attribute.
+    fn check_branch_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        let bare = name.trim_matches('_');
+        if !matches!(bare, "indirect_branch" | "function_return") {
+            return true;
+        }
+        let warning = match args {
+            [AttributeArg::String(s)] if crate::machine::Thunk::from_name(s).is_some() => {
+                return true
+            }
+            [AttributeArg::String(_)] => {
+                "argument to '{0}' attribute is not (keep|thunk|thunk-inline|thunk-extern)"
+            }
+            _ => "'{0}' attribute requires a string constant argument",
+        };
+        diag::group_warning_args(ATTRIBUTE_WARNING, pos, warning, &[bare]);
+        false
+    }
+
+    /// `error` and `warning` take one string, the message: any other count
+    /// is gcc's error, and an argument that is not a string drops the
+    /// attribute with gcc's warning. `false` drops the attribute.
+    fn check_call_diagnostic_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        let bare = name.trim_matches('_');
+        if !matches!(bare, "error" | "warning") {
+            return true;
+        }
+        match args {
+            [AttributeArg::String(_)] => return true,
+            [_] => {
+                diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[bare])
+            }
+            _ => Self::report_one_arg_expected(bare, args, pos),
+        }
+        false
+    }
+
+    /// `tls_model` takes one string naming one of gcc's four models; gcc
+    /// refuses anything else. `false` drops the attribute.
+    fn check_tls_model_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        if name.trim_matches('_') != "tls_model" {
+            return true;
+        }
+        match args {
+            [AttributeArg::String(s)] if crate::target::TlsModel::from_name(s).is_some() => {
+                return true
+            }
+            [AttributeArg::String(_)] => diag::error(
+                pos,
+                &gettext(
+                    "'tls_model' argument must be one of 'local-exec', 'initial-exec', \
+                     'local-dynamic', or 'global-dynamic'",
+                ),
+            ),
+            [_] => diag::error(pos, &gettext("'tls_model' argument not a string")),
+            _ => Self::report_one_arg_expected("tls_model", args, pos),
+        }
+        false
+    }
+
+    /// `zero_call_used_regs` takes one string naming one of
+    /// `-fzero-call-used-regs=`'s choices, and `patchable_function_entry`
+    /// one or two counts of nops up to 65535, the second no more than the
+    /// first: gcc's diagnostics for anything else. `false` drops the
+    /// attribute.
+    fn check_shape_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        match name.trim_matches('_') {
+            "zero_call_used_regs" => match args {
+                [AttributeArg::String(s)] if crate::target::ZeroRegs::from_name(s).is_some() => {
+                    true
+                }
+                [AttributeArg::String(s)] => {
+                    diag::error_args(
+                        pos,
+                        "unrecognized '{0}' attribute argument '{1}'",
+                        &["zero_call_used_regs", s],
+                    );
+                    false
+                }
+                [_] => {
+                    diag::error(pos, &gettext("'zero_call_used_regs' argument not a string"));
+                    false
+                }
+                _ => {
+                    Self::report_one_arg_expected("zero_call_used_regs", args, pos);
+                    false
+                }
+            },
+            "patchable_function_entry" => Self::check_patchable_entry(args, pos),
+            _ => true,
+        }
+    }
+
+    /// `patchable_function_entry(N[, M])`'s arguments, as gcc 13 checks
+    /// them; an `M` above `N` is warned about here and read as 0.
+    fn check_patchable_entry(args: &[AttributeArg], pos: Position) -> bool {
+        const NAME: &str = "patchable_function_entry";
+        if !(1..=2).contains(&args.len()) {
+            diag::error_args(
+                pos,
+                "wrong number of arguments specified for '{0}' attribute",
+                &[NAME],
+            );
+            diag::note_args(
+                pos,
+                "expected between 1 and 2, found {0}",
+                &[&args.len().to_string()],
+            );
+            return false;
+        }
+        let mut counts = Vec::with_capacity(2);
+        for arg in args {
+            let shown = match arg {
+                AttributeArg::Int(n) if (0..=65535).contains(n) => {
+                    counts.push(*n);
+                    continue;
+                }
+                AttributeArg::Int(n) if *n > 65535 => {
+                    diag::group_warning_args(
+                        ATTRIBUTE_WARNING,
+                        pos,
+                        "'{0}' attribute argument '{1}' exceeds 65535",
+                        &[NAME, &n.to_string()],
+                    );
+                    return false;
+                }
+                AttributeArg::Int(n) => n.to_string(),
+                AttributeArg::String(s) => format!("\"{s}\""),
+                AttributeArg::Ident(s) => s.clone(),
+            };
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument '{1}' is not an integer constant",
+                &[NAME, &shown],
+            );
+            return false;
+        }
+        if let [total, before] = counts[..] {
+            if before > total {
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "patchable function entry {0} exceeds size {1}",
+                    &[&before.to_string(), &total.to_string()],
+                );
+            }
+        }
+        true
+    }
+
+    /// `no_sanitize("...", ...)` names one or more sanitizers, each string a
+    /// comma-separated list of `-fsanitize=`'s names: gcc's error for no
+    /// argument or one that is not a string, and its warning -- naming the
+    /// sanitizer as if it were an attribute -- for a name it does not know.
+    /// c17 inserts no sanitizer, so a known name changes nothing. `false`
+    /// drops the attribute.
+    fn check_no_sanitize_attr(name: &str, args: &[AttributeArg], pos: Position) -> bool {
+        /// gcc 13's sanitizer names.
+        const SANITIZERS: &[&str] = &[
+            "address",
+            "alignment",
+            "all",
+            "bool",
+            "bounds",
+            "bounds-strict",
+            "builtin",
+            "enum",
+            "float-cast-overflow",
+            "float-divide-by-zero",
+            "hwaddress",
+            "integer-divide-by-zero",
+            "kernel-address",
+            "kernel-hwaddress",
+            "leak",
+            "nonnull-attribute",
+            "null",
+            "object-size",
+            "pointer-compare",
+            "pointer-overflow",
+            "pointer-subtract",
+            "return",
+            "returns-nonnull-attribute",
+            "shadow-call-stack",
+            "shift",
+            "shift-base",
+            "shift-exponent",
+            "signed-integer-overflow",
+            "thread",
+            "undefined",
+            "unreachable",
+            "vla-bound",
+            "vptr",
+        ];
+        if name.trim_matches('_') != "no_sanitize" {
+            return true;
+        }
+        if args.is_empty() {
+            diag::error_args(
+                pos,
+                "wrong number of arguments specified for '{0}' attribute",
+                &["no_sanitize"],
+            );
+            diag::note(pos, &gettext("expected 1 or more, found 0"));
+            return false;
+        }
+        for arg in args {
+            let AttributeArg::String(list) = arg else {
+                diag::error(pos, &gettext("'no_sanitize' argument not a string"));
+                return false;
+            };
+            for unknown in list.split(',').filter(|s| !SANITIZERS.contains(s)) {
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "'{0}' attribute directive ignored",
+                    &[unknown],
+                );
+            }
+        }
+        true
+    }
+
+    /// gcc's error, and its note, for an attribute that takes exactly one
+    /// argument given `args`.
+    fn report_one_arg_expected(bare: &str, args: &[AttributeArg], pos: Position) {
+        diag::error_args(
+            pos,
+            "wrong number of arguments specified for '{0}' attribute",
+            &[bare],
+        );
+        diag::note_args(pos, "expected 1, found {0}", &[&args.len().to_string()]);
+    }
+
     /// `cleanup` takes exactly one argument, in gcc's words.
     fn report_cleanup_arg_count(pos: Position) {
         diag::error_args(
@@ -753,6 +1287,9 @@ impl Parser<'_> {
         args: &[AttributeArg],
         pos: Position,
     ) -> Result<(), Diagnosed> {
+        if role == IntArgRole::AssumedAlignment {
+            return Self::check_assumed_alignment(name, args, pos);
+        }
         let value = match args {
             [] => None,
             [AttributeArg::Int(n)] => Some(*n),
@@ -787,6 +1324,50 @@ impl Parser<'_> {
             }
             None => Ok(()),
         }
+    }
+
+    /// `assume_aligned(N[, M])`: one or two integer constants, `N` a power
+    /// of two and `M` below it, as gcc checks them.
+    fn check_assumed_alignment(
+        name: &str,
+        args: &[AttributeArg],
+        pos: Position,
+    ) -> Result<(), Diagnosed> {
+        let role = IntArgRole::AssumedAlignment;
+        let fault = match args {
+            [] | [_, _, _, ..] => IntArgFault::Count,
+            [AttributeArg::Int(n), rest @ ..] => {
+                let n = *n;
+                match rest {
+                    _ if n <= 0 => IntArgFault::OutOfRange(n),
+                    _ if !(n as u128).is_power_of_two() => IntArgFault::OutOfRange(n),
+                    [] => return Ok(()),
+                    [AttributeArg::Int(m)] if (0..n).contains(m) => return Ok(()),
+                    [AttributeArg::Int(m)] => IntArgFault::Misalignment(*m, n),
+                    _ => IntArgFault::NotConstant,
+                }
+            }
+            _ => IntArgFault::NotConstant,
+        };
+        role.report(name, pos, fault);
+        Err(Diagnosed)
+    }
+
+    /// An attribute as `__builtin_has_attribute` names it, a name c17
+    /// recognises: read as `__attribute__((...))` reads one, but checked by
+    /// nothing and given to no declaration, since a query may leave out the
+    /// arguments a declaration must give.
+    pub(super) fn parse_attribute_query(&mut self) -> Option<Attribute> {
+        let name = self.get_ident_name(self.current())?;
+        self.advance();
+        let args = if self.is_special(b'(') {
+            self.advance();
+            let grammar = AttrArgs::of(&name, true);
+            self.parse_attribute_args(&name, grammar).ok()?
+        } else {
+            Vec::new()
+        };
+        Some(Attribute::with_args(name, args))
     }
 
     /// Parse a single attribute: name or name(args)
@@ -829,6 +1410,15 @@ impl Parser<'_> {
             AttrArgs::Integers(role) => self.check_integer_args(&name, role, &args, pos).ok()?,
             AttrArgs::Cleanup => self.check_cleanup_function(&args, pos).ok()?,
             _ => {}
+        }
+        if recognised
+            && !(Self::check_branch_attr(&name, &args, pos)
+                && Self::check_call_diagnostic_attr(&name, &args, pos)
+                && Self::check_tls_model_attr(&name, &args, pos)
+                && Self::check_shape_attr(&name, &args, pos)
+                && Self::check_no_sanitize_attr(&name, &args, pos))
+        {
+            return None;
         }
         let target_attr = match name.trim_matches('_') {
             "target" => Some(false),
@@ -942,7 +1532,8 @@ impl Parser<'_> {
         SpecifierAttrs {
             fn_attrs: self.pending_fn_attrs.clone(),
             symbol_attrs: self.pending_symbol_attrs.clone(),
-            calling_conv: self.pending_calling_conv,
+            written: self.pending_written_attrs.clone(),
+            fn_type: self.pending_fn_type,
         }
     }
 
@@ -951,7 +1542,8 @@ impl Parser<'_> {
     pub(super) fn begin_declarator(&mut self, spec: &SpecifierAttrs) {
         self.pending_fn_attrs = spec.fn_attrs.clone();
         self.pending_symbol_attrs = spec.symbol_attrs.clone();
-        self.pending_calling_conv = spec.calling_conv;
+        self.pending_written_attrs = spec.written.clone();
+        self.pending_fn_type = spec.fn_type;
         self.pending_declarator_align = None;
     }
 
@@ -977,11 +1569,129 @@ impl Parser<'_> {
         self.pending_symbol_attrs.merge(&symbol_attrs);
     }
 
-    /// `cleanup(fn)` on something that has no scope to leave -- a member, a
-    /// parameter -- is dropped with gcc's warning.
-    pub(super) fn drop_pending_cleanup(&mut self, pos: Position) {
-        if self.pending_symbol_attrs.cleanup.take().is_some() {
+    /// The symbol attributes pending on a member or a parameter `name`,
+    /// which names no symbol, dropped with gcc's diagnostic for each -- as
+    /// `cleanup(fn)` is, there being no scope to leave.
+    pub(super) fn drop_pending_symbol_attrs(&mut self, name: StringId, pos: Position) {
+        self.pending_written_attrs.clear();
+        let mut attrs = std::mem::take(&mut self.pending_symbol_attrs);
+        if attrs.cleanup.take().is_some() {
             Self::warn_cleanup_ignored(pos);
+        }
+        Self::drop_ifunc(&mut attrs, pos);
+        self.drop_symbol_attrs(&mut attrs, name, pos, false);
+    }
+
+    /// gcc's diagnostic for each of `weak`, `used`, `visibility`, `alias`,
+    /// `retain`, `section` and `tls_model` in `attrs`, written on `name` at
+    /// `pos`, which declares no object or function: a `typedef`, a member or
+    /// a parameter. Each is dropped. gcc says nothing of `used` on a typedef.
+    pub(super) fn drop_symbol_attrs(
+        &self,
+        attrs: &mut crate::parse::ast::SymbolAttrs,
+        name: StringId,
+        pos: Position,
+        typedef: bool,
+    ) {
+        let ignored = [
+            (std::mem::take(&mut attrs.weak), "weak"),
+            (std::mem::take(&mut attrs.used) && !typedef, "used"),
+            (attrs.visibility.take().is_some(), "visibility"),
+            (attrs.alias.take().is_some(), "alias"),
+            (std::mem::take(&mut attrs.retain), "retain"),
+        ];
+        for (_, attr) in ignored.iter().filter(|(set, _)| *set) {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[attr]);
+        }
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        if attrs.section.take().is_some() {
+            diag::error_args(pos, "section attribute not allowed for '{0}'", &[spelled]);
+        }
+        if attrs.tls_model.take().is_some() {
+            NotTheVariable::NotAVariable.warn("tls_model", spelled, pos);
+        }
+        if std::mem::take(&mut attrs.uninitialized) {
+            NotTheVariable::NotAVariable.warn("uninitialized", spelled, pos);
+        }
+    }
+
+    /// A variable's attribute on a declaration of `name` that is not the
+    /// kind of variable it wants is dropped with gcc's warning: `tls_model`
+    /// wants a thread-local, `uninitialized` an automatic variable, and a
+    /// function is no variable at all.
+    pub(super) fn check_variable_attrs(
+        &self,
+        attrs: &mut crate::parse::ast::SymbolAttrs,
+        name: StringId,
+        pos: Position,
+        is_fn: bool,
+        storage: TypeModifiers,
+        automatic: bool,
+    ) {
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        let tls = match (is_fn, storage.contains(TypeModifiers::THREAD_LOCAL)) {
+            (true, _) => Some(NotTheVariable::NotAVariable),
+            (false, false) => Some(NotTheVariable::NoThreadStorage),
+            (false, true) => None,
+        };
+        if let Some(why) = tls.filter(|_| attrs.tls_model.is_some()) {
+            attrs.tls_model = None;
+            why.warn("tls_model", spelled, pos);
+        }
+        let local = match (is_fn, automatic) {
+            (true, _) => Some(NotTheVariable::NotAVariable),
+            (false, false) => Some(NotTheVariable::NotLocal),
+            (false, true) => None,
+        };
+        if let Some(why) = local.filter(|_| attrs.uninitialized) {
+            attrs.uninitialized = false;
+            why.warn("uninitialized", spelled, pos);
+        }
+    }
+
+    /// gcc's diagnostics for the symbol attributes `attrs` on `name`, an
+    /// object or function with `linkage`, which only a name with external
+    /// linkage may carry: `weak` is an error, `visibility` is ignored, a
+    /// name with no linkage is no `alias` -- and an `automatic` object has
+    /// no symbol for `used` and `section` to act on. Each is dropped.
+    pub(super) fn check_private_symbol_attrs(
+        &self,
+        attrs: &mut crate::parse::ast::SymbolAttrs,
+        name: StringId,
+        pos: Position,
+        linkage: crate::symbol::Linkage,
+        automatic: bool,
+    ) {
+        if linkage == crate::symbol::Linkage::External {
+            return;
+        }
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        if std::mem::take(&mut attrs.weak) {
+            diag::error_args(pos, "weak declaration of '{0}' must be public", &[spelled]);
+        }
+        if attrs.visibility.take().is_some() {
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute ignored",
+                &["visibility"],
+            );
+        }
+        let ignored = [
+            (
+                linkage == crate::symbol::Linkage::None && attrs.alias.take().is_some(),
+                "alias",
+            ),
+            (automatic && std::mem::take(&mut attrs.used), "used"),
+        ];
+        for (_, attr) in ignored.iter().filter(|(set, _)| *set) {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[attr]);
+        }
+        if automatic && attrs.section.take().is_some() {
+            diag::error(
+                pos,
+                &gettext("section attribute cannot be specified for local variables"),
+            );
         }
     }
 
@@ -1020,10 +1730,11 @@ impl Parser<'_> {
     /// Shared by the two routes that can reach the mistake: on the
     /// struct-or-union specifier, and trailing after the declarator.
     pub(super) fn warn_transparent_union_ignored(&self, pos: Position) {
-        diag::group_warning(
+        diag::group_warning_args(
             ATTRIBUTE_WARNING,
             pos,
-            &gettext("'transparent_union' attribute ignored on a non-union type"),
+            "'{0}' attribute ignored",
+            &["transparent_union"],
         );
     }
 
@@ -1034,7 +1745,8 @@ impl Parser<'_> {
     /// so every path that finishes a declarator calls this rather than
     /// remembering which attributes exist.
     pub(super) fn apply_pending_type_attrs(&mut self, typ: TypeId) -> TypeId {
-        let typ = self.apply_pending_calling_conv(typ);
+        let typ = self.apply_pending_noreturn_pointer(typ);
+        let typ = self.apply_pending_fn_type_attrs(typ);
         let typ = self.apply_pending_mode(typ);
         let typ = self.apply_pending_vector_size(typ);
         if let Some(pos) = self.pending_transparent_union.take() {
@@ -1047,12 +1759,110 @@ impl Parser<'_> {
         typ
     }
 
+    /// `noreturn` on a declarator that declares no function: on a pointer to
+    /// a function it makes the function noreturn, as gcc's `volatile`
+    /// function type does, so every call through the pointer is one that
+    /// does not return. Anywhere else gcc warns and ignores it, as it does
+    /// `returns_twice` and `nothrow`, which only a function's declaration
+    /// can carry. A function declarator has consumed all three already.
+    fn apply_pending_noreturn_pointer(&mut self, typ: TypeId) -> TypeId {
+        if self.types.kind(typ) == TypeKind::Function {
+            return typ;
+        }
+        let pointee = self
+            .types
+            .base_type(typ)
+            .filter(|_| self.types.kind(typ) == TypeKind::Pointer)
+            .filter(|&f| self.types.kind(f) == TypeKind::Function);
+        let typ = match pointee {
+            Some(func) if std::mem::take(&mut self.pending_fn_attrs.noreturn) => {
+                let mut func = self.types.get(func).clone();
+                func.noreturn = true;
+                let func = self.types.intern(func);
+                let mut ptr = self.types.get(typ).clone();
+                ptr.base = Some(func);
+                self.types.intern(ptr)
+            }
+            _ => typ,
+        };
+        self.drop_fn_decl_attrs(typ);
+        typ
+    }
+
+    /// gcc's diagnostic for each attribute only a function may carry that
+    /// is still pending on a declarator of type `typ` that declares no
+    /// function -- a typedef of a function type among them -- which drops
+    /// them: `noreturn`, `returns_twice` and `nothrow`, then the rest in
+    /// the order written.
+    pub(super) fn drop_fn_decl_attrs(&mut self, typ: TypeId) {
+        let pos = self.current_pos();
+        let attrs = &mut self.pending_fn_attrs;
+        let dropped = [
+            (std::mem::take(&mut attrs.noreturn), "noreturn"),
+            (std::mem::take(&mut attrs.returns_twice), "returns_twice"),
+            (std::mem::take(&mut attrs.nothrow), "nothrow"),
+        ];
+        let written = std::mem::take(&mut attrs.function_only);
+        for (_, name) in dropped.iter().filter(|(set, _)| *set) {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[name]);
+        }
+        let points_to_function = self.types.kind(typ) == TypeKind::Pointer
+            && self
+                .types
+                .base_type(typ)
+                .is_some_and(|f| self.types.kind(f) == TypeKind::Function);
+        let function_type = points_to_function || self.types.kind(typ) == TypeKind::Function;
+        for (name, pos) in written {
+            let Some((_, verdict)) = function_only(name) else {
+                continue;
+            };
+            match verdict {
+                FunctionOnly::Declaration => {}
+                FunctionOnly::Const if points_to_function => continue,
+                FunctionOnly::Const => {}
+                FunctionOnly::FunctionType if function_type => continue,
+                FunctionOnly::FunctionType => {
+                    diag::group_warning_args(
+                        ATTRIBUTE_WARNING,
+                        pos,
+                        "'{0}' attribute only applies to function types",
+                        &[name],
+                    );
+                    continue;
+                }
+                FunctionOnly::Malloc => {
+                    diag::group_warning(
+                        ATTRIBUTE_WARNING,
+                        pos,
+                        &gettext("'malloc' attribute ignored; valid only for functions"),
+                    );
+                    continue;
+                }
+                FunctionOnly::Refused => {
+                    diag::error_args(pos, "'{0}' attribute applies only to functions", &[name]);
+                    continue;
+                }
+            }
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, "'{0}' attribute ignored", &[name]);
+        }
+    }
+
     /// Fold the function attributes `attrs` carries into those pending for
     /// the declaration being parsed. Of `stack_protect` and
     /// `no_stack_protector`, the first written wins and gcc's warning names
     /// the other -- in the same list or another.
     fn merge_fn_attrs(&mut self, attrs: &AttributeList, pos: Position) {
-        let fn_attrs = attrs.function_attrs(&self.types.target());
+        let target = self.types.target();
+        let mut fn_attrs = attrs.function_attrs(&target);
+        // An attribute this target does not have was warned about as
+        // unknown already.
+        fn_attrs.function_only = attrs
+            .attrs
+            .iter()
+            .filter(|a| crate::kw::spelling_exists_on(&a.name, target.arch))
+            .filter_map(|a| function_only(&a.name))
+            .map(|(name, _)| (name, pos))
+            .collect();
         let in_list = attrs.stack_protect().err();
         let across = self
             .pending_fn_attrs
@@ -1084,15 +1894,28 @@ impl Parser<'_> {
         );
     }
 
-    /// Hold the calling convention `attrs` names for the declarator being
-    /// parsed, refusing a second one that disagrees with it -- in the same
-    /// list or another -- as gcc does.
-    fn merge_calling_conv(&mut self, attrs: &AttributeList, pos: Position) {
+    /// Hold the function-type attributes `attrs` names for the declarator
+    /// being parsed: a calling convention, refusing a second one that
+    /// disagrees with it -- in the same list or another -- as gcc does; and
+    /// `nocf_check`, which only branch protection gives a meaning, gcc
+    /// warning that it is ignored otherwise.
+    fn merge_fn_type_attrs(&mut self, attrs: &AttributeList, pos: Position) {
+        if attrs.has_attr("nocf_check") {
+            if self.cf_branch {
+                self.pending_fn_type.nocf_check = Some(pos);
+            } else {
+                diag::group_warning(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "'nocf_check' attribute ignored. Use '-fcf-protection' option to enable it",
+                );
+            }
+        }
         if self.types.target().arch != crate::target::Arch::X86_64 {
             return;
         }
         let both = attrs.find("ms_abi").is_some() && attrs.find("sysv_abi").is_some();
-        let conflict = match (self.pending_calling_conv, attrs.calling_conv()) {
+        let conflict = match (self.pending_fn_type.conv, attrs.calling_conv()) {
             (Some((held, _)), Some(new)) => held != new,
             _ => false,
         };
@@ -1101,11 +1924,12 @@ impl Parser<'_> {
             return;
         }
         if let Some(conv) = attrs.calling_conv() {
-            self.pending_calling_conv = Some((conv, pos));
+            self.pending_fn_type.conv = Some((conv, pos));
         }
     }
 
-    /// Give the declared type the calling convention its declaration names.
+    /// Give the declared type the function-type attributes its declaration
+    /// names.
     ///
     /// gcc's placement rule for an attribute that needs a function type: a
     /// function takes it, a pointer to a function hands it to the function it
@@ -1113,48 +1937,50 @@ impl Parser<'_> {
     /// to an `ms_abi` function -- and anything else, including a pointer to
     /// such a pointer, warns and ignores it. `sysv_abi` names the default,
     /// so it changes nothing but is placed by the same rule.
-    fn apply_pending_calling_conv(&mut self, typ: TypeId) -> TypeId {
-        let Some((conv, pos)) = self.pending_calling_conv.take() else {
+    fn apply_pending_fn_type_attrs(&mut self, typ: TypeId) -> TypeId {
+        let pending = std::mem::take(&mut self.pending_fn_type);
+        if pending.conv.is_none() && pending.nocf_check.is_none() {
             return typ;
+        }
+        let func = match self.types.kind(typ) {
+            TypeKind::Function => Some(typ),
+            TypeKind::Pointer => self
+                .types
+                .base_type(typ)
+                .filter(|&b| self.types.kind(b) == TypeKind::Function),
+            _ => None,
         };
-        match self.types.kind(typ) {
-            TypeKind::Function => self.with_calling_conv(typ, conv),
-            TypeKind::Pointer
-                if self
-                    .types
-                    .base_type(typ)
-                    .is_some_and(|b| self.types.kind(b) == TypeKind::Function) =>
-            {
-                let func = self.types.base_type(typ).expect("checked above");
-                let func = self.with_calling_conv(func, conv);
-                let mut ptr = self.types.get(typ).clone();
-                ptr.base = Some(func);
-                self.types.intern(ptr)
-            }
-            _ => {
+        let Some(func) = func else {
+            let conv = pending.conv.map(|(conv, pos)| {
                 let name = match conv {
                     crate::abi::CallingConv::Win64 => "ms_abi",
                     crate::abi::CallingConv::C => "sysv_abi",
                 };
+                (name, pos)
+            });
+            let nocf = pending.nocf_check.map(|pos| ("nocf_check", pos));
+            for (name, pos) in conv.into_iter().chain(nocf) {
                 diag::group_warning_args(
                     ATTRIBUTE_WARNING,
                     pos,
                     "'{0}' attribute only applies to function types",
                     &[name],
                 );
-                typ
             }
-        }
-    }
-
-    /// The function type `func` with calling convention `conv`.
-    fn with_calling_conv(&mut self, func: TypeId, conv: crate::abi::CallingConv) -> TypeId {
-        if self.types.get(func).conv == conv {
-            return func;
-        }
+            return typ;
+        };
         let mut changed = self.types.get(func).clone();
-        changed.conv = conv;
-        self.types.intern(changed)
+        if let Some((conv, _)) = pending.conv {
+            changed.conv = conv;
+        }
+        changed.nocf_check |= pending.nocf_check.is_some();
+        let changed = self.types.intern(changed);
+        if func == typ {
+            return changed;
+        }
+        let mut ptr = self.types.get(typ).clone();
+        ptr.base = Some(changed);
+        self.types.intern(ptr)
     }
 
     /// Apply `__attribute__((vector_size(N)))` to a declared type.
@@ -1258,17 +2084,17 @@ impl Parser<'_> {
         }
         let unsigned = self.types.is_unsigned(typ);
         let t = &self.types;
-        let mapped = match mode.as_str() {
-            // Integer modes, named for their width in bytes.
-            // `byte` is a byte, and `word`, `pointer` and `unwind_word` are
-            // eight bytes on every target c17 has.
-            "QI" | "byte" => Some(if unsigned { t.uchar_id } else { t.schar_id }),
-            "HI" => Some(if unsigned { t.ushort_id } else { t.short_id }),
-            "SI" => Some(if unsigned { t.uint_id } else { t.int_id }),
-            "DI" | "word" | "pointer" | "unwind_word" => {
-                Some(if unsigned { t.ulong_id } else { t.long_id })
+        let mapped = match (class, mode.as_str()) {
+            // Integer modes, by the width `MachineModeClass::of` gives each
+            // name -- `QI` to `TI`, and gcc's aliases for the ones the target
+            // picks: `byte`, `word`, `pointer`, `unwind_word` and libgcc's.
+            (MachineModeClass::Int(8), _) => Some(if unsigned { t.uchar_id } else { t.schar_id }),
+            (MachineModeClass::Int(16), _) => Some(if unsigned { t.ushort_id } else { t.short_id }),
+            (MachineModeClass::Int(32), _) => Some(if unsigned { t.uint_id } else { t.int_id }),
+            (MachineModeClass::Int(64), _) => Some(if unsigned { t.ulong_id } else { t.long_id }),
+            (MachineModeClass::Int(128), _) => {
+                Some(if unsigned { t.uint128_id } else { t.int128_id })
             }
-            "TI" => Some(if unsigned { t.uint128_id } else { t.int128_id }),
             // Floating modes. `XF` is the x87 extended format and `TF` IEEE
             // binary128 -- both sixteen bytes on x86-64 and *not*
             // interchangeable, so they map to their own types rather than to a
@@ -1282,19 +2108,19 @@ impl Parser<'_> {
             // arm64 produced a type needing `__divtf3` and `__multf3`, which
             // that platform has no equivalent of. `has_float128` is the one
             // condition both places ask.
-            "HF" => Some(t.float16_id),
-            "SF" => Some(t.float_id),
-            "DF" => Some(t.double_id),
-            "XF" => Some(t.longdouble_id),
-            "TF" if t.has_float128() => Some(t.float128_id),
+            (_, "HF") => Some(t.float16_id),
+            (_, "SF") => Some(t.float_id),
+            (_, "DF") => Some(t.double_id),
+            (_, "XF") => Some(t.longdouble_id),
+            (_, "TF") if t.has_float128() => Some(t.float128_id),
             // Complex modes, named for the format of each half. glibc's
             // <bits/floatn.h> declares `__cfloat128` with `mode(TC)`, which was
             // 285 of the warnings a CPython build produced.
-            "HC" => Some(t.complex_float16_id),
-            "SC" => Some(t.complex_float_id),
-            "DC" => Some(t.complex_double_id),
-            "XC" => Some(t.complex_longdouble_id),
-            "TC" if t.has_float128() => Some(t.complex_float128_id),
+            (_, "HC") => Some(t.complex_float16_id),
+            (_, "SC") => Some(t.complex_float_id),
+            (_, "DC") => Some(t.complex_double_id),
+            (_, "XC") => Some(t.complex_longdouble_id),
+            (_, "TC") if t.has_float128() => Some(t.complex_float128_id),
             _ => None,
         };
         match mapped {
@@ -1302,7 +2128,10 @@ impl Parser<'_> {
                 // The declared type's qualifiers survive; only its width and
                 // family change.
                 let quals = self.types.modifiers(typ)
-                    & (TypeModifiers::CONST | TypeModifiers::VOLATILE | TypeModifiers::ATOMIC);
+                    & (TypeModifiers::CONST
+                        | TypeModifiers::VOLATILE
+                        | TypeModifiers::ATOMIC
+                        | crate::types::Type::ADDRESS_SPACES);
                 if quals.is_empty() {
                     m
                 } else {
@@ -1368,7 +2197,7 @@ impl Parser<'_> {
     /// Apply alignment from __attribute__((aligned(N))) to pending_alignas.
     /// Merges max: multiple aligned attrs → strictest wins.
     fn apply_attribute_alignment(&mut self, attrs: &AttributeList) {
-        if let Some(align) = attrs.get_alignment() {
+        if let Some(align) = attrs.get_alignment(self.types.biggest_alignment()) {
             self.raise_pending_alignas(align);
         }
     }
@@ -1398,21 +2227,6 @@ impl Parser<'_> {
             if self.is_attribute_keyword() {
                 let pos = self.current_pos();
                 let attrs = self.parse_attributes();
-                if declarator_scoped {
-                    if let Some(align) = attrs.get_alignment() {
-                        if align > 0 && align.is_power_of_two() {
-                            self.pending_declarator_align = Some(
-                                self.pending_declarator_align
-                                    .map_or(align, |a| a.max(align)),
-                            );
-                        }
-                    }
-                } else {
-                    self.apply_attribute_alignment(&attrs);
-                }
-                if attrs.has_transparent_union() {
-                    self.pending_transparent_union = Some(self.current_pos());
-                }
                 // A struct or union's order is written in its specifier; on
                 // a declaration or declarator gcc ignores it, and says so.
                 if attrs.find("scalar_storage_order").is_some() {
@@ -1423,10 +2237,7 @@ impl Parser<'_> {
                         &["scalar_storage_order"],
                     );
                 }
-                self.pending_packed |= attrs.has_packed();
-                self.merge_symbol_attrs(&attrs);
-                self.merge_calling_conv(&attrs, pos);
-                self.merge_fn_attrs(&attrs, pos);
+                self.apply_declaration_attrs(&attrs, pos, declarator_scoped);
             } else if self.is_asm_keyword() {
                 self.parse_asm_label();
             } else if self.is_nullability_qualifier() {
@@ -1435,6 +2246,39 @@ impl Parser<'_> {
                 break;
             }
         }
+    }
+
+    /// Hand an attribute list written in a declaration to the slots of the
+    /// declaration being parsed: among its specifiers, or, when
+    /// `declarator_scoped`, after one declarator (where `aligned` is that
+    /// declarator's alone).
+    pub(super) fn apply_declaration_attrs(
+        &mut self,
+        attrs: &AttributeList,
+        pos: Position,
+        declarator_scoped: bool,
+    ) {
+        if declarator_scoped {
+            if let Some(align) = attrs.get_alignment(self.types.biggest_alignment()) {
+                if align > 0 && align.is_power_of_two() {
+                    self.pending_declarator_align = Some(
+                        self.pending_declarator_align
+                            .map_or(align, |a| a.max(align)),
+                    );
+                }
+            }
+        } else {
+            self.apply_attribute_alignment(attrs);
+        }
+        if attrs.has_transparent_union() {
+            self.pending_transparent_union = Some(self.current_pos());
+        }
+        self.pending_packed |= attrs.has_packed();
+        self.pending_written_attrs
+            .extend(attrs.attrs.iter().cloned());
+        self.merge_symbol_attrs(attrs);
+        self.merge_fn_type_attrs(attrs, pos);
+        self.merge_fn_attrs(attrs, pos);
     }
 }
 
@@ -1453,7 +2297,19 @@ impl Parser<'_> {
 pub(super) struct SpecifierAttrs {
     fn_attrs: crate::parse::ast::FunctionAttrs,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
-    calling_conv: Option<(crate::abi::CallingConv, Position)>,
+    written: Vec<Attribute>,
+    fn_type: FnTypeAttrs,
+}
+
+/// The attributes of a function *type* awaiting the declarator they belong
+/// to, each with where it was written: placed by
+/// [`Parser::apply_pending_fn_type_attrs`].
+#[derive(Clone, Copy, Default)]
+pub(super) struct FnTypeAttrs {
+    /// `ms_abi` or `sysv_abi` (x86-64 only).
+    conv: Option<(crate::abi::CallingConv, Position)>,
+    /// `nocf_check`, under branch protection.
+    nocf_check: Option<Position>,
 }
 
 /// Every slot an attribute list writes for the declaration being parsed.
@@ -1476,8 +2332,9 @@ pub(super) struct PendingDeclAttrs {
     transparent_union: Option<Position>,
     packed: bool,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
+    written: Vec<Attribute>,
     fn_attrs: crate::parse::ast::FunctionAttrs,
-    calling_conv: Option<(crate::abi::CallingConv, Position)>,
+    fn_type: FnTypeAttrs,
     asm_label: Option<String>,
 }
 
@@ -1496,8 +2353,9 @@ impl Parser<'_> {
             transparent_union: take(&mut self.pending_transparent_union),
             packed: take(&mut self.pending_packed),
             symbol_attrs: take(&mut self.pending_symbol_attrs),
+            written: take(&mut self.pending_written_attrs),
             fn_attrs: take(&mut self.pending_fn_attrs),
-            calling_conv: take(&mut self.pending_calling_conv),
+            fn_type: take(&mut self.pending_fn_type),
             asm_label: take(&mut self.pending_asm_label),
         }
     }
@@ -1514,8 +2372,9 @@ impl Parser<'_> {
         self.pending_transparent_union = saved.transparent_union;
         self.pending_packed = saved.packed;
         self.pending_symbol_attrs = saved.symbol_attrs;
+        self.pending_written_attrs = saved.written;
         self.pending_fn_attrs = saved.fn_attrs;
-        self.pending_calling_conv = saved.calling_conv;
+        self.pending_fn_type = saved.fn_type;
         self.pending_asm_label = saved.asm_label;
     }
 }

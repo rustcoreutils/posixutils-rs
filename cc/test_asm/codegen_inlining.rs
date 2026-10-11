@@ -7,12 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 // Assembly cases of tests/codegen/inlining.rs, in process: which calls the
-// inliner keeps (`noinline`, `always_inline` and its stack guard, weak
+// inliner keeps (`noinline`, `always_inline` past the stack guard, weak
 // definitions), which inline spellings emit a symbol, and the TLS model of an
 // `extern` thread-local.
 //
 
-use crate::test_asm::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
+use crate::test_asm::asm_probe::{asm_for_with, frame_size, AARCH64_LINUX, X86_64_LINUX};
 
 /// `__attribute__((noinline))` is a directive, not a hint.
 ///
@@ -138,24 +138,18 @@ fn codegen_always_inline_spellings_and_conflict() {
     );
 }
 
-/// `always_inline` overrides the *desirability* heuristics, not the
-/// stack-safety guards.
+/// `always_inline` overrides c17's stack-safety guard on a recursive caller,
+/// as it overrides every other heuristic: gcc always splices it.
 ///
-/// The distinction is c17-specific and load-bearing. gcc can honour the
-/// attribute unconditionally because its frames are compact; c17 has no
-/// register promotion, so every inlined copy adds roughly eight bytes of
-/// stack, which is why `should_inline` caps growth into a recursive caller at
-/// `RECURSIVE_CALLER_MAX_STACK`. Inlining past that cap does not produce wrong
-/// code -- it exhausts the stack at a recursion depth the program's own guard
-/// thought was safe.
-///
-/// Found by the CPython gate: `test_isinstance` segfaulted in
-/// `test_infinitely_many_bases`, which recurses until it expects a
-/// `RecursionError`, once `always_inline` was allowed to bypass this check.
-/// CPython documents the same hazard in `Include/pyport.h`, noting that
-/// forcing inlining takes its per-call stack from 6 KB to 15 KB.
+/// The guard used to win, and the call it left standing was wrong twice over
+/// in the kernel: FORTIFY's `extern inline` `gnu_inline` helpers have no
+/// out-of-line copy (an undefined reference at link), and a static key's
+/// `"i"(&key)` operand is a constant only once spliced. The cost is stack:
+/// c17's copies are bigger than gcc's, which once made CPython's
+/// `test_isinstance` (`test_infinitely_many_bases`) overflow before its
+/// recursion guard fired.
 #[test]
-fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
+fn codegen_always_inline_ignores_the_recursive_stack_guard() {
     // Big enough that caller_size * 8 clears RECURSIVE_CALLER_MAX_STACK --
     // after simplification, so no statement may undo the ones before it: a
     // shift by `i % 7` alone is `s ^= s` every seventh line.
@@ -170,11 +164,45 @@ fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
 
     let asm = asm_for_with("always_inline_recursive", X86_64_LINUX, &src, &["-O2"]);
     assert!(
-        asm.lines().any(|l| l.trim().starts_with("call helper")),
-        "always_inline must not inline into a recursive caller past the \
-         stack cap; the frame growth overflows the stack at a depth the \
-         program's own recursion guard considers safe:\n{asm}"
+        !asm.lines().any(|l| l.trim().starts_with("call helper")),
+        "always_inline is spliced into a recursive caller of any size:\n{asm}"
     );
+}
+
+/// A copied body's locals end where the copy returns, as the call's frame
+/// did, so the copies of one callee share a frame slot.
+///
+/// They had no end: a function's outermost locals are ended by its return,
+/// which a copy no longer has, so each copy was live to the end of the
+/// caller. Eight copies of a 512-byte buffer took 4 KB, and liveness over
+/// blocks x copies made compile time quadratic in the calls spliced into
+/// one function -- the SSE4.1 intrinsic fixture, a few hundred
+/// `always_inline` calls in one function, took three times as long.
+#[test]
+fn codegen_inlined_locals_end_at_the_copy_s_return() {
+    let src = r#"
+static inline __attribute__((always_inline)) int fill(int x)
+{
+    volatile char buf[512];
+    buf[x & 511] = (char)x;
+    return buf[x & 511];
+}
+int many(int x)
+{
+    return fill(x) + fill(x + 1) + fill(x + 2) + fill(x + 3) + fill(x + 4)
+         + fill(x + 5) + fill(x + 6) + fill(x + 7);
+}
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        for opt in ["-O0", "-O2"] {
+            let asm = asm_for_with("inlined_locals_share", triple, src, &[opt]);
+            let frame = frame_size(&asm, "many");
+            assert!(
+                frame.is_some_and(|n| n < 1024),
+                "{triple} {opt}: the copies' buffers share one slot, frame {frame:?}:\n{asm}"
+            );
+        }
+    }
 }
 
 /// The four inline spellings differ in whether they emit an external symbol.
@@ -287,4 +315,106 @@ int call_weak_static(void) { return local_impl(); }
         !static_caller.contains("local_impl"),
         "a weak *static* cannot be interposed, so it may be inlined:\n{static_caller}"
     );
+}
+
+/// `__attribute__((noipa))`: the function is opaque to its callers, as gcc
+/// 13 makes it -- never inlined, and nothing learned from its body: a call
+/// to one that writes no memory is still a call that may write `g`, which
+/// is read again after it. The attribute was ignored with a warning, the
+/// small callee inlined and `g` forwarded across the call.
+#[test]
+fn codegen_noipa_is_opaque_to_callers() {
+    let src = r#"
+int g;
+__attribute__((noipa)) static int ident(int x) { return x; }
+static int ident2(int x) { return x; }
+__attribute__((noinline)) static int ident3(int x) { return x; }
+int user(void) { g = 1; int r = ident(2); return g + r; }
+int user2(void) { g = 1; int r = ident3(2); return g + r + ident2(3); }
+"#;
+    // Whether `text` names the symbol `g`.
+    let names_g = |text: &str| {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .any(|word| word == "g")
+    };
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("noipa", triple, src, &["-O2"]);
+        assert_eq!(callees_of(&asm, "user"), ["ident"], "{triple}:\n{asm}");
+        let user = crate::test_asm::asm_probe::body_of(&asm, "user");
+        let call = user.find("ident").unwrap();
+        assert!(names_g(&user[call..]), "{triple}: g not reloaded:\n{asm}");
+        // Without it: `ident3` is called, `ident2` inlined, and `g` known
+        // to be 1 after the call, which the inferred effect allows.
+        assert_eq!(callees_of(&asm, "user2"), ["ident3"], "{triple}:\n{asm}");
+        let user2 = crate::test_asm::asm_probe::body_of(&asm, "user2");
+        let call = user2.find("ident3").unwrap();
+        assert!(!names_g(&user2[call..]), "{triple}:\n{asm}");
+    }
+}
+
+/// The functions `name`'s body in `asm` calls, by the symbols its call
+/// instructions name.
+fn callees_of(asm: &str, name: &str) -> Vec<String> {
+    crate::test_asm::asm_probe::body_of(asm, name)
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let target = l.strip_prefix("call ").or_else(|| l.strip_prefix("bl "))?;
+            Some(target.trim_end_matches("@PLT").to_string())
+        })
+        .collect()
+}
+
+/// `__attribute__((flatten))`: when optimizing, every call in the
+/// function's body whose callee this unit defines is inlined, and so is
+/// every call in what was inlined, however large -- as gcc 13 does. A
+/// `noinline` callee, a recursive one and an external one stay calls, and
+/// the callees themselves are left as they were. At -O0 nothing is
+/// inlined, as in gcc. The attribute was ignored with a warning.
+#[test]
+fn codegen_flatten_inlines_the_whole_call_tree() {
+    let src = r#"
+int g1(int);
+static int leaf(int x) { return x * 3 + g1(x); }
+static int mid(int x) {
+    int s = 0;
+    for (int i = 0; i < x; i++)
+        s += leaf(i) + leaf(i + 1) + leaf(i + 2) + leaf(i + 3) + leaf(i + 4) + leaf(i + 5)
+           + leaf(i + 6) + leaf(i + 7) + leaf(i + 8) + leaf(i + 9) + leaf(i + 10);
+    return s;
+}
+__attribute__((noinline)) int ni(int x) { return x + 1; }
+int rec(int x) { return x ? rec(x - 1) + 1 : 0; }
+static int ping(int x);
+static int pong(int x) { return x > 0 ? ping(x - 1) : 0; }
+static int ping(int x) { return x > 0 ? pong(x - 1) + 1 : 0; }
+__attribute__((flatten)) int top(int x) { return mid(x) + mid(x + 1) + ni(x) + rec(x) + ping(x); }
+int __attribute__((__flatten__)) top2(int x);
+int top2(int x) { return mid(x); }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("flatten", triple, src, &["-O2"]);
+        let top = callees_of(&asm, "top");
+        for gone in ["mid", "leaf"] {
+            assert!(
+                !top.contains(&gone.to_string()),
+                "{triple}: {gone} in top:\n{asm}"
+            );
+        }
+        assert_eq!(
+            top.iter().filter(|c| *c == "g1").count(),
+            22,
+            "{triple}:\n{asm}"
+        );
+        for kept in ["ni", "rec"] {
+            assert!(top.contains(&kept.to_string()), "{triple}: {kept}:\n{asm}");
+        }
+        let top2 = callees_of(&asm, "top2");
+        assert!(top2.iter().all(|c| c == "g1"), "{triple}: {top2:?}\n{asm}");
+        let asm = asm_for_with("flatten_o0", triple, src, &["-O0"]);
+        assert!(
+            callees_of(&asm, "top").contains(&"mid".to_string()),
+            "{asm}"
+        );
+    }
 }

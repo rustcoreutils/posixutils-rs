@@ -15,7 +15,7 @@
 
 use crate::common::{compile_and_run, compile_and_run_aarch64_with};
 
-const CLEANUP: &str = r#"
+pub const CLEANUP: &str = r#"
 #include <stdlib.h>
 #include <string.h>
 

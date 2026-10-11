@@ -15,17 +15,20 @@ use super::linearize_emit::Controlling;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, GlobalStorage, Initializer, Instruction, Opcode, PseudoId,
 };
-use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
+use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass, AsmRegClass, PinnedGp};
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
+use crate::ir::Access;
 use crate::parse::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Label,
     LabelId, Stmt, UnaryOp,
 };
+use crate::parse::expr_check::register_address_refusal;
 use crate::symbol::SymbolId;
 use crate::token::lexer::payload_bytes;
 use crate::types::TypeTable;
+use gettextrs::gettext;
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
@@ -191,13 +194,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.reg_aggregate_return_type {
                         self.emit_reg_aggregate_return(e, ret_type);
+                    } else if self.types.kind(func_ret_type) == TypeKind::Void {
+                        // GNU C `return f();` in a void function, `f` void
+                        // too: the expression runs for its effects and the
+                        // function returns nothing. Returning the call's
+                        // result pseudo instead handed every consumer a
+                        // value that has no definition once the inliner
+                        // splices `f` (a void callee builds no return phi),
+                        // and a callee mixing such a return with a plain
+                        // one gave its inlined copy a return phi missing
+                        // the plain one's edge.
+                        self.linearize_expr(e);
+                        self.emit_return(Instruction::ret(None));
                     } else {
                         // Converted as if by assignment (C17 6.8.6.4p3).
-                        let converted_val = if self.types.kind(func_ret_type) == TypeKind::Void {
-                            self.linearize_expr(e)
-                        } else {
-                            self.linearize_converted(e, func_ret_type)
-                        };
+                        let converted_val = self.linearize_converted(e, func_ret_type);
                         let converted_val = self.outlive_cleanups(converted_val, func_ret_type, 0);
                         // Function types decay to pointers when returned
                         let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
@@ -408,6 +419,24 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // sequence for `extern _Thread_local`. A name this unit also
                 // defines is not external, so it is left alone.
                 let name = self.symbol_name(declarator.symbol).to_string();
+                // Its attributes are the symbol's, as at file scope: a
+                // visibility given here hides the reference, and a
+                // definition later in the unit inherits them.
+                if self.module.globals.iter().any(|g| g.name == name) {
+                    self.module
+                        .set_symbol_attrs(&name, declarator.symbol_attrs.clone());
+                } else if !self
+                    .module
+                    .functions
+                    .iter()
+                    .any(|f| f.name == name && f.emit)
+                {
+                    self.module
+                        .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
+                } else {
+                    self.module
+                        .add_call_diagnostics(&name, &declarator.symbol_attrs.call_diagnostics);
+                }
                 if !is_block_scope_function && !self.module.globals.iter().any(|g| g.name == name) {
                     self.module.extern_symbols.insert(name.clone());
                     self.module.extern_object_align.insert(
@@ -464,6 +493,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             // Track in linearizer's locals map using SymbolId as key
             self.insert_local(declarator.symbol, LocalVarInfo::frame(sym_id, typ));
+            if let Some(func) = &mut self.current_func {
+                func.declared_locals.push(typ);
+            }
 
             // A pointer to a variably-modified array: the extents are the
             // pointee's, and they are what one index step off the pointer
@@ -474,6 +506,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             // which is adjusted to exactly this pointer type; see
             // `linearize_function`.
             self.record_pointee_extents(declarator.symbol, declarator.typ, &declarator.vla_sizes);
+
+            if declarator.init.is_none() && !declarator.symbol_attrs.uninitialized {
+                self.auto_var_init(sym_id, 0, self.types.size_bytes(typ) as i64, typ);
+            }
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -664,6 +700,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             .with_src(total_size)
             .with_type_and_size(self.types.void_ptr_id, self.ptr_bits());
         self.emit(alloca_insn);
+        if !declarator.symbol_attrs.uninitialized {
+            self.auto_var_init_vla(alloca_result, total_size);
+        }
 
         // Create a symbol pseudo for the VLA pointer variable
         // This symbol stores the pointer to the VLA memory (like a pointer variable)
@@ -768,6 +807,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.static_local_counter
         );
         self.static_local_counter += 1;
+        if let Some(func) = &mut self.current_func {
+            func.static_locals.push(global_name.clone());
+        }
         if let Some(statics) = &mut self.clone_statics {
             statics.insert(declarator.symbol, global_name.clone());
         }
@@ -817,6 +859,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             declarator.explicit_align,
             storage,
         );
+        // Its `section`, `used` and the rest are the object's, exactly as
+        // at file scope: Linux puts its `__dyndbg` descriptors and
+        // `.data.once` flags in named sections from inside functions.
+        if declarator.symbol_attrs.section.is_some() {
+            let shown = self
+                .str(self.symbols.get(declarator.symbol).name)
+                .to_string();
+            self.record_section_definition(&global_name, declarator.pos, shown);
+        }
+        self.module
+            .set_symbol_attrs(&global_name, declarator.symbol_attrs.clone());
     }
 
     /// Linearize an initializer list for arrays or structs
@@ -990,12 +1043,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     for visit in visits {
                         let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
                         if let Some(reset) = self.init_override_reset(&mut written, &visit, held) {
-                            let volatile = self.types.contains_volatile(typ);
+                            let access = Access::of(self.types, typ);
                             self.emit_block_zero(
                                 base_sym,
                                 base_offset + reset.start as i64,
                                 (reset.end - reset.start) as i64,
-                                volatile,
+                                access,
                             );
                         }
 
@@ -1679,9 +1732,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// The body is walked as any statement is, compound or not.
     pub(crate) fn collect_switch_cases(&self, body: &Stmt, conv: CaseConv) -> (CaseSet, bool) {
         let mut case_values = CaseSet::new(conv);
-        let mut has_default = false;
-        self.collect_cases_from_stmt(body, &mut case_values, &mut has_default);
-        (case_values, has_default)
+        let mut default = None;
+        self.collect_cases_from_stmt(body, &mut case_values, &mut default);
+        (case_values, default.is_some())
     }
 
     /// The block every computed `goto` in this function branches through,
@@ -1815,6 +1868,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             let (label, _, pos) = &w.labels[i];
             let spelled = self.strings.get(label.name).to_string();
             crate::diag::error_args(*pos, "duplicate label '{0}'", &[&spelled]);
+            // gcc gives a label the type `void` in its note.
+            if let Some(&first) = first_label.get(label) {
+                crate::diag::note_args(
+                    w.labels[first].2,
+                    "previous definition of '{0}' with type 'void'",
+                    &[&spelled],
+                );
+            }
         }
 
         // A `goto` is illegal exactly when its label sits inside a scope the
@@ -1825,14 +1886,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             let Some(&i) = first_label.get(&jump.label) else {
                 continue;
             };
-            let (_, to, label_pos) = &w.labels[i];
+            let (label, to, label_pos) = &w.labels[i];
             let pos = jump.pos.unwrap_or(*label_pos);
             for id in w.entered(&jump.from, to) {
-                self.report_protected_jump(&w.scopes[id], false, pos);
+                let label = Some((label.name, *label_pos));
+                self.report_protected_jump(&w.scopes[id], label, pos);
             }
         }
         for (id, pos) in w.bad_cases() {
-            self.report_protected_jump(&w.scopes[id], true, pos);
+            self.report_protected_jump(&w.scopes[id], None, pos);
         }
 
         for (pos, what) in &w.stray_jumps {
@@ -1853,18 +1915,33 @@ impl<'a> super::linearize::Linearizer<'a> {
         LabelScopes { written, cleanups }
     }
 
-    /// Report a jump into `scope`, by a `switch` reaching a label inside it
-    /// or by a `goto`.
-    fn report_protected_jump(&self, scope: &JumpScope, by_switch: bool, pos: Position) {
+    /// Report a jump into `scope`, by a `goto` to `label` (its name and
+    /// where it is written) or, with none, by a `switch` reaching a label
+    /// inside it.
+    fn report_protected_jump(
+        &self,
+        scope: &JumpScope,
+        label: Option<(crate::strings::StringId, Position)>,
+        pos: Position,
+    ) {
+        let by_switch = label.is_none();
         match scope {
             JumpScope::VariablyModified(symbol) => {
-                let what = if by_switch { "switch jump" } else { "jump" };
-                let name = self.strings.get(self.symbols.get(*symbol).name);
-                error(
-                    pos,
-                    &format!(
-                        "{what} into the scope of '{name}', which has a variably modified type",
-                    ),
+                let message = if by_switch {
+                    "switch jumps into scope of identifier with variably modified type"
+                } else {
+                    "jump into scope of identifier with variably modified type"
+                };
+                error(pos, &gettext(message));
+                if let Some((name, at)) = label {
+                    let spelled = self.strings.get(name);
+                    crate::diag::note_args(at, "label '{0}' defined here", &[spelled]);
+                }
+                let symbol = self.symbols.get(*symbol);
+                crate::diag::note_args(
+                    symbol.declared.pos,
+                    "'{0}' declared here",
+                    &[self.strings.get(symbol.name)],
                 );
             }
             // Entering one is legal: gcc accepts it in silence, and the
@@ -1995,36 +2072,38 @@ impl<'a> super::linearize::Linearizer<'a> {
             crate::diag::warning(expr.pos, "empty range specified");
             return;
         }
-        if let Some((lo2, hi2)) = case_values.overlap(lo, hi) {
-            let what = if lo == hi && lo2 == hi2 {
-                format!("duplicate case value '{}' in switch", lo)
-            } else {
-                format!(
-                    "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
-                    lo, hi, lo2, hi2
-                )
+        // gcc's words depend on whether the label just written is a range.
+        if let Some((lo2, _)) = case_values.overlap(lo, hi) {
+            let (what, earlier) = match high {
+                Some(_) => (
+                    "duplicate (or overlapping) case value",
+                    "this is the first entry overlapping that value",
+                ),
+                None => ("duplicate case value", "previously used here"),
             };
-            error(expr.pos, &what);
+            error(expr.pos, &gettext(what));
+            crate::diag::note(case_values.written_at(lo2), &gettext(earlier));
         }
-        case_values.insert(lo, hi);
+        case_values.insert(lo, hi, expr.pos);
     }
 
-    fn collect_default_label(&self, has_default: &mut bool) {
-        // C99 6.8.4.2p3: at most one default label per switch.
-        if *has_default {
-            error(
-                self.current_pos.unwrap_or_default(),
-                "multiple default labels in one switch",
-            );
+    /// C99 6.8.4.2p3: at most one default label per switch. `first` is
+    /// where the first one was written.
+    fn collect_default_label(&self, pos: Position, first: &mut Option<Position>) {
+        match *first {
+            Some(earlier) => {
+                error(pos, &gettext("multiple default labels in one switch"));
+                crate::diag::note(earlier, &gettext("this is the first default label"));
+            }
+            None => *first = Some(pos),
         }
-        *has_default = true;
     }
 
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
         case_values: &mut CaseSet,
-        has_default: &mut bool,
+        has_default: &mut Option<Position>,
     ) {
         match stmt {
             Stmt::Labeled { labels, stmt } => {
@@ -2033,7 +2112,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         Label::Case(expr, high) => {
                             self.collect_case_label(expr, high.as_ref(), case_values)
                         }
-                        Label::Default(_) => self.collect_default_label(has_default),
+                        Label::Default(pos) => self.collect_default_label(*pos, has_default),
                         Label::Named { .. } => {}
                     }
                 }
@@ -2153,8 +2232,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         if matches!(tail, StringTail::Zero) {
             let start = base_offset + (written as i64) * elem_bytes;
             let bytes = (capacity - written) as i64 * elem_bytes;
-            let volatile = self.types.contains_volatile(arr_typ);
-            self.emit_block_zero(base_sym, start, bytes, volatile);
+            let access = Access::of(self.types, arr_typ);
+            self.emit_block_zero(base_sym, start, bytes, access);
         }
     }
 
@@ -2669,16 +2748,198 @@ impl<'a> super::linearize::Linearizer<'a> {
                 Ok(class) => asm_operand_misuse(&class, is_output, outputs.len())
                     .map_or(Ok(class), |why| Err(why.to_string())),
             };
-            reason.unwrap_or_else(|msg| {
-                error(op.expr.pos, &msg);
+            let plain = || {
                 let plain = if is_output { "=r" } else { "r" };
                 AsmOperandClass::parse(plain, self.target.arch).expect("a register class")
-            })
+            };
+            match reason {
+                Err(msg) => {
+                    error(op.expr.pos, &msg);
+                    plain()
+                }
+                // A memory operand is its object's address, which a
+                // `register` object has none of.
+                Ok(class) if class.is_memory_only() => {
+                    match register_address_refusal(self.types, self.symbols, &op.expr) {
+                        Some((sym, msg)) => {
+                            let name = self.str(self.symbols.get(sym).name);
+                            crate::diag::error_args(op.expr.pos, msg, &[name]);
+                            plain()
+                        }
+                        None => class,
+                    }
+                }
+                Ok(class) => class,
+            }
         };
         (
             outputs.iter().map(|op| classify(op, true)).collect(),
             inputs.iter().map(|op| classify(op, false)).collect(),
         )
+    }
+
+    /// Report a matching constraint gcc refuses: one naming an output that
+    /// another input is already tied to, a `"+"` output -- whose own hidden
+    /// input it would replace -- a memory output, which has no register to
+    /// share, or a flag output, which is no operand an input can be. Each
+    /// output is one operand, read once -- but a second tie reading the same
+    /// non-volatile frame local as the first is that one value again, which
+    /// gcc accepts at every level. Such a repeat is marked in the answer, and
+    /// puts nothing more in the output's register.
+    ///
+    /// A refused tie is then dropped, leaving the input an operand of its
+    /// own, so the statement is still linearized whole; the error stops the
+    /// compilation. Kept, a second tie wrote its value over the first's in
+    /// the output's pseudo, which then had two definitions.
+    fn check_matching_constraints(
+        &self,
+        inputs: &[AsmOperand],
+        output_classes: &[AsmOperandClass],
+        input_classes: &mut [AsmOperandClass],
+    ) -> Vec<bool> {
+        let mut first_tie: Vec<Option<&Expr>> = vec![None; output_classes.len()];
+        let mut repeats = vec![false; inputs.len()];
+        for (i, (op, class)) in inputs.iter().zip(input_classes).enumerate() {
+            let Some(out) = class.tied.filter(|&i| i < output_classes.len()) else {
+                continue;
+            };
+            let target = &output_classes[out];
+            let why = if target.flag.is_some() {
+                // The input takes the output's constraint, and `@` cannot
+                // begin an input's.
+                Some("invalid punctuation '@' in constraint")
+            } else if let Some(first) = first_tie[out] {
+                repeats[i] = self.same_local_value(first, &op.expr);
+                (!repeats[i]).then_some("inconsistent operand constraints in an 'asm'")
+            } else if target.access == AsmAccess::ReadWrite || target.is_memory_only() {
+                Some("inconsistent operand constraints in an 'asm'")
+            } else {
+                None
+            };
+            first_tie[out].get_or_insert(&op.expr);
+            if let Some(why) = why {
+                error(op.expr.pos, why);
+                class.tied = None;
+                class.reg = Some(AsmRegClass::General);
+            }
+        }
+        repeats
+    }
+
+    /// Whether `a` and `b` read one value: both name the same non-volatile
+    /// object in this function's frame, which nothing between two operands
+    /// of one statement can change.
+    fn same_local_value(&self, a: &Expr, b: &Expr) -> bool {
+        let (ExprKind::Ident(x), ExprKind::Ident(y)) = (&a.kind, &b.kind) else {
+            return false;
+        };
+        let in_frame = matches!(
+            self.locals.get(x).map(|local| &local.binding),
+            Some(LocalBinding::Frame { .. })
+        );
+        let volatile = self
+            .types
+            .modifiers(self.symbols.get(*x).typ)
+            .contains(TypeModifiers::VOLATILE);
+        x == y && in_frame && !volatile
+    }
+
+    /// Pin each operand that is a register variable to its register, when
+    /// its class offers a general one -- gcc's one documented guarantee for a
+    /// local register variable, and what glibc's syscall wrappers stand on:
+    /// `register long _a4 asm("r10") = arg4;` then `"r"(_a4)`.
+    ///
+    /// Decided here, from the operand expression, and carried in the
+    /// operand's class: by the time the optimizer has promoted the variable,
+    /// substituted its value and inlined the function, nothing else could
+    /// tell which value was the variable.
+    ///
+    /// The register cannot also be a clobber, which the template may write
+    /// before it reads the operand. gcc refuses the same.
+    fn pin_register_variables(
+        &self,
+        ops: &[AsmOperand],
+        classes: &mut [AsmOperandClass],
+        clobbers: &[String],
+    ) {
+        for (op, class) in ops.iter().zip(classes) {
+            let ExprKind::Ident(sym) = op.expr.kind else {
+                continue;
+            };
+            let Some(reg) = self.symbols.get(sym).hard_register else {
+                continue;
+            };
+            let pinned = class.pinned_to(reg);
+            if pinned.reg == class.reg {
+                continue;
+            }
+            *class = pinned;
+            let arch = self.target.arch;
+            if clobbers
+                .iter()
+                .any(|c| PinnedGp::named(c, arch) == Some(reg))
+            {
+                crate::diag::error_args(
+                    op.expr.pos,
+                    "'asm' specifier for variable '{0}' conflicts with 'asm' clobber list",
+                    &[self.str(self.symbols.get(sym).name)],
+                );
+            }
+        }
+    }
+
+    /// The value in the register a file-scope register variable is, read by
+    /// an empty asm whose one output is pinned there -- for Linux's
+    /// `current_stack_pointer` on x86-64, a `mov %rsp, ...`.
+    pub(crate) fn emit_register_read(&mut self, reg: PinnedGp, typ: TypeId) -> PseudoId {
+        let pseudo = self.alloc_reg_pseudo();
+        let output = self.register_operand(pseudo, reg, AsmAccess::Write, typ);
+        self.emit(Instruction::asm(AsmData {
+            template: String::new(),
+            outputs: vec![output],
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        pseudo
+    }
+
+    /// Store `val` into the register a file-scope register variable is: an
+    /// empty asm whose one input is pinned there.
+    pub(crate) fn emit_register_write(&mut self, reg: PinnedGp, val: PseudoId, typ: TypeId) {
+        let input = self.register_operand(val, reg, AsmAccess::Read, typ);
+        self.emit(Instruction::asm(AsmData {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: vec![input],
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+    }
+
+    /// An asm operand of type `typ` in `reg` and nowhere else.
+    fn register_operand(
+        &self,
+        pseudo: PseudoId,
+        reg: PinnedGp,
+        access: AsmAccess,
+        typ: TypeId,
+    ) -> AsmConstraint {
+        AsmConstraint {
+            pseudo,
+            name: None,
+            matching_output: None,
+            constraint: if access == AsmAccess::Read { "r" } else { "=r" }.to_string(),
+            class: AsmOperandClass::in_register(reg, access),
+            size: self.types.size_bits(typ),
+            offset: 0,
+            addr_space: crate::types::AddressSpace::Generic,
+        }
+    }
+
+    /// The register a file-scope register variable `sym` is, if it is one.
+    pub(crate) fn global_register(&self, sym: SymbolId) -> Option<PinnedGp> {
+        self.symbols.get(sym).global_register()
     }
 
     /// An immediate-only operand that is a constant expression, as the
@@ -2736,7 +2997,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Bare `+r` with no tied input must still load the lvalue's
         // current value (only producer of the initial register contents),
         // so the load is gated on whether any input matches this output.
-        let (output_classes, input_classes) = self.asm_operand_classes(outputs, inputs);
+        let (mut output_classes, mut input_classes) = self.asm_operand_classes(outputs, inputs);
+        self.pin_register_variables(outputs, &mut output_classes, clobbers);
+        self.pin_register_variables(inputs, &mut input_classes, clobbers);
+        let repeated_ties =
+            self.check_matching_constraints(inputs, &output_classes, &mut input_classes);
         let tied_inputs: Vec<bool> = {
             let mut out_has_tied_input = vec![false; outputs.len()];
             for class in &input_classes {
@@ -2785,6 +3050,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     None => self.linearize_lvalue(&op.expr),
                 };
                 let (addr, offset) = self.asm_memory_operand(addr);
+                let space = self.types.address_space(self.expr_type(&op.expr));
                 output_places.push(place);
 
                 if is_readwrite {
@@ -2798,6 +3064,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         class,
                         size,
                         offset,
+                        addr_space: space,
                     });
                 }
 
@@ -2809,10 +3076,27 @@ impl<'a> super::linearize::Linearizer<'a> {
                     class,
                     size,
                     offset,
+                    addr_space: space,
                 });
 
                 skip_post_handling.push(true);
                 continue;
+            }
+
+            // A flag output is written 0 or 1 at its own width, which has to
+            // be an integer's: gcc takes any integer or pointer object.
+            let flag_type = (self.types.is_integer(typ) && !self.types.is_complex(typ))
+                || self.types.kind(typ) == TypeKind::Pointer;
+            if class.flag.is_some() && !(flag_type && size <= 64) {
+                error(op.expr.pos, "invalid type for 'asm' flag output");
+            }
+            // The flags are read once the template has run, on the
+            // fall-through; a jump to a label would leave the output unset.
+            if class.flag.is_some() && !goto_labels.is_empty() {
+                error(
+                    op.expr.pos,
+                    "flag outputs are not supported in an 'asm goto' statement",
+                );
             }
 
             // Non-memory output (register or value class): allocate a
@@ -2850,6 +3134,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     class,
                     size,
                     offset: 0,
+                    addr_space: crate::types::AddressSpace::Generic,
                 });
             }
 
@@ -2861,6 +3146,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 class,
                 size,
                 offset: 0,
+                addr_space: crate::types::AddressSpace::Generic,
             });
 
             skip_post_handling.push(false);
@@ -2868,7 +3154,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
 
         // Process input operands
-        for (op, &class) in inputs.iter().zip(&input_classes) {
+        for ((op, &class), &repeated_tie) in inputs.iter().zip(&input_classes).zip(&repeated_ties) {
             let is_memory = class.is_memory_only();
             let matching = class.tied;
 
@@ -2895,8 +3181,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             // For matching constraints (like "0"), we need to load the input value
             // into the matched output's pseudo so they use the same register
             let mut memory_offset = 0;
+            let mut memory_space = crate::types::AddressSpace::Generic;
             let pseudo = if let Some(match_idx) = matching {
-                if match_idx < ir_outputs.len() {
+                if repeated_tie {
+                    // The value an earlier tie already put there.
+                    ir_outputs[match_idx].pseudo
+                } else if match_idx < ir_outputs.len() {
                     // Use the matched output's pseudo
                     let out_pseudo = ir_outputs[match_idx].pseudo;
                     // Load the input value into the output's pseudo
@@ -2919,6 +3209,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let addr = self.linearize_lvalue(&op.expr);
                 let (pseudo, offset) = self.asm_memory_operand(addr);
                 memory_offset = offset;
+                memory_space = self.types.address_space(declared);
                 pseudo
             } else if let Some(k) = self.asm_constant_operand(&op.expr, typ, &class) {
                 k
@@ -2935,6 +3226,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 class,
                 size,
                 offset: memory_offset,
+                addr_space: memory_space,
             });
         }
 
@@ -3812,6 +4104,10 @@ impl JumpScopeWalk {
 /// [`crate::constexpr`] owns the walk; what differs from the parser's half is
 /// the `const`-object folding gcc performs in a static initializer.
 impl crate::constexpr::ConstEnv for Linearizer<'_> {
+    fn fp_rounding(&self) -> crate::float::FpRounding {
+        self.fp_rounding
+    }
+
     /// A static initializer needs an answer; the linearizer's other folds --
     /// a constant `?:` condition, chiefly -- are optimizations, and one of
     /// those is exactly the shape `__builtin_constant_p` is written in.
@@ -3869,7 +4165,7 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
 /// words, or `None` when it can.
 ///
 /// An output must be written (`=` or `+`) and be somewhere a value can be
-/// written: a register or memory, never only a constant. An input is only
+/// written: a register, memory or a flag, never only a constant. An input is only
 /// read, so `=`, `+` and `&` make no sense there, and a matching constraint
 /// must name an output that exists.
 fn asm_operand_misuse(
@@ -3882,7 +4178,7 @@ fn asm_operand_misuse(
             Some("output operand constraint lacks '='")
         } else if class.tied.is_some() {
             Some("matching constraint not valid in output operand")
-        } else if class.reg.is_none() && class.mem.is_none() {
+        } else if class.reg.is_none() && class.mem.is_none() && class.flag.is_none() {
             Some("impossible constraint in 'asm'")
         } else {
             None
@@ -4042,7 +4338,8 @@ pub(crate) struct CaseSet {
     /// the labels were written.
     ranges: Vec<(i128, i128)>,
     /// Each range by its low end, as an order-preserving key, to its high end.
-    by_lo: std::collections::BTreeMap<i128, (i128, i128, i128)>,
+    /// And where it was written, for the note on a duplicate.
+    by_lo: std::collections::BTreeMap<i128, (i128, i128, i128, Position)>,
     /// What every endpoint entering the set is converted by.
     conv: CaseConv,
 }
@@ -4076,27 +4373,46 @@ impl CaseSet {
         }
     }
 
-    /// An earlier range sharing a value with `lo..=hi`, if any, as converted.
+    /// The lowest earlier range sharing a value with `lo..=hi`, if any, as
+    /// converted: the one gcc's note calls the first entry overlapping it.
     ///
-    /// The ranges recorded are disjoint -- an overlap is an error -- so the
-    /// only candidate is the one starting last at or before `hi`.
+    /// The ranges recorded are disjoint -- an overlap is an error -- so it is
+    /// the one holding `lo`, or else the first starting after `lo` but at
+    /// or before `hi`.
     fn overlap(&self, lo: i128, hi: i128) -> Option<(i128, i128)> {
         let (lo, hi) = (self.conv.convert(lo), self.conv.convert(hi));
-        let (_, &(hi_key, lo2, hi2)) = self.by_lo.range(..=self.key(hi)).next_back()?;
-        (hi_key >= self.key(lo)).then_some((lo2, hi2))
+        let (lo_key, hi_key) = (self.key(lo), self.key(hi));
+        if let Some((_, &(end, lo2, hi2, _))) = self.by_lo.range(..=lo_key).next_back() {
+            if end >= lo_key {
+                return Some((lo2, hi2));
+            }
+        }
+        let (_, &(_, lo2, hi2, _)) = self.by_lo.range(lo_key..=hi_key).next()?;
+        Some((lo2, hi2))
     }
 
-    fn insert(&mut self, lo: i128, hi: i128) {
+    fn insert(&mut self, lo: i128, hi: i128, pos: Position) {
         let (lo, hi) = (self.conv.convert(lo), self.conv.convert(hi));
         self.ranges.push((lo, hi));
         let (lo_key, hi_key) = (self.key(lo), self.key(hi));
-        self.by_lo.insert(lo_key, (hi_key, lo, hi));
+        // A duplicate, already reported, leaves the first in place, which
+        // is the one a later duplicate's note names.
+        self.by_lo.entry(lo_key).or_insert((hi_key, lo, hi, pos));
+    }
+
+    /// Where the range starting at `lo`, as [`Self::overlap`] answers it,
+    /// was written.
+    fn written_at(&self, lo: i128) -> Position {
+        self.by_lo
+            .get(&self.key(lo))
+            .map_or_else(Position::default, |&(.., pos)| pos)
     }
 }
 
 #[cfg(test)]
 mod case_set_tests {
     use super::{CaseConv, CaseIndex, CaseSet};
+    use crate::diag::Position;
 
     /// A 128-bit conversion is the identity, which is what the ranges below
     /// want: they are about ordering, not about width.
@@ -4178,11 +4494,11 @@ mod case_set_tests {
     fn the_index_finds_a_label_by_its_unconverted_constant() {
         let conv = CaseConv::new(32, false);
         let mut set = CaseSet::new(conv);
-        set.insert(0, 0);
-        set.insert(-1, -1);
-        set.insert(70000, 70005);
+        set.insert(0, 0, Position::default());
+        set.insert(-1, -1, Position::default());
+        set.insert(70000, 70005, Position::default());
         // Stored converted, and 2^32+3 is 3 in an `int` switch.
-        set.insert(4294967299, 4294967299);
+        set.insert(4294967299, 4294967299, Position::default());
         assert_eq!(set.ranges(), [(0, 0), (-1, -1), (70000, 70005), (3, 3)]);
 
         let index = CaseIndex::of(&set);
@@ -4197,7 +4513,7 @@ mod case_set_tests {
         // And a label the controlling type sees as negative.
         let uconv = CaseConv::new(32, true);
         let mut uset = CaseSet::new(uconv);
-        uset.insert(-1, -1);
+        uset.insert(-1, -1, Position::default());
         assert_eq!(uset.ranges(), [(4294967295, 4294967295)]);
         let uindex = CaseIndex::of(&uset);
         assert_eq!(uindex.lookup(-1, -1), Some(0));
@@ -4209,7 +4525,7 @@ mod case_set_tests {
     #[test]
     fn overlap_sees_the_converted_values() {
         let mut set = CaseSet::new(CaseConv::new(32, false));
-        set.insert(0, 0);
+        set.insert(0, 0, Position::default());
         assert_eq!(set.overlap(4294967296, 4294967296), Some((0, 0)));
         assert_eq!(set.overlap(1, 1), None);
     }
@@ -4217,9 +4533,9 @@ mod case_set_tests {
     #[test]
     fn overlap_finds_the_range_sharing_a_value() {
         let mut set = CaseSet::new(wide(false));
-        set.insert(-10, -5);
-        set.insert(0, 0);
-        set.insert(10, 20);
+        set.insert(-10, -5, Position::default());
+        set.insert(0, 0, Position::default());
+        set.insert(10, 20, Position::default());
         assert_eq!(set.overlap(-7, -7), Some((-10, -5)));
         assert_eq!(set.overlap(-4, -1), None);
         assert_eq!(set.overlap(-1, 1), Some((0, 0)));
@@ -4230,6 +4546,25 @@ mod case_set_tests {
         assert_eq!(set.ranges, [(-10, -5), (0, 0), (10, 20)]);
     }
 
+    /// A range overlapping several earlier labels answers the lowest -- gcc's
+    /// "first entry overlapping that value" -- and a duplicate, once
+    /// reported, leaves the first label's place for the next one's note.
+    #[test]
+    fn overlap_answers_the_first_entry() {
+        let at = |line| Position::new(0, line, 1);
+        let mut set = CaseSet::new(wide(false));
+        set.insert(1, 1, at(1));
+        set.insert(2, 2, at(2));
+        set.insert(5, 9, at(3));
+        assert_eq!(set.overlap(0, 2), Some((1, 1)));
+        assert_eq!(set.overlap(2, 6), Some((2, 2)));
+        assert_eq!(set.overlap(3, 7), Some((5, 9)));
+        assert_eq!(set.overlap(7, 7), Some((5, 9)));
+        set.insert(1, 1, at(4));
+        assert_eq!(set.written_at(1), at(1));
+        assert_eq!(set.ranges().len(), 4);
+    }
+
     /// Unsigned order: a value above `i64::MAX`, carried in an `i128` as a
     /// negative 128-bit pattern for `unsigned __int128`, still sorts above
     /// every small one.
@@ -4237,8 +4572,8 @@ mod case_set_tests {
     fn overlap_orders_by_the_switch_type_signedness() {
         let big = u128::MAX as i128; // -1 as i128, the largest unsigned value
         let mut set = CaseSet::new(wide(true));
-        set.insert(1, 5);
-        set.insert(big - 10, big);
+        set.insert(1, 5, Position::default());
+        set.insert(big - 10, big, Position::default());
         assert_eq!(set.overlap(big - 3, big - 3), Some((big - 10, big)));
         assert_eq!(set.overlap(6, 100), None);
         assert_eq!(set.overlap(0, 1), Some((1, 5)));

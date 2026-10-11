@@ -8,8 +8,9 @@
 //
 // `__attribute__((target("...")))` and `target_clones(...)`: one function
 // compiled for an ISA above the translation unit's, the way runtime CPU
-// dispatch is written (zlib-ng, xxhash, pixman). c17's ceiling is SSE4.2;
-// anything above it is warned about and compiled at the unit's ISA.
+// dispatch is written (zlib-ng, xxhash, pixman). Every extension gcc names
+// is the function's, as the `-m` option of its name is the unit's; c17's
+// vector code stops at SSE4.2, and `fma` is the instruction under FMA.
 //
 
 use super::asm_probe::{asm_for, asm_for_with, assert_body_contains, assert_body_lacks};
@@ -78,16 +79,26 @@ fn target_attr_spellings_are_recognised() {
     assert!(!c.stderr.contains("ignored"), "{}", c.stderr);
 }
 
-/// An ISA above c17's SSE4.2 ceiling is ignored without a word, and the
-/// function is compiled at the unit's ISA rather than refused.
+/// An ISA above SSE4.2 is the function's without a word, as in gcc: under
+/// `target("fma")` -- or `avx512f`, which has the instruction too -- `fma`
+/// is `vfmadd`, where the unit's own functions call the library.
 #[test]
-fn target_attr_beyond_the_ceiling_compiles_silently() {
-    let src = "__attribute__((target(\"avx2\"))) int f(int x) { return x + 1; }\n";
+fn target_attr_above_sse42_is_the_functions() {
+    let src = "__attribute__((target(\"avx2\"))) int f(int x) { return x + 1; }\n\
+               __attribute__((target(\"fma\"))) double g(double a, double b, double c)\n\
+               { return __builtin_fma(a, b, c); }\n\
+               __attribute__((target(\"avx512f\"))) double h(double a, double b, double c)\n\
+               { return __builtin_fma(a, b, c); }\n\
+               double k(double a, double b, double c) { return __builtin_fma(a, b, c); }\n";
     let c = compile("target_avx2", src, &["--target=x86_64-unknown-linux-gnu"]);
     assert!(c.success, "{}", c.stderr);
     // Recognised and judged, not skipped as an unknown attribute.
     assert!(c.stderr.is_empty(), "{}", c.stderr);
-    assert!(c.asm.is_some());
+    let asm = asm_for_with("target_fma", X86_64_LINUX, src, &["-O2"]);
+    assert_body_contains(&asm, "g", "vfmadd", "target(\"fma\") has FMA");
+    assert_body_contains(&asm, "h", "vfmadd", "AVX512F has FMA's instructions");
+    assert_body_lacks(&asm, "k", "vfmadd", "the unit has no FMA");
+    assert_body_contains(&asm, "k", "fma", "the unit calls the library");
 }
 
 /// `target_clones` builds one copy per supported ISA plus `default`, named

@@ -428,3 +428,117 @@ fn libm_min_max_fma_of_constants() {
         "initializer element is not constant",
     );
 }
+
+const LRINT_SRC: &str = "long lrint(double); long lrintf(float);\n\
+                         long long llrint(double); long long llrintf(float);\n\
+                         long lround(double); long lroundf(float);\n\
+                         long long llround(double); long long llroundf(float);\n\
+                         long r1(double x) { return lrint(x); }\n\
+                         long r2(float x) { return lrintf(x); }\n\
+                         long long r3(double x) { return llrint(x); }\n\
+                         long long r4(float x) { return llrintf(x); }\n\
+                         int r5(double x) { return (int)__builtin_lrint(x); }\n\
+                         long n1(double x) { return lround(x); }\n\
+                         long n2(float x) { return lroundf(x); }\n\
+                         long long n3(double x) { return llround(x); }\n\
+                         long long n4(float x) { return llroundf(x); }\n";
+
+/// The body of `func` in `asm`, from its label to its `.size`.
+fn fn_body<'a>(asm: &'a str, func: &str) -> &'a str {
+    let label = format!("\n{func}:\n");
+    let start = asm
+        .find(&label)
+        .unwrap_or_else(|| panic!("no {func}:\n{asm}"));
+    let rest = &asm[start + label.len()..];
+    &rest[..rest.find(".size").unwrap_or(rest.len())]
+}
+
+/// `-fno-math-errno` lets gcc compute `lrint` and `llrint` in place -- one
+/// `cvtsd2si`, which converts in the current rounding direction, on x86-64,
+/// and `frintx` then `fcvtzs` on aarch64 -- and `lround` too on aarch64, as
+/// `fcvtas`; x86-64 has no instruction for `lround`'s ties away from zero,
+/// and calls it. With `errno` to be set, every one is a call.
+#[test]
+fn libm_lrint_is_the_instruction_without_errno() {
+    let x86 = asm_for(
+        "lrint_x86",
+        LRINT_SRC,
+        &[
+            "-O2",
+            "-fno-math-errno",
+            "--target=x86_64-unknown-linux-gnu",
+        ],
+    );
+    for (func, insn) in [
+        ("r1", "cvtsd2siq"),
+        ("r2", "cvtss2siq"),
+        ("r3", "cvtsd2siq"),
+        ("r4", "cvtss2siq"),
+        ("r5", "cvtsd2siq"),
+    ] {
+        let body = fn_body(&x86, func);
+        assert!(
+            has_insn(body, insn) && !body.contains("call"),
+            "{func}:\n{x86}"
+        );
+    }
+    for (func, callee) in [
+        ("n1", "lround"),
+        ("n2", "lroundf"),
+        ("n3", "llround"),
+        ("n4", "llroundf"),
+    ] {
+        assert!(calls_any(fn_body(&x86, func), &[callee]), "{func}:\n{x86}");
+    }
+
+    let a64 = asm_for(
+        "lrint_a64",
+        LRINT_SRC,
+        &[
+            "-O2",
+            "-fno-math-errno",
+            "--target=aarch64-unknown-linux-gnu",
+        ],
+    );
+    for (func, reg) in [
+        ("r1", "d"),
+        ("r2", "s"),
+        ("r3", "d"),
+        ("r4", "s"),
+        ("r5", "d"),
+    ] {
+        let body = fn_body(&a64, func);
+        assert!(
+            has_insn(body, "frintx") && has_insn(body, "fcvtzs") && !body.contains("bl "),
+            "{func}:\n{a64}"
+        );
+        assert!(body.contains(&format!("frintx {reg}")), "{func}:\n{a64}");
+    }
+    for func in ["n1", "n2", "n3", "n4"] {
+        let body = fn_body(&a64, func);
+        assert!(
+            has_insn(body, "fcvtas") && !body.contains("bl "),
+            "{func}:\n{a64}"
+        );
+    }
+
+    // ELF triples: `fn_body` reads ELF labels, and Mach-O's carry a `_`.
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let asm = asm_for(
+            &format!("lrint_errno_{target}"),
+            LRINT_SRC,
+            &["-O2", &format!("--target={target}")],
+        );
+        for (func, callee) in [
+            ("r1", "lrint"),
+            ("r2", "lrintf"),
+            ("r3", "llrint"),
+            ("n1", "lround"),
+        ] {
+            assert!(
+                calls_any(fn_body(&asm, func), &[callee]),
+                "{target} {func}:\n{asm}"
+            );
+        }
+    }
+}

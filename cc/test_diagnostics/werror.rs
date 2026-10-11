@@ -13,10 +13,9 @@
 
 use crate::test_compile::{compile, compile_accepted, compile_rejected_with};
 
-/// A warning c17 has no option name for: gcc's `-Wincompatible-pointer-types`.
-const INCOMPATIBLE: &str = "char c; int *g(void){return &c;}\n";
-const INCOMPATIBLE_MSG: &str =
-    "returning 'char *' from a function with return type 'int *' incompatible pointer type";
+/// A warning gcc gives in no group, so `-Werror` tags it `[-Werror]`.
+const UNNAMED: &str = "int f(char *p){return p == 1;}\n";
+const UNNAMED_MSG: &str = "comparison between pointer and integer";
 
 /// One `-Woverflow` warning and one `-Wattributes` warning. The overflow is
 /// found after parsing, which an error stops, so where the attribute's
@@ -30,7 +29,7 @@ const ATTRIBUTE_MSG: &str = "'bogus_attr' attribute directive ignored";
 /// A default pedwarn, and one given only under `-Wpedantic`.
 const PEDWARNS: &str = "struct s { int a };\nint f(...);\n";
 const SEMICOLON_MSG: &str = "no semicolon at end of struct or union";
-const NAMED_ARG_MSG: &str = "ISO C requires a named argument before '...'";
+const NAMED_ARG_MSG: &str = "ISO C requires a named argument before '...' before C2X";
 
 const ALL: &str = "c17: all warnings being treated as errors";
 const SOME: &str = "c17: some warnings being treated as errors";
@@ -49,12 +48,12 @@ fn lacks(stderr: &str, text: &str) {
 /// the unit ends with gcc's "all warnings" line.
 #[test]
 fn werror_makes_a_warning_an_error() {
-    let plain = compile_accepted("werror_plain", INCOMPATIBLE, &[]);
-    has(&plain, &format!("warning: {INCOMPATIBLE_MSG}\n"));
+    let plain = compile_accepted("werror_plain", UNNAMED, &[]);
+    has(&plain, &format!("warning: {UNNAMED_MSG}\n"));
     lacks(&plain, "-Werror");
 
-    let strict = compile_rejected_with("werror_all", INCOMPATIBLE, &["-Werror"]);
-    has(&strict, &format!("error: {INCOMPATIBLE_MSG} [-Werror]\n"));
+    let strict = compile_rejected_with("werror_all", UNNAMED, &["-Werror"]);
+    has(&strict, &format!("error: {UNNAMED_MSG} [-Werror]\n"));
     has(&strict, &format!("{ALL}\n"));
     lacks(&strict, "warning:");
 }
@@ -63,7 +62,7 @@ fn werror_makes_a_warning_an_error() {
 #[test]
 fn werror_with_w_is_silent() {
     for flags in [&["-Werror", "-w"][..], &["-w", "-Werror"]] {
-        let c = compile("werror_w", INCOMPATIBLE, flags);
+        let c = compile("werror_w", UNNAMED, flags);
         assert!(c.success && c.stderr.is_empty(), "{flags:?}:\n{}", c.stderr);
     }
 }
@@ -89,7 +88,7 @@ fn werror_named_promotes_only_its_group() {
         &["-Werror=overflow"],
     );
     has(&c, &format!("error: {OVERFLOW_MSG} [-Werror=overflow]\n"));
-    has(&c, &format!("warning: {ATTRIBUTE_MSG}\n"));
+    has(&c, &format!("warning: {ATTRIBUTE_MSG} [-Wattributes]\n"));
     has(&c, &format!("{SOME}\n"));
     lacks(&c, ALL);
 
@@ -99,7 +98,10 @@ fn werror_named_promotes_only_its_group() {
         &format!("error: {ATTRIBUTE_MSG} [-Werror=attributes]\n"),
     );
     let overflow = compile_accepted("werror_attributes_only", OVERFLOW, &["-Werror=attributes"]);
-    has(&overflow, &format!("warning: {OVERFLOW_MSG}\n"));
+    has(
+        &overflow,
+        &format!("warning: {OVERFLOW_MSG} [-Woverflow]\n"),
+    );
 }
 
 /// Under `-Werror` a named warning carries its own name, and
@@ -127,7 +129,7 @@ fn werror_with_a_group_excluded() {
         &["-Werror", "-Wno-error=attributes"],
     );
     has(&c, &format!("error: {OVERFLOW_MSG} [-Werror=overflow]\n"));
-    has(&c, &format!("warning: {ATTRIBUTE_MSG}\n"));
+    has(&c, &format!("warning: {ATTRIBUTE_MSG} [-Wattributes]\n"));
     has(&c, &format!("{ALL}\n"));
 
     // Excluding the only group that warns leaves nothing to fail on.
@@ -136,7 +138,7 @@ fn werror_with_a_group_excluded() {
         ATTRIBUTE,
         &["-Werror", "-Wno-error=attributes"],
     );
-    has(&ok, &format!("warning: {ATTRIBUTE_MSG}\n"));
+    has(&ok, &format!("warning: {ATTRIBUTE_MSG} [-Wattributes]\n"));
     lacks(&ok, "treated as errors");
 }
 
@@ -157,7 +159,7 @@ fn werror_named_enables_its_group() {
         &["-Werror=overflow", "-Wno-overflow"],
     );
     lacks(&off, OVERFLOW_MSG);
-    has(&off, &format!("warning: {ATTRIBUTE_MSG}\n"));
+    has(&off, &format!("warning: {ATTRIBUTE_MSG} [-Wattributes]\n"));
 
     // `-Werror` with the group off: only the other one is left to promote.
     let off = compile_accepted("werror_group_off", OVERFLOW, &["-Werror", "-Wno-overflow"]);
@@ -168,11 +170,11 @@ fn werror_named_enables_its_group() {
 /// `-Wno-error` wins, and neither undoes a named verdict.
 #[test]
 fn werror_options_fold_in_order() {
-    let c = compile_rejected_with("werror_last", INCOMPATIBLE, &["-Wno-error", "-Werror"]);
-    has(&c, &format!("error: {INCOMPATIBLE_MSG} [-Werror]\n"));
+    let c = compile_rejected_with("werror_last", UNNAMED, &["-Wno-error", "-Werror"]);
+    has(&c, &format!("error: {UNNAMED_MSG} [-Werror]\n"));
 
-    let ok = compile_accepted("werror_undone", INCOMPATIBLE, &["-Werror", "-Wno-error"]);
-    has(&ok, &format!("warning: {INCOMPATIBLE_MSG}\n"));
+    let ok = compile_accepted("werror_undone", UNNAMED, &["-Werror", "-Wno-error"]);
+    has(&ok, &format!("warning: {UNNAMED_MSG}\n"));
     lacks(&ok, "-Werror");
 
     let named = compile_rejected_with(
@@ -191,7 +193,10 @@ fn werror_options_fold_in_order() {
         OVERFLOW,
         &["-Wno-error=overflow", "-Werror"],
     );
-    has(&excluded_first, &format!("warning: {OVERFLOW_MSG}\n"));
+    has(
+        &excluded_first,
+        &format!("warning: {OVERFLOW_MSG} [-Woverflow]\n"),
+    );
     let c = compile_rejected_with(
         "werror_excluded_other",
         ATTRIBUTE,
@@ -229,11 +234,12 @@ fn werror_promotes_pedwarns() {
         &["-pedantic", "-Werror", "-Wno-error=pedantic"],
     );
     has(&c, &format!("error: {SEMICOLON_MSG} [-Werror]\n"));
-    has(&c, &format!("warning: {NAMED_ARG_MSG}\n"));
+    has(&c, &format!("warning: {NAMED_ARG_MSG} [-Wpedantic]\n"));
 }
 
 /// `-pedantic-errors` is unchanged by `-Werror` and `-Wno-error`: plain
-/// errors, no tag, no closing line.
+/// errors, tagged with their own option if they have one and never with
+/// `-Werror`, and no closing line.
 #[test]
 fn pedantic_errors_unchanged_by_werror() {
     for flags in [
@@ -244,7 +250,7 @@ fn pedantic_errors_unchanged_by_werror() {
         let c = compile("pedantic_errors_werror", PEDWARNS, flags);
         assert!(!c.success, "{flags:?}:\n{}", c.stderr);
         has(&c.stderr, &format!("error: {SEMICOLON_MSG}\n"));
-        has(&c.stderr, &format!("error: {NAMED_ARG_MSG}\n"));
+        has(&c.stderr, &format!("error: {NAMED_ARG_MSG} [-Wpedantic]\n"));
         lacks(&c.stderr, "-Werror");
         lacks(&c.stderr, "treated as errors");
     }

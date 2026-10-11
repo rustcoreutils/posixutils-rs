@@ -9,7 +9,9 @@
 // C99 initializers: designated overrides, ranges and excess initializers
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
+use crate::common::{
+    compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere, compile_and_run_optimized,
+};
 
 // ============================================================================
 // Mega-test: designated overrides, ranges and excess initializers
@@ -654,6 +656,88 @@ int main(void)
     );
 }
 
+/// The same range with a value that is not an integer constant: a braced
+/// address constant, as the kernel's ima_queue.c initializes its hash table
+/// (`.queue[0 ... IMA_MEASURE_HTABLE_SIZE - 1] = HLIST_HEAD_INIT`), and, in
+/// an automatic object, any value whose evaluation has no effect, which may
+/// as well be evaluated once per element. c17 refused every value but an
+/// integer constant.
+#[test]
+fn c99_index_range_after_a_field_with_a_braced_or_pure_value() {
+    let code = r#"
+struct h { void *first; };
+struct t { long len; struct h q[4]; double d[3]; };
+static int anchor;
+struct t tbl = { .len = 1, .q[0 ... 3] = { (void *)8 }, .d[1 ... 2] = 2.5 };
+static struct t tp = { .q[1 ... 2] = { &anchor }, .q[3].first = 0 };
+int main(void) {
+    for (int i = 0; i < 4; i++)
+        if (tbl.q[i].first != (void *)8) return 1 + i;
+    if (tbl.len != 1 || tbl.d[0] != 0 || tbl.d[1] != 2.5 || tbl.d[2] != 2.5) return 5;
+    if (tp.q[0].first || tp.q[1].first != &anchor || tp.q[2].first != &anchor || tp.q[3].first)
+        return 6;
+    int n = 3;
+    void *p = &n;
+    struct t l = { .len = n, .q[1 ... 3] = { p }, .d[0 ... 1] = n * 0.5 };
+    if (l.q[0].first || l.q[1].first != p || l.q[3].first != p) return 7;
+    if (l.d[0] != 1.5 || l.d[1] != 1.5 || l.d[2] != 0) return 8;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("index_range_after_field_braced", code);
+}
+
+/// A range whose value has an effect -- a call, an increment -- evaluates it
+/// once, as gcc does, and stores that one value into every element it
+/// covers: after a field designator or first in the chain, scalar or
+/// structure, in a braced value too, and in a compound literal. A copy a
+/// later designator replaces is not evaluated, so a range replaced
+/// everywhere never runs its value; one replaced in part still runs it
+/// once. c17 refused the value after a field, and first in the chain
+/// evaluated it once per element.
+#[test]
+fn c99_index_range_value_with_effects_is_evaluated_once() {
+    let code = r#"
+static int calls;
+static int f(void) { return ++calls * 10; }
+struct P { int x, y; };
+static struct P mk(void) { struct P p = { ++calls, 99 }; return p; }
+struct S { int a[6]; int k; struct P ps[4]; double d[3]; };
+int main(void)
+{
+    int i = 5;
+    struct S s = { .a[1 ... 3] = f(), .k = 7, .ps[0 ... 2] = mk(), .d[0 ... 2] = f() };
+    if (calls != 3) return 1;
+    if (s.a[0] || s.a[1] != 10 || s.a[2] != 10 || s.a[3] != 10 || s.a[4] || s.k != 7) return 2;
+    if (s.ps[0].x != 2 || s.ps[2].x != 2 || s.ps[2].y != 99 || s.ps[3].x) return 3;
+    if (s.d[0] != 30 || s.d[2] != 30) return 4;
+
+    int arr[8] = { [2 ... 5] = i++, [7] = 1 };
+    if (i != 6 || arr[1] || arr[2] != 5 || arr[5] != 5 || arr[6] || arr[7] != 1) return 5;
+
+    calls = 0;
+    struct P bp[3] = { [0 ... 2] = { f(), 2 } };
+    struct S q = { .ps[1 ... 3] = { f(), 3 } };
+    if (calls != 2 || bp[0].x != 10 || bp[2].x != 10 || bp[1].y != 2) return 6;
+    if (q.ps[0].x || q.ps[1].x != 20 || q.ps[3].x != 20 || q.ps[3].y != 3) return 7;
+
+    calls = 0;
+    int part[4] = { [0 ... 3] = f(), [1] = 5 };
+    int none[4] = { [0 ... 3] = f(), [0 ... 3] = 7 };
+    if (calls != 1 || part[0] != 10 || part[1] != 5 || part[3] != 10) return 8;
+    if (none[0] != 7 || none[3] != 7) return 9;
+
+    calls = 0;
+    int *lit = (int[4]){ [1 ... 2] = f() };
+    struct S *ls = &(struct S){ .a[0 ... 5] = f() };
+    if (calls != 2 || lit[0] || lit[1] != 10 || lit[2] != 10 || lit[3]) return 10;
+    if (ls->a[0] != 20 || ls->a[5] != 20) return 11;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("index_range_value_effects", code);
+}
+
 // Kept separate: the only test run at exactly -O0 and -O2 (no matrix level).
 /// A later designator reaching inside something a whole *value* initialized
 /// keeps the rest of that value, through a union exactly as through a
@@ -731,4 +815,52 @@ int main(void) {
             assert_eq!(rc, 0, "aarch64 {level}");
         }
     }
+}
+
+/// A range, then an element that initializes one of the range's slots
+/// again (Linux's fs/proc/task_mmu.c `mnemonics[BITS_PER_LONG][2]`). A
+/// braced list or string for the whole slot replaces what the range put
+/// there; a brace-elided value only overwrites from the slot's start, as
+/// gcc does. The later element was appended to the range's, so a string
+/// was "not constant", a static struct kept the range's first member, and an
+/// automatic char array read garbage.
+#[test]
+fn c99_range_then_override_of_one_slot() {
+    let code = r#"
+#include <string.h>
+struct t { int x, y, z; };
+static const char mn[8][3] = { [0 ... 7] = "??", [2] = "rd" };
+static const char s[3][4] = { [0 ... 2] = "abc", [1] = "x", [2] = {'q'} };
+static int e[4] = { [0 ... 3] = 1, [1] = 5, 6 };
+static struct t a[3] = { [0 ... 2] = {1, 2, 3}, [1] = {7} };
+static struct t b[3] = { [0 ... 2] = {1, 2, 3}, [1] = 7 };
+static struct t c[3] = { [0 ... 2] = {1, 2, 3}, [0] = 7, 8, 9, 10 };
+static struct t d[3] = { [0 ... 2] = {1, 2, 3}, [1].y = 7, 8 };
+static int m[3][2] = { [0 ... 2] = {1, 2}, [1] = 7 };
+static int eq(const struct t *v, int x, int y, int z) { return v->x == x && v->y == y && v->z == z; }
+int main(void)
+{
+    const char lmn[4][3] = { [0 ... 3] = "??", [2] = "rd" };
+    struct t la[3] = { [0 ... 2] = {1, 2, 3}, [1] = {7} };
+    struct t lb[3] = { [0 ... 2] = {1, 2, 3}, [1] = 7 };
+    if (memcmp(mn[0], "??", 3) || memcmp(mn[2], "rd", 3) || memcmp(mn[7], "??", 3))
+        return 1;
+    if (strcmp(s[0], "abc") || memcmp(s[1], "x\0\0", 4) || memcmp(s[2], "q\0\0", 4))
+        return 2;
+    if (e[0] != 1 || e[1] != 5 || e[2] != 6 || e[3] != 1)
+        return 3;
+    if (!eq(&a[0], 1, 2, 3) || !eq(&a[1], 7, 0, 0) || !eq(&a[2], 1, 2, 3))
+        return 4;
+    if (!eq(&b[1], 7, 2, 3) || !eq(&c[0], 7, 8, 9) || !eq(&c[1], 10, 2, 3) || !eq(&c[2], 1, 2, 3))
+        return 5;
+    if (!eq(&d[1], 1, 7, 8) || m[1][0] != 7 || m[1][1] != 2 || m[2][0] != 1)
+        return 6;
+    if (memcmp(lmn[2], "rd", 3) || memcmp(lmn[3], "??", 3))
+        return 7;
+    if (!eq(&la[1], 7, 0, 0) || !eq(&lb[1], 7, 2, 3) || !eq(&lb[2], 1, 2, 3))
+        return 8;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("c99_range_override", code);
 }

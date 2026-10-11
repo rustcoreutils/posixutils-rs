@@ -8983,6 +8983,49 @@ fn test_every_declarator_position_binds_the_same_way() {
     assert_eq!(seen, ["a", "b", "c", "d", "e", "k"]);
 }
 
+/// `returns_twice` is carried into the function's type, as `noreturn` is,
+/// from this declaration or an earlier one of the name, so every direct call
+/// after it sees it. gcc ignores it on a typedef or a pointer, and so does
+/// c17: those types stay ordinary.
+#[test]
+fn test_returns_twice_is_carried_on_the_function_type() {
+    let src = "int a(void *) __attribute__((returns_twice));\n\
+               int b(void *);\n\
+               int b(void *) __attribute__((__returns_twice__));\n\
+               int b(void *);\n\
+               int c(void *);\n\
+               typedef int T(void *) __attribute__((returns_twice));\n\
+               int (*p)(void *) __attribute__((returns_twice));\n";
+    let (tu, types, strings, symbols) = parse_tu(src).unwrap();
+    let mut seen = Vec::new();
+    for item in &tu.items {
+        let ExternalDecl::Declaration(decl) = item else {
+            continue;
+        };
+        for d in &decl.declarators {
+            let name = strings.get(symbols.get(d.symbol).name).to_string();
+            let typ = types.get(d.typ);
+            let twice = if typ.kind == crate::types::TypeKind::Pointer {
+                types.get(typ.base.unwrap()).returns_twice
+            } else {
+                typ.returns_twice
+            };
+            seen.push((name, twice));
+        }
+    }
+    let expect = [
+        ("a", true),
+        ("b", false),
+        ("b", true),
+        ("b", true),
+        ("c", false),
+        ("T", false),
+        ("p", false),
+    ];
+    let expect: Vec<(String, bool)> = expect.iter().map(|&(n, t)| (n.to_string(), t)).collect();
+    assert_eq!(seen, expect);
+}
+
 /// A later typedef declarator gets its trailing alignment, and a later or
 /// grouped declarator completes an earlier `extern` array.
 #[test]
@@ -9106,6 +9149,46 @@ fn test_calling_convention_conflicts() {
         .typ;
     let func = types.base_type(types.base_type(pp).unwrap()).unwrap();
     assert_eq!(types.get(func).conv, crate::abi::CallingConv::C);
+}
+
+/// `nocf_check` under branch protection is placed as `ms_abi` is: on the
+/// declared function, on the function a declared pointer points at, through
+/// a typedef of either and `__typeof__`, and not on a pointer to a pointer.
+/// Without branch protection it is ignored and no type carries it.
+#[test]
+fn test_nocf_check_is_a_function_type_attribute() {
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let src = "__attribute__((nocf_check)) void f(void);\n\
+               void (*__attribute__((nocf_check)) p)(void);\n\
+               typedef void (*np)(void) __attribute__((nocf_check));\n\
+               np q;\n\
+               __typeof__(f) *r;\n\
+               void (**pp)(void) __attribute__((nocf_check));\n\
+               void g(void);\n";
+    let parse = |branch: bool| {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
+        let tokens = tokenizer.tokenize();
+        let mut symbols = SymbolTable::new();
+        let mut types = TypeTable::new(&target);
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.set_cf_branch(branch);
+        parser.parse_translation_unit().unwrap();
+        let func_of = |name: &str| {
+            let id = strings.lookup(name).unwrap();
+            let mut t = symbols
+                .lookup(id, crate::symbol::Namespace::Ordinary)
+                .unwrap()
+                .typ;
+            while types.kind(t) != TypeKind::Function {
+                t = types.base_type(t).unwrap();
+            }
+            types.get(t).nocf_check
+        };
+        ["f", "p", "q", "r", "pp", "g"].map(func_of)
+    };
+    assert_eq!(parse(true), [true, true, true, true, false, false]);
+    assert_eq!(parse(false), [false; 6]);
 }
 
 /// On aarch64 neither attribute exists, as for gcc there: the type keeps the
@@ -9961,6 +10044,55 @@ fn binary_operand_verdicts() {
     for (op, l, r, want) in table {
         assert_eq!(
             binary_operand_verdict(ty, op, l, r),
+            want,
+            "{} {} {}",
+            ty.format_type(l.typ, None),
+            op.spelling(),
+            ty.format_type(r.typ, None)
+        );
+    }
+}
+
+/// Pointers to arrays whose elements differ only in qualifiers: gcc takes
+/// C2x's rule that an array is exactly as qualified as its elements, so
+/// `char (*)[19] - const char (*)[19]` is a valid difference (glibc's nss
+/// subtracts so) and the comparisons are of compatible pointers; only
+/// `-pedantic` objects. Arrays of different element types stay invalid.
+#[test]
+fn binary_operand_verdicts_qualified_arrays() {
+    use super::operand_rule::{binary_operand_verdict, Operand, OperandVerdict::*};
+    use crate::types::{ArrayExtent, Type};
+    let mut ty = TypeTable::new(&Target::host());
+    let (char_id, int_id, long_id) = (ty.char_id, ty.int_id, ty.long_id);
+    let mut ptr_to_array = |elem: TypeId, n: usize, quals: TypeModifiers| {
+        let elem = ty.qualified_with(elem, quals);
+        let array = ty.intern(Type::array_of(elem, ArrayExtent::Known(n)));
+        Operand {
+            typ: ty.intern(Type::pointer(array)),
+            null_constant: false,
+        }
+    };
+    let plain = ptr_to_array(char_id, 19, TypeModifiers::empty());
+    let konst = ptr_to_array(char_id, 19, TypeModifiers::CONST);
+    let vol = ptr_to_array(int_id, 3, TypeModifiers::VOLATILE);
+    let cint = ptr_to_array(int_id, 3, TypeModifiers::CONST);
+    let clong = ptr_to_array(long_id, 3, TypeModifiers::CONST);
+    let short = ptr_to_array(char_id, 18, TypeModifiers::CONST);
+    use BinaryOp::*;
+    let table = [
+        (Sub, plain, konst, QualifiedArrays),
+        (Sub, konst, plain, QualifiedArrays),
+        (Sub, vol, cint, QualifiedArrays),
+        (Lt, plain, konst, QualifiedArrays),
+        (Eq, konst, plain, QualifiedArrays),
+        (Sub, konst, konst, Valid),
+        (Sub, cint, clong, Invalid),
+        (Sub, plain, short, Invalid),
+        (Eq, cint, clong, DistinctPointers),
+    ];
+    for (op, l, r, want) in table {
+        assert_eq!(
+            binary_operand_verdict(&ty, op, l, r),
             want,
             "{} {} {}",
             ty.format_type(l.typ, None),

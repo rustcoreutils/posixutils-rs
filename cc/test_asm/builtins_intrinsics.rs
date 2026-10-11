@@ -68,3 +68,33 @@ fn builtins_incompatible_declaration_displaces_the_bare_builtin() {
     let asm = asm_for("compatible_bare_builtin", src, &[]);
     assert!(!calls(&asm, "abs") && !calls(&asm, "labs"), "{asm}");
 }
+
+/// `__builtin_trap` is the target's trap instruction, as gcc emits it --
+/// `ud2` on x86-64, `brk #1000` on aarch64 -- never a call to `abort`: glibc
+/// uses it on paths that must not depend on libc, and its configure asks
+/// for exactly that. It does not return, and unlike `__builtin_unreachable`
+/// it is no promise about the program: the branch to it stays.
+#[test]
+fn builtins_trap_is_a_trap_instruction() {
+    use super::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
+    let src = "int f(int x) { if (x) __builtin_trap(); return 1; }\n\
+               void g(void) { __builtin_trap(); }\n";
+    for (triple, trap) in [(X86_64_LINUX, "ud2"), (AARCH64_LINUX, "brk #1000")] {
+        for opt in ["-O0", "-O2"] {
+            let asm = asm_for_with("builtin_trap", triple, src, &[opt]);
+            for func in ["f", "g"] {
+                let body = body_of(&asm, func);
+                assert!(
+                    body.lines().any(|l| l.trim() == trap),
+                    "{triple} {opt} {func}: no {trap}:\n{body}"
+                );
+            }
+            assert!(!calls(&asm, "abort"), "{triple} {opt}:\n{asm}");
+            // `f` still returns 1 when `x` is 0, and `g` never returns.
+            let f = body_of(&asm, "f");
+            assert!(f.contains("ret"), "{triple} {opt}:\n{f}");
+            let g = body_of(&asm, "g");
+            assert!(!g.contains("ret"), "{triple} {opt}:\n{g}");
+        }
+    }
+}

@@ -290,10 +290,14 @@ fn collect(func: &Function, ctx: &FoldCtx) -> Vec<FoldSite> {
 }
 
 /// Whether `insn` is a call by name, with nothing appended at inlining.
+///
+/// A call with a landing pad is left alone: it ends its block with an edge
+/// into the pad, which what it folds to would have to take over.
 fn is_direct_call(insn: &Instruction) -> bool {
     insn.op == Opcode::Call
         && insn.extra().indirect_target.is_none()
         && !insn.extra().ends_with_va_arg_pack
+        && insn.extra().landing_pad.is_none()
 }
 
 /// What the call `insn` to `known` folds to, by the family it is in.
@@ -304,6 +308,9 @@ fn fold(known: LibFn, insn: &Instruction, facts: &CallSite) -> Option<Folded> {
         LibFamily::Output => stdio::fold(known, insn, facts),
         LibFamily::ComplexArith => complex::fold(known, insn, facts),
         LibFamily::Fortified => fortify::fold(known, insn, facts),
+        // Nothing to fold: what is known of them is the size of what they
+        // return, which `objsize` reads.
+        LibFamily::Allocation => None,
     }
 }
 
@@ -457,6 +464,27 @@ fn byte_value(b: &mut Builder, byte: Byte, typ: TypeId) -> PseudoId {
             b.convert(Opcode::Zext, v, uchar, typ)
         }
     }
+}
+
+/// Whether `caller` may call the library function `func`: the program has
+/// left its name alone, and `caller` is not it.
+pub(crate) fn can_call(ctx: &FoldCtx, caller: &Function, func: LibFn) -> bool {
+    let name = Callee::Known(func).c_name();
+    ctx.callees.contains_key(name) && !is_the_function(caller, ctx, name)
+}
+
+/// A call to `func` with `args`, for a pass other than this one, which has
+/// asked [`can_call`]; answers the pseudo holding its result.
+pub(crate) fn call_library(
+    b: &mut Builder,
+    ctx: &FoldCtx,
+    func: LibFn,
+    args: Vec<Operand>,
+) -> PseudoId {
+    let target = b.func.alloc_pseudo();
+    let ret = func.return_type(b.types);
+    make_call(b, ctx, Some(target), ret, NewCall { func, args });
+    target
 }
 
 /// The call `new`, returning `ret` into `target`.

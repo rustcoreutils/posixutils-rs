@@ -24,14 +24,7 @@ use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeTable};
 
 /// Create a default position for test code
 pub(super) fn test_pos() -> Position {
-    Position {
-        stream: 0,
-        line: 1,
-        col: 1,
-        newline: false,
-        whitespace: false,
-        noexpand: false,
-    }
+    Position::new(0, 1, 1)
 }
 
 /// Test context that provides StringTable, TypeTable, and SymbolTable for tests.
@@ -81,8 +74,7 @@ impl TestContext {
             &self.types,
             &self.strings,
             &target,
-            false,
-            true,
+            Default::default(),
         )
     }
 }
@@ -106,7 +98,7 @@ pub(super) fn test_linearize(
 ) -> Module {
     let symbols = SymbolTable::new();
     let target = Target::host();
-    linearize(tu, &symbols, types, strings, &target, false, true)
+    linearize(tu, &symbols, types, strings, &target, Default::default())
 }
 
 pub(super) fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDef {
@@ -1260,7 +1252,7 @@ fn test_linearize_with_symbols(
     strings: &StringTable,
 ) -> Module {
     let target = Target::host();
-    linearize(tu, symbols, types, strings, &target, false, true)
+    linearize(tu, symbols, types, strings, &target, Default::default())
 }
 
 #[test]
@@ -1432,6 +1424,22 @@ pub(super) fn linearize_source_trapping(
     policy: crate::parse::LibraryCallPolicy,
     trapping_math: bool,
 ) -> (Module, TypeTable) {
+    linearize_source_with(src, target, policy, trapping_math, false)
+}
+
+/// [`linearize_source`] under `-fexceptions`.
+pub(crate) fn linearize_source_eh(src: &str, target: &Target) -> Module {
+    linearize_source_with(src, target, Default::default(), true, true).0
+}
+
+/// Linearize `src` for `target` with each option as given.
+fn linearize_source_with(
+    src: &str,
+    target: &Target,
+    policy: crate::parse::LibraryCallPolicy,
+    trapping_math: bool,
+    exceptions: bool,
+) -> (Module, TypeTable) {
     let mut strings = StringTable::new();
     let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
@@ -1449,8 +1457,13 @@ pub(super) fn linearize_source_trapping(
         &types,
         &strings,
         target,
-        false,
-        trapping_math,
+        super::LinearizeOptions {
+            debug: false,
+            trapping_math,
+            fp_rounding: Default::default(),
+            exceptions,
+            ..Default::default()
+        },
     );
     (module, types)
 }
@@ -1543,10 +1556,10 @@ fn test_alias_declarations_become_symbol_aliases() {
                extern int b[4];\n\
                int a[4];\n\
                static int s;\n\
-               static int t __attribute__((weak, alias(\"s\")));\n\
+               static int t __attribute__((alias(\"s\")));\n\
                int f(void) { return 0; }\n\
                int g(void) __attribute__((alias(\"f\"), visibility(\"hidden\")));\n\
-               int h(void) __attribute__((alias(\"g\")));\n\
+               int h(void) __attribute__((weak, alias(\"g\")));\n\
                int use(void) { return b[0] + g(); }\n";
     // An ELF target: Mach-O has no aliases, and a Darwin host would reject
     // every one of these before recording it.
@@ -1566,9 +1579,9 @@ fn test_alias_declarations_become_symbol_aliases() {
         module.aliases,
         [
             alias("b", "a", false, false, None),
-            alias("t", "s", true, true, None),
+            alias("t", "s", true, false, None),
             alias("g", "f", false, false, Some("hidden")),
-            alias("h", "g", false, false, None),
+            alias("h", "g", false, true, None),
         ]
     );
     for name in ["b", "t", "g", "h"] {
@@ -1587,6 +1600,54 @@ fn test_alias_declarations_become_symbol_aliases() {
     }
 }
 
+/// glibc's `libc_hidden_weak` over a function <bits/stdio.h> also gives a
+/// `gnu_inline` body: the hidden asm name `__GI_g` is both that body's name
+/// and an alias of `__g`, and the public `g` an alias of `__GI_g`. The body
+/// emits no symbol, so the alias is what `__GI_g` names and `g` resolves
+/// through it -- it was "aliased to external symbol '__GI_g'". A body with
+/// no alias behind it is still an external target.
+#[test]
+fn test_alias_through_a_name_with_an_inline_body() {
+    let src = "extern __inline __attribute__((__gnu_inline__)) int g(int x) { return x + 1; }\n\
+               extern __typeof(g) g __asm__(\"__GI_g\") __attribute__((visibility(\"hidden\")));\n\
+               int __g(int x) { return x + 1; }\n\
+               extern __typeof(__g) g __attribute__((weak, alias(\"__g\")));\n\
+               extern __typeof(g) __EI_g __asm__(\"g\");\n\
+               extern __typeof(g) __EI_g __attribute__((alias(\"__GI_g\"))) __attribute__((weak));\n\
+               int use(int x) { return g(x); }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let errors = crate::diag::error_count();
+    let module = linearize_source(src, &target);
+    assert_eq!(crate::diag::error_count(), errors, "rejected");
+    let undecorated = crate::arch::lir::undecorated;
+    let found: Vec<(&str, &str, bool, Option<&str>)> = module
+        .aliases
+        .iter()
+        .map(|a| {
+            let vis = a.visibility.as_deref();
+            (undecorated(&a.name), undecorated(&a.target), a.weak, vis)
+        })
+        .collect();
+    // `__GI_g` is hidden by its earlier declaration, as gcc makes it.
+    assert_eq!(
+        found,
+        [
+            ("__GI_g", "__g", true, Some("hidden")),
+            ("g", "__GI_g", true, None)
+        ]
+    );
+
+    let lone = "extern __inline __attribute__((__gnu_inline__)) int k(int x) { return x; }\n\
+                int a(int) __attribute__((alias(\"k\")));\n";
+    let errors = crate::diag::error_count();
+    let module = linearize_source(lone, &target);
+    assert!(
+        crate::diag::error_count() > errors,
+        "an inline body alone accepted"
+    );
+    assert!(module.aliases.is_empty());
+}
+
 /// An `ifunc` declaration becomes a `SymbolAlias` of the `Ifunc` form naming
 /// its resolver -- not a definition, and not the resolver: a call to it is a
 /// call to an external symbol, reached through the GOT, which is where the
@@ -1597,9 +1658,9 @@ fn test_ifunc_declarations_become_indirect_functions() {
     use crate::parse::ast::AliasForm;
     let src = "static int impl(int x) { return x; }\n\
                static void *res(void) { return (void *)impl; }\n\
-               int f(int) __attribute__((ifunc(\"res\")));\n\
+               int f(int) __attribute__((ifunc(\"res\"), visibility(\"hidden\")));\n\
                int f(int);\n\
-               static int g(int) __attribute__((ifunc(\"res\"), visibility(\"hidden\")));\n\
+               static int g(int) __attribute__((ifunc(\"res\")));\n\
                int use(void) { return f(1) + g(2); }\n";
     let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
     let module = linearize_source(src, &target);
@@ -1613,7 +1674,7 @@ fn test_ifunc_declarations_become_indirect_functions() {
     };
     assert_eq!(
         module.aliases,
-        [ifunc("f", false, None), ifunc("g", true, Some("hidden"))]
+        [ifunc("f", false, Some("hidden")), ifunc("g", true, None)]
     );
     for name in ["f", "g"] {
         assert!(
@@ -1757,17 +1818,14 @@ fn test_target_clones_become_versions_and_a_resolver() {
             .find(|f| f.name == name)
             .unwrap_or_else(|| panic!("no {name}"))
     };
-    let sse42 = X86Isa {
-        simd: X86Simd::Sse42,
-        popcnt: true,
-    };
+    let sse42 = X86Isa::from_flags(&["-msse4.2".to_string()]);
     assert!(func("sum.default").is_static);
     assert_eq!(func("sum.default").isa, X86Isa::default());
     assert!(func("sum.sse4_2").is_static);
     assert_eq!(func("sum.sse4_2").isa, sse42);
     assert!(!func("sum.resolver").is_static);
     assert!(func("sum.resolver").symbol_attrs.weak);
-    assert_eq!(func("t").isa.simd, X86Simd::Ssse3);
+    assert_eq!(func("t").isa.simd(), X86Simd::Ssse3);
     assert_eq!(func("plain").isa, X86Isa::default());
     assert!(module.functions.iter().all(|f| f.name != "sum"));
     let alias = module.aliases.iter().find(|a| a.name == "sum").unwrap();
@@ -2024,4 +2082,51 @@ fn test_stack_protect_attribute_reaches_the_function() {
     assert_eq!(attr("p"), StackProtectAttr::Protect);
     assert_eq!(attr("n"), StackProtectAttr::Exempt);
     assert_eq!(attr("d"), StackProtectAttr::Unspecified);
+}
+
+/// A file-scope object records where it was first declared, for `-g`'s
+/// `DW_TAG_variable` -- a tentative definition completed later keeps the
+/// first line -- and a block-scope `static` records nothing, having no
+/// file-scope DIE.
+#[test]
+fn test_file_scope_objects_record_their_declaration() {
+    let src = "int a;\n\nstatic int b = 1;\nint a = 2;\nint f(void) { static int c; return c; }\n";
+    let module = linearize_source(src, &Target::host());
+    let line = |name: &str| {
+        module
+            .globals
+            .iter()
+            .find(|g| g.name == name || g.name.contains(&format!("{name}.")))
+            .unwrap_or_else(|| panic!("no global {name}"))
+            .decl_pos
+            .map(|p| p.line)
+    };
+    assert_eq!(line("a"), Some(1));
+    assert_eq!(line("b"), Some(3));
+    assert_eq!(line("c"), None);
+}
+
+/// The line table numbers files, not preprocessor streams: a header
+/// included twice is one `.file`, and a synthetic stream -- the predefined
+/// macros, the command-line `-D`s -- is none.
+#[test]
+fn test_source_files_number_each_file_once() {
+    let names = [
+        "t.c",
+        "<built-in>",
+        "h.h",
+        "",
+        "g.h",
+        "h.h",
+        "<command-line>",
+    ];
+    let files = SourceFiles::from_stream_names(names.iter().map(|n| n.to_string()));
+    assert_eq!(files.paths, ["t.c", "h.h", "g.h"]);
+    let numbered: Vec<Option<u32>> = (0..names.len() as u16 + 1)
+        .map(|s| files.file_of(s))
+        .collect();
+    assert_eq!(
+        numbered,
+        [Some(1), None, Some(2), None, Some(3), Some(2), None, None]
+    );
 }

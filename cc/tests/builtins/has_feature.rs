@@ -11,7 +11,7 @@
 // Consolidates: __has_builtin, __has_feature tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_everywhere};
 
 // ============================================================================
 // Mega-test: __has_builtin, __has_feature, __has_attribute
@@ -236,4 +236,53 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("builtins_has_feature_mega", code, &[]), 0);
+}
+
+/// `__builtin_has_attribute`, gcc 13's answers for declarations and types,
+/// usable where an integer constant is required; and `__has_builtin`
+/// admits it. The operand is not evaluated.
+#[test]
+fn builtins_has_attribute() {
+    let code = r#"
+/* Mach-O names a segment with the section. */
+#ifdef __APPLE__
+#define XX "__DATA,xx"
+#define YY "__DATA,yy"
+#else
+#define XX "xx"
+#define YY "yy"
+#endif
+extern void f1(void) __attribute__((noreturn, cold));
+int v1 __attribute__((aligned(16), used));
+static int v2 __attribute__((section(XX), unused)) = 3;
+typedef int T1 __attribute__((aligned(32)));
+typedef int V4 __attribute__((vector_size(16)));
+struct __attribute__((packed)) P { char c; int i; };
+extern int pf(const char *, ...) __attribute__((format(printf, 1, 2), nonnull(1)));
+int vis __attribute__((visibility("hidden")));
+#if !__has_builtin(__builtin_has_attribute)
+#error "__has_builtin(__builtin_has_attribute)"
+#endif
+_Static_assert(__builtin_has_attribute(f1, __noreturn__), "noreturn");
+char a[__builtin_has_attribute(v1, aligned(16)) ? 1 : -1];
+int main(void) {
+    int n = 0;
+    int r[] = {
+        __builtin_has_attribute(f1, cold), !__builtin_has_attribute(f1, hot),
+        __builtin_has_attribute(v1, used), !__builtin_has_attribute(v1, aligned(8)),
+        __builtin_has_attribute(v2, section(XX)), !__builtin_has_attribute(v2, section(YY)),
+        __builtin_has_attribute(v2, unused), __builtin_has_attribute(T1, aligned),
+        !__builtin_has_attribute(int, aligned), __builtin_has_attribute(struct P, packed),
+        __builtin_has_attribute(V4, vector_size(16)), __builtin_has_attribute(pf, format),
+        __builtin_has_attribute(vis, visibility("hidden")),
+        !__builtin_has_attribute(vis, visibility("default")),
+        !__builtin_has_attribute(int[n++], aligned),
+    };
+    for (unsigned i = 0; i < sizeof r / sizeof r[0]; i++)
+        if (!r[i])
+            return 1 + (int)i;
+    return n;
+}
+"#;
+    compile_and_run_everywhere("builtins_has_attribute", code);
 }

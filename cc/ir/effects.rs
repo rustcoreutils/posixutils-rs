@@ -211,7 +211,8 @@ fn solve(inferable: &[Summary], effects: &mut HashMap<String, MemEffect>) {
 /// called, so only those are inferred -- anything else must say what it does
 /// with an attribute.
 fn is_inferable(f: &Function) -> bool {
-    f.is_static && !f.symbol_attrs.weak && !f.blocks.is_empty()
+    // `noipa` asks that no caller learn anything from the body.
+    f.is_static && !f.symbol_attrs.weak && !f.is_noipa && !f.blocks.is_empty()
 }
 
 /// What one instruction that is not a call does to observable memory: the
@@ -302,6 +303,18 @@ mod tests {
         });
         let table = EffectTable::build(&module(vec![f]), &types());
         assert_eq!(table.of("f"), MemEffect::Const);
+    }
+
+    /// `noipa`: an empty body, which is `Const`, tells its callers nothing.
+    #[test]
+    fn effects_noipa_body_is_not_inferred() {
+        let t = types();
+        let mut f = func("f", true, |_, bb| {
+            bb.add_insn(Instruction::new(Opcode::Ret).with_type_and_size(t.void_id, 0));
+        });
+        f.is_noipa = true;
+        let table = EffectTable::build(&module(vec![f]), &types());
+        assert_eq!(table.of("f"), MemEffect::Unknown);
     }
 
     /// Reading a global is `Pure`; writing one is `Unknown`.

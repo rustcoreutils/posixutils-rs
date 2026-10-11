@@ -193,6 +193,16 @@ const DEFAULT_PEDWARNS: &[(&str, &str, &str)] = &[
         "variable 'x' declared 'inline'",
     ),
     (
+        "typedef_declared_inline",
+        "typedef inline int f(void);\n",
+        "typedef 'f' declared 'inline'",
+    ),
+    (
+        "typedef_declared_noreturn",
+        "typedef _Noreturn void f(void);\n",
+        "typedef 'f' declared '_Noreturn'",
+    ),
+    (
         "variable_declared_noreturn",
         "_Noreturn int x;\n",
         "variable 'x' declared '_Noreturn'",
@@ -227,13 +237,13 @@ const GCC13_DEFAULT_PEDWARNS: &[(&str, &str, &str, &[&str])] = &[
     (
         "argument_incompatible_pointer",
         "void g(int *p);\nvoid f(double *q) { g(q); }\n",
-        "passing argument 1 of 'g' as 'int *' from 'double *' incompatible pointer type",
+        "passing argument 1 of 'g' from incompatible pointer type",
         &[],
     ),
     (
         "argument_to_unnamed_callee",
         "struct S { void (*fp)(int *); };\nvoid f(struct S s, double *q) { s.fp(q); }\n",
-        "passing argument 1 as 'int *' from 'double *' incompatible pointer type",
+        "passing argument 1 from incompatible pointer type",
         &[],
     ),
     (
@@ -245,7 +255,7 @@ const GCC13_DEFAULT_PEDWARNS: &[(&str, &str, &str, &[&str])] = &[
     (
         "initialization_discards_const",
         "const int c;\nint *p = &c;\n",
-        "initialization of 'int *' from 'const int *' discards a qualifier from the pointer target type",
+        "initialization discards 'const' qualifier from pointer target type",
         &[],
     ),
     (
@@ -345,7 +355,7 @@ fn gccs_pedantic_only_diagnostics_are_silent_by_default() {
         (
             "enumerator_outside_int",
             "enum E { A = 0x80000000 };\n",
-            "ISO C restricts enumerator values to range of 'int'",
+            "ISO C restricts enumerator values to range of 'int' before C2X",
         ),
         (
             "line_number_zero",

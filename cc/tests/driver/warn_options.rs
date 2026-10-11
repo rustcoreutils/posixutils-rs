@@ -248,3 +248,27 @@ fn linker_options_are_untouched() {
     ]);
     assert!(r.success, "{}", r.stderr);
 }
+
+/// `-fno-diagnostics-show-option` leaves gcc's `[-W<name>]` tag off a
+/// warning, and `-fdiagnostics-show-option` after it puts the tag back.
+#[test]
+fn diagnostics_show_option_controls_the_tag() {
+    let (dir, path) = scratch("t.c", WARNS);
+    let msg = "1:28: warning: left shift count >= width of type";
+    for (flags, tag) in [
+        (&[][..], " [-Wshift-count-overflow]"),
+        (&["-fno-diagnostics-show-option"], ""),
+        (
+            &["-fno-diagnostics-show-option", "-fdiagnostics-show-option"],
+            " [-Wshift-count-overflow]",
+        ),
+    ] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(r.success, "{}", r.stderr);
+        assert!(
+            r.stderr.ends_with(&format!("{msg}{tag}\n")),
+            "{flags:?}:\n{}",
+            r.stderr
+        );
+    }
+}

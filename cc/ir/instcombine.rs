@@ -29,6 +29,7 @@ use super::constfold::{
     eval_int, is_int_foldable, possible_against, CmpDomain, Outcomes,
 };
 use super::facts::{CmpFacts, ConstMap, Relation};
+use super::memloc::{AddrMap, MemBase};
 use super::propagate;
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
 use crate::float::FloatVal;
@@ -42,6 +43,11 @@ use std::collections::{HashMap, HashSet};
 /// added.
 struct RunFacts<'a> {
     cmps: CmpFacts,
+    /// The function, for [`RunFacts::offsets_in_one_object`].
+    func: &'a Function,
+    /// What each address is the address of, built the first time a
+    /// comparison of two non-constants asks.
+    addrs: std::cell::OnceCell<AddrMap>,
     /// Pseudos whose value is never *less than* zero -- which is not the
     /// same as non-negative, and is deliberately the weaker fact: `fabs` of
     /// a NaN is a NaN, and a NaN is not less than zero either, because an
@@ -53,7 +59,7 @@ struct RunFacts<'a> {
 }
 
 impl<'a> RunFacts<'a> {
-    pub(crate) fn new(func: &Function, consts: &ConstMap, types: &'a TypeTable) -> Self {
+    pub(crate) fn new(func: &'a Function, consts: &ConstMap, types: &'a TypeTable) -> Self {
         let mut never_lt_zero = HashSet::new();
         for bb in &func.blocks {
             for insn in &bb.insns {
@@ -66,9 +72,31 @@ impl<'a> RunFacts<'a> {
         }
         Self {
             cmps: CmpFacts::new(func, consts),
+            func,
+            addrs: std::cell::OnceCell::new(),
             never_lt_zero,
             types,
         }
+    }
+
+    /// The byte offsets of `a` and `b` into one object, when both are
+    /// addresses of the same named object or local at constant offsets that
+    /// lie at or past its start: `&x.prev` and `&x` are `(8, 0)`.
+    ///
+    /// Their comparison is the comparison of those offsets, whatever the
+    /// object's address turns out to be -- which is how gcc folds the
+    /// kernel's `BUILD_BUG_ON(STABLE_NODE_DUP_HEAD <= &migrate_nodes)`. A
+    /// negative offset is left alone: as unsigned addresses, a pointer
+    /// before an object near zero compares above it.
+    fn offsets_in_one_object(&self, a: PseudoId, b: PseudoId) -> Option<(i64, i64)> {
+        let addrs = self.addrs.get_or_init(|| AddrMap::build(self.func));
+        let la = addrs.object_of(self.func, a);
+        let lb = addrs.object_of(self.func, b);
+        if la.base == MemBase::Unknown || la.base != lb.base {
+            return None;
+        }
+        let (oa, ob) = (la.offset?, lb.offset?);
+        (oa >= 0 && ob >= 0).then_some((oa, ob))
     }
 
     /// The format `insn`'s float operands are in, or `None` when the
@@ -201,7 +229,9 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &RunFacts) -> Opti
         }
         Opcode::FCvtF => simplify_fcvtf(insn, consts, facts),
         op if op.is_float_comparison() => simplify_fcmp(insn, consts, facts),
-        Opcode::FCvtS | Opcode::FCvtU | Opcode::Signbit => simplify_fcvt(insn, consts, facts),
+        Opcode::FCvtS | Opcode::FCvtU | Opcode::RoundToInteger(_) | Opcode::Signbit => {
+            simplify_fcvt(insn, consts, facts)
+        }
 
         // Unary
         Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),
@@ -569,6 +599,13 @@ fn simplify_comparison(
         return fold_with(insn, &[a, b]);
     }
 
+    // Two addresses into one object compare as their offsets into it.
+    if val1.is_none() && val2.is_none() {
+        if let Some((a, b)) = facts.offsets_in_one_object(src1, src2) {
+            return fold_with(insn, &[i128::from(a), i128::from(b)]);
+        }
+    }
+
     None
 }
 
@@ -709,7 +746,7 @@ fn simplify_fbinop(
     let a = consts.fget(insn.src[0], width)?;
     let b = consts.fget(insn.src[1], width)?;
     let fmt = facts.fp_format(insn.typ)?;
-    eval_fbinop(insn.op, fmt, a, b).map(Simplification::FoldToFloat)
+    eval_fbinop(insn.op, fmt, a, b, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
 
 /// Fold `Fma` of three constants.
@@ -725,7 +762,7 @@ fn simplify_fternop(
     let a = consts.fget(*a, width)?;
     let b = consts.fget(*b, width)?;
     let c = consts.fget(*c, width)?;
-    eval_fternop(insn.op, fmt, a, b, c).map(Simplification::FoldToFloat)
+    eval_fternop(insn.op, fmt, a, b, c, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
 
 /// Fold `FNeg` of a constant.
@@ -743,7 +780,7 @@ fn simplify_funop(
     }
     let a = consts.fget(insn.src[0], insn.size.max(1))?;
     let fmt = facts.fp_format(insn.typ)?;
-    eval_funop(insn.op, fmt, a).map(Simplification::FoldToFloat)
+    eval_funop(insn.op, fmt, a, facts.func.fp_rounding).map(Simplification::FoldToFloat)
 }
 
 /// Fold a float-to-float conversion of a constant, to `typ`'s format.
@@ -758,7 +795,8 @@ fn simplify_fcvtf(
     let a = consts.fget(insn.src[0], insn.operand_width())?;
     let src_fmt = facts.fp_format(insn.operand_type())?;
     let dst_fmt = facts.fp_format(insn.typ)?;
-    eval_fcvtf(insn.op, src_fmt, dst_fmt, a).map(Simplification::FoldToFloat)
+    eval_fcvtf(insn.op, src_fmt, dst_fmt, a, facts.func.fp_rounding)
+        .map(Simplification::FoldToFloat)
 }
 
 /// Fold a float-to-integer conversion of a constant, or a `Signbit` of one,
@@ -3136,6 +3174,10 @@ mod tests {
                 (Round, -0.5, -1.0),
                 (Rint, 4.0, 4.0),
                 (NearbyInt, -8.0, -8.0),
+                // Ties to even, whatever the direction.
+                (RoundEven, 2.5, 2.0),
+                (RoundEven, -3.5, -4.0),
+                (RoundEven, 1.75, 2.0),
             ] {
                 assert_eq!(
                     fold(how, arg).map(|v| v.to_f64()),
@@ -3399,5 +3441,85 @@ mod tests {
         // These read the same either way, so they fold.
         assert_eq!(fold_convert(Opcode::Trunc, 0x1200, 32, 8), Some(0));
         assert_eq!(fold_convert(Opcode::Trunc, 100, 32, 8), Some(100));
+    }
+
+    /// `op` of `&lhs + lhs_off` against `&rhs + rhs_off`, the addresses
+    /// formed the way the linearizer forms them (each `Sym` named through its
+    /// own pseudo): the constant it folds to, or `None`.
+    fn fold_address_compare(op: Opcode, lhs: (&str, i128), rhs: (&str, i128)) -> Option<i128> {
+        let types = host_types();
+        let ptr = types.void_ptr_id;
+        let insns = vec![
+            Instruction::sym_addr(PseudoId(2), PseudoId(0), ptr),
+            Instruction::binop(Opcode::Add, PseudoId(3), PseudoId(2), PseudoId(4), ptr, 64),
+            Instruction::sym_addr(PseudoId(5), PseudoId(1), ptr),
+            Instruction::binop(Opcode::Add, PseudoId(6), PseudoId(5), PseudoId(7), ptr, 64),
+            Instruction::compare(
+                op,
+                PseudoId(8),
+                (PseudoId(3), PseudoId(6)),
+                (ptr, 64),
+                (types.int_id, 32),
+            ),
+        ];
+        let pseudos = vec![
+            Pseudo::sym(PseudoId(0), lhs.0.to_string()),
+            Pseudo::sym(PseudoId(1), rhs.0.to_string()),
+            Pseudo::reg(PseudoId(2), 2),
+            Pseudo::reg(PseudoId(3), 3),
+            Pseudo::val(PseudoId(4), lhs.1),
+            Pseudo::reg(PseudoId(5), 5),
+            Pseudo::reg(PseudoId(6), 6),
+            Pseudo::val(PseudoId(7), rhs.1),
+            Pseudo::reg(PseudoId(8), 8),
+        ];
+        let mut func = make_test_func_with_insns(insns, pseudos);
+        run(&mut func, &types);
+        let got = insn_at(&func, 4);
+        (got.op == Opcode::Copy)
+            .then(|| func.const_val(got.src[0]))
+            .flatten()
+    }
+
+    /// Two addresses into one object compare as their offsets into it, by
+    /// every comparison: `&x.prev <= &x` is false, whatever `x`'s address.
+    #[test]
+    fn addresses_into_one_object_compare_as_their_offsets() {
+        for (op, want) in [
+            (Opcode::SetBe, 0),
+            (Opcode::SetB, 0),
+            (Opcode::SetA, 1),
+            (Opcode::SetAe, 1),
+            (Opcode::SetNe, 1),
+            (Opcode::SetEq, 0),
+            (Opcode::SetLt, 0),
+            (Opcode::SetGt, 1),
+        ] {
+            assert_eq!(
+                fold_address_compare(op, ("x", 8), ("x", 0)),
+                Some(want),
+                "{op:?}"
+            );
+        }
+        assert_eq!(
+            fold_address_compare(Opcode::SetEq, ("x", 4), ("x", 4)),
+            Some(1)
+        );
+    }
+
+    /// Two different objects are not ordered by anything the compiler knows,
+    /// and an address before an object's start compares as an unsigned
+    /// address near zero might: neither folds.
+    #[test]
+    fn addresses_this_cannot_order_are_left_alone() {
+        assert_eq!(fold_address_compare(Opcode::SetB, ("x", 0), ("y", 8)), None);
+        assert_eq!(
+            fold_address_compare(Opcode::SetEq, ("x", 0), ("y", 0)),
+            None
+        );
+        assert_eq!(
+            fold_address_compare(Opcode::SetB, ("x", -8), ("x", 0)),
+            None
+        );
     }
 }

@@ -14,7 +14,7 @@ use crate::common::{compile_and_run, compile_and_run_optimized};
 /// `__attribute__((fallthrough));` is a null statement carrying an attribute,
 /// the GNU spelling of C23's `[[fallthrough]]`, and the way code that builds
 /// with `-Wimplicit-fallthrough` marks a deliberate fall into the next case.
-/// `__has_attribute(fallthrough)` answers 1, so code that probes for it uses
+/// `__has_attribute(fallthrough)` answers 201910, so code that probes for it uses
 /// it -- and c17 rejected the statement as "declaration declares nothing".
 #[test]
 fn misc_fallthrough_statement_attribute() {
@@ -60,7 +60,7 @@ fn misc_statement_attributes_mega() {
  *  `__attribute__((fallthrough));` is a null statement carrying an attribute,
  *  the GNU spelling of C23's `[[fallthrough]]`, and the way code that builds
  *  with `-Wimplicit-fallthrough` marks a deliberate fall into the next case.
- *  `__has_attribute(fallthrough)` answers 1, so code that probes for it uses
+ *  `__has_attribute(fallthrough)` answers 201910, so code that probes for it uses
  *  it -- and c17 rejected the statement as "declaration declares nothing".
  */
 int f(int x) {

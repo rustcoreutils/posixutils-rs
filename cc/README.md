@@ -98,7 +98,8 @@ Supported:
 - The C17 language, C99 baseline and all C11 additions alike
 - C11 additions: `_Generic`, `_Atomic` / `<stdatomic.h>` (including access through ordinary operators), `<tgmath.h>`, `_Noreturn`, `_Static_assert`, `_Alignas` / `_Alignof`, `_Thread_local` (Local-Exec and Initial-Exec models), anonymous struct/union members, Unicode literals
 - GCC-compatible inline assembly: extended asm with constraints, clobbers,
-  named operands, matching constraints, `asm goto` with labels, SSE (`x`) and
+  named operands, matching constraints by number or name (`"[sum]"`), flag
+  outputs (`"=@ccz"`, `"=@cceq"`), `asm goto` with labels, SSE (`x`) and
   x87 (`t`/`u`) operand classes on x86-64, and vector (`w`) operands with the
   `b`/`h`/`s`/`d`/`q` width modifiers on AArch64; and basic asm at file scope
   (`__asm__(".symver ...");`), written verbatim in source order among the
@@ -133,9 +134,11 @@ Supported:
 Not yet implemented:
 - assembly peephole optimizations
 - the AVX families of intrinsics (`avxintrin.h` and later): `<immintrin.h>`
-  stops at SSE4.2, and `-march=x86-64-v3` claims no more than v2. The SSE
-  through SSE4.2 headers and a core `<arm_neon.h>` are bundled, written in C
-  over `vector_size` values
+  stops at SSE4.2 (with SHA-NI, RTM and CET's shadow stack), and
+  `-march=x86-64-v3` claims no more than v2. `-mavx2` and the rest of gcc's
+  ISA options are accepted and define gcc's macros, but c17 vectorizes
+  nothing with them. The SSE through SSE4.2 headers and a core
+  `<arm_neon.h>` are bundled, written in C over `vector_size` values
 
 Will not implement:
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested

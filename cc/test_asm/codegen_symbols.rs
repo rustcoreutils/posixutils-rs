@@ -485,3 +485,300 @@ int get(int i) { return y + x + s[i] + t; }
         );
     }
 }
+
+/// Position-independent code reaches a symbol that binds within the output
+/// -- `static`, or hidden or internal whether defined here or only declared
+/// -- PC-relative, never through the GOT, as gcc does: the Linux vDSO is
+/// built `-fPIC` and linked with no dynamic relocations, and glibc's loader
+/// runs before its GOT is relocated. A default or protected one, and a weak
+/// declaration that may stay null, still goes through the GOT.
+#[test]
+fn codegen_locally_bound_symbols_skip_the_got_under_pic() {
+    let src = r#"
+extern int hv __attribute__((visibility("hidden")));
+extern int iv __attribute__((visibility("internal")));
+static int sv = 1;
+__attribute__((visibility("hidden"))) int dv = 2;
+extern int ev;
+extern int wv __attribute__((weak, visibility("hidden")));
+extern int pv __attribute__((visibility("protected")));
+void set(int x) { sv = x; }
+int get(void) { return hv + iv + sv + dv + ev + pv; }
+int *addr_w(void) { return &wv; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let x86 = triple == X86_64_LINUX;
+        let direct = |n: &str| {
+            if x86 {
+                format!("{n}(%rip)")
+            } else {
+                format!(":lo12:{n}]")
+            }
+        };
+        let got = |n: &str| {
+            if x86 {
+                format!("{n}@GOTPCREL")
+            } else {
+                format!(":got:{n}")
+            }
+        };
+        for pic in ["-fPIC", "-fpic", "-fPIE"] {
+            let asm = asm_for_with("local_binding_pic", triple, src, &["-O2", pic]);
+            let get = body_of(&asm, "get");
+            for name in ["hv", "iv", "sv", "dv"] {
+                assert!(
+                    get.contains(&direct(name)) && !get.contains(&got(name)),
+                    "{triple} {pic}: {name} must be PC-relative:\n{get}"
+                );
+            }
+            for name in ["ev", "pv"] {
+                assert!(get.contains(&got(name)), "{triple} {pic}: {name}:\n{get}");
+            }
+            let addr = body_of(&asm, "addr_w");
+            assert!(addr.contains(&got("wv")), "{triple} {pic}:\n{addr}");
+        }
+    }
+}
+
+/// `#pragma GCC visibility push(hidden)` makes the declarations it encloses
+/// hidden -- an `extern` one too, unlike `-fvisibility=hidden` -- so they are
+/// marked `.hidden` and reached PC-relative under `-fPIC`, as gcc does: Linux
+/// force-includes the pragma into its PIE decompressor and EFI stub so they
+/// have no GOT. An explicit `visibility("default")` wins, the pushes nest,
+/// and after the last `pop` nothing is hidden. A block-scope `extern` is
+/// one of the declarations, as is one with its own attribute.
+#[test]
+fn codegen_visibility_pragma_hides_enclosed_declarations() {
+    let src = r#"
+#pragma GCC visibility push(hidden)
+extern int hv;
+extern int hfn(void);
+extern int ev __attribute__((visibility("default")));
+#pragma GCC visibility push(default)
+extern int dv;
+#pragma GCC visibility pop
+extern int hv2;
+int get(void) { extern int bv; return hv + hfn() + ev + dv + hv2 + bv; }
+#pragma GCC visibility pop
+extern int zv;
+int get2(void) { extern int ba __attribute__((visibility("hidden"))); return zv + ba; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let x86 = triple == X86_64_LINUX;
+        let direct = |n: &str| {
+            if x86 {
+                format!("{n}(%rip)")
+            } else {
+                format!(":lo12:{n}]")
+            }
+        };
+        let got = |n: &str| {
+            if x86 {
+                format!("{n}@GOTPCREL")
+            } else {
+                format!(":got:{n}")
+            }
+        };
+        let asm = asm_for_with("vis_pragma_pic", triple, src, &["-O2", "-fPIC"]);
+        let hidden: Vec<&str> = asm
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix(".hidden "))
+            .collect();
+        for name in ["hv", "hfn", "hv2", "bv", "ba", "get"] {
+            assert!(
+                hidden.contains(&name),
+                "{triple}: {name} not hidden:\n{asm}"
+            );
+        }
+        for name in ["ev", "dv", "zv", "get2"] {
+            assert!(!hidden.contains(&name), "{triple}: {name} hidden:\n{asm}");
+        }
+        let get_body = body_of(&asm, "get");
+        for name in ["hv", "hv2", "bv"] {
+            assert!(
+                get_body.contains(&direct(name)) && !get_body.contains(&got(name)),
+                "{triple}: {name} must be PC-relative:\n{get_body}"
+            );
+        }
+        for name in ["ev", "dv"] {
+            assert!(
+                get_body.contains(&got(name)),
+                "{triple}: {name}:\n{get_body}"
+            );
+        }
+        let get2 = body_of(&asm, "get2");
+        assert!(get2.contains(&got("zv")), "{triple}:\n{get2}");
+        assert!(get2.contains(&direct("ba")), "{triple}:\n{get2}");
+    }
+    // Mach-O spells hidden `.private_extern`.
+    let asm = asm_for_with("vis_pragma_macho", AARCH64_DARWIN, src, &["-O2"]);
+    for name in ["_hv", "_hfn", "_hv2", "_bv", "_get"] {
+        assert!(
+            asm.lines()
+                .any(|l| l.trim() == format!(".private_extern {name}")),
+            "{name}:\n{asm}"
+        );
+    }
+    assert!(!asm.contains(".private_extern _zv"), "{asm}");
+}
+
+/// `-fvisibility=hidden` gives its visibility to definitions only, and a
+/// `gnu_inline` body is not one: it provides no external definition, so the
+/// function is still whatever unit defines it out of line, and its address
+/// comes from the GOT under `-fPIC`, as gcc does. Taking it PC-relative made
+/// guile's shared library unlinkable ("relocation R_X86_64_PC32 against
+/// symbol `scm_car' can not be used when making a shared object"). The
+/// emitted definition beside it is still hidden.
+#[test]
+fn codegen_fvisibility_skips_inline_definitions() {
+    let src = r#"
+extern __inline__ __attribute__((__gnu_inline__)) int scm_car(int x) { return x + 1; }
+int (*p)(int);
+void init(void) { p = scm_car; }
+"#;
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_with(
+            "fvisibility_inline_def",
+            X86_64_LINUX,
+            src,
+            &[opt, "-fPIC", "-fvisibility=hidden"],
+        );
+        let init = body_of(&asm, "init");
+        assert!(init.contains("scm_car@GOTPCREL"), "{opt}:\n{init}");
+        assert!(!asm.contains(".hidden scm_car"), "{opt}:\n{asm}");
+        assert!(asm.contains(".hidden init"), "{opt}:\n{asm}");
+    }
+}
+
+/// Shared-object code calls an exported function of its own through the
+/// PLT and never inlines it, as gcc's `-fPIC` default: the executable may
+/// interpose its own definition, and the library's calls must reach that
+/// one (binutils' ld-vsb tests). Code for an executable, a hidden or
+/// `inline` callee, and `-fno-semantic-interposition` inline it.
+#[test]
+fn codegen_shared_object_calls_interposable_functions() {
+    let src = r#"
+int f(void) { return 1; }
+__attribute__((visibility("hidden"))) int hf(void) { return 2; }
+inline int inf(void) { return 3; }
+extern int inf(void);
+int g(void) { return f(); }
+int hg(void) { return hf() + inf(); }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let call = if triple == X86_64_LINUX {
+            "f@PLT"
+        } else {
+            "bl f"
+        };
+        let asm = asm_for_with("interpose_pic", triple, src, &["-O2", "-fPIC"]);
+        let g = body_of(&asm, "g");
+        assert!(g.contains(call), "{triple}: f inlined:\n{g}");
+        let hg = body_of(&asm, "hg");
+        assert!(
+            !hg.contains("hf") && !hg.contains("inf"),
+            "{triple}: hf and inf bind locally:\n{hg}"
+        );
+        for flags in [
+            &["-O2", "-fPIE"][..],
+            &["-O2", "-fPIC", "-fno-semantic-interposition"],
+        ] {
+            let asm = asm_for_with("interpose_pie", triple, src, flags);
+            let g = body_of(&asm, "g");
+            assert!(!g.contains(call), "{triple} {flags:?}:\n{g}");
+        }
+    }
+}
+
+/// aarch64 shared-object code reaches its own exported objects and takes
+/// its own exported functions' addresses through the GOT, as gcc does: the
+/// executable may interpose them, and `ld -shared` refuses a page-relative
+/// reference to a symbol that may bind elsewhere. Code for an executable
+/// reaches them directly; a `gnu_inline` body defines nothing, so its
+/// address is the GOT's even under `-fvisibility=hidden`.
+#[test]
+fn codegen_aarch64_shared_object_exports_go_through_the_got() {
+    let src = r#"
+int gv = 3;
+static int sv = 4;
+__attribute__((visibility("hidden"))) int hv = 5;
+int f(void) { return 1; }
+__attribute__((visibility("protected"))) int pf(void) { return 2; }
+extern __inline__ __attribute__((__gnu_inline__)) int scm_car(int x) { return x + 1; }
+int get(void) { return gv + sv + hv; }
+void *addr_f(void) { return f; }
+void *addr_pf(void) { return pf; }
+void *addr_car(void) { return scm_car; }
+"#;
+    let asm = asm_for_with(
+        "aarch64_pic_exports",
+        AARCH64_LINUX,
+        src,
+        &["-O2", "-fPIC", "-fvisibility=default"],
+    );
+    let get = body_of(&asm, "get");
+    assert!(get.contains(":got:gv"), "{get}");
+    for name in ["sv", "hv"] {
+        assert!(!get.contains(&format!(":got:{name}")), "{name}:\n{get}");
+    }
+    assert!(body_of(&asm, "addr_f").contains(":got:f"), "{asm}");
+    assert!(!body_of(&asm, "addr_pf").contains(":got:"), "{asm}");
+    for flags in [
+        &["-O2", "-fPIC"][..],
+        &["-O2", "-fPIC", "-fvisibility=hidden"],
+    ] {
+        let asm = asm_for_with("aarch64_pic_car", AARCH64_LINUX, src, flags);
+        let car = body_of(&asm, "addr_car");
+        assert!(car.contains(":got:scm_car"), "{flags:?}:\n{car}");
+    }
+    let asm = asm_for_with("aarch64_pie_exports", AARCH64_LINUX, src, &["-O2", "-fPIE"]);
+    assert!(!body_of(&asm, "get").contains(":got:"), "{asm}");
+    assert!(!body_of(&asm, "addr_f").contains(":got:"), "{asm}");
+}
+
+/// Position-dependent x86-64 code takes a symbol's address as an absolute
+/// 32-bit immediate (`R_X86_64_32`), as gcc does, which is what makes the
+/// linker give a library function its canonical PLT address; PIE and PIC
+/// code keep `leaq` and the GOT. Mach-O code is position independent
+/// whatever it is told.
+#[test]
+fn codegen_no_pie_symbol_address_is_an_immediate() {
+    let src = r#"
+extern int f(void);
+extern int ev;
+static int sv;
+void *a(void) { return (void *)f; }
+int *b(void) { return &ev; }
+int *c(void) { return &sv; }
+int d(void) { return ev; }
+"#;
+    let asm = asm_for_with("nopie_addr", X86_64_LINUX, src, &["-O2", "-fno-pie"]);
+    for (func, name) in [("a", "f"), ("b", "ev"), ("c", "sv")] {
+        let body = body_of(&asm, func);
+        assert!(
+            body.contains(&format!("movl ${name}, %")),
+            "{func}:\n{body}"
+        );
+    }
+    // A load is still PC-relative, as gcc's.
+    assert!(body_of(&asm, "d").contains("ev(%rip)"), "{asm}");
+    // A name only read quoted keeps `leaq`: gas misreads a quoted
+    // immediate's `@` suffix (binutils' ld-size `bar@SIZE`).
+    let sized = "extern char size_of_bar __asm__(\"bar@SIZE\");\n\
+                 long e(void) { return (long)&size_of_bar; }\n";
+    let asm = asm_for_with("nopie_quoted", X86_64_LINUX, sized, &["-O2", "-fno-pie"]);
+    assert!(
+        body_of(&asm, "e").contains("leaq \"bar@SIZE\"(%rip)"),
+        "{asm}"
+    );
+    let asm = asm_for_with("pie_addr", X86_64_LINUX, src, &["-O2", "-fPIE"]);
+    assert!(body_of(&asm, "a").contains("f@GOTPCREL"), "{asm}");
+    assert!(body_of(&asm, "c").contains("leaq sv(%rip)"), "{asm}");
+    let asm = asm_for_with(
+        "macho_addr",
+        "x86_64-apple-darwin",
+        src,
+        &["-O2", "-fno-pie"],
+    );
+    assert!(!asm.contains("movl $"), "{asm}");
+}

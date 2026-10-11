@@ -7,7 +7,8 @@
  * SPDX-License-Identifier: MIT
  *
  * Written from the instruction semantics in Intel's Intrinsics Guide, over
- * GNU vectors and c17's vector builtins: no `__builtin_ia32_*`. Every
+ * GNU vectors and c17's vector builtins: no `__builtin_ia32_*` but the
+ * time-stamp counter's, which glibc calls by those names too. Every
  * function is available whatever -m flags are given; the feature macros
  * (`__SSE4_1__` and the rest) follow the flags, as gcc's do.
  */
@@ -17,13 +18,10 @@
 
 #include <immintrin.h>
 
-/* The time-stamp counter. */
-__C17_INTRIN unsigned long long __rdtsc(void)
-{
-    unsigned int __lo, __hi;
-    __asm__ __volatile__("rdtsc" : "=a"(__lo), "=d"(__hi));
-    return ((unsigned long long)__hi << 32) | __lo;
-}
+/* The time-stamp counter, alone and with the processor's signature: gcc's
+   builtins, which c17 has too. */
+__C17_INTRIN unsigned long long __rdtsc(void) { return __builtin_ia32_rdtsc(); }
+__C17_INTRIN unsigned long long __rdtscp(unsigned int *__aux) { return __builtin_ia32_rdtscp(__aux); }
 
 __C17_INTRIN int __bsfd(int __x) { return __builtin_ctz((unsigned int)__x); }
 __C17_INTRIN int __bsrd(int __x) { return 31 - __builtin_clz((unsigned int)__x); }

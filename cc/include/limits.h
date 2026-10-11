@@ -97,4 +97,16 @@
 /* Maximum value an unsigned long long int can hold (minimum is 0) */
 #define ULLONG_MAX (__LONG_LONG_MAX__ * 2ULL + 1ULL)
 
+/* The GNU spellings of the long long limits, under gcc's condition: glibc's
+   _GNU_SOURCE, or with any other C library, unless __STRICT_ANSI__. glibc's
+   vfprintf-internal.c needs them. */
+#if defined(__GNU_LIBRARY__) ? defined(__USE_GNU) : !defined(__STRICT_ANSI__)
+#undef LONG_LONG_MIN
+#undef LONG_LONG_MAX
+#undef ULONG_LONG_MAX
+#define LONG_LONG_MIN (-__LONG_LONG_MAX__ - 1LL)
+#define LONG_LONG_MAX __LONG_LONG_MAX__
+#define ULONG_LONG_MAX (__LONG_LONG_MAX__ * 2ULL + 1ULL)
+#endif
+
 #endif /* _C17_LIMITS_H */

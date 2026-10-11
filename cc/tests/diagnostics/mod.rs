@@ -29,8 +29,7 @@ mod narrow_initializers;
 mod parse_error_location;
 
 use crate::common::{
-    compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_ok,
-    create_c_file, run_c17,
+    compile_and_run, compile_expect_error, compile_expect_ok, create_c_file, run_c17,
 };
 
 // ============================================================================
@@ -290,7 +289,7 @@ fn diagnostics_jump_rules_reach_inside_statement_expressions() {
     );
     assert_eq!(errors.len(), 2, "{errors:?}");
     assert!(
-        errors[0].contains("jump into the scope of 'a'"),
+        errors[0].contains("jump into scope of identifier with variably modified type"),
         "{errors:?}"
     );
     assert!(
@@ -760,6 +759,21 @@ fn diagnostics_shift_count_warnings_can_be_turned_off() {
     }
 }
 
+/// A shift by a width-derived count in the arm a constant condition
+/// discards builds under `-Werror` and runs, as with gcc: the guard is how
+/// generic code keeps the shift from ever happening.
+#[test]
+fn diagnostics_shift_count_in_a_discarded_arm_builds_under_werror() {
+    let src = "#define W 64\n\
+               static unsigned long f(unsigned long x) { return W > 64 ? x << (64 - W - 1) : x; }\n\
+               static unsigned long g(unsigned long x) { return W <= 64 ? x : x >> (W - 128); }\n\
+               int main(void) { return !(f(5) == 5 && g(6) == 6); }\n";
+    assert_eq!(
+        crate::common::compile_and_run("shift_discarded_arm", src, &["-Werror".to_string()]),
+        0
+    );
+}
+
 /// C17 6.5.7p3: "the type of the result is that of the promoted left operand".
 /// The right operand's type never reaches the result, and c17 took the usual
 /// arithmetic conversions instead -- so `1 << 1L` came out `long` and
@@ -1035,27 +1049,24 @@ int main(void) { return use(1) == 2 ? 0 : 1; }
     assert_eq!(compile_and_run("diag_plain_inline_ok", code, &[]), 0);
 }
 
-/// An `always_inline` call the inliner merely *declined* is not an error
-/// either.
+/// An `always_inline` call in a large recursive caller is spliced, at every
+/// level, as gcc splices it -- neither declined nor diagnosed.
 ///
-/// The caps on caller size and on recursive stack depth are c17's own -- gcc
-/// has no counterpart -- so a refusal by one of them says nothing about
-/// whether an out-of-line definition exists. Reporting it rejected programs
-/// gcc compiles, and this is the shape that reaches it: glibc's
-/// `__fortify_function` is exactly an `extern __inline` `gnu_inline`
-/// `always_inline` definition, and any recursive function over a few hundred
-/// instructions calling one declines the splice.
-///
-/// Two translation units, because that is the arrangement the idiom names: the
-/// header's inline definition promises an out-of-line copy elsewhere, and the
-/// call the inliner left standing is resolved against it.
+/// c17's caps on caller size and recursive stack depth used to decline it,
+/// and the call left standing was resolvable only against an out-of-line
+/// copy from another unit. The kernel's FORTIFY helpers -- `extern inline`
+/// `gnu_inline` `always_inline`, like glibc's `__fortify_function` -- have
+/// none anywhere, so the link failed; and treating the refusal as an error
+/// instead rejected programs gcc compiles. This unit defines no `helper`
+/// but its inline body, so it links only when every call is spliced.
 #[test]
-fn diagnostics_always_inline_declined_for_stack_depth_is_not_an_error() {
+fn diagnostics_always_inline_in_a_large_recursive_caller_is_spliced() {
     let header_user = r#"
 extern __inline __attribute__((__gnu_inline__, __always_inline__))
 int helper(int x) { return x + 1; }
 
-/* Large enough that the recursive-caller stack guard turns the splice down. */
+/* Large enough that the recursive-caller stack guard would refuse a
+   plain inline. */
 int rec(int i)
 {
     int t = 0;
@@ -1265,15 +1276,11 @@ int rec(int i)
 
 int main(void) { return rec(1) == 0 ? 1 : 0; }
 "#;
-    let out_of_line = r#"
-int helper(int x) { return x + 1; }
-"#;
     for opt in ["-O0", "-O2"] {
         assert_eq!(
-            compile_and_run_two_units(
-                &format!("diag_always_inline_declined{opt}"),
+            compile_and_run(
+                &format!("diag_always_inline_recursive{opt}"),
                 header_user,
-                out_of_line,
                 &[opt.to_string()],
             ),
             0,

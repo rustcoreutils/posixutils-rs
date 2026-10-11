@@ -22,8 +22,6 @@ pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
         // userland (GNU/kFreeBSD), nor `__BSD_VISIBLE`, which <sys/cdefs.h>
         // computes from the feature-test macros a program defines -- as the
         // system compiler leaves it to.
-        // POSIX threads
-        ("_REENTRANT", Some("1".into())),
     ]
 }
 

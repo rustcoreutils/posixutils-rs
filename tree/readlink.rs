@@ -12,6 +12,7 @@ use gettextrs::gettext;
 use std::fs;
 use std::io::Write;
 use std::io::{stderr, stdout};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::path::{Component, Path};
 
@@ -125,6 +126,12 @@ fn do_readlink(args: Args) -> Result<String, String> {
         }
     } else {
         match fs::symlink_metadata(pathname_path) {
+            // POSIX pathname resolution: a trailing <slash> resolves the last component, and a
+            // pathname so resolved that names no directory fails with ENOTDIR. Linux's lstat()
+            // reports it; macOS's follows `link/` to a file and succeeds.
+            Ok(me) if !me.is_dir() && pathname_path.as_os_str().as_bytes().ends_with(b"/") => {
+                map_io_error(&std::io::Error::from_raw_os_error(libc::ENOTDIR))
+            }
             Ok(me) => {
                 if !me.is_symlink() {
                     // POSIX: "If file does not name a symbolic link, readlink shall write a

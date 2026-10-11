@@ -9,7 +9,9 @@
 // Architecture-independent code generation interface
 //
 
-use crate::arch::lir::{is_private_name, Directive, EmitAsm, LirInst, OperandSize, Symbol};
+use crate::arch::lir::{
+    is_private_name, Directive, EmitAsm, LirInst, OperandSize, SectionFlags, Symbol,
+};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::float::{FloatVal, FpFormat};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
@@ -128,8 +130,11 @@ pub struct CodeGenBase<I: LirInst> {
     /// The x86-64 ISA of the function being emitted (`ir::Function::isa`),
     /// which picks the instructions a vector operation becomes.
     pub isa: crate::target::X86Isa,
-    /// Whether to emit unwind tables (the CFI procedures and their frame rules)
-    pub emit_unwind_tables: bool,
+    /// The aarch64 branch protection of the function being emitted
+    /// (`ir::Function::branch_protection`).
+    pub branch_protection: crate::target::BranchProtection,
+    /// Where the CFI procedures and their frame rules go, if anywhere.
+    pub cfi: crate::target::Cfi,
     /// A source position for the function being emitted, for a backend
     /// diagnostic that has no nearer one -- `crate::abi::slot_bytes` and
     /// `crate::arch::regalloc::grow_frame` report against it. Set from
@@ -138,22 +143,29 @@ pub struct CodeGenBase<I: LirInst> {
     /// Last emitted source line (for avoiding duplicate .loc directives)
     pub last_debug_line: u32,
     /// Last emitted source file index
-    pub last_debug_file: u16,
+    pub last_debug_file: u32,
+    /// The line table's files, and which one each preprocessor stream
+    /// reads: what a `.loc` and a `DW_AT_decl_file` number a position by.
+    pub source_files: crate::ir::SourceFiles,
     /// Whether to emit debug info (.file/.loc directives)
     pub emit_debug: bool,
     /// What selects the thread-local access model: whether the output has
     /// to be able to live in a shared object (`-shared`, `-fpic`, `-fPIC`),
-    /// and `-ftls-model=`; see [`CodeGenBase::use_tls_dynamic`].
+    /// and `-ftls-model=`; see [`CodeGenBase::tls_model`].
     pub tls: crate::target::TlsPolicy,
+    /// The access model of each thread-local; see
+    /// [`CodeGenBase::plan_thread_locals`].
+    pub tls_models: std::collections::HashMap<String, crate::target::TlsModel>,
     /// `-fverbose-asm`: annotate the generated instructions.
     pub verbose_asm: bool,
-    /// `-fcf-protection`, which only x86-64's `__builtin_setjmp` and
-    /// `__builtin_longjmp` read.
+    /// `-fcf-protection`, which only x86-64 reads: for its landing pads, and
+    /// the layout of `__builtin_setjmp`'s buffer.
     pub cf_protection: crate::target::CfProtection,
-    /// `-fstack-clash-protection`; see [`CodeGenBase::check_stack_clash`].
-    pub stack_clash: bool,
+    /// `-fstack-clash-protection` and its `--param`s; see
+    /// [`CodeGenBase::check_stack_clash`].
+    pub stack_clash: Option<crate::target::StackClash>,
     /// `-fstack-protector` and its levels; see `arch::stack_protect`.
-    pub stack_protector: crate::target::StackProtector,
+    pub stack_protector: crate::target::StackProtection,
     /// Trailing comments to hang off individual LIR instructions, by their
     /// index in `lir_buffer`.
     ///
@@ -175,31 +187,345 @@ pub struct CodeGenBase<I: LirInst> {
     /// Extended asm statements emitted so far in this module: the next one's
     /// `%=` number; see [`CodeGenBase::next_asm_instance`].
     pub asm_instances: u32,
+    /// The flags of each section the program named, decided for all of its
+    /// definitions at once; see [`CodeGenBase::plan_named_sections`].
+    pub named_sections: std::collections::HashMap<String, SectionFlags>,
+    /// The symbols the static linker resolves within the output being
+    /// built; see [`CodeGenBase::plan_local_binding`].
+    pub binds_locally: std::collections::HashSet<String>,
+    /// `-ffunction-sections`, `-fdata-sections`, `-fcommon`, `-fno-plt`.
+    pub layout: crate::target::ObjectLayout,
+    /// `-falign-functions`, `-fpatchable-function-entry=` and their kin.
+    pub shape: crate::target::FunctionShape,
+    /// The shape of the function being emitted: [`Self::shape_of`] it.
+    pub fn_shape: crate::target::FunctionShape,
+    /// The `__patchable_function_entries` records written so far: the
+    /// next one's label number.
+    pub patchable_entries: u32,
+    /// The `-fexceptions` tables: the LSDAs and what they name.
+    pub eh: super::eh::EhTables,
+    /// Whether the unit is optimized, which decides with what certainty a
+    /// static function is known to be called only directly.
+    pub optimizing: bool,
+    /// Under branch protection, where an indirect branch may land.
+    pub landing_pads: super::landing_pads::LandingPads,
+}
+
+/// The own section of `global` under `-fdata-sections` or `retain`, named as
+/// gcc names it: the section it would otherwise share, then `.` and its
+/// name -- `.bss.x`, `.tdata.x`, `.rodata.x`, `.data.rel.ro.x`, `.data.x`
+/// -- and marked `R` when retained.
+fn own_data_section(global: &crate::ir::GlobalDef, zero_init: bool) -> Directive {
+    let name = &global.name;
+    let retain = global.symbol_attrs.retain;
+    let r = if retain { "R" } else { "" };
+    let (name, flags) = if global.is_thread_local {
+        if matches!(global.init, Initializer::None) {
+            (
+                format!(".tbss.{name},\"awT{r}\",@nobits"),
+                SectionFlags::ThreadLocal,
+            )
+        } else {
+            (format!(".tdata.{name}"), SectionFlags::ThreadLocal)
+        }
+    } else if global.is_const {
+        if global.init.has_reloc() {
+            (format!(".data.rel.ro.{name}"), SectionFlags::Writable)
+        } else {
+            (format!(".rodata.{name}"), SectionFlags::ReadOnly)
+        }
+    } else if zero_init {
+        (
+            format!(".bss.{name},\"aw{r}\",@nobits"),
+            SectionFlags::Writable,
+        )
+    } else {
+        (format!(".data.{name}"), SectionFlags::Writable)
+    };
+    Directive::NamedSection {
+        name,
+        flags,
+        retain,
+    }
 }
 
 impl<I: LirInst + EmitAsm> CodeGenBase<I> {
+    /// The alignment directives before `func`'s label, whose code the
+    /// target already aligns to `1 << least_log` bytes: the function's own
+    /// `aligned(N)`, raised to `-fmin-function-alignment=` (gcc 14's, which
+    /// every function gets); then, for a function that asked for none,
+    /// `-falign-functions`, as gcc writes it.
+    pub fn function_alignment(&self, func: &Function, least_log: u32) -> Vec<Directive> {
+        let user = func.align.map(u32::trailing_zeros);
+        let min = (self.shape.min_align > 1)
+            .then(|| self.shape.min_align.next_power_of_two().trailing_zeros());
+        let base = [user, min, Some(least_log)].into_iter().flatten().max();
+        let mut directives: Vec<Directive> = base
+            .filter(|&log| log > 0)
+            .map(Directive::Align)
+            .into_iter()
+            .collect();
+        if let (None, Some(spec)) = (user, self.shape.align) {
+            directives.extend(spec.levels().into_iter().map(|level| {
+                if level.limited() {
+                    Directive::AlignMax {
+                        log: level.log,
+                        max_skip: level.max_skip,
+                    }
+                } else {
+                    Directive::Align(level.log)
+                }
+            }));
+        }
+        directives
+    }
+
+    /// How `func` begins and ends: the options' shape, with what its own
+    /// `patchable_function_entry` and `zero_call_used_regs` say in place of
+    /// theirs. Mach-O has no `__patchable_function_entries`, and the option
+    /// is refused there, so the attribute asks for nothing.
+    pub fn shape_of(&self, func: &Function) -> crate::target::FunctionShape {
+        let mut shape = func.shape.apply(self.shape);
+        if self.target.os == Os::MacOS {
+            shape.patchable = None;
+        }
+        shape
+    }
+
+    /// `-fpatchable-function-entry=N,M`'s part of `func`'s entry, as gcc
+    /// writes it: before its label (`before_label`) the `M` nops, and after
+    /// its landing pad (`endbr64`, `bti c`) the other `N - M`. The record of
+    /// where they start -- a `__patchable_function_entries` entry, its
+    /// section linked to the function's so the linker keeps or drops the
+    /// two together -- goes before the first of them, and so after the label
+    /// when `M` is 0.
+    pub fn patchable_entry(&mut self, func: &Function, before_label: bool) -> Vec<Directive> {
+        let Some(entry) = self.shape_of(func).patchable else {
+            return Vec::new();
+        };
+        let (nops, recorded_here) = if before_label {
+            (entry.before, entry.before > 0)
+        } else {
+            (entry.total - entry.before, entry.before == 0)
+        };
+        let mut directives = Vec::new();
+        if recorded_here {
+            let label = format!(".LPFE{}", self.patchable_entries);
+            self.patchable_entries += 1;
+            let word = match self.target.arch {
+                crate::target::Arch::X86_64 => ".quad",
+                crate::target::Arch::Aarch64 => ".8byte",
+            };
+            directives.push(Directive::Verbatim(format!(
+                "\t.section\t__patchable_function_entries,\"awo\",@progbits,{label}\n\
+                 \t.p2align 3\n\t{word}\t{label}"
+            )));
+            directives.push(self.function_section(func).unwrap_or(Directive::Text));
+            directives.push(Directive::local_label(label));
+        }
+        directives.extend((0..nops).map(|_| Directive::Raw("nop".to_string())));
+        directives
+    }
+
     /// Create a new CodeGenBase for the given target
     pub fn new(target: Target) -> Self {
         Self {
             isa: target.x86_isa,
+            branch_protection: target.branch_protection,
             target,
             output: String::new(),
             lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
             current_fn: String::new(),
-            emit_unwind_tables: true,
+            cfi: crate::target::Cfi::EhFrame,
             func_pos: crate::diag::Position::default(),
             last_debug_line: 0,
             last_debug_file: 0,
+            source_files: Default::default(),
             emit_debug: false,
             tls: crate::target::TlsPolicy::default(),
+            tls_models: std::collections::HashMap::new(),
             verbose_asm: false,
             cf_protection: crate::target::CfProtection::default(),
-            stack_clash: false,
-            stack_protector: crate::target::StackProtector::Off,
+            stack_clash: None,
+            stack_protector: crate::target::StackProtection::default(),
             lir_comments: std::collections::HashMap::new(),
             value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
             asm_instances: 0,
+            named_sections: std::collections::HashMap::new(),
+            binds_locally: std::collections::HashSet::new(),
+            layout: Default::default(),
+            shape: Default::default(),
+            fn_shape: Default::default(),
+            patchable_entries: 0,
+            eh: Default::default(),
+            optimizing: false,
+            landing_pads: Default::default(),
+        }
+    }
+
+    /// Note which symbols bind within the output being built, whatever
+    /// else is linked with it, so position-independent code reaches them
+    /// PC-relative instead of through the GOT, as gcc does (`binds_local_p`).
+    /// The Linux vDSO, built `-fPIC`, is linked with no dynamic relocations
+    /// at all, and glibc's loader runs code before its own GOT is relocated.
+    ///
+    /// Wherever the code goes, that is a `static` definition, and one with
+    /// hidden or internal visibility, defined here or only declared; and a
+    /// protected function defined here, whose address the dynamic linker
+    /// never gives to another object's definition. Code for an executable
+    /// (a PIE) also binds everything it defines but a common symbol, which
+    /// may be merged with another object's definition: nothing loaded later
+    /// can replace an executable's definition. Shared-object code does not: an
+    /// exported definition may be interposed at load time by one in the
+    /// executable or an earlier library.
+    ///
+    /// A weak declaration may stay undefined, and only the GOT can hold its
+    /// null; a protected object may be copied into the executable, so its
+    /// address is the GOT's to give too. ELF only: Mach-O's `.private_extern`
+    /// is left to the GOT, as before.
+    pub fn plan_local_binding(&mut self, module: &Module) {
+        self.binds_locally.clear();
+        if self.target.os == Os::MacOS {
+            return;
+        }
+        let executable = !self.tls.shared_code;
+        let local_visibility =
+            |visibility: Option<&str>| matches!(visibility, Some("hidden" | "internal"));
+        let functions = module
+            .functions
+            .iter()
+            .filter(|f| {
+                let visibility = f.symbol_attrs.visibility.as_deref();
+                f.is_static
+                    || local_visibility(visibility)
+                    || (f.emit && (executable || visibility == Some("protected")))
+            })
+            .map(|f| &f.name);
+        let objects = module
+            .globals
+            .iter()
+            .filter(|g| {
+                g.is_static
+                    || local_visibility(g.symbol_attrs.visibility.as_deref())
+                    || (executable && !self.is_common(g))
+            })
+            .map(|g| &g.name);
+        // An indirect function's address is the one its resolver picks,
+        // which only the GOT gives in every kind of output.
+        let aliases = module
+            .aliases
+            .iter()
+            .filter(|a| a.form == crate::parse::ast::AliasForm::Alias)
+            .filter(|a| a.is_static || executable || local_visibility(a.visibility.as_deref()))
+            .map(|a| &a.name);
+        let declared = module
+            .declared_symbol_attrs
+            .iter()
+            .filter(|(_, attrs)| local_visibility(attrs.visibility.as_deref()) && !attrs.weak)
+            .map(|(name, _)| name);
+        let binds_locally = functions
+            .chain(objects)
+            .chain(aliases)
+            .chain(declared)
+            .cloned()
+            .collect();
+        self.binds_locally = binds_locally;
+    }
+
+    /// Whether `global` is emitted as a common symbol: `-fcommon`'s
+    /// tentative definition -- one with no initializer anywhere in the unit
+    /// -- unless it has internal linkage, is thread-local, is weak or names
+    /// its section, as gcc. A common symbol may be merged with a definition
+    /// elsewhere, so it never binds locally in position-independent code.
+    pub fn is_common(&self, global: &crate::ir::GlobalDef) -> bool {
+        self.layout.common
+            && self.target.os != Os::MacOS
+            && !global.is_static
+            && !global.is_thread_local
+            && !global.symbol_attrs.weak
+            && !global.symbol_attrs.retain
+            && global.symbol_attrs.section.is_none()
+            && !is_private_name(&global.name)
+            && matches!(global.init, Initializer::None)
+    }
+
+    /// Whether the definition with `attrs` is retained: `retain`, which
+    /// only ELF can express, as `SHF_GNU_RETAIN`.
+    pub fn retains(&self, attrs: &crate::parse::ast::SymbolAttrs) -> bool {
+        attrs.retain && self.target.os != Os::MacOS
+    }
+
+    /// The section `func` goes in, when it is not `.text`: the one its
+    /// `section` attribute names, or under `-ffunction-sections` or `retain`
+    /// its own `.text.NAME`, gcc's name, so that `ld --gc-sections` can
+    /// drop it -- or, retained, must keep it.
+    pub fn function_section(&self, func: &Function) -> Option<Directive> {
+        let retain = self.retains(&func.symbol_attrs);
+        let name = match &func.symbol_attrs.section {
+            Some(name) => name.clone(),
+            None if (self.layout.function_sections || retain) && self.target.os != Os::MacOS => {
+                format!(".text.{}", func.name)
+            }
+            None => return None,
+        };
+        Some(Directive::NamedSection {
+            name,
+            flags: SectionFlags::Code,
+            retain,
+        })
+    }
+
+    /// `-fno-plt`: whether a call to `name` loads the function's address
+    /// from its GOT entry and calls that, rather than calling a PLT stub --
+    /// every function that may bind outside the output, in ELF code, as
+    /// gcc does.
+    pub fn calls_through_got(&self, name: &str) -> bool {
+        !self.layout.plt
+            && self.target.os != Os::MacOS
+            && !is_private_name(name)
+            && !self.binds_locally.contains(name)
+    }
+
+    /// Whether position-independent code reaches `name` through the GOT:
+    /// every symbol that may bind outside the output being built (see
+    /// [`Self::plan_local_binding`]), except a name c17 made up.
+    pub fn pic_needs_got(&self, name: &str, pic: bool) -> bool {
+        pic && !super::lir::is_private_name(name) && !self.binds_locally.contains(name)
+    }
+
+    /// Decide the flags of every section the program named, before any
+    /// definition is emitted into one: one ELF section has one set, so its
+    /// definitions decide them together, as gcc's `get_section` does.
+    ///
+    /// A `const` object holding addresses is read-only in position-dependent
+    /// code -- the kernel's `__initconst`, which is `"a"` for every object in
+    /// it -- but in position-independent code the loader writes it before
+    /// it can be protected, `.data.rel.ro`'s case, so it is `"aw"`, and the
+    /// read-only objects sharing its section go there with it. Pairs that
+    /// cannot share at all were reported by the linearizer
+    /// (`check_section_conflicts`); the strongest claim stands for them.
+    pub fn plan_named_sections(&mut self, module: &Module, pic: bool) {
+        use crate::ir::SectionUse;
+        self.named_sections.clear();
+        let functions = module
+            .functions
+            .iter()
+            .filter(|f| f.emit)
+            .filter_map(|f| Some((f.symbol_attrs.section.as_ref()?, SectionFlags::Code)));
+        let objects = module.globals.iter().filter_map(|g| {
+            let flags = match g.section_use() {
+                SectionUse::Code => SectionFlags::Code,
+                SectionUse::ThreadLocal => SectionFlags::ThreadLocal,
+                SectionUse::Writable => SectionFlags::Writable,
+                SectionUse::ReadOnly { relocs } if relocs && pic => SectionFlags::Writable,
+                SectionUse::ReadOnly { .. } => SectionFlags::ReadOnly,
+            };
+            Some((g.symbol_attrs.section.as_ref()?, flags))
+        });
+        for (name, flags) in functions.chain(objects) {
+            let slot = self.named_sections.entry(name.clone()).or_insert(flags);
+            *slot = (*slot).max(flags);
         }
     }
 
@@ -223,13 +549,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// default: 4 KiB on x86-64; 64 KiB on aarch64, less the 1 KiB a caller
     /// may leave untouched below its own frame.
     pub fn check_stack_clash(&self, func: &Function, adjustment: i64) {
-        if !self.stack_clash {
+        let Some(stack_clash) = self.stack_clash else {
             return;
-        }
-        let guard = match self.target.arch {
-            crate::target::Arch::X86_64 => 4096,
-            crate::target::Arch::Aarch64 => 64 * 1024 - 1024,
         };
+        let guard = stack_clash.probed_from(self.target.arch);
         let dynamic = func
             .blocks
             .iter()
@@ -245,6 +568,29 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
+    /// `-Wframe-larger-than=`: warn, as gcc does, when this function's
+    /// frame is larger than the limit. The size is gcc's measure as near as
+    /// c17's frame allows -- the locals, the spill slots and the variadic
+    /// register save area -- and leaves out what gcc leaves out: the saved
+    /// registers, the return address and frame record, the outgoing
+    /// arguments, and what `alloca` and variable-length arrays take at run
+    /// time. gcc points at the function's closing brace; c17 has no position
+    /// for it and names the function's first line instead.
+    pub fn check_frame_size(&self, frame_bytes: i64) {
+        let Some(limit) = crate::diag::frame_larger_than() else {
+            return;
+        };
+        let size = frame_bytes.max(0) as u64;
+        if size > limit {
+            crate::diag::group_warning_args(
+                crate::diag::FRAME_LARGER_THAN_WARNING,
+                self.func_pos,
+                "the frame size of {0} bytes is larger than {1} bytes",
+                &[&size.to_string(), &limit.to_string()],
+            );
+        }
+    }
+
     /// Attach `text` to the next instruction pushed, as a trailing comment.
     ///
     /// Does nothing unless `-fverbose-asm` asked for it.
@@ -254,41 +600,68 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
-    /// Whether thread-local access must use the dynamic model.
-    ///
-    /// Initial Exec resolves the offset through the GOT at load time, which
-    /// requires the object's thread-locals to fit in the loader's static-TLS
-    /// surplus -- so a library `dlopen`ed later with a large block is rejected.
-    /// Only the dynamic model has no such limit.
-    ///
-    /// `tls.shared_code` is set for `-shared` and for `-fPIC`, which asks for
-    /// code that can live in a shared object -- the same requirement. It is
-    /// *not* set for `-fPIE` or the PIE default, because a PIE executable
-    /// still resolves its own thread-locals at link time. And
-    /// `-ftls-model=initial-exec` or `local-exec` waives the requirement.
-    ///
-    /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given,
-    /// since that pass is what puts the address computation where the register
-    /// allocator can see it.
-    pub fn use_tls_dynamic(&self) -> bool {
-        self.tls_access() == crate::target::TlsAccess::ElfDescriptor
+    /// Record the access model of every thread-local `module` names, as
+    /// [`Module::tls_model`] gives it -- the rule `ir::tls` expanded the IR
+    /// by, so every access is emitted for the model it was expanded for.
+    pub fn plan_thread_locals(&mut self, module: &Module) {
+        self.tls_models = module
+            .thread_locals()
+            .map(|name| (name.to_string(), module.tls_model(name, self.tls)))
+            .collect();
     }
 
-    /// How this target obtains a thread-local's address; see
-    /// [`crate::target::Target::tls_access`], which `ir::tls` asks too.
-    pub fn tls_access(&self) -> crate::target::TlsAccess {
-        self.target.tls_access(self.tls)
+    /// The model of the thread-local `name`; see [`Self::plan_thread_locals`].
+    ///
+    /// The dynamic models compute the address by a call: Initial Exec
+    /// resolves the offset through the GOT at load time, which requires the
+    /// object's thread-locals to fit in the loader's static-TLS surplus, so
+    /// a library `dlopen`ed later with a large block is rejected; only the
+    /// dynamic models have no such limit. `tls.shared_code` is set for
+    /// `-shared` and for `-fPIC`, which asks for code that can live in a
+    /// shared object -- the same requirement -- and *not* for `-fPIE` or the
+    /// PIE default, because a PIE executable still resolves its own
+    /// thread-locals at link time. `-ftls-model=initial-exec` or
+    /// `local-exec` waives the requirement, and a `tls_model` attribute
+    /// decides one variable's model whatever the rest says.
+    pub fn tls_model(&self, name: &str) -> crate::target::TlsModel {
+        self.tls_models
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| self.tls.model(true, None))
     }
 
-    /// Whether a thread-local access must use the Initial Exec model rather
-    /// than Local Exec; see [`crate::target::TlsPolicy::initial_exec`].
+    /// How this target obtains the address of the thread-local `name`; see
+    /// [`crate::target::Target::tls_access`].
+    pub fn tls_access(&self, name: &str) -> crate::target::TlsAccess {
+        self.target.tls_access(self.tls_model(name))
+    }
+
+    /// What computing a thread-local's address by a call costs on this
+    /// target, which is what a `TlsAddr` does: `ir::tls` makes one only for
+    /// a thread-local whose access is a call.
+    pub fn tls_call_access(&self) -> crate::target::TlsAccess {
+        self.target
+            .tls_access(crate::target::TlsModel::GlobalDynamic)
+    }
+
+    /// The thread-locals whose every access `ir::tls` expanded into a
+    /// `TlsAddr`, which no other path may reach.
+    pub fn called_thread_locals(&self) -> std::collections::HashSet<String> {
+        self.tls_models
+            .keys()
+            .filter(|name| self.tls_access(name).is_call())
+            .cloned()
+            .collect()
+    }
+
+    /// Whether an access to the thread-local `name` reached statically is
+    /// Initial Exec rather than Local Exec.
     ///
-    /// On Linux shared code takes the descriptor model before it gets here;
-    /// on FreeBSD, which stays with the static models, leaving shared code
-    /// out put Local Exec in a shared object -- `%fs:t@TPOFF`, a relocation
+    /// On FreeBSD, which stays with the static models, shared code is
+    /// Initial Exec: Local Exec there was `%fs:t@TPOFF`, a relocation
     /// `ld -shared` refuses.
-    pub fn use_tls_ie(&self, is_extern: bool) -> bool {
-        self.use_tls_dynamic() || self.tls.initial_exec(is_extern)
+    pub fn use_tls_ie(&self, name: &str) -> bool {
+        self.tls_model(name) != crate::target::TlsModel::LocalExec
     }
 
     pub fn push_lir(&mut self, inst: I) {
@@ -301,10 +674,19 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
     /// Emit all buffered LIR instructions to the output string
     pub fn emit_all(&mut self) {
+        self.emit_all_with(|_, _| {});
+    }
+
+    /// [`Self::emit_all`], with `retarget` shown each instruction before it
+    /// is emitted and free to change the target it is emitted for: what a
+    /// function's own attributes change of the command line's choices.
+    pub fn emit_all_with(&mut self, mut retarget: impl FnMut(&I, &mut Target)) {
         let comment = asm_comment_prefix(&self.target);
+        let mut target = self.target.clone();
         for (idx, inst) in self.lir_buffer.iter().enumerate() {
             let before = self.output.len();
-            inst.emit(&self.target, &mut self.output);
+            retarget(inst, &mut target);
+            inst.emit(&target, &mut self.output);
             let Some(text) = self.lir_comments.get(&idx) else {
                 continue;
             };
@@ -340,6 +722,39 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::Comment(comment));
         }
         self.push_directive(Directive::Text);
+        if self.cfi == crate::target::Cfi::DebugFrame {
+            self.push_directive(Directive::Raw(".cfi_sections .debug_frame".into()));
+        }
+    }
+
+    /// Emit the line table's file list, one `.file` per distinct source
+    /// file, and keep the stream-to-file numbering for the `.loc`s and DIEs
+    /// that follow. Emitted with or without `-g`, as the file names are
+    /// useful to diagnostics and profilers either way.
+    pub fn emit_file_table(&mut self, module: &Module) {
+        self.source_files = module.source_files.clone();
+        // Entry 0 names the compilation directory and the primary source, as
+        // gcc's does, which makes the assembler write a version 5 line
+        // table. An older table has no entry 0, and a reader fills that slot
+        // with the directory itself: gprofng then archives the
+        // "file" `<comp_dir>` and reports it missing. Apple's assembler
+        // keeps the older form.
+        if let (true, false, Some(dir), Some(name)) = (
+            self.emit_debug,
+            self.target.os == crate::target::Os::MacOS,
+            &module.comp_dir,
+            &module.source_name,
+        ) {
+            self.push_directive(Directive::File {
+                index: 0,
+                dir: Some(dir.clone()),
+                path: name.clone(),
+            });
+        }
+        for (i, path) in module.source_files.paths.iter().enumerate() {
+            // File indices in DWARF start at 1
+            self.push_directive(Directive::file((i + 1) as u32, path.clone()));
+        }
     }
 
     /// Emit .loc directive for source line tracking
@@ -348,11 +763,16 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         if !self.emit_debug {
             return false;
         }
-        if let Some(pos) = &insn.pos {
-            let file = pos.stream + 1; // DWARF file indices start at 1
+        // A position in a synthetic stream (`<built-in>`) is in no file and
+        // leaves the line table where it was.
+        if let Some((pos, file)) = insn
+            .pos
+            .as_ref()
+            .and_then(|p| Some((p, self.source_files.file_of(p.stream)?)))
+        {
             let line = pos.line;
             if line != self.last_debug_line || file != self.last_debug_file {
-                self.push_directive(Directive::loc(file.into(), line, pos.col.into()));
+                self.push_directive(Directive::loc(file, line, pos.col.into()));
                 self.last_debug_line = line;
                 self.last_debug_file = file;
                 return true;
@@ -386,8 +806,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         else {
             return;
         };
-        let file = pos.stream + 1; // DWARF file indices start at 1
-        self.push_directive(Directive::loc(file.into(), pos.line, pos.col.into()));
+        let Some(file) = self.source_files.file_of(pos.stream) else {
+            return;
+        };
+        self.push_directive(Directive::loc(file, pos.line, pos.col.into()));
         self.last_debug_line = pos.line;
         self.last_debug_file = file;
     }
@@ -447,10 +869,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     pub fn emit_declared_symbol_attrs(&mut self, module: &Module) {
         let declared: std::collections::HashSet<String> =
             module.declared_symbol_attrs.keys().cloned().collect();
-        let referenced = module.referenced_symbols(&declared);
+        let referenced = module.referenced_in_output(&declared);
         for (name, attrs) in &module.declared_symbol_attrs {
+            // An inline definition defines nothing: a name that has only
+            // one is a reference to the symbol, like any other.
             if !referenced.contains(name)
-                || module.functions.iter().any(|f| f.name == *name)
+                || module.functions.iter().any(|f| f.name == *name && f.emit)
                 || module.globals.iter().any(|g| g.name == *name)
             {
                 continue;
@@ -540,7 +964,26 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             && named_section.is_none()
             && !global.symbol_attrs.weak
             && global.symbol_attrs.visibility.is_none();
-        if zero_init && !is_local_label {
+        if self.is_common(global) {
+            if let Some(how) = &global.symbol_attrs.visibility {
+                self.push_directive(Directive::Visibility(
+                    Symbol::global(&global.name),
+                    how.clone(),
+                ));
+            }
+            self.push_directive(Directive::Comm {
+                sym: Symbol::global(&global.name),
+                size,
+                align,
+            });
+            return;
+        }
+        let retain = self.retains(&global.symbol_attrs);
+        let own_section = (self.layout.data_sections || retain)
+            && self.target.os != Os::MacOS
+            && !is_local_label
+            && named_section.is_none();
+        if zero_init && !is_local_label && !own_section {
             if global.is_static {
                 self.push_directive(Directive::bss_local(&global.name, size, align));
             } else {
@@ -555,14 +998,14 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
         // Select appropriate section for TLS vs regular data
         if let Some(name) = &named_section {
+            let flags = self.named_sections[name];
             self.push_directive(Directive::NamedSection {
                 name: name.clone(),
-                executable: false,
-                // Const data that needs relocations cannot be mapped read-only
-                // until the dynamic linker has run, so it is writable in the
-                // object the same way `.data.rel.ro` is.
-                writable: !global.is_const || global.init.has_reloc(),
+                flags,
+                retain,
             });
+        } else if own_section {
+            self.push_directive(own_data_section(global, zero_init));
         } else if global.is_thread_local {
             if matches!(global.init, Initializer::None) {
                 // Uninitialized TLS: .tbss section
@@ -603,6 +1046,15 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             ));
         }
 
+        // Alignment, before `.type` and `.size` as gcc writes it: they
+        // create the symbol, and gas orders a section's symbols by creation.
+        // After them, aarch64's `$d` mapping symbol, made at the first byte,
+        // followed a static object at its address, and ld, naming a link
+        // warning's location by the last symbol there, found no variable.
+        if align > 1 {
+            self.push_directive(Directive::Align(align.trailing_zeros()));
+        }
+
         // ELF-only type and size (handled by Directive::emit which skips on macOS)
         // TLS objects have TLS type instead of regular object type
         if global.is_thread_local {
@@ -611,11 +1063,6 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::type_object(&global.name));
         }
         self.push_directive(Directive::size(&global.name, size));
-
-        // Alignment
-        if align > 1 {
-            self.push_directive(Directive::Align(align.trailing_zeros()));
-        }
 
         // Label - use local_label for names starting with '.'
         if is_local_label {
@@ -968,6 +1415,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         self.push_directive(Directive::Text);
+        if self.cfi == crate::target::Cfi::DebugFrame {
+            self.push_directive(Directive::Raw(".cfi_sections .debug_frame".into()));
+        }
     }
 
     /// Emit `u"..."` literals referenced by address.
@@ -985,6 +1435,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::Short(0));
         }
         self.push_directive(Directive::Text);
+        if self.cfi == crate::target::Cfi::DebugFrame {
+            self.push_directive(Directive::Raw(".cfi_sections .debug_frame".into()));
+        }
     }
 
     /// Emit `U"..."` and `L"..."` literals referenced by address.
@@ -1002,6 +1455,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::Long(0));
         }
         self.push_directive(Directive::Text);
+        if self.cfi == crate::target::Cfi::DebugFrame {
+            self.push_directive(Directive::Raw(".cfi_sections .debug_frame".into()));
+        }
     }
 }
 
@@ -1026,6 +1482,9 @@ pub enum AsmOperandValue<R> {
     /// A symbolic address constant, `sym` or `sym+off`, decorated for the
     /// target.
     Symbol(String),
+    /// A flag output (`"=@ccz"`): numbered like any operand, but nothing the
+    /// template can name.
+    Flag,
 }
 
 impl<R> AsmOperandValue<R> {
@@ -1038,6 +1497,7 @@ impl<R> AsmOperandValue<R> {
             AsmOperandValue::Int(_) => "an integer constant",
             AsmOperandValue::Float(..) => "a floating constant",
             AsmOperandValue::Symbol(_) => "a symbolic constant",
+            AsmOperandValue::Flag => "a flag output",
         }
     }
 }
@@ -1155,6 +1615,16 @@ pub fn impossible_constant(operand: usize, value: i128, constraint: &str) -> Str
     )
 }
 
+/// Report an asm statement that wants more registers than are left to give
+/// its operands, once its pinned operands and clobbers have taken theirs --
+/// in gcc's words, which it gives for the same statement.
+pub fn report_asm_registers_exhausted(pos: Option<crate::diag::Position>) {
+    crate::diag::error(
+        pos.unwrap_or_default(),
+        "'asm' operand has impossible constraints",
+    );
+}
+
 /// How a template names an operand: by number or by `[name]`.
 enum OperandRef {
     Number(usize),
@@ -1162,24 +1632,27 @@ enum OperandRef {
 }
 
 /// Read the operand reference after `%` and any modifier: digits, or a
-/// bracketed name. `None` when neither follows.
-fn read_operand_ref(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<OperandRef> {
+/// bracketed name. `None` when neither follows; an error, in gcc's words,
+/// for a name with no `]`.
+fn read_operand_ref(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> Result<Option<OperandRef>, String> {
     if chars.next_if_eq(&'[').is_some() {
         let mut name = String::new();
-        for ch in chars.by_ref() {
-            if ch == ']' {
-                break;
+        loop {
+            match chars.next() {
+                Some(']') => return Ok(Some(OperandRef::Name(name))),
+                Some(ch) => name.push(ch),
+                None => return Err("missing close brace for named operand".to_string()),
             }
-            name.push(ch);
         }
-        return Some(OperandRef::Name(name));
     }
     let mut digits = String::new();
     while let Some(d) = chars.next_if(|d| d.is_ascii_digit()) {
         digits.push(d);
     }
     // Too many digits to be an operand is out of range, like any other.
-    (!digits.is_empty()).then(|| OperandRef::Number(digits.parse().unwrap_or(usize::MAX)))
+    Ok((!digits.is_empty()).then(|| OperandRef::Number(digits.parse().unwrap_or(usize::MAX))))
 }
 
 /// Substitute the operands into an extended-asm template, as gcc does:
@@ -1254,7 +1727,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
             }
         }
         let modifier = chars.next_if(|m| m.is_ascii_alphabetic());
-        let Some(operand) = read_operand_ref(&mut chars) else {
+        let Some(operand) = read_operand_ref(&mut chars)? else {
             return Err(match (modifier, chars.peek()) {
                 (Some(m), _) => {
                     format!("operand number missing after '%{m}' in asm template")
@@ -1264,7 +1737,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
             });
         };
         if modifier == Some('l') {
-            result.push_str(&goto_label(&operand, slots.len(), goto_labels)?);
+            result.push_str(&goto_label(&operand, slots, goto_labels)?);
             continue;
         }
         // A label is an operand too, numbered after the rest, and a bare
@@ -1287,9 +1760,11 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
             OperandRef::Name(name) => slots
                 .iter()
                 .find(|s| s.name.as_deref() == Some(name.as_str()))
-                .ok_or_else(|| format!("undefined named asm operand '{name}'"))?,
+                .ok_or_else(|| undefined_operand_name(name))?,
         };
         let text = match (modifier, &slot.value) {
+            // gcc's words; the formatter is never asked.
+            (_, AsmOperandValue::Flag) => return Err("invalid use of asm flag output".to_string()),
             (Some('c'), AsmOperandValue::Int(v)) => Ok(v.to_string()),
             (Some('c'), AsmOperandValue::Symbol(sym)) => Ok(sym.clone()),
             (Some('n'), AsmOperandValue::Int(v)) => Ok((-(*v as i128)).to_string()),
@@ -1345,22 +1820,30 @@ fn skip_other_alternatives(chars: &mut std::iter::Peekable<std::str::Chars>) -> 
 /// The `asm goto` label `%l` names. gcc numbers labels after every operand,
 /// the hidden inputs of `"+"` outputs included, so the first label of a
 /// statement with three operands is `%l3`.
-fn goto_label(
+fn goto_label<R>(
     operand: &OperandRef,
-    operands: usize,
+    slots: &[AsmOperandSlot<R>],
     goto_labels: &[(String, String)],
 ) -> Result<String, String> {
     let label = match operand {
         OperandRef::Name(name) => goto_labels.iter().find(|(_, n)| n == name),
-        OperandRef::Number(n) => n.checked_sub(operands).and_then(|i| goto_labels.get(i)),
+        OperandRef::Number(n) => n.checked_sub(slots.len()).and_then(|i| goto_labels.get(i)),
     };
     match (label, operand) {
         (Some((text, _)), _) => Ok(text.clone()),
-        (None, OperandRef::Name(name)) => Err(format!("undefined asm goto label '{name}'")),
+        (None, OperandRef::Name(name)) if slots.iter().any(|s| s.name.as_ref() == Some(name)) => {
+            Err("'%l' operand isn't a label".to_string())
+        }
+        (None, OperandRef::Name(name)) => Err(undefined_operand_name(name)),
         (None, OperandRef::Number(n)) => {
             Err(format!("asm operand {n} named by '%l' is not a label"))
         }
     }
+}
+
+/// gcc's report of a `%[name]` or `%l[name]` that names nothing.
+fn undefined_operand_name(name: &str) -> String {
+    format!("undefined named operand '{name}'")
 }
 
 // CodeGenerator Trait
@@ -1370,8 +1853,8 @@ pub trait CodeGenerator {
     /// Generate assembly code for the given IR module
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String;
 
-    /// Set whether to emit unwind tables (the CFI procedures and their frame rules)
-    fn set_emit_unwind_tables(&mut self, emit: bool);
+    /// Set where the CFI procedures and their frame rules go, if anywhere.
+    fn set_cfi(&mut self, cfi: crate::target::Cfi);
 
     /// Set position-independent code mode (for shared libraries and PIE)
     fn set_pic_mode(&mut self, pic: bool);
@@ -1386,26 +1869,51 @@ pub trait CodeGenerator {
     fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection);
 
     /// Set `-fstack-clash-protection`.
-    fn set_stack_clash(&mut self, on: bool);
+    fn set_stack_clash(&mut self, stack_clash: Option<crate::target::StackClash>);
 
     /// Set the `-fstack-protector` level.
-    fn set_stack_protector(&mut self, level: crate::target::StackProtector);
+    fn set_stack_protector(&mut self, protection: crate::target::StackProtection);
+
+    /// Set `-pg` and the shape of its call. A target whose call is an
+    /// ordinary one has it put into the IR instead
+    /// (`arch::mapping::call_profiler`), and ignores this.
+    fn set_profiling(&mut self, _profiling: Option<crate::target::Profiling>) {}
+
+    /// Say whether the unit is optimized. Branch protection reads it: as in
+    /// gcc, only optimization finds a static function needs no landing pad.
+    fn set_optimizing(&mut self, on: bool);
+
+    /// Set `-ffunction-sections`, `-fdata-sections`, `-fcommon` and
+    /// `-fno-plt`.
+    fn set_object_layout(&mut self, layout: crate::target::ObjectLayout);
+
+    /// Set how each function begins and ends: `-falign-functions`,
+    /// `-fpatchable-function-entry=` and their kin.
+    fn set_function_shape(&mut self, shape: crate::target::FunctionShape);
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit
-/// `_Alignas`/`aligned` if it has one, else its type's, and at least 16 for an
-/// array of 16 bytes or more (clang's choice, which vector code relies on).
+/// `_Alignas`/`aligned` if it has one, exactly; else its type's, and at
+/// least 16 for an array of 16 bytes or more (clang's choice, which vector
+/// code relies on).
+///
+/// gcc never raises an alignment the program wrote on the variable
+/// (`DECL_USER_ALIGN`), and code depends on that: an `.init_array` table
+/// written `aligned(sizeof(void *))` is read entry by entry from where the
+/// linker concatenates it, and padding the table to sixteen put a null
+/// entry in front of it, which the startup code called.
 ///
 /// The one rule, read both where the definition is emitted and where a
 /// backend decides whether an access can assume that alignment.
 pub fn global_alignment(global: &crate::ir::GlobalDef, types: &TypeTable) -> u32 {
+    if let Some(align) = global.explicit_align {
+        return align;
+    }
     let size = types.size_bytes(global.typ) as u64;
     let size = if size == 0 { 8 } else { size };
-    let mut align = global
-        .explicit_align
-        .unwrap_or_else(|| types.alignment(global.typ) as u32);
+    let align = types.alignment(global.typ) as u32;
     if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array) && size >= 16 {
-        align = align.max(16);
+        return align.max(16);
     }
     align
 }
@@ -1669,12 +2177,12 @@ pub fn asm_comment_prefix(target: &Target) -> &'static str {
 /// Create a code generator for the given target
 pub fn create_codegen(
     target: Target,
-    emit_unwind_tables: bool,
+    cfi: crate::target::Cfi,
     pic_mode: bool,
     tls: crate::target::TlsPolicy,
     verbose_asm: bool,
     cf_protection: crate::target::CfProtection,
-    stack_clash: bool,
+    stack_clash: Option<crate::target::StackClash>,
 ) -> Box<dyn CodeGenerator> {
     use crate::target::Arch;
 
@@ -1682,7 +2190,7 @@ pub fn create_codegen(
         Arch::X86_64 => Box::new(super::x86_64::codegen::X86_64CodeGen::new(target)),
         Arch::Aarch64 => Box::new(super::aarch64::codegen::Aarch64CodeGen::new(target)),
     };
-    codegen.set_emit_unwind_tables(emit_unwind_tables);
+    codegen.set_cfi(cfi);
     codegen.set_pic_mode(pic_mode);
     codegen.set_tls_policy(tls);
     codegen.set_verbose_asm(verbose_asm);
@@ -1842,10 +2350,12 @@ mod tests {
         assert!(err("%e").contains("operand number missing after '%e'"));
         assert!(err("%9").contains("operand number 9 out of range"));
         assert!(err("%k4").contains("'%k' does not apply to a symbolic constant"));
-        assert!(err("%[nope]").contains("undefined named asm operand 'nope'"));
+        assert!(err("%[nope]").contains("undefined named operand 'nope'"));
+        assert!(err("%[nope").contains("missing close brace for named operand"));
         assert!(err("%!").contains("invalid '%!'"));
         assert!(err("x %").contains("at the end"));
         assert!(err("%l1").contains("asm operand 1 named by '%l' is not a label"));
-        assert!(err("%l[gone]").contains("undefined asm goto label 'gone'"));
+        assert!(err("%l[gone]").contains("undefined named operand 'gone'"));
+        assert!(err("%l[out]").contains("'%l' operand isn't a label"));
     }
 }

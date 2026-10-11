@@ -39,11 +39,12 @@
 // not give up, so no `longjmp` can resume inside this frame and read it.
 //
 
+use super::bitset::BitSet;
 use super::escape::EscapeInfo;
 use super::memloc::{is_ordinary_object, may_alias, Access, AddrMap, MemBase, MemLoc, ModuleInfo};
 use super::{BasicBlockId, Function, Opcode, PseudoId};
 use crate::types::TypeTable;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// How many sweeps the dead-at-exit fixed point may take before it gives up.
 ///
@@ -102,12 +103,7 @@ struct DseCtx<'a> {
 
 impl DseCtx<'_> {
     /// Collect the dead stores in one block.
-    fn scan_block(
-        &self,
-        b: usize,
-        dead_at_end: &HashMap<BasicBlockId, HashSet<PseudoId>>,
-        kills: &mut Vec<(usize, usize)>,
-    ) {
+    fn scan_block(&self, b: usize, dead_at_end: &DeadAtEnd, kills: &mut Vec<(usize, usize)>) {
         let DseCtx {
             func,
             types,
@@ -162,12 +158,9 @@ impl DseCtx<'_> {
 
         // Whatever is still pending at the end of the block is dead if the whole
         // object is dead on every path out.
-        let Some(dead) = dead_at_end.get(&func.blocks[b].id) else {
-            return;
-        };
         for p in pending {
             if let MemBase::Local(sym) = p.loc.base {
-                if dead.contains(&sym) {
+                if dead_at_end.contains(b, sym) {
                     kills.push((b, p.index));
                 }
             }
@@ -198,6 +191,24 @@ fn covers(later: &MemLoc, earlier: &MemLoc) -> bool {
     }
 }
 
+/// Which locals are never read again at the end of each block, as
+/// [`DseCtx::dead_locals_at_block_end`] found them.
+struct DeadAtEnd {
+    /// The candidates, numbered for the bit sets.
+    index: HashMap<PseudoId, usize>,
+    /// By block position.
+    by_block: Vec<BitSet>,
+}
+
+impl DeadAtEnd {
+    /// Is `sym` dead at the end of the block at position `b`?
+    fn contains(&self, b: usize, sym: PseudoId) -> bool {
+        self.index
+            .get(&sym)
+            .is_some_and(|&i| self.by_block[b].contains(i))
+    }
+}
+
 impl DseCtx<'_> {
     /// Which locals are never read again, at the end of each block.
     ///
@@ -210,7 +221,13 @@ impl DseCtx<'_> {
     /// of this function, it never escaped, and `EscapeInfo` did not give up. A
     /// block-scope `static` is a `Global` here and so is never a candidate,
     /// which is the trap this guards.
-    fn dead_locals_at_block_end(&self) -> HashMap<BasicBlockId, HashSet<PseudoId>> {
+    ///
+    /// The sets are bits over the candidates, and an access pinned to one
+    /// object is asked about that object alone: a hash set per block, and
+    /// every read asked about every candidate, made this blocks x locals per
+    /// sweep, which a function with hundreds of calls spliced in pays in
+    /// seconds.
+    fn dead_locals_at_block_end(&self) -> DeadAtEnd {
         let DseCtx {
             func,
             types,
@@ -218,7 +235,7 @@ impl DseCtx<'_> {
             am,
             mi,
         } = *self;
-        let mut candidates: HashSet<PseudoId> = HashSet::new();
+        let mut candidates: Vec<PseudoId> = Vec::new();
         for p in &func.pseudos {
             let Some(local) = func.local_of(p.id) else {
                 continue;
@@ -226,94 +243,99 @@ impl DseCtx<'_> {
             if !local.is_ordinary(types) || esc.is_captured(&MemBase::Local(p.id)) {
                 continue;
             }
-            candidates.insert(p.id);
+            candidates.push(p.id);
         }
-
-        let mut out: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
-        if candidates.is_empty() {
-            for bb in &func.blocks {
-                out.insert(bb.id, HashSet::new());
-            }
-            return out;
+        let index: HashMap<PseudoId, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (c, i))
+            .collect();
+        let n = candidates.len();
+        let nothing = |index| DeadAtEnd {
+            index,
+            by_block: vec![BitSet::new(n); func.blocks.len()],
+        };
+        if n == 0 {
+            return nothing(index);
         }
 
         // What each block reads, computed once, and each instruction's
         // footprint once rather than once per candidate.
-        let wholes: Vec<(PseudoId, MemLoc)> = candidates
+        let wholes: Vec<MemLoc> = candidates
             .iter()
-            .map(|&c| {
-                let whole = MemLoc {
-                    base: MemBase::Local(c),
-                    offset: Some(0),
-                    size: 0,
-                    typ: None,
-                };
-                (c, whole)
+            .map(|&c| MemLoc {
+                base: MemBase::Local(c),
+                offset: Some(0),
+                size: 0,
+                typ: None,
             })
             .collect();
-        let mut reads: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
+        let mut reads: Vec<BitSet> = Vec::with_capacity(func.blocks.len());
         for bb in &func.blocks {
-            let mut r = HashSet::new();
+            let mut r = BitSet::new(n);
             for insn in &bb.insns {
-                if r.len() == wholes.len() {
-                    break;
-                }
                 let access = mi.access(am, func, insn);
-                if access.reads.is_empty() {
-                    continue;
-                }
-                for (c, whole) in &wholes {
-                    if !r.contains(c) && self.may_read(&access, whole) {
-                        r.insert(*c);
+                for f in &access.reads {
+                    let mut ask = |i: usize| {
+                        if !r.contains(i) && f.may_touch(&wholes[i], mi, esc) {
+                            r.insert(i);
+                        }
+                    };
+                    match f.pinned_base() {
+                        Some(MemBase::Local(p)) => {
+                            if let Some(&i) = index.get(p) {
+                                ask(i);
+                            }
+                        }
+                        Some(_) => {}
+                        None => (0..n).for_each(ask),
                     }
                 }
             }
-            reads.insert(bb.id, r);
+            reads.push(r);
         }
 
         // Start everything dead and remove: the greatest fixed point is the
         // right one here, so a loop that never reads a local keeps it dead.
-        let mut dead_in: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
-        for bb in &func.blocks {
-            dead_in.insert(bb.id, candidates.clone());
-        }
+        let position: HashMap<BasicBlockId, usize> = func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, bb)| (bb.id, i))
+            .collect();
+        let all = BitSet::full(n);
+        let mut dead_in = vec![all.clone(); func.blocks.len()];
+        let mut out = vec![BitSet::new(n); func.blocks.len()];
 
-        let mut converged = false;
         for _ in 0..MAX_SWEEPS {
             let mut moved = false;
-            for bb in func.blocks.iter().rev() {
-                let succ = &bb.children;
+            for (b, bb) in func.blocks.iter().enumerate().rev() {
                 // No successors is an exit: the frame is gone, so everything a
                 // non-escaping local held is unobservable.
-                let mut dead_out = candidates.clone();
-                for s in succ {
-                    if let Some(d) = dead_in.get(s) {
-                        dead_out.retain(|c| d.contains(c));
+                let mut dead_out = all.clone();
+                for s in &bb.children {
+                    if let Some(&s) = position.get(s) {
+                        dead_out.intersect_with(&dead_in[s]);
                     }
                 }
                 let mut d_in = dead_out.clone();
-                if let Some(r) = reads.get(&bb.id) {
-                    d_in.retain(|c| !r.contains(c));
-                }
-                out.insert(bb.id, dead_out);
-                if dead_in.get(&bb.id) != Some(&d_in) {
-                    dead_in.insert(bb.id, d_in);
+                d_in.subtract(&reads[b]);
+                out[b] = dead_out;
+                if dead_in[b] != d_in {
+                    dead_in[b] = d_in;
                     moved = true;
                 }
             }
             if !moved {
-                converged = true;
-                break;
+                return DeadAtEnd {
+                    index,
+                    by_block: out,
+                };
             }
         }
-        if !converged {
-            // An unfinished greatest fixed point still says "dead" for things
-            // that are read. Answer nothing rather than something wrong.
-            for bb in &func.blocks {
-                out.insert(bb.id, HashSet::new());
-            }
-        }
-        out
+        // An unfinished greatest fixed point still says "dead" for things
+        // that are read. Answer nothing rather than something wrong.
+        nothing(index)
     }
 }
 

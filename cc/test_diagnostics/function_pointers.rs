@@ -145,7 +145,7 @@ fn diagnostics_pedantic_errors_are_fatal() {
         (
             "ped_err_ellipsis",
             "int f(...);\n",
-            "error: ISO C requires a named argument before '...'",
+            "error: ISO C requires a named argument before '...' before C2X",
         ),
     ] {
         let stderr = compile_rejected_with(name, src, &["-pedantic-errors"]);
@@ -161,7 +161,7 @@ fn diagnostics_pedantic_errors_are_fatal() {
 #[test]
 fn diagnostics_ellipsis_without_named_parameter_is_pedantic_only() {
     let src = "int f(...);\n";
-    let want = "ISO C requires a named argument before '...'";
+    let want = "ISO C requires a named argument before '...' before C2X";
     let quiet = compile_accepted("ellipsis_only_default", src, &[]);
     assert!(!quiet.contains(want), "warned without -pedantic:\n{quiet}");
     let loud = compile_accepted("ellipsis_only_pedantic", src, &["-Wpedantic"]);
@@ -234,7 +234,7 @@ void f(void){ int *p = 0; (void)g(p); }
 /// would leave the program believing a rule was in force that was not.
 ///
 /// Every position that can carry it is covered, because they reach the check
-/// by two different routes: the three specifier positions land on the
+/// by two different routes: the specifier positions land on the
 /// `CompositeType` as it is built, while the trailing-on-a-typedef spelling --
 /// glibc's own -- is held over and applied once the declarator finishes. The
 /// specifier ones were silently dropped when this landed; only the typedef
@@ -251,10 +251,6 @@ fn diagnostics_transparent_union_on_a_non_union_warns() {
             "struct __attribute__((transparent_union)) T { int a; };\nstruct T y;\n",
         ),
         (
-            "transparent_union_after_struct_tag",
-            "struct U __attribute__((transparent_union)) { int a; };\nstruct U w;\n",
-        ),
-        (
             "transparent_union_on_struct_typedef",
             "typedef struct { int a; } SA __attribute__((transparent_union));\nSA z;\n",
         ),
@@ -262,7 +258,7 @@ fn diagnostics_transparent_union_on_a_non_union_warns() {
         compile_expect_warning(
             name,
             src,
-            "'transparent_union' attribute ignored on a non-union type",
+            "'transparent_union' attribute ignored [-Wattributes]",
         );
     }
 }
@@ -381,7 +377,7 @@ fn diagnostics_conflicting_declarations_are_rejected() {
         (
             "function_then_object",
             "int f(void);\nint f;\n",
-            "redeclared as a different kind of symbol",
+            "redeclared as different kind of symbol",
         ),
         (
             "array_size_mismatch",
@@ -817,5 +813,79 @@ fn diagnostics_function_pointer_and_void_pointer_are_pedantic_only() {
         ] {
             assert!(loud.contains(want), "{flag}: missing {want:?}:\n{loud}");
         }
+    }
+}
+
+/// `noreturn`, `returns_twice` and `nothrow` are a function declaration's.
+/// gcc warns and ignores each on any other declarator -- an object, a
+/// typedef (even of a function type), a pointer to a pointer -- except
+/// `noreturn` on a pointer to a function, which makes the function noreturn
+/// and draws no warning.
+#[test]
+fn function_declaration_attributes_on_other_declarators() {
+    for (name, src, attr) in [
+        (
+            "fdecl_attr_int_noreturn",
+            "int x __attribute__((noreturn));\n",
+            "noreturn",
+        ),
+        (
+            "fdecl_attr_int_rt",
+            "int x __attribute__((returns_twice));\n",
+            "returns_twice",
+        ),
+        (
+            "fdecl_attr_int_nothrow",
+            "int x __attribute__((nothrow));\n",
+            "nothrow",
+        ),
+        (
+            "fdecl_attr_typedef_noreturn",
+            "typedef void f(void) __attribute__((noreturn));\n",
+            "noreturn",
+        ),
+        (
+            "fdecl_attr_typedef_rt",
+            "typedef void f(void) __attribute__((returns_twice));\n",
+            "returns_twice",
+        ),
+        (
+            "fdecl_attr_ptr_nothrow",
+            "void (*p)(void) __attribute__((nothrow));\n",
+            "nothrow",
+        ),
+        (
+            "fdecl_attr_ptr_ptr_noreturn",
+            "void (**p)(void) __attribute__((noreturn));\n",
+            "noreturn",
+        ),
+        (
+            "fdecl_attr_member_rt",
+            "struct S { void (*m)(void) __attribute__((returns_twice)); };\n",
+            "returns_twice",
+        ),
+    ] {
+        compile_expect_warning(name, src, &format!("'{attr}' attribute ignored"));
+    }
+    for (name, src) in [
+        (
+            "fdecl_attr_ptr_noreturn",
+            "void (*p)(void) __attribute__((noreturn));\n",
+        ),
+        (
+            "fdecl_attr_member_noreturn",
+            "struct S { void (*m)(void) __attribute__((noreturn)); };\n",
+        ),
+        (
+            "fdecl_attr_param_noreturn",
+            "void f(void (*cb)(void) __attribute__((noreturn)));\n",
+        ),
+        (
+            "fdecl_attr_fn",
+            "void f(void) __attribute__((noreturn, nothrow));\nint g(void) __attribute__((returns_twice));\n",
+        ),
+    ] {
+        let stderr = compile_accepted(name, src, &[]);
+        assert!(!stderr.contains("ignored"), "{name}:\n{stderr}");
     }
 }

@@ -109,6 +109,12 @@ impl<'a> Preprocessor<'a> {
             None => return, // Empty directive, ignore
         };
 
+        if self.passes_through_as_text(&directive_token) {
+            output.push(hash_token.clone());
+            iter.unread(vec![directive_token]);
+            return;
+        }
+
         // Get directive StringId
         let directive_id = match &directive_token.typ {
             TokenType::Ident => {
@@ -128,7 +134,7 @@ impl<'a> Preprocessor<'a> {
                 // linemarker `# N "file" flags` -- the form `c17 -E` writes
                 // and POSIX 87981 makes a `.i` operand.
                 if directive_token.typ == TokenType::Number && !self.is_skipping() {
-                    self.handle_linemarker(iter, &directive_token);
+                    self.handle_linemarker(iter, &directive_token, output);
                     return;
                 }
                 // Anything else after the `#` -- a punctuator, a literal --
@@ -186,7 +192,7 @@ impl<'a> Preprocessor<'a> {
             crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
             crate::kw::PRAGMA => self.handle_pragma(iter, output, idents, hash_token.pos),
-            crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
+            crate::kw::LINE => self.handle_line(iter, output, idents, hash_token.pos),
             // `#ident` and `#sccs` carry a version string for the object file.
             // c17 records nothing, but they are directives it knows, so they
             // are consumed rather than reported as unknown -- GCC is silent
@@ -210,12 +216,31 @@ impl<'a> Preprocessor<'a> {
     /// Whether a `#` line that names no directive is an error here.
     ///
     /// Not in a skipped group, whose lines are only searched for the
-    /// conditionals that nest (C17 6.10.1p6). And not in assembly, where `#`
-    /// also introduces a comment, so such a line is prose rather than a
-    /// mistake -- `# save the frame pointer` is ordinary in a `.S` file. gcc
-    /// is silent about both.
+    /// conditionals that nest (C17 6.10.1p6); gcc is silent there. Assembly
+    /// never gets this far: see [`Self::passes_through_as_text`].
     fn reports_invalid_directives(&self) -> bool {
-        !self.is_skipping() && self.lexer_mode != LexerMode::Assembly
+        !self.is_skipping()
+    }
+
+    /// Whether the `#` line whose first token after the `#` is `first` is
+    /// ordinary text rather than a directive.
+    ///
+    /// In assembly `#` also introduces a comment, so a line naming no
+    /// directive is prose -- `# save the frame pointer` -- and gcc's
+    /// `-lang-asm` passes it through, macro-replaced like any other line. A
+    /// number is no exception: `# 7/12-bit word rotation` is a comment, and
+    /// even `# 100 "foo.S"` is left for the assembler rather than taken as a
+    /// linemarker, so it changes neither `__LINE__` nor where the next line
+    /// is written. A skipped group's lines are only searched for the
+    /// conditionals that nest (C17 6.10.1p6), and are dropped as before.
+    fn passes_through_as_text(&self, first: &Token) -> bool {
+        if self.lexer_mode != LexerMode::Assembly || self.is_skipping() {
+            return false;
+        }
+        match (&first.typ, &first.value) {
+            (TokenType::Ident, TokenValue::Ident(id)) => !Self::is_known_directive(*id),
+            _ => true,
+        }
     }
 
     /// Consume a `# N ["file" [flags]]` linemarker and record the attribution
@@ -226,7 +251,12 @@ impl<'a> Preprocessor<'a> {
     /// identifier. C17 has no such directive; this is the GCC form that
     /// `c17 -E` itself writes, and `#line` is deliberately *not* routed here
     /// (GCC honors only this form in a preprocessed file, and so does c17).
-    fn handle_linemarker(&mut self, iter: &mut TokenCursor, number: &Token) {
+    fn handle_linemarker(
+        &mut self,
+        iter: &mut TokenCursor,
+        number: &Token,
+        output: &mut Vec<Token>,
+    ) {
         let TokenValue::Number(ref text) = number.value else {
             self.skip_to_eol(iter);
             return;
@@ -261,22 +291,37 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Flags 1 (entering) and 2 (returning) are attribution the stream
-        // registry already derives; 4 (extern "C") means nothing here. Only 3
-        // carries a decision: it marks a system header, whose warnings are
-        // not the user's to act on.
+        // registry already derives, and `-E` writes them again; 4 (extern
+        // "C") means nothing here. 3 carries a decision: it marks a system
+        // header, whose warnings are not the user's to act on.
         let mut is_system = false;
+        let (mut entering, mut returning) = (false, false);
+        // Where the text stood before the marker, which an entry is made from.
+        let from = self.remap_pos(number.pos);
         while let Some(tok) = iter.peek() {
             if tok.pos.newline {
                 break;
             }
             if let TokenValue::Number(flag) = &tok.value {
-                if flag == "3" {
-                    is_system = true;
+                match flag.as_str() {
+                    "1" => entering = true,
+                    "2" => returning = true,
+                    "3" => is_system = true,
+                    _ => {}
                 }
             }
             iter.next();
         }
-        self.set_line_marker(line, name, is_system);
+        let stream = self.set_line_marker(line, name, is_system);
+        let at = Position::new(stream, line, 1);
+        let (change, pos) = if entering {
+            (FileChange::Enter { stream }, from)
+        } else if returning {
+            (FileChange::Return, at)
+        } else {
+            (FileChange::Rename, at)
+        };
+        self.mark_file_change(output, change, pos);
     }
 
     /// Skip tokens until end of line
@@ -342,11 +387,16 @@ impl<'a> Preprocessor<'a> {
     ///
     /// C17 6.10p1 gives `#else` and `#endif` no operands at all, and gcc warns
     /// about anything after them -- usually a stale `#endif MACRO` left from
-    /// before comments were the convention.
+    /// before comments were the convention -- in its `-Wendif-labels` group.
     fn warn_extra_tokens(&self, iter: &mut TokenCursor, directive: &str) {
         if iter.peek().is_some_and(|t| !t.pos.newline) {
             let pos = iter.peek().map(|t| t.pos).unwrap_or_default();
-            diag::pedwarn_default_args(pos, "extra tokens at end of #{0} directive", &[directive]);
+            let template = "extra tokens at end of #{0} directive";
+            if matches!(directive, "else" | "endif") {
+                diag::group_pedwarn_default_args("endif-labels", pos, template, &[directive]);
+            } else {
+                diag::pedwarn_default_args(pos, template, &[directive]);
+            }
         }
         self.skip_to_eol(iter);
     }
@@ -572,7 +622,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Collect body tokens
-        let body_tokens = self.collect_to_eol(iter);
+        let body_tokens = self.collect_macro_body(iter);
         if !(is_variadic && variadic_name.is_none()) {
             for token in &body_tokens {
                 Self::warn_stray_va_args(token, idents);
@@ -596,6 +646,7 @@ impl<'a> Preprocessor<'a> {
             variadic_name,
             builtin: None,
             predefined: false,
+            defined_at: name_pos,
         };
 
         // C17 6.10.3p2: a macro may be redefined only by a definition of the
@@ -605,10 +656,17 @@ impl<'a> Preprocessor<'a> {
         // break a great deal of code that redefines a macro benignly.
         if let Some(existing) = self.macros.get(&name) {
             if let Some(why) = macro_redefinition_conflict(existing, &mac) {
-                diag::pedwarn_default_args(
-                    name_pos,
-                    "'{0}' redefined: {1}",
-                    &[&name.to_string(), why],
+                let template = "'{0}' redefined: {1}";
+                let args = [name.as_str(), why];
+                match builtin_macro_group(&name) {
+                    Some(group) => {
+                        diag::group_pedwarn_default_args(group, name_pos, template, &args)
+                    }
+                    None => diag::pedwarn_default_args(name_pos, template, &args),
+                }
+                diag::note(
+                    existing.defined_at,
+                    &gettext("this is the location of the previous definition"),
                 );
             }
         }
@@ -638,7 +696,11 @@ impl<'a> Preprocessor<'a> {
             diag::error(pos, &gettext("\"defined\" cannot be used as a macro name"));
         } else {
             if is_standard_predefined(&name) {
-                diag::warning_args(pos, "undefining \"{0}\"", &[&name]);
+                let template = "undefining \"{0}\"";
+                match builtin_macro_group(&name) {
+                    Some(group) => diag::group_warning_args(group, pos, template, &[&name]),
+                    None => diag::warning_args(pos, template, &[&name]),
+                }
             }
             self.undef_macro(&name);
         }
@@ -809,6 +871,12 @@ impl<'a> Preprocessor<'a> {
             diag::error(hash_token.pos, &gettext("expected filename after #include"));
             return;
         }
+        // The includer resumes on the line after the directive, which may
+        // have run on over spliced lines. The `#` is already where any
+        // `#line` put it; the operand is counted from it physically.
+        let directive_lines = path_tokens
+            .last()
+            .map_or(0, |t| t.pos.line.saturating_sub(self.physical_line));
 
         // Check if we need macro expansion (C99 6.10.2)
         // If the first token is not < or ", expand macros first
@@ -858,15 +926,23 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
+        let site = IncludeSite {
+            from: hash_token.pos,
+            back: Position {
+                line: hash_token.pos.line + directive_lines + 1,
+                ..hash_token.pos
+            },
+        };
+
         // Find and include the file
         if let Some((source, pos)) = self.find_include_file(&filename, is_system, is_include_next) {
             match source {
                 IncludeSource::File(path) => {
                     self.record_dependency(&path, pos);
-                    self.include_file(&path, output, idents, hash_token, pos);
+                    self.include_file(&path, output, idents, hash_token, site, pos);
                 }
                 IncludeSource::Builtin(content) => {
-                    self.include_builtin(&filename, content, output, idents, hash_token);
+                    self.include_builtin(&filename, content, output, idents, hash_token, site);
                 }
             }
         } else {
@@ -942,7 +1018,7 @@ impl<'a> Preprocessor<'a> {
         if !self.collect_dependencies {
             return;
         }
-        let is_system = matches!(pos, Some(SearchPos::System(_)));
+        let is_system = pos.is_some_and(SearchPos::is_system);
         // Listed once however many times it is included. Linear because the
         // list is short and its order is the output's order.
         if !self.dependencies.iter().any(|(p, _)| p == path) {
@@ -1019,6 +1095,27 @@ impl<'a> Preprocessor<'a> {
         // what `-isystem` and `-idirafter` put there.
         if let Some(found) = search_dirs(&self.system_include_paths, SearchPos::System) {
             return Some(found);
+        }
+
+        // Last, the host gcc's own include directory, for the private
+        // headers it has and c17 does not bundle. It goes with the bundled
+        // headers (`-nostdinc`, `-nobuiltininc`), and only a host compile
+        // may use it: its headers are the host target's. Not on macOS, where
+        // the host driver is clang: its headers are clang's -- its
+        // <limits.h>, reached by the bundled one's `#include_next` when
+        // nothing else has one, sets `MB_LEN_MAX` to 1 -- and the SDK has the
+        // <unwind.h> this directory is searched for.
+        if start <= SearchPos::HostCompiler
+            && self.use_builtin_headers
+            && self.target.is_host()
+            && self.target.os != crate::target::Os::MacOS
+        {
+            if let Some(dir) = crate::linkargs::host_include_dir() {
+                let path = Path::new(dir).join(filename);
+                if path.exists() {
+                    return Some((IncludeSource::File(path), Some(SearchPos::HostCompiler)));
+                }
+            }
         }
 
         None
@@ -1146,6 +1243,7 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
         hash_token: &Token,
+        site: IncludeSite,
         search_pos: Option<SearchPos>,
     ) {
         // Canonicalize path for cycle detection
@@ -1233,7 +1331,7 @@ impl<'a> Preprocessor<'a> {
         // spelling. Its warnings are not shown, and neither `-Werror` nor
         // `-pedantic-errors` reaches it.
         let is_system = match search_pos {
-            Some(pos) => matches!(pos, SearchPos::System(_) | SearchPos::Bundled),
+            Some(pos) => pos.is_system(),
             None => diag::stream_is_system(hash_token.pos.stream),
         };
         diag::set_stream_system(stream_id, is_system);
@@ -1244,7 +1342,8 @@ impl<'a> Preprocessor<'a> {
         // Use the same lexer mode as the main file (C or Assembly).
         let tokens = {
             let mut tokenizer =
-                Tokenizer::new_with_mode(&content, stream_id, idents, self.lexer_mode);
+                Tokenizer::new_with_mode(&content, stream_id, idents, self.lexer_mode)
+                    .keeping_comments(self.comments.lexed());
             tokenizer.tokenize()
         };
 
@@ -1253,16 +1352,8 @@ impl<'a> Preprocessor<'a> {
         // is decided after this one finishes, below.
         let guard = Self::guard_of(&tokens, idents);
 
-        // Preprocess the included tokens
         let preprocessed = self.preprocess(tokens, idents);
-
-        // Filter out stream markers from included content
-        for token in preprocessed {
-            match token.typ {
-                TokenType::StreamBegin | TokenType::StreamEnd => {}
-                _ => output.push(token),
-            }
-        }
+        self.splice_included(output, preprocessed, stream_id, site);
 
         // The file has now been read through to the end, so what its guard
         // protects is known rather than guessed.
@@ -1290,6 +1381,7 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
         hash_token: &Token,
+        site: IncludeSite,
     ) {
         // Check include depth
         if self.include_depth >= self.max_include_depth {
@@ -1319,20 +1411,13 @@ impl<'a> Preprocessor<'a> {
 
         // Tokenize the builtin content
         let tokens = {
-            let mut tokenizer = Tokenizer::new(content.as_bytes(), stream_id, idents);
+            let mut tokenizer = Tokenizer::new(content.as_bytes(), stream_id, idents)
+                .keeping_comments(self.comments.lexed());
             tokenizer.tokenize()
         };
 
-        // Preprocess the included tokens
         let preprocessed = self.preprocess(tokens, idents);
-
-        // Filter out stream markers from included content
-        for token in preprocessed {
-            match token.typ {
-                TokenType::StreamBegin | TokenType::StreamEnd => {}
-                _ => output.push(token),
-            }
-        }
+        self.splice_included(output, preprocessed, stream_id, site);
 
         // Restore state
         self.include_depth -= 1;
@@ -1344,6 +1429,26 @@ impl<'a> Preprocessor<'a> {
         self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
         self.current_search_pos = saved_search_pos;
+    }
+
+    /// Put an included file's tokens in the includer's output, without the
+    /// file's own stream markers, and -- for `-E`, which writes line markers
+    /// for them -- between the entry into stream `stream` and the return
+    /// from it, at `site`.
+    fn splice_included(
+        &self,
+        output: &mut Vec<Token>,
+        included: Vec<Token>,
+        stream: u16,
+        site: IncludeSite,
+    ) {
+        self.mark_file_change(output, FileChange::Enter { stream }, site.from);
+        output.extend(
+            included
+                .into_iter()
+                .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd)),
+        );
+        self.mark_file_change(output, FileChange::Return, site.back);
     }
 
     fn handle_error(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
@@ -1365,7 +1470,8 @@ impl<'a> Preprocessor<'a> {
 
         let tokens = self.collect_to_eol(iter);
         let msg = self.tokens_to_message(&tokens, idents);
-        diag::warning_args(*pos, "#warning {0}", &[&msg.to_string()]);
+        // gcc's `-Wcpp` is the group of `#warning`.
+        diag::group_warning_args("cpp", *pos, "#warning {0}", &[&msg.to_string()]);
     }
 
     /// The macro name in `#pragma push_macro("FOO")`.
@@ -1404,6 +1510,21 @@ impl<'a> Preprocessor<'a> {
         idents: &IdentTable,
         hash_pos: Position,
     ) {
+        if self.preprocess_only {
+            diag::without_warnings(|| self.handle_pragma_line(iter, output, idents, hash_pos));
+        } else {
+            self.handle_pragma_line(iter, output, idents, hash_pos);
+        }
+    }
+
+    /// [`Self::handle_pragma`], with its warnings given.
+    fn handle_pragma_line(
+        &mut self,
+        iter: &mut TokenCursor,
+        output: &mut Vec<Token>,
+        idents: &IdentTable,
+        hash_pos: Position,
+    ) {
         if self.is_skipping() {
             self.skip_to_eol(iter);
             return;
@@ -1425,6 +1546,15 @@ impl<'a> Preprocessor<'a> {
         if let Some(token) = iter.peek() {
             if let TokenValue::Ident(id) = &token.value {
                 if let Some(name) = idents.get_opt(*id) {
+                    // The pragmas the parser acts on travel under `-E` as
+                    // written, as gcc's do, for the compile that reads them
+                    // to act on and diagnose.
+                    if self.preprocess_only
+                        && matches!(name, "pack" | "scalar_storage_order" | "GCC")
+                    {
+                        emit_verbatim(self, output);
+                        return;
+                    }
                     if name == "pack" {
                         // A directive handler pulls its own tokens, so they
                         // never pass the remap in the main loop. Attribute the
@@ -1434,13 +1564,7 @@ impl<'a> Preprocessor<'a> {
                         let pos = self.remap_pos(token.pos);
                         iter.next(); // consume "pack"
                         if let Some(action) = self.parse_pack_pragma(iter, idents, pos) {
-                            // The parser decides layout, so the pragma has to
-                            // reach it. It travels as a marker in the stream
-                            // because that is the only ordering that survives
-                            // include splicing.
-                            let mut marker = Token::new(TokenType::Pragma, pos);
-                            marker.value = TokenValue::String(LayoutPragma::Pack(action).encode());
-                            output.push(marker);
+                            self.push_parser_pragma(output, LayoutPragma::Pack(action), pos);
                         }
                         self.skip_to_eol(iter);
                         return;
@@ -1451,11 +1575,20 @@ impl<'a> Preprocessor<'a> {
                         let pos = self.remap_pos(token.pos);
                         let body = verbatim.strip_prefix("#pragma").unwrap_or(&verbatim);
                         if let Some(pragma) = parse_pragma_text(body, pos) {
-                            let mut marker = Token::new(TokenType::Pragma, pos);
-                            marker.value = TokenValue::String(pragma.encode());
-                            output.push(marker);
+                            self.push_parser_pragma(output, pragma, pos);
                         }
                         self.skip_to_eol(iter);
+                        return;
+                    } else if name == "GCC" {
+                        // `GCC visibility` is the parser's, and travels the
+                        // same way; every other `GCC` pragma, and a
+                        // visibility one that does nothing, as its text.
+                        let pos = self.remap_pos(token.pos);
+                        let body = verbatim.strip_prefix("#pragma").unwrap_or(&verbatim);
+                        match parse_pragma_text(body, pos) {
+                            Some(pragma) => self.push_parser_pragma(output, pragma, pos),
+                            None => emit_verbatim(self, output),
+                        }
                         return;
                     } else if name == "push_macro" || name == "pop_macro" {
                         // MSVC's, adopted by gcc and clang and relied on by
@@ -1577,18 +1710,22 @@ impl<'a> Preprocessor<'a> {
         iter: &mut TokenCursor,
         output: &mut Vec<Token>,
         pragma_pos: Position,
+        idents: &mut IdentTable,
     ) {
         // C17 6.10.9p1: the operand is `( string-literal )`. Each token is
         // looked at before it is taken: one that does not belong to the
         // operator -- the end of the stream above all, which every caller
-        // needs to see -- stays where it is.
+        // needs to see -- stays where it is. Each is macro-replaced first, as
+        // gcc does: the Linux kernel writes `_Pragma(__diag_str(...))`.
         let is_punct =
             |t: &Token, c: u8| matches!(&t.value, TokenValue::Special(code) if *code == c as u32);
+        self.expand_ahead(iter, idents);
         if !iter.peek().is_some_and(|t| is_punct(t, b'(')) {
             Self::pragma_operand_error(pragma_pos);
             return;
         }
         iter.next();
+        self.expand_ahead(iter, idents);
         if !iter.peek().is_some_and(|t| t.typ == TokenType::String) {
             Self::pragma_operand_error(pragma_pos);
             return;
@@ -1602,27 +1739,61 @@ impl<'a> Preprocessor<'a> {
         // be the same wrong struct in the spelling nobody tested.
         if let TokenValue::String(body) = &token.value {
             let pos = self.remap_pos(token.pos);
-            let mut marker = Token::new(TokenType::Pragma, pos);
-            marker.value = TokenValue::String(match parse_pragma_text(body, token.pos) {
-                Some(pragma) => pragma.encode(),
+            // Under `-E` every one travels as its text; see `handle_pragma`.
+            let quiet = self.preprocess_only;
+            let mut act = || match parse_pragma_text(body, pos).filter(|_| !quiet) {
+                Some(pragma) => self.push_parser_pragma(output, pragma, pos),
                 // Not one c17 acts on, so it travels as the directive it
                 // stands for. C99 6.10.9p1 makes `_Pragma("x")` mean
                 // `#pragma x`, and the operand is a string literal, so the
                 // escaping the lexer kept has to come back off.
-                None => format!(
-                    "{}#pragma {}",
-                    PRAGMA_TEXT_PREFIX,
-                    destringify(&payload_text(body))
-                ),
-            });
-            output.push(marker);
+                None => {
+                    let mut marker = Token::new(TokenType::Pragma, pos);
+                    marker.value = TokenValue::String(format!(
+                        "{}#pragma {}",
+                        PRAGMA_TEXT_PREFIX,
+                        destringify(&payload_text(body))
+                    ));
+                    output.push(marker);
+                }
+            };
+            if quiet {
+                diag::without_warnings(act);
+            } else {
+                act();
+            }
         }
 
+        self.expand_ahead(iter, idents);
         if iter.peek().is_some_and(|t| is_punct(t, b')')) {
             iter.next();
         } else {
             Self::pragma_operand_error(pragma_pos);
         }
+    }
+
+    /// Hand `pragma` to the parser, which acts on it: as a marker in the
+    /// stream, because that is the only ordering that survives include
+    /// splicing.
+    ///
+    /// A `#pragma GCC visibility pop` with nothing pushed is gcc's warning,
+    /// given here where the pragma stands; the parser pops nothing for it.
+    fn push_parser_pragma(&mut self, output: &mut Vec<Token>, pragma: LayoutPragma, pos: Position) {
+        match pragma {
+            LayoutPragma::Visibility(VisibilityPragma::Push(_)) => self.visibility_depth += 1,
+            LayoutPragma::Visibility(VisibilityPragma::Pop) => match self.visibility_depth {
+                0 => diag::group_warning(
+                    PRAGMAS_WARNING,
+                    pos,
+                    &gettext("no matching push for '#pragma GCC visibility pop'"),
+                ),
+                _ => self.visibility_depth -= 1,
+            },
+            LayoutPragma::Pack(_) | LayoutPragma::StorageOrder(_) => {}
+        }
+        let mut marker = Token::new(TokenType::Pragma, pos);
+        marker.value = TokenValue::String(pragma.encode());
+        output.push(marker);
     }
 
     fn pragma_operand_error(pos: Position) {
@@ -1635,6 +1806,7 @@ impl<'a> Preprocessor<'a> {
     fn handle_line(
         &mut self,
         iter: &mut TokenCursor,
+        output: &mut Vec<Token>,
         idents: &mut IdentTable,
         directive_pos: Position,
     ) {
@@ -1699,7 +1871,13 @@ impl<'a> Preprocessor<'a> {
             _ => None,
         });
         let is_system = diag::stream_is_system(self.physical_stream);
-        self.set_line_marker(line_num, name, is_system);
+        let stream = self.set_line_marker(line_num, name, is_system);
+        // gcc's `-E` marks the change whether or not it moves the text.
+        self.mark_file_change(
+            output,
+            FileChange::Rename,
+            Position::new(stream, line_num, 1),
+        );
     }
 
     /// The line number a `#line` digit sequence names, as gcc reads it.
@@ -1716,7 +1894,7 @@ impl<'a> Preprocessor<'a> {
         let message = gettext("line number out of range");
         match wide {
             Some(n) if (1..=2147483647).contains(&n) => {}
-            Some(n) if n <= u64::from(u32::MAX) => diag::pedwarn(pos, &message),
+            Some(n) if n <= u64::from(u32::MAX) => diag::cpp_pedwarn(pos, &message),
             _ => diag::pedwarn_default(pos, &message),
         }
         wrapped

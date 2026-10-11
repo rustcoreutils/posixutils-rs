@@ -9,7 +9,7 @@
 //! Initializer and global declaration linearization
 
 use super::linearize::*;
-use super::{GlobalStorage, Initializer, SymbolAlias};
+use super::{GlobalStorage, Initializer, SectionUse, SymbolAlias};
 use crate::constexpr;
 use crate::constexpr::ConstScope;
 use crate::diag::error;
@@ -22,7 +22,7 @@ use crate::symbol::Linkage;
 use crate::target::ByteOrder;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Determine whether a declared object type is `const`-qualified for the
 /// purpose of section selection.
@@ -187,8 +187,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             let storage_class = declarator.storage_class;
             let name = self.symbol_name(declarator.symbol);
 
-            // Skip typedef declarations - they don't define storage
+            // Skip typedef declarations - they don't define storage.
             if storage_class.contains(TypeModifiers::TYPEDEF) {
+                continue;
+            }
+            // Nor does a register variable, which is its register: one the
+            // whole unit leaves alone.
+            if storage_class.contains(TypeModifiers::REGISTER) {
+                let reg = self.symbols.get(declarator.symbol).global_register();
+                if let Some(reg) = reg.filter(|r| !self.module.global_registers.contains(r)) {
+                    self.module.global_registers.push(reg);
+                }
                 continue;
             }
 
@@ -220,8 +229,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Function declarations without bodies are external functions
             // Track them in extern_symbols so codegen uses GOT access
             if self.types.kind(declarator.typ) == TypeKind::Function {
-                // Check if not defined in this module (forward refs will be cleaned up later)
-                if !self.module.functions.iter().any(|f| f.name == name) {
+                // Check if not defined in this module (forward refs will be
+                // cleaned up later). An inline definition defines no symbol,
+                // so the name is still a reference to one defined elsewhere --
+                // or, made an alias, here -- with this declaration's
+                // attributes.
+                if !self
+                    .module
+                    .functions
+                    .iter()
+                    .any(|f| f.name == name && f.emit)
+                {
                     self.module
                         .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
                     if declarator.fn_effect != crate::parse::ast::MemEffect::Unknown {
@@ -230,6 +248,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                             .insert(name.clone(), declarator.fn_effect);
                     }
                     self.module.extern_symbols.insert(name);
+                } else {
+                    self.module
+                        .add_call_diagnostics(&name, &declarator.symbol_attrs.call_diagnostics);
                 }
                 continue;
             }
@@ -311,7 +332,81 @@ impl<'a> super::linearize::Linearizer<'a> {
                 declarator.explicit_align,
                 storage,
             );
+            if let Some(global) = self.module.global_mut(&name) {
+                global.decl_pos.get_or_insert(declarator.pos);
+            }
+            if attrs.section.is_some() {
+                let shown = self
+                    .str(self.symbols.get(declarator.symbol).name)
+                    .to_string();
+                self.record_section_definition(&name, declarator.pos, shown);
+            }
             self.module.set_symbol_attrs(&name, attrs);
+        }
+    }
+
+    /// Note where a definition placed in a named section was written, and
+    /// its name as the program spells it -- the first definition of it, for
+    /// a tentative one completed later.
+    pub(crate) fn record_section_definition(&mut self, name: &str, pos: Position, shown: String) {
+        self.section_definitions
+            .entry(name.to_string())
+            .or_insert((pos, shown));
+    }
+
+    /// Report a named section asked to hold definitions that cannot share
+    /// one: writable data beside read-only data, data beside code, a
+    /// thread-local beside an ordinary object. One ELF section has one set of
+    /// flags, and the assembler would otherwise stop at the second with
+    /// "changed section attributes" -- or, as `as` does for some pairs, give
+    /// the section the first set silently.
+    ///
+    /// gcc's order, so the same pair is named: the functions claim their
+    /// sections first, then the objects from the end of the unit back, and a
+    /// section is reported once, at the definition that met another's claim.
+    /// Mach-O sections carry no flags, so nothing conflicts there.
+    pub(crate) fn check_section_conflicts(&self) {
+        if self.target.os == crate::target::Os::MacOS || self.section_definitions.is_empty() {
+            return;
+        }
+        let functions = self
+            .module
+            .functions
+            .iter()
+            .filter(|f| f.emit)
+            .filter_map(|f| {
+                Some((
+                    f.symbol_attrs.section.as_deref()?,
+                    &f.name,
+                    SectionUse::Code,
+                ))
+            });
+        let objects =
+            self.module.globals.iter().rev().filter_map(|g| {
+                Some((g.symbol_attrs.section.as_deref()?, &g.name, g.section_use()))
+            });
+        let mut claims: HashMap<&str, (&String, SectionUse)> = HashMap::new();
+        let mut reported: HashSet<&str> = HashSet::new();
+        for (section, name, asks) in functions.chain(objects) {
+            let Some(&(owner, held)) = claims.get(section) else {
+                claims.insert(section, (name, asks));
+                continue;
+            };
+            if held.compatible(asks) || !reported.insert(section) {
+                continue;
+            }
+            let at = |n: &String| self.section_definitions.get(n.as_str()).cloned();
+            let Some((pos, shown)) = at(name) else {
+                continue;
+            };
+            let (owner_pos, owner_shown) =
+                at(owner).unwrap_or_else(|| (Position::default(), owner.clone()));
+            crate::diag::error_args(
+                pos,
+                "'{0}' causes a section type conflict with '{1}'",
+                &[&shown, &owner_shown],
+            );
+            crate::diag::note_args(owner_pos, "'{0}' was declared here", &[&owner_shown]);
         }
     }
 
@@ -1224,7 +1319,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Consumed either way: the elements belong to this slot, and
                 // leaving them in the list would make the next iteration read
                 // them as initializers for the enclosing array.
-                let sub_elements = self.consume_brace_elision(elements, &mut elem_idx, elem_type);
+                let mut sub_elements =
+                    self.consume_brace_elision(elements, &mut elem_idx, elem_type);
                 if !in_bounds(element_index) {
                     continue;
                 }
@@ -1232,6 +1328,18 @@ impl<'a> super::linearize::Linearizer<'a> {
                     element_indices.push(element_index);
                     Vec::new()
                 });
+                // Over what an earlier element -- a range -- put in the slot,
+                // the elided values start again at its first subobject, and
+                // overwrite only as far as they go: gcc's `{[0 ... 2] = {1,
+                // 2, 3}, [1] = 7}` leaves `{7, 2, 3}` in the middle.
+                if !entry.is_empty() {
+                    if let Some(first) = sub_elements.first_mut() {
+                        first.designators =
+                            crate::parse::ast::first_subobject(self.types, elem_type)
+                                .into_iter()
+                                .collect();
+                    }
+                }
                 entry.extend(sub_elements);
                 continue;
             }
@@ -1272,6 +1380,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                     });
 
                     if remaining_designators.is_empty() {
+                        // The value initializes the whole slot -- a braced
+                        // list, a string for a character array, a scalar --
+                        // so it replaces whatever an earlier element, a
+                        // range, put there (C17 6.7.9p19). Appended, Linux's
+                        // `{[0 ... 63] = "??", [2] = "rd"}` gave the slot two
+                        // strings, and the second was "not constant".
+                        entry.clear();
                         if let ExprKind::InitList {
                             elements: nested_elements,
                         } = &element.value.kind
@@ -2863,11 +2978,19 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `extern int b __attribute__((alias("a")));` -- records it as an
     /// external reference, which it is not.
     pub(crate) fn resolve_aliases(&mut self) {
-        let declared = std::mem::take(&mut self.declared_aliases);
-        for a in &declared {
+        let mut declared = std::mem::take(&mut self.declared_aliases);
+        for a in &mut declared {
             self.module.extern_symbols.remove(&a.name);
-            self.module.declared_symbol_attrs.remove(&a.name);
             self.module.extern_object_align.remove(&a.name);
+            // The other declarations of the name are the alias's too: glibc
+            // declares `__GI_g` hidden with `hidden_proto` and only then makes
+            // it an alias with `weak_alias`, and gcc's alias is hidden.
+            if let Some(attrs) = self.module.declared_symbol_attrs.remove(&a.name) {
+                a.weak |= attrs.weak;
+                if a.visibility.is_none() {
+                    a.visibility = attrs.visibility;
+                }
+            }
         }
         // Mach-O has neither symbol aliases nor indirect functions -- clang
         // refuses `alias` on Darwin for the same reason -- so there is
@@ -3033,15 +3156,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         // One hop per alias at most; anything longer is a cycle, which
         // defines nothing.
         for _ in 0..=declared.len() {
-            if let Some(f) = self
+            let function = self
                 .module
                 .functions
                 .iter()
-                .find(|f| undecorated(&f.name) == cur)
-            {
-                if !f.emit {
-                    return Err(AliasFault::External);
-                }
+                .find(|f| undecorated(&f.name) == cur);
+            if let Some(f) = function.filter(|f| f.emit) {
                 return Ok((
                     emitted.unwrap_or_else(|| f.name.clone()),
                     AliasKind::Function,
@@ -3055,8 +3175,17 @@ impl<'a> super::linearize::Linearizer<'a> {
             {
                 return Ok((emitted.unwrap_or_else(|| g.name.clone()), AliasKind::Object));
             }
+            // A name may have an inline definition, which emits no symbol,
+            // and be an alias as well -- glibc's `libc_hidden_weak` aliases
+            // `__GI_getc_unlocked`, which is also the asm name of the
+            // `gnu_inline` body <bits/stdio.h> gives `getc_unlocked`. The
+            // alias is the symbol.
             let Some(next) = declared.iter().find(|d| undecorated(&d.name) == cur) else {
-                return Err(AliasFault::Undefined);
+                return Err(if function.is_some() {
+                    AliasFault::External
+                } else {
+                    AliasFault::Undefined
+                });
             };
             emitted.get_or_insert_with(|| next.name.clone());
             cur = &next.target;
@@ -3189,6 +3318,62 @@ mod tests {
             vec![designated(Designator::IndexRange(0, 4), 7, types)]
         });
         assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    /// `int m[3][2] = {[0 ... 2] = {1, 2}, [1] = {7}, [2] = 9}`: a braced
+    /// list for a slot the range filled replaces the range's elements, and a
+    /// brace-elided value overwrites from the slot's first element, as gcc
+    /// does; both were appended after the range's, where they were excess.
+    #[test]
+    fn an_element_after_a_range_overrides_its_slot() {
+        let target = Target::host();
+        let mut types = TypeTable::new(&target);
+        let row = types.intern(Type::array(types.int_id, 2));
+        let matrix = types.intern(Type::array(row, 3));
+        let list = |values: &[i64], types: &TypeTable| {
+            let elements = values.iter().map(|&v| positional(v, types)).collect();
+            Box::new(Expr::new(
+                ExprKind::InitList { elements },
+                Position::default(),
+            ))
+        };
+        let elements = vec![
+            InitElement {
+                designators: vec![Designator::IndexRange(0, 2)],
+                value: list(&[1, 2], &types),
+            },
+            InitElement {
+                designators: vec![Designator::Index(1)],
+                value: list(&[7], &types),
+            },
+            designated(Designator::Index(2), 9, &types),
+        ];
+        let symbols = SymbolTable::new();
+        let strings = crate::strings::StringTable::new();
+        let lin = Linearizer::new(&symbols, &types, &strings, &target);
+        let groups = lin.group_array_init_elements(&elements, matrix);
+        let shape = |index: i64| -> Vec<(Vec<Designator>, Option<i64>)> {
+            groups.element_lists[&index]
+                .iter()
+                .map(|e| {
+                    let value = match e.value.kind {
+                        ExprKind::IntLit(v) => Some(v),
+                        _ => None,
+                    };
+                    (e.designators.clone(), value)
+                })
+                .collect()
+        };
+        assert_eq!(shape(0), [(vec![], Some(1)), (vec![], Some(2))]);
+        assert_eq!(shape(1), [(vec![], Some(7))]);
+        assert_eq!(
+            shape(2),
+            [
+                (vec![], Some(1)),
+                (vec![], Some(2)),
+                (vec![Designator::Index(0)], Some(9))
+            ]
+        );
     }
 
     #[test]

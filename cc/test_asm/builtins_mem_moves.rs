@@ -58,19 +58,21 @@ fn builtins_mem_moves_call_memcpy_and_memmove() {
 
 /// Optimizing, a `memmove` whose blocks cannot overlap calls `memcpy`; one
 /// whose blocks might stays a `memmove`, and so does every one at `-O0`.
+/// The blocks are past the 8 KB x86-64 copies in place, so the `memcpy`
+/// stays a call.
 #[test]
 fn builtins_mem_moves_disjoint_move_is_memcpy() {
     let src = format!(
         "{PROTOTYPES}\
-         static const long table[20] = {{ 1, 2, 3 }};\n\
-         long g[20], h[20];\n\
+         static const long table[2000] = {{ 1, 2, 3 }};\n\
+         long g[2000], h[2000];\n\
          void from_const(void *d) {{ memmove(d, table, sizeof table); }}\n\
-         void from_literal(void *d) {{ memmove(d, \"{long}\", 150); }}\n\
+         void from_literal(void *d) {{ memmove(d, \"{long}\", 9000); }}\n\
          void between_locals(void (*use)(char *, char *)) {{\n\
-             char a[200], b[200]; use(a, b); memmove(a, b, sizeof a); use(a, b); }}\n\
+             char a[9000], b[9000]; use(a, b); memmove(a, b, sizeof a); use(a, b); }}\n\
          void local_and_global(void (*use)(long *)) {{\n\
-             long a[20]; use(a); memmove(g, a, sizeof a); }}\n",
-        long = "x".repeat(160)
+             long a[2000]; use(a); memmove(g, a, sizeof a); }}\n",
+        long = "x".repeat(9010)
     );
     for_each_target("mem_moves_disjoint", &src, &[], |asm, what| {
         let optimizing = what.starts_with("-O2");
@@ -80,7 +82,7 @@ fn builtins_mem_moves_disjoint_move_is_memcpy() {
 
     let src = format!(
         "{PROTOTYPES}\
-         long g[20], h[20];\n\
+         long g[2000], h[2000];\n\
          void unknown(void *d, const void *s) {{ memmove(d, s, 160); }}\n\
          void two_globals(void) {{ memmove(g, h, sizeof h); }}\n\
          void one_local(void (*use)(char *)) {{\n\

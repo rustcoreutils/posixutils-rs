@@ -20,7 +20,7 @@
 //! identifier means, and which struct a member path starts from. That is the
 //! [`ConstEnv`] trait; everything else is here.
 
-use crate::float::{Complex, FloatVal, FpFormat};
+use crate::float::{Complex, FloatVal, FpFormat, FpRounding, Rounded};
 use crate::ir::constfold::{eval_bit_op, BitOp};
 use crate::parse::ast::{
     BinaryOp, CheckedOp, Expr, ExprKind, FpTest, InlineLibraryFn, OffsetOfPath, UnaryOp,
@@ -99,6 +99,25 @@ pub(crate) trait ConstEnv {
 
     /// [`Self::subobject_value`] for a floating subobject.
     fn float_subobject_value(&self, expr: &Expr, scope: ConstScope) -> Option<FloatVal>;
+
+    /// The rounding direction a floating-point operation evaluated at run
+    /// time may assume ([`FpRounding`]). What the parser evaluates is all
+    /// translation time -- a `case` label, an array bound, an enumerator --
+    /// where it is to nearest; only the linearizer folds an expression the
+    /// program evaluates at run time.
+    fn fp_rounding(&self) -> FpRounding {
+        FpRounding::ToNearest
+    }
+}
+
+/// The rounding direction a floating constant in `scope` is evaluated in: a
+/// static initializer's at translation time, to nearest (C17 F.8.5), and
+/// anything else as the program runs it.
+fn rounding_in(env: &impl ConstEnv, scope: ConstScope) -> FpRounding {
+    match scope {
+        ConstScope::StaticInitializer => FpRounding::ToNearest,
+        ConstScope::Standard | ConstScope::ArrayBound => env.fp_rounding(),
+    }
 }
 
 /// Reduce a value to what its type can hold.
@@ -412,6 +431,11 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
                     // Every other context takes gcc's saturated one.
                     (IntConversion::Saturated(v), _) => Some(v),
                 };
+            }
+            // An array converts to its address, which a member of a pointer
+            // constant has as an integer: `(size_t)((T *)0)->array`.
+            if inner.typ.is_some_and(|t| types.kind(t) == TypeKind::Array) {
+                return eval_pointer(env, scope, inner);
             }
             eval(env, scope, inner)
         }
@@ -812,17 +836,20 @@ pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) ->
             Some(if *op == UnaryOp::Real { re } else { im })
         }
 
+        // Only an exact result where the rounding direction is the
+        // program's to set.
         ExprKind::Binary { op, left, right } => {
             let l = eval_float(env, scope, left)?;
             let r = eval_float(env, scope, right)?;
             let fmt = fmt?;
-            Some(match op {
-                BinaryOp::Add => l.add(r, fmt),
-                BinaryOp::Sub => l.sub(r, fmt),
-                BinaryOp::Mul => l.mul(r, fmt),
-                BinaryOp::Div => l.div(r, fmt),
+            match op {
+                BinaryOp::Add => l.add_rounded(r, fmt),
+                BinaryOp::Sub => l.sub_rounded(r, fmt),
+                BinaryOp::Mul => l.mul_rounded(r, fmt),
+                BinaryOp::Div => l.div_rounded(r, fmt),
                 _ => return None,
-            })
+            }
+            .under(rounding_in(env, scope))
         }
 
         // A cast converts to the target format. Discarding the cast type
@@ -900,19 +927,22 @@ pub(crate) fn integer_to_float(types: &TypeTable, typ: TypeId, v: i128) -> Float
 /// to the floating type `to` as the program converts it at run time: rounded
 /// at `from`'s format first, and a NaN quieted when the format changes (see
 /// [`FloatVal::convert`]). From an integer, whose value is exact here, it is
-/// one rounding; to a type that is not floating, nothing.
-pub(crate) fn convert_float(
+/// one rounding; to a type that is not floating, nothing. `None` for a
+/// conversion that rounds where `rounding` leaves the direction to run time.
+fn convert_float(
     types: &TypeTable,
     val: FloatVal,
     from: Option<TypeId>,
     to: TypeId,
-) -> FloatVal {
+    rounding: FpRounding,
+) -> Option<FloatVal> {
     let src = from.and_then(|t| types.fp_format(t));
     match (src, types.fp_format(to)) {
-        (Some(src), Some(dst)) => val.convert(src, dst),
-        (None, Some(dst)) => val.round_to_format(dst),
-        (_, None) => val,
+        (Some(src), Some(dst)) => val.convert_rounded(src, dst),
+        (None, Some(dst)) => val.rounded_to_format(dst),
+        (_, None) => Rounded::exact(val),
     }
+    .under(rounding)
 }
 
 /// The width and signedness [`FloatVal::to_integer`] converts to for the
@@ -966,8 +996,10 @@ pub(crate) fn eval_complex(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
     match &expr.kind {
         // `I` itself is `__builtin_complex(0.0, 1.0)`.
         ExprKind::BuiltinComplex { real, imag } => {
-            let half =
-                |e: &Expr| convert_complex_half(types, eval_float(env, scope, e)?, e.typ?, base);
+            let half = |e: &Expr| {
+                let v = eval_float(env, scope, e)?;
+                convert_complex_half(types, v, e.typ?, base, rounding_in(env, scope))
+            };
             Some((half(real)?, half(imag)?))
         }
 
@@ -1009,10 +1041,13 @@ pub(crate) fn eval_complex(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
 
         // The usual arithmetic conversions have made `base` the type both
         // operands are converted to.
+        // A floating one rounds in the run-time direction where that is the
+        // program's to set, as `__mul?c3` and `__div?c3` do: not folded.
         ExprKind::Binary { op, left, right } => {
             let x = eval_complex_as(env, scope, left, base)?;
             let y = eval_complex_as(env, scope, right, base)?;
             match types.fp_format(base) {
+                Some(_) if rounding_in(env, scope) == FpRounding::Dynamic => None,
                 Some(fmt) => fold_complex_float(*op, x, y, fmt, &types.target()),
                 None => fold_complex_int(types, *op, x, y, base),
             }
@@ -1033,9 +1068,10 @@ pub(crate) fn eval_complex_as(
     let types = env.types();
     let (re, im) = eval_complex(env, scope, expr)?;
     let from = types.complex_base(expr.typ?);
+    let rounding = rounding_in(env, scope);
     Some((
-        convert_complex_half(types, re, from, base)?,
-        convert_complex_half(types, im, from, base)?,
+        convert_complex_half(types, re, from, base, rounding)?,
+        convert_complex_half(types, im, from, base, rounding)?,
     ))
 }
 
@@ -1048,9 +1084,10 @@ fn convert_complex_half(
     v: FloatVal,
     from: TypeId,
     to: TypeId,
+    rounding: FpRounding,
 ) -> Option<FloatVal> {
     if !types.is_integer(to) {
-        return Some(convert_float(types, v, Some(from), to));
+        return convert_float(types, v, Some(from), to, rounding);
     }
     let n = if types.is_integer(from) {
         normalize(types, Some(to), float_to_integer(types, v, from)?)
@@ -1200,7 +1237,7 @@ pub(crate) fn eval_as_float(
     to: TypeId,
 ) -> Option<FloatVal> {
     let (v, from) = real_part(env, scope, expr)?;
-    Some(convert_float(env.types(), v, from, to))
+    convert_float(env.types(), v, from, to, rounding_in(env, scope))
 }
 
 /// A constant converted to an integer type: in range, or out of range with
@@ -1337,6 +1374,14 @@ pub(crate) fn eval_pointer(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
 
         ExprKind::Unary {
             op: UnaryOp::AddrOf,
+            operand,
+        } => eval_pointer(env, scope, operand),
+
+        // `*p` designates the object at `p`, so its address is `p`'s value:
+        // `&(*(T *)0).m` is the `.` spelling of `&((T *)0)->m`, and the Linux
+        // kernel's sysrq.c initializes a table with `&(*(const T *)NULL)`.
+        ExprKind::Unary {
+            op: UnaryOp::Deref,
             operand,
         } => eval_pointer(env, scope, operand),
 

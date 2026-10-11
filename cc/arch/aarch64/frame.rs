@@ -15,7 +15,7 @@ use crate::abi::aapcs64::StackedArgs;
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::features::{VA_GR_SAVE_BYTES, VA_VR_SAVE_BYTES};
-use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
+use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, Hint, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, Reg, RegAlloc, VReg};
 use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
@@ -103,18 +103,25 @@ impl Aarch64CodeGen {
         // Check if this function uses varargs
         let is_variadic = is_variadic_function(func);
 
-        if self.base.tls_access().is_call() {
+        let called = self.base.called_thread_locals();
+        if !called.is_empty() {
             crate::arch::codegen::check_tls_reached_only_by_address(
                 func,
-                &self.tls_symbols,
+                &called,
                 self.base.func_pos,
             );
         }
 
         // Register allocation
-        let guarded = crate::arch::stack_protect::protects(func, types, self.base.stack_protector);
+        let guarded = crate::arch::stack_protect::protects(
+            func,
+            types,
+            self.base.stack_protector,
+            self.base.optimizing,
+        );
         let mut alloc = RegAlloc::new(StackedArgs::of(&self.base.target))
-            .with_tls_access(self.base.tls_access())
+            .with_global_registers(&self.global_registers)
+            .with_tls_access(self.base.tls_call_access())
             .with_stack_guard(guarded);
         self.locations = alloc.allocate(func, types);
         self.stack_guard = alloc.stack_guard_slot();
@@ -173,6 +180,8 @@ impl Aarch64CodeGen {
         // on the symbol the assembler is asked for.
         self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
         self.base.func_pos = crate::arch::func_pos(func);
+        self.base.branch_protection = func.branch_protection;
+        self.base.landing_pads.enter(&func.name);
         self.frame_size = total_frame;
         self.stack_alloc_size = stack_size;
 
@@ -183,8 +192,14 @@ impl Aarch64CodeGen {
         let first_inst = self.base.lir_buffer.len();
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
+        self.emit_entry_protection(func);
+        for directive in self.base.patchable_entry(func, false) {
+            self.push_lir(Aarch64Inst::Directive(directive));
+        }
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
         self.base.check_stack_clash(func, total_frame as i64);
+        self.base
+            .check_frame_size(i64::from(stack_size + reg_save_area_size));
 
         self.emit_frame_base_latch();
         self.emit_stack_guard_set();
@@ -222,10 +237,32 @@ impl Aarch64CodeGen {
             self.emit_block(block, &frame_info, types);
         }
 
+        // The landings of calls whose argument area was realigned: `sp`
+        // back from where the call saved it, then the pad (`arch::eh`).
+        for detour in self.base.take_eh_detours() {
+            self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(detour.label)));
+            self.push_lir(Aarch64Inst::Ldr {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::SP,
+                    offset: detour.saved_sp,
+                },
+                dst: Reg::X16,
+            });
+            self.push_lir(Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::X16,
+                src2: GpOperand::Imm(0),
+                dst: Reg::sp(),
+            });
+            self.push_lir(Aarch64Inst::B { target: detour.pad });
+        }
+
         // CFI: End procedure
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiEndProc));
         }
+        self.base.eh_end_function();
 
         // The label `DW_AT_high_pc` names, before `.size` so it marks the end
         // of the code rather than a point after the directive.
@@ -310,18 +347,15 @@ impl Aarch64CodeGen {
         }
 
         let ret_typ = (types.kind(func.return_type) != TypeKind::Void).then_some(func.return_type);
-        let decl_line = func
-            .blocks
-            .iter()
-            .flat_map(|b| b.insns.iter())
-            .find_map(|i| i.pos.as_ref())
-            .map(|p| p.line)
-            .unwrap_or(0);
+        // Declared where its first instruction is; a function made in no
+        // file (a synthetic stream) names none.
+        let pos = self.base.func_pos;
 
         self.base.fn_dies.push(crate::arch::dwarf::FnDie {
             name: func.name.clone(),
             external: !func.is_static,
-            decl_line,
+            decl_file: self.base.source_files.file_of(pos.stream).unwrap_or(0),
+            decl_line: pos.line,
             end_label,
             ret_typ,
             vars,
@@ -335,12 +369,8 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Directive(Directive::Text));
 
         // A named section replaces .text for this function.
-        if let Some(sec) = &func.symbol_attrs.section {
-            self.push_lir(Aarch64Inst::Directive(Directive::NamedSection {
-                name: sec.clone(),
-                executable: true,
-                writable: false,
-            }));
+        if let Some(section) = self.base.function_section(func) {
+            self.push_lir(Aarch64Inst::Directive(section));
         }
 
         // Skip .globl for static functions (internal linkage)
@@ -365,11 +395,13 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Directive(Directive::type_func(name)));
 
         // An instruction is four bytes, so that is the least; `aligned(N)`
-        // raises it.
-        let align = func.align.unwrap_or(4).max(4);
-        self.push_lir(Aarch64Inst::Directive(Directive::Align(
-            align.trailing_zeros(),
-        )));
+        // and the `-f` alignment options raise it.
+        for directive in self.base.function_alignment(func, 2) {
+            self.push_lir(Aarch64Inst::Directive(directive));
+        }
+        for directive in self.base.patchable_entry(func, true) {
+            self.push_lir(Aarch64Inst::Directive(directive));
+        }
 
         // Function label
         self.push_lir(Aarch64Inst::Directive(Directive::global_label(name)));
@@ -380,8 +412,60 @@ impl Aarch64CodeGen {
         self.base.emit_function_entry_loc(func);
 
         // CFI: Start procedure (enables stack unwinding for this function)
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(Directive::CfiStartProc));
+        }
+        self.base.eh_begin_function(func, self.pic_mode);
+    }
+
+    /// What `-mbranch-protection` puts at a function's entry, before its
+    /// prologue saves x30. Under `pac-ret`, x30 signed, and the CFI saying
+    /// so: gcc signs in every function that saves x30, and every c17 frame
+    /// does, so `leaf` changes nothing. `paciasp` is a landing pad for an
+    /// indirect call too, so it is all a signing function needs; otherwise,
+    /// under `bti`, a function an indirect call may reach starts with
+    /// `bti c`.
+    fn emit_entry_protection(&mut self, func: &Function) {
+        match self.base.branch_protection.pac_ret {
+            Some(pac) => {
+                if pac.b_key {
+                    self.push_cfi(Directive::CfiBKeyFrame);
+                }
+                let sign = if pac.b_key {
+                    Hint::Pacibsp
+                } else {
+                    Hint::Paciasp
+                };
+                self.push_lir(Aarch64Inst::Hint(sign));
+                self.push_cfi(Directive::CfiWindowSave);
+            }
+            None if self.base.landing_pads.entry(&func.name) => {
+                self.push_lir(Aarch64Inst::Hint(Hint::BtiC));
+            }
+            None => {}
+        }
+    }
+
+    /// Under `pac-ret`, authenticate x30, reloaded by the epilogue, just
+    /// before the `ret` that branches to it, as gcc does.
+    fn emit_return_authentication(&mut self) {
+        if let Some(pac) = self.base.branch_protection.pac_ret {
+            let auth = if pac.b_key {
+                Hint::Autibsp
+            } else {
+                Hint::Autiasp
+            };
+            self.push_lir(Aarch64Inst::Hint(auth));
+            self.push_cfi(Directive::CfiWindowSave);
+        }
+    }
+
+    /// Under `bti`, the landing pad of a place an indirect jump reaches: the
+    /// return of a call that returns twice, an exception landing pad,
+    /// `__builtin_setjmp`'s resume point, a label a computed goto may take.
+    pub(super) fn emit_jump_landing_pad(&mut self) {
+        if self.base.landing_pads.active() {
+            self.push_lir(Aarch64Inst::Hint(Hint::BtiJ));
         }
     }
 
@@ -393,7 +477,7 @@ impl Aarch64CodeGen {
     /// not with `-g`. Each follows the instruction that makes it true, so the
     /// CFA and every saved register are described at every instruction.
     fn push_cfi(&mut self, rule: Directive) {
-        if self.base.emit_unwind_tables {
+        if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(rule));
         }
     }
@@ -1657,6 +1741,7 @@ impl Aarch64CodeGen {
             self.push_cfi(Directive::cfi_restore("x29"));
             self.emit_sp_adjust(dealloc, dealloc);
         }
+        self.emit_return_authentication();
         self.push_lir(Aarch64Inst::Ret);
         self.push_cfi(Directive::CfiRestoreState);
     }

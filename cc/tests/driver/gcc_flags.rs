@@ -153,14 +153,128 @@ fn gcc_flags_cpu_selection_is_accepted() {
         let r = compile_with("cpu.c", MAIN, &[flag]);
         assert!(r.success, "{flag}: {}", r.stderr);
     }
-    // An instruction-set extension or an ABI change is still refused.
-    for flag in ["-mavx2", "-mno-red-zone", "-mgeneral-regs-only"] {
+    // An ABI change is still refused. (The instruction-set options are
+    // `isa_flags.rs`'s, and a kernel's `kernel_flags.rs`'s.)
+    for flag in ["-mabi=ms", "-mx32"] {
         let r = compile_with("cpu.c", MAIN, &[flag]);
         assert!(!r.success, "{flag} accepted");
         assert!(
             r.stderr.contains("unsupported machine flag"),
             "{}",
             r.stderr
+        );
+    }
+}
+
+/// gcc's x86-64 floating-point and TLS options are taken where they ask
+/// for what c17 does and refused where they would change it: c17's `long
+/// double` is the x87 80-bit format, its arithmetic is SSE's, and it reaches
+/// a dynamic thread-local through a TLS descriptor (`gnu2`), so
+/// `-mlong-double-80`, `-mfpmath=sse` and `-mtls-dialect=gnu2` change
+/// nothing. `-mtls-dialect=gnu`, gcc's default, is taken as well: the
+/// descriptor sequence links and runs wherever `__tls_get_addr`'s does.
+/// `long double` as `double` or as binary128 and x87 arithmetic are not what
+/// c17 generates. glibc's configure and tests pass all of these.
+#[test]
+fn gcc_flags_x86_64_fp_and_tls_options() {
+    let x86 = "--target=x86_64-unknown-linux-gnu";
+    let src = "__thread int tv;\nint *addr(void) { return &tv; }\n\
+               long double ld(long double x) { return x * 2; }\n";
+    let plain = crate::common::asm_for_at("c17_fptls_", src, &[x86, "-fPIC"]);
+    assert!(plain.contains("tv@TLSDESC(%rip)"), "{plain}");
+    for flag in [
+        "-mlong-double-80",
+        "-mfpmath=sse",
+        "-mtls-dialect=gnu2",
+        "-mtls-dialect=gnu",
+        "-mprefer-vector-width=128",
+    ] {
+        let asm = crate::common::asm_for_at("c17_fptls_", src, &[x86, "-fPIC", flag]);
+        let strip = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.contains("c17_fptls_"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip(&asm), strip(&plain), "{flag}");
+    }
+    let (_dir, path) = scratch("fptls.c", src);
+    for flag in [
+        "-mlong-double-64",
+        "-mlong-double-128",
+        "-mfpmath=387",
+        "-mfpmath=both",
+        "-mfpmath=sse+387",
+    ] {
+        let r = run_c17(&[x86, flag, "-S", "-o", "/dev/null", path.to_str().unwrap()]);
+        assert!(!r.success, "{flag} accepted");
+        assert_eq!(
+            r.stderr,
+            format!("c17: unsupported machine flag: {flag}\n"),
+            "{flag}"
+        );
+    }
+    // None is an aarch64 option.
+    for flag in ["-mlong-double-80", "-mtls-dialect=gnu2"] {
+        let r = run_c17(&[
+            "--target=aarch64-unknown-linux-gnu",
+            flag,
+            "-S",
+            "-o",
+            "/dev/null",
+            path.to_str().unwrap(),
+        ]);
+        assert!(!r.success, "aarch64 {flag} accepted");
+    }
+}
+
+/// `-mtls-dialect=` names each architecture's own pair, as gcc's does: x86-64
+/// takes `gnu` and `gnu2`, aarch64 `desc` and `trad`. c17 reaches a dynamic
+/// thread-local through a TLS descriptor on both, so `desc` changes nothing;
+/// aarch64's `trad` asks for `__tls_get_addr` calls c17 does not generate,
+/// and is refused. Any other value -- the other architecture's included --
+/// is refused in gcc's words, with the valid ones listed. aarch64's `desc`
+/// was refused as an unsupported machine flag.
+#[test]
+fn gcc_flags_tls_dialect_per_architecture() {
+    let a64 = "--target=aarch64-unknown-linux-gnu";
+    let x86 = "--target=x86_64-unknown-linux-gnu";
+    let src = "__thread int tv;\nint *addr(void) { return &tv; }\n";
+    let plain = crate::common::asm_for_at("c17_tlsd_", src, &[a64, "-fPIC"]);
+    assert!(plain.contains(":tlsdesc:tv"), "{plain}");
+    let asm = crate::common::asm_for_at("c17_tlsd_", src, &[a64, "-fPIC", "-mtls-dialect=desc"]);
+    let strip = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.contains("c17_tlsd_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(strip(&asm), strip(&plain));
+
+    let (_dir, path) = scratch("tlsd.c", src);
+    let path = path.to_str().unwrap();
+    let r = run_c17(&[a64, "-mtls-dialect=trad", "-S", "-o", "/dev/null", path]);
+    assert!(!r.success, "trad accepted");
+    assert_eq!(
+        r.stderr,
+        "c17: unsupported machine flag: -mtls-dialect=trad\n"
+    );
+    for (target, value, valid) in [
+        (x86, "desc", "gnu gnu2"),
+        (x86, "bogus", "gnu gnu2"),
+        (a64, "gnu", "desc trad"),
+        (a64, "gnu2", "desc trad"),
+    ] {
+        let flag = format!("-mtls-dialect={value}");
+        let r = run_c17(&[target, &flag, "-S", "-o", "/dev/null", path]);
+        assert!(!r.success, "{target} {flag} accepted");
+        assert_eq!(
+            r.stderr,
+            format!(
+                "c17: error: unrecognized argument in option '{flag}'\n\
+                 c17: note: valid arguments to '-mtls-dialect=' are: {valid}\n"
+            ),
+            "{target} {flag}"
         );
     }
 }
@@ -548,9 +662,10 @@ fn elf_linkage(path: &std::path::Path) -> ElfLinkage {
     }
 }
 
-/// `-static` links a program with no dynamic loader that runs, whatever PIE
-/// request came before it -- gcc's answer to `-pie -static` is a static,
-/// fixed-address executable -- and `-static-pie` links a static PIE.
+/// `-static` (or gcc's `--static`) links a program with no dynamic loader
+/// that runs, whatever PIE request came before it -- gcc's answer to `-pie
+/// -static` is a static, fixed-address executable -- and `-static-pie`
+/// links a static PIE.
 #[cfg(target_os = "linux")]
 #[test]
 fn gcc_flags_static_links_without_an_interpreter() {
@@ -558,6 +673,7 @@ fn gcc_flags_static_links_without_an_interpreter() {
     let exe = dir.path().join("st");
     for (flags, e_type) in [
         (&["-static"][..], 2u16),
+        (&["--static"], 2),
         (&["-pie", "-static"], 2),
         (&["-static", "-pie"], 2),
         (&["-static-pie"], 3),
@@ -573,6 +689,44 @@ fn gcc_flags_static_links_without_an_interpreter() {
         let status = std::process::Command::new(&exe).status().expect("run");
         assert_eq!(status.code(), Some(7), "{flags:?}");
     }
+}
+
+/// `-r` links the objects into one relocatable object, as gcc's does: no
+/// startup files, no libraries and no `-pie`, so the result still has
+/// `main` and the other unit's function to itself, and links into a program
+/// that runs. binutils' ld tests build their inputs this way.
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_r_links_a_relocatable_object() {
+    let (dir, path) = scratch(
+        "main.c",
+        "int other(void);
+int main(void) { return other(); }
+",
+    );
+    let other = dir.path().join("other.c");
+    std::fs::write(
+        &other,
+        "int other(void) { return 9; }
+",
+    )
+    .unwrap();
+    let combined = dir.path().join("combined.o");
+    let r = run_c17(&[
+        "-r",
+        "-o",
+        combined.to_str().unwrap(),
+        path.to_str().unwrap(),
+        other.to_str().unwrap(),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let elf = elf_linkage(&combined);
+    assert_eq!(elf.e_type, 1, "not ET_REL");
+    let exe = dir.path().join("prog");
+    let r = run_c17(&["-o", exe.to_str().unwrap(), combined.to_str().unwrap()]);
+    assert!(r.success, "{}", r.stderr);
+    let status = std::process::Command::new(&exe).status().expect("run");
+    assert_eq!(status.code(), Some(9));
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +859,14 @@ fn gcc_flags_link_queries_are_forwarded_to_the_host_driver() {
         ("-print-libgcc-file-name", "-print-libgcc-file-name"),
         ("--print-search-dirs", "-print-search-dirs"),
         ("-print-multi-os-directory", "-print-multi-os-directory"),
+        ("--print-multi-os-directory", "-print-multi-os-directory"),
+        ("--print-libgcc-file-name", "-print-libgcc-file-name"),
+        // gcc names its own programs by their full path; libtool and gcc's
+        // configure (AIX) ask for collect2.
+        ("-print-prog-name=collect2", "-print-prog-name=collect2"),
+        ("-print-prog-name=ld", "-print-prog-name=ld"),
+        ("--print-prog-name=ld", "-print-prog-name=ld"),
+        ("-print-prog-name=cc1", "-print-prog-name=cc1"),
     ] {
         let want = std::process::Command::new("cc")
             .arg(host)
@@ -713,6 +875,84 @@ fn gcc_flags_link_queries_are_forwarded_to_the_host_driver() {
         let r = run_c17(&[query]);
         assert_eq!(r.success, want.status.success(), "{query}: {}", r.stderr);
         assert_eq!(r.stdout, String::from_utf8_lossy(&want.stdout), "{query}");
+    }
+}
+
+/// gcc takes `--print-prog-name` and `--print-file-name` with their
+/// argument in the next word as well. gcc-14's configure asks
+/// `--print-prog-name liblto_plugin.so` for ar's `--plugin`, and refused,
+/// left `RANLIB="ranlib --plugin "` dangling. With no next word it is
+/// gcc's "missing argument".
+#[test]
+fn gcc_flags_two_dash_queries_take_the_next_word() {
+    for (query, value, host) in [
+        (
+            "--print-prog-name",
+            "liblto_plugin.so",
+            "-print-prog-name=liblto_plugin.so",
+        ),
+        ("--print-prog-name", "ld", "-print-prog-name=ld"),
+        ("--print-file-name", "libc.so", "-print-file-name=libc.so"),
+    ] {
+        let want = std::process::Command::new("cc")
+            .arg(host)
+            .output()
+            .expect("run host cc");
+        let r = run_c17(&[query, value]);
+        assert!(r.success, "{query} {value}: {}", r.stderr);
+        assert_eq!(r.stdout, String::from_utf8_lossy(&want.stdout), "{query}");
+    }
+    for query in ["--print-prog-name", "--print-file-name"] {
+        let r = run_c17(&[query]);
+        assert!(!r.success, "{query}");
+        assert_eq!(
+            r.stderr,
+            format!("c17: error: missing argument to '{query}'\n"),
+            "{query}"
+        );
+    }
+}
+
+/// The multilib queries describe the one library layout c17 compiles for:
+/// it takes no `-m32` or `-mx32`, so there is only the default, which gcc
+/// names `.`. glibc's configure sets its csu `multidir` from
+/// `-print-multi-directory`; with nothing there, the crt1.o rule died in a
+/// shell syntax error.
+#[test]
+fn gcc_flags_multilib_queries_name_the_default_layout() {
+    for (query, want) in [
+        ("-print-multi-directory", ".\n"),
+        ("--print-multi-directory", ".\n"),
+        ("-print-multi-lib", ".;\n"),
+        ("--print-multi-lib", ".;\n"),
+    ] {
+        let r = run_c17(&[query]);
+        assert!(r.success, "{query}: {}", r.stderr);
+        assert_eq!(r.stdout, want, "{query}");
+    }
+}
+
+/// `-print-sysroot` prints the `--sysroot` in force, the last one given, in
+/// either spelling and wherever it stands; with none, it prints nothing at
+/// all, not even a newline, as gcc built without a sysroot does.
+#[test]
+fn gcc_flags_print_sysroot_names_the_sysroot() {
+    for (args, want) in [
+        (&["-print-sysroot"][..], ""),
+        (&["--print-sysroot"], ""),
+        (
+            &["--sysroot=/opt/c17root", "-print-sysroot"],
+            "/opt/c17root\n",
+        ),
+        (
+            &["-print-sysroot", "--sysroot", "/opt/c17root"],
+            "/opt/c17root\n",
+        ),
+        (&["--sysroot=/a", "-print-sysroot", "--sysroot=/b"], "/b\n"),
+    ] {
+        let r = run_c17(args);
+        assert!(r.success, "{args:?}: {}", r.stderr);
+        assert_eq!(r.stdout, want, "{args:?}");
     }
 }
 
@@ -957,6 +1197,18 @@ fn gcc_flags_missing_object_is_an_error_without_linking() {
     }
 }
 
+/// Compile `src` (written as `name`) to assembly with `flags`: a target
+/// other than the host's needs no assembler.
+fn assemble_with(name: &str, src: &str, flags: &[&str]) -> crate::common::C17Run {
+    let (dir, path) = scratch(name, src);
+    let out = dir.path().join("out.s");
+    let mut args: Vec<&str> = flags.to_vec();
+    args.extend(["-S", "-o", out.to_str().unwrap(), path.to_str().unwrap()]);
+    run_c17(&args)
+}
+
+const X86_64_LINUX: &str = "--target=x86_64-unknown-linux-gnu";
+
 /// `-fcf-protection` is honoured, not ignored: every level gcc has is
 /// accepted without the "unrecognized option" warning, as is
 /// `-fno-cf-protection`, and a level gcc does not have is an error in its
@@ -972,7 +1224,7 @@ fn gcc_flags_cf_protection() {
         "-fcf-protection=check",
         "-fno-cf-protection",
     ] {
-        let r = compile_with("cet.c", MAIN, &[flag]);
+        let r = assemble_with("cet.c", MAIN, &[X86_64_LINUX, flag]);
         assert!(r.success, "{flag}: {}", r.stderr);
         assert!(!r.stderr.contains("unrecognized"), "{flag}: {}", r.stderr);
     }
@@ -984,6 +1236,167 @@ fn gcc_flags_cf_protection() {
         "{}",
         r.stderr
     );
+}
+
+/// CET is x86-64's, and its note ELF's: on aarch64 and on Darwin a level
+/// that asks for a protection is an error in gcc's words, the bare flag
+/// being `full`, even for `-E`. `none` and `check` ask for none, and are
+/// accepted.
+#[test]
+fn gcc_flags_cf_protection_needs_cet() {
+    for target in [
+        "--target=aarch64-unknown-linux-gnu",
+        "--target=aarch64-apple-darwin",
+        "--target=x86_64-apple-darwin",
+    ] {
+        for (flag, level) in [
+            ("-fcf-protection", "full"),
+            ("-fcf-protection=full", "full"),
+            ("-fcf-protection=branch", "branch"),
+            ("-fcf-protection=return", "return"),
+        ] {
+            let r = assemble_with("cet.c", MAIN, &[target, flag]);
+            assert!(!r.success, "{target} {flag}");
+            let msg = format!("error: '-fcf-protection={level}' is not supported for this target");
+            assert!(r.stderr.contains(&msg), "{target} {flag}: {}", r.stderr);
+            let r = preprocess_text("cet", MAIN, &[target, flag]);
+            assert!(!r.success, "{target} {flag} -E");
+        }
+        for flag in ["-fcf-protection=none", "-fcf-protection=check"] {
+            let r = assemble_with("cet.c", MAIN, &[target, flag]);
+            assert!(r.success, "{target} {flag}: {}", r.stderr);
+        }
+    }
+}
+
+/// gcc's `__CET__`, for C and for a `.S` alike: 1 for branch protection, 2
+/// for return protection, 3 for both and 8 for `check`; nothing for `none`,
+/// nor on a target without CET.
+#[test]
+fn gcc_flags_cet_macro() {
+    let src = "#ifdef __CET__\ncet __CET__\n#else\nno cet\n#endif\n";
+    for (flag, want) in [
+        ("-fcf-protection", "cet 3"),
+        ("-fcf-protection=full", "cet 3"),
+        ("-fcf-protection=branch", "cet 1"),
+        ("-fcf-protection=return", "cet 2"),
+        ("-fcf-protection=check", "cet 8"),
+        ("-fcf-protection=none", "no cet"),
+        ("-fno-cf-protection", "no cet"),
+    ] {
+        let r = preprocess_text("cet", src, &[X86_64_LINUX, flag]);
+        assert!(r.success, "{flag}: {}", r.stderr);
+        assert!(r.stdout.contains(want), "{flag}: {}", r.stdout);
+        let r = preprocess_text(
+            "cet",
+            src,
+            &[X86_64_LINUX, flag, "-x", "assembler-with-cpp"],
+        );
+        assert!(r.success, "{flag} .S: {}", r.stderr);
+        assert!(r.stdout.contains(want), "{flag} .S: {}", r.stdout);
+    }
+    let r = preprocess_text("cet", src, &[X86_64_LINUX]);
+    assert!(r.stdout.contains("no cet"), "default: {}", r.stdout);
+    let r = preprocess_text(
+        "cet",
+        src,
+        &[
+            "--target=aarch64-unknown-linux-gnu",
+            "-fcf-protection=check",
+        ],
+    );
+    assert!(r.stdout.contains("no cet"), "aarch64: {}", r.stdout);
+}
+
+/// `-pg` refuses what gcc refuses: a frame pointer omitted by the last of
+/// `-f[no-]omit-frame-pointer` (but not for `-E`), and Darwin, where clang
+/// has no `-pg` either. `-mnop-mcount` is refused in position-independent
+/// code, the PIE default included, with or without `-pg`. The `-m` options
+/// that reshape the call are x86-64's.
+#[test]
+fn gcc_flags_pg_refusals() {
+    let incompatible = "error: -pg and -fomit-frame-pointer are incompatible";
+    let r = assemble_with("pg.c", MAIN, &[X86_64_LINUX, "-pg", "-fomit-frame-pointer"]);
+    assert!(
+        !r.success && r.stderr.contains(incompatible),
+        "{}",
+        r.stderr
+    );
+    let r = assemble_with("pg.c", MAIN, &["-fomit-frame-pointer", X86_64_LINUX, "-p"]);
+    assert!(
+        !r.success && r.stderr.contains(incompatible),
+        "{}",
+        r.stderr
+    );
+    let r = assemble_with(
+        "pg.c",
+        MAIN,
+        &[
+            X86_64_LINUX,
+            "-pg",
+            "-fomit-frame-pointer",
+            "-fno-omit-frame-pointer",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    let r = preprocess_text("pg", MAIN, &[X86_64_LINUX, "-pg", "-fomit-frame-pointer"]);
+    assert!(r.success, "-E: {}", r.stderr);
+    let r = assemble_with("pg.c", MAIN, &["-fomit-frame-pointer"]);
+    assert!(r.success, "no -pg: {}", r.stderr);
+
+    for target in [
+        "--target=aarch64-apple-darwin",
+        "--target=x86_64-apple-darwin",
+    ] {
+        let r = assemble_with("pg.c", MAIN, &[target, "-pg"]);
+        assert!(!r.success, "{target}");
+        assert!(
+            r.stderr
+                .contains("error: '-pg' is not supported for this target"),
+            "{target}: {}",
+            r.stderr
+        );
+    }
+
+    let nop = "error: '-mnop-mcount' is not implemented for '-fPIC'";
+    for flags in [
+        &[X86_64_LINUX, "-pg", "-mnop-mcount"][..],
+        &[X86_64_LINUX, "-pg", "-mnop-mcount", "-fPIC"],
+        &[X86_64_LINUX, "-mnop-mcount", "-fpie"],
+    ] {
+        let r = assemble_with("pg.c", MAIN, flags);
+        assert!(
+            !r.success && r.stderr.contains(nop),
+            "{flags:?}: {}",
+            r.stderr
+        );
+    }
+    for flags in [
+        &[X86_64_LINUX, "-pg", "-mnop-mcount", "-fno-pic"][..],
+        &[X86_64_LINUX, "-pg", "-mfentry", "-mrecord-mcount", "-fPIC"],
+        &[
+            X86_64_LINUX,
+            "-mfentry",
+            "-mno-fentry",
+            "-mno-record-mcount",
+            "-mno-nop-mcount",
+        ],
+    ] {
+        let r = assemble_with("pg.c", MAIN, flags);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+    }
+    let r = assemble_with(
+        "pg.c",
+        MAIN,
+        &["--target=aarch64-unknown-linux-gnu", "-pg", "-mfentry"],
+    );
+    assert!(
+        !r.success && r.stderr.contains("unsupported machine flag: -mfentry"),
+        "{}",
+        r.stderr
+    );
+    let r = assemble_with("pg.c", MAIN, &["--target=aarch64-unknown-linux-gnu", "-pg"]);
+    assert!(r.success, "{}", r.stderr);
 }
 
 /// `-ftls-model=` takes gcc's four model names, and refuses anything else in
@@ -1188,4 +1601,51 @@ fn gcc_flags_missing_argument_names_the_option_as_written() {
         }
     }
     assert!(!dir.path().join("-D").exists(), "-o took an appended -D");
+}
+
+/// `-z keyword`, gcc's option for the linker, as binutils' own testsuite
+/// passes it (`-z noexecstack`), and its joined spelling. c17 refused it as
+/// an unknown option. Like every linker option it is ignored under `-c`,
+/// and it needs its argument.
+#[cfg(target_os = "linux")]
+#[test]
+fn z_options_reach_the_linker() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_z_option_")
+        .tempdir()
+        .unwrap();
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(p("m.c"), "int main(void) { return 0; }\n").unwrap();
+    let stack = |exe: &str| {
+        let out = std::process::Command::new("readelf")
+            .args(["-lW", exe])
+            .output()
+            .expect("readelf");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("GNU_STACK"))
+            .map(|l| l.contains("RWE"))
+            .expect("a GNU_STACK header")
+    };
+    let r = run_c17(&["-o", &p("exec"), &p("m.c"), "-z", "execstack"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(stack(&p("exec")), "-z execstack did not reach the linker");
+    let r = run_c17(&[
+        "-o",
+        &p("noexec"),
+        &p("m.c"),
+        "-znoexecstack",
+        "-z",
+        "relro",
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(!stack(&p("noexec")));
+    let r = run_c17(&["-c", "-o", &p("m.o"), &p("m.c"), "-z", "noexecstack"]);
+    assert!(r.success, "{}", r.stderr);
+    let r = run_c17(&[&p("m.c"), "-z"]);
+    assert!(
+        !r.success && r.stderr.contains("missing argument to '-z'"),
+        "{}",
+        r.stderr
+    );
 }

@@ -37,26 +37,27 @@ use super::{Function, Instruction, Module, Opcode, Pseudo, PseudoId};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashSet};
 
-/// Rewrite every thread-local access in `module` into an explicit address
-/// computation followed by an ordinary access.
+/// Rewrite every access in `module` to a thread-local reached by a call
+/// into an explicit address computation followed by an ordinary access.
 ///
-/// `dynamic` selects whether the pass does anything: it is the same condition
-/// the backend uses to choose the dynamic model, and the two must agree, since
-/// the backend's own thread-local paths are what handle the other models.
+/// Which thread-locals those are is asked of the same rule the backend
+/// uses to choose each one's model, [`Module::tls_model`] under `policy`,
+/// and the two must agree, since the backend's own thread-local paths are
+/// what handle the other models. A `tls_model` attribute gives one
+/// thread-local a model of its own, so a unit may have both kinds.
 ///
 /// The addresses this pass introduces are `void *`s. What is accessed
 /// through them is irrelevant to how they are held.
-pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, types: &TypeTable) {
-    if !dynamic {
-        return;
-    }
-
+pub fn expand_dynamic_tls(
+    module: &mut Module,
+    target: &crate::target::Target,
+    policy: crate::target::TlsPolicy,
+    types: &TypeTable,
+) {
     let tls: HashSet<String> = module
-        .globals
-        .iter()
-        .filter(|g| g.is_thread_local)
-        .map(|g| g.name.clone())
-        .chain(module.extern_tls_symbols.iter().cloned())
+        .thread_locals()
+        .filter(|name| target.tls_access(module.tls_model(name, policy)).is_call())
+        .map(str::to_string)
         .collect();
 
     if tls.is_empty() {
@@ -191,8 +192,70 @@ mod tests {
     use crate::ir::{
         AsmConstraint, AsmData, BasicBlock, BasicBlockId, GlobalDef, Initializer, PseudoKind,
     };
-    use crate::target::Target;
+    use crate::target::{Os, Target, TlsModel, TlsPolicy};
     use crate::types::TypeTable;
+
+    /// A Linux target of the host's architecture building shared code,
+    /// where every thread-local is reached by a descriptor call.
+    fn shared_linux() -> (Target, TlsPolicy) {
+        let target = Target::new(Target::host().arch, Os::Linux);
+        let policy = TlsPolicy {
+            shared_code: true,
+            ..TlsPolicy::default()
+        };
+        (target, policy)
+    }
+
+    /// In an executable only a thread-local whose `tls_model` names a
+    /// dynamic model is reached by a call, so only its accesses are
+    /// expanded; one asked for a static model in shared code is not.
+    #[test]
+    fn only_thread_locals_of_a_dynamic_model_are_expanded() {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = Function::new("f", int);
+        for (i, name) in ["dyn", "plain", "le"].iter().enumerate() {
+            func.add_pseudo(Pseudo::sym(PseudoId(i as u32), name.to_string()));
+        }
+        func.add_pseudo(Pseudo::reg(PseudoId(3), 3));
+        func.next_pseudo = 4;
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        for i in 0..3 {
+            entry.add_insn(Instruction::load(PseudoId(3), PseudoId(i), 0, int, 32));
+        }
+        entry.add_insn(Instruction::ret(None));
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+        func.rebuild_block_idx();
+        let mut module = Module::default();
+        for (name, model) in [
+            ("dyn", Some(TlsModel::GlobalDynamic)),
+            ("plain", None),
+            ("le", Some(TlsModel::LocalExec)),
+        ] {
+            let mut global = GlobalDef::new(name, int, Initializer::None);
+            global.is_thread_local = true;
+            global.symbol_attrs.tls_model = model;
+            module.globals.push(global);
+        }
+        module.add_function(func);
+        let expanded = |module: &Module| -> Vec<PseudoId> {
+            module.functions[0].blocks[0]
+                .insns
+                .iter()
+                .filter(|i| i.op == Opcode::TlsAddr)
+                .map(|i| i.src[0])
+                .collect()
+        };
+
+        let (target, shared) = shared_linux();
+        let mut exe = module.clone();
+        expand_dynamic_tls(&mut exe, &target, TlsPolicy::default(), &types);
+        assert_eq!(expanded(&exe), [PseudoId(0)]);
+        expand_dynamic_tls(&mut module, &target, shared, &types);
+        assert_eq!(expanded(&module), [PseudoId(0), PseudoId(1)]);
+    }
 
     /// A thread-local named by an inline-asm memory operand lives in
     /// `asm_data`, not `src`, and used to reach the backend as a global. The
@@ -230,7 +293,8 @@ mod tests {
         let mut module = Module::default();
         module.globals.push(global);
         module.add_function(func);
-        expand_dynamic_tls(&mut module, true, &types);
+        let (target, policy) = shared_linux();
+        expand_dynamic_tls(&mut module, &target, policy, &types);
 
         let insns = &module.functions[0].blocks[0].insns;
         let tls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::TlsAddr).collect();
@@ -296,7 +360,8 @@ mod tests {
         let mut module = Module::default();
         module.extern_tls_symbols.insert("x".to_string());
         module.add_function(func);
-        expand_dynamic_tls(&mut module, true, &types);
+        let (target, policy) = shared_linux();
+        expand_dynamic_tls(&mut module, &target, policy, &types);
 
         let insns = &module.functions[0].blocks[0].insns;
         let tls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::TlsAddr).collect();

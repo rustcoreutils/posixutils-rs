@@ -18,7 +18,7 @@ use crate::common::{compile_and_run, compile_and_run_aarch64_with};
 
 /// Run `code` at -O0 and -O2 on the host and on aarch64, with `opts` and,
 /// when `libm` is set, `-lm`.
-fn run_everywhere(name: &str, code: &str, opts: &[&str], libm: bool) {
+pub(super) fn run_everywhere(name: &str, code: &str, opts: &[&str], libm: bool) {
     let libs: &[&str] = if libm { &["-lm"] } else { &[] };
     for opt in ["-O0", "-O2"] {
         let mut args: Vec<String> = vec![opt.to_string()];
@@ -559,6 +559,38 @@ int main(void)
 }
 "#;
     run_everywhere("libm_values", code, &[], true);
+    // Again where `roundsd` computes the roundings (SSE4.1) and `vfmadd`
+    // the fused multiply-adds (FMA), on a host that has them.
+    if cfg!(target_arch = "x86_64") {
+        for (flag, feature) in [("-msse4.1", "sse4.1"), ("-mfma", "fma")] {
+            if !host_has(feature) {
+                continue;
+            }
+            for opt in ["-O0", "-O2"] {
+                let flags: Vec<String> = [opt, flag, "-lm"].map(String::from).to_vec();
+                let rc = compile_and_run(&format!("libm_values{flag}"), code, &flags);
+                assert_eq!(rc, 0, "{flag} {opt}");
+            }
+        }
+    }
+}
+
+/// Whether this machine has the x86-64 extension `feature`, by the name
+/// `is_x86_feature_detected!` knows it.
+pub(super) fn host_has(feature: &str) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match feature {
+            "sse4.1" => std::arch::is_x86_feature_detected!("sse4.1"),
+            "fma" => std::arch::is_x86_feature_detected!("fma"),
+            _ => false,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = feature;
+        false
+    }
 }
 
 /// Constant libm calls in static initializers, linked without -lm: what they
@@ -952,4 +984,69 @@ int main(void) {
             "{opt}"
         );
     }
+}
+
+/// `lrint`, `llrint` and `lround` computed in place under `-fno-math-errno`
+/// answer what libm answers, in every rounding direction: `lrint` rounds in
+/// the current one, as `cvtsd2si` and `frintx` do, and `lround` ties away
+/// from zero in all of them. The library is reached through pointers, which
+/// nothing computes in place; the `__builtin_` spellings are in place at
+/// `-O0` too.
+#[test]
+fn libm_lrint_in_place_follows_the_rounding_direction() {
+    let src = r#"
+long lrint(double); long lrintf(float);
+long long llrint(double); long long llrintf(float);
+long lround(double); long lroundf(float);
+long long llround(double); long long llroundf(float);
+int fesetround(int);
+#if defined(__x86_64__)
+enum { NEAREST = 0, DOWN = 0x400, UP = 0x800, ZERO = 0xc00 };
+#else
+enum { NEAREST = 0, UP = 0x400000, DOWN = 0x800000, ZERO = 0xc00000 };
+#endif
+long (*volatile lib_lrint)(double) = lrint;
+long (*volatile lib_lrintf)(float) = lrintf;
+long long (*volatile lib_llrint)(double) = llrint;
+long long (*volatile lib_llrintf)(float) = llrintf;
+long (*volatile lib_lround)(double) = lround;
+long (*volatile lib_lroundf)(float) = lroundf;
+long long (*volatile lib_llround)(double) = llround;
+long long (*volatile lib_llroundf)(float) = llroundf;
+static volatile double in[] = {
+    0.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 2.4999999999999996, -7.75,
+    3.0000000000000004, 1e15 + 0.5, -1e15 - 0.5, 4503599627370495.5,
+    9007199254740993.0, 123456.25,
+};
+int main(void) {
+    static const int dirs[] = { NEAREST, DOWN, UP, ZERO };
+    for (unsigned d = 0; d < 4; d++) {
+        if (fesetround(dirs[d]) != 0) return 1;
+        for (unsigned i = 0; i < sizeof in / sizeof in[0]; i++) {
+            double x = in[i];
+            float f = (float)x;
+            if (lrint(x) != lib_lrint(x)) return 10 + d;
+            if (lrintf(f) != lib_lrintf(f)) return 20 + d;
+            if (llrint(x) != lib_llrint(x)) return 30 + d;
+            if (llrintf(f) != lib_llrintf(f)) return 40 + d;
+            if (__builtin_lrint(x) != lib_lrint(x)) return 50 + d;
+            if (__builtin_llrintf(f) != lib_llrintf(f)) return 60 + d;
+            if (lround(x) != lib_lround(x)) return 70 + d;
+            if (lroundf(f) != lib_lroundf(f)) return 80 + d;
+            if (llround(x) != lib_llround(x)) return 90 + d;
+            if (__builtin_llroundf(f) != lib_llroundf(f)) return 100 + d;
+        }
+    }
+    fesetround(NEAREST);
+    /* Spot values, so that agreeing with a wrong library is not enough. */
+    if (lrint(in[6]) != 2 || lrint(in[7]) != -2 || lround(in[6]) != 3) return 2;
+    if (llrintf((float)in[4]) != 2 || lroundf((float)in[3]) != -1) return 3;
+    fesetround(UP);
+    if (lrint(in[2]) != 1 || llrint(in[3]) != 0) return 4;
+    fesetround(NEAREST);
+    return 0;
+}
+"#;
+    run_everywhere("libm_lrint_rounding", src, &["-fno-math-errno"], true);
+    run_everywhere("libm_lrint_rounding_errno", src, &[], true);
 }

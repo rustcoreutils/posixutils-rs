@@ -16,12 +16,11 @@
 use crate::arch::codegen::SelectOperands;
 use crate::arch::codegen::{AsmModifierError, AsmOperandSlot, AsmOperandValue};
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
-use crate::arch::lir::{is_private_name, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, X87Scratch, XmmReg};
 use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to_float};
 use crate::ir::{Instruction, Module, NanCompare, Opcode, PseudoId, PseudoKind};
-use crate::parse::ast::JmpKind;
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
@@ -69,10 +68,15 @@ pub struct X86_64CodeGen {
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
+    /// The registers the unit's file-scope register variables are, which no
+    /// function may allocate; see `Module::global_registers`.
+    pub(super) global_registers: Vec<crate::arch::x86_64::regalloc::Reg>,
     /// Thread-local storage symbols (need TLS access via FS segment)
     pub(super) tls_symbols: HashSet<String>,
     /// Position-independent code mode (for shared libraries and PIE)
-    pic_mode: bool,
+    pub(super) pic_mode: bool,
+    /// `-pg`, and the shape of its call.
+    pub(super) profiling: Option<crate::target::Profiling>,
     /// Long double constants to emit (label_bits -> value_bits).
     /// BTreeMap so the .rodata emission order in `emit_ld_constants`
     /// is deterministic (HashMap iteration would vary the layout
@@ -126,8 +130,10 @@ impl X86_64CodeGen {
             named_incoming_end: 16,
             unique_label_counter: 0,
             extern_symbols: HashSet::new(),
+            global_registers: Vec::new(),
             tls_symbols: HashSet::new(),
             pic_mode: false,
+            profiling: None,
             ld_constants: std::collections::BTreeMap::new(),
             double_constants: std::collections::BTreeMap::new(),
             quad_constants: std::collections::BTreeMap::new(),
@@ -141,6 +147,23 @@ impl X86_64CodeGen {
             win64_xmm_saves: Vec::new(),
             incoming_pointers: HashSet::new(),
         }
+    }
+
+    /// `-pg`'s call, when `func` makes one: `before_prologue` asks for
+    /// `-mfentry`'s, the other for `mcount`'s, which follows it.
+    pub(super) fn emit_profile_call(&mut self, func: &crate::ir::Function, before_prologue: bool) {
+        let Some(profiling) = self.profiling else {
+            return;
+        };
+        if func.no_instrument || profiling.fentry != before_prologue {
+            return;
+        }
+        self.push_lir(X86Inst::ProfileCall {
+            routine: profiling.routine(&self.base.target),
+            via_got: self.pic_mode,
+            nop: profiling.nop,
+            record: profiling.record,
+        });
     }
 
     /// Push a LIR instruction to the buffer (deferred emission)
@@ -296,7 +319,7 @@ impl X86_64CodeGen {
     /// Whether accessing the thread-local `name` needs the Initial Exec model
     /// rather than Local Exec. See [`CodeGenBase::use_tls_ie`].
     pub(super) fn use_tls_ie(&self, name: &str) -> bool {
-        self.base.use_tls_ie(self.extern_symbols.contains(name))
+        self.base.use_tls_ie(name)
     }
 
     /// Compute the *address* of a thread-local into `dst`.
@@ -309,7 +332,7 @@ impl X86_64CodeGen {
     /// segfaults on a write.
     fn emit_tls_addr(&mut self, name: &str, dst: Reg) {
         let symbol = Symbol::global(name.to_string());
-        if self.base.tls_access() == crate::target::TlsAccess::MachOTlv {
+        if self.base.tls_access(name) == crate::target::TlsAccess::MachOTlv {
             // Mach-O thread-local variable descriptor (clang's sequence):
             //   movq _v@TLVP(%rip), %rdi    ; the descriptor
             //   call *(%rdi)                ; its getter: the ADDRESS in %rax
@@ -339,7 +362,7 @@ impl X86_64CodeGen {
             }
             return;
         }
-        if self.base.use_tls_dynamic() {
+        if self.base.tls_access(name) == crate::target::TlsAccess::ElfDescriptor {
             // TLS descriptor, the dynamic model:
             //   leaq sym@TLSDESC(%rip), %rax
             //   call *sym@TLSCALL(%rax)      ; returns an OFFSET in %rax
@@ -408,13 +431,13 @@ impl X86_64CodeGen {
     }
 
     /// Check if a symbol needs GOT access
-    /// - In PIC mode: all non-local symbols need GOT access (interposition)
+    /// - In PIC mode: all symbols that may bind outside the output do
     /// - On macOS: external symbols always need GOT access (even without PIC)
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
-        // In PIC mode, all non-local symbols need GOT access because they
-        // could be interposed at runtime (the default for global symbols).
-        // A name c17 made up is local and can't be interposed.
-        if self.pic_mode && !is_private_name(name) {
+        // In PIC mode, a global symbol needs GOT access because it could be
+        // interposed at runtime, or defined in another module. A name c17
+        // made up, and a symbol that binds within the output, cannot.
+        if self.base.pic_needs_got(name, self.pic_mode) {
             return true;
         }
         // External symbols need GOT access on macOS for dynamic linking.
@@ -581,6 +604,13 @@ impl X86_64CodeGen {
             &self.base.current_fn,
             block.id.0,
         ))));
+        if self
+            .base
+            .landing_pads
+            .label(&block.id.label_symbol(&self.base.current_fn))
+        {
+            self.push_lir(X86Inst::Endbr64);
+        }
 
         // Emit instructions
         for insn in &block.insns {
@@ -923,6 +953,26 @@ impl X86_64CodeGen {
                             ))),
                             dst: GpOperand::Reg(dst_reg),
                         });
+                    } else if !self.pic_mode
+                        && self.base.target.os != Os::MacOS
+                        && !Symbol::named(name.as_str())
+                            .format_for_target(&self.base.target)
+                            .starts_with('"')
+                    {
+                        // Position-dependent ELF code takes the address as
+                        // an absolute immediate, as gcc does. For a function
+                        // in a shared library, that is what makes the linker
+                        // give the executable's PLT entry as its one
+                        // canonical address; a PC-relative `leaq` did not,
+                        // and a pointer the library compared with its own
+                        // came out different. A name the assembler reads
+                        // only quoted -- an asm label such as `bar@SIZE` --
+                        // keeps the `leaq`: gas splits a quoted immediate's
+                        // `@` suffix from the name wrongly ("bar ").
+                        self.push_lir(X86Inst::MovSymAddr {
+                            sym: Symbol::named(name),
+                            dst: dst_reg,
+                        });
                     } else {
                         self.push_lir(X86Inst::Lea {
                             addr: MemAddr::RipRelative(Symbol::named(name)),
@@ -1082,7 +1132,9 @@ impl X86_64CodeGen {
             // Only a `float` or `double` `floor`, `ceil`, `trunc` or `rint`
             // gets here; the rest are calls by now.
             Opcode::RoundToIntegral(how) => self.emit_fp_round_to_integral(insn, how, types),
-            Opcode::FMin | Opcode::FMax | Opcode::Fma => {
+            // Only where the function's ISA has a fused multiply-add.
+            Opcode::Fma => self.emit_fp_fma(insn, types),
+            Opcode::FMin | Opcode::FMax => {
                 unreachable!("{:?} is a call on x86-64 (see computes_in_place)", insn.op)
             }
 
@@ -1113,7 +1165,9 @@ impl X86_64CodeGen {
                 }
             }
 
-            // Float to integer conversions
+            // Float to integer conversions; `lrint` reaches here only for a
+            // `float` or `double`, the mapping having made any other a call.
+            Opcode::RoundToInteger(_) => self.emit_float_to_int(insn, types),
             Opcode::FCvtU | Opcode::FCvtS => {
                 if is_x87_float_to_int(insn, types) {
                     self.emit_x87_float_to_int(insn);
@@ -1215,6 +1269,7 @@ impl X86_64CodeGen {
 
             Opcode::StackSave => self.emit_stack_save(insn),
             Opcode::StackRestore => self.emit_stack_restore(insn),
+            Opcode::LandingPad => self.emit_landing_pad(insn),
 
             Opcode::Memset => {
                 self.emit_memset(insn);
@@ -1236,6 +1291,9 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Ud2);
             }
 
+            // gcc's `__builtin_trap` too: SIGILL.
+            Opcode::Trap => self.push_lir(X86Inst::Ud2),
+
             Opcode::FrameAddress => {
                 // __builtin_frame_address(level)
                 self.emit_frame_address(insn);
@@ -1246,16 +1304,9 @@ impl X86_64CodeGen {
                 self.emit_return_address(insn);
             }
 
-            // setjmp/longjmp support
-            Opcode::Setjmp => match insn.jmp_kind() {
-                JmpKind::Library => self.emit_setjmp(insn),
-                JmpKind::Builtin => self.emit_builtin_setjmp(insn),
-            },
-
-            Opcode::Longjmp => match insn.jmp_kind() {
-                JmpKind::Library => self.emit_longjmp(insn),
-                JmpKind::Builtin => self.emit_builtin_longjmp(insn),
-            },
+            // gcc's non-local goto
+            Opcode::Setjmp => self.emit_builtin_setjmp(insn),
+            Opcode::Longjmp => self.emit_builtin_longjmp(insn),
 
             Opcode::Asm => {
                 self.emit_inline_asm(insn);
@@ -1366,7 +1417,7 @@ impl X86_64CodeGen {
         }
 
         // Emit the call instruction
-        self.emit_call_instruction(insn, &func_name);
+        self.emit_call_instruction(insn, &func_name, stack_args);
 
         // Clean up stack
         self.cleanup_call_stack(stack_args);
@@ -1630,6 +1681,7 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
                 V::Int(v) => format!("${v}"),
                 V::Float(v, bits) => format!("${}", v.to_bits_at_width(*bits)),
                 V::Symbol(sym) => format!("${sym}"),
+                V::Flag => return Err(AsmModifierError::Inapplicable),
             },
             _ => return Err(AsmModifierError::Unsupported),
         })
@@ -1655,38 +1707,86 @@ impl X86_64CodeGen {
 
 // CodeGenerator trait implementation
 
+impl X86_64CodeGen {
+    /// The retpoline thunks the unit's code branches through and must
+    /// define itself, under `-mindirect-branch=thunk` and
+    /// `-mfunction-return=thunk`: one comdat section each, which the
+    /// linker keeps one copy of, as gcc writes them.
+    fn emit_retpoline_thunks(&mut self) {
+        use crate::machine::Thunk;
+        let mut target = self.base.target.clone();
+        let mut regs: Vec<Reg> = Vec::new();
+        let mut returns = false;
+        for inst in &self.base.lir_buffer {
+            Self::retarget(inst, &mut target);
+            let reg = match inst {
+                X86Inst::Call {
+                    target: crate::arch::lir::CallTarget::Indirect(reg),
+                }
+                | X86Inst::NotrackCall { reg }
+                | X86Inst::JmpIndirect { reg } => Some(*reg),
+                X86Inst::CallGot { .. } => Some(Reg::R11),
+                X86Inst::Ret => {
+                    returns |= target.x86.function_return == Thunk::Thunk;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(reg) =
+                reg.filter(|r| target.x86.indirect_branch == Thunk::Thunk && !regs.contains(r))
+            {
+                regs.push(reg);
+            }
+        }
+        regs.sort_by_key(|r| r.name64());
+        let mut text: String = regs
+            .into_iter()
+            .map(|reg| super::lir::retpoline_thunk_definition(Some(reg)))
+            .collect();
+        if returns {
+            text.push_str(&super::lir::retpoline_thunk_definition(None));
+        }
+        if !text.is_empty() {
+            self.base.push_directive(Directive::Verbatim(text));
+        }
+    }
+
+    /// What a function's [`X86Inst::BranchModes`] makes of the target its
+    /// instructions are emitted for.
+    fn retarget(inst: &X86Inst, target: &mut crate::target::Target) {
+        if let X86Inst::BranchModes { indirect, ret } = inst {
+            target.x86.indirect_branch = *indirect;
+            target.x86.function_return = *ret;
+        }
+    }
+}
+
 impl CodeGenerator for X86_64CodeGen {
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String {
         self.base.output.clear();
         self.base.reset_debug_state();
         self.base.emit_debug = module.debug;
         self.extern_symbols = module.extern_symbols.clone();
-
-        // Collect thread-local storage symbols (both defined and extern)
-        self.tls_symbols = module
-            .globals
+        self.global_registers = module
+            .global_registers
             .iter()
-            .filter(|g| g.is_thread_local)
-            .map(|g| g.name.clone())
-            .chain(module.extern_tls_symbols.iter().cloned())
+            .filter_map(|r| r.x86_64())
             .collect();
 
+        // Collect thread-local storage symbols (both defined and extern),
+        // each with its access model.
+        self.base.plan_thread_locals(module);
+        self.tls_symbols = self.base.tls_models.keys().cloned().collect();
+
         // Emit file header
+        self.base.plan_named_sections(module, self.pic_mode);
+        self.base.plan_local_binding(module);
+        let branch = self.base.cf_protection.branch;
+        self.base.landing_pads =
+            crate::arch::landing_pads::LandingPads::plan(module, self.base.optimizing, |_| branch);
         self.emit_header();
 
-        // Emit .file directives unconditionally (useful for diagnostics/profiling)
-        // Use "." as placeholder for empty paths (synthetic files like <paste>)
-        // to keep file numbers sequential for .loc directives
-        for (i, path) in module.source_files.iter().enumerate() {
-            let file_path = if path.is_empty() {
-                ".".to_string()
-            } else {
-                path.clone()
-            };
-            // File indices in DWARF start at 1
-            self.base
-                .push_directive(Directive::file((i + 1) as u32, file_path));
-        }
+        self.base.emit_file_table(module);
 
         // The definitions, in runs between the file-scope asm statements:
         // each run's globals, then its functions, then the asm after it.
@@ -1738,12 +1838,16 @@ impl CodeGenerator for X86_64CodeGen {
             let comp_dir = module.comp_dir.as_deref().unwrap_or(".");
 
             // Only reference text labels if we have code (functions)
-            // Data-only files use 0 for low_pc/high_pc
-            let (low_pc, high_pc) = if module.functions.is_empty() {
-                (None, None)
-            } else {
-                (Some(".Ltext0"), Some(".Ltext_end"))
-            };
+            // Data-only files use 0 for low_pc/high_pc, as does a unit
+            // whose functions each have a section of their own: no one
+            // range covers them, and a debugger takes the unit's extent
+            // from its functions' DIEs instead.
+            let (low_pc, high_pc) =
+                if module.functions.is_empty() || self.base.layout.function_sections {
+                    (None, None)
+                } else {
+                    (Some(".Ltext0"), Some(".Ltext_end"))
+                };
 
             super::super::dwarf::generate_abbrev_table(&mut self.base);
             let fns = std::mem::take(&mut self.base.fn_dies);
@@ -1753,24 +1857,39 @@ impl CodeGenerator for X86_64CodeGen {
                 comp_dir,
                 low_pc_label: low_pc,
                 high_pc_label: high_pc,
+                globals: &module.globals,
             };
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
 
+        self.base.emit_eh_tables(self.pic_mode);
+        self.emit_retpoline_thunks();
         self.base.push_directive(Directive::UnitEnd);
+        if let Some(bits) = self.base.cf_protection.feature_bits() {
+            self.base.push_directive(Directive::FeatureNote(bits));
+        }
 
-        // Emit all buffered LIR instructions to output string
-        self.base.emit_all();
+        // Emit all buffered LIR instructions to output string, each
+        // function's branches made as it asks.
+        self.base.emit_all_with(Self::retarget);
 
         self.base.output.clone()
     }
 
-    fn set_emit_unwind_tables(&mut self, emit: bool) {
-        self.base.emit_unwind_tables = emit;
+    fn set_cfi(&mut self, cfi: crate::target::Cfi) {
+        self.base.cfi = cfi;
     }
 
     fn set_pic_mode(&mut self, pic: bool) {
         self.pic_mode = pic;
+    }
+
+    fn set_object_layout(&mut self, layout: crate::target::ObjectLayout) {
+        self.base.layout = layout;
+    }
+
+    fn set_function_shape(&mut self, shape: crate::target::FunctionShape) {
+        self.base.shape = shape;
     }
 
     fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy) {
@@ -1785,11 +1904,19 @@ impl CodeGenerator for X86_64CodeGen {
         self.base.cf_protection = cf_protection;
     }
 
-    fn set_stack_clash(&mut self, on: bool) {
-        self.base.stack_clash = on;
+    fn set_stack_clash(&mut self, stack_clash: Option<crate::target::StackClash>) {
+        self.base.stack_clash = stack_clash;
     }
 
-    fn set_stack_protector(&mut self, level: crate::target::StackProtector) {
-        self.base.stack_protector = level;
+    fn set_stack_protector(&mut self, protection: crate::target::StackProtection) {
+        self.base.stack_protector = protection;
+    }
+
+    fn set_profiling(&mut self, profiling: Option<crate::target::Profiling>) {
+        self.profiling = profiling;
+    }
+
+    fn set_optimizing(&mut self, on: bool) {
+        self.base.optimizing = on;
     }
 }

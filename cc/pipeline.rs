@@ -38,6 +38,7 @@ pub fn source_tokens(
     display_path: &str,
     trigraphs: bool,
     preprocessed: bool,
+    comments: token::preprocess::Comments,
     strings: &mut StringTable,
 ) -> (Vec<Token>, u16) {
     // Phase 0, before anything looks at the bytes: a byte order mark is not
@@ -53,7 +54,8 @@ pub fn source_tokens(
     };
 
     let stream_id = diag::init_stream(display_path);
-    let mut tokenizer = Tokenizer::new(&buffer, stream_id, strings);
+    let mut tokenizer =
+        Tokenizer::new(&buffer, stream_id, strings).keeping_comments(comments.lexed());
     // Translation phase 2 likewise already ran.
     if preprocessed {
         tokenizer = tokenizer.without_splicing();
@@ -70,6 +72,8 @@ pub struct CodegenOptions<'a> {
     pub debug: bool,
     /// `-ftrapping-math` (the default) rather than `-fno-trapping-math`.
     pub trapping_math: bool,
+    /// `-frounding-math` (dynamic) rather than `-fno-rounding-math`.
+    pub fp_rounding: crate::float::FpRounding,
     /// `-fvisibility=`.
     pub default_visibility: Option<&'a str>,
     /// What thread-local accesses may assume: whether the code is for a
@@ -77,20 +81,35 @@ pub struct CodegenOptions<'a> {
     pub tls: crate::target::TlsPolicy,
     /// Position-independent code.
     pub pic: bool,
-    pub unwind_tables: bool,
+    /// `-fsemantic-interposition` (the default) rather than
+    /// `-fno-semantic-interposition`; see
+    /// [`ir::Module::exports_interposable`].
+    pub semantic_interposition: bool,
+    /// `-ffunction-sections`, `-fdata-sections`, `-fcommon`, `-fno-plt`.
+    pub layout: crate::target::ObjectLayout,
+    /// Where the unit's CFI goes; see [`crate::target::UnwindTables::cfi`].
+    pub cfi: crate::target::Cfi,
+    /// `-fexceptions`: unwinding a frame runs the cleanups in scope; see
+    /// `ir::linearize_cleanup`.
+    pub exceptions: bool,
     /// `-fverbose-asm`.
     pub verbose_asm: bool,
     /// `-fcf-protection`.
     pub cf_protection: crate::target::CfProtection,
     /// `-fstack-clash-protection`.
-    pub stack_clash: bool,
+    pub stack_clash: Option<crate::target::StackClash>,
     /// `-fstack-protector` and its levels.
-    pub stack_protector: crate::target::StackProtector,
+    pub stack_protector: crate::target::StackProtection,
+    /// `-pg`, and the shape of its call.
+    pub profiling: Option<crate::target::Profiling>,
     /// The name DWARF records for the primary source file.
     pub source_name: &'a str,
     /// `-fdebug-prefix-map`: rewrites every path the debug information and
     /// the `.file` directives record.
     pub debug_prefix_map: &'a PrefixMap,
+    /// `-falign-functions`, `-fpatchable-function-entry=`,
+    /// `-ftrivial-auto-var-init=` and their kin.
+    pub code: crate::f_options::CodeOptions,
 }
 
 /// The pipeline's points of interest to the driver: its dumps, `--stats`, and
@@ -178,6 +197,9 @@ pub fn compile_tokens(
         optimizing: opts.optimization.optimizes(),
         math_errno: opts.math_errno,
     });
+    parser.set_cf_branch(opts.cf_protection.branch);
+    parser.set_x86_isa(target.x86_isa);
+    parser.set_strict_flex_arrays(opts.code.strict_flex_arrays);
     // A syntax error is reported where it is, like every other diagnostic:
     // its position may be in a header, and only `diag` knows which file a
     // position belongs to and which includes reached it.
@@ -202,12 +224,18 @@ pub fn compile_tokens(
         &types,
         strings,
         target,
-        opts.debug,
-        opts.trapping_math,
+        ir::linearize::LinearizeOptions {
+            debug: opts.debug,
+            trapping_math: opts.trapping_math,
+            fp_rounding: opts.fp_rounding,
+            exceptions: opts.exceptions,
+            auto_var_init: opts.code.auto_var_init,
+        },
     );
     if let Some(how) = opts.default_visibility {
         module.apply_default_visibility(how);
     }
+    module.exports_interposable = opts.tls.shared_code && opts.semantic_interposition;
     module.apply_pragma_weak(&weak_names);
 
     // Check for errors during linearization (e.g., unsupported global initializers)
@@ -219,14 +247,13 @@ pub fn compile_tokens(
 
     // Set DWARF metadata. Every path it records goes through the debug
     // prefix map, as gcc's does: the compilation directory, the primary
-    // source's name, and each `.file`. A placeholder for a synthetic stream
-    // is not a path and stays empty.
+    // source's name, and each `.file`.
     let map = opts.debug_prefix_map;
     module.source_name = Some(map.apply(opts.source_name).into_owned());
     module.comp_dir = std::env::current_dir()
         .ok()
         .map(|p| map.apply(&p.to_string_lossy()).into_owned());
-    for file in module.source_files.iter_mut().filter(|f| !f.is_empty()) {
+    for file in module.source_files.paths.iter_mut() {
         if let Cow::Owned(mapped) = map.apply(file) {
             *file = mapped;
         }
@@ -255,7 +282,7 @@ pub fn compile_tokens(
     // has to see the address computation -- see `ir::tls`. The backend below
     // is given the same `TlsPolicy`, so the pass and the backend agree on
     // the model.
-    ir::tls::expand_dynamic_tls(&mut module, target.tls_access(opts.tls).is_call(), &types);
+    ir::tls::expand_dynamic_tls(&mut module, target, opts.tls, &types);
 
     observer.stage("post-tls", &module, &types, None);
     ir::validate::verify(&module, ir::validate::Stage::Ssa, "target mapping");
@@ -270,7 +297,21 @@ pub fn compile_tokens(
     // `_Float16` one -- becomes that call after the optimizer, which could
     // still fold it.
     arch::mapping::call_library_fallbacks(&mut module, &types, target);
+    // `-pg`'s call, after the inliner, so a body inlined into another is
+    // counted as the function it now is.
+    if let Some(profiling) = opts.profiling {
+        arch::mapping::call_profiler(&mut module, &types, target, profiling);
+    }
     ir::validate::verify(&module, ir::validate::Stage::Ssa, "optimization");
+
+    // `-mno-sse` and its kin: what survived optimization may need no
+    // register the ISA lacks.
+    if target.arch == crate::target::Arch::X86_64 {
+        arch::x86_64::fp_regs::check(&module, &types, target);
+        if diag::has_error() != 0 {
+            return Err(failed("compilation failed"));
+        }
+    }
 
     if !observer.stage("post-opt", &module, &types, Some(&report)) {
         return Ok(None);
@@ -290,7 +331,7 @@ pub fn compile_tokens(
     // thread-locals at link time. gcc draws the line in the same place.
     let mut codegen = arch::codegen::create_codegen(
         target.clone(),
-        opts.unwind_tables,
+        opts.cfi,
         opts.pic,
         opts.tls,
         opts.verbose_asm,
@@ -298,6 +339,10 @@ pub fn compile_tokens(
         opts.stack_clash,
     );
     codegen.set_stack_protector(opts.stack_protector);
+    codegen.set_profiling(opts.profiling);
+    codegen.set_optimizing(opts.optimization.optimizes());
+    codegen.set_object_layout(opts.layout);
+    codegen.set_function_shape(opts.code.shape);
     let asm = codegen.generate(&module, &types);
 
     // Codegen can diagnose too. Inline asm is the case that reaches here: a

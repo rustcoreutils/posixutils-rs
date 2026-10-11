@@ -383,16 +383,17 @@ fn c17_does_not_claim_annex_g_complex() {
     );
 }
 
-/// #H12: accepting a flag that does nothing is misleading. There is no
-/// freestanding environment to enter, so say so.
+/// `-ffreestanding` is gcc's: `__STDC_HOSTED__` is 0 and the library
+/// functions are not builtins (`codegen/code_options.rs`), and a program
+/// built so still links and runs on a hosted system.
 #[test]
-fn c17_ffreestanding_is_diagnosed() {
+fn c17_ffreestanding_is_accepted() {
     let dir = plib::tmp::Builder::new()
         .prefix("c17_freestanding_")
         .tempdir()
         .unwrap();
     let src = dir.path().join("t.c");
-    std::fs::write(&src, "int main(void){return 0;}\n").unwrap();
+    std::fs::write(&src, "int main(void){return __STDC_HOSTED__;}\n").unwrap();
     let exe = dir.path().join("t.out");
 
     let r = run_c17(&[
@@ -401,12 +402,9 @@ fn c17_ffreestanding_is_diagnosed() {
         "-o",
         &exe.to_string_lossy(),
     ]);
-    assert!(!r.success, "-ffreestanding must not be silently accepted");
-    assert!(
-        r.stderr.contains("freestanding"),
-        "expected a diagnostic naming the flag:\n{}",
-        r.stderr
-    );
+    assert!(r.success, "{}", r.stderr);
+    let status = std::process::Command::new(&exe).status().unwrap();
+    assert_eq!(status.code(), Some(0));
 }
 
 /// #X8: `__STDC_NO_THREADS__` is a claim about the host, so the only thing

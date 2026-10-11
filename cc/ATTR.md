@@ -10,6 +10,7 @@ what `__has_attribute` answers for it, and how to add a new one.
 - [Accepted and Ignored](#accepted-and-ignored)
 - [Not Recognised](#not-recognised)
 - [`__has_attribute`](#__has_attribute)
+- [`__builtin_has_attribute`](#__builtin_has_attribute)
 - [Adding an Attribute](#adding-an-attribute)
 - [References](#references)
 
@@ -46,6 +47,29 @@ rather than a missed optimization. `pure` and `const` are stricter than gcc:
 written among the specifiers they apply to the first declarator only, since
 wrongly believing a callee writes nothing is a miscompile at the call site.
 
+### On the wrong kind of declaration
+
+An attribute written where it cannot apply is dropped with gcc 13's
+diagnostic, in the `-Wattributes` group:
+
+| Written | Diagnostic |
+|---------|------------|
+| A function's own attribute (`cold`, `hot`, `noinline`, `always_inline`, `pure`, `constructor`, `destructor`, `leaf`, `noclone`, `gnu_inline`, `artificial`, `optimize`, `target`, `target_clones`, `stack_protect`, `no_stack_protector`, `no_sanitize`, `no_sanitize_*`, `no_address_safety_analysis`, `noreturn`, `returns_twice`, `nothrow`, `error`, `warning`, `flatten`, `noipa`, `no_profile_instrument_function`, `indirect_branch`, `function_return`) on anything but a function | "'X' attribute ignored" |
+| `const` on anything but a function or a pointer to one, or on a typedef | "'const' attribute ignored" |
+| `malloc` on anything but a function | "'malloc' attribute ignored; valid only for functions" |
+| A function type's attribute (`nonnull`, `format`, `format_arg`, `warn_unused_result`, `sentinel`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `access`, `no_caller_saved_registers`) on anything but a function, a pointer to one, or a typedef of either | "'X' attribute only applies to function types" |
+| `no_instrument_function`, `zero_call_used_regs` on anything but a function | an error, "'X' attribute applies only to functions" |
+| `patchable_function_entry` on anything but a function | ignored in silence, as gcc does |
+| `tls_model` on a function, typedef, member or parameter; on an object that is not `_Thread_local` | "'tls_model' attribute ignored because 'x' is not a variable"; "... does not have thread storage duration" |
+| `uninitialized` on a function, typedef, member or parameter; on an object with static storage | "'uninitialized' attribute ignored because 'x' is not a variable"; "... is not a local variable" |
+| `retain` on a typedef, member, parameter, automatic variable or `extern` object | "'retain' attribute ignored" |
+| `weak` on a name without external linkage | an error, "weak declaration of 'x' must be public" |
+| `visibility` on a name without external linkage | "'visibility' attribute ignored" |
+| `alias` on a name with no linkage; `used` on an automatic object | "'X' attribute ignored" |
+| `section` on an automatic object | an error |
+| `weak`, `used`, `visibility`, `alias` on a typedef, a member or a parameter | "'X' attribute ignored" (`used` on a typedef in silence) |
+| `section` on a typedef, a member or a parameter | an error, "section attribute not allowed for 'x'" |
+
 ### Arguments
 
 An argument is read as gcc reads it: an optional leading bare name (`printf` in
@@ -59,7 +83,12 @@ A bad argument drops the attribute after a diagnostic:
 | `aligned` | error unless a power of two no larger than 2^28; `aligned(0)` is a warning and ignored |
 | `vector_size` | error unless a positive constant |
 | `constructor`, `destructor` | error unless 0 to 65535 |
-| `nonnull`, `nonnull_if_nonzero`, `sentinel`, `alloc_size`, `alloc_align`, `regparm` | warning; the attribute is dropped |
+| `nonnull`, `sentinel`, `alloc_size`, `alloc_align`, `regparm` | warning; the attribute is dropped |
+| `assume_aligned` | warning unless one or two constants, the first a power of two and the second below it ("argument N is not a power of 2", "... is not in the range [0, N-1]"); the wrong count is an error |
+| `error`, `warning`, `tls_model` | one string, else an error ("wrong number of arguments specified for 'X' attribute", with gcc's note "expected 1, found N"); for `error` and `warning` an argument that is not a string warns "'X' attribute ignored"; for `tls_model` it is an error ("argument not a string"), as is a string naming no model |
+| `zero_call_used_regs` | one string naming one of `-fzero-call-used-regs=`'s choices, else gcc's error ("unrecognized ... attribute argument", "argument not a string", the count) |
+| `patchable_function_entry` | one or two counts from 0 to 65535: the wrong count is an error (note "expected between 1 and 2"); a negative or non-integer one warns "is not an integer constant", a larger one "exceeds 65535", and the attribute is dropped; a second count above the first warns "patchable function entry M exceeds size N" and is read as 0 |
+| `no_sanitize` | one or more strings, each a comma-separated list of sanitizers: none, or one not a string, is an error; a name gcc does not know warns "'name' attribute directive ignored", as gcc's does |
 
 The arguments of an unrecognised attribute are skipped without being parsed.
 
@@ -67,9 +96,11 @@ The arguments of an unrecognised attribute are skipped without being parsed.
 
 | Attribute | Applies to | Effect |
 |-----------|-----------|--------|
+| `returns_twice` | Functions | Part of the function *type*, as `noreturn` is, but only on a function's declaration: gcc ignores it on a typedef or a pointer, so only a direct call of the declared function sees it. Such a call is treated as gcc treats `setjmp` (`Instruction::returns_twice`): no value is kept in a register across it, each value live across it keeps its slot to the end of the function, the memory passes give up on the function, the function is never inlined ("can never be inlined because it uses setjmp", an error under `always_inline`), and under `-fcf-protection=branch` the call is followed by `endbr64`, under aarch64 `-mbranch-protection=bti` by `bti j`. gcc's list of names (`setjmp`, `sigsetjmp` under up to two leading underscores, `savectx`, `vfork`, `getcontext`, external functions only) gets the same treatment without the attribute. gcc's warning that it is ignored elsewhere is not given |
 | `noreturn` | Functions | Part of the function *type*. The linearizer emits an `Unreachable` after every call through such a type, which the backends lower to `ud2` (x86-64) or `brk #1` (AArch64), and which ends the block for the optimizer. A noreturn function's own body is compiled normally |
 | `ms_abi` | Function types (x86-64) | The Microsoft x64 calling convention, carried on the function *type* (`Type::conv`): every call is classified by the type it calls through, directly or through a pointer (`CallingConv::of_callee`), and a definition by its own (`abi::Win64Abi`). The x86-64 backend assigns the argument positions, the 32-byte shadow area and the callee-saved RSI, RDI and XMM6-XMM15 (`arch/x86_64/win64.rs`). As in gcc it goes to the declared function or to the function a declared pointer points at, and on anything else warns "'ms_abi' attribute only applies to function types". Two function types differing only in convention are incompatible: a pointer assignment between them warns, a redeclaration that changes it is "conflicting types", and `ms_abi` with `sysv_abi` on one declaration is an error. On aarch64 it is not an attribute: it warns "directive ignored", `__has_attribute` answers 0, and the native convention applies, as in gcc |
 | `sysv_abi` | Function types (x86-64) | The x86-64 default convention, placed and checked as `ms_abi` is. Not an attribute on aarch64 |
+| `nocf_check` | Function types | Under `-fcf-protection=branch`, part of the function *type* (`Type::nocf_check`), placed as `ms_abi` is, so a typedef, `__typeof__` and a declared pointer carry it: a function of that type has no `endbr64` at its entry (`arch::landing_pads`), and an indirect call through a pointer to one is `notrack call`. As in gcc, two function types differing only here are incompatible -- a pointer assignment between them warns, a redeclaration that adds or drops it is "conflicting types" -- and on anything but a function type it warns "only applies to function types". Without branch protection, aarch64 included, it warns "'nocf_check' attribute ignored. Use '-fcf-protection' option to enable it" and no type carries it |
 | `aligned` | Types, variables, struct members, functions | Raises alignment: layout and `_Alignof` on a type, `.align` on a variable, `.p2align` on a function. Bare `aligned` means 16. Several requests take the largest. Ignored silently on an enum, and after an enum's closing brace on the declarators that follow, as gcc does |
 | `packed` | Structs, unions, enums, struct and union members | On a member, drops the alignment its type demands to 1 (a typedef's `aligned` included) and packs a bit-field to the bit; the rest of the aggregate is unaffected, and the aggregate's alignment is the largest its members then demand. On a struct or union it is `packed` on every member. One rule, `TypeTable::member_alignment`, combines it with the rest: an `aligned`/`_Alignas` written on the member raises the result and never lowers it, and a `#pragma pack(n)` in force caps it at `n` last, written alignment included. Accepted anywhere in the struct-or-union specifier, and anywhere in a member declaration: among the specifiers it reaches every declarator, after a declarator only that one. Ignored silently on an anonymous member, as gcc does, and on anything else that is not a member, where gcc warns. On an enum definition it makes the enum the smallest of the 1-, 2-, 4- and 8-byte integer types that holds every enumerator, signed iff one is negative, with that type's alignment; the enumeration constants stay `int` unless the enum is wider than `int`. Read between `enum` and the tag and after the closing brace, as gcc does; between the tag and `{` is a syntax error there too, and on a declaration that is not a definition it is ignored |
 | `transparent_union` | Unions | An argument matching **any** member's type may be passed to a parameter of this union, and the union is passed as its **first** member would be -- an unnamed zero-width bit-field is not a member for this purpose. glibc declares every socket call this way. Calls only: assignment and `return` stay strict, as in gcc. Ignored with a warning anywhere but a union |
@@ -81,18 +112,32 @@ The arguments of an unrecognised attribute are skipped without being parsed.
 | `always_inline` | Functions | Inlined at every call site regardless of size, and at `-O0` too. `noinline` outranks it, as in gcc |
 | `stack_protect` | Functions | Under any `-fstack-protector` level the function gets a canary, whatever its locals; `-fstack-protector-explicit` protects only these. With no level it does nothing, as in gcc |
 | `no_stack_protector` | Functions | The function never gets a canary, `-fstack-protector-all` included. With `stack_protect` on the same function -- in one list or across its declarations -- the first written wins and gcc's warning names the other ("ignoring attribute 'X' because it conflicts with attribute 'Y'"). Either attribute belongs to the function's own body: inlined into a caller, the body is protected as the caller is, as in gcc |
+| `no_instrument_function` | Functions | Under `-pg` the function makes no call to the profiler at its entry, as in gcc. A body inlined into another is counted as the function it is inlined into either way, since the call is made after the inliner |
 | `gnu_inline` | Functions | GNU89 inline semantics for this definition: plain `inline` emits an external definition, `extern inline` does not (the reverse of C99). `-fgnu89-inline` makes it the default. glibc's `__fortify_function` relies on it |
 | `constructor` | Functions | Runs before `main`, via `.init_array` (`__DATA,__mod_init_func` on Mach-O). An optional priority orders it: ELF encodes it in the section name; Mach-O has no equivalent, so it only orders the entries within one translation unit. An unprioritised entry runs after prioritised ones |
 | `destructor` | Functions | Runs after `main` returns or on `exit`. ELF lists it in `.fini_array`. Mach-O does not run `__mod_term_func` for a main executable, so each destructor is rewritten (`ir/mach_o_dtors.rs`) into an `atexit` registration made from a synthesized constructor of the same priority |
 | `weak` | Functions, variables | `.weak` rather than `.globl`: another definition wins, and an unresolved reference is null rather than a link error. Honoured on a *declaration* with no definition too. A weak *definition* is never inlined, since the body that runs may be some other one -- `static` is exempt, having internal linkage nothing can interpose, and `always_inline` outranks it as in gcc |
 | `used` | Functions, variables | Kept even when nothing refers to it. Load-bearing for functions, since an unreferenced static function is pruned at `-O1` and above. Variables are not pruned, so it changes nothing there |
-| `visibility` | Functions, variables | ELF `.hidden` / `.protected` / `.internal`; "default" is the *absence* of a directive, not a `.default` pseudo-op. Mach-O has only `.private_extern`, used for "hidden" and "internal". A zero-initialized variable leaves the `.comm` fast path rather than lose it |
+| `visibility` | Functions, variables | ELF `.hidden` / `.protected` / `.internal`; "default" is the *absence* of a directive, not a `.default` pseudo-op. Mach-O has only `.private_extern`, used for "hidden" and "internal". A zero-initialized variable leaves the `.comm` fast path rather than lose it. `#pragma GCC visibility push(default\|internal\|hidden\|protected)` ... `pop` (or `_Pragma`), nested as a stack, gives its visibility to every declaration with external linkage in between -- `extern` declarations and block-scope ones included, unlike `-fvisibility` -- that neither it nor an earlier declaration of the name gave one; a hidden one is then reached PC-relative under `-fPIC`. gcc's `-Wpragmas` warnings for a malformed pragma and an unmatched `pop` |
 | `alias("target")` | Functions, variables | The declaration becomes a second symbol for `target`, which this translation unit must define: `.set name, target`, with the alias's own binding -- `.globl`, `.weak` with `weak`, nothing when `static` -- and its own visibility. The target may itself be an alias, and a static function reached only through its alias is kept. An error, as in gcc, when the target is undefined here or only an inline definition, when one of the two is a function and the other a variable, and when the alias is also defined normally. Mach-O has no symbol aliases and the attribute is an error there, as in clang. The optimizer treats a store through either name as a store to the one object |
 | `ifunc("resolver")` | Functions | The declaration becomes a GNU indirect function, bound at load time to the function `resolver` returns; the resolver must be defined in this translation unit. Emitted as gcc does: the binding -- `.globl`, nothing when `static` -- its visibility, `.type name, @gnu_indirect_function` and `.set name, resolver`, sharing `alias`'s record (`ir::SymbolAlias` of form `AliasForm::Ifunc`) and its checks. A call goes through the PLT and the address is loaded from the GOT, where the binding is stored; a static resolver reached only through the attribute is kept. An error, as in gcc, when the resolver is undefined here or a variable, when the function is also defined ("redefinition of"), when it is `weak`, and when the resolver returns anything but a pointer; a pointer to neither `void` nor the function's type is a warning. On a variable it warns "'ifunc' attribute ignored". Mach-O has no indirect functions, so it is an error there ("ifunc is not supported on this target") |
-| `target("...")` | Functions | The function alone is compiled for the ISA the string asks, relative to the translation unit's (`IsaRequest`, applied by `X86Isa::with_request`): a comma list of `sse3` .. `sse4.2`, `sse4`, `popcnt` and their `no-` forms, read as the `-m` options are, and `arch=CPU`, which adds what that CPU has; `tune=`, `fpmath=sse`, `prefer-vector-width=` and the baseline `mmx`, `sse`, `sse2`, `fxsr` change nothing. One rule, `Linearizer::function_isa`, sets `ir::Function::isa`, which both the linearizer and the x86-64 backend read to pick packed instructions. The `__SSE4_1__` family of macros stays the unit's, as in gcc. Accumulated over the declarations, so a prototype's applies to the definition after it. The inliner splices a body only into a function whose ISA includes the body's, gcc's rule: a `target("sse4.1")` function is never inlined into a baseline one, and a baseline one is inlined into it. Every other ISA gcc 13 knows (`avx`, `avx2`, `avx512*`, `bmi`, `bmi2`, `fma`, `f16c`, `aes`, `pclmul`, ...) is above c17's SSE4.2 ceiling and is ignored without a word, as is its `no-` form: `target` only permits an ISA, so plain C under it compiles the same, and a body that really used one fails on its own (libzstd's tests put `target("lzcnt,bmi,bmi2")` on plain-C functions under `-Werror`). Turning off a baseline ISA, `fpmath=387` and gcc's code-generation switches (`cld`, `recip`, ...) warn that they are ignored. As in gcc: an unknown name is an error ("attribute 'target' argument 'X' is unknown"), as are an unknown `arch=`/`tune=` CPU, an unknown `fpmath=` value and an argument that is not a string; an empty string warns. On aarch64 gcc's spellings (`arch=`, `cpu=`, `tune=`, `+ext`, `branch-protection=` and its switches) are accepted and change nothing; anything else is gcc's error "pragma or attribute 'target("X")' is not valid" |
+| `target("...")` | Functions | The function alone is compiled for the ISA the string asks, relative to the translation unit's (`IsaRequest`, applied by `X86Isa::with_request`): a comma list of `sse3` .. `sse4.2`, `sse4`, `popcnt` and their `no-` forms, read as the `-m` options are, and `arch=CPU`, which adds what that CPU has; `tune=`, `fpmath=sse`, `prefer-vector-width=` and the baseline `mmx`, `sse`, `sse2`, `fxsr` change nothing. One rule, `Linearizer::function_isa`, sets `ir::Function::isa`, which both the linearizer and the x86-64 backend read to pick packed instructions. The `__SSE4_1__` family of macros stays the unit's, as in gcc. Accumulated over the declarations, so a prototype's applies to the definition after it. The inliner splices a body only into a function whose ISA includes the body's, gcc's rule: a `target("sse4.1")` function is never inlined into a baseline one, and a baseline one is inlined into it. Every other ISA gcc 13 knows (`avx`, `avx2`, `avx512*`, `bmi`, `bmi2`, `fma`, `f16c`, `aes`, `pclmul`, ...) is above c17's SSE4.2 ceiling and is ignored without a word, as is its `no-` form: `target` only permits an ISA, so plain C under it compiles the same, and a body that really used one fails on its own (libzstd's tests put `target("lzcnt,bmi,bmi2")` on plain-C functions under `-Werror`). Turning off a baseline ISA, `fpmath=387` and gcc's code-generation switches (`cld`, `recip`, ...) warn that they are ignored. As in gcc: an unknown name is an error ("attribute 'target' argument 'X' is unknown"), as are an unknown `arch=`/`tune=` CPU, an unknown `fpmath=` value and an argument that is not a string; an empty string warns. On aarch64 gcc's spellings (`arch=`, `cpu=`, `tune=`, `+ext` and its switches) are accepted and change nothing, except `branch-protection=`: read as `-mbranch-protection=` is, the last one builds the function with that protection in place of the unit's (`ir::Function::branch_protection`) -- its `bti c`, `paciasp`/`pacibsp` and `autiasp`/`autibsp`, and the `bti j` landing pads inside it -- while the unit's `.note.gnu.property` and the `__ARM_FEATURE_*` macros stay the command line's. A bad value is gcc's error for the attribute ("invalid protection type 'X' in 'target("branch-protection=")' pragma or attribute", "missing argument to ...", "unexpected 'X' after 'none'") followed by "is not valid" for the item; on Darwin, which refuses `-mbranch-protection`, a protection asked for is ignored with a warning. Anything else is gcc's error "pragma or attribute 'target("X")' is not valid" |
 | `target_clones("...", ...)` | Functions | The body is compiled once per version, each item of each string being one, and the function becomes a GNU indirect function, as gcc 13 builds it (`ir/target_clones.rs`): local versions `name.default` (the unit's ISA) and `name.sse4_2` and the like (gcc's suffix: every character but a letter or digit made `_`), each compiled as `target` would compile it; a resolver `name.resolver` that calls `__cpu_indicator_init` and returns the first version whose `__builtin_cpu_supports` bit the CPU has, in gcc's priority order (`popcnt` above `sse4.2` above `sse4.1` ...), else `name.default`; and `name` itself bound to it through `ifunc`'s record, so calls go through the PLT. For a function with external linkage the resolver is `.weak` in the comdat section `.text.name.resolver`; for a `static` one everything is local. A static local is one object shared by every version. The function's other attributes divide as in gcc: `constructor`/`destructor` (with priority) register `name.default`; `section` reaches every version but `name.default`, which stays in `.text`; `used` reaches every version and the resolver; `visibility` and `weak` are dropped, so a `hidden` function's name is exported -- gcc 13's behaviour, matched so a library exports what a gcc build does. A diagnostic about the body is given once, not once per version. Versions c17 builds: `mmx`, `sse`, `sse2`, `sse3`, `ssse3`, `sse4.1`, `sse4.2`, `popcnt`, `arch=x86-64-v2`. A version above the ceiling, `sse4` or another `arch=` CPU warns "'target_clones' version 'X' is beyond c17's SSE4.2 ceiling and is not built" and is dropped; with none left the function is its `default` version under its own name. As in gcc: one item warns "single 'target_clones' attribute is ignored"; no `default` ("'default' target was not set"), two ("multiple 'default' targets were set"), an unknown item ("attribute 'target_clone' argument 'X' is unknown") and a `no-` item are errors; with `target` on the same function it warns and is ignored. aarch64 has no dispatcher in gcc 13: a list is an error, an x86 name as "pragma or attribute 'target("X")' is not valid" and an aarch64 one as "target does not support function version dispatcher". Mach-O has no indirect functions: the function is its `default` version, in silence |
-| `cleanup(fn)` | Automatic variables | `fn(&var)` runs whenever `var` leaves its scope, as in gcc: innermost scope first and in reverse declaration order; on falling out of a block, a `for` loop's declaration or a statement expression, after the statement expression's value is computed; on `return`, after the value returned is computed, side effects included; on `break` and `continue`, each time round; and on a `goto` out of the scope, forward or backward. A computed `goto`, an `asm goto`'s jump, `longjmp` and `exit` run none, as in gcc. A returned or statement-expression value the IR keeps in memory -- a complex number, a vector, an aggregate wider than a register -- is copied out before the cleanups run. The parser builds the call and checks it as any call (`Parser::cleanup_call`), so an argument the prototype cannot take draws the usual warning or error; the linearizer keeps the calls of the variables in scope on a stack, and one question, how much of it is still in scope where an exit lands, decides what every exit runs (`ir/linearize_cleanup.rs`); a `goto` learns its label's cleanup scopes from the jump-scope walk, which runs before lowering. A jump into the scope is accepted, as in gcc. An argument that is not a bare name is an error ("cleanup argument not an identifier"), as is a name that is not a function ("cleanup argument not a function") and anything but one argument. On a `static`, file-scope, `typedef`, function, member or parameter declaration it warns "'cleanup' attribute ignored"; on a block-scope `extern` it is ignored in silence, as gcc does |
+| `cleanup(fn)` | Automatic variables | `fn(&var)` runs whenever `var` leaves its scope, as in gcc: innermost scope first and in reverse declaration order; on falling out of a block, a `for` loop's declaration or a statement expression, after the statement expression's value is computed; on `return`, after the value returned is computed, side effects included; on `break` and `continue`, each time round; and on a `goto` out of the scope, forward or backward. A computed `goto`, an `asm goto`'s jump, `longjmp` and `exit` run none, as in gcc. A returned or statement-expression value the IR keeps in memory -- a complex number, a vector, an aggregate wider than a register -- is copied out before the cleanups run. The parser builds the call and checks it as any call (`Parser::cleanup_call`), so an argument the prototype cannot take draws the usual warning or error; the linearizer keeps the calls of the variables in scope on a stack, and one question, how much of it is still in scope where an exit lands, decides what every exit runs (`ir/linearize_cleanup.rs`); a `goto` learns its label's cleanup scopes from the jump-scope walk, which runs before lowering. A jump into the scope is accepted, as in gcc. An argument that is not a bare name is an error ("cleanup argument not an identifier"), as is a name that is not a function ("cleanup argument not a function") and anything but one argument. On a `static`, file-scope, `typedef`, function, member or parameter declaration it warns "'cleanup' attribute ignored"; on a block-scope `extern` it is ignored in silence, as gcc does. Under `-fexceptions` the cleanups also run when the frame is unwound through a call in their scope -- thread cancellation, `pthread_exit`, a forced or foreign unwind -- through gcc's LSDA, `__gcc_personality_v0` and a landing pad per call that may throw (`ir/linearize_cleanup.rs`, `arch/eh.rs`) |
+| `nothrow` | Functions | The function never unwinds through its caller, so under `-fexceptions` a call to it needs no landing pad, as in gcc; glibc's `__THROW` puts it on most of libc. Carried on the function type, as `noreturn` is |
 | `section("name")` | Functions, variables | Places the symbol in the named section, ahead of every other rule -- including the zero-initialized fast path, since `.comm` would let the linker choose. ELF flags follow the contents: `"ax"` for code, `"aw"` for mutable data, `"a"` for read-only data |
+| `retain` | Functions, objects with static storage | The definition goes in a section of its own, named as `-ffunction-sections` and `-fdata-sections` name it (`.text.f`, `.data.x`, `.bss.x`, `.rodata.x`, `.data.rel.ro.x`, `.tdata.x`, `.tbss.x`), or in the section it names, marked `SHF_GNU_RETAIN` (`R`) so `ld --gc-sections` keeps it, as gcc 13 writes it with binutils 2.36 and later; a tentative definition is no common symbol. It does not keep an unreferenced `static` the optimizer may drop -- that is `used`. gcc's warning when a retained and an unretained definition share a named section is not given. Mach-O has no such flag, and there it does nothing. The Linux kernel's `__retain` |
+| `error("msg")`, `warning("msg")` | Functions | Each call of the function that survives optimization is reported at the call, as gcc reports it: "call to 'f' declared with attribute error: msg" is an error, the `warning` form a warning in `-Wattribute-warning`; with both, both, the error first. Checked after the optimizer (`opt::report_attribute_calls`), so a call in a branch it proved dead -- or never generated, a constant condition being decided at `-O0` too -- or one it inlined away is no call; the Linux kernel's `BUILD_BUG_ON` and `compiletime_assert` rely on that, and glibc's `__warndecl`/`__errordecl`. Written on any declaration of the name, block-scope `extern` and after the call included. Carried in `SymbolAttrs::call_diagnostics`. A call through a pointer is reported only when it is a direct call by then, and c17's optimizer does not make it one where gcc's does |
+| `tls_model("model")` | Thread-locals | The variable's access model, as written, in place of what the code could prove and of `-ftls-model=`, as gcc does: `initial-exec` on an executable's own thread-local, `global-dynamic` anywhere, `local-exec` in shared code. `local-dynamic` is the descriptor call of `global-dynamic`, as `-ftls-model=` makes it. One rule, `ir::Module::tls_model`, decides each thread-local's model for both `ir::tls`, which expands only the accesses made by a call, and the backends. Mach-O always calls the TLV getter |
+| `flatten` | Functions | When optimizing, every call in the body whose callee this unit defines and can inline is inlined, and so is every call in what was inlined, past every size cap (`ir::inline::flatten_splices`), as gcc 13 flattens. A `noinline`, `noipa`, interposable or self-recursive callee stays a call, as does one on a cycle of calls; at `-O0` nothing is inlined, as in gcc |
+| `noipa` | Functions | No caller learns anything from the body: never inlined, and no memory effect is inferred from it (`ir::effects`), so a call to one is a call that may touch any memory |
+| `indirect_branch("choice")`, `function_return("choice")` | Functions (x86-64) | The function's own `-mindirect-branch=` and `-mfunction-return=`: `keep`, `thunk`, `thunk-inline` or `thunk-extern`, over the options. Anything else warns as gcc does and is dropped. Not attributes on aarch64 |
+| `patchable_function_entry(N[, M])` | Functions | The function's own `-fpatchable-function-entry=N,M`, over the option (`target::ShapeAttrs`, read by `CodeGenBase::shape_of`): `(0)` takes the function out of the option, and `M` is 0 when not given. ELF only; on Mach-O, which refuses the option, it does nothing. The Linux kernel's `notrace` |
+| `zero_call_used_regs("choice")` | Functions (x86-64) | The function's own `-fzero-call-used-regs=`, over the option: `skip` takes it out. Not an attribute on aarch64, where c17 has no `-fzero-call-used-regs=` either |
+| `no_caller_saved_registers` | Functions (x86-64) | The function preserves every general register it changes: besides the callee-saved ones it uses, it saves and restores every call-clobbered one but those its value is returned in (`X86_64CodeGen::call_clobbered_to_preserve`) -- all of them, where gcc saves only those it or its callees use, which preserves the same registers. gcc saves no SSE register for one and so compiles none while SSE is on: "sorry, unimplemented: SSE instructions aren't allowed in a function with the 'no_caller_saved_registers' attribute", unless `-mgeneral-regs-only` or `-mno-sse`. A caller does not rely on the registers it preserves. Not an attribute on aarch64. The Linux kernel's `__no_caller_saved_registers` |
+| `uninitialized` | Automatic variables | `-ftrivial-auto-var-init=` leaves the variable as C does, uninitialized |
+| `alloc_size(i[, j])` | Functions | The object a direct call returns is as many bytes as argument `i` says, or as the product of arguments `i` and `j`, which `__builtin_dynamic_object_size` answers once optimizing (`ir::objsize`); gcc knows the same of `malloc`, `calloc` and `realloc` without it. Written on any declaration of the name, as `error` is (`SymbolAttrs::alloc_size`). A call through a pointer learns nothing. An index past the arguments, or naming one that is no integer, says nothing |
+| `access(mode, ref, size)` | Functions | With a size, the pointer parameter `ref` points to at least as many elements of its pointee type (bytes for `void`) as parameter `size` holds, which `__builtin_dynamic_object_size` of the parameter answers inside the function once optimizing. Every mode (`read_only`, `write_only`, `read_write`, `none`) alike; without a size it does nothing (`SymbolAttrs::access`) |
 
 ### `noreturn` spellings
 
@@ -104,8 +149,8 @@ _Noreturn void my_exit(int code);
 
 The property is carried on the function type, gathered from `_Noreturn` among
 the specifiers or the attribute on this or any earlier declaration of the name
-(`Parser::function_declarator_attrs`). `setjmp`/`longjmp` need no attribute:
-they are recognised by name and lowered to `Opcode::Setjmp` / `Opcode::Longjmp`.
+(`Parser::function_declarator_attrs`). The library's `longjmp` family takes
+it from <setjmp.h> like any other function.
 
 ## Accepted and Ignored
 
@@ -114,14 +159,21 @@ else happens. Each is either a pure hint or something ignoring cannot change
 the result of a correct program. glibc puts most of them on every declaration.
 
 `unused`, `deprecated`, `hot`, `cold`, `warn_unused_result`, `format`,
-`nonstring`, `malloc`, `sentinel`, `nonnull`, `nonnull_if_nonzero`,
-`returns_nonnull`, `nothrow`, `access`, `returns_twice`, `externally_visible`,
-`abi_tag`, `weakref`, `simd`, `regparm`, `leaf`, `alloc_size`, `alloc_align`,
-`noclone`, `no_instrument_function`, `copy`, `designated_init`, `may_alias`,
-`artificial`, `no_sanitize_memory`, `no_sanitize_address`, `no_sanitize_thread`,
-`optimize`.
+`format_arg` (glibc's `__attribute_format_arg__` on `gettext`),
+`nonstring`, `malloc`, `sentinel`, `nonnull`,
+`returns_nonnull`, `externally_visible`,
+`weakref`, `simd`, `regparm` (x86-64 only, as in gcc), `leaf`,
+`alloc_align`, `assume_aligned` (the Linux kernel's `__assume_aligned`),
+`noclone`, `copy`, `designated_init`, `may_alias`, `artificial`,
+`no_sanitize`, `no_sanitize_address`, `no_sanitize_thread`,
+`no_sanitize_undefined`, `no_sanitize_coverage`, `no_address_safety_analysis`
+(c17 refuses `-fsanitize=` and inserts no sanitizer),
+`no_profile_instrument_function` (the Linux kernel's `__no_profile`; c17
+refuses `-fprofile-arcs` and inserts no counter), `optimize`.
 
-No diagnostic comes from `deprecated`, `warn_unused_result` or `format`.
+No diagnostic comes from `deprecated`, `warn_unused_result`, `format` or
+`format_arg`: c17 has no `-Wformat`, so there is no format check for
+`format_arg` to look through.
 `optimize(...)` takes any arguments and is ignored without a word, as an ISA
 beyond the ceiling in `target` is: it only changes how gcc optimizes the one
 function (libzstd's `DONT_VECTORIZE`, `optimize("no-tree-vectorize")`, under
@@ -162,17 +214,49 @@ whatever it would have left pending for a declarator is discarded.
 ## Not Recognised
 
 Any other name warns "'name' attribute directive ignored", suppressible with
-`-Wno-attributes`, and its arguments are skipped.
+`-Wno-attributes`, and its arguments are skipped. Among them are gcc 13's own
+omissions -- `abi_tag` (C++'s), `nonnull_if_nonzero` and `counted_by` (gcc
+15's), `no_sanitize_memory` (clang's) -- which gcc 13 warns about too. The
+Linux kernel enables `__counted_by` only when a probe compiling one under
+`-Werror` passes, so it does not use it with c17, as with gcc 13.
 
 ## `__has_attribute`
 
-Answers 1 exactly when `kw::attribute_supported` does: the name carries the
-`SUPPORTED_ATTR` tag in `kw.rs` -- every attribute in the two sections above,
-in both spellings, plus `__const` -- and is not tagged `X86_64_ONLY` on
-another target (`ms_abi`, `sysv_abi`). The parser's "directive ignored"
-warning and both evaluators ask that one function -- `eval_has_attribute` in
-`token/preprocess.rs` (`#if`) and the `BuiltinMacro::HasAttribute` arm in
-`token/preprocess_macro.rs` -- so there is no second list to keep in step.
+Answers as gcc 13 does, through one function, `kw::has_attribute`, which
+both evaluators ask -- `eval_has_attribute` in `token/preprocess.rs` (`#if`)
+and the `BuiltinMacro::HasAttribute` arm in `token/preprocess_macro.rs` -- so
+there is no second list to keep in step. It is nonzero exactly when
+`kw::attribute_supported` is, which the parser's "directive ignored" warning
+asks too: the name carries the `SUPPORTED_ATTR` tag in `kw.rs` -- every
+attribute in the two sections above, in both spellings -- and is not tagged
+`X86_64_ONLY` on another target (`ms_abi`, `sysv_abi`, `regparm`,
+`indirect_branch`, `function_return`, `zero_call_used_regs`,
+`no_caller_saved_registers`). The value is 1, but for the three standard
+attributes gcc also knows by their GNU names, which answer the version of
+the C standard that added them, in either spelling: `deprecated` 201904,
+`fallthrough` 201910, `noreturn` 202202. `__const` is accepted as an
+attribute and answers 0, as in gcc.
+
+## `__builtin_has_attribute`
+
+`__builtin_has_attribute(T-or-E, attribute)` is an integer constant: whether
+the declaration `E` names (through `*&`, as gcc reads it) or, for a type-name
+or an expression naming no declaration, the type, has the attribute. The
+operand is not evaluated. Every attribute written on a declaration is
+recorded against what it declares (`Parser::written_attrs`, keyed by name
+for a declaration with linkage, whose definition binds a fresh symbol), and
+a declaration has the attribute when any of its declarations wrote it.
+Asked with arguments, gcc's comparison of them is applied where gcc compares
+them -- `aligned`'s value, a `section`, `visibility`, `error`/`warning`
+message, `alias`/`ifunc` target or `vector_size`, and `nonnull`'s positions
+(a `nonnull` naming none answers a query naming any, and a query naming none
+answers only one) -- and elsewhere the name alone decides, as gcc's does. A
+type has `aligned` (and its value), `packed`, `vector_size`,
+`transparent_union`, `scalar_storage_order` and, on a function type,
+`noreturn`. A name that is no attribute is gcc's error, "unknown attribute
+'X'". gcc's own oddities for `constructor` and `tls_model` with arguments,
+and for an attribute it applies to a scratch declaration to check, are not
+reproduced.
 
 ```c
 #if __has_attribute(noreturn)
@@ -223,7 +307,7 @@ In order:
      `Parser::function_declarator_attrs` (`parse/bind.rs`). One that a pointer
      to a function, a typedef, a parameter or a type-name carries too, as
      `ms_abi` does, is a type attribute instead (below), placed on the
-     function by `Parser::apply_pending_calling_conv`.
+     function by `Parser::apply_pending_fn_type_attrs`.
    - *A property of a type*: a `pending_*` slot set in
      `Parser::parse_single_attribute` and applied in
      `Parser::apply_pending_type_attrs`, once the type is final. A new slot must
@@ -239,6 +323,10 @@ In order:
    specifiers' share and `Parser::begin_declarator` restores it for each
    declarator. A value that must belong to one declarator only is *taken* when
    consumed, as `Parser::take_pending_fn_effect` takes the memory effect.
+   Every list also lands as written in `pending_written_attrs`, recorded for
+   `__builtin_has_attribute` when the declarator is bound; a new attribute
+   needs nothing there unless gcc compares its arguments
+   (`has_attribute::arguments_match`).
 
 5. **Semantics.** Apply it in the IR pass or backend that owns the behaviour,
    on both targets and both object formats; where a format cannot express it,

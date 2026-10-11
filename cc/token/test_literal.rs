@@ -121,6 +121,31 @@ fn incomplete_ucn_keeps_its_digits() {
     ));
 }
 
+/// GNU `\e` and `\E` name ESC, 27; they are not ISO escapes, so they decode
+/// as their own kind, which `-pedantic` reports, while `\q` stays an unknown
+/// escape standing for its letter.
+#[test]
+fn gnu_escape_is_esc() {
+    for (payload, letter) in [("\\e", 'e'), ("\\E", 'E')] {
+        assert!(
+            matches!(
+                parse_string_literal(payload)[..],
+                [Escaped::NonIso { unit: 0x1b, letter: l }] if l == letter
+            ),
+            "{payload}"
+        );
+        assert_eq!(
+            literal_bytes(&parse_string_literal(payload)),
+            "\u{1b}",
+            "{payload}"
+        );
+    }
+    assert!(matches!(
+        parse_string_literal("\\q")[..],
+        [Escaped::Unit(0x71)]
+    ));
+}
+
 /// gcc keeps the low 64 bits of an integer constant too wide for any type,
 /// and says so; a character that is no digit of the radix is no constant.
 #[test]

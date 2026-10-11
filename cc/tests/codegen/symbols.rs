@@ -1389,3 +1389,139 @@ int main(void)
         );
     }
 }
+
+/// An unused `static inline` function is not emitted because its name is a
+/// word of some asm template, and the block-scope statics of a function
+/// dropped as unused go with it -- at every level, as in gcc. The program
+/// links only if neither leaves its references to undefined symbols behind:
+/// the kernel's `wbinvd`, `rdtsc` and friends were emitted out of line in
+/// every object, and erofs's `xattr_handler_map[]` named handlers that may
+/// not be configured in.
+#[test]
+fn codegen_unused_static_inline_and_its_statics_are_not_emitted() {
+    compile_and_run_everywhere(
+        "unused_static_inline_statics",
+        r#"
+extern void never_defined(void);
+extern const int handler_a, handler_b;
+
+/* Named in an asm template below, referenced by nothing. */
+static inline void wbinvd(void) { never_defined(); }
+
+/* A table, and a static naming it, inside an unused static inline. */
+static inline const int *prefix(unsigned idx)
+{
+    static const int *const map[] = { &handler_a, &handler_b };
+    static const int *const *const outer = map;
+    return idx < 2 ? outer[idx] : 0;
+}
+
+/* Used and inlined: its static stays, and still names `lens`. */
+static int lens[] = { 3, 5, 7 };
+static inline int len_of(unsigned i)
+{
+    static const int *const table = lens;
+    return table[i];
+}
+
+int main(void)
+{
+    __asm__ volatile(".ifdef wbinvd\n.endif\n.ifdef prefix\n.endif" ::: "memory");
+    return len_of(2) == 7 ? 0 : 1;
+}
+"#,
+    );
+}
+
+/// Above -O0 gcc drops any static object nothing refers to -- a file-scope
+/// one, and a plain (non-`inline`) static function with its own statics --
+/// but keeps one marked `used`. At -O0 it emits both, so this links only
+/// when optimizing.
+#[test]
+fn codegen_unreferenced_static_objects_are_dropped_when_optimizing() {
+    let src = r#"
+extern const int handler_a;
+extern void never_defined(void);
+static const int *const file_table[] = { &handler_a };
+static void plain(void)
+{
+    static void (*const hook)(void) = never_defined;
+    hook();
+}
+__attribute__((used)) static int kept = 42;
+int main(void) { return 0; }
+"#;
+    for level in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("unreferenced_static_objects", src, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+    }
+}
+
+/// ld names where a warning symbol is referenced from by the referencing
+/// object's DWARF: for a reference from data, the `DW_TAG_variable` whose
+/// address range holds it. With file-scope objects described, a c17 object
+/// gets gcc's "beginwarn.c:7:" (binutils' ld-elf beginwarn test) instead of
+/// a bare section offset, and readelf shows the variable's line.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_debug_variables_locate_link_warnings() {
+    let dir = crate::common::work_dir("beginwarn");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(
+        p("beginwarn.c"),
+        "static const char _evoke_link_warning_foo []\n\
+         \x20 __attribute__ ((used, section (\".gnu.warning.foo\")))\n\
+         \x20   = \"function foo is deprecated\";\n\
+         \n\
+         extern void foo (void);\n\
+         \n\
+         static void (*const init_array []) (void)\n\
+         \x20 __attribute__ ((used, section (\".init_array\"), aligned (sizeof (void *))))\n\
+         \x20 = { foo };\n",
+    )
+    .unwrap();
+    std::fs::write(p("foo.c"), "void foo (void) { }\n").unwrap();
+    let r = crate::common::run_c17(&[
+        "-g",
+        "-fPIC",
+        "-c",
+        "-o",
+        &p("beginwarn.o"),
+        &p("beginwarn.c"),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let r = crate::common::run_c17(&["-shared", "-fPIC", "-o", &p("libfoo.so"), &p("foo.c")]);
+    assert!(r.success, "{}", r.stderr);
+    let r = crate::common::run_c17(&[
+        "-shared",
+        "-o",
+        &p("libbarw.so"),
+        &p("beginwarn.o"),
+        &p("libfoo.so"),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(
+        r.stderr.contains("beginwarn.c:7:") && r.stderr.contains("function foo is deprecated"),
+        "{}",
+        r.stderr
+    );
+
+    let info = Command::new("readelf")
+        .args(["--debug-dump=info", &p("beginwarn.o")])
+        .output()
+        .expect("readelf");
+    let info = String::from_utf8_lossy(&info.stdout);
+    let die = info
+        .split("DW_TAG_variable")
+        .find(|d| d.contains("init_array"))
+        .unwrap_or_else(|| panic!("no DIE for init_array:\n{info}"));
+    let line = die
+        .lines()
+        .find_map(|l| l.split("DW_AT_decl_line").nth(1))
+        .map(|v| v.trim_start_matches([' ', ':']).trim());
+    assert!(matches!(line, Some("7" | "0x7")), "{die}");
+    assert!(die.contains("DW_OP_addr"), "{die}");
+}

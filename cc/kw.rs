@@ -45,9 +45,10 @@ pub const TYPE_KEYWORD: u32 = 1 << 13;
 /// separates standard C from GNU extensions (`FOO` vs `GNU_FOO`), because that
 /// lives in the Rust const identifier and is not queryable at runtime.
 pub const RESERVED_NAME: u32 = 1 << 14;
-/// An attribute or builtin gcc knows only on x86-64: the calling-convention
-/// attributes and the Microsoft `va_list` builtins. Anywhere else gcc has
-/// never heard of the name, so neither has c17 -- see [`exists_on`].
+/// An attribute, builtin or qualifier gcc knows only on x86-64: the
+/// calling-convention attributes, the Microsoft `va_list` builtins and the
+/// `__seg_fs`/`__seg_gs` address spaces. Anywhere else gcc has never heard
+/// of the name, so neither has c17 -- see [`exists_on`].
 pub const X86_64_ONLY: u32 = 1 << 15;
 
 /// Composite: all tags that start a declaration
@@ -202,6 +203,9 @@ define_keywords! {
     (GNU_VOLATILE2,     "__volatile",        QUALIFIER),
     (GNU_RESTRICT,      "__restrict__",      QUALIFIER),
     (GNU_RESTRICT2,     "__restrict",        QUALIFIER),
+    // gcc's x86-64 named address spaces.
+    (SEG_FS,            "__seg_fs",          QUALIFIER | X86_64_ONLY),
+    (SEG_GS,            "__seg_gs",          QUALIFIER | X86_64_ONLY),
 
     // ---- Inline (INLINE_KW) ----
     (INLINE,            "inline",            INLINE_KW),
@@ -273,8 +277,9 @@ define_keywords! {
     (ENDIF,             "endif",             0),
     (INCLUDE,           "include",           0),
     (INCLUDE_NEXT,      "include_next",      0),
-    (PP_ERROR,          "error",             0),
-    (WARNING,           "warning",           0),
+    // Also the `error` and `warning` function attributes.
+    (PP_ERROR,          "error",             SUPPORTED_ATTR),
+    (WARNING,           "warning",           SUPPORTED_ATTR),
     (PRAGMA,            "pragma",            0),
     (LINE,              "line",              0),
     (PP_IDENT,          "ident",             0),
@@ -612,6 +617,157 @@ define_keywords! {
     (BUILTIN_COPYSIGNQ,    "__builtin_copysignq",    BUILTIN),
     (BUILTIN_SQRTF128,  "__builtin_sqrtf128",    BUILTIN),
     (BUILTIN_FMAF128,   "__builtin_fmaf128",     BUILTIN),
+    // roundeven, lrint, lround, scalbn in every type, and the _FloatN
+    // forms of the libm functions glibc's sources name.
+    (BUILTIN_ROUNDEVEN, "__builtin_roundeven", BUILTIN),
+    (BUILTIN_ROUNDEVENF, "__builtin_roundevenf", BUILTIN),
+    (BUILTIN_ROUNDEVENL, "__builtin_roundevenl", BUILTIN),
+    (BUILTIN_ROUNDEVENF32, "__builtin_roundevenf32", BUILTIN),
+    (BUILTIN_ROUNDEVENF64, "__builtin_roundevenf64", BUILTIN),
+    (BUILTIN_ROUNDEVENF32X, "__builtin_roundevenf32x", BUILTIN),
+    (BUILTIN_ROUNDEVENF64X, "__builtin_roundevenf64x", BUILTIN),
+    (BUILTIN_ROUNDEVENF128, "__builtin_roundevenf128", BUILTIN),
+    (BUILTIN_LRINT, "__builtin_lrint", BUILTIN),
+    (BUILTIN_LRINTF, "__builtin_lrintf", BUILTIN),
+    (BUILTIN_LRINTL, "__builtin_lrintl", BUILTIN),
+    (BUILTIN_LRINTF32, "__builtin_lrintf32", BUILTIN),
+    (BUILTIN_LRINTF64, "__builtin_lrintf64", BUILTIN),
+    (BUILTIN_LRINTF32X, "__builtin_lrintf32x", BUILTIN),
+    (BUILTIN_LRINTF64X, "__builtin_lrintf64x", BUILTIN),
+    (BUILTIN_LRINTF128, "__builtin_lrintf128", BUILTIN),
+    (BUILTIN_LLRINT, "__builtin_llrint", BUILTIN),
+    (BUILTIN_LLRINTF, "__builtin_llrintf", BUILTIN),
+    (BUILTIN_LLRINTL, "__builtin_llrintl", BUILTIN),
+    (BUILTIN_LLRINTF32, "__builtin_llrintf32", BUILTIN),
+    (BUILTIN_LLRINTF64, "__builtin_llrintf64", BUILTIN),
+    (BUILTIN_LLRINTF32X, "__builtin_llrintf32x", BUILTIN),
+    (BUILTIN_LLRINTF64X, "__builtin_llrintf64x", BUILTIN),
+    (BUILTIN_LLRINTF128, "__builtin_llrintf128", BUILTIN),
+    (BUILTIN_LROUND, "__builtin_lround", BUILTIN),
+    (BUILTIN_LROUNDF, "__builtin_lroundf", BUILTIN),
+    (BUILTIN_LROUNDL, "__builtin_lroundl", BUILTIN),
+    (BUILTIN_LROUNDF32, "__builtin_lroundf32", BUILTIN),
+    (BUILTIN_LROUNDF64, "__builtin_lroundf64", BUILTIN),
+    (BUILTIN_LROUNDF32X, "__builtin_lroundf32x", BUILTIN),
+    (BUILTIN_LROUNDF64X, "__builtin_lroundf64x", BUILTIN),
+    (BUILTIN_LROUNDF128, "__builtin_lroundf128", BUILTIN),
+    (BUILTIN_LLROUND, "__builtin_llround", BUILTIN),
+    (BUILTIN_LLROUNDF, "__builtin_llroundf", BUILTIN),
+    (BUILTIN_LLROUNDL, "__builtin_llroundl", BUILTIN),
+    (BUILTIN_LLROUNDF32, "__builtin_llroundf32", BUILTIN),
+    (BUILTIN_LLROUNDF64, "__builtin_llroundf64", BUILTIN),
+    (BUILTIN_LLROUNDF32X, "__builtin_llroundf32x", BUILTIN),
+    (BUILTIN_LLROUNDF64X, "__builtin_llroundf64x", BUILTIN),
+    (BUILTIN_LLROUNDF128, "__builtin_llroundf128", BUILTIN),
+    (BUILTIN_SCALBN, "__builtin_scalbn", BUILTIN),
+    (BUILTIN_SCALBNF, "__builtin_scalbnf", BUILTIN),
+    (BUILTIN_SCALBNL, "__builtin_scalbnl", BUILTIN),
+    (BUILTIN_SCALBNF32, "__builtin_scalbnf32", BUILTIN),
+    (BUILTIN_SCALBNF64, "__builtin_scalbnf64", BUILTIN),
+    (BUILTIN_SCALBNF32X, "__builtin_scalbnf32x", BUILTIN),
+    (BUILTIN_SCALBNF64X, "__builtin_scalbnf64x", BUILTIN),
+    (BUILTIN_SCALBNF128, "__builtin_scalbnf128", BUILTIN),
+    (BUILTIN_SCALBLN, "__builtin_scalbln", BUILTIN),
+    (BUILTIN_SCALBLNF, "__builtin_scalblnf", BUILTIN),
+    (BUILTIN_SCALBLNL, "__builtin_scalblnl", BUILTIN),
+    (BUILTIN_SCALBLNF32, "__builtin_scalblnf32", BUILTIN),
+    (BUILTIN_SCALBLNF64, "__builtin_scalblnf64", BUILTIN),
+    (BUILTIN_SCALBLNF32X, "__builtin_scalblnf32x", BUILTIN),
+    (BUILTIN_SCALBLNF64X, "__builtin_scalblnf64x", BUILTIN),
+    (BUILTIN_SCALBLNF128, "__builtin_scalblnf128", BUILTIN),
+    (BUILTIN_ROUNDF32, "__builtin_roundf32", BUILTIN),
+    (BUILTIN_ROUNDF64, "__builtin_roundf64", BUILTIN),
+    (BUILTIN_ROUNDF32X, "__builtin_roundf32x", BUILTIN),
+    (BUILTIN_ROUNDF64X, "__builtin_roundf64x", BUILTIN),
+    (BUILTIN_ROUNDF128, "__builtin_roundf128", BUILTIN),
+    (BUILTIN_RINTF32, "__builtin_rintf32", BUILTIN),
+    (BUILTIN_RINTF64, "__builtin_rintf64", BUILTIN),
+    (BUILTIN_RINTF32X, "__builtin_rintf32x", BUILTIN),
+    (BUILTIN_RINTF64X, "__builtin_rintf64x", BUILTIN),
+    (BUILTIN_RINTF128, "__builtin_rintf128", BUILTIN),
+    (BUILTIN_NEARBYINTF32, "__builtin_nearbyintf32", BUILTIN),
+    (BUILTIN_NEARBYINTF64, "__builtin_nearbyintf64", BUILTIN),
+    (BUILTIN_NEARBYINTF32X, "__builtin_nearbyintf32x", BUILTIN),
+    (BUILTIN_NEARBYINTF64X, "__builtin_nearbyintf64x", BUILTIN),
+    (BUILTIN_NEARBYINTF128, "__builtin_nearbyintf128", BUILTIN),
+    (BUILTIN_TRUNCF32, "__builtin_truncf32", BUILTIN),
+    (BUILTIN_TRUNCF64, "__builtin_truncf64", BUILTIN),
+    (BUILTIN_TRUNCF32X, "__builtin_truncf32x", BUILTIN),
+    (BUILTIN_TRUNCF64X, "__builtin_truncf64x", BUILTIN),
+    (BUILTIN_TRUNCF128, "__builtin_truncf128", BUILTIN),
+    (BUILTIN_FLOORF32, "__builtin_floorf32", BUILTIN),
+    (BUILTIN_FLOORF64, "__builtin_floorf64", BUILTIN),
+    (BUILTIN_FLOORF32X, "__builtin_floorf32x", BUILTIN),
+    (BUILTIN_FLOORF64X, "__builtin_floorf64x", BUILTIN),
+    (BUILTIN_FLOORF128, "__builtin_floorf128", BUILTIN),
+    (BUILTIN_CEILF32, "__builtin_ceilf32", BUILTIN),
+    (BUILTIN_CEILF64, "__builtin_ceilf64", BUILTIN),
+    (BUILTIN_CEILF32X, "__builtin_ceilf32x", BUILTIN),
+    (BUILTIN_CEILF64X, "__builtin_ceilf64x", BUILTIN),
+    (BUILTIN_CEILF128, "__builtin_ceilf128", BUILTIN),
+    (BUILTIN_LOGBF32, "__builtin_logbf32", BUILTIN),
+    (BUILTIN_LOGBF64, "__builtin_logbf64", BUILTIN),
+    (BUILTIN_LOGBF32X, "__builtin_logbf32x", BUILTIN),
+    (BUILTIN_LOGBF64X, "__builtin_logbf64x", BUILTIN),
+    (BUILTIN_LOGBF128, "__builtin_logbf128", BUILTIN),
+    (BUILTIN_SQRTF32, "__builtin_sqrtf32", BUILTIN),
+    (BUILTIN_SQRTF64, "__builtin_sqrtf64", BUILTIN),
+    (BUILTIN_SQRTF32X, "__builtin_sqrtf32x", BUILTIN),
+    (BUILTIN_SQRTF64X, "__builtin_sqrtf64x", BUILTIN),
+    (BUILTIN_CBRTF32, "__builtin_cbrtf32", BUILTIN),
+    (BUILTIN_CBRTF64, "__builtin_cbrtf64", BUILTIN),
+    (BUILTIN_CBRTF32X, "__builtin_cbrtf32x", BUILTIN),
+    (BUILTIN_CBRTF64X, "__builtin_cbrtf64x", BUILTIN),
+    (BUILTIN_CBRTF128, "__builtin_cbrtf128", BUILTIN),
+    (BUILTIN_FMINF32, "__builtin_fminf32", BUILTIN),
+    (BUILTIN_FMINF64, "__builtin_fminf64", BUILTIN),
+    (BUILTIN_FMINF32X, "__builtin_fminf32x", BUILTIN),
+    (BUILTIN_FMINF64X, "__builtin_fminf64x", BUILTIN),
+    (BUILTIN_FMINF128, "__builtin_fminf128", BUILTIN),
+    (BUILTIN_FMAXF32, "__builtin_fmaxf32", BUILTIN),
+    (BUILTIN_FMAXF64, "__builtin_fmaxf64", BUILTIN),
+    (BUILTIN_FMAXF32X, "__builtin_fmaxf32x", BUILTIN),
+    (BUILTIN_FMAXF64X, "__builtin_fmaxf64x", BUILTIN),
+    (BUILTIN_FMAXF128, "__builtin_fmaxf128", BUILTIN),
+    (BUILTIN_FMAF32, "__builtin_fmaf32", BUILTIN),
+    (BUILTIN_FMAF64, "__builtin_fmaf64", BUILTIN),
+    (BUILTIN_FMAF32X, "__builtin_fmaf32x", BUILTIN),
+    (BUILTIN_FMAF64X, "__builtin_fmaf64x", BUILTIN),
+    (BUILTIN_ILOGBF32, "__builtin_ilogbf32", BUILTIN),
+    (BUILTIN_ILOGBF64, "__builtin_ilogbf64", BUILTIN),
+    (BUILTIN_ILOGBF32X, "__builtin_ilogbf32x", BUILTIN),
+    (BUILTIN_ILOGBF64X, "__builtin_ilogbf64x", BUILTIN),
+    (BUILTIN_ILOGBF128, "__builtin_ilogbf128", BUILTIN),
+    (BUILTIN_LDEXPF32, "__builtin_ldexpf32", BUILTIN),
+    (BUILTIN_LDEXPF64, "__builtin_ldexpf64", BUILTIN),
+    (BUILTIN_LDEXPF32X, "__builtin_ldexpf32x", BUILTIN),
+    (BUILTIN_LDEXPF64X, "__builtin_ldexpf64x", BUILTIN),
+    (BUILTIN_LDEXPF128, "__builtin_ldexpf128", BUILTIN),
+    (BUILTIN_FREXPF32, "__builtin_frexpf32", BUILTIN),
+    (BUILTIN_FREXPF64, "__builtin_frexpf64", BUILTIN),
+    (BUILTIN_FREXPF32X, "__builtin_frexpf32x", BUILTIN),
+    (BUILTIN_FREXPF64X, "__builtin_frexpf64x", BUILTIN),
+    (BUILTIN_FREXPF128, "__builtin_frexpf128", BUILTIN),
+    (BUILTIN_MODFF32, "__builtin_modff32", BUILTIN),
+    (BUILTIN_MODFF64, "__builtin_modff64", BUILTIN),
+    (BUILTIN_MODFF32X, "__builtin_modff32x", BUILTIN),
+    (BUILTIN_MODFF64X, "__builtin_modff64x", BUILTIN),
+    (BUILTIN_MODFF128, "__builtin_modff128", BUILTIN),
+    (BUILTIN_NEXTAFTERF32, "__builtin_nextafterf32", BUILTIN),
+    (BUILTIN_NEXTAFTERF64, "__builtin_nextafterf64", BUILTIN),
+    (BUILTIN_NEXTAFTERF32X, "__builtin_nextafterf32x", BUILTIN),
+    (BUILTIN_NEXTAFTERF64X, "__builtin_nextafterf64x", BUILTIN),
+    (BUILTIN_NEXTAFTERF128, "__builtin_nextafterf128", BUILTIN),
+    (BUILTIN_FDIMF32, "__builtin_fdimf32", BUILTIN),
+    (BUILTIN_FDIMF64, "__builtin_fdimf64", BUILTIN),
+    (BUILTIN_FDIMF32X, "__builtin_fdimf32x", BUILTIN),
+    (BUILTIN_FDIMF64X, "__builtin_fdimf64x", BUILTIN),
+    (BUILTIN_FDIMF128, "__builtin_fdimf128", BUILTIN),
+    (BUILTIN_HYPOTF32, "__builtin_hypotf32", BUILTIN),
+    (BUILTIN_HYPOTF64, "__builtin_hypotf64", BUILTIN),
+    (BUILTIN_HYPOTF32X, "__builtin_hypotf32x", BUILTIN),
+    (BUILTIN_HYPOTF64X, "__builtin_hypotf64x", BUILTIN),
+    (BUILTIN_HYPOTF128, "__builtin_hypotf128", BUILTIN),
     (BUILTIN_FABS,      "__builtin_fabs",     BUILTIN),
     (BUILTIN_FABSF,     "__builtin_fabsf",    BUILTIN),
     (BUILTIN_FABSL,     "__builtin_fabsl",    BUILTIN),
@@ -728,6 +884,13 @@ define_keywords! {
     (BUILTIN_CPU_INIT,     "__builtin_cpu_init",     BUILTIN | X86_64_ONLY),
     (BUILTIN_CPU_SUPPORTS, "__builtin_cpu_supports", BUILTIN | X86_64_ONLY),
     (BUILTIN_CPU_IS,       "__builtin_cpu_is",       BUILTIN | X86_64_ONLY),
+    // One machine instruction each: `parse::ast::MachineOp`.
+    (BUILTIN_IA32_RDTSC,    "__builtin_ia32_rdtsc",    BUILTIN | X86_64_ONLY),
+    (BUILTIN_IA32_RDTSCP,   "__builtin_ia32_rdtscp",   BUILTIN | X86_64_ONLY),
+    (BUILTIN_IA32_CVTPD2PS, "__builtin_ia32_cvtpd2ps", BUILTIN | X86_64_ONLY),
+    (BUILTIN_THREAD_POINTER, "__builtin_thread_pointer", BUILTIN),
+    // <tgmath.h>'s: the call its arguments pick of its functions.
+    (BUILTIN_TGMATH,        "__builtin_tgmath",        BUILTIN),
     (CPU_MODEL,            "__cpu_model",            0),
     (CPU_FEATURES2,        "__cpu_features2",        0),
     (CPU_INDICATOR_INIT,   "__cpu_indicator_init",   0),
@@ -746,6 +909,11 @@ define_keywords! {
     (_, "__builtin___strcpy_chk", BUILTIN),
     (_, "__builtin___strncat_chk", BUILTIN),
     (_, "__builtin___strncpy_chk", BUILTIN),
+    (_, "__builtin___stpncpy_chk", BUILTIN),
+    (_, "__builtin___vsprintf_chk", BUILTIN),
+    (_, "__builtin___memccpy_chk", BUILTIN),
+    (_, "__builtin___strlcpy_chk", BUILTIN),
+    (_, "__builtin___strlcat_chk", BUILTIN),
 
     // ---- C11 atomic builtins (BUILTIN) ----
     (C11_ATOMIC_INIT,    "__c11_atomic_init",    BUILTIN),
@@ -762,16 +930,12 @@ define_keywords! {
     (C11_ATOMIC_THREAD_FENCE, "__c11_atomic_thread_fence", BUILTIN),
     (C11_ATOMIC_SIGNAL_FENCE, "__c11_atomic_signal_fence", BUILTIN),
 
-    // ---- setjmp/longjmp (special-cased in parser, not true builtins) ----
+    // ---- Library functions the parser special-cases ----
     // gcc predefines bare `alloca` as well as `__builtin_alloca`, and code in
     // the wild calls it without including <alloca.h>. Tagged 0, not BUILTIN:
     // `__has_builtin` asks about the reserved spelling, and a user declaration
     // may still displace this one (see `builtin_is_shadowed`).
     (ALLOCA,            "alloca",            0),
-    (SETJMP,            "setjmp",            0),
-    (SETJMP2,           "_setjmp",           0),
-    (LONGJMP,           "longjmp",           0),
-    (LONGJMP2,          "_longjmp",          0),
 
     // ---- Plain spellings of libm entry points ----
     // gcc recognizes the standard names whether or not <math.h> was included,
@@ -796,6 +960,155 @@ define_keywords! {
     (COPYSIGNQ,         "copysignq",         0),
     (SQRTF128,          "sqrtf128",          0),
     (FMAF128,           "fmaf128",           0),
+    (ROUNDEVEN, "roundeven", 0),
+    (ROUNDEVENF, "roundevenf", 0),
+    (ROUNDEVENL, "roundevenl", 0),
+    (ROUNDEVENF32, "roundevenf32", 0),
+    (ROUNDEVENF64, "roundevenf64", 0),
+    (ROUNDEVENF32X, "roundevenf32x", 0),
+    (ROUNDEVENF64X, "roundevenf64x", 0),
+    (ROUNDEVENF128, "roundevenf128", 0),
+    (LRINT, "lrint", 0),
+    (LRINTF, "lrintf", 0),
+    (LRINTL, "lrintl", 0),
+    (LRINTF32, "lrintf32", 0),
+    (LRINTF64, "lrintf64", 0),
+    (LRINTF32X, "lrintf32x", 0),
+    (LRINTF64X, "lrintf64x", 0),
+    (LRINTF128, "lrintf128", 0),
+    (LLRINT, "llrint", 0),
+    (LLRINTF, "llrintf", 0),
+    (LLRINTL, "llrintl", 0),
+    (LLRINTF32, "llrintf32", 0),
+    (LLRINTF64, "llrintf64", 0),
+    (LLRINTF32X, "llrintf32x", 0),
+    (LLRINTF64X, "llrintf64x", 0),
+    (LLRINTF128, "llrintf128", 0),
+    (LROUND, "lround", 0),
+    (LROUNDF, "lroundf", 0),
+    (LROUNDL, "lroundl", 0),
+    (LROUNDF32, "lroundf32", 0),
+    (LROUNDF64, "lroundf64", 0),
+    (LROUNDF32X, "lroundf32x", 0),
+    (LROUNDF64X, "lroundf64x", 0),
+    (LROUNDF128, "lroundf128", 0),
+    (LLROUND, "llround", 0),
+    (LLROUNDF, "llroundf", 0),
+    (LLROUNDL, "llroundl", 0),
+    (LLROUNDF32, "llroundf32", 0),
+    (LLROUNDF64, "llroundf64", 0),
+    (LLROUNDF32X, "llroundf32x", 0),
+    (LLROUNDF64X, "llroundf64x", 0),
+    (LLROUNDF128, "llroundf128", 0),
+    (SCALBN, "scalbn", 0),
+    (SCALBNF, "scalbnf", 0),
+    (SCALBNL, "scalbnl", 0),
+    (SCALBNF32, "scalbnf32", 0),
+    (SCALBNF64, "scalbnf64", 0),
+    (SCALBNF32X, "scalbnf32x", 0),
+    (SCALBNF64X, "scalbnf64x", 0),
+    (SCALBNF128, "scalbnf128", 0),
+    (SCALBLN, "scalbln", 0),
+    (SCALBLNF, "scalblnf", 0),
+    (SCALBLNL, "scalblnl", 0),
+    (SCALBLNF32, "scalblnf32", 0),
+    (SCALBLNF64, "scalblnf64", 0),
+    (SCALBLNF32X, "scalblnf32x", 0),
+    (SCALBLNF64X, "scalblnf64x", 0),
+    (SCALBLNF128, "scalblnf128", 0),
+    (ROUNDF32, "roundf32", 0),
+    (ROUNDF64, "roundf64", 0),
+    (ROUNDF32X, "roundf32x", 0),
+    (ROUNDF64X, "roundf64x", 0),
+    (ROUNDF128, "roundf128", 0),
+    (RINTF32, "rintf32", 0),
+    (RINTF64, "rintf64", 0),
+    (RINTF32X, "rintf32x", 0),
+    (RINTF64X, "rintf64x", 0),
+    (RINTF128, "rintf128", 0),
+    (NEARBYINTF32, "nearbyintf32", 0),
+    (NEARBYINTF64, "nearbyintf64", 0),
+    (NEARBYINTF32X, "nearbyintf32x", 0),
+    (NEARBYINTF64X, "nearbyintf64x", 0),
+    (NEARBYINTF128, "nearbyintf128", 0),
+    (TRUNCF32, "truncf32", 0),
+    (TRUNCF64, "truncf64", 0),
+    (TRUNCF32X, "truncf32x", 0),
+    (TRUNCF64X, "truncf64x", 0),
+    (TRUNCF128, "truncf128", 0),
+    (FLOORF32, "floorf32", 0),
+    (FLOORF64, "floorf64", 0),
+    (FLOORF32X, "floorf32x", 0),
+    (FLOORF64X, "floorf64x", 0),
+    (FLOORF128, "floorf128", 0),
+    (CEILF32, "ceilf32", 0),
+    (CEILF64, "ceilf64", 0),
+    (CEILF32X, "ceilf32x", 0),
+    (CEILF64X, "ceilf64x", 0),
+    (CEILF128, "ceilf128", 0),
+    (LOGBF32, "logbf32", 0),
+    (LOGBF64, "logbf64", 0),
+    (LOGBF32X, "logbf32x", 0),
+    (LOGBF64X, "logbf64x", 0),
+    (LOGBF128, "logbf128", 0),
+    (SQRTF32, "sqrtf32", 0),
+    (SQRTF64, "sqrtf64", 0),
+    (SQRTF32X, "sqrtf32x", 0),
+    (SQRTF64X, "sqrtf64x", 0),
+    (CBRTF32, "cbrtf32", 0),
+    (CBRTF64, "cbrtf64", 0),
+    (CBRTF32X, "cbrtf32x", 0),
+    (CBRTF64X, "cbrtf64x", 0),
+    (CBRTF128, "cbrtf128", 0),
+    (FMINF32, "fminf32", 0),
+    (FMINF64, "fminf64", 0),
+    (FMINF32X, "fminf32x", 0),
+    (FMINF64X, "fminf64x", 0),
+    (FMINF128, "fminf128", 0),
+    (FMAXF32, "fmaxf32", 0),
+    (FMAXF64, "fmaxf64", 0),
+    (FMAXF32X, "fmaxf32x", 0),
+    (FMAXF64X, "fmaxf64x", 0),
+    (FMAXF128, "fmaxf128", 0),
+    (FMAF32, "fmaf32", 0),
+    (FMAF64, "fmaf64", 0),
+    (FMAF32X, "fmaf32x", 0),
+    (FMAF64X, "fmaf64x", 0),
+    (ILOGBF32, "ilogbf32", 0),
+    (ILOGBF64, "ilogbf64", 0),
+    (ILOGBF32X, "ilogbf32x", 0),
+    (ILOGBF64X, "ilogbf64x", 0),
+    (ILOGBF128, "ilogbf128", 0),
+    (LDEXPF32, "ldexpf32", 0),
+    (LDEXPF64, "ldexpf64", 0),
+    (LDEXPF32X, "ldexpf32x", 0),
+    (LDEXPF64X, "ldexpf64x", 0),
+    (LDEXPF128, "ldexpf128", 0),
+    (FREXPF32, "frexpf32", 0),
+    (FREXPF64, "frexpf64", 0),
+    (FREXPF32X, "frexpf32x", 0),
+    (FREXPF64X, "frexpf64x", 0),
+    (FREXPF128, "frexpf128", 0),
+    (MODFF32, "modff32", 0),
+    (MODFF64, "modff64", 0),
+    (MODFF32X, "modff32x", 0),
+    (MODFF64X, "modff64x", 0),
+    (MODFF128, "modff128", 0),
+    (NEXTAFTERF32, "nextafterf32", 0),
+    (NEXTAFTERF64, "nextafterf64", 0),
+    (NEXTAFTERF32X, "nextafterf32x", 0),
+    (NEXTAFTERF64X, "nextafterf64x", 0),
+    (NEXTAFTERF128, "nextafterf128", 0),
+    (FDIMF32, "fdimf32", 0),
+    (FDIMF64, "fdimf64", 0),
+    (FDIMF32X, "fdimf32x", 0),
+    (FDIMF64X, "fdimf64x", 0),
+    (FDIMF128, "fdimf128", 0),
+    (HYPOTF32, "hypotf32", 0),
+    (HYPOTF64, "hypotf64", 0),
+    (HYPOTF32X, "hypotf32x", 0),
+    (HYPOTF64X, "hypotf64x", 0),
+    (HYPOTF128, "hypotf128", 0),
     (COPYSIGN,          "copysign",          0),
     (COPYSIGNF,         "copysignf",         0),
     (COPYSIGNL,         "copysignl",         0),
@@ -882,6 +1195,11 @@ define_keywords! {
     (VSNPRINTF_CHK,     "__vsnprintf_chk",      0),
     (VPRINTF_CHK,       "__vprintf_chk",        0),
     (VFPRINTF_CHK,      "__vfprintf_chk",       0),
+    // Darwin's own: its `<secure/_string.h>` calls them through the
+    // `__builtin___` spelling, and its C library has them.
+    (MEMCCPY_CHK,       "__memccpy_chk",        0),
+    (STRLCPY_CHK,       "__strlcpy_chk",        0),
+    (STRLCAT_CHK,       "__strlcat_chk",        0),
     // Same reason, for the builtins that are just the library function: a
     // translation unit may call `__builtin_strlen` without having included
     // the header that declares `strlen`, exactly as gcc allows.
@@ -1092,13 +1410,13 @@ define_keywords! {
     (MALLOC, "malloc",               SUPPORTED_ATTR),
     (_, "pure",                 SUPPORTED_ATTR),
     (_, "sentinel",             SUPPORTED_ATTR),
-    (_, "no_sanitize_memory",   SUPPORTED_ATTR),
     (_, "no_sanitize_address",  SUPPORTED_ATTR),
     (_, "no_sanitize_thread",   SUPPORTED_ATTR),
     (_, "gnu_inline",              SUPPORTED_ATTR),
     (_, "artificial",              SUPPORTED_ATTR),
     (_, "sysv_abi",                SUPPORTED_ATTR | X86_64_ONLY),
     (_, "ms_abi",                  SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "nocf_check",              SUPPORTED_ATTR),
     (_, "mode",                    SUPPORTED_ATTR),
     (_, "vector_size",             SUPPORTED_ATTR),
     (_, "scalar_storage_order",    SUPPORTED_ATTR),
@@ -1112,21 +1430,22 @@ define_keywords! {
     (_, "access",                  SUPPORTED_ATTR),
     (_, "returns_twice",           SUPPORTED_ATTR),
     (_, "externally_visible",      SUPPORTED_ATTR),
-    (_, "abi_tag",                 SUPPORTED_ATTR),
     (_, "weakref",                 SUPPORTED_ATTR),
     (_, "transparent_union",       SUPPORTED_ATTR),
     (_, "simd",                    SUPPORTED_ATTR),
-    (_, "regparm",                 SUPPORTED_ATTR),
+    (_, "regparm",                 SUPPORTED_ATTR | X86_64_ONLY),
     (_, "leaf",                    SUPPORTED_ATTR),
     (_, "alloc_size",              SUPPORTED_ATTR),
     (_, "alloc_align",             SUPPORTED_ATTR),
+    (_, "assume_aligned",          SUPPORTED_ATTR),
     (_, "noclone",                 SUPPORTED_ATTR),
     (_, "no_instrument_function",  SUPPORTED_ATTR),
-    (_, "nonnull_if_nonzero",      SUPPORTED_ATTR),
     (_, "copy",                    SUPPORTED_ATTR),
     (_, "designated_init",         SUPPORTED_ATTR),
     (_, "may_alias",               SUPPORTED_ATTR),
-    // How gcc optimizes one function, which ignoring cannot make wrong.
+    // How gcc optimizes one function, which ignoring cannot make wrong --
+    // but for a stack-protector option, which sets the function's level
+    // (`AttributeList::optimize_stack_protector`).
     (_, "optimize",                SUPPORTED_ATTR),
     // GNU forms (__foo__)
     // Note: __noreturn__ is already defined above with NORETURN_KW | SUPPORTED_ATTR
@@ -1152,13 +1471,13 @@ define_keywords! {
     (_, "__malloc__",           SUPPORTED_ATTR),
     (_, "__pure__",             SUPPORTED_ATTR),
     (_, "__sentinel__",         SUPPORTED_ATTR),
-    (_, "__no_sanitize_memory__",    SUPPORTED_ATTR),
     (_, "__no_sanitize_address__",   SUPPORTED_ATTR),
     (_, "__no_sanitize_thread__",    SUPPORTED_ATTR),
     (_, "__gnu_inline__",            SUPPORTED_ATTR),
     (_, "__artificial__",            SUPPORTED_ATTR),
     (_, "__sysv_abi__",              SUPPORTED_ATTR | X86_64_ONLY),
     (_, "__ms_abi__",                SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__nocf_check__",            SUPPORTED_ATTR),
     (_, "__mode__",                  SUPPORTED_ATTR),
     (_, "__vector_size__",           SUPPORTED_ATTR),
     (_, "__scalar_storage_order__",  SUPPORTED_ATTR),
@@ -1168,17 +1487,16 @@ define_keywords! {
     (_, "__access__",                SUPPORTED_ATTR),
     (_, "__returns_twice__",         SUPPORTED_ATTR),
     (_, "__externally_visible__",    SUPPORTED_ATTR),
-    (_, "__abi_tag__",               SUPPORTED_ATTR),
     (_, "__weakref__",               SUPPORTED_ATTR),
     (_, "__transparent_union__",     SUPPORTED_ATTR),
     (_, "__simd__",                  SUPPORTED_ATTR),
-    (_, "__regparm__",               SUPPORTED_ATTR),
+    (_, "__regparm__",               SUPPORTED_ATTR | X86_64_ONLY),
     (_, "__leaf__",                  SUPPORTED_ATTR),
     (_, "__alloc_size__",            SUPPORTED_ATTR),
     (_, "__alloc_align__",           SUPPORTED_ATTR),
+    (_, "__assume_aligned__",        SUPPORTED_ATTR),
     (_, "__noclone__",               SUPPORTED_ATTR),
     (_, "__no_instrument_function__", SUPPORTED_ATTR),
-    (_, "__nonnull_if_nonzero__",    SUPPORTED_ATTR),
     (_, "__copy__",                  SUPPORTED_ATTR),
     (_, "__designated_init__",       SUPPORTED_ATTR),
     (_, "__may_alias__",             SUPPORTED_ATTR),
@@ -1231,6 +1549,71 @@ define_keywords! {
     (_, "__stack_protect__",         SUPPORTED_ATTR),
     (_, "no_stack_protector",        SUPPORTED_ATTR),
     (_, "__no_stack_protector__",    SUPPORTED_ATTR),
+    // gcc's spellings of `signed`, keywords as in gcc rather than macros, so
+    // `#ifdef __signed__` is false and `-E` keeps them. Appended, as above.
+    (GNU_SIGNED,        "__signed__",        TYPE_SPEC | TYPE_KEYWORD),
+    (GNU_SIGNED2,       "__signed",          TYPE_SPEC | TYPE_KEYWORD),
+    // `__extension__`: marks a GNU construct. Taken before a declaration,
+    // a block item or a member declaration, and as a unary prefix; it means
+    // nothing else. Appended, as above.
+    (GNU_EXTENSION,     "__extension__",     RESERVED_NAME),
+    // `uninitialized`: an automatic variable `-ftrivial-auto-var-init`
+    // leaves alone. Appended, as above.
+    (_, "uninitialized",             SUPPORTED_ATTR),
+    (_, "__uninitialized__",         SUPPORTED_ATTR),
+    // `indirect_branch` and `function_return`: one function's own
+    // `-mindirect-branch=` and `-mfunction-return=`. x86-64's alone.
+    // Appended, as above.
+    (_, "indirect_branch",           SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__indirect_branch__",       SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "function_return",           SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__function_return__",       SUPPORTED_ATTR | X86_64_ONLY),
+    // `error("msg")` and `warning("msg")`: each call that survives
+    // optimization is reported. The plain spellings are the preprocessor
+    // directives' entries above. Appended, as above.
+    (_, "__error__",                 SUPPORTED_ATTR),
+    (_, "__warning__",               SUPPORTED_ATTR),
+    // `tls_model("...")`: one thread-local's access model. Appended, as
+    // above.
+    (_, "tls_model",                 SUPPORTED_ATTR),
+    (_, "__tls_model__",             SUPPORTED_ATTR),
+    // `format_arg(N)`: a hint for `-Wformat`, which c17 does not check.
+    // `flatten`: every call in the body inlined. `retain`: the definition's
+    // section kept by `ld --gc-sections`. `noipa`: the function opaque to
+    // every interprocedural decision. `no_profile_instrument_function`: no
+    // `-fprofile-arcs` counters, which c17 never inserts. Appended, as
+    // above.
+    (_, "format_arg",                SUPPORTED_ATTR),
+    (_, "__format_arg__",            SUPPORTED_ATTR),
+    (_, "flatten",                   SUPPORTED_ATTR),
+    (_, "__flatten__",               SUPPORTED_ATTR),
+    (_, "retain",                    SUPPORTED_ATTR),
+    (_, "__retain__",                SUPPORTED_ATTR),
+    (_, "noipa",                     SUPPORTED_ATTR),
+    (_, "__noipa__",                 SUPPORTED_ATTR),
+    (_, "no_profile_instrument_function", SUPPORTED_ATTR),
+    (_, "__no_profile_instrument_function__", SUPPORTED_ATTR),
+    // One function's `-fpatchable-function-entry=` and, on x86-64 where
+    // c17 has the option, `-fzero-call-used-regs=`; and x86-64's
+    // `no_caller_saved_registers`. Appended, as above.
+    (_, "patchable_function_entry",  SUPPORTED_ATTR),
+    (_, "__patchable_function_entry__", SUPPORTED_ATTR),
+    (_, "zero_call_used_regs",       SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__zero_call_used_regs__",   SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "no_caller_saved_registers", SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__no_caller_saved_registers__", SUPPORTED_ATTR | X86_64_ONLY),
+    // gcc 13's other ways to exempt a function from a sanitizer, which c17
+    // never inserts (it refuses `-fsanitize=`). Appended, as above.
+    (_, "no_sanitize",               SUPPORTED_ATTR),
+    (_, "__no_sanitize__",           SUPPORTED_ATTR),
+    (_, "no_sanitize_undefined",     SUPPORTED_ATTR),
+    (_, "__no_sanitize_undefined__", SUPPORTED_ATTR),
+    (_, "no_sanitize_coverage",      SUPPORTED_ATTR),
+    (_, "__no_sanitize_coverage__",  SUPPORTED_ATTR),
+    (_, "no_address_safety_analysis", SUPPORTED_ATTR),
+    (_, "__no_address_safety_analysis__", SUPPORTED_ATTR),
+    // `__builtin_has_attribute(T-or-E, attr)`. Appended, as above.
+    (BUILTIN_HAS_ATTRIBUTE, "__builtin_has_attribute", BUILTIN),
 }
 
 // Tag query API
@@ -1259,6 +1642,31 @@ pub fn spelling_exists_on(name: &str, arch: crate::target::Arch) -> bool {
             .iter()
             .zip(KEYWORD_TAGS.iter())
             .any(|(s, &t)| *s == name && t & X86_64_ONLY != 0)
+}
+
+/// What `__has_attribute(id)` answers on a target of architecture `arch`,
+/// as gcc 13 answers it: 0 for an attribute c17 does not support ([`attribute_supported`]);
+/// for one of the standard attributes gcc also knows by its GNU name, the
+/// version of the C standard that added it, in either spelling --
+/// `deprecated` 201904, `fallthrough` 201910, `noreturn` 202202; and 1 for
+/// the rest. `__const` is accepted as an attribute but is no name gcc
+/// answers for, so it answers 0. The one answer both evaluators give.
+pub fn has_attribute(id: StringId, arch: crate::target::Arch) -> i64 {
+    if !attribute_supported(id, arch) {
+        return 0;
+    }
+    let spelled = KEYWORD_STRINGS[id.0 as usize - 1];
+    let bare = spelled
+        .strip_prefix("__")
+        .and_then(|n| n.strip_suffix("__"))
+        .unwrap_or(spelled);
+    match bare {
+        "deprecated" => 201904,
+        "fallthrough" => 201910,
+        "noreturn" => 202202,
+        "__const" => 0,
+        _ => 1,
+    }
 }
 
 /// Is `id` an attribute c17 supports on a target of architecture `arch`?
@@ -1621,6 +2029,12 @@ mod tests {
             "__target_clones__",
             "optimize",
             "__optimize__",
+            "uninitialized",
+            "__uninitialized__",
+            "error",
+            "__error__",
+            "warning",
+            "__warning__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);
@@ -1630,6 +2044,60 @@ mod tests {
                 s
             );
         }
+    }
+
+    /// `__has_attribute` answers as gcc 13 does, on x86-64 and on aarch64,
+    /// in the plain spelling and the `__name__` one, for every attribute
+    /// c17 implements; and 0, as gcc 13 does, for those it answered 1 for
+    /// without gcc 13 knowing them (`abi_tag` is C++'s, the rest newer).
+    /// `zero_call_used_regs` is x86-64's alone in c17, which has no aarch64
+    /// `-fzero-call-used-regs=`.
+    #[test]
+    fn test_has_attribute_answers_as_gcc_13() {
+        use crate::target::Arch;
+        #[rustfmt::skip]
+        let rows: &[(&str, i64, i64)] = &[
+            ("access", 1, 1), ("alias", 1, 1), ("aligned", 1, 1),
+            ("alloc_align", 1, 1), ("alloc_size", 1, 1), ("always_inline", 1, 1),
+            ("artificial", 1, 1), ("assume_aligned", 1, 1), ("cleanup", 1, 1),
+            ("cold", 1, 1), ("const", 1, 1), ("constructor", 1, 1), ("copy", 1, 1),
+            ("deprecated", 201904, 201904), ("designated_init", 1, 1),
+            ("destructor", 1, 1), ("error", 1, 1), ("externally_visible", 1, 1),
+            ("fallthrough", 201910, 201910), ("flatten", 1, 1), ("format", 1, 1),
+            ("format_arg", 1, 1), ("function_return", 1, 0), ("gnu_inline", 1, 1),
+            ("hot", 1, 1), ("ifunc", 1, 1), ("indirect_branch", 1, 0), ("leaf", 1, 1),
+            ("malloc", 1, 1), ("may_alias", 1, 1), ("mode", 1, 1), ("ms_abi", 1, 0),
+            ("no_address_safety_analysis", 1, 1), ("no_caller_saved_registers", 1, 0),
+            ("nocf_check", 1, 1), ("noclone", 1, 1), ("noinline", 1, 1),
+            ("no_instrument_function", 1, 1), ("noipa", 1, 1), ("nonnull", 1, 1),
+            ("nonstring", 1, 1), ("no_profile_instrument_function", 1, 1),
+            ("noreturn", 202202, 202202), ("no_sanitize", 1, 1),
+            ("no_sanitize_address", 1, 1), ("no_sanitize_coverage", 1, 1),
+            ("no_sanitize_thread", 1, 1), ("no_sanitize_undefined", 1, 1),
+            ("no_stack_protector", 1, 1), ("nothrow", 1, 1), ("optimize", 1, 1),
+            ("packed", 1, 1), ("patchable_function_entry", 1, 1), ("pure", 1, 1),
+            ("regparm", 1, 0), ("retain", 1, 1), ("returns_nonnull", 1, 1),
+            ("returns_twice", 1, 1), ("scalar_storage_order", 1, 1), ("section", 1, 1),
+            ("sentinel", 1, 1), ("simd", 1, 1), ("stack_protect", 1, 1),
+            ("sysv_abi", 1, 0), ("target", 1, 1), ("target_clones", 1, 1),
+            ("tls_model", 1, 1), ("transparent_union", 1, 1), ("uninitialized", 1, 1),
+            ("unused", 1, 1), ("used", 1, 1), ("vector_size", 1, 1),
+            ("visibility", 1, 1), ("warning", 1, 1), ("warn_unused_result", 1, 1),
+            ("weak", 1, 1), ("weakref", 1, 1), ("zero_call_used_regs", 1, 0),
+            ("abi_tag", 0, 0), ("nonnull_if_nonzero", 0, 0),
+            ("no_sanitize_memory", 0, 0), ("counted_by", 0, 0),
+        ];
+        let table = StringTable::new();
+        let answer = |name: &str, arch| table.lookup(name).map_or(0, |id| has_attribute(id, arch));
+        for &(name, x86, a64) in rows {
+            let gnu = format!("__{name}__");
+            for spelled in [name, gnu.as_str()] {
+                assert_eq!(answer(spelled, Arch::X86_64), x86, "{spelled} on x86-64");
+                assert_eq!(answer(spelled, Arch::Aarch64), a64, "{spelled} on aarch64");
+            }
+        }
+        // Accepted as an attribute, but no name gcc answers for.
+        assert_eq!(answer("__const", Arch::X86_64), 0);
     }
 
     #[test]

@@ -15,8 +15,7 @@ the keyword tag is not consulted while parsing.
 
 - **Reserved spellings** (`__builtin_*`, `__sync_*`, ...) are never
   displaced, whatever the program declares (C17 7.1.3).
-- **Bare spellings** -- `alloca`, `offsetof`, `setjmp`, `_setjmp`, `longjmp`,
-  `_longjmp`, and the library functions computed in place (`abs`, `fabs`,
+- **Bare spellings** -- `alloca`, `offsetof`, and the library functions computed in place (`abs`, `fabs`,
   `sqrt`, `memcpy`, ...; see below) -- are displaced by `-fno-builtin`,
   `-fno-builtin-NAME`, a declaration that is not a function, and (library
   functions only) a function declaration whose type is not the library
@@ -203,6 +202,7 @@ value gcc folds them to on both targets; at run time they stay undefined.
 | `__builtin_constant_p(expr)` | 1 if `expr` is a compile-time constant, by gcc's rules. A parse-time constant (integer or floating) and the address of a string literal's first character (`"hi"`, `&"hi"[0]`, through a conversion that keeps the representation) answer 1 at once; any other pointer or aggregate, and anything at `-O0`, answers 0 at once. The rest becomes `Opcode::ConstantP` at `-O1`+, which `sccp` resolves to 1 if propagation proves the operand constant -- after inlining, so an inline function's parameter is one where the caller passes a constant -- and `ir::lower` resolves to 0 otherwise. An operand with side effects answers 0 and is not linearized; one that may only trap (`"hi"[0]`, `x / y`) is computed for the question and deleted unrun once it is answered |
 | `__builtin_types_compatible_p(t1, t2)` | `TypeTable::types_compatible` of two type names, top-level qualifiers ignored. **Bug:** an enumerated type is compatible with no integer type here (C17 6.7.2.2p4 makes it compatible with one; gcc uses `unsigned int`, or `int` with a negative enumerator), so `__builtin_types_compatible_p(enum E, unsigned)` is 0 where gcc answers 1, and `_Generic` misses the same association |
 | `__builtin_classify_type(expr)` | A code for the type family after the usual conversions: 0 void, 1 integer (including `char`, enumerations and `_Bool`), 5 pointer (including arrays, functions and string literals), 8 real floating, 9 complex, 12 struct, 13 union. The argument is not evaluated |
+| `__builtin_has_attribute(T-or-E, attr)` | Whether a declaration or a type has an attribute, as an integer constant; the operand is not evaluated. See [ATTR.md](ATTR.md#__builtin_has_attribute) |
 | `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`, selected in the parser; the other arm is parsed (so an undeclared name or unknown member in it is still an error) and then discarded, so it is never evaluated or linearized |
 
 ## Memory
@@ -226,7 +226,8 @@ their `_FloatN`, `_FloatNx` and `q` forms (`fabsf32`, `fabsf64`,
 libm's `fabsf128` and `copysignf128`, there being no sign-bit instruction
 for an XMM-held binary128),
 `sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`, `trunc`, `round`, `rint`,
-`nearbyint`, `fmin`, `fmax`, `fma` and their `f` forms, `creal`, `cimag` and
+`nearbyint`, `roundeven`, `fmin`, `fmax`, `fma`, their `f` forms and their
+`f32`, `f64` and `f32x` forms (`sqrtf64x` too), `creal`, `cimag` and
 `conj` in each precision, and `memcpy`, `memset`, `memmove`, `mempcpy` and
 `bcopy`, under their bare names and their `__builtin_` spellings.
 
@@ -244,10 +245,11 @@ The magnitudes, `copysign`, the complex accessors and the block memory
 functions are computed at every level.
 
 A libm function computed in place is one IR opcode keyed on its type
-(`Sqrt`, `RoundToIntegral`, `FMin`, `FMax`, `Fma`; `Opcode::is_libm`). Where
+(`Sqrt`, `RoundToIntegral`, `RoundToInteger`, `FMin`, `FMax`, `Fma`; `Opcode::is_libm`). Where
 the target has no instruction for that type (`ArchMapper::computes_in_place`:
-binary128 on aarch64; `round`, `nearbyint`, `fmin`, `fmax` and `fma` on
-x86-64) `call_library_fallbacks` turns it back into a call to the function
+binary128 on aarch64; on x86-64 `round`, `fmin` and `fmax`, and
+`nearbyint`, `roundeven` and `fma` unless the function's ISA has SSE4.1 or
+FMA) `call_library_fallbacks` turns it back into a call to the function
 the instruction names, after the optimizer, which could still fold it.
 
 Displacement: every bare name yields to `-fno-builtin[-NAME]`, a non-function
@@ -265,8 +267,9 @@ complex accessors do not (defining a reserved library name is undefined, C17
 | `fabs`, `fabsf`, `fabsl` | `Opcode::Fabs`: clears the sign bit and nothing else, so `-0.0` becomes `+0.0` and a NaN keeps its payload and raises nothing. Never a call; `fabs(x) < 0.0` folds to 0 |
 | `copysign`, `copysignf`, `copysignl` | `Opcode::CopySign`: moves one bit, from a zero or a NaN as from anything else. Never a call. `bits/floatn.h` uses `__builtin_copysignf` |
 | `sqrt`, `sqrtf`, `sqrtl` | `Opcode::Sqrt`: `sqrtsd`/`sqrtss` and x87 `fsqrt` on x86-64, `fsqrt` on aarch64; binary128 (`sqrtl` on aarch64 Linux) is a call. With `-fmath-errno` (the default) an argument with `x < 0` (ordered, so not `-0` or NaN) still calls the library to set `EDOM`; `-fno-math-errno` drops that call, and then `sqrt(x) < 0` folds to 0. A constant folds, in a static initializer too, except a negative one |
-| `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint`, `f` forms | `Opcode::RoundToIntegral`: `frintm`, `frintp`, `frintz`, `frinta`, `frintx`, `frinti` on aarch64. On x86-64 (no `roundsd` in the baseline) gcc's SSE2 sequences for `floor`, `ceil`, `trunc` and `rint`, which set the result's sign rather than or-ing it in, so they are right in every rounding direction; `round` and `nearbyint` are calls. A `float` argument to the `double` function is computed by the `f` form (`NarrowedLibraryCall`): exact, because the result is an integer no larger than `x`; the call is still a `double` and still names `floor`. Constants fold, except a `rint`/`nearbyint` of a non-integer, whose answer depends on the rounding direction |
-| `fmin`, `fmax`, `fma`, `f` forms | `fminnm`, `fmaxnm`, `fmadd` on aarch64; calls on x86-64 (no FMA in the baseline; `minsd` does not ignore a NaN). Constants fold on both targets: `fmin(+0, -0)` is -0 and `fmax(-0, +0)` +0; a NaN argument is not a constant in a static initializer |
+| `floor`, `ceil`, `trunc`, `round`, `rint`, `nearbyint`, `roundeven`, `f` forms | `Opcode::RoundToIntegral`: `frintm`, `frintp`, `frintz`, `frinta`, `frintx`, `frinti`, `frintn` on aarch64. On x86-64 with SSE4.1 (`-msse4.1`, `target("sse4.1")`) `roundss`/`roundsd` with gcc's immediates for all but `round`; without it (no `roundsd` in the baseline) gcc's SSE2 sequences for `floor`, `ceil`, `trunc` and `rint`, which set the result's sign rather than or-ing it in, so they are right in every rounding direction; `round`, `nearbyint` and `roundeven` are calls. A `float` argument to the `double` function is computed by the `f` form (`NarrowedLibraryCall`): exact, because the result is an integer no larger than `x`; the call is still a `double` and still names `floor`. Constants fold, except a `rint`/`nearbyint` of a non-integer, whose answer depends on the rounding direction |
+| `lrint`, `llrint`, `lround`, `llround`, `f` forms | Calls under `-fmath-errno` (the default), at every level, since an argument out of range is a domain error. Under `-fno-math-errno` `Opcode::RoundToInteger`, as gcc: `lrint` is `cvtsd2si`/`cvtss2si` on x86-64, which converts in the current rounding direction, and `frintx` then `fcvtzs` on aarch64; `lround` is `fcvtas` on aarch64 and a call on x86-64, which has no instruction that ties away from zero. `long double` and the `_FloatN` forms are calls. A constant folds only where no rounding direction and no range matters: an `lround`, or an `lrint` of an integral value, that fits |
+| `fmin`, `fmax`, `fma`, `f` forms | `fminnm`, `fmaxnm`, `fmadd` on aarch64; calls on x86-64 (`minsd` does not ignore a NaN), but for `fma` in a function whose ISA has FMA or AVX512F (`vfmadd213`/`vfmadd231`) or FMA4 (`vfmadd`), where `__FP_FAST_FMA` says so. Constants fold on both targets: `fmin(+0, -0)` is -0 and `fmax(-0, +0)` +0; a NaN argument is not a constant in a static initializer |
 | `creal`, `cimag`, `conj` (each precision) | The half read in place, as `__real__`/`__imag__` read it; `conj` negates the imaginary half as `~z` does, so a zero imaginary part becomes -0. The argument converts to the suffix's complex type first (`crealf` of a `double _Complex` is the rounded `float` half) |
 | `memcpy`, `memset`, `memmove` | `Opcode::Memcpy` / `Memset` / `Memmove`, at every level |
 | `mempcpy` | A `Memcpy` and an `Add`; `mempcpy` itself is never called |
@@ -285,7 +288,10 @@ a length that inlining or SCCP makes constant is expanded too; the stored
 bytes are then forwarded like any others (`unsigned x = 5, y; memcpy(&y, &x,
 4); return y + 1;` returns the constant 6). No alignment is assumed.
 `memmove` loads every chunk before storing any, which is why its limit is
-lower. A longer or variable length is a call. The linearizer's own aggregate
+lower. On x86-64 a `Memset` or `Memcpy` of a longer constant length, up to
+gcc's 8 KB, is `rep stosq` or `rep movsq` and the ragged tail, at every
+level, as gcc emits it (glibc's configure probes for exactly that). A longer
+or variable length is a call. The linearizer's own aggregate
 copies use the same chunks and limit.
 
 Optimizing, a `Memmove` whose blocks cannot overlap becomes a `Memcpy`
@@ -386,14 +392,16 @@ C23 7.12.17.1 requires. The results are exact.
 | `__builtin_return_address(level)` | `Opcode::ReturnAddress` |
 | `__builtin_extract_return_addr(addr)` | The identity on both targets (it exists for ARM Thumb's flag bit); `addr` is evaluated once |
 | `__builtin___clear_cache(begin, end)` | A call to libgcc's `__clear_cache`: a no-op on x86-64, required on AArch64 for code written as data |
-| `setjmp(env)`, `_setjmp(env)` | Bare names parsed as builtins: `Opcode::Setjmp`, calling the library function under the name its declaration gives it. `setjmp()` with no argument is an ordinary unprototyped call |
-| `longjmp(env, val)`, `_longjmp(env, val)` | `Opcode::Longjmp`, a terminator |
-| `__builtin_setjmp(buf)` | `int (void *)`. `Opcode::Setjmp` with `JmpKind::Builtin`: inline code, no library call. Returns 0, and 1 when resumed |
-| `__builtin_longjmp(buf, 1)` | `void (void *, int)`. `Opcode::Longjmp` with `JmpKind::Builtin`, a terminator. A value other than the constant 1 is an error, as in gcc |
+| `__builtin_setjmp(buf)` | `int (void *)`. `Opcode::Setjmp`: inline code, no library call. Returns 0, and 1 when resumed |
+| `__builtin_longjmp(buf, 1)` | `void (void *, int)`. `Opcode::Longjmp`, a terminator. A value other than the constant 1 is an error, as in gcc |
 
-`setjmp` and `longjmp` are displaced only by a declaration that is not a
-function, or by `-fno-builtin`; `<setjmp.h>`'s function declarations keep
-them.
+The library's `setjmp`, `_setjmp`, `sigsetjmp`, `longjmp` and the rest are
+not builtins: each is an ordinary call of the function the program names,
+after <setjmp.h>'s macros (glibc's `setjmp(env)` is `_setjmp(env)`, which
+saves no signal mask). A direct call of `setjmp`, `sigsetjmp` (under up to
+two leading underscores), `savectx`, `vfork`, `getcontext`, or a function
+declared `returns_twice`, returns twice, and is treated as `__builtin_setjmp`
+is in what follows except the prologue (see ATTR.md).
 
 `__builtin_setjmp` stores gcc's layout in the first three of its five words:
 the frame pointer, the address of a resume label inside the instruction's own
@@ -403,7 +411,7 @@ code is the same on every target, Mach-O included. No signal mask and no
 other register is saved, so the function containing the setjmp:
 
 - keeps no value in a register across it: the setjmp is a constraint point
-  that clobbers every allocatable register (`builtin_setjmp_constraint`), and
+  that clobbers every allocatable register (`returns_twice_constraint`), and
   a call-like opcode, so floating values go to the stack too;
 - saves every callee-saved register in its prologue, since the jump skips the
   epilogues of the frames it unwinds;
@@ -518,7 +526,18 @@ implicit declaration of one of these names takes the row's return type.
 | `__builtin_cpow`, `cpowf`, `cpowl` | Through the complex prototype, so a real argument converts to it (`__builtin_cpow(x, 75)`) |
 | `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `ilogb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
 | `__builtin_modf`, `frexp`, `ldexp` and `f`/`l` forms | The second parameter is a pointer or an `int` |
-| `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl`, `fminl`, `fmaxl`, `fmal` | The `long double` forms of functions computed in place |
+| `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl`, `roundevenl`, `fminl`, `fmaxl`, `fmal` | The `long double` forms of functions computed in place, and their `f64x` and `f128` forms |
+| `__builtin_lrintl`, `llrintl`, `lroundl`, `llroundl`, `scalbn`, `scalbln` and every type's form of each (`f`, `l`, `f32`, `f64`, `f32x`, `f64x`, `f128`), and the `_FloatN` forms of `lrint`, `llrint`, `lround`, `llround` | Calls |
+| `__builtin_logbf32`, ..., and the `_FloatN`/`_FloatNx` forms of `logb`, `ilogb`, `cbrt`, `ldexp`, `frexp`, `modf`, `nextafter`, `fdim`, `hypot` | Calls of the function of the builtin's own name (`hypotf128`), as gcc's |
+
+### Machine instructions and type-generic calls
+
+| Builtin | Notes |
+|---------|-------|
+| `__builtin_ia32_rdtsc()`, `__builtin_ia32_rdtscp(unsigned *)` | x86-64 only: `rdtsc`/`rdtscp` as an asm statement's outputs (`ExprKind::MachineBuiltin`); `<x86intrin.h>`'s `__rdtsc` and `__rdtscp` are these |
+| `__builtin_ia32_cvtpd2ps(v2df)` | x86-64 only: both lanes rounded to `float` in the current direction, the upper two 0; `_mm_cvtpd_ps` is this |
+| `__builtin_thread_pointer()` | `%fs:0` on x86-64 (`%gs:0` on Darwin), `tpidr_el0` on aarch64 |
+| `__builtin_tgmath(functions..., arguments...)` | The call of the function C2x's type-generic rules pick (`parse/tgmath_builtin.rs`), with gcc 13's diagnostics; each argument is evaluated once |
 
 ### Calls the optimizer folds
 
@@ -562,7 +581,7 @@ incompatible declaration keep the bare name's call.
 | Builtin | Description |
 |---------|-------------|
 | `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into. Folded at parse time (`parse_object_size`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Anything else becomes `Opcode::ObjectSize` at `-O1`+, answered by `ir::objsize` after inlining by walking the pointer back through copies, constant displacements, `?:` and phis to a local, a named object, a string literal or a constant `alloca` -- the largest arm for types 0/1, the smallest for 2/3. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3, given at `-O0`, for an operand with side effects, and for whatever the walk cannot see once the optimizer has converged. Type 1 through the IR is the whole object's remaining size, and type 3 is 0 (see `DECISIONS.md`). `type` must be an integer constant from 0 to 3 |
-| `__builtin_dynamic_object_size(ptr, type)` | The same builtin: every static answer is a correct one for it, and c17 gives no run-time sizes |
+| `__builtin_dynamic_object_size(ptr, type)` | Every answer `__builtin_object_size` gives, and, once the optimizer has converged, a size computed at run time where the builtin is (`ir::objsize`): `malloc(n)`, `realloc(p, n)` and an `alloc_size` function are their size argument, `calloc(n, m)` and `alloc_size(i, j)` the product, `strdup(s)` is `strlen(s) + 1` (a `strlen` call placed before it), `strndup(s, n)` at most `n + 1` and at least 1, an `alloca` or VLA its byte size, a parameter with `access(mode, ref, size)` that parameter's elements; a run-time displacement into any object is subtracted, saturating at 0; a `?:` between objects is a select of their sizes, and a phi their largest (types 0/1) or smallest (2/3). A size built from a value not defined before the builtin -- one a phi's incoming edge alone defines -- is unknown. Type 3 of the start of an allocated object is its size; type 3 elsewhere through the IR is 0, as for the static form. At `-O0` only an object of fixed size at a run-time displacement is answered (`fixed + m` is `sizeof fixed - m`), as gcc does. glibc's `_FORTIFY_SOURCE=3` does not use it under c17: it takes level 3 only for gcc 12 or clang 9, and c17 claims gcc 8, so glibc falls back to level 2's `__builtin_object_size`. No `counted_by`, which gcc 13 lacks too (see [ATTR.md](ATTR.md#not-recognised)) |
 | `__builtin___memcpy_chk`, `memmove_chk`, `mempcpy_chk`, `memset_chk` | Calls to `__memcpy_chk` etc., decided at `-O1`+ as below |
 | `__builtin___strcpy_chk`, `stpcpy_chk`, `strncpy_chk`, `stpncpy_chk`, `strcat_chk`, `strncat_chk` | |
 | `__builtin___sprintf_chk`, `snprintf_chk`, `vsprintf_chk`, `vsnprintf_chk` | |

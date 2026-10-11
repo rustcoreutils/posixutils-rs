@@ -20,7 +20,7 @@ use super::linkage::Declared;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Linkage, Namespace, Symbol, SymbolId};
+use crate::symbol::{DeclaredAt, Linkage, Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -102,9 +102,9 @@ impl DeclSpecs {
 
 /// What binding one declarator produced.
 enum Bound {
-    Decl(InitDeclarator),
+    Decl(Box<InitDeclarator>),
     /// Only ever the first declarator at file scope: `int f(void) { .. }`.
-    FuncDef(super::ast::FunctionDef),
+    FuncDef(Box<super::ast::FunctionDef>),
     /// A block-scope redeclaration the symbol table refused, which binds
     /// nothing new.
     Nothing,
@@ -214,8 +214,8 @@ impl Parser<'_> {
                 // label.
                 self.skip_extensions_after_declarator();
                 match self.bind_declarator(&specs, d, scope, first)? {
-                    Bound::FuncDef(def) => return Ok(ExternalDecl::FunctionDef(def)),
-                    Bound::Decl(d) => declarators.push(d),
+                    Bound::FuncDef(def) => return Ok(ExternalDecl::FunctionDef(*def)),
+                    Bound::Decl(d) => declarators.push(*d),
                     Bound::Nothing => {}
                 }
                 if !self.is_special(b',') {
@@ -389,6 +389,7 @@ impl Parser<'_> {
         let ParsedDeclarator {
             name,
             pos,
+            name_pos,
             mut typ,
             mut vla,
             vla_pos,
@@ -425,7 +426,9 @@ impl Parser<'_> {
 
         let is_fn = self.types.kind(typ) == TypeKind::Function;
         self.check_derived_types(typ, name, pos);
-        if !is_typedef {
+        if is_typedef {
+            self.check_typedef_function_specifiers(specs, name, pos);
+        } else {
             self.check_storage_for_declarator(specs, name, is_fn, scope, pos);
         }
         let fn_attrs = if is_fn {
@@ -463,8 +466,18 @@ impl Parser<'_> {
                     );
                 }
                 let params = params.map(|list| list.params);
+                // gcc saves no SSE register for such a function, and so
+                // compiles none while SSE is enabled.
+                if attrs.saves_all_registers && self.x86_isa.has_sse() {
+                    diag::error(
+                        pos,
+                        "sorry, unimplemented: SSE instructions aren't allowed in a function \
+                         with the 'no_caller_saved_registers' attribute",
+                    );
+                }
+                self.record_written_attrs(super::has_attribute::WrittenOn::Linked(name));
                 let def = self.define_function(specs, name, pos, typ, params, attrs.clone())?;
-                return Ok(Bound::FuncDef(def));
+                return Ok(Bound::FuncDef(Box::new(def)));
             }
         }
 
@@ -473,9 +486,10 @@ impl Parser<'_> {
         if (is_typedef || is_fn) && scope == (DeclScope::Block { for_init: true }) {
             self.report_for_init_non_variable(name, pos);
         }
-        let (symbol, init) = if is_typedef {
+        let (symbol, init, linkage) = if is_typedef {
             typ = self.align_typedef_type(typ, align);
-            (self.bind_typedef_name(scope, name, pos, typ, &vla)?, None)
+            let symbol = self.bind_typedef_name(scope, name, pos, typ, &vla)?;
+            (symbol, None, Linkage::None)
         } else {
             // gcc words this ahead of anything the declaration conflicts with.
             if !is_fn && (inferred_init.is_some() || self.is_special(b'=')) {
@@ -486,25 +500,40 @@ impl Parser<'_> {
             // declaration has linkage (6.2.2p3, p5); at block scope only an
             // `extern` one or a function does (6.2.2p4, p5).
             let has_linkage = scope == DeclScope::File || is_fn || specs.is_extern();
+            if !is_fn
+                && matches!(scope, DeclScope::Block { .. })
+                && !specs.storage_class.intersects(NO_AUTO_DURATION)
+            {
+                self.reject_address_space(typ, "auto variable", name, pos);
+            }
             typ = self.composite_with_prior_declaration(name, typ, has_linkage);
             self.check_redeclaration(name, typ, pos, Redeclared::Declaration);
+            // An initializer makes an object's declaration a definition
+            // (6.9.2p1); one without is at most a tentative definition.
+            let defines = !is_fn && self.is_special(b'=');
             let linkage = self.declare_linkage(Declared {
                 name,
                 typ,
                 pos,
+                name_pos,
                 storage: specs.storage_class,
                 scope,
-                // An initializer makes an object's declaration a definition
-                // (6.9.2p1); one without is at most a tentative definition.
-                defines: !is_fn && self.is_special(b'='),
+                defines,
                 gnu_extern_inline: fn_attrs
                     .as_ref()
                     .is_some_and(|attrs| attrs.gnu_inline_only(specs.storage_class)),
             });
+            if let Some(list) = params.as_ref().filter(|_| is_fn) {
+                self.record_param_positions(name, &list.params);
+            }
+            let mut visibility = self.pending_symbol_attrs.visibility.take();
+            self.settle_visibility(name, linkage, is_fn, &mut visibility);
+            self.pending_symbol_attrs.visibility = visibility;
             let sym = self
                 .declared_symbol(name, typ, align)
                 .with_variably_modified_array(!vla.is_empty())
-                .with_linkage(linkage);
+                .with_linkage(linkage)
+                .declared_at(DeclaredAt::at(name_pos, defines));
             // Bound before the initializer: C99 6.2.1p7 starts the scope just
             // after the declarator, so `int *p = sizeof *p ...` sees `p`.
             let symbol = self.declare_in(scope, sym, name);
@@ -531,22 +560,39 @@ impl Parser<'_> {
             if !is_fn && !vla.is_empty() {
                 self.check_variably_modified_storage(specs.storage_class, name, typ, pos);
             }
-            (symbol, init)
+            (symbol, init, linkage)
         };
 
         match scope {
+            // A `register` variable's label names its register, not a symbol.
+            _ if !is_fn && specs.storage_class.contains(TypeModifiers::REGISTER) => {
+                self.bind_register_variable(symbol, name, typ, scope, init.is_some(), pos)
+            }
             DeclScope::File => self.settle_declaration_facts(name, specs.storage_class),
             // A block-scope declaration with linkage names the same object or
             // function a file-scope one would, under the same assembler name.
             DeclScope::Block { .. } if is_fn || specs.is_extern() => self.settle_asm_label(name),
             // One without names nothing an asm label could rename, and must
-            // not hand its label to the next declarator of the list.
-            DeclScope::Block { .. } => self.pending_asm_label = None,
+            // not hand its label to the next declarator of the list. gcc
+            // warns of it on an automatic variable.
+            DeclScope::Block { .. } => {
+                let label = self.pending_asm_label.take();
+                if label.is_some() && !specs.storage_class.contains(TypeModifiers::STATIC) {
+                    diag::warning_args(
+                        pos,
+                        "ignoring 'asm' specifier for non-static local variable '{0}'",
+                        &[self.idents.get_opt(name).unwrap_or("")],
+                    );
+                }
+            }
         }
 
         let Some(symbol) = symbol else {
+            self.pending_written_attrs.clear();
             return Ok(Bound::Nothing);
         };
+        let written_on = self.written_on(symbol);
+        self.record_written_attrs(written_on);
         // Checked after the initializer, which is what can still infer the
         // extent of `char a[] = { .. }`. `register` does not exempt an array:
         // it still has automatic storage duration.
@@ -565,6 +611,33 @@ impl Parser<'_> {
         let mut symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
         if !is_fn {
             Self::drop_ifunc(&mut symbol_attrs, pos);
+            // Already warned about as a function's attribute.
+            symbol_attrs.call_diagnostics = Default::default();
+            symbol_attrs.alloc_size = None;
+            symbol_attrs.access.clear();
+        }
+        if is_typedef {
+            self.drop_symbol_attrs(&mut symbol_attrs, name, pos, true);
+        } else {
+            let automatic = matches!(scope, DeclScope::Block { .. })
+                && !is_fn
+                && !specs.storage_class.intersects(NO_AUTO_DURATION);
+            let storage = specs.storage_class;
+            self.check_variable_attrs(&mut symbol_attrs, name, pos, is_fn, storage, automatic);
+            self.check_private_symbol_attrs(&mut symbol_attrs, name, pos, linkage, automatic);
+            // `retain` keeps a definition: an object declared `extern` or
+            // automatic has none here, and gcc ignores it there.
+            if !is_fn
+                && (automatic || specs.is_extern())
+                && std::mem::take(&mut symbol_attrs.retain)
+            {
+                diag::group_warning_args(
+                    super::attribute::ATTRIBUTE_WARNING,
+                    pos,
+                    "'{0}' attribute ignored",
+                    &["retain"],
+                );
+            }
         }
         let cleanup = symbol_attrs.cleanup.take().and_then(|func| {
             let var = Cleanup {
@@ -585,7 +658,7 @@ impl Parser<'_> {
         if !is_fn && !is_typedef && static_duration {
             typ = self.types.without_decl_specifiers(typ);
         }
-        Ok(Bound::Decl(InitDeclarator {
+        Ok(Bound::Decl(Box::new(InitDeclarator {
             symbol_attrs,
             fn_effect: fn_attrs.map_or(pending_effect, |a| a.effect),
             cleanup,
@@ -597,7 +670,7 @@ impl Parser<'_> {
             // C11 6.7.5p2: a function has no alignment specifier.
             explicit_align: if is_fn { None } else { align },
             pos,
-        }))
+        })))
     }
 
     /// The call `__attribute__((cleanup(fn)))` asks for on the declarator
@@ -650,6 +723,19 @@ impl Parser<'_> {
             c.pos,
         );
         self.checked_call(callee, vec![arg], c.pos, c.pos)
+    }
+
+    /// C17 6.7.4p1: the function specifiers declare functions, and a
+    /// typedef declares none -- not even a typedef of a function type. gcc
+    /// warns, and the type is the one written without them.
+    fn check_typedef_function_specifiers(&self, specs: &DeclSpecs, name: StringId, pos: Position) {
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        if specs.storage_class.contains(TypeModifiers::INLINE) {
+            diag::pedwarn_default_args(pos, "typedef '{0}' declared 'inline'", &[spelled]);
+        }
+        if specs.ty.modifiers.contains(TypeModifiers::NORETURN) {
+            diag::pedwarn_default_args(pos, "typedef '{0}' declared '_Noreturn'", &[spelled]);
+        }
     }
 
     /// The storage-class and function specifiers a declarator of this kind,
@@ -798,7 +884,8 @@ impl Parser<'_> {
             }
         }
         self.check_typedef_redefinition(name, typ, pos);
-        let sym = Symbol::typedef(name, typ, self.symbols.depth());
+        let sym = Symbol::typedef(name, typ, self.symbols.depth())
+            .declared_at(DeclaredAt::at(pos, false));
         let symbol = self.declare_in(scope, sym, name);
         if let Some(id) = symbol.filter(|_| !extents.is_empty()) {
             self.vm_typedefs.insert(id, extents.len() as u32);
@@ -807,37 +894,45 @@ impl Parser<'_> {
     }
 
     /// The attributes of a function declarator, and its type made to carry
-    /// `noreturn` when anything said so.
+    /// `noreturn`, `returns_twice` and `nothrow` when anything said so.
     ///
     /// Answers the attributes accumulated under the function's name, or
-    /// `None` for a typedef, which names a type and no function.
+    /// `None` for a typedef, which names a type and no function: gcc keeps
+    /// all three on a function's declaration, so on a typedef it warns and
+    /// ignores them, and a function declared through the typedef is an
+    /// ordinary one.
     fn function_declarator_attrs(
         &mut self,
         specs: &DeclSpecs,
         name: StringId,
         typ: &mut TypeId,
     ) -> Option<FunctionAttrs> {
-        let attrs = if specs.is_typedef() {
-            None
-        } else {
-            // C11 6.7.5p2: not on a function. A pointer to function is an
-            // object and stays legal, so this asks the finished type.
-            self.reject_alignas_in("a function");
-            Some(self.accumulate_fn_attrs(name))
-        };
-        // `noreturn` belongs to the function *type*, since that is what a
-        // call site reads: `_Noreturn` among the specifiers, or the attribute
-        // on this declarator or on any earlier declaration of the name.
-        let noreturn = specs.ty.modifiers.contains(TypeModifiers::NORETURN)
-            || attrs
-                .as_ref()
-                .map_or(self.pending_fn_attrs.noreturn, |a| a.noreturn);
-        if noreturn && !self.types.get(*typ).noreturn {
-            let mut func = self.types.get(*typ).clone();
-            func.noreturn = true;
+        if specs.is_typedef() {
+            self.drop_fn_decl_attrs(*typ);
+            return None;
+        }
+        // C11 6.7.5p2: not on a function. A pointer to function is an
+        // object and stays legal, so this asks the finished type.
+        self.reject_alignas_in("a function");
+        let attrs = self.accumulate_fn_attrs(name);
+        // c17 records them on the declared function's *type*, where a call
+        // naming the function reads them: `_Noreturn` among the specifiers,
+        // or the attribute on this declarator or on any earlier declaration
+        // of the name. `__typeof__` of the function takes them off again
+        // (`TypeTable::without_function_decl_attrs`).
+        let noreturn = specs.ty.modifiers.contains(TypeModifiers::NORETURN) || attrs.noreturn;
+        let current = self.types.get(*typ);
+        if (noreturn && !current.noreturn)
+            || (attrs.returns_twice && !current.returns_twice)
+            || (attrs.nothrow && !current.nothrow)
+        {
+            let mut func = current.clone();
+            func.noreturn |= noreturn;
+            func.returns_twice |= attrs.returns_twice;
+            func.nothrow |= attrs.nothrow;
             *typ = self.types.intern(func);
         }
-        attrs
+        Some(attrs)
     }
 
     /// Declare `sym`, or answer the symbol an earlier declaration of the name

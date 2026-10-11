@@ -22,7 +22,7 @@ use super::ast::{
 use super::builtin_args::BuiltinArgs;
 use super::parser::{ParseResult, Parser};
 use crate::constexpr::ConstScope;
-use crate::float::IntegralRounding;
+use crate::float::{IntegerRounding, IntegralRounding};
 use crate::kw;
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
@@ -79,7 +79,14 @@ impl LibraryCallPolicy {
     /// and stores or the library call is decided on the IR
     /// (`ir::memexpand`), where a length that only inlining makes constant
     /// can still be seen.
+    ///
+    /// `lrint` and `lround` are computed in place only under
+    /// `-fno-math-errno`: they have no instruction that sets `errno` for an
+    /// argument out of range, and gcc then calls them at every level.
     fn in_place(self, func: InlineLibraryFn, spelling: Spelling) -> bool {
+        if matches!(func, InlineLibraryFn::RoundToInteger(_)) && self.math_errno {
+            return false;
+        }
         if self.optimizing {
             return true;
         }
@@ -94,6 +101,7 @@ impl LibraryCallPolicy {
             InlineLibraryFn::Sqrt(MathErrno::Set) => false,
             InlineLibraryFn::Sqrt(MathErrno::Ignored)
             | InlineLibraryFn::RoundToIntegral(_)
+            | InlineLibraryFn::RoundToInteger(_)
             | InlineLibraryFn::FMin
             | InlineLibraryFn::FMax
             | InlineLibraryFn::Fma => spelling == Spelling::Reserved,
@@ -142,6 +150,12 @@ pub(super) enum ProtoType {
     FloatPtr,
     DoublePtr,
     LongDoublePtr,
+    /// Pointers to the `_FloatN` and `_FloatNx` types, `modf`'s.
+    Float32Ptr,
+    Float64Ptr,
+    Float32xPtr,
+    Float64xPtr,
+    Float128Ptr,
     /// `FILE *`. c17 has no `FILE` of its own, so any pointer to an object
     /// stands for it in a declaration; one this synthesizes says `void *`,
     /// which every ABI passes the same way.
@@ -186,6 +200,12 @@ impl ProtoType {
             ProtoType::FloatPtr => t.float_ptr_id,
             ProtoType::DoublePtr => t.double_ptr_id,
             ProtoType::LongDoublePtr => t.longdouble_ptr_id,
+            // Interned with the table: see `TypeTable::new`.
+            ProtoType::Float32Ptr => t.pointer_to(ProtoType::Float32.id(t)),
+            ProtoType::Float64Ptr => t.pointer_to(ProtoType::Float64.id(t)),
+            ProtoType::Float32xPtr => t.pointer_to(ProtoType::Float32x.id(t)),
+            ProtoType::Float64xPtr => t.pointer_to(ProtoType::Float64x.id(t)),
+            ProtoType::Float128Ptr => t.pointer_to(t.float128_id),
             ProtoType::VaList => t.va_list_id,
             ProtoType::SizeT => t.ulong_id,
         }
@@ -314,6 +334,7 @@ const fn plain(
 #[rustfmt::skip]
 static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     use InlineLibraryFn as F;
+    use IntegerRounding as I;
     use IntegralRounding as R;
     use LibFn as L;
     use MemoryFn as M;
@@ -416,6 +437,11 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         known(kw::PUTCHAR,           Int,          &[Int],                                     FIXED,    L::Putchar),
         known(kw::FPUTC,             Int,          &[Int, ObjPtr],                             FIXED,    L::Fputc),
         known(kw::FWRITE,            SizeT,        &[ConstVoidPtr, SizeT, SizeT, ObjPtr],      FIXED,    L::Fwrite),
+        known(kw::STRDUP,            CharPtr,      &[ConstCharPtr],                            FIXED,    L::Strdup),
+        known(kw::STRNDUP,           CharPtr,      &[ConstCharPtr, SizeT],                     FIXED,    L::Strndup),
+        known(kw::MALLOC,            VoidPtr,      &[SizeT],                                   FIXED,    L::Malloc),
+        known(kw::CALLOC,            VoidPtr,      &[SizeT, SizeT],                            FIXED,    L::Calloc),
+        known(kw::REALLOC,           VoidPtr,      &[VoidPtr, SizeT],                          FIXED,    L::Realloc),
         //    name               returns           parameters                                   `...`
         plain(kw::CBRT,             Double,            &[Double],                FIXED),
         plain(kw::CBRTF,            Float,             &[Float],                 FIXED),
@@ -548,6 +574,158 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         plain(kw::NANF128,          Float128,          &[ConstCharPtr],          FIXED),
         plain(kw::SQRTF128,         Float128,          &[Float128],              FIXED),
         plain(kw::FMAF128,          Float128,          &[Float128, Float128, Float128], FIXED),
+        // roundeven, lrint, lround, scalbn in every type, and the _FloatN
+        // forms of the libm functions glibc's sources name: computed in
+        // place as their standard-typed siblings are, or called.
+        entry(kw::ROUNDEVEN, kw::BUILTIN_ROUNDEVEN, Double, &[Double], F::RoundToIntegral(R::RoundEven)),
+        entry(kw::ROUNDEVENF, kw::BUILTIN_ROUNDEVENF, Float, &[Float], F::RoundToIntegral(R::RoundEven)),
+        plain(kw::ROUNDEVENL, LongDouble, &[LongDouble], FIXED),
+        entry(kw::ROUNDEVENF32, kw::BUILTIN_ROUNDEVENF32, Float32, &[Float32], F::RoundToIntegral(R::RoundEven)),
+        entry(kw::ROUNDEVENF64, kw::BUILTIN_ROUNDEVENF64, Float64, &[Float64], F::RoundToIntegral(R::RoundEven)),
+        entry(kw::ROUNDEVENF32X, kw::BUILTIN_ROUNDEVENF32X, Float32x, &[Float32x], F::RoundToIntegral(R::RoundEven)),
+        plain(kw::ROUNDEVENF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::ROUNDEVENF128, Float128, &[Float128], FIXED),
+        entry(kw::LRINT, kw::BUILTIN_LRINT, Long, &[Double], F::RoundToInteger(I::Rint)),
+        entry(kw::LRINTF, kw::BUILTIN_LRINTF, Long, &[Float], F::RoundToInteger(I::Rint)),
+        plain(kw::LRINTL, Long, &[LongDouble], FIXED),
+        plain(kw::LRINTF32, Long, &[Float32], FIXED),
+        plain(kw::LRINTF64, Long, &[Float64], FIXED),
+        plain(kw::LRINTF32X, Long, &[Float32x], FIXED),
+        plain(kw::LRINTF64X, Long, &[Float64x], FIXED),
+        plain(kw::LRINTF128, Long, &[Float128], FIXED),
+        entry(kw::LLRINT, kw::BUILTIN_LLRINT, LongLong, &[Double], F::RoundToInteger(I::Rint)),
+        entry(kw::LLRINTF, kw::BUILTIN_LLRINTF, LongLong, &[Float], F::RoundToInteger(I::Rint)),
+        plain(kw::LLRINTL, LongLong, &[LongDouble], FIXED),
+        plain(kw::LLRINTF32, LongLong, &[Float32], FIXED),
+        plain(kw::LLRINTF64, LongLong, &[Float64], FIXED),
+        plain(kw::LLRINTF32X, LongLong, &[Float32x], FIXED),
+        plain(kw::LLRINTF64X, LongLong, &[Float64x], FIXED),
+        plain(kw::LLRINTF128, LongLong, &[Float128], FIXED),
+        entry(kw::LROUND, kw::BUILTIN_LROUND, Long, &[Double], F::RoundToInteger(I::Round)),
+        entry(kw::LROUNDF, kw::BUILTIN_LROUNDF, Long, &[Float], F::RoundToInteger(I::Round)),
+        plain(kw::LROUNDL, Long, &[LongDouble], FIXED),
+        plain(kw::LROUNDF32, Long, &[Float32], FIXED),
+        plain(kw::LROUNDF64, Long, &[Float64], FIXED),
+        plain(kw::LROUNDF32X, Long, &[Float32x], FIXED),
+        plain(kw::LROUNDF64X, Long, &[Float64x], FIXED),
+        plain(kw::LROUNDF128, Long, &[Float128], FIXED),
+        entry(kw::LLROUND, kw::BUILTIN_LLROUND, LongLong, &[Double], F::RoundToInteger(I::Round)),
+        entry(kw::LLROUNDF, kw::BUILTIN_LLROUNDF, LongLong, &[Float], F::RoundToInteger(I::Round)),
+        plain(kw::LLROUNDL, LongLong, &[LongDouble], FIXED),
+        plain(kw::LLROUNDF32, LongLong, &[Float32], FIXED),
+        plain(kw::LLROUNDF64, LongLong, &[Float64], FIXED),
+        plain(kw::LLROUNDF32X, LongLong, &[Float32x], FIXED),
+        plain(kw::LLROUNDF64X, LongLong, &[Float64x], FIXED),
+        plain(kw::LLROUNDF128, LongLong, &[Float128], FIXED),
+        plain(kw::SCALBN, Double, &[Double, Int], FIXED),
+        plain(kw::SCALBNF, Float, &[Float, Int], FIXED),
+        plain(kw::SCALBNL, LongDouble, &[LongDouble, Int], FIXED),
+        plain(kw::SCALBNF32, Float32, &[Float32, Int], FIXED),
+        plain(kw::SCALBNF64, Float64, &[Float64, Int], FIXED),
+        plain(kw::SCALBNF32X, Float32x, &[Float32x, Int], FIXED),
+        plain(kw::SCALBNF64X, Float64x, &[Float64x, Int], FIXED),
+        plain(kw::SCALBNF128, Float128, &[Float128, Int], FIXED),
+        plain(kw::SCALBLN, Double, &[Double, Long], FIXED),
+        plain(kw::SCALBLNF, Float, &[Float, Long], FIXED),
+        plain(kw::SCALBLNL, LongDouble, &[LongDouble, Long], FIXED),
+        plain(kw::SCALBLNF32, Float32, &[Float32, Long], FIXED),
+        plain(kw::SCALBLNF64, Float64, &[Float64, Long], FIXED),
+        plain(kw::SCALBLNF32X, Float32x, &[Float32x, Long], FIXED),
+        plain(kw::SCALBLNF64X, Float64x, &[Float64x, Long], FIXED),
+        plain(kw::SCALBLNF128, Float128, &[Float128, Long], FIXED),
+        entry(kw::ROUNDF32, kw::BUILTIN_ROUNDF32, Float32, &[Float32], F::RoundToIntegral(R::Round)),
+        entry(kw::ROUNDF64, kw::BUILTIN_ROUNDF64, Float64, &[Float64], F::RoundToIntegral(R::Round)),
+        entry(kw::ROUNDF32X, kw::BUILTIN_ROUNDF32X, Float32x, &[Float32x], F::RoundToIntegral(R::Round)),
+        plain(kw::ROUNDF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::ROUNDF128, Float128, &[Float128], FIXED),
+        entry(kw::RINTF32, kw::BUILTIN_RINTF32, Float32, &[Float32], F::RoundToIntegral(R::Rint)),
+        entry(kw::RINTF64, kw::BUILTIN_RINTF64, Float64, &[Float64], F::RoundToIntegral(R::Rint)),
+        entry(kw::RINTF32X, kw::BUILTIN_RINTF32X, Float32x, &[Float32x], F::RoundToIntegral(R::Rint)),
+        plain(kw::RINTF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::RINTF128, Float128, &[Float128], FIXED),
+        entry(kw::NEARBYINTF32, kw::BUILTIN_NEARBYINTF32, Float32, &[Float32], F::RoundToIntegral(R::NearbyInt)),
+        entry(kw::NEARBYINTF64, kw::BUILTIN_NEARBYINTF64, Float64, &[Float64], F::RoundToIntegral(R::NearbyInt)),
+        entry(kw::NEARBYINTF32X, kw::BUILTIN_NEARBYINTF32X, Float32x, &[Float32x], F::RoundToIntegral(R::NearbyInt)),
+        plain(kw::NEARBYINTF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::NEARBYINTF128, Float128, &[Float128], FIXED),
+        entry(kw::TRUNCF32, kw::BUILTIN_TRUNCF32, Float32, &[Float32], F::RoundToIntegral(R::Trunc)),
+        entry(kw::TRUNCF64, kw::BUILTIN_TRUNCF64, Float64, &[Float64], F::RoundToIntegral(R::Trunc)),
+        entry(kw::TRUNCF32X, kw::BUILTIN_TRUNCF32X, Float32x, &[Float32x], F::RoundToIntegral(R::Trunc)),
+        plain(kw::TRUNCF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::TRUNCF128, Float128, &[Float128], FIXED),
+        entry(kw::FLOORF32, kw::BUILTIN_FLOORF32, Float32, &[Float32], F::RoundToIntegral(R::Floor)),
+        entry(kw::FLOORF64, kw::BUILTIN_FLOORF64, Float64, &[Float64], F::RoundToIntegral(R::Floor)),
+        entry(kw::FLOORF32X, kw::BUILTIN_FLOORF32X, Float32x, &[Float32x], F::RoundToIntegral(R::Floor)),
+        plain(kw::FLOORF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::FLOORF128, Float128, &[Float128], FIXED),
+        entry(kw::CEILF32, kw::BUILTIN_CEILF32, Float32, &[Float32], F::RoundToIntegral(R::Ceil)),
+        entry(kw::CEILF64, kw::BUILTIN_CEILF64, Float64, &[Float64], F::RoundToIntegral(R::Ceil)),
+        entry(kw::CEILF32X, kw::BUILTIN_CEILF32X, Float32x, &[Float32x], F::RoundToIntegral(R::Ceil)),
+        plain(kw::CEILF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::CEILF128, Float128, &[Float128], FIXED),
+        plain(kw::LOGBF32, Float32, &[Float32], FIXED),
+        plain(kw::LOGBF64, Float64, &[Float64], FIXED),
+        plain(kw::LOGBF32X, Float32x, &[Float32x], FIXED),
+        plain(kw::LOGBF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::LOGBF128, Float128, &[Float128], FIXED),
+        entry(kw::SQRTF32, kw::BUILTIN_SQRTF32, Float32, &[Float32], SQRT),
+        entry(kw::SQRTF64, kw::BUILTIN_SQRTF64, Float64, &[Float64], SQRT),
+        entry(kw::SQRTF32X, kw::BUILTIN_SQRTF32X, Float32x, &[Float32x], SQRT),
+        entry(kw::SQRTF64X, kw::BUILTIN_SQRTF64X, Float64x, &[Float64x], SQRT),
+        plain(kw::CBRTF32, Float32, &[Float32], FIXED),
+        plain(kw::CBRTF64, Float64, &[Float64], FIXED),
+        plain(kw::CBRTF32X, Float32x, &[Float32x], FIXED),
+        plain(kw::CBRTF64X, Float64x, &[Float64x], FIXED),
+        plain(kw::CBRTF128, Float128, &[Float128], FIXED),
+        entry(kw::FMINF32, kw::BUILTIN_FMINF32, Float32, &[Float32, Float32], F::FMin),
+        entry(kw::FMINF64, kw::BUILTIN_FMINF64, Float64, &[Float64, Float64], F::FMin),
+        entry(kw::FMINF32X, kw::BUILTIN_FMINF32X, Float32x, &[Float32x, Float32x], F::FMin),
+        plain(kw::FMINF64X, Float64x, &[Float64x, Float64x], FIXED),
+        plain(kw::FMINF128, Float128, &[Float128, Float128], FIXED),
+        entry(kw::FMAXF32, kw::BUILTIN_FMAXF32, Float32, &[Float32, Float32], F::FMax),
+        entry(kw::FMAXF64, kw::BUILTIN_FMAXF64, Float64, &[Float64, Float64], F::FMax),
+        entry(kw::FMAXF32X, kw::BUILTIN_FMAXF32X, Float32x, &[Float32x, Float32x], F::FMax),
+        plain(kw::FMAXF64X, Float64x, &[Float64x, Float64x], FIXED),
+        plain(kw::FMAXF128, Float128, &[Float128, Float128], FIXED),
+        entry(kw::FMAF32, kw::BUILTIN_FMAF32, Float32, &[Float32, Float32, Float32], F::Fma),
+        entry(kw::FMAF64, kw::BUILTIN_FMAF64, Float64, &[Float64, Float64, Float64], F::Fma),
+        entry(kw::FMAF32X, kw::BUILTIN_FMAF32X, Float32x, &[Float32x, Float32x, Float32x], F::Fma),
+        plain(kw::FMAF64X, Float64x, &[Float64x, Float64x, Float64x], FIXED),
+        plain(kw::ILOGBF32, Int, &[Float32], FIXED),
+        plain(kw::ILOGBF64, Int, &[Float64], FIXED),
+        plain(kw::ILOGBF32X, Int, &[Float32x], FIXED),
+        plain(kw::ILOGBF64X, Int, &[Float64x], FIXED),
+        plain(kw::ILOGBF128, Int, &[Float128], FIXED),
+        plain(kw::LDEXPF32, Float32, &[Float32, Int], FIXED),
+        plain(kw::LDEXPF64, Float64, &[Float64, Int], FIXED),
+        plain(kw::LDEXPF32X, Float32x, &[Float32x, Int], FIXED),
+        plain(kw::LDEXPF64X, Float64x, &[Float64x, Int], FIXED),
+        plain(kw::LDEXPF128, Float128, &[Float128, Int], FIXED),
+        plain(kw::FREXPF32, Float32, &[Float32, IntPtr], FIXED),
+        plain(kw::FREXPF64, Float64, &[Float64, IntPtr], FIXED),
+        plain(kw::FREXPF32X, Float32x, &[Float32x, IntPtr], FIXED),
+        plain(kw::FREXPF64X, Float64x, &[Float64x, IntPtr], FIXED),
+        plain(kw::FREXPF128, Float128, &[Float128, IntPtr], FIXED),
+        plain(kw::MODFF32, Float32, &[Float32, Float32Ptr], FIXED),
+        plain(kw::MODFF64, Float64, &[Float64, Float64Ptr], FIXED),
+        plain(kw::MODFF32X, Float32x, &[Float32x, Float32xPtr], FIXED),
+        plain(kw::MODFF64X, Float64x, &[Float64x, Float64xPtr], FIXED),
+        plain(kw::MODFF128, Float128, &[Float128, Float128Ptr], FIXED),
+        plain(kw::NEXTAFTERF32, Float32, &[Float32, Float32], FIXED),
+        plain(kw::NEXTAFTERF64, Float64, &[Float64, Float64], FIXED),
+        plain(kw::NEXTAFTERF32X, Float32x, &[Float32x, Float32x], FIXED),
+        plain(kw::NEXTAFTERF64X, Float64x, &[Float64x, Float64x], FIXED),
+        plain(kw::NEXTAFTERF128, Float128, &[Float128, Float128], FIXED),
+        plain(kw::FDIMF32, Float32, &[Float32, Float32], FIXED),
+        plain(kw::FDIMF64, Float64, &[Float64, Float64], FIXED),
+        plain(kw::FDIMF32X, Float32x, &[Float32x, Float32x], FIXED),
+        plain(kw::FDIMF64X, Float64x, &[Float64x, Float64x], FIXED),
+        plain(kw::FDIMF128, Float128, &[Float128, Float128], FIXED),
+        plain(kw::HYPOTF32, Float32, &[Float32, Float32], FIXED),
+        plain(kw::HYPOTF64, Float64, &[Float64, Float64], FIXED),
+        plain(kw::HYPOTF32X, Float32x, &[Float32x, Float32x], FIXED),
+        plain(kw::HYPOTF64X, Float64x, &[Float64x, Float64x], FIXED),
+        plain(kw::HYPOTF128, Float128, &[Float128, Float128], FIXED),
         //    name               returns      parameters                                            `...`     calls
         known(kw::MEMCPY_CHK,    VoidPtr,     &[VoidPtr, ConstVoidPtr, SizeT, SizeT],               FIXED,    L::MemcpyChk),
         known(kw::MEMMOVE_CHK,   VoidPtr,     &[VoidPtr, ConstVoidPtr, SizeT, SizeT],               FIXED,    L::MemmoveChk),
@@ -564,20 +742,18 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         known(kw::VSPRINTF_CHK,  Int,         &[CharPtr, Int, SizeT, ConstCharPtr, VaList],         FIXED,    L::VsprintfChk),
         known(kw::VSNPRINTF_CHK, Int,         &[CharPtr, SizeT, Int, SizeT, ConstCharPtr, VaList],  FIXED,    L::VsnprintfChk),
         //    name               returns           parameters                                   `...`
+        plain(kw::MEMCCPY_CHK,      VoidPtr,           &[VoidPtr, ConstVoidPtr, Int, SizeT, SizeT], FIXED),
+        plain(kw::STRLCPY_CHK,      SizeT,             &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
+        plain(kw::STRLCAT_CHK,      SizeT,             &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
         plain(kw::SNPRINTF,         Int,               &[CharPtr, SizeT, ConstCharPtr], VARIADIC),
         plain(kw::BCMP,             Int,               &[ConstVoidPtr, ConstVoidPtr, SizeT], FIXED),
         plain(kw::BZERO,            Void,              &[VoidPtr, SizeT],        FIXED),
         plain(kw::STPNCPY,          CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
-        plain(kw::STRDUP,           CharPtr,           &[ConstCharPtr],          FIXED),
-        plain(kw::STRNDUP,          CharPtr,           &[ConstCharPtr, SizeT],   FIXED),
         plain(kw::STRCASECMP,       Int,               &[ConstCharPtr, ConstCharPtr], FIXED),
         plain(kw::STRNCASECMP,      Int,               &[ConstCharPtr, ConstCharPtr, SizeT], FIXED),
         plain(kw::STRSPN,           SizeT,             &[ConstCharPtr, ConstCharPtr], FIXED),
         plain(kw::ABORT,            Void,              &[],                      FIXED),
         plain(kw::EXIT,             Void,              &[Int],                   FIXED),
-        plain(kw::MALLOC,           VoidPtr,           &[SizeT],                 FIXED),
-        plain(kw::CALLOC,           VoidPtr,           &[SizeT, SizeT],          FIXED),
-        plain(kw::REALLOC,          VoidPtr,           &[VoidPtr, SizeT],        FIXED),
         plain(kw::FREE,             Void,              &[VoidPtr],               FIXED),
         plain(kw::ALLOCA,           VoidPtr,           &[SizeT],                 FIXED),
     ]
@@ -1015,9 +1191,10 @@ mod tests {
             K::Output,
             K::ComplexArith,
             K::Fortified,
+            K::Allocation,
         ]
         .map(count);
-        assert_eq!(sizes, [11, 6, 16, 2, 14]);
+        assert_eq!(sizes, [11, 6, 16, 2, 14, 5]);
         assert_eq!(sizes.iter().sum::<usize>(), all.len());
     }
 

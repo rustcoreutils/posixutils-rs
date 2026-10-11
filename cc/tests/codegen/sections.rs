@@ -26,7 +26,7 @@
 // supported tier-1 hosts).
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_everywhere};
 
 // ----------------------------------------------------------------------------
 // Behavioral correctness — programs must run and produce expected output
@@ -98,4 +98,33 @@ fn sections_runtime_behavior_mega() {
         compile_and_run("sections_runtime_behavior_mega", code, &[]),
         0
     );
+}
+
+/// binutils' ld-elf/init.c: an `.init_array` table written
+/// `aligned(sizeof(void *))`. The linker concatenates such tables and the
+/// startup code calls every pointer in the section, so the table may be
+/// aligned only as asked. c17 raised every array of sixteen bytes or more to
+/// sixteen, the padding put a null entry in the section, and the program
+/// died before `main`; gcc keeps an alignment the program wrote.
+#[test]
+fn init_array_table_keeps_its_written_alignment() {
+    let src = r#"
+#ifdef __ELF__
+static int count;
+static void init_0(void) { count = count * 10 + 1; }
+static void init_1(void) { count = count * 10 + 2; }
+static void init_2(void) { count = count * 10 + 3; }
+static void one(void) { count = count * 10 + 4; }
+void (*const init_array[])(void)
+    __attribute__((section(".init_array"), aligned(sizeof(void *)))) = {
+    &init_0, &init_1, &init_2
+};
+/* A lone pointer first, so the table does not start the section. */
+void (*const first)(void) __attribute__((section(".init_array"), aligned(sizeof(void *)))) = &one;
+int main(void) { return count == 4123 || count == 1234 ? 0 : 1; }
+#else
+int main(void) { return 0; }
+#endif
+"#;
+    compile_and_run_everywhere("init_array_written_alignment", src);
 }

@@ -1522,19 +1522,27 @@ pub trait CodeGenerator {
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit
-/// `_Alignas`/`aligned` if it has one, else its type's, and at least 16 for an
-/// array of 16 bytes or more (clang's choice, which vector code relies on).
+/// `_Alignas`/`aligned` if it has one, exactly; else its type's, and at
+/// least 16 for an array of 16 bytes or more (clang's choice, which vector
+/// code relies on).
+///
+/// gcc never raises an alignment the program wrote on the variable
+/// (`DECL_USER_ALIGN`), and code depends on that: an `.init_array` table
+/// written `aligned(sizeof(void *))` is read entry by entry from where the
+/// linker concatenates it, and padding the table to sixteen put a null
+/// entry in front of it, which the startup code called.
 ///
 /// The one rule, read both where the definition is emitted and where a
 /// backend decides whether an access can assume that alignment.
 pub fn global_alignment(global: &crate::ir::GlobalDef, types: &TypeTable) -> u32 {
+    if let Some(align) = global.explicit_align {
+        return align;
+    }
     let size = types.size_bytes(global.typ) as u64;
     let size = if size == 0 { 8 } else { size };
-    let mut align = global
-        .explicit_align
-        .unwrap_or_else(|| types.alignment(global.typ) as u32);
+    let align = types.alignment(global.typ) as u32;
     if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array) && size >= 16 {
-        align = align.max(16);
+        return align.max(16);
     }
     align
 }

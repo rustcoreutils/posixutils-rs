@@ -262,3 +262,47 @@ fn sections_no_reloc_const_stays_in_rodata() {
         asm
     );
 }
+
+/// An alignment the program wrote on a variable is the one it gets: an
+/// array of sixteen bytes or more is raised to sixteen only when nothing was
+/// written, as in gcc (`DECL_USER_ALIGN`) -- for a global, a block-scope
+/// static and a tentative definition, with the attribute or `_Alignas`, even
+/// below the type's own alignment as the attribute allows.
+#[test]
+fn written_alignment_is_not_raised() {
+    let src = "long a1[4] __attribute__((aligned(8))) = {1};\n\
+               _Alignas(8) long a2[4] = {1};\n\
+               long a3[4] = {1};\n\
+               long a4[4] __attribute__((aligned(4))) = {1};\n\
+               long a7[4] __attribute__((aligned(8)));\n\
+               long *g(void) { static long a6[4] __attribute__((aligned(8))) = {1}; return a6; }\n";
+    for triple in [
+        super::asm_probe::X86_64_LINUX,
+        super::asm_probe::AARCH64_LINUX,
+    ] {
+        let asm = super::asm_probe::asm_for_with("written_align", triple, src, &["-O2"]);
+        let align_of = |sym: &str| {
+            let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+            let at = lines
+                .iter()
+                .position(|l| l.strip_suffix(':').is_some_and(|n| n.ends_with(sym)))
+                .unwrap_or_else(|| panic!("{triple}: no {sym}:\n{asm}"));
+            lines[..at]
+                .iter()
+                .rev()
+                .find_map(|l| l.strip_prefix(".p2align "))
+                .unwrap_or_else(|| panic!("{triple}: {sym} has no alignment"))
+                .to_string()
+        };
+        for (sym, p2) in [
+            ("a1", "3"),
+            ("a2", "3"),
+            ("a3", "4"),
+            ("a4", "2"),
+            ("a7", "3"),
+            ("a6.0", "3"),
+        ] {
+            assert_eq!(align_of(sym), p2, "{triple} {sym}:\n{asm}");
+        }
+    }
+}

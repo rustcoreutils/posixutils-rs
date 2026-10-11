@@ -1100,8 +1100,16 @@ impl<'a> Preprocessor<'a> {
         // Last, the host gcc's own include directory, for the private
         // headers it has and c17 does not bundle. It goes with the bundled
         // headers (`-nostdinc`, `-nobuiltininc`), and only a host compile
-        // may use it: its headers are the host target's.
-        if start <= SearchPos::HostCompiler && self.use_builtin_headers && self.target.is_host() {
+        // may use it: its headers are the host target's. Not on macOS, where
+        // the host driver is clang: its headers are clang's -- its
+        // <limits.h>, reached by the bundled one's `#include_next` when
+        // nothing else has one, sets `MB_LEN_MAX` to 1 -- and the SDK has the
+        // <unwind.h> this directory is searched for.
+        if start <= SearchPos::HostCompiler
+            && self.use_builtin_headers
+            && self.target.is_host()
+            && self.target.os != crate::target::Os::MacOS
+        {
             if let Some(dir) = crate::linkargs::host_include_dir() {
                 let path = Path::new(dir).join(filename);
                 if path.exists() {

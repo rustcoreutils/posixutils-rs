@@ -142,15 +142,7 @@ pub fn host_driver() -> Command {
 
 /// The host driver's answer to `-print-file-name=include` -- gcc's own
 /// include directory -- when that is a directory. Asked once per process.
-///
-/// None on macOS: the host driver there is clang, whose own headers are
-/// clang's, not gcc's -- its <limits.h>, reached by the bundled one's
-/// `#include_next` when nothing else has one, sets `MB_LEN_MAX` to 1 -- and
-/// the SDK has the <unwind.h> this directory is searched for.
 pub fn host_include_dir() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        return None;
-    }
     static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
         let out = host_driver()

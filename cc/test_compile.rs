@@ -207,8 +207,14 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
 
     let prefix_maps = PrefixMaps::from_options(&o.prefix_maps);
     let mut strings = StringTable::new();
-    let (tokens, _) =
-        pipeline::source_tokens(src.as_bytes(), &source_name, false, false, &mut strings);
+    let (tokens, _) = pipeline::source_tokens(
+        src.as_bytes(),
+        &source_name,
+        false,
+        false,
+        Default::default(),
+        &mut strings,
+    );
     let (preprocessed, _) = preprocess_collecting(
         tokens,
         &target,
@@ -224,6 +230,9 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             trigraphs: false,
             preprocessed: false,
             pre_includes: &[],
+            imacros: &[],
+            undef: false,
+            comments: Default::default(),
             dump_macros: false,
             keep_definitions: false,
             collect_dependencies: false,

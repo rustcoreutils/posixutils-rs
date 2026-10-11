@@ -469,6 +469,25 @@ struct Conditional {
     pos: Position,
 }
 
+/// What `-E` keeps of the source's comments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Comments {
+    /// Each is one space (C17 5.1.1.2p1, phase 3): the default.
+    #[default]
+    Dropped,
+    /// `-C`: those of the text, where they stand. A directive's go with it.
+    InText,
+    /// `-CC`: those of a macro definition too, in each of its expansions.
+    InTextAndMacros,
+}
+
+impl Comments {
+    /// Whether the lexer makes a token of each comment.
+    pub fn lexed(self) -> bool {
+        self != Comments::Dropped
+    }
+}
+
 // Preprocessor
 
 pub struct Preprocessor<'a> {
@@ -622,6 +641,9 @@ pub struct Preprocessor<'a> {
     /// `defined` that an expansion produces, and expanding first destroys the
     /// operand: `#define D defined(FOO)` / `#if D` would evaluate `0 (1)`.
     in_if_condition: bool,
+    /// The comments `-C` and `-CC` keep, which each included file is lexed
+    /// for too.
+    pub(super) comments: Comments,
 }
 
 /// Where a linemarker says the text after it really came from.
@@ -1266,6 +1288,7 @@ impl<'a> Preprocessor<'a> {
             expansion_budget: EXPANSION_BUDGET,
             paste_stream: std::cell::Cell::new(None),
             in_if_condition: false,
+            comments: Comments::Dropped,
         };
 
         // Include paths first: __STDC_NO_THREADS__ is decided by probing them.
@@ -1532,17 +1555,24 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Preprocess a translation unit's tokens, the `-include` files first.
+    /// Preprocess a translation unit's tokens, the `-imacros` files and then
+    /// the `-include` files first.
     ///
     /// They run after `-D`/`-U`, because a header may well test what they
     /// defined, and before the source, because that is what "as if it were
-    /// the first line" means.
+    /// the first line" means. An `-imacros` file is read for its macros
+    /// alone, before every `-include`, as gcc orders them: its text is
+    /// thrown away.
     pub fn preprocess_unit(
         &mut self,
         tokens: Vec<Token>,
+        imacros: &[String],
         pre_includes: &[String],
         idents: &mut IdentTable,
     ) -> Vec<Token> {
+        for path in imacros {
+            self.include_from_cmdline(path, &mut Vec::new(), idents);
+        }
         let mut included = Vec::new();
         for path in pre_includes {
             self.include_from_cmdline(path, &mut included, idents);
@@ -1647,6 +1677,26 @@ impl<'a> Preprocessor<'a> {
         self.macros.remove(name);
     }
 
+    /// `-undef`: drop every predefined macro but those the C standard names
+    /// (C17 6.10.8), as gcc does -- nothing of the target, the system or the
+    /// compiler is left: no `__GNUC__`, `__x86_64__`, `linux` or `unix`. The
+    /// dynamic ones (`__LINE__`, `__FILE__`, `__has_include`) are operators
+    /// more than macros, and gcc keeps them too.
+    pub(crate) fn keep_only_standard_macros(&mut self) {
+        const STANDARD: &[&str] = &[
+            "__STDC__",
+            "__STDC_HOSTED__",
+            "__STDC_IEC_559__",
+            "__STDC_ISO_10646__",
+            "__STDC_NO_THREADS__",
+            "__STDC_UTF_16__",
+            "__STDC_UTF_32__",
+            "__STDC_VERSION__",
+        ];
+        self.macros
+            .retain(|name, mac| mac.builtin.is_some() || STANDARD.contains(&name.as_str()));
+    }
+
     /// Apply the command line's `-D` and then its `-U` options.
     ///
     /// POSIX c17: "The -D option has lower precedence than the -U option.
@@ -1705,8 +1755,10 @@ impl<'a> Preprocessor<'a> {
         // expansion; inert outside a controlling expression.
         let mut defined_scan = DefinedScan::Idle;
         let mut cursor = TokenCursor::new(tokens);
+        // A directive just handled, whose line's comments `-C` drops with it.
+        let mut on_directive_line = false;
 
-        while let Some(mut token) = cursor.next() {
+        while let Some(mut token) = cursor.next_or_comment() {
             // Attribute the token before anything looks at it, so that macro
             // expansion, diagnostics and the `-E` marker writer all inherit
             // the position a linemarker established. The physical position is
@@ -1726,6 +1778,16 @@ impl<'a> Preprocessor<'a> {
                 token.pos = self.remap_pos(token.pos);
             }
 
+            if token.typ == TokenType::Comment {
+                // `-C`: a comment of the text, where it stands.
+                on_directive_line &= !token.pos.newline;
+                if !on_directive_line && !self.is_skipping() && !self.in_if_condition {
+                    output.push(token);
+                }
+                continue;
+            }
+            on_directive_line = false;
+
             match token.typ {
                 TokenType::StreamBegin | TokenType::StreamEnd => {
                     // Pass through stream markers
@@ -1736,6 +1798,7 @@ impl<'a> Preprocessor<'a> {
                     // `#` at start of line, from the file: a directive.
                     if self.is_file_directive(&token, &cursor) {
                         self.handle_directive(&mut cursor, &token, &mut output, idents);
+                        on_directive_line = true;
                         continue;
                     }
                     if !self.is_skipping() {
@@ -1931,6 +1994,28 @@ impl<'a> Preprocessor<'a> {
                 name,
             },
         );
+    }
+
+    /// A `#define`'s replacement list: the rest of the line, with its
+    /// comments under `-CC`. A `//` comment becomes a `/* */` one, as gcc
+    /// writes it, so that what follows an expansion on its line stays there.
+    fn collect_macro_body(&self, iter: &mut TokenCursor) -> Vec<Token> {
+        if self.comments != Comments::InTextAndMacros {
+            return self.collect_to_eol(iter);
+        }
+        let mut tokens = Vec::new();
+        while iter.peek_or_comment().is_some_and(|t| !t.pos.newline) {
+            let Some(mut token) = iter.next_or_comment() else {
+                break;
+            };
+            if let (TokenType::Comment, TokenValue::String(text)) = (token.typ, &token.value) {
+                if let Some(line) = text.strip_prefix("//") {
+                    token.value = TokenValue::String(format!("/*{line}*/"));
+                }
+            }
+            tokens.push(token);
+        }
+        tokens
     }
 
     /// Collect tokens until end of line
@@ -3093,9 +3178,18 @@ pub struct PreprocessConfig<'a> {
     /// If true, the input is a `.i` operand -- already the output of `c17 -E`
     /// -- and the processing that produced it must not be repeated.
     pub preprocessed: bool,
+    /// `-C`, `-CC`: the comments kept; see [`Comments`]. The source's own
+    /// tokens must have been lexed for them too.
+    pub comments: Comments,
     /// Files to process as if each were a `#include "..."` on the line before
     /// the source, in the order given (`-include`).
     pub pre_includes: &'a [String],
+    /// Files read for their macros alone, ahead of `pre_includes`
+    /// (`-imacros`).
+    pub imacros: &'a [String],
+    /// `-undef`: predefine only what the C standard names; see
+    /// [`Preprocessor::keep_only_standard_macros`].
+    pub undef: bool,
     /// Collect every macro definition for `-dM` instead of only the tokens.
     pub dump_macros: bool,
     /// `-dD`: carry each `#define` and `#undef` in the output where it
@@ -3268,15 +3362,20 @@ pub fn preprocess_collecting(
     }
     pp.trigraphs = config.trigraphs;
     pp.preprocessed = config.preprocessed;
+    pp.comments = config.comments;
     pp.collect_dependencies = config.collect_dependencies;
     pp.macro_prefix_map = config.macro_prefix_map.clone();
 
-    define_optimization_macros(&mut pp, config.optimization);
-    define_pic_macros(&mut pp, target, config.position);
-    define_isa_macros(&mut pp, target, config.isa);
-    define_cet_macro(&mut pp, target, config.cf_protection);
-    define_exceptions_macro(&mut pp, config.exceptions);
-    define_cfi_macro(&mut pp, config.cfi);
+    if config.undef {
+        pp.keep_only_standard_macros();
+    } else {
+        define_optimization_macros(&mut pp, config.optimization);
+        define_pic_macros(&mut pp, target, config.position);
+        define_isa_macros(&mut pp, target, config.isa);
+        define_cet_macro(&mut pp, target, config.cf_protection);
+        define_exceptions_macro(&mut pp, config.exceptions);
+        define_cfi_macro(&mut pp, config.cfi);
+    }
 
     pp.set_include_paths(config.include_paths);
 
@@ -3293,7 +3392,7 @@ pub fn preprocess_collecting(
         Vec::new()
     };
 
-    let output = pp.preprocess_unit(tokens, config.pre_includes, idents);
+    let output = pp.preprocess_unit(tokens, config.imacros, config.pre_includes, idents);
 
     let outcome = PreprocessOutcome {
         macro_definitions: if config.dump_macros {
@@ -3350,6 +3449,12 @@ pub struct AsmPreprocessConfig<'a> {
     /// `.S` as to C, and glibc and Kbuild force-include their configuration
     /// headers into every one.
     pub pre_includes: &'a [String],
+    /// See [`PreprocessConfig::imacros`].
+    pub imacros: &'a [String],
+    /// See [`PreprocessConfig::undef`]; `__ASSEMBLER__` stays.
+    pub undef: bool,
+    /// See [`PreprocessConfig::comments`].
+    pub comments: Comments,
 }
 
 /// A preprocessed `.S`: the text for `as`, and the headers it read.
@@ -3409,7 +3514,8 @@ pub fn preprocess_asm_file(
     // Tokenize with assembly mode (`;` comments)
     let tokens = {
         let mut tokenizer =
-            Tokenizer::new_with_mode(content, stream_id, &mut strings, LexerMode::Assembly);
+            Tokenizer::new_with_mode(content, stream_id, &mut strings, LexerMode::Assembly)
+                .keeping_comments(config.comments.lexed());
         tokenizer.tokenize()
     };
 
@@ -3420,6 +3526,7 @@ pub fn preprocess_asm_file(
 
     // Use assembly lexer mode for included files as well
     pp.lexer_mode = LexerMode::Assembly;
+    pp.comments = config.comments;
     pp.macro_prefix_map = config.macro_prefix_map.clone();
     pp.collect_dependencies = config.collect_dependencies;
 
@@ -3428,15 +3535,19 @@ pub fn preprocess_asm_file(
     pp.undef_macro("__STDC_VERSION__");
     pp.undef_macro("__STDC_HOSTED__");
 
+    if config.undef {
+        pp.keep_only_standard_macros();
+    } else {
+        define_optimization_macros(&mut pp, config.optimization);
+        define_pic_macros(&mut pp, target, config.position);
+        define_isa_macros(&mut pp, target, config.isa);
+        define_cet_macro(&mut pp, target, config.cf_protection);
+        define_exceptions_macro(&mut pp, config.exceptions);
+        define_cfi_macro(&mut pp, config.cfi);
+    }
+
     // Define __ASSEMBLER__ (GCC-compatible, indicates assembly preprocessing)
     pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
-
-    define_optimization_macros(&mut pp, config.optimization);
-    define_pic_macros(&mut pp, target, config.position);
-    define_isa_macros(&mut pp, target, config.isa);
-    define_cet_macro(&mut pp, target, config.cf_protection);
-    define_exceptions_macro(&mut pp, config.exceptions);
-    define_cfi_macro(&mut pp, config.cfi);
 
     // -nostdinc: the directories are dropped in `Preprocessor::new`; the
     // bundled headers go with them.
@@ -3449,7 +3560,8 @@ pub fn preprocess_asm_file(
     // -D, then -U, which wins
     pp.apply_cmdline_macros(config.defines, config.undefines, &mut strings);
 
-    let preprocessed = pp.preprocess_unit(tokens, config.pre_includes, &mut strings);
+    let preprocessed =
+        pp.preprocess_unit(tokens, config.imacros, config.pre_includes, &mut strings);
 
     // Convert tokens back to text
     let text = tokens_to_source_bytes(&preprocessed, &strings);

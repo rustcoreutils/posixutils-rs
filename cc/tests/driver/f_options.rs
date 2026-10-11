@@ -722,3 +722,73 @@ fn fexceptions_defines_exceptions_macro() {
         assert!(r.stdout.contains(want), "{flags:?} .S: {}", r.stdout);
     }
 }
+
+/// `-frandom-seed=` and `-fmerge-all-constants` are taken in silence and
+/// change nothing c17 writes. c17 names nothing at random -- gcc reads the
+/// seed for names it makes up, and libbacktrace builds each object with
+/// `-frandom-seed=$@` so they come out the same every time, which c17's
+/// already do -- and merging constants is a permission c17 never uses:
+/// glibc compiles everything with `-fmerge-all-constants`.
+#[test]
+fn f_options_random_seed_and_merge_all_constants_change_nothing() {
+    let src = "static const int t[] = {1, 2, 3};\nconst char *s(void) { return \"x\"; }\n\
+               int f(int i) { return t[i]; }\n";
+    // Less the lines naming the scratch file, which differs per run.
+    let asm = |flags: &[&str]| -> String {
+        crate::common::asm_for_at("c17_seed_", src, flags)
+            .lines()
+            .filter(|l| !l.contains("c17_seed_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let plain = asm(&["-O2"]);
+    for flags in [
+        &["-frandom-seed=x.lo"][..],
+        &["-frandom-seed=0x1234"],
+        &["-fmerge-all-constants"],
+        &["-fmerge-all-constants", "-frandom-seed=y", "-Werror"],
+    ] {
+        let mut args = flags.to_vec();
+        args.push("-O2");
+        assert_eq!(asm(&args), plain, "{flags:?}");
+    }
+    let (dir, path) = scratch("t.c", CLEAN);
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &["-frandom-seed=x", "-fmerge-all-constants"],
+    );
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+    // `-fexcess-precision=16` rounds each `_Float16` operation to
+    // `_Float16`, which is what c17 does; `standard` and `fast` would keep
+    // the intermediate in `float` (gcc's code for them is the same), which
+    // c17 does not. `float` and `double` have no excess precision on either
+    // target under any of them.
+    let r = compile_in(dir.path(), &path, &["-fexcess-precision=16", "-Werror"]);
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+    for style in ["standard", "fast"] {
+        let flag = format!("-fexcess-precision={style}");
+        let r = compile_in(dir.path(), &path, &[&flag]);
+        assert!(r.success, "{flag}: {}", r.stderr);
+        assert!(
+            r.stderr
+                .contains(&format!("'{flag}' is not supported; ignored")),
+            "{flag}: {}",
+            r.stderr
+        );
+    }
+    let r = compile_in(dir.path(), &path, &["-fexcess-precision=double"]);
+    assert!(!r.success);
+    assert_eq!(
+        r.stderr,
+        "c17: error: unknown excess precision style 'double'\n\
+         c17: note: valid arguments to '-fexcess-precision=' are: 16 fast standard\n"
+    );
+    // gcc's text for a seed left out.
+    let r = compile_in(dir.path(), &path, &["-frandom-seed="]);
+    assert!(!r.success);
+    assert_eq!(
+        r.stderr,
+        "c17: error: missing argument to '-frandom-seed='\n"
+    );
+}

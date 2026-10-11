@@ -602,7 +602,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Collect body tokens
-        let body_tokens = self.collect_to_eol(iter);
+        let body_tokens = self.collect_macro_body(iter);
         if !(is_variadic && variadic_name.is_none()) {
             for token in &body_tokens {
                 Self::warn_stray_va_args(token, idents);
@@ -1286,7 +1286,8 @@ impl<'a> Preprocessor<'a> {
         // Use the same lexer mode as the main file (C or Assembly).
         let tokens = {
             let mut tokenizer =
-                Tokenizer::new_with_mode(&content, stream_id, idents, self.lexer_mode);
+                Tokenizer::new_with_mode(&content, stream_id, idents, self.lexer_mode)
+                    .keeping_comments(self.comments.lexed());
             tokenizer.tokenize()
         };
 
@@ -1361,7 +1362,8 @@ impl<'a> Preprocessor<'a> {
 
         // Tokenize the builtin content
         let tokens = {
-            let mut tokenizer = Tokenizer::new(content.as_bytes(), stream_id, idents);
+            let mut tokenizer = Tokenizer::new(content.as_bytes(), stream_id, idents)
+                .keeping_comments(self.comments.lexed());
             tokenizer.tokenize()
         };
 

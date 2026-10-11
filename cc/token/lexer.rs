@@ -244,6 +244,11 @@ pub enum TokenType {
     /// marker in the stream does. `extract_pragma_directives` removes these
     /// before parsing and hands the parser their positions in the stream.
     Pragma,
+    /// A comment, its text as written in the value, kept for `-C` and `-CC`
+    /// (see [`Tokenizer::keeping_comments`]); only `-E` ever lexes one. It
+    /// takes the start-of-line status of where it stands and leaves it for
+    /// the token after it, so that it hides no directive.
+    Comment,
 }
 
 /// Special tokens (operators and punctuators)
@@ -835,6 +840,9 @@ pub struct Tokenizer<'a, 'b> {
     // so a surviving backslash-newline is text the user meant, and GCC
     // likewise reports it rather than joining the lines a second time.
     splice: bool,
+
+    // `-C`: each comment is a `Comment` token rather than white space.
+    keep_comments: bool,
 }
 
 impl<'a, 'b> Tokenizer<'a, 'b> {
@@ -861,7 +869,15 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             strings,
             mode,
             splice: true,
+            keep_comments: false,
         }
+    }
+
+    /// Lex each comment as a [`TokenType::Comment`] token instead of white
+    /// space (`-C`), for `-E` to write where it stood.
+    pub fn keeping_comments(mut self, keep: bool) -> Self {
+        self.keep_comments = keep;
+        self
     }
 
     /// Stop performing translation phase 2 (backslash-newline splicing).
@@ -1299,6 +1315,26 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         token
     }
 
+    /// The comment that began at byte `start`, at `pos`, and ends where the
+    /// lexer now stands, as a token if comments are kept (`-C`). A `//`
+    /// comment's text stops short of the newline that ends it, which the
+    /// next token starts a line with.
+    fn comment_token(&self, start: usize, pos: Position) -> Option<Token> {
+        if !self.keep_comments {
+            return None;
+        }
+        let mut text = &self.buffer[start..self.offset.min(self.buffer.len())];
+        while let [rest @ .., b'\n' | b'\r'] = text {
+            text = rest;
+        }
+        let text = String::from_utf8_lossy(text).into_owned();
+        Some(Token::with_value(
+            TokenType::Comment,
+            pos,
+            TokenValue::String(text),
+        ))
+    }
+
     /// Skip a single-line comment (// ...)
     fn skip_line_comment(&mut self) {
         loop {
@@ -1379,17 +1415,18 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         // of "a b".
         if class & COMMENT != 0 {
             let next = self.peekchar();
+            let start = self.offset - 1;
             if next == b'/' as i32 {
                 self.nextchar();
                 self.skip_line_comment();
                 self.whitespace = true;
-                return None; // No token, continue tokenizing
+                return self.comment_token(start, pos);
             }
             if next == b'*' as i32 {
                 self.nextchar();
                 self.skip_block_comment(pos);
                 self.whitespace = true;
-                return None; // No token, continue tokenizing
+                return self.comment_token(start, pos);
             }
         }
 
@@ -1671,6 +1708,15 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             };
 
             match token.or_else(|| self.get_one_token(c as u8)) {
+                // A kept comment stands where it is, and is as transparent
+                // as a dropped one to the token after it.
+                Some(mut token) if token.typ == TokenType::Comment => {
+                    token.pos.newline = newline;
+                    token.pos.whitespace = whitespace;
+                    token.pos.line_offset = line_offset;
+                    self.newline |= newline;
+                    tokens.push(token);
+                }
                 Some(mut token) => {
                     token.pos.newline = newline;
                     token.pos.whitespace = whitespace;
@@ -1920,6 +1966,10 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
             TokenValue::String(s) => format!("<PRAGMA {s}>"),
             _ => "<PRAGMA>".to_string(),
         },
+        TokenType::Comment => match &token.value {
+            TokenValue::String(s) => s.clone(),
+            _ => String::new(),
+        },
         TokenType::Ident => {
             if let TokenValue::Ident(id) = &token.value {
                 strings.get(*id).to_string()
@@ -1959,6 +2009,7 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
 pub fn token_type_name(typ: TokenType) -> &'static str {
     match typ {
         TokenType::Pragma => "PRAGMA",
+        TokenType::Comment => "COMMENT",
         TokenType::Ident => "IDENT",
         TokenType::Number => "NUMBER",
         TokenType::Char => "CHAR",
@@ -2001,6 +2052,8 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
     let mut last_stream: u16 = 0;
     let mut last_line: u32 = 1;
     let mut last_char: Option<u8> = None;
+    // A comment `-C` keeps, which the token after it may share a line with.
+    let mut after_comment = false;
 
     for token in tokens {
         // Skip stream markers
@@ -2030,7 +2083,7 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
         // preceded it. The assembler then reports a confident wrong location --
         // `#define`/`#if` above the first instruction shifted a `.S` diagnostic
         // three lines in the case that found this.
-        if token.pos.newline {
+        if token.pos.newline && !(after_comment && token.pos.line == last_line) {
             let spelling: Vec<u8> = result.split_off(start);
             while last_line < token.pos.line {
                 result.push(b'\n');
@@ -2049,6 +2102,11 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
 
         last_char = result.last().copied();
         last_line = token.pos.line;
+        // A comment `-C` keeps may run over several lines.
+        after_comment = token.typ == TokenType::Comment;
+        if let (true, TokenValue::String(text)) = (after_comment, &token.value) {
+            last_line += text.matches('\n').count() as u32;
+        }
     }
 
     // Ensure file ends with newline

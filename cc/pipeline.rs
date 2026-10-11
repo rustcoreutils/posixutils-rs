@@ -38,6 +38,7 @@ pub fn source_tokens(
     display_path: &str,
     trigraphs: bool,
     preprocessed: bool,
+    comments: token::preprocess::Comments,
     strings: &mut StringTable,
 ) -> (Vec<Token>, u16) {
     // Phase 0, before anything looks at the bytes: a byte order mark is not
@@ -53,7 +54,8 @@ pub fn source_tokens(
     };
 
     let stream_id = diag::init_stream(display_path);
-    let mut tokenizer = Tokenizer::new(&buffer, stream_id, strings);
+    let mut tokenizer =
+        Tokenizer::new(&buffer, stream_id, strings).keeping_comments(comments.lexed());
     // Translation phase 2 likewise already ran.
     if preprocessed {
         tokenizer = tokenizer.without_splicing();

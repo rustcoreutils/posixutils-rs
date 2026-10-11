@@ -132,6 +132,9 @@ const PLAIN: &[(&str, Effect)] = &[
     // The unwind tables, and the landing pads that run a `cleanup`
     // variable's cleanup when its frame is unwound: `target::UnwindTables`.
     ("exceptions", Implemented),
+    // Each `_Float16` operation is rounded to `_Float16`, as c17 does;
+    // `float` and `double` have no excess precision on either target.
+    ("excess-precision=16", Accepted(Default)),
     ("expensive-optimizations", Accepted(Pass)),
     ("fast-math", Accepted(Permission)),
     // c17's objects hold machine code, which is what a fat LTO object
@@ -164,6 +167,9 @@ const PLAIN: &[(&str, Effect)] = &[
     ("loop-parallelize-all", Accepted(Pass)),
     ("lto", Accepted(Pass)),
     ("math-errno", Implemented),
+    // Lets distinct constant objects share storage, which C does not: c17
+    // gives every object its own.
+    ("merge-all-constants", Accepted(Permission)),
     ("modulo-sched", Accepted(Pass)),
     ("move-loop-invariants", Accepted(Pass)),
     ("no-PIC", Implemented),
@@ -397,6 +403,17 @@ const JOINED: &[(&str, Value, Effect)] = &[
         Value::Choice(ChoiceText::Unrecognized, &["always", "auto", "never"]),
         Accepted(Presentation),
     ),
+    // `16` is in `PLAIN`. `standard` and `fast` -- the same code in gcc --
+    // keep a `_Float16` operation's result in `float` until it is assigned
+    // or converted, where c17 rounds each one to `_Float16`.
+    (
+        "excess-precision",
+        Value::Choice(
+            ChoiceText::Unknown("excess precision style"),
+            &["16", "fast", "standard"],
+        ),
+        Unsupported,
+    ),
     ("file-prefix-map", Value::Driver, Implemented),
     // `off` is what c17 does; `on` and `fast` permit contracting `a * b + c`
     // into a fused multiply-add, which c17 never does.
@@ -436,6 +453,10 @@ const JOINED: &[(&str, Value, Effect)] = &[
     ("no-sanitize-trap", Value::Any, Accepted(SanitizerModifier)),
     // Every struct keeps its natural layout.
     ("pack-struct", Value::PackAlign, Unsupported),
+    // The seed gcc makes up names from, so that its objects come out the
+    // same every time. c17 makes up no name at random: its output is a
+    // function of its input alone.
+    ("random-seed", Value::Any, Accepted(Default)),
     // Refused by the driver unless withdrawn; see `SANITIZERS`.
     ("sanitize", Value::Driver, Implemented),
     ("sanitize-coverage", Value::Driver, Implemented),

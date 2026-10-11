@@ -9,7 +9,7 @@
 // The token stream a preprocessing pass reads.
 //
 
-use super::lexer::Token;
+use super::lexer::{Token, TokenType};
 
 /// Where the token just read came from.
 ///
@@ -62,12 +62,61 @@ impl TokenCursor {
     }
 
     /// The next token without consuming it, from the pushback if there is one
-    /// and from the file otherwise.
+    /// and from the file otherwise. A comment kept for `-C` is passed over,
+    /// as [`next`](Iterator::next) passes it.
     pub(super) fn peek(&self) -> Option<&Token> {
+        self.pushback
+            .iter()
+            .rev()
+            .map(|(token, _)| token)
+            .chain(self.main.as_slice())
+            .find(|t| t.typ != TokenType::Comment)
+    }
+
+    /// [`peek`](Self::peek), a comment kept for `-C` included.
+    pub(super) fn peek_or_comment(&self) -> Option<&Token> {
         match self.pushback.last() {
             Some((token, _)) => Some(token),
             None => self.main.as_slice().first(),
         }
+    }
+
+    /// The next token, a comment kept for `-C` included: what the main
+    /// preprocessing loop reads, the one place a comment can reach the
+    /// output. Every other reader -- a directive, a macro's arguments --
+    /// sees past it with [`next`](Iterator::next).
+    pub(super) fn next_or_comment(&mut self) -> Option<Token> {
+        let token = self.take()?;
+        Some(self.with_pending_spacing(token))
+    }
+
+    /// The next token, its spacing as it is.
+    fn take(&mut self) -> Option<Token> {
+        match self.pushback.pop() {
+            Some((token, provenance)) => {
+                self.last = provenance;
+                Some(token)
+            }
+            None => {
+                self.last = Provenance::Main;
+                self.main.next()
+            }
+        }
+    }
+
+    /// `token`, given the spacing an expansion left for whatever comes next.
+    ///
+    /// Added to, never taken away. The flags describe where the invocation
+    /// stood, and the token they land on is the expansion's first -- unless
+    /// the expansion was empty, in which case it is the next token of the
+    /// *file*, which already knows where it stands. Overwriting would make
+    /// an empty expansion swallow the following line break.
+    fn with_pending_spacing(&mut self, mut token: Token) -> Token {
+        if let Some((whitespace, newline)) = self.pending_spacing.take() {
+            token.pos.whitespace |= whitespace;
+            token.pos.newline |= newline;
+        }
+        token
     }
 
     /// Where the token most recently returned by [`next`](Iterator::next) came
@@ -115,30 +164,14 @@ impl TokenCursor {
 impl Iterator for TokenCursor {
     type Item = Token;
 
+    /// The next token that is not a comment kept for `-C`.
     fn next(&mut self) -> Option<Token> {
-        let token = match self.pushback.pop() {
-            Some((token, provenance)) => {
-                self.last = provenance;
-                Some(token)
-            }
-            None => {
-                self.last = Provenance::Main;
-                self.main.next()
+        let token = loop {
+            let token = self.take()?;
+            if token.typ != TokenType::Comment {
+                break token;
             }
         };
-        match (token, self.pending_spacing.take()) {
-            (Some(mut token), Some((whitespace, newline))) => {
-                // Added to, never taken away. The flags describe where the
-                // invocation stood, and the token they land on is the
-                // expansion's first -- unless the expansion was empty, in
-                // which case it is the next token of the *file*, which already
-                // knows where it stands. Overwriting would make an empty
-                // expansion swallow the following line break.
-                token.pos.whitespace |= whitespace;
-                token.pos.newline |= newline;
-                Some(token)
-            }
-            (token, _) => token,
-        }
+        Some(self.with_pending_spacing(token))
     }
 }

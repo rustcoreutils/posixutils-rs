@@ -1714,3 +1714,44 @@ fn test_spellings_merge_is_the_lexers_answer() {
         assert!(!spellings_merge(left, right), "{left:?} {right:?}");
     }
 }
+
+/// Kept for `-C`, a comment is a token with its text as written -- a `//`
+/// one's without the newline ending it -- that takes its place's start of
+/// line and leaves it for the token after it, so a directive behind it is
+/// still one. Otherwise there is none.
+#[test]
+fn test_comments_kept_as_tokens() {
+    let src = "/* a\n b */ #define X 1 // x\nint y; /**/\n";
+    let mut strings = StringTable::new();
+    let tokens = Tokenizer::new(src.as_bytes(), 0, &mut strings)
+        .keeping_comments(true)
+        .tokenize();
+    let comments: Vec<(String, bool)> = tokens
+        .iter()
+        .filter(|t| t.typ == TokenType::Comment)
+        .map(|t| match &t.value {
+            TokenValue::String(s) => (s.clone(), t.pos.newline),
+            _ => panic!("a comment without its text"),
+        })
+        .collect();
+    assert_eq!(
+        comments,
+        [
+            ("/* a\n b */".to_string(), true),
+            ("// x".to_string(), false),
+            ("/**/".to_string(), false),
+        ]
+    );
+    let hash = tokens.iter().find(|t| t.typ == TokenType::Special).unwrap();
+    assert!(hash.pos.newline && hash.pos.whitespace, "{:?}", hash.pos);
+    let int = tokens
+        .iter()
+        .find(|t| show_token(t, &strings) == "int")
+        .unwrap();
+    assert!(int.pos.newline);
+
+    let mut strings = StringTable::new();
+    let plain = Tokenizer::new(src.as_bytes(), 0, &mut strings).tokenize();
+    assert!(plain.iter().all(|t| t.typ != TokenType::Comment));
+    assert_eq!(plain.len() + 3, tokens.len());
+}

@@ -11,6 +11,7 @@
 // Tests for macro expansion, stringification, token pasting, and directives.
 //
 
+mod cmdline_options;
 mod conformance;
 mod directives;
 mod end_of_file;

@@ -789,6 +789,9 @@ fn preprocess_assembler(
         macro_prefix_map: Default::default(),
         collect_dependencies: false,
         pre_includes: &[],
+        imacros: &[],
+        undef: false,
+        comments: Default::default(),
     };
     // A #error or a missing include makes the remaining bytes not worth
     // assembling: `as` would bury the real diagnostic under syntax errors.

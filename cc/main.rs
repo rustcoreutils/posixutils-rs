@@ -108,6 +108,11 @@ struct Args {
     #[arg(short = 'P', help = gettext("Do not emit line markers in preprocessed output"))]
     no_line_markers: bool,
 
+    /// `-C` keeps the comments of the `-E` output's text, `-CC` (the option
+    /// given twice) those of macro definitions too.
+    #[arg(short = 'C', action = clap::ArgAction::Count, help = gettext("Keep comments in preprocessed output (-CC: in macros too)"))]
+    keep_comments: u8,
+
     /// Dump every macro definition instead of the preprocessed text (`-dM`).
     #[arg(long = "dM", help = gettext("Dump macro definitions instead of output"))]
     dump_macros: bool,
@@ -170,6 +175,20 @@ struct Args {
         help = gettext("Process <file> as if it were the first #include")
     )]
     pre_includes: Vec<String>,
+
+    /// Process a file for its macro definitions alone, discarding its text,
+    /// before every `-include` (`-imacros`). Repeatable, applied in order.
+    #[arg(
+        long = "imacros",
+        value_name = "file",
+        action = clap::ArgAction::Append,
+        help = gettext("Take the macros of <file>, discarding its text")
+    )]
+    imacros: Vec<String>,
+
+    /// `-undef`: predefine only the macros the C standard names.
+    #[arg(long = "undef", help = gettext("Predefine no system- or compiler-specific macro"))]
+    undef: bool,
 
     /// Dump AST (for debugging parser)
     #[arg(long = "dump-ast", help = gettext("Parse and dump AST to stdout"))]
@@ -871,6 +890,20 @@ impl Args {
     fn dependencies_omit_system(&self) -> bool {
         self.deps_only_user || self.deps_side_user
     }
+
+    /// The comments `-C` and `-CC` keep: only `-E` writes text for them to be
+    /// kept in, so a compile drops them as gcc's does.
+    fn comments(&self) -> token::preprocess::Comments {
+        use token::preprocess::Comments;
+        match (
+            self.preprocess_only && !self.dump_macros,
+            self.keep_comments,
+        ) {
+            (false, _) | (true, 0) => Comments::Dropped,
+            (true, 1) => Comments::InText,
+            (true, _) => Comments::InTextAndMacros,
+        }
+    }
 }
 
 /// Preprocess an assembler operand under `-E` and write the text out.
@@ -921,6 +954,9 @@ fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8
         macro_prefix_map: args.prefix_maps().macros,
         collect_dependencies,
         pre_includes: &args.pre_includes,
+        comments: args.comments(),
+        imacros: &args.imacros,
+        undef: args.undef,
     };
     // Catches #error, a missing include, and friends.
     let preprocessed = preprocess_asm_file(content, target, name, &config).map_err(|e| {
@@ -1301,9 +1337,20 @@ fn emit_preprocessed(
             write_token(&mut spelling, token, strings);
             out.preprocessed.write_all(&spelling)?;
             at_line_start = false;
+            // A comment `-C` keeps may run over lines of its own, and the
+            // token after one that starts a line inherits its start of line,
+            // though it may stand on the line the comment ends on.
+            let comment = token.typ == TokenType::Comment;
+            if comment {
+                current_line += text.matches('\n').count() as u32;
+            }
             // Check next token to determine separator
             if let Some(next) = iter.peek() {
-                if next.pos.newline {
+                let after_comment_on_its_line = comment
+                    && next.pos.stream == token.pos.stream
+                    && !matches!(next.typ, TokenType::StreamBegin | TokenType::StreamEnd)
+                    && diag::effective_position(next.pos).1 == current_line;
+                if next.pos.newline && !after_comment_on_its_line {
                     writeln!(out.preprocessed)?;
                     current_line += 1;
                     at_line_start = true;
@@ -1378,6 +1425,7 @@ fn process_file(
         display_path,
         args.trigraphs,
         preprocessed,
+        args.comments(),
         &mut strings,
     );
 
@@ -1427,7 +1475,10 @@ fn process_file(
             no_builtin_inc: args.no_builtin_inc,
             trigraphs: args.trigraphs,
             preprocessed,
+            comments: args.comments(),
             pre_includes: &args.pre_includes,
+            imacros: &args.imacros,
+            undef: args.undef,
             dump_macros: args.dump_macros,
             // Only `-E` writes the text the directives are carried into.
             keep_definitions: args.dump_definitions && args.preprocess_only,
@@ -1994,6 +2045,26 @@ const GCC_ONE_DASH_LONG: &[&str] = &[
     "-nobuiltininc",
     "-nostdinc",
     "-shared",
+    "-undef",
+];
+
+/// gcc's driver options that only choose what the link puts around the
+/// objects: the startup files, the C library, libgcc and the kind of
+/// executable. c17 links through the host driver and adds nothing of its own
+/// there, so each goes to that driver as written. `-static` and
+/// `-static-pie` also decide the link's leading option (`link_mode_flag`).
+/// clap would read every one as a short cluster (`-shared-libgcc` as
+/// `-s -h ...`, which printed the help).
+const HOST_LINK_OPTIONS: &[&str] = &[
+    "-nodefaultlibs",
+    "-nolibc",
+    "-nostartfiles",
+    "-nostdlib",
+    "-shared-libgcc",
+    "-static",
+    "-static-libgcc",
+    "-static-libstdc++",
+    "-static-pie",
 ];
 
 /// `arg` as clap is given it: see [`GCC_ONE_DASH_LONG`].
@@ -2011,7 +2082,15 @@ fn takes_next_word(arg: &str) -> bool {
     // Bare `-W` is `-Wextra`, given its value by the pre-pass.
     arg != "-W"
         && (takes_separate_value(&clap_spelling(arg))
-            || matches!(arg, "-x" | "-Xlinker" | "-Xassembler" | "--param" | "-z"))
+            || matches!(
+                arg,
+                "-x" | "-Xlinker"
+                    | "-Xassembler"
+                    | "--param"
+                    | "-z"
+                    | "--print-prog-name"
+                    | "--print-file-name"
+            ))
 }
 
 /// Preprocess command-line arguments for gcc compatibility.
@@ -2430,6 +2509,11 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             result.push("--iquote".to_string());
             result.push(dir.to_string());
             i += 1;
+        } else if let Some(file) = arg.strip_prefix("-imacros").filter(|f| !f.is_empty()) {
+            // Joined, as gcc takes it too.
+            result.push("--imacros".to_string());
+            result.push(file.to_string());
+            i += 1;
         } else if let Some(dir) = arg.strip_prefix("--sysroot=") {
             result.push("--sysroot".to_string());
             result.push(dir.to_string());
@@ -2498,19 +2582,16 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             // -rdynamic -> pass to linker
             result.push("--c17-linker-flag=-rdynamic".to_string());
             i += 1;
-        } else if arg == "-static" || arg == "-static-pie" {
-            // For the link step, which reads them to choose its leading
-            // option: see `link_mode_flag`. clap would read `-static` as the
-            // short cluster `-s -t -a ...`.
+        } else if HOST_LINK_OPTIONS.contains(&arg.as_str()) {
             result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
+        } else if matches!(arg.as_str(), "--print-prog-name" | "--print-file-name") {
+            // gcc's two-dash spelling with the name in the next word, which
+            // gcc-14's configure uses: `--print-prog-name liblto_plugin.so`.
+            let query = format!("{arg}={}", raw_args[i + 1]);
+            std::process::exit(answer_driver_query(&query, &raw_args).unwrap_or(1));
         } else if let Some(status) = answer_driver_query(arg, &raw_args) {
             std::process::exit(status);
-        } else if let Some(prog) = arg.strip_prefix("-print-prog-name=") {
-            // GCC compatibility: print program path and exit
-            // Just echo back the program name (like gcc does when it doesn't have a special path)
-            println!("{}", prog);
-            std::process::exit(0);
         } else {
             // An operand, or an option's value -- the two cannot be told apart
             // here, and recording a language for a value is harmless, since
@@ -2582,10 +2663,13 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
         trailer.push(format!("--c17-ssp-buffer-size={bytes}"));
     }
     trailer.extend(stack_clash_params);
+    // The option macros below are gcc's predefined ones, which `-undef`
+    // leaves out as it does the rest.
+    let undef = raw_args.iter().any(|a| a == "-undef");
     if let Some(level) = stack_protector {
         trailer.push(format!("--c17-stack-protector={}", level.option()));
         // gcc's `__SSP__` family, defined as gcc defines it.
-        if let Some((name, value)) = level.predefined_macro() {
+        if let Some((name, value)) = level.predefined_macro().filter(|_| !undef) {
             trailer.push("-D".to_string());
             trailer.push(format!("{name}={value}"));
         }
@@ -2593,7 +2677,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     if debug == Some(true) {
         trailer.push("-g".to_string());
     }
-    if signaling_nans {
+    if signaling_nans && !undef {
         trailer.push("-D".to_string());
         trailer.push("__SUPPORT_SNAN__".to_string());
     }
@@ -2690,15 +2774,42 @@ fn answer_driver_query(arg: &str, raw_args: &[String]) -> Option<i32> {
         }
         "-dumpversion" => println!("{}", token::preprocess::GNUC_VERSION[0]),
         "-dumpfullversion" => println!("{}", token::preprocess::GNUC_VERSION.join(".")),
+        // c17 takes no `-m32` or `-mx32`, so the only library layout is the
+        // default one, which gcc calls `.`.
+        "-print-multi-directory" => println!("."),
+        "-print-multi-lib" => println!(".;"),
+        // Nothing at all without a `--sysroot`, as from a gcc built without
+        // one.
+        "-print-sysroot" => {
+            if let Some(dir) = query_sysroot(raw_args) {
+                println!("{dir}");
+            }
+        }
         "-print-search-dirs" | "-print-libgcc-file-name" | "-print-multi-os-directory" => {
             return Some(forward_to_host_driver(query));
         }
-        _ if query.starts_with("-print-file-name=") => {
+        // The host driver names its own programs (`collect2`,
+        // `liblto_plugin.so`) by their full paths, and others as asked.
+        _ if query.starts_with("-print-file-name=") || query.starts_with("-print-prog-name=") => {
             return Some(forward_to_host_driver(query));
         }
         _ => return None,
     }
     Some(0)
+}
+
+/// The directory the last `--sysroot` names, in either spelling.
+fn query_sysroot(raw_args: &[String]) -> Option<&str> {
+    let mut dir = None;
+    let mut it = raw_args.iter().skip(1);
+    while let Some(arg) = it.next() {
+        if let Some(d) = arg.strip_prefix("--sysroot=") {
+            dir = Some(d);
+        } else if arg == "--sysroot" {
+            dir = it.next().map(String::as_str);
+        }
+    }
+    dir
 }
 
 /// The target named by `--target` in either spelling, last one winning, or
@@ -2949,9 +3060,13 @@ fn version_banner(target: &Target) -> String {
 /// and POPCNT of what it has, so code that tests `__AVX2__` and friends
 /// takes its baseline path. `-msse`, `-msse2` and `-mfpmath=sse` name the
 /// baseline itself; `-msse2avx` is the assembler's, and `-mvzeroupper` and
-/// `-mprefer-vector-width=` speak of code c17 never generates. Everything
-/// else -- an ABI or code-model change -- would make the code different
-/// from what was asked, so it is an error. gcc's aarch64 driver does not
+/// `-mprefer-vector-width=` speak of code c17 never generates.
+/// `-mlong-double-80` is c17's `long double`, and `-mtls-dialect=gnu2` the
+/// TLS descriptors it reaches a dynamic thread-local through. Everything
+/// else -- an ABI or code-model change, x87 arithmetic (`-mfpmath=387`), a
+/// `long double` of 64 or 128 bits, `__tls_get_addr` (`-mtls-dialect=gnu`)
+/// -- would make the code different from what was asked, so it is an
+/// error. gcc's aarch64 driver does not
 /// know the x86-64 instruction-set options at all, and nor does c17's.
 fn check_machine_flags(flags: &[String], target: &Target) {
     if target.arch == target::Arch::Aarch64 {
@@ -2983,6 +3098,8 @@ fn check_machine_flags(flags: &[String], target: &Target) {
                                 | "-mvzeroupper"
                                 | "-mno-vzeroupper"
                                 | "-mfpmath=sse"
+                                | "-mlong-double-80"
+                                | "-mtls-dialect=gnu2"
                                 | "-mcmodel=small"
                                 | "-mprefer-vector-width=none"
                                 | "-mprefer-vector-width=128"
@@ -4908,6 +5025,7 @@ mod tests {
             ("-isystem", |a| a.isystem_paths),
             ("-idirafter", |a| a.idirafter_paths),
             ("-include", |a| a.pre_includes),
+            ("-imacros", |a| a.imacros),
             ("-MT", |a| a.deps_target),
             ("--dump-ir-func", |a| a.dump_ir_func.into_iter().collect()),
         ];
@@ -4942,6 +5060,9 @@ mod tests {
             "-MF",
             "-MT",
             "-include",
+            "-imacros",
+            "--print-prog-name",
+            "--print-file-name",
             "-iquote",
             "-isystem",
             "-idirafter",

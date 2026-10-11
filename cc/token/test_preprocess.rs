@@ -3065,3 +3065,59 @@ fn test_cfi_asm_macro_follows_the_cfi() {
         );
     }
 }
+
+/// `-undef` keeps the standard's macros and the dynamic ones, and drops the
+/// target's, the system's, gcc's and the options' -- `-D` and the `-imacros`
+/// files apply after it, and an `-imacros` file's text is not kept.
+#[test]
+fn test_undef_and_imacros() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_pp_undef_")
+        .tempdir()
+        .unwrap();
+    let macros = dir.path().join("m.h");
+    std::fs::write(&macros, "#define FROM_IMACROS 7\ntext_of_imacros\n").unwrap();
+    let macros = [macros.to_str().unwrap().to_string()];
+    let defines = ["USER=3".to_string()];
+    let input = "__STDC__ __STDC_VERSION__ __STDC_HOSTED__ __LINE__ __GNUC__ __x86_64__ \
+                 __aarch64__ __OPTIMIZE__ __PIC__ linux unix USER FROM_IMACROS\n";
+    let words = |undef: bool| -> Vec<String> {
+        let config = PreprocessConfig {
+            undef,
+            imacros: &macros,
+            defines: &defines,
+            optimization: crate::opt::Optimization::from_flag("2").unwrap(),
+            position: crate::target::PositionIndependence::from_flag("-fPIC").unwrap(),
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+        let (out, _) = preprocess_collecting(tokens, &Target::host(), &mut idents, "t.c", &config);
+        out.iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .map(|t| show_token(t, &idents))
+            .collect()
+    };
+    assert_eq!(
+        words(true),
+        [
+            "1",
+            "201710L",
+            "1",
+            "1",
+            "__GNUC__",
+            "__x86_64__",
+            "__aarch64__",
+            "__OPTIMIZE__",
+            "__PIC__",
+            "linux",
+            "unix",
+            "3",
+            "7"
+        ]
+    );
+    let all = words(false);
+    assert_ne!(all[4], "__GNUC__");
+    assert_eq!(all[7], "1", "__OPTIMIZE__");
+    assert_eq!(&all[11..], ["3", "7"]);
+}

@@ -166,6 +166,67 @@ fn gcc_flags_cpu_selection_is_accepted() {
     }
 }
 
+/// gcc's x86-64 floating-point and TLS options are taken where they ask
+/// for what c17 does and refused where they would change it: c17's `long
+/// double` is the x87 80-bit format, its arithmetic is SSE's, and it reaches
+/// a dynamic thread-local through a TLS descriptor (`gnu2`), so
+/// `-mlong-double-80`, `-mfpmath=sse` and `-mtls-dialect=gnu2` change
+/// nothing. `long double` as `double` or as binary128, x87 arithmetic and
+/// `__tls_get_addr` are not what c17 generates. glibc's configure and tests
+/// pass all of these.
+#[test]
+fn gcc_flags_x86_64_fp_and_tls_options() {
+    let x86 = "--target=x86_64-unknown-linux-gnu";
+    let src = "__thread int tv;\nint *addr(void) { return &tv; }\n\
+               long double ld(long double x) { return x * 2; }\n";
+    let plain = crate::common::asm_for_at("c17_fptls_", src, &[x86, "-fPIC"]);
+    assert!(plain.contains("tv@TLSDESC(%rip)"), "{plain}");
+    for flag in [
+        "-mlong-double-80",
+        "-mfpmath=sse",
+        "-mtls-dialect=gnu2",
+        "-mprefer-vector-width=128",
+    ] {
+        let asm = crate::common::asm_for_at("c17_fptls_", src, &[x86, "-fPIC", flag]);
+        let strip = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.contains("c17_fptls_"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip(&asm), strip(&plain), "{flag}");
+    }
+    let (_dir, path) = scratch("fptls.c", src);
+    for flag in [
+        "-mlong-double-64",
+        "-mlong-double-128",
+        "-mfpmath=387",
+        "-mfpmath=both",
+        "-mfpmath=sse+387",
+        "-mtls-dialect=gnu",
+    ] {
+        let r = run_c17(&[x86, flag, "-S", "-o", "/dev/null", path.to_str().unwrap()]);
+        assert!(!r.success, "{flag} accepted");
+        assert_eq!(
+            r.stderr,
+            format!("c17: unsupported machine flag: {flag}\n"),
+            "{flag}"
+        );
+    }
+    // None is an aarch64 option.
+    for flag in ["-mlong-double-80", "-mtls-dialect=gnu2"] {
+        let r = run_c17(&[
+            "--target=aarch64-unknown-linux-gnu",
+            flag,
+            "-S",
+            "-o",
+            "/dev/null",
+            path.to_str().unwrap(),
+        ]);
+        assert!(!r.success, "aarch64 {flag} accepted");
+    }
+}
+
 /// The `-fpic` family -- `-fpic`, `-fPIC`, `-fpie`, `-fPIE` and their four
 /// `-fno-` forms -- is one option: the last one given wins, and any `-fno-`
 /// form turns position independence off altogether, PIE included. The
@@ -706,6 +767,14 @@ fn gcc_flags_link_queries_are_forwarded_to_the_host_driver() {
         ("-print-libgcc-file-name", "-print-libgcc-file-name"),
         ("--print-search-dirs", "-print-search-dirs"),
         ("-print-multi-os-directory", "-print-multi-os-directory"),
+        ("--print-multi-os-directory", "-print-multi-os-directory"),
+        ("--print-libgcc-file-name", "-print-libgcc-file-name"),
+        // gcc names its own programs by their full path; libtool and gcc's
+        // configure (AIX) ask for collect2.
+        ("-print-prog-name=collect2", "-print-prog-name=collect2"),
+        ("-print-prog-name=ld", "-print-prog-name=ld"),
+        ("--print-prog-name=ld", "-print-prog-name=ld"),
+        ("-print-prog-name=cc1", "-print-prog-name=cc1"),
     ] {
         let want = std::process::Command::new("cc")
             .arg(host)
@@ -714,6 +783,84 @@ fn gcc_flags_link_queries_are_forwarded_to_the_host_driver() {
         let r = run_c17(&[query]);
         assert_eq!(r.success, want.status.success(), "{query}: {}", r.stderr);
         assert_eq!(r.stdout, String::from_utf8_lossy(&want.stdout), "{query}");
+    }
+}
+
+/// gcc takes `--print-prog-name` and `--print-file-name` with their
+/// argument in the next word as well. gcc-14's configure asks
+/// `--print-prog-name liblto_plugin.so` for ar's `--plugin`, and refused,
+/// left `RANLIB="ranlib --plugin "` dangling. With no next word it is
+/// gcc's "missing argument".
+#[test]
+fn gcc_flags_two_dash_queries_take_the_next_word() {
+    for (query, value, host) in [
+        (
+            "--print-prog-name",
+            "liblto_plugin.so",
+            "-print-prog-name=liblto_plugin.so",
+        ),
+        ("--print-prog-name", "ld", "-print-prog-name=ld"),
+        ("--print-file-name", "libc.so", "-print-file-name=libc.so"),
+    ] {
+        let want = std::process::Command::new("cc")
+            .arg(host)
+            .output()
+            .expect("run host cc");
+        let r = run_c17(&[query, value]);
+        assert!(r.success, "{query} {value}: {}", r.stderr);
+        assert_eq!(r.stdout, String::from_utf8_lossy(&want.stdout), "{query}");
+    }
+    for query in ["--print-prog-name", "--print-file-name"] {
+        let r = run_c17(&[query]);
+        assert!(!r.success, "{query}");
+        assert_eq!(
+            r.stderr,
+            format!("c17: error: missing argument to '{query}'\n"),
+            "{query}"
+        );
+    }
+}
+
+/// The multilib queries describe the one library layout c17 compiles for:
+/// it takes no `-m32` or `-mx32`, so there is only the default, which gcc
+/// names `.`. glibc's configure sets its csu `multidir` from
+/// `-print-multi-directory`; with nothing there, the crt1.o rule died in a
+/// shell syntax error.
+#[test]
+fn gcc_flags_multilib_queries_name_the_default_layout() {
+    for (query, want) in [
+        ("-print-multi-directory", ".\n"),
+        ("--print-multi-directory", ".\n"),
+        ("-print-multi-lib", ".;\n"),
+        ("--print-multi-lib", ".;\n"),
+    ] {
+        let r = run_c17(&[query]);
+        assert!(r.success, "{query}: {}", r.stderr);
+        assert_eq!(r.stdout, want, "{query}");
+    }
+}
+
+/// `-print-sysroot` prints the `--sysroot` in force, the last one given, in
+/// either spelling and wherever it stands; with none, it prints nothing at
+/// all, not even a newline, as gcc built without a sysroot does.
+#[test]
+fn gcc_flags_print_sysroot_names_the_sysroot() {
+    for (args, want) in [
+        (&["-print-sysroot"][..], ""),
+        (&["--print-sysroot"], ""),
+        (
+            &["--sysroot=/opt/c17root", "-print-sysroot"],
+            "/opt/c17root\n",
+        ),
+        (
+            &["-print-sysroot", "--sysroot", "/opt/c17root"],
+            "/opt/c17root\n",
+        ),
+        (&["--sysroot=/a", "-print-sysroot", "--sysroot=/b"], "/b\n"),
+    ] {
+        let r = run_c17(args);
+        assert!(r.success, "{args:?}: {}", r.stderr);
+        assert_eq!(r.stdout, want, "{args:?}");
     }
 }
 

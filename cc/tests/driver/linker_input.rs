@@ -252,3 +252,103 @@ fn linker_input_sx_is_preprocessed_assembly() {
     assert!(r.success, "{}", r.stderr);
     assert!(obj.exists());
 }
+
+/// A `-B` directory holding an `ld` that records its arguments in `ld.args`
+/// and succeeds without writing anything.
+#[cfg(target_os = "linux")]
+fn recording_ld(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let pfx = dir.join("pfx");
+    std::fs::create_dir(&pfx).expect("mkdir");
+    let ld = write(
+        &pfx,
+        "ld",
+        &format!(
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done > '{}'\n",
+            s(&pfx.join("ld.args"))
+        ),
+    );
+    std::fs::set_permissions(&ld, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    pfx
+}
+
+/// gcc counts `-l` and the options that hand the linker an argument
+/// (`-Wl,`, `-Xlinker`) as input files, so with no operands at all it still
+/// links. binutils' testsuite asks `$CC -B<dir> -Wl,--version` which `ld`
+/// the compiler runs, and skipped testing the new `ld` when c17 said
+/// "no input files" instead. The arguments keep their command-line order.
+#[cfg(target_os = "linux")]
+#[test]
+fn linker_input_link_options_alone_run_the_link() {
+    let dir = workdir();
+    let pfx = recording_ld(dir.path());
+    let prefix = format!("-B{}/", s(&pfx));
+    let out = dir.path().join("a.out");
+    let log = pfx.join("ld.args");
+    for (argv, expect) in [
+        (&["-Wl,--version"][..], &["--version"][..]),
+        (&["-Xlinker", "--version"], &["--version"]),
+        (&["-lm"], &["-lm"]),
+        (&["-l", "m"], &["-lm"]),
+        (&["-Wl,"], &[]),
+        (&["-v", "-lm"], &["-lm"]),
+        (
+            &["-Wl,--first", "-lm", "-Xlinker", "--last"],
+            &["--first", "-lm", "--last"],
+        ),
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let mut full = vec![prefix.as_str(), "-o", s(&out)];
+        full.extend(argv);
+        let r = run_c17(&full);
+        assert!(r.success, "{argv:?}: {}", r.stderr);
+        let args = std::fs::read_to_string(&log)
+            .unwrap_or_else(|_| panic!("{argv:?}: the -B directory's ld was not run"));
+        let args: Vec<&str> = args.lines().collect();
+        let at: Vec<usize> = expect
+            .iter()
+            .map(|e| {
+                args.iter()
+                    .position(|a| a == e)
+                    .unwrap_or_else(|| panic!("{argv:?}: {e} not in {args:?}"))
+            })
+            .collect();
+        assert!(at.is_sorted(), "{argv:?}: out of order in {args:?}");
+    }
+}
+
+/// Without a link, those inputs are unused and the run does nothing, without
+/// a word, as in gcc.
+#[test]
+fn linker_input_link_options_alone_without_link() {
+    for mode in ["-c", "-S", "-E", "-M", "-fsyntax-only"] {
+        for argv in [&["-lm"][..], &["-Wl,--version"], &["-Xlinker", "--version"]] {
+            let mut full = vec![mode];
+            full.extend(argv);
+            let r = run_c17(&full);
+            assert!(r.success, "{full:?}: {}", r.stderr);
+            assert_eq!(r.stderr, "", "{full:?}");
+            assert_eq!(r.stdout, "", "{full:?}");
+        }
+    }
+}
+
+/// Every other link option is not an input: alone, there is nothing to do.
+#[test]
+fn linker_input_other_link_options_are_not_inputs() {
+    for argv in [
+        &["-L/usr/lib"][..],
+        &["-z", "now"],
+        &["-s"],
+        &["-static"],
+        &["-shared"],
+        &["-pthread"],
+        &["-rdynamic"],
+        &["-Wa,--noexecstack"],
+        &["-c"],
+    ] {
+        let r = run_c17(argv);
+        assert!(!r.success, "{argv:?}");
+        assert_eq!(r.stderr, "c17: fatal error: no input files\n", "{argv:?}");
+    }
+}

@@ -85,8 +85,8 @@ impl RuntimeLib {
     about = gettext("c17 - compile standard C programs")
 )]
 struct Args {
-    /// Not required with `-v` alone, which prints gcc's version banner.
-    #[arg(required_unless_present_any = ["print_targets", "verbose"], help = gettext("Input files"))]
+    /// May be empty; `has_input` says when that leaves nothing to do.
+    #[arg(help = gettext("Input files"))]
     files: Vec<String>,
 
     /// Print registered targets
@@ -699,6 +699,27 @@ impl Args {
             None => Ok(None),
             Some(spec) => classify_std(spec).map(Some).ok_or(spec.as_str()),
         }
+    }
+
+    /// Whether the command line names an input for the link alone.
+    ///
+    /// gcc counts as input files, beside the operands, the `-l` libraries and
+    /// the arguments handed to the linker by `-Wl,` and `-Xlinker`, so any of
+    /// them with no operand at all still links: binutils' testsuite runs
+    /// `$CC -B<dir> -Wl,--version` to learn which `ld` the compiler runs.
+    /// Every other link option (`-L`, `-z`, `-static`, ...) is not an input.
+    fn has_link_input(&self) -> bool {
+        !self.libraries.is_empty()
+            || self
+                .linker_flags
+                .iter()
+                .any(|f| f.starts_with("-Wl,") || f == "-Xlinker")
+    }
+
+    /// Whether the command line names anything to work on: an input, or
+    /// `--print-targets` or `-v`, which need none.
+    fn has_input(&self) -> bool {
+        !self.files.is_empty() || self.has_link_input() || self.print_targets || self.verbose
     }
 }
 
@@ -3045,6 +3066,10 @@ fn try_parse(argv: &[String]) -> Result<Args, clap::Error> {
 fn parse_args(argv: Vec<String>) -> Args {
     use clap::error::ErrorKind;
     match try_parse(&argv) {
+        Ok(args) if !args.has_input() => {
+            eprintln!("c17: {}", gettext("fatal error: no input files"));
+            std::process::exit(1);
+        }
         Ok(args) => args,
         Err(e) => match e.kind() {
             ErrorKind::DisplayHelp
@@ -3072,8 +3097,6 @@ fn parse_error_text(e: &clap::Error, argv: &[String]) -> String {
             gettext("error: unrecognized command-line option"),
             unknown_option_culprit(argv, invalid_arg)
         ),
-        // The operands are the only required argument.
-        ErrorKind::MissingRequiredArgument => gettext("fatal error: no input files"),
         // clap's first paragraph is the message; the rest is usage and help.
         _ => {
             let text = e.render().to_string();
@@ -3945,7 +3968,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         Target::host()
     };
 
-    if args.verbose && args.files.is_empty() {
+    if args.verbose && args.files.is_empty() && !args.has_link_input() {
         eprint!("{}", version_banner(&target));
         return Ok(());
     }
@@ -4168,9 +4191,12 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let link_line = build_link_line(&scanned, &args, &operand_objects);
 
-    let has_object = link_line.iter().any(|i| matches!(i, LinkItem::Object(_)));
+    // Something for the linker: an object, or one of the options gcc counts
+    // as an input file.
+    let has_input =
+        args.has_link_input() || link_line.iter().any(|i| matches!(i, LinkItem::Object(_)));
 
-    if !failed && link_phase && has_object {
+    if !failed && link_phase && has_input {
         let exe_file = args.output.clone().unwrap_or_else(|| "a.out".to_string());
         if let Err(e) = link_objects(&link_line, &exe_file, &args, &target) {
             eprintln!("c17: {}", plib::diag::io_error_text(&e));

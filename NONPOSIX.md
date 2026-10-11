@@ -136,6 +136,12 @@ Language and preprocessor additions:
    `__alignof__` keyword aliases.
  * GCC extended inline assembly, including `asm goto`; `asm` / `__asm__` /
    `__asm`.
+ * Inline-asm flag outputs, `"=@cc<cond>"`, with gcc's condition names on
+   x86-64 and aarch64, and `__GCC_ASM_FLAG_OUTPUTS__` predefined: the output
+   is 1 when the condition holds on the flags the template leaves.  The
+   Linux kernel's x86 bitops, `cmpxchg` and per-CPU helpers write
+   `"=@ccz"`/`"=@ccc"` outputs (older kernels through `CC_SET`/`CC_OUT`,
+   when the macro is defined).
  * Inline-asm operand names as matching constraints, `"[sum]"` for the
    output named `sum`, anywhere in a constraint as gcc reads them: gcc's
    own torture suite ties inputs to outputs so (`pr20314-2.c`).

@@ -1681,6 +1681,7 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
                 V::Int(v) => format!("${v}"),
                 V::Float(v, bits) => format!("${}", v.to_bits_at_width(*bits)),
                 V::Symbol(sym) => format!("${sym}"),
+                V::Flag => return Err(AsmModifierError::Inapplicable),
             },
             _ => return Err(AsmModifierError::Unsupported),
         })

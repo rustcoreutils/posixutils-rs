@@ -1413,6 +1413,9 @@ pub enum AsmOperandValue<R> {
     /// A symbolic address constant, `sym` or `sym+off`, decorated for the
     /// target.
     Symbol(String),
+    /// A flag output (`"=@ccz"`): numbered like any operand, but nothing the
+    /// template can name.
+    Flag,
 }
 
 impl<R> AsmOperandValue<R> {
@@ -1425,6 +1428,7 @@ impl<R> AsmOperandValue<R> {
             AsmOperandValue::Int(_) => "an integer constant",
             AsmOperandValue::Float(..) => "a floating constant",
             AsmOperandValue::Symbol(_) => "a symbolic constant",
+            AsmOperandValue::Flag => "a flag output",
         }
     }
 }
@@ -1690,6 +1694,8 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                 .ok_or_else(|| undefined_operand_name(name))?,
         };
         let text = match (modifier, &slot.value) {
+            // gcc's words; the formatter is never asked.
+            (_, AsmOperandValue::Flag) => return Err("invalid use of asm flag output".to_string()),
             (Some('c'), AsmOperandValue::Int(v)) => Ok(v.to_string()),
             (Some('c'), AsmOperandValue::Symbol(sym)) => Ok(sym.clone()),
             (Some('n'), AsmOperandValue::Int(v)) => Ok((-(*v as i128)).to_string()),

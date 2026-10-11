@@ -1305,6 +1305,7 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
                     "aarch64 writes only a floating constant `fmov` encodes as an immediate",
                 ))?,
                 V::Symbol(sym) => sym.clone(),
+                V::Flag => return Err(AsmModifierError::Inapplicable),
             },
             _ => return Err(AsmModifierError::Unsupported),
         })

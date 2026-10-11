@@ -2778,7 +2778,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Report a matching constraint gcc refuses: one naming an output that
     /// another input is already tied to, a `"+"` output -- whose own hidden
     /// input it would replace -- a memory output, which has no register to
-    /// share. Each
+    /// share, or a flag output, which is no operand an input can be. Each
     /// output is one operand, read once -- but a second tie reading the same
     /// non-volatile frame local as the first is that one value again, which
     /// gcc accepts at every level. Such a repeat is marked in the answer, and
@@ -2801,7 +2801,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             };
             let target = &output_classes[out];
-            let why = if let Some(first) = first_tie[out] {
+            let why = if target.flag.is_some() {
+                // The input takes the output's constraint, and `@` cannot
+                // begin an input's.
+                Some("invalid punctuation '@' in constraint")
+            } else if let Some(first) = first_tie[out] {
                 repeats[i] = self.same_local_value(first, &op.expr);
                 (!repeats[i]).then_some("inconsistent operand constraints in an 'asm'")
             } else if target.access == AsmAccess::ReadWrite || target.is_memory_only() {
@@ -3074,6 +3078,22 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                 skip_post_handling.push(true);
                 continue;
+            }
+
+            // A flag output is written 0 or 1 at its own width, which has to
+            // be an integer's: gcc takes any integer or pointer object.
+            let flag_type = (self.types.is_integer(typ) && !self.types.is_complex(typ))
+                || self.types.kind(typ) == TypeKind::Pointer;
+            if class.flag.is_some() && !(flag_type && size <= 64) {
+                error(op.expr.pos, "invalid type for 'asm' flag output");
+            }
+            // The flags are read once the template has run, on the
+            // fall-through; a jump to a label would leave the output unset.
+            if class.flag.is_some() && !goto_labels.is_empty() {
+                error(
+                    op.expr.pos,
+                    "flag outputs are not supported in an 'asm goto' statement",
+                );
             }
 
             // Non-memory output (register or value class): allocate a
@@ -4142,7 +4162,7 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
 /// words, or `None` when it can.
 ///
 /// An output must be written (`=` or `+`) and be somewhere a value can be
-/// written: a register or memory, never only a constant. An input is only
+/// written: a register, memory or a flag, never only a constant. An input is only
 /// read, so `=`, `+` and `&` make no sense there, and a matching constraint
 /// must name an output that exists.
 fn asm_operand_misuse(
@@ -4155,7 +4175,7 @@ fn asm_operand_misuse(
             Some("output operand constraint lacks '='")
         } else if class.tied.is_some() {
             Some("matching constraint not valid in output operand")
-        } else if class.reg.is_none() && class.mem.is_none() {
+        } else if class.reg.is_none() && class.mem.is_none() && class.flag.is_none() {
             Some("impossible constraint in 'asm'")
         } else {
             None

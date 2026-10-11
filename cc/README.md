@@ -98,8 +98,8 @@ Supported:
 - The C17 language, C99 baseline and all C11 additions alike
 - C11 additions: `_Generic`, `_Atomic` / `<stdatomic.h>` (including access through ordinary operators), `<tgmath.h>`, `_Noreturn`, `_Static_assert`, `_Alignas` / `_Alignof`, `_Thread_local` (Local-Exec and Initial-Exec models), anonymous struct/union members, Unicode literals
 - GCC-compatible inline assembly: extended asm with constraints, clobbers,
-  named operands, matching constraints by number or name (`"[sum]"`),
-  `asm goto` with labels, SSE (`x`) and
+  named operands, matching constraints by number or name (`"[sum]"`), flag
+  outputs (`"=@ccz"`, `"=@cceq"`), `asm goto` with labels, SSE (`x`) and
   x87 (`t`/`u`) operand classes on x86-64, and vector (`w`) operands with the
   `b`/`h`/`s`/`d`/`q` width modifiers on AArch64; and basic asm at file scope
   (`__asm__(".symver ...");`), written verbatim in source order among the

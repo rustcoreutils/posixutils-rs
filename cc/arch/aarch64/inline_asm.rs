@@ -17,7 +17,7 @@ use crate::arch::aarch64::regalloc::{
     asm_pinned_regs_aarch64, parse_gp_clobber_name, Loc, Reg, VReg,
 };
 use crate::arch::asm_constraints::{
-    canonical_int, AsmAccess, AsmMemClass, AsmOperandClass, AsmRegClass,
+    canonical_int, AsmAccess, AsmMemClass, AsmOperandClass, AsmRegClass, FlagCondition,
 };
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
 use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep, OperandSize, Symbol};
@@ -282,6 +282,9 @@ impl Aarch64CodeGen {
         // Register outputs the allocator gave no register: written by the
         // template into a scratch, stored back after it.
         let mut gp_output_moves: Vec<(Reg, Loc, u32)> = Vec::new();
+        // Flag outputs, read off the flags once the template has run:
+        // (condition, destination, operand size in bits).
+        let mut flag_outputs: Vec<(FlagCondition, Loc, u32)> = Vec::new();
 
         // Process output operands (they go first: %0, %1, etc.)
         for (idx, output) in asm_data.outputs.iter().enumerate() {
@@ -295,6 +298,13 @@ impl Aarch64CodeGen {
                 size: op_size,
                 name: op_name.clone(),
             };
+            // A flag output takes no register: its value is read off the
+            // flags once the template has run.
+            if let Some(cond) = output.class.flag {
+                slots.push(mk(AsmOperandValue::Flag));
+                flag_outputs.push((cond, loc, op_size));
+                continue;
+            }
             if let Some(pin) = pins[idx] {
                 slots.push(mk(AsmOperandValue::Reg(pin)));
                 if loc != Loc::Reg(pin) {
@@ -814,10 +824,27 @@ impl Aarch64CodeGen {
             self.emit_vec_store_to_loc(*vreg, loc, *size, insn.pos);
         }
 
+        // Flag outputs last: the moves and stores above set no flags, and by
+        // now the scratch registers are free to stage one through.
+        for (cond, loc, size) in &flag_outputs {
+            self.emit_flag_output(*cond, loc, *size);
+        }
+
         // Clobbers emit nothing here. A register clobber is a constraint the
         // allocator honours (`regalloc::get_constraint_info_aarch64`), and a
         // `"memory"` clobber makes the asm a barrier in the IR
         // (`Instruction::is_memory_barrier`).
+    }
+
+    /// Write a flag output: `cset` of its condition, as gcc reads one, into
+    /// the operand's own register, or through X9 into its slot.
+    fn emit_flag_output(&mut self, cond: FlagCondition, loc: &Loc, size: u32) {
+        let reg = Self::loc_reg(loc).unwrap_or(Reg::X9);
+        let text = format!("cset {}, {}", asm_reg_name_32(reg), cond.suffix());
+        self.push_lir(Aarch64Inst::Directive(Directive::Raw(text)));
+        if Self::loc_reg(loc).is_none() {
+            self.emit_move_to_loc(reg, loc, size);
+        }
     }
 
     /// The move of `pseudo` into or out of `pin`, the register an operand

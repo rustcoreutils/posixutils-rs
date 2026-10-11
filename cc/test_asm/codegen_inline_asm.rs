@@ -257,3 +257,42 @@ void bump(void) { reg = (reg & 0xffff0000u) | 7u; }
         }
     }
 }
+
+/// A flag output is read straight off the flags the template leaves, by the
+/// first instruction after it: `setl` and a zero-extension on x86-64, `cset`
+/// on aarch64, as gcc emits. Nothing between may touch the flags.
+#[test]
+fn codegen_asm_flag_output_is_read_after_the_template() {
+    let cases = [
+        (X86_64_LINUX, "cmp %2, %1 # flagtest", "=@ccl", "setl %"),
+        (AARCH64_LINUX, "cmp %1, %2 // flagtest", "=@cclt", "cset w"),
+    ];
+    for (triple, template, constraint, read) in cases {
+        let code = format!(
+            "int f(long a, long b) {{\n\
+             int r;\n\
+             __asm__(\"{template}\" : \"{constraint}\"(r) : \"r\"(a), \"r\"(b));\n\
+             return r;\n\
+             }}\n"
+        );
+        for opt in ["-O0", "-O2"] {
+            let asm = asm_for_with("asm_flag_output_read", triple, &code, &[opt]);
+            let mut lines = asm.lines().map(str::trim);
+            lines
+                .by_ref()
+                .find(|l| l.ends_with("flagtest"))
+                .unwrap_or_else(|| panic!("{triple} {opt}: no template:\n{asm}"));
+            let next = lines.next().unwrap_or_default();
+            assert!(next.starts_with(read), "{triple} {opt}: {next:?}\n{asm}");
+            if triple == AARCH64_LINUX {
+                assert!(next.ends_with(", lt"), "{triple} {opt}: {next:?}");
+            } else {
+                let widen = lines.next().unwrap_or_default();
+                assert!(
+                    widen.starts_with("movzbl"),
+                    "{triple} {opt}: {widen:?}\n{asm}"
+                );
+            }
+        }
+    }
+}

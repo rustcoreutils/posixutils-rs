@@ -172,3 +172,23 @@ fn named_address_space_macros_are_x86_64s() {
         }
     }
 }
+
+/// Inline asm can write a condition flag to an output (`"=@ccz"`) on both
+/// targets, and says so as gcc does: the Linux kernel's `CC_SET`/`CC_OUT`
+/// use flag outputs exactly when this is defined.
+#[test]
+fn asm_flag_outputs_macro_on_every_target() {
+    for triple in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-linux-gnu",
+        "aarch64-apple-darwin",
+    ] {
+        let m = predefines(triple);
+        assert_eq!(
+            defined(&m, "__GCC_ASM_FLAG_OUTPUTS__").as_deref(),
+            Some("1"),
+            "{triple}"
+        );
+    }
+}

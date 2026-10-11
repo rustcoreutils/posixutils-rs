@@ -373,6 +373,10 @@ pub fn get_misc_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
         // (<bits/flt-eval-method.h>) both read this.
         ("__FLT_EVAL_METHOD__", "0"),
         ("__FINITE_MATH_ONLY__", "0"),
+        // Inline asm can write a condition flag to an output, `"=@ccz"`, on
+        // both targets; the Linux kernel's `CC_SET`/`CC_OUT` use flag
+        // outputs exactly when this says so.
+        ("__GCC_ASM_FLAG_OUTPUTS__", "1"),
     ]
 }
 

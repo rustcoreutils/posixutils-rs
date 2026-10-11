@@ -10,7 +10,9 @@
 // and the moves that place operands where a constraint demands
 //
 
-use crate::arch::asm_constraints::{canonical_int, AsmOperandClass, AsmRegClass, X87Slot};
+use crate::arch::asm_constraints::{
+    canonical_int, AsmOperandClass, AsmRegClass, FlagCondition, X87Slot,
+};
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
 use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
@@ -66,6 +68,9 @@ struct AsmOperandBuild {
     /// Carries the output's index, which a tied input names.
     x87_store: Option<(usize, X87Operand)>,
     x87_slots: usize,
+    /// Flag outputs, read off the flags once the template has run:
+    /// (condition, destination, operand size in bits).
+    flag_outputs: Vec<(FlagCondition, Loc, u32)>,
 }
 
 /// One operand on the x87 register stack.
@@ -183,6 +188,7 @@ impl AsmOperandBuild {
             x87_pushes: Vec::new(),
             x87_store: None,
             x87_slots: 0,
+            flag_outputs: Vec::new(),
         }
     }
 }
@@ -270,6 +276,7 @@ impl X86_64CodeGen {
             x87_store,
             x87_slots,
             pseudo_to_xmm,
+            flag_outputs,
             ..
         } = build;
         // Process output operands (they go first: %0, %1, etc.)
@@ -285,6 +292,14 @@ impl X86_64CodeGen {
                 size: op_size,
                 name: op_name.clone(),
             };
+
+            // A flag output takes no register: its value is read off the
+            // flags once the template has run.
+            if let Some(cond) = output.class.flag {
+                slots.push(mk(AsmOperandValue::Flag));
+                flag_outputs.push((cond, loc, op_size));
+                continue;
+            }
 
             // An operand pinned to one register
             if let Some(specific_reg) = pins[idx] {
@@ -814,6 +829,7 @@ impl X86_64CodeGen {
             remap_restore,
             sse_output_moves,
             x87_store,
+            flag_outputs,
             ..
         } = build;
         // Copy SSE outputs out of the scratch register into where the
@@ -885,10 +901,32 @@ impl X86_64CodeGen {
             }
         }
 
+        // Flag outputs last: every move above is a `mov`, `xchg` or an
+        // x87 or SSE store, none of which touches the flags, and by now the
+        // temps are free to stage one through.
+        for (cond, loc, size) in flag_outputs.iter() {
+            self.emit_flag_output(*cond, loc, *size);
+        }
+
         // Clobbers emit nothing here. A register clobber is a constraint the
         // allocator honours (`regalloc::get_constraint_info`), and a `"memory"`
         // clobber makes the asm a barrier in the IR
         // (`Instruction::is_memory_barrier`).
+    }
+
+    /// Write a flag output: `set<cond>` and a zero-extension, as gcc reads
+    /// one, into the operand's own register, or through %r10 into its slot.
+    fn emit_flag_output(&mut self, cond: FlagCondition, loc: &Loc, size: u32) {
+        let reg = Self::loc_reg(loc).unwrap_or(Reg::R10);
+        for text in [
+            format!("set{} {}", cond.suffix(), reg.name8()),
+            format!("movzbl {}, {}", reg.name8(), reg.name32()),
+        ] {
+            self.push_lir(X86Inst::Directive(Directive::Raw(text)));
+        }
+        if Self::loc_reg(loc).is_none() {
+            self.emit_raw_mov_to_loc(reg, loc, size);
+        }
     }
 
     /// Get the mov suffix and register size modifier for a given bit size

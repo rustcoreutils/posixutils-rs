@@ -13,11 +13,10 @@
 // after optimization, as gcc decides, so a literal inlined into a `static
 // inline` helper's `"i"(param)` satisfies it at -O2 but not at -O0. c17
 // substituted whatever register held the operand instead. A constraint letter
-// or sequence c17 does not model -- a flag output `"=@ccz"`, x86-64 `"Yz"`,
-// aarch64 `"Ump"` -- was read as nothing, leaving the operand to whatever the
-// rest of the string said. Each case here is checked against gcc's verdict;
-// every test compiles for a named target, so the letters mean the same on
-// any host.
+// or sequence c17 does not model -- x86-64 `"Yz"`, aarch64 `"Ump"` -- was
+// read as nothing, leaving the operand to whatever the rest of the string
+// said. Each case here is checked against gcc's verdict; every test compiles
+// for a named target, so the letters mean the same on any host.
 //
 
 use crate::test_compile::{compile, compile_rejected_with};
@@ -238,11 +237,6 @@ fn asm_hash_hides_the_rest_of_the_alternative() {
 fn asm_unsupported_constraints() {
     let x86: &[(&str, &str, &str)] = &[
         (
-            "asm_flag_out",
-            ":\"=@ccz\"(r)",
-            "unsupported flag output constraint \"=@ccz\"",
-        ),
-        (
             "asm_yz",
             "::\"Yz\"(1.0)",
             "unsupported constraint 'Yz' in asm operand \"Yz\"",
@@ -263,11 +257,6 @@ fn asm_unsupported_constraints() {
         }
     }
     let a64: &[(&str, &str, &str)] = &[
-        (
-            "asm_a64_flag",
-            ":\"=@cceq\"(r)",
-            "unsupported flag output constraint",
-        ),
         (
             "asm_a64_ump",
             "::\"Ump\"(r)",

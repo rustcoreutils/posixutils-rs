@@ -75,6 +75,42 @@ fn branch_protection_defines_gccs_macros() {
     );
 }
 
+/// `__ARM_FEATURE_BTI` says the architecture has BTI, whatever
+/// `-mbranch-protection` asks for: gcc 13 defines it for armv8.5-a and
+/// later, armv9-a and later, and the CPUs that implement one of them. The
+/// last `-march=` decides, then the last `-mcpu=`; a `+feature` suffix
+/// changes nothing about it.
+#[test]
+fn branch_protection_bti_feature_follows_the_architecture() {
+    let bti = |flags: &[&str]| {
+        let mut argv = vec![AARCH64, "-dM"];
+        argv.extend_from_slice(flags);
+        let r = preprocess_text("bti_feature", "", &argv);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        r.stdout.contains("#define __ARM_FEATURE_BTI 1\n")
+    };
+    for (flags, want) in [
+        (&[][..], false),
+        (&["-march=armv8-a"][..], false),
+        (&["-march=armv8.4-a"][..], false),
+        (&["-march=armv8.5-a"][..], true),
+        (&["-march=armv8.8-a+crc"][..], true),
+        (&["-march=armv8-r"][..], false),
+        (&["-march=armv9-a"][..], true),
+        (&["-march=armv9.3-a"][..], true),
+        (&["-march=armv8.5-a", "-march=armv8-a"][..], false),
+        (&["-mbranch-protection=bti"][..], false),
+        (&["-march=armv8.5-a", "-mbranch-protection=none"][..], true),
+        (&["-mcpu=cortex-a76"][..], false),
+        (&["-mcpu=neoverse-n2"][..], true),
+        (&["-mcpu=ampere1+nocrc"][..], true),
+        (&["-mcpu=neoverse-n2", "-march=armv8-a"][..], false),
+        (&["-mcpu=cortex-a53", "-march=armv8.5-a"][..], true),
+    ] {
+        assert_eq!(bti(flags), want, "{flags:?}");
+    }
+}
+
 /// Compile an empty unit with `flags`, returning whether it succeeded and
 /// its diagnostics.
 fn compile(flags: &[&str]) -> (bool, String) {

@@ -545,6 +545,49 @@ pub struct BranchProtection {
     pub pac_ret: Option<PacRet>,
 }
 
+/// Whether the aarch64 architecture the machine `flags` select has BTI,
+/// which arrived in armv8.5-a: gcc 13's `__ARM_FEATURE_BTI`. The last
+/// `-march=` decides, and without one the last `-mcpu=`, read as the
+/// architecture of each CPU gcc 13 knows to have it. A `+feature` suffix
+/// leaves the answer alone; gcc has no `+bti` modifier.
+pub fn aarch64_arch_has_bti(flags: &[String]) -> bool {
+    const BTI_ARCHES: &[&str] = &[
+        "armv8.5-a",
+        "armv8.6-a",
+        "armv8.7-a",
+        "armv8.8-a",
+        "armv9-a",
+        "armv9.1-a",
+        "armv9.2-a",
+        "armv9.3-a",
+    ];
+    const BTI_CPUS: &[&str] = &[
+        "ampere1",
+        "ampere1a",
+        "cortex-a510",
+        "cortex-a710",
+        "cortex-a715",
+        "cortex-x2",
+        "cortex-x3",
+        "neoverse-n2",
+        "cobalt-100",
+        "neoverse-v2",
+        "grace",
+        "demeter",
+    ];
+    let last = |prefix: &str| {
+        flags
+            .iter()
+            .rev()
+            .find_map(|f| f.strip_prefix(prefix))
+            .map(|v| v.split('+').next().unwrap_or(v))
+    };
+    match last("-march=") {
+        Some(arch) => BTI_ARCHES.contains(&arch),
+        None => last("-mcpu=").is_some_and(|cpu| BTI_CPUS.contains(&cpu)),
+    }
+}
+
 /// How `pac-ret` signs return addresses.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PacRet {
@@ -1867,6 +1910,9 @@ pub struct Target {
     pub x86_isa: X86Isa,
     /// aarch64's `-mbranch-protection=`; none for any other target.
     pub branch_protection: BranchProtection,
+    /// aarch64: whether the architecture `-march=` or `-mcpu=` selects has
+    /// BTI ([`aarch64_arch_has_bti`]), whatever `branch_protection` asks.
+    pub arch_has_bti: bool,
     /// x86-64's code model, mitigations and stack-guard options; the
     /// defaults for any other target, where they mean nothing.
     pub x86: crate::machine::X86Options,
@@ -1908,6 +1954,7 @@ impl Target {
             max_aggregate_register_bits,
             x86_isa: X86Isa::default(),
             branch_protection: BranchProtection::default(),
+            arch_has_bti: false,
             x86: Default::default(),
             short_wchar: false,
         }
@@ -2696,5 +2743,22 @@ mod tests {
         assert_eq!(CharSignedness::Unsigned.byte_value(0x80), 128);
         assert_eq!(CharSignedness::Unsigned.byte_value(0xff), 255);
         assert_eq!(CharSignedness::Unsigned.byte_value(0x7f), 127);
+    }
+
+    #[test]
+    fn aarch64_bti_is_the_last_march_then_mcpu() {
+        let has = |flags: &[&str]| {
+            let owned: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            aarch64_arch_has_bti(&owned)
+        };
+        assert!(!has(&[]));
+        assert!(has(&["-march=armv8.5-a"]));
+        assert!(has(&["-march=armv9.2-a+sve2"]));
+        assert!(!has(&["-march=armv8.4-a"]));
+        assert!(!has(&["-march=armv8.5-a", "-march=armv8-a"]));
+        assert!(has(&["-mcpu=neoverse-v2"]));
+        assert!(!has(&["-mcpu=cortex-a76"]));
+        assert!(!has(&["-mcpu=neoverse-n2", "-march=armv8.2-a"]));
+        assert!(has(&["-march=armv9-a", "-mcpu=cortex-a53"]));
     }
 }

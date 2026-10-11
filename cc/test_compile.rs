@@ -229,6 +229,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
                 .expect("test_compile: refused machine flag");
     } else {
         target.branch_protection = target::BranchProtection::from_flags(&o.mflags).unwrap();
+        target.arch_has_bti = target::aarch64_arch_has_bti(&o.mflags);
     }
     if let Some(signedness) = o.plain_char {
         target.plain_char = signedness;

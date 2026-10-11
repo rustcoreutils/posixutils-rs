@@ -3827,6 +3827,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         target.x86 = x86_options(&args, &target);
     } else {
         target.branch_protection = branch_protection(&args.mflags, &target);
+        target.arch_has_bti = target::aarch64_arch_has_bti(&args.mflags);
     }
     let code_options =
         f_options::CodeOptions::from_names(&args.fopts, &target).unwrap_or_else(|lines| {

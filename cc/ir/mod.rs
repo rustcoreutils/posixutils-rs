@@ -12,6 +12,7 @@
 //
 
 pub mod asm_operand;
+pub(crate) mod bitset;
 mod build;
 pub mod cfg;
 pub(crate) mod constfold;

@@ -9,6 +9,7 @@
 // Common register allocator utilities shared between architectures
 //
 
+use crate::ir::bitset::BitSet;
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -514,8 +515,11 @@ where
         last_pos_map[0].entry(arg_pseudo).or_insert(0);
     }
 
+    // Each block's declared locals, which its walk in Phase C starts from.
+    let mut declared_in: Vec<Vec<PseudoId>> = vec![Vec::new(); num_blocks];
     for local_var in func.locals.values() {
         if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
+            declared_in[block_idx].push(local_var.sym);
             def_blocks
                 .entry(local_var.sym)
                 .or_default()
@@ -600,13 +604,21 @@ where
     // spanning its uses and no liveness. One with a def (a 128-bit constant's
     // `SetVal`, whose stack slot must survive to its last use) is tracked
     // like any value.
+    //
+    // Nor is a frame local, which has its slot before coloring
+    // (`place_locals`) and whose interval is its lifetime
+    // (`local_lifetimes`), whatever liveness would say. Tracked, every local
+    // whose declaring block an optimization had merged away -- or a copied
+    // parameter, declared in no block -- was carried back to the entry from
+    // every use: blocks x locals set entries, for nothing.
     let needs_no_liveness = |p: PseudoId| -> bool {
-        !def_blocks.contains_key(&p)
-            && func.get_pseudo(p).is_some_and(|ps| match &ps.kind {
-                PseudoKind::Val(_) | PseudoKind::FVal(_) => true,
-                PseudoKind::Sym(_) => func.local_of(p).is_none(),
-                _ => false,
-            })
+        func.get_pseudo(p).is_some_and(|ps| match &ps.kind {
+            PseudoKind::Sym(_) if func.local_of(p).is_some() => true,
+            PseudoKind::Val(_) | PseudoKind::FVal(_) | PseudoKind::Sym(_) => {
+                !def_blocks.contains_key(&p)
+            }
+            _ => false,
+        })
     };
 
     let propagate_use = |use_block: usize,
@@ -668,13 +680,7 @@ where
                 defined_so_far.insert(arg);
             }
         }
-        for local_var in func.locals.values() {
-            if let Some(&block_idx) = local_var.decl_block.and_then(|id| bb_id_to_idx.get(&id)) {
-                if block_idx == idx {
-                    defined_so_far.insert(local_var.sym);
-                }
-            }
-        }
+        defined_so_far.extend(declared_in[idx].iter().copied());
 
         for insn in &block.insns {
             for &src in &insn.src {
@@ -1044,10 +1050,6 @@ fn local_lifetimes(
         return locals.into_iter().map(|l| (l, (0, last))).collect();
     }
     let index: HashMap<PseudoId, usize> = locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
-    let words = locals.len().div_ceil(64);
-    let set = |bits: &mut Vec<u64>, i: usize| bits[i / 64] |= 1 << (i % 64);
-    let clear = |bits: &mut Vec<u64>, i: usize| bits[i / 64] &= !(1 << (i % 64));
-    let has = |bits: &[u64], i: usize| bits[i / 64] & (1 << (i % 64)) != 0;
 
     // Each block's events in order: (position, local, starts) -- a mention
     // starts (or continues) a lifetime, a `LifetimeEnd` ends one.
@@ -1069,13 +1071,13 @@ fn local_lifetimes(
     }
 
     // Forward "may be inside its lifetime", to a fixed point.
-    let mut live_in: Vec<Vec<u64>> = vec![vec![0; words]; func.blocks.len()];
-    let mut live_out: Vec<Vec<u64>> = vec![vec![0; words]; func.blocks.len()];
+    let mut live_in = vec![BitSet::new(locals.len()); func.blocks.len()];
+    let mut live_out = vec![BitSet::new(locals.len()); func.blocks.len()];
     let params: HashSet<&str> = func.params.iter().map(|(n, _)| n.as_str()).collect();
     if let Some(&entry) = bb_id_to_idx.get(&func.entry) {
         for (name, local) in &func.locals {
             if params.contains(name.as_str()) {
-                set(&mut live_in[entry], index[&local.sym]);
+                live_in[entry].insert(index[&local.sym]);
             }
         }
     }
@@ -1086,57 +1088,50 @@ fn local_lifetimes(
         let mut out = live_in[b].clone();
         for &(_, i, starts) in &events[b] {
             if starts {
-                set(&mut out, i);
+                out.insert(i);
             } else {
-                clear(&mut out, i);
+                out.remove(i);
             }
         }
         if out == live_out[b] {
             continue;
         }
-        live_out[b] = out;
         for child in &func.blocks[b].children {
             let Some(&c) = bb_id_to_idx.get(child) else {
                 continue;
             };
-            let mut changed = false;
-            for (w, word) in live_in[c].iter_mut().enumerate() {
-                let merged = *word | live_out[b][w];
-                changed |= merged != *word;
-                *word = merged;
-            }
-            if changed && !queued[c] {
+            if live_in[c].union_with(&out) && !queued[c] {
                 queued[c] = true;
                 work.push_back(c);
             }
         }
+        live_out[b] = out;
     }
 
     // The hull: a block's start where the object is live in, its end where
-    // live out, and every event in between.
-    let mut hull: HashMap<PseudoId, (usize, usize)> = HashMap::new();
+    // live out, and every event in between. Only the set bits are visited:
+    // a block's sets hold the few locals live there, not every local.
+    let mut hull: Vec<Option<(usize, usize)>> = vec![None; locals.len()];
     let mut widen = |i: usize, pos: usize| {
-        hull.entry(locals[i])
-            .and_modify(|(s, e)| {
-                *s = (*s).min(pos);
-                *e = (*e).max(pos);
-            })
-            .or_insert((pos, pos));
+        let (s, e) = hull[i].get_or_insert((pos, pos));
+        *s = (*s).min(pos);
+        *e = (*e).max(pos);
     };
     for b in 0..func.blocks.len() {
-        for i in 0..locals.len() {
-            if has(&live_in[b], i) {
-                widen(i, block_start_pos[b]);
-            }
-            if has(&live_out[b], i) {
-                widen(i, block_end_pos[b]);
-            }
+        for i in live_in[b].iter() {
+            widen(i, block_start_pos[b]);
+        }
+        for i in live_out[b].iter() {
+            widen(i, block_end_pos[b]);
         }
         for &(pos, i, _) in &events[b] {
             widen(i, pos);
         }
     }
-    hull
+    hull.into_iter()
+        .enumerate()
+        .filter_map(|(i, span)| Some((locals[i], span?)))
+        .collect()
 }
 
 /// Each pseudo's live interval, by pseudo -- the first, if several.

@@ -414,6 +414,17 @@ impl Footprint {
         }
     }
 
+    /// The object this footprint is pinned to, when it is one: a known
+    /// location's base. [`may_alias`] keeps such a footprint apart from every
+    /// local but that base, so a pass asking about many locals at once need
+    /// ask [`Self::may_touch`] of that one alone.
+    pub(crate) fn pinned_base(&self) -> Option<&MemBase> {
+        match self {
+            Footprint::At(m) | Footprint::Object(m) if m.is_known() => Some(&m.base),
+            _ => None,
+        }
+    }
+
     /// Is everything this footprint may include in a local of this function
     /// that nothing outside it can reach?
     pub(crate) fn is_private(&self, esc: &EscapeInfo) -> bool {

@@ -56,7 +56,7 @@ diagnostic, in the `-Wattributes` group:
 | A function's own attribute (`cold`, `hot`, `noinline`, `always_inline`, `pure`, `constructor`, `destructor`, `leaf`, `noclone`, `gnu_inline`, `artificial`, `optimize`, `target`, `target_clones`, `stack_protect`, `no_stack_protector`, `no_sanitize_*`, `noreturn`, `returns_twice`, `nothrow`) on anything but a function | "'X' attribute ignored" |
 | `const` on anything but a function or a pointer to one, or on a typedef | "'const' attribute ignored" |
 | `malloc` on anything but a function | "'malloc' attribute ignored; valid only for functions" |
-| A function type's attribute (`nonnull`, `format`, `warn_unused_result`, `sentinel`, `returns_nonnull`, `alloc_size`, `alloc_align`, `access`) on anything but a function, a pointer to one, or a typedef of either | "'X' attribute only applies to function types" |
+| A function type's attribute (`nonnull`, `format`, `warn_unused_result`, `sentinel`, `returns_nonnull`, `alloc_size`, `alloc_align`, `assume_aligned`, `access`) on anything but a function, a pointer to one, or a typedef of either | "'X' attribute only applies to function types" |
 | `no_instrument_function` on anything but a function | an error |
 | `weak` on a name without external linkage | an error, "weak declaration of 'x' must be public" |
 | `visibility` on a name without external linkage | "'visibility' attribute ignored" |
@@ -79,6 +79,7 @@ A bad argument drops the attribute after a diagnostic:
 | `vector_size` | error unless a positive constant |
 | `constructor`, `destructor` | error unless 0 to 65535 |
 | `nonnull`, `nonnull_if_nonzero`, `sentinel`, `alloc_size`, `alloc_align`, `regparm` | warning; the attribute is dropped |
+| `assume_aligned` | warning unless one or two constants, the first a power of two and the second below it ("argument N is not a power of 2", "... is not in the range [0, N-1]"); the wrong count is an error |
 
 The arguments of an unrecognised attribute are skipped without being parsed.
 
@@ -140,6 +141,7 @@ the result of a correct program. glibc puts most of them on every declaration.
 `nonstring`, `malloc`, `sentinel`, `nonnull`, `nonnull_if_nonzero`,
 `returns_nonnull`, `access`, `externally_visible`,
 `abi_tag`, `weakref`, `simd`, `regparm`, `leaf`, `alloc_size`, `alloc_align`,
+`assume_aligned` (the Linux kernel's `__assume_aligned`),
 `noclone`, `copy`, `designated_init`, `may_alias`,
 `artificial`, `no_sanitize_memory`, `no_sanitize_address`, `no_sanitize_thread`,
 `optimize`.

@@ -51,6 +51,7 @@ const FUNCTION_ONLY: &[(&str, FunctionOnly)] = &[
     ("alloc_size", FunctionOnly::FunctionType),
     ("always_inline", FunctionOnly::Declaration),
     ("artificial", FunctionOnly::Declaration),
+    ("assume_aligned", FunctionOnly::FunctionType),
     ("cold", FunctionOnly::Declaration),
     ("const", FunctionOnly::Const),
     ("constructor", FunctionOnly::Declaration),
@@ -134,9 +135,9 @@ impl AttrArgs {
             "aligned" => AttrArgs::Integers(IntArgRole::Alignment),
             "vector_size" => AttrArgs::Integers(IntArgRole::VectorSize),
             "constructor" | "destructor" => AttrArgs::Integers(IntArgRole::Priority),
+            "assume_aligned" => AttrArgs::Integers(IntArgRole::AssumedAlignment),
             "alloc_size"
             | "alloc_align"
-            | "assume_aligned"
             | "warn_if_not_aligned"
             | "nonnull"
             | "nonnull_if_nonzero"
@@ -159,6 +160,10 @@ enum IntArgRole {
     VectorSize,
     /// `constructor(P)` / `destructor(P)`: an init priority, 0 to 65535.
     Priority,
+    /// `assume_aligned(N[, M])`: a power of two, and the misalignment from
+    /// it, below it. Accepted and not acted on; a bad argument drops the
+    /// attribute with gcc's warning.
+    AssumedAlignment,
     /// `nonnull(1, 2)`, `alloc_size(1)`, `sentinel(0)`, ...: accepted and not
     /// acted on, so a bad argument drops the attribute with a warning, as gcc
     /// does.
@@ -173,6 +178,8 @@ enum IntArgFault {
     Zero,
     OutOfRange(i128),
     TooLarge(i128),
+    /// `assume_aligned`'s misalignment, not below its alignment.
+    Misalignment(i128, i128),
 }
 
 /// An attribute whose arguments have already been diagnosed, and which is
@@ -224,6 +231,33 @@ impl IntArgRole {
                     &[&n.to_string()],
                 )
             }
+            (_, IntArgFault::Misalignment(m, n)) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument {1} is not in the range [0, {2}]",
+                &[name, &m.to_string(), &(n - 1).to_string()],
+            ),
+            (IntArgRole::AssumedAlignment, IntArgFault::NotConstant) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument is not an integer constant",
+                &[name],
+            ),
+            (
+                IntArgRole::AssumedAlignment,
+                IntArgFault::OutOfRange(n) | IntArgFault::TooLarge(n),
+            ) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument {1} is not a power of 2",
+                &[name, &n.to_string()],
+            ),
+            (IntArgRole::AssumedAlignment, IntArgFault::Zero) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument {1} is not a power of 2",
+                &[name, "0"],
+            ),
             (IntArgRole::Priority, _) => diag::error_args(
                 pos,
                 "{0} priorities must be integers from 0 to 65535 inclusive",
@@ -905,6 +939,9 @@ impl Parser<'_> {
         args: &[AttributeArg],
         pos: Position,
     ) -> Result<(), Diagnosed> {
+        if role == IntArgRole::AssumedAlignment {
+            return Self::check_assumed_alignment(name, args, pos);
+        }
         let value = match args {
             [] => None,
             [AttributeArg::Int(n)] => Some(*n),
@@ -939,6 +976,33 @@ impl Parser<'_> {
             }
             None => Ok(()),
         }
+    }
+
+    /// `assume_aligned(N[, M])`: one or two integer constants, `N` a power
+    /// of two and `M` below it, as gcc checks them.
+    fn check_assumed_alignment(
+        name: &str,
+        args: &[AttributeArg],
+        pos: Position,
+    ) -> Result<(), Diagnosed> {
+        let role = IntArgRole::AssumedAlignment;
+        let fault = match args {
+            [] | [_, _, _, ..] => IntArgFault::Count,
+            [AttributeArg::Int(n), rest @ ..] => {
+                let n = *n;
+                match rest {
+                    _ if n <= 0 => IntArgFault::OutOfRange(n),
+                    _ if !(n as u128).is_power_of_two() => IntArgFault::OutOfRange(n),
+                    [] => return Ok(()),
+                    [AttributeArg::Int(m)] if (0..n).contains(m) => return Ok(()),
+                    [AttributeArg::Int(m)] => IntArgFault::Misalignment(*m, n),
+                    _ => IntArgFault::NotConstant,
+                }
+            }
+            _ => IntArgFault::NotConstant,
+        };
+        role.report(name, pos, fault);
+        Err(Diagnosed)
     }
 
     /// Parse a single attribute: name or name(args)

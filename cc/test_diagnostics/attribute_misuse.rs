@@ -194,3 +194,32 @@ fn transparent_union_on_a_non_union() {
         ["warning: 'transparent_union' attribute ignored [-Wattributes]"]
     );
 }
+
+/// `assume_aligned(N[, M])` is gcc's: taken in silence on a function -- the
+/// Linux kernel's `__assume_aligned` drew an "attribute directive ignored"
+/// warning on every use -- and diagnosed in gcc's words where its arguments
+/// are wrong or there is no function type to carry it.
+#[test]
+fn assume_aligned_is_gccs() {
+    let ok = "void *a(void) __attribute__((assume_aligned(64)));\n\
+              void *b(void) __attribute__((__assume_aligned__(32, 8)));\n\
+              void *(*fp)(void) __attribute__((assume_aligned(16)));\n\
+              _Static_assert(__has_attribute(assume_aligned), \"has\");\n";
+    assert_eq!(messages("assume_aligned_ok", ok), Vec::<String>::new());
+    let bad = "int v __attribute__((assume_aligned(16)));\n\
+               void *c(void) __attribute__((assume_aligned(3)));\n\
+               void *d(void) __attribute__((assume_aligned(16, 16)));\n\
+               void *e(void) __attribute__((assume_aligned(16, 1, 2)));\n\
+               void *f(void) __attribute__((assume_aligned));\n";
+    assert_eq!(
+        messages("assume_aligned_bad", bad),
+        [
+            "warning: 'assume_aligned' attribute only applies to function types [-Wattributes]",
+            "warning: 'assume_aligned' attribute argument 3 is not a power of 2 [-Wattributes]",
+            "warning: 'assume_aligned' attribute argument 16 is not in the range [0, 15] \
+             [-Wattributes]",
+            "error: wrong number of arguments specified for 'assume_aligned' attribute",
+            "error: wrong number of arguments specified for 'assume_aligned' attribute",
+        ]
+    );
+}

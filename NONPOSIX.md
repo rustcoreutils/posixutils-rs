@@ -128,7 +128,8 @@ Language and preprocessor additions:
  * `__attribute__` (and `__attribute`), with `noreturn unused aligned packed
    deprecated weak section visibility constructor destructor used noinline
    always_inline hot cold warn_unused_result format fallthrough nonstring
-   malloc pure sentinel no_sanitize_*` and their `__name__` spellings.
+   malloc pure sentinel no_sanitize_* assume_aligned` and their `__name__`
+   spellings (`assume_aligned`: the Linux kernel's `__assume_aligned`).
  * Statement expressions `({ ... })`.
  * `typeof` / `__typeof__` / `__typeof`, and the `__const`, `__volatile`,
    `__restrict`, `__inline`, `__signed`, `__extension__`, `__thread`,

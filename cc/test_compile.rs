@@ -263,6 +263,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         &mut strings,
         &source_name,
         &PreprocessConfig {
+            language: Default::default(),
             defines: &o.defines,
             undefines: &o.undefines,
             include_paths: &o.include_paths,

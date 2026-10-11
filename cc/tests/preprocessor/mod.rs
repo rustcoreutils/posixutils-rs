@@ -15,6 +15,7 @@ mod cmdline_options;
 mod conformance;
 mod directives;
 mod end_of_file;
+mod line_markers;
 mod macros;
 mod output_spacing;
 mod paste;

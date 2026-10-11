@@ -12,6 +12,7 @@
 pub mod cursor;
 pub mod lexer;
 pub mod literal;
+pub mod ppoutput;
 pub mod preprocess;
 
 // Re-export items used by main.rs
@@ -20,5 +21,5 @@ pub use lexer::{
     StreamTable, TokenType, Tokenizer,
 };
 pub use preprocess::{
-    preprocess_asm_file, preprocess_collecting, AsmPreprocessConfig, PreprocessConfig,
+    preprocess_asm_collecting, preprocess_asm_file, preprocess_collecting, PreprocessConfig,
 };

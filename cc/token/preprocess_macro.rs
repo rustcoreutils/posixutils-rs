@@ -604,7 +604,8 @@ impl<'a> Preprocessor<'a> {
                 MacroTokenValue::Char(c.clone())
             }
             TokenValue::HeaderName(h) => MacroTokenValue::String(h.clone()),
-            TokenValue::None => MacroTokenValue::None,
+            // A change of file is never inside a definition.
+            TokenValue::None | TokenValue::FileChange(_) => MacroTokenValue::None,
         };
 
         MacroToken {
@@ -1640,7 +1641,7 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// One `#define` line for one macro.
-    fn render_definition(&self, mac: &Macro, idents: &mut IdentTable) -> String {
+    pub(super) fn render_definition(&self, mac: &Macro, idents: &mut IdentTable) -> String {
         let mut out = format!("#define {}", mac.name);
 
         if mac.is_function {

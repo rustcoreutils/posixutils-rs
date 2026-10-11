@@ -170,3 +170,79 @@ fn asm_input_invalid_paste_is_two_tokens() {
     let dump = String::from_utf8_lossy(&dump.stdout);
     assert!(dump.contains(" 0000 01000000 02000000 04000000"), "{dump}");
 }
+
+/// The source the next three tests preprocess: definitions among the text,
+/// and blank lines.
+const DEFINING_ASM: &str =
+    "#define FOO 1\n#define BAR(x) x+1\n\n\nmov FOO, %eax\n#define BAZ 2\nmov BAZ, %eax\n";
+
+/// `-dM -E` of a `.S` lists the macros in force at its end, assembler-with-
+/// cpp's own among them, as gcc's does; c17 wrote nothing at all.
+#[test]
+fn asm_input_dash_dm_lists_the_macros() {
+    let w = WorkDir::new("asm_dm");
+    let src = w.write("x.S", DEFINING_ASM);
+    let r = crate::common::run_c17(&["-dM", "-E", &s(&src)]);
+    assert!(r.success, "{}", r.stderr);
+    let lines: Vec<&str> = r.stdout.lines().collect();
+    for want in [
+        "#define FOO 1",
+        "#define BAR(x) x+1",
+        "#define BAZ 2",
+        "#define __ASSEMBLER__ 1",
+    ] {
+        assert!(lines.contains(&want), "{want}: {}", r.stdout);
+    }
+    assert!(
+        !lines.iter().any(|l| l.starts_with("#define __STDC__ ")),
+        "{}",
+        r.stdout
+    );
+    assert!(!r.stdout.contains("mov"), "{}", r.stdout);
+}
+
+/// `-E -P` of a `.S` closes up the lines its directives stood on, as it does
+/// for C and as gcc does; c17 left a blank line for each.
+#[test]
+fn asm_input_dash_p_closes_up_directive_lines() {
+    let w = WorkDir::new("asm_p");
+    let src = w.write("x.S", DEFINING_ASM);
+    let r = crate::common::run_c17(&["-E", "-P", &s(&src)]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.stdout, "mov 1, %eax\nmov 2, %eax\n");
+}
+
+/// `-E` of a `.S` carries gcc's line markers, as C's does: c17 wrote none,
+/// so the text after a `#include` claimed the includer's lines. And `-dD`
+/// keeps the definitions where they stood. A line's indentation is gcc's,
+/// a tab written as one space.
+#[test]
+fn asm_input_dash_e_writes_line_markers() {
+    let w = WorkDir::new("asm_markers");
+    let inc = w.write("regs.h", "#define RET ret\n\tnop\n");
+    let src = w.write(
+        "x.S",
+        &format!("{DEFINING_ASM}#include \"regs.h\"\n\tRET\n"),
+    );
+    let (src, inc) = (s(&src), s(&inc));
+    let r = crate::common::run_c17(&["-E", &src]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        format!(
+            "# 0 \"{src}\"\n# 0 \"<built-in>\"\n# 0 \"<command-line>\"\n# 1 \"{src}\"\n\
+             \n\n\n\nmov 1, %eax\n\nmov 2, %eax\n\
+             # 1 \"{inc}\" 1\n\n nop\n# 9 \"{src}\" 2\n ret\n"
+        )
+    );
+    let r = crate::common::run_c17(&["-E", "-dD", "-P", &src]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(
+        r.stdout.ends_with(
+            "#define FOO 1\n#define BAR(x) x+1\nmov 1, %eax\n#define BAZ 2\n\
+             mov 2, %eax\n#define RET ret\n nop\n ret\n"
+        ),
+        "{}",
+        r.stdout
+    );
+}

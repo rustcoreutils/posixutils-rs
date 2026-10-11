@@ -20,8 +20,8 @@ use std::time::SystemTime;
 use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
     decode_string_spelling, escape_c_string, literal_payload, payload_bytes, payload_text,
-    show_token, tokens_to_source_bytes, write_token, IdentTable, LexerMode, Position, Punctuator,
-    SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
+    show_token, tokens_to_source_bytes, write_token, FileChange, IdentTable, LexerMode, Position,
+    Punctuator, SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
 };
 use super::literal;
 use crate::arch;
@@ -343,7 +343,8 @@ impl Macro {
                             // one is lexed only inside #include -- but the
                             // type carries it back either way.
                             TokenValue::HeaderName(h) => MacroTokenValue::String(h.clone()),
-                            TokenValue::None => MacroTokenValue::None,
+                            // A change of file is never inside a definition.
+                            TokenValue::None | TokenValue::FileChange(_) => MacroTokenValue::None,
                         };
                         MacroToken {
                             typ: token.typ,
@@ -487,6 +488,17 @@ struct Conditional {
     seen_else: bool,
     /// Position of the #if/#ifdef/#ifndef directive
     pos: Position,
+}
+
+/// Where an inclusion stands in its includer, as the `-E` line markers
+/// around the included text say.
+#[derive(Debug, Clone, Copy)]
+struct IncludeSite {
+    /// The line of the `#include`, which the output is brought up to before
+    /// the file is entered.
+    from: Position,
+    /// The line after it, where the includer resumes.
+    back: Position,
 }
 
 /// What `-E` keeps of the source's comments.
@@ -1586,17 +1598,28 @@ impl<'a> Preprocessor<'a> {
     ) {
         let stream_id = diag::init_stream("<command-line>");
         let hash = Token::new(TokenType::Special, Position::new(stream_id, 1, 1));
+        // gcc's `<command-line>` has the one line, 0, and the file returns
+        // to it.
+        let line_zero = Position::new(stream_id, 0, 1);
+        let site = IncludeSite {
+            from: line_zero,
+            back: line_zero,
+        };
 
-        // Searched like `#include "..."`: the working directory first, then
-        // `-I`, then the system paths.
-        match self.find_include_file(path, false, false) {
+        // Searched like `#include "..."`, but from the working directory
+        // rather than the source's, as gcc's `-include` is -- and named from
+        // it, `./inc.h` -- then `-I`, then the system paths.
+        let source_dir = std::mem::replace(&mut self.current_dir, ".".to_string());
+        let found = self.find_include_file(path, false, false);
+        self.current_dir = source_dir;
+        match found {
             Some((IncludeSource::File(found), pos)) => {
                 // A `-include` is a dependency exactly as a `#include` is.
                 self.record_dependency(&found, pos);
-                self.include_file(&found, output, idents, &hash, pos)
+                self.include_file(&found, output, idents, &hash, site, pos)
             }
             Some((IncludeSource::Builtin(content), _)) => {
-                self.include_builtin(path, content, output, idents, &hash)
+                self.include_builtin(path, content, output, idents, &hash, site)
             }
             None => diag::error_args(hash.pos, "'{0}': file not found", &[path]),
         }
@@ -1617,12 +1640,23 @@ impl<'a> Preprocessor<'a> {
         pre_includes: &[String],
         idents: &mut IdentTable,
     ) -> Vec<Token> {
-        for path in imacros {
-            self.include_from_cmdline(path, &mut Vec::new(), idents);
-        }
+        // An `-imacros` file's text is thrown away, but `-E` still marks
+        // entering and leaving it, as gcc's does.
         let mut included = Vec::new();
+        for path in imacros {
+            let mut text = Vec::new();
+            self.include_from_cmdline(path, &mut text, idents);
+            included.extend(text.into_iter().filter(|t| t.typ == TokenType::FileChange));
+        }
         for path in pre_includes {
             self.include_from_cmdline(path, &mut included, idents);
+        }
+        // Where `-E` names the source again, after the command line -- but
+        // not a `.i`, whose own markers name what it holds, as gcc's
+        // `-fpreprocessed` has it.
+        if let Some(first) = tokens.first().filter(|_| !self.preprocessed) {
+            let pos = Position::new(first.pos.stream, 1, 1);
+            self.mark_file_change(&mut included, FileChange::Rename, pos);
         }
 
         let mut output = self.preprocess(tokens, idents);
@@ -1753,21 +1787,30 @@ impl<'a> Preprocessor<'a> {
     /// that name redefines nothing and is not reported: zstd builds its
     /// programs with `-DZSTD_LEGACY_SUPPORT=5 -UZSTD_LEGACY_SUPPORT
     /// -DZSTD_LEGACY_SUPPORT=0` under `-Werror`.
+    ///
+    /// Returns the directives applied, as `-dD` writes them, in order.
     fn apply_cmdline_macros(
         &mut self,
         defines: &[String],
         undefines: &[String],
         idents: &mut IdentTable,
-    ) {
+    ) -> Vec<String> {
+        let mut applied = Vec::new();
         for def in defines {
             let name_end = def.find(['=', '(']).unwrap_or(def.len());
-            if !undefines.iter().any(|u| *u == def[..name_end]) {
+            let name = &def[..name_end];
+            if !undefines.iter().any(|u| u == name) {
                 self.define_from_cmdline(def, idents);
+                if let Some(mac) = self.macros.get(name).cloned() {
+                    applied.push(self.render_definition(&mac, idents));
+                }
             }
         }
         for undef in undefines {
             self.undef_from_cmdline(undef, idents);
+            applied.push(format!("#undef {undef}"));
         }
+        applied
     }
 
     /// Check if a macro is defined
@@ -2064,7 +2107,9 @@ impl<'a> Preprocessor<'a> {
     /// Establish that the physical line after the current directive is line
     /// `line` of `name` (or of the file it already belongs to): what `#line`
     /// (C17 6.10.4) and a `# N "file"` linemarker both mean.
-    fn set_line_marker(&mut self, line: u32, name: Option<String>, is_system: bool) {
+    ///
+    /// Returns the stream the text after the directive is attributed to.
+    fn set_line_marker(&mut self, line: u32, name: Option<String>, is_system: bool) -> u16 {
         let origin = self.physical_stream;
         let prior = self.linemarkers.get(&origin);
         let (target, name) = match name {
@@ -2085,6 +2130,19 @@ impl<'a> Preprocessor<'a> {
                 name,
             },
         );
+        target
+    }
+
+    /// For `-E`, which writes a line marker for it, put a change of file at
+    /// `pos` in the output.
+    fn mark_file_change(&self, output: &mut Vec<Token>, change: FileChange, pos: Position) {
+        if self.preprocess_only {
+            output.push(Token::with_value(
+                TokenType::FileChange,
+                pos,
+                TokenValue::FileChange(change),
+            ));
+        }
     }
 
     /// A `#define`'s replacement list: the rest of the line, with its
@@ -3246,8 +3304,12 @@ fn remove_duplicate_dirs(
 }
 
 /// Configuration for preprocessing command-line options
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PreprocessConfig<'a> {
+    /// What the source is written in: C, or gcc's assembler-with-cpp (a
+    /// `.S`), which lexes a few characters differently, predefines
+    /// `__ASSEMBLER__` and none of the C standard's `__STDC__` macros.
+    pub language: LexerMode,
     /// Command-line -D defines
     pub defines: &'a [String],
     /// Command-line -U undefines
@@ -3431,9 +3493,12 @@ pub struct PreprocessOutcome {
     /// Every macro in force at the end, as `#define` lines, sorted (`-dM`).
     /// Empty unless asked for: rendering them is not free.
     pub macro_definitions: Vec<String>,
-    /// Under `-dD`, the macros in force before the source -- predefined and
-    /// from the command line -- as `#define` lines, sorted. Empty otherwise.
+    /// Under `-dD`, the macros the compiler predefines, as `#define` lines,
+    /// sorted. Empty otherwise.
     pub initial_definitions: Vec<String>,
+    /// Under `-dD`, the command line's `-D` and `-U` as the `#define` and
+    /// `#undef` lines they stand for, in the order applied. Empty otherwise.
+    pub cmdline_definitions: Vec<String>,
     /// Every header opened, in the order first opened, with whether it came
     /// from a system directory (the `-M` family). Empty unless asked for.
     pub dependencies: Vec<(PathBuf, bool)>,
@@ -3465,11 +3530,21 @@ pub fn preprocess_collecting(
     if config.no_builtin_inc {
         pp.use_builtin_headers = false;
     }
+    // Included files are lexed as the source is.
+    pp.lexer_mode = config.language;
     pp.trigraphs = config.trigraphs;
     pp.preprocessed = config.preprocessed;
     pp.comments = config.comments;
     pp.collect_dependencies = config.collect_dependencies;
     pp.macro_prefix_map = config.macro_prefix_map.clone();
+
+    let assembly = config.language == LexerMode::Assembly;
+    // Assembly is not C, so nothing the C standard predefines applies.
+    if assembly {
+        pp.undef_macro("__STDC__");
+        pp.undef_macro("__STDC_VERSION__");
+        pp.undef_macro("__STDC_HOSTED__");
+    }
 
     if config.undef {
         pp.keep_only_standard_macros();
@@ -3481,27 +3556,36 @@ pub fn preprocess_collecting(
         define_exceptions_macro(&mut pp, config.exceptions);
         define_cfi_macro(&mut pp, config.cfi);
     }
+    // gcc's mark of assembler-with-cpp, which `-undef` keeps.
+    if assembly {
+        pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
+    }
 
     pp.set_include_paths(config.include_paths);
 
-    // -D, then -U, which wins
-    pp.apply_cmdline_macros(config.defines, config.undefines, idents);
-
-    // `-dD`: what is defined now is what the source starts with; from here
-    // on each directive is carried where it stands, `-include`d ones too.
-    pp.preprocess_only = config.preprocess_only;
+    // `-dD`: the definitions the compiler starts with, then the command
+    // line's directives as applied; from the source on each directive is
+    // carried where it stands, `-include`d ones too.
     let initial_definitions = if config.keep_definitions {
-        pp.keep_definitions = true;
         pp.macro_definitions(idents)
     } else {
         Vec::new()
     };
+    // -D, then -U, which wins
+    let cmdline_definitions = pp.apply_cmdline_macros(config.defines, config.undefines, idents);
+    pp.preprocess_only = config.preprocess_only;
+    pp.keep_definitions = config.keep_definitions;
 
     let output = pp.preprocess_unit(tokens, config.imacros, config.pre_includes, idents);
 
     let outcome = PreprocessOutcome {
         macro_definitions: if config.dump_macros {
             pp.macro_definitions(idents)
+        } else {
+            Vec::new()
+        },
+        cmdline_definitions: if config.keep_definitions {
+            cmdline_definitions
         } else {
             Vec::new()
         },
@@ -3512,55 +3596,6 @@ pub fn preprocess_collecting(
 }
 
 // Assembly File Preprocessing
-
-/// Configuration for assembly file preprocessing
-#[derive(Debug, Clone, Default)]
-pub struct AsmPreprocessConfig<'a> {
-    /// Command-line -D defines
-    pub defines: &'a [String],
-    /// Command-line -U undefines
-    pub undefines: &'a [String],
-    /// Command-line -I include paths
-    pub include_paths: &'a [String],
-    /// Where the system headers are; see [`SystemSearch`].
-    pub search: SystemSearch<'a>,
-    /// If true, disable system include paths (-nostdinc)
-    pub no_std_inc: bool,
-    /// What optimization was asked for; see [`PreprocessConfig::optimization`].
-    /// GCC defines these for `.S` files too.
-    pub optimization: crate::opt::Optimization,
-    /// See [`PreprocessConfig::position`]; gcc defines the macros for `.S`
-    /// files too, where hand-written assembly chooses GOT or direct accesses
-    /// by them.
-    pub position: crate::target::PositionIndependence,
-    /// See [`PreprocessConfig::isa`].
-    pub isa: crate::target::X86Isa,
-    /// See [`PreprocessConfig::cf_protection`]: a `.S` reads `__CET__` to
-    /// decide whether to start its functions with `endbr64`.
-    pub cf_protection: crate::target::CfProtection,
-    /// See [`PreprocessConfig::exceptions`]: gcc defines `__EXCEPTIONS` for
-    /// a `.S` too.
-    pub exceptions: bool,
-    /// See [`PreprocessConfig::cfi`]: a `.S` reads
-    /// `__GCC_HAVE_DWARF2_CFI_ASM` to decide whether to write `.cfi_*`.
-    pub cfi: crate::target::Cfi,
-    /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
-    /// is mapped as in C.
-    pub macro_prefix_map: PrefixMap,
-    /// See [`PreprocessConfig::collect_dependencies`]: a `.S` is preprocessed,
-    /// so the `-M` family has a rule to write for it.
-    pub collect_dependencies: bool,
-    /// See [`PreprocessConfig::pre_includes`]: gcc applies `-include` to a
-    /// `.S` as to C, and glibc and Kbuild force-include their configuration
-    /// headers into every one.
-    pub pre_includes: &'a [String],
-    /// See [`PreprocessConfig::imacros`].
-    pub imacros: &'a [String],
-    /// See [`PreprocessConfig::undef`]; `__ASSEMBLER__` stays.
-    pub undef: bool,
-    /// See [`PreprocessConfig::comments`].
-    pub comments: Comments,
-}
 
 /// A preprocessed `.S`: the text for `as`, and the headers it read.
 #[derive(Debug, Default)]
@@ -3586,14 +3621,40 @@ impl std::fmt::Display for AsmPreprocessFailed {
 
 impl std::error::Error for AsmPreprocessFailed {}
 
+/// Lex and preprocess an assembly file (`.S`) as gcc's assembler-with-cpp
+/// does: the preprocessed tokens, what [`PreprocessConfig`] asked to be
+/// collected, and the stream the file was registered as.
+///
+/// The same preprocessor as C, whatever `config.language` says: the file is
+/// lexed in assembly mode (`'` opens no literal, `#` that names no directive
+/// is text), its headers likewise, and the predefined macros are
+/// assembler-with-cpp's.
+pub fn preprocess_asm_collecting(
+    content: &[u8],
+    target: &Target,
+    idents: &mut IdentTable,
+    filename: &str,
+    config: &PreprocessConfig<'_>,
+) -> (Vec<Token>, PreprocessOutcome, u16) {
+    let stream_id = diag::init_stream(filename);
+    let tokens = Tokenizer::new_with_mode(content, stream_id, idents, LexerMode::Assembly)
+        .keeping_comments(config.comments.lexed())
+        .tokenize();
+    let config = PreprocessConfig {
+        language: LexerMode::Assembly,
+        ..config.clone()
+    };
+    let (tokens, outcome) = preprocess_collecting(tokens, target, idents, filename, &config);
+    (tokens, outcome, stream_id)
+}
+
 /// Preprocess an assembly file (.S) and return the preprocessed text.
 ///
-/// This uses the same preprocessor as C files but with assembly-specific
-/// comment syntax (`;` for line comments, no `//` or `/* */`).
+/// See [`preprocess_asm_collecting`].
 ///
 /// # Returns
 /// The preprocessed assembly text, as bytes, with the headers read when
-/// [`AsmPreprocessConfig::collect_dependencies`] asks: a string literal's payload is a
+/// [`PreprocessConfig::collect_dependencies`] asks: a string literal's payload is a
 /// byte sequence, so rendering it through a Rust `String` would re-encode
 /// every byte >= 0x80. `Err` means this call reported a diagnostic -- a
 /// `#error`, a missing include -- and the bytes are not worth assembling.
@@ -3607,68 +3668,12 @@ pub fn preprocess_asm_file(
     content: &[u8],
     target: &Target,
     filename: &str,
-    config: &AsmPreprocessConfig<'_>,
+    config: &PreprocessConfig<'_>,
 ) -> Result<AsmPreprocessed, AsmPreprocessFailed> {
     let errors_on_entry = diag::error_count();
-    // Create string table for tokenization
     let mut strings = IdentTable::new();
-
-    // Initialize stream for this file
-    let stream_id = diag::init_stream(filename);
-
-    // Tokenize with assembly mode (`;` comments)
-    let tokens = {
-        let mut tokenizer =
-            Tokenizer::new_with_mode(content, stream_id, &mut strings, LexerMode::Assembly)
-                .keeping_comments(config.comments.lexed());
-        tokenizer.tokenize()
-    };
-
-    // Create preprocessor with assembly-specific predefined macros. The C
-    // standard macros are undefined immediately below, so nothing the language
-    // mode contributes survives into an assembly translation unit.
-    let mut pp = Preprocessor::new(target, filename, &config.search);
-
-    // Use assembly lexer mode for included files as well
-    pp.lexer_mode = LexerMode::Assembly;
-    pp.comments = config.comments;
-    pp.macro_prefix_map = config.macro_prefix_map.clone();
-    pp.collect_dependencies = config.collect_dependencies;
-
-    // Undefine C-specific macros that don't apply to assembly
-    pp.undef_macro("__STDC__");
-    pp.undef_macro("__STDC_VERSION__");
-    pp.undef_macro("__STDC_HOSTED__");
-
-    if config.undef {
-        pp.keep_only_standard_macros();
-    } else {
-        define_optimization_macros(&mut pp, config.optimization);
-        define_pic_macros(&mut pp, target, config.position);
-        define_isa_macros(&mut pp, target, config.isa);
-        define_cet_macro(&mut pp, target, config.cf_protection);
-        define_exceptions_macro(&mut pp, config.exceptions);
-        define_cfi_macro(&mut pp, config.cfi);
-    }
-
-    // Define __ASSEMBLER__ (GCC-compatible, indicates assembly preprocessing)
-    pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
-
-    // -nostdinc: the directories are dropped in `Preprocessor::new`; the
-    // bundled headers go with them.
-    if config.no_std_inc {
-        pp.use_builtin_headers = false;
-    }
-
-    pp.set_include_paths(config.include_paths);
-
-    // -D, then -U, which wins
-    pp.apply_cmdline_macros(config.defines, config.undefines, &mut strings);
-
-    let preprocessed =
-        pp.preprocess_unit(tokens, config.imacros, config.pre_includes, &mut strings);
-
-    // Convert tokens back to text
+    let (preprocessed, outcome, _) =
+        preprocess_asm_collecting(content, target, &mut strings, filename, config);
     let text = tokens_to_source_bytes(&preprocessed, &strings);
 
     if diag::error_count() != errors_on_entry {
@@ -3676,7 +3681,7 @@ pub fn preprocess_asm_file(
     }
     Ok(AsmPreprocessed {
         text,
-        dependencies: std::mem::take(&mut pp.dependencies),
+        dependencies: outcome.dependencies,
     })
 }
 

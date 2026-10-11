@@ -59,11 +59,11 @@ fn preprocessor_argument_keeps_its_parameters_space() {
 }
 
 /// Every file a line marker names is a file, or one of the pseudo-names gcc
-/// writes for text that has none. Tools read the markers as a dependency
-/// list: perl's `makedepend` turns each into a make prerequisite, drops
-/// `<built-in>` and `<command-line>`, and choked on `<builtin:stdarg.h>`
-/// ("target pattern contains no '%'") -- c17's bundled headers are not on
-/// disk.
+/// writes for text that has none, `<built-in>` and `<command-line>`. Tools
+/// read the markers as a dependency list: perl's `makedepend` turns each
+/// into a make prerequisite, drops those two, and choked on
+/// `<builtin:stdarg.h>` ("target pattern contains no '%'") -- c17's bundled
+/// headers are not on disk.
 #[test]
 fn preprocessor_markers_name_files_or_gcc_pseudo_files() {
     let dir = plib::tmp::Builder::new()
@@ -82,7 +82,10 @@ fn preprocessor_markers_name_files_or_gcc_pseudo_files() {
     for line in r.stdout.lines().filter(|l| l.starts_with("# ")) {
         let name = line.split('"').nth(1).expect("marker without a name");
         if name.starts_with('<') {
-            assert_eq!(name, "<built-in>", "marker {line:?}");
+            assert!(
+                matches!(name, "<built-in>" | "<command-line>"),
+                "marker {line:?}"
+            );
             pseudo += 1;
         } else {
             assert!(

@@ -21,8 +21,7 @@ use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
 use posixutils_cc::target::Target;
 use posixutils_cc::token::{
-    preprocess_asm_file, preprocess_collecting, AsmPreprocessConfig, PreprocessConfig, StreamTable,
-    Tokenizer,
+    preprocess_asm_file, preprocess_collecting, PreprocessConfig, StreamTable, Tokenizer,
 };
 use posixutils_cc::types::{TypeKind, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -772,7 +771,7 @@ fn preprocess_assembler(
     let content = std::fs::read(file)?;
     let target = Target::host();
 
-    let config = AsmPreprocessConfig {
+    let config = PreprocessConfig {
         defines,
         undefines,
         include_paths: &args.include_paths,
@@ -792,6 +791,7 @@ fn preprocess_assembler(
         imacros: &[],
         undef: false,
         comments: Default::default(),
+        ..Default::default()
     };
     // A #error or a missing include makes the remaining bytes not worth
     // assembling: `as` would bury the real diagnostic under syntax errors.

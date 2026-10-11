@@ -134,7 +134,7 @@ impl<'a> Preprocessor<'a> {
                 // linemarker `# N "file" flags` -- the form `c17 -E` writes
                 // and POSIX 87981 makes a `.i` operand.
                 if directive_token.typ == TokenType::Number && !self.is_skipping() {
-                    self.handle_linemarker(iter, &directive_token);
+                    self.handle_linemarker(iter, &directive_token, output);
                     return;
                 }
                 // Anything else after the `#` -- a punctuator, a literal --
@@ -192,7 +192,7 @@ impl<'a> Preprocessor<'a> {
             crate::kw::PP_ERROR => self.handle_error(iter, &hash_token.pos, idents),
             crate::kw::WARNING => self.handle_warning(iter, &hash_token.pos, idents),
             crate::kw::PRAGMA => self.handle_pragma(iter, output, idents, hash_token.pos),
-            crate::kw::LINE => self.handle_line(iter, idents, hash_token.pos),
+            crate::kw::LINE => self.handle_line(iter, output, idents, hash_token.pos),
             // `#ident` and `#sccs` carry a version string for the object file.
             // c17 records nothing, but they are directives it knows, so they
             // are consumed rather than reported as unknown -- GCC is silent
@@ -251,7 +251,12 @@ impl<'a> Preprocessor<'a> {
     /// identifier. C17 has no such directive; this is the GCC form that
     /// `c17 -E` itself writes, and `#line` is deliberately *not* routed here
     /// (GCC honors only this form in a preprocessed file, and so does c17).
-    fn handle_linemarker(&mut self, iter: &mut TokenCursor, number: &Token) {
+    fn handle_linemarker(
+        &mut self,
+        iter: &mut TokenCursor,
+        number: &Token,
+        output: &mut Vec<Token>,
+    ) {
         let TokenValue::Number(ref text) = number.value else {
             self.skip_to_eol(iter);
             return;
@@ -286,22 +291,37 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Flags 1 (entering) and 2 (returning) are attribution the stream
-        // registry already derives; 4 (extern "C") means nothing here. Only 3
-        // carries a decision: it marks a system header, whose warnings are
-        // not the user's to act on.
+        // registry already derives, and `-E` writes them again; 4 (extern
+        // "C") means nothing here. 3 carries a decision: it marks a system
+        // header, whose warnings are not the user's to act on.
         let mut is_system = false;
+        let (mut entering, mut returning) = (false, false);
+        // Where the text stood before the marker, which an entry is made from.
+        let from = self.remap_pos(number.pos);
         while let Some(tok) = iter.peek() {
             if tok.pos.newline {
                 break;
             }
             if let TokenValue::Number(flag) = &tok.value {
-                if flag == "3" {
-                    is_system = true;
+                match flag.as_str() {
+                    "1" => entering = true,
+                    "2" => returning = true,
+                    "3" => is_system = true,
+                    _ => {}
                 }
             }
             iter.next();
         }
-        self.set_line_marker(line, name, is_system);
+        let stream = self.set_line_marker(line, name, is_system);
+        let at = Position::new(stream, line, 1);
+        let (change, pos) = if entering {
+            (FileChange::Enter { stream }, from)
+        } else if returning {
+            (FileChange::Return, at)
+        } else {
+            (FileChange::Rename, at)
+        };
+        self.mark_file_change(output, change, pos);
     }
 
     /// Skip tokens until end of line
@@ -851,6 +871,12 @@ impl<'a> Preprocessor<'a> {
             diag::error(hash_token.pos, &gettext("expected filename after #include"));
             return;
         }
+        // The includer resumes on the line after the directive, which may
+        // have run on over spliced lines. The `#` is already where any
+        // `#line` put it; the operand is counted from it physically.
+        let directive_lines = path_tokens
+            .last()
+            .map_or(0, |t| t.pos.line.saturating_sub(self.physical_line));
 
         // Check if we need macro expansion (C99 6.10.2)
         // If the first token is not < or ", expand macros first
@@ -900,15 +926,23 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
+        let site = IncludeSite {
+            from: hash_token.pos,
+            back: Position {
+                line: hash_token.pos.line + directive_lines + 1,
+                ..hash_token.pos
+            },
+        };
+
         // Find and include the file
         if let Some((source, pos)) = self.find_include_file(&filename, is_system, is_include_next) {
             match source {
                 IncludeSource::File(path) => {
                     self.record_dependency(&path, pos);
-                    self.include_file(&path, output, idents, hash_token, pos);
+                    self.include_file(&path, output, idents, hash_token, site, pos);
                 }
                 IncludeSource::Builtin(content) => {
-                    self.include_builtin(&filename, content, output, idents, hash_token);
+                    self.include_builtin(&filename, content, output, idents, hash_token, site);
                 }
             }
         } else {
@@ -1201,6 +1235,7 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
         hash_token: &Token,
+        site: IncludeSite,
         search_pos: Option<SearchPos>,
     ) {
         // Canonicalize path for cycle detection
@@ -1309,16 +1344,8 @@ impl<'a> Preprocessor<'a> {
         // is decided after this one finishes, below.
         let guard = Self::guard_of(&tokens, idents);
 
-        // Preprocess the included tokens
         let preprocessed = self.preprocess(tokens, idents);
-
-        // Filter out stream markers from included content
-        for token in preprocessed {
-            match token.typ {
-                TokenType::StreamBegin | TokenType::StreamEnd => {}
-                _ => output.push(token),
-            }
-        }
+        self.splice_included(output, preprocessed, stream_id, site);
 
         // The file has now been read through to the end, so what its guard
         // protects is known rather than guessed.
@@ -1346,6 +1373,7 @@ impl<'a> Preprocessor<'a> {
         output: &mut Vec<Token>,
         idents: &mut IdentTable,
         hash_token: &Token,
+        site: IncludeSite,
     ) {
         // Check include depth
         if self.include_depth >= self.max_include_depth {
@@ -1380,16 +1408,8 @@ impl<'a> Preprocessor<'a> {
             tokenizer.tokenize()
         };
 
-        // Preprocess the included tokens
         let preprocessed = self.preprocess(tokens, idents);
-
-        // Filter out stream markers from included content
-        for token in preprocessed {
-            match token.typ {
-                TokenType::StreamBegin | TokenType::StreamEnd => {}
-                _ => output.push(token),
-            }
-        }
+        self.splice_included(output, preprocessed, stream_id, site);
 
         // Restore state
         self.include_depth -= 1;
@@ -1401,6 +1421,26 @@ impl<'a> Preprocessor<'a> {
         self.report_unterminated_conditionals();
         self.cond_stack = saved_cond_stack;
         self.current_search_pos = saved_search_pos;
+    }
+
+    /// Put an included file's tokens in the includer's output, without the
+    /// file's own stream markers, and -- for `-E`, which writes line markers
+    /// for them -- between the entry into stream `stream` and the return
+    /// from it, at `site`.
+    fn splice_included(
+        &self,
+        output: &mut Vec<Token>,
+        included: Vec<Token>,
+        stream: u16,
+        site: IncludeSite,
+    ) {
+        self.mark_file_change(output, FileChange::Enter { stream }, site.from);
+        output.extend(
+            included
+                .into_iter()
+                .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd)),
+        );
+        self.mark_file_change(output, FileChange::Return, site.back);
     }
 
     fn handle_error(&mut self, iter: &mut TokenCursor, pos: &Position, idents: &IdentTable) {
@@ -1758,6 +1798,7 @@ impl<'a> Preprocessor<'a> {
     fn handle_line(
         &mut self,
         iter: &mut TokenCursor,
+        output: &mut Vec<Token>,
         idents: &mut IdentTable,
         directive_pos: Position,
     ) {
@@ -1822,7 +1863,13 @@ impl<'a> Preprocessor<'a> {
             _ => None,
         });
         let is_system = diag::stream_is_system(self.physical_stream);
-        self.set_line_marker(line_num, name, is_system);
+        let stream = self.set_line_marker(line_num, name, is_system);
+        // gcc's `-E` marks the change whether or not it moves the text.
+        self.mark_file_change(
+            output,
+            FileChange::Rename,
+            Position::new(stream, line_num, 1),
+        );
     }
 
     /// The line number a `#line` digit sequence names, as gcc reads it.

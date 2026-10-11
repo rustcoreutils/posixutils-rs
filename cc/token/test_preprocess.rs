@@ -2029,7 +2029,7 @@ fn test_assembly_collects_dependencies_when_asked() {
     let tree = SearchTree::new(&[("q/regs.h", "#define RET ret\n")]);
     let include_paths = [tree.path("q")];
     let run = |collect_dependencies| {
-        let config = AsmPreprocessConfig {
+        let config = PreprocessConfig {
             include_paths: &include_paths,
             collect_dependencies,
             ..Default::default()
@@ -2086,7 +2086,9 @@ fn test_search_pos_order_is_the_search_order() {
 
 /// `-dD`: each `#define` and `#undef` that takes effect travels in the
 /// output as its own text, where it stood, and the definitions in force
-/// before the source come back separately.
+/// before the source come back separately: the compiler's own, and the
+/// command line's `-D` and `-U` in the order applied, which gcc writes
+/// under `<built-in>` and `<command-line>` respectively.
 #[test]
 fn test_keep_definitions_carries_the_directives() {
     let input = "#define A  1\nA\n#undef A\n#if 0\n#define B 2\n#endif\n#define F(x) ( x+1 )\n";
@@ -2094,7 +2096,8 @@ fn test_keep_definitions_carries_the_directives() {
     let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
     let config = PreprocessConfig {
         keep_definitions: true,
-        defines: &["CMD=7".to_string()],
+        defines: &["CMD=7".to_string(), "GONE".to_string()],
+        undefines: &["GONE".to_string(), "NEVER".to_string()],
         ..Default::default()
     };
     let (out, outcome) =
@@ -2102,13 +2105,22 @@ fn test_keep_definitions_carries_the_directives() {
     let carried: Vec<String> = out.iter().filter_map(pragma_text).collect();
     assert_eq!(carried, ["#define A 1", "#undef A", "#define F(x) ( x+1 )"]);
     assert!(get_token_strings(&out, &idents).contains(&"1".to_string()));
-    for want in ["#define __STDC__ 1", "#define CMD 7"] {
-        assert!(
-            outcome.initial_definitions.iter().any(|d| d == want),
-            "{want}: {:?}",
-            outcome.initial_definitions
-        );
-    }
+    assert!(
+        outcome
+            .initial_definitions
+            .iter()
+            .any(|d| d == "#define __STDC__ 1"),
+        "{:?}",
+        outcome.initial_definitions
+    );
+    assert!(!outcome
+        .initial_definitions
+        .iter()
+        .any(|d| d.contains("CMD")));
+    assert_eq!(
+        outcome.cmdline_definitions,
+        ["#define CMD 7", "#undef GONE", "#undef NEVER"]
+    );
 
     // Without the option, nothing is carried and nothing collected.
     let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
@@ -2121,6 +2133,77 @@ fn test_keep_definitions_carries_the_directives() {
     );
     assert!(out.iter().all(|t| pragma_text(t).is_none()));
     assert!(outcome.initial_definitions.is_empty());
+    assert!(outcome.cmdline_definitions.is_empty());
+}
+
+/// For `-E`, each inclusion is bracketed by its entry and return, with the
+/// directive's line and the line after it, even for a header that yields
+/// no token; the `-include` files come first, entered from and returning to
+/// `<command-line>`'s line 0; and the source starts again at line 1 after
+/// them. A compile gets none of these.
+#[test]
+fn test_file_changes_mark_every_inclusion() {
+    let tree = SearchTree::new(&[
+        ("q/empty.h", "#define E 1\n"),
+        ("q/text.h", "int t;\n"),
+        ("q/pre.h", "int p;\n"),
+    ]);
+    let include_paths = [tree.path("q")];
+    let pre = [tree.path("q/pre.h")];
+    let input = "int a;\n#include \"empty.h\"\n#include \\\n\"text.h\"\nint b;\n";
+    let run = |preprocess_only| {
+        let mut idents = IdentTable::new();
+        let main = diag::init_stream("<test>");
+        let tokens = Tokenizer::new(input.as_bytes(), main, &mut idents).tokenize();
+        let config = PreprocessConfig {
+            include_paths: &include_paths,
+            pre_includes: &pre,
+            preprocess_only,
+            ..Default::default()
+        };
+        let (out, _) =
+            preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+        out.iter()
+            .filter_map(|t| match t.value {
+                TokenValue::FileChange(change) => {
+                    let (name, line, _) = diag::effective_position(t.pos);
+                    Some((change, name, line))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let changes = run(true);
+    let entered = |change: &FileChange| match change {
+        FileChange::Enter { stream } => diag::effective_position(Position::new(*stream, 1, 1)).0,
+        _ => String::new(),
+    };
+    let summary: Vec<String> = changes
+        .iter()
+        .map(|(change, name, line)| {
+            let what = match change {
+                FileChange::Enter { .. } => format!("enter {}", entered(change)),
+                FileChange::Return => "return".to_string(),
+                FileChange::Rename => "rename".to_string(),
+            };
+            format!("{what} @ {name}:{line}")
+        })
+        .collect();
+    let q = tree.path("q");
+    assert_eq!(
+        summary,
+        [
+            format!("enter {} @ <command-line>:0", pre[0]),
+            "return @ <command-line>:0".to_string(),
+            "rename @ <test>:1".to_string(),
+            format!("enter {q}/empty.h @ <test>:2"),
+            "return @ <test>:3".to_string(),
+            format!("enter {q}/text.h @ <test>:3"),
+            // The directive ran on over a spliced line.
+            "return @ <test>:5".to_string(),
+        ]
+    );
+    assert!(run(false).is_empty());
 }
 
 /// `-iquote` directories are searched for the `"..."` form only, after the
@@ -2727,7 +2810,7 @@ fn test_assembly_leaves_unknown_directives_alone() {
         b"# save the frame pointer\n#! odd\n#foo bar\n\tnop\n",
         &Target::host(),
         "t.S",
-        &AsmPreprocessConfig::default(),
+        &PreprocessConfig::default(),
     );
     let lines = crate::diag::take_captured_diagnostics();
     assert!(out.is_ok(), "{lines:?}");
@@ -2779,7 +2862,7 @@ fn test_assembly_hash_lines_pass_through() {
           # 100 \"foo.S\"\n.long __LINE__\n# save FOO\n#if 0\n# 5 x\n#endif\nnop\n",
         &Target::host(),
         "t.S",
-        &AsmPreprocessConfig::default(),
+        &PreprocessConfig::default(),
     )
     .expect("preprocesses");
     let text = String::from_utf8_lossy(&out.text);
@@ -2817,7 +2900,7 @@ fn test_assembly_invalid_paste_keeps_both_tokens() {
           SIZE(\\name)\nSEC(1)\nARG(%eax, %ebx)\n",
         &Target::host(),
         "t.S",
-        &AsmPreprocessConfig::default(),
+        &PreprocessConfig::default(),
     );
     let lines = crate::diag::take_captured_diagnostics();
     assert!(lines.is_empty(), "{lines:?}");
@@ -3114,7 +3197,7 @@ fn test_cfi_asm_macro_follows_the_cfi() {
         let numbers: Vec<_> = out.iter().filter(|t| t.typ == TokenType::Number).collect();
         assert_eq!(numbers.len(), usize::from(defined), "{cfi:?}");
 
-        let config = AsmPreprocessConfig {
+        let config = PreprocessConfig {
             cfi,
             ..Default::default()
         };

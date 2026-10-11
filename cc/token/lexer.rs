@@ -249,6 +249,27 @@ pub enum TokenType {
     /// takes the start-of-line status of where it stands and leaves it for
     /// the token after it, so that it hides no directive.
     Comment,
+    /// Where `-E` writes a line marker for a change of file, the change in
+    /// the value (a [`FileChange`]). Only `-E` asks for them: an `#include`
+    /// enters a file and returns from it whether or not the file yields a
+    /// token, and the markers say so whatever the text between them.
+    FileChange,
+}
+
+/// A change of file `-E` marks, as gcc's `-E` marks it; the token's
+/// position says where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    /// An `#include`, or a `-include`, standing at the token's position,
+    /// enters the file of stream `stream` at its line 1 (gcc's flag 1).
+    Enter { stream: u16 },
+    /// Back in the includer, at the token's position: the line after the
+    /// `#include` (gcc's flag 2).
+    Return,
+    /// The text that follows is at the token's position, reached by no
+    /// inclusion: the primary source after the command line's `-include`
+    /// files, or what a `#line` or a linemarker without a flag names.
+    Rename,
 }
 
 /// Special tokens (operators and punctuators)
@@ -630,6 +651,8 @@ pub enum TokenValue {
     /// `<stdio.h>` or `"local.h"`. A payload like the literals above: one
     /// `char` per source byte.
     HeaderName(String),
+    /// What a [`TokenType::FileChange`] marks.
+    FileChange(FileChange),
 }
 
 // Token
@@ -1962,6 +1985,10 @@ fn show_other_token(token: &Token, strings: &StringTable) -> String {
     match token.typ {
         TokenType::StreamBegin => "<STREAM_BEGIN>".to_string(),
         TokenType::StreamEnd => "<STREAM_END>".to_string(),
+        TokenType::FileChange => match &token.value {
+            TokenValue::FileChange(change) => format!("<FILE_CHANGE {change:?}>"),
+            _ => "<FILE_CHANGE>".to_string(),
+        },
         TokenType::Pragma => match &token.value {
             TokenValue::String(s) => format!("<PRAGMA {s}>"),
             _ => "<PRAGMA>".to_string(),
@@ -2024,6 +2051,7 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
         TokenType::Special => "SPECIAL",
         TokenType::StreamBegin => "STREAM_BEGIN",
         TokenType::StreamEnd => "STREAM_END",
+        TokenType::FileChange => "FILE_CHANGE",
     }
 }
 
@@ -2058,7 +2086,7 @@ pub fn tokens_to_source_bytes(tokens: &[Token], strings: &StringTable) -> Vec<u8
     for token in tokens {
         // Skip stream markers
         match token.typ {
-            TokenType::StreamBegin | TokenType::StreamEnd => continue,
+            TokenType::StreamBegin | TokenType::StreamEnd | TokenType::FileChange => continue,
             _ => {}
         }
 

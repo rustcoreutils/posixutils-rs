@@ -45,7 +45,7 @@ use target::Os;
 use target::{classify_std, StdRequest, Target};
 use token::{
     preprocess_asm_file, preprocess_collecting, show_token, strip_bom, token_type_name,
-    write_token, AsmPreprocessConfig, PreprocessConfig, TokenType,
+    PreprocessConfig,
 };
 
 // Runtime Library Selection
@@ -980,12 +980,57 @@ impl Args {
     }
 }
 
-/// Preprocess an assembler operand under `-E` and write the text out.
+/// The preprocessor's options from the command line, as every operand that
+/// is preprocessed is given them.
+fn preprocess_config<'a>(args: &'a Args, target: &Target) -> PreprocessConfig<'a> {
+    PreprocessConfig {
+        language: token::lexer::LexerMode::C,
+        defines: &args.defines,
+        undefines: &args.undefines,
+        include_paths: &args.include_paths,
+        search: system_search(args),
+        no_std_inc: args.no_std_inc,
+        no_builtin_inc: args.no_builtin_inc,
+        trigraphs: args.trigraphs,
+        preprocessed: false,
+        comments: args.comments(),
+        pre_includes: &args.pre_includes,
+        imacros: &args.imacros,
+        undef: args.undef,
+        dump_macros: args.dump_macros,
+        // Only `-E` writes the text the directives are carried into.
+        keep_definitions: args.dump_definitions && args.preprocess_only,
+        collect_dependencies: args.wants_dependencies(),
+        preprocess_only: args.preprocess_only,
+        optimization: args.optimization(),
+        position: position_independence(args, target),
+        isa: target::X86Isa::from_flags(&args.mflags),
+        cf_protection: args.cf_protection.unwrap_or_default(),
+        exceptions: args.unwind_tables().exceptions(),
+        cfi: args.unwind_tables().cfi(target, args.debug > 0),
+        macro_prefix_map: args.prefix_maps().macros,
+    }
+}
+
+/// The options a `.S` (or, under `-E`, a `.s`) is preprocessed with: the
+/// command line's, but for trigraphs, which the assembler's preprocessing
+/// does not replace, and the dependency rule, which only a `.S` has -- gcc
+/// writes none for a `.s`, under `-M` or `-MD`.
+fn asm_preprocess_config<'a>(args: &'a Args, target: &Target, path: &str) -> PreprocessConfig<'a> {
+    PreprocessConfig {
+        language: token::lexer::LexerMode::Assembly,
+        trigraphs: false,
+        collect_dependencies: args.wants_dependencies() && args.lang_of(path) == Lang::AsmCpp,
+        ..preprocess_config(args, target)
+    }
+}
+
+/// Preprocess an assembler operand under `-E` (or `-M`) and write the text
+/// out.
 ///
-/// The same pass `assemble_operand` runs before handing a `.S` to `as`, with
-/// the result going to the preprocessed sink instead of a scratch file. A `.s`
-/// has no directives to act on, so this is a copy for it -- which is also what
-/// gcc does rather than skipping the operand. Under `-M`/`-MM` the rule is the
+/// A `.S` is written as C is, line markers and all, through the same writer:
+/// `-P`, `-dM` and `-dD` mean what they mean for C. A `.s` has no directives
+/// to act on, so this is a copy for it. Under `-M`/`-MM` the rule is the
 /// whole output, so the text is not written.
 fn preprocess_asm_operand(
     path: &str,
@@ -993,12 +1038,42 @@ fn preprocess_asm_operand(
     target: &Target,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    let preprocessed = preprocess_asm(path, args, target)?;
+    if args.lang_of(path) != Lang::AsmCpp {
+        let preprocessed = preprocess_asm(path, args, target)?;
+        if args.dependencies_replace_output() {
+            return Ok(());
+        }
+        out.write_all(&preprocessed)?;
+        return out.flush();
+    }
+    let (content, name) = read_operand(path)?;
+    let content = strip_bom(&content);
+    let config = asm_preprocess_config(args, target, path);
+    let mut strings = StringTable::new();
+    let (preprocessed, outcome, _) =
+        token::preprocess_asm_collecting(content, target, &mut strings, name, &config);
+    if config.collect_dependencies {
+        write_dependency_rule(args, path, &outcome.dependencies)?;
+    }
     if args.dependencies_replace_output() {
+        if diag::has_error() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "preprocessing failed",
+            ));
+        }
         return Ok(());
     }
-    out.write_all(&preprocessed)?;
-    out.flush()
+    emit_preprocessed(
+        args,
+        &preprocessed,
+        &outcome,
+        &strings,
+        name,
+        pp_layout(args, token::lexer::LexerMode::Assembly, false),
+        out,
+    )
+    .map(|_| ())
 }
 
 /// Run the preprocessor over an assembler operand, the `.S` form's first
@@ -1010,34 +1085,20 @@ fn preprocess_asm_operand(
 fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8>> {
     let (content, name) = read_operand(path)?;
     let content = strip_bom(&content);
-    // Only a `.S` is preprocessed, so only a `.S` has a rule: gcc writes none
-    // for a `.s`, under `-M` or `-MD`.
-    let collect_dependencies = args.wants_dependencies() && args.lang_of(path) == Lang::AsmCpp;
-    let config = AsmPreprocessConfig {
-        optimization: args.optimization(),
-        position: position_independence(args, target),
-        isa: target::X86Isa::from_flags(&args.mflags),
-        cf_protection: args.cf_protection.unwrap_or_default(),
-        exceptions: args.unwind_tables().exceptions(),
-        cfi: args.unwind_tables().cfi(target, args.debug > 0),
-        defines: &args.defines,
-        undefines: &args.undefines,
-        include_paths: &args.include_paths,
-        search: system_search(args),
-        no_std_inc: args.no_std_inc,
-        macro_prefix_map: args.prefix_maps().macros,
-        collect_dependencies,
-        pre_includes: &args.pre_includes,
-        comments: args.comments(),
-        imacros: &args.imacros,
-        undef: args.undef,
+    // The text goes to `as`, which wants neither `-E`'s line markers nor a
+    // `-dM` list: those are written by `preprocess_asm_operand`.
+    let config = PreprocessConfig {
+        dump_macros: false,
+        keep_definitions: false,
+        preprocess_only: false,
+        ..asm_preprocess_config(args, target, path)
     };
     // Catches #error, a missing include, and friends.
     let preprocessed = preprocess_asm_file(content, target, name, &config).map_err(|e| {
         diag::reset_counts();
         io::Error::new(io::ErrorKind::InvalidData, e.to_string())
     })?;
-    if collect_dependencies {
+    if config.collect_dependencies {
         write_dependency_rule(args, path, &preprocessed.dependencies)?;
     }
     Ok(preprocessed.text)
@@ -1075,9 +1136,9 @@ fn write_dependency_rule(
     let headers: Vec<String> = dependencies
         .iter()
         .filter(|(_, is_system)| !(*is_system && args.dependencies_omit_system()))
-        .map(|(path, _)| escape_for_make(&path.to_string_lossy()))
+        .map(|(path, _)| escape_for_make(without_dot_slash(&path.to_string_lossy())))
         .collect();
-    let named_source = (source != "-").then(|| escape_for_make(source));
+    let named_source = (source != "-").then(|| escape_for_make(without_dot_slash(source)));
     let prerequisites: Vec<&String> = named_source.iter().chain(&headers).collect();
 
     // gcc wraps near 80 columns; the exact column is cosmetic, the
@@ -1114,6 +1175,15 @@ fn write_dependency_rule(
             io::stdout().flush()
         }
     }
+}
+
+/// A prerequisite as gcc names it: without the `./` it may start with --
+/// `#include "./x.h"`, or a `-include` found in the working directory.
+fn without_dot_slash(mut path: &str) -> &str {
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest.trim_start_matches('/');
+    }
+    path
 }
 
 /// A path as make will read it back.
@@ -1188,287 +1258,69 @@ fn dependency_sink(args: &Args, source: &str) -> Option<std::path::PathBuf> {
     })
 }
 
+/// How `-E` lays out the text of a source in `language`, `preprocessed`
+/// when it is a `.i`.
+fn pp_layout(
+    args: &Args,
+    language: token::lexer::LexerMode,
+    preprocessed: bool,
+) -> token::ppoutput::Layout {
+    token::ppoutput::Layout {
+        markers: !args.no_line_markers,
+        language,
+        preprocessed,
+    }
+}
+
 /// Write the preprocessed token stream for `-E`.
 ///
 /// STDOUT (88032-88038) requires the output to carry at least one
 /// `# <line> "<file>"` line for each file processed via #include, so that a
 /// consumer can attribute the text; RATIONALE (88370-88374) names makefile
-/// dependency generation as the purpose.
+/// dependency generation as the purpose. The markers are gcc's, one for one;
+/// see [`token::ppoutput::write_preprocessed`].
+///
+/// `-dM` asks what the macros are, not what the source becomes, so it
+/// replaces the output rather than adding to it.
 fn emit_preprocessed(
     args: &Args,
     preprocessed: &[token::lexer::Token],
     outcome: &token::preprocess::PreprocessOutcome,
     strings: &StringTable,
     display_path: &str,
-    stream_id: u16,
-    out: &mut Outputs,
+    layout: token::ppoutput::Layout,
+    out: &mut dyn Write,
 ) -> io::Result<Compiled> {
-    // Output preprocessed tokens.
-    //
-    // STDOUT (88032-88038) requires the -E output to carry at least one
-    // `# <line> "<file>"` line for each file processed via #include, so
-    // that a consumer can attribute the text; RATIONALE (88370-88374)
-    // names makefile dependency generation as the purpose.
-    //
-    // `include_file` strips the included stream's begin/end tokens, so the
-    // transition is detected from `pos.stream` instead. The trailing flag
-    // follows GCC: 1 on entering a file, 2 on returning to one.
-    // Start by naming the primary source, as GCC does: a consumer needs
-    // that even when the first token comes from an #include.
-    //
-    // The line numbers are physical. `#line` is *not* reflected: it sets
-    // state on the preprocessor and is never recorded in the stream
-    // registry, so `effective_position` cannot see it either — the same
-    // pre-existing gap that keeps parser diagnostics on physical lines.
-    // `-dM` asks what the macros are, not what the source becomes, so it
-    // replaces the output rather than adding to it.
     if args.dump_macros {
         for line in &outcome.macro_definitions {
-            writeln!(out.preprocessed, "{}", line)?;
+            writeln!(out, "{}", line)?;
         }
-        out.preprocessed.flush()?;
-        if diag::has_error() != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "preprocessing failed",
-            ));
-        }
-        return Ok(Compiled::Nothing);
-    }
-
-    // `-P` asks for the text alone. Everything that would emit a marker
-    // below checks this; a marker is never merely cosmetic, so each site
-    // has to say what it does instead.
-    let markers = !args.no_line_markers;
-    // `-dD`: the definitions the source starts with, under gcc's name for
-    // where they came from. The marker naming the source follows, so the
-    // line count is right again for what comes after.
-    if !outcome.initial_definitions.is_empty() {
-        if markers {
-            writeln!(out.preprocessed, "# 1 \"<built-in>\"")?;
-        }
-        for line in &outcome.initial_definitions {
-            writeln!(out.preprocessed, "{}", line.trim_end())?;
-        }
-    }
-    if markers {
-        writeln!(
-            out.preprocessed,
-            "# 1 \"{}\"",
-            token::lexer::escape_c_string(display_path)
-        )?;
-    }
-    let mut emitted_marker_for: Vec<u16> = vec![stream_id];
-    let mut current_stream: Option<u16> = Some(stream_id);
-    let mut at_line_start = true;
-    // The next token was sent back to its own source line.
-    let mut returned = false;
-    // The source line the next output line stands for.
-    //
-    // Directives and blank lines produce no tokens, so without this the
-    // output would close up the gaps they leave and every line after the
-    // first `#define` would claim a number several too low. The markers
-    // are the only record of where the text came from, so `c17 -E x.c -o
-    // x.i` followed by `c17 -c x.i` would report an error in `x.c` at the
-    // wrong line.
-    let mut current_line: u32 = 1;
-    let mut spelling: Vec<u8> = Vec::new();
-
-    let mut iter = preprocessed.iter().peekable();
-    while let Some(token) = iter.next() {
-        if args.verbose {
+        out.flush()?;
+    } else if args.verbose {
+        for token in preprocessed {
             writeln!(
-                out.preprocessed,
+                out,
                 "{:>4}:{:<3} {:12} {}",
                 token.pos.line,
                 token.pos.col,
                 token_type_name(token.typ),
                 show_token(token, strings)
             )?;
-        } else {
-            // A `#pragma pack` travels to the parser as a marker token
-            // carrying an internal payload, and `show_token` spells that
-            // payload `<PRAGMA pack:set:1>` -- a debug form, not C. It was
-            // reaching the output, so `c17 -E` on any source using the
-            // pragma produced a file that neither c17 nor gcc would
-            // compile. Write the directive that produced it instead;
-            // dropping it would lose the packing, which is the one thing
-            // the marker exists to carry.
-            let pragma = if token.typ == TokenType::Pragma {
-                // `pack` and `scalar_storage_order` travel decoded, because
-                // the parser acts on them; every other pragma travels as its
-                // own text. Dropping the second kind is what made `c17 -E`
-                // keep one pragma line out of five, so an `-E`/compile split
-                // silently meant something different from compiling in one
-                // step.
-                match token::preprocess::LayoutPragma::from_token(token) {
-                    Some(action) => Some(action.to_pragma_text()),
-                    None => match token::preprocess::pragma_text(token) {
-                        Some(text) => Some(text),
-                        None => continue,
-                    },
-                }
-            } else {
-                None
-            };
-
-            let text = match &pragma {
-                Some(directive) => directive.clone(),
-                None => {
-                    let text = show_token(token, strings);
-                    // Skip stream markers (e.g., <STREAM_BEGIN>,
-                    // <STREAM_END>) but NOT the '<' operator or '<=', etc.
-                    if text.starts_with("<STREAM")
-                        || text.starts_with("<ident")
-                        || text.starts_with("<special")
-                    {
-                        continue;
-                    }
-                    text
-                }
-            };
-
-            if current_stream != Some(token.pos.stream) {
-                let (name, line, _) = diag::effective_position(token.pos);
-                let returning = emitted_marker_for.contains(&token.pos.stream);
-                if !returning {
-                    emitted_marker_for.push(token.pos.stream);
-                }
-                if !at_line_start {
-                    writeln!(out.preprocessed)?;
-                    at_line_start = true;
-                }
-                if markers {
-                    writeln!(
-                        out.preprocessed,
-                        "# {} \"{}\" {}",
-                        line,
-                        token::lexer::escape_c_string(token::preprocess::marker_file_name(&name)),
-                        if returning { 2 } else { 1 }
-                    )?;
-                }
-                current_stream = Some(token.pos.stream);
-                current_line = line;
-            }
-
-            // Put the token back on the line it came from. Every consumed
-            // directive and every blank line is a gap the token stream
-            // does not carry, so it has to be reopened here or the count
-            // drifts for the rest of the file.
-            if at_line_start {
-                let (name, line, _) = diag::effective_position(token.pos);
-                if line > current_line {
-                    // GCC's threshold: up to seven blank lines are smaller
-                    // than a marker, eight or more are not.
-                    const MAX_BLANK_RUN: u32 = 7;
-                    if !markers {
-                        // `-P` is asked for by things that are not C
-                        // compilers, which want the text and nothing
-                        // standing in for the lines that produced it. gcc
-                        // collapses the run rather than padding it out.
-                    } else if line - current_line <= MAX_BLANK_RUN {
-                        for _ in 0..(line - current_line) {
-                            writeln!(out.preprocessed)?;
-                        }
-                    } else {
-                        writeln!(
-                            out.preprocessed,
-                            "# {} \"{}\"",
-                            line,
-                            token::lexer::escape_c_string(token::preprocess::marker_file_name(
-                                &name
-                            ))
-                        )?;
-                    }
-                    current_line = line;
-                }
-            }
-
-            // A directive owns its line: it has to start one, and the text
-            // after it has to start another.
-            if pragma.is_some() {
-                if !at_line_start {
-                    writeln!(out.preprocessed)?;
-                    current_line += 1;
-                }
-                writeln!(out.preprocessed, "{}", text)?;
-                current_line += 1;
-                at_line_start = true;
-                // The text after it starts its own line afresh: a `_Pragma`
-                // that a later line's token sent back to its line leaves no
-                // space owed to that token.
-                returned = false;
-                continue;
-            }
-
-            // Byte for byte: a literal's payload holds one `char` per
-            // source byte, so writing `text` re-encoded every byte >= 0x80
-            // as two and `c17 -E` changed what the string held.
-            spelling.clear();
-            if at_line_start {
-                // A token sent back to its line (below) keeps at least the
-                // one space its separation from the last token asked for.
-                let indent = token::lexer::indentation(token.pos);
-                spelling.resize(indent.max(usize::from(returned)), b' ');
-            }
-            returned = false;
-            write_token(&mut spelling, token, strings);
-            out.preprocessed.write_all(&spelling)?;
-            at_line_start = false;
-            // A comment `-C` keeps may run over lines of its own, and the
-            // token after one that starts a line inherits its start of line,
-            // though it may stand on the line the comment ends on.
-            let comment = token.typ == TokenType::Comment;
-            if comment {
-                current_line += text.matches('\n').count() as u32;
-            }
-            // Check next token to determine separator
-            if let Some(next) = iter.peek() {
-                let after_comment_on_its_line = comment
-                    && next.pos.stream == token.pos.stream
-                    && !matches!(next.typ, TokenType::StreamBegin | TokenType::StreamEnd)
-                    && diag::effective_position(next.pos).1 == current_line;
-                if next.pos.newline && !after_comment_on_its_line {
-                    writeln!(out.preprocessed)?;
-                    current_line += 1;
-                    at_line_start = true;
-                } else if markers
-                    && next.pos.stream == token.pos.stream
-                    && diag::effective_position(next.pos).1 > current_line
-                {
-                    // A token from a later line than this one, though no
-                    // newline precedes it: one after a macro invocation
-                    // whose arguments ran on, or the first of an expansion
-                    // after one. gcc puts it back on its own line (its
-                    // `do_line_change`), so the text keeps its lines; the
-                    // start of the next line reopens the gap. Only for
-                    // white space or an expansion boundary in gcc, but
-                    // nothing else reaches a later line without a newline.
-                    writeln!(out.preprocessed)?;
-                    current_line += 1;
-                    at_line_start = true;
-                    returned = true;
-                } else {
-                    // A space where the source had one, and wherever the
-                    // two would otherwise lex back as different tokens.
-                    let next_text = show_token(next, strings);
-                    let needs_space =
-                        next.pos.whitespace || token::spellings_merge(&text, &next_text);
-                    if needs_space {
-                        write!(out.preprocessed, " ")?;
-                    }
-                }
-            }
         }
+        out.flush()?;
+    } else {
+        token::ppoutput::write_preprocessed(
+            out,
+            preprocessed,
+            strings,
+            display_path,
+            token::ppoutput::InitialDefinitions {
+                builtin: &outcome.initial_definitions,
+                cmdline: &outcome.cmdline_definitions,
+            },
+            layout,
+        )?;
     }
-    // The output ends with a newline, but the last token already wrote one
-    // unless it was mid-line. Writing unconditionally left a trailing blank
-    // line that gcc does not produce.
-    if !args.verbose && !at_line_start {
-        writeln!(out.preprocessed)?;
-    }
-    // The sink may be a file, and a BufWriter's Drop discards errors.
-    out.preprocessed.flush()?;
     // Check for preprocessor errors (e.g., #error directive)
     if diag::has_error() != 0 {
         return Err(io::Error::new(
@@ -1493,16 +1345,16 @@ fn process_file(
     // processing that produced it "shall not be repeated when the file is
     // compiled". Phases 1 and 2 are part of that processing, so neither runs
     // here; phase 4 is narrowed to GCC's allowlist inside the preprocessor.
-    let preprocessed = args.lang_of(path) == Lang::Preprocessed;
+    let dot_i = args.lang_of(path) == Lang::Preprocessed;
 
     // Create shared string table for identifier interning
     let mut strings = StringTable::new();
 
-    let (tokens, stream_id) = pipeline::source_tokens(
+    let (tokens, _) = pipeline::source_tokens(
         &buffer,
         display_path,
         args.trigraphs,
-        preprocessed,
+        dot_i,
         args.comments(),
         &mut strings,
     );
@@ -1545,30 +1397,8 @@ fn process_file(
         &mut strings,
         path,
         &PreprocessConfig {
-            defines: &args.defines,
-            undefines: &args.undefines,
-            include_paths: &args.include_paths,
-            search: system_search(args),
-            no_std_inc: args.no_std_inc,
-            no_builtin_inc: args.no_builtin_inc,
-            trigraphs: args.trigraphs,
-            preprocessed,
-            comments: args.comments(),
-            pre_includes: &args.pre_includes,
-            imacros: &args.imacros,
-            undef: args.undef,
-            dump_macros: args.dump_macros,
-            // Only `-E` writes the text the directives are carried into.
-            keep_definitions: args.dump_definitions && args.preprocess_only,
-            collect_dependencies: args.wants_dependencies(),
-            preprocess_only: args.preprocess_only,
-            optimization: args.optimization(),
-            position: position_independence(args, target),
-            isa: target::X86Isa::from_flags(&args.mflags),
-            cf_protection: args.cf_protection.unwrap_or_default(),
-            exceptions: args.unwind_tables().exceptions(),
-            cfi: args.unwind_tables().cfi(target, args.debug > 0),
-            macro_prefix_map: prefix_maps.macros,
+            preprocessed: dot_i,
+            ..preprocess_config(args, target)
         },
     );
 
@@ -1599,8 +1429,8 @@ fn process_file(
             &outcome,
             &strings,
             display_path,
-            stream_id,
-            out,
+            pp_layout(args, token::lexer::LexerMode::C, dot_i),
+            out.preprocessed,
         );
     }
 

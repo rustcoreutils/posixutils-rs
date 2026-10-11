@@ -105,3 +105,36 @@ fn search_chain_iquote_duplicates_are_dropped() {
         assert_eq!(preprocess(p, opts, "q.c"), "int x = 2;", "{opts:?}");
     }
 }
+
+/// The host gcc's private headers (`<unwind.h>`) are found last, after
+/// every directory the command line and the target name, so a project's own
+/// `unwind.h` wins; and they go with the bundled headers under `-nostdinc`.
+#[cfg(target_os = "linux")]
+#[test]
+fn search_chain_host_compiler_headers_come_last() {
+    let host = run_c17(&["-print-file-name=include"]).stdout;
+    if !Path::new(host.trim()).join("unwind.h").is_file() {
+        return; // the host driver is not gcc
+    }
+    let dir = scratch();
+    std::fs::create_dir_all(dir.path().join("own")).unwrap();
+    std::fs::write(dir.path().join("own/unwind.h"), "#define OWN 1\n").unwrap();
+    std::fs::write(
+        dir.path().join("u.c"),
+        "#include <unwind.h>\n#ifdef OWN\nint own;\n#else\nint gcc_s = _URC_NO_REASON;\n#endif\n",
+    )
+    .unwrap();
+    let out = preprocess(dir.path(), &[], "u.c");
+    assert!(out.ends_with("int gcc_s = _URC_NO_REASON;"), "{out}");
+    for opts in [&["-I{}/own"][..], &["-idirafter", "{}/own"]] {
+        let out = preprocess(dir.path(), opts, "u.c");
+        assert!(out.ends_with("int own;"), "{opts:?}: {out}");
+    }
+    let u = dir.path().join("u.c");
+    let r = run_c17(&["-E", "-nostdinc", u.to_str().unwrap()]);
+    assert!(
+        !r.success && r.stderr.contains("'unwind.h': file not found"),
+        "{}",
+        r.stderr
+    );
+}

@@ -2953,7 +2953,7 @@ fn include_search_list(args: &Args, target: &Target) -> String {
 
     let mut angle = chain.bracket;
     if !args.no_std_inc && !args.no_builtin_inc {
-        angle.extend(host_include_dir());
+        angle.extend(linkargs::host_include_dir().map(str::to_string));
     }
     angle.extend(chain.system);
 
@@ -2965,18 +2965,6 @@ fn include_search_list(args: &Args, target: &Target) -> String {
     out.extend(angle.iter().filter(exists).map(entry));
     out.push_str("End of search list.\n");
     out
-}
-
-/// The host driver's answer to `-print-file-name=include`, when that is a
-/// directory.
-fn host_include_dir() -> Option<String> {
-    let out = linkargs::host_driver()
-        .arg("-print-file-name=include")
-        .output()
-        .ok()?;
-    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && Path::new(&dir).is_absolute() && Path::new(&dir).is_dir())
-        .then_some(dir)
 }
 
 /// Put `query` to the host driver and pass on its answer and exit status.

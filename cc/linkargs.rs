@@ -140,6 +140,22 @@ pub fn host_driver() -> Command {
     Command::new(HOST_DRIVER)
 }
 
+/// The host driver's answer to `-print-file-name=include` -- gcc's own
+/// include directory -- when that is a directory. Asked once per process.
+pub fn host_include_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let out = host_driver()
+            .arg("-print-file-name=include")
+            .output()
+            .ok()?;
+        let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && Path::new(&dir).is_absolute() && Path::new(&dir).is_dir())
+            .then_some(dir)
+    })
+    .as_deref()
+}
+
 /// The program name of the host C driver; see [`host_driver`].
 pub const HOST_DRIVER: &str = "cc";
 

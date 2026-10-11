@@ -984,7 +984,7 @@ impl<'a> Preprocessor<'a> {
         if !self.collect_dependencies {
             return;
         }
-        let is_system = matches!(pos, Some(SearchPos::System(_)));
+        let is_system = pos.is_some_and(SearchPos::is_system);
         // Listed once however many times it is included. Linear because the
         // list is short and its order is the output's order.
         if !self.dependencies.iter().any(|(p, _)| p == path) {
@@ -1061,6 +1061,19 @@ impl<'a> Preprocessor<'a> {
         // what `-isystem` and `-idirafter` put there.
         if let Some(found) = search_dirs(&self.system_include_paths, SearchPos::System) {
             return Some(found);
+        }
+
+        // Last, the host gcc's own include directory, for the private
+        // headers it has and c17 does not bundle. It goes with the bundled
+        // headers (`-nostdinc`, `-nobuiltininc`), and only a host compile
+        // may use it: its headers are the host target's.
+        if start <= SearchPos::HostCompiler && self.use_builtin_headers && self.target.is_host() {
+            if let Some(dir) = crate::linkargs::host_include_dir() {
+                let path = Path::new(dir).join(filename);
+                if path.exists() {
+                    return Some((IncludeSource::File(path), Some(SearchPos::HostCompiler)));
+                }
+            }
         }
 
         None
@@ -1275,7 +1288,7 @@ impl<'a> Preprocessor<'a> {
         // spelling. Its warnings are not shown, and neither `-Werror` nor
         // `-pedantic-errors` reaches it.
         let is_system = match search_pos {
-            Some(pos) => matches!(pos, SearchPos::System(_) | SearchPos::Bundled),
+            Some(pos) => pos.is_system(),
             None => diag::stream_is_system(hash_token.pos.stream),
         };
         diag::set_stream_system(stream_id, is_system);

@@ -51,7 +51,9 @@ const DEFAULT_INCLUDE_TRACK_CAPACITY: usize = 32;
 ///
 /// The chain is gcc's: the `-iquote` directories (for the `"..."` form
 /// only), the `-I` directories, then the directory of headers the compiler
-/// owns (here, the bundled ones), then the system directories.
+/// owns (here, the bundled ones), then the system directories, and last
+/// the host gcc's own include directory, for its private headers that c17
+/// does not bundle (`<unwind.h>`).
 /// `#include_next` resumes just after the position the current file came
 /// from, so a bundled header that forwards reaches the system's, and a `-I`
 /// header that forwards reaches the bundled one first. The variant order is
@@ -67,6 +69,14 @@ pub enum SearchPos {
     /// The system directory at this index: `-isystem`, the target's own,
     /// then `-idirafter`.
     System(usize),
+    /// The host gcc's include directory. gcc searches it ahead of the
+    /// target's directories; here it comes after them, where it costs a
+    /// query of the host driver only when nothing else has the header, and
+    /// what it holds that the bundled headers do not is found in neither.
+    HostCompiler,
+    /// Past the end of the chain: where `#include_next` resumes in a file
+    /// found at the very end.
+    End,
 }
 
 impl SearchPos {
@@ -79,7 +89,17 @@ impl SearchPos {
             Some(SearchPos::Quote(i)) => SearchPos::Quote(i + 1),
             Some(SearchPos::Bundled) => SearchPos::System(0),
             Some(SearchPos::System(i)) => SearchPos::System(i + 1),
+            Some(SearchPos::HostCompiler | SearchPos::End) => SearchPos::End,
         }
+    }
+
+    /// Whether a header found here is a system header, as gcc has it: one
+    /// from a system directory or the compiler's own.
+    pub(super) fn is_system(self) -> bool {
+        matches!(
+            self,
+            SearchPos::Bundled | SearchPos::System(_) | SearchPos::HostCompiler
+        )
     }
 }
 

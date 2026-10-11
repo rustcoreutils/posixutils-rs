@@ -2072,6 +2072,16 @@ fn test_search_pos_order_is_the_search_order() {
         SearchPos::after(Some(SearchPos::System(4))),
         SearchPos::System(5)
     );
+    // The host gcc's include directory comes after every system directory,
+    // and `#include_next` from a header found there finds nothing more.
+    assert!(SearchPos::System(usize::MAX) < SearchPos::HostCompiler);
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::HostCompiler)),
+        SearchPos::End
+    );
+    assert!(SearchPos::HostCompiler < SearchPos::End);
+    assert!(SearchPos::HostCompiler.is_system());
+    assert!(!SearchPos::Quote(0).is_system());
 }
 
 /// `-dD`: each `#define` and `#undef` that takes effect travels in the

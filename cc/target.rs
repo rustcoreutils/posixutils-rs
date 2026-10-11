@@ -2102,6 +2102,12 @@ impl Target {
         IntType::Int
     }
 
+    /// Whether this is the target c17 runs on, whose host toolchain is the
+    /// target's own.
+    pub fn is_host(&self) -> bool {
+        self.arch == Self::detect_arch() && self.os == Self::detect_os()
+    }
+
     /// Detect host architecture at runtime
     fn detect_arch() -> Arch {
         #[cfg(target_arch = "x86_64")]

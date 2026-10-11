@@ -146,3 +146,53 @@ fn codegen_no_unwind_tables_object_sections() {
     assert!(!debug.contains(".eh_frame"), "{debug}");
     assert!(debug.contains(".debug_frame"), "{debug}");
 }
+
+/// `<unwind.h>` is the compiler's own header, from gcc's private include
+/// directory, which c17 searches after every other: libbacktrace walks the
+/// stack with `_Unwind_Backtrace` and `_Unwind_GetIPInfo` and degrades to
+/// "no stack trace" without it. Each frame the walk reports has to be one
+/// of the functions on the stack. (macOS's SDK has its own `<unwind.h>`.)
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_unwind_h_walks_the_stack() {
+    let src = r#"
+#include <unwind.h>
+#include <stdint.h>
+
+struct walk { int n; uintptr_t ip[8]; };
+
+static _Unwind_Reason_Code step(struct _Unwind_Context *ctx, void *arg) {
+    struct walk *w = arg;
+    int before = 0;
+    uintptr_t ip = _Unwind_GetIPInfo(ctx, &before);
+    if (ip && w->n < 8)
+        w->ip[w->n++] = ip;
+    return _URC_NO_REASON;
+}
+
+__attribute__((noinline)) int inner(struct walk *w) {
+    w->n = 0;
+    return _Unwind_Backtrace(step, w) == _URC_END_OF_STACK ? w->n : -1;
+}
+
+__attribute__((noinline)) int outer(struct walk *w) { return inner(w) + 1; }
+
+static int within(uintptr_t ip, void *fn) {
+    uintptr_t f = (uintptr_t)fn;
+    return ip > f && ip - f < 256;
+}
+
+int main(void) {
+    struct walk w;
+    int n = outer(&w);
+    if (n < 4) return 10 + n;
+    if (!within(w.ip[0], (void *)inner)) return 2;
+    if (!within(w.ip[1], (void *)outer)) return 3;
+    if (!within(w.ip[2], (void *)main)) return 4;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(run_host_plain("unwind_h", src, &[opt]), 0, "at {opt}");
+    }
+}

@@ -177,6 +177,11 @@ fn abbrev<I: LirInst + EmitAsm>(
 /// Several shapes come in pairs because DWARF has no "absent" value: a
 /// function with no return type and one with a return type are different
 /// shapes, as are a variable that has a location and one that does not.
+///
+/// The entries go out in code order, 1, 2, 3, ...: DWARF allows any order,
+/// but gprofng's reader numbers the entries by position and drops the rest
+/// of the table at the first code out of place -- and with it every DIE
+/// that used one, so a profile lost its source.
 pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
     base.push_directive(Directive::DebugAbbrev);
     base.push_directive(Directive::local_label(".Ldebug_abbrev0"));
@@ -244,33 +249,6 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
         abbrev(base, code_noloc, tag, DW_CHILDREN_NO, var_attrs);
     }
 
-    // A file-scope object: where it was declared -- in any file of the unit,
-    // so the file is a `.file` number rather than always the first -- whether
-    // it is exported, and its address. A thread-local one has no address.
-    let global_attrs: &[(u64, u64)] = &[
-        (DW_AT_NAME, DW_FORM_STRING),
-        (DW_AT_DECL_FILE, DW_FORM_UDATA),
-        (DW_AT_DECL_LINE, DW_FORM_DATA4),
-        (DW_AT_TYPE, DW_FORM_REF4),
-        (DW_AT_EXTERNAL, DW_FORM_FLAG),
-    ];
-    let mut global_with_loc = global_attrs.to_vec();
-    global_with_loc.push((DW_AT_LOCATION, DW_FORM_BLOCK1));
-    abbrev(
-        base,
-        ABBREV_GLOBAL_VAR,
-        DW_TAG_VARIABLE,
-        DW_CHILDREN_NO,
-        &global_with_loc,
-    );
-    abbrev(
-        base,
-        ABBREV_GLOBAL_VAR_NOLOC,
-        DW_TAG_VARIABLE,
-        DW_CHILDREN_NO,
-        global_attrs,
-    );
-
     abbrev(
         base,
         ABBREV_BASE_TYPE,
@@ -327,6 +305,33 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
             &[(DW_AT_BYTE_SIZE, DW_FORM_DATA4)],
         );
     }
+
+    // A file-scope object: where it was declared -- in any file of the unit,
+    // so the file is a `.file` number rather than always the first -- whether
+    // it is exported, and its address. A thread-local one has no address.
+    let global_attrs: &[(u64, u64)] = &[
+        (DW_AT_NAME, DW_FORM_STRING),
+        (DW_AT_DECL_FILE, DW_FORM_UDATA),
+        (DW_AT_DECL_LINE, DW_FORM_DATA4),
+        (DW_AT_TYPE, DW_FORM_REF4),
+        (DW_AT_EXTERNAL, DW_FORM_FLAG),
+    ];
+    let mut global_with_loc = global_attrs.to_vec();
+    global_with_loc.push((DW_AT_LOCATION, DW_FORM_BLOCK1));
+    abbrev(
+        base,
+        ABBREV_GLOBAL_VAR,
+        DW_TAG_VARIABLE,
+        DW_CHILDREN_NO,
+        &global_with_loc,
+    );
+    abbrev(
+        base,
+        ABBREV_GLOBAL_VAR_NOLOC,
+        DW_TAG_VARIABLE,
+        DW_CHILDREN_NO,
+        global_attrs,
+    );
 
     // A zero code ends the table.
     base.push_directive(Directive::Uleb128(0));

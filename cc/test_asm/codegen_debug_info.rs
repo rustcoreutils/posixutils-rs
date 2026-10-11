@@ -136,6 +136,50 @@ fn codegen_debug_abbrev_offset_is_relocatable() {
     }
 }
 
+/// The abbreviation table lists its codes in order, 1, 2, 3, ...
+///
+/// DWARF allows any order, but gprofng's reader numbers the entries by
+/// position and stops at the first code out of place. The file-scope
+/// variable shapes (15, 16) had gone out between 7 and 8, so gprofng lost
+/// every shape after them -- the type DIEs, so the whole unit -- and a
+/// profile of a c17 program had no source (binutils' gp-archive.exp).
+#[test]
+fn codegen_debug_abbrev_codes_are_in_order() {
+    let src = "volatile long v;\nconst int c = 1;\nint *const p = 0;\n\
+               int f(int a) { volatile int b = a; return b + c + v; }\n";
+    for triple in [X86_64_LINUX, AARCH64_LINUX, DARWIN] {
+        let asm = asm_for_with("debug_abbrev_order", triple, src, &["-g", "-O0"]);
+        // The table's numbers, from its label to the next section.
+        let table: Vec<u64> = asm
+            .split_once("debug_abbrev0:")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("{triple}: no abbreviation table:\n{asm}"))
+            .lines()
+            .map(str::trim)
+            .take_while(|l| !l.starts_with(".section"))
+            .filter_map(|l| {
+                let v = l
+                    .strip_prefix(".uleb128 ")
+                    .or_else(|| l.strip_prefix(".byte "))?;
+                v.parse().ok()
+            })
+            .collect();
+        // code, tag, children, then (attribute, form) pairs up to (0, 0).
+        let mut codes = Vec::new();
+        let mut at = 0;
+        while table[at] != 0 {
+            codes.push(table[at]);
+            at += 3;
+            while (table[at], table[at + 1]) != (0, 0) {
+                at += 2;
+            }
+            at += 2;
+        }
+        let expected: Vec<u64> = (1..=codes.len() as u64).collect();
+        assert_eq!(codes, expected, "{triple}: abbreviation codes out of order");
+    }
+}
+
 /// `-g` is what turns all of this on; without it none of it appears.
 #[test]
 fn codegen_debug_directives_need_dash_g() {

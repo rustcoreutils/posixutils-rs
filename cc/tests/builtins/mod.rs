@@ -33,6 +33,7 @@ mod libm;
 mod math;
 mod mem_expand;
 mod mem_moves;
+mod mem_rep;
 mod memory;
 mod overflow_p_constant;
 mod stdio_fold;

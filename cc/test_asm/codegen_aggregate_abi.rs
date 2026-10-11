@@ -313,11 +313,12 @@ fn codegen_a_large_aggregate_zero_is_a_memset_call() {
     };
 
     for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        // Comfortably over `INLINE_LIMIT_BYTES` (128).
-        let big = asm_for_with("aggzero_big", triple, &src(4096), &["-O2"]);
+        // Comfortably over `INLINE_LIMIT_BYTES` (128), and the 8 KB x86-64
+        // fills in place with `rep stosq`.
+        let big = asm_for_with("aggzero_big", triple, &src(16384), &["-O2"]);
         assert!(
             big.contains("memset"),
-            "a 4096-byte zero-fill belongs in a memset call, not 512 stores, on {triple}:\n{big}"
+            "a 16384-byte zero-fill belongs in a memset call, not 2048 stores, on {triple}:\n{big}"
         );
 
         // And the unrolled form is still used where it is cheaper than a call.

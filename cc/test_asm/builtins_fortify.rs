@@ -20,7 +20,7 @@ const TRIPLES: [&str; 2] = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-g
 const PRELUDE: &str = "typedef unsigned long size_t;\n\
     typedef __builtin_va_list va_list;\n\
     #define os(p) __builtin_object_size(p, 0)\n\
-    char big[8192], small[8];\n\
+    char big[20000], small[8];\n\
     extern const char *s;\n\
     extern size_t n;\n\
     extern void use(char *);\n";
@@ -44,13 +44,15 @@ fn calls_in(asm: &str, name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Each case: a function body, and the one function it calls at `-O2`.
+/// Each case: a function body, and the one function it calls at `-O2`. A
+/// constant length that fits is past the 8 KB x86-64 does in place, so its
+/// plain call stays one.
 const CASES: &[(&str, &str)] = &[
     // A known object and a length known to fit: the plain call.
-    ("void *f(void) { return __builtin___memcpy_chk(big, s, 4096, os(big)); }", "memcpy"),
+    ("void *f(void) { return __builtin___memcpy_chk(big, s, 10000, os(big)); }", "memcpy"),
     // ... and the largest of two lengths fits.
     (
-        "void *f(int c) { return __builtin___memset_chk(big, 0, c ? 4096 : 5000, os(big)); }",
+        "void *f(int c) { return __builtin___memset_chk(big, 0, c ? 10000 : 12000, os(big)); }",
         "memset",
     ),
     // A known object and a length known only at run time: checked.
@@ -99,11 +101,11 @@ const CASES: &[(&str, &str)] = &[
     ),
     // A destination found only by propagation: a choice of two objects.
     (
-        "void *f(int c) { char *p = c ? big : big + 4000; return __builtin___memcpy_chk(p, s, 4096, os(p)); }",
+        "void *f(int c) { char *p = c ? big : big + 9000; return __builtin___memcpy_chk(p, s, 10000, os(p)); }",
         "memcpy",
     ),
     (
-        "void *f(int c) { char *p = c ? big + 8000 : small; return __builtin___memcpy_chk(p, s, 4096, os(p)); }",
+        "void *f(int c) { char *p = c ? big + 19000 : small; return __builtin___memcpy_chk(p, s, 10000, os(p)); }",
         "__memcpy_chk",
     ),
 ];
@@ -129,8 +131,8 @@ fn builtins_fortify_sees_through_an_inlined_wrapper() {
          static inline __attribute__((always_inline)) void *\n\
          my_memcpy(void *d, const void *s, size_t k)\n\
          {{ return __builtin___memcpy_chk(d, s, k, os(d)); }}\n\
-         void *fits(void) {{ return my_memcpy(big, s, 4096); }}\n\
-         void *overflows(void) {{ return my_memcpy(small, s, 4096); }}\n"
+         void *fits(void) {{ return my_memcpy(big, s, 10000); }}\n\
+         void *overflows(void) {{ return my_memcpy(small, s, 10000); }}\n"
     );
     for triple in TRIPLES {
         let asm = asm_for_with("fortify_inline", triple, &src, &["-O2"]);

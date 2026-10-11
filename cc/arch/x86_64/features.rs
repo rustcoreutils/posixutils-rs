@@ -1424,7 +1424,55 @@ impl X86_64CodeGen {
         });
     }
 
-    /// Emit __builtin_memset(dest, c, n) - calls memset
+    /// The length of a block operation done in place with `rep`: a constant
+    /// one up to gcc 13's cutoff for generic tuning, 8 KB, at every level.
+    /// (`ir::memexpand` has unrolled the short ones already, where it could
+    /// see the constant.) Past it, gcc calls the library, and so does this.
+    fn rep_block_length(&self, n: PseudoId) -> Option<i64> {
+        const REP_LIMIT_BYTES: i64 = 8192;
+        match self.get_location(n) {
+            Loc::Imm(v) => i64::try_from(v)
+                .ok()
+                .filter(|v| (0..=REP_LIMIT_BYTES).contains(v)),
+            _ => None,
+        }
+    }
+
+    /// A `memset` or `memcpy` of `bytes` with the arguments in place as for
+    /// the call (destination in %rdi, source in %rsi): `rep` of `insn`
+    /// over the whole eightbytes, then `tail` for each of the ragged end's
+    /// pieces -- at an offset from %rdi (and %rsi), which `rep` has moved
+    /// past the eightbytes -- and the call's value, the destination, in
+    /// %rax. Every register it writes, the call would have.
+    fn emit_rep_block(
+        &mut self,
+        bytes: i64,
+        insn: X86Inst,
+        mut tail: impl FnMut(&mut Self, i32, OperandSize),
+    ) {
+        let qwords = bytes / 8;
+        if qwords > 0 {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Imm(qwords),
+                dst: GpOperand::Reg(Reg::Rcx),
+            });
+            self.push_lir(insn);
+        }
+        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes % 8) {
+            tail(self, off as i32, OperandSize::from_bits(chunk.bits()));
+        }
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::BaseOffset {
+                base: Reg::Rdi,
+                offset: -(qwords as i32) * 8,
+            },
+            dst: Reg::Rax,
+        });
+    }
+
+    /// Emit __builtin_memset(dest, c, n) - calls memset, or for a constant
+    /// length of at most 8 KB stores it in place (`rep_block_length`).
     /// System V AMD64 ABI: dest in RDI, c in RSI, n in RDX, returns dest in RAX
     pub(super) fn emit_memset(&mut self, insn: &Instruction) {
         let dest = match insn.src.first() {
@@ -1446,10 +1494,39 @@ impl X86_64CodeGen {
         self.emit_move(c, Reg::Rsi, 32); // c is int (32-bit)
         self.emit_move(dest, Reg::Rdi, 64);
 
-        // Call memset
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
+        if let Some(bytes) = self.rep_block_length(n) {
+            // RAX = the byte, in every byte: its low eight bits times
+            // 0x0101010101010101.
+            self.push_lir(X86Inst::Movzx {
+                src_size: OperandSize::B8,
+                dst_size: OperandSize::B32,
+                src: GpOperand::Reg(Reg::Rsi),
+                dst: Reg::Rax,
+            });
+            self.push_lir(X86Inst::MovAbs {
+                imm: 0x0101_0101_0101_0101,
+                dst: Reg::Rcx,
+            });
+            self.push_lir(X86Inst::IMul2 {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::Rcx),
+                dst: Reg::Rax,
+            });
+            self.emit_rep_block(bytes, X86Inst::RepStosq, |cg, off, size| {
+                cg.push_lir(X86Inst::Mov {
+                    size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rdi,
+                        offset: off,
+                    }),
+                });
+            });
+        } else {
+            self.push_lir(X86Inst::Call {
+                target: CallTarget::Direct(Symbol::global(insn.library_callee())),
+            });
+        }
 
         // Store result from RAX to target (returns dest)
         if let Some(target) = target {
@@ -1458,7 +1535,8 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Emit __builtin_memcpy(dest, src, n) - calls memcpy
+    /// Emit __builtin_memcpy(dest, src, n) - calls memcpy, or for a constant
+    /// length of at most 8 KB copies it in place (`rep_block_length`).
     /// System V AMD64 ABI: dest in RDI, src in RSI, n in RDX, returns dest in RAX
     pub(super) fn emit_memcpy(&mut self, insn: &Instruction) {
         let dest = match insn.src.first() {
@@ -1480,10 +1558,30 @@ impl X86_64CodeGen {
         self.emit_move(src, Reg::Rsi, 64);
         self.emit_move(dest, Reg::Rdi, 64);
 
-        // Call memcpy
-        self.push_lir(X86Inst::Call {
-            target: CallTarget::Direct(Symbol::global(insn.library_callee())),
-        });
+        if let Some(bytes) = self.rep_block_length(n) {
+            self.emit_rep_block(bytes, X86Inst::RepMovsq, |cg, off, size| {
+                cg.push_lir(X86Inst::Mov {
+                    size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rsi,
+                        offset: off,
+                    }),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                cg.push_lir(X86Inst::Mov {
+                    size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rdi,
+                        offset: off,
+                    }),
+                });
+            });
+        } else {
+            self.push_lir(X86Inst::Call {
+                target: CallTarget::Direct(Symbol::global(insn.library_callee())),
+            });
+        }
 
         // Store result from RAX to target (returns dest)
         if let Some(target) = target {

@@ -19,7 +19,7 @@ use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, 
 use crate::token::preprocess::{
     LayoutPragma, PackAction, StorageOrderPragma, SymbolVisibility, VisibilityPragma,
 };
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{Type, TypeId, TypeKind, TypeTable};
 use gettextrs::gettext;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -772,11 +772,7 @@ impl<'a> Parser<'a> {
         let Some(tag_type) = typ.composite.as_ref().and_then(|c| c.tag_type) else {
             return self.types.intern(typ.clone());
         };
-        let type_qualifier_mask = TypeModifiers::CONST
-            | TypeModifiers::VOLATILE
-            | TypeModifiers::RESTRICT
-            | TypeModifiers::ATOMIC;
-        let qualifiers = typ.modifiers & type_qualifier_mask;
+        let qualifiers = typ.modifiers & Type::QUALIFIERS;
         if qualifiers.is_empty() {
             return tag_type;
         }

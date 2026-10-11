@@ -72,7 +72,8 @@ impl X86_64CodeGen {
 
         match addr_loc {
             Loc::Reg(r) => {
-                self.push_fp_mem_load(
+                self.push_fp_access_load(
+                    insn,
                     fp_size,
                     MemAddr::BaseOffset {
                         base: r,
@@ -87,7 +88,8 @@ impl X86_64CodeGen {
 
                 if is_symbol {
                     // Local variable - load directly from stack slot
-                    self.push_fp_mem_load(
+                    self.push_fp_access_load(
+                        insn,
                         fp_size,
                         self.stack_mem(offset - insn.displacement()),
                         dst_xmm,
@@ -99,7 +101,8 @@ impl X86_64CodeGen {
                         src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
-                    self.push_fp_mem_load(
+                    self.push_fp_access_load(
+                        insn,
                         fp_size,
                         MemAddr::BaseOffset {
                             base: Reg::R11,
@@ -111,12 +114,13 @@ impl X86_64CodeGen {
             }
             Loc::Global(name) => {
                 let src = self.global_mem(&name, insn.displacement(), Reg::R11);
-                self.push_fp_mem_load(fp_size, src, dst_xmm);
+                self.push_fp_access_load(insn, fp_size, src, dst_xmm);
             }
             _ => {
                 // Load address into R11, then load from that address
                 self.emit_move(addr, Reg::R11, 64);
-                self.push_fp_mem_load(
+                self.push_fp_access_load(
+                    insn,
                     fp_size,
                     MemAddr::BaseOffset {
                         base: Reg::R11,
@@ -175,7 +179,8 @@ impl X86_64CodeGen {
             Loc::Reg(_) => {
                 // Use the saved register (R11 if it was RAX, otherwise original)
                 let r = addr_reg.unwrap_or(Reg::Rax);
-                self.push_fp_mem_store(
+                self.push_fp_access_store(
+                    insn,
                     fp_size,
                     XmmReg::Xmm15,
                     MemAddr::BaseOffset {
@@ -190,7 +195,8 @@ impl X86_64CodeGen {
 
                 if is_symbol {
                     // Local variable - store directly to stack slot
-                    self.push_fp_mem_store(
+                    self.push_fp_access_store(
+                        insn,
                         fp_size,
                         XmmReg::Xmm15,
                         self.stack_mem(offset - insn.displacement()),
@@ -202,7 +208,8 @@ impl X86_64CodeGen {
                         src: GpOperand::Mem(self.stack_mem(offset)),
                         dst: GpOperand::Reg(Reg::R11),
                     });
-                    self.push_fp_mem_store(
+                    self.push_fp_access_store(
+                        insn,
                         fp_size,
                         XmmReg::Xmm15,
                         MemAddr::BaseOffset {
@@ -214,12 +221,13 @@ impl X86_64CodeGen {
             }
             Loc::Global(name) => {
                 let dst = self.global_mem(&name, insn.displacement(), Reg::R11);
-                self.push_fp_mem_store(fp_size, XmmReg::Xmm15, dst);
+                self.push_fp_access_store(insn, fp_size, XmmReg::Xmm15, dst);
             }
             _ => {
                 // Load address into R11, then store
                 self.emit_move(addr, Reg::R11, 64);
-                self.push_fp_mem_store(
+                self.push_fp_access_store(
+                    insn,
                     fp_size,
                     XmmReg::Xmm15,
                     MemAddr::BaseOffset {
@@ -229,6 +237,24 @@ impl X86_64CodeGen {
                 );
             }
         }
+    }
+
+    /// [`Self::push_fp_mem_load`] of the object `insn` reaches at `src`,
+    /// through the segment of its address space.
+    fn push_fp_access_load(&mut self, insn: &Instruction, size: FpSize, src: MemAddr, dst: XmmReg) {
+        self.push_fp_mem_load(size, Self::through_segment(insn, src), dst);
+    }
+
+    /// [`Self::push_fp_mem_store`] to the object `insn` reaches at `dst`,
+    /// through the segment of its address space.
+    fn push_fp_access_store(
+        &mut self,
+        insn: &Instruction,
+        size: FpSize,
+        src: XmmReg,
+        dst: MemAddr,
+    ) {
+        self.push_fp_mem_store(size, src, Self::through_segment(insn, dst));
     }
 
     /// Load a `size` value from `src` into `dst`.

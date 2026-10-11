@@ -119,6 +119,16 @@ pub(super) fn sse_operands(asm: &AsmData) -> impl Iterator<Item = &AsmConstraint
         .filter(|c| !c.is_memory() && requires_sse(effective_class(asm, c)))
 }
 
+/// The memory operand `mem` of asm operand `c`, through the segment of the
+/// address space its object is in: `%gs:var(%rip)`.
+fn through_segment(c: &AsmConstraint, mem: String) -> String {
+    match c.addr_space {
+        crate::types::AddressSpace::Generic => mem,
+        crate::types::AddressSpace::SegFs => format!("%fs:{mem}"),
+        crate::types::AddressSpace::SegGs => format!("%gs:{mem}"),
+    }
+}
+
 /// Whether the class offers a general register.
 fn takes_gp_register(class: &AsmOperandClass) -> bool {
     matches!(
@@ -335,7 +345,7 @@ impl X86_64CodeGen {
                             input_moves,
                             insn.pos,
                         );
-                        slots.push(mk(AsmOperandValue::Mem(mem_str)));
+                        slots.push(mk(AsmOperandValue::Mem(through_segment(output, mem_str))));
                     }
                     _ if requires_sse(&output.class) => {
                         match sse_scratch.pop() {
@@ -589,7 +599,7 @@ impl X86_64CodeGen {
                             used_regs.insert(temp);
                             input_moves.push((temp, loc.clone(), op_size));
                             let mem_str = format!("(%{})", self.reg_name_64(temp));
-                            slots.push(mk(AsmOperandValue::Mem(mem_str)));
+                            slots.push(mk(AsmOperandValue::Mem(through_segment(input, mem_str))));
                         }
                         _ if requires_mem => {
                             let mem_str = self.asm_memory_slot(
@@ -601,7 +611,7 @@ impl X86_64CodeGen {
                                 input_moves,
                                 insn.pos,
                             );
-                            slots.push(mk(AsmOperandValue::Mem(mem_str)));
+                            slots.push(mk(AsmOperandValue::Mem(through_segment(input, mem_str))));
                         }
                         // A symbolic constant: the global's address, written
                         // into the template as an immediate. The operand

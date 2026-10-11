@@ -307,6 +307,10 @@ impl Parser<'_> {
                 "passing argument {0} of '{1}' discards '{2}' qualifier from pointer target type",
                 "passing argument {0} discards '{2}' qualifier from pointer target type",
             ),
+            AssignFault::AddressSpace => (
+                "passing argument {0} of '{1}' from pointer to non-enclosed address space",
+                "passing argument {0} from pointer to non-enclosed address space",
+            ),
         };
         let msg = match callee {
             Some(f) => gettext_args(named, &[n, f, quals]),
@@ -583,6 +587,13 @@ impl Parser<'_> {
                     &gettext("ISO C forbids comparison of 'void *' with function pointer"),
                 );
                 true
+            }
+            OperandVerdict::DisjointAddressSpaces => {
+                diag::error(
+                    pos,
+                    &gettext("comparison of pointers to disjoint address spaces"),
+                );
+                false
             }
             OperandVerdict::QualifiedArrays => {
                 diag::pedwarn(
@@ -893,6 +904,11 @@ impl Parser<'_> {
                 "returning '{1}' from a function with return type '{0}' makes pointer from \
                  integer without a cast"
             }
+            (Assignment, AddressSpace) => "assignment from pointer to non-enclosed address space",
+            (Initialization, AddressSpace) => {
+                "initialization from pointer to non-enclosed address space"
+            }
+            (Return, AddressSpace) => "return from pointer to non-enclosed address space",
             (_, FunctionPointerVoid) => unreachable!("reported above"),
         };
         let quals = self.types.discarded_qualifiers(t, v);
@@ -902,6 +918,13 @@ impl Parser<'_> {
                 diag::group_pedwarn_default(group, pos, &gettext_args(template, args));
             }
             None => diag::error_args(pos, template, args),
+        }
+        if fault == AddressSpace {
+            diag::note_args(
+                pos,
+                "expected '{0}' but pointer is of type '{1}'",
+                &[&t_name, &v_name],
+            );
         }
     }
 

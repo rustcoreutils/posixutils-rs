@@ -39,5 +39,11 @@ pub fn get_macros() -> Vec<(&'static str, Option<&'static str>)> {
         // sizes, in `arch::get_atomic_macros`.
         // 128-bit integer support
         ("__SIZEOF_INT128__", Some("16")),
+        // The named address spaces `__seg_fs` and `__seg_gs` exist. glibc
+        // reads `THREAD_SELF` through `__seg_fs` when the gcc it sees has
+        // them, and the Linux kernel's per-CPU accessors go through
+        // `__seg_gs` (`CC_HAS_NAMED_AS`).
+        ("__SEG_FS", Some("1")),
+        ("__SEG_GS", Some("1")),
     ]
 }

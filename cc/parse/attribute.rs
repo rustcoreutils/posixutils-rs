@@ -1709,7 +1709,10 @@ impl Parser<'_> {
                 // The declared type's qualifiers survive; only its width and
                 // family change.
                 let quals = self.types.modifiers(typ)
-                    & (TypeModifiers::CONST | TypeModifiers::VOLATILE | TypeModifiers::ATOMIC);
+                    & (TypeModifiers::CONST
+                        | TypeModifiers::VOLATILE
+                        | TypeModifiers::ATOMIC
+                        | crate::types::Type::ADDRESS_SPACES);
                 if quals.is_empty() {
                     m
                 } else {

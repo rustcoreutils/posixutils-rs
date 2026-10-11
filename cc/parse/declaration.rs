@@ -922,9 +922,9 @@ impl<'a> Parser<'a> {
 
         while let Some(name_id) = self.current_ident() {
             let pos = self.current_pos();
-            // Every spelling of `const`, `volatile` and `restrict`, from the
-            // one shared answer.
-            if let Some(m) = super::cv_qualifier_modifier(name_id) {
+            // Every spelling of `const`, `volatile` and `restrict`, and the
+            // target's address spaces, from the one shared answer.
+            if let Some(m) = super::type_qualifier_modifier(name_id, self.types.target().arch) {
                 self.advance();
                 modifiers |= m;
                 continue;
@@ -1037,12 +1037,7 @@ impl<'a> Parser<'a> {
                     };
                     self.expect_special(b')')?;
                     // C17 6.7.2.4p3: nor an atomic or qualified type.
-                    if self.types.modifiers(inner).intersects(
-                        TypeModifiers::CONST
-                            | TypeModifiers::VOLATILE
-                            | TypeModifiers::RESTRICT
-                            | TypeModifiers::ATOMIC,
-                    ) {
+                    if self.types.modifiers(inner).intersects(Type::QUALIFIERS) {
                         diag::error(pos, &gettext("'_Atomic' applied to a qualified type"));
                     }
                     tally.note_data_type("_Atomic", pos);
@@ -1419,6 +1414,17 @@ impl<'a> Parser<'a> {
             }
         };
 
+        // A type is in one address space at most.
+        let (mut ty, mut id) = (ty, id);
+        if ty.modifiers.contains(Type::ADDRESS_SPACES) {
+            diag::error(
+                start,
+                "incompatible address space qualifiers '__seg_fs' and '__seg_gs'",
+            );
+            ty.modifiers.remove(TypeModifiers::SEG_FS);
+            id = None;
+        }
+
         // C17 6.7.2.4p3 and 6.7.3p3: neither `_Atomic(T)` nor the `_Atomic`
         // qualifier may name an array or function type. The qualifier reaches
         // one only through a typedef -- `_Atomic int a[4]` is an array *of*
@@ -1510,6 +1516,26 @@ impl<'a> Parser<'a> {
         }
         self.advance();
         true
+    }
+
+    /// gcc's error for an object of type `typ` that cannot be in a named
+    /// address space, when it is: `what` is `"auto variable"`,
+    /// `"parameter"` or `"structure field"`. Only an object of static
+    /// storage duration lives in a segment.
+    pub(super) fn reject_address_space(
+        &self,
+        typ: TypeId,
+        what: &str,
+        name: StringId,
+        pos: Position,
+    ) {
+        if let Some(space) = self.types.address_space(typ).keyword() {
+            diag::error_args(
+                pos,
+                "'{0}' specified for {1} '{2}'",
+                &[space, what, self.str(name)],
+            );
+        }
     }
 
     /// C17 6.7.6.3p2: the only storage-class specifier a parameter

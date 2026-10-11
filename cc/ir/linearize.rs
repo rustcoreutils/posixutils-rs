@@ -13,8 +13,8 @@ use super::mem2reg::mem2reg;
 use super::memexpand::BlockOp;
 use super::ssa::ssa_convert;
 use super::{
-    conversion_raises_fp, BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, FpRaise, Function,
-    Initializer, Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
+    conversion_raises_fp, Access, BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, FpRaise,
+    Function, Initializer, Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
     SourceFiles,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
@@ -32,7 +32,9 @@ use crate::parse::ast::{
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
-use crate::types::{ArrayExtent, MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{
+    AddressSpace, ArrayExtent, MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable,
+};
 use std::collections::{HashMap, HashSet};
 
 const DEFAULT_LOCALS_CAPACITY: usize = 64;
@@ -491,12 +493,19 @@ pub(crate) struct ArrayInitGroups {
     pub(crate) indices: Vec<i64>,
 }
 
-/// Which ends of a block copy reach a `volatile` object. See
-/// [`Linearizer::block_volatility`].
+/// How each end of a block copy reaches its object: volatile or not, and
+/// in which address space. See [`Linearizer::block_volatility`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct BlockVolatility {
-    pub(crate) dst: bool,
-    pub(crate) src: bool,
+    pub(crate) dst: Access,
+    pub(crate) src: Access,
+}
+
+impl BlockVolatility {
+    /// Do both ends reach ordinary memory, with nothing to keep?
+    pub(crate) fn is_plain(self) -> bool {
+        self.dst == Access::default() && self.src == Access::default()
+    }
 }
 
 /// A field visit from walking struct/union initializer elements.
@@ -1364,8 +1373,22 @@ impl<'a> Linearizer<'a> {
     /// An access addressed through [`Self::volatile_init_object`] is marked
     /// whatever its type says, which is how an initializer's accesses to the
     /// members of a `volatile` object are marked.
+    ///
+    /// The address space is read here the same way, and an access through a
+    /// segment is kept as a volatile one is; see [`Access::observable`].
     fn mark_volatile_access(&self, mut insn: Instruction) -> Instruction {
-        if !matches!(insn.op, Opcode::Load | Opcode::Store) || insn.is_volatile {
+        if !matches!(insn.op, Opcode::Load | Opcode::Store) {
+            return insn;
+        }
+        if insn.addr_space == AddressSpace::Generic {
+            if let Some(typ) = insn.typ {
+                insn.addr_space = self.types.address_space(typ);
+            }
+        }
+        if insn.addr_space != AddressSpace::Generic {
+            insn.is_volatile = true;
+        }
+        if insn.is_volatile {
             return insn;
         }
         if self.volatile_init_object.is_some()
@@ -1807,8 +1830,8 @@ impl<'a> Linearizer<'a> {
             // `offset < size` rounds *up* -- a 12-byte struct wrote 16
             // bytes, four of them past the local.
             let vol = BlockVolatility {
-                dst: self.types.contains_volatile(typ),
-                src: false,
+                dst: Access::of(self.types, typ),
+                src: Access::default(),
             };
             self.emit_block_copy(local_sym, addr_pseudo, typ_bytes, vol);
         } else if typ_size > 64 || self.passed_by_reference(typ, conv) {
@@ -1817,8 +1840,8 @@ impl<'a> Linearizer<'a> {
             // three-byte struct or `long double`.
             // Copy each 8-byte chunk through pointer dereference.
             let vol = BlockVolatility {
-                dst: self.types.contains_volatile(typ),
-                src: false,
+                dst: Access::of(self.types, typ),
+                src: Access::default(),
             };
             self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
         } else if typ_bytes > 0 {
@@ -2512,8 +2535,8 @@ impl<'a> Linearizer<'a> {
         // copied exactly rather than rounded up past the caller's object.
         // The caller's buffer is its own temporary, never a volatile object.
         let vol = BlockVolatility {
-            dst: false,
-            src: self.types.contains_volatile(self.expr_type(e)),
+            dst: Access::default(),
+            src: Access::of(self.types, self.expr_type(e)),
         };
         self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64, vol);
 
@@ -2576,6 +2599,7 @@ impl<'a> Linearizer<'a> {
     /// how on the `Ret`.
     pub(crate) fn emit_reg_aggregate_return(&mut self, e: &Expr, ret_type: TypeId) {
         let src_addr = self.linearize_lvalue(e);
+        let src_addr = self.readable_storage(src_addr, self.expr_type(e));
         let struct_size = self.types.size_bits(ret_type);
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
         let ret_class = abi.classify_return(ret_type, self.types);
@@ -2766,9 +2790,12 @@ impl<'a> Linearizer<'a> {
     /// with a `volatile` member reads that member. The type of a member or
     /// an element carries the object's qualifiers (C17 6.5.2.3p3), so this
     /// covers a volatile member and a member of a volatile object alike.
+    ///
+    /// A read through a segment counts as one, as its access does
+    /// ([`Access::observable`]).
     fn reads_volatile(&self, expr: &Expr) -> bool {
         expr.typ
-            .is_some_and(|typ| self.types.contains_volatile(typ))
+            .is_some_and(|typ| Access::of(self.types, typ).observable())
     }
 
     /// Whether `expr` may be computed for the operand of a deferred
@@ -3082,6 +3109,7 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn complex_operand_addr(&mut self, expr: &Expr) -> PseudoId {
         let addr = self.complex_storage_addr(expr);
         let typ = self.expr_type(expr);
+        let addr = self.readable_storage(addr, typ);
         self.complex_in_native_order(addr, typ)
     }
 
@@ -3158,6 +3186,21 @@ impl<'a> Linearizer<'a> {
     /// For a value that has to outlive whatever storage it was read from --
     /// an object whose lifetime ends, or that a cleanup is about to change --
     /// before anything has used it.
+    /// Where a value of type `typ` held in storage at `addr` can be read:
+    /// `addr` itself, or, for one in a named address space, a copy in the
+    /// frame read out through the segment once.
+    ///
+    /// A value held in storage is read where it lies, by whatever consumes
+    /// it -- a return, an argument, complex arithmetic -- each with accesses
+    /// of its own types; one in a segment lies at an address none of those
+    /// accesses could follow.
+    pub(crate) fn readable_storage(&mut self, addr: PseudoId, typ: TypeId) -> PseudoId {
+        if self.types.address_space(typ) == AddressSpace::Generic {
+            return addr;
+        }
+        self.detach_value(addr, typ)
+    }
+
     pub(crate) fn detach_value(&mut self, value: PseudoId, typ: TypeId) -> PseudoId {
         if !self.value_is_storage(typ) {
             return value;
@@ -3165,8 +3208,8 @@ impl<'a> Linearizer<'a> {
         let copy = self.frame_temp_addr("__value_copy", typ);
         let bytes = self.types.size_bytes(typ) as i64;
         let vol = BlockVolatility {
-            dst: false,
-            src: self.types.contains_volatile(typ),
+            dst: Access::default(),
+            src: Access::of(self.types, typ),
         };
         self.emit_block_copy(copy, value, bytes, vol);
         copy
@@ -3244,7 +3287,7 @@ impl<'a> Linearizer<'a> {
             return self.complex_in_native_order(addr, typ);
         }
         if self.object_reads_as_address(typ) {
-            return match place {
+            let addr = match place {
                 ObjectPlace::Sym(sym) => {
                     // An array's address is its first element's (6.3.2.1p3).
                     let pointee = match self.types.kind(typ) {
@@ -3258,6 +3301,7 @@ impl<'a> Linearizer<'a> {
                 }
                 ObjectPlace::At(base, offset) => self.offset_address(base, offset),
             };
+            return self.readable_storage(addr, typ);
         }
         let (base, offset) = match place {
             ObjectPlace::Sym(sym) => (sym, 0),
@@ -4795,6 +4839,7 @@ impl<'a> Linearizer<'a> {
         // hands back the temporary's address, so both cases are the
         // same call.
         let addr = self.linearize_lvalue(a);
+        let addr = self.readable_storage(addr, self.expr_type(a));
         let val = if self.passed_by_reference(arg_type, conv) {
             let vol = self.block_volatility(arg_type, self.expr_type(a));
             self.argument_copy(addr, arg_type, true, vol)
@@ -6560,7 +6605,13 @@ impl<'a> Linearizer<'a> {
         self.emit(Instruction::store(exp_val, exp_addr, 0, elem_typ, bits));
 
         // `__sync_*` is sequentially consistent and has no order argument.
-        let ok = self.emit_atomic_cas(addr, exp_addr, des_val, bits, MemoryOrder::SeqCst);
+        let ok = self.emit_atomic_cas(
+            addr,
+            exp_addr,
+            des_val,
+            (elem_typ, bits),
+            MemoryOrder::SeqCst,
+        );
 
         if !returns_old {
             return ok;
@@ -6595,6 +6646,7 @@ impl<'a> Linearizer<'a> {
 
         let ptr_type = self.expr_type(ptr);
         let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
+        self.refuse_atomic_in_segment(elem_type);
         let size = self.types.size_bits(elem_type);
         let result = self.alloc_pseudo();
 
@@ -6656,7 +6708,13 @@ impl<'a> Linearizer<'a> {
                 let ptr_type = self.expr_type(ptr);
                 let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
                 let elem_size = self.types.size_bits(elem_type);
-                self.emit_atomic_cas(ptr_val, expected_ptr, desired_val, elem_size, memory_order)
+                self.emit_atomic_cas(
+                    ptr_val,
+                    expected_ptr,
+                    desired_val,
+                    (elem_type, elem_size),
+                    memory_order,
+                )
             }
 
             ExprKind::GnuAtomicRmw {

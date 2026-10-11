@@ -64,6 +64,8 @@ mod macho_labels;
 mod memopt;
 mod memopt_blockops;
 mod ms_abi;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod named_address_spaces;
 mod named_sections;
 mod object_layout;
 mod optimizer;

@@ -786,7 +786,7 @@ impl Linearizer<'_> {
     fn copy_vector(&mut self, dst: PseudoId, src: PseudoId, typ: TypeId, vol: BlockVolatility) {
         let bytes = self.types.size_bytes(typ);
         match self.register_carrier(typ) {
-            Some(carrier) if !vol.dst && !vol.src => {
+            Some(carrier) if vol.is_plain() => {
                 let value = self.vector_to_carrier(src, typ, carrier);
                 let bits = self.types.size_bits(carrier);
                 self.emit(Instruction::store(value, dst, 0, carrier, bits));

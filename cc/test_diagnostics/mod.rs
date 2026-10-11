@@ -56,6 +56,7 @@ mod keywords_and_suffixes;
 mod lexical_errors;
 mod misc;
 mod mode_attribute;
+mod named_address_spaces;
 mod notes;
 mod objects_and_constants;
 mod option_tags;

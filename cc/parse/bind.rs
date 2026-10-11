@@ -490,6 +490,12 @@ impl Parser<'_> {
             // declaration has linkage (6.2.2p3, p5); at block scope only an
             // `extern` one or a function does (6.2.2p4, p5).
             let has_linkage = scope == DeclScope::File || is_fn || specs.is_extern();
+            if !is_fn
+                && matches!(scope, DeclScope::Block { .. })
+                && !specs.storage_class.intersects(NO_AUTO_DURATION)
+            {
+                self.reject_address_space(typ, "auto variable", name, pos);
+            }
             typ = self.composite_with_prior_declaration(name, typ, has_linkage);
             self.check_redeclaration(name, typ, pos, Redeclared::Declaration);
             // An initializer makes an object's declaration a definition

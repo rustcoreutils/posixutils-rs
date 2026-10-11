@@ -19,6 +19,7 @@ use crate::arch::asm_constraints::{AsmOperandClass, PinnedGp};
 use crate::constexpr::{ConstScope, IntConversion};
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
+use crate::ir::Access;
 use crate::parse::ast::{
     AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MachineOp, MathErrno, UnaryOp,
 };
@@ -440,8 +441,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the list does not reach is initialized as a static object would be.
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
         let total_bytes = self.types.size_bytes(typ) as i64;
-        let volatile = self.types.contains_volatile(typ);
-        self.emit_block_zero(base_sym, 0, total_bytes, volatile);
+        let access = Access::of(self.types, typ);
+        self.emit_block_zero(base_sym, 0, total_bytes, access);
     }
 
     /// `-ftrivial-auto-var-init=`: start the `size_bytes` of an automatic
@@ -460,8 +461,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             crate::target::AutoVarInit::Zero => 0,
             crate::target::AutoVarInit::Pattern => 0xfe,
         };
-        let volatile = self.types.contains_volatile(typ);
-        self.emit_block_fill(dst, offset, size_bytes, byte, volatile);
+        let access = Access::of(self.types, typ);
+        self.emit_block_fill(dst, offset, size_bytes, byte, access);
     }
 
     /// [`Self::auto_var_init`] for a variable length array: the
@@ -483,15 +484,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
     }
 
-    /// Which ends of a block move between objects of type `dst` and `src`
-    /// reach something volatile -- the answer every chunk of the move is
-    /// marked with. By `contains_volatile`, the rule `emit` applies to a
-    /// single access: a struct with one `volatile` member is read and written
-    /// whole, so every chunk of it is observable.
+    /// How each end of a block move between objects of type `dst` and `src`
+    /// reaches its object -- the [`Access`] every chunk of the move is marked
+    /// with. By `contains_volatile`, the rule `emit` applies to a single
+    /// access: a struct with one `volatile` member is read and written whole,
+    /// so every chunk of it is observable; and an object in a segment is
+    /// reached through it by every chunk.
     pub(crate) fn block_volatility(&self, dst: TypeId, src: TypeId) -> BlockVolatility {
         BlockVolatility {
-            dst: self.types.contains_volatile(dst),
-            src: self.types.contains_volatile(src),
+            dst: Access::of(self.types, dst),
+            src: Access::of(self.types, src),
         }
     }
 
@@ -519,15 +521,16 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// volatility, so its stores come out unmarked and a pass may then drop
     /// them. Within the inline limit such a fill is emitted here, as stores
     /// marked for what they write; past it, the call stays a call, which
-    /// nothing deletes.
+    /// nothing deletes. An object in a segment is filled here at any size:
+    /// a call could not reach it.
     pub(crate) fn emit_block_zero(
         &mut self,
         dst: PseudoId,
         dst_base_offset: i64,
         size_bytes: i64,
-        volatile: bool,
+        access: Access,
     ) {
-        self.emit_block_fill(dst, dst_base_offset, size_bytes, 0, volatile);
+        self.emit_block_fill(dst, dst_base_offset, size_bytes, 0, access);
     }
 
     /// [`Self::emit_block_zero`] with every byte `byte`.
@@ -537,12 +540,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         dst_base_offset: i64,
         size_bytes: i64,
         byte: u8,
-        volatile: bool,
+        access: Access,
     ) {
         if size_bytes <= 0 {
             return;
         }
-        if volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES {
+        // An object in a segment has no address `memset` could take, so it
+        // is filled here at any size.
+        if access.in_segment() || (access.volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES) {
             for (offset, chunk) in memexpand::block_chunks(size_bytes) {
                 let (typ, bits) = (chunk.typ(self.types), chunk.bits());
                 // Every byte the same: the chunk's value, sign-extended.
@@ -550,7 +555,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let value = self.emit_const(pattern, typ);
                 self.emit(
                     Instruction::store(value, dst, dst_base_offset + offset, typ, bits)
-                        .with_volatile(true),
+                        .with_access(access),
                 );
             }
             return;
@@ -584,12 +589,13 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// Above `memexpand::INLINE_LIMIT_BYTES` the copy is a `memcpy` call
     /// instead, by the same rule and in the same chunks as a `memcpy` the
-    /// program wrote.
+    /// program wrote -- unless an end is in a segment, which no call could
+    /// reach.
     ///
     /// Each chunk is marked with `vol`: the chunks are integers, so the
-    /// qualifier of the aggregate they move cannot be read back off their
-    /// type, and an unmarked chunk load of a `volatile` struct nothing
-    /// used was deleted outright from `-O1` up.
+    /// qualifiers and address space of the aggregate they move cannot be
+    /// read back off their type, and an unmarked chunk load of a `volatile`
+    /// struct nothing used was deleted outright from `-O1` up.
     pub(crate) fn emit_block_copy_at_offset(
         &mut self,
         dst: PseudoId,
@@ -598,7 +604,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         size_bytes: i64,
         vol: BlockVolatility,
     ) {
-        if size_bytes > memexpand::INLINE_LIMIT_BYTES {
+        // An object in a segment has no address `memcpy` could take, so it
+        // is copied here at any size.
+        let in_segment = vol.dst.in_segment() || vol.src.in_segment();
+        if size_bytes > memexpand::INLINE_LIMIT_BYTES && !in_segment {
             self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
             return;
         }
@@ -612,12 +621,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             || self.alloc_pseudo(),
         );
         for insn in copy {
-            let volatile = if insn.op == Opcode::Load {
+            let access = if insn.op == Opcode::Load {
                 vol.src
             } else {
                 vol.dst
             };
-            self.emit(insn.with_volatile(volatile));
+            self.emit(insn.with_access(access));
         }
     }
 
@@ -698,13 +707,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
 
         // 1. Load the entire storage unit, as a number in the target's order:
         // a unit stored in reverse order is swapped, and its fields are then
         // numbered from the most significant bit (see `bitfield_bit_offset`).
         let storage_val = self.alloc_pseudo();
-        self.load_bitfield_unit(storage_val, base, bf, typ, volatile);
+        self.load_bitfield_unit(storage_val, base, bf, typ, access);
         let bit_offset = self.bitfield_bit_offset(bf, typ);
 
         // 2. Shift right by bit_offset (using logical shift for unsigned extraction)
@@ -858,7 +867,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
         // Every byte of a volatile field is part of the one observable read.
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
         // In reverse order the field's bits run from the most significant end
         // of each byte, so its last byte holds its least significant bits.
         let reversed = self.types.reverses_storage(typ);
@@ -878,7 +887,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let byte = self.alloc_pseudo();
             self.emit(
                 Instruction::load(byte, base, (byte_offset + i as usize) as i64, byte_type, 8)
-                    .with_volatile(volatile),
+                    .with_access(access),
             );
             // Widen before shifting, or the shift is done at eight bits and
             // drops everything it moves. `uchar` is unsigned, so this is a
@@ -1027,11 +1036,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
         let storage_bits = storage_size * 8;
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
 
         // 1. Load current storage unit value, as `emit_bitfield_load` does.
         let old_val = self.alloc_pseudo();
-        self.load_bitfield_unit(old_val, base, bf, typ, volatile);
+        self.load_bitfield_unit(old_val, base, bf, typ, access);
         let bit_offset = self.bitfield_bit_offset(bf, typ);
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
@@ -1096,7 +1105,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // 6. Store back, in the unit's own order.
         if self.bitfield_unit_reversed(bf, typ) {
-            self.emit_reversed_store(combined, base, byte_offset as i64, storage_type, volatile);
+            self.emit_reversed_store(combined, base, byte_offset as i64, storage_type, access);
         } else {
             self.emit(
                 Instruction::store(
@@ -1106,7 +1115,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     storage_type,
                     storage_bits,
                 )
-                .with_volatile(volatile),
+                .with_access(access),
             );
         }
     }
@@ -1119,16 +1128,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         base: PseudoId,
         bf: Bitfield,
         typ: TypeId,
-        volatile: bool,
+        access: Access,
     ) {
         let storage_type = self.bitfield_storage_type(bf.access_bytes as usize);
         let offset = bf.offset as i64;
         if self.bitfield_unit_reversed(bf, typ) {
-            self.emit_reversed_load(target, base, offset, storage_type, volatile);
+            self.emit_reversed_load(target, base, offset, storage_type, access);
         } else {
             let bits = bf.access_bytes * 8;
             self.emit(
-                Instruction::load(target, base, offset, storage_type, bits).with_volatile(volatile),
+                Instruction::load(target, base, offset, storage_type, bits).with_access(access),
             );
         }
     }
@@ -1187,7 +1196,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         };
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
         // See `emit_bitfield_load_bytewise`.
         let reversed = self.types.reverses_storage(typ);
 
@@ -1267,9 +1276,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 placed
             } else {
                 let old = self.alloc_pseudo();
-                self.emit(
-                    Instruction::load(old, base, addr_off, byte_type, 8).with_volatile(volatile),
-                );
+                self.emit(Instruction::load(old, base, addr_off, byte_type, 8).with_access(access));
                 let keep = self.emit_const((!byte_mask & 0xff) as i128, byte_type);
                 let cleared = self.alloc_pseudo();
                 self.emit(Instruction::binop(
@@ -1305,7 +1312,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 out
             };
             self.emit(
-                Instruction::store(to_store, base, addr_off, byte_type, 8).with_volatile(volatile),
+                Instruction::store(to_store, base, addr_off, byte_type, 8).with_access(access),
             );
         }
     }
@@ -3194,20 +3201,18 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         let (real, imag, base_typ, base_bits) = self.load_complex_halves(src, complex_typ);
         let imag_offset = offset + (base_bits / 8) as i64;
+        // The halves are of the base type, which has lost the object's
+        // qualifiers and address space.
+        let access = Access::of(self.types, complex_typ);
         if self.types.reverses_storage(complex_typ) {
-            let volatile = self.types.contains_volatile(complex_typ);
-            self.emit_reversed_store(real, dst, offset, base_typ, volatile);
-            self.emit_reversed_store(imag, dst, imag_offset, base_typ, volatile);
+            self.emit_reversed_store(real, dst, offset, base_typ, access);
+            self.emit_reversed_store(imag, dst, imag_offset, base_typ, access);
             return;
         }
-        self.emit(Instruction::store(real, dst, offset, base_typ, base_bits));
-        self.emit(Instruction::store(
-            imag,
-            dst,
-            imag_offset,
-            base_typ,
-            base_bits,
-        ));
+        self.emit(Instruction::store(real, dst, offset, base_typ, base_bits).with_access(access));
+        self.emit(
+            Instruction::store(imag, dst, imag_offset, base_typ, base_bits).with_access(access),
+        );
     }
 
     pub(crate) fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
@@ -3436,6 +3441,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     .expect("a builtin's constraint is a valid one"),
                 size: self.types.size_bits(typ),
                 offset: 0,
+                addr_space: crate::types::AddressSpace::Generic,
             })
             .collect();
         let written = outputs.iter().map(|o| o.pseudo).collect();

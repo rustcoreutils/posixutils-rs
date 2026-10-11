@@ -404,6 +404,59 @@ bitflags::bitflags! {
         // of what makes two types compatible, and dropped by lvalue
         // conversion: only an *object* is stored in an order, never a value.
         const REVERSE_ORDER = 1 << 21;
+
+        // gcc's x86-64 named address spaces (ISO/IEC TR 18037): an object
+        // of a type so qualified is reached through the `%fs` or `%gs`
+        // segment, and a pointer to one is an offset from the segment's
+        // base. Qualifiers like the others -- they make pointees differ and
+        // travel to members -- but each space is disjoint from the generic
+        // one; see `AddressSpace`.
+        const SEG_FS = 1 << 22;
+        const SEG_GS = 1 << 23;
+    }
+}
+
+/// The address space an object is in: the generic one, or one of gcc's
+/// x86-64 named spaces, which an access reaches through a segment register.
+/// Every pair of distinct spaces is disjoint, as gcc has them: no pointer
+/// converts from one to another without a cast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressSpace {
+    #[default]
+    Generic,
+    SegFs,
+    SegGs,
+}
+
+impl AddressSpace {
+    /// The space the qualifiers `mods` name. Both segments at once is an
+    /// error the parser reports; `%gs` is then taken.
+    pub fn of(mods: TypeModifiers) -> Self {
+        if mods.contains(TypeModifiers::SEG_GS) {
+            AddressSpace::SegGs
+        } else if mods.contains(TypeModifiers::SEG_FS) {
+            AddressSpace::SegFs
+        } else {
+            AddressSpace::Generic
+        }
+    }
+
+    /// The qualifier keyword, as gcc names the space in diagnostics.
+    pub fn keyword(self) -> Option<&'static str> {
+        match self {
+            AddressSpace::Generic => None,
+            AddressSpace::SegFs => Some("__seg_fs"),
+            AddressSpace::SegGs => Some("__seg_gs"),
+        }
+    }
+
+    /// gcc's name for the space in a cast warning: `'__seg_gs'`, or
+    /// `generic`.
+    pub fn quoted(self) -> String {
+        match self.keyword() {
+            Some(k) => format!("'{k}'"),
+            None => "generic".to_string(),
+        }
     }
 }
 
@@ -772,7 +825,7 @@ impl Type {
     /// compatible with `int`. Invisible to `sizeof`, fatal to any comparison.
     pub const DECL_SPECIFIERS: TypeModifiers = Self::STORAGE_CLASS.union(TypeModifiers::NORETURN);
 
-    /// The type qualifiers of C17 6.7.3p1.
+    /// The type qualifiers of C17 6.7.3p1, and gcc's x86-64 address spaces.
     ///
     /// These are the bits a *type* carries at its top level, as opposed to the
     /// declaration specifiers above: `const int` and `int` are two types, while
@@ -783,13 +836,18 @@ impl Type {
     pub const QUALIFIERS: TypeModifiers = TypeModifiers::CONST
         .union(TypeModifiers::VOLATILE)
         .union(TypeModifiers::RESTRICT)
-        .union(TypeModifiers::ATOMIC);
+        .union(TypeModifiers::ATOMIC)
+        .union(Type::ADDRESS_SPACES);
+
+    /// gcc's x86-64 named address space qualifiers; see [`AddressSpace`].
+    pub const ADDRESS_SPACES: TypeModifiers = TypeModifiers::SEG_FS.union(TypeModifiers::SEG_GS);
 
     /// The qualifiers a member inherits from the object that holds it.
     ///
     /// C17 6.5.2.3p3/p4 gives `s.m` the "so-qualified version" of the member's
-    /// type, which is the member's type plus the qualifiers of `s`. Not all
-    /// four travel:
+    /// type, which is the member's type plus the qualifiers of `s`. An
+    /// address space travels -- a member of an object in `%gs` is in `%gs`
+    /// -- but not every qualifier does:
     ///
     /// * `_Atomic` does not. A member of an `_Atomic` struct is not itself
     ///   atomic -- there is no lock-free way to read one out of an atomic
@@ -797,8 +855,9 @@ impl Type {
     ///   what `Parser::warn_atomic_member_access` already reports.
     /// * `restrict` cannot: 6.7.3p2 admits it only on a pointer to an object
     ///   type, so a composite never carries it in the first place.
-    pub const MEMBER_QUALIFIERS: TypeModifiers =
-        TypeModifiers::CONST.union(TypeModifiers::VOLATILE);
+    pub const MEMBER_QUALIFIERS: TypeModifiers = TypeModifiers::CONST
+        .union(TypeModifiers::VOLATILE)
+        .union(Type::ADDRESS_SPACES);
 
     /// The storage-class specifiers of C17 6.7.1, and `inline`.
     ///
@@ -1086,6 +1145,10 @@ pub enum AssignFault {
     /// one POSIX requires to work, since `dlsym` returns `void *` and every
     /// caller assigns it to a function pointer.
     FunctionPointerVoid,
+    /// Two pointers into different address spaces -- the generic one and
+    /// one of x86-64's segments, or both segments -- which gcc's disjoint
+    /// spaces make an error: only a cast converts between them.
+    AddressSpace,
 }
 
 impl AssignFault {
@@ -1100,7 +1163,7 @@ impl AssignFault {
     /// `None` for the one that is an error.
     pub fn group(self) -> Option<&'static str> {
         match self {
-            AssignFault::Incompatible => None,
+            AssignFault::Incompatible | AssignFault::AddressSpace => None,
             AssignFault::FunctionPointerVoid => Some("pedantic"),
             AssignFault::IntegerFromPointer | AssignFault::PointerFromInteger => {
                 Some("int-conversion")
@@ -2016,6 +2079,10 @@ impl TypeTable {
                 if typ.modifiers.contains(TypeModifiers::VOLATILE) {
                     inner.push_str(" volatile");
                 }
+                if let Some(space) = AddressSpace::of(typ.modifiers).keyword() {
+                    inner.push(' ');
+                    inner.push_str(space);
+                }
                 if !decl.is_empty() {
                     // `**`, never `* *`; but `*const p` needs its space.
                     if !inner.ends_with('*') {
@@ -2038,6 +2105,10 @@ impl TypeTable {
                 }
                 if typ.modifiers.contains(TypeModifiers::VOLATILE) {
                     name.push_str("volatile ");
+                }
+                if let Some(space) = AddressSpace::of(typ.modifiers).keyword() {
+                    name.push_str(space);
+                    name.push(' ');
                 }
                 let elem = typ
                     .base
@@ -2147,6 +2218,10 @@ impl TypeTable {
                 }
                 if typ.modifiers.contains(TypeModifiers::VOLATILE) {
                     result.push_str("volatile ");
+                }
+                if let Some(space) = AddressSpace::of(typ.modifiers).keyword() {
+                    result.push_str(space);
+                    result.push(' ');
                 }
                 let gcc_int = match style {
                     Spelling::Gcc => self.gcc_integer_name(id),
@@ -2792,6 +2867,9 @@ impl TypeTable {
             let (Some(t_pointee), Some(v_pointee)) = (t_pointee, v_pointee) else {
                 return None;
             };
+            if self.address_space(t_pointee) != self.address_space(v_pointee) {
+                return Some(AssignFault::AddressSpace);
+            }
             // `void *` converts to and from any object pointer (6.5.16.1p1).
             //
             // "Object" is the whole of it: the carve-out does not reach a
@@ -4126,11 +4204,29 @@ impl TypeTable {
         self.intern(composite)
     }
 
+    /// The address space an object of type `id` is in -- an array's is its
+    /// elements'.
+    pub fn address_space(&self, id: TypeId) -> AddressSpace {
+        AddressSpace::of(self.qualifiers_through_arrays(id))
+    }
+
+    /// The address space the pointer type `id` points into; generic for
+    /// anything that is not a pointer.
+    pub fn pointee_address_space(&self, id: TypeId) -> AddressSpace {
+        match self.kind(id) {
+            TypeKind::Pointer => self
+                .base_type(id)
+                .map_or(AddressSpace::Generic, |p| self.address_space(p)),
+            _ => AddressSpace::Generic,
+        }
+    }
+
     /// The qualifiers of `id`, where those of an array type are its element
     /// type's (C17 6.7.3p10): `const int[3]` is as `const` as `const int`.
     pub fn qualifiers_through_arrays(&self, id: TypeId) -> TypeModifiers {
         match self.kind(id) {
-            TypeKind::Array => self
+            // A vector is a value, and holds its qualifiers itself.
+            TypeKind::Array if !self.is_vector(id) => self
                 .base_type(id)
                 .map_or_else(TypeModifiers::empty, |e| self.qualifiers_through_arrays(e)),
             _ => self.qualifiers(id),

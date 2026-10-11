@@ -553,6 +553,7 @@ impl Parser<'_> {
                     ..
                 } = self.parse_declarator(knr_base_id, DeclaratorContext::OldStyleParameter)?;
                 self.check_parameter_specifiers(knr_type.modifiers, decl_name, knr_pos);
+                self.reject_address_space(decl_typ, "parameter", decl_name, knr_pos);
                 // C99 6.7.5.3: array/function params adjusted to pointers;
                 // a vector is passed by value.
                 let adjusted = self.types.get(decl_typ);

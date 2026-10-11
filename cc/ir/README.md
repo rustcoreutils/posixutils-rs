@@ -264,6 +264,20 @@ survives every optimization level: `dce::is_root` treats it as a root,
 `constglobal` will not answer one from an initializer, and `ssa` will not
 promote the object it reaches out of memory.
 
+They also carry an **address space**, `Instruction::addr_space`: generic, or
+one of x86-64's `__seg_fs`/`__seg_gs`, which the backend reaches through the
+segment register (`%gs:8(%rax)`), printed as a trailing `__seg_gs` in a dump.
+It is set the same way, from the type the access reaches, or by the site
+itself through `Instruction::with_access` where the access is of another type
+than the object -- a bit-field's storage unit, an integer chunk of a struct
+copy. An access through a segment is marked volatile as well
+(`Access::observable`): what the segment base points to is memory no pass can
+model. An `asm` memory operand carries its object's space in
+`AsmConstraint::addr_space`. A value held in storage -- a struct, complex or
+vector -- read out of a segment is copied into the frame first
+(`Linearizer::readable_storage`), since each of its consumers reads it with
+accesses of its own.
+
 ### SSA Operations
 
 | Opcode | Description |

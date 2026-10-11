@@ -144,3 +144,31 @@ fn feature_test_macros_are_not_predefined() {
         assert_eq!(defined(&r.stdout, name), None, "{name} with -pthread");
     }
 }
+
+/// gcc's x86-64 named address spaces say they exist on every x86-64 target,
+/// and no other target has them: glibc's `THREAD_SELF` and the Linux
+/// kernel's per-CPU accessors choose their `__seg_fs`/`__seg_gs` forms by
+/// these.
+#[test]
+fn named_address_space_macros_are_x86_64s() {
+    for triple in [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-freebsd",
+    ] {
+        let m = predefines(triple);
+        for name in ["__SEG_FS", "__SEG_GS"] {
+            assert_eq!(
+                defined(&m, name).as_deref(),
+                Some("1"),
+                "{name} on {triple}"
+            );
+        }
+    }
+    for triple in ["aarch64-linux-gnu", "aarch64-apple-darwin"] {
+        let m = predefines(triple);
+        for name in ["__SEG_FS", "__SEG_GS"] {
+            assert_eq!(defined(&m, name), None, "{name} on {triple}");
+        }
+    }
+}

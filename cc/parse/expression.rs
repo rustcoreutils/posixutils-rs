@@ -504,6 +504,13 @@ impl<'a> Parser<'a> {
         ) else {
             return then_typ;
         };
+        if self.types.address_space(tp) != self.types.address_space(ep) {
+            diag::error(
+                pos,
+                &gettext("pointers to disjoint address spaces used in conditional expression"),
+            );
+            return then_typ;
+        }
         let quals =
             self.types.qualifiers_through_arrays(tp) | self.types.qualifiers_through_arrays(ep);
         let (tp, ep) = (
@@ -1290,7 +1297,25 @@ impl<'a> Parser<'a> {
         } else if target_kind == TypeKind::Pointer && self.types.is_float(from) {
             diag::error(pos, &gettext("cannot convert to a pointer type"));
         } else if target_kind == TypeKind::Pointer && from_kind == TypeKind::Pointer {
+            self.warn_address_space_cast(target, from, expr, pos);
             self.check_function_object_pointer_cast(target, from, expr, pos);
+        }
+    }
+
+    /// gcc's warning for a cast between pointers into disjoint address
+    /// spaces, which it performs as it would between two generic pointers.
+    /// A null pointer constant points nowhere, and converts in silence.
+    fn warn_address_space_cast(&self, target: TypeId, from: TypeId, expr: &Expr, pos: Position) {
+        let (to, of) = (
+            self.types.pointee_address_space(target),
+            self.types.pointee_address_space(from),
+        );
+        if to != of && !self.is_null_pointer_constant(expr) {
+            diag::warning_args(
+                pos,
+                "cast to {0} address space pointer from disjoint {1} address space pointer",
+                &[&to.quoted(), &of.quoted()],
+            );
         }
     }
 

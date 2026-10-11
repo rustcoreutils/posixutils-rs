@@ -36,6 +36,7 @@ use super::linearize::Linearizer;
 use super::{Initializer, Instruction, Opcode, PseudoId};
 use crate::diag;
 use crate::float::{FloatVal, FpFormat};
+use crate::ir::Access;
 use crate::target::ByteOrder;
 use crate::types::{TypeId, TypeKind};
 
@@ -60,11 +61,11 @@ impl<'a> Linearizer<'a> {
         match insn.op {
             Opcode::Load => {
                 let target = insn.target.expect("a load defines its target");
-                self.emit_reversed_load(target, addr, insn.offset, typ, insn.is_volatile);
+                self.emit_reversed_load(target, addr, insn.offset, typ, insn.access());
             }
             _ => {
                 let value = insn.src[1];
-                self.emit_reversed_store(value, addr, insn.offset, typ, insn.is_volatile);
+                self.emit_reversed_store(value, addr, insn.offset, typ, insn.access());
             }
         }
         None
@@ -78,20 +79,20 @@ impl<'a> Linearizer<'a> {
         addr: PseudoId,
         offset: i64,
         typ: TypeId,
-        volatile: bool,
+        access: Access,
     ) {
         let bytes = self.types.size_bytes(typ);
         if !self.reject_unswappable(typ) && self.types.is_integer(typ) && bytes <= 8 {
             let word = self.word_type(bytes);
             let raw = self.alloc_reg_pseudo();
             let bits = self.types.size_bits(word);
-            self.emit(Instruction::load(raw, addr, offset, word, bits).with_volatile(volatile));
+            self.emit(Instruction::load(raw, addr, offset, word, bits).with_access(access));
             self.emit_bswap_into(target, raw, bytes);
             return;
         }
         let native = self.native_scalar_type(typ);
         let temp = self.frame_temp_addr("__sso", native);
-        self.copy_reversed(temp, 0, addr, offset, bytes, (false, volatile));
+        self.copy_reversed(temp, 0, addr, offset, bytes, (Access::default(), access));
         let bits = self.types.size_bits(native);
         self.emit(Instruction::load(target, temp, 0, native, bits));
     }
@@ -104,7 +105,7 @@ impl<'a> Linearizer<'a> {
         addr: PseudoId,
         offset: i64,
         typ: TypeId,
-        volatile: bool,
+        access: Access,
     ) {
         let bytes = self.types.size_bytes(typ);
         if !self.reject_unswappable(typ) && self.types.is_integer(typ) && bytes <= 8 {
@@ -112,22 +113,20 @@ impl<'a> Linearizer<'a> {
             let swapped = self.alloc_reg_pseudo();
             self.emit_bswap_into(swapped, value, bytes);
             let bits = self.types.size_bits(word);
-            self.emit(
-                Instruction::store(swapped, addr, offset, word, bits).with_volatile(volatile),
-            );
+            self.emit(Instruction::store(swapped, addr, offset, word, bits).with_access(access));
             return;
         }
         let native = self.native_scalar_type(typ);
         let temp = self.frame_temp_addr("__sso", native);
         let bits = self.types.size_bits(native);
         self.emit(Instruction::store(value, temp, 0, native, bits));
-        self.copy_reversed(addr, offset, temp, 0, bytes, (volatile, false));
+        self.copy_reversed(addr, offset, temp, 0, bytes, (access, Access::default()));
     }
 
     /// Copy the `bytes` bytes at `src + src_offset` to `dst + dst_offset` in
     /// the opposite order, a word at a time: the first word read, swapped,
-    /// is the last word written. `volatile` marks the (destination, source)
-    /// accesses that reach a volatile object.
+    /// is the last word written. `access` marks the (destination, source)
+    /// accesses as the objects they reach are: volatile, or in a segment.
     fn copy_reversed(
         &mut self,
         dst: PseudoId,
@@ -135,7 +134,7 @@ impl<'a> Linearizer<'a> {
         src: PseudoId,
         src_offset: i64,
         bytes: usize,
-        volatile: (bool, bool),
+        access: (Access, Access),
     ) {
         let step = bytes.min(8);
         let word = self.word_type(step);
@@ -144,10 +143,10 @@ impl<'a> Linearizer<'a> {
             let from = src_offset + (k * step) as i64;
             let to = dst_offset + (bytes - (k + 1) * step) as i64;
             let raw = self.alloc_reg_pseudo();
-            self.emit(Instruction::load(raw, src, from, word, bits).with_volatile(volatile.1));
+            self.emit(Instruction::load(raw, src, from, word, bits).with_access(access.1));
             let swapped = self.alloc_reg_pseudo();
             self.emit_bswap_into(swapped, raw, step);
-            self.emit(Instruction::store(swapped, dst, to, word, bits).with_volatile(volatile.0));
+            self.emit(Instruction::store(swapped, dst, to, word, bits).with_access(access.0));
         }
     }
 
@@ -218,11 +217,11 @@ impl<'a> Linearizer<'a> {
         let half = self.types.complex_base(typ);
         let half_bytes = self.types.size_bytes(half) as i64;
         let half_bits = self.types.size_bits(half);
-        let volatile = self.types.contains_volatile(typ);
+        let access = Access::of(self.types, typ);
         let copy = self.frame_temp_addr("__sso", self.types.make_complex(half));
         for offset in [0, half_bytes] {
             let value = self.alloc_reg_pseudo();
-            self.emit_reversed_load(value, addr, offset, half, volatile);
+            self.emit_reversed_load(value, addr, offset, half, access);
             self.emit(Instruction::store(value, copy, offset, half, half_bits));
         }
         copy

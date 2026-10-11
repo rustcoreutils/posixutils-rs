@@ -19,6 +19,7 @@ use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass, PinnedGp};
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
+use crate::ir::Access;
 use crate::parse::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Label,
     LabelId, Stmt, UnaryOp,
@@ -1039,12 +1040,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     for visit in visits {
                         let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
                         if let Some(reset) = self.init_override_reset(&mut written, &visit, held) {
-                            let volatile = self.types.contains_volatile(typ);
+                            let access = Access::of(self.types, typ);
                             self.emit_block_zero(
                                 base_sym,
                                 base_offset + reset.start as i64,
                                 (reset.end - reset.start) as i64,
-                                volatile,
+                                access,
                             );
                         }
 
@@ -2228,8 +2229,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         if matches!(tail, StringTail::Zero) {
             let start = base_offset + (written as i64) * elem_bytes;
             let bytes = (capacity - written) as i64 * elem_bytes;
-            let volatile = self.types.contains_volatile(arr_typ);
-            self.emit_block_zero(base_sym, start, bytes, volatile);
+            let access = Access::of(self.types, arr_typ);
+            self.emit_block_zero(base_sym, start, bytes, access);
         }
     }
 
@@ -2863,6 +2864,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             class: AsmOperandClass::in_register(reg, access),
             size: self.types.size_bits(typ),
             offset: 0,
+            addr_space: crate::types::AddressSpace::Generic,
         }
     }
 
@@ -2977,6 +2979,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     None => self.linearize_lvalue(&op.expr),
                 };
                 let (addr, offset) = self.asm_memory_operand(addr);
+                let space = self.types.address_space(self.expr_type(&op.expr));
                 output_places.push(place);
 
                 if is_readwrite {
@@ -2990,6 +2993,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         class,
                         size,
                         offset,
+                        addr_space: space,
                     });
                 }
 
@@ -3001,6 +3005,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     class,
                     size,
                     offset,
+                    addr_space: space,
                 });
 
                 skip_post_handling.push(true);
@@ -3042,6 +3047,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     class,
                     size,
                     offset: 0,
+                    addr_space: crate::types::AddressSpace::Generic,
                 });
             }
 
@@ -3053,6 +3059,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 class,
                 size,
                 offset: 0,
+                addr_space: crate::types::AddressSpace::Generic,
             });
 
             skip_post_handling.push(false);
@@ -3087,6 +3094,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // For matching constraints (like "0"), we need to load the input value
             // into the matched output's pseudo so they use the same register
             let mut memory_offset = 0;
+            let mut memory_space = crate::types::AddressSpace::Generic;
             let pseudo = if let Some(match_idx) = matching {
                 if match_idx < ir_outputs.len() {
                     // Use the matched output's pseudo
@@ -3111,6 +3119,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let addr = self.linearize_lvalue(&op.expr);
                 let (pseudo, offset) = self.asm_memory_operand(addr);
                 memory_offset = offset;
+                memory_space = self.types.address_space(declared);
                 pseudo
             } else if let Some(k) = self.asm_constant_operand(&op.expr, typ, &class) {
                 k
@@ -3127,6 +3136,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 class,
                 size,
                 offset: memory_offset,
+                addr_space: memory_space,
             });
         }
 

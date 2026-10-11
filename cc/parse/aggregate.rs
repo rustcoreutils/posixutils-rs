@@ -899,6 +899,7 @@ impl Parser<'_> {
                     pos: member_pos,
                     ..
                 } = self.parse_declarator(member_base_type_id, DeclaratorContext::Declaration)?;
+                self.reject_address_space(typ, "structure field", name, member_pos);
 
                 // C99 6.7.5.2: VLAs cannot be members of structures or unions
                 if !vla.is_empty() {

@@ -89,6 +89,10 @@ pub enum MemAddr {
     /// Pairs with `FsAbsolute(0)` to form a thread-local address:
     /// `movq %fs:0, %r` then `leaq sym@TPOFF(%r), %r`.
     TlsTpoffBase { sym: Symbol, base: Reg },
+
+    /// `%gs:8(%rax)`, `%gs:sym(%rip)`: an object in one of gcc's named
+    /// address spaces, reached at `addr` from the segment's base.
+    Seg { seg: SegReg, addr: Box<MemAddr> },
 }
 
 impl MemAddr {
@@ -138,6 +142,7 @@ impl MemAddr {
             MemAddr::TlsTpoffBase { sym, base } => {
                 format!("{}@TPOFF({})", sym.format_for_target(target), base.name64())
             }
+            MemAddr::Seg { seg, addr } => format!("{seg}:{}", addr.format(target)),
         }
     }
 }

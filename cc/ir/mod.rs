@@ -61,7 +61,7 @@ use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::diag::Position;
 use crate::float::{FloatVal, IntegralRounding};
 use crate::target::Target;
-use crate::types::{TypeId, TypeTable};
+use crate::types::{AddressSpace, TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -1642,6 +1642,11 @@ pub struct AsmConstraint {
     /// operands than registers, was spilled -- and the slot holding the
     /// address was then substituted as if it were the object.
     pub offset: i64,
+    /// For a memory operand: the address space of the object, which the
+    /// operand is written through (`%gs:8(%rax)`) -- x86-64's `__seg_fs` and
+    /// `__seg_gs`. The Linux kernel's per-CPU asm leaves the prefix to the
+    /// operand when the compiler has named address spaces.
+    pub addr_space: AddressSpace,
 }
 
 impl AsmConstraint {
@@ -1657,6 +1662,7 @@ impl AsmConstraint {
             class: AsmOperandClass::parse(constraint, arch).expect("a modelled constraint"),
             size,
             offset: 0,
+            addr_space: AddressSpace::Generic,
         }
     }
 
@@ -1761,6 +1767,39 @@ macro_rules! mention_slots {
     }};
 }
 
+/// How a `Load` or `Store` reaches the object it accesses, as the
+/// object's type says: whether the object is `volatile`, and which address
+/// space it is in. A site whose access is of another type than the object's
+/// -- a bit-field's storage unit, an integer chunk of a struct -- says so
+/// with [`Instruction::with_access`], since nothing downstream can read the
+/// qualifiers back off the chunk's own type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Access {
+    pub volatile: bool,
+    pub space: AddressSpace,
+}
+
+impl Access {
+    /// The access to an object of type `typ`.
+    pub fn of(types: &TypeTable, typ: TypeId) -> Self {
+        Access {
+            volatile: types.contains_volatile(typ),
+            space: types.address_space(typ),
+        }
+    }
+
+    /// Is the access through a segment register?
+    pub fn in_segment(self) -> bool {
+        self.space != AddressSpace::Generic
+    }
+
+    /// Must the access stay exactly as written? A volatile one must, and
+    /// so must one through a segment, whose memory no pass can model.
+    pub fn observable(self) -> bool {
+        self.volatile || self.in_segment()
+    }
+}
+
 /// An IR instruction
 #[derive(Debug, Clone)]
 pub struct Instruction {
@@ -1806,6 +1845,12 @@ pub struct Instruction {
     /// Set for every access the linearizer emits, from the type it is
     /// accessing, in `Linearizer::mark_volatile_access`.
     pub is_volatile: bool,
+    /// For `Load` and `Store`: the address space of the object accessed --
+    /// x86-64's `__seg_fs`/`__seg_gs`, which the backend reaches through
+    /// the segment register. Set with [`Instruction::with_access`], which
+    /// marks such an access volatile too: what a segment base points to is
+    /// memory no pass can see.
+    pub addr_space: AddressSpace,
     /// The fields only calls, switches, `asm` and atomics use, in one box
     /// that every other instruction leaves empty. Read them through
     /// [`Instruction::extra`] and set them through [`Instruction::extra_mut`].
@@ -1928,6 +1973,7 @@ impl Default for Instruction {
             src_typ: None,
             pos: None,
             is_volatile: false,
+            addr_space: AddressSpace::Generic,
             extra: None,
         }
     }
@@ -2023,6 +2069,26 @@ impl Instruction {
         );
         self.is_volatile = is_volatile;
         self
+    }
+
+    /// Mark this `Load` or `Store` with how it reaches its object: see
+    /// [`Access`].
+    pub fn with_access(mut self, access: Access) -> Self {
+        debug_assert!(
+            access == Access::default() || matches!(self.op, Opcode::Load | Opcode::Store),
+            "only a Load or a Store carries an access"
+        );
+        self.is_volatile = access.observable();
+        self.addr_space = access.space;
+        self
+    }
+
+    /// How this `Load` or `Store` reaches its object; see [`Access`].
+    pub fn access(&self) -> Access {
+        Access {
+            volatile: self.is_volatile,
+            space: self.addr_space,
+        }
     }
 
     /// Is this an access to a `volatile` object?
@@ -2865,6 +2931,9 @@ impl fmt::Display for InstructionDisplay<'_> {
                 }
                 if this.is_volatile {
                     write!(f, " volatile")?;
+                }
+                if let Some(space) = this.addr_space.keyword() {
+                    write!(f, " {space}")?;
                 }
             }
             _ => {

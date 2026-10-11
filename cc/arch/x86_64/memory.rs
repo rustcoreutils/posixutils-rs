@@ -16,7 +16,8 @@ use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{Loc, Reg, XmmReg};
 use crate::ir::{Instruction, PseudoId};
-use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::machine::SegReg;
+use crate::types::{AddressSpace, TypeId, TypeKind, TypeTable};
 
 impl X86_64CodeGen {
     /// The source width of a zero-extending load, when the hardware has one.
@@ -312,6 +313,76 @@ impl X86_64CodeGen {
         }
     }
 
+    /// The memory operand of the object the `Load` or `Store` `insn` reaches
+    /// at `addr`: [`Self::scalar_mem_operand`], through the segment of the
+    /// address space it is in. A constant address in a segment is an offset
+    /// from its base, `%fs:16`, as gcc writes glibc's `THREAD_SELF`.
+    pub(super) fn access_mem_operand(
+        &mut self,
+        insn: &Instruction,
+        addr: PseudoId,
+        scratch: Reg,
+    ) -> MemAddr {
+        let disp = insn.displacement();
+        if let Some(seg) = Self::access_segment(insn) {
+            if let Loc::Imm(v) = self.get_location(addr) {
+                if let Ok(offset) = i32::try_from(v + i128::from(disp)) {
+                    return MemAddr::SegOffset { seg, offset };
+                }
+            }
+        }
+        let mem = self.scalar_mem_operand(addr, disp, scratch);
+        Self::through_segment(insn, mem)
+    }
+
+    /// The segment register the `Load` or `Store` `insn` goes through, if
+    /// the object it reaches is in a named address space.
+    pub(super) fn access_segment(insn: &Instruction) -> Option<SegReg> {
+        match insn.addr_space {
+            AddressSpace::Generic => None,
+            AddressSpace::SegFs => Some(SegReg::Fs),
+            AddressSpace::SegGs => Some(SegReg::Gs),
+        }
+    }
+
+    /// `mem`, the operand `insn` accesses, through the segment of its
+    /// address space. A thread-local's operand is already `%fs`-relative and
+    /// stays as it is.
+    pub(super) fn through_segment(insn: &Instruction, mem: MemAddr) -> MemAddr {
+        match (Self::access_segment(insn), mem) {
+            (
+                Some(_),
+                mem @ (MemAddr::TlsLocalExec(_)
+                | MemAddr::FsBase(_)
+                | MemAddr::FsAbsolute(_)
+                | MemAddr::SegOffset { .. }
+                | MemAddr::SegRip { .. }
+                | MemAddr::SegBase { .. }
+                | MemAddr::Seg { .. }),
+            ) => mem,
+            (Some(seg), mem) => MemAddr::Seg {
+                seg,
+                addr: Box::new(mem),
+            },
+            (None, mem) => mem,
+        }
+    }
+
+    /// Refuse an access in a named address space down a path that does not
+    /// reach through the segment, rather than emit one that silently misses
+    /// it.
+    pub(super) fn refuse_segment_access(insn: &Instruction, what: &str) -> bool {
+        if Self::access_segment(insn).is_none() {
+            return false;
+        }
+        crate::diag::error_args(
+            insn.pos.unwrap_or_default(),
+            "sorry, unimplemented: {0} in a named address space",
+            &[what],
+        );
+        true
+    }
+
     /// The memory operand of global symbol `name`: thread-local through the
     /// FS segment (Local Exec, or Initial Exec with the offset loaded into
     /// `scratch`), external through the GOT (the address loaded into
@@ -484,6 +555,9 @@ impl X86_64CodeGen {
         // copy via the emit_int128_copy path. For pointer dereferences (*ptr where
         // ptr is to an int128), addr is a runtime pointer that must be dereferenced.
         if self.int128_pseudos.contains(&target) {
+            if Self::refuse_segment_access(insn, "a 128-bit integer load") {
+                return;
+            }
             let addr_loc = self.get_location(addr);
             // A stack slot holding the value itself, or one holding a pointer
             // to it? Only the pseudo's *kind* says: a `Sym` names storage,
@@ -634,6 +708,9 @@ impl X86_64CodeGen {
         if is_fp {
             // Long double uses x87, not SSE
             if self.is_longdouble_op(insn, types) {
+                if Self::refuse_segment_access(insn, "a long double load") {
+                    return;
+                }
                 self.emit_x87_load(insn);
             } else {
                 self.emit_fp_load(insn, types);
@@ -651,7 +728,7 @@ impl X86_64CodeGen {
         // special-case here.
         let is_unsigned = insn.typ.is_some_and(|t| types.is_unsigned(t));
 
-        let mem = self.scalar_mem_operand(addr, insn.displacement(), Reg::R11);
+        let mem = self.access_mem_operand(insn, addr, Reg::R11);
         self.emit_extending_load(mem, mem_size, reg_size, is_unsigned, dst_reg);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
             self.emit_move_to_loc(dst_reg, &dst_loc, reg_size);
@@ -678,6 +755,9 @@ impl X86_64CodeGen {
         if is_fp {
             // Long double uses x87, not SSE
             if self.is_longdouble_op(insn, types) {
+                if Self::refuse_segment_access(insn, "a long double store") {
+                    return;
+                }
                 self.emit_x87_store(insn);
             } else {
                 self.emit_fp_store(insn, types);
@@ -688,7 +768,9 @@ impl X86_64CodeGen {
         // For struct stores (size > 64), we need to copy multiple words
         // The value is a symbol containing the struct data
         if mem_size > 64 {
-            self.emit_struct_store(insn, addr, value);
+            if !Self::refuse_segment_access(insn, "a store wider than 64 bits") {
+                self.emit_struct_store(insn, addr, value);
+            }
             return;
         }
 
@@ -702,7 +784,7 @@ impl X86_64CodeGen {
             }
         };
 
-        let mem = self.scalar_mem_operand(addr, insn.displacement(), Reg::R11);
+        let mem = self.access_mem_operand(insn, addr, Reg::R11);
         // A local object's own slot is stored at the width `SymSlot::store_bits`
         // decides; everything else at the access width.
         let store_bits = match self.get_location(addr) {

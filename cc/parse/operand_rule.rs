@@ -104,6 +104,9 @@ pub(crate) enum OperandVerdict {
     /// subtracted or compared. C2x makes them pointers to compatible types;
     /// gcc accepts them and objects only under `-pedantic`.
     QualifiedArrays,
+    /// Two pointers into disjoint address spaces compared -- the generic
+    /// space and an x86-64 segment, or two segments. gcc rejects it.
+    DisjointAddressSpaces,
 }
 
 /// Check a binary operator's operands against C17 6.5.5p2 through 6.5.14p2.
@@ -143,17 +146,17 @@ fn pointer_form_verdict(
         } else {
             OperandVerdict::Invalid
         }),
-        _ if op.is_comparison() && lp && rp => {
-            Some(if pointees_differ_in_array_qualifiers(types, left, right) {
-                OperandVerdict::QualifiedArrays
-            } else if !pointers_comparable(types, op, left, right) {
-                OperandVerdict::DistinctPointers
-            } else if pairs_function_with_void(types, left, right) {
-                OperandVerdict::FunctionPointerVoid
-            } else {
-                OperandVerdict::Valid
-            })
-        }
+        _ if op.is_comparison() && lp && rp => Some(if !same_address_space(types, left, right) {
+            OperandVerdict::DisjointAddressSpaces
+        } else if pointees_differ_in_array_qualifiers(types, left, right) {
+            OperandVerdict::QualifiedArrays
+        } else if !pointers_comparable(types, op, left, right) {
+            OperandVerdict::DistinctPointers
+        } else if pairs_function_with_void(types, left, right) {
+            OperandVerdict::FunctionPointerVoid
+        } else {
+            OperandVerdict::Valid
+        }),
         _ if op.is_comparison() && pointer_and_integer => {
             let integer = if lp { right } else { left };
             Some(if integer.null_constant {
@@ -166,19 +169,32 @@ fn pointer_form_verdict(
     }
 }
 
-/// Do two pointers point at compatible types, qualifiers aside?
+/// Do two pointers point at compatible types, qualifiers aside, in one
+/// address space?
 fn pointees_compatible(types: &TypeTable, left: Operand, right: Operand) -> bool {
     match (types.base_type(left.typ), types.base_type(right.typ)) {
-        (Some(l), Some(r)) => types.types_compatible(l, r),
+        (Some(l), Some(r)) => {
+            types.types_compatible(l, r) && same_address_space(types, left, right)
+        }
         _ => false,
     }
+}
+
+/// Do two pointers point into one address space? A null pointer constant
+/// points nowhere, so into any.
+fn same_address_space(types: &TypeTable, left: Operand, right: Operand) -> bool {
+    left.null_constant
+        || right.null_constant
+        || types.pointee_address_space(left.typ) == types.pointee_address_space(right.typ)
 }
 
 /// Do two pointers point at arrays that differ only in the qualifiers of
 /// their elements? See [`TypeTable::arrays_differ_in_qualifiers_only`].
 fn pointees_differ_in_array_qualifiers(types: &TypeTable, left: Operand, right: Operand) -> bool {
     match (types.base_type(left.typ), types.base_type(right.typ)) {
-        (Some(l), Some(r)) => types.arrays_differ_in_qualifiers_only(l, r),
+        (Some(l), Some(r)) => {
+            types.arrays_differ_in_qualifiers_only(l, r) && same_address_space(types, left, right)
+        }
         _ => false,
     }
 }

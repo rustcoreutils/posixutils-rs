@@ -145,6 +145,13 @@ Language and preprocessor additions:
    The integer form `2i`, which gcc types `_Complex int`, is not accepted.
  * Clang nullability qualifiers `_Nonnull`, `_Nullable`, `_Null_unspecified`
    and their `__` spellings.
+ * On x86-64, gcc's named address spaces `__seg_fs` and `__seg_gs`, with
+   `__SEG_FS` and `__SEG_GS` predefined: an object so qualified is reached
+   through the `%fs` or `%gs` segment.  glibc's `THREAD_SELF` reads the
+   thread pointer through `__seg_fs`, and the Linux kernel's per-CPU
+   accessors use `__seg_gs` when its `CC_HAS_NAMED_AS` probe passes.
+   Atomic operations, `__int128` and `long double` in a named space are
+   refused ("sorry, unimplemented").
  * Pointers to arrays whose elements differ only in qualifiers subtract and
    compare (C2x's rule, which gcc applies): glibc's nss subtracts a
    `const char (*)[N]` from a `char (*)[N]`.  `-pedantic` warns.

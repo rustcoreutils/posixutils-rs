@@ -72,9 +72,9 @@ impl Parser<'_> {
     pub(super) fn parse_pointer_qualifiers(&mut self) -> TypeModifiers {
         let mut modifiers = TypeModifiers::empty();
         while let Some(name_id) = self.current_ident() {
-            // Every spelling of the three CV qualifiers, from the one shared
-            // answer.
-            if let Some(m) = super::cv_qualifier_modifier(name_id) {
+            // Every spelling of the three CV qualifiers, and the target's
+            // address spaces, from the one shared answer.
+            if let Some(m) = super::type_qualifier_modifier(name_id, self.types.target().arch) {
                 modifiers |= m;
                 self.advance();
                 continue;
@@ -363,7 +363,8 @@ impl Parser<'_> {
         while let Some(name_id) = self.current_ident() {
             match name_id {
                 crate::kw::STATIC | crate::kw::ATOMIC => {}
-                _ if super::cv_qualifier_modifier(name_id).is_some() => {}
+                _ if super::type_qualifier_modifier(name_id, self.types.target().arch)
+                    .is_some() => {}
                 _ => break,
             }
             qualified = true;
@@ -706,6 +707,7 @@ impl Parser<'_> {
             // other declaration: `typeof(a) b` beside `int (*a)[n]`.
             vla_sizes.extend(param_specs.vm_dims);
             self.check_parameter_specifiers(param_type.modifiers, param_name, param_pos);
+            self.reject_address_space(typ_id, "parameter", param_name, param_pos);
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();

@@ -45,9 +45,10 @@ pub const TYPE_KEYWORD: u32 = 1 << 13;
 /// separates standard C from GNU extensions (`FOO` vs `GNU_FOO`), because that
 /// lives in the Rust const identifier and is not queryable at runtime.
 pub const RESERVED_NAME: u32 = 1 << 14;
-/// An attribute or builtin gcc knows only on x86-64: the calling-convention
-/// attributes and the Microsoft `va_list` builtins. Anywhere else gcc has
-/// never heard of the name, so neither has c17 -- see [`exists_on`].
+/// An attribute, builtin or qualifier gcc knows only on x86-64: the
+/// calling-convention attributes, the Microsoft `va_list` builtins and the
+/// `__seg_fs`/`__seg_gs` address spaces. Anywhere else gcc has never heard
+/// of the name, so neither has c17 -- see [`exists_on`].
 pub const X86_64_ONLY: u32 = 1 << 15;
 
 /// Composite: all tags that start a declaration
@@ -202,6 +203,9 @@ define_keywords! {
     (GNU_VOLATILE2,     "__volatile",        QUALIFIER),
     (GNU_RESTRICT,      "__restrict__",      QUALIFIER),
     (GNU_RESTRICT2,     "__restrict",        QUALIFIER),
+    // gcc's x86-64 named address spaces.
+    (SEG_FS,            "__seg_fs",          QUALIFIER | X86_64_ONLY),
+    (SEG_GS,            "__seg_gs",          QUALIFIER | X86_64_ONLY),
 
     // ---- Inline (INLINE_KW) ----
     (INLINE,            "inline",            INLINE_KW),

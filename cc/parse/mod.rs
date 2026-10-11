@@ -117,3 +117,19 @@ pub(crate) fn cv_qualifier_modifier(
         _ => None,
     }
 }
+
+/// The type qualifier this identifier spells on a target of architecture
+/// `arch`: a [`cv_qualifier_modifier`], or one of x86-64's named address
+/// spaces, which no other target has.
+pub(crate) fn type_qualifier_modifier(
+    id: crate::strings::StringId,
+    arch: crate::target::Arch,
+) -> Option<crate::types::TypeModifiers> {
+    use crate::types::TypeModifiers as M;
+    match id {
+        crate::kw::SEG_FS | crate::kw::SEG_GS if !crate::kw::exists_on(id, arch) => None,
+        crate::kw::SEG_FS => Some(M::SEG_FS),
+        crate::kw::SEG_GS => Some(M::SEG_GS),
+        _ => cv_qualifier_modifier(id),
+    }
+}

@@ -2775,6 +2775,41 @@ fn test_assembly_hash_lines_pass_through() {
     );
 }
 
+/// In assembly a `##` that forms no single token leaves its two operands
+/// side by side, unspaced, with no diagnostic, as gcc's `-lang-asm` does:
+/// the kernel's `.L__sym_size_##name` with `name` a `.macro` parameter
+/// `\name`, `initcall##level##.init` in vmlinux.lds.h, and `,##reg`.
+#[test]
+fn test_assembly_invalid_paste_keeps_both_tokens() {
+    crate::diag::capture_diagnostics();
+    let out = preprocess_asm_file(
+        b"#define SIZE(name) .set .L__sym_size_##name, 4\n\
+          #define SEC(level) .section .initcall##level##.init,\"a\"\n\
+          #define ARG(a, b) mov a,##b\n\
+          SIZE(\\name)\nSEC(1)\nARG(%eax, %ebx)\n",
+        &Target::host(),
+        "t.S",
+        &AsmPreprocessConfig::default(),
+    );
+    let lines = crate::diag::take_captured_diagnostics();
+    assert!(lines.is_empty(), "{lines:?}");
+    let text = String::from_utf8_lossy(&out.expect("preprocesses").text).into_owned();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ".set .L__sym_size_\\name, 4",
+            ".section .initcall1.init,\"a\"",
+            "mov %eax, %ebx"
+        ],
+        "{text}"
+    );
+}
+
 /// C17 6.10.1p4 evaluates `#if` in `intmax_t`, where signed overflow is
 /// undefined. gcc's default pedwarn "integer overflow in preprocessor
 /// expression" covers `+`, `-`, `*`, `/`, unary `-` and a signed left shift

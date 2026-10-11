@@ -1510,8 +1510,14 @@ impl<'a> Preprocessor<'a> {
     /// Report a `##` whose result is not a single preprocessing token.
     ///
     /// The operands are then emitted side by side, unpasted, which is what gcc
-    /// does and keeps the rest of the line meaningful.
+    /// does and keeps the rest of the line meaningful. In assembly that is
+    /// all that happens, as with gcc's `-lang-asm`: the assembler's syntax is
+    /// not C's, and `.L__sym_size_##name` with `name` a `.macro` parameter
+    /// `\name` means exactly those characters side by side.
     fn reject_paste(&self, left: &Token, right: &Token, pos: &Position, idents: &IdentTable) {
+        if self.lexer_mode == LexerMode::Assembly {
+            return;
+        }
         crate::diag::error_args(
             *pos,
             "pasting \"{0}\" and \"{1}\" does not give a valid preprocessing token",

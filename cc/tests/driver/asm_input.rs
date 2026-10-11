@@ -141,3 +141,32 @@ fn asm_input_stdin_dash_m_target() {
     assert!(r.success, "{}", r.stderr);
     assert_eq!(r.stdout.trim_end(), "-:");
 }
+
+/// A `##` that forms no single token is no error in assembler-with-cpp, as
+/// in gcc's `-lang-asm`: the two tokens stand side by side. The kernel's
+/// linkage.h pastes onto a `.macro` parameter (`.L__sym_size_##name`),
+/// vmlinux.lds.h builds `initcall##level##.init`, and the crypto code
+/// writes `,##reg`; c17 stopped with "preprocessing failed".
+#[cfg(target_os = "linux")]
+#[test]
+fn asm_input_invalid_paste_is_two_tokens() {
+    let w = WorkDir::new("asm_paste");
+    let src = w.write(
+        "paste.S",
+        "#define SIZE(name) .set .L__sym_size_##name, 4\n\
+         #define SEC(level) .section .initcall##level##.init,\"a\"\n\
+         #define LIST(a, b) .long a,##b\n\
+         .macro m name\nSIZE(\\name)\n.long .L__sym_size_\\name\n.endm\n\
+         \tSEC(1)\n\tLIST(1, 2)\n\tm foo\n",
+    );
+    let obj = w.join("paste.o");
+    let r = crate::common::run_c17(&["-c", &s(&src), "-o", &s(&obj)]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.is_empty(), "{}", r.stderr);
+    let dump = std::process::Command::new("objdump")
+        .args(["-s", "-j", ".initcall1.init", &s(&obj)])
+        .output()
+        .expect("objdump");
+    let dump = String::from_utf8_lossy(&dump.stdout);
+    assert!(dump.contains(" 0000 01000000 02000000 04000000"), "{dump}");
+}

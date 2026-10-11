@@ -155,6 +155,10 @@ Language and preprocessor additions:
  * `__FUNCTION__`, `__PRETTY_FUNCTION__`.
  * `#include_next`, `#warning`, `#pragma once`, `#pragma push_macro` and
    `#pragma pop_macro`.
+ * In assembler-with-cpp (`.S`) a `##` that forms no single token leaves its
+   operands side by side without a diagnostic, as gcc's `-lang-asm` does:
+   the Linux kernel pastes onto `.macro` parameters (`.L__sym_size_##name`)
+   and builds `initcall##level##.init` in its linker script.
  * `<limits.h>` defines gcc's `LONG_LONG_MIN`, `LONG_LONG_MAX` and
    `ULONG_LONG_MAX` under glibc's `_GNU_SOURCE` (with another C library,
    always): glibc's vfprintf stops without them.

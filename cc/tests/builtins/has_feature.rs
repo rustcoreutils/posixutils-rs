@@ -244,9 +244,17 @@ int main(void) {
 #[test]
 fn builtins_has_attribute() {
     let code = r#"
+/* Mach-O names a segment with the section. */
+#ifdef __APPLE__
+#define XX "__DATA,xx"
+#define YY "__DATA,yy"
+#else
+#define XX "xx"
+#define YY "yy"
+#endif
 extern void f1(void) __attribute__((noreturn, cold));
 int v1 __attribute__((aligned(16), used));
-static int v2 __attribute__((section("xx"), unused)) = 3;
+static int v2 __attribute__((section(XX), unused)) = 3;
 typedef int T1 __attribute__((aligned(32)));
 typedef int V4 __attribute__((vector_size(16)));
 struct __attribute__((packed)) P { char c; int i; };
@@ -262,7 +270,7 @@ int main(void) {
     int r[] = {
         __builtin_has_attribute(f1, cold), !__builtin_has_attribute(f1, hot),
         __builtin_has_attribute(v1, used), !__builtin_has_attribute(v1, aligned(8)),
-        __builtin_has_attribute(v2, section("xx")), !__builtin_has_attribute(v2, section("yy")),
+        __builtin_has_attribute(v2, section(XX)), !__builtin_has_attribute(v2, section(YY)),
         __builtin_has_attribute(v2, unused), __builtin_has_attribute(T1, aligned),
         !__builtin_has_attribute(int, aligned), __builtin_has_attribute(struct P, packed),
         __builtin_has_attribute(V4, vector_size(16)), __builtin_has_attribute(pf, format),

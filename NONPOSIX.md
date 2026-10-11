@@ -136,6 +136,9 @@ Language and preprocessor additions:
    `__alignof__` keyword aliases.
  * GCC extended inline assembly, including `asm goto`; `asm` / `__asm__` /
    `__asm`.
+ * Inline-asm operand names as matching constraints, `"[sum]"` for the
+   output named `sum`, anywhere in a constraint as gcc reads them: gcc's
+   own torture suite ties inputs to outputs so (`pr20314-2.c`).
  * `__int128`, `__int128_t`, `__uint128_t`, `_Float16`, `_Float32`, `_Float64`,
    `__builtin_va_list`.
  * GNU imaginary constants — `1.0i`, `2.2if`, `1.0fi`, `2.2iL`, `1.j`.  The

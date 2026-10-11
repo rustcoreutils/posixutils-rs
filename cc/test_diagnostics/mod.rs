@@ -25,6 +25,7 @@
 
 mod arrays_and_initializers;
 mod asm_constraints;
+mod asm_operand_names;
 mod asm_templates;
 mod atomics_and_asm;
 mod attribute_misuse;

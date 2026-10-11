@@ -289,6 +289,8 @@ impl Parser<'_> {
         self.expect_special(b')')?;
         self.expect_special(b';')?;
 
+        let (outputs, inputs) = self.resolve_asm_operand_names(pos, outputs, inputs, &goto_labels);
+
         // Every asm is already treated as volatile: `Opcode::Asm` is a memory
         // access, so DCE never deletes one and no pass reorders it past
         // another memory operation. The qualifier has nothing left to add.
@@ -302,6 +304,45 @@ impl Parser<'_> {
             clobbers,
             goto_labels,
         })
+    }
+
+    /// The operands with every `[name]` in a constraint rewritten as the
+    /// number of the operand it names, as gcc does before it reads the
+    /// constraint: `"[sum]"` is the matching constraint `"0"` when `sum` is
+    /// output 0. Names number outputs, then inputs, then `asm goto` labels.
+    ///
+    /// A name given twice is reported, and so is a constraint naming an
+    /// operand that does not exist, in gcc's words. The template's
+    /// `%[name]` is substituted where the operands are, in the backend.
+    fn resolve_asm_operand_names(
+        &self,
+        pos: Position,
+        outputs: Vec<AsmOperand>,
+        inputs: Vec<AsmOperand>,
+        labels: &[LabelId],
+    ) -> (Vec<AsmOperand>, Vec<AsmOperand>) {
+        let names: Vec<Option<&str>> = outputs
+            .iter()
+            .chain(&inputs)
+            .map(|op| op.name.map(|n| self.str(n)))
+            .chain(labels.iter().map(|l| Some(self.str(l.name))))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for name in names.iter().flatten() {
+            if !seen.insert(*name) {
+                diag::error_args(pos, "duplicate 'asm' operand name '{0}'", &[name]);
+            }
+        }
+        let resolve = |mut op: AsmOperand| {
+            match resolve_operand_names(&op.constraint, &names) {
+                Ok(c) => op.constraint = c,
+                Err(e) => diag::error(pos, &e.to_string()),
+            }
+            op
+        };
+        let outputs = outputs.into_iter().map(resolve).collect();
+        let inputs = inputs.into_iter().map(resolve).collect();
+        (outputs, inputs)
     }
 
     /// Parse GNU basic asm at file scope: `asm ( string-literal ) ;`, the
@@ -507,4 +548,53 @@ impl Parser<'_> {
 
         Ok(labels)
     }
+}
+
+/// Why a `[name]` in an asm constraint names no operand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OperandNameError {
+    /// `[` with no `]` after it.
+    MissingCloseBrace,
+    /// A name no operand or label of the statement has.
+    Undefined(String),
+}
+
+impl std::fmt::Display for OperandNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperandNameError::MissingCloseBrace => {
+                f.write_str(&gettext("missing close brace for named operand"))
+            }
+            OperandNameError::Undefined(name) => f.write_str(&gettextrs::gettext_args(
+                "undefined named operand '{0}'",
+                &[name],
+            )),
+        }
+    }
+}
+
+/// `constraint` with each `[name]` replaced by the number of the operand
+/// `names` gives it -- `names` lists the statement's operand names in gcc's
+/// numbering: outputs, inputs, then labels. A name may sit anywhere in the
+/// constraint (`"r[sum]"` is `"r0"`), as in gcc.
+pub(super) fn resolve_operand_names(
+    constraint: &str,
+    names: &[Option<&str>],
+) -> Result<String, OperandNameError> {
+    let mut out = String::with_capacity(constraint.len());
+    let mut rest = constraint;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find(']').ok_or(OperandNameError::MissingCloseBrace)?;
+        let name = &after[..close];
+        let number = names
+            .iter()
+            .position(|n| *n == Some(name))
+            .ok_or_else(|| OperandNameError::Undefined(name.to_string()))?;
+        out.push_str(&number.to_string());
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }

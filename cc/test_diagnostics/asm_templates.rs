@@ -131,7 +131,12 @@ fn asm_template_references_that_name_nothing() {
         (
             "asm_tpl_name",
             r##""# %[nope]" :: "r"(x)"##,
-            "undefined named asm operand 'nope'",
+            "undefined named operand 'nope'",
+        ),
+        (
+            "asm_tpl_name_open",
+            r##""# %[x" :: [x] "r"(x)"##,
+            "missing close brace for named operand",
         ),
         (
             "asm_tpl_bang",

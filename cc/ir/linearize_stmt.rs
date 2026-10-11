@@ -15,7 +15,7 @@ use super::linearize_emit::Controlling;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, GlobalStorage, Initializer, Instruction, Opcode, PseudoId,
 };
-use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass, PinnedGp};
+use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass, AsmRegClass, PinnedGp};
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
@@ -2775,6 +2775,68 @@ impl<'a> super::linearize::Linearizer<'a> {
         )
     }
 
+    /// Report a matching constraint gcc refuses: one naming an output that
+    /// another input is already tied to, a `"+"` output -- whose own hidden
+    /// input it would replace -- a memory output, which has no register to
+    /// share. Each
+    /// output is one operand, read once -- but a second tie reading the same
+    /// non-volatile frame local as the first is that one value again, which
+    /// gcc accepts at every level. Such a repeat is marked in the answer, and
+    /// puts nothing more in the output's register.
+    ///
+    /// A refused tie is then dropped, leaving the input an operand of its
+    /// own, so the statement is still linearized whole; the error stops the
+    /// compilation. Kept, a second tie wrote its value over the first's in
+    /// the output's pseudo, which then had two definitions.
+    fn check_matching_constraints(
+        &self,
+        inputs: &[AsmOperand],
+        output_classes: &[AsmOperandClass],
+        input_classes: &mut [AsmOperandClass],
+    ) -> Vec<bool> {
+        let mut first_tie: Vec<Option<&Expr>> = vec![None; output_classes.len()];
+        let mut repeats = vec![false; inputs.len()];
+        for (i, (op, class)) in inputs.iter().zip(input_classes).enumerate() {
+            let Some(out) = class.tied.filter(|&i| i < output_classes.len()) else {
+                continue;
+            };
+            let target = &output_classes[out];
+            let why = if let Some(first) = first_tie[out] {
+                repeats[i] = self.same_local_value(first, &op.expr);
+                (!repeats[i]).then_some("inconsistent operand constraints in an 'asm'")
+            } else if target.access == AsmAccess::ReadWrite || target.is_memory_only() {
+                Some("inconsistent operand constraints in an 'asm'")
+            } else {
+                None
+            };
+            first_tie[out].get_or_insert(&op.expr);
+            if let Some(why) = why {
+                error(op.expr.pos, why);
+                class.tied = None;
+                class.reg = Some(AsmRegClass::General);
+            }
+        }
+        repeats
+    }
+
+    /// Whether `a` and `b` read one value: both name the same non-volatile
+    /// object in this function's frame, which nothing between two operands
+    /// of one statement can change.
+    fn same_local_value(&self, a: &Expr, b: &Expr) -> bool {
+        let (ExprKind::Ident(x), ExprKind::Ident(y)) = (&a.kind, &b.kind) else {
+            return false;
+        };
+        let in_frame = matches!(
+            self.locals.get(x).map(|local| &local.binding),
+            Some(LocalBinding::Frame { .. })
+        );
+        let volatile = self
+            .types
+            .modifiers(self.symbols.get(*x).typ)
+            .contains(TypeModifiers::VOLATILE);
+        x == y && in_frame && !volatile
+    }
+
     /// Pin each operand that is a register variable to its register, when
     /// its class offers a general one -- gcc's one documented guarantee for a
     /// local register variable, and what glibc's syscall wrappers stand on:
@@ -2931,6 +2993,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         let (mut output_classes, mut input_classes) = self.asm_operand_classes(outputs, inputs);
         self.pin_register_variables(outputs, &mut output_classes, clobbers);
         self.pin_register_variables(inputs, &mut input_classes, clobbers);
+        let repeated_ties =
+            self.check_matching_constraints(inputs, &output_classes, &mut input_classes);
         let tied_inputs: Vec<bool> = {
             let mut out_has_tied_input = vec![false; outputs.len()];
             for class in &input_classes {
@@ -3067,7 +3131,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
 
         // Process input operands
-        for (op, &class) in inputs.iter().zip(&input_classes) {
+        for ((op, &class), &repeated_tie) in inputs.iter().zip(&input_classes).zip(&repeated_ties) {
             let is_memory = class.is_memory_only();
             let matching = class.tied;
 
@@ -3096,7 +3160,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             let mut memory_offset = 0;
             let mut memory_space = crate::types::AddressSpace::Generic;
             let pseudo = if let Some(match_idx) = matching {
-                if match_idx < ir_outputs.len() {
+                if repeated_tie {
+                    // The value an earlier tie already put there.
+                    ir_outputs[match_idx].pseudo
+                } else if match_idx < ir_outputs.len() {
                     // Use the matched output's pseudo
                     let out_pseudo = ir_outputs[match_idx].pseudo;
                     // Load the input value into the output's pseudo

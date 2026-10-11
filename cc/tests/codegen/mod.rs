@@ -19,6 +19,7 @@ mod asm_callee_saved;
 mod asm_constraint_letters;
 mod asm_fp_clobbers;
 mod asm_memory_outputs;
+mod asm_named_operands;
 mod asm_operand_modifiers;
 mod asm_paravirt;
 mod asm_pinned_operands;

@@ -1559,24 +1559,27 @@ enum OperandRef {
 }
 
 /// Read the operand reference after `%` and any modifier: digits, or a
-/// bracketed name. `None` when neither follows.
-fn read_operand_ref(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<OperandRef> {
+/// bracketed name. `None` when neither follows; an error, in gcc's words,
+/// for a name with no `]`.
+fn read_operand_ref(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> Result<Option<OperandRef>, String> {
     if chars.next_if_eq(&'[').is_some() {
         let mut name = String::new();
-        for ch in chars.by_ref() {
-            if ch == ']' {
-                break;
+        loop {
+            match chars.next() {
+                Some(']') => return Ok(Some(OperandRef::Name(name))),
+                Some(ch) => name.push(ch),
+                None => return Err("missing close brace for named operand".to_string()),
             }
-            name.push(ch);
         }
-        return Some(OperandRef::Name(name));
     }
     let mut digits = String::new();
     while let Some(d) = chars.next_if(|d| d.is_ascii_digit()) {
         digits.push(d);
     }
     // Too many digits to be an operand is out of range, like any other.
-    (!digits.is_empty()).then(|| OperandRef::Number(digits.parse().unwrap_or(usize::MAX)))
+    Ok((!digits.is_empty()).then(|| OperandRef::Number(digits.parse().unwrap_or(usize::MAX))))
 }
 
 /// Substitute the operands into an extended-asm template, as gcc does:
@@ -1651,7 +1654,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
             }
         }
         let modifier = chars.next_if(|m| m.is_ascii_alphabetic());
-        let Some(operand) = read_operand_ref(&mut chars) else {
+        let Some(operand) = read_operand_ref(&mut chars)? else {
             return Err(match (modifier, chars.peek()) {
                 (Some(m), _) => {
                     format!("operand number missing after '%{m}' in asm template")
@@ -1661,7 +1664,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
             });
         };
         if modifier == Some('l') {
-            result.push_str(&goto_label(&operand, slots.len(), goto_labels)?);
+            result.push_str(&goto_label(&operand, slots, goto_labels)?);
             continue;
         }
         // A label is an operand too, numbered after the rest, and a bare
@@ -1684,7 +1687,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
             OperandRef::Name(name) => slots
                 .iter()
                 .find(|s| s.name.as_deref() == Some(name.as_str()))
-                .ok_or_else(|| format!("undefined named asm operand '{name}'"))?,
+                .ok_or_else(|| undefined_operand_name(name))?,
         };
         let text = match (modifier, &slot.value) {
             (Some('c'), AsmOperandValue::Int(v)) => Ok(v.to_string()),
@@ -1742,22 +1745,30 @@ fn skip_other_alternatives(chars: &mut std::iter::Peekable<std::str::Chars>) -> 
 /// The `asm goto` label `%l` names. gcc numbers labels after every operand,
 /// the hidden inputs of `"+"` outputs included, so the first label of a
 /// statement with three operands is `%l3`.
-fn goto_label(
+fn goto_label<R>(
     operand: &OperandRef,
-    operands: usize,
+    slots: &[AsmOperandSlot<R>],
     goto_labels: &[(String, String)],
 ) -> Result<String, String> {
     let label = match operand {
         OperandRef::Name(name) => goto_labels.iter().find(|(_, n)| n == name),
-        OperandRef::Number(n) => n.checked_sub(operands).and_then(|i| goto_labels.get(i)),
+        OperandRef::Number(n) => n.checked_sub(slots.len()).and_then(|i| goto_labels.get(i)),
     };
     match (label, operand) {
         (Some((text, _)), _) => Ok(text.clone()),
-        (None, OperandRef::Name(name)) => Err(format!("undefined asm goto label '{name}'")),
+        (None, OperandRef::Name(name)) if slots.iter().any(|s| s.name.as_ref() == Some(name)) => {
+            Err("'%l' operand isn't a label".to_string())
+        }
+        (None, OperandRef::Name(name)) => Err(undefined_operand_name(name)),
         (None, OperandRef::Number(n)) => {
             Err(format!("asm operand {n} named by '%l' is not a label"))
         }
     }
+}
+
+/// gcc's report of a `%[name]` or `%l[name]` that names nothing.
+fn undefined_operand_name(name: &str) -> String {
+    format!("undefined named operand '{name}'")
 }
 
 // CodeGenerator Trait
@@ -2264,10 +2275,12 @@ mod tests {
         assert!(err("%e").contains("operand number missing after '%e'"));
         assert!(err("%9").contains("operand number 9 out of range"));
         assert!(err("%k4").contains("'%k' does not apply to a symbolic constant"));
-        assert!(err("%[nope]").contains("undefined named asm operand 'nope'"));
+        assert!(err("%[nope]").contains("undefined named operand 'nope'"));
+        assert!(err("%[nope").contains("missing close brace for named operand"));
         assert!(err("%!").contains("invalid '%!'"));
         assert!(err("x %").contains("at the end"));
         assert!(err("%l1").contains("asm operand 1 named by '%l' is not a label"));
-        assert!(err("%l[gone]").contains("undefined asm goto label 'gone'"));
+        assert!(err("%l[gone]").contains("undefined named operand 'gone'"));
+        assert!(err("%l[out]").contains("'%l' operand isn't a label"));
     }
 }

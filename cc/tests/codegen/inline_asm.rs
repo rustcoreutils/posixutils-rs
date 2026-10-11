@@ -1144,7 +1144,7 @@ static int t_x86_64_class_letter_i_immediate(void) {
     int x = 0x42;
     int shifted;
     // Shift left by a compile-time constant 4 -- fits in `I` range.
-    __asm__("shll $4, %0" : "+r"(shifted) : "0"(x));
+    __asm__("shll $4, %0" : "=r"(shifted) : "0"(x));
     return (shifted == 0x420) ? 0 : 1;
 }
 
@@ -1316,16 +1316,12 @@ int main(void) {
     }
 }
 
-// The `I` constraint test above surfaced this:
-//
-// `+r`(out) paired with a tied matching input (`"0"(in)`) must not double-
-// define the output's pseudo.  The linearizer used to emit BOTH a Load (the
-// `+r` read-half) AND a Copy (from the tied input) targeting the same
-// pseudo — fine at -O0 (no validator) but rejected by the optimizer-stage
-// I1 invariant ("single definition per pseudo") at -O2.  This test pins
-// the behavior down for several lvalue shapes so a regression in the
-// linearizer's tied-input handling is caught no matter which constraint
-// letter happens to surface it.
+// An output tied to a matching input (`"=r"(out) : "0"(in)`) is defined
+// once, by the copy of the input into the output's register, for several
+// lvalue shapes of the input. A `"+r"` output cannot also be tied: gcc
+// refuses `"+r"(out) : "0"(in)` as inconsistent, and so does c17 (see
+// `test_diagnostics::asm_operand_names`); accepted, it gave the output's
+// pseudo two definitions, the read half's and the copy's.
 #[cfg(target_arch = "x86_64")]
 const TIED_INPUTS: &str = r#"
 /* Exit codes: section k fails with 10*k + its original code.
@@ -1338,7 +1334,7 @@ const TIED_INPUTS: &str = r#"
 static int t_tied_int_local(void) {
     int src = 0x42;
     int dst;
-    __asm__("shll $4, %0" : "+r"(dst) : "0"(src));
+    __asm__("shll $4, %0" : "=r"(dst) : "0"(src));
     return (dst == 0x420) ? 0 : 1;
 }
 
@@ -1347,7 +1343,7 @@ static int t_tied_int_local(void) {
 int g = 7;
 static int t_tied_int_global(void) {
     int out;
-    __asm__("addl $3, %0" : "+r"(out) : "0"(g));
+    __asm__("addl $3, %0" : "=r"(out) : "0"(g));
     return (out == 10) ? 0 : 1;
 }
 
@@ -1355,7 +1351,7 @@ static int t_tied_int_global(void) {
    historically emitted the wrong Copy when a tied input was present). */
 int helper(int src) {
     int dst;
-    __asm__("addl $1, %0" : "+r"(dst) : "0"(src));
+    __asm__("addl $1, %0" : "=r"(dst) : "0"(src));
     return dst;
 }
 static int t_tied_int_param(void) { return (helper(41) == 42) ? 0 : 1; }

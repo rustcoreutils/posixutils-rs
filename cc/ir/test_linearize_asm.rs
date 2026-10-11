@@ -344,3 +344,34 @@ fn test_register_variable_operands_are_pinned() {
         assert_eq!(accesses, vec![(1, 0), (0, 1), (1, 0)], "{arch:?}");
     }
 }
+
+/// An output two inputs are tied to is reported, and the second tie is
+/// dropped: the input becomes an operand of its own. Both ties used to copy
+/// their value into the output's pseudo, which then had two definitions --
+/// an internal error after linearization.
+#[test]
+fn test_second_tie_to_an_output_is_dropped() {
+    let src = "long f(long a, long b) {\n\
+               long sum;\n\
+               __asm__(\"\" : \"=r\"(sum) : \"0\"(a), \"0\"(b));\n\
+               return sum;\n\
+               }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let asm = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .find_map(|i| i.extra().asm_data.as_deref())
+        .expect("the statement");
+    let ties: Vec<Option<usize>> = asm.inputs.iter().map(|c| c.matching_output).collect();
+    assert_eq!(ties, [Some(0), None]);
+    let out = asm.outputs[0].pseudo;
+    let defs = f
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .filter(|i| i.target == Some(out))
+        .count();
+    assert_eq!(defs, 1, "the output's pseudo is defined once");
+}

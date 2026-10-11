@@ -4048,6 +4048,10 @@ impl Module {
     /// asked for no visibility of its own -- function, object or alias --
     /// this one. A declaration of something defined elsewhere is not
     /// affected, as in gcc, and `visibility(...)` on the symbol still wins.
+    /// Nor is an inline definition (C99 6.7.4p7, or `gnu_inline`), which is
+    /// a body to inline and not the function's definition: its address is
+    /// whatever unit defines it out of line, so hiding it made a shared
+    /// object take that address PC-relative, which `ld` refuses.
     ///
     /// Ignoring the flag exported every symbol of a shared object built with
     /// `-fvisibility=hidden`, and its calls between its own functions then
@@ -4063,7 +4067,7 @@ impl Module {
                 *slot = Some(how.to_string());
             }
         };
-        for func in &mut self.functions {
+        for func in self.functions.iter_mut().filter(|f| f.emit) {
             set(&mut func.symbol_attrs.visibility, func.is_static);
         }
         for global in &mut self.globals {
@@ -4640,7 +4644,7 @@ mod tests {
     }
 
     /// `-fvisibility=` reaches every external definition that named none,
-    /// and nothing else.
+    /// and nothing else: not an inline definition, which defines nothing.
     #[test]
     fn default_visibility_applies_to_external_definitions_only() {
         let types = TypeTable::new(&Target::host());
@@ -4649,8 +4653,10 @@ mod tests {
         let plain = Function::new("plain", types.int_id);
         let mut local = Function::new("local", types.int_id);
         local.is_static = true;
+        let mut inline_body = Function::new("inline_body", types.int_id);
+        inline_body.emit = false;
         let mut module = Module {
-            functions: vec![public, plain, local],
+            functions: vec![public, plain, local, inline_body],
             globals: vec![GlobalDef::new("g", types.int_id, Initializer::None)],
             aliases: vec![SymbolAlias {
                 name: "a".into(),
@@ -4669,7 +4675,7 @@ mod tests {
             .iter()
             .map(|f| f.symbol_attrs.visibility.as_deref())
             .collect();
-        assert_eq!(vis, [Some("default"), Some("hidden"), None]);
+        assert_eq!(vis, [Some("default"), Some("hidden"), None, None]);
         assert_eq!(
             module.globals[0].symbol_attrs.visibility.as_deref(),
             Some("hidden")

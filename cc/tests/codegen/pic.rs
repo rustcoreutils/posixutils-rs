@@ -292,3 +292,55 @@ int hfn(int x) { return x + 1; }
         );
     }
 }
+
+/// A shared object built `-fvisibility=hidden` that takes the address of a
+/// `gnu_inline` function defined out of line in another of its units links
+/// and runs: the inline body is no definition, so the address comes from
+/// the GOT. Taken PC-relative, as for a hidden symbol, it made guile's
+/// library unlinkable ("relocation R_X86_64_PC32 against symbol `scm_car'
+/// can not be used when making a shared object").
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_pic_fvisibility_inline_definition_address() {
+    let header = r#"
+extern __inline__ __attribute__((__gnu_inline__)) int scm_car(int x) { return x + 1; }
+"#;
+    let user = format!(
+        "{header}int (*p)(int);\n\
+         __attribute__((visibility(\"default\"))) int lib_call(int x) {{ p = scm_car; return p(x); }}\n"
+    );
+    let definer = "__attribute__((visibility(\"default\"))) int scm_car(int x) { return x + 1; }\n";
+    let main = "int lib_call(int);\nint main(void) { return lib_call(41) != 42; }\n";
+    let dir = crate::common::work_dir("pic_fvis_inline");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(p("user.c"), user).unwrap();
+    std::fs::write(p("definer.c"), definer).unwrap();
+    std::fs::write(p("main.c"), main).unwrap();
+    for opt in ["-O0", "-O2"] {
+        let r = crate::common::run_c17(&[
+            opt,
+            "-shared",
+            "-fPIC",
+            "-fvisibility=hidden",
+            "-o",
+            &p("libfvis.so"),
+            &p("user.c"),
+            &p("definer.c"),
+        ]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let r = crate::common::run_c17(&[
+            "-o",
+            &p("main"),
+            &p("main.c"),
+            &p("libfvis.so"),
+            &format!("-Wl,-rpath,{}", dir.path().display()),
+        ]);
+        assert!(r.success, "{opt}: {}", r.stderr);
+        let code = std::process::Command::new(p("main"))
+            .status()
+            .unwrap()
+            .code();
+        assert_eq!(code, Some(0), "{opt}");
+    }
+}
+

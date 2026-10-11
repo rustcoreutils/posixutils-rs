@@ -621,3 +621,32 @@ int get2(void) { extern int ba __attribute__((visibility("hidden"))); return zv 
     }
     assert!(!asm.contains(".private_extern _zv"), "{asm}");
 }
+
+/// `-fvisibility=hidden` gives its visibility to definitions only, and a
+/// `gnu_inline` body is not one: it provides no external definition, so the
+/// function is still whatever unit defines it out of line, and its address
+/// comes from the GOT under `-fPIC`, as gcc does. Taking it PC-relative made
+/// guile's shared library unlinkable ("relocation R_X86_64_PC32 against
+/// symbol `scm_car' can not be used when making a shared object"). The
+/// emitted definition beside it is still hidden.
+#[test]
+fn codegen_fvisibility_skips_inline_definitions() {
+    let src = r#"
+extern __inline__ __attribute__((__gnu_inline__)) int scm_car(int x) { return x + 1; }
+int (*p)(int);
+void init(void) { p = scm_car; }
+"#;
+    for opt in ["-O0", "-O2"] {
+        let asm = asm_for_with(
+            "fvisibility_inline_def",
+            X86_64_LINUX,
+            src,
+            &[opt, "-fPIC", "-fvisibility=hidden"],
+        );
+        let init = body_of(&asm, "init");
+        assert!(init.contains("scm_car@GOTPCREL"), "{opt}:\n{init}");
+        assert!(!asm.contains(".hidden scm_car"), "{opt}:\n{asm}");
+        assert!(asm.contains(".hidden init"), "{opt}:\n{asm}");
+    }
+}
+

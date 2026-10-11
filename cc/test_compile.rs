@@ -80,6 +80,8 @@ struct Options {
     /// `-fdebug-prefix-map=`, `-fmacro-prefix-map=`, `-ffile-prefix-map=`,
     /// in order.
     prefix_maps: Vec<MapOption>,
+    /// `-fvisibility=`.
+    default_visibility: Option<String>,
 }
 
 /// Apply `flags` the way the driver does: the switches that live in
@@ -163,6 +165,8 @@ fn apply_flags(flags: &[&str]) -> Options {
                     o.include_paths.push(i.to_string());
                 } else if let Some(level) = flag.strip_prefix("-fcf-protection=") {
                     o.cf_protection = target::CfProtection::from_level(level).unwrap();
+                } else if let Some(how) = flag.strip_prefix("-fvisibility=") {
+                    o.default_visibility = Some(how.to_string());
                 } else if let Some(t) = flag.strip_prefix("--target=") {
                     o.target = Some(t.to_string());
                 } else if flag.starts_with("-m") && flag.len() > 2 {
@@ -253,7 +257,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         debug: o.debug,
         trapping_math: o.trapping_math,
         fp_rounding: o.fp_rounding,
-        default_visibility: None,
+        default_visibility: o.default_visibility.as_deref(),
         tls: target::TlsPolicy {
             shared_code: o.shared || position.is_shared_code(),
             floor: o.tls_model,

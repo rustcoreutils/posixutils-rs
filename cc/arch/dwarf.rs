@@ -12,7 +12,7 @@
 use super::codegen::{escape_path, CodeGenBase};
 use super::lir::{Directive, EmitAsm, LirInst, OperandSize, Symbol};
 use crate::ir::GlobalDef;
-use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
 
 // DWARF Constants (DWARF Version 2)
@@ -51,6 +51,10 @@ pub const DW_TAG_BASE_TYPE: u64 = 0x24;
 pub const DW_TAG_SUBPROGRAM: u64 = 0x2e;
 pub const DW_TAG_VARIABLE: u64 = 0x34;
 pub const DW_TAG_SUBRANGE_TYPE: u64 = 0x21;
+pub const DW_TAG_CONST_TYPE: u64 = 0x26;
+pub const DW_TAG_VOLATILE_TYPE: u64 = 0x35;
+pub const DW_TAG_RESTRICT_TYPE: u64 = 0x37;
+pub const DW_TAG_ATOMIC_TYPE: u64 = 0x47;
 
 pub const DW_AT_BYTE_SIZE: u64 = 0x0b;
 pub const DW_AT_ENCODING: u64 = 0x3e;
@@ -98,6 +102,57 @@ const ABBREV_STRUCT: u64 = 13;
 const ABBREV_UNION: u64 = 14;
 const ABBREV_GLOBAL_VAR: u64 = 15;
 const ABBREV_GLOBAL_VAR_NOLOC: u64 = 16;
+const ABBREV_CONST: u64 = 17;
+const ABBREV_CONST_VOID: u64 = 18;
+const ABBREV_VOLATILE: u64 = 19;
+const ABBREV_VOLATILE_VOID: u64 = 20;
+const ABBREV_RESTRICT: u64 = 21;
+const ABBREV_RESTRICT_VOID: u64 = 22;
+const ABBREV_ATOMIC: u64 = 23;
+const ABBREV_ATOMIC_VOID: u64 = 24;
+
+/// A qualifier's modifier DIE: the qualifier, its tag, and its two shapes --
+/// over a type DIE, and over `void`, which has none to name.
+struct QualifierDie {
+    qual: TypeModifiers,
+    tag: u64,
+    abbrev: u64,
+    abbrev_void: u64,
+}
+
+/// The qualifiers in the order gcc nests their DIEs, innermost first:
+/// `const volatile int` is a volatile DIE over a const DIE over `int`.
+const QUALIFIER_DIES: [QualifierDie; 4] = [
+    QualifierDie {
+        qual: TypeModifiers::CONST,
+        tag: DW_TAG_CONST_TYPE,
+        abbrev: ABBREV_CONST,
+        abbrev_void: ABBREV_CONST_VOID,
+    },
+    QualifierDie {
+        qual: TypeModifiers::VOLATILE,
+        tag: DW_TAG_VOLATILE_TYPE,
+        abbrev: ABBREV_VOLATILE,
+        abbrev_void: ABBREV_VOLATILE_VOID,
+    },
+    QualifierDie {
+        qual: TypeModifiers::RESTRICT,
+        tag: DW_TAG_RESTRICT_TYPE,
+        abbrev: ABBREV_RESTRICT,
+        abbrev_void: ABBREV_RESTRICT_VOID,
+    },
+    QualifierDie {
+        qual: TypeModifiers::ATOMIC,
+        tag: DW_TAG_ATOMIC_TYPE,
+        abbrev: ABBREV_ATOMIC,
+        abbrev_void: ABBREV_ATOMIC_VOID,
+    },
+];
+
+/// The modifier DIE outermost for `quals`, which holds the DIE of the rest.
+fn outermost_qualifier(quals: TypeModifiers) -> Option<&'static QualifierDie> {
+    QUALIFIER_DIES.iter().rev().find(|q| quals.contains(q.qual))
+}
 
 /// Where a variable lives, as the code generator computed it: a register and a
 /// byte offset from it.
@@ -333,21 +388,56 @@ pub fn generate_abbrev_table<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>) {
         global_attrs,
     );
 
+    // A qualified type: a modifier DIE over the type without it, or over
+    // nothing for a qualified `void`.
+    for q in &QUALIFIER_DIES {
+        abbrev(
+            base,
+            q.abbrev,
+            q.tag,
+            DW_CHILDREN_NO,
+            &[(DW_AT_TYPE, DW_FORM_REF4)],
+        );
+        abbrev(base, q.abbrev_void, q.tag, DW_CHILDREN_NO, &[]);
+    }
+
     // A zero code ends the table.
     base.push_directive(Directive::Uleb128(0));
+}
+
+/// One type DIE: the type `core` stands for, without its top-level
+/// qualifiers, under the qualifiers `quals`. With none it is that type's own
+/// DIE; with some it is the modifier DIE for the outermost of them.
+///
+/// Keyed by the unqualified type rather than by `TypeId` so that `int`,
+/// `const int` and `volatile int` share one `int` DIE, and every `const int`
+/// one modifier DIE, as gcc's do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DieKey {
+    core: TypeId,
+    quals: u32,
+}
+
+impl DieKey {
+    fn quals(self) -> TypeModifiers {
+        TypeModifiers::from_bits_truncate(self.quals)
+    }
 }
 
 /// The type DIEs a set of functions needs, and where each one will sit.
 ///
 /// Types are reached transitively -- a pointer needs its pointee, an array its
-/// element. Emission follows `order`, the sequence in which they were first
-/// reached, so the table does not depend on hash iteration order.
+/// element, a qualified type the type without the qualifier. Emission follows
+/// `order`, the sequence in which they were first reached, so the table does
+/// not depend on hash iteration order.
 struct TypeDies {
-    /// Type -> index, which names its label `.Ldie_ty<N>`. Lookup only:
+    /// DIE -> index, which names its label `.Ldie_ty<N>`. Lookup only:
     /// emission walks `order`, so hash iteration never reaches the output.
-    index: HashMap<TypeId, usize>,
+    index: HashMap<DieKey, usize>,
     /// Emission order, so a DIE is written once and the table is stable.
-    order: Vec<TypeId>,
+    order: Vec<DieKey>,
+    /// Each type a DIE was asked for -> the index of its DIE.
+    by_type: HashMap<TypeId, usize>,
 }
 
 impl TypeDies {
@@ -355,6 +445,7 @@ impl TypeDies {
         let mut this = TypeDies {
             index: HashMap::new(),
             order: Vec::new(),
+            by_type: HashMap::new(),
         };
         for g in globals.iter().filter(|g| g.decl_pos.is_some()) {
             this.add(g.typ, types, 0);
@@ -370,34 +461,85 @@ impl TypeDies {
         this
     }
 
-    /// Record `id` and whatever it refers to.
+    /// Record `id` and whatever it refers to; its DIE's index, or `None`
+    /// for a type with no DIE.
     ///
     /// `depth` guards against a type that reaches itself -- `struct s { struct
     /// s *next; };` is ordinary C, and the pointer arm would otherwise recurse
     /// forever. Aggregates emit no members here, so the walk stops at them
     /// anyway; the cap is for the pointer and array chains.
-    fn add(&mut self, id: TypeId, types: &TypeTable, depth: u32) {
-        if depth > 16 || self.index.contains_key(&id) {
-            return;
+    fn add(&mut self, id: TypeId, types: &TypeTable, depth: u32) -> Option<usize> {
+        if let Some(&n) = self.by_type.get(&id) {
+            return Some(n);
         }
-        let kind = types.kind(id);
-        // A type c17 has no DIE shape for is left out; the variable using it
-        // then has no `DW_AT_type` and is skipped rather than mislabelled.
-        if !describable(kind) {
-            return;
+        if depth > 16 {
+            return None;
         }
-        self.index.insert(id, self.order.len());
-        self.order.push(id);
-        if matches!(kind, TypeKind::Pointer | TypeKind::Array) {
-            if let Some(base) = types.base_type(id) {
-                self.add(base, types, depth + 1);
+        // A type met only qualified is its own unqualified stand-in: its DIE
+        // describes it without the qualifiers either way.
+        let core = types.existing_unqualified(id).unwrap_or(id);
+        let n = self.add_key(core, types.qualifiers(id), types, depth)?;
+        self.by_type.insert(id, n);
+        Some(n)
+    }
+
+    fn add_key(
+        &mut self,
+        core: TypeId,
+        quals: TypeModifiers,
+        types: &TypeTable,
+        depth: u32,
+    ) -> Option<usize> {
+        let key = DieKey {
+            core,
+            quals: quals.bits(),
+        };
+        if let Some(&n) = self.index.get(&key) {
+            return Some(n);
+        }
+        let kind = types.kind(core);
+        match outermost_qualifier(quals) {
+            None => {
+                // A type c17 has no DIE shape for is left out; the variable
+                // using it then has no `DW_AT_type` and is skipped rather
+                // than mislabelled.
+                if !describable(kind) {
+                    return None;
+                }
+                let n = self.push(key);
+                if matches!(kind, TypeKind::Pointer | TypeKind::Array) {
+                    if let Some(base) = types.base_type(core) {
+                        self.add(base, types, depth + 1);
+                    }
+                }
+                Some(n)
+            }
+            Some(outer) => {
+                // The qualifier's DIE wraps the DIE of the rest -- of which
+                // a qualified `void` has none.
+                let inner = quals - outer.qual;
+                if !(inner.is_empty() && kind == TypeKind::Void) {
+                    self.add_key(core, inner, types, depth)?;
+                }
+                Some(self.push(key))
             }
         }
     }
 
-    fn label(&self, id: TypeId) -> Option<String> {
-        self.index.get(&id).map(|n| format!(".Ldie_ty{}", n))
+    fn push(&mut self, key: DieKey) -> usize {
+        let n = self.order.len();
+        self.index.insert(key, n);
+        self.order.push(key);
+        n
     }
+
+    fn label(&self, id: TypeId) -> Option<String> {
+        self.by_type.get(&id).map(|&n| die_label(n))
+    }
+}
+
+fn die_label(n: usize) -> String {
+    format!(".Ldie_ty{}", n)
 }
 
 /// Whether this kind of type has a DIE shape in the abbreviation table.
@@ -459,8 +601,23 @@ fn emit_type_dies<I: LirInst + EmitAsm>(
     dies: &TypeDies,
     types: &TypeTable,
 ) {
-    for (n, &id) in dies.order.iter().enumerate() {
-        base.push_directive(Directive::local_label(format!(".Ldie_ty{}", n)));
+    for (n, &key) in dies.order.iter().enumerate() {
+        base.push_directive(Directive::local_label(die_label(n)));
+        if let Some(outer) = outermost_qualifier(key.quals()) {
+            let inner = DieKey {
+                core: key.core,
+                quals: (key.quals() - outer.qual).bits(),
+            };
+            match dies.index.get(&inner) {
+                Some(&m) => {
+                    base.push_directive(Directive::Uleb128(outer.abbrev));
+                    type_ref(base, &die_label(m));
+                }
+                None => base.push_directive(Directive::Uleb128(outer.abbrev_void)),
+            }
+            continue;
+        }
+        let id = key.core;
         let size = types.size_bytes(id) as i64;
         match types.kind(id) {
             TypeKind::Pointer => match types.base_type(id).and_then(|b| dies.label(b)) {

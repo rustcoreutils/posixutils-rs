@@ -3120,6 +3120,41 @@ impl TypeTable {
         self.intern(unqualified)
     }
 
+    /// The version of `id` without its top-level qualifiers, if the table
+    /// already holds one -- for a reader with the table shared, which
+    /// cannot intern. The scalars, `int` and the rest, are always there --
+    /// spelled `short` or `short int`, `signed` or not, a scalar met only
+    /// qualified answers with the table's own; a tagged struct, union or
+    /// enum answers with its tag's own type when that is unqualified. `None`
+    /// otherwise: a type only ever met qualified.
+    ///
+    /// Unlike [`Self::unqualified`] this drops only the qualifiers, not the
+    /// storage order.
+    pub fn existing_unqualified(&self, id: TypeId) -> Option<TypeId> {
+        if self.qualifiers(id).is_empty() {
+            return Some(id);
+        }
+        let typ = self.get(id);
+        if let Some(composite) = typ.composite.as_deref() {
+            return composite
+                .tag_type
+                .filter(|&t| self.qualifiers(t).is_empty());
+        }
+        let find = |drop: TypeModifiers| {
+            let mut plain = typ.clone();
+            plain.modifiers.remove(drop);
+            self.make_key(&plain)
+                .and_then(|key| self.lookup.get(&key).copied())
+        };
+        // The size words only spell the kind, and `signed` is the default
+        // for every integer but `char`.
+        let mut spelling = TypeModifiers::SHORT | TypeModifiers::LONG | TypeModifiers::LONGLONG;
+        if typ.kind != TypeKind::Char {
+            spelling |= TypeModifiers::SIGNED;
+        }
+        find(Type::QUALIFIERS).or_else(|| find(Type::QUALIFIERS | spelling))
+    }
+
     /// Is an object of type `id` stored in the byte order opposite to the
     /// target's? See [`TypeModifiers::REVERSE_ORDER`].
     pub fn reverses_storage(&self, id: TypeId) -> bool {

@@ -6,8 +6,8 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// `-g` output that needs more than one source file: the line table's
-// file list.
+// `-g` output that needs more than one source file or a DWARF reader: the
+// line table's file list, and the type DIEs as readelf decodes them.
 //
 
 use crate::common::{run_c17, work_dir};
@@ -137,4 +137,181 @@ fn codegen_debug_file_table_lists_each_file_once() {
             "{target}: main's `return` -- PLUS included -- is t.c line 6:\n{asm}"
         );
     }
+}
+
+/// One DIE as readelf prints it: its tag, and its name and type if it has
+/// them.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default, Clone)]
+struct Die {
+    tag: String,
+    name: Option<String>,
+    typ: Option<u64>,
+}
+
+/// The DIEs of an object, by offset, from `readelf --debug-dump=info`.
+#[cfg(target_os = "linux")]
+fn read_dies(obj: &str) -> std::collections::BTreeMap<u64, Die> {
+    let out = std::process::Command::new("readelf")
+        .args(["--debug-dump=info", obj])
+        .output()
+        .expect("readelf");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut dies = std::collections::BTreeMap::new();
+    let mut current: Option<u64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        // `<1><45>: Abbrev Number: 2 (DW_TAG_const_type)`
+        if let Some(tag_at) = line.find("(DW_TAG_") {
+            let off = line
+                .split('>')
+                .nth(1)
+                .and_then(|s| s.strip_prefix('<'))
+                .and_then(|s| u64::from_str_radix(s, 16).ok())
+                .expect("DIE offset");
+            let tag = line[tag_at + 1..].trim_end_matches(')').to_string();
+            dies.insert(
+                off,
+                Die {
+                    tag,
+                    ..Die::default()
+                },
+            );
+            current = Some(off);
+            continue;
+        }
+        let Some(die) = current.and_then(|o| dies.get_mut(&o)) else {
+            continue;
+        };
+        let value = |l: &str| l.split_once(": ").map(|(_, v)| v.trim().to_string());
+        if line.contains("DW_AT_name") {
+            // An indirect string reads `(indirect string, offset: 0x93): long int`.
+            die.name = value(line).map(|v| match v.rsplit_once("): ") {
+                Some((_, n)) => n.to_string(),
+                None => v,
+            });
+        } else if line.contains("DW_AT_type") {
+            die.typ = value(line).and_then(|v| {
+                u64::from_str_radix(v.trim_start_matches("<0x").trim_end_matches('>'), 16).ok()
+            });
+        }
+    }
+    dies
+}
+
+/// The chain of tags from a named variable's type down to a DIE with no
+/// type, then that DIE's name: `const_type pointer_type base_type:int`.
+#[cfg(target_os = "linux")]
+fn type_chain(dies: &std::collections::BTreeMap<u64, Die>, var: &str) -> String {
+    let die = dies
+        .values()
+        .find(|d| {
+            matches!(
+                d.tag.as_str(),
+                "DW_TAG_variable" | "DW_TAG_formal_parameter"
+            ) && d.name.as_deref() == Some(var)
+        })
+        .unwrap_or_else(|| panic!("no DIE for {var}:\n{dies:#?}"));
+    let mut chain = Vec::new();
+    let mut next = die.typ;
+    while let Some(off) = next {
+        let t = &dies[&off];
+        let tag = t.tag.trim_start_matches("DW_TAG_");
+        chain.push(match &t.name {
+            Some(n) => format!("{tag}:{n}"),
+            None => tag.to_string(),
+        });
+        next = t.typ;
+        assert!(chain.len() < 16, "{var}: type chain loops: {chain:?}");
+    }
+    chain.join(" ")
+}
+
+/// A qualified type is a modifier DIE over the unqualified one, as gcc
+/// emits it -- `DW_TAG_const_type`, `DW_TAG_volatile_type`,
+/// `DW_TAG_restrict_type`, `DW_TAG_atomic_type` -- not a base type named
+/// "const int": a debugger looks a base type up by name and encoding, and
+/// a pointer's own qualifier was dropped altogether. gcc nests them const
+/// innermost, then volatile, restrict, atomic.
+#[cfg(target_os = "linux")]
+#[test]
+fn codegen_debug_qualifiers_are_modifier_dies() {
+    let dir = work_dir("debug_quals");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(
+        p("q.c"),
+        "struct S { int a; };\n\
+         volatile long v;\n\
+         const int c = 1;\n\
+         int plain;\n\
+         int *const cp = 0;\n\
+         const int *pc;\n\
+         int *const restrict cpr;\n\
+         _Atomic int ai;\n\
+         const volatile int cvi;\n\
+         const _Atomic int cai;\n\
+         const struct S cs;\n\
+         const void *cvp;\n\
+         const signed int csi;\n\
+         const short csh;\n\
+         volatile unsigned long long vull;\n\
+         int f(void)\n\
+         {\n\
+         \x20   volatile int lv = 1;\n\
+         \x20   return lv + c + v;\n\
+         }\n",
+    )
+    .unwrap();
+    let obj = p("q.o");
+    let r = run_c17(&["-g", "-O0", "-c", "-o", &obj, &p("q.c")]);
+    assert!(r.success, "{}", r.stderr);
+    let dies = read_dies(&obj);
+
+    for d in dies.values() {
+        if let Some(n) = &d.name {
+            assert!(
+                !["const", "volatile", "restrict", "_Atomic"]
+                    .iter()
+                    .any(|q| n.split_whitespace().any(|w| w == *q)),
+                "a qualifier in a type name: {d:?}"
+            );
+        }
+    }
+    let ints = dies
+        .values()
+        .filter(|d| d.tag == "DW_TAG_base_type" && d.name.as_deref() == Some("int"))
+        .count();
+    assert_eq!(ints, 1, "one base-type DIE for int:\n{dies:#?}");
+
+    for (var, chain) in [
+        ("v", "volatile_type base_type:long"),
+        ("c", "const_type base_type:int"),
+        ("plain", "base_type:int"),
+        ("cp", "const_type pointer_type base_type:int"),
+        ("pc", "pointer_type const_type base_type:int"),
+        ("cpr", "restrict_type const_type pointer_type base_type:int"),
+        ("ai", "atomic_type base_type:int"),
+        ("cvi", "volatile_type const_type base_type:int"),
+        ("cai", "atomic_type const_type base_type:int"),
+        ("cs", "const_type structure_type"),
+        ("cvp", "pointer_type const_type"),
+        ("lv", "volatile_type base_type:int"),
+        // However the scalar is spelled, the qualifier wraps the plain one.
+        ("csi", "const_type base_type:int"),
+        ("csh", "const_type base_type:short"),
+        ("vull", "volatile_type base_type:unsigned long long"),
+    ] {
+        assert_eq!(type_chain(&dies, var), chain, "{var}");
+    }
+
+    // Each qualified type is described once, however many objects use it.
+    let consts_over_int = dies
+        .values()
+        .filter(|d| {
+            d.tag == "DW_TAG_const_type"
+                && d.typ
+                    .is_some_and(|t| dies[&t].name.as_deref() == Some("int"))
+        })
+        .count();
+    assert_eq!(consts_over_int, 1, "one const int DIE:\n{dies:#?}");
 }

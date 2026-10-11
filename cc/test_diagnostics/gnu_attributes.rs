@@ -117,7 +117,13 @@ __attribute__((patchable_function_entry(70000))) int p6(int a) { return a; }
 __attribute__((patchable_function_entry(2, 3))) int p7(int a) { return a; }
 __attribute__((zero_call_used_regs("used-gpr"), patchable_function_entry(2, 1))) int ok(int a) { return a; }
 "#;
-    let (ok, got) = messages("codegen_attr_misuse", src, &[]);
+    // x86-64's: c17 has no aarch64 `-fzero-call-used-regs=`, and on aarch64
+    // `zero_call_used_regs` is no attribute.
+    let (ok, got) = messages(
+        "codegen_attr_misuse",
+        src,
+        &["--target=x86_64-unknown-linux-gnu"],
+    );
     assert!(!ok);
     assert_eq!(
         got,

@@ -522,7 +522,13 @@ fn libm_lrint_is_the_instruction_without_errno() {
         );
     }
 
-    for (target, asm) in asm_both("lrint_errno", LRINT_SRC, &["-O2"]) {
+    // ELF triples: `fn_body` reads ELF labels, and Mach-O's carry a `_`.
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let asm = asm_for(
+            &format!("lrint_errno_{target}"),
+            LRINT_SRC,
+            &["-O2", &format!("--target={target}")],
+        );
         for (func, callee) in [
             ("r1", "lrint"),
             ("r2", "lrintf"),

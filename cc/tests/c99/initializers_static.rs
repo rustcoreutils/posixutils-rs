@@ -9,7 +9,7 @@
 // C99 initializers: constant folding in static initializers
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere};
 
 // ============================================================================
 // Mega-test: constant folding in global initializers
@@ -676,4 +676,38 @@ int main(void)
     {
         assert_eq!(rc, 0);
     }
+}
+
+/// Addresses computed from a pointer constant initialize static objects as
+/// gcc's do: the pre-`<stddef.h>` offsetof spellings through `->`, `*` and
+/// `[]`, an array member's address without `&`, and `&*(T *)0`, which the
+/// Linux kernel's sysrq.c puts in a table (`&(*(const T *)NULL)`).
+#[test]
+fn c99_static_initializers_from_pointer_constants() {
+    let code = r#"
+typedef __SIZE_TYPE__ size_t;
+struct s { int a; char b[10]; struct { int x, y; } in[3]; };
+static size_t o1 = (size_t)&((struct s *)0)->b;
+static size_t o2 = (size_t)&((struct s *)0)->b[3];
+static size_t o3 = (size_t)&((struct s *)0)->in[2].y;
+static char *p1 = &((struct s *)0)->b[1];
+static const struct s *n1 = &(*(const struct s *)0);
+static const int *n2 = &(*(const struct s *)0).a;
+static const int *n3 = &((const struct s *)0)[2].a;
+static size_t o4 = (size_t)&(*(struct s *)0).in[1].x;
+static size_t o5 = (size_t)((struct s *)16)->b;
+static const struct s *n4 = &*(const struct s *)32;
+struct op { int x; };
+#define missing_op (*(const struct op *)0)
+static const struct op real = { 1 };
+static const struct op *tab[3] = { &missing_op, &real, &missing_op };
+int main(void) {
+    if (o1 != 4 || o2 != 7 || o3 != 36 || o4 != 24 || o5 != 20) return 1;
+    if (p1 != (char *)5 || n1 || n2 || n4 != (const struct s *)32) return 2;
+    if (n3 != (const int *)(2 * sizeof(struct s))) return 3;
+    if (tab[0] || tab[1] != &real || tab[2]) return 4;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("static_init_pointer_constants", code);
 }

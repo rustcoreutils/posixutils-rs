@@ -125,6 +125,24 @@ fn a_constant_index_stays_a_constant_expression() {
     assert!(matches!(e.kind, ExprKind::OffsetOf { .. }), "{:?}", e.kind);
 }
 
+/// The pre-`<stddef.h>` spellings of offsetof fold as gcc folds them,
+/// through `*` as well as `->`: `&(*(T *)0).m`, `&((T *)0)[i].m`, and an
+/// array member's own value (its address) without `&`. The Linux kernel's
+/// sysrq.c has `&(*(const struct sysrq_key_op *)NULL)`.
+#[test]
+fn null_based_member_addresses_are_constants() {
+    let src = format!(
+        "{S} _Static_assert((unsigned long)&((struct S *)0)->a[2].y[1] == 4 + 2 * 12 + 4 + 2, \"a\");
+         _Static_assert((unsigned long)&(*(struct S *)0).z == 56, \"b\");
+         _Static_assert((unsigned long)&*(struct S *)8 == 8, \"c\");
+         _Static_assert((unsigned long)&((struct S *)0)[2].a[1] == 2 * 64 + 4 + 12, \"d\");
+         _Static_assert((unsigned long)((struct S *)16)->a[1].y == 16 + 4 + 12 + 4, \"e\");"
+    );
+    let before = crate::diag::error_count();
+    parse_tu(&src).expect("parse");
+    assert_eq!(crate::diag::error_count(), before, "refused");
+}
+
 /// A variable index is not a constant: `_Static_assert` refuses it. (A
 /// static initializer is refused when it is lowered; see the e2e test.)
 #[test]

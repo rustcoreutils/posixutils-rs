@@ -432,6 +432,11 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
                     (IntConversion::Saturated(v), _) => Some(v),
                 };
             }
+            // An array converts to its address, which a member of a pointer
+            // constant has as an integer: `(size_t)((T *)0)->array`.
+            if inner.typ.is_some_and(|t| types.kind(t) == TypeKind::Array) {
+                return eval_pointer(env, scope, inner);
+            }
             eval(env, scope, inner)
         }
 
@@ -1369,6 +1374,14 @@ pub(crate) fn eval_pointer(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) 
 
         ExprKind::Unary {
             op: UnaryOp::AddrOf,
+            operand,
+        } => eval_pointer(env, scope, operand),
+
+        // `*p` designates the object at `p`, so its address is `p`'s value:
+        // `&(*(T *)0).m` is the `.` spelling of `&((T *)0)->m`, and the Linux
+        // kernel's sysrq.c initializes a table with `&(*(const T *)NULL)`.
+        ExprKind::Unary {
+            op: UnaryOp::Deref,
             operand,
         } => eval_pointer(env, scope, operand),
 

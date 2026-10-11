@@ -144,6 +144,10 @@ Language and preprocessor additions:
    The integer form `2i`, which gcc types `_Complex int`, is not accepted.
  * Clang nullability qualifiers `_Nonnull`, `_Nullable`, `_Null_unspecified`
    and their `__` spellings.
+ * `(size_t)&((T *)0)->m`, the offsetof spelling from before `<stddef.h>`,
+   and `&*(T *)0`, are constant expressions, through `->`, `.`, `*` and
+   `[]` alike, as in gcc: the Linux kernel's sysrq.c puts
+   `&(*(const T *)NULL)` in a static table.
  * Roughly 145 `__builtin_*` and `__c11_atomic_*` intrinsics, including the
    `__builtin___*_chk` FORTIFY family and the libc aliases (`__builtin_abort`,
    `__builtin_printf`, `__builtin_strcpy`, ...) that let a translation unit

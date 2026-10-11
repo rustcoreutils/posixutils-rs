@@ -902,6 +902,9 @@ pub struct Linearizer<'a> {
     /// global each of its static locals became in the first version, which
     /// every later one shares, as gcc's clones share them.
     pub(crate) clone_statics: Option<HashMap<SymbolId, String>>,
+    /// The value each GNU range value ([`ExprKind::RangeValue`]) of the
+    /// function being linearized was evaluated to, by its id.
+    pub(crate) range_values: HashMap<u32, PseudoId>,
 }
 
 /// One compilation of a function definition other than its own: a
@@ -975,6 +978,7 @@ impl<'a> Linearizer<'a> {
             unwind: Default::default(),
             isa: target.x86_isa,
             clone_statics: None,
+            range_values: HashMap::new(),
         }
     }
 
@@ -1958,6 +1962,7 @@ impl<'a> Linearizer<'a> {
         self.locals.clear();
         self.local_scope_stack.clear();
         self.label_map.clear();
+        self.range_values.clear();
         self.break_targets.clear();
         self.continue_targets.clear();
         self.switch_stack.clear();
@@ -2992,6 +2997,9 @@ impl<'a> Linearizer<'a> {
 
             // Statement expressions have side effects
             ExprKind::StmtExpr { .. } => false,
+
+            // A range's value is made one only for a value with an effect.
+            ExprKind::RangeValue { .. } => false,
 
             // Variadic builtins have side effects
             ExprKind::VaStart { .. }
@@ -7441,6 +7449,17 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::CompoundLiteral { .. } => self.linearize_compound_literal(expr),
+
+            // A range's value, evaluated where the first copy kept is and
+            // read again at every other.
+            ExprKind::RangeValue { id, value } => match self.range_values.get(id) {
+                Some(&evaluated) => evaluated,
+                None => {
+                    let evaluated = self.linearize_expr(value);
+                    self.range_values.insert(*id, evaluated);
+                    evaluated
+                }
+            },
 
             ExprKind::VaStart { .. }
             | ExprKind::VaArg { .. }

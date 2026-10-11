@@ -978,6 +978,18 @@ pub enum ExprKind {
         elements: Vec<InitElement>,
     },
 
+    /// The value of a GNU index range, `[lo ... hi] = value`, whose
+    /// evaluation has an effect. The range initializes every element it
+    /// covers with a copy of this node, and gcc evaluates the value once:
+    /// so does the linearizer, at the first copy the initialization keeps,
+    /// every other copy with the same `id` reading that one result. A copy
+    /// a later designator replaces is never evaluated, as in gcc.
+    RangeValue {
+        /// Shared by the copies of one range's value, unique otherwise.
+        id: u32,
+        value: Box<Expr>,
+    },
+
     // =========================================================================
     // GNU Statement Expressions
     // =========================================================================
@@ -2555,6 +2567,7 @@ impl Expr {
             | K::ReturnAddress { .. }
             | K::OffsetOf { .. } => Vec::new(),
             K::StmtExpr { result, .. } => vec![result],
+            K::RangeValue { value, .. } => vec![value],
             K::ConvertVector { value } => vec![value],
             K::VectorShuffle {
                 first,

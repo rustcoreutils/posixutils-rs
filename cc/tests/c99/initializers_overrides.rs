@@ -687,6 +687,57 @@ int main(void) {
     compile_and_run_everywhere("index_range_after_field_braced", code);
 }
 
+/// A range whose value has an effect -- a call, an increment -- evaluates it
+/// once, as gcc does, and stores that one value into every element it
+/// covers: after a field designator or first in the chain, scalar or
+/// structure, in a braced value too, and in a compound literal. A copy a
+/// later designator replaces is not evaluated, so a range replaced
+/// everywhere never runs its value; one replaced in part still runs it
+/// once. c17 refused the value after a field, and first in the chain
+/// evaluated it once per element.
+#[test]
+fn c99_index_range_value_with_effects_is_evaluated_once() {
+    let code = r#"
+static int calls;
+static int f(void) { return ++calls * 10; }
+struct P { int x, y; };
+static struct P mk(void) { struct P p = { ++calls, 99 }; return p; }
+struct S { int a[6]; int k; struct P ps[4]; double d[3]; };
+int main(void)
+{
+    int i = 5;
+    struct S s = { .a[1 ... 3] = f(), .k = 7, .ps[0 ... 2] = mk(), .d[0 ... 2] = f() };
+    if (calls != 3) return 1;
+    if (s.a[0] || s.a[1] != 10 || s.a[2] != 10 || s.a[3] != 10 || s.a[4] || s.k != 7) return 2;
+    if (s.ps[0].x != 2 || s.ps[2].x != 2 || s.ps[2].y != 99 || s.ps[3].x) return 3;
+    if (s.d[0] != 30 || s.d[2] != 30) return 4;
+
+    int arr[8] = { [2 ... 5] = i++, [7] = 1 };
+    if (i != 6 || arr[1] || arr[2] != 5 || arr[5] != 5 || arr[6] || arr[7] != 1) return 5;
+
+    calls = 0;
+    struct P bp[3] = { [0 ... 2] = { f(), 2 } };
+    struct S q = { .ps[1 ... 3] = { f(), 3 } };
+    if (calls != 2 || bp[0].x != 10 || bp[2].x != 10 || bp[1].y != 2) return 6;
+    if (q.ps[0].x || q.ps[1].x != 20 || q.ps[3].x != 20 || q.ps[3].y != 3) return 7;
+
+    calls = 0;
+    int part[4] = { [0 ... 3] = f(), [1] = 5 };
+    int none[4] = { [0 ... 3] = f(), [0 ... 3] = 7 };
+    if (calls != 1 || part[0] != 10 || part[1] != 5 || part[3] != 10) return 8;
+    if (none[0] != 7 || none[3] != 7) return 9;
+
+    calls = 0;
+    int *lit = (int[4]){ [1 ... 2] = f() };
+    struct S *ls = &(struct S){ .a[0 ... 5] = f() };
+    if (calls != 2 || lit[0] || lit[1] != 10 || lit[2] != 10 || lit[3]) return 10;
+    if (ls->a[0] != 20 || ls->a[5] != 20) return 11;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("index_range_value_effects", code);
+}
+
 // Kept separate: the only test run at exactly -O0 and -O2 (no matrix level).
 /// A later designator reaching inside something a whole *value* initialized
 /// keeps the rest of that value, through a union exactly as through a

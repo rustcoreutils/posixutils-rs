@@ -213,9 +213,10 @@ impl<'a> Parser<'a> {
     /// the one subobject it names, where such a range names many. A range
     /// first in the chain is kept whole; the initializer walk handles it.
     ///
-    /// gcc evaluates the value of a range once, so the expansion is made only
-    /// for a value whose copies cannot be told apart from it; see
-    /// [`Self::evaluates_alike_repeated`]. binutils' i386-dis.c needs it:
+    /// gcc evaluates the value of a range once, and so do the copies: one
+    /// whose evaluation has an effect was made a [`ExprKind::RangeValue`] as
+    /// it was parsed ([`Self::evaluated_once`]). binutils' i386-dis.c needs
+    /// it:
     /// `.op_index[0 ... MAX_OPERANDS - 1] = -1`; and the Linux kernel's
     /// ima_queue.c, with a braced address constant:
     /// `.queue[0 ... IMA_MEASURE_HTABLE_SIZE - 1] = HLIST_HEAD_INIT`.
@@ -232,13 +233,6 @@ impl<'a> Parser<'a> {
         if !inner_range {
             elements.push(element);
             return Ok(());
-        }
-        if !self.evaluates_alike_repeated(&element.value) {
-            return Err(ParseError::new(
-                "an index range after a field designator needs a value without side effects; \
-                 write '.field = { [lo ... hi] = value }'",
-                element.value.pos,
-            ));
         }
         // Every index of every range in the chain, the last varying fastest.
         let mut chains: Vec<Vec<Designator>> = vec![Vec::new()];
@@ -271,6 +265,41 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// The value of an index range, `[lo ... hi] = value`, made to be
+    /// evaluated once however many elements it initializes, as gcc evaluates
+    /// it ([`ExprKind::RangeValue`]): a value whose evaluation has an effect
+    /// is wrapped, and in a braced value each such part of it. One that
+    /// [`Self::evaluates_alike_repeated`] stays as it is, so that a constant
+    /// is still one.
+    fn evaluated_once(&mut self, value: Expr) -> Expr {
+        if self.evaluates_alike_repeated(&value) {
+            return value;
+        }
+        let (typ, pos) = (value.typ, value.pos);
+        let kind = match value.kind {
+            ExprKind::InitList { elements } => ExprKind::InitList {
+                elements: elements
+                    .into_iter()
+                    .map(|el| InitElement {
+                        designators: el.designators,
+                        value: Box::new(self.evaluated_once(*el.value)),
+                    })
+                    .collect(),
+            },
+            kind => {
+                self.range_values += 1;
+                ExprKind::RangeValue {
+                    id: self.range_values,
+                    value: Box::new(Expr { kind, ..value }),
+                }
+            }
+        };
+        Expr {
+            typ,
+            ..Expr::new(kind, pos)
+        }
+    }
+
     /// Whether evaluating `e` once per element of a range cannot be told
     /// from evaluating it once: it has no effect -- no call, assignment,
     /// increment or statement expression -- touches nothing volatile, and
@@ -291,7 +320,9 @@ impl<'a> Parser<'a> {
             | ExprKind::Ident(_)
             | ExprKind::LabelAddr(_)
             | ExprKind::AlignofType(_)
-            | ExprKind::AlignofExpr(_) => true,
+            | ExprKind::AlignofExpr(_)
+            // Evaluated once, however many copies there are.
+            | ExprKind::RangeValue { .. } => true,
             ExprKind::Unary { op, operand } => {
                 !matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) && alike(operand)
             }
@@ -409,6 +440,14 @@ impl<'a> Parser<'a> {
 
         // Parse the initializer value (can be nested initializer list)
         let value = self.parse_initializer()?;
+        let ranged = designators
+            .iter()
+            .any(|d| matches!(d, Designator::IndexRange(..)));
+        let value = if ranged {
+            self.evaluated_once(value)
+        } else {
+            value
+        };
 
         Ok(InitElement {
             designators,

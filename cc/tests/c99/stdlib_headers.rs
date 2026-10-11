@@ -544,6 +544,42 @@ int main(void) { return SSIZE_MAX - 5; }
     assert_eq!(compile_and_run("own_ssize_max", code, &[]), 0);
 }
 
+/// gcc's `<limits.h>` adds the GNU spellings `LONG_LONG_MIN`,
+/// `LONG_LONG_MAX` and `ULONG_LONG_MAX` under glibc's `__USE_GNU` (or,
+/// with any other C library, unless `__STRICT_ANSI__`); glibc's
+/// vfprintf-internal.c stops with `#error` without them. Without
+/// `_GNU_SOURCE` glibc's namespace stays clean of them.
+#[test]
+fn gnu_long_long_limits() {
+    let code = r#"
+#define _GNU_SOURCE
+#include <limits.h>
+#if !defined LONG_LONG_MAX || !defined LONG_LONG_MIN || !defined ULONG_LONG_MAX
+#error "GNU long long limits missing"
+#endif
+#if LONG_LONG_MAX != LLONG_MAX || LONG_LONG_MIN != LLONG_MIN || ULONG_LONG_MAX != ULLONG_MAX
+#error "GNU long long limits wrong in #if"
+#endif
+int main(void) {
+    if (_Generic(LONG_LONG_MIN, long long: 0, default: 1)) return 1;
+    if (_Generic(ULONG_LONG_MAX, unsigned long long: 0, default: 1)) return 2;
+    return !(LONG_LONG_MAX == LLONG_MAX && ULONG_LONG_MAX + 1 == 0);
+}
+"#;
+    assert_eq!(compile_and_run("gnu_long_long_limits", code, &[]), 0);
+    #[cfg(target_os = "linux")]
+    {
+        let clean = r#"
+#include <limits.h>
+#ifdef LONG_LONG_MAX
+#error "LONG_LONG_MAX without _GNU_SOURCE"
+#endif
+int main(void) { return 0; }
+"#;
+        assert_eq!(compile_and_run("gnu_long_long_limits_clean", clean, &[]), 0);
+    }
+}
+
 /// `<complex.h>` belongs to the C library, which declares more than C17 lists:
 /// glibc adds `clog10` under `_GNU_SOURCE`, which the program defines. The bundled
 /// header used to stand in for glibc's and hid those declarations (guile's

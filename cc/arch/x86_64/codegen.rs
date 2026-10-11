@@ -1782,11 +1782,9 @@ impl CodeGenerator for X86_64CodeGen {
         // Emit file header
         self.base.plan_named_sections(module, self.pic_mode);
         self.base.plan_local_binding(module);
-        self.base.landing_pads = crate::arch::landing_pads::LandingPads::plan(
-            module,
-            self.base.optimizing,
-            self.base.cf_protection.branch,
-        );
+        let branch = self.base.cf_protection.branch;
+        self.base.landing_pads =
+            crate::arch::landing_pads::LandingPads::plan(module, self.base.optimizing, |_| branch);
         self.emit_header();
 
         self.base.emit_file_table(module);

@@ -1380,11 +1380,10 @@ impl CodeGenerator for Aarch64CodeGen {
         // Emit file header
         self.base.plan_named_sections(module, self.pic_mode);
         self.base.plan_local_binding(module);
-        self.base.landing_pads = crate::arch::landing_pads::LandingPads::plan(
-            module,
-            self.base.optimizing,
-            self.base.target.branch_protection.bti,
-        );
+        self.base.landing_pads =
+            crate::arch::landing_pads::LandingPads::plan(module, self.base.optimizing, |f| {
+                f.branch_protection.bti
+            });
         self.emit_header();
 
         self.base.emit_file_table(module);

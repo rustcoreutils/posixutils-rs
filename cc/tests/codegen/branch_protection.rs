@@ -52,8 +52,31 @@ __asm__(".text\n.globl bare\n.type bare,%function\nbare:\n add w0, w0, 1\n ret\n
         ".size bare,.-bare\n");
 int (*volatile bp)(int) = bare;
 #endif
+#ifdef ATTR
+__attribute__((target("branch-protection=bti+pac-ret+b-key")))
+int bkeyed(int n) { return n ? n + bkeyed(n - 1) : 0; }
+int (*volatile kp)(int) = bkeyed;
+__attribute__((target("branch-protection=bti")))
+static int bti_only(int x) { return x * 3; }
+int (*volatile op)(int) = bti_only;
+__attribute__((target("branch-protection=pac-ret")))
+void *where(void) { return __builtin_return_address(0); }
+#endif
+#ifdef ATTR_NONE
+__attribute__((target("branch-protection=none"))) int unpadded(int x) { return x + 1; }
+int (*volatile up)(int) = unpadded;
+#endif
 __attribute__((noinline)) int run(void)
 {
+#ifdef ATTR
+    if (kp(10) != 55) return 7;
+    if (op(5) != 15) return 8;
+    char *w = where();
+    if (w < (char *)run || w > (char *)run + 4096) return 9;
+#endif
+#ifdef ATTR_NONE
+    return up(1);
+#endif
     if (fp(21) != 42) return 1;
     if (ep(1) != 2) return 2;
     if (pick(0) + pick(1) != 30) return 3;
@@ -146,6 +169,40 @@ fn branch_protection_bti_enforced_program_runs() {
                 "{opt} {flag}"
             );
         }
+    }
+}
+
+/// `target("branch-protection=...")` builds one function as the option
+/// would: functions signing with the B key, a static one with only `bti`
+/// reached through a pointer, and the stripped return address of a signing
+/// function all run under enforcement. The control -- a function whose
+/// attribute takes the unit's protection away, called through a pointer --
+/// dies with SIGILL, which shows the attribute is what decides.
+#[test]
+fn branch_protection_target_attribute_runs() {
+    if !aarch64_cross_available() {
+        eprintln!("SKIP branch_protection_target_attribute_runs: no aarch64 cross toolchain");
+        return;
+    }
+    let control = run_freestanding(
+        "bti_attr_ctl",
+        &["-O2", "-mbranch-protection=standard", "-DATTR_NONE"],
+    );
+    if control == (Some(2), None) {
+        panic!("the unpadded function was called without a fault: the attribute did nothing");
+    }
+    if control != (None, Some(4)) {
+        eprintln!(
+            "SKIP branch_protection_target_attribute_runs: qemu enforces no BTI ({control:?})"
+        );
+        return;
+    }
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            run_freestanding("bti_attr", &[opt, "-mbranch-protection=standard", "-DATTR"]),
+            (Some(0), None),
+            "{opt}"
+        );
     }
 }
 

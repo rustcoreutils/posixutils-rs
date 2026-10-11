@@ -3188,6 +3188,11 @@ pub struct Function {
     /// version asks. What the linearizer and the backend both read; set
     /// once, by `Linearizer::linearize_function`. The baseline elsewhere.
     pub isa: crate::target::X86Isa,
+    /// The aarch64 branch protection this function is built with: the
+    /// translation unit's `-mbranch-protection`, or what its
+    /// `target("branch-protection=...")` asks in its place. Set once, by
+    /// `Linearizer::linearize_function`; read by the backend.
+    pub branch_protection: crate::target::BranchProtection,
     /// The rounding direction the optimizer may assume when it folds this
     /// function's floating-point operations: to nearest, or under
     /// `-frounding-math` whatever `fesetround` set. Set once, by
@@ -3306,6 +3311,7 @@ impl Default for Function {
             conv: CallingConv::C,
             is_noinline: false,
             isa: Default::default(),
+            branch_protection: Default::default(),
             fp_rounding: Default::default(),
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,

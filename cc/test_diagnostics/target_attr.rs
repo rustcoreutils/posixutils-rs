@@ -159,6 +159,74 @@ fn diagnostics_target_clones_on_mach_o_is_the_default_body() {
     assert!(asm.contains("_f:") && !asm.contains("resolver"), "{asm}");
 }
 
+/// aarch64's `target("branch-protection=...")` is read as the option is,
+/// and refused in the words gcc 13 has for the attribute -- each fault, then
+/// the item as a whole.
+#[test]
+fn diagnostics_target_branch_protection_values() {
+    for (value, fault) in [
+        (
+            "",
+            "missing argument to 'target(\"branch-protection=\")' pragma or attribute",
+        ),
+        (
+            "++",
+            "missing argument to 'target(\"branch-protection=\")' pragma or attribute",
+        ),
+        (
+            "foo",
+            "invalid protection type 'foo' in 'target(\"branch-protection=\")' pragma or attribute",
+        ),
+        (
+            "bti+leaf",
+            "invalid protection type 'leaf' in 'target(\"branch-protection=\")' pragma or attribute",
+        ),
+        ("none+bti", "unexpected 'bti' after 'none'"),
+    ] {
+        let src = format!(
+            "__attribute__((target(\"branch-protection={value}\"))) int f(int x) {{ return x; }}\n"
+        );
+        let stderr = compile_rejected_with(value, &src, &["--target=aarch64-unknown-linux-gnu"]);
+        let whole = format!(
+            "error: pragma or attribute 'target(\"branch-protection={value}\")' is not valid"
+        );
+        assert!(
+            stderr.contains(&format!("error: {fault}")) && stderr.contains(&whole),
+            "{value:?}:\n{stderr}"
+        );
+    }
+    for value in [
+        "none",
+        "standard",
+        "bti",
+        "+bti",
+        "pac-ret+b-key+leaf",
+        "bti+pac-ret",
+    ] {
+        let src = format!(
+            "__attribute__((target(\"branch-protection={value}\"))) int f(int x) {{ return x; }}\n"
+        );
+        let c = compile(value, &src, &["--target=aarch64-unknown-linux-gnu"]);
+        assert!(c.success && c.stderr.is_empty(), "{value}: {}", c.stderr);
+    }
+    // Darwin, which refuses `-mbranch-protection`, ignores the attribute's
+    // protection with a warning, and builds the function without it.
+    let c = compile(
+        "bp_darwin",
+        "__attribute__((target(\"branch-protection=standard\"))) int f(int x) { return x; }\n",
+        &["--target=aarch64-apple-darwin"],
+    );
+    assert!(
+        c.success
+            && c.stderr.contains(
+                "warning: 'branch-protection=standard' in 'target' attribute is not supported and is ignored"
+            ),
+        "{}",
+        c.stderr
+    );
+    assert!(!c.asm.unwrap().contains("hint"));
+}
+
 /// A `target_clones` body is lowered once per version, but a diagnostic about
 /// its source is the source's, and is reported once.
 #[test]

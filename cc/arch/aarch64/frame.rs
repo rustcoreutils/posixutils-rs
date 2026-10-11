@@ -179,6 +179,8 @@ impl Aarch64CodeGen {
         // on the symbol the assembler is asked for.
         self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
         self.base.func_pos = crate::arch::func_pos(func);
+        self.base.branch_protection = func.branch_protection;
+        self.base.landing_pads.enter(&func.name);
         self.frame_size = total_frame;
         self.stack_alloc_size = stack_size;
 
@@ -423,7 +425,7 @@ impl Aarch64CodeGen {
     /// under `bti`, a function an indirect call may reach starts with
     /// `bti c`.
     fn emit_entry_protection(&mut self, func: &Function) {
-        match self.base.target.branch_protection.pac_ret {
+        match self.base.branch_protection.pac_ret {
             Some(pac) => {
                 if pac.b_key {
                     self.push_cfi(Directive::CfiBKeyFrame);
@@ -446,7 +448,7 @@ impl Aarch64CodeGen {
     /// Under `pac-ret`, authenticate x30, reloaded by the epilogue, just
     /// before the `ret` that branches to it, as gcc does.
     fn emit_return_authentication(&mut self) {
-        if let Some(pac) = self.base.target.branch_protection.pac_ret {
+        if let Some(pac) = self.base.branch_protection.pac_ret {
             let auth = if pac.b_key {
                 Hint::Autibsp
             } else {

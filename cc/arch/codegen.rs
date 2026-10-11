@@ -130,6 +130,9 @@ pub struct CodeGenBase<I: LirInst> {
     /// The x86-64 ISA of the function being emitted (`ir::Function::isa`),
     /// which picks the instructions a vector operation becomes.
     pub isa: crate::target::X86Isa,
+    /// The aarch64 branch protection of the function being emitted
+    /// (`ir::Function::branch_protection`).
+    pub branch_protection: crate::target::BranchProtection,
     /// Where the CFI procedures and their frame rules go, if anywhere.
     pub cfi: crate::target::Cfi,
     /// A source position for the function being emitted, for a backend
@@ -304,6 +307,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     pub fn new(target: Target) -> Self {
         Self {
             isa: target.x86_isa,
+            branch_protection: target.branch_protection,
             target,
             output: String::new(),
             lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),

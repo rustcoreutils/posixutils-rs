@@ -2073,6 +2073,12 @@ impl<'a> Linearizer<'a> {
             .as_ref()
             .map_or_else(|| self.function_isa(func.attrs.target.as_ref()), |v| v.isa);
         self.isa = ir_func.isa;
+        ir_func.branch_protection = func
+            .attrs
+            .target
+            .as_ref()
+            .and_then(|r| r.branch_protection())
+            .unwrap_or(self.target.branch_protection);
         ir_func.fp_rounding = self.fp_rounding;
 
         // Whether this is an *inline definition*, which provides no external

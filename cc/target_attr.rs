@@ -16,7 +16,7 @@
 // gcc's words.
 //
 
-use crate::target::{isa_edit, Arch, IsaRequest, IsaSet};
+use crate::target::{isa_edit, Arch, BranchProtection, BranchProtectionError, IsaRequest, IsaSet};
 
 /// gcc 13's x86-64 `-march=` roster, which `target("arch=...")` and
 /// `target("tune=...")` accept: the list its "valid arguments" note prints.
@@ -126,6 +126,9 @@ pub enum TargetIssue {
     Unsupported(String),
     /// aarch64: a string gcc's aarch64 back end refuses, an error.
     NotValid(String),
+    /// aarch64: what is wrong with a `branch-protection=` value, an error
+    /// given before the item's [`Self::NotValid`].
+    BranchProtection(BranchProtectionError),
 }
 
 impl TargetIssue {
@@ -192,7 +195,8 @@ fn x86_item(item: &str) -> Result<X86Item, TargetIssue> {
 
 /// Whether gcc 13's aarch64 back end accepts `item` of a `target` string:
 /// an architecture, CPU or tuning, `+extension`s, and its own switches.
-/// None of them changes c17's code.
+/// None of them but `branch-protection=` changes c17's code, and that one
+/// `parse_target` reads for itself.
 fn aarch64_item_valid(item: &str) -> bool {
     const SWITCHES: &[&str] = &[
         "general-regs-only",
@@ -234,11 +238,19 @@ pub fn parse_target(text: &str, arch: Arch) -> (IsaRequest, Vec<TargetIssue>) {
                 Ok(X86Item::Edit(edit)) => request.push_edit(edit),
                 Err(issue) => issues.push(issue),
             },
-            Arch::Aarch64 => {
-                if !aarch64_item_valid(item) {
+            Arch::Aarch64 => match item.strip_prefix("branch-protection=") {
+                Some(value) => match BranchProtection::parse(value) {
+                    Ok(protection) => request.push_branch_protection(protection),
+                    Err(e) => {
+                        issues.push(TargetIssue::BranchProtection(e));
+                        issues.push(TargetIssue::NotValid(item.to_string()));
+                    }
+                },
+                None if !aarch64_item_valid(item) => {
                     issues.push(TargetIssue::NotValid(item.to_string()));
                 }
-            }
+                None => {}
+            },
         }
     }
     (request, issues)
@@ -468,6 +480,38 @@ mod tests {
         assert!(a64("arch=armv8-a+crc").is_empty());
         assert!(a64("+crc,cpu=cortex-a72,tune=cortex-a72").is_empty());
         assert_eq!(a64("sse4.2"), vec![TargetIssue::NotValid("sse4.2".into())]);
+        assert_eq!(
+            a64("branch-protection=bti+leaf"),
+            vec![
+                TargetIssue::BranchProtection(BranchProtectionError::Invalid("leaf".into())),
+                TargetIssue::NotValid("branch-protection=bti+leaf".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn target_branch_protection_is_the_last_asked() {
+        let request = |t: &str| {
+            let (request, issues) = parse_target(t, Arch::Aarch64);
+            assert!(issues.is_empty(), "{t}: {issues:?}");
+            request.branch_protection()
+        };
+        assert_eq!(request("arch=armv8-a"), None);
+        assert_eq!(
+            request("branch-protection=none"),
+            Some(BranchProtection::default())
+        );
+        let bti = BranchProtection {
+            bti: true,
+            pac_ret: None,
+        };
+        assert_eq!(request("branch-protection=+bti"), Some(bti));
+        assert_eq!(
+            request("branch-protection=bti,branch-protection=none"),
+            Some(BranchProtection::default())
+        );
+        let standard = request("branch-protection=standard").unwrap();
+        assert!(standard.bti && standard.pac_ret.is_some());
     }
 
     #[test]

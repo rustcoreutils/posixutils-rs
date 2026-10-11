@@ -545,6 +545,40 @@ pub struct BranchProtection {
     pub pac_ret: Option<PacRet>,
 }
 
+/// What is wrong with a `-mbranch-protection=` or
+/// `target("branch-protection=")` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchProtectionError {
+    /// No word at all; `empty` when the value itself is empty.
+    Missing { empty: bool },
+    /// A word that names no protection.
+    Invalid(String),
+    /// A word after `none` or `standard`, which must come last.
+    Unexpected { word: String, next: String },
+}
+
+impl BranchProtectionError {
+    /// gcc 13's message for the command-line option.
+    pub fn option_message(&self) -> String {
+        match self {
+            Self::Missing { empty: true } => "missing argument to '-mbranch-protection='".into(),
+            Self::Missing { empty: false } => "missing argument for '-mbranch-protection='".into(),
+            Self::Invalid(word) => format!("invalid argument '{word}' for '-mbranch-protection='"),
+            Self::Unexpected { word, next } => format!("unexpected '{next}' after '{word}'"),
+        }
+    }
+
+    /// gcc 13's message for the `target` attribute.
+    pub fn attribute_message(&self) -> String {
+        const WHERE: &str = "'target(\"branch-protection=\")' pragma or attribute";
+        match self {
+            Self::Missing { .. } => format!("missing argument to {WHERE}"),
+            Self::Invalid(word) => format!("invalid protection type '{word}' in {WHERE}"),
+            Self::Unexpected { .. } => self.option_message(),
+        }
+    }
+}
+
 /// Whether the aarch64 architecture the machine `flags` select has BTI,
 /// which arrived in armv8.5-a: gcc 13's `__ARM_FEATURE_BTI`. The last
 /// `-march=` decides, and without one the last `-mcpu=`, read as the
@@ -604,14 +638,14 @@ impl BranchProtection {
     /// `standard` reset everything and must be the last word, `bti` adds
     /// landing pads, and `pac-ret` signs with the A key in the functions that
     /// save the link register, as modified by the `leaf` and `b-key` words
-    /// directly after it. `Err` is gcc's message.
-    pub fn parse(value: &str) -> Result<Self, String> {
-        if value.is_empty() {
-            return Err("missing argument to '-mbranch-protection='".to_string());
-        }
+    /// directly after it. `target("branch-protection=<value>")` reads its
+    /// value the same way.
+    pub fn parse(value: &str) -> Result<Self, BranchProtectionError> {
         let words: Vec<&str> = value.split('+').filter(|w| !w.is_empty()).collect();
         if words.is_empty() {
-            return Err("missing argument for '-mbranch-protection='".to_string());
+            return Err(BranchProtectionError::Missing {
+                empty: value.is_empty(),
+            });
         }
         let mut protection = Self::default();
         let mut i = 0;
@@ -620,7 +654,10 @@ impl BranchProtection {
             match word {
                 "none" | "standard" => {
                     if let Some(next) = next {
-                        return Err(format!("unexpected '{next}' after '{word}'"));
+                        return Err(BranchProtectionError::Unexpected {
+                            word: word.to_string(),
+                            next: next.to_string(),
+                        });
                     }
                     protection = if word == "none" {
                         Self::default()
@@ -644,11 +681,7 @@ impl BranchProtection {
                     }
                     protection.pac_ret = Some(pac);
                 }
-                _ => {
-                    return Err(format!(
-                        "invalid argument '{word}' for '-mbranch-protection='"
-                    ))
-                }
+                _ => return Err(BranchProtectionError::Invalid(word.to_string())),
             }
             i += 1;
         }
@@ -662,7 +695,9 @@ impl BranchProtection {
             .iter()
             .rev()
             .find_map(|f| f.strip_prefix("-mbranch-protection="))
-            .map_or(Ok(Self::default()), Self::parse)
+            .map_or(Ok(Self::default()), |value| {
+                Self::parse(value).map_err(|e| e.option_message())
+            })
     }
 
     /// Whether code is built for either protection.
@@ -1556,7 +1591,8 @@ pub enum FusedMultiplyAdd {
 /// What `__attribute__((target("...")))` asks of one function's x86-64
 /// ISA, relative to the translation unit's: the extensions an `arch=` CPU
 /// has, and the feature edits (`sse4.1`, `no-sse4.2`, `popcnt`) in order.
-/// Read from the attribute by `crate::target_attr`; applied by
+/// On aarch64, the `branch-protection=` it is built with instead of the
+/// unit's. Read from the attribute by `crate::target_attr`; applied by
 /// [`X86Isa::with_request`]. One list, so that a function's attributes stay
 /// a pointer's size here whatever an [`IsaSet`] holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1571,6 +1607,8 @@ enum IsaRequestItem {
     Arch(IsaSet),
     /// A feature turned on or off.
     Edit(IsaEdit),
+    /// aarch64 `branch-protection=`.
+    BranchProtection(BranchProtection),
 }
 
 impl IsaRequest {
@@ -1584,13 +1622,29 @@ impl IsaRequest {
         self.items.push(IsaRequestItem::Edit(edit));
     }
 
+    /// Ask for the function to be built with `protection`, in place of any
+    /// asked for before.
+    pub(crate) fn push_branch_protection(&mut self, protection: BranchProtection) {
+        self.items
+            .push(IsaRequestItem::BranchProtection(protection));
+    }
+
+    /// The branch protection asked for last, if any: the function's in
+    /// place of the unit's, as gcc builds it.
+    pub fn branch_protection(&self) -> Option<BranchProtection> {
+        self.items.iter().rev().find_map(|item| match item {
+            IsaRequestItem::BranchProtection(p) => Some(*p),
+            _ => None,
+        })
+    }
+
     /// The extensions of every `arch=` CPU asked for, if there is one.
     fn arch(&self) -> Option<IsaSet> {
         self.items
             .iter()
             .filter_map(|item| match item {
                 IsaRequestItem::Arch(set) => Some(*set),
-                IsaRequestItem::Edit(_) => None,
+                _ => None,
             })
             .reduce(IsaSet::with)
     }
@@ -1599,7 +1653,7 @@ impl IsaRequest {
     fn edits(&self) -> impl Iterator<Item = IsaEdit> + '_ {
         self.items.iter().filter_map(|item| match item {
             IsaRequestItem::Edit(edit) => Some(*edit),
-            IsaRequestItem::Arch(_) => None,
+            _ => None,
         })
     }
 

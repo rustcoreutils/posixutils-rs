@@ -1480,7 +1480,7 @@ impl Aarch64CodeGen {
         // From the saved frame record, even at level 0: x30 itself is
         // overwritten by any call the function has made before this point.
         self.emit_frame_walk(insn.frame_level());
-        if self.base.target.branch_protection.pac_ret.is_some() {
+        if self.base.branch_protection.pac_ret.is_some() {
             // Signed where it was saved: stripped of its signature, as gcc
             // does, through x30 -- the one register `xpaclri` works on, and
             // free here, since the epilogue reloads it from the frame.

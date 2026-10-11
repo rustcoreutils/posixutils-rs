@@ -228,3 +228,73 @@ fn branch_protection_property_note() {
         assert!(!asm.contains(".cfi_window_save"), "{flags:?}:\n{asm}");
     }
 }
+
+/// `target("branch-protection=...")` builds one function as the option
+/// would, in place of the command line's protection, whichever that is.
+const PER_FUNCTION: &str = r#"
+extern int g(int);
+int plain(int x) { return g(x) + 1; }
+__attribute__((target("branch-protection=none"))) int none(int x) { return g(x) + 1; }
+__attribute__((target("branch-protection=standard"))) int std(int x) { return g(x) + 1; }
+__attribute__((target("branch-protection=bti"))) int bti(int x) { return g(x) + 1; }
+__attribute__((target("branch-protection=pac-ret"))) int pac(int x) { return g(x) + 1; }
+__attribute__((target("branch-protection=pac-ret+leaf+b-key")))
+int bkey(int x) { return g(x) + 1; }
+__attribute__((target("branch-protection=bti,branch-protection=none")))
+int last(int x) { return g(x) + 1; }
+__attribute__((target("arch=armv8-a,branch-protection=+bti")))
+int cg(int i) {
+    static void *t[] = { &&a, &&b };
+    goto *t[i];
+a:  return g(1);
+b:  return g(2);
+}
+__attribute__((target("branch-protection=pac-ret")))
+void *ra(void) { return __builtin_return_address(0); }
+"#;
+
+/// What each function of [`PER_FUNCTION`] starts and returns with, as
+/// aarch64-linux-gnu-gcc 13 builds it with or without
+/// `-mbranch-protection=standard`: the attribute decides, and the unit's
+/// protection reaches only `plain`.
+#[test]
+fn target_attribute_overrides_branch_protection() {
+    const PACIASP: &str = "hint 25 // paciasp";
+    const AUTIASP: &str = "    hint 29 // autiasp\n    .cfi_window_save\n    ret\n";
+    for unit in [None, Some("-mbranch-protection=standard")] {
+        let mut flags = vec!["-O2"];
+        flags.extend(unit);
+        let asm = asm_for_with("bp_attr", AARCH64_LINUX, PER_FUNCTION, &flags);
+        let ctx = format!("{unit:?}:\n{asm}");
+        let protected = |func: &str| asm.contains("hint") && body_of(&asm, func).contains("hint");
+        for func in ["none", "last"] {
+            assert!(!protected(func), "{func} {ctx}");
+            assert!(!body_of(&asm, func).contains(".cfi_window_save"), "{ctx}");
+        }
+        assert_eq!(protected("plain"), unit.is_some(), "{ctx}");
+        for func in ["std", "pac"] {
+            assert_eq!(first_insn(&asm, func), PACIASP, "{func} {ctx}");
+            assert_body_contains(&asm, func, AUTIASP, func);
+            assert!(!body_of(&asm, func).contains("bti"), "{func} {ctx}");
+        }
+        assert_eq!(first_insn(&asm, "bti"), BTI_C, "{ctx}");
+        assert!(!body_of(&asm, "bti").contains("aut"), "{ctx}");
+        assert_body_contains(
+            &asm,
+            "bkey",
+            "    .cfi_b_key_frame\n    hint 27 // pacibsp\n    .cfi_window_save\n",
+            "bkey",
+        );
+        assert_body_contains(
+            &asm,
+            "bkey",
+            "    hint 31 // autibsp\n    .cfi_window_save\n    ret\n",
+            "bkey",
+        );
+        assert_eq!(first_insn(&asm, "cg"), BTI_C, "{ctx}");
+        assert_eq!(count_in_body(&asm, "cg", BTI_J), 2, "{ctx}");
+        assert_body_contains(&asm, "ra", "hint 7 // xpaclri", "ra");
+        // The note is the unit's: what the command line asked for.
+        assert_eq!(asm.contains(".note.gnu.property"), unit.is_some(), "{ctx}");
+    }
+}

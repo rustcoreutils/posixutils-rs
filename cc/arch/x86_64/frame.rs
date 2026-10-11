@@ -307,6 +307,7 @@ impl X86_64CodeGen {
         } else {
             Vec::new()
         };
+        self.base.landing_pads.enter(&func.name);
         if self.base.landing_pads.entry(&func.name) {
             self.push_lir(X86Inst::Endbr64);
         }

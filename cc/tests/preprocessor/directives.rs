@@ -489,6 +489,58 @@ fn preprocessor_pragma_operator_destringifies() {
     );
 }
 
+/// The Linux kernel's `__diag(s)` builds `_Pragma(__diag_str(GCC
+/// diagnostic s))`: the operand comes from macro expansion, which gcc
+/// performs (`__bpf_kfunc_start_defs`, `__diag_ignore_all`; glibc's
+/// `DIAG_IGNORE_NEEDS_COMMENT`). c17 rejected every one. The `-E` text is
+/// gcc 13's, and the compiled program honours the pragmas: the diagnostic
+/// one silences `-Wmissing-prototypes -Werror`, the `pack` one packs.
+#[test]
+fn preprocessor_pragma_operator_operand_from_macros() {
+    let src = r#"#define __diag_str1(s) #s
+#define __diag_str(s) __diag_str1(s)
+#define __diag(s) _Pragma(__diag_str(GCC diagnostic s))
+#define __diag_ignore_all(option, comment) __diag(ignored option)
+#define PACK "pack(push, 1)"
+#define POP _Pragma(STRPOP)
+#define STRPOP "pack(pop)"
+__diag(push)
+__diag_ignore_all("-Wmissing-prototypes", "kfuncs")
+int kfunc(int x) { return x + 1; }
+__diag(pop)
+_Pragma(PACK)
+struct s { char c; int i; };
+POP
+int main(void) { return kfunc(-1) + (sizeof(struct s) != 5); }
+"#;
+    // With linemarkers too: the line after a `_Pragma` starts in column 1.
+    for opts in [&["-P"][..], &[]] {
+        let r = preprocess_text("pragma_macro_operand", src, opts);
+        assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+        let lines: Vec<&str> = r
+            .stdout
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with("# "))
+            .collect();
+        assert_eq!(lines, PRAGMA_MACRO_OPERAND_E, "{opts:?}");
+    }
+    let opts = ["-Wmissing-prototypes".to_string(), "-Werror".to_string()];
+    assert_eq!(compile_and_run("pragma_macro_operand", src, &opts), 0);
+}
+
+/// gcc 13's `-E` lines for the program above, blank lines and linemarkers
+/// aside.
+const PRAGMA_MACRO_OPERAND_E: [&str; 8] = [
+    "#pragma GCC diagnostic push",
+    "#pragma GCC diagnostic ignored \"-Wmissing-prototypes\"",
+    "int kfunc(int x) { return x + 1; }",
+    "#pragma GCC diagnostic pop",
+    "#pragma pack(push, 1)",
+    "struct s { char c; int i; };",
+    "#pragma pack(pop)",
+    "int main(void) { return kfunc(-1) + (sizeof(struct s) != 5); }",
+];
+
 /// Preprocessing to a `.i` and compiling that must lay a struct out the same
 /// way as compiling the source directly — which is the whole reason the
 /// pragmas have to survive.

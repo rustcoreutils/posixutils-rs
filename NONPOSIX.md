@@ -155,6 +155,9 @@ Language and preprocessor additions:
  * `__FUNCTION__`, `__PRETTY_FUNCTION__`.
  * `#include_next`, `#warning`, `#pragma once`, `#pragma push_macro` and
    `#pragma pop_macro`.
+ * A `_Pragma` operand is macro-replaced before it is read, as gcc does:
+   the Linux kernel's `__diag()` writes `_Pragma(__diag_str(...))`, glibc's
+   `DIAG_IGNORE_NEEDS_COMMENT` the same.
  * In assembler-with-cpp (`.S`) a `##` that forms no single token leaves its
    operands side by side without a diagnostic, as gcc's `-lang-asm` does:
    the Linux kernel pastes onto `.macro` parameters (`.L__sym_size_##name`)

@@ -1394,6 +1394,10 @@ fn emit_preprocessed(
                 writeln!(out.preprocessed, "{}", text)?;
                 current_line += 1;
                 at_line_start = true;
+                // The text after it starts its own line afresh: a `_Pragma`
+                // that a later line's token sent back to its line leaves no
+                // space owed to that token.
+                returned = false;
                 continue;
             }
 

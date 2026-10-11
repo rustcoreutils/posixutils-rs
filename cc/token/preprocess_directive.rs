@@ -1649,18 +1649,22 @@ impl<'a> Preprocessor<'a> {
         iter: &mut TokenCursor,
         output: &mut Vec<Token>,
         pragma_pos: Position,
+        idents: &mut IdentTable,
     ) {
         // C17 6.10.9p1: the operand is `( string-literal )`. Each token is
         // looked at before it is taken: one that does not belong to the
         // operator -- the end of the stream above all, which every caller
-        // needs to see -- stays where it is.
+        // needs to see -- stays where it is. Each is macro-replaced first, as
+        // gcc does: the Linux kernel writes `_Pragma(__diag_str(...))`.
         let is_punct =
             |t: &Token, c: u8| matches!(&t.value, TokenValue::Special(code) if *code == c as u32);
+        self.expand_ahead(iter, idents);
         if !iter.peek().is_some_and(|t| is_punct(t, b'(')) {
             Self::pragma_operand_error(pragma_pos);
             return;
         }
         iter.next();
+        self.expand_ahead(iter, idents);
         if !iter.peek().is_some_and(|t| t.typ == TokenType::String) {
             Self::pragma_operand_error(pragma_pos);
             return;
@@ -1699,6 +1703,7 @@ impl<'a> Preprocessor<'a> {
             }
         }
 
+        self.expand_ahead(iter, idents);
         if iter.peek().is_some_and(|t| is_punct(t, b')')) {
             iter.next();
         } else {

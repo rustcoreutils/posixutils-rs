@@ -2299,6 +2299,24 @@ fn test_stream_end_survives_unfinished_constructs() {
     }
 }
 
+/// A `_Pragma` operand is macro-expanded, as gcc does: the Linux kernel's
+/// `__diag(s)` is `_Pragma(__diag_str(GCC diagnostic s))`, and glibc's
+/// `DIAG_IGNORE_NEEDS_COMMENT` is built the same way. The parenthesis may
+/// come from a macro too.
+#[test]
+fn test_pragma_operator_operand_is_macro_expanded() {
+    let before = crate::diag::error_count();
+    let (tokens, idents) = preprocess_str(
+        "#define S1(s) #s\n#define S(s) S1(s)\n#define D(s) _Pragma(S(GCC diagnostic s))\n\
+         #define PK \"pack(push, 1)\"\n#define LP (\n\
+         D(push) a _Pragma(PK) b _Pragma LP \"pack(pop)\" ) c\n",
+    );
+    assert_eq!(crate::diag::error_count(), before);
+    assert_eq!(get_token_strings(&tokens, &idents), ["a", "b", "c"]);
+    let pragmas = tokens.iter().filter(|t| t.typ == TokenType::Pragma).count();
+    assert_eq!(pragmas, 3);
+}
+
 /// A malformed `_Pragma` operand is gcc's error and consumes nothing that is
 /// not part of the operator.
 #[test]

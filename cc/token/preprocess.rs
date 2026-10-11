@@ -1859,7 +1859,12 @@ impl<'a> Preprocessor<'a> {
                             // Handle the _Pragma operator (C99):
                             // `_Pragma("string")` is `#pragma string`.
                             if is_pragma {
-                                self.handle_pragma_operator(&mut cursor, &mut output, token.pos);
+                                self.handle_pragma_operator(
+                                    &mut cursor,
+                                    &mut output,
+                                    token.pos,
+                                    idents,
+                                );
                                 continue;
                             }
 
@@ -1909,6 +1914,45 @@ impl<'a> Preprocessor<'a> {
         }
 
         output
+    }
+
+    /// Macro-replace what `cursor` holds next until it no longer starts with
+    /// a macro invocation, for an operator that reads its operand token by
+    /// token rather than through the main loop: gcc's `_Pragma` operand gets
+    /// the replacement the main loop would give it. A name that turns out
+    /// not to be an invocation goes back where it came from.
+    pub(super) fn expand_ahead(&mut self, cursor: &mut TokenCursor, idents: &mut IdentTable) {
+        loop {
+            let Some(token) = cursor.peek() else {
+                return;
+            };
+            let TokenValue::Ident(id) = &token.value else {
+                return;
+            };
+            let Some(name) = idents.get_opt(*id) else {
+                return;
+            };
+            if !self.macros.contains_key(name) || token.is_no_expand(name) {
+                return;
+            }
+            let name = name.to_string();
+            let token = cursor.next().expect("peeked");
+            let from_file = cursor.provenance() == Provenance::Main;
+            match self.try_expand_macro(&name, &token, cursor, idents) {
+                Some(expanded) if self.charge_expansion(token.pos) => {
+                    cursor.push_expansion(expanded, token.pos.whitespace, token.pos.newline);
+                }
+                _ => {
+                    let (whitespace, newline) = (token.pos.whitespace, token.pos.newline);
+                    if from_file {
+                        cursor.unread(vec![token]);
+                    } else {
+                        cursor.push_expansion(vec![token], whitespace, newline);
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     /// Account for one expansion, and say whether it may proceed.

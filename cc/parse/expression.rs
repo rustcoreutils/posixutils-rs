@@ -190,9 +190,11 @@ impl<'a> Parser<'a> {
     /// first in the chain is kept whole; the initializer walk handles it.
     ///
     /// gcc evaluates the value of a range once, so the expansion is made only
-    /// for an integer constant value, whose copies cannot be told apart from
-    /// it. binutils' i386-dis.c needs it: `.op_index[0 ... MAX_OPERANDS - 1]
-    /// = -1`.
+    /// for a value whose copies cannot be told apart from it; see
+    /// [`Self::evaluates_alike_repeated`]. binutils' i386-dis.c needs it:
+    /// `.op_index[0 ... MAX_OPERANDS - 1] = -1`; and the Linux kernel's
+    /// ima_queue.c, with a braced address constant:
+    /// `.queue[0 ... IMA_MEASURE_HTABLE_SIZE - 1] = HLIST_HEAD_INIT`.
     fn push_init_element(
         &self,
         elements: &mut Vec<InitElement>,
@@ -207,9 +209,9 @@ impl<'a> Parser<'a> {
             elements.push(element);
             return Ok(());
         }
-        if self.eval_const_expr(&element.value).is_none() {
+        if !self.evaluates_alike_repeated(&element.value) {
             return Err(ParseError::new(
-                "an index range after a field designator needs a constant value; \
+                "an index range after a field designator needs a value without side effects; \
                  write '.field = { [lo ... hi] = value }'",
                 element.value.pos,
             ));
@@ -243,6 +245,48 @@ impl<'a> Parser<'a> {
             value: element.value.clone(),
         }));
         Ok(())
+    }
+
+    /// Whether evaluating `e` once per element of a range cannot be told
+    /// from evaluating it once: it has no effect -- no call, assignment,
+    /// increment or statement expression -- touches nothing volatile, and
+    /// makes no object, as a compound literal would, whose address each copy
+    /// would see differently. Any initializer of a static object qualifies.
+    fn evaluates_alike_repeated(&self, e: &Expr) -> bool {
+        if e.typ.is_some_and(|t| self.types.contains_volatile(t)) {
+            return false;
+        }
+        let alike = |e: &Expr| self.evaluates_alike_repeated(e);
+        match &e.kind {
+            ExprKind::IntLit(_)
+            | ExprKind::FloatLit(_)
+            | ExprKind::CharLit(_)
+            | ExprKind::StringLit(_)
+            | ExprKind::WideStringLit(_)
+            | ExprKind::FuncName
+            | ExprKind::Ident(_)
+            | ExprKind::LabelAddr(_)
+            | ExprKind::AlignofType(_)
+            | ExprKind::AlignofExpr(_) => true,
+            ExprKind::Unary { op, operand } => {
+                !matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) && alike(operand)
+            }
+            ExprKind::Binary { left, right, .. } => alike(left) && alike(right),
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => alike(cond) && alike(then_expr) && alike(else_expr),
+            ExprKind::CondElvis { cond, else_expr } => alike(cond) && alike(else_expr),
+            ExprKind::Member { expr, .. }
+            | ExprKind::Arrow { expr, .. }
+            | ExprKind::Cast { expr, .. }
+            | ExprKind::SizeofExpr(expr) => alike(expr),
+            ExprKind::Index { array, index } => alike(array) && alike(index),
+            ExprKind::SizeofType(_, dims) | ExprKind::Comma(dims) => dims.iter().all(alike),
+            ExprKind::InitList { elements } => elements.iter().all(|el| alike(&el.value)),
+            _ => false,
+        }
     }
 
     /// Parse a single element of an initializer list

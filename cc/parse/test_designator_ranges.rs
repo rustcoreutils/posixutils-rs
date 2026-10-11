@@ -74,4 +74,32 @@ fn a_leading_range_is_kept_whole() {
 fn a_range_after_a_field_with_a_value_that_is_not_constant_is_refused() {
     let src = "struct S { int m[4]; }; int g; void f(void) { struct S s = { .m[0 ... 3] = g++ }; }";
     assert!(parse_tu(src).is_err());
+    for value in ["f()", "v", "(g = 1)", "(struct H){ 0 }"] {
+        let src = format!(
+            "struct H {{ int x; }}; struct S {{ struct H m[4]; }}; int f(void); \
+             volatile struct H v; int g;\n\
+             void h(void) {{ struct S s = {{ .m[0 ... 3] = {value} }}; }}"
+        );
+        assert!(parse_tu(&src).is_err(), "{value}");
+    }
+}
+
+/// A value that is not an integer constant is spelled out too when
+/// evaluating it once per element cannot be told from evaluating it once:
+/// a braced address constant (the kernel's `HLIST_HEAD_INIT`), or an
+/// expression with no effect and no volatile access.
+#[test]
+fn a_range_after_a_field_with_a_value_free_of_effects_is_spelled_out() {
+    let els = elements(
+        "struct H { void *first; }; struct S { struct H q[4]; };\n\
+         struct S s = { .q[0 ... 3] = { (void *)8 } };",
+    );
+    assert_eq!(els.len(), 4);
+    assert!(els
+        .iter()
+        .all(|e| matches!(e.value.kind, ExprKind::InitList { .. })));
+    let src = "struct S { double d[4]; int *p[2]; }; int g;\n\
+               void h(int n) { int a[3]; struct S s = { .d[1 ... 3] = n * 0.5 + g, \
+               .p[0 ... 1] = &a[n] }; (void)s; }";
+    assert!(parse_tu(src).is_ok());
 }

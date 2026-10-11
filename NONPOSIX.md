@@ -162,6 +162,10 @@ Language and preprocessor additions:
    `__has_include`, `__has_include_next`.
  * Named variadic macro parameters (`#define F(args...)`), an empty variadic
    tail, and the `, ## __VA_ARGS__` comma-swallow.
+ * Index range designators `[lo ... hi]`, also after a field designator,
+   `.f[lo ... hi] = v`, whose value may be any without side effects: the
+   Linux kernel's ima_queue.c initializes a hash table of `HLIST_HEAD_INIT`
+   so, binutils' i386-dis.c an array of `-1`.
  * Empty `enum { }` (diagnosed under `--pedantic`).
  * Digraphs, and the C23 one-argument `_Static_assert`.
  * `__GNUC__`, `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__`, `__VERSION__` and

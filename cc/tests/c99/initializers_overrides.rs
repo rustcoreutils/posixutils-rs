@@ -9,7 +9,9 @@
 // C99 initializers: designated overrides, ranges and excess initializers
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
+use crate::common::{
+    compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere, compile_and_run_optimized,
+};
 
 // ============================================================================
 // Mega-test: designated overrides, ranges and excess initializers
@@ -652,6 +654,37 @@ int main(void)
         compile_and_run("index_range_after_field_o2", code, &["-O2".to_string()]),
         0
     );
+}
+
+/// The same range with a value that is not an integer constant: a braced
+/// address constant, as the kernel's ima_queue.c initializes its hash table
+/// (`.queue[0 ... IMA_MEASURE_HTABLE_SIZE - 1] = HLIST_HEAD_INIT`), and, in
+/// an automatic object, any value whose evaluation has no effect, which may
+/// as well be evaluated once per element. c17 refused every value but an
+/// integer constant.
+#[test]
+fn c99_index_range_after_a_field_with_a_braced_or_pure_value() {
+    let code = r#"
+struct h { void *first; };
+struct t { long len; struct h q[4]; double d[3]; };
+static int anchor;
+struct t tbl = { .len = 1, .q[0 ... 3] = { (void *)8 }, .d[1 ... 2] = 2.5 };
+static struct t tp = { .q[1 ... 2] = { &anchor }, .q[3].first = 0 };
+int main(void) {
+    for (int i = 0; i < 4; i++)
+        if (tbl.q[i].first != (void *)8) return 1 + i;
+    if (tbl.len != 1 || tbl.d[0] != 0 || tbl.d[1] != 2.5 || tbl.d[2] != 2.5) return 5;
+    if (tp.q[0].first || tp.q[1].first != &anchor || tp.q[2].first != &anchor || tp.q[3].first)
+        return 6;
+    int n = 3;
+    void *p = &n;
+    struct t l = { .len = n, .q[1 ... 3] = { p }, .d[0 ... 1] = n * 0.5 };
+    if (l.q[0].first || l.q[1].first != p || l.q[3].first != p) return 7;
+    if (l.d[0] != 1.5 || l.d[1] != 1.5 || l.d[2] != 0) return 8;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("index_range_after_field_braced", code);
 }
 
 // Kept separate: the only test run at exactly -O0 and -O2 (no matrix level).

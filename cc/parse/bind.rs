@@ -613,6 +613,8 @@ impl Parser<'_> {
             Self::drop_ifunc(&mut symbol_attrs, pos);
             // Already warned about as a function's attribute.
             symbol_attrs.call_diagnostics = Default::default();
+            symbol_attrs.alloc_size = None;
+            symbol_attrs.access.clear();
         }
         if is_typedef {
             self.drop_symbol_attrs(&mut symbol_attrs, name, pos, true);

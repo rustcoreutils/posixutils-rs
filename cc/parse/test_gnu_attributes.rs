@@ -193,3 +193,30 @@ fn test_error_and_warning_attributes_reach_the_function() {
     assert!(got[3].function.is_some());
     assert_eq!(diags(4), ("v", None, None));
 }
+
+/// `alloc_size` and a sized `access` reach the function, their parameter
+/// numbers counted from 0; a definition takes those of the declarations
+/// before it; an `access` with no size, one of an unknown mode, and either
+/// attribute on an object say nothing.
+#[test]
+fn test_alloc_size_and_access_reach_the_function() {
+    use crate::parse::ast::{AccessSize, AllocSize};
+    let got = declared(
+        "void *m(unsigned long) __attribute__((alloc_size(1)));\n\
+         void *c(int, unsigned long, unsigned long) __attribute__((__alloc_size__(2, 3)));\n\
+         int f(const char *, unsigned long, char *) __attribute__((access(read_only, 1, 2), access(write_only, 3)));\n\
+         int f(const char *p, unsigned long n, char *q) { return 0; }\n\
+         int g(char *, int) __attribute__((access(bogus, 1, 2)));\n\
+         int v __attribute__((alloc_size(1)));\n",
+    );
+    let attrs = |i: usize| (got[i].symbol.alloc_size, got[i].symbol.access.clone());
+    let one = |size, count| Some(AllocSize { size, count });
+    assert_eq!(attrs(0), (one(0, None), vec![]));
+    assert_eq!(attrs(1), (one(1, Some(2)), vec![]));
+    let sized = vec![AccessSize { ptr: 0, size: 1 }];
+    assert_eq!(attrs(2), (None, sized.clone()));
+    assert_eq!(attrs(3), (None, sized));
+    assert!(got[3].function.is_some());
+    assert_eq!(attrs(4), (None, vec![]));
+    assert_eq!(attrs(5), (None, vec![]));
+}

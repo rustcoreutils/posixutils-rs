@@ -663,6 +663,8 @@ impl AttributeList {
                 "tls_model" => {
                     out.tls_model = text(attr).and_then(|m| crate::target::TlsModel::from_name(&m))
                 }
+                "alloc_size" => out.alloc_size = alloc_size(&attr.args),
+                "access" => out.access.extend(access_size(&attr.args)),
                 _ => {}
             }
         }
@@ -687,6 +689,50 @@ impl AttributeList {
         }
         None
     }
+}
+
+/// A parameter number an attribute names, counting from 1, as an index
+/// counting from 0.
+fn param_index(arg: &AttributeArg) -> Option<usize> {
+    match arg {
+        AttributeArg::Int(n) => usize::try_from(*n).ok()?.checked_sub(1),
+        _ => None,
+    }
+}
+
+/// `alloc_size(i)` or `alloc_size(i, j)`. Whether the parameters are
+/// integers is asked where a call is read, which knows the arguments.
+fn alloc_size(args: &[AttributeArg]) -> Option<crate::parse::ast::AllocSize> {
+    use crate::parse::ast::AllocSize;
+    match args {
+        [size] => Some(AllocSize {
+            size: param_index(size)?,
+            count: None,
+        }),
+        [size, count] => Some(AllocSize {
+            size: param_index(size)?,
+            count: Some(param_index(count)?),
+        }),
+        _ => None,
+    }
+}
+
+/// `access(mode, ref, size)`, when it names a size: the bare
+/// `access(mode, ref)` says nothing of one.
+fn access_size(args: &[AttributeArg]) -> Option<crate::parse::ast::AccessSize> {
+    let [AttributeArg::Ident(mode), ptr, size] = args else {
+        return None;
+    };
+    if !matches!(
+        mode.as_str(),
+        "read_only" | "write_only" | "read_write" | "none"
+    ) {
+        return None;
+    }
+    Some(crate::parse::ast::AccessSize {
+        ptr: param_index(ptr)?,
+        size: param_index(size)?,
+    })
 }
 
 /// What gcc's `mode` attribute makes of a machine mode name, on the target

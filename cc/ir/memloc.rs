@@ -144,6 +144,11 @@ impl AddrMap {
         func.blocks.get(b)?.insns.get(i)
     }
 
+    /// Where the one instruction defining `id` is, if this function has it.
+    pub(crate) fn def_site(&self, id: PseudoId) -> Option<(usize, usize)> {
+        self.defs.get(&id).copied()
+    }
+
     /// The width and type of the value `id` holds: what its defining
     /// instruction produces, or for an incoming scalar argument, the type
     /// its parameter is passed as.

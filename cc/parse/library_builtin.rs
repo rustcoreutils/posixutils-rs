@@ -437,6 +437,11 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         known(kw::PUTCHAR,           Int,          &[Int],                                     FIXED,    L::Putchar),
         known(kw::FPUTC,             Int,          &[Int, ObjPtr],                             FIXED,    L::Fputc),
         known(kw::FWRITE,            SizeT,        &[ConstVoidPtr, SizeT, SizeT, ObjPtr],      FIXED,    L::Fwrite),
+        known(kw::STRDUP,            CharPtr,      &[ConstCharPtr],                            FIXED,    L::Strdup),
+        known(kw::STRNDUP,           CharPtr,      &[ConstCharPtr, SizeT],                     FIXED,    L::Strndup),
+        known(kw::MALLOC,            VoidPtr,      &[SizeT],                                   FIXED,    L::Malloc),
+        known(kw::CALLOC,            VoidPtr,      &[SizeT, SizeT],                            FIXED,    L::Calloc),
+        known(kw::REALLOC,           VoidPtr,      &[VoidPtr, SizeT],                          FIXED,    L::Realloc),
         //    name               returns           parameters                                   `...`
         plain(kw::CBRT,             Double,            &[Double],                FIXED),
         plain(kw::CBRTF,            Float,             &[Float],                 FIXED),
@@ -744,16 +749,11 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         plain(kw::BCMP,             Int,               &[ConstVoidPtr, ConstVoidPtr, SizeT], FIXED),
         plain(kw::BZERO,            Void,              &[VoidPtr, SizeT],        FIXED),
         plain(kw::STPNCPY,          CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
-        plain(kw::STRDUP,           CharPtr,           &[ConstCharPtr],          FIXED),
-        plain(kw::STRNDUP,          CharPtr,           &[ConstCharPtr, SizeT],   FIXED),
         plain(kw::STRCASECMP,       Int,               &[ConstCharPtr, ConstCharPtr], FIXED),
         plain(kw::STRNCASECMP,      Int,               &[ConstCharPtr, ConstCharPtr, SizeT], FIXED),
         plain(kw::STRSPN,           SizeT,             &[ConstCharPtr, ConstCharPtr], FIXED),
         plain(kw::ABORT,            Void,              &[],                      FIXED),
         plain(kw::EXIT,             Void,              &[Int],                   FIXED),
-        plain(kw::MALLOC,           VoidPtr,           &[SizeT],                 FIXED),
-        plain(kw::CALLOC,           VoidPtr,           &[SizeT, SizeT],          FIXED),
-        plain(kw::REALLOC,          VoidPtr,           &[VoidPtr, SizeT],        FIXED),
         plain(kw::FREE,             Void,              &[VoidPtr],               FIXED),
         plain(kw::ALLOCA,           VoidPtr,           &[SizeT],                 FIXED),
     ]
@@ -1191,9 +1191,10 @@ mod tests {
             K::Output,
             K::ComplexArith,
             K::Fortified,
+            K::Allocation,
         ]
         .map(count);
-        assert_eq!(sizes, [11, 6, 16, 2, 14]);
+        assert_eq!(sizes, [11, 6, 16, 2, 14, 5]);
         assert_eq!(sizes.iter().sum::<usize>(), all.len());
     }
 

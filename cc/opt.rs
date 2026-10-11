@@ -26,7 +26,7 @@ use crate::ir::loadfwd;
 use crate::ir::mem2reg::mem2reg;
 use crate::ir::memexpand;
 use crate::ir::memloc;
-use crate::ir::objsize::{self, ObjectSizes, Settle};
+use crate::ir::objsize::{self, ObjectSizes, Scope, Settle};
 use crate::ir::sccp;
 use crate::ir::vrp;
 use crate::ir::{Function, Module, Opcode};
@@ -202,7 +202,13 @@ const PASSES: [Pass; 13] = [
     // `libcall_fold` sees the size a `_chk` call checks against. One whose
     // object is still unknown waits for the end: see `optimize_function`.
     ("objsize", |f, c| {
-        objsize::run(f, c.types, c.sizes, Settle::Known)
+        objsize::run(
+            f,
+            c.types,
+            c.sizes,
+            Scope::Optimizing(c.fold),
+            Settle::Known,
+        )
     }),
     // `sccp` proves branches dead, which `instcombine` cannot, and leaves
     // behind `Copy` from a constant -- exactly the shape `instcombine`'s
@@ -643,6 +649,12 @@ pub fn optimize_module(
     let report = if opt.optimizes() {
         optimize_functions(module, types, target, MAX_ITERATIONS)
     } else {
+        // gcc answers `__builtin_dynamic_object_size` of a fixed-size
+        // object at a run-time offset even unoptimized.
+        let sizes = ObjectSizes::build(module, types);
+        for func in &mut module.functions {
+            objsize::run(func, types, &sizes, Scope::Unoptimized, Settle::Everything);
+        }
         OptReport::default()
     };
 
@@ -780,7 +792,8 @@ fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) 
         still_changing: Vec::new(),
     };
     run_passes(func, ctx, max_iterations, &mut c);
-    if objsize::run(func, ctx.types, ctx.sizes, Settle::Everything) {
+    let scope = Scope::Optimizing(ctx.fold);
+    if objsize::run(func, ctx.types, ctx.sizes, scope, Settle::Everything) {
         run_passes(func, ctx, max_iterations, &mut c);
     }
     c

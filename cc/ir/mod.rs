@@ -462,14 +462,17 @@ pub enum Opcode {
     /// `ir::lower` to 0 otherwise -- which is every case at `-O0`, where
     /// the optimizer does not run at all.
     ConstantP,
-    /// `__builtin_object_size(src[0], type)`, deferred until inlining and
-    /// propagation have shown what object `src[0]` points into.
+    /// `__builtin_object_size(src[0], type)`, or the dynamic form, deferred
+    /// until inlining and propagation have shown what object `src[0]`
+    /// points into.
     ///
     /// Answered by `ir::objsize` -- the moment its object is known, and
-    /// with the unknown object's answer once the optimizer has converged --
-    /// and by `ir::lower` with the unknown object's answer for anything
-    /// left. The parser answers at `-O0`, so no `-O0` function has one.
-    ObjectSize(crate::parse::ast::ObjectSizeType),
+    /// with the unknown object's answer, or for the dynamic form a size
+    /// computed at run time, once the optimizer has converged -- and by
+    /// `ir::lower` with the unknown object's answer for anything left. The
+    /// parser answers the static form at `-O0`, so there only the dynamic
+    /// form has one.
+    ObjectSize(ObjectSizeQuery),
 
     // Byte-swapping builtins
     Bswap16, // Byte-swap 16-bit value
@@ -826,6 +829,41 @@ impl SimdOp {
             SimdOp::CvtUF => "vcvt_uf",
             SimdOp::CvtFS => "vcvt_fs",
             SimdOp::CvtFU => "vcvt_fu",
+        }
+    }
+}
+
+/// What an `ObjectSize` placeholder asks: the builtin's type and which
+/// builtin it is, in one byte, which keeps an [`Opcode`] two bytes wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectSizeQuery(u8);
+
+impl ObjectSizeQuery {
+    /// Bit 2: the dynamic form; bits 0 and 1 are the type's.
+    const DYNAMIC: u8 = 4;
+
+    pub const fn new(
+        otype: crate::parse::ast::ObjectSizeType,
+        form: crate::parse::ast::ObjectSizeForm,
+    ) -> Self {
+        let form = match form {
+            crate::parse::ast::ObjectSizeForm::Static => 0,
+            crate::parse::ast::ObjectSizeForm::Dynamic => Self::DYNAMIC,
+        };
+        ObjectSizeQuery(otype.subobject as u8 | (otype.minimum as u8) << 1 | form)
+    }
+
+    /// The builtin's second argument.
+    pub fn otype(self) -> crate::parse::ast::ObjectSizeType {
+        crate::parse::ast::ObjectSizeType::from_bits(u64::from(self.0 & 3))
+    }
+
+    /// Which of the two builtins asked.
+    pub fn form(self) -> crate::parse::ast::ObjectSizeForm {
+        if self.0 & Self::DYNAMIC != 0 {
+            crate::parse::ast::ObjectSizeForm::Dynamic
+        } else {
+            crate::parse::ast::ObjectSizeForm::Static
         }
     }
 }
@@ -1294,10 +1332,38 @@ macro_rules! every_opcode {
                 Opcode::Simd(SimdOp::CvtUF),
                 Opcode::Simd(SimdOp::CvtFS),
                 Opcode::Simd(SimdOp::CvtFU),
-                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(0)),
-                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(1)),
-                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(2)),
-                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(3)),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(0),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(1),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(2),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(3),
+                    crate::parse::ast::ObjectSizeForm::Static,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(0),
+                    crate::parse::ast::ObjectSizeForm::Dynamic,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(1),
+                    crate::parse::ast::ObjectSizeForm::Dynamic,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(2),
+                    crate::parse::ast::ObjectSizeForm::Dynamic,
+                )),
+                Opcode::ObjectSize(ObjectSizeQuery::new(
+                    crate::parse::ast::ObjectSizeType::from_bits(3),
+                    crate::parse::ast::ObjectSizeForm::Dynamic,
+                )),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.

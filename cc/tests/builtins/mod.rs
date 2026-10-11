@@ -21,6 +21,7 @@ mod bit_ops;
 mod call_semantics;
 mod constant_p;
 mod copy_fold;
+mod dynamic_object_size;
 mod float_n_math;
 mod fortify;
 mod frame_address;

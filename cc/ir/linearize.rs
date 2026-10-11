@@ -7242,7 +7242,7 @@ impl<'a> Linearizer<'a> {
             // argument: gcc answers one with side effects as an unknown
             // object at once, and a computation without is dead once the
             // placeholder is answered.
-            ExprKind::ObjectSize { ptr, otype } => {
+            ExprKind::ObjectSize { ptr, otype, form } => {
                 let size_t = self.types.ulong_id;
                 if !self.is_discardable(ptr) {
                     return self.emit_const(super::objsize::size_constant(otype.unknown()), size_t);
@@ -7250,10 +7250,12 @@ impl<'a> Linearizer<'a> {
                 let operand = self.linearize_expr(ptr);
                 let result = self.alloc_reg_pseudo();
                 self.emit(
-                    Instruction::new(Opcode::ObjectSize(*otype))
-                        .with_target(result)
-                        .with_src(operand)
-                        .with_type_and_size(size_t, self.types.size_bits(size_t)),
+                    Instruction::new(Opcode::ObjectSize(super::ObjectSizeQuery::new(
+                        *otype, *form,
+                    )))
+                    .with_target(result)
+                    .with_src(operand)
+                    .with_type_and_size(size_t, self.types.size_bits(size_t)),
                 );
                 result
             }

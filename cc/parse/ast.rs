@@ -172,6 +172,37 @@ impl ObjectSizeType {
     }
 }
 
+/// Which of the two object-size builtins asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectSizeForm {
+    /// `__builtin_object_size`: a constant, or the unknown answer.
+    Static,
+    /// `__builtin_dynamic_object_size`: also a size known only at run time
+    /// -- `malloc(n)` is `n` bytes -- computed where the builtin is.
+    Dynamic,
+}
+
+/// `alloc_size(i)` or `alloc_size(i, j)`, and what gcc knows of `malloc`,
+/// `calloc` and `realloc`: a call returns a pointer to an object of as many
+/// bytes as an argument says, or as the product of two. Indices count from
+/// 0, where the attribute counts from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocSize {
+    /// The argument holding the size, or the element size of a product.
+    pub size: usize,
+    /// The argument holding the element count, for a product.
+    pub count: Option<usize>,
+}
+
+/// `access(mode, ref, size)`: the pointer parameter `ptr` points to an
+/// object of at least as many elements of its pointee type as parameter
+/// `size` holds. Indices count from 0, where the attribute counts from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessSize {
+    pub ptr: usize,
+    pub size: usize,
+}
+
 /// A library function whose call stays a call, but whose result the
 /// optimizer may know from its arguments (C17 7.1.4p1): `strlen("abc")` is 3,
 /// `strchr(s, 0)` is `s + strlen(s)`.
@@ -219,6 +250,11 @@ pub enum LibFn {
     Putchar,
     Fputc,
     Fwrite,
+    Malloc,
+    Calloc,
+    Realloc,
+    Strdup,
+    Strndup,
     /// libgcc's `__mul?c3`, which a floating complex `*` calls, for the
     /// format its arguments are in. No program names it: the linearizer
     /// makes the call (`emit_complex_float_muldiv`), so it has no row in the
@@ -263,6 +299,9 @@ pub enum LibFamily {
     /// A `_chk` function that checks a write against the size of the object
     /// written to, and is the plain function where the write provably fits.
     Fortified,
+    /// A function that returns a new object, whose size
+    /// `__builtin_dynamic_object_size` knows from the arguments.
+    Allocation,
 }
 
 impl LibFn {
@@ -315,6 +354,7 @@ impl LibFn {
             | L::SnprintfChk
             | L::VsprintfChk
             | L::VsnprintfChk => LibFamily::Fortified,
+            L::Malloc | L::Calloc | L::Realloc | L::Strdup | L::Strndup => LibFamily::Allocation,
         }
     }
 
@@ -322,6 +362,18 @@ impl LibFn {
     /// leaves every object as it found it.
     pub fn only_reads(self) -> bool {
         self.family() == LibFamily::StringQuery
+    }
+
+    /// The `alloc_size` the function has whatever its declaration says, as
+    /// gcc knows it: `malloc(n)`, `calloc(n, m)`, `realloc(p, n)`.
+    pub fn alloc_size(self) -> Option<AllocSize> {
+        let (size, count) = match self {
+            LibFn::Malloc => (0, None),
+            LibFn::Calloc => (0, Some(1)),
+            LibFn::Realloc => (1, None),
+            _ => return None,
+        };
+        Some(AllocSize { size, count })
     }
 
     /// The function's name in C, which a call an optimizer pass makes to it
@@ -363,6 +415,11 @@ impl LibFn {
             L::Putchar => "putchar",
             L::Fputc => "fputc",
             L::Fwrite => "fwrite",
+            L::Malloc => "malloc",
+            L::Calloc => "calloc",
+            L::Realloc => "realloc",
+            L::Strdup => "strdup",
+            L::Strndup => "strndup",
             L::MemcpyChk => "__memcpy_chk",
             L::MempcpyChk => "__mempcpy_chk",
             L::MemmoveChk => "__memmove_chk",
@@ -1059,9 +1116,14 @@ pub enum ExprKind {
     /// answers it after inlining and propagation, at `-O1` and above, so it
     /// is deferred to `ir::objsize`; at `-O0` the parser answers it
     /// [`ObjectSizeType::unknown`] at once, as gcc does.
+    ///
+    /// `__builtin_dynamic_object_size` is deferred at every level: at `-O0`
+    /// gcc still answers a fixed-size object at a run-time offset, which only
+    /// the IR shows.
     ObjectSize {
         ptr: Box<Expr>,
         otype: ObjectSizeType,
+        form: ObjectSizeForm,
     },
 
     /// __builtin_va_copy(dest, src)
@@ -2850,6 +2912,14 @@ pub struct SymbolAttrs {
     /// it names, marked `SHF_GNU_RETAIN` so `ld --gc-sections` keeps it.
     /// ELF only.
     pub retain: bool,
+    /// `alloc_size(...)`: how big the object a call returns is, which
+    /// `__builtin_dynamic_object_size` answers (`ir::objsize`). Carried with
+    /// the symbol's attributes for the reason `call_diagnostics` is.
+    pub alloc_size: Option<AllocSize>,
+    /// `access(mode, ref, size)` with a size: how big the objects the
+    /// function's pointer parameters point to are, which
+    /// `__builtin_dynamic_object_size` answers inside it.
+    pub access: Vec<AccessSize>,
 }
 
 /// The messages gcc's `error` and `warning` function attributes attach to
@@ -2924,6 +2994,14 @@ impl SymbolAttrs {
             self.tls_model = other.tls_model;
         }
         self.retain |= other.retain;
+        if other.alloc_size.is_some() {
+            self.alloc_size = other.alloc_size;
+        }
+        for &a in &other.access {
+            if !self.access.contains(&a) {
+                self.access.push(a);
+            }
+        }
     }
 }
 

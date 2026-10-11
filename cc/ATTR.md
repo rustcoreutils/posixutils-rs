@@ -136,6 +136,8 @@ The arguments of an unrecognised attribute are skipped without being parsed.
 | `zero_call_used_regs("choice")` | Functions (x86-64) | The function's own `-fzero-call-used-regs=`, over the option: `skip` takes it out. Not an attribute on aarch64, where c17 has no `-fzero-call-used-regs=` either |
 | `no_caller_saved_registers` | Functions (x86-64) | The function preserves every general register it changes: besides the callee-saved ones it uses, it saves and restores every call-clobbered one but those its value is returned in (`X86_64CodeGen::call_clobbered_to_preserve`) -- all of them, where gcc saves only those it or its callees use, which preserves the same registers. gcc saves no SSE register for one and so compiles none while SSE is on: "sorry, unimplemented: SSE instructions aren't allowed in a function with the 'no_caller_saved_registers' attribute", unless `-mgeneral-regs-only` or `-mno-sse`. A caller does not rely on the registers it preserves. Not an attribute on aarch64. The Linux kernel's `__no_caller_saved_registers` |
 | `uninitialized` | Automatic variables | `-ftrivial-auto-var-init=` leaves the variable as C does, uninitialized |
+| `alloc_size(i[, j])` | Functions | The object a direct call returns is as many bytes as argument `i` says, or as the product of arguments `i` and `j`, which `__builtin_dynamic_object_size` answers once optimizing (`ir::objsize`); gcc knows the same of `malloc`, `calloc` and `realloc` without it. Written on any declaration of the name, as `error` is (`SymbolAttrs::alloc_size`). A call through a pointer learns nothing. An index past the arguments, or naming one that is no integer, says nothing |
+| `access(mode, ref, size)` | Functions | With a size, the pointer parameter `ref` points to at least as many elements of its pointee type (bytes for `void`) as parameter `size` holds, which `__builtin_dynamic_object_size` of the parameter answers inside the function once optimizing. Every mode (`read_only`, `write_only`, `read_write`, `none`) alike; without a size it does nothing (`SymbolAttrs::access`) |
 
 ### `noreturn` spellings
 
@@ -159,8 +161,8 @@ the result of a correct program. glibc puts most of them on every declaration.
 `unused`, `deprecated`, `hot`, `cold`, `warn_unused_result`, `format`,
 `format_arg` (glibc's `__attribute_format_arg__` on `gettext`),
 `nonstring`, `malloc`, `sentinel`, `nonnull`,
-`returns_nonnull`, `access`, `externally_visible`,
-`weakref`, `simd`, `regparm` (x86-64 only, as in gcc), `leaf`, `alloc_size`,
+`returns_nonnull`, `externally_visible`,
+`weakref`, `simd`, `regparm` (x86-64 only, as in gcc), `leaf`,
 `alloc_align`, `assume_aligned` (the Linux kernel's `__assume_aligned`),
 `noclone`, `copy`, `designated_init`, `may_alias`, `artificial`,
 `no_sanitize`, `no_sanitize_address`, `no_sanitize_thread`,

@@ -348,3 +348,104 @@ int main(void) {
 fn normal_exits_are_unchanged_under_fexceptions() {
     run_everywhere("eh_normal_exits", crate::misc::cleanup_attr::CLEANUP);
 }
+
+/// An unwind out of a frame that keeps doubles in d8-d15 hands the frame it
+/// lands in back its own d8-d15, read from where the inner frame saved them
+/// by its `.cfi_offset` rules: `middle` overwrites them with values of its
+/// own across its call, and the cleanup run in `outer`'s landing pad finds
+/// exactly what `middle` found on entry. Rules naming the wrong slots -- d8
+/// and d9 swapped -- fail it at -O0 and -O2. On x86-64, where System V saves
+/// no XMM register, it is an unwind through FP-heavy frames.
+#[test]
+fn forced_unwind_restores_d8_to_d15() {
+    let src = r#"
+#include <setjmp.h>
+
+struct _Unwind_Exception {
+    unsigned long exception_class;
+    void (*exception_cleanup)(int, struct _Unwind_Exception *);
+    unsigned long private_1, private_2;
+} __attribute__((__aligned__));
+typedef int (*stop_fn)(int, int, unsigned long, struct _Unwind_Exception *,
+                       void *, void *);
+extern int _Unwind_ForcedUnwind(struct _Unwind_Exception *, stop_fn, void *);
+
+static jmp_buf back;
+static struct _Unwind_Exception exc;
+static int found, ran;
+volatile double vsink;
+
+#ifdef __aarch64__
+#define READ_D(d)                                         \
+    do {                                                  \
+        __asm__ volatile("fmov %0, d8" : "=r"((d)[0]));   \
+        __asm__ volatile("fmov %0, d9" : "=r"((d)[1]));   \
+        __asm__ volatile("fmov %0, d10" : "=r"((d)[2]));  \
+        __asm__ volatile("fmov %0, d11" : "=r"((d)[3]));  \
+        __asm__ volatile("fmov %0, d12" : "=r"((d)[4]));  \
+        __asm__ volatile("fmov %0, d13" : "=r"((d)[5]));  \
+        __asm__ volatile("fmov %0, d14" : "=r"((d)[6]));  \
+        __asm__ volatile("fmov %0, d15" : "=r"((d)[7]));  \
+    } while (0)
+#else
+#define READ_D(d) ((void)(d))
+#endif
+
+static unsigned long before[8];
+
+/* Run in outer()'s landing pad, with the registers the unwinder restored
+   for outer() from middle()'s saves: d8-d15 as outer() had them at the
+   call. */
+__attribute__((noinline)) static void cl(int *p) {
+    unsigned long d[8] = {0};
+    READ_D(d);
+    ran += *p;
+    found = 1;
+    for (int i = 0; i < 8; i++)
+        if (d[i] != before[i])
+            found = 0;
+}
+
+static int stop(int version, int actions, unsigned long cls,
+                struct _Unwind_Exception *e, void *ctx, void *param) {
+    (void)version; (void)cls; (void)e; (void)ctx; (void)param;
+    if (ran || (actions & 16 /* _UA_END_OF_STACK */))
+        longjmp(back, 1);
+    return 0;
+}
+
+__attribute__((noinline)) static void thrower(int k) {
+    exc.exception_class = 0x43313700;
+    if (k)
+        _Unwind_ForcedUnwind(&exc, stop, 0);
+}
+
+/* Its own doubles live across the call in d8 and up, over outer()'s: what
+   it finds there on entry is what the unwinder must give outer() back. */
+__attribute__((noinline)) static double middle(double a, int k) {
+    READ_D(before);
+    double p = a * 3.0, q = a * 5.0, r = a * 7.0, s = a * 11.0;
+    thrower(k);
+    return p + q + r + s;
+}
+
+__attribute__((noinline)) static int outer(double x, int k) {
+    int c __attribute__((cleanup(cl))) = 1;
+    double keep = x * 1.25;
+    vsink = middle(x, k);
+    return keep == x * 1.25 ? c - 1 : 9;
+}
+
+int main(void) {
+    if (outer(2.0, 0) != 0 || ran != 1)
+        return 2;
+    ran = 0;
+    if (setjmp(back) == 0) {
+        outer(2.0, 1);
+        return 3;
+    }
+    return ran == 1 && found ? 0 : 1;
+}
+"#;
+    run_everywhere("eh_restores_d8", src);
+}

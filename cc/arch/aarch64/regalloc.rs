@@ -42,8 +42,8 @@
 use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::arch::asm_constraints::{operand_pins, AsmRegClass, PinnedGp};
 use crate::arch::regalloc::{
-    asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
-    identify_fp_pseudos, ConstraintPoint, Crossing, LiveInterval, LivenessResult, SlotShape,
+    asm_clobbered, compute_live_intervals, find_call_positions, identify_fp_pseudos,
+    ConstraintPoint, Crossing, LiveInterval, LivenessResult, SlotShape,
 };
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -1274,9 +1274,11 @@ struct Clobbering {
     crossings: HashMap<usize, Crossing>,
     /// The calls' positions.
     calls: Vec<usize>,
-    /// The positions that end every FP value live across them: the calls,
-    /// and each inline asm that clobbers a V register.
-    fp_calls: Vec<usize>,
+    /// The calls that return twice ([`Instruction::returns_twice`]): control
+    /// comes back to them with no register restored but the frame's.
+    returns_twice: HashSet<usize>,
+    /// Each inline asm that clobbers a V register, with the ones it names.
+    fp_asms: Vec<(usize, Vec<VReg>)>,
     /// The constraint points that clobber a register a value may be in, or
     /// an argument arrives in: the others clobber only codegen scratch.
     points: Vec<ConstraintPoint<Reg>>,
@@ -1287,7 +1289,6 @@ impl Clobbering {
         func: &Function,
         live_out: &[HashSet<PseudoId>],
         calls: &[usize],
-        fp_calls: Vec<usize>,
         constraint_points: &[ConstraintPoint<Reg>],
         allocatable: &[Reg],
     ) -> Self {
@@ -1300,13 +1301,26 @@ impl Clobbering {
             })
             .cloned()
             .collect();
+        let insns: Vec<&Instruction> = func.blocks.iter().flat_map(|b| &b.insns).collect();
+        let returns_twice = calls
+            .iter()
+            .copied()
+            .filter(|&pos| insns[pos].returns_twice())
+            .collect();
+        let fp_asms: Vec<(usize, Vec<VReg>)> = insns
+            .iter()
+            .enumerate()
+            .map(|(pos, insn)| (pos, asm_clobbered(insn, parse_fp_clobber_name)))
+            .filter(|(_, regs)| !regs.is_empty())
+            .collect();
         let mut positions: std::collections::BTreeSet<usize> = calls.iter().copied().collect();
-        positions.extend(&fp_calls);
+        positions.extend(fp_asms.iter().map(|&(pos, _)| pos));
         positions.extend(points.iter().map(|cp| cp.position));
         Self {
             crossings: crate::arch::regalloc::crossings(func, live_out, &positions),
             calls: calls.to_vec(),
-            fp_calls,
+            returns_twice,
+            fp_asms,
             points,
         }
     }
@@ -1319,15 +1333,91 @@ impl Clobbering {
             .collect()
     }
 
-    /// Every pseudo that crosses an instruction ending the FP values live
-    /// across it, an argument and an asm's output included
-    /// ([`Crossing::bank_crossers`]).
-    fn fp_call_crossers(&self) -> HashSet<PseudoId> {
-        self.fp_calls
+    /// The V registers each of `candidates` may not take.
+    ///
+    /// Where it is live across a call, every caller-saved one: AAPCS64
+    /// preserves V8-V15 only. And only their low 64 bits (§6.1.2), so a value
+    /// wider than that -- not in `narrow` -- may take no V register at all;
+    /// nor may anything a call that returns twice touches, which comes back
+    /// with none of them restored
+    /// ([`crate::arch::regalloc::returns_twice_constraint`]).
+    ///
+    /// Where it is only an argument of the call, V0-V7: the call's lowering
+    /// moves its arguments into them one by one, and would overwrite one
+    /// waiting in a later argument's register. Any other register keeps it
+    /// until it is read, and it is dead after.
+    ///
+    /// Where it crosses an inline asm ([`Crossing::bank_crossers`]), the V
+    /// registers the asm's clobber list names.
+    fn vreg_forbidden(
+        &self,
+        candidates: &std::collections::BTreeSet<PseudoId>,
+        narrow: &HashSet<PseudoId>,
+    ) -> BTreeMap<PseudoId, std::collections::BTreeSet<VReg>> {
+        let every: &[VReg] = VReg::allocatable();
+        let caller_saved: Vec<VReg> = every
             .iter()
-            .flat_map(|pos| self.crossings[pos].bank_crossers())
-            .collect()
+            .copied()
+            .filter(|v| !v.is_callee_saved())
+            .collect();
+        let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<VReg>> = BTreeMap::new();
+        for pos in &self.calls {
+            let crossing = &self.crossings[pos];
+            let resumes_bare = self.returns_twice.contains(pos);
+            let across = crossing.across.iter().map(|&p| (p, true));
+            let args = crossing.uses.iter().map(|&p| (p, false));
+            for (p, live_across) in across.chain(args) {
+                if !candidates.contains(&p) {
+                    continue;
+                }
+                let regs: &[VReg] = if resumes_bare || (live_across && !narrow.contains(&p)) {
+                    every
+                } else if live_across {
+                    &caller_saved
+                } else {
+                    VReg::arg_regs()
+                };
+                forbidden.entry(p).or_default().extend(regs);
+            }
+        }
+        for (pos, regs) in &self.fp_asms {
+            for p in self.crossings[pos].bank_crossers() {
+                if candidates.contains(&p) {
+                    forbidden.entry(p).or_default().extend(regs);
+                }
+            }
+        }
+        forbidden
     }
+}
+
+/// The floating-point and vector values known to fit the low 64 bits of a V
+/// register: by their first def's width, an asm output's, or a parameter's
+/// type. Any other may be wider -- a binary128 `long double`, a 128-bit
+/// vector -- and loses its high half in V8-V15 across a call.
+fn narrow_v_values(func: &Function, types: &TypeTable) -> HashSet<PseudoId> {
+    let mut narrow: HashSet<PseudoId> = HashSet::new();
+    let mut seen: HashSet<PseudoId> = HashSet::new();
+    for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+        if let Some(t) = insn.target {
+            if seen.insert(t) && insn.size > 0 && insn.size <= 64 {
+                narrow.insert(t);
+            }
+        }
+        if let Some(asm) = insn.extra().asm_data.as_deref() {
+            for out in asm.outputs.iter().filter(|o| !o.is_memory()) {
+                if seen.insert(out.pseudo) && out.size > 0 && out.size <= 64 {
+                    narrow.insert(out.pseudo);
+                }
+            }
+        }
+    }
+    for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
+        if types.size_bits(t) <= 64 {
+            narrow.insert(p);
+        }
+    }
+    narrow
 }
 
 /// Bytes a spilled floating-point pseudo needs on the stack.
@@ -1465,6 +1555,9 @@ pub struct RegAlloc {
     used_callee_saved_fp: Vec<VReg>,
     /// Set of pseudos that need FP registers (determined by analyzing the IR)
     fp_pseudos: HashSet<PseudoId>,
+    /// The values that fit the low half of a V register
+    /// ([`narrow_v_values`]): the only ones V8-V15 keep across a call.
+    narrow_v: HashSet<PseudoId>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
     /// The pseudos that live in a frame slot, with the slot each needs:
@@ -1520,6 +1613,7 @@ impl RegAlloc {
             used_callee_saved: Vec::new(),
             used_callee_saved_fp: Vec::new(),
             fp_pseudos: HashSet::new(),
+            narrow_v: HashSet::new(),
             spilled_args: Vec::new(),
             stack_homed: BTreeMap::new(),
             live_in: Vec::new(),
@@ -1616,27 +1710,23 @@ impl RegAlloc {
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_aarch64);
-        // An inline asm that clobbers a SIMD/FP register ends every FP value
-        // live across it, as a call does: the clobber list is all the
-        // allocator knows of what the template writes.
-        let fp_call_positions = find_insn_positions(func, |insn| {
-            is_call_like_aarch64(insn.op) || !asm_clobbered(insn, parse_fp_clobber_name).is_empty()
-        });
-
         let clobbering = Clobbering::of(
             func,
             &self.live_out,
             &call_positions,
-            fp_call_positions,
             &constraint_points,
             &self.allocatable_regs(),
         );
+        self.narrow_v = narrow_v_values(func, types);
 
         self.spill_args_across_calls(func, types, &intervals, &clobbering);
         self.allocate_alloca_to_stack(func);
         self.place_locals(func, types, &intervals, rest);
         self.run_chordal_color(func, types, intervals, &clobbering);
         self.place_stack_slots(func);
+        // In register order, so the prologue saves them in pairs as gcc
+        // does: `stp d8, d9`.
+        self.used_callee_saved_fp.sort();
         if cfg!(debug_assertions) {
             self.verify(func, types, &constraint_points, &call_positions);
         }
@@ -1651,6 +1741,7 @@ impl RegAlloc {
         self.used_callee_saved.clear();
         self.used_callee_saved_fp.clear();
         self.fp_pseudos.clear();
+        self.narrow_v.clear();
         self.spilled_args.clear();
         self.stack_homed.clear();
         self.live_in.clear();
@@ -1730,7 +1821,8 @@ impl RegAlloc {
     /// is overwritten while the argument is live: a general register by the
     /// rule every value is colored by ([`RegAlloc::gp_forbidden`]) -- a call
     /// it crosses, or a constraint point that clobbers it -- and a V register
-    /// when it crosses a call.
+    /// by [`Clobbering::vreg_forbidden`]: a call it crosses, or an asm that
+    /// clobbers it.
     fn spill_args_across_calls(
         &mut self,
         func: &Function,
@@ -1751,13 +1843,30 @@ impl RegAlloc {
             forbidden.get(&p).is_some_and(|regs| regs.contains(&reg))
         });
 
-        // Check FP arguments in caller-saved registers (v0-v7)
+        // A V argument whose register is overwritten while it is live: a
+        // scalar one is colored afresh with the other V values -- into V8-V15
+        // across a call, or a slot -- and the prologue moves it there
+        // (`store_args_to_stack`); one arriving in several registers, an HFA
+        // or a complex, is stored to a slot.
         let fp_arg_regs_set = VReg::arg_regs();
         let lowering = crate::arch::regalloc::AbiLowering::new(func);
-        let crossers = clobbering.fp_call_crossers();
+        let v_args: std::collections::BTreeSet<PseudoId> = self
+            .locations
+            .iter()
+            .filter(|(_, loc)| matches!(loc, Loc::VReg(r) if fp_arg_regs_set.contains(r)))
+            .map(|(&p, _)| p)
+            .collect();
+        let forbidden = clobbering.vreg_forbidden(&v_args, &self.narrow_v);
         for interval in intervals {
             if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
-                if fp_arg_regs_set.contains(reg) && crossers.contains(&interval.pseudo) {
+                let overwritten = forbidden
+                    .get(&interval.pseudo)
+                    .is_some_and(|regs| regs.contains(reg));
+                if fp_arg_regs_set.contains(reg) && overwritten {
+                    if self.arg_span.get(&interval.pseudo).copied().unwrap_or(1) == 1 {
+                        self.locations.remove(&interval.pseudo);
+                        continue;
+                    }
                     let from_reg = *reg;
                     // Reserve what the value actually needs: a binary128
                     // argument is sixteen bytes, and eight left half of it
@@ -1908,7 +2017,8 @@ impl RegAlloc {
     ///      sets.
     ///   2. Color: per-bank chordal coloring. ABI-pinned args become
     ///      pre-colored vertices; cross-call → caller-saved becomes a
-    ///      per-vertex forbidden set. In-loop pseudos get a
+    ///      per-vertex forbidden set, in both banks (`gp_forbidden`,
+    ///      `Clobbering::vreg_forbidden`). In-loop general values get a
     ///      callee-first preferred palette (soft, not forbidden).
     ///   3. Commit: write Loc::Reg / Loc::VReg for colored vertices,
     ///      allocate stack slots for spilled vertices, track
@@ -1921,8 +2031,6 @@ impl RegAlloc {
         clobbering: &Clobbering,
     ) {
         // -------- Phase 1: pre-pass --------
-        let crosses_blocks = crate::arch::regalloc::live_out_anywhere(&self.live_out);
-        let crosses_calls = clobbering.fp_call_crossers();
         // What the pre-pass asks about each interval, indexed once: asking by
         // scanning the function per interval made it quadratic.
         let setval_sizes = crate::arch::regalloc::setval_sizes(func);
@@ -2006,18 +2114,7 @@ impl RegAlloc {
                 continue;
             }
 
-            let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
-            if needs_fp {
-                // FP cross-call/block → stack (avoids the chordal pass
-                // having to model V-bank cross-call eviction, which is
-                // not implemented yet; matches the x86_64 XMM policy).
-                let crosses_call = crosses_calls.contains(&interval.pseudo);
-                let crosses_block = crosses_blocks.contains(&interval.pseudo);
-                if crosses_call || crosses_block {
-                    let bytes = fp_pseudo_bytes(func, interval.pseudo);
-                    self.home_on_stack(interval.pseudo, SlotShape::new(bytes, bytes));
-                    continue;
-                }
+            if self.fp_pseudos.contains(&interval.pseudo) {
                 vreg_candidates.insert(interval.pseudo);
             } else {
                 gp_candidates.insert(interval.pseudo);
@@ -2026,7 +2123,7 @@ impl RegAlloc {
 
         // -------- Phase 2: per-bank chordal coloring --------
         self.color_gp_bank(func, &intervals, clobbering, &gp_candidates);
-        self.color_vreg_bank(func, &vreg_candidates);
+        self.color_vreg_bank(func, clobbering, &vreg_candidates);
     }
 
     /// The X registers each of `candidates` may not take: every register a
@@ -2275,9 +2372,15 @@ impl RegAlloc {
         }
     }
 
+    /// Color the floating-point and vector values. One that crosses a call
+    /// may take only V8-V15 ([`Clobbering::vreg_forbidden`]), and so is
+    /// spilled once those are taken; every other value tries the
+    /// caller-saved registers first, so that only what has to survive a call
+    /// costs the prologue a save.
     fn color_vreg_bank(
         &mut self,
         func: &Function,
+        clobbering: &Clobbering,
         vreg_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
@@ -2296,8 +2399,27 @@ impl RegAlloc {
         // ops are three-operand at the architectural level (fadd d0,
         // d1, d2), so target and source can share a register without
         // codegen workarounds. Same rationale as x86_64's XMM bank.
-        let graph = build_interference_graph(&all_vertices, func, &self.live_out, false);
-        let forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<VReg>> = BTreeMap::new();
+        let mut graph = build_interference_graph(&all_vertices, func, &self.live_out, false);
+        crate::arch::regalloc::args_interfere(&mut graph, func, &all_vertices);
+        let mut forbidden = clobbering.vreg_forbidden(vreg_candidates, &self.narrow_v);
+        // An argument here is one `spill_args_across_calls` took out of the
+        // register it arrived in. The prologue moves the arguments one at a
+        // time, so none may land in another's arrival register.
+        for &p in vreg_candidates {
+            if func
+                .get_pseudo(p)
+                .is_some_and(|ps| matches!(ps.kind, PseudoKind::Arg(_)))
+            {
+                forbidden.entry(p).or_default().extend(VReg::arg_regs());
+            }
+        }
+        let caller_first: Vec<VReg> = {
+            let (callee, mut caller): (Vec<VReg>, Vec<VReg>) = VReg::allocatable()
+                .iter()
+                .partition(|v| v.is_callee_saved());
+            caller.extend(callee);
+            caller
+        };
         let order = mcs_ordering(&graph);
         let result = greedy_color(
             &graph,
@@ -2305,7 +2427,7 @@ impl RegAlloc {
             VReg::allocatable(),
             &pre_colored,
             &forbidden,
-            |_| None::<Vec<VReg>>,
+            |_| Some(caller_first.clone()),
         );
         for (&pid, &reg) in &result.colors {
             if pre_colored.contains_key(&pid) {
@@ -2318,7 +2440,13 @@ impl RegAlloc {
         }
         for spilled in result.spilled {
             if !self.is_placed(spilled) {
-                let bytes = fp_pseudo_bytes(func, spilled);
+                // Sixteen bytes unless the value is known to fit eight: a
+                // binary128 argument has no def to read its width from.
+                let bytes = if self.narrow_v.contains(&spilled) {
+                    8
+                } else {
+                    16
+                };
                 self.home_on_stack(spilled, SlotShape::new(bytes, bytes));
             }
         }
@@ -2346,29 +2474,7 @@ impl RegAlloc {
         call_positions: &[usize],
     ) {
         use crate::arch::regalloc::{Assignment, Cell, Clobber, Spared};
-        // Values known to fit the low 64 bits of a V register: by their
-        // first def's width, an asm output's, or a parameter's type.
-        let mut narrow: HashSet<PseudoId> = HashSet::new();
-        let mut seen: HashSet<PseudoId> = HashSet::new();
-        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
-            if let Some(t) = insn.target {
-                if seen.insert(t) && insn.size > 0 && insn.size <= 64 {
-                    narrow.insert(t);
-                }
-            }
-            if let Some(asm) = insn.extra().asm_data.as_deref() {
-                for out in asm.outputs.iter().filter(|o| !o.is_memory()) {
-                    if seen.insert(out.pseudo) && out.size > 0 && out.size <= 64 {
-                        narrow.insert(out.pseudo);
-                    }
-                }
-            }
-        }
-        for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
-            if types.size_bits(t) <= 64 {
-                narrow.insert(p);
-            }
-        }
+        let narrow = narrow_v_values(func, types);
         let cells = |p: PseudoId, loc: &Loc| -> Vec<Cell<RegUnit>> {
             let span = self.arg_span.get(&p).copied().unwrap_or(1);
             match loc {

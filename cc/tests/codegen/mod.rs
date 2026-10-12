@@ -80,6 +80,7 @@ mod plain_char;
 mod profiling;
 mod promotion;
 mod regalloc;
+mod regalloc_fp;
 mod rounding_math;
 mod scaling;
 mod sections;

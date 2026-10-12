@@ -1223,15 +1223,6 @@ pub fn intervals_by_pseudo(intervals: &[LiveInterval]) -> HashMap<PseudoId, &Liv
     by_pseudo
 }
 
-/// Every pseudo live out of some block: one whose value crosses a block
-/// boundary.
-///
-/// Built once per function. Asking it per interval by scanning every block's
-/// live-out set made the chordal pre-pass intervals x blocks.
-pub fn live_out_anywhere(live_out: &[HashSet<PseudoId>]) -> HashSet<PseudoId> {
-    live_out.iter().flatten().copied().collect()
-}
-
 /// Identify pseudo-registers that should use floating-point registers.
 /// This is a shared implementation used by both x86-64 and AArch64.
 ///
@@ -1593,6 +1584,31 @@ pub fn build_interference_graph(
     graph
 }
 
+/// Make the arguments among `vertices` interfere with one another. The
+/// prologue writes each argument that has left the register it arrived in --
+/// to a slot or to another register -- at entry, where none has a def for
+/// [`build_interference_graph`] to see, and one that is never read is
+/// written all the same.
+pub fn args_interfere(
+    graph: &mut InterferenceGraph,
+    func: &Function,
+    vertices: &std::collections::BTreeSet<PseudoId>,
+) {
+    let args: Vec<PseudoId> = vertices
+        .iter()
+        .copied()
+        .filter(|&p| {
+            func.get_pseudo(p)
+                .is_some_and(|ps| matches!(ps.kind, PseudoKind::Arg(_)))
+        })
+        .collect();
+    for (n, &a) in args.iter().enumerate() {
+        for &b in &args[n + 1..] {
+            graph.add_edge(a, b);
+        }
+    }
+}
+
 /// Walk every block backward from its live-out set, handing `visit` each
 /// instruction's linear position (blocks in order, as
 /// [`compute_live_intervals`] numbers them), the instruction, what it
@@ -1683,19 +1699,7 @@ pub fn color_stack_slots(
 ) -> StackColoring {
     let candidates: std::collections::BTreeSet<PseudoId> = homed.keys().copied().collect();
     let mut graph = build_interference_graph(&candidates, func, live_out, true);
-    let args: Vec<PseudoId> = candidates
-        .iter()
-        .copied()
-        .filter(|&p| {
-            func.get_pseudo(p)
-                .is_some_and(|ps| matches!(ps.kind, PseudoKind::Arg(_)))
-        })
-        .collect();
-    for (n, &a) in args.iter().enumerate() {
-        for &b in &args[n + 1..] {
-            graph.add_edge(a, b);
-        }
-    }
+    args_interfere(&mut graph, func, &candidates);
     let mut exclusive: std::collections::BTreeSet<PseudoId> = std::collections::BTreeSet::new();
     if func.has_nonlocal_control() {
         walk_live_after(

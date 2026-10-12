@@ -2108,7 +2108,7 @@ impl RegAlloc {
     /// rule every value is colored by ([`RegAlloc::gp_forbidden`]) -- a call
     /// it crosses, or a constraint point that clobbers it, such as a variable
     /// shift loading its count into RCX while the fourth parameter still
-    /// lives there -- and an XMM register always.
+    /// lives there -- and an XMM register where it crosses a call.
     fn spill_args_across_calls(
         &mut self,
         func: &Function,
@@ -2127,10 +2127,10 @@ impl RegAlloc {
             forbidden.get(&p).is_some_and(|regs| regs.contains(&reg))
         });
 
-        // Always spill XMM function parameter arguments to stack.
-        // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
-        // computation within the function may reuse the same XMM register,
-        // clobbering the parameter value.
+        // An XMM argument crossing an instruction that destroys the XMM
+        // registers -- a call: System V preserves none -- is stored to a
+        // slot at entry. One that crosses none stays where it arrived, a
+        // precolored vertex the other values are colored around.
         //
         // A *complex* parameter is excluded. It arrives in one or two XMM
         // registers depending on its base type, and the prologue in
@@ -2153,13 +2153,15 @@ impl RegAlloc {
             .collect();
 
         let xmm_arg_regs = XmmReg::arg_regs();
+        let crossers = clobbering.fp_call_crossers();
         for interval in intervals {
-            if complex_arg_pseudos.contains(&interval.pseudo) {
+            if complex_arg_pseudos.contains(&interval.pseudo)
+                || !crossers.contains(&interval.pseudo)
+            {
                 continue;
             }
             if let Some(Loc::Xmm(xmm)) = self.locations.get(&interval.pseudo) {
                 if xmm_arg_regs.contains(xmm) && interval.start == 0 {
-                    // This is a function parameter in an XMM register — always spill
                     let from_xmm = *xmm;
                     let is_quad = self.quad_pseudos.contains(&interval.pseudo);
                     let bytes = if is_quad { 16 } else { 8 };
@@ -2332,7 +2334,7 @@ impl RegAlloc {
     ///   1. Pre-pass: route non-register-allocated pseudos to their
     ///      proper Locs (constants → Imm/FImm, Sym → stack slot,
     ///      int128 → 16-byte stack, long-double → x87 stack, FP
-    ///      crossing call/block boundary → spill XMM caller-saved).
+    ///      crossing a call → stack, every XMM being caller-saved).
     ///      The remaining pseudos go into per-bank candidate sets.
     ///   2. Color: per-bank chordal coloring. ABI-pinned args become
     ///      pre-colored vertices; constraint clobbers (idiv RAX/RDX,
@@ -2349,7 +2351,6 @@ impl RegAlloc {
         clobbering: &Clobbering,
     ) {
         // -------- Phase 1: pre-pass --------
-        let crosses_blocks = crate::arch::regalloc::live_out_anywhere(&self.live_out);
         let crosses_calls = clobbering.fp_call_crossers();
         let setval_sizes = crate::arch::regalloc::setval_sizes(func);
         let mut gp_candidates: std::collections::BTreeSet<PseudoId> =
@@ -2411,23 +2412,18 @@ impl RegAlloc {
             }
             let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
             if needs_fp {
-                let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
-                let is_quad = self.quad_pseudos.contains(&interval.pseudo);
-                let crosses_call = crosses_calls.contains(&interval.pseudo);
-                let crosses_block = crosses_blocks.contains(&interval.pseudo);
-                if is_longdouble {
+                if self.ld_pseudos.contains(&interval.pseudo) {
                     self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                     continue;
                 }
-                if is_quad && (crosses_call || crosses_block) {
-                    // A `__float128` is 16 bytes. An 8-byte slot let a
-                    // 16-byte store run over its neighbour and read back
-                    // garbage in the low half.
-                    self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
-                    continue;
-                }
-                if crosses_call || crosses_block {
-                    self.home_on_stack(interval.pseudo, SlotShape::new(8, 8));
+                // System V preserves no XMM register across a call, so a
+                // value crossing one lives in memory -- sixteen bytes for a
+                // `__float128`, whose 16-byte store ran over an 8-byte slot's
+                // neighbour. Every other value is colored, whatever blocks it
+                // spans.
+                if crosses_calls.contains(&interval.pseudo) {
+                    let bytes = self.fp_slot_bytes(interval.pseudo);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(bytes, bytes));
                     continue;
                 }
                 xmm_candidates.insert(interval.pseudo);

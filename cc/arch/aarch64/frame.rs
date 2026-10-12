@@ -1219,25 +1219,45 @@ impl Aarch64CodeGen {
                 } else if is_fp {
                     // FP argument
                     if fp_arg_idx < fp_arg_regs.len() {
-                        if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id) {
-                            // From the type, not a `32 or else`
-                            // guess: `long double` is binary128
-                            // here, and storing it as a double
-                            // dropped its top eight bytes, so the
-                            // *second* such parameter came back
-                            // truncated while the first, stored
-                            // elsewhere, was whole.
-                            let fp_size = FpSize::from_type_or_bits(
-                                Some(*typ),
-                                types.size_bits(*typ),
-                                types,
-                                &self.base.target,
-                            );
-                            self.push_lir(Aarch64Inst::StrFp {
-                                size: fp_size,
-                                src: fp_arg_regs[fp_arg_idx],
-                                addr: self.stack_mem(*offset),
-                            });
+                        // From the type, not a `32 or else`
+                        // guess: `long double` is binary128
+                        // here, and storing it as a double
+                        // dropped its top eight bytes, so the
+                        // *second* such parameter came back
+                        // truncated while the first, stored
+                        // elsewhere, was whole. And from this
+                        // target's width of it: binary128 on Linux,
+                        // a double on Darwin, never x87's format.
+                        let fp_size =
+                            self.fp_size_from_type(Some(*typ), types.size_bits(*typ), types);
+                        let from = fp_arg_regs[fp_arg_idx];
+                        match self.locations.get_ref(pseudo.id) {
+                            Some(Loc::Stack(offset)) => {
+                                self.push_lir(Aarch64Inst::StrFp {
+                                    size: fp_size,
+                                    src: from,
+                                    addr: self.stack_mem(*offset),
+                                });
+                            }
+                            // Colored away from the register it arrived in,
+                            // which a call it crosses overwrites: into one of
+                            // V8-V15, never another argument's register.
+                            // Moved as a double unless it is wider: `fmov` of
+                            // a half register needs FEAT_FP16.
+                            Some(&Loc::VReg(to)) if to != from => {
+                                debug_assert!(!fp_arg_regs.contains(&to));
+                                let size = if fp_size == FpSize::Quad {
+                                    FpSize::Quad
+                                } else {
+                                    FpSize::Double
+                                };
+                                self.push_lir(Aarch64Inst::FmovReg {
+                                    size,
+                                    src: from,
+                                    dst: to,
+                                });
+                            }
+                            _ => {}
                         }
                     }
                     fp_arg_idx += 1;

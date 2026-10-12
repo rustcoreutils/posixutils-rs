@@ -1,6 +1,4 @@
-use crate::test_compile::{
-    compile, compile_expect_error, compile_expect_ok, compile_expect_warning,
-};
+use crate::test_compile::{compile, compile_expect_error, compile_expect_warning};
 
 // ============================================================================
 // #C116 — the lock-free atomic ceiling
@@ -104,7 +102,7 @@ fn diagnostics_float_constant_is_accepted_by_the_other_asm_classes() {
     ] {
         let src =
             format!("int main(void) {{ __asm__ (\"nop\" :: \"{constraint}\"(1.0)); return 0; }}\n");
-        compile_expect_ok(name, &src);
+        crate::test_compile::compile_expect_ok(name, &src);
     }
 }
 
@@ -118,7 +116,7 @@ fn diagnostics_float_constant_is_accepted_by_the_other_asm_classes() {
 #[test]
 fn diagnostics_sse_asm_operands_are_limited_to_the_scratch_registers() {
     // Two fit.
-    compile_expect_ok(
+    crate::test_compile::compile_expect_ok(
         "asm_two_sse_constants",
         "int main(void) { __asm__ (\"nop\" :: \"x\"(1.0), \"x\"(2.0)); return 0; }\n",
     );

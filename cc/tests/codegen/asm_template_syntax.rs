@@ -19,6 +19,7 @@ use crate::common::compile_and_run_aarch64;
 /// The asm below sits in an inline function called twice, so once inlined it
 /// is emitted twice in one function, and each copy needs its own number or
 /// the labels are defined twice. gcc's number is per emitted instance.
+#[cfg(target_arch = "x86_64")]
 const X86_LOOP: &str = r#"
 static inline long count_up(long x, long lim) {
     __asm__("jmp .Lchk%=\n"

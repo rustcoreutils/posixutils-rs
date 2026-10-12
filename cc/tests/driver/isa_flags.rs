@@ -13,7 +13,7 @@
 //
 
 use super::{s, WorkDir};
-use crate::common::{asm_for_at, compile_and_run, preprocess_text, run_c17};
+use crate::common::{asm_for_at, preprocess_text, run_c17};
 
 /// Every macro an x86-64 ISA option can define, in the order the tests
 /// list them.
@@ -277,7 +277,7 @@ int main(void) {
     for opt in ["-O0", "-O2"] {
         let flags = vec![opt.to_string(), "-mfma".to_string()];
         assert_eq!(
-            compile_and_run("isa_fma_rounds_once", src, &flags),
+            crate::common::compile_and_run("isa_fma_rounds_once", src, &flags),
             0,
             "{opt}"
         );

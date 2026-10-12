@@ -831,6 +831,35 @@ fn gcc_flags_dumpversion_agrees_with_the_gnuc_macros() {
     assert_eq!(r.stdout, format!("{full}\n"));
 }
 
+/// c17 claims gcc 12.4: the highest release whose version-gated paths in
+/// glibc and the gate's packages it supports. 12 turns on glibc's
+/// `_FORTIFY_SOURCE=3`, which `__builtin_dynamic_object_size` serves; the
+/// minor is at least 1 because gnulib's `careadlinkat.c` emits two
+/// `#warning`s when optimizing for any gcc from 10.1 to 12.0 -- a `-Werror`
+/// build fails -- and takes a pragma from 12.1 on. 13 adds nothing c17 can
+/// reach in C17 mode but glibc's C2x `<tgmath.h>` path.
+#[test]
+fn gcc_flags_claims_gcc_12_4() {
+    let r = run_c17(&["-dumpfullversion"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.stdout, "12.4.0\n");
+    let gate = preprocess_text(
+        "gnuc_gates",
+        "#if __GNUC__ == 12 && __GNUC_MINOR__ >= 1\nclaim_ok\n#endif\n\
+         #if (__GNUC__ > 10 || (__GNUC__ == 10 && __GNUC_MINOR__ >= 1)) \
+         && (__GNUC__ < 12 || (__GNUC__ == 12 && __GNUC_MINOR__ < 1))\n\
+         careadlinkat_warns\n#endif\n",
+        &["-P"],
+    );
+    assert!(gate.success, "{}", gate.stderr);
+    assert!(gate.stdout.contains("claim_ok"), "{}", gate.stdout);
+    assert!(
+        !gate.stdout.contains("careadlinkat_warns"),
+        "{}",
+        gate.stdout
+    );
+}
+
 /// gcc spells it with one dash; c17 already knew the two-dash form.
 #[test]
 fn gcc_flags_print_multiarch_single_dash() {

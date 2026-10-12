@@ -178,3 +178,34 @@ int main(void) {
         assert_eq!(code, 0, "{opt}");
     }
 }
+
+/// Claiming gcc 9 and later, glibc's <math.h> declares libmvec's AdvSIMD
+/// functions itself on aarch64 -- `__vpcs __f32x4_t _ZGVnN4v_sinf
+/// (__f32x4_t)` -- and its SVE ones for gcc 10 and later: a program calls
+/// the first through the header's own declaration and takes the address of
+/// the second.
+#[test]
+fn aarch64_math_h_declares_the_vector_functions() {
+    let src = r#"
+#include <math.h>
+#if !__GNUC_PREREQ (10, 0)
+#error "glibc's vector declarations are not reached"
+#endif
+volatile float x0 = 0.25f;
+int main(void) {
+    __f32x4_t x = {x0, x0 * 2, x0 * 3, x0 * 4};
+    __f32x4_t s = _ZGVnN4v_sinf(x);
+    for (int i = 0; i < 4; i++)
+        if (fabsf(s[i] - sinf(x[i])) > 1e-6f) return 1;
+    __sv_f32_t (*volatile sve)(__sv_f32_t, __sv_bool_t) = _ZGVsMxv_sinf;
+    return sve == 0 ? 2 : 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        if let Some(code) =
+            compile_and_run_aarch64_with("vpcs_math_h", src, &[opt], &["-lmvec", "-lm"])
+        {
+            assert_eq!(code, 0, "{opt}");
+        }
+    }
+}

@@ -14,7 +14,7 @@
 
 use crate::common::compile_and_run;
 
-/// The glibc headers take their gcc 7 paths, and the type-generic macros of
+/// The glibc headers take their gcc 7 and later paths, and the type-generic macros of
 /// both <math.h> and <tgmath.h> reach the function of each argument's type --
 /// `sqrtf32` where the C library has it, else `sqrtf`, of the same format.
 #[test]
@@ -24,7 +24,7 @@ fn float_n_through_the_c_library() {
 #include <tgmath.h>
 #include <complex.h>
 int main(void) {
-#if __GNUC__ != 7
+#if __GNUC__ < 7
     return 1;
 #endif
     _Float32 a = 2.0f32;

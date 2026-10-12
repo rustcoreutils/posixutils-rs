@@ -116,9 +116,15 @@ pub enum AttributeArg {
     /// An integer constant expression, already folded: `16` in `aligned(16)`,
     /// but equally `0x40`, `16UL`, an enumerator or `sizeof(long double)`
     Int(i128),
-    /// An argument of `format` or `format_arg` that is no integer constant:
-    /// its name when it is one, and its type, which gcc's reports give.
-    Other { name: Option<String>, typ: String },
+    /// An argument that is no integer constant, as gcc's reports give it:
+    /// its spelling, its type, and whether that is an integer type (a
+    /// variable) rather than another (a string, a floating constant, an
+    /// address).
+    Other {
+        spelled: String,
+        typ: String,
+        integral: bool,
+    },
 }
 
 /// A `format` or `format_arg` attribute as written, for
@@ -383,9 +389,7 @@ impl fmt::Display for Attribute {
                     AttributeArg::Ident(s) => write!(f, "{}", s)?,
                     AttributeArg::String(s) => write!(f, "\"{}\"", s)?,
                     AttributeArg::Int(n) => write!(f, "{}", n)?,
-                    AttributeArg::Other { name, .. } => {
-                        write!(f, "{}", name.as_deref().unwrap_or("..."))?
-                    }
+                    AttributeArg::Other { spelled, .. } => write!(f, "{}", spelled)?,
                 }
             }
             write!(f, ")")?;
@@ -953,6 +957,15 @@ impl Parser<'_> {
             }
         };
         if undeclared && matches!(expr.kind, ExprKind::IntLit(0)) {
+            // `patchable_function_entry` reports the argument as gcc does,
+            // after the expression parser's error.
+            if grammar == AttrArgs::Values {
+                return Ok(Some(AttributeArg::Other {
+                    spelled: "<erroneous-expression>".to_string(),
+                    typ: String::new(),
+                    integral: true,
+                }));
+            }
             return Err(Diagnosed);
         }
         if let (AttrArgs::General | AttrArgs::Values, ExprKind::StringLit(bytes)) =
@@ -966,6 +979,9 @@ impl Parser<'_> {
                 role.report(name, pos, IntArgFault::NotConstant);
                 Err(Diagnosed)
             }
+            // Kept, so the count is the arguments written, and reported as
+            // gcc reports a value that is no integer constant.
+            (None, AttrArgs::Values) => Ok(Some(self.other_arg(&expr))),
             (None, _) => Ok(None),
         }
     }
@@ -1106,15 +1122,51 @@ impl Parser<'_> {
         if let Some(n) = self.eval_const_expr(&expr) {
             return Ok(Some(AttributeArg::Int(n)));
         }
-        let named = match &expr.kind {
-            ExprKind::Ident(sym) => Some(self.str(self.symbols.get(*sym).name).to_string()),
-            _ => None,
-        };
-        let typ = expr
-            .typ
-            .map(|t| self.types.format_type(t, Some(self.idents)))
-            .unwrap_or_default();
-        Ok(Some(AttributeArg::Other { name: named, typ }))
+        Ok(Some(self.other_arg(&expr)))
+    }
+
+    /// An argument `expr` that is no integer constant, as gcc reports it.
+    fn other_arg(&self, expr: &Expr) -> AttributeArg {
+        let typ = expr.typ;
+        AttributeArg::Other {
+            spelled: self.spell_attribute_expr(expr),
+            typ: typ
+                .map(|t| self.types.format_type(t, Some(self.idents)))
+                .unwrap_or_default(),
+            integral: typ.is_some_and(|t| self.types.is_integer(t)),
+        }
+    }
+
+    /// `expr` as gcc prints an attribute argument: a name, `&name`, or a
+    /// floating constant in its `%E` form, `2.0e+0`.
+    fn spell_attribute_expr(&self, expr: &Expr) -> String {
+        let name = |sym: crate::symbol::SymbolId| self.str(self.symbols.get(sym).name).to_string();
+        match &expr.kind {
+            ExprKind::Ident(sym) => name(*sym),
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => match &operand.kind {
+                ExprKind::Ident(sym) => format!("&{}", name(*sym)),
+                _ => "<expression>".to_string(),
+            },
+            ExprKind::FloatLit(v) => {
+                let text = format!("{:e}", v.to_f64());
+                let (mantissa, exp) = text.split_once('e').unwrap_or((&text, "0"));
+                let mantissa = if mantissa.contains('.') {
+                    mantissa.to_string()
+                } else {
+                    format!("{mantissa}.0")
+                };
+                let exp = if exp.starts_with('-') {
+                    exp.to_string()
+                } else {
+                    format!("+{exp}")
+                };
+                format!("{mantissa}e{exp}")
+            }
+            _ => "<expression>".to_string(),
+        }
     }
 
     /// `malloc`'s first argument: the deallocation function, named or
@@ -1371,7 +1423,7 @@ impl Parser<'_> {
                 AttributeArg::Int(n) => n.to_string(),
                 AttributeArg::String(s) => format!("\"{s}\""),
                 AttributeArg::Ident(s) => s.clone(),
-                AttributeArg::Other { name, .. } => name.clone().unwrap_or_default(),
+                AttributeArg::Other { spelled, .. } => spelled.clone(),
             };
             diag::group_warning_args(
                 ATTRIBUTE_WARNING,
@@ -2197,13 +2249,18 @@ impl Parser<'_> {
         };
         let n = match arg {
             AttributeArg::Int(n) => *n,
-            AttributeArg::Other { name, typ } => {
-                return match name {
-                    Some(name) if typ != "double" && typ != "float" => warn(
+            AttributeArg::Other {
+                spelled,
+                typ,
+                integral,
+            } => {
+                return if *integral {
+                    warn(
                         "'{0}' attribute {w} value '{1}' is not an integer constant",
-                        name,
-                    ),
-                    _ => warn("'{0}' attribute {w} has type '{1}'", typ),
+                        spelled,
+                    )
+                } else {
+                    warn("'{0}' attribute {w} has type '{1}'", typ)
                 };
             }
             AttributeArg::String(s) => {

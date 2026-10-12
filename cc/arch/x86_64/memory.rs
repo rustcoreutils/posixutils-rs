@@ -40,7 +40,7 @@ impl X86_64CodeGen {
         let actual_size = size; // Keep original size for sub-32-bit handling
         let narrow = Self::extending_load_size(actual_size).filter(|_| actual_size < 32);
         let size = size.max(32);
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let loc = self.get_location(src);
         match loc {
             Loc::Reg(r) if r == dst => {
@@ -183,7 +183,7 @@ impl X86_64CodeGen {
                 // For sub-32-bit values (e.g., Float16), zero-extend to clear garbage
                 if actual_size < 32 {
                     self.push_lir(X86Inst::Movzx {
-                        src_size: OperandSize::from_bits(actual_size),
+                        src_size: OperandSize::from_bits(crate::units::Bits::new(actual_size)),
                         dst_size: OperandSize::B32,
                         src: GpOperand::Reg(dst),
                         dst,
@@ -233,7 +233,7 @@ impl X86_64CodeGen {
             }
             Loc::Reg(r) => {
                 let reg_size = size.max(32);
-                let op_size = OperandSize::from_bits(reg_size);
+                let op_size = OperandSize::from_bits(crate::units::Bits::new(reg_size));
                 // LIR: register-to-register move
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
@@ -429,7 +429,7 @@ impl X86_64CodeGen {
             self.emit_gp_load(mem, mem_size, reg_size, dst);
             return;
         }
-        let src_size = OperandSize::from_bits(mem_size);
+        let src_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
         let src = GpOperand::Mem(mem);
         let dst_size = OperandSize::B32;
         self.push_lir(if is_unsigned {
@@ -476,7 +476,7 @@ impl X86_64CodeGen {
             // this can offset from; a ragged one keeps the wide read.
             _ => {
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::from_bits(reg_size),
+                    size: OperandSize::from_bits(crate::units::Bits::new(reg_size)),
                     src: GpOperand::Mem(mem),
                     dst: GpOperand::Reg(dst),
                 });
@@ -517,7 +517,7 @@ impl X86_64CodeGen {
                 });
             } else {
                 self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::from_bits(width as u32 * 8),
+                    src_size: OperandSize::from_bits(crate::units::Bits::new(width as u32 * 8)),
                     dst_size: OperandSize::B32,
                     src: GpOperand::Mem(addr),
                     dst: into,
@@ -788,10 +788,12 @@ impl X86_64CodeGen {
         // A local object's own slot is stored at the width `SymSlot::store_bits`
         // decides; everything else at the access width.
         let store_bits = match self.get_location(addr) {
-            Loc::Stack(_) if self.pseudos.is_sym(addr) => {
-                SymSlot::store_bits(self.sym_slots.get(&addr), mem_size, insn.offset)
-            }
-            _ => mem_size,
+            Loc::Stack(_) if self.pseudos.is_sym(addr) => SymSlot::store_bits(
+                self.sym_slots.get(&addr),
+                crate::units::Bits::new(mem_size),
+                insn.offset,
+            ),
+            _ => crate::units::Bits::new(mem_size),
         };
         self.push_lir(X86Inst::Mov {
             size: OperandSize::from_bits(store_bits),

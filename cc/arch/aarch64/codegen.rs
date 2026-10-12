@@ -74,7 +74,7 @@ pub struct Aarch64CodeGen {
     pub(super) tls_symbols: HashSet<String>,
     /// Every data symbol's known alignment in bytes -- definitions here and
     /// `extern` declarations -- for [`Self::lo12_folds`].
-    pub(super) sym_align: HashMap<String, u32>,
+    pub(super) sym_align: HashMap<String, crate::units::Align>,
     /// Position-independent code mode (for shared libraries)
     pub(super) pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
@@ -325,7 +325,7 @@ impl Aarch64CodeGen {
     /// and `Select` both make. A wider-than-64-bit condition also uses X10,
     /// or X11 when `scratch` is X10, so neither may hold anything live.
     fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
-        let bits = self.base.value_widths.bits(cond);
+        let bits = self.base.value_widths.bits(cond).get();
         let loc = self.get_location(cond);
         if bits > 64 {
             if let l @ (Loc::Stack(_) | Loc::IncomingArg(_)) = &loc {
@@ -462,7 +462,7 @@ impl Aarch64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.get().max(32));
-        let op_size = OperandSize::from_bits(switch_size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(switch_size));
 
         // Move switch value to scratch0
         match &loc {
@@ -1173,8 +1173,8 @@ impl Aarch64CodeGen {
         let cond_loc = self.get_location(cond);
         if let Loc::Imm(v) = cond_loc {
             let val = if v != 0 { then_val } else { else_val };
-            self.emit_fp_move(val, VReg::V17, typ, size, types);
-            self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size, types);
+            self.emit_fp_move(val, VReg::V17, typ, size.get(), types);
+            self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size.get(), types);
             return;
         }
 
@@ -1190,18 +1190,18 @@ impl Aarch64CodeGen {
         });
 
         // Else: load else_val to V17
-        self.emit_fp_move(else_val, VReg::V17, typ, size, types);
+        self.emit_fp_move(else_val, VReg::V17, typ, size.get(), types);
         self.push_lir(Aarch64Inst::B {
             target: done_label.clone(),
         });
 
         // Then: load then_val to V17
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(then_label)));
-        self.emit_fp_move(then_val, VReg::V17, typ, size, types);
+        self.emit_fp_move(then_val, VReg::V17, typ, size.get(), types);
 
         // Done: store V17 to destination
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
-        self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size, types);
+        self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size.get(), types);
     }
 
     /// Emit integer select using CSEL
@@ -1213,7 +1213,7 @@ impl Aarch64CodeGen {
             target,
             width: size,
         } = ops;
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size.get()));
         let dst_loc = self.get_location(target);
         // Use X16 as default scratch to avoid clobbering live values
         let dst_reg = match &dst_loc {
@@ -1230,8 +1230,8 @@ impl Aarch64CodeGen {
         // The test first, while the other two scratches are still free for
         // it; loading the arms after it leaves the flags alone.
         self.emit_condition_test(cond, cond_reg);
-        self.emit_move(then_val, then_reg, size);
-        self.emit_move(else_val, else_reg, size);
+        self.emit_move(then_val, then_reg, size.get());
+        self.emit_move(else_val, else_reg, size.get());
 
         // Use csel: if cond != 0, select then_val, else select else_val
         self.push_lir(Aarch64Inst::Csel {
@@ -1243,7 +1243,7 @@ impl Aarch64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, size.get());
         }
     }
 
@@ -1375,7 +1375,7 @@ impl CodeGenerator for Aarch64CodeGen {
                 module
                     .extern_object_align
                     .iter()
-                    .map(|(n, a)| (n.clone(), *a)),
+                    .map(|(n, a)| (n.clone(), crate::units::Align::of_bytes(u64::from(*a)))),
             )
             .collect();
 

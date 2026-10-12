@@ -2379,7 +2379,8 @@ impl RegAlloc {
                         // constants that merely *feed* a 128-bit instruction,
                         // and those are still ordinary immediates that get
                         // widened at the use site.
-                        let defined_128 = setval_sizes.get(&interval.pseudo) == Some(&128);
+                        let defined_128 = setval_sizes.get(&interval.pseudo)
+                            == Some(&crate::units::Bits::new(128));
                         if defined_128 {
                             self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                             continue;
@@ -2388,7 +2389,7 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        let size = setval_sizes.get(&interval.pseudo).copied().unwrap_or(64);
+                        let size = setval_sizes.get(&interval.pseudo).map_or(64, |b| b.get());
                         self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;

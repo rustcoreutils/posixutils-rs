@@ -42,9 +42,11 @@ impl Aarch64CodeGen {
                 }
             }
             TypeKind::Float128 => FpSize::Quad,
-            _ => FpSize::from_bits(size.max(32), &self.base.target),
+            _ => FpSize::from_bits(crate::units::Bits::new(size.max(32)), &self.base.target),
         })
-        .unwrap_or_else(|| FpSize::from_bits(size.max(32), &self.base.target))
+        .unwrap_or_else(|| {
+            FpSize::from_bits(crate::units::Bits::new(size.max(32)), &self.base.target)
+        })
     }
 
     /// Get size in bits from type, with fallback to provided size.
@@ -745,7 +747,7 @@ impl Aarch64CodeGen {
         let src_size = Self::size_from_type(insn.src_typ, insn.src_size.get(), types);
         let dst_size = Self::size_from_type(insn.typ, insn.size.get(), types);
         let fp_size = self.fp_size_from_type(insn.typ, insn.size.get(), types);
-        let int_size = OperandSize::from_bits(src_size);
+        let int_size = OperandSize::from_bits(crate::units::Bits::new(src_size));
 
         let dst_loc = self.get_location(target);
         let dst_vreg = match &dst_loc {
@@ -798,7 +800,7 @@ impl Aarch64CodeGen {
         let src_size = Self::size_from_type(insn.src_typ, insn.src_size.get(), types);
         let dst_size = Self::size_from_type(insn.typ, insn.size.get(), types);
         let fp_size = self.fp_size_from_type(insn.src_typ, insn.src_size.get(), types);
-        let int_size = OperandSize::from_bits(dst_size);
+        let int_size = OperandSize::from_bits(crate::units::Bits::new(dst_size));
 
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {

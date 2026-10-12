@@ -187,7 +187,7 @@ impl X86_64CodeGen {
                     self.emit_move(count, Reg::R11, bits);
                     if bits < 32 {
                         self.push_lir(X86Inst::Movzx {
-                            src_size: OperandSize::from_bits(bits),
+                            src_size: OperandSize::from_bits(crate::units::Bits::new(bits)),
                             dst_size: OperandSize::B32,
                             src: GpOperand::Reg(Reg::R11),
                             dst: Reg::R11,

@@ -1384,7 +1384,7 @@ impl EmitAsm for Aarch64Inst {
                     out,
                     "    cmp {}, {}",
                     src1.name_for_size(sz),
-                    src2.format(OperandSize::from_bits(sz))
+                    src2.format(OperandSize::from_bits(crate::units::Bits::new(sz)))
                 );
             }
 
@@ -1888,7 +1888,7 @@ impl Aarch64Inst {
             "    {op} {}, {}, {}",
             dst.name_for_size(sz),
             src1.name_for_size(sz),
-            src2.format(OperandSize::from_bits(sz))
+            src2.format(OperandSize::from_bits(crate::units::Bits::new(sz)))
         );
     }
 
@@ -1937,7 +1937,7 @@ impl Aarch64Inst {
             "    {op} {}, {}, {}",
             dst.name_for_size(sz),
             src.name_for_size(sz),
-            amount.format(OperandSize::from_bits(sz))
+            amount.format(OperandSize::from_bits(crate::units::Bits::new(sz)))
         );
     }
 
@@ -2000,7 +2000,7 @@ impl Aarch64Inst {
                     out,
                     "    mov {}, {}",
                     dst.name_for_size(sz),
-                    src.format(OperandSize::from_bits(sz))
+                    src.format(OperandSize::from_bits(crate::units::Bits::new(sz)))
                 );
             }
             GpOperand::Imm(v) => Self::emit_mov_imm(sz, *v as u64, dst, out),

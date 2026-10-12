@@ -117,7 +117,9 @@ impl X86_64CodeGen {
     /// natural width needs no shift and stores straight out of it.
     fn store_reg_bytes_to_local(&mut self, src: Reg, local: i32, at: i64, bytes: i64) {
         let mut shifted = 0;
-        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes) {
+        for (off, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(bytes).expect("a byte count is not negative"),
+        )) {
             if off != 0 {
                 if shifted == 0 && src != Reg::R10 {
                     self.push_lir(X86Inst::Mov {
@@ -136,7 +138,7 @@ impl X86_64CodeGen {
             let from = if off == 0 { src } else { Reg::R10 };
             let addr = self.stack_field(local, (at + off) as i32);
             self.push_lir(X86Inst::Mov {
-                size: OperandSize::from_bits(chunk.bits().get()),
+                size: OperandSize::from_bits(chunk.bits()),
                 src: GpOperand::Reg(from),
                 dst: GpOperand::Mem(addr),
             });
@@ -194,8 +196,10 @@ impl X86_64CodeGen {
             return;
         };
         let dst_offset = *dst_offset;
-        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
-            let size = OperandSize::from_bits(chunk.bits().get());
+        for (at, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(bytes).expect("a byte count is not negative"),
+        )) {
+            let size = OperandSize::from_bits(chunk.bits());
             let at = at as i32;
             self.push_lir(X86Inst::Mov {
                 size,
@@ -1240,7 +1244,7 @@ impl X86_64CodeGen {
                 // registers is what a gcc-compiled caller does not expect.
                 let base = self.address_of_pseudo(*src);
                 self.push_lir(X86Inst::MovFp {
-                    size: FpSize::for_sse_aggregate(ret_size),
+                    size: FpSize::for_sse_aggregate(crate::units::Bits::new(ret_size)),
                     src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 0 }),
                     dst: XmmOperand::Reg(XmmReg::Xmm0),
                 });
@@ -1362,7 +1366,7 @@ impl X86_64CodeGen {
                                 // own type answers `Double` whatever it holds,
                                 // which is two bytes too wide for a `_Float16`
                                 // and half as wide as a binary128 needs.
-                                let fp_size = FpSize::for_sse_aggregate(size_bits.get());
+                                let fp_size = FpSize::for_sse_aggregate(size_bits);
                                 match src_loc {
                                     Loc::Stack(offset) => {
                                         self.push_lir(X86Inst::MovFp {

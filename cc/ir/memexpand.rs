@@ -96,7 +96,10 @@ impl Chunk {
 
 /// The pieces a block of `bytes` is moved in, as (offset, width), in rising
 /// offset: as many 8-byte chunks as fit, then at most one each of 4, 2 and 1.
-pub(crate) fn block_chunks(bytes: i64) -> impl Iterator<Item = (i64, Chunk)> {
+/// An offset is a displacement from the block's start, so it is signed, as
+/// every displacement is.
+pub(crate) fn block_chunks(bytes: ByteSize) -> impl Iterator<Item = (i64, Chunk)> {
+    let bytes = bytes.to_i64();
     let mut offset = 0;
     std::iter::from_fn(move || {
         let chunk = [Chunk::B8, Chunk::B4, Chunk::B2, Chunk::B1]
@@ -128,7 +131,7 @@ pub(crate) fn chunk_copy(
     mut alloc: impl FnMut() -> PseudoId,
 ) -> Vec<Instruction> {
     let mut out = Vec::new();
-    for (at, chunk) in block_chunks(bytes.to_i64()) {
+    for (at, chunk) in block_chunks(bytes) {
         let (t, bits) = (typ(chunk), chunk.bits());
         let v = alloc();
         out.push(Instruction::load(v, src, at, t, bits));
@@ -271,7 +274,7 @@ impl Expander<'_> {
                 }
             }
             BlockOp::Move => {
-                let loaded: Vec<_> = block_chunks(n.to_i64())
+                let loaded: Vec<_> = block_chunks(n)
                     .map(|(at, chunk)| (self.load(second, at, chunk), at, chunk))
                     .collect();
                 for (v, at, chunk) in loaded {
@@ -280,7 +283,7 @@ impl Expander<'_> {
             }
             BlockOp::Set => {
                 let mut fill = Fill::new(second, self.consts);
-                for (at, chunk) in block_chunks(n.to_i64()) {
+                for (at, chunk) in block_chunks(n) {
                     let v = fill.at(&mut self.b, chunk);
                     self.store(v, dest, at, chunk);
                 }
@@ -386,7 +389,7 @@ mod tests {
                 next += 1;
                 PseudoId(next)
             });
-            let pieces: Vec<(i64, Chunk)> = block_chunks(n).collect();
+            let pieces: Vec<(i64, Chunk)> = block_chunks(ByteSize::new(n as u64)).collect();
             assert_eq!(insns.len(), 2 * pieces.len(), "{n} bytes");
             for (k, ((at, chunk), pair)) in pieces.iter().zip(insns.chunks(2)).enumerate() {
                 let v = PseudoId(51 + k as u32);
@@ -435,7 +438,7 @@ mod tests {
     #[test]
     fn chunks_cover_the_block_widest_first() {
         let pieces = |n| {
-            block_chunks(n)
+            block_chunks(ByteSize::new(n))
                 .map(|(at, c)| (at, c.bytes()))
                 .collect::<Vec<_>>()
         };
@@ -446,11 +449,11 @@ mod tests {
         assert_eq!(pieces(23), vec![(0, 8), (8, 8), (16, 4), (20, 2), (22, 1)]);
         for n in 0..=200 {
             let mut next = 0;
-            for (at, c) in block_chunks(n) {
+            for (at, c) in block_chunks(ByteSize::new(n)) {
                 assert_eq!(at, next, "{n}: a gap or an overlap");
                 next += c.bytes();
             }
-            assert_eq!(next, n, "{n}: not covered");
+            assert_eq!(next as u64, n, "{n}: not covered");
         }
     }
 

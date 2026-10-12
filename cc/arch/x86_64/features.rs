@@ -197,7 +197,7 @@ impl X86_64CodeGen {
         // from the pointer it had just destroyed.
         let overflow_label = Label::internal("va_overflow", label_suffix);
         let done_label = Label::internal("va_done", label_suffix);
-        let lir_arg_size = OperandSize::from_bits(arg_size);
+        let lir_arg_size = OperandSize::from_bits(crate::units::Bits::new(arg_size));
 
         // gp_offset -> R10d
         self.push_lir(X86Inst::Mov {
@@ -593,8 +593,10 @@ impl X86_64CodeGen {
             );
             at = (qwords * 8) as i32;
         }
-        for (off, chunk) in crate::ir::memexpand::block_chunks(i64::from(nbytes - at)) {
-            let size = OperandSize::from_bits(chunk.bits().get());
+        for (off, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(i64::from(nbytes - at)).expect("a byte count is not negative"),
+        )) {
+            let size = OperandSize::from_bits(chunk.bits());
             let done = at + off as i32;
             self.push_lir(X86Inst::Mov {
                 size,
@@ -1441,8 +1443,10 @@ impl X86_64CodeGen {
             });
             self.push_lir(insn);
         }
-        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes % 8) {
-            tail(self, off as i32, OperandSize::from_bits(chunk.bits().get()));
+        for (off, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(bytes % 8).expect("a byte count is not negative"),
+        )) {
+            tail(self, off as i32, OperandSize::from_bits(chunk.bits()));
         }
         self.push_lir(X86Inst::Lea {
             addr: MemAddr::BaseOffset {

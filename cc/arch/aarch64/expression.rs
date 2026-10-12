@@ -33,7 +33,7 @@ impl Aarch64CodeGen {
             return;
         }
 
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -137,7 +137,7 @@ impl Aarch64CodeGen {
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.get().max(32));
 
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -177,7 +177,7 @@ impl Aarch64CodeGen {
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.get().max(32));
 
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -213,7 +213,7 @@ impl Aarch64CodeGen {
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.get().max(32));
 
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -274,7 +274,7 @@ impl Aarch64CodeGen {
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.operand_width().get().max(32));
 
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,

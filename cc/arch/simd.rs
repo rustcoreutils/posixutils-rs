@@ -88,11 +88,13 @@ struct Whole {
 /// floating lanes of `float` or `double` format.
 fn whole_register(vec: TypeId, types: &TypeTable) -> Option<Whole> {
     let (lane, _) = types.vector_lanes(vec)?;
-    let bytes = types.size_bytes(vec);
-    if bytes != 16 && bytes != 8 {
-        return None;
-    }
-    let lane_bytes = types.size_bytes(lane);
+    let bytes = match types.byte_size(vec).get() {
+        16 => 16,
+        8 => 8,
+        _ => return None,
+    };
+    // A lane is a scalar, so its size is its width's.
+    let lane_bytes = types.value_bits(lane).bytes_exact() as usize;
     let float = match types.fp_format(lane) {
         Some(FpFormat::Binary32 | FpFormat::Binary64) => true,
         Some(_) => return None,

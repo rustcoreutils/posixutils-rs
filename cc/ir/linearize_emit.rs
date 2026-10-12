@@ -555,7 +555,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // An object in a segment has no address `memset` could take, so it
         // is filled here at any size.
         if access.in_segment() || (access.volatile && size_bytes <= memexpand::INLINE_LIMIT_BYTES) {
-            for (offset, chunk) in memexpand::block_chunks(size_bytes.to_i64()) {
+            for (offset, chunk) in memexpand::block_chunks(size_bytes) {
                 let (typ, bits) = (chunk.typ(self.types), chunk.bits());
                 // Every byte the same: the chunk's value, sign-extended.
                 let pattern = i128::from(i64::from_ne_bytes([byte; 8]) >> (64 - bits.get()));

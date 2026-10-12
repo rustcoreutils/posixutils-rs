@@ -724,8 +724,10 @@ impl Aarch64CodeGen {
             });
         }
         // The cursors point at the tail, so its pieces are offsets from them.
-        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes - pairs) {
-            let size = OperandSize::from_bits(chunk.bits().get());
+        for (off, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(bytes - pairs).expect("a byte count is not negative"),
+        )) {
+            let size = OperandSize::from_bits(chunk.bits());
             self.push_lir(Aarch64Inst::Ldr {
                 size,
                 addr: MemAddr::BaseOffset {
@@ -1160,8 +1162,12 @@ impl Aarch64CodeGen {
                             // the widths are `block_chunks`'s so the tail of
                             // one that is not a multiple of eight is moved as
                             // wide as it is and no wider.
-                            for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
-                                let size = OperandSize::from_bits(chunk.bits().get());
+                            for (done, chunk) in
+                                crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+                                    u64::try_from(bytes).expect("a byte count is not negative"),
+                                ))
+                            {
+                                let size = OperandSize::from_bits(chunk.bits());
                                 let done = done as i32;
                                 self.push_lir(Aarch64Inst::Ldr {
                                     size,

@@ -148,8 +148,10 @@ impl X86_64CodeGen {
             self.emit_rep_movsq(from, BlockDst::OutgoingArg(dst_off), qwords);
             at = qwords * 8;
         }
-        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes - at) {
-            let size = OperandSize::from_bits(chunk.bits().get());
+        for (off, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(bytes - at).expect("a byte count is not negative"),
+        )) {
+            let size = OperandSize::from_bits(chunk.bits());
             let byte = (at + off) as i32;
             self.push_lir(X86Inst::Mov {
                 size,
@@ -415,18 +417,18 @@ impl X86_64CodeGen {
             // 16-byte scalar long double and only half of it copied.
             if let Some(bytes) = arg_type.and_then(|t| {
                 crate::arch::lir::memory_class_bytes(types, t)
-                    .or_else(|| types.is_complex(t).then(|| types.size_bytes(t)))
+                    .or_else(|| types.is_complex(t).then(|| types.byte_size(t)))
                     // A register-pair struct that ran out of registers goes on
                     // the stack *whole*. Without this it fell through to the
                     // scalar path below and pushed eight bytes of a sixteen-byte
                     // value -- the callee then read half of it plus whatever
                     // followed.
                     .or_else(|| {
-                        crate::abi::struct_param_classes(t, types).map(|_| types.size_bytes(t))
+                        crate::abi::struct_param_classes(t, types).map(|_| types.byte_size(t))
                     })
             }) {
                 let base = self.address_of_pseudo(arg);
-                self.emit_stack_arg_copy(base, base_off, bytes as i64);
+                self.emit_stack_arg_copy(base, base_off, bytes.to_i64());
                 continue;
             }
 
@@ -619,8 +621,10 @@ impl X86_64CodeGen {
     /// The aarch64 back end does the same, through its own instructions; the
     /// chunking both ask for is `ir::memexpand::block_chunks`.
     fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: i64) {
-        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
-            let size = OperandSize::from_bits(chunk.bits().get());
+        for (at, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(bytes).expect("a byte count is not negative"),
+        )) {
+            let size = OperandSize::from_bits(chunk.bits());
             let mem = GpOperand::Mem(MemAddr::BaseOffset {
                 base,
                 offset: offset + at as i32,
@@ -786,7 +790,7 @@ impl X86_64CodeGen {
             }) {
                 if fp_arg_idx < fp_arg_regs.len() {
                     let size_bits = arg_type.map_or(64, |t| types.size_bits(t));
-                    let fmt = FpSize::for_sse_aggregate(size_bits);
+                    let fmt = FpSize::for_sse_aggregate(crate::units::Bits::new(size_bits));
                     let dst = fp_arg_regs[fp_arg_idx];
                     self.emit_fp_move(arg, dst, fmt);
                     fp_arg_idx += 1;
@@ -832,9 +836,9 @@ impl X86_64CodeGen {
                         // would hand a gcc-compiled callee only the first.
                         if classes.len() == 1 {
                             self.push_lir(X86Inst::MovFp {
-                                size: FpSize::for_sse_aggregate(
+                                size: FpSize::for_sse_aggregate(crate::units::Bits::new(
                                     arg_type.map_or(64, |t| types.size_bits(t)),
-                                ),
+                                )),
                                 src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 0 }),
                                 dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
                             });
@@ -1027,7 +1031,7 @@ impl X86_64CodeGen {
         if let Loc::Reg(src_reg) = arg_loc {
             if let Some(&saved_reg) = saved_arg_regs.get(&src_reg) {
                 self.push_lir(X86Inst::Mov {
-                    size: OperandSize::from_bits(arg_size),
+                    size: OperandSize::from_bits(crate::units::Bits::new(arg_size)),
                     src: GpOperand::Reg(saved_reg),
                     dst: GpOperand::Reg(dest_reg),
                 });
@@ -1107,7 +1111,7 @@ impl X86_64CodeGen {
                     let fmt = if insn.typ.is_some_and(|t| {
                         matches!(types.kind(t), TypeKind::Struct | TypeKind::Union)
                     }) {
-                        FpSize::for_sse_aggregate(size_bits.get())
+                        FpSize::for_sse_aggregate(*size_bits)
                     } else {
                         ret_fmt
                     };
@@ -1152,7 +1156,7 @@ impl X86_64CodeGen {
                 self.emit_fp_move_from_xmm(
                     XmmReg::Xmm0,
                     &dst_loc,
-                    FpSize::from_bits(size_bits, &self.base.target),
+                    FpSize::from_bits(Bits::new(size_bits), &self.base.target),
                 );
             }
             ArgClass::Extend { .. } => {

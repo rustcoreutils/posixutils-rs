@@ -255,9 +255,9 @@ pub(crate) fn has_quiet_relational(types: &TypeTable, typ: TypeId) -> bool {
 /// where gcc calls `__fixtfsi`.
 pub(crate) fn int_suffix_for_longdouble(types: &TypeTable, int_type: TypeId) -> &'static str {
     let promoted = types.integer_promote(int_type);
-    let size = types.size_bits(promoted);
+    let size = types.value_bits(promoted);
     let is_unsigned = types.is_unsigned(promoted);
-    match (is_unsigned, size <= 32) {
+    match (is_unsigned, size <= Bits::new(32)) {
         (true, true) => "usi",
         (true, false) => "udi",
         (false, true) => "si",
@@ -355,7 +355,7 @@ pub(crate) fn build_f16_convert_call(
     target: &Target,
 ) -> Instruction {
     let target_pseudo = insn.target.expect("conversion must have target");
-    let dst_size = types.size_bits(dst_type);
+    let dst_size = types.value_bits(dst_type);
     let src_kind = types.kind(src_type);
     let dst_kind = types.kind(dst_type);
 
@@ -399,7 +399,7 @@ pub(crate) fn build_f16_convert_call(
         insn.src.clone(),
         vec![arg_type],
         dst_type,
-        Bits::new(dst_size),
+        dst_size,
     );
     call_insn.extra_mut().abi_info = Some(call_abi_info);
     call_insn.pos = insn.pos;
@@ -417,7 +417,7 @@ fn build_f16_extend_call(
     let rtlib = RtlibNames::new(target);
     let f16_abi = rtlib.float16_abi();
     let float_type = types.float_id;
-    let float_size = types.size_bits(float_type);
+    let float_size = types.value_bits(float_type);
 
     // Arg type: ushort for compiler-rt, Float16 for libgcc
     let arg_type = if f16_abi == Float16Abi::Integer {
@@ -449,7 +449,7 @@ fn build_f16_extend_call(
         vec![src],
         vec![arg_type],
         float_type,
-        Bits::new(float_size),
+        float_size,
     );
     call_insn.extra_mut().abi_info = Some(call_abi_info);
     call_insn.pos = pos;
@@ -468,7 +468,7 @@ fn build_f16_truncate_call(
     let f16_abi = rtlib.float16_abi();
     let float_type = types.float_id;
     let float16_type = types.float16_id;
-    let f16_size = types.size_bits(float16_type);
+    let f16_size = types.value_bits(float16_type);
 
     // Arg is always SSE float
     let abi = get_abi_for_conv(CallingConv::C, target);
@@ -492,7 +492,7 @@ fn build_f16_truncate_call(
         vec![src],
         vec![float_type],
         float16_type,
-        Bits::new(f16_size),
+        f16_size,
     );
     call_insn.extra_mut().abi_info = Some(call_abi_info);
     call_insn.pos = pos;
@@ -897,7 +897,7 @@ fn expand_int128_cmp_ord(
         lo_cmp,
         hi_cmp,
         result_type.0,
-        Bits::new(result_type.1.get()),
+        result_type.1,
     ));
     insns
 }
@@ -912,14 +912,14 @@ fn expand_int128_zext(
     let mut insns = Vec::new();
 
     let src = insn.src[0];
-    let src_size = insn.src_size.get();
+    let src_size = insn.src_size;
 
     // Zero-extend src to 64-bit if needed
-    let lo = if src_size < 64 {
+    let lo = if src_size < Bits::new(64) {
         let ext = func.create_reg_pseudo();
         let mut zext_insn = Instruction::unop(Opcode::Zext, ext, src, long_type, Bits::new(64));
         zext_insn.src_typ = insn.src_typ;
-        zext_insn.src_size = Bits::new(src_size);
+        zext_insn.src_size = src_size;
         insns.push(zext_insn);
         ext
     } else {
@@ -949,14 +949,14 @@ fn expand_int128_sext(
     let mut insns = Vec::new();
 
     let src = insn.src[0];
-    let src_size = insn.src_size.get();
+    let src_size = insn.src_size;
 
     // Sign-extend src to 64-bit if needed
-    let lo = if src_size < 64 {
+    let lo = if src_size < Bits::new(64) {
         let ext = func.create_reg_pseudo();
         let mut sext_insn = Instruction::unop(Opcode::Sext, ext, src, long_type, Bits::new(64));
         sext_insn.src_typ = insn.src_typ;
-        sext_insn.src_size = Bits::new(src_size);
+        sext_insn.src_size = src_size;
         insns.push(sext_insn);
         ext
     } else {
@@ -1385,7 +1385,7 @@ pub(crate) fn expand_float16_arith(
     target: &Target,
 ) -> Vec<Instruction> {
     let float_type = types.float_id;
-    let float_size = types.size_bits(float_type);
+    let float_size = types.value_bits(float_type);
     let pos = insn.pos;
     let result = insn.target.expect("binop must have target");
     let left = insn.src[0];
@@ -1408,7 +1408,7 @@ pub(crate) fn expand_float16_arith(
         left_ext,
         right_ext,
         float_type,
-        Bits::new(float_size),
+        float_size,
     ));
 
     // Truncate result back to Float16
@@ -1451,13 +1451,12 @@ pub(crate) fn map_int128_to_float16(
             }
 
             let float_type = types.float_id;
-            let float_size = types.size_bits(float_type);
+            let float_size = types.value_bits(float_type);
             let result = insn.target?;
             let src = *insn.src.first()?;
             let as_float = ctx.func.create_reg_pseudo();
 
-            let mut widen =
-                Instruction::unop(insn.op, as_float, src, float_type, Bits::new(float_size));
+            let mut widen = Instruction::unop(insn.op, as_float, src, float_type, float_size);
             widen.src_typ = Some(src_typ);
             widen.src_size = Bits::new(128);
             widen.pos = insn.pos;
@@ -1473,10 +1472,10 @@ pub(crate) fn map_int128_to_float16(
                 result,
                 as_float,
                 dst_typ,
-                Bits::new(types.size_bits(dst_typ)),
+                types.value_bits(dst_typ),
             );
             narrow.src_typ = Some(float_type);
-            narrow.src_size = Bits::new(float_size);
+            narrow.src_size = float_size;
             narrow.pos = insn.pos;
 
             Some(MappedInsn::Replace(vec![call, narrow]))
@@ -1507,7 +1506,7 @@ pub(crate) fn expand_float16_int_convert(
     target: &Target,
 ) -> Vec<Instruction> {
     let float_type = types.float_id;
-    let float_size = types.size_bits(float_type);
+    let float_size = types.value_bits(float_type);
     let pos = insn.pos;
     let src = insn.src[0];
     let result = insn.target.expect("conversion must have target");
@@ -1517,15 +1516,14 @@ pub(crate) fn expand_float16_int_convert(
         // half -> integer
         Opcode::FCvtS | Opcode::FCvtU => {
             let dst_typ = insn.typ.expect("conversion must have type");
-            let dst_size = types.size_bits(dst_typ);
+            let dst_size = types.value_bits(dst_typ);
 
             let as_float = func.create_reg_pseudo();
             insns.push(build_f16_extend_call(as_float, src, pos, types, target));
 
-            let mut step =
-                Instruction::unop(insn.op, result, as_float, dst_typ, Bits::new(dst_size));
+            let mut step = Instruction::unop(insn.op, result, as_float, dst_typ, dst_size);
             step.src_typ = Some(float_type);
-            step.src_size = Bits::new(float_size);
+            step.src_size = float_size;
             step.pos = pos;
 
             if types.kind(dst_typ) == TypeKind::Int128 {
@@ -1542,13 +1540,12 @@ pub(crate) fn expand_float16_int_convert(
         // integer -> half
         Opcode::SCvtF | Opcode::UCvtF => {
             let src_typ = insn.src_typ.expect("conversion must have src_typ");
-            let src_size = types.size_bits(src_typ);
+            let src_size = types.value_bits(src_typ);
 
             let as_float = func.create_reg_pseudo();
-            let mut step =
-                Instruction::unop(insn.op, as_float, src, float_type, Bits::new(float_size));
+            let mut step = Instruction::unop(insn.op, as_float, src, float_type, float_size);
             step.src_typ = Some(src_typ);
-            step.src_size = Bits::new(src_size);
+            step.src_size = src_size;
             step.pos = pos;
 
             if types.kind(src_typ) == TypeKind::Int128 {
@@ -1580,7 +1577,7 @@ pub(crate) fn expand_float16_neg(
     target: &Target,
 ) -> Vec<Instruction> {
     let float_type = types.float_id;
-    let float_size = types.size_bits(float_type);
+    let float_size = types.value_bits(float_type);
     let pos = insn.pos;
     let result = insn.target.expect("unary must have target");
     let src = insn.src[0];
@@ -1595,7 +1592,7 @@ pub(crate) fn expand_float16_neg(
         neg_result,
         src_ext,
         float_type,
-        Bits::new(float_size),
+        float_size,
     ));
 
     insns.push(build_f16_truncate_call(
@@ -1612,7 +1609,7 @@ pub(crate) fn expand_float16_cmp(
     target: &Target,
 ) -> Vec<Instruction> {
     let float_type = types.float_id;
-    let float_size = types.size_bits(float_type);
+    let float_size = types.value_bits(float_type);
     let pos = insn.pos;
     let result = insn.target.expect("cmp must have target");
     let left = insn.src[0];
@@ -1630,7 +1627,7 @@ pub(crate) fn expand_float16_cmp(
         insn.op,
         result,
         (left_ext, right_ext),
-        (float_type, Bits::new(float_size)),
+        (float_type, float_size),
         comparison_result_type(insn, types),
     ));
     insns
@@ -1997,7 +1994,7 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
 
             let result_pseudo = insn.target.expect("cmp must have target");
             let int_type = ctx.types.int_id;
-            let int_size = ctx.types.size_bits(int_type);
+            let int_size = ctx.types.value_bits(int_type);
             let ld_type = operand_typ;
 
             // Allocate pseudo for cmp call result
@@ -2024,7 +2021,7 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
                 cmp_op,
                 result_pseudo,
                 (cmp_result, zero),
-                (int_type, Bits::new(int_size)),
+                (int_type, int_size),
                 comparison_result_type(insn, ctx.types),
             );
 
@@ -2286,15 +2283,15 @@ pub(crate) mod test_helpers {
     pub fn make_convert_insn(
         op: Opcode,
         dst_type: TypeId,
-        dst_size: u32,
+        dst_size: Bits,
         src_type: TypeId,
-        src_size: u32,
+        src_size: Bits,
     ) -> Instruction {
         let mut insn = Instruction::new(op)
             .with_target(PseudoId(2))
             .with_src(PseudoId(0))
-            .with_type_and_size(dst_type, Bits::new(dst_size));
-        insn.src_size = Bits::new(src_size);
+            .with_type_and_size(dst_type, dst_size);
+        insn.src_size = src_size;
         insn.src_typ = Some(src_type);
         insn
     }
@@ -2361,14 +2358,8 @@ mod tests {
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
         bb.add_insn(
-            Instruction::unop(
-                op,
-                PseudoId(1),
-                PseudoId(0),
-                typ,
-                Bits::new(types.size_bits(typ)),
-            )
-            .with_func(callee),
+            Instruction::unop(op, PseudoId(1), PseudoId(0), typ, types.value_bits(typ))
+                .with_func(callee),
         );
         bb.add_insn(Instruction::ret(Some(PseudoId(1))));
         func.add_block(bb);
@@ -2544,7 +2535,7 @@ mod tests {
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
             typ,
-            Bits::new(types.size_bits(typ)),
+            types.value_bits(typ),
         );
         cmp.src_typ = Some(typ);
         bb.add_insn(cmp);
@@ -2742,9 +2733,9 @@ mod tests {
         bb.add_insn(make_convert_insn(
             Opcode::SCvtF,
             types.double_id,
-            64,
+            Bits::new(64),
             types.int128_id,
-            128,
+            Bits::new(128),
         ));
         bb.add_insn(Instruction::ret(Some(PseudoId(1))));
         func.add_block(bb);
@@ -2779,7 +2770,13 @@ mod tests {
             func.next_pseudo = 3;
             let mut bb = BasicBlock::new(BasicBlockId(0));
             bb.add_insn(Instruction::new(Opcode::Entry));
-            bb.add_insn(make_convert_insn(op, types.int128_id, 128, from, 32));
+            bb.add_insn(make_convert_insn(
+                op,
+                types.int128_id,
+                Bits::new(128),
+                from,
+                Bits::new(32),
+            ));
             bb.add_insn(Instruction::ret(Some(PseudoId(2))));
             func.add_block(bb);
             func.entry = BasicBlockId(0);

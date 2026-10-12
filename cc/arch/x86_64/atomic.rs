@@ -56,7 +56,7 @@ impl X86_64CodeGen {
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size.get();
         let size = insn.size.get().max(32);
-        let op_size = OperandSize::from_bits(mem_size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
 
         // XCHG is a store with a full barrier; anything weaker is a plain
         // store, which already has release semantics on x86.
@@ -90,7 +90,7 @@ impl X86_64CodeGen {
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size.get();
         let size = insn.size.get().max(32);
-        let op_size = OperandSize::from_bits(mem_size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
 
         let value_loc = self.get_location(value);
 
@@ -131,7 +131,7 @@ impl X86_64CodeGen {
         let mem_size = insn.size.get();
         let size = insn.size.get().max(32);
 
-        let op_size = OperandSize::from_bits(mem_size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
 
         // Every operand is read before any register that can hold another
         // is written. The allocator never places a pseudo in R10 or R11, so
@@ -213,7 +213,7 @@ impl X86_64CodeGen {
 
         let is_unsigned = insn.typ.is_some_and(|t| types.is_unsigned(t));
 
-        let src_size = OperandSize::from_bits(mem_size);
+        let src_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
         if is_unsigned {
             self.push_lir(X86Inst::Movzx {
                 src_size,
@@ -240,7 +240,7 @@ impl X86_64CodeGen {
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size.get();
         let size = insn.size.get().max(32);
-        let op_size = OperandSize::from_bits(mem_size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
 
         let value_loc = self.get_location(value);
 
@@ -280,7 +280,7 @@ impl X86_64CodeGen {
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size.get();
         let size = insn.size.get().max(32);
-        let op_size = OperandSize::from_bits(mem_size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
 
         let value_loc = self.get_location(value);
 
@@ -337,7 +337,7 @@ impl X86_64CodeGen {
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size.get();
         let size = insn.size.get().max(32);
-        let op_size = OperandSize::from_bits(mem_size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
 
         let value_loc = self.get_location(value);
 
@@ -438,7 +438,7 @@ impl X86_64CodeGen {
 
     /// Helper to move a value to a register
     fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: u32) {
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         match loc {
             Loc::Reg(src) => {
                 if src != reg {

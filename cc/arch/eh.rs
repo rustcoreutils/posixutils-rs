@@ -298,7 +298,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         });
         self.push_directive(Directive::Size {
             sym: sym.clone(),
-            size: 8,
+            size: crate::units::ByteSize::new(8),
         });
         self.push_directive(Directive::GlobalLabel(sym));
         self.push_directive(Directive::QuadSym(Symbol::extern_sym(PERSONALITY)));

@@ -88,7 +88,9 @@ impl Aarch64CodeGen {
     /// (`execute/20040709-1`). A symbol whose alignment is unknown here -- a
     /// literal pool label, say -- is not folded either.
     pub(super) fn lo12_folds(&self, name: &str, bytes: u32) -> bool {
-        self.sym_align.get(name).is_some_and(|&a| a >= bytes)
+        self.sym_align
+            .get(name)
+            .is_some_and(|a| a.bytes() >= u64::from(bytes))
     }
 
     /// Load value of a global symbol into a register with specified size
@@ -166,7 +168,7 @@ impl Aarch64CodeGen {
     /// outside -0x8000..=0xFFFF, a second copy of the same rule.
     pub(super) fn emit_mov_imm(&mut self, dst: Reg, val: i64, size: u32) {
         self.push_lir(Aarch64Inst::Mov {
-            size: OperandSize::from_bits(size.max(32)),
+            size: OperandSize::from_bits(crate::units::Bits::new(size.max(32))),
             src: GpOperand::Imm(val),
             dst,
         });
@@ -176,7 +178,7 @@ impl Aarch64CodeGen {
         let actual_size = size; // Keep original size for sub-32-bit stack loads
         let size = size.max(32);
         let loc = self.get_location(src);
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
 
         match loc {
             Loc::Reg(r) if r == dst => {}
@@ -191,7 +193,7 @@ impl Aarch64CodeGen {
             ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 // For sub-32-bit values, use sized load (ldrb/ldrh) which zero-extends.
                 // This avoids reading garbage from adjacent stack bytes.
-                let load_size = OperandSize::from_bits(actual_size.max(8));
+                let load_size = OperandSize::from_bits(crate::units::Bits::new(actual_size.max(8)));
                 // LIR: load from stack (FP-relative for alloca safety)
                 self.push_lir(Aarch64Inst::Ldr {
                     size: load_size,
@@ -203,7 +205,7 @@ impl Aarch64CodeGen {
                 self.emit_mov_imm(dst, v as i64, size);
             }
             Loc::Global(name) => {
-                let load_size = OperandSize::from_bits(size.max(32));
+                let load_size = OperandSize::from_bits(crate::units::Bits::new(size.max(32)));
                 self.emit_load_global(&name, dst, load_size);
             }
             Loc::VReg(v) => {
@@ -289,14 +291,14 @@ impl Aarch64CodeGen {
                 let reg_size = size.max(32);
                 // LIR: mov register to register
                 self.push_lir(Aarch64Inst::Mov {
-                    size: OperandSize::from_bits(reg_size),
+                    size: OperandSize::from_bits(crate::units::Bits::new(reg_size)),
                     src: GpOperand::Reg(src),
                     dst: *r,
                 });
             }
             Loc::Stack(offset) => {
                 // LIR: store to stack (FP-relative for alloca safety)
-                let op_size = OperandSize::from_bits(size);
+                let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
                 self.push_lir(Aarch64Inst::Str {
                     size: op_size,
                     src,
@@ -421,7 +423,7 @@ impl Aarch64CodeGen {
         // `dst` is an allocated register or X9, so it is never X16 or X17;
         // `base` may be either, since that is what carries a computed address.
         let scratch = if base == Reg::X16 { Reg::X17 } else { Reg::X16 };
-        let size = OperandSize::from_bits(width as u32 * 8);
+        let size = OperandSize::from_bits(crate::units::Bits::new(width as u32 * 8));
         // Whichever half lands in `base` has to be read last: after
         // coalescing, `dst` can be the very register holding the address.
         // `scratch` is chosen above so that it never is.
@@ -533,7 +535,7 @@ impl Aarch64CodeGen {
             8 => {
                 this.push_lir(Aarch64Inst::Ldrs {
                     src_size: OperandSize::B8,
-                    dst_size: OperandSize::from_bits(reg_size),
+                    dst_size: OperandSize::from_bits(crate::units::Bits::new(reg_size)),
                     addr: mem_addr,
                     dst: dst_reg,
                 });
@@ -548,7 +550,7 @@ impl Aarch64CodeGen {
             16 => {
                 this.push_lir(Aarch64Inst::Ldrs {
                     src_size: OperandSize::B16,
-                    dst_size: OperandSize::from_bits(reg_size),
+                    dst_size: OperandSize::from_bits(crate::units::Bits::new(reg_size)),
                     addr: mem_addr,
                     dst: dst_reg,
                 });
@@ -563,7 +565,7 @@ impl Aarch64CodeGen {
                 }
                 _ => {
                     this.push_lir(Aarch64Inst::Ldr {
-                        size: OperandSize::from_bits(mem_size),
+                        size: OperandSize::from_bits(crate::units::Bits::new(mem_size)),
                         addr: mem_addr,
                         dst: dst_reg,
                     });
@@ -584,7 +586,7 @@ impl Aarch64CodeGen {
                         self.emit_overlapped_load(Reg::X17, 0, width, high, dst_reg);
                     }
                     None => {
-                        let load_size = OperandSize::from_bits(mem_size);
+                        let load_size = OperandSize::from_bits(crate::units::Bits::new(mem_size));
                         self.emit_load_global(&name, dst_reg, load_size);
                     }
                 }
@@ -635,7 +637,7 @@ impl Aarch64CodeGen {
         // At the width `SymSlot::store_bits` decides.
         let store_size = OperandSize::from_bits(SymSlot::store_bits(
             self.sym_slots.get(&addr),
-            mem_size,
+            crate::units::Bits::new(mem_size),
             insn.offset,
         ));
 

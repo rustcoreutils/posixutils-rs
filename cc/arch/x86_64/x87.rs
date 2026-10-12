@@ -1048,7 +1048,7 @@ impl X86_64CodeGen {
             }
         } else {
             X86Inst::Mov {
-                size: OperandSize::from_bits(dst_size.max(32)),
+                size: OperandSize::from_bits(crate::units::Bits::new(dst_size.max(32))),
                 src: GpOperand::Mem(result),
                 dst: GpOperand::Reg(Reg::R10),
             }

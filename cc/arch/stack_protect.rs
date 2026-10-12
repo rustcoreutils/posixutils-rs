@@ -120,7 +120,7 @@ fn large_char_array(t: TypeId, types: &TypeTable, buffer_size: u64) -> bool {
             types
                 .base_type(t)
                 .is_some_and(|e| types.kind(e) == TypeKind::Char)
-                && types.size_bytes(t) as u64 >= buffer_size
+                && types.byte_size(t).get() >= buffer_size
         }
         TypeKind::Struct | TypeKind::Union => types.composite(t).is_some_and(|c| {
             c.members

@@ -2075,7 +2075,7 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        let size = setval_sizes.get(&interval.pseudo).copied().unwrap_or(64);
+                        let size = setval_sizes.get(&interval.pseudo).map_or(64, |b| b.get());
                         self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;

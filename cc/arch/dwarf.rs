@@ -618,7 +618,7 @@ fn emit_type_dies<I: LirInst + EmitAsm>(
             continue;
         }
         let id = key.core;
-        let size = types.size_bytes(id) as i64;
+        let size = types.byte_size(id).to_i64();
         match types.kind(id) {
             TypeKind::Pointer => match types.base_type(id).and_then(|b| dies.label(b)) {
                 Some(pointee) => {
@@ -645,7 +645,7 @@ fn emit_type_dies<I: LirInst + EmitAsm>(
                 // One subrange child giving the last valid index.
                 let elem_size = types
                     .base_type(id)
-                    .map(|b| types.size_bytes(b) as i64)
+                    .map(|b| types.byte_size(b).to_i64())
                     .unwrap_or(1)
                     .max(1);
                 base.push_directive(Directive::Uleb128(ABBREV_SUBRANGE));

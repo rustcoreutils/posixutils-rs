@@ -733,7 +733,7 @@ impl X86_64CodeGen {
         // An SSE register operand: sixteen bytes is the whole register, never
         // x87's extended format, which `from_bits` would pick for 128 bits.
         for (xmm, pseudo, size) in sse_input_moves.iter() {
-            let fp_size = FpSize::for_sse_aggregate(*size);
+            let fp_size = FpSize::for_sse_aggregate(crate::units::Bits::new(*size));
             self.emit_fp_move(*pseudo, *xmm, fp_size);
         }
 
@@ -845,7 +845,7 @@ impl X86_64CodeGen {
                 );
                 continue;
             }
-            let fp_size = FpSize::for_sse_aggregate(*size);
+            let fp_size = FpSize::for_sse_aggregate(crate::units::Bits::new(*size));
             self.emit_fp_move_from_xmm(*xmm, actual_loc, fp_size);
         }
 

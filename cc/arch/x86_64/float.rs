@@ -45,9 +45,14 @@ impl X86_64CodeGen {
     pub(super) fn fp_format(&self, typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
         let width = Self::size_from_type(typ, size, types);
         if typ.is_some_and(|t| types.is_complex_float(t)) {
-            return FpSize::from_bits(width, &self.base.target);
+            return FpSize::from_bits(crate::units::Bits::new(width), &self.base.target);
         }
-        FpSize::from_type_or_bits(typ, width, types, &self.base.target)
+        FpSize::from_type_or_bits(
+            typ,
+            crate::units::Bits::new(width),
+            types,
+            &self.base.target,
+        )
     }
 
     /// Emit a floating-point load operation
@@ -68,8 +73,7 @@ impl X86_64CodeGen {
         let addr_loc = self.get_location(addr);
 
         // Use type-aware FP size determination
-        let fp_size =
-            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         match addr_loc {
             Loc::Reg(r) => {
@@ -149,8 +153,7 @@ impl X86_64CodeGen {
             _ => return,
         };
         // Use type-aware FP size determination
-        let fp_size =
-            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         // IMPORTANT: Check address location BEFORE emit_fp_move, because emit_fp_move
         // may clobber RAX when loading immediate values. If addr is in RAX, we need
@@ -337,8 +340,7 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
         // Use type-aware FP size determination
-        let fp_size =
-            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         // Helper to emit the FP binop LIR instruction
         let emit_fp_binop_lir = |cg: &mut Self, src: XmmOperand, dst: XmmReg| match insn.op {
@@ -920,8 +922,7 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
         // Use type-aware FP size determination
-        let fp_size =
-            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
 
         // Move source to destination
         self.emit_fp_move(
@@ -1111,7 +1112,7 @@ impl X86_64CodeGen {
         let nan = cmp.nan();
         // The operands' format; the result is an `int`.
         let (operand, width) = (insn.operand_type(), insn.operand_width());
-        let fp_size = FpSize::from_type_or_bits(operand, width.get(), types, &self.base.target);
+        let fp_size = FpSize::from_type_or_bits(operand, width, types, &self.base.target);
         let move_size = self.fp_format(operand, width.get(), types);
 
         // Use Xmm15 as the work register for src1 (Xmm15/Xmm14 are
@@ -1271,8 +1272,7 @@ impl X86_64CodeGen {
             _ => XmmReg::Xmm15,
         };
 
-        let fp_size =
-            FpSize::from_type_or_bits(insn.typ, insn.size.get(), types, &self.base.target);
+        let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
         let is_unsigned_64 = insn.op == Opcode::UCvtF && src_size == 64;
 
         // Move integer to R10 first (scratch register)
@@ -1367,7 +1367,7 @@ impl X86_64CodeGen {
                 // Zero-extend 32-bit unsigned to 64-bit signed for correct conversion
                 OperandSize::B64
             } else {
-                OperandSize::from_bits(src_size)
+                OperandSize::from_bits(crate::units::Bits::new(src_size))
             };
             self.push_lir(X86Inst::CvtIntToFp {
                 int_size,
@@ -1402,7 +1402,7 @@ impl X86_64CodeGen {
 
         // Move float to XMM15 (reserved scratch — see emit_fp_binop).
         let fp_size =
-            FpSize::from_type_or_bits(insn.src_typ, insn.src_size.get(), types, &self.base.target);
+            FpSize::from_type_or_bits(insn.src_typ, insn.src_size, types, &self.base.target);
         self.emit_fp_move(
             src,
             XmmReg::Xmm15,
@@ -1439,7 +1439,7 @@ impl X86_64CodeGen {
             let int_size = if is_unsigned && dst_size == 32 {
                 OperandSize::B64 // cvttsd2siq then truncate
             } else {
-                OperandSize::from_bits(dst_size)
+                OperandSize::from_bits(crate::units::Bits::new(dst_size))
             };
             self.push_lir(X86Inst::CvtFpToInt {
                 truncate,
@@ -1614,12 +1614,8 @@ impl X86_64CodeGen {
             _ => {
                 // Same type or types unknown, just move if needed
                 if dst_xmm != src_xmm {
-                    let dst_fp_size = FpSize::from_type_or_bits(
-                        insn.typ,
-                        insn.size.get(),
-                        types,
-                        &self.base.target,
-                    );
+                    let dst_fp_size =
+                        FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
                     self.push_lir(X86Inst::MovFp {
                         size: dst_fp_size,
                         src: XmmOperand::Reg(src_xmm),
@@ -1705,7 +1701,7 @@ impl X86_64CodeGen {
         // `copysign(1.0, -0.0)` is `-1.0`.
         if value.is_positive_zero() {
             // Use xorps/xorpd to zero the register (faster)
-            let fp_size = FpSize::from_bits(size, &self.base.target);
+            let fp_size = FpSize::from_bits(crate::units::Bits::new(size), &self.base.target);
             self.push_lir(X86Inst::XorFp {
                 size: fp_size,
                 src: xmm,

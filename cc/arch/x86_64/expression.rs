@@ -33,7 +33,7 @@ impl X86_64CodeGen {
             self.emit_int128_binop(insn);
             return;
         }
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -162,7 +162,7 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.get().max(32));
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -197,7 +197,7 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.get().max(32));
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -232,7 +232,7 @@ impl X86_64CodeGen {
             .typ
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.size.get().max(32));
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -309,7 +309,7 @@ impl X86_64CodeGen {
             .operand_type()
             .map(|t| types.size_bits(t).max(32))
             .unwrap_or(insn.operand_width().get().max(32));
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&s1), Some(&s2)) => (s1, s2),
             _ => return,
@@ -365,7 +365,7 @@ impl X86_64CodeGen {
                 cc,
                 CondCode::Slt | CondCode::Sle | CondCode::Sgt | CondCode::Sge
             );
-            let from = OperandSize::from_bits(narrow);
+            let from = OperandSize::from_bits(crate::units::Bits::new(narrow));
             // The second operand first, into a scratch no pseudo is
             // allocated to: the work register may be the one it is in.
             for (src, reg) in [(src2, scratch), (src1, work_reg)] {

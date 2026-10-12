@@ -256,12 +256,12 @@ pub fn constraint_clobbers<R: Copy + Ord>(
 /// Built once for the chordal pre-pass, which asked it per interval by
 /// scanning the whole function; that made the pre-pass intervals x
 /// instructions.
-pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, u32> {
+pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, crate::units::Bits> {
     let mut sizes = HashMap::new();
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
         if insn.op == Opcode::SetVal {
             if let Some(target) = insn.target {
-                sizes.entry(target).or_insert(insn.size.get());
+                sizes.entry(target).or_insert(insn.size);
             }
         }
     }
@@ -940,7 +940,7 @@ pub fn local_slot(
     let align = local
         .explicit_align
         .map(|a| a as i32)
-        .unwrap_or_else(|| (types.alignment(local.typ) as i32).max(8));
+        .unwrap_or_else(|| crate::abi::slot_align(types.align(local.typ)).max(8));
     (bytes.max(8), align)
 }
 

@@ -412,7 +412,7 @@ impl X86_64CodeGen {
 
     /// Load the `bytes` (1, 2, 4 or 8) bytes at `addr` into `dst`.
     fn load_bits(&mut self, addr: MemAddr, bytes: usize, dst: Reg) {
-        let size = OperandSize::from_bits((bytes * 8) as u32);
+        let size = OperandSize::from_bits(crate::units::Bits::new((bytes * 8) as u32));
         match size {
             OperandSize::B8 | OperandSize::B16 => self.push_lir(X86Inst::Movzx {
                 src_size: size,

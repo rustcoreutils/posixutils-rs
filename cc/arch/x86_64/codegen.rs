@@ -267,7 +267,7 @@ impl X86_64CodeGen {
     /// `scratch` when no immediate encoding holds it. `scratch` must not be a
     /// register `addr` is formed from.
     pub(super) fn store_imm(&mut self, v: i128, size: u32, addr: MemAddr, scratch: Reg) {
-        let op_size = OperandSize::from_bits(size.max(32));
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size.max(32)));
         let src = match Self::imm_operand(v, size) {
             Some(imm) => imm,
             None => {
@@ -646,8 +646,8 @@ impl X86_64CodeGen {
     /// `scratch` where it is neither in a register nor in the frame. The one
     /// test `Cbr` and `Select` both make.
     fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
-        let bits = self.base.value_widths.bits(cond).clamp(8, 64);
-        let size = OperandSize::from_bits(bits);
+        let bits = self.base.value_widths.bits(cond).get().clamp(8, 64);
+        let size = OperandSize::from_bits(crate::units::Bits::new(bits));
         match self.get_location(cond) {
             Loc::Reg(r) => self.push_lir(X86Inst::Test {
                 size,
@@ -684,7 +684,7 @@ impl X86_64CodeGen {
         };
 
         let loc = self.get_location(cond);
-        let size = self.base.value_widths.bits(cond);
+        let size = self.base.value_widths.bits(cond).get();
 
         // Handle 128-bit integer stack values: OR both halves together and test
         if self.int128_pseudos.contains(&insn.src[0]) {
@@ -915,7 +915,7 @@ impl X86_64CodeGen {
                     PseudoKind::Val(v) => match target_loc {
                         Some(Loc::Reg(r)) => {
                             self.push_lir(X86Inst::Mov {
-                                size: OperandSize::from_bits(insn.size.get()),
+                                size: OperandSize::from_bits(insn.size),
                                 src: GpOperand::Imm(*v as i64),
                                 dst: GpOperand::Reg(r),
                             });
@@ -1457,7 +1457,7 @@ impl X86_64CodeGen {
             || matches!(self.get_location(else_val), Loc::Xmm(_) | Loc::FImm(..));
 
         if is_fp {
-            let fmt = self.fp_format(insn.typ, size, types);
+            let fmt = self.fp_format(insn.typ, size.get(), types);
             if fmt == FpSize::Extended {
                 self.emit_x87_select(ops);
             } else {
@@ -1577,7 +1577,7 @@ impl X86_64CodeGen {
             target,
             width: size,
         } = ops;
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size.get()));
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
@@ -1585,21 +1585,21 @@ impl X86_64CodeGen {
         };
 
         // Move else value into destination first (default if condition is false)
-        self.emit_move(else_val, dst_reg, size);
+        self.emit_move(else_val, dst_reg, size.get());
 
         // Test condition
         let cond_loc = self.get_location(cond);
         match &cond_loc {
             Loc::Imm(v) => {
                 if *v != 0 {
-                    self.emit_move(then_val, dst_reg, size);
+                    self.emit_move(then_val, dst_reg, size.get());
                     if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                        self.emit_move_to_loc(dst_reg, &dst_loc, size);
+                        self.emit_move_to_loc(dst_reg, &dst_loc, size.get());
                     }
                     return;
                 }
                 if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                    self.emit_move_to_loc(dst_reg, &dst_loc, size);
+                    self.emit_move_to_loc(dst_reg, &dst_loc, size.get());
                 }
                 return;
             }
@@ -1611,7 +1611,7 @@ impl X86_64CodeGen {
         } else {
             Reg::R10
         };
-        self.emit_move(then_val, then_reg, size);
+        self.emit_move(then_val, then_reg, size.get());
         self.push_lir(X86Inst::CMov {
             cc: CondCode::Ne,
             size: op_size,
@@ -1620,7 +1620,7 @@ impl X86_64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, size);
+            self.emit_move_to_loc(dst_reg, &dst_loc, size.get());
         }
     }
 

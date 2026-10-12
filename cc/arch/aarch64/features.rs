@@ -722,8 +722,10 @@ impl Aarch64CodeGen {
             self.emit_block_copy_loop(Reg::X16, addr, bytes.into());
             return;
         }
-        for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
-            let size = OperandSize::from_bits(chunk.bits().get());
+        for (done, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(bytes).expect("a byte count is not negative"),
+        )) {
+            let size = OperandSize::from_bits(chunk.bits());
             let done = done as i32;
             self.push_lir(Aarch64Inst::Ldr {
                 size,
@@ -857,7 +859,7 @@ impl Aarch64CodeGen {
         let (_, scratch1, _) = Reg::scratch_regs();
 
         if is_fp {
-            let fp_size = FpSize::from_bits(type_bits, &self.base.target);
+            let fp_size = FpSize::from_bits(crate::units::Bits::new(type_bits), &self.base.target);
             self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size,
                 addr: MemAddr::Base(addr),
@@ -883,7 +885,7 @@ impl Aarch64CodeGen {
             return;
         }
 
-        let op_size = OperandSize::from_bits(type_bits.max(32));
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(type_bits.max(32)));
         self.push_lir(Aarch64Inst::Ldr {
             size: op_size,
             addr: MemAddr::Base(addr),

@@ -778,8 +778,12 @@ impl Aarch64CodeGen {
                 // so a composite that is not a multiple of eight reads and
                 // writes its tail as wide as the tail is.
                 let src = self.aggregate_arg_address(stack_arg.pseudo);
-                for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
-                    let size = OperandSize::from_bits(chunk.bits().get());
+                for (done, chunk) in
+                    crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+                        u64::try_from(bytes).expect("a byte count is not negative"),
+                    ))
+                {
+                    let size = OperandSize::from_bits(chunk.bits());
                     let done = done as i32;
                     self.push_lir(Aarch64Inst::Ldr {
                         size,
@@ -859,13 +863,13 @@ impl Aarch64CodeGen {
                 // the value's own size on Apple, where a `char` is one byte
                 // and the next argument begins right after it.
                 self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::from_bits(
+                    size: OperandSize::from_bits(crate::units::Bits::new(
                         slot.bytes
                             .min(ByteSize::new(8))
                             .bits()
                             .expect("eight bytes have a width")
                             .get(),
-                    ),
+                    )),
                     src: Reg::X9,
                     addr: MemAddr::BaseOffset {
                         base: Reg::SP,
@@ -890,8 +894,10 @@ impl Aarch64CodeGen {
     /// A ragged width is assembled from the pieces `block_chunks` gives, each
     /// shifted to its place, which is what clang emits for the same argument.
     fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: i64) {
-        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
-            let size = OperandSize::from_bits(chunk.bits().get());
+        for (at, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
+            u64::try_from(bytes).expect("a byte count is not negative"),
+        )) {
+            let size = OperandSize::from_bits(chunk.bits());
             // The first piece lands in `dst`; the rest are shifted into it
             // through the address scratch, which the base is not held in.
             let into = if at == 0 { dst } else { Reg::X16 };

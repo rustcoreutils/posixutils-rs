@@ -97,7 +97,7 @@ impl Aarch64CodeGen {
         let target = insn.target.expect("atomic load needs target");
         let addr = insn.src[0];
         let size = insn.size.get();
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
 
         self.emit_addr_into(addr, insn.displacement(), Reg::X10);
 
@@ -116,7 +116,7 @@ impl Aarch64CodeGen {
         let addr = insn.src[0];
         let value = insn.src[1];
         let size = insn.size.get();
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
 
         let value_loc = self.get_location(value);
 
@@ -149,7 +149,7 @@ impl Aarch64CodeGen {
         let addr = insn.src[0];
         let value = insn.src[1];
         let size = insn.size.get();
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         let ordering = Ordering::of(insn.extra().memory_order);
 
         let value_loc = self.get_location(value);
@@ -255,7 +255,7 @@ impl Aarch64CodeGen {
         let expected_ptr = insn.src[1];
         let desired = insn.src[2];
         let size = insn.size.get();
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         // The success and failure orders were combined into this one by the
         // linearizer (`cas_order`); a failed attempt runs the same load.
         let ordering = Ordering::of(insn.extra().memory_order);
@@ -372,7 +372,7 @@ impl Aarch64CodeGen {
 
     /// Helper to move a value into a register
     fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: u32) {
-        let op_size = OperandSize::from_bits(size);
+        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
         match loc {
             Loc::Reg(src) => {
                 if src != reg {

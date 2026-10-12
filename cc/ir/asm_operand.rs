@@ -27,6 +27,7 @@ use crate::arch::asm_constraints::{
     canonical_int, AsmOperandClass, AsmRegClass, FloatImm, PinnedGp,
 };
 use crate::target::Arch;
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 
 /// Follows the address arithmetic of an operand back to the object it names.
@@ -360,7 +361,9 @@ pub fn resolve_pinned_registers(func: &mut Function, arch: Arch, optimizing: boo
 enum PinnedValue {
     /// A register variable: the register itself.
     Register,
-    Pseudo(PseudoId),
+    /// A value, at the width the operand puts it in the register: one
+    /// value at two widths is two (`-1` and `-1L`).
+    Pseudo(PseudoId, Bits),
 }
 
 /// How many instructions deep [`ValueWalk::same`] compares two values.
@@ -380,9 +383,16 @@ impl ValueWalk<'_> {
         if a == b {
             return true;
         }
+        // A constant lives in its pseudo, not in the `SetVal` that defines
+        // it: compared here, and never by that instruction's operands, which
+        // it has none of. (The caller has matched the operands' widths.)
         let kind = |p: PseudoId| self.func.get_pseudo(p).map(|x| &x.kind);
-        if let (Some(PseudoKind::Val(x)), Some(PseudoKind::Val(y))) = (kind(a), kind(b)) {
-            return x == y;
+        match (kind(a), kind(b)) {
+            (Some(PseudoKind::Val(x)), Some(PseudoKind::Val(y))) => return x == y,
+            (Some(PseudoKind::FVal(x)), Some(PseudoKind::FVal(y))) => return x == y,
+            (Some(PseudoKind::Val(_) | PseudoKind::FVal(_)), _)
+            | (_, Some(PseudoKind::Val(_) | PseudoKind::FVal(_))) => return false,
+            _ => {}
         }
         let (Some(x), Some(y)) = (self.defs.get(&a), self.defs.get(&b)) else {
             return false;
@@ -404,7 +414,6 @@ impl ValueWalk<'_> {
                 | Zext
                 | Sext
                 | SymAddr
-                | SetVal
         );
         depth > 0
             && pure
@@ -476,9 +485,9 @@ fn pinned_conflicts(
         if class.variable_pin {
             PinnedValue::Register
         } else if c.matching_output.is_some() {
-            PinnedValue::Pseudo(copied_in(c.pseudo))
+            PinnedValue::Pseudo(copied_in(c.pseudo), c.size)
         } else {
-            PinnedValue::Pseudo(c.pseudo)
+            PinnedValue::Pseudo(c.pseudo, c.size)
         }
     };
     let mut groups = Vec::new();
@@ -526,8 +535,8 @@ fn pinned_conflicts(
     let values = ValueWalk { func, defs: &defs };
     let shareable = |a: PinnedValue, b: PinnedValue| match (a, b) {
         (PinnedValue::Register, PinnedValue::Register) => true,
-        (PinnedValue::Pseudo(x), PinnedValue::Pseudo(y)) => {
-            optimizing && values.same(x, y, SAME_VALUE_DEPTH)
+        (PinnedValue::Pseudo(x, xw), PinnedValue::Pseudo(y, yw)) => {
+            optimizing && xw == yw && values.same(x, y, SAME_VALUE_DEPTH)
         }
         _ => false,
     };

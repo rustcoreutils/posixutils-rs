@@ -47,6 +47,11 @@ fn asm_pinned_registers_impossible_at_every_level() {
         // never moves a register-pinned value to memory to free its
         // register, so it refuses it at -O0 too.
         r#"__asm__("" : "=a"(x) : "am"(a), "a"(b));"#,
+        // Two floating constants are one value only with one encoding: not
+        // 1.0f and 2.0f, and not 1.0f and 1.0, whose bits differ.
+        r#"__asm__("" : "=r"(x) : "a"(1.0f), "a"(2.0f));"#,
+        r#"__asm__("" : "=r"(x) : "a"(1.0f), "a"(1.0));"#,
+        r#"__asm__("" : "=r"(x) : "a"(-1), "a"(-1L));"#,
     ];
     for (n, stmt) in cases.iter().enumerate() {
         for opt in ["-O0", "-O1", "-O2"] {
@@ -67,6 +72,7 @@ fn asm_pinned_registers_one_value_shares_when_optimizing() {
         r#"__asm__("" : "=a"(x) : "a"(1), "a"(1));"#,
         r#"__asm__("" : "=r"(x) : "a"(a + 1), "a"(a + 1));"#,
         r#"__asm__("" : "=a"(x) : "a"(a), "a"(a));"#,
+        r#"__asm__("" : "=r"(x) : "a"(1.5f), "a"(1.5f));"#,
     ];
     for (n, stmt) in cases.iter().enumerate() {
         let name = format!("asm_pin_share_{n}");

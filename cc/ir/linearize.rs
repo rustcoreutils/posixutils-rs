@@ -699,6 +699,9 @@ pub struct Linearizer<'a> {
     /// Local variables (use Load/Store, converted to SSA later)
     /// Keyed by SymbolId for proper scope handling
     pub(crate) locals: HashMap<SymbolId, LocalVarInfo>,
+    /// The automatic objects of an SVE type, which have no storage: see
+    /// `linearize_local_decl`.
+    pub(crate) sve_locals: std::collections::HashSet<SymbolId>,
     /// The evaluated extents of each variably modified `typedef` in scope,
     /// keyed by the typedef's symbol.
     ///
@@ -934,6 +937,7 @@ impl<'a> Linearizer<'a> {
             next_pseudo: 0,
             next_bb: 0,
             locals: HashMap::with_capacity(DEFAULT_LOCALS_CAPACITY),
+            sve_locals: Default::default(),
             vm_typedef_dims: HashMap::new(),
             label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             break_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
@@ -1965,6 +1969,7 @@ impl<'a> Linearizer<'a> {
         self.next_pseudo = 0;
         self.next_bb = 0;
         self.locals.clear();
+        self.sve_locals.clear();
         self.local_scope_stack.clear();
         self.label_map.clear();
         self.range_values.clear();
@@ -3380,6 +3385,9 @@ impl<'a> Linearizer<'a> {
                 self.record_type_name_extents(*symbol, self.expr_type(expr), dims);
                 self.linearize_lvalue(expr)
             }
+            ExprKind::Ident(symbol_id) if self.sve_object_used(*symbol_id, expr.pos) => {
+                self.emit_const(0, self.types.ulong_id)
+            }
             ExprKind::Ident(symbol_id) => {
                 let local = self.locals.get(symbol_id).cloned();
                 let (sym, typ) = match local {
@@ -3586,7 +3594,7 @@ impl<'a> Linearizer<'a> {
         // for a NaN. The optimizer deleted the dead conversion at -O1 and
         // above, so only -O0 raised it.
         if self.types.kind(cast_type) == TypeKind::Void {
-            return self.linearize_expr(inner_expr);
+            return self.linearize_discarded(inner_expr);
         }
 
         // A floating constant to an integer type folds, saturated where it
@@ -5682,7 +5690,45 @@ impl<'a> Linearizer<'a> {
         result
     }
 
+    /// Evaluate `expr` for its side effects alone, its value discarded: an
+    /// expression statement, a cast to `void`, a comma's left operand.
+    ///
+    /// An object of an SVE type is then not read -- gcc reads none, and
+    /// reading one is SVE code -- so `(void)*p` and an unused SVE local's
+    /// `(void)v` are nothing but the pointer's own evaluation, as in gcc.
+    ///
+    /// Answers a pseudo of what it evaluated, which the caller discards.
+    pub(crate) fn linearize_discarded(&mut self, expr: &Expr) -> PseudoId {
+        let typ = self.expr_type(expr);
+        let volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
+        if self.types.sve_name(typ).is_some() && !volatile {
+            match &expr.kind {
+                ExprKind::Ident(_) => return self.emit_const(0, self.types.int_id),
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand,
+                } => return self.linearize_expr(operand),
+                _ => {}
+            }
+        }
+        self.linearize_expr(expr)
+    }
+
+    /// Whether `symbol_id` is an automatic object of an SVE type, which is
+    /// then reported at `pos`: it has no storage to read, write or locate,
+    /// which only SVE code could give it.
+    pub(crate) fn sve_object_used(&self, symbol_id: SymbolId, pos: Position) -> bool {
+        let used = self.sve_locals.contains(&symbol_id);
+        if used {
+            crate::diag::error(pos, "this operation requires the SVE ISA extension");
+        }
+        used
+    }
+
     pub(crate) fn linearize_ident(&mut self, expr: &Expr, symbol_id: SymbolId) -> PseudoId {
+        if self.sve_object_used(symbol_id, expr.pos) {
+            return self.emit_const(0, self.types.int_id);
+        }
         let sym = self.symbols.get(symbol_id);
 
         // First check if it's an enum constant
@@ -7527,8 +7573,13 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::Comma(exprs) => {
                 let mut result = self.emit_const(0, self.types.int_id);
-                for e in exprs {
-                    result = self.linearize_expr(e);
+                for (i, e) in exprs.iter().enumerate() {
+                    // Every operand but the last is evaluated for its effects.
+                    result = if i + 1 < exprs.len() {
+                        self.linearize_discarded(e)
+                    } else {
+                        self.linearize_expr(e)
+                    };
                 }
                 result
             }

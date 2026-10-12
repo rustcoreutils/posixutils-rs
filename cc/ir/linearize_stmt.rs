@@ -128,7 +128,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Empty => {}
 
             Stmt::Expr(expr) => {
-                self.linearize_expr(expr);
+                self.linearize_discarded(expr);
             }
 
             Stmt::Block(items) => {
@@ -388,6 +388,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .collect();
                     self.vm_typedef_dims.insert(declarator.symbol, variable);
                 }
+                continue;
+            }
+
+            // An object of an SVE type: its size is the machine's, which
+            // only SVE code knows, so it gets no storage -- an object
+            // nothing uses needs none, as in gcc -- and any use of it is
+            // reported (`sve_object_used`). A static or `extern` one, or an
+            // initialized one, the parser has already refused.
+            if self.types.sve_name(typ).is_some() {
+                self.sve_locals.insert(declarator.symbol);
                 continue;
             }
 

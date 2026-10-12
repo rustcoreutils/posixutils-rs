@@ -545,19 +545,21 @@ impl Parser<'_> {
             // so its object needs a size like any other.
             if !is_fn && self.types.sve_name(typ).is_some() {
                 // gcc refuses an SVE object of static storage duration, or
-                // an `extern` one, for its size, and makes no other without
-                // SVE code; neither does c17.
-                let what = if scope == DeclScope::File
+                // an `extern` one, for its size. An automatic one needs SVE
+                // code only once something reads, writes or locates it --
+                // an initializer here; otherwise the linearizer reports the
+                // use, and an object nothing uses is no code at all, as in
+                // gcc.
+                let fixed = scope == DeclScope::File
                     || specs.is_extern()
                     || specs
                         .storage_class
-                        .contains(crate::types::TypeModifiers::STATIC)
-                {
-                    super::target_types::SveUse::StaticObject
-                } else {
-                    super::target_types::SveUse::Value
-                };
-                self.report_sve_use(typ, what, pos);
+                        .contains(crate::types::TypeModifiers::STATIC);
+                if fixed {
+                    self.report_sve_use(typ, super::target_types::SveUse::StaticObject, pos);
+                } else if init.is_some() {
+                    self.report_sve_use(typ, super::target_types::SveUse::Value, pos);
+                }
             } else if !is_fn && (!specs.is_extern() || init.is_some()) {
                 self.check_object_complete(scope, name, typ, pos);
             }

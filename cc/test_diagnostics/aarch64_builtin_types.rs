@@ -185,8 +185,18 @@ fn sve_types_refuse_what_needs_a_size() {
             "this operation requires the SVE ISA extension",
         ),
         (
-            "sve_local",
-            "void g(void) { sv v; }\n",
+            "sve_local_read",
+            "void g(sv *p) { sv v; *p = v; }\n",
+            "this operation requires the SVE ISA extension",
+        ),
+        (
+            "sve_local_address",
+            "void h(void *); void g(void) { sv v; h(&v); }\n",
+            "this operation requires the SVE ISA extension",
+        ),
+        (
+            "sve_local_init",
+            "void g(sv *p) { sv v = *p; (void)v; }\n",
             "this operation requires the SVE ISA extension",
         ),
         (
@@ -200,6 +210,31 @@ fn sve_types_refuse_what_needs_a_size() {
         let stderr = compile_rejected_with(name, &src, LINUX);
         assert!(stderr.contains(expected), "{name}:\n{stderr}");
         assert!(!stderr.contains("incomplete"), "{name}:\n{stderr}");
+    }
+}
+
+/// What needs no SVE code is accepted, as gcc accepts it without SVE: an
+/// automatic SVE object nothing reads, writes or locates -- it gets no
+/// storage -- and an SVE object designated with its value discarded, which
+/// reads nothing. gcc 13 at every level.
+#[test]
+fn sve_types_accept_what_needs_no_sve_code() {
+    let pre = "typedef __SVFloat32_t sv;\n";
+    for body in [
+        "void g(void) { sv v; }\n",
+        "void g(void) { register sv v; __SVBool_t a, b; }\n",
+        "void g(sv *p) { sv v; (void)v; }\n",
+        "void g(sv *p) { __typeof__(*p) v; }\n",
+        "void g(sv *p) { (void)*p; }\n",
+        "void g(sv *p) { *p; }\n",
+        "int g(sv *p) { int x = (*p, 1); return x; }\n",
+        "void g(sv *p, int c) { c ? (void)*p : (void)0; }\n",
+    ] {
+        let src = format!("{pre}{body}");
+        for opt in ["-O0", "-O2"] {
+            let stderr = compile_accepted("sve_no_code", &src, &[LINUX[0], opt]);
+            assert!(stderr.is_empty(), "{body} {opt}:\n{stderr}");
+        }
     }
 }
 

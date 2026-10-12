@@ -585,3 +585,53 @@ int main(void)
 "#;
     crate::common::compile_and_run_everywhere("misc_returns_twice_attr", code);
 }
+
+/// A value live across `setjmp` keeps its slot at every point the setjmp
+/// reaches, not only at the points laid out after it. Inlining `half` sorts
+/// the blocks breadth first, which puts the call to `child` -- reached from
+/// the setjmp's first return -- ahead of the setjmp's own block. The slot
+/// holding `t` went to an argument of `child` laid out there, so after the
+/// `longjmp` came back `restore` read that argument instead of the token.
+/// CPython's `_posixsubprocess.do_fork_exec` lost `vfork_tstate_save` this way
+/// across `vfork`.
+#[test]
+fn misc_value_across_setjmp_survives_code_laid_out_before_it() {
+    let code = r#"
+#include <assert.h>
+#include <setjmp.h>
+static jmp_buf jb;
+__attribute__((noinline)) long save(void) { return 0x5eed; }
+static inline __attribute__((always_inline)) long half(long x) { return x / 2; }
+__attribute__((noinline)) int zero(void) { return 0; }
+__attribute__((noinline)) int restore(long t) { return t == 0x5eed ? 0 : 1; }
+__attribute__((noinline)) void child(long a, long b, long c, long d, long e,
+                                     long f, long g, long h, long i, long j) {
+    if (a + b + c + d + e + f + g + h + i + j != 55)
+        __builtin_trap();
+    longjmp(jb, 1);
+}
+__attribute__((noinline)) int run(int flag, long a, long b, long c, long d,
+                                  long e, long f, long g, long h, long i, long j) {
+    int r, bad = 0;
+    long t;
+    if (flag) {
+        assert(a == 1);
+        assert(b == 2);
+        assert(c == 3);
+        assert(d == 4);
+        t = half(save() * 2);
+        r = setjmp(jb);
+        if (r != 0)
+            bad = restore(t);
+    } else {
+        r = zero();
+    }
+    if (r != 0)
+        return bad ? 2 : 0;
+    child(a, b, c, d, e, f, g, h, i, j);
+    return 3;
+}
+int main(void) { return run(1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10); }
+"#;
+    crate::common::compile_and_run_everywhere("misc_setjmp_reaches_back", code);
+}

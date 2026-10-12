@@ -844,6 +844,8 @@ where
     extend_across_returns_twice(
         func,
         &mut result,
+        &block_start_pos,
+        &bb_id_to_idx,
         block_end_pos.last().copied().unwrap_or(0),
     );
     result.sort_by_key(|i| (i.start, i.pseudo.0));
@@ -856,37 +858,72 @@ where
 }
 
 /// Stretch every value live across an instruction that returns twice (see
-/// [`Instruction::returns_twice`]) to the end of the function.
+/// [`Instruction::returns_twice`]) over every position the instruction
+/// reaches: to the end of the function, and back to the first block it
+/// reaches.
 ///
 /// A `longjmp` resumes at the setjmp from whatever call it is made under,
 /// and the CFG has no edge for that: a value live across the setjmp is read
 /// again on the second return, after code the liveness analysis believed it
 /// was dead in -- the path that led to the `longjmp`. A slot or register
 /// handed to another value there is overwritten before the value is read
-/// back. Every call after the setjmp may be the one that jumps, so the value
-/// must survive to the end. This is the pseudo-level counterpart of
+/// back. Every call the setjmp reaches may be the one that jumps, so the
+/// value must survive all of them. This is the pseudo-level counterpart of
 /// `local_lifetimes`, which spans every local over the whole function.
+///
+/// What the setjmp reaches is not only what is laid out after it: the
+/// inliner sorts blocks breadth first, and a path from the setjmp's first
+/// return can run through blocks laid out before it. Stretched only to the
+/// end, the value's slot went to a spill in one of those -- and `vfork`, a
+/// setjmp whose second return comes after the child has run on the same
+/// stack, lost CPython's `vfork_tstate_save` that way.
 ///
 /// The setjmp's own result starts there, and is written again on each
 /// return, so it is not stretched.
-fn extend_across_returns_twice(func: &Function, intervals: &mut [LiveInterval], last: usize) {
-    let positions: Vec<usize> = func
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insns)
-        .enumerate()
-        .filter(|(_, insn)| insn.returns_twice())
-        .map(|(pos, _)| pos)
-        .collect();
-    if positions.is_empty() {
-        return;
+fn extend_across_returns_twice(
+    func: &Function,
+    intervals: &mut [LiveInterval],
+    block_start_pos: &[usize],
+    bb_id_to_idx: &HashMap<BasicBlockId, usize>,
+    last: usize,
+) {
+    // Each returns-twice instruction's position, and the first position of
+    // anything it reaches.
+    let mut points: Vec<(usize, usize)> = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (pos, insn) in (block_start_pos[b]..).zip(&block.insns) {
+            if !insn.returns_twice() {
+                continue;
+            }
+            let mut reached = vec![false; func.blocks.len()];
+            let mut work: Vec<usize> = block
+                .children
+                .iter()
+                .filter_map(|c| bb_id_to_idx.get(c).copied())
+                .collect();
+            let mut from = pos;
+            while let Some(r) = work.pop() {
+                if std::mem::replace(&mut reached[r], true) {
+                    continue;
+                }
+                from = from.min(block_start_pos[r]);
+                work.extend(
+                    func.blocks[r]
+                        .children
+                        .iter()
+                        .filter_map(|c| bb_id_to_idx.get(c).copied()),
+                );
+            }
+            points.push((pos, from));
+        }
     }
     for interval in intervals.iter_mut() {
-        if positions
-            .iter()
-            .any(|&p| interval.start < p && p < interval.end)
-        {
-            interval.end = interval.end.max(last);
+        let (start, end) = (interval.start, interval.end);
+        for &(p, from) in &points {
+            if start < p && p < end {
+                interval.start = interval.start.min(from);
+                interval.end = interval.end.max(last);
+            }
         }
     }
 }
@@ -2169,6 +2206,67 @@ mod tests {
                 "{kind:?}: a value after the setjmp"
             );
         }
+    }
+
+    /// `.L0: br .L2; .L1: %5 = 1; ret %5; .L2: %3 = load p; %4 = setjmp;
+    /// cbr %4, .L3, .L1; .L3: ret %3` -- the path from the setjmp's first
+    /// return runs through `.L1`, laid out before the setjmp. `%3`, read on
+    /// the second return, spans `.L1` too, or `%5` could take its slot.
+    #[test]
+    fn a_value_across_setjmp_spans_what_it_reaches_laid_out_before_it() {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.int_id);
+        f.add_param("p", types.int_id);
+        f.add_pseudo(Pseudo::sym(PseudoId(2), "p".into()));
+        f.add_local("p", PseudoId(2), types.int_id, None, None);
+        for id in 3..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.add_pseudo(Pseudo::val(PseudoId(6), 1));
+        f.next_pseudo = 7;
+        let [b0, b1, b2, b3] = [0, 1, 2, 3].map(BasicBlockId);
+        let mut entry = BasicBlock::new(b0);
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::br(b2));
+        entry.children = vec![b2];
+        let mut first = BasicBlock::new(b1);
+        first.add_insn(Instruction::unop(
+            Opcode::Copy,
+            PseudoId(5),
+            PseudoId(6),
+            types.int_id,
+            32,
+        ));
+        first.add_insn(Instruction::ret(Some(PseudoId(5))));
+        first.parents = vec![b2];
+        let mut set = BasicBlock::new(b2);
+        set.add_insn(Instruction::load(
+            PseudoId(3),
+            PseudoId(2),
+            0,
+            types.int_id,
+            32,
+        ));
+        let mut setjmp = Instruction::new(Opcode::Setjmp);
+        setjmp.target = Some(PseudoId(4));
+        set.add_insn(setjmp.with_type_and_size(types.int_id, 32));
+        set.add_insn(Instruction::cbr(PseudoId(4), b3, b1));
+        set.parents = vec![b0];
+        set.children = vec![b3, b1];
+        let mut second = BasicBlock::new(b3);
+        second.add_insn(Instruction::ret(Some(PseudoId(3))));
+        second.parents = vec![b2];
+        for b in [entry, first, set, second] {
+            f.add_block(b);
+        }
+        f.entry = b0;
+        // .L1 is positions 2-3, the load 4, the setjmp 5.
+        let (start, end) = lifetime_of(&f, 3);
+        assert!(start <= 2, "{start}..{end} misses .L1");
+        assert_eq!(end, 7);
+        let (start5, end5) = lifetime_of(&f, 5);
+        assert!(start <= start5 && end5 <= end, "%5 {start5}..{end5}");
     }
 
     /// Where `setjmp` can bring control back unseen, every local spans the

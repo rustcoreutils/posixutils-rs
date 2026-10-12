@@ -35,14 +35,14 @@ use crate::units::{Align, Bits, ByteSize};
 
 /// An object's byte count as the backends' frame arithmetic needs it.
 ///
-/// Every stack slot and every stacked-argument slot in both backends is
-/// addressed by a signed 32-bit displacement, so a size has to become an `i32`
-/// before that arithmetic runs. Fifteen sites used to spell that `as i32`,
-/// which wraps: 3000000000 came out as -1294967296, the `size.max(8)` that
-/// follows gave the object an eight-byte slot, and the function's whole frame
-/// was `subq $32, %rsp` with the array laid over it.
+/// Every frame quantity in both backends is an `i64`, so a size has to
+/// become one before that arithmetic runs. Fifteen sites used to spell the
+/// conversion `as i32`, when the arithmetic was 32 bits wide, which wraps:
+/// 3000000000 came out as -1294967296, the `size.max(8)` that follows gave
+/// the object an eight-byte slot, and the function's whole frame was
+/// `subq $32, %rsp` with the array laid over it.
 ///
-/// [`TypeTable::MAX_STACK_OBJECT_BYTES`] is the bound, and
+/// [`TypeTable::MAX_FRAME_BYTES`] is the bound, and
 /// `Parser::check_stack_object_size` refuses a *declaration* that passes it.
 /// This is the backstop for the objects that check cannot see, and each one is
 /// reachable from C source:
@@ -68,7 +68,7 @@ pub fn slot_bytes(bytes: ByteSize, pos: crate::diag::Position, what: &str) -> i6
 /// [`slot_bytes`] kept as a size: `bytes` itself when a frame slot can hold
 /// it, and otherwise the one-eightbyte placeholder, after the diagnostic.
 pub fn checked_slot_size(bytes: ByteSize, pos: crate::diag::Position, what: &str) -> ByteSize {
-    let max = ByteSize::from_usize(TypeTable::MAX_STACK_OBJECT_BYTES);
+    let max = ByteSize::new(TypeTable::MAX_FRAME_BYTES.unsigned_abs());
     if bytes <= max {
         return bytes;
     }
@@ -80,9 +80,9 @@ pub fn checked_slot_size(bytes: ByteSize, pos: crate::diag::Position, what: &str
     ByteSize::new(8)
 }
 
-/// An alignment as the backends' frame arithmetic needs it: an `i32`, like
-/// every displacement [`slot_bytes`] feeds. No alignment c17 accepts is past
-/// 2^28, so one that does not fit is an internal compiler error.
+/// An alignment as the backends' frame arithmetic needs it: an `i32`. No
+/// alignment c17 accepts is past 2^28, so one that does not fit is an
+/// internal compiler error.
 pub fn slot_align(align: Align) -> i32 {
     match i32::try_from(align.bytes()) {
         Ok(bytes) => bytes,

@@ -262,8 +262,8 @@ impl StackSlot {
     /// sit at.
     pub fn place(self, at: i64) -> (i64, i64) {
         let align = ByteSize::new(self.align.bytes()).to_i64();
-        let start = (at + align - 1) & !(align - 1);
-        (start, start + self.bytes.to_i64())
+        let start = at.saturating_add(align - 1) & !(align - 1);
+        (start, start.saturating_add(self.bytes.to_i64()))
     }
 }
 

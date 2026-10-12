@@ -822,12 +822,10 @@ impl Parser<'_> {
 
     /// Refuse an object the backend cannot give a stack slot.
     ///
-    /// C17 puts no limit here; this one is c17's. Both backends address a local
-    /// and a stacked argument by a signed 32-bit displacement from the frame
-    /// register, so an object past [`TypeTable::MAX_STACK_OBJECT_BYTES`] has no
-    /// slot to be given -- and every size conversion in `arch/` and `abi/` was
-    /// a bare `as i32` that wrapped, so `char a[3000000000];` in a function got
-    /// an eight-byte slot and a `subq $32, %rsp` frame with no diagnostic.
+    /// C17 puts no limit here; this one is c17's, and gcc's: a frame cannot
+    /// span more than [`TypeTable::MAX_FRAME_BYTES`], `PTRDIFF_MAX` less what
+    /// the prologue adds, so an object past it has no slot to be given. An
+    /// object up to it has one, however far from the frame register.
     ///
     /// Asked only of an object with *automatic* storage duration and of a
     /// by-value parameter type. A static or file-scope object of the same size
@@ -848,7 +846,7 @@ impl Parser<'_> {
         what: &str,
     ) -> Result<(), ParseError> {
         let bytes = self.types.byte_size(typ);
-        if bytes <= ByteSize::from_usize(TypeTable::MAX_STACK_OBJECT_BYTES) {
+        if bytes <= ByteSize::new(TypeTable::MAX_FRAME_BYTES.unsigned_abs()) {
             return Ok(());
         }
         Err(ParseError::new(
@@ -856,7 +854,7 @@ impl Parser<'_> {
                 "size of {what} of type '{}' is {bytes} bytes, which exceeds \
                  the maximum stack object size of {} bytes",
                 self.types.format_type(typ, Some(self.idents)),
-                TypeTable::MAX_STACK_OBJECT_BYTES,
+                TypeTable::MAX_FRAME_BYTES,
             ),
             pos,
         ))

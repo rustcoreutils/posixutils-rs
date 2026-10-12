@@ -22,22 +22,21 @@ pub use verify::{
     check_assignment, verify_assignment, Assignment, Cell, Clobber, Conflict, Spared, Violation,
 };
 
-/// Grow a frame's locals area by one slot, refusing a total no `i32`
-/// displacement can reach -- counting what the prologue will add to it.
+/// Grow a frame's locals area by one slot, refusing a total past
+/// [`TypeTable::MAX_FRAME_BYTES`] -- counting what the prologue will add to
+/// it.
 ///
-/// [`TypeTable::MAX_STACK_OBJECT_BYTES`] bounds one object and
-/// [`crate::abi::slot_bytes`] enforces that. Neither bounds their *sum*, and
-/// `+=` on an `i32` wraps: a frame past two gigabytes came out negative and the
-/// prologue subtracted nothing. Every slot of either backend's frame is laid
-/// out through here, so this is the one place the total can be checked. A
-/// VLA or `alloca` extent never reaches it: the frame holds only an
-/// eight-byte pointer for one, and the extent is subtracted from the stack
-/// pointer at run time in a 64-bit register.
+/// [`crate::abi::slot_bytes`] bounds one object. It does not bound their
+/// *sum*, which is checked here: every slot of either backend's frame is laid
+/// out through here, so this is the one place the total can be. A VLA or
+/// `alloca` extent never reaches it: the frame holds only an eight-byte
+/// pointer for one, and the extent is subtracted from the stack pointer at
+/// run time in a 64-bit register.
 ///
 /// Admitting a frame here is a promise to everything downstream, so the check
 /// is against what the frame *becomes*, not what it is so far:
 ///
-/// - The slot's own rounding happens inside, in `i64`: the offset up to the
+/// - The slot's own rounding happens inside, in `i128`: the offset up to the
 ///   slot's alignment, and the size up to a multiple of it. Callers used to
 ///   round the size first, in `i32`, so `_Alignas(16) char a[2147483640]`
 ///   wrapped to a zero-byte slot before this check ever saw it.
@@ -46,13 +45,13 @@ pub use verify::{
 ///   can add almost twice it (`stack_size`). It is reserved here.
 /// - Everything else the prologue adds -- saved registers, the variadic save
 ///   area -- is inside [`TypeTable::FRAME_HEADROOM_BYTES`], which
-///   `MAX_STACK_OBJECT_BYTES` already leaves below `i32::MAX`.
+///   `MAX_FRAME_BYTES` already leaves below `i64::MAX`.
 ///
-/// So every frame quantity computed later, in `i32`, stays in range without a
-/// check of its own. Before this, an accepted frame near the limit wrapped in
-/// `stack_size`, in the prologue total and in aarch64's frame zeroing -- which
-/// then looped forever, pushing instructions until the compiler ran out of
-/// memory.
+/// So every frame quantity computed later, in `i64`, stays in range without a
+/// check of its own. When frame quantities were `i32`, an accepted frame near
+/// their limit wrapped in `stack_size`, in the prologue total and in aarch64's
+/// frame zeroing -- which then looped forever, pushing instructions until the
+/// compiler ran out of memory.
 pub fn grow_frame(
     offset: &mut i64,
     size: i64,
@@ -60,39 +59,41 @@ pub fn grow_frame(
     frame_align: i32,
     pos: crate::diag::Position,
 ) -> i64 {
-    let align = i64::from(alignment.max(1));
-    let mut want = *offset;
+    let align = i128::from(alignment.max(1));
+    let mut want = i128::from(*offset);
     if alignment > 8 {
         want = (want + align - 1) & !(align - 1);
     }
-    want += (size.max(0) + align - 1) & !(align - 1);
-    let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i64 - 2 * i64::from(frame_align.max(16));
-    if want <= limit {
-        *offset = want;
-    } else {
-        crate::diag::error_args(
-            pos,
-            "this function's stack frame needs {0} bytes, \
+    want += (i128::from(size.max(0)) + align - 1) & !(align - 1);
+    let limit = TypeTable::MAX_FRAME_BYTES - 2 * i64::from(frame_align.max(16));
+    match i64::try_from(want) {
+        Ok(want) if want <= limit => *offset = want,
+        _ => {
+            crate::diag::error_args(
+                pos,
+                "this function's stack frame needs {0} bytes, \
              past the {1} bytes a frame can address",
-            &[&want.to_string(), &limit.max(0).to_string()],
-        );
-        *offset = offset.saturating_add(8);
+                &[&want.to_string(), &limit.max(0).to_string()],
+            );
+            *offset = offset.saturating_add(8);
+        }
     }
     *offset
 }
 
-/// Refuse an incoming stacked-argument area no `i32` displacement reaches.
+/// Refuse an incoming stacked-argument area past
+/// [`TypeTable::MAX_FRAME_BYTES`].
 ///
 /// Each parameter is inside the frame ceiling on its own; their sum is not,
 /// and `IncomingOff::take` saturates rather than wrapping so this one check
 /// at the end of a function's parameter layout sees it.
 pub fn check_incoming_area(end: i64, pos: crate::diag::Position) {
-    if end as usize > TypeTable::MAX_STACK_OBJECT_BYTES {
+    if end > TypeTable::MAX_FRAME_BYTES {
         crate::diag::error_args(
             pos,
             "this function's stacked parameters need more than the {0} bytes \
              a stack frame can address",
-            &[&TypeTable::MAX_STACK_OBJECT_BYTES.to_string()],
+            &[&TypeTable::MAX_FRAME_BYTES.to_string()],
         );
     }
 }
@@ -106,7 +107,8 @@ pub fn check_incoming_area(end: i64, pos: crate::diag::Position) {
 /// unshared, with its alignment's worth of padding; every pseudo as a spill
 /// slot of the largest kind; every parameter and the largest call's
 /// arguments as stacked; and the largest offset an access adds to its
-/// address. [`TypeTable::FRAME_HEADROOM_BYTES`] covers what the prologue adds.
+/// address. [`TypeTable::FRAME_HEADROOM_BYTES`] covers what the prologue
+/// adds.
 ///
 /// x86-64 asks it to decide whether a function needs a far scratch register
 /// before it allocates the others (`far_scratch_of` in x86_64/regalloc.rs), so
@@ -154,7 +156,7 @@ pub fn frame_reach(func: &Function, types: &TypeTable) -> u64 {
         call_args,
         access,
         spills,
-        TypeTable::FRAME_HEADROOM_BYTES as u64,
+        TypeTable::FRAME_HEADROOM_BYTES.unsigned_abs(),
     ]
     .into_iter()
     .fold(0u64, u64::saturating_add)
@@ -2469,9 +2471,16 @@ mod tests {
     #[test]
     fn test_grow_frame_reserves_what_follows() {
         let pos = crate::diag::Position::default();
-        let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i64 - 2 * 16;
+        let limit = TypeTable::MAX_FRAME_BYTES - 2 * 16;
         let mut offset = 0;
         assert_eq!(grow_frame(&mut offset, limit, 8, 16, pos), limit);
+
+        // A frame past four gigabytes is admitted whole: the bound is C's.
+        let mut offset = 16;
+        assert_eq!(
+            grow_frame(&mut offset, 1 << 40, 16, 16, pos),
+            (1 << 40) + 16
+        );
 
         // An `_Alignas(16)` object whose size is not a multiple of 16 takes
         // the rounded size.
@@ -2482,6 +2491,30 @@ mod tests {
         let mut offset = limit;
         let after = grow_frame(&mut offset, 16, 8, 16, pos);
         assert!(after > 0, "offset wrapped to {after}");
+
+        // Two objects each inside the bound, whose sum is past `i64`.
+        let mut offset = 1 << 62;
+        let after = grow_frame(&mut offset, i64::MAX, 8, 16, pos);
+        assert!(after > 0, "offset wrapped to {after}");
+    }
+
+    /// The frame bound is the object bound less the prologue's headroom, on
+    /// every target: a constant, because the frame arithmetic has no table
+    /// to ask.
+    #[test]
+    fn test_frame_bound_is_the_object_bound() {
+        use crate::target::{Arch, Os, Target};
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for os in [Os::Linux, Os::MacOS] {
+                let types = TypeTable::new(&Target::new(arch, os));
+                let objects = types.max_object_bytes().to_i64();
+                assert_eq!(
+                    TypeTable::MAX_FRAME_BYTES,
+                    (objects - TypeTable::FRAME_HEADROOM_BYTES) & !15,
+                    "{arch:?} {os:?}"
+                );
+            }
+        }
     }
 
     /// Maximum weight first, and the smallest id among equals: `4` is picked

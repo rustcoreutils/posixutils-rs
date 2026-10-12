@@ -533,10 +533,6 @@ compile/20030224-1     all      VLA as a struct member
 compile/20030418-1     all      nested functions
 compile/20030716-1     all      nested functions
 compile/20031011-1     all      nested functions
-compile/20031023-1     all      needs 64-bit stack frames
-compile/20031023-2     all      needs 64-bit stack frames
-compile/20031023-3     all      needs 64-bit stack frames
-compile/20031023-4     all      needs 64-bit stack frames
 compile/20040310-1     all      nested functions
 compile/20040317-3     all      nested functions
 compile/20040323-1     all      nested functions
@@ -576,7 +572,6 @@ compile/pr42956        all      VLA as a struct member
 compile/pr77754-6      all      VLA as a struct member
 compile/pr82564        all      VLA as a struct member
 compile/pr99324        all      nested functions
-compile/stack-check-1  all      needs 64-bit stack frames
 execute/20000822-1     all      nested functions
 execute/20010209-1     all      nested functions
 execute/20010605-1     all      nested functions

@@ -203,7 +203,7 @@ impl X86_64CodeGen {
             let slot = bytes
                 .align_up(Align::EIGHT)
                 .expect("no argument's size is within an eightbyte of overflowing");
-            *at += slot.to_i64();
+            *at = at.saturating_add(slot.to_i64());
         };
 
         let abi_info = insn
@@ -350,9 +350,9 @@ impl X86_64CodeGen {
         // area began, so the callee read it sixteen bytes out.
         let area_align = i64::from(Self::outgoing_area_align(insn, types));
         let stack_bytes = (at + area_align - 1) & !(area_align - 1);
-        let limit = crate::types::TypeTable::MAX_STACK_OBJECT_BYTES as i64;
+        let limit = crate::types::TypeTable::MAX_FRAME_BYTES;
         let (stack_offsets, stack_bytes) = if stack_bytes <= limit {
-            (stack_offsets.into_iter().collect(), stack_bytes)
+            (stack_offsets, stack_bytes)
         } else {
             crate::diag::error_args(
                 insn.pos.unwrap_or(self.base.func_pos),

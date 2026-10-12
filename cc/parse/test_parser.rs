@@ -8001,14 +8001,10 @@ fn test_imaginary_marker_placement() {
     }
 }
 
-/// An object no `i32` frame displacement can reach is refused where it is
-/// declared.
-///
-/// C17 sets no limit here; `TypeTable::MAX_STACK_OBJECT_BYTES` is c17's, because
-/// both backends address a local and a stacked argument by a signed 32-bit
-/// displacement. Before this check every conversion in `arch/` and `abi/` was a
-/// bare `as i32` and wrapped: `char a[3000000000];` in a function got an
-/// eight-byte slot and a `subq $32, %rsp` frame, with no diagnostic.
+/// An automatic object is refused where it is declared only past the frame
+/// bound, [`crate::types::TypeTable::MAX_FRAME_BYTES`]: `PTRDIFF_MAX` less what the prologue
+/// adds, as gcc's is. Up to it the object has a slot, however far from the
+/// frame register; the backends reach it through a register.
 ///
 /// One rule, asked from four places, because an automatic object, a prototyped
 /// parameter, a K&R parameter and a compound literal are four different
@@ -8016,8 +8012,11 @@ fn test_imaginary_marker_placement() {
 /// below them (`Function::add_local`, `Linearizer::insert_local`,
 /// `SymbolTable::declare`) all lack a `Position`, and the first two also see
 /// compiler temporaries that have no declaration to point at.
+///
+/// Every object here is past two gigabytes, which is where the bound stood
+/// while frame displacements were 32 bits wide.
 #[test]
-fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
+fn test_stack_object_past_the_frame_bound_is_rejected() {
     for src in [
         // An automatic object, in each of the scopes that can declare one.
         "int f(void){ char a[3000000000]; return a[0]; }",
@@ -8039,12 +8038,21 @@ fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
         "struct S { char x[3000000000]; };\n\
          void sink(struct S *); void f(void){ sink(&(struct S){0}); }",
     ] {
-        match parse_tu(src) {
+        if let Err(e) = parse_tu(src) {
+            panic!("{src}\nshould have been accepted: {e}");
+        }
+        // The same declaration of an object of `PTRDIFF_MAX` bytes, which C
+        // can describe and no frame can hold.
+        let past = src
+            .replace("char a[3000000000]", "char a[0x7fffffffffffffff]")
+            .replace("int a[600000000]", "char a[0x7fffffffffffffff]")
+            .replace("char x[3000000000]", "char x[0x7fffffffffffffff]");
+        match parse_tu(&past) {
             Err(e) => assert!(
                 e.to_string().contains("maximum stack object size"),
-                "{src}\nwas rejected, but not for its size: {e}"
+                "{past}\nwas rejected, but not for its size: {e}"
             ),
-            Ok(_) => panic!("{src}\nshould have been rejected"),
+            Ok(_) => panic!("{past}\nshould have been rejected"),
         }
     }
 }

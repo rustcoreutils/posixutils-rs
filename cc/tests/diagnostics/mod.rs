@@ -1423,55 +1423,46 @@ int main(void)
     );
 }
 
-/// Frames at the edge of the ceiling, on both targets: diagnosed, never
-/// wrapped.
-///
-/// Each of these was accepted before and came out wrong, because the ceiling
-/// was `i32::MAX` and the arithmetic after it -- a slot's alignment rounding,
-/// the prologue's saved registers and variadic save area, the final frame
-/// rounding -- ran past it in `i32`:
-///
-/// - `_Alignas(16) char a[2147483640]`: the slot size was rounded up to its
-///   alignment before the frame check, wrapped, and the array got zero bytes
-///   inside a 16-byte frame on x86-64.
-/// - a variadic function near the limit: the prologue total wrapped negative,
-///   so x86-64 allocated no frame at all and addressed `2147483640(%rbp)`.
-/// - a plain `char a[2147483632]` on aarch64: frame zeroing computed its last
-///   store's offset in `i32`, wrapped into the unrolled path, and its loop never
-///   ended -- the compiler pushed instructions until it ran out of memory.
-/// - two by-value arguments of 1.5 GB each: the outgoing area's sum wrapped,
-///   and x86-64 unrolled the copy into seven gigabytes of compiler memory.
+/// Frames at the edge of the old 32-bit ceiling, on both targets, through
+/// the driver: compiled whole, and frames past `PTRDIFF_MAX` refused, never
+/// wrapped. The in-process half, with the history of each case, is
+/// `test_diagnostics::permissive`.
 #[test]
-fn diagnostics_frame_at_the_ceiling_is_refused_not_wrapped() {
+fn diagnostics_frame_at_the_old_ceiling_compiles_and_past_ptrdiff_max_is_refused() {
     let cases = [
         (
             "aligned_local",
             "extern void sink(void *);\n\
              void f(void){ _Alignas(16) char a[2147483640]; sink(a); }\n",
+            true,
         ),
         (
             "variadic",
             "extern void sink(void *);\n\
              void f(int n, ...){ char a[2147483624]; sink(a); }\n",
+            true,
         ),
         (
             "plain_local",
             "extern void sink(void *);\n\
              void f(void){ char a[2147483632]; sink(a); }\n",
-        ),
-        (
-            "local_one_rounding_past",
-            "extern void sink(void *);\n\
-             void f(void){ _Alignas(64) char a[2147479480]; sink(a); }\n",
+            true,
         ),
         (
             "stacked_arguments",
             "struct big { char b[1500000000]; };\n\
              extern void take(struct big, struct big);\n\
              void f(struct big *p){ take(*p, *p); }\n",
+            true,
+        ),
+        (
+            "sum_past",
+            "extern void sink(void *);\n\
+             void f(void){ char a[1L << 62], b[1L << 62]; sink(a); sink(b); }\n",
+            false,
         ),
     ];
-    for (name, src) in cases {
+    for (name, src, compiles) in cases {
         for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
             let c = create_c_file(name, src);
             let out = c.path().with_extension("s");
@@ -1484,14 +1475,14 @@ fn diagnostics_frame_at_the_ceiling_is_refused_not_wrapped() {
                 &c.path().to_string_lossy(),
             ]);
             let _ = std::fs::remove_file(&out);
-            assert!(!run.success, "{name} on {target} compiled:\n{}", run.stderr);
-            assert!(
-                run.stderr.contains("stack object size")
-                    || run.stderr.contains("stack frame")
-                    || run.stderr.contains("stacked arguments"),
-                "{name} on {target}: expected a frame diagnostic, got:\n{}",
-                run.stderr
-            );
+            assert_eq!(run.success, compiles, "{name} on {target}:\n{}", run.stderr);
+            if !compiles {
+                assert!(
+                    run.stderr.contains("stack frame"),
+                    "{name} on {target}: expected a frame diagnostic, got:\n{}",
+                    run.stderr
+                );
+            }
         }
     }
 }

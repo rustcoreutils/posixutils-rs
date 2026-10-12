@@ -3714,37 +3714,20 @@ impl TypeTable {
         ByteSize::new(u64::MAX >> (64 - (width - 1)))
     }
 
-    /// The largest object the backend can give a *stack* slot.
+    /// The most bytes a stack frame -- one object in it, or all of them
+    /// together -- can span: [`Self::max_object_bytes`], `PTRDIFF_MAX` on
+    /// every target c17 has, less [`Self::FRAME_HEADROOM_BYTES`], rounded
+    /// down to the sixteen bytes a frame is kept a multiple of.
     ///
-    /// Two bounds again, and this time the operative one is not C's:
-    ///
-    /// - **The object's own**, [`Self::max_object_bytes`]: what a size can be
-    ///   described as at all, and what `sizeof` answers.
-    /// - **The frame's**, `i32::MAX` less [`Self::FRAME_HEADROOM_BYTES`] and
-    ///   rounded down to an eightbyte, and therefore the operative one here:
-    ///   both backends address a local and a stacked argument by a signed
-    ///   32-bit displacement from the frame register, so an object past this
-    ///   has no slot to be given. The headroom is what the prologue adds after
-    ///   the locals are laid out; without it an accepted frame wrapped in that
-    ///   arithmetic and the prologue allocated nothing.
-    ///
-    /// This is a c17 backend limit and not a C one -- C17 says nothing about
-    /// where an object with automatic storage duration lives, and gcc compiles
-    /// the same declaration with `movabsq`-based 64-bit frame addressing.
-    /// Widening both backends' offsets to `i64` is the change that would lift
-    /// the bound; until then a diagnostic is the honest answer.
-    ///
-    /// It does **not** apply to an object with static storage duration, which
-    /// is addressed symbolically and works at any size
-    /// [`Self::max_object_bytes`] allows: `char g[3000000000];` emits
-    /// `.zero 3000000000` on both targets.
-    ///
-    /// Until this existed every size conversion in `arch/` and `abi/` was a
-    /// bare `as i32` and wrapped. `char a[3000000000];` in a function came out
-    /// as -1294967296, the `size.max(8)` that follows gave it an eight-byte
-    /// slot, and the whole frame was `subq $32, %rsp` with the array laid
-    /// across it -- with no diagnostic at all.
-    pub const MAX_STACK_OBJECT_BYTES: usize = (i32::MAX as usize - Self::FRAME_HEADROOM_BYTES) & !7;
+    /// Both backends compute every frame quantity in `i64` and reach a
+    /// displacement past 32 bits through a register (`movabsq` on x86-64,
+    /// `movz`/`movk` on aarch64), as gcc does, so C's own bound is the
+    /// frame's too; the headroom is what the prologue adds after the locals
+    /// are laid out, reserved so that the sums after it cannot overflow. A
+    /// constant rather than a method of the table, because the frame
+    /// arithmetic that checks it has no table; a test asserts the agreement.
+    /// gcc refuses a frame past `PTRDIFF_MAX` less 511 the same way.
+    pub const MAX_FRAME_BYTES: i64 = (i64::MAX - Self::FRAME_HEADROOM_BYTES) & !15;
 
     /// What a prologue adds to a frame beyond its locals, bounded generously:
     /// the saved frame pointer and link register, every callee-saved general
@@ -3755,8 +3738,8 @@ impl TypeTable {
     /// reserves it separately.
     ///
     /// Reserving it once, where a frame is admitted, is what lets every sum
-    /// after that stay in `i32` without a check of its own.
-    pub const FRAME_HEADROOM_BYTES: usize = 4096;
+    /// after that stay in `i64` without a check of its own.
+    pub const FRAME_HEADROOM_BYTES: i64 = 4096;
 
     /// The size of an object of type `id`: the answer `sizeof` gives.
     ///

@@ -50,6 +50,7 @@ mod determinism;
 // Thread cancellation and libgcc's forced unwind, as a glibc system has them.
 #[cfg(target_os = "linux")]
 mod exceptions;
+mod far_frames;
 mod file_scope_asm;
 mod float_to_int_saturation;
 mod floating;

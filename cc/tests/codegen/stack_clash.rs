@@ -119,7 +119,11 @@ int main(void) {
 /// -- as a frame, with `alloca`, as a VLA, and as a by-value argument. Each
 /// must fault on the guard and leave the mapping below it untouched; the
 /// handler then walks the stack from the faulting instruction, inside a
-/// probe loop, and must find the allocating function and its caller.
+/// probe loop, and must find the allocating function and its caller --
+/// through the CFI with `backtrace()` on Linux, and on Darwin, whose
+/// `backtrace()` stops at the alternate signal stack, along the
+/// frame-pointer chain from the interrupted registers, as its crash reports
+/// walk it.
 /// Unprobed, the allocation lands in the mapping below and the thread
 /// returns (exit 2) or writes it (exit 3).
 #[test]
@@ -133,6 +137,9 @@ fn codegen_stack_clash_probes_reach_the_guard() {
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#endif
 
 #define BELOW (64 * 1024)
 #define GUARD (64 * 1024)
@@ -182,6 +189,37 @@ static int owner(void *pc) {
     return best;
 }
 
+#if defined(__APPLE__)
+/* Darwin's backtrace() stops where a frame pointer leaves the thread's
+   stack, which the handler's own frames, on the alternate stack, already
+   do. Walk the frame-pointer chain from the interrupted registers instead,
+   as Darwin's crash reports walk a faulting thread: the faulting function
+   must be in it while its probes run. */
+static int walk(void *ucv, void **frames, int max) {
+    ucontext_t *uc = ucv;
+    char *lo = base + BELOW + GUARD, *hi = lo + STACK;
+#if defined(__aarch64__) && defined(__darwin_arm_thread_state64_get_fp)
+    void **fp = (void **)__darwin_arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
+    void *pc = (void *)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+#elif defined(__aarch64__)
+    void **fp = (void **)uc->uc_mcontext->__ss.__fp;
+    void *pc = (void *)uc->uc_mcontext->__ss.__pc;
+#else
+    void **fp = (void **)uc->uc_mcontext->__ss.__rbp;
+    void *pc = (void *)uc->uc_mcontext->__ss.__rip;
+#endif
+    int n = 0;
+    frames[n++] = pc;
+    while (n < max && (char *)fp >= lo && (char *)fp < hi && fp[1]) {
+        frames[n++] = fp[1];
+        if ((char *)fp[0] <= (char *)fp)
+            break;
+        fp = fp[0];
+    }
+    return n;
+}
+#endif
+
 static void on_segv(int sig, siginfo_t *si, void *uc) {
     char *at = si->si_addr;
     (void)sig;
@@ -192,7 +230,11 @@ static void on_segv(int sig, siginfo_t *si, void *uc) {
     if (at < base + BELOW || at >= base + BELOW + GUARD)
         _exit(4);
     void *frames[32];
+#if defined(__APPLE__)
+    int n = walk(uc, frames, 32);
+#else
     int n = backtrace(frames, 32);
+#endif
     for (int i = 0; i + 1 < n; i++)
         if (owner(frames[i]) == which && owner(frames[i + 1]) == 4)
             _exit(0);

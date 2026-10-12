@@ -241,10 +241,16 @@ past 32 bits goes through a register, one rule in each back end's
 - **x86-64 passes a by-value argument past two gigabytes.** gcc refuses one
   ("sorry, unimplemented: passing too large argument on stack"); C sets no
   such limit, and the outgoing area is reserved and copied like any other.
-- **An inline-asm operand in a frame slot past 32 bits** is given its address
-  in a register when it is the object itself (an `m` operand of a local),
-  as a global's is; a spilled value's slot that far away is refused, since
-  its template text could only spell a displacement no instruction holds.
+- **An inline-asm memory operand in a frame slot past 32 bits** -- a local
+  under `m`, or a value spilled there under `g` or `rm` -- is written as an
+  offset from one address the x86-64 far scratch holds while the template
+  runs, loaded after the statement's inputs: no other register is free
+  there, the allocator gives the far scratch to no value, and it is chosen
+  from registers the statement neither clobbers nor pins. One more than two
+  gigabytes from the first such operand, in a frame past four, takes R10 or
+  R11 holding its address instead. On aarch64 those constraints take a
+  register, loaded through X15's legalizer, and a local's address is formed
+  in a scratch register, as everywhere.
 
 ## GNU extensions: what c17 will and will not grow
 

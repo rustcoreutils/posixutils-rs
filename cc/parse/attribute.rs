@@ -11,7 +11,7 @@
 // they feed while a declarator is built
 //
 
-use super::ast::ExprKind;
+use super::ast::{Expr, ExprKind, UnaryOp};
 use super::parser::Parser;
 use crate::diag;
 use crate::strings::StringId;
@@ -137,6 +137,10 @@ enum AttrArgs {
     General,
     /// `cleanup(fn)`: exactly one argument, the name of a function.
     Cleanup,
+    /// Expressions only, a leading name among them: `malloc(dealloc, n)`
+    /// and `copy(decl)`, whose name must be declared -- gcc reads them as
+    /// expressions and refuses an undeclared one.
+    Expressions,
     /// Strings and integer constant expressions, a name among them read as
     /// the value it names: `patchable_function_entry(N, M)`.
     Values,
@@ -158,6 +162,7 @@ impl AttrArgs {
             | "sentinel"
             | "regparm" => AttrArgs::Integers(IntArgRole::Unused),
             "cleanup" if recognised => AttrArgs::Cleanup,
+            "malloc" | "copy" if recognised => AttrArgs::Expressions,
             "patchable_function_entry" if recognised => AttrArgs::Values,
             _ if recognised => AttrArgs::General,
             _ => AttrArgs::Unknown,
@@ -898,6 +903,9 @@ impl Parser<'_> {
         if grammar == AttrArgs::Cleanup {
             return self.parse_cleanup_arg(first);
         }
+        if grammar == AttrArgs::Expressions {
+            return self.parse_expression_arg(name, first);
+        }
         if grammar == AttrArgs::General && first && self.at_bare_attribute_name() {
             let ident = self.get_ident_name(self.current()).ok_or(Diagnosed)?;
             self.advance();
@@ -986,7 +994,173 @@ impl Parser<'_> {
             Self::report_cleanup_arg_count(pos);
             result = Err(Diagnosed);
         }
+        if grammar == AttrArgs::Expressions {
+            self.malloc_deallocator = None;
+            if name.trim_matches('_') == "malloc" && count > 2 {
+                diag::error_args(
+                    pos,
+                    "wrong number of arguments specified for '{0}' attribute",
+                    &["malloc"],
+                );
+                result = Err(Diagnosed);
+            }
+        }
         result.map(|()| args)
+    }
+
+    /// One argument of `malloc` or `copy`: an expression, so an undeclared
+    /// name is the expression parser's error, as in gcc. `malloc`'s are
+    /// checked as gcc checks them: the first names a deallocation function
+    /// taking a pointer first, the second is the number of a pointer
+    /// parameter of it. What gcc refuses is an error that drops the
+    /// attribute; what it ignores, a `-Wattributes` warning that does too.
+    fn parse_expression_arg(
+        &mut self,
+        name: &str,
+        first: bool,
+    ) -> Result<Option<AttributeArg>, Diagnosed> {
+        let pos = self.current_pos();
+        // A builtin function, glibc's `malloc(__builtin_free, 1)`: declared
+        // by the compiler, and a keyword here, which no expression is.
+        if self.at_bare_attribute_name() {
+            let ident = self.get_ident_name(self.current()).ok_or(Diagnosed)?;
+            if ident.starts_with("__builtin_") {
+                self.advance();
+                return Ok(Some(AttributeArg::Ident(ident)));
+            }
+        }
+        let undeclared = self.at_bare_attribute_name()
+            && self
+                .current_ident()
+                .is_some_and(|id| self.symbols.lookup_id(id, Namespace::Ordinary).is_none());
+        let expr = match self.parse_assignment_expr() {
+            Ok(expr) => expr,
+            Err(e) => {
+                diag::error(e.pos, &e.message);
+                self.skip_attribute_arg();
+                return Err(Diagnosed);
+            }
+        };
+        if undeclared {
+            return Err(Diagnosed);
+        }
+        if name.trim_matches('_') != "malloc" {
+            return Ok(match &expr.kind {
+                ExprKind::Ident(sym) => Some(AttributeArg::Ident(
+                    self.str(self.symbols.get(*sym).name).to_string(),
+                )),
+                _ => None,
+            });
+        }
+        if first {
+            return self.malloc_deallocator(&expr, pos).map(Some);
+        }
+        self.malloc_dealloc_index(&expr, pos)
+    }
+
+    /// `malloc`'s first argument: the deallocation function, named or
+    /// taken the address of, whose first parameter is a pointer.
+    fn malloc_deallocator(
+        &mut self,
+        expr: &Expr,
+        pos: Position,
+    ) -> Result<AttributeArg, Diagnosed> {
+        let named = match &expr.kind {
+            ExprKind::Ident(sym) => Some(sym),
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => match &operand.kind {
+                ExprKind::Ident(sym) => Some(sym),
+                _ => None,
+            },
+            _ => None,
+        };
+        let func = named
+            .copied()
+            .filter(|&s| self.types.kind(self.symbols.get(s).typ) == TypeKind::Function);
+        let Some(sym) = func else {
+            diag::error(
+                pos,
+                "'malloc' attribute argument 1 does not name a function",
+            );
+            return Err(Diagnosed);
+        };
+        let typ = self.symbols.get(sym).typ;
+        let first = self
+            .types
+            .get(typ)
+            .params
+            .as_ref()
+            .and_then(|p| p.first().copied());
+        if let Some(param) = first.filter(|&p| self.types.kind(p) != TypeKind::Pointer) {
+            let have = self.types.format_type(param, Some(self.idents));
+            diag::error_args(
+                pos,
+                "'malloc' attribute argument 1 must take a pointer type as its first argument; have '{0}'",
+                &[&have],
+            );
+            return Err(Diagnosed);
+        }
+        self.malloc_deallocator = Some(typ);
+        Ok(AttributeArg::Ident(
+            self.str(self.symbols.get(sym).name).to_string(),
+        ))
+    }
+
+    /// `malloc`'s second argument: which parameter of the deallocation
+    /// function, counting from 1, takes the pointer.
+    fn malloc_dealloc_index(
+        &mut self,
+        expr: &Expr,
+        pos: Position,
+    ) -> Result<Option<AttributeArg>, Diagnosed> {
+        let warn = |template: &str, args: &[&str]| {
+            diag::group_warning_args(ATTRIBUTE_WARNING, pos, template, args);
+            Err(Diagnosed)
+        };
+        let Some(dealloc) = self.malloc_deallocator.take() else {
+            return Ok(None);
+        };
+        if let ExprKind::StringLit(_) = &expr.kind {
+            let have = expr
+                .typ
+                .map(|t| self.types.format_type(t, Some(self.idents)))
+                .unwrap_or_default();
+            return warn("'malloc' attribute argument has type '{0}'", &[&have]);
+        }
+        let Some(n) = self.eval_const_expr(expr) else {
+            let spelled = match &expr.kind {
+                ExprKind::Ident(sym) => self.str(self.symbols.get(*sym).name).to_string(),
+                _ => String::new(),
+            };
+            return warn(
+                "'malloc' attribute argument value '{0}' is not an integer constant",
+                &[&spelled],
+            );
+        };
+        let params = self.types.get(dealloc).params.clone().unwrap_or_default();
+        let value = n.to_string();
+        if n == 0 {
+            return warn(
+                "'malloc' attribute argument value '{0}' does not refer to a function parameter",
+                &[&value],
+            );
+        }
+        let Some(&param) = usize::try_from(n - 1).ok().and_then(|i| params.get(i)) else {
+            return warn(
+                "'malloc' attribute argument value '{0}' exceeds the number of function parameters {1}",
+                &[&value, &params.len().to_string()],
+            );
+        };
+        if self.types.kind(param) != TypeKind::Pointer {
+            let have = self.types.format_type(param, Some(self.idents));
+            return warn(
+                "'malloc' attribute argument value '{0}' refers to parameter type '{1}'",
+                &[&value, &have],
+            );
+        }
+        Ok(Some(AttributeArg::Int(n)))
     }
 
     /// One argument of `cleanup`. Only the first is read, and it has to be a

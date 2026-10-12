@@ -280,6 +280,9 @@ pub struct Parser<'a> {
     /// specifiers, between the type and the declarator, or after the
     /// parameter list. Cleared at the start of each external declaration.
     pub(super) pending_fn_attrs: crate::parse::ast::FunctionAttrs,
+    /// The type of the deallocation function a `malloc(dealloc, n)`
+    /// attribute names, while its arguments are read.
+    pub(super) malloc_deallocator: Option<crate::types::TypeId>,
     /// The function-type attributes -- `ms_abi`, `sysv_abi`, `nocf_check`
     /// -- awaiting the declarator whose function type they belong to. A
     /// property of the type, so they are applied with the other type
@@ -449,6 +452,7 @@ impl<'a> Parser<'a> {
             pending_written_attrs: Vec::new(),
             written_attrs: HashMap::new(),
             pending_fn_attrs: Default::default(),
+            malloc_deallocator: None,
             pending_fn_type: Default::default(),
             cf_branch: false,
             x86_isa: Default::default(),

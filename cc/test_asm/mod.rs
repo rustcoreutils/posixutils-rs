@@ -58,6 +58,7 @@ mod codegen_exceptions;
 mod codegen_file_scope_asm;
 mod codegen_floating;
 mod codegen_fp_compare;
+mod codegen_frame_slots;
 mod codegen_inline_asm;
 mod codegen_inlining;
 mod codegen_kernel;

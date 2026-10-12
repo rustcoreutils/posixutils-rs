@@ -101,10 +101,10 @@ The torture tests that need it (`compile/20031023-1..4`,
 What it takes:
 
 - Widen every frame quantity to `i64`: `MemAddr` displacements on both targets,
-  `Loc::Stack`/`Loc::IncomingArg`, `RegAlloc::stack_offset`, the shared
-  `ActiveSlot`/`FreeSlot`, `callee_saved_offset`, `stack_alloc_size`,
-  `reg_save_area_offset`, the outgoing-argument layout, `IncomingOff`, and the
-  CFI directive offsets. `crate::abi::slot_bytes` (the only place an object
+  `Loc::Stack`/`Loc::IncomingArg`, `RegAlloc::stack_offset`,
+  `callee_saved_offset`, `stack_alloc_size`, `reg_save_area_offset`, the
+  outgoing-argument layout, `IncomingOff`, and the CFI directive offsets.
+  `crate::abi::slot_bytes` (the only place an object
   size becomes a slot size) and `arch::regalloc::grow_frame` (the only place a
   frame total grows) then bound at `max_object_bytes` instead, less the
   prologue headroom (`FRAME_HEADROOM_BYTES`) and the frame's final alignment

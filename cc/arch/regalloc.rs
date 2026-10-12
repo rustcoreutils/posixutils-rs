@@ -27,9 +27,9 @@ pub use verify::{
 /// [`TypeTable::MAX_STACK_OBJECT_BYTES`] bounds one object and
 /// [`crate::abi::slot_bytes`] enforces that. Neither bounds their *sum*, and
 /// `+=` on an `i32` wraps: a frame past two gigabytes came out negative and the
-/// prologue subtracted nothing. Both backends' `alloc_stack_slot` is the one
-/// place their locals area grows, so this is the one place the total can be
-/// checked. A VLA or `alloca` extent never reaches it: the frame holds only an
+/// prologue subtracted nothing. Every slot of either backend's frame is laid
+/// out through here, so this is the one place the total can be checked. A
+/// VLA or `alloca` extent never reaches it: the frame holds only an
 /// eight-byte pointer for one, and the extent is subtracted from the stack
 /// pointer at run time in a 64-bit register.
 ///
@@ -179,40 +179,6 @@ pub struct LiveInterval {
     pub in_loop: bool,
 }
 
-/// A stack slot freed by an expired live interval, available for reuse.
-#[derive(Debug, Clone)]
-pub struct FreeSlot {
-    pub offset: i32,
-    pub alignment: i32,
-    /// The live intervals of *every* pseudo that has ever owned
-    /// this slot — current and prior owners. A candidate may
-    /// reuse the slot only if its own interval is disjoint from
-    /// EVERY entry. The "current owner only" approximation
-    /// (checking just the most-recent occupant) is unsafe:
-    /// suppose A owns the slot during [11,17], then frees it; B
-    /// reuses during [81,130], also frees. If a candidate C with
-    /// interval [6,42] now checks "do I overlap B?" it sees no
-    /// conflict — but C overlaps A's old window [11,17] and would
-    /// read garbage during that span. CPython's `double_round`
-    /// miscompile (assertAlmostEqual segfault) hits this exact
-    /// pattern.
-    pub owner_intervals: Vec<LiveInterval>,
-}
-
-/// A stack slot currently assigned to a live pseudo, plus the full
-/// history of past owners. Used by `expire_stack_intervals` and
-/// `try_reuse_stack_slot` to preserve history across reuse cycles.
-#[derive(Debug, Clone)]
-pub struct ActiveSlot {
-    /// The current owner's live interval — drives `expire_stack_intervals`.
-    pub current: LiveInterval,
-    /// Past owners (FIFO) whose intervals already ended but whose
-    /// constraints must still be respected on the next reuse.
-    pub past: Vec<LiveInterval>,
-    pub offset: i32,
-    pub size: i32,
-}
-
 /// A point in the function where register constraints apply.
 /// Used during allocation to avoid assigning pseudos to registers
 /// that would be clobbered at this point.
@@ -331,53 +297,6 @@ pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, u32> {
 }
 
 // Common Functions
-
-/// Release stack slots whose owning interval ended before `point` back
-/// to the free-slot pool, where future `try_reuse_stack_slot` calls
-/// can find them.
-///
-/// The chordal allocator calls it twice per bank: once in Phase 1
-/// sweeping monotonically by interval start, then once with
-/// `usize::MAX` just before Phase 3 spill commits to drain everything
-/// so spilled pseudos can reuse any non-interfering slot.
-///
-/// Without this, every `alloc_stack_slot` request creates a fresh
-/// slot. On x86_64 that's wasteful but harmless. On aarch64 it pushes
-/// stp/ldp offsets past the architectural [-512, 504] immediate range
-/// and the assembler rejects the output.
-pub fn expire_stack_intervals(
-    active_stack: &mut Vec<ActiveSlot>,
-    free_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
-    point: usize,
-) {
-    let mut to_free: Vec<ActiveSlot> = Vec::new();
-    active_stack.retain(|slot| {
-        if slot.current.end < point {
-            to_free.push(slot.clone());
-            false
-        } else {
-            true
-        }
-    });
-    for slot in to_free {
-        let alignment = if slot.size >= 16 { 16 } else { 8 };
-        // The freed slot's history is `past ++ [current]`.
-        let mut owners = slot.past;
-        owners.push(slot.current);
-        // Merge with any existing FreeSlot at the same offset (an
-        // earlier owner that already freed and is waiting for reuse).
-        let slots = free_slots.entry(slot.size).or_default();
-        if let Some(existing) = slots.iter_mut().find(|s| s.offset == slot.offset) {
-            existing.owner_intervals.extend(owners);
-        } else {
-            slots.push(FreeSlot {
-                offset: slot.offset,
-                alignment,
-                owner_intervals: owners,
-            });
-        }
-    }
-}
 
 /// Find all positions of call-like instructions in a function.
 /// Used by spill_args_across_calls and the chordal allocator's cross-call
@@ -1354,35 +1273,14 @@ where
 // shared shape and let each backend supply the architecture-specific bits as
 // a closure.
 
-/// Assign a fresh stack slot to every `Alloca` instruction's result pseudo.
-///
-/// Both backends bump their stack counter by 8 per Alloca and write a
-/// `Loc::Stack(offset)` for the result. The stack-offset sign differs
-/// (x86_64 stores `+stack_offset`, aarch64 stores `-stack_offset`), so
-/// the caller passes a `mk_stack_loc` closure that converts an i32
-/// counter into the backend's preferred `Loc::Stack` value. Each slot's
-/// size goes in `slot_bytes`, as every frame slot's does: see
-/// [`SlotBytes`].
-pub fn assign_alloca_slots<L, F>(
-    func: &Function,
-    stack_offset: &mut i32,
-    locations: &mut HashMap<PseudoId, L>,
-    slot_bytes: &mut SlotBytes,
-    mk_stack_loc: F,
-) where
-    F: Fn(i32) -> L,
-{
-    for block in &func.blocks {
-        for insn in &block.insns {
-            if insn.op == Opcode::Alloca {
-                if let Some(target) = insn.target {
-                    *stack_offset += 8;
-                    locations.insert(target, mk_stack_loc(*stack_offset));
-                    slot_bytes.insert(target, 8);
-                }
-            }
-        }
-    }
+/// Every `Alloca` instruction's result pseudo: each lives in a frame slot.
+pub fn alloca_results(func: &Function) -> Vec<PseudoId> {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .filter(|insn| insn.op == Opcode::Alloca)
+        .filter_map(|insn| insn.target)
+        .collect()
 }
 
 /// Does anything overwrite `reg` while `interval` is live -- a constraint
@@ -1391,7 +1289,7 @@ pub fn assign_alloca_slots<L, F>(
 /// The coloring pass asks the same question of the pseudos it places, through
 /// [`constraint_clobbers`], which is where each backend's `exempt` rule comes
 /// from; an ABI-pinned argument never reaches that pass, so
-/// [`spill_gp_args_across`] asks it here.
+/// [`gp_args_overwritten`] asks it here.
 pub fn clobbered_while_live<R: PartialEq>(
     interval: &LiveInterval,
     reg: R,
@@ -1406,8 +1304,9 @@ pub fn clobbered_while_live<R: PartialEq>(
     })
 }
 
-/// Move an ABI-pinned GP argument out of its register when something
-/// overwrites that register while the argument is live.
+/// The ABI-pinned GP arguments that must leave their register for a frame
+/// slot, because something overwrites that register while they are live --
+/// each with the register it arrived in.
 ///
 /// An argument arrives pre-colored in its ABI register and never goes through
 /// coloring, so the forbidden-color machinery that keeps an ordinary value out
@@ -1421,50 +1320,21 @@ pub fn clobbered_while_live<R: PartialEq>(
 /// left every later use of an argument that arrived in x0 reading the
 /// thread-local's address.
 ///
-/// The caller supplies which registers are argument registers, how to extract
-/// a register from a `Loc`, how to construct the spilled `Loc`, and how to
-/// record the spill for the prologue. The stack-offset sign convention is
-/// folded into `mk_stack_loc` and `record_spill`, so this helper is
-/// sign-agnostic.
-#[allow(clippy::too_many_arguments)]
-pub fn spill_gp_args_across<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpill, PushFree>(
+/// `reg_of` answers the argument register a pseudo's location is, if it is
+/// one. The backend records each spill for its prologue and asks for the
+/// slot ([`color_stack_slots`] places it with the others).
+pub fn gp_args_overwritten<R: Copy>(
     intervals: &[LiveInterval],
+    reg_of: impl Fn(PseudoId) -> Option<R>,
     overwritten: impl Fn(&LiveInterval, R) -> bool,
-    locations: &mut HashMap<PseudoId, L>,
-    stack_offset: &mut i32,
-    is_arg_reg: IsArg,
-    extract_reg: ExtractReg,
-    mk_stack_loc: MkStackLoc,
-    mut record_spill: RecordSpill,
-    mut push_free: PushFree,
-) where
-    L: Clone,
-    R: Copy,
-    IsArg: Fn(R) -> bool,
-    ExtractReg: Fn(&L) -> Option<R>,
-    MkStackLoc: Fn(i32) -> L,
-    RecordSpill: FnMut(PseudoId, R, i32),
-    PushFree: FnMut(R),
-{
-    for interval in intervals {
-        let Some(loc) = locations.get(&interval.pseudo) else {
-            continue;
-        };
-        let Some(reg) = extract_reg(loc) else {
-            continue;
-        };
-        if !is_arg_reg(reg) {
-            continue;
-        }
-        if !overwritten(interval, reg) {
-            continue;
-        }
-        *stack_offset += 8;
-        let to_offset = *stack_offset;
-        record_spill(interval.pseudo, reg, to_offset);
-        locations.insert(interval.pseudo, mk_stack_loc(to_offset));
-        push_free(reg);
-    }
+) -> Vec<(PseudoId, R)> {
+    intervals
+        .iter()
+        .filter_map(|interval| {
+            let reg = reg_of(interval.pseudo)?;
+            overwritten(interval, reg).then_some((interval.pseudo, reg))
+        })
+        .collect()
 }
 
 // SSA interference graphs are chordal (Pereira/Palsberg 2005, Hack
@@ -1683,6 +1553,151 @@ pub fn build_interference_graph(
         }
     }
     graph
+}
+
+/// Walk every block backward from its live-out set, handing `visit` each
+/// instruction's linear position (blocks in order, as
+/// [`compute_live_intervals`] numbers them), the instruction, what it
+/// defines and reads among the pseudos `tracked` admits, and the set of
+/// those live just after it.
+///
+/// The one per-instruction liveness walk the allocators' exact questions
+/// share: what a stack slot may be shared with, and what is live across an
+/// instruction that returns twice.
+pub(crate) fn walk_live_after(
+    func: &Function,
+    live_out: &[HashSet<PseudoId>],
+    tracked: impl Fn(PseudoId) -> bool,
+    mut visit: impl FnMut(usize, &Instruction, &DefsUses, &std::collections::BTreeSet<PseudoId>),
+) {
+    let mut start = 0usize;
+    for (idx, block) in func.blocks.iter().enumerate() {
+        let mut live: std::collections::BTreeSet<PseudoId> = live_out[idx]
+            .iter()
+            .copied()
+            .filter(|&p| tracked(p))
+            .collect();
+        for (i, insn) in block.insns.iter().enumerate().rev() {
+            let du = DefsUses::of(insn, &tracked);
+            visit(start + i, insn, &du, &live);
+            du.step(&mut live);
+        }
+        start += block.insns.len();
+    }
+}
+
+/// The bytes and alignment of a frame slot a pseudo lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SlotShape {
+    pub bytes: i32,
+    pub align: i32,
+}
+
+impl SlotShape {
+    pub fn new(bytes: i32, align: i32) -> Self {
+        Self { bytes, align }
+    }
+}
+
+/// Where [`color_stack_slots`] puts each stack-homed pseudo.
+#[derive(Debug, Default)]
+pub struct StackColoring {
+    /// Each slot's shape, by slot number.
+    pub slots: Vec<SlotShape>,
+    /// Each pseudo's slot number.
+    pub slot_of: BTreeMap<PseudoId, usize>,
+}
+
+/// Give every pseudo in `homed` a frame slot of its shape, sharing a slot
+/// between pseudos that are never live together.
+///
+/// The question is the one register coloring answers, asked of the frame:
+/// two values may share a slot unless one is defined where the other is
+/// live, by the same exact per-instruction liveness
+/// ([`build_interference_graph`]). The hull of a value's positions will not
+/// do: block order scatters a `switch` case's blocks among the other cases',
+/// so a value's hull spans every case it is dead in, and no two cases would
+/// share. A slot holds one shape: a pseudo takes the lowest-numbered slot of
+/// its own shape that no neighbour holds, in maximum-cardinality order, or a
+/// new one.
+///
+/// Beyond liveness, three things decide:
+///
+/// - A def never shares with a source of its own instruction (the def-src
+///   edges): the back ends write a frame-resident target before they have
+///   read every source.
+/// - The arguments never share with one another: the prologue writes every
+///   spilled argument at entry, where none has a def for the graph to see,
+///   and one that is never read is written all the same.
+/// - A pseudo live across an instruction that returns twice gets a slot of
+///   its own. A `longjmp` resumes there from code the graph sees no path
+///   back from: whatever that code defines, while the value is dead to the
+///   graph, would land on the slot it is read from on the second return.
+///   `extend_across_returns_twice` is the interval-side counterpart.
+///
+/// The order is deterministic: the graph's containers are ordered, and the
+/// slot numbers follow the order pseudos are colored in.
+pub fn color_stack_slots(
+    func: &Function,
+    live_out: &[HashSet<PseudoId>],
+    homed: &BTreeMap<PseudoId, SlotShape>,
+) -> StackColoring {
+    let candidates: std::collections::BTreeSet<PseudoId> = homed.keys().copied().collect();
+    let mut graph = build_interference_graph(&candidates, func, live_out, true);
+    let args: Vec<PseudoId> = candidates
+        .iter()
+        .copied()
+        .filter(|&p| {
+            func.get_pseudo(p)
+                .is_some_and(|ps| matches!(ps.kind, PseudoKind::Arg(_)))
+        })
+        .collect();
+    for (n, &a) in args.iter().enumerate() {
+        for &b in &args[n + 1..] {
+            graph.add_edge(a, b);
+        }
+    }
+    let mut exclusive: std::collections::BTreeSet<PseudoId> = std::collections::BTreeSet::new();
+    if func.has_nonlocal_control() {
+        walk_live_after(
+            func,
+            live_out,
+            |p| candidates.contains(&p),
+            |_, insn, du, live| {
+                if insn.returns_twice() {
+                    exclusive.extend(live.iter().filter(|p| !du.defs.contains(p)));
+                }
+            },
+        );
+    }
+
+    let mut coloring = StackColoring::default();
+    // The shared slots of each shape, in slot-number order.
+    let mut shared: BTreeMap<SlotShape, Vec<usize>> = BTreeMap::new();
+    for v in mcs_ordering(&graph) {
+        let shape = homed[&v];
+        let reuse = if exclusive.contains(&v) {
+            None
+        } else {
+            let taken: std::collections::BTreeSet<usize> = graph
+                .neighbors(v)
+                .filter_map(|n| coloring.slot_of.get(&n).copied())
+                .collect();
+            shared
+                .get(&shape)
+                .and_then(|slots| slots.iter().copied().find(|s| !taken.contains(s)))
+        };
+        let slot = reuse.unwrap_or_else(|| {
+            let slot = coloring.slots.len();
+            coloring.slots.push(shape);
+            if !exclusive.contains(&v) {
+                shared.entry(shape).or_default().push(slot);
+            }
+            slot
+        });
+        coloring.slot_of.insert(v, slot);
+    }
+    coloring
 }
 
 /// The pairs `(output, read)` of one asm statement's operands that may not
@@ -1966,54 +1981,6 @@ pub fn next_use_distance(
     } else {
         usize::MAX
     }
-}
-
-/// Try to reuse a previously freed stack slot of the given size and alignment.
-///
-/// Reuse is safe iff `candidate_interval` is disjoint from **every**
-/// past owner of the slot. Two intervals `[a.start, a.end]` and
-/// `[b.start, b.end]` are disjoint iff `a.end < b.start` or
-/// `b.end < a.start`.
-///
-/// History matters: when slot S is freed by A and reused by B, the
-/// slot's "current owner" is B but A's interval still constrains any
-/// future candidate. The earlier implementation checked only the
-/// most-recent owner — when A.lifetime [11,17] and B.lifetime
-/// [81,130] were both past owners, a candidate C with [6,42] saw
-/// only B (no conflict) but actually collided with A's [11,17].
-/// CPython's `double_round` miscompile (the assertAlmostEqual
-/// segfault) reproduced this exact pattern.
-///
-/// When a slot is reused, the existing `FreeSlot` entry is removed
-/// from `free_stack_slots`; the *new* owner's interval is appended to
-/// the entry when the slot is freed again by `expire_stack_intervals`.
-/// This preserves the full ownership history across the reuse cycle.
-/// To make the history preservation work, this function returns
-/// (offset, history) so the caller can stash history into
-/// `active_stack` and have it re-merged on expire.
-pub fn try_reuse_stack_slot(
-    free_stack_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
-    size: i32,
-    alignment: i32,
-    candidate_interval: &LiveInterval,
-) -> Option<(i32, Vec<LiveInterval>)> {
-    if let Some(slots) = free_stack_slots.get_mut(&size) {
-        if let Some(idx) = slots.iter().position(|s| {
-            if s.alignment < alignment {
-                return false;
-            }
-            s.owner_intervals.iter().all(|owner| {
-                owner.end < candidate_interval.start || candidate_interval.end < owner.start
-            })
-        }) {
-            let slot = slots.remove(idx);
-            if slots.is_empty() {
-                free_stack_slots.remove(&size);
-            }
-            return Some((slot.offset, slot.owner_intervals));
-        }
-    }
-    None
 }
 
 /// A function's incoming-argument pseudos, indexed for the allocators.
@@ -2426,6 +2393,165 @@ mod tests {
             mcs_ordering(&graph),
             [PseudoId(1), PseudoId(2), PseudoId(4), PseudoId(3)]
         );
+    }
+
+    /// `homed` colored over `f`'s own liveness, as each pseudo's slot.
+    fn stack_slots(f: &Function, homed: &[(u32, SlotShape)]) -> BTreeMap<u32, usize> {
+        let r = compute_live_intervals(f, |_| None::<(Vec<()>, Vec<PseudoId>)>);
+        let homed: BTreeMap<PseudoId, SlotShape> =
+            homed.iter().map(|&(p, s)| (PseudoId(p), s)).collect();
+        let coloring = color_stack_slots(f, &r.live_out, &homed);
+        for (p, &n) in &coloring.slot_of {
+            assert_eq!(coloring.slots[n], homed[p], "{p} in a slot of its shape");
+        }
+        coloring
+            .slot_of
+            .into_iter()
+            .map(|(p, n)| (p.0, n))
+            .collect()
+    }
+
+    const EIGHT: SlotShape = SlotShape { bytes: 8, align: 8 };
+
+    /// One block: `%2 = %0 + %0; %3 = %2 + %2; %4 = %3 + %0; %5 = %3 + %4;
+    /// ret %5`, with `%0` and `%1` the arguments.
+    fn straight_line() -> Function {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.long_id);
+        for n in 0..2 {
+            f.add_param(format!("p{n}"), types.long_id);
+            f.add_pseudo(Pseudo::arg(PseudoId(n), n));
+        }
+        for id in 2..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 6;
+        let add = |t: u32, a: u32, b: u32| {
+            Instruction::binop(
+                Opcode::Add,
+                PseudoId(t),
+                PseudoId(a),
+                PseudoId(b),
+                types.long_id,
+                64,
+            )
+        };
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(add(2, 0, 0));
+        bb.add_insn(add(3, 2, 2));
+        bb.add_insn(add(4, 3, 0));
+        bb.add_insn(add(5, 3, 4));
+        bb.add_insn(Instruction::ret(Some(PseudoId(5))));
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        f
+    }
+
+    /// Two values share a slot when neither is defined while the other is
+    /// live, and not otherwise: `%2` dies where `%3` is defined -- which also
+    /// reads it, so even there they may not share -- while `%3` is live where
+    /// `%4` is defined. `%2` and `%4` never meet.
+    #[test]
+    fn stack_slots_are_shared_by_liveness() {
+        let f = straight_line();
+        let slot = stack_slots(&f, &[(2, EIGHT), (3, EIGHT), (4, EIGHT)]);
+        assert_ne!(slot[&2], slot[&3], "a def and its own source");
+        assert_ne!(slot[&3], slot[&4], "live together");
+        assert_eq!(slot[&2], slot[&4], "never live together");
+    }
+
+    /// A slot holds one shape: an eight-byte value and a sixteen-byte one
+    /// never share, live together or not.
+    #[test]
+    fn stack_slots_hold_one_shape() {
+        let f = straight_line();
+        let slot = stack_slots(&f, &[(2, EIGHT), (4, SlotShape::new(16, 16))]);
+        assert_ne!(slot[&2], slot[&4]);
+    }
+
+    /// The arguments are all written at entry: two in the frame never share,
+    /// though the second is never read.
+    #[test]
+    fn stack_slots_of_arguments_are_distinct() {
+        let f = straight_line();
+        let slot = stack_slots(&f, &[(0, EIGHT), (1, EIGHT)]);
+        assert_ne!(slot[&0], slot[&1]);
+    }
+
+    /// `.L0: cbr %0, .L1, .L2; .L1: %3 = %0 + %0; br .L3;
+    /// .L2: %4 = %0 + %0; ret %4; .L3: ret %3` -- `%3`'s positions span
+    /// `.L2`, laid out between its def and its use, but it is dead there: the
+    /// two share a slot, as the cases of a `switch` do.
+    #[test]
+    fn stack_slots_follow_liveness_not_layout() {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.long_id);
+        f.add_param("p", types.long_id);
+        f.add_pseudo(Pseudo::arg(PseudoId(0), 0));
+        for id in 3..5 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 5;
+        let [b0, b1, b2, b3] = [0, 1, 2, 3].map(BasicBlockId);
+        let add = |t: u32| {
+            Instruction::binop(
+                Opcode::Add,
+                PseudoId(t),
+                PseudoId(0),
+                PseudoId(0),
+                types.long_id,
+                64,
+            )
+        };
+        let mut entry = BasicBlock::new(b0);
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::cbr(PseudoId(0), b1, b2));
+        entry.children = vec![b1, b2];
+        let mut def = BasicBlock::new(b1);
+        def.add_insn(add(3));
+        def.add_insn(Instruction::br(b3));
+        def.parents = vec![b0];
+        def.children = vec![b3];
+        let mut other = BasicBlock::new(b2);
+        other.add_insn(add(4));
+        other.add_insn(Instruction::ret(Some(PseudoId(4))));
+        other.parents = vec![b0];
+        let mut uses = BasicBlock::new(b3);
+        uses.add_insn(Instruction::ret(Some(PseudoId(3))));
+        uses.parents = vec![b1];
+        for b in [entry, def, other, uses] {
+            f.add_block(b);
+        }
+        f.entry = b0;
+        let slot = stack_slots(&f, &[(3, EIGHT), (4, EIGHT)]);
+        assert_eq!(slot[&3], slot[&4]);
+    }
+
+    /// `%3` is live across a setjmp and read on its second return only; `%5`
+    /// is defined on the first return's path, where `%3` is dead. Liveness
+    /// would let them share, and the `longjmp` from that path would then
+    /// return to `%5` in `%3`'s slot: a value live across an instruction
+    /// that returns twice gets a slot of its own.
+    #[test]
+    fn stack_slot_across_setjmp_is_its_own() {
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, 32);
+        call.extra_mut().returns_twice_call = true;
+        for twice in [Instruction::new(Opcode::Setjmp), call] {
+            let kind = twice.op;
+            let f = value_across_setjmp(twice);
+            let slot = stack_slots(&f, &[(3, EIGHT), (5, EIGHT)]);
+            assert_ne!(slot[&3], slot[&5], "{kind:?}");
+            // Without the setjmp the two would share.
+            let mut plain = f.clone();
+            plain.blocks[0].insns[2] =
+                Instruction::load(PseudoId(4), PseudoId(2), 0, types.int_id, 32);
+            let slot = stack_slots(&plain, &[(3, EIGHT), (5, EIGHT)]);
+            assert_eq!(slot[&3], slot[&5], "{kind:?} replaced by a load");
+        }
     }
 
     fn interval(p: u32, start: usize, end: usize) -> LiveInterval {

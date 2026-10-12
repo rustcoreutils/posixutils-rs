@@ -43,8 +43,8 @@ use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::arch::asm_constraints::{operand_pins, AsmRegClass, PinnedGp};
 use crate::arch::regalloc::{
     asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
-    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
-    LivenessResult,
+    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval, LivenessResult,
+    SlotShape,
 };
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -362,8 +362,9 @@ impl FrameBase {
 
     /// Decide from the function's declared locals.
     ///
-    /// Over-alignment can only originate here: every other caller of
-    /// `alloc_stack_slot` passes a spill size of at most 16. The alignment
+    /// Over-alignment can only originate here: every other frame slot -- a
+    /// spill, an argument's, a call's multi-register return -- is aligned to
+    /// at most 16. The alignment
     /// expression must stay in step with the one the Sym arm applies when it
     /// lays the slot out, or the frame would be padded for one alignment and
     /// addressed for another.
@@ -794,25 +795,19 @@ impl VReg {
 
 /// A slot in the **callee's** frame -- a local, a spill slot, or an alloca.
 ///
-/// Held as the negative displacement the backend expects, and only mintable by
-/// [`LocalSlot::alloc`], which does the negation. A distinct type, rather than
-/// a signed `i32`, keeps the callee's frame from being confused with the
+/// Held as the negative displacement the backend expects, which
+/// [`LocalSlot::from_displacement`] checks. A distinct type, rather than a
+/// signed `i32`, keeps the callee's frame from being confused with the
 /// caller's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalSlot(i32);
 
 impl LocalSlot {
-    /// Carve `size` bytes off the frame, growing `used`.
-    ///
-    /// `used` counts upwards; the slot is the negated result, so the caller
-    /// never sees -- or has to remember to apply -- the sign convention.
-    pub fn alloc(used: &mut i32, size: i32) -> Self {
-        debug_assert!(size > 0, "a frame slot needs a positive size");
-        *used += size;
-        LocalSlot(-*used)
-    }
+    /// No slot yet: a record made before its slot is placed, and completed
+    /// when it is.
+    const PENDING: LocalSlot = LocalSlot(0);
 
-    /// Reconstruct a slot already carved earlier, e.g. by slot reuse.
+    /// The slot at `displacement`, below the frame pointer.
     pub fn from_displacement(displacement: i32) -> Self {
         debug_assert!(
             displacement < 0,
@@ -1396,15 +1391,10 @@ pub struct RegAlloc {
     /// allocated, saved or restored in any of its functions. Set with
     /// `with_global_registers`.
     global_registers: Vec<Reg>,
-    /// Free GP registers (used by argument pre-allocation and the
-    /// spill-args helper; the chordal coloring core ignores it).
-    free_regs: Vec<Reg>,
-    /// Free FP registers (same role as `free_regs` for the V bank).
-    free_fp_regs: Vec<VReg>,
     /// Next stack slot offset
     stack_offset: i32,
     /// A source position for this function, for the frame diagnostics
-    /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `alloc_stack_slot` and
+    /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `new_frame_slot` and
     /// `IncomingOff::take` have no `&Function` to recover one from.
     func_pos: crate::diag::Position,
     /// Callee-saved registers that were used
@@ -1415,10 +1405,13 @@ pub struct RegAlloc {
     fp_pseudos: HashSet<PseudoId>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
-    /// Active stack slot intervals (interval, offset, size) for reuse tracking
-    active_stack: Vec<crate::arch::regalloc::ActiveSlot>,
-    /// Free stack slots keyed by size, available for reuse
-    free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
+    /// The pseudos that live in a frame slot, with the slot each needs:
+    /// spills, arguments moved out of their registers, 128-bit values, a
+    /// call's multi-register return, alloca pointers. Their offsets are
+    /// decided together, once both banks are colored
+    /// ([`crate::arch::regalloc::color_stack_slots`]); a spilled argument's
+    /// record is completed then.
+    stack_homed: BTreeMap<PseudoId, SlotShape>,
     /// Per-block live-in sets for interference-based stack coloring
     live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets for interference-based stack coloring
@@ -1460,16 +1453,13 @@ impl RegAlloc {
         Self {
             stacked_args,
             locations: HashMap::new(),
-            free_regs: Reg::allocatable().to_vec(),
-            free_fp_regs: VReg::allocatable().to_vec(),
             stack_offset: 0,
             func_pos: crate::diag::Position::default(),
             used_callee_saved: Vec::new(),
             used_callee_saved_fp: Vec::new(),
             fp_pseudos: HashSet::new(),
             spilled_args: Vec::new(),
-            active_stack: Vec::new(),
-            free_stack_slots: BTreeMap::new(),
+            stack_homed: BTreeMap::new(),
             live_in: Vec::new(),
             live_out: Vec::new(),
             frame_base: FrameBase::Fp,
@@ -1506,11 +1496,7 @@ impl RegAlloc {
         // claims a register for its base, and the prologue overwrites it
         // unconditionally, so it must never be handed to a pseudo.
         self.frame_base = FrameBase::of(func, types, &self.global_registers);
-        if let Some(base) = self.frame_base.reg() {
-            self.free_regs.retain(|r| *r != base);
-        }
         let allocatable = self.allocatable_regs();
-        self.free_regs.retain(|r| allocatable.contains(r));
         // Before any other slot: the first is the highest, just under the
         // variadic save area and the saved registers, which is where the
         // canary has to be -- and the arrays right under it.
@@ -1594,6 +1580,7 @@ impl RegAlloc {
             &fp_call_positions,
             &constraint_points,
         );
+        self.place_stack_slots(func);
         if cfg!(debug_assertions) {
             self.verify(func, types, &constraint_points, &call_positions);
         }
@@ -1604,15 +1591,12 @@ impl RegAlloc {
     /// Reset allocator state for a new function
     fn reset_state(&mut self) {
         self.locations.clear();
-        self.free_regs = Reg::allocatable().to_vec();
-        self.free_fp_regs = VReg::allocatable().to_vec();
         self.stack_offset = 0;
         self.used_callee_saved.clear();
         self.used_callee_saved_fp.clear();
         self.fp_pseudos.clear();
         self.spilled_args.clear();
-        self.active_stack.clear();
-        self.free_stack_slots.clear();
+        self.stack_homed.clear();
         self.live_in.clear();
         self.live_out.clear();
         self.frame_base = FrameBase::Fp;
@@ -1653,21 +1637,13 @@ impl RegAlloc {
                 ParamPlace::Fp { first, count } => {
                     self.locations.insert(pseudo, Loc::VReg(fp_arg_regs[first]));
                     self.arg_span.insert(pseudo, count);
-                    let used = &fp_arg_regs[first..first + count];
-                    self.free_fp_regs.retain(|r| !used.contains(r));
                     self.fp_pseudos.insert(pseudo);
                 }
                 // __int128 arrives in an even-aligned register pair, but
                 // always lives in a 16-byte local slot; the prologue spills
                 // the pair into it.
-                ParamPlace::Gp { first, count } if types.is_plain_int128(typ) => {
-                    self.stack_offset += 16;
-                    let slot = -self.stack_offset;
-                    self.locations
-                        .insert(pseudo, Loc::Stack(LocalSlot::from_displacement(slot)));
-                    self.slot_bytes.insert(pseudo, 16);
-                    let used = &int_arg_regs[first..first + count];
-                    self.free_regs.retain(|r| !used.contains(r));
+                ParamPlace::Gp { .. } if types.is_plain_int128(typ) => {
+                    self.home_on_stack(pseudo, SlotShape::new(16, 16));
                 }
                 // A scalar, or a composite of at most sixteen bytes in
                 // consecutive X registers: the prologue writes those into the
@@ -1675,8 +1651,6 @@ impl RegAlloc {
                 ParamPlace::Gp { first, count } => {
                     self.locations.insert(pseudo, Loc::Reg(int_arg_regs[first]));
                     self.arg_span.insert(pseudo, count);
-                    let used = &int_arg_regs[first..first + count];
-                    self.free_regs.retain(|r| !used.contains(r));
                 }
                 ParamPlace::Stack { at, fp } => {
                     self.locations.insert(pseudo, Loc::IncomingArg(at));
@@ -1689,15 +1663,11 @@ impl RegAlloc {
         crate::arch::regalloc::check_incoming_area(layout.stack_end.displacement(), self.func_pos);
     }
 
-    /// Force alloca results to stack to avoid clobbering issues
+    /// Alloca results live in the frame.
     fn allocate_alloca_to_stack(&mut self, func: &Function) {
-        crate::arch::regalloc::assign_alloca_slots(
-            func,
-            &mut self.stack_offset,
-            &mut self.locations,
-            &mut self.slot_bytes,
-            |off| Loc::Stack(LocalSlot::from_displacement(-off)),
-        );
+        for p in crate::arch::regalloc::alloca_results(func) {
+            self.home_on_stack(p, SlotShape::new(8, 8));
+        }
     }
 
     /// Spill arguments in caller-saved registers if their interval crosses a call
@@ -1726,20 +1696,16 @@ impl RegAlloc {
                     // argument is sixteen bytes, and eight left half of it
                     // overlapping whatever came next.
                     let bytes = fp_arg_bytes(func, &lowering, interval.pseudo, types);
-                    let slot = LocalSlot::alloc(&mut self.stack_offset, bytes);
-
-                    // Record the spill for codegen to emit stores in prologue
+                    // Record the spill for codegen to emit stores in prologue;
+                    // the slot is filled in once it is placed.
                     self.spilled_args.push(SpilledArg {
                         pseudo: interval.pseudo,
                         from_gp_reg: None,
                         from_fp_reg: Some(from_reg),
-                        to_stack_offset: slot,
+                        to_stack_offset: LocalSlot::PENDING,
                         bytes,
                     });
-
-                    self.locations.insert(interval.pseudo, Loc::Stack(slot));
-                    self.slot_bytes.insert(interval.pseudo, bytes);
-                    self.free_fp_regs.push(from_reg);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(bytes, bytes));
                 }
             }
         }
@@ -1748,56 +1714,38 @@ impl RegAlloc {
     /// Spill a GP argument -- including the sret pointer in X8 -- out of its
     /// ABI register when `overwritten` says something destroys that register
     /// while the argument is live. See
-    /// [`crate::arch::regalloc::spill_gp_args_across`].
+    /// [`crate::arch::regalloc::gp_args_overwritten`].
+    ///
+    /// X8 carries the sret pointer, which a call overwrites -- the callee may
+    /// use X8 freely, and a call that itself returns a large aggregate loads
+    /// X8 with *its* buffer. Left out of this set, a function returning a
+    /// large struct that called anything stored its result through the last
+    /// callee's buffer: the caller received zeros. An atomic's fixed scratch
+    /// clobbers X8 too.
     fn spill_gp_args(
         &mut self,
         intervals: &[LiveInterval],
         overwritten: impl Fn(&LiveInterval, Reg) -> bool,
     ) {
-        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
-        let spilled_args = &mut self.spilled_args;
-        let slot_bytes = &mut self.slot_bytes;
-        let free_regs = &mut self.free_regs;
-        // X8 carries the sret pointer, which a call overwrites -- the callee
-        // may use X8 freely, and a call that itself returns a large aggregate
-        // loads X8 with *its* buffer. Left out of this set, a function
-        // returning a large struct that called anything stored its result
-        // through the last callee's buffer: the caller received zeros. An
-        // atomic's fixed scratch clobbers X8 too.
-        crate::arch::regalloc::spill_gp_args_across(
+        let spills = crate::arch::regalloc::gp_args_overwritten(
             intervals,
+            |p| match self.locations.get(&p) {
+                Some(Loc::Reg(r)) if Reg::arg_regs().contains(r) || *r == Reg::X8 => Some(*r),
+                _ => None,
+            },
             overwritten,
-            &mut self.locations,
-            &mut self.stack_offset,
-            |reg| int_arg_regs_set.contains(&reg) || reg == Reg::X8,
-            |loc| {
-                if let Loc::Reg(reg) = loc {
-                    Some(*reg)
-                } else {
-                    None
-                }
-            },
-            |off| Loc::Stack(LocalSlot::from_displacement(-off)),
-            |pseudo, from_reg, to_stack_offset| {
-                // The shared helper hands both closures the same raw counter.
-                // `LocalSlot` applies the sign once, so this record and the
-                // location cannot disagree about which frame they name.
-                spilled_args.push(SpilledArg {
-                    pseudo,
-                    from_gp_reg: Some(from_reg),
-                    from_fp_reg: None,
-                    to_stack_offset: LocalSlot::from_displacement(-to_stack_offset),
-                    bytes: 8,
-                });
-                slot_bytes.insert(pseudo, 8);
-            },
-            // X8 is not allocatable, so it is never handed back as free.
-            |reg| {
-                if reg != Reg::X8 {
-                    free_regs.push(reg)
-                }
-            },
         );
+        for (pseudo, from_reg) in spills {
+            // The slot is filled in once it is placed.
+            self.spilled_args.push(SpilledArg {
+                pseudo,
+                from_gp_reg: Some(from_reg),
+                from_fp_reg: None,
+                to_stack_offset: LocalSlot::PENDING,
+                bytes: 8,
+            });
+            self.home_on_stack(pseudo, SlotShape::new(8, 8));
+        }
     }
 
     /// Get arguments that were spilled from caller-saved registers
@@ -1805,24 +1753,6 @@ impl RegAlloc {
         &self.spilled_args
     }
 
-    /// Try to reuse a freed stack slot of the given size and alignment.
-    fn try_reuse_stack_slot(
-        &mut self,
-        size: i32,
-        alignment: i32,
-        candidate_interval: &LiveInterval,
-    ) -> Option<(i32, Vec<LiveInterval>)> {
-        super::super::regalloc::try_reuse_stack_slot(
-            &mut self.free_stack_slots,
-            size,
-            alignment,
-            candidate_interval,
-        )
-    }
-
-    /// Allocate a stack slot, optionally reusing a freed slot.
-    /// AArch64 uses negative offsets from the frame pointer.
-    /// Only short-lived spills (not crossing calls/loops) should set `reusable=true`.
     /// A fresh frame slot of `size` bytes at `alignment`, shared with
     /// nothing, as a displacement.
     fn new_frame_slot(&mut self, size: i32, alignment: i32) -> i32 {
@@ -1864,42 +1794,39 @@ impl RegAlloc {
         }
     }
 
-    fn alloc_stack_slot(
-        &mut self,
-        interval: &LiveInterval,
-        size: i32,
-        alignment: i32,
-        reusable: bool,
-    ) {
-        if reusable {
-            if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
-                self.locations.insert(
-                    interval.pseudo,
-                    Loc::Stack(LocalSlot::from_displacement(reused)),
-                );
-                self.slot_bytes.insert(interval.pseudo, size);
-                self.active_stack.push(crate::arch::regalloc::ActiveSlot {
-                    current: interval.clone(),
-                    past,
-                    offset: reused,
-                    size,
-                });
-                return;
-            }
+    /// `pseudo` lives in a frame slot of `shape`, wherever it was before. The
+    /// slot is placed by [`RegAlloc::place_stack_slots`].
+    fn home_on_stack(&mut self, pseudo: PseudoId, shape: SlotShape) {
+        self.locations.remove(&pseudo);
+        self.stack_homed.insert(pseudo, shape);
+    }
+
+    /// Has `pseudo` a home already: a location, or a frame slot to come?
+    fn is_placed(&self, pseudo: PseudoId) -> bool {
+        self.locations.contains_key(&pseudo) || self.stack_homed.contains_key(&pseudo)
+    }
+
+    /// Lay out the frame slots of every stack-homed pseudo, sharing between
+    /// those never live together
+    /// ([`crate::arch::regalloc::color_stack_slots`]), and complete the
+    /// spilled arguments' records with where they went. The most aligned
+    /// slots first, so that rounding pads the frame once.
+    fn place_stack_slots(&mut self, func: &Function) {
+        let homed = std::mem::take(&mut self.stack_homed);
+        let coloring = crate::arch::regalloc::color_stack_slots(func, &self.live_out, &homed);
+        let mut order: Vec<usize> = (0..coloring.slots.len()).collect();
+        order.sort_by_key(|&n| (std::cmp::Reverse(coloring.slots[n].align), n));
+        let mut slot = vec![LocalSlot::PENDING; coloring.slots.len()];
+        for n in order {
+            let shape = coloring.slots[n];
+            slot[n] = LocalSlot::from_displacement(self.new_frame_slot(shape.bytes, shape.align));
         }
-        let offset = self.new_frame_slot(size, alignment);
-        self.locations.insert(
-            interval.pseudo,
-            Loc::Stack(LocalSlot::from_displacement(offset)),
-        );
-        self.slot_bytes.insert(interval.pseudo, size);
-        if reusable {
-            self.active_stack.push(crate::arch::regalloc::ActiveSlot {
-                current: interval.clone(),
-                past: Vec::new(),
-                offset,
-                size,
-            });
+        for (&p, &n) in &coloring.slot_of {
+            self.locations.insert(p, Loc::Stack(slot[n]));
+            self.slot_bytes.insert(p, homed[&p].bytes);
+        }
+        for arg in &mut self.spilled_args {
+            arg.to_stack_offset = slot[coloring.slot_of[&arg.pseudo]];
         }
     }
 
@@ -1960,18 +1887,7 @@ impl RegAlloc {
         let mut vreg_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         for interval in &intervals {
-            // Intervals come pre-sorted by start position from
-            // compute_live_intervals, so this monotonic expiration
-            // recovers the linear-scan-era slot-reuse behavior the
-            // chordal sweep would otherwise lose. Without this,
-            // int128-heavy functions push stp/ldp offsets past
-            // aarch64's [-512, 504] immediate range.
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                interval.start,
-            );
-            if self.locations.contains_key(&interval.pseudo) {
+            if self.is_placed(interval.pseudo) {
                 // Already assigned by allocate_arguments / spill_args
                 // / alloca passes; arg pseudos become pre-colored
                 // graph vertices in Phase 2.
@@ -2004,7 +1920,7 @@ impl RegAlloc {
             // __int128 → 16-byte stack slot, never in registers.
             let is_int128 = int128_pseudos.contains(&interval.pseudo);
             if is_int128 {
-                self.alloc_stack_slot(interval, 16, 16, true);
+                self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                 continue;
             }
 
@@ -2020,7 +1936,7 @@ impl RegAlloc {
                 );
                 let size = size.max(8);
                 let alignment = types.alignment(typ) as i32;
-                self.alloc_stack_slot(interval, size, alignment, false);
+                self.home_on_stack(interval.pseudo, SlotShape::new(size, alignment));
                 continue;
             }
 
@@ -2033,7 +1949,7 @@ impl RegAlloc {
                 let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if crosses_call || crosses_block {
                     let bytes = fp_pseudo_bytes(func, interval.pseudo);
-                    self.alloc_stack_slot(interval, bytes, bytes, true);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(bytes, bytes));
                     continue;
                 }
                 vreg_candidates.insert(interval.pseudo);
@@ -2050,7 +1966,7 @@ impl RegAlloc {
             constraint_points,
             &gp_candidates,
         );
-        self.color_vreg_bank(func, &intervals, &vreg_candidates);
+        self.color_vreg_bank(func, &vreg_candidates);
     }
 
     fn color_gp_bank(
@@ -2269,29 +2185,10 @@ impl RegAlloc {
             }
         }
 
-        // Process spill commits in interval.start order with
-        // monotonic expiration. The earlier `usize::MAX` drain
-        // relied on `pseudos_interfere`'s block-level liveness which
-        // misses within-block interference. See the x86_64 mirror
-        // for the full rationale (CPython
-        // `PyThread_acquire_lock_timed` miscompile root cause).
-        let mut ordered_spilled: Vec<(usize, PseudoId)> = final_spilled
-            .iter()
-            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
-            .collect();
-        ordered_spilled.sort_by_key(|&(start, _)| start);
-        for (start, spilled) in ordered_spilled {
-            if self.locations.contains_key(&spilled) {
-                continue;
-            }
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                start,
-            );
-            if let Some(interval) = by_pseudo.get(&spilled).copied() {
-                let bytes = fp_pseudo_bytes(func, interval.pseudo);
-                self.alloc_stack_slot(interval, bytes, bytes, true);
+        for spilled in final_spilled {
+            if !self.is_placed(spilled) {
+                let bytes = fp_pseudo_bytes(func, spilled);
+                self.home_on_stack(spilled, SlotShape::new(bytes, bytes));
             }
         }
     }
@@ -2299,10 +2196,8 @@ impl RegAlloc {
     fn color_vreg_bank(
         &mut self,
         func: &Function,
-        intervals: &[LiveInterval],
         vreg_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
-        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if vreg_candidates.is_empty() {
             return;
@@ -2339,27 +2234,10 @@ impl RegAlloc {
                 self.used_callee_saved_fp.push(reg);
             }
         }
-        // Same monotonic-by-start spill commit as `color_gp_bank` —
-        // see the comment there for why the earlier `usize::MAX`
-        // drain was unsafe.
-        let mut ordered_spilled: Vec<(usize, PseudoId)> = result
-            .spilled
-            .iter()
-            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
-            .collect();
-        ordered_spilled.sort_by_key(|&(start, _)| start);
-        for (start, spilled) in ordered_spilled {
-            if self.locations.contains_key(&spilled) {
-                continue;
-            }
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                start,
-            );
-            if let Some(interval) = by_pseudo.get(&spilled).copied() {
-                let bytes = fp_pseudo_bytes(func, interval.pseudo);
-                self.alloc_stack_slot(interval, bytes, bytes, true);
+        for spilled in result.spilled {
+            if !self.is_placed(spilled) {
+                let bytes = fp_pseudo_bytes(func, spilled);
+                self.home_on_stack(spilled, SlotShape::new(bytes, bytes));
             }
         }
     }

@@ -48,8 +48,8 @@ use crate::arch::asm_constraints::{operand_pins, AsmOperandClass, AsmRegClass, P
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
     asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
-    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
-    LivenessResult,
+    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, LiveInterval, LivenessResult,
+    SlotShape,
 };
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -846,21 +846,13 @@ pub struct RegAlloc {
     /// did not fit. A separate tally of "how many registers overflowed" can
     /// express neither, nor the alignment padding `IncomingOff::take` inserts.
     named_incoming_end: i32,
-    /// Free general-purpose registers
-    free_regs: Vec<Reg>,
-    /// Free XMM registers (for floating-point)
-    free_xmm_regs: Vec<XmmReg>,
-    /// Active integer register intervals (sorted by end point)
-    active: Vec<(LiveInterval, Reg)>,
-    /// Active XMM register intervals (sorted by end point)
-    active_xmm: Vec<(LiveInterval, XmmReg)>,
     /// Next stack slot offset
     stack_offset: i32,
     /// Reserved when the function converts a long double to an integer.
     x87_scratch: Option<X87Scratch>,
     x87_control_words: Option<X87ControlWords>,
     /// A source position for this function, for the frame diagnostics
-    /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `alloc_stack_slot` and
+    /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `new_frame_slot` and
     /// `IncomingOff::take` have no `&Function` to recover one from.
     func_pos: crate::diag::Position,
     /// Callee-saved registers that were used
@@ -887,10 +879,12 @@ pub struct RegAlloc {
     spilled_args: Vec<SpilledArg>,
     /// XMM arguments spilled from XMM registers to stack
     spilled_xmm_args: Vec<SpilledXmmArg>,
-    /// Active stack slot intervals (interval, offset, size) for reuse tracking
-    active_stack: Vec<crate::arch::regalloc::ActiveSlot>,
-    /// Free stack slots keyed by size, available for reuse
-    free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
+    /// The pseudos that live in a frame slot, with the slot each needs:
+    /// spills, arguments moved out of their registers, 128-bit values, alloca
+    /// pointers. Their offsets are decided together, once both banks are
+    /// colored ([`crate::arch::regalloc::color_stack_slots`]); a spilled
+    /// argument's record is completed then.
+    stack_homed: BTreeMap<PseudoId, SlotShape>,
     /// Per-block live-in sets for interference-based stack coloring
     live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets for interference-based stack coloring
@@ -1183,10 +1177,6 @@ impl RegAlloc {
             named_gp_regs: 0,
             named_fp_regs: 0,
             named_incoming_end: IncomingOff::FIRST.0,
-            free_regs: Reg::allocatable().to_vec(),
-            free_xmm_regs: XmmReg::allocatable().to_vec(),
-            active: Vec::new(),
-            active_xmm: Vec::new(),
             stack_offset: 0,
             x87_scratch: None,
             x87_control_words: None,
@@ -1200,8 +1190,7 @@ impl RegAlloc {
             int128_incoming: BTreeMap::new(),
             spilled_args: Vec::new(),
             spilled_xmm_args: Vec::new(),
-            active_stack: Vec::new(),
-            free_stack_slots: BTreeMap::new(),
+            stack_homed: BTreeMap::new(),
             live_in: Vec::new(),
             live_out: Vec::new(),
             max_local_align: 8,
@@ -1263,12 +1252,10 @@ impl RegAlloc {
             self.incoming_stack_align,
         );
         if let Some(base) = self.frame_base.reg() {
-            self.free_regs.retain(|r| *r != base);
             // The prologue writes it, so the function must save it.
             self.used_callee_saved.push(base);
         }
         let allocatable = self.allocatable_regs();
-        self.free_regs.retain(|r| allocatable.contains(r));
         // Before any other slot: the first is the highest, nearest the saved
         // registers, which is where the canary has to be -- and the arrays
         // right under it.
@@ -1342,6 +1329,7 @@ impl RegAlloc {
             &fp_call_positions,
             &constraint_points,
         );
+        self.place_stack_slots(func);
         if win64 {
             self.win64_xmm_saves = self.win64_xmm_to_save(func);
         }
@@ -1433,10 +1421,6 @@ impl RegAlloc {
     /// Reset allocator state for a new function
     fn reset_state(&mut self) {
         self.locations.clear();
-        self.free_regs = Reg::allocatable().to_vec();
-        self.free_xmm_regs = XmmReg::allocatable().to_vec();
-        self.active.clear();
-        self.active_xmm.clear();
         self.stack_offset = 0;
         self.x87_scratch = None;
         self.x87_control_words = None;
@@ -1449,8 +1433,7 @@ impl RegAlloc {
         self.int128_incoming.clear();
         self.spilled_args.clear();
         self.spilled_xmm_args.clear();
-        self.active_stack.clear();
-        self.free_stack_slots.clear();
+        self.stack_homed.clear();
         self.live_in.clear();
         self.live_out.clear();
         self.max_local_align = 8;
@@ -1731,7 +1714,6 @@ impl RegAlloc {
         // Allocate RDI for hidden return pointer if present
         if let Some(sret_id) = lowering.sret_pseudo {
             self.locations.insert(sret_id, Loc::Reg(int_arg_regs[0]));
-            self.free_regs.retain(|&r| r != int_arg_regs[0]);
             spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
         }
 
@@ -1788,7 +1770,6 @@ impl RegAlloc {
                 if fp_arg_idx < fp_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                    self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                     self.fp_pseudos.insert(pseudo_id);
                     spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
                 } else {
@@ -1892,8 +1873,6 @@ impl RegAlloc {
                 } else if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                    let used = &fp_arg_regs[fp_arg_idx..fp_arg_idx + sse_regs];
-                    self.free_xmm_regs.retain(|r| !used.contains(r));
                     self.arg_span.insert(pseudo_id, sse_regs);
                     self.fp_pseudos.insert(pseudo_id);
                     spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
@@ -1920,7 +1899,6 @@ impl RegAlloc {
                 if fp_arg_idx < fp_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                    self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                     self.fp_pseudos.insert(pseudo_id);
                 } else {
                     // Stack args are placed in parameter order per System V AMD64 ABI
@@ -1942,19 +1920,12 @@ impl RegAlloc {
                 spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
             } else if types.is_plain_int128(*typ) {
                 // __int128: uses two GP registers when available.
-                // Always allocate a local stack slot — for register params,
+                // Always lives in a frame slot — for register params,
                 // store_args_to_stack stores register values; for stack params,
                 // store_args_to_stack copies from the incoming arg area.
-                self.stack_offset = (self.stack_offset + 15) & !15;
-                self.stack_offset += 16;
-                self.locations
-                    .insert(pseudo_id, Loc::Stack(self.stack_offset));
-                self.slot_bytes.insert(pseudo_id, 16);
+                self.home_on_stack(pseudo_id, SlotShape::new(16, 16));
                 self.int128_pseudos.insert(pseudo_id);
                 if int_arg_idx + 1 < int_arg_regs.len() {
-                    self.free_regs.retain(|&r| {
-                        r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
-                    });
                     spend_arg_regs(&mut int_arg_idx, 2, int_arg_regs.len());
                 } else {
                     let at = IncomingOff::take(&mut stack_arg_offset, 16, 16);
@@ -1989,7 +1960,6 @@ impl RegAlloc {
                 } else if int_arg_idx < int_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Reg(int_arg_regs[int_arg_idx]));
-                    self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
                     spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                 } else {
                     // Stack args are placed in parameter order per System V AMD64 ABI
@@ -2066,25 +2036,19 @@ impl RegAlloc {
                     // This is a function parameter in an XMM register — always spill
                     let from_xmm = *xmm;
                     let is_quad = self.quad_pseudos.contains(&interval.pseudo);
-                    self.stack_offset += if is_quad { 16 } else { 8 };
-                    let to_stack_offset = self.stack_offset;
-
+                    let bytes = if is_quad { 16 } else { 8 };
+                    // The slot's offset is filled in once it is placed.
                     self.spilled_xmm_args.push(SpilledXmmArg {
                         pseudo: interval.pseudo,
                         from_xmm,
-                        to_stack_offset,
+                        to_stack_offset: 0,
                         size: if is_quad {
                             FpSize::Quad
                         } else {
                             FpSize::Double
                         },
                     });
-
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
-                    self.slot_bytes
-                        .insert(interval.pseudo, if is_quad { 16 } else { 8 });
-                    self.free_xmm_regs.push(from_xmm);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(bytes, bytes));
                 }
             }
         }
@@ -2129,73 +2093,38 @@ impl RegAlloc {
     /// something destroys that register while the argument is live: a call,
     /// or a constraint point such as a variable shift loading its count into
     /// RCX while the fourth parameter still lives there. See
-    /// [`crate::arch::regalloc::spill_gp_args_across`].
+    /// [`crate::arch::regalloc::gp_args_overwritten`].
     fn spill_gp_args(
         &mut self,
         intervals: &[LiveInterval],
         overwritten: impl Fn(&LiveInterval, Reg) -> bool,
     ) {
-        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
-        let spilled_args = &mut self.spilled_args;
-        let slot_bytes = &mut self.slot_bytes;
-        let free_regs = &mut self.free_regs;
-        crate::arch::regalloc::spill_gp_args_across(
+        let spills = crate::arch::regalloc::gp_args_overwritten(
             intervals,
+            |p| match self.locations.get(&p) {
+                Some(Loc::Reg(r)) if Reg::arg_regs().contains(r) => Some(*r),
+                _ => None,
+            },
             overwritten,
-            &mut self.locations,
-            &mut self.stack_offset,
-            |reg| int_arg_regs_set.contains(&reg),
-            |loc| {
-                if let Loc::Reg(reg) = loc {
-                    Some(*reg)
-                } else {
-                    None
-                }
-            },
-            Loc::Stack,
-            |pseudo, from_reg, to_stack_offset| {
-                spilled_args.push(SpilledArg {
-                    pseudo,
-                    from_reg,
-                    to_stack_offset,
-                });
-                slot_bytes.insert(pseudo, 8);
-            },
-            |reg| free_regs.push(reg),
         );
+        for (pseudo, from_reg) in spills {
+            // The slot's offset is filled in once it is placed.
+            self.spilled_args.push(SpilledArg {
+                pseudo,
+                from_reg,
+                to_stack_offset: 0,
+            });
+            self.home_on_stack(pseudo, SlotShape::new(8, 8));
+        }
     }
 
-    /// Force alloca results to stack to avoid clobbering issues
+    /// Alloca results live in the frame.
     fn allocate_alloca_to_stack(&mut self, func: &Function) {
-        crate::arch::regalloc::assign_alloca_slots(
-            func,
-            &mut self.stack_offset,
-            &mut self.locations,
-            &mut self.slot_bytes,
-            Loc::Stack,
-        );
+        for p in crate::arch::regalloc::alloca_results(func) {
+            self.home_on_stack(p, SlotShape::new(8, 8));
+        }
     }
 
-    /// Try to reuse a freed stack slot of the given size and alignment.
-    /// Uses interference check to ensure the candidate doesn't overlap with the slot's owner.
-    fn try_reuse_stack_slot(
-        &mut self,
-        size: i32,
-        alignment: i32,
-        candidate_interval: &LiveInterval,
-    ) -> Option<(i32, Vec<LiveInterval>)> {
-        super::super::regalloc::try_reuse_stack_slot(
-            &mut self.free_stack_slots,
-            size,
-            alignment,
-            candidate_interval,
-        )
-    }
-
-    /// Allocate a stack slot, optionally reusing a freed slot.
-    /// Only short-lived spills (no register available, not crossing calls/loops)
-    /// should set `reusable=true`. Call-crossing and in-loop spills have
-    /// unreliable interval estimates in complex control flow (e.g., computed gotos).
     /// A fresh frame slot of `size` bytes at `alignment`, shared with nothing.
     fn new_frame_slot(&mut self, size: i32, alignment: i32) -> i32 {
         if alignment > self.max_local_align {
@@ -2233,38 +2162,43 @@ impl RegAlloc {
         }
     }
 
-    fn alloc_stack_slot(
-        &mut self,
-        interval: &LiveInterval,
-        size: i32,
-        alignment: i32,
-        reusable: bool,
-    ) {
-        // A reused slot was counted toward the frame's alignment when it was
-        // made; a new one is counted by `new_frame_slot`.
-        if reusable {
-            if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
-                self.locations.insert(interval.pseudo, Loc::Stack(reused));
-                self.slot_bytes.insert(interval.pseudo, size);
-                self.active_stack.push(crate::arch::regalloc::ActiveSlot {
-                    current: interval.clone(),
-                    past,
-                    offset: reused,
-                    size,
-                });
-                return;
-            }
+    /// `pseudo` lives in a frame slot of `shape`, wherever it was before. The
+    /// slot is placed by [`RegAlloc::place_stack_slots`].
+    fn home_on_stack(&mut self, pseudo: PseudoId, shape: SlotShape) {
+        self.locations.remove(&pseudo);
+        self.stack_homed.insert(pseudo, shape);
+    }
+
+    /// Has `pseudo` a home already: a location, or a frame slot to come?
+    fn is_placed(&self, pseudo: PseudoId) -> bool {
+        self.locations.contains_key(&pseudo) || self.stack_homed.contains_key(&pseudo)
+    }
+
+    /// Lay out the frame slots of every stack-homed pseudo, sharing between
+    /// those never live together
+    /// ([`crate::arch::regalloc::color_stack_slots`]), and complete the
+    /// spilled arguments' records with where they went. The most aligned
+    /// slots first, so that rounding pads the frame once.
+    fn place_stack_slots(&mut self, func: &Function) {
+        let homed = std::mem::take(&mut self.stack_homed);
+        let coloring = crate::arch::regalloc::color_stack_slots(func, &self.live_out, &homed);
+        let mut order: Vec<usize> = (0..coloring.slots.len()).collect();
+        order.sort_by_key(|&n| (std::cmp::Reverse(coloring.slots[n].align), n));
+        let mut offset = vec![0; coloring.slots.len()];
+        for n in order {
+            let shape = coloring.slots[n];
+            offset[n] = self.new_frame_slot(shape.bytes, shape.align);
         }
-        let offset = self.new_frame_slot(size, alignment);
-        self.locations.insert(interval.pseudo, Loc::Stack(offset));
-        self.slot_bytes.insert(interval.pseudo, size);
-        if reusable {
-            self.active_stack.push(crate::arch::regalloc::ActiveSlot {
-                current: interval.clone(),
-                past: Vec::new(),
-                offset,
-                size,
-            });
+        for (&p, &n) in &coloring.slot_of {
+            self.locations.insert(p, Loc::Stack(offset[n]));
+            self.slot_bytes.insert(p, homed[&p].bytes);
+        }
+        let slot = |p: PseudoId| offset[coloring.slot_of[&p]];
+        for arg in &mut self.spilled_args {
+            arg.to_stack_offset = slot(arg.pseudo);
+        }
+        for arg in &mut self.spilled_xmm_args {
+            arg.to_stack_offset = slot(arg.pseudo);
         }
     }
 
@@ -2300,15 +2234,7 @@ impl RegAlloc {
         let mut xmm_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         for interval in &intervals {
-            // Intervals come pre-sorted by start position from
-            // compute_live_intervals, so this monotonic expiration
-            // keeps slot reuse available to the chordal sweep.
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                interval.start,
-            );
-            if self.locations.contains_key(&interval.pseudo) {
+            if self.is_placed(interval.pseudo) {
                 // Already assigned by allocate_arguments / spill_args
                 // / alloca passes; arg pseudos become pre-colored
                 // graph vertices in Phase 2.
@@ -2330,7 +2256,7 @@ impl RegAlloc {
                         // widened at the use site.
                         let defined_128 = setval_sizes.get(&interval.pseudo) == Some(&128);
                         if defined_128 {
-                            self.alloc_stack_slot(interval, 16, 16, true);
+                            self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                             continue;
                         }
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
@@ -2357,7 +2283,7 @@ impl RegAlloc {
                 }
             }
             if self.int128_pseudos.contains(&interval.pseudo) {
-                self.alloc_stack_slot(interval, 16, 16, true);
+                self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                 continue;
             }
             let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
@@ -2367,18 +2293,18 @@ impl RegAlloc {
                 let crosses_call = interval_crosses_call(interval, fp_call_positions);
                 let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if is_longdouble {
-                    self.alloc_stack_slot(interval, 16, 16, false);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                     continue;
                 }
                 if is_quad && (crosses_call || crosses_block) {
                     // A `__float128` is 16 bytes. An 8-byte slot let a
                     // 16-byte store run over its neighbour and read back
                     // garbage in the low half.
-                    self.alloc_stack_slot(interval, 16, 16, false);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                     continue;
                 }
                 if crosses_call || crosses_block {
-                    self.alloc_stack_slot(interval, 8, 8, true);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(8, 8));
                     continue;
                 }
                 xmm_candidates.insert(interval.pseudo);
@@ -2745,26 +2671,9 @@ impl RegAlloc {
                 self.used_callee_saved.push(s_reg);
             }
         }
-        // The monotonic sweep mirrors linear scan's invariant: a
-        // slot is only freed once the owning interval has ended,
-        // and a new interval's start ≥ the freed slot's owner's
-        // end, so they cannot interfere within a block.
-        let mut ordered_spilled: Vec<(usize, PseudoId)> = final_spilled
-            .iter()
-            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
-            .collect();
-        ordered_spilled.sort_by_key(|&(start, _)| start);
-        for (start, spilled) in ordered_spilled {
-            if self.locations.contains_key(&spilled) {
-                continue;
-            }
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                start,
-            );
-            if let Some(interval) = by_pseudo.get(&spilled).copied() {
-                self.alloc_stack_slot(interval, 8, 8, true);
+        for spilled in final_spilled {
+            if !self.is_placed(spilled) {
+                self.home_on_stack(spilled, SlotShape::new(8, 8));
             }
         }
     }
@@ -2775,7 +2684,6 @@ impl RegAlloc {
         intervals: &[LiveInterval],
         xmm_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
-        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if xmm_candidates.is_empty() {
             return;
@@ -2813,27 +2721,10 @@ impl RegAlloc {
             }
             self.locations.insert(pid, Loc::Xmm(reg));
         }
-        // Same monotonic-by-start spill commit as `color_gp_bank` —
-        // see the comment there for why the earlier `usize::MAX`
-        // drain was unsafe.
-        let mut ordered_spilled: Vec<(usize, PseudoId)> = result
-            .spilled
-            .iter()
-            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
-            .collect();
-        ordered_spilled.sort_by_key(|&(start, _)| start);
-        for (start, spilled) in ordered_spilled {
-            if self.locations.contains_key(&spilled) {
-                continue;
-            }
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                start,
-            );
-            if let Some(interval) = by_pseudo.get(&spilled).copied() {
+        for spilled in result.spilled {
+            if !self.is_placed(spilled) {
                 let bytes = self.fp_slot_bytes(spilled);
-                self.alloc_stack_slot(interval, bytes, bytes, true);
+                self.home_on_stack(spilled, SlotShape::new(bytes, bytes));
             }
         }
     }

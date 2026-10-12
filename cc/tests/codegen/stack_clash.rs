@@ -223,7 +223,9 @@ static int run(int k) {
         memset(&sa, 0, sizeof sa);
         sa.sa_sigaction = on_segv;
         sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        /* macOS raises SIGBUS, not SIGSEGV, on a PROT_NONE page. */
         sigaction(SIGSEGV, &sa, 0);
+        sigaction(SIGBUS, &sa, 0);
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         if (pthread_attr_setstack(&attr, base + BELOW + GUARD, STACK))

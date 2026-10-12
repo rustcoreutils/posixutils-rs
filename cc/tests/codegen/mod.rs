@@ -49,6 +49,7 @@ mod cross_abi_types;
 mod cross_abi_varargs;
 mod debug_info;
 mod determinism;
+mod devirt;
 // Thread cancellation and libgcc's forced unwind, as a glibc system has them.
 #[cfg(target_os = "linux")]
 mod exceptions;

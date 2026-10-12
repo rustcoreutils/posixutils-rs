@@ -20,6 +20,7 @@ pub mod constglobal;
 pub mod copyprop;
 pub mod dataflow;
 pub mod dce;
+pub mod devirt;
 pub mod dominate;
 pub mod dse;
 pub mod effects;

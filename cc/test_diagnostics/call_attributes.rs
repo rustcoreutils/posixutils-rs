@@ -201,6 +201,53 @@ int k(void) { extern int m(void) __asm__("m_impl") __attribute__((warning("blk")
     }
 }
 
+/// A call through a pointer that holds one known function is that
+/// function's call once optimizing, as gcc makes it from -O1: a local
+/// pointer, a `static const` one, and a member of a `const` table. At -O0
+/// it stays a call through the pointer, and is not reported; neither is a
+/// call through a pointer that may hold either of two functions, or a
+/// modifiable global one, at any level.
+#[test]
+fn calls_through_a_pointer_to_a_known_function() {
+    let src = r#"void f(void) __attribute__((warning("w")));
+void g(int);
+static void (*const sp)(void) = f;
+void (*gp)(void) = f;
+struct ops { int n; void (*go)(void); void (*put)(int); };
+static const struct ops tab = { 1, f, g };
+void h(void) { void (*p)(void) = f; p(); }
+void h2(void) { sp(); }
+void h3(void) { gp(); }
+void h4(int c) { void (*p)(void) = c ? f : (void (*)(void))0; p(); }
+void h5(void) { tab.go(); tab.put(4); }
+"#;
+    let (ok, got) = diagnostics("attr_devirt_o0", src, &["-O0"]);
+    assert!(ok && got.is_empty(), "{got:#?}");
+    for opt in ["-O1", "-O2"] {
+        let (ok, got) = diagnostics("attr_devirt", src, &[opt]);
+        assert!(ok, "{got:#?}");
+        let w = "warning: call to 'f' declared with attribute warning: w [-Wattribute-warning]";
+        assert_eq!(
+            got,
+            [
+                format!("7:37: {w}"),
+                format!("8:17: {w}"),
+                format!("11:17: {w}"),
+            ],
+            "{opt}"
+        );
+        let asm = compile(
+            "attr_devirt_asm",
+            src,
+            &["--target=x86_64-unknown-linux-gnu", opt],
+        )
+        .asm
+        .expect("assembly");
+        assert_eq!(asm.matches("call f").count(), 3, "{opt}:\n{asm}");
+        assert_eq!(asm.matches("call g").count(), 1, "{opt}:\n{asm}");
+    }
+}
+
 /// `-Wno-attribute-warning` silences the warnings, never the errors.
 #[test]
 fn warning_group_is_attribute_warning() {

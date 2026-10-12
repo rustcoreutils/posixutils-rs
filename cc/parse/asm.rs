@@ -250,7 +250,8 @@ impl Parser<'_> {
         // Basic asm, with no colon, is emitted as written: gcc substitutes
         // nothing into it, so `%eax`, `%%` and an x86 `{` all reach the
         // assembler unchanged.
-        if !self.is_special(b':') {
+        let has_operands = self.is_special(b':');
+        if !has_operands {
             template = crate::arch::basic_asm_template(&template, self.types.target().arch);
         }
 
@@ -290,6 +291,9 @@ impl Parser<'_> {
         self.expect_special(b';')?;
 
         let (outputs, inputs) = self.resolve_asm_operand_names(pos, outputs, inputs, &goto_labels);
+        if has_operands {
+            self.check_template_operand_names(pos, &template, &outputs, &inputs, &goto_labels);
+        }
 
         // Every asm is already treated as volatile: `Opcode::Asm` is a memory
         // access, so DCE never deletes one and no pass reorders it past
@@ -343,6 +347,33 @@ impl Parser<'_> {
         let outputs = outputs.into_iter().map(resolve).collect();
         let inputs = inputs.into_iter().map(resolve).collect();
         (outputs, inputs)
+    }
+
+    /// Report each `%[name]` and `%l[name]` of an extended asm's template
+    /// that names no operand or label, or has no `]`, in gcc's words.
+    ///
+    /// Here, as the statement is parsed, because gcc does it then: a
+    /// `static inline` function no one calls is reported too, where the
+    /// backend's substitution never sees it. Everything else about a
+    /// template -- an operand number out of range, a modifier, `%l` naming
+    /// an operand -- gcc decides when it writes the function, as c17 does.
+    fn check_template_operand_names(
+        &self,
+        pos: Position,
+        template: &str,
+        outputs: &[AsmOperand],
+        inputs: &[AsmOperand],
+        labels: &[LabelId],
+    ) {
+        let names: Vec<Option<&str>> = outputs
+            .iter()
+            .chain(inputs)
+            .map(|op| op.name.map(|n| self.str(n)))
+            .chain(labels.iter().map(|l| Some(self.str(l.name))))
+            .collect();
+        for err in template_name_errors(template, &names) {
+            diag::error(pos, &err.to_string());
+        }
     }
 
     /// Parse GNU basic asm at file scope: `asm ( string-literal ) ;`, the
@@ -571,6 +602,41 @@ impl std::fmt::Display for OperandNameError {
             )),
         }
     }
+}
+
+/// What is wrong with each `%[name]` and `%x[name]` of `template` -- a name
+/// not among `names`, or no `]` -- in order, as gcc's scan finds them: a
+/// `%` followed by `[`, or by one letter and `[`; `%%` is skipped whole.
+pub(super) fn template_name_errors(
+    template: &str,
+    names: &[Option<&str>],
+) -> Vec<OperandNameError> {
+    let mut errors = Vec::new();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while let Some(off) = template[i..].find('%') {
+        let p = i + off;
+        let next = bytes.get(p + 1).copied();
+        let open = if next == Some(b'[') {
+            p + 1
+        } else if next.is_some_and(|c| c.is_ascii_alphabetic()) && bytes.get(p + 2) == Some(&b'[') {
+            p + 2
+        } else {
+            i = p + 1 + usize::from(next == Some(b'%'));
+            continue;
+        };
+        let after = &template[open + 1..];
+        let Some(close) = after.find(']') else {
+            errors.push(OperandNameError::MissingCloseBrace);
+            break;
+        };
+        let name = &after[..close];
+        if !names.contains(&Some(name)) {
+            errors.push(OperandNameError::Undefined(name.to_string()));
+        }
+        i = open + 1 + close + 1;
+    }
+    errors
 }
 
 /// `constraint` with each `[name]` replaced by the number of the operand

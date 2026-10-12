@@ -176,6 +176,49 @@ fn asm_template_references_that_name_nothing() {
     }
 }
 
+/// A `%[name]` or `%l[name]` naming nothing, or with no `]`, is reported
+/// as the statement is parsed, as gcc does: in a `static inline` function
+/// no one calls too, for which the backend writes nothing. gcc leaves the
+/// rest -- an operand number out of range here -- to the function's output,
+/// so an unused function is not reported for it, by either compiler.
+#[test]
+fn asm_template_names_in_an_unused_function() {
+    let unused = |stmt: &str| {
+        format!(
+            "static inline void h(long x) {{\n\
+             {stmt}\n\
+             }}\n\
+             void f(void) {{ }}\n"
+        )
+    };
+    for opt in OPTS {
+        for target in [X86, A64] {
+            for (stmt, wanted) in [
+                (
+                    r##"__asm__("# %[nope]" :: "r"(x));"##,
+                    "undefined named operand 'nope'",
+                ),
+                (
+                    r##"__asm__ goto("# %l[nope]" :: "r"(x) :: out); out:;"##,
+                    "undefined named operand 'nope'",
+                ),
+                (
+                    r##"__asm__("# %[x" :: [x] "r"(x));"##,
+                    "missing close brace for named operand",
+                ),
+            ] {
+                expect_rejected("asm_tpl_unused", &unused(stmt), target, opt, wanted, 2);
+            }
+            expect_accepted(
+                "asm_tpl_unused_range",
+                &unused(r##"__asm__("# %3" :: "r"(x));"##),
+                target,
+                opt,
+            );
+        }
+    }
+}
+
 /// Basic asm -- no colon -- is emitted as written, as gcc emits it: nothing
 /// is substituted, and `%%` stays `%%`.
 #[test]

@@ -3307,6 +3307,9 @@ pub struct FunctionAttrs {
     /// where its list is: a declarator that declares no function ignores
     /// them with gcc's diagnostic (`Parser::drop_fn_decl_attrs`).
     pub function_only: Vec<(&'static str, crate::diag::Position)>,
+    /// The `format` and `format_arg` attributes written, checked against
+    /// the function type once it is known (`Parser::check_format_uses`).
+    pub format_uses: Vec<crate::parse::attribute::FormatUse>,
 }
 
 impl FunctionAttrs {

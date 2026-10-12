@@ -99,7 +99,7 @@ const PLAIN: &[(&str, Effect)] = &[
     ("extra", Accepted),
     ("float-conversion", Accepted),
     ("float-equal", Accepted),
-    ("format", Accepted),
+    ("format", Implemented),
     ("format-contains-nul", Accepted),
     ("format-diag", Accepted),
     ("format-extra-args", Accepted),
@@ -734,6 +734,7 @@ mod tests {
     fn implemented_groups_are_in_the_table() {
         for name in [
             "attributes",
+            "format",
             "builtin-macro-redefined",
             "c17-dialect",
             "cpp",
@@ -772,7 +773,6 @@ mod tests {
             "",
             "all",
             "extra",
-            "format",
             "format=2",
             "format=02",
             "format-security",

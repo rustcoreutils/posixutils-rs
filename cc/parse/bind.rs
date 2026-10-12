@@ -927,6 +927,7 @@ impl Parser<'_> {
         name: StringId,
         typ: &mut TypeId,
     ) -> Option<FunctionAttrs> {
+        self.check_format_uses(*typ);
         if specs.is_typedef() {
             self.drop_fn_decl_attrs(*typ);
             return None;

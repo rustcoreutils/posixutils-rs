@@ -50,6 +50,7 @@ mod default_pedwarns;
 mod diagnostic_pragmas;
 mod empty_declarations;
 mod expressions;
+mod format_attributes;
 mod frame_larger_than;
 mod function_compatibility;
 mod function_pointers;

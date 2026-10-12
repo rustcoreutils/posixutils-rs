@@ -225,6 +225,9 @@ impl Aarch64CodeGen {
                 src2: GpOperand::Imm(0),
                 dst: Reg::sp(),
             });
+            // The rounding below the reservation takes at most the
+            // alignment less the sixteen `sp` already has.
+            self.base.sp_lowered(i64::from(reserve + max_align - 16));
             self.push_lir(Aarch64Inst::Str {
                 size: OperandSize::B64,
                 src: Reg::X16,
@@ -241,6 +244,7 @@ impl Aarch64CodeGen {
                 src2: GpOperand::Imm(aligned_bytes as i64),
                 dst: Reg::sp(),
             });
+            self.base.sp_lowered(aligned_bytes as i64);
         }
 
         self.store_stack_args(placed, types);
@@ -283,6 +287,7 @@ impl Aarch64CodeGen {
             src2: GpOperand::Imm(aligned_bytes as i64),
             dst: Reg::sp(),
         });
+        self.base.sp_lowered(aligned_bytes as i64);
 
         self.store_stack_args(placed.args, types);
 
@@ -1129,6 +1134,7 @@ impl Aarch64CodeGen {
                 src2: GpOperand::Imm(0),
                 dst: Reg::sp(),
             });
+            self.base.sp_restored();
             return;
         }
         if stack_args > 0 {
@@ -1138,6 +1144,7 @@ impl Aarch64CodeGen {
                 src2: GpOperand::Imm((stack_args * 16) as i64),
                 dst: Reg::sp(),
             });
+            self.base.sp_raised(i64::from(stack_args * 16));
         }
     }
 

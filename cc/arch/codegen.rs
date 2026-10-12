@@ -209,6 +209,12 @@ pub struct CodeGenBase<I: LirInst> {
     pub optimizing: bool,
     /// Under branch protection, where an indirect branch may land.
     pub landing_pads: super::landing_pads::LandingPads,
+    /// How far the body of the function being emitted moves the stack
+    /// pointer below its frame; see [`Self::sp_lowered`].
+    pub excursion: super::stack_usage::Excursion,
+    /// The stack use of each function emitted, for `-fstack-usage`; see
+    /// [`Self::record_stack_usage`].
+    pub stack_usage: Vec<super::stack_usage::StackUsage>,
 }
 
 /// The own section of `global` under `-fdata-sections` or `retain`, named as
@@ -361,6 +367,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             eh: Default::default(),
             optimizing: false,
             landing_pads: Default::default(),
+            excursion: Default::default(),
+            stack_usage: Vec::new(),
         }
     }
 
@@ -553,12 +561,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             return;
         };
         let guard = stack_clash.probed_from(self.target.arch);
-        let dynamic = func
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insns)
-            .any(|i| i.op == Opcode::Alloca);
-        if adjustment >= guard || dynamic {
+        if adjustment >= guard || super::stack_usage::allocates_at_run_time(func) {
             crate::diag::group_warning_args(
                 crate::f_options::UNSUPPORTED_WARNING,
                 self.func_pos,
@@ -588,6 +591,38 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 "the frame size of {0} bytes is larger than {1} bytes",
                 &[&size.to_string(), &limit.to_string()],
             );
+        }
+    }
+
+    /// The body moves the stack pointer `bytes` below where it stands: an
+    /// outgoing argument area, or a push it pops again. Every such move is
+    /// reported here and undone by [`Self::sp_raised`], so that
+    /// [`Self::record_stack_usage`] counts the deepest; `alloca` is not one,
+    /// its amount being unknown.
+    pub fn sp_lowered(&mut self, bytes: i64) {
+        self.excursion.lowered(bytes);
+    }
+
+    /// The body moves the stack pointer `bytes` back up.
+    pub fn sp_raised(&mut self, bytes: i64) {
+        self.excursion.raised(bytes);
+    }
+
+    /// The body puts the stack pointer back at the bottom of the frame
+    /// from a saved copy, having moved it by an amount known only at run
+    /// time within a bound it has already reported.
+    pub fn sp_restored(&mut self) {
+        self.excursion.restored();
+    }
+
+    /// Record the stack use of the function just emitted, whose prologue
+    /// took `frame_bytes` below the caller's stack pointer, and give
+    /// `-Wstack-usage=`'s warning about it. Called once the body is emitted,
+    /// so that its moves are all counted.
+    pub fn record_stack_usage(&mut self, func: &Function, frame_bytes: i64) {
+        if let Some(usage) = self.excursion.finish(func, frame_bytes) {
+            usage.check_limit();
+            self.stack_usage.push(usage);
         }
     }
 
@@ -1852,6 +1887,9 @@ fn undefined_operand_name(name: &str) -> String {
 pub trait CodeGenerator {
     /// Generate assembly code for the given IR module
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String;
+
+    /// The stack use of each function [`Self::generate`] emitted, in order.
+    fn stack_usage(&self) -> &[super::stack_usage::StackUsage];
 
     /// Set where the CFI procedures and their frame rules go, if anywhere.
     fn set_cfi(&mut self, cfi: crate::target::Cfi);

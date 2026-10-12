@@ -148,6 +148,12 @@ pub trait Observer {
     ) -> bool {
         true
     }
+
+    /// The assembly was generated without error; `stack_usage` is the
+    /// stack use of each function in it, for `-fstack-usage`.
+    fn generated(&mut self, _stack_usage: &[arch::stack_usage::StackUsage]) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// An observer that changes nothing.
@@ -354,6 +360,7 @@ pub fn compile_tokens(
     if diag::has_error() != 0 {
         return Err(failed("compilation failed"));
     }
+    observer.generated(codegen.stack_usage())?;
 
     Ok(Some(asm))
 }

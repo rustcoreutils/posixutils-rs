@@ -69,6 +69,7 @@ mod pointer_sign;
 mod ranges_designators_labels;
 mod return_conversion;
 mod specifiers;
+mod stack_usage;
 mod storage_order;
 mod target_attr;
 mod va_arg_pack;

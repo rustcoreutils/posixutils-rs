@@ -1490,6 +1490,10 @@ impl CodeGenerator for Aarch64CodeGen {
         self.base.stack_protector = protection;
     }
 
+    fn stack_usage(&self) -> &[crate::arch::stack_usage::StackUsage] {
+        &self.base.stack_usage
+    }
+
     fn set_optimizing(&mut self, on: bool) {
         self.base.optimizing = on;
     }

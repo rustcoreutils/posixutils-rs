@@ -22,6 +22,7 @@ pub mod mapping;
 pub mod regalloc;
 pub mod simd;
 pub mod stack_protect;
+pub mod stack_usage;
 pub mod x86_64;
 
 // Re-export inline asm support traits and functions
@@ -35,7 +36,8 @@ use crate::target::{Arch, CharSignedness, IntType, Os, Target};
 /// The first source position this function's instructions carry, for a backend
 /// diagnostic that has no better one.
 ///
-/// `ir::Function` records no position of its own. This is the recovery
+/// `ir::Function::declared` has the declarator's position, which only the
+/// stack-usage records and warnings report at, as gcc does. This is the recovery
 /// `CodeGenBase::emit_function_entry_loc` already performs for the entry `.loc`,
 /// and a widening of the `Opcode::Asm`-only scan both `FrameBase::of`s do: any
 /// instruction carrying a position is nearer the object than

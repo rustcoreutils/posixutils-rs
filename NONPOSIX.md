@@ -111,6 +111,8 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
    would alter string literals).
  * `--dump-tokens`, `--dump-ast`, `--dump-ir`, `--dump-ir-func` — developer
    diagnostics.
+ * `-fstack-usage` and `-Wstack-usage=` — each function's stack use, in gcc's
+   `.su` file and warnings, to compare c17's frames with gcc's.
  * A GCC-compatibility argument rewriter accepts and maps `-std=`, `-f*`,
    `-m*`, the `-fpic` family (`-fPIC`/`-fpic`/`-fPIE`/`-fpie` and their
    `-fno-` forms, last one wins), `-ftls-model=`, `-pie`/`-no-pie`,

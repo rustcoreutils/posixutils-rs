@@ -273,6 +273,7 @@ impl X86_64CodeGen {
             src: GpOperand::Imm(area),
             dst: Reg::Rsp,
         });
+        self.base.sp_lowered(area);
         for (n, &arg) in insn.src.iter().enumerate() {
             let typ = insn.extra().arg_types.get(n).copied();
             self.store_win64_arg(arg, typ, &classes[n], n, types);

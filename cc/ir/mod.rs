@@ -3225,11 +3225,24 @@ pub struct ImplicitParamCopy {
     pub arg_is_address: bool,
 }
 
+/// A function definition as the source wrote it: what gcc names a function
+/// by in `-fstack-usage` records and `-Wstack-usage=` warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDecl {
+    /// The C identifier, which an asm label does not change.
+    pub name: String,
+    /// Where the declarator's identifier stands.
+    pub pos: Position,
+}
+
 /// A function in IR form
 #[derive(Debug, Clone)]
 pub struct Function {
     /// Function name
     pub name: String,
+    /// The definition as the source wrote it; `None` for a function the
+    /// compiler made up.
+    pub declared: Option<FunctionDecl>,
     /// `weak`, `used`, `section(...)`, `visibility(...)`.
     pub symbol_attrs: crate::parse::ast::SymbolAttrs,
     /// `__attribute__((aligned(N)))`: the byte alignment the function's code
@@ -3395,6 +3408,7 @@ impl Default for Function {
     fn default() -> Self {
         Self {
             name: String::new(),
+            declared: None,
             symbol_attrs: Default::default(),
             align: None,
             takes_label_addr: false,

@@ -937,9 +937,7 @@ impl X86_64CodeGen {
         };
         if !self.base.isa.has_sse2() {
             debug_assert!(src.0 != Reg::Rax && dst.0 != Reg::Rax);
-            self.push_lir(X86Inst::Push {
-                src: GpOperand::Reg(Reg::Rax),
-            });
+            self.push_saved(Reg::Rax);
             for i in 0..count {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
@@ -952,7 +950,7 @@ impl X86_64CodeGen {
                     dst: GpOperand::Mem(at(dst, i, 8)),
                 });
             }
-            self.push_lir(X86Inst::Pop { dst: Reg::Rax });
+            self.pop_saved(Reg::Rax);
             return;
         }
         for i in 0..count {

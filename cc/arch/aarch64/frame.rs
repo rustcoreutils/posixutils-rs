@@ -236,6 +236,10 @@ impl Aarch64CodeGen {
         for block in &func.blocks {
             self.emit_block(block, &frame_info, types);
         }
+        // The frame the prologue allocates, frame record and saved
+        // registers included: gcc's measure here, the return address being
+        // in a register.
+        self.base.record_stack_usage(func, i64::from(total_frame));
 
         // The landings of calls whose argument area was realigned: `sp`
         // back from where the call saved it, then the pad (`arch::eh`).

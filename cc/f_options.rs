@@ -279,6 +279,7 @@ const PLAIN: &[(&str, Effect)] = &[
     // The stack protector's levels and their withdrawal:
     // `target::StackProtector`.
     ("no-stack-protector", Implemented),
+    ("no-stack-usage", Implemented),
     // c17 does not assume aliasing by type: a store through `float *`
     // reloads an `int` read through `int *`.
     ("no-strict-aliasing", Accepted(Default)),
@@ -372,6 +373,8 @@ const PLAIN: &[(&str, Effect)] = &[
     ("stack-protector-all", Implemented),
     ("stack-protector-explicit", Implemented),
     ("stack-protector-strong", Implemented),
+    // Main driver: each function's stack use, in a `.su` file.
+    ("stack-usage", Implemented),
     ("strict-aliasing", Accepted(Permission)),
     ("strict-flex-arrays", Implemented),
     ("strict-overflow", Accepted(Permission)),

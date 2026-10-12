@@ -2040,6 +2040,22 @@ impl<'a> Linearizer<'a> {
         request.map_or(unit, |r| unit.with_request(r))
     }
 
+    /// The definition `func` as the source wrote it: its identifier, and
+    /// where the declarator names it -- the symbol's definition, which a
+    /// later declaration of the name does not replace. The definition's
+    /// first token stands in for a symbol not found.
+    fn function_decl(&self, func: &FunctionDef) -> crate::ir::FunctionDecl {
+        let pos = self
+            .symbols
+            .lookup(func.name, crate::symbol::Namespace::Ordinary)
+            .filter(|s| s.declared.definition)
+            .map_or(func.pos, |s| s.declared.pos);
+        crate::ir::FunctionDecl {
+            name: self.str(func.name).to_string(),
+            pos,
+        }
+    }
+
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
         self.linearize_function_as(func, None)
     }
@@ -2073,6 +2089,7 @@ impl<'a> Linearizer<'a> {
         self.current_calling_conv = func.calling_conv;
 
         let mut ir_func = Function::new(name, func.return_type);
+        ir_func.declared = Some(self.function_decl(func));
         ir_func.conv = func.calling_conv;
         ir_func.isa = version
             .as_ref()

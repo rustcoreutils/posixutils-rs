@@ -115,6 +115,12 @@ Supported:
 - Variably modified types everywhere C17 admits them, including a `typedef` of
   one (6.7.7), whose extents are evaluated at the typedef rather than at each use
 - `-fverbose-asm`, annotating each instruction with the source names it came from
+- `-fstack-usage`, writing each function's stack use to a `.su` file named,
+  laid out and counted as gcc's, so that a c17 build and a gcc build compare
+  function by function; and `-Wstack-usage=`, warning in gcc's words. The
+  figures are c17's own frames. On AArch64 c17 moves `sp` for each call's
+  stacked arguments, so such a function is `dynamic,bounded` where gcc,
+  reserving the area in its frame, says `static`
 - `-fdebug-prefix-map=OLD=NEW`, `-fmacro-prefix-map=OLD=NEW` and
   `-ffile-prefix-map=OLD=NEW`, with gcc's rules: the last matching option
   wins, `OLD` is a plain string prefix, and the argument splits at its last `=`

@@ -93,9 +93,7 @@ impl X86_64CodeGen {
     pub(super) fn emit_rep_movsq(&mut self, src: MemAddr, dst: BlockDst, qwords: i64) {
         let saved = [Reg::Rdi, Reg::Rsi, Reg::Rcx];
         for r in saved {
-            self.push_lir(X86Inst::Push {
-                src: GpOperand::Reg(r),
-            });
+            self.push_saved(r);
         }
         self.push_lir(X86Inst::Lea {
             addr: src,
@@ -119,7 +117,7 @@ impl X86_64CodeGen {
         });
         self.push_lir(X86Inst::RepMovsq);
         for r in saved.into_iter().rev() {
-            self.push_lir(X86Inst::Pop { dst: r });
+            self.pop_saved(r);
         }
     }
 
@@ -388,6 +386,7 @@ impl X86_64CodeGen {
             src: GpOperand::Imm(info.stack_bytes as i64),
             dst: Reg::Rsp,
         });
+        self.base.sp_lowered(info.stack_bytes as i64);
         for (n, &i) in info.stack_arg_indices.iter().enumerate() {
             let base_off = info.stack_offsets[n];
             let arg = insn.src[i];
@@ -1458,6 +1457,7 @@ impl X86_64CodeGen {
                 src: GpOperand::Imm(stack_cleanup as i64),
                 dst: Reg::Rsp,
             });
+            self.base.sp_raised(stack_cleanup as i64);
         }
     }
 

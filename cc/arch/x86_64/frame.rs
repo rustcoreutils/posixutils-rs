@@ -333,6 +333,7 @@ impl X86_64CodeGen {
             .check_stack_clash(func, self.stack_alloc_size as i64 + realign);
         self.base
             .check_frame_size(i64::from(stack_size + reg_save_area_size));
+        let frame_bytes = self.prologue_bytes();
         self.emit_stack_guard_set();
 
         // Store spilled arguments before any calls can clobber them
@@ -364,6 +365,7 @@ impl X86_64CodeGen {
         for block in &func.blocks {
             self.emit_block(block, types);
         }
+        self.base.record_stack_usage(func, frame_bytes);
 
         // CFI: End procedure
         if self.base.cfi.emitted() {
@@ -655,6 +657,28 @@ impl X86_64CodeGen {
 
         // What a dynamically aligned frame addresses its locals from.
         self.stack_alloc_size = alloc_size;
+    }
+
+    /// How far below the caller's stack pointer the prologue leaves `%rsp`,
+    /// by gcc's `-fstack-usage` measure: the return address, the saved
+    /// `%rbp`, the pushed registers and an `ms_abi` XMM save area, the
+    /// `subq`, and the most an over-aligned frame's `andq` can take -- the
+    /// alignment less what `%rsp` is already known to be aligned to, `%rbp`
+    /// being aligned as the stack is on entry.
+    fn prologue_bytes(&self) -> i64 {
+        let pushed =
+            self.callee_saved_regs.len() as i64 * 8 + i64::from(self.win64_xmm_area_bytes());
+        let below_rbp = pushed + i64::from(self.stack_alloc_size);
+        let realign = match self.frame_base {
+            FrameBase::Aligned { align, .. } => {
+                let entry = i64::from(self.base.target.x86.incoming_stack_align());
+                // The largest power of two dividing both.
+                let known = 1i64 << (below_rbp | entry).trailing_zeros();
+                i64::from(align) - known
+            }
+            _ => 0,
+        };
+        16 + below_rbp + realign.max(0)
     }
 
     /// Re-establish an over-aligned frame's base register from `%rbp` alone,

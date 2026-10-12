@@ -171,6 +171,21 @@ impl X86_64CodeGen {
         self.base.push_lir(inst);
     }
 
+    /// Save `reg` on the stack in the body, for a [`Self::pop_saved`] to
+    /// restore: the push moves `%rsp`, which `-fstack-usage` counts.
+    pub(super) fn push_saved(&mut self, reg: Reg) {
+        self.push_lir(X86Inst::Push {
+            src: GpOperand::Reg(reg),
+        });
+        self.base.sp_lowered(8);
+    }
+
+    /// Restore `reg` from a [`Self::push_saved`].
+    pub(super) fn pop_saved(&mut self, reg: Reg) {
+        self.push_lir(X86Inst::Pop { dst: reg });
+        self.base.sp_raised(8);
+    }
+
     /// Compute the memory address for a stack offset.
     /// In normal mode: [rbp - (offset + callee_saved_offset)]
     /// In dynamic alignment mode: [base + (stack_alloc_size - offset)]
@@ -841,9 +856,7 @@ impl X86_64CodeGen {
         if op_size == OperandSize::B64 && !fits(lo) {
             // No scratch left for a wide immediate, so build it
             // in R10 and restore R10 afterwards.
-            self.push_lir(X86Inst::Push {
-                src: GpOperand::Reg(Reg::R10),
-            });
+            self.push_saved(Reg::R10);
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Imm(lo),
@@ -854,7 +867,7 @@ impl X86_64CodeGen {
                 src: GpOperand::Reg(Reg::R10),
                 dst: Reg::R11,
             });
-            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
+            self.pop_saved(Reg::R10);
         } else {
             self.push_lir(X86Inst::Sub {
                 size: op_size,
@@ -863,9 +876,7 @@ impl X86_64CodeGen {
             });
         }
         if op_size == OperandSize::B64 && !fits(span) {
-            self.push_lir(X86Inst::Push {
-                src: GpOperand::Reg(Reg::R10),
-            });
+            self.push_saved(Reg::R10);
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Imm(span),
@@ -876,7 +887,7 @@ impl X86_64CodeGen {
                 src: GpOperand::Reg(Reg::R10),
                 dst: GpOperand::Reg(Reg::R11),
             });
-            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
+            self.pop_saved(Reg::R10);
         } else {
             self.push_lir(X86Inst::Cmp {
                 size: op_size,
@@ -1914,6 +1925,10 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_profiling(&mut self, profiling: Option<crate::target::Profiling>) {
         self.profiling = profiling;
+    }
+
+    fn stack_usage(&self) -> &[crate::arch::stack_usage::StackUsage] {
+        &self.base.stack_usage
     }
 
     fn set_optimizing(&mut self, on: bool) {

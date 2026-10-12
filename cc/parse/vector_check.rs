@@ -192,9 +192,9 @@ impl Parser<'_> {
     /// size, and converts nothing else. Answers whether it is valid.
     pub(super) fn check_vector_cast(&mut self, from: TypeId, to: TypeId, pos: Position) -> bool {
         let types = &*self.types;
-        // Either type may be an aggregate with no value width; two of them
-        // compare equal here, as the saturated widths always did.
-        let same_size = types.checked_value_bits(from) == types.checked_value_bits(to);
+        // Compared in bytes: a vector past 512 MiB has no value width, and
+        // comparing widths made any two such vectors the same size.
+        let same_size = types.byte_size(from) == types.byte_size(to);
         let (vector, other) = if types.is_vector(to) {
             (to, from)
         } else {

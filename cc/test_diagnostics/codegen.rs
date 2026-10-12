@@ -232,6 +232,21 @@ fn vector_operand_constraints() {
     }
 }
 
+/// A cast between vectors past 512 MiB of different sizes is refused as any
+/// other: their widths saturated at the same `u32::MAX` bits and compared
+/// equal, so `(W)v` between a 1 GiB and a 512 MiB vector was accepted.
+#[test]
+fn vector_cast_between_large_vectors_of_different_sizes() {
+    compile_expect_error(
+        "vec_cast_large",
+        "typedef char V __attribute__((vector_size(1 << 30)));\n\
+         typedef char W __attribute__((vector_size(1 << 29)));\n\
+         extern V v; W *x;\n\
+         void f(void) { *x = (W)v; }\n",
+        "which has different size",
+    );
+}
+
 #[test]
 fn vector_builtin_constraints() {
     for (name, expr, expected) in [

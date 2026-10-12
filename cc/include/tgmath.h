@@ -3,14 +3,19 @@
  *
  * Builtin header for c17.
  *
- * Written entirely in _Generic, which is the idiom the standard itself
- * describes. Deliberately independent of the host's <tgmath.h>: every glibc
- * version of that header requires compiler internals c17 does not have --
- * __builtin_tgmath for GCC >= 8, and __builtin_classify_type plus __real__ for
- * the older path -- and it additionally #errors out unless __HAVE_FLOAT128
- * agrees with __HAVE_FLOAT64X, which is decided purely by the __GNUC__ version
- * we advertise. None of that is reachable from here, and none of it is needed:
- * _Generic expresses the whole facility.
+ * Every macro is a `__builtin_tgmath` call over the functions the C library
+ * declares for it, as glibc's own <tgmath.h> is under gcc 13: the builtin
+ * picks the function by the types of the arguments (C2x 7.27p3, and its
+ * rules for the macros that round to a narrower type), and expands and
+ * evaluates each argument once. Which macros exist, and which functions each
+ * may reach, follow glibc's feature tests, so a program sees under c17 what
+ * it sees under gcc: `sqrt` of a `_Float128` is `sqrtf128` where <math.h>
+ * declares that, and is refused where it does not, never a `double` call.
+ * Elsewhere than glibc (macOS) there is no `__GLIBC_USE`, so a macro reaches
+ * only the `float`, `double` and `long double` functions of C17.
+ *
+ * glibc's own header cannot serve: it picks its implementation by the gcc
+ * version claimed, and below 13 needs __builtin_classify_type tricks.
  *
  * A program may #undef any of these to reach the underlying function, as
  * C11 7.1.4p1 permits.
@@ -21,181 +26,294 @@
 #include <math.h>
 #include <complex.h>
 
-/* ------------------------------------------------------------------------
- * Dispatch helpers.
- *
- * The controlling expression of a _Generic is not evaluated (C17 6.5.1.1p2);
- * only its type is used, after lvalue conversion. That is what lets these
- * dispatch on an argument that has side effects, and what lets the
- * multi-argument forms dispatch on a sum of their arguments (see __tg_t) --
- * the usual arithmetic conversions pick the common type without any operand
- * being evaluated.
- * ------------------------------------------------------------------------ */
-
-/* C17 7.25p3: an argument of integer type counts as `double` when choosing
-   the function. A one-argument macro gets that from `default:`; for the
-   multi-argument ones the arguments' common type is taken over these stand-ins
-   rather than the arguments themselves, so `pow(i, f)` for an `int i` and a
-   `float f` is `pow`, not `powf` -- the usual arithmetic conversions alone
-   would have made it `float` and rounded `i`. */
-/* C23's _FloatN and _FloatNx types (7.27): a real argument of one reaches
-   the function for that type, `sqrtf32` for a `_Float32`, where the C
-   library's <math.h> declares those -- glibc's does with its IEC 60559 types
-   extension on. Elsewhere, and for complex arguments (the <complex.h> here
-   declares only the standard functions), it reaches the standard function of
-   the same format, which computes the same value in a type of another name. `_Float64x` exists only
-   where `long double` is wider than `double`, and an association may not
-   name a type that does not. */
-#ifdef __FLT64X_MANT_DIG__
-#define __tg_f64x(e) _Float64x: e,
-#define __tg_cf64x(e) _Float64x _Complex: e,
-#else
-#define __tg_f64x(e)
-#define __tg_cf64x(e)
-#endif
-
-/* The same-format standard function, real and complex. */
-#define __tg_floatn_std(fn) _Float32: fn##f, _Float64: fn, _Float32x: fn, __tg_f64x(fn##l)
-#define __tg_cfloatn_std(fn) \
-    _Float32 _Complex: fn##f, _Float64 _Complex: fn, _Float32x _Complex: fn, \
-    __tg_cf64x(fn##l)
-
+/* The C library's feature tests, as flags this header can test without
+   `__GLIBC_USE`, which only glibc defines. */
 #ifdef __GLIBC_USE
 #if __GLIBC_USE (IEC_60559_TYPES_EXT)
-#define __TG_FLOATN_FUNCTIONS 1
+#define __TG_TYPES 1
+#endif
+#if __GLIBC_USE (IEC_60559_BFP_EXT)
+#define __TG_BFP 1
+#endif
+#if __GLIBC_USE (IEC_60559_BFP_EXT_C2X)
+#define __TG_BFP_C2X 1
+#endif
+#if __GLIBC_USE (IEC_60559_FUNCS_EXT_C2X)
+#define __TG_FUNCS_C2X 1
+#endif
+#if __GLIBC_USE (ISOC2X)
+#define __TG_C2X 1
 #endif
 #endif
 
-#ifdef __TG_FLOATN_FUNCTIONS
-#define __tg_floatn(fn) \
-    _Float32: fn##f32, _Float64: fn##f64, _Float32x: fn##f32x, __tg_f64x(fn##f64x)
+/* The function of each _FloatN and _FloatNx type <math.h> declares, as a
+   list entry with its comma, or nothing. */
+#if defined __TG_TYPES && __HAVE_FLOAT16
+#define __TG_F16(F) F##f16,
 #else
-#define __tg_floatn(fn) __tg_floatn_std(fn)
+#define __TG_F16(F)
+#endif
+#if defined __TG_TYPES && __HAVE_FLOAT32
+#define __TG_F32(F) F##f32,
+#else
+#define __TG_F32(F)
+#endif
+#if defined __TG_TYPES && __HAVE_FLOAT64
+#define __TG_F64(F) F##f64,
+#else
+#define __TG_F64(F)
+#endif
+#if defined __TG_TYPES && __HAVE_FLOAT128
+#define __TG_F128(F) F##f128,
+#else
+#define __TG_F128(F)
+#endif
+#if defined __TG_TYPES && __HAVE_FLOAT32X
+#define __TG_F32X(F) F##f32x,
+#else
+#define __TG_F32X(F)
+#endif
+#if defined __TG_TYPES && __HAVE_FLOAT64X
+#define __TG_F64X(F) F##f64x,
+#else
+#define __TG_F64X(F)
+#endif
+#if defined __TG_TYPES && __HAVE_FLOAT128X
+#define __TG_F128X(F) F##f128x,
+#else
+#define __TG_F128X(F)
 #endif
 
-#define __tg_t(x) _Generic((x), \
-    _Float32: (x), _Float64: (x), _Float32x: (x), __tg_f64x((x)) \
-    _Float32 _Complex: (x), _Float64 _Complex: (x), _Float32x _Complex: (x), \
-    __tg_cf64x((x)) \
-    float: (x), \
-    long double: (x), \
-    float _Complex: (x), \
-    double _Complex: (x), \
-    long double _Complex: (x), \
-    default: 0.0)
+/* Every function of a family, the standard three first. */
+#define __TG_FNS(F) F##f, F, F##l, \
+    __TG_F16(F) __TG_F32(F) __TG_F64(F) __TG_F128(F) \
+    __TG_F32X(F) __TG_F64X(F) __TG_F128X(F)
 
-/* Real-only: float / double / long double, integers promoted to double. */
-#define __tg_real(fn, x) _Generic((x), \
-    __tg_floatn(fn) \
-    float: fn##f, \
-    long double: fn##l, \
-    default: fn)
-
-/* Real or complex, one argument. */
-#define __tg_rc(fn, cfn, x) _Generic((x), \
-    __tg_floatn(fn) \
-    __tg_cfloatn_std(cfn) \
-    float: fn##f, \
-    long double: fn##l, \
-    float _Complex: cfn##f, \
-    double _Complex: cfn, \
-    long double _Complex: cfn##l, \
-    default: fn)
-
-/* Complex-only, one argument. A real argument is treated as the complex type
-   of its own precision (C17 7.25p3), and an integer as `double`. */
-#define __tg_cplx(cfn, x) _Generic((x), \
-    __tg_floatn_std(cfn) \
-    __tg_cfloatn_std(cfn) \
-    float: cfn##f, \
-    float _Complex: cfn##f, \
-    long double: cfn##l, \
-    long double _Complex: cfn##l, \
-    default: cfn)
+#define __TG_1(F, x)       __builtin_tgmath(__TG_FNS(F) (x))
+#define __TG_2(F, x, y)    __builtin_tgmath(__TG_FNS(F) (x), (y))
+#define __TG_3(F, x, y, z) __builtin_tgmath(__TG_FNS(F) (x), (y), (z))
+/* Real or complex: both families, the complex one picked for a complex
+   argument. */
+#define __TG_1C(F, C, x)    __builtin_tgmath(__TG_FNS(F) __TG_FNS(C) (x))
+#define __TG_2C(F, C, x, y) __builtin_tgmath(__TG_FNS(F) __TG_FNS(C) (x), (y))
+/* Only the standard three: no C library has the others. */
+#define __TG_2STD(F, x, y) __builtin_tgmath(F##f, F, F##l, (x), (y))
 
 /* ------------------------------------------------------------------------
  * 7.25.2 - real or complex
  * ------------------------------------------------------------------------ */
 
-#define acos(x)  __tg_rc(acos,  cacos,  x)(x)
-#define asin(x)  __tg_rc(asin,  casin,  x)(x)
-#define atan(x)  __tg_rc(atan,  catan,  x)(x)
-#define acosh(x) __tg_rc(acosh, cacosh, x)(x)
-#define asinh(x) __tg_rc(asinh, casinh, x)(x)
-#define atanh(x) __tg_rc(atanh, catanh, x)(x)
-#define cos(x)   __tg_rc(cos,   ccos,   x)(x)
-#define sin(x)   __tg_rc(sin,   csin,   x)(x)
-#define tan(x)   __tg_rc(tan,   ctan,   x)(x)
-#define cosh(x)  __tg_rc(cosh,  ccosh,  x)(x)
-#define sinh(x)  __tg_rc(sinh,  csinh,  x)(x)
-#define tanh(x)  __tg_rc(tanh,  ctanh,  x)(x)
-#define exp(x)   __tg_rc(exp,   cexp,   x)(x)
-#define log(x)   __tg_rc(log,   clog,   x)(x)
-#define sqrt(x)  __tg_rc(sqrt,  csqrt,  x)(x)
-#define fabs(x)  __tg_rc(fabs,  cabs,   x)(x)
-
-/* pow dispatches on the combined type of both arguments. */
-#define pow(x, y) __tg_rc(pow, cpow, __tg_t(x) + __tg_t(y))((x), (y))
+#define acos(x)  __TG_1C(acos,  cacos,  x)
+#define asin(x)  __TG_1C(asin,  casin,  x)
+#define atan(x)  __TG_1C(atan,  catan,  x)
+#define acosh(x) __TG_1C(acosh, cacosh, x)
+#define asinh(x) __TG_1C(asinh, casinh, x)
+#define atanh(x) __TG_1C(atanh, catanh, x)
+#define cos(x)   __TG_1C(cos,   ccos,   x)
+#define sin(x)   __TG_1C(sin,   csin,   x)
+#define tan(x)   __TG_1C(tan,   ctan,   x)
+#define cosh(x)  __TG_1C(cosh,  ccosh,  x)
+#define sinh(x)  __TG_1C(sinh,  csinh,  x)
+#define tanh(x)  __TG_1C(tanh,  ctanh,  x)
+#define exp(x)   __TG_1C(exp,   cexp,   x)
+#define log(x)   __TG_1C(log,   clog,   x)
+#define sqrt(x)  __TG_1C(sqrt,  csqrt,  x)
+#define fabs(x)  __TG_1C(fabs,  cabs,   x)
+#define pow(x, y) __TG_2C(pow, cpow, x, y)
 
 /* ------------------------------------------------------------------------
  * 7.25.3 - real only
  * ------------------------------------------------------------------------ */
 
-#define atan2(x, y)     __tg_real(atan2,     __tg_t(x) + __tg_t(y))((x), (y))
-#define cbrt(x)         __tg_real(cbrt,      x)(x)
-#define ceil(x)         __tg_real(ceil,      x)(x)
-#define copysign(x, y)  __tg_real(copysign,  __tg_t(x) + __tg_t(y))((x), (y))
-#define erf(x)          __tg_real(erf,       x)(x)
-#define erfc(x)         __tg_real(erfc,      x)(x)
-#define exp2(x)         __tg_real(exp2,      x)(x)
-#define expm1(x)        __tg_real(expm1,     x)(x)
-#define fdim(x, y)      __tg_real(fdim,      __tg_t(x) + __tg_t(y))((x), (y))
-#define floor(x)        __tg_real(floor,     x)(x)
-#define fma(x, y, z)    __tg_real(fma,       __tg_t(x) + __tg_t(y) + __tg_t(z))((x), (y), (z))
-#define fmax(x, y)      __tg_real(fmax,      __tg_t(x) + __tg_t(y))((x), (y))
-#define fmin(x, y)      __tg_real(fmin,      __tg_t(x) + __tg_t(y))((x), (y))
-#define fmod(x, y)      __tg_real(fmod,      __tg_t(x) + __tg_t(y))((x), (y))
-#define frexp(x, p)     __tg_real(frexp,     x)((x), (p))
-#define hypot(x, y)     __tg_real(hypot,     __tg_t(x) + __tg_t(y))((x), (y))
-#define ilogb(x)        __tg_real(ilogb,     x)(x)
-#define ldexp(x, n)     __tg_real(ldexp,     x)((x), (n))
-#define lgamma(x)       __tg_real(lgamma,    x)(x)
-#define llrint(x)       __tg_real(llrint,    x)(x)
-#define llround(x)      __tg_real(llround,   x)(x)
-#define log10(x)        __tg_real(log10,     x)(x)
-#define log1p(x)        __tg_real(log1p,     x)(x)
-#define log2(x)         __tg_real(log2,      x)(x)
-#define logb(x)         __tg_real(logb,      x)(x)
-#define lrint(x)        __tg_real(lrint,     x)(x)
-#define lround(x)       __tg_real(lround,    x)(x)
-#define nearbyint(x)    __tg_real(nearbyint, x)(x)
-#define nextafter(x, y) __tg_real(nextafter, __tg_t(x) + __tg_t(y))((x), (y))
-#define remainder(x, y) __tg_real(remainder, __tg_t(x) + __tg_t(y))((x), (y))
-#define remquo(x, y, q) __tg_real(remquo,    __tg_t(x) + __tg_t(y))((x), (y), (q))
-#define rint(x)         __tg_real(rint,      x)(x)
-#define round(x)        __tg_real(round,     x)(x)
-#define scalbln(x, n)   __tg_real(scalbln,   x)((x), (n))
-#define scalbn(x, n)    __tg_real(scalbn,    x)((x), (n))
-#define tgamma(x)       __tg_real(tgamma,    x)(x)
-#define trunc(x)        __tg_real(trunc,     x)(x)
+#define atan2(x, y)     __TG_2(atan2,     x, y)
+#define cbrt(x)         __TG_1(cbrt,      x)
+#define ceil(x)         __TG_1(ceil,      x)
+#define copysign(x, y)  __TG_2(copysign,  x, y)
+#define erf(x)          __TG_1(erf,       x)
+#define erfc(x)         __TG_1(erfc,      x)
+#define exp2(x)         __TG_1(exp2,      x)
+#define expm1(x)        __TG_1(expm1,     x)
+#define fdim(x, y)      __TG_2(fdim,      x, y)
+#define floor(x)        __TG_1(floor,     x)
+#define fma(x, y, z)    __TG_3(fma,       x, y, z)
+#define fmod(x, y)      __TG_2(fmod,      x, y)
+#define frexp(x, p)     __TG_2(frexp,     x, p)
+#define hypot(x, y)     __TG_2(hypot,     x, y)
+#define ilogb(x)        __TG_1(ilogb,     x)
+#define ldexp(x, n)     __TG_2(ldexp,     x, n)
+#define lgamma(x)       __TG_1(lgamma,    x)
+#define llrint(x)       __TG_1(llrint,    x)
+#define llround(x)      __TG_1(llround,   x)
+#define log1p(x)        __TG_1(log1p,     x)
+#define log2(x)         __TG_1(log2,      x)
+#define logb(x)         __TG_1(logb,      x)
+#define lrint(x)        __TG_1(lrint,     x)
+#define lround(x)       __TG_1(lround,    x)
+#define nearbyint(x)    __TG_1(nearbyint, x)
+#define nextafter(x, y) __TG_2(nextafter, x, y)
+#define remainder(x, y) __TG_2(remainder, x, y)
+#define remquo(x, y, q) __TG_3(remquo,    x, y, q)
+#define rint(x)         __TG_1(rint,      x)
+#define round(x)        __TG_1(round,     x)
+#define scalbln(x, n)   __TG_2(scalbln,   x, n)
+#define scalbn(x, n)    __TG_2(scalbn,    x, n)
+#define tgamma(x)       __TG_1(tgamma,    x)
+#define trunc(x)        __TG_1(trunc,     x)
+/* The second argument is `long double` for each function. */
+#define nexttoward(x, y) __TG_2STD(nexttoward, x, y)
 
-/* nexttoward's second argument is always long double, so only the first
-   participates in the dispatch. No C library has a `_FloatN` nexttoward,
-   so those reach the standard function of their format. */
-#define nexttoward(x, y) _Generic((x), \
-    __tg_floatn_std(nexttoward) \
-    float: nexttowardf, \
-    long double: nexttowardl, \
-    default: nexttoward)((x), (y))
+/* glibc's complex base-10 logarithm, under _GNU_SOURCE. */
+#ifdef __USE_GNU
+#define log10(x) __TG_1C(log10, clog10, x)
+#else
+#define log10(x) __TG_1(log10, x)
+#endif
+
+#if defined __TG_C2X && !defined __USE_GNU
+#define fmax(x, y) __TG_2STD(fmax, x, y)
+#define fmin(x, y) __TG_2STD(fmin, x, y)
+#else
+#define fmax(x, y) __TG_2(fmax, x, y)
+#define fmin(x, y) __TG_2(fmin, x, y)
+#endif
 
 /* ------------------------------------------------------------------------
  * 7.25.4 - complex only
  * ------------------------------------------------------------------------ */
 
-#define carg(x)  __tg_cplx(carg,  x)(x)
-#define cimag(x) __tg_cplx(cimag, x)(x)
-#define conj(x)  __tg_cplx(conj,  x)(x)
-#define cproj(x) __tg_cplx(cproj, x)(x)
-#define creal(x) __tg_cplx(creal, x)(x)
+#define carg(x)  __TG_1(carg,  x)
+#define cimag(x) __TG_1(cimag, x)
+#define conj(x)  __TG_1(conj,  x)
+#define cproj(x) __TG_1(cproj, x)
+#define creal(x) __TG_1(creal, x)
+
+/* ------------------------------------------------------------------------
+ * The C library's extensions: glibc's, under its feature tests
+ * ------------------------------------------------------------------------ */
+
+#ifdef __USE_MISC
+#define scalb(x, y) __TG_2STD(scalb, x, y)
+#endif
+
+#ifdef __TG_FUNCS_C2X
+#define exp10(x) __TG_1(exp10, x)
+#endif
+
+#ifdef __TG_BFP_C2X
+#define nextdown(x)        __TG_1(nextdown,  x)
+#define nextup(x)          __TG_1(nextup,    x)
+#define roundeven(x)       __TG_1(roundeven, x)
+#define llogb(x)           __TG_1(llogb,     x)
+#define fromfp(x, r, w)    __TG_3(fromfp,    x, r, w)
+#define ufromfp(x, r, w)   __TG_3(ufromfp,   x, r, w)
+#define fromfpx(x, r, w)   __TG_3(fromfpx,   x, r, w)
+#define ufromfpx(x, r, w)  __TG_3(ufromfpx,  x, r, w)
+#endif
+
+#ifdef __TG_BFP
+#define fmaxmag(x, y) __TG_2(fmaxmag, x, y)
+#define fminmag(x, y) __TG_2(fminmag, x, y)
+#endif
+
+#ifdef __TG_C2X
+#define fmaximum(x, y)         __TG_2(fmaximum,         x, y)
+#define fminimum(x, y)         __TG_2(fminimum,         x, y)
+#define fmaximum_num(x, y)     __TG_2(fmaximum_num,     x, y)
+#define fminimum_num(x, y)     __TG_2(fminimum_num,     x, y)
+#define fmaximum_mag(x, y)     __TG_2(fmaximum_mag,     x, y)
+#define fminimum_mag(x, y)     __TG_2(fminimum_mag,     x, y)
+#define fmaximum_mag_num(x, y) __TG_2(fmaximum_mag_num, x, y)
+#define fminimum_mag_num(x, y) __TG_2(fminimum_mag_num, x, y)
+#endif
+
+/* ------------------------------------------------------------------------
+ * The macros that round their result to a narrower type (TS 18661-1 and
+ * -3, C2x 7.12.14). A macro whose functions all return one type picks by
+ * the narrowing rule of `__builtin_tgmath`: the function for the type the
+ * arguments determine, else the first listed whose parameter type holds
+ * every value of that type. The `d` and `f64x` macros have one function,
+ * called directly.
+ * ------------------------------------------------------------------------ */
+
+#define __TG_NARROW_F(F)   F, F##l,
+#define __TG_NARROW_F16(F) __TG_F32(F) __TG_F64(F) __TG_F128(F) \
+    __TG_F32X(F) __TG_F64X(F) __TG_F128X(F)
+#define __TG_NARROW_F32(F) __TG_F64(F) __TG_F128(F) \
+    __TG_F32X(F) __TG_F64X(F) __TG_F128X(F)
+#define __TG_NARROW_F64(F) __TG_F128(F) __TG_F64X(F) __TG_F128X(F)
+#define __TG_NARROW_F32X(F) __TG_F64X(F) __TG_F128X(F) __TG_F64(F) __TG_F128(F)
+
+#ifdef __TG_BFP_C2X
+#define fadd(x, y)    __builtin_tgmath(__TG_NARROW_F(fadd) (x), (y))
+#define fsub(x, y)    __builtin_tgmath(__TG_NARROW_F(fsub) (x), (y))
+#define fmul(x, y)    __builtin_tgmath(__TG_NARROW_F(fmul) (x), (y))
+#define fdiv(x, y)    __builtin_tgmath(__TG_NARROW_F(fdiv) (x), (y))
+#define fsqrt(x)      __builtin_tgmath(__TG_NARROW_F(fsqrt) (x))
+#define ffma(x, y, z) __builtin_tgmath(__TG_NARROW_F(ffma) (x), (y), (z))
+#define dadd(x, y)    (daddl(x, y))
+#define dsub(x, y)    (dsubl(x, y))
+#define dmul(x, y)    (dmull(x, y))
+#define ddiv(x, y)    (ddivl(x, y))
+#define dsqrt(x)      (dsqrtl(x))
+#define dfma(x, y, z) (dfmal(x, y, z))
+#endif
+
+#ifdef __TG_TYPES
+
+#if __HAVE_FLOAT16
+#define f16add(x, y)    __builtin_tgmath(__TG_NARROW_F16(f16add) (x), (y))
+#define f16sub(x, y)    __builtin_tgmath(__TG_NARROW_F16(f16sub) (x), (y))
+#define f16mul(x, y)    __builtin_tgmath(__TG_NARROW_F16(f16mul) (x), (y))
+#define f16div(x, y)    __builtin_tgmath(__TG_NARROW_F16(f16div) (x), (y))
+#define f16sqrt(x)      __builtin_tgmath(__TG_NARROW_F16(f16sqrt) (x))
+#define f16fma(x, y, z) __builtin_tgmath(__TG_NARROW_F16(f16fma) (x), (y), (z))
+#endif
+
+#if __HAVE_FLOAT32
+#define f32add(x, y)    __builtin_tgmath(__TG_NARROW_F32(f32add) (x), (y))
+#define f32sub(x, y)    __builtin_tgmath(__TG_NARROW_F32(f32sub) (x), (y))
+#define f32mul(x, y)    __builtin_tgmath(__TG_NARROW_F32(f32mul) (x), (y))
+#define f32div(x, y)    __builtin_tgmath(__TG_NARROW_F32(f32div) (x), (y))
+#define f32sqrt(x)      __builtin_tgmath(__TG_NARROW_F32(f32sqrt) (x))
+#define f32fma(x, y, z) __builtin_tgmath(__TG_NARROW_F32(f32fma) (x), (y), (z))
+#endif
+
+#if __HAVE_FLOAT64 && (__HAVE_FLOAT64X || __HAVE_FLOAT128)
+#define f64add(x, y)    __builtin_tgmath(__TG_NARROW_F64(f64add) (x), (y))
+#define f64sub(x, y)    __builtin_tgmath(__TG_NARROW_F64(f64sub) (x), (y))
+#define f64mul(x, y)    __builtin_tgmath(__TG_NARROW_F64(f64mul) (x), (y))
+#define f64div(x, y)    __builtin_tgmath(__TG_NARROW_F64(f64div) (x), (y))
+#define f64sqrt(x)      __builtin_tgmath(__TG_NARROW_F64(f64sqrt) (x))
+#define f64fma(x, y, z) __builtin_tgmath(__TG_NARROW_F64(f64fma) (x), (y), (z))
+#endif
+
+#if __HAVE_FLOAT32X
+#if __HAVE_FLOAT128
+#define f32xadd(x, y)    __builtin_tgmath(__TG_NARROW_F32X(f32xadd) (x), (y))
+#define f32xsub(x, y)    __builtin_tgmath(__TG_NARROW_F32X(f32xsub) (x), (y))
+#define f32xmul(x, y)    __builtin_tgmath(__TG_NARROW_F32X(f32xmul) (x), (y))
+#define f32xdiv(x, y)    __builtin_tgmath(__TG_NARROW_F32X(f32xdiv) (x), (y))
+#define f32xsqrt(x)      __builtin_tgmath(__TG_NARROW_F32X(f32xsqrt) (x))
+#define f32xfma(x, y, z) __builtin_tgmath(__TG_NARROW_F32X(f32xfma) (x), (y), (z))
+#else
+#define f32xadd(x, y)    (f32xaddf64(x, y))
+#define f32xsub(x, y)    (f32xsubf64(x, y))
+#define f32xmul(x, y)    (f32xmulf64(x, y))
+#define f32xdiv(x, y)    (f32xdivf64(x, y))
+#define f32xsqrt(x)      (f32xsqrtf64(x))
+#define f32xfma(x, y, z) (f32xfmaf64(x, y, z))
+#endif
+#endif
+
+#if __HAVE_FLOAT64X && (__HAVE_FLOAT128X || __HAVE_FLOAT128)
+#define f64xadd(x, y)    (f64xaddf128(x, y))
+#define f64xsub(x, y)    (f64xsubf128(x, y))
+#define f64xmul(x, y)    (f64xmulf128(x, y))
+#define f64xdiv(x, y)    (f64xdivf128(x, y))
+#define f64xsqrt(x)      (f64xsqrtf128(x))
+#define f64xfma(x, y, z) (f64xfmaf128(x, y, z))
+#endif
+
+#endif /* __TG_TYPES */
 
 #endif /* _TGMATH_H */

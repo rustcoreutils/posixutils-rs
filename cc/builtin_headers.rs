@@ -55,12 +55,14 @@ pub const CPUID_H: &str = include_str!("include/cpuid.h");
 
 /// Builtin tgmath.h - C11 7.25 type-generic math macros.
 ///
-/// Registered rather than left to the host, unlike xmmintrin.h below, because
-/// this body is genuinely better here: every glibc <tgmath.h> needs compiler
-/// internals c17 lacks (__builtin_tgmath, or __builtin_classify_type plus
-/// __real__) and #errors out before reaching any of them unless
-/// __HAVE_FLOAT128 agrees with __HAVE_FLOAT64X. A user's own tgmath.h still
-/// wins: builtin headers are searched after the includer's directory and -I.
+/// Registered rather than left to the host, unlike xmmintrin.h below: glibc's
+/// <tgmath.h> picks its implementation by the gcc version claimed, and below
+/// gcc 13 needs __builtin_classify_type tricks c17 does not have. The bundled
+/// one is glibc's gcc 13 path written afresh -- every macro a
+/// `__builtin_tgmath` call over the functions glibc declares under the same
+/// feature tests -- and works on other C libraries too. A user's own
+/// tgmath.h still wins: builtin headers are searched after the includer's
+/// directory and -I.
 pub const TGMATH_H: &str = include_str!("include/tgmath.h");
 
 /// The x86-64 intrinsic headers, SSE through SSE4.2, SHA-NI and RTM

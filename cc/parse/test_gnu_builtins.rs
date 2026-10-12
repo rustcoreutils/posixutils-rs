@@ -131,11 +131,42 @@ fn test_float_n_math_builtins_parse() {
 /// nothing else: an integer argument picks the `double` one.
 #[test]
 fn test_tgmath_is_the_picked_call() {
+    let decls = "float f(float); double g(double);\n";
+    assert_eq!(tgmath_pick(decls, "double", "f, g, 1"), "g");
+}
+
+/// gcc 13's rules beyond the exact match: an integer is `_Float32x` beside
+/// a `_FloatNx` argument, and where every function returns one real
+/// floating type (a narrowing macro), a type no function takes reaches the
+/// first function listed whose parameter type holds its values.
+#[test]
+fn test_tgmath_narrowing_and_integer_rules() {
+    let narrow = "float fd(double, double); float fl(long double, long double);\n";
+    assert_eq!(tgmath_pick(narrow, "float", "fd, fl, 1.0f, 1.0f"), "fd");
+    assert_eq!(
+        tgmath_pick(narrow, "float", "fd, fl, 1, (_Float32x)1"),
+        "fd"
+    );
+    assert_eq!(
+        tgmath_pick(narrow, "float", "fd, fl, 1.0f, (_Float64x)1"),
+        "fl"
+    );
+    let f32x = "_Float32x a(_Float64x); _Float32x b(_Float64); _Float32x c(_Float128);\n";
+    assert_eq!(tgmath_pick(f32x, "_Float32x", "a, b, c, 1.0"), "a");
+    assert_eq!(tgmath_pick(f32x, "_Float32x", "a, b, c, 1.0f64"), "b");
+    assert_eq!(tgmath_pick(f32x, "_Float32x", "a, b, c, 1.0f128"), "c");
+    let plain = "double d(double, double); _Float32x x(_Float32x, _Float32x);\n";
+    assert_eq!(tgmath_pick(plain, "double", "d, x, 1, 1.0"), "d");
+    assert_eq!(tgmath_pick(plain, "double", "d, x, 1, (_Float32x)1"), "x");
+}
+
+/// The name of the function `__builtin_tgmath(args)` calls, after `decls`,
+/// in a function returning `ret`.
+fn tgmath_pick(decls: &str, ret: &str, args: &str) -> String {
     use super::ast::{BlockItem, ExternalDecl, Stmt};
     use super::test_parser::parse_tu_for;
-    let src = "float f(float); double g(double);\n\
-               double h(void) { return __builtin_tgmath(f, g, 1); }\n";
-    let (tu, _, strings, symbols) = parse_tu_for(src, &x86_linux()).unwrap();
+    let src = format!("{decls}{ret} h(void) {{ return __builtin_tgmath({args}); }}\n");
+    let (tu, _, strings, symbols) = parse_tu_for(&src, &x86_linux()).unwrap();
     let body = tu
         .items
         .iter()
@@ -153,14 +184,13 @@ fn test_tgmath_is_the_picked_call() {
     let Stmt::Return(Some(e)) = &**stmt else {
         panic!("{stmt:?}")
     };
-    let ExprKind::Call { func, args, .. } = &e.kind else {
+    let ExprKind::Call { func, .. } = &e.kind else {
         panic!("{:?}", e.kind)
     };
     let ExprKind::Ident(sym) = func.kind else {
         panic!("{:?}", func.kind)
     };
-    assert_eq!(strings.get(symbols.get(sym).name), "g");
-    assert_eq!(args.len(), 1);
+    strings.get(symbols.get(sym).name).to_string()
 }
 
 /// The `__builtin_ia32_*` names are x86-64's alone; the thread pointer is

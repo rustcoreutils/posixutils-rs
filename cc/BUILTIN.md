@@ -550,7 +550,7 @@ implicit declaration of one of these names takes the row's return type.
 | `__builtin_ia32_cvtpd2ps(v2df)` | x86-64 only: both lanes rounded to `float` in the current direction, the upper two 0; `_mm_cvtpd_ps` is this |
 | `__builtin_thread_pointer()` | `%fs:0` on x86-64 (`%gs:0` on Darwin), `tpidr_el0` on aarch64 |
 | `__builtin_aarch64_get_fpcr()`, `__builtin_aarch64_set_fpcr(unsigned)`, `__builtin_aarch64_get_fpsr()`, `__builtin_aarch64_set_fpsr(unsigned)`, and the `64` forms of each on `unsigned long long` | aarch64 only, as in gcc: `mrs`/`msr` of an X register as an asm statement's operand, which glibc's `<fpu_control.h>` (`_FPU_GETCW`, `_FPU_SETCW`, `_FPU_GETFPSR`, `_FPU_SETFPSR`) expands to. Each stays where the program has it among the floating-point operations: c17 moves no instruction past an asm statement, and deletes or merges none |
-| `__builtin_tgmath(functions..., arguments...)` | The call of the function C2x's type-generic rules pick (`parse/tgmath_builtin.rs`), with gcc 13's diagnostics; each argument is evaluated once |
+| `__builtin_tgmath(functions..., arguments...)` | The call of the function C2x's type-generic rules pick (`parse/tgmath_builtin.rs`), with gcc 13's diagnostics; each argument is evaluated once. An integer counts as `_Float32x` beside a `_FloatNx` argument, `double` otherwise; where every function returns one real floating type (`fadd`, `f32xsqrt`), a type no function takes reaches the first listed whose parameter type holds its values |
 
 ### Calls the optimizer folds
 

@@ -17,7 +17,7 @@ use super::builtin_args::BuiltinArgs;
 use super::parser::{ParseResult, Parser};
 use crate::diag;
 use crate::token::lexer::Position;
-use crate::types::TypeId;
+use crate::types::{FloatClass, TypeId, TypeKind};
 
 impl Parser<'_> {
     /// `__builtin_tgmath( ... )`, its name already consumed.
@@ -99,8 +99,6 @@ impl Parser<'_> {
         }
 
         let call_args = &args[count..];
-        let mut real: Option<TypeId> = None;
-        let mut complex = false;
         for &k in &generic {
             let arg = &call_args[k];
             let typ = arg.typ.unwrap_or(int);
@@ -113,11 +111,33 @@ impl Parser<'_> {
                 );
                 return refused(self);
             }
-            complex |= self.types.is_complex(typ);
-            let this = if self.types.is_float(self.types.complex_base(typ)) {
+        }
+        let bases: Vec<TypeId> = generic
+            .iter()
+            .map(|&k| {
+                let typ = call_args[k].typ.unwrap_or(int);
                 self.types.complex_base(typ)
+            })
+            .collect();
+        let complex = generic
+            .iter()
+            .any(|&k| self.types.is_complex(call_args[k].typ.unwrap_or(int)));
+        // C2x 7.27p3: an integer counts as `double`, but as `_Float32x`
+        // where another argument is of a `_FloatNx` type, real or complex.
+        let extended = bases.iter().any(|&b| {
+            self.types.is_float(b) && self.types.get(b).float_class == FloatClass::Extended
+        });
+        let integer_as = if extended {
+            self.types.floating(TypeKind::Double, FloatClass::Extended)
+        } else {
+            self.types.double_id
+        };
+        let mut real: Option<TypeId> = None;
+        for &base in &bases {
+            let this = if self.types.is_float(base) {
+                base
             } else {
-                self.types.double_id
+                integer_as
             };
             real = Some(match real {
                 Some(r) => self.usual_arithmetic_conversions(r, this),
@@ -133,6 +153,8 @@ impl Parser<'_> {
         let complex_of = self.types.make_complex(real);
         let pick = if complex {
             wanted(self, complex_of)
+        } else if self.tgmath_narrowing(&args[..count]) {
+            wanted(self, real).or_else(|| self.tgmath_first_holding(&generic_type, real))
         } else {
             let any_real = generic_type.iter().any(|&g| !self.types.is_complex(g));
             if any_real {
@@ -149,6 +171,39 @@ impl Parser<'_> {
         let call_args = args.split_off(count);
         let callee = args.swap_remove(pick);
         Ok(self.checked_call(callee, call_args, call_pos, pos))
+    }
+
+    /// Whether the functions round their result to a narrower type (C2x
+    /// 7.12.14, `fadd`, `f32xsqrt`): every one returns the same real
+    /// floating type, so the result type is no generic parameter. Such a
+    /// call may reach a function whose parameter type is not the arguments'
+    /// type but holds all its values.
+    fn tgmath_narrowing(&self, functions: &[Expr]) -> bool {
+        let returns: Vec<TypeId> = functions
+            .iter()
+            .filter_map(|f| self.resolved_function_type(f))
+            .map(|func| self.types.base_type(func).unwrap_or(func))
+            .collect();
+        let Some(&first) = returns.first() else {
+            return false;
+        };
+        self.types.is_float(first)
+            && !self.types.is_complex(first)
+            && returns
+                .iter()
+                .all(|&r| self.types.types_compatible(r, first))
+    }
+
+    /// For a narrowing call whose arguments' type `real` no function takes:
+    /// the first function, in the order given, whose generic parameter type
+    /// holds every value of `real` -- gcc's pick, so that `f32xsqrt` of a
+    /// `double` is `f32xsqrtf64x`, the first listed, not `f32xsqrtf64`.
+    fn tgmath_first_holding(&self, generic_type: &[TypeId], real: TypeId) -> Option<usize> {
+        let want = self.types.fp_format(real)?;
+        generic_type.iter().position(|&g| {
+            !self.types.is_complex(g)
+                && self.types.fp_format(g).is_some_and(|have| have.holds(want))
+        })
     }
 
     /// The parameter types of function argument `n` (1-based) of a

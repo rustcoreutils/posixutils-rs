@@ -1451,7 +1451,7 @@ impl<'a> Preprocessor<'a> {
         //         fails -- hence a minor of at least 1
         //
         // 13 adds nothing reachable in C17 mode but glibc's C2x <tgmath.h>
-        // path, which needs gcc's `__builtin_tgmath` narrowing rules.
+        // path, which the bundled <tgmath.h> (gcc 13's semantics) shadows.
         let [major, minor, patchlevel] = GNUC_VERSION;
         self.define_macro(Macro::predefined("__GNUC__", Some(major)));
         self.define_macro(Macro::predefined("__GNUC_MINOR__", Some(minor)));

@@ -837,7 +837,8 @@ fn gcc_flags_dumpversion_agrees_with_the_gnuc_macros() {
 /// minor is at least 1 because gnulib's `careadlinkat.c` emits two
 /// `#warning`s when optimizing for any gcc from 10.1 to 12.0 -- a `-Werror`
 /// build fails -- and takes a pragma from 12.1 on. 13 adds nothing c17 can
-/// reach in C17 mode but glibc's C2x `<tgmath.h>` path.
+/// reach in C17 mode but glibc's C2x `<tgmath.h>` path, which the bundled
+/// `<tgmath.h>` shadows.
 #[test]
 fn gcc_flags_claims_gcc_12_4() {
     let r = run_c17(&["-dumpfullversion"]);

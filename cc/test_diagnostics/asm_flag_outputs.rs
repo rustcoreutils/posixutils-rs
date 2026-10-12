@@ -114,7 +114,7 @@ fn asm_flag_outputs_gcc_refuses() {
         &statement(r##""# %0" : "=@ccz"(r)"##),
         X86,
         "-O0",
-        "invalid use of asm flag output",
+        "invalid 'asm': invalid use of asm flag output",
         3,
     );
 }

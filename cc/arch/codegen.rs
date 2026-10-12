@@ -1741,7 +1741,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
         if dialects {
             match c {
                 '{' if in_alternatives => {
-                    return Err("nested assembly dialect alternatives".to_string())
+                    return Err(invalid_asm("nested assembly dialect alternatives"))
                 }
                 '{' => {
                     in_alternatives = true;
@@ -1779,12 +1779,9 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
         }
         let modifier = chars.next_if(|m| m.is_ascii_alphabetic());
         let Some(operand) = read_operand_ref(&mut chars)? else {
-            return Err(match (modifier, chars.peek()) {
-                (Some(m), _) => {
-                    format!("operand number missing after '%{m}' in asm template")
-                }
-                (None, Some(p)) => format!("invalid '%{p}' in asm template"),
-                (None, None) => "'%' at the end of an asm template".to_string(),
+            return Err(match modifier {
+                Some(_) => invalid_asm("operand number missing after %-letter"),
+                None => invalid_asm("invalid %-code"),
             });
         };
         if modifier == Some('l') {
@@ -1799,7 +1796,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                 let (text, _) = n
                     .checked_sub(slots.len())
                     .and_then(|i| goto_labels.get(i))
-                    .ok_or_else(|| format!("asm operand number {n} out of range"))?;
+                    .ok_or_else(|| invalid_asm("operand number out of range"))?;
                 label_slot = AsmOperandSlot {
                     value: AsmOperandValue::Symbol(text.clone()),
                     size: Bits::new(64),
@@ -1815,7 +1812,9 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
         };
         let text = match (modifier, &slot.value) {
             // gcc's words; the formatter is never asked.
-            (_, AsmOperandValue::Flag) => return Err("invalid use of asm flag output".to_string()),
+            (_, AsmOperandValue::Flag) => {
+                return Err(invalid_asm("invalid use of asm flag output"))
+            }
             (Some('c'), AsmOperandValue::Int(v)) => Ok(v.to_string()),
             (Some('c'), AsmOperandValue::Symbol(sym)) => Ok(sym.clone()),
             (Some('n'), AsmOperandValue::Int(v)) => Ok((-(*v as i128)).to_string()),
@@ -1846,9 +1845,8 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
         }
     }
 
-    if in_alternatives {
-        return Err("unterminated assembly dialect alternative".to_string());
-    }
+    // A `{` that no `|` or `}` follows runs to the end, as in gcc, which
+    // says nothing.
     Ok(result)
 }
 
@@ -1865,7 +1863,13 @@ fn skip_other_alternatives(chars: &mut std::iter::Peekable<std::str::Chars>) -> 
             _ => {}
         }
     }
-    Err("unterminated assembly dialect alternative".to_string())
+    Err(invalid_asm("unterminated assembly dialect alternative"))
+}
+
+/// gcc's report of a template it cannot write out: "invalid 'asm': " and
+/// what is wrong.
+fn invalid_asm(what: &str) -> String {
+    format!("invalid 'asm': {what}")
 }
 
 /// The `asm goto` label `%l` names. gcc numbers labels after every operand,
@@ -1883,12 +1887,13 @@ fn goto_label<R>(
     match (label, operand) {
         (Some((text, _)), _) => Ok(text.clone()),
         (None, OperandRef::Name(name)) if slots.iter().any(|s| s.name.as_ref() == Some(name)) => {
-            Err("'%l' operand isn't a label".to_string())
+            Err(invalid_asm("'%l' operand isn't a label"))
         }
         (None, OperandRef::Name(name)) => Err(undefined_operand_name(name)),
-        (None, OperandRef::Number(n)) => {
-            Err(format!("asm operand {n} named by '%l' is not a label"))
+        (None, OperandRef::Number(n)) if *n < slots.len() => {
+            Err(invalid_asm("'%l' operand isn't a label"))
         }
+        (None, OperandRef::Number(_)) => Err(invalid_asm("operand number out of range")),
     }
 }
 
@@ -2382,7 +2387,9 @@ mod tests {
 
     /// x86's dialect alternatives: the first, AT&T, is written; `%{`, `%|`
     /// and `%}` are the characters, also inside an alternative skipped; a
-    /// `|` outside braces is itself. Without dialects every brace is text.
+    /// `|` outside braces is itself; a `{` that nothing closes runs to the
+    /// end, which only a `|` makes an error, as in gcc. Without dialects
+    /// every brace is text.
     #[test]
     fn substitution_dialect_alternatives() {
         let x86 = |t: &str| substitute_for(Stub(true), t);
@@ -2393,28 +2400,34 @@ mod tests {
         assert_eq!(x86("{%{%|x|%}y}%{%}"), Ok("{|x{}".to_string()));
         assert_eq!(x86("{a|b}{|c}{d}"), Ok("ad".to_string()));
         assert!(x86("{a{b}}").unwrap_err().contains("nested"));
-        assert!(x86("{a").unwrap_err().contains("unterminated"));
+        assert_eq!(x86("x{a"), Ok("xa".to_string()));
         assert!(x86("{a|b").unwrap_err().contains("unterminated"));
         assert_eq!(substitute("{v0.4s}|{x}"), Ok("{v0.4s}|{x}".to_string()));
-        assert!(substitute("%{").unwrap_err().contains("invalid '%{'"));
+        assert!(substitute("%{").unwrap_err().contains("invalid %-code"));
     }
 
-    /// Anything else after a `%` is an error naming what it is.
+    /// Anything else after a `%` is an error: in gcc's words, "invalid
+    /// 'asm': ...", where gcc has one, and naming the modifier where c17
+    /// does not write it.
     #[test]
     fn substitution_errors() {
         let err = |t: &str| substitute(t).unwrap_err();
         assert!(err("%z0").contains("unsupported operand modifier '%z'"));
         assert!(err("%k3").contains("'%k' does not apply to a memory reference"));
         assert!(err("%c0").contains("'%c' does not apply to a general register"));
-        assert!(err("%e").contains("operand number missing after '%e'"));
-        assert!(err("%9").contains("operand number 9 out of range"));
+        assert_eq!(
+            err("%e"),
+            "invalid 'asm': operand number missing after %-letter"
+        );
+        assert_eq!(err("%9"), "invalid 'asm': operand number out of range");
         assert!(err("%k4").contains("'%k' does not apply to a symbolic constant"));
         assert!(err("%[nope]").contains("undefined named operand 'nope'"));
         assert!(err("%[nope").contains("missing close brace for named operand"));
-        assert!(err("%!").contains("invalid '%!'"));
-        assert!(err("x %").contains("at the end"));
-        assert!(err("%l1").contains("asm operand 1 named by '%l' is not a label"));
+        assert_eq!(err("%!"), "invalid 'asm': invalid %-code");
+        assert_eq!(err("x %"), "invalid 'asm': invalid %-code");
+        assert_eq!(err("%l1"), "invalid 'asm': '%l' operand isn't a label");
+        assert_eq!(err("%l9"), "invalid 'asm': operand number out of range");
         assert!(err("%l[gone]").contains("undefined named operand 'gone'"));
-        assert!(err("%l[out]").contains("'%l' operand isn't a label"));
+        assert_eq!(err("%l[out]"), "invalid 'asm': '%l' operand isn't a label");
     }
 }

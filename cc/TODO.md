@@ -9,38 +9,10 @@ keeping one here reads as a backlog item nobody is picking up.
 ## Table of Contents
 
 - [Technical Debt](#technical-debt)
-- [Future Features](#future-features)
 - [Optimization Passes](#optimization-passes)
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
 
 ## Technical Debt
-
-### Stack frames are larger than gcc's
-
-CPython hardcodes `C_RECURSION_LIMIT 10000` (`Include/cpython/pystate.h`),
-tuned to gcc's frame sizes. At `-O2` on the default 8 MB stack, `test_call`,
-`test_compile` and `test_isinstance` recurse toward that limit and run out of
-stack before the counter trips, so the acceptance gate has to run under
-`ulimit -s 65536`. Done is the CPython `-O2` suite passing on the default
-8 MB stack.
-
-Locals are not what inflates a frame: locals whose lifetimes never meet share
-a slot (`arch::regalloc::local_lifetimes`, `place_locals`), and no prologue
-zeroes its frame. Spilling is: c17 keeps in the frame what gcc keeps in
-registers, and the interpreter loop, `_PyEval_EvalFrameDefault`, is both the
-largest frame and the function that recurses. Two contributors, in both
-allocators:
-
-- A floating-point value live across a call or a block boundary always goes to
-  a stack slot (`run_chordal_color`): the chordal pass never gives such a value
-  a register, not even a callee-saved one where the ABI has them (aarch64
-  `d8`-`d15`).
-- There is no live-range splitting, so a value spilled anywhere is spilled
-  everywhere, which is what a large function's register pressure turns into.
-
-A slot stays at least eight bytes, and that is not part of this gap: the back
-ends move register-passed values and aggregate tails a whole eightbyte at a
-time (see `arch::regalloc::local_slot`).
 
 ### R10 and R11 are never allocated
 
@@ -56,66 +28,6 @@ from one instruction to the next.
 Done is R10 and R11 in `Reg::allocatable()`, with each of those emitters
 either confined to one instruction's lowering or declaring its scratch as a
 constraint.
-
----
-
-## Future Features
-
-### Object size and value width are the same `u32`
-
-`TypeTable::size_bits` answers a *value* width -- what an instruction operand
-holds, bounded at 128 bits -- and `size_bytes` answers an *object* size, which
-is not bounded. Both are plain integers, so nothing stops one being used where
-the other is meant, and the unit is a naming convention rather than a type.
-`size_bits` saturates for an object past `u32::MAX` bits, so any byte count
-derived from it is wrong for a large object while `sizeof` stays right.
-
-A `grep` for `size_bits(..) / 8` is not a check: the bit count reaches a
-division through a local variable, a `u32` field (`ArgClass::Indirect`'s
-payload, `Instruction::size`) or an equality comparison, none of which the
-grep follows. The conversions that remain are safe for three different
-reasons nothing enforces: a `complex_base` is a scalar, a bit-field width is
-bounded by its storage unit, and a threshold comparison against 64 or 128
-answers correctly even when saturated.
-
-Done is the distinction as a *type*: a `Bits` newtype for value widths that
-implements no division, and a `ByteSize` for object sizes, so every conversion
-is a compile error. Widening `size_bits` to `u64` is not this fix -- most of
-its callers want a `u32` because they are value widths, and casting them back
-reintroduces the truncation at the aggregate-fed sites.
-
----
-
-### 64-bit stack frames
-
-An automatic object past `TypeTable::MAX_STACK_OBJECT_BYTES` (just under
-2 GiB) is refused with a diagnostic, and so is a frame whose total passes it,
-because a frame displacement is an `i32`. gcc compiles both: x86-64 reaches the
-frame through `movabsq`-materialised displacements, and aarch64 through
-`movz`/`movk` into a scratch register. The diagnostic exists so that c17 never
-emits a wrapped frame.
-
-The torture tests that need it (`compile/20031023-1..4`,
-`compile/stack-check-1`) fail with that diagnostic.
-
-What it takes:
-
-- Widen every frame quantity to `i64`: `MemAddr` displacements on both targets,
-  `Loc::Stack`/`Loc::IncomingArg`, `RegAlloc::stack_offset`, the shared
-  `ActiveSlot`/`FreeSlot`, `callee_saved_offset`, `stack_alloc_size`,
-  `reg_save_area_offset`, the outgoing-argument layout, `IncomingOff`, and the
-  CFI directive offsets. `crate::abi::slot_bytes` (the only place an object
-  size becomes a slot size) and `arch::regalloc::grow_frame` (the only place a
-  frame total grows) then bound at `max_object_bytes` instead, less the
-  prologue headroom (`FRAME_HEADROOM_BYTES`) and the frame's final alignment
-  rounding, which `grow_frame` reserves for the same reason.
-- A displacement outside the target's encodable range goes through a scratch
-  register: `movabsq` plus an indexed or `addq` form on x86-64. On aarch64
-  `legalize.rs` already expands any offset through X15; only the width of the
-  offsets it is given changes.
-- The prologue's `subq $N, %rsp` becomes `movabsq $N, %r11; subq %r11, %rsp`.
-- Stack probing: a frame larger than the guard gap touches each page on the
-  way down, as gcc and clang do. No target probes.
 
 ---
 

@@ -38,6 +38,8 @@ use super::memloc::{AddrMap, MemBase, MemLoc};
 use super::{Function, GlobalDef, Initializer, Module, Opcode, PseudoId};
 use crate::token::lexer::payload_bytes;
 use crate::types::{TypeKind, TypeTable};
+use crate::units::Bits;
+use crate::units::ByteSize;
 use std::collections::{HashMap, HashSet};
 
 /// How many definitions `string_len` follows before it gives up.
@@ -105,10 +107,10 @@ fn const_char_array(g: &GlobalDef, types: &TypeTable) -> Option<Vec<u8>> {
     }
     let elem = types.base_type(g.typ)?;
     // `qualifies` asks the array; a `volatile` element is as volatile.
-    if types.size_bytes(elem) != 1 || types.contains_volatile(elem) {
+    if types.byte_size(elem) != ByteSize::new(1) || types.contains_volatile(elem) {
         return None;
     }
-    let mut bytes = vec![0u8; types.size_bytes(g.typ)];
+    let mut bytes = vec![0u8; types.byte_size(g.typ).to_usize()];
     match &g.init {
         // `char s[3] = "abc"` keeps no terminator: the string is cut to the
         // array, never the array stretched to the string.
@@ -118,16 +120,16 @@ fn const_char_array(g: &GlobalDef, types: &TypeTable) -> Option<Vec<u8>> {
             }
         }
         Initializer::Array {
-            elem_size: 1,
+            elem_size,
             elements,
             ..
-        } => {
+        } if *elem_size == ByteSize::new(1) => {
             for (at, init) in elements {
                 let Initializer::Int(v) = init else {
                     return None;
                 };
                 // The byte of the value, whichever `char` it initializes.
-                *bytes.get_mut(*at)? = *v as u8;
+                *bytes.get_mut(at.to_usize())? = *v as u8;
             }
         }
         _ => return None,
@@ -196,7 +198,7 @@ pub(crate) struct StrReader<'a> {
     func: &'a Function,
     am: &'a AddrMap,
     /// The width of an address: what pointer arithmetic is done at.
-    ptr_bits: u32,
+    ptr_bits: Bits,
     /// Where a local array's bytes are read, when they are.
     locals: Option<LocalBytes<'a>>,
 }
@@ -223,7 +225,7 @@ impl<'a> StrReader<'a> {
             data,
             func,
             am,
-            ptr_bits: types.size_bits(types.void_ptr_id),
+            ptr_bits: types.value_bits(types.void_ptr_id),
             locals: None,
         }
     }
@@ -326,14 +328,17 @@ impl<'a> StrReader<'a> {
         let MemBase::Local(sym) = at.base else {
             return None;
         };
-        let size = locals.types.size_bytes(self.func.local_of(sym)?.typ);
+        let size = locals
+            .types
+            .byte_size(self.func.local_of(sym)?.typ)
+            .to_usize();
         let start = usize::try_from(at.offset?).ok()?;
         let end = size.min(start.saturating_add(MAX_LOCAL_STRING));
         for (len, offset) in (start..end).enumerate() {
             let byte = MemLoc {
                 base: at.base.clone(),
                 offset: Some(i64::try_from(offset).ok()?),
-                size: 8,
+                size: Bits::new(8),
                 typ: Some(locals.types.uchar_id),
             };
             if locals
@@ -461,7 +466,7 @@ pub(crate) mod fixture {
         pub(crate) fn op(&mut self, op: Opcode, a: PseudoId, b: PseudoId) -> PseudoId {
             let t = self.func().alloc_pseudo();
             let ulong = self.types.ulong_id;
-            self.push(Instruction::binop(op, t, a, b, ulong, 64));
+            self.push(Instruction::binop(op, t, a, b, ulong, Bits::new(64)));
             t
         }
 
@@ -469,17 +474,17 @@ pub(crate) mod fixture {
             let cond = self.unknown();
             let t = self.func().alloc_pseudo();
             let ptr = self.types.char_ptr_id;
-            self.push(Instruction::select(t, cond, a, b, ptr, 64));
+            self.push(Instruction::select(t, cond, a, b, ptr, Bits::new(64)));
             t
         }
 
         /// `target = phi(arms...)`, each arm through its `PhiSource`.
         pub(crate) fn phi_into(&mut self, target: PseudoId, arms: &[PseudoId]) {
             let ptr = self.types.char_ptr_id;
-            let mut phi = Instruction::phi(target, ptr, 64);
+            let mut phi = Instruction::phi(target, ptr, Bits::new(64));
             for &arm in arms {
                 let src = self.func().alloc_pseudo();
-                self.push(Instruction::phi_source(src, arm, ptr, 64));
+                self.push(Instruction::phi_source(src, arm, ptr, Bits::new(64)));
                 phi.phi_list.push((BasicBlockId(0), src));
             }
             self.push(phi);
@@ -501,7 +506,7 @@ pub(crate) mod fixture {
         /// `p[at] = v`, one `char` wide.
         pub(crate) fn store_byte(&mut self, p: PseudoId, at: i64, v: PseudoId) {
             let c = self.types.char_id;
-            self.push(Instruction::store(v, p, at, c, 8));
+            self.push(Instruction::store(v, p, at, c, Bits::new(8)));
         }
 
         pub(crate) fn fresh(&mut self) -> PseudoId {
@@ -522,7 +527,7 @@ pub(crate) mod fixture {
         ) -> PseudoId {
             let t = self.func().alloc_pseudo();
             let (srcs, arg_types): (Vec<_>, Vec<_>) = args.iter().copied().unzip();
-            let size = self.types.size_bits(ret);
+            let size = self.types.value_bits(ret);
             let mut call = Instruction::call(Some(t), name, srcs, arg_types, ret, size);
             call.extra_mut().known = Some(known);
             self.push(call);
@@ -612,15 +617,15 @@ mod tests {
         fx.const_array("padded", 8, Initializer::String("ab".into()), |_| {});
         fx.const_array("cut", 3, Initializer::String("abc".into()), |_| {});
         let elements = vec![
-            (0, Initializer::Int(b'x'.into())),
-            (1, Initializer::Int(-1)),
+            (ByteSize::new(0), Initializer::Int(b'x'.into())),
+            (ByteSize::new(1), Initializer::Int(-1)),
         ];
         fx.const_array(
             "listed",
             4,
             Initializer::Array {
-                elem_size: 1,
-                total_size: 4,
+                elem_size: ByteSize::new(1),
+                total_size: ByteSize::new(4),
                 elements,
             },
             |_| {},

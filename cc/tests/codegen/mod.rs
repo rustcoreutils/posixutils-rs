@@ -50,11 +50,13 @@ mod determinism;
 // Thread cancellation and libgcc's forced unwind, as a glibc system has them.
 #[cfg(target_os = "linux")]
 mod exceptions;
+mod far_frames;
 mod file_scope_asm;
 mod float_to_int_saturation;
 mod floating;
 mod fp_compare_traps;
 mod fp_untaken_arms;
+mod frame_slots;
 mod gnu_inline_linkage;
 mod ifunc;
 mod inline_asm;
@@ -79,10 +81,12 @@ mod plain_char;
 mod profiling;
 mod promotion;
 mod regalloc;
+mod regalloc_fp;
 mod rounding_math;
 mod scaling;
 mod sections;
 mod simd_headers;
+mod stack_clash;
 mod stack_protector;
 mod stacked_args;
 mod storage_order;

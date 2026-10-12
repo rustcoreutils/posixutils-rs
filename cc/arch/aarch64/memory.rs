@@ -18,6 +18,7 @@ use crate::arch::lir::{FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::target::Os;
 use crate::types::{TypeId, TypeTable};
+use crate::units::{Bits, ByteSize};
 
 /// Result of computing a memory address for load/store operations
 enum ComputedAddr {
@@ -88,7 +89,9 @@ impl Aarch64CodeGen {
     /// (`execute/20040709-1`). A symbol whose alignment is unknown here -- a
     /// literal pool label, say -- is not folded either.
     pub(super) fn lo12_folds(&self, name: &str, bytes: u32) -> bool {
-        self.sym_align.get(name).is_some_and(|&a| a >= bytes)
+        self.sym_align
+            .get(name)
+            .is_some_and(|a| a.bytes() >= u64::from(bytes))
     }
 
     /// Load value of a global symbol into a register with specified size
@@ -164,17 +167,17 @@ impl Aarch64CodeGen {
     /// `movz`/`movk` sequence the value needs, which is the one place that
     /// sequence is spelled out. This used to build its own for anything
     /// outside -0x8000..=0xFFFF, a second copy of the same rule.
-    pub(super) fn emit_mov_imm(&mut self, dst: Reg, val: i64, size: u32) {
+    pub(super) fn emit_mov_imm(&mut self, dst: Reg, val: i64, size: Bits) {
         self.push_lir(Aarch64Inst::Mov {
-            size: OperandSize::from_bits(size.max(32)),
+            size: OperandSize::from_bits(size.max(Bits::new(32))),
             src: GpOperand::Imm(val),
             dst,
         });
     }
 
-    pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: u32) {
+    pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: Bits) {
         let actual_size = size; // Keep original size for sub-32-bit stack loads
-        let size = size.max(32);
+        let size = size.max(Bits::new(32));
         let loc = self.get_location(src);
         let op_size = OperandSize::from_bits(size);
 
@@ -191,7 +194,7 @@ impl Aarch64CodeGen {
             ref l @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 // For sub-32-bit values, use sized load (ldrb/ldrh) which zero-extends.
                 // This avoids reading garbage from adjacent stack bytes.
-                let load_size = OperandSize::from_bits(actual_size.max(8));
+                let load_size = OperandSize::from_bits(actual_size.max(Bits::new(8)));
                 // LIR: load from stack (FP-relative for alloca safety)
                 self.push_lir(Aarch64Inst::Ldr {
                     size: load_size,
@@ -203,12 +206,12 @@ impl Aarch64CodeGen {
                 self.emit_mov_imm(dst, v as i64, size);
             }
             Loc::Global(name) => {
-                let load_size = OperandSize::from_bits(size.max(32));
+                let load_size = OperandSize::from_bits(size.max(Bits::new(32)));
                 self.emit_load_global(&name, dst, load_size);
             }
             Loc::VReg(v) => {
                 // LIR: fmov from FP to GP register
-                let fp_size = if size <= 32 {
+                let fp_size = if size <= Bits::new(32) {
                     FpSize::Single
                 } else {
                     FpSize::Double
@@ -256,8 +259,8 @@ impl Aarch64CodeGen {
             Loc::Imm(v) => {
                 let lo = v as u64 as i64;
                 let hi = (v >> 64) as u64 as i64;
-                self.emit_mov_imm(Reg::X9, lo, 64);
-                self.emit_mov_imm(Reg::X10, hi, 64);
+                self.emit_mov_imm(Reg::X9, lo, Bits::new(64));
+                self.emit_mov_imm(Reg::X10, hi, Bits::new(64));
                 let dst_mem = self.stack_mem(dst_offset);
                 self.push_lir(Aarch64Inst::Stp {
                     size: OperandSize::B64,
@@ -268,7 +271,7 @@ impl Aarch64CodeGen {
             }
             _ => {
                 // For other locations, load as 64-bit and zero-extend
-                self.emit_move(src, Reg::X9, 64);
+                self.emit_move(src, Reg::X9, Bits::new(64));
                 let dst_mem = self.stack_mem(dst_offset);
                 self.push_lir(Aarch64Inst::Stp {
                     size: OperandSize::B64,
@@ -280,13 +283,13 @@ impl Aarch64CodeGen {
         }
     }
 
-    pub(super) fn emit_move_to_loc(&mut self, src: Reg, dst: &Loc, size: u32) {
+    pub(super) fn emit_move_to_loc(&mut self, src: Reg, dst: &Loc, size: Bits) {
         // For stack stores, use actual size to properly handle char/short
         // For register-to-register, use minimum 32-bit
         match dst {
             Loc::Reg(r) if *r == src => {}
             Loc::Reg(r) => {
-                let reg_size = size.max(32);
+                let reg_size = size.max(Bits::new(32));
                 // LIR: mov register to register
                 self.push_lir(Aarch64Inst::Mov {
                     size: OperandSize::from_bits(reg_size),
@@ -309,7 +312,7 @@ impl Aarch64CodeGen {
             // `ad != n` compared against a stale value.
             Loc::VReg(v) => {
                 self.push_lir(Aarch64Inst::FmovFromGp {
-                    size: if size <= 32 {
+                    size: if size <= Bits::new(32) {
                         FpSize::Single
                     } else {
                         FpSize::Double
@@ -328,7 +331,7 @@ impl Aarch64CodeGen {
     fn compute_mem_addr(
         &mut self,
         addr: PseudoId,
-        insn_offset: i32,
+        insn_offset: i64,
         temp_reg: Reg,
     ) -> ComputedAddr {
         let addr_loc = self.get_location(addr);
@@ -360,7 +363,7 @@ impl Aarch64CodeGen {
             Loc::Global(name) => ComputedAddr::Global(name.clone()),
             _ => {
                 // Other location types - emit move to temp register
-                self.emit_move(addr, temp_reg, 64);
+                self.emit_move(addr, temp_reg, Bits::new(64));
                 ComputedAddr::WithSetup(MemAddr::BaseOffset {
                     base: temp_reg,
                     offset: insn_offset,
@@ -379,7 +382,7 @@ impl Aarch64CodeGen {
     /// and store uses: a `Sym`'s slot is the object, so its address is taken;
     /// any other pseudo's slot holds a pointer, which is loaded. Loading every
     /// operand as a value read a local object's contents as its address.
-    pub(super) fn emit_addr_into(&mut self, addr: PseudoId, disp: i32, dst: Reg) {
+    pub(super) fn emit_addr_into(&mut self, addr: PseudoId, disp: i64, dst: Reg) {
         let (base, offset) = match self.compute_mem_addr(addr, disp, dst) {
             ComputedAddr::Global(name) => {
                 self.emit_load_addr(&name, dst);
@@ -395,7 +398,7 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: base,
-                src2: GpOperand::Imm(offset.into()),
+                src2: GpOperand::Imm(offset),
                 dst,
             });
         } else if base != dst {
@@ -417,15 +420,19 @@ impl Aarch64CodeGen {
     /// of the object. Rounding the access up to the next width instead, which
     /// is what a bare `from_bits` does, reads up to three bytes too far and
     /// faults whenever a 3, 5, 6 or 7 byte object ends a page.
-    fn emit_overlapped_load(&mut self, base: Reg, offset: i32, width: i64, high: i64, dst: Reg) {
+    fn emit_overlapped_load(&mut self, base: Reg, offset: i64, width: i64, high: i64, dst: Reg) {
         // `dst` is an allocated register or X9, so it is never X16 or X17;
         // `base` may be either, since that is what carries a computed address.
         let scratch = if base == Reg::X16 { Reg::X17 } else { Reg::X16 };
-        let size = OperandSize::from_bits(width as u32 * 8);
+        let size = OperandSize::from_bits(
+            ByteSize::new(width as u64)
+                .bits()
+                .expect("a half is at most four bytes"),
+        );
         // Whichever half lands in `base` has to be read last: after
         // coalescing, `dst` can be the very register holding the address.
         // `scratch` is chosen above so that it never is.
-        let halves = [(offset, dst), (offset + high as i32, scratch)];
+        let halves = [(offset, dst), (offset + high, scratch)];
         let halves = if dst == base {
             [halves[1], halves[0]]
         } else {
@@ -454,7 +461,7 @@ impl Aarch64CodeGen {
 
     pub(super) fn emit_load(&mut self, insn: &Instruction, types: &TypeTable) {
         let mem_size = insn.size;
-        let reg_size = insn.size.max(32);
+        let reg_size = insn.size.max(Bits::new(32));
         let addr = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -474,7 +481,7 @@ impl Aarch64CodeGen {
         }
 
         // 128-bit integer load: load both halves to destination stack slot
-        if mem_size == 128 {
+        if mem_size == Bits::new(128) {
             if let Loc::Stack(dst_offset) = dst_loc {
                 match self.compute_mem_addr(addr, insn.displacement(), Reg::X16) {
                     ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
@@ -522,7 +529,7 @@ impl Aarch64CodeGen {
         let is_unsigned = insn.typ.is_some_and(|t| types.is_unsigned(t));
 
         // Helper to emit the appropriate load instruction
-        let emit_load_lir = |this: &mut Self, mem_addr: MemAddr| match mem_size {
+        let emit_load_lir = |this: &mut Self, mem_addr: MemAddr| match mem_size.get() {
             8 if is_unsigned => {
                 this.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B8,
@@ -619,9 +626,9 @@ impl Aarch64CodeGen {
 
         // For struct stores (size > 64), we need to copy multiple words
         // The value is a symbol containing the struct data
-        if mem_size > 64 {
+        if mem_size > Bits::new(64) {
             // Check for Int128 immediate stores
-            if mem_size == 128 {
+            if mem_size == Bits::new(128) {
                 let value_loc = self.get_location(value);
                 if let Loc::Imm(v) = value_loc {
                     self.emit_int128_imm_store(insn, addr, v);
@@ -641,9 +648,9 @@ impl Aarch64CodeGen {
 
         // Use widened size for register load when store is widened
         let reg_size = if store_size == OperandSize::B64 {
-            64
+            Bits::new(64)
         } else {
-            insn.size.max(32)
+            insn.size.max(Bits::new(32))
         };
 
         self.emit_move(value, Reg::X9, reg_size);
@@ -671,8 +678,7 @@ impl Aarch64CodeGen {
     /// Emit a struct copy (store of size > 64 bits)
     /// The value is a symbol containing the source struct data
     fn emit_struct_store(&mut self, insn: &Instruction, addr: PseudoId, value: PseudoId) {
-        let struct_size = insn.size; // Size in bits
-        let num_qwords = struct_size.div_ceil(64);
+        let num_qwords = insn.size.get().div_ceil(64);
 
         // Get source address (where the struct data is)
         let value_loc = self.get_location(value);
@@ -693,7 +699,7 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: base,
-                    src2: GpOperand::Imm(total_offset as i64),
+                    src2: GpOperand::Imm(total_offset),
                     dst: Reg::X16,
                 });
             }
@@ -725,7 +731,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: base,
-                        src2: GpOperand::Imm(total_offset as i64),
+                        src2: GpOperand::Imm(total_offset),
                         dst: Reg::X17,
                     });
                 } else {
@@ -739,7 +745,7 @@ impl Aarch64CodeGen {
                         self.push_lir(Aarch64Inst::Add {
                             size: OperandSize::B64,
                             src1: Reg::X17,
-                            src2: GpOperand::Imm(insn.displacement().into()),
+                            src2: GpOperand::Imm(insn.displacement()),
                             dst: Reg::X17,
                         });
                     }
@@ -750,7 +756,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: r,
-                        src2: GpOperand::Imm(insn.displacement().into()),
+                        src2: GpOperand::Imm(insn.displacement()),
                         dst: Reg::X17,
                     });
                 } else if r != Reg::X17 {
@@ -769,7 +775,7 @@ impl Aarch64CodeGen {
 
         // Copy qword by qword using X9 as temp
         for i in 0..num_qwords {
-            let byte_offset = (i * 8) as i32;
+            let byte_offset = (i * 8) as i64;
             self.push_lir(Aarch64Inst::Ldr {
                 size: OperandSize::B64,
                 addr: MemAddr::BaseOffset {
@@ -801,7 +807,7 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: base,
-                    src2: GpOperand::Imm(total_offset as i64),
+                    src2: GpOperand::Imm(total_offset),
                     dst: Reg::X17,
                 });
             }
@@ -810,7 +816,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: r,
-                        src2: GpOperand::Imm(insn.displacement().into()),
+                        src2: GpOperand::Imm(insn.displacement()),
                         dst: Reg::X17,
                     });
                 } else if r != Reg::X17 {
@@ -827,7 +833,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: Reg::X17,
-                        src2: GpOperand::Imm(insn.displacement().into()),
+                        src2: GpOperand::Imm(insn.displacement()),
                         dst: Reg::X17,
                     });
                 }
@@ -837,7 +843,7 @@ impl Aarch64CodeGen {
 
         // Store zeros using XZR (zero register) - aarch64 has hardware zero reg!
         for i in 0..num_qwords {
-            let byte_offset = (i * 8) as i32;
+            let byte_offset = (i * 8) as i64;
             self.push_lir(Aarch64Inst::Str {
                 size: OperandSize::B64,
                 src: Reg::Xzr,
@@ -853,8 +859,8 @@ impl Aarch64CodeGen {
     fn emit_int128_imm_store(&mut self, insn: &Instruction, addr: PseudoId, v: i128) {
         let lo = v as u64 as i64;
         let hi = (v >> 64) as u64 as i64;
-        self.emit_mov_imm(Reg::X9, lo, 64);
-        self.emit_mov_imm(Reg::X10, hi, 64);
+        self.emit_mov_imm(Reg::X9, lo, Bits::new(64));
+        self.emit_mov_imm(Reg::X10, hi, Bits::new(64));
 
         match self.compute_mem_addr(addr, insn.displacement(), Reg::X16) {
             ComputedAddr::Direct(mem_addr) | ComputedAddr::WithSetup(mem_addr) => {
@@ -881,13 +887,13 @@ impl Aarch64CodeGen {
         &mut self,
         src: PseudoId,
         dst: PseudoId,
-        size: u32,
+        size: Bits,
         typ: Option<TypeId>,
         types: &TypeTable,
     ) {
         // Keep actual size for handling narrow types
         let actual_size = size;
-        let reg_size = size.max(32);
+        let reg_size = size.max(Bits::new(32));
         let dst_loc = self.get_location(dst);
         let src_loc = self.get_location(src);
 
@@ -899,7 +905,7 @@ impl Aarch64CodeGen {
         // path). Same gating: same location, no narrow-type
         // extension, not FP. See x86_64::emit_copy_with_type for
         // the full rationale.
-        if src_loc == dst_loc && actual_size >= 32 && !is_fp_copy {
+        if src_loc == dst_loc && actual_size >= Bits::new(32) && !is_fp_copy {
             return;
         }
 
@@ -915,7 +921,7 @@ impl Aarch64CodeGen {
         // truncated an `FImm` to its *f64* encoding (and a `VReg` to its low
         // lane), so `long double a = 3.14159...L;` landed a denormal on the
         // stack. FP goes through `emit_fp_move`, which assembles both halves.
-        if actual_size == 128 && !is_fp_copy {
+        if actual_size == Bits::new(128) && !is_fp_copy {
             if let Loc::Stack(dst_offset) = dst_loc {
                 self.emit_int128_move_to_stack(src, dst_offset);
             }
@@ -939,16 +945,16 @@ impl Aarch64CodeGen {
             match &dst_loc {
                 // A narrow constant is extended now rather than at run time,
                 // as on x86-64.
-                Loc::Reg(r) if actual_size < 32 && matches!(src_loc, Loc::Imm(_)) => {
+                Loc::Reg(r) if actual_size < Bits::new(32) && matches!(src_loc, Loc::Imm(_)) => {
                     let Loc::Imm(v) = src_loc else { unreachable!() };
-                    let v = crate::ir::constfold::at_width(v, actual_size, !is_unsigned);
-                    self.emit_mov_imm(*r, v as i64, 32);
+                    let v = crate::ir::constfold::at_width(v, actual_size.get(), !is_unsigned);
+                    self.emit_mov_imm(*r, v as i64, Bits::new(32));
                 }
                 Loc::Reg(r) => {
                     self.emit_move(src, *r, reg_size);
                     // For narrow types (8 or 16 bits), extend to correct width
                     // AARCH64: UXTB/UXTH for unsigned, SXTB/SXTH for signed
-                    if actual_size == 8 {
+                    if actual_size == Bits::new(8) {
                         if is_unsigned {
                             self.push_lir(Aarch64Inst::Uxtb { src: *r, dst: *r });
                         } else {
@@ -958,7 +964,7 @@ impl Aarch64CodeGen {
                                 dst: *r,
                             });
                         }
-                    } else if actual_size == 16 {
+                    } else if actual_size == Bits::new(16) {
                         if is_unsigned {
                             self.push_lir(Aarch64Inst::Uxth { src: *r, dst: *r });
                         } else {
@@ -973,7 +979,7 @@ impl Aarch64CodeGen {
                 Loc::Stack(_) => {
                     self.emit_move(src, Reg::X9, reg_size);
                     // For narrow types stored to stack, use the actual size
-                    if actual_size <= 16 {
+                    if actual_size <= Bits::new(16) {
                         self.emit_move_to_loc(Reg::X9, &dst_loc, actual_size);
                     } else {
                         self.emit_move_to_loc(Reg::X9, &dst_loc, reg_size);
@@ -1014,7 +1020,7 @@ mod tests {
                 src1,
                 src2: GpOperand::Imm(imm),
                 dst: Reg::X10,
-            }] if *src1 == base && *imm == i64::from(offset)
+            }] if *src1 == base && *imm == offset
         ));
 
         cg.base.lir_buffer.clear();

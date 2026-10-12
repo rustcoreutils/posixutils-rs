@@ -91,7 +91,7 @@ pub(super) fn materialize(b: &mut Builder, call: &Instruction, (re, im): (FloatV
     } else {
         call.target.expect("a complex routine's result has storage")
     };
-    let half_bytes = i64::from(b.types.size_bits(typ) / 8);
+    let half_bytes = i64::from(b.types.value_bits(typ).bytes_exact());
     for (half, at) in [(re, 0), (im, half_bytes)] {
         let v = b.float_constant(half, typ);
         b.store(v, dest, at, typ);
@@ -106,6 +106,7 @@ mod tests {
     use crate::ir::strdata::fixture::Fixture;
     use crate::ir::{CallAbiInfo, Opcode, Pseudo, PseudoId};
     use crate::types::TypeId;
+    use crate::units::Bits;
 
     fn linux(arch: Arch) -> Target {
         Target::new(arch, Os::Linux)
@@ -113,7 +114,7 @@ mod tests {
 
     /// A float constant of `typ`.
     fn fconst(fx: &mut Fixture, v: f64, typ: TypeId) -> PseudoId {
-        let size = fx.types.size_bits(typ);
+        let size = fx.types.value_bits(typ);
         let f = fx.func();
         let p = f.alloc_pseudo();
         f.add_pseudo(Pseudo::fval(p, FloatVal::from_f64(v)));
@@ -129,7 +130,7 @@ mod tests {
         let ret = f.alloc_pseudo();
         f.add_pseudo(Pseudo::sym(ret, "__cret".to_string()));
         f.add_local("__cret", ret, complex, None, None);
-        let size = fx.types.size_bits(complex);
+        let size = fx.types.value_bits(complex);
         let mut insn = Instruction::call(
             Some(ret),
             "__muldc3",
@@ -208,11 +209,11 @@ mod tests {
             [slot].into_iter().chain(h).collect(),
             [ptr].into_iter().chain([dbl; 4]).collect(),
             ptr,
-            64,
+            Bits::new(64),
         );
         let indirect = ArgClass::Indirect {
-            align: 16,
-            size_bytes: 16,
+            align: crate::units::Align::of_bytes(16),
+            size_bytes: crate::units::ByteSize::new(16),
         };
         insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], indirect)));
         insn.extra_mut().known = Some(LibFn::MulComplex);

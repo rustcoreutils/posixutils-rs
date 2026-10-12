@@ -17,6 +17,7 @@ use crate::float::{FloatVal, IntegralRounding};
 use crate::ir::{FloatCmp, Instruction, NanCompare, Opcode, PseudoId};
 use crate::target::{FusedMultiplyAdd, X86Simd};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::Bits;
 
 /// What `emit_fp_sign_bit_op` does to the sign bit.
 #[derive(Clone, Copy)]
@@ -28,9 +29,10 @@ enum SignBitOp {
 }
 
 impl X86_64CodeGen {
-    /// Get size in bits from type, with fallback to provided size.
-    fn size_from_type(typ: Option<TypeId>, size: u32, types: &TypeTable) -> u32 {
-        typ.map(|t| types.size_bits(t)).unwrap_or(size).max(32)
+    /// The width of a floating-point operand: its type's, else `size`, and
+    /// never under 32 bits.
+    fn size_from_type(typ: Option<TypeId>, size: Bits, types: &TypeTable) -> Bits {
+        typ.map_or(size, |t| types.value_bits(t)).max(Bits::new(32))
     }
 
     /// The register format for a floating-point operand, from its *type*.
@@ -42,12 +44,12 @@ impl X86_64CodeGen {
     /// A complex value is moved as one unit rather than as a scalar of its
     /// base type, so its *width* is what picks the instruction; everything
     /// else is decided by the type.
-    pub(super) fn fp_format(&self, typ: Option<TypeId>, size: u32, types: &TypeTable) -> FpSize {
-        let width = Self::size_from_type(typ, size, types);
-        if typ.is_some_and(|t| types.is_complex_float(t)) {
+    pub(super) fn fp_format(&self, typ: Option<TypeId>, size: Bits, types: &TypeTable) -> FpSize {
+        if let Some(t) = typ.filter(|&t| types.is_complex_float(t)) {
+            let width = types.value_bits(t).max(Bits::new(32));
             return FpSize::from_bits(width, &self.base.target);
         }
-        FpSize::from_type_or_bits(typ, width, types, &self.base.target)
+        FpSize::from_type_or_bits(typ, size.max(Bits::new(32)), types, &self.base.target)
     }
 
     /// Emit a floating-point load operation
@@ -118,7 +120,7 @@ impl X86_64CodeGen {
             }
             _ => {
                 // Load address into R11, then load from that address
-                self.emit_move(addr, Reg::R11, 64);
+                self.emit_move(addr, Reg::R11, Bits::new(64));
                 self.push_fp_access_load(
                     insn,
                     fp_size,
@@ -225,7 +227,7 @@ impl X86_64CodeGen {
             }
             _ => {
                 // Load address into R11, then store
-                self.emit_move(addr, Reg::R11, 64);
+                self.emit_move(addr, Reg::R11, Bits::new(64));
                 self.push_fp_access_store(
                     insn,
                     fp_size,
@@ -1008,7 +1010,7 @@ impl X86_64CodeGen {
             dst: Reg::R10,
         });
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(32));
     }
 
     /// Emit `CopySign` of a `float` or `double`: the magnitude bits of the
@@ -1129,7 +1131,7 @@ impl X86_64CodeGen {
                 if move_size == FpSize::Quad {
                     self.emit_quad_const_to_xmm(v, XmmReg::Xmm14);
                 } else {
-                    self.emit_fp_imm_to_xmm(v, XmmReg::Xmm14, move_size.bits());
+                    self.emit_fp_imm_to_xmm(v, XmmReg::Xmm14, move_size.width());
                 }
                 self.push_lir(X86Inst::ComiFp {
                     nan,
@@ -1227,7 +1229,7 @@ impl X86_64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(32));
         }
     }
 
@@ -1236,9 +1238,8 @@ impl X86_64CodeGen {
         // Use type-aware sizing: src_typ is the integer type, typ is the float type
         let src_size = insn
             .src_typ
-            .map(|t| types.size_bits(t))
-            .unwrap_or(insn.src_size)
-            .max(32);
+            .map_or(insn.src_size, |t| types.value_bits(t))
+            .max(Bits::new(32));
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -1256,7 +1257,7 @@ impl X86_64CodeGen {
         };
 
         let fp_size = FpSize::from_type_or_bits(insn.typ, insn.size, types, &self.base.target);
-        let is_unsigned_64 = insn.op == Opcode::UCvtF && src_size == 64;
+        let is_unsigned_64 = insn.op == Opcode::UCvtF && src_size == Bits::new(64);
 
         // Move integer to R10 first (scratch register)
         self.emit_move(src, Reg::R10, src_size);
@@ -1346,7 +1347,7 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
         } else {
             // Signed conversion, or unsigned 32-bit (zero-extended to 64-bit fits signed)
-            let int_size = if insn.op == Opcode::UCvtF && src_size == 32 {
+            let int_size = if insn.op == Opcode::UCvtF && src_size == Bits::new(32) {
                 // Zero-extend 32-bit unsigned to 64-bit signed for correct conversion
                 OperandSize::B64
             } else {
@@ -1373,7 +1374,7 @@ impl X86_64CodeGen {
     pub(super) fn emit_float_to_int(&mut self, insn: &Instruction, types: &TypeTable) {
         // Use type-aware sizing: src_typ is the float type, typ is the integer type
         let dst_typ = insn.typ.expect("float-to-int conversion must have typ");
-        let dst_size = types.size_bits(dst_typ).max(32);
+        let dst_size = types.value_bits(dst_typ).max(Bits::new(32));
         let src = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -1407,7 +1408,10 @@ impl X86_64CodeGen {
         // rounding direction, which is what `cvtsd2si` does.
         let truncate = !matches!(insn.op, Opcode::RoundToInteger(_));
 
-        if is_unsigned && dst_size == 64 && matches!(fp_size, FpSize::Single | FpSize::Double) {
+        if is_unsigned
+            && dst_size == Bits::new(64)
+            && matches!(fp_size, FpSize::Single | FpSize::Double)
+        {
             // cvttss2si/cvttsd2si are *signed*: every value at or above 2^63
             // overflows and yields the "integer indefinite" 0x8000000000000000,
             // so the whole upper half of the unsigned range came back wrong.
@@ -1419,7 +1423,7 @@ impl X86_64CodeGen {
             // For unsigned 32-bit targets, use 64-bit conversion to avoid
             // overflow for values >= 2^31 that fit in uint32_t but not int32_t.
             // A Half source cannot reach 2^63 at all, so it needs no split.
-            let int_size = if is_unsigned && dst_size == 32 {
+            let int_size = if is_unsigned && dst_size == Bits::new(32) {
                 OperandSize::B64 // cvttsd2siq then truncate
             } else {
                 OperandSize::from_bits(dst_size)
@@ -1485,7 +1489,7 @@ impl X86_64CodeGen {
         self.emit_fp_imm_to_xmm(
             FloatVal::from_f64(TWO_POW_63),
             XmmReg::Xmm14,
-            fp_size.bits(),
+            fp_size.width(),
         );
 
         self.push_lir(X86Inst::ComiFp {
@@ -1629,7 +1633,7 @@ impl X86_64CodeGen {
         if size == FpSize::Quad {
             self.emit_quad_const_to_xmm(value, dst_xmm);
         } else {
-            self.emit_fp_imm_to_xmm(value, dst_xmm, size.bits());
+            self.emit_fp_imm_to_xmm(value, dst_xmm, size.width());
         }
 
         if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
@@ -1677,7 +1681,7 @@ impl X86_64CodeGen {
     /// XMM holds only `_Float16`, `float` and `double`; an x87 80-bit or a
     /// binary128 constant never reaches here. The bits are the value's own
     /// encoding at `size`, taken from the exact value.
-    pub(super) fn emit_fp_imm_to_xmm(&mut self, value: FloatVal, xmm: XmmReg, size: u32) {
+    pub(super) fn emit_fp_imm_to_xmm(&mut self, value: FloatVal, xmm: XmmReg, size: Bits) {
         // `is_positive_zero`, not `is_zero`: the shortcut below produces
         // `+0.0`, and `-0.0` is a different value with the same magnitude.
         // C equates the two under `==` but not under `signbit`, and
@@ -1694,7 +1698,7 @@ impl X86_64CodeGen {
         }
         // Loaded through an integer register (R10 scratch).
         let bits = value.to_bits_at_width(size);
-        let width = if size <= 32 {
+        let width = if size <= Bits::new(32) {
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B32,
                 src: GpOperand::Imm(bits),
@@ -1847,7 +1851,7 @@ impl X86_64CodeGen {
     pub(super) fn emit_va_arg_float(
         &mut self,
         ap_base: Reg,
-        ap_base_offset: i32,
+        ap_base_offset: i64,
         dst_loc: &Loc,
         arg_type: TypeId,
         label_suffix: u32,
@@ -1856,13 +1860,13 @@ impl X86_64CodeGen {
         let overflow_label = Label::internal("va_fp_overflow", label_suffix);
         let done_label = Label::internal("va_fp_done", label_suffix);
 
-        let fp_size = types.size_bits(arg_type);
+        let fp_size = types.value_bits(arg_type);
         // `__float128` occupies a whole XMM register and a sixteen-byte slot.
         // Moving it as a `Double` copies its low half and leaves the exponent
         // and the top of the mantissa behind.
-        let lir_fp_size = if fp_size <= 32 {
+        let lir_fp_size = if fp_size <= Bits::new(32) {
             FpSize::Single
-        } else if fp_size <= 64 {
+        } else if fp_size <= Bits::new(64) {
             FpSize::Double
         } else {
             FpSize::Quad
@@ -1870,7 +1874,7 @@ impl X86_64CodeGen {
         // How far the overflow area advances, and how far the register save
         // area's cursor does. Both are the argument's slot, which is eight
         // bytes for a float or double and sixteen for a binary128.
-        let slot_bytes: i64 = if fp_size > 64 { 16 } else { 8 };
+        let slot_bytes: i64 = if fp_size > Bits::new(64) { 16 } else { 8 };
 
         // Load fp_offset from va_list (at offset 4)
         self.push_lir(X86Inst::Mov {

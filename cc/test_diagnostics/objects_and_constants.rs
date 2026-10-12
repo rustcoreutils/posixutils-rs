@@ -652,8 +652,8 @@ fn diagnostics_representable_enumerators_are_accepted() {
 /// arithmetic, and 6.5.6p9 makes the difference of two pointers into one
 /// object a `ptrdiff_t`, so an object whose size does not fit a signed 64-bit
 /// value cannot be indexed from end to end. `PTRDIFF_MAX` itself is allowed
-/// and one byte more is not. It used to be 512 MB, an accident of `size_bits`
-/// answering in a `u32`, and an extent past it saturated in silence:
+/// and one byte more is not. It used to be 512 MB, an accident of a type's bit
+/// width being answered in a `u32`, and an extent past it saturated in silence:
 /// `char big[5000000000];` compiled and reported `sizeof` 536870911. Then it
 /// was `u64::MAX / 8`, because struct layout accumulated its bits in a
 /// `usize`, which refused gcc.c-torture `991014-1`.
@@ -683,6 +683,22 @@ fn diagnostics_object_larger_than_the_compiler_can_describe() {
         (
             "array_one_past_ptrdiff_max",
             "typedef char T[9223372036854775808UL];\nint main(void){ return 0; }\n",
+        ),
+        // An array sized by its initializer is measured as well: a designator
+        // past the bound used to give an object of 2^63 + 16 bytes, and one
+        // whose size overflowed `u64` an internal compiler error (before
+        // that, a wrapped `.size`).
+        (
+            "array_sized_by_designator",
+            "long a[] = {[0x1000000000000001] = 1};\nint main(void){ return 0; }\n",
+        ),
+        (
+            "array_sized_by_designator_past_u64",
+            "long a[] = {[0x2000000000000001] = 1};\nint main(void){ return 0; }\n",
+        ),
+        (
+            "compound_literal_sized_by_designator",
+            "int main(void){ return ((long[]){[0x1000000000000001] = 1})[0]; }\n",
         ),
     ] {
         compile_expect_error(

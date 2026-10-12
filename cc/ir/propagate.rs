@@ -23,6 +23,7 @@
 //
 
 use super::{BasicBlockId, ConstValue, Function, Instruction, Opcode, PseudoId, Site};
+use crate::units::Bits;
 use std::collections::HashMap;
 
 /// Replace the instruction at `site` with a `Copy` of the constant `v`.
@@ -48,7 +49,7 @@ pub(crate) fn fold_target_to_const(
     // *`SetVal`'s* size, which a minted pseudo has none of, and aarch64
     // has no such case at all. Emitting one would mean inserting an
     // instruction, which the in-place discipline here does not do.
-    if insn.size == 128 {
+    if insn.size == Bits::new(128) {
         return false;
     }
     // Already a copy of this very constant: rewriting would mint a fresh
@@ -72,7 +73,7 @@ pub(crate) fn fold_target_to_const(
     insn.op = Opcode::Copy;
     insn.src = vec![c];
     insn.src_typ = None;
-    insn.src_size = 0;
+    insn.src_size = Bits::new(0);
     // A folded phi keeps no incoming values; clearing the list is what
     // makes the now-unread `PhiSource` instructions dead, for the `dce`
     // run that follows to collect.
@@ -204,7 +205,11 @@ pub(crate) fn switch_taken(insn: &Instruction, v: i128) -> Option<BasicBlockId> 
     if insn.typ.is_some() {
         return None;
     }
-    let w = if insn.size.max(32) > 32 { 64 } else { 32 };
+    let w = if insn.size.max(Bits::new(32)) > Bits::new(32) {
+        64
+    } else {
+        32
+    };
     let mask = |x: i128| -> u128 { (x as u128) & (u128::MAX >> (128 - w)) };
 
     let sel = mask(v);
@@ -252,14 +257,14 @@ mod tests {
             PseudoId(1),
             PseudoId(1),
             int,
-            32,
+            Bits::new(32),
         ));
         b0.add_insn(Instruction::cbr(PseudoId(1), l1, l2));
         b0.children = vec![l1, l2];
         f.add_block(b0);
         for (id, src) in [(l1, 10u32), (l2, 11)] {
             let mut b = BasicBlock::new(id);
-            let mut ps = Instruction::phi_source(PseudoId(src), PseudoId(2), int, 32);
+            let mut ps = Instruction::phi_source(PseudoId(src), PseudoId(2), int, Bits::new(32));
             ps.phi_list = vec![(l3, PseudoId(12))];
             b.add_insn(ps);
             b.add_insn(Instruction::br(l3));
@@ -267,7 +272,7 @@ mod tests {
             f.add_block(b);
         }
         let mut b3 = BasicBlock::new(l3);
-        let mut phi = Instruction::phi(PseudoId(12), int, 32);
+        let mut phi = Instruction::phi(PseudoId(12), int, Bits::new(32));
         phi.phi_list = vec![(l1, PseudoId(10)), (l2, PseudoId(11))];
         b3.add_insn(phi);
         b3.add_insn(Instruction::ret(Some(PseudoId(12))));
@@ -305,7 +310,7 @@ mod tests {
     #[test]
     fn a_128_bit_value_is_not_folded_to_a_copy() {
         let mut f = diamond();
-        f.blocks[0].insns[1].size = 128;
+        f.blocks[0].insns[1].size = Bits::new(128);
         let mut minted = HashMap::new();
         assert!(!fold_target_to_const(&mut f, (0, 1), 1 << 70, &mut minted));
         assert_eq!(f.blocks[0].insns[1].op, Opcode::Add);
@@ -323,7 +328,7 @@ mod tests {
             ..Default::default()
         };
         f.blocks[0].insns[1].pos = Some(pos);
-        f.blocks[0].insns[1].size = 128;
+        f.blocks[0].insns[1].size = Bits::new(128);
         let typ = f.blocks[0].insns[1].typ;
 
         assert!(fold_target_to_setval(
@@ -333,7 +338,7 @@ mod tests {
         ));
         let insn = &f.blocks[0].insns[1];
         assert_eq!(
-            (insn.op, insn.target, insn.typ, insn.size, insn.pos),
+            (insn.op, insn.target, insn.typ, insn.size.get(), insn.pos),
             (Opcode::SetVal, Some(PseudoId(2)), typ, 128, Some(pos))
         );
         assert!(insn.src.is_empty());
@@ -404,7 +409,7 @@ mod tests {
     #[test]
     fn switch_taken_matches_a_gnu_range() {
         let mut insn = Instruction::new(Opcode::Switch);
-        insn.size = 32;
+        insn.size = Bits::new(32);
         insn.extra_mut().switch_cases = vec![(30, 50, BasicBlockId(7))];
         insn.extra_mut().switch_default = Some(BasicBlockId(9));
         assert_eq!(switch_taken(&insn, 40), Some(BasicBlockId(7)));
@@ -418,7 +423,7 @@ mod tests {
     fn switch_taken_with_a_type_is_left_alone() {
         let types = TypeTable::new(&Target::host());
         let mut insn = Instruction::new(Opcode::Switch);
-        insn.size = 32;
+        insn.size = Bits::new(32);
         insn.typ = Some(types.int_id);
         insn.extra_mut().switch_cases = vec![(5, 5, BasicBlockId(7))];
         insn.extra_mut().switch_default = Some(BasicBlockId(9));
@@ -427,7 +432,7 @@ mod tests {
 
     fn switch_case_for(case: i64, selector: i128) -> Option<BasicBlockId> {
         let mut insn = Instruction::new(Opcode::Switch);
-        insn.size = 32;
+        insn.size = Bits::new(32);
         insn.extra_mut().switch_cases = vec![(case, case, BasicBlockId(7))];
         insn.extra_mut().switch_default = Some(BasicBlockId(9));
         switch_taken(&insn, selector)

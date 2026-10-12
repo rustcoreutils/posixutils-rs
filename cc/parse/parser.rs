@@ -998,7 +998,7 @@ impl Parser<'_> {
                 // error under a message naming a keyword the source did not
                 // contain.
                 if self.pending_alignas_kw.is_some() {
-                    let natural = self.types.natural_alignment(typ) as u32;
+                    let natural = self.types.natural_align(typ).bytes() as u32;
                     if explicit < natural {
                         return Err(ParseError::new(
                             format!(

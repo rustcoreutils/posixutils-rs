@@ -59,6 +59,7 @@ algorithms and contracts live:
 | `ir/memloc.rs`, `ir/loadfwd.rs` | Memory analysis: what an access addresses, what may alias, and what a location holds at a point |
 | `abi/` | Calling-convention classification (System V AMD64, Microsoft x64, AAPCS64) |
 | `arch/regalloc.rs` | Shared register allocation: liveness, local lifetimes and slot sharing, spill slots |
+| `arch/regalloc/verify.rs` | The allocation verifier: in a debug build, each function's assignment is checked against exact liveness -- no two live values in one register or on one stack byte -- and an internal compiler error names the pair |
 | `arch/x86_64/`, `arch/aarch64/` | Code generators: instruction selection, frames, calls, inline asm |
 
 ## Debugging
@@ -71,6 +72,10 @@ The compiler supports C input via `-` for stdin, and can output intermediate rep
 - `--dump-ast` — Parse and dump AST to stdout
 - `--dump-tokens` — Dump preprocessed token stream
 - `-E` — Run the preprocessor only
+- `-fstack-usage` — Each function's stack use in a `.su` file, counted as gcc counts it.
+  `scripts/c17_frames.sh` compares c17's against gcc's function by function over CPython
+  and a torture sample; `scripts/c17_frames.sh -i BASE_C17` checks instead that two c17
+  builds emit identical assembly over the same files, both targets, `-O0` and `-O2`
 
 Examples:
 
@@ -115,6 +120,15 @@ Supported:
 - Variably modified types everywhere C17 admits them, including a `typedef` of
   one (6.7.7), whose extents are evaluated at the typedef rather than at each use
 - `-fverbose-asm`, annotating each instruction with the source names it came from
+- `-fstack-usage`, writing each function's stack use to a `.su` file named,
+  laid out and counted as gcc's, so that a c17 build and a gcc build compare
+  function by function; and `-Wstack-usage=`, warning in gcc's words. The
+  figures are c17's own frames. On AArch64 c17 moves `sp` for each call's
+  stacked arguments, so such a function is `dynamic,bounded` where gcc,
+  reserving the area in its frame, says `static`
+- `-fstack-clash-protection` and its `--param`s, probing the stack as gcc does
+  so that no frame, `alloca`, VLA or stacked argument area jumps the guard
+  page; `-fstack-check` is an alias of it (see [DECISIONS.md](DECISIONS.md))
 - `-fdebug-prefix-map=OLD=NEW`, `-fmacro-prefix-map=OLD=NEW` and
   `-ffile-prefix-map=OLD=NEW`, with gcc's rules: the last matching option
   wins, `OLD` is a plain string prefix, and the argument splits at its last `=`

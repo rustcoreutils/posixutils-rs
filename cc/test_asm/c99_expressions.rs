@@ -15,7 +15,7 @@ use crate::test_compile::compile_expect_error;
 /// `sizeof` a variably-length array is not an integer constant expression.
 ///
 /// `SizeofType` grew a runtime guard; `SizeofExpr` did not, so `sizeof a` for
-/// `int a[n]` folded to 0 -- `size_bits` reports 0 for an array with no extent
+/// `int a[n]` folded to 0 -- `byte_size` reports 0 for an array with no extent
 /// -- and `case sizeof a:` was accepted with the wrong value, matching
 /// `switch (0)`. The question is asked of the array levels: any variable
 /// one makes the size a run-time value.

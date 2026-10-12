@@ -16,9 +16,10 @@ use crate::arch::asm_constraints::{
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
 use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
-use crate::arch::x86_64::lir::X86Inst;
+use crate::arch::x86_64::lir::{MemAddr, X86Inst};
 use crate::arch::x86_64::regalloc::{asm_pinned_regs, Loc, Reg, XmmReg};
 use crate::ir::{AsmConstraint, AsmData, Instruction, PseudoId};
+use crate::units::Bits;
 
 /// Everything the two operand-building passes accumulate before any code is
 /// emitted, bundled because both passes touch nearly all of it: as separate
@@ -28,14 +29,14 @@ struct AsmOperandBuild {
     slots: Vec<crate::arch::AsmOperandSlot<Reg>>,
     /// Outputs to move out of a specific register once the template has run:
     /// (output index, specific register, actual location, size in bits).
-    output_moves: Vec<(usize, Reg, Loc, u32)>,
+    output_moves: Vec<(usize, Reg, Loc, Bits)>,
     /// Inputs to move into a specific register before the template runs:
     /// (specific register, actual location, size in bits).
-    input_moves: Vec<(Reg, Loc, u32)>,
+    input_moves: Vec<(Reg, Loc, Bits)>,
     /// Allocated registers that collided with a reserved one, and the temp
     /// standing in for them: (original, temp, location to restore, size).
-    remap_setup: Vec<(Reg, Reg, Loc, u32)>,
-    remap_restore: Vec<(Reg, Reg, Loc, u32)>,
+    remap_setup: Vec<(Reg, Reg, Loc, Bits)>,
+    remap_restore: Vec<(Reg, Reg, Loc, Bits)>,
     /// Pseudos already given a temp register, so a `"+r"` operand whose input
     /// and output share a pseudo reuses one rather than taking two.
     pseudo_to_temp: std::collections::HashMap<PseudoId, Reg>,
@@ -46,10 +47,10 @@ struct AsmOperandBuild {
     sse_scratch: Vec<XmmReg>,
     /// SSE outputs to copy back once the template has run:
     /// (scratch register, destination, operand size in bits).
-    sse_output_moves: Vec<(XmmReg, Loc, u32)>,
+    sse_output_moves: Vec<(XmmReg, Loc, Bits)>,
     /// SSE read-write (`"+x"`) operands whose current value must reach the
     /// scratch before the template runs: (scratch, source pseudo, size).
-    sse_input_moves: Vec<(XmmReg, PseudoId, u32)>,
+    sse_input_moves: Vec<(XmmReg, PseudoId, Bits)>,
     /// Pseudos already given an SSE scratch, so a tied `"+x"` input reuses its
     /// output's register rather than taking a second one.
     pseudo_to_xmm: std::collections::HashMap<PseudoId, XmmReg>,
@@ -70,7 +71,7 @@ struct AsmOperandBuild {
     x87_slots: usize,
     /// Flag outputs, read off the flags once the template has run:
     /// (condition, destination, operand size in bits).
-    flag_outputs: Vec<(FlagCondition, Loc, u32)>,
+    flag_outputs: Vec<(FlagCondition, Loc, Bits)>,
 }
 
 /// One operand on the x87 register stack.
@@ -81,7 +82,7 @@ struct X87Operand {
     pseudo: PseudoId,
     /// Operand width in bits: 32 and 64 are `float` and `double`, anything
     /// wider an x87 `long double`.
-    size: u32,
+    size: Bits,
 }
 
 /// The x87 stack slot an operand's class asks for: `f` any of it, `t` its
@@ -878,7 +879,7 @@ impl X86_64CodeGen {
         // one, or a temp standing in for a reserved one -- to where they
         // live, as though all at once: one output's home may be the register
         // another was pinned to.
-        let outs: Vec<(Reg, &Loc, u32)> = output_moves
+        let outs: Vec<(Reg, &Loc, Bits)> = output_moves
             .iter()
             .map(|(_, reg, loc, size)| (*reg, loc, *size))
             .chain(
@@ -916,7 +917,7 @@ impl X86_64CodeGen {
 
     /// Write a flag output: `set<cond>` and a zero-extension, as gcc reads
     /// one, into the operand's own register, or through %r10 into its slot.
-    fn emit_flag_output(&mut self, cond: FlagCondition, loc: &Loc, size: u32) {
+    fn emit_flag_output(&mut self, cond: FlagCondition, loc: &Loc, size: Bits) {
         let reg = Self::loc_reg(loc).unwrap_or(Reg::R10);
         for text in [
             format!("set{} {}", cond.suffix(), reg.name8()),
@@ -930,8 +931,8 @@ impl X86_64CodeGen {
     }
 
     /// Get the mov suffix and register size modifier for a given bit size
-    fn asm_mov_info(size_bits: u32) -> (&'static str, char) {
-        match size_bits {
+    fn asm_mov_info(size_bits: Bits) -> (&'static str, char) {
+        match size_bits.get() {
             0..=8 => ("movb", 'b'),
             9..=16 => ("movw", 'w'),
             17..=32 => ("movl", 'k'),
@@ -940,7 +941,7 @@ impl X86_64CodeGen {
     }
 
     /// Emit a raw mov instruction from a location to a register (for asm input setup)
-    fn emit_raw_mov_from_loc(&mut self, loc: &Loc, dest_reg: Reg, size_bits: u32) {
+    fn emit_raw_mov_from_loc(&mut self, loc: &Loc, dest_reg: Reg, size_bits: Bits) {
         let (mov, sz) = Self::asm_mov_info(size_bits);
         let dest_name = if sz == 'q' {
             self.reg_name_64(dest_reg)
@@ -1018,7 +1019,7 @@ impl X86_64CodeGen {
     }
 
     /// Emit a raw mov instruction from a register to a location (for asm output store)
-    fn emit_raw_mov_to_loc(&mut self, src_reg: Reg, loc: &Loc, size_bits: u32) {
+    fn emit_raw_mov_to_loc(&mut self, src_reg: Reg, loc: &Loc, size_bits: Bits) {
         let (mov, sz) = Self::asm_mov_info(size_bits);
         let src_name = if sz == 'q' {
             self.reg_name_64(src_reg)
@@ -1099,7 +1100,7 @@ impl X86_64CodeGen {
         loc: &Loc,
         reserved: &std::collections::HashSet<Reg>,
         used: &mut std::collections::HashSet<Reg>,
-        input_moves: &mut Vec<(Reg, Loc, u32)>,
+        input_moves: &mut Vec<(Reg, Loc, Bits)>,
         pos: Option<crate::diag::Position>,
     ) -> String {
         let target = self.base.target.clone();
@@ -1112,14 +1113,23 @@ impl X86_64CodeGen {
                 return "0".to_string();
             };
             return match loc {
-                Loc::Stack(slot) => self.stack_field(*slot, offset).format(&target),
-                Loc::IncomingArg(off) => format!("{}(%rbp)", off + offset),
+                Loc::Stack(slot) => {
+                    let addr = self.stack_field(*slot, offset.into());
+                    self.asm_frame_operand(addr, reserved, used, pos)
+                }
+                Loc::IncomingArg(off) => {
+                    let addr = MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off + i64::from(offset),
+                    };
+                    self.asm_frame_operand(addr, reserved, used, pos)
+                }
                 Loc::Global(name) => {
                     if self.is_tls_symbol(name) || self.needs_got_access(name) {
                         let temp = find_temp_reg(reserved, used, pos);
                         used.insert(temp);
                         let name = name.clone();
-                        self.global_mem(&name, offset, temp).format(&target)
+                        self.global_mem(&name, offset.into(), temp).format(&target)
                     } else if offset == 0 {
                         format!("{}(%rip)", self.format_symbol_name(name))
                     } else {
@@ -1134,10 +1144,32 @@ impl X86_64CodeGen {
             Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) => {
                 let temp = find_temp_reg(reserved, used, pos);
                 used.insert(temp);
-                input_moves.push((temp, loc.clone(), 64));
+                input_moves.push((temp, loc.clone(), Bits::new(64)));
                 format!("(%{})", self.reg_name_64(temp))
             }
             other => self.loc_to_asm_string(other),
+        }
+    }
+
+    /// The template text of a memory operand in the frame at `addr`: the
+    /// address itself while its displacement fits the instruction, and past
+    /// 32 bits a register holding it, as the global operands above take a
+    /// register for an address the template cannot spell.
+    fn asm_frame_operand(
+        &mut self,
+        addr: MemAddr,
+        reserved: &std::collections::HashSet<Reg>,
+        used: &mut std::collections::HashSet<Reg>,
+        pos: Option<crate::diag::Position>,
+    ) -> String {
+        match addr {
+            MemAddr::BaseOffset { offset, .. } if !super::legalize::fits_i32(offset) => {
+                let temp = find_temp_reg(reserved, used, pos);
+                used.insert(temp);
+                self.push_lir(X86Inst::Lea { addr, dst: temp });
+                format!("({})", temp.name64())
+            }
+            addr => addr.format(&self.base.target),
         }
     }
 
@@ -1145,7 +1177,19 @@ impl X86_64CodeGen {
     fn loc_to_asm_string(&self, loc: &Loc) -> String {
         match loc {
             Loc::Reg(r) => format!("%{}", self.reg_name_64(*r)),
-            Loc::Stack(offset) => self.stack_mem(*offset).format(&self.base.target),
+            Loc::Stack(offset) => {
+                let addr = self.stack_mem(*offset);
+                if let MemAddr::BaseOffset { offset, .. } = addr {
+                    if !super::legalize::fits_i32(offset) {
+                        crate::diag::error(
+                            self.base.func_pos,
+                            "an asm operand's stack slot lies past the displacement \
+                             an instruction can hold",
+                        );
+                    }
+                }
+                addr.format(&self.base.target)
+            }
             Loc::IncomingArg(offset) => {
                 format!("{}(%rbp)", offset)
             }
@@ -1158,7 +1202,7 @@ impl X86_64CodeGen {
 
     /// A location as the template substitutes it, for an operand of
     /// `size_bits`.
-    fn loc_to_asm_operand(&self, loc: &Loc, size_bits: u32) -> AsmOperandValue<Reg> {
+    fn loc_to_asm_operand(&self, loc: &Loc, size_bits: Bits) -> AsmOperandValue<Reg> {
         match loc {
             Loc::Reg(r) => AsmOperandValue::Reg(*r),
             Loc::Stack(offset) => {
@@ -1219,8 +1263,8 @@ impl X86_64CodeGen {
     /// it is. A `long double` is loaded from memory by `get_x87_mem_addr`,
     /// which has no arm for `Loc::Xmm` and falls back to `[rbp+0]` -- the
     /// saved frame pointer -- so anything it cannot address is refused.
-    fn x87_input_home(loc: &Loc, size: u32) -> bool {
-        size <= 64
+    fn x87_input_home(loc: &Loc, size: Bits) -> bool {
+        size <= Bits::new(64)
             || matches!(
                 loc,
                 Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) | Loc::Reg(_) | Loc::FImm(..)
@@ -1234,8 +1278,8 @@ impl X86_64CodeGen {
     /// every x87 operand of that type. A `float` or `double` is staged through
     /// the x87 scratch into a register or its slot -- where the allocator puts
     /// one, and at -O1 and above that is usually an XMM register.
-    fn x87_output_home(loc: &Loc, size: u32) -> bool {
-        if size > 64 {
+    fn x87_output_home(loc: &Loc, size: Bits) -> bool {
+        if size > Bits::new(64) {
             matches!(loc, Loc::Stack(_) | Loc::IncomingArg(_))
         } else {
             matches!(loc, Loc::Stack(_) | Loc::Xmm(_) | Loc::Reg(_))
@@ -1360,16 +1404,16 @@ mod tests {
                 format!("{:?}", cg.loc_to_gp_operand(loc))
             }),
             ("emit_raw_mov_from_loc", |cg, loc| {
-                cg.emit_raw_mov_from_loc(loc, Reg::Rax, 32);
+                cg.emit_raw_mov_from_loc(loc, Reg::Rax, Bits::new(32));
                 format!("{:?}", cg.base.lir_buffer)
             }),
             ("emit_raw_mov_to_loc", |cg, loc| {
-                cg.emit_raw_mov_to_loc(Reg::Rax, loc, 32);
+                cg.emit_raw_mov_to_loc(Reg::Rax, loc, Bits::new(32));
                 format!("{:?}", cg.base.lir_buffer)
             }),
             ("loc_to_asm_string", |cg, loc| cg.loc_to_asm_string(loc)),
             ("loc_to_asm_operand", |cg, loc| {
-                format!("{:?}", cg.loc_to_asm_operand(loc, 32))
+                format!("{:?}", cg.loc_to_asm_operand(loc, Bits::new(32)))
             }),
         ];
         for (site, emit) in sites {
@@ -1396,11 +1440,11 @@ mod tests {
             cg.loc_to_gp_operand(&g),
             GpOperand::Mem(MemAddr::RipRelative(_))
         ));
-        cg.emit_raw_mov_from_loc(&g, Reg::Rax, 32);
-        cg.emit_raw_mov_to_loc(Reg::Rax, &g, 32);
+        cg.emit_raw_mov_from_loc(&g, Reg::Rax, Bits::new(32));
+        cg.emit_raw_mov_to_loc(Reg::Rax, &g, Bits::new(32));
         assert_eq!(cg.loc_to_asm_string(&g), "g(%rip)");
         assert!(matches!(
-            cg.loc_to_asm_operand(&g, 32),
+            cg.loc_to_asm_operand(&g, Bits::new(32)),
             AsmOperandValue::Mem(m) if m == "g(%rip)"
         ));
         captured(0);

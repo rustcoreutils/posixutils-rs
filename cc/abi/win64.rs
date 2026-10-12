@@ -27,6 +27,7 @@
 
 use super::{is_float, is_integer, Abi, ArgClass, RegClass};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Bits, ByteSize};
 
 /// Register positions: RCX, RDX, R8, R9 or XMM0-XMM3.
 pub const WIN64_REG_POSITIONS: usize = 4;
@@ -49,7 +50,7 @@ impl Win64Abi {
     }
 
     /// One integer position carrying the value's own bits.
-    fn integer(size_bits: u32) -> ArgClass {
+    fn integer(size_bits: Bits) -> ArgClass {
         ArgClass::Direct {
             classes: vec![RegClass::Integer],
             size_bits,
@@ -59,8 +60,8 @@ impl Win64Abi {
     /// By reference, or through the hidden return pointer.
     fn indirect(ty: TypeId, types: &TypeTable) -> ArgClass {
         ArgClass::Indirect {
-            align: types.alignment(ty) as u32,
-            size_bytes: types.size_bytes(ty),
+            align: types.align(ty),
+            size_bytes: types.byte_size(ty),
         }
     }
 
@@ -70,8 +71,8 @@ impl Win64Abi {
     /// double` and `__float128` all meet it here, and so does a zero-sized
     /// struct, which gcc passes by reference and charges a position.
     fn by_size(ty: TypeId, types: &TypeTable) -> ArgClass {
-        match types.size_bytes(ty) {
-            1 | 2 | 4 | 8 => Self::integer(types.size_bits(ty)),
+        match types.byte_size(ty).get() {
+            1 | 2 | 4 | 8 => Self::integer(types.value_bits(ty)),
             _ => Self::indirect(ty, types),
         }
     }
@@ -100,11 +101,12 @@ impl Abi for Win64Abi {
         if let Some(wrapper) = types.vector_wrapper_carrier(vec) {
             return wrapper;
         }
-        match types.size_bytes(vec) {
+        let bytes = types.byte_size(vec);
+        match bytes.get() {
             17.. => types.vector_memory_carrier(vec),
             16 => types.int128_id,
             8 => types.ulong_id,
-            bytes => super::small_vector_bits(bytes, types),
+            _ => super::small_vector_bits(bytes, types),
         }
     }
 
@@ -115,9 +117,9 @@ impl Abi for Win64Abi {
     /// it is passed.
     fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
         match types.vector_wrapper_carrier(vec) {
-            Some(wrapper) => match types.size_bytes(vec) {
+            Some(wrapper) => match types.byte_size(vec).get() {
                 8 => types.ulong_id,
-                bytes @ ..=4 => super::small_vector_bits(bytes, types),
+                bytes @ ..=4 => super::small_vector_bits(ByteSize::new(bytes), types),
                 _ => wrapper,
             },
             None => self.vector_carrier(vec, types),
@@ -141,21 +143,20 @@ impl Abi for Win64Abi {
         if is_sse_scalar(kind, ty, types) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Sse],
-                size_bits: types.size_bits(ty),
+                size_bits: types.value_bits(ty),
             };
         }
-        let size_bits = types.size_bits(ty);
-        if is_integer(kind) && !types.is_complex(ty) && size_bits < 32 {
+        if is_integer(kind) && !types.is_complex(ty) && types.value_bits(ty) < Bits::new(32) {
             return ArgClass::Extend {
                 signed: !types.is_unsigned(ty),
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
         if matches!(
             kind,
             TypeKind::Pointer | TypeKind::Array | TypeKind::Function
         ) {
-            return Self::integer(64);
+            return Self::integer(Bits::new(64));
         }
         Self::by_size(ty, types)
     }
@@ -171,7 +172,7 @@ impl Abi for Win64Abi {
         if types.is_plain_int128(ty) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Sse],
-                size_bits: 128,
+                size_bits: Bits::new(128),
             };
         }
         // `long double` and `__float128` are floats too wide for any
@@ -211,7 +212,7 @@ mod tests {
             .map(|&(typ, offset)| StructMember {
                 name: crate::strings::StringId::default(),
                 typ,
-                offset,
+                offset: crate::units::ByteSize::from_usize(offset),
                 bit_width: None,
                 bit_offset: None,
                 access_bytes: None,
@@ -222,9 +223,9 @@ mod tests {
             tag: None,
             members,
             enum_constants: vec![],
-            size,
-            align,
-            member_align: align,
+            size: crate::units::ByteSize::from_usize(size),
+            align: crate::units::Align::of_bytes(align as u64),
+            member_align: crate::units::Align::of_bytes(align as u64),
             is_complete: true,
             transparent: false,
             reverse_order: false,
@@ -242,14 +243,14 @@ mod tests {
     fn integer(bits: u32) -> ArgClass {
         ArgClass::Direct {
             classes: vec![RegClass::Integer],
-            size_bits: bits,
+            size_bits: Bits::new(bits),
         }
     }
 
     fn sse(bits: u32) -> ArgClass {
         ArgClass::Direct {
             classes: vec![RegClass::Sse],
-            size_bits: bits,
+            size_bits: Bits::new(bits),
         }
     }
 
@@ -266,14 +267,14 @@ mod tests {
             abi.classify_param(t.char_id, &t),
             ArgClass::Extend {
                 signed: true,
-                size_bits: 8
+                size_bits: Bits::new(8)
             }
         );
         assert_eq!(
             abi.classify_param(t.ushort_id, &t),
             ArgClass::Extend {
                 signed: false,
-                size_bits: 16
+                size_bits: Bits::new(16)
             }
         );
         // gcc's choice: the integer position, two bytes of it.
@@ -304,7 +305,7 @@ mod tests {
         for n in [0, 3, 5, 6, 7, 9, 12, 16, 24, 100] {
             let s = chars(&mut t, n);
             assert!(
-                matches!(abi.classify_param(s, &t), ArgClass::Indirect { size_bytes, .. } if size_bytes == n),
+                matches!(abi.classify_param(s, &t), ArgClass::Indirect { size_bytes, .. } if size_bytes == ByteSize::from_usize(n)),
                 "{n}"
             );
             assert!(
@@ -361,7 +362,7 @@ mod tests {
         let cl = t.make_complex(t.long_id);
         assert!(matches!(
             abi.classify_param(cl, &t),
-            ArgClass::Indirect { size_bytes: 16, .. }
+            ArgClass::Indirect { size_bytes, .. } if size_bytes == ByteSize::new(16)
         ));
     }
 }

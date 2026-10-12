@@ -1991,7 +1991,7 @@ impl Parser<'_> {
         let Some((bytes, pos)) = self.pending_vector_size.take() else {
             return typ;
         };
-        let elem_size = self.types.size_bytes(typ);
+        let elem_size = self.types.byte_size(typ).get();
         // A lane is a real number: no complex type, and no `_Bool`.
         let t = &*self.types;
         let lane = (t.is_integer(typ) || t.is_float(typ))
@@ -2010,7 +2010,7 @@ impl Parser<'_> {
         // produced a four-gigabyte type, and a width near `u64::MAX` made
         // `next_power_of_two` overflow -- a panic in a debug build.
         let max = self.types.max_object_bytes();
-        if bytes > max as u64 {
+        if bytes > max.get() {
             diag::error_args(
                 pos,
                 "'vector_size' attribute argument value '{0}' exceeds {1}, the maximum object size",
@@ -2018,7 +2018,7 @@ impl Parser<'_> {
             );
             return typ;
         }
-        if bytes % elem_size as u64 != 0 {
+        if bytes % elem_size != 0 {
             diag::error(
                 pos,
                 &gettext("vector size not an integral multiple of component size"),
@@ -2027,7 +2027,7 @@ impl Parser<'_> {
         }
         // gcc refuses any other lane count at the declaration, so every
         // vector a convention has to pass is one of its widths.
-        let count = bytes / elem_size as u64;
+        let count = bytes / elem_size;
         if !count.is_power_of_two() {
             diag::error_args(
                 pos,

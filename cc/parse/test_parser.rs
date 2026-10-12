@@ -3654,7 +3654,7 @@ fn test_bitfield_struct_size() {
             assert_eq!(decl.declarators.len(), 1);
             if let Some(composite) = types.composite(decl.declarators[0].typ) {
                 // Three 1-bit fields should fit in one 4-byte int
-                assert_eq!(composite.size, 4);
+                assert_eq!(composite.size, crate::units::ByteSize::new(4));
             }
         }
         _ => panic!("Expected Declaration"),
@@ -3712,14 +3712,19 @@ fn test_empty_enum_is_an_error() {
 
 /// The declared variable's enum type, its size and alignment, and the
 /// integer type it is compatible with.
-fn enum_of_variable(src: &str) -> (usize, usize, Option<TypeId>, TypeTable) {
+fn enum_of_variable(src: &str) -> (u64, u64, Option<TypeId>, TypeTable) {
     let (tu, types, _strings, _symbols) = parse_tu(src).unwrap();
     let ExternalDecl::Declaration(ref decl) = tu.items.last().unwrap() else {
         panic!("{src}: expected a declaration");
     };
     let typ = decl.declarators[0].typ;
     let compat = types.enum_compatible_type(typ);
-    (types.size_bytes(typ), types.alignment(typ), compat, types)
+    (
+        types.byte_size(typ).get(),
+        types.align(typ).bytes(),
+        compat,
+        types,
+    )
 }
 
 /// `packed` makes an enum the smallest integer type holding its members,
@@ -4856,7 +4861,7 @@ fn test_gcc_function_identifier_parsing() {
     }
     let typ = expr.typ.unwrap();
     assert_eq!(types.kind(typ), TypeKind::Array);
-    assert_eq!(types.size_bytes(typ), 1);
+    assert_eq!(types.byte_size(typ).get(), 1);
 }
 
 #[test]
@@ -4870,7 +4875,7 @@ fn test_gcc_pretty_function_identifier_parsing() {
     }
     let typ = expr.typ.unwrap();
     assert_eq!(types.kind(typ), TypeKind::Array);
-    assert_eq!(types.size_bytes(typ), 1);
+    assert_eq!(types.byte_size(typ).get(), 1);
 }
 
 // Long double type parsing tests
@@ -7080,7 +7085,7 @@ fn test_attr_aligned_on_struct_member() {
     // The variable `x` of type `struct S` should have alignment 16
     if let ExternalDecl::Declaration(ref decl) = tu.items[1] {
         let typ = decl.declarators[0].typ;
-        assert_eq!(types.alignment(typ), 16);
+        assert_eq!(types.align(typ).bytes(), 16);
     }
 }
 
@@ -7091,7 +7096,7 @@ fn test_attr_aligned_on_struct_tag() {
     // The variable type should have alignment 32
     if let ExternalDecl::Declaration(ref decl) = tu.items[1] {
         let typ = decl.declarators[0].typ;
-        assert_eq!(types.alignment(typ), 32);
+        assert_eq!(types.align(typ).bytes(), 32);
     }
 }
 
@@ -7103,7 +7108,7 @@ fn test_attr_aligned_on_typedef() {
     // The variable's type should have alignment 16
     if let ExternalDecl::Declaration(ref decl) = tu.items[1] {
         let typ = decl.declarators[0].typ;
-        assert_eq!(types.alignment(typ), 16);
+        assert_eq!(types.align(typ).bytes(), 16);
     }
 }
 
@@ -7125,21 +7130,25 @@ fn test_aligned_typedef_as_struct_member() {
     // struct S should inherit alignment 16 from typedef member
     if let ExternalDecl::Declaration(ref decl) = tu.items[2] {
         let typ = decl.declarators[0].typ;
-        assert_eq!(types.alignment(typ), 16);
+        assert_eq!(types.align(typ).bytes(), 16);
     }
 }
 
 /// The layout of the type of the last declaration's first declarator:
 /// member offsets, size and alignment.
-fn last_struct_layout(src: &str) -> (Vec<usize>, usize, usize) {
+fn last_struct_layout(src: &str) -> (Vec<u64>, u64, u64) {
     let (tu, types, _strings, _symbols) = parse_tu(src).unwrap();
     let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
         panic!("{src}: the last item is not a declaration");
     };
     let typ = decl.declarators[0].typ;
     let composite = types.composite(typ).expect("a struct or union");
-    let offsets = composite.members.iter().map(|m| m.offset).collect();
-    (offsets, types.size_bytes(typ), types.alignment(typ))
+    let offsets = composite.members.iter().map(|m| m.offset.get()).collect();
+    (
+        offsets,
+        types.byte_size(typ).get(),
+        types.align(typ).bytes(),
+    )
 }
 
 /// `packed` on a member drops that member's alignment to 1 wherever the
@@ -7266,7 +7275,7 @@ fn test_attr_vector_size_constant_expression() {
         let ExternalDecl::Declaration(ref decl) = tu.items[item] else {
             panic!("Expected Declaration");
         };
-        assert_eq!(types.size_bytes(decl.declarators[0].typ), size);
+        assert_eq!(types.byte_size(decl.declarators[0].typ).get(), size);
     }
 }
 
@@ -7316,10 +7325,10 @@ fn test_signed_int128_decl() {
 #[test]
 fn test_int128_sizeof() {
     let (_, types, _, _) = parse_decl("__int128 x;").unwrap();
-    assert_eq!(types.size_bits(types.int128_id), 128);
-    assert_eq!(types.size_bits(types.uint128_id), 128);
-    assert_eq!(types.alignment(types.int128_id), 16);
-    assert_eq!(types.alignment(types.uint128_id), 16);
+    assert_eq!(types.value_bits(types.int128_id).get(), 128);
+    assert_eq!(types.value_bits(types.uint128_id).get(), 128);
+    assert_eq!(types.align(types.int128_id).bytes(), 16);
+    assert_eq!(types.align(types.uint128_id).bytes(), 16);
 }
 
 #[test]
@@ -7329,7 +7338,7 @@ fn test_int128_struct_member() {
     let typ = decl.declarators[0].typ;
     assert_eq!(types.kind(typ), TypeKind::Struct);
     // 32 * 16 = 512 bytes
-    assert_eq!(types.size_bytes(typ), 512);
+    assert_eq!(types.byte_size(typ).get(), 512);
 }
 
 // C11 `_Generic` type-generic selection (C17 6.5.1.1)
@@ -7633,7 +7642,7 @@ fn test_gnu_complex_spellings_agree() {
     ] {
         let (d, types, _, _) = parse_decl(decl).unwrap_or_else(|e| panic!("{decl}: {e:?}"));
         let typ = d.declarators[0].typ;
-        seen.push((decl, types.kind(typ), types.size_bits(typ)));
+        seen.push((decl, types.kind(typ), types.value_bits(typ).get()));
     }
     let (first_spelling, first_kind, first_bits) = seen[0];
     for (spelling, kind, bits) in &seen[1..] {
@@ -7659,7 +7668,7 @@ fn test_gnu_complex_in_type_name() {
             panic!("sizeof({spelling}) gave {:?}", expr.kind);
         };
         assert_eq!(
-            types.size_bits(typ),
+            types.value_bits(typ).get(),
             64,
             "{spelling} in a type name is not a complex float"
         );
@@ -7702,7 +7711,7 @@ fn test_imaginary_is_diagnosed_and_recovers_as_complex() {
     let ExprKind::SizeofType(typ, _) = expr.kind else {
         panic!("sizeof(float _Imaginary) gave {:?}", expr.kind);
     };
-    assert_eq!(types.size_bits(typ), 64);
+    assert_eq!(types.value_bits(typ).get(), 64);
 }
 
 /// Where only a declarator's name can stand, `_Imaginary` is that name, as a
@@ -7762,7 +7771,7 @@ fn test_complex_integer_type_sizes() {
             panic!("sizeof({spelling}) gave {:?}", expr.kind);
         };
         assert_eq!(
-            types.size_bits(typ),
+            types.value_bits(typ).get(),
             want_bits,
             "{spelling} is the wrong width"
         );
@@ -7795,7 +7804,7 @@ fn test_imaginary_integer_constants() {
             types.is_complex_integer(typ),
             "{src} should be a complex *integer*"
         );
-        assert_eq!(types.size_bits(typ), want_bits, "{src} width");
+        assert_eq!(types.value_bits(typ).get(), want_bits, "{src} width");
         let ExprKind::BuiltinComplex { real, imag } = &expr.kind else {
             panic!("{src} gave {:?}", expr.kind);
         };
@@ -7983,7 +7992,7 @@ fn test_imaginary_marker_placement() {
             parse_expr(src).unwrap_or_else(|e| panic!("{src} did not parse: {e:?}"));
         let typ = expr.typ.unwrap();
         assert!(types.is_complex_integer(typ), "{src} should be complex int");
-        assert_eq!(types.size_bits(typ), want_bits, "{src} width");
+        assert_eq!(types.value_bits(typ).get(), want_bits, "{src} width");
     }
     for src in [
         "2.0fi16", "2.0f1i6", "2.0f16ij", "2.0iif", "1lil", "1.0ii", "2.0Lif", "1if16", "1f16i",
@@ -7992,14 +8001,10 @@ fn test_imaginary_marker_placement() {
     }
 }
 
-/// An object no `i32` frame displacement can reach is refused where it is
-/// declared.
-///
-/// C17 sets no limit here; `TypeTable::MAX_STACK_OBJECT_BYTES` is c17's, because
-/// both backends address a local and a stacked argument by a signed 32-bit
-/// displacement. Before this check every conversion in `arch/` and `abi/` was a
-/// bare `as i32` and wrapped: `char a[3000000000];` in a function got an
-/// eight-byte slot and a `subq $32, %rsp` frame, with no diagnostic.
+/// An automatic object is refused where it is declared only past the frame
+/// bound, [`crate::types::TypeTable::MAX_FRAME_BYTES`]: `PTRDIFF_MAX` less what the prologue
+/// adds, as gcc's is. Up to it the object has a slot, however far from the
+/// frame register; the backends reach it through a register.
 ///
 /// One rule, asked from four places, because an automatic object, a prototyped
 /// parameter, a K&R parameter and a compound literal are four different
@@ -8007,8 +8012,11 @@ fn test_imaginary_marker_placement() {
 /// below them (`Function::add_local`, `Linearizer::insert_local`,
 /// `SymbolTable::declare`) all lack a `Position`, and the first two also see
 /// compiler temporaries that have no declaration to point at.
+///
+/// Every object here is past two gigabytes, which is where the bound stood
+/// while frame displacements were 32 bits wide.
 #[test]
-fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
+fn test_stack_object_past_the_frame_bound_is_rejected() {
     for src in [
         // An automatic object, in each of the scopes that can declare one.
         "int f(void){ char a[3000000000]; return a[0]; }",
@@ -8030,12 +8038,21 @@ fn test_stack_object_larger_than_a_frame_slot_is_rejected() {
         "struct S { char x[3000000000]; };\n\
          void sink(struct S *); void f(void){ sink(&(struct S){0}); }",
     ] {
-        match parse_tu(src) {
+        if let Err(e) = parse_tu(src) {
+            panic!("{src}\nshould have been accepted: {e}");
+        }
+        // The same declaration of an object of `PTRDIFF_MAX` bytes, which C
+        // can describe and no frame can hold.
+        let past = src
+            .replace("char a[3000000000]", "char a[0x7fffffffffffffff]")
+            .replace("int a[600000000]", "char a[0x7fffffffffffffff]")
+            .replace("char x[3000000000]", "char x[0x7fffffffffffffff]");
+        match parse_tu(&past) {
             Err(e) => assert!(
                 e.to_string().contains("maximum stack object size"),
-                "{src}\nwas rejected, but not for its size: {e}"
+                "{past}\nwas rejected, but not for its size: {e}"
             ),
-            Ok(_) => panic!("{src}\nshould have been rejected"),
+            Ok(_) => panic!("{past}\nshould have been rejected"),
         }
     }
 }
@@ -8423,7 +8440,7 @@ fn test_attr_mode_and_vector_size_follow_the_tag() {
     ] {
         let (decl, types, _strings, symbols) = parse_decl(src).unwrap();
         let typ = symbols.get(decl.declarators[0].symbol).typ;
-        assert_eq!(types.size_bytes(typ), size, "{src}");
+        assert_eq!(types.byte_size(typ).get(), size, "{src}");
         assert_eq!(types.is_vector(typ), vector, "{src}");
     }
 }
@@ -8820,7 +8837,7 @@ fn test_type_name_attributes() {
         let ExprKind::AlignofType(typ) = expr.kind else {
             panic!("{src}: expected AlignofType, got {:?}", expr.kind);
         };
-        assert_eq!(types.alignment(typ), want, "{src}");
+        assert_eq!(types.align(typ).bytes(), want, "{src}");
     }
 }
 
@@ -8835,7 +8852,7 @@ fn test_type_name_attributes_do_not_reach_the_declaration() {
 
     let (decl, types, _, _) = parse_decl("_Alignas(16) struct { char a; char b; } x;").unwrap();
     assert_eq!(decl.declarators[0].explicit_align, Some(16));
-    assert_eq!(types.size_bytes(decl.declarators[0].typ), 2);
+    assert_eq!(types.byte_size(decl.declarators[0].typ).get(), 2);
 }
 
 /// `aligned` on a reference to an existing tag is the declaration's, as gcc
@@ -8848,7 +8865,7 @@ fn test_aligned_on_a_tag_reference_aligns_the_declaration() {
         panic!("expected a declaration");
     };
     assert_eq!(decl.declarators[0].explicit_align, Some(32));
-    assert_eq!(types.alignment(decl.declarators[0].typ), 4);
+    assert_eq!(types.align(decl.declarators[0].typ).bytes(), 4);
 }
 
 /// The qualifiers written before a `typeof` belong to the type it names, in a
@@ -9395,8 +9412,8 @@ fn test_unary_plus_leaves_a_complex_integer_alone() {
             "`{op}` on a complex integer keeps both halves' type"
         );
         assert_eq!(
-            types.size_bits(t),
-            types.size_bits(types.short_id) * 2,
+            types.value_bits(t).get(),
+            types.value_bits(types.short_id).get() * 2,
             "`{op}` does not widen it to _Complex int either"
         );
     }

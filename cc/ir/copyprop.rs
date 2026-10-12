@@ -38,13 +38,14 @@
 use super::constfold::unambiguous_at;
 use super::{Function, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
+use crate::units::Bits;
 use std::collections::HashMap;
 
 /// What a pseudo's definition produces: its width, and whether it lives in
 /// a floating-point register.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Shape {
-    width: u32,
+    width: Bits,
     float: bool,
 }
 
@@ -106,11 +107,13 @@ fn forwarding(func: &Function, types: &TypeTable) -> HashMap<PseudoId, PseudoId>
             } else {
                 args.of(n)
             };
-            if let Some(t) = typ {
+            // An aggregate too large to have a value width arrives by
+            // address and is no copy's source.
+            if let Some((t, width)) = typ.and_then(|t| Some((t, types.checked_value_bits(t)?))) {
                 shape.insert(
                     p.id,
                     Shape {
-                        width: types.size_bits(t),
+                        width,
                         float: types.is_float(t),
                     },
                 );
@@ -154,7 +157,7 @@ fn forwarding(func: &Function, types: &TypeTable) -> HashMap<PseudoId, PseudoId>
             float: types.is_float(typ),
         };
         let same = match func.get_pseudo(src).map(|p| &p.kind) {
-            Some(PseudoKind::Val(v)) => !copy.float && unambiguous_at(*v, copy.width.max(1)),
+            Some(PseudoKind::Val(v)) => !copy.float && unambiguous_at(*v, copy.width.get().max(1)),
             Some(PseudoKind::Reg(_) | PseudoKind::Arg(_) | PseudoKind::Phi(_)) | None => {
                 shape.get(&src) == Some(&copy)
             }
@@ -196,9 +199,23 @@ mod tests {
         let int = types.int_id;
         let mut f = func_of(
             vec![
-                Instruction::binop(Opcode::Add, PseudoId(1), PseudoId(0), PseudoId(0), int, 32),
-                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(1), int, 32),
-                Instruction::binop(Opcode::Add, PseudoId(3), PseudoId(2), PseudoId(2), int, 32),
+                Instruction::binop(
+                    Opcode::Add,
+                    PseudoId(1),
+                    PseudoId(0),
+                    PseudoId(0),
+                    int,
+                    Bits::new(32),
+                ),
+                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(1), int, Bits::new(32)),
+                Instruction::binop(
+                    Opcode::Add,
+                    PseudoId(3),
+                    PseudoId(2),
+                    PseudoId(2),
+                    int,
+                    Bits::new(32),
+                ),
             ],
             (0..4).map(|i| Pseudo::reg(PseudoId(i), i)).collect(),
         );
@@ -215,14 +232,21 @@ mod tests {
         let (int, ch) = (types.int_id, types.char_id);
         let mut f = func_of(
             vec![
-                Instruction::binop(Opcode::Add, PseudoId(1), PseudoId(0), PseudoId(0), int, 32),
-                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(1), ch, 8),
+                Instruction::binop(
+                    Opcode::Add,
+                    PseudoId(1),
+                    PseudoId(0),
+                    PseudoId(0),
+                    int,
+                    Bits::new(32),
+                ),
+                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(1), ch, Bits::new(8)),
                 Instruction::compare(
                     Opcode::SetEq,
                     PseudoId(3),
                     (PseudoId(2), PseudoId(0)),
-                    (ch, 8),
-                    (int, 32),
+                    (ch, Bits::new(8)),
+                    (int, Bits::new(32)),
                 ),
             ],
             (0..4).map(|i| Pseudo::reg(PseudoId(i), i)).collect(),
@@ -238,9 +262,23 @@ mod tests {
         let (long, dbl) = (types.long_id, types.double_id);
         let mut f = func_of(
             vec![
-                Instruction::binop(Opcode::Add, PseudoId(1), PseudoId(0), PseudoId(0), long, 64),
-                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(1), dbl, 64),
-                Instruction::binop(Opcode::FAdd, PseudoId(3), PseudoId(2), PseudoId(2), dbl, 64),
+                Instruction::binop(
+                    Opcode::Add,
+                    PseudoId(1),
+                    PseudoId(0),
+                    PseudoId(0),
+                    long,
+                    Bits::new(64),
+                ),
+                Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(1), dbl, Bits::new(64)),
+                Instruction::binop(
+                    Opcode::FAdd,
+                    PseudoId(3),
+                    PseudoId(2),
+                    PseudoId(2),
+                    dbl,
+                    Bits::new(64),
+                ),
             ],
             (0..4).map(|i| Pseudo::reg(PseudoId(i), i)).collect(),
         );
@@ -257,8 +295,8 @@ mod tests {
         for (v, forwarded) in [(0, true), (100, true), (200, false)] {
             let mut f = func_of(
                 vec![
-                    Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(1), ch, 8),
-                    Instruction::store(PseudoId(2), PseudoId(0), 0, ch, 8),
+                    Instruction::unop(Opcode::Copy, PseudoId(2), PseudoId(1), ch, Bits::new(8)),
+                    Instruction::store(PseudoId(2), PseudoId(0), 0, ch, Bits::new(8)),
                 ],
                 vec![
                     Pseudo::reg(PseudoId(0), 0),

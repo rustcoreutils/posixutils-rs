@@ -662,7 +662,10 @@ mod tests {
         let calls = calls(&insns);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].extra().func_name.as_deref(), Some("fwrite"));
-        assert_eq!((calls[0].typ, calls[0].size), (Some(fx.types.ulong_id), 64));
+        assert_eq!(
+            (calls[0].typ, calls[0].size.get()),
+            (Some(fx.types.ulong_id), 64)
+        );
         assert_eq!(calls[0].src[3], fp.0);
     }
 }

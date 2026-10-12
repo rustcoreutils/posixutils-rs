@@ -64,6 +64,7 @@ use super::memloc::{
 };
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
@@ -115,7 +116,7 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
         let Some(target) = target else { continue };
         let (op, src_size, src_typ) = match avail.narrow {
             Some(n) => (Opcode::Trunc, n.from, n.typ),
-            None => (Opcode::Copy, 0, None),
+            None => (Opcode::Copy, Bits::ZERO, None),
         };
         func.blocks[b].insns[i] = Instruction {
             op,
@@ -233,7 +234,7 @@ impl<'a> MemOracle<'a> {
         loc: &MemLoc,
         little_endian: bool,
     ) -> Option<u8> {
-        if loc.size != 8 {
+        if loc.size != Bits::new(8) {
             return None;
         }
         let paths = self.paths()?;
@@ -362,9 +363,9 @@ impl<'a> MemOracle<'a> {
                 let byte = insn
                     .src
                     .get(1)
-                    .and_then(|&v| self.am.const_operand(v, s.size))
+                    .and_then(|&v| self.am.const_operand(v, s.size.get()))
                     .filter(|_| plain)
-                    .and_then(|c| byte_of(c, s.size / 8, at, little_endian));
+                    .and_then(|c| byte_of(c, s.size.whole_bytes()?, at, little_endian));
                 Some(byte.map_or(Candidate::Clobber, Candidate::Value))
             }
             // A load writes nothing, and what it read is a pseudo, not a
@@ -456,7 +457,7 @@ struct Available {
 /// The width and type a forwarded value has to be truncated *from*.
 #[derive(Clone, Copy)]
 struct Narrowing {
-    from: u32,
+    from: Bits,
     typ: Option<TypeId>,
 }
 
@@ -483,13 +484,13 @@ fn narrowing(
     types: &TypeTable,
     am: &AddrMap,
     v: PseudoId,
-    size: u32,
+    size: Bits,
 ) -> Option<Available> {
     // A constant is width-polymorphic: it materializes at whatever width its
     // reader asks for, so it needs no narrowing -- but only where it means
     // one thing at that width, which is exactly what `unambiguous_at` asks.
     if let Some(c) = func.const_val(v) {
-        return unambiguous_at(c, size.max(1)).then_some(Available {
+        return unambiguous_at(c, size.get().max(1)).then_some(Available {
             value: v,
             narrow: None,
         });
@@ -504,7 +505,7 @@ fn narrowing(
 /// Which byte of the store `s` the one-byte access `b` is, counting from
 /// the store's lowest address; `None` unless `s` writes all of `b`.
 fn byte_index(s: &MemLoc, b: &MemLoc) -> Option<u32> {
-    if s.base != b.base || !s.size.is_multiple_of(8) {
+    if s.base != b.base || s.size.whole_bytes().is_none() {
         return None;
     }
     let (start, end) = s.byte_extent()?;
@@ -618,7 +619,7 @@ mod tests {
             let loc = MemLoc {
                 base: MemBase::Local(PseudoId(0)),
                 offset: Some(at),
-                size: 8,
+                size: Bits::new(8),
                 typ: Some(self.types.uchar_id),
             };
             let site = (0, self.f.blocks[0].insns.len() - 1);
@@ -636,7 +637,7 @@ mod tests {
     }
 
     fn store8(v: PseudoId, at: i64, types: &TypeTable) -> Instruction {
-        Instruction::store(v, PseudoId(10), at, types.char_id, 8)
+        Instruction::store(v, PseudoId(10), at, types.char_id, Bits::new(8))
     }
 
     fn entry() -> Instruction {
@@ -657,7 +658,7 @@ mod tests {
     }
 
     fn call(name: &str, types: &TypeTable) -> Instruction {
-        Instruction::call(None, name, vec![], vec![], types.void_id, 0)
+        Instruction::call(None, name, vec![], vec![], types.void_id, Bits::new(0))
     }
 
     /// A store and a load of the same bytes in one block, with a call to an
@@ -673,9 +674,9 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 c,
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -697,9 +698,9 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 fence,
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -711,7 +712,7 @@ mod tests {
     fn block_op(op: Opcode, dest: PseudoId, src: PseudoId, types: &TypeTable) -> Instruction {
         Instruction::new(op)
             .with_src3(dest, src, PseudoId(5))
-            .with_type_and_size(types.void_ptr_id, 64)
+            .with_type_and_size(types.void_ptr_id, Bits::new(64))
     }
 
     /// A local whose address went only to a `memcpy` -- as its source -- has
@@ -730,10 +731,10 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, Bits::new(32)),
                 copy,
                 c,
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -760,9 +761,9 @@ mod tests {
                 vec![
                     entry(),
                     Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                    Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                    Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, Bits::new(32)),
                     write,
-                    Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                    Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
                 ],
                 vec![],
             );
@@ -783,9 +784,9 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(5), PseudoId(1), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(1), 0, i32t, Bits::new(32)),
                 c,
-                Instruction::load(PseudoId(20), PseudoId(1), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(1), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -806,7 +807,7 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 br(1),
             ],
             vec![1],
@@ -814,9 +815,9 @@ mod tests {
         b.block(
             1,
             vec![
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
                 // The clobber, after the load, on the latch.
-                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, Bits::new(32)),
                 br(1),
             ],
             vec![1],
@@ -845,9 +846,9 @@ mod tests {
         b.block(
             1,
             vec![
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
-                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, Bits::new(32)),
                 br(1),
             ],
             vec![1],
@@ -876,7 +877,7 @@ mod tests {
         b.block(
             1,
             vec![
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 br(2),
             ],
             vec![2],
@@ -884,8 +885,8 @@ mod tests {
         b.block(
             2,
             vec![
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
-                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, Bits::new(32)),
                 br(1),
             ],
             vec![1],
@@ -915,7 +916,7 @@ mod tests {
         b.block(
             1,
             vec![
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 br(2),
             ],
             vec![2],
@@ -923,7 +924,7 @@ mod tests {
         b.block(
             2,
             vec![
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
                 br(3),
             ],
             vec![3],
@@ -931,7 +932,7 @@ mod tests {
         b.block(
             3,
             vec![
-                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, Bits::new(32)),
                 cbr(PseudoId(7), 2, 4),
             ],
             vec![2, 4],
@@ -953,7 +954,7 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 cbr(PseudoId(7), 1, 2),
             ],
             vec![1, 2],
@@ -961,7 +962,7 @@ mod tests {
         b.block(
             1,
             vec![
-                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, Bits::new(32)),
                 br(3),
             ],
             vec![3],
@@ -969,7 +970,13 @@ mod tests {
         b.block(2, vec![br(3)], vec![3]);
         b.block(
             3,
-            vec![Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32)],
+            vec![Instruction::load(
+                PseudoId(20),
+                PseudoId(10),
+                0,
+                i32t,
+                Bits::new(32),
+            )],
             vec![],
         );
         assert!(!b.run());
@@ -988,7 +995,7 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 cbr(PseudoId(7), 1, 2),
             ],
             vec![1, 2],
@@ -997,7 +1004,13 @@ mod tests {
         b.block(2, vec![br(3)], vec![3]);
         b.block(
             3,
-            vec![Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32)],
+            vec![Instruction::load(
+                PseudoId(20),
+                PseudoId(10),
+                0,
+                i32t,
+                Bits::new(32),
+            )],
             vec![],
         );
         assert!(b.run());
@@ -1023,9 +1036,9 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 asm,
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1049,8 +1062,8 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1069,8 +1082,8 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
-                Instruction::load(PseudoId(21), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(21), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1099,11 +1112,11 @@ mod tests {
                     PseudoId(5),
                     PseudoId(6),
                     i32t,
-                    32,
+                    Bits::new(32),
                 ),
                 // ... and only its low 8 bits are stored.
-                Instruction::store(PseudoId(30), PseudoId(10), 0, i8t, 8),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i8t, 8),
+                Instruction::store(PseudoId(30), PseudoId(10), 0, i8t, Bits::new(8)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i8t, Bits::new(8)),
             ],
             vec![],
         );
@@ -1115,8 +1128,8 @@ mod tests {
             "the store narrowed; the value did not"
         );
         assert_eq!(fwd.src, vec![PseudoId(30)]);
-        assert_eq!(fwd.src_size, 32);
-        assert_eq!(fwd.size, 8);
+        assert_eq!(fwd.src_size, Bits::new(32));
+        assert_eq!(fwd.size, Bits::new(8));
     }
 
     /// A parameter's slot is filled from an `Arg`, which no instruction
@@ -1132,9 +1145,9 @@ mod tests {
             0,
             vec![
                 entry(),
-                Instruction::store(PseudoId(30), PseudoId(0), 0, i32t, 32),
+                Instruction::store(PseudoId(30), PseudoId(0), 0, i32t, Bits::new(32)),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1157,15 +1170,15 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(30), PseudoId(10), 0, i8t, 8),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i8t, 8),
+                Instruction::store(PseudoId(30), PseudoId(10), 0, i8t, Bits::new(8)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i8t, Bits::new(8)),
             ],
             vec![],
         );
         assert!(b.run());
         let fwd = &b.f.blocks[0].insns[3];
         assert_eq!(fwd.op, Opcode::Trunc);
-        assert_eq!(fwd.src_size, 32);
+        assert_eq!(fwd.src_size, Bits::new(32));
     }
 
     /// A complex or aggregate argument may be an address or the caller's
@@ -1183,9 +1196,9 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
-                Instruction::store(PseudoId(30), PseudoId(10), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(30), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1208,10 +1221,10 @@ mod tests {
                     PseudoId(5),
                     PseudoId(6),
                     i32t,
-                    32,
+                    Bits::new(32),
                 ),
-                Instruction::store(PseudoId(30), PseudoId(10), 0, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(30), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1232,8 +1245,8 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(8), PseudoId(10), 0, i8t, 8),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i8t, 8),
+                Instruction::store(PseudoId(8), PseudoId(10), 0, i8t, Bits::new(8)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i8t, Bits::new(8)),
             ],
             vec![],
         );
@@ -1252,9 +1265,9 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
-                Instruction::store(PseudoId(6), PseudoId(10), 4, i32t, 32),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
+                Instruction::store(PseudoId(6), PseudoId(10), 4, i32t, Bits::new(32)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1277,10 +1290,10 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 // one byte inside the four just written
-                Instruction::store(PseudoId(6), PseudoId(10), 1, i8t, 8),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(6), PseudoId(10), 1, i8t, Bits::new(8)),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1299,9 +1312,9 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 Instruction::new(Opcode::Setjmp),
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1349,7 +1362,7 @@ mod tests {
             vec![],
             vec![],
             i32t,
-            64,
+            Bits::new(64),
         );
         c.target = Some(PseudoId(0));
         b.block(
@@ -1357,9 +1370,9 @@ mod tests {
             vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, Bits::new(32)),
                 c,
-                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, Bits::new(32)),
             ],
             vec![],
         );
@@ -1401,7 +1414,7 @@ mod tests {
             entry(),
             Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
             store8(x, 0, &b.types),
-            Instruction::store(PseudoId(30), PseudoId(10), 1, i8t, 8),
+            Instruction::store(PseudoId(30), PseudoId(10), 1, i8t, Bits::new(8)),
             ret(),
         ];
         b.block(0, insns, vec![]);
@@ -1420,7 +1433,7 @@ mod tests {
         let insns = vec![
             entry(),
             Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
-            Instruction::store(w, PseudoId(10), 0, i32t, 32),
+            Instruction::store(w, PseudoId(10), 0, i32t, Bits::new(32)),
             store8(z, 1, &b.types),
             ret(),
         ];
@@ -1461,7 +1474,7 @@ mod tests {
                 b.types.float_id
             };
             let (x, y) = (b.konst(0x61), b.konst(0x62));
-            let size = b.types.size_bits(typ);
+            let size = b.types.value_bits(typ);
             let insns = vec![
                 entry(),
                 Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
@@ -1484,7 +1497,14 @@ mod tests {
             let i32t = b.types.int_id;
             let x = b.konst(0x61);
             let ptr = b.types.char_ptr_id;
-            let mut c = Instruction::call(None, "strlen", vec![PseudoId(10)], vec![ptr], i32t, 32);
+            let mut c = Instruction::call(
+                None,
+                "strlen",
+                vec![PseudoId(10)],
+                vec![ptr],
+                i32t,
+                Bits::new(32),
+            );
             c.extra_mut().known = known;
             let insns = vec![
                 entry(),
@@ -1525,8 +1545,8 @@ mod tests {
                 vec![
                     entry(),
                     Instruction::sym_addr(PseudoId(10), PseudoId(0), q),
-                    Instruction::store(PseudoId(30), PseudoId(10), 0, q, 128),
-                    Instruction::load(PseudoId(20), PseudoId(10), 0, typ, bits),
+                    Instruction::store(PseudoId(30), PseudoId(10), 0, q, Bits::new(128)),
+                    Instruction::load(PseudoId(20), PseudoId(10), 0, typ, Bits::new(bits)),
                 ],
                 vec![],
             );

@@ -180,7 +180,7 @@ impl Parser<'_> {
                 .composite
                 .as_ref()
                 .is_some_and(|c| !c.members.is_empty() && c.members.iter().all(|m| m.align.packed)),
-            "vector_size" => self.types.is_vector(typ) && wanted(self.types.size_bytes(typ) as u64),
+            "vector_size" => self.types.is_vector(typ) && wanted(self.types.byte_size(typ).get()),
             "transparent_union" => t.composite.as_ref().is_some_and(|c| c.transparent),
             "scalar_storage_order" => t.composite.as_ref().is_some_and(|c| c.reverse_order),
             "noreturn" => {

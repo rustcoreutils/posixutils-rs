@@ -1515,6 +1515,8 @@ impl<'a> Parser<'a> {
                 None => Some(self.array_size_from_elements(&elements, elem_type)),
             }
             .unwrap_or_else(|| self.array_size_from_elements(&elements, elem_type));
+            // A designator can size the array past what an object may be.
+            self.check_array_bound(elem_type, array_size, paren_pos)?;
             self.types.intern(Type::array(elem_type, array_size))
         } else {
             typ
@@ -2093,9 +2095,9 @@ impl<'a> Parser<'a> {
         // report from.
         let unit_bits = match encoding {
             None => literal::CHAR_UNIT_BITS,
-            Some(TokenType::WideString) => self.types.size_bits(self.types.wchar_id),
-            Some(TokenType::Utf16String) => self.types.size_bits(self.types.char16_id),
-            Some(_) => self.types.size_bits(self.types.char32_id),
+            Some(TokenType::WideString) => self.types.value_bits(self.types.wchar_id).get(),
+            Some(TokenType::Utf16String) => self.types.value_bits(self.types.char16_id).get(),
+            Some(_) => self.types.value_bits(self.types.char32_id).get(),
         };
         let mut elements: Vec<literal::Escaped> = Vec::new();
         for (pos, piece) in pieces {
@@ -2273,8 +2275,8 @@ impl<'a> Parser<'a> {
             BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
             _ => None,
         }
-        .filter(|bits| *bits < self.types.size_bits(result_type))
-        .filter(|_| !self.types.is_vector(result_type));
+        .filter(|_| !self.types.is_vector(result_type))
+        .filter(|bits| *bits < self.types.value_bits(result_type).get());
 
         let pos = left.pos;
         let mut e = Self::typed_expr(
@@ -2476,7 +2478,12 @@ impl<'a> Parser<'a> {
         let Some(count) = self.eval_const_expr(right) else {
             return;
         };
-        let width = self.types.size_bits(promoted_left) as i128;
+        // An operand with no value width is an aggregate, already refused as
+        // a shift operand; there is no count to check against it.
+        let Some(width) = self.types.checked_value_bits(promoted_left) else {
+            return;
+        };
+        let width = i128::from(width.get());
         let side = if op == BinaryOp::Shl { "left" } else { "right" };
 
         // gcc spells these as two groups, and so does `-Wno-`.
@@ -2514,8 +2521,9 @@ impl<'a> Parser<'a> {
             return Some(bits);
         }
         let (bits, typ) = self.bitfield_of(e)?;
-        (bits < self.types.size_bits(typ) && bits > self.types.size_bits(self.types.int_id))
-            .then_some(bits)
+        (bits < self.types.value_bits(typ).get()
+            && bits > self.types.value_bits(self.types.int_id).get())
+        .then_some(bits)
     }
 
     /// The width an operation's result is confined to.
@@ -2629,7 +2637,7 @@ impl<'a> Parser<'a> {
     /// operator on it would be.
     fn unary_bitfield_width(&mut self, operand: &Expr, result_typ: TypeId) -> Option<u32> {
         self.effective_bitfield_width(operand)
-            .filter(|bits| *bits < self.types.size_bits(result_typ))
+            .filter(|bits| *bits < self.types.value_bits(result_typ).get())
     }
 
     /// Wrap a bit-field operand in the conversion C17 6.3.1.1p2 calls for.
@@ -2657,7 +2665,7 @@ impl<'a> Parser<'a> {
         let Some((bit_width, field_typ)) = self.bitfield_of(e) else {
             return declared;
         };
-        let int_bits = self.types.size_bits(self.types.int_id);
+        let int_bits = self.types.value_bits(self.types.int_id).get();
         if bit_width < int_bits {
             self.types.int_id
         } else if bit_width == int_bits && self.types.is_unsigned(field_typ) {
@@ -3073,7 +3081,7 @@ impl<'a> Parser<'a> {
                             TokenType::Utf16Char => self.types.char16_id,
                             _ => self.types.char32_id,
                         };
-                        let bits = self.types.size_bits(typ);
+                        let bits = self.types.value_bits(typ).get();
                         // The consumed token's position, as above.
                         let (code_point, _) = literal::char_literal_value(s, Some(bits), token_pos);
                         let value = literal::prefixed_char_value(

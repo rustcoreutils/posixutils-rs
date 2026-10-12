@@ -746,6 +746,7 @@ mod tests {
     use crate::ir::{BasicBlock, BasicBlockId, Function, Instruction, Opcode, Pseudo, PseudoId};
     use crate::target::Target;
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     /// A function of `blocks`, each `(id, instructions, successors)`, with
     /// `%1` a condition and `%2` a value to hand along edges.
@@ -799,9 +800,9 @@ mod tests {
     #[test]
     fn simplify_cfg_merges_a_chain_and_turns_its_phis_into_copies() {
         let int = TypeTable::new(&Target::host()).int_id;
-        let mut src = Instruction::phi_source(PseudoId(10), PseudoId(2), int, 32);
+        let mut src = Instruction::phi_source(PseudoId(10), PseudoId(2), int, Bits::new(32));
         src.phi_list = vec![(BasicBlockId(1), PseudoId(11))];
-        let mut phi = Instruction::phi(PseudoId(11), int, 32);
+        let mut phi = Instruction::phi(PseudoId(11), int, Bits::new(32));
         phi.phi_list = vec![(BasicBlockId(0), PseudoId(10))];
         let mut f = function(vec![
             (0, vec![entry(), src, br(1)], vec![1]),
@@ -863,11 +864,11 @@ mod tests {
     #[test]
     fn simplify_cfg_does_not_thread_into_a_phi() {
         let int = TypeTable::new(&Target::host()).int_id;
-        let mut s1 = Instruction::phi_source(PseudoId(10), PseudoId(2), int, 32);
+        let mut s1 = Instruction::phi_source(PseudoId(10), PseudoId(2), int, Bits::new(32));
         s1.phi_list = vec![(BasicBlockId(3), PseudoId(12))];
-        let mut s2 = Instruction::phi_source(PseudoId(11), PseudoId(1), int, 32);
+        let mut s2 = Instruction::phi_source(PseudoId(11), PseudoId(1), int, Bits::new(32));
         s2.phi_list = vec![(BasicBlockId(3), PseudoId(12))];
-        let mut phi = Instruction::phi(PseudoId(12), int, 32);
+        let mut phi = Instruction::phi(PseudoId(12), int, Bits::new(32));
         phi.phi_list = vec![
             (BasicBlockId(1), PseudoId(10)),
             (BasicBlockId(2), PseudoId(11)),
@@ -913,11 +914,11 @@ mod tests {
     #[test]
     fn move_successors_hands_the_edges_to_the_tail() {
         let int = TypeTable::new(&Target::host()).int_id;
-        let mut src0 = Instruction::phi_source(PseudoId(10), PseudoId(2), int, 32);
+        let mut src0 = Instruction::phi_source(PseudoId(10), PseudoId(2), int, Bits::new(32));
         src0.phi_list = vec![(BasicBlockId(2), PseudoId(11))];
-        let mut src1 = Instruction::phi_source(PseudoId(12), PseudoId(2), int, 32);
+        let mut src1 = Instruction::phi_source(PseudoId(12), PseudoId(2), int, Bits::new(32));
         src1.phi_list = vec![(BasicBlockId(2), PseudoId(11))];
-        let mut phi = Instruction::phi(PseudoId(11), int, 32);
+        let mut phi = Instruction::phi(PseudoId(11), int, Bits::new(32));
         phi.phi_list = vec![
             (BasicBlockId(0), PseudoId(10)),
             (BasicBlockId(1), PseudoId(12)),
@@ -964,7 +965,7 @@ mod tests {
     fn unwind_calls_to_ends_each_throwing_call_s_block() {
         let types = TypeTable::new(&Target::host());
         let call = |name: &str, may_throw: bool| {
-            let mut c = Instruction::call(None, name, vec![], vec![], types.void_id, 0);
+            let mut c = Instruction::call(None, name, vec![], vec![], types.void_id, Bits::new(0));
             c.extra_mut().may_throw = may_throw;
             c
         };
@@ -975,7 +976,7 @@ mod tests {
                 Instruction::new(Opcode::LandingPad)
                     .with_target(PseudoId(exception))
                     .with_type(types.void_ptr_id)
-                    .with_size(64),
+                    .with_size(Bits::new(64)),
                 br(4),
             ]
         };
@@ -1031,13 +1032,13 @@ mod tests {
     #[test]
     fn retarget_moves_control_targets_and_not_phi_predecessors() {
         let types = TypeTable::new(&Target::host());
-        let mut phi = Instruction::phi(PseudoId(9), types.int_id, 32);
+        let mut phi = Instruction::phi(PseudoId(9), types.int_id, Bits::new(32));
         phi.phi_list = vec![(BasicBlockId(1), PseudoId(2))];
         let mut sw = Instruction::switch_insn(
             PseudoId(1),
             vec![(0, 0, BasicBlockId(1)), (1, 1, BasicBlockId(2))],
             Some(BasicBlockId(1)),
-            32,
+            Bits::new(32),
         );
         let map = std::collections::HashMap::from([(BasicBlockId(1), BasicBlockId(5))]);
         phi.retarget(&map);

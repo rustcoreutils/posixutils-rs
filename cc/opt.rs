@@ -825,6 +825,7 @@ fn run_passes(func: &mut Function, ctx: &PassCtx, max_iterations: usize, c: &mut
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, Instruction, Opcode, Pseudo, PseudoId};
+    use crate::units::Bits;
 
     /// `entry: cbr 1, .L1, .L2`, each arm returning: one round folds the
     /// branch and deletes the dead arm, and a second finds nothing left.
@@ -962,7 +963,7 @@ int f(void) { if (__builtin_setjmp(buf)) return 7; g(); return 0; }
                 vec![],
                 vec![],
                 types.int_id,
-                32,
+                Bits::new(32),
             )],
         );
         assert!(forwarder_addresses(&called, &static_forwarders(&called)).is_empty());

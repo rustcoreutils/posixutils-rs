@@ -19,6 +19,8 @@ use crate::parse::ast::{
 use crate::symbol::Symbol;
 use crate::target::Target;
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable};
+use crate::units::Bits;
+use crate::units::ByteSize;
 
 // Compound assignment lvalue tests
 
@@ -283,7 +285,7 @@ fn test_atomic_compound_assign_uses_fetch_add() {
         .find(|i| i.op == Opcode::AtomicFetchAdd)
         .unwrap();
     assert_eq!(insn.extra().memory_order, MemoryOrder::SeqCst);
-    assert_eq!(insn.size, 32);
+    assert_eq!(insn.size, Bits::new(32));
     assert_eq!(insn.src.len(), 3, "expected [addr, value, order]");
 }
 
@@ -387,16 +389,16 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         members: vec![StructMember {
             name: a_name,
             typ: int_id,
-            offset: 0,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
             align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
-        size: 4,
-        align: 4,
-        member_align: 4,
+        size: ByteSize::new(4),
+        align: crate::units::Align::of_bytes(4),
+        member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
         transparent: false,
         reverse_order: false,
@@ -462,7 +464,8 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         .find(|i| i.op == Opcode::AtomicStore)
         .expect("no AtomicStore");
     assert_eq!(
-        store.size, 32,
+        store.size,
+        Bits::new(32),
         "the access must be the aggregate's own width, not widened"
     );
     let typ = store.typ.expect("AtomicStore carries no type");
@@ -472,8 +475,8 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         ctx.types.kind(typ)
     );
     assert_eq!(
-        ctx.types.size_bits(typ),
-        32,
+        ctx.types.value_bits(typ),
+        Bits::new(32),
         "the surrogate must be the same width as the aggregate"
     );
 }
@@ -661,7 +664,8 @@ fn test_atomic_compound_divide_computes_at_the_common_type() {
 
     let div = first_op(&module, Opcode::DivS);
     assert_eq!(
-        div.size, 32,
+        div.size,
+        Bits::new(32),
         "the divide happens at the common type's width, not the object's"
     );
     assert_eq!(
@@ -682,7 +686,11 @@ fn test_atomic_compound_shift_promotes_its_left_operand() {
     let (_ctx, module) = atomic_typed_module(AssignOp::ShrAssign, |t| t.uchar_id, 1);
 
     let shift = first_op(&module, Opcode::Asr);
-    assert_eq!(shift.size, 32, "the left operand is promoted to int first");
+    assert_eq!(
+        shift.size,
+        Bits::new(32),
+        "the left operand is promoted to int first"
+    );
     assert_eq!(
         count_op(&module, Opcode::Lsr),
         0,
@@ -708,7 +716,7 @@ fn test_atomic_narrow_add_keeps_its_native_fetch_op() {
     );
     assert_eq!(
         first_op(&module, Opcode::AtomicFetchAdd).size,
-        8,
+        Bits::new(8),
         "the atomic operates at the object's own width"
     );
 }

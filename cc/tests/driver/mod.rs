@@ -24,6 +24,7 @@ mod kernel_flags;
 mod link_options;
 mod linker_input;
 mod prefix_map;
+mod stack_usage;
 mod subprogram_options;
 mod warn_options;
 mod werror;

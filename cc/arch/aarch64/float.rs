@@ -16,6 +16,7 @@ use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
 use crate::float::{IntegerRounding, IntegralRounding};
 use crate::ir::{FloatCmp, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::Bits;
 
 impl Aarch64CodeGen {
     /// Get FP size from type on aarch64.
@@ -27,7 +28,7 @@ impl Aarch64CodeGen {
     pub(super) fn fp_size_from_type(
         &self,
         typ: Option<TypeId>,
-        size: u32,
+        size: Bits,
         types: &TypeTable,
     ) -> FpSize {
         typ.map(|t| match types.kind(t) {
@@ -35,21 +36,21 @@ impl Aarch64CodeGen {
             TypeKind::Float => FpSize::Single,
             TypeKind::Double => FpSize::Double,
             TypeKind::LongDouble => {
-                if types.size_bits(t) > 64 {
+                if types.value_bits(t) > Bits::new(64) {
                     FpSize::Quad
                 } else {
                     FpSize::Double
                 }
             }
             TypeKind::Float128 => FpSize::Quad,
-            _ => FpSize::from_bits(size.max(32), &self.base.target),
+            _ => FpSize::from_bits(size.max(Bits::new(32)), &self.base.target),
         })
-        .unwrap_or_else(|| FpSize::from_bits(size.max(32), &self.base.target))
+        .unwrap_or_else(|| FpSize::from_bits(size.max(Bits::new(32)), &self.base.target))
     }
 
     /// Get size in bits from type, with fallback to provided size.
-    fn size_from_type(typ: Option<TypeId>, size: u32, types: &TypeTable) -> u32 {
-        typ.map(|t| types.size_bits(t)).unwrap_or(size).max(32)
+    fn size_from_type(typ: Option<TypeId>, size: Bits, types: &TypeTable) -> Bits {
+        typ.map_or(size, |t| types.value_bits(t)).max(Bits::new(32))
     }
     /// Emit a floating-point load instruction
     pub(super) fn emit_fp_load(&mut self, insn: &Instruction, types: &TypeTable) {
@@ -154,7 +155,7 @@ impl Aarch64CodeGen {
                 }
             }
             _ => {
-                self.emit_move(addr, Reg::X16, 64);
+                self.emit_move(addr, Reg::X16, Bits::new(64));
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
                     addr: MemAddr::BaseOffset {
@@ -181,7 +182,7 @@ impl Aarch64CodeGen {
     /// when it is not zero, is inserted into lane 1.
     pub(super) fn emit_fp_bits(&mut self, lo: u64, hi: u64, fp_size: FpSize, dst: VReg) {
         let (scratch0, scratch1, _) = Reg::scratch_regs();
-        self.emit_mov_imm(scratch0, lo as i64, 64);
+        self.emit_mov_imm(scratch0, lo as i64, Bits::new(64));
         if fp_size != FpSize::Quad {
             self.push_lir(Aarch64Inst::FmovFromGp {
                 size: fp_size,
@@ -196,7 +197,7 @@ impl Aarch64CodeGen {
             dst,
         });
         if hi != 0 {
-            self.emit_mov_imm(scratch1, hi as i64, 64);
+            self.emit_mov_imm(scratch1, hi as i64, Bits::new(64));
             self.push_lir(Aarch64Inst::InsGpToVecD {
                 lane: 1,
                 src: scratch1,
@@ -211,7 +212,7 @@ impl Aarch64CodeGen {
         src: PseudoId,
         dst: VReg,
         typ: Option<TypeId>,
-        size: u32,
+        size: Bits,
         types: &TypeTable,
     ) {
         let loc = self.get_location(src);
@@ -239,7 +240,7 @@ impl Aarch64CodeGen {
             Loc::FImm(f, imm_size) => {
                 // The constant's own width, unless the value is headed for a
                 // binary128 register, which takes it at that precision.
-                let const_size = match (fp_size, imm_size) {
+                let const_size = match (fp_size, imm_size.get()) {
                     (FpSize::Quad, _) => FpSize::Quad,
                     (_, 16) => FpSize::Half,
                     (_, 32) => FpSize::Single,
@@ -306,7 +307,7 @@ impl Aarch64CodeGen {
         src: VReg,
         dst: &Loc,
         typ: Option<TypeId>,
-        size: u32,
+        size: Bits,
         types: &TypeTable,
     ) {
         let fp_size = self.fp_size_from_type(typ, size, types);
@@ -572,7 +573,7 @@ impl Aarch64CodeGen {
         let width = self.emit_fp_sign_half_to_gp(fp_size, VReg::V17, scratch0);
         self.emit_gp_shift(false, width, scratch0, width.bits() - 1);
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(scratch0, &dst_loc, u32::BITS);
+        self.emit_move_to_loc(scratch0, &dst_loc, Bits::new(32));
     }
 
     /// Emit `CopySign`: the first operand with the sign bit of the second,
@@ -727,7 +728,7 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Cset { cond, dst: dst_reg });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(32));
         }
     }
 
@@ -1005,7 +1006,7 @@ impl Aarch64CodeGen {
             }
             _ => {
                 let (scratch0, _, _) = Reg::scratch_regs();
-                self.emit_move(addr, scratch0, 64);
+                self.emit_move(addr, scratch0, Bits::new(64));
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_size,
                     src: src_vreg,
@@ -1023,9 +1024,9 @@ impl Aarch64CodeGen {
 /// `hi` is zero for everything narrower than binary128.
 pub(super) fn fp_const_bits(f: crate::float::FloatVal, size: FpSize) -> (u64, u64) {
     match size {
-        FpSize::Half => (f.to_bits_at_width(16) as u64, 0),
-        FpSize::Single => (f.to_bits_at_width(32) as u64, 0),
+        FpSize::Half => (f.to_bits_at_width(Bits::new(16)) as u64, 0),
+        FpSize::Single => (f.to_bits_at_width(Bits::new(32)) as u64, 0),
         FpSize::Quad => f.to_f128_bits(),
-        FpSize::Double | FpSize::Extended => (f.to_bits_at_width(64) as u64, 0),
+        FpSize::Double | FpSize::Extended => (f.to_bits_at_width(Bits::new(64)) as u64, 0),
     }
 }

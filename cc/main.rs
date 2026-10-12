@@ -553,6 +553,15 @@ struct Args {
     #[arg(long = "fno-common", overrides_with = "fcommon", help = gettext("Make a tentative definition an ordinary definition (default)"))]
     fno_common: bool,
 
+    /// `-fstack-usage`: write each function's stack use to a `.su` file,
+    /// as gcc does; see [`stack_usage_file`].
+    #[arg(long = "fstack-usage", help = gettext("Write each function's stack use to a .su file"))]
+    fstack_usage: bool,
+
+    /// Undo `-fstack-usage`: the default.
+    #[arg(long = "fno-stack-usage", overrides_with = "fstack_usage", help = gettext("Write no .su file (default)"))]
+    fno_stack_usage: bool,
+
     /// `-fno-plt`: call a function that may be defined elsewhere through
     /// its GOT entry.
     #[arg(long = "fno-plt", help = gettext("Call external functions through the GOT, not the PLT"))]
@@ -607,9 +616,9 @@ struct Args {
           allow_hyphen_values = true, hide = true)]
     unsupported_options: Vec<String>,
 
-    /// `-fstack-clash-protection`, last of it and `-fno-` winning (rewritten
-    /// by `preprocess_args_from`): c17 probes no stack, and warns for each
-    /// function whose stack gcc would probe.
+    /// `-fstack-clash-protection`, last of it and `-fno-` winning, or
+    /// `-fstack-check`, its alias (rewritten by `preprocess_args_from`):
+    /// probe the stack wherever it could jump the guard page.
     #[arg(long = "c17-stack-clash", hide = true)]
     stack_clash: bool,
 
@@ -786,10 +795,47 @@ fn note_unconverged(report: &opt::OptReport) {
     }
 }
 
-/// The driver's dumps and `--stats`, at the pipeline's points of interest.
+/// The driver's dumps, `--stats` and `-fstack-usage`, at the pipeline's
+/// points of interest.
 struct DriverObserver<'a> {
     args: &'a Args,
     path: &'a str,
+}
+
+/// Where `-fstack-usage` writes the records of the source operand
+/// `source`, named as gcc 13 names it. Compiling only, it is the object or
+/// assembly `-o` names with its suffix replaced by `.su`, or the source's
+/// basename with `.su` in the current directory. Linking, it is
+/// `<output>-<source basename>.su` beside the output, the output being `a`
+/// when it is `a.out` or not named, and losing a `.exe` suffix. An output
+/// to standard output or `/dev/null` names nothing. Standard input's
+/// basename is `-`.
+fn stack_usage_file(args: &Args, source: &str) -> std::path::PathBuf {
+    let stem = if source == "-" {
+        "-".into()
+    } else {
+        Path::new(source)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+    };
+    let output = args
+        .output
+        .as_deref()
+        .filter(|out| !["-", "/dev/null"].contains(out));
+    if args.compile_only || args.asm_only {
+        return match output {
+            Some(out) => Path::new(out).with_extension("su"),
+            None => format!("{stem}.su").into(),
+        };
+    }
+    let output = Path::new(output.unwrap_or("a.out"));
+    let name = output.file_name().unwrap_or_default().to_string_lossy();
+    let base = match name.as_ref() {
+        "a.out" => "a",
+        name => name.strip_suffix(".exe").unwrap_or(name),
+    };
+    output.with_file_name(format!("{base}-{stem}.su"))
 }
 
 impl pipeline::Observer for DriverObserver<'_> {
@@ -848,6 +894,24 @@ impl pipeline::Observer for DriverObserver<'_> {
             "post-lower" => args.dump_ir.is_none(),
             _ => true,
         }
+    }
+
+    fn generated(
+        &mut self,
+        stack_usage: &[posixutils_cc::arch::stack_usage::StackUsage],
+    ) -> io::Result<()> {
+        if !self.args.fstack_usage {
+            return Ok(());
+        }
+        let file = stack_usage_file(self.args, self.path);
+        let text: String = stack_usage
+            .iter()
+            .map(|usage| usage.record() + "\n")
+            .collect();
+        std::fs::write(&file, text).map_err(|e| {
+            let file = file.display();
+            io::Error::new(e.kind(), format!("cannot write '{file}': {e}"))
+        })
     }
 }
 
@@ -1957,11 +2021,13 @@ const GCC_ONE_DASH_LONG: &[&str] = &[
     "-fno-plt",
     "-fno-rounding-math",
     "-fno-semantic-interposition",
+    "-fno-stack-usage",
     "-fno-trapping-math",
     "-fpermissive",
     "-fplt",
     "-frounding-math",
     "-fsemantic-interposition",
+    "-fstack-usage",
     "-fsyntax-only",
     "-ftrapping-math",
     "-fverbose-asm",
@@ -2085,6 +2151,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
     let mut unwind = Vec::new();
     // `-fstack-clash-protection`, last one wins.
     let mut stack_clash = false;
+    // `-fstack-check`, c17's alias of it, last of its own forms winning;
+    // see `f_options::stack_check`.
+    let mut stack_check = false;
     // `-fstack-protector`, its levels and `-fno-stack-protector`: last wins.
     let mut stack_protector = None;
     // `--param ssp-buffer-size=`, last wins.
@@ -2336,6 +2405,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             i += 1;
         } else if arg == "-fstack-clash-protection" || arg == "-fno-stack-clash-protection" {
             stack_clash = arg == "-fstack-clash-protection";
+            i += 1;
+        } else if let Some(on) = arg.strip_prefix("-f").and_then(f_options::stack_check) {
+            stack_check = on;
             i += 1;
         } else if let Some(level) = arg
             .strip_prefix("-f")
@@ -2592,7 +2664,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Result<Vec<String>, String> {
             .into_iter()
             .map(|(_, arg)| format!("--c17-unsupported={arg}")),
     );
-    if stack_clash {
+    if stack_clash || stack_check {
         trailer.push("--c17-stack-clash".to_string());
     }
     if omit_frame_pointer {
@@ -4693,6 +4765,13 @@ mod tests {
             "-fno-unsigned-char",
             "-fstack-clash-protection",
             "-fno-stack-clash-protection",
+            "-fstack-check",
+            "-fstack-check=specific",
+            "-fstack-check=generic",
+            "-fstack-check=no",
+            "-fno-stack-check",
+            "-fstack-usage",
+            "-fno-stack-usage",
             "-ftls-model=initial-exec",
             "-ftrapping-math",
             "-fno-trapping-math",
@@ -4713,6 +4792,14 @@ mod tests {
         assert!(run_preprocess(&["-fstack-clash-protection"]).contains(&"--c17-stack-clash".into()));
         assert!(
             !run_preprocess(&["-fstack-clash-protection", "-fno-stack-clash-protection"])
+                .contains(&"--c17-stack-clash".into())
+        );
+        // `-fstack-check` is its alias, withdrawn by its own `-fno-`.
+        assert!(run_preprocess(&["-fstack-check"]).contains(&"--c17-stack-clash".into()));
+        assert!(!run_preprocess(&["-fstack-check", "-fstack-check=no"])
+            .contains(&"--c17-stack-clash".into()));
+        assert!(
+            run_preprocess(&["-fstack-check", "-fno-stack-clash-protection"])
                 .contains(&"--c17-stack-clash".into())
         );
     }

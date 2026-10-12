@@ -68,11 +68,11 @@ long realigned(void)
 /// Indexing scales by the element's **byte size**, at every size the compiler
 /// accepts.
 ///
-/// `size_bits` answers a *value* width in a `u32` and saturates for an
+/// A type's width in bits was answered in a `u32` that saturated for an
 /// aggregate past `u32::MAX` bits. While the object-size bound was that same
 /// number the saturation was unreachable -- the parser refused any type that
 /// could reach it. Raising the bound made it reachable, and every site still
-/// deriving a byte count as `size_bits / 8` began answering 536870911 for any
+/// deriving a byte count as that width over eight began answering 536870911 for any
 /// larger type: `&a[1][0] - &a[0][0]` on a `char[3][600000000]`, the stride of
 /// an array of a 600 MB struct, and `p + 1` on a pointer to one. `sizeof` was
 /// right throughout, so the sizes agreed with gcc while the addresses did not.
@@ -116,7 +116,7 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 /// accepts.
 ///
 /// The companion to `codegen_pointer_scaling_past_the_old_object_bound`, and
-/// the same root cause: `size_bits` saturates at `u32::MAX` bits, and raising
+/// the same root cause: a type's bit width saturated at `u32::MAX` bits, and raising
 /// the object-size bound made the saturation reachable. The sites that survived
 /// that commit's audit were the ones that launder the bit count through a local
 /// variable -- two of them spell it `let target_size_bytes = target_size / 8;`,
@@ -124,7 +124,9 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 /// (`struct_return_size`), or through `ArgClass::Indirect`'s payload.
 ///
 /// Every shape below copied 536870911 bytes of a 600000000-byte object, on both
-/// targets, at every optimization level. `a = b` is the one that matters most:
+/// targets, at every optimization level -- a member initialized from a struct
+/// value as millions of unrolled moves, gigabytes of assembly for one
+/// function. `a = b` is the one that matters most:
 /// it is the plainest aggregate copy in the language.
 ///
 /// Asserted on x86-64 alone, and the source is shaped to stay cheap. Both are
@@ -158,6 +160,8 @@ void initialize(void) { struct Big loc = src; sink(&loc); }
 void by_value_param(struct Big p) { sink(&p); }
 struct Big returns_it(void) { return src; }
 unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
+struct W { int x; struct Big b; };
+void member(struct W *d) { struct W w = { 1, src }; *d = w; }
 "#;
 
     let asm = asm_for_with("aggregate_copy_length", X86_64_LINUX, SRC, &["-O2"]);
@@ -167,6 +171,7 @@ unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
         "by_value_param",
         "returns_it",
         "extent",
+        "member",
     ] {
         let body = body_of(&asm, func);
         assert!(

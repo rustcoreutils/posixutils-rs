@@ -15,6 +15,7 @@ use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst};
 use crate::arch::x86_64::regalloc::{Loc, Reg};
 use crate::ir::{Instruction, MemoryOrder, PseudoId};
 use crate::types::TypeTable;
+use crate::units::Bits;
 
 /// Helper enum for atomic bitwise operations
 #[derive(Clone, Copy)]
@@ -55,7 +56,7 @@ impl X86_64CodeGen {
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let size = insn.size.max(Bits::new(32));
         let op_size = OperandSize::from_bits(mem_size);
 
         // XCHG is a store with a full barrier; anything weaker is a plain
@@ -89,7 +90,7 @@ impl X86_64CodeGen {
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let size = insn.size.max(Bits::new(32));
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
@@ -116,7 +117,7 @@ impl X86_64CodeGen {
         // %rax`. Move it to where the allocator expects instead.
         let dst_loc = self.get_location(target);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size);
         }
     }
 
@@ -129,7 +130,7 @@ impl X86_64CodeGen {
         // As above: the compare-and-exchange must be exactly as wide as the
         // object, or it reads and writes adjacent bytes.
         let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let size = insn.size.max(Bits::new(32));
 
         let op_size = OperandSize::from_bits(mem_size);
 
@@ -195,7 +196,7 @@ impl X86_64CodeGen {
         // %rax`. Move it to where the allocator expects instead.
         let dst_loc = self.get_location(target);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size);
         }
     }
 
@@ -207,7 +208,7 @@ impl X86_64CodeGen {
     /// negative rather than as a large positive.
     fn extend_narrow_atomic_result(&mut self, insn: &Instruction, types: &TypeTable) {
         let mem_size = insn.size;
-        if mem_size >= 32 {
+        if mem_size >= Bits::new(32) {
             return;
         }
 
@@ -239,7 +240,7 @@ impl X86_64CodeGen {
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let size = insn.size.max(Bits::new(32));
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
@@ -266,7 +267,7 @@ impl X86_64CodeGen {
         // %rax`. Move it to where the allocator expects instead.
         let dst_loc = self.get_location(target);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size);
         }
     }
 
@@ -279,7 +280,7 @@ impl X86_64CodeGen {
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let size = insn.size.max(Bits::new(32));
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
@@ -310,7 +311,7 @@ impl X86_64CodeGen {
         // %rax`. Move it to where the allocator expects instead.
         let dst_loc = self.get_location(target);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size);
         }
     }
 
@@ -336,7 +337,7 @@ impl X86_64CodeGen {
         // it to 32 bits made an 8- or 16-bit atomic read-modify-write touch
         // its neighbours. Register moves still use at least 32 bits.
         let mem_size = insn.size;
-        let size = insn.size.max(32);
+        let size = insn.size.max(Bits::new(32));
         let op_size = OperandSize::from_bits(mem_size);
 
         let value_loc = self.get_location(value);
@@ -416,7 +417,7 @@ impl X86_64CodeGen {
         // %rax`. Move it to where the allocator expects instead.
         let dst_loc = self.get_location(target);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::Rax) {
-            self.emit_move_to_loc(Reg::Rax, &dst_loc, size.max(32));
+            self.emit_move_to_loc(Reg::Rax, &dst_loc, size);
         }
     }
 
@@ -437,7 +438,7 @@ impl X86_64CodeGen {
     }
 
     /// Helper to move a value to a register
-    fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: u32) {
+    fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: Bits) {
         let op_size = OperandSize::from_bits(size);
         match loc {
             Loc::Reg(src) => {
@@ -511,7 +512,7 @@ impl X86_64CodeGen {
     /// An allocated base register is copied to `scratch`: the atomic
     /// sequences overwrite RAX, RCX, R8 and R9 after resolving the address,
     /// and any of them can be where the allocator put the pointer.
-    fn atomic_mem_operand(&mut self, addr: PseudoId, disp: i32, scratch: Reg) -> MemAddr {
+    fn atomic_mem_operand(&mut self, addr: PseudoId, disp: i64, scratch: Reg) -> MemAddr {
         match self.scalar_mem_operand(addr, disp, scratch) {
             MemAddr::BaseOffset { base, offset } if Reg::allocatable().contains(&base) => {
                 self.push_lir(X86Inst::Mov {

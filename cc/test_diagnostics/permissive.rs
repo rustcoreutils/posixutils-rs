@@ -366,91 +366,111 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
     }
 }
 
-/// An object the *backend* cannot give a stack slot is diagnosed, not
-/// miscompiled.
+/// An automatic object past two gigabytes is compiled, on both targets, as
+/// gcc compiles it: C sets no bound of its own here, and the frame's is
+/// `PTRDIFF_MAX` less what the prologue adds
+/// (`TypeTable::MAX_FRAME_BYTES`). Every displacement past 32 bits is
+/// reached through a register.
 ///
-/// This bound is not C's. Both backends address a local and a stacked argument
-/// by a signed 32-bit displacement from the frame register, so `i32::MAX`, less
-/// the headroom the prologue adds, is the ceiling -- a billion times under the
-/// `max_object_bytes` the type table allows, which is why the two are separate
-/// bounds and separate messages. gcc compiles the same local with
-/// `movabsq`-based 64-bit frame addressing; c17 says so instead, and refuses the
-/// argument case exactly as gcc does ("sorry, unimplemented: passing too large
-/// argument on stack").
+/// Until frame displacements were widened this bound was `i32::MAX` and
+/// every case below was refused; before that there was no diagnostic at all,
+/// and `char a[3000000000];` in a function emitted `subq $32, %rsp` with the
+/// array at `leaq -40(%rbp)` on x86-64, because the byte count cast `as i32`
+/// wrapped to -1294967296 and the `size.max(8)` that follows gave it eight
+/// bytes. So each is also checked for the `movabsq` that reaches it.
 ///
-/// There was no diagnostic at all before. `char a[3000000000];` in a function
-/// emitted `subq $32, %rsp` with the array at `leaq -40(%rbp)` on x86-64 and a
-/// 48-byte frame with it at `x29 + #40` on aarch64, because
-/// `types.size_bytes(t) as i32` wrapped to -1294967296 and the `size.max(8)`
-/// that follows gave it eight bytes.
-///
-/// The last three cases are not declarations, so `check_stack_object_size` is
-/// asked of them somewhere other than the declarator loop: a compound literal
-/// has automatic storage duration by C17 6.5.2.5p5, a K&R parameter's real type
-/// arrives after the identifier list, and an aggregate *return* type is not an
-/// object at all -- that one reaches `abi::slot_bytes` in the backend, which is
-/// why its message differs.
+/// The cases that are not declarations are asked somewhere other than the
+/// declarator loop: a compound literal has automatic storage duration by
+/// C17 6.5.2.5p5, a K&R parameter's real type arrives after the identifier
+/// list, and an aggregate *return* type is not an object at all -- that one
+/// reaches `abi::slot_bytes` in the backend, which is why its refusal past
+/// the bound reads differently.
 #[test]
-fn diagnostics_stack_object_larger_than_a_frame_slot_is_rejected() {
-    for (name, src, expected) in [
+fn diagnostics_stack_object_past_two_gigabytes_is_accepted() {
+    let cases = [
         (
             "automatic_array",
             "extern void sink(char *);\n\
              int f(void){ char a[3000000000]; a[0]=1; sink(a); return a[0]; }\n",
-            "maximum stack object size",
         ),
         (
             "automatic_array_of_int",
             "int f(void){ int a[600000000]; a[0]=1; return a[0]; }\n",
-            "maximum stack object size",
         ),
         (
             "automatic_struct",
             "struct S { char x[3000000000]; };\n\
              int f(void){ struct S s; s.x[0]=1; return s.x[0]; }\n",
-            "maximum stack object size",
         ),
         (
             "automatic_register",
             "int f(void){ register char a[3000000000]; return a[0]; }\n",
-            "maximum stack object size",
         ),
         (
             "automatic_nested_block",
             "int f(int c){ if (c) { char a[3000000000]; return a[0]; } return 0; }\n",
-            "maximum stack object size",
-        ),
-        (
-            "parameter_prototype",
-            "struct S { char x[3000000000]; };\nint f(struct S s);\n",
-            "maximum stack object size",
-        ),
-        (
-            "parameter_unnamed",
-            "struct S { char x[3000000000]; };\nvoid f(struct S);\n",
-            "maximum stack object size",
         ),
         (
             "parameter_definition",
             "struct S { char x[3000000000]; };\n\
              int f(struct S s){ return s.x[0]; }\n",
-            "maximum stack object size",
         ),
         (
             "compound_literal",
             "struct S { char x[3000000000]; };\nvoid sink(struct S *);\n\
              void f(void){ sink(&(struct S){0}); }\n",
-            "maximum stack object size",
         ),
         (
             "parameter_knr",
             "struct S { char x[3000000000]; };\n\
              int f(a) struct S a; { return a.x[0]; }\n",
-            "maximum stack object size",
         ),
         (
             "aggregate_return_temporary",
             "struct S { char x[3000000000]; };\nextern struct S g(void);\n\
+             int f(void){ return g().x[0]; }\n",
+        ),
+    ];
+    for (name, src) in cases {
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let run = compile(name, src, &[&format!("--target={target}")]);
+            assert!(run.success, "{name} on {target}:\n{}", run.stderr);
+            let asm = run.asm.unwrap_or_default();
+            let far = if target.starts_with("x86_64") {
+                "movabsq $"
+            } else {
+                "movk x15, "
+            };
+            assert!(asm.contains(far), "{name} on {target}: no {far}\n{asm}");
+        }
+    }
+    // Declared, and not defined: no frame at all.
+    compile_expect_ok(
+        "parameter_prototype",
+        "struct S { char x[3000000000]; };\nint f(struct S s);\nvoid g(struct S);\n",
+    );
+}
+
+/// What no frame can hold is still refused, where it is declared when it is
+/// declared: an object of `PTRDIFF_MAX` bytes, which C can describe, and an
+/// aggregate return temporary of that size, which only the backend sees.
+#[test]
+fn diagnostics_stack_object_past_the_frame_bound_is_rejected() {
+    for (name, src, expected) in [
+        (
+            "automatic_array",
+            "extern void sink(char *);\n\
+             void f(void){ char a[0x7fffffffffffffff]; sink(a); }\n",
+            "maximum stack object size",
+        ),
+        (
+            "parameter_prototype",
+            "struct S { char x[0x7fffffffffffffff]; };\nint f(struct S s);\n",
+            "maximum stack object size",
+        ),
+        (
+            "aggregate_return_temporary",
+            "struct S { char x[0x7fffffffffffffff]; };\nextern struct S g(void);\n\
              int f(void){ return g().x[0]; }\n",
             "a stack frame slot can address",
         ),
@@ -575,13 +595,13 @@ fn diagnostics_every_declared_vector_is_passed() {
     );
 }
 
-/// Frames at the edge of the ceiling, on both targets: diagnosed, never
-/// wrapped.
+/// Frames at the edge of the old 32-bit ceiling, on both targets: compiled
+/// whole, and frames past `PTRDIFF_MAX` refused, never wrapped.
 ///
-/// Each of these was accepted before and came out wrong, because the ceiling
-/// was `i32::MAX` and the arithmetic after it -- a slot's alignment rounding,
-/// the prologue's saved registers and variadic save area, the final frame
-/// rounding -- ran past it in `i32`:
+/// Each of the first five was accepted once and came out wrong, because the
+/// ceiling was `i32::MAX` and the arithmetic after it -- a slot's alignment
+/// rounding, the prologue's saved registers and variadic save area, the final
+/// frame rounding -- ran past it in `i32`:
 ///
 /// - `_Alignas(16) char a[2147483640]`: the slot size was rounded up to its
 ///   alignment before the frame check, wrapped, and the array got zero bytes
@@ -593,9 +613,13 @@ fn diagnostics_every_declared_vector_is_passed() {
 ///   ended -- the compiler pushed instructions until it ran out of memory.
 /// - two by-value arguments of 1.5 GB each: the outgoing area's sum wrapped,
 ///   and x86-64 unrolled the copy into seven gigabytes of compiler memory.
+///
+/// Then they were refused; frame quantities are `i64` now, so they compile.
+/// The last two pass the `i64` bound itself: one object, rounded to its
+/// alignment, and two objects whose sum overflows `i64`.
 #[test]
-fn diagnostics_frame_at_the_ceiling_is_refused_not_wrapped() {
-    let cases = [
+fn diagnostics_frame_at_the_old_ceiling_compiles_and_past_ptrdiff_max_is_refused() {
+    let compiles = [
         (
             "aligned_local",
             "extern void sink(void *);\n\
@@ -623,14 +647,29 @@ fn diagnostics_frame_at_the_ceiling_is_refused_not_wrapped() {
              void f(struct big *p){ take(*p, *p); }\n",
         ),
     ];
-    for (name, src) in cases {
-        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-            let run = compile(name, src, &[&format!("--target={target}")]);
+    let refused = [
+        (
+            "aligned_past",
+            "extern void sink(void *);\n\
+             void f(void){ _Alignas(64) char a[0x7fffffffffffefc0]; sink(a); }\n",
+        ),
+        (
+            "sum_past",
+            "extern void sink(void *);\n\
+             void f(void){ char a[1L << 62], b[1L << 62]; sink(a); sink(b); }\n",
+        ),
+    ];
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let flag = format!("--target={target}");
+        for (name, src) in compiles {
+            let run = compile(name, src, &[&flag]);
+            assert!(run.success, "{name} on {target}:\n{}", run.stderr);
+        }
+        for (name, src) in refused {
+            let run = compile(name, src, &[&flag]);
             assert!(!run.success, "{name} on {target} compiled:\n{}", run.stderr);
             assert!(
-                run.stderr.contains("stack object size")
-                    || run.stderr.contains("stack frame")
-                    || run.stderr.contains("stacked arguments"),
+                run.stderr.contains("stack frame"),
                 "{name} on {target}: expected a frame diagnostic, got:\n{}",
                 run.stderr
             );

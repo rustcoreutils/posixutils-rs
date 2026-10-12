@@ -15,6 +15,7 @@
 
 use crate::target::{Arch, Os, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Align, Bits, ByteSize};
 use std::fmt::{self, Write};
 
 // Operand Size
@@ -33,9 +34,15 @@ pub enum OperandSize {
 }
 
 impl OperandSize {
-    /// Create from bit count
-    pub fn from_bits(bits: u32) -> Self {
-        match bits {
+    /// The narrowest general-register width that holds a value of `width`.
+    ///
+    /// Clamped at both ends, deliberately: no width answers B8, and anything
+    /// past 64 bits answers B64. A value wider than a register -- an
+    /// `__int128`, or an aggregate -- is moved a register at a time, or
+    /// through its address, and what its callers ask this for is the
+    /// register that does it.
+    pub fn from_bits(width: Bits) -> Self {
+        match width.get() {
             0..=8 => OperandSize::B8,
             9..=16 => OperandSize::B16,
             17..=32 => OperandSize::B32,
@@ -43,7 +50,13 @@ impl OperandSize {
         }
     }
 
-    /// Get bit count
+    /// The register width, as a value width.
+    pub fn width(&self) -> Bits {
+        Bits::new(self.bits())
+    }
+
+    /// The register width as a raw bit count: what a register name or a
+    /// shift count is spelled in.
     pub fn bits(&self) -> u32 {
         match self {
             OperandSize::B8 => 8,
@@ -93,8 +106,11 @@ impl fmt::Display for OperandSize {
 ///
 /// Zero for an eightbyte past the end, which a class vector longer than the
 /// object cannot produce but a caller need not prove.
-pub fn eightbyte_bytes(total: i64, at: i64) -> i64 {
-    (total - at).clamp(0, 8)
+pub fn eightbyte_bytes(total: ByteSize, at: ByteSize) -> ByteSize {
+    let eight = ByteSize::new(8);
+    total
+        .checked_sub(at)
+        .map_or(ByteSize::ZERO, |rest| rest.min(eight))
 }
 
 // Floating-Point Size
@@ -123,14 +139,18 @@ pub enum FpSize {
 }
 
 impl FpSize {
-    /// Create from bit count, for a given target.
+    /// The floating-point format of a value of `width`, for a given target.
     ///
     /// The target is required because 128 bits is ambiguous on its own: it is
     /// x87 extended on x86-64 and IEEE binary128 on aarch64. Asking without
     /// saying which machine is how quad-precision loads ended up on the x87
     /// path.
-    pub fn from_bits(bits: u32, target: &Target) -> Self {
-        match bits {
+    ///
+    /// Clamped like [`OperandSize::from_bits`]: every width past 64 bits is
+    /// the target's wide format -- a complex value's whole width included,
+    /// whose callers move it a part at a time.
+    pub fn from_bits(width: Bits, target: &Target) -> Self {
+        match width.get() {
             0..=16 => FpSize::Half,
             17..=32 => FpSize::Single,
             33..=64 => FpSize::Double,
@@ -149,8 +169,8 @@ impl FpSize {
     /// architecture: a single SSE register holding sixteen bytes is SSE+SSEUP,
     /// and x87's `Extended`, which `from_bits` picks on x86-64, is MEMORY
     /// class and never travels in a register at all.
-    pub fn for_sse_aggregate(size_bits: u32) -> Self {
-        match size_bits {
+    pub fn for_sse_aggregate(width: Bits) -> Self {
+        match width.get() {
             0..=16 => FpSize::Half,
             17..=32 => FpSize::Single,
             33..=64 => FpSize::Double,
@@ -169,8 +189,8 @@ impl FpSize {
     ///
     /// Rounding up instead is what wrote four bytes past the twelve-byte
     /// `struct { float x, y, z; }` whose second eightbyte holds only its `z`.
-    pub fn exact_sse_store(bytes: i64) -> Option<FpSize> {
-        match bytes {
+    pub fn exact_sse_store(bytes: ByteSize) -> Option<FpSize> {
+        match bytes.get() {
             2 => Some(FpSize::Half),
             4 => Some(FpSize::Single),
             8 => Some(FpSize::Double),
@@ -200,15 +220,20 @@ impl FpSize {
     /// Preferred method when both type and size information are available.
     pub fn from_type_or_bits(
         typ: Option<TypeId>,
-        size: u32,
+        size: Bits,
         types: &TypeTable,
         target: &Target,
     ) -> Self {
         typ.map(|t| Self::from_type_kind(types.kind(t)))
-            .unwrap_or_else(|| Self::from_bits(size.max(32), target))
+            .unwrap_or_else(|| Self::from_bits(size.max(Bits::new(32)), target))
     }
 
-    /// Width in bits of a value of this format.
+    /// The width of a value of this format.
+    pub fn width(&self) -> Bits {
+        Bits::new(self.bits())
+    }
+
+    /// Width in bits of a value of this format, as a raw bit count.
     ///
     /// `Extended` reports 80 — the significant width of x87's format, not the
     /// 16 bytes it is stored in — because callers use this to choose between
@@ -525,7 +550,7 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
         // Two binary128 halves are 32 bytes, over the two-eightbyte limit that
         // makes a value register-passable at all.
         TypeKind::Float128 => 0,
-        _ if types.size_bits(complex_typ) <= 64 => 1,
+        _ if types.value_bits(complex_typ) <= Bits::new(64) => 1,
         _ => 2,
     }
 }
@@ -543,11 +568,11 @@ pub fn complex_sse_regs(types: &TypeTable, complex_typ: TypeId) -> usize {
 ///
 /// Only the x86-64 backend calls this, which is why it may ask System V
 /// directly.
-pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<usize> {
+pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<ByteSize> {
     if crate::abi::param_is_memory_class(typ, types)
         || (types.is_complex_float(typ) && complex_sse_regs(types, typ) == 0)
     {
-        return Some(types.size_bytes(typ));
+        return Some(types.byte_size(typ));
     }
     None
 }
@@ -559,7 +584,7 @@ pub fn memory_class_bytes(types: &TypeTable, typ: TypeId) -> Option<usize> {
 /// - x86-64: 80-bit extended precision, padded to 16 bytes per element
 /// - AArch64/Linux: 128-bit IEEE quad precision, 16 bytes per element
 /// - AArch64/macOS: 64-bit (same as double), 8 bytes per element
-pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) -> (FpSize, i32) {
+pub fn complex_fp_info(types: &TypeTable, target: &Target, complex_typ: TypeId) -> (FpSize, i64) {
     let base = types.complex_base(complex_typ);
     match types.kind(base) {
         TypeKind::Float16 => (FpSize::Half, 2),
@@ -983,7 +1008,7 @@ pub enum Directive {
     /// `__DATA,__thread_bss` for a thread-local's initial image.
     ThreadZerofill {
         sym: Symbol,
-        size: u64,
+        size: ByteSize,
         align_log2: u32,
     },
 
@@ -1028,14 +1053,18 @@ pub enum Directive {
     Type { sym: Symbol, kind: SymbolType },
 
     /// .size symbol, size (ELF only)
-    Size { sym: Symbol, size: u64 },
+    Size { sym: Symbol, size: ByteSize },
 
     /// Allocate file-scope, internal-linkage BSS storage for a single symbol.
     /// Emitted as `.local sym` + `.comm sym, size, align` on ELF (which routes
     /// the symbol to `.bss` with local visibility) and as
     /// `.zerofill __DATA,__bss,sym,size,log2(align)` on Mach-O. The alignment
-    /// is expressed in bytes; the emitter converts to log2 on Mach-O.
-    BssLocal { sym: Symbol, size: u64, align: u32 },
+    /// is written in bytes on ELF and as its log2 on Mach-O.
+    BssLocal {
+        sym: Symbol,
+        size: ByteSize,
+        align: Align,
+    },
 
     /// An exported object with no initialized bytes, as a *definition*.
     ///
@@ -1044,12 +1073,20 @@ pub enum Directive {
     /// silently where C17 6.9p5 allows one and gcc reports
     /// `multiple definition`. gcc has defaulted to `-fno-common` since 10,
     /// and emits no common symbols at all.
-    BssGlobal { sym: Symbol, size: u64, align: u32 },
+    BssGlobal {
+        sym: Symbol,
+        size: ByteSize,
+        align: Align,
+    },
 
     /// `.comm sym,size,align`: a common symbol, `-fcommon`'s tentative
     /// definition, which the linker merges with every other definition of
     /// the name. ELF only; the alignment is in bytes.
-    Comm { sym: Symbol, size: u64, align: u32 },
+    Comm {
+        sym: Symbol,
+        size: ByteSize,
+        align: Align,
+    },
 
     // ========================================================================
     // Alignment
@@ -1066,7 +1103,7 @@ pub enum Directive {
     // Data Emission
     // ========================================================================
     /// .zero N - emit N zero bytes
-    Zero(usize),
+    Zero(ByteSize),
 
     /// .byte value - emit 8-bit value
     Byte(i64),
@@ -1120,13 +1157,13 @@ pub enum Directive {
     SizeToHere { sym: Symbol },
 
     /// .cfi_def_cfa register, offset - set CFA to register + offset
-    CfiDefCfa { reg: String, offset: i32 },
+    CfiDefCfa { reg: String, offset: i64 },
 
     /// .cfi_def_cfa_offset offset - set CFA offset from current register
-    CfiDefCfaOffset(i32),
+    CfiDefCfaOffset(i64),
 
     /// .cfi_offset register, offset - register saved at CFA+offset
-    CfiOffset { reg: String, offset: i32 },
+    CfiOffset { reg: String, offset: i64 },
 
     /// .cfi_def_cfa_register register - CFA is now based on this register
     CfiDefCfaRegister(String),
@@ -1308,7 +1345,7 @@ impl Directive {
         }
     }
 
-    pub fn size(name: impl Into<String>, size: u64) -> Self {
+    pub fn size(name: impl Into<String>, size: ByteSize) -> Self {
         Directive::Size {
             sym: Symbol::global(name),
             size,
@@ -1327,7 +1364,7 @@ impl Directive {
         }
     }
 
-    pub fn bss_local(name: impl Into<String>, size: u64, align: u32) -> Self {
+    pub fn bss_local(name: impl Into<String>, size: ByteSize, align: Align) -> Self {
         Directive::BssLocal {
             sym: Symbol::global(name),
             size,
@@ -1335,7 +1372,7 @@ impl Directive {
         }
     }
 
-    pub fn bss_global(name: impl Into<String>, size: u64, align: u32) -> Self {
+    pub fn bss_global(name: impl Into<String>, size: ByteSize, align: Align) -> Self {
         Directive::BssGlobal {
             sym: Symbol::global(name),
             size,
@@ -1351,7 +1388,7 @@ impl Directive {
         }
     }
 
-    pub fn cfi_offset(reg: impl Into<String>, offset: i32) -> Self {
+    pub fn cfi_offset(reg: impl Into<String>, offset: i64) -> Self {
         Directive::CfiOffset {
             reg: reg.into(),
             offset,
@@ -1366,7 +1403,7 @@ impl Directive {
         Directive::CfiRestore(reg.into())
     }
 
-    pub fn cfi_def_cfa(reg: impl Into<String>, offset: i32) -> Self {
+    pub fn cfi_def_cfa(reg: impl Into<String>, offset: i64) -> Self {
         Directive::CfiDefCfa {
             reg: reg.into(),
             offset,
@@ -1592,21 +1629,17 @@ impl EmitAsm for Directive {
                     Os::MacOS => {
                         // `.zerofill` names the symbol itself, so there is no
                         // label-then-data shape to follow here.
-                        let align_log2 = if *align == 0 {
-                            0
-                        } else {
-                            align.trailing_zeros()
-                        };
+                        let align_log2 = align.log2();
                         let _ = writeln!(out, ".zerofill __DATA,__bss,{name},{size},{align_log2}");
                     }
                     Os::Linux | Os::FreeBSD => {
                         let _ = writeln!(out, ".bss");
-                        if *align > 1 {
+                        if *align > Align::ONE {
                             // `.p2align`, as everything else here spells it:
                             // GAS reads a bare `.align` on x86 ELF as a byte
                             // count, so the log2 would be a different and
                             // often invalid alignment.
-                            let _ = writeln!(out, ".p2align {}", align.trailing_zeros());
+                            let _ = writeln!(out, ".p2align {}", align.log2());
                         }
                         let _ = writeln!(out, ".type {name},@object");
                         let _ = writeln!(out, ".size {name},{size}");
@@ -1627,11 +1660,7 @@ impl EmitAsm for Directive {
             Directive::BssLocal { sym, size, align } => match target.os {
                 Os::MacOS => {
                     // .zerofill SEG,SECT,name,size,align_log2
-                    let align_log2 = if *align == 0 {
-                        0
-                    } else {
-                        align.trailing_zeros()
-                    };
+                    let align_log2 = align.log2();
                     let _ = writeln!(
                         out,
                         ".zerofill __DATA,__bss,{},{},{}",
@@ -1968,22 +1997,24 @@ mod tests {
     /// four bytes past a twelve-byte local.
     #[test]
     fn test_eightbyte_bytes_stops_at_the_end_of_the_object() {
+        let at =
+            |total: u64, at: u64| eightbyte_bytes(ByteSize::new(total), ByteSize::new(at)).get();
         // A multiple of eight fills every register it takes.
-        assert_eq!(eightbyte_bytes(16, 0), 8);
-        assert_eq!(eightbyte_bytes(16, 8), 8);
+        assert_eq!(at(16, 0), 8);
+        assert_eq!(at(16, 8), 8);
         // Twelve and thirteen do not: the second register holds four and five.
-        assert_eq!(eightbyte_bytes(12, 0), 8);
-        assert_eq!(eightbyte_bytes(12, 8), 4);
-        assert_eq!(eightbyte_bytes(13, 8), 5);
+        assert_eq!(at(12, 0), 8);
+        assert_eq!(at(12, 8), 4);
+        assert_eq!(at(13, 8), 5);
         // Under a register's worth the one register holds the whole object.
-        assert_eq!(eightbyte_bytes(3, 0), 3);
+        assert_eq!(at(3, 0), 3);
         // Past the end is nothing at all, never a negative width.
-        assert_eq!(eightbyte_bytes(12, 16), 0);
-        assert_eq!(eightbyte_bytes(0, 0), 0);
+        assert_eq!(at(12, 16), 0);
+        assert_eq!(at(0, 0), 0);
 
         // The eightbytes of any size account for it exactly.
-        for total in 1..=64i64 {
-            let sum: i64 = (0..8).map(|i| eightbyte_bytes(total, i * 8)).sum();
+        for total in 1..=64u64 {
+            let sum: u64 = (0..8).map(|i| at(total, i * 8)).sum();
             assert_eq!(sum, total, "the eightbytes of {total} must cover it");
         }
     }
@@ -1992,19 +2023,16 @@ mod tests {
     /// floating-point store has is refused rather than rounded up to one.
     #[test]
     fn test_exact_sse_store_refuses_a_width_it_cannot_write() {
-        assert_eq!(FpSize::exact_sse_store(2), Some(FpSize::Half));
-        assert_eq!(FpSize::exact_sse_store(4), Some(FpSize::Single));
-        assert_eq!(FpSize::exact_sse_store(8), Some(FpSize::Double));
-        assert_eq!(FpSize::exact_sse_store(16), Some(FpSize::Quad));
+        let store = |bytes| FpSize::exact_sse_store(ByteSize::new(bytes));
+        assert_eq!(store(2), Some(FpSize::Half));
+        assert_eq!(store(4), Some(FpSize::Single));
+        assert_eq!(store(8), Some(FpSize::Double));
+        assert_eq!(store(16), Some(FpSize::Quad));
         // `for_sse_aggregate` answers every one of these with a *wider* store,
         // which is what wrote past the object; here they have no answer and
         // the caller moves the bytes through a general register instead.
         for ragged in [0, 1, 3, 5, 6, 7, 9, 12, 15, 17] {
-            assert_eq!(
-                FpSize::exact_sse_store(ragged),
-                None,
-                "{ragged} bytes is not one SSE store"
-            );
+            assert_eq!(store(ragged), None, "{ragged} bytes is not one SSE store");
         }
     }
 
@@ -2095,11 +2123,20 @@ mod tests {
 
     #[test]
     fn test_operand_size() {
-        assert_eq!(OperandSize::from_bits(1), OperandSize::B8);
-        assert_eq!(OperandSize::from_bits(8), OperandSize::B8);
-        assert_eq!(OperandSize::from_bits(16), OperandSize::B16);
-        assert_eq!(OperandSize::from_bits(32), OperandSize::B32);
-        assert_eq!(OperandSize::from_bits(64), OperandSize::B64);
+        assert_eq!(OperandSize::from_bits(Bits::new(1)), OperandSize::B8);
+        assert_eq!(OperandSize::from_bits(Bits::new(8)), OperandSize::B8);
+        assert_eq!(OperandSize::from_bits(Bits::new(16)), OperandSize::B16);
+        assert_eq!(OperandSize::from_bits(Bits::new(32)), OperandSize::B32);
+        assert_eq!(OperandSize::from_bits(Bits::new(64)), OperandSize::B64);
+        // Clamped at both ends: no width is a byte, and anything wider than a
+        // register is moved a register at a time.
+        assert_eq!(OperandSize::from_bits(Bits::ZERO), OperandSize::B8);
+        assert_eq!(OperandSize::from_bits(Bits::new(128)), OperandSize::B64);
+        assert_eq!(
+            OperandSize::from_bits(Bits::new(u32::MAX)),
+            OperandSize::B64
+        );
+        assert_eq!(OperandSize::B32.width(), Bits::new(32));
 
         assert_eq!(OperandSize::B8.bits(), 8);
 
@@ -2117,17 +2154,22 @@ mod tests {
 
         // The narrow sizes are target-independent.
         for t in [&x86, &arm] {
-            assert_eq!(FpSize::from_bits(16, t), FpSize::Half);
-            assert_eq!(FpSize::from_bits(32, t), FpSize::Single);
-            assert_eq!(FpSize::from_bits(64, t), FpSize::Double);
+            assert_eq!(FpSize::from_bits(Bits::new(16), t), FpSize::Half);
+            assert_eq!(FpSize::from_bits(Bits::new(32), t), FpSize::Single);
+            assert_eq!(FpSize::from_bits(Bits::new(64), t), FpSize::Double);
         }
 
         // 128 bits is the whole reason from_bits needs a target: it is x87
         // extended on x86-64 and IEEE binary128 on aarch64, and answering
         // Extended for both is what sent quad loads down the x87 path.
-        assert_eq!(FpSize::from_bits(80, &x86), FpSize::Extended);
-        assert_eq!(FpSize::from_bits(128, &x86), FpSize::Extended);
-        assert_eq!(FpSize::from_bits(128, &arm), FpSize::Quad);
+        assert_eq!(FpSize::from_bits(Bits::new(80), &x86), FpSize::Extended);
+        assert_eq!(FpSize::from_bits(Bits::new(128), &x86), FpSize::Extended);
+        assert_eq!(FpSize::from_bits(Bits::new(128), &arm), FpSize::Quad);
+        // Wider still is the wide format too: a complex value's whole width.
+        assert_eq!(FpSize::from_bits(Bits::new(256), &x86), FpSize::Extended);
+        assert_eq!(FpSize::from_bits(Bits::new(256), &arm), FpSize::Quad);
+        assert_eq!(FpSize::for_sse_aggregate(Bits::new(128)), FpSize::Quad);
+        assert_eq!(FpSize::Extended.width(), Bits::new(80));
 
         assert_eq!(FpSize::Half.x86_suffix(), "ss");
         assert_eq!(FpSize::Single.x86_suffix(), "ss");
@@ -2295,7 +2337,7 @@ mod tests {
         let target = Target::new(Arch::X86_64, Os::Linux);
 
         let mut out = String::new();
-        Directive::Zero(16).emit(&target, &mut out);
+        Directive::Zero(ByteSize::new(16)).emit(&target, &mut out);
         assert_eq!(out, "    .zero 16\n");
 
         let mut out = String::new();
@@ -2342,7 +2384,8 @@ mod tests {
         let macos = Target::new(Arch::X86_64, Os::MacOS);
 
         let mut out = String::new();
-        Directive::bss_global("my_var", 8, 8).emit(&linux, &mut out);
+        Directive::bss_global("my_var", ByteSize::new(8), Align::of_bytes(8))
+            .emit(&linux, &mut out);
         assert_eq!(
             out,
             ".globl my_var\n.bss\n.p2align 3\n.type my_var,@object\n.size my_var,8\nmy_var:\n.zero 8\n"
@@ -2355,12 +2398,14 @@ mod tests {
         // Mach-O has no label-then-data shape here: `.zerofill` names the
         // symbol, and takes log2 of the alignment.
         let mut out = String::new();
-        Directive::bss_global("my_var", 8, 8).emit(&macos, &mut out);
+        Directive::bss_global("my_var", ByteSize::new(8), Align::of_bytes(8))
+            .emit(&macos, &mut out);
         assert_eq!(out, ".globl _my_var\n.zerofill __DATA,__bss,_my_var,8,3\n");
 
         // Alignment 1 emits no directive at all.
         let mut out = String::new();
-        Directive::bss_global("byte_var", 1, 1).emit(&linux, &mut out);
+        Directive::bss_global("byte_var", ByteSize::new(1), Align::of_bytes(1))
+            .emit(&linux, &mut out);
         assert!(!out.contains("p2align"), "{out}");
     }
 
@@ -2410,22 +2455,25 @@ mod tests {
 
         // Linux: `.local name` + `.comm name,size,align(bytes)`
         let mut out = String::new();
-        Directive::bss_local("zerobuf", 4096, 16).emit(&linux, &mut out);
+        Directive::bss_local("zerobuf", ByteSize::new(4096), Align::of_bytes(16))
+            .emit(&linux, &mut out);
         assert_eq!(out, ".local zerobuf\n.comm zerobuf,4096,16\n");
 
         // macOS x86_64: `.zerofill __DATA,__bss,_name,size,align_log2`
         let mut out = String::new();
-        Directive::bss_local("zerobuf", 4096, 16).emit(&macos, &mut out);
+        Directive::bss_local("zerobuf", ByteSize::new(4096), Align::of_bytes(16))
+            .emit(&macos, &mut out);
         assert_eq!(out, ".zerofill __DATA,__bss,_zerobuf,4096,4\n");
 
         // macOS aarch64: same form with leading underscore
         let mut out = String::new();
-        Directive::bss_local("z", 8, 8).emit(&aarch64_macos, &mut out);
+        Directive::bss_local("z", ByteSize::new(8), Align::of_bytes(8))
+            .emit(&aarch64_macos, &mut out);
         assert_eq!(out, ".zerofill __DATA,__bss,_z,8,3\n");
 
         // Sub-page alignment: 1 byte → log2 = 0 on macOS
         let mut out = String::new();
-        Directive::bss_local("b", 1, 1).emit(&macos, &mut out);
+        Directive::bss_local("b", ByteSize::new(1), Align::of_bytes(1)).emit(&macos, &mut out);
         assert_eq!(out, ".zerofill __DATA,__bss,_b,1,0\n");
     }
 

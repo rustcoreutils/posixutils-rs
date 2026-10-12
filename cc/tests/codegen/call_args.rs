@@ -285,7 +285,7 @@ int main(void) {
 /// AAPCS64 derives an argument's alignment from the members and ignores the
 /// type's own `__attribute__((aligned(N)))`.
 ///
-/// c17 asked `types.alignment()`, which includes that attribute, at three
+/// c17 asked the type's own alignment, which includes that attribute, at three
 /// aarch64 sites that then disagreed with each other: the caller and the
 /// callee both rounded a 32-byte-aligned struct's stack slot to 32, while
 /// `va_arg` capped at 16. Caller and callee agreeing is why a *named* call

@@ -23,6 +23,8 @@ use crate::target::{Arch, Os, Target};
 use crate::types::{
     ArrayExtent, CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable,
 };
+use crate::units::Bits;
+use crate::units::ByteSize;
 
 // Static local variables
 
@@ -277,7 +279,7 @@ fn test_large_struct_copy_from_array() {
         StructMember {
             name: ptr_id,
             typ: ptr_type,
-            offset: 0,
+            offset: ByteSize::ZERO,
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -286,7 +288,7 @@ fn test_large_struct_copy_from_array() {
         StructMember {
             name: str_id,
             typ: ptr_type,
-            offset: 8,
+            offset: ByteSize::new(8),
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
@@ -300,9 +302,9 @@ fn test_large_struct_copy_from_array() {
             tag: None,
             members,
             enum_constants: vec![],
-            size: 16,
-            align: 8,
-            member_align: 8,
+            size: ByteSize::new(16),
+            align: crate::units::Align::of_bytes(8),
+            member_align: crate::units::Align::of_bytes(8),
             is_complete: true,
             transparent: false,
             reverse_order: false,
@@ -1141,7 +1143,7 @@ fn test_zero_sized_aggregate_is_never_loaded_or_stored() {
     let func = module.functions.iter().find(|f| f.name == "f").expect("f");
     for insn in func.blocks.iter().flat_map(|bb| bb.insns.iter()) {
         if matches!(insn.op, Opcode::Load | Opcode::Store) {
-            assert!(insn.size > 0, "a zero-width access: {insn:?}");
+            assert!(insn.size > Bits::new(0), "a zero-width access: {insn:?}");
         }
     }
 }

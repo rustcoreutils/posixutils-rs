@@ -13,25 +13,30 @@ use crate::arch::asm_constraints::AsmRegClass;
 use crate::ir::bitset::BitSet;
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
-/// Grow a frame's locals area by one slot, refusing a total no `i32`
-/// displacement can reach -- counting what the prologue will add to it.
+mod verify;
+pub use verify::{
+    check_assignment, verify_assignment, Assignment, Cell, Clobber, Conflict, Spared, Violation,
+};
+
+/// Grow a frame's locals area by one slot, refusing a total past
+/// [`TypeTable::MAX_FRAME_BYTES`] -- counting what the prologue will add to
+/// it.
 ///
-/// [`TypeTable::MAX_STACK_OBJECT_BYTES`] bounds one object and
-/// [`crate::abi::slot_bytes`] enforces that. Neither bounds their *sum*, and
-/// `+=` on an `i32` wraps: a frame past two gigabytes came out negative and the
-/// prologue subtracted nothing. Both backends' `alloc_stack_slot` is the one
-/// place their locals area grows, so this is the one place the total can be
-/// checked. A VLA or `alloca` extent never reaches it: the frame holds only an
-/// eight-byte pointer for one, and the extent is subtracted from the stack
-/// pointer at run time in a 64-bit register.
+/// [`crate::abi::slot_bytes`] bounds one object. It does not bound their
+/// *sum*, which is checked here: every slot of either backend's frame is laid
+/// out through here, so this is the one place the total can be. A VLA or
+/// `alloca` extent never reaches it: the frame holds only an eight-byte
+/// pointer for one, and the extent is subtracted from the stack pointer at
+/// run time in a 64-bit register.
 ///
 /// Admitting a frame here is a promise to everything downstream, so the check
 /// is against what the frame *becomes*, not what it is so far:
 ///
-/// - The slot's own rounding happens inside, in `i64`: the offset up to the
+/// - The slot's own rounding happens inside, in `i128`: the offset up to the
 ///   slot's alignment, and the size up to a multiple of it. Callers used to
 ///   round the size first, in `i32`, so `_Alignas(16) char a[2147483640]`
 ///   wrapped to a zero-byte slot before this check ever saw it.
@@ -40,34 +45,34 @@ use std::hash::Hash;
 ///   can add almost twice it (`stack_size`). It is reserved here.
 /// - Everything else the prologue adds -- saved registers, the variadic save
 ///   area -- is inside [`TypeTable::FRAME_HEADROOM_BYTES`], which
-///   `MAX_STACK_OBJECT_BYTES` already leaves below `i32::MAX`.
+///   `MAX_FRAME_BYTES` already leaves below `i64::MAX`.
 ///
-/// So every frame quantity computed later, in `i32`, stays in range without a
-/// check of its own. Before this, an accepted frame near the limit wrapped in
-/// `stack_size`, in the prologue total and in aarch64's frame zeroing -- which
-/// then looped forever, pushing instructions until the compiler ran out of
-/// memory.
+/// So every frame quantity computed later, in `i64`, stays in range without a
+/// check of its own. When frame quantities were `i32`, an accepted frame near
+/// their limit wrapped in `stack_size`, in the prologue total and in aarch64's
+/// frame zeroing -- which then looped forever, pushing instructions until the
+/// compiler ran out of memory.
 pub fn grow_frame(
-    offset: &mut i32,
-    size: i32,
+    offset: &mut i64,
+    size: i64,
     alignment: i32,
     frame_align: i32,
     pos: crate::diag::Position,
-) -> i32 {
-    let align = i64::from(alignment.max(1));
-    let mut want = i64::from(*offset);
+) -> i64 {
+    let align = i128::from(alignment.max(1));
+    let mut want = i128::from(*offset);
     if alignment > 8 {
         want = (want + align - 1) & !(align - 1);
     }
-    want += (i64::from(size.max(0)) + align - 1) & !(align - 1);
-    let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i64 - 2 * i64::from(frame_align.max(16));
-    match i32::try_from(want) {
-        Ok(n) if i64::from(n) <= limit => *offset = n,
+    want += (i128::from(size.max(0)) + align - 1) & !(align - 1);
+    let limit = TypeTable::MAX_FRAME_BYTES - 2 * i64::from(frame_align.max(16));
+    match i64::try_from(want) {
+        Ok(want) if want <= limit => *offset = want,
         _ => {
             crate::diag::error_args(
                 pos,
                 "this function's stack frame needs {0} bytes, \
-                 past the {1} bytes a frame can address",
+             past the {1} bytes a frame can address",
                 &[&want.to_string(), &limit.max(0).to_string()],
             );
             *offset = offset.saturating_add(8);
@@ -76,20 +81,85 @@ pub fn grow_frame(
     *offset
 }
 
-/// Refuse an incoming stacked-argument area no `i32` displacement reaches.
+/// Refuse an incoming stacked-argument area past
+/// [`TypeTable::MAX_FRAME_BYTES`].
 ///
 /// Each parameter is inside the frame ceiling on its own; their sum is not,
 /// and `IncomingOff::take` saturates rather than wrapping so this one check
 /// at the end of a function's parameter layout sees it.
-pub fn check_incoming_area(end: i32, pos: crate::diag::Position) {
-    if end as usize > TypeTable::MAX_STACK_OBJECT_BYTES {
+pub fn check_incoming_area(end: i64, pos: crate::diag::Position) {
+    if end > TypeTable::MAX_FRAME_BYTES {
         crate::diag::error_args(
             pos,
             "this function's stacked parameters need more than the {0} bytes \
              a stack frame can address",
-            &[&TypeTable::MAX_STACK_OBJECT_BYTES.to_string()],
+            &[&TypeTable::MAX_FRAME_BYTES.to_string()],
         );
     }
+}
+
+/// An upper bound on the bytes any frame displacement of `func` can span:
+/// how far from the frame pointer a local, a spill slot, a stacked
+/// argument, the variadic save area or a stack-pointer adjustment can lie.
+///
+/// Measured before allocation, from what the frame is made of, and never
+/// less than what allocation then lays out: every local counted whole and
+/// unshared, with its alignment's worth of padding; every pseudo as a spill
+/// slot of the largest kind; every parameter and the largest call's
+/// arguments as stacked; and the largest offset an access adds to its
+/// address. [`TypeTable::FRAME_HEADROOM_BYTES`] covers what the prologue
+/// adds.
+///
+/// x86-64 asks it to decide whether a function needs a far scratch register
+/// before it allocates the others (`far_scratch_of` in x86_64/regalloc.rs), so
+/// that allocation runs once; aarch64 has X15 for every function and does
+/// not ask. Saturating: a sum past `u64` is past every limit anyway.
+pub fn frame_reach(func: &Function, types: &TypeTable) -> u64 {
+    let object = |typ: crate::types::TypeId| {
+        types
+            .byte_size(typ)
+            .get()
+            .saturating_add(types.align(typ).bytes())
+    };
+    let locals = func
+        .locals
+        .values()
+        .map(|l| object(l.typ).saturating_add(u64::from(l.explicit_align.unwrap_or(0))))
+        .fold(0u64, u64::saturating_add);
+    let params = func
+        .params
+        .iter()
+        .map(|(_, typ)| object(*typ).saturating_add(16))
+        .fold(0u64, u64::saturating_add);
+    let mut call_args = 0u64;
+    let mut access = 0u64;
+    for insn in func.blocks.iter().flat_map(|b| b.insns.iter()) {
+        if insn.op == crate::ir::Opcode::Call {
+            let args = insn
+                .extra()
+                .arg_types
+                .iter()
+                .map(|t| object(*t).saturating_add(8))
+                .fold(16u64, u64::saturating_add);
+            call_args = call_args.max(args);
+        }
+        if insn.op.addresses_memory() {
+            access = access.max(insn.offset.unsigned_abs());
+        }
+    }
+    // The widest slot a pseudo is spilled to, with its alignment.
+    const SPILL_SLOT_BYTES: u64 = 64;
+    let spills = (func.pseudos.len() as u64).saturating_mul(SPILL_SLOT_BYTES);
+    [
+        locals,
+        params,
+        call_args,
+        access,
+        spills,
+        TypeTable::FRAME_HEADROOM_BYTES.unsigned_abs(),
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add)
 }
 
 // ============================================================================
@@ -147,6 +217,16 @@ impl<L: Clone> From<HashMap<PseudoId, L>> for LocationMap<L> {
     }
 }
 
+/// The size of each frame slot the allocator hands a pseudo, by pseudo.
+///
+/// A backend's `Loc::Stack` carries only an offset, and the slot's extent is
+/// decided where it is made -- a spill's width, a local's object, a 128-bit
+/// value's sixteen bytes -- so each site that binds a pseudo to a slot
+/// records it here too. The allocation verifier (`check_assignment`)
+/// compares slots by these extents: two pseudos whose bytes overlap may
+/// not be live together.
+pub type SlotBytes = HashMap<PseudoId, i64>;
+
 const DEFAULT_INTERVAL_CAPACITY: usize = 64;
 const DEFAULT_CONSTRAINT_CAPACITY: usize = 16;
 const DEFAULT_CALL_POS_CAPACITY: usize = 16;
@@ -162,40 +242,6 @@ pub struct LiveInterval {
     pub end: usize,
     /// True if this interval spans a loop back edge (used within a loop)
     pub in_loop: bool,
-}
-
-/// A stack slot freed by an expired live interval, available for reuse.
-#[derive(Debug, Clone)]
-pub struct FreeSlot {
-    pub offset: i32,
-    pub alignment: i32,
-    /// The live intervals of *every* pseudo that has ever owned
-    /// this slot — current and prior owners. A candidate may
-    /// reuse the slot only if its own interval is disjoint from
-    /// EVERY entry. The "current owner only" approximation
-    /// (checking just the most-recent occupant) is unsafe:
-    /// suppose A owns the slot during [11,17], then frees it; B
-    /// reuses during [81,130], also frees. If a candidate C with
-    /// interval [6,42] now checks "do I overlap B?" it sees no
-    /// conflict — but C overlaps A's old window [11,17] and would
-    /// read garbage during that span. CPython's `double_round`
-    /// miscompile (assertAlmostEqual segfault) hits this exact
-    /// pattern.
-    pub owner_intervals: Vec<LiveInterval>,
-}
-
-/// A stack slot currently assigned to a live pseudo, plus the full
-/// history of past owners. Used by `expire_stack_intervals` and
-/// `try_reuse_stack_slot` to preserve history across reuse cycles.
-#[derive(Debug, Clone)]
-pub struct ActiveSlot {
-    /// The current owner's live interval — drives `expire_stack_intervals`.
-    pub current: LiveInterval,
-    /// Past owners (FIFO) whose intervals already ended but whose
-    /// constraints must still be respected on the next reuse.
-    pub past: Vec<LiveInterval>,
-    pub offset: i32,
-    pub size: i32,
 }
 
 /// A point in the function where register constraints apply.
@@ -214,83 +260,55 @@ pub struct ConstraintPoint<R> {
 }
 
 impl<R> ConstraintPoint<R> {
-    /// May `interval` sit in a register this point clobbers?
+    /// May `pseudo` sit in a register this point clobbers? `across` says
+    /// whether it is live across the point ([`Crossing::across`]).
     ///
     /// Being an operand of the clobbering instruction is not enough on its
     /// own. `mulq` and `idivq` read an operand out of a fixed register and
     /// write their result back over it, so an operand whose value is still
     /// wanted *after* the instruction is destroyed by it. The exemption is
-    /// only sound at the two ends of a live range:
+    /// only sound for an operand not live across the instruction:
     ///
-    /// - the range starts here, so the pseudo *is* what the instruction
+    /// - it is defined here, so the pseudo *is* what the instruction
     ///   produces (the `%rdx` half of a `mulq`, the quotient in `%rax`);
-    /// - the range ends here, so the value has been consumed and nothing
-    ///   reads it again.
+    /// - it dies here, so the value has been consumed and nothing reads it
+    ///   again.
     ///
-    /// A range that spans the point strictly is live on both sides, and the
+    /// An operand live across the point is live on both sides, and the
     /// instruction overwrites it in between. That is what left a 128-bit
     /// product's cross term computed from the low half of its own multiply.
-    pub fn operand_survives(&self, pseudo: PseudoId, start: usize, end: usize) -> bool {
-        self.involved_pseudos.contains(&pseudo) && (start >= self.position || end <= self.position)
+    pub fn operand_survives(&self, pseudo: PseudoId, across: bool) -> bool {
+        self.involved_pseudos.contains(&pseudo) && !across
     }
 }
 
-/// The registers each candidate may not take because a constraint point
-/// inside its live range clobbers them -- unless `exempt` says the interval
-/// is one the point may clobber, which is where the backends differ.
+/// The registers each candidate may not take because a constraint point it
+/// touches clobbers them -- unless `exempt` says the pseudo is one the point
+/// may clobber, which is where the backends differ.
 ///
-/// An exemption belongs to an operand of the point, so `exempt` is asked only
-/// about points whose `involved_pseudos` name the interval's pseudo; both
-/// backends' rules already require that.
+/// A point touches what is live across it, what it reads and what it
+/// defines ([`Crossing`]); `exempt` is told which of these the pseudo is
+/// live across. Asked by exact liveness, not by an interval: a value whose
+/// positions merely span a point -- dead on the path through it -- is free
+/// to take the registers it clobbers.
 ///
-/// Each register is looked up once per interval: the points clobbering it
-/// inside the interval are counted by binary search over their positions, and
-/// the register is forbidden unless every one of them excuses the interval.
-/// The work is intervals x registers, not intervals x points. Visiting every
-/// point an interval spans was quadratic for a function with many labels and
-/// gotos, whose merged live ranges each span most of the function.
+/// Every point must have its [`Crossing`] in `crossings`. The work is the
+/// points times what each touches.
 pub fn constraint_clobbers<R: Copy + Ord>(
     constraint_points: &[ConstraintPoint<R>],
-    intervals: &[LiveInterval],
+    crossings: &HashMap<usize, Crossing>,
     candidates: &std::collections::BTreeSet<PseudoId>,
-    exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
+    exempt: impl Fn(&ConstraintPoint<R>, PseudoId, bool) -> bool,
 ) -> BTreeMap<PseudoId, std::collections::BTreeSet<R>> {
-    // Positions of the points clobbering each register, one per point.
-    let mut clobbered_at: BTreeMap<R, Vec<usize>> = BTreeMap::new();
-    // The points each pseudo is an operand of, one entry per point.
-    let mut operand_of: HashMap<PseudoId, Vec<&ConstraintPoint<R>>> = HashMap::new();
-    for cp in constraint_points {
-        let regs: std::collections::BTreeSet<R> = cp.clobbers.iter().copied().collect();
-        for r in regs {
-            clobbered_at.entry(r).or_default().push(cp.position);
-        }
-        let operands: std::collections::BTreeSet<PseudoId> =
-            cp.involved_pseudos.iter().copied().collect();
-        for p in operands {
-            operand_of.entry(p).or_default().push(cp);
-        }
-    }
-    for positions in clobbered_at.values_mut() {
-        positions.sort_unstable();
-    }
-
     let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<R>> = BTreeMap::new();
-    for interval in intervals.iter().filter(|i| candidates.contains(&i.pseudo)) {
-        // A point is inside the interval when start <= position <= end.
-        let excused: Vec<&ConstraintPoint<R>> = operand_of
-            .get(&interval.pseudo)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|cp| interval.start <= cp.position && cp.position <= interval.end)
-            .filter(|cp| exempt(cp, interval))
-            .collect();
-        for (&r, positions) in &clobbered_at {
-            let inside = positions.partition_point(|&q| q <= interval.end)
-                - positions.partition_point(|&q| q < interval.start);
-            let excused_here = excused.iter().filter(|cp| cp.clobbers.contains(&r)).count();
-            if inside > excused_here {
-                forbidden.entry(interval.pseudo).or_default().insert(r);
+    for cp in constraint_points {
+        let crossing = &crossings[&cp.position];
+        for (p, across) in crossing.touching() {
+            if candidates.contains(&p) && !exempt(cp, p, across) {
+                forbidden
+                    .entry(p)
+                    .or_default()
+                    .extend(cp.clobbers.iter().copied());
             }
         }
     }
@@ -303,7 +321,7 @@ pub fn constraint_clobbers<R: Copy + Ord>(
 /// Built once for the chordal pre-pass, which asked it per interval by
 /// scanning the whole function; that made the pre-pass intervals x
 /// instructions.
-pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, u32> {
+pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, Bits> {
     let mut sizes = HashMap::new();
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
         if insn.op == Opcode::SetVal {
@@ -316,53 +334,6 @@ pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, u32> {
 }
 
 // Common Functions
-
-/// Release stack slots whose owning interval ended before `point` back
-/// to the free-slot pool, where future `try_reuse_stack_slot` calls
-/// can find them.
-///
-/// The chordal allocator calls it twice per bank: once in Phase 1
-/// sweeping monotonically by interval start, then once with
-/// `usize::MAX` just before Phase 3 spill commits to drain everything
-/// so spilled pseudos can reuse any non-interfering slot.
-///
-/// Without this, every `alloc_stack_slot` request creates a fresh
-/// slot. On x86_64 that's wasteful but harmless. On aarch64 it pushes
-/// stp/ldp offsets past the architectural [-512, 504] immediate range
-/// and the assembler rejects the output.
-pub fn expire_stack_intervals(
-    active_stack: &mut Vec<ActiveSlot>,
-    free_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
-    point: usize,
-) {
-    let mut to_free: Vec<ActiveSlot> = Vec::new();
-    active_stack.retain(|slot| {
-        if slot.current.end < point {
-            to_free.push(slot.clone());
-            false
-        } else {
-            true
-        }
-    });
-    for slot in to_free {
-        let alignment = if slot.size >= 16 { 16 } else { 8 };
-        // The freed slot's history is `past ++ [current]`.
-        let mut owners = slot.past;
-        owners.push(slot.current);
-        // Merge with any existing FreeSlot at the same offset (an
-        // earlier owner that already freed and is waiting for reuse).
-        let slots = free_slots.entry(slot.size).or_default();
-        if let Some(existing) = slots.iter_mut().find(|s| s.offset == slot.offset) {
-            existing.owner_intervals.extend(owners);
-        } else {
-            slots.push(FreeSlot {
-                offset: slot.offset,
-                alignment,
-                owner_intervals: owners,
-            });
-        }
-    }
-}
 
 /// Find all positions of call-like instructions in a function.
 /// Used by spill_args_across_calls and the chordal allocator's cross-call
@@ -421,14 +392,101 @@ pub fn returns_twice_constraint<R: Copy>(
     (regs.to_vec(), insn.target.into_iter().collect())
 }
 
-/// Check if a live interval crosses any call position.
-/// Note: We use <= for the end check because values used as call arguments
-/// (where interval.end == call_pos) need to survive until after argument
-/// setup, which clobbers caller-saved registers before the actual call.
-pub fn interval_crosses_call(interval: &LiveInterval, call_positions: &[usize]) -> bool {
-    call_positions
-        .iter()
-        .any(|&call_pos| interval.start <= call_pos && call_pos <= interval.end)
+/// What one instruction must preserve, reads and defines: the answer to
+/// "does this value cross this call, or this constraint point", by exact
+/// liveness rather than by the hull of a value's positions, which spans
+/// every block laid out between its first and last -- live there or not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Crossing {
+    /// Live just after the instruction and not defined by it: what it must
+    /// leave as it found it.
+    pub across: Vec<PseudoId>,
+    /// What it reads ([`DefsUses`]).
+    pub uses: Vec<PseudoId>,
+    /// What it defines.
+    pub defs: Vec<PseudoId>,
+    /// It is an inline asm, which may write the registers it clobbers after
+    /// it has written its outputs.
+    pub is_asm: bool,
+}
+
+impl Crossing {
+    /// Every pseudo the instruction touches, once each, with whether it is
+    /// live across it.
+    pub fn touching(&self) -> impl Iterator<Item = (PseudoId, bool)> + '_ {
+        let mut seen: std::collections::BTreeSet<PseudoId> = self.across.iter().copied().collect();
+        let rest: Vec<PseudoId> = self
+            .uses
+            .iter()
+            .chain(&self.defs)
+            .copied()
+            .filter(|&p| seen.insert(p))
+            .collect();
+        self.across
+            .iter()
+            .map(|&p| (p, true))
+            .chain(rest.into_iter().map(|p| (p, false)))
+    }
+
+    /// What a call destroys in a caller-saved register: every value live
+    /// across it, and every argument it reads -- see [`crossings`].
+    pub fn call_crossers(&self) -> impl Iterator<Item = PseudoId> + '_ {
+        self.across.iter().chain(&self.uses).copied()
+    }
+
+    /// What an instruction that destroys a whole register bank -- a call,
+    /// or an asm whose clobber list names the bank's registers -- destroys
+    /// there: [`Crossing::call_crossers`], and an asm's outputs too, which
+    /// the template may have written before it writes a clobbered
+    /// register. A call writes its result after everything it clobbers.
+    pub fn bank_crossers(&self) -> impl Iterator<Item = PseudoId> + '_ {
+        let defs: &[PseudoId] = if self.is_asm { &self.defs } else { &[] };
+        self.call_crossers().chain(defs.iter().copied())
+    }
+}
+
+/// Each instruction at `positions` (as [`compute_live_intervals`] numbers
+/// them) with its [`Crossing`], by one backward walk over the pseudos that
+/// have liveness: not a constant, nor a symbol, which live in no register.
+///
+/// A call's own result is not live across it: the call writes it after it
+/// returns, into whatever register it was given. An argument is, for the
+/// caller-saved registers, by [`Crossing::call_crossers`]: a call's lowering
+/// stages its arguments through caller-saved registers before it reads them
+/// all, so an argument there may be overwritten before it is read. A
+/// backend that knows better for a particular call says so itself.
+pub fn crossings(
+    func: &Function,
+    live_out: &[HashSet<PseudoId>],
+    positions: &std::collections::BTreeSet<usize>,
+) -> HashMap<usize, Crossing> {
+    let tracked = |p: PseudoId| {
+        !func.get_pseudo(p).is_some_and(|ps| {
+            matches!(
+                ps.kind,
+                PseudoKind::Val(_) | PseudoKind::FVal(_) | PseudoKind::Sym(_)
+            )
+        })
+    };
+    let mut out = HashMap::with_capacity(positions.len());
+    walk_live_after(func, live_out, tracked, |pos, insn, du, live| {
+        if positions.contains(&pos) {
+            out.insert(
+                pos,
+                Crossing {
+                    across: live
+                        .iter()
+                        .copied()
+                        .filter(|p| !du.defs.contains(p))
+                        .collect(),
+                    uses: du.uses.clone(),
+                    defs: du.defs.clone(),
+                    is_asm: insn.op == Opcode::Asm,
+                },
+            );
+        }
+    });
+    out
 }
 
 /// Result of liveness analysis: intervals, constraint points, and per-block liveness sets.
@@ -844,6 +902,8 @@ where
     extend_across_returns_twice(
         func,
         &mut result,
+        &block_start_pos,
+        &bb_id_to_idx,
         block_end_pos.last().copied().unwrap_or(0),
     );
     result.sort_by_key(|i| (i.start, i.pseudo.0));
@@ -856,37 +916,72 @@ where
 }
 
 /// Stretch every value live across an instruction that returns twice (see
-/// [`Instruction::returns_twice`]) to the end of the function.
+/// [`Instruction::returns_twice`]) over every position the instruction
+/// reaches: to the end of the function, and back to the first block it
+/// reaches.
 ///
 /// A `longjmp` resumes at the setjmp from whatever call it is made under,
 /// and the CFG has no edge for that: a value live across the setjmp is read
 /// again on the second return, after code the liveness analysis believed it
 /// was dead in -- the path that led to the `longjmp`. A slot or register
 /// handed to another value there is overwritten before the value is read
-/// back. Every call after the setjmp may be the one that jumps, so the value
-/// must survive to the end. This is the pseudo-level counterpart of
+/// back. Every call the setjmp reaches may be the one that jumps, so the
+/// value must survive all of them. This is the pseudo-level counterpart of
 /// `local_lifetimes`, which spans every local over the whole function.
+///
+/// What the setjmp reaches is not only what is laid out after it: the
+/// inliner sorts blocks breadth first, and a path from the setjmp's first
+/// return can run through blocks laid out before it. Stretched only to the
+/// end, the value's slot went to a spill in one of those -- and `vfork`, a
+/// setjmp whose second return comes after the child has run on the same
+/// stack, lost CPython's `vfork_tstate_save` that way.
 ///
 /// The setjmp's own result starts there, and is written again on each
 /// return, so it is not stretched.
-fn extend_across_returns_twice(func: &Function, intervals: &mut [LiveInterval], last: usize) {
-    let positions: Vec<usize> = func
-        .blocks
-        .iter()
-        .flat_map(|b| &b.insns)
-        .enumerate()
-        .filter(|(_, insn)| insn.returns_twice())
-        .map(|(pos, _)| pos)
-        .collect();
-    if positions.is_empty() {
-        return;
+fn extend_across_returns_twice(
+    func: &Function,
+    intervals: &mut [LiveInterval],
+    block_start_pos: &[usize],
+    bb_id_to_idx: &HashMap<BasicBlockId, usize>,
+    last: usize,
+) {
+    // Each returns-twice instruction's position, and the first position of
+    // anything it reaches.
+    let mut points: Vec<(usize, usize)> = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (pos, insn) in (block_start_pos[b]..).zip(&block.insns) {
+            if !insn.returns_twice() {
+                continue;
+            }
+            let mut reached = vec![false; func.blocks.len()];
+            let mut work: Vec<usize> = block
+                .children
+                .iter()
+                .filter_map(|c| bb_id_to_idx.get(c).copied())
+                .collect();
+            let mut from = pos;
+            while let Some(r) = work.pop() {
+                if std::mem::replace(&mut reached[r], true) {
+                    continue;
+                }
+                from = from.min(block_start_pos[r]);
+                work.extend(
+                    func.blocks[r]
+                        .children
+                        .iter()
+                        .filter_map(|c| bb_id_to_idx.get(c).copied()),
+                );
+            }
+            points.push((pos, from));
+        }
     }
     for interval in intervals.iter_mut() {
-        if positions
-            .iter()
-            .any(|&p| interval.start < p && p < interval.end)
-        {
-            interval.end = interval.end.max(last);
+        let (start, end) = (interval.start, interval.end);
+        for &(p, from) in &points {
+            if start < p && p < end {
+                interval.start = interval.start.min(from);
+                interval.end = interval.end.max(last);
+            }
         }
     }
 }
@@ -905,17 +1000,17 @@ pub fn local_slot(
     local: &crate::ir::LocalVar,
     types: &TypeTable,
     pos: crate::diag::Position,
-) -> (i32, i32) {
-    let bytes = crate::abi::slot_bytes(types.size_bytes(local.typ), pos, "an automatic object");
+) -> (i64, i32) {
+    let bytes = crate::abi::slot_bytes(types.byte_size(local.typ), pos, "an automatic object");
     let align = local
         .explicit_align
         .map(|a| a as i32)
-        .unwrap_or_else(|| (types.alignment(local.typ) as i32).max(8));
+        .unwrap_or_else(|| crate::abi::slot_align(types.align(local.typ)).max(8));
     (bytes.max(8), align)
 }
 
-/// Each local's frame slot, as `(local, offset)`, with `new_slot(bytes,
-/// alignment)` making a fresh one.
+/// Each local's frame slot, as `(local, offset, bytes)`, with
+/// `new_slot(bytes, alignment)` making a fresh one.
 ///
 /// Locals are laid out in declaration order, as they always were: the order
 /// decides which of them land near the frame base, and an inline-asm memory
@@ -960,12 +1055,12 @@ pub fn place_locals(
     pos: crate::diag::Position,
     intervals: &[LiveInterval],
     set: LocalSet,
-    mut new_slot: impl FnMut(i32, i32) -> i32,
-) -> Vec<(PseudoId, i32)> {
+    mut new_slot: impl FnMut(i64, i32) -> i64,
+) -> Vec<(PseudoId, i64, i64)> {
     struct Shared {
-        bytes: i32,
+        bytes: i64,
         align: i32,
-        offset: i32,
+        offset: i64,
         owners: Vec<(usize, usize)>,
     }
     let lifetime: HashMap<PseudoId, (usize, usize)> = intervals
@@ -1014,7 +1109,7 @@ pub fn place_locals(
                 offset
             }
         };
-        placed.push((local.sym, offset));
+        placed.push((local.sym, offset, bytes));
     }
     placed
 }
@@ -1045,94 +1140,139 @@ fn local_lifetimes(
     block_end_pos: &[usize],
     bb_id_to_idx: &HashMap<BasicBlockId, usize>,
 ) -> HashMap<PseudoId, (usize, usize)> {
-    let locals: Vec<PseudoId> = func.locals.values().map(|l| l.sym).collect();
+    let regions = LocalRegions::of(func, block_start_pos, bb_id_to_idx);
     let last = block_end_pos.last().copied().unwrap_or(0);
-    if func.has_nonlocal_control() {
-        return locals.into_iter().map(|l| (l, (0, last))).collect();
-    }
-    let index: HashMap<PseudoId, usize> = locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
-
-    // Each block's events in order: (position, local, starts) -- a mention
-    // starts (or continues) a lifetime, a `LifetimeEnd` ends one.
-    let mut events: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); func.blocks.len()];
-    for (b, block) in func.blocks.iter().enumerate() {
-        for (pos, insn) in (block_start_pos[b]..).zip(&block.insns) {
-            if insn.op == Opcode::LifetimeEnd {
-                if let Some(&i) = insn.extra().lifetime_of.and_then(|l| index.get(&l)) {
-                    events[b].push((pos, i, false));
-                }
-                continue;
-            }
-            for p in insn.mentioned() {
-                if let Some(&i) = index.get(&p) {
-                    events[b].push((pos, i, true));
-                }
-            }
-        }
-    }
-
-    // Forward "may be inside its lifetime", to a fixed point.
-    let mut live_in = vec![BitSet::new(locals.len()); func.blocks.len()];
-    let mut live_out = vec![BitSet::new(locals.len()); func.blocks.len()];
-    let params: HashSet<&str> = func.params.iter().map(|(n, _)| n.as_str()).collect();
-    if let Some(&entry) = bb_id_to_idx.get(&func.entry) {
-        for (name, local) in &func.locals {
-            if params.contains(name.as_str()) {
-                live_in[entry].insert(index[&local.sym]);
-            }
-        }
-    }
-    let mut work: VecDeque<usize> = (0..func.blocks.len()).collect();
-    let mut queued = vec![true; func.blocks.len()];
-    while let Some(b) = work.pop_front() {
-        queued[b] = false;
-        let mut out = live_in[b].clone();
-        for &(_, i, starts) in &events[b] {
-            if starts {
-                out.insert(i);
-            } else {
-                out.remove(i);
-            }
-        }
-        if out == live_out[b] {
-            continue;
-        }
-        for child in &func.blocks[b].children {
-            let Some(&c) = bb_id_to_idx.get(child) else {
-                continue;
-            };
-            if live_in[c].union_with(&out) && !queued[c] {
-                queued[c] = true;
-                work.push_back(c);
-            }
-        }
-        live_out[b] = out;
+    if regions.everywhere {
+        return regions.locals.into_iter().map(|l| (l, (0, last))).collect();
     }
 
     // The hull: a block's start where the object is live in, its end where
     // live out, and every event in between. Only the set bits are visited:
     // a block's sets hold the few locals live there, not every local.
-    let mut hull: Vec<Option<(usize, usize)>> = vec![None; locals.len()];
+    let mut hull: Vec<Option<(usize, usize)>> = vec![None; regions.locals.len()];
     let mut widen = |i: usize, pos: usize| {
         let (s, e) = hull[i].get_or_insert((pos, pos));
         *s = (*s).min(pos);
         *e = (*e).max(pos);
     };
     for b in 0..func.blocks.len() {
-        for i in live_in[b].iter() {
+        for i in regions.live_in[b].iter() {
             widen(i, block_start_pos[b]);
         }
-        for i in live_out[b].iter() {
+        for i in regions.live_out[b].iter() {
             widen(i, block_end_pos[b]);
         }
-        for &(pos, i, _) in &events[b] {
+        for &(pos, i, _) in &regions.events[b] {
             widen(i, pos);
         }
     }
     hull.into_iter()
         .enumerate()
-        .filter_map(|(i, span)| Some((locals[i], span?)))
+        .filter_map(|(i, span)| Some((regions.locals[i], span?)))
         .collect()
+}
+
+/// Where each local may be inside its lifetime, block by block: the
+/// forward analysis [`local_lifetimes`] takes the hull of, and the
+/// allocation verifier reads point by point.
+pub(crate) struct LocalRegions {
+    /// The locals, by index.
+    pub(crate) locals: Vec<PseudoId>,
+    /// Each block's events in order: `(position, local, starts)` -- a
+    /// mention starts (or continues) a lifetime, a `LifetimeEnd` ends one.
+    pub(crate) events: Vec<Vec<(usize, usize, bool)>>,
+    /// The locals that may be inside their lifetime entering each block.
+    pub(crate) live_in: Vec<BitSet>,
+    /// ... and leaving it.
+    pub(crate) live_out: Vec<BitSet>,
+    /// Control can come back to a point the analysis cannot see -- a
+    /// `setjmp` -- so every local is live everywhere, and the sets above
+    /// are left empty.
+    pub(crate) everywhere: bool,
+}
+
+impl LocalRegions {
+    pub(crate) fn of(
+        func: &Function,
+        block_start_pos: &[usize],
+        bb_id_to_idx: &HashMap<BasicBlockId, usize>,
+    ) -> Self {
+        let locals: Vec<PseudoId> = func.locals.values().map(|l| l.sym).collect();
+        let n = func.blocks.len();
+        if func.has_nonlocal_control() {
+            return Self {
+                live_in: vec![BitSet::new(locals.len()); n],
+                live_out: vec![BitSet::new(locals.len()); n],
+                locals,
+                events: vec![Vec::new(); n],
+                everywhere: true,
+            };
+        }
+        let index: HashMap<PseudoId, usize> =
+            locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
+
+        let mut events: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); n];
+        for (b, block) in func.blocks.iter().enumerate() {
+            for (pos, insn) in (block_start_pos[b]..).zip(&block.insns) {
+                if insn.op == Opcode::LifetimeEnd {
+                    if let Some(&i) = insn.extra().lifetime_of.and_then(|l| index.get(&l)) {
+                        events[b].push((pos, i, false));
+                    }
+                    continue;
+                }
+                for p in insn.mentioned() {
+                    if let Some(&i) = index.get(&p) {
+                        events[b].push((pos, i, true));
+                    }
+                }
+            }
+        }
+
+        // Forward "may be inside its lifetime", to a fixed point.
+        let mut live_in = vec![BitSet::new(locals.len()); n];
+        let mut live_out = vec![BitSet::new(locals.len()); n];
+        let params: HashSet<&str> = func.params.iter().map(|(n, _)| n.as_str()).collect();
+        if let Some(&entry) = bb_id_to_idx.get(&func.entry) {
+            for (name, local) in &func.locals {
+                if params.contains(name.as_str()) {
+                    live_in[entry].insert(index[&local.sym]);
+                }
+            }
+        }
+        let mut work: VecDeque<usize> = (0..n).collect();
+        let mut queued = vec![true; n];
+        while let Some(b) = work.pop_front() {
+            queued[b] = false;
+            let mut out = live_in[b].clone();
+            for &(_, i, starts) in &events[b] {
+                if starts {
+                    out.insert(i);
+                } else {
+                    out.remove(i);
+                }
+            }
+            if out == live_out[b] {
+                continue;
+            }
+            for child in &func.blocks[b].children {
+                let Some(&c) = bb_id_to_idx.get(child) else {
+                    continue;
+                };
+                if live_in[c].union_with(&out) && !queued[c] {
+                    queued[c] = true;
+                    work.push_back(c);
+                }
+            }
+            live_out[b] = out;
+        }
+        Self {
+            locals,
+            events,
+            live_in,
+            live_out,
+            everywhere: false,
+        }
+    }
 }
 
 /// Each pseudo's live interval, by pseudo -- the first, if several.
@@ -1146,15 +1286,6 @@ pub fn intervals_by_pseudo(intervals: &[LiveInterval]) -> HashMap<PseudoId, &Liv
         by_pseudo.entry(interval.pseudo).or_insert(interval);
     }
     by_pseudo
-}
-
-/// Every pseudo live out of some block: one whose value crosses a block
-/// boundary.
-///
-/// Built once per function. Asking it per interval by scanning every block's
-/// live-out set made the chordal pre-pass intervals x blocks.
-pub fn live_out_anywhere(live_out: &[HashSet<PseudoId>]) -> HashSet<PseudoId> {
-    live_out.iter().flatten().copied().collect()
 }
 
 /// Identify pseudo-registers that should use floating-point registers.
@@ -1257,113 +1388,47 @@ where
 // shared shape and let each backend supply the architecture-specific bits as
 // a closure.
 
-/// Assign a fresh stack slot to every `Alloca` instruction's result pseudo.
-///
-/// Both backends bump their stack counter by 8 per Alloca and write a
-/// `Loc::Stack(offset)` for the result. The stack-offset sign differs
-/// (x86_64 stores `+stack_offset`, aarch64 stores `-stack_offset`), so
-/// the caller passes a `mk_stack_loc` closure that converts an i32
-/// counter into the backend's preferred `Loc::Stack` value.
-pub fn assign_alloca_slots<L, F>(
-    func: &Function,
-    stack_offset: &mut i32,
-    locations: &mut HashMap<PseudoId, L>,
-    mk_stack_loc: F,
-) where
-    F: Fn(i32) -> L,
-{
-    for block in &func.blocks {
-        for insn in &block.insns {
-            if insn.op == Opcode::Alloca {
-                if let Some(target) = insn.target {
-                    *stack_offset += 8;
-                    locations.insert(target, mk_stack_loc(*stack_offset));
-                }
-            }
-        }
-    }
+/// Every `Alloca` instruction's result pseudo: each lives in a frame slot.
+pub fn alloca_results(func: &Function) -> Vec<PseudoId> {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .filter(|insn| insn.op == Opcode::Alloca)
+        .filter_map(|insn| insn.target)
+        .collect()
 }
 
-/// Does anything overwrite `reg` while `interval` is live -- a constraint
-/// point that clobbers it and does not exempt the interval's pseudo?
-///
-/// The coloring pass asks the same question of the pseudos it places, through
-/// [`constraint_clobbers`], which is where each backend's `exempt` rule comes
-/// from; an ABI-pinned argument never reaches that pass, so
-/// [`spill_gp_args_across`] asks it here.
-pub fn clobbered_while_live<R: PartialEq>(
-    interval: &LiveInterval,
-    reg: R,
-    constraint_points: &[ConstraintPoint<R>],
-    exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
-) -> bool {
-    constraint_points.iter().any(|cp| {
-        interval.start <= cp.position
-            && cp.position <= interval.end
-            && cp.clobbers.contains(&reg)
-            && !exempt(cp, interval)
-    })
-}
-
-/// Move an ABI-pinned GP argument out of its register when something
-/// overwrites that register while the argument is live.
+/// The ABI-pinned GP arguments that must leave their register for a frame
+/// slot, because something overwrites that register while they are live --
+/// each with the register it arrived in.
 ///
 /// An argument arrives pre-colored in its ABI register and never goes through
 /// coloring, so the forbidden-color machinery that keeps an ordinary value out
 /// of a clobbered register does not apply to it. `overwritten` says whether its
-/// register is destroyed within its interval: a call (every argument register
-/// is caller-saved), or a constraint point that clobbers it
-/// ([`clobbered_while_live`]) -- inline asm, an atomic's fixed scratch, a
+/// register is destroyed while it is live: a call (every argument register is
+/// caller-saved), or a constraint point that clobbers it
+/// ([`constraint_clobbers`]) -- inline asm, an atomic's fixed scratch, a
 /// thread-local sequence that calls a resolver or getter. One rule for both
 /// backends: aarch64 once asked only about calls, so a thread-local access
 /// under the descriptor or Mach-O TLV model, which returns its result in x0,
 /// left every later use of an argument that arrived in x0 reading the
 /// thread-local's address.
 ///
-/// The caller supplies which registers are argument registers, how to extract
-/// a register from a `Loc`, how to construct the spilled `Loc`, and how to
-/// record the spill for the prologue. The stack-offset sign convention is
-/// folded into `mk_stack_loc` and `record_spill`, so this helper is
-/// sign-agnostic.
-#[allow(clippy::too_many_arguments)]
-pub fn spill_gp_args_across<L, R, IsArg, ExtractReg, MkStackLoc, RecordSpill, PushFree>(
+/// `reg_of` answers the argument register a pseudo's location is, if it is
+/// one. The backend records each spill for its prologue and asks for the
+/// slot ([`color_stack_slots`] places it with the others).
+pub fn gp_args_overwritten<R: Copy>(
     intervals: &[LiveInterval],
-    overwritten: impl Fn(&LiveInterval, R) -> bool,
-    locations: &mut HashMap<PseudoId, L>,
-    stack_offset: &mut i32,
-    is_arg_reg: IsArg,
-    extract_reg: ExtractReg,
-    mk_stack_loc: MkStackLoc,
-    mut record_spill: RecordSpill,
-    mut push_free: PushFree,
-) where
-    L: Clone,
-    R: Copy,
-    IsArg: Fn(R) -> bool,
-    ExtractReg: Fn(&L) -> Option<R>,
-    MkStackLoc: Fn(i32) -> L,
-    RecordSpill: FnMut(PseudoId, R, i32),
-    PushFree: FnMut(R),
-{
-    for interval in intervals {
-        let Some(loc) = locations.get(&interval.pseudo) else {
-            continue;
-        };
-        let Some(reg) = extract_reg(loc) else {
-            continue;
-        };
-        if !is_arg_reg(reg) {
-            continue;
-        }
-        if !overwritten(interval, reg) {
-            continue;
-        }
-        *stack_offset += 8;
-        let to_offset = *stack_offset;
-        record_spill(interval.pseudo, reg, to_offset);
-        locations.insert(interval.pseudo, mk_stack_loc(to_offset));
-        push_free(reg);
-    }
+    reg_of: impl Fn(PseudoId) -> Option<R>,
+    overwritten: impl Fn(PseudoId, R) -> bool,
+) -> Vec<(PseudoId, R)> {
+    intervals
+        .iter()
+        .filter_map(|interval| {
+            let reg = reg_of(interval.pseudo)?;
+            overwritten(interval.pseudo, reg).then_some((interval.pseudo, reg))
+        })
+        .collect()
 }
 
 // SSA interference graphs are chordal (Pereira/Palsberg 2005, Hack
@@ -1434,6 +1499,77 @@ impl InterferenceGraph {
     }
 }
 
+/// What one instruction defines and reads, among the pseudos `tracked`
+/// admits: the one enumeration the backward liveness walks share --
+/// [`build_interference_graph`] and the allocation verifier
+/// ([`check_assignment`]) -- so the two cannot disagree about what an
+/// instruction kills and what it revives.
+///
+/// The defs are the target and every register asm output. A *memory* asm
+/// output defines nothing: its pseudo is the address the template writes
+/// through, so it is a use, like every input, the sources and an indirect
+/// call's target.
+pub(crate) struct DefsUses {
+    pub(crate) defs: Vec<PseudoId>,
+    pub(crate) uses: Vec<PseudoId>,
+}
+
+/// The set a backward liveness walk keeps: what is live at the current
+/// point. [`DefsUses::step`] moves it across one instruction.
+pub(crate) trait LiveSet {
+    /// `p` is defined here, so it is not live above this point.
+    fn kill(&mut self, p: PseudoId);
+    /// `p` is read here, so it is live above this point.
+    fn revive(&mut self, p: PseudoId);
+}
+
+impl LiveSet for std::collections::BTreeSet<PseudoId> {
+    fn kill(&mut self, p: PseudoId) {
+        self.remove(&p);
+    }
+    fn revive(&mut self, p: PseudoId) {
+        self.insert(p);
+    }
+}
+
+impl DefsUses {
+    pub(crate) fn of(insn: &Instruction, tracked: impl Fn(PseudoId) -> bool) -> Self {
+        let asm = insn
+            .extra()
+            .asm_data
+            .as_deref()
+            .filter(|_| insn.op == Opcode::Asm);
+        let mut defs: Vec<PseudoId> = insn.target.into_iter().filter(|&t| tracked(t)).collect();
+        let mut uses: Vec<PseudoId> = insn.src.iter().copied().filter(|&s| tracked(s)).collect();
+        uses.extend(insn.extra().indirect_target.filter(|&p| tracked(p)));
+        if let Some(asm) = asm {
+            for output in &asm.outputs {
+                if !tracked(output.pseudo) {
+                    continue;
+                }
+                if output.is_memory() {
+                    uses.push(output.pseudo);
+                } else {
+                    defs.push(output.pseudo);
+                }
+            }
+            uses.extend(asm.inputs.iter().map(|i| i.pseudo).filter(|&p| tracked(p)));
+        }
+        Self { defs, uses }
+    }
+
+    /// Move `live` from just after the instruction to just before it: its
+    /// defs were born here, and its uses are live coming in.
+    pub(crate) fn step(&self, live: &mut impl LiveSet) {
+        for &d in &self.defs {
+            live.kill(d);
+        }
+        for &u in &self.uses {
+            live.revive(u);
+        }
+    }
+}
+
 /// Build the interference graph for pseudos in `candidates`.
 ///
 /// Walks each basic block backward maintaining the current live set.
@@ -1462,155 +1598,251 @@ pub fn build_interference_graph(
     for &c in candidates {
         graph.add_vertex(c);
     }
+    let tracked = |p: PseudoId| candidates.contains(&p);
     for (idx, block) in func.blocks.iter().enumerate() {
         let mut live: std::collections::BTreeSet<PseudoId> = live_out[idx]
             .iter()
             .copied()
-            .filter(|p| candidates.contains(p))
+            .filter(|&p| tracked(p))
             .collect();
         for insn in block.insns.iter().rev() {
-            // Collect defs of this instruction.
-            let mut defs: Vec<PseudoId> = Vec::new();
-            if let Some(target) = insn.target {
-                if candidates.contains(&target) {
-                    defs.push(target);
-                }
-            }
-            if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.extra().asm_data {
-                    for output in &asm.outputs {
-                        // A memory output defines nothing; it reads an address.
-                        if !output.is_memory() && candidates.contains(&output.pseudo) {
-                            defs.push(output.pseudo);
+            let du = DefsUses::of(insn, tracked);
+            // An early-clobber asm output, and a register output beside a
+            // memory output, may not share with what the statement reads;
+            // see `asm_must_differ`.
+            if let Some(asm) = insn.extra().asm_data.as_deref() {
+                if insn.op == Opcode::Asm {
+                    for (out, read) in asm_must_differ(asm) {
+                        if tracked(out) && tracked(read) {
+                            // `add_edge` ignores a self-edge: a tied input
+                            // is the output.
+                            graph.add_edge(out, read);
                         }
                     }
-                }
-            }
-            // An early-clobber asm output is written before the template
-            // has read its inputs, so it interferes with every one of them
-            // -- a register input, and the address of a memory operand, which
-            // the template also reads -- even an input that dies here, whose
-            // register a plain output may take. A tied input names the
-            // output's own pseudo and so shares with it by construction.
-            if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.extra().asm_data {
-                    add_early_clobber_edges(&mut graph, asm, candidates);
-                    add_memory_output_edges(&mut graph, asm, candidates);
                 }
             }
             // Each def interferes with everything currently live AND
             // with the instruction's other defs AND with each src
             // (for the lowering-correctness reason described above).
-            for &d in &defs {
+            for &d in &du.defs {
                 for &l in live.iter() {
                     if l != d {
                         graph.add_edge(d, l);
                     }
                 }
-                for &d2 in &defs {
+                for &d2 in &du.defs {
                     if d != d2 {
                         graph.add_edge(d, d2);
                     }
                 }
                 if add_def_src_edges {
                     for &src in &insn.src {
-                        if src != d && candidates.contains(&src) {
+                        if src != d && tracked(src) {
                             graph.add_edge(d, src);
                         }
                     }
                 }
             }
-            // Remove defs from live (they were born here; not live before).
-            for &d in &defs {
-                live.remove(&d);
-            }
-            // Add uses (srcs are live coming INTO this instruction).
-            for &src in &insn.src {
-                if candidates.contains(&src) {
-                    live.insert(src);
-                }
-            }
-            if let Some(indirect) = insn.extra().indirect_target {
-                if candidates.contains(&indirect) {
-                    live.insert(indirect);
-                }
-            }
-            if insn.op == Opcode::Asm {
-                if let Some(asm) = &insn.extra().asm_data {
-                    for input in &asm.inputs {
-                        if candidates.contains(&input.pseudo) {
-                            live.insert(input.pseudo);
-                        }
-                    }
-                    // A memory output is read, not written: its address must
-                    // stay live across the asm.
-                    for output in &asm.outputs {
-                        if output.is_memory() && candidates.contains(&output.pseudo) {
-                            live.insert(output.pseudo);
-                        }
-                    }
-                }
-            }
+            du.step(&mut live);
         }
     }
     graph
 }
 
-/// Edges from each early-clobber register output of one asm statement to
-/// every pseudo the statement reads: its inputs, and the addresses of its
-/// memory outputs.
-fn add_early_clobber_edges(
+/// Make the arguments among `vertices` interfere with one another. The
+/// prologue writes each argument that has left the register it arrived in --
+/// to a slot or to another register -- at entry, where none has a def for
+/// [`build_interference_graph`] to see, and one that is never read is
+/// written all the same.
+pub fn args_interfere(
     graph: &mut InterferenceGraph,
-    asm: &crate::ir::AsmData,
-    candidates: &std::collections::BTreeSet<PseudoId>,
+    func: &Function,
+    vertices: &std::collections::BTreeSet<PseudoId>,
 ) {
-    let read = asm
-        .inputs
+    let args: Vec<PseudoId> = vertices
         .iter()
-        .chain(asm.outputs.iter().filter(|o| o.is_memory()))
-        .map(|c| c.pseudo)
-        .filter(|p| candidates.contains(p));
-    let read: Vec<PseudoId> = read.collect();
-    for out in &asm.outputs {
-        if !out.is_early_clobber() || out.is_memory() || !candidates.contains(&out.pseudo) {
-            continue;
-        }
-        for &p in &read {
-            // `add_edge` ignores a self-edge: a tied input is the output.
-            graph.add_edge(out.pseudo, p);
+        .copied()
+        .filter(|&p| {
+            func.get_pseudo(p)
+                .is_some_and(|ps| matches!(ps.kind, PseudoKind::Arg(_)))
+        })
+        .collect();
+    for (n, &a) in args.iter().enumerate() {
+        for &b in &args[n + 1..] {
+            graph.add_edge(a, b);
         }
     }
 }
 
-/// Edges from each register output of one asm statement to the address of
-/// each of its memory outputs.
+/// Walk every block backward from its live-out set, handing `visit` each
+/// instruction's linear position (blocks in order, as
+/// [`compute_live_intervals`] numbers them), the instruction, what it
+/// defines and reads among the pseudos `tracked` admits, and the set of
+/// those live just after it.
 ///
-/// A plain output may share a register with an input the template has
-/// finished reading, but the address of a memory output is read for the
-/// template's write through it, which may come after the register output is
-/// written. gprofng's `__collector_subget_32` is
-/// `movl %2, %0; negl %0; lock; xaddl %0, %1` with `"=r"(r), "=m"(*ptr)`:
-/// given one register for `r` and `ptr`, the `negl` overwrote the address and
-/// the `xaddl` wrote through the negated count.
-fn add_memory_output_edges(
-    graph: &mut InterferenceGraph,
-    asm: &crate::ir::AsmData,
-    candidates: &std::collections::BTreeSet<PseudoId>,
+/// The one per-instruction liveness walk the allocators' exact questions
+/// share: what a stack slot may be shared with, what is live across an
+/// instruction that returns twice, and what crosses a call or a constraint
+/// point ([`crossings`]).
+pub(crate) fn walk_live_after(
+    func: &Function,
+    live_out: &[HashSet<PseudoId>],
+    tracked: impl Fn(PseudoId) -> bool,
+    mut visit: impl FnMut(usize, &Instruction, &DefsUses, &std::collections::BTreeSet<PseudoId>),
 ) {
+    let mut start = 0usize;
+    for (idx, block) in func.blocks.iter().enumerate() {
+        let mut live: std::collections::BTreeSet<PseudoId> = live_out[idx]
+            .iter()
+            .copied()
+            .filter(|&p| tracked(p))
+            .collect();
+        for (i, insn) in block.insns.iter().enumerate().rev() {
+            let du = DefsUses::of(insn, &tracked);
+            visit(start + i, insn, &du, &live);
+            du.step(&mut live);
+        }
+        start += block.insns.len();
+    }
+}
+
+/// The bytes and alignment of a frame slot a pseudo lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SlotShape {
+    pub bytes: i32,
+    pub align: i32,
+}
+
+impl SlotShape {
+    pub fn new(bytes: i32, align: i32) -> Self {
+        Self { bytes, align }
+    }
+}
+
+/// Where [`color_stack_slots`] puts each stack-homed pseudo.
+#[derive(Debug, Default)]
+pub struct StackColoring {
+    /// Each slot's shape, by slot number.
+    pub slots: Vec<SlotShape>,
+    /// Each pseudo's slot number.
+    pub slot_of: BTreeMap<PseudoId, usize>,
+}
+
+/// Give every pseudo in `homed` a frame slot of its shape, sharing a slot
+/// between pseudos that are never live together.
+///
+/// The question is the one register coloring answers, asked of the frame:
+/// two values may share a slot unless one is defined where the other is
+/// live, by the same exact per-instruction liveness
+/// ([`build_interference_graph`]). The hull of a value's positions will not
+/// do: block order scatters a `switch` case's blocks among the other cases',
+/// so a value's hull spans every case it is dead in, and no two cases would
+/// share. A slot holds one shape: a pseudo takes the lowest-numbered slot of
+/// its own shape that no neighbour holds, in maximum-cardinality order, or a
+/// new one.
+///
+/// Beyond liveness, three things decide:
+///
+/// - A def never shares with a source of its own instruction (the def-src
+///   edges): the back ends write a frame-resident target before they have
+///   read every source.
+/// - The arguments never share with one another: the prologue writes every
+///   spilled argument at entry, where none has a def for the graph to see,
+///   and one that is never read is written all the same.
+/// - A pseudo live across an instruction that returns twice gets a slot of
+///   its own. A `longjmp` resumes there from code the graph sees no path
+///   back from: whatever that code defines, while the value is dead to the
+///   graph, would land on the slot it is read from on the second return.
+///   `extend_across_returns_twice` is the interval-side counterpart.
+///
+/// The order is deterministic: the graph's containers are ordered, and the
+/// slot numbers follow the order pseudos are colored in.
+pub fn color_stack_slots(
+    func: &Function,
+    live_out: &[HashSet<PseudoId>],
+    homed: &BTreeMap<PseudoId, SlotShape>,
+) -> StackColoring {
+    let candidates: std::collections::BTreeSet<PseudoId> = homed.keys().copied().collect();
+    let mut graph = build_interference_graph(&candidates, func, live_out, true);
+    args_interfere(&mut graph, func, &candidates);
+    let mut exclusive: std::collections::BTreeSet<PseudoId> = std::collections::BTreeSet::new();
+    if func.has_nonlocal_control() {
+        walk_live_after(
+            func,
+            live_out,
+            |p| candidates.contains(&p),
+            |_, insn, du, live| {
+                if insn.returns_twice() {
+                    exclusive.extend(live.iter().filter(|p| !du.defs.contains(p)));
+                }
+            },
+        );
+    }
+
+    let mut coloring = StackColoring::default();
+    // The shared slots of each shape, in slot-number order.
+    let mut shared: BTreeMap<SlotShape, Vec<usize>> = BTreeMap::new();
+    for v in mcs_ordering(&graph) {
+        let shape = homed[&v];
+        let reuse = if exclusive.contains(&v) {
+            None
+        } else {
+            let taken: std::collections::BTreeSet<usize> = graph
+                .neighbors(v)
+                .filter_map(|n| coloring.slot_of.get(&n).copied())
+                .collect();
+            shared
+                .get(&shape)
+                .and_then(|slots| slots.iter().copied().find(|s| !taken.contains(s)))
+        };
+        let slot = reuse.unwrap_or_else(|| {
+            let slot = coloring.slots.len();
+            coloring.slots.push(shape);
+            if !exclusive.contains(&v) {
+                shared.entry(shape).or_default().push(slot);
+            }
+            slot
+        });
+        coloring.slot_of.insert(v, slot);
+    }
+    coloring
+}
+
+/// The pairs `(output, read)` of one asm statement's operands that may not
+/// share a register even where `read` dies at the statement.
+///
+/// - An early-clobber register output is written before the template has
+///   read its inputs, so it differs from every one of them -- a register
+///   input, and the address of a memory operand, which the template also
+///   reads -- even an input that dies here, whose register a plain output
+///   may take. A tied input names the output's own pseudo and so shares
+///   with it by construction.
+/// - A register output differs from the address of each memory output. A
+///   plain output may share a register with an input the template has
+///   finished reading, but the address of a memory output is read for the
+///   template's write through it, which may come after the register output
+///   is written. gprofng's `__collector_subget_32` is
+///   `movl %2, %0; negl %0; lock; xaddl %0, %1` with `"=r"(r), "=m"(*ptr)`:
+///   given one register for `r` and `ptr`, the `negl` overwrote the address
+///   and the `xaddl` wrote through the negated count.
+pub(crate) fn asm_must_differ(asm: &crate::ir::AsmData) -> Vec<(PseudoId, PseudoId)> {
     let addresses: Vec<PseudoId> = asm
         .outputs
         .iter()
-        .filter(|o| o.is_memory() && candidates.contains(&o.pseudo))
+        .filter(|o| o.is_memory())
         .map(|o| o.pseudo)
         .collect();
-    for out in &asm.outputs {
-        if out.is_memory() || !candidates.contains(&out.pseudo) {
-            continue;
+    let mut pairs = Vec::new();
+    for out in asm.outputs.iter().filter(|o| !o.is_memory()) {
+        if out.is_early_clobber() {
+            pairs.extend(asm.inputs.iter().map(|i| (out.pseudo, i.pseudo)));
         }
-        for &p in &addresses {
-            graph.add_edge(out.pseudo, p);
-        }
+        pairs.extend(addresses.iter().map(|&a| (out.pseudo, a)));
     }
+    pairs.retain(|&(out, read)| out != read);
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
 }
 
 /// Walk `func` and collect every `Opcode::Copy` instruction's
@@ -1859,54 +2091,6 @@ pub fn next_use_distance(
     }
 }
 
-/// Try to reuse a previously freed stack slot of the given size and alignment.
-///
-/// Reuse is safe iff `candidate_interval` is disjoint from **every**
-/// past owner of the slot. Two intervals `[a.start, a.end]` and
-/// `[b.start, b.end]` are disjoint iff `a.end < b.start` or
-/// `b.end < a.start`.
-///
-/// History matters: when slot S is freed by A and reused by B, the
-/// slot's "current owner" is B but A's interval still constrains any
-/// future candidate. The earlier implementation checked only the
-/// most-recent owner — when A.lifetime [11,17] and B.lifetime
-/// [81,130] were both past owners, a candidate C with [6,42] saw
-/// only B (no conflict) but actually collided with A's [11,17].
-/// CPython's `double_round` miscompile (the assertAlmostEqual
-/// segfault) reproduced this exact pattern.
-///
-/// When a slot is reused, the existing `FreeSlot` entry is removed
-/// from `free_stack_slots`; the *new* owner's interval is appended to
-/// the entry when the slot is freed again by `expire_stack_intervals`.
-/// This preserves the full ownership history across the reuse cycle.
-/// To make the history preservation work, this function returns
-/// (offset, history) so the caller can stash history into
-/// `active_stack` and have it re-merged on expire.
-pub fn try_reuse_stack_slot(
-    free_stack_slots: &mut BTreeMap<i32, Vec<FreeSlot>>,
-    size: i32,
-    alignment: i32,
-    candidate_interval: &LiveInterval,
-) -> Option<(i32, Vec<LiveInterval>)> {
-    if let Some(slots) = free_stack_slots.get_mut(&size) {
-        if let Some(idx) = slots.iter().position(|s| {
-            if s.alignment < alignment {
-                return false;
-            }
-            s.owner_intervals.iter().all(|owner| {
-                owner.end < candidate_interval.start || candidate_interval.end < owner.start
-            })
-        }) {
-            let slot = slots.remove(idx);
-            if slots.is_empty() {
-                free_stack_slots.remove(&size);
-            }
-            return Some((slot.offset, slot.owner_intervals));
-        }
-    }
-    None
-}
-
 /// A function's incoming-argument pseudos, indexed for the allocators.
 ///
 /// Built once per function: it indexes the pseudos by `Arg(n)` for O(1)
@@ -1973,6 +2157,7 @@ impl AbiLowering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::Bits;
 
     /// The asm register operands are the ones the template needs in a
     /// register of their own: `"r"`, and a `"0"` tied to one. An operand
@@ -1990,7 +2175,7 @@ mod tests {
         f.next_pseudo = 6;
         let op = |p: u32, c: &str, tied: Option<usize>| AsmConstraint {
             matching_output: tied,
-            ..AsmConstraint::new(PseudoId(p), c, Arch::X86_64, 64)
+            ..AsmConstraint::new(PseudoId(p), c, Arch::X86_64, Bits::new(64))
         };
         let mut asm = Instruction::new(Opcode::Asm);
         asm.extra_mut().asm_data = Some(Box::new(AsmData {
@@ -2039,7 +2224,7 @@ mod tests {
             PseudoId(0),
             0,
             types.long_id,
-            64,
+            Bits::new(64),
         ));
         bb.add_insn(Instruction::lifetime_end(PseudoId(0)));
         bb.add_insn(Instruction::load(
@@ -2047,7 +2232,7 @@ mod tests {
             PseudoId(1),
             0,
             types.long_id,
-            64,
+            Bits::new(64),
         ));
         bb.add_insn(Instruction::lifetime_end(PseudoId(1)));
         bb.add_insn(Instruction::load(
@@ -2055,7 +2240,7 @@ mod tests {
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::ret(Some(PseudoId(5))));
         f.add_block(bb);
@@ -2113,10 +2298,10 @@ mod tests {
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         twice.target = Some(PseudoId(4));
-        entry.add_insn(twice.with_type_and_size(types.int_id, 32));
+        entry.add_insn(twice.with_type_and_size(types.int_id, Bits::new(32)));
         entry.add_insn(Instruction::cbr(PseudoId(4), b1, b2));
         entry.children = vec![b1, b2];
         let mut resumed = BasicBlock::new(b1);
@@ -2128,7 +2313,7 @@ mod tests {
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         direct.add_insn(Instruction::ret(Some(PseudoId(5))));
         direct.parents = vec![b0];
@@ -2142,7 +2327,7 @@ mod tests {
     #[test]
     fn a_value_live_across_setjmp_spans_to_the_end() {
         let types = TypeTable::new(&crate::target::Target::host());
-        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, 32);
+        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, Bits::new(32));
         call.extra_mut().returns_twice_call = true;
         for twice in [Instruction::new(Opcode::Setjmp), call] {
             let kind = twice.op;
@@ -2169,6 +2354,67 @@ mod tests {
                 "{kind:?}: a value after the setjmp"
             );
         }
+    }
+
+    /// `.L0: br .L2; .L1: %5 = 1; ret %5; .L2: %3 = load p; %4 = setjmp;
+    /// cbr %4, .L3, .L1; .L3: ret %3` -- the path from the setjmp's first
+    /// return runs through `.L1`, laid out before the setjmp. `%3`, read on
+    /// the second return, spans `.L1` too, or `%5` could take its slot.
+    #[test]
+    fn a_value_across_setjmp_spans_what_it_reaches_laid_out_before_it() {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.int_id);
+        f.add_param("p", types.int_id);
+        f.add_pseudo(Pseudo::sym(PseudoId(2), "p".into()));
+        f.add_local("p", PseudoId(2), types.int_id, None, None);
+        for id in 3..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.add_pseudo(Pseudo::val(PseudoId(6), 1));
+        f.next_pseudo = 7;
+        let [b0, b1, b2, b3] = [0, 1, 2, 3].map(BasicBlockId);
+        let mut entry = BasicBlock::new(b0);
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::br(b2));
+        entry.children = vec![b2];
+        let mut first = BasicBlock::new(b1);
+        first.add_insn(Instruction::unop(
+            Opcode::Copy,
+            PseudoId(5),
+            PseudoId(6),
+            types.int_id,
+            Bits::new(32),
+        ));
+        first.add_insn(Instruction::ret(Some(PseudoId(5))));
+        first.parents = vec![b2];
+        let mut set = BasicBlock::new(b2);
+        set.add_insn(Instruction::load(
+            PseudoId(3),
+            PseudoId(2),
+            0,
+            types.int_id,
+            Bits::new(32),
+        ));
+        let mut setjmp = Instruction::new(Opcode::Setjmp);
+        setjmp.target = Some(PseudoId(4));
+        set.add_insn(setjmp.with_type_and_size(types.int_id, Bits::new(32)));
+        set.add_insn(Instruction::cbr(PseudoId(4), b3, b1));
+        set.parents = vec![b0];
+        set.children = vec![b3, b1];
+        let mut second = BasicBlock::new(b3);
+        second.add_insn(Instruction::ret(Some(PseudoId(3))));
+        second.parents = vec![b2];
+        for b in [entry, first, set, second] {
+            f.add_block(b);
+        }
+        f.entry = b0;
+        // .L1 is positions 2-3, the load 4, the setjmp 5.
+        let (start, end) = lifetime_of(&f, 3);
+        assert!(start <= 2, "{start}..{end} misses .L1");
+        assert_eq!(end, 7);
+        let (start5, end5) = lifetime_of(&f, 5);
+        assert!(start <= start5 && end5 <= end, "%5 {start5}..{end5}");
     }
 
     /// Where `setjmp` can bring control back unseen, every local spans the
@@ -2225,9 +2471,16 @@ mod tests {
     #[test]
     fn test_grow_frame_reserves_what_follows() {
         let pos = crate::diag::Position::default();
-        let limit = TypeTable::MAX_STACK_OBJECT_BYTES as i32 - 2 * 16;
+        let limit = TypeTable::MAX_FRAME_BYTES - 2 * 16;
         let mut offset = 0;
         assert_eq!(grow_frame(&mut offset, limit, 8, 16, pos), limit);
+
+        // A frame past four gigabytes is admitted whole: the bound is C's.
+        let mut offset = 16;
+        assert_eq!(
+            grow_frame(&mut offset, 1 << 40, 16, 16, pos),
+            (1 << 40) + 16
+        );
 
         // An `_Alignas(16)` object whose size is not a multiple of 16 takes
         // the rounded size.
@@ -2238,6 +2491,30 @@ mod tests {
         let mut offset = limit;
         let after = grow_frame(&mut offset, 16, 8, 16, pos);
         assert!(after > 0, "offset wrapped to {after}");
+
+        // Two objects each inside the bound, whose sum is past `i64`.
+        let mut offset = 1 << 62;
+        let after = grow_frame(&mut offset, i64::MAX, 8, 16, pos);
+        assert!(after > 0, "offset wrapped to {after}");
+    }
+
+    /// The frame bound is the object bound less the prologue's headroom, on
+    /// every target: a constant, because the frame arithmetic has no table
+    /// to ask.
+    #[test]
+    fn test_frame_bound_is_the_object_bound() {
+        use crate::target::{Arch, Os, Target};
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for os in [Os::Linux, Os::MacOS] {
+                let types = TypeTable::new(&Target::new(arch, os));
+                let objects = types.max_object_bytes().to_i64();
+                assert_eq!(
+                    TypeTable::MAX_FRAME_BYTES,
+                    (objects - TypeTable::FRAME_HEADROOM_BYTES) & !15,
+                    "{arch:?} {os:?}"
+                );
+            }
+        }
     }
 
     /// Maximum weight first, and the smallest id among equals: `4` is picked
@@ -2258,142 +2535,278 @@ mod tests {
         );
     }
 
-    fn interval(p: u32, start: usize, end: usize) -> LiveInterval {
-        LiveInterval {
-            pseudo: PseudoId(p),
-            start,
-            end,
-            in_loop: false,
+    /// `homed` colored over `f`'s own liveness, as each pseudo's slot.
+    fn stack_slots(f: &Function, homed: &[(u32, SlotShape)]) -> BTreeMap<u32, usize> {
+        let r = compute_live_intervals(f, |_| None::<(Vec<()>, Vec<PseudoId>)>);
+        let homed: BTreeMap<PseudoId, SlotShape> =
+            homed.iter().map(|&(p, s)| (PseudoId(p), s)).collect();
+        let coloring = color_stack_slots(f, &r.live_out, &homed);
+        for (p, &n) in &coloring.slot_of {
+            assert_eq!(coloring.slots[n], homed[p], "{p} in a slot of its shape");
         }
+        coloring
+            .slot_of
+            .into_iter()
+            .map(|(p, n)| (p.0, n))
+            .collect()
     }
 
-    /// A point clobbers every candidate live across it, ends inclusive, and
-    /// nothing else: not an interval that ended before it, not one that
-    /// starts after it, not a non-candidate, and not one `exempt` excuses.
-    #[test]
-    fn test_constraint_clobbers_sweep() {
-        let intervals = [
-            interval(1, 0, 10),
-            interval(2, 5, 5),
-            interval(3, 6, 30),
-            interval(4, 0, 40),
-            interval(5, 26, 40),
-        ];
-        let points = [
-            ConstraintPoint {
-                position: 25,
-                clobbers: vec![2u8],
-                involved_pseudos: vec![PseudoId(3)],
-            },
-            ConstraintPoint {
-                position: 5,
-                clobbers: vec![1u8],
-                involved_pseudos: vec![],
-            },
-        ];
-        let candidates: std::collections::BTreeSet<PseudoId> =
-            [1, 2, 3, 5].into_iter().map(PseudoId).collect();
-        let forbidden = constraint_clobbers(&points, &intervals, &candidates, |cp, i| {
-            cp.involved_pseudos.contains(&i.pseudo)
-        });
-        let expect: BTreeMap<PseudoId, std::collections::BTreeSet<u8>> =
-            [(PseudoId(1), [1u8].into()), (PseudoId(2), [1u8].into())].into();
-        assert_eq!(forbidden, expect);
-    }
+    const EIGHT: SlotShape = SlotShape { bytes: 8, align: 8 };
 
-    /// The answer of pairing every point with every interval it lies in.
-    fn clobbers_by_pairing(
-        points: &[ConstraintPoint<u8>],
-        intervals: &[LiveInterval],
-        candidates: &std::collections::BTreeSet<PseudoId>,
-        exempt: impl Fn(&ConstraintPoint<u8>, &LiveInterval) -> bool,
-    ) -> BTreeMap<PseudoId, std::collections::BTreeSet<u8>> {
-        let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<u8>> = BTreeMap::new();
-        for cp in points {
-            for i in intervals.iter().filter(|i| candidates.contains(&i.pseudo)) {
-                if i.start <= cp.position && cp.position <= i.end && !exempt(cp, i) {
-                    forbidden
-                        .entry(i.pseudo)
-                        .or_default()
-                        .extend(cp.clobbers.iter().copied());
-                }
-            }
+    /// One block: `%2 = %0 + %0; %3 = %2 + %2; %4 = %3 + %0; %5 = %3 + %4;
+    /// ret %5`, with `%0` and `%1` the arguments.
+    fn straight_line() -> Function {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.long_id);
+        for n in 0..2 {
+            f.add_param(format!("p{n}"), types.long_id);
+            f.add_pseudo(Pseudo::arg(PseudoId(n), n));
         }
-        forbidden.retain(|_, regs| !regs.is_empty());
-        forbidden
-    }
-
-    /// Agrees with pairing on overlapping intervals, a pseudo with two
-    /// intervals, points clobbering one register twice or none, points that
-    /// name an operand twice, and both backends' exemption rules.
-    #[test]
-    fn test_constraint_clobbers_matches_pairing() {
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = |bound: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % bound as u64) as usize
+        for id in 2..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 6;
+        let add = |t: u32, a: u32, b: u32| {
+            Instruction::binop(
+                Opcode::Add,
+                PseudoId(t),
+                PseudoId(a),
+                PseudoId(b),
+                types.long_id,
+                Bits::new(64),
+            )
         };
-        for _ in 0..200 {
-            let intervals: Vec<LiveInterval> = (0..12)
-                .map(|_| {
-                    let start = next(60);
-                    interval(next(8) as u32, start, start + next(30))
-                })
-                .collect();
-            let points: Vec<ConstraintPoint<u8>> = (0..10)
-                .map(|_| ConstraintPoint {
-                    position: next(90),
-                    clobbers: (0..next(4)).map(|_| next(5) as u8).collect(),
-                    involved_pseudos: (0..next(3)).map(|_| PseudoId(next(8) as u32)).collect(),
-                })
-                .collect();
-            let candidates: std::collections::BTreeSet<PseudoId> =
-                (0..8).filter(|p| p % 3 != 2).map(PseudoId).collect();
-            let operand = |cp: &ConstraintPoint<u8>, i: &LiveInterval| {
-                cp.involved_pseudos.contains(&i.pseudo)
-            };
-            let survives = |cp: &ConstraintPoint<u8>, i: &LiveInterval| {
-                cp.operand_survives(i.pseudo, i.start, i.end)
-            };
-            assert_eq!(
-                constraint_clobbers(&points, &intervals, &candidates, operand),
-                clobbers_by_pairing(&points, &intervals, &candidates, operand)
-            );
-            assert_eq!(
-                constraint_clobbers(&points, &intervals, &candidates, survives),
-                clobbers_by_pairing(&points, &intervals, &candidates, survives)
-            );
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(add(2, 0, 0));
+        bb.add_insn(add(3, 2, 2));
+        bb.add_insn(add(4, 3, 0));
+        bb.add_insn(add(5, 3, 4));
+        bb.add_insn(Instruction::ret(Some(PseudoId(5))));
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        f
+    }
+
+    /// Two values share a slot when neither is defined while the other is
+    /// live, and not otherwise: `%2` dies where `%3` is defined -- which also
+    /// reads it, so even there they may not share -- while `%3` is live where
+    /// `%4` is defined. `%2` and `%4` never meet.
+    #[test]
+    fn stack_slots_are_shared_by_liveness() {
+        let f = straight_line();
+        let slot = stack_slots(&f, &[(2, EIGHT), (3, EIGHT), (4, EIGHT)]);
+        assert_ne!(slot[&2], slot[&3], "a def and its own source");
+        assert_ne!(slot[&3], slot[&4], "live together");
+        assert_eq!(slot[&2], slot[&4], "never live together");
+    }
+
+    /// A slot holds one shape: an eight-byte value and a sixteen-byte one
+    /// never share, live together or not.
+    #[test]
+    fn stack_slots_hold_one_shape() {
+        let f = straight_line();
+        let slot = stack_slots(&f, &[(2, EIGHT), (4, SlotShape::new(16, 16))]);
+        assert_ne!(slot[&2], slot[&4]);
+    }
+
+    /// The arguments are all written at entry: two in the frame never share,
+    /// though the second is never read.
+    #[test]
+    fn stack_slots_of_arguments_are_distinct() {
+        let f = straight_line();
+        let slot = stack_slots(&f, &[(0, EIGHT), (1, EIGHT)]);
+        assert_ne!(slot[&0], slot[&1]);
+    }
+
+    /// `.L0: cbr %0, .L1, .L2; .L1: %3 = %0 + %0; br .L3;
+    /// .L2: %4 = %0 + %0; ret %4; .L3: ret %3` -- `%3`'s positions span
+    /// `.L2`, laid out between its def and its use, but it is dead there: the
+    /// two share a slot, as the cases of a `switch` do.
+    #[test]
+    fn stack_slots_follow_liveness_not_layout() {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.long_id);
+        f.add_param("p", types.long_id);
+        f.add_pseudo(Pseudo::arg(PseudoId(0), 0));
+        for id in 3..5 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 5;
+        let [b0, b1, b2, b3] = [0, 1, 2, 3].map(BasicBlockId);
+        let add = |t: u32| {
+            Instruction::binop(
+                Opcode::Add,
+                PseudoId(t),
+                PseudoId(0),
+                PseudoId(0),
+                types.long_id,
+                Bits::new(64),
+            )
+        };
+        let mut entry = BasicBlock::new(b0);
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::cbr(PseudoId(0), b1, b2));
+        entry.children = vec![b1, b2];
+        let mut def = BasicBlock::new(b1);
+        def.add_insn(add(3));
+        def.add_insn(Instruction::br(b3));
+        def.parents = vec![b0];
+        def.children = vec![b3];
+        let mut other = BasicBlock::new(b2);
+        other.add_insn(add(4));
+        other.add_insn(Instruction::ret(Some(PseudoId(4))));
+        other.parents = vec![b0];
+        let mut uses = BasicBlock::new(b3);
+        uses.add_insn(Instruction::ret(Some(PseudoId(3))));
+        uses.parents = vec![b1];
+        for b in [entry, def, other, uses] {
+            f.add_block(b);
+        }
+        f.entry = b0;
+        let slot = stack_slots(&f, &[(3, EIGHT), (4, EIGHT)]);
+        assert_eq!(slot[&3], slot[&4]);
+    }
+
+    /// `%3` is live across a setjmp and read on its second return only; `%5`
+    /// is defined on the first return's path, where `%3` is dead. Liveness
+    /// would let them share, and the `longjmp` from that path would then
+    /// return to `%5` in `%3`'s slot: a value live across an instruction
+    /// that returns twice gets a slot of its own.
+    #[test]
+    fn stack_slot_across_setjmp_is_its_own() {
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut call = Instruction::call(None, "rt", vec![], vec![], types.int_id, Bits::new(32));
+        call.extra_mut().returns_twice_call = true;
+        for twice in [Instruction::new(Opcode::Setjmp), call] {
+            let kind = twice.op;
+            let f = value_across_setjmp(twice);
+            let slot = stack_slots(&f, &[(3, EIGHT), (5, EIGHT)]);
+            assert_ne!(slot[&3], slot[&5], "{kind:?}");
+            // Without the setjmp the two would share.
+            let mut plain = f.clone();
+            plain.blocks[0].insns[2] =
+                Instruction::load(PseudoId(4), PseudoId(2), 0, types.int_id, Bits::new(32));
+            let slot = stack_slots(&plain, &[(3, EIGHT), (5, EIGHT)]);
+            assert_eq!(slot[&3], slot[&5], "{kind:?} replaced by a load");
         }
     }
 
-    /// The work does not grow with intervals x points. Every interval spans
-    /// every point, as the merged live ranges of a function full of gotos do,
-    /// and the exemption rule is asked only about the points each pseudo is an
-    /// operand of: one per interval here, where pairing asked about all of
-    /// them.
+    /// `.L0: cbr %0, .L1, .L2; .L1: %3 = %0 + %0; br .L3;
+    /// .L2: %4 = call g(%0); %5 = %4 + %0; ret %5; .L3: ret %3` -- the call
+    /// at position 4. `%3`'s positions span the call, laid out between its
+    /// def and its use, but it is dead there; `%0` is an argument of the
+    /// call and live after it; `%4` is the call's result.
+    fn call_between() -> (Function, usize) {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.long_id);
+        f.add_param("p", types.long_id);
+        f.add_pseudo(Pseudo::arg(PseudoId(0), 0));
+        for id in 3..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 6;
+        let [b0, b1, b2, b3] = [0, 1, 2, 3].map(BasicBlockId);
+        let add = |t: u32, a: u32| {
+            Instruction::binop(
+                Opcode::Add,
+                PseudoId(t),
+                PseudoId(a),
+                PseudoId(0),
+                types.long_id,
+                Bits::new(64),
+            )
+        };
+        let mut entry = BasicBlock::new(b0);
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::cbr(PseudoId(0), b1, b2));
+        entry.children = vec![b1, b2];
+        let mut def = BasicBlock::new(b1);
+        def.add_insn(add(3, 0));
+        def.add_insn(Instruction::br(b3));
+        def.parents = vec![b0];
+        def.children = vec![b3];
+        let mut call = BasicBlock::new(b2);
+        call.add_insn(Instruction::call(
+            Some(PseudoId(4)),
+            "g",
+            vec![PseudoId(0)],
+            vec![types.long_id],
+            types.long_id,
+            Bits::new(64),
+        ));
+        call.add_insn(add(5, 4));
+        call.add_insn(Instruction::ret(Some(PseudoId(5))));
+        call.parents = vec![b0];
+        let mut uses = BasicBlock::new(b3);
+        uses.add_insn(Instruction::ret(Some(PseudoId(3))));
+        uses.parents = vec![b1];
+        for b in [entry, def, call, uses] {
+            f.add_block(b);
+        }
+        f.entry = b0;
+        (f, 4)
+    }
+
+    /// What crosses an instruction is what is live just after it and not
+    /// defined there: not a value whose positions merely span it, nor its
+    /// own result.
     #[test]
-    fn test_constraint_clobbers_work_is_not_pairwise() {
-        const N: usize = 4000;
-        let intervals: Vec<LiveInterval> = (0..N).map(|p| interval(p as u32, 0, 2 * N)).collect();
-        let points: Vec<ConstraintPoint<u8>> = (0..N)
-            .map(|p| ConstraintPoint {
-                position: 2 * p + 1,
-                clobbers: vec![(p % 3) as u8],
-                involved_pseudos: vec![PseudoId(p as u32)],
-            })
-            .collect();
+    fn a_crossing_is_exact_liveness() {
+        let (f, call) = call_between();
+        let r = compute_live_intervals(&f, |_| None::<(Vec<()>, Vec<PseudoId>)>);
+        let span = r
+            .intervals
+            .iter()
+            .find(|i| i.pseudo == PseudoId(3))
+            .unwrap();
+        assert!(
+            span.start < call && call < span.end,
+            "{span:?} spans the call"
+        );
+        let at = crossings(&f, &r.live_out, &[call].into());
+        let c = &at[&call];
+        assert_eq!(c.across, [PseudoId(0)]);
+        assert_eq!(c.uses, [PseudoId(0)]);
+        assert_eq!(c.defs, [PseudoId(4)]);
+        let crossers: Vec<PseudoId> = c.call_crossers().collect();
+        assert!(!crossers.contains(&PseudoId(3)), "dead across the call");
+        assert!(!crossers.contains(&PseudoId(4)), "the call's own result");
+    }
+
+    /// A constraint point forbids its clobbers to what it touches -- what is
+    /// live across it, what it reads and what it defines -- unless `exempt`
+    /// excuses it, and to nothing else: not to a value whose positions merely
+    /// span it. x86-64's rule excuses an operand that is not live across
+    /// the point.
+    #[test]
+    fn a_constraint_point_clobbers_what_it_touches() {
+        let (f, call) = call_between();
+        let r = compute_live_intervals(&f, |_| None::<(Vec<()>, Vec<PseudoId>)>);
+        let at = crossings(&f, &r.live_out, &[call].into());
         let candidates: std::collections::BTreeSet<PseudoId> =
-            (0..N as u32).map(PseudoId).collect();
-        let asked = std::cell::Cell::new(0usize);
-        let forbidden = constraint_clobbers(&points, &intervals, &candidates, |cp, i| {
-            asked.set(asked.get() + 1);
-            cp.involved_pseudos.contains(&i.pseudo)
-        });
-        assert_eq!(asked.get(), N);
-        // Every pseudo still meets the other points clobbering each register.
-        assert!(forbidden.values().all(|regs| regs.len() == 3));
-        assert_eq!(forbidden.len(), N);
+            [0, 3, 4, 5].into_iter().map(PseudoId).collect();
+        let point = |involved: Vec<PseudoId>| ConstraintPoint {
+            position: call,
+            clobbers: vec![7u8],
+            involved_pseudos: involved,
+        };
+        let forbidden = |cp: ConstraintPoint<u8>| {
+            constraint_clobbers(&[cp], &at, &candidates, |cp, p, across| {
+                cp.operand_survives(p, across)
+            })
+        };
+        let seven: std::collections::BTreeSet<u8> = [7].into();
+        let none = forbidden(point(Vec::new()));
+        assert_eq!(
+            none,
+            [(PseudoId(0), seven.clone()), (PseudoId(4), seven.clone())].into()
+        );
+        // The result is excused; the argument, live across, is not.
+        let operands = forbidden(point(vec![PseudoId(4), PseudoId(0)]));
+        assert_eq!(operands, [(PseudoId(0), seven)].into());
     }
 }

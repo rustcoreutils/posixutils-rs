@@ -44,6 +44,7 @@ use super::codegen::CodeGenBase;
 use super::lir::{internal_label, Directive, EmitAsm, Label, LirInst, Symbol, SymbolType};
 use crate::ir::{Function, Instruction};
 use crate::target::Os;
+use crate::units::ByteSize;
 
 /// gcc's personality routine for C.
 const PERSONALITY: &str = "__gcc_personality_v0";
@@ -74,7 +75,7 @@ pub enum CallArgsArea {
     Fixed(i64),
     /// `sp` was realigned by an amount only known at run time, and its old
     /// value stored this many bytes above the new one.
-    Realigned { saved_sp: i32 },
+    Realigned { saved_sp: i64 },
 }
 
 /// The landing of a call whose argument area was realigned: a few
@@ -83,7 +84,7 @@ pub enum CallArgsArea {
 /// which knows the instructions ([`CodeGenBase::take_eh_detours`]).
 pub struct SpDetour {
     pub label: Label,
-    pub saved_sp: i32,
+    pub saved_sp: i64,
     pub pad: Label,
 }
 
@@ -298,7 +299,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         });
         self.push_directive(Directive::Size {
             sym: sym.clone(),
-            size: 8,
+            size: ByteSize::new(8),
         });
         self.push_directive(Directive::GlobalLabel(sym));
         self.push_directive(Directive::QuadSym(Symbol::extern_sym(PERSONALITY)));

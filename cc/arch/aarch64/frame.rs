@@ -23,13 +23,14 @@ use crate::arch::lir::{
 };
 use crate::ir::{Function, Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Bits, ByteSize};
 use std::collections::HashSet;
 
 /// The most bytes this back end moves with unrolled loads and stores; past it,
 /// [`Aarch64CodeGen::emit_block_copy_loop`]. It is the bound the IR puts on an
 /// expanded `memcpy`, for the same reason: the instruction count of an unrolled
 /// copy is linear in the object.
-pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES;
+pub(super) const UNROLL_LIMIT_BYTES: ByteSize = crate::ir::memexpand::INLINE_LIMIT_BYTES;
 
 /// Where a frame's areas lie, as displacements up from x29, which points at
 /// the frame record at the bottom of the frame.
@@ -47,14 +48,14 @@ pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BY
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct FrameLayout {
     /// The callee-saved registers' area.
-    pub saves_at: i32,
+    pub saves_at: i64,
     /// Where the locals begin; an over-aligned frame's base register is
     /// rounded up from here.
-    pub locals_base: i32,
+    pub locals_base: i64,
     /// Where the locals end: a slot's displacement is measured down from it.
-    pub locals_top: i32,
+    pub locals_top: i64,
     /// A protected function's copy of the frame record.
-    pub record_copy: Option<i32>,
+    pub record_copy: Option<i64>,
 }
 
 impl FrameLayout {
@@ -70,8 +71,8 @@ impl FrameLayout {
     /// function outright ("immediate offset out of range"). `x29` is
     /// 16-aligned at any public interface, so a 16-aligned displacement
     /// from it keeps every slot 16-aligned too.
-    pub fn of(guarded: bool, saves: i32, locals: i32, va_area: i32) -> (Self, i32, i32) {
-        let round = |n: i32| (n + 15) & !15;
+    pub fn of(guarded: bool, saves: i64, locals: i64, va_area: i64) -> (Self, i64, i64) {
+        let round = |n: i64| (n + 15) & !15;
         if guarded {
             let locals_top = round(16 + locals);
             let saves_at = locals_top + va_area;
@@ -149,7 +150,7 @@ impl Aarch64CodeGen {
         // On Darwin (macOS/iOS), variadic args are passed on the stack by the caller,
         // so we don't need a register save area.
         let is_darwin = self.base.target.os == crate::target::Os::MacOS;
-        let reg_save_area_size: i32 = if is_variadic && !is_darwin {
+        let reg_save_area_size: i64 = if is_variadic && !is_darwin {
             VA_GR_SAVE_BYTES + VA_VR_SAVE_BYTES
         } else {
             0
@@ -160,9 +161,9 @@ impl Aarch64CodeGen {
         // Round up callee-saved counts to even for 16-byte alignment
         // Note: AAPCS64 only requires the lower 64 bits of V8-V15 to be preserved (d8-d15)
         let callee_saved_gp_pairs = callee_saved.len().div_ceil(2);
-        let callee_saved_gp_size = callee_saved_gp_pairs as i32 * 16;
+        let callee_saved_gp_size = callee_saved_gp_pairs as i64 * 16;
         let callee_saved_fp_pairs = callee_saved_fp.len().div_ceil(2);
-        let callee_saved_fp_size = callee_saved_fp_pairs as i32 * 16; // 8 bytes per d-reg, 16 per pair
+        let callee_saved_fp_size = callee_saved_fp_pairs as i64 * 16; // 8 bytes per d-reg, 16 per pair
         let callee_saved_size = callee_saved_gp_size + callee_saved_fp_size;
 
         let (layout, save_area_base, total_frame) = FrameLayout::of(
@@ -171,6 +172,15 @@ impl Aarch64CodeGen {
             stack_size,
             reg_save_area_size,
         );
+        // On Darwin a frame the protection probes stores a record of its own
+        // at its top before the probes run (`emit_record_first`), sixteen
+        // more bytes above everything `layout` placed.
+        let record_first = is_darwin && self.base.frame_probe_plan(total_frame + 16).is_some();
+        let total_frame = if record_first {
+            total_frame + 16
+        } else {
+            total_frame
+        };
         self.layout = layout;
         self.reg_save_area_offset = if is_variadic { save_area_base } else { 0 };
 
@@ -196,10 +206,8 @@ impl Aarch64CodeGen {
         for directive in self.base.patchable_entry(func, false) {
             self.push_lir(Aarch64Inst::Directive(directive));
         }
-        self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
-        self.base.check_stack_clash(func, total_frame as i64);
-        self.base
-            .check_frame_size(i64::from(stack_size + reg_save_area_size));
+        self.emit_prologue(total_frame, record_first, &callee_saved, &callee_saved_fp);
+        self.base.check_frame_size(stack_size + reg_save_area_size);
 
         self.emit_frame_base_latch();
         self.emit_stack_guard_set();
@@ -236,6 +244,10 @@ impl Aarch64CodeGen {
         for block in &func.blocks {
             self.emit_block(block, &frame_info, types);
         }
+        // The frame the prologue allocates, frame record and saved
+        // registers included: gcc's measure here, the return address being
+        // in a register.
+        self.base.record_stack_usage(func, total_frame);
 
         // The landings of calls whose argument area was realigned: `sp`
         // back from where the call saved it, then the pad (`arch::eh`).
@@ -299,7 +311,7 @@ impl Aarch64CodeGen {
             size: OperandSize::B64,
             dst: base,
             src1: Reg::X29,
-            src2: GpOperand::Imm((base_offset + max_align - 1) as i64),
+            src2: GpOperand::Imm(base_offset + i64::from(max_align) - 1),
         });
         // AND with bitmask: aarch64 AND (immediate) encodes bitmasks
         self.push_lir(Aarch64Inst::And {
@@ -335,7 +347,7 @@ impl Aarch64CodeGen {
                 .and_then(|l| self.loc_addr_parts(&l))
                 .map(|(reg, off)| crate::arch::dwarf::VarLocation {
                     reg: reg.dwarf_number(),
-                    offset: off as i64,
+                    offset: off,
                 });
             vars.push(crate::arch::dwarf::VarDie {
                 name: name.clone(),
@@ -476,7 +488,7 @@ impl Aarch64CodeGen {
     /// with `.cfi_startproc`, as gcc's `-fasynchronous-unwind-tables` does,
     /// not with `-g`. Each follows the instruction that makes it true, so the
     /// CFA and every saved register are described at every instruction.
-    fn push_cfi(&mut self, rule: Directive) {
+    pub(super) fn push_cfi(&mut self, rule: Directive) {
         if self.base.cfi.emitted() {
             self.push_lir(Aarch64Inst::Directive(rule));
         }
@@ -488,7 +500,7 @@ impl Aarch64CodeGen {
     /// The legalizer would split an immediate past 4095 into two
     /// instructions behind one LIR entry, leaving the CFA wrong between them,
     /// so the split is made here: the shifted part, then the rest.
-    fn emit_sp_adjust(&mut self, delta: i32, mut cfa: i32) {
+    pub(super) fn emit_sp_adjust(&mut self, delta: i64, mut cfa: i64) {
         let bytes = delta.abs();
         let hi = bytes & !0xFFF;
         let parts = if hi != 0 && hi != bytes && bytes < 1 << 24 {
@@ -497,7 +509,7 @@ impl Aarch64CodeGen {
             vec![bytes]
         };
         for part in parts {
-            let (src1, src2, dst) = (Reg::SP, GpOperand::Imm(part.into()), Reg::SP);
+            let (src1, src2, dst) = (Reg::SP, GpOperand::Imm(part), Reg::SP);
             let size = OperandSize::B64;
             if delta < 0 {
                 self.push_lir(Aarch64Inst::Sub {
@@ -525,13 +537,19 @@ impl Aarch64CodeGen {
     /// The frame record sits at the bottom of the frame, so once X29 points at
     /// it the CFA is X29 + `total_frame` for the rest of the function, however
     /// `alloca` moves SP.
-    fn emit_prologue(&mut self, total_frame: i32, callee_saved: &[Reg], callee_saved_fp: &[VReg]) {
+    fn emit_prologue(
+        &mut self,
+        total_frame: i64,
+        record_first: bool,
+        callee_saved: &[Reg],
+        callee_saved_fp: &[VReg],
+    ) {
         let fp = Reg::fp();
         let lr = Reg::lr();
 
         // AArch64 stp/ldp pre/post-indexed addressing has a limited offset range: [-512, 504]
         // For large frames, we must use separate sub/add and stp/ldp instructions
-        const MAX_STP_OFFSET: i32 = 504;
+        const MAX_STP_OFFSET: i64 = 504;
 
         if total_frame <= MAX_STP_OFFSET {
             // Combined push and allocate: stp x29, x30, [sp, #-N]!
@@ -545,9 +563,12 @@ impl Aarch64CodeGen {
                 },
             });
             self.push_cfi(Directive::CfiDefCfaOffset(total_frame));
+        } else if record_first {
+            self.emit_record_first(total_frame);
         } else {
-            // Large frame: separate sub and stp
-            self.emit_sp_adjust(-total_frame, 0);
+            // Large frame: separate sub and stp, the sub probed under
+            // `-fstack-clash-protection` once the frame could jump the guard
+            self.emit_frame_allocation(total_frame);
             // stp x29, x30, [sp]
             self.push_lir(Aarch64Inst::Stp {
                 size: OperandSize::B64,
@@ -580,14 +601,69 @@ impl Aarch64CodeGen {
             src: GpOperand::Reg(Reg::SP),
             dst: fp,
         });
-        self.push_cfi(Directive::cfi_def_cfa_register("x29"));
+        if record_first {
+            // The CFA was x29 + 16 while x29 named the record at the top.
+            self.push_cfi(Directive::cfi_def_cfa("x29", total_frame));
+        } else {
+            self.push_cfi(Directive::cfi_def_cfa_register("x29"));
+        }
 
         // Save callee-saved GP registers in pairs
         self.save_callee_saved_gp_regs(total_frame, callee_saved);
 
         // Save callee-saved FP registers in pairs
-        let gp_offset = self.layout.saves_at + (callee_saved.len().div_ceil(2) as i32 * 16);
+        let gp_offset = self.layout.saves_at + (callee_saved.len().div_ceil(2) as i64 * 16);
         self.save_callee_saved_fp_regs(total_frame, callee_saved_fp, gp_offset);
+    }
+
+    /// The prologue of a Darwin frame the protection probes, up to the
+    /// frame record at its bottom: a record of its own at the top first,
+    /// with x29 at it, then the probed allocation, then the bottom record,
+    /// stored from the caller's x29 the top one keeps.
+    ///
+    /// Darwin's `backtrace()`, its crash reports and its samplers walk the
+    /// frame-pointer chain, not the CFI. gcc's order -- probe, then store
+    /// the record -- leaves x29 at the caller's record while the probes run,
+    /// with this function's return address only in x30: a fault on the guard
+    /// there is walked from this function straight to its caller's caller.
+    /// clang stores the record before it calls `___chkstk_darwin` for the
+    /// same reason. The top record costs sixteen bytes, and `total_frame`
+    /// counts them.
+    fn emit_record_first(&mut self, total_frame: i64) {
+        let fp = Reg::fp();
+        let lr = Reg::lr();
+        self.push_lir(Aarch64Inst::Stp {
+            size: OperandSize::B64,
+            src1: fp,
+            src2: lr,
+            addr: MemAddr::PreIndex {
+                base: Reg::SP,
+                offset: -16,
+            },
+        });
+        self.push_cfi(Directive::CfiDefCfaOffset(16));
+        self.push_cfi(Directive::cfi_offset("x29", -16));
+        self.push_cfi(Directive::cfi_offset("x30", -8));
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::SP),
+            dst: fp,
+        });
+        self.push_cfi(Directive::cfi_def_cfa_register("x29"));
+        // The CFA is x29-based now, so the probed moves of `sp` need no rule.
+        self.emit_frame_body_allocation(total_frame - 16);
+        // stp <caller's x29>, x30, [sp]: the record the frame keeps.
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: MemAddr::Base(fp),
+            dst: Reg::X16,
+        });
+        self.push_lir(Aarch64Inst::Stp {
+            size: OperandSize::B64,
+            src1: Reg::X16,
+            src2: lr,
+            addr: MemAddr::Base(Reg::SP),
+        });
     }
 
     /// Copy `bytes` bytes from `[src]` to `[dst]`, in a counted loop over the
@@ -606,13 +682,14 @@ impl Aarch64CodeGen {
     /// `va_arg` sequence has free. Both `src` and `dst` are cursors and are
     /// left past the object, so the caller must be finished with them; X17
     /// holds the end of the paired part and then shuttles the tail.
-    pub(super) fn emit_block_copy_loop(&mut self, dst: Reg, src: Reg, bytes: i64) {
-        let pairs = bytes & !15;
-        if pairs > 0 {
+    pub(super) fn emit_block_copy_loop(&mut self, dst: Reg, src: Reg, bytes: ByteSize) {
+        let pairs = ByteSize::new(bytes.get() & !15);
+        let tail = ByteSize::new(bytes.get() & 15);
+        if !pairs.is_zero() {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: src,
-                src2: GpOperand::Imm(pairs),
+                src2: GpOperand::Imm(pairs.to_i64()),
                 dst: Reg::X17,
             });
             let top = self.next_unique_label("block_copy");
@@ -644,13 +721,13 @@ impl Aarch64CodeGen {
             });
         }
         // The cursors point at the tail, so its pieces are offsets from them.
-        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes - pairs) {
+        for (off, chunk) in crate::ir::memexpand::block_chunks(tail) {
             let size = OperandSize::from_bits(chunk.bits());
             self.push_lir(Aarch64Inst::Ldr {
                 size,
                 addr: MemAddr::BaseOffset {
                     base: src,
-                    offset: off as i32,
+                    offset: off,
                 },
                 dst: Reg::X17,
             });
@@ -659,14 +736,14 @@ impl Aarch64CodeGen {
                 src: Reg::X17,
                 addr: MemAddr::BaseOffset {
                     base: dst,
-                    offset: off as i32,
+                    offset: off,
                 },
             });
         }
     }
 
     /// Save callee-saved GP registers in pairs (or single if odd count)
-    fn save_callee_saved_gp_regs(&mut self, total_frame: i32, callee_saved: &[Reg]) {
+    fn save_callee_saved_gp_regs(&mut self, total_frame: i64, callee_saved: &[Reg]) {
         let mut offset = self.layout.saves_at;
         let mut i = 0;
         while i < callee_saved.len() {
@@ -711,9 +788,9 @@ impl Aarch64CodeGen {
     /// Save callee-saved FP registers (d8-d15) in pairs
     fn save_callee_saved_fp_regs(
         &mut self,
-        total_frame: i32,
+        total_frame: i64,
         callee_saved_fp: &[VReg],
-        start_offset: i32,
+        start_offset: i64,
     ) {
         let mut offset = start_offset;
         let mut i = 0;
@@ -765,7 +842,7 @@ impl Aarch64CodeGen {
     fn emit_variadic_save_area(&mut self) {
         let arg_regs = Reg::arg_regs();
         for (i, reg) in arg_regs.iter().enumerate() {
-            let offset = self.reg_save_area_offset + (i as i32 * 8);
+            let offset = self.reg_save_area_offset + (i as i64 * 8);
             self.push_lir(Aarch64Inst::Str {
                 size: OperandSize::B64,
                 src: *reg,
@@ -779,7 +856,7 @@ impl Aarch64CodeGen {
         // The SIMD half stores whole q registers: a `long double` unnamed
         // argument is binary128 and occupies the full 16-byte slot.
         for (i, vreg) in VReg::arg_regs().iter().enumerate() {
-            let offset = self.reg_save_area_offset + VA_GR_SAVE_BYTES + (i as i32 * 16);
+            let offset = self.reg_save_area_offset + VA_GR_SAVE_BYTES + (i as i64 * 16);
             self.push_lir(Aarch64Inst::StrFp {
                 size: FpSize::Quad,
                 src: *vreg,
@@ -825,7 +902,7 @@ impl Aarch64CodeGen {
     /// `struct { float x, y; }`, whose elements are 4 bytes -- so using it for
     /// both copied HFAs at twice their stride, reading and writing 8 bytes
     /// past each end.
-    fn two_element_fp_info(&self, typ: TypeId, types: &TypeTable) -> (FpSize, i32) {
+    fn two_element_fp_info(&self, typ: TypeId, types: &TypeTable) -> (FpSize, i64) {
         if types.is_complex_float(typ) {
             return complex_fp_info(types, &self.base.target, typ);
         }
@@ -851,7 +928,7 @@ impl Aarch64CodeGen {
         typ: TypeId,
         types: &TypeTable,
         pseudo: PseudoId,
-        elems: i32,
+        elems: i64,
     ) {
         let param_name = &func.params[param_idx].0;
         let Some(local) = func.locals.get(param_name) else {
@@ -912,7 +989,7 @@ impl Aarch64CodeGen {
                 Reg::X9
             }
             _ => {
-                self.emit_move(src, Reg::X9, 64);
+                self.emit_move(src, Reg::X9, Bits::new(64));
                 Reg::X9
             }
         }
@@ -1070,8 +1147,8 @@ impl Aarch64CodeGen {
                             // body reads, exactly as the spilled-HFA
                             // case does; without this the parameter was
                             // left uninitialized.
-                            let bytes = crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                            let bytes = crate::abi::checked_slot_size(
+                                types.byte_size(*typ),
                                 crate::arch::func_pos(func),
                                 "a stacked parameter",
                             );
@@ -1080,9 +1157,8 @@ impl Aarch64CodeGen {
                             // the widths are `block_chunks`'s so the tail of
                             // one that is not a multiple of eight is moved as
                             // wide as it is and no wider.
-                            for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
+                            for (done, chunk) in crate::ir::memexpand::block_chunks(bytes) {
                                 let size = OperandSize::from_bits(chunk.bits());
-                                let done = done as i32;
                                 self.push_lir(Aarch64Inst::Ldr {
                                     size,
                                     addr: self.incoming_mem_plus(incoming, done),
@@ -1113,7 +1189,7 @@ impl Aarch64CodeGen {
                                     self.push_lir(Aarch64Inst::StrFp {
                                         size: fp_size,
                                         src: fp_arg_regs[fp_arg_idx + elem],
-                                        addr: self.stack_mem_plus(offset, elem as i32 * elem_bytes),
+                                        addr: self.stack_mem_plus(offset, elem as i64 * elem_bytes),
                                     });
                                 }
                             }
@@ -1132,32 +1208,52 @@ impl Aarch64CodeGen {
                             *typ,
                             types,
                             pseudo.id,
-                            count as i32,
+                            count as i64,
                         );
                     }
                     fp_arg_idx += count;
                 } else if is_fp {
                     // FP argument
                     if fp_arg_idx < fp_arg_regs.len() {
-                        if let Some(Loc::Stack(offset)) = self.locations.get_ref(pseudo.id) {
-                            // From the type, not a `32 or else`
-                            // guess: `long double` is binary128
-                            // here, and storing it as a double
-                            // dropped its top eight bytes, so the
-                            // *second* such parameter came back
-                            // truncated while the first, stored
-                            // elsewhere, was whole.
-                            let fp_size = FpSize::from_type_or_bits(
-                                Some(*typ),
-                                types.size_bits(*typ),
-                                types,
-                                &self.base.target,
-                            );
-                            self.push_lir(Aarch64Inst::StrFp {
-                                size: fp_size,
-                                src: fp_arg_regs[fp_arg_idx],
-                                addr: self.stack_mem(*offset),
-                            });
+                        // From the type, not a `32 or else`
+                        // guess: `long double` is binary128
+                        // here, and storing it as a double
+                        // dropped its top eight bytes, so the
+                        // *second* such parameter came back
+                        // truncated while the first, stored
+                        // elsewhere, was whole. And from this
+                        // target's width of it: binary128 on Linux,
+                        // a double on Darwin, never x87's format.
+                        let fp_size =
+                            self.fp_size_from_type(Some(*typ), types.value_bits(*typ), types);
+                        let from = fp_arg_regs[fp_arg_idx];
+                        match self.locations.get_ref(pseudo.id) {
+                            Some(Loc::Stack(offset)) => {
+                                self.push_lir(Aarch64Inst::StrFp {
+                                    size: fp_size,
+                                    src: from,
+                                    addr: self.stack_mem(*offset),
+                                });
+                            }
+                            // Colored away from the register it arrived in,
+                            // which a call it crosses overwrites: into one of
+                            // V8-V15, never another argument's register.
+                            // Moved as a double unless it is wider: `fmov` of
+                            // a half register needs FEAT_FP16.
+                            Some(&Loc::VReg(to)) if to != from => {
+                                debug_assert!(!fp_arg_regs.contains(&to));
+                                let size = if fp_size == FpSize::Quad {
+                                    FpSize::Quad
+                                } else {
+                                    FpSize::Double
+                                };
+                                self.push_lir(Aarch64Inst::FmovReg {
+                                    size,
+                                    src: from,
+                                    dst: to,
+                                });
+                            }
+                            _ => {}
                         }
                     }
                     fp_arg_idx += 1;
@@ -1223,16 +1319,16 @@ impl Aarch64CodeGen {
         );
         match plan {
             PairMove::InOrder => {
-                self.emit_move(s0, d0, 64);
-                self.emit_move(s1, d1, 64);
+                self.emit_move(s0, d0, Bits::new(64));
+                self.emit_move(s1, d1, Bits::new(64));
             }
             PairMove::Reversed => {
-                self.emit_move(s1, d1, 64);
-                self.emit_move(s0, d0, 64);
+                self.emit_move(s1, d1, Bits::new(64));
+                self.emit_move(s0, d0, Bits::new(64));
             }
             PairMove::Swap => {
-                self.emit_move(s0, Reg::X9, 64);
-                self.emit_move(s1, d1, 64);
+                self.emit_move(s0, Reg::X9, Bits::new(64));
+                self.emit_move(s1, d1, Bits::new(64));
                 self.push_lir(Aarch64Inst::Mov {
                     size: OperandSize::B64,
                     dst: d0,
@@ -1316,8 +1412,8 @@ impl Aarch64CodeGen {
             // Derive return size from type to avoid 32-bit truncation
             let ret_typ = insn.typ;
             let ret_size = ret_typ
-                .map(|t| types.size_bits(t).max(32))
-                .unwrap_or(insn.size.max(32));
+                .map_or(insn.size, |t| types.value_bits(t))
+                .max(Bits::new(32));
 
             if let Some((fp_size, 1)) = hfa_ret {
                 // One V register carries all of it. The linearizer hands the
@@ -1325,7 +1421,7 @@ impl Aarch64CodeGen {
                 // sixteen-byte value reaches here; assemble them into the
                 // register's two lanes, exactly as gcc does.
                 if insn.src.len() == 2 {
-                    self.emit_move(src, Reg::X9, 64);
+                    self.emit_move(src, Reg::X9, Bits::new(64));
                     if fp_size == FpSize::Quad {
                         self.push_lir(Aarch64Inst::FmovFromGp {
                             size: FpSize::Double,
@@ -1333,7 +1429,7 @@ impl Aarch64CodeGen {
                             dst: VReg::V0,
                         });
                         if let Some(&src2) = insn.src.get(1) {
-                            self.emit_move(src2, Reg::X9, 64);
+                            self.emit_move(src2, Reg::X9, Bits::new(64));
                             self.push_lir(Aarch64Inst::InsGpToVecD {
                                 lane: 1,
                                 src: Reg::X9,
@@ -1348,7 +1444,7 @@ impl Aarch64CodeGen {
                         });
                     }
                 } else {
-                    let hfa_bits = insn.typ.map_or(0, |t| types.size_bits(t));
+                    let hfa_bits = insn.typ.map_or(Bits::ZERO, |t| types.value_bits(t));
                     match src_loc {
                         // Eight bytes or fewer, already loaded into a general
                         // register: move it across. This is the common shape --
@@ -1356,7 +1452,7 @@ impl Aarch64CodeGen {
                         // than handing over its address -- and leaving it in
                         // `x0` is what made the callee and the caller, which
                         // reads `s0`/`d0`, disagree inside one program.
-                        Loc::Reg(r) if hfa_bits <= 64 => {
+                        Loc::Reg(r) if hfa_bits <= Bits::new(64) => {
                             self.push_lir(Aarch64Inst::FmovFromGp {
                                 size: fp_size,
                                 src: r,
@@ -1364,7 +1460,7 @@ impl Aarch64CodeGen {
                             });
                         }
                         // Eight bytes or fewer: the slot holds the value.
-                        Loc::Stack(offset) if hfa_bits <= 64 => {
+                        Loc::Stack(offset) if hfa_bits <= Bits::new(64) => {
                             self.push_lir(Aarch64Inst::LdrFp {
                                 size: fp_size,
                                 dst: VReg::V0,
@@ -1411,14 +1507,14 @@ impl Aarch64CodeGen {
                 if insn.src.len() == 2 && count == 2 {
                     // Two-source path: linearizer pre-loaded struct halves as integers.
                     // Move from GP registers to V0/V1 via FmovFromGp.
-                    self.emit_move(src, Reg::X9, 64);
+                    self.emit_move(src, Reg::X9, Bits::new(64));
                     self.push_lir(Aarch64Inst::FmovFromGp {
                         size: fp_size,
                         src: Reg::X9,
                         dst: VReg::V0,
                     });
                     if let Some(&src2) = insn.src.get(1) {
-                        self.emit_move(src2, Reg::X9, 64);
+                        self.emit_move(src2, Reg::X9, Bits::new(64));
                         self.push_lir(Aarch64Inst::FmovFromGp {
                             size: fp_size,
                             src: Reg::X9,
@@ -1433,14 +1529,14 @@ impl Aarch64CodeGen {
                     // four. Dereferencing the value's own bytes is what a
                     // two-element half-precision HFA started doing the moment
                     // it became an HFA at all.
-                    let hfa_bits = insn.typ.map_or(0, |t| types.size_bits(t));
+                    let hfa_bits = insn.typ.map_or(Bits::ZERO, |t| types.value_bits(t));
                     match src_loc {
-                        Loc::Stack(offset) if hfa_bits <= 64 => {
+                        Loc::Stack(offset) if hfa_bits <= Bits::new(64) => {
                             for (i, &dst) in ret_regs[..count].iter().enumerate() {
                                 self.push_lir(Aarch64Inst::LdrFp {
                                     size: fp_size,
                                     dst,
-                                    addr: self.stack_field(offset, i as i32 * elem_offset),
+                                    addr: self.stack_field(offset, i as i64 * elem_offset),
                                 });
                             }
                         }
@@ -1456,7 +1552,7 @@ impl Aarch64CodeGen {
                                     dst,
                                     addr: MemAddr::BaseOffset {
                                         base: Reg::X9,
-                                        offset: i as i32 * elem_offset,
+                                        offset: i as i64 * elem_offset,
                                     },
                                 });
                             }
@@ -1465,7 +1561,7 @@ impl Aarch64CodeGen {
                         // value, not a pointer to it, so the elements come out
                         // of it by shifting rather than by loading. Treating it
                         // as an address dereferenced the value's own bits.
-                        Loc::Reg(r) if hfa_bits <= 64 => {
+                        Loc::Reg(r) if hfa_bits <= Bits::new(64) => {
                             for (i, &dst) in ret_regs[..count].iter().enumerate() {
                                 let gp = if i == 0 {
                                     r
@@ -1473,7 +1569,7 @@ impl Aarch64CodeGen {
                                     self.push_lir(Aarch64Inst::Lsr {
                                         size: OperandSize::B64,
                                         src: r,
-                                        amount: GpOperand::Imm((i as i32 * elem_offset * 8) as i64),
+                                        amount: GpOperand::Imm(i as i64 * elem_offset * 8),
                                         dst: Reg::X9,
                                     });
                                     Reg::X9
@@ -1492,7 +1588,7 @@ impl Aarch64CodeGen {
                                     dst,
                                     addr: MemAddr::BaseOffset {
                                         base: r,
-                                        offset: i as i32 * elem_offset,
+                                        offset: i as i64 * elem_offset,
                                     },
                                 });
                             }
@@ -1503,7 +1599,7 @@ impl Aarch64CodeGen {
             } else if insn.returns_two_regs() {
                 match insn.src.get(1).copied() {
                     Some(src2) => self.emit_gp_pair_move((src, Reg::X0), (src2, Reg::X1)),
-                    None => self.emit_move(src, Reg::X0, 64),
+                    None => self.emit_move(src, Reg::X0, Bits::new(64)),
                 }
             } else if let Some(gp_n) =
                 insn.typ
@@ -1528,7 +1624,7 @@ impl Aarch64CodeGen {
                         dst: *reg,
                         addr: MemAddr::BaseOffset {
                             base,
-                            offset: (k * 8) as i32,
+                            offset: (k * 8) as i64,
                         },
                     });
                 }
@@ -1595,11 +1691,11 @@ impl Aarch64CodeGen {
                 } else if let Loc::Imm(v) = loc {
                     // A constant: both halves. The fallback below zeroed the
                     // high one, so `return (i128)1 << 100;` returned 0.
-                    self.emit_mov_imm(Reg::X0, v as u64 as i64, 64);
-                    self.emit_mov_imm(Reg::X1, (v >> 64) as u64 as i64, 64);
+                    self.emit_mov_imm(Reg::X0, v as u64 as i64, Bits::new(64));
+                    self.emit_mov_imm(Reg::X1, (v >> 64) as u64 as i64, Bits::new(64));
                 } else {
                     // Fallback: load lo half to X0, zero X1
-                    self.emit_move(src, Reg::X0, 64);
+                    self.emit_move(src, Reg::X0, Bits::new(64));
                     self.push_lir(Aarch64Inst::Mov {
                         size: OperandSize::B64,
                         src: GpOperand::Reg(Reg::Xzr),
@@ -1697,7 +1793,7 @@ impl Aarch64CodeGen {
 
         // Restore fp/lr and deallocate stack
         // AArch64 ldp post-indexed addressing has a limited offset range: [-512, 504]
-        const MAX_LDP_OFFSET: i32 = 504;
+        const MAX_LDP_OFFSET: i64 = 504;
         let dealloc = self.frame_size;
 
         if let Some(copy) = self.layout.record_copy {

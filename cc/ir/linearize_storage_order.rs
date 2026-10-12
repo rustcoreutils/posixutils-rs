@@ -39,6 +39,7 @@ use crate::float::{FloatVal, FpFormat};
 use crate::ir::Access;
 use crate::target::ByteOrder;
 use crate::types::{TypeId, TypeKind};
+use crate::units::ByteSize;
 
 impl<'a> Linearizer<'a> {
     /// A `Load` or `Store` of an object stored in reverse order, emitted as
@@ -52,7 +53,7 @@ impl<'a> Linearizer<'a> {
         if !self.types.reverses_storage(typ) {
             return Some(insn);
         }
-        if self.types.size_bytes(typ) <= 1 {
+        if self.types.byte_size(typ) <= ByteSize::new(1) {
             // One byte has no order: the access is the target's own.
             insn.typ = Some(self.native_scalar_type(typ));
             return Some(insn);
@@ -81,11 +82,11 @@ impl<'a> Linearizer<'a> {
         typ: TypeId,
         access: Access,
     ) {
-        let bytes = self.types.size_bytes(typ);
+        let bytes = self.types.byte_size(typ).to_usize();
         if !self.reject_unswappable(typ) && self.types.is_integer(typ) && bytes <= 8 {
             let word = self.word_type(bytes);
             let raw = self.alloc_reg_pseudo();
-            let bits = self.types.size_bits(word);
+            let bits = self.types.value_bits(word);
             self.emit(Instruction::load(raw, addr, offset, word, bits).with_access(access));
             self.emit_bswap_into(target, raw, bytes);
             return;
@@ -93,7 +94,7 @@ impl<'a> Linearizer<'a> {
         let native = self.native_scalar_type(typ);
         let temp = self.frame_temp_addr("__sso", native);
         self.copy_reversed(temp, 0, addr, offset, bytes, (Access::default(), access));
-        let bits = self.types.size_bits(native);
+        let bits = self.types.value_bits(native);
         self.emit(Instruction::load(target, temp, 0, native, bits));
     }
 
@@ -107,18 +108,18 @@ impl<'a> Linearizer<'a> {
         typ: TypeId,
         access: Access,
     ) {
-        let bytes = self.types.size_bytes(typ);
+        let bytes = self.types.byte_size(typ).to_usize();
         if !self.reject_unswappable(typ) && self.types.is_integer(typ) && bytes <= 8 {
             let word = self.word_type(bytes);
             let swapped = self.alloc_reg_pseudo();
             self.emit_bswap_into(swapped, value, bytes);
-            let bits = self.types.size_bits(word);
+            let bits = self.types.value_bits(word);
             self.emit(Instruction::store(swapped, addr, offset, word, bits).with_access(access));
             return;
         }
         let native = self.native_scalar_type(typ);
         let temp = self.frame_temp_addr("__sso", native);
-        let bits = self.types.size_bits(native);
+        let bits = self.types.value_bits(native);
         self.emit(Instruction::store(value, temp, 0, native, bits));
         self.copy_reversed(addr, offset, temp, 0, bytes, (access, Access::default()));
     }
@@ -138,7 +139,7 @@ impl<'a> Linearizer<'a> {
     ) {
         let step = bytes.min(8);
         let word = self.word_type(step);
-        let bits = self.types.size_bits(word);
+        let bits = self.types.value_bits(word);
         for k in 0..bytes / step {
             let from = src_offset + (k * step) as i64;
             let to = dst_offset + (bytes - (k + 1) * step) as i64;
@@ -159,8 +160,13 @@ impl<'a> Linearizer<'a> {
             8 => (Opcode::Bswap64, self.types.ulonglong_id),
             _ => unreachable!("no {bytes}-byte swap: the callers split wider values into words"),
         };
-        let bits = (bytes * 8) as u32;
-        self.emit(Instruction::unop(op, target, value, typ, bits));
+        self.emit(Instruction::unop(
+            op,
+            target,
+            value,
+            typ,
+            self.types.value_bits(typ),
+        ));
     }
 
     /// The unsigned integer type of `bytes` bytes.
@@ -184,7 +190,7 @@ impl<'a> Linearizer<'a> {
             TypeKind::Float16 => self.types.float16_id,
             TypeKind::Float128 => self.types.float128_id,
             TypeKind::Bool => self.types.bool_id,
-            _ => self.word_type(self.types.size_bytes(typ)),
+            _ => self.word_type(self.types.byte_size(typ).to_usize()),
         }
     }
 
@@ -215,8 +221,8 @@ impl<'a> Linearizer<'a> {
             return addr;
         }
         let half = self.types.complex_base(typ);
-        let half_bytes = self.types.size_bytes(half) as i64;
-        let half_bits = self.types.size_bits(half);
+        let half_bytes = self.types.byte_size(half).to_i64();
+        let half_bits = self.types.value_bits(half);
         let access = Access::of(self.types, typ);
         let copy = self.frame_temp_addr("__sso", self.types.make_complex(half));
         for offset in [0, half_bytes] {
@@ -251,11 +257,11 @@ impl<'a> Linearizer<'a> {
             let Some(elem) = self.types.base_type(typ) else {
                 return init;
             };
-            let elem_size = self.types.size_bytes(elem);
-            if !self.types.reverses_storage(elem) || elem_size <= 1 {
+            let elem_size = self.types.byte_size(elem);
+            if !self.types.reverses_storage(elem) || elem_size <= ByteSize::new(1) {
                 return init;
             }
-            let total = self.types.size_bytes(typ);
+            let total = self.types.byte_size(typ);
             return match init.string_as_array(elem_size, total) {
                 Some(Initializer::Array {
                     elem_size,
@@ -294,7 +300,7 @@ impl<'a> Linearizer<'a> {
     /// The initializer of the scalar `typ` (an integer or real floating
     /// type, read at its own width) with its bytes reversed.
     fn reversed_scalar(&self, init: Initializer, typ: TypeId) -> Initializer {
-        let bytes = self.types.size_bytes(typ);
+        let bytes = self.types.byte_size(typ).to_usize();
         if bytes <= 1 || matches!(init, Initializer::None) {
             return init;
         }

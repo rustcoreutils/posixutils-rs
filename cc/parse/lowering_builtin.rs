@@ -273,7 +273,7 @@ mod tests {
             panic!("{:?}", e.kind);
         };
         assert_eq!(types.kind(pointee), TypeKind::Struct);
-        assert_eq!(types.size_bytes(pointee), 8);
+        assert_eq!(types.byte_size(pointee).get(), 8);
         assert_eq!(e.typ, Some(types.void_id));
     }
 }

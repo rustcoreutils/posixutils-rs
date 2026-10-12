@@ -329,6 +329,9 @@ thread_local! {
     /// `-Wframe-larger-than=`'s limit; see [`frame_larger_than`].
     static FRAME_LARGER_THAN: Cell<Option<u64>> = const { Cell::new(None) };
 
+    /// `-Wstack-usage=`'s limit; see [`stack_usage_warns_above`].
+    static STACK_USAGE: Cell<Option<u64>> = const { Cell::new(None) };
+
     /// Warnings made errors by [`WERROR`] in this translation unit, for
     /// [`finish_unit`].
     static PROMOTED: Cell<u32> = const { Cell::new(0) };
@@ -489,29 +492,53 @@ pub fn set_warning_options(names: &[&str]) {
     PEDANTIC.set(Pedantic::from_warning_options(names.iter().copied()));
     WERROR.replace(Werror::from_warning_options(names.iter().copied()));
     FRAME_LARGER_THAN.set(frame_limit(names.iter().copied()));
+    STACK_USAGE.set(stack_usage_limit(names.iter().copied()));
 }
 
 /// The warning group of "the frame size of B bytes is larger than N bytes",
 /// as gcc tags it.
 pub const FRAME_LARGER_THAN_WARNING: &str = "frame-larger-than=";
 
-/// The limit the `-Wframe-larger-than=<size>` options in `names` set: the
-/// last one's, `-Werror=frame-larger-than=<size>` setting it as well, and
-/// none after `-Wno-frame-larger-than`.
-fn frame_limit<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<u64> {
+/// The limit the `-W<group><size>` options in `names` set, `group` being a
+/// size-valued warning's (`frame-larger-than=`): the last one's,
+/// `-Werror=<group><size>` setting it as well, and none after the bare
+/// `-Wno-` form of the group.
+fn size_limit<'a>(names: impl IntoIterator<Item = &'a str>, group: &str) -> Option<u64> {
+    let negated = format!("no-{}", group.trim_end_matches('='));
     names.into_iter().fold(None, |limit, name| {
         let name = name.strip_prefix("error=").unwrap_or(name);
-        match name.strip_prefix(FRAME_LARGER_THAN_WARNING) {
+        match name.strip_prefix(group) {
             Some(size) => warn_options::size_value(size).or(limit),
-            None if name == "no-frame-larger-than" => None,
+            None if name == negated => None,
             None => limit,
         }
     })
 }
 
+/// The limit of `-Wframe-larger-than=`; see [`size_limit`].
+fn frame_limit<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<u64> {
+    size_limit(names, FRAME_LARGER_THAN_WARNING)
+}
+
 /// The frame size `-Wframe-larger-than=` warns above, if it is in effect.
 pub fn frame_larger_than() -> Option<u64> {
     FRAME_LARGER_THAN.get()
+}
+
+/// The warning group of "stack usage is N bytes" and its kin, as gcc tags
+/// them.
+pub const STACK_USAGE_WARNING: &str = "stack-usage=";
+
+/// The limit of `-Wstack-usage=`; see [`size_limit`]. gcc takes a limit of
+/// `PTRDIFF_MAX` or more -- which an overlong count saturates to -- as none,
+/// so that not even "might be unbounded" is said.
+fn stack_usage_limit<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<u64> {
+    size_limit(names, STACK_USAGE_WARNING).filter(|&limit| limit < i64::MAX as u64)
+}
+
+/// The stack usage `-Wstack-usage=` warns above, if it is in effect.
+pub fn stack_usage_warns_above() -> Option<u64> {
+    STACK_USAGE.get()
 }
 
 /// Is `-pedantic` (or `-pedantic-errors`) in effect? For a warning gcc gives
@@ -1379,6 +1406,28 @@ mod tests {
         assert!(
             !werror(&["error", "no-error=frame-larger-than="]).promotes(Some("frame-larger-than="))
         );
+    }
+
+    /// `-Wstack-usage=` folds as `-Wframe-larger-than=` does, apart from the
+    /// other's options, and a limit of `PTRDIFF_MAX` or more is none.
+    #[test]
+    fn stack_usage_limit_folds_in_order() {
+        let limit = |names: &[&str]| stack_usage_limit(names.iter().copied());
+        assert_eq!(limit(&[]), None);
+        assert_eq!(limit(&["stack-usage=100"]), Some(100));
+        assert_eq!(limit(&["error=stack-usage=1KiB"]), Some(1024));
+        assert_eq!(limit(&["stack-usage=100", "no-stack-usage"]), None);
+        assert_eq!(
+            limit(&["stack-usage=100", "no-frame-larger-than"]),
+            Some(100)
+        );
+        assert_eq!(limit(&["frame-larger-than=100"]), None);
+        assert_eq!(
+            limit(&["stack-usage=9223372036854775806"]),
+            Some(i64::MAX as u64 - 1)
+        );
+        assert_eq!(limit(&["stack-usage=9223372036854775807"]), None);
+        assert_eq!(limit(&["stack-usage=99999999999999999999"]), None);
     }
 
     /// A note follows the diagnostic before it: shown after one that was,

@@ -24,7 +24,7 @@ fn test_func_name_is_a_const_char_array() {
         with_statement_expr("", spelled, |p, e| {
             let typ = e.typ.expect("typed");
             assert_eq!(p.types.kind(typ), TypeKind::Array, "{spelled}");
-            assert_eq!(p.types.size_bytes(typ), 2, "{spelled}");
+            assert_eq!(p.types.byte_size(typ).get(), 2, "{spelled}");
             let elem = p.types.base_type(typ).expect("element");
             assert!(p.types.modifiers(elem).contains(TypeModifiers::CONST));
         });
@@ -64,7 +64,7 @@ fn test_named_machine_modes() {
             .lookup(id, Namespace::Ordinary)
             .expect("declared")
             .typ;
-        (types.size_bytes(typ), types.is_unsigned(typ))
+        (types.byte_size(typ).get(), types.is_unsigned(typ))
     };
     assert_eq!(size("b"), (1, false));
     assert_eq!(size("uw"), (8, true));
@@ -114,7 +114,7 @@ fn test_libgcc_machine_modes() {
                 .lookup(id, Namespace::Ordinary)
                 .expect("declared")
                 .typ;
-            (types.size_bytes(typ), types.is_unsigned(typ))
+            (types.byte_size(typ).get(), types.is_unsigned(typ))
         };
         assert_eq!(size("cmp_t"), (cmp_bytes, false), "{arch:?}");
         assert_eq!(size("sh_t"), (8, true), "{arch:?}");

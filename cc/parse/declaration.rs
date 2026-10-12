@@ -20,6 +20,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::Position;
 use crate::types::{ArrayExtent, FloatClass, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::units::ByteSize;
 use gettextrs::gettext;
 
 /// C17 6.7.2p2: the type specifiers must together name one of a
@@ -751,6 +752,11 @@ impl Parser<'_> {
         };
 
         if let Some(size) = new_size {
+            // A designator can size the array past what an object may be.
+            if let Err(e) = self.check_array_bound(elem_type, size, init.pos) {
+                diag::error(e.pos, &e.message);
+                return typ;
+            }
             // Update type with actual size from initializer
             // Preserve modifiers (like const, static)
             let modifiers = self.types.modifiers(typ);
@@ -786,29 +792,40 @@ impl Parser<'_> {
         pos: Position,
     ) -> Result<TypeId, ParseError> {
         if let ArrayExtent::Known(count) = extent {
-            let total = (count as u128) * (self.types.size_bytes(elem) as u128);
-            let max = self.types.max_object_bytes();
-            if total > max as u128 {
-                return Err(ParseError::new(
-                    format!(
-                        "size of array is too large: it exceeds the maximum \
-                         object size of {max} bytes"
-                    ),
-                    pos,
-                ));
-            }
+            self.check_array_bound(elem, count, pos)?;
         }
         Ok(self.types.intern(Type::array_of(elem, extent)))
     }
 
+    /// Refuse an array of `count` elements of `elem` past
+    /// [`TypeTable::max_object_bytes`]: the one bound every array type is
+    /// held to, whether its extent was written or an initializer gave it.
+    pub(super) fn check_array_bound(
+        &self,
+        elem: TypeId,
+        count: usize,
+        pos: Position,
+    ) -> Result<(), ParseError> {
+        let total = self.types.byte_size(elem).checked_mul(count as u64);
+        let max = self.types.max_object_bytes();
+        if total.is_none_or(|total| total > max) {
+            return Err(ParseError::new(
+                format!(
+                    "size of array is too large: it exceeds the maximum \
+                     object size of {max} bytes"
+                ),
+                pos,
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse an object the backend cannot give a stack slot.
     ///
-    /// C17 puts no limit here; this one is c17's. Both backends address a local
-    /// and a stacked argument by a signed 32-bit displacement from the frame
-    /// register, so an object past [`TypeTable::MAX_STACK_OBJECT_BYTES`] has no
-    /// slot to be given -- and every size conversion in `arch/` and `abi/` was
-    /// a bare `as i32` that wrapped, so `char a[3000000000];` in a function got
-    /// an eight-byte slot and a `subq $32, %rsp` frame with no diagnostic.
+    /// C17 puts no limit here; this one is c17's, and gcc's: a frame cannot
+    /// span more than [`TypeTable::MAX_FRAME_BYTES`], `PTRDIFF_MAX` less what
+    /// the prologue adds, so an object past it has no slot to be given. An
+    /// object up to it has one, however far from the frame register.
     ///
     /// Asked only of an object with *automatic* storage duration and of a
     /// by-value parameter type. A static or file-scope object of the same size
@@ -828,8 +845,8 @@ impl Parser<'_> {
         pos: Position,
         what: &str,
     ) -> Result<(), ParseError> {
-        let bytes = self.types.size_bytes(typ);
-        if bytes <= TypeTable::MAX_STACK_OBJECT_BYTES {
+        let bytes = self.types.byte_size(typ);
+        if bytes <= ByteSize::new(TypeTable::MAX_FRAME_BYTES.unsigned_abs()) {
             return Ok(());
         }
         Err(ParseError::new(
@@ -837,7 +854,7 @@ impl Parser<'_> {
                 "size of {what} of type '{}' is {bytes} bytes, which exceeds \
                  the maximum stack object size of {} bytes",
                 self.types.format_type(typ, Some(self.idents)),
-                TypeTable::MAX_STACK_OBJECT_BYTES,
+                TypeTable::MAX_FRAME_BYTES,
             ),
             pos,
         ))
@@ -1701,7 +1718,7 @@ impl Parser<'_> {
         self.advance();
         self.expect_special(b'(')?;
         let align = if let Some(type_id) = self.try_parse_type_name() {
-            self.types.alignment(type_id) as i128
+            i128::from(self.types.align(type_id).bytes())
         } else {
             let expr = self.parse_expression()?;
             match self.eval_const_expr(&expr) {

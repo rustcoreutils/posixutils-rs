@@ -162,7 +162,7 @@ impl Solver {
         // the value, exactly as `instcombine` does it.
         if let ([a, b], Some((mask, domain))) = (insn.src.as_slice(), Outcomes::of_op(insn.op)) {
             let w = insn.operand_width();
-            if self.consts.same(*a, *b, w) {
+            if self.consts.same(*a, *b, w.get()) {
                 if let Some(v) = mask.decide(domain.reflexive()) {
                     return Val::Const(i128::from(v));
                 }
@@ -285,6 +285,7 @@ mod tests {
     use crate::ir::{BasicBlock, Pseudo};
     use crate::target::Target;
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     /// The type table every test drives the pass with.
     fn host_types() -> TypeTable {
@@ -324,7 +325,7 @@ mod tests {
         b0.children = vec![then, els];
 
         let mut b1 = BasicBlock::new(then);
-        let mut ps1 = Instruction::phi_source(PseudoId(12), PseudoId(10), int, 32);
+        let mut ps1 = Instruction::phi_source(PseudoId(12), PseudoId(10), int, Bits::new(32));
         ps1.phi_list = vec![(merge, PseudoId(14))];
         b1.add_insn(ps1);
         b1.add_insn(Instruction::br(merge));
@@ -332,7 +333,7 @@ mod tests {
         b1.children = vec![merge];
 
         let mut b2 = BasicBlock::new(els);
-        let mut ps2 = Instruction::phi_source(PseudoId(13), PseudoId(11), int, 32);
+        let mut ps2 = Instruction::phi_source(PseudoId(13), PseudoId(11), int, Bits::new(32));
         ps2.phi_list = vec![(merge, PseudoId(14))];
         b2.add_insn(ps2);
         b2.add_insn(Instruction::br(merge));
@@ -340,7 +341,7 @@ mod tests {
         b2.children = vec![merge];
 
         let mut b3 = BasicBlock::new(merge);
-        let mut phi = Instruction::phi(PseudoId(14), int, 32);
+        let mut phi = Instruction::phi(PseudoId(14), int, Bits::new(32));
         phi.phi_list = vec![(then, PseudoId(12)), (els, PseudoId(13))];
         b3.add_insn(phi);
         b3.add_insn(Instruction::ret(Some(PseudoId(14))));
@@ -479,7 +480,7 @@ mod tests {
             let insn = Instruction::new(op)
                 .with_target(PseudoId(2))
                 .with_src(PseudoId(1))
-                .with_size(size)
+                .with_size(Bits::new(size))
                 .with_type(types.int_id);
 
             let mut b0 = BasicBlock::new(BasicBlockId(0));
@@ -528,14 +529,14 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(2))
                 .with_src(PseudoId(1))
-                .with_type_and_size(int, 32),
+                .with_type_and_size(int, Bits::new(32)),
         );
         b0.add_insn(Instruction::compare(
             Opcode::SetEq,
             PseudoId(3),
             (PseudoId(1), PseudoId(2)),
-            (int, 32),
-            (int, 32),
+            (int, Bits::new(32)),
+            (int, Bits::new(32)),
         ));
         b0.add_insn(Instruction::cbr(
             PseudoId(3),
@@ -584,7 +585,7 @@ mod tests {
             let mut insn = Instruction::new(op);
             insn.target = Some(PseudoId(2));
             insn.src = vec![PseudoId(1), PseudoId(1)];
-            insn.size = 32;
+            insn.size = Bits::new(32);
 
             let mut b0 = BasicBlock::new(BasicBlockId(0));
             b0.add_insn(Instruction::new(Opcode::Entry));
@@ -631,8 +632,8 @@ mod tests {
             Opcode::SetLt,
             PseudoId(3),
             (PseudoId(1), PseudoId(2)),
-            (types.long_id, 64),
-            (types.int_id, 32),
+            (types.long_id, Bits::new(64)),
+            (types.int_id, Bits::new(32)),
         ));
         b0.add_insn(Instruction::ret(Some(PseudoId(3))));
         func.add_block(b0);
@@ -643,7 +644,7 @@ mod tests {
         assert_eq!(folded.op, Opcode::Copy);
         assert_eq!(func.const_val(folded.src[0]), Some(1));
         assert_eq!(folded.typ, Some(types.int_id), "not the operand type");
-        assert_eq!(folded.size, types.size_bits(types.int_id));
+        assert_eq!(folded.size, types.value_bits(types.int_id));
     }
 
     /// A 128-bit constant needs a correctly sized `SetVal` to get its stack
@@ -666,7 +667,7 @@ mod tests {
             PseudoId(1),
             PseudoId(2),
             types.int_id,
-            128,
+            Bits::new(128),
         ));
         b0.add_insn(Instruction::ret(Some(PseudoId(3))));
         func.add_block(b0);
@@ -792,7 +793,7 @@ mod tests {
             Instruction::new(Opcode::ConstantP)
                 .with_target(PseudoId(2))
                 .with_src(operand_id)
-                .with_type_and_size(types.int_id, 32),
+                .with_type_and_size(types.int_id, Bits::new(32)),
         );
         b0.add_insn(Instruction::ret(Some(PseudoId(2))));
         func.add_block(b0);

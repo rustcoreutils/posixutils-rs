@@ -77,6 +77,7 @@ use super::{Function, Instruction, Module, Opcode, PseudoId, PseudoKind, Site};
 use crate::parse::ast::{AllocSize, LibFn, ObjectSizeForm, ObjectSizeType};
 use crate::token::lexer::payload_bytes;
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::Bits;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 
@@ -106,7 +107,7 @@ impl ObjectSizes {
             if g.symbol_attrs.weak || types.has_unbounded_tail(g.typ) {
                 continue;
             }
-            let size = types.size_bytes(g.typ) as u64;
+            let size = types.byte_size(g.typ).get();
             if size > 0 {
                 named.insert(g.name.clone(), size);
             }
@@ -441,7 +442,7 @@ struct Walker<'w, 'a, 's> {
     minimum: bool,
     form: ObjectSizeForm,
     /// The width of an address: what pointer arithmetic is done at.
-    ptr_bits: u32,
+    ptr_bits: Bits,
     /// Definitions left to follow.
     budget: usize,
     /// The phis being walked, and the displacement each was entered at.
@@ -454,7 +455,7 @@ impl<'w, 'a, 's> Walker<'w, 'a, 's> {
             ctx,
             minimum: otype.minimum,
             form,
-            ptr_bits: ctx.types.size_bits(ctx.types.void_ptr_id),
+            ptr_bits: ctx.types.value_bits(ctx.types.void_ptr_id),
             budget: MAX_WALK,
             open: HashMap::new(),
         }
@@ -527,7 +528,7 @@ impl<'w, 'a, 's> Walker<'w, 'a, 's> {
             return None;
         };
         let size = match func.local_of(p) {
-            Some(local) => self.ctx.types.size_bytes(local.typ) as u64,
+            Some(local) => self.ctx.types.byte_size(local.typ).get(),
             None => self.ctx.sizes.named(name)?,
         };
         (size > 0).then_some(size)
@@ -535,7 +536,7 @@ impl<'w, 'a, 's> Walker<'w, 'a, 's> {
 
     /// The constant `p` adds to an address, if it is one.
     fn displacement(&self, p: PseudoId) -> Option<i64> {
-        i64::try_from(self.ctx.am.const_operand(p, self.ptr_bits)?).ok()
+        i64::try_from(self.ctx.am.const_operand(p, self.ptr_bits.get())?).ok()
     }
 
     /// What `p` reaches, `k` bytes further on than `off`.
@@ -651,7 +652,7 @@ impl<'w, 'a, 's> Walker<'w, 'a, 's> {
         match self
             .ctx
             .am
-            .const_operand(count.value, self.ctx.types.size_bits(count.typ))
+            .const_operand(count.value, self.ctx.types.value_bits(count.typ).get())
         {
             Some(n) => u64::try_from(n).ok()?.checked_mul(elem).map(Extent::Bytes),
             None => Some(Extent::Elements { count, elem }),
@@ -749,7 +750,7 @@ impl<'w, 'a, 's> Walker<'w, 'a, 's> {
         let types = self.ctx.types;
         let elem = types
             .base_type(func.params[param].1)
-            .map(|t| match types.size_bytes(t) {
+            .map(|t| match types.byte_size(t).to_usize() {
                 // `void`: bytes.
                 0 if types.kind(t) == TypeKind::Void => 1,
                 n => n as u64,
@@ -956,7 +957,7 @@ fn offset(b: &mut Builder, off: &Offset) -> PseudoId {
 /// `v` as a `size_t`, extended as its type says if it is narrower.
 fn widened(b: &mut Builder, v: Operand) -> PseudoId {
     let size_t = b.types.ulong_id;
-    if b.types.size_bits(v.typ) >= b.types.size_bits(size_t) {
+    if b.types.value_bits(v.typ) >= b.types.value_bits(size_t) {
         return v.value;
     }
     let op = if b.types.is_unsigned(v.typ) {
@@ -1055,14 +1056,14 @@ mod tests {
         fn binop(&mut self, op: Opcode, a: PseudoId, b: PseudoId) -> PseudoId {
             let t = self.fresh();
             let ptr = self.ptr();
-            self.push(0, Instruction::binop(op, t, a, b, ptr, 64));
+            self.push(0, Instruction::binop(op, t, a, b, ptr, Bits::new(64)));
             t
         }
 
         fn select(&mut self, a: PseudoId, b: PseudoId) -> PseudoId {
             let (c, t) = (self.unknown(), self.fresh());
             let ptr = self.ptr();
-            self.push(0, Instruction::select(t, c, a, b, ptr, 64));
+            self.push(0, Instruction::select(t, c, a, b, ptr, Bits::new(64)));
             t
         }
 
@@ -1079,7 +1080,7 @@ mod tests {
                 )))
                 .with_target(t)
                 .with_src(p)
-                .with_type_and_size(ulong, 64),
+                .with_type_and_size(ulong, Bits::new(64)),
             );
             t
         }
@@ -1097,7 +1098,7 @@ mod tests {
                 )))
                 .with_target(t)
                 .with_src(p)
-                .with_type_and_size(ulong, 64),
+                .with_type_and_size(ulong, Bits::new(64)),
             );
             t
         }
@@ -1113,7 +1114,7 @@ mod tests {
                 args.to_vec(),
                 vec![ulong; args.len()],
                 ptr,
-                64,
+                Bits::new(64),
             );
             insn.extra_mut().known = known;
             self.push(0, insn);
@@ -1287,7 +1288,7 @@ mod tests {
             Instruction::new(Opcode::Alloca)
                 .with_target(t)
                 .with_src(n)
-                .with_type_and_size(ptr, 64),
+                .with_type_and_size(ptr, Bits::new(64)),
         );
         let a = fx.local("a", 20);
         let k = fx.konst(17);
@@ -1325,19 +1326,22 @@ mod tests {
         let (p, from_entry, from_loop) = (fx.fresh(), fx.fresh(), fx.fresh());
         let ptr = fx.ptr();
         let (entry, body) = (BasicBlockId(0), BasicBlockId(1));
-        let mut src = Instruction::phi_source(from_entry, init, ptr, 64);
+        let mut src = Instruction::phi_source(from_entry, init, ptr, Bits::new(64));
         src.phi_list = vec![(body, p)];
         fx.push(0, src);
         fx.func.add_block(BasicBlock::new(body));
         let mut phi = Instruction::new(Opcode::Phi)
             .with_target(p)
-            .with_type_and_size(ptr, 64);
+            .with_type_and_size(ptr, Bits::new(64));
         phi.phi_list = vec![(entry, from_entry), (body, from_loop)];
         fx.push(1, phi);
         let k = fx.konst(step);
         let next = fx.fresh();
-        fx.push(1, Instruction::binop(Opcode::Add, next, p, k, ptr, 64));
-        let mut back = Instruction::phi_source(from_loop, next, ptr, 64);
+        fx.push(
+            1,
+            Instruction::binop(Opcode::Add, next, p, k, ptr, Bits::new(64)),
+        );
+        let mut back = Instruction::phi_source(from_loop, next, ptr, Bits::new(64));
         back.phi_list = vec![(body, p)];
         fx.push(1, back);
         fx.max_min(p)
@@ -1444,7 +1448,7 @@ mod tests {
             Instruction::new(Opcode::Alloca)
                 .with_target(a)
                 .with_src(n)
-                .with_type_and_size(ptr, 64),
+                .with_type_and_size(ptr, Bits::new(64)),
         );
         let local = fx.local("local", 20);
         let k = fx.konst(5);
@@ -1524,24 +1528,34 @@ mod tests {
             let n = fx.fresh();
             let at = if before_the_branch { 0 } else { 1 };
             let ulong = fx.types.ulong_id;
-            fx.push(at, Instruction::binop(Opcode::Add, n, x, k, ulong, 64));
+            fx.push(
+                at,
+                Instruction::binop(Opcode::Add, n, x, k, ulong, Bits::new(64)),
+            );
             let c = fx.unknown();
             fx.push(0, Instruction::cbr(c, ids[0], ids[1]));
             let (p, from1, from2) = (fx.fresh(), fx.fresh(), fx.fresh());
             for (block, from, size) in [(1, from1, n), (2, from2, x)] {
                 let a = fx.fresh();
-                let call = Instruction::call(Some(a), "malloc", vec![size], vec![ulong], ptr, 64);
+                let call = Instruction::call(
+                    Some(a),
+                    "malloc",
+                    vec![size],
+                    vec![ulong],
+                    ptr,
+                    Bits::new(64),
+                );
                 let mut call = call;
                 call.extra_mut().known = Some(LibFn::Malloc);
                 fx.push(block, call);
-                let mut src = Instruction::phi_source(from, a, ptr, 64);
+                let mut src = Instruction::phi_source(from, a, ptr, Bits::new(64));
                 src.phi_list = vec![(ids[2], p)];
                 fx.push(block, src);
                 fx.push(block, Instruction::br(ids[2]));
             }
             let mut phi = Instruction::new(Opcode::Phi)
                 .with_target(p)
-                .with_type_and_size(ptr, 64);
+                .with_type_and_size(ptr, Bits::new(64));
             phi.phi_list = vec![(ids[0], from1), (ids[1], from2)];
             fx.push(3, phi);
             fx.func.blocks[0].children = vec![ids[0], ids[1]];
@@ -1560,7 +1574,7 @@ mod tests {
                 )))
                 .with_target(t)
                 .with_src(p)
-                .with_type_and_size(ulong, 64),
+                .with_type_and_size(ulong, Bits::new(64)),
             );
             let want = if before_the_branch { 8 } else { u64::MAX };
             assert_eq!(fx.computed(t, true, &[(x, 7)]), Some(want));
@@ -1582,25 +1596,34 @@ mod tests {
             fx.func.add_block(BasicBlock::new(exit));
             let first = fx.call("malloc", Some(LibFn::Malloc), &[x]);
             let (p, from_entry, from_loop) = (fx.fresh(), fx.fresh(), fx.fresh());
-            let mut src = Instruction::phi_source(from_entry, first, ptr, 64);
+            let mut src = Instruction::phi_source(from_entry, first, ptr, Bits::new(64));
             src.phi_list = vec![(body, p)];
             fx.push(0, src);
             fx.push(0, Instruction::br(body));
             let mut phi = Instruction::new(Opcode::Phi)
                 .with_target(p)
-                .with_type_and_size(ptr, 64);
+                .with_type_and_size(ptr, Bits::new(64));
             phi.phi_list = vec![(entry, from_entry), (body, from_loop)];
             fx.push(1, phi);
             let size = if in_the_loop {
                 let (k, one) = (fx.fresh(), fx.konst(1));
-                fx.push(1, Instruction::binop(Opcode::Add, k, y, one, ulong, 64));
+                fx.push(
+                    1,
+                    Instruction::binop(Opcode::Add, k, y, one, ulong, Bits::new(64)),
+                );
                 k
             } else {
                 x
             };
             let next = fx.fresh();
-            let mut call =
-                Instruction::call(Some(next), "malloc", vec![size], vec![ulong], ptr, 64);
+            let mut call = Instruction::call(
+                Some(next),
+                "malloc",
+                vec![size],
+                vec![ulong],
+                ptr,
+                Bits::new(64),
+            );
             call.extra_mut().known = Some(LibFn::Malloc);
             fx.push(1, call);
             let t = fx.fresh();
@@ -1612,9 +1635,9 @@ mod tests {
                 )))
                 .with_target(t)
                 .with_src(p)
-                .with_type_and_size(ulong, 64),
+                .with_type_and_size(ulong, Bits::new(64)),
             );
-            let mut back = Instruction::phi_source(from_loop, next, ptr, 64);
+            let mut back = Instruction::phi_source(from_loop, next, ptr, Bits::new(64));
             back.phi_list = vec![(body, p)];
             fx.push(1, back);
             let c = fx.unknown();

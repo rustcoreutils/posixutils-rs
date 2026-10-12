@@ -206,7 +206,7 @@ impl<'a> CallSite<'a> {
     /// The float constant `p` holds, of the format `typ` is in.
     pub(crate) fn float(&self, p: PseudoId, typ: TypeId) -> Option<FloatVal> {
         let fmt = self.types.fp_format(typ)?;
-        let v = self.am.consts().fget(p, self.types.size_bits(typ))?;
+        let v = self.am.consts().fget(p, self.types.value_bits(typ).get())?;
         Some(v.round_to_format(fmt))
     }
 
@@ -217,15 +217,15 @@ impl<'a> CallSite<'a> {
 
     /// The constant `p` holds, read as a `size_t`.
     pub(crate) fn size_t(&self, p: PseudoId) -> Option<u128> {
-        self.unsigned(p, self.types.size_bits(self.types.ulong_id))
+        self.unsigned(p, self.types.value_bits(self.types.ulong_id).get())
     }
 
     /// Whether `a` and `b` are the same pointer: one value copied, or two
     /// addresses of the same place in the same object.
     pub(crate) fn same_pointer(&self, a: PseudoId, b: PseudoId) -> bool {
-        let bits = self.types.size_bits(self.types.void_ptr_id);
+        let bits = self.types.value_bits(self.types.void_ptr_id);
         let consts = self.am.consts();
-        if consts.root(a, bits) == consts.root(b, bits) {
+        if consts.root(a, bits.get()) == consts.root(b, bits.get()) {
             return true;
         }
         let loc = |p| self.am.object_of(self.func, p);
@@ -626,7 +626,7 @@ pub(super) mod tests {
         assert!(!ops(&insns).contains(&Opcode::Call));
         let copy = def(&insns, r);
         assert_eq!(
-            (copy.op, copy.typ, copy.size),
+            (copy.op, copy.typ, copy.size.get()),
             (Opcode::Copy, Some(ulong), 64)
         );
         let set = def(&insns, copy.src[0]);
@@ -645,12 +645,18 @@ pub(super) mod tests {
         let insns = run_on(&mut fx, &[]);
         let copy = def(&insns, r);
         let sub = def(&insns, copy.src[0]);
-        assert_eq!((sub.op, sub.size), (Opcode::Sub, 32));
+        assert_eq!((sub.op, sub.size.get()), (Opcode::Sub, 32));
         for (side, from) in sub.src.iter().zip([u, v]) {
             let zext = def(&insns, *side);
-            assert_eq!((zext.op, zext.src_size, zext.size), (Opcode::Zext, 8, 32));
+            assert_eq!(
+                (zext.op, zext.src_size.get(), zext.size.get()),
+                (Opcode::Zext, 8, 32)
+            );
             let load = def(&insns, zext.src[0]);
-            assert_eq!((load.op, load.src[0], load.size), (Opcode::Load, from, 8));
+            assert_eq!(
+                (load.op, load.src[0], load.size.get()),
+                (Opcode::Load, from, 8)
+            );
             assert_eq!(load.typ, Some(fx.types.uchar_id));
         }
     }

@@ -14,6 +14,7 @@ use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg};
 use crate::arch::lir::{CondCode, Directive, FpSize, OperandSize};
 use crate::ir::{Instruction, MemoryOrder, Opcode};
+use crate::units::Bits;
 
 /// How an atomic access is ordered on AArch64 without LSE: which of its
 /// halves carry the acquire and the release.
@@ -241,10 +242,10 @@ impl Aarch64CodeGen {
     /// every atomic result alias the same register, so two atomic reads in
     /// one expression collapsed into one -- `x + y` on two _Atomic ints
     /// returned `y + y`.
-    fn move_atomic_result(&mut self, reg: Reg, target: crate::ir::PseudoId, size: u32) {
+    fn move_atomic_result(&mut self, reg: Reg, target: crate::ir::PseudoId, size: Bits) {
         let dst_loc = self.get_location(target);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == reg) {
-            self.emit_move_to_loc(reg, &dst_loc, size.max(32));
+            self.emit_move_to_loc(reg, &dst_loc, size.max(Bits::new(32)));
         }
     }
 
@@ -371,7 +372,7 @@ impl Aarch64CodeGen {
     }
 
     /// Helper to move a value into a register
-    fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: u32) {
+    fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: Bits) {
         let op_size = OperandSize::from_bits(size);
         match loc {
             Loc::Reg(src) => {
@@ -413,7 +414,7 @@ impl Aarch64CodeGen {
             // one was missed.
             Loc::VReg(v) => {
                 self.push_lir(Aarch64Inst::FmovToGp {
-                    size: if size <= 32 {
+                    size: if size <= Bits::new(32) {
                         FpSize::Single
                     } else {
                         FpSize::Double
@@ -424,7 +425,7 @@ impl Aarch64CodeGen {
             }
             Loc::FImm(f, imm_size) => {
                 let bits = f.to_bits_at_width(imm_size);
-                self.emit_mov_imm(reg, bits, 64);
+                self.emit_mov_imm(reg, bits, Bits::new(64));
             }
         }
     }

@@ -143,7 +143,7 @@ impl Parser<'_> {
                 // gcc computes these inline, so one of a constant is an
                 // integer constant expression there and makes no call.
                 if let Some(value) = self.eval_const_expr(&arg) {
-                    let width = self.types.size_bits(row.param.id(self.types));
+                    let width = self.types.value_bits(row.param.id(self.types)).get();
                     let folded = eval_bit_op(op, width, value) as i64;
                     return Self::typed_expr(ExprKind::IntLit(folded), ret, pos);
                 }

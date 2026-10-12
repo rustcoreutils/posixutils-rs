@@ -18,14 +18,15 @@ use crate::arch::codegen::BswapSize;
 use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, OperandSize, Symbol};
 use crate::ir::Instruction;
 use crate::types::TypeTable;
+use crate::units::{Align, Bits, ByteSize};
 
 /// Bytes of the variadic register save area holding x0-x7.
-pub(super) const VA_GR_SAVE_BYTES: i32 = 8 * 8;
+pub(super) const VA_GR_SAVE_BYTES: i64 = 8 * 8;
 /// Bytes of the variadic register save area holding q0-q7.
 ///
 /// Whole `q` registers, not `d`: an unnamed `long double` is binary128 on
 /// AAPCS64 and fills the slot.
-pub(super) const VA_VR_SAVE_BYTES: i32 = 8 * 16;
+pub(super) const VA_VR_SAVE_BYTES: i64 = 8 * 16;
 
 // AAPCS64 `va_list` field offsets (Linux/FreeBSD). The type is
 //
@@ -42,11 +43,11 @@ pub(super) const VA_VR_SAVE_BYTES: i32 = 8 * 16;
 // which meant `va_arg(ap, double)` read a GP slot -- the incoming d0-d7 were
 // never spilled at all -- and an `ap` handed to `vsnprintf` did not match what
 // libc expected.
-const VA_STACK_OFF: i32 = 0;
-const VA_GR_TOP_OFF: i32 = 8;
-const VA_VR_TOP_OFF: i32 = 16;
-const VA_GR_OFFS_OFF: i32 = 24;
-const VA_VR_OFFS_OFF: i32 = 28;
+const VA_STACK_OFF: i64 = 0;
+const VA_GR_TOP_OFF: i64 = 8;
+const VA_VR_TOP_OFF: i64 = 16;
+const VA_GR_OFFS_OFF: i64 = 24;
+const VA_VR_OFFS_OFF: i64 = 28;
 
 /// How an aggregate argument reaches `va_arg`, per AAPCS64 §6.4.2.
 ///
@@ -60,15 +61,15 @@ enum VaAggKind {
     Hfa(HfaElem, u8),
     /// A composite of at most sixteen bytes: consecutive general-register
     /// slots, contiguous in both the save area and the caller's frame.
-    Gp { qwords: u8, bytes: i32 },
+    Gp { qwords: u8, bytes: ByteSize },
     /// A composite larger than sixteen bytes. Stage B.4 has the caller copy it
     /// to memory and pass a *pointer* to the copy, so one general slot holds
     /// the address and the object is read through it.
-    Indirect { bytes: i32 },
+    Indirect { bytes: ByteSize },
     /// gcc's floating vector of four bytes or fewer
     /// ([`crate::abi::ArgClass::Stacked`]): always on the stack, and every
     /// later general-register argument with it.
-    Stacked { bytes: i32 },
+    Stacked { bytes: ByteSize },
 }
 
 impl VaAggKind {
@@ -86,15 +87,18 @@ impl VaAggKind {
         if !types.is_aggregate_or_complex(typ) {
             return VaAggKind::Scalar;
         }
-        let bytes =
-            crate::abi::slot_bytes(types.size_bytes(typ).max(1), pos, "a variadic argument");
+        let bytes = crate::abi::checked_slot_size(
+            types.byte_size(typ).max(ByteSize::new(1)),
+            pos,
+            "a variadic argument",
+        );
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, target);
         match abi.classify_param(typ, types) {
             crate::abi::ArgClass::Hfa { base, count } => VaAggKind::Hfa(HfaElem::of(base), count),
             crate::abi::ArgClass::Indirect { .. } => VaAggKind::Indirect { bytes },
             crate::abi::ArgClass::Stacked { .. } => VaAggKind::Stacked { bytes },
             _ => VaAggKind::Gp {
-                qwords: ((bytes + 7) / 8) as u8,
+                qwords: bytes.get().div_ceil(8) as u8,
                 bytes,
             },
         }
@@ -137,10 +141,10 @@ impl Aarch64CodeGen {
     }
 
     /// Store a 32-bit immediate into a `va_list` field.
-    fn store_va_i32(&mut self, ap: Reg, field: i32, value: i32, scratch: Reg) {
+    fn store_va_i32(&mut self, ap: Reg, field: i64, value: i64, scratch: Reg) {
         // Build the bit pattern rather than the signed value: the offsets are
         // negative, and only the low 32 bits reach memory.
-        self.emit_mov_imm(scratch, (value as u32) as i64, 32);
+        self.emit_mov_imm(scratch, (value as u32) as i64, Bits::new(32));
         self.push_lir(Aarch64Inst::Str {
             size: OperandSize::B32,
             src: scratch,
@@ -152,11 +156,11 @@ impl Aarch64CodeGen {
     }
 
     /// Store `x29 + offset` into a `va_list` pointer field.
-    fn store_va_frame_ptr(&mut self, ap: Reg, field: i32, frame_offset: i32, scratch: Reg) {
+    fn store_va_frame_ptr(&mut self, ap: Reg, field: i64, frame_offset: i64, scratch: Reg) {
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
             src1: Reg::X29,
-            src2: GpOperand::Imm(frame_offset as i64),
+            src2: GpOperand::Imm(frame_offset),
             dst: scratch,
         });
         self.push_lir(Aarch64Inst::Str {
@@ -201,8 +205,8 @@ impl Aarch64CodeGen {
         // start past them.
         let gr_top = self.reg_save_area_offset + VA_GR_SAVE_BYTES;
         let vr_top = gr_top + VA_VR_SAVE_BYTES;
-        let gr_offs = -((8 - self.num_fixed_gp_params.min(8) as i32) * 8);
-        let vr_offs = -((8 - self.num_fixed_fp_params.min(8) as i32) * 16);
+        let gr_offs = -((8 - self.num_fixed_gp_params.min(8) as i64) * 8);
+        let vr_offs = -((8 - self.num_fixed_fp_params.min(8) as i64) * 16);
 
         let Some(ap) = self.va_list_addr(&ap_loc, scratch1) else {
             return;
@@ -244,20 +248,26 @@ impl Aarch64CodeGen {
             return;
         }
 
-        let type_bits = types.size_bits(arg_type);
         let is_fp = types.is_float(arg_type);
         // An HFA arrives in the SIMD registers, so it is read out of *their*
         // save area, one element per 16-byte slot, matching the caller's
         // AAPCS64 §5.4.2 layout.
         let agg = VaAggKind::of(pos, arg_type, types, &self.base.target);
+        // An argument passed by reference is read through the pointer its
+        // slot holds and never as a value -- it can be larger than any value
+        // is wide -- so the width is the pointer's.
+        let type_bits = match agg {
+            VaAggKind::Indirect { .. } => Bits::new(64),
+            _ => types.value_bits(arg_type),
+        };
 
         let ap_loc = self.get_location(ap_addr);
         let dst_loc = self.get_location(target);
 
         if self.base.target.os == crate::target::Os::MacOS {
-            let (_, align) =
-                crate::abi::aapcs64::darwin_va_slot(pos, types, arg_type, &self.base.target);
-            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg, align);
+            let slot = crate::abi::aapcs64::darwin_va_slot(pos, types, arg_type, &self.base.target);
+            let align = crate::abi::slot_align(slot.align);
+            self.emit_va_arg_darwin(&ap_loc, &dst_loc, type_bits, is_fp, agg, align.into());
         } else {
             self.emit_va_arg_aapcs64(
                 &ap_loc,
@@ -265,7 +275,8 @@ impl Aarch64CodeGen {
                 type_bits,
                 is_fp,
                 agg,
-                crate::abi::aapcs64::argument_alignment(types, arg_type) as i32,
+                crate::abi::slot_align(crate::abi::aapcs64::argument_alignment(types, arg_type))
+                    .into(),
             );
         }
     }
@@ -282,10 +293,10 @@ impl Aarch64CodeGen {
         &mut self,
         ap_loc: &Loc,
         dst_loc: &Loc,
-        type_bits: u32,
+        type_bits: Bits,
         is_fp: bool,
         agg: VaAggKind,
-        align: i32,
+        align: i64,
     ) {
         let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
@@ -301,10 +312,10 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: scratch0,
-                src2: GpOperand::Imm((align - 1) as i64),
+                src2: GpOperand::Imm(align - 1),
                 dst: scratch0,
             });
-            self.emit_mov_imm(scratch1, -(align as i64), 64);
+            self.emit_mov_imm(scratch1, -align, Bits::new(64));
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
                 src1: scratch0,
@@ -320,13 +331,13 @@ impl Aarch64CodeGen {
         // loader took one register's worth of it and called that the value.
         let step = match agg {
             VaAggKind::Hfa(elem, count) => {
-                let bytes = count as i32 * elem.bytes;
-                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= 8);
-                ((bytes + 7) & !7) as i64
+                let bytes = elem.packed(count);
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= ByteSize::new(8));
+                Self::granules(bytes)
             }
             VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
-                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= 8);
-                ((bytes + 7) & !7) as i64
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= ByteSize::new(8));
+                Self::granules(bytes)
             }
             VaAggKind::Indirect { bytes } => {
                 self.push_lir(Aarch64Inst::Ldr {
@@ -343,8 +354,8 @@ impl Aarch64CodeGen {
             // destination slot happened to hold -- the same saturation the
             // AAPCS64 path carries its own arm for. Darwin reaches this
             // emitter instead, and was missed.
-            VaAggKind::Scalar if !is_fp && type_bits == 128 => {
-                self.emit_va_arg_bytes(dst_loc, scratch0, 0, 16, false);
+            VaAggKind::Scalar if !is_fp && type_bits == Bits::new(128) => {
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, ByteSize::new(16), false);
                 16
             }
             VaAggKind::Scalar => {
@@ -367,9 +378,18 @@ impl Aarch64CodeGen {
 
     /// Bytes an argument of `type_bits` occupies in a stack slot: its size
     /// rounded up to the 8-byte stack granule.
-    fn va_slot_bytes(type_bits: u32) -> i64 {
-        let bytes = type_bits.div_ceil(8).max(1) as i64;
+    fn va_slot_bytes(type_bits: Bits) -> i64 {
+        let bytes = i64::from(type_bits.bytes_covering().max(1));
         (bytes + 7) & !7
+    }
+
+    /// Bytes an aggregate of `bytes` occupies on the stack: whole 8-byte
+    /// granules.
+    fn granules(bytes: ByteSize) -> i64 {
+        bytes
+            .align_up(Align::EIGHT)
+            .expect("a frame slot rounded to an eightbyte still fits")
+            .to_i64()
     }
 
     /// Linux/FreeBSD: read the next argument per AAPCS64 Appendix B.
@@ -387,10 +407,10 @@ impl Aarch64CodeGen {
         &mut self,
         ap_loc: &Loc,
         dst_loc: &Loc,
-        type_bits: u32,
+        type_bits: Bits,
         is_fp: bool,
         agg: VaAggKind,
-        align: i32,
+        align: i64,
     ) {
         let (scratch0, scratch1, scratch2) = Reg::scratch_regs();
         let Some(ap) = self.va_list_addr_pinned(ap_loc, scratch2) else {
@@ -409,12 +429,8 @@ impl Aarch64CodeGen {
         let stack_step = match agg {
             // On the stack an HFA is laid out as the aggregate it is:
             // elements packed at their own stride, the whole rounded to 8.
-            VaAggKind::Hfa(elem, count) => {
-                Self::va_slot_bytes((count as u32) * (elem.bytes as u32) * 8)
-            }
-            VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
-                Self::va_slot_bytes(bytes as u32 * 8)
-            }
+            VaAggKind::Hfa(elem, count) => Self::granules(elem.packed(count)),
+            VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => Self::granules(bytes),
             // Only the pointer is on the stack, not the object.
             VaAggKind::Indirect { .. } => 8,
             VaAggKind::Scalar => Self::va_slot_bytes(type_bits),
@@ -430,7 +446,7 @@ impl Aarch64CodeGen {
             // whatever `offs` was, so the argument comes off the stack, and
             // the committed offset pins every later general argument there
             // too -- NGRN becoming 8, as the caller had it.
-            VaAggKind::Stacked { .. } => i64::from(VA_GR_SAVE_BYTES) + 8,
+            VaAggKind::Stacked { .. } => VA_GR_SAVE_BYTES + 8,
             VaAggKind::Scalar if is_fp => 16,
             VaAggKind::Scalar => stack_step,
         };
@@ -485,7 +501,7 @@ impl Aarch64CodeGen {
                 src2: GpOperand::Imm(15),
                 dst: scratch0,
             });
-            self.emit_mov_imm(scratch1, -16, 64);
+            self.emit_mov_imm(scratch1, -16, Bits::new(64));
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
                 src1: scratch0,
@@ -546,10 +562,10 @@ impl Aarch64CodeGen {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: Reg::X17,
-                src2: GpOperand::Imm(stack_align as i64 - 1),
+                src2: GpOperand::Imm(stack_align - 1),
                 dst: scratch0,
             });
-            self.emit_mov_imm(scratch1, -(stack_align as i64), 64);
+            self.emit_mov_imm(scratch1, -stack_align, Bits::new(64));
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
                 src1: scratch0,
@@ -600,7 +616,7 @@ impl Aarch64CodeGen {
             VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
                 // Contiguous in both sources: consecutive eightbyte slots in
                 // the save area, and the object itself on the stack.
-                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, type_bits <= 64);
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, type_bits <= Bits::new(64));
                 return;
             }
             VaAggKind::Indirect { bytes } => {
@@ -618,7 +634,7 @@ impl Aarch64CodeGen {
             // saturates at 64 -- so it moved the low half and left the high
             // half whatever the slot happened to hold.
             VaAggKind::Scalar if needs_even_gr_pair => {
-                self.emit_va_arg_bytes(dst_loc, scratch0, 0, 16, false);
+                self.emit_va_arg_bytes(dst_loc, scratch0, 0, ByteSize::new(16), false);
                 return;
             }
             _ => {}
@@ -630,8 +646,8 @@ impl Aarch64CodeGen {
             // still live -- nothing since has written the flags -- so the
             // stride is selected the same way the address was, and the copy
             // walks it rather than branching on which source won.
-            self.emit_mov_imm(Reg::X16, 16, 64);
-            self.emit_mov_imm(Reg::X17, elem.bytes as i64, 64);
+            self.emit_mov_imm(Reg::X16, 16, Bits::new(64));
+            self.emit_mov_imm(Reg::X17, elem.bytes, Bits::new(64));
             self.push_lir(Aarch64Inst::Csel {
                 size: OperandSize::B64,
                 cond: CondCode::Sle,
@@ -641,7 +657,7 @@ impl Aarch64CodeGen {
             });
             // At or below a register's worth the result is the value
             // itself, not an object at an address.
-            let holds_value = type_bits <= 64;
+            let holds_value = type_bits <= Bits::new(64);
             self.emit_va_arg_hfa_copy(dst_loc, scratch0, scratch1, elem, count, holds_value);
             return;
         }
@@ -662,8 +678,8 @@ impl Aarch64CodeGen {
         &mut self,
         dst_loc: &Loc,
         addr: Reg,
-        off: i32,
-        bytes: i32,
+        off: i64,
+        bytes: ByteSize,
         holds_value: bool,
     ) {
         // A register destination *is* the aggregate: one load of the whole
@@ -683,7 +699,7 @@ impl Aarch64CodeGen {
                 return;
             }
         }
-        if i64::from(bytes) > UNROLL_LIMIT_BYTES {
+        if bytes > UNROLL_LIMIT_BYTES {
             // X16 becomes the destination cursor; the source cursor is `addr`
             // itself, advanced past the object.
             match dst_loc {
@@ -694,7 +710,7 @@ impl Aarch64CodeGen {
                     self.push_lir(Aarch64Inst::Add {
                         size: OperandSize::B64,
                         src1: base,
-                        src2: GpOperand::Imm(disp.into()),
+                        src2: GpOperand::Imm(disp),
                         dst: Reg::X16,
                     });
                 }
@@ -711,16 +727,15 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: addr,
-                    src2: GpOperand::Imm(off.into()),
+                    src2: GpOperand::Imm(off),
                     dst: addr,
                 });
             }
-            self.emit_block_copy_loop(Reg::X16, addr, bytes.into());
+            self.emit_block_copy_loop(Reg::X16, addr, bytes);
             return;
         }
-        for (done, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
+        for (done, chunk) in crate::ir::memexpand::block_chunks(bytes) {
             let size = OperandSize::from_bits(chunk.bits());
-            let done = done as i32;
             self.push_lir(Aarch64Inst::Ldr {
                 size,
                 addr: MemAddr::BaseOffset {
@@ -772,7 +787,7 @@ impl Aarch64CodeGen {
         count: u8,
         holds_value: bool,
     ) {
-        for i in 0..count as i32 {
+        for i in 0..count as i64 {
             self.push_lir(Aarch64Inst::LdrFp {
                 size: elem.size,
                 addr: MemAddr::Base(addr),
@@ -801,7 +816,7 @@ impl Aarch64CodeGen {
                         self.push_lir(Aarch64Inst::Lsl {
                             size: OperandSize::B64,
                             src: Reg::X16,
-                            amount: GpOperand::Imm(delta as i64 * 8),
+                            amount: GpOperand::Imm(delta * 8),
                             dst: Reg::X16,
                         });
                         self.push_lir(Aarch64Inst::Orr {
@@ -822,7 +837,7 @@ impl Aarch64CodeGen {
                 }),
                 _ => return,
             }
-            if i + 1 < count as i32 {
+            if i + 1 < count as i64 {
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: addr,
@@ -849,7 +864,7 @@ impl Aarch64CodeGen {
     }
 
     /// Read the argument at `addr` and place it in `dst_loc`.
-    fn emit_va_arg_load(&mut self, dst_loc: &Loc, addr: Reg, type_bits: u32, is_fp: bool) {
+    fn emit_va_arg_load(&mut self, dst_loc: &Loc, addr: Reg, type_bits: Bits, is_fp: bool) {
         let (_, scratch1, _) = Reg::scratch_regs();
 
         if is_fp {
@@ -879,7 +894,7 @@ impl Aarch64CodeGen {
             return;
         }
 
-        let op_size = OperandSize::from_bits(type_bits.max(32));
+        let op_size = OperandSize::from_bits(type_bits.max(Bits::new(32)));
         self.push_lir(Aarch64Inst::Ldr {
             size: op_size,
             addr: MemAddr::Base(addr),
@@ -925,7 +940,7 @@ impl Aarch64CodeGen {
         // Darwin's va_list is one pointer; everywhere else it is the 32-byte
         // AAPCS64 record, and copying only the first 8 bytes left the copy
         // with a garbage `__gr_top` and offsets.
-        let bytes: i32 = if self.base.target.os == crate::target::Os::MacOS {
+        let bytes: i64 = if self.base.target.os == crate::target::Os::MacOS {
             8
         } else {
             32
@@ -1199,7 +1214,7 @@ impl Aarch64CodeGen {
             }
             Loc::Imm(v) => {
                 // Use emit_mov_imm which handles large immediates with movz/movk
-                self.emit_mov_imm(scratch, v as i64, src_size.bits());
+                self.emit_mov_imm(scratch, v as i64, src_size.width());
             }
             _ => return,
         }
@@ -1266,7 +1281,7 @@ impl Aarch64CodeGen {
             }
             Loc::Imm(v) => {
                 // Use emit_mov_imm which handles large immediates with movz/movk
-                self.emit_mov_imm(scratch, v as i64, src_size.bits());
+                self.emit_mov_imm(scratch, v as i64, src_size.width());
             }
             _ => return,
         }
@@ -1347,7 +1362,7 @@ impl Aarch64CodeGen {
             offset,
         };
 
-        self.emit_move(env, Reg::X9, 64);
+        self.emit_move(env, Reg::X9, Bits::new(64));
         self.push_lir(Aarch64Inst::Str {
             size: OperandSize::B64,
             src: Reg::X29,
@@ -1398,7 +1413,7 @@ impl Aarch64CodeGen {
 
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done)));
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X10, &dst_loc, u32::BITS);
+        self.emit_move_to_loc(Reg::X10, &dst_loc, Bits::new(32));
     }
 
     /// gcc's `__builtin_longjmp(buf, 1)`: put back the x29 and sp the
@@ -1413,7 +1428,7 @@ impl Aarch64CodeGen {
             base: Reg::X9,
             offset,
         };
-        self.emit_move(env, Reg::X9, 64);
+        self.emit_move(env, Reg::X9, Bits::new(64));
         self.push_lir(Aarch64Inst::Ldr {
             size: OperandSize::B64,
             addr: word(8),
@@ -1468,7 +1483,7 @@ impl Aarch64CodeGen {
         };
         self.emit_frame_walk(insn.frame_level());
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::X9, &dst_loc, Bits::new(64));
     }
 
     /// Emit __builtin_return_address(level) - return address at given level
@@ -1509,7 +1524,7 @@ impl Aarch64CodeGen {
             });
         }
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::X9, &dst_loc, Bits::new(64));
     }
 
     /// Emit __builtin_alloca - dynamic stack allocation
@@ -1524,7 +1539,7 @@ impl Aarch64CodeGen {
         };
 
         // Load size into X9 (scratch register)
-        self.emit_move(size, Reg::X9, 64);
+        self.emit_move(size, Reg::X9, Bits::new(64));
 
         // Round up to 16-byte alignment: (size + 15) & ~15
         self.push_lir(Aarch64Inst::Add {
@@ -1541,12 +1556,7 @@ impl Aarch64CodeGen {
         });
 
         // Subtract from stack pointer
-        self.push_lir(Aarch64Inst::Sub {
-            size: OperandSize::B64,
-            src1: Reg::SP,
-            src2: GpOperand::Reg(Reg::X9),
-            dst: Reg::SP,
-        });
+        self.emit_dynamic_allocation();
 
         // Return new stack pointer
         self.push_lir(Aarch64Inst::Mov {
@@ -1557,7 +1567,7 @@ impl Aarch64CodeGen {
 
         // Store result
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::X9, &dst_loc, Bits::new(64));
     }
 
     /// Capture SP so a later restore can put it back.
@@ -1573,7 +1583,7 @@ impl Aarch64CodeGen {
             dst: Reg::X9,
         });
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::X9, &dst_loc, 64);
+        self.emit_move_to_loc(Reg::X9, &dst_loc, Bits::new(64));
     }
 
     /// The start of a landing pad, where the unwinder jumps with the
@@ -1583,7 +1593,7 @@ impl Aarch64CodeGen {
         self.emit_jump_landing_pad();
         if let Some(target) = insn.target {
             let dst_loc = self.get_location(target);
-            self.emit_move_to_loc(Reg::X0, &dst_loc, 64);
+            self.emit_move_to_loc(Reg::X0, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1592,7 +1602,7 @@ impl Aarch64CodeGen {
         let Some(&src) = insn.src.first() else {
             return;
         };
-        self.emit_move(src, Reg::X9, 64);
+        self.emit_move(src, Reg::X9, Bits::new(64));
         self.push_lir(Aarch64Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(Reg::X9),
@@ -1619,9 +1629,9 @@ impl Aarch64CodeGen {
         }
         // Into the argument registers in reverse, so a source still sitting in
         // x0 or x1 is read before it is overwritten.
-        self.emit_move(insn.src[2], Reg::X2, 64);
-        self.emit_move(insn.src[1], Reg::X1, 64);
-        self.emit_move(insn.src[0], Reg::X0, 64);
+        self.emit_move(insn.src[2], Reg::X2, Bits::new(64));
+        self.emit_move(insn.src[1], Reg::X1, Bits::new(64));
+        self.emit_move(insn.src[0], Reg::X0, Bits::new(64));
 
         self.push_lir(Aarch64Inst::Bl {
             target: CallTarget::Direct(Symbol::global(insn.library_callee())),
@@ -1630,7 +1640,7 @@ impl Aarch64CodeGen {
         // All three return the destination pointer.
         if let Some(target) = insn.target {
             let dst_loc = self.get_location(target);
-            self.emit_move_to_loc(Reg::X0, &dst_loc, 64);
+            self.emit_move_to_loc(Reg::X0, &dst_loc, Bits::new(64));
         }
     }
 }

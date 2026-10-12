@@ -306,3 +306,27 @@ _Static_assert(__LINE__ < 256, "exit codes are __LINE__ and must stay below 256"
 "#;
     compile_and_run_everywhere("vec_mega", src);
 }
+
+/// A scalar splatted into 128-bit lanes fits whatever its value. The range
+/// check computed the lane's bounds as `-(1 << 127)` and `(1 << 128) - 1` in
+/// `i128`, both of which overflow: a debug build panicked, and a release
+/// build wrapped the upper bound to 0 and refused `v + 5` as a truncation.
+#[test]
+fn vector_splat_into_128_bit_lanes() {
+    let src = r#"
+typedef unsigned __int128 V __attribute__((vector_size(16)));
+typedef __int128 W __attribute__((vector_size(16)));
+int main(void) {
+    V v = {7};
+    V r = v + 5;
+    W w = {-3};
+    W s = w - 1;
+    if (r[0] != 12) return 1;
+    if (s[0] != -4) return 2;
+    V m = v * 0xffffffffffffffffULL;
+    if (m[0] != (unsigned __int128)7 * 0xffffffffffffffffULL) return 3;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("vec_splat_128", src);
+}

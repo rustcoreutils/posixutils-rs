@@ -29,6 +29,7 @@ use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::FpFormat;
 use crate::ir::{FloatCmp, Instruction, NanCompare, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
+use crate::units::Bits;
 
 /// 2^63 as the bit pattern of a `double`.
 ///
@@ -47,7 +48,7 @@ impl X86_64CodeGen {
         self.stack_mem(self.x87_scratch_slot())
     }
 
-    fn x87_scratch_slot(&self) -> i32 {
+    fn x87_scratch_slot(&self) -> i64 {
         self.x87_scratch
             .expect("the allocator reserves the x87 scratch for every `uses_x87_scratch`")
             .slot()
@@ -60,8 +61,8 @@ impl X86_64CodeGen {
     /// slot -- and `fld` reads only memory, so it goes through the reserved
     /// XMM scratch into the x87 scratch. A constant is read at the width it is
     /// pooled at, not its type's: see `emit_fp_imm_to_xmm`.
-    pub(super) fn emit_x87_asm_push(&mut self, pseudo: PseudoId, size: u32) {
-        if size > 64 {
+    pub(super) fn emit_x87_asm_push(&mut self, pseudo: PseudoId, size: Bits) {
+        if size > Bits::new(64) {
             let addr = self.get_x87_mem_addr(pseudo);
             self.push_lir(X86Inst::X87Load { addr });
             return;
@@ -70,7 +71,7 @@ impl X86_64CodeGen {
             Loc::FImm(_, imm_bits) => imm_bits,
             _ => size,
         };
-        let fp_size = if bits <= 32 {
+        let fp_size = if bits <= Bits::new(32) {
             FpSize::Single
         } else {
             FpSize::Double
@@ -93,13 +94,13 @@ impl X86_64CodeGen {
     /// The mirror of `emit_x87_asm_push`: a `long double` is stored to its
     /// memory, and a `float` or `double` rounded through the x87 scratch and
     /// the reserved XMM scratch into wherever the allocator put it.
-    pub(super) fn emit_x87_asm_pop(&mut self, pseudo: PseudoId, size: u32) {
-        if size > 64 {
+    pub(super) fn emit_x87_asm_pop(&mut self, pseudo: PseudoId, size: Bits) {
+        if size > Bits::new(64) {
             let addr = self.get_x87_mem_addr(pseudo);
             self.push_lir(X86Inst::X87Store { addr });
             return;
         }
-        let fp_size = if size <= 32 {
+        let fp_size = if size <= Bits::new(32) {
             FpSize::Single
         } else {
             FpSize::Double
@@ -127,7 +128,7 @@ impl X86_64CodeGen {
     /// Asked of its *operands*: a comparison of two `long double`s produces
     /// an `int`, and is an x87 operation all the same.
     pub fn is_longdouble_op(&self, insn: &Instruction, types: &TypeTable) -> bool {
-        insn.operand_width() >= 80
+        insn.operand_width() >= Bits::new(80)
             && insn
                 .operand_type()
                 .is_some_and(|t| types.kind(t) == TypeKind::LongDouble)
@@ -186,7 +187,7 @@ impl X86_64CodeGen {
             Loc::Global(name) => self.global_mem(&name, insn.displacement(), Reg::R11),
             _ => {
                 // Load address into R11
-                self.emit_move(addr, Reg::R11, 64);
+                self.emit_move(addr, Reg::R11, Bits::new(64));
                 MemAddr::BaseOffset {
                     base: Reg::R11,
                     offset: insn.displacement(),
@@ -214,7 +215,7 @@ impl X86_64CodeGen {
     /// area, 16-byte aligned and 16 bytes wide. `emit_va_arg_float` models
     /// only the SSE class, so it went looking in the XMM save area and read a
     /// `double`-sized hole -- the argument always came back as zero.
-    pub(super) fn emit_va_arg_x87(&mut self, ap_base: Reg, ap_base_offset: i32, dst_loc: &Loc) {
+    pub(super) fn emit_va_arg_x87(&mut self, ap_base: Reg, ap_base_offset: i64, dst_loc: &Loc) {
         let Loc::Stack(dst_offset) = dst_loc else {
             // An x87 value only ever lives in a stack slot; without one there
             // is nowhere to pop ST(0) to, and pushing it would unbalance the
@@ -320,7 +321,7 @@ impl X86_64CodeGen {
             }
             Loc::Global(name) => self.global_mem(&name, insn.displacement(), Reg::R11),
             _ => {
-                self.emit_move(addr, Reg::R11, 64);
+                self.emit_move(addr, Reg::R11, Bits::new(64));
                 MemAddr::BaseOffset {
                     base: Reg::R11,
                     offset: insn.displacement(),
@@ -441,7 +442,7 @@ impl X86_64CodeGen {
             dst: Reg::R10,
         });
         let dst_loc = self.get_location(target);
-        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(32));
     }
 
     /// Emit `CopySign` of a `long double`, on its memory image: the
@@ -631,7 +632,7 @@ impl X86_64CodeGen {
 
         // Move to final destination if needed
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, u32::BITS);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(32));
         }
     }
 
@@ -931,7 +932,7 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        let src_size = insn.src_size.max(32);
+        let src_size = insn.src_size.max(Bits::new(32));
         let src_loc = self.get_location(src);
 
         // We need the integer in memory for fild. If it's in a register, store it first.
@@ -953,7 +954,7 @@ impl X86_64CodeGen {
                     self.x87_scratch_addr()
                 };
 
-                let op_size = if src_size <= 32 {
+                let op_size = if src_size <= Bits::new(32) {
                     OperandSize::B32
                 } else {
                     OperandSize::B64
@@ -968,7 +969,11 @@ impl X86_64CodeGen {
             Loc::Imm(val) => {
                 // Immediate - store to temp location after callee-saved area
                 let temp_addr = self.x87_scratch_addr();
-                let width = if src_size <= 32 { 32 } else { 64 };
+                let width = if src_size <= Bits::new(32) {
+                    Bits::new(32)
+                } else {
+                    Bits::new(64)
+                };
                 self.store_imm(*val, width, temp_addr.clone(), Reg::R10);
                 temp_addr
             }
@@ -987,7 +992,7 @@ impl X86_64CodeGen {
         };
 
         // Load integer with fildl/fildq - converts to x87 extended precision
-        if src_size <= 32 {
+        if src_size <= Bits::new(32) {
             self.push_lir(X86Inst::X87LoadInt32 { addr: src_addr });
         } else {
             self.push_lir(X86Inst::X87LoadInt64 { addr: src_addr });
@@ -1047,7 +1052,7 @@ impl X86_64CodeGen {
             }
         } else {
             X86Inst::Mov {
-                size: OperandSize::from_bits(dst_size.max(32)),
+                size: OperandSize::from_bits(dst_size.max(Bits::new(32))),
                 src: GpOperand::Mem(result),
                 dst: GpOperand::Reg(Reg::R10),
             }
@@ -1194,7 +1199,7 @@ impl X86_64CodeGen {
             dst: Reg::R10,
         });
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
-        self.emit_move_to_loc(Reg::R10, dst_loc, 64);
+        self.emit_move_to_loc(Reg::R10, dst_loc, Bits::new(64));
     }
 }
 
@@ -1232,7 +1237,7 @@ pub(super) fn uses_x87_scratch(insn: &Instruction, types: &TypeTable) -> bool {
                 .extra()
                 .asm_data
                 .as_ref()
-                .is_some_and(|asm| x87_operands(asm).any(|c| c.size <= 64)))
+                .is_some_and(|asm| x87_operands(asm).any(|c| c.size <= Bits::new(64))))
 }
 
 fn is_long_double(typ: Option<crate::types::TypeId>, types: &TypeTable) -> bool {
@@ -1248,8 +1253,8 @@ fn is_long_double(typ: Option<crate::types::TypeId>, types: &TypeTable) -> bool 
 /// `unsigned short` at 32, as gcc does. Any value representable in the
 /// destination is then representable in the store, and C leaves every other
 /// value undefined.
-fn fistp_width(bits: u32, signed: bool) -> Option<X87IntWidth> {
-    match bits + u32::from(!signed) {
+fn fistp_width(width: Bits, signed: bool) -> Option<X87IntWidth> {
+    match width.get() + u32::from(!signed) {
         0..=16 => Some(X87IntWidth::W16),
         17..=32 => Some(X87IntWidth::W32),
         33..=64 => Some(X87IntWidth::W64),
@@ -1281,7 +1286,7 @@ mod tests {
             (64, false, None),
         ] {
             assert_eq!(
-                fistp_width(bits, signed),
+                fistp_width(Bits::new(bits), signed),
                 want,
                 "{bits} bits, signed {signed}"
             );

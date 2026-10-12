@@ -177,7 +177,7 @@ impl Parser<'_> {
             return;
         };
         let scalar = self.types.is_integer(typ) || self.types.kind(typ) == TypeKind::Pointer;
-        if !scalar || self.types.size_bits(typ) > 64 {
+        if !scalar || self.types.value_bits(typ).get() > 64 {
             diag::error_args(
                 pos,
                 "data type of '{0}' isn't suitable for a general register",

@@ -18,6 +18,7 @@ use crate::arch::x86_64::regalloc::{Loc, Reg, XmmReg};
 use crate::ir::{Instruction, PseudoId};
 use crate::machine::SegReg;
 use crate::types::{AddressSpace, TypeId, TypeKind, TypeTable};
+use crate::units::{Bits, ByteSize};
 
 impl X86_64CodeGen {
     /// The source width of a zero-extending load, when the hardware has one.
@@ -28,18 +29,18 @@ impl X86_64CodeGen {
     /// size up instead. Asking `OperandSize::from_bits` and using the answer
     /// regardless produced a `Movzx` from 32 bits to 32 bits, which the
     /// assembly printer then had to guess at.
-    fn extending_load_size(actual_size: u32) -> Option<OperandSize> {
-        match actual_size {
+    fn extending_load_size(actual_size: Bits) -> Option<OperandSize> {
+        match actual_size.get() {
             1..=8 => Some(OperandSize::B8),
             9..=16 => Some(OperandSize::B16),
             _ => None,
         }
     }
 
-    pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: u32) {
+    pub(super) fn emit_move(&mut self, src: PseudoId, dst: Reg, size: Bits) {
         let actual_size = size; // Keep original size for sub-32-bit handling
-        let narrow = Self::extending_load_size(actual_size).filter(|_| actual_size < 32);
-        let size = size.max(32);
+        let narrow = Self::extending_load_size(actual_size).filter(|_| actual_size < Bits::new(32));
+        let size = size.max(Bits::new(32));
         let op_size = OperandSize::from_bits(size);
         let loc = self.get_location(src);
         match loc {
@@ -102,7 +103,7 @@ impl X86_64CodeGen {
                 let v = v as i64;
                 // x86-64: movl sign-extends to 64-bit, movq only works with 32-bit signed immediates
                 // For values outside 32-bit signed range, use movabsq
-                if size == 64 && (v > i32::MAX as i64 || v < i32::MIN as i64) {
+                if size == Bits::new(64) && (v > i32::MAX as i64 || v < i32::MIN as i64) {
                     // LIR: 64-bit immediate move
                     self.push_lir(X86Inst::MovAbs { imm: v, dst });
                 } else {
@@ -181,7 +182,7 @@ impl X86_64CodeGen {
                     dst,
                 });
                 // For sub-32-bit values (e.g., Float16), zero-extend to clear garbage
-                if actual_size < 32 {
+                if actual_size < Bits::new(32) {
                     self.push_lir(X86Inst::Movzx {
                         src_size: OperandSize::from_bits(actual_size),
                         dst_size: OperandSize::B32,
@@ -195,7 +196,7 @@ impl X86_64CodeGen {
                 // pattern -- used for the Float16 rtlib calls, and for an
                 // inline-asm operand under a general-register constraint.
                 let bits = v.to_bits_at_width(fp_size);
-                if fp_size <= 32 {
+                if fp_size <= Bits::new(32) {
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(bits),
@@ -216,7 +217,7 @@ impl X86_64CodeGen {
     /// zero-extends to 64 bits, so `movq %reg, mem` is correct.
     /// For 8/16-bit values, store the actual size to avoid clobbering adjacent
     /// struct fields when the "slot" is really a struct member.
-    fn store_to_stack_slot(&mut self, src: Reg, stack_offset: i32) {
+    fn store_to_stack_slot(&mut self, src: Reg, stack_offset: i64) {
         self.push_lir(X86Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(src),
@@ -224,7 +225,7 @@ impl X86_64CodeGen {
         });
     }
 
-    pub(super) fn emit_move_to_loc(&mut self, src: Reg, dst: &Loc, size: u32) {
+    pub(super) fn emit_move_to_loc(&mut self, src: Reg, dst: &Loc, size: Bits) {
         // For stack stores, use actual size to properly handle char/short
         // For register-to-register, use minimum 32-bit
         match dst {
@@ -232,8 +233,7 @@ impl X86_64CodeGen {
                 // No-op: same register
             }
             Loc::Reg(r) => {
-                let reg_size = size.max(32);
-                let op_size = OperandSize::from_bits(reg_size);
+                let op_size = OperandSize::from_bits(size.max(Bits::new(32)));
                 // LIR: register-to-register move
                 self.push_lir(X86Inst::Mov {
                     size: op_size,
@@ -242,7 +242,7 @@ impl X86_64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                if size < 32 {
+                if size < Bits::new(32) {
                     // Sub-32-bit values: zero-extend to 32 bits, then store
                     // full slot via store_to_stack_slot (which writes 64-bit)
                     let scratch = if src == Reg::R10 { Reg::R11 } else { Reg::R10 };
@@ -251,7 +251,7 @@ impl X86_64CodeGen {
                         src: GpOperand::Reg(src),
                         dst: GpOperand::Reg(scratch),
                     });
-                    let mask = (1i64 << size) - 1;
+                    let mask = (1i64 << size.get()) - 1;
                     self.push_lir(X86Inst::And {
                         size: OperandSize::B32,
                         src: GpOperand::Imm(mask),
@@ -264,7 +264,7 @@ impl X86_64CodeGen {
             }
             Loc::Xmm(xmm) => {
                 // Move from GP register to XMM register (used for Float16 rtlib returns)
-                let op_size = if size <= 32 {
+                let op_size = if size <= Bits::new(32) {
                     OperandSize::B32
                 } else {
                     OperandSize::B64
@@ -296,7 +296,7 @@ impl X86_64CodeGen {
     pub(super) fn scalar_mem_operand(
         &mut self,
         addr: PseudoId,
-        disp: i32,
+        disp: i64,
         scratch: Reg,
     ) -> MemAddr {
         match self.get_location(addr) {
@@ -304,7 +304,7 @@ impl X86_64CodeGen {
             Loc::Stack(offset) if self.pseudos.is_sym(addr) => self.stack_mem(offset - disp),
             Loc::Global(name) => self.global_mem_operand(&name, disp, scratch),
             _ => {
-                self.emit_move(addr, scratch, 64);
+                self.emit_move(addr, scratch, Bits::new(64));
                 MemAddr::BaseOffset {
                     base: scratch,
                     offset: disp,
@@ -387,7 +387,7 @@ impl X86_64CodeGen {
     /// FS segment (Local Exec, or Initial Exec with the offset loaded into
     /// `scratch`), external through the GOT (the address loaded into
     /// `scratch`), anything else RIP-relative.
-    fn global_mem_operand(&mut self, name: &str, disp: i32, scratch: Reg) -> MemAddr {
+    fn global_mem_operand(&mut self, name: &str, disp: i64, scratch: Reg) -> MemAddr {
         let symbol = Symbol::named(name);
         // TLS first: an external thread-local must not take the GOT path.
         if self.is_tls_symbol(name) {
@@ -420,12 +420,12 @@ impl X86_64CodeGen {
     fn emit_extending_load(
         &mut self,
         mem: MemAddr,
-        mem_size: u32,
-        reg_size: u32,
+        mem_size: Bits,
+        reg_size: Bits,
         is_unsigned: bool,
         dst: Reg,
     ) {
-        if mem_size > 16 {
+        if mem_size > Bits::new(16) {
             self.emit_gp_load(mem, mem_size, reg_size, dst);
             return;
         }
@@ -456,7 +456,7 @@ impl X86_64CodeGen {
     /// is what a small composite gives -- is read as two overlapping halves
     /// rather than rounded up to the next width, which reads up to three
     /// bytes past the end and faults when the object ends a page.
-    fn emit_gp_load(&mut self, mem: MemAddr, mem_size: u32, reg_size: u32, dst: Reg) {
+    fn emit_gp_load(&mut self, mem: MemAddr, mem_size: Bits, reg_size: Bits, dst: Reg) {
         match (crate::ir::memexpand::overlapping_halves(mem_size), &mem) {
             (Some((width, high)), MemAddr::BaseOffset { base, offset }) => {
                 let (base, offset) = (*base, *offset);
@@ -492,13 +492,13 @@ impl X86_64CodeGen {
     /// The halves share their middle bytes, which come back the same from
     /// both reads, so OR-ing them is exact -- and neither read passes the end
     /// of the object.
-    fn emit_overlapped_load(&mut self, base: Reg, offset: i32, width: i64, high: i64, dst: Reg) {
+    fn emit_overlapped_load(&mut self, base: Reg, offset: i64, width: i64, high: i64, dst: Reg) {
         // R10 and R11 are the only scratch registers, and `dst` is either an
         // allocated register or R10 -- never R11. R11 also carries the
         // computed address at several callers, which is why the half that
         // lands in `base` is read last.
         let scratch = Reg::R11;
-        let halves = [(offset, dst), (offset + high as i32, scratch)];
+        let halves = [(offset, dst), (offset + high, scratch)];
         let halves = if dst == base {
             [halves[1], halves[0]]
         } else {
@@ -517,7 +517,11 @@ impl X86_64CodeGen {
                 });
             } else {
                 self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::from_bits(width as u32 * 8),
+                    src_size: OperandSize::from_bits(
+                        ByteSize::new(width as u64)
+                            .bits()
+                            .expect("a half is at most four bytes"),
+                    ),
                     dst_size: OperandSize::B32,
                     src: GpOperand::Mem(addr),
                     dst: into,
@@ -538,7 +542,7 @@ impl X86_64CodeGen {
 
     pub(super) fn emit_load(&mut self, insn: &Instruction, types: &TypeTable) {
         let mem_size = insn.size;
-        let reg_size = insn.size.max(32);
+        let reg_size = insn.size.max(Bits::new(32));
         let addr = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -572,11 +576,11 @@ impl X86_64CodeGen {
                     // A pointer in a slot: load it, then read through it.
                     let dst_lo = self.int128_lo_mem_loc(&dst_loc);
                     let dst_hi = self.int128_hi_mem_loc(&dst_loc);
-                    self.emit_move(addr, Reg::R10, 64);
+                    self.emit_move(addr, Reg::R10, Bits::new(64));
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.displacement().into()),
+                            src: GpOperand::Imm(insn.displacement()),
                             dst: Reg::R10,
                         });
                     }
@@ -626,7 +630,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.displacement().into()),
+                            src: GpOperand::Imm(insn.displacement()),
                             dst: Reg::R10,
                         });
                     }
@@ -662,11 +666,11 @@ impl X86_64CodeGen {
                     // addr is a runtime pointer — dereference it
                     let dst_lo = self.int128_lo_mem_loc(&dst_loc);
                     let dst_hi = self.int128_hi_mem_loc(&dst_loc);
-                    self.emit_move(addr, Reg::R10, 64);
+                    self.emit_move(addr, Reg::R10, Bits::new(64));
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.displacement().into()),
+                            src: GpOperand::Imm(insn.displacement()),
                             dst: Reg::R10,
                         });
                     }
@@ -740,7 +744,7 @@ impl X86_64CodeGen {
         // This is critical for char/short types that need byte/word stores
         let mem_size = insn.size;
         // Register operations use minimum 32-bit
-        let reg_size = insn.size.max(32);
+        let reg_size = insn.size.max(Bits::new(32));
 
         let (addr, value) = match (insn.src.first(), insn.src.get(1)) {
             (Some(&a), Some(&v)) => (a, v),
@@ -767,7 +771,7 @@ impl X86_64CodeGen {
 
         // For struct stores (size > 64), we need to copy multiple words
         // The value is a symbol containing the struct data
-        if mem_size > 64 {
+        if mem_size > Bits::new(64) {
             if !Self::refuse_segment_access(insn, "a store wider than 64 bits") {
                 self.emit_struct_store(insn, addr, value);
             }
@@ -803,7 +807,7 @@ impl X86_64CodeGen {
     /// Emit a struct copy (store of size > 64 bits)
     /// The value is a symbol containing the source struct data
     fn emit_struct_store(&mut self, insn: &Instruction, addr: PseudoId, value: PseudoId) {
-        let struct_size = insn.size; // Size in bits
+        let struct_size = insn.size.get(); // Size in bits
         let num_qwords = struct_size.div_ceil(64);
 
         // Get source address (where the struct data is)
@@ -877,7 +881,7 @@ impl X86_64CodeGen {
                     if insn.offset != 0 {
                         self.push_lir(X86Inst::Add {
                             size: OperandSize::B64,
-                            src: GpOperand::Imm(insn.displacement().into()),
+                            src: GpOperand::Imm(insn.displacement()),
                             dst: Reg::R11,
                         });
                     }
@@ -930,16 +934,14 @@ impl X86_64CodeGen {
     /// where no XMM register may be touched, through %rax, saved around
     /// the copy since it may hold a live pseudo. A base of %rsp is read
     /// past the push.
-    pub(super) fn copy_eightbytes(&mut self, src: (Reg, i32), dst: (Reg, i32), count: u32) {
-        let at = |(base, offset): (Reg, i32), i: u32, pushed: i32| MemAddr::BaseOffset {
+    pub(super) fn copy_eightbytes(&mut self, src: (Reg, i64), dst: (Reg, i64), count: u32) {
+        let at = |(base, offset): (Reg, i64), i: u32, pushed: i64| MemAddr::BaseOffset {
             base,
-            offset: offset + (i * 8) as i32 + if base == Reg::Rsp { pushed } else { 0 },
+            offset: offset + i64::from(i * 8) + if base == Reg::Rsp { pushed } else { 0 },
         };
         if !self.base.isa.has_sse2() {
             debug_assert!(src.0 != Reg::Rax && dst.0 != Reg::Rax);
-            self.push_lir(X86Inst::Push {
-                src: GpOperand::Reg(Reg::Rax),
-            });
+            self.push_saved(Reg::Rax);
             for i in 0..count {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
@@ -952,7 +954,7 @@ impl X86_64CodeGen {
                     dst: GpOperand::Mem(at(dst, i, 8)),
                 });
             }
-            self.push_lir(X86Inst::Pop { dst: Reg::Rax });
+            self.pop_saved(Reg::Rax);
             return;
         }
         for i in 0..count {
@@ -1035,7 +1037,7 @@ impl X86_64CodeGen {
             }
             _ => {
                 // Fallback: load lo half into R10 and store it
-                self.emit_move(src, Reg::R10, 64);
+                self.emit_move(src, Reg::R10, Bits::new(64));
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::R10),
@@ -1120,7 +1122,7 @@ impl X86_64CodeGen {
                 if insn.offset != 0 {
                     self.push_lir(X86Inst::Add {
                         size: OperandSize::B64,
-                        src: GpOperand::Imm(insn.displacement().into()),
+                        src: GpOperand::Imm(insn.displacement()),
                         dst: Reg::R11,
                     });
                 }
@@ -1137,7 +1139,7 @@ impl X86_64CodeGen {
 
         // Store zeros to each qword
         for i in 0..num_qwords {
-            let byte_offset = (i * 8) as i32;
+            let byte_offset = (i * 8) as i64;
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Reg(Reg::R10),
@@ -1153,7 +1155,7 @@ impl X86_64CodeGen {
         &mut self,
         src: PseudoId,
         dst: PseudoId,
-        size: u32,
+        size: Bits,
         typ: Option<TypeId>,
         types: &TypeTable,
     ) {
@@ -1168,7 +1170,7 @@ impl X86_64CodeGen {
 
         // Keep actual size for handling narrow types
         let actual_size = size;
-        let reg_size = size.max(32);
+        let reg_size = size.max(Bits::new(32));
         let dst_loc = self.get_location(dst);
         let src_loc = self.get_location(src);
 
@@ -1182,7 +1184,7 @@ impl X86_64CodeGen {
         // copy doesn't carry narrow-type truncation (8/16 bit needs
         // explicit AND/SHL+SAR) AND it's not a FP copy (FP path has
         // size-specific quirks), the Copy is a true no-op and can be
-        if src_loc == dst_loc && actual_size >= 32 && !is_fp_copy {
+        if src_loc == dst_loc && actual_size >= Bits::new(32) && !is_fp_copy {
             return;
         }
 
@@ -1211,8 +1213,7 @@ impl X86_64CodeGen {
                 };
 
                 // Use type-aware size for FP operations
-                let fp_size = typ.map(|t| types.size_bits(t)).unwrap_or(reg_size).max(32);
-                let fp_fmt = self.fp_format(typ, fp_size, types);
+                let fp_fmt = self.fp_format(typ, reg_size, types);
                 self.emit_fp_move(src, dst_xmm, fp_fmt);
 
                 if !matches!(&dst_loc, Loc::Xmm(x) if *x == dst_xmm) {
@@ -1225,7 +1226,7 @@ impl X86_64CodeGen {
                 Loc::Reg(r) => {
                     // A narrow value is kept extended to 32 bits by its type's
                     // signedness, which is what every consumer reads.
-                    let narrow = match actual_size {
+                    let narrow = match actual_size.get() {
                         8 => Some(OperandSize::B8),
                         16 => Some(OperandSize::B16),
                         _ => None,
@@ -1235,7 +1236,8 @@ impl X86_64CodeGen {
                         // `char buf[16] = {0}` spent a shift pair on every
                         // zero byte.
                         (Some(_), Loc::Imm(v)) => {
-                            let v = crate::ir::constfold::at_width(*v, actual_size, !is_unsigned);
+                            let v =
+                                crate::ir::constfold::at_width(*v, actual_size.get(), !is_unsigned);
                             self.push_lir(X86Inst::Mov {
                                 size: OperandSize::B32,
                                 src: GpOperand::Imm(v as i64),
@@ -1272,13 +1274,13 @@ impl X86_64CodeGen {
                     // movl to a 32-bit register zero-extends to 64-bit on x86-64,
                     // so loading with reg_size then storing with 64 is correct.
                     self.emit_move(src, Reg::R10, reg_size);
-                    if actual_size <= 16 {
+                    if actual_size <= Bits::new(16) {
                         // 8/16-bit values: store actual size (these are char/short
                         // fields stored to struct offsets, not full stack slots)
                         self.emit_move_to_loc(Reg::R10, &dst_loc, actual_size);
                     } else {
                         // 32-bit values: store as 64-bit to zero-fill upper 4 bytes
-                        self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+                        self.emit_move_to_loc(Reg::R10, &dst_loc, Bits::new(64));
                     }
                 }
                 _ => {}

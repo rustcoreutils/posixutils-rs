@@ -23,6 +23,7 @@ use crate::parse::ast::{
 };
 use crate::target::{Arch, Os, Target};
 use crate::types::Type;
+use crate::units::Bits;
 
 // Frame/Return address builtin tests
 
@@ -411,13 +412,13 @@ fn test_rounding_is_one_opcode() {
         .find(|i| i.op == Opcode::RoundToIntegral(Floor))
         .expect("floor");
     assert_eq!(floor.extra().func_name.as_deref(), Some("floorf"));
-    assert_eq!(floor.size, 32, "computed at float");
+    assert_eq!(floor.size, Bits::new(32), "computed at float");
     let nearby = insns
         .iter()
         .find(|i| i.op == Opcode::RoundToIntegral(NearbyInt))
         .expect("nearbyint");
     assert_eq!(nearby.extra().func_name.as_deref(), Some("nearbyint"));
-    assert_eq!(nearby.size, 64);
+    assert_eq!(nearby.size, Bits::new(64));
 }
 
 /// `fma` is one three-operand opcode, and `fmin` and `fmax` two-operand
@@ -437,7 +438,7 @@ fn test_min_max_fma_are_opcodes() {
     ] {
         let insn = insns.iter().find(|i| i.op == op).expect(name);
         assert_eq!(insn.extra().func_name.as_deref(), Some(name));
-        assert_eq!((insn.src.len(), insn.size), (srcs, size), "{name}");
+        assert_eq!((insn.src.len(), insn.size.get()), (srcs, size), "{name}");
     }
 }
 
@@ -504,7 +505,7 @@ fn test_mempcpy_and_bcopy_are_memcpy_and_memmove() {
         .iter()
         .find(|i| i.op == Opcode::Add && i.src == [mempcpy.src[0], mempcpy.src[2]])
         .expect("mempcpy's value is d + n");
-    assert_eq!(end.size, 64);
+    assert_eq!(end.size, Bits::new(64));
 }
 
 /// Under `-fno-math-errno` the opcode stands alone; on a target without the
@@ -554,7 +555,7 @@ fn test_int_abs_is_linearized_without_a_call() {
     let widths: Vec<u32> = insns
         .iter()
         .filter(|i| i.op == Opcode::Asr)
-        .map(|i| i.size)
+        .map(|i| i.size.get())
         .collect();
     assert_eq!(widths, vec![32, 64, 64]);
 }
@@ -786,7 +787,7 @@ fn run_issignaling(module: &Module, image: [u8; 16]) -> i128 {
             }
             Opcode::Load if Some(insn.src[0]) == temp => {
                 let at = insn.offset as usize;
-                let bytes = insn.size as usize / 8;
+                let bytes = insn.size.bytes_exact() as usize;
                 let mut word = [0u8; 16];
                 word[..bytes].copy_from_slice(&image[at..at + bytes]);
                 vals.insert(insn.target.unwrap(), u128::from_le_bytes(word) as i128);
@@ -987,7 +988,7 @@ fn test_stack_save_and_restore_are_their_opcodes() {
             .iter()
             .find(|i| i.op == Opcode::StackRestore)
             .expect("a StackRestore");
-        assert_eq!(save.size, 64, "{arch:?}");
+        assert_eq!(save.size, Bits::new(64), "{arch:?}");
         assert_eq!(restore.src.len(), 1, "{arch:?}");
         // `m` is promoted: the restore reads the save's own result, through
         // the copy that was the assignment.
@@ -1159,7 +1160,7 @@ fn test_constant_p_of_a_vector_asks_each_lane() {
                 .iter()
                 .find(|i| i.target == Some(cp.src[0]))
                 .expect("the operand is defined");
-            assert_eq!((load.op, load.size), (Opcode::Load, width), "{body}");
+            assert_eq!((load.op, load.size.get()), (Opcode::Load, width), "{body}");
         }
     }
     let src = format!("{decls}int f(void) {{ volatile v4si v = {{ 1, 2, 3, 4 }}; return __builtin_constant_p(v); }}\n");

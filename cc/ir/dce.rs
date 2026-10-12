@@ -215,6 +215,7 @@ mod tests {
     use crate::ir::{BasicBlock, Instruction, Pseudo};
     use crate::target::Target;
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     fn make_simple_func() -> Function {
         let types = TypeTable::new(&Target::host());
@@ -233,7 +234,7 @@ mod tests {
             PseudoId(2),
             PseudoId(2),
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         // Dead: result unused
         bb.add_insn(Instruction::binop(
@@ -242,7 +243,7 @@ mod tests {
             PseudoId(2),
             PseudoId(2),
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::ret(Some(PseudoId(0))));
         func.add_block(bb);
@@ -284,7 +285,7 @@ mod tests {
             PseudoId(1),
             PseudoId(2),
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::ret(Some(PseudoId(0))));
         func.add_block(bb);
@@ -314,7 +315,7 @@ mod tests {
             PseudoId(2),
             PseudoId(2),
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         // %1 = mul %0, %2 (live because ret uses it)
         bb.add_insn(Instruction::binop(
@@ -323,7 +324,7 @@ mod tests {
             PseudoId(0),
             PseudoId(2),
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::ret(Some(PseudoId(1))));
         func.add_block(bb);
@@ -409,7 +410,7 @@ mod tests {
             vec![PseudoId(1)],
             vec![types.int_id],
             types.void_id,
-            8,
+            Bits::new(8),
         ));
         bb2.add_insn(Instruction::new(Opcode::Unreachable));
 
@@ -526,7 +527,8 @@ mod tests {
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
         bb.add_insn(
-            Instruction::load(PseudoId(0), PseudoId(1), 0, types.int_id, 32).with_volatile(true),
+            Instruction::load(PseudoId(0), PseudoId(1), 0, types.int_id, Bits::new(32))
+                .with_volatile(true),
         );
         bb.add_insn(Instruction::ret(None));
         func.add_block(bb);
@@ -553,10 +555,17 @@ mod tests {
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.add_insn(Instruction::new(Opcode::Entry));
         // %1 = load p        (plain: reading the pointer variable)
-        bb.add_insn(Instruction::load(PseudoId(1), PseudoId(0), 0, ptr, 64));
+        bb.add_insn(Instruction::load(
+            PseudoId(1),
+            PseudoId(0),
+            0,
+            ptr,
+            Bits::new(64),
+        ));
         // %2 = load *%1      (volatile: reading the pointed-to object)
         bb.add_insn(
-            Instruction::load(PseudoId(2), PseudoId(1), 0, types.int_id, 32).with_volatile(true),
+            Instruction::load(PseudoId(2), PseudoId(1), 0, types.int_id, Bits::new(32))
+                .with_volatile(true),
         );
         bb.add_insn(Instruction::ret(None));
         func.add_block(bb);
@@ -572,8 +581,8 @@ mod tests {
         // `kill` makes a `Nop`, which reaches no memory: a marker left behind
         // would be a stale claim to any pass reading the field directly.
         let types = TypeTable::new(&Target::host());
-        let mut insn =
-            Instruction::load(PseudoId(0), PseudoId(1), 0, types.int_id, 32).with_volatile(true);
+        let mut insn = Instruction::load(PseudoId(0), PseudoId(1), 0, types.int_id, Bits::new(32))
+            .with_volatile(true);
         insn.kill();
         assert_eq!(insn.op, Opcode::Nop);
         assert!(!insn.is_volatile);
@@ -597,7 +606,7 @@ mod tests {
             PseudoId(2),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::ret(None));
         func.add_block(bb);
@@ -631,7 +640,8 @@ mod tests {
         bb0.add_insn(Instruction::new(Opcode::Entry));
 
         // PhiSource: %1 = phisrc %0, back-pointer → (bb1, %2)
-        let mut phisrc = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        let mut phisrc =
+            Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, Bits::new(32));
         phisrc.phi_list = vec![(BasicBlockId(1), PseudoId(2))];
         bb0.add_insn(phisrc);
 
@@ -643,7 +653,7 @@ mod tests {
         bb1.parents = vec![BasicBlockId(0)];
 
         // Phi: %2 = phi [bb0: %1]
-        let mut phi = Instruction::phi(PseudoId(2), types.int_id, 32);
+        let mut phi = Instruction::phi(PseudoId(2), types.int_id, Bits::new(32));
         phi.phi_list = vec![(BasicBlockId(0), PseudoId(1))];
         bb1.add_insn(phi);
 
@@ -670,7 +680,8 @@ mod tests {
         let types = TypeTable::new(&Target::host());
 
         // Build a PhiSource with back-pointer to (bb1, %2)
-        let mut phisrc = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        let mut phisrc =
+            Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, Bits::new(32));
         phisrc.phi_list = vec![(BasicBlockId(1), PseudoId(2))];
 
         let uses = phisrc.uses();
@@ -688,7 +699,7 @@ mod tests {
         // Verify that Phi instructions still report phi_list pseudos as uses
         let types = TypeTable::new(&Target::host());
 
-        let mut phi = Instruction::phi(PseudoId(2), types.int_id, 32);
+        let mut phi = Instruction::phi(PseudoId(2), types.int_id, Bits::new(32));
         phi.phi_list = vec![(BasicBlockId(0), PseudoId(1))];
 
         let uses = phi.uses();
@@ -712,7 +723,7 @@ mod tests {
             vec![PseudoId(1), PseudoId(2)],   // args
             vec![types.int_id, types.int_id], // arg_types
             types.int_id,
-            32,
+            Bits::new(32),
         );
 
         let uses = call_insn.uses();
@@ -745,7 +756,7 @@ mod tests {
         load.target = Some(PseudoId(1));
         load.src = vec![PseudoId(2)]; // load from some address
         load.typ = Some(types.pointer_to(types.int_id));
-        load.size = 64;
+        load.size = Bits::new(64);
         bb.add_insn(load);
 
         // %0 = call_indirect %1(%2)
@@ -755,7 +766,7 @@ mod tests {
             vec![PseudoId(2)],  // args
             vec![types.int_id], // arg_types
             types.int_id,
-            32,
+            Bits::new(32),
         );
         bb.add_insn(call);
 

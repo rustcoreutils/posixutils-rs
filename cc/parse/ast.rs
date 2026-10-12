@@ -2202,7 +2202,7 @@ pub fn is_brace_elision_candidate(
         let elem_kind = types.kind(elem_typ);
         if matches!(elem_kind, TypeKind::Struct | TypeKind::Union)
             && elem_kind == types.kind(target_type)
-            && types.size_bytes(elem_typ) == types.size_bytes(target_type)
+            && types.byte_size(elem_typ) == types.byte_size(target_type)
         {
             return false;
         }

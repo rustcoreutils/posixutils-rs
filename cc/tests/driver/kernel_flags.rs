@@ -202,15 +202,9 @@ fn kernel_flags_f_options() {
     ] {
         refused(&[X86, flag], want);
     }
-    // Stack probes are not emitted: taken with c17's warning.
+    // Stack probes: c17's `-fstack-clash-protection`, taken in silence.
     let r = compile(&[X86, "-fstack-check=specific"]);
-    assert!(
-        r.success
-            && r.stderr
-                .contains("'-fstack-check=specific' is not supported; ignored"),
-        "{}",
-        r.stderr
-    );
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
 }
 
 /// The mitigation and stack-guard options: taken with each of gcc's values,

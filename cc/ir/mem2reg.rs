@@ -89,6 +89,8 @@ mod tests {
     };
     use crate::target::Target;
     use crate::types::TypeTable;
+    use crate::units::Bits;
+    use crate::units::ByteSize;
 
     /// A local named only by an inline-asm memory operand is still storage
     /// the program uses. Dropping it left the operand with no stack slot and
@@ -109,7 +111,7 @@ mod tests {
                 PseudoId(0),
                 "=m",
                 crate::target::Arch::X86_64,
-                64,
+                Bits::new(64),
             )],
             inputs: vec![],
             clobbers: vec![],
@@ -138,7 +140,7 @@ mod tests {
                 .push(crate::ir::ImplicitParamCopy {
                     arg_index: id,
                     local_sym: PseudoId(id),
-                    size_bytes: 16,
+                    size_bytes: ByteSize::new(16),
                     qword_type: types.long_id,
                     arg_is_address: true,
                 });
@@ -152,7 +154,7 @@ mod tests {
             PseudoId(1),
             0,
             types.double_id,
-            64,
+            Bits::new(64),
         ));
         bb.add_insn(Instruction::ret(None));
         func.blocks.push(bb);
@@ -186,7 +188,7 @@ mod tests {
             PseudoId(1),
             0,
             types.int_id,
-            32,
+            Bits::new(32),
         ));
         bb.add_insn(Instruction::lifetime_end(PseudoId(0)));
         bb.add_insn(Instruction::lifetime_end(PseudoId(1)));

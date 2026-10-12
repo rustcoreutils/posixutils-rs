@@ -26,6 +26,7 @@ use crate::abi::CallingConv;
 use crate::parse::ast::{AliasAttr, AliasForm, FunctionAttrs, FunctionDef, SymbolAttrs};
 use crate::target_attr::TargetClones;
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::HashMap;
 
 /// A version the resolver can return: its symbol, and where the runtime
@@ -234,27 +235,49 @@ fn build_resolver(
     for choice in choices.iter().rev() {
         let base = address_of(&mut func, &mut block, choice.word.0, void_ptr);
         let word = reg(&mut func);
-        block.add_insn(Instruction::load(word, base, choice.word.1, uint, 32));
+        block.add_insn(Instruction::load(
+            word,
+            base,
+            choice.word.1,
+            uint,
+            Bits::new(32),
+        ));
         let mask = value(&mut func, i128::from(choice.mask));
         let bits = reg(&mut func);
-        block.add_insn(Instruction::binop(Opcode::And, bits, word, mask, uint, 32));
+        block.add_insn(Instruction::binop(
+            Opcode::And,
+            bits,
+            word,
+            mask,
+            uint,
+            Bits::new(32),
+        ));
         let zero = value(&mut func, 0);
         let has = reg(&mut func);
         block.add_insn(Instruction::compare(
             Opcode::SetNe,
             has,
             (bits, zero),
-            (uint, 32),
-            (types.int_id, 32),
+            (uint, Bits::new(32)),
+            (types.int_id, Bits::new(32)),
         ));
         let version = address_of(&mut func, &mut block, &choice.symbol, void_ptr);
         let picked = reg(&mut func);
         block.add_insn(Instruction::select(
-            picked, has, version, chosen, void_ptr, 64,
+            picked,
+            has,
+            version,
+            chosen,
+            void_ptr,
+            Bits::new(64),
         ));
         chosen = picked;
     }
-    block.add_insn(Instruction::ret_typed(Some(chosen), void_ptr, 64));
+    block.add_insn(Instruction::ret_typed(
+        Some(chosen),
+        void_ptr,
+        Bits::new(64),
+    ));
     func.entry = BasicBlockId(0);
     func.add_block(block);
     func

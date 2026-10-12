@@ -26,13 +26,14 @@ use crate::diag;
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, Expr, ExprKind};
 use crate::types::{TypeId, TypeKind};
+use crate::units::Bits;
 
 /// An `_Atomic` lvalue that can be operated on with a single hardware atomic:
 /// its address, its element type, and the width in bits.
 pub(crate) struct AtomicLvalue {
     pub addr: PseudoId,
     pub elem_typ: TypeId,
-    pub size_bits: u32,
+    pub size_bits: Bits,
 }
 
 /// C17 6.5.16.2p3 / 7.17.3p12: an operator on an atomic object is
@@ -230,10 +231,13 @@ impl Linearizer<'_> {
 
         let is_aggregate = matches!(kind, TypeKind::Struct | TypeKind::Union);
 
-        let bits = self.types.size_bits(typ);
+        // An aggregate too large to have a value width is not lock-free.
         (is_scalar || is_aggregate)
-            && bits.is_multiple_of(8)
-            && crate::target::atomic_is_lock_free(u64::from(bits / 8))
+            && self
+                .types
+                .checked_value_bits(typ)
+                .and_then(Bits::whole_bytes)
+                .is_some_and(|bytes| crate::target::atomic_is_lock_free(u64::from(bytes)))
     }
 
     /// The type the atomic instruction actually operates through.
@@ -245,7 +249,7 @@ impl Linearizer<'_> {
     /// substituting here is enough; nothing downstream has to know.
     fn atomic_access_type(&self, typ: TypeId) -> TypeId {
         if matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union) {
-            self.bitfield_storage_type((self.types.size_bytes(typ)).max(1))
+            self.bitfield_storage_type(self.types.byte_size(typ).to_usize().max(1))
         } else {
             typ
         }
@@ -308,7 +312,7 @@ impl Linearizer<'_> {
                  lock-free atomics only at 1, 2, 4 and 8 bytes",
                 &[
                     &self.types.get(typ).to_string(),
-                    &self.types.size_bytes(typ).to_string(),
+                    &self.types.byte_size(typ).to_string(),
                 ],
             );
             return None;
@@ -319,7 +323,7 @@ impl Linearizer<'_> {
         if self.atomic_access_type(typ) != typ {
             self.refuse_atomic_in_segment(typ);
         }
-        let size_bits = self.types.size_bits(typ);
+        let size_bits = self.types.value_bits(typ);
         let addr = self.linearize_lvalue(expr);
         Some(AtomicLvalue {
             addr,
@@ -490,7 +494,7 @@ impl Linearizer<'_> {
         addr: PseudoId,
         exp_addr: PseudoId,
         desired: PseudoId,
-        (elem_typ, bits): (TypeId, u32),
+        (elem_typ, bits): (TypeId, Bits),
         order: MemoryOrder,
     ) -> PseudoId {
         self.refuse_atomic_in_segment(elem_typ);
@@ -650,8 +654,8 @@ impl Linearizer<'_> {
         rhs: PseudoId,
     ) -> PseudoId {
         let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
-        let elem_size = self.types.size_bytes(elem_type);
-        let scale = self.emit_const(elem_size as i128, self.types.long_id);
+        let elem_size = self.types.byte_size(elem_type);
+        let scale = self.emit_const(i128::from(elem_size.get()), self.types.long_id);
         let extended = self.emit_convert(rhs, value_typ, self.types.long_id);
         let scaled = self.alloc_reg_pseudo();
         self.emit(Instruction::binop(
@@ -660,7 +664,7 @@ impl Linearizer<'_> {
             extended,
             scale,
             self.types.long_id,
-            self.types.size_bits(self.types.long_id),
+            self.types.value_bits(self.types.long_id),
         ));
         scaled
     }
@@ -720,7 +724,7 @@ impl Linearizer<'_> {
     pub(crate) fn incdec_delta(&mut self, typ: TypeId) -> PseudoId {
         if self.types.kind(typ) == TypeKind::Pointer {
             let elem = self.types.base_type(typ).unwrap_or(self.types.char_id);
-            let bytes = (self.types.size_bytes(elem)).max(1);
+            let bytes = self.types.byte_size(elem).to_usize().max(1);
             return self.emit_const(bytes as i128, self.types.long_id);
         }
         if self.types.is_float(typ) {

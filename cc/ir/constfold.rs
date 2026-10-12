@@ -316,8 +316,8 @@ fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
                 return None;
             };
             let size = insn.operand_width();
-            let a = at_width(a, size, signed);
-            let b = at_width(b, size, signed);
+            let a = at_width(a, size.get(), signed);
+            let b = at_width(b, size.get(), signed);
             let ord = if signed {
                 a.cmp(&b)
             } else {
@@ -408,7 +408,7 @@ pub(crate) fn divmod_may_trap(op: Opcode, size: u32, a: Option<i128>, b: Option<
 /// route their constant folding through [`eval_binop`].
 fn eval_divmod(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
     let signed = matches!(insn.op, Opcode::DivS | Opcode::ModS);
-    let size = insn.size.max(1);
+    let size = insn.size.get().max(1);
     if divmod_may_trap(insn.op, size, Some(a), Some(b)) {
         return None;
     }
@@ -429,7 +429,7 @@ fn eval_divmod(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 /// `Lsr` the logical one. A shift count outside `[0, width)` is undefined and
 /// is not folded.
 fn eval_shift(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
-    let size = insn.size.max(1);
+    let size = insn.size.get().max(1);
     if !(0..size as i128).contains(&b) {
         return None;
     }
@@ -676,9 +676,11 @@ fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
         // it reads the same at every width the `int` result is taken at.
         // Read the operand at the width it was stored in, in the signedness
         // the opcode names, and leave it there: the destination is wider.
-        Opcode::Sext | Opcode::Zext => {
-            Some(at_width(a, insn.operand_width(), insn.op == Opcode::Sext))
-        }
+        Opcode::Sext | Opcode::Zext => Some(at_width(
+            a,
+            insn.operand_width().get(),
+            insn.op == Opcode::Sext,
+        )),
         // Truncation keeps the low `size` bits -- but *which value* those
         // bits are is decided by the consumer, not here, and the IR does not
         // record it: `-(unsigned char)200` reaches the negation as
@@ -689,7 +691,7 @@ fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
         // rule than `unambiguous_at` enforces on *chaining* elsewhere in this
         // file, and deliberately so: this one governs the rewrite itself.
         Opcode::Trunc => {
-            let size = insn.size.max(1);
+            let size = insn.size.get().max(1);
             let v = at_width(a, size, true);
             unambiguous_at(v, size).then_some(v)
         }
@@ -768,6 +770,7 @@ pub(crate) fn eval_bit_op(op: BitOp, width: u32, a: i128) -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::Bits;
 
     const DOMAINS: [CmpDomain; 3] = [
         CmpDomain::Int { signed: true },
@@ -950,7 +953,7 @@ mod tests {
                 // A comparison's operand width is its source width; the
                 // result is an `int`.
                 let mut insn = binop_at(op, 32);
-                insn.src_size = size;
+                insn.src_size = Bits::new(size);
                 for a in values {
                     for b in values {
                         let (x, y) = (at_width(a, size, signed), at_width(b, size, signed));
@@ -1154,7 +1157,7 @@ mod tests {
     }
 
     fn binop_at(op: Opcode, size: u32) -> Instruction {
-        Instruction::new(op).with_size(size)
+        Instruction::new(op).with_size(Bits::new(size))
     }
 
     /// `eval_binop` is the one door `instcombine`, `sccp` and `vrp` fold
@@ -1286,7 +1289,7 @@ mod tests {
             (Opcode::Popcount32, -1, 32),
             (Opcode::Popcount64, -1, 64),
         ] {
-            let insn = Instruction::new(op).with_size(32);
+            let insn = Instruction::new(op).with_size(Bits::new(32));
             assert_eq!(eval_unop(&insn, a), Some(want), "{op:?} of {a:#x}");
         }
     }
@@ -1308,7 +1311,7 @@ mod tests {
             (Opcode::Load, &[1], None),
             (Opcode::UMulHi, &[1, 1], None),
         ] {
-            let insn = Instruction::new(op).with_size(32);
+            let insn = Instruction::new(op).with_size(Bits::new(32));
             assert_eq!(eval_int(&insn, ops), want, "{op:?} of {ops:?}");
         }
         for op in [Opcode::Load, Opcode::UMulHi, Opcode::FAdd, Opcode::Lo64] {

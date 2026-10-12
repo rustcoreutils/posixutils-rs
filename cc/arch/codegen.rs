@@ -17,6 +17,7 @@ use crate::float::{FloatVal, FpFormat};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
+use crate::units::{Align, Bits, ByteSize};
 
 // Shared Helper Types
 
@@ -161,8 +162,8 @@ pub struct CodeGenBase<I: LirInst> {
     /// `-fcf-protection`, which only x86-64 reads: for its landing pads, and
     /// the layout of `__builtin_setjmp`'s buffer.
     pub cf_protection: crate::target::CfProtection,
-    /// `-fstack-clash-protection` and its `--param`s; see
-    /// [`CodeGenBase::check_stack_clash`].
+    /// `-fstack-clash-protection` and its `--param`s: how the stack is
+    /// probed as it grows ([`crate::target::StackClash`]).
     pub stack_clash: Option<crate::target::StackClash>,
     /// `-fstack-protector` and its levels; see `arch::stack_protect`.
     pub stack_protector: crate::target::StackProtection,
@@ -209,6 +210,12 @@ pub struct CodeGenBase<I: LirInst> {
     pub optimizing: bool,
     /// Under branch protection, where an indirect branch may land.
     pub landing_pads: super::landing_pads::LandingPads,
+    /// How far the body of the function being emitted moves the stack
+    /// pointer below its frame; see [`Self::sp_lowered`].
+    pub excursion: super::stack_usage::Excursion,
+    /// The stack use of each function emitted, for `-fstack-usage`; see
+    /// [`Self::record_stack_usage`].
+    pub stack_usage: Vec<super::stack_usage::StackUsage>,
 }
 
 /// The own section of `global` under `-fdata-sections` or `retain`, named as
@@ -361,6 +368,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             eh: Default::default(),
             optimizing: false,
             landing_pads: Default::default(),
+            excursion: Default::default(),
+            stack_usage: Vec::new(),
         }
     }
 
@@ -538,34 +547,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         n
     }
 
-    /// Under `-fstack-clash-protection`, warn that `func` is unprobed if gcc
-    /// would probe it: when its prologue moves the stack pointer by
-    /// `adjustment` bytes, enough to step over the guard page, or when it
-    /// allocates on the stack at run time (`alloca`, a VLA). c17 emits no
-    /// probes. Any other function needs none: its prologue's step is
-    /// smaller than the guard, and the store the prologue makes at the new
-    /// stack pointer (x86-64's return address below it, aarch64's frame
-    /// record at it) touches the guard if anything does. The guard is gcc's
-    /// default: 4 KiB on x86-64; 64 KiB on aarch64, less the 1 KiB a caller
-    /// may leave untouched below its own frame.
-    pub fn check_stack_clash(&self, func: &Function, adjustment: i64) {
-        let Some(stack_clash) = self.stack_clash else {
-            return;
-        };
-        let guard = stack_clash.probed_from(self.target.arch);
-        let dynamic = func
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insns)
-            .any(|i| i.op == Opcode::Alloca);
-        if adjustment >= guard || dynamic {
-            crate::diag::group_warning_args(
-                crate::f_options::UNSUPPORTED_WARNING,
-                self.func_pos,
-                "'-fstack-clash-protection' is not supported; the stack of '{0}' is not probed",
-                &[&self.current_fn],
-            );
-        }
+    /// Under `-fstack-clash-protection`, how a prologue moving the stack
+    /// pointer by `bytes` probes the move; `None` when it needs no probe or
+    /// the protection is off. See [`crate::target::StackClash`].
+    pub fn frame_probe_plan(&self, bytes: i64) -> Option<crate::target::ProbePlan> {
+        self.stack_clash?.plan(self.target.arch, bytes)
     }
 
     /// `-Wframe-larger-than=`: warn, as gcc does, when this function's
@@ -588,6 +574,38 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 "the frame size of {0} bytes is larger than {1} bytes",
                 &[&size.to_string(), &limit.to_string()],
             );
+        }
+    }
+
+    /// The body moves the stack pointer `bytes` below where it stands: an
+    /// outgoing argument area, or a push it pops again. Every such move is
+    /// reported here and undone by [`Self::sp_raised`], so that
+    /// [`Self::record_stack_usage`] counts the deepest; `alloca` is not one,
+    /// its amount being unknown.
+    pub fn sp_lowered(&mut self, bytes: i64) {
+        self.excursion.lowered(bytes);
+    }
+
+    /// The body moves the stack pointer `bytes` back up.
+    pub fn sp_raised(&mut self, bytes: i64) {
+        self.excursion.raised(bytes);
+    }
+
+    /// The body puts the stack pointer back at the bottom of the frame
+    /// from a saved copy, having moved it by an amount known only at run
+    /// time within a bound it has already reported.
+    pub fn sp_restored(&mut self) {
+        self.excursion.restored();
+    }
+
+    /// Record the stack use of the function just emitted, whose prologue
+    /// took `frame_bytes` below the caller's stack pointer, and give
+    /// `-Wstack-usage=`'s warning about it. Called once the body is emitted,
+    /// so that its moves are all counted.
+    pub fn record_stack_usage(&mut self, func: &Function, frame_bytes: i64) {
+        if let Some(usage) = self.excursion.finish(func, frame_bytes) {
+            usage.check_limit();
+            self.stack_usage.push(usage);
         }
     }
 
@@ -924,8 +942,13 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     }
 
     pub fn emit_global(&mut self, global: &crate::ir::GlobalDef, types: &TypeTable) {
-        let size = types.size_bytes(global.typ) as u64;
-        let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
+        let size = types.byte_size(global.typ);
+        // Default to 8 bytes
+        let size = if size.is_zero() {
+            ByteSize::new(8)
+        } else {
+            size
+        };
         let align = global_alignment(global, types);
 
         if global.is_thread_local && self.target.os == Os::MacOS {
@@ -959,7 +982,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         // tentative and the initialized `const` there.
         let zero_init = !global.is_thread_local
             && !global.is_const
-            && size > 0
+            && !size.is_zero()
             && global.init.is_all_zero()
             && named_section.is_none()
             && !global.symbol_attrs.weak
@@ -1051,8 +1074,8 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         // After them, aarch64's `$d` mapping symbol, made at the first byte,
         // followed a static object at its address, and ld, naming a link
         // warning's location by the last symbol there, found no variable.
-        if align > 1 {
-            self.push_directive(Directive::Align(align.trailing_zeros()));
+        if align > Align::ONE {
+            self.push_directive(Directive::Align(align.log2()));
         }
 
         // ELF-only type and size (handled by Directive::emit which skips on macOS)
@@ -1072,7 +1095,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
 
         // Emit initializer
-        self.emit_initializer_data(&global.init, size as usize);
+        self.emit_initializer_data(&global.init, size);
     }
 
     /// A Mach-O thread-local variable: its initial image, and the descriptor
@@ -1095,7 +1118,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     ///
     /// Linkage belongs to the descriptor: `.globl`/weak/visibility go on `_v`,
     /// and the image is always a local symbol.
-    fn emit_macho_thread_local(&mut self, global: &crate::ir::GlobalDef, size: u64, align: u32) {
+    fn emit_macho_thread_local(
+        &mut self,
+        global: &crate::ir::GlobalDef,
+        size: ByteSize,
+        align: Align,
+    ) {
         let image = Symbol::global(format!("{}$tlv$init", global.name));
         let zero_fill = global.init.is_all_zero() && global.symbol_attrs.section.is_none();
         if zero_fill {
@@ -1105,15 +1133,15 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             self.push_directive(Directive::ThreadZerofill {
                 sym: image.clone(),
                 size,
-                align_log2: align.max(1).trailing_zeros(),
+                align_log2: align.log2(),
             });
         } else {
             self.push_directive(Directive::Tdata);
-            if align > 1 {
-                self.push_directive(Directive::Align(align.trailing_zeros()));
+            if align > Align::ONE {
+                self.push_directive(Directive::Align(align.log2()));
             }
             self.push_directive(Directive::global_label(image.name.clone()));
-            self.emit_initializer_data(&global.init, size as usize);
+            self.emit_initializer_data(&global.init, size);
         }
 
         self.push_directive(Directive::ThreadVars);
@@ -1149,10 +1177,10 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// 80-bit extended padded to 16 bytes on x86_64. Every width is encoded
     /// from the exact value, so `LDBL_MAX` is not already infinity and a NaN
     /// keeps its sign and payload.
-    fn emit_float_initializer(&mut self, val: FloatVal, size: usize) {
-        match size {
-            2 => self.push_directive(Directive::Short(val.to_bits_at_width(16))),
-            4 => self.push_directive(Directive::Long(val.to_bits_at_width(32))),
+    fn emit_float_initializer(&mut self, val: FloatVal, size: ByteSize) {
+        match size.get() {
+            2 => self.push_directive(Directive::Short(val.to_bits_at_width(Bits::new(16)))),
+            4 => self.push_directive(Directive::Long(val.to_bits_at_width(Bits::new(32)))),
             16 => {
                 let fmt = match self.target.arch {
                     crate::target::Arch::Aarch64 => FpFormat::Binary128,
@@ -1163,26 +1191,26 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 self.push_directive(Directive::Quad(bits as i64));
                 self.push_directive(Directive::Quad((bits >> 64) as i64));
             }
-            _ => self.push_directive(Directive::Quad(val.to_bits_at_width(64))),
+            _ => self.push_directive(Directive::Quad(val.to_bits_at_width(Bits::new(64)))),
         }
     }
 
     /// Emit data for an initializer, recursively handling complex types
-    pub fn emit_initializer_data(&mut self, init: &Initializer, size: usize) {
+    pub fn emit_initializer_data(&mut self, init: &Initializer, size: ByteSize) {
         match init {
             Initializer::None => {
                 // Zero-fill
                 self.push_directive(Directive::Zero(size));
             }
             Initializer::Int(val) => {
-                if size > 8 {
+                if size > ByteSize::new(8) {
                     // 128-bit: emit as two quads (little-endian: lo then hi)
                     let lo = *val as i64;
                     let hi = (*val >> 64) as u64 as i64;
                     self.push_directive(Directive::Quad(lo));
                     self.push_directive(Directive::Quad(hi));
                 } else {
-                    match size {
+                    match size.get() {
                         1 => self.push_directive(Directive::Byte(*val as i64)),
                         2 => self.push_directive(Directive::Short(*val as i64)),
                         4 => self.push_directive(Directive::Long(*val as i64)),
@@ -1218,11 +1246,16 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 // a flexible array member, `struct { char c; char f[]; }`,
                 // whose extent the initializer is what establishes. There is
                 // nothing to truncate to, so the literal is emitted whole.
-                let room = if size == 0 { usize::MAX } else { size };
+                let room = if size.is_zero() {
+                    usize::MAX
+                } else {
+                    size.to_usize()
+                };
                 let kept: String = s.chars().take(room).collect();
                 let bytes_emitted = kept.chars().count();
                 self.push_directive(Directive::Ascii(escape_string(&kept)));
-                if size == 0 {
+                let rest = size.checked_sub(ByteSize::from_usize(bytes_emitted));
+                if size.is_zero() {
                     // Unbounded: the terminator is part of what the
                     // initializer establishes, so it is emitted rather than
                     // zero-filled. gcc writes `.string "wx"` here -- four
@@ -1230,44 +1263,32 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                     // -- and the wide encodings below already did this, so
                     // leaving it out made the narrow one the odd case and an
                     // unbounded array came back without its `\0`.
-                    self.push_directive(Directive::Zero(1));
-                } else if size > bytes_emitted {
-                    self.push_directive(Directive::Zero(size - bytes_emitted));
+                    self.push_directive(Directive::Zero(ByteSize::new(1)));
+                } else if let Some(rest) = rest.filter(|r| !r.is_zero()) {
+                    self.push_directive(Directive::Zero(rest));
                 }
             }
             Initializer::Utf16String(units) => {
                 // char16_t: 2 bytes per code unit.
                 // A flexible array member has no bound; see `String`.
-                let room = if size == 0 { usize::MAX } else { size / 2 };
-                let mut emitted = 0;
-                for &u in units.iter().take(room) {
-                    self.push_directive(Directive::Short(u as i64));
-                    emitted += 2;
-                }
-                if size == 0 || emitted + 2 <= size {
-                    self.push_directive(Directive::Short(0));
-                    emitted += 2;
-                }
-                if size > emitted {
-                    self.push_directive(Directive::Zero(size - emitted));
-                }
+                self.emit_code_units(
+                    units,
+                    size,
+                    2,
+                    |u| Directive::Short(u as i64),
+                    Directive::Short(0),
+                );
             }
             Initializer::Utf32String(units) => {
                 // char32_t, and wchar_t: 4 bytes per code unit.
                 // A flexible array member has no bound; see `String`.
-                let room = if size == 0 { usize::MAX } else { size / 4 };
-                let mut emitted = 0;
-                for &u in units.iter().take(room) {
-                    self.push_directive(Directive::Long(u as i64));
-                    emitted += 4;
-                }
-                if size == 0 || emitted + 4 <= size {
-                    self.push_directive(Directive::Long(0));
-                    emitted += 4;
-                }
-                if size > emitted {
-                    self.push_directive(Directive::Zero(size - emitted));
-                }
+                self.emit_code_units(
+                    units,
+                    size,
+                    4,
+                    |u| Directive::Long(i64::from(u)),
+                    Directive::Long(0),
+                );
             }
             Initializer::Array {
                 elem_size,
@@ -1275,43 +1296,35 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 elements,
             } => {
                 // Emit array elements with gaps filled by zeros
-                let mut current_offset = 0usize;
+                let mut current_offset = ByteSize::ZERO;
 
                 for (offset, elem_init) in elements {
                     // Zero-fill gap before this element
-                    if *offset > current_offset {
-                        self.push_directive(Directive::Zero(*offset - current_offset));
-                    }
+                    self.emit_zero_gap(current_offset, *offset);
 
                     // Emit element
                     self.emit_initializer_data(elem_init, *elem_size);
-                    current_offset = offset + elem_size;
+                    current_offset = offset.offset_by(*elem_size);
                 }
 
                 // Zero-fill remaining space
-                if *total_size > current_offset {
-                    self.push_directive(Directive::Zero(*total_size - current_offset));
-                }
+                self.emit_zero_gap(current_offset, *total_size);
             }
             Initializer::Struct { total_size, fields } => {
                 // Emit struct fields with gaps filled by zeros
-                let mut current_offset = 0usize;
+                let mut current_offset = ByteSize::ZERO;
 
                 for (offset, field_size, field_init) in fields {
                     // Zero-fill gap before this field
-                    if *offset > current_offset {
-                        self.push_directive(Directive::Zero(*offset - current_offset));
-                    }
+                    self.emit_zero_gap(current_offset, *offset);
 
                     // Emit field
                     self.emit_initializer_data(field_init, *field_size);
-                    current_offset = offset + field_size;
+                    current_offset = offset.offset_by(*field_size);
                 }
 
                 // Zero-fill remaining space
-                if *total_size > current_offset {
-                    self.push_directive(Directive::Zero(*total_size - current_offset));
-                }
+                self.emit_zero_gap(current_offset, *total_size);
             }
             Initializer::SymAddr(name) => {
                 let sym = Symbol::named(name.clone());
@@ -1324,16 +1337,55 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             Initializer::LabelDiff { end, start, addend } => {
                 // The linearizer accepts only the widths with a directive.
                 debug_assert!(
-                    matches!(size, 1 | 2 | 4 | 8),
+                    matches!(size.get(), 1 | 2 | 4 | 8),
                     "label difference of {size} bytes"
                 );
+                let width = size
+                    .bits()
+                    .expect("a label difference is at most eight bytes");
                 self.push_directive(Directive::SymDifference {
-                    size: OperandSize::from_bits(size as u32 * 8),
+                    size: OperandSize::from_bits(width),
                     end: Symbol::named(end.clone()),
                     start: Symbol::named(start.clone()),
                     addend: *addend,
                 });
             }
+        }
+    }
+
+    /// Zero-fill from `from` up to `to`, when `to` is past it: the gap an
+    /// initializer leaves before its next element, or after its last.
+    fn emit_zero_gap(&mut self, from: ByteSize, to: ByteSize) {
+        if let Some(gap) = to.checked_sub(from).filter(|g| !g.is_zero()) {
+            self.push_directive(Directive::Zero(gap));
+        }
+    }
+
+    /// A wide string's code units, `unit` bytes each, in an object of `size`
+    /// bytes: as many units as fit, the terminator if it fits, and zeros for
+    /// the rest. A size of zero is a flexible array member's, which has no
+    /// bound; see `Initializer::String`.
+    fn emit_code_units<U: Copy>(
+        &mut self,
+        units: &[U],
+        size: ByteSize,
+        unit: usize,
+        directive: impl Fn(U) -> Directive,
+        terminator: Directive,
+    ) {
+        let bytes = size.to_usize();
+        let room = if bytes == 0 { usize::MAX } else { bytes / unit };
+        let mut emitted = 0;
+        for &u in units.iter().take(room) {
+            self.push_directive(directive(u));
+            emitted += unit;
+        }
+        if bytes == 0 || emitted + unit <= bytes {
+            self.push_directive(terminator);
+            emitted += unit;
+        }
+        if bytes > emitted {
+            self.push_directive(Directive::Zero(ByteSize::from_usize(bytes - emitted)));
         }
     }
 
@@ -1478,7 +1530,7 @@ pub enum AsmOperandValue<R> {
     /// [`crate::arch::asm_constraints::canonical_int`]).
     Int(i64),
     /// A floating constant, and its width in bits.
-    Float(FloatVal, u32),
+    Float(FloatVal, Bits),
     /// A symbolic address constant, `sym` or `sym+off`, decorated for the
     /// target.
     Symbol(String),
@@ -1508,9 +1560,8 @@ impl<R> AsmOperandValue<R> {
 #[derive(Debug, Clone)]
 pub struct AsmOperandSlot<R> {
     pub value: AsmOperandValue<R>,
-    /// Operand size in bits: the width a bare `%0` names a general register
-    /// at.
-    pub size: u32,
+    /// Operand width: the width a bare `%0` names a general register at.
+    pub size: Bits,
     /// GCC named-operand alias (e.g. the `[out]` in `%[out]`). `None`
     /// for positional `%0`/`%1`/... operands.
     pub name: Option<String>,
@@ -1751,7 +1802,7 @@ pub fn substitute_asm_operands<F: AsmOperandFormatter>(
                     .ok_or_else(|| format!("asm operand number {n} out of range"))?;
                 label_slot = AsmOperandSlot {
                     value: AsmOperandValue::Symbol(text.clone()),
-                    size: 64,
+                    size: Bits::new(64),
                     name: None,
                 };
                 &label_slot
@@ -1853,6 +1904,9 @@ pub trait CodeGenerator {
     /// Generate assembly code for the given IR module
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String;
 
+    /// The stack use of each function [`Self::generate`] emitted, in order.
+    fn stack_usage(&self) -> &[super::stack_usage::StackUsage];
+
     /// Set where the CFI procedures and their frame rules go, if anywhere.
     fn set_cfi(&mut self, cfi: crate::target::Cfi);
 
@@ -1905,15 +1959,16 @@ pub trait CodeGenerator {
 ///
 /// The one rule, read both where the definition is emitted and where a
 /// backend decides whether an access can assume that alignment.
-pub fn global_alignment(global: &crate::ir::GlobalDef, types: &TypeTable) -> u32 {
+pub fn global_alignment(global: &crate::ir::GlobalDef, types: &TypeTable) -> Align {
     if let Some(align) = global.explicit_align {
-        return align;
+        return Align::of_bytes(u64::from(align));
     }
-    let size = types.size_bytes(global.typ) as u64;
-    let size = if size == 0 { 8 } else { size };
-    let align = types.alignment(global.typ) as u32;
-    if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array) && size >= 16 {
-        return align.max(16);
+    let size = types.byte_size(global.typ);
+    let align = types.align(global.typ);
+    if matches!(types.get(global.typ).kind, crate::types::TypeKind::Array)
+        && size >= ByteSize::new(16)
+    {
+        return align.max(Align::of_bytes(16));
     }
     align
 }
@@ -1980,11 +2035,10 @@ pub fn report_tls_operand(pos: crate::diag::Position, name: &str) {
 /// place. Both back ends had that test and both got an eight-byte aggregate
 /// wrong, so the question is asked once, here.
 pub struct SymSlot {
-    /// Width of the declared type, in bits.
-    pub bits: u32,
-    /// The slot holds a single scalar value, so anything above a narrow store
-    /// at offset 0 is stale bits of that same object.
-    pub one_scalar: bool,
+    /// The width of the single scalar value the slot holds, so that anything
+    /// above a narrow store at offset 0 is stale bits of that same object;
+    /// `None` for an aggregate or a complex.
+    pub one_scalar: Option<Bits>,
 }
 
 impl SymSlot {
@@ -1997,13 +2051,10 @@ impl SymSlot {
     /// nothing above it that is its own. `slot` is `None` for an address that
     /// is no local this function records -- exact width there too, since
     /// nothing says what adjoins it.
-    pub fn store_bits(slot: Option<&SymSlot>, mem_bits: u32, offset: i64) -> u32 {
-        match slot {
-            Some(s)
-                if mem_bits == 32 && offset == 0 && s.one_scalar && (33..=64).contains(&s.bits) =>
-            {
-                64
-            }
+    pub fn store_bits(slot: Option<&SymSlot>, mem_bits: Bits, offset: i64) -> Bits {
+        let wider = |w: Bits| (Bits::new(33)..=Bits::new(64)).contains(&w);
+        match slot.and_then(|s| s.one_scalar) {
+            Some(w) if mem_bits == Bits::new(32) && offset == 0 && wider(w) => Bits::new(64),
             _ => mem_bits,
         }
     }
@@ -2018,7 +2069,7 @@ pub struct SelectOperands {
     pub else_val: crate::ir::PseudoId,
     pub target: crate::ir::PseudoId,
     /// The arms' width: the result type's, and never under 32 bits.
-    pub width: u32,
+    pub width: Bits,
 }
 
 impl SelectOperands {
@@ -2036,8 +2087,8 @@ impl SelectOperands {
             target: insn.target?,
             width: insn
                 .typ
-                .map(|t| types.size_bits(t).max(32))
-                .unwrap_or(insn.size.max(32)),
+                .map_or(insn.size, |t| types.value_bits(t))
+                .max(Bits::new(32)),
         })
     }
 }
@@ -2051,17 +2102,19 @@ impl SelectOperands {
 /// comparison's `int` result stored with `str w16` and tested as a branch
 /// condition with `ldr x9` was the case that showed it.
 #[derive(Debug, Default)]
-pub struct ValueWidths(std::collections::HashMap<crate::ir::PseudoId, u32>);
+pub struct ValueWidths(std::collections::HashMap<crate::ir::PseudoId, Bits>);
 
 impl ValueWidths {
+    /// An argument of an aggregate type too large to have a value width is
+    /// held by its address and never read as a value, so it records none.
     pub fn of(func: &crate::ir::Function, types: &crate::types::TypeTable) -> ValueWidths {
         let mut widths: std::collections::HashMap<_, _> =
             crate::arch::regalloc::arg_pseudo_types(func)
                 .into_iter()
-                .map(|(p, t)| (p, types.size_bits(t)))
+                .filter_map(|(p, t)| Some((p, types.checked_value_bits(t)?)))
                 .collect();
         for insn in func.blocks.iter().flat_map(|b| &b.insns) {
-            if let Some(t) = insn.target.filter(|_| insn.size > 0) {
+            if let Some(t) = insn.target.filter(|_| insn.size > Bits::ZERO) {
                 widths.insert(t, insn.size);
             }
         }
@@ -2070,8 +2123,12 @@ impl ValueWidths {
 
     /// The width `id`'s value is held at; sixty-four bits for a value with no
     /// recorded width, which is what every reader assumed before.
-    pub fn bits(&self, id: crate::ir::PseudoId) -> u32 {
-        self.0.get(&id).copied().filter(|&b| b > 0).unwrap_or(64)
+    pub fn bits(&self, id: crate::ir::PseudoId) -> Bits {
+        self.0
+            .get(&id)
+            .copied()
+            .filter(|&b| b > Bits::ZERO)
+            .unwrap_or(Bits::new(64))
     }
 }
 
@@ -2089,8 +2146,8 @@ pub fn sym_slots(
             slots.insert(
                 pseudo.id,
                 SymSlot {
-                    bits: types.size_bits(typ),
-                    one_scalar: types.is_scalar(typ) && !types.is_complex(typ),
+                    one_scalar: (types.is_scalar(typ) && !types.is_complex(typ))
+                        .then(|| types.value_bits(typ)),
                 },
             );
         }
@@ -2202,41 +2259,43 @@ pub fn create_codegen(
 #[cfg(test)]
 mod tests {
     use super::SymSlot;
+    use crate::units::Bits;
 
     /// The one place a store into a local is widened: 32 bits at offset 0 of
     /// a slot holding a single scalar wider than that, and nothing else.
     #[test]
     fn a_store_is_widened_only_into_a_wider_scalar() {
+        let b = Bits::new;
         let scalar = |bits| SymSlot {
-            bits,
-            one_scalar: true,
+            one_scalar: Some(b(bits)),
         };
-        let aggregate = SymSlot {
-            bits: 64,
-            one_scalar: false,
-        };
+        let aggregate = SymSlot { one_scalar: None };
         assert_eq!(
-            SymSlot::store_bits(Some(&scalar(64)), 32, 0),
-            64,
+            SymSlot::store_bits(Some(&scalar(64)), b(32), 0),
+            b(64),
             "int into a long"
         );
         assert_eq!(
-            SymSlot::store_bits(Some(&scalar(32)), 32, 0),
-            32,
+            SymSlot::store_bits(Some(&scalar(32)), b(32), 0),
+            b(32),
             "int into an int"
         );
-        assert_eq!(SymSlot::store_bits(Some(&aggregate), 32, 0), 32, "a member");
         assert_eq!(
-            SymSlot::store_bits(Some(&scalar(64)), 32, 4),
-            32,
+            SymSlot::store_bits(Some(&aggregate), b(32), 0),
+            b(32),
+            "a member"
+        );
+        assert_eq!(
+            SymSlot::store_bits(Some(&scalar(64)), b(32), 4),
+            b(32),
             "not at the start"
         );
         assert_eq!(
-            SymSlot::store_bits(Some(&scalar(64)), 16, 0),
-            16,
+            SymSlot::store_bits(Some(&scalar(64)), b(16), 0),
+            b(16),
             "not 32 bits"
         );
-        assert_eq!(SymSlot::store_bits(None, 32, 0), 32, "no record");
+        assert_eq!(SymSlot::store_bits(None, b(32), 0), b(32), "no record");
     }
 
     /// A formatter that writes a register as `rN` and implements only `%k`,
@@ -2274,7 +2333,7 @@ mod tests {
         use super::{AsmOperandSlot, AsmOperandValue as V};
         let slot = |value, name: Option<&str>| AsmOperandSlot {
             value,
-            size: 64,
+            size: Bits::new(64),
             name: name.map(String::from),
         };
         let slots = [

@@ -332,9 +332,9 @@ fn single_addr(
     out: &mut Vec<Aarch64Inst>,
 ) -> Result<MemAddr, Unencodable> {
     match addr {
-        MemAddr::BaseOffset { base, offset } if !single_offset_fits(offset.into(), bytes) => {
+        MemAddr::BaseOffset { base, offset } if !single_offset_fits(offset, bytes) => {
             debug_assert_ne!(base, LEGALIZE_REG);
-            let off = i64::from(offset);
+            let off = offset;
             // Keep an encodable low part in the instruction when the high
             // part is one shifted add: two instructions rather than three.
             let lo = off & 0xFFF;
@@ -348,7 +348,7 @@ fn single_addr(
                 });
                 return Ok(MemAddr::BaseOffset {
                     base: LEGALIZE_REG,
-                    offset: lo as i32,
+                    offset: lo,
                 });
             }
             address_into_scratch(base, off, out);
@@ -372,13 +372,13 @@ fn pair_addr(
     out: &mut Vec<Aarch64Inst>,
 ) -> Result<MemAddr, Unencodable> {
     match addr {
-        MemAddr::BaseOffset { base, offset } if !pair_offset_fits(offset.into(), bytes) => {
+        MemAddr::BaseOffset { base, offset } if !pair_offset_fits(offset, bytes) => {
             debug_assert_ne!(base, LEGALIZE_REG);
-            address_into_scratch(base, offset.into(), out);
+            address_into_scratch(base, offset, out);
             Ok(MemAddr::Base(LEGALIZE_REG))
         }
         MemAddr::PreIndex { offset, .. } | MemAddr::PostIndex { offset, .. }
-            if !pair_offset_fits(offset.into(), bytes) =>
+            if !pair_offset_fits(offset, bytes) =>
         {
             Err(Unencodable(
                 "a pre- or post-indexed pair load or store past its scaled range",
@@ -393,7 +393,7 @@ fn bare_addr(addr: MemAddr, out: &mut Vec<Aarch64Inst>) -> Result<MemAddr, Unenc
     match addr {
         MemAddr::BaseOffset { base, offset } if offset != 0 => {
             debug_assert_ne!(base, LEGALIZE_REG);
-            address_into_scratch(base, offset.into(), out);
+            address_into_scratch(base, offset, out);
             Ok(MemAddr::Base(LEGALIZE_REG))
         }
         MemAddr::PreIndex { .. } | MemAddr::PostIndex { .. } => Err(Unencodable(
@@ -597,7 +597,7 @@ mod tests {
         s
     }
 
-    fn ldr(size: OperandSize, off: i32) -> Aarch64Inst {
+    fn ldr(size: OperandSize, off: i64) -> Aarch64Inst {
         Aarch64Inst::Ldr {
             size,
             addr: MemAddr::BaseOffset {
@@ -608,7 +608,7 @@ mod tests {
         }
     }
 
-    fn stp(off: i32) -> Aarch64Inst {
+    fn stp(off: i64) -> Aarch64Inst {
         Aarch64Inst::Stp {
             size: OperandSize::B64,
             src1: Reg::X0,
@@ -670,6 +670,57 @@ mod tests {
         }
         assert!(pair_offset_fits(252, 4) && !pair_offset_fits(256, 4));
         assert!(pair_offset_fits(1008, 16) && !pair_offset_fits(1024, 16));
+    }
+
+    /// A frame past four gigabytes: the whole displacement goes into X15, a
+    /// MOVZ and a MOVK for each further halfword, and the access goes
+    /// through it -- on either side of x29, and for a pair.
+    #[test]
+    fn test_offsets_past_32_bits_go_through_the_scratch() {
+        let tib = 1i64 << 40;
+        assert_eq!(
+            asm(&run(ldr(OperandSize::B64, tib + 8))),
+            "    movz x15, #8\n    movk x15, #256, lsl #32\n    \
+             add x15, x29, x15\n    ldr x0, [x15]\n"
+        );
+        assert_eq!(
+            asm(&run(ldr(OperandSize::B64, -(tib + 16)))),
+            "    movz x15, #16\n    movk x15, #256, lsl #32\n    \
+             sub x15, x29, x15\n    ldr x0, [x15]\n"
+        );
+        // Every halfword set: one MOVZ and three MOVKs.
+        let out = run(ldr(OperandSize::B64, 0x1234_5678_9ABC_DEF0));
+        assert!(
+            asm(&out).starts_with(
+                "    movz x15, #57072\n    movk x15, #39612, lsl #16\n    \
+                 movk x15, #22136, lsl #32\n    movk x15, #4660, lsl #48\n"
+            ),
+            "{}",
+            asm(&out)
+        );
+        let out = run(stp(tib));
+        assert!(all_encodable(&out), "{}", asm(&out));
+        assert!(asm(&out).ends_with("stp x0, x1, [x15]\n"), "{}", asm(&out));
+    }
+
+    /// The prologue's allocation of a frame that size: the magnitude in X15
+    /// and the extended-register form, which is the one that takes `sp`.
+    #[test]
+    fn test_sp_moves_past_32_bits_go_through_the_scratch() {
+        let sub = Aarch64Inst::Sub {
+            size: OperandSize::B64,
+            src1: Reg::SP,
+            src2: GpOperand::Imm((1 << 40) + 32),
+            dst: Reg::SP,
+        };
+        assert_eq!(
+            asm(&run(sub)),
+            "    movz x15, #32\n    movk x15, #256, lsl #32\n    sub sp, sp, x15\n"
+        );
+        assert_eq!(
+            asm(&run(add(Reg::SP, 5 << 32, Reg::SP))),
+            "    movz x15, #5, lsl #32\n    add sp, sp, x15\n"
+        );
     }
 
     #[test]

@@ -49,4 +49,5 @@ mod test_diagnostics;
 pub mod token;
 pub mod tools;
 pub mod types;
+pub mod units;
 pub mod warn_options;

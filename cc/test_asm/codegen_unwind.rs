@@ -49,6 +49,8 @@ struct CfiWalk<'a> {
     /// CFA minus SP and CFA minus FP, when known.
     sp: Option<i64>,
     fp: Option<i64>,
+    /// CFA minus x17, the end of an aarch64 stack-probing loop, when known.
+    x17: Option<i64>,
     stack: Vec<Remembered>,
     calls: usize,
     rets: usize,
@@ -79,6 +81,7 @@ impl<'a> CfiWalk<'a> {
             saved: HashSet::new(),
             sp: Some(cfa),
             fp: None,
+            x17: None,
             stack: Vec::new(),
             calls: 0,
             rets: 0,
@@ -168,6 +171,8 @@ impl<'a> CfiWalk<'a> {
             self.sp
         } else if self.cfa.0 == fp {
             self.fp
+        } else if self.cfa.0 == "x17" && !self.x86 {
+            self.x17
         } else {
             self.fail(line, &format!("CFA in {}", self.cfa.0))
         };
@@ -232,6 +237,12 @@ impl<'a> CfiWalk<'a> {
             ("add", o) if o.starts_with("sp, sp, #") => {
                 self.sp = add(self.sp, -imm(&o["sp, sp, ".len()..]));
             }
+            // A stack-probing loop counts `sp` down to x17, and leaves it
+            // there.
+            ("sub", o) if o.starts_with("x17, sp, #") => {
+                self.x17 = add(self.sp, imm(&o["x17, sp, ".len()..]));
+            }
+            ("cmp", "sp, x17") => self.sp = self.x17,
             ("mov", "x29, sp") => self.fp = self.sp,
             ("mov", "sp, x29") => self.sp = self.fp,
             _ if ops.contains("[sp") && (ops.ends_with("]!") || ops.contains("], #")) => {
@@ -321,6 +332,54 @@ fn codegen_cfi_describes_every_frame() {
                 let name = format!("{f} ({triple} {opts:?})");
                 CfiWalk::new(triple.starts_with("x86_64"), &name, body_of(&asm, f)).walk();
             }
+        }
+    }
+}
+
+/// Frames `-fstack-clash-protection` probes in a loop on both targets, and
+/// one it unrolls on aarch64.
+const PROBED_FRAMES: &str = "
+__attribute__((noinline, noclone)) int huge(int n) {
+    volatile char buf[1 << 20];
+    buf[n] = 1;
+    return depth() + buf[n];
+}
+__attribute__((noinline, noclone)) int wide(int n) {
+    volatile char buf[200000];
+    buf[n] = 1;
+    return huge(n) + buf[n];
+}
+";
+
+/// The CFI stays right through `-fstack-clash-protection`'s probes: in the
+/// prologue's loop, where aarch64 moves the CFA to the loop's end register
+/// while `sp` moves, and after the probed `alloca` and VLA of `dyn`.
+#[test]
+fn codegen_cfi_describes_probed_frames() {
+    let src = format!("{FRAMES}{PROBED_FRAMES}{DEPTH_STUB}");
+    let funcs = [
+        "pressure", "dyn", "big", "mid", "aligned", "varargs", "huge", "wide",
+    ];
+    for triple in [
+        AARCH64_LINUX,
+        AARCH64_DARWIN,
+        X86_64_LINUX,
+        "x86_64-apple-darwin",
+    ] {
+        for level in ["-O0", "-O2"] {
+            let opts = [level, "-fstack-clash-protection"];
+            let asm = asm_for_with("cfi_walk_probed", triple, &src, &opts);
+            for f in funcs {
+                let name = format!("{f} ({triple} {opts:?})");
+                CfiWalk::new(triple.starts_with("x86_64"), &name, body_of(&asm, f)).walk();
+            }
+            // The loop really is there to walk through.
+            let probe = if triple.starts_with("x86_64") {
+                "cmpq %r11, %rsp"
+            } else {
+                "cmp sp, x17"
+            };
+            assert!(body_of(&asm, "huge").contains(probe), "{triple}: no loop");
         }
     }
 }

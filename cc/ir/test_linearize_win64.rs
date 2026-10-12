@@ -69,7 +69,7 @@ fn calls_are_classified_by_the_callee() {
     let classes = &take.extra().abi_info.as_ref().unwrap().params;
     assert!(matches!(
         classes[1],
-        ArgClass::Indirect { size_bytes: 24, .. }
+        ArgClass::Indirect { size_bytes, .. } if size_bytes == crate::units::ByteSize::new(24)
     ));
     // The struct goes by reference, to a copy the callee owns.
     assert!(caller.locals.keys().any(|n| n.starts_with("__argcopy")));

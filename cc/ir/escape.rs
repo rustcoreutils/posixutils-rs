@@ -240,6 +240,7 @@ mod tests {
     use crate::ir::{BasicBlock, BasicBlockId, Instruction, Pseudo};
     use crate::target::Target;
     use crate::types::{TypeId, TypeTable};
+    use crate::units::Bits;
 
     fn host_types() -> TypeTable {
         TypeTable::new(&Target::host())
@@ -263,7 +264,7 @@ mod tests {
             Instruction::new(Opcode::Copy)
                 .with_target(PseudoId(11))
                 .with_src(PseudoId(10))
-                .with_type_and_size(i64t, 64),
+                .with_type_and_size(i64t, Bits::new(64)),
         );
         tail(i64t, &mut bb);
         f.blocks.push(bb);
@@ -283,8 +284,20 @@ mod tests {
     #[test]
     fn escape_addressing_a_local_is_not_escaping() {
         let f = with_local(|t, bb| {
-            bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
-            bb.add_insn(Instruction::load(PseudoId(12), PseudoId(11), 0, t, 64));
+            bb.add_insn(Instruction::store(
+                PseudoId(5),
+                PseudoId(11),
+                0,
+                t,
+                Bits::new(64),
+            ));
+            bb.add_insn(Instruction::load(
+                PseudoId(12),
+                PseudoId(11),
+                0,
+                t,
+                Bits::new(64),
+            ));
         });
         assert!(!captured(&f));
     }
@@ -300,9 +313,15 @@ mod tests {
                 PseudoId(11),
                 PseudoId(5),
                 t,
-                64,
+                Bits::new(64),
             ));
-            bb.add_insn(Instruction::load(PseudoId(13), PseudoId(12), 0, t, 64));
+            bb.add_insn(Instruction::load(
+                PseudoId(13),
+                PseudoId(12),
+                0,
+                t,
+                Bits::new(64),
+            ));
         });
         assert!(!captured(&f));
     }
@@ -318,7 +337,7 @@ mod tests {
                 vec![PseudoId(11)],
                 vec![t],
                 types.void_id,
-                0,
+                Bits::new(0),
             ));
         });
         assert!(captured(&f));
@@ -330,13 +349,25 @@ mod tests {
     #[test]
     fn escape_storing_the_address_escapes_storing_through_it_does_not() {
         let through = with_local(|t, bb| {
-            bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
+            bb.add_insn(Instruction::store(
+                PseudoId(5),
+                PseudoId(11),
+                0,
+                t,
+                Bits::new(64),
+            ));
         });
         assert!(!captured(&through));
 
         let itself = with_local(|t, bb| {
             // store *the address* into some other location.
-            bb.add_insn(Instruction::store(PseudoId(11), PseudoId(5), 0, t, 64));
+            bb.add_insn(Instruction::store(
+                PseudoId(11),
+                PseudoId(5),
+                0,
+                t,
+                Bits::new(64),
+            ));
         });
         assert!(captured(&itself));
     }
@@ -344,7 +375,7 @@ mod tests {
     fn block_op(op: Opcode, dest: PseudoId, src: PseudoId, len: PseudoId) -> Instruction {
         Instruction::new(op)
             .with_src3(dest, src, len)
-            .with_type_and_size(host_types().void_ptr_id, 64)
+            .with_type_and_size(host_types().void_ptr_id, Bits::new(64))
     }
 
     /// A block operation reads and writes through its pointers and keeps
@@ -399,7 +430,7 @@ mod tests {
                     vec![PseudoId(20)],
                     vec![t],
                     types.void_id,
-                    0,
+                    Bits::new(0),
                 ));
             })
         };
@@ -411,7 +442,13 @@ mod tests {
                 block_op(Opcode::Memset, PseudoId(11), PseudoId(5), PseudoId(5))
                     .with_target(PseudoId(20)),
             );
-            bb.add_insn(Instruction::load(PseudoId(21), PseudoId(20), 0, t, 64));
+            bb.add_insn(Instruction::load(
+                PseudoId(21),
+                PseudoId(20),
+                0,
+                t,
+                Bits::new(64),
+            ));
         });
         assert!(!captured(&read_back));
     }
@@ -423,7 +460,7 @@ mod tests {
             bb.add_insn(
                 Instruction::new(Opcode::Ret)
                     .with_src(PseudoId(11))
-                    .with_type_and_size(t, 64),
+                    .with_type_and_size(t, Bits::new(64)),
             );
         });
         assert!(captured(&f));
@@ -434,7 +471,13 @@ mod tests {
     #[test]
     fn escape_setjmp_gives_up_on_the_whole_function() {
         let f = with_local(|t, bb| {
-            bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
+            bb.add_insn(Instruction::store(
+                PseudoId(5),
+                PseudoId(11),
+                0,
+                t,
+                Bits::new(64),
+            ));
             bb.add_insn(Instruction::new(Opcode::Setjmp));
         });
         let info = EscapeInfo::analyze(&f, &host_types());
@@ -448,8 +491,14 @@ mod tests {
     fn escape_returns_twice_call_gives_up() {
         for twice in [true, false] {
             let f = with_local(|t, bb| {
-                bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
-                let mut call = Instruction::call(None, "_setjmp", vec![], vec![], t, 32);
+                bb.add_insn(Instruction::store(
+                    PseudoId(5),
+                    PseudoId(11),
+                    0,
+                    t,
+                    Bits::new(64),
+                ));
+                let mut call = Instruction::call(None, "_setjmp", vec![], vec![], t, Bits::new(32));
                 call.extra_mut().returns_twice_call = twice;
                 bb.add_insn(call);
             });
@@ -461,7 +510,13 @@ mod tests {
     #[test]
     fn escape_label_address_gives_up() {
         let mut f = with_local(|t, bb| {
-            bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
+            bb.add_insn(Instruction::store(
+                PseudoId(5),
+                PseudoId(11),
+                0,
+                t,
+                Bits::new(64),
+            ));
         });
         f.takes_label_addr = true;
         assert!(EscapeInfo::analyze(&f, &host_types()).gave_up());
@@ -477,7 +532,13 @@ mod tests {
             crate::types::TypeModifiers::VOLATILE,
         ));
         let mut f = with_local(|t, bb| {
-            bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
+            bb.add_insn(Instruction::store(
+                PseudoId(5),
+                PseudoId(11),
+                0,
+                t,
+                Bits::new(64),
+            ));
         });
         f.add_local("a.0", PseudoId(0), vol_long, None, None);
         assert!(EscapeInfo::analyze(&f, &types).is_captured(&MemBase::Local(PseudoId(0))));
@@ -488,7 +549,13 @@ mod tests {
     #[test]
     fn escape_a_global_is_always_captured() {
         let f = with_local(|t, bb| {
-            bb.add_insn(Instruction::store(PseudoId(5), PseudoId(11), 0, t, 64));
+            bb.add_insn(Instruction::store(
+                PseudoId(5),
+                PseudoId(11),
+                0,
+                t,
+                Bits::new(64),
+            ));
         });
         let info = EscapeInfo::analyze(&f, &host_types());
         assert!(info.is_captured(&MemBase::Global("g".into())));

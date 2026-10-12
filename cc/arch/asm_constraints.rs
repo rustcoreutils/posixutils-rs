@@ -27,6 +27,7 @@ use crate::arch::x86_64::regalloc::Reg as X86Reg;
 use crate::float::FloatVal;
 use crate::ir::{AsmConstraint, AsmData, PseudoId};
 use crate::target::Arch;
+use crate::units::Bits;
 
 /// How the template accesses an operand: `=` writes it, `+` reads and
 /// writes it, and an operand with neither is only read.
@@ -373,7 +374,8 @@ impl FloatImm {
 
 /// An integer constant as gcc substitutes and checks it: sign-extended from
 /// the operand's width. `"i"(0xffffffffu)` is `$-1`, not `$4294967295`.
-pub fn canonical_int(v: i128, bits: u32) -> i64 {
+pub fn canonical_int(v: i128, width: Bits) -> i64 {
+    let bits = width.get();
     match bits {
         1..=63 => ((v as i64) << (64 - bits)) >> (64 - bits),
         _ => v as i64,
@@ -889,6 +891,7 @@ impl<R: Copy + Ord> InstrConstraints<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::units::Bits;
     use AsmRegClass::*;
 
     fn x86(s: &str) -> AsmOperandClass {
@@ -1161,11 +1164,11 @@ mod tests {
 
     #[test]
     fn canonical_int_sign_extends() {
-        assert_eq!(canonical_int(0xffff_ffff, 32), -1);
-        assert_eq!(canonical_int(200, 8), -56);
-        assert_eq!(canonical_int(200, 16), 200);
-        assert_eq!(canonical_int(0xffff_ffff, 64), 0xffff_ffff);
-        assert_eq!(canonical_int(-1, 64), -1);
+        assert_eq!(canonical_int(0xffff_ffff, Bits::new(32)), -1);
+        assert_eq!(canonical_int(200, Bits::new(8)), -56);
+        assert_eq!(canonical_int(200, Bits::new(16)), 200);
+        assert_eq!(canonical_int(0xffff_ffff, Bits::new(64)), 0xffff_ffff);
+        assert_eq!(canonical_int(-1, Bits::new(64)), -1);
     }
 
     #[test]
@@ -1286,7 +1289,7 @@ mod tests {
     }
 
     fn operand(pseudo: u32, constraint: &str) -> crate::ir::AsmConstraint {
-        crate::ir::AsmConstraint::new(PseudoId(pseudo), constraint, Arch::X86_64, 64)
+        crate::ir::AsmConstraint::new(PseudoId(pseudo), constraint, Arch::X86_64, Bits::new(64))
     }
 
     #[test]

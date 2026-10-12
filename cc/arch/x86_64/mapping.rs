@@ -181,6 +181,7 @@ mod tests {
     use crate::ir::{Instruction, Opcode, PseudoId};
     use crate::target::{Arch, Os, Target};
     use crate::types::TypeTable;
+    use crate::units::Bits;
 
     #[test]
     fn test_x86_64_legal_insns() {
@@ -217,7 +218,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int128_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -240,7 +241,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.uint128_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -263,7 +264,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int128_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -286,7 +287,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.uint128_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -309,7 +310,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int_id,
-            32,
+            Bits::new(32),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -334,7 +335,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int128_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -354,7 +355,13 @@ mod tests {
         let mapper = X86_64Mapper;
 
         // signed int128 → float
-        let insn = make_convert_insn(Opcode::SCvtF, types.float_id, 32, types.int128_id, 128);
+        let insn = make_convert_insn(
+            Opcode::SCvtF,
+            types.float_id,
+            Bits::new(32),
+            types.int128_id,
+            Bits::new(128),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -364,7 +371,13 @@ mod tests {
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floattisf");
 
         // signed int128 → double
-        let insn = make_convert_insn(Opcode::SCvtF, types.double_id, 64, types.int128_id, 128);
+        let insn = make_convert_insn(
+            Opcode::SCvtF,
+            types.double_id,
+            Bits::new(64),
+            types.int128_id,
+            Bits::new(128),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -374,7 +387,13 @@ mod tests {
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floattidf");
 
         // unsigned int128 → float
-        let insn = make_convert_insn(Opcode::UCvtF, types.float_id, 32, types.uint128_id, 128);
+        let insn = make_convert_insn(
+            Opcode::UCvtF,
+            types.float_id,
+            Bits::new(32),
+            types.uint128_id,
+            Bits::new(128),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -384,7 +403,13 @@ mod tests {
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floatuntisf");
 
         // unsigned int128 → double
-        let insn = make_convert_insn(Opcode::UCvtF, types.double_id, 64, types.uint128_id, 128);
+        let insn = make_convert_insn(
+            Opcode::UCvtF,
+            types.double_id,
+            Bits::new(64),
+            types.uint128_id,
+            Bits::new(128),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -401,7 +426,13 @@ mod tests {
         let mapper = X86_64Mapper;
 
         // float → signed int128
-        let insn = make_convert_insn(Opcode::FCvtS, types.int128_id, 128, types.float_id, 32);
+        let insn = make_convert_insn(
+            Opcode::FCvtS,
+            types.int128_id,
+            Bits::new(128),
+            types.float_id,
+            Bits::new(32),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -411,7 +442,13 @@ mod tests {
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__fixsfti");
 
         // double → signed int128
-        let insn = make_convert_insn(Opcode::FCvtS, types.int128_id, 128, types.double_id, 64);
+        let insn = make_convert_insn(
+            Opcode::FCvtS,
+            types.int128_id,
+            Bits::new(128),
+            types.double_id,
+            Bits::new(64),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -421,7 +458,13 @@ mod tests {
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__fixdfti");
 
         // float → unsigned int128
-        let insn = make_convert_insn(Opcode::FCvtU, types.uint128_id, 128, types.float_id, 32);
+        let insn = make_convert_insn(
+            Opcode::FCvtU,
+            types.uint128_id,
+            Bits::new(128),
+            types.float_id,
+            Bits::new(32),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -431,7 +474,13 @@ mod tests {
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__fixunssfti");
 
         // double → unsigned int128
-        let insn = make_convert_insn(Opcode::FCvtU, types.uint128_id, 128, types.double_id, 64);
+        let insn = make_convert_insn(
+            Opcode::FCvtU,
+            types.uint128_id,
+            Bits::new(128),
+            types.double_id,
+            Bits::new(64),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -448,7 +497,13 @@ mod tests {
         let mapper = X86_64Mapper;
 
         // x86-64 long double uses "xf" suffix
-        let insn = make_convert_insn(Opcode::SCvtF, types.longdouble_id, 80, types.int128_id, 128);
+        let insn = make_convert_insn(
+            Opcode::SCvtF,
+            types.longdouble_id,
+            Bits::new(80),
+            types.int128_id,
+            Bits::new(128),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -457,7 +512,13 @@ mod tests {
         };
         assert_libcall(&mapper.map_insn(&insn, &mut ctx), "__floattixf");
 
-        let insn = make_convert_insn(Opcode::FCvtS, types.int128_id, 128, types.longdouble_id, 80);
+        let insn = make_convert_insn(
+            Opcode::FCvtS,
+            types.int128_id,
+            Bits::new(128),
+            types.longdouble_id,
+            Bits::new(80),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -474,7 +535,13 @@ mod tests {
         let mapper = X86_64Mapper;
 
         // int32 → double should remain Legal
-        let insn = make_convert_insn(Opcode::SCvtF, types.double_id, 64, types.int_id, 32);
+        let insn = make_convert_insn(
+            Opcode::SCvtF,
+            types.double_id,
+            Bits::new(64),
+            types.int_id,
+            Bits::new(32),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -484,7 +551,13 @@ mod tests {
         assert_legal(&mapper.map_insn(&insn, &mut ctx));
 
         // double → int32 should remain Legal
-        let insn = make_convert_insn(Opcode::FCvtS, types.int_id, 32, types.double_id, 64);
+        let insn = make_convert_insn(
+            Opcode::FCvtS,
+            types.int_id,
+            Bits::new(32),
+            types.double_id,
+            Bits::new(64),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -507,7 +580,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.longdouble_id,
-            80,
+            Bits::new(80),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -525,7 +598,13 @@ mod tests {
         let mapper = X86_64Mapper;
 
         // x86_64 long double conversions are native
-        let insn = make_convert_insn(Opcode::FCvtF, types.longdouble_id, 80, types.float_id, 32);
+        let insn = make_convert_insn(
+            Opcode::FCvtF,
+            types.longdouble_id,
+            Bits::new(80),
+            types.float_id,
+            Bits::new(32),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -552,7 +631,7 @@ mod tests {
             PseudoId(0),
             shift_const,
             types.int128_id,
-            128,
+            Bits::new(128),
         );
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -576,7 +655,7 @@ mod tests {
             PseudoId(0),
             shift_const,
             types.uint128_id,
-            128,
+            Bits::new(128),
         );
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -600,7 +679,7 @@ mod tests {
             PseudoId(0),
             shift_const,
             types.int128_id,
-            128,
+            Bits::new(128),
         );
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -623,7 +702,7 @@ mod tests {
             PseudoId(0),
             PseudoId(1),
             types.int128_id,
-            128,
+            Bits::new(128),
         );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
@@ -645,18 +724,32 @@ mod tests {
         let types = TypeTable::new(&target);
         let mapper = X86_64Mapper;
         let h = types.float16_id;
-        let add = Instruction::binop(Opcode::FAdd, PseudoId(2), PseudoId(0), PseudoId(1), h, 16);
-        let neg = Instruction::unop(Opcode::FNeg, PseudoId(2), PseudoId(0), h, 16);
+        let add = Instruction::binop(
+            Opcode::FAdd,
+            PseudoId(2),
+            PseudoId(0),
+            PseudoId(1),
+            h,
+            Bits::new(16),
+        );
+        let neg = Instruction::unop(Opcode::FNeg, PseudoId(2), PseudoId(0), h, Bits::new(16));
         let mut cmp = Instruction::compare(
             Opcode::FCmpOLt,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
-            (types.int_id, 16),
-            (types.int_id, 32),
+            (types.int_id, Bits::new(16)),
+            (types.int_id, Bits::new(32)),
         );
         cmp.src_typ = Some(h);
-        let widen = make_convert_insn(Opcode::FCvtF, types.float_id, 32, h, 16);
-        let to_int = make_convert_insn(Opcode::FCvtS, types.int_id, 32, h, 16);
+        let widen = make_convert_insn(
+            Opcode::FCvtF,
+            types.float_id,
+            Bits::new(32),
+            h,
+            Bits::new(16),
+        );
+        let to_int =
+            make_convert_insn(Opcode::FCvtS, types.int_id, Bits::new(32), h, Bits::new(16));
         for insn in [add, neg, cmp, widen, to_int] {
             let mut func = make_minimal_func(&types);
             let mut ctx = MappingCtx {
@@ -683,7 +776,13 @@ mod tests {
         let mapper = X86_64Mapper;
 
         // Float16 → float should expand to __extendhfsf2
-        let insn = make_convert_insn(Opcode::FCvtF, types.float_id, 32, types.float16_id, 16);
+        let insn = make_convert_insn(
+            Opcode::FCvtF,
+            types.float_id,
+            Bits::new(32),
+            types.float16_id,
+            Bits::new(16),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -700,7 +799,13 @@ mod tests {
         let mapper = X86_64Mapper;
 
         // float → Float16 should expand to __truncsfhf2
-        let insn = make_convert_insn(Opcode::FCvtF, types.float16_id, 16, types.float_id, 32);
+        let insn = make_convert_insn(
+            Opcode::FCvtF,
+            types.float16_id,
+            Bits::new(16),
+            types.float_id,
+            Bits::new(32),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -716,7 +821,13 @@ mod tests {
         let types = TypeTable::new(&target);
         let mapper = X86_64Mapper;
 
-        let insn = make_convert_insn(Opcode::FCvtF, types.double_id, 64, types.float16_id, 16);
+        let insn = make_convert_insn(
+            Opcode::FCvtF,
+            types.double_id,
+            Bits::new(64),
+            types.float16_id,
+            Bits::new(16),
+        );
         let mut func = make_minimal_func(&types);
         let mut ctx = MappingCtx {
             func: &mut func,
@@ -788,7 +899,7 @@ mod tests {
         ];
 
         for (op, dst, dst_size, src, src_size, expected_call) in cases {
-            let insn = make_convert_insn(op, dst, dst_size, src, src_size);
+            let insn = make_convert_insn(op, dst, Bits::new(dst_size), src, Bits::new(src_size));
             let mut func = make_minimal_func(&types);
             let mut ctx = MappingCtx {
                 func: &mut func,
@@ -867,7 +978,7 @@ mod tests {
         ];
 
         for (op, dst, dst_size, src, src_size, expected) in cases {
-            let insn = make_convert_insn(op, dst, dst_size, src, src_size);
+            let insn = make_convert_insn(op, dst, Bits::new(dst_size), src, Bits::new(src_size));
             let mut func = make_minimal_func(&types);
             let mut ctx = MappingCtx {
                 func: &mut func,

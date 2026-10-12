@@ -24,6 +24,7 @@ use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ShuffleSelector, UnaryOp};
 use crate::types::{TypeId, TypeKind};
+use crate::units::Bits;
 
 /// Which operands of a shuffle its lanes come from.
 #[derive(Clone, Copy)]
@@ -149,15 +150,15 @@ impl Linearizer<'_> {
         vec: TypeId,
         carrier: TypeId,
     ) -> PseudoId {
-        let bytes = self.types.size_bytes(vec);
-        let narrow = bytes < self.types.size_bytes(carrier) && self.types.is_integer(carrier);
+        let bytes = self.types.byte_size(vec);
+        let narrow = bytes < self.types.byte_size(carrier) && self.types.is_integer(carrier);
         let typ = if narrow {
             crate::abi::small_vector_bits(bytes, self.types)
         } else {
             carrier
         };
         let value = self.alloc_reg_pseudo();
-        let bits = self.types.size_bits(typ);
+        let bits = self.types.value_bits(typ);
         self.emit(Instruction::load(value, addr, 0, typ, bits));
         self.emit_convert(value, typ, carrier)
     }
@@ -171,7 +172,7 @@ impl Linearizer<'_> {
         vec: TypeId,
     ) -> PseudoId {
         let result = self.frame_temp_addr("__vec", vec);
-        let bits = self.types.size_bits(carrier);
+        let bits = self.types.value_bits(carrier);
         self.emit(Instruction::store(value, result, 0, carrier, bits));
         result
     }
@@ -236,7 +237,7 @@ impl Linearizer<'_> {
             ShuffleSelector::Indices(_) => None,
         };
         let result = self.frame_temp_addr("__vec", result_typ);
-        let bits = self.types.size_bits(lane);
+        let bits = self.types.value_bits(lane);
         let long = self.types.long_id;
         for k in 0..count {
             let value = match (selector, mask) {
@@ -309,7 +310,7 @@ impl Linearizer<'_> {
     ) -> Option<(ShuffleIndices, ShuffleFrom)> {
         let same_shape = |e: &Expr| {
             let t = self.expr_type(e);
-            self.types.size_bytes(t) == self.types.size_bytes(result_typ)
+            self.types.byte_size(t) == self.types.byte_size(result_typ)
                 && self.types.vector_lanes(t).map(|(_, n)| n)
                     == self.types.vector_lanes(result_typ).map(|(_, n)| n)
         };
@@ -350,7 +351,7 @@ impl Linearizer<'_> {
     fn native_convert(&self, from: TypeId, to: TypeId) -> Option<SimdOp> {
         let (from_lane, from_n) = self.types.vector_lanes(from)?;
         let (to_lane, to_n) = self.types.vector_lanes(to)?;
-        if from_n != to_n || self.types.size_bytes(from_lane) != self.types.size_bytes(to_lane) {
+        if from_n != to_n || self.types.byte_size(from_lane) != self.types.byte_size(to_lane) {
             return None;
         }
         let op = match (self.types.is_float(from_lane), self.types.is_float(to_lane)) {
@@ -374,7 +375,7 @@ impl Linearizer<'_> {
         let (to, count, to_size) = self.vector_shape(result_typ);
         let (from, _, from_size) = self.vector_shape(from_typ);
         let result = self.frame_temp_addr("__vec", result_typ);
-        let bits = self.types.size_bits(to);
+        let bits = self.types.value_bits(to);
         for k in 0..count {
             let v = self.load_lane(src, k as i64 * from_size, from);
             let v = self.emit_convert(v, from, to);
@@ -385,7 +386,7 @@ impl Linearizer<'_> {
 
     /// The lane of type `lane` at `addr + offset`.
     fn load_lane(&mut self, addr: PseudoId, offset: i64, lane: TypeId) -> PseudoId {
-        let bits = self.types.size_bits(lane);
+        let bits = self.types.value_bits(lane);
         let value = self.alloc_reg_pseudo();
         self.emit(Instruction::load(value, addr, offset, lane, bits));
         value
@@ -419,7 +420,7 @@ impl Linearizer<'_> {
                 Instruction::new(Opcode::ConstantP)
                     .with_target(constant)
                     .with_src(value)
-                    .with_type_and_size(int, 32),
+                    .with_type_and_size(int, Bits::new(32)),
             );
             answer = Some(match answer {
                 Some(acc) => self.emit_binary(BinaryOp::BitAnd, acc, constant, int, int),
@@ -435,7 +436,7 @@ impl Linearizer<'_> {
             .types
             .vector_lanes(typ)
             .expect("a vector expression has a vector type");
-        (lane, count, self.types.size_bytes(lane) as i64)
+        (lane, count, self.types.byte_size(lane).to_i64())
     }
 
     /// The address of the lanes of vector expression `e`.
@@ -462,8 +463,8 @@ impl Linearizer<'_> {
         match lanes {
             Lanes::Splat(value) => value,
             Lanes::Vector { addr, lane: own } => {
-                let size = self.types.size_bits(own);
-                let offset = i as i64 * (size / 8) as i64;
+                let size = self.types.value_bits(own);
+                let offset = i as i64 * i64::from(size.bytes_exact());
                 let value = self.alloc_reg_pseudo();
                 self.emit(Instruction::load(value, addr, offset, own, size));
                 self.emit_convert(value, own, lane)
@@ -517,7 +518,7 @@ impl Linearizer<'_> {
         }
         let (result_lane, _, result_size) = self.vector_shape(result_typ);
         let result = self.frame_temp_addr("__vec", result_typ);
-        let lane_bits = self.types.size_bits(result_lane);
+        let lane_bits = self.types.value_bits(result_lane);
         for i in 0..count {
             let a = self.vector_lane(l, i, lane);
             let b = self.vector_lane(r, i, lane);
@@ -557,7 +558,7 @@ impl Linearizer<'_> {
             return lane;
         }
         self.types
-            .unsigned_of_size(self.types.size_bytes(lane))
+            .unsigned_of_size(self.types.byte_size(lane).to_usize())
             .unwrap_or(lane)
     }
 
@@ -581,7 +582,7 @@ impl Linearizer<'_> {
             }
         }
         let result = self.frame_temp_addr("__vec", typ);
-        let bits = self.types.size_bits(lane);
+        let bits = self.types.value_bits(lane);
         for i in 0..count {
             let a = self.vector_lane(src, i, lane);
             let value = self.emit_unary(op, a, lane);
@@ -609,7 +610,7 @@ impl Linearizer<'_> {
     /// register's worth: binary128 for sixteen bytes (an XMM or Q register),
     /// `double` for eight. `None` for any other size.
     fn register_carrier(&self, typ: TypeId) -> Option<TypeId> {
-        match self.types.size_bytes(typ) {
+        match self.types.byte_size(typ).to_usize() {
             16 => Some(self.types.float128_id),
             8 => Some(self.types.double_id),
             _ => None,
@@ -758,7 +759,7 @@ impl Linearizer<'_> {
         values: &[PseudoId],
         vec: TypeId,
     ) -> (PseudoId, Instruction) {
-        let bits = self.types.size_bits(self.native_carrier(vec));
+        let bits = self.types.value_bits(self.native_carrier(vec));
         let value = self.alloc_reg_pseudo();
         let insn = match values[..] {
             [a] => Instruction::unop(Opcode::Simd(op), value, a, vec, bits),
@@ -772,7 +773,7 @@ impl Linearizer<'_> {
     /// fresh vector of `result_typ`.
     fn simd_result(&mut self, value: PseudoId, vec: TypeId, result_typ: TypeId) -> PseudoId {
         let carrier = self.native_carrier(vec);
-        let bits = self.types.size_bits(carrier);
+        let bits = self.types.value_bits(carrier);
         let result = self.frame_temp_addr("__vec", result_typ);
         self.emit(Instruction::store(value, result, 0, carrier, bits));
         result
@@ -784,14 +785,14 @@ impl Linearizer<'_> {
     /// eight-byte general-register chunks; a volatile one keeps the block
     /// copy, which accesses each byte as the object's qualifiers say.
     fn copy_vector(&mut self, dst: PseudoId, src: PseudoId, typ: TypeId, vol: BlockVolatility) {
-        let bytes = self.types.size_bytes(typ);
+        let bytes = self.types.byte_size(typ);
         match self.register_carrier(typ) {
             Some(carrier) if vol.is_plain() => {
                 let value = self.vector_to_carrier(src, typ, carrier);
-                let bits = self.types.size_bits(carrier);
+                let bits = self.types.value_bits(carrier);
                 self.emit(Instruction::store(value, dst, 0, carrier, bits));
             }
-            _ => self.emit_block_copy(dst, src, bytes as i64, vol),
+            _ => self.emit_block_copy(dst, src, bytes, vol),
         }
     }
 
@@ -800,7 +801,7 @@ impl Linearizer<'_> {
     /// or an integer as a vector.
     pub(crate) fn linearize_vector_cast(&mut self, inner: &Expr, to: TypeId) -> PseudoId {
         let from = self.expr_type(inner);
-        let bits = self.types.size_bits(to);
+        let bits = self.types.value_bits(to);
         if self.types.is_vector(from) {
             let addr = self.vector_addr(inner);
             if self.types.is_vector(to) {
@@ -861,7 +862,7 @@ impl Linearizer<'_> {
             self.emit_const(1, lane)
         };
         let op = if inc { BinaryOp::Add } else { BinaryOp::Sub };
-        let bits = self.types.size_bits(lane);
+        let bits = self.types.value_bits(lane);
         for i in 0..count {
             let a = self.vector_lane(src, i, lane);
             let v = self.emit_binary(op, a, one, lane, lane);

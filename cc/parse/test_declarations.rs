@@ -283,7 +283,7 @@ fn test_static_array_parameter_with_parenthesized_name() {
 fn test_incomplete_array_definition_is_judged_at_end_of_unit() {
     use crate::parse::ast::ExternalDecl;
     use crate::types::TypeKind;
-    let sizes = |src: &str| -> (u32, Vec<usize>) {
+    let sizes = |src: &str| -> (u32, Vec<u64>) {
         let before = crate::diag::warning_count();
         let (tu, types, _, _) = parse_tu(src).unwrap();
         let mut sizes = Vec::new();
@@ -291,7 +291,7 @@ fn test_incomplete_array_definition_is_judged_at_end_of_unit() {
             if let ExternalDecl::Declaration(d) = item {
                 for decl in &d.declarators {
                     if types.kind(decl.typ) == TypeKind::Array {
-                        sizes.push(types.size_bytes(decl.typ));
+                        sizes.push(types.byte_size(decl.typ).get());
                     }
                 }
             }

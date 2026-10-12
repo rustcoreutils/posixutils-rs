@@ -14,9 +14,10 @@ use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::abi::{Abi, ArgClass, RegClass};
 use crate::arch::eh::CallArgsArea;
-use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
+use crate::arch::lir::{complex_fp_info, eightbyte_bytes, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeKind, TypeTable};
+use crate::units::{Align, Bits, ByteSize};
 use std::collections::HashMap;
 
 /// The alignment a stacked argument must start on: its type's, at least 8.
@@ -24,7 +25,7 @@ fn arg_align(insn: &Instruction, types: &TypeTable, i: usize) -> i32 {
     insn.extra()
         .arg_types
         .get(i)
-        .map(|&t| types.alignment(t) as i32)
+        .map(|&t| crate::abi::slot_align(types.align(t)))
         .unwrap_or(8)
 }
 
@@ -41,9 +42,9 @@ pub(super) struct CallArgInfo {
     /// top -- which is what this replaced -- cannot express a gap between two
     /// arguments, so a sixteen-byte-aligned one after an odd number of
     /// eight-byte slots landed eight bytes low.
-    pub stack_offsets: Vec<i32>,
+    pub stack_offsets: Vec<i64>,
     /// Total bytes to reserve, rounded to the 16-byte call boundary.
-    pub stack_bytes: i32,
+    pub stack_bytes: i64,
     /// Indices of arguments the ABI ignores entirely -- a zero-sized type,
     /// which occupies neither a register nor a stack slot.
     ///
@@ -60,7 +61,7 @@ pub(super) struct CallArgInfo {
 /// `rep movsq`. It is the bound the IR puts on an expanded `memcpy`, for the
 /// same reason: one load/store pair per eightbyte made a 600 MB argument 75
 /// million instructions and tens of gigabytes of compiler memory.
-pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES;
+pub(super) const UNROLL_LIMIT_BYTES: ByteSize = crate::ir::memexpand::INLINE_LIMIT_BYTES;
 
 /// Where [`X86_64CodeGen::emit_rep_movsq`] writes.
 ///
@@ -70,7 +71,7 @@ pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BY
 pub(super) enum BlockDst {
     /// A byte offset in the outgoing argument area, addressed through `%rsp`;
     /// the helper adds what its own pushes moved `%rsp` by.
-    OutgoingArg(i32),
+    OutgoingArg(i64),
     /// Any address `%rsp` moving does not disturb -- a frame slot, or a
     /// register holding a pointer. It must not be built on `%rsp`, `%rdi`,
     /// `%rsi` or `%rcx`.
@@ -93,9 +94,7 @@ impl X86_64CodeGen {
     pub(super) fn emit_rep_movsq(&mut self, src: MemAddr, dst: BlockDst, qwords: i64) {
         let saved = [Reg::Rdi, Reg::Rsi, Reg::Rcx];
         for r in saved {
-            self.push_lir(X86Inst::Push {
-                src: GpOperand::Reg(r),
-            });
+            self.push_saved(r);
         }
         self.push_lir(X86Inst::Lea {
             addr: src,
@@ -104,7 +103,7 @@ impl X86_64CodeGen {
         let dst_addr = match dst {
             BlockDst::OutgoingArg(off) => MemAddr::BaseOffset {
                 base: Reg::Rsp,
-                offset: off + 8 * saved.len() as i32,
+                offset: off + 8 * saved.len() as i64,
             },
             BlockDst::At(addr) => addr,
         };
@@ -119,7 +118,7 @@ impl X86_64CodeGen {
         });
         self.push_lir(X86Inst::RepMovsq);
         for r in saved.into_iter().rev() {
-            self.push_lir(X86Inst::Pop { dst: r });
+            self.pop_saved(r);
         }
     }
 
@@ -138,20 +137,22 @@ impl X86_64CodeGen {
     ///
     /// Past [`UNROLL_LIMIT_BYTES`] the whole eightbytes go through `rep movsq`
     /// and only the ragged tail is unrolled.
-    fn emit_stack_arg_copy(&mut self, src: Reg, dst_off: i32, bytes: i64) {
+    fn emit_stack_arg_copy(&mut self, src: Reg, dst_off: i64, bytes: ByteSize) {
         let mut at = 0;
+        let mut rest = bytes;
         if bytes > UNROLL_LIMIT_BYTES {
-            let qwords = bytes / 8;
+            let qwords = bytes.to_i64() / 8;
             let from = MemAddr::BaseOffset {
                 base: src,
                 offset: 0,
             };
             self.emit_rep_movsq(from, BlockDst::OutgoingArg(dst_off), qwords);
             at = qwords * 8;
+            rest = ByteSize::new(bytes.get() % 8);
         }
-        for (off, chunk) in crate::ir::memexpand::block_chunks(bytes - at) {
+        for (off, chunk) in crate::ir::memexpand::block_chunks(rest) {
             let size = OperandSize::from_bits(chunk.bits());
-            let byte = (at + off) as i32;
+            let byte = at + off;
             self.push_lir(X86Inst::Mov {
                 size,
                 src: GpOperand::Mem(MemAddr::BaseOffset {
@@ -190,7 +191,7 @@ impl X86_64CodeGen {
         let mut at: i64 = 0;
         // Reserve `bytes` for the argument at `i`, starting it on `align`.
         let place = |i: usize,
-                     bytes: usize,
+                     bytes: ByteSize,
                      align: i32,
                      indices: &mut Vec<usize>,
                      offsets: &mut Vec<i64>,
@@ -199,7 +200,10 @@ impl X86_64CodeGen {
             *at = (*at + align - 1) & !(align - 1);
             indices.push(i);
             offsets.push(*at);
-            *at += (bytes as i64 + 7) & !7;
+            let slot = bytes
+                .align_up(Align::EIGHT)
+                .expect("no argument's size is within an eightbyte of overflowing");
+            *at = at.saturating_add(slot.to_i64());
         };
 
         let abi_info = insn
@@ -223,7 +227,7 @@ impl X86_64CodeGen {
                 // Long double is always passed on the stack by value (16 bytes = 2 qwords)
                 place(
                     i,
-                    16,
+                    ByteSize::new(16),
                     16,
                     &mut stack_arg_indices,
                     &mut stack_offsets,
@@ -246,7 +250,7 @@ impl X86_64CodeGen {
                         // Every eightbyte lands on the stack, so a mixed pair
                         // takes two qwords -- `max` counted it as one and left
                         // the outgoing area a qword short.
-                        let bytes = classes.len().max(1) * 8;
+                        let bytes = ByteSize::from_usize(classes.len().max(1) * 8);
                         let align = arg_align(insn, types, i);
                         place(
                             i,
@@ -292,7 +296,14 @@ impl X86_64CodeGen {
                     // Advancing anyway made this side count a register the
                     // setup side had not.
                     if temp_int_idx >= int_arg_regs.len() {
-                        place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
+                        place(
+                            i,
+                            ByteSize::new(8),
+                            8,
+                            &mut stack_arg_indices,
+                            &mut stack_offsets,
+                            &mut at,
+                        );
                     } else {
                         temp_int_idx += 1;
                     }
@@ -302,7 +313,14 @@ impl X86_64CodeGen {
                     if temp_fp_idx + (*count as usize) > fp_arg_regs.len() {
                         // §3.2.3 step 5 again: to memory whole, consuming none
                         // of the registers it did not fit in.
-                        place(i, 8, 8, &mut stack_arg_indices, &mut stack_offsets, &mut at);
+                        place(
+                            i,
+                            ByteSize::new(8),
+                            8,
+                            &mut stack_arg_indices,
+                            &mut stack_offsets,
+                            &mut at,
+                        );
                     } else {
                         temp_fp_idx += *count as usize;
                     }
@@ -332,12 +350,9 @@ impl X86_64CodeGen {
         // area began, so the callee read it sixteen bytes out.
         let area_align = i64::from(Self::outgoing_area_align(insn, types));
         let stack_bytes = (at + area_align - 1) & !(area_align - 1);
-        let limit = crate::types::TypeTable::MAX_STACK_OBJECT_BYTES as i64;
+        let limit = crate::types::TypeTable::MAX_FRAME_BYTES;
         let (stack_offsets, stack_bytes) = if stack_bytes <= limit {
-            (
-                stack_offsets.into_iter().map(|o| o as i32).collect(),
-                stack_bytes as i32,
-            )
+            (stack_offsets, stack_bytes)
         } else {
             crate::diag::error_args(
                 insn.pos.unwrap_or(self.base.func_pos),
@@ -366,7 +381,7 @@ impl X86_64CodeGen {
         insn.extra()
             .arg_types
             .iter()
-            .map(|t| types.alignment(*t) as i32)
+            .map(|t| crate::abi::slot_align(types.align(*t)))
             .fold(16, i32::max)
     }
 
@@ -383,11 +398,8 @@ impl X86_64CodeGen {
         // Reserve the whole outgoing area at once, then write each argument at
         // the offset the layout gave it. Pushing in reverse could not express a
         // gap between two arguments, which is what an alignment boundary is.
-        self.push_lir(X86Inst::Sub {
-            size: OperandSize::B64,
-            src: GpOperand::Imm(info.stack_bytes as i64),
-            dst: Reg::Rsp,
-        });
+        self.emit_call_area(info.stack_bytes);
+        self.base.sp_lowered(info.stack_bytes);
         for (n, &i) in info.stack_arg_indices.iter().enumerate() {
             let base_off = info.stack_offsets[n];
             let arg = insn.src[i];
@@ -402,18 +414,18 @@ impl X86_64CodeGen {
             // 16-byte scalar long double and only half of it copied.
             if let Some(bytes) = arg_type.and_then(|t| {
                 crate::arch::lir::memory_class_bytes(types, t)
-                    .or_else(|| types.is_complex(t).then(|| types.size_bytes(t)))
+                    .or_else(|| types.is_complex(t).then(|| types.byte_size(t)))
                     // A register-pair struct that ran out of registers goes on
                     // the stack *whole*. Without this it fell through to the
                     // scalar path below and pushed eight bytes of a sixteen-byte
                     // value -- the callee then read half of it plus whatever
                     // followed.
                     .or_else(|| {
-                        crate::abi::struct_param_classes(t, types).map(|_| types.size_bytes(t))
+                        crate::abi::struct_param_classes(t, types).map(|_| types.byte_size(t))
                     })
             }) {
                 let base = self.address_of_pseudo(arg);
-                self.emit_stack_arg_copy(base, base_off, bytes as i64);
+                self.emit_stack_arg_copy(base, base_off, bytes);
                 continue;
             }
 
@@ -425,11 +437,7 @@ impl X86_64CodeGen {
             };
 
             if is_fp {
-                let fp_size = if let Some(typ) = arg_type {
-                    types.size_bits(typ)
-                } else {
-                    64
-                };
+                let fp_size = arg_type.map_or(Bits::new(64), |t| types.value_bits(t));
                 // The *type* decides the register format: x87 extended and
                 // binary128 are both 128 bits wide here, and only the type
                 // tells them apart.
@@ -487,11 +495,8 @@ impl X86_64CodeGen {
                     continue;
                 }
                 // (Large aggregates are handled by the MEMORY-class arm above.)
-                let arg_size = if let Some(typ) = arg_type {
-                    types.size_bits(typ).max(32)
-                } else {
-                    64
-                };
+                let arg_size =
+                    arg_type.map_or(Bits::new(64), |t| types.value_bits(t).max(Bits::new(32)));
                 self.emit_move(arg, Reg::Rax, arg_size);
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
@@ -605,12 +610,12 @@ impl X86_64CodeGen {
     ///
     /// The aarch64 back end does the same, through its own instructions; the
     /// chunking both ask for is `ir::memexpand::block_chunks`.
-    fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: i64) {
+    fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i64, bytes: ByteSize) {
         for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
             let size = OperandSize::from_bits(chunk.bits());
             let mem = GpOperand::Mem(MemAddr::BaseOffset {
                 base,
-                offset: offset + at as i32,
+                offset: offset + at,
             });
             // The first piece lands in `dst`; the rest are shifted into it
             // through R11, which no argument register is.
@@ -664,7 +669,7 @@ impl X86_64CodeGen {
                 Reg::R11
             }
             _ => {
-                self.emit_move(arg, Reg::R11, 64);
+                self.emit_move(arg, Reg::R11, Bits::new(64));
                 Reg::R11
             }
         }
@@ -699,11 +704,7 @@ impl X86_64CodeGen {
 
             // Get actual arg size without clamping - emit_move handles sub-32-bit properly
             // This is needed for Float16 (16-bit) to get correct zero-extension
-            let arg_size = if let Some(typ) = arg_type {
-                types.size_bits(typ)
-            } else {
-                64
-            };
+            let arg_size = arg_type.map_or(Bits::new(64), |t| types.value_bits(t));
 
             if is_complex {
                 // §3.2.3, by base type:
@@ -718,7 +719,7 @@ impl X86_64CodeGen {
                 if types.kind(base) == TypeKind::LongDouble {
                     continue;
                 }
-                let packed = types.size_bits(arg_type.unwrap()) <= 64;
+                let packed = types.value_bits(arg_type.unwrap()) <= Bits::new(64);
                 self.setup_complex_arg(
                     arg,
                     arg_type,
@@ -738,20 +739,16 @@ impl X86_64CodeGen {
                 // complex arg pseudo always holds an address and that arm
                 // moves the pseudo itself.
                 let base = self.struct_arg_base(arg);
-                let bytes = arg_type.map_or(0, |t| types.size_bytes(t)) as i64;
+                let bytes = arg_type.map_or(ByteSize::ZERO, |t| types.byte_size(t));
                 for i in 0..classes.len() {
                     // Only what this eightbyte holds: `_Complex char` is two
                     // bytes, not eight.
-                    let take = (bytes - (i as i64) * 8).clamp(0, 8);
-                    self.load_object_bytes(int_arg_regs[int_arg_idx], base, (i * 8) as i32, take);
+                    let take = eightbyte_bytes(bytes, ByteSize::from_usize(i * 8));
+                    self.load_object_bytes(int_arg_regs[int_arg_idx], base, (i * 8) as i64, take);
                     int_arg_idx += 1;
                 }
             } else if is_fp {
-                let fp_size = if let Some(typ) = arg_type {
-                    types.size_bits(typ)
-                } else {
-                    64
-                };
+                let fp_size = arg_type.map_or(Bits::new(64), |t| types.value_bits(t));
                 // The *type* decides the register format: x87 extended and
                 // binary128 are both 128 bits wide here, and only the type
                 // tells them apart.
@@ -769,10 +766,11 @@ impl X86_64CodeGen {
                 // argument pseudo holds the *value* at this size, not an
                 // address, so it moves straight into an XMM register the way a
                 // floating scalar does.
-                types.size_bits(t) <= 64 && crate::abi::sse_struct_regs(t, types).is_some()
+                types.byte_size(t) <= ByteSize::new(8)
+                    && crate::abi::sse_struct_regs(t, types).is_some()
             }) {
                 if fp_arg_idx < fp_arg_regs.len() {
-                    let size_bits = arg_type.map_or(64, |t| types.size_bits(t));
+                    let size_bits = arg_type.map_or(Bits::new(64), |t| types.value_bits(t));
                     let fmt = FpSize::for_sse_aggregate(size_bits);
                     let dst = fp_arg_regs[fp_arg_idx];
                     self.emit_fp_move(arg, dst, fmt);
@@ -781,8 +779,8 @@ impl X86_64CodeGen {
             } else if arg_type.is_some_and(|t| {
                 let k = types.kind(t);
                 (k == TypeKind::Struct || k == TypeKind::Union)
-                    && types.size_bits(t) > 64
-                    && types.size_bits(t) <= 128
+                    && types.byte_size(t) > ByteSize::new(8)
+                    && types.byte_size(t) <= ByteSize::new(16)
             }) {
                 // Medium struct (9-16 bytes, e.g., {double, double}):
                 // Load two 8-byte fields into register pairs per ABI classification.
@@ -809,7 +807,7 @@ impl X86_64CodeGen {
                                 Reg::R11
                             }
                             _ => {
-                                self.emit_move(arg, Reg::R11, 64);
+                                self.emit_move(arg, Reg::R11, Bits::new(64));
                                 Reg::R11
                             }
                         };
@@ -820,7 +818,7 @@ impl X86_64CodeGen {
                         if classes.len() == 1 {
                             self.push_lir(X86Inst::MovFp {
                                 size: FpSize::for_sse_aggregate(
-                                    arg_type.map_or(64, |t| types.size_bits(t)),
+                                    arg_type.map_or(Bits::new(64), |t| types.value_bits(t)),
                                 ),
                                 src: XmmOperand::Mem(MemAddr::BaseOffset { base, offset: 0 }),
                                 dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
@@ -846,21 +844,19 @@ impl X86_64CodeGen {
                         let addr = match arg_loc {
                             Loc::Reg(r) => r,
                             _ => {
-                                self.emit_move(arg, Reg::R10, 64);
+                                self.emit_move(arg, Reg::R10, Bits::new(64));
                                 Reg::R10
                             }
                         };
                         // Two registers, but not always sixteen bytes: a
                         // twelve-byte composite fills the first and four
                         // bytes of the second.
-                        let bytes = arg_type.map_or(16, |t| types.size_bytes(t)) as i64;
-                        self.load_object_bytes(int_arg_regs[int_arg_idx], addr, 0, bytes.min(8));
-                        self.load_object_bytes(
-                            int_arg_regs[int_arg_idx + 1],
-                            addr,
-                            8,
-                            (bytes - 8).clamp(0, 8),
-                        );
+                        let bytes = arg_type.map_or(ByteSize::new(16), |t| types.byte_size(t));
+                        let (low, high) = (ByteSize::ZERO, ByteSize::new(8));
+                        let first = eightbyte_bytes(bytes, low);
+                        self.load_object_bytes(int_arg_regs[int_arg_idx], addr, 0, first);
+                        let second = eightbyte_bytes(bytes, high);
+                        self.load_object_bytes(int_arg_regs[int_arg_idx + 1], addr, 8, second);
                         int_arg_idx += 2;
                     } else {
                         // Mixed: one eightbyte to a general register and one to
@@ -871,7 +867,7 @@ impl X86_64CodeGen {
                         for (i, class) in classes.iter().enumerate() {
                             let addr = MemAddr::BaseOffset {
                                 base,
-                                offset: (i * 8) as i32,
+                                offset: (i * 8) as i64,
                             };
                             if *class == crate::abi::RegClass::Sse {
                                 self.push_lir(X86Inst::MovFp {
@@ -939,7 +935,7 @@ impl X86_64CodeGen {
         // while `crealf` happened to be right, a silent wrong answer. One
         // 64-bit move carries the whole value, mirroring what the *return*
         // path has always done.
-        let packed = types.size_bits(complex_ty) <= 64;
+        let packed = types.value_bits(complex_ty) <= Bits::new(64);
         let load_size = if packed { FpSize::Double } else { fp_size };
 
         match arg_loc {
@@ -1006,7 +1002,7 @@ impl X86_64CodeGen {
     fn setup_int_arg(
         &mut self,
         arg: PseudoId,
-        arg_size: u32,
+        arg_size: Bits,
         dest_reg: Reg,
         saved_arg_regs: &HashMap<Reg, Reg>,
     ) {
@@ -1034,8 +1030,8 @@ impl X86_64CodeGen {
         let dst_loc = self.get_location(target);
         let ret_size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
         let ret_fmt = self.fp_format(insn.typ, ret_size, types);
 
         let abi_info = insn
@@ -1047,7 +1043,7 @@ impl X86_64CodeGen {
         match &abi_info.ret {
             ArgClass::Direct { classes, size_bits } => {
                 // Check for two-register struct return (9-16 bytes)
-                if *size_bits > 64 && classes.len() == 2 {
+                if *size_bits > Bits::new(64) && classes.len() == 2 {
                     // Check if it's two INTEGER (struct) vs two SSE (complex) vs mixed
                     if classes.iter().all(|c| *c == RegClass::Integer) {
                         self.handle_two_reg_return(&dst_loc);
@@ -1139,7 +1135,7 @@ impl X86_64CodeGen {
                 self.emit_fp_move_from_xmm(
                     XmmReg::Xmm0,
                     &dst_loc,
-                    FpSize::from_bits(size_bits, &self.base.target),
+                    FpSize::from_bits(Bits::new(size_bits), &self.base.target),
                 );
             }
             ArgClass::Extend { .. } => {
@@ -1156,7 +1152,7 @@ impl X86_64CodeGen {
                     // imaginary part to the top for the second store. Both
                     // must be popped or the x87 stack leaks across the call.
                     let base = types.complex_base(insn.typ.unwrap());
-                    let imag_off = (types.size_bytes(base)) as i32;
+                    let imag_off = types.value_bits(base).bytes_exact() as i64;
                     let base_addr = self.address_of_pseudo(target);
                     self.push_lir(X86Inst::X87Store {
                         addr: MemAddr::BaseOffset {
@@ -1302,7 +1298,7 @@ impl X86_64CodeGen {
                 let mut xmm_idx = 0;
                 let mut gp_idx = 0;
                 for (i, &class) in classes.iter().enumerate() {
-                    let mem_offset = i as i32 * 8;
+                    let mem_offset = i as i64 * 8;
                     match class {
                         RegClass::Sse => {
                             let xmm = if xmm_idx == 0 {
@@ -1334,7 +1330,7 @@ impl X86_64CodeGen {
                 let mut xmm_idx = 0;
                 let mut gp_idx = 0;
                 for (i, &class) in classes.iter().enumerate() {
-                    let mem_offset = i as i32 * 8;
+                    let mem_offset = i as i64 * 8;
                     match class {
                         RegClass::Sse => {
                             let xmm = if xmm_idx == 0 {
@@ -1458,6 +1454,7 @@ impl X86_64CodeGen {
                 src: GpOperand::Imm(stack_cleanup as i64),
                 dst: Reg::Rsp,
             });
+            self.base.sp_raised(stack_cleanup as i64);
         }
     }
 

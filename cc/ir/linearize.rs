@@ -35,6 +35,7 @@ use crate::target::Target;
 use crate::types::{
     AddressSpace, ArrayExtent, MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable,
 };
+use crate::units::{Bits, ByteSize};
 use std::collections::{HashMap, HashSet};
 
 const DEFAULT_LOCALS_CAPACITY: usize = 64;
@@ -395,9 +396,11 @@ impl RawFieldInit {
     /// `char` member owns, while the field itself does not.
     pub(crate) fn byte_span(&self) -> std::ops::Range<usize> {
         match (self.bit_offset, self.bit_width) {
-            (Some(bit_offset), Some(bit_width)) => {
-                crate::types::own_bit_bytes(self.offset, bit_offset, bit_width)
-            }
+            (Some(bit_offset), Some(bit_width)) => crate::types::own_bit_bytes(
+                ByteSize::from_usize(self.offset),
+                bit_offset,
+                bit_width,
+            ),
             _ => self.offset..self.offset + self.field_size,
         }
     }
@@ -536,7 +539,7 @@ impl StructFieldVisit {
     /// This field's placement, if it is a bit-field of non-zero width.
     pub(crate) fn bitfield(&self) -> Option<crate::types::Bitfield> {
         crate::types::Bitfield::from_parts(
-            self.offset,
+            ByteSize::from_usize(self.offset),
             self.bit_offset,
             self.bit_width,
             self.access_bytes,
@@ -1139,8 +1142,8 @@ impl<'a> Linearizer<'a> {
     }
 
     /// The width of a pointer: an address, and a saved stack pointer.
-    pub(crate) fn ptr_bits(&self) -> u32 {
-        self.types.size_bits(self.types.void_ptr_id)
+    pub(crate) fn ptr_bits(&self) -> Bits {
+        self.types.value_bits(self.types.void_ptr_id)
     }
 
     /// The assembler name of the C library function `name`, for a call the
@@ -1314,7 +1317,7 @@ impl<'a> Linearizer<'a> {
         phi_target: PseudoId,
         phi_bb: BasicBlockId,
         typ: TypeId,
-        size: u32,
+        size: Bits,
     ) -> PseudoId {
         let phisrc_pseudo = self.alloc_pseudo();
         let pseudo = Pseudo::phi(phisrc_pseudo, phisrc_pseudo.0);
@@ -1439,9 +1442,10 @@ impl<'a> Linearizer<'a> {
         from_typ: TypeId,
         to_typ: TypeId,
     ) -> PseudoId {
-        // Same type and size - no conversion needed
+        // Same type and size - no conversion needed. Two aggregates too large
+        // to have a value width are the same size as far as this asks.
         if self.types.kind(from_typ) == self.types.kind(to_typ)
-            && self.types.size_bits(from_typ) == self.types.size_bits(to_typ)
+            && self.types.checked_value_bits(from_typ) == self.types.checked_value_bits(to_typ)
         {
             return val;
         }
@@ -1449,8 +1453,8 @@ impl<'a> Linearizer<'a> {
         // An array or a function is converted as the pointer it decays to
         // (C17 6.3.2.1p3-4), which is what its value already is: the address.
         let from_typ = self.types.decayed_value(from_typ);
-        let from_size = self.types.size_bits(from_typ);
-        let to_size = self.types.size_bits(to_typ);
+        let from_size = self.types.value_bits(from_typ);
+        let to_size = self.types.value_bits(to_typ);
         let from_float = self.types.is_float(from_typ);
         let to_float = self.types.is_float(to_typ);
         let from_kind = self.types.kind(from_typ);
@@ -1701,7 +1705,8 @@ impl<'a> Linearizer<'a> {
             // size rule below.
             return false;
         }
-        if self.types.size_bits(typ) > self.target.max_aggregate_register_bits {
+        let max = Bits::new(self.target.max_aggregate_register_bits);
+        if self.types.checked_value_bits(typ).is_none_or(|w| w > max) {
             // Every other aggregate over two eightbytes.
             return true;
         }
@@ -1725,7 +1730,7 @@ impl<'a> Linearizer<'a> {
             let ptr_type = self.types.pointer_to(typ);
             let local_sym = self.alloc_pseudo();
             self.named_local(local_sym, name, ptr_type, None, None);
-            let ptr_size = self.types.size_bits(ptr_type);
+            let ptr_size = self.types.value_bits(ptr_type);
             self.emit(Instruction::store(
                 arg_pseudo, local_sym, 0, ptr_type, ptr_size,
             ));
@@ -1783,11 +1788,10 @@ impl<'a> Linearizer<'a> {
     /// Fill `local_sym` from the parameter `arg_pseudo` of the struct, union
     /// or by-reference type `typ`, which arrived as the convention passes it.
     fn fill_struct_param(&mut self, local_sym: PseudoId, typ: TypeId, arg_pseudo: PseudoId) {
-        let typ_size = self.types.size_bits(typ);
-        // The copy length is an object size, so it is counted in bytes.
-        // `typ_size` saturates for an aggregate past `u32::MAX` bits and is
-        // good only for the class tests below, which compare against 64.
-        let typ_bytes = self.types.size_bytes(typ) as i64;
+        // The copy length is an object size, so it is counted in bytes, and so
+        // is the class test below: over one eightbyte.
+        let wide = self.types.byte_size(typ) > ByteSize::new(8);
+        let typ_bytes = self.types.byte_size(typ);
         let conv = self.current_calling_conv;
         let abi = get_abi_for_conv(conv, self.target);
         // MEMORY class: the caller left the bytes in the incoming argument
@@ -1838,7 +1842,7 @@ impl<'a> Linearizer<'a> {
                 src: Access::default(),
             };
             self.emit_block_copy(local_sym, addr_pseudo, typ_bytes, vol);
-        } else if typ_size > 64 || self.passed_by_reference(typ, conv) {
+        } else if wide || self.passed_by_reference(typ, conv) {
             // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
             // So is anything passed by reference, at any size: a Win64
             // three-byte struct or `long double`.
@@ -1848,18 +1852,19 @@ impl<'a> Linearizer<'a> {
                 src: Access::default(),
             };
             self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
-        } else if typ_bytes > 0 {
+        } else if !typ_bytes.is_zero() {
             // Small struct: arg_pseudo contains the value directly. A
             // complex value passed that way (Win64) is its bits, stored
             // as the integer they are. A zero-sized one arrives in
             // nothing (`ArgClass::Ignore`) and has nothing to store.
             let as_typ = if self.types.is_complex(typ) {
                 self.types
-                    .unsigned_of_size(typ_bytes as usize)
+                    .unsigned_of_size(typ_bytes.to_usize())
                     .unwrap_or(typ)
             } else {
                 typ
             };
+            let typ_size = self.types.value_bits(typ);
             self.emit(Instruction::store(
                 arg_pseudo, local_sym, 0, as_typ, typ_size,
             ));
@@ -1882,7 +1887,7 @@ impl<'a> Linearizer<'a> {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             self.named_local(local_sym, name, typ, None, None);
-            let typ_size_bytes = self.types.size_bytes(typ);
+            let typ_size_bytes = self.types.byte_size(typ);
             if let Some(func) = &mut self.current_func {
                 // Record for inliner: the backend prologue fills this local from
                 // registers; the inliner must generate an explicit copy instead.
@@ -1935,7 +1940,7 @@ impl<'a> Linearizer<'a> {
             } else {
                 (self.emit_convert(arg, passed_as, typ), typ)
             };
-            let typ_size = self.types.size_bits(stored);
+            let typ_size = self.types.value_bits(stored);
             self.emit(Instruction::store(
                 arg_pseudo, local_sym, 0, stored, typ_size,
             ));
@@ -2040,6 +2045,22 @@ impl<'a> Linearizer<'a> {
         request.map_or(unit, |r| unit.with_request(r))
     }
 
+    /// The definition `func` as the source wrote it: its identifier, and
+    /// where the declarator names it -- the symbol's definition, which a
+    /// later declaration of the name does not replace. The definition's
+    /// first token stands in for a symbol not found.
+    fn function_decl(&self, func: &FunctionDef) -> crate::ir::FunctionDecl {
+        let pos = self
+            .symbols
+            .lookup(func.name, crate::symbol::Namespace::Ordinary)
+            .filter(|s| s.declared.definition)
+            .map_or(func.pos, |s| s.declared.pos);
+        crate::ir::FunctionDecl {
+            name: self.str(func.name).to_string(),
+            pos,
+        }
+    }
+
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
         self.linearize_function_as(func, None)
     }
@@ -2073,6 +2094,7 @@ impl<'a> Linearizer<'a> {
         self.current_calling_conv = func.calling_conv;
 
         let mut ir_func = Function::new(name, func.return_type);
+        ir_func.declared = Some(self.function_decl(func));
         ir_func.conv = func.calling_conv;
         ir_func.isa = version
             .as_ref()
@@ -2323,7 +2345,7 @@ impl<'a> Linearizer<'a> {
                 // Medium structs (9-16 bytes) with all-SSE classification are
                 // passed like complex types (in two XMM registers). Route them
                 // through complex_params so the codegen handles the register split.
-                let size = self.types.size_bits(param.typ);
+                let size = self.types.byte_size(param.typ);
                 // An HFA arrives in one register per element whatever its
                 // size, and the prologue writes them into the local -- so it
                 // must not also get the small-struct store below, which would
@@ -2332,10 +2354,12 @@ impl<'a> Linearizer<'a> {
                     .classify_param(param.typ, self.types);
                 let is_hfa_param = matches!(
                     class,
-                    crate::abi::ArgClass::Hfa { count, .. } if count >= 2 || size > 64
+                    crate::abi::ArgClass::Hfa { count, .. } if count >= 2 || size > ByteSize::new(8)
                 );
-                let is_two_fp_regs =
-                    is_hfa_param || size > 64 && size <= 128 && class.is_register_aggregate();
+                let is_two_fp_regs = is_hfa_param
+                    || size > ByteSize::new(8)
+                        && size <= ByteSize::new(16)
+                        && class.is_register_aggregate();
                 if is_two_fp_regs {
                     complex_params.push((
                         name,
@@ -2476,10 +2500,16 @@ impl<'a> Linearizer<'a> {
             if ret_kind == TypeKind::Void {
                 self.emit(Instruction::ret(None));
             } else {
-                // Return 0 as default, widened to actual return type
+                // Return 0 as default, widened to actual return type. An
+                // aggregate too large to have a value width goes back through
+                // the hidden pointer, and the value here is never read.
                 let ret_type = func.return_type;
-                let ret_size = self.types.size_bits(ret_type).max(32);
-                let zero = self.emit_const(0, ret_type);
+                let width = self
+                    .types
+                    .checked_value_bits(ret_type)
+                    .unwrap_or(Bits::ZERO);
+                let ret_size = width.max(Bits::new(32));
+                let zero = self.emit_const_at(0, ret_type, width);
                 self.emit(Instruction::ret_typed(Some(zero), ret_type, ret_size));
             }
         }
@@ -2529,12 +2559,12 @@ impl<'a> Linearizer<'a> {
             // `long double` -- is converted as `return` converts any value
             // (C17 6.8.6.4p3) and stored there.
             let val = self.linearize_converted(e, ret_type);
-            let size = self.types.size_bits(ret_type);
+            let size = self.types.value_bits(ret_type);
             self.emit(Instruction::store(val, sret_ptr, 0, ret_type, size));
             self.emit_return(Instruction::ret_typed(
                 Some(sret_ptr),
                 self.types.void_ptr_id,
-                64,
+                Bits::new(64),
             ));
             return;
         }
@@ -2543,7 +2573,7 @@ impl<'a> Linearizer<'a> {
         } else {
             self.linearize_lvalue(e)
         };
-        let struct_bytes = self.types.size_bytes(ret_type);
+        let struct_bytes = self.types.byte_size(ret_type);
         // The shared block copy, for the same two reasons the parameter
         // prologue uses it: a large struct becomes a `memcpy` call instead of
         // an unbounded unroll, and a size that is not a multiple of eight is
@@ -2553,14 +2583,14 @@ impl<'a> Linearizer<'a> {
             dst: Access::default(),
             src: Access::of(self.types, self.expr_type(e)),
         };
-        self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64, vol);
+        self.emit_block_copy(sret_ptr, src_addr, struct_bytes, vol);
 
         // The value is in the caller's buffer before any cleanup runs, so a
         // cleanup that scrubs the variable returned does not reach it.
         self.emit_return(Instruction::ret_typed(
             Some(sret_ptr),
             self.types.void_ptr_id,
-            64,
+            Bits::new(64),
         ));
     }
 
@@ -2577,7 +2607,7 @@ impl<'a> Linearizer<'a> {
     /// refuse every HFA and x87 return.
     pub(crate) fn returns_reg_aggregate(&self, typ: TypeId, conv: CallingConv) -> bool {
         matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
-            && self.types.size_bits(typ) > 64
+            && self.types.byte_size(typ) > ByteSize::new(8)
             && !self.returns_via_hidden_pointer(typ, conv)
     }
 
@@ -2605,7 +2635,7 @@ impl<'a> Linearizer<'a> {
             && self.types.is_complex(typ)
             && self
                 .types
-                .unsigned_of_size(self.types.size_bytes(typ))
+                .unsigned_of_size(self.types.byte_size(typ).to_usize())
                 .is_some()
     }
 
@@ -2615,7 +2645,7 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn emit_reg_aggregate_return(&mut self, e: &Expr, ret_type: TypeId) {
         let src_addr = self.linearize_lvalue(e);
         let src_addr = self.readable_storage(src_addr, self.expr_type(e));
-        let struct_size = self.types.size_bits(ret_type);
+        let struct_size = self.types.value_bits(ret_type);
         let abi = get_abi_for_conv(self.current_calling_conv, self.target);
         let ret_class = abi.classify_return(ret_type, self.types);
 
@@ -2643,7 +2673,7 @@ impl<'a> Linearizer<'a> {
         // sixteen bytes: a wider aggregate that is not returned by address
         // went through the hidden pointer.
         debug_assert!(
-            struct_size <= 128,
+            struct_size <= Bits::new(128),
             "a two-register return of {struct_size} bits"
         );
 
@@ -2654,12 +2684,12 @@ impl<'a> Linearizer<'a> {
             src_addr,
             0,
             self.types.long_id,
-            64,
+            Bits::new(64),
         ));
 
         // Load second portion (remaining bytes, up to 8)
         let high_temp = self.alloc_reg_pseudo();
-        let high_size = std::cmp::min(64, struct_size - 64);
+        let high_size = Bits::new(std::cmp::min(64, struct_size.get() - 64));
         self.emit(Instruction::load(
             high_temp,
             src_addr,
@@ -3177,7 +3207,7 @@ impl<'a> Linearizer<'a> {
             if !self.aggregate_travels_by_value(typ) {
                 return val;
             }
-            let size = self.types.size_bits(typ);
+            let size = self.types.value_bits(typ);
             let tmp = self.frame_temp("__rvalue", typ);
             self.emit(Instruction::store(val, tmp, 0, typ, size));
             return self.rvalue_addr(tmp, typ);
@@ -3225,7 +3255,7 @@ impl<'a> Linearizer<'a> {
             return value;
         }
         let copy = self.frame_temp_addr("__value_copy", typ);
-        let bytes = self.types.size_bytes(typ) as i64;
+        let bytes = self.types.byte_size(typ);
         let vol = BlockVolatility {
             dst: Access::default(),
             src: Access::of(self.types, typ),
@@ -3244,7 +3274,7 @@ impl<'a> Linearizer<'a> {
     /// lowered as a one-byte access that stored over its neighbour.
     pub(crate) fn aggregate_travels_by_value(&self, typ: TypeId) -> bool {
         matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
-            && (1..=64).contains(&self.types.size_bits(typ))
+            && (1..=8).contains(&self.types.byte_size(typ).get())
     }
 
     /// Whether an object of type `typ`, read as an rvalue, yields its
@@ -3327,7 +3357,7 @@ impl<'a> Linearizer<'a> {
             ObjectPlace::At(base, offset) => (base, offset),
         };
         let result = self.alloc_reg_pseudo();
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         self.emit(Instruction::load(result, base, offset, typ, size));
         result
     }
@@ -3357,7 +3387,7 @@ impl<'a> Linearizer<'a> {
                         // &a` pointed at the pointer and read back garbage.
                         if let Storage::Indirect(ptr_type) = storage {
                             let result = self.alloc_pseudo();
-                            let size = self.types.size_bits(ptr_type);
+                            let size = self.types.value_bits(ptr_type);
                             self.emit(Instruction::load(result, sym, 0, ptr_type, size));
                             return result;
                         }
@@ -3409,7 +3439,7 @@ impl<'a> Linearizer<'a> {
                     .find_member(struct_type, *member)
                     .unwrap_or_else(|| MemberInfo::standing_in(self.expr_type(expr)));
 
-                self.offset_address(base, member_info.offset as i64)
+                self.offset_address(base, member_info.offset.to_i64())
             }
             ExprKind::Arrow {
                 expr: inner,
@@ -3427,7 +3457,7 @@ impl<'a> Linearizer<'a> {
                     .find_member(struct_type, *member)
                     .unwrap_or_else(|| MemberInfo::standing_in(self.expr_type(expr)));
 
-                self.offset_address(ptr, member_info.offset as i64)
+                self.offset_address(ptr, member_info.offset.to_i64())
             }
             ExprKind::Index { array, index } => {
                 // arr[idx] as lvalue = arr + idx * sizeof(elem)
@@ -3451,8 +3481,8 @@ impl<'a> Linearizer<'a> {
                 // element type has no usable compile-time size, and this is
                 // the path that `a[i][j] = v` and `&a[i][j]` take.
                 let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
-                    let elem_size = self.types.size_bytes(elem_type);
-                    self.emit_const(elem_size as i128, self.types.long_id)
+                    let elem_size = self.types.byte_size(elem_type);
+                    self.emit_const(i128::from(elem_size.get()), self.types.long_id)
                 });
 
                 // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
@@ -3465,7 +3495,7 @@ impl<'a> Linearizer<'a> {
                     idx_extended,
                     elem_size_val,
                     self.types.long_id,
-                    64,
+                    Bits::new(64),
                 ));
 
                 let addr = self.alloc_pseudo();
@@ -3475,7 +3505,7 @@ impl<'a> Linearizer<'a> {
                     arr,
                     offset,
                     self.types.long_id,
-                    64,
+                    Bits::new(64),
                 ));
                 addr
             }
@@ -3500,7 +3530,8 @@ impl<'a> Linearizer<'a> {
                 if *op == UnaryOp::Real || !self.types.is_complex(op_typ) {
                     return addr;
                 }
-                let base_bytes = (self.types.size_bytes(self.types.complex_base(op_typ))) as i128;
+                let base_bytes =
+                    i128::from(self.types.byte_size(self.types.complex_base(op_typ)).get());
                 let off = self.emit_const(base_bytes, self.types.long_id);
                 let out = self.alloc_reg_pseudo();
                 let ptr_type = self.types.pointer_to(self.types.complex_base(op_typ));
@@ -3510,7 +3541,7 @@ impl<'a> Linearizer<'a> {
                     addr,
                     off,
                     ptr_type,
-                    self.target.pointer_width,
+                    Bits::new(self.target.pointer_width),
                 ));
                 out
             }
@@ -3595,12 +3626,12 @@ impl<'a> Linearizer<'a> {
             } else {
                 Opcode::FCvtS
             };
-            let dst_size = self.types.size_bits(cast_type);
+            let dst_size = self.types.value_bits(cast_type);
             let mut insn = Instruction::new(opcode)
                 .with_target(result)
                 .with_src(src)
                 .with_type_and_size(cast_type, dst_size);
-            insn.src_size = self.types.size_bits(src_type);
+            insn.src_size = self.types.value_bits(src_type);
             insn.src_typ = Some(src_type);
             self.emit(insn);
             result
@@ -3613,12 +3644,12 @@ impl<'a> Linearizer<'a> {
             } else {
                 Opcode::SCvtF
             };
-            let dst_size = self.types.size_bits(cast_type);
+            let dst_size = self.types.value_bits(cast_type);
             let mut insn = Instruction::new(opcode)
                 .with_target(result)
                 .with_src(src)
                 .with_type_and_size(cast_type, dst_size);
-            insn.src_size = self.types.size_bits(src_type);
+            insn.src_size = self.types.value_bits(src_type);
             insn.src_typ = Some(src_type);
             self.emit(insn);
             result
@@ -3630,8 +3661,8 @@ impl<'a> Linearizer<'a> {
             // and IEEE binary128 are both 128 bits wide here, and comparing
             // widths elided every `long double` <-> `__float128` cast, leaving
             // one format's bytes to be read as the other's.
-            let src_size = self.types.size_bits(src_type);
-            let dst_size = self.types.size_bits(cast_type);
+            let src_size = self.types.value_bits(src_type);
+            let dst_size = self.types.value_bits(cast_type);
             if self.types.kind(src_type) != self.types.kind(cast_type) {
                 let result = self.alloc_reg_pseudo();
                 let mut insn = Instruction::new(Opcode::FCvtF)
@@ -3709,7 +3740,10 @@ impl<'a> Linearizer<'a> {
         if let Some(bf) = member_info.bitfield() {
             return self.emit_bitfield_load(base, bf, access_typ);
         }
-        self.read_object(ObjectPlace::At(base, member_info.offset as i64), access_typ)
+        self.read_object(
+            ObjectPlace::At(base, member_info.offset.to_i64()),
+            access_typ,
+        )
     }
 
     /// Bytes that one step of `ptr_expr` spans, as a run-time value.
@@ -3727,8 +3761,8 @@ impl<'a> Linearizer<'a> {
             .types
             .arithmetic_pointee(ptr_typ)
             .unwrap_or(self.types.char_id);
-        let elem_size = self.types.size_bytes(elem_type);
-        self.emit_const(elem_size as i128, self.types.long_id)
+        let elem_size = self.types.byte_size(elem_type);
+        self.emit_const(i128::from(elem_size.get()), self.types.long_id)
     }
 
     /// Record the extents of a variably-modified `array_type`, evaluating each
@@ -3792,7 +3826,13 @@ impl<'a> Linearizer<'a> {
             // Widen to 64-bit before storing.
             let dim_expr_typ = size_expr.typ.unwrap_or(self.types.int_id);
             let dim_size = self.emit_convert(dim_size, dim_expr_typ, ulong_type);
-            self.emit(Instruction::store(dim_size, dim_sym_id, 0, ulong_type, 64));
+            self.emit(Instruction::store(
+                dim_size,
+                dim_sym_id,
+                0,
+                ulong_type,
+                Bits::new(64),
+            ));
             dims.push(VmDim::Sym(dim_sym_id));
         }
 
@@ -3813,7 +3853,7 @@ impl<'a> Linearizer<'a> {
                     // Reload at the point of use: the extent lives in a hidden
                     // local precisely so it survives across basic blocks.
                     let loaded = self.alloc_pseudo();
-                    self.emit(Instruction::load(loaded, sym, 0, ulong, 64));
+                    self.emit(Instruction::load(loaded, sym, 0, ulong, Bits::new(64)));
                     loaded
                 }
             };
@@ -3827,7 +3867,7 @@ impl<'a> Linearizer<'a> {
                         prev,
                         val,
                         ulong,
-                        64,
+                        Bits::new(64),
                     ));
                     result
                 }
@@ -3850,7 +3890,7 @@ impl<'a> Linearizer<'a> {
         let ulong = self.types.ulong_id;
         let acc = self.vm_extent_product(dims);
 
-        let elem_size = self.types.size_bytes(elem) as i128;
+        let elem_size = i128::from(self.types.byte_size(elem).get());
         let elem_size_val = self.emit_const(elem_size, ulong);
         let total = self.alloc_pseudo();
         self.emit(Instruction::binop(
@@ -3859,7 +3899,7 @@ impl<'a> Linearizer<'a> {
             acc.expect("a Sym extent guarantees an accumulator"),
             elem_size_val,
             ulong,
-            64,
+            Bits::new(64),
         ));
         Some(total)
     }
@@ -3935,7 +3975,7 @@ impl<'a> Linearizer<'a> {
             .fp_format(typ)
             .expect("issignaling takes a real floating operand");
         let image = self.frame_temp_addr("__snan", typ);
-        let bits = self.types.size_bits(typ);
+        let bits = self.types.value_bits(typ);
         self.emit(Instruction::store(x, image, 0, typ, bits));
         let u64t = self.types.ulonglong_id;
         match fmt {
@@ -3948,17 +3988,17 @@ impl<'a> Linearizer<'a> {
                 let zero = self.emit_const(0, u64t);
                 let lo_set = self.emit_compare(Opcode::SetNe, lo, zero, u64t);
                 let lo_set = self.emit_convert(lo_set, self.types.int_id, u64t);
-                let hi = self.emit_int_binop(Opcode::Or, hi, lo_set, u64t, 64);
+                let hi = self.emit_int_binop(Opcode::Or, hi, lo_set, u64t, Bits::new(64));
                 self.ieee_word_is_signaling(hi, u64t, 64, 112 - 64)
             }
             _ => {
-                let word_typ = match bits {
+                let word_typ = match bits.get() {
                     16 => self.types.ushort_id,
                     32 => self.types.uint_id,
                     _ => u64t,
                 };
                 let word = self.load_word(image, 0, word_typ);
-                let (word, word_typ) = match bits {
+                let (word, word_typ) = match bits.get() {
                     16 => {
                         let uint = self.types.uint_id;
                         (self.emit_convert(word, word_typ, uint), uint)
@@ -3966,7 +4006,7 @@ impl<'a> Linearizer<'a> {
                     _ => (word, word_typ),
                 };
                 let fraction = fmt.precision() - 1;
-                self.ieee_word_is_signaling(word, word_typ, bits, fraction)
+                self.ieee_word_is_signaling(word, word_typ, bits.get(), fraction)
             }
         }
     }
@@ -3974,7 +4014,7 @@ impl<'a> Linearizer<'a> {
     /// One integer of type `typ` read from `addr + offset`.
     fn load_word(&mut self, addr: PseudoId, offset: i64, typ: TypeId) -> PseudoId {
         let value = self.alloc_reg_pseudo();
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         self.emit(Instruction::load(value, addr, offset, typ, size));
         value
     }
@@ -3995,7 +4035,7 @@ impl<'a> Linearizer<'a> {
         width: u32,
         fraction: u32,
     ) -> PseudoId {
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         let magnitude_mask = (1i128 << (width - 1)) - 1;
         let quiet = 1i128 << (fraction - 1);
         let exponent = magnitude_mask & !((1i128 << fraction) - 1);
@@ -4027,13 +4067,13 @@ impl<'a> Linearizer<'a> {
         let sign_exp = self.load_word(image, 8, self.types.ushort_id);
         let sign_exp = self.emit_convert(sign_exp, self.types.ushort_id, uint);
         let exp_mask = self.emit_const(0x7fff, uint);
-        let exp = self.emit_int_binop(Opcode::And, sign_exp, exp_mask, uint, 32);
+        let exp = self.emit_int_binop(Opcode::And, sign_exp, exp_mask, uint, Bits::new(32));
 
         // A NaN with the integer bit set: flipping the quiet bit puts a
         // signalling one above integer-and-quiet bits alone.
         let all_ones = self.emit_compare(Opcode::SetEq, exp, exp_mask, uint);
         let quiet = self.emit_const(QUIET_BIT, u64t);
-        let flipped = self.emit_int_binop(Opcode::Xor, sig, quiet, u64t, 64);
+        let flipped = self.emit_int_binop(Opcode::Xor, sig, quiet, u64t, Bits::new(64));
         let threshold = self.emit_const(INTEGER_BIT | QUIET_BIT, u64t);
         let payload = self.emit_compare(Opcode::SetA, flipped, threshold, u64t);
         let nan = self.emit_bool_combine(Opcode::And, all_ones, payload);
@@ -4113,7 +4153,14 @@ impl<'a> Linearizer<'a> {
     fn emit_bool_combine(&mut self, op: Opcode, lhs: PseudoId, rhs: PseudoId) -> PseudoId {
         let int_typ = self.types.int_id;
         let result = self.alloc_pseudo();
-        self.emit(Instruction::binop(op, result, lhs, rhs, int_typ, 32));
+        self.emit(Instruction::binop(
+            op,
+            result,
+            lhs,
+            rhs,
+            int_typ,
+            Bits::new(32),
+        ));
         result
     }
 
@@ -4123,7 +4170,7 @@ impl<'a> Linearizer<'a> {
     /// represent at all -- carrying literals at target precision is what makes
     /// `isnormal` on a `long double` expressible.
     fn smallest_normal(&self, typ: TypeId) -> FloatVal {
-        let exp = match self.types.size_bits(typ) {
+        let exp = match self.types.value_bits(typ).get() {
             0..=16 => -14,   // binary16
             17..=32 => -126, // binary32
             33..=64 => -1022,
@@ -4173,7 +4220,14 @@ impl<'a> Linearizer<'a> {
             (is_nan, nan_code),
         ] {
             let next = self.alloc_pseudo();
-            self.emit(Instruction::select(next, cond, code, acc, int_typ, 32));
+            self.emit(Instruction::select(
+                next,
+                cond,
+                code,
+                acc,
+                int_typ,
+                Bits::new(32),
+            ));
             acc = next;
         }
         acc
@@ -4278,8 +4332,8 @@ impl<'a> Linearizer<'a> {
         // covers every depth -- `b[i]`, `b[i][j]`, ... -- and locals and
         // parameters alike, because both record their element type's extents.
         let elem_size_val = self.vm_index_stride(ptr_expr).unwrap_or_else(|| {
-            let elem_size = self.types.size_bytes(elem_type);
-            self.emit_const(elem_size as i128, self.types.long_id)
+            let elem_size = self.types.byte_size(elem_type);
+            self.emit_const(i128::from(elem_size.get()), self.types.long_id)
         });
 
         // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
@@ -4292,7 +4346,7 @@ impl<'a> Linearizer<'a> {
             idx_extended,
             elem_size_val,
             ptr_typ,
-            64,
+            Bits::new(64),
         ));
 
         let addr = self.alloc_pseudo();
@@ -4302,7 +4356,7 @@ impl<'a> Linearizer<'a> {
             arr,
             offset,
             ptr_typ,
-            64,
+            Bits::new(64),
         ));
 
         self.read_object(ObjectPlace::At(addr, 0), elem_type)
@@ -4348,10 +4402,10 @@ impl<'a> Linearizer<'a> {
             self.types.pointer_to(typ),
         ));
         if by_address {
-            let bytes = self.types.size_bytes(typ) as i64;
+            let bytes = self.types.byte_size(typ);
             self.emit_block_copy(copy_addr, val, bytes, vol);
         } else {
-            let size = self.types.size_bits(typ);
+            let size = self.types.value_bits(typ);
             self.emit(Instruction::store(val, copy, 0, typ, size));
         }
         copy_addr
@@ -4374,13 +4428,13 @@ impl<'a> Linearizer<'a> {
             return self.argument_copy(val, passed, by_address, BlockVolatility::default());
         }
         if self.complex_travels_as_bits(passed, conv) {
-            let bytes = self.types.size_bytes(passed);
+            let bytes = self.types.byte_size(passed).to_usize();
             let bits = self
                 .types
                 .unsigned_of_size(bytes)
                 .expect("checked by complex_travels_as_bits");
             let loaded = self.alloc_reg_pseudo();
-            let size = self.types.size_bits(bits);
+            let size = self.types.value_bits(bits);
             self.emit(Instruction::load(loaded, val, 0, bits, size));
             return loaded;
         }
@@ -4521,17 +4575,17 @@ impl<'a> Linearizer<'a> {
                 vals: arg_vals,
                 types: arg_types_vec,
             };
-            self.build_call(target, call_args, result, (ptr_typ, 64), facts);
+            self.build_call(target, call_args, result, (ptr_typ, Bits::new(64)), facts);
             // A scalar returned through the pointer is read back as the
             // call's value; anything else is used by address, as stored.
             if self.types.is_scalar(typ) && !self.types.is_complex(typ) {
                 let val = self.alloc_reg_pseudo();
-                let size = self.types.size_bits(typ);
+                let size = self.types.value_bits(typ);
                 self.emit(Instruction::load(val, result_sym, 0, typ, size));
                 return val;
             }
         } else {
-            let ret_size = self.types.size_bits(typ);
+            let ret_size = self.types.value_bits(typ);
             let call_args = CallArgs {
                 vals: arg_vals,
                 types: arg_types_vec,
@@ -4745,7 +4799,7 @@ impl<'a> Linearizer<'a> {
             // value of that type.
             self.lower_vector_arg(a, conv)
         } else if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
-            && (self.types.size_bits(arg_type) > 64
+            && (self.types.byte_size(arg_type) > ByteSize::new(8)
                 || self.passed_by_reference(arg_type, conv)
                 || self.passed_in_memory(arg_type, conv))
         {
@@ -4830,10 +4884,9 @@ impl<'a> Linearizer<'a> {
         arg_type: TypeId,
         conv: CallingConv,
     ) -> (PseudoId, TypeId) {
-        let size_bits = self.types.size_bits(arg_type);
         let abi = get_abi_for_conv(conv, self.target);
         let class = abi.classify_param(arg_type, self.types);
-        let passed = if size_bits > 128 {
+        let passed = if self.types.byte_size(arg_type) > ByteSize::new(16) {
             // Large struct (> 16 bytes): keep struct type so ABI classifies as
             // Indirect/MEMORY. The pseudo is the struct's address: System V
             // copies its bytes to the stack there, and AAPCS64 is handed a
@@ -4900,8 +4953,10 @@ impl<'a> Linearizer<'a> {
         // - Int→FP: uint32_t→double (e.g., log10(uint32_t_val))
         // - FP→Int: rare but legal
         if let Some(param_type) = param {
-            let arg_size = self.types.size_bits(arg_type);
-            let param_size = self.types.size_bits(param_type);
+            // Compared only between two integers or two floating types; an
+            // aggregate may have no value width at all.
+            let arg_size = self.types.checked_value_bits(arg_type);
+            let param_size = self.types.checked_value_bits(param_type);
             let arg_is_int = self.types.is_integer(arg_type);
             let param_is_int = self.types.is_integer(param_type);
             let arg_is_fp = self.types.is_float(arg_type);
@@ -4966,7 +5021,7 @@ impl<'a> Linearizer<'a> {
         target: CallTarget,
         args: CallArgs,
         result: PseudoId,
-        ret: (TypeId, u32),
+        ret: (TypeId, Bits),
         facts: CallFacts,
     ) {
         let (ret_typ, ret_size) = ret;
@@ -5039,7 +5094,7 @@ impl<'a> Linearizer<'a> {
                     .with_target(temp)
                     .with_src(val)
                     .with_type(typ)
-                    .with_size(self.types.size_bits(typ)),
+                    .with_size(self.types.value_bits(typ)),
             );
             temp
         } else {
@@ -5067,7 +5122,7 @@ impl<'a> Linearizer<'a> {
             Opcode::Sub
         };
         let arith_type = if is_ptr { self.types.long_id } else { typ };
-        let arith_size = self.types.size_bits(arith_type);
+        let arith_size = self.types.value_bits(arith_type);
         self.emit(Instruction::binop(
             opcode, result, val, delta, arith_type, arith_size,
         ));
@@ -5157,7 +5212,7 @@ impl<'a> Linearizer<'a> {
                 left_val,
                 right_val,
                 self.types.long_id,
-                64,
+                Bits::new(64),
             ));
 
             let scale = self.pointer_step_bytes(left, left_typ);
@@ -5168,7 +5223,7 @@ impl<'a> Linearizer<'a> {
                 byte_diff,
                 scale,
                 self.types.long_id,
-                64,
+                Bits::new(64),
             ));
             result
         } else if is_ptr_arith {
@@ -5200,7 +5255,7 @@ impl<'a> Linearizer<'a> {
                 int_val_extended,
                 scale,
                 self.types.long_id,
-                64,
+                Bits::new(64),
             ));
 
             // Add (or subtract) to pointer
@@ -5216,7 +5271,7 @@ impl<'a> Linearizer<'a> {
                 ptr_val,
                 scaled_offset,
                 self.types.long_id,
-                64,
+                Bits::new(64),
             ));
             result
         } else if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
@@ -5292,10 +5347,10 @@ impl<'a> Linearizer<'a> {
             };
         }
         let base_typ = self.types.complex_base(op_typ);
-        let base_bits = self.types.size_bits(base_typ);
+        let base_bits = self.types.value_bits(base_typ);
         let offset = match half {
             ComplexHalf::Real => 0,
-            ComplexHalf::Imag => (base_bits / 8) as i64,
+            ComplexHalf::Imag => i64::from(base_bits.bytes_exact()),
         };
         let addr = self.complex_operand_addr(operand);
         let value = self.alloc_pseudo();
@@ -5371,7 +5426,7 @@ impl<'a> Linearizer<'a> {
         match (func, args) {
             (InlineLibraryFn::IntAbs, [arg]) => {
                 let arg_val = self.linearize_expr(arg);
-                let size = self.types.size_bits(typ);
+                let size = self.types.value_bits(typ);
                 self.emit_int_abs(arg_val, typ, size)
             }
             (InlineLibraryFn::Fabs, [arg]) => {
@@ -5433,7 +5488,7 @@ impl<'a> Linearizer<'a> {
             MemoryFn::MoveSourceFirst => (BlockOp::Move, b, a),
         };
         let ptr = self.types.void_ptr_id;
-        let ptr_bits = self.types.size_bits(ptr);
+        let ptr_bits = self.types.value_bits(ptr);
         let result = self.alloc_pseudo();
         let callee = self.library_function_name(op.c_name());
         self.emit(
@@ -5537,7 +5592,7 @@ impl<'a> Linearizer<'a> {
             } else {
                 Opcode::Sub
             };
-            let size = self.types.size_bits(typ);
+            let size = self.types.value_bits(typ);
             self.emit(Instruction::binop(
                 opcode, result, val, increment, typ, size,
             ));
@@ -5637,7 +5692,7 @@ impl<'a> Linearizer<'a> {
                     && !self.types.va_list_is_pointer() =>
                 {
                     let ptr = self.alloc_reg_pseudo();
-                    let ptr_size = self.types.size_bits(ptr_type);
+                    let ptr_size = self.types.value_bits(ptr_type);
                     self.emit(Instruction::load(ptr, sym, 0, ptr_type, ptr_size));
                     ObjectPlace::At(ptr, 0)
                 }
@@ -5759,7 +5814,7 @@ impl<'a> Linearizer<'a> {
     ///
     /// Kept separate from `linearize_ternary`'s general path rather than
     /// folded into it: the phi here merges *pointers*, so it is a
-    /// pointer-width phi of `pointer_to(result_typ)`, not a `size_bits`-wide
+    /// pointer-width phi of `pointer_to(result_typ)`, not a `value_bits`-wide
     /// phi of the complex type.
     fn linearize_complex_ternary(
         &mut self,
@@ -5770,7 +5825,7 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         let cond_bool = self.linearize_condition(cond);
         let ptr_typ = self.types.pointer_to(result_typ);
-        let ptr_bits = self.target.pointer_width;
+        let ptr_bits = Bits::new(self.target.pointer_width);
         self.emit_diamond(
             cond_bool,
             ptr_typ,
@@ -5831,16 +5886,19 @@ impl<'a> Linearizer<'a> {
         ) && !self.aggregate_travels_by_value(result_typ))
             || self.types.is_vector(result_typ);
         let (merge_typ, size) = if aggregate {
-            (self.types.pointer_to(result_typ), self.target.pointer_width)
+            (
+                self.types.pointer_to(result_typ),
+                Bits::new(self.target.pointer_width),
+            )
         } else if self.types.kind(result_typ) == TypeKind::Function {
-            (result_typ, 64)
+            (result_typ, Bits::new(64))
         } else {
-            (result_typ, self.types.size_bits(result_typ))
+            (result_typ, self.types.value_bits(result_typ))
         };
 
         if self.is_speculatable_arm(then_expr, result_typ)
             && self.is_speculatable_arm(else_expr, result_typ)
-            && size <= 64
+            && size <= Bits::new(64)
         {
             // Pure: use Select instruction (enables cmov/csel)
             let cond_bool = self.linearize_condition(cond);
@@ -5920,7 +5978,7 @@ impl<'a> Linearizer<'a> {
         };
 
         let ptr_typ = self.types.pointer_to(result_typ);
-        let ptr_bits = self.target.pointer_width;
+        let ptr_bits = Bits::new(self.target.pointer_width);
         self.emit_diamond(
             cond_bool,
             ptr_typ,
@@ -5972,9 +6030,9 @@ impl<'a> Linearizer<'a> {
         }
 
         let size = if self.types.kind(result_typ) == TypeKind::Function {
-            64
+            Bits::new(64)
         } else {
-            self.types.size_bits(result_typ)
+            self.types.value_bits(result_typ)
         };
 
         // Evaluated here, before either form below, so there is exactly one
@@ -5984,7 +6042,7 @@ impl<'a> Linearizer<'a> {
 
         // The left operand converted is the value taken where it is nonzero,
         // and converting a zero is exact, so only the right one is asked.
-        if self.is_speculatable_arm(else_expr, result_typ) && size <= 64 {
+        if self.is_speculatable_arm(else_expr, result_typ) && size <= Bits::new(64) {
             // No branch here, so both arms are converted in place.
             let then_val = self.convert_conditional_arm(cond_val, cond_typ, result_typ);
             let mut else_val = self.linearize_expr(else_expr);
@@ -6066,7 +6124,7 @@ impl<'a> Linearizer<'a> {
             val,
             shift,
             signed_typ,
-            width,
+            Bits::new(width),
         ));
 
         // x ^ sign: x when non-negative, ~x when negative. Top bit is clear.
@@ -6077,7 +6135,7 @@ impl<'a> Linearizer<'a> {
             val,
             sign,
             val_typ,
-            width,
+            Bits::new(width),
         ));
 
         // (folded << 1) | 1 -- never zero, and one bit shorter to count.
@@ -6089,7 +6147,7 @@ impl<'a> Linearizer<'a> {
             folded,
             one,
             val_typ,
-            width,
+            Bits::new(width),
         ));
         let one_again = self.emit_const(1, val_typ);
         let nonzero = self.alloc_pseudo();
@@ -6099,7 +6157,7 @@ impl<'a> Linearizer<'a> {
             shifted,
             one_again,
             val_typ,
-            width,
+            Bits::new(width),
         ));
 
         let op = if width == 32 {
@@ -6124,9 +6182,9 @@ impl<'a> Linearizer<'a> {
     fn emit_bit_count(&mut self, op: Opcode, val: PseudoId, operand: TypeId) -> PseudoId {
         let result = self.alloc_pseudo();
         let int = self.types.int_id;
-        let mut insn = Instruction::unop(op, result, val, int, self.types.size_bits(int));
+        let mut insn = Instruction::unop(op, result, val, int, self.types.value_bits(int));
         insn.src_typ = Some(operand);
-        insn.src_size = self.types.size_bits(operand);
+        insn.src_size = self.types.value_bits(operand);
         self.emit(insn);
         result
     }
@@ -6176,7 +6234,7 @@ impl<'a> Linearizer<'a> {
                     .with_src(ap_addr)
                     .with_func(self.str(*last_param).to_string())
                     .with_type(self.types.void_id)
-                    .with_size(0);
+                    .with_size(Bits::new(0));
                 self.emit(insn);
                 result
             }
@@ -6212,7 +6270,7 @@ impl<'a> Linearizer<'a> {
                 let dest_addr = self.linearize_lvalue(dest);
                 let val = self.linearize_expr(src);
                 let ptr = self.types.ms_va_list_id;
-                self.emit(Instruction::store(val, dest_addr, 0, ptr, 64));
+                self.emit(Instruction::store(val, dest_addr, 0, ptr, Bits::new(64)));
                 self.alloc_pseudo()
             }
 
@@ -6220,7 +6278,12 @@ impl<'a> Linearizer<'a> {
                 // va_arg(ap, type)
                 // Get address of ap (it's an lvalue)
                 let ap_addr = self.linearize_lvalue(ap);
-                let arg_size = self.types.size_bits(*arg_type);
+                // An aggregate's `VaArg` lands in the local below, and nothing
+                // reads its width: one too large to have one records none.
+                let arg_size = self
+                    .types
+                    .checked_value_bits(*arg_type)
+                    .unwrap_or(Bits::ZERO);
 
                 // Every aggregate gets a local of its own, whatever its size,
                 // and the backend writes the argument into it -- the same
@@ -6266,7 +6329,7 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(ap_addr)
                     .with_type(self.types.void_id)
-                    .with_size(0);
+                    .with_size(Bits::new(0));
                 self.emit(insn);
                 result
             }
@@ -6282,7 +6345,7 @@ impl<'a> Linearizer<'a> {
                     .with_src(dest_addr)
                     .with_src(src_addr)
                     .with_type(self.types.void_id)
-                    .with_size(0);
+                    .with_size(Bits::new(0));
                 self.emit(insn);
                 result
             }
@@ -6305,7 +6368,7 @@ impl<'a> Linearizer<'a> {
     fn linearize_ms_va_arg(&mut self, ap_addr: PseudoId, typ: TypeId) -> PseudoId {
         let ptr = self.types.ms_va_list_id;
         let slot = self.alloc_reg_pseudo();
-        self.emit(Instruction::load(slot, ap_addr, 0, ptr, 64));
+        self.emit(Instruction::load(slot, ap_addr, 0, ptr, Bits::new(64)));
         let step = self.emit_const(crate::abi::WIN64_POSITION_BYTES as i128, self.types.long_id);
         let next = self.alloc_reg_pseudo();
         self.emit(Instruction::binop(
@@ -6314,24 +6377,24 @@ impl<'a> Linearizer<'a> {
             slot,
             step,
             self.types.long_id,
-            64,
+            Bits::new(64),
         ));
-        self.emit(Instruction::store(next, ap_addr, 0, ptr, 64));
+        self.emit(Instruction::store(next, ap_addr, 0, ptr, Bits::new(64)));
         let at = if self.passed_by_reference(typ, CallingConv::Win64) {
             let target = self.alloc_reg_pseudo();
-            self.emit(Instruction::load(target, slot, 0, ptr, 64));
+            self.emit(Instruction::load(target, slot, 0, ptr, Bits::new(64)));
             target
         } else {
             slot
         };
         if self.types.is_aggregate_or_complex(typ) {
             let local = self.frame_temp("__vaarg", typ);
-            let bytes = self.types.size_bytes(typ) as i64;
+            let bytes = self.types.byte_size(typ);
             self.emit_block_copy(local, at, bytes, BlockVolatility::default());
             return local;
         }
         let val = self.alloc_reg_pseudo();
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         self.emit(Instruction::load(val, at, 0, typ, size));
         val
     }
@@ -6346,7 +6409,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Bswap16)
                     .with_target(result)
                     .with_src(arg_val)
-                    .with_size(16)
+                    .with_size(Bits::new(16))
                     .with_type(self.types.ushort_id);
                 self.emit(insn);
                 result
@@ -6359,7 +6422,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Bswap32)
                     .with_target(result)
                     .with_src(arg_val)
-                    .with_size(32)
+                    .with_size(Bits::new(32))
                     .with_type(self.types.uint_id);
                 self.emit(insn);
                 result
@@ -6372,7 +6435,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Bswap64)
                     .with_target(result)
                     .with_src(arg_val)
-                    .with_size(64)
+                    .with_size(Bits::new(64))
                     .with_type(self.types.ulonglong_id);
                 self.emit(insn);
                 result
@@ -6497,7 +6560,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Setjmp)
                     .with_target(result)
                     .with_src(env_val)
-                    .with_type_and_size(self.types.int_id, 32);
+                    .with_type_and_size(self.types.int_id, Bits::new(32));
                 self.emit(insn);
                 result
             }
@@ -6545,7 +6608,7 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         let ptr_type = self.expr_type(ptr);
         let elem_typ = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-        let bits = self.types.size_bits(elem_typ);
+        let bits = self.types.value_bits(elem_typ);
 
         let addr = self.linearize_expr(ptr);
         let value_typ = self.expr_type(val);
@@ -6618,7 +6681,7 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         let ptr_type = self.expr_type(ptr);
         let elem_typ = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-        let bits = self.types.size_bits(elem_typ);
+        let bits = self.types.value_bits(elem_typ);
 
         let addr = self.linearize_expr(ptr);
         let exp_typ = self.expr_type(expected);
@@ -6674,7 +6737,7 @@ impl<'a> Linearizer<'a> {
         let ptr_type = self.expr_type(ptr);
         let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
         self.refuse_atomic_in_segment(elem_type);
-        let size = self.types.size_bits(elem_type);
+        let size = self.types.value_bits(elem_type);
         let result = self.alloc_pseudo();
 
         let mut insn = Instruction::new(op).with_target(result).with_src(ptr_val);
@@ -6734,7 +6797,7 @@ impl<'a> Linearizer<'a> {
                 let memory_order = self.cas_order(succ_order, fail_order);
                 let ptr_type = self.expr_type(ptr);
                 let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
-                let elem_size = self.types.size_bits(elem_type);
+                let elem_size = self.types.value_bits(elem_type);
                 self.emit_atomic_cas(
                     ptr_val,
                     expected_ptr,
@@ -6813,7 +6876,7 @@ impl<'a> Linearizer<'a> {
             CheckedOp::Mul => BinaryOp::Mul,
         };
         let r = self.emit_binary(bin, a, b, dst, dst);
-        let dst_size = self.types.size_bits(dst);
+        let dst_size = self.types.value_bits(dst);
         self.emit(Instruction::store(r, addr, 0, dst, dst_size));
 
         let int_id = self.types.int_id;
@@ -6958,7 +7021,7 @@ impl<'a> Linearizer<'a> {
             crate::parse::ast::CheckedOp::Sub => BinaryOp::Sub,
             crate::parse::ast::CheckedOp::Mul => BinaryOp::Mul,
         };
-        if self.types.size_bits(dst_typ) >= 128 {
+        if self.types.value_bits(dst_typ) >= Bits::new(128) {
             // A 128-bit destination has no wider type to compute in,
             // so "did narrowing lose anything" would compare a value
             // to itself -- `linearize_checked_arith_wide` below
@@ -6976,7 +7039,7 @@ impl<'a> Linearizer<'a> {
             // `w` for an unsigned operand, `w-1` for a signed one --
             // and require the result to fit `wide`.
             let magnitude_bits = |t: TypeId| {
-                let w = self.types.size_bits(t);
+                let w = self.types.value_bits(t).get();
                 if self.types.is_unsigned(t) {
                     w
                 } else {
@@ -6995,10 +7058,12 @@ impl<'a> Linearizer<'a> {
                 // operand, i.e. `ma.max(mb) + 1 <= room`.
                 _ => ma.max(mb) < room,
             };
-            if self.types.size_bits(a_typ) < 128 && self.types.size_bits(b_typ) < 128 && exact_fits
+            if self.types.value_bits(a_typ) < Bits::new(128)
+                && self.types.value_bits(b_typ) < Bits::new(128)
+                && exact_fits
             {
                 let exact = self.emit_binary(bin, aw, bw, wide, wide);
-                let dst_size = self.types.size_bits(dst_typ);
+                let dst_size = self.types.value_bits(dst_typ);
                 let narrowed = self.emit_convert(exact, wide, dst_typ);
                 if store {
                     self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
@@ -7022,7 +7087,7 @@ impl<'a> Linearizer<'a> {
         let exact = self.emit_binary(bin, aw, bw, wide, wide);
 
         let narrowed = self.emit_convert(exact, wide, dst_typ);
-        let dst_size = self.types.size_bits(dst_typ);
+        let dst_size = self.types.value_bits(dst_typ);
         if store {
             self.emit(Instruction::store(narrowed, addr, 0, dst_typ, dst_size));
         }
@@ -7044,11 +7109,12 @@ impl<'a> Linearizer<'a> {
                 if let (Some(size_sym), Some(elem_type)) = (info.vla_size_sym, info.vla_elem_type) {
                     // VLA: compute sizeof at runtime as num_elements * sizeof(element)
                     let result_typ = self.types.ulong_id;
-                    let elem_size = self.types.size_bytes(elem_type) as i64;
+                    let elem_size = self.types.byte_size(elem_type).to_i64();
 
                     // Load the stored number of elements
                     let num_elements = self.alloc_pseudo();
-                    let load_insn = Instruction::load(num_elements, size_sym, 0, result_typ, 64);
+                    let load_insn =
+                        Instruction::load(num_elements, size_sym, 0, result_typ, Bits::new(64));
                     self.emit(load_insn);
 
                     // Multiply by element size
@@ -7058,7 +7124,7 @@ impl<'a> Linearizer<'a> {
                         .with_target(result)
                         .with_src(num_elements)
                         .with_src(elem_size_const)
-                        .with_size(64)
+                        .with_size(Bits::new(64))
                         .with_type(result_typ);
                     self.emit(mul_insn);
                     return result;
@@ -7074,10 +7140,10 @@ impl<'a> Linearizer<'a> {
 
         // Non-VLA: compute size at compile time
         let inner_typ = self.expr_type(inner_expr);
-        let size = self.types.size_bytes(inner_typ);
+        let size = self.types.byte_size(inner_typ);
         // sizeof returns size_t, which is unsigned long in our implementation
         let result_typ = self.types.ulong_id;
-        self.emit_const(size as i128, result_typ)
+        self.emit_const(i128::from(size.get()), result_typ)
     }
 
     /// GNU `&&label`: the address of a label, for a computed goto.
@@ -7146,7 +7212,7 @@ impl<'a> Linearizer<'a> {
             Some(VmDim::Const(n)) => self.emit_const(n as i128, ulong),
             Some(VmDim::Sym(sym)) => {
                 let loaded = self.alloc_pseudo();
-                self.emit(Instruction::load(loaded, sym, 0, ulong, 64));
+                self.emit(Instruction::load(loaded, sym, 0, ulong, Bits::new(64)));
                 loaded
             }
             // The declaration that records an extent -- a typedef's, or
@@ -7163,8 +7229,8 @@ impl<'a> Linearizer<'a> {
         // __builtin_complex(real, imag) - construct complex value
         let complex_typ = self.expr_type(expr);
         let base_typ = self.types.complex_base(complex_typ);
-        let base_bits = self.types.size_bits(base_typ);
-        let base_bytes = (base_bits / 8) as i64;
+        let base_bits = self.types.value_bits(base_typ);
+        let base_bytes = i64::from(base_bits.bytes_exact());
 
         let real_val = self.linearize_expr(real);
         let imag_val = self.linearize_expr(imag);
@@ -7230,7 +7296,7 @@ impl<'a> Linearizer<'a> {
                     Instruction::new(Opcode::ConstantP)
                         .with_target(result)
                         .with_src(operand)
-                        .with_type_and_size(self.types.int_id, 32),
+                        .with_type_and_size(self.types.int_id, Bits::new(32)),
                 );
                 result
             }
@@ -7255,7 +7321,7 @@ impl<'a> Linearizer<'a> {
                     )))
                     .with_target(result)
                     .with_src(operand)
-                    .with_type_and_size(size_t, self.types.size_bits(size_t)),
+                    .with_type_and_size(size_t, self.types.value_bits(size_t)),
                 );
                 result
             }
@@ -7267,7 +7333,7 @@ impl<'a> Linearizer<'a> {
                 self.emit(
                     Instruction::new(Opcode::VaArgPackLen)
                         .with_target(result)
-                        .with_type_and_size(self.types.int_id, 32),
+                        .with_type_and_size(self.types.int_id, Bits::new(32)),
                 );
                 result
             }
@@ -7422,8 +7488,8 @@ impl<'a> Linearizer<'a> {
                     }
                 }
 
-                let size = self.types.size_bytes(*typ);
-                self.emit_const(size as i128, result_typ)
+                let size = self.types.byte_size(*typ);
+                self.emit_const(i128::from(size.get()), result_typ)
             }
 
             ExprKind::SizeofExpr(inner_expr) => self.linearize_sizeof_expr(inner_expr),
@@ -7432,7 +7498,7 @@ impl<'a> Linearizer<'a> {
                 let align = self.types.alignof_value(*typ);
                 // _Alignof returns size_t
                 let result_typ = self.types.ulong_id;
-                self.emit_const(align as i128, result_typ)
+                self.emit_const(i128::from(align.bytes()), result_typ)
             }
 
             ExprKind::AlignofExpr(inner_expr) => {
@@ -7440,7 +7506,7 @@ impl<'a> Linearizer<'a> {
                 let align = self.types.alignof_value(inner_typ);
                 // _Alignof returns size_t
                 let result_typ = self.types.ulong_id;
-                self.emit_const(align as i128, result_typ)
+                self.emit_const(i128::from(align.bytes()), result_typ)
             }
 
             ExprKind::Comma(exprs) => {

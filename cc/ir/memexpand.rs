@@ -33,6 +33,7 @@ use super::build::Builder;
 use super::facts::ConstMap;
 use super::{Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeTable};
+use crate::units::{Bits, ByteSize};
 
 /// The most bytes a `memcpy` or `memset` of a constant length is expanded
 /// into, and the most an aggregate copy the linearizer emits is.
@@ -47,7 +48,7 @@ use crate::types::{TypeId, TypeTable};
 /// 256 KB struct passed by value -- `struct big { int i[0x10000]; }`, which
 /// gcc.c-torture's pr28982b does -- once produced 65,536 IR instructions and
 /// a 65-second compile against gcc's one `call memcpy`.
-pub(crate) const INLINE_LIMIT_BYTES: i64 = 128;
+pub(crate) const INLINE_LIMIT_BYTES: ByteSize = ByteSize::new(128);
 
 /// The most bytes a `memmove` of a constant length is expanded into.
 ///
@@ -57,7 +58,7 @@ pub(crate) const INLINE_LIMIT_BYTES: i64 = 128;
 /// registers either target has free without spilling. gcc stops at a single
 /// move (16 bytes); c17 has no 16-byte move, and its eight are still cheaper
 /// than the call.
-const MOVE_LIMIT_BYTES: i64 = 64;
+const MOVE_LIMIT_BYTES: ByteSize = ByteSize::new(64);
 
 /// One of the widths a block is moved in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +79,8 @@ impl Chunk {
         }
     }
 
-    pub(crate) fn bits(self) -> u32 {
-        self.bytes() as u32 * 8
+    pub(crate) fn bits(self) -> Bits {
+        Bits::new(self.bytes() as u32 * 8)
     }
 
     /// The unsigned integer type the chunk is moved as.
@@ -95,7 +96,10 @@ impl Chunk {
 
 /// The pieces a block of `bytes` is moved in, as (offset, width), in rising
 /// offset: as many 8-byte chunks as fit, then at most one each of 4, 2 and 1.
-pub(crate) fn block_chunks(bytes: i64) -> impl Iterator<Item = (i64, Chunk)> {
+/// An offset is a displacement from the block's start, so it is signed, as
+/// every displacement is.
+pub(crate) fn block_chunks(bytes: ByteSize) -> impl Iterator<Item = (i64, Chunk)> {
+    let bytes = bytes.to_i64();
     let mut offset = 0;
     std::iter::from_fn(move || {
         let chunk = [Chunk::B8, Chunk::B4, Chunk::B2, Chunk::B1]
@@ -122,7 +126,7 @@ pub(crate) fn chunk_copy(
     src: PseudoId,
     dst: PseudoId,
     dst_offset: i64,
-    bytes: i64,
+    bytes: ByteSize,
     typ: impl Fn(Chunk) -> TypeId,
     mut alloc: impl FnMut() -> PseudoId,
 ) -> Vec<Instruction> {
@@ -154,9 +158,9 @@ pub(crate) fn chunk_copy(
 /// Rounding a ragged size up to the next width instead is what the back ends
 /// used to do, and it reads up to three bytes past the object -- which faults
 /// when the object ends a page.
-pub(crate) fn overlapping_halves(bits: u32) -> Option<(i64, i64)> {
-    let bytes = i64::from(bits / 8);
-    if !bits.is_multiple_of(8) || bytes == 0 || bytes > 8 || bytes.count_ones() == 1 {
+pub(crate) fn overlapping_halves(width: Bits) -> Option<(i64, i64)> {
+    let bytes = i64::from(width.whole_bytes()?);
+    if bytes == 0 || bytes > 8 || bytes.count_ones() == 1 {
         return None;
     }
     let width = 1i64 << (63 - bytes.leading_zeros() as i64);
@@ -199,7 +203,7 @@ impl BlockOp {
         }
     }
 
-    fn limit(self) -> i64 {
+    fn limit(self) -> ByteSize {
         match self {
             BlockOp::Copy | BlockOp::Set => INLINE_LIMIT_BYTES,
             BlockOp::Move => MOVE_LIMIT_BYTES,
@@ -211,13 +215,13 @@ impl BlockOp {
 /// constant. Answers whether anything changed.
 pub fn run(func: &mut Function, types: &TypeTable) -> bool {
     let consts = ConstMap::new(func);
-    let size_t_bits = types.size_bits(types.ulong_id);
+    let size_t_bits = types.value_bits(types.ulong_id);
     let mut changed = false;
     for b in 0..func.blocks.len() {
         let insns = std::mem::take(&mut func.blocks[b].insns);
         let mut out = Vec::with_capacity(insns.len());
         for insn in insns {
-            match expandable(&insn, &consts, size_t_bits) {
+            match expandable(&insn, &consts, size_t_bits.get()) {
                 Some((op, n)) => {
                     Expander {
                         b: Builder::new(&mut *func, types, insn.pos, &mut out),
@@ -236,13 +240,17 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
 }
 
 /// The operation `insn` is and its length, when it is one to expand.
-fn expandable(insn: &Instruction, consts: &ConstMap, size_t_bits: u32) -> Option<(BlockOp, i64)> {
+fn expandable(
+    insn: &Instruction,
+    consts: &ConstMap,
+    size_t_bits: u32,
+) -> Option<(BlockOp, ByteSize)> {
     let op = BlockOp::of(insn.op)?;
     let &[_, _, n] = insn.src.as_slice() else {
         return None;
     };
-    let n = i64::try_from(consts.get_at(n, size_t_bits, false)?).ok()?;
-    (0..=op.limit()).contains(&n).then_some((op, n))
+    let n = ByteSize::new(u64::try_from(consts.get_at(n, size_t_bits, false)?).ok()?);
+    (n <= op.limit()).then_some((op, n))
 }
 
 /// The instructions that replace one block memory operation.
@@ -254,7 +262,7 @@ struct Expander<'a> {
 }
 
 impl Expander<'_> {
-    fn expand(mut self, op: BlockOp, n: i64) {
+    fn expand(mut self, op: BlockOp, n: ByteSize) {
         let (dest, second) = (self.model.src[0], self.model.src[1]);
         match op {
             BlockOp::Copy => {
@@ -377,11 +385,11 @@ mod tests {
         let width_type = |c: Chunk| TypeId(c.bytes() as u32 + 100);
         for n in 0..=24 {
             let mut next = 50;
-            let insns = chunk_copy(src, dst, 1000, n, width_type, || {
+            let insns = chunk_copy(src, dst, 1000, ByteSize::new(n as u64), width_type, || {
                 next += 1;
                 PseudoId(next)
             });
-            let pieces: Vec<(i64, Chunk)> = block_chunks(n).collect();
+            let pieces: Vec<(i64, Chunk)> = block_chunks(ByteSize::new(n as u64)).collect();
             assert_eq!(insns.len(), 2 * pieces.len(), "{n} bytes");
             for (k, ((at, chunk), pair)) in pieces.iter().zip(insns.chunks(2)).enumerate() {
                 let v = PseudoId(51 + k as u32);
@@ -414,10 +422,10 @@ mod tests {
             assert_eq!(next, 50 + pieces.len() as u32, "one temporary per piece");
         }
         let widths = |n| {
-            chunk_copy(src, dst, 0, n, width_type, || PseudoId(0))
+            chunk_copy(src, dst, 0, ByteSize::new(n), width_type, || PseudoId(0))
                 .iter()
                 .step_by(2)
-                .map(|i| (i.offset, i.size / 8))
+                .map(|i| (i.offset, i.size.bytes_exact()))
                 .collect::<Vec<_>>()
         };
         assert!(widths(0).is_empty());
@@ -430,7 +438,7 @@ mod tests {
     #[test]
     fn chunks_cover_the_block_widest_first() {
         let pieces = |n| {
-            block_chunks(n)
+            block_chunks(ByteSize::new(n))
                 .map(|(at, c)| (at, c.bytes()))
                 .collect::<Vec<_>>()
         };
@@ -441,11 +449,11 @@ mod tests {
         assert_eq!(pieces(23), vec![(0, 8), (8, 8), (16, 4), (20, 2), (22, 1)]);
         for n in 0..=200 {
             let mut next = 0;
-            for (at, c) in block_chunks(n) {
+            for (at, c) in block_chunks(ByteSize::new(n)) {
                 assert_eq!(at, next, "{n}: a gap or an overlap");
                 next += c.bytes();
             }
-            assert_eq!(next, n, "{n}: not covered");
+            assert_eq!(next as u64, n, "{n}: not covered");
         }
     }
 
@@ -467,7 +475,13 @@ mod tests {
             Some(n) => {
                 let k = f.create_const_pseudo(n);
                 let copy = f.alloc_pseudo();
-                bb.add_insn(Instruction::unop(Opcode::Copy, copy, k, types.ulong_id, 64));
+                bb.add_insn(Instruction::unop(
+                    Opcode::Copy,
+                    copy,
+                    k,
+                    types.ulong_id,
+                    Bits::new(64),
+                ));
                 copy
             }
             None => PseudoId(2),
@@ -482,9 +496,9 @@ mod tests {
                 .with_func(op.name())
                 .with_target(result)
                 .with_src3(PseudoId(0), second, len)
-                .with_type_and_size(vp, 64),
+                .with_type_and_size(vp, Bits::new(64)),
         );
-        bb.add_insn(Instruction::ret_typed(Some(result), vp, 64));
+        bb.add_insn(Instruction::ret_typed(Some(result), vp, Bits::new(64)));
         f.blocks.push(bb);
         f.entry = BasicBlockId(0);
         (f, types)
@@ -515,7 +529,7 @@ mod tests {
             .insns
             .iter()
             .filter(|i| i.op == Opcode::Store)
-            .map(|i| (i.offset, i.size))
+            .map(|i| (i.offset, i.size.get()))
             .collect();
         assert_eq!(widths, vec![(0, 64), (8, 64), (16, 32), (20, 16), (22, 8)]);
         // Each store is of the load just before it, from the source.
@@ -560,7 +574,7 @@ mod tests {
             .insns
             .iter()
             .filter(|i| i.op == Opcode::Store)
-            .map(|i| (i.size, val(&f, i.src[1])))
+            .map(|i| (i.size.get(), val(&f, i.src[1])))
             .collect();
         assert_eq!(
             stored,
@@ -629,7 +643,7 @@ mod tests {
     #[test]
     fn overlapping_halves_covers_a_ragged_size_without_passing_its_end() {
         for (bytes, want) in [(3i64, (2, 1)), (5, (4, 1)), (6, (4, 2)), (7, (4, 3))] {
-            let got = overlapping_halves(bytes as u32 * 8);
+            let got = overlapping_halves(Bits::new(bytes as u32 * 8));
             assert_eq!(
                 got,
                 Some(want),
@@ -658,7 +672,7 @@ mod tests {
     fn overlapping_halves_declines_a_size_that_is_already_one_access() {
         for bits in [0, 8, 16, 32, 64, 72, 96, 128, 40 + 4] {
             assert_eq!(
-                overlapping_halves(bits),
+                overlapping_halves(Bits::new(bits)),
                 None,
                 "{bits} bits was split, but it is not a ragged sub-register size"
             );

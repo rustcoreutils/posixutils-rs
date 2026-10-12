@@ -169,7 +169,7 @@ fn test_a_typedef_names_a_variant_in_the_written_order() {
     assert_eq!(members(le), [false, false]);
     assert!(!types.types_compatible(tag, be));
     assert!(types.types_compatible(tag, le));
-    assert_eq!(types.size_bytes(be), types.size_bytes(tag));
+    assert_eq!(types.byte_size(be).get(), types.byte_size(tag).get());
 }
 
 /// The aggregate records its own order, which a struct of pointers alone --

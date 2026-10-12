@@ -56,8 +56,15 @@ fn pg_x86_64_calls_mcount_after_the_prologue() {
         }
         assert_body_lacks(&asm, "quiet", "mcount", "no_instrument_function");
     }
-    // The frame `f` keeps `x` in a callee-saved register; it is pushed first.
-    let asm = asm_for_with("pg_x86", X86_64_LINUX, PROGRAM, &["-O2", "-pg", "-fno-pic"]);
+    // `y` lives across the call to `g` in a callee-saved register, which is
+    // pushed first.
+    let src = "extern int g(int);\nint f(int x) { int y = x * 3; return g(x) + y; }\n";
+    let asm = asm_for_with(
+        "pg_x86_saved",
+        X86_64_LINUX,
+        src,
+        &["-O2", "-pg", "-fno-pic"],
+    );
     assert!(
         before(&asm, "f", "call mcount").contains("pushq %rbx"),
         "callee-saved pushes precede the call:\n{asm}"

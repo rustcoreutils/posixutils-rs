@@ -430,9 +430,31 @@ impl ShapeAttrs {
     }
 }
 
-/// `-fstack-clash-protection`'s two `--param`s, as written: each the log2 of
-/// a byte count. c17 probes no stack; these move where gcc would, and so
-/// which functions c17 warns about.
+/// `-fstack-clash-protection` (and `-fstack-check`, its alias here) with its
+/// two `--param`s, as written: each the log2 of a byte count.
+///
+/// The protection is gcc's: the stack pointer never moves past the guard
+/// page below the stack without touching it, so a frame or an `alloca` too
+/// large for the stack faults on the guard instead of landing in whatever
+/// is mapped beyond it. A move of more than the guard is made in steps of
+/// the probe interval, each followed by a store (a probe) to the memory it
+/// uncovered. What counts as touched differs by target:
+///
+/// - x86-64: the `call` stores the return address at the new stack pointer,
+///   so a function starts with nothing unprobed. Its frame is probed every
+///   interval and its last part, less than one, is left unprobed: whatever
+///   it calls stores there first. Every later move -- an outgoing argument
+///   area, `alloca` -- probes at the top of each interval it uncovers, which
+///   is safe however much the frame left unprobed, and ends with the new
+///   stack pointer probed.
+/// - aarch64: `bl` stores nothing, so a caller may leave up to
+///   [`StackClash::AARCH64_CALLER_GUARD`] bytes unprobed above the stack
+///   pointer at a call. A frame under the guard less that much is probed by
+///   the frame record the prologue stores at its bottom; a larger one is
+///   probed every interval 1 KiB above the new stack pointer, as gcc does.
+///   c17's body keeps the stack pointer probed: an outgoing argument area
+///   past the caller's allowance, and every `alloca`, ends with a probe at
+///   the new stack pointer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StackClash {
     /// `stack-clash-protection-guard-size`.
@@ -441,10 +463,54 @@ pub struct StackClash {
     pub probe_interval: Option<u32>,
 }
 
+/// How a probed move of the stack pointer by a known number of bytes is
+/// made: whole probe intervals, each probed, then a residual of less than
+/// one interval, whose probing is the caller's to decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbePlan {
+    /// `steps` interval-sized moves written out one after another.
+    Unrolled { steps: i64, residual: i64 },
+    /// A loop over `rounded` bytes, a multiple of the interval, one
+    /// interval and one probe a turn.
+    Loop { rounded: i64, residual: i64 },
+}
+
+impl ProbePlan {
+    /// The part under one interval left after the whole intervals.
+    pub fn residual(self) -> i64 {
+        match self {
+            ProbePlan::Unrolled { residual, .. } | ProbePlan::Loop { residual, .. } => residual,
+        }
+    }
+}
+
 impl StackClash {
     /// The space aarch64 leaves for the caller's own use of the guard,
-    /// gcc's `STACK_CLASH_CALLER_GUARD`.
-    const AARCH64_CALLER_GUARD: i64 = 1024;
+    /// gcc's `STACK_CLASH_CALLER_GUARD`: a function may be called with this
+    /// much below its last probe unprobed.
+    pub const AARCH64_CALLER_GUARD: i64 = 1024;
+
+    /// The most whole intervals written out before a loop is used instead,
+    /// gcc's on both targets.
+    const MAX_UNROLLED_STEPS: i64 = 4;
+
+    /// The bytes of the guard the protection assumes below the stack.
+    pub fn guard_bytes(self, arch: Arch) -> i64 {
+        let default = match arch {
+            Arch::X86_64 => 12,
+            Arch::Aarch64 => 16,
+        };
+        1i64 << self.guard_size.unwrap_or(default)
+    }
+
+    /// The bytes between two probes. aarch64 has no interval of its own:
+    /// gcc refuses one that differs from the guard ([`Self::aarch64_errors`]).
+    pub fn interval(self, arch: Arch) -> i64 {
+        match arch {
+            Arch::X86_64 => 1i64 << self.probe_interval.unwrap_or(12),
+            Arch::Aarch64 => self.guard_bytes(arch),
+        }
+    }
 
     /// The smallest static allocation gcc probes on `arch`. On x86-64 one of
     /// at least the guard size is probed every interval, so it is probed
@@ -453,12 +519,37 @@ impl StackClash {
     /// guard less what the caller may have used of it.
     pub fn probed_from(self, arch: Arch) -> i64 {
         match arch {
-            Arch::X86_64 => {
-                let guard = self.guard_size.unwrap_or(12);
-                let interval = self.probe_interval.unwrap_or(12);
-                1i64 << guard.max(interval)
+            Arch::X86_64 => self.guard_bytes(arch).max(self.interval(arch)),
+            Arch::Aarch64 => self.guard_bytes(arch) - Self::AARCH64_CALLER_GUARD,
+        }
+    }
+
+    /// How a prologue allocates a frame of `bytes`: `None` when it needs no
+    /// probe, being smaller than [`Self::probed_from`].
+    pub fn plan(self, arch: Arch, bytes: i64) -> Option<ProbePlan> {
+        (bytes >= self.probed_from(arch)).then(|| self.steps(arch, bytes))
+    }
+
+    /// The intervals and residual of a probed move by `bytes`, written out
+    /// up to four intervals and looped past that, as gcc does: on x86-64 by
+    /// the whole move (`ix86_adjust_stack_and_probe`), on aarch64 by its
+    /// whole intervals (`aarch64_allocate_and_probe_stack_space`).
+    pub fn steps(self, arch: Arch, bytes: i64) -> ProbePlan {
+        let interval = self.interval(arch);
+        let rounded = bytes / interval * interval;
+        let residual = bytes - rounded;
+        let limit = Self::MAX_UNROLLED_STEPS * interval;
+        let unrolled = match arch {
+            Arch::X86_64 => bytes <= limit,
+            Arch::Aarch64 => rounded <= limit,
+        };
+        if unrolled {
+            ProbePlan::Unrolled {
+                steps: rounded / interval,
+                residual,
             }
-            Arch::Aarch64 => (1i64 << self.guard_size.unwrap_or(16)) - Self::AARCH64_CALLER_GUARD,
+        } else {
+            ProbePlan::Loop { rounded, residual }
         }
     }
 
@@ -2416,6 +2507,80 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe plans of gcc 13's prologues, as `-S` shows them: x86-64
+    /// writes out up to four 4 KiB steps of the whole frame and loops past
+    /// that (a 16408-byte frame loops), aarch64 four 64 KiB steps of the
+    /// rounded part; a frame under the threshold has no plan.
+    #[test]
+    fn stack_clash_plans_are_gccs() {
+        let sc = StackClash::default();
+        let x86 = |n| sc.plan(Arch::X86_64, n);
+        let a64 = |n| sc.plan(Arch::Aarch64, n);
+        assert_eq!(x86(4088), None);
+        assert_eq!(
+            x86(4120),
+            Some(ProbePlan::Unrolled {
+                steps: 1,
+                residual: 24
+            })
+        );
+        assert_eq!(
+            x86(16384),
+            Some(ProbePlan::Unrolled {
+                steps: 4,
+                residual: 0
+            })
+        );
+        assert_eq!(
+            x86(16408),
+            Some(ProbePlan::Loop {
+                rounded: 16384,
+                residual: 24
+            })
+        );
+        assert_eq!(a64(64432), None);
+        assert_eq!(
+            a64(65056),
+            Some(ProbePlan::Unrolled {
+                steps: 0,
+                residual: 65056
+            })
+        );
+        assert_eq!(
+            a64(5 * 65536 - 4096 + 16),
+            Some(ProbePlan::Unrolled {
+                steps: 4,
+                residual: 61456
+            })
+        );
+        assert_eq!(
+            a64(1 << 20 | 16),
+            Some(ProbePlan::Loop {
+                rounded: 1 << 20,
+                residual: 16
+            })
+        );
+        // The parameters move both the threshold and the step.
+        let small = StackClash {
+            guard_size: Some(12),
+            probe_interval: None,
+        };
+        assert_eq!(small.probed_from(Arch::Aarch64), 3072);
+        assert_eq!(small.interval(Arch::Aarch64), 4096);
+        let wide = StackClash {
+            guard_size: None,
+            probe_interval: Some(14),
+        };
+        assert_eq!(wide.plan(Arch::X86_64, 5000), None);
+        assert_eq!(
+            wide.plan(Arch::X86_64, 20000),
+            Some(ProbePlan::Unrolled {
+                steps: 1,
+                residual: 3616
+            })
+        );
+    }
 
     /// Every gcc triple names its own target again, and multiarch is the
     /// triple on Linux and nothing elsewhere.

@@ -21,10 +21,14 @@
 
 use super::{is_aggregate, is_float, is_integer, is_pointer, Abi, ArgClass, RegClass};
 use crate::types::{ArrayExtent, TypeId, TypeKind, TypeTable};
+use crate::units::{Align, Bits, ByteSize};
 
-/// Maximum aggregate size (in bits) that can be passed in registers.
-/// Structs larger than 128 bits (16 bytes) must use sret.
-const MAX_AGGREGATE_BITS: u32 = 128;
+/// Maximum aggregate size that can be passed in registers.
+/// Structs larger than 16 bytes must use sret.
+const MAX_AGGREGATE_BYTES: ByteSize = ByteSize::new(16);
+
+/// The size of an eightbyte.
+const EIGHTBYTE: ByteSize = ByteSize::new(8);
 
 /// Size of an eightbyte in bits.
 const EIGHTBYTE_BITS: u32 = 64;
@@ -91,7 +95,7 @@ pub fn param_is_ignored(typ: TypeId, types: &TypeTable) -> bool {
 /// which [`sse_struct_regs`] already describes.
 pub fn struct_param_classes(typ: TypeId, types: &TypeTable) -> Option<Vec<RegClass>> {
     let kind = types.kind(typ);
-    let bits = types.size_bits(typ);
+    let bytes = types.byte_size(typ);
     // A GNU complex integer answers here at *every* register-passable size,
     // including eight bytes and under. A struct that small holds its value in
     // the argument pseudo and moves with an ordinary register move, but a
@@ -105,8 +109,8 @@ pub fn struct_param_classes(typ: TypeId, types: &TypeTable) -> Option<Vec<RegCla
     }
     if (kind != TypeKind::Struct && kind != TypeKind::Union)
         || types.is_complex(typ)
-        || bits <= 64
-        || bits > 128
+        || bytes <= EIGHTBYTE
+        || bytes > MAX_AGGREGATE_BYTES
     {
         return None;
     }
@@ -126,7 +130,7 @@ pub fn struct_param_classes(typ: TypeId, types: &TypeTable) -> Option<Vec<RegCla
 /// gcc-compiled peer reads only the first.
 pub fn sse_struct_regs(typ: TypeId, types: &TypeTable) -> Option<usize> {
     let kind = types.kind(typ);
-    let bits = types.size_bits(typ);
+    let bytes = types.byte_size(typ);
     // No lower bound: a struct of eight bytes or fewer whose eightbyte is SSE
     // travels in an XMM register too. Excluding those sent `struct { float v; }`
     // and `struct { _Float16 a, b; }` down the general-register path as
@@ -135,8 +139,8 @@ pub fn sse_struct_regs(typ: TypeId, types: &TypeTable) -> Option<usize> {
     // gcc.
     if (kind != TypeKind::Struct && kind != TypeKind::Union)
         || types.is_complex(typ)
-        || bits == 0
-        || bits > 128
+        || bytes.is_zero()
+        || bytes > MAX_AGGREGATE_BYTES
     {
         return None;
     }
@@ -171,7 +175,8 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
         }
         // A sixteen-byte vector is one SSE+SSEUP unit, as its carrier is.
         TypeKind::Array if types.is_vector(ty) => {
-            return (types.size_bytes(ty) == 16).then(|| super::native_vector_carrier(ty, types));
+            return (types.byte_size(ty) == MAX_AGGREGATE_BYTES)
+                .then(|| super::native_vector_carrier(ty, types));
         }
         TypeKind::Array => {
             let typ = types.get(ty);
@@ -183,7 +188,7 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
         _ => return Some(ty),
     };
     // An over-aligned or padded wrapper is not the scalar; it is bigger.
-    (types.size_bytes(ty) == types.size_bytes(inner)).then_some(inner)
+    (types.byte_size(ty) == types.byte_size(inner)).then_some(inner)
 }
 
 /// A floating complex type's argument class.
@@ -217,12 +222,12 @@ fn classify_complex_float(ty: TypeId, types: &TypeTable) -> ArgClass {
         TypeKind::LongDouble | TypeKind::Float128
     ) {
         return ArgClass::Indirect {
-            align: 16,
-            size_bytes: types.size_bytes(ty),
+            align: Align::of_bytes(16),
+            size_bytes: types.byte_size(ty),
         };
     }
-    let total_bits = types.size_bits(base_ty) * 2;
-    let classes = if total_bits <= 64 {
+    let total_bits = types.value_bits(ty);
+    let classes = if total_bits <= Bits::new(64) {
         vec![RegClass::Sse]
     } else {
         vec![RegClass::Sse, RegClass::Sse]
@@ -246,14 +251,16 @@ fn classify_complex_float(ty: TypeId, types: &TypeTable) -> ArgClass {
 /// `is_integer` and was given a single register for a sixteen-byte value, and
 /// `_Complex char` reached the sub-32-bit path and was sign-extended, which
 /// overwrites the imaginary half with a copy of the real one's sign.
-fn classify_complex_integer(size_bits: u32, size_bytes: usize) -> ArgClass {
-    if size_bits > 128 {
+fn classify_complex_integer(ty: TypeId, types: &TypeTable) -> ArgClass {
+    let size_bytes = types.byte_size(ty);
+    if size_bytes > MAX_AGGREGATE_BYTES {
         return ArgClass::Indirect {
-            align: 16,
+            align: Align::of_bytes(16),
             size_bytes,
         };
     }
-    let regs = size_bits.div_ceil(64) as usize;
+    let size_bits = types.value_bits(ty);
+    let regs = size_bits.get().div_ceil(64) as usize;
     ArgClass::Direct {
         classes: vec![RegClass::Integer; regs],
         size_bits,
@@ -264,6 +271,23 @@ impl SysVAmd64Abi {
     /// Create a new System V AMD64 ABI classifier.
     pub fn new() -> Self {
         Self
+    }
+
+    /// A type no rule above names, in either direction: one general
+    /// register when it fits an eightbyte, memory otherwise.
+    fn classify_default(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
+        let size_bytes = types.byte_size(ty);
+        if size_bytes <= EIGHTBYTE {
+            ArgClass::Direct {
+                classes: vec![RegClass::Integer],
+                size_bits: types.value_bits(ty),
+            }
+        } else {
+            ArgClass::Indirect {
+                align: types.align(ty),
+                size_bytes,
+            }
+        }
     }
 
     /// Classify a single eightbyte of a type at the given bit offset.
@@ -357,12 +381,12 @@ impl SysVAmd64Abi {
                 let (field_start, field_end) = match (member.bit_width, member.bit_offset) {
                     (Some(0), _) => continue,
                     (Some(width), Some(bit_offset)) => {
-                        let start = member.offset as u32 * 8 + bit_offset;
+                        let start = member.offset.get() as u32 * 8 + bit_offset;
                         (start, start + width)
                     }
                     _ => {
-                        let start = member.offset as u32 * 8;
-                        (start, start + types.size_bits(field_ty))
+                        let start = member.offset.get() as u32 * 8;
+                        (start, start + types.value_bits(field_ty).get())
                     }
                 };
 
@@ -389,29 +413,29 @@ impl SysVAmd64Abi {
 
     /// Classify a complete aggregate type into ArgClass.
     fn classify_aggregate(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
-        let size_bits = types.size_bits(ty);
-        let size_bytes = types.size_bytes(ty);
+        let size_bytes = types.byte_size(ty);
 
         // Rule: Aggregates larger than 2 eightbytes (16 bytes) go to MEMORY
-        if size_bits > MAX_AGGREGATE_BITS {
+        if size_bytes > MAX_AGGREGATE_BYTES {
             return ArgClass::Indirect {
-                align: types.alignment(ty) as u32,
+                align: types.align(ty),
                 size_bytes,
             };
         }
 
         // Empty struct
-        if size_bits == 0 {
+        if size_bytes.is_zero() {
             return ArgClass::Ignore;
         }
 
         // Classify each eightbyte
+        let size_bits = types.value_bits(ty);
         let mut classes = Vec::new();
-        let num_eightbytes = size_bits.div_ceil(EIGHTBYTE_BITS);
+        let num_eightbytes = size_bits.get().div_ceil(EIGHTBYTE_BITS);
 
         for i in 0..num_eightbytes {
             let offset = i * EIGHTBYTE_BITS;
-            let class = self.classify_eightbyte(ty, offset, size_bits - offset, types);
+            let class = self.classify_eightbyte(ty, offset, size_bits.get() - offset, types);
             classes.push(class);
         }
 
@@ -437,7 +461,7 @@ impl SysVAmd64Abi {
         // Post-merge cleanup: if any eightbyte is MEMORY, the whole thing is MEMORY
         if classes.contains(&RegClass::Memory) {
             return ArgClass::Indirect {
-                align: types.alignment(ty) as u32,
+                align: types.align(ty),
                 size_bytes,
             };
         }
@@ -482,8 +506,6 @@ impl Abi for SysVAmd64Abi {
             return self.classify_param(self.vector_carrier(ty, types), types);
         }
         let kind = types.kind(ty);
-        let size_bits = types.size_bits(ty);
-        let size_bytes = types.size_bytes(ty);
 
         // `__attribute__((transparent_union))` passes the union exactly as its
         // first member would be passed. Substituted here rather than on the
@@ -503,21 +525,24 @@ impl Abi for SysVAmd64Abi {
         // Complex integers, before any integer path: see
         // `classify_complex_integer`.
         if types.is_complex_integer(ty) {
-            return classify_complex_integer(size_bits, size_bytes);
+            return classify_complex_integer(ty, types);
         }
 
         // Integer types smaller than 32 bits need extension
-        if is_integer(kind) && size_bits < 32 {
+        if is_integer(kind) && types.value_bits(ty) < Bits::new(32) {
             // Check if type is unsigned
             let signed = !types.is_unsigned(ty);
-            return ArgClass::Extend { signed, size_bits };
+            return ArgClass::Extend {
+                signed,
+                size_bits: types.value_bits(ty),
+            };
         }
 
         // 128-bit integer types: two GP registers
         if kind == TypeKind::Int128 {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer, RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -525,7 +550,7 @@ impl Abi for SysVAmd64Abi {
         if is_integer(kind) || is_pointer(kind) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -540,13 +565,13 @@ impl Abi for SysVAmd64Abi {
             if kind == TypeKind::LongDouble {
                 // Long double uses x87, passed on stack
                 return ArgClass::Indirect {
-                    align: 16,
-                    size_bytes,
+                    align: Align::of_bytes(16),
+                    size_bytes: types.byte_size(ty),
                 };
             }
             return ArgClass::Direct {
                 classes: vec![RegClass::Sse],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -559,7 +584,7 @@ impl Abi for SysVAmd64Abi {
         if kind == TypeKind::Array {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits: 64, // Pointer size
+                size_bits: Bits::new(64), // Pointer size
             };
         }
 
@@ -567,22 +592,12 @@ impl Abi for SysVAmd64Abi {
         if kind == TypeKind::Function {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits: 64,
+                size_bits: Bits::new(64),
             };
         }
 
         // Default: pass by value if small enough
-        if size_bits <= 64 {
-            ArgClass::Direct {
-                classes: vec![RegClass::Integer],
-                size_bits,
-            }
-        } else {
-            ArgClass::Indirect {
-                align: types.alignment(ty) as u32,
-                size_bytes,
-            }
-        }
+        self.classify_default(ty, types)
     }
 
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
@@ -590,8 +605,6 @@ impl Abi for SysVAmd64Abi {
             return self.classify_return(self.vector_return_carrier(ty, types), types);
         }
         let kind = types.kind(ty);
-        let size_bits = types.size_bits(ty);
-        let size_bytes = types.size_bytes(ty);
 
         // Void return
         if kind == TypeKind::Void {
@@ -601,14 +614,14 @@ impl Abi for SysVAmd64Abi {
         // Complex integers, before any integer path: see
         // `classify_complex_integer`.
         if types.is_complex_integer(ty) {
-            return classify_complex_integer(size_bits, size_bytes);
+            return classify_complex_integer(ty, types);
         }
 
         // 128-bit integer types: return in RAX+RDX
         if kind == TypeKind::Int128 {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer, RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -616,7 +629,7 @@ impl Abi for SysVAmd64Abi {
         if is_integer(kind) || is_pointer(kind) {
             return ArgClass::Direct {
                 classes: vec![RegClass::Integer],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -630,7 +643,9 @@ impl Abi for SysVAmd64Abi {
         // for it had the callee load its halves with `fldt`.
         if types.is_complex(ty) {
             if types.kind(types.complex_base(ty)) == TypeKind::LongDouble {
-                return ArgClass::X87 { size_bits };
+                return ArgClass::X87 {
+                    size_bits: types.value_bits(ty),
+                };
             }
             return classify_complex_float(ty, types);
         }
@@ -639,11 +654,13 @@ impl Abi for SysVAmd64Abi {
         if is_float(kind) {
             if kind == TypeKind::LongDouble {
                 // Long double returned in ST(0) per System V AMD64 ABI
-                return ArgClass::X87 { size_bits };
+                return ArgClass::X87 {
+                    size_bits: types.value_bits(ty),
+                };
             }
             return ArgClass::Direct {
                 classes: vec![RegClass::Sse],
-                size_bits,
+                size_bits: types.value_bits(ty),
             };
         }
 
@@ -657,23 +674,15 @@ impl Abi for SysVAmd64Abi {
             if sole_scalar_content(ty, types)
                 .is_some_and(|inner| types.kind(inner) == TypeKind::LongDouble)
             {
-                return ArgClass::X87 { size_bits };
+                return ArgClass::X87 {
+                    size_bits: types.value_bits(ty),
+                };
             }
             return self.classify_aggregate(ty, types);
         }
 
         // Default
-        if size_bits <= 64 {
-            ArgClass::Direct {
-                classes: vec![RegClass::Integer],
-                size_bits,
-            }
-        } else {
-            ArgClass::Indirect {
-                align: types.alignment(ty) as u32,
-                size_bytes,
-            }
-        }
+        self.classify_default(ty, types)
     }
 }
 
@@ -698,14 +707,14 @@ mod tests {
 
     /// A one-member struct wrapping `member`.
     fn wrap(types: &mut TypeTable, member: TypeId) -> TypeId {
-        let size = types.size_bytes(member);
-        let align = types.alignment(member);
+        let size = types.byte_size(member);
+        let align = types.align(member);
         types.intern(Type::struct_type(CompositeType {
             tag: None,
             members: vec![StructMember {
                 name: crate::strings::StringId::default(),
                 typ: member,
-                offset: 0,
+                offset: crate::units::ByteSize::ZERO,
                 bit_width: None,
                 bit_offset: None,
                 access_bytes: None,
@@ -754,7 +763,7 @@ mod tests {
         assert!(
             matches!(abi.classify_return(wrapped, &types),
                      ArgClass::Direct { ref classes, size_bits }
-                         if classes == &[RegClass::Sse] && size_bits == 16),
+                         if classes == &[RegClass::Sse] && size_bits == Bits::new(16)),
             "struct {{ _Float16 }} returns in one SSE register, got {:?}",
             abi.classify_return(wrapped, &types)
         );
@@ -839,7 +848,7 @@ mod tests {
             ] {
                 assert!(
                     matches!(class, ArgClass::Direct { ref classes, size_bits }
-                             if classes == &[RegClass::Sse] && size_bits == 128),
+                             if classes == &[RegClass::Sse] && size_bits == Bits::new(128)),
                     "{name} takes one SSE register of sixteen bytes, got {class:?}"
                 );
             }
@@ -855,7 +864,7 @@ mod tests {
                 StructMember {
                     name: crate::strings::StringId::default(),
                     typ: q,
-                    offset: 0,
+                    offset: crate::units::ByteSize::ZERO,
                     bit_width: None,
                     bit_offset: None,
                     access_bytes: None,
@@ -864,7 +873,7 @@ mod tests {
                 StructMember {
                     name: crate::strings::StringId::default(),
                     typ: arr2,
-                    offset: 0,
+                    offset: crate::units::ByteSize::ZERO,
                     bit_width: None,
                     bit_offset: None,
                     access_bytes: None,
@@ -872,9 +881,9 @@ mod tests {
                 },
             ],
             enum_constants: vec![],
-            size: 16,
-            align: 16,
-            member_align: 16,
+            size: crate::units::ByteSize::new(16),
+            align: crate::units::Align::of_bytes(16),
+            member_align: crate::units::Align::of_bytes(16),
             is_complete: true,
             transparent: false,
             reverse_order: false,
@@ -937,21 +946,23 @@ mod tests {
             );
         }
         let q = types.make_complex(types.float128_id);
-        assert!(matches!(
+        assert_eq!(
             abi.classify_return(q, &types),
             ArgClass::Indirect {
-                align: 16,
-                size_bytes: 32
+                align: Align::of_bytes(16),
+                size_bytes: ByteSize::new(32)
             }
-        ));
+        );
         let ld = types.make_complex(types.longdouble_id);
         assert!(matches!(
             abi.classify_param(ld, &types),
             ArgClass::Indirect { .. }
         ));
-        assert!(matches!(
+        assert_eq!(
             abi.classify_return(ld, &types),
-            ArgClass::X87 { size_bits: 256 }
-        ));
+            ArgClass::X87 {
+                size_bits: Bits::new(256)
+            }
+        );
     }
 }

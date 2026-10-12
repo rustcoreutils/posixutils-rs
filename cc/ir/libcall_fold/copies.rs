@@ -161,7 +161,7 @@ fn strncpy(facts: &CallSite, d: PseudoId, s: PseudoId, n: PseudoId) -> Option<Fo
     let len = known_len(facts, s)?;
     let copied = n.min(len + 1);
     let zeros = n - copied;
-    if zeros > INLINE_LIMIT_BYTES as u64 {
+    if zeros > INLINE_LIMIT_BYTES.get() {
         return None;
     }
     Some(Folded::Write(Write::Copy {
@@ -309,7 +309,7 @@ fn block(b: &mut Builder, ctx: &FoldCtx, op: BlockOp, dest: PseudoId, second: Ps
             .with_func(callee)
             .with_target(result)
             .with_src3(dest, second, n)
-            .with_type_and_size(void_ptr, b.types.size_bits(void_ptr)),
+            .with_type_and_size(void_ptr, b.types.value_bits(void_ptr)),
     );
 }
 
@@ -466,7 +466,7 @@ mod tests {
             fx.konst(4),
             fx.konst(6),
             fx.konst(10),
-            fx.konst(6 + INLINE_LIMIT_BYTES as i128 + 1),
+            fx.konst(6 + i128::from(INLINE_LIMIT_BYTES.get()) + 1),
         );
         let ptr = fx.types.char_ptr_id;
         let at = Place::At(d);

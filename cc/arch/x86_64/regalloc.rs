@@ -48,12 +48,12 @@ use crate::arch::asm_constraints::{operand_pins, AsmOperandClass, AsmRegClass, P
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
     asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
-    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
-    LivenessResult,
+    identify_fp_pseudos, ConstraintPoint, Crossing, LiveInterval, LivenessResult, SlotShape,
 };
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
+use crate::units::{Bits, ByteSize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // x86-64 Register Definitions
@@ -744,17 +744,44 @@ pub enum Loc {
     /// In an XMM register (floating-point)
     Xmm(XmmReg),
     /// On the stack at [rbp - offset]
-    Stack(i32),
+    Stack(i64),
     /// Incoming stack argument at [rbp + offset] (positive offset, above return address)
     /// Used for function parameters 7+ that are passed on the stack by the caller
-    IncomingArg(i32),
+    IncomingArg(i64),
     /// Immediate integer constant
     Imm(i128),
     /// Immediate float constant (value, size in bits)
-    FImm(FloatVal, u32),
+    FImm(FloatVal, Bits),
     /// Global symbol
     Global(String),
 }
+
+/// A register as the allocation verifier compares them: one per bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RegUnit {
+    Gp(Reg),
+    Xmm(XmmReg),
+}
+
+/// Every general register.
+const EVERY_GP: [Reg; 16] = [
+    Reg::Rax,
+    Reg::Rbx,
+    Reg::Rcx,
+    Reg::Rdx,
+    Reg::Rsi,
+    Reg::Rdi,
+    Reg::Rbp,
+    Reg::Rsp,
+    Reg::R8,
+    Reg::R9,
+    Reg::R10,
+    Reg::R11,
+    Reg::R12,
+    Reg::R13,
+    Reg::R14,
+    Reg::R15,
+];
 
 /// Information about an argument spilled from a caller-saved register to stack
 #[derive(Debug, Clone)]
@@ -764,7 +791,7 @@ pub struct SpilledArg {
     /// The register the argument originally arrived in
     pub from_reg: Reg,
     /// The stack offset where it was spilled to
-    pub to_stack_offset: i32,
+    pub to_stack_offset: i64,
 }
 
 /// XMM argument that was spilled from an XMM register to the stack.
@@ -776,7 +803,7 @@ pub struct SpilledXmmArg {
     /// The XMM register the argument originally arrived in
     pub from_xmm: XmmReg,
     /// The stack offset where it was spilled to
-    pub to_stack_offset: i32,
+    pub to_stack_offset: i64,
     /// The move width. A `__float128` argument is a whole XMM; storing it as
     /// a `double` dropped its top half.
     pub size: FpSize,
@@ -795,7 +822,7 @@ pub struct RegAlloc {
     /// [`RegAlloc::with_stack_guard`].
     guard_requested: bool,
     /// The canary's slot: the frame's first, so above every other local.
-    guard_slot: Option<i32>,
+    guard_slot: Option<i64>,
     /// What `%rsp` is a multiple of at a call; see
     /// [`RegAlloc::with_incoming_stack_align`].
     incoming_stack_align: i32,
@@ -818,22 +845,14 @@ pub struct RegAlloc {
     /// consuming no register, and step 5 charges nothing for an argument that
     /// did not fit. A separate tally of "how many registers overflowed" can
     /// express neither, nor the alignment padding `IncomingOff::take` inserts.
-    named_incoming_end: i32,
-    /// Free general-purpose registers
-    free_regs: Vec<Reg>,
-    /// Free XMM registers (for floating-point)
-    free_xmm_regs: Vec<XmmReg>,
-    /// Active integer register intervals (sorted by end point)
-    active: Vec<(LiveInterval, Reg)>,
-    /// Active XMM register intervals (sorted by end point)
-    active_xmm: Vec<(LiveInterval, XmmReg)>,
+    named_incoming_end: i64,
     /// Next stack slot offset
-    stack_offset: i32,
+    stack_offset: i64,
     /// Reserved when the function converts a long double to an integer.
     x87_scratch: Option<X87Scratch>,
     x87_control_words: Option<X87ControlWords>,
     /// A source position for this function, for the frame diagnostics
-    /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `alloc_stack_slot` and
+    /// `grow_frame` and [`crate::abi::slot_bytes`] emit. `new_frame_slot` and
     /// `IncomingOff::take` have no `&Function` to recover one from.
     func_pos: crate::diag::Position,
     /// Callee-saved registers that were used
@@ -855,15 +874,17 @@ pub struct RegAlloc {
     /// Such a parameter is given a *local* sixteen-byte slot as its location,
     /// because that is where the prologue copies it to; the caller's offset has
     /// nowhere else to live, and the prologue must not recompute it.
-    int128_incoming: BTreeMap<PseudoId, i32>,
+    int128_incoming: BTreeMap<PseudoId, i64>,
     /// Arguments spilled from caller-saved registers to stack
     spilled_args: Vec<SpilledArg>,
     /// XMM arguments spilled from XMM registers to stack
     spilled_xmm_args: Vec<SpilledXmmArg>,
-    /// Active stack slot intervals (interval, offset, size) for reuse tracking
-    active_stack: Vec<crate::arch::regalloc::ActiveSlot>,
-    /// Free stack slots keyed by size, available for reuse
-    free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
+    /// The pseudos that live in a frame slot, with the slot each needs:
+    /// spills, arguments moved out of their registers, 128-bit values, alloca
+    /// pointers. Their offsets are decided together, once both banks are
+    /// colored ([`crate::arch::regalloc::color_stack_slots`]); a spilled
+    /// argument's record is completed then.
+    stack_homed: BTreeMap<PseudoId, SlotShape>,
     /// Per-block live-in sets for interference-based stack coloring
     live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets for interference-based stack coloring
@@ -872,6 +893,15 @@ pub struct RegAlloc {
     max_local_align: i32,
     /// How this function's locals are addressed.
     frame_base: FrameBase,
+    /// The register held back for displacements past 32 bits, if the frame
+    /// may have any; see [`far_scratch_of`].
+    far_scratch: Option<Reg>,
+    /// The size of every frame slot handed to a pseudo; see
+    /// [`crate::arch::regalloc::SlotBytes`].
+    slot_bytes: crate::arch::regalloc::SlotBytes,
+    /// An argument arriving in more than one register -- a `double _Complex`
+    /// in two XMM registers -- by how many. Its location names the first.
+    arg_span: HashMap<PseudoId, usize>,
 }
 
 /// How a function's locals are addressed.
@@ -947,7 +977,7 @@ impl FrameBase {
                 local
                     .explicit_align
                     .map(|a| a as i32)
-                    .unwrap_or_else(|| (types.alignment(local.typ) as i32).max(8))
+                    .unwrap_or_else(|| (crate::abi::slot_align(types.align(local.typ))).max(8))
             })
             .max()
             .unwrap_or(8);
@@ -963,7 +993,7 @@ impl FrameBase {
             .flat_map(|b| b.insns.iter())
             .filter(|insn| matches!(insn.op, Opcode::Call))
             .flat_map(|insn| insn.extra().arg_types.iter())
-            .map(|t| types.alignment(*t) as i32)
+            .map(|t| crate::abi::slot_align(types.align(*t)))
             .max()
             .unwrap_or(8);
         // `%rbp` is as aligned as the stack was at the call, 16 bytes or,
@@ -1011,30 +1041,187 @@ impl FrameBase {
     }
 }
 
-/// Whether a constraint point may leave `interval`'s pseudo in a register
-/// it clobbers: only an operand of the instruction, and only at the ends of
-/// its live range (see [`ConstraintPoint::operand_survives`]). The one rule
-/// for x86-64, asked both when coloring and when deciding whether an
-/// ABI-pinned argument must leave its register.
-fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bool {
-    cp.operand_survives(interval.pseudo, interval.start, interval.end)
+/// The register a function whose frame may reach past `i32` holds back as
+/// its *far scratch*: `super::legalize` loads each displacement no 32-bit
+/// field holds into it with `movabsq` and addresses through it.
+///
+/// Decided before allocation, from `crate::arch::regalloc::frame_reach`, an
+/// upper bound on every frame displacement, so allocation runs once; a
+/// function under the bound -- every frame under two gigabytes -- gives
+/// nothing up and comes out as it did. Callee-saved, so the prologue saves
+/// it like any register the function writes; and one the function's inline
+/// asm has not claimed, nor the frame base, nor a global register variable,
+/// for the reasons [`FrameBase::of`] gives. Taken from the far end of the
+/// callee-saved set, where the frame base is taken from the near one.
+fn far_scratch_of(
+    func: &Function,
+    types: &TypeTable,
+    global_registers: &[Reg],
+    frame_base: FrameBase,
+) -> Option<Reg> {
+    if crate::arch::regalloc::frame_reach(func, types) <= i32::MAX as u64 {
+        return None;
+    }
+    let mut claimed = FrameBase::asm_claimed_regs(func);
+    claimed.extend(global_registers.iter().copied());
+    claimed.extend(frame_base.reg());
+    const CANDIDATES: [Reg; 5] = [Reg::R15, Reg::R14, Reg::R13, Reg::R12, Reg::Rbx];
+    let reg = CANDIDATES.into_iter().find(|r| !claimed.contains(r));
+    if reg.is_none() {
+        crate::diag::error(
+            crate::arch::func_pos(func),
+            "inline asm claims every callee-saved register, leaving none \
+             to address this function's frame past two gigabytes",
+        );
+    }
+    reg
 }
 
-/// Keeps [`SPARE_XMM`] free wherever an instruction may write it: no
-/// candidate live there -- an operand included, since the sequence writes
-/// it while its operands are still wanted -- may take it.
-fn spare_xmm_forbidden(
-    func: &Function,
-    intervals: &[LiveInterval],
-    xmm_candidates: &std::collections::BTreeSet<PseudoId>,
-) -> BTreeMap<PseudoId, std::collections::BTreeSet<XmmReg>> {
-    let positions = find_call_positions(func, writes_spare_xmm);
-    intervals
+/// Whether a constraint point may leave `p` in a register it clobbers --
+/// `across` says whether `p` is live across it: only an operand of the
+/// instruction, and only one not live across it (see
+/// [`ConstraintPoint::operand_survives`]). The one rule for x86-64, asked
+/// both when coloring and when deciding whether an ABI-pinned argument must
+/// leave its register.
+fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, p: PseudoId, across: bool) -> bool {
+    cp.operand_survives(p, across)
+}
+
+/// The arguments of `insn` that a System V call reads from the very
+/// register it passes them in, each with that register: none, unless every
+/// argument is an integer or pointer scalar in a register.
+///
+/// In general an argument may not be in a caller-saved register at its
+/// call, and every argument counts as crossing it
+/// ([`Crossing::call_crossers`]): `push_stack_args` stages stacked arguments
+/// through `%rax` and copies aggregates with `rep movsq`, and
+/// `setup_register_args` writes the argument registers in order, while
+/// `save_clobbered_arg_regs` can rescue only two sources an earlier write
+/// would overwrite. A call with nothing on the stack and only scalar integer
+/// arguments writes each argument register once, from its own argument; one
+/// already there is read in place, by no move at all, and nothing before it
+/// writes that register. So such an argument may live there -- in that
+/// register only -- and the value passed from one call's result to the next
+/// needs no callee-saved register. An argument read twice, or also the
+/// call's target, is left out.
+fn args_in_place(insn: &Instruction, types: &TypeTable) -> Vec<(PseudoId, Reg)> {
+    let system_v = insn
+        .extra()
+        .abi_info
+        .as_ref()
+        .is_some_and(|ai| ai.conv != crate::abi::CallingConv::Win64);
+    let arg_types = &insn.extra().arg_types;
+    let scalar = |t: &crate::types::TypeId| {
+        (types.is_integer(*t) || types.kind(*t) == crate::types::TypeKind::Pointer)
+            && !types.is_complex(*t)
+            && types.byte_size(*t) <= ByteSize::new(8)
+    };
+    if insn.op != Opcode::Call
+        || !system_v
+        || insn.src.len() > Reg::arg_regs().len()
+        || arg_types.len() != insn.src.len()
+        || !arg_types.iter().all(scalar)
+    {
+        return Vec::new();
+    }
+    let read = |p: PseudoId| {
+        insn.src.iter().filter(|&&s| s == p).count()
+            + usize::from(insn.extra().indirect_target == Some(p))
+    };
+    insn.src
         .iter()
-        .filter(|i| xmm_candidates.contains(&i.pseudo))
-        .filter(|i| interval_crosses_call(i, &positions))
-        .map(|i| (i.pseudo, std::collections::BTreeSet::from([SPARE_XMM])))
+        .zip(Reg::arg_regs())
+        .filter(|&(&p, _)| read(p) == 1)
+        .map(|(&p, &r)| (p, r))
         .collect()
+}
+
+/// What crosses each call and each constraint point that matters, by exact
+/// liveness ([`crate::arch::regalloc::crossings`]): the one answer every
+/// clobber question of this allocator reads.
+struct Clobbering {
+    crossings: HashMap<usize, Crossing>,
+    /// Each call's position, with the arguments it reads in place.
+    calls: Vec<(usize, Vec<(PseudoId, Reg)>)>,
+    /// The positions that destroy every XMM register
+    /// ([`RegAlloc::fp_call_positions`]).
+    fp_calls: Vec<usize>,
+    /// The instructions that may write [`SPARE_XMM`].
+    spare: Vec<usize>,
+    /// The constraint points that clobber a register a value may be in:
+    /// the others clobber only the scratch R10/R11.
+    points: Vec<ConstraintPoint<Reg>>,
+}
+
+impl Clobbering {
+    fn of(
+        func: &Function,
+        types: &TypeTable,
+        live_out: &[HashSet<PseudoId>],
+        calls: &[usize],
+        fp_calls: Vec<usize>,
+        constraint_points: &[ConstraintPoint<Reg>],
+        allocatable: &[Reg],
+    ) -> Self {
+        let spare = find_call_positions(func, writes_spare_xmm);
+        let points: Vec<ConstraintPoint<Reg>> = constraint_points
+            .iter()
+            .filter(|cp| {
+                cp.clobbers
+                    .iter()
+                    .any(|r| allocatable.contains(r) || Reg::arg_regs().contains(r))
+            })
+            .cloned()
+            .collect();
+        let mut positions: std::collections::BTreeSet<usize> = calls.iter().copied().collect();
+        positions.extend(&fp_calls);
+        positions.extend(&spare);
+        positions.extend(points.iter().map(|cp| cp.position));
+        let insns: Vec<&Instruction> = func.blocks.iter().flat_map(|b| &b.insns).collect();
+        Self {
+            crossings: crate::arch::regalloc::crossings(func, live_out, &positions),
+            calls: calls
+                .iter()
+                .map(|&pos| (pos, args_in_place(insns[pos], types)))
+                .collect(),
+            fp_calls,
+            spare,
+            points,
+        }
+    }
+
+    /// Every pseudo some call touches, in the general bank's sense.
+    fn gp_call_touched(&self) -> HashSet<PseudoId> {
+        self.calls
+            .iter()
+            .flat_map(|(pos, _)| self.crossings[pos].call_crossers())
+            .collect()
+    }
+
+    /// Every pseudo that crosses an instruction destroying the XMM
+    /// registers, an argument and an asm's output included
+    /// ([`Crossing::bank_crossers`]): none of them may be in one.
+    fn fp_call_crossers(&self) -> HashSet<PseudoId> {
+        self.fp_calls
+            .iter()
+            .flat_map(|pos| self.crossings[pos].bank_crossers())
+            .collect()
+    }
+
+    /// Keeps [`SPARE_XMM`] free wherever an instruction may write it: no
+    /// candidate the instruction touches -- an operand included, since the
+    /// sequence writes it while its operands are still wanted -- may take it.
+    fn spare_xmm_forbidden(
+        &self,
+        xmm_candidates: &std::collections::BTreeSet<PseudoId>,
+    ) -> BTreeMap<PseudoId, std::collections::BTreeSet<XmmReg>> {
+        self.spare
+            .iter()
+            .flat_map(|pos| self.crossings[pos].touching())
+            .filter(|(p, _)| xmm_candidates.contains(p))
+            .map(|(p, _)| (p, std::collections::BTreeSet::from([SPARE_XMM])))
+            .collect()
+    }
 }
 
 /// The frame slot `x87.rs` stages a value through on its way into or out of
@@ -1047,14 +1234,14 @@ fn spare_xmm_forbidden(
 /// one way to address it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct X87Scratch {
-    slot: i32,
+    slot: i64,
 }
 
 impl X87Scratch {
     /// Two eight-byte halves: `emit_x87_float_to_u64` uses both at once.
-    pub(super) const BYTES: i32 = 16;
+    pub(super) const BYTES: i64 = 16;
 
-    pub(super) fn slot(self) -> i32 {
+    pub(super) fn slot(self) -> i64 {
         self.slot
     }
 }
@@ -1070,24 +1257,24 @@ impl X87Scratch {
 /// containing such a conversion, and only for those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct X87ControlWords {
-    slot: i32,
+    slot: i64,
 }
 
 impl X87ControlWords {
     /// Bytes reserved: the two 16-bit words, rounded up to the eight every
     /// other slot is laid out in, so the slots after this one stay aligned.
-    const BYTES: i32 = 8;
+    const BYTES: i64 = 8;
 
     /// The stack slot the two words are fields of.
-    pub(super) fn slot(self) -> i32 {
+    pub(super) fn slot(self) -> i64 {
         self.slot
     }
 
     /// Byte offset of the control word found on entry, restored afterwards.
-    pub(super) const SAVED: i32 = 0;
+    pub(super) const SAVED: i64 = 0;
 
     /// Byte offset of the truncating copy loaded around the `fistp`.
-    pub(super) const TRUNCATING: i32 = 2;
+    pub(super) const TRUNCATING: i64 = 2;
 }
 
 /// Where the next stack-passed argument starts, measured from `%rbp` in the
@@ -1099,7 +1286,7 @@ impl X87ControlWords {
 /// through `IncomingOff::take`, which applies the rounding; aarch64's
 /// `IncomingOff::take` is the same shape.
 #[derive(Clone, Copy)]
-struct IncomingOff(i32);
+struct IncomingOff(i64);
 
 impl IncomingOff {
     /// The first stacked argument sits above the saved `%rbp` and the return
@@ -1126,13 +1313,12 @@ impl IncomingOff {
     /// Summed in `i64` and saturated: two stacked arguments each inside the
     /// frame ceiling can still overflow their total. The caller checks the
     /// end once, with [`crate::arch::regalloc::check_incoming_area`].
-    fn take(next: &mut IncomingOff, bytes: i32, align: i32) -> i32 {
+    fn take(next: &mut IncomingOff, bytes: i64, align: i32) -> i64 {
         let align = i64::from(align.max(8));
-        let base = i64::from(IncomingOff::FIRST.0);
-        let at = base + ((i64::from(next.0) - base + align - 1) & !(align - 1));
-        let end = at + ((i64::from(bytes) + 7) & !7);
-        next.0 = i32::try_from(end).unwrap_or(i32::MAX);
-        i32::try_from(at).unwrap_or(i32::MAX)
+        let base = IncomingOff::FIRST.0;
+        let at = base.saturating_add((next.0 - base + align - 1) & !(align - 1));
+        next.0 = at.saturating_add((bytes + 7) & !7);
+        at
     }
 }
 
@@ -1150,10 +1336,6 @@ impl RegAlloc {
             named_gp_regs: 0,
             named_fp_regs: 0,
             named_incoming_end: IncomingOff::FIRST.0,
-            free_regs: Reg::allocatable().to_vec(),
-            free_xmm_regs: XmmReg::allocatable().to_vec(),
-            active: Vec::new(),
-            active_xmm: Vec::new(),
             stack_offset: 0,
             x87_scratch: None,
             x87_control_words: None,
@@ -1167,12 +1349,14 @@ impl RegAlloc {
             int128_incoming: BTreeMap::new(),
             spilled_args: Vec::new(),
             spilled_xmm_args: Vec::new(),
-            active_stack: Vec::new(),
-            free_stack_slots: BTreeMap::new(),
+            stack_homed: BTreeMap::new(),
             live_in: Vec::new(),
             live_out: Vec::new(),
             max_local_align: 8,
             frame_base: FrameBase::Rbp,
+            far_scratch: None,
+            slot_bytes: HashMap::new(),
+            arg_span: HashMap::new(),
             tls_access: crate::target::TlsAccess::ElfStatic,
             guard_requested: false,
             guard_slot: None,
@@ -1207,7 +1391,7 @@ impl RegAlloc {
     }
 
     /// The canary's slot, if [`RegAlloc::with_stack_guard`] asked for one.
-    pub fn stack_guard_slot(&self) -> Option<i32> {
+    pub fn stack_guard_slot(&self) -> Option<i64> {
         self.guard_slot
     }
 
@@ -1228,12 +1412,15 @@ impl RegAlloc {
             self.incoming_stack_align,
         );
         if let Some(base) = self.frame_base.reg() {
-            self.free_regs.retain(|r| *r != base);
             // The prologue writes it, so the function must save it.
             self.used_callee_saved.push(base);
         }
+        self.far_scratch = far_scratch_of(func, types, &self.global_registers, self.frame_base);
+        if let Some(scratch) = self.far_scratch {
+            // So does the legalizer, wherever it needs it.
+            self.used_callee_saved.push(scratch);
+        }
         let allocatable = self.allocatable_regs();
-        self.free_regs.retain(|r| allocatable.contains(r));
         // Before any other slot: the first is the highest, nearest the saved
         // registers, which is where the canary has to be -- and the arrays
         // right under it.
@@ -1287,28 +1474,26 @@ impl RegAlloc {
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_x86_64);
-        let fp_call_positions = self.fp_call_positions(func);
+        let clobbering = Clobbering::of(
+            func,
+            types,
+            &self.live_out,
+            &call_positions,
+            self.fp_call_positions(func),
+            &constraint_points,
+            &self.allocatable_regs(),
+        );
 
-        self.spill_args_across_calls(func, types, &intervals, &call_positions);
-        self.spill_gp_args(&intervals, |interval, reg| {
-            crate::arch::regalloc::clobbered_while_live(
-                interval,
-                reg,
-                &constraint_points,
-                exempt_from_clobber,
-            )
-        });
+        self.spill_args_across_calls(func, types, &intervals, &clobbering);
         self.allocate_alloca_to_stack(func);
         self.place_locals(func, types, &intervals, rest);
-        self.run_chordal_color(
-            func,
-            intervals,
-            &call_positions,
-            &fp_call_positions,
-            &constraint_points,
-        );
+        self.run_chordal_color(func, intervals, &clobbering);
+        self.place_stack_slots(func);
         if win64 {
             self.win64_xmm_saves = self.win64_xmm_to_save(func);
+        }
+        if cfg!(debug_assertions) {
+            self.verify(func, &constraint_points, &call_positions);
         }
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
@@ -1395,10 +1580,6 @@ impl RegAlloc {
     /// Reset allocator state for a new function
     fn reset_state(&mut self) {
         self.locations.clear();
-        self.free_regs = Reg::allocatable().to_vec();
-        self.free_xmm_regs = XmmReg::allocatable().to_vec();
-        self.active.clear();
-        self.active_xmm.clear();
         self.stack_offset = 0;
         self.x87_scratch = None;
         self.x87_control_words = None;
@@ -1411,11 +1592,12 @@ impl RegAlloc {
         self.int128_incoming.clear();
         self.spilled_args.clear();
         self.spilled_xmm_args.clear();
-        self.active_stack.clear();
-        self.free_stack_slots.clear();
+        self.stack_homed.clear();
         self.live_in.clear();
         self.live_out.clear();
         self.max_local_align = 8;
+        self.slot_bytes.clear();
+        self.arg_span.clear();
     }
 
     /// Reserve the [`X87Scratch`] if an instruction of `func` stages a value
@@ -1424,11 +1606,11 @@ impl RegAlloc {
     fn reserve_x87_frame(&mut self, func: &Function, types: &TypeTable) {
         let insns = || func.blocks.iter().flat_map(|block| &block.insns);
         let frame_align = self.frame_align();
-        let mut reserve = |bytes: i32| {
+        let mut reserve = |bytes: i64| {
             crate::arch::regalloc::grow_frame(
                 &mut self.stack_offset,
                 bytes,
-                bytes,
+                bytes as i32,
                 frame_align,
                 self.func_pos,
             )
@@ -1509,7 +1691,7 @@ impl RegAlloc {
             };
             for c in super::inline_asm::x87_operands(asm) {
                 self.fp_pseudos.insert(c.pseudo);
-                if c.size > 64 {
+                if c.size > Bits::new(64) {
                     self.ld_pseudos.insert(c.pseudo);
                 }
             }
@@ -1532,7 +1714,7 @@ impl RegAlloc {
             };
             for c in super::inline_asm::sse_operands(asm) {
                 self.fp_pseudos.insert(c.pseudo);
-                if c.size > 64 {
+                if c.size > Bits::new(64) {
                     self.quad_pseudos.insert(c.pseudo);
                 }
             }
@@ -1557,7 +1739,7 @@ impl RegAlloc {
                 let is_quad = insn
                     .typ
                     .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Float128)
-                    || (matches!(insn.op, Opcode::Simd(_)) && insn.size > 64);
+                    || (matches!(insn.op, Opcode::Simd(_)) && insn.size > Bits::new(64));
                 if is_quad {
                     if let Some(target) = insn.target {
                         self.quad_pseudos.insert(target);
@@ -1691,7 +1873,6 @@ impl RegAlloc {
         // Allocate RDI for hidden return pointer if present
         if let Some(sret_id) = lowering.sret_pseudo {
             self.locations.insert(sret_id, Loc::Reg(int_arg_regs[0]));
-            self.free_regs.retain(|&r| r != int_arg_regs[0]);
             spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
         }
 
@@ -1740,7 +1921,7 @@ impl RegAlloc {
                     Loc::IncomingArg(IncomingOff::take(&mut stack_arg_offset, 16, 16)),
                 );
                 self.fp_pseudos.insert(pseudo_id);
-            } else if sse_struct.is_some() && types.size_bits(*typ) <= 64 {
+            } else if sse_struct.is_some() && types.byte_size(*typ) <= ByteSize::new(8) {
                 // One eightbyte, arriving in an XMM register as a value: the
                 // parameter pseudo *is* that value, and the linearizer's
                 // small-struct path stores it straight into the local. Larger
@@ -1748,7 +1929,6 @@ impl RegAlloc {
                 if fp_arg_idx < fp_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                    self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                     self.fp_pseudos.insert(pseudo_id);
                     spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
                 } else {
@@ -1757,7 +1937,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             8,
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                     self.fp_pseudos.insert(pseudo_id);
@@ -1786,11 +1966,11 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 }
@@ -1816,11 +1996,11 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 } else {
@@ -1842,18 +2022,17 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 } else if fp_arg_idx + sse_regs <= fp_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                    let used = &fp_arg_regs[fp_arg_idx..fp_arg_idx + sse_regs];
-                    self.free_xmm_regs.retain(|r| !used.contains(r));
+                    self.arg_span.insert(pseudo_id, sse_regs);
                     self.fp_pseudos.insert(pseudo_id);
                     spend_arg_regs(&mut fp_arg_idx, sse_regs, fp_arg_regs.len());
                 } else {
@@ -1867,11 +2046,11 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 }
@@ -1879,7 +2058,6 @@ impl RegAlloc {
                 if fp_arg_idx < fp_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Xmm(fp_arg_regs[fp_arg_idx]));
-                    self.free_xmm_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
                     self.fp_pseudos.insert(pseudo_id);
                 } else {
                     // Stack args are placed in parameter order per System V AMD64 ABI
@@ -1890,29 +2068,23 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                 }
                 spend_arg_regs(&mut fp_arg_idx, 1, fp_arg_regs.len());
             } else if types.is_plain_int128(*typ) {
                 // __int128: uses two GP registers when available.
-                // Always allocate a local stack slot — for register params,
+                // Always lives in a frame slot — for register params,
                 // store_args_to_stack stores register values; for stack params,
                 // store_args_to_stack copies from the incoming arg area.
-                self.stack_offset = (self.stack_offset + 15) & !15;
-                self.stack_offset += 16;
-                self.locations
-                    .insert(pseudo_id, Loc::Stack(self.stack_offset));
+                self.home_on_stack(pseudo_id, SlotShape::new(16, 16));
                 self.int128_pseudos.insert(pseudo_id);
                 if int_arg_idx + 1 < int_arg_regs.len() {
-                    self.free_regs.retain(|&r| {
-                        r != int_arg_regs[int_arg_idx] && r != int_arg_regs[int_arg_idx + 1]
-                    });
                     spend_arg_regs(&mut int_arg_idx, 2, int_arg_regs.len());
                 } else {
                     let at = IncomingOff::take(&mut stack_arg_offset, 16, 16);
@@ -1936,18 +2108,17 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             crate::abi::slot_bytes(
-                                types.size_bytes(*typ),
+                                types.byte_size(*typ),
                                 self.func_pos,
                                 "a stacked parameter",
                             ),
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                     // Don't increment int_arg_idx — no GP register consumed
                 } else if int_arg_idx < int_arg_regs.len() {
                     self.locations
                         .insert(pseudo_id, Loc::Reg(int_arg_regs[int_arg_idx]));
-                    self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
                     spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
                 } else {
                     // Stack args are placed in parameter order per System V AMD64 ABI
@@ -1956,7 +2127,7 @@ impl RegAlloc {
                         Loc::IncomingArg(IncomingOff::take(
                             &mut stack_arg_offset,
                             8,
-                            types.alignment(*typ) as i32,
+                            crate::abi::slot_align(types.align(*typ)),
                         )),
                     );
                     spend_arg_regs(&mut int_arg_idx, 1, int_arg_regs.len());
@@ -1977,22 +2148,34 @@ impl RegAlloc {
         crate::arch::regalloc::check_incoming_area(stack_arg_offset.0, self.func_pos);
     }
 
-    /// Spill arguments in caller-saved registers if their interval crosses a call
+    /// Move an argument out of the register it arrived in when that register
+    /// is overwritten while the argument is live: a general register by the
+    /// rule every value is colored by ([`RegAlloc::gp_forbidden`]) -- a call
+    /// it crosses, or a constraint point that clobbers it, such as a variable
+    /// shift loading its count into RCX while the fourth parameter still
+    /// lives there -- and an XMM register where it crosses a call.
     fn spill_args_across_calls(
         &mut self,
         func: &Function,
         types: &TypeTable,
         intervals: &[LiveInterval],
-        call_positions: &[usize],
+        clobbering: &Clobbering,
     ) {
-        self.spill_gp_args(intervals, |interval, _| {
-            interval_crosses_call(interval, call_positions)
+        let args: std::collections::BTreeSet<PseudoId> = self
+            .locations
+            .iter()
+            .filter(|(_, loc)| matches!(loc, Loc::Reg(r) if Reg::arg_regs().contains(r)))
+            .map(|(&p, _)| p)
+            .collect();
+        let forbidden = self.gp_forbidden(clobbering, &args);
+        self.spill_gp_args(intervals, |p, reg| {
+            forbidden.get(&p).is_some_and(|regs| regs.contains(&reg))
         });
 
-        // Always spill XMM function parameter arguments to stack.
-        // All XMM registers are caller-saved on x86-64 SysV ABI, and any float
-        // computation within the function may reuse the same XMM register,
-        // clobbering the parameter value.
+        // An XMM argument crossing an instruction that destroys the XMM
+        // registers -- a call: System V preserves none -- is stored to a
+        // slot at entry. One that crosses none stays where it arrived, a
+        // precolored vertex the other values are colored around.
         //
         // A *complex* parameter is excluded. It arrives in one or two XMM
         // registers depending on its base type, and the prologue in
@@ -2015,39 +2198,37 @@ impl RegAlloc {
             .collect();
 
         let xmm_arg_regs = XmmReg::arg_regs();
+        let crossers = clobbering.fp_call_crossers();
         for interval in intervals {
-            if complex_arg_pseudos.contains(&interval.pseudo) {
+            if complex_arg_pseudos.contains(&interval.pseudo)
+                || !crossers.contains(&interval.pseudo)
+            {
                 continue;
             }
             if let Some(Loc::Xmm(xmm)) = self.locations.get(&interval.pseudo) {
                 if xmm_arg_regs.contains(xmm) && interval.start == 0 {
-                    // This is a function parameter in an XMM register — always spill
                     let from_xmm = *xmm;
                     let is_quad = self.quad_pseudos.contains(&interval.pseudo);
-                    self.stack_offset += if is_quad { 16 } else { 8 };
-                    let to_stack_offset = self.stack_offset;
-
+                    let bytes = if is_quad { 16 } else { 8 };
+                    // The slot's offset is filled in once it is placed.
                     self.spilled_xmm_args.push(SpilledXmmArg {
                         pseudo: interval.pseudo,
                         from_xmm,
-                        to_stack_offset,
+                        to_stack_offset: 0,
                         size: if is_quad {
                             FpSize::Quad
                         } else {
                             FpSize::Double
                         },
                     });
-
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(to_stack_offset));
-                    self.free_xmm_regs.push(from_xmm);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(bytes, bytes));
                 }
             }
         }
     }
 
     /// Where a stack-passed `__int128` parameter arrives, if it did.
-    pub fn int128_incoming(&self, pseudo: PseudoId) -> Option<i32> {
+    pub fn int128_incoming(&self, pseudo: PseudoId) -> Option<i64> {
         self.int128_incoming.get(&pseudo).copied()
     }
 
@@ -2062,7 +2243,7 @@ impl RegAlloc {
     }
 
     /// The `%rbp` displacement where the variadic arguments begin.
-    pub fn named_incoming_end(&self) -> i32 {
+    pub fn named_incoming_end(&self) -> i64 {
         self.named_incoming_end
     }
 
@@ -2082,75 +2263,41 @@ impl RegAlloc {
     }
 
     /// Spill a GP argument out of its ABI register when `overwritten` says
-    /// something destroys that register while the argument is live: a call,
-    /// or a constraint point such as a variable shift loading its count into
-    /// RCX while the fourth parameter still lives there. See
-    /// [`crate::arch::regalloc::spill_gp_args_across`].
+    /// something destroys that register while the argument is live. See
+    /// [`crate::arch::regalloc::gp_args_overwritten`].
     fn spill_gp_args(
         &mut self,
         intervals: &[LiveInterval],
-        overwritten: impl Fn(&LiveInterval, Reg) -> bool,
+        overwritten: impl Fn(PseudoId, Reg) -> bool,
     ) {
-        let int_arg_regs_set: &[Reg] = Reg::arg_regs();
-        let spilled_args = &mut self.spilled_args;
-        let free_regs = &mut self.free_regs;
-        crate::arch::regalloc::spill_gp_args_across(
+        let spills = crate::arch::regalloc::gp_args_overwritten(
             intervals,
+            |p| match self.locations.get(&p) {
+                Some(Loc::Reg(r)) if Reg::arg_regs().contains(r) => Some(*r),
+                _ => None,
+            },
             overwritten,
-            &mut self.locations,
-            &mut self.stack_offset,
-            |reg| int_arg_regs_set.contains(&reg),
-            |loc| {
-                if let Loc::Reg(reg) = loc {
-                    Some(*reg)
-                } else {
-                    None
-                }
-            },
-            Loc::Stack,
-            |pseudo, from_reg, to_stack_offset| {
-                spilled_args.push(SpilledArg {
-                    pseudo,
-                    from_reg,
-                    to_stack_offset,
-                });
-            },
-            |reg| free_regs.push(reg),
         );
+        for (pseudo, from_reg) in spills {
+            // The slot's offset is filled in once it is placed.
+            self.spilled_args.push(SpilledArg {
+                pseudo,
+                from_reg,
+                to_stack_offset: 0,
+            });
+            self.home_on_stack(pseudo, SlotShape::new(8, 8));
+        }
     }
 
-    /// Force alloca results to stack to avoid clobbering issues
+    /// Alloca results live in the frame.
     fn allocate_alloca_to_stack(&mut self, func: &Function) {
-        crate::arch::regalloc::assign_alloca_slots(
-            func,
-            &mut self.stack_offset,
-            &mut self.locations,
-            Loc::Stack,
-        );
+        for p in crate::arch::regalloc::alloca_results(func) {
+            self.home_on_stack(p, SlotShape::new(8, 8));
+        }
     }
 
-    /// Try to reuse a freed stack slot of the given size and alignment.
-    /// Uses interference check to ensure the candidate doesn't overlap with the slot's owner.
-    fn try_reuse_stack_slot(
-        &mut self,
-        size: i32,
-        alignment: i32,
-        candidate_interval: &LiveInterval,
-    ) -> Option<(i32, Vec<LiveInterval>)> {
-        super::super::regalloc::try_reuse_stack_slot(
-            &mut self.free_stack_slots,
-            size,
-            alignment,
-            candidate_interval,
-        )
-    }
-
-    /// Allocate a stack slot, optionally reusing a freed slot.
-    /// Only short-lived spills (no register available, not crossing calls/loops)
-    /// should set `reusable=true`. Call-crossing and in-loop spills have
-    /// unreliable interval estimates in complex control flow (e.g., computed gotos).
     /// A fresh frame slot of `size` bytes at `alignment`, shared with nothing.
-    fn new_frame_slot(&mut self, size: i32, alignment: i32) -> i32 {
+    fn new_frame_slot(&mut self, size: i64, alignment: i32) -> i64 {
         if alignment > self.max_local_align {
             self.max_local_align = alignment;
         }
@@ -2177,44 +2324,52 @@ impl RegAlloc {
             crate::arch::regalloc::place_locals(func, types, pos, intervals, set, |b, a| {
                 self.new_frame_slot(b, a)
             });
-        for (local, offset) in placed {
+        for (local, offset, bytes) in placed {
             self.locations.insert(local, Loc::Stack(offset));
+            self.slot_bytes.insert(local, bytes);
             if func.local_of(local).is_some_and(|l| types.is_float(l.typ)) {
                 self.fp_pseudos.insert(local);
             }
         }
     }
 
-    fn alloc_stack_slot(
-        &mut self,
-        interval: &LiveInterval,
-        size: i32,
-        alignment: i32,
-        reusable: bool,
-    ) {
-        // A reused slot was counted toward the frame's alignment when it was
-        // made; a new one is counted by `new_frame_slot`.
-        if reusable {
-            if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
-                self.locations.insert(interval.pseudo, Loc::Stack(reused));
-                self.active_stack.push(crate::arch::regalloc::ActiveSlot {
-                    current: interval.clone(),
-                    past,
-                    offset: reused,
-                    size,
-                });
-                return;
-            }
+    /// `pseudo` lives in a frame slot of `shape`, wherever it was before. The
+    /// slot is placed by [`RegAlloc::place_stack_slots`].
+    fn home_on_stack(&mut self, pseudo: PseudoId, shape: SlotShape) {
+        self.locations.remove(&pseudo);
+        self.stack_homed.insert(pseudo, shape);
+    }
+
+    /// Has `pseudo` a home already: a location, or a frame slot to come?
+    fn is_placed(&self, pseudo: PseudoId) -> bool {
+        self.locations.contains_key(&pseudo) || self.stack_homed.contains_key(&pseudo)
+    }
+
+    /// Lay out the frame slots of every stack-homed pseudo, sharing between
+    /// those never live together
+    /// ([`crate::arch::regalloc::color_stack_slots`]), and complete the
+    /// spilled arguments' records with where they went. The most aligned
+    /// slots first, so that rounding pads the frame once.
+    fn place_stack_slots(&mut self, func: &Function) {
+        let homed = std::mem::take(&mut self.stack_homed);
+        let coloring = crate::arch::regalloc::color_stack_slots(func, &self.live_out, &homed);
+        let mut order: Vec<usize> = (0..coloring.slots.len()).collect();
+        order.sort_by_key(|&n| (std::cmp::Reverse(coloring.slots[n].align), n));
+        let mut offset = vec![0; coloring.slots.len()];
+        for n in order {
+            let shape = coloring.slots[n];
+            offset[n] = self.new_frame_slot(shape.bytes.into(), shape.align);
         }
-        let offset = self.new_frame_slot(size, alignment);
-        self.locations.insert(interval.pseudo, Loc::Stack(offset));
-        if reusable {
-            self.active_stack.push(crate::arch::regalloc::ActiveSlot {
-                current: interval.clone(),
-                past: Vec::new(),
-                offset,
-                size,
-            });
+        for (&p, &n) in &coloring.slot_of {
+            self.locations.insert(p, Loc::Stack(offset[n]));
+            self.slot_bytes.insert(p, homed[&p].bytes.into());
+        }
+        let slot = |p: PseudoId| offset[coloring.slot_of[&p]];
+        for arg in &mut self.spilled_args {
+            arg.to_stack_offset = slot(arg.pseudo);
+        }
+        for arg in &mut self.spilled_xmm_args {
+            arg.to_stack_offset = slot(arg.pseudo);
         }
     }
 
@@ -2224,7 +2379,7 @@ impl RegAlloc {
     ///   1. Pre-pass: route non-register-allocated pseudos to their
     ///      proper Locs (constants → Imm/FImm, Sym → stack slot,
     ///      int128 → 16-byte stack, long-double → x87 stack, FP
-    ///      crossing call/block boundary → spill XMM caller-saved).
+    ///      crossing a call → stack, every XMM being caller-saved).
     ///      The remaining pseudos go into per-bank candidate sets.
     ///   2. Color: per-bank chordal coloring. ABI-pinned args become
     ///      pre-colored vertices; constraint clobbers (idiv RAX/RDX,
@@ -2238,27 +2393,17 @@ impl RegAlloc {
         &mut self,
         func: &Function,
         intervals: Vec<LiveInterval>,
-        call_positions: &[usize],
-        fp_call_positions: &[usize],
-        constraint_points: &[ConstraintPoint<Reg>],
+        clobbering: &Clobbering,
     ) {
         // -------- Phase 1: pre-pass --------
-        let crosses_blocks = crate::arch::regalloc::live_out_anywhere(&self.live_out);
+        let crosses_calls = clobbering.fp_call_crossers();
         let setval_sizes = crate::arch::regalloc::setval_sizes(func);
         let mut gp_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         let mut xmm_candidates: std::collections::BTreeSet<PseudoId> =
             std::collections::BTreeSet::new();
         for interval in &intervals {
-            // Intervals come pre-sorted by start position from
-            // compute_live_intervals, so this monotonic expiration
-            // keeps slot reuse available to the chordal sweep.
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                interval.start,
-            );
-            if self.locations.contains_key(&interval.pseudo) {
+            if self.is_placed(interval.pseudo) {
                 // Already assigned by allocate_arguments / spill_args
                 // / alloca passes; arg pseudos become pre-colored
                 // graph vertices in Phase 2.
@@ -2278,16 +2423,20 @@ impl RegAlloc {
                         // constants that merely *feed* a 128-bit instruction,
                         // and those are still ordinary immediates that get
                         // widened at the use site.
-                        let defined_128 = setval_sizes.get(&interval.pseudo) == Some(&128);
+                        let defined_128 =
+                            setval_sizes.get(&interval.pseudo) == Some(&Bits::new(128));
                         if defined_128 {
-                            self.alloc_stack_slot(interval, 16, 16, true);
+                            self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                             continue;
                         }
                         self.locations.insert(interval.pseudo, Loc::Imm(*v));
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        let size = setval_sizes.get(&interval.pseudo).copied().unwrap_or(64);
+                        let size = setval_sizes
+                            .get(&interval.pseudo)
+                            .copied()
+                            .unwrap_or(Bits::new(64));
                         self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;
@@ -2307,28 +2456,23 @@ impl RegAlloc {
                 }
             }
             if self.int128_pseudos.contains(&interval.pseudo) {
-                self.alloc_stack_slot(interval, 16, 16, true);
+                self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                 continue;
             }
             let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
             if needs_fp {
-                let is_longdouble = self.ld_pseudos.contains(&interval.pseudo);
-                let is_quad = self.quad_pseudos.contains(&interval.pseudo);
-                let crosses_call = interval_crosses_call(interval, fp_call_positions);
-                let crosses_block = crosses_blocks.contains(&interval.pseudo);
-                if is_longdouble {
-                    self.alloc_stack_slot(interval, 16, 16, false);
+                if self.ld_pseudos.contains(&interval.pseudo) {
+                    self.home_on_stack(interval.pseudo, SlotShape::new(16, 16));
                     continue;
                 }
-                if is_quad && (crosses_call || crosses_block) {
-                    // A `__float128` is 16 bytes. An 8-byte slot let a
-                    // 16-byte store run over its neighbour and read back
-                    // garbage in the low half.
-                    self.alloc_stack_slot(interval, 16, 16, false);
-                    continue;
-                }
-                if crosses_call || crosses_block {
-                    self.alloc_stack_slot(interval, 8, 8, true);
+                // System V preserves no XMM register across a call, so a
+                // value crossing one lives in memory -- sixteen bytes for a
+                // `__float128`, whose 16-byte store ran over an 8-byte slot's
+                // neighbour. Every other value is colored, whatever blocks it
+                // spans.
+                if crosses_calls.contains(&interval.pseudo) {
+                    let bytes = self.fp_slot_bytes(interval.pseudo);
+                    self.home_on_stack(interval.pseudo, SlotShape::new(bytes, bytes));
                     continue;
                 }
                 xmm_candidates.insert(interval.pseudo);
@@ -2338,22 +2482,62 @@ impl RegAlloc {
         }
 
         // -------- Phase 2: per-bank chordal coloring --------
-        self.color_gp_bank(
-            func,
-            &intervals,
-            call_positions,
-            constraint_points,
-            &gp_candidates,
+        self.color_gp_bank(func, &intervals, clobbering, &gp_candidates);
+        self.color_xmm_bank(func, clobbering, &xmm_candidates);
+    }
+
+    /// The general registers each of `candidates` may not take: every
+    /// register a constraint point it touches clobbers, unless the point
+    /// excuses it ([`exempt_from_clobber`]), and every caller-saved register
+    /// where it crosses a call ([`Crossing::call_crossers`]) -- less, for an
+    /// argument of the call, the register the call takes it in, where the
+    /// call reads it in place ([`args_in_place`]).
+    fn gp_forbidden(
+        &self,
+        clobbering: &Clobbering,
+        candidates: &std::collections::BTreeSet<PseudoId>,
+    ) -> BTreeMap<PseudoId, std::collections::BTreeSet<Reg>> {
+        let mut forbidden = crate::arch::regalloc::constraint_clobbers(
+            &clobbering.points,
+            &clobbering.crossings,
+            candidates,
+            exempt_from_clobber,
         );
-        self.color_xmm_bank(func, &intervals, &xmm_candidates);
+        // The argument registers are all caller-saved, allocatable or not.
+        let mut caller_saved: Vec<Reg> = self
+            .allocatable_regs()
+            .into_iter()
+            .filter(|r| !r.is_callee_saved())
+            .collect();
+        for &r in Reg::arg_regs() {
+            if !caller_saved.contains(&r) {
+                caller_saved.push(r);
+            }
+        }
+        for (pos, in_place) in &clobbering.calls {
+            let crossing = &clobbering.crossings[pos];
+            for p in crossing.call_crossers() {
+                if !candidates.contains(&p) {
+                    continue;
+                }
+                let kept = in_place
+                    .iter()
+                    .find(|&&(arg, _)| arg == p && !crossing.across.contains(&p))
+                    .map(|&(_, r)| r);
+                forbidden
+                    .entry(p)
+                    .or_default()
+                    .extend(caller_saved.iter().filter(|&&r| Some(r) != kept));
+            }
+        }
+        forbidden
     }
 
     fn color_gp_bank(
         &mut self,
         func: &Function,
         intervals: &[LiveInterval],
-        call_positions: &[usize],
-        constraint_points: &[ConstraintPoint<Reg>],
+        clobbering: &Clobbering,
         gp_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
         let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
@@ -2392,14 +2576,22 @@ impl RegAlloc {
                 asm_outputs_at.insert(pos, outputs.collect());
             }
         }
-        let writes_it = |cp: &ConstraintPoint<Reg>, interval: &LiveInterval| {
-            exempt_from_clobber(cp, interval)
+        let writes_it = |cp: &ConstraintPoint<Reg>, p: PseudoId, across: bool| {
+            exempt_from_clobber(cp, p, across)
                 || asm_outputs_at
                     .get(&cp.position)
-                    .is_some_and(|outs| outs.contains(&interval.pseudo))
+                    .is_some_and(|outs| outs.contains(&p))
         };
         let allocatable = self.allocatable_regs();
-        for (pid, reg) in collect_asm_fixed_precolors_x86_64(func) {
+        let asm_pins = collect_asm_fixed_precolors_x86_64(func);
+        let pinned: std::collections::BTreeSet<PseudoId> = asm_pins.keys().copied().collect();
+        let pins_clobbered = crate::arch::regalloc::constraint_clobbers(
+            &clobbering.points,
+            &clobbering.crossings,
+            &pinned,
+            writes_it,
+        );
+        for (pid, reg) in asm_pins {
             // Only pre-color if the pseudo is a GP candidate. The
             // lowering already routes pinned-operand registers
             // into the ConstraintPoint clobber set, so even if
@@ -2422,14 +2614,9 @@ impl RegAlloc {
             // one's; uncolored, the pseudo is placed like any other value,
             // kept out of the register by that constraint point, and the asm
             // codegen moves it in and out.
-            let overwritten = by_pseudo.get(&pid).is_some_and(|interval| {
-                crate::arch::regalloc::clobbered_while_live(
-                    interval,
-                    reg,
-                    constraint_points,
-                    writes_it,
-                )
-            });
+            let overwritten = pins_clobbered
+                .get(&pid)
+                .is_some_and(|regs| regs.contains(&reg));
             // Nor if another value already colored that register is live
             // with it: an argument still in %rsi when the operand pinned to
             // %rsi is copied in. `swap(x, y)` into `"S"(x), "D"(y)` wrote x
@@ -2479,41 +2666,27 @@ impl RegAlloc {
         // which would clobber a source sharing the target's register.
         let graph = build_interference_graph(&all_vertices, func, &self.live_out, true);
 
-        // Forbidden colors. Three sources:
-        //   (a) constraint clobbers (idiv RAX/RDX, etc.) — for pseudos
-        //       live across the constraint that are NOT operands.
-        //   (b) cross-call → all caller-saved registers (HARD
-        //       constraint, NOT a preference: the call clobbers them
-        //       and the value would be lost).
-        //   (c) NB: in-loop is NOT a forbidden constraint, only a
-        //       preference (soft) — see preferred_palette below.
+        // Forbidden colors (`gp_forbidden`): constraint clobbers (idiv
+        // RAX/RDX, etc.) for the pseudos a constraint touches that are not
+        // its operands, and every caller-saved register for one that crosses
+        // a call -- a HARD constraint, NOT a preference: the call clobbers
+        // them and the value would be lost. In-loop is NOT a forbidden
+        // constraint, only a preference (soft) -- see preferred_palette
+        // below -- for a value no call touches.
         let allocatable = self.allocatable_regs();
         let caller_saved: Vec<Reg> = allocatable
             .iter()
             .copied()
             .filter(|r| !r.is_callee_saved())
             .collect();
-        let mut forbidden = crate::arch::regalloc::constraint_clobbers(
-            constraint_points,
-            intervals,
-            gp_candidates,
-            exempt_from_clobber,
-        );
-        let mut in_loop_set: std::collections::BTreeSet<PseudoId> =
-            std::collections::BTreeSet::new();
-        for interval in intervals {
-            if !gp_candidates.contains(&interval.pseudo) {
-                continue;
-            }
-            if interval_crosses_call(interval, call_positions) {
-                let entry = forbidden.entry(interval.pseudo).or_default();
-                for &r in &caller_saved {
-                    entry.insert(r);
-                }
-            } else if interval.in_loop {
-                in_loop_set.insert(interval.pseudo);
-            }
-        }
+        let forbidden = self.gp_forbidden(clobbering, gp_candidates);
+        let touched = clobbering.gp_call_touched();
+        let in_loop_set: std::collections::BTreeSet<PseudoId> = intervals
+            .iter()
+            .filter(|i| i.in_loop && gp_candidates.contains(&i.pseudo))
+            .filter(|i| !touched.contains(&i.pseudo))
+            .map(|i| i.pseudo)
+            .collect();
 
         // Preferred palettes: in-loop → callee-saved first, else
         // caller-saved first (to avoid touching callee-saved slots in
@@ -2695,26 +2868,9 @@ impl RegAlloc {
                 self.used_callee_saved.push(s_reg);
             }
         }
-        // The monotonic sweep mirrors linear scan's invariant: a
-        // slot is only freed once the owning interval has ended,
-        // and a new interval's start ≥ the freed slot's owner's
-        // end, so they cannot interfere within a block.
-        let mut ordered_spilled: Vec<(usize, PseudoId)> = final_spilled
-            .iter()
-            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
-            .collect();
-        ordered_spilled.sort_by_key(|&(start, _)| start);
-        for (start, spilled) in ordered_spilled {
-            if self.locations.contains_key(&spilled) {
-                continue;
-            }
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                start,
-            );
-            if let Some(interval) = by_pseudo.get(&spilled).copied() {
-                self.alloc_stack_slot(interval, 8, 8, true);
+        for spilled in final_spilled {
+            if !self.is_placed(spilled) {
+                self.home_on_stack(spilled, SlotShape::new(8, 8));
             }
         }
     }
@@ -2722,10 +2878,9 @@ impl RegAlloc {
     fn color_xmm_bank(
         &mut self,
         func: &Function,
-        intervals: &[LiveInterval],
+        clobbering: &Clobbering,
         xmm_candidates: &std::collections::BTreeSet<PseudoId>,
     ) {
-        let by_pseudo = crate::arch::regalloc::intervals_by_pseudo(intervals);
         use crate::arch::regalloc::{build_interference_graph, greedy_color, mcs_ordering};
         if xmm_candidates.is_empty() {
             return;
@@ -2747,7 +2902,7 @@ impl RegAlloc {
         // paths (e.g. _Py_dg_strtod's correction loop) in non-obvious
         // ways.
         let graph = build_interference_graph(&all_vertices, func, &self.live_out, false);
-        let forbidden = spare_xmm_forbidden(func, intervals, xmm_candidates);
+        let forbidden = clobbering.spare_xmm_forbidden(xmm_candidates);
         let order = mcs_ordering(&graph);
         let result = greedy_color(
             &graph,
@@ -2763,27 +2918,10 @@ impl RegAlloc {
             }
             self.locations.insert(pid, Loc::Xmm(reg));
         }
-        // Same monotonic-by-start spill commit as `color_gp_bank` —
-        // see the comment there for why the earlier `usize::MAX`
-        // drain was unsafe.
-        let mut ordered_spilled: Vec<(usize, PseudoId)> = result
-            .spilled
-            .iter()
-            .filter_map(|&p| by_pseudo.get(&p).copied().map(|i| (i.start, p)))
-            .collect();
-        ordered_spilled.sort_by_key(|&(start, _)| start);
-        for (start, spilled) in ordered_spilled {
-            if self.locations.contains_key(&spilled) {
-                continue;
-            }
-            crate::arch::regalloc::expire_stack_intervals(
-                &mut self.active_stack,
-                &mut self.free_stack_slots,
-                start,
-            );
-            if let Some(interval) = by_pseudo.get(&spilled).copied() {
+        for spilled in result.spilled {
+            if !self.is_placed(spilled) {
                 let bytes = self.fp_slot_bytes(spilled);
-                self.alloc_stack_slot(interval, bytes, bytes, true);
+                self.home_on_stack(spilled, SlotShape::new(bytes, bytes));
             }
         }
     }
@@ -2798,6 +2936,152 @@ impl RegAlloc {
         } else {
             8
         }
+    }
+
+    /// Check the finished assignment against exact liveness; see
+    /// [`crate::arch::regalloc::verify_assignment`]. A debug build only.
+    ///
+    /// What this backend tells the verifier: where each location is; what
+    /// each instruction overwrites -- a call every caller-saved register and
+    /// every XMM register, a constraint point its clobbers, an asm the XMM
+    /// registers it names, a SIMD sequence [`SPARE_XMM`], the Mach-O TLV
+    /// getter every XMM register; which frame slots the frame reserves; and
+    /// that a general register or a frame slot may not hold a def and a
+    /// source of the same instruction -- the two-address lowerings write the
+    /// target before they read the second source -- while an XMM register
+    /// may, and an identity `Copy` is no instruction at all.
+    fn verify(
+        &self,
+        func: &Function,
+        constraint_points: &[ConstraintPoint<Reg>],
+        call_positions: &[usize],
+    ) {
+        use crate::arch::regalloc::{Assignment, Cell, Clobber, Spared};
+        let cells = |p: PseudoId, loc: &Loc| -> Vec<Cell<RegUnit>> {
+            match loc {
+                Loc::Reg(r) => vec![Cell::Reg(RegUnit::Gp(*r))],
+                Loc::Xmm(x) => {
+                    let span = self.arg_span.get(&p).copied().unwrap_or(1);
+                    let regs = XmmReg::arg_regs();
+                    match regs.iter().position(|r| r == x) {
+                        Some(first) if span > 1 => regs[first..first + span]
+                            .iter()
+                            .map(|&r| Cell::Reg(RegUnit::Xmm(r)))
+                            .collect(),
+                        _ => vec![Cell::Reg(RegUnit::Xmm(*x))],
+                    }
+                }
+                Loc::Stack(n) => {
+                    let bytes = self.slot_bytes.get(&p).copied().unwrap_or_else(|| {
+                        panic!(
+                            "internal compiler error: {p} of `{}` has frame slot {n} \
+                             but no recorded size",
+                            func.name
+                        )
+                    });
+                    let lo = -(*n);
+                    vec![Cell::Frame { lo, hi: lo + bytes }]
+                }
+                Loc::IncomingArg(o) => vec![Cell::Incoming(*o)],
+                Loc::Imm(_) | Loc::FImm(..) | Loc::Global(_) => Vec::new(),
+            }
+        };
+
+        let gp = |regs: &[Reg]| regs.iter().map(|&r| RegUnit::Gp(r)).collect::<Vec<_>>();
+        let every_xmm = || XmmReg::allocatable().iter().map(|&x| RegUnit::Xmm(x));
+        let mut clobbers: Vec<Clobber<RegUnit>> = constraint_points
+            .iter()
+            .map(|cp| Clobber {
+                position: cp.position,
+                regs: gp(&cp.clobbers),
+                spared: Spared::Ends(cp.involved_pseudos.clone()),
+                why: "the instruction",
+            })
+            .collect();
+        let caller_saved: Vec<RegUnit> = Reg::allocatable()
+            .iter()
+            .filter(|r| !r.is_callee_saved())
+            .map(|&r| RegUnit::Gp(r))
+            .chain(every_xmm())
+            .collect();
+        clobbers.extend(call_positions.iter().map(|&position| Clobber {
+            position,
+            regs: caller_saved.clone(),
+            spared: Spared::Operands,
+            why: "a call",
+        }));
+        let tlv = self.tls_access == crate::target::TlsAccess::MachOTlv;
+        for (position, insn) in func.blocks.iter().flat_map(|b| &b.insns).enumerate() {
+            if tlv && insn.op == Opcode::TlsAddr {
+                clobbers.push(Clobber {
+                    position,
+                    regs: every_xmm().collect(),
+                    spared: Spared::Operands,
+                    why: "the TLV getter",
+                });
+            }
+            let named: Vec<RegUnit> = asm_clobbered(insn, parse_xmm_clobber_name)
+                .into_iter()
+                .filter_map(|n| XmmReg::allocatable().get(usize::from(n)))
+                .map(|&x| RegUnit::Xmm(x))
+                .collect();
+            if !named.is_empty() {
+                clobbers.push(Clobber {
+                    position,
+                    regs: named,
+                    spared: Spared::Nothing,
+                    why: "the asm's clobber list",
+                });
+            }
+            if writes_spare_xmm(insn.op) {
+                clobbers.push(Clobber {
+                    position,
+                    regs: vec![RegUnit::Xmm(SPARE_XMM)],
+                    spared: Spared::Nothing,
+                    why: "the SIMD sequence",
+                });
+            }
+        }
+
+        let frame = |slot: i64, bytes: i64| {
+            let lo = -slot;
+            Cell::Frame { lo, hi: lo + bytes }
+        };
+        let mut reserved = Vec::new();
+        if let Some(slot) = self.guard_slot {
+            reserved.push(("the canary's slot", frame(slot, 8)));
+        }
+        if let Some(s) = self.x87_scratch {
+            reserved.push(("the x87 scratch slot", frame(s.slot(), X87Scratch::BYTES)));
+        }
+        if let Some(s) = self.x87_control_words {
+            reserved.push((
+                "the x87 control words' slot",
+                frame(s.slot(), X87ControlWords::BYTES),
+            ));
+        }
+        // The stack and frame pointers, the scratch pair, the frame base
+        // and the global register variables: every general register this
+        // function may not colour with, and the two scratch XMM registers.
+        let allocatable = self.allocatable_regs();
+        let held_back = EVERY_GP
+            .iter()
+            .filter(|r| !allocatable.contains(r))
+            .map(|&r| RegUnit::Gp(r))
+            .chain([RegUnit::Xmm(XmmReg::Xmm14), RegUnit::Xmm(XmmReg::Xmm15)]);
+        reserved.extend(held_back.map(|u| ("a register held back from allocation", Cell::Reg(u))));
+        let def_may_share_src = |insn: &Instruction, cell: &Cell<RegUnit>| {
+            insn.op == Opcode::Copy || matches!(cell, Cell::Reg(RegUnit::Xmm(_)))
+        };
+        crate::arch::regalloc::verify_assignment(&Assignment {
+            func,
+            live_out: &self.live_out,
+            locations: &self.locations,
+            cells: &cells,
+            clobbers,
+            reserved,
+            def_may_share_src: &def_may_share_src,
+        });
     }
 
     /// Compute live intervals, constraint points, and per-block liveness sets.
@@ -2817,8 +3101,8 @@ impl RegAlloc {
         base.max(self.max_local_align).max(16)
     }
 
-    pub fn stack_size(&self) -> i32 {
-        let align = self.max_local_align.max(16);
+    pub fn stack_size(&self) -> i64 {
+        let align = i64::from(self.max_local_align.max(16));
         (self.stack_offset + align - 1) & !(align - 1)
     }
 
@@ -2841,12 +3125,18 @@ impl RegAlloc {
     /// and withholding the base from `free_regs` alone left it free to hand
     /// out the very register the prologue overwrites.
     fn allocatable_regs(&self) -> Vec<Reg> {
-        let claimed = self.frame_base.reg();
+        let claimed = [self.frame_base.reg(), self.far_scratch];
         Reg::allocatable()
             .iter()
             .copied()
-            .filter(|r| Some(*r) != claimed && !self.global_registers.contains(r))
+            .filter(|r| !claimed.contains(&Some(*r)) && !self.global_registers.contains(r))
             .collect()
+    }
+
+    /// The register this function reaches far displacements through, if its
+    /// frame may have any; see [`far_scratch_of`].
+    pub fn far_scratch(&self) -> Option<Reg> {
+        self.far_scratch
     }
 
     /// Get callee-saved registers that need to be preserved
@@ -2897,7 +3187,7 @@ mod tests {
         for align in [32, 64] {
             let mut next = IncomingOff::FIRST;
             assert_eq!(
-                IncomingOff::take(&mut next, align, align),
+                IncomingOff::take(&mut next, align, align as i32),
                 first,
                 "an {align}-aligned argument arriving first starts at the area base"
             );
@@ -2909,7 +3199,7 @@ mod tests {
             let mut next = IncomingOff::FIRST;
             assert_eq!(IncomingOff::take(&mut next, 8, 8), first);
             assert_eq!(
-                IncomingOff::take(&mut next, align, align),
+                IncomingOff::take(&mut next, align, align as i32),
                 first + align,
                 "an {align}-aligned argument rounds within the argument area"
             );
@@ -3003,7 +3293,9 @@ mod tests {
         use crate::ir::{AsmConstraint, AsmData};
         let (outputs, inputs): (Vec<_>, Vec<_>) = operands
             .iter()
-            .map(|&(c, pseudo)| AsmConstraint::new(pseudo, c, crate::target::Arch::X86_64, 64))
+            .map(|&(c, pseudo)| {
+                AsmConstraint::new(pseudo, c, crate::target::Arch::X86_64, Bits::new(64))
+            })
             .partition(|c| c.class.access != AsmAccess::Read);
         let mut insn = Instruction::new(Opcode::Asm);
         insn.extra_mut().asm_data = Some(Box::new(AsmData {
@@ -3090,7 +3382,7 @@ mod tests {
         let data = asm.extra_mut().asm_data.as_mut().unwrap();
         data.inputs[1].matching_output = Some(0);
         let mut ld = make_asm_insn(&[], &[("=f", PseudoId(5))]);
-        ld.extra_mut().asm_data.as_mut().unwrap().outputs[0].size = 128;
+        ld.extra_mut().asm_data.as_mut().unwrap().outputs[0].size = Bits::new(128);
 
         let types = crate::types::TypeTable::new(&crate::target::Target::host());
         let mut func = Function::new("f", types.void_id);
@@ -3130,6 +3422,44 @@ mod tests {
         let neighbors: Vec<PseudoId> = graph.neighbors(PseudoId(1)).collect();
         assert!(neighbors.contains(&PseudoId(2)), "{neighbors:?}");
         assert!(!neighbors.contains(&PseudoId(3)), "{neighbors:?}");
+    }
+
+    /// Only a frame that may reach past `i32` holds back a far scratch: the
+    /// last callee-saved register the frame base, a global register variable
+    /// and inline asm leave it. Every other frame gives nothing up.
+    #[test]
+    fn far_scratch_only_for_a_frame_past_two_gigabytes() {
+        use crate::ir::{BasicBlock, BasicBlockId, Function};
+        use crate::types::Type;
+        let mut types = crate::types::TypeTable::new(&crate::target::Target::host());
+        let big = types.intern(Type::array(types.char_id, 3_000_000_000));
+        let small = types.intern(Type::array(types.char_id, 4096));
+        let func = |typ, clobbers: &[&str]| {
+            let mut func = Function::new("f", types.void_id);
+            func.add_local("a", PseudoId(1), typ, None, None);
+            let mut block = BasicBlock::new(BasicBlockId(0));
+            if !clobbers.is_empty() {
+                block.insns.push(make_asm_insn(clobbers, &[]));
+            }
+            func.blocks.push(block);
+            func
+        };
+        let near = func(small, &[]);
+        assert_eq!(far_scratch_of(&near, &types, &[], FrameBase::Rbp), None);
+        let far = func(big, &[]);
+        assert_eq!(
+            far_scratch_of(&far, &types, &[], FrameBase::Rbp),
+            Some(Reg::R15)
+        );
+        let base = FrameBase::Aligned {
+            reg: Reg::R13,
+            align: 32,
+        };
+        let claimed = func(big, &["r15"]);
+        assert_eq!(
+            far_scratch_of(&claimed, &types, &[Reg::R14], base),
+            Some(Reg::R12)
+        );
     }
 
     /// A `Q` operand is pinned to the first of %rax..%rdx that the statement
@@ -3270,7 +3600,7 @@ mod arg_location_tests {
 
         // Past the sixth, arguments arrive in the caller's frame: 16 bytes up
         // from the frame pointer (saved rbp + return address), then every 8.
-        for (i, want) in [(6u32, 16i32), (7, 24), (8, 32)] {
+        for (i, want) in [(6u32, 16i64), (7, 24), (8, 32)] {
             assert_eq!(
                 locs.get(PseudoId(i)),
                 Some(Loc::IncomingArg(want)),

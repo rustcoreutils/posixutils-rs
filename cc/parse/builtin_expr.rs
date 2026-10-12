@@ -23,6 +23,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
 use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers};
+use crate::units::ByteSize;
 use gettextrs::gettext;
 
 /// What is statically known about the object a pointer points into, and
@@ -197,8 +198,8 @@ impl Parser<'_> {
                     TypeKind::Pointer => true,
                     _ => {
                         self.types.is_integer(*cast_type)
-                            && self.types.size_bits(*cast_type)
-                                == self.types.size_bits(self.types.void_ptr_id)
+                            && self.types.value_bits(*cast_type)
+                                == self.types.value_bits(self.types.void_ptr_id)
                     }
                 };
                 keeps && self.is_string_literal_start(inner)
@@ -1127,14 +1128,14 @@ impl Parser<'_> {
                 // bit-field.
                 let mut current = type_id;
                 // The element size each variable index scales by.
-                let mut scales: Vec<(Expr, usize)> = Vec::new();
+                let mut scales: Vec<(Expr, ByteSize)> = Vec::new();
                 let mut variable = variable.into_iter().peekable();
                 for (at, step) in path.iter().enumerate() {
                     if let (OffsetOfPath::Index(_), Some(elem)) =
                         (step, self.types.base_type(current))
                     {
                         if let Some((_, index)) = variable.next_if(|(place, _)| *place == at) {
-                            scales.push((index, self.types.size_bytes(elem)));
+                            scales.push((index, self.types.byte_size(elem)));
                         }
                     }
                     current = match step {
@@ -1173,7 +1174,11 @@ impl Parser<'_> {
     /// 0, plus each index converted to `size_t` times its element size --
     /// an ordinary run-time `size_t` expression. With no such index it is
     /// `constant` itself, an integer constant expression.
-    fn offsetof_plus_variable_indices(&self, constant: Expr, scales: Vec<(Expr, usize)>) -> Expr {
+    fn offsetof_plus_variable_indices(
+        &self,
+        constant: Expr,
+        scales: Vec<(Expr, ByteSize)>,
+    ) -> Expr {
         let size_t = self.types.ulong_id;
         scales.into_iter().fold(constant, |sum, (index, scale)| {
             let pos = index.pos;
@@ -1185,7 +1190,7 @@ impl Parser<'_> {
                 size_t,
                 pos,
             );
-            let scale = Self::typed_expr(ExprKind::IntLit(scale as i64), size_t, pos);
+            let scale = Self::typed_expr(ExprKind::IntLit(scale.get() as i64), size_t, pos);
             let term = Self::typed_expr(
                 ExprKind::Binary {
                     op: BinaryOp::Mul,
@@ -1800,7 +1805,7 @@ impl Parser<'_> {
             let kind = self.types.kind(p);
             let operand = (self.is_integral(p) && !(arithmetic && kind == TypeKind::Bool))
                 || kind == TypeKind::Pointer;
-            operand && matches!(self.types.size_bytes(p), 1 | 2 | 4 | 8 | 16)
+            operand && matches!(self.types.byte_size(p).get(), 1 | 2 | 4 | 8 | 16)
         });
         if !valid {
             let type_name = self.types.format_type(typ, Some(self.idents));
@@ -2303,7 +2308,7 @@ impl Parser<'_> {
             None if is_array && extent == crate::types::ArrayExtent::Known(0) => 0,
             None => return None,
         };
-        outer.narrow(info.offset as u64, size, at_end, array)
+        outer.narrow(info.offset.get(), size, at_end, array)
     }
 
     /// Whether a trailing array of `extent` may be a flexible array in all
@@ -2359,11 +2364,11 @@ impl Parser<'_> {
 
     /// Size in bytes of a type whose size is known and non-zero.
     fn byte_size(&self, typ: TypeId) -> Option<u64> {
-        let bytes = self.types.size_bytes(typ);
-        if bytes == 0 {
+        let bytes = self.types.byte_size(typ);
+        if bytes.is_zero() {
             return None;
         }
-        Some(bytes as u64)
+        Some(bytes.get())
     }
 
     /// Size of what `expr` points at, for scaling pointer arithmetic.

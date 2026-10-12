@@ -13,6 +13,7 @@
 
 use super::{BasicBlockId, Function, Instruction, Module, Opcode, PseudoKind};
 use crate::types::TypeId;
+use crate::units::Bits;
 use std::collections::HashMap;
 
 const DEFAULT_COPY_CAPACITY: usize = 8;
@@ -185,7 +186,7 @@ fn route_unsplit_phis(func: &mut Function) -> HashMap<crate::ir::PseudoId, crate
 struct CopyInfo {
     target: crate::ir::PseudoId,
     source: crate::ir::PseudoId,
-    size: u32,
+    size: Bits,
     typ: Option<TypeId>,
 }
 
@@ -359,9 +360,9 @@ mod tests {
         entry.children = vec![BasicBlockId(1)];
         entry.add_insn(Instruction::new(Opcode::Entry));
         // %1 = setval 0 (initial value)
-        entry.add_insn(Instruction::set_val(PseudoId(1), int_type, 32));
+        entry.add_insn(Instruction::set_val(PseudoId(1), int_type, Bits::new(32)));
         // PhiSource: %5 = phisrc %1 (-> .L1:%3)
-        let mut phisrc1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, 32);
+        let mut phisrc1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, Bits::new(32));
         phisrc1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
         entry.add_insn(phisrc1);
         entry.add_insn(Instruction::br(BasicBlockId(1)));
@@ -372,7 +373,7 @@ mod tests {
         cond.children = vec![BasicBlockId(2), BasicBlockId(3)];
 
         // Phi node: %3 = phi [.L0: %5], [.L2: %6]
-        let mut phi = Instruction::phi(PseudoId(3), int_type, 32);
+        let mut phi = Instruction::phi(PseudoId(3), int_type, Bits::new(32));
         phi.phi_list = vec![(BasicBlockId(0), phisrc1_id), (BasicBlockId(2), phisrc2_id)];
         cond.add_insn(phi);
         cond.add_insn(Instruction::cbr(
@@ -392,11 +393,11 @@ mod tests {
             PseudoId(3),
             PseudoId(4), // constant 1
             int_type,
-            32,
+            Bits::new(32),
         );
         body.add_insn(add);
         // PhiSource: %6 = phisrc %2 (-> .L1:%3)
-        let mut phisrc2 = Instruction::phi_source(phisrc2_id, PseudoId(2), int_type, 32);
+        let mut phisrc2 = Instruction::phi_source(phisrc2_id, PseudoId(2), int_type, Bits::new(32));
         phisrc2.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
         body.add_insn(phisrc2);
         body.add_insn(Instruction::br(BasicBlockId(1)));
@@ -529,13 +530,13 @@ mod tests {
             CopyInfo {
                 target: PseudoId(1),
                 source: PseudoId(10),
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
             CopyInfo {
                 target: PseudoId(2),
                 source: PseudoId(20),
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
         ];
@@ -560,13 +561,13 @@ mod tests {
             CopyInfo {
                 target: PseudoId(1), // a
                 source: PseudoId(2), // b
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
             CopyInfo {
                 target: PseudoId(2),  // b
                 source: PseudoId(10), // x
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
         ];
@@ -590,13 +591,13 @@ mod tests {
             CopyInfo {
                 target: PseudoId(1), // a
                 source: PseudoId(2), // b
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
             CopyInfo {
                 target: PseudoId(2), // b
                 source: PseudoId(1), // a
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
         ];
@@ -625,19 +626,19 @@ mod tests {
             CopyInfo {
                 target: PseudoId(1), // a
                 source: PseudoId(2), // b
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
             CopyInfo {
                 target: PseudoId(2), // b
                 source: PseudoId(3), // c
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
             CopyInfo {
                 target: PseudoId(3), // c
                 source: PseudoId(1), // a
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
         ];
@@ -679,25 +680,25 @@ mod tests {
             CopyInfo {
                 target: PseudoId(1), // a
                 source: PseudoId(2), // b
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
             CopyInfo {
                 target: PseudoId(2), // b
                 source: PseudoId(1), // a
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
             CopyInfo {
                 target: PseudoId(3), // c
                 source: PseudoId(4), // d
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
             CopyInfo {
                 target: PseudoId(4), // d
                 source: PseudoId(3), // c
-                size: 32,
+                size: Bits::new(32),
                 typ: None,
             },
         ];
@@ -737,13 +738,13 @@ mod tests {
             CopyInfo {
                 target: PseudoId(1),
                 source: PseudoId(2),
-                size: 32,
+                size: Bits::new(32),
                 typ: Some(float_type),
             },
             CopyInfo {
                 target: PseudoId(2),
                 source: PseudoId(1),
-                size: 32,
+                size: Bits::new(32),
                 typ: Some(float_type),
             },
         ];
@@ -781,14 +782,14 @@ mod tests {
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.children = vec![BasicBlockId(1)];
         entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::set_val(PseudoId(1), int_type, 32));
-        entry.add_insn(Instruction::set_val(PseudoId(2), int_type, 32));
+        entry.add_insn(Instruction::set_val(PseudoId(1), int_type, Bits::new(32)));
+        entry.add_insn(Instruction::set_val(PseudoId(2), int_type, Bits::new(32)));
         // PhiSource for phi_a (%3): src=%1
-        let mut ps1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, 32);
+        let mut ps1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, Bits::new(32));
         ps1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
         entry.add_insn(ps1);
         // PhiSource for phi_b (%4): src=%2
-        let mut ps2 = Instruction::phi_source(phisrc2_id, PseudoId(2), int_type, 32);
+        let mut ps2 = Instruction::phi_source(phisrc2_id, PseudoId(2), int_type, Bits::new(32));
         ps2.phi_list = vec![(BasicBlockId(1), PseudoId(4))];
         entry.add_insn(ps2);
         entry.add_insn(Instruction::br(BasicBlockId(1)));
@@ -797,13 +798,13 @@ mod tests {
         let mut cond = BasicBlock::new(BasicBlockId(1));
         cond.parents = vec![BasicBlockId(0), BasicBlockId(2)];
         cond.children = vec![BasicBlockId(2), BasicBlockId(3)];
-        let mut phi_a = Instruction::phi(PseudoId(3), int_type, 32);
+        let mut phi_a = Instruction::phi(PseudoId(3), int_type, Bits::new(32));
         phi_a.phi_list = vec![
             (BasicBlockId(0), phisrc1_id),
             (BasicBlockId(2), phisrc3_id), // from body: was %4
         ];
         cond.add_insn(phi_a);
-        let mut phi_b = Instruction::phi(PseudoId(4), int_type, 32);
+        let mut phi_b = Instruction::phi(PseudoId(4), int_type, Bits::new(32));
         phi_b.phi_list = vec![
             (BasicBlockId(0), phisrc2_id),
             (BasicBlockId(2), phisrc4_id), // from body: was %3
@@ -820,11 +821,11 @@ mod tests {
         body.parents = vec![BasicBlockId(1)];
         body.children = vec![BasicBlockId(1)];
         // PhiSource for phi_a (%3): src=%4 (the swap!)
-        let mut ps3 = Instruction::phi_source(phisrc3_id, PseudoId(4), int_type, 32);
+        let mut ps3 = Instruction::phi_source(phisrc3_id, PseudoId(4), int_type, Bits::new(32));
         ps3.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
         body.add_insn(ps3);
         // PhiSource for phi_b (%4): src=%3 (the swap!)
-        let mut ps4 = Instruction::phi_source(phisrc4_id, PseudoId(3), int_type, 32);
+        let mut ps4 = Instruction::phi_source(phisrc4_id, PseudoId(3), int_type, Bits::new(32));
         ps4.phi_list = vec![(BasicBlockId(1), PseudoId(4))];
         body.add_insn(ps4);
         body.add_insn(Instruction::br(BasicBlockId(1)));
@@ -888,7 +889,7 @@ mod tests {
             Instruction::new(Opcode::ConstantP)
                 .with_target(PseudoId(1))
                 .with_src(PseudoId(0))
-                .with_type_and_size(types.int_id, 32),
+                .with_type_and_size(types.int_id, Bits::new(32)),
         );
         b0.add_insn(Instruction::ret(Some(PseudoId(1))));
         func.add_block(b0);
@@ -928,7 +929,7 @@ mod tests {
                 )))
                 .with_target(PseudoId(t))
                 .with_src(PseudoId(0))
-                .with_type_and_size(ulong, 64),
+                .with_type_and_size(ulong, Bits::new(64)),
             );
         }
         b0.add_insn(Instruction::ret(Some(PseudoId(1))));
@@ -964,12 +965,12 @@ mod tests {
         f.next_pseudo = 8;
         let mut b0 = BasicBlock::new(BasicBlockId(0));
         b0.add_insn(Instruction::new(Opcode::Entry));
-        let mut s0 = Instruction::phi_source(PseudoId(5), PseudoId(1), int, 32);
+        let mut s0 = Instruction::phi_source(PseudoId(5), PseudoId(1), int, Bits::new(32));
         s0.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
         b0.add_insn(s0);
         b0.add_insn(Instruction::br(BasicBlockId(1)));
         let mut b1 = BasicBlock::new(BasicBlockId(1));
-        let mut phi = Instruction::phi(PseudoId(3), int, 32);
+        let mut phi = Instruction::phi(PseudoId(3), int, Bits::new(32));
         phi.phi_list = vec![
             (BasicBlockId(0), PseudoId(5)),
             (BasicBlockId(1), PseudoId(6)),
@@ -981,9 +982,9 @@ mod tests {
             PseudoId(3),
             PseudoId(4),
             int,
-            32,
+            Bits::new(32),
         ));
-        let mut s1 = Instruction::phi_source(PseudoId(6), PseudoId(2), int, 32);
+        let mut s1 = Instruction::phi_source(PseudoId(6), PseudoId(2), int, Bits::new(32));
         s1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
         b1.add_insn(s1);
         b1.add_insn(Instruction::cbr(
@@ -1052,7 +1053,7 @@ mod tests {
         // .L1 or .L2 by address. .L1 merges a value from .L0 and from .L3.
         let mut b0 = BasicBlock::new(BasicBlockId(0));
         b0.add_insn(Instruction::new(Opcode::Entry));
-        let mut s0 = Instruction::phi_source(PseudoId(5), PseudoId(1), int, 32);
+        let mut s0 = Instruction::phi_source(PseudoId(5), PseudoId(1), int, Bits::new(32));
         s0.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
         b0.add_insn(s0);
         b0.add_insn(Instruction::cbr(
@@ -1061,13 +1062,13 @@ mod tests {
             BasicBlockId(3),
         ));
         let mut b3 = BasicBlock::new(BasicBlockId(3));
-        let mut s3 = Instruction::phi_source(PseudoId(6), PseudoId(2), int, 32);
+        let mut s3 = Instruction::phi_source(PseudoId(6), PseudoId(2), int, Bits::new(32));
         s3.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
         b3.add_insn(s3);
         b3.add_insn(Instruction::indirect_br(PseudoId(4)));
         let mut b1 = BasicBlock::new(BasicBlockId(1));
         b1.addr_taken = true;
-        let mut phi = Instruction::phi(PseudoId(3), int, 32);
+        let mut phi = Instruction::phi(PseudoId(3), int, Bits::new(32));
         phi.phi_list = vec![
             (BasicBlockId(0), PseudoId(5)),
             (BasicBlockId(3), PseudoId(6)),

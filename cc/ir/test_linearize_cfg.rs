@@ -22,6 +22,7 @@ use crate::parse::ast::{
 use crate::strings::StringTable;
 use crate::target::Target;
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeTable};
+use crate::units::ByteSize;
 
 // Nested if-else CFG edge linking
 
@@ -957,7 +958,7 @@ fn test_conditional_short_circuit_arrow() {
     let members = vec![StructMember {
         name: x_id,
         typ: int_type,
-        offset: 0,
+        offset: ByteSize::ZERO,
         bit_offset: None,
         bit_width: None,
         access_bytes: None,
@@ -967,9 +968,9 @@ fn test_conditional_short_circuit_arrow() {
         tag: None,
         members,
         enum_constants: vec![],
-        size: 4,
-        align: 4,
-        member_align: 4,
+        size: ByteSize::new(4),
+        align: crate::units::Align::of_bytes(4),
+        member_align: crate::units::Align::of_bytes(4),
         is_complete: true,
         transparent: false,
         reverse_order: false,

@@ -23,6 +23,7 @@ use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to
 use crate::ir::{Instruction, Module, NanCompare, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
+use crate::units::Bits;
 use std::collections::{HashMap, HashSet};
 
 // x86-64 Code Generator
@@ -42,14 +43,14 @@ pub struct X86_64CodeGen {
     /// Callee-saved registers used in current function (for epilogue)
     pub(super) callee_saved_regs: Vec<Reg>,
     /// Offset to add to stack locations to account for callee-saved registers
-    pub(super) callee_saved_offset: i32,
+    pub(super) callee_saved_offset: i64,
     /// Bytes the prologue allocates for locals: what a dynamically aligned
     /// frame addresses them from.
-    pub(super) stack_alloc_size: i32,
+    pub(super) stack_alloc_size: i64,
     /// The stack-protector canary's slot, when this function has one.
-    pub(super) stack_guard: Option<i32>,
+    pub(super) stack_guard: Option<i64>,
     /// Offset from rbp to register save area (for variadic functions)
-    pub(super) reg_save_area_offset: i32,
+    pub(super) reg_save_area_offset: i64,
     /// GP argument registers the named parameters consumed, for `va_start`'s
     /// `gp_offset` (variadic functions only).
     pub(super) named_gp_regs: usize,
@@ -63,7 +64,7 @@ pub struct X86_64CodeGen {
     /// consuming a register, and `IncomingOff::take` may insert alignment
     /// padding, so no multiple of eight derived from register overflow can
     /// express where the area actually ends.
-    pub(super) named_incoming_end: i32,
+    pub(super) named_incoming_end: i64,
     /// Counter for generating unique internal labels
     pub(super) unique_label_counter: u32,
     /// External symbols (need GOT access on macOS)
@@ -112,6 +113,14 @@ pub struct X86_64CodeGen {
     /// the object -- [`Self::address_of_pseudo`] loads the one and takes the
     /// address of the other.
     pub(super) incoming_pointers: HashSet<PseudoId>,
+    /// Under `-fstack-clash-protection`, the most the current function's
+    /// stack pointer stands below its last probe once the prologue is done:
+    /// the part of the frame the prologue leaves unprobed. See
+    /// `X86_64CodeGen::emit_frame_allocation`.
+    pub(super) unprobed_frame: i64,
+    /// The register the current function reaches displacements past 32
+    /// bits through, when its frame may have any; see `super::legalize`.
+    pub(super) far_scratch: Option<Reg>,
 }
 
 impl X86_64CodeGen {
@@ -146,6 +155,8 @@ impl X86_64CodeGen {
             func_conv: crate::abi::CallingConv::C,
             win64_xmm_saves: Vec::new(),
             incoming_pointers: HashSet::new(),
+            unprobed_frame: 0,
+            far_scratch: None,
         }
     }
 
@@ -166,9 +177,30 @@ impl X86_64CodeGen {
         });
     }
 
-    /// Push a LIR instruction to the buffer (deferred emission)
+    /// Push a LIR instruction to the buffer (deferred emission), through
+    /// [`super::legalize::legalize`]: one whose displacement or immediate is
+    /// past 32 bits goes through the function's far scratch.
     pub(super) fn push_lir(&mut self, inst: X86Inst) {
-        self.base.push_lir(inst);
+        let mut out = Vec::with_capacity(1);
+        super::legalize::legalize(inst, self.far_scratch, &mut out);
+        for inst in out {
+            self.base.push_lir(inst);
+        }
+    }
+
+    /// Save `reg` on the stack in the body, for a [`Self::pop_saved`] to
+    /// restore: the push moves `%rsp`, which `-fstack-usage` counts.
+    pub(super) fn push_saved(&mut self, reg: Reg) {
+        self.push_lir(X86Inst::Push {
+            src: GpOperand::Reg(reg),
+        });
+        self.base.sp_lowered(8);
+    }
+
+    /// Restore `reg` from a [`Self::push_saved`].
+    pub(super) fn pop_saved(&mut self, reg: Reg) {
+        self.push_lir(X86Inst::Pop { dst: reg });
+        self.base.sp_raised(8);
     }
 
     /// Compute the memory address for a stack offset.
@@ -178,7 +210,7 @@ impl X86_64CodeGen {
     /// Nothing corrects for the outgoing-argument area here. Reserving one
     /// moves `%rsp`, which is exactly why the aligned base is a register the
     /// prologue sets once instead.
-    pub(super) fn stack_mem(&self, offset: i32) -> MemAddr {
+    pub(super) fn stack_mem(&self, offset: i64) -> MemAddr {
         if let FrameBase::Aligned { reg, .. } = self.frame_base {
             MemAddr::BaseOffset {
                 base: reg,
@@ -200,7 +232,7 @@ impl X86_64CodeGen {
     /// `%rbp + slot + byte` by hand -- as several emitters did -- addresses the
     /// caller's incoming-argument area instead, which is a different frame
     /// entirely.
-    pub(super) fn stack_field(&self, slot: i32, byte: i32) -> MemAddr {
+    pub(super) fn stack_field(&self, slot: i64, byte: i64) -> MemAddr {
         self.stack_mem(slot - byte)
     }
 
@@ -214,8 +246,8 @@ impl X86_64CodeGen {
     /// The one statement of that rule; three emitters checked it themselves
     /// and the x87 conversion did not, storing `$9223372036854775807` to
     /// memory, which the assembler rejects.
-    pub(super) fn imm_operand(v: i128, size: u32) -> Option<GpOperand> {
-        let fits = if size <= 32 {
+    pub(super) fn imm_operand(v: i128, size: Bits) -> Option<GpOperand> {
+        let fits = if size <= Bits::new(32) {
             i32::try_from(v).is_ok() || u32::try_from(v).is_ok()
         } else {
             i32::try_from(v).is_ok()
@@ -230,7 +262,7 @@ impl X86_64CodeGen {
         &mut self,
         src: PseudoId,
         loc: &Loc,
-        size: u32,
+        size: Bits,
         scratch: Reg,
     ) -> GpOperand {
         match loc {
@@ -245,8 +277,8 @@ impl X86_64CodeGen {
     /// Store the constant `v`, `size` bits wide, to `addr` -- through
     /// `scratch` when no immediate encoding holds it. `scratch` must not be a
     /// register `addr` is formed from.
-    pub(super) fn store_imm(&mut self, v: i128, size: u32, addr: MemAddr, scratch: Reg) {
-        let op_size = OperandSize::from_bits(size.max(32));
+    pub(super) fn store_imm(&mut self, v: i128, size: Bits, addr: MemAddr, scratch: Reg) {
+        let op_size = OperandSize::from_bits(size.max(Bits::new(32)));
         let src = match Self::imm_operand(v, size) {
             Some(imm) => imm,
             None => {
@@ -457,7 +489,7 @@ impl X86_64CodeGen {
     /// out as `movsd tv(%rip)`: the variable's initialization image rather
     /// than this thread's copy, and for an `extern` one a non-TLS reference
     /// the linker rejects. And the RIP-relative form dropped `offset`.
-    pub(super) fn global_mem(&mut self, name: &str, offset: i32, scratch: Reg) -> MemAddr {
+    pub(super) fn global_mem(&mut self, name: &str, offset: i64, scratch: Reg) -> MemAddr {
         if self.is_tls_symbol(name) {
             let symbol = Symbol::global(name.to_string());
             if offset == 0 {
@@ -625,7 +657,11 @@ impl X86_64CodeGen {
     /// `scratch` where it is neither in a register nor in the frame. The one
     /// test `Cbr` and `Select` both make.
     fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
-        let bits = self.base.value_widths.bits(cond).clamp(8, 64);
+        let bits = self
+            .base
+            .value_widths
+            .bits(cond)
+            .clamp(Bits::new(8), Bits::new(64));
         let size = OperandSize::from_bits(bits);
         match self.get_location(cond) {
             Loc::Reg(r) => self.push_lir(X86Inst::Test {
@@ -710,7 +746,7 @@ impl X86_64CodeGen {
                 return true;
             }
             Loc::Xmm(x) => {
-                let fp_size = if size <= 32 {
+                let fp_size = if size <= Bits::new(32) {
                     FpSize::Single
                 } else {
                     FpSize::Double
@@ -763,10 +799,10 @@ impl X86_64CodeGen {
         // Derive comparison size from type to handle long/pointer switches
         let switch_size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
         self.emit_move(val, Reg::R10, switch_size);
-        let op_size = if switch_size > 32 {
+        let op_size = if switch_size > Bits::new(32) {
             OperandSize::B64
         } else {
             OperandSize::B32
@@ -829,7 +865,7 @@ impl X86_64CodeGen {
     fn emit_switch_range(
         &mut self,
         val: PseudoId,
-        switch_size: u32,
+        switch_size: Bits,
         op_size: OperandSize,
         lo: i64,
         hi: i64,
@@ -841,9 +877,7 @@ impl X86_64CodeGen {
         if op_size == OperandSize::B64 && !fits(lo) {
             // No scratch left for a wide immediate, so build it
             // in R10 and restore R10 afterwards.
-            self.push_lir(X86Inst::Push {
-                src: GpOperand::Reg(Reg::R10),
-            });
+            self.push_saved(Reg::R10);
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Imm(lo),
@@ -854,7 +888,7 @@ impl X86_64CodeGen {
                 src: GpOperand::Reg(Reg::R10),
                 dst: Reg::R11,
             });
-            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
+            self.pop_saved(Reg::R10);
         } else {
             self.push_lir(X86Inst::Sub {
                 size: op_size,
@@ -863,9 +897,7 @@ impl X86_64CodeGen {
             });
         }
         if op_size == OperandSize::B64 && !fits(span) {
-            self.push_lir(X86Inst::Push {
-                src: GpOperand::Reg(Reg::R10),
-            });
+            self.push_saved(Reg::R10);
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Imm(span),
@@ -876,7 +908,7 @@ impl X86_64CodeGen {
                 src: GpOperand::Reg(Reg::R10),
                 dst: GpOperand::Reg(Reg::R11),
             });
-            self.push_lir(X86Inst::Pop { dst: Reg::R10 });
+            self.pop_saved(Reg::R10);
         } else {
             self.push_lir(X86Inst::Cmp {
                 size: op_size,
@@ -1001,7 +1033,7 @@ impl X86_64CodeGen {
             }
             // Move to final destination if needed
             if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
             }
         }
     }
@@ -1018,7 +1050,7 @@ impl X86_64CodeGen {
             if let Loc::Global(name) = self.get_location(src) {
                 self.emit_tls_addr(&name, dst_reg);
                 if !matches!(dst_loc, Loc::Reg(_)) {
-                    self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                    self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
                 }
             }
         }
@@ -1060,7 +1092,7 @@ impl X86_64CodeGen {
             // block, so liveness and DCE already see the real successors.
             Opcode::IndirectBr => {
                 if let Some(&val) = insn.src.first() {
-                    self.emit_move(val, Reg::R10, 64);
+                    self.emit_move(val, Reg::R10, Bits::new(64));
                     self.push_lir(X86Inst::JmpIndirect { reg: Reg::R10 });
                 }
             }
@@ -1413,7 +1445,7 @@ impl X86_64CodeGen {
         // so a target parked there before the setup was overwritten, and the
         // `call *%r11` jumped into whatever the last argument had addressed.
         if let Some(func_addr) = insn.extra().indirect_target {
-            self.emit_move(func_addr, Reg::R11, 64);
+            self.emit_move(func_addr, Reg::R11, Bits::new(64));
         }
 
         // Emit the call instruction
@@ -1645,7 +1677,7 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
             },
             (Some('P' | 'p'), V::Int(v)) => v.to_string(),
             (Some('P' | 'p'), V::Symbol(sym)) => sym.clone(),
-            (Some('z'), _) => match slot.size {
+            (Some('z'), _) => match slot.size.get() {
                 8 => "b",
                 16 => "w",
                 32 => "l",
@@ -1694,8 +1726,8 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
 
 impl X86_64CodeGen {
     /// A general register at the operand's width, without the `%`.
-    fn asm_default_reg(&self, reg: Reg, size_bits: u32) -> String {
-        let size_mod = match size_bits {
+    fn asm_default_reg(&self, reg: Reg, size_bits: Bits) -> String {
+        let size_mod = match size_bits.get() {
             8 => 'b',
             16 => 'w',
             64 => 'q',
@@ -1914,6 +1946,10 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_profiling(&mut self, profiling: Option<crate::target::Profiling>) {
         self.profiling = profiling;
+    }
+
+    fn stack_usage(&self) -> &[crate::arch::stack_usage::StackUsage] {
+        &self.base.stack_usage
     }
 
     fn set_optimizing(&mut self, on: bool) {

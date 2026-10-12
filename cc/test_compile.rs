@@ -14,9 +14,10 @@
 // these run here.
 //
 
+use crate::arch::stack_usage::StackUsage;
 use crate::diag;
 use crate::opt::Optimization;
-use crate::pipeline::{self, CodegenOptions, Quiet};
+use crate::pipeline::{self, CodegenOptions, Observer};
 use crate::prefix_map::{MapOption, PrefixMaps};
 use crate::strings::StringTable;
 use crate::target::{self, Target};
@@ -39,6 +40,22 @@ pub struct Compiled {
     pub stderr: String,
     /// The assembly, if it compiled.
     pub asm: Option<String>,
+    /// Each function's stack use, as `-fstack-usage` records it.
+    pub stack_usage: Vec<StackUsage>,
+}
+
+/// The observer of a test compile: it keeps the stack use the back end
+/// reports, which `c17 -fstack-usage` would write to a `.su` file.
+#[derive(Default)]
+struct Recorder {
+    stack_usage: Vec<StackUsage>,
+}
+
+impl Observer for Recorder {
+    fn generated(&mut self, stack_usage: &[StackUsage]) -> std::io::Result<()> {
+        self.stack_usage = stack_usage.to_vec();
+        Ok(())
+    }
 }
 
 /// The command-line options a test may pass. Anything else is a test bug and
@@ -55,6 +72,8 @@ struct Options {
     /// The unwind-table options, folded.
     unwind: target::UnwindTables,
     stack_clash: bool,
+    /// `--param=stack-clash-protection-{guard-size,probe-interval}=`.
+    stack_clash_params: target::StackClash,
     /// The last of `-fstack-protector`'s levels and `-fno-stack-protector`.
     stack_protector: target::StackProtector,
     /// `--param=ssp-buffer-size=`.
@@ -165,6 +184,14 @@ fn apply_flags(flags: &[&str]) -> Options {
                     o.stack_protector = level;
                 } else if let Some(bytes) = flag.strip_prefix("--param=ssp-buffer-size=") {
                     o.ssp_buffer_size = Some(bytes.parse().unwrap());
+                } else if let Some(log2) =
+                    flag.strip_prefix("--param=stack-clash-protection-guard-size=")
+                {
+                    o.stack_clash_params.guard_size = Some(log2.parse().unwrap());
+                } else if let Some(log2) =
+                    flag.strip_prefix("--param=stack-clash-protection-probe-interval=")
+                {
+                    o.stack_clash_params.probe_interval = Some(log2.parse().unwrap());
                 } else if let Some(model) = flag.strip_prefix("-ftls-model=") {
                     o.tls_model = target::TlsModel::from_name(model).unwrap();
                 } else if let Some(level) = flag.strip_prefix("-O") {
@@ -309,7 +336,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         exceptions: o.unwind.exceptions(),
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
-        stack_clash: o.stack_clash.then(target::StackClash::default),
+        stack_clash: o.stack_clash.then_some(o.stack_clash_params),
         profiling: o.profile.then(|| target::Profiling::from_flags(&o.mflags)),
         stack_protector: target::StackProtection {
             level: o.stack_protector,
@@ -321,7 +348,8 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         debug_prefix_map: &prefix_maps.debug,
         code,
     };
-    let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
+    let mut recorder = Recorder::default();
+    let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut recorder);
 
     diag::finish_unit();
     let mut diags = diag::take_captured_diagnostics();
@@ -343,6 +371,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         success: asm.is_some(),
         stderr,
         asm,
+        stack_usage: recorder.stack_usage,
     }
 }
 

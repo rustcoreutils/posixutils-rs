@@ -35,6 +35,7 @@ use crate::abi::{
 use crate::arch::lir::{Directive, FpSize, OperandSize};
 use crate::ir::{Function, Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Bits, ByteSize};
 
 /// The integer register of each register position.
 pub(super) const GP_ARGS: [Reg; WIN64_REG_POSITIONS] = [Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9];
@@ -66,8 +67,8 @@ pub(super) const CALLEE_SAVED_XMM: [XmmReg; 10] = [
 /// Where argument position `n` arrives, as an `%rbp` displacement in the
 /// callee: past the saved `%rbp` and the return address, in the caller's
 /// outgoing area -- the shadow slot for a register position.
-pub(super) fn incoming_offset(position: usize) -> i32 {
-    16 + (position * WIN64_POSITION_BYTES) as i32
+pub(super) fn incoming_offset(position: usize) -> i64 {
+    16 + (position * WIN64_POSITION_BYTES) as i64
 }
 
 /// The register a position's value travels in.
@@ -157,19 +158,19 @@ impl X86_64CodeGen {
     /// The `%rbp` displacement of the save slot of the `k`th saved XMM
     /// register: sixteen-byte slots below the pushed general registers, at a
     /// sixteen-byte aligned address since `%rbp` is one.
-    fn win64_xmm_slot(&self, k: usize) -> i32 {
-        let gp_pushed = (self.callee_saved_regs.len() as i32 * 8 + 15) & !15;
-        -(gp_pushed + 16 * (k as i32 + 1))
+    fn win64_xmm_slot(&self, k: usize) -> i64 {
+        let gp_pushed = (self.callee_saved_regs.len() as i64 * 8 + 15) & !15;
+        -(gp_pushed + 16 * (k as i64 + 1))
     }
 
     /// The bytes the XMM save area adds below the pushed registers,
     /// including the padding that makes it start sixteen-byte aligned.
-    pub(super) fn win64_xmm_area_bytes(&self) -> i32 {
+    pub(super) fn win64_xmm_area_bytes(&self) -> i64 {
         if self.win64_xmm_saves.is_empty() {
             return 0;
         }
-        let gp_bytes = self.callee_saved_regs.len() as i32 * 8;
-        ((gp_bytes + 15) & !15) - gp_bytes + 16 * self.win64_xmm_saves.len() as i32
+        let gp_bytes = self.callee_saved_regs.len() as i64 * 8;
+        ((gp_bytes + 15) & !15) - gp_bytes + 16 * self.win64_xmm_saves.len() as i64
     }
 
     /// Reserve the XMM save area and save every register in it, with the
@@ -182,7 +183,7 @@ impl X86_64CodeGen {
         }
         self.push_lir(X86Inst::Sub {
             size: OperandSize::B64,
-            src: GpOperand::Imm(area as i64),
+            src: GpOperand::Imm(area),
             dst: Reg::Rsp,
         });
         for (k, xmm) in self.win64_xmm_saves.clone().into_iter().enumerate() {
@@ -268,11 +269,8 @@ impl X86_64CodeGen {
         let positions = insn.src.len().max(WIN64_REG_POSITIONS);
         let area = ((positions * WIN64_POSITION_BYTES) as i64 + 15) & !15;
         debug_assert!(area >= WIN64_SHADOW_BYTES as i64);
-        self.push_lir(X86Inst::Sub {
-            size: OperandSize::B64,
-            src: GpOperand::Imm(area),
-            dst: Reg::Rsp,
-        });
+        self.emit_call_area(area);
+        self.base.sp_lowered(area);
         for (n, &arg) in insn.src.iter().enumerate() {
             let typ = insn.extra().arg_types.get(n).copied();
             self.store_win64_arg(arg, typ, &classes[n], n, types);
@@ -282,7 +280,7 @@ impl X86_64CodeGen {
             self.load_win64_position(n, class, typ, types);
         }
         if let Some(func_addr) = insn.extra().indirect_target {
-            self.emit_move(func_addr, Reg::R11, 64);
+            self.emit_move(func_addr, Reg::R11, Bits::new(64));
         }
         self.emit_call_instruction(insn, func_name, area as usize);
         self.cleanup_call_stack(area as usize);
@@ -293,7 +291,7 @@ impl X86_64CodeGen {
     fn win64_outgoing_slot(n: usize) -> MemAddr {
         MemAddr::BaseOffset {
             base: Reg::Rsp,
-            offset: (n * WIN64_POSITION_BYTES) as i32,
+            offset: (n * WIN64_POSITION_BYTES) as i64,
         }
     }
 
@@ -308,7 +306,8 @@ impl X86_64CodeGen {
     ) {
         let slot = Self::win64_outgoing_slot(n);
         if is_sse(class) {
-            let fmt = self.fp_format(typ, typ.map_or(64, |t| types.size_bits(t)), types);
+            let size = typ.map_or(Bits::new(64), |t| types.value_bits(t));
+            let fmt = self.fp_format(typ, size, types);
             self.emit_fp_move(arg, XmmReg::Xmm15, fmt);
             self.push_lir(X86Inst::MovFp {
                 size: fmt,
@@ -338,10 +337,10 @@ impl X86_64CodeGen {
         types: &TypeTable,
     ) {
         if matches!(class, ArgClass::Indirect { .. }) {
-            self.emit_move(arg, dst, 64);
+            self.emit_move(arg, dst, Bits::new(64));
             return;
         }
-        let size = typ.map_or(64, |t| types.size_bits(t));
+        let size = typ.map_or(Bits::new(64), |t| types.value_bits(t));
         if typ.is_some_and(|t| types.is_float(t)) {
             let fmt = self.fp_format(typ, size, types);
             self.emit_fp_move(arg, XmmReg::Xmm15, fmt);
@@ -366,7 +365,8 @@ impl X86_64CodeGen {
     ) {
         let slot = Self::win64_outgoing_slot(n);
         if is_sse(class) {
-            let fmt = self.fp_format(typ, typ.map_or(64, |t| types.size_bits(t)), types);
+            let size = typ.map_or(Bits::new(64), |t| types.value_bits(t));
+            let fmt = self.fp_format(typ, size, types);
             self.push_lir(X86Inst::MovFp {
                 size: fmt,
                 src: XmmOperand::Mem(slot.clone()),
@@ -391,7 +391,6 @@ impl X86_64CodeGen {
         if types.kind(typ) == TypeKind::Void {
             return;
         }
-        let size = types.size_bits(typ);
         let class = Win64Abi::new().classify_return(typ, types);
         if types.is_plain_int128(typ) {
             let loc = self.get_location(src);
@@ -402,20 +401,21 @@ impl X86_64CodeGen {
                 dst: XmmOperand::Reg(XmmReg::Xmm0),
             });
         } else if is_sse(&class) {
-            let fmt = self.fp_format(Some(typ), size, types);
+            let fmt = self.fp_format(Some(typ), types.value_bits(typ), types);
             self.emit_fp_move(src, XmmReg::Xmm0, fmt);
         } else if types.is_complex(typ) {
             // A complex `Ret` carries the value's address; its bits go back.
             let addr = self.scalar_mem_operand(src, 0, Reg::R11);
-            self.load_bits(addr, types.size_bytes(typ), Reg::Rax);
+            self.load_bits(addr, types.byte_size(typ), Reg::Rax);
         } else {
             self.load_win64_gp_value(src, Some(typ), &class, Reg::Rax, types);
         }
     }
 
     /// Load the `bytes` (1, 2, 4 or 8) bytes at `addr` into `dst`.
-    fn load_bits(&mut self, addr: MemAddr, bytes: usize, dst: Reg) {
-        let size = OperandSize::from_bits((bytes * 8) as u32);
+    fn load_bits(&mut self, addr: MemAddr, bytes: ByteSize, dst: Reg) {
+        let width = bytes.bits().expect("a value in RAX is at most eight bytes");
+        let size = OperandSize::from_bits(width);
         match size {
             OperandSize::B8 | OperandSize::B16 => self.push_lir(X86Inst::Movzx {
                 src_size: size,
@@ -447,15 +447,15 @@ mod tests {
     fn each_position_takes_one_register_of_its_class() {
         let int = ArgClass::Direct {
             classes: vec![RegClass::Integer],
-            size_bits: 64,
+            size_bits: Bits::new(64),
         };
         let sse = ArgClass::Direct {
             classes: vec![RegClass::Sse],
-            size_bits: 64,
+            size_bits: Bits::new(64),
         };
         let by_ref = ArgClass::Indirect {
-            align: 8,
-            size_bytes: 24,
+            align: crate::units::Align::EIGHT,
+            size_bytes: ByteSize::new(24),
         };
         assert_eq!(position_reg(0, &int), Some(PositionReg::Gp(Reg::Rcx)));
         assert_eq!(position_reg(1, &sse), Some(PositionReg::Xmm(XmmReg::Xmm1)));

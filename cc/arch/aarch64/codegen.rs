@@ -28,6 +28,7 @@ use crate::float::FloatVal;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
+use crate::units::{Align, Bits};
 use std::collections::{HashMap, HashSet};
 
 // AArch64 Code Generator
@@ -45,25 +46,25 @@ pub struct Aarch64CodeGen {
     /// Current function's pseudos (for looking up values)
     pub(super) pseudos: crate::arch::codegen::PseudoTable,
     /// Total frame size for current function
-    pub(super) frame_size: i32,
+    pub(super) frame_size: i64,
     /// Where the current function's frame areas lie.
     pub(super) layout: crate::arch::aarch64::frame::FrameLayout,
     /// Offset from FP to register save area (for variadic functions)
-    pub(super) reg_save_area_offset: i32,
+    pub(super) reg_save_area_offset: i64,
     /// Number of fixed GP parameters (for variadic functions)
     pub(super) num_fixed_gp_params: usize,
     /// Number of fixed FP/SIMD parameters (for variadic functions)
     pub(super) num_fixed_fp_params: usize,
     /// Bytes of incoming stack arguments consumed by named parameters
     /// (for variadic functions whose named parameters overflow the registers)
-    pub(super) named_stack_param_bytes: i32,
+    pub(super) named_stack_param_bytes: i64,
     /// Where the pre-call `%sp` was saved, for a Darwin variadic call whose
     /// argument area needs more than the sixteen bytes `%sp` is guaranteed.
     ///
     /// Such a call realigns `%sp` by an amount only known at run time, so the
     /// area cannot be released with the matching `add` every other call uses;
     /// the old value is read back from this offset instead.
-    pub(super) darwin_va_sp_slot: Option<i32>,
+    pub(super) darwin_va_sp_slot: Option<i64>,
     /// External symbols (need GOT access on macOS)
     pub(super) extern_symbols: HashSet<String>,
     /// The registers the unit's file-scope register variables are, which no
@@ -73,14 +74,14 @@ pub struct Aarch64CodeGen {
     pub(super) tls_symbols: HashSet<String>,
     /// Every data symbol's known alignment in bytes -- definitions here and
     /// `extern` declarations -- for [`Self::lo12_folds`].
-    pub(super) sym_align: HashMap<String, u32>,
+    pub(super) sym_align: HashMap<String, Align>,
     /// Position-independent code mode (for shared libraries)
     pub(super) pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
     unique_label_counter: u32,
     /// Bytes the prologue allocates for locals: what a dynamically aligned
     /// frame addresses them from.
-    pub(super) stack_alloc_size: i32,
+    pub(super) stack_alloc_size: i64,
     /// The stack-protector canary's slot, when this function has one.
     pub(super) stack_guard: Option<LocalSlot>,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
@@ -133,7 +134,7 @@ impl Aarch64CodeGen {
     /// For local variables (negative offsets), this accounts for the
     /// register save area in varargs functions which is placed at the
     /// end of the frame (after locals).
-    fn stack_offset(&self, offset: i32) -> i32 {
+    fn stack_offset(&self, offset: i64) -> i64 {
         if offset < 0 {
             if let FrameBase::Aligned { align, .. } = self.frame_base {
                 // Over-aligned locals: x19-relative addressing.
@@ -142,7 +143,7 @@ impl Aarch64CodeGen {
                 // start of the locals area. Offset from x19 = base_rounded + regalloc_offset.
                 // Since base_rounded is a multiple of max_align and regalloc aligns each
                 // local's position to its alignment, the result preserves alignment.
-                let base_rounded = self.stack_alloc_size - (align - 1);
+                let base_rounded = self.stack_alloc_size - (i64::from(align) - 1);
                 base_rounded + offset
             } else {
                 // Measured down from the top of the locals; see
@@ -165,14 +166,14 @@ impl Aarch64CodeGen {
     /// Private and raw: callers name their frame through the typed helpers
     /// below, so that the sign is applied by the producer rather than
     /// re-derived here.
-    fn stack_base_reg(&self, raw_offset: i32) -> Reg {
+    fn stack_base_reg(&self, raw_offset: i64) -> Reg {
         match self.frame_base.reg() {
             Some(base) if raw_offset < 0 => base,
             _ => Reg::X29,
         }
     }
 
-    fn raw_mem(&self, raw_offset: i32, extra: i32) -> MemAddr {
+    fn raw_mem(&self, raw_offset: i64, extra: i64) -> MemAddr {
         MemAddr::BaseOffset {
             base: self.stack_base_reg(raw_offset),
             offset: self.stack_offset(raw_offset) + extra,
@@ -190,24 +191,24 @@ impl Aarch64CodeGen {
     }
 
     /// The address of byte `byte` of the object in callee-frame slot `slot`.
-    pub(super) fn stack_mem_plus(&self, slot: LocalSlot, extra: i32) -> MemAddr {
+    pub(super) fn stack_mem_plus(&self, slot: LocalSlot, extra: i64) -> MemAddr {
         self.raw_mem(slot.displacement(), extra)
     }
 
     /// The address of byte `byte` of an incoming stack argument.
-    pub(super) fn incoming_mem_plus(&self, off: IncomingOff, extra: i32) -> MemAddr {
+    pub(super) fn incoming_mem_plus(&self, off: IncomingOff, extra: i64) -> MemAddr {
         self.raw_mem(off.displacement(), extra)
     }
 
     /// The address of byte `byte` of the object in stack slot `slot`.
-    pub(super) fn stack_field(&self, slot: LocalSlot, byte: i32) -> MemAddr {
+    pub(super) fn stack_field(&self, slot: LocalSlot, byte: i64) -> MemAddr {
         self.stack_mem_plus(slot, byte)
     }
 
     /// The base register and displacement addressing whatever frame `loc`
     /// names, for the sites that materialize an address with an `add` rather
     /// than folding it into a load or store.
-    pub(super) fn loc_addr_parts(&self, loc: &Loc) -> Option<(Reg, i32)> {
+    pub(super) fn loc_addr_parts(&self, loc: &Loc) -> Option<(Reg, i64)> {
         let raw = match loc {
             Loc::Stack(slot) => slot.displacement(),
             Loc::IncomingArg(off) => off.displacement(),
@@ -217,7 +218,7 @@ impl Aarch64CodeGen {
     }
 
     /// [`Self::loc_mem`] plus a byte offset into the object.
-    pub(super) fn loc_mem_plus(&self, loc: &Loc, extra: i32) -> Option<MemAddr> {
+    pub(super) fn loc_mem_plus(&self, loc: &Loc, extra: i64) -> Option<MemAddr> {
         let raw = match loc {
             Loc::Stack(slot) => slot.displacement(),
             Loc::IncomingArg(off) => off.displacement(),
@@ -293,7 +294,7 @@ impl Aarch64CodeGen {
     pub(super) fn emit_block(
         &mut self,
         block: &crate::ir::BasicBlock,
-        frame_info: &(i32, Vec<Reg>, Vec<VReg>),
+        frame_info: &(i64, Vec<Reg>, Vec<VReg>),
         types: &TypeTable,
     ) {
         // Always emit block ID label for consistency with jumps
@@ -326,7 +327,7 @@ impl Aarch64CodeGen {
     fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
         let bits = self.base.value_widths.bits(cond);
         let loc = self.get_location(cond);
-        if bits > 64 {
+        if bits > Bits::new(64) {
             if let l @ (Loc::Stack(_) | Loc::IncomingArg(_)) = &loc {
                 // Both halves, ORed: nonzero if either is.
                 let other = if scratch == Reg::X10 {
@@ -354,13 +355,13 @@ impl Aarch64CodeGen {
                 return;
             }
         }
-        let bits = bits.min(64);
+        let bits = bits.min(Bits::new(64));
         let reg = match loc {
-            Loc::Reg(r) if bits >= 32 => r,
+            Loc::Reg(r) if bits >= Bits::new(32) => r,
             _ => {
                 self.emit_move(cond, scratch, bits);
                 // A register keeps whatever lies above a narrow value.
-                match bits {
+                match bits.get() {
                     8 => self.push_lir(Aarch64Inst::Uxtb {
                         src: scratch,
                         dst: scratch,
@@ -375,7 +376,7 @@ impl Aarch64CodeGen {
             }
         };
         self.push_lir(Aarch64Inst::Cmp {
-            size: if bits <= 32 {
+            size: if bits <= Bits::new(32) {
                 OperandSize::B32
             } else {
                 OperandSize::B64
@@ -407,8 +408,12 @@ impl Aarch64CodeGen {
                 return true;
             }
             Loc::VReg(v) => {
-                let bit_size = if insn.size == 0 { 64 } else { insn.size };
-                let fp_size = if bit_size <= 32 {
+                let bit_size = if insn.size == Bits::ZERO {
+                    Bits::new(64)
+                } else {
+                    insn.size
+                };
+                let fp_size = if bit_size <= Bits::new(32) {
                     FpSize::Single
                 } else {
                     FpSize::Double
@@ -455,8 +460,8 @@ impl Aarch64CodeGen {
         let (scratch0, scratch1, _) = Reg::scratch_regs();
         let switch_size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
         let op_size = OperandSize::from_bits(switch_size);
 
         // Move switch value to scratch0
@@ -572,7 +577,7 @@ impl Aarch64CodeGen {
     fn emit_insn(
         &mut self,
         insn: &Instruction,
-        frame_info: &(i32, Vec<Reg>, Vec<VReg>),
+        frame_info: &(i64, Vec<Reg>, Vec<VReg>),
         types: &TypeTable,
     ) {
         // Emit .loc directive for debug info
@@ -616,7 +621,7 @@ impl Aarch64CodeGen {
                 if let Some(&val) = insn.src.first() {
                     let (scratch, _, _) = Reg::scratch_regs();
 
-                    self.emit_move(val, scratch, 64);
+                    self.emit_move(val, scratch, Bits::new(64));
 
                     self.push_lir(Aarch64Inst::BrReg { reg: scratch });
                 }
@@ -710,7 +715,7 @@ impl Aarch64CodeGen {
                     if let Loc::Global(name) = self.get_location(src) {
                         self.emit_tls_addr(&name, dst_reg);
                         if !matches!(dst_loc, Loc::Reg(_)) {
-                            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
                         }
                     }
                 }
@@ -739,7 +744,7 @@ impl Aarch64CodeGen {
                             self.push_lir(Aarch64Inst::Add {
                                 size: OperandSize::B64,
                                 src1: base,
-                                src2: GpOperand::Imm(adjusted.into()),
+                                src2: GpOperand::Imm(adjusted),
                                 dst: dst_reg,
                             });
                         }
@@ -747,7 +752,7 @@ impl Aarch64CodeGen {
                     }
                     // Move to final destination if needed
                     if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                        self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                        self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
                     }
                 }
             }
@@ -1120,7 +1125,7 @@ impl Aarch64CodeGen {
         // shuttles through it -- so a target parked there before the setup was
         // overwritten and the call branched into the argument data.
         if let Some(func_addr) = insn.extra().indirect_target {
-            self.emit_move(func_addr, Reg::X16, 64);
+            self.emit_move(func_addr, Reg::X16, Bits::new(64));
         }
 
         // Emit the call instruction
@@ -1297,7 +1302,7 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
             // names its width with a modifier, `%d0`.
             (None, V::RegName(name)) => format!("v{}", &name[1..]),
             (None | Some('w' | 'x'), value) => match value {
-                V::Reg(r) if slot.size <= 32 => asm_reg_name_32(*r).to_string(),
+                V::Reg(r) if slot.size <= Bits::new(32) => asm_reg_name_32(*r).to_string(),
                 V::Reg(r) => asm_reg_name_64(*r).to_string(),
                 V::RegName(text) | V::Mem(text) => text.clone(),
                 V::Int(v) => v.to_string(),
@@ -1370,7 +1375,7 @@ impl CodeGenerator for Aarch64CodeGen {
                 module
                     .extern_object_align
                     .iter()
-                    .map(|(n, a)| (n.clone(), *a)),
+                    .map(|(n, a)| (n.clone(), Align::of_bytes(u64::from(*a)))),
             )
             .collect();
 
@@ -1488,6 +1493,10 @@ impl CodeGenerator for Aarch64CodeGen {
 
     fn set_stack_protector(&mut self, protection: crate::target::StackProtection) {
         self.base.stack_protector = protection;
+    }
+
+    fn stack_usage(&self) -> &[crate::arch::stack_usage::StackUsage] {
+        &self.base.stack_usage
     }
 
     fn set_optimizing(&mut self, on: bool) {

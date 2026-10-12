@@ -21,6 +21,7 @@ use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOpera
 use crate::arch::x86_64::regalloc::{spend_arg_regs, FrameBase, Loc, Reg, RegAlloc, XmmReg};
 use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Bits, ByteSize};
 use std::collections::HashSet;
 
 impl X86_64CodeGen {
@@ -41,7 +42,7 @@ impl X86_64CodeGen {
         fp_arg_idx: &mut usize,
         int_arg_regs: &[Reg],
         fp_arg_regs: &[XmmReg],
-        type_size_bits: u32,
+        type_size: ByteSize,
     ) {
         let gp_needed = classes
             .iter()
@@ -53,12 +54,7 @@ impl X86_64CodeGen {
         if *int_arg_idx + gp_needed > int_arg_regs.len()
             || *fp_arg_idx + sse_needed > fp_arg_regs.len()
         {
-            self.copy_incoming_arg_to_local(
-                func,
-                &func.params[param_idx].0,
-                pseudo,
-                (type_size_bits / 8) as i32,
-            );
+            self.copy_incoming_arg_to_local(func, &func.params[param_idx].0, pseudo, type_size);
             return;
         }
 
@@ -81,15 +77,15 @@ impl X86_64CodeGen {
 
         // The last eightbyte of a composite whose size is not a multiple of
         // eight holds fewer bytes than the register carrying it.
-        let total = i64::from(type_size_bits / 8);
         let mut next_int = pair_start_int;
         let mut next_fp = pair_start_fp;
         for (i, class) in classes.iter().enumerate() {
-            let at = (i * 8) as i64;
-            let bytes = eightbyte_bytes(total, at);
-            if bytes == 0 {
+            let at = ByteSize::from_usize(i * 8);
+            let bytes = eightbyte_bytes(type_size, at);
+            if bytes.is_zero() {
                 continue;
             }
+            let at = at.to_i64();
             if *class == crate::abi::RegClass::Sse {
                 let src = fp_arg_regs[next_fp];
                 next_fp += 1;
@@ -115,7 +111,7 @@ impl X86_64CodeGen {
     /// value is shifted down as each leaves. The shifting is done in R10 --
     /// this file's scratch -- so the incoming argument register survives; a
     /// natural width needs no shift and stores straight out of it.
-    fn store_reg_bytes_to_local(&mut self, src: Reg, local: i32, at: i64, bytes: i64) {
+    fn store_reg_bytes_to_local(&mut self, src: Reg, local: i64, at: i64, bytes: ByteSize) {
         let mut shifted = 0;
         for (off, chunk) in crate::ir::memexpand::block_chunks(bytes) {
             if off != 0 {
@@ -134,7 +130,7 @@ impl X86_64CodeGen {
                 shifted = off;
             }
             let from = if off == 0 { src } else { Reg::R10 };
-            let addr = self.stack_field(local, (at + off) as i32);
+            let addr = self.stack_field(local, at + off);
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::from_bits(chunk.bits()),
                 src: GpOperand::Reg(from),
@@ -151,9 +147,9 @@ impl X86_64CodeGen {
     /// no SSE store of it: the second eightbyte of
     /// `struct { float a, b, c; _Float16 d; }` is six bytes, and all of SSE
     /// class.
-    fn store_sse_bytes_to_local(&mut self, src: XmmReg, local: i32, at: i64, bytes: i64) {
+    fn store_sse_bytes_to_local(&mut self, src: XmmReg, local: i64, at: i64, bytes: ByteSize) {
         if let Some(size) = FpSize::exact_sse_store(bytes) {
-            let addr = self.stack_field(local, at as i32);
+            let addr = self.stack_field(local, at);
             self.push_lir(X86Inst::MovFp {
                 size,
                 src: XmmOperand::Reg(src),
@@ -182,7 +178,7 @@ impl X86_64CodeGen {
         func: &crate::ir::Function,
         param_name: &str,
         arg_pseudo: crate::ir::PseudoId,
-        bytes: i32,
+        bytes: ByteSize,
     ) {
         let Some(Loc::IncomingArg(src_offset)) = self.locations.get(arg_pseudo) else {
             return;
@@ -194,9 +190,8 @@ impl X86_64CodeGen {
             return;
         };
         let dst_offset = *dst_offset;
-        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes.into()) {
+        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
             let size = OperandSize::from_bits(chunk.bits());
-            let at = at as i32;
             self.push_lir(X86Inst::Mov {
                 size,
                 src: GpOperand::Mem(MemAddr::BaseOffset {
@@ -270,6 +265,7 @@ impl X86_64CodeGen {
         }
         self.max_local_align = alloc.max_local_align();
         self.frame_base = alloc.frame_base();
+        self.far_scratch = alloc.far_scratch();
         self.x87_scratch = alloc.x87_scratch();
         self.x87_control_words = alloc.x87_control_words();
         // Pad callee_saved_offset to multiple of 16 so that 16-byte-aligned
@@ -277,9 +273,9 @@ impl X86_64CodeGen {
         // rbp is 16-aligned (ABI), so -(padded_offset + aligned_stack_offset) is also aligned.
         // An `ms_abi` function's XMM save area sits below the pushes, in
         // the same region, so the locals start below it.
-        self.callee_saved_offset = ((self.callee_saved_regs.len() as i32 * 8) + 15) & !15;
+        self.callee_saved_offset = ((self.callee_saved_regs.len() as i64 * 8) + 15) & !15;
         if !self.win64_xmm_saves.is_empty() {
-            self.callee_saved_offset += 16 * self.win64_xmm_saves.len() as i32;
+            self.callee_saved_offset += 16 * self.win64_xmm_saves.len() as i64;
         }
 
         // For variadic functions, we need extra space for the register save area
@@ -290,7 +286,7 @@ impl X86_64CodeGen {
         // Not for an `ms_abi` one, whose variadic arguments are all in
         // memory once its prologue homes the register positions.
         let sysv_variadic = is_variadic && !win64;
-        let reg_save_area_size: i32 = if sysv_variadic { 176 } else { 0 };
+        let reg_save_area_size: i64 = if sysv_variadic { 176 } else { 0 };
         self.reg_save_area_offset = if sysv_variadic {
             // The register save area will be at the end of the stack frame
             self.callee_saved_offset + stack_size + reg_save_area_size
@@ -323,16 +319,8 @@ impl X86_64CodeGen {
         self.emit_profile_call(func, true);
         self.emit_prologue(stack_size, reg_save_area_size, &homes);
         self.emit_profile_call(func, false);
-        // An over-aligned frame's `andq` moves `%rsp` on by up to the
-        // alignment.
-        let realign = match self.frame_base {
-            FrameBase::Aligned { align, .. } => align as i64,
-            _ => 0,
-        };
-        self.base
-            .check_stack_clash(func, self.stack_alloc_size as i64 + realign);
-        self.base
-            .check_frame_size(i64::from(stack_size + reg_save_area_size));
+        self.base.check_frame_size(stack_size + reg_save_area_size);
+        let frame_bytes = self.prologue_bytes();
         self.emit_stack_guard_set();
 
         // Store spilled arguments before any calls can clobber them
@@ -364,6 +352,7 @@ impl X86_64CodeGen {
         for block in &func.blocks {
             self.emit_block(block, types);
         }
+        self.base.record_stack_usage(func, frame_bytes);
 
         // CFI: End procedure
         if self.base.cfi.emitted() {
@@ -408,7 +397,7 @@ impl X86_64CodeGen {
                 Some(Loc::Stack(off)) => match self.stack_mem(*off) {
                     MemAddr::BaseOffset { base, offset } => Some(crate::arch::dwarf::VarLocation {
                         reg: base.dwarf_number(),
-                        offset: offset as i64,
+                        offset,
                     }),
                     _ => None,
                 },
@@ -504,7 +493,9 @@ impl X86_64CodeGen {
     fn call_clobbered_to_preserve(func: &Function, types: &TypeTable) -> Vec<Reg> {
         let returned = if types.kind(func.return_type) == crate::types::TypeKind::Void {
             &[][..]
-        } else if (9..=16).contains(&types.size_bytes(func.return_type)) {
+        } else if (ByteSize::new(9)..=ByteSize::new(16))
+            .contains(&types.byte_size(func.return_type))
+        {
             &[Reg::Rax, Reg::Rdx][..]
         } else {
             &[Reg::Rax][..]
@@ -565,8 +556,8 @@ impl X86_64CodeGen {
     /// shadow area, first of all.
     fn emit_prologue(
         &mut self,
-        stack_size: i32,
-        reg_save_area_size: i32,
+        stack_size: i64,
+        reg_save_area_size: i64,
         homes: &[(usize, crate::arch::x86_64::win64::PositionReg)],
     ) {
         let bp = Reg::bp();
@@ -591,7 +582,7 @@ impl X86_64CodeGen {
         self.emit_win64_homing(homes);
 
         // Save callee-saved registers
-        let mut cfi_offset = -24i32; // First callee-saved is at -24 (after rbp at -16)
+        let mut cfi_offset = -24i64; // First callee-saved is at -24 (after rbp at -16)
         for reg in &self.callee_saved_regs.clone() {
             self.push_lir(X86Inst::Push {
                 src: GpOperand::Reg(*reg),
@@ -608,7 +599,7 @@ impl X86_64CodeGen {
         let aligned_stack = (total_stack + 15) & !15;
         // Subtract only what `%rsp` has already moved by: the pushes, and an
         // `ms_abi` function's XMM save area below them.
-        let pushed = self.callee_saved_regs.len() as i32 * 8 + self.win64_xmm_area_bytes();
+        let pushed = self.callee_saved_regs.len() as i64 * 8 + self.win64_xmm_area_bytes();
         let alloc_size = aligned_stack - pushed;
         // An over-aligned frame addresses each local as `%rsp + (alloc_size -
         // slot)`. The `andq` below makes `%rsp` itself a multiple of the
@@ -617,17 +608,20 @@ impl X86_64CodeGen {
         // total less eight bytes per pushed register, so an odd number of
         // callee-saved pushes left every over-aligned local off by eight.
         let alloc_size = if let FrameBase::Aligned { align, .. } = self.frame_base {
+            let align = i64::from(align);
             (alloc_size + align - 1) & !(align - 1)
         } else {
             alloc_size
         };
-        if alloc_size > 0 {
-            self.push_lir(X86Inst::Sub {
-                size: OperandSize::B64,
-                src: GpOperand::Imm(alloc_size as i64),
-                dst: Reg::Rsp,
-            });
+        // Under `-fstack-clash-protection` an over-aligned frame rounds
+        // `%rsp` first, probed, and then allocates, so that the allocation
+        // starts from a probed stack pointer. `alloc_size` is a multiple of
+        // the alignment, so the order leaves `%rsp` where it would be.
+        let probing = self.base.stack_clash.is_some();
+        if let (true, FrameBase::Aligned { align, .. }) = (probing, self.frame_base) {
+            self.emit_probed_realignment(align);
         }
+        self.emit_frame_allocation(alloc_size);
 
         // Dynamic stack alignment for locals with alignment > 16.
         // After sub, emit andq to force RSP to the required alignment, then
@@ -641,11 +635,13 @@ impl X86_64CodeGen {
         // epilogue restores `%rsp` from `%rbp` and pops the base back, so
         // nothing else has to know.
         if let FrameBase::Aligned { reg, align } = self.frame_base {
-            self.push_lir(X86Inst::And {
-                size: OperandSize::B64,
-                src: GpOperand::Imm(-(align as i64)),
-                dst: Reg::Rsp,
-            });
+            if !probing {
+                self.push_lir(X86Inst::And {
+                    size: OperandSize::B64,
+                    src: GpOperand::Imm(-(align as i64)),
+                    dst: Reg::Rsp,
+                });
+            }
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Reg(Reg::Rsp),
@@ -657,6 +653,27 @@ impl X86_64CodeGen {
         self.stack_alloc_size = alloc_size;
     }
 
+    /// How far below the caller's stack pointer the prologue leaves `%rsp`,
+    /// by gcc's `-fstack-usage` measure: the return address, the saved
+    /// `%rbp`, the pushed registers and an `ms_abi` XMM save area, the
+    /// `subq`, and the most an over-aligned frame's `andq` can take -- the
+    /// alignment less what `%rsp` is already known to be aligned to, `%rbp`
+    /// being aligned as the stack is on entry.
+    fn prologue_bytes(&self) -> i64 {
+        let pushed = self.callee_saved_regs.len() as i64 * 8 + self.win64_xmm_area_bytes();
+        let below_rbp = pushed + self.stack_alloc_size;
+        let realign = match self.frame_base {
+            FrameBase::Aligned { align, .. } => {
+                let entry = i64::from(self.base.target.x86.incoming_stack_align());
+                // The largest power of two dividing both.
+                let known = 1i64 << (below_rbp | entry).trailing_zeros();
+                i64::from(align) - known
+            }
+            _ => 0,
+        };
+        16 + below_rbp + realign.max(0)
+    }
+
     /// Re-establish an over-aligned frame's base register from `%rbp` alone,
     /// where a `__builtin_longjmp` resumes and nothing but `%rbp` and `%rsp`
     /// is restored. The value is the one the prologue latched: `%rsp` just
@@ -666,7 +683,7 @@ impl X86_64CodeGen {
         let FrameBase::Aligned { reg, align } = self.frame_base else {
             return;
         };
-        let pushed = self.callee_saved_regs.len() as i32 * 8 + self.win64_xmm_area_bytes();
+        let pushed = self.callee_saved_regs.len() as i64 * 8 + self.win64_xmm_area_bytes();
         self.push_lir(X86Inst::Lea {
             addr: MemAddr::BaseOffset {
                 base: Reg::Rbp,
@@ -708,7 +725,7 @@ impl X86_64CodeGen {
         for (i, reg) in int_arg_regs.iter().enumerate() {
             // offset from rbp = reg_save_area_offset - (i * 8)
             // reg at ABI offset i*8 relative to reg_save_area base
-            let offset = self.reg_save_area_offset - (i as i32 * 8);
+            let offset = self.reg_save_area_offset - (i as i64 * 8);
             self.push_lir(X86Inst::Mov {
                 size: OperandSize::B64,
                 src: GpOperand::Reg(*reg),
@@ -732,7 +749,7 @@ impl X86_64CodeGen {
         for (i, xmm) in xmm_arg_regs.iter().enumerate() {
             // XMM save area starts at offset 48 from reg_save_area base
             // Each slot is 16 bytes: base_offset = reg_save_area_offset - 48 - (i * 16)
-            let offset = self.reg_save_area_offset - 48 - (i as i32 * 16);
+            let offset = self.reg_save_area_offset - 48 - (i as i64 * 16);
             self.push_lir(X86Inst::MovFp {
                 // The whole register, not its low double. The slot is sixteen
                 // bytes and the ABI says the register is saved into it; an
@@ -870,7 +887,7 @@ impl X86_64CodeGen {
                 };
                 // A MEMORY-class struct arrives on the stack by
                 // value and uses no GP register — skip it entirely.
-                let type_size_bits = types.size_bits(*typ);
+                let type_size = types.byte_size(*typ);
                 let is_large_struct_param = crate::abi::param_is_memory_class(*typ, types);
                 if is_large_struct_param {
                     break 'arg;
@@ -922,7 +939,7 @@ impl X86_64CodeGen {
                             &mut fp_arg_idx,
                             int_arg_regs,
                             fp_arg_regs,
-                            type_size_bits,
+                            type_size,
                         );
                         break 'arg;
                     }
@@ -939,7 +956,7 @@ impl X86_64CodeGen {
                             func,
                             &func.params[i].0,
                             pseudo.id,
-                            (type_size_bits / 8) as i32,
+                            type_size,
                         );
                         // A memory-class argument consumes no XMM
                         // registers; the ones it did not fit in stay
@@ -952,7 +969,7 @@ impl X86_64CodeGen {
                         if let Some(local) = func.locals.get(param_name) {
                             if let Some(Loc::Stack(offset)) = self.locations.get_ref(local.sym) {
                                 let offset = *offset;
-                                let total = i64::from(type_size_bits / 8);
+                                let total = type_size;
                                 if sse_struct.is_some() {
                                     // An all-SSE aggregate: each register
                                     // holds the eightbyte it was classified
@@ -965,19 +982,19 @@ impl X86_64CodeGen {
                                     // struct and not eight. Giving both the
                                     // same width wrote four bytes past it.
                                     for reg in 0..sse_regs {
-                                        let at = (reg * 8) as i64;
+                                        let at = ByteSize::from_usize(reg * 8);
                                         let bytes = if sse_regs == 1 {
-                                            total.min(16)
+                                            total.min(ByteSize::new(16))
                                         } else {
                                             eightbyte_bytes(total, at)
                                         };
-                                        if bytes == 0 {
+                                        if bytes.is_zero() {
                                             continue;
                                         }
                                         self.store_sse_bytes_to_local(
                                             fp_arg_regs[fp_arg_idx + reg],
                                             offset,
-                                            at,
+                                            at.to_i64(),
                                             bytes,
                                         );
                                     }
@@ -1028,7 +1045,7 @@ impl X86_64CodeGen {
                             // From the type: a `__float128` argument
                             // arrives as a whole XMM, and storing it
                             // as a `double` dropped its top half.
-                            let fp_size = self.fp_format(Some(*typ), types.size_bits(*typ), types);
+                            let fp_size = self.fp_format(Some(*typ), types.value_bits(*typ), types);
                             self.push_lir(X86Inst::MovFp {
                                 size: fp_size,
                                 src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
@@ -1138,16 +1155,16 @@ impl X86_64CodeGen {
         );
         match plan {
             PairMove::InOrder => {
-                self.emit_move(s0, d0, 64);
-                self.emit_move(s1, d1, 64);
+                self.emit_move(s0, d0, Bits::new(64));
+                self.emit_move(s1, d1, Bits::new(64));
             }
             PairMove::Reversed => {
-                self.emit_move(s1, d1, 64);
-                self.emit_move(s0, d0, 64);
+                self.emit_move(s1, d1, Bits::new(64));
+                self.emit_move(s0, d0, Bits::new(64));
             }
             PairMove::Swap => {
-                self.emit_move(s0, Reg::R10, 64);
-                self.emit_move(s1, d1, 64);
+                self.emit_move(s0, Reg::R10, Bits::new(64));
+                self.emit_move(s1, d1, Bits::new(64));
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::R10),
@@ -1204,10 +1221,13 @@ impl X86_64CodeGen {
                 kind == TypeKind::Struct || kind == TypeKind::Union
             });
 
-            // Derive return size from type to avoid 32-bit truncation
+            // Derive return size from type to avoid 32-bit truncation. An
+            // aggregate too large to have a value width goes back through
+            // the hidden pointer, and RAX returns that: a pointer's width.
             let ret_size = ret_typ
-                .map(|t| types.size_bits(t).max(32))
-                .unwrap_or(insn.size.max(32));
+                .map_or(Some(insn.size), |t| types.checked_value_bits(t))
+                .unwrap_or(Bits::new(64))
+                .max(Bits::new(32));
 
             let one_sse_ret = matches!(
                 insn.ret_class(),
@@ -1273,25 +1293,25 @@ impl X86_64CodeGen {
                                 self.emit_gp_pair_move(gp_moves[0], gp_moves[1]);
                             } else {
                                 for (s, gp) in &gp_moves {
-                                    self.emit_move(*s, *gp, 64);
+                                    self.emit_move(*s, *gp, Bits::new(64));
                                 }
                             }
                         } else {
-                            self.emit_move(*src, Reg::Rax, 64);
+                            self.emit_move(*src, Reg::Rax, Bits::new(64));
                             if let Some(&src2) = insn.src.get(1) {
-                                self.emit_move(src2, Reg::Rdx, 64);
+                                self.emit_move(src2, Reg::Rdx, Bits::new(64));
                             }
                         }
                     } else {
-                        self.emit_move(*src, Reg::Rax, 64);
+                        self.emit_move(*src, Reg::Rax, Bits::new(64));
                         if let Some(&src2) = insn.src.get(1) {
-                            self.emit_move(src2, Reg::Rdx, 64);
+                            self.emit_move(src2, Reg::Rdx, Bits::new(64));
                         }
                     }
                 } else {
-                    self.emit_move(*src, Reg::Rax, 64);
+                    self.emit_move(*src, Reg::Rax, Bits::new(64));
                     if let Some(&src2) = insn.src.get(1) {
-                        self.emit_move(src2, Reg::Rdx, 64);
+                        self.emit_move(src2, Reg::Rdx, Bits::new(64));
                     }
                 }
             } else if is_struct_or_union && !is_complex {
@@ -1399,7 +1419,7 @@ impl X86_64CodeGen {
                         size: OperandSize::B64,
                         src: GpOperand::Mem(MemAddr::BaseOffset {
                             base,
-                            offset: (i * 8) as i32,
+                            offset: (i * 8) as i64,
                         }),
                         dst: GpOperand::Reg(*reg),
                     });
@@ -1481,7 +1501,7 @@ impl X86_64CodeGen {
                 // a stack, so push the imaginary part first and the real part
                 // second to leave them in that order.
                 let base = types.complex_base(insn.typ.unwrap());
-                let imag_off = (types.size_bytes(base)) as i32;
+                let imag_off = types.value_bits(base).bytes_exact() as i64;
                 let base_addr = self.address_of_pseudo(*src);
                 self.push_lir(X86Inst::X87Load {
                     addr: MemAddr::BaseOffset {
@@ -1507,7 +1527,7 @@ impl X86_64CodeGen {
                 } else {
                     // Use type-aware size for FP return
                     let fp_typ = insn.typ.expect("FP return must have type");
-                    let fp_size = types.size_bits(fp_typ).max(32);
+                    let fp_size = types.value_bits(fp_typ).max(Bits::new(32));
                     let fp_fmt = self.fp_format(Some(fp_typ), fp_size, types);
                     self.emit_fp_move(*src, XmmReg::Xmm0, fp_fmt);
                 }
@@ -1545,7 +1565,7 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Lea {
                 addr: MemAddr::BaseOffset {
                     base: Reg::Rbp,
-                    offset: -(offset as i32),
+                    offset: -(offset as i64),
                 },
                 dst: Reg::Rsp,
             });

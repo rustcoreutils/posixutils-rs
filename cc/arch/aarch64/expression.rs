@@ -16,16 +16,17 @@ use crate::arch::codegen::UnaryOp;
 use crate::arch::lir::{CondCode, Directive, OperandSize};
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::types::TypeTable;
+use crate::units::Bits;
 
 impl Aarch64CodeGen {
     pub(super) fn emit_binop(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
 
         // 128-bit shifts are still handled by the backend (mapping pass doesn't expand them)
-        if size == 128 {
+        if size == Bits::new(128) {
             if matches!(insn.op, Opcode::Shl | Opcode::Lsr | Opcode::Asr) {
                 self.emit_int128_binop(insn);
             }
@@ -133,8 +134,8 @@ impl Aarch64CodeGen {
     pub(super) fn emit_unary_op(&mut self, insn: &Instruction, op: UnaryOp, types: &TypeTable) {
         let size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
 
         let op_size = OperandSize::from_bits(size);
         let src = match insn.src.first() {
@@ -173,8 +174,8 @@ impl Aarch64CodeGen {
     pub(super) fn emit_mul(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
 
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
@@ -209,8 +210,8 @@ impl Aarch64CodeGen {
     pub(super) fn emit_div(&mut self, insn: &Instruction, types: &TypeTable) {
         let size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
 
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
@@ -270,8 +271,8 @@ impl Aarch64CodeGen {
         // Compared at the operands' width; the result is an `int`.
         let size = insn
             .operand_type()
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.operand_width().max(32));
+            .map_or(insn.operand_width(), |t| types.value_bits(t))
+            .max(Bits::new(32));
 
         let op_size = OperandSize::from_bits(size);
         let (src1, src2) = match (insn.src.first(), insn.src.get(1)) {
@@ -328,7 +329,7 @@ impl Aarch64CodeGen {
         // in the upper 32 bits. cset produces 0 or 1 in a 64-bit register
         // (upper 32 bits are already zero), so str x__ is correct.
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
         }
     }
 
@@ -343,7 +344,7 @@ impl Aarch64CodeGen {
         };
 
         // Handle truncation FROM 128-bit (Zext/Sext TO 128 handled by mapping pass)
-        if insn.src_size == 128 && insn.op == Opcode::Trunc {
+        if insn.src_size == Bits::new(128) && insn.op == Opcode::Trunc {
             self.emit_int128_trunc(insn);
             return;
         }
@@ -357,8 +358,8 @@ impl Aarch64CodeGen {
         match insn.op {
             Opcode::Zext => {
                 // Zero extend: use uxtb, uxth, or just mov for 32->64
-                self.emit_move(src, dst_reg, 64);
-                match insn.src_size {
+                self.emit_move(src, dst_reg, Bits::new(64));
+                match insn.src_size.get() {
                     8 => {
                         self.push_lir(Aarch64Inst::Uxtb {
                             src: dst_reg,
@@ -390,8 +391,8 @@ impl Aarch64CodeGen {
             }
             Opcode::Sext => {
                 // Sign extend: use sxtb, sxth, sxtw based on source size
-                self.emit_move(src, dst_reg, 64);
-                match insn.src_size {
+                self.emit_move(src, dst_reg, Bits::new(64));
+                match insn.src_size.get() {
                     8 => {
                         self.push_lir(Aarch64Inst::Sxtb {
                             dst_size: OperandSize::B64,
@@ -426,9 +427,9 @@ impl Aarch64CodeGen {
                 // return value and lets the other side assume it, so a
                 // zero-extended `(char)0xC3` reached Apple clang as 195 where
                 // it reads -61.
-                self.emit_move(src, dst_reg, 64);
+                self.emit_move(src, dst_reg, Bits::new(64));
                 let signed = insn.typ.is_some_and(|t| !types.is_unsigned(t));
-                match insn.size {
+                match insn.size.get() {
                     8 if signed => {
                         self.push_lir(Aarch64Inst::Sxtb {
                             dst_size: OperandSize::B32,
@@ -517,12 +518,12 @@ impl Aarch64CodeGen {
             Loc::Imm(v) => {
                 let lo = v as u64 as i64;
                 let hi = (v >> 64) as u64 as i64;
-                self.emit_mov_imm(lo_reg, lo, 64);
-                self.emit_mov_imm(hi_reg, hi, 64);
+                self.emit_mov_imm(lo_reg, lo, Bits::new(64));
+                self.emit_mov_imm(hi_reg, hi, Bits::new(64));
             }
             _ => {
                 // Fallback: load as 64-bit, zero hi
-                self.emit_move(src, lo_reg, 64);
+                self.emit_move(src, lo_reg, Bits::new(64));
                 self.push_lir(Aarch64Inst::Mov {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(Reg::Xzr),
@@ -561,7 +562,7 @@ impl Aarch64CodeGen {
         self.load_int128(src1, Reg::X9, Reg::X10);
 
         // Shift amount is a regular small integer, not int128.
-        self.emit_move(src2, Reg::X11, 64);
+        self.emit_move(src2, Reg::X11, Bits::new(64));
 
         match insn.op {
             Opcode::Shl => self.emit_int128_shl(),
@@ -915,7 +916,7 @@ impl Aarch64CodeGen {
             });
         }
         // Mask to target size if needed
-        match target_size {
+        match target_size.get() {
             8 => {
                 self.push_lir(Aarch64Inst::And {
                     size: OperandSize::B32,
@@ -974,7 +975,7 @@ impl Aarch64CodeGen {
                     });
                 }
             }
-            _ => self.emit_move_to_loc(Reg::X9, &dst_loc, 64),
+            _ => self.emit_move_to_loc(Reg::X9, &dst_loc, Bits::new(64)),
         }
     }
 
@@ -995,7 +996,7 @@ impl Aarch64CodeGen {
                     });
                 }
             }
-            _ => self.emit_move_to_loc(Reg::X10, &dst_loc, 64),
+            _ => self.emit_move_to_loc(Reg::X10, &dst_loc, Bits::new(64)),
         }
     }
 
@@ -1005,8 +1006,8 @@ impl Aarch64CodeGen {
         let src_hi = insn.src[1];
         let target = insn.target.expect("Pair64 must have target");
 
-        self.emit_move(src_lo, Reg::X9, 64);
-        self.emit_move(src_hi, Reg::X10, 64);
+        self.emit_move(src_lo, Reg::X9, Bits::new(64));
+        self.emit_move(src_hi, Reg::X10, Bits::new(64));
         self.store_int128(Reg::X9, Reg::X10, target);
     }
 
@@ -1023,8 +1024,8 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        self.emit_move(src1, dst_reg, 64);
-        self.emit_move(src2, Reg::X10, 64);
+        self.emit_move(src1, dst_reg, Bits::new(64));
+        self.emit_move(src2, Reg::X10, Bits::new(64));
 
         if with_carry {
             self.push_lir(Aarch64Inst::Adc {
@@ -1043,7 +1044,7 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1060,8 +1061,8 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        self.emit_move(src1, dst_reg, 64);
-        self.emit_move(src2, Reg::X10, 64);
+        self.emit_move(src1, dst_reg, Bits::new(64));
+        self.emit_move(src2, Reg::X10, Bits::new(64));
 
         if with_borrow {
             self.push_lir(Aarch64Inst::Sbc {
@@ -1080,7 +1081,7 @@ impl Aarch64CodeGen {
         }
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
         }
     }
 
@@ -1095,8 +1096,8 @@ impl Aarch64CodeGen {
             _ => Reg::X16,
         };
 
-        self.emit_move(src1, Reg::X9, 64);
-        self.emit_move(src2, Reg::X10, 64);
+        self.emit_move(src1, Reg::X9, Bits::new(64));
+        self.emit_move(src2, Reg::X10, Bits::new(64));
 
         self.push_lir(Aarch64Inst::Umulh {
             src1: Reg::X9,
@@ -1105,7 +1106,7 @@ impl Aarch64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
         }
     }
 }
@@ -1121,14 +1122,14 @@ impl Aarch64CodeGen {
 ///   written: `legalize.rs` keeps an encodable one and puts any other in a
 ///   register, which is the one place that rule lives.
 /// - `lsl` / `lsr` / `asr` take a shift amount below the operand width.
-fn immediate_fits(op: Opcode, value: i128, size: u32) -> bool {
+fn immediate_fits(op: Opcode, value: i128, size: Bits) -> bool {
     match op {
         Opcode::Add | Opcode::Sub => (0..=4095).contains(&value),
         Opcode::And | Opcode::Or | Opcode::Xor => {
             i64::try_from(value).is_ok() || u64::try_from(value).is_ok()
         }
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => {
-            let width = if size > 32 { 64 } else { 32 } as i128;
+            let width = if size > Bits::new(32) { 64 } else { 32 } as i128;
             (0..width).contains(&value)
         }
         // Anything else reaching this operand builder takes a register.
@@ -1146,21 +1147,21 @@ mod immediate_tests {
     #[test]
     fn each_opcode_family_has_its_own_immediate_range() {
         // add/sub: 12-bit unsigned.
-        assert!(immediate_fits(Opcode::Add, 4095, 32));
-        assert!(!immediate_fits(Opcode::Add, 4096, 32));
-        assert!(!immediate_fits(Opcode::Sub, -1, 32));
+        assert!(immediate_fits(Opcode::Add, 4095, Bits::new(32)));
+        assert!(!immediate_fits(Opcode::Add, 4096, Bits::new(32)));
+        assert!(!immediate_fits(Opcode::Sub, -1, Bits::new(32)));
 
         // logical: any value; the legalizer decides whether it encodes.
-        assert!(immediate_fits(Opcode::And, 4095, 32));
-        assert!(immediate_fits(Opcode::And, 1000, 32));
-        assert!(immediate_fits(Opcode::Or, 0, 32));
-        assert!(immediate_fits(Opcode::Xor, -17, 64));
+        assert!(immediate_fits(Opcode::And, 4095, Bits::new(32)));
+        assert!(immediate_fits(Opcode::And, 1000, Bits::new(32)));
+        assert!(immediate_fits(Opcode::Or, 0, Bits::new(32)));
+        assert!(immediate_fits(Opcode::Xor, -17, Bits::new(64)));
 
         // shifts: below the operand width.
-        assert!(immediate_fits(Opcode::Shl, 31, 32));
-        assert!(!immediate_fits(Opcode::Shl, 32, 32));
-        assert!(immediate_fits(Opcode::Lsr, 63, 64));
-        assert!(!immediate_fits(Opcode::Asr, 64, 64));
-        assert!(!immediate_fits(Opcode::Shl, -1, 32));
+        assert!(immediate_fits(Opcode::Shl, 31, Bits::new(32)));
+        assert!(!immediate_fits(Opcode::Shl, 32, Bits::new(32)));
+        assert!(immediate_fits(Opcode::Lsr, 63, Bits::new(64)));
+        assert!(!immediate_fits(Opcode::Asr, 64, Bits::new(64)));
+        assert!(!immediate_fits(Opcode::Shl, -1, Bits::new(32)));
     }
 }

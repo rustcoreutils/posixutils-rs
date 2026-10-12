@@ -13,6 +13,7 @@
 use super::dominate::{domtree_build, idf_compute, DomTree};
 use super::{BasicBlockId, Function, Instruction, Opcode, Pseudo, PseudoId, Site};
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::HashMap;
 
 const DEFAULT_SSA_RENAME_CAPACITY: usize = 32;
@@ -82,7 +83,7 @@ struct VarInfo {
     /// Type of the variable
     typ: TypeId,
     /// Size of the type in bits
-    size: u32,
+    size: Bits,
     /// Blocks that store to this variable
     def_blocks: Vec<BasicBlockId>,
     /// Total number of stores
@@ -110,7 +111,7 @@ fn analyze_variables(func: &Function, types: &TypeTable) -> HashMap<String, VarI
             let promotable = local.is_ordinary(types) && types.is_scalar(local.typ);
             let info = promotable.then(|| VarInfo {
                 typ: local.typ,
-                size: types.size_bits(local.typ),
+                size: types.value_bits(local.typ),
                 ..Default::default()
             });
             (local.sym, (name.as_str(), info))
@@ -770,7 +771,7 @@ mod tests {
         entry.children = vec![BasicBlockId(1), BasicBlockId(2)];
         entry.add_insn(Instruction::new(Opcode::Entry));
         // Store x = 1
-        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, Bits::new(32)));
         // Conditional branch
         entry.add_insn(Instruction::cbr(cond, BasicBlockId(1), BasicBlockId(2)));
 
@@ -778,7 +779,7 @@ mod tests {
         let mut then_bb = BasicBlock::new(BasicBlockId(1));
         then_bb.parents = vec![BasicBlockId(0)];
         then_bb.children = vec![BasicBlockId(3)];
-        then_bb.add_insn(Instruction::store(val2, x_sym, 0, int_id, 32));
+        then_bb.add_insn(Instruction::store(val2, x_sym, 0, int_id, Bits::new(32)));
         then_bb.add_insn(Instruction::br(BasicBlockId(3)));
 
         // Else block: (no assignment)
@@ -793,7 +794,7 @@ mod tests {
         let result = PseudoId(4);
         func.add_pseudo(Pseudo::reg(result, 0));
         // Load x
-        merge.add_insn(Instruction::load(result, x_sym, 0, int_id, 32));
+        merge.add_insn(Instruction::load(result, x_sym, 0, int_id, Bits::new(32)));
         merge.add_insn(Instruction::ret(Some(result)));
 
         func.entry = BasicBlockId(0);
@@ -934,15 +935,27 @@ mod tests {
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.children = vec![BasicBlockId(1)];
         entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::store(val0, x_sym, 0, int_id, 32));
-        entry.add_insn(Instruction::store(val0, opcode_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::store(val0, x_sym, 0, int_id, Bits::new(32)));
+        entry.add_insn(Instruction::store(
+            val0,
+            opcode_sym,
+            0,
+            int_id,
+            Bits::new(32),
+        ));
         entry.add_insn(Instruction::br(BasicBlockId(1)));
 
         // dispatch(1): load opcode; switch(opcode) { 0->handler0, 1->handler1, default->done }
         let mut dispatch = BasicBlock::new(BasicBlockId(1));
         dispatch.parents = vec![BasicBlockId(0), BasicBlockId(2)]; // entry + handler0 back-edge
         dispatch.children = vec![BasicBlockId(2), BasicBlockId(3), BasicBlockId(4)];
-        dispatch.add_insn(Instruction::load(load_result, opcode_sym, 0, int_id, 32));
+        dispatch.add_insn(Instruction::load(
+            load_result,
+            opcode_sym,
+            0,
+            int_id,
+            Bits::new(32),
+        ));
         dispatch.add_insn(Instruction::switch_insn(
             load_result,
             vec![
@@ -950,28 +963,40 @@ mod tests {
                 (1, 1, BasicBlockId(3)), // case 1 -> handler1
             ],
             Some(BasicBlockId(4)), // default -> done
-            32,
+            Bits::new(32),
         ));
 
         // handler0(2): x = 10; opcode = 1; goto dispatch (back-edge)
         let mut handler0 = BasicBlock::new(BasicBlockId(2));
         handler0.parents = vec![BasicBlockId(1)];
         handler0.children = vec![BasicBlockId(1)]; // back-edge to dispatch
-        handler0.add_insn(Instruction::store(val10, x_sym, 0, int_id, 32));
-        handler0.add_insn(Instruction::store(val1, opcode_sym, 0, int_id, 32));
+        handler0.add_insn(Instruction::store(val10, x_sym, 0, int_id, Bits::new(32)));
+        handler0.add_insn(Instruction::store(
+            val1,
+            opcode_sym,
+            0,
+            int_id,
+            Bits::new(32),
+        ));
         handler0.add_insn(Instruction::br(BasicBlockId(1)));
 
         // handler1(3): x = 20; goto done
         let mut handler1 = BasicBlock::new(BasicBlockId(3));
         handler1.parents = vec![BasicBlockId(1)];
         handler1.children = vec![BasicBlockId(4)];
-        handler1.add_insn(Instruction::store(val20, x_sym, 0, int_id, 32));
+        handler1.add_insn(Instruction::store(val20, x_sym, 0, int_id, Bits::new(32)));
         handler1.add_insn(Instruction::br(BasicBlockId(4)));
 
         // done(4): return x
         let mut done = BasicBlock::new(BasicBlockId(4));
         done.parents = vec![BasicBlockId(1), BasicBlockId(3)];
-        done.add_insn(Instruction::load(load_x_done, x_sym, 0, int_id, 32));
+        done.add_insn(Instruction::load(
+            load_x_done,
+            x_sym,
+            0,
+            int_id,
+            Bits::new(32),
+        ));
         done.add_insn(Instruction::ret(Some(load_x_done)));
 
         func.entry = BasicBlockId(0);
@@ -1197,8 +1222,8 @@ mod tests {
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, 32));
-        entry.add_insn(Instruction::load(loaded, x_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, Bits::new(32)));
+        entry.add_insn(Instruction::load(loaded, x_sym, 0, int_id, Bits::new(32)));
         entry.add_insn(Instruction::ret(Some(loaded)));
 
         func.entry = BasicBlockId(0);
@@ -1295,9 +1320,9 @@ mod tests {
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::store(lo, z_sym, 0, int_id, 32));
-        entry.add_insn(Instruction::store(hi, z_sym, 8, int_id, 32));
-        entry.add_insn(Instruction::load(out, z_sym, 0, wide, 64));
+        entry.add_insn(Instruction::store(lo, z_sym, 0, int_id, Bits::new(32)));
+        entry.add_insn(Instruction::store(hi, z_sym, 8, int_id, Bits::new(32)));
+        entry.add_insn(Instruction::load(out, z_sym, 0, wide, Bits::new(64)));
         entry.add_insn(Instruction::ret(Some(out)));
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry];
@@ -1341,7 +1366,7 @@ mod tests {
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, Bits::new(32)));
         // A call taking the symbol directly as an argument.
         let mut call = Instruction::new(Opcode::Call);
         call.target = Some(ret);
@@ -1384,9 +1409,9 @@ mod tests {
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::store(one, a, 0, int_id, 32));
-        entry.add_insn(Instruction::store(c, b, 0, ptr_id, 64));
-        entry.add_insn(Instruction::store(one, b, 0, ptr_id, 64));
+        entry.add_insn(Instruction::store(one, a, 0, int_id, Bits::new(32)));
+        entry.add_insn(Instruction::store(c, b, 0, ptr_id, Bits::new(64)));
+        entry.add_insn(Instruction::store(one, b, 0, ptr_id, Bits::new(64)));
         let mut call = Instruction::new(Opcode::Call);
         call.target = Some(ret);
         call.src = vec![a];
@@ -1432,9 +1457,15 @@ mod tests {
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
-        entry.add_insn(Instruction::store(one, local_sym, 0, int_id, 32));
-        entry.add_insn(Instruction::store(two, global_sym, 0, int_id, 32));
-        entry.add_insn(Instruction::load(out, local_sym, 0, int_id, 32));
+        entry.add_insn(Instruction::store(one, local_sym, 0, int_id, Bits::new(32)));
+        entry.add_insn(Instruction::store(
+            two,
+            global_sym,
+            0,
+            int_id,
+            Bits::new(32),
+        ));
+        entry.add_insn(Instruction::load(out, local_sym, 0, int_id, Bits::new(32)));
         entry.add_insn(Instruction::ret(Some(out)));
         func.entry = BasicBlockId(0);
         func.blocks = vec![entry];
@@ -1495,8 +1526,8 @@ mod tests {
         let mut body = BasicBlock::new(BasicBlockId(2));
         body.parents = vec![BasicBlockId(1)];
         body.children = vec![BasicBlockId(1)];
-        body.add_insn(Instruction::load(loaded, t_sym, 0, int_id, 32));
-        body.add_insn(Instruction::store(stored, t_sym, 0, int_id, 32));
+        body.add_insn(Instruction::load(loaded, t_sym, 0, int_id, Bits::new(32)));
+        body.add_insn(Instruction::store(stored, t_sym, 0, int_id, Bits::new(32)));
         body.add_insn(Instruction::br(BasicBlockId(1)));
 
         let mut exit = BasicBlock::new(BasicBlockId(3));

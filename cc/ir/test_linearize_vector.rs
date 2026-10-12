@@ -24,7 +24,7 @@ fn load_widths(src: &str, name: &str) -> Vec<u32> {
     insns_of(&module, name)
         .into_iter()
         .filter(|i| i.op == Opcode::Load)
-        .map(|i| i.size)
+        .map(|i| i.size.get())
         .collect()
 }
 
@@ -311,7 +311,7 @@ fn test_darwin_small_vector_argument_reads_only_its_bytes() {
     let loads: Vec<u32> = call
         .iter()
         .filter(|i| i.op == Opcode::Load)
-        .map(|i| i.size)
+        .map(|i| i.size.get())
         .collect();
     assert!(loads.contains(&8) && loads.contains(&16), "{loads:?}");
     assert!(!loads.contains(&32), "{loads:?}");
@@ -319,7 +319,7 @@ fn test_darwin_small_vector_argument_reads_only_its_bytes() {
     let stores: Vec<u32> = insns_of(&module, "out")
         .iter()
         .filter(|i| i.op == Opcode::Store)
-        .map(|i| i.size)
+        .map(|i| i.size.get())
         .collect();
     assert_eq!(stores, [8], "the asm output stores {stores:?}");
 }

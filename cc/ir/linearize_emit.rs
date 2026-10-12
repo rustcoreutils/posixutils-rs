@@ -27,6 +27,7 @@ use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::Bitfield;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
+use crate::units::{Bits, ByteSize};
 
 /// A read-modify-write target whose address has been computed **once**.
 ///
@@ -413,13 +414,19 @@ pub(crate) fn bitfield_value_mask_128(bit_width: u32) -> u128 {
 
 impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn emit_const(&mut self, val: i128, typ: TypeId) -> PseudoId {
+        self.emit_const_at(val, typ, self.types.value_bits(typ))
+    }
+
+    /// [`Self::emit_const`] at a width the caller decides, for a type that
+    /// may have none of its own.
+    pub(crate) fn emit_const_at(&mut self, val: i128, typ: TypeId, width: Bits) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::val(id, val);
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(pseudo);
         }
 
-        self.emit(Instruction::set_val(id, typ, self.types.size_bits(typ)));
+        self.emit(Instruction::set_val(id, typ, width));
 
         id
     }
@@ -431,7 +438,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             func.add_pseudo(pseudo);
         }
 
-        self.emit(Instruction::set_val(id, typ, self.types.size_bits(typ)));
+        self.emit(Instruction::set_val(id, typ, self.types.value_bits(typ)));
 
         id
     }
@@ -440,7 +447,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// 6.7.9p19 asks for before an initializer list is applied: every member
     /// the list does not reach is initialized as a static object would be.
     pub(crate) fn emit_aggregate_zero(&mut self, base_sym: PseudoId, typ: TypeId) {
-        let total_bytes = self.types.size_bytes(typ) as i64;
+        let total_bytes = self.types.byte_size(typ);
         let access = Access::of(self.types, typ);
         self.emit_block_zero(base_sym, 0, total_bytes, access);
     }
@@ -453,7 +460,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         dst: PseudoId,
         offset: i64,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         typ: TypeId,
     ) {
         let byte = match self.auto_var_init {
@@ -527,7 +534,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         dst: PseudoId,
         dst_base_offset: i64,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         access: Access,
     ) {
         self.emit_block_fill(dst, dst_base_offset, size_bytes, 0, access);
@@ -538,11 +545,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         dst: PseudoId,
         dst_base_offset: i64,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         byte: u8,
         access: Access,
     ) {
-        if size_bytes <= 0 {
+        if size_bytes.is_zero() {
             return;
         }
         // An object in a segment has no address `memset` could take, so it
@@ -551,7 +558,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             for (offset, chunk) in memexpand::block_chunks(size_bytes) {
                 let (typ, bits) = (chunk.typ(self.types), chunk.bits());
                 // Every byte the same: the chunk's value, sign-extended.
-                let pattern = i128::from(i64::from_ne_bytes([byte; 8]) >> (64 - bits));
+                let pattern = i128::from(i64::from_ne_bytes([byte; 8]) >> (64 - bits.get()));
                 let value = self.emit_const(pattern, typ);
                 self.emit(
                     Instruction::store(value, dst, dst_base_offset + offset, typ, bits)
@@ -562,7 +569,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
         let byte = self.emit_const(i128::from(byte), self.types.int_id);
-        let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
+        let n = self.emit_const(i128::from(size_bytes.get()), self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(
             Instruction::new(BlockOp::Set.opcode())
@@ -578,7 +585,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         dst: PseudoId,
         src: PseudoId,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         vol: BlockVolatility,
     ) {
         self.emit_block_copy_at_offset(dst, 0, src, size_bytes, vol);
@@ -601,7 +608,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         dst: PseudoId,
         dst_base_offset: i64,
         src: PseudoId,
-        size_bytes: i64,
+        size_bytes: ByteSize,
         vol: BlockVolatility,
     ) {
         // An object in a segment has no address `memcpy` could take, so it
@@ -653,11 +660,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         dst: PseudoId,
         dst_base_offset: i64,
         src: PseudoId,
-        size_bytes: i64,
+        size_bytes: ByteSize,
     ) {
         let dst_ptr = self.block_dest_addr(dst, dst_base_offset);
         let src = self.rvalue_addr(src, self.types.void_ptr_id);
-        let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
+        let n = self.emit_const(i128::from(size_bytes.get()), self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(
             Instruction::new(BlockOp::Copy.opcode())
@@ -706,7 +713,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
-        let storage_bits = storage_size * 8;
+        let storage_bits = self.types.value_bits(storage_type);
         let access = Access::of(self.types, typ);
 
         // 1. Load the entire storage unit, as a number in the target's order:
@@ -754,9 +761,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         // -1 came back 4294967295 with `a < 0` false. And where the field
         // exactly fills its unit the guard was false outright, so a signed
         // field got no extension at all.
-        let value_bits = self.types.size_bits(typ);
-        if !self.types.is_unsigned(typ) && bit_width < value_bits {
-            self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
+        let value_bits = self.types.value_bits(typ);
+        if !self.types.is_unsigned(typ) && bit_width < value_bits.get() {
+            self.emit_sign_extend_bitfield(masked, bit_width, value_bits.get())
         } else {
             self.widen_bitfield_to_declared(masked, storage_type, storage_bits, typ, value_bits)
         }
@@ -780,9 +787,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         value: PseudoId,
         storage_type: TypeId,
-        storage_bits: u32,
+        storage_bits: Bits,
         typ: TypeId,
-        value_bits: u32,
+        value_bits: Bits,
     ) -> PseudoId {
         if storage_bits >= value_bits {
             // Already at least as wide, and masked to the field, so reading
@@ -811,8 +818,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         bit_width: u32,
         typ: TypeId,
     ) -> PseudoId {
-        let value_bits = self.types.size_bits(typ);
-        if bit_width >= value_bits {
+        let value_bits = self.types.value_bits(typ);
+        if bit_width >= value_bits.get() {
             // The field fills its declared type; nothing to narrow, and the
             // mask below would be a no-op that only costs an instruction.
             return value;
@@ -831,7 +838,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         if self.types.is_unsigned(typ) {
             masked
         } else {
-            self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
+            self.emit_sign_extend_bitfield(masked, bit_width, value_bits.get())
         }
     }
 
@@ -864,7 +871,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         } else {
             self.types.uint_id
         };
-        let carrier_bits = if wide { 64 } else { 32 };
+        let carrier_bits = Bits::new(if wide { 64 } else { 32 });
         let byte_type = self.types.uchar_id;
         // Every byte of a volatile field is part of the one observable read.
         let access = Access::of(self.types, typ);
@@ -886,8 +893,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             let byte = self.alloc_pseudo();
             self.emit(
-                Instruction::load(byte, base, (byte_offset + i as usize) as i64, byte_type, 8)
-                    .with_access(access),
+                Instruction::load(
+                    byte,
+                    base,
+                    byte_offset.to_i64() + i64::from(i),
+                    byte_type,
+                    Bits::new(8),
+                )
+                .with_access(access),
             );
             // Widen before shifting, or the shift is done at eight bits and
             // drops everything it moves. `uchar` is unsigned, so this is a
@@ -951,9 +964,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         ));
 
         // As above: the declared type's width, not the carrier's.
-        let value_bits = self.types.size_bits(typ);
-        if !self.types.is_unsigned(typ) && bit_width < value_bits {
-            self.emit_sign_extend_bitfield(masked, bit_width, value_bits)
+        let value_bits = self.types.value_bits(typ);
+        if !self.types.is_unsigned(typ) && bit_width < value_bits.get() {
+            self.emit_sign_extend_bitfield(masked, bit_width, value_bits.get())
         } else {
             self.widen_bitfield_to_declared(masked, carrier, carrier_bits, typ, value_bits)
         }
@@ -977,13 +990,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         // tier for the same reason -- capping at 64 sign-extends only the low
         // half.
         let (typ, op_bits) = if target_bits <= 32 {
-            (self.types.int_id, 32)
+            (self.types.int_id, Bits::new(32))
         } else if target_bits <= 64 {
-            (self.types.long_id, 64)
+            (self.types.long_id, Bits::new(64))
         } else {
-            (self.types.int128_id, 128)
+            (self.types.int128_id, Bits::new(128))
         };
-        let shift_amount = op_bits - bit_width;
+        let shift_amount = op_bits.get() - bit_width;
 
         let shift_val = self.emit_const(shift_amount as i128, typ);
         let shifted_left = self.alloc_pseudo();
@@ -1035,7 +1048,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Determine storage type based on storage unit size
         let storage_type = self.bitfield_storage_type(storage_size as usize);
-        let storage_bits = storage_size * 8;
+        let storage_bits = self.types.value_bits(storage_type);
         let access = Access::of(self.types, typ);
 
         // 1. Load current storage unit value, as `emit_bitfield_load` does.
@@ -1047,7 +1060,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         //
         // Complemented inside the storage unit rather than inside the widest
         // carrier: `!field_mask` alone sets every bit above the unit.
-        let unit_mask = bitfield_value_mask_128(storage_bits);
+        let unit_mask = bitfield_value_mask_128(storage_bits.get());
         let field_mask = bitfield_value_mask_128(bit_width) << bit_offset;
         let clear_mask = !field_mask & unit_mask;
         let clear_mask_val = self.emit_const(clear_mask as i128, storage_type);
@@ -1105,13 +1118,13 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // 6. Store back, in the unit's own order.
         if self.bitfield_unit_reversed(bf, typ) {
-            self.emit_reversed_store(combined, base, byte_offset as i64, storage_type, access);
+            self.emit_reversed_store(combined, base, byte_offset.to_i64(), storage_type, access);
         } else {
             self.emit(
                 Instruction::store(
                     combined,
                     base,
-                    byte_offset as i64,
+                    byte_offset.to_i64(),
                     storage_type,
                     storage_bits,
                 )
@@ -1131,11 +1144,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         access: Access,
     ) {
         let storage_type = self.bitfield_storage_type(bf.access_bytes as usize);
-        let offset = bf.offset as i64;
+        let offset = bf.offset.to_i64();
         if self.bitfield_unit_reversed(bf, typ) {
             self.emit_reversed_load(target, base, offset, storage_type, access);
         } else {
-            let bits = bf.access_bytes * 8;
+            let bits = self.types.value_bits(storage_type);
             self.emit(
                 Instruction::load(target, base, offset, storage_type, bits).with_access(access),
             );
@@ -1194,7 +1207,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         } else {
             self.types.uint_id
         };
-        let carrier_bits = if wide { 64 } else { 32 };
+        let carrier_bits = Bits::new(if wide { 64 } else { 32 });
         let byte_type = self.types.uchar_id;
         let access = Access::of(self.types, typ);
         // See `emit_bitfield_load_bytewise`.
@@ -1264,19 +1277,22 @@ impl<'a> super::linearize::Linearizer<'a> {
                     piece,
                     amount,
                     byte_type,
-                    8,
+                    Bits::new(8),
                 ));
                 out
             };
 
-            let addr_off = (byte_offset + i as usize) as i64;
+            let addr_off = byte_offset.to_i64() + i64::from(i);
             let to_store = if byte_mask == 0xff {
                 // The field owns every bit of this byte, so nothing has to be
                 // preserved and the read can be skipped.
                 placed
             } else {
                 let old = self.alloc_pseudo();
-                self.emit(Instruction::load(old, base, addr_off, byte_type, 8).with_access(access));
+                self.emit(
+                    Instruction::load(old, base, addr_off, byte_type, Bits::new(8))
+                        .with_access(access),
+                );
                 let keep = self.emit_const((!byte_mask & 0xff) as i128, byte_type);
                 let cleared = self.alloc_pseudo();
                 self.emit(Instruction::binop(
@@ -1285,7 +1301,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     old,
                     keep,
                     byte_type,
-                    8,
+                    Bits::new(8),
                 ));
                 let masked_piece = {
                     let m = self.emit_const(byte_mask as i128, byte_type);
@@ -1296,7 +1312,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         placed,
                         m,
                         byte_type,
-                        8,
+                        Bits::new(8),
                     ));
                     out
                 };
@@ -1307,19 +1323,19 @@ impl<'a> super::linearize::Linearizer<'a> {
                     cleared,
                     masked_piece,
                     byte_type,
-                    8,
+                    Bits::new(8),
                 ));
                 out
             };
             self.emit(
-                Instruction::store(to_store, base, addr_off, byte_type, 8).with_access(access),
+                Instruction::store(to_store, base, addr_off, byte_type, Bits::new(8))
+                    .with_access(access),
             );
         }
     }
 
     pub(crate) fn emit_unary(&mut self, op: UnaryOp, src: PseudoId, typ: TypeId) -> PseudoId {
         let is_float = self.types.is_float(typ);
-        let size = self.types.size_bits(typ);
 
         let result = self.alloc_pseudo();
 
@@ -1369,6 +1385,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         };
 
+        // Only an arithmetic operand gets this far: a dereferenced aggregate
+        // returned above, and may have no value width.
+        let size = self.types.value_bits(typ);
         self.emit(Instruction::unop(opcode, result, src, typ, size));
         result
     }
@@ -1387,7 +1406,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let insn = if opcode.is_comparison() {
             self.compare_insn(opcode, result, (left, right), operand_typ)
         } else {
-            let size = self.types.size_bits(result_typ);
+            let size = self.types.value_bits(result_typ);
             Instruction::binop(opcode, result, left, right, result_typ, size)
         };
         self.emit(insn);
@@ -1411,9 +1430,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         operand: TypeId,
     ) -> Instruction {
         let operand = self.types.decayed_value(operand);
-        let width = self.types.size_bits(operand);
+        let width = self.types.value_bits(operand);
         let int = self.types.int_id;
-        let result = (int, self.types.size_bits(int));
+        let result = (int, self.types.value_bits(int));
         Instruction::compare(op, target, operands, (operand, width), result)
     }
 
@@ -1438,8 +1457,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         complex_typ: TypeId,
     ) -> PseudoId {
         let base_typ = self.types.complex_base(complex_typ);
-        let base_bits = self.types.size_bits(base_typ);
-        let base_bytes = (base_bits / 8) as i64;
+        let base_bits = self.types.value_bits(base_typ);
+        let base_bytes = i64::from(base_bits.bytes_exact());
 
         let converted = self.emit_convert(val, val_typ, base_typ);
 
@@ -1491,10 +1510,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             return addr;
         }
 
-        let src_bits = self.types.size_bits(src_base);
-        let src_bytes = (src_bits / 8) as i64;
-        let dst_bits = self.types.size_bits(dst_base);
-        let dst_bytes = (dst_bits / 8) as i64;
+        let src_bits = self.types.value_bits(src_base);
+        let src_bytes = i64::from(src_bits.bytes_exact());
+        let dst_bits = self.types.value_bits(dst_base);
+        let dst_bytes = i64::from(dst_bits.bytes_exact());
 
         let result = self.frame_temp_addr("__ctmp", complex_typ);
         for (src_off, dst_off) in [(0, 0), (src_bytes, dst_bytes)] {
@@ -1584,8 +1603,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         negate_real: bool,
     ) -> PseudoId {
         let base_typ = self.types.complex_base(complex_typ);
-        let base_bits = self.types.size_bits(base_typ);
-        let base_bytes = (base_bits / 8) as i64;
+        let base_bits = self.types.value_bits(base_typ);
+        let base_bytes = i64::from(base_bits.bytes_exact());
 
         let addr = self.complex_operand_at_precision(operand, complex_typ);
         let result = self.frame_temp_addr("__ctmp", complex_typ);
@@ -1626,7 +1645,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             return self.emit_complex_nonzero_at(addr, complex_typ);
         }
         let base_typ = self.types.complex_base(complex_typ);
-        let base_bits = self.types.size_bits(base_typ);
+        let base_bits = self.types.value_bits(base_typ);
         let real = self.alloc_pseudo();
         self.emit(Instruction::load(real, addr, 0, base_typ, base_bits));
         self.emit_convert(real, base_typ, target_typ)
@@ -1643,8 +1662,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) -> PseudoId {
         // Get the base float type (float, double, or long double)
         let base_typ = self.types.complex_base(complex_typ);
-        let base_size = self.types.size_bits(base_typ);
-        let base_bytes = (base_size / 8) as i64;
+        let base_size = self.types.value_bits(base_typ);
+        let base_bytes = i64::from(base_size.bytes_exact());
 
         // Allocate result temporary (stack space for the complex result)
         let result_addr = self.frame_temp_addr("__ctmp", complex_typ);
@@ -1811,7 +1830,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         left: (PseudoId, PseudoId),
         right: (PseudoId, PseudoId),
         base_typ: TypeId,
-        base_size: u32,
+        base_size: Bits,
     ) -> (PseudoId, PseudoId) {
         let (a, b) = left;
         let (c, d) = right;
@@ -1848,13 +1867,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         right: (PseudoId, PseudoId),
         result_addr: PseudoId,
         base_typ: TypeId,
-        base_size: u32,
+        base_size: Bits,
     ) {
         let (a, b) = left;
         let (c, d) = right;
         let unsigned = self.types.is_unsigned(base_typ);
         let div = if unsigned { Opcode::DivU } else { Opcode::DivS };
-        let base_bytes = (base_size / 8) as i64;
+        let base_bytes = i64::from(base_size.bytes_exact());
 
         // `|c| < |d|` decides which half scales. The absolute values are
         // non-negative, so an unsigned compare would do for both -- but the
@@ -1930,7 +1949,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         denom: PseudoId,
         div: Opcode,
         base_typ: TypeId,
-        base_size: u32,
+        base_size: Bits,
         base_bytes: i64,
     ) {
         let re = self.emit_int_binop(div, num.0, denom, base_typ, base_size);
@@ -1950,11 +1969,11 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `t = x >> (width - 1)` is all ones for a negative value and zero
     /// otherwise, so `(x ^ t) - t` is the magnitude either way. An unsigned
     /// value is already its own magnitude.
-    pub(crate) fn emit_int_abs(&mut self, x: PseudoId, typ: TypeId, size: u32) -> PseudoId {
+    pub(crate) fn emit_int_abs(&mut self, x: PseudoId, typ: TypeId, size: Bits) -> PseudoId {
         if self.types.is_unsigned(typ) {
             return x;
         }
-        let shift = self.emit_const((size - 1) as i128, typ);
+        let shift = self.emit_const(i128::from(size.get() - 1), typ);
         let sign = self.emit_int_binop(Opcode::Asr, x, shift, typ, size);
         let flipped = self.emit_int_binop(Opcode::Xor, x, sign, typ, size);
         self.emit_int_binop(Opcode::Sub, flipped, sign, typ, size)
@@ -1968,7 +1987,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let callee = self.library_function_name("fabsf128");
             return self.emit_library_call(&callee, &[(x, typ)], typ);
         }
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         let result = self.alloc_pseudo();
         let insn = Instruction::new(Opcode::Fabs)
             .with_target(result)
@@ -1996,7 +2015,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let callee = self.library_function_name("copysignf128");
             return self.emit_library_call(&callee, &[(x, typ), (y, typ)], typ);
         }
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         let result = self.alloc_pseudo();
         let insn = Instruction::new(Opcode::CopySign)
             .with_target(result)
@@ -2036,7 +2055,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             MathErrno::Set => {
                 let zero = self.emit_fconst(FloatVal::ZERO, typ);
                 let below = self.emit_compare(Opcode::FCmpOLt, x, zero, typ);
-                let size = self.types.size_bits(typ);
+                let size = self.types.value_bits(typ);
                 self.emit_diamond(
                     below,
                     typ,
@@ -2070,7 +2089,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
         callee: &str,
     ) -> PseudoId {
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         let result = self.alloc_pseudo();
         let mut insn = Instruction::new(op)
             .with_target(result)
@@ -2098,12 +2117,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         let result = self.alloc_pseudo();
         let mut insn = Instruction::new(Opcode::RoundToInteger(how))
             .with_target(result)
-            .with_size(self.types.size_bits(typ))
+            .with_size(self.types.value_bits(typ))
             .with_type(typ)
             .with_func(callee);
         insn.src = vec![val];
         insn.src_typ = Some(from);
-        insn.src_size = self.types.size_bits(from);
+        insn.src_size = self.types.value_bits(from);
         self.emit(insn);
         result
     }
@@ -2145,12 +2164,12 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `size` is passed rather than taken from `typ` because the two are not
     /// always the same: a complex conditional merges *addresses*, so its phi
     /// is pointer-wide over a pointer type, and a function designator's
-    /// `size_bits` is 0 where the merge wants a pointer's 64.
+    /// `value_bits` is 0 where the merge wants a pointer's 64.
     pub(crate) fn emit_diamond(
         &mut self,
         cond: PseudoId,
         typ: TypeId,
-        size: u32,
+        size: Bits,
         then_arm: impl FnOnce(&mut Self) -> PseudoId,
         else_arm: impl FnOnce(&mut Self) -> PseudoId,
     ) -> PseudoId {
@@ -2232,9 +2251,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut insn = Instruction::new(Opcode::Signbit)
             .with_target(result)
             .with_src(x)
-            .with_type_and_size(int_id, self.types.size_bits(int_id));
+            .with_type_and_size(int_id, self.types.value_bits(int_id));
         insn.src_typ = Some(typ);
-        insn.src_size = self.types.size_bits(typ);
+        insn.src_size = self.types.value_bits(typ);
         self.emit(insn);
         result
     }
@@ -2246,7 +2265,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         lhs: PseudoId,
         rhs: PseudoId,
         typ: TypeId,
-        size: u32,
+        size: Bits,
     ) -> PseudoId {
         debug_assert!(
             !op.is_comparison(),
@@ -2277,7 +2296,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             .filter(|_| !crate::arch::mapping::has_quiet_relational(self.types, typ));
         if let Some(signaling) = guarded {
             let int = self.types.int_id;
-            let size = self.types.size_bits(int);
+            let size = self.types.value_bits(int);
             let unordered = self.emit_unordered(lhs, rhs, typ);
             return self.emit_diamond(
                 unordered,
@@ -2422,7 +2441,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 arg_vals,
                 arg_types,
                 complex_typ,
-                self.types.size_bits(complex_typ),
+                self.types.value_bits(complex_typ),
             )
         };
         call_insn.extra_mut().abi_info = Some(call_abi_info);
@@ -2441,16 +2460,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         addr: PseudoId,
         complex_typ: TypeId,
-    ) -> (PseudoId, PseudoId, TypeId, u32) {
+    ) -> (PseudoId, PseudoId, TypeId, Bits) {
         let base_typ = self.types.complex_base(complex_typ);
-        let base_bits = self.types.size_bits(base_typ);
+        let base_bits = self.types.value_bits(base_typ);
         let real = self.alloc_pseudo();
         self.emit(Instruction::load(real, addr, 0, base_typ, base_bits));
         let imag = self.alloc_pseudo();
         self.emit(Instruction::load(
             imag,
             addr,
-            (base_bits / 8) as i64,
+            i64::from(base_bits.bytes_exact()),
             base_typ,
             base_bits,
         ));
@@ -2485,7 +2504,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         let result = self.alloc_pseudo();
         let int_typ = self.types.int_id;
-        let int_bits = self.types.size_bits(int_typ);
+        let int_bits = self.types.value_bits(int_typ);
         self.emit(Instruction::binop(
             Opcode::Or,
             result,
@@ -2525,7 +2544,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         let result = self.alloc_pseudo();
         let int_typ = self.types.int_id;
-        let int_bits = self.types.size_bits(int_typ);
+        let int_bits = self.types.value_bits(int_typ);
         self.emit(Instruction::binop(
             combine, result, real_cmp, imag_cmp, int_typ, int_bits,
         ));
@@ -2846,13 +2865,26 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(phi_pseudo);
         }
-        let mut phi_insn = Instruction::phi(result, result_typ, 32);
+        let mut phi_insn = Instruction::phi(result, result_typ, Bits::new(32));
         if short_circuits {
-            let phisrc1 = self.emit_phi_source(lhs_end_bb, zero, result, merge_bb, result_typ, 32);
+            let phisrc1 = self.emit_phi_source(
+                lhs_end_bb,
+                zero,
+                result,
+                merge_bb,
+                result_typ,
+                Bits::new(32),
+            );
             phi_insn.phi_list.push((lhs_end_bb, phisrc1));
         }
-        let phisrc2 =
-            self.emit_phi_source(rhs_end_bb, right_bool, result, merge_bb, result_typ, 32);
+        let phisrc2 = self.emit_phi_source(
+            rhs_end_bb,
+            right_bool,
+            result,
+            merge_bb,
+            result_typ,
+            Bits::new(32),
+        );
         phi_insn.phi_list.push((rhs_end_bb, phisrc2));
         self.emit(phi_insn);
 
@@ -2912,13 +2944,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(phi_pseudo);
         }
-        let mut phi_insn = Instruction::phi(result, result_typ, 32);
+        let mut phi_insn = Instruction::phi(result, result_typ, Bits::new(32));
         if short_circuits {
-            let phisrc1 = self.emit_phi_source(lhs_end_bb, one, result, merge_bb, result_typ, 32);
+            let phisrc1 =
+                self.emit_phi_source(lhs_end_bb, one, result, merge_bb, result_typ, Bits::new(32));
             phi_insn.phi_list.push((lhs_end_bb, phisrc1));
         }
-        let phisrc2 =
-            self.emit_phi_source(rhs_end_bb, right_bool, result, merge_bb, result_typ, 32);
+        let phisrc2 = self.emit_phi_source(
+            rhs_end_bb,
+            right_bool,
+            result,
+            merge_bb,
+            result_typ,
+            Bits::new(32),
+        );
         phi_insn.phi_list.push((rhs_end_bb, phisrc2));
         self.emit(phi_insn);
 
@@ -3032,7 +3071,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             Some(bf) => PlaceAt::Bitfield(base, bf, target_typ),
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
-            _ => PlaceAt::Object(self.offset_address(base, info.offset as i64)),
+            _ => PlaceAt::Object(self.offset_address(base, info.offset.to_i64())),
         };
         RmwPlace { at, ident: None }
     }
@@ -3050,7 +3089,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             base,
             delta,
             self.types.long_id,
-            self.types.size_bits(self.types.long_id),
+            self.types.value_bits(self.types.long_id),
         ));
         addr
     }
@@ -3072,7 +3111,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(ident) = place.ident {
             self.check_inline_static_reference(ident);
         }
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         let val = self.alloc_reg_pseudo();
         self.emit(Instruction::load(val, base, 0, typ, size));
         val
@@ -3089,7 +3128,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         val: PseudoId,
         typ: TypeId,
     ) -> Option<(u32, TypeId)> {
-        let size = self.types.size_bits(typ);
+        let size = self.types.value_bits(typ);
         match place.at {
             PlaceAt::Object(base) => self.emit(Instruction::store(val, base, 0, typ, size)),
             PlaceAt::Bitfield(base, bf, field_typ) => {
@@ -3125,7 +3164,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         rhs: PseudoId,
     ) -> PseudoId {
         let arith_type = compound_assign_arith_type(self.types, ca);
-        let arith_size = self.types.size_bits(arith_type);
+        let arith_size = self.types.value_bits(arith_type);
         let opcode = compound_assign_opcode(self.types, ca.op, arith_type);
 
         // Both operands into the arithmetic type. The left one is the object's
@@ -3226,7 +3265,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         complex_typ: TypeId,
     ) {
         let (real, imag, base_typ, base_bits) = self.load_complex_halves(src, complex_typ);
-        let imag_offset = offset + (base_bits / 8) as i64;
+        let imag_offset = offset + i64::from(base_bits.bytes_exact());
         // The halves are of the base type, which has lost the object's
         // qualifiers and address space.
         let access = Access::of(self.types, complex_typ);
@@ -3299,7 +3338,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // address. A zero-sized one copies nothing; through the scalar path
         // below its "nothing" was stored as a byte, over the next member.
         let target_kind = self.types.kind(target_typ);
-        let target_size_bytes = self.types.size_bytes(target_typ);
+        let target_size_bytes = self.types.byte_size(target_typ);
         if (target_kind == TypeKind::Struct || target_kind == TypeKind::Union)
             && op == AssignOp::Assign
         {
@@ -3307,7 +3346,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             let value_addr = self.linearize_lvalue(value);
 
             let vol = self.block_volatility(target_typ, self.expr_type(value));
-            self.emit_block_copy(target_addr, value_addr, target_size_bytes as i64, vol);
+            self.emit_block_copy(target_addr, value_addr, target_size_bytes, vol);
 
             // The assignment's value is the target's new value, in the IR's
             // convention for an aggregate: its value when it fits in a
@@ -3315,7 +3354,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // size handed `x = (t = u)` a pointer where a small struct's bits
             // belong.
             if self.aggregate_travels_by_value(target_typ) {
-                let size = self.types.size_bits(target_typ);
+                let size = self.types.value_bits(target_typ);
                 let value = self.alloc_pseudo();
                 self.emit(Instruction::load(value, target_addr, 0, target_typ, size));
                 return value;
@@ -3344,7 +3383,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 rhs_extended,
                 scale,
                 self.types.long_id,
-                self.types.size_bits(self.types.long_id),
+                self.types.value_bits(self.types.long_id),
             ));
             scaled
         } else if op != AssignOp::Assign {
@@ -3416,7 +3455,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 };
                 let regs = self.emit_machine_asm(template, outputs);
                 if let Some(aux) = aux {
-                    self.emit(Instruction::store(regs[2], aux, 0, uint, 32));
+                    self.emit(Instruction::store(regs[2], aux, 0, uint, Bits::new(32)));
                 }
                 let lo = self.emit_convert(regs[0], uint, ulonglong);
                 let hi = self.emit_convert(regs[1], uint, ulonglong);
@@ -3431,12 +3470,18 @@ impl<'a> super::linearize::Linearizer<'a> {
                 for lane in 0..4 {
                     let value = if lane < 2 {
                         let d = self.alloc_reg_pseudo();
-                        self.emit(Instruction::load(d, src, lane * 8, double, 64));
+                        self.emit(Instruction::load(d, src, lane * 8, double, Bits::new(64)));
                         self.emit_convert(d, double, float)
                     } else {
                         self.emit_fconst(FloatVal::ZERO, float)
                     };
-                    self.emit(Instruction::store(value, result, lane * 4, float, 32));
+                    self.emit(Instruction::store(
+                        value,
+                        result,
+                        lane * 4,
+                        float,
+                        Bits::new(32),
+                    ));
                 }
                 result
             }
@@ -3465,7 +3510,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 constraint: constraint.to_string(),
                 class: AsmOperandClass::parse(constraint, arch)
                     .expect("a builtin's constraint is a valid one"),
-                size: self.types.size_bits(typ),
+                size: self.types.value_bits(typ),
                 offset: 0,
                 addr_space: crate::types::AddressSpace::Generic,
             })

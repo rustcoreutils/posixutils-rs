@@ -82,6 +82,7 @@ mod tests {
     use crate::ir::strdata::fixture::Fixture;
     use crate::ir::{GlobalDef, Initializer, Pseudo, PseudoId};
     use crate::types::Type;
+    use crate::units::Bits;
 
     /// `memmove(dest, src, n)` as the linearizer makes it, and its result.
     fn memmove(fx: &mut Fixture, dest: PseudoId, src: PseudoId) -> PseudoId {
@@ -93,7 +94,7 @@ mod tests {
                 .with_func("memmove")
                 .with_target(t)
                 .with_src3(dest, src, n)
-                .with_type_and_size(ptr, 64),
+                .with_type_and_size(ptr, Bits::new(64)),
         );
         t
     }

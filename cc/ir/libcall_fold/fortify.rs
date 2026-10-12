@@ -361,8 +361,8 @@ fn largest(facts: &CallSite, p: PseudoId) -> Option<u128> {
         open: HashSet::new(),
         budget: MAX_WALK,
     };
-    let bits = facts.types.size_bits(facts.types.ulong_id);
-    walk.of(p, bits, false).flatten()
+    let bits = facts.types.value_bits(facts.types.ulong_id);
+    walk.of(p, bits.get(), false).flatten()
 }
 
 /// One walk for [`largest`].
@@ -387,8 +387,8 @@ impl Largest<'_> {
         let d = self.am.def(self.func, p)?;
         match (d.op, d.src.as_slice()) {
             (Opcode::Copy | Opcode::PhiSource, &[src]) => self.of(src, bits, signed),
-            (Opcode::Zext, &[src]) => self.of(src, d.operand_width(), false),
-            (Opcode::Sext, &[src]) => self.of(src, d.operand_width(), true),
+            (Opcode::Zext, &[src]) => self.of(src, d.operand_width().get(), false),
+            (Opcode::Sext, &[src]) => self.of(src, d.operand_width().get(), true),
             (Opcode::Select, &[_, a, b]) => self.join(&[a, b], bits, signed),
             (Opcode::Phi, _) => {
                 if !self.open.insert(p) {
@@ -443,7 +443,7 @@ fn block(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, op: BlockOp, target
             .with_func(callee_symbol(ctx, Callee::Block(op)))
             .with_target(target)
             .with_src3(call.src[0], call.src[1], call.src[2])
-            .with_type_and_size(void_ptr, b.types.size_bits(void_ptr)),
+            .with_type_and_size(void_ptr, b.types.value_bits(void_ptr)),
     );
 }
 
@@ -495,6 +495,7 @@ mod tests {
     use super::*;
     use crate::ir::strdata::fixture::Fixture;
     use crate::types::TypeId;
+    use crate::units::Bits;
 
     /// An argument of a `_chk` call in a test, and the type it is passed as.
     #[derive(Clone, Copy)]
@@ -536,8 +537,9 @@ mod tests {
                     let (a, b) = (fx.konst(a), fx.konst(b));
                     let narrow = fx.select(a, b);
                     let wide = fx.fresh();
-                    let mut sext = Instruction::unop(Opcode::Sext, wide, narrow, ulong, 64);
-                    sext.src_size = 32;
+                    let mut sext =
+                        Instruction::unop(Opcode::Sext, wide, narrow, ulong, Bits::new(64));
+                    sext.src_size = Bits::new(32);
                     sext.src_typ = Some(int);
                     fx.push(sext);
                     (wide, ulong)

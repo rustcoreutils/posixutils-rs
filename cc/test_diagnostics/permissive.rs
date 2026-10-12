@@ -381,7 +381,7 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
 /// There was no diagnostic at all before. `char a[3000000000];` in a function
 /// emitted `subq $32, %rsp` with the array at `leaq -40(%rbp)` on x86-64 and a
 /// 48-byte frame with it at `x29 + #40` on aarch64, because
-/// `types.size_bytes(t) as i32` wrapped to -1294967296 and the `size.max(8)`
+/// the byte count cast `as i32` wrapped to -1294967296 and the `size.max(8)`
 /// that follows gave it eight bytes.
 ///
 /// The last three cases are not declarations, so `check_stack_object_size` is

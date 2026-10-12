@@ -2333,7 +2333,7 @@ mod tests {
         use super::{AsmOperandSlot, AsmOperandValue as V};
         let slot = |value, name: Option<&str>| AsmOperandSlot {
             value,
-            size: crate::units::Bits::new(64),
+            size: Bits::new(64),
             name: name.map(String::from),
         };
         let slots = [

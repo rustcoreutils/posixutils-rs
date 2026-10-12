@@ -14,6 +14,7 @@ use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg};
 use crate::arch::lir::{CondCode, Directive, FpSize, OperandSize};
 use crate::ir::{Instruction, MemoryOrder, Opcode};
+use crate::units::Bits;
 
 /// How an atomic access is ordered on AArch64 without LSE: which of its
 /// halves carry the acquire and the release.
@@ -96,8 +97,8 @@ impl Aarch64CodeGen {
     pub(super) fn emit_atomic_load(&mut self, insn: &Instruction) {
         let target = insn.target.expect("atomic load needs target");
         let addr = insn.src[0];
-        let size = insn.size.get();
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
 
         self.emit_addr_into(addr, insn.displacement(), Reg::X10);
 
@@ -109,14 +110,14 @@ impl Aarch64CodeGen {
             Aarch64Inst::Ldr { size, addr, dst }
         });
 
-        self.move_atomic_result(Reg::X9, target, insn.size.get());
+        self.move_atomic_result(Reg::X9, target, insn.size);
     }
 
     pub(super) fn emit_atomic_store(&mut self, insn: &Instruction) {
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size.get();
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
 
         let value_loc = self.get_location(value);
 
@@ -148,8 +149,8 @@ impl Aarch64CodeGen {
         let target = insn.target.expect("atomic read-modify-write needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
-        let size = insn.size.get();
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
         let ordering = Ordering::of(insn.extra().memory_order);
 
         let value_loc = self.get_location(value);
@@ -241,10 +242,10 @@ impl Aarch64CodeGen {
     /// every atomic result alias the same register, so two atomic reads in
     /// one expression collapsed into one -- `x + y` on two _Atomic ints
     /// returned `y + y`.
-    fn move_atomic_result(&mut self, reg: Reg, target: crate::ir::PseudoId, size: u32) {
+    fn move_atomic_result(&mut self, reg: Reg, target: crate::ir::PseudoId, size: Bits) {
         let dst_loc = self.get_location(target);
         if !matches!(&dst_loc, Loc::Reg(r) if *r == reg) {
-            self.emit_move_to_loc(reg, &dst_loc, size.max(32));
+            self.emit_move_to_loc(reg, &dst_loc, size.max(Bits::new(32)));
         }
     }
 
@@ -254,8 +255,8 @@ impl Aarch64CodeGen {
         let addr = insn.src[0];
         let expected_ptr = insn.src[1];
         let desired = insn.src[2];
-        let size = insn.size.get();
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+        let size = insn.size;
+        let op_size = OperandSize::from_bits(size);
         // The success and failure orders were combined into this one by the
         // linearizer (`cas_order`); a failed attempt runs the same load.
         let ordering = Ordering::of(insn.extra().memory_order);
@@ -371,8 +372,8 @@ impl Aarch64CodeGen {
     }
 
     /// Helper to move a value into a register
-    fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: u32) {
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(size));
+    fn emit_mov_to_reg(&mut self, loc: Loc, reg: Reg, size: Bits) {
+        let op_size = OperandSize::from_bits(size);
         match loc {
             Loc::Reg(src) => {
                 if src != reg {
@@ -413,7 +414,7 @@ impl Aarch64CodeGen {
             // one was missed.
             Loc::VReg(v) => {
                 self.push_lir(Aarch64Inst::FmovToGp {
-                    size: if size <= 32 {
+                    size: if size <= Bits::new(32) {
                         FpSize::Single
                     } else {
                         FpSize::Double
@@ -423,8 +424,8 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::FImm(f, imm_size) => {
-                let bits = f.to_bits_at_width(crate::units::Bits::new(imm_size));
-                self.emit_mov_imm(reg, bits, 64);
+                let bits = f.to_bits_at_width(imm_size);
+                self.emit_mov_imm(reg, bits, Bits::new(64));
             }
         }
     }

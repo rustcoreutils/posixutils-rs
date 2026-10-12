@@ -48,7 +48,7 @@ use crate::arch::regalloc::{
 use crate::float::FloatVal;
 use crate::ir::{AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeKind, TypeTable};
-use crate::units::Bits;
+use crate::units::{Bits, ByteSize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 // AArch64 Register Definitions
@@ -376,7 +376,7 @@ impl FrameBase {
                 local
                     .explicit_align
                     .map(|a| a as i32)
-                    .unwrap_or_else(|| (types.alignment(local.typ) as i32).max(8))
+                    .unwrap_or_else(|| crate::abi::slot_align(types.align(local.typ)).max(8))
             })
             .max()
             .unwrap_or(8);
@@ -1021,7 +1021,7 @@ pub enum Loc {
     /// Immediate constant
     Imm(i128),
     /// Floating-point immediate constant (value, size in bits)
-    FImm(FloatVal, u32),
+    FImm(FloatVal, Bits),
     /// Global symbol
     Global(String),
 }
@@ -1104,7 +1104,13 @@ fn fp_arg_bytes(
             PseudoKind::Arg(idx) => lowering.param_type(func, idx),
             _ => None,
         })
-        .map(|typ| if types.size_bits(typ) > 64 { 16 } else { 8 })
+        .map(|typ| {
+            if types.byte_size(typ) > ByteSize::new(8) {
+                16
+            } else {
+                8
+            }
+        })
         .unwrap_or(8)
 }
 
@@ -1414,7 +1420,7 @@ fn narrow_v_values(func: &Function, types: &TypeTable) -> HashSet<PseudoId> {
         }
     }
     for (p, t) in crate::arch::regalloc::arg_pseudo_types(func) {
-        if types.size_bits(t) <= 64 {
+        if types.byte_size(t) <= ByteSize::new(8) {
             narrow.insert(p);
         }
     }
@@ -2075,7 +2081,10 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        let size = setval_sizes.get(&interval.pseudo).map_or(64, |b| b.get());
+                        let size = setval_sizes
+                            .get(&interval.pseudo)
+                            .copied()
+                            .unwrap_or(Bits::new(64));
                         self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;
@@ -2110,7 +2119,7 @@ impl RegAlloc {
                     "an aggregate returned by a call",
                 );
                 let size = size.max(8);
-                let alignment = types.alignment(typ) as i32;
+                let alignment = crate::abi::slot_align(types.align(typ));
                 self.home_on_stack(interval.pseudo, SlotShape::new(size, alignment));
                 continue;
             }
@@ -2670,7 +2679,7 @@ mod tests {
     #[test]
     fn incoming_args_are_laid_out_from_the_area_base() {
         let slot = |bytes: u64, align: u64| StackSlot {
-            bytes: crate::units::ByteSize::new(bytes),
+            bytes: ByteSize::new(bytes),
             align: crate::units::Align::of_bytes(align),
         };
         let first = IncomingOff::FIRST.0;

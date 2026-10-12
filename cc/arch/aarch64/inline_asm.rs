@@ -22,6 +22,7 @@ use crate::arch::asm_constraints::{
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
 use crate::arch::lir::{plan_parallel_moves, Directive, FpSize, MoveStep, OperandSize, Symbol};
 use crate::ir::{AsmData, Instruction, PseudoId};
+use crate::units::Bits;
 
 /// What goes in a scratch register before the template: a memory operand's
 /// address, or the value of a register operand the allocator gave no register.
@@ -33,7 +34,7 @@ enum OperandSetup {
     /// `reg = &name + offset`.
     Global { name: String, offset: i64 },
     /// `reg = value of pseudo`, wherever it lives.
-    Value { pseudo: PseudoId, size: u32 },
+    Value { pseudo: PseudoId, size: Bits },
     /// `reg = constant`, for a register-only operand whose value is one.
     Imm(i64),
 }
@@ -206,7 +207,7 @@ struct PinnedMove {
     /// The operand's value, where it lives.
     pseudo: PseudoId,
     loc: Loc,
-    size: u32,
+    size: Bits,
     /// A scratch to stage through, when `pin` is the stack pointer and
     /// `loc` is memory: `sp` can be neither loaded nor stored.
     via: Option<Reg>,
@@ -266,9 +267,9 @@ impl Aarch64CodeGen {
             .collect();
         let mut v_scratch: Vec<VReg> = vec![VReg::V18, VReg::V17, VReg::V16];
         // Vector operands copied back out of their scratch after the template.
-        let mut vec_output_moves: Vec<(VReg, Loc, u32)> = Vec::new();
+        let mut vec_output_moves: Vec<(VReg, Loc, Bits)> = Vec::new();
         // Vector operands copied into their scratch before it.
-        let mut vec_input_moves: Vec<(VReg, Loc, u32)> = Vec::new();
+        let mut vec_input_moves: Vec<(VReg, Loc, Bits)> = Vec::new();
         // Operands that have to be put in a scratch register first.
         let mut addr_regs = OperandRegs::new(
             &asm_data.clobbers,
@@ -281,21 +282,21 @@ impl Aarch64CodeGen {
         );
         // Register outputs the allocator gave no register: written by the
         // template into a scratch, stored back after it.
-        let mut gp_output_moves: Vec<(Reg, Loc, u32)> = Vec::new();
+        let mut gp_output_moves: Vec<(Reg, Loc, Bits)> = Vec::new();
         // Flag outputs, read off the flags once the template has run:
         // (condition, destination, operand size in bits).
-        let mut flag_outputs: Vec<(FlagCondition, Loc, u32)> = Vec::new();
+        let mut flag_outputs: Vec<(FlagCondition, Loc, Bits)> = Vec::new();
 
         // Process output operands (they go first: %0, %1, etc.)
         for (idx, output) in asm_data.outputs.iter().enumerate() {
             let loc = self.get_location(output.pseudo);
             let requires_mem = output.is_memory();
             let read_write = output.class.access == AsmAccess::ReadWrite;
-            let op_size = output.size.get();
+            let op_size = output.size;
             let op_name = output.name.clone();
             let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
                 value,
-                size: crate::units::Bits::new(op_size),
+                size: op_size,
                 name: op_name.clone(),
             };
             // A flag output takes no register: its value is read off the
@@ -441,7 +442,7 @@ impl Aarch64CodeGen {
                         if let Some(m) = self.pinned_move(
                             pin,
                             pseudo,
-                            input.size.get(),
+                            input.size,
                             &mut addr_regs,
                             &mut gp_scratch,
                             insn,
@@ -483,11 +484,11 @@ impl Aarch64CodeGen {
             };
             let class = &input.class;
             let requires_mem = input.is_memory();
-            let op_size = input.size.get();
+            let op_size = input.size;
             let op_name = input.name.clone();
             let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
                 value,
-                size: crate::units::Bits::new(op_size),
+                size: op_size,
                 name: op_name.clone(),
             };
             if let Some(pin) = pins[num_outputs + input_idx] {
@@ -511,7 +512,7 @@ impl Aarch64CodeGen {
             // template: it is copied to a scratch first.
             let loc = match loc {
                 Loc::Reg(r) if pinned.contains(&r) => {
-                    let size = if requires_mem { 64 } else { op_size };
+                    let size = if requires_mem { Bits::new(64) } else { op_size };
                     let Some(reg) = addr_regs.take(&mut gp_scratch, false) else {
                         crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
                         slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
@@ -558,11 +559,7 @@ impl Aarch64CodeGen {
                 // `"rI"(5000)`. A class that offers no register at all takes
                 // the constant as written, if it fits.
                 Loc::Imm(v)
-                    if class.reg.is_some()
-                        && !class
-                            .imm
-                            .int
-                            .admits(canonical_int(v, crate::units::Bits::new(op_size))) =>
+                    if class.reg.is_some() && !class.imm.int.admits(canonical_int(v, op_size)) =>
                 {
                     let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
                         crate::arch::codegen::report_asm_registers_exhausted(insn.pos);
@@ -574,10 +571,7 @@ impl Aarch64CodeGen {
                 }
                 Loc::Imm(v)
                     if !class.imm.int.is_empty()
-                        && !class
-                            .imm
-                            .int
-                            .admits(canonical_int(v, crate::units::Bits::new(op_size))) =>
+                        && !class.imm.int.admits(canonical_int(v, op_size)) =>
                 {
                     crate::diag::error(
                         insn.pos.unwrap_or_default(),
@@ -587,10 +581,7 @@ impl Aarch64CodeGen {
                 }
                 Loc::Imm(v) => {
                     // Immediate value
-                    slots.push(mk(AsmOperandValue::Int(canonical_int(
-                        v,
-                        crate::units::Bits::new(op_size),
-                    ))));
+                    slots.push(mk(AsmOperandValue::Int(canonical_int(v, op_size))));
                 }
                 // A floating constant has no address, so a memory-class
                 // constraint cannot be satisfied. gcc says the same and stops.
@@ -605,7 +596,7 @@ impl Aarch64CodeGen {
                 // and a constant is never allocated one. Materialize it into
                 // a scratch: nothing else is live there across the asm.
                 Loc::FImm(v, imm_size) if class.reg.is_some() => {
-                    let bits = v.to_bits_at_width(crate::units::Bits::new(imm_size));
+                    let bits = v.to_bits_at_width(imm_size);
                     let Some(scratch) = gp_scratch.pop() else {
                         crate::diag::error(
                             insn.pos.unwrap_or_default(),
@@ -615,7 +606,7 @@ impl Aarch64CodeGen {
                         slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
-                    self.emit_mov_imm(scratch, bits, 64);
+                    self.emit_mov_imm(scratch, bits, Bits::new(64));
                     if requires_vector(class) {
                         // Three scratch V registers are reserved, not one.
                         let Some(vreg) = v_scratch.pop() else {
@@ -628,7 +619,7 @@ impl Aarch64CodeGen {
                                 .push(mk(AsmOperandValue::RegName(VReg::V16.name_d().to_string())));
                             continue;
                         };
-                        let fp_size = match imm_size {
+                        let fp_size = match imm_size.get() {
                             16 => FpSize::Half,
                             32 => FpSize::Single,
                             _ => FpSize::Double,
@@ -694,7 +685,7 @@ impl Aarch64CodeGen {
                         slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
-                    let fp_size = match op_size {
+                    let fp_size = match op_size.get() {
                         16 => FpSize::Half,
                         32 => FpSize::Single,
                         _ => FpSize::Double,
@@ -848,7 +839,7 @@ impl Aarch64CodeGen {
 
     /// Write a flag output: `cset` of its condition, as gcc reads one, into
     /// the operand's own register, or through X9 into its slot.
-    fn emit_flag_output(&mut self, cond: FlagCondition, loc: &Loc, size: u32) {
+    fn emit_flag_output(&mut self, cond: FlagCondition, loc: &Loc, size: Bits) {
         let reg = Self::loc_reg(loc).unwrap_or(Reg::X9);
         let text = format!("cset {}, {}", asm_reg_name_32(reg), cond.suffix());
         self.push_lir(Aarch64Inst::Directive(Directive::Raw(text)));
@@ -864,7 +855,7 @@ impl Aarch64CodeGen {
         &self,
         pin: Reg,
         pseudo: PseudoId,
-        size: u32,
+        size: Bits,
         addr_regs: &mut OperandRegs,
         gp_scratch: &mut Vec<Reg>,
         insn: &Instruction,
@@ -908,7 +899,7 @@ impl Aarch64CodeGen {
                     match (from, m.via) {
                         (Some(r), _) => self.emit_reg_move(r, m.pin),
                         (None, Some(via)) => {
-                            self.emit_move(m.pseudo, via, 64);
+                            self.emit_move(m.pseudo, via, Bits::new(64));
                             self.emit_reg_move(via, m.pin);
                         }
                         (None, None) => self.emit_move(m.pseudo, m.pin, m.size),
@@ -922,8 +913,8 @@ impl Aarch64CodeGen {
     /// Store each register output where it lives -- a scratch the template
     /// wrote (`scratch`), or a pinned register -- as though all at once: one
     /// output's home may be the register another was pinned to.
-    fn emit_register_outputs(&mut self, scratch: &[(Reg, Loc, u32)], pinned: &[PinnedMove]) {
-        let outs: Vec<(Reg, &Loc, u32, Option<Reg>)> = scratch
+    fn emit_register_outputs(&mut self, scratch: &[(Reg, Loc, Bits)], pinned: &[PinnedMove]) {
+        let outs: Vec<(Reg, &Loc, Bits, Option<Reg>)> = scratch
             .iter()
             .map(|(reg, loc, size)| (*reg, loc, *size, None))
             .chain(pinned.iter().map(|m| (m.pin, &m.loc, m.size, m.via)))
@@ -1001,7 +992,7 @@ impl Aarch64CodeGen {
         object_offset: i64,
         mem: Option<AsmMemClass>,
         loc: &Loc,
-        size_bits: u32,
+        size_bits: Bits,
         regs: &mut OperandRegs,
         gp_scratch: &mut Vec<Reg>,
         insn: &Instruction,
@@ -1023,7 +1014,7 @@ impl Aarch64CodeGen {
             Loc::Stack(_) | Loc::IncomingArg(_) if self.pseudos.is_sym(pseudo) => {
                 let (base, offset) = self.loc_addr_parts(loc).unwrap();
                 let offset = offset + object_offset;
-                let bytes = i64::from(size_bits / 8);
+                let bytes = i64::from(size_bits.bytes_exact());
                 let fits = if mem == Some(AsmMemClass::BaseOnly) {
                     offset == 0
                 } else if matches!(bytes, 1 | 2 | 4 | 8 | 16) {
@@ -1111,8 +1102,10 @@ impl Aarch64CodeGen {
                     });
                 }
             }
-            OperandSetup::Value { pseudo, size } => self.emit_move(pseudo, reg, size.max(32)),
-            OperandSetup::Imm(v) => self.emit_mov_imm(reg, v, 64),
+            OperandSetup::Value { pseudo, size } => {
+                self.emit_move(pseudo, reg, size.max(Bits::new(32)))
+            }
+            OperandSetup::Imm(v) => self.emit_mov_imm(reg, v, Bits::new(64)),
         }
     }
 
@@ -1121,10 +1114,10 @@ impl Aarch64CodeGen {
         &mut self,
         dst: VReg,
         loc: &Loc,
-        size: u32,
+        size: Bits,
         pos: Option<crate::diag::Position>,
     ) {
-        let fp_size = match size {
+        let fp_size = match size.get() {
             16 => FpSize::Half,
             32 => FpSize::Single,
             // A sixteen-byte operand -- a vector, a binary128 -- is the
@@ -1167,10 +1160,10 @@ impl Aarch64CodeGen {
         &mut self,
         src: VReg,
         loc: &Loc,
-        size: u32,
+        size: Bits,
         pos: Option<crate::diag::Position>,
     ) {
-        let fp_size = match size {
+        let fp_size = match size.get() {
             16 => FpSize::Half,
             32 => FpSize::Single,
             // A sixteen-byte operand -- a vector, a binary128 -- is the
@@ -1212,8 +1205,8 @@ impl Aarch64CodeGen {
     ///
     /// AArch64 names the same register `b`/`h`/`s`/`d`/`q` by the width being
     /// operated on, and an instruction that wants `d0` rejects `v0`.
-    fn vreg_name(v: VReg, size_bits: u32) -> &'static str {
-        match size_bits {
+    fn vreg_name(v: VReg, size_bits: Bits) -> &'static str {
+        match size_bits.get() {
             0..=8 => v.name_b(),
             16 => v.name_h(),
             32 => v.name_s(),
@@ -1224,7 +1217,7 @@ impl Aarch64CodeGen {
 
     /// A location as the template substitutes it, for an operand of
     /// `size_bits`.
-    fn loc_to_asm_operand(&self, loc: &Loc, size_bits: u32) -> AsmOperandValue<Reg> {
+    fn loc_to_asm_operand(&self, loc: &Loc, size_bits: Bits) -> AsmOperandValue<Reg> {
         match loc {
             Loc::Reg(r) => AsmOperandValue::Reg(*r),
             loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
@@ -1232,14 +1225,12 @@ impl Aarch64CodeGen {
                 let (base, actual) = self.loc_addr_parts(loc).unwrap();
                 AsmOperandValue::Mem(format!("[{}, #{}]", asm_reg_name_64(base), actual))
             }
-            Loc::Imm(v) => {
-                AsmOperandValue::Int(canonical_int(*v, crate::units::Bits::new(size_bits)))
-            }
+            Loc::Imm(v) => AsmOperandValue::Int(canonical_int(*v, size_bits)),
             Loc::VReg(vreg) => AsmOperandValue::RegName(vreg.name_d().to_string()),
             // An immediate-class constraint takes the constant itself. The
             // register and memory classes never reach here; `emit_inline_asm`
             // materializes or diagnoses them first.
-            Loc::FImm(v, fp_size) => AsmOperandValue::Float(*v, crate::units::Bits::new(*fp_size)),
+            Loc::FImm(v, fp_size) => AsmOperandValue::Float(*v, *fp_size),
             Loc::Global(name) => AsmOperandValue::Mem(name.clone()),
         }
     }

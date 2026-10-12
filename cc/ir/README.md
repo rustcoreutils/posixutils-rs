@@ -332,11 +332,16 @@ function type a call names, directly or through a pointer, since
 copy the caller made, as under AAPCS64, and the backend assigns registers
 by argument position.
 
-`ArgClass` variants:
+`ArgClass` variants (a width is a `Bits`, an object size a `ByteSize`, an
+alignment an `Align`; see `units.rs`):
 - `Direct { classes, size_bits }` - pass in register(s)
-- `Indirect { align, size_bits }` - pass by pointer (sret)
+- `Indirect { align, size_bytes }` - in memory: by value on the System V
+  stack, by pointer to a copy under AAPCS64 and Win64, and through the
+  hidden pointer as a return
 - `Hfa { base, count }` - homogeneous FP aggregate (AArch64)
 - `Extend { signed, size_bits }` - extend small integer
+- `Stacked { size_bytes }` - on the stack by value (AArch64 small float vectors)
+- `X87 { size_bits }` - returned in the x87 stack (x86-64 `long double`)
 - `Ignore` - zero-sized type
 
 This provides per-eightbyte register class (INTEGER vs SSE) for struct fields.

@@ -2164,7 +2164,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `size` is passed rather than taken from `typ` because the two are not
     /// always the same: a complex conditional merges *addresses*, so its phi
     /// is pointer-wide over a pointer type, and a function designator's
-    /// `size_bits` is 0 where the merge wants a pointer's 64.
+    /// `value_bits` is 0 where the merge wants a pointer's 64.
     pub(crate) fn emit_diamond(
         &mut self,
         cond: PseudoId,

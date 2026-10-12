@@ -23,13 +23,14 @@ use crate::arch::lir::{
 };
 use crate::ir::{Function, Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::units::{Bits, ByteSize};
 use std::collections::HashSet;
 
 /// The most bytes this back end moves with unrolled loads and stores; past it,
 /// [`Aarch64CodeGen::emit_block_copy_loop`]. It is the bound the IR puts on an
 /// expanded `memcpy`, for the same reason: the instruction count of an unrolled
 /// copy is linear in the object.
-pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES.get() as i64;
+pub(super) const UNROLL_LIMIT_BYTES: ByteSize = crate::ir::memexpand::INLINE_LIMIT_BYTES;
 
 /// Where a frame's areas lie, as displacements up from x29, which points at
 /// the frame record at the bottom of the frame.
@@ -686,13 +687,14 @@ impl Aarch64CodeGen {
     /// `va_arg` sequence has free. Both `src` and `dst` are cursors and are
     /// left past the object, so the caller must be finished with them; X17
     /// holds the end of the paired part and then shuttles the tail.
-    pub(super) fn emit_block_copy_loop(&mut self, dst: Reg, src: Reg, bytes: i64) {
-        let pairs = bytes & !15;
-        if pairs > 0 {
+    pub(super) fn emit_block_copy_loop(&mut self, dst: Reg, src: Reg, bytes: ByteSize) {
+        let pairs = ByteSize::new(bytes.get() & !15);
+        let tail = ByteSize::new(bytes.get() & 15);
+        if !pairs.is_zero() {
             self.push_lir(Aarch64Inst::Add {
                 size: OperandSize::B64,
                 src1: src,
-                src2: GpOperand::Imm(pairs),
+                src2: GpOperand::Imm(pairs.to_i64()),
                 dst: Reg::X17,
             });
             let top = self.next_unique_label("block_copy");
@@ -724,9 +726,7 @@ impl Aarch64CodeGen {
             });
         }
         // The cursors point at the tail, so its pieces are offsets from them.
-        for (off, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
-            u64::try_from(bytes - pairs).expect("a byte count is not negative"),
-        )) {
+        for (off, chunk) in crate::ir::memexpand::block_chunks(tail) {
             let size = OperandSize::from_bits(chunk.bits());
             self.push_lir(Aarch64Inst::Ldr {
                 size,
@@ -994,7 +994,7 @@ impl Aarch64CodeGen {
                 Reg::X9
             }
             _ => {
-                self.emit_move(src, Reg::X9, 64);
+                self.emit_move(src, Reg::X9, Bits::new(64));
                 Reg::X9
             }
         }
@@ -1152,7 +1152,7 @@ impl Aarch64CodeGen {
                             // body reads, exactly as the spilled-HFA
                             // case does; without this the parameter was
                             // left uninitialized.
-                            let bytes = crate::abi::slot_bytes(
+                            let bytes = crate::abi::checked_slot_size(
                                 types.byte_size(*typ),
                                 crate::arch::func_pos(func),
                                 "a stacked parameter",
@@ -1162,11 +1162,7 @@ impl Aarch64CodeGen {
                             // the widths are `block_chunks`'s so the tail of
                             // one that is not a multiple of eight is moved as
                             // wide as it is and no wider.
-                            for (done, chunk) in
-                                crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
-                                    u64::try_from(bytes).expect("a byte count is not negative"),
-                                ))
-                            {
+                            for (done, chunk) in crate::ir::memexpand::block_chunks(bytes) {
                                 let size = OperandSize::from_bits(chunk.bits());
                                 let done = done as i32;
                                 self.push_lir(Aarch64Inst::Ldr {
@@ -1235,7 +1231,7 @@ impl Aarch64CodeGen {
                         // target's width of it: binary128 on Linux,
                         // a double on Darwin, never x87's format.
                         let fp_size =
-                            self.fp_size_from_type(Some(*typ), types.size_bits(*typ), types);
+                            self.fp_size_from_type(Some(*typ), types.value_bits(*typ), types);
                         let from = fp_arg_regs[fp_arg_idx];
                         match self.locations.get_ref(pseudo.id) {
                             Some(Loc::Stack(offset)) => {
@@ -1329,16 +1325,16 @@ impl Aarch64CodeGen {
         );
         match plan {
             PairMove::InOrder => {
-                self.emit_move(s0, d0, 64);
-                self.emit_move(s1, d1, 64);
+                self.emit_move(s0, d0, Bits::new(64));
+                self.emit_move(s1, d1, Bits::new(64));
             }
             PairMove::Reversed => {
-                self.emit_move(s1, d1, 64);
-                self.emit_move(s0, d0, 64);
+                self.emit_move(s1, d1, Bits::new(64));
+                self.emit_move(s0, d0, Bits::new(64));
             }
             PairMove::Swap => {
-                self.emit_move(s0, Reg::X9, 64);
-                self.emit_move(s1, d1, 64);
+                self.emit_move(s0, Reg::X9, Bits::new(64));
+                self.emit_move(s1, d1, Bits::new(64));
                 self.push_lir(Aarch64Inst::Mov {
                     size: OperandSize::B64,
                     dst: d0,
@@ -1422,8 +1418,8 @@ impl Aarch64CodeGen {
             // Derive return size from type to avoid 32-bit truncation
             let ret_typ = insn.typ;
             let ret_size = ret_typ
-                .map(|t| types.size_bits(t).max(32))
-                .unwrap_or(insn.size.get().max(32));
+                .map_or(insn.size, |t| types.value_bits(t))
+                .max(Bits::new(32));
 
             if let Some((fp_size, 1)) = hfa_ret {
                 // One V register carries all of it. The linearizer hands the
@@ -1431,7 +1427,7 @@ impl Aarch64CodeGen {
                 // sixteen-byte value reaches here; assemble them into the
                 // register's two lanes, exactly as gcc does.
                 if insn.src.len() == 2 {
-                    self.emit_move(src, Reg::X9, 64);
+                    self.emit_move(src, Reg::X9, Bits::new(64));
                     if fp_size == FpSize::Quad {
                         self.push_lir(Aarch64Inst::FmovFromGp {
                             size: FpSize::Double,
@@ -1439,7 +1435,7 @@ impl Aarch64CodeGen {
                             dst: VReg::V0,
                         });
                         if let Some(&src2) = insn.src.get(1) {
-                            self.emit_move(src2, Reg::X9, 64);
+                            self.emit_move(src2, Reg::X9, Bits::new(64));
                             self.push_lir(Aarch64Inst::InsGpToVecD {
                                 lane: 1,
                                 src: Reg::X9,
@@ -1454,7 +1450,7 @@ impl Aarch64CodeGen {
                         });
                     }
                 } else {
-                    let hfa_bits = insn.typ.map_or(0, |t| types.size_bits(t));
+                    let hfa_bits = insn.typ.map_or(Bits::ZERO, |t| types.value_bits(t));
                     match src_loc {
                         // Eight bytes or fewer, already loaded into a general
                         // register: move it across. This is the common shape --
@@ -1462,7 +1458,7 @@ impl Aarch64CodeGen {
                         // than handing over its address -- and leaving it in
                         // `x0` is what made the callee and the caller, which
                         // reads `s0`/`d0`, disagree inside one program.
-                        Loc::Reg(r) if hfa_bits <= 64 => {
+                        Loc::Reg(r) if hfa_bits <= Bits::new(64) => {
                             self.push_lir(Aarch64Inst::FmovFromGp {
                                 size: fp_size,
                                 src: r,
@@ -1470,7 +1466,7 @@ impl Aarch64CodeGen {
                             });
                         }
                         // Eight bytes or fewer: the slot holds the value.
-                        Loc::Stack(offset) if hfa_bits <= 64 => {
+                        Loc::Stack(offset) if hfa_bits <= Bits::new(64) => {
                             self.push_lir(Aarch64Inst::LdrFp {
                                 size: fp_size,
                                 dst: VReg::V0,
@@ -1517,14 +1513,14 @@ impl Aarch64CodeGen {
                 if insn.src.len() == 2 && count == 2 {
                     // Two-source path: linearizer pre-loaded struct halves as integers.
                     // Move from GP registers to V0/V1 via FmovFromGp.
-                    self.emit_move(src, Reg::X9, 64);
+                    self.emit_move(src, Reg::X9, Bits::new(64));
                     self.push_lir(Aarch64Inst::FmovFromGp {
                         size: fp_size,
                         src: Reg::X9,
                         dst: VReg::V0,
                     });
                     if let Some(&src2) = insn.src.get(1) {
-                        self.emit_move(src2, Reg::X9, 64);
+                        self.emit_move(src2, Reg::X9, Bits::new(64));
                         self.push_lir(Aarch64Inst::FmovFromGp {
                             size: fp_size,
                             src: Reg::X9,
@@ -1539,9 +1535,9 @@ impl Aarch64CodeGen {
                     // four. Dereferencing the value's own bytes is what a
                     // two-element half-precision HFA started doing the moment
                     // it became an HFA at all.
-                    let hfa_bits = insn.typ.map_or(0, |t| types.size_bits(t));
+                    let hfa_bits = insn.typ.map_or(Bits::ZERO, |t| types.value_bits(t));
                     match src_loc {
-                        Loc::Stack(offset) if hfa_bits <= 64 => {
+                        Loc::Stack(offset) if hfa_bits <= Bits::new(64) => {
                             for (i, &dst) in ret_regs[..count].iter().enumerate() {
                                 self.push_lir(Aarch64Inst::LdrFp {
                                     size: fp_size,
@@ -1571,7 +1567,7 @@ impl Aarch64CodeGen {
                         // value, not a pointer to it, so the elements come out
                         // of it by shifting rather than by loading. Treating it
                         // as an address dereferenced the value's own bits.
-                        Loc::Reg(r) if hfa_bits <= 64 => {
+                        Loc::Reg(r) if hfa_bits <= Bits::new(64) => {
                             for (i, &dst) in ret_regs[..count].iter().enumerate() {
                                 let gp = if i == 0 {
                                     r
@@ -1609,7 +1605,7 @@ impl Aarch64CodeGen {
             } else if insn.returns_two_regs() {
                 match insn.src.get(1).copied() {
                     Some(src2) => self.emit_gp_pair_move((src, Reg::X0), (src2, Reg::X1)),
-                    None => self.emit_move(src, Reg::X0, 64),
+                    None => self.emit_move(src, Reg::X0, Bits::new(64)),
                 }
             } else if let Some(gp_n) =
                 insn.typ
@@ -1701,11 +1697,11 @@ impl Aarch64CodeGen {
                 } else if let Loc::Imm(v) = loc {
                     // A constant: both halves. The fallback below zeroed the
                     // high one, so `return (i128)1 << 100;` returned 0.
-                    self.emit_mov_imm(Reg::X0, v as u64 as i64, 64);
-                    self.emit_mov_imm(Reg::X1, (v >> 64) as u64 as i64, 64);
+                    self.emit_mov_imm(Reg::X0, v as u64 as i64, Bits::new(64));
+                    self.emit_mov_imm(Reg::X1, (v >> 64) as u64 as i64, Bits::new(64));
                 } else {
                     // Fallback: load lo half to X0, zero X1
-                    self.emit_move(src, Reg::X0, 64);
+                    self.emit_move(src, Reg::X0, Bits::new(64));
                     self.push_lir(Aarch64Inst::Mov {
                         size: OperandSize::B64,
                         src: GpOperand::Reg(Reg::Xzr),

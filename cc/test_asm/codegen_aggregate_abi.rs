@@ -68,11 +68,11 @@ long realigned(void)
 /// Indexing scales by the element's **byte size**, at every size the compiler
 /// accepts.
 ///
-/// `size_bits` answers a *value* width in a `u32` and saturates for an
+/// A type's width in bits was answered in a `u32` that saturated for an
 /// aggregate past `u32::MAX` bits. While the object-size bound was that same
 /// number the saturation was unreachable -- the parser refused any type that
 /// could reach it. Raising the bound made it reachable, and every site still
-/// deriving a byte count as `size_bits / 8` began answering 536870911 for any
+/// deriving a byte count as that width over eight began answering 536870911 for any
 /// larger type: `&a[1][0] - &a[0][0]` on a `char[3][600000000]`, the stride of
 /// an array of a 600 MB struct, and `p + 1` on a pointer to one. `sizeof` was
 /// right throughout, so the sizes agreed with gcc while the addresses did not.
@@ -116,7 +116,7 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 /// accepts.
 ///
 /// The companion to `codegen_pointer_scaling_past_the_old_object_bound`, and
-/// the same root cause: `size_bits` saturates at `u32::MAX` bits, and raising
+/// the same root cause: a type's bit width saturated at `u32::MAX` bits, and raising
 /// the object-size bound made the saturation reachable. The sites that survived
 /// that commit's audit were the ones that launder the bit count through a local
 /// variable -- two of them spell it `let target_size_bytes = target_size / 8;`,

@@ -283,7 +283,7 @@ pub struct CompositeType {
     /// The alignment the **members** require, before a struct-level
     /// `__attribute__((aligned(N)))` raises `align` above it.
     ///
-    /// Not "natural alignment": `natural_alignment()` answers `align` for a
+    /// Not "natural alignment": `natural_align()` answers `align` for a
     /// composite and so cannot tell an over-aligned struct from a naturally
     /// aligned one. This can, and AAPCS64 needs it -- that ABI derives an
     /// argument's alignment from the members and ignores the type's own
@@ -3413,7 +3413,7 @@ impl TypeTable {
     /// reaches a `&TypeTable` and nothing else.
     ///
     /// The ladder is by conversion **rank**, not by width: on LP64 `long` and
-    /// `long long` are both 64 bits, so comparing `size_bits` would answer
+    /// `long long` are both 64 bits, so comparing `value_bits` would answer
     /// with whichever operand stood on the left, letting `l + ll` disagree
     /// with `ll + l`.
     pub fn common_type(&self, left: TypeId, right: TypeId) -> TypeId {
@@ -3534,7 +3534,7 @@ impl TypeTable {
     ///
     /// Rank is not width. `long` and `long long` are both 64 bits on every
     /// target here and yet rank apart, which is exactly the case that made
-    /// comparing `size_bits` return whichever operand came first.
+    /// comparing `value_bits` return whichever operand came first.
     fn integer_rank(&self, id: TypeId) -> u8 {
         match self.kind(id) {
             TypeKind::Bool => 0,
@@ -3695,19 +3695,6 @@ impl TypeTable {
         }
     }
 
-    /// The size of a type in bits, as a raw `u32`.
-    ///
-    /// The interface [`Self::value_bits`] replaced, kept for the callers in
-    /// `ir/`, `abi/` and `arch/` that still count in bare integers, and to be
-    /// deleted once the last of them has moved to the typed one. For an
-    /// aggregate with no value width it saturates at `u32::MAX`, as it always
-    /// has: a too-wide type then never looks small to a threshold comparison,
-    /// but any byte count derived from it is wrong, which is why the typed
-    /// interface refuses to answer instead.
-    pub fn size_bits(&self, id: TypeId) -> u32 {
-        self.checked_value_bits(id).map_or(u32::MAX, Bits::get)
-    }
-
     /// The largest object c17 can describe: `PTRDIFF_MAX` bytes.
     ///
     /// An object is addressed by pointer arithmetic, and C17 6.5.6p9 makes the
@@ -3802,15 +3789,6 @@ impl TypeTable {
         }
     }
 
-    /// The size of a type in bytes, as a host `usize`.
-    ///
-    /// The interface [`Self::byte_size`] replaced, kept for the callers in
-    /// `ir/`, `abi/` and `arch/` that still count in bare integers, and to be
-    /// deleted once the last of them has moved to the typed one.
-    pub fn size_bytes(&self, id: TypeId) -> usize {
-        self.byte_size(id).to_usize()
-    }
-
     /// The alignment of type `id`.
     ///
     /// If the type has an explicit alignment (from typedef
@@ -3838,13 +3816,6 @@ impl TypeTable {
             }
         }
         self.natural_align(id)
-    }
-
-    /// [`Self::align`] in bytes, as a host `usize`: the interface it replaced,
-    /// kept for the callers in `ir/`, `abi/` and `arch/` that still count in
-    /// bare integers, and to be deleted once the last of them has moved.
-    pub fn alignment(&self, id: TypeId) -> usize {
-        self.align(id).to_usize()
     }
 
     /// The alignment the type would have without `_Atomic`.
@@ -3883,14 +3854,6 @@ impl TypeTable {
             TypeKind::VaList => return self.va_list_alignment(),
         };
         Align::of_bytes(bytes)
-    }
-
-    /// [`Self::natural_align`] in bytes, as a host `usize`: the interface it
-    /// replaced, kept for the callers in `ir/`, `abi/` and `arch/` that still
-    /// count in bare integers, and to be deleted once the last of them has
-    /// moved.
-    pub fn natural_alignment(&self, id: TypeId) -> usize {
-        self.natural_align(id).to_usize()
     }
 
     // Target-dependent type size helpers

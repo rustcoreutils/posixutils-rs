@@ -28,7 +28,7 @@ use crate::float::FloatVal;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
-use crate::units::Bits;
+use crate::units::{Align, Bits};
 use std::collections::{HashMap, HashSet};
 
 // AArch64 Code Generator
@@ -74,7 +74,7 @@ pub struct Aarch64CodeGen {
     pub(super) tls_symbols: HashSet<String>,
     /// Every data symbol's known alignment in bytes -- definitions here and
     /// `extern` declarations -- for [`Self::lo12_folds`].
-    pub(super) sym_align: HashMap<String, crate::units::Align>,
+    pub(super) sym_align: HashMap<String, Align>,
     /// Position-independent code mode (for shared libraries)
     pub(super) pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
@@ -325,9 +325,9 @@ impl Aarch64CodeGen {
     /// and `Select` both make. A wider-than-64-bit condition also uses X10,
     /// or X11 when `scratch` is X10, so neither may hold anything live.
     fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
-        let bits = self.base.value_widths.bits(cond).get();
+        let bits = self.base.value_widths.bits(cond);
         let loc = self.get_location(cond);
-        if bits > 64 {
+        if bits > Bits::new(64) {
             if let l @ (Loc::Stack(_) | Loc::IncomingArg(_)) = &loc {
                 // Both halves, ORed: nonzero if either is.
                 let other = if scratch == Reg::X10 {
@@ -355,13 +355,13 @@ impl Aarch64CodeGen {
                 return;
             }
         }
-        let bits = bits.min(64);
+        let bits = bits.min(Bits::new(64));
         let reg = match loc {
-            Loc::Reg(r) if bits >= 32 => r,
+            Loc::Reg(r) if bits >= Bits::new(32) => r,
             _ => {
                 self.emit_move(cond, scratch, bits);
                 // A register keeps whatever lies above a narrow value.
-                match bits {
+                match bits.get() {
                     8 => self.push_lir(Aarch64Inst::Uxtb {
                         src: scratch,
                         dst: scratch,
@@ -376,7 +376,7 @@ impl Aarch64CodeGen {
             }
         };
         self.push_lir(Aarch64Inst::Cmp {
-            size: if bits <= 32 {
+            size: if bits <= Bits::new(32) {
                 OperandSize::B32
             } else {
                 OperandSize::B64
@@ -408,12 +408,12 @@ impl Aarch64CodeGen {
                 return true;
             }
             Loc::VReg(v) => {
-                let bit_size = if insn.size == Bits::new(0) {
-                    64
+                let bit_size = if insn.size == Bits::ZERO {
+                    Bits::new(64)
                 } else {
-                    insn.size.get()
+                    insn.size
                 };
-                let fp_size = if bit_size <= 32 {
+                let fp_size = if bit_size <= Bits::new(32) {
                     FpSize::Single
                 } else {
                     FpSize::Double
@@ -460,9 +460,9 @@ impl Aarch64CodeGen {
         let (scratch0, scratch1, _) = Reg::scratch_regs();
         let switch_size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.get().max(32));
-        let op_size = OperandSize::from_bits(crate::units::Bits::new(switch_size));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
+        let op_size = OperandSize::from_bits(switch_size);
 
         // Move switch value to scratch0
         match &loc {
@@ -621,7 +621,7 @@ impl Aarch64CodeGen {
                 if let Some(&val) = insn.src.first() {
                     let (scratch, _, _) = Reg::scratch_regs();
 
-                    self.emit_move(val, scratch, 64);
+                    self.emit_move(val, scratch, Bits::new(64));
 
                     self.push_lir(Aarch64Inst::BrReg { reg: scratch });
                 }
@@ -675,7 +675,7 @@ impl Aarch64CodeGen {
                         match self.locations.get(target) {
                             Some(Loc::Reg(r)) => {
                                 if let PseudoKind::Val(v) = &pseudo.kind {
-                                    self.emit_mov_imm(r, *v as i64, insn.size.get());
+                                    self.emit_mov_imm(r, *v as i64, insn.size);
                                 }
                             }
                             Some(Loc::VReg(v)) => {
@@ -685,7 +685,7 @@ impl Aarch64CodeGen {
                                     // here and was loaded as a double's bits
                                     // into a binary128 register.
                                     let fp_size =
-                                        self.fp_size_from_type(insn.typ, insn.size.get(), types);
+                                        self.fp_size_from_type(insn.typ, insn.size, types);
                                     let (lo, hi) = super::float::fp_const_bits(*f, fp_size);
                                     self.emit_fp_bits(lo, hi, fp_size, v);
                                 }
@@ -699,7 +699,7 @@ impl Aarch64CodeGen {
             Opcode::Copy => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     // Pass the type for proper sign/zero extension
-                    self.emit_copy_with_type(src, target, insn.size.get(), insn.typ, types);
+                    self.emit_copy_with_type(src, target, insn.size, insn.typ, types);
                 }
             }
 
@@ -715,7 +715,7 @@ impl Aarch64CodeGen {
                     if let Loc::Global(name) = self.get_location(src) {
                         self.emit_tls_addr(&name, dst_reg);
                         if !matches!(dst_loc, Loc::Reg(_)) {
-                            self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                            self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
                         }
                     }
                 }
@@ -752,7 +752,7 @@ impl Aarch64CodeGen {
                     }
                     // Move to final destination if needed
                     if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-                        self.emit_move_to_loc(dst_reg, &dst_loc, 64);
+                        self.emit_move_to_loc(dst_reg, &dst_loc, Bits::new(64));
                     }
                 }
             }
@@ -1125,7 +1125,7 @@ impl Aarch64CodeGen {
         // shuttles through it -- so a target parked there before the setup was
         // overwritten and the call branched into the argument data.
         if let Some(func_addr) = insn.extra().indirect_target {
-            self.emit_move(func_addr, Reg::X16, 64);
+            self.emit_move(func_addr, Reg::X16, Bits::new(64));
         }
 
         // Emit the call instruction
@@ -1173,8 +1173,8 @@ impl Aarch64CodeGen {
         let cond_loc = self.get_location(cond);
         if let Loc::Imm(v) = cond_loc {
             let val = if v != 0 { then_val } else { else_val };
-            self.emit_fp_move(val, VReg::V17, typ, size.get(), types);
-            self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size.get(), types);
+            self.emit_fp_move(val, VReg::V17, typ, size, types);
+            self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size, types);
             return;
         }
 
@@ -1190,18 +1190,18 @@ impl Aarch64CodeGen {
         });
 
         // Else: load else_val to V17
-        self.emit_fp_move(else_val, VReg::V17, typ, size.get(), types);
+        self.emit_fp_move(else_val, VReg::V17, typ, size, types);
         self.push_lir(Aarch64Inst::B {
             target: done_label.clone(),
         });
 
         // Then: load then_val to V17
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(then_label)));
-        self.emit_fp_move(then_val, VReg::V17, typ, size.get(), types);
+        self.emit_fp_move(then_val, VReg::V17, typ, size, types);
 
         // Done: store V17 to destination
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
-        self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size.get(), types);
+        self.emit_fp_move_to_loc(VReg::V17, &dst_loc, typ, size, types);
     }
 
     /// Emit integer select using CSEL
@@ -1230,8 +1230,8 @@ impl Aarch64CodeGen {
         // The test first, while the other two scratches are still free for
         // it; loading the arms after it leaves the flags alone.
         self.emit_condition_test(cond, cond_reg);
-        self.emit_move(then_val, then_reg, size.get());
-        self.emit_move(else_val, else_reg, size.get());
+        self.emit_move(then_val, then_reg, size);
+        self.emit_move(else_val, else_reg, size);
 
         // Use csel: if cond != 0, select then_val, else select else_val
         self.push_lir(Aarch64Inst::Csel {
@@ -1243,7 +1243,7 @@ impl Aarch64CodeGen {
         });
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
-            self.emit_move_to_loc(dst_reg, &dst_loc, size.get());
+            self.emit_move_to_loc(dst_reg, &dst_loc, size);
         }
     }
 
@@ -1302,9 +1302,7 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
             // names its width with a modifier, `%d0`.
             (None, V::RegName(name)) => format!("v{}", &name[1..]),
             (None | Some('w' | 'x'), value) => match value {
-                V::Reg(r) if slot.size <= crate::units::Bits::new(32) => {
-                    asm_reg_name_32(*r).to_string()
-                }
+                V::Reg(r) if slot.size <= Bits::new(32) => asm_reg_name_32(*r).to_string(),
                 V::Reg(r) => asm_reg_name_64(*r).to_string(),
                 V::RegName(text) | V::Mem(text) => text.clone(),
                 V::Int(v) => v.to_string(),
@@ -1377,7 +1375,7 @@ impl CodeGenerator for Aarch64CodeGen {
                 module
                     .extern_object_align
                     .iter()
-                    .map(|(n, a)| (n.clone(), crate::units::Align::of_bytes(u64::from(*a)))),
+                    .map(|(n, a)| (n.clone(), Align::of_bytes(u64::from(*a)))),
             )
             .collect();
 

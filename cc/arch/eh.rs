@@ -44,6 +44,7 @@ use super::codegen::CodeGenBase;
 use super::lir::{internal_label, Directive, EmitAsm, Label, LirInst, Symbol, SymbolType};
 use crate::ir::{Function, Instruction};
 use crate::target::Os;
+use crate::units::ByteSize;
 
 /// gcc's personality routine for C.
 const PERSONALITY: &str = "__gcc_personality_v0";
@@ -298,7 +299,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         });
         self.push_directive(Directive::Size {
             sym: sym.clone(),
-            size: crate::units::ByteSize::new(8),
+            size: ByteSize::new(8),
         });
         self.push_directive(Directive::GlobalLabel(sym));
         self.push_directive(Directive::QuadSym(Symbol::extern_sym(PERSONALITY)));

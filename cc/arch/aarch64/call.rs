@@ -15,7 +15,7 @@ use super::regalloc::{Loc, Reg, VReg};
 use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::abi::{ArgClass, HfaBase, RegClass};
 use crate::arch::eh::CallArgsArea;
-use crate::arch::lir::{complex_fp_info, CallTarget, FpSize, OperandSize, Symbol};
+use crate::arch::lir::{complex_fp_info, eightbyte_bytes, CallTarget, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use crate::units::{Align, Bits, ByteSize};
@@ -42,13 +42,13 @@ enum StackKind {
     /// A composite laid on the stack by value. The pseudo carries its
     /// address; `bytes` of it are copied into the outgoing slot.
     /// Pushing it as a scalar wrote the *pointer* there instead.
-    Composite { bytes: i32 },
+    Composite { bytes: ByteSize },
 }
 
 struct StackArg {
     pseudo: PseudoId,
     is_fp: bool,
-    size: u32,
+    size: Bits,
     typ: Option<TypeId>,
     kind: StackKind,
 }
@@ -61,7 +61,7 @@ impl StackArg {
         match self.typ {
             Some(t) => stacked.slot(types, t),
             None => StackSlot {
-                bytes: ByteSize::new(if self.size == 128 { 16 } else { 8 }),
+                bytes: ByteSize::new(if self.size == Bits::new(128) { 16 } else { 8 }),
                 align: Align::EIGHT,
             },
         }
@@ -98,7 +98,7 @@ impl Aarch64CodeGen {
     pub(super) fn setup_sret_arg(&mut self, insn: &Instruction) -> usize {
         if insn.returns_via_sret() && !insn.src.is_empty() {
             // First argument is sret pointer - move to X8
-            self.emit_move(insn.src[0], Reg::X8, 64);
+            self.emit_move(insn.src[0], Reg::X8, Bits::new(64));
             1 // Skip first arg in main loop
         } else {
             0
@@ -213,7 +213,7 @@ impl Aarch64CodeGen {
             // A negative mask is not a logical immediate here, so it is
             // materialized and applied from a register -- which is also why
             // the result cannot be written straight to `%sp`.
-            self.emit_mov_imm(Reg::X9, -(max_align as i64), 64);
+            self.emit_mov_imm(Reg::X9, -(max_align as i64), Bits::new(64));
             self.push_lir(Aarch64Inst::And {
                 size: OperandSize::B64,
                 src1: Reg::X17,
@@ -304,10 +304,10 @@ impl Aarch64CodeGen {
 
     /// The size of an argument of type `typ` that is classed
     /// [`ArgClass::Stacked`], or `None` for any other.
-    pub(super) fn stacked_arg_bytes(&self, typ: TypeId, types: &TypeTable) -> Option<i32> {
+    pub(super) fn stacked_arg_bytes(&self, typ: TypeId, types: &TypeTable) -> Option<ByteSize> {
         let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
         match abi.classify_param(typ, types) {
-            ArgClass::Stacked { size_bytes } => i32::try_from(size_bytes.get()).ok(),
+            ArgClass::Stacked { size_bytes } => Some(size_bytes),
             _ => None,
         }
     }
@@ -342,7 +342,7 @@ impl Aarch64CodeGen {
                 stack_args_info.push(StackArg {
                     pseudo: arg,
                     is_fp: false,
-                    size: 64,
+                    size: Bits::new(64),
                     typ: arg_type,
                     kind: StackKind::Composite { bytes },
                 });
@@ -363,7 +363,7 @@ impl Aarch64CodeGen {
                     match abi.classify_param(t, types) {
                         ArgClass::Hfa { base, count } => {
                             let count = count as usize;
-                            if count == 1 && types.size_bits(t) <= 64 {
+                            if count == 1 && types.byte_size(t) <= ByteSize::new(8) {
                                 None
                             } else {
                                 Some((base, count))
@@ -402,7 +402,7 @@ impl Aarch64CodeGen {
             let is_hfa_one = arg_type.is_some_and(|t| {
                 let abi =
                     crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
-                types.size_bits(t) <= 64
+                types.byte_size(t) <= ByteSize::new(8)
                     && matches!(abi.classify_param(t, types), ArgClass::Hfa { count: 1, .. })
             });
             let is_fp = if is_hfa_one {
@@ -414,11 +414,13 @@ impl Aarch64CodeGen {
                 matches!(arg_loc, Loc::VReg(_) | Loc::FImm(..))
             };
 
-            let arg_size = if let Some(typ) = arg_type {
-                types.size_bits(typ).max(32)
-            } else {
-                64
-            };
+            // An object too large for a value width is passed by reference
+            // (stage B.4), so what the register carries is its address.
+            let arg_size = arg_type.map_or(Bits::new(64), |t| {
+                types
+                    .checked_value_bits(t)
+                    .map_or(Bits::new(64), |w| w.max(Bits::new(32)))
+            });
 
             if let Some((hfa_base, count)) = hfa_regs {
                 if fp_arg_idx + count <= fp_arg_regs.len() {
@@ -462,11 +464,11 @@ impl Aarch64CodeGen {
             {
                 if int_arg_idx + gp_n <= int_arg_regs.len() {
                     let base = self.aggregate_arg_address(arg);
-                    let bytes = arg_type.map_or(0, |t| types.size_bytes(t)) as i64;
+                    let bytes = arg_type.map_or(ByteSize::ZERO, |t| types.byte_size(t));
                     for k in 0..gp_n {
                         // Only what this register's eightbyte actually holds:
                         // `_Complex char` is two bytes, not eight.
-                        let take = (bytes - (k as i64) * 8).clamp(0, 8);
+                        let take = eightbyte_bytes(bytes, ByteSize::from_usize(k * 8));
                         self.load_object_bytes(
                             int_arg_regs[int_arg_idx],
                             base,
@@ -484,7 +486,7 @@ impl Aarch64CodeGen {
                         size: arg_size,
                         typ: arg_type,
                         kind: StackKind::Composite {
-                            bytes: crate::abi::slot_bytes(
+                            bytes: crate::abi::checked_slot_size(
                                 types.byte_size(arg_type.unwrap()),
                                 insn.pos.unwrap_or_default(),
                                 "a by-value argument",
@@ -514,14 +516,11 @@ impl Aarch64CodeGen {
                     // twelve-byte composite fills the first and four bytes of
                     // the second. `Ldp` has no narrow form, so the pair is two
                     // sized loads rather than one that reads past the object.
-                    let bytes = arg_type.map_or(16, |t| types.size_bytes(t)) as i64;
-                    self.load_object_bytes(int_arg_regs[int_arg_idx], base, 0, bytes.min(8));
-                    self.load_object_bytes(
-                        int_arg_regs[int_arg_idx + 1],
-                        base,
-                        8,
-                        (bytes - 8).clamp(0, 8),
-                    );
+                    let bytes = arg_type.map_or(ByteSize::new(16), |t| types.byte_size(t));
+                    let first = eightbyte_bytes(bytes, ByteSize::ZERO);
+                    self.load_object_bytes(int_arg_regs[int_arg_idx], base, 0, first);
+                    let second = eightbyte_bytes(bytes, ByteSize::new(8));
+                    self.load_object_bytes(int_arg_regs[int_arg_idx + 1], base, 8, second);
                     int_arg_idx += 2;
                 } else {
                     stack_args_info.push(StackArg {
@@ -530,8 +529,8 @@ impl Aarch64CodeGen {
                         size: arg_size,
                         typ: arg_type,
                         kind: StackKind::Composite {
-                            bytes: arg_type.map_or(16, |t| {
-                                crate::abi::slot_bytes(
+                            bytes: arg_type.map_or(ByteSize::new(16), |t| {
+                                crate::abi::checked_slot_size(
                                     types.byte_size(t),
                                     insn.pos.unwrap_or_default(),
                                     "a by-value argument",
@@ -569,11 +568,7 @@ impl Aarch64CodeGen {
                 }
             } else if is_fp {
                 if fp_arg_idx < fp_arg_regs.len() {
-                    let fp_size = if let Some(typ) = arg_type {
-                        types.size_bits(typ)
-                    } else {
-                        64
-                    };
+                    let fp_size = arg_type.map_or(Bits::new(64), |t| types.value_bits(t));
                     self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], arg_type, fp_size, types);
                     fp_arg_idx += 1;
                 } else {
@@ -616,11 +611,11 @@ impl Aarch64CodeGen {
                         Loc::Imm(v) => {
                             let lo = v as u64 as i64;
                             let hi = (v >> 64) as u64 as i64;
-                            self.emit_mov_imm(int_arg_regs[int_arg_idx], lo, 64);
-                            self.emit_mov_imm(int_arg_regs[int_arg_idx + 1], hi, 64);
+                            self.emit_mov_imm(int_arg_regs[int_arg_idx], lo, Bits::new(64));
+                            self.emit_mov_imm(int_arg_regs[int_arg_idx + 1], hi, Bits::new(64));
                         }
                         _ => {
-                            self.emit_move(arg, int_arg_regs[int_arg_idx], 64);
+                            self.emit_move(arg, int_arg_regs[int_arg_idx], Bits::new(64));
                             self.push_lir(Aarch64Inst::Mov {
                                 size: OperandSize::B64,
                                 src: GpOperand::Reg(Reg::Xzr),
@@ -634,7 +629,7 @@ impl Aarch64CodeGen {
                     stack_args_info.push(StackArg {
                         pseudo: arg,
                         is_fp: false,
-                        size: 128,
+                        size: Bits::new(128),
                         typ: arg_type,
                         kind: StackKind::Scalar,
                     });
@@ -718,11 +713,11 @@ impl Aarch64CodeGen {
                     Loc::Imm(v) => {
                         let lo = v as u64 as i64;
                         let hi = (v >> 64) as u64 as i64;
-                        self.emit_mov_imm(Reg::X9, lo, 64);
-                        self.emit_mov_imm(Reg::X10, hi, 64);
+                        self.emit_mov_imm(Reg::X9, lo, Bits::new(64));
+                        self.emit_mov_imm(Reg::X10, hi, Bits::new(64));
                     }
                     _ => {
-                        self.emit_move(stack_arg.pseudo, Reg::X9, 64);
+                        self.emit_move(stack_arg.pseudo, Reg::X9, Bits::new(64));
                         self.push_lir(Aarch64Inst::Mov {
                             size: OperandSize::B64,
                             src: GpOperand::Reg(Reg::Xzr),
@@ -778,11 +773,7 @@ impl Aarch64CodeGen {
                 // so a composite that is not a multiple of eight reads and
                 // writes its tail as wide as the tail is.
                 let src = self.aggregate_arg_address(stack_arg.pseudo);
-                for (done, chunk) in
-                    crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
-                        u64::try_from(bytes).expect("a byte count is not negative"),
-                    ))
-                {
+                for (done, chunk) in crate::ir::memexpand::block_chunks(bytes) {
                     let size = OperandSize::from_bits(chunk.bits());
                     let done = done as i32;
                     self.push_lir(Aarch64Inst::Ldr {
@@ -863,7 +854,7 @@ impl Aarch64CodeGen {
                 // the value's own size on Apple, where a `char` is one byte
                 // and the next argument begins right after it.
                 self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::from_bits(crate::units::Bits::new(
+                    size: OperandSize::from_bits(Bits::new(
                         slot.bytes
                             .min(ByteSize::new(8))
                             .bits()
@@ -893,10 +884,8 @@ impl Aarch64CodeGen {
     /// A width the hardware loads directly (1, 2, 4, 8) is one instruction.
     /// A ragged width is assembled from the pieces `block_chunks` gives, each
     /// shifted to its place, which is what clang emits for the same argument.
-    fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: i64) {
-        for (at, chunk) in crate::ir::memexpand::block_chunks(crate::units::ByteSize::new(
-            u64::try_from(bytes).expect("a byte count is not negative"),
-        )) {
+    fn load_object_bytes(&mut self, dst: Reg, base: Reg, offset: i32, bytes: ByteSize) {
+        for (at, chunk) in crate::ir::memexpand::block_chunks(bytes) {
             let size = OperandSize::from_bits(chunk.bits());
             // The first piece lands in `dst`; the rest are shifted into it
             // through the address scratch, which the base is not held in.
@@ -959,7 +948,7 @@ impl Aarch64CodeGen {
                 Reg::X9
             }
             _ => {
-                self.emit_move(arg, Reg::X9, 64);
+                self.emit_move(arg, Reg::X9, Bits::new(64));
                 Reg::X9
             }
         }
@@ -1003,7 +992,7 @@ impl Aarch64CodeGen {
     ) {
         let fp_size = elem.size;
         let delta = index as i32 * elem.bytes;
-        if types.size_bits(typ) > 64 {
+        if types.byte_size(typ) > ByteSize::new(8) {
             let base = self.aggregate_arg_address(arg);
             self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size,
@@ -1161,8 +1150,8 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let ret_size = insn
             .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.get().max(32));
+            .map_or(insn.size, |t| types.value_bits(t))
+            .max(Bits::new(32));
 
         let abi_info = insn
             .extra()
@@ -1388,6 +1377,11 @@ pub(super) struct HfaElem {
 }
 
 impl HfaElem {
+    /// The size of `count` elements packed at their own stride.
+    pub(super) fn packed(self, count: u8) -> ByteSize {
+        ByteSize::new(u64::from(count) * u64::from(self.bytes.unsigned_abs()))
+    }
+
     pub(super) fn of(base: HfaBase) -> HfaElem {
         let size = match base {
             HfaBase::Float16 => FpSize::Half,

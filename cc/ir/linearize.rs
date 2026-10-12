@@ -5814,7 +5814,7 @@ impl<'a> Linearizer<'a> {
     ///
     /// Kept separate from `linearize_ternary`'s general path rather than
     /// folded into it: the phi here merges *pointers*, so it is a
-    /// pointer-width phi of `pointer_to(result_typ)`, not a `size_bits`-wide
+    /// pointer-width phi of `pointer_to(result_typ)`, not a `value_bits`-wide
     /// phi of the complex type.
     fn linearize_complex_ternary(
         &mut self,

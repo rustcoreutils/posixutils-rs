@@ -16,6 +16,7 @@ use super::lir::{Aarch64Inst, Arrangement, NeonOp};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::ir::{Instruction, PseudoId, SimdOp};
 use crate::types::{TypeId, TypeTable};
+use crate::units::{Bits, ByteSize};
 
 impl Aarch64CodeGen {
     /// `Opcode::Simd(op)`: one three-operand NEON instruction, reading each
@@ -29,14 +30,15 @@ impl Aarch64CodeGen {
         let (lane, _) = types
             .vector_lanes(vec)
             .expect("a vector operation's type is a vector");
-        let total = insn.size.get() as usize / 8;
+        let total = insn.size.bytes_exact() as usize;
         // The carrier the operands are held in, which picks the Q or D move.
         let carrier = if total == 16 {
             types.float128_id
         } else {
             types.double_id
         };
-        let lane_bytes = types.size_bytes(lane);
+        // A lane is a scalar, so its size is its width's.
+        let lane_bytes = types.value_bits(lane).bytes_exact() as usize;
         let dst_loc = self.get_location(target);
         let dst = match dst_loc {
             Loc::VReg(v) => v,
@@ -54,11 +56,11 @@ impl Aarch64CodeGen {
             } else {
                 Arrangement::of(lane_bytes, total)
             };
-            let src1 = self.simd_operand(insn.src[0], VReg::V17, carrier, insn.size.get(), types);
+            let src1 = self.simd_operand(insn.src[0], VReg::V17, carrier, insn.size, types);
             let mut src2 = insn
                 .src
                 .get(1)
-                .map(|&s| self.simd_operand(s, VReg::V18, carrier, insn.size.get(), types));
+                .map(|&s| self.simd_operand(s, VReg::V18, carrier, insn.size, types));
             if matches!(op, SimdOp::Lsr | SimdOp::Asr) {
                 // A right shift is a left shift by the negated counts,
                 // made in V18 so an operand's own register is untouched.
@@ -91,7 +93,7 @@ impl Aarch64CodeGen {
             }
         }
         if !matches!(dst_loc, Loc::VReg(v) if v == dst) {
-            self.emit_fp_move_to_loc(dst, &dst_loc, Some(carrier), insn.size.get(), types);
+            self.emit_fp_move_to_loc(dst, &dst_loc, Some(carrier), insn.size, types);
         }
     }
 
@@ -102,7 +104,7 @@ impl Aarch64CodeGen {
         src: PseudoId,
         scratch: VReg,
         carrier: TypeId,
-        size: u32,
+        size: Bits,
         types: &TypeTable,
     ) -> VReg {
         match self.get_location(src) {
@@ -128,7 +130,7 @@ impl Aarch64CodeGen {
         dst: VReg,
         types: &TypeTable,
     ) {
-        let total = insn.size.get() as usize / 8;
+        let total = insn.size.bytes_exact() as usize;
         let carrier = if total == 16 {
             types.float128_id
         } else {
@@ -137,27 +139,14 @@ impl Aarch64CodeGen {
         let n = total / lane_bytes;
         let second = (insn.src.len() == 2).then_some(VReg::V18);
         let table = if second.is_some() {
-            self.simd_pair(
-                insn.src[0],
-                insn.src[1],
-                dst,
-                carrier,
-                insn.size.get(),
-                types,
-            );
+            self.simd_pair(insn.src[0], insn.src[1], dst, carrier, insn.size, types);
             VReg::V17
         } else {
             match self.get_location(insn.src[0]) {
                 // Not the target's register, which the index is built in.
                 Loc::VReg(v) if v != dst => v,
                 _ => {
-                    self.emit_fp_move(
-                        insn.src[0],
-                        VReg::V17,
-                        Some(carrier),
-                        insn.size.get(),
-                        types,
-                    );
+                    self.emit_fp_move(insn.src[0], VReg::V17, Some(carrier), insn.size, types);
                     VReg::V17
                 }
             }
@@ -193,7 +182,7 @@ impl Aarch64CodeGen {
         b: PseudoId,
         tmp: VReg,
         carrier: TypeId,
-        size: u32,
+        size: Bits,
         types: &TypeTable,
     ) {
         let in_reg = |cg: &Self, p, r| matches!(cg.get_location(p), Loc::VReg(v) if v == r);
@@ -230,7 +219,9 @@ impl Aarch64CodeGen {
         types: &TypeTable,
     ) {
         let arr = Arrangement::of(lane_bytes, 16);
-        let bits = lane_bytes as u32 * 8;
+        let bits = ByteSize::from_usize(lane_bytes)
+            .bits()
+            .expect("a lane is at most eight bytes");
         if float {
             let typ = if lane_bytes == 4 {
                 types.float_id

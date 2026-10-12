@@ -34,31 +34,6 @@ constraint.
 
 ## Future Features
 
-### Object size and value width are the same `u32`
-
-`TypeTable::size_bits` answers a *value* width -- what an instruction operand
-holds, bounded at 128 bits -- and `size_bytes` answers an *object* size, which
-is not bounded. Both are plain integers, so nothing stops one being used where
-the other is meant, and the unit is a naming convention rather than a type.
-`size_bits` saturates for an object past `u32::MAX` bits, so any byte count
-derived from it is wrong for a large object while `sizeof` stays right.
-
-A `grep` for `size_bits(..) / 8` is not a check: the bit count reaches a
-division through a local variable, a `u32` field (`ArgClass::Indirect`'s
-payload, `Instruction::size`) or an equality comparison, none of which the
-grep follows. The conversions that remain are safe for three different
-reasons nothing enforces: a `complex_base` is a scalar, a bit-field width is
-bounded by its storage unit, and a threshold comparison against 64 or 128
-answers correctly even when saturated.
-
-Done is the distinction as a *type*: a `Bits` newtype for value widths that
-implements no division, and a `ByteSize` for object sizes, so every conversion
-is a compile error. Widening `size_bits` to `u64` is not this fix -- most of
-its callers want a `u32` because they are value widths, and casting them back
-reintroduces the truncation at the aggregate-fed sites.
-
----
-
 ### 64-bit stack frames
 
 An automatic object past `TypeTable::MAX_STACK_OBJECT_BYTES` (just under

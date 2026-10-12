@@ -13,6 +13,7 @@ use crate::arch::asm_constraints::AsmRegClass;
 use crate::ir::bitset::BitSet;
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
+use crate::units::Bits;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
@@ -256,7 +257,7 @@ pub fn constraint_clobbers<R: Copy + Ord>(
 /// Built once for the chordal pre-pass, which asked it per interval by
 /// scanning the whole function; that made the pre-pass intervals x
 /// instructions.
-pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, crate::units::Bits> {
+pub fn setval_sizes(func: &Function) -> HashMap<PseudoId, Bits> {
     let mut sizes = HashMap::new();
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
         if insn.op == Opcode::SetVal {

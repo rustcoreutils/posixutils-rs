@@ -652,8 +652,8 @@ fn diagnostics_representable_enumerators_are_accepted() {
 /// arithmetic, and 6.5.6p9 makes the difference of two pointers into one
 /// object a `ptrdiff_t`, so an object whose size does not fit a signed 64-bit
 /// value cannot be indexed from end to end. `PTRDIFF_MAX` itself is allowed
-/// and one byte more is not. It used to be 512 MB, an accident of `size_bits`
-/// answering in a `u32`, and an extent past it saturated in silence:
+/// and one byte more is not. It used to be 512 MB, an accident of a type's bit
+/// width being answered in a `u32`, and an extent past it saturated in silence:
 /// `char big[5000000000];` compiled and reported `sizeof` 536870911. Then it
 /// was `u64::MAX / 8`, because struct layout accumulated its bits in a
 /// `usize`, which refused gcc.c-torture `991014-1`.

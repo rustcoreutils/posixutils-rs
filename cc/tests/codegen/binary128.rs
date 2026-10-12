@@ -165,3 +165,46 @@ fn binary128_values_spilled_under_register_pressure() {
     );
     crate::common::compile_and_run_everywhere("binary128_spill_pressure", &src);
 }
+
+/// A `long double` argument for a `_Float128` parameter, and the reverse,
+/// is converted (C17 6.5.2.2p7). Calls decided by size whether a floating
+/// argument needed converting, and on x86-64 both types are sixteen bytes:
+/// the x87 value went over unconverted, on the stack, and the callee read
+/// %xmm0. The other conversions between the two are checked alongside.
+///
+/// Not on macOS: Apple's targets have no `_Float128`, as with clang.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn binary128_long_double_arguments_are_converted() {
+    let src = r#"
+long double g_ld = 0.5L;
+_Float128 g_q = 0.25f128;
+__attribute__((noinline)) double one(_Float128 x) { return (double)x; }
+__attribute__((noinline)) double two(_Float128 x, _Float128 y) { return (double)x * 10 + (double)y; }
+__attribute__((noinline)) double ldp(long double x) { return (double)x; }
+__attribute__((noinline)) _Float128 ret_q(long double x) { return x; }
+__attribute__((noinline)) long double ret_ld(_Float128 x) { return x; }
+struct S { _Float128 q; long double l; };
+int main(void) {
+    long double a = 0.5L, b = 0.25L;
+    if (one(g_ld) != 0.5) return 1;
+    if (two(g_ld, g_ld) != 5.5) return 2;
+    if (two(a, b) != 5.25) return 3;
+    if (ldp(g_q) != 0.25) return 4;
+    if ((double)ret_q(a) != 0.5) return 5;
+    if ((double)ret_ld(g_q) != 0.25) return 6;
+    struct S s = { a, g_q };
+    if ((double)s.q != 0.5 || (double)s.l != 0.25) return 7;
+    _Float128 q = 1; q += a;
+    if ((double)q != 1.5) return 8;
+    long double l = 1; l += g_q;
+    if ((double)l != 1.25) return 9;
+    if (!(a > g_q) || (a < g_q) || a == g_q) return 10;
+    if ((double)(a + g_q) != 0.75 || sizeof(a + g_q) != 16) return 11;
+    _Float128 arr[2] = { a, b };
+    if ((double)arr[1] != 0.25) return 12;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("binary128_ld_args", src);
+}

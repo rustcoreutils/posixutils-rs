@@ -4983,8 +4983,15 @@ impl<'a> Linearizer<'a> {
                 // in one byte, so `f(..., 'a')` recorded as `int`
                 // took four and moved every later argument.
                 || (arg_is_int && param_is_int && arg_size > param_size)
-                // FP size mismatch (float→double, long double→double, etc.)
-                || (arg_is_fp && param_is_fp && arg_size != param_size)
+                // FP format mismatch (float→double, long double→double,
+                // etc.). The format, not the size: x86-64's `long double`
+                // and `_Float128` are both sixteen bytes, and a `long
+                // double` handed unconverted to a `_Float128` parameter
+                // arrived as its x87 bytes, on the stack, where the callee
+                // read %xmm0.
+                || (arg_is_fp
+                    && param_is_fp
+                    && self.types.fp_format(arg_type) != self.types.fp_format(param_type))
                 // Integer to FP (uint32_t→double, int→float, etc.)
                 || (arg_is_int && param_is_fp)
                 // FP to integer (rare but legal)

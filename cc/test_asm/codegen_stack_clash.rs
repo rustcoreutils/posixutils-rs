@@ -141,7 +141,10 @@ fn a64(triple: &str, flags: &[&str]) -> String {
 /// is allocated 64 KiB at a time, each probed 1 KiB above the new stack
 /// pointer, in a loop past four intervals -- with the CFA in the loop's end
 /// register while `sp` moves -- and a residual of 63 KiB or more is probed
-/// too.
+/// too. On Darwin, whose tools walk the frame-pointer chain, a probed frame
+/// stores a record of its own at its top and points x29 at it before the
+/// probes, so the CFA is x29-based throughout and the walk from a fault on
+/// the guard finds the function.
 #[test]
 fn codegen_stack_clash_aarch64_frames() {
     for triple in [AARCH64_LINUX, AARCH64_DARWIN] {
@@ -159,8 +162,21 @@ fn codegen_stack_clash_aarch64_frames() {
             "{triple}: 1 MiB loops"
         );
         assert_body_contains(&asm, "f1m", "cmp sp, x17", "the loop's end");
-        assert_body_contains(&asm, "f1m", ".cfi_def_cfa x17, 1048576", "CFA");
-        assert_body_contains(&asm, "f1m", ".cfi_def_cfa sp, 1048576", "CFA");
+        if triple == AARCH64_DARWIN {
+            for f in ["f64k", "f200k", "f1m"] {
+                let body = body_of(&asm, f);
+                let record = body.find("stp x29, x30, [sp, #-16]!");
+                let first_probe = body.find(probe);
+                assert!(
+                    record.is_some() && record < first_probe,
+                    "{triple} {f}: the record before the probes:\n{body}"
+                );
+                assert_body_lacks(&asm, f, ".cfi_def_cfa x17", "x29-based CFA");
+            }
+        } else {
+            assert_body_contains(&asm, "f1m", ".cfi_def_cfa x17, 1048576", "CFA");
+            assert_body_contains(&asm, "f1m", ".cfi_def_cfa sp, 1048576", "CFA");
+        }
 
         let plain = a64(triple, &["-O2"]);
         for f in ["f64k", "f200k", "f1m", "dyn_alloca", "dyn_vla", "pass_huge"] {

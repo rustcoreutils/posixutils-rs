@@ -180,7 +180,14 @@ three deliberate differences.
 - **Darwin is probed too.** clang's driver drops the option for Apple targets,
   whose own defence is `___chkstk_darwin`. The probes are plain stores
   that are right on any stack with a guard page, so c17 emits the same ones
-  for Mach-O as for ELF rather than take the option and do nothing.
+  for Mach-O as for ELF rather than take the option and do nothing. One
+  difference in order: a Darwin aarch64 frame that needs probes stores a
+  frame record at its top and points x29 at it before probing, then the
+  usual record at the bottom -- sixteen more bytes -- because Darwin's
+  `backtrace()`, crash reports and samplers walk the frame-pointer chain,
+  and gcc's order (probe, then store the record) leaves the function out of
+  that chain while its probes run. clang stores the record before calling
+  `___chkstk_darwin` for the same reason.
 
 ## GNU extensions: what c17 will and will not grow
 

@@ -150,6 +150,19 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Move `sp` down the `bytes` of a frame below a record the prologue has
+    /// already stored at its top, x29 pointing at it: probed as gcc probes
+    /// a frame, the CFA staying x29-based so no move needs describing. The
+    /// bottom record stored next is the last probe.
+    pub(super) fn emit_frame_body_allocation(&mut self, bytes: i64) {
+        match self.base.frame_probe_plan(bytes) {
+            None => self.sub_sp(bytes),
+            Some(plan) => {
+                self.emit_probe_steps(plan, None);
+            }
+        }
+    }
+
     /// Move `sp` down a call's outgoing argument area of `bytes`. Up to
     /// 1 KiB is the allowance a callee assumes and needs no probe; past it,
     /// under the protection, the area is probed as an `alloca` of its size

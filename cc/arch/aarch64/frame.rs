@@ -171,6 +171,19 @@ impl Aarch64CodeGen {
             stack_size,
             reg_save_area_size,
         );
+        // On Darwin a frame the protection probes stores a record of its own
+        // at its top before the probes run (`emit_record_first`), sixteen
+        // more bytes above everything `layout` placed.
+        let record_first = is_darwin
+            && self
+                .base
+                .frame_probe_plan(i64::from(total_frame) + 16)
+                .is_some();
+        let total_frame = if record_first {
+            total_frame + 16
+        } else {
+            total_frame
+        };
         self.layout = layout;
         self.reg_save_area_offset = if is_variadic { save_area_base } else { 0 };
 
@@ -196,7 +209,7 @@ impl Aarch64CodeGen {
         for directive in self.base.patchable_entry(func, false) {
             self.push_lir(Aarch64Inst::Directive(directive));
         }
-        self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
+        self.emit_prologue(total_frame, record_first, &callee_saved, &callee_saved_fp);
         self.base
             .check_frame_size(i64::from(stack_size + reg_save_area_size));
 
@@ -528,7 +541,13 @@ impl Aarch64CodeGen {
     /// The frame record sits at the bottom of the frame, so once X29 points at
     /// it the CFA is X29 + `total_frame` for the rest of the function, however
     /// `alloca` moves SP.
-    fn emit_prologue(&mut self, total_frame: i32, callee_saved: &[Reg], callee_saved_fp: &[VReg]) {
+    fn emit_prologue(
+        &mut self,
+        total_frame: i32,
+        record_first: bool,
+        callee_saved: &[Reg],
+        callee_saved_fp: &[VReg],
+    ) {
         let fp = Reg::fp();
         let lr = Reg::lr();
 
@@ -548,6 +567,8 @@ impl Aarch64CodeGen {
                 },
             });
             self.push_cfi(Directive::CfiDefCfaOffset(total_frame));
+        } else if record_first {
+            self.emit_record_first(total_frame);
         } else {
             // Large frame: separate sub and stp, the sub probed under
             // `-fstack-clash-protection` once the frame could jump the guard
@@ -584,7 +605,12 @@ impl Aarch64CodeGen {
             src: GpOperand::Reg(Reg::SP),
             dst: fp,
         });
-        self.push_cfi(Directive::cfi_def_cfa_register("x29"));
+        if record_first {
+            // The CFA was x29 + 16 while x29 named the record at the top.
+            self.push_cfi(Directive::cfi_def_cfa("x29", total_frame));
+        } else {
+            self.push_cfi(Directive::cfi_def_cfa_register("x29"));
+        }
 
         // Save callee-saved GP registers in pairs
         self.save_callee_saved_gp_regs(total_frame, callee_saved);
@@ -592,6 +618,56 @@ impl Aarch64CodeGen {
         // Save callee-saved FP registers in pairs
         let gp_offset = self.layout.saves_at + (callee_saved.len().div_ceil(2) as i32 * 16);
         self.save_callee_saved_fp_regs(total_frame, callee_saved_fp, gp_offset);
+    }
+
+    /// The prologue of a Darwin frame the protection probes, up to the
+    /// frame record at its bottom: a record of its own at the top first,
+    /// with x29 at it, then the probed allocation, then the bottom record,
+    /// stored from the caller's x29 the top one keeps.
+    ///
+    /// Darwin's `backtrace()`, its crash reports and its samplers walk the
+    /// frame-pointer chain, not the CFI. gcc's order -- probe, then store
+    /// the record -- leaves x29 at the caller's record while the probes run,
+    /// with this function's return address only in x30: a fault on the guard
+    /// there is walked from this function straight to its caller's caller.
+    /// clang stores the record before it calls `___chkstk_darwin` for the
+    /// same reason. The top record costs sixteen bytes, and `total_frame`
+    /// counts them.
+    fn emit_record_first(&mut self, total_frame: i32) {
+        let fp = Reg::fp();
+        let lr = Reg::lr();
+        self.push_lir(Aarch64Inst::Stp {
+            size: OperandSize::B64,
+            src1: fp,
+            src2: lr,
+            addr: MemAddr::PreIndex {
+                base: Reg::SP,
+                offset: -16,
+            },
+        });
+        self.push_cfi(Directive::CfiDefCfaOffset(16));
+        self.push_cfi(Directive::cfi_offset("x29", -16));
+        self.push_cfi(Directive::cfi_offset("x30", -8));
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::SP),
+            dst: fp,
+        });
+        self.push_cfi(Directive::cfi_def_cfa_register("x29"));
+        // The CFA is x29-based now, so the probed moves of `sp` need no rule.
+        self.emit_frame_body_allocation(i64::from(total_frame - 16));
+        // stp <caller's x29>, x30, [sp]: the record the frame keeps.
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: MemAddr::Base(fp),
+            dst: Reg::X16,
+        });
+        self.push_lir(Aarch64Inst::Stp {
+            size: OperandSize::B64,
+            src1: Reg::X16,
+            src2: lr,
+            addr: MemAddr::Base(Reg::SP),
+        });
     }
 
     /// Copy `bytes` bytes from `[src]` to `[dst]`, in a counted loop over the
